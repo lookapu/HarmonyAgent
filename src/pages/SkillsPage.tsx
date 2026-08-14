@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listSkills, importSkillFromGithub, toggleSkill, removeSkill, cloneSkill, type Skill } from '../api/skill'
 import { skillTemplates, type SkillTemplate } from '../data/skillTemplates'
@@ -36,16 +36,17 @@ export default function SkillsPage() {
   const [useProxy, setUseProxy] = useState(false)
   const [installingKey, setInstallingKey] = useState<string | null>(null)
 
-  const load = async () => {
+  // useCallback 稳定引用：projectId 变化时 load 重建触发 effect，避免每次渲染重复加载
+  const load = useCallback(async () => {
     try {
       const list = await listSkills(projectId)
       setSkills(list)
     } catch (e) {
       console.error(e)
     }
-  }
+  }, [projectId])
 
-  useEffect(() => { load() }, [projectId])
+  useEffect(() => { load() }, [load])
 
   const visibleSkills = useMemo(
     () => skills.filter((s) => effectiveScope === 'global' ? !s.project_id : s.project_id === projectId),

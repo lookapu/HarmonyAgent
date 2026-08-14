@@ -14,6 +14,7 @@ pub mod harmony_knowledge;
 pub mod jdk_runtime;
 pub mod sdk_api;
 pub mod key_store;
+pub mod llm_replay;
 pub mod maintenance;
 pub mod mcp_client;
 pub mod mcp_manager;

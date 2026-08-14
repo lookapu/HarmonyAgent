@@ -149,11 +149,13 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
       }
     }
     void tick()
-    perfTimerRef.current[target.id] = setInterval(() => void tick(), 2000)
+    const timers = perfTimerRef.current
+    const timerId = setInterval(() => void tick(), 2000)
+    timers[target.id] = timerId
     return () => {
-      if (perfTimerRef.current[target.id]) {
-        clearInterval(perfTimerRef.current[target.id])
-        delete perfTimerRef.current[target.id]
+      if (timers[target.id] === timerId) {
+        clearInterval(timerId)
+        delete timers[target.id]
       }
     }
   }, [devices, expanded, tabMap])

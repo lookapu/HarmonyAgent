@@ -39,6 +39,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# 与 reqwest 0.12 内部版本一致（构造 llm-replay 重放响应用）
+http = "1"
 futures-util = "0.3"
 thiserror = "1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }

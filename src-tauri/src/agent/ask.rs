@@ -95,22 +95,24 @@ mod tests {
 
     #[test]
     fn resolve_returns_answer() {
-        let rid = "r1".to_string();
-        let rx = wait("c1", rid.clone(), "q".into(), vec![]);
-        assert_eq!(pending("c1").map(|e| e.request_id).as_deref(), Some("r1"));
+        // 会话/请求 ID 用专属前缀：全局会话单例与其它模块测试并发共享，
+        // 避免与 session_ctx 等测试的同名 key 互相误删
+        let rid = "ask-r1".to_string();
+        let rx = wait("ask-c1", rid.clone(), "q".into(), vec![]);
+        assert_eq!(pending("ask-c1").map(|e| e.request_id).as_deref(), Some("ask-r1"));
         assert!(resolve(&rid, "是".into()));
         assert!(rx.blocking_recv().unwrap() == "是");
         assert!(!resolve(&rid, "again".into()));
-        assert!(pending("c1").is_none());
+        assert!(pending("ask-c1").is_none());
     }
 
     #[test]
     fn cancel_closes_channel() {
-        let rid = "r2".to_string();
-        let rx = wait("c2", rid.clone(), "q".into(), vec!["a".into()]);
-        assert_eq!(pending("c2").map(|e| e.options.len()), Some(1));
-        cancel_conversation("c2");
+        let rid = "ask-r2".to_string();
+        let rx = wait("ask-c2", rid.clone(), "q".into(), vec!["a".into()]);
+        assert_eq!(pending("ask-c2").map(|e| e.options.len()), Some(1));
+        cancel_conversation("ask-c2");
         assert!(rx.blocking_recv().is_err());
-        assert!(pending("c2").is_none());
+        assert!(pending("ask-c2").is_none());
     }
 }

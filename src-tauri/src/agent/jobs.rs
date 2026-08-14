@@ -44,12 +44,33 @@ pub struct Job {
     pub pid: Option<u32>,
     /// 累计输出（stdout+stderr 合并，尾部缓冲）
     pub output: String,
-    /// 是否已结束（正常完成/失败/被杀/超时）
-    pub finished: bool,
-    /// 是否成功（仅 finished 后有效）
+    /// 生命周期状态：运行中 → 停止中 → 已结束（kill/超时先置 Stopping 再收尾）
+    pub status: JobStatus,
+    /// 是否成功（仅 status=Finished 后有效）
     pub ok: bool,
     /// 结束摘要（未结束时为 None）
     pub summary: Option<String>,
+}
+
+/// 任务生命周期状态（dsh 式 running→stopping→terminal 三态）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JobStatus {
+    /// 运行中（进程已启动或尚未退出）
+    Running,
+    /// 停止中（收到 kill/超时，进程树正在被终止，收尾尚未完成）
+    Stopping,
+    /// 已结束（正常完成/失败/被杀/超时，summary 有效）
+    Finished,
+}
+
+impl JobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStatus::Running => "running",
+            JobStatus::Stopping => "stopping",
+            JobStatus::Finished => "finished",
+        }
+    }
 }
 
 /// 任务注册表：job_id -> 任务记录
@@ -66,6 +87,8 @@ pub struct JobInfo {
     pub command: String,
     pub cwd: String,
     pub finished: bool,
+    /// 生命周期状态字符串（running/stopping/finished）
+    pub status: String,
     pub ok: bool,
     pub summary: Option<String>,
     pub output_len: usize,
@@ -88,7 +111,7 @@ pub fn start_background(
             .values()
             .filter(|j| {
                 j.lock()
-                    .map(|j| j.conversation_id == ctx.conversation_id && !j.finished)
+                    .map(|j| j.conversation_id == ctx.conversation_id && j.status != JobStatus::Finished)
                     .unwrap_or(false)
             })
             .count();
@@ -105,7 +128,7 @@ pub fn start_background(
         cwd: cwd.clone(),
         pid: None,
         output: String::new(),
-        finished: false,
+        status: JobStatus::Running,
         ok: false,
         summary: None,
     }));
@@ -196,6 +219,8 @@ async fn run_job(
                 }
             },
             _ = tokio::time::sleep_until(deadline) => {
+                // 先置停止中（job_list 立即反映终止意图），再强杀进程树
+                mark_stopping(job);
                 crate::utils::process::kill_tree(pid);
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
@@ -216,7 +241,12 @@ async fn run_job(
         format!("命令退出码 {}", status.code().unwrap_or(-1))
     };
     finish_job(job, ok, summary.clone());
-    notify(&app, &conv, &job_id, &command, ok, &summary);
+    // 结束摘要以任务记录为准（job_kill 已先置“已被终止”时不被退出码覆盖）
+    let final_summary = job
+        .lock()
+        .map(|j| j.summary.clone().unwrap_or_else(|| summary.clone()))
+        .unwrap_or_else(|_| summary.clone());
+    notify(&app, &conv, &job_id, &command, ok, &final_summary);
 }
 
 /// 结束收尾：注入会话队列（模型下一轮请求自动看到）+ 前端事件
@@ -241,10 +271,22 @@ fn notify(app: &Option<AppHandle>, conv: &str, job_id: &str, command: &str, ok: 
     }
 }
 
-/// 标记任务结束（记录结果摘要）
+/// 标记任务停止中（kill/超时发起后、收尾完成前）
+fn mark_stopping(job: &Arc<Mutex<Job>>) {
+    if let Ok(mut j) = job.lock() {
+        if j.status == JobStatus::Running {
+            j.status = JobStatus::Stopping;
+        }
+    }
+}
+
+/// 标记任务结束（记录结果摘要）；幂等：已结束的任务不覆盖（防 kill 与收尾竞争覆盖）
 fn finish_job(job: &Arc<Mutex<Job>>, ok: bool, summary: String) {
     if let Ok(mut j) = job.lock() {
-        j.finished = true;
+        if j.status == JobStatus::Finished {
+            return;
+        }
+        j.status = JobStatus::Finished;
         j.ok = ok;
         j.summary = Some(summary);
     }
@@ -299,11 +341,12 @@ pub fn list_jobs(conversation_id: &str) -> Vec<JobInfo> {
                 Ok(j) => j,
                 Err(_) => return None,
             };
-            Some(JobInfo {
+        Some(JobInfo {
                 job_id: id.clone(),
                 command: j.command.clone(),
                 cwd: j.cwd.display().to_string(),
-                finished: j.finished,
+                finished: j.status == JobStatus::Finished,
+                status: j.status.as_str().to_string(),
                 ok: j.ok,
                 summary: j.summary.clone(),
                 output_len: j.output.len(),
@@ -320,27 +363,33 @@ pub fn get_job_output(conversation_id: &str, job_id: &str) -> Result<String, Str
     let job = find_job(conversation_id, job_id)?;
     let j = job.lock().map_err(|e| e.to_string())?;
     if j.output.is_empty() {
-        Ok(if j.finished {
-            "（任务已结束，无输出）".to_string()
-        } else {
-            "（任务运行中，暂无输出）".to_string()
+        Ok(match j.status {
+            JobStatus::Finished => "（任务已结束，无输出）".to_string(),
+            JobStatus::Stopping => "（任务正在停止…）".to_string(),
+            JobStatus::Running => "（任务运行中，暂无输出）".to_string(),
         })
     } else {
         Ok(j.output.clone())
     }
 }
 
-/// 终止任务（强杀进程树）；已结束的任务返回错误
+/// 终止任务（强杀进程树）；幂等：已结束/停止中的任务直接返回对应状态
 pub fn kill_job(conversation_id: &str, job_id: &str) -> Result<String, String> {
     let job = find_job(conversation_id, job_id)?;
-    let (pid, finished) = {
+    let (pid, status) = {
         let j = job.lock().map_err(|e| e.to_string())?;
-        (j.pid, j.finished)
+        (j.pid, j.status)
     };
-    if finished {
-        return Err("任务已结束，无需终止".into());
+    match status {
+        JobStatus::Finished => return Err("任务已结束，无需终止".into()),
+        // 已在停止中：重复 kill 幂等返回，不重复强杀
+        JobStatus::Stopping => return Ok("任务正在停止中".into()),
+        JobStatus::Running => {}
     }
+    mark_stopping(&job);
     crate::utils::process::kill_tree(pid);
+    // 立即收尾（run_job 的 wait 收尾幂等，不会覆盖本摘要）；kill 后残留输出
+    // 仍会被行级收集任务追加，直到进程树退出
     finish_job(&job, false, "已被 job_kill 终止".into());
     Ok("任务已终止".into())
 }
@@ -369,7 +418,7 @@ pub fn drop_conversation_jobs(conversation_id: &str) {
             .iter()
             .filter(|(_, j)| {
                 j.lock()
-                    .map(|j| j.conversation_id == conversation_id && !j.finished)
+                    .map(|j| j.conversation_id == conversation_id && j.status != JobStatus::Finished)
                     .unwrap_or(false)
             })
             .map(|(id, j)| (id.clone(), j.lock().map(|j| j.pid).unwrap_or(None)))
@@ -416,7 +465,7 @@ mod tests {
             cwd: PathBuf::from("."),
             pid: None,
             output: String::new(),
-            finished: false,
+            status: JobStatus::Running,
             ok: false,
             summary: None,
         }));
@@ -430,5 +479,30 @@ mod tests {
         assert!(j.output.ends_with('\n'), "保留的应是尾部内容（含最后追加的换行）");
         assert!(!j.output.contains('b'), "被裁剪的头部不应残留");
         assert!(j.output.starts_with('a'), "保留的应是后写入的尾部块");
+    }
+
+    #[test]
+    fn finish_is_idempotent_and_status_transitions() {
+        let job = Arc::new(Mutex::new(Job {
+            conversation_id: "c".into(),
+            command: "x".into(),
+            cwd: PathBuf::from("."),
+            pid: None,
+            output: String::new(),
+            status: JobStatus::Running,
+            ok: false,
+            summary: None,
+        }));
+        assert_eq!(job.lock().unwrap().status.as_str(), "running");
+        // kill 先置 stopping：job_list 立即反映终止意图，且收尾前状态可查
+        mark_stopping(&job);
+        assert_eq!(job.lock().unwrap().status.as_str(), "stopping");
+        // finish 幂等：kill 已写摘要后，收尾竞争写入不得覆盖
+        finish_job(&job, false, "已被 job_kill 终止".into());
+        finish_job(&job, true, "命令执行成功".into());
+        let j = job.lock().unwrap();
+        assert_eq!(j.status.as_str(), "finished");
+        assert!(!j.ok, "幂等：已结束任务的 ok 不被后续覆盖");
+        assert_eq!(j.summary.as_deref(), Some("已被 job_kill 终止"));
     }
 }

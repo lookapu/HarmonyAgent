@@ -211,9 +211,10 @@ export function EditMessageDialog({
   const [value, setValue] = useState(message.content)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   useEffect(() => {
+    // value 初始值即 message.content，挂载时用初始长度定位光标即可（message 在本弹窗生命周期内不变）
     inputRef.current?.focus()
-    inputRef.current?.setSelectionRange(value.length, value.length)
-  }, [])
+    inputRef.current?.setSelectionRange(message.content.length, message.content.length)
+  }, [message.content.length])
   return (
     <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
       <div className="w-[560px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">

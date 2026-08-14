@@ -705,10 +705,14 @@ pub fn read_sdk_api_module(
     let env = detect(&state);
     let dir = default_api_dir(&env).ok_or_else(|| "未找到 SDK 的 ets/api 目录".to_string())?;
     // 防目录穿越：只取文件名部分
-    let fname = Path::new(&module)
+    let mut fname = Path::new(&module)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or(module);
+    // 模块名不带后缀：补 .d.ts（与 agent 侧读取口径一致，如 @ohos.abilityAccessCtrl → @ohos.abilityAccessCtrl.d.ts）
+    if !fname.ends_with(".d.ts") {
+        fname.push_str(".d.ts");
+    }
     let path = PathBuf::from(&dir).join(&fname);
     if !path.is_file() {
         return Err(format!("未找到声明文件：{fname}"));

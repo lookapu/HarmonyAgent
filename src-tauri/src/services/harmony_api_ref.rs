@@ -730,7 +730,7 @@ fn strip_html_tags(s: &str) -> String {
 ///   ...
 ///   本模块首批接口从API version 6开始支持。
 ///   #### 导入模块
-///   ```
+///   ```arkts
 ///   import {batteryInfo} from '@kit.BasicServicesKit';
 ///   ```
 ///   系统能力：SystemCapability.PowerManager.BatteryManager.Core

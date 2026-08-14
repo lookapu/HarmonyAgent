@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listMcpServers, addMcpServer, updateMcpServer, testMcpServer, toggleMcpServer, removeMcpServer, cloneMcpServer, exportMcpConfig, importMcpConfig, fetchMcpFromUrl, type McpServer, type CreateMcpInput, type McpDraft } from '../api/mcp'
 import { mcpTemplates, matchMcpTemplate, templateEnvDefaults, type McpTemplate } from '../data/mcpTemplates'
@@ -60,7 +60,8 @@ export default function McpPage() {
   const [drafts, setDrafts] = useState<McpDraft[] | null>(null)
   const [fetchError, setFetchError] = useState<string | null>(null)
 
-  const load = async () => {
+  // useCallback 稳定引用：projectId 变化时 load 重建触发 effect，避免每次渲染重复加载
+  const load = useCallback(async () => {
     try {
       // 加载全局 + 当前项目，前端按作用域 tab 过滤展示
       const list = await listMcpServers(projectId)
@@ -68,9 +69,9 @@ export default function McpPage() {
     } catch (e) {
       console.error(e)
     }
-  }
+  }, [projectId])
 
-  useEffect(() => { load() }, [projectId])
+  useEffect(() => { load() }, [load])
 
   const visibleServers = useMemo(
     () => servers.filter((s) => effectiveScope === 'global' ? !s.project_id : s.project_id === projectId),

@@ -289,10 +289,12 @@ pub(super) fn job_list_tool(_args: &Value, conversation_id: &str) -> Result<Stri
     }
     let mut out = format!("后台任务（{} 个）：\n", jobs.len());
     for j in &jobs {
-        let status = if j.finished {
-            if j.ok { "✓ 完成" } else { "✗ 失败" }
-        } else {
-            "⏳ 运行中"
+        let status = match j.status.as_str() {
+            "stopping" => "⏹ 停止中",
+            "finished" => {
+                if j.ok { "✓ 完成" } else { "✗ 失败" }
+            }
+            _ => "⏳ 运行中",
         };
         out.push_str(&format!(
             "- [{status}] {} | 输出 {} 字符 | 命令：{}\n",

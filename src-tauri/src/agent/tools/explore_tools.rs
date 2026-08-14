@@ -474,7 +474,8 @@ pub(super) fn search_api(args: &Value, db: &crate::db::DbState) -> Result<String
         change_type: args["change_type"].as_str().map(|s| s.to_string()),
         limit: Some((args["limit"].as_u64().unwrap_or(50) as usize).min(200)),
     };
-    let entries = crate::services::harmony_api_diff::search(&conn, &query)?;
+    // 向量增强块会按 RRF 融合结果重排 entries（见下），故声明为可变
+    let mut entries = crate::services::harmony_api_diff::search(&conn, &query)?;
     // 向量增强：有 keyword 时用语义向量召回与关键词命中做 RRF 融合重排，
     // 让"语义相关但无字面命中"的 API 也能浮上来；向量索引/模型不可用时自动降级为纯关键词结果。
     // 注意：依赖 candle 的 vector_search 仅在 embedding feature 下可用（见 embedding 模块说明），

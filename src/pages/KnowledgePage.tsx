@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import Icon from '../icons/Icon'
 import { useProjectStore } from '../stores/projectStore'
@@ -29,14 +29,15 @@ export default function KnowledgePage() {
 
   const scopeProjectId = effectiveScope === 'project' ? projectId : null
 
-  const load = async () => {
+  // useCallback 稳定引用：scope 变化时 load 重建触发 effect，避免每次渲染重复加载
+  const load = useCallback(async () => {
     try {
       setEntries(await listKnowledge(scopeProjectId))
     } catch (e) {
       console.error(e)
     }
-  }
-  useEffect(() => { load() }, [scopeProjectId])
+  }, [scopeProjectId])
+  useEffect(() => { load() }, [load])
 
   const resetForm = () => {
     setForm(emptyForm)

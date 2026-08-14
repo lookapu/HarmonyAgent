@@ -136,6 +136,57 @@
 
 **验收**：模型启动后台构建后可继续执行其他步骤；任务完成提示自动出现在下一轮对话。
 
+### 9. 工具并发调度（只读并行池 + 模型序提交）✅
+
+**目标**（对齐 deepseek-harness maxParallelToolCalls）：一轮内连续只读工具（L0）并行执行，写工具串行 barrier，减少多步读文件的串行等待。
+
+**方案**（已完成）：
+- `MAX_TOOL_CONCURRENCY=4` 有界并行池：主循环把连续 L0 工具收集到 pending 批次，满 4 或遇写工具时 `run_tool_batch` 按 chunks + join_all 并行派发，结果保序
+- `is_concurrency_safe`：L0 + 非交互类工具（ask_user/审批/进度类除外）才入池
+- 关键简化：主循环工具结果不走 messages 而是 tool_runs（下一轮请求组装时统一注入）→ 批次函数全不可变借用，无需共享 &mut
+- 拦截语义并发降级对齐 dsh“drain 已启动调用”：批次内拦截工具不执行，已派发工具照常完成，收集后 Budget/Blacklist 请求最终总结再终止；批次间检查用户停止
+
+**验收**：多文件读取轮次耗时显著下降；工具结果顺序与模型标记序一致；拦截/停止语义与串行路径一致。
+
+### 10. LLM 录制/重放（llm-replay）✅
+
+**目标**（对齐 dsh llm-replay）：无 key 回归 agent 行为——录制真实响应后重放，测试不依赖网络/余额。
+
+**方案**（已完成）：
+- `services/llm_replay.rs`：环境变量 `DEVS_LLM_REPLAY=record:dir|replay:dir`；指纹 = model + 消息序列 SHA-256 前 8 字节 hex（消息含工具结果逐轮不同 → 轮级精确匹配）
+- 录制：流式响应存原始 SSE 文本流（含 reasoning delta），重放经 `replay_sse_response` 包装为 reqwest::Response 走完整解析路径；非流式（子 Agent）存最终文本；仅正常结束路径落盘
+- 重放 fail-closed：未命中报错且不重试，避免回归测试静默打到真实 API；同 key 重复录制取最新一条
+
+**验收**：record 模式跑真实任务后，replay 模式同对话/同模型可无网络复现全部轮次。
+
+### 11. jobs 状态机升级（stopping 态 + 幂等收尾）✅
+
+**目标**（对齐 dsh job 生命周期）：kill 与正常收尾竞争时不再互相覆盖状态。
+
+**方案**（已完成）：
+- `JobStatus` 三态（Running/Stopping/Finished）：kill 先 mark_stopping 再杀进程树，超时分支同样先标记
+- `finish_job` 幂等（Finished 后不重复写）；最终摘要从 job 记录读取，防 kill 摘要被退出码覆盖
+- `job_list` 展示 “⏹ 停止中”；JobInfo 保留 finished 字段兼容前端
+
+**验收**：kill 后状态短暂为 stopping、最终 finished；kill 与 wait 并发收尾不丢摘要。
+
+### 12. 自动压缩触发（context 压力阈值）✅
+
+**目标**（对齐 dsh pressure 触发）：上下文压力达阈值自动滚动摘要，不靠超限报错被动触发。
+
+**结论**：**已存在，无需改动**——主循环已实现 85% 预算阈值自动 `summarize_rolling_history` + 保留最近 N 条 + chat-compact 事件 + compact_keep 持久化，且 ContextOverflow 仍可自动恢复（见改进项 1）。
+
+### 13. subagent 委派约束（toolFilter + maxDepth + persona）✅
+
+**目标**（对齐 dsh 委派三件套）：子 Agent 不再全量继承工具——越权/嵌套滥用由代码级约束。
+
+**方案**（已完成）：
+- `SubAgentLimits` 三件套：tool_filter（工具白名单）/ max_depth（可再委派层数）/ persona（角色约束），spawn_agents 顶层与 agents[] 逐任务均可指定，深度缺省继承调用方剩余-1
+- 双重生效：系统提示注入（模型自省）+ 子 Agent 工具循环执行前过滤（白名单外工具跳过并注入说明继续）；嵌套 spawn 深度为 0 时直接拒绝
+- `ToolCtx.spawn_remaining` 沿委派链递减（主 Agent=1）；run_spawn_agents 入口检查深度上限
+
+**验收**：子 Agent 调用白名单外工具被跳过；嵌套委派超限被拒；persona 出现在子 Agent 系统提示。
+
 ---
 
 ## 三、实施顺序
@@ -146,3 +197,4 @@
 | 第二批（后端，中风险） | 3 记忆相关性 + 4 replan 档 + 5 敏感文件保护 | ✅ |
 | 第三批（前端） | 6 任务进度清单 | ✅ |
 | 第四批（执行循环改造） | 7 流水线钩子 + 8 后台任务协议 | ✅ |
+| 第五批（dsh 借鉴） | 9 并发调度 + 10 llm-replay + 11 jobs 状态机 + 12 压缩阈值（已存在）+ 13 subagent 约束 | ✅ |

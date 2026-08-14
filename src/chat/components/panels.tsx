@@ -450,12 +450,13 @@ export function TerminalPanel({
     return () => clearInterval(timer)
   }, [entries])
   // 新条目追加/运行中输出增长时自动滚动到底部，追踪最新执行输出
+  const lastEntry = filteredEntries[filteredEntries.length - 1]
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [
     filteredEntries.length,
-    filteredEntries[filteredEntries.length - 1]?.status,
-    filteredEntries[filteredEntries.length - 1]?.liveOutput?.length,
+    lastEntry?.status,
+    lastEntry?.liveOutput?.length,
     filteredBuild.length,
     tab,
   ])

@@ -1,3 +1,5 @@
+/* eslint-disable no-control-regex */
+// ANSI 转义序列解析是本文件核心功能，正则中控制字符（\x1b）为功能必需
 import { Fragment, type ReactNode } from 'react'
 
 /**
@@ -168,7 +170,7 @@ export function AnsiText({ text, className }: { text: string; className?: string
     last = m.index + m[0].length
   }
   if (last < cleaned.length) {
-    parts.push(run(cleaned.slice(last), style, key++))
+    parts.push(run(cleaned.slice(last), style, key))
   }
   return <span className={className}>{parts.length === 0 ? text : parts}</span>
 }

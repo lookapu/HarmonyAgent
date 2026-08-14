@@ -26,6 +26,8 @@ export default function VersionsPage() {
     setLoading(false)
   }
 
+  // 挂载时加载一次：函数引用每次渲染变化属预期，不加入依赖避免重复请求
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load() }, [])
 
   const handleInstall = async (version: string) => {

@@ -185,6 +185,8 @@ export default function HealthPage() {
       setLtsMsg(t('health.ltsQueryFailed', { err: String(e) }))
     }
   }
+  // 挂载时加载一次：函数引用每次渲染变化属预期，不加入依赖避免重复请求
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { loadNodeRuntime() }, [])
 
   const loadGitRuntime = async () => {
@@ -201,6 +203,8 @@ export default function HealthPage() {
       setGitLatest(null)
     }
   }
+  // 挂载时加载一次：函数引用每次渲染变化属预期，不加入依赖避免重复请求
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { loadGitRuntime() }, [])
 
   const loadJdkRuntime = async () => {
@@ -224,6 +228,8 @@ export default function HealthPage() {
       setJdkUpdates({})
     }
   }
+  // 挂载时加载一次：函数引用每次渲染变化属预期，不加入依赖避免重复请求
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { loadJdkRuntime() }, [])
 
   // 监听 Node / Git 运行时升级进度事件（与 JDK 共用 RuntimeProgressBar 展示）
@@ -525,7 +531,7 @@ export default function HealthPage() {
   }
 
   /** 为指定工具选择文件夹：把选中的目录追加到自定义工具链列表并重新检测 */
-  const pickDirectoryFor = async (_name: string) => {
+  const pickDirectoryFor = async () => {
     try {
       const picked = await open({ directory: true })
       if (!picked) return
@@ -633,6 +639,8 @@ export default function HealthPage() {
     setLoading(false)
   }
 
+  // 挂载时加载一次：函数引用每次渲染变化属预期，不加入依赖避免重复请求
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load() }, [])
 
   const statusColor = (status: string) => {
@@ -1466,7 +1474,7 @@ export default function HealthPage() {
                       <button
                         onClick={() => {
                           setCandMenu(null)
-                          pickDirectoryFor(c.name)
+                          pickDirectoryFor()
                         }}
                         className="w-full text-left px-3 py-2 text-xs text-[var(--accent)] hover:bg-[var(--bg-hover)] border-t border-[var(--border)] transition-colors"
                       >

@@ -261,8 +261,7 @@ function normalizeSegment(text: string): string {
 
   const lines = out.split('\n')
   const result: string[] = []
-  let blankStreak = 0
-  for (let raw of lines) {
+  for (const raw of lines) {
     let line = raw
     // 标题：#后无空格 → 补空格（最多6级）
     line = line.replace(/^(#{1,6})(?=\S)/, '$1 ')
@@ -280,12 +279,6 @@ function normalizeSegment(text: string): string {
     line = line.replace(/^(\s*)(\d{1,2})[、．)]\s*/, (_m, indent: string, n: string) => `${indent}${n}. `)
 
     result.push(line)
-
-    if (line.trim() === '') {
-      blankStreak++
-    } else {
-      blankStreak = 0
-    }
   }
   out = result.join('\n')
 
@@ -305,7 +298,8 @@ function normalizeSegment(text: string): string {
     },
   )
 
-  // 还原行内代码
+  // 还原行内代码（\u0000 为占位符，用于避免行内代码内容被后续转换误伤）
+  // eslint-disable-next-line no-control-regex
   out = out.replace(/\u0000ICODE(\d+)\u0000/g, (_m, i: string) => inlineCodes[Number(i)] ?? '')
   return out
 }

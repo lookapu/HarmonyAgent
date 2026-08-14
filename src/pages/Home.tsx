@@ -351,11 +351,12 @@ export default function Home() {
   // 工具审批弹窗：选择记忆范围（空=仅本次；session=本会话免审；project=本项目持久化免审）；拒绝理由反馈给模型
   const [approvalScope, setApprovalScope] = useState<'' | 'session' | 'project'>('')
   const [approvalFeedback, setApprovalFeedback] = useState('')
+  // 审批队列首项 ID：切换时重置选择与理由（每个工具独立决策）
+  const firstApprovalRequestId = toolApprovals[0]?.requestId
   useEffect(() => {
-    // 审批队列切换时重置选择与理由（每个工具独立决策）
     setApprovalScope('')
     setApprovalFeedback('')
-  }, [toolApprovals[0]?.requestId])
+  }, [firstApprovalRequestId])
   // 工具风险分级展示：L0 只读=绿 / L1 写入=橙 / L2 危险=红
   const approvalRisk = (tool: string): { label: string; cls: string } => {
     if (/^(bash|exec|run_command|delete_|remove_|spawn_agents|git_push|publish|deploy|format_)/.test(tool)) {
@@ -375,27 +376,29 @@ export default function Home() {
       setPlanEditing(false)
       setPlanFeedback('')
     }
-  }, [pendingPlan?.requestId])
+  }, [pendingPlan])
   // Agent 提问卡：新问题到来时重置回答输入
   const [askAnswer, setAskAnswer] = useState('')
   useEffect(() => {
     if (askCard) setAskAnswer('')
-  }, [askCard?.requestId])
+  }, [askCard])
   // 上下文可视条：消息数 + 摘要状态 + token 预算占用（切换会话/收到新消息后刷新）
   const [ctxInfo, setCtxInfo] = useState<ConversationContextInfo | null>(null)
+  // 当前会话 ID：上下文可视条刷新依赖（避免 effect 内直接引用会话对象）
+  const convId = currentConversation?.id
   useEffect(() => {
-    if (!currentConversation) {
+    if (!convId) {
       setCtxInfo(null)
       return
     }
     let cancelled = false
-    getConversationContext(currentConversation.id)
+    getConversationContext(convId)
       .then((info) => !cancelled && setCtxInfo(info))
       .catch(() => {})
     return () => {
       cancelled = true
     }
-  }, [currentConversation?.id, messages.length, modelOptions.model_id])
+  }, [convId, messages.length, modelOptions.model_id])
   // 会话跟随模型：切换会话时恢复该会话绑定的模型（未绑定的会话保持当前全局选择）
   useEffect(() => {
     if (currentConversation?.model_id) {
@@ -410,8 +413,10 @@ export default function Home() {
   }, [currentConversation?.id])
   // 项目目录监视：外部工具（IDE/编辑器/其他进程）修改文件时，节流刷新文件树与 Git 面板，
   // 让界面实时感知项目变化（Agent 执行工具产生的修改同样感知；构建产物目录已过滤）
+  // 当前项目路径：目录监视与后续依赖使用（避免 effect 内直接引用项目对象）
+  const projectPath = currentProject?.path
   useEffect(() => {
-    if (!currentProject?.path) return
+    if (!projectPath) return
     let cancelled = false
     let unwatch: (() => void) | undefined
     let lastRefresh = 0
@@ -421,7 +426,7 @@ export default function Home() {
       return IGNORE_SEG.some((s) => lower.includes(`/${s}/`) || lower.includes(`\\${s}\\`))
     }
     watch(
-      currentProject.path,
+      projectPath,
       (event) => {
         if (cancelled) return
         const paths = event.paths ?? []
@@ -445,7 +450,7 @@ export default function Home() {
       cancelled = true
       unwatch?.()
     }
-  }, [currentProject?.id])
+  }, [projectPath])
   // 排队中消息列表：消息/任务状态变化时刷新（任务结束后排队消息被消费清空）
   const [queuedOpen, setQueuedOpen] = useState(false)
   useEffect(() => {
@@ -786,7 +791,6 @@ export default function Home() {
     if (stickToBottomRef.current && streamingActive) {
       rafScrollToBottom()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [streamingLen, streamingActive, toolRuns.length, agentRuns.length])
 
   // 组件卸载时清理 rAF
@@ -1351,11 +1355,13 @@ export default function Home() {
 
   /** 符号索引预热：项目切换/启动后在后台线程池预热（磁盘缓存命中 + 增量校正），
    *  让符号面板与首轮对话构建工程概要时秒出结果；静默执行不阻塞界面。 */
+  // 当前项目 ID/类型：符号索引预热触发条件（避免 effect 内直接引用项目对象）
+  const projectId = currentProject?.id
+  const projectKind = currentProject?.kind
   useEffect(() => {
-    if (!currentProject || currentProject.kind === 'global') return
-    const pid = currentProject.id
-    warmupSymbolIndex(pid).catch(() => {})
-  }, [currentProject?.id])
+    if (!projectId || projectKind === 'global') return
+    warmupSymbolIndex(projectId).catch(() => {})
+  }, [projectId, projectKind])
 
   /** 自动补扫：旧项目（添加时未做工作区扫描）或新添加项目模块为空时，
    *  在后台异步扫描一次，不阻塞界面；扫描完成后刷新列表以更新类型标签与模块卡。 */
@@ -1957,7 +1963,7 @@ export default function Home() {
 
   // 概览面板：切换到 overview 时刷新最近任务（task_runs 明细）
   useEffect(() => {
-    if (rightTab === 'overview' && currentProject) void loadRecentRuns()
+    if (rightTab === 'overview' && currentProject?.id) void loadRecentRuns()
   }, [rightTab, currentProject?.id, loadRecentRuns])
 
   // 当前选择的模型标签（输入区按钮展示，默认跟随 Provider）
@@ -4622,5 +4628,7 @@ const settingsItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/proxy', labelKey: 'nav.proxy', icon: 'proxy' },
   { path: '/mcp', labelKey: 'nav.mcp', icon: 'mcp' },
   { path: '/skills', labelKey: 'nav.skill', icon: 'skill' },
+  { path: '/knowledge', labelKey: 'nav.knowledge', icon: 'skill' },
+  { path: '/api-knowledge', labelKey: 'nav.apiKnowledge', icon: 'package' },
   { path: '/health', labelKey: 'nav.health', icon: 'health' },
 ]

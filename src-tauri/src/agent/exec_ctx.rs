@@ -79,16 +79,18 @@ pub struct ToolCtx {
     pub app: Option<AppHandle>,
     /// 当前会话 id（事件 payload 中带回，前端按会话过滤）
     pub conversation_id: String,
+    /// 还可再委派子 Agent 的层数（防无限嵌套；主 Agent=1，子 Agent 由委派约束决定）
+    pub spawn_remaining: usize,
 }
 
 impl ToolCtx {
     pub fn new(app: AppHandle, conversation_id: String) -> Self {
-        Self { app: Some(app), conversation_id }
+        Self { app: Some(app), conversation_id, spawn_remaining: 1 }
     }
 
     #[allow(dead_code)]
     pub fn empty() -> Self {
-        Self { app: None, conversation_id: String::new() }
+        Self { app: None, conversation_id: String::new(), spawn_remaining: 0 }
     }
 
     /// 推送一行流式日志到前端。失败静默（日志推送不应中断工具执行）。

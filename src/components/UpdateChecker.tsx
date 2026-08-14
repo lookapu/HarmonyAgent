@@ -14,11 +14,6 @@ export default function UpdateChecker() {
   const [baseUpdate, setBaseUpdate] = useState<{ current: string; latest: string } | null>(null)
   const [baseDismissed, setBaseDismissed] = useState(false)
 
-  useEffect(() => {
-    checkForUpdate()
-    checkBase()
-  }, [])
-
   const checkForUpdate = async () => {
     try {
       const update = await withProxy(checkWithProxy)
@@ -42,6 +37,11 @@ export default function UpdateChecker() {
       console.debug('Base update check failed:', e)
     }
   }
+
+  useEffect(() => {
+    checkForUpdate()
+    checkBase()
+  }, [])
 
   const handleUpdate = async () => {
     setDownloading(true)

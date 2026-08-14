@@ -430,6 +430,255 @@ pub(super) fn glob_match(pattern: &str, text: &str) -> bool {
     m(&p, &t)
 }
 
+/// 单目录最多展示条目数：超出折叠为一行汇总，避免静态资源/生成物把输出刷爆后整体截断（截断对模型无用）
+const DIR_SHOW_MAX: usize = 30;
+/// . 开头目录白名单（默认隐藏目录全部跳过，仅保留对 AI 有用的）
+const HIDDEN_ALLOW: [&str; 1] = [".github"];
+/// 单壳目录穿透预算：只有单个子目录且无文件的目录链（如 entry/src/main/ets）自动展开，不消耗 depth
+const SHELL_PENETRATE_MAX: usize = 3;
+
+/// .gitignore 规则（简化子集：! 取反、结尾 / 仅目录、/ 开头锚定根、含 / 按相对路径匹配，否则按条目名匹配任意层级）
+#[derive(Clone)]
+struct IgnoreRule {
+    pattern: String,
+    negate: bool,
+    dir_only: bool,
+    anchored: bool,
+    /// 规则基准：相对项目根的目录（如 "entry"，规则仅作用于该目录及以下）；空 = 项目根
+    base: String,
+}
+
+/// 解析 .gitignore：仅支持本项目需要的子集（完整 git 语义过于复杂，够用即可）
+fn parse_gitignore(content: &str) -> Vec<IgnoreRule> {
+    parse_gitignore_at(content, "")
+}
+
+/// 解析某子目录下的 .gitignore：规则以 base（相对项目根）为基准
+fn parse_gitignore_at(content: &str, base: &str) -> Vec<IgnoreRule> {
+    let mut rules = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut pat = line;
+        let mut negate = false;
+        if let Some(rest) = pat.strip_prefix('!') {
+            negate = true;
+            pat = rest;
+        }
+        if pat.is_empty() {
+            continue;
+        }
+        let dir_only = pat.ends_with('/');
+        if dir_only {
+            pat = pat.trim_end_matches('/');
+        }
+        // / 开头：锚定到规则所在目录（按相对路径匹配，防止 "/build" 误伤子层同名目录）
+        let anchored = pat.starts_with('/');
+        if anchored {
+            pat = pat.trim_start_matches('/');
+        }
+        if pat.is_empty() {
+            continue;
+        }
+        rules.push(IgnoreRule {
+            pattern: pat.to_string(),
+            negate,
+            dir_only,
+            anchored,
+            base: base.to_string(),
+        });
+    }
+    rules
+}
+
+/// 相对路径与规则基准的关系：base 为空 → 全匹配；否则 rel 必须是 base 自身或 base 的子路径
+/// （子目录 .gitignore 只作用于其目录及以下；返回剥离基准后的相对路径用于匹配）
+fn rel_vs_base<'a>(rel: &'a str, base: &str) -> Option<&'a str> {
+    if base.is_empty() {
+        return Some(rel);
+    }
+    if rel == base {
+        return Some("");
+    }
+    rel.strip_prefix(base).and_then(|rest| rest.strip_prefix('/'))
+}
+
+/// 判断条目是否被 gitignore 规则忽略（后置规则覆盖前置；目录与文件共用条目名匹配）
+fn gitignore_ignored(rules: &[IgnoreRule], name: &str, rel: &str, is_dir: bool) -> bool {
+    let mut ignored = false;
+    for r in rules {
+        if r.dir_only && !is_dir {
+            continue;
+        }
+        // 子目录规则先验基准：不在 base 子树内的条目直接跳过
+        let Some(eff_rel) = rel_vs_base(rel, &r.base) else { continue };
+        // 锚定或含 / 的规则按相对路径匹配，否则按条目名匹配（任意层级）
+        let hit = if r.anchored || r.pattern.contains('/') {
+            glob_match(&r.pattern, eff_rel)
+        } else {
+            glob_match(&r.pattern, name)
+        };
+        if hit {
+            ignored = !r.negate;
+        }
+    }
+    ignored
+}
+
+/// 查找包含 root 的项目根（roots 中首个包含者），加载其 .gitignore 规则；
+/// 返回 (规则, root 相对项目根的路径，作为相对路径匹配基准)
+fn load_project_ignore(root: &Path, roots: &[String]) -> (Vec<IgnoreRule>, String) {
+    let mut proj_root: Option<PathBuf> = None;
+    for r in roots {
+        let Ok(rc) = std::fs::canonicalize(r) else { continue };
+        // canonicalize 在 Windows 带 \?\ 前缀，与 resolve_in_roots 返回的规范化路径不一致，
+        // 不归一化会导致 path_within 字符串比较失败 → gitignore 规则静默失效
+        let rc = PathBuf::from(crate::utils::path::normalize_path(&rc.to_string_lossy()));
+        if crate::utils::path::path_within(root, &rc) {
+            proj_root = Some(rc);
+            break;
+        }
+    }
+    let mut rules = Vec::new();
+    if let Some(pr) = &proj_root {
+        if let Ok(content) = std::fs::read_to_string(pr.join(".gitignore")) {
+            rules = parse_gitignore(&content);
+        }
+    }
+    let start_rel = proj_root
+        .as_ref()
+        .and_then(|pr| root.strip_prefix(pr).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    (rules, start_rel)
+}
+
+/// 子目录 .gitignore 合并：本目录的规则以 rel 为基准，只对其子树生效，与父规则合并后向下传递
+fn load_child_rules(rules: &[IgnoreRule], dir: &Path, rel: &str) -> Vec<IgnoreRule> {
+    if rel.is_empty() {
+        return rules.to_vec();
+    }
+    match std::fs::read_to_string(dir.join(".gitignore")) {
+        Ok(content) => {
+            let mut v = rules.to_vec();
+            v.extend(parse_gitignore_at(&content, rel));
+            v
+        }
+        Err(_) => rules.to_vec(),
+    }
+}
+
+/// 注释折叠阈值：连续注释行达到该值才折叠为一行摘要（短注释块信息密度高，保留原文）
+const COMMENT_FOLD_MIN: usize = 8;
+
+/// 代码语言扩展名（注释识别/折叠只对代码生效；文本/数据文件如 .md 的 # 是标题、.json 无注释，误伤代价高）
+fn is_code_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "ets" | "ts" | "tsx" | "js" | "jsx" | "rs" | "py" | "java" | "kt" | "swift"
+            | "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "go" | "sql" | "lua"
+            | "sh" | "bash" | "bat" | "cmd" | "ps1" | "css" | "scss" | "less"
+            | "vue" | "svelte" | "php" | "rb" | "cs" | "dart" | "m" | "mm"
+    )
+}
+
+/// 判断某行是否为注释行（C 系 // /* */ *，Python/Shell #，SQL/Lua --）
+fn is_comment_line(line: &str, ext: &str) -> bool {
+    if !is_code_ext(ext) {
+        return false;
+    }
+    let t = line.trim_start();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with("*/") {
+        return true;
+    }
+    if (ext == "py" || ext == "sh" || ext == "bash" || ext == "ps1" || ext == "rb")
+        && t.starts_with('#')
+    {
+        return true;
+    }
+    if (ext == "sql" || ext == "lua") && t.starts_with("--") {
+        return true;
+    }
+    false
+}
+
+/// 低价值文件聚合：扩展名 → 类别（这类文件逐条列出对理解结构无益，按类别汇总一行即可）
+fn agg_category(name: &str) -> Option<&'static str> {
+    const EXT: &[(&str, &str)] = &[
+        ("png", "图片"), ("jpg", "图片"), ("jpeg", "图片"), ("gif", "图片"),
+        ("webp", "图片"), ("svg", "图片"), ("ico", "图片"), ("bmp", "图片"),
+        ("avif", "图片"), ("heic", "图片"),
+        ("ttf", "字体"), ("otf", "字体"), ("woff", "字体"), ("woff2", "字体"), ("eot", "字体"),
+        ("mp3", "媒体"), ("mp4", "媒体"), ("avi", "媒体"), ("mkv", "媒体"),
+        ("mov", "媒体"), ("wav", "媒体"), ("flac", "媒体"), ("webm", "媒体"),
+        ("zip", "压缩包"), ("rar", "压缩包"), ("7z", "压缩包"), ("tar", "压缩包"),
+        ("gz", "压缩包"), ("jar", "压缩包"), ("har", "压缩包"),
+        ("bin", "二进制"), ("exe", "二进制"), ("dll", "二进制"), ("so", "二进制"),
+        ("apk", "安装包"), ("hap", "安装包"), ("hsp", "安装包"),
+        ("db", "数据库"), ("sqlite", "数据库"), ("sqlite3", "数据库"),
+        ("log", "日志"), ("map", "构建产物"),
+    ];
+    let lower = name.to_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    EXT.iter().find(|(e, _)| *e == ext).map(|(_, c)| *c)
+}
+
+/// 标志文件（★ 标注：配置/清单/说明类，帮模型快速定位关键文件）
+fn is_mark_file(name: &str) -> bool {
+    matches!(
+        name,
+        "pom.xml" | "package.json" | "build-profile.json5" | "oh-package.json5"
+            | "Cargo.toml" | "go.mod" | "build.gradle" | "build.gradle.kts"
+            | "settings.gradle" | "settings.gradle.kts" | "pyproject.toml"
+            | "requirements.txt" | "README.md" | "AGENTS.md" | ".gitignore"
+            | "hvigorfile.ts" | "hvigorfile.js" | "tsconfig.json" | "vite.config.ts"
+            | "vite.config.js" | "webpack.config.js" | "Dockerfile" | "docker-compose.yml"
+    )
+}
+
+/// 项目类型探测：根目录标志文件（HarmonyOS 优先，避免与 Node 误判）
+fn detect_project_type(root: &Path) -> Option<(String, String)> {
+    const MARKS: &[(&str, &str)] = &[
+        ("HarmonyOS 工程（DevEco）", "build-profile.json5"),
+        ("Java 工程（Maven）", "pom.xml"),
+        ("Gradle 工程", "build.gradle"),
+        ("Node.js 工程", "package.json"),
+        ("Rust 工程（Cargo）", "Cargo.toml"),
+        ("Go 工程", "go.mod"),
+        ("Python 工程", "pyproject.toml"),
+    ];
+    for (kind, mark) in MARKS {
+        if root.join(mark).is_file() {
+            return Some((kind.to_string(), mark.to_string()));
+        }
+    }
+    // .NET 工程以解决方案/项目文件命名（无法用固定文件名，扫一级）
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.ends_with(".sln") || n.ends_with(".csproj") {
+                return Some((".NET 工程".to_string(), n));
+            }
+        }
+    }
+    None
+}
+
+/// 目录浏览统计（跨层累计）
+#[derive(Default)]
+struct ListStats {
+    dirs: usize,
+    files: usize,
+    bytes: u64,
+    /// 聚合类别 → (数量, 字节)
+    agg: std::collections::BTreeMap<&'static str, (usize, u64)>,
+}
+
 pub(super) async fn list_dir(args: &Value, roots: &[String]) -> Result<String, String> {
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法浏览文件".into());
@@ -440,62 +689,228 @@ pub(super) async fn list_dir(args: &Value, roots: &[String]) -> Result<String, S
     if !root.is_dir() {
         return Err(format!("路径不是目录: {}", root.display()));
     }
+    // .gitignore 规则：项目根规则 + 浏览目标自身规则
+    // （root 非项目根时，其自身 .gitignore 由 walk 首层按子规则加载，基准为 root 自身，语义等价）
+    let (ignore_rules, start_rel) = load_project_ignore(&root, roots);
+
     let mut out = String::new();
+    // 浏览项目根时附带项目类型识别，帮助模型快速定位技术栈；
+    // Git 仓库提示：list_dir 只反映文件系统现状，查变更/历史应转用 git 工具（自 root 向上查找 .git）
+    let in_git = root.ancestors().any(|a| a.join(".git").exists());
+    if let Some((kind, mark)) = detect_project_type(&root) {
+        let hint = if in_git {
+            "；目录在 Git 仓库内，可用 git status 查变更、git log 查历史"
+        } else {
+            ""
+        };
+        out.push_str(&format!("（项目类型：{kind}，依据：{mark}{hint}）\n"));
+    } else if in_git {
+        out.push_str("（目录在 Git 仓库内，可用 git status 查变更、git log 查历史）\n");
+    }
     let mut skipped = 0u32;
+    let mut stats = ListStats::default();
     fn walk(
         dir: &Path,
+        rel: &str,
         depth: u32,
         max_depth: u32,
+        shell_left: usize,
+        chain: String,
+        rules: &[IgnoreRule],
+        stats: &mut ListStats,
         skipped: &mut u32,
         out: &mut String,
     ) -> Result<(), String> {
+        // 本目录的 .gitignore（多模块工程/子仓库常见）：规则只对其所在子树生效，
+        // 与父规则合并后向下传递（项目根已在外层加载，rel 为空时跳过）
+        let child_rules = load_child_rules(rules, dir, rel);
         let entries =
             std::fs::read_dir(dir).map_err(|e| format!("读取目录失败 {}: {e}", dir.display()))?;
         let mut items: Vec<(String, bool, u64, std::time::SystemTime)> = Vec::new();
+        let mut agg: std::collections::BTreeMap<&'static str, (usize, u64)> =
+            std::collections::BTreeMap::new();
+        let mut folded = 0usize; // 超出 DIR_SHOW_MAX 后折叠的条目数
+        let mut folded_dirs: Vec<String> = Vec::new(); // 被折叠的目录名（前几个，提示模型可继续深入）
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.is_dir() && should_skip_dir(&name) {
+            let Ok(ft) = e.file_type() else { continue };
+            let is_dir = ft.is_dir();
+            // 隐藏目录（. 开头，白名单除外）+ 已知忽略目录 + .gitignore 命中 → 跳过
+            // 注意：含 / 的规则（如 src/main/）按条目自身相对路径匹配，而不是父目录路径
+            let hidden =
+                is_dir && name.starts_with('.') && !HIDDEN_ALLOW.contains(&name.as_str());
+            let entry_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if hidden || should_skip_dir(&name)
+                || gitignore_ignored(&child_rules, &name, &entry_rel, is_dir)
+            {
                 *skipped += 1;
                 continue;
             }
-            items.push((
-                name,
-                meta.is_dir(),
-                meta.len(),
-                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-            ));
+            if is_dir {
+                stats.dirs += 1;
+                if items.len() < DIR_SHOW_MAX {
+                    items.push((name, true, 0, std::time::UNIX_EPOCH));
+                } else {
+                    folded += 1;
+                    if folded_dirs.len() < 5 {
+                        folded_dirs.push(name);
+                    }
+                }
+            } else if let Some(cat) = agg_category(&name) {
+                // 低价值文件：只聚合统计，不逐条列出（大图/字体/压缩包对结构理解无益）
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                let ent = agg.entry(cat).or_insert((0, 0));
+                ent.0 += 1;
+                ent.1 += size;
+                stats.files += 1;
+                stats.bytes += size;
+            } else if is_mark_file(&name) || items.len() < DIR_SHOW_MAX {
+                // 关键配置/清单文件（★）不受折叠限制：结构信息永远可见
+                let Ok(meta) = e.metadata() else { continue };
+                let size = meta.len();
+                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                stats.files += 1;
+                stats.bytes += size;
+                items.push((name, false, size, mtime));
+            } else {
+                folded += 1;
+                // 折叠文件也计入统计，保证汇总数字真实
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                stats.files += 1;
+                stats.bytes += size;
+            }
+        }
+        for (k, (n, sz)) in agg {
+            let ent = stats.agg.entry(k).or_insert((0, 0));
+            ent.0 += n;
+            ent.1 += sz;
+        }
+        // 单壳目录穿透：仅 1 个子目录且无文件/聚合/折叠时，合并路径继续深入（不消耗 depth）
+        if shell_left > 0 && items.len() == 1 && items[0].1 && folded == 0 {
+            let sub = items[0].0.clone();
+            let child_rel = if rel.is_empty() {
+                sub.clone()
+            } else {
+                format!("{rel}/{sub}")
+            };
+            // 先借用 sub 构造路径，再 move 进 new_chain（顺序敏感：sub 随后被转移）
+            let joined = dir.join(&sub);
+            let new_chain = if chain.is_empty() {
+                sub
+            } else {
+                format!("{chain}/{sub}")
+            };
+            return walk(
+                &joined,
+                &child_rel,
+                depth,
+                max_depth,
+                shell_left - 1,
+                new_chain,
+                &child_rules,
+                stats,
+                skipped,
+                out,
+            );
         }
         // 目录优先，同级按名称排序
         items.sort_by(|a, b| {
             b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
         });
         let indent = "  ".repeat(depth as usize);
-        for (name, is_dir, size, mtime) in items {
-            if is_dir {
-                out.push_str(&format!("{indent}[目录] {name}/\n"));
-                if depth < max_depth {
-                    walk(&dir.join(&name), depth + 1, max_depth, skipped, out)?;
+        for (name, is_dir, size, mtime) in &items {
+            if *is_dir {
+                let disp = if chain.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{chain}/{name}")
+                };
+                out.push_str(&format!("{indent}[目录] {disp}/\n"));
+                // 目录超限（folded>0）时结构不完整，不再深入，避免输出缺块误导模型
+                if depth < max_depth && folded == 0 {
+                    let child_rel = if rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel}/{name}")
+                    };
+                    walk(
+                        &dir.join(name),
+                        &child_rel,
+                        depth + 1,
+                        max_depth,
+                        SHELL_PENETRATE_MAX,
+                        String::new(),
+                        &child_rules,
+                        stats,
+                        skipped,
+                        out,
+                    )?;
                 }
             } else {
+                let star = if is_mark_file(name) { "★" } else { "" };
                 out.push_str(&format!(
-                    "{indent}[文件] {name}  {}  {}\n",
-                    human_size(size),
-                    fmt_time(mtime)
+                    "{indent}{star}[文件] {name}  {}  {}\n",
+                    human_size(*size),
+                    fmt_time(*mtime)
                 ));
             }
         }
+        if folded > 0 {
+            let dir_hint = if folded_dirs.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "（含目录：{} 等）",
+                    folded_dirs.iter().map(|d| format!("{d}/")).collect::<Vec<_>>().join("、")
+                )
+            };
+            out.push_str(&format!(
+                "{indent}…（该目录共 {} 项，其余 {folded} 项省略{dir_hint}；如需查看请直接对该目录再调 list_dir）\n",
+                items.len() + folded
+            ));
+        }
         Ok(())
     }
-    walk(&root, 0, depth, &mut skipped, &mut out)?;
+    walk(
+        &root,
+        &start_rel,
+        0,
+        depth,
+        SHELL_PENETRATE_MAX,
+        String::new(),
+        &ignore_rules,
+        &mut stats,
+        &mut skipped,
+        &mut out,
+    )?;
     if out.is_empty() {
         out.push_str("（空目录）\n");
     }
+    // 汇总：计数 + 聚合类别（低价值文件不逐条列出但明确告知，避免模型误以为目录里没有）
     out.push_str(&format!(
-        "（目录: {}，已跳过 {skipped} 个忽略目录 .git/node_modules/build 等）",
-        root.display()
+        "（目录: {}，共 {} 个文件、{} 个目录，总大小 {}；已跳过 {skipped} 个忽略项）\n",
+        root.display(),
+        stats.files,
+        stats.dirs,
+        human_size(stats.bytes)
     ));
-    Ok(truncate_out(&out))
+    if !stats.agg.is_empty() {
+        let parts: Vec<String> = stats
+            .agg
+            .iter()
+            .map(|(c, (n, sz))| format!("{c} {n} 个/{}", human_size(*sz)))
+            .collect();
+        out.push_str(&format!(
+            "（聚合未逐一列出：{}；如需查看请对该目录单独 list_dir）\n",
+            parts.join("、")
+        ));
+    }
+    // 保尾截断：统计汇总在尾部，超长时纯截头会让模型拿到残缺结构认知
+    Ok(truncate_out_head_tail(&out, 3000))
 }
 
 pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, String> {
@@ -605,9 +1020,49 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     let block_expanded = !block_note.is_empty();
     let char_budget = if block_expanded { BLOCK_CHARS } else { MAX_CHARS };
     let line_budget = if block_expanded { MAX_LINES * 2 } else { MAX_LINES };
+    // 注释清洗：文件注释占比高时，连续长注释块折叠为一行摘要。
+    // 痛点：license/文件头大段注释会吃掉字符预算，代码本身还没读到就被截断，
+    // 喂给模型的是一堆注释而看不到代码。短注释块信息密度高，保留原文。
+    let comment_ratio = if is_code_ext(&ext) {
+        lines.iter().filter(|l| is_comment_line(l, &ext)).count() as f64 / total.max(1) as f64
+    } else {
+        0.0
+    };
+    let mut folded_runs = 0usize; // 折叠的注释块数
+    let mut folded_lines = 0usize; // 折叠的注释总行数
+    fn flush_comment_buf(
+        out: &mut String,
+        buf: &[usize],
+        lines: &[&str],
+        shown_lines: &mut usize,
+        folded_runs: &mut usize,
+        folded_lines: &mut usize,
+    ) {
+        if buf.is_empty() {
+            return;
+        }
+        let run = buf.len();
+        if run >= COMMENT_FOLD_MIN {
+            let first = buf[0] + 1;
+            let last = buf[run - 1] + 1;
+            out.push_str(&format!(
+                "{first:>5} │ …(L{first}-L{last}：{run} 行注释已折叠；start={first}/lines={run} 可看原文)…\n"
+            ));
+            *folded_runs += 1;
+            *folded_lines += run;
+        } else {
+            // 短注释块：逐行展示
+            for abs in buf {
+                let s: String = lines[*abs].chars().take(240).collect();
+                out.push_str(&format!("{:>5} │ {s}\n", abs + 1));
+            }
+        }
+        *shown_lines += run;
+    }
     let mut out = String::new();
-    let mut shown_lines = 0usize; // 实际输出行数（截断时用于提示续读位置）
+    let mut shown_lines = 0usize; // 已展示的真实行数（截断时用于提示续读位置）
     let mut cut_block: Option<(usize, usize)> = None; // 字符/行数截断命中的块（用于完整区间提示）
+    let mut comment_buf: Vec<usize> = Vec::new(); // 累积的连续注释行（绝对行号）
     for (i, line) in lines[win_begin..win_end].iter().enumerate() {
         if i >= line_budget || out.chars().count() >= char_budget {
             // 命中预算：若窗口结束符仍不可见，记录截断处所在块，给出完整区间与结束符位置
@@ -617,10 +1072,34 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
             }
             break;
         }
+        let abs = win_begin + i;
+        // 注释行先累积（判断是否成块），代码行先 flush 注释块再输出
+        if comment_ratio > 0.35 && is_comment_line(line, &ext) {
+            comment_buf.push(abs);
+            continue;
+        }
+        flush_comment_buf(
+            &mut out,
+            &comment_buf,
+            &lines,
+            &mut shown_lines,
+            &mut folded_runs,
+            &mut folded_lines,
+        );
+        comment_buf.clear();
         let snippet: String = line.chars().take(240).collect();
-        out.push_str(&format!("{:>5} │ {snippet}\n", win_begin + i + 1));
+        out.push_str(&format!("{:>5} │ {snippet}\n", abs + 1));
         shown_lines += 1;
     }
+    // 窗口结尾的注释块同样处理
+    flush_comment_buf(
+        &mut out,
+        &comment_buf,
+        &lines,
+        &mut shown_lines,
+        &mut folded_runs,
+        &mut folded_lines,
+    );
     // 截断提示：优先给出“块没读完”的完整区间与结束符行号（防模型基于残缺片段编辑）；
     // 普通截断则告知已读到第几行、从哪继续。
     if shown_lines < win_end - win_begin {
@@ -648,9 +1127,23 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     if out.is_empty() {
         out.push_str("（文件为空或没有可显示的内容）\n");
     }
+    // 注释清洗提示：折叠发生时说明原文结构（模型可据此决定是否 outline 或精读注释区）
+    let comment_note = if folded_lines > 0 {
+        format!(
+            "（注释占 {:.0}%，长注释块已折叠 {folded_runs} 处/共 {folded_lines} 行；可用 outline=true 查看结构骨架）\n",
+            comment_ratio * 100.0
+        )
+    } else if comment_ratio >= 0.4 {
+        format!(
+            "（注释占 {:.0}%，文件注释较多；可用 outline=true 查看结构骨架）\n",
+            comment_ratio * 100.0
+        )
+    } else {
+        String::new()
+    };
     Ok(truncate_out_max(
         &format!(
-            "文件 {}{enc_note}（{}，共 {total} 行）：\n{block_note}{out}",
+            "文件 {}{enc_note}（{}，共 {total} 行）：\n{block_note}{comment_note}{out}",
             p.display(),
             human_size(meta.len())
         ),
@@ -1159,19 +1652,37 @@ pub(super) async fn find_files(args: &Value, roots: &[String]) -> Result<String,
     if !root.is_dir() {
         return Err(format!("路径不是目录: {}", root.display()));
     }
+    let (ignore_rules, start_rel) = load_project_ignore(&root, roots);
     let mut hits: Vec<PathBuf> = Vec::new();
     let mut skipped = 0u32;
-    fn walk(dir: &Path, root: &Path, pattern: &str, hits: &mut Vec<PathBuf>, skipped: &mut u32) {
+    fn walk(
+        dir: &Path,
+        root: &Path,
+        rel: &str,
+        rules: &[IgnoreRule],
+        pattern: &str,
+        hits: &mut Vec<PathBuf>,
+        skipped: &mut u32,
+    ) {
+        // 子目录 .gitignore（与 list_dir 同口径）
+        let child_rules = load_child_rules(rules, dir, rel);
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for e in entries.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
             if p.is_dir() {
-                if should_skip_dir(&name) {
+                let entry_rel = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if should_skip_dir(&name)
+                    || gitignore_ignored(&child_rules, &name, &entry_rel, true)
+                {
                     *skipped += 1;
                     continue;
                 }
-                walk(&p, root, pattern, hits, skipped);
+                walk(&p, root, &entry_rel, &child_rules, pattern, hits, skipped);
                 if hits.len() >= 100 {
                     return;
                 }
@@ -1190,7 +1701,9 @@ pub(super) async fn find_files(args: &Value, roots: &[String]) -> Result<String,
             }
         }
     }
-    walk(&root, &root, pattern, &mut hits, &mut skipped);
+    walk(&root, &root, &start_rel, &ignore_rules, pattern, &mut hits, &mut skipped);
+    // 排序：按路径字典序，同级目录聚拢、结果可预测（read_dir 顺序是随机的）
+    hits.sort();
     if hits.is_empty() {
         return Ok(format!(
             "未找到匹配 {pattern} 的文件（已跳过 {skipped} 个忽略目录）"
@@ -1221,6 +1734,7 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
     // 便于直接了解/编辑整个方法而不只看单行；最多展开前 5 条防输出爆炸
     let block_mode = args["block"].as_bool().unwrap_or(false);
     const MAX_BLOCK_HITS: usize = 5;
+    let (ignore_rules, start_rel) = load_project_ignore(&root, roots);
     let lower = pattern.to_lowercase();
     let mut hits: Vec<String> = Vec::new();
     let mut files_checked = 0u32;
@@ -1230,6 +1744,8 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
     const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
     fn walk(
         dir: &Path,
+        rel: &str,
+        rules: &[IgnoreRule],
         pattern: &str,
         lower: &str,
         case_sensitive: bool,
@@ -1240,16 +1756,38 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
         files_checked: &mut u32,
         skipped: &mut u32,
     ) {
+        // 子目录 .gitignore（与 list_dir 同口径）：规则只对其子树生效
+        let child_rules = load_child_rules(rules, dir, rel);
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for e in entries.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
             if p.is_dir() {
-                if should_skip_dir(&name) {
+                let entry_rel = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if should_skip_dir(&name)
+                    || gitignore_ignored(&child_rules, &name, &entry_rel, true)
+                {
                     *skipped += 1;
                     continue;
                 }
-                walk(&p, pattern, lower, case_sensitive, glob, block_mode, block_shown, hits, files_checked, skipped);
+                walk(
+                    &p,
+                    &entry_rel,
+                    &child_rules,
+                    pattern,
+                    lower,
+                    case_sensitive,
+                    glob,
+                    block_mode,
+                    block_shown,
+                    hits,
+                    files_checked,
+                    skipped,
+                );
                 if hits.len() >= 50 {
                     return;
                 }
@@ -1305,7 +1843,9 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
                             }
                         }
                         let snippet: String = line.trim().chars().take(160).collect();
-                        hits.push(format!("{}:{}: {snippet}", p.display(), i + 1));
+                        // 注释命中标注：模型据此区分代码逻辑位置与说明性位置，避免误读
+                        let tag = if is_comment_line(line, &ext) { "[注释] " } else { "" };
+                        hits.push(format!("{}:{}: {tag}{snippet}", p.display(), i + 1));
                         if hits.len() >= 50 {
                             return;
                         }
@@ -1314,7 +1854,20 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
             }
         }
     }
-    walk(&root, pattern, &lower, case_sensitive, glob, block_mode, &mut block_shown, &mut hits, &mut files_checked, &mut skipped);
+    walk(
+        &root,
+        &start_rel,
+        &ignore_rules,
+        pattern,
+        &lower,
+        case_sensitive,
+        glob,
+        block_mode,
+        &mut block_shown,
+        &mut hits,
+        &mut files_checked,
+        &mut skipped,
+    );
     if hits.is_empty() {
         return Ok(format!(
             "未找到包含「{pattern}」的内容（检查了 {files_checked} 个文件，跳过 {skipped} 个忽略目录）"
@@ -2014,6 +2567,116 @@ mod tests {
         assert!(out.contains("let y = 2"), "{out}");
         assert!(!out.contains("完整代码块"), "默认单行模式不应展开块: {out}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    // ---------- 注释识别 / 折叠清洗 ----------
+
+    #[test]
+    fn comment_line_detection() {
+        assert!(is_comment_line("// x", "rs"));
+        assert!(is_comment_line("  // x", "ts"));
+        assert!(is_comment_line("/* x", "c"));
+        assert!(is_comment_line(" * doc", "java"));
+        assert!(is_comment_line("*/", "go"));
+        assert!(is_comment_line("# x", "py"));
+        assert!(is_comment_line("-- x", "sql"));
+        assert!(!is_comment_line("let a = 1; // 行尾注释", "ts"), "行内注释不算整行注释");
+        assert!(!is_comment_line("# 标题", "md"), "非代码语言不识别");
+        assert!(!is_comment_line("// 字符串", "json"), "数据文件不识别");
+    }
+
+    #[test]
+    fn read_file_folds_long_comment_blocks() {
+        // 10 行头注释 + 3 行代码：注释占比 77% → 长注释块折叠，代码可见
+        let content = format!(
+            "{}",
+            [
+                "// 文件头说明",
+                "// 文件头说明",
+                "// 文件头说明",
+                "// 文件头说明",
+                "// 文件头说明",
+                "// 文件头说明",
+                "// 文件头说明",
+                "// 文件头说明",
+                "// 文件头说明",
+                "// 文件头说明",
+                "fn a() {",
+                "  let x = 1;",
+                "}",
+            ]
+            .join("\n")
+        );
+        let (f, roots) = tmp_file("read_fold", &content, "rs");
+        let rel = f.to_string_lossy().to_string();
+        let args = serde_json::json!({"path": rel});
+        let out = block_on_rt(read_file(&args, &roots)).expect("读取应成功");
+        assert!(out.contains("行注释已折叠"), "长注释块应折叠: {out}");
+        assert!(out.contains("注释占 77%"), "应标注注释占比: {out}");
+        assert!(out.contains("fn a() {") && out.contains("let x = 1"), "代码必须完整可见: {out}");
+        assert!(!out.contains("文件头说明"), "折叠后不应再逐行展示注释: {out}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_keeps_short_comment_blocks() {
+        // 3 行短注释块（< 8 行）即使注释占比高也保留原文
+        let content = "// 简介\n// 简介2\n// 简介3\nfn a() {\n  let x = 1;\n}\n";
+        let (f, roots) = tmp_file("read_keep", content, "rs");
+        let rel = f.to_string_lossy().to_string();
+        let args = serde_json::json!({"path": rel});
+        let out = block_on_rt(read_file(&args, &roots)).expect("读取应成功");
+        assert!(out.contains("简介2"), "短注释块应保留原文: {out}");
+        assert!(!out.contains("行注释已折叠"), "短注释块不应折叠: {out}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn grep_marks_comment_hits() {
+        let content = "// let y = 2\nfn b() {\n  let y = 2;\n}\n";
+        let (f, roots) = tmp_file("grep_cmt", content, "rs");
+        let args = serde_json::json!({"path": ".", "pattern": "let y"});
+        let out = block_on_rt(grep_files(&args, &roots)).expect("搜索应成功");
+        assert!(out.contains("[注释] // let y = 2"), "注释命中应标注: {out}");
+        assert!(out.contains("let y = 2;"), "代码命中不应标注: {out}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn grep_respects_gitignore() {
+        // .gitignore 忽略的目录不进入搜索结果
+        let dir = std::env::temp_dir().join(format!("agent_gi_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(dir.join("ignored")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(dir.join("kept.txt"), "needle here\n").unwrap();
+        std::fs::write(dir.join("ignored").join("secret.txt"), "needle here\n").unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let args = serde_json::json!({"path": ".", "pattern": "needle"});
+        let out = block_on_rt(grep_files(&args, &roots)).expect("搜索应成功");
+        assert!(out.contains("kept.txt"), "应命中保留文件: {out}");
+        assert!(!out.contains("secret.txt"), "gitignore 目录不应命中: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_dir_respects_gitignore_and_hidden() {
+        // gitignore 目录 + 隐藏目录跳过；普通文件可见；★ 关键文件标注
+        let dir = std::env::temp_dir().join(format!("agent_ld_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(dir.join("ignored")).unwrap();
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(dir.join("keep.txt"), "x").unwrap();
+        std::fs::write(dir.join("README.md"), "# t").unwrap();
+        std::fs::write(dir.join("ignored").join("secret.txt"), "x").unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let args = serde_json::json!({"path": "."});
+        let out = block_on_rt(list_dir(&args, &roots)).expect("浏览应成功");
+        assert!(out.contains("keep.txt"), "普通文件应可见: {out}");
+        assert!(out.contains("README.md"), "关键文件应可见: {out}");
+        assert!(!out.contains("secret.txt") && !out.contains("ignored/"), "gitignore 目录应跳过: {out}");
+        assert!(!out.contains(".hidden"), "隐藏目录应跳过: {out}");
+        assert!(out.contains("跳过 2 个忽略项"), "应统计跳过数: {out}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

@@ -34,7 +34,7 @@ export default function ConfigPage() {
   useEffect(() => {
     load()
     refreshScale()
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps -- 挂载时加载一次：函数引用每次渲染变化属预期，不加入依赖避免重复请求
 
   const handleSave = async () => {
     setError(null)
