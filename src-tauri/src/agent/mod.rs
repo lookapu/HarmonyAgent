@@ -1,0 +1,15 @@
+//! Agent 能力：工具注册、执行与协议（工具调用标记解析）
+
+pub mod ask;
+pub mod diagnostics;
+pub mod crash;
+pub mod runtime_log;
+pub mod exec_ctx;
+pub mod jobs;
+pub mod scanner;
+pub mod session_ctx;
+pub mod session_events;
+pub mod subagents;
+pub mod todo;
+pub mod tools;
+pub mod undo;

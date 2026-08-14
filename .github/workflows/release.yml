@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri (universal)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # macOS 无法编译 CUDA（nvcc 不支持 mac），用 --config 覆盖 tauri.conf.json 的 features 关闭 cuda，走 CPU 推理
+        run: npx tauri build --target universal-apple-darwin --config '{"build":{"features":[]}}'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      # candle 的 cuda feature 编译 CUDA 内核需要 nvcc（choco 的 cuda 包会自动设置 CUDA_PATH）；
+      # 运行时只需显卡驱动（cudarc Driver API），无 N 卡机器自动回退 CPU
+      - name: Install CUDA toolkit (nvcc for candle cuda kernel)
+        shell: pwsh
+        run: choco install cuda --version=12.6.3 -y --no-progress
+
+      # nvcc 在 Windows 上需要 MSVC host 编译器（cl.exe），设置 VC 工具链环境供后续 step 使用
+      - name: Set up MSVC environment (cl.exe for nvcc)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # 准备出厂捆绑运行时（Node / PortableGit / Temurin JDK 17）到 src-tauri/runtime。
+      # 优先使用系统代理（HTTP_PROXY/HTTPS_PROXY 环境变量），未设置则直连；下载失败自动重试 3 次。
+      - name: Prepare bundled runtimes (Node / Git / JDK)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $proxy = $env:HTTPS_PROXY
+          if (-not $proxy) { $proxy = $env:HTTP_PROXY }
+          $proxyArg = if ($proxy) { @{ Proxy = $proxy } } else { @{} }
+          New-Item -ItemType Directory -Force -Path src-tauri/runtime | Out-Null
+
+          # 带重试的下载（网络抖动时自动重试 3 次）
+          function Get-FileRetry([string]$Uri, [string]$OutFile) {
+            $ok = $false
+            for ($i = 1; $i -le 3; $i++) {
+              try {
+                Invoke-WebRequest @proxyArg -Uri $Uri -OutFile $OutFile
+                $ok = $true
+                break
+              } catch {
+                Write-Host "Download failed (attempt $i/3): $($_.Exception.Message)"
+                Start-Sleep -Seconds 10
+              }
+            }
+            if (-not $ok) { throw "Download failed after 3 attempts: $Uri" }
+          }
+
+          # Node 最新 LTS（nodejs.org index.json 自动筛选，解压平铺到 runtime/node）
+          $nodeIndex = Invoke-RestMethod @proxyArg -Uri 'https://nodejs.org/dist/index.json'
+          $nodeVer = ($nodeIndex | Where-Object { $_.lts } | Select-Object -First 1).version
+          Get-FileRetry -Uri "https://nodejs.org/dist/$nodeVer/node-$nodeVer-win-x64.zip" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath node_tmp -Force
+          New-Item -ItemType Directory -Force -Path src-tauri/runtime/node | Out-Null
+          $nodeRoot = Get-ChildItem node_tmp -Directory | Select-Object -First 1
+          Get-ChildItem $nodeRoot.FullName | ForEach-Object { Move-Item $_.FullName src-tauri/runtime/node -Force }
+          Remove-Item node.zip, node_tmp -Recurse -Force
+
+          # PortableGit（GitHub 最新 release，SFX 静默解压平铺到 runtime/git）
+          $gitTag = (Invoke-RestMethod @proxyArg -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest').tag_name
+          $gitVer = $gitTag.TrimStart('v')
+          Get-FileRetry -Uri "https://github.com/git-for-windows/git/releases/download/$gitTag/PortableGit-$gitVer-64-bit.7z.exe" -OutFile git.exe
+          New-Item -ItemType Directory -Force -Path git_tmp | Out-Null
+          Start-Process -Wait -FilePath "$PWD\git.exe" -ArgumentList '-o', "$PWD\git_tmp", '-y'
+          New-Item -ItemType Directory -Force -Path src-tauri/runtime/git | Out-Null
+          $gitRoot = Get-ChildItem git_tmp -Directory | Select-Object -First 1
+          Get-ChildItem $gitRoot.FullName | ForEach-Object { Move-Item $_.FullName src-tauri/runtime/git -Force }
+          Remove-Item git.exe, git_tmp -Recurse -Force
+
+          # Temurin JDK 17（Adoptium 官方 binary API，直接返回 zip，解压为 runtime/jdk）
+          Get-FileRetry -Uri 'https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse' -OutFile jdk.zip
+          Expand-Archive jdk.zip -DestinationPath jdk_tmp -Force
+          $jdkRoot = Get-ChildItem jdk_tmp -Directory | Select-Object -First 1
+          Move-Item $jdkRoot.FullName src-tauri/runtime/jdk -Force
+          Remove-Item jdk.zip, jdk_tmp -Recurse -Force
+          # 瘦身：删除构建不需要的大文件（源码包/jmods/示例/手册/JNI 头），与本地开发机保持一致
+          foreach ($d in 'src.zip', 'jmods', 'demo', 'man', 'include') {
+            $p = Join-Path 'src-tauri/runtime/jdk' $d
+            if (Test-Path $p) { Remove-Item $p -Recurse -Force }
+          }
+
+      - name: Build Tauri
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.zip
+            src-tauri/target/release/bundle/msi/*.msi.zip.sig
+            src-tauri/target/release/bundle/nsis/*.exe
+
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-artifacts
+          path: artifacts/macos
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-artifacts
+          path: artifacts/windows
+
+      - name: Generate latest.json for updater
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          MAC_SIG=$(cat artifacts/macos/*.sig 2>/dev/null || echo "")
+          WIN_SIG=$(cat artifacts/windows/*.sig 2>/dev/null || echo "")
+
+          cat > artifacts/latest.json << ENDJSON
+          {
+            "version": "${VERSION}",
+            "notes": "Release v${VERSION}",
+            "pub_date": "${DATE}",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${MAC_SIG}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/DevEco-Switch.app.tar.gz"
+              },
+              "darwin-x86_64": {
+                "signature": "${MAC_SIG}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/DevEco-Switch.app.tar.gz"
+              },
+              "windows-x86_64": {
+                "signature": "${WIN_SIG}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/DevEco-Switch_${VERSION}_x64-setup.msi.zip"
+              }
+            }
+          }
+          ENDJSON
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/macos/*
+            artifacts/windows/*
+            artifacts/latest.json
