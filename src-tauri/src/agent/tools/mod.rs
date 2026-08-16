@@ -10,16 +10,22 @@
 
 mod build_tools;
 mod cmd_tools;
+mod compose_tools;
 mod debug_tools;
+pub(crate) mod doc_tools;
 mod device_tools;
 mod errors;
 mod explore_tools;
-mod fs_tools;
+pub(crate) mod fs_tools;
 mod git_tools;
 pub(crate) mod guards;
+mod media_tools;
 mod memory_tools;
+mod meta_tools;
 mod pipeline;
+mod project_tools;
 mod protocol;
+mod quality_tools;
 mod test_tools;
 mod ui_tools;
 mod web_tools;
@@ -52,6 +58,204 @@ use crate::utils::path::normalize_path;
 pub struct ToolSpec {
     pub name: &'static str,
     pub desc: &'static str,
+}
+
+/// 工具按任务域分组（[62] task_group）：build/fix/explore/deploy/refactor/test/other。
+/// 供 tool_list 按组过滤、tool_help 展示分组、前端按任务折叠展示（[75]）使用。
+/// 未登记的工具默认归 other（内部标记命令也在其中）。
+pub const TOOL_GROUP: &[(&str, &str)] = &[
+    // build：构建 / 依赖 / 静态检查 / 工程创建
+    ("analyze_hap_size", "build"),
+    ("size_diff", "build"),
+    ("api_mock", "build"),
+    ("build_generic", "build"),
+    ("build_hap", "build"),
+    ("build_profile", "build"),
+    ("build_project", "build"),
+    ("check_code", "build"),
+    ("secret_scan", "build"),
+    ("check_sdk_alignment", "build"),
+    ("check_signature", "build"),
+    ("create_harmony_project", "build"),
+    ("diagnose_signing", "build"),
+    ("diff_api_versions", "build"),
+    ("oh_package", "build"),
+    ("ohpm_install", "build"),
+    ("ohpm_search", "build"),
+    ("refresh_api_db", "build"),
+    ("refresh_api_details", "build"),
+    ("run_lint", "build"),
+    ("scan_api_compat", "build"),
+    // deploy：安装 / 部署 / 运行 / 应用控制
+    ("clear_app_data", "deploy"),
+    ("deploy", "deploy"),
+    ("deploy_all", "deploy"),
+    ("grant_permission", "deploy"),
+    ("install_launch", "deploy"),
+    ("run_app", "deploy"),
+    ("set_airplane_mode", "deploy"),
+    ("set_network_condition", "deploy"),
+    ("set_wifi_state", "deploy"),
+    ("start_ability", "deploy"),
+    ("stop_app", "deploy"),
+    ("uninstall_app", "deploy"),
+    // fix：文件修改 / 编辑 / 代码修复
+    ("copy_file", "fix"),
+    ("delete_file", "fix"),
+    ("edit_file", "fix"),
+    ("lsp_code_action", "fix"),
+    ("lsp_format", "fix"),
+    ("format_file", "fix"),
+    ("lsp_rename", "fix"),
+    ("move_file", "fix"),
+    ("multi_edit", "fix"),
+    ("preview_edit", "fix"),
+    ("read_module_config", "fix"),
+    ("review_changes", "fix"),
+    ("type_or_syntax", "fix"),
+    ("undo_edit", "fix"),
+    ("write_file", "fix"),
+    // explore：读取 / 搜索 / 查询 / 诊断 / 设备列表
+    ("analyze_crash", "explore"),
+    ("analyze_generic_project", "explore"),
+    ("ask_history", "explore"),
+    ("auto_explore", "explore"),
+    ("codebase_search", "explore"),
+    ("connect_device", "explore"),
+    ("db_query", "explore"),
+    ("debug_probe", "explore"),
+    ("deep_scan", "explore"),
+    ("device_file", "explore"),
+    ("device_perf", "explore"),
+    ("device_shell", "explore"),
+    ("dump_battery", "explore"),
+    ("dump_memory", "explore"),
+    ("memory_snapshot", "explore"),
+    ("environment_check", "explore"),
+    ("find_files", "explore"),
+    ("get_api_detail", "explore"),
+    ("get_app_info", "explore"),
+    ("get_build_log", "explore"),
+    ("get_cost_summary", "explore"),
+    ("get_diagnostics", "explore"),
+    ("get_env_info", "explore"),
+    ("get_file_info", "explore"),
+    ("get_installed_apps", "explore"),
+    ("get_project_info", "explore"),
+    ("get_symbol_details", "explore"),
+    ("grep_files", "explore"),
+    ("image_inspect", "explore"),
+    ("list_devices", "explore"),
+    ("list_dir", "explore"),
+    ("list_emulators", "explore"),
+    ("list_mcp_servers", "explore"),
+    ("list_modules", "explore"),
+    ("lsp_completion", "explore"),
+    ("lsp_definition", "explore"),
+    ("lsp_diagnostics", "explore"),
+    ("lsp_hover", "explore"),
+    ("lsp_references", "explore"),
+    ("lsp_signature", "explore"),
+    ("lsp_symbols", "explore"),
+    ("manage_hdc", "explore"),
+    ("read_document", "explore"),
+    ("read_file", "explore"),
+    ("read_harmony_doc", "explore"),
+    ("read_logcat", "explore"),
+    ("read_pdf", "explore"),
+    ("read_runtime_logs", "explore"),
+    ("read_sdk_api_module", "explore"),
+    ("search_api", "explore"),
+    ("search_harmony_docs", "explore"),
+    ("search_hilog", "explore"),
+    ("log_query", "explore"),
+    ("search_knowledge", "explore"),
+    ("conversation_search", "explore"),
+    ("search_sdk_api", "explore"),
+    ("search_symbols", "explore"),
+    ("stack_dump", "explore"),
+    ("tool_help", "explore"),
+    ("tool_history", "explore"),
+    ("tool_list", "explore"),
+    ("view_image", "explore"),
+    // refactor：Git / 重构 / 计划
+    ("git_blame", "refactor"),
+    ("git_branch", "refactor"),
+    ("git_commit", "refactor"),
+    ("git_diff", "refactor"),
+    ("git_fetch", "refactor"),
+    ("git_log", "refactor"),
+    ("git_merge", "refactor"),
+    ("git_pull", "refactor"),
+    ("git_push", "refactor"),
+    ("git_restore", "refactor"),
+    ("git_stash", "refactor"),
+    ("git_status", "refactor"),
+    ("git_tag", "refactor"),
+    ("plan_task", "refactor"),
+    ("todo_get", "refactor"),
+    ("todo_write", "refactor"),
+    // test：测试 / UI 验证 / 性能 / 截图
+    ("collect_perf", "test"),
+    ("create_emulator", "test"),
+    ("dump_ui_hierarchy", "test"),
+    ("ui_locator", "test"),
+    ("record_ui", "test"),
+    ("replay_ui", "test"),
+    ("gesture_perform", "test"),
+    ("run_perf_benchmark", "test"),
+    ("run_tests", "test"),
+    ("flaky_test_detect", "test"),
+    ("smoke_test", "test"),
+    ("run_ui_flow", "test"),
+    ("screen_record", "test"),
+    ("start_emulator", "test"),
+    ("take_screenshot", "test"),
+    ("verify_ui", "test"),
+    ("write_unit_tests", "test"),
+    // other：元工具 / 导出 / 审计
+    ("permission_audit", "other"),
+    ("trace_export", "other"),
+    ("db_migrate", "other"),
+    ("state_snapshot", "other"),
+    ("prompt_optimize", "other"),
+    ("export_tools_meta", "other"),
+    ("compose", "other"),
+    ("chart_extract", "explore"),
+    ("ocr_image", "explore"),
+    ("fact_extract", "other"),
+    ("reflexion_query", "other"),
+    ("reflexion_pin", "other"),
+    ("export_report", "other"),
+    // 质量/度量/工程治理（TOOL_ENHANCEMENTS 第 2/3 批）
+    ("code_metrics", "explore"),
+    ("metric_export", "explore"),
+    ("log_aggregate", "explore"),
+    ("snippet_insert", "other"),
+    ("replay_trace", "other"),
+    ("api_test", "test"),
+    ("api_health", "test"),
+    ("obfuscate", "build"),
+    ("sandbox_exec", "other"),
+    ("license_check", "test"),
+    ("vuln_scan", "test"),
+    ("docx_read", "explore"),
+    ("audio_transcribe", "explore"),
+    ("attach_debugger", "debug"),
+    ("step_debug", "debug"),
+    ("ota_pack", "build"),
+];
+
+/// 全部任务分组（tool_list 过滤与前端分组 UI 用）
+pub const TASK_GROUPS: [&str; 8] = ["build", "fix", "explore", "deploy", "refactor", "test", "debug", "other"];
+
+/// 查询工具所属任务分组（未登记默认 other）
+pub fn tool_group(name: &str) -> &'static str {
+    TOOL_GROUP
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, g)| *g)
+        .unwrap_or("other")
 }
 
 pub const TOOL_SPECS: &[ToolSpec] = &[
@@ -100,6 +304,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "在 ohpm 官方仓库搜索三方库（ohpm search），确认包是否存在与可用版本。\n参数：{\"keyword\":\"<包名或关键字>\",\"detail\":<可选 true 时追加 ohpm info 查询版本/依赖详情>}。\n适合：写代码前确认三方库在 ohpm 仓库的可用性/版本、查依赖包说明；确认后可 ohpm_install package=<包名> 安装。\n副作用：无（只读仓库索引）。\n返回：搜索/详情结果。",
     },
     ToolSpec {
+        name: "create_harmony_project",
+        desc: "创建完整标准 HarmonyOS 工程骨架（Stage 模型），一次生成全部模板文件，避免逐文件手写遗漏。\n参数：{\"path\":\"<工程目录，相对项目根或绝对路径，缺省项目根；目标必须不存在或为空目录>\",\"name\":\"<可选应用显示名>\",\"bundle_name\":\"<可选包名，缺省 com.example.<目录名>；与 copy_signing_from 同传时以参考工程包名为准>\",\"module\":\"<可选入口模块名，缺省 entry>\",\"sdk_version\":\"<可选，形如 6.1.1(24)>\",\"copy_signing_from\":\"<可选参考工程绝对路径：复用其包名与 signingConfigs，新工程直接产出可安装真机的签名 HAP>\",\"with_tests\":<可选 bool，缺省 true 生成 hypium 单测骨架>}。\n自动生成：根配置（build-profile/oh-package/hvigorfile/hvigor-config/code-linter）、根 .gitignore/README、hvigorw 启动脚本（优先从 DevEco 工具链拷贝）、AppScope（app.json5+多语言+PNG 图标）、入口模块（EntryAbility+首页+资源）、单测骨架。\n创建完成后返回文件清单与签名状态提示，可继续 build_project 验证。\n副作用：在目标目录创建完整工程（目录非空时拒绝执行，防覆盖）。\n返回：生成文件清单、SDK 版本、签名复用状态/待办提示。",
+    },
+    ToolSpec {
         name: "build_project",
         desc: "构建当前 HarmonyOS 工程（hvigorw assembleHap）。\n参数：{\"mode\":\"debug\"|\"release\",\"clean\":bool,\"module\":\"<可选模块名，如 entry/feature，缺省 entry>\"}，mode 缺省 debug；clean=true 时先 hvigor clean 清缓存再构建（用于缓存导致的诡异失败，不要每次都传）；module 指定后只构建该模块（多模块工程改库/功能模块后按需验证）。\n副作用：在工程 build 目录生成/更新 .hap 产物，耗时可能数分钟。\n返回：构建日志尾部与结论。失败时返回结构化错误（含 category 根因分类：type/syntax/dependency/sdk/api_level/signing/ohpm/resource）与\"推荐下一步\"，请按推荐选择后续工具（如 ohpm_install、check_sdk_alignment、show_diagnose_card、edit_file），不要盲目重复相同构建。",
     },
@@ -113,7 +321,47 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "spawn_agents",
-        desc: "委派多个子 Agent 并行处理子任务（可给每个任务指定模型与委派约束）。\n参数：{\"agents\":[{\"name\":\"<任务名>\",\"prompt\":\"<委派任务>\",\"model\":\"<可选模型名>\",\"tool_filter\":<可选工具白名单数组，如 [\"read_file\",\"grep_files\"]>,\"persona\":\"<可选角色/行为约束>\"}],\"max_depth\":<可选子 Agent 再委派层数，缺省 0=子 Agent 禁止再委派>}，model 缺省时使用用户配置的子 Agent 默认模型；tool_filter 限制子 Agent 只能调用白名单内工具（防止其越权修改）；persona 注入子 Agent 约束其行为。\n适合把大任务拆分成互不依赖的子任务并行执行，最后汇总结果；子任务有依赖关系时不要使用本工具。\n副作用：子 Agent 拥有其白名单内的工具集，可能调用工具修改工程文件（受同样安全策略约束）。\n返回：各子任务的执行结果汇总。",
+        desc: "委派多个子 Agent 处理子任务（可给每个任务指定模型与委派约束）。\n参数：{\"agents\":[{\"name\":\"<任务名>\",\"prompt\":\"<委派任务>\",\"model\":\"<可选模型名>\",\"tool_filter\":<可选工具白名单数组，如 [\"read_file\",\"grep_files\"]>,\"persona\":\"<可选角色/行为约束>\"}],\"sequential\":<可选 true=按顺序逐个执行，前一个子 Agent 的输出自动注入下一个的 prompt（适合有依赖的流水线，如 explore 结果 → refactor 修改）>,\"max_depth\":<可选子 Agent 再委派层数，缺省 0=子 Agent 禁止再委派>}，model 缺省时使用用户配置的子 Agent 默认模型；tool_filter 限制子 Agent 只能调用白名单内工具（防止其越权修改）；persona 注入子 Agent 约束其行为。\n适合把大任务拆分成子任务执行：互不依赖时缺省并发并行；有依赖链时（后一个任务需要前一个的结果）设 sequential=true。\n副作用：子 Agent 拥有其白名单内的工具集，可能调用工具修改工程文件（受同样安全策略约束）。\n返回：各子任务的执行结果汇总（sequential 模式含逐段传递的前序输出）。",
+    },
+    ToolSpec {
+        name: "agent_publish",
+        desc: "向会话消息板发布一条消息（按 topic 归类），供其他子 Agent 或主 Agent 后续用 agent_subscribe 读取。\n参数：{\"topic\":\"<主题，如 explore_result>\",\"content\":\"<消息内容，≤4000 字符>\"}。\n适合 A2A 协作：explore 类子 Agent 把发现发布到 topic，refactor 类子 Agent 订阅读取；或主 Agent 把阶段性结论发布供后续轮次参考。\n副作用：写入进程内会话消息板（重启清空，每会话最多保留 200 条）。\n返回：发布确认与当前该 topic 消息数。",
+    },
+    ToolSpec {
+        name: "agent_subscribe",
+        desc: "读取会话消息板上指定 topic 的消息（新→旧）。\n参数：{\"topic\":\"<主题；留空/缺省读取全部>\",\"limit\":<可选条数 1-100，缺省 20>}。\n适合：查看其他子 Agent 发布的结果；在 spawn_agents sequential 流水线中前序结果已自动注入 prompt，一般无需手动订阅。\n副作用：无（只读进程内消息板）。\n返回：消息列表（时间/主题/发送者/内容）。",
+    },
+    ToolSpec {
+        name: "job_template",
+        desc: "查询当前项目的预置任务模板（build/test/lint 一键组合，按项目类型自动识别 HarmonyOS hvigor 工程 / npm 工程）。\n参数：无。\n适合：不确定该项目的构建/测试命令时先查模板，取其中命令作为 run_command / run_in_background 的 command 参数（可直接修改）；hvigor 工程额外提供 build-module（只构建 entry）与 clean（清缓存重建）模板。\n副作用：无（只读模板表）。\n返回：模板清单（模板名 + 命令 + 说明）。",
+    },
+    ToolSpec {
+        name: "debug_probe",
+        desc: "在 .ets 源文件的目标函数/方法入口插桩 hilog 日志（可附带变量值），形成“软件断点”——无需 DevEco 调试器协议即可在运行期观察函数是否被调用与参数值。\n参数：{\"path\":\"<文件路径>\",\"target\":\"<函数/方法名>\",\"vars\":[\"<可选变量名数组>\"],\"action\":\"insert|cleanup|list（缺省 insert）\"}。\n适合：定位“函数是否执行/参数是什么”类问题（如点击无反应、数据未更新）；比直接改代码更安全，插桩点自动记录可一键还原。\n副作用：修改源文件（插入 hilog 调用与 import，构建前必须 cleanup 或保留）；插桩点记录在会话内。\n返回：插桩位置与后续流程（build_project → deploy → query_hilog(tag=\"devecoProbe\") → cleanup）。",
+    },
+    ToolSpec {
+        name: "stack_dump",
+        desc: "采集设备上指定应用（缺省当前工程）的进程/线程快照：自动定位 pid、枚举线程（tid + 名称）、拉取 hidumper 进程详情（CPU/内存/线程状态）。\n参数：{\"device\":\"<可选>\",\"package\":\"<可选包名，缺省当前工程 bundleName>\"}。\n适合：应用无响应/卡死时确认线程是否阻塞、看线程构成（ArkTS/GC/渲染线程是否健在）；与 analyze_crash 互补形成运行期取证闭环。\n副作用：仅查询。\n返回：进程列表 + 每进程线程枚举与 hidumper 详情。",
+    },
+    ToolSpec {
+        name: "lsp_definition",
+        desc: "LSP 跳转定义（真实 AST，非文本扫描）：给出文件中某个符号的行列位置，返回该符号的声明位置（工程内文件或 SDK .d.ts 内置组件声明）。\n参数：{\"path\":\"<文件路径>\",\"line\":<行号 1 起>,\"column\":<列号 1 起>}。\n适合：确认某个标识符（组件/函数/变量/属性）到底声明在哪；看内置组件（Text/Column/List 等）的 SDK 声明与可用属性。\n依赖：@arkts/language-server（npm i -g @arkts/language-server）与本机鸿蒙 SDK；首次调用会启动语言服务器进程（会话内常驻）。\n副作用：启动 LSP 子进程（只读查询）。\n返回：定义位置列表（文件:行:列 + 该行代码）。",
+    },
+    ToolSpec {
+        name: "lsp_references",
+        desc: "LSP 查找引用（真实 AST）：给出文件中某个符号的行列位置，返回该符号全部引用位置。\n参数：{\"path\":\"<文件路径>\",\"line\":<行号 1 起>,\"column\":<列号 1 起>,\"include_declaration\":<可选，缺省 true=含声明本身>}。\n适合：重构前评估影响面（改名字/改签名会波及哪些地方）。\n副作用：只读查询（会话内常驻 LSP 进程）。\n返回：引用位置列表。",
+    },
+    ToolSpec {
+        name: "lsp_symbols",
+        desc: "LSP 文档符号树（真实 AST）：解析 .ets 文件的 struct/方法/状态变量/装饰器结构，带行号。\n参数：{\"path\":\"<文件路径>\"}。\n适合：快速了解一个页面文件的整体结构（比通读全文高效）；定位方法定义位置。\n副作用：只读查询。\n返回：按层级缩进的符号列表（类型:名称:行号）。",
+    },
+    ToolSpec {
+        name: "lsp_hover",
+        desc: "LSP 悬停文档（真实 AST）：给出文件中某个符号的行列位置，返回其 API 说明/类型签名（含 SDK 内置组件/装饰器说明）。\n参数：{\"path\":\"<文件路径>\",\"line\":<行号 1 起>,\"column\":<列号 1 起>}。\n适合：快速了解某个 API/组件的用途与签名，不必翻 SDK 声明文件。\n副作用：只读查询。\n返回：悬停文档文本。",
+    },
+    ToolSpec {
+        name: "lsp_diagnostics",
+        desc: "LSP 真实诊断（跨文件类型检查，比 grep/正则强得多）：对 .ets 文件做语法+类型+模块解析检查。\n参数：{\"path\":\"<文件路径>\"}。\n适合：改完代码后验证是否正确（补全 import、类型不匹配、@Component 装饰器用法等）；定位编译错误的具体位置。\n副作用：只读查询（会话内常驻 LSP 进程，首次较慢）。\n返回：诊断列表（级别/行:列/消息/上下文代码），无错误时明确说明。",
     },
     ToolSpec {
         name: "web_search",
@@ -165,11 +413,15 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "write_file",
-        desc: "写入/覆盖文本文件（UTF-8，单次 ≤1MB，自动创建父目录）。\n参数：{\"path\":\"<文件路径，相对项目根>\",\"content\":\"<完整文件内容>\"}。\n注意：会覆盖目标文件现有内容，写入前请先用 read_file 确认现有内容（需要修改少量内容时优先用 edit_file）。若文件自上次读取后被外部修改（IDE/用户/其他会话），写入会被拒绝并提示重新读取。\n副作用：修改/创建项目内文件。\n返回：写入结果与字节数。",
+        desc: "写入/覆盖文本文件（UTF-8，单次 ≤1MB，自动创建父目录）。\n参数：{\"path\":\"<文件路径，相对项目根>\",\"content\":\"<完整文件内容>\",\"dry_run\":<可选 true 只预览不落盘>}。\n注意：会覆盖目标文件现有内容，写入前请先用 read_file 确认现有内容（需要修改少量内容时优先用 edit_file）；先 dry_run 预览再落盘可避免误覆盖。\n转义提示：content 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行。若文件自上次读取后被外部修改（IDE/用户/其他会话），写入会被拒绝并提示重新读取。\n副作用：修改/创建项目内文件（dry_run=true 时无副作用）。\n返回：写入结果与字节数。",
     },
     ToolSpec {
         name: "edit_file",
-        desc: "修改文件，两种模式：old 精确文本替换，或 start 按「完整代码块」整体替换（推荐编辑/删除整个方法，不固定行数、不会漏块结束符）。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文片段（模式一），须与文件内容完全一致>\",\"new\":\"<替换后内容；模式二 new 为空=整块删除>\",\"replace_all\":<可选，true 替换全部出现处，缺省仅替换第一处>,\"start\":<可选行号（模式二）：按语言感知的成对 {}() 匹配定位该行所在「完整方法/代码块」并整体替换，块有多长操作多长>}。\nold 与 start 互斥（不能同时给）。\n文件 ≤1MB；old 不匹配时返回错误并提示附近内容。若文件自上次读取后被外部修改（IDE/用户/其他会话），编辑会被拒绝并提示重新读取。\n副作用：修改项目内文件。\n返回：替换处数与位置（start 模式返回块行区间）。",
+        desc: "修改文件，两种模式：old 精确文本替换，或 start 按「完整代码块」整体替换（推荐编辑/删除整个方法，不固定行数、不会漏块结束符）。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文片段（模式一），须与文件内容完全一致>\",\"new\":\"<替换后内容；模式二 new 为空=整块删除>\",\"replace_all\":<可选，true 替换全部出现处，缺省仅替换第一处>,\"start\":<可选行号（模式二）：按语言感知的成对 {}() 匹配定位该行所在「完整方法/代码块」并整体替换，块有多长操作多长>,\"dry_run\":<可选 true 只返回 unified diff 不落盘>}。\nold 与 start 互斥（不能同时给）；改动前建议先 dry_run 预览 diff。\n转义提示：old/new 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行，old 会匹配失败。\n文件 ≤1MB；old 不匹配时返回错误并提示附近内容。若文件自上次读取后被外部修改（IDE/用户/其他会话），编辑会被拒绝并提示重新读取。\n副作用：修改项目内文件（dry_run=true 时无副作用）。\n返回：替换处数与位置（start 模式返回块行区间）。",
+    },
+    ToolSpec {
+        name: "preview_edit",
+        desc: "预览文件编辑的 diff（不落盘，只读）：与 edit_file 相同的参数（path/old/new/replace_all/start），但只计算并返回 unified diff（含 @@ 行号、上下文、新增/删除行统计），文件不会被修改。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文本，需唯一>\",\"new\":\"<新文本>\",\"replace_all\":<可选，全部替换>,\"start\":<可选起始行>}。\n适合：编辑前先给用户展示改动（信任感），确认后同参数调用 edit_file 应用；或连续编辑出错时先预览再落盘。\n副作用：无（只读）。\n返回：unified diff 文本 + 统计；确认后必须用 edit_file 应用同一修改。",
     },
     ToolSpec {
         name: "run_command",
@@ -185,7 +437,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "job_kill",
-        desc: "终止后台任务（强杀进程树）。\n参数：{\"job_id\":\"<任务 id>\"}。\n副作用：终止命令进程及其子进程。\n返回：终止结果。",
+        desc: "终止后台任务（强杀进程树，含子进程）：任务卡死/误启动/需要中断长耗时操作时使用。\n参数：{\"job_id\":\"<任务 id，来自 job_list>\"}。\n适合：run_command/build_project 等后台任务失控时强制清理，避免残留进程占用端口或锁文件。\n副作用：终止命令进程及其全部子进程（不可恢复）。\n返回：终止结果与受影响进程数。",
     },
     ToolSpec {
         name: "git_status",
@@ -204,12 +456,20 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "运行工程测试，自动按工程类型选择命令：HarmonyOS→hvigorw test；Node→npm test；Go→go test ./...；Rust→cargo test；Python→pytest；Maven→mvn test；Makefile→make test。\n参数：{\"module\":\"<可选模块名，仅鸿蒙工程有效，如 entry，缺省全部模块>\",\"coverage\":<可选 true 时生成覆盖率（鸿蒙 --coverage / Node -- --coverage / Go -coverprofile / Python --cov；Rust/Maven/Makefile 需自带插件，忽略该参数）>}。\n作用目录为当前会话的鸿蒙主工程（混合工作区时）或当前绑定目录；其它类型工程直接在该目录执行对应测试命令。\n耗时可能数分钟。\n副作用：在 build 目录生成测试报告（coverage=true 时含覆盖率数据）。\n返回：测试执行日志（含通过/失败统计）。",
     },
     ToolSpec {
+        name: "flaky_test_detect",
+        desc: "测试稳定性检测：重复执行测试 N 次（缺省 3 次，最多 5 次），对比各轮结果识别不稳定（flaky）用例。\n参数：{\"runs\":<可选 2-5，缺省 3>,\"module\":\"<可选模块名，仅鸿蒙工程有效>\"}。\n适合：测试偶发失败怀疑是波动而非代码问题时（先跑一轮 run_tests 失败，再跑本工具验证）、提交前确认测试套件稳定。\n副作用：在 build 目录生成测试报告（多次执行）。\n返回：每轮结果摘要 + 稳定性结论（稳定通过/稳定失败/波动）+ 失败线索清单。",
+    },
+    ToolSpec {
+        name: "smoke_test",
+        desc: "部署后自动冒烟链：build（可选跳过）→ deploy → run_ui_flow 断言 → 截图验证，输出冒烟报告。\n参数：{\"steps\":[<run_ui_flow 的 UI 断言步骤，至少 1 条>]（必填），\"device\":\"<可选>\",\"hap\":\"<可选 HAP 路径，缺省自动找最新产物>\",\"verify\":<可选缺省 true，结束时截图供核对>,\"skip_build\":<可选缺省 false，true 时直接用已有产物部署>}。\n适合：改完核心流程后快速确认「能装、能起、能点」；步骤参考 dump_ui_hierarchy/ui_locator 得到的元素坐标。\n副作用：构建+部署应用并在设备上执行 UI 操作（与 run_ui_flow 相同）。\n返回：三阶段执行结果 + 冒烟结论。",
+    },
+    ToolSpec {
         name: "read_logcat",
         desc: "读取已连接设备的日志（hdc hilog，取最近 N 行），支持按包名/标签/级别过滤。\n参数：{\"device\":\"<可选设备序列号，缺省默认设备>\",\"package\":\"<可选包名，如 com.example.app，自动映射到进程 pid 过滤>\",\"tag\":\"<可选日志 tag 过滤>\",\"level\":\"<可选级别：D|I|W|E|F（分别为调试/信息/警告/错误/致命），取该级别及以上>\",\"filter\":\"<可选关键词，按行内容模糊匹配>\",\"lines\":<可选行数 10-1000，缺省 200>}。\n优先用 package/tag/level 在设备端过滤，再用 filter 做本地关键词匹配；排查指定应用崩溃/报错时建议传 package。\n副作用：无（只读）。\n返回：日志内容（截断 6000 字符）。",
     },
     ToolSpec {
         name: "read_runtime_logs",
-        desc: "读取部署后自动回流的应用运行期错误日志（最近的 error 级 hilog 环形缓存）。\n参数：{\"lines\":<可选行数 20-400，缺省 100>}。\n与 read_logcat 的区别：这个工具读取的是本次部署后持续监听、与当前应用相关的错误流（无需指定设备/包名），适合排查用户操作过程中才出现的运行时异常；部署/重部署后会自动重新开始监听。当跨轮诊断提示存在 runtime_error 时，优先调用本工具查看完整错误栈。\n副作用：无（只读）。\n返回：最近的运行期错误日志。",
+        desc: "读取部署后自动回流的应用运行期错误日志（最近的 error 级 hilog 环形缓存）。\n参数：{\"lines\":<可选行数 20-400，缺省 100>,\"filter\":\"<可选关键字，大小写不敏感子串过滤，如 filter=\"TypeError\" 只看 TypeError 相关行>\",\"regex\":\"<可选正则表达式过滤，如 regex=\"Error|Exception\"；与 filter 同时给出时 filter 优先>\",\"context\":<可选命中行前后附带行数 0-10，缺省 0>}。\n与 read_logcat 的区别：这个工具读取的是本次部署后持续监听、与当前应用相关的错误流（无需指定设备/包名），适合排查用户操作过程中才出现的运行时异常；部署/重部署后会自动重新开始监听。当跨轮诊断提示存在 runtime_error 时，优先调用本工具查看完整错误栈；日志量大时用 filter/regex 定位关键词。\n副作用：无（只读）。\n返回：最近的运行期错误日志（过滤/上下文模式按命中行输出，> 标记命中行）。",
     },
     ToolSpec {
         name: "web_fetch",
@@ -220,8 +480,12 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "截取已连接鸿蒙设备当前屏幕，保存为 PNG 到项目内并返回路径。\n参数：{\"device\":\"<可选设备序列号，缺省默认设备>\"}。\n适合查看应用在真机上的实际显示效果（配合 deploy 后验证 UI）。\n副作用：在项目 .deveco-agent/screenshots 目录写入截图文件。\n返回：截图文件绝对路径。",
     },
     ToolSpec {
+        name: "view_image",
+        desc: "读取项目内图片并让模型直接看到（多模态）：支持 png/jpg/jpeg（webp/gif/bmp 请先用命令行工具转换）。\n参数：{\"path\":\"<图片路径，相对项目根或绝对路径>\"}。\n适合查看 UI 设计稿、截图、示意图、报错弹窗等视觉信息；图片自动压缩后随下轮请求进入模型视野（同 take_screenshot 机制）。\n副作用：无（只读，仅编码发送给模型）。\n返回：图片信息与路径（图片已编码，下轮请求自动进入你的视野，建议调用后继续下一步操作）。",
+    },
+    ToolSpec {
         name: "collect_perf",
-        desc: "采集已连接设备上当前应用的性能指标并给出异常分析。\n参数：{\"device\":\"<可选设备序列号，缺省默认设备>\",\"package\":\"<可选包名，缺省自动取当前工程 bundleName>\",\"seconds\":<可选采样秒数 3-30，缺省 6>}。\n采样内容：应用进程内存（PSS，通过 hidumper/top）、系统 CPU/内存占用率、设备温度与电量，多次采样取均值/峰值，并标注异常（CPU 持续过高、内存异常、设备过热、内存泄漏趋势）。\n部署并操作应用后调用，用于排查卡顿、发热、内存问题；无副作用（只读）。\n返回：性能报告（含均值/峰值与异常判断）。",
+        desc: "采集已连接设备上当前应用的性能指标并给出异常分析。\n参数：{\"device\":\"<可选设备序列号，缺省默认设备>\",\"package\":\"<可选包名，缺省自动取当前工程 bundleName>\",\"seconds\":<可选采样秒数 3-30，缺省 6>}。\n采样内容：应用进程内存（PSS，通过 hidumper/top）、系统 CPU/内存占用率、设备温度与电量，多次采样取均值/峰值，并标注异常（CPU 持续过高、内存异常、设备过热、内存泄漏趋势）。\n部署并操作应用后调用，用于排查卡顿、发热、内存问题。\n副作用：无（只读采样，不修改设备状态）。\n返回：性能报告（含均值/峰值与异常判断）。",
     },
     ToolSpec {
         name: "deploy_all",
@@ -248,6 +512,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "获取当前界面的 UI 控件树（组件树，JSON 格式），每个节点包含控件类型/文字/资源 id/包名/坐标范围/是否可点击等信息。\n参数：{\"device\":\"<可选设备序列号>\"}。\n底层调用 hdc shell uitest dumpLayout，将控件树 JSON 保存到工程本地并返回路径与前 40 行预览，你可 read_file 读取完整文件。\n适合：用户要求“看看界面上有啥/找到某个按钮/确认某文字是否显示/UI 自动化前先看控件”等场景，比截图更精准（截图 + 控件树配合使用效果最佳）。\n副作用：仅查询，不修改设备状态。\n返回：控件树 JSON 路径、节点数量统计、关键控件（按钮/输入框/列表）摘要。",
     },
     ToolSpec {
+        name: "ui_locator",
+        desc: "按文字/类型在设备当前界面控件树中定位元素，返回匹配清单与推荐点击坐标（可直接给 run_ui_flow 的 tap 用）。\n参数：{\"text\":\"<可选，文字部分匹配>\",\"type\":\"<可选，控件类型如 Button/Text/TextField>\",\"index\":<可选，选第几个匹配，缺省 0>,\"path\":\"<可选，本地 dumpLayout JSON，缺省现场采集>\"}。\ntext/type 至少给一个。适合：UI 自动化前定位按钮/输入框坐标、确认某元素是否存在。\n副作用：无（现场采集时仅在设备临时目录生成控件树文件）。\n返回：匹配项列表 + 推荐点击坐标。",
+    },
+    ToolSpec {
         name: "start_ability",
         desc: "启动指定 Ability 或通过 Deep Link 拉起应用特定页面。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"ability\":\"<可选 Ability 名，如 EntryAbility>\"，\"uri\":\"<可选 Deep Link URI，如 myapp://page/settings>\"}。\n显式启动：传 bundle + ability；隐式 Deep Link：传 uri（可省略 bundle）；同时传则以显式 Want 启动并附带 uri 参数。\n适合：部署完想直接跳到某个页面验证、复现特定路由下的 bug、对比不同页面性能等。\n副作用：会切换设备前台应用。\n返回：启动结果与应用是否成功进入前台（aa dump -l 检查）。",
     },
@@ -258,6 +526,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "dump_memory",
         desc: "获取指定应用的详细内存使用情况（PSS/RSS/Heap/SMAP 近似等），可按模块/库分类展示。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\"}。\n基于 hidumper + bm dump + /proc/<pid>/smaps 综合读取，输出总览与主要分类占比，帮助定位内存增长来源。\n适合：collect_perf/run_perf_benchmark 发现内存偏高后，进一步下钻分析是 JS 堆、native 堆还是资源占用。\n副作用：仅查询，有轻微性能开销（1-2 秒）。\n返回：内存结构化报告（总 PSS / Java 堆 / Native 堆 / 图形 / 代码 / 栈 / 其他）。",
+    },
+    ToolSpec {
+        name: "memory_snapshot",
+        desc: "内存快照归档 + 增长对比（定位内存泄漏）。\n参数：{\"action\":\"take|list|diff\"（缺省 take）,\"tag\":\"<可选标签，缺省时间戳>\"}。\ntake：抓一次内存快照（基于 dump_memory），归档到工程 .deveco-agent/memory-snapshots/<tag>.txt；\nlist：列出已存快照（时间/标签/路径）；\ndiff：对比最近两次快照，输出 VmRSS/VmSize 增长（KB + 百分比），增长>10% 提示疑似泄漏。\n适合：怀疑内存泄漏时跑目标场景前后各 take 一次再 diff、发布前做基线快照、上线后做趋势追踪。\n副作用：写工程目录的 .deveco-agent/memory-snapshots/（不影响业务代码）。\n返回：take 返回快照路径；list 返回文件清单；diff 返回两次快照的内存增长对比 + 风险提示。",
     },
     ToolSpec {
         name: "get_installed_apps",
@@ -296,12 +568,28 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "回放之前用 record_ui 录制的 UI 操作流程（或直接指定步骤文件）。\n参数：{\"device\":\"<可选>\",\"name\":\"<录制名称，与 record_ui 的 name 对应>\",\"path\":\"<可选，直接指定步骤 JSON 文件路径>\"，\"speed\":<可选速度倍率 0.5-3.0，缺省 1.0>}。\n读取录制步骤文件，按时间间隔或压缩速度依次回放点击/滑动/长按/输入/按键，结束后可选截图验证。\n适合：回归测试、复现 bug、对比修改前后效果。录制一次，多次回放。\n副作用：在设备上注入真实操作事件。\n返回：每步执行结果与最终状态。",
     },
     ToolSpec {
+        name: "gesture_perform",
+        desc: "单次触摸/输入手势注入：tap/swipe/longPress/doubleTap/text/key，直接作用于设备屏幕。\n参数：{\"device\":\"<可选>\",\"action\":\"tap|swipe|longPress|doubleTap|text|key\",\"x\":<像素坐标 x>,\"y\":<像素坐标 y>（tap/longPress/doubleTap 需要），\"x1\":<起点 x>,\"y1\":<起点 y>,\"x2\":<终点 x>,\"y2\":<终点 y>,\"speed\":<swipe 速度，可选缺省 600>，\"text\":\"<text 时输入文本>\",\"name\":\"<key 时按键名，缺省 back>\"}。\n适合：定位到元素后直接交互（坐标用 ui_locator 输出的推荐点击坐标）、小步验证交互反馈（比 run_ui_flow 更可控）。\n副作用：在设备上注入真实操作事件。\n返回：执行结果。",
+    },
+    ToolSpec {
         name: "analyze_hap_size",
         desc: "分析 HAP/HSP/APP 包的大小构成，按目录分类（ArkTS 字节码 / 资源 / 原生库 / assets / 配置），列 Top N 大文件，给出瘦身建议。\n参数：{\"path\":\"<可选，HAP 文件路径，缺省自动查找最新构建产物>\",\"top\":<可选 Top N 大文件数，缺省 15>}。\n底层解压 zip 格式的 HAP 并遍历统计，输出分类占比饼图文字版 + Top 大文件列表 + 针对性瘦身建议（图片转 webp、删除未用资源、按需分包等）。\n适合：用户说「包太大了怎么减」「看看包体积构成」时做分析，之后可用 edit_file / 资源替换做优化，再重新构建验证。\n副作用：无（只读解析包文件，不产生临时文件）。\n返回：包大小分析报告。",
     },
     ToolSpec {
+        name: "size_diff",
+        desc: "对比两个 HAP 包（或同一工程两次构建产物）的大小差异：总大小/分类占比变化 + 文件级新增/删除/变大/变小 Top 清单。\n参数：{\"path_a\":\"<基线 HAP 路径>\",\"path_b\":\"<新 HAP 路径>\",\"top\":<可选，每类清单条数，缺省 10>}。\n适合：用户问「这次构建怎么大了 X MB」「体积变化原因」时，用上次/基线的 HAP 与当前产物对比，直接定位增长来源文件。\n副作用：无（只读解析两个包文件）。\n返回：对比报告 + 主要增长来源结论。",
+    },
+    ToolSpec {
+        name: "screenshot_diff",
+        desc: "逐像素对比两张截图（PNG）差异：输出差异像素数/比例、差异区域包围盒坐标与位置提示。\n参数：{\"path_a\":\"<基线截图>\",\"path_b\":\"<变更截图>\",\"threshold\":<可选，单通道容差，缺省 10>}。\n适合：UI 改动前后验证（先 take_screenshot 存基线，改动后截图对比）；两张图尺寸必须一致，否则先裁剪对齐。\n副作用：无（只读本地解析，不连设备）。\n返回：差异统计 + 区域定位 + 判读建议。",
+    },
+    ToolSpec {
         name: "search_hilog",
-        desc: "在设备 hilog 中按条件搜索过滤日志，比 read_runtime_logs 更强大。\n参数：{\"device\":\"<可选>\",\"package\":\"<可选包名过滤>\",\"tag\":\"<可选 tag 过滤>\",\"level\":\"DEBUG|INFO|WARN|ERROR|FATAL，缺省 WARN 及以上\"，\"keyword\":\"<可选关键字>\",\"regex\":<可选 true 时 keyword 作为正则>，\"since\":<可选只看最近 N 分钟，缺省 5>，\"max_lines\":<可选最大返回行数，缺省 200>，\"context\":<可选匹配行前后上下文行数 0-10，缺省 2>}。\n适合：排查问题时快速定位关键日志、搜索特定错误堆栈、看某个 tag 的所有输出。\n副作用：仅查询。\n返回：匹配的日志行（带上下文）。",
+        desc: "在设备 hilog 中按条件搜索过滤日志，比 read_runtime_logs 更强大（结构化查询：级别/tag/关键词/正则/时间窗口）。\n参数：{\"device\":\"<可选>\",\"package\":\"<可选包名过滤>\",\"tag\":\"<可选 tag 过滤>\",\"level\":\"DEBUG|INFO|WARN|ERROR|FATAL，缺省 WARN 及以上\"，\"keyword\":\"<可选关键字>\",\"regex\":<可选 true 时 keyword 作为正则>，\"since\":<可选只看最近 N 分钟，缺省 5>，\"until\":<可选时间上限 N 分钟：只保留 N 分钟以前的日志，与 since 组合成 [since, until] 窗口，缺省 0=无上限>，\"max_lines\":<可选最大返回行数，缺省 200>，\"context\":<可选匹配行前后上下文行数 0-10，缺省 2>}。\n适合：排查问题时快速定位关键日志、搜索特定错误堆栈、看某个 tag 的所有输出。\n副作用：仅查询。\n返回：匹配的日志行（带上下文）。",
+    },
+    ToolSpec {
+        name: "log_query",
+        desc: "结构化日志查询：跨多源（hilog/runtime/faultlog）按时间范围/日志级别/关键词/正则多维过滤。\n参数：{\"sources\":[\"hilog\",\"runtime\",\"faultlog\"]（缺省三源）,\"since_minutes\":<可选，缺省 10>,\"level_min\":\"E|W|I|D（缺省 I，输出 ≥ 该级别，E=仅错误/致命，W=含警告，I=含信息，D=全开）\",\"keyword\":\"<可选普通包含匹配>\",\"regex\":\"<可选正则子串匹配>\",\"max_lines\":<可选每源上限，缺省 200>}。\n适合：「过去 10 分钟内所有 ERROR + 含 TypeError」这类精准排查、跨设备日志 + 崩溃文件 + 工程运行时日志横向对照、按级别过滤只看错误/警告。\n副作用：仅查询，不改任何状态。\n返回：按源分组的匹配行 + 合计匹配行数 + 过滤条件摘要。",
     },
     ToolSpec {
         name: "run_lint",
@@ -314,6 +602,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "check_signature",
         desc: "检查 HAP 或已安装应用的签名信息（签名类型、签名相关文件、特权等级）。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，检查设备上已安装应用>\"，\"hap_path\":\"<可选 HAP 文件路径，检查本地文件>\"}。\n至少传 bundle 或 hap_path 之一。解析 HAP 内 META-INF/pack.info/profile 等签名相关文件，读取已安装应用的签名类型与特权等级，并解释常见签名错误码 9568319（签名不匹配）。\n适合：安装失败怀疑签名问题、确认打包的是 debug 还是 release、排查权限申请不生效等。\n副作用：仅查询。\n返回：签名诊断报告。",
+    },
+    ToolSpec {
+        name: "diagnose_signing",
+        desc: "签名配置自检：核对工程签名配置、签名材料（~/.ohos/config）与设备 UDID 的匹配关系，输出修复指引。\n参数：{\"path\":\"<可选工程目录，缺省当前绑定根>\"}。\n自动完成：解析 build-profile.json5 signingConfigs（含材料存在性）、AppScope/app.json5 bundleName、扫描本地材料库各 profile 的 bundle-name/type/device-ids、读取在线设备 UDID，给出四项比对结论。\n适合：构建/部署报签名错误（9568319、signature verify failed）时**先调用本工具**自动定位——多数情况可直接得出修复路径（重新构建已签名产物、复用匹配材料、或改 bundleName），无需用户去 DevEco 手动操作；只有材料库完全无匹配时才需要 DevEco 重新生成。\n副作用：仅只读查询。\n返回：结构化自检报告（bundleName/签名配置/设备 UDID/材料匹配矩阵/修复建议）。",
     },
     ToolSpec {
         name: "dump_battery",
@@ -329,11 +621,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "refresh_api_db",
-        desc: "从华为官方文档站抓取各版本 API 变更清单（Ability Kit / ArkUI / ArkTS 等所有 Kit），聚合到本地知识库。\n参数：无。每次调用都会全量重新抓取（无增量/跳过逻辑），结果覆盖入库。\n数据来源是官方每版本的 API diff 页面，表格里明确标注了每个 API 的操作（新增/删除/废弃/变更）、所属 d.ts 文件、类名、完整声明。聚合后即可知道任意 API 在哪个 API level 引入、哪个版本废弃。\n首次调用会抓取 API 12~26 共约十几个版本的所有 Kit 页面，耗时较长（网络情况而定），结果会持久化到本地数据库，后续 search_api 离线查询。\n适合：想查某个 API 从哪个版本开始有、升级 targetSdk 前做兼容性摸底。\n返回：抓取的版本数、页面数、入库条目数、错误列表。",
+        desc: "从华为官方文档站抓取各版本 API 变更清单（Ability Kit / ArkUI / ArkTS 等所有 Kit），聚合到本地知识库。\n参数：无。每次调用都会全量重新抓取（无增量跳过逻辑），结果覆盖入库。\n数据来源是官方每版本的 API diff 页面，表格里明确标注了每个 API 的操作（新增/删除/废弃/变更）、所属 d.ts 文件、类名、完整声明。聚合后即可知道任意 API 在哪个 API level 引入、哪个版本废弃。\n首次调用会抓取 API 12~26 共约十几个版本的所有 Kit 页面，耗时较长（网络情况而定），结果会持久化到本地数据库，后续用 search_api 离线查询。\n适合：想查某个 API 从哪个版本开始有、升级 targetSdk 前做兼容性摸底。\n副作用：写入本地 API 知识库（覆盖旧数据）。\n返回：抓取的版本数、页面数、入库条目数、错误列表。",
     },
     ToolSpec {
         name: "search_api",
-        desc: "在已抓取的鸿蒙官方 API 知识库中搜索 API 声明、版本与所属模块。\n参数：{\"keyword\":\"<关键字，函数名/类名/模块名片段>\",\"module\":\"<可选过滤 @ohos.xxx>\",\"kit\":\"<可选过滤 Kit 名>\",\"api_level\":<可选只看某版本>,\"change_type\":\"added|removed|deprecated|modified\",\"limit\":<可选返回条数，缺省 50>}。\n返回匹配的 API 列表，每条包含：所属 Kit / d.ts 文件 / 模块 / 类名 / 完整声明 / 变更类型 / 版本标签 / API level / 官方文档链接。\n适合：写代码时查 API 签名与最低版本、判断某 API 是否兼容目标版本、找废弃 API 的替代、确认某功能属于哪个 Kit。\n前提：需要先 refresh_api_db 抓取过数据（若库为空会提示）。",
+        desc: "在已抓取的鸿蒙官方 API 知识库中搜索 API 声明、版本与所属模块。\n参数：{\"keyword\":\"<关键字，函数名/类名/模块名片段>\",\"module\":\"<可选过滤 @ohos.xxx>\",\"kit\":\"<可选过滤 Kit 名>\",\"api_level\":<可选只看某版本>,\"change_type\":\"added|removed|deprecated|modified\",\"limit\":<可选返回条数，缺省 50>}。\n返回匹配的 API 列表，每条包含：所属 Kit / d.ts 文件 / 模块 / 类名 / 完整声明 / 变更类型 / 版本标签 / API level / 官方文档链接。\n适合：写代码时查 API 签名与最低版本、判断某 API 是否兼容目标版本、找废弃 API 的替代、确认某功能属于哪个 Kit。\n前提：需要先 refresh_api_db 抓取过数据（若库为空会提示）。\n副作用：无（只读本地知识库）。",
     },
     ToolSpec {
         name: "refresh_api_details",
@@ -341,11 +633,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "get_api_detail",
-        desc: "查询某个鸿蒙 API 模块/类/方法的官方参考详情（描述、导入方式、系统能力、权限、示例、成员列表）。\n参数：{\"module\":\"<可选，模块名片段，如 @ohos.file.fs 或 file.fs>\",\"keyword\":\"<可选，任意关键字，会在正文里搜索并返回片段>\",\"limit\":<可选，缺省 5>}。\nmodule/keyword 至少给一个。返回每个命中模块的标题、Kit、首批 API 版本、导入语句、系统能力、权限、设备类型、示例代码、以及子项（类/接口/枚举/方法/属性）列表。\n适合：写代码前确认 API 签名与用法、查看需要申请的权限、复制示例、判断某 API 支持哪些设备。\n前提：先调用 refresh_api_details 抓取正文；未抓取时仅能返回知识库中已有的模块元数据。",
+        desc: "查询某个鸿蒙 API 模块/类/方法的官方参考详情（描述、导入方式、系统能力、权限、示例、成员列表）。\n参数：{\"module\":\"<可选，模块名片段，如 @ohos.file.fs 或 file.fs>\",\"keyword\":\"<可选，任意关键字，会在正文里搜索并返回片段>\",\"limit\":<可选，缺省 5>}。\nmodule/keyword 至少给一个。返回每个命中模块的标题、Kit、首批 API 版本、导入语句、系统能力、权限、设备类型、示例代码、以及子项（类/接口/枚举/方法/属性）列表。\n适合：写代码前确认 API 签名与用法、查看需要申请的权限、复制示例、判断某 API 支持哪些设备。\n前提：先调用 refresh_api_details 抓取正文；未抓取时仅能返回知识库中已有的模块元数据。\n副作用：无（只读本地知识库）。",
     },
     ToolSpec {
         name: "diff_api_versions",
-        desc: "对比两个鸿蒙 API 版本之间的 API 变更，输出新增/删除/废弃/修改清单并给出迁移建议。\n参数：{\"from_level\":<旧版本 API level，数字>,\"to_level\":<新版本 API level，数字>,\"kit\":\"<可选，只看某个 Kit>\",\"module\":\"<可选，只看某个 @ohos.xxx 模块>\",\"change_type\":\"added|removed|deprecated|modified\",\"limit\":<可选，缺省 200>}。\n基于 refresh_api_db 抓取的全量版本 diff 数据聚合：在 from_level 之后、to_level 及之前出现的 added/removed/deprecated/modified 条目。会自动给出迁移建议（删除的 API 找替代、废弃的 API 提示迁移、新增的 API 仅高版本可用）。\n适合：升级 targetSdk / compatibleSdk 前评估影响、从 API 12 迁到 API 26 时了解需要适配的内容、发版说明。\n前提：需要先 refresh_api_db。",
+        desc: "对比两个鸿蒙 API 版本之间的 API 变更，输出新增/删除/废弃/修改清单并给出迁移建议。\n参数：{\"from_level\":<旧版本 API level，数字>,\"to_level\":<新版本 API level，数字>,\"kit\":\"<可选，只看某个 Kit>\",\"module\":\"<可选，只看某个 @ohos.xxx 模块>\",\"change_type\":\"added|removed|deprecated|modified\",\"limit\":<可选，缺省 200>}。\n基于 refresh_api_db 抓取的全量版本 diff 数据聚合：在 from_level 之后、to_level 及之前出现的 added/removed/deprecated/modified 条目。会自动给出迁移建议（删除的 API 找替代、废弃的 API 提示迁移、新增的 API 仅高版本可用）。\n适合：升级 targetSdk / compatibleSdk 前评估影响、从 API 12 迁到 API 26 时了解需要适配的内容、发版说明。\n前提：需要先 refresh_api_db。\n副作用：无（只读本地知识库）。",
     },
     ToolSpec {
         name: "get_project_info",
@@ -354,6 +646,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "environment_check",
         desc: "一次性体检开发环境：hdc/ohpm/node/git/java 可用性与版本、hdc 服务端状态与在线设备数、代理设置、以及（传 path 时）鸿蒙工程的 hvigor 工具链与 SDK 版本对齐。\n参数：{\"path\":\"<可选工程目录，用于 SDK 对齐与 hvigor 检测>\"}。\n当遇到\"hdc 不可用\"\"ohpm 找不到\"等环境类错误、或部署/构建前想确认环境就绪时优先调用，比逐个工具碰运气更高效。\n副作用：无（只读）。\n返回：每项检查的结果（✓/✗）与原因、版本号、修复提示。",
+    },
+    ToolSpec {
+        name: "conversation_search",
+        desc: "全局历史对话搜索：跨会话检索消息内容（用户提问/助手回答），返回命中片段、会话标题与时间。\n参数：{\"query\":\"<关键词>\",\"project\":\"<可选项目 id，缺省当前项目>\",\"role\":\"user|assistant|all\"（可选缺省 all）,\"limit\":<可选 1-20 缺省 8>}。\n适合：回忆之前讨论过的方案/踩过的坑（“上次那个签名问题怎么解决的”）、查找历史决策依据；关键词用核心名词，命中率更高。\n副作用：无（只读数据库）。\n返回：按时间倒序的命中消息列表（角色/时间/会话/片段）。",
     },
     ToolSpec {
         name: "search_knowledge",
@@ -369,7 +665,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "update_progress",
-        desc: "更新 plan_task 创建的计划中某一步的状态。\n参数：{\"step\":<步骤编号（1 起）>,\"status\":\"done|failed|doing\"（缺省 done）,\"note\":\"<可选备注，如失败原因或完成说明>\"}。\n适合：长任务每完成/失败一步后汇报，让用户随时能看到任务推进到哪一步。\n返回：更新后的计划摘要（已完成 x/N 步）。",
+        desc: "更新 plan_task 创建的计划中某一步的状态。\n参数：{\"step\":<步骤编号（1 起）>,\"status\":\"done|failed|doing\"（缺省 done）,\"note\":\"<可选备注，如失败原因或完成说明>\"}。\n适合：长任务每完成/失败一步后汇报，让用户随时能看到任务推进到哪一步。\n副作用：写入 plan_steps 表（修改任务计划状态）。\n返回：更新后的计划摘要（已完成 x/N 步）。",
     },
     ToolSpec {
         name: "manage_memory",
@@ -421,7 +717,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "delete_file",
-        desc: "删除文件或空目录（删除后移入回收站/工程内 .deveco-agent/trash，可恢复，不直接永久删除）。\n参数：{\"path\":\"<要删除的文件路径，相对项目根>\"}。\n禁止删除 .git、oh_modules、build 等受保护目录及工程根。\n副作用：把文件移动到回收目录（可恢复）。\n返回：删除结果。",
+        desc: "删除文件或空目录（删除后移入回收站/工程内 .deveco-agent/trash，可恢复，不直接永久删除）。\n参数：{\"path\":\"<要删除的文件路径，相对项目根>\",\"dry_run\":<可选 true 只预览不执行>}。\n禁止删除 .git、oh_modules、build 等受保护目录及工程根；删除前建议先 dry_run 确认路径。\n副作用：把文件移动到回收目录（可恢复；dry_run=true 时无副作用）。\n返回：删除结果。",
     },
     ToolSpec {
         name: "git_stash",
@@ -441,11 +737,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "move_file",
-        desc: "移动/重命名项目内的文件或目录（类似 mv，自动创建目标父目录）。\n参数：{\"from\":\"<源路径，相对项目根>\",\"to\":\"<目标路径，相对项目根>\"}。\n不覆盖已存在的目标路径；禁止移动项目根、.git/oh_modules/build 等受保护目录与敏感文件；跨盘移动自动回退复制方案。\n适合重命名文件、把文件移入子目录、调整工程结构。\n副作用：改变文件/目录位置（可配合 undo 工具回滚前一步内容，位置变更本身不可撤销）。\n返回：移动结果。",
+        desc: "移动/重命名项目内的文件或目录（类似 mv，自动创建目标父目录）。\n参数：{\"from\":\"<源路径，相对项目根>\",\"to\":\"<目标路径，相对项目根>\",\"dry_run\":<可选 true 只预览不执行>}。\n不覆盖已存在的目标路径；禁止移动项目根、.git/oh_modules/build 等受保护目录与敏感文件；跨盘移动自动回退复制方案。\n适合重命名文件、把文件移入子目录、调整工程结构；移动前建议先 dry_run 确认。\n副作用：改变文件/目录位置（可配合 undo 工具回滚前一步内容，位置变更本身不可撤销；dry_run=true 时无副作用）。\n返回：移动结果。",
     },
     ToolSpec {
         name: "undo_edit",
-        desc: "撤销最近的文件修改（还原到 Agent 修改前的内容）。\n参数：{\"count\":<可选撤销步数 1-10，缺省 1>}。\n仅能回滚本会话内 write_file/edit_file 落盘前自动记录的快照（每次写入前旧内容入栈，LIFO 顺序恢复）；会话最多保留 40 步。\n适合编辑方向走偏、批量改错时逐步回退。\n副作用：把文件内容恢复为旧版本（同会话内可反复撤销）。\n返回：已恢复的文件列表与剩余可撤销步数。",
+        desc: "撤销最近的文件修改（还原到 Agent 修改前的内容）。\n参数：{\"count\":<可选撤销步数 1-10，缺省 1>,\"preview\":<可选 true 时只展示将恢复的改动 diff 不落盘，缺省 false 直接恢复>}。\n仅能回滚本会话内 write_file/edit_file 落盘前自动记录的快照（每次写入前旧内容入栈，LIFO 顺序恢复）；会话最多保留 40 步。\n适合编辑方向走偏、批量改错时逐步回退；拿不准时先 preview=true 看 diff 再决定。\n副作用：把文件内容恢复为旧版本（同会话内可反复撤销）；preview=true 无副作用。\n返回：已恢复的文件列表与剩余可撤销步数；preview 模式返回将恢复的 diff。",
     },
     ToolSpec {
         name: "get_diagnostics",
@@ -453,11 +749,19 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "todo_write",
-        desc: "维护任务清单（拆分复杂任务并跟踪进度，清单会展示在界面上）。\n参数：{\"todos\":[{\"id\":\"<简短唯一标识>\",\"content\":\"<任务描述>\",\"status\":\"pending|in_progress|done\"}],\"merge\":<可选，true 按 id 合并更新，缺省整体替换>}。\n适合多步骤任务（构建+部署+验证等）开始前拆分清单，完成后逐项标记 done；每项 content ≤200 字，最多 30 项。\n副作用：无（只更新界面任务清单展示）。\n返回：清单统计（总数/已完成/进行中/待处理）。",
+        desc: "维护任务清单（拆分复杂任务并跟踪进度，清单会展示在界面上）。\n参数：{\"todos\":[{\"id\":\"<简短唯一标识>\",\"content\":\"<任务描述>\",\"status\":\"pending|in_progress|done\"}],\"merge\":<可选，true 按 id 合并更新，缺省整体替换>,\"project\":\"<可选，项目根路径；提供后清单升级为项目级共享：同一项目的其他会话读写同一份，适合跨会话推进同一任务>\"}。\n适合多步骤任务（构建+部署+验证等）开始前拆分清单，完成后逐项标记 done；每项 content ≤200 字，最多 30 项。\n副作用：无（只更新界面任务清单展示；project 模式下更新项目级共享清单）。\n返回：清单统计（总数/已完成/进行中/待处理）；project 模式下附带项目级历史任务摘要。",
+    },
+    ToolSpec {
+name: "todo_get",
+        desc: "读取任务清单（会话级或项目级）。\n参数：{\"project\":\"<可选，项目根路径；提供后读取该项目跨会话共享清单>\"}。\n适合：新会话接手同一项目的任务时查看项目级清单，了解历史进度后继续推进。\n副作用：无（只读）。\n返回：清单内容（按状态分组）。",
     },
     ToolSpec {
         name: "ask_user",
         desc: "向用户提问并等待回答（任务执行中需要用户决策/补充信息时使用）。\n参数：{\"question\":\"<问题，单轮一个，表达清楚选项含义>\",\"options\":[\"<可选建议选项，最多 4 个>\"]}。\n适合：目标不明确需要二选一/多选一、需要用户提供密钥/配置信息、是否继续执行有副作用操作等场景；不要用琐碎确认打断用户。\n副作用：无（暂停等待用户回答，回答后自动继续）。\n返回：用户的回答文本；用户跳过/超时（5 分钟）会有明确提示，可据此继续或换一种方式确认。",
+    },
+    ToolSpec {
+name: "ask_history",
+        desc: "查询本会话内已答复的提问历史（用户此前回答过什么）。\n参数：{\"limit\":<可选条数 1-20，缺省 10>}。\n适合：长时间会话后需要回忆用户之前的决策/偏好（如选定的方案、提供的密钥提示、确认过的副作用操作），避免重复提问或擅自改变已确认的方向。\n副作用：无（只读进程内历史）。\n返回：历史提问与用户回答（新→旧）。",
     },
     ToolSpec {
         name: "check_code",
@@ -470,6 +774,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "codebase_search",
         desc: "全库混合检索：按查询词在符号名、文件路径、代码内容三路匹配并打分排序（无需向量库的轻量语义检索）。\n参数：{\"query\":\"<查询词，如支付流程 payment>\",\"limit\":\"<可选返回条数，缺省 10，最多 30>\"}。\n适合按功能/概念找实现位置（“XX功能在哪实现”），比 grep_files 精确匹配更强；找到候选后配合 read_file/get_symbol_details 精读。\n副作用：无（只读）。\n返回：按相关度排序的命中列表（文件+行号+命中内容+得分）。",
+    },
+    ToolSpec {
+        name: "secret_scan",
+        desc: "密钥泄露专项扫描：全仓检测硬编码密钥/密码（源码复用 check_code 的 hardcoded-secret 规则）+ 配置文件（.env/local.properties/.npmrc/.pem/.keystore 等）中的疑似密钥键值对。\n参数：{\"path\":\"<可选子目录，缺省项目根>\",\"include_config\":<可选，false 只扫源码，缺省 true>}。\n适合发布前安全检查、接私密项目时摸底；扫描结果中的值已掩码（仅保留前 2 字符 + 长度），不会泄露明文。\n副作用：无（只读扫描）。\n返回：命中清单（文件:行号 + 键名 + 掩码值），按源码/配置文件分组。",
     },
     ToolSpec {
         name: "get_symbol_details",
@@ -508,6 +816,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "查看文件元信息（大小、修改时间、行数、编码探测、是否文本/二进制、权限）。\n参数：{\"path\":\"<文件路径，相对项目根或绝对路径>\"}。\n适合读取大文件前先了解规模、判断文件类型是否适合 read_file。\n副作用：无（只读）。\n返回：文件元信息。",
     },
     ToolSpec {
+        name: "read_document",
+        desc: "读取文档文件为纯文本：docx（Word）/pptx（PPT）/xlsx（Excel）/pdf（PDF 文字层）及 txt/md/json/csv/xml/yaml/log 等常见文本格式。\n参数：{\"path\":\"<文档路径，相对项目根或绝对路径>\"}。\n适合阅读需求文档、设计说明、测试用例表、接口文档（.docx/.pdf）等；解析保留段落与表格结构（单元格间制表符分隔）。\n副作用：无（只读）。\n返回：文档正文（保头保尾截断 8000 字符；PDF 为扫描件/加密时提示无法提取，可转图片后 view_image 查看）。",
+    },
+    ToolSpec {
         name: "list_agents",
         desc: "查看最近的子 Agent（spawn_agents 派发的子任务）运行记录：任务名、模型、状态（done/error/skipped）、耗时与输出摘要。\n参数：无。\n适合 spawn_agents 执行后回看各子任务结果、判断是否需要重新委派失败的子任务。\n副作用：无（只读进程内登记表）。\n返回：子 Agent 运行记录清单（最近 50 条，新→旧）。",
     },
@@ -517,11 +829,207 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "multi_edit",
-        desc: "一次调用批量修改多个文件（单文件替换逻辑与 edit_file 一致：old→new、可选 replace_all、冲突保护、可撤销）。\n参数：{\"edits\":[{\"path\":\"<文件路径，相对项目根或绝对路径>\",\"old\":\"<原文>\",\"new\":\"<新文>\",\"replace_all\":<可选布尔>}]}。\n单次最多 10 个文件；某项失败不影响其他项继续，返回逐项 ✅/❌ 汇总。\n适合跨多文件的重命名/统一修复/接口迁移等联动修改，减少工具调用轮次。\n副作用：修改项目内文件。\n返回：逐项替换结果汇总。",
+        desc: "一次调用批量修改多个文件（单文件替换逻辑与 edit_file 一致：old→new、可选 replace_all、冲突保护、可撤销）。\n参数：{\"edits\":[{\"path\":\"<文件路径，相对项目根或绝对路径>\",\"old\":\"<原文>\",\"new\":\"<新文>\",\"replace_all\":<可选布尔>}]}。\n转义提示：old/new 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行，old 会匹配失败。\n单次最多 10 个文件；某项失败不影响其他项继续，返回逐项 ✅/❌ 汇总。\n适合跨多文件的重命名/统一修复/接口迁移等联动修改，减少工具调用轮次。\n副作用：修改项目内文件。\n返回：逐项替换结果汇总。",
     },
     ToolSpec {
         name: "device_perf",
         desc: "采样已连接鸿蒙设备的实时性能：CPU 占用率、内存占用率、电池电量、温度。\n参数：{\"device\":\"<可选设备序列号，缺省默认设备>\"}。\n适合分析应用卡顿、内存泄漏疑点、设备发热等性能问题。\n副作用：无（只读采样）。\n返回：性能快照文本。",
+    },
+    // ---- 工具自我管理域（meta_tools）----
+    ToolSpec {
+        name: "tool_list",
+        desc: "动态列出当前全部可用工具（名称 + 一句话描述 + 超时/重试/成本元数据），比 system prompt 里的简要清单更完整。\n参数：无。\n适合：不清楚能调用什么工具、或想找某个领域工具时先摸底。\n副作用：无（只读注册表）。\n返回：工具清单（含执行预期提示）；某工具细节用 tool_help 查。",
+    },
+    ToolSpec {
+        name: "tool_help",
+        desc: "查某个工具的详细说明：完整描述 + 权限级别 + 执行预期（超时/重试/成本）+ 参数示例。\n参数：{\"name\":\"<工具名>\"}。\n适合：对某工具的参数、副作用、返回结构不确定时调用；不确定用法先 tool_help 而不是猜参数。\n副作用：无（只读）。\n返回：该工具完整说明。",
+    },
+    ToolSpec {
+        name: "tool_history",
+        desc: "查看最近工具调用历史（默认当前会话，新→旧）：时间、工具名、状态（成功/失败）、耗时、参数摘要、失败原因。\n参数：{\"limit\":<可选 1-100，缺省 10>,\"tool\":\"<可选按工具名过滤>\",\"status\":\"<可选 ok|error|running|cancelled|ask>\",\"all\":<可选 true 时跨会话查询>}。\n适合：复盘「刚才那个工具为什么失败」「我调用了哪些工具」；与 session_events 同源。\n副作用：无（只读）。\n返回：调用历史清单。",
+    },
+    ToolSpec {
+        name: "db_query",
+        desc: "只读 SQL 查询项目 SQLite 数据库（messages / tool_runs / session_events / conversation_todos 等 30+ 张表），用于诊断、复盘、报告生成。\n参数：{\"sql\":\"<只读 SELECT/WITH 语句>\"}。\n安全限制：仅允许 SELECT/WITH 单条语句（禁分号）、禁写操作关键词、自动追加 LIMIT 200、独立只读连接执行。\n注意：查询可跨会话（含其他会话的对话与工具记录，可能含敏感信息），只查必要数据。\n适合：查某次工具调用的完整参数/结果、统计会话消息量、按 trace_id 回溯事件。\n副作用：无（只读）。\n返回：表格结果（列名 + 最多 50 行，超长单元格截断）。",
+    },
+    ToolSpec {
+        name: "share_session",
+        desc: "把当前会话导出为 JSON 分享文件（脱敏：api_key/secret/token/password/authorization 等字段值替换为 ***），含消息与事件，可被 import_session 重新导入。\n参数：{\"out\":\"<可选输出路径，缺省项目 .deveco-agent/shared/<会话id>.share.json>\"}。\n适合：把一次完整任务过程分享给同事/其他环境。\n副作用：写分享文件。\n返回：导出统计与文件路径。",
+    },
+    ToolSpec {
+        name: "import_session",
+        desc: "导入分享的会话 JSON（share_session 导出的格式），生成新会话并把消息写入数据库。\n参数：{\"path\":\"<分享文件路径>\"}。\n适合：接收别人分享的会话后继续工作（历史消息会进入上下文）。\n副作用：创建新会话并写入消息（最多 500 条）。\n返回：新会话 id 与导入消息数。",
+    },
+    ToolSpec {
+        name: "trace_export",
+        desc: "把某 trace_id（任务级链路 ID）的全部事件导出为 OpenTelemetry 风格 JSON（resource_spans/scope_spans/spans），与 TimelinePanel 的 trace 折叠配套。\n参数：{\"trace_id\":\"<任务级链路 ID>\",\"out\":\"<可选输出路径，缺省项目 .deveco-agent/traces/<trace_id>.json>\"}。\n适合：离线分析一次任务的完整链路、接入 Jaeger 等观测后端。\n副作用：写导出文件。\n返回：导出事件数与文件路径。",
+    },
+    ToolSpec {
+        name: "permission_audit",
+        desc: "工具使用安全审计：聚合本项目的工具调用统计与权限分级（L0/L1/L2），输出审计报告（使用排行、成功率、危险级工具占比、失败率高企提示）。\n参数：{\"days\":<可选天数窗口，缺省全部>,\"level\":\"L0|L1|L2\"（可选只看某级）,\"min_calls\":<可选最少调用次数过滤>}。\n适合：项目交接前审查 Agent 行为、排查失败率高的工具配置问题、统计危险级工具使用情况。\n副作用：无（只读统计）。\n返回：审计报告文本。",
+    },
+    ToolSpec {
+        name: "db_migrate",
+        desc: "数据库迁移管理：查看迁移状态或补跑未应用的迁移（与启动时自动迁移共用同一清单）。\n参数：{\"action\":\"status|apply\"（缺省 status）}。\nstatus：列出全部 35 个迁移的已应用状态与时间；apply：补跑所有未应用迁移（幂等，每条独立事务失败回滚）。\n适合：升级后确认迁移是否齐全、修复被中断的半应用状态。\n副作用：apply 会修改数据库结构（幂等补跑，不会重复执行已应用迁移）。\n返回：状态列表或补跑结果。",
+    },
+    ToolSpec {
+        name: "state_snapshot",
+        desc: "应用状态快照：把关键表（settings/projects/project_memories/knowledge_entries/mcp_servers/providers）导出为可读 JSON 备份，或从快照恢复。\n参数：{\"action\":\"export|import|list\"（缺省 export）,\"path\":\"<import 时快照文件路径>\",\"tables\":[\"<可选子集>\"],\"dest\":\"<可选导出目录，缺省项目 .deveco-agent/snapshots>\"}。\nexport：导出各表行数据（敏感字段 api_key/token/secret 掩码为 ***）；import：按主键 INSERT OR REPLACE 合并恢复；list：列出快照文件。\n适合：换机迁移前备份配置/记忆、误删记忆后找回、批量迁移项目清单。\n副作用：import 会写入数据库（按主键覆盖重复数据，不删除现有行）。\n返回：导出/恢复统计或文件列表。",
+    },
+    ToolSpec {
+        name: "prompt_optimize",
+        desc: "失败模式分析：汇总近 N 天工具/任务执行记录中的高频失败（按工具名+错误样本聚类），并给出针对性改进建议（复用错误诊断规则，不调用模型）。\n参数：{\"days\":<可选天数窗口，缺省 7>,\"min_fail\":<可选聚合门槛次数，缺省 1>,\"limit\":<可选输出条数 1-30，缺省 10>}。\n适合：任务反复失败后自查行为盲区（如反复构建失败说明前置检查不足）、优化前先看高频失败点。\n副作用：无（只读统计）。\n返回：失败模式清单（次数 + 错误样本 + 建议动作）。",
+    },
+    ToolSpec {
+        name: "export_tools_meta",
+        desc: "导出全部工具元数据为 JSON 快照（tools_meta.json：名称/描述/任务分组/权限级别/时限成本元数据），供外部工具/前端/自动化消费（只导出，不影响运行时加载）。\n参数：{\"out\":\"<可选输出路径，缺省项目 .deveco-agent/tools_meta.json>\"}。\n适合：外部系统需要完整工具清单、CI 校验工具注册表一致性、用户自定义工具前置调研。\n副作用：写一个 JSON 文件。\n返回：导出条目数与文件路径。",
+    },
+    ToolSpec {
+        name: "compose",
+        desc: "组合链执行：把多个工具按顺序串成一条链一次跑完（每步输出成功/失败与结果摘要）。\n参数：{\"chain\":\"build_and_deploy|smoke|test_and_report\"}（预置链）或 {\"steps\":[{\"tool\":\"<工具名>\",\"args\":{...},\"fallback\":\"<可选备选工具>\",\"fallback_args\":{...}},...],\"stop_on_error\":<可选缺省 true>}（自定义）；链级参数（如 device）自动合并进每一步；步骤可声明 fallback，主工具失败时自动执行备选工具并把失败原因一并返回。\n适合：固定套路（先构建再部署、先测试再出报告）不想分步调用时；想观察中间结果建议分步调用。\n副作用：等于链内各工具副作用之和。\n返回：每步结果（输出截断）+ 总结论。",
+    },
+    // ---- 多模态/密钥域（media_tools）----
+    ToolSpec {
+        name: "read_pdf",
+        desc: "提取 PDF 文件文本内容（需求文档/规范文档常见格式），默认前 8000 字符。\n参数：{\"path\":\"<PDF 文件路径，相对项目根或绝对路径>\",\"max_chars\":<可选 200-60000，缺省 8000>}。\n适合：用户甩来需求 PDF、阅读规范/协议文档；扫描件/图片型 PDF 无文字层时提示需要 OCR。\n副作用：无（只读）。\n返回：提取的文本内容（截断提示总字符数）。",
+    },
+    ToolSpec {
+        name: "image_inspect",
+        desc: "读取图片元数据：尺寸、格式、文件大小（不做图像内容识别）。\n参数：{\"path\":\"<图片路径>\"}。\n适合：截图质检（确认分辨率）、检查资源图片尺寸/格式是否符合规范（如启动图 2K、图标 512x512）。\n副作用：无（只读）。\n返回：尺寸/格式/大小/路径。",
+    },
+    ToolSpec {
+        name: "ocr_image",
+        desc: "Windows 系统 OCR：识别图片中的文字（Windows.Media.Ocr，无需外置引擎/模型，需系统装有 OCR 语言包）。\n参数：{\"path\":\"<图片路径，支持 png/jpg/jpeg/bmp>\"}。\n适合：扫描件/图片型 PDF 提取文字（配合 read_pdf 提示）、截图里的报错信息识别、验证码/文案核对。\n副作用：无（只读，调用系统 OCR 服务）。\n返回：识别文本（按行）与行数；无文字时提示可能原因。",
+    },
+    ToolSpec {
+        name: "secret_store",
+        desc: "把密钥保存到系统钥匙串（Windows 凭据管理器），替代明文落盘存储。\n参数：{\"key\":\"<键名 1-64 字符>\",\"value\":\"<密钥内容>\"}。\n适合：保存 API key、签名密码、账号 token 等敏感信息；与 secret_get/secret_delete 配合。\n副作用：写入系统钥匙串（持久化）。\n返回：保存确认。",
+    },
+    ToolSpec {
+        name: "secret_get",
+        desc: "从系统钥匙串读取密钥（返回明文给 Agent 使用）。\n参数：{\"key\":\"<键名>\"}。\n注意：明文会出现在工具结果中（对话历史可见），用完建议 secret_delete 清除。\n副作用：无（只读钥匙串）。\n返回：密钥明文。",
+    },
+    ToolSpec {
+        name: "secret_delete",
+        desc: "删除系统钥匙串中的密钥：密钥轮换、不再使用或误存凭据时清理。\n参数：{\"key\":\"<键名，与 secret_store 写入时一致>\"}。\n适合：替换签名密钥、清理过期的 API token，保证钥匙串与当前配置一致。\n副作用：删除系统凭据（不可恢复，删除后 secret_get 将不可用）。\n返回：删除确认。",
+    },
+    // ---- LSP 完整能力（lsp_client）----
+    ToolSpec {
+        name: "lsp_rename",
+        desc: "LSP 重命名符号：基于 AST 找出全部引用并同步修改（跨文件），是重构最值钱的能力。\n参数：{\"path\":\"<文件路径>\",\"line\":<行号 1 起>,\"column\":<列号 1 起>,\"new_name\":\"<新符号名>\"}。\n依赖：@arkts/language-server（会话内常驻进程）。\n副作用：修改文件（可 undo_edit 回退）。\n返回：修改的文件数与增删行数。",
+    },
+    ToolSpec {
+        name: "lsp_format",
+        desc: "按 ArkTS 语言服务风格格式化整个文件（缩进/换行/空格规范化）。\n参数：{\"path\":\"<文件路径>\",\"tab_size\":<可选 2-8，缺省 4>}。\n适合：写完代码统一格式、消除 hvigor 格式化告警。\n副作用：修改文件（可 undo_edit 回退）。\n返回：格式变更统计（增删行数）。",
+    },
+    ToolSpec {
+        name: "format_file",
+        desc: "按 ArkTS 语言服务风格格式化单个文件（缩进/换行/空格规范化）。\n参数：{\"path\":\"<文件路径>\",\"dry_run\":<可选 true 只返回 diff 不落盘，缺省 false>,\"tab_size\":<可选 2-8，缺省 4>}。\n适合：写完代码统一格式、格式化前先用 dry_run 预览改动再落盘。\n副作用：修改文件（可 undo_edit 回退；dry_run=true 时无副作用）。\n返回：格式化 diff 预览或变更统计。",
+    },
+    ToolSpec {
+        name: "lsp_code_action",
+        desc: "列出或执行某位置的 quick fix（自动修复导入缺失、类型错误建议等）。\n参数：{\"path\":\"<文件路径>\",\"line\":<行号>,\"column\":<列号>,\"index\":<可选动作编号>}。\n不带 index 时列出该位置全部可用修复（带编号）；带 index 执行对应修复并落盘。\n适合：lsp_diagnostics 报错后的自动修复。\n副作用：执行修复时修改文件（可 undo_edit 回退）。\n返回：修复清单或执行结果。",
+    },
+    ToolSpec {
+        name: "lsp_completion",
+        desc: "LSP 自动补全：在指定行列位置获取基于 AST 的补全候选（方法/属性/关键字等）。\n参数：{\"path\":\"<文件路径>\",\"line\":<行号>,\"column\":<列号>,\"limit\":<可选 1-50，缺省 30>}。\n适合：不确定某处可写什么（如组件属性、API 参数）时让补全提示。\n副作用：无（只读查询）。\n返回：补全候选列表（类型/标签/详情）。",
+    },
+    ToolSpec {
+        name: "lsp_signature",
+        desc: "LSP 函数签名提示：在调用点返回函数签名与当前参数位置。\n参数：{\"path\":\"<文件路径>\",\"line\":<行号>,\"column\":<列号>}。\n适合：确认函数参数顺序/类型、写调用时不确定参数。\n副作用：无（只读查询）。\n返回：签名列表（active 参数位置 ▶ 标记）。",
+    },
+    // ---- 图表提取（batch2）----
+    ToolSpec {
+        name: "chart_extract",
+        desc: "从图表截图/设计图中提取结构化数据（视觉模型读图）。\n参数：{\"path\":\"<单张图表路径>\"} 或 {\"charts\":[\"<多张图表路径>\"]}（最多 8 张），\n{\"format\":\"table|json|csv\"（缺省 table：Markdown 表格）,\"focus\":\"<可选，提取重点，如 只看 2024 年数据>\",\"title\":\"<可选，图表说明>\"}。\n适合：性能/包体积/架构图的柱状图、折线图、饼图数据提取；图表会随下轮请求进入模型视野。\n副作用：无（只读）。\n返回：按指定格式输出的结构化数据（含列名/单位/系列，不得臆造数据）。",
+    },
+    // ---- 事实抽取（batch2）----
+    ToolSpec {
+        name: "fact_extract",
+        desc: "把任务收尾时值得长期记住的事实（架构约定/技术决策/踩坑根因/构建命令）沉淀为项目记忆。\n参数：{\"fact\":\"<事实/经验文本>\"（必填，≤2000 字符）,\"category\":\"<可选 general|code|build|deploy|decision|pitfall>\",\"title\":\"<可选，缺省自动截取>\",\"dedupe\":<可选 true/false，缺省 true 自动去重>}。\n适合：本轮任务产出了对后续同类任务有复用价值的结论时调用。\n副作用：写入项目记忆库（后续对话自动参考）。\n返回：保存确认或与已有记忆重复的提示。",
+    },
+    // ---- Reflexion 反思卡查询/钉住（batch2）----
+    ToolSpec {
+        name: "reflexion_query",
+        desc: "查询 Reflexion 反思卡片：最近任务的失败模式与对策（连续失败 ≥2 次才成卡）。\n参数：{\"limit\":<可选 1-50，缺省 20>}。\n适合：新任务开始时回顾历史失败教训、排查重复错误。\n副作用：无（只读进程内缓存）。\n返回：卡片列表（工具名/失败模式/证据/对策/是否钉住）。",
+    },
+    ToolSpec {
+        name: "reflexion_pin",
+        desc: "钉住/取消钉住 Reflexion 反思卡片：钉住的卡片不受 1 小时时间窗口限制，持续注入系统提示。\n参数：{\"tool\":\"<工具名>\",\"pin\":<可选 true/false，缺省 true>}。\n适合：某条失败教训对当前多轮任务都重要（如 某个命令必须加参数），钉住防遗忘。\n副作用：修改进程内反思卡状态（重启后失效）。\n返回：钉住确认。",
+    },
+    // ---- 报告导出（batch2）----
+    ToolSpec {
+        name: "export_report",
+        desc: "把 Markdown 报告导出为 HTML/PDF（自带极简渲染器，PDF 走 Edge/Chrome headless 打印）。\n参数：{\"content\":\"<Markdown 正文>\"} 或 {\"path\":\"<md 文件路径>\"}，\n{\"format\":\"html|pdf|both\"（缺省 pdf）,\"out\":\"<可选输出路径>\"}。\n适合：任务收尾把检查报告/设计文档导出给用户留存。\n副作用：写文件到 .deveco-agent/reports/（或 out 指定位置）。\n返回：生成的文件路径列表。",
+    },
+    // ---- 质量/度量/工程治理（TOOL_ENHANCEMENTS 第 2/3 批）----
+    ToolSpec {
+        name: "code_metrics",
+        desc: "静态代码度量（启发式，无需编译）：文件/目录的圈复杂度、注释率、最大嵌套深度、函数数。\n参数：{\"path\":\"<文件或目录，相对项目根或绝对路径，缺省项目根>\",\"top\":<可选列出复杂度最高文件数，缺省 10>}。\n适合：重构前评估哪些文件复杂度超标（≥10 需关注、≥15 建议拆分）、量化注释覆盖。\n副作用：无（只读扫描）。\n返回：汇总指标 + 复杂度 Top 文件 + 机器可读 JSON。",
+    },
+    ToolSpec {
+        name: "metric_export",
+        desc: "导出 Prometheus text 格式指标：工具调用次数/失败/耗时总和 + LLM 请求/Token/费用（按模型与工具）。\n参数：{\"days\":<可选最近 N 天，缺省 7>}。\n适合：接监控大盘（Grafana/Prometheus）、生成自动化巡检报告。\n副作用：无（只读聚合）。\n返回：text 格式指标行（deveco_tool_*/deveco_llm_*）。",
+    },
+    ToolSpec {
+        name: "log_aggregate",
+        desc: "一次调用归并三源日志：hilog（设备运行日志）+ runtime（工程本地运行日志）+ faultlog（崩溃副本）。\n参数：{\"device\":\"<可选>\",\"since\":<可选分钟窗口，缺省 5，透传 hilog>,\"sources\":[\"hilog\",\"runtime\",\"faultlog\"（缺省三源全开）],\"max_lines\":<可选每源行数上限，缺省 120>}。\n适合：崩溃/异常定位时横向对照设备日志与本地日志时间线，无需逐个工具分别调。\n副作用：无（只读；faultlog 源读取 .deveco-agent/crashes 副本）。\n返回：分源归并报告与时间线提示。",
+    },
+    ToolSpec {
+        name: "snippet_insert",
+        desc: "代码片段库 CRUD：保存/覆盖/查询常用代码模板，避免反复手写。\n参数：{\"action\":\"insert|list|get|search|update|delete（缺省 insert）\",\"name\":\"<片段名，唯一>\",\"body\":\"<代码体，insert/update 必填>\",\"description\":\"<可选说明>\",\"language\":\"<可选，缺省 ArkTS>\",\"keyword\":\"<search 用>\"}。\n适合：沉淀本项目的常见写法（网络请求封装/列表懒加载/权限申请模板），后续让模型按 name 复用。\n副作用：写 snippets 表（本地库）。\n返回：操作结果与库内片段列表。",
+    },
+    ToolSpec {
+        name: "replay_trace",
+        desc: "回放会话事件调用链（按任务 trace_id 1:1 还原）：查看某次任务的工具调用序列与参数/输出。\n参数：{\"trace_id\":\"<可选，缺省列出最近 10 个任务>\",\"conversation_id\":\"<可选，缺省当前会话>\"}。\n适合：复盘失败任务定位卡点（哪个工具超时/报错）、给用户解释刚才做了什么。\n副作用：无（只读事件日志）。\n返回：调用链事件序列（时间/类型/工具/参数/输出摘要）。",
+    },
+    ToolSpec {
+        name: "api_test",
+        desc: "API 用例批量测试：读取 OpenAPI 3 描述或显式用例，逐条发起请求并断言状态码。\n参数：{\"spec\":\"<OpenAPI JSON 文件路径（相对项目根）或内联 JSON>\",\"base_url\":\"<可选覆盖 servers[0].url>\",\"cases\":[{\"name\":\"<可选>\",\"path\":\"/users\",\"method\":\"GET\",\"status\":200,\"headers\":{},\"body\":\"\"}],\"timeout_secs\":<可选，缺省 15>}。\n无 cases 时自动提取 spec 全部 GET 路径冒烟探测。\n适合：联调前验证接口可用性/状态码契约、回归检查。\n副作用：向目标服务发起 HTTP 请求（只读探测为主）。\n返回：逐用例通过/失败报告。",
+    },
+    ToolSpec {
+        name: "api_mock",
+        desc: "OpenAPI mock 服务：解析 OpenAPI 3.x spec（路径或内联 JSON），生成零依赖 Node mock 服务并后台启动（内置 Node，常驻 12 小时，可 job_kill 终止）。\n参数：{\"path\":\"<OpenAPI JSON 路径或内联>\",\"port\":<可选端口 1024-65535，缺省 18080>,\"headers\":{\"X-Custom\":\"value\"}}。\n每个端点从 200 响应（或首个 2xx/default）的 example/schema 递归生成样例数据，路径参数 {id} 自动匹配；响应统一包装为 {\"_mock\":{\"status\",\"path\",\"method\"},\"data\":<样例>}。\n适合：后端未就绪时先行联调前端/契约验证、给 api_test 提供稳定桩服务。\n副作用：在 .deveco-agent/mock/ 写脚本并启动本地后台服务（占用端口，job_kill 终止）。\n返回：服务地址、路由数、示例请求与任务 ID。",
+    },
+    ToolSpec {
+        name: "api_health",
+        desc: "批量探测外部 API 健康状态：GET 状态码 + 耗时。\n参数：{\"urls\":[\"<http(s)://…>\"...]，或单 url 字段；\"timeout_secs\":<可选，缺省 8>}。\n适合：部署前后验证依赖服务可用性、巡检第三方接口。\n副作用：向目标服务发起 HTTP 请求（只读探测）。\n返回：逐端点健康表 + 汇总。",
+    },
+    ToolSpec {
+        name: "obfuscate",
+        desc: "读写 HarmonyOS 工程混淆配置（build-profile.json5 的 obfuscation 开关）。\n参数：{\"action\":\"status|enable|disable（缺省 status）\",\"path\":\"<可选 build-profile.json5 路径，缺省项目根>\"}。\n适合：发布前开启混淆、排查混淆导致的问题时临时关闭；写前自动备份到 .deveco-agent/backups/。\n副作用：修改 build-profile.json5（写前备份）。\n返回：当前开关状态或切换结果。",
+    },
+    ToolSpec {
+        name: "sandbox_exec",
+        desc: "危险命令干跑：在系统临时沙箱目录模拟执行（可先复制 source 目录进去），预览结果后再决定是否真执行。\n参数：{\"command\":\"<命令串>\",\"source\":\"<可选源目录，复制到沙箱后执行（限 50MB/200 文件）>\",\"mode\":\"simulate|preview（缺省 simulate）\",\"timeout_secs\":<可选，缺省 30>}。\nsimulate：有 source 时在沙箱内真执行（影响面仅沙箱），否则对命中危险模式的命令只做静态预览；preview：仅静态危险分析不执行。\n适合：rm -rf / git clean -f 等破坏性命令先看影响面、批量改名/重构前验证脚本行为。\n副作用：系统临时目录创建/删除文件（不影响项目）；preview 模式无任何副作用。\n返回：危险分析 + 沙箱执行输出与退出码。",
+    },
+    ToolSpec {
+        name: "license_check",
+        desc: "依赖许可证合规扫描（ohpm/Cargo/uv，不联网）。\n参数：{\"action\":\"scan|list\"（缺省 scan）,\"allow\":<可选白名单数组，缺省 MIT/Apache-2.0/BSD-3-Clause/ISC/MPL-2.0/CC0-1.0>,\"deny\":<可选黑名单数组>,\"path\":\"<可选工程子目录>\"}。\n实现：扫 oh-package.json5 + lock + Cargo.toml + pyproject.toml，匹配 allow/deny 列表；lock 里有 license 字段的优先用。\n适合：法务合规审查、企业许可证策略、新人 onboarding 时检查项目依赖是否合规。\n副作用：仅读文件。\n返回：依赖清单 + 状态（ALLOW/DENY/未确认）+ 修复建议。",
+    },
+    ToolSpec {
+        name: "vuln_scan",
+        desc: "依赖漏洞扫描（基于内置小型漏洞库，不联网）。\n参数：{\"source\":\"ohpm|cargo|uv|all\"（缺省 all）,\"path\":\"<可选子目录>\"}。\n实现：解析 lock 文件，提取包名+版本，与内置已知漏洞库（lodash/axios/requests 等）匹配；命中返回严重级别+描述。\n适合：CI 兜底、升级前快速评估、临时离线场景。\n副作用：仅读 lock 文件。\n返回：命中列表（来源/名称/版本/严重/描述）+ 高危提醒；生产建议接 OSV/NVD 实时数据。",
+    },
+    ToolSpec {
+        name: "docx_read",
+        desc: "读取 Word 文档（.docx）正文文本，保留段落结构。\n参数：{\"path\":\"<docx 文件路径，相对工程根或绝对>\"}。\n实现：docx 是 zip 包，解压读 word/document.xml，提取 <w:t> 文本节点。\n适合：产品需求文档导入对话、设计稿文字说明提取、会议纪要分析。\n副作用：仅读文件。\n返回：纯文本（按段落换行，截断 5000 字符）+ 段落数 + 文件元信息（作者/字数等）。",
+    },
+    ToolSpec {
+        name: "audio_transcribe",
+        desc: "音频转文字（本地 whisper.cpp，依赖外部二进制）。\n参数：{\"path\":\"<音频文件路径（wav/mp3/m4a/ogg）>\"}。\n实现：在 PATH 或 resources/ 下找 whisper.cpp 二进制 + ggml-base.bin 模型；调用并返回结果文本。\n前置：用户需自行安装 whisper.cpp（https://github.com/ggerganov/whisper.cpp），模型文件放 ~/.cache/whisper/。\n副作用：仅读音频文件 + 调外部 CLI。\n返回：识别文本（截断 4000 字符）+ 耗时 + 段数。失败时给出安装提示。",
+    },
+    ToolSpec {
+        name: "attach_debugger",
+        desc: "通过 hdc 把调试器 attach 到目标进程（ArkTS/native）。\n参数：{\"device\":\"<可选设备，缺省默认>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"wait_secs\":\"<可选等待秒数，缺省 30>\"}。\n实现：先 hdc shell pidof 拿 PID，再 hdc shell debuggerd -p <pid> attach；失败时回退到 `aa debug -b <bundle>` 启动开发模式。\n适合：应用闪退但 hilog 没抓到根因时 attach 看现场调用栈、运行期断点调试（需 DevEco Studio 配合 Attach Debugger）。\n副作用：在设备端拉起调试器（性能开销 + 日志输出增加，不修改用户数据）。\n返回：attach 状态 + debuggerd 输出 + 后续操作建议。",
+    },
+    ToolSpec {
+        name: "step_debug",
+        desc: "对已 attach 的进程发单步调试指令（hdc debuggerd）。\n参数：{\"device\":\"<可选>\",\"pid\":\"<可选，未指定取当前工程应用 PID>\",\"action\":\"step|next|continue|interrupt|where|info\"（缺省 step）}。\n实现：hdc shell debuggerd -p <pid> -c <command>；step=si/s, next=ni/n, continue=c, interrupt=i, where=bt, info=r。\n适合：attach 后单步到可疑函数、看调用栈（where/backtrace）、查看寄存器（info）。\n副作用：向已 attach 进程发调试命令。\n返回：debuggerd 命令输出。",
+    },
+    ToolSpec {
+        name: "ota_pack",
+        desc: "基于 HAP 包制作 HarmonyOS OTA 升级包（.pkg）。\n参数：{\"hap_path\":\"<HAP 文件路径>\"（必填）,\"out_path\":\"<输出 .pkg 路径>\"（必填）,\"profile_path\":\"<可选签名 profile.json>\"}。\n实现：调 java -jar packagingtool.jar --mode ota --hap <HAP> --out <pkg> --profile <profile> --force。\n前置：DevEco Studio 工具链或 Sdk Command-Line Tools（含 packagingtool.jar，PATH 或 HOS_PACKAGING_TOOL 环境变量）。\n副作用：写 .pkg 到 out_path。\n返回：出包路径 + 大小 + 耗时 + stdout 摘要；失败时 stderr。",
     },
 ];
 
@@ -548,6 +1056,12 @@ pub async fn run_tool(
     } else {
         serde_json::from_str(args).unwrap_or(Value::Null)
     };
+    // [67] 工具响应缓存：仅 L0 只读工具命中缓存直接返回（TTL 15s，键含项目+参数）
+    if crate::services::permissions::tool_level(name) == crate::services::permissions::Level::L0 {
+        if let Some(hit) = crate::services::tool_cache::get(name, project_id, &args) {
+            return Ok(hit);
+        }
+    }
     // MCP 工具：转发到对应服务器执行（tools/call）
     // 同名多实例：hint 中带 #n 后缀（mysql#2），按同一排序规则查 DB 定位实例后按 id 精确调用
     if let Some((server, tool)) = parse_mcp_tool_name(name) {
@@ -564,12 +1078,14 @@ pub async fn run_tool(
             };
             if let Some(id) = instance_id {
                 let mcp_result = mcp.call_by_id(&id, &tool, args.clone()).await;
-                return mcp_result;
+                // 统一出口脱敏（[57]）：MCP 返回同样过文本级遮罩
+                return mcp_result.map(|ok| crate::utils::redact::redact_text(&ok));
             }
             // 查不到编号实例：可能是用户实例名本身含 #n（唯一实例），回退旧路径按全名匹配
         }
         let mcp_result = mcp.call(&server, &tool, args.clone(), Some(project_id)).await;
-        return mcp_result;
+        // 统一出口脱敏（[57]）：MCP 返回同样过文本级遮罩
+        return mcp_result.map(|ok| crate::utils::redact::redact_text(&ok));
     }
     // 有效根：用户指明目录优先（按消息先后顺序），会话项目根兜底（去重）。
     // 文件工具相对路径按此顺序逐个尝试，绝对路径在任一有效根内放行。
@@ -627,16 +1143,19 @@ pub async fn run_tool(
         "search_sdk_api" => test_tools::search_sdk_api(&args, db),
         "read_sdk_api_module" => test_tools::read_sdk_api_module(&args, db),
         "check_sdk_alignment" => check_sdk_alignment(&args, &roots, db),
+        "create_harmony_project" => project_tools::create_harmony_project(&args, &roots).await,
         "show_diagnose_card" => show_diagnose_card(&args, ctx).await,
         "search_harmony_docs" => test_tools::search_harmony_docs_tool(&args, ctx).await,
         "read_harmony_doc" => test_tools::read_harmony_doc_tool(&args, ctx).await,
         "save_memory" => memory_tools::save_memory(&args, project_id, db).await,
+        "conversation_search" => memory_tools::conversation_search(&args, project_id, db).await,
         "list_dir" => fs_tools::list_dir(&args, &roots).await,
         "read_file" => fs_tools::read_file(&args, &roots).await,
         "find_files" => fs_tools::find_files(&args, &roots).await,
         "grep_files" => fs_tools::grep_files(&args, &roots).await,
         "write_file" => fs_tools::write_file(&args, &roots, &ctx.conversation_id).await,
         "edit_file" => fs_tools::edit_file(&args, &roots, &ctx.conversation_id).await,
+        "preview_edit" => fs_tools::preview_edit(&args, &roots, &ctx.conversation_id).await,
         "run_command" => cmd_tools::run_command(&args, &roots, ctx).await,
         "job_list" => cmd_tools::job_list_tool(&args, &ctx.conversation_id),
         "job_output" => cmd_tools::job_output_tool(&args, &ctx.conversation_id),
@@ -648,10 +1167,14 @@ pub async fn run_tool(
         "git_diff" => git_tools::git_diff(&args, &roots).await,
         "git_commit" => git_tools::git_commit(&args, &roots).await,
         "run_tests" => test_tools::run_tests(&args, &roots).await,
+        "flaky_test_detect" => test_tools::flaky_test_detect(&args, &roots).await,
+        "smoke_test" => compose_tools::smoke_test(&args, project_path, path_hints, project_id, db, mcp, ctx).await,
+        "compose" => compose_tools::compose(&args, project_path, path_hints, project_id, db, mcp, ctx).await,
         "read_logcat" => test_tools::read_logcat(&args).await,
         "read_runtime_logs" => test_tools::read_runtime_logs(&args, &roots, ctx).await,
         "web_fetch" => test_tools::web_fetch(&args).await,
         "take_screenshot" => take_screenshot(&args, &roots).await,
+        "view_image" => doc_tools::view_image(&args, &roots).await,
         "verify_ui" => verify_ui(&args, &roots).await,
         "collect_perf" => collect_perf(&args, &roots).await,
         "deploy_all" => build_tools::deploy_all(&args, &roots, ctx, project_id).await,
@@ -659,9 +1182,11 @@ pub async fn run_tool(
         "run_ui_flow" => test_tools::run_ui_flow(&args, &roots).await,
         "run_perf_benchmark" => ui_tools::run_perf_benchmark(&args, &roots).await,
         "dump_ui_hierarchy" => ui_tools::dump_ui_hierarchy(&args, &roots).await,
+        "ui_locator" => ui_tools::ui_locator(&args, &roots).await,
         "start_ability" => ui_tools::start_ability(&args, &roots).await,
         "clear_app_data" => ui_tools::clear_app_data(&args, &roots).await,
         "dump_memory" => ui_tools::dump_memory(&args, &roots).await,
+        "memory_snapshot" => quality_tools::memory_snapshot(&args, &roots).await,
         "get_installed_apps" => ui_tools::get_installed_apps(&args, &roots).await,
         "get_app_info" => ui_tools::get_app_info(&args, &roots).await,
         "uninstall_app" => ui_tools::uninstall_app(&args, &roots).await,
@@ -671,11 +1196,16 @@ pub async fn run_tool(
         "screen_record" => ui_tools::screen_record(&args, &roots).await,
         "record_ui" => ui_tools::record_ui(&args, &roots).await,
         "replay_ui" => ui_tools::replay_ui(&args, &roots).await,
+        "gesture_perform" => ui_tools::gesture_perform(&args, &roots).await,
         "analyze_hap_size" => ui_tools::analyze_hap_size(&args, &roots).await,
+        "size_diff" => ui_tools::size_diff(&args, &roots),
+        "screenshot_diff" => ui_tools::screenshot_diff(&args, &roots),
         "search_hilog" => debug_tools::search_hilog(&args, &roots).await,
+        "log_query" => quality_tools::log_query(&args, &roots, ctx).await,
         "run_lint" => debug_tools::run_lint(&args, &roots).await,
         "set_network_condition" => debug_tools::set_network_condition(&args, &roots).await,
         "check_signature" => debug_tools::check_signature(&args, &roots).await,
+        "diagnose_signing" => build_tools::diagnose_signing(&args, &roots).await,
         "dump_battery" => debug_tools::dump_battery(&args, &roots).await,
         "scan_api_compat" => debug_tools::scan_api_compat(&args, &roots, db).await,
         "auto_explore" => explore_tools::auto_explore(&args, &roots).await,
@@ -708,8 +1238,11 @@ pub async fn run_tool(
         "undo_edit" => fs_tools::undo_edit(&args, &roots, &ctx.conversation_id).await,
         "get_diagnostics" => get_diagnostics(project_path).await,
         "todo_write" => todo_write(&args, ctx).await,
+        "todo_get" => todo_get(&args, ctx).await,
         "ask_user" => ask_user(&args, ctx).await,
+        "ask_history" => ask_history(&args, ctx).await,
         "check_code" => cmd_tools::check_code_tool(&args, &roots).await,
+        "secret_scan" => cmd_tools::secret_scan_tool(&args, &roots).await,
         "deep_scan" => cmd_tools::deep_scan_tool(&args, &roots).await,
         "codebase_search" => cmd_tools::codebase_search_tool(&args, &roots).await,
         "get_symbol_details" => cmd_tools::get_symbol_details_tool(&args, &roots).await,
@@ -721,12 +1254,86 @@ pub async fn run_tool(
         "get_env_info" => cmd_tools::get_env_info().await,
         "copy_file" => fs_tools::copy_file(&args, &roots).await,
         "get_file_info" => fs_tools::get_file_info(&args, &roots).await,
+        "read_document" => doc_tools::read_document(&args, &roots).await,
         "list_agents" => cmd_tools::list_agents_tool(),
+        "agent_publish" => crate::agent::agent_board::agent_publish(&args, ctx).await,
+        "agent_subscribe" => crate::agent::agent_board::agent_subscribe(&args, ctx).await,
+        "job_template" => job_template(&args, &roots).await,
+        "lsp_definition" => crate::agent::lsp_client::lsp_definition(&args, &roots, &ctx.conversation_id).await,
+        "lsp_references" => crate::agent::lsp_client::lsp_references(&args, &roots, &ctx.conversation_id).await,
+        "lsp_symbols" => crate::agent::lsp_client::lsp_symbols(&args, &roots, &ctx.conversation_id).await,
+        "lsp_hover" => crate::agent::lsp_client::lsp_hover(&args, &roots, &ctx.conversation_id).await,
+        "lsp_diagnostics" => crate::agent::lsp_client::lsp_diagnostics(&args, &roots, &ctx.conversation_id).await,
+        "debug_probe" => debug_tools::debug_probe(&args, &roots, ctx).await,
+        "stack_dump" => debug_tools::stack_dump(&args, &roots).await,
         "http_request" => cmd_tools::http_request(&args).await,
         "multi_edit" => fs_tools::multi_edit(&args, &roots, &ctx.conversation_id).await,
         "device_perf" => cmd_tools::device_perf(&args).await,
+        // ---- 工具自我管理域（meta_tools）----
+        "tool_list" => meta_tools::tool_list(&args, &roots).await,
+        "tool_help" => meta_tools::tool_help(&args, &roots).await,
+        "tool_history" => meta_tools::tool_history(&args, &roots, &ctx.conversation_id, db).await,
+        "db_query" => meta_tools::db_query(&args, &roots, db).await,
+        "share_session" => meta_tools::share_session(&args, &roots, &ctx.conversation_id, db).await,
+        "import_session" => meta_tools::import_session(&args, &roots, project_id, db).await,
+        "trace_export" => meta_tools::trace_export(&args, &roots, &ctx.conversation_id, db).await,
+        "permission_audit" => meta_tools::permission_audit(&args, &roots, project_id, db).await,
+        "db_migrate" => meta_tools::db_migrate(&args, &roots, db).await,
+        "state_snapshot" => meta_tools::state_snapshot(&args, &roots, db).await,
+        "prompt_optimize" => meta_tools::prompt_optimize(&args, &roots, project_id, db).await,
+        "export_tools_meta" => meta_tools::export_tools_meta(&args, &roots).await,
+        // ---- 多模态/密钥域（media_tools）----
+        "read_pdf" => media_tools::read_pdf(&args, &roots).await,
+        "image_inspect" => media_tools::image_inspect(&args, &roots).await,
+        "ocr_image" => media_tools::ocr_image(&args, &roots).await,
+        "secret_store" => media_tools::secret_store(&args, &roots).await,
+        "secret_get" => media_tools::secret_get(&args, &roots).await,
+        "secret_delete" => media_tools::secret_delete(&args, &roots).await,
+        // ---- LSP 完整能力 ----
+        "lsp_rename" => crate::agent::lsp_client::lsp_rename(&args, &roots, &ctx.conversation_id).await,
+        "lsp_format" => crate::agent::lsp_client::lsp_format(&args, &roots, &ctx.conversation_id).await,
+        "format_file" => crate::agent::lsp_client::format_file(&args, &roots, &ctx.conversation_id).await,
+        "lsp_code_action" => crate::agent::lsp_client::lsp_code_action(&args, &roots, &ctx.conversation_id).await,
+        "lsp_completion" => crate::agent::lsp_client::lsp_completion(&args, &roots, &ctx.conversation_id).await,
+        "lsp_signature" => crate::agent::lsp_client::lsp_signature(&args, &roots, &ctx.conversation_id).await,
+        // ---- 图表提取 / 事实抽取 / Reflexion / 报告导出（batch2）----
+        "chart_extract" => doc_tools::chart_extract(&args, &roots).await,
+        "fact_extract" => memory_tools::fact_extract(&args, project_id, db).await,
+        "reflexion_query" => meta_tools::reflexion_query(&args, &roots).await,
+        "reflexion_pin" => meta_tools::reflexion_pin(&args, &roots).await,
+        "export_report" => meta_tools::export_report(&args, &roots).await,
+        // ---- 质量/度量/工程治理（TOOL_ENHANCEMENTS 第 2/3 批）----
+        "code_metrics" => quality_tools::code_metrics(&args, &roots).await,
+        "metric_export" => quality_tools::metric_export(&args, &roots, project_id, db).await,
+        "log_aggregate" => quality_tools::log_aggregate(&args, &roots, ctx).await,
+        "snippet_insert" => quality_tools::snippet_insert(&args, &roots, db).await,
+        "replay_trace" => quality_tools::replay_trace(&args, &roots, &ctx.conversation_id, db).await,
+        "api_test" => quality_tools::api_test(&args, &roots).await,
+        "api_mock" => quality_tools::api_mock(&args, &roots, ctx).await,
+        "api_health" => quality_tools::api_health(&args).await,
+        "obfuscate" => quality_tools::obfuscate(&args, &roots).await,
+        "sandbox_exec" => quality_tools::sandbox_exec(&args, &roots).await,
+        "license_check" => quality_tools::license_check(&args, &roots).await,
+        "vuln_scan" => quality_tools::vuln_scan(&args, &roots).await,
+        "docx_read" => quality_tools::docx_read(&args, &roots).await,
+        "audio_transcribe" => quality_tools::audio_transcribe(&args, &roots).await,
+        "attach_debugger" => quality_tools::attach_debugger(&args, &roots).await,
+        "step_debug" => quality_tools::step_debug(&args, &roots).await,
+        "ota_pack" => quality_tools::ota_pack(&args, &roots).await,
         other => Err(format!("未知工具: {other}")),
     };
+    // 统一出口脱敏（[57]）：所有工具返回文本过文本级遮罩（密钥/JWT/邮箱/手机号/身份证等）
+    let result = result.map(|ok| crate::utils::redact::redact_text(&ok));
+    // 统一错误信封（[65]）：所有工具的 Err 自动套上 category/可重试/advice 头
+    let result = result.map_err(|e| errors::ToolError::enrich(name, e).to_envelope());
+    // [67] 写缓存：仅 L0 只读工具（有副作用的 L1/L2 绝不缓存）
+    if result.is_ok()
+        && crate::services::permissions::tool_level(name) == crate::services::permissions::Level::L0
+    {
+        if let Ok(ok) = &result {
+            crate::services::tool_cache::put(name, project_id, &args, ok);
+        }
+    }
     // 修改类工具成功后增量失效符号缓存：只重扫被改动的文件，其余文件复用缓存。
     // git_commit/git_stash/run_command 等无法枚举改动面的不显式失效，
     // 由 index_project_cached 的文件指纹（mtime+大小）对比兜底发现。
@@ -752,7 +1359,7 @@ pub async fn run_tool(
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        for rel in changed_paths {
+        for rel in &changed_paths {
             let rels = [rel.to_string()];
             for r in &roots {
                 let p = Path::new(r);
@@ -761,8 +1368,41 @@ pub async fn run_tool(
                 }
             }
         }
+        // 项目标识文件（框架标志文件）变更：重新分类项目身份并广播刷新——
+        // 新增/删除 build-profile.json5、package.json、go.mod 等会改变项目类型，
+        // 前端据此刷新对话框顶部徽标、概览、右侧栏各 tab。
+        if !project_id.is_empty() && !changed_paths.is_empty() {
+            if let Some(app) = ctx.app.as_ref() {
+                let changed: Vec<String> = changed_paths.iter().map(|s| s.to_string()).collect();
+                crate::commands::project::on_project_meta_files_changed(app, project_id, &changed, &roots, db);
+            }
+        }
     }
     result
+}
+
+/// 递归入口：compose / fallback 链 / smoke_test 内部经本函数间接调用 run_tool，
+/// Box 化打破 async 递归类型（run_tool → compose → run_tool 的 future 无限嵌套）。
+pub(crate) fn run_tool_boxed<'a>(
+    name: &'a str,
+    args: &'a str,
+    project_path: &'a str,
+    path_hints: &'a [String],
+    project_id: &'a str,
+    db: &'a crate::db::DbState,
+    mcp: &'a crate::services::mcp_manager::McpManager,
+    ctx: &'a crate::agent::exec_ctx::ToolCtx,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
+    Box::pin(run_tool(
+        name,
+        args,
+        project_path,
+        path_hints,
+        project_id,
+        db,
+        mcp,
+        ctx,
+    ))
 }
 
 // ---------- 命令执行 ----------
@@ -1087,6 +1727,13 @@ async fn run_hdc_shell(device: &str, args: &[&str], timeout: u64) -> Result<Stri
     run_cmd("hdc", &full, None, timeout).await
 }
 
+/// hdc shell 命令输出是否失败：hdc 的 shell 子命令失败时 exit code 仍为 0，
+/// 错误只体现在输出文本里（如 snapshot_display 的 error: 行、screencap 的 not found），
+/// 不能只信 status，须按文本特征判断。
+fn hdc_shell_failed(out: &str) -> bool {
+    out.contains("error:") || out.contains("[Fail]") || out.contains("not found") || out.contains("No such file")
+}
+
 /// take_screenshot：截取设备屏幕保存到项目内
 async fn take_screenshot(args: &Value, roots: &[String]) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
@@ -1107,10 +1754,23 @@ async fn take_screenshot(args: &Value, roots: &[String]) -> Result<String, Strin
 
 /// 在设备上截图并拉取到项目截图目录，返回本地路径与设备序列号。
 async fn capture_screenshot(project_path: &str, device: &str) -> Result<(PathBuf, String), String> {
-    let remote = "/sdcard/deveco_agent_shot.png";
-    let shot = run_hdc_shell(device, &["snapshot_display", "-f", remote], 30).await;
-    if shot.is_err() {
-        run_hdc_shell(device, &["screencap", "-p", remote], 30).await?;
+    // 设备端截图：snapshot_display（鸿蒙标准，-t png 显式输出真 PNG 供 verify_ui 质检）
+    // → 失败回退 screencap（AOSP）。路径用 /data/local/tmp（部分鸿蒙设备没有 /sdcard，
+    // 且 snapshot_display 按后缀推断格式）；失败判断用文本特征（hdc shell 失败时 exit 仍为 0）。
+    let remote = "/data/local/tmp/deveco_agent_shot.png";
+    let shot = run_hdc_shell(device, &["snapshot_display", "-t", "png", "-f", remote], 30)
+        .await
+        .unwrap_or_default();
+    if hdc_shell_failed(&shot) {
+        let shot2 = run_hdc_shell(device, &["screencap", "-p", remote], 30)
+            .await
+            .unwrap_or_default();
+        if hdc_shell_failed(&shot2) {
+            return Err(format!(
+                "设备截图失败：{}",
+                shot.lines().next().unwrap_or("未知错误")
+            ));
+        }
     }
     let dir = Path::new(project_path).join(".deveco-agent").join("screenshots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1139,9 +1799,11 @@ async fn capture_screenshot(project_path: &str, device: &str) -> Result<(PathBuf
     )
     .await
     .map_err(|e| with_advice("take_screenshot", e))?;
-    if !local.exists() {
+    if !local.exists() || std::fs::metadata(&local).map(|m| m.len() == 0).unwrap_or(true) {
         return Err(format!("截图拉取失败：{pull}"));
     }
+    // 清理设备端临时文件，避免多次截图累积
+    let _ = run_hdc_shell(device, &["rm", remote], 10).await;
     Ok((local, device.to_string()))
 }
 
@@ -1174,8 +1836,8 @@ async fn verify_ui(args: &Value, roots: &[String]) -> Result<String, String> {
                 "✓ 画面正常（亮度与色彩差异在合理范围）"
             };
             report.push_str(&format!(
-                "{status}\n平均亮度: {:.0}/255，画面差异: {:.1}\n",
-                c.avg_brightness, c.variance
+                "{status}\n分辨率: {}x{}，平均亮度: {:.0}/255，画面差异: {:.1}\n",
+                img.width, img.height, c.avg_brightness, c.variance
             ));
         }
         Err(e) => {
@@ -2713,21 +3375,43 @@ async fn get_diagnostics(project_key: &str) -> Result<String, String> {
             }
         }
     }
+    // 历史崩溃模式：同类崩溃跨轮聚集统计（按次数倒序，最多展示 5 条）
+    let patterns = crate::agent::crash::patterns(project_key);
+    if !patterns.is_empty() {
+        s.push_str("\n历史崩溃模式（同类聚集，按次数倒序）：\n");
+        for p in patterns.iter().take(5) {
+            let mins = (chrono::Utc::now().timestamp() - p.last_at).max(0) / 60;
+            s.push_str(&format!(
+                "- [{}] {}（{} 次，最近 {} 分钟前）\n",
+                p.category, p.location, p.count, mins
+            ));
+        }
+    }
     Ok(s)
 }
 
 /// todo_write：维护任务清单（merge 按 id 合并，否则整体替换），并推送前端展示
 async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
-    let arr = args["todos"].as_array().ok_or(
-        "todo_write 需要参数 {\"todos\":[{\"id\":\"<标识>\",\"content\":\"<任务>\",\"status\":\"pending|in_progress|done\"}],\"merge\":true}",
-    )?;
+    // 容错：模型偶尔把数组直接当顶层参数（漏了 todos 包装）——自动包装，避免一次参数小错中断任务
+    let arr = args["todos"]
+        .as_array()
+        .or_else(|| args.as_array())
+        .ok_or(
+            "todo_write 需要参数 {\"todos\":[{\"id\":\"<标识>\",\"content\":\"<任务>\",\"status\":\"pending|in_progress|done\"}],\"merge\":true}",
+        )?;
     let mut items = Vec::new();
-    for t in arr.iter().take(30) {
+    for (i, t) in arr.iter().take(30).enumerate() {
         let id = t["id"].as_str().unwrap_or("").trim().to_string();
         let content: String = t["content"].as_str().unwrap_or("").trim().chars().take(200).collect();
-        if id.is_empty() || content.is_empty() {
+        if content.is_empty() {
             continue;
         }
+        // 缺省自动分配稳定 id：内容作 id 的替代（同一任务内容不变则合并路径稳定）
+        let id = if id.is_empty() {
+            format!("t{}", i + 1)
+        } else {
+            id
+        };
         let status = match t["status"].as_str().unwrap_or("pending") {
             "in_progress" => "in_progress",
             "done" => "done",
@@ -2737,10 +3421,18 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
         items.push(crate::agent::todo::TodoItem { id, content, status });
     }
     let merge = args["merge"].as_bool().unwrap_or(false);
+    // 项目级共享：提供 project 参数时清单挂在项目键下（跨会话同一份），否则挂会话键
+    let project = args["project"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let key = project
+        .map(|p| crate::agent::todo::project_key(p))
+        .unwrap_or_else(|| ctx.conversation_id.clone());
     let todos = if merge {
-        crate::agent::todo::merge(&ctx.conversation_id, items)
+        crate::agent::todo::merge(&key, items)
     } else {
-        crate::agent::todo::replace(&ctx.conversation_id, items)
+        crate::agent::todo::replace(&key, items)
     };
     if let Some(app) = &ctx.app {
         use tauri::Emitter;
@@ -2756,11 +3448,82 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
         todos.iter().filter(|t| t.status == "done").count(),
         todos.iter().filter(|t| t.status == "in_progress").count(),
     );
-    Ok(format!(
+    let mut out = format!(
         "任务清单已更新：共 {} 项，已完成 {done}，进行中 {doing}，待处理 {}",
         todos.len(),
         todos.len() - done - doing,
-    ))
+    );
+    if let Some(p) = project {
+        out.push_str(&format!("\n（项目级共享模式：同一项目其他会话可读写同一份清单）\n{}", crate::agent::todo::project_digest(p)));
+    }
+    Ok(out)
+}
+
+/// todo_get：读取会话级或项目级任务清单
+async fn todo_get(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
+    let project = args["project"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (key, label) = match project {
+        Some(p) => (crate::agent::todo::project_key(p), format!("项目「{p}」")),
+        None => (ctx.conversation_id.clone(), "当前会话".to_string()),
+    };
+    let items = crate::agent::todo::get(&key);
+    if items.is_empty() {
+        return Ok(format!("{label}暂无任务清单"));
+    }
+    let (done, doing) = (
+        items.iter().filter(|t| t.status == "done").count(),
+        items.iter().filter(|t| t.status == "in_progress").count(),
+    );
+    let mut out = format!("{label}任务清单：共 {} 项（done {done} / in_progress {doing} / pending {}）\n", items.len(), items.len() - done - doing);
+    for t in &items {
+        out.push_str(&format!("- [{}{}] {}\n", t.status, t.id, t.content));
+    }
+    Ok(out)
+}
+
+/// ask_history：查询本会话内已答复的提问历史
+async fn ask_history(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
+    let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 20) as usize;
+    let h = crate::agent::ask::history(&ctx.conversation_id, limit);
+    if h.is_empty() {
+        return Ok("本会话还没有已答复的提问记录（ask_user 未使用过或用户尚未回答）".into());
+    }
+    let mut out = format!("本会话提问历史（新→旧，共 {} 条）：\n", h.len());
+    for r in h {
+        let t = chrono::DateTime::from_timestamp(r.at, 0)
+            .map(|d| d.format("%H:%M:%S").to_string())
+            .unwrap_or_default();
+        let opts = if r.options.is_empty() {
+            String::new()
+        } else {
+            format!("（选项: {}）", r.options.join(" / "))
+        };
+        out.push_str(&format!("- [{t}] 问：{}{opts} → 答：{}\n", r.question, r.answer));
+    }
+    Ok(out)
+}
+
+/// job_template：查询当前项目的预置任务模板（build/test/lint）
+async fn job_template(args: &Value, roots: &[String]) -> Result<String, String> {
+    let _ = args;
+    let Some(project_path) = roots.first().map(String::as_str).filter(|s| !s.is_empty()) else {
+        return Err("当前会话未绑定项目目录，无法识别项目类型".into());
+    };
+    let kind = crate::agent::jobs::project_kind(project_path);
+    let tpls = crate::agent::jobs::templates(project_path);
+    if tpls.is_empty() {
+        return Ok(format!(
+            "未识别到项目类型（未发现 hvigorfile.*/build-profile.json5 或 package.json），暂无预置模板。可先确认项目结构或手动指定构建命令。"
+        ));
+    }
+    let mut out = format!("项目类型：{kind}（{} 条预置模板，可直接作为 run_command / run_in_background 的 command 参数）：\n", tpls.len());
+    for t in &tpls {
+        out.push_str(&format!("- [{name}] {command}\n  {desc}\n", name = t.name, command = t.command, desc = t.desc));
+    }
+    Ok(out)
 }
 
 /// ask_user：向用户提问并等待回答（前端提问卡 + oneshot 通道闭环）
@@ -2906,6 +3669,50 @@ pub(crate) fn resolve_in_roots(roots: &[String], raw: &str) -> Result<PathBuf, S
     } else {
         Err(format!("路径不存在或不可访问:\n{}", candidates.join("\n")))
     }
+}
+
+/// 只读系统路径解析：先按项目根约束解析（resolve_in_roots）；项目外路径若命中
+/// 受信任只读系统目录（DevEco SDK 根及其子路径、用户 ~/.ohos/config 签名材料库），
+/// 仍允许读取——Agent 诊断 SDK 版本/签名配置时 read_file/list_dir 不再被“越界拒绝”卡住
+/// （testhy 会话实证：读 sdk-pkg.json 与 ~/.ohos/config 各失败一次，只能绕道 type 命令）。
+/// 仅限只读工具使用（read_file/list_dir）；写路径仍走 resolve_for_write 严格受限。
+pub(crate) fn resolve_readable(roots: &[String], raw: &str) -> Result<PathBuf, String> {
+    match resolve_in_roots(roots, raw) {
+        Ok(p) => Ok(p),
+        Err(proj_err) => {
+            // 相对路径一律项目内解析，不享受系统目录例外
+            let p = PathBuf::from(raw);
+            if !p.is_absolute() || !trusted_system_dir(&p) {
+                return Err(proj_err);
+            }
+            Ok(PathBuf::from(normalize_path(&p.to_string_lossy())))
+        }
+    }
+}
+
+/// 受信任只读系统目录判定：路径需已存在（canonicalize 失败视为不存在，不信任）。
+/// - DEVECO_SDK_HOME 指向的 sdk 根及其任意子路径（sdk/default、toolchains 等）；
+/// - 用户签名材料库 ~/.ohos/config（*.p7b 证书，diagnose_signing 之外 Agent 自查用）。
+fn trusted_system_dir(p: &Path) -> bool {
+    let Ok(full) = std::fs::canonicalize(p) else {
+        return false;
+    };
+    if let Ok(home) = std::env::var("DEVECO_SDK_HOME") {
+        if let Ok(hc) = std::fs::canonicalize(&home) {
+            if crate::utils::path::path_within(&full, &hc) {
+                return true;
+            }
+        }
+    }
+    if let Some(uh) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let cfg = std::path::Path::new(&uh).join(".ohos").join("config");
+        if let Ok(cc) = std::fs::canonicalize(&cfg) {
+            if crate::utils::path::path_within(&full, &cc) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 写入/创建用路径解析：允许目标文件尚不存在（resolve_in_roots 要求路径已存在，
@@ -3707,6 +4514,25 @@ mod tests {
     }
 
     #[test]
+    fn log_line_older_than_window() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // until=0 无上限：任何行都通过
+        assert!(super::debug_tools::log_line_older_than(&format!("{}.123 W x/y: z", now), 0));
+        // 10 分钟前的行在 until=5（只保留 5 分钟前更早的）窗口内 → 通过
+        assert!(super::debug_tools::log_line_older_than(&format!("{}.0 W x/y: z", now - 600), 5));
+        // 2 分钟前的行在 until=5 窗口外（比 now-5min 新）→ 丢弃
+        assert!(!super::debug_tools::log_line_older_than(&format!("{}.0 W x/y: z", now - 120), 5));
+        // 解析失败 → 保守保留
+        assert!(super::debug_tools::log_line_older_than("08-13 10:00:00.123 W x/y: z", 5));
+        // 组合窗口验证：since=5 与 until=20 之间（now-1200s 在两者之间）
+        assert!(super::debug_tools::log_line_recent_enough(&format!("{}.0 W x/y: z", now - 1200), 25));
+        assert!(super::debug_tools::log_line_older_than(&format!("{}.0 W x/y: z", now - 1200), 15));
+    }
+
+    #[test]
     fn needs_shell_detect() {
         // 简单命令不需要 shell
         assert!(!super::cmd_tools::needs_shell("git status --short"));
@@ -3754,9 +4580,9 @@ mod tests {
         // 危险命令拒绝
         let req = super::cmd_tools::CommandRequest::from_args(&serde_json::json!({"command":"rm -rf /"})).unwrap();
         assert!(req.resolve(&roots).is_err());
-        // 白名单外命令拒绝（echo 非工具链）
+        // 白名单外命令不再硬拦截（未命中白名单交由审批层按权限模式裁决：allow_all 放行 / ask 弹窗）
         let req = super::cmd_tools::CommandRequest::from_args(&serde_json::json!({"command":"echo hi"})).unwrap();
-        assert!(req.resolve(&roots).is_err());
+        assert!(req.resolve(&roots).is_ok());
         // 白名单内命令：超时钳制 + 相对 cwd 按工程根归一化 + 缺省 timeout=60
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let req = super::cmd_tools::CommandRequest::from_args(&serde_json::json!({"command":"git status","timeout":9999,"cwd":"sub"})).unwrap();
@@ -3805,12 +4631,19 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_shell_chain() {
-        // 安全策略：echo 等非工具链命令被白名单拒绝
+        // 安全策略：白名单外命令不再硬拦截（审批层按权限模式裁决），危险黑名单仍拦截
         let root = std::env::temp_dir().join("deveco-run-cmd-test");
         std::fs::create_dir_all(&root).unwrap();
         let args = serde_json::json!({"command": "echo hello && echo world"});
+        let r = super::cmd_tools::run_command(&args, &[root.to_string_lossy().to_string()], &crate::agent::exec_ctx::ToolCtx::empty()).await;
+        // echo 是 shell 内建（非危险命令），无事件环境直接放行执行；环境无 echo 时返回 Err（程序不存在），两种都不 panic
+        if let Ok(out) = r {
+            assert!(out.contains("hello"), "out={out}");
+        }
+        // 危险命令仍被黑名单拒绝（任何权限模式）
+        let args = serde_json::json!({"command": "rm -rf / && echo x"});
         let rejected = super::cmd_tools::run_command(&args, &[root.to_string_lossy().to_string()], &crate::agent::exec_ctx::ToolCtx::empty()).await;
-        assert!(rejected.is_err(), "echo 应被白名单拒绝: {rejected:?}");
+        assert!(rejected.is_err(), "危险命令应被黑名单拒绝: {rejected:?}");
         // 白名单内命令（git --version）应可直接执行（不依赖 shell）
         let r = super::cmd_tools::run_command(
             &serde_json::json!({"command": "git --version"}),
@@ -3922,6 +4755,7 @@ mod tests {
             directory: None,
             repo_owner: None,
             repo_name: None,
+            repo_host: None,
             repo_branch: String::new(),
             subdir: None,
             enabled: true,
@@ -4162,6 +4996,80 @@ export { util };
         assert!(!names.iter().any(|n| n == "Shape" || n == "Alias" || n == "util"));
     }
 
+    /// [60] 副作用标注 lint：每个工具 desc 必须含「副作用：」段，
+    /// 否则模型无法判断调用的可逆性（写文件/发消息等需二次确认）。
+    #[test]
+    fn all_tools_have_side_effect_annotation() {
+        let missing: Vec<&str> = TOOL_SPECS
+            .iter()
+            .filter(|t| !t.desc.contains("副作用"))
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "以下 {} 个工具缺「副作用」标注：{}",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+
+    /// [62] task_group：所有工具必须映射到已知分组。
+    #[test]
+    fn all_tools_have_valid_group() {
+        let unknown: Vec<&str> = TOOL_SPECS
+            .iter()
+            .filter(|t| !TASK_GROUPS.contains(&tool_group(t.name)))
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "以下 {} 个工具映射到未知分组：{}",
+            unknown.len(),
+            unknown.join(", ")
+        );
+    }
+
+    /// [61] desc 长度规范 lint：描述需信息密度适中——过短缺失关键信息（参数/副作用/返回），
+    /// 过长稀释注入上下文。硬性断言：全部 desc 在 80-800 字符（中文按字符计）；
+    /// 达标率（200-500 字符）统计输出供人工打磨。
+    #[test]
+    fn desc_length_within_band() {
+        let too_short: Vec<&str> = TOOL_SPECS
+            .iter()
+            .filter(|t| t.desc.chars().count() < 80)
+            .map(|t| t.name)
+            .collect();
+        let too_long: Vec<&str> = TOOL_SPECS
+            .iter()
+            .filter(|t| t.desc.chars().count() > 800)
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            too_short.is_empty(),
+            "以下 {} 个工具 desc 过短（<80 字符）：{}",
+            too_short.len(),
+            too_short.join(", ")
+        );
+        assert!(
+            too_long.is_empty(),
+            "以下 {} 个工具 desc 过长（>800 字符）：{}",
+            too_long.len(),
+            too_long.join(", ")
+        );
+        let in_band = TOOL_SPECS
+            .iter()
+            .filter(|t| {
+                let n = t.desc.chars().count();
+                (200..=500).contains(&n)
+            })
+            .count();
+        println!(
+            "[61] desc 长度达标率（200-500 字符）：{in_band}/{} = {:.1}%",
+            TOOL_SPECS.len(),
+            in_band as f64 * 100.0 / TOOL_SPECS.len() as f64
+        );
+    }
+
     #[test]
     fn first_number_extracts_values() {
         assert_eq!(super::ui_tools::first_number("fps: 60.5"), Some(60.5));
@@ -4181,5 +5089,35 @@ export { util };
         assert!(content.contains("export default function fooTest()"), "{content}");
         assert!(content.contains("it('add_should_exist'"), "{content}");
         assert!(content.contains("expect(add).assertNotNull();"), "{content}");
+    }
+
+    /// [60] 副作用标注 lint：每个工具 desc 必须含「副作用：」段（模型选工具时的安全决策输入）
+    #[test]
+    fn every_tool_desc_has_side_effect_section() {
+        let missing: Vec<&str> = TOOL_SPECS
+            .iter()
+            .filter(|t| !t.desc.contains("副作用："))
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "以下工具 desc 缺少「副作用：」段（[[60]] 要求）：{}",
+            missing.join(" / ")
+        );
+    }
+
+    /// [60] 补充断言：desc 必须同时含「参数：」段（参数说明是工具可用性的基础）
+    #[test]
+    fn every_tool_desc_has_param_section() {
+        let missing: Vec<&str> = TOOL_SPECS
+            .iter()
+            .filter(|t| !t.desc.contains("参数："))
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "以下工具 desc 缺少「参数：」段：{}",
+            missing.join(" / ")
+        );
     }
 }

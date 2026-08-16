@@ -3,16 +3,23 @@
 
 
 
-/// 判断错误是否值得自动重试（超时 / 网络类，重试可恢复）
+/// 判断错误是否值得自动重试（瞬态/环境类，重试可恢复）
 pub fn is_retryable_err(e: &str) -> bool {
-    const KEYS: [&str; 6] = ["超时", "请求失败", "timed out", "连接", "network", "timeout"];
+    const KEYS: [&str; 14] = [
+        // 网络/超时类：请求失败、连接中断、偶发超时
+        "超时", "请求失败", "timed out", "连接", "network", "timeout",
+        // 文件/进程占用类：DevEco/杀毒软件偶发占用，稍后重试可恢复
+        "占用", "being used", "being locked", "busy", "locked",
+        // 进程启动瞬态失败（PATH/系统负载抖动）
+        "failed to spawn", "spawn error", "cannot find the path",
+    ];
     KEYS.iter().any(|k| e.to_lowercase().contains(k))
 }
 
 // ---------- 错误模式诊断（常见错误 → 修复建议，帮助 Agent 快速定位，减少打转） ----------
 
 /// 按工具 + 错误文本匹配高频失败模式，返回针对性修复建议
-fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str> {
+pub(crate) fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str> {
     let l = err.to_lowercase();
     let has_any = |keys: &[&str]| keys.iter().any(|k| l.contains(k));
     match tool {
@@ -20,7 +27,7 @@ fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str> {
             if has_any(&["arkts", "compile", "编译", "类型错误"]) {
                 Some("ArkTS 编译错误：请阅读日志中 ERROR 行定位具体文件与行号，修复类型/API 用法后重新构建")
             } else if has_any(&["signing", "keystore", "certificate", "签名"]) {
-                Some("签名配置问题：检查 build-profile.json5 中 signingConfigs 的 keystore 路径与密码")
+                Some("签名配置问题：调用 diagnose_signing 自检签名材料与设备/bundle 匹配性，按建议修复 build-profile.json5 后重新构建（材料库无匹配时才需 DevEco 重新生成）")
             } else if has_any(&["compatibleSdkVersion", "api version", "sdk 版本", "sdk version"]) {
                 Some("SDK 版本不匹配：检查工程要求的 SDK 版本与本地 DevEco SDK 是否一致，必要时修改 compileSdkVersion")
             } else if has_any(&["out of memory", "heap", "oom"])
@@ -54,7 +61,7 @@ fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str> {
             if has_any(&["no devices", "not found", "empty", "没有设备"]) {
                 Some("没有可用设备：请连接真机或启动模拟器，确认 hdc list targets 有设备输出")
             } else if has_any(&["signature", "certificate", "签名"]) {
-                Some("签名不一致：设备上已有不同签名版本的应用，需先卸载旧版本或改用相同签名构建")
+                Some("签名不一致：先调用 diagnose_signing 核对签名配置与设备匹配性；或设备上已有不同签名版本的应用，需先卸载旧版本再安装")
             } else if has_any(&["install", "failed", "失败"]) && has_any(&["space", "full", "空间"]) {
                 Some("设备空间不足：清理设备存储后重试")
             } else if has_any(&["timeout", "超时"]) {
@@ -85,7 +92,7 @@ fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str> {
                 None
             }
         }
-        "write_file" | "edit_file" => {
+        "write_file" | "edit_file" | "preview_edit" => {
             if has_any(&["outside", "超出", "范围", "拒绝访问"]) {
                 Some("路径超出项目目录范围：仅可修改当前工程内的文件，请使用相对路径")
             } else if has_any(&["not found", "不存在", "找不到", "不匹配"]) {
@@ -216,6 +223,17 @@ fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str> {
                 None
             }
         }
+        "lsp_definition" | "lsp_references" | "lsp_symbols" | "lsp_hover" | "lsp_diagnostics" => {
+            if has_any(&["未找到 @arkts/language-server"]) {
+                Some("LSP 包未安装：执行 npm i -g @arkts/language-server 后重试；或用 MCP 快集成（设置 → MCP → DevEco Toolbox 模板）")
+            } else if has_any(&["未找到鸿蒙 SDK"]) {
+                Some("本机未探测到鸿蒙 SDK：设置环境变量 DEVECO_SDK_HOME 指向 SDK 根目录后重试")
+            } else if has_any(&["超时", "initialize 被拒绝"]) {
+                Some("LSP 初始化失败：确认 SDK 路径有效（含 default/openharmony/ets），稍后重试")
+            } else {
+                None
+            }
+        }
         "copy_file" => {
             if has_any(&["目标已存在", "覆盖"]) {
                 Some("目标路径已存在：换个目标路径，或先 delete_file 清理旧文件")
@@ -243,7 +261,7 @@ fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str> {
         }
         "multi_edit" => {
             if has_any(&["未找到"]) {
-                Some("替换原文未找到：先 read_file 确认目标文件当前内容（注意缩进/引号/空白完全一致）")
+                Some("替换原文未找到：先 read_file 确认目标文件当前内容（注意缩进/引号/空白完全一致；若含反斜杠或正则如 \\n，确认参数已按 JSON 双重转义为 \\\\n）")
             } else if has_any(&["冲突", "修改"]) {
                 Some("编辑冲突：文件被外部修改，先 read_file 解除冲突保护再重试")
             } else {
@@ -343,6 +361,237 @@ pub(crate) fn with_advice(tool: &str, err: String) -> String {
     match diagnose_tool_error(tool, &err) {
         Some(adv) => format!("{err}\n\n【诊断建议】{adv}"),
         None => err,
+    }
+}
+
+// ---------- [65] 统一工具错误信封（ToolError） ----------
+//
+// 设计目标：让所有 180 个工具（fs/git/lsp/debug/...）失败时**自动**套上
+// 结构化头（category + 可重试 + 建议），而不是只对 build_project/deploy 等少数
+// 工具有 structured_tool_error 包装。Agent 在自动修复循环里能稳定 parse。
+//
+// 实现策略：不动现有 180 个工具的 Err 字符串，只在 run_tool 出口处把所有
+// `Err(string)` 过一次 `enrich()`，按工具名 + 错误文本推断 category 并补 advice。
+// 这样零侵入扩到所有工具，模型的体验立刻提升（看错误就知道下一步）。
+
+/// 错误分类（对标 build_project 的 category：type/syntax/dependency/sdk/api_level/...）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolErrorCategory {
+    /// 通用输入/参数错误（路径不存在、参数缺失、格式不对）
+    InvalidInput,
+    /// 文件/进程权限或占用
+    Permission,
+    /// 网络/超时/连接中断
+    Network,
+    /// 找不到依赖/模块/包
+    NotFound,
+    /// 工具自身抛错（内部 bug / 解析失败）
+    Internal,
+    /// 外部进程退出码非 0（命令、构建、部署等）
+    CommandFailed,
+    /// 不可恢复错误（达到硬上限、状态不可逆）
+    #[allow(dead_code)]
+    Unrecoverable,
+}
+
+impl ToolErrorCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::Permission => "permission",
+            Self::Network => "network",
+            Self::NotFound => "not_found",
+            Self::Internal => "internal",
+            Self::CommandFailed => "command_failed",
+            Self::Unrecoverable => "unrecoverable",
+        }
+    }
+}
+
+/// 统一的工具错误信封：把现有 Err(String) 升级为带 category + advice 的结构化字符串
+#[derive(Debug, Clone)]
+pub struct ToolError {
+    /// 工具名
+    pub tool: String,
+    /// 错误分类
+    pub category: ToolErrorCategory,
+    /// 原始错误（透传给 LLM 看细节）
+    pub raw: String,
+    /// 一句话摘要（可空）
+    pub summary: Option<String>,
+    /// 是否值得自动重试（瞬态错误）
+    pub retryable: bool,
+    /// 推荐下一步（来自 diagnose_tool_error 启发式表）
+    pub advice: Option<String>,
+}
+
+impl ToolError {
+    /// 从工具名 + 原始错误构造 ToolError，按关键词推断 category / retryable / advice
+    pub fn enrich(tool: &str, raw: String) -> Self {
+        let lower = raw.to_lowercase();
+
+        // 1) 分类推断
+        let category = if lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("超时")
+            || lower.contains("connection")
+            || lower.contains("network")
+            || lower.contains("连接")
+        {
+            ToolErrorCategory::Network
+        } else if lower.contains("permission denied")
+            || lower.contains("being used")
+            || lower.contains("being locked")
+            || lower.contains("busy")
+            || lower.contains("locked")
+            || lower.contains("拒绝访问")
+            || lower.contains("占用")
+        {
+            ToolErrorCategory::Permission
+        } else if lower.contains("not found")
+            || lower.contains("no such file")
+            || lower.contains("不存在")
+            || lower.contains("找不到")
+            || lower.contains("未找到")
+            || lower.contains("cannot find")
+        {
+            ToolErrorCategory::NotFound
+        } else if lower.contains("invalid")
+            || lower.contains("missing required")
+            || lower.contains("参数")
+            || lower.contains("格式")
+        {
+            ToolErrorCategory::InvalidInput
+        } else if lower.contains("exit code")
+            || lower.contains("non-zero")
+            || lower.contains("failed")
+            || lower.contains("失败")
+        {
+            ToolErrorCategory::CommandFailed
+        } else if lower.contains("panic")
+            || lower.contains("internal")
+            || lower.contains("unexpected")
+        {
+            ToolErrorCategory::Internal
+        } else {
+            // 默认：命令执行类失败（覆盖最广）
+            ToolErrorCategory::CommandFailed
+        };
+
+        // 2) 可重试判断
+        let retryable = is_retryable_err(&raw);
+
+        // 3) 提取 advice（复用已有诊断表）
+        let advice = diagnose_tool_error(tool, &raw).map(|s| s.to_string());
+
+        // 4) 一句话摘要（取首行或前 80 字符）
+        let summary = raw
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| {
+                if l.chars().count() > 80 {
+                    format!("{}…", l.chars().take(80).collect::<String>())
+                } else {
+                    l.to_string()
+                }
+            });
+
+        Self {
+            tool: tool.to_string(),
+            category,
+            raw,
+            summary,
+            retryable,
+            advice,
+        }
+    }
+
+    /// 序列化为 LLM 友好的多行字符串（保持人类可读、可解析）
+    pub fn to_envelope(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!(
+            "【工具失败】{}\ncategory: {}\n可重试: {}\n",
+            self.tool,
+            self.category.as_str(),
+            if self.retryable { "是" } else { "否" },
+        ));
+        if let Some(sum) = &self.summary {
+            s.push_str(&format!("摘要: {sum}\n"));
+        }
+        s.push_str(&format!("详情: {}\n", self.raw));
+        if let Some(adv) = &self.advice {
+            s.push_str(&format!("\n【诊断建议】{adv}\n"));
+        }
+        s
+    }
+}
+
+/// 工具出口处的统一包装：把所有 `Err(String)` 自动升级为结构化错误
+/// 替代 with_advice 的同时保留 category 维度。
+#[allow(dead_code)]
+pub(crate) fn with_advice_v2(tool: &str, err: String) -> String {
+    ToolError::enrich(tool, err).to_envelope()
+}
+
+#[cfg(test)]
+mod tests_v2 {
+    use super::*;
+
+    #[test]
+    fn enrich_classifies_timeout_as_network() {
+        let e = ToolError::enrich("read_file", "请求超时：connection timed out after 30s".into());
+        assert_eq!(e.category, ToolErrorCategory::Network);
+        assert!(e.retryable, "网络超时应该可重试");
+    }
+
+    #[test]
+    fn enrich_classifies_permission() {
+        let e = ToolError::enrich("write_file", "Permission denied: being locked by another process".into());
+        assert_eq!(e.category, ToolErrorCategory::Permission);
+        assert!(e.retryable);
+    }
+
+    #[test]
+    fn enrich_classifies_not_found() {
+        let e = ToolError::enrich("read_file", "文件不存在: ./.env".into());
+        assert_eq!(e.category, ToolErrorCategory::NotFound);
+        assert!(!e.retryable);
+    }
+
+    #[test]
+    fn enrich_classifies_command_failed() {
+        let e = ToolError::enrich("run_command", "exit code 1: build failed".into());
+        assert_eq!(e.category, ToolErrorCategory::CommandFailed);
+    }
+
+    #[test]
+    fn enrich_extracts_summary() {
+        let e = ToolError::enrich(
+            "build_project",
+            "ERROR at ./src/main.ets:42: Type 'string' is not assignable to type 'number'\nThis is the actual error".into(),
+        );
+        assert!(e.summary.is_some());
+        assert!(e.summary.as_ref().unwrap().contains("ERROR"));
+    }
+
+    #[test]
+    fn enrich_advice_from_known_pattern() {
+        let e = ToolError::enrich(
+            "build_project",
+            "ArkTS 编译错误：Type 'X' has no properties in common with type 'Y'".into(),
+        );
+        assert!(e.advice.is_some());
+        assert!(e.advice.as_ref().unwrap().contains("ArkTS"));
+    }
+
+    #[test]
+    fn envelope_format_is_stable() {
+        let e = ToolError::enrich("read_file", "文件不存在: ./.env".into());
+        let env = e.to_envelope();
+        assert!(env.contains("【工具失败】read_file"));
+        assert!(env.contains("category: not_found"));
+        assert!(env.contains("可重试: 否"));
+        assert!(env.contains("详情:"));
     }
 }
 
