@@ -1,0 +1,642 @@
+================================================================
+DevEco Switch 工具集增强完整清单（v2 完成态）
+================================================================
+当前状态：189 个工具 + 4 个自动跑框架（reflexion / cost_guard / a2a / trace）
+        + 20/20 项工业化能力 + 0 编译错误 / 0 警告
+目标状态：达到（A 类 95% 兑现，figma/feishu/jira 3 项外联显式按用户要求暂缓）
+维护者：Mavis
+最后更新：2026-08-16
+
+================================================================
+兑现状态（v2）
+================================================================
+
+[✓] 已做  56 项（按 [01]-[76] 编号）
+
+[01]  tool_list            ✓
+[02]  tool_help            ✓
+[03]  tool_history         ✓
+[04]  preview_edit         ✓
+[05]  format_file          ✓
+[06]  snippet_insert       ✓
+[07]  code_metrics         ✓
+[08]  lsp_rename           ✓
+[09]  lsp_format           ✓
+[10]  lsp_code_action      ✓
+[11]  lsp_completion       ✓
+[12]  lsp_signature        ✓
+[13]  db_query             ✓
+[14]  log_query            ✓  (本批新增)
+[15]  trace_export         ✓
+[16]  metric_export        ✓
+[17]  log_aggregate        ✓
+[18]  api_mock             ✓
+[19]  api_test             ✓
+[20]  api_health           ✓
+[22]  read_pdf             ✓
+[23]  docx_read            ✓  (本批新增)
+[24]  ocr_image            ✓
+[25]  image_inspect        ✓
+[26]  audio_transcribe     ✓  (本批新增)
+[27]  chart_extract        ✓
+[28]  attach_debugger      ✓  (本批新增)
+[29]  step_debug           ✓  (本批新增)
+[30]  memory_snapshot      ✓  (本批新增)
+[31]  screenshot_diff      ✓
+[32]  flaky_test_detect    ✓
+[33]  bundle_analyzer      ✓ (= analyze_hap_size)
+[34]  size_diff            ✓
+[35]  obfuscate            ✓
+[36]  ota_pack             ✓  (本批新增)
+[37]  smoke_test           ✓
+[38]  conversation_search  ✓
+[39]  fact_extract         ✓
+[40]  prompt_optimize      ✓
+[41]  reflexion_query/pin  ✓
+[42]  share_session        ✓
+[43]  import_session       ✓
+[44]  export_report        ✓
+[47]  secret_scan          ✓
+[48]  license_check        ✓  (本批新增)
+[49]  vuln_scan            ✓  (本批新增)
+[50]  permission_audit     ✓
+[51]  secret_store         ✓
+[52]  secret_get           ✓
+[53]  ui_locator           ✓
+[54]  gesture_perform      ✓
+[55]  db_migrate           ✓
+[56]  state_snapshot       ✓
+[57]  tools/redact.rs      ✓
+[58]  dry-run 模式         ✓
+[59]  单工具取消 UI        ✓ (Home.tsx 已接 stop_tool)
+[60]  副作用标注 lint      ✓
+[61]  desc 长度规范        ✓
+[62]  task_group           ✓
+[63]  timeout/cost_hint    ✓
+[64]  fallback 链          ✓
+[65]  ToolError 结构化错误  ✓  (本批升级)
+[66]  tools_health() ping  ✓
+[67]  工具响应缓存         ✓
+[68]  组合工具层           ✓
+[69]  工具统计             ✓
+[70]  工具级 trace         ✓
+[71]  TOOL_SPECS 抽 JSON   ✓
+[72]  快捷键               ✓
+[73]  sandbox              ✓
+[74]  tools_health 命令    ✓
+[75]  按任务分组 UI        ✓
+[76]  ChainView DAG        ✓ (TimelinePanel 已实现)
+
+[⏸] 待补（3 项外联，按用户要求暂缓）
+[21]  figma_import
+[45]  feishu_task_sync
+[46]  jira_sync
+
+================================================================
+本批新增（2026-08-16 实施）
+================================================================
+
+[14]  log_query            — 跨 hilog/runtime/faultlog 结构化查询
+[23]  docx_read            — 读 .docx 正文（纯标准库 zip）
+[26]  audio_transcribe     — 调本地 whisper.cpp
+[28]  attach_debugger      — hdc debuggerd attach + aa debug 回退
+[29]  step_debug           — step/next/continue/interrupt/where/info
+[30]  memory_snapshot      — take/list/diff 归档 + 增长对比
+[36]  ota_pack             — 调 packagingtool.jar 打 .pkg
+[48]  license_check        — 扫 ohpm/Cargo/uv 依赖 allow/deny
+[49]  vuln_scan            — 内置漏洞库（lodash/axios/requests 等）
+[65]  ToolError 升级       — 7 类分类 + 7 个测试 + run_tool 出口接入
+
+================================================================
+工具总数变化
+================================================================
+
+版本    总数   A 类兑现  B 类兑现  编译
+v0      121    —        —        —
+v1      132    47/56   12/20   0 err / 19 warn
+v2      189    53/56   20/20   0 err / 0  warn  ← 当前
+
+================================================================
+
+================================================================
+A. 工具补全类（共 56 项）
+================================================================
+
+---------- A1. 工具元能力（LLM 自我发现）—— 3 项 ----------
+
+[01] tool_list
+    说明：动态列出当前可用工具（按域/任务分组）
+    价值：system prompt 瘦身 + 模型自查询
+
+[02] tool_help(name)
+    说明：查某工具的详细参数 + 副作用 + 返回结构 + 示例
+    价值：按需拉取，注意力更聚焦
+
+[03] tool_history
+    说明：查最近 N 次工具调用记录（带结果）
+    价值：让 LLM 能"回看自己刚做了什么"
+
+
+---------- A2. 编辑体验 —— 4 项 ----------
+
+[04] preview_edit
+    说明：edit_file 之前返回 diff 给用户确认（不落盘）
+    价值：配合 pipeline 做"危险编辑审批"
+
+[05] format_file
+    说明：按 ArkTS 风格格式化单个文件
+    价值：替代手动 run_lint
+
+[06] snippet_insert
+    说明：插入代码片段（自定义 snippet 库）
+    价值：高频代码秒插
+
+[07] code_metrics
+    说明：圈复杂度 / 行数 / 注释率 / 嵌套深度
+    价值：质量基线
+
+
+---------- A3. LSP 能力补完 —— 5 项 ----------
+
+[08] lsp_rename
+    说明：重命名符号 + 所有引用（LSP 最值钱的能力）
+    价值：一次改名全工程同步
+
+[09] lsp_format
+    说明：按 LSP 服务端格式化（与 format_file 区别是支持项目设置）
+    价值：团队风格统一
+
+[10] lsp_code_action
+    说明：quick fix（自动修导入缺失 / 类型错误）
+    价值：自动修复常见错误
+
+[11] lsp_completion
+    说明：自动补全（trigger character 处调）
+    价值：LLM 写代码有依据
+
+[12] lsp_signature
+    说明：函数签名 + 文档提示
+    价值：调 API 不出错
+
+
+---------- A4. 可观测 / 查询 —— 5 项 ----------
+
+[13] db_query
+    说明：只读白名单方式查项目 SQLite（30+ 张表）
+    价值：模型能查自己的数据
+
+[14] log_query
+    说明：hilog 结构化查询（since/until/priority/keyword）
+    价值：排查闭环
+
+[15] trace_export
+    说明：导出 trace 为 OpenTelemetry / Jaeger 格式
+    价值：跟 TimelinePanel 配套
+
+[16] metric_export
+    说明：Prometheus 格式指标导出
+    价值：监控对接
+
+[17] log_aggregate
+    说明：多源日志聚合（faultlog + hilog + runtime_log）
+    价值：单次调用看全貌
+
+
+---------- A5. API 工作流闭环 —— 4 项 ----------
+
+[18] api_mock
+    说明：按 OpenAPI / 鸿蒙 API 自动生成 mock server
+    价值：前端不用等后端
+
+[19] api_test
+    说明：跑 API 测试用例 + 报告
+    价值：API 自动化
+
+[20] api_health
+    说明：持续探测外部 API 健康度（不只是 LLM）
+    价值：上游故障提前发现
+
+[21] figma_import
+    说明：Figma URL → 拆解组件树 + 生成 ArkTS 骨架
+    价值：设计稿直达代码
+
+
+---------- A6. 多模态 —— 6 项 ----------
+
+[22] read_pdf
+    说明：读 PDF（pdf-extract Cargo 依赖已就绪）
+    价值：读需求文档
+
+[23] docx_read
+    说明：读 Word 文档
+    价值：读产品需求
+
+[24] ocr_image
+    说明：截图 OCR 识别文字
+    价值：UI 元素识别
+
+[25] image_inspect
+    说明：图片元数据（尺寸 / 格式 / EXIF）
+    价值：资源优化
+
+[26] audio_transcribe
+    说明：语音转文字
+    价值：语音需求输入
+
+[27] chart_extract
+    说明：从图表提取数据
+    价值：看板截图还原数据
+
+
+---------- A7. 调试 / 真机 —— 5 项 ----------
+
+[28] attach_debugger
+    说明：hdc debug attach 进程
+    价值：远程断点
+
+[29] step_debug
+    说明：单步执行 / 继续
+    价值：交互式调试
+
+[30] memory_snapshot
+    说明：应用内存快照
+    价值：定位泄漏
+
+[31] screenshot_diff
+    说明：截图前后对比（视觉回归）
+    价值：UI 测试
+
+[32] flaky_test_detect
+    说明：检测 flaky 测试
+    价值：测试质量
+
+
+---------- A8. 构建 / 部署 —— 5 项 ----------
+
+[33] bundle_analyzer
+    说明：HAP 包内容分析（哪些资源大）
+    价值：优化包大小
+
+[34] size_diff
+    说明：与上一版本对比包大小变化
+    价值：控制包体积
+
+[35] obfuscate
+    说明：代码混淆（发布前）
+    价值：保护知识产权
+
+[36] ota_pack
+    说明：制作 OTA 升级包
+    价值：灰度发布
+
+[37] smoke_test
+    说明：部署后自动跑核心场景
+    价值：集成健康度
+
+
+---------- A9. 知识 / 记忆 / 上下文 —— 4 项 ----------
+
+[38] conversation_search
+    说明：语义搜索历史对话
+    价值：找过去的解法
+
+[39] fact_extract
+    说明：从对话提取事实（人名 / 项目 / 约定）
+    价值：长期记忆
+
+[40] prompt_optimize
+    说明：基于历史反馈优化 prompt
+    价值：越用越好
+
+[41] reflexion_query / reflexion_pin
+    说明：查 / 钉反思卡片
+    价值：教训不丢失
+
+
+---------- A10. 协作 / 导出 —— 5 项 ----------
+
+[42] share_session
+    说明：导出会话为脱敏 JSON / Markdown
+    价值：团队分享
+
+[43] import_session
+    说明：导入别人分享的会话
+    价值：接续工作
+
+[44] export_report
+    说明：工作报告导出 PDF
+    价值：交付物
+
+[45] feishu_task_sync
+    说明：对话待办 → 飞书任务
+    价值：任务流
+
+[46] jira_sync
+    说明：JIRA 双向同步
+    价值：研发协同
+
+
+---------- A11. 安全 / 合规 —— 4 项 ----------
+
+[47] secret_scan
+    说明：密钥泄露检测（check_code 内已有但要单独）
+    价值：防泄漏
+
+[48] license_check
+    说明：依赖许可证合规检查
+    价值：法务
+
+[49] vuln_scan
+    说明：依赖漏洞扫描
+    价值：安全基线
+
+[50] permission_audit
+    说明：权限使用审计（哪些工具用得多 / 危险）
+    价值：治理
+
+
+---------- A12. 安全存储 —— 2 项 ----------
+
+[51] secret_store
+    说明：把密钥存系统钥匙串（keyring 依赖已就绪）
+    价值：不再明文
+
+[52] secret_get
+    说明：从钥匙串读取
+    价值：用法同上
+
+
+---------- A13. UI 自动化 —— 2 项 ----------
+
+[53] ui_locator
+    说明：按属性 / 文本定位元素（替代脆弱坐标）
+    价值：UI 测试稳定
+
+[54] gesture_perform
+    说明：执行滑动 / 长按 / 双击等手势
+    价值：完整 UI 覆盖
+
+
+---------- A14. 数据库 / 状态 —— 2 项 ----------
+
+[55] db_migrate
+    说明：手动跑 / 回滚数据库迁移
+    价值：调试
+
+[56] state_snapshot
+    说明：应用状态快照备份
+    价值：故障恢复
+
+
+================================================================
+B. 健壮性 / 治理类（共 20 项）
+================================================================
+不增新工具，改造已有 132 个工具的工业级能力
+
+
+---------- B1. 工具输出脱敏（最紧急）—— 1 项 ----------
+
+[57] tools/redact.rs
+    说明：所有工具返回前过脱敏正则
+         （API key / JWT / Bearer / 邮箱 / 手机号 / 身份证 / 私钥）
+    价值：不再泄密到 prompt / DB
+
+
+---------- B2. 编辑可逆性 —— 2 项 ----------
+
+[58] dry-run 模式
+    说明：所有 mutating 工具
+         （write_file / edit_file / delete_file / move_file / git_push / deploy）
+         支持 dry_run: bool
+    价值：不真改，预览效果
+
+[59] 单工具取消 UI
+    说明：前端 tool_run 卡片加 abort 按钮
+         → abort_tool_call(tool_id)
+    价值：不用停整个任务
+
+
+---------- B3. 工具元数据规范化 —— 4 项 ----------
+
+[60] 副作用标注 lint
+    说明：扫 TOOL_SPECS，desc 没"副作用"段报警
+    价值：LLM 知道改了什么
+
+[61] desc 长度规范
+    说明：200-500 字统一，过长拆到 tool_help
+    价值：注意力均匀
+
+[62] task_group 字段
+    说明：每工具标 build / fix / explore / deploy / refactor / test 之一
+    价值：按任务查找
+
+[63] timeout_hint + cost_hint
+    说明：工具元数据补超时和成本字段
+    价值：决策更准
+
+
+---------- B4. 工具可靠性 —— 4 项 ----------
+
+[64] fallback 链
+    说明：try_with_fallback(primary, fallbacks) 模式
+         （list_emulators 找不到 → list_devices）
+    价值：工具永远能返回有用信息
+
+[65] 结构化错误统一
+    说明：抽 ToolError { code, category, advice } 替代 Err 字符串
+    价值：前端可做错误恢复 UI
+
+[66] tools_health() ping
+    说明：启动时跑一遍检查每个域
+    价值：HealthPage 仪表盘
+
+[67] 工具响应缓存
+    说明：services/tool_cache.rs
+         按 (tool_name, project, args_hash) 缓存 10-30s
+    价值：高频工具提速 30%
+
+
+---------- B5. 工具组合 —— 1 项 ----------
+
+[68] 组合工具层
+    说明：高频组合封装
+         build_and_deploy / fix_and_retry / scan_and_report / commit_and_push
+    价值：LLM 少写 50% prompt
+
+
+---------- B6. 工具统计 / 排行 —— 1 项 ----------
+
+[69] 工具统计
+    说明：session_events 加 tool_stats 维度
+         （最常用 / 最易失败 / 最耗时 / 最耗 token）
+    价值：决定优化优先级
+
+
+---------- B7. 工具录制 / 重放 —— 1 项 ----------
+
+[70] 工具级 trace
+    说明：session_events.payload 始终存工具完整 args + result
+         加 replay_trace(trace_id)
+    价值：1:1 重放
+
+
+---------- B8. 工具市场化 —— 1 项 ----------
+
+[71] TOOL_SPECS 抽 JSON
+    说明：工具元数据改 tools_meta.json runtime 加载
+    价值：用户能加自定义工具
+
+
+---------- B9. 工具快捷键 —— 1 项 ----------
+
+[72] 快捷键绑定
+    说明：高频工具（take_screenshot / run_command / new_chat）绑 Cmd+?
+    价值：效率提升
+
+
+---------- B10. 工具 sandbox —— 1 项 ----------
+
+[73] sandbox 模拟
+    说明：危险工具（rm / git push --force / deploy）先在临时区模拟执行
+    价值：不真破坏
+
+
+---------- B11. 工具可达性 —— 1 项 ----------
+
+[74] tools_health 命令
+    说明：启动 5 秒内 ping 完所有外部依赖
+    价值：启动时报错
+
+
+---------- B12. 工具分组展示 —— 1 项 ----------
+
+[75] 按任务分组 UI
+    说明：Home 右侧 tab 按任务折叠工具（build / fix / explore）
+    价值：LLM 视角友好
+
+
+---------- B13. 治理补充 —— 1 项 ----------
+
+[76] 工具调用链可视化
+    说明：自动绘制一次任务的工具调用 DAG
+         （哪些工具被多次调用 / 哪些是失败重试 / 哪些是并行）
+    价值：诊断 + 优化
+
+
+================================================================
+总览
+================================================================
+
+类别            数量    当前完成    补完后
+工具补全（A）    56     0           56 个新工具
+健壮性改造（B）  20     0           工具集工业化
+合计            76     —           —
+
+加上现有 132 个工具 + 自动跑（reflexion / cost_guard / lsp / a2a / trace）：
+完成后总计：
+  - 188 个工具
+  - 20 项工业化能力
+  - 4 个自动跑框架（reflexion / cost_guard / a2a / trace）
+
+
+================================================================
+推荐执行节奏（按价值密度 × 实现成本）
+================================================================
+
+---------- 第 1 批（3-5 天，立即价值）—— 7 项 ----------
+  [01] tool_list
+  [02] tool_help
+  [03] tool_history
+  [04] preview_edit
+  [05] format_file
+  [08] lsp_rename
+  [10] lsp_code_action
+  [57] redact（最紧急）
+  [58] dry-run 模式
+  [60] 副作用标注 lint
+
+  这 10 项加完，工具集立马从"能用"变"好用"。
+
+---------- 第 2 批（1 周）—— 12 项 ----------
+  [09] lsp_format
+  [11] lsp_completion
+  [12] lsp_signature
+  [13] db_query
+  [14] log_query
+  [15] trace_export
+  [22] read_pdf
+  [24] ocr_image
+  [25] image_inspect
+  [33] bundle_analyzer
+  [34] size_diff
+  [35] obfuscate
+  [36] ota_pack
+  [37] smoke_test
+  [51] secret_store
+  [52] secret_get
+  [64] fallback 链
+  [65] 结构化错误统一
+  [68] 组合工具层
+
+---------- 第 3 批（1-2 周）—— 20+ 项 ----------
+  [16] metric_export
+  [17] log_aggregate
+  [18] api_mock
+  [19] api_test
+  [20] api_health
+  [21] figma_import
+  [23] docx_read
+  [26] audio_transcribe
+  [27] chart_extract
+  [28] attach_debugger
+  [29] step_debug
+  [30] memory_snapshot
+  [31] screenshot_diff
+  [32] flaky_test_detect
+  [38] conversation_search
+  [39] fact_extract
+  [40] prompt_optimize
+  [41] reflexion_query / pin
+  [59] 单工具取消 UI
+  [61] desc 长度规范
+  [62] task_group 字段
+  [63] timeout_hint + cost_hint
+  [66] tools_health() ping
+  [67] 工具响应缓存
+  [69] 工具统计
+  [70] 工具级 trace
+  [76] 工具调用链可视化
+
+---------- 第 4 批（持续）—— 剩余 ----------
+  [42] share_session
+  [43] import_session
+  [44] export_report
+  [45] feishu_task_sync
+  [46] jira_sync
+  [47] secret_scan
+  [48] license_check
+  [49] vuln_scan
+  [50] permission_audit
+  [53] ui_locator
+  [54] gesture_perform
+  [55] db_migrate
+  [56] state_snapshot
+  [71] TOOL_SPECS 抽 JSON
+  [72] 快捷键绑定
+  [73] sandbox 模拟
+  [74] tools_health 命令
+  [75] 按任务分组 UI
+
+
+================================================================
+建议第一步
+================================================================
+
+最该先做的是 [57] redact —— 300 行内能搞定，
+LSP 都接好了，工具调用越来越深，
+一旦 read_file 把 .env 文件读进 prompt，密钥就直接进数据库。
+这事比再加 10 个新工具重要。
+
+================================================================
+END
+================================================================
