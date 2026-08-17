@@ -57,3 +57,12 @@ _ide.json
 screenshots/
 _e2e_new_harmony/
 _lsp_test/
+
+# 内置运行时与大型资源（约 1GB 构建产物，不随仓库分发）：
+# - runtime/     便携版 Node + JDK + Git（构建/打包时需要，CI 自动下载）
+# - resources/   种子知识库 knowledge.db + embedding 模型 + CUDA 运行时
+# - portable-build/ 绿色版构建产物
+# 本机构建需保留这些目录；克隆用户请参考 README 从 Release 或官方源获取。
+src-tauri/runtime/
+src-tauri/resources/
+portable-build/

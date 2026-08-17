@@ -28,8 +28,9 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        # macOS 无法编译 CUDA（nvcc 不支持 mac），用 --config 覆盖 tauri.conf.json 的 features 关闭 cuda，走 CPU 推理
-        run: npx tauri build --target universal-apple-darwin --config '{"build":{"features":[]}}'
+        # macOS 无法编译 CUDA（nvcc 不支持 mac），用 --config 覆盖 tauri.conf.json 的 features 关闭 cuda，走 CPU 推理；
+        # 仓库不再跟踪 runtime/resources（见 .gitignore），macOS 产物不打包 Windows 便携运行时与种子库
+        run: npx tauri build --target universal-apple-darwin --config '{"build":{"features":[]},"bundle":{"resources":{}}}'
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -130,7 +131,9 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build
+        # seed/embedding（知识库种子与向量模型，约 340MB）无公开下载源，CI 产物仅捆绑上方下载的运行时；
+        # 完整版（含知识库/向量检索）需在本机保留 src-tauri/resources 后构建
+        run: npx tauri build --config '{"bundle":{"resources":{"runtime/node":"node","runtime/git":"git","runtime/jdk":"jdk"}}}'
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -21,7 +21,7 @@
 | 🔌 **多 Provider 路由** | 华为/智谱/通义等多家 LLM 接入 + 本地 HTTP 代理 + 熔断器 + 自动 failover + 费用追踪 + 请求日志 |
 | 📚 **API 知识库** | 内置 HarmonyOS API 索引（向量检索 + 符号索引） + 跨版本 diff + 兼容性扫描 + 用户笔记（knowledge entries） |
 | 🛡 **安全治理** | 工具调用白名单 / 工具限额（按任务组） / 任务守卫 / 预算控制 / 权限管理 / 审批拦截流水线（pre/post hooks） |
-| 📦 **内置运行时** | 自带 Node + JDK + Git 运行环境（`src-tauri/runtime/`），用户机器无需预装开发环境 |
+| 📦 **内置运行时** | 便携版 Node + JDK + Git 随安装包捆绑（构建时由 CI 从官方源自动下载），用户机器无需预装开发环境 |
 | 💬 **会话管理** | 多会话 / 上下文压缩（compact） / LLM 调用回放（llm_replay） / 事件溯源（session_events） / 会话标签 / 置顶 / 消息队列 |
 | 🧠 **代码理解** | LSP 语义级分析（ArkTS 语言服务器） + 分级扫描（check_code / deep_scan / codebase_search / get_symbol_details） / 符号索引 / 文件系统工具集 |
 | 🌐 **生态能力** | MCP 服务器管理 / Skill 启停与使用统计 / ohpm 生态面板 / 鸿蒙官方文档检索 / Web 搜索与抓取 / 知识库导入导出 |
@@ -195,8 +195,10 @@ src-tauri/src/
 ├── db/                     # SQLite + 49 个迁移
 ├── utils/                  # 工具（10 文件）
 ├── tray/                   # 系统托盘
-└── runtime/                # 内置 Node + JDK + Git
+└── runtime/                # 内置 Node + JDK + Git（约 700MB，不入库，见下）
 ```
+
+> **关于大文件**：`src-tauri/runtime/`（便携运行时）、`src-tauri/resources/`（种子知识库 + embedding 模型，约 340MB）与 `portable-build/`（绿色版产物）共约 1GB，属构建产物/下载资源，**不随 Git 仓库分发**（见 `.gitignore`）。本机构建请保留这些目录；克隆用户可从 Release 安装包获取完整运行时，或参照 [release.yml](.github/workflows/release.yml) 的下载逻辑自行准备。
 
 ## 193 个 Agent 工具按域分组
 
@@ -239,17 +241,18 @@ npm install
 # 开发模式（热更新）
 npx tauri dev
 
-# 生产构建
+# 生产构建（需本机已准备 src-tauri/runtime 与 src-tauri/resources，见下方说明）
 npx tauri build
-
-# 内置运行时已随仓库跟踪，无需预装 Node / JDK / Git
 ```
+
+> **内置运行时说明**：便携版 Node / JDK / Git（约 700MB）与知识库种子、embedding 模型（约 340MB）不随仓库分发。
+> 本机构建请保留本地 `src-tauri/runtime/`、`src-tauri/resources/` 目录；CI 会自动从官方源下载运行时（见 [release.yml](.github/workflows/release.yml)）。
+> 缺少这些目录时：内置环境（Node/JDK/Git）、API 知识库与向量检索功能不可用，其余功能不受影响。
 
 ### 系统要求
 
-- **构建机**：Rust 1.75+、Node 18+、Tauri 2 依赖
+- **构建机**：Rust 1.75+、Node 18+、Tauri 2 依赖；打包完整版还需准备 `src-tauri/runtime/` 与 `src-tauri/resources/`（约 1GB）
 - **运行机**：Windows 10+ / macOS 11+ / Ubuntu 22.04+
-- **首次构建**：`src-tauri/runtime/` 需解压（约 200MB）
 
 ## 文档
 
