@@ -1089,7 +1089,7 @@ export default function HealthPage() {
         </div>
         {updateInfo && <p className="text-xs mt-2 break-all">{updateInfo}</p>}
         <p className="text-xs text-[var(--text-muted)] mt-2 font-mono break-all">
-          {t('health.updateSource', { url: 'https://github.com/like3213934360-lab/Deveco-code-swich/releases/latest/download/latest.json' })}
+          {t('health.updateSource', { url: 'https://github.com/lookapu/HarmonyAgent/releases/latest/download/latest.json' })}
         </p>
         {appInfo && (
           <div className="text-xs text-[var(--text-muted)] mt-2 font-mono break-all space-y-0.5">

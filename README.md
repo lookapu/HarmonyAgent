@@ -217,7 +217,7 @@ src-tauri/src/
 
 ## 安装
 
-从 [Releases](https://github.com/like3213934360-lab/Deveco-code-swich/releases) 下载安装包：
+从 [Releases](https://github.com/lookapu/HarmonyAgent/releases) 下载安装包：
 
 - **Windows**: `.exe`（NSIS 安装包）或 `.msi`
 - **macOS**: `.dmg` 或 `.app.tar.gz`

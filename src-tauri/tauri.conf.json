@@ -63,7 +63,7 @@
     },
     "updater": {
       "endpoints": [
-        "https://github.com/like3213934360-lab/Deveco-code-swich/releases/latest/download/latest.json"
+        "https://github.com/lookapu/HarmonyAgent/releases/latest/download/latest.json"
       ],
       "pubkey": ""
     }
