@@ -41,6 +41,10 @@ import search from './search.svg'
 import terminal from './terminal.svg'
 import phone from './phone.svg'
 import arrowDown from './arrow-down.svg'
+import history from './history.svg'
+import quote from './quote.svg'
+import tune from './tune.svg'
+import apps from './apps.svg'
 
 export const icons = {
   bolt,
@@ -86,6 +90,10 @@ export const icons = {
   terminal,
   phone,
   'arrow-down': arrowDown,
+  history,
+  quote,
+  tune,
+  apps,
 } as const
 
 export type IconName = keyof typeof icons

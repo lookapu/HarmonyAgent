@@ -2,9 +2,12 @@
 //!
 //! - L0（只读）：读取/搜索/列表/查看类，对已信任项目免审。
 //! - L1（写入，限定项目内）：写文件、编辑、构建、安装依赖、部署等，对已信任项目免审。
-//! - L2（危险/越界）：删除、执行任意命令、git push、网络写等，始终需要用户确认。
+//! - L2（危险/越界）：删除、执行任意命令、git push、网络写等，需用户确认（ask/auto 模式弹窗；
+//!   allow_all 模式用户已完全授权，直接放行）。
 //!
-//! 命令白名单：run_command 仅允许一组明确的可执行程序（开发工具链），其余命令需经 L2 审批。
+//! 命令白名单：作为 run_command 的审批分级依据——命中白名单的命令视为 L1（已信任项目免审），
+//! 未命中的视为 L2（ask/auto 模式弹窗确认，allow_all 模式直接放行）；危险命令黑名单在
+//! run_command 工具内部硬拦截，任何权限模式均生效。
 
 use rusqlite::Connection;
 
@@ -39,37 +42,61 @@ pub fn tool_level(tool: &str) -> Level {
         | "read_logcat" | "web_search" | "web_fetch" | "search_symbols"
         | "get_diagnostics" | "todo_write" | "ask_user"
         | "check_code" | "deep_scan" | "codebase_search" | "get_symbol_details"
+                | "secret_scan"
+        | "lsp_definition" | "lsp_references" | "lsp_symbols" | "lsp_hover" | "lsp_diagnostics"
         | "git_log" | "git_blame" | "get_env_info" | "get_file_info"
         | "device_perf" | "collect_perf" | "read_runtime_logs"
         | "list_modules" | "read_module_config" | "search_sdk_api" | "read_sdk_api_module"
         | "check_sdk_alignment" | "search_harmony_docs" | "read_harmony_doc"
         | "show_diagnose_card"
-        | "dump_ui_hierarchy" | "dump_memory" | "get_installed_apps" | "get_app_info"
+        | "dump_ui_hierarchy" | "ui_locator" | "dump_memory" | "get_installed_apps" | "get_app_info"
         | "analyze_hap_size" | "search_hilog" | "run_lint" | "check_signature"
+        | "size_diff" | "screenshot_diff"
+        | "diagnose_signing"
         | "dump_battery" | "scan_api_compat" | "search_api"
         | "get_api_detail" | "diff_api_versions"
         | "list_agents"
         | "list_emulators" | "device_shell" | "ohpm_search"
         | "environment_check" | "search_knowledge" | "list_mcp_servers"
+        | "conversation_search"
         | "plan_task" | "update_progress" | "get_cost_summary"
-        | "review_changes" | "analyze_generic_project" | "job_list" | "job_output" => Level::L0,
+        | "review_changes" | "analyze_generic_project" | "job_list" | "job_output"
+        | "agent_publish" | "agent_subscribe"
+        | "stack_dump" | "preview_edit"
+        | "tool_list" | "tool_help" | "tool_history" | "lsp_completion" | "lsp_signature"
+        | "read_pdf" | "image_inspect" | "ocr_image" | "permission_audit"
+        | "chart_extract" | "reflexion_query" | "prompt_optimize" | "export_tools_meta" => Level::L0,
+        // 质量/度量域只读工具（TOOL_ENHANCEMENTS 第 2/3 批）
+        "code_metrics" | "metric_export" | "log_aggregate" | "replay_trace" => Level::L0,
         // L1 写入（限定项目内 / 开发动作）
         "write_file" | "edit_file" | "move_file" | "copy_file" | "undo_edit" | "build_project" | "deploy" | "ohpm_install"
+        | "create_harmony_project"
         | "run_tests" | "take_screenshot" | "save_memory" | "spawn_agents"
+        | "flaky_test_detect" | "smoke_test" | "compose"
         | "http_request" | "multi_edit"
         | "verify_ui" | "deploy_all" | "write_unit_tests" | "run_ui_flow" | "run_perf_benchmark"
         | "start_ability" | "clear_app_data" | "uninstall_app" | "grant_permission"
         | "set_wifi_state" | "set_airplane_mode" | "screen_record"
         | "record_ui" | "replay_ui" | "set_network_condition" | "auto_explore"
+        | "gesture_perform"
         | "refresh_api_db" | "refresh_api_details"
         | "connect_device" | "manage_hdc" | "start_emulator" | "create_emulator"
         | "device_file" | "stop_app" | "analyze_crash"
         | "manage_memory" | "manage_knowledge" | "export_data"
         | "build_generic" | "run_app" | "git_fetch"
-        | "git_branch" | "git_tag" | "job_kill" => Level::L1,
+        | "git_branch" | "git_tag" | "job_kill"
+        | "debug_probe"
+        | "db_query" | "lsp_rename" | "lsp_format" | "lsp_code_action"
+        | "format_file"
+        | "share_session" | "import_session" | "trace_export"
+        | "db_migrate" | "state_snapshot"
+        | "secret_store" | "secret_delete"
+        | "fact_extract" | "reflexion_pin" | "export_report" | "use_skill" => Level::L1,
+        // 质量/度量域写/外部请求工具（snippet 库、混淆开关、HTTP 探测）
+        "snippet_insert" | "obfuscate" | "api_test" | "api_health" => Level::L1,
         // L2 危险/越界
         "delete_file" | "run_command" | "git_commit" | "git_stash" | "git_restore"
-        | "git_pull" | "git_push" => Level::L2,
+        | "git_pull" | "git_push" | "secret_get" | "sandbox_exec" => Level::L2,
         _ => Level::L2,
     }
 }
@@ -83,10 +110,17 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     "go", "mvn", "mvnw", "mvnw.bat", "dotnet", "pip", "pip3", "pytest",
     "ruby", "bundle", "composer", "php", "flutter", "dart", "swift", "xcodebuild",
     "make", "cmake", "clang", "gcc", "g++",
+    // cmd 内建只读命令：type 仅打印文本文件内容（如读工作区外的 SDK 配置），
+    // read_file 受项目根限制覆盖不了该场景，且无执行风险，直接放行
+    "type",
+    // 目录切换/列举：无执行风险（cd 仅改会话 CWD；dir 只读），放行便于组合命令
+    "cd",
+    "dir",
 ];
 
 /// 命令中的危险子操作（即使程序在白名单内，命中也升级为 L2）。
-const DANGEROUS_PATTERNS: &[&str] = &[
+/// pub(crate)：sandbox_exec 工具复用同一口径做干跑预览。
+pub(crate) const DANGEROUS_PATTERNS: &[&str] = &[
     "git push", "git reset --hard", "git clean -f", "git checkout .",
     "npm publish", "ohpm publish", "hdc shell", "hdc install",
     "format ", "shutdown", "diskpart", "mkfs", "rm -rf", "rm -fr",
@@ -94,6 +128,9 @@ const DANGEROUS_PATTERNS: &[&str] = &[
 ];
 
 /// 判断命令是否在白名单内（程序名允许且无危险子操作）。
+/// 仅用于审批分级（L1 免审 / L2 弹窗），不再用于工具内部硬拦截；
+/// 危险命令黑名单（is_dangerous_command）才是任何模式都生效的硬拦截。
+/// 支持 `cd /d X && cmd` 组合：按 && 分段，每段程序均须在白名单（cd 段无风险直接放行）。
 pub fn is_command_allowed(cmd: &str) -> bool {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -104,8 +141,22 @@ pub fn is_command_allowed(cmd: &str) -> bool {
     if DANGEROUS_PATTERNS.iter().any(|p| lower.contains(p)) {
         return false;
     }
+    // && 组合：每段程序都须允许（如 cd /d X && hvigorw.bat ...）；
+    // 注意危险模式已在上面按整条命令检查过，分段只校验程序名
+    let segments: Vec<&str> = trimmed.split("&&").collect();
+    if segments.len() > 1 {
+        return segments.iter().all(|s| segment_allowed(s.trim()));
+    }
+    segment_allowed(trimmed)
+}
+
+/// 单段命令白名单校验（取第一个 token 作为程序名）。
+fn segment_allowed(seg: &str) -> bool {
+    if seg.is_empty() {
+        return false;
+    }
     // 取第一个 token 作为程序名，去掉引号和可能的路径前缀
-    let first = trimmed.split_whitespace().next().unwrap_or("");
+    let first = seg.split_whitespace().next().unwrap_or("");
     let first = first.trim_matches('"');
     let prog = std::path::Path::new(first)
         .file_name()
@@ -263,6 +314,7 @@ mod tests {
         assert!(is_command_allowed("mvn compile"));
         assert!(is_command_allowed("dotnet build"));
         assert!(is_command_allowed("python -m pytest"));
+        assert!(is_command_allowed("type \"C:\\Program Files\\Huawei\\DevEco Studio\\sdk\\default\\sdk-pkg.json\""));
         assert!(!is_command_allowed("git push origin main"));
         assert!(!is_command_allowed("format c:"));
         assert!(!is_command_allowed("malware.exe"));

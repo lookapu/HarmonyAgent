@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// CREATE_NO_WINDOW：子进程不创建控制台窗口（Windows）
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// App 是否持有（隐藏的）控制台。GUI 双击运行时无控制台，需 AllocConsole 创建一个隐藏控制台，
 /// 使 hvigor/ohpm 等命令行工具的子进程、孙进程（hvigor worker / node 编译进程等）
@@ -80,6 +80,12 @@ pub fn set_harmony_path_dirs(dirs: Vec<PathBuf>) {
     *HARMONY_EXTRA_PATH.lock().unwrap() = dirs;
 }
 
+/// 当前注册的鸿蒙工具链额外 PATH 目录（内置终端等构造子进程环境时注入 PATH，
+/// 使 hdc/ohpm 未进系统 PATH 时终端命令也能命中）。
+pub fn extra_path_dirs() -> Vec<PathBuf> {
+    HARMONY_EXTRA_PATH.lock().unwrap().clone()
+}
+
 /// 内置默认 JDK 目录（jdk_runtime 默认版本或出厂捆绑版）；None 表示未初始化/无内置。
 /// 系统已设置 JAVA_HOME 时注入跳过（以系统为准）；否则自动注入 JAVA_HOME 并前置 bin 到 PATH，
 /// 使 hvigor 构建 / java 命令在无系统 JDK 时也能工作。
@@ -94,7 +100,7 @@ pub fn set_default_jdk_dir(dir: Option<PathBuf>) {
 /// - 系统 JAVA_HOME 已存在 → 跳过
 /// - 系统 PATH 已有 java.exe → 跳过
 /// 否则返回 (key, value) 对：JAVA_HOME + 前置 `<jdk>/bin` 的 PATH。
-fn jdk_env_overrides() -> Vec<(String, String)> {
+pub fn jdk_env_overrides() -> Vec<(String, String)> {
     if std::env::var_os("JAVA_HOME").is_some() || system_path_has_java() {
         return Vec::new();
     }

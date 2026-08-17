@@ -117,7 +117,7 @@ pub async fn set_default_device(device_id: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 设备详情：展开卡片时按需查询（品牌/厂商/系统版本/分辨率/电池/内存）。
+/// 设备详情：展开卡片时按需查询（品牌/厂商/系统版本/分辨率/电池/内存/存储/频率）。
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct DeviceDetail {
     pub brand: String,
@@ -127,6 +127,14 @@ pub struct DeviceDetail {
     pub resolution: String,
     pub battery: String,
     pub ram: String,
+    /// 存储用量文本（如 "28.2GB / 220.3GB（13%）"），读不到为空
+    pub storage: String,
+    /// CPU 当前频率（如 "1.62GHz"），读不到为空
+    pub cpu_freq: String,
+    /// 电池状态文本（充电状态 + 电压 + 电流 + 电芯技术），读不到为空
+    pub battery_status: String,
+    /// 电池温度 ℃（如 "30.0℃"），读不到为空
+    pub battery_temp: String,
 }
 
 /// 在目标设备上执行 shell 命令（单命令字符串，返回去空白输出）
@@ -164,8 +172,39 @@ pub async fn get_device_detail(device_id: String) -> Result<DeviceDetail, String
         .lines()
         .find_map(|l| l.trim().strip_prefix("Physical size:").map(|s| s.trim().to_string()))
         .unwrap_or_default();
-    // 电池电量百分比（%）
-    let battery = shell_exec(d, "cat /sys/class/power_supply/battery/capacity").await;
+    // 电池：hidumper BatteryService（鸿蒙 shell 无权限读 /sys/class/power_supply，
+    // 实测 cat capacity 报 No such file / Permission denied；hidumper 是授权通道）
+    let batt_raw = shell_exec(d, "hidumper -s BatteryService -a -i").await;
+    let (capacity, temp, charging, voltage, current, tech) = parse_battery_info(&batt_raw);
+    let battery = if capacity >= 0.0 {
+        format!("{capacity:.0}%")
+    } else {
+        String::new()
+    };
+    let battery_temp = if temp >= 0.0 { format!("{temp:.1}℃") } else { String::new() };
+    let battery_status = {
+        let mut parts: Vec<String> = Vec::new();
+        match charging {
+            1 => parts.push("充电中".into()),
+            2 => parts.push("未充电".into()),
+            3 => parts.push("已充满".into()),
+            _ => {}
+        }
+        if voltage > 0 {
+            parts.push(format!("{:.2}V", voltage as f64 / 1_000_000.0));
+        }
+        if current > 0 {
+            parts.push(format!("{current}mA"));
+        }
+        if !tech.is_empty() {
+            parts.push(tech);
+        }
+        parts.join(" · ")
+    };
+    // 存储：hidumper --storage（df -k 输出，取 /data 分区）
+    let storage = parse_storage(&shell_exec(d, "hidumper --storage").await);
+    // CPU 当前频率：hidumper --cpufreq（取首个有效核）
+    let cpu_freq = parse_cpu_freq(&shell_exec(d, "hidumper --cpufreq").await);
     // 内存总量（/proc/meminfo MemTotal，单位 kB）
     let ram = shell_exec(d, "cat /proc/meminfo")
         .await
@@ -184,7 +223,76 @@ pub async fn get_device_detail(device_id: String) -> Result<DeviceDetail, String
         resolution,
         battery,
         ram,
+        storage,
+        cpu_freq,
+        battery_status,
+        battery_temp,
     })
+}
+
+/// 解析 hidumper BatteryService -i 输出（"key: value" 行）。
+/// 返回 (电量%, 温度℃, 充电状态, 电压µV, 电流mA, 电芯技术)；缺项取默认。
+/// temperature 单位 0.1℃（如 300 → 30.0℃）；chargingStatus 1=充电中 2=未充电 3=已充满。
+fn parse_battery_info(out: &str) -> (f64, f64, i64, u64, i64, String) {
+    let mut capacity = -1.0f64;
+    let mut temp = -1.0f64;
+    let mut charging = -1i64;
+    let mut voltage = 0u64;
+    let mut current = 0i64;
+    let mut tech = String::new();
+    for line in out.lines() {
+        let l = line.trim();
+        let Some((k, v)) = l.split_once(':') else { continue };
+        let v = v.trim();
+        match k.trim() {
+            "capacity" => capacity = v.parse().unwrap_or(-1.0),
+            "temperature" => temp = v.parse::<f64>().map(|t| t / 10.0).unwrap_or(-1.0),
+            "chargingStatus" => charging = v.parse().unwrap_or(-1),
+            "voltage" => voltage = v.parse().unwrap_or(0),
+            "nowCurrent" => current = v.parse().unwrap_or(0),
+            "technology" => tech = v.to_string(),
+            _ => {}
+        }
+    }
+    (capacity, temp, charging, voltage, current, tech)
+}
+
+/// 从 hidumper --storage 输出（df -k 表格）解析 /data 分区用量文本。
+/// 行格式：<设备> <1K-blocks> <Used> <Available> <Use%> <挂载点>
+fn parse_storage(out: &str) -> String {
+    for line in out.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 6 && (parts[5] == "/data" || parts[5].starts_with("/data/")) {
+            let total_kb: u64 = parts[1].parse().unwrap_or(0);
+            let used_kb: u64 = parts[2].parse().unwrap_or(0);
+            if total_kb == 0 {
+                continue;
+            }
+            return format!(
+                "{:.1}GB / {:.1}GB（{:.0}%）",
+                used_kb as f64 / 1048576.0,
+                total_kb as f64 / 1048576.0,
+                used_kb as f64 / total_kb as f64 * 100.0
+            );
+        }
+    }
+    String::new()
+}
+
+/// 从 hidumper --cpufreq 输出解析首个有效核的当前频率（"cmd is: …" 行跳过）。
+fn parse_cpu_freq(out: &str) -> String {
+    for line in out.lines() {
+        let l = line.trim();
+        if l.starts_with("cmd is:") || l.is_empty() {
+            continue;
+        }
+        if let Ok(hz) = l.parse::<u64>() {
+            if hz > 0 {
+                return format!("{:.2}GHz", hz as f64 / 1_000_000.0);
+            }
+        }
+    }
+    String::new()
 }
 
 /// 设备性能快照（CPU/内存/温度/电量），供实时监控曲线使用。
@@ -230,28 +338,19 @@ pub async fn get_device_perf(device_id: String) -> Result<DevicePerf, String> {
         }
     };
 
-    // ---- 电池 ----
-    let battery = shell_exec(d, "cat /sys/class/power_supply/battery/capacity")
-        .await
-        .trim()
-        .parse::<f64>()
-        .unwrap_or(-1.0);
-
-    // ---- 温度：遍历 thermal_zone0..3 取第一个有效 ----
-    let mut temp = -1.0;
-    for i in 0..4 {
-        let v = shell_exec(d, &format!("cat /sys/class/thermal/thermal_zone{i}/temp")).await;
-        let v = v.trim().trim_end_matches('0');
-        if let Ok(t) = v.parse::<f64>() {
-            if t > 0.0 {
-                // thermal_zone temp 通常为毫摄氏度（如 42000 → 42℃），小数值为摄氏度
-                temp = if t > 1000.0 { t / 1000.0 } else { t };
-                break;
-            }
-        }
-    }
+    // ---- 电池/温度：hidumper BatteryService（鸿蒙 shell 读 sysfs 权限不足）----
+    let (battery, temp) = sample_battery_via_hidumper(d).await;
 
     Ok(DevicePerf { cpu, mem, battery, temp, ts })
+}
+
+/// 通过 hidumper BatteryService -i 读取电量与温度。
+/// 鸿蒙 shell 读 /sys/class/power_supply 与 /sys/class/thermal 均 Permission denied，
+/// hidumper 是系统授权通道；temperature 单位 0.1℃（300 → 30.0℃）。
+async fn sample_battery_via_hidumper(device: &str) -> (f64, f64) {
+    let out = shell_exec(device, "hidumper -s BatteryService -a -i").await;
+    let (capacity, temp, _, _, _, _) = parse_battery_info(&out);
+    (capacity, temp)
 }
 
 /// 从 /proc/meminfo 文本提取 "MemTotal:" 后的 kB 数值（数字后可能带 kB 单位，取首个空白分隔 token）
@@ -326,12 +425,21 @@ pub async fn stop_hdc_service() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// 截取设备屏幕：截图保存到项目 `.deveco-agent/screenshots/` 目录，返回项目内相对路径。
+/// hdc shell 命令输出是否失败：hdc 的 shell 子命令失败时 exit code 仍为 0，
+/// 错误只体现在输出文本里（如 snapshot_display 的 error: 行、screencap 的 not found），
+/// 不能只信 status，须按文本特征判断。
+fn hdc_shell_failed(out: &str) -> bool {
+    out.contains("error:") || out.contains("[Fail]") || out.contains("not found") || out.contains("No such file")
+}
+
+/// 截取设备屏幕：截图保存到项目 `.deveco-agent/screenshots/` 目录，返回本地绝对路径。
+/// 文件名带设备号与项目名（多个项目/多设备并存时一眼可辨）。
 /// 前端用项目根 + 该路径通过 asset protocol 预览（复用 Agent 截图工具同款流程）。
 #[tauri::command]
 pub async fn capture_device_screenshot(
     project_id: String,
     device_id: Option<String>,
+    project_name: Option<String>,
     state: State<'_, DbState>,
     app: AppHandle,
 ) -> Result<String, String> {
@@ -357,27 +465,49 @@ pub async fn capture_device_screenshot(
         return Err("未指定设备且没有默认设备".into());
     }
 
-    // 设备端截图（旧版 hdc 回退 screencap）
-    let remote = "/sdcard/deveco_agent_shot.png";
-    if run_hdc(
-        &["-t", device.as_str(), "shell", "snapshot_display", "-f", remote],
+    // 设备端截图：snapshot_display（鸿蒙标准，-t png 显式输出真 PNG）→ 失败回退 screencap（AOSP）。
+    // 路径用 /data/local/tmp（部分鸿蒙设备没有 /sdcard，且 snapshot_display 按后缀推断格式）；
+    // 失败判断用文本特征（hdc shell 失败时 exit 仍为 0），最终以拉取到文件为唯一标准。
+    let remote = "/data/local/tmp/deveco_agent_shot.png";
+    let shot = run_hdc(
+        &["-t", device.as_str(), "shell", "snapshot_display", "-t", "png", "-f", remote],
         30,
     )
     .await
-    .is_err()
-    {
-        run_hdc(
+    .unwrap_or_default();
+    if hdc_shell_failed(&shot) {
+        let shot2 = run_hdc(
             &["-t", device.as_str(), "shell", "screencap", "-p", remote],
             30,
         )
-        .await?;
+        .await
+        .unwrap_or_default();
+        if hdc_shell_failed(&shot2) {
+            return Err(format!(
+                "设备截图失败：{}",
+                shot.lines().next().unwrap_or("未知错误")
+            ));
+        }
     }
 
-    // 拉取到项目 screenshots 目录
+    // 拉取到项目 screenshots 目录（文件名带设备号与项目名；项目名清洗非法字符）
     let dir = Path::new(&project_path).join(".deveco-agent").join("screenshots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let local = dir.join(format!("shot-{ts}.png"));
+    let safe_name: String = project_name
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if "<>:\"/\\|?*".contains(c) || c.is_whitespace() { '-' } else { c })
+        .take(24)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let file_name = if safe_name.is_empty() {
+        format!("shot-{device}-{ts}.png")
+    } else {
+        format!("shot-{device}-{safe_name}-{ts}.png")
+    };
+    let local = dir.join(&file_name);
     let owned: Vec<String> = vec![
         "-t".into(),
         device.clone(),
@@ -393,13 +523,103 @@ pub async fn capture_device_screenshot(
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    if !local.exists() {
-        return Err("截图文件未生成".into());
+    if !local.exists() || std::fs::metadata(&local).map(|m| m.len() == 0).unwrap_or(true) {
+        return Err("截图文件未生成（设备端截图可能失败）".into());
     }
+    // 清理设备端临时文件，避免多次截图累积
+    let _ = run_hdc(&["-t", device.as_str(), "shell", "rm", remote], 10).await;
 
     // 项目目录注册为资源访问范围（前端 convertFileSrc 预览）
     let _ = app.asset_protocol_scope().allow_directory(Path::new(&project_path), true);
     Ok(local.to_string_lossy().to_string())
+}
+
+/// 截图文件条目（列表用）
+#[derive(Debug, Serialize, Clone)]
+pub struct ShotFile {
+    /// 文件名（如 shot-6UNB...-MyApp-20260814-193000.png）
+    pub name: String,
+    /// 本地绝对路径（前端 convertFileSrc 预览）
+    pub path: String,
+    /// 文件大小（字节）
+    pub size: u64,
+    /// 修改时间（unix 秒）
+    pub mtime: i64,
+}
+
+/// 项目截图目录（.deveco-agent/screenshots）；项目不存在时报错。
+fn screenshots_dir(project_id: &str, state: &State<'_, DbState>) -> Result<std::path::PathBuf, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let p: String = conn
+        .query_row(
+            "SELECT path FROM projects WHERE id = ?1",
+            [project_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("项目不存在: {e}"))?;
+    Ok(Path::new(&crate::utils::path::normalize_path(&p))
+        .join(".deveco-agent")
+        .join("screenshots"))
+}
+
+/// 列出项目截图目录的图片（png/jpg/jpeg，时间倒序，最多 50 张）。
+#[tauri::command]
+pub async fn list_device_screenshots(
+    project_id: String,
+    state: State<'_, DbState>,
+) -> Result<Vec<ShotFile>, String> {
+    let dir = screenshots_dir(&project_id, &state)?;
+    let mut items: Vec<ShotFile> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let lower = name.to_lowercase();
+            if !(lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
+                continue;
+            }
+            let md = match e.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !md.is_file() {
+                continue;
+            }
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            items.push(ShotFile {
+                name,
+                path: e.path().to_string_lossy().to_string(),
+                size: md.len(),
+                mtime,
+            });
+        }
+    }
+    items.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    items.truncate(50);
+    Ok(items)
+}
+
+/// 删除一张截图（仅限截图目录内、无路径分隔符的文件名，防目录穿越）。
+#[tauri::command]
+pub async fn delete_device_screenshot(
+    project_id: String,
+    name: String,
+    state: State<'_, DbState>,
+) -> Result<(), String> {
+    let dir = screenshots_dir(&project_id, &state)?;
+    let safe = name.replace('\\', "/");
+    if safe.contains('/') || safe.contains("..") {
+        return Err("非法的截图文件名".into());
+    }
+    let target = dir.join(&name);
+    if !target.is_file() {
+        return Err("截图不存在".into());
+    }
+    std::fs::remove_file(&target).map_err(|e| format!("删除截图失败: {e}"))
 }
 
 /// 已安装应用信息（第三方应用清单）

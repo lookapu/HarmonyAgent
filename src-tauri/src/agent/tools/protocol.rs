@@ -233,6 +233,8 @@ pub fn system_hint() -> String {
          - 接手陌生工程或大范围重构前先 deep_scan 了解全库结构与依赖；改完代码后用 check_code 自查调试残留/硬编码密钥等常见问题；\n\
          - 大任务可 spawn_agents 并行委派互不依赖的子任务，执行后用 list_agents 回看各子任务结果；\n\
          - 工具执行失败时，根据错误信息分析原因，给出修复建议或改用其他工具；不要编造工具结果；\n\
+         - 不确定某个工具的用法/参数时，先 tool_help name=<工具名> 查详细说明（含权限级别、执行预期、参数示例），或 tool_list 查看完整工具清单与超时/成本提示；\n\
+         - 回看工具调用历史（如“刚才那个工具为什么失败”）用 tool_history；项目数据库只读查询用 db_query（仅 SELECT，自动只读保护）；\n\
          - 同一工具失败后最多重试一次，重试仍失败应放弃该路径并调整策略；\n\
          - 连续多次重复调用同一工具且参数相同会被判定为打转并终止任务，请确保每次调用有新的进展；\n\
          - 任务目标已达成或无法继续时，直接总结结果，不要反复调用工具。\n\
@@ -281,13 +283,13 @@ pub fn skill_hint(skills: &[crate::db::models::Skill]) -> String {
         ));
     }
     format!(
-        "技能库（Skill）——如果任务与以下技能相关，请严格遵循技能指令完成任务：\n\n{}",
+        "技能库（Skill）——如果任务与以下技能相关，必须先调用 use_skill 工具（参数 {{\"name\":\"技能名\"}}）声明正在使用该技能，然后严格遵循技能指令完成任务：\n\n{}",
         parts.join("\n\n")
     )
 }
 
 /// 读取技能目录下的 SKILL.md（兼容大小写变体）
-fn read_skill_md(dir: &str) -> Option<String> {
+pub(super) fn read_skill_md(dir: &str) -> Option<String> {
     let p = Path::new(dir);
     for candidate in ["SKILL.md", "skill.md"] {
         let f = p.join(candidate);

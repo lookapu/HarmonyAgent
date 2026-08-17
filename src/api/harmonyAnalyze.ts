@@ -52,6 +52,8 @@ export interface ProjectBasic {
   main_element?: string | null
   entry_module?: string | null
   api_version?: number | null
+  /** compatibleSdkVersion 原文（如 "6.1.1(24)"） */
+  sdk_version?: string | null
   signing_configured: boolean
 }
 

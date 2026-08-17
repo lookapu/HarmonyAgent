@@ -45,8 +45,6 @@ export interface DateRange {
 export interface LogFilter {
   limit?: number
   offset?: number
-  provider_id?: string
-  model?: string
 }
 
 /** 任务级指标（task_runs 聚合：成功率 / 耗时分布 / 成本 / 错误分类） */
@@ -98,3 +96,28 @@ export const getTaskStats = (projectId?: string, days = 30) =>
 /** 最近任务列表；project_id 为空 = 全局；status 可选过滤（success/error/cancelled） */
 export const getTaskRuns = (projectId?: string, status?: string, limit = 20) =>
   invoke<TaskRun[]>('get_task_runs', { projectId: projectId ?? '', status: status ?? '', limit })
+
+/** 单 Provider 预算状态：当日/当月已用 + 日/月上限 */
+export interface BudgetStatus {
+  provider_id: string | null
+  used_today_cny: number
+  used_month_cny: number
+  daily_limit_cny: number | null
+  monthly_limit_cny: number | null
+}
+
+/** 全部 Provider 预算概览：单 Provider 列表 + 跨 Provider 汇总 */
+export interface AllBudgetStatus {
+  providers: BudgetStatus[]
+  used_today_cny: number
+  used_month_cny: number
+  daily_limit_cny: number | null
+  monthly_limit_cny: number | null
+}
+
+/** 查询某 Provider 预算状态；provider_id 缺省 = 跨 Provider 汇总 */
+export const getBudgetStatus = (providerId?: string) =>
+  invoke<BudgetStatus>('get_budget_status', { providerId: providerId ?? null })
+
+/** 全部 Provider 预算概览（成本页顶部预算总览卡片用） */
+export const getAllBudgetStatus = () => invoke<AllBudgetStatus>('get_all_budget_status')

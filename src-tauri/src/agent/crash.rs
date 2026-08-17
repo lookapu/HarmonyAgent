@@ -4,6 +4,7 @@
 //! 推荐下一步），从而自主读文件→修复→重新部署，形成运行时闭环。
 
 use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 一次崩溃的结构化分析结果。
 #[derive(Debug, Clone, Default, Serialize)]
@@ -25,11 +26,6 @@ pub struct CrashReport {
     pub snippet: String,
 }
 
-impl CrashReport {
-    fn is_empty(&self) -> bool {
-        self.category.is_empty() || self.category == "unknown"
-    }
-}
 
 /// 分析 faultlog（优先，结构化程度高）与 hilog -x（兜底）文本，返回结构化崩溃报告。
 /// `bundle` 用于过滤与本应用相关的行。
@@ -395,6 +391,99 @@ fn truncate(s: &str, max: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max).collect::<String>() + "…"
+}
+
+// ---------------- 历史崩溃模式（同类崩溃聚集） ----------------
+
+/// 一个历史崩溃模式：同项目内 (category, exception, 定位文件) 相同则聚为一类。
+#[derive(Clone, serde::Serialize)]
+pub struct CrashPattern {
+    pub category: String,
+    pub exception: String,
+    /// 首个定位（file:line，无则空）
+    pub location: String,
+    /// 累计出现次数
+    pub count: usize,
+    /// 最近一次出现的 unix 秒
+    pub last_at: i64,
+}
+
+static HISTORY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<CrashPattern>>>> =
+    std::sync::OnceLock::new();
+
+fn history() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, Vec<CrashPattern>>> {
+    HISTORY
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// 每项目最多保留的模式数（超出丢弃最旧，防内存膨胀）
+const MAX_PATTERNS_PER_PROJECT: usize = 20;
+
+/// 记录一次崩溃并返回该模式的历史计数（含本次）；
+/// 返回 >1 表示同类崩溃已反复出现，调用方可提示模型参考既往修复经验。
+pub fn record_pattern(project_key: &str, report: &CrashReport) -> usize {
+    let mut h = history();
+    let list = h.entry(project_key.to_string()).or_default();
+    let loc = report.locations.first().cloned().unwrap_or_default();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    match list.iter_mut().find(|p| {
+        p.category == report.category && p.exception == report.exception && p.location == loc
+    }) {
+        Some(p) => {
+            p.count += 1;
+            p.last_at = now;
+            p.count
+        }
+        None => {
+            list.push(CrashPattern {
+                category: report.category.clone(),
+                exception: report.exception.clone(),
+                location: loc,
+                count: 1,
+                last_at: now,
+            });
+            if list.len() > MAX_PATTERNS_PER_PROJECT {
+                // 丢弃最久未出现的模式
+                list.sort_by_key(|p| p.last_at);
+                list.drain(0..list.len() - MAX_PATTERNS_PER_PROJECT);
+            }
+            1
+        }
+    }
+}
+
+/// 查询某项目的历史崩溃模式（按出现次数倒序，同次按最近时间倒序）。
+pub fn patterns(project_key: &str) -> Vec<CrashPattern> {
+    let mut list = history().get(project_key).cloned().unwrap_or_default();
+    list.sort_by(|a, b| b.count.cmp(&a.count).then(b.last_at.cmp(&a.last_at)));
+    list
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn pattern_groups_same_crash() {
+        let mk = |cat: &str, ex: &str, loc: &str| CrashReport {
+            category: cat.into(),
+            exception: ex.into(),
+            locations: if loc.is_empty() { Vec::new() } else { vec![loc.into()] },
+            ..Default::default()
+        };
+        assert_eq!(record_pattern("proj-a", &mk("arkts_type_error", "TypeError", "a.ets:1")), 1);
+        assert_eq!(record_pattern("proj-a", &mk("arkts_type_error", "TypeError", "a.ets:1")), 2);
+        // 同类别不同位置：另一类
+        assert_eq!(record_pattern("proj-a", &mk("arkts_type_error", "TypeError", "b.ets:9")), 1);
+        let ps = patterns("proj-a");
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].count, 2);
+        assert_eq!(ps[0].location, "a.ets:1");
+        // 项目隔离
+        assert!(patterns("proj-b").is_empty());
+    }
 }
 
 #[cfg(test)]

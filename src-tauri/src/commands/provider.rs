@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
@@ -40,6 +40,10 @@ pub struct UpdateModelInput {
     pub context_limit: Option<i64>,
     pub output_limit: Option<i64>,
     pub enabled: Option<bool>,
+    /// 输入模态（text/image/audio/video），如 ["text","image"]
+    pub input_modalities: Option<Vec<String>>,
+    /// 输出模态（text/image/audio/video）
+    pub output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,8 +117,9 @@ pub fn create_provider(db: State<DbState>, input: CreateProviderInput) -> Result
             conn.execute(
                 "INSERT INTO models (id, provider_id, model_id, display_name, tool_call,
                         context_limit, output_limit, input_modalities, output_modalities,
-                        input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                        input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at,
+                        sort_order)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 rusqlite::params![
                     id,
                     provider.id,
@@ -135,6 +140,7 @@ pub fn create_provider(db: State<DbState>, input: CreateProviderInput) -> Result
                     m.use_proxy.unwrap_or(false) as i64,
                     1,
                     now,
+                    i as i64,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -152,7 +158,8 @@ pub fn update_model(db: State<DbState>, id: String, input: UpdateModelInput) -> 
         .query_row(
             "SELECT id, provider_id, model_id, display_name, tool_call, context_limit,
                     output_limit, input_modalities, output_modalities,
-                    input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at
+                    input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at,
+                    sort_order
              FROM models WHERE id = ?1",
             [&id],
             |r| {
@@ -172,6 +179,7 @@ pub fn update_model(db: State<DbState>, id: String, input: UpdateModelInput) -> 
                     use_proxy: r.get(12)?,
                     enabled: r.get(13)?,
                     created_at: r.get(14)?,
+                    sort_order: r.get(15)?,
                 })
             },
         )
@@ -209,12 +217,23 @@ pub fn update_model(db: State<DbState>, id: String, input: UpdateModelInput) -> 
         conn.execute("UPDATE models SET enabled = ?1 WHERE id = ?2", rusqlite::params![en as i64, id])
             .map_err(|e| e.to_string())?;
     }
+    if let Some(mods) = input.input_modalities {
+        let json = serde_json::to_string(&mods).unwrap_or_else(|_| "[\"text\"]".into());
+        conn.execute("UPDATE models SET input_modalities = ?1 WHERE id = ?2", rusqlite::params![json, id])
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(mods) = input.output_modalities {
+        let json = serde_json::to_string(&mods).unwrap_or_else(|_| "[\"text\"]".into());
+        conn.execute("UPDATE models SET output_modalities = ?1 WHERE id = ?2", rusqlite::params![json, id])
+            .map_err(|e| e.to_string())?;
+    }
 
     let updated = conn
         .query_row(
             "SELECT id, provider_id, model_id, display_name, tool_call, context_limit,
                     output_limit, input_modalities, output_modalities,
-                    input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at
+                    input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at,
+                    sort_order
              FROM models WHERE id = ?1",
             [&id],
             |r| {
@@ -234,6 +253,7 @@ pub fn update_model(db: State<DbState>, id: String, input: UpdateModelInput) -> 
                     use_proxy: r.get(12)?,
                     enabled: r.get(13)?,
                     created_at: r.get(14)?,
+                    sort_order: r.get(15)?,
                 })
             },
         )
@@ -306,8 +326,9 @@ pub fn add_model(
     conn.execute(
         "INSERT INTO models (id, provider_id, model_id, display_name, tool_call,
                 context_limit, output_limit, input_modalities, output_modalities,
-                input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at,
+                sort_order)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         rusqlite::params![
             id,
             provider_id,
@@ -328,13 +349,15 @@ pub fn add_model(
             input.use_proxy.unwrap_or(false) as i64,
             1,
             now,
+            count,
         ],
     )
     .map_err(|e| e.to_string())?;
     conn.query_row(
         "SELECT id, provider_id, model_id, display_name, tool_call, context_limit,
                 output_limit, input_modalities, output_modalities,
-                input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at
+                input_price_per_mtok, output_price_per_mtok, is_default, use_proxy, enabled, created_at,
+                sort_order
          FROM models WHERE id = ?1",
         [&id],
         |r| {
@@ -354,19 +377,121 @@ pub fn add_model(
                 use_proxy: r.get(12)?,
                 enabled: r.get(13)?,
                 created_at: r.get(14)?,
+                sort_order: r.get(15)?,
             })
         },
     )
     .map_err(|e| e.to_string())
 }
 
-/// 删除模型
+/// 删除模型；若删除的是默认模型，则自动将剩余模型中排序最靠前的顺延为默认（保持"默认置顶"）
 #[tauri::command]
 pub fn remove_model(db: State<DbState>, id: String) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 删除前记录：是否为默认模型 + 所属 Provider
+    let (was_default, provider_id): (bool, Option<String>) = conn
+        .query_row(
+            "SELECT is_default, provider_id FROM models WHERE id = ?1",
+            [&id],
+            |r| Ok((r.get::<_, i64>(0).map(|v| v != 0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap_or((false, None));
     conn.execute("DELETE FROM models WHERE id = ?1", [&id])
         .map_err(|e| e.to_string())?;
+    if was_default {
+        if let Some(pid) = provider_id {
+            let next_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM models WHERE provider_id = ?1
+                     ORDER BY sort_order ASC, created_at ASC, id ASC LIMIT 1",
+                    [&pid],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(nid) = next_id {
+                conn.execute("UPDATE models SET is_default = 1 WHERE id = ?1", [&nid])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// 手动排序模型：ordered_ids 为该 Provider 下模型的新顺序（需包含该 Provider 全部模型 ID）。
+/// 仅写 sort_order，默认模型仍由查询层强制置顶。
+#[tauri::command]
+pub fn reorder_provider_models(
+    db: State<DbState>,
+    provider_id: String,
+    ordered_ids: Vec<String>,
+) -> Result<Vec<crate::db::models::Model>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 去重校验
+    let unique: std::collections::HashSet<&String> = ordered_ids.iter().collect();
+    if unique.len() != ordered_ids.len() {
+        return Err("ordered_ids 存在重复项".into());
+    }
+    // 校验全部属于该 Provider
+    for id in &ordered_ids {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM models WHERE id = ?1 AND provider_id = ?2",
+                rusqlite::params![id, provider_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("模型 {id} 不属于该 Provider"));
+        }
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    for (i, id) in ordered_ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE models SET sort_order = ?1 WHERE id = ?2 AND provider_id = ?3",
+            rusqlite::params![i as i64, id, provider_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    queries::list_models_for_provider(&conn, &provider_id).map_err(|e| e.to_string())
+}
+
+/// 手动排序 Provider：ordered_ids 为全部 Provider 的新顺序（含当前激活的）。
+/// 仅写 priority；当前激活的 Provider 仍由查询层 is_active 强制置顶。
+#[tauri::command]
+pub fn reorder_providers(
+    db: State<DbState>,
+    ordered_ids: Vec<String>,
+) -> Result<Vec<Provider>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 去重校验
+    let unique: std::collections::HashSet<&String> = ordered_ids.iter().collect();
+    if unique.len() != ordered_ids.len() {
+        return Err("ordered_ids 存在重复项".into());
+    }
+    // 校验全部存在
+    for id in &ordered_ids {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM providers WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("Provider {id} 不存在"));
+        }
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    for (i, id) in ordered_ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE providers SET priority = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![i as i64, chrono::Utc::now().timestamp(), id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    queries::list_providers(&conn).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -399,6 +524,167 @@ pub fn switch_provider(db: State<DbState>, id: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// 模型同步结果：拉取平台当前模型列表后与本地配置对比
+#[derive(Debug, Serialize)]
+pub struct SyncModelsResult {
+    pub provider_id: String,
+    /// 平台当前返回的模型 ID 列表
+    pub remote_models: Vec<String>,
+    /// 本地已配置但平台当前不可用的模型 ID（默认模型等旧配置）
+    pub missing: Vec<String>,
+    /// 平台当前有、但本地未配置的模型 ID（新增候选）
+    pub new_models: Vec<String>,
+    /// 拉取远端模型列表失败时的原因（None=成功）
+    pub error: Option<String>,
+}
+
+/// 同步 Provider 的模型配置：拉取平台当前模型列表，与本地 models 对比，
+/// 返回「已失效（missing）」与「新增（new_models）」，前端据此提示手动移除/添加。
+/// 按协议分派（与 test_provider 同口径），跟随默认模型的代理设置。
+#[tauri::command]
+pub async fn sync_provider_models(db: State<'_, DbState>, id: String) -> Result<SyncModelsResult, String> {
+    let (protocol, base_url, use_proxy, api_key, local_models) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let provider = queries::get_provider(&conn, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Provider not found".to_string())?;
+        let use_proxy: bool = conn
+            .query_row(
+                "SELECT use_proxy FROM models WHERE provider_id = ?1
+                 ORDER BY is_default DESC, created_at ASC LIMIT 1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        let local_models = queries::list_models_for_provider(&conn, &id).map_err(|e| e.to_string())?;
+        (
+            provider.protocol.clone(),
+            provider.base_url.clone(),
+            use_proxy,
+            provider.api_key,
+            local_models,
+        )
+    };
+    // 密钥可能已迁移到系统凭据管理器，同步前安全读取补全
+    let api_key = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        key_store::load_provider_key(&conn, &id).unwrap_or(api_key)
+    };
+
+    let client = crate::utils::net::build_client(use_proxy)?;
+    let base = base_url.trim_end_matches('/');
+
+    // 按协议分派模型列表端点
+    let resp_json = {
+        let req = match protocol.as_str() {
+            "anthropic" => {
+                let mut rb = client.get(format!("{base}/v1/models"));
+                if let Some(ref key) = api_key {
+                    rb = rb
+                        .header("x-api-key", key)
+                        .header("anthropic-version", "2023-06-01");
+                }
+                rb
+            }
+            "gemini" => {
+                let mut rb = client.get(format!("{base}/v1beta/models"));
+                if let Some(ref key) = api_key {
+                    rb = rb.header("x-goog-api-key", key);
+                }
+                rb
+            }
+            _ => {
+                let mut rb = client.get(format!("{base}/models"));
+                if let Some(ref key) = api_key {
+                    rb = rb.header("Authorization", format!("Bearer {key}"));
+                }
+                rb
+            }
+        };
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    return Ok(SyncModelsResult {
+                        provider_id: id,
+                        remote_models: vec![],
+                        missing: local_models.iter().map(|m| m.model_id.clone()).collect(),
+                        new_models: vec![],
+                        error: Some(format!("HTTP {status}: {text}", text = text.chars().take(200).collect::<String>())),
+                    });
+                }
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok(SyncModelsResult {
+                            provider_id: id,
+                            remote_models: vec![],
+                            missing: local_models.iter().map(|m| m.model_id.clone()).collect(),
+                            new_models: vec![],
+                            error: Some("模型列表响应无法解析".to_string()),
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                return Ok(SyncModelsResult {
+                    provider_id: id,
+                    remote_models: vec![],
+                    missing: local_models.iter().map(|m| m.model_id.clone()).collect(),
+                    new_models: vec![],
+                    error: Some(format!("连接失败: {e}")),
+                })
+            }
+        }
+    };
+
+    // 平台模型 ID 提取：openai/anthropic -> data[].id；gemini -> models[].name（去 models/ 前缀）
+    let remote_models: Vec<String> = match protocol.as_str() {
+        "gemini" => resp_json["models"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["name"].as_str())
+                    .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => resp_json["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["id"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+
+    let remote_set: std::collections::HashSet<String> = remote_models.iter().cloned().collect();
+    let local_set: std::collections::HashSet<String> =
+        local_models.iter().map(|m| m.model_id.clone()).collect();
+
+    // missing：本地有、平台无（旧配置/已下线模型）；new_models：平台有、本地无（新增候选）
+    let missing: Vec<String> = local_models
+        .iter()
+        .map(|m| m.model_id.clone())
+        .filter(|m| !remote_set.contains(m))
+        .collect();
+    let new_models: Vec<String> = remote_models
+        .iter()
+        .filter(|m| !local_set.contains(*m))
+        .cloned()
+        .collect();
+
+    Ok(SyncModelsResult {
+        provider_id: id,
+        remote_models,
+        missing,
+        new_models,
+        error: None,
+    })
 }
 
 /// 测试 Provider 连通性（按协议分派最小请求，用该 Provider 配置的默认模型，避免写死 model ID 造成假失败）

@@ -61,10 +61,10 @@ export default function UpdateChecker() {
 
   if (updateAvailable && !dismissed) {
     return (
-      <div className="fixed bottom-4 right-4 bg-[var(--bg-secondary)] border border-[var(--accent)] rounded-lg p-4 shadow-lg z-50 max-w-sm">
+      <div className="fixed bottom-4 right-4 glass-card border-[var(--accent)] rounded-lg p-4 z-50 max-w-sm animate-modal-in">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <p className="text-sm font-medium">{t('update.newVersion')} v{version}</p>
+            <p className="text-sm font-medium tnum">{t('update.newVersion')} v{version}</p>
             <p className="text-xs text-[var(--text-secondary)] mt-1">{t('update.recommend')}</p>
           </div>
           <button
@@ -78,13 +78,13 @@ export default function UpdateChecker() {
           <button
             onClick={handleUpdate}
             disabled={downloading}
-            className="px-3 py-1.5 bg-[var(--accent)] text-white rounded text-xs hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+            className="px-3 py-1.5 btn-primary rounded text-xs disabled:opacity-50 transition-colors"
           >
             {downloading ? t('update.downloading') : t('update.now')}
           </button>
           <button
             onClick={() => setDismissed(true)}
-            className="px-3 py-1.5 border border-[var(--border)] rounded text-xs hover:bg-[var(--bg-card)] transition-colors"
+            className="px-3 py-1.5 btn-ghost rounded text-xs transition-colors"
           >
             {t('update.later')}
           </button>
@@ -95,11 +95,11 @@ export default function UpdateChecker() {
 
   if (baseUpdate && !baseDismissed) {
     return (
-      <div className="fixed bottom-4 right-4 bg-[var(--bg-secondary)] border border-[var(--accent)] rounded-lg p-4 shadow-lg z-50 max-w-sm">
+      <div className="fixed bottom-4 right-4 glass-card border-[var(--accent)] rounded-lg p-4 z-50 max-w-sm animate-modal-in">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <p className="text-sm font-medium">{t('update.baseNewVersion', { version: baseUpdate.latest })}</p>
-            <p className="text-xs text-[var(--text-secondary)] mt-1">
+            <p className="text-sm font-medium tnum">{t('update.baseNewVersion', { version: baseUpdate.latest })}</p>
+            <p className="text-xs text-[var(--text-secondary)] mt-1 tnum">
               {t('update.baseCurrent', { version: baseUpdate.current || '-' })}
             </p>
           </div>
@@ -116,13 +116,13 @@ export default function UpdateChecker() {
               setBaseDismissed(true)
               navigate('/versions')
             }}
-            className="px-3 py-1.5 bg-[var(--accent)] text-white rounded text-xs hover:bg-[var(--accent-hover)] transition-colors"
+            className="px-3 py-1.5 btn-primary rounded text-xs transition-colors"
           >
             {t('update.baseGoInstall')}
           </button>
           <button
             onClick={() => setBaseDismissed(true)}
-            className="px-3 py-1.5 border border-[var(--border)] rounded text-xs hover:bg-[var(--bg-card)] transition-colors"
+            className="px-3 py-1.5 btn-ghost rounded text-xs transition-colors"
           >
             {t('update.later')}
           </button>
@@ -133,3 +133,4 @@ export default function UpdateChecker() {
 
   return null
 }
+

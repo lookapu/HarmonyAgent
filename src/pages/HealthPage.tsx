@@ -50,6 +50,7 @@ export default function HealthPage() {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const projectPath = useProjectStore((s) => s.currentProject?.path)
+  const currentProject = useProjectStore((s) => s.currentProject)
   const [results, setResults] = useState<HealthResult[]>([])
   const [toolchain, setToolchain] = useState<ToolchainCheck[]>([])
   const [loading, setLoading] = useState(false)
@@ -602,9 +603,25 @@ export default function HealthPage() {
       case 'bundled': return t('health.toolchainSourceBundled')
       case 'custom': return t('health.toolchainSourceCustom')
       case 'deveco': return t('health.toolchainSourceDeveco')
+      case 'sdk': return t('health.toolchainSourceSdk')
       case 'path': return t('health.toolchainSourcePath')
       default: return source
     }
+  }
+
+  // 工程结构检查项的描述（有 structure 时前端拼 i18n 文案，不再用后端中文 detail）
+  const structureDesc = (c: ToolchainCheck): string => {
+    const s = c.structure!
+    const pathLine = c.detail.split('\n')[0]
+    if (s.kind === 'single') {
+      return `${pathLine}\n${t('health.projectStructureSingle')}`
+    }
+    if (s.kind === 'workspace') {
+      const names = s.projects.join(', ') + (s.projects.length < s.total ? ', …' : '')
+      return `${pathLine}\n${t('health.projectStructureWorkspace', { names, total: s.total })}`
+    }
+    const reason = s.dir_exists ? t('health.projectStructureDirExists') : t('health.projectStructureDirMissing')
+    return `${pathLine}\n${t('health.projectStructureInvalid', { missing: s.missing.join(', '), reason })}`
   }
 
   // 点击菜单外部时关闭候选下拉
@@ -628,9 +645,10 @@ export default function HealthPage() {
     } catch (e) {
       setError(String(e))
     }
-    // 鸿蒙工具链检查（hvigorw / hdc / ohpm / 工程结构），失败不影响主检查
+    // 鸿蒙工具链检查（hvigorw / hdc / ohpm / 工程结构），失败不影响主检查；
+    // 绑定项目时传入项目 id 触发工程结构检查（全局模式无项目可查，后端不返回该项）
     try {
-      const c = await checkHarmonyToolchain(undefined, paths)
+      const c = await checkHarmonyToolchain(currentProject?.id ?? undefined, paths)
       setToolchain(c)
       loadToolVersions(c)
     } catch (e) {
@@ -677,7 +695,7 @@ export default function HealthPage() {
         <button
           onClick={load}
           disabled={loading}
-          className="px-4 py-2 bg-[var(--accent)] text-white rounded-lg text-sm hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+          className="px-4 py-2 btn-primary rounded-lg text-sm  disabled:opacity-50 transition-colors"
         >
           {loading ? t('health.checking') : t('health.refresh')}
         </button>
@@ -690,7 +708,7 @@ export default function HealthPage() {
           </div>
         )}
         {results.map((r) => (
-          <div key={r.provider_id} className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 flex items-center justify-between">
+          <div key={r.provider_id} className="modern-card rounded-lg p-4 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div
                 className="w-3 h-3 rounded-full"
@@ -703,7 +721,7 @@ export default function HealthPage() {
             </div>
             <div className="text-right">
               {r.latency_ms !== null && (
-                <span className="text-sm font-mono">{r.latency_ms}ms</span>
+                <span className="text-sm font-mono tnum">{r.latency_ms}ms</span>
               )}
               {r.error && (
                 <p className="text-xs text-[var(--danger)] mt-1">{r.error}</p>
@@ -716,7 +734,7 @@ export default function HealthPage() {
             <p className="text-[var(--text-secondary)] text-sm">{t('health.noProvider')}</p>
             <button
               onClick={() => navigate('/providers')}
-              className="h-9 px-4 rounded-lg bg-[var(--accent)] text-white text-[13px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all"
+              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium  active:scale-[0.98] transition-all"
             >
               {t('health.goAdd')}
             </button>
@@ -726,7 +744,7 @@ export default function HealthPage() {
 
       {/* 鸿蒙 SDK / command-line-tools 环境：自动探测 + 手动指定（后端持久化） */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.harmonyEnvTitle')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-3">
+      <div className="modern-card rounded-lg p-4 mb-3">
         {/* 状态总览 */}
         <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
           <div className="flex items-center gap-3 min-w-0">
@@ -807,7 +825,15 @@ export default function HealthPage() {
               </div>
             )}
             {harmonyEnv.hdc_path && !harmonyEnv.cli?.has_hdc && (
-              <div><span className="text-[var(--warning)]">●</span> hdc (PATH): {harmonyEnv.hdc_path}</div>
+              <div>
+                <span className={harmonyEnv.hdc_source === 'path' ? 'text-[var(--warning)]' : 'text-[var(--success)]'}>
+                  ●
+                </span>{' '}
+                hdc ({sourceLabel(harmonyEnv.hdc_source ?? 'sdk')}): {harmonyEnv.hdc_path}
+                {harmonyEnv.hdc_source !== 'path' && (
+                  <span className="ml-2 text-[10px] text-[var(--text-muted)]">{t('health.toolchainHdcFallback')}</span>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -860,7 +886,7 @@ export default function HealthPage() {
             <button
               onClick={saveEnv}
               disabled={envLoading || envSaving}
-              className="h-8 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px] font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
+              className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
             >
               {envSaving ? t('health.envSaving') : t('health.envSave')}
             </button>
@@ -917,7 +943,7 @@ export default function HealthPage() {
 
       {/* OpenHarmony 文档库：无需登录的离线 API 文档 */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.docsTitle')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-3">
+      <div className="modern-card rounded-lg p-4 mb-3">
         <div className="flex items-center gap-3 flex-wrap">
           <div className={`w-3 h-3 rounded-full ${docsStatus?.downloaded ? 'bg-[var(--success)]' : 'bg-[var(--muted)]'} shrink-0`} />
           <span className="text-xs text-[var(--text-secondary)]">
@@ -937,7 +963,7 @@ export default function HealthPage() {
           <button
             onClick={() => void handleDocsSync()}
             disabled={docsBusy}
-            className="px-3 h-8 rounded-lg bg-[var(--accent)] text-white text-xs font-medium hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+            className="px-3 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors"
           >
             {docsBusy ? t('health.docsSyncing') : (docsStatus?.downloaded ? t('health.docsUpdate') : t('health.docsDownload'))}
           </button>
@@ -957,12 +983,12 @@ export default function HealthPage() {
                 onChange={(e) => setDocQuery(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && void handleDocSearch()}
                 placeholder={t('health.docsSearchPlaceholder')}
-                className="flex-1 h-8 px-3 rounded-lg bg-[var(--bg-card)] border border-[var(--border)] text-xs outline-none focus:border-[var(--accent)]"
+                className="flex-1 h-8 px-3 rounded-lg modern-card border-[var(--border)] text-xs outline-none focus:border-[var(--accent)]"
               />
               <button
                 onClick={() => void handleDocSearch()}
                 disabled={docSearching || !docQuery.trim()}
-                className="px-3 h-8 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-primary)] text-xs hover:border-[var(--accent)]/50 disabled:opacity-50 transition-colors"
+                className="px-3 h-8 rounded-lg modern-card text-[var(--text-primary)] text-xs hover:border-[var(--accent)]/50 disabled:opacity-50 transition-colors"
               >
                 {docSearching ? t('health.docsSearching') : t('health.docsSearch')}
               </button>
@@ -1000,7 +1026,7 @@ export default function HealthPage() {
           onClick={() => setDocDetail(null)}
         >
           <div
-            className="relative w-full max-w-3xl max-h-[80vh] rounded-xl overflow-hidden bg-[var(--bg-card)] border border-[var(--border)] shadow-2xl flex flex-col"
+            className="relative w-full max-w-3xl max-h-[80vh] rounded-xl overflow-hidden modern-card border-[var(--border)] shadow-2xl flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-2 px-4 py-3 border-b border-[var(--border)] shrink-0">
@@ -1022,7 +1048,7 @@ export default function HealthPage() {
 
       {/* 应用基座：自身版本 / 安装位置 / 检查更新（更新源在 GitHub，可勾选走系统代理） */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.baseTitle')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-3">
+      <div className="modern-card rounded-lg p-4 mb-3">
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-3 h-3 rounded-full bg-[var(--success)] shrink-0" />
@@ -1046,7 +1072,7 @@ export default function HealthPage() {
             <button
               onClick={checkUpdate}
               disabled={checkingUpdate}
-              className="px-3 h-8 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-primary)] text-xs hover:border-[var(--accent)]/50 disabled:opacity-50 transition-colors"
+              className="px-3 h-8 rounded-lg modern-card text-[var(--text-primary)] text-xs hover:border-[var(--accent)]/50 disabled:opacity-50 transition-colors"
             >
               {checkingUpdate ? t('health.checking') : t('health.checkUpdate')}
             </button>
@@ -1054,7 +1080,7 @@ export default function HealthPage() {
               <button
                 onClick={handleUpdate}
                 disabled={updating}
-                className="px-3 h-8 rounded-lg bg-[var(--accent)] text-white text-xs font-medium hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+                className="px-3 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors"
               >
                 {updating ? t('health.updating') : t('health.updateNow')}
               </button>
@@ -1075,7 +1101,7 @@ export default function HealthPage() {
 
       {/* Node 运行时：系统未安装 npx 时内置便携版兑底，支持在线升级 */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.nodeRuntime')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-3">
+      <div className="modern-card rounded-lg p-4 mb-3">
         {nodeRt ? (
           <>
             <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -1131,12 +1157,12 @@ export default function HealthPage() {
                 onChange={(e) => setRtVersion(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter') handleUpgrade() }}
                 placeholder={t('health.versionPlaceholder', { example: nodeLatestLts || '22.14.0' })}
-                className="flex-1 px-3 h-8 rounded-lg bg-[var(--bg-card)] border border-[var(--border)] text-[12px] font-mono outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] transition-colors"
+                className="flex-1 px-3 h-8 rounded-lg modern-card border-[var(--border)] text-[12px] font-mono outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] transition-colors"
               />
               <button
                 onClick={handleUpgrade}
                 disabled={rtBusy}
-                className="px-4 h-8 rounded-lg bg-[var(--accent)] text-white text-xs font-medium hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors shrink-0"
+                className="px-4 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors shrink-0"
               >
                 {rtBusy ? t('health.upgrading') : t('health.upgrade')}
               </button>
@@ -1160,7 +1186,7 @@ export default function HealthPage() {
 
       {/* Git 运行时：系统未装 Git 时内置便携版兑底，支持在线升级 */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.gitRuntime')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-3">
+      <div className="modern-card rounded-lg p-4 mb-3">
         {gitRt ? (
           <>
             <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -1200,7 +1226,7 @@ export default function HealthPage() {
               <button
                 onClick={handleGitUpgrade}
                 disabled={gitBusy}
-                className="px-4 h-8 rounded-lg bg-[var(--accent)] text-white text-xs font-medium hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors shrink-0"
+                className="px-4 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors shrink-0"
               >
                 {gitBusy ? t('health.upgrading') : t('health.upgrade')}
               </button>
@@ -1233,7 +1259,7 @@ export default function HealthPage() {
 
       {/* JDK 运行时：多版本并存 + 默认切换；系统无 JDK 时构建自动注入内置 JAVA_HOME */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.jdkRuntime')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-3">
+      <div className="modern-card rounded-lg p-4 mb-3">
         {jdkRt ? (
           <>
             <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -1263,7 +1289,7 @@ export default function HealthPage() {
                 {jdkRt.versions.map((v) => (
                   <div
                     key={`${v.source}-${v.feature}`}
-                    className="flex items-center justify-between gap-2 flex-wrap bg-[var(--bg-card)] border border-[var(--border)] rounded-lg px-3 py-2"
+                    className="flex items-center justify-between gap-2 flex-wrap modern-card rounded-lg px-3 py-2"
                   >
                     <div className="flex items-center gap-2 min-w-0">
                       {v.is_default && (
@@ -1315,7 +1341,7 @@ export default function HealthPage() {
               <select
                 value={jdkFeature}
                 onChange={(e) => setJdkFeature(e.target.value)}
-                className="px-2 h-8 rounded-lg bg-[var(--bg-card)] border border-[var(--border)] text-[12px] font-mono outline-none focus:border-[var(--accent)] transition-colors"
+                className="px-2 h-8 rounded-lg modern-card border-[var(--border)] text-[12px] font-mono outline-none focus:border-[var(--accent)] transition-colors"
               >
                 {(jdkReleases.length > 0 ? jdkReleases : ['17']).map((r) => (
                   <option key={r} value={r}>
@@ -1326,7 +1352,7 @@ export default function HealthPage() {
               <button
                 onClick={() => handleJdkInstall(jdkFeature, false)}
                 disabled={jdkBusy !== null}
-                className="px-4 h-8 rounded-lg bg-[var(--accent)] text-white text-xs font-medium hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors shrink-0"
+                className="px-4 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors shrink-0"
               >
                 {jdkBusy === jdkFeature ? t('health.jdkInstalling') : t('health.jdkInstall')}
               </button>
@@ -1353,17 +1379,19 @@ export default function HealthPage() {
       {/* 鸿蒙工具链：hvigorw / hdc / ohpm / 工程结构 */}
       <div className="flex items-center justify-between mt-8 mb-3">
         <h3 className="text-sm font-medium text-[var(--text-secondary)]">{t('health.toolchainTitle')}</h3>
-        <button
-          onClick={() => shellOpen(HARMONY_TOOLCHAIN_DOWNLOAD_URL)}
-          className="flex items-center gap-1.5 px-3 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[11px] hover:bg-[var(--accent)]/10 transition-colors"
-          title={t('health.toolchainOfficialTitle')}
-        >
-          <Icon name="download" size={12} />
-          {t('health.toolchainOfficialDownload')}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => shellOpen(HARMONY_TOOLCHAIN_DOWNLOAD_URL)}
+            className="flex items-center gap-1.5 px-3 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[11px] hover:bg-[var(--accent)]/10 transition-colors"
+            title={t('health.toolchainOfficialTitle')}
+          >
+            <Icon name="download" size={12} />
+            {t('health.toolchainOfficialDownload')}
+          </button>
+        </div>
       </div>
       {/* 自定义工具链目录：不依赖系统 PATH，直接指定 DevEco Studio 安装目录（手动填写） */}
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-3 mb-3">
+      <div className="modern-card rounded-lg p-3 mb-3">
         <label className="block text-xs text-[var(--text-secondary)] mb-1.5">
           {t('health.customPathsLabel')}
         </label>
@@ -1382,11 +1410,11 @@ export default function HealthPage() {
               }
             }}
             placeholder={'例如：\nC:\\Program Files\\Huawei\\DevEco Studio\\tools\\hvigor\\bin\nC:\\Program Files\\Huawei\\DevEco Studio\\sdk\\default\\openharmony\\toolchains\nC:\\Program Files\\Huawei\\DevEco Studio\\tools\\ohpm\\bin'}
-            className="flex-1 px-3 py-2 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] resize-none"
+            className="flex-1 px-3 py-2 modern-card rounded-lg text-[12px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] resize-none"
           />
           <button
             onClick={load}
-            className="self-end px-4 h-9 rounded-lg bg-[var(--accent)] text-white text-[13px] font-medium hover:bg-[var(--accent-hover)] transition-colors shrink-0"
+            className="self-end px-4 h-9 rounded-lg btn-primary text-[13px] font-medium  transition-colors shrink-0"
           >
             {t('health.recheck')}
           </button>
@@ -1399,7 +1427,7 @@ export default function HealthPage() {
           toolchain.map((c) => (
             <div
               key={c.name}
-              className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-3 flex items-start justify-between gap-3"
+              className="modern-card rounded-lg p-3 flex items-start justify-between gap-3"
             >
               <div className="flex items-start gap-3 min-w-0">
                 <div
@@ -1407,15 +1435,22 @@ export default function HealthPage() {
                   style={{ backgroundColor: c.found ? 'var(--success)' : 'var(--danger)' }}
                 />
                 <div className="min-w-0">
-                  <span className="font-medium text-sm">{c.name}</span>
+                  <span className="font-medium text-sm">
+                    {c.name === 'project_structure' ? t('health.projectStructure') : c.name}
+                  </span>
                   {c.found && toolVersions[c.detail] && (
                     <span className="text-xs text-[var(--text-secondary)] ml-2">
                       {t('health.version', { version: toolVersions[c.detail].slice(0, 40) })}
                     </span>
                   )}
-                  <p className="text-xs text-[var(--text-secondary)] mt-0.5 break-all whitespace-pre-line">{c.detail}</p>
-                  {c.suggestion && (
+                  <p className="text-xs text-[var(--text-secondary)] mt-0.5 break-all whitespace-pre-line">
+                    {c.structure ? structureDesc(c) : c.detail}
+                  </p>
+                  {c.suggestion && !c.structure && (
                     <p className="text-xs text-[var(--warning)] mt-0.5">{c.suggestion}</p>
+                  )}
+                  {c.structure && c.structure.kind === 'invalid' && (
+                    <p className="text-xs text-[var(--warning)] mt-0.5">{t('health.projectStructureInvalidHint')}</p>
                   )}
                 </div>
               </div>
@@ -1446,7 +1481,7 @@ export default function HealthPage() {
                   {candMenu === c.name && (
                     <div
                       onClick={(e) => e.stopPropagation()}
-                      className="absolute right-0 top-full mt-1 z-20 w-80 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg shadow-lg overflow-hidden"
+                      className="absolute right-0 top-full mt-1 z-20 w-80 modern-card rounded-lg shadow-lg overflow-hidden"
                     >
                       <div className="px-3 py-2 text-[10px] text-[var(--text-muted)] border-b border-[var(--border)]">
                         {t('health.toolchainCandidates', { name: c.name })}
@@ -1491,3 +1526,8 @@ export default function HealthPage() {
     </div>
   )
 }
+
+
+
+
+

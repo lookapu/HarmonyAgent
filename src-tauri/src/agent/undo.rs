@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone)]
 pub struct Snapshot {
     /// 文件绝对路径
     pub path: PathBuf,
@@ -56,6 +57,15 @@ pub fn snapshot(conversation_id: &str, path: &std::path::Path, old_content: &[u8
 /// 弹出最近一次快照（LIFO）。无快照时返回 None。
 pub fn pop_undo(conversation_id: &str) -> Option<Snapshot> {
     table().undo_stacks.get_mut(conversation_id).and_then(|l| l.pop())
+}
+
+
+/// 查看从栈顶数第 n 条快照（n=0 为最近一次，不弹出，撤销预览用）。
+pub fn peek_at(conversation_id: &str, n: usize) -> Option<Snapshot> {
+    let ctx = table();
+    let l = ctx.undo_stacks.get(conversation_id)?;
+    let idx = l.len().checked_sub(n + 1)?;
+    l.get(idx).cloned()
 }
 
 /// 查询当前剩余可撤销次数（前端/工具结果展示用）。

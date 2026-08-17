@@ -5,7 +5,7 @@ export default function RuntimeProgressBar({ progress }: { progress: RuntimeProg
   const showBar = progress.phase === 'download' && progress.percent != null
   const speedMb = progress.speed != null ? (progress.speed / 1024 / 1024).toFixed(1) : null
   return (
-    <div className="mt-3 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg px-3 py-2">
+    <div className="mt-3 modern-card rounded-lg px-3 py-2">
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="text-[var(--text-secondary)]">{progress.message}</span>
         {showBar && (
@@ -25,3 +25,4 @@ export default function RuntimeProgressBar({ progress }: { progress: RuntimeProg
     </div>
   )
 }
+

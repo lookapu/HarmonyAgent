@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { FileTreeNode } from '../api/project'
+import { onFileTreeIndexDone, onFileTreeIndexProgress, searchProjectFiles, type FileSearchHit, type FileTreeNode } from '../api/project'
 import { symbolCounts } from '../api/symbols'
 import Icon from '../icons/Icon'
 import FilePreviewDialog from './FilePreviewDialog'
@@ -10,6 +10,8 @@ interface Props {
   building: boolean
   projectId: string
   projectPath: string
+  /** 会话工作目录（worktree 模式为 worktree 路径，本地模式为 undefined） */
+  root?: string
   /** 懒加载缓存：目录相对路径 -> 该层子项列表 */
   dirCache: Record<string, FileTreeNode[]>
   /** 读取单层目录（带缓存），返回该层子项 */
@@ -26,6 +28,7 @@ export default function FileTreePanel({
   building,
   projectId,
   projectPath,
+  root,
   dirCache,
   onLoadDir,
   onRefresh,
@@ -44,9 +47,39 @@ export default function FileTreePanel({
   // 文件级符号数量（徽标展示，后台异步拉取，失败静默）
   const [symCounts, setSymCounts] = useState<Record<string, number>>({})
 
+  // 文件树全量索引构建进度（后台扫描，非阻塞；通过 Tauri 事件实时更新已扫描项数）
+  const [indexProgress, setIndexProgress] = useState<number | null>(null)
+
+  // 文件名搜索：搜索模式开关 / 输入 / 结果 / 加载中
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<FileSearchHit[]>([])
+  const [searching, setSearching] = useState(false)
+  // 过期响应丢弃：每次发起新请求自增，回包时仅接受与当前一致的序号
+  const searchReqRef = useRef(0)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    setIndexProgress(null)
+    let unlistenP: (() => void) | null = null
+    let unlistenD: (() => void) | null = null
+    let cancelled = false
+    onFileTreeIndexProgress((p) => {
+      if (p.projectId === projectId) setIndexProgress(p.scanned)
+    }).then((u) => { if (cancelled) u(); else unlistenP = u })
+    onFileTreeIndexDone((p) => {
+      if (p.projectId === projectId) setIndexProgress(null)
+    }).then((u) => { if (cancelled) u(); else unlistenD = u })
+    return () => {
+      cancelled = true
+      unlistenP?.()
+      unlistenD?.()
+    }
+  }, [projectId])
+
   useEffect(() => {
     let cancelled = false
-    symbolCounts(projectId)
+    symbolCounts(projectId, root)
       .then((list) => {
         if (cancelled) return
         const map: Record<string, number> = {}
@@ -57,13 +90,58 @@ export default function FileTreePanel({
     return () => {
       cancelled = true
     }
-  }, [projectId])
+  }, [projectId, root])
 
-  // 切换项目时重置展开/菜单状态
+  // 切换项目时重置展开/菜单/搜索状态
   useEffect(() => {
     setExpanded(new Set(['']))
     setMenu(null)
+    setSearchOpen(false)
+    setSearchQuery('')
+    setSearchResults([])
+    setSearching(false)
+    searchReqRef.current += 1
   }, [projectId])
+
+  // 文件名搜索：250ms 防抖 + 序号防过期响应；搜索范围仅文件名（后端实现），目录名不参与匹配
+  useEffect(() => {
+    if (!searchOpen || !searchQuery.trim()) {
+      setSearchResults([])
+      setSearching(false)
+      return
+    }
+    const q = searchQuery.trim()
+    setSearching(true)
+    const reqId = ++searchReqRef.current
+    const timer = setTimeout(async () => {
+      try {
+        const hits = await searchProjectFiles(projectId, q, root, 200)
+        if (reqId !== searchReqRef.current) return // 已有更新的请求，丢弃过期结果
+        setSearchResults(hits)
+        setSearching(false)
+      } catch {
+        if (reqId === searchReqRef.current) setSearching(false)
+      }
+    }, 250)
+    return () => clearTimeout(timer)
+  }, [searchOpen, searchQuery, projectId, root])
+
+  // 打开搜索模式时自动聚焦输入框
+  useEffect(() => {
+    if (searchOpen) searchInputRef.current?.focus()
+  }, [searchOpen])
+
+  const closeSearch = () => {
+    searchReqRef.current += 1 // 使进行中的请求作废
+    setSearchOpen(false)
+    setSearchQuery('')
+    setSearchResults([])
+    setSearching(false)
+  }
+
+  const openSearchHit = (hit: FileSearchHit) => {
+    setPreview({ name: hit.name, path: hit.path, type: 'file' })
+  }
 
   /**
    * 监听全局"打开文件"事件（代码块文件路径/行号点击触发）：
@@ -211,8 +289,30 @@ export default function FileTreePanel({
     <div className="p-2 pb-4">
       {/* 头部：项目名 + 展开/收起 + 刷新 */}
       <div className="flex items-center justify-between px-2 pb-2">
-        <span className="text-[11px] font-medium text-[var(--text-secondary)] truncate">{tree.name}</span>
+        <span className="flex items-center gap-2 min-w-0">
+          <span className="text-[11px] font-medium text-[var(--text-secondary)] truncate">{tree.name}</span>
+          {indexProgress != null && (
+            <span className="shrink-0 flex items-center gap-1 text-[10px] text-[var(--accent)] tabular-nums">
+              <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
+              {t('home.indexing', { count: indexProgress.toLocaleString() })}
+            </span>
+          )}
+        </span>
         <div className="flex items-center gap-0.5 shrink-0">
+          <button
+            onClick={() => {
+              if (searchOpen) closeSearch()
+              else {
+                setSearchOpen(true)
+                setSearchQuery('')
+                setSearchResults([])
+              }
+            }}
+            title={t('home.searchFile')}
+            className={`p-1 rounded-md transition-colors ${searchOpen ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'}`}
+          >
+            <Icon name="search" size={13} />
+          </button>
           <button
             onClick={expanded.size > 1 ? collapseAll : expandAll}
             title={expanded.size > 1 ? t('home.collapseAll') : t('home.expandAll')}
@@ -221,7 +321,11 @@ export default function FileTreePanel({
             {loadingAll ? (
               <span className="block w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
             ) : (
-              <Icon name={expanded.size > 1 ? 'chevron-left' : 'chevron-right'} size={13} className="rotate-90" />
+              <Icon
+                name="chevron-right"
+                size={13}
+                className={`shrink-0 transition-transform duration-150 ${expanded.size > 1 ? 'rotate-90' : ''}`}
+              />
             )}
           </button>
           <button
@@ -233,29 +337,106 @@ export default function FileTreePanel({
           </button>
         </div>
       </div>
-      <div className="space-y-px">
-        {tree.children?.map((node) => (
-          <TreeNodeItem
-            key={node.path}
-            node={node}
-            depth={0}
-            expanded={expanded}
-            dirCache={dirCache}
-            onLoadDir={onLoadDir}
-            onToggle={toggle}
-            onReference={onReference}
-            onPreview={(n) => setPreview(n)}
-            onContextMenu={openContextMenu}
-            counts={symCounts}
-          />
-        ))}
-      </div>
+
+      {searchOpen ? (
+        /* 文件名搜索模式：输入框 + 扁平结果列表（替换树视图） */
+        <div>
+          <div className="flex items-center gap-1.5 px-2 pb-2">
+            <input
+              ref={searchInputRef}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') closeSearch()
+              }}
+              placeholder={t('home.searchFilePlaceholder')}
+              spellCheck={false}
+              className="flex-1 min-w-0 h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] transition-colors"
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery('')}
+                title={t('home.searchClear')}
+                className="p-1 shrink-0 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <Icon name="close" size={12} />
+              </button>
+            )}
+          </div>
+          {!searchQuery.trim() ? (
+            <div className="px-2 py-3 text-[11px] text-[var(--text-muted)] leading-relaxed">
+              {t('home.searchFileHint')}
+            </div>
+          ) : searching ? (
+            <div className="flex items-center gap-2 px-2 py-3 text-[11px] text-[var(--text-muted)]">
+              <span className="w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
+              {t('home.searching')}
+            </div>
+          ) : searchResults.length === 0 ? (
+            <div className="px-2 py-3 text-[11px] text-[var(--text-muted)]">{t('home.searchNoResult')}</div>
+          ) : (
+            <div className="space-y-px max-h-[60vh] overflow-y-auto pr-0.5">
+              {searchResults.map((hit) => {
+                const dirIdx = hit.path.lastIndexOf('/')
+                const dir = dirIdx >= 0 ? hit.path.slice(0, dirIdx) : ''
+                return (
+                  <div
+                    key={hit.path}
+                    className="group flex items-center gap-1 rounded-md py-[3px] pr-1 text-[12px] cursor-pointer select-none transition-colors text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                    style={{ paddingLeft: 8 }}
+                    onClick={() => openSearchHit(hit)}
+                    onContextMenu={(e) => openContextMenu(e, { name: hit.name, path: hit.path, type: 'file' })}
+                    title={hit.path}
+                  >
+                    <span className="w-[11px] shrink-0" />
+                    <Icon name="file" size={13} className="shrink-0 opacity-60" />
+                    <span className="flex-1 truncate">{hit.name}</span>
+                    {dir && (
+                      <span className="shrink-0 max-w-[45%] truncate text-[10px] text-[var(--text-muted)] opacity-70 group-hover:opacity-100" title={dir}>
+                        {dir}
+                      </span>
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onReference(hit.path)
+                      }}
+                      title={t('home.sendToChat')}
+                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-all shrink-0"
+                    >
+                      <Icon name="plus" size={12} />
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-px">
+          {tree.children?.map((node) => (
+            <TreeNodeItem
+              key={node.path}
+              node={node}
+              depth={0}
+              expanded={expanded}
+              dirCache={dirCache}
+              onLoadDir={onLoadDir}
+              onToggle={toggle}
+              onReference={onReference}
+              onPreview={(n) => setPreview(n)}
+              onContextMenu={openContextMenu}
+              counts={symCounts}
+            />
+          ))}
+        </div>
+      )}
 
       {/* 右键菜单 */}
       {menu && (
         <div
           ref={menuRef}
-          className="fixed z-[80] w-44 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 py-1 animate-modal-in"
+          className="fixed z-[80] w-44 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
           style={{
             left: Math.min(menu.x, window.innerWidth - 190),
             top: Math.min(menu.y, window.innerHeight - 140),
@@ -297,6 +478,7 @@ export default function FileTreePanel({
           node={preview}
           projectId={projectId}
           projectPath={projectPath}
+          root={root}
           onClose={() => {
             setPreview(null)
             setPreviewLine(undefined)
@@ -304,6 +486,7 @@ export default function FileTreePanel({
           onReference={onReference}
           onReferenceSelection={onReferenceSelection}
           focusLine={previewLine}
+          onRefresh={onRefresh}
         />
       )}
     </div>
@@ -456,3 +639,4 @@ function TreeNodeItem({
     </div>
   )
 }
+

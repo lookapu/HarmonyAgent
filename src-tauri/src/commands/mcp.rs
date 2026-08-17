@@ -601,3 +601,98 @@ fn split_command(mut cmd: Vec<String>) -> (Vec<String>, Vec<String>) {
         (cmd, args)
     }
 }
+
+/// MCP 服务器使用统计：按服务器聚合 tool_runs 中 mcp__ 前缀工具的调用情况。
+/// project_id 为空时统计全部项目（全局服务器跨项目调用也计入）；
+/// 工具名 `mcp__服务器__工具` 解析出服务器名（含 #n 实例后缀的按基础名归并）。
+#[tauri::command]
+pub fn list_mcp_usage_stats(
+    db: State<DbState>,
+    project_id: Option<String>,
+) -> Result<Vec<crate::db::models::McpUsageStat>, String> {
+    use crate::db::models::{McpToolUsage, McpUsageStat};
+    use std::collections::BTreeMap;
+
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let rows = queries::list_mcp_tool_stats(&conn, project_id.as_deref()).map_err(|e| e.to_string())?;
+    // 服务器名 → (聚合统计, 工具明细 map)
+    let mut servers: BTreeMap<String, (McpUsageStat, BTreeMap<String, McpToolUsage>)> = BTreeMap::new();
+    for r in rows {
+        // 工具名格式 mcp__服务器名__工具名；服务器名可能带 #n 实例后缀（如 mysql#2）
+        let Some((server, tool)) = crate::agent::tools::parse_mcp_tool_name(&r.tool_name) else {
+            continue;
+        };
+        // 实例后缀归并到基础名：mysql#2 → mysql，统计落到同一个服务器条目上
+        let base = crate::agent::tools::split_instance_name(&server)
+            .map(|(b, _)| b.to_string())
+            .unwrap_or(server);
+        let entry = servers.entry(base.clone()).or_insert_with(|| {
+            (
+                McpUsageStat {
+                    server_name: base,
+                    call_count: 0,
+                    success_count: 0,
+                    fail_count: 0,
+                    avg_duration_ms: None,
+                    last_called_at: None,
+                    tools: Vec::new(),
+                },
+                BTreeMap::new(),
+            )
+        });
+        let (stat, tools) = entry;
+        // 汇总该服务器总计数（按工具行的计数累加）
+        stat.call_count += r.call_count;
+        stat.success_count += r.success_count;
+        stat.fail_count += r.fail_count;
+        stat.avg_duration_ms = merge_avg(stat.avg_duration_ms, stat.call_count - r.call_count, r.avg_duration_ms, r.call_count);
+        stat.last_called_at = stat.last_called_at.max(r.last_called_at);
+        // 工具明细
+        let t = tools.entry(tool.clone()).or_insert(McpToolUsage {
+            tool_name: tool,
+            call_count: 0,
+            success_count: 0,
+            fail_count: 0,
+            avg_duration_ms: None,
+            last_called_at: None,
+        });
+        t.call_count += r.call_count;
+        t.success_count += r.success_count;
+        t.fail_count += r.fail_count;
+        t.avg_duration_ms = merge_avg(t.avg_duration_ms, t.call_count - r.call_count, r.avg_duration_ms, r.call_count);
+        t.last_called_at = t.last_called_at.max(r.last_called_at);
+    }
+    let mut out: Vec<McpUsageStat> = servers
+        .into_values()
+        .map(|(mut s, tools)| {
+            let mut ts: Vec<McpToolUsage> = tools.into_values().collect();
+            ts.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+            s.tools = ts;
+            s
+        })
+        .collect();
+    out.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+    Ok(out)
+}
+
+/// 加权合并平均耗时：(旧均值×旧次数 + 新均值×新次数) / 总数
+fn merge_avg(
+    old_avg: Option<i64>,
+    old_n: i64,
+    new_avg: Option<i64>,
+    new_n: i64,
+) -> Option<i64> {
+    match (old_avg, new_avg) {
+        (Some(a), Some(b)) => {
+            let total = old_n + new_n;
+            if total > 0 {
+                Some((a * old_n + b * new_n) / total)
+            } else {
+                Some((a + b) / 2)
+            }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}

@@ -179,6 +179,13 @@ pub(super) async fn build_project(
     if output.status.success() {
         let elapsed = build_started.elapsed().as_secs_f32();
         let mut summary = format!("构建成功（{mode}，耗时 {elapsed:.1}s）。\n");
+        // 未签名产物预警：构建日志出现 No signingConfig 说明产出 unsigned HAP，
+        // 真机部署必然报 9568319——提前告知并给出自动修复路径，避免部署失败后再回查
+        if combined.contains("No signingConfig") || combined.contains("no signingConfig found") {
+            summary.push_str(
+                "⚠ 本次构建产物未签名（构建日志：No signingConfig found）——部署真机将报 9568319 签名校验失败。\n请先调用 diagnose_signing 自检签名配置并按建议修复（或确认工程已配置签名），再重新构建。\n",
+            );
+        }
         if let Some(dir) = &info.hap_output_dir {
             if dir.exists() {
                 summary.push_str(&format!("产物目录: {}\n", dir.display()));
@@ -243,7 +250,9 @@ pub(super) async fn build_project(
                 "缺失 API 用 show_diagnose_card(category=sdk) 提示用户安装",
             ],
             Some("signing") => vec![
-                "不要改代码，调用 show_diagnose_card(category=signing) 引导用户在 DevEco Studio 配置签名",
+                "调用 diagnose_signing 自动核对签名配置/材料与设备匹配性，按建议修复 build-profile.json5（或 bundleName）",
+                "修复后重新 build_project 验证",
+                "仅当材料库完全无匹配（需登录华为账号生成证书）时才 show_diagnose_card(category=signing) 提示用户",
             ],
             Some("ohpm") => vec![
                 "调用 ohpm_install 验证 ohpm 是否可用",
@@ -302,24 +311,33 @@ pub(super) fn harmony_modules(root: &Path) -> Vec<String> {
     // 1) build-profile.json5 的 modules 数组
     if let Some(text) = std::fs::read_to_string(root.join("build-profile.json5")).ok() {
         let trimmed = text.trim();
-        // 取 "modules": [ {"name": "xxx", ...} ... ] 中的 name 值（不引入 json5 解析器依赖）
-        if let Some(idx) = trimmed.find("\"modules\"") {
+        // 取 "modules": [ {"name": "xxx", ...} ... ] 中的 name 值（不引入 json5 解析器依赖）；
+        // 兼容 JSON5 无引号键（modules: / name:）与带注释的写法
+        let modules_idx = trimmed
+            .find("\"modules\"")
+            .or_else(|| trimmed.find("modules"));
+        if let Some(idx) = modules_idx {
             let rest = &trimmed[idx..];
             if let Some(start) = rest.find('[') {
                 if let Some(end) = rest[start..].find(']') {
                     let arr = &rest[start + 1..start + end];
                     for seg in arr.split('{') {
-                        if let Some(ni) = seg.find("\"name\"") {
-                            let after = &seg[ni + "\"name\"".len()..];
-                            if let Some(c) = after.find(':') {
-                                let v = &after[c + 1..];
-                                let v = v.trim().trim_start_matches('"');
-                                if let Some(end_q) = v.find('"') {
-                                    let n = v[..end_q].trim();
-                                    if !n.is_empty() {
-                                        names.push(n.to_string());
-                                    }
-                                }
+                        let name_idx = seg
+                            .find("\"name\"")
+                            .or_else(|| seg.find("name"));
+                        if let Some(ni) = name_idx {
+                            // 从命中的 name 起找冒号，统一从冒号后取字符串值（兼容有无引号键）
+                            let after = &seg[ni..];
+                            let Some(c) = after.find(':') else { continue };
+                            let v = after[c + 1..].trim();
+                            let v = v.trim_start_matches('"').trim_start_matches('\'');
+                            let end_q = v
+                                .find('"')
+                                .or_else(|| v.find('\''))
+                                .unwrap_or(v.len());
+                            let n = v[..end_q].trim();
+                            if !n.is_empty() && !n.starts_with("//") {
+                                names.push(n.to_string());
                             }
                         }
                     }
@@ -327,7 +345,7 @@ pub(super) fn harmony_modules(root: &Path) -> Vec<String> {
             }
         }
     }
-    // 2) 回退：扫描直接子目录（含 oh-package.json5 且非 AppScope/.hvigor/.ohpm）
+    // 2) 回退：扫描直接子目录（含 oh-package.json5 / build-profile.json5 / src/main/module.json5 的目录）
     if names.is_empty() {
         if let Ok(rd) = std::fs::read_dir(root) {
             for e in rd.flatten() {
@@ -338,7 +356,10 @@ pub(super) fn harmony_modules(root: &Path) -> Vec<String> {
                 if name.starts_with('.') || name.eq_ignore_ascii_case("AppScope") {
                     continue;
                 }
-                if e.path().join("oh-package.json5").is_file() || e.path().join("build-profile.json5").is_file() {
+                if e.path().join("oh-package.json5").is_file()
+                    || e.path().join("build-profile.json5").is_file()
+                    || e.path().join("src/main/module.json5").is_file()
+                {
                     names.push(name);
                 }
             }
@@ -381,7 +402,18 @@ pub(super) async fn deploy(
     let is_signed = Path::new(&hap)
         .file_name()
         .and_then(|s| s.to_str())
-        .is_some_and(|s| s.contains("-signed"));
+        .is_some_and(|s| s.contains("-signed") && !s.contains("unsigned"));
+    // 明确未签名的产物直接拒绝部署（unsigned 产物上真机必然 9568319，早报早修）
+    if !is_signed
+        && Path::new(&hap)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.contains("unsigned"))
+    {
+        return Err(format!(
+            "{hap} 是未签名产物（unsigned）——真机安装将报 9568319 签名校验失败。\n请先确认工程签名配置（build-profile.json5 signingConfigs，可调用 diagnose_signing 自检）后 build_project 重新构建，再 deploy。"
+        ));
+    }
 
     // 全局并发护栏：同一时间只允许一个部署
     let _gate = crate::services::tool_limits::acquire_gate("deploy").await;
@@ -525,6 +557,8 @@ pub(super) async fn deploy(
         let faultlog = fetch_recent_faultlog(&device_id, bundle).await.unwrap_or_default();
         let hilog = run_hdc_shell(&device_id, &["hilog", "-x"], 25).await.unwrap_or_default();
         let report = crate::agent::crash::analyze(bundle, &faultlog, &hilog);
+        // 历史崩溃模式：同类崩溃反复出现时提示参考既往修复经验
+        let nth = crate::agent::crash::record_pattern(project_path, &report);
 
         // 写入跨轮诊断，下一轮 model 能看到"上次运行时崩溃是什么"
         crate::agent::diagnostics::record(
@@ -532,7 +566,11 @@ pub(super) async fn deploy(
             crate::agent::diagnostics::Diagnosis {
                 source: "crash_analysis".into(),
                 category: report.category.clone(),
-                summary: report.summary.clone(),
+                summary: if nth > 1 {
+                    format!("{}（同类崩溃历史第 {nth} 次，建议参考既往修复经验避免重复踩坑）", report.summary)
+                } else {
+                    report.summary.clone()
+                },
                 detail: if report.locations.is_empty() {
                     tail(&report.snippet, 600)
                 } else {
@@ -758,12 +796,17 @@ pub(super) async fn deploy_one_device(
         let faultlog = fetch_recent_faultlog(device_id, bundle).await.unwrap_or_default();
         let hilog = run_hdc_shell(device_id, &["hilog", "-x"], 25).await.unwrap_or_default();
         let report = crate::agent::crash::analyze(bundle, &faultlog, &hilog);
+        let nth = crate::agent::crash::record_pattern(project_path, &report);
         crate::agent::diagnostics::record(
             project_path,
             crate::agent::diagnostics::Diagnosis {
                 source: "crash_analysis".into(),
                 category: report.category.clone(),
-                summary: report.summary.clone(),
+                summary: if nth > 1 {
+                    format!("{}（同类崩溃历史第 {nth} 次，建议参考既往修复经验避免重复踩坑）", report.summary)
+                } else {
+                    report.summary.clone()
+                },
                 detail: tail(&report.snippet, 600),
                 at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
             },
@@ -803,7 +846,7 @@ pub(super) fn classify_deploy_error(output: &str, is_signed: bool) -> (String, S
         || lower.contains("9568339")
         || lower.contains("code:95683")
     {
-        ("signing", "签名校验失败或产物未签名。不要改代码：调用 show_diagnose_card(category=signing) 引导用户在 DevEco Studio 配置自动签名；或先用 release 模式重新构建已签名产物再部署。")
+        ("signing", "签名校验失败或产物未签名。先调用 diagnose_signing 自动核对签名材料与设备/bundle 匹配性并按建议修复；若构建日志提示 No signingConfig（unsigned 产物）直接 build_project 重新构建后再部署；材料库完全无匹配时才需要 DevEco 重新签名。")
     } else if lower.contains("downgrade")
         || lower.contains("version downgrade")
         || lower.contains("install_failed_version_downgrade")
@@ -843,14 +886,29 @@ pub(super) async fn ohpm_search(args: &Value) -> Result<String, String> {
         return Err("ohpm_search 需要 keyword（包名或关键字）".into());
     };
     let detail = args["detail"].as_bool().unwrap_or(false);
-    let search_out = run_cmd("ohpm", &["search".into(), keyword.to_string()], None, 60).await
-        .map_err(|e| with_advice("ohpm_search", e))?;
-    if search_out.trim().is_empty() {
-        return Ok(format!(
-            "ohpm 仓库未找到与「{keyword}」匹配的包。\n建议：检查包名拼写；用 web_search 查该库的鸿蒙支持情况；或考虑替代库。"
-        ));
+    // ohpm 6.x 已移除 search 子命令：优先 view 查询包信息（返回版本/描述/依赖），
+    // 兼容旧版先试 search、报 unknown command 时自动回退 view
+    let search_out = match run_cmd("ohpm", &["search".into(), keyword.to_string()], None, 60).await {
+        Ok(o) => o,
+        Err(e) if e.contains("unknown command") || e.contains("unknown option") => {
+            String::new()
+        }
+        Err(e) => return Err(with_advice("ohpm_search", e)),
+    };
+    let search_out = search_out.trim();
+    let mut s = String::new();
+    if search_out.is_empty() {
+        s.push_str(&format!("ohpm 无 search 命令（6.x 起移除），改用 view 查询包「{keyword}」信息：\n"));
+    } else {
+        s.push_str(&format!("ohpm 搜索结果（{keyword}）：\n{}\n", search_out));
     }
-    let mut s = format!("ohpm 搜索结果（{keyword}）：\n{}\n", search_out.trim_end());
+    let view = run_cmd("ohpm", &["view".into(), keyword.to_string()], None, 60).await
+        .unwrap_or_else(|e| format!("ohpm view 失败：{e}"));
+    if view.contains("error") || view.contains("not found") {
+        s.push_str(&format!("ohpm 仓库未找到与「{keyword}」匹配的包（view 无结果）。\n建议：检查包名拼写；用 web_search 查该库的鸿蒙支持情况；或考虑替代库。\n"));
+        return Ok(s);
+    }
+    s.push_str(&format!("--- ohpm view {keyword} ---\n{}\n", view.trim_end()));
     if detail {
         let info = run_cmd("ohpm", &["info".into(), keyword.to_string()], None, 60).await
             .unwrap_or_else(|e| format!("ohpm info 失败：{e}"));
@@ -860,6 +918,107 @@ pub(super) async fn ohpm_search(args: &Value) -> Result<String, String> {
         "\n确认可用后：ohpm_install package={keyword}（或先 edit_file 更新 oh-package.json5 依赖再 ohpm_install）。"
     ));
     Ok(s)
+}
+
+/// 截断展示用文本（保留前 n 字符）
+fn display_truncate(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        s.to_string()
+    } else {
+        let cut: String = chars[..n].iter().collect();
+        format!("{cut}…")
+    }
+}
+
+/// ohpm_recommend：基于本地 landscape 缓存的离线三方库推荐/检索。
+/// 数据来自 ohpm 官方 landscape（开源技术图谱）接口的定期镜像：
+/// 含四级分类 / 描述 / 关键词 / 60 天下载量 / 评分，按热度排序。
+pub(super) async fn ohpm_recommend(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+    use crate::services::ohpm_landscape as ls;
+
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let st = ls::status(&conn)?;
+    if st.total == 0 {
+        return Ok(
+            "本地三方库推荐缓存为空（还没拉取过）。\n处理建议：请用户在健康检查页「三方库推荐」点一次刷新；应用启动后也会自动拉取。\n在此之前可用 ohpm_search 在线查询包是否存在。".to_string(),
+        );
+    }
+
+    let keyword = args["keyword"]
+        .as_str()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let category = args["category"]
+        .as_str()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let top = args["top"]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or(8)
+        .min(15);
+    // 排序：likes（最受欢迎）/ popularity（最流行）/ latest（最新发布），默认下载量
+    let order = args["order"]
+        .as_str()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+
+    let (pkgs, scope) = if let Some(kw) = keyword {
+        (ls::search(&conn, kw, order, top, 0)?, format!("「{kw}」"))
+    } else if let Some(cat) = category {
+        (
+            ls::by_category(&conn, cat, "", order, top, 0)?,
+            format!("分类「{cat}」"),
+        )
+    } else {
+        (ls::hot(&conn, order, top, 0)?, "热门".to_string())
+    };
+
+    if pkgs.is_empty() {
+        return Ok(
+            "本地三方库缓存中未找到匹配项。\n建议：换更短/更宽泛的关键词（含英文名）；先不带参数列出热门库看分类命名；或用 ohpm_search 在线查询。"
+                .to_string(),
+        );
+    }
+
+    let updated = st
+        .updated_at
+        .map(|t| {
+            let s = chrono::DateTime::from_timestamp(t, 0)
+                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            format!("更新于 {s}")
+        })
+        .unwrap_or_default();
+    let mut out = format!(
+        "本地三方库推荐（ohpm 官方 landscape 缓存，共 {} 个包，{}）：\n\n",
+        st.total, updated
+    );
+    for (i, p) in pkgs.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. **{}** v{} | ⬇ {} 次/60天 | {} | {}\n    {}\n",
+            i + 1,
+            p.package_name,
+            p.version,
+            p.down_count_60d,
+            if p.license.is_empty() { "-".to_string() } else { p.license.clone() },
+            p.level1(),
+            display_truncate(&p.description, 90),
+        ));
+    }
+    let order_name = match order {
+        "likes" => "最受欢迎（点赞数）",
+        "popularity" => "最流行（流行度）",
+        "latest" => "最新发布（发布时间）",
+        _ => "下载量",
+    };
+    out.push_str(&format!(
+        "\n以上为{scope} Top{}（按{order_name}排序）。\n需要安装：ohpm_install package=<包名>；需要最新版本/依赖详情：ohpm_search keyword=<包名> detail=true；浏览其他分类：ohpm_recommend category=<一级分类名>。",
+        pkgs.len()
+    ));
+    Ok(out)
 }
 
 pub(super) async fn ohpm_install(args: &Value, roots: &[String]) -> Result<String, String> {
@@ -876,5 +1035,234 @@ pub(super) async fn ohpm_install(args: &Value, roots: &[String]) -> Result<Strin
     run_in_project(project_path, "ohpm", &cmd_args, 300)
         .await
         .map_err(|e| with_advice("ohpm_install", e))
+}
+
+// ==================== 签名自检（diagnose_signing） ====================
+
+/// 解析 p7b profile 元数据：DER 编码内嵌 JSON 的可读字符串，宽松提取关键字段。
+fn parse_profile_meta(bytes: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(bytes);
+    let mut meta = serde_json::Map::new();
+    for key in ["bundle-name", "type", "developer-id", "device-ids"] {
+        let needle = format!("\"{key}\"");
+        let Some(idx) = text.find(&needle) else { continue };
+        let after = &text[idx + needle.len()..];
+        let Some(colon) = after.find(':') else { continue };
+        let v = after[colon + 1..].trim_start();
+        if v.starts_with('"') {
+            if let Some(end) = v[1..].find('"') {
+                meta.insert(key.to_string(), serde_json::Value::String(v[1..1 + end].to_string()));
+            }
+        } else if v.starts_with('[') {
+            // device-ids 数组：收集全部引号字符串
+            let mut ids: Vec<serde_json::Value> = Vec::new();
+            let mut rest_v = v;
+            while let Some(q) = rest_v.find('"') {
+                let tail = &rest_v[q + 1..];
+                match tail.find('"') {
+                    Some(qe) => {
+                        ids.push(serde_json::Value::String(tail[..qe].to_string()));
+                        rest_v = &tail[qe + 1..];
+                    }
+                    None => break,
+                }
+            }
+            meta.insert(key.to_string(), serde_json::Value::Array(ids));
+        }
+    }
+    serde_json::Value::Object(meta)
+}
+
+/// 扫描用户签名材料目录（~/.ohos/config），返回 [(文件名, profile 元数据)]。
+fn scan_sign_materials() -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    let Some(home) = home else { return out };
+    let dir = home.join(".ohos").join("config");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        let is_p7b = p
+            .extension()
+            .map(|s| s.to_string_lossy().eq_ignore_ascii_case("p7b"))
+            .unwrap_or(false);
+        if !is_p7b {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&p) {
+            let meta = parse_profile_meta(&bytes);
+            if meta.get("bundle-name").map(|v| v.is_string()).unwrap_or(false) {
+                out.push((p.file_name().unwrap_or_default().to_string_lossy().to_string(), meta));
+            }
+        }
+    }
+    out
+}
+
+/// 检查 build-profile.json5 的签名配置引用的材料文件是否齐全。
+fn signing_material_status(cfg: &serde_json::Value, root: &Path) -> (Vec<String>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut missing = Vec::new();
+    for (key, field) in [("certpath", "证书"), ("profile", "profile"), ("storeFile", "密钥库")] {
+        let v = cfg.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        if v.is_empty() {
+            missing.push(format!("{field}（{key}）未配置"));
+            continue;
+        }
+        let p = Path::new(v);
+        let p = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
+        if p.is_file() {
+            ok.push(field.to_string());
+        } else {
+            missing.push(format!("{field}文件不存在：{}", p.display()));
+        }
+    }
+    (ok, missing)
+}
+
+/// diagnose_signing：签名自检——核对工程签名配置、签名材料与设备 UDID 的匹配关系，
+/// 输出结构化诊断与修复指引（优先给出可自动执行的修复路径：复用匹配材料/跨工程签名配置）。
+pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<String, String> {
+    let root = match args["path"].as_str() {
+        Some(p) if !p.trim().is_empty() => resolve_in_roots(roots, p)?,
+        _ => PathBuf::from(roots.first().map(String::as_str).unwrap_or("")),
+    };
+    if !root.is_dir() {
+        return Err(format!("工程目录不存在：{}", root.display()));
+    }
+    let mut out = String::new();
+    out.push_str(&format!("签名自检报告（{}）：\n\n", root.display()));
+
+    // 1) 工程 bundleName
+    let app_text = std::fs::read_to_string(root.join("AppScope").join("app.json5"))
+        .or_else(|_| std::fs::read_to_string(root.join("app.json5")))
+        .unwrap_or_default();
+    let bundle = crate::services::harmony::parse_json5(&app_text)
+        .ok()
+        .and_then(|v| {
+            let app = v.get("app").or_else(|| v.get("bundle"));
+            app.and_then(|a| a.get("bundleName"))
+                .and_then(|b| b.as_str())
+                .map(String::from)
+        });
+    out.push_str(&format!("1. 工程 bundleName：{}\n", bundle.as_deref().unwrap_or("（未能解析 app.json5）")));
+
+    // 2) 当前签名配置
+    let bp_text = std::fs::read_to_string(root.join("build-profile.json5")).unwrap_or_default();
+    let bp = crate::services::harmony::parse_json5(&bp_text).ok();
+    let cfgs: Vec<serde_json::Value> = bp
+        .as_ref()
+        .and_then(|v| v.get("app"))
+        .and_then(|v| v.get("signingConfigs"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    out.push_str(&format!("2. 签名配置：{} 项\n", cfgs.len()));
+    let mut current_profile: Option<String> = None;
+    if cfgs.is_empty() {
+        out.push_str("   ⚠ 未配置 signingConfigs——构建产物为 unsigned HAP，部署真机将报 9568319\n");
+    } else {
+        for (i, cfg) in cfgs.iter().enumerate() {
+            let name = cfg.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let (ok, missing) = signing_material_status(cfg, &root);
+            out.push_str(&format!("   [{i}] {name}：材料齐全（{}），缺失：{}\n", ok.join("+"), if missing.is_empty() { "无".to_string() } else { missing.join("; ") }));
+            if let Some(pp) = cfg.get("profile").and_then(|v| v.as_str()) {
+                let p = Path::new(pp);
+                if p.is_absolute() { p.to_path_buf() } else { root.join(p) }
+                    .is_file()
+                    .then(|| current_profile = Some(pp.to_string()));
+            }
+        }
+    }
+
+    // 3) 设备与 profile 匹配性
+    let device = default_device_id().await.ok();
+    let mut device_udid: Option<String> = None;
+    if let Some(dev) = &device {
+        if let Ok(u) = run_hdc_shell(dev, &["bm", "get", "-u"], 30).await {
+            let u = u.trim();
+            if !u.is_empty() && !u.contains("error") {
+                device_udid = Some(u.to_string());
+            }
+        }
+    }
+    out.push_str(&format!(
+        "3. 设备：{}（UDID：{})\n",
+        device.as_deref().unwrap_or("未检测到在线设备（请连接真机/模拟器）"),
+        device_udid.as_deref().unwrap_or("未知")
+    ));
+
+    // 4) 签名材料库扫描（~/.ohos/config）
+    let materials = scan_sign_materials();
+    out.push_str(&format!("4. 本地签名材料（~/.ohos/config）：{} 套\n", materials.len()));
+    let mut matched_material: Option<String> = None;
+    for (fname, meta) in &materials {
+        let mb = meta.get("bundle-name").and_then(|v| v.as_str()).unwrap_or("");
+        let mtype = meta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let ids: Vec<&str> = meta
+            .get("device-ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        let bundle_ok = bundle.as_deref().is_some_and(|b| mb == b);
+        let device_ok = device_udid.as_ref().is_some_and(|u| ids.contains(&u.as_str()));
+        let flag = if bundle_ok && device_ok {
+            "✅ 完全匹配"
+        } else if bundle_ok {
+            "⚠ bundle 匹配，设备未绑定"
+        } else if device_ok {
+            "⚠ 设备匹配，bundle 不匹配"
+        } else {
+            "✗ 不匹配"
+        };
+        out.push_str(&format!("   - {fname}：bundle={mb}，type={mtype}，绑定额外设备 {} 台，当前设备 {} → {flag}\n", ids.len(), device_udid.as_deref().map(|u| u.chars().take(12).collect::<String>() + "…").unwrap_or_default()));
+        if bundle_ok && device_ok && matched_material.is_none() {
+            matched_material = Some(fname.clone());
+        }
+    }
+    // 当前配置引用的 profile 是否在材料库中且匹配
+    let current_ok = current_profile
+        .as_ref()
+        .and_then(|p| Path::new(p).file_name())
+        .and_then(|f| materials.iter().find(|(n, _)| n == &f.to_string_lossy()))
+        .is_some_and(|(_, m)| {
+            let mb = m.get("bundle-name").and_then(|v| v.as_str()).unwrap_or("");
+            let ids: Vec<String> = m
+                .get("device-ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            bundle.as_deref().is_some_and(|b| b == mb)
+                && device_udid.as_ref().is_some_and(|u| ids.contains(u))
+        });
+
+    // 5) 结论与修复指引
+    out.push_str("\n5. 结论与建议：\n");
+    if cfgs.is_empty() {
+        if let Some(m) = &matched_material {
+            out.push_str(&format!(
+                "   • 未配置签名，但材料库中存在匹配材料 {m}。\n"
+            ));
+            out.push_str("   • 修复路径：请在 build-profile.json5 的 app.signingConfigs 添加配置并引用该材料\n");
+            out.push_str("     （certpath/profile/storeFile 指向 ~/.ohos/config 下对应 .cer/.p7b/.p12，keyAlias=debugKey，signAlg=SHA256withECDSA）；\n");
+            out.push_str("     或复用工作区内其他鸿蒙工程（同 bundle）已配置的 signingConfigs（含密码字段，复制即可）。\n");
+        } else {
+            out.push_str("   • 材料库中没有与当前 bundle+设备匹配的 profile。\n");
+            out.push_str("   • 只能通过 DevEco Studio（File → Project Structure → Signing Configs）登录华为账号自动生成签名（生成后材料自动落入 ~/.ohos/config，下次自检即可自动修复）。\n");
+        }
+        out.push_str("   • 建议：配置完成后调用 build_project 重新构建，再 deploy。\n");
+    } else if current_ok {
+        out.push_str("   ✅ 当前签名配置与 bundle、设备完全匹配——直接 build_project 重新构建即可产出已签名 HAP，随后 deploy。\n");
+        out.push_str("     注意：若此前部署报 9568319，多为部署了旧的 unsigned HAP 产物，重新构建可解决。\n");
+    } else if let Some(m) = &matched_material {
+        out.push_str(&format!("   • 当前配置的 profile 与设备/bundle 不匹配，但材料库 {m} 匹配。\n"));
+        out.push_str("   • 修复路径：用 edit_file 把 build-profile.json5 的 signingConfigs 中 certpath/profile/storeFile 改为材料库匹配项（或整体复用匹配工程的配置），再 build_project + deploy。\n");
+    } else {
+        out.push_str("   • 当前签名配置与设备/bundle 不匹配，且材料库无匹配项。\n");
+        out.push_str("   • 可选：调整 AppScope/app.json5 的 bundleName 与现有 profile 一致（需评估应用身份影响）；或用 DevEco Studio 重新生成签名。\n");
+    }
+    Ok(out)
 }
 

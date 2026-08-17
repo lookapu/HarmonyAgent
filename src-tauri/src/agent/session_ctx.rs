@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio::sync::oneshot;
 
-use crate::agent::ask::AskEvent;
+use crate::agent::ask::{AskEvent, AskRecord};
 use crate::agent::todo::TodoItem;
 use crate::agent::undo::Snapshot;
 
@@ -37,6 +37,8 @@ pub struct SessionContext {
     pub task_plans: HashMap<String, (String, Vec<PlanStep>)>,
     /// 提问等待者（ask_user）：request_id -> (事件, 回答通道)
     pub ask_waiters: HashMap<String, (AskEvent, oneshot::Sender<String>)>,
+    /// 已答复的提问历史（ask_user）：conversation_id -> 最近记录（≤20 条）
+    pub ask_history: HashMap<String, Vec<AskRecord>>,
     /// 轻量注入队列：异步事件（后台任务完成等）写入的模型可见消息，
     /// 下一轮请求组装时 drain 为 user 消息注入（防堆积：每会话上限 10 条）
     pub injected_messages: HashMap<String, VecDeque<String>>,
@@ -58,6 +60,7 @@ pub fn drop_session(conversation_id: &str) {
         ctx.todo_lists.remove(conversation_id);
         ctx.task_plans.remove(conversation_id);
         ctx.ask_waiters.retain(|_, (ev, _)| ev.conversation_id != conversation_id);
+        ctx.ask_history.remove(conversation_id);
         ctx.injected_messages.remove(conversation_id);
     }
 }

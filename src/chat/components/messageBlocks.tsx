@@ -1,10 +1,18 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { ChatErrorDetail } from '../../stores/projectStore'
 import Icon from '../../icons/Icon'
 import Markdown from '../../components/Markdown'
 import { gitDiffStat, gitFileDiff, gitAcceptChanges, gitRevertFile } from '../../api/git'
 import { sanitizeToolMarkers } from '../chatUtils'
+import { createPortal } from 'react-dom'
+
+/** 流式补全未闭合的代码围栏：``` 未配对时补一个闭合，否则 react-markdown 把整块当纯文本，
+ *  代码块刚开头时裸露 ``` 符号闪烁；只影响展示层，不改真实内容 */
+function closeOpenFence(md: string): string {
+  if ((md.match(/```/g) ?? []).length % 2 === 1) return md + `\n` + '```'
+  return md
+}
 
 /** diff 文本按行着色：+ 绿 / - 红 / @@ 蓝（未跟踪新文件预览保持默认色） */
 export function DiffText({ text }: { text: string }) {
@@ -26,16 +34,34 @@ export function DiffText({ text }: { text: string }) {
 }
 
 /* ============ 思考过程（推理模型 reasoning 折叠展示） ============ */
-export function ThinkingBlock({ content }: { content: string }) {
+export const ThinkingBlock = memo(function ThinkingBlock({ content }: { content: string }) {
   const { t } = useTranslation()
-  const [open, setOpen] = useState(false)
-  const lines = content.split('\n').filter((l) => l.trim())
-  const preview = lines.slice(0, 3).join(' ').slice(0, 60)
+  // 展开偏好记忆：用户手动开合后跨会话记住（localStorage）
+  const [open, setOpen] = useState(() => {
+    try {
+      return localStorage.getItem('deveco-thinking-open') === '1'
+    } catch {
+      return false
+    }
+  })
+  const toggle = () => {
+    setOpen((v) => {
+      const next = !v
+      try {
+        localStorage.setItem('deveco-thinking-open', next ? '1' : '0')
+      } catch {
+        // localStorage 不可用时静默
+      }
+      return next
+    })
+  }
+  const lines = useMemo(() => content.split('\n').filter((l) => l.trim()), [content])
+  const preview = useMemo(() => lines.slice(0, 3).join(' ').slice(0, 60), [lines])
   return (
     <div className={`thinking-block ${open ? 'open' : ''}`}>
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         className="thinking-block-head"
         title={t('home.toggleThinking')}
       >
@@ -53,7 +79,7 @@ export function ThinkingBlock({ content }: { content: string }) {
       )}
     </div>
   )
-}
+})
 
 /* 点赞/点踩内联图标（Icon 组件无对应图样） */
 export function ThumbUpIcon({ filled }: { filled?: boolean }) {
@@ -76,7 +102,7 @@ export function ThumbDownIcon({ filled }: { filled?: boolean }) {
 
 /* ============ 修改文件折叠卡片（ChatGPT 式：正文下方列出本次修改的文件） ============ */
 /** 变更审查卡片：修改文件列表 + 逐文件 diff/接受/还原（Qoder 式变更审核） */
-export function ModifiedFilesCard({ files, projectPath }: { files: string[]; projectPath?: string }) {
+export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projectPath }: { files: string[]; projectPath?: string }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
@@ -102,6 +128,19 @@ export function ModifiedFilesCard({ files, projectPath }: { files: string[]; pro
   // 变更审查状态：file -> diff 文本（undefined=未加载 / null=已加载为空）
   const [diffMap, setDiffMap] = useState<Record<string, string | null>>({})
   const [diffLoading, setDiffLoading] = useState<string | null>(null)
+  // 已展开 diff 的文件集合（与 diffMap 分离：已加载 ≠ 展开中，再次点击可收缩）
+  const [openDiffs, setOpenDiffs] = useState<Set<string>>(new Set())
+  // 独立审核窗口开关（portal 到 document.body，不受父容器裁剪/层级影响）
+  const [reviewOpen, setReviewOpen] = useState(false)
+  // 审核窗口 Esc 关闭（与文件预览弹窗行为一致）
+  useEffect(() => {
+    if (!reviewOpen) return
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setReviewOpen(false)
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [reviewOpen])
   const [busy, setBusy] = useState<string | null>(null)
   const [accepted, setAccepted] = useState<Set<string>>(new Set())
   const [reverted, setReverted] = useState<Set<string>>(new Set())
@@ -118,17 +157,28 @@ export function ModifiedFilesCard({ files, projectPath }: { files: string[]; pro
     }
   }
 
-  /** 加载单文件 diff（已加载过直接复用） */
-  const loadDiff = async (p: string) => {
-    if (!projectPath || diffMap[p] !== undefined) return
-    setDiffLoading(p)
-    try {
-      const d = await gitFileDiff(projectPath, p)
-      setDiffMap((m) => ({ ...m, [p]: d }))
-    } catch (e) {
-      setDiffMap((m) => ({ ...m, [p]: String(e) }))
-    } finally {
-      setDiffLoading(null)
+  /** 切换单文件 diff：展开中再点收缩；未加载则拉取后展开 */
+  const toggleDiff = async (p: string) => {
+    if (!projectPath) return
+    if (openDiffs.has(p)) {
+      setOpenDiffs((s) => {
+        const n = new Set(s)
+        n.delete(p)
+        return n
+      })
+      return
+    }
+    setOpenDiffs((s) => new Set(s).add(p))
+    if (diffMap[p] === undefined) {
+      setDiffLoading(p)
+      try {
+        const d = await gitFileDiff(projectPath, p)
+        setDiffMap((m) => ({ ...m, [p]: d }))
+      } catch (e) {
+        setDiffMap((m) => ({ ...m, [p]: String(e) }))
+      } finally {
+        setDiffLoading(null)
+      }
     }
   }
 
@@ -201,6 +251,21 @@ export function ModifiedFilesCard({ files, projectPath }: { files: string[]; pro
             {t('home.changesAccepted', { n: accepted.size })}
           </span>
         )}
+        {/* 审核窗口入口：stopPropagation 避免误触卡片展开/收缩 */}
+        {canReview && files.length > 0 && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation()
+              setReviewOpen(true)
+            }}
+            title={t('home.reviewChanges')}
+            className="shrink-0 h-5 px-1.5 rounded-md text-[10px] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
+          >
+            <Icon name="git-branch" size={10} />
+            {t('home.reviewChanges')}
+          </button>
+        )}
         <Icon
           name="chevron-right"
           size={11}
@@ -234,7 +299,7 @@ export function ModifiedFilesCard({ files, projectPath }: { files: string[]; pro
                     <span className="flex items-center gap-0.5 shrink-0">
                       <button
                         type="button"
-                        onClick={() => loadDiff(p)}
+                        onClick={() => toggleDiff(p)}
                         disabled={diffLoading === p}
                         title={t('home.viewDiff')}
                         className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -258,12 +323,14 @@ export function ModifiedFilesCard({ files, projectPath }: { files: string[]; pro
                       >
                         <Icon name="check" size={11} />
                       </button>
+                      {/* 危险操作分隔线：还原会丢弃改动，与常规操作拉开视觉距离，降低误触 */}
+                      <span className="mx-0.5 w-px h-3 bg-[var(--border)] shrink-0" aria-hidden="true" />
                       <button
                         type="button"
                         onClick={() => revertFile(p)}
                         disabled={busy === p || isAccepted}
                         title={t('home.revertChange')}
-                        className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
+                        className="p-1 ml-0.5 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
                       >
                         <Icon name="close" size={11} />
                       </button>
@@ -271,7 +338,7 @@ export function ModifiedFilesCard({ files, projectPath }: { files: string[]; pro
                   )}
                 </div>
                 {isReverted && <div className="text-[10px] text-[var(--danger)] mt-0.5 pl-4">{t('home.changeReverted')}</div>}
-                {diff && !isReverted && (
+                {diff && !isReverted && openDiffs.has(p) && (
                   <pre className="mt-1 ml-4 mr-1 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] p-2 text-[10.5px] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-40 overflow-y-auto">
                     <DiffText text={diff} />
                   </pre>
@@ -294,42 +361,212 @@ export function ModifiedFilesCard({ files, projectPath }: { files: string[]; pro
           )}
         </div>
       )}
+
+      {/* 独立审核窗口：portal 到 body 顶层，全屏遮罩 + 文件列表逐项审查 */}
+      {reviewOpen && canReview &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-6"
+            onMouseDown={(e) => {
+              if (e.target === e.currentTarget) setReviewOpen(false)
+            }}
+          >
+            <div className="w-[860px] max-w-[95vw] h-[82vh] max-h-[82vh] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl flex flex-col overflow-hidden animate-modal-in">
+              {/* 头部 */}
+              <div className="h-12 shrink-0 px-4 flex items-center gap-3 border-b border-[var(--border)]">
+                <div className="w-7 h-7 rounded-lg bg-[var(--accent-soft)] flex items-center justify-center shrink-0">
+                  <Icon name="git-branch" size={13} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[13px] font-medium truncate leading-tight">{t('home.reviewChanges')}</div>
+                  <div className="text-[10px] text-[var(--text-muted)] truncate">{t('home.reviewDesc')}</div>
+                </div>
+                <span className="shrink-0 text-[10px] text-[var(--text-muted)] tabular-nums bg-[var(--bg-card)] rounded-md px-2 py-1">
+                  {t('home.changesAccepted', { n: accepted.size })} / {files.length}
+                </span>
+                <button
+                  onClick={() => setReviewOpen(false)}
+                  className="shrink-0 w-7 h-7 rounded-lg flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                  title={t('common.close')}
+                >
+                  <Icon name="close" size={14} />
+                </button>
+              </div>
+              {/* 文件列表 */}
+              <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-2">
+                {files.map((p) => {
+                  const isAccepted = accepted.has(p)
+                  const isReverted = reverted.has(p)
+                  const diffOpen = openDiffs.has(p)
+                  const diff = diffMap[p]
+                  return (
+                    <div key={p} className="rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] overflow-hidden">
+                      <div className="flex items-center gap-1.5 px-2.5 py-1.5">
+                        <button
+                          type="button"
+                          onClick={() => toggleDiff(p)}
+                          className="flex-1 min-w-0 flex items-center gap-1.5 text-left"
+                          title={t('home.viewDiff')}
+                        >
+                          <Icon name="file" size={11} className="shrink-0 opacity-40" />
+                          <span className="flex-1 min-w-0 truncate text-[11px] font-mono text-[var(--text-secondary)]">{p}</span>
+                          <Icon
+                            name="chevron-right"
+                            size={10}
+                            className={`shrink-0 text-[var(--text-muted)] transition-transform ${diffOpen ? 'rotate-90' : ''}`}
+                          />
+                        </button>
+                        {isAccepted && (
+                          <span className="shrink-0 text-[9.5px] px-1.5 py-px rounded bg-[var(--success)]/10 text-[var(--success)]">
+                            {t('home.changeAccepted')}
+                          </span>
+                        )}
+                        {isReverted && (
+                          <span className="shrink-0 text-[9.5px] px-1.5 py-px rounded bg-[var(--danger)]/10 text-[var(--danger)]">
+                            {t('home.changeReverted')}
+                          </span>
+                        )}
+                        {!isReverted && (
+                          <span className="flex items-center gap-0.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => acceptFile(p)}
+                              disabled={busy === p || isAccepted}
+                              title={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
+                              className={`p-1 rounded-md transition-colors ${
+                                isAccepted
+                                  ? 'text-[var(--success)]'
+                                  : 'text-[var(--text-muted)] hover:text-[var(--success)] hover:bg-[var(--success)]/10'
+                              }`}
+                            >
+                              <Icon name="check" size={11} />
+                            </button>
+                            <span className="mx-0.5 w-px h-3 bg-[var(--border)] shrink-0" aria-hidden="true" />
+                            <button
+                              type="button"
+                              onClick={() => revertFile(p)}
+                              disabled={busy === p || isAccepted}
+                              title={t('home.revertChange')}
+                              className="p-1 ml-0.5 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
+                            >
+                              <Icon name="close" size={11} />
+                            </button>
+                          </span>
+                        )}
+                      </div>
+                      {diffOpen && !isReverted && (
+                        <div className="px-3 pb-2">
+                          {diffLoading === p ? (
+                            <div className="flex items-center gap-2 text-[10.5px] text-[var(--text-muted)] py-2">
+                              <span className="inline-block w-2.5 h-2.5 rounded-full border border-[var(--text-muted)] border-t-transparent animate-spin" />
+                              {t('common.loading')}
+                            </div>
+                          ) : diff ? (
+                            <pre className="rounded-lg bg-[var(--bg-window)] border border-[var(--border)] p-2 text-[10.5px] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-72 overflow-y-auto">
+                              <DiffText text={diff} />
+                            </pre>
+                          ) : null}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+                {errorMsg && <div className="px-3 py-1.5 text-[10.5px] text-[var(--danger)]">{errorMsg}</div>}
+              </div>
+              {/* 底部：全部接受 */}
+              {files.length > 1 && (
+                <div className="shrink-0 px-4 py-2.5 border-t border-[var(--border)] flex items-center justify-end">
+                  <button
+                    type="button"
+                    onClick={acceptAll}
+                    disabled={busy !== null}
+                    className="h-7 px-3.5 rounded-lg bg-[var(--success)]/12 text-[var(--success)] text-[11px] font-medium hover:bg-[var(--success)]/20 disabled:opacity-40 transition-colors"
+                  >
+                    {busy === '__all__' ? t('home.changesAccepting') : t('home.acceptAllChanges')}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   )
-}
+})
 
 /* ============ 流式回复（打字机效果 + 思考过程） ============ */
-export function StreamingMessage({ content, reasoning }: { content: string; reasoning: string }) {
+export const StreamingMessage = memo(function StreamingMessage({ content, reasoning, speed = 1 }: { content: string; reasoning: string; speed?: number }) {
   const { t } = useTranslation()
-  // 流式渲染节流：高频 delta 先缓存，每 60ms 才同步一次到渲染副本。
+  // 流式渲染节流：高频 delta 先缓存，按内容长度自适应间隔（短文本 60ms，长文本降频），
   // 避免每个 token 都触发重型 Markdown 全量解析（长回复时渲染跟不上会卡顿，显得响应慢）
   const [display, setDisplay] = useState({ content, reasoning })
+  // 节流（throttle）而非防抖：delta 到达后缓存最新值，距上次渲染超过间隔才刷新。
+  // 防抖（clearTimeout 重排）在 delta 间隔小于延迟时会不断重置计时器，
+  // 内容迟迟不渲染，直到流停顿才"跳"出一大段（快速流/本地模型场景明显）
+  const latestRef = useRef({ content, reasoning })
+  const rafRef = useRef<number | null>(null)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastFlushRef = useRef(0)
   useEffect(() => {
-    const timer = setTimeout(() => setDisplay({ content, reasoning }), 60)
-    return () => clearTimeout(timer)
+    latestRef.current = { content, reasoning }
+    // 速度倍率：0.5x=慢、1x=正常、2x=快、4x=极速（节流间隔 × 倍率 = 实际间隔）
+    const baseDelay = content.length > 8000 ? 220 : content.length > 3000 ? 130 : 60
+    const delay = Math.max(8, Math.round(baseDelay * speed))
+    if (performance.now() - lastFlushRef.current >= delay) {
+      lastFlushRef.current = performance.now()
+      setDisplay(latestRef.current)
+      return
+    }
+    // 间隔内到达的更新：rAF 合并到帧边界，再排一个尾随刷新（保证流停顿后内容不滞留）
+    if (rafRef.current == null) {
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null
+        if (timerRef.current == null) {
+          timerRef.current = setTimeout(() => {
+            timerRef.current = null
+            lastFlushRef.current = performance.now()
+            setDisplay(latestRef.current)
+          }, delay)
+        }
+      })
+    }
   }, [content, reasoning])
+  // 卸载时清理 rAF 与尾随计时器
+  useEffect(
+    () => () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current)
+      if (timerRef.current != null) clearTimeout(timerRef.current)
+    },
+    [],
+  )
   const shown = display
+  // 缓存 sanitizeToolMarkers + closeOpenFence 结果：节流渲染时避免重复正则处理长文本
+  const processedContent = useMemo(
+    () => closeOpenFence(sanitizeToolMarkers(shown.content)),
+    [shown.content],
+  )
   return (
-    <div className="flex gap-2.5 animate-fade-in-up">
-      <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shrink-0 mt-0.5 shadow-md shadow-[var(--accent)]/20">
+    <div className="flex gap-2.5 msg-row msg-role msg-role-agent">
+      <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--role-agent)] to-[#6d28d9] flex items-center justify-center shrink-0 mt-0.5 shadow-md shadow-[var(--role-agent)]/25">
         <Icon name="spark" size={13} white />
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 mb-1.5">
-          <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.agent')}</span>
-          <span className="text-[10px] text-[var(--text-muted)] flex items-center gap-1">
+          <span className="role-tag role-tag-agent">{t('home.agent')}</span>
+          <span className="text-[10px] text-[var(--text-muted)] flex items-center gap-1 tnum">
             <span className="inline-flex gap-0.5">
-              <span className="w-1 h-1 rounded-full bg-[var(--accent)] animate-bounce" style={{ animationDelay: '0ms' }} />
-              <span className="w-1 h-1 rounded-full bg-[var(--accent)] animate-bounce" style={{ animationDelay: '150ms' }} />
-              <span className="w-1 h-1 rounded-full bg-[var(--accent)] animate-bounce" style={{ animationDelay: '300ms' }} />
+              <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '0ms' }} />
+              <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '150ms' }} />
+              <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '300ms' }} />
             </span>
             {t('home.typing')}
           </span>
+          <span className="msg-timestamp ml-auto tnum">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
         </div>
         {shown.reasoning && <ThinkingBlock content={shown.reasoning} />}
         {shown.content.trim() ? (
           <div className="text-sm break-words leading-relaxed text-[var(--text-primary)]">
-            <Markdown>{sanitizeToolMarkers(shown.content)}</Markdown>
+            <Markdown streaming>{processedContent}</Markdown>
             <span className="typing-cursor" />
           </div>
         ) : (
@@ -338,10 +575,10 @@ export function StreamingMessage({ content, reasoning }: { content: string; reas
       </div>
     </div>
   )
-}
+})
 
 /* ============ 结构化错误卡片（chat-error 事件友好展示） ============ */
-export function ErrorCard({
+export const ErrorCard = memo(function ErrorCard({
   error,
   detail,
   onRetry,
@@ -363,8 +600,8 @@ export function ErrorCard({
   const showRetry = !detail || detail.retryable
   return (
     <div
-      className="rounded-xl border px-3.5 py-3 text-[12px]"
-      style={{ borderColor: `${color}55`, backgroundColor: `${color}1a`, color }}
+      className="msg-role task-failed px-3.5 py-3 text-[12px] animate-fade-in-up"
+      style={{ color }}
     >
       <div className="flex items-start gap-2">
         <Icon name="info" size={14} className="shrink-0 mt-0.5" />
@@ -393,11 +630,28 @@ export function ErrorCard({
       </div>
     </div>
   )
-}
+})
 
-/* ============ 空状态：未添加项目 ============ */
-export function EmptyState({ onAdd }: { onAdd: () => void }) {
+/* ============ 空状态：未添加项目 ============
+ * 顶部：欢迎 + 添加项目主 CTA
+ * 下方：3 个"快速操作"卡（导入会话/查看审计/打开成本页）—— 让新用户不用看完文档就能上手 */
+export const EmptyState = memo(function EmptyState({
+  onAdd,
+  onImport,
+  onAudit,
+  onCost,
+}: {
+  onAdd: () => void
+  onImport?: () => void
+  onAudit?: () => void
+  onCost?: () => void
+}) {
   const { t } = useTranslation()
+  const secondaryActions = [
+    onImport && { icon: 'file' as const, title: t('home.quickImport'), desc: t('home.quickImportDesc'), onClick: onImport },
+    onAudit && { icon: 'history' as const, title: t('home.quickAudit'), desc: t('home.quickAuditDesc'), onClick: onAudit },
+    onCost && { icon: 'receipt' as const, title: t('home.quickCost'), desc: t('home.quickCostDesc'), onClick: onCost },
+  ].filter((x): x is NonNullable<typeof x> => Boolean(x))
   return (
     <div className="h-full flex flex-col items-center justify-center text-center">
       <div className="relative mb-7">
@@ -410,16 +664,34 @@ export function EmptyState({ onAdd }: { onAdd: () => void }) {
       <p className="text-[13px] text-[var(--text-secondary)] mt-1.5 max-w-sm leading-relaxed">{t('home.welcomeDesc')}</p>
       <button
         onClick={onAdd}
-        className="mt-7 h-10 px-5 rounded-[10px] bg-[var(--accent)] text-white text-[13px] font-medium flex items-center gap-1.5 hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all shadow-lg shadow-[var(--accent)]/20"
+        className="mt-7 h-10 px-5 rounded-[10px] btn-primary text-[13px] font-medium flex items-center gap-1.5 active:scale-[0.98] transition-all"
       >
         <Icon name="plus" size={15} white /> {t('home.addProject')}
       </button>
+      {secondaryActions.length > 0 && (
+        <div className="mt-8 grid grid-cols-3 gap-2.5 w-full max-w-md animate-fade-in-up">
+          {secondaryActions.map((a, i) => (
+            <button
+              key={a.title}
+              onClick={a.onClick}
+              style={{ animationDelay: `${i * 60}ms` }}
+              className="group p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-md transition-all duration-200"
+            >
+              <div className="w-7 h-7 rounded-md bg-[var(--accent-soft)] flex items-center justify-center mb-1.5 group-hover:bg-[var(--accent)] transition-all">
+                <Icon name={a.icon} size={13} className="group-hover:[filter:brightness(0)_invert(1)]!" />
+              </div>
+              <div className="text-[12px] font-medium text-[var(--text-primary)]">{a.title}</div>
+              <div className="text-[10px] text-[var(--text-muted)] mt-0.5 leading-snug line-clamp-2">{a.desc}</div>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   )
-}
+})
 
 /* ============ 空状态：已选项目、无消息 ============ */
-export function ChatEmptyState({ onQuick }: { onQuick: (text: string) => void }) {
+export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuick: (text: string) => void }) {
   const { t } = useTranslation()
 
   const quickActions = [
@@ -440,6 +712,24 @@ export function ChatEmptyState({ onQuick }: { onQuick: (text: string) => void })
       title: t('home.quickPage'),
       desc: t('home.quickPageDesc'),
       prompt: t('home.quickPagePrompt'),
+    },
+    {
+      icon: 'language' as const,
+      title: t('home.quickTranslate'),
+      desc: t('home.quickTranslateDesc'),
+      prompt: t('home.quickTranslatePrompt'),
+    },
+    {
+      icon: 'receipt' as const,
+      title: t('home.quickCostCheck'),
+      desc: t('home.quickCostCheckDesc'),
+      prompt: t('home.quickCostCheckPrompt'),
+    },
+    {
+      icon: 'history' as const,
+      title: t('home.quickRecentTasks'),
+      desc: t('home.quickRecentTasksDesc'),
+      prompt: t('home.quickRecentTasksPrompt'),
     },
   ]
 
@@ -477,17 +767,19 @@ export function ChatEmptyState({ onQuick }: { onQuick: (text: string) => void })
         <span className="text-[11px] text-[var(--text-muted)]">{t('home.tryExamples')}</span>
         <button
           onClick={() => onQuick(t('home.example1'))}
-          className="px-3 py-1.5 rounded-full text-[11px] text-[var(--text-secondary)] bg-[var(--bg-card)] border border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
+          className="px-3 py-1.5 rounded-full text-[11px] text-[var(--text-secondary)] modern-card border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
         >
           {t('home.example1')}
         </button>
         <button
           onClick={() => onQuick(t('home.example2'))}
-          className="px-3 py-1.5 rounded-full text-[11px] text-[var(--text-secondary)] bg-[var(--bg-card)] border border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
+          className="px-3 py-1.5 rounded-full text-[11px] text-[var(--text-secondary)] modern-card border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
         >
           {t('home.example2')}
         </button>
       </div>
     </div>
   )
-}
+})
+
+

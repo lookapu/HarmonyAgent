@@ -10,6 +10,96 @@ pub struct Image {
     pub rgb: Vec<u8>,
 }
 
+// ---------- 最小 PNG 编码（纯色图标生成，供工程创建模板写 PNG 资源） ----------
+
+/// 生成一张纯色 PNG（8-bit RGB，zlib stored 块），用于创建工程时的图标占位。
+pub fn encode_solid_png(width: u32, height: u32, color: &[u8; 3]) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        return Err(format!("非法尺寸：{width}x{height}（支持 1-4096）"));
+    }
+    let data: Vec<u8> = (0..width * height).flat_map(|_| color.iter().copied()).collect();
+    // 每行 1 字节 filter（Sub=1）+ 行数据：纯色行对 Sub 滤波后全零
+    let mut raw = Vec::with_capacity(((width * 3 + 1) * height) as usize);
+    for y in 0..height {
+        let row = &data[(y * width * 3) as usize..((y + 1) * width * 3) as usize];
+        let mut filtered = Vec::with_capacity(row.len() + 1);
+        filtered.push(1u8); // Sub filter
+        for (i, &b) in row.iter().enumerate() {
+            let left = if i >= 3 { row[i - 3] } else { 0 };
+            filtered.push(b.wrapping_sub(left));
+        }
+        raw.extend_from_slice(&filtered);
+    }
+    let comp = zlib_stored(&raw);
+    let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+    png.extend_from_slice(&make_chunk(b"IHDR", &ihdr));
+    png.extend_from_slice(&make_chunk(b"IDAT", &comp));
+    png.extend_from_slice(&make_chunk(b"IEND", &[]));
+    Ok(png)
+}
+
+fn make_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut c = Vec::new();
+    c.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    c.extend_from_slice(kind);
+    c.extend_from_slice(data);
+    let crc = crc32(kind, data);
+    c.extend_from_slice(&crc.to_be_bytes());
+    c
+}
+
+fn crc32(kind: &[u8], data: &[u8]) -> u32 {
+    let mut crc = 0xffffffffu32;
+    for &b in kind.iter().chain(data.iter()) {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+// zlib 头 + 单个 stored deflate 块 + adler32
+fn zlib_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    let mut pos = 0;
+    loop {
+        let chunk = data.len().saturating_sub(pos).min(65535);
+        let last = if pos + chunk >= data.len() { 1u8 } else { 0 };
+        out.push(last);
+        let len = chunk as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(&data[pos..pos + chunk]);
+        pos += chunk;
+        if last == 1 {
+            break;
+        }
+    }
+    let adler = adler32(data);
+    out.extend_from_slice(&adler.to_be_bytes());
+    out
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &x in data {
+        a = (a + x as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+
 /// 从 PNG 字节解码出下采样后的 RGB 位图。
 /// `max_dim` 控制返回图的最大边长（等比缩小），用于降低质检计算量。
 pub fn decode_png(data: &[u8], max_dim: u32) -> Result<Image, String> {
@@ -420,8 +510,7 @@ mod tests {
     }
 
     fn make_png(w: u32, h: u32, color: &[u8; 3]) -> Vec<u8> {
-        let data: Vec<u8> = (0..w * h).flat_map(|_| color.iter().copied()).collect();
-        make_png_rgb(w, h, &data)
+        encode_solid_png(w, h, color).expect("编码应成功")
     }
 
     fn make_png_rgb(w: u32, h: u32, rgb: &[u8]) -> Vec<u8> {
@@ -446,60 +535,14 @@ mod tests {
         png
     }
 
-    fn make_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let mut c = Vec::new();
-        c.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        c.extend_from_slice(kind);
-        c.extend_from_slice(data);
-        let crc = crc32(kind, data);
-        c.extend_from_slice(&crc.to_be_bytes());
-        c
-    }
-
-    fn crc32(kind: &[u8], data: &[u8]) -> u32 {
-        let mut crc = 0xffffffffu32;
-        for &b in kind.iter().chain(data.iter()) {
-            crc ^= b as u32;
-            for _ in 0..8 {
-                if crc & 1 != 0 {
-                    crc = (crc >> 1) ^ 0xedb88320;
-                } else {
-                    crc >>= 1;
-                }
-            }
-        }
-        !crc
-    }
-
-    // zlib 头 + 单个 stored deflate 块 + adler32
-    fn zlib_stored(data: &[u8]) -> Vec<u8> {
-        let mut out = vec![0x78, 0x01];
-        let mut pos = 0;
-        loop {
-            let chunk = data.len().saturating_sub(pos).min(65535);
-            let last = if pos + chunk >= data.len() { 1u8 } else { 0 };
-            out.push(last);
-            let len = chunk as u16;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&(!len).to_le_bytes());
-            out.extend_from_slice(&data[pos..pos + chunk]);
-            pos += chunk;
-            if last == 1 {
-                break;
-            }
-        }
-        let adler = adler32(data);
-        out.extend_from_slice(&adler.to_be_bytes());
-        out
-    }
-
-    fn adler32(data: &[u8]) -> u32 {
-        let mut a = 1u32;
-        let mut b = 0u32;
-        for &x in data {
-            a = (a + x as u32) % 65521;
-            b = (b + a) % 65521;
-        }
-        (b << 16) | a
+    #[test]
+    fn encode_solid_roundtrip() {
+        // 编码出的纯色 PNG 应能被本模块解码器正确还原
+        let png = encode_solid_png(32, 32, &[12, 34, 56]).expect("编码成功");
+        let img = decode_png(&png, 64).expect("解码成功");
+        assert_eq!(img.width, 32);
+        assert_eq!(img.height, 32);
+        assert!(img.rgb.iter().all(|&b| b == 12 || b == 34 || b == 56));
+        assert_eq!(&img.rgb[0..3], &[12, 34, 56]);
     }
 }

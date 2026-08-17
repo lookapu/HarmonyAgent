@@ -8,17 +8,23 @@
 //!
 //! 预算按会话记录、任务开始时重置：同一次任务的工具调用（含子 Agent）共享一份预算，
 //! 避免多子 Agent 并行时各自打转。
+//!
+//! 各项阈值（总次数/重操作次数/打转检测）的默认值定义在 agent_limits，
+//! 运行时以 agent_limits::current() 动态配置为准（设置页可调，0/-1 表示不限制），
+//! 此处常量仅作默认值与测试引用。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// 单任务工具调用总预算（兜底护栏：正常任务几十上百次调用足够，仅防极端失控烧 token）
-pub const TASK_TOOL_CALL_LIMIT: usize = 300;
-/// 重操作（build/deploy）单任务最多调用次数（有副作用且耗时，反复构建/部署无意义）
-pub const HEAVY_TOOL_CALL_LIMIT: usize = 2;
-/// 打转检测阈值：同一 (工具, 参数) 连续重复 N 次判定打转（正常任务不会触发）
-pub const REPEAT_CALL_LIMIT: usize = 5;
+/// 单任务工具调用总预算（默认值；运行时以 agent_limits 配置为准）
+pub const TASK_TOOL_CALL_LIMIT: usize = crate::services::agent_limits::DEFAULT_TOOL_CALL_LIMIT as usize;
+/// 重操作（build/deploy）单任务最多调用次数（默认值；运行时以 agent_limits 配置为准）。
+/// 取值需覆盖“创建→构建→部署”一轮闭环的合理调用数（run_command 也计入），
+/// 真正的死循环由 REPEAT_CALL_LIMIT 与失败黑名单兜底。
+pub const HEAVY_TOOL_CALL_LIMIT: usize = crate::services::agent_limits::DEFAULT_HEAVY_TOOL_CALL_LIMIT as usize;
+/// 打转检测阈值：同一 (工具, 参数) 连续重复 N 次判定打转（默认值；运行时以 agent_limits 配置为准）
+pub const REPEAT_CALL_LIMIT: usize = crate::services::agent_limits::DEFAULT_REPEAT_CALL_LIMIT as usize;
 /// 计为重操作（单任务调用次数受限）的工具名：有副作用且耗时，反复执行无意义
 const GATED_TOOLS: &[&str] = &["build_project", "deploy", "run_command"];
 /// 需要并发信号量互斥的工具：重操作 + 写工作区操作（并发会踩踏 build 目录/.ohpm/暂存区）
@@ -69,29 +75,39 @@ pub fn reset_task_budget(conversation_id: &str) {
 
 /// 工具调用前检查预算：总次数 / 重操作次数任一超限即拒绝继续；
 /// 连续重复调用（同一工具同一参数）达到阈值判定打转，引导模型换策略或总结。
+/// 各项阈值取自 agent_limits 动态配置（0/-1 表示不限制）。
 /// 返回 Err 时调用方应停止工具循环（错误反馈给模型，防止打转）
 pub fn check_task_budget(conversation_id: &str, tool: &str, args: &str) -> Result<(), String> {
+    let limits = crate::services::agent_limits::current();
     if let Ok(map) = BUDGETS.lock() {
         if let Some(b) = map.as_ref().and_then(|m| m.get(conversation_id)) {
-            if b.calls >= TASK_TOOL_CALL_LIMIT {
-                return Err(format!(
-                    "本任务工具调用已达上限（{TASK_TOOL_CALL_LIMIT} 次），请停止调用工具并直接总结结果"
-                ));
+            if let Some(limit) = limits.tool_calls() {
+                if b.calls >= limit {
+                    return Err(format!(
+                        "本任务工具调用已达上限（{limit} 次），请停止调用工具并直接总结结果"
+                    ));
+                }
             }
-            if GATED_TOOLS.contains(&tool) && b.heavy_calls >= HEAVY_TOOL_CALL_LIMIT {
-                return Err(format!(
-                    "本任务 {tool} 已调用 {HEAVY_TOOL_CALL_LIMIT} 次，请勿反复构建/部署，直接总结结果"
-                ));
+            if GATED_TOOLS.contains(&tool) {
+                if let Some(limit) = limits.heavy_tool_calls() {
+                    if b.heavy_calls >= limit {
+                        return Err(format!(
+                            "本任务 {tool} 已调用 {limit} 次，请勿反复构建/部署，直接总结结果"
+                        ));
+                    }
+                }
             }
             // 打转检测：连续重复调用同一工具同一参数
             let same = b.last_call.as_ref().is_some_and(|(t, a)| {
                 t == tool && a == args.trim()
             });
             let repeat = if same { b.repeat_count + 1 } else { 0 };
-            if repeat >= REPEAT_CALL_LIMIT {
-                return Err(format!(
-                    "检测到连续 {REPEAT_CALL_LIMIT} 次重复调用（{tool} 参数相同），疑似打转无进展，请停止重复调用，直接总结结果或改用其他策略"
-                ));
+            if let Some(limit) = limits.repeat_calls() {
+                if repeat >= limit {
+                    return Err(format!(
+                        "检测到连续 {limit} 次重复调用（{tool} 参数相同），疑似打转无进展，请停止重复调用，直接总结结果或改用其他策略"
+                    ));
+                }
             }
         }
     }
@@ -171,12 +187,13 @@ mod tests {
     #[test]
     fn test_heavy_tool_limit() {
         setup("c3");
-        // 重操作 2 次后第三次被拒
-        record_tool_call("c3", "build_project", "{\"mode\":\"debug\"}");
-        record_tool_call("c3", "build_project", "{\"mode\":\"debug\"}");
+        // 重操作 6 次后第 7 次被拒（放宽后覆盖一轮“创建→构建→部署”的合理调用数）
+        for _ in 0..HEAVY_TOOL_CALL_LIMIT {
+            record_tool_call("c3", "build_project", "{\"mode\":\"debug\"}");
+        }
         let err = check_task_budget("c3", "build_project", "{\"mode\":\"debug\"}").unwrap_err();
         assert!(err.contains("build_project"));
-        assert!(err.contains("2 次"));
+        assert!(err.contains("6 次"));
         // 但轻量工具仍可用（总预算未满）
         assert!(check_task_budget("c3", "list_devices", "").is_ok());
     }

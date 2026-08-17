@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export interface Project {
   id: string
@@ -20,6 +21,8 @@ export interface Project {
   workspace_modules: string | null
   /** 会话"鸿蒙主工程"（混合工作区中实际进行鸿蒙开发的子工程：相对项目根或绝对路径）；空=用项目根本身 */
   harmony_project_path: string | null
+  /** 该项目的会话数量（列表接口填充） */
+  conversation_count: number
 }
 
 export interface Conversation {
@@ -31,8 +34,18 @@ export interface Conversation {
   system_prompt_version: number | null
   is_pinned: boolean
   archived: boolean
+  /** 标签：逗号分隔字符串（如 "bug,refactor,urgent"），空串=无标签 */
+  tags?: string
+  /** 工作模式：'local'（项目主仓库）| 'worktree'（绑定的 worktree 目录） */
+  work_mode?: string
+  /** worktree 模式时的 worktree 绝对路径（本地模式为 null） */
+  worktree_path?: string | null
+  /** worktree 模式时的分支名（列表徽标展示） */
+  worktree_branch?: string | null
   created_at: number
   updated_at: number
+  /** 消息数（fork 等场景后端附带返回；列表接口可能不填充） */
+  messages_count?: number
 }
 
 export interface ChatMessage {
@@ -153,6 +166,22 @@ export interface PendingAsk {
 export const getAsk = (conversationId: string) =>
   invoke<PendingAsk | null>('get_ask', { conversationId })
 
+/** 会话待确认项（会话列表角标 + 切回会话恢复弹窗）：审批 / 计划 / 提问三类 */
+export interface PendingConfirmation {
+  conversation_id: string
+  kind: 'approval' | 'plan' | 'ask'
+  request_id: string
+  tool: string | null
+  args: string | null
+  plan: string | null
+  question: string | null
+  options: string[] | null
+}
+
+/** 查询项目内所有会话的待确认项（审批/计划/提问） */
+export const listPendingConfirmations = (projectId: string) =>
+  invoke<PendingConfirmation[]>('list_pending_confirmations', { projectId })
+
 /** 回复 Agent 的提问（answer 为空串表示跳过） */
 export const resolveAskUser = (requestId: string, answer: string) =>
   invoke<void>('resolve_ask_user', { requestId, answer })
@@ -186,6 +215,8 @@ export interface SessionEvent {
   seq: number
   event_type: string
   payload: Record<string, unknown>
+  /** 任务级 Trace ID：一次任务（一轮用户消息触发的完整执行）的全部事件共享同一 ID；无任务上下文的事件为 null */
+  trace_id: string | null
   created_at: number
 }
 
@@ -295,12 +326,12 @@ export const setWorkspaceModules = (projectId: string, modules: WorkspaceModule[
   }
   
   /** 查询项目的"鸿蒙主工程"解析结果 */
-  export const getHarmonyRoot = (projectId: string) =>
-    invoke<HarmonyRootInfo>('get_harmony_root', { projectId })
+  export const getHarmonyRoot = (projectId: string, root?: string) =>
+    invoke<HarmonyRootInfo>('get_harmony_root', { projectId, root: root ?? null })
   
   /** 设置会话"鸿蒙主工程"（空串=清除，回退项目根本身）；返回更新后的项目 */
-  export const setHarmonyProjectPath = (projectId: string, path: string) =>
-    invoke<Project>('set_harmony_project_path', { projectId, path })
+  export const setHarmonyProjectPath = (projectId: string, path: string, root?: string) =>
+    invoke<Project>('set_harmony_project_path', { projectId, path, root: root ?? null })
 
 /** 解析 project.workspace_modules JSON 字符串为数组 */
 export const parseWorkspaceModules = (json: string | null | undefined): WorkspaceModule[] => {
@@ -397,11 +428,42 @@ export const projectScopedCounts = () =>
 export const listConversations = (projectId: string, includeArchived = false, keyword = '') =>
   invoke<Conversation[]>('list_conversations', { projectId, includeArchived, keyword })
 
-export const createConversation = (projectId: string, title?: string) =>
-  invoke<Conversation>('create_conversation', { projectId, title })
+/** 按 id 查询单个会话（不区分归档状态）：搜索命中跳转兜底用，查不到返回 null */
+export const getConversation = (conversationId: string) =>
+  invoke<Conversation | null>('get_conversation', { id: conversationId })
+
+export interface NewConversationWorktree {
+  /** 'local' | 'worktree' */
+  work_mode?: string
+  worktree_path?: string
+  worktree_branch?: string
+}
+
+export const createConversation = (projectId: string, title?: string, worktree?: NewConversationWorktree) =>
+  invoke<Conversation>('create_conversation', {
+    projectId,
+    title,
+    workMode: worktree?.work_mode ?? null,
+    worktreePath: worktree?.worktree_path ?? null,
+    worktreeBranch: worktree?.worktree_branch ?? null,
+  })
+
+/** 会话 Fork：从既有会话派生新会话（复制截至 untilMessageId 含该条的消息与事件；缺省全部） */
+export const forkConversation = (fromId: string, untilMessageId?: string) =>
+  invoke<Conversation>('fork_conversation', { fromId, untilMessageId: untilMessageId ?? null })
 
 export const listMessages = (conversationId: string) =>
   invoke<ChatMessage[]>('list_messages', { conversationId })
+
+/** 消息分页结果（messages 正序，hasMore 表示游标之前是否还有更早消息） */
+export interface MessagePage {
+  messages: ChatMessage[]
+  hasMore: boolean
+}
+
+/** 游标分页加载消息：beforeId 为空返回最近 limit 条，否则返回该消息之前（更早）的 limit 条 */
+export const listMessagesPage = (conversationId: string, beforeId?: string, limit?: number) =>
+  invoke<MessagePage>('list_messages_page', { conversationId, beforeId: beforeId ?? null, limit: limit ?? 60 })
 
 /** 消息全文搜索命中 */
 export interface MessageSearchHit {
@@ -412,11 +474,18 @@ export interface MessageSearchHit {
   created_at: number
   snippet: string
   match_start: number
+  /** 所属项目（跨项目搜索时填充，单项目搜索为 undefined） */
+  project_id?: string
+  project_name?: string
 }
 
 /** 在项目内（或指定会话）全文检索消息内容，返回命中片段 */
 export const searchMessages = (projectId: string, query: string, conversationId?: string) =>
   invoke<MessageSearchHit[]>('search_messages', { projectId, query, conversationId: conversationId ?? null })
+
+/** 跨项目全文检索：搜所有项目，结果带 project_id/project_name 用于分组展示 */
+export const searchMessagesAllProjects = (query: string) =>
+  invoke<MessageSearchHit[]>('search_messages_all_projects', { query })
 
 export const sendMessage = (conversationId: string, content: string) =>
   invoke<ChatMessage>('send_message', { conversationId, content })
@@ -493,6 +562,22 @@ export const archiveConversation = (id: string, archived: boolean) =>
 export const setConversationModel = (id: string, modelId: string) =>
   invoke<Conversation>('update_conversation', { id, isPinned: null, archived: null, modelId })
 
+/** 会话标签更新（覆盖；空串清除；后端自动去重 + trim + 限制 10 个） */
+export const setConversationTags = (id: string, tags: string) =>
+  invoke<Conversation>('update_conversation', { id, isPinned: null, archived: null, modelId: null, tags })
+
+/** 按标签筛选会话（项目内） */
+export const listConversationsByTag = (projectId: string, tag: string, includeArchived = false) =>
+  invoke<Conversation[]>('list_conversations_by_tag', { projectId, tag, includeArchived })
+
+/** 列出项目下所有出现过的标签 + 频次（按频次倒序），用于标签筛选下拉 */
+export interface TagCount {
+  tag: string
+  count: number
+}
+export const listConversationTags = (projectId: string) =>
+  invoke<TagCount[]>('list_conversation_tags', { projectId })
+
 export const deleteConversation = (id: string) =>
   invoke<void>('delete_conversation', { id })
 
@@ -502,19 +587,67 @@ export const getGitBranches = (projectId: string) =>
 export const switchGitBranch = (projectId: string, branch: string) =>
   invoke<GitBranchInfo>('switch_git_branch', { projectId, branch })
 
-export const buildProjectIndex = (projectId: string) =>
-  invoke<FileTreeNode>('build_project_index', { projectId })
+/** 从会话推导文件操作根目录：worktree 模式返回 worktree_path，否则 undefined（后端回退项目主路径） */
+export const conversationRoot = (
+  conv?: { work_mode?: string; worktree_path?: string | null } | null,
+): string | undefined =>
+  conv?.work_mode === 'worktree' && conv.worktree_path ? conv.worktree_path : undefined
+
+export const buildProjectIndex = (projectId: string, root?: string) =>
+  invoke<FileTreeNode>('build_project_index', { projectId, root: root ?? null })
+
+/** 文件树索引进度/完成事件 payload */
+export interface FileTreeIndexProgress {
+  projectId: string
+  scanned: number
+}
+
+/** 监听文件树全量索引构建进度（后台扫描已扫描项数） */
+export function onFileTreeIndexProgress(cb: (p: FileTreeIndexProgress) => void): Promise<UnlistenFn> {
+  return listen<FileTreeIndexProgress>('file-tree-index-progress', (e) => cb(e.payload))
+}
+
+/** 监听文件树全量索引构建完成 */
+export function onFileTreeIndexDone(cb: (p: FileTreeIndexProgress) => void): Promise<UnlistenFn> {
+  return listen<FileTreeIndexProgress>('file-tree-index-done', (e) => cb(e.payload))
+}
 
 export const getProjectFileTree = (projectId: string) =>
   invoke<FileTreeNode | null>('get_project_file_tree', { projectId })
 
 /** 读取单层目录内容（文件树懒加载：根目录 → 展开时逐级按需请求） */
-export const listProjectDir = (projectId: string, path: string) =>
-  invoke<FileTreeNode[]>('list_project_dir', { projectId, path })
+export const listProjectDir = (projectId: string, path: string, root?: string) =>
+  invoke<FileTreeNode[]>('list_project_dir', { projectId, path, root: root ?? null })
 
-/** 读取项目内文件文本内容（UTF-8，≤5MB），供预览面板使用 */
-export const readProjectFile = (projectId: string, path: string) =>
-  invoke<string>('read_project_file', { projectId, path })
+/** 文件搜索结果项（仅文件名匹配，不含目录名） */
+export interface FileSearchHit {
+  name: string
+  /** 相对项目根的路径（正斜杠） */
+  path: string
+}
+
+/** 按文件名（不含目录路径）不区分大小写子串搜索，最多返回 limit 条；仅匹配文件名，目录名不参与匹配 */
+export const searchProjectFiles = (projectId: string, query: string, root?: string, limit = 200) =>
+  invoke<FileSearchHit[]>('search_project_files', { projectId, query, root: root ?? null, limit })
+
+/** 预览读取结果：content 为渲染文本；truncated 表示是否因过大截断；totalChars 为截断前总字符数 */
+export interface PreviewResult {
+  content: string
+  truncated: boolean
+  totalChars?: number
+}
+
+/** 读取项目内文件内容（文本 ≤5MB 完整返回；大文件/文档智能截断保留头尾），供预览面板使用 */
+export const readProjectFile = (projectId: string, path: string, root?: string) =>
+  invoke<PreviewResult>('read_project_file', { projectId, path, root: root ?? null })
+
+/** 预览窗口下载：复制项目内文件到用户选择的保存位置（返回字节数） */
+export const saveProjectFile = (projectId: string, path: string, dest: string, root?: string) =>
+  invoke<number>('save_project_file', { projectId, path, dest, root: root ?? null })
+
+/** 预览窗口删除：把项目内文件移入系统回收站（Windows/macOS 可恢复） */
+export const deleteProjectFile = (projectId: string, path: string, root?: string) =>
+  invoke<string>('delete_project_file', { projectId, path, root: root ?? null })
 
 /* ============ 项目记忆（Memory） ============ */
 
@@ -555,6 +688,21 @@ export interface ToolStat {
 
 export const listToolStats = (projectId: string) =>
   invoke<ToolStat[]>('list_tool_stats', { projectId })
+
+/** 全部工具 → task_group 映射（[75] 工具面板按任务分组折叠 UI） */
+export const listToolGroups = () => invoke<Array<[string, string]>>('list_tool_groups')
+
+/** 工具 token 消耗排行（[69]：request_logs.tool_name 按工具聚合，代理链路口径） */
+export interface ToolTokenStat {
+  tool_name: string
+  request_count: number
+  input_tokens: number
+  output_tokens: number
+  total_cost_cny: number
+}
+
+export const listToolTokenStats = (days: number) =>
+  invoke<ToolTokenStat[]>('list_tool_token_stats', { days })
 
 /* ============ 消息反馈（点赞/点踩） ============ */
 

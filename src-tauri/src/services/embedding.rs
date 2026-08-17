@@ -21,7 +21,8 @@
 /// 向量维度（bge-small-zh-v1.5 = 512）
 pub const EMBED_DIM: usize = 512;
 
-/// L2 归一化（余弦相似度等价）
+/// L2 归一化（余弦相似度等价）；未启用 embedding feature 时暂无调用方
+#[cfg_attr(not(feature = "embedding"), allow(dead_code))]
 fn l2_normalize(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm <= f32::EPSILON {
@@ -57,7 +58,9 @@ pub fn from_f32_le_bytes(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// 单个查询向量与某条存储向量的余弦相似度（两者均已 L2 归一化 → 点积）
+/// 单个查询向量与某条存储向量的余弦相似度（两者均已 L2 归一化 → 点积）；
+/// 未启用 embedding feature 时暂无调用方
+#[cfg_attr(not(feature = "embedding"), allow(dead_code))]
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useProjectStore } from '../../stores/projectStore'
 import type { MessageVersion, ChatMessage, MemoryDraft } from '../../api/project'
@@ -34,7 +34,7 @@ export function FeedbackDialog({ onSubmit, onCancel }: { onSubmit: (reason?: str
           onChange={(e) => setReason(e.target.value)}
           placeholder={t('home.feedbackPlaceholder')}
           rows={3}
-          className="mt-3 w-full resize-none rounded-lg bg-[var(--bg-card)] border border-[var(--border)] px-3 py-2 text-[12px] outline-none focus:border-[var(--accent)] placeholder:text-[var(--text-muted)]"
+          className="mt-3 w-full resize-none rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[12px] outline-none focus:border-[var(--accent)] placeholder:text-[var(--text-muted)]"
         />
         <div className="flex items-center justify-end gap-2 mt-4">
           <button
@@ -66,14 +66,15 @@ export function VersionDiffDialog({
   onClose: () => void
 }) {
   const { t } = useTranslation()
-  const versions = useProjectStore((s) => s.versionMap[userMessageId] ?? [])
+  // ⚠️ ?? [] 必须在 selector 外（否则无限重渲染，见 Home.tsx PinnedBar 注释）
+  const versions = useProjectStore((s) => s.versionMap[userMessageId]) ?? []
   const [selected, setSelected] = useState<MessageVersion | null>(versions[0] ?? null)
   if (!selected) {
     return (
       <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
         <div className="w-[560px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
           <p className="text-[12px] text-[var(--text-muted)]">{t('home.noVersions')}</p>
-          <button onClick={onClose} className="mt-3 h-8 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px]">
+          <button onClick={onClose} className="mt-3 h-8 px-4 rounded-lg btn-primary text-[12px]">
             {t('home.close')}
           </button>
         </div>
@@ -112,7 +113,7 @@ export function VersionDiffDialog({
             {t('home.versionCurrent')}
           </span>
         </div>
-        <div className="mt-3 flex-1 min-h-0 overflow-y-auto rounded-xl bg-[var(--bg-card)] border border-[var(--border)] p-3 text-[12px] leading-relaxed whitespace-pre-wrap break-words">
+        <div className="mt-3 flex-1 min-h-0 overflow-y-auto rounded-xl modern-card border-[var(--border)] p-3 text-[12px] leading-relaxed whitespace-pre-wrap break-words">
           {changes.map((ch, i) => {
             const cls = ch.added
               ? 'bg-[var(--success)]/15 text-[var(--success)]'
@@ -174,7 +175,7 @@ export function MemoryDraftDialog({
               {categories.find(([v]) => v === draft.category)?.[1] ?? draft.category}
             </span>
           </div>
-          <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border)] p-3 max-h-52 overflow-y-auto">
+          <div className="rounded-xl modern-card border-[var(--border)] p-3 max-h-52 overflow-y-auto">
             <p className="text-[12px] leading-relaxed text-[var(--text-primary)] whitespace-pre-wrap">{draft.content}</p>
           </div>
         </div>
@@ -187,7 +188,7 @@ export function MemoryDraftDialog({
           </button>
           <button
             onClick={onConfirm}
-            className="h-8 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all"
+            className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all"
           >
             {t('home.memoryDraftSave')}
           </button>
@@ -230,7 +231,7 @@ export function EditMessageDialog({
           value={value}
           onChange={(e) => setValue(e.target.value)}
           rows={6}
-          className="mt-3 w-full resize-y rounded-xl bg-[var(--bg-card)] border border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[13px] leading-relaxed"
+          className="mt-3 w-full resize-y rounded-xl modern-card border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[13px] leading-relaxed"
           placeholder={t('home.editMessagePlaceholder')}
         />
         <div className="flex items-center justify-end gap-2 mt-4">
@@ -243,7 +244,7 @@ export function EditMessageDialog({
           <button
             onClick={() => onSubmit(value.trim())}
             disabled={!value.trim()}
-            className="h-8 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all disabled:opacity-50"
+            className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all disabled:opacity-50"
           >
             {t('home.editMessageSave')}
           </button>
@@ -254,6 +255,8 @@ export function EditMessageDialog({
 }
 
 /* ============ Rules 编辑弹窗：全局指令 + 项目级 rules（保存后注入 system_prompt） ============ */
+import { RULE_TEMPLATES, type RuleTemplate, type RuleTemplateScope } from '../../data/ruleTemplates'
+
 export function RulesDialog({
   tab,
   setTab,
@@ -276,6 +279,38 @@ export function RulesDialog({
   onClose: () => void
 }) {
   const { t } = useTranslation()
+  // 应用模板浮层：null = 关闭；string = 待确认的模板 id
+  const [pendingTemplate, setPendingTemplate] = useState<RuleTemplate | null>(null)
+
+  // 当前 tab 的可套用模板（按 category 过滤）
+  const availableTemplates = useMemo(() => {
+    return RULE_TEMPLATES.filter((tp) => tp.scope === 'both' || tp.scope === (tab as RuleTemplateScope))
+  }, [tab])
+  // 按 category 分组
+  const groupedTemplates = useMemo(() => {
+    const map = new Map<string, RuleTemplate[]>()
+    for (const tp of availableTemplates) {
+      const arr = map.get(tp.category) ?? []
+      arr.push(tp)
+      map.set(tp.category, arr)
+    }
+    return Array.from(map.entries())
+  }, [availableTemplates])
+
+  // 应用模板：替换 or 追加
+  const applyTemplate = (tp: RuleTemplate, mode: 'append' | 'replace') => {
+    const setter = tab === 'global' ? setGlobalText : setProjectText
+    const current = tab === 'global' ? globalText : projectText
+    if (mode === 'replace') {
+      setter(tp.content)
+    } else {
+      // 追加：已有内容则加换行分隔
+      const sep = current.trim() ? '\n\n' : ''
+      setter(current + sep + tp.content)
+    }
+    setPendingTemplate(null)
+  }
+
   return (
     <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
       <div className="w-[620px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
@@ -289,7 +324,7 @@ export function RulesDialog({
           <button
             onClick={() => setTab('global')}
             className={`h-7 px-3 rounded-md text-[12px] font-medium transition-colors ${
-              tab === 'global' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              tab === 'global' ? 'tab-active' : 'tab-inactive'
             }`}
           >
             {t('home.rulesGlobal')}
@@ -297,17 +332,42 @@ export function RulesDialog({
           <button
             onClick={() => setTab('project')}
             className={`h-7 px-3 rounded-md text-[12px] font-medium transition-colors ${
-              tab === 'project' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              tab === 'project' ? 'tab-active' : 'tab-inactive'
             }`}
           >
             {t('home.rulesProject')}
           </button>
         </div>
+        {/* 模板选择下拉：按 category 分组，点击进入确认模式 */}
+        <div className="mt-3 modern-card rounded-lg p-2 max-h-[120px] overflow-y-auto">
+          <p className="text-[10.5px] font-medium text-[var(--text-muted)] px-1.5 py-1 uppercase tracking-wider">
+            {t('home.ruleTemplate')}
+          </p>
+          {groupedTemplates.map(([cat, items]) => (
+            <div key={cat} className="mt-1">
+              <p className="text-[10px] text-[var(--text-muted)] px-1.5 py-0.5">
+                {t(`home.ruleTemplateCategory.${cat}`)}
+              </p>
+              <div className="flex flex-wrap gap-1 px-1">
+                {items.map((tp) => (
+                  <button
+                    key={tp.id}
+                    onClick={() => setPendingTemplate(tp)}
+                    title={t(`${tp.i18nKey}.desc`)}
+                    className="px-2 py-0.5 rounded-md text-[11px] bg-[var(--bg-card)] text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] border border-[var(--border)] transition-colors"
+                  >
+                    {t(tp.i18nKey)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
         <textarea
           value={tab === 'global' ? globalText : projectText}
           onChange={(e) => (tab === 'global' ? setGlobalText(e.target.value) : setProjectText(e.target.value))}
           rows={14}
-          className="mt-3 w-full resize-y rounded-xl bg-[var(--bg-card)] border border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[13px] leading-relaxed font-mono"
+          className="mt-3 w-full resize-y rounded-xl modern-card border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[13px] leading-relaxed font-mono"
           placeholder={
             tab === 'global'
               ? t('home.rulesGlobalPlaceholder')
@@ -326,13 +386,52 @@ export function RulesDialog({
             <button
               onClick={onSave}
               disabled={saving}
-              className="h-8 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all disabled:opacity-50"
+              className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all disabled:opacity-50"
             >
               {saving ? t('home.rulesSaving') : t('home.rulesSave')}
             </button>
           </div>
         </div>
       </div>
+
+      {/* 模板套用确认浮层：避免点一下就覆盖用户的现有内容 */}
+      {pendingTemplate && (
+        <div className="cmdk-backdrop" onClick={() => setPendingTemplate(null)}>
+          <div
+            className="w-[420px] max-w-[90vw] rounded-2xl glass-card p-4 animate-modal-in"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="text-[13px] font-semibold mb-1">{t('home.ruleTemplateConfirmTitle')}</p>
+            <p className="text-[12px] text-[var(--text-secondary)] mb-3">
+              {t(pendingTemplate.i18nKey)} — {t('home.ruleTemplateConfirmBody')}
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setPendingTemplate(null)}
+                className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                {t('home.cancel')}
+              </button>
+              <button
+                onClick={() => applyTemplate(pendingTemplate, 'append')}
+                className="h-8 px-3 rounded-lg btn-ghost text-[12px] transition-colors"
+              >
+                {t('home.ruleTemplateConfirmAppend')}
+              </button>
+              <button
+                onClick={() => applyTemplate(pendingTemplate, 'replace')}
+                className="h-8 px-3 rounded-lg btn-primary text-[12px] transition-all"
+              >
+                {t('home.ruleTemplateConfirmReplace')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
+
+
+
+

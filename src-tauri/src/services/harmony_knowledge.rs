@@ -1,8 +1,8 @@
-//! 鸿蒙开发常见错误知识库（按需注入，不常驻 system prompt）。
+//! 鸿蒙开发高频坑知识库。
 //!
-//! 目的：Agent 改代码/修 bug 时，遇到高频鸿蒙报错能直接给出"根因 + 正确写法"，
-//! 而不是让模型凭通用 TS 经验猜测（Stage 模型、ArkTS 严格模式、资源引用等有很多
-//! 与普通 Web/TS 不同的约束）。为节省 token，只在出现对应错误时按类别附加。
+//! 用途一（常驻）：鸿蒙工程对话首轮即通过 format_all_for_prompt 全量注入 system prompt，
+//! 让 Agent 写代码/配置前就掌握正确写法；用途二（按需）：构建/运行错误出现时按关键词
+//! 匹配附加根因与修复。条目必须是经实际构建/运行验证过的正确写法，禁止臆造版本号/API。
 
 /// 一条知识条目：关键词匹配 + 简短根因 + 修复要点。
 pub struct KnowledgeEntry {
@@ -74,6 +74,36 @@ const ENTRIES: &[KnowledgeEntry] = &[
         title: "module.json5 / Ability 配置",
         cause: "Ability 必须在 module.json5 的 abilities 数组注册，且 srcEntry 指向的类存在并导出；mainElement 要与 Ability 名一致。",
         fix: "检查 srcEntry 路径（如 './ets/entryability/EntryAbility.ets'）、name、export default class、@Entry 装饰器；修改后 clean 再构建。",
+    },
+    KnowledgeEntry {
+        keywords: &["compatiblesdkversion", "00306042", "00303038", "schema validate", "configuration error", "specification limit", "targetsdkversion", "compilesdkversion", "api level is 10", "must be string"],
+        title: "SDK 版本字段格式（hvigor 00306042/00303038）",
+        cause: "HarmonyOS 配置模式下 API 10 及以上，build-profile.json5 的 compileSdkVersion/compatibleSdkVersion/targetSdkVersion 必须写成 \"平台版本(API版本)\" 字符串（如 \"6.1.1(24)\"），裸数字 \"24\" 不合法；API 9 及以下可写数字。",
+        fix: "写法：\"compatibleSdkVersion\": \"6.1.1(24)\"、\"targetSdkVersion\": \"6.1.1(24)\"。平台版本与 API 必须取自本机实际安装的 SDK：读 DEVECO_SDK_HOME（或 DevEco Studio 内置 SDK）下 default/sdk-pkg.json 的 platformVersion 与 apiVersion 字段，二者必须匹配（如 5.0.0 平台=API 12、6.1.1 平台=API 24），禁止臆造组合。",
+    },
+    KnowledgeEntry {
+        keywords: &["00303083", "do not match", "platform version", "configured sdk version does not exist", "sdk version"],
+        title: "平台版本与 API 版本不匹配（hvigor 00303083）",
+        cause: "compatibleSdkVersion 的 \"平台版本(API版本)\" 组合在本机 SDK 中不存在（如 \"5.0.0(24)\"：5.0.0 平台只对应 API 12），hvigor 报 00303083 Configuration Error。",
+        fix: "读 DEVECO_SDK_HOME 或 DevEco Studio 内置 SDK 的 default/sdk-pkg.json，用其中的 platformVersion 与 apiVersion 组合（如 \"6.1.1(24)\"）；也可直接参考本机可正常构建的鸿蒙工程（如 D:\\DevEcoStudioProjects 下用户工程的 build-profile.json5 配置）。",
+    },
+    KnowledgeEntry {
+        keywords: &["unsigned", "signingconfigs", "signhap", "hap install", "install bundle failed", "signature", "provision profile", "signed.hap"],
+        title: "真机安装必须签名（signingConfigs）",
+        cause: "hvigor 默认产物 entry-default-unsigned.hap 未签名，hdc install 会因签名校验失败无法安装；签名材料（cer/p12/p7b）与 provisioning profile 绑定 bundleName 与设备，profile 不匹配会签名失败。",
+        fix: "在 build-profile.json5 的 signingConfigs 配置 material（certpath/storeFile/profile/keyAlias/signAlg，密码可为 DevEco 加密格式 0000001B 开头，hvigor 直接支持）；签名材料的 bundleName 必须与 AppScope/app.json5 的 bundleName 一致；可复用 ~/.ohos/config 下已有的签名材料，或让用户在 DevEco Studio 自动签名。",
+    },
+    KnowledgeEntry {
+        keywords: &["media", "app_icon", "icon", "png", "resources", "图标", "资源缺失", "resource not found", "cannot find resource", "image resource"],
+        title: "鸿蒙工程图标资源必须真实存在（$media:icon / $media:app_icon）",
+        cause: "AppScope/app.json5 的 icon 引用 $media:app_icon、entry 的 module.json5 的 abilities[].icon 引用 $media:icon 时，必须存在对应 PNG 文件；创建工程若只写了引用而没放图片（如 media 目录仅 .gitkeep），构建报图标资源缺失。",
+        fix: "创建工程时同步创建 AppScope/resources/base/media/app_icon.png 与 entry/src/main/resources/base/media/icon.png（尺寸建议 1024x1024 / 512x512，PNG 格式，可由代码生成纯色底图），并确认 module.json5 与 app.json5 中引用名称与文件名一致；修改资源后 clean 再构建。",
+    },
+    KnowledgeEntry {
+        keywords: &["dev eco sdk home", "sdk root", "00303217", "00303312", "sdk not found", "环境检测", "sdk 路径"],
+        title: "构建实际使用的 SDK 由 DEVECO_SDK_HOME 决定",
+        cause: "hvigor（HarmonyOS 模式）只认 DEVECO_SDK_HOME 环境变量定位 SDK；若该变量指向 DevEco Studio 内置 SDK（C:\\Program Files\\Huawei\\DevEco Studio\\sdk），则构建使用其 default 变体（如 6.1.1/API 24），即使环境检测另报了其他 SDK 目录（如 AppData\\Local\\Huawei\\Sdk 只有 8/9），写版本配置也应以 DEVECO_SDK_HOME 为准。",
+        fix: "写 compatibleSdkVersion 前先确认实际构建 SDK：读 DEVECO_SDK_HOME 下的 default/sdk-pkg.json（platformVersion/apiVersion）；环境检测与构建 SDK 不一致时以构建实际使用的为准。",
     },
 ];
 
@@ -195,6 +225,19 @@ pub fn format_knowledge(entries: &[&'static KnowledgeEntry]) -> String {
     }
     let mapped: Vec<MatchedEntry> = entries.iter().map(|e| MatchedEntry::from_builtin(e)).collect();
     format_matched(&mapped)
+}
+
+/// 全量内置知识条目，格式化供鸿蒙项目常驻注入（对话首轮即注入，
+/// 让 Agent 写代码/配置前就掌握高频坑，而不是等构建失败后才匹配到）。
+pub fn format_all_for_prompt() -> String {
+    if ENTRIES.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("鸿蒙知识库（高频坑与正确写法，涉及对应场景时优先遵守）：\n");
+    for e in ENTRIES {
+        s.push_str(&format!("- {}：{} 修复：{}\n", e.title, e.cause, e.fix));
+    }
+    s
 }
 
 #[cfg(test)]

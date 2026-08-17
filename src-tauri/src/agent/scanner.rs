@@ -14,7 +14,7 @@
 use std::path::Path;
 
 /// 需要跳过的目录（与 tools.rs 保持同一清单，避免扫描依赖/产物/工具自身数据）
-const SKIP_DIRS: [&str; 15] = [
+pub const SKIP_DIRS: [&str; 15] = [
     ".git", ".hvigor", ".idea", ".ohpm", "node_modules", "oh_modules", "build", ".arkui-x",
     ".deveco-agent", "dist", "target", ".venv", "coverage", ".cxx", ".preview",
 ];
@@ -637,6 +637,216 @@ pub fn symbol_details(root: &Path, name: &str, file_filter: Option<&str>) -> Res
     }
     if refs == 0 {
         out.push_str("  （未发现其他引用）\n");
+    }
+    Ok(cut(&out, 12000))
+}
+
+// ==================== secret_scan：密钥泄露专项扫描 ====================
+
+/// 配置类文件名（白名单），扫描密钥时额外纳入：.env 族 / properties / 密钥证书文件
+fn is_secret_config_file(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n == ".env"
+        || n.starts_with(".env.")
+        || n == "local.properties"
+        || n.ends_with(".properties")
+        || n == ".npmrc"
+        || n == ".pypirc"
+        || n == ".netrc"
+        || n.ends_with(".pem")
+        || n.ends_with(".key")
+        || n.ends_with(".p12")
+        || n.ends_with(".keystore")
+        || n.ends_with(".jks")
+        || n.ends_with(".bks")
+}
+
+/// 对疑似密钥值做掩码展示（只保留前 2 字符 + 长度），防止扫描结果自身泄露明文
+fn mask_value(v: &str) -> String {
+    let v = v.trim().trim_matches('"').trim_matches('\'');
+    let chars: Vec<char> = v.chars().collect();
+    if chars.len() <= 2 {
+        return "***".into();
+    }
+    format!("{}***（长度 {}）", chars[..2].iter().collect::<String>(), chars.len())
+}
+
+/// 配置文件中提取键值对（兼容 KEY=value / KEY: value / KEY value）
+fn parse_kv(line: &str) -> Option<(String, String)> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') || t.starts_with(';') || t.starts_with("//") {
+        return None;
+    }
+    let pos = t.find(['=', ':'])?;
+    let key = t[..pos].trim().trim_matches('"').trim_matches('\'');
+    if key.is_empty() {
+        return None;
+    }
+    let mut val = t[pos + 1..].trim();
+    // 行尾注释剥离（# 前有空格视为注释）
+    if let Some(c) = val.find(" #") {
+        val = val[..c].trim();
+    }
+    if val.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), val.to_string()))
+}
+
+/// 配置值是否像真实密钥（排除空壳占位符：xxx/your-/<...>/${...} 引用/纯数字短串）
+fn looks_real_secret(k: &str, v: &str) -> bool {
+    let kl = k.to_lowercase();
+    let sensitive = kl.contains("password")
+        || kl.contains("passwd")
+        || kl.contains("secret")
+        || kl.contains("api_key")
+        || kl.contains("apikey")
+        || kl.contains("token")
+        || kl.contains("credential")
+        || kl.contains("access_key")
+        || kl.contains("private_key")
+        || kl.contains("client_secret")
+        || kl.contains("auth")
+        || kl == "key"
+        || kl == "pwd";
+    if !sensitive {
+        return false;
+    }
+    let vl = v.to_lowercase();
+    if vl.is_empty()
+        || vl.contains("xxx")
+        || vl.contains("your_")
+        || vl.contains("your-")
+        || vl.contains("<")
+        || vl.contains(">")
+        || vl.contains("placeholder")
+        || vl.contains("example")
+        || vl.starts_with("${")
+        || vl.starts_with("\\$")
+    {
+        return false;
+    }
+    // 纯数字且长度 ≤ 4：多半是端口/版本号等误报
+    !(v.chars().all(|c| c.is_ascii_digit()) && v.len() <= 4)
+}
+
+/// 密钥泄露专项扫描：源码（复用 hardcoded-secret 规则）+ 配置类文件（.env/local.properties 等）。
+/// 输出命中文件:行 + 键名 + 掩码值；源码每文件每类最多 3 条，配置文件最多 5 条。
+/// include_config=false 时只扫源码（默认 true 一并扫配置文件）。
+pub fn secret_scan(
+    root: &Path,
+    path: Option<&str>,
+    include_config: Option<bool>,
+) -> Result<String, String> {
+    let scan_root = match path {
+        Some(p) if !p.trim().is_empty() => {
+            let c = root.join(p.trim());
+            if !c.is_dir() {
+                return Err(format!("扫描目录不存在: {}", c.display()));
+            }
+            c
+        }
+        _ => root.to_path_buf(),
+    };
+    let rule = RULES.iter().find(|r| r.id == "hardcoded-secret").unwrap();
+    let mut hits: Vec<(String, usize, String)> = Vec::new(); // (file, line, 掩码文本)
+    let mut scanned_files = 0usize;
+
+    // 1) 源码文件：复用 hardcoded-secret 规则
+    for f in collect_src_files(&scan_root, 512 * 1024).iter().take(500) {
+        scanned_files += 1;
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let relf = rel(root, f);
+        let mut n = 0usize;
+        for (i, line) in text.lines().enumerate() {
+            if n >= 3 {
+                break;
+            }
+            if (rule.hit)(line) {
+                // 掩码赋值右侧的值：截取 = / : 后片段
+                let shown = if let Some(pos) = line.find(['=', ':']) {
+                    let v = line[pos + 1..].trim();
+                    format!("{} {}", line[..=pos].trim(), mask_value(v))
+                } else {
+                    line.trim().to_string()
+                };
+                hits.push((relf.clone(), i + 1, shown));
+                n += 1;
+            }
+        }
+    }
+
+    // 2) 配置文件：白名单名 + 键值模式检测
+    let mut conf_hits: Vec<(String, usize, String)> = Vec::new();
+    if include_config.unwrap_or(true) {
+        let mut conf_files: Vec<std::path::PathBuf> = Vec::new();
+        fn walk_conf(
+            dir: &Path,
+            root: &Path,
+            out: &mut Vec<std::path::PathBuf>,
+        ) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if !should_skip_dir(&name) {
+                        walk_conf(&p, root, out);
+                    }
+                } else if is_secret_config_file(&name) {
+                    if e.metadata().map(|m| m.len() <= 512 * 1024).unwrap_or(false) {
+                        out.push(p);
+                    }
+                }
+            }
+            let _ = root;
+        }
+        walk_conf(&scan_root, &scan_root, &mut conf_files);
+        for f in conf_files.iter().take(200) {
+            scanned_files += 1;
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            let relf = rel(root, f);
+            let mut n = 0usize;
+            for (i, line) in text.lines().enumerate() {
+                if n >= 5 {
+                    break;
+                }
+                if let Some((k, v)) = parse_kv(line) {
+                    if looks_real_secret(&k, &v) {
+                        conf_hits.push((relf.clone(), i + 1, format!("{} = {}", k, mask_value(&v))));
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let total = hits.len() + conf_hits.len();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "密钥泄露扫描完成：检查 {} 个文件，发现 {} 处疑似敏感信息。\n（值已掩码，仅保留前 2 字符 + 长度；确认后应立即改用环境变量/配置中心）\n",
+        scanned_files, total
+    ));
+    if !hits.is_empty() {
+        out.push_str(&format!("\n## 源码硬编码（高危）\n{} 处\n", hits.len()));
+        for (f, l, t) in hits.iter().take(30) {
+            out.push_str(&format!("  {f}:{l}  {t}\n"));
+        }
+        if hits.len() > 30 {
+            out.push_str(&format!("  …另 {} 处\n", hits.len() - 30));
+        }
+    }
+    if !conf_hits.is_empty() {
+        out.push_str(&format!("\n## 配置文件疑似密钥（高危）\n{} 处\n", conf_hits.len()));
+        for (f, l, t) in conf_hits.iter().take(30) {
+            out.push_str(&format!("  {f}:{l}  {t}\n"));
+        }
+        if conf_hits.len() > 30 {
+            out.push_str(&format!("  …另 {} 处\n", conf_hits.len() - 30));
+        }
+    }
+    if total == 0 {
+        out.push_str("\n未发现疑似密钥，安全状况良好。");
     }
     Ok(cut(&out, 12000))
 }

@@ -105,7 +105,7 @@ export default function SdkApiBrowser() {
   }
 
   return (
-    <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg overflow-hidden">
+    <div className="modern-card rounded-lg overflow-hidden">
       <div className="flex items-center gap-2 p-3 border-b border-[var(--border)]">
         <input
           value={query}
@@ -128,7 +128,7 @@ export default function SdkApiBrowser() {
             <div className="flex flex-wrap gap-1 p-2 border-b border-[var(--border)] max-h-24 overflow-auto">
               <button
                 onClick={() => setActiveKit(null)}
-                className={`px-2 h-6 rounded-md text-[11px] transition-colors ${activeKit === null ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}`}
+                className={`px-2 h-6 rounded-md text-[11px] transition-colors ${activeKit === null ? 'tab-active' : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}`}
               >
                 {t('health.apiAllKits')}
               </button>
@@ -136,7 +136,7 @@ export default function SdkApiBrowser() {
                 <button
                   key={k}
                   onClick={() => setActiveKit(k === activeKit ? null : k)}
-                  className={`px-2 h-6 rounded-md text-[11px] transition-colors ${k === activeKit ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}`}
+                  className={`px-2 h-6 rounded-md text-[11px] transition-colors ${k === activeKit ? 'tab-active' : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}`}
                   title={k}
                 >
                   {k}
@@ -199,3 +199,5 @@ export default function SdkApiBrowser() {
     </div>
   )
 }
+
+

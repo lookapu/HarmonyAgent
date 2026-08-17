@@ -5,6 +5,7 @@ pub mod net;
 pub mod path;
 pub mod png;
 pub mod process;
+pub mod redact;
 pub mod relevance;
 pub mod retry;
 pub mod tokenizer;

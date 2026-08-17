@@ -59,6 +59,9 @@ pub struct SessionEvent {
     pub seq: i64,
     pub event_type: SessionEventType,
     pub payload: Value,
+    /// 任务级 Trace ID：一次任务（一次用户消息触发的完整执行）的所有事件共享同一 ID，
+    /// 全链路可 grep / 前端 timeline 按它折叠
+    pub trace_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -74,11 +77,13 @@ pub struct DerivedMessage {
 }
 
 /// 追加一条事件（seq 自动递增）。返回新事件的 seq。
+/// `trace_id`：任务级全链路 ID（None 表示不属于任何任务，如系统事件）。
 pub fn append_event(
     conn: &Connection,
     conversation_id: &str,
     event_type: SessionEventType,
     payload: Value,
+    trace_id: Option<&str>,
 ) -> Result<i64, String> {
     let seq: i64 = conn
         .query_row(
@@ -88,8 +93,8 @@ pub fn append_event(
         )
         .map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT INTO session_events (conversation_id, seq, event_type, payload) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![conversation_id, seq, event_type.as_str(), payload.to_string()],
+        "INSERT INTO session_events (conversation_id, seq, event_type, payload, trace_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![conversation_id, seq, event_type.as_str(), payload.to_string(), trace_id],
     )
     .map_err(|e| e.to_string())?;
     Ok(seq)
@@ -99,7 +104,7 @@ pub fn append_event(
 pub fn replay(conn: &Connection, conversation_id: &str) -> Result<Vec<SessionEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, conversation_id, seq, event_type, payload, created_at
+            "SELECT id, conversation_id, seq, event_type, payload, trace_id, created_at
              FROM session_events WHERE conversation_id = ?1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -113,7 +118,8 @@ pub fn replay(conn: &Connection, conversation_id: &str) -> Result<Vec<SessionEve
                 seq: row.get(2)?,
                 event_type: SessionEventType::from_str(&raw),
                 payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-                created_at: row.get(5)?,
+                trace_id: row.get(5)?,
+                created_at: row.get(6)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -195,6 +201,7 @@ mod tests {
                 seq INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
                 payload TEXT NOT NULL DEFAULT '{}',
+                trace_id TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE INDEX idx_session_events_conv_seq ON session_events(conversation_id, seq);",
@@ -206,15 +213,20 @@ mod tests {
     #[test]
     fn append_replay_roundtrip() {
         let conn = mem_conn();
-        append_event(&conn, "c1", SessionEventType::UserMessage, serde_json::json!({"content": "hi"})).unwrap();
-        append_event(&conn, "c1", SessionEventType::ToolCall, serde_json::json!({"name": "read_file", "args": {}})).unwrap();
-        append_event(&conn, "c1", SessionEventType::ToolResult, serde_json::json!({"ok": true, "output": "file content"})).unwrap();
-        append_event(&conn, "c1", SessionEventType::AssistantMessage, serde_json::json!({"content": "done"})).unwrap();
+        append_event(&conn, "c1", SessionEventType::UserMessage, serde_json::json!({"content": "hi"}), None).unwrap();
+        append_event(&conn, "c1", SessionEventType::ToolCall, serde_json::json!({"name": "read_file", "args": {}}), Some("tr-1")).unwrap();
+        append_event(&conn, "c1", SessionEventType::ToolResult, serde_json::json!({"ok": true, "output": "file content"}), Some("tr-1")).unwrap();
+        append_event(&conn, "c1", SessionEventType::AssistantMessage, serde_json::json!({"content": "done"}), Some("tr-1")).unwrap();
         // seq 单调递增
         let events = replay(&conn, "c1").unwrap();
         assert_eq!(events.len(), 4);
         assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
         assert_eq!(count_events(&conn, "c1"), 4);
+        // trace_id 落库：任务内事件共享同一 ID，用户消息无 trace
+        assert_eq!(events[0].trace_id, None);
+        assert_eq!(events[1].trace_id.as_deref(), Some("tr-1"));
+        assert_eq!(events[2].trace_id.as_deref(), Some("tr-1"));
+        assert_eq!(events[3].trace_id.as_deref(), Some("tr-1"));
         // 会话隔离
         assert_eq!(count_events(&conn, "c2"), 0);
     }
@@ -222,10 +234,10 @@ mod tests {
     #[test]
     fn derive_projects_messages_from_events() {
         let conn = mem_conn();
-        append_event(&conn, "c1", SessionEventType::UserMessage, serde_json::json!({"content": "读一下"})).unwrap();
-        append_event(&conn, "c1", SessionEventType::ToolCall, serde_json::json!({"name": "read_file", "args": {"path": "a.txt"}})).unwrap();
-        append_event(&conn, "c1", SessionEventType::ToolResult, serde_json::json!({"ok": false, "output": "not found"})).unwrap();
-        append_event(&conn, "c1", SessionEventType::AssistantMessage, serde_json::json!({"content": "文件不存在"})).unwrap();
+        append_event(&conn, "c1", SessionEventType::UserMessage, serde_json::json!({"content": "读一下"}), None).unwrap();
+        append_event(&conn, "c1", SessionEventType::ToolCall, serde_json::json!({"name": "read_file", "args": {"path": "a.txt"}}), Some("t1")).unwrap();
+        append_event(&conn, "c1", SessionEventType::ToolResult, serde_json::json!({"ok": false, "output": "not found"}), Some("t1")).unwrap();
+        append_event(&conn, "c1", SessionEventType::AssistantMessage, serde_json::json!({"content": "文件不存在"}), Some("t1")).unwrap();
         let msgs = derive_messages(&conn, "c1").unwrap();
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "user");
@@ -240,7 +252,7 @@ mod tests {
     #[test]
     fn delete_conversation_cleans_events() {
         let conn = mem_conn();
-        append_event(&conn, "c1", SessionEventType::SystemNote, serde_json::json!({"text": "note"})).unwrap();
+        append_event(&conn, "c1", SessionEventType::SystemNote, serde_json::json!({"text": "note"}), None).unwrap();
         delete_conversation_events(&conn, "c1").unwrap();
         assert_eq!(count_events(&conn, "c1"), 0);
     }

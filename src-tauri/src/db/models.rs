@@ -48,6 +48,8 @@ pub struct Model {
     pub use_proxy: bool, // 是否走系统代理
     pub enabled: bool,   // 是否启用（禁用后不可在对话中选择）
     pub created_at: i64,
+    /// 手动排序序号（默认模型强制置顶后，其余按此升序排列）
+    pub sort_order: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +140,8 @@ pub struct Skill {
     pub directory: Option<String>,
     pub repo_owner: Option<String>,
     pub repo_name: Option<String>,
+    /// 仓库平台（github / gitee），用于查重与展示
+    pub repo_host: Option<String>,
     pub repo_branch: String,
     /// 技能在仓库内的子目录（NULL/空=仓库根）
     pub subdir: Option<String>,
@@ -197,6 +201,8 @@ pub struct Project {
     pub workspace_modules: Option<String>,
     /// 会话"鸿蒙主工程"：混合工作区中实际进行鸿蒙开发的子工程（相对项目根路径或绝对路径）；空=用项目根本身
     pub harmony_project_path: Option<String>,
+    /// 该项目的会话数量（含归档；list_projects 子查询填充，其余场景为 0）
+    pub conversation_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,8 +215,22 @@ pub struct Conversation {
     pub system_prompt_version: Option<i64>,
     pub is_pinned: bool, // 置顶（排序优先）
     pub archived: bool,  // 归档（默认列表隐藏）
+    /// 标签：逗号分隔字符串（如 "bug,refactor,urgent"），空串=无标签
+    #[serde(default)]
+    pub tags: String,
+    /// 工作模式：'local'（项目主仓库）| 'worktree'（绑定的 worktree 目录）
+    #[serde(default = "default_work_mode")]
+    pub work_mode: String,
+    /// worktree 模式时的 worktree 绝对路径（本地模式为 None）
+    pub worktree_path: Option<String>,
+    /// worktree 模式时的分支名（列表徽标展示；worktree 被删后仍保留历史分支名）
+    pub worktree_branch: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+fn default_work_mode() -> String {
+    "local".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +321,93 @@ pub struct ToolStat {
     /// 平均耗时（毫秒，duration_ms 非空时）
     pub avg_duration_ms: Option<i64>,
     /// 最近一次调用时间
+    pub last_called_at: Option<i64>,
+}
+
+/// Skill 调用统计（use_skill 工具按技能聚合：次数 / 最近调用时间）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillUsageStat {
+    pub skill_id: String,
+    pub skill_name: String,
+    /// 总调用次数
+    pub call_count: i64,
+    /// 最近一次调用时间（unix 秒）
+    pub last_called_at: Option<i64>,
+}
+
+/// Skill 调用明细（时间线：一次 use_skill 调用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillUsageEvent {
+    pub id: String,
+    pub skill_id: String,
+    pub skill_name: String,
+    /// 触发会话标题（会话已删除时为空）
+    pub conversation_title: String,
+    /// 归属项目（'' = 无项目会话）
+    pub project_id: String,
+    pub created_at: i64,
+}
+
+/// 模型 token 消耗统计（request_logs 按模型聚合，工具统计增强 token 维度）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelTokenStat {
+    pub model: String,
+    /// 请求次数
+    pub request_count: i64,
+    /// 输入 token 总量
+    pub input_tokens: i64,
+    /// 输出 token 总量
+    pub output_tokens: i64,
+    /// 缓存 token 总量（读 + 写）
+    pub cache_tokens: i64,
+    /// 总费用（元）
+    pub total_cost_cny: f64,
+    /// 平均耗时（毫秒，非流式请求时）
+    pub avg_latency_ms: Option<i64>,
+}
+
+/// 工具 token 消耗统计（[69]：request_logs.tool_name 按工具聚合，代理链路口径）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolTokenStat {
+    pub tool_name: String,
+    /// 带标注的 LLM 请求次数
+    pub request_count: i64,
+    /// 输入 token 总量
+    pub input_tokens: i64,
+    /// 输出 token 总量
+    pub output_tokens: i64,
+    /// 总费用（元）
+    pub total_cost_cny: f64,
+}
+
+/// MCP 服务器使用统计（tool_runs 按 mcp__服务器名__工具 聚合到服务器维度）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpUsageStat {
+    /// 服务器名（不含 #n 实例后缀）
+    pub server_name: String,
+    /// 总调用次数
+    pub call_count: i64,
+    /// 成功次数（status = 'ok'）
+    pub success_count: i64,
+    /// 失败次数（status IN ('error','cancelled')）
+    pub fail_count: i64,
+    /// 平均耗时（毫秒，duration_ms 非空时）
+    pub avg_duration_ms: Option<i64>,
+    /// 最近一次调用时间
+    pub last_called_at: Option<i64>,
+    /// 该服务器下各工具明细（按调用次数降序）
+    pub tools: Vec<McpToolUsage>,
+}
+
+/// MCP 单个工具的使用明细
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolUsage {
+    /// 工具名（不含 mcp__服务器名__ 前缀）
+    pub tool_name: String,
+    pub call_count: i64,
+    pub success_count: i64,
+    pub fail_count: i64,
+    pub avg_duration_ms: Option<i64>,
     pub last_called_at: Option<i64>,
 }
 

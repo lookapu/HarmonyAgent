@@ -3,6 +3,7 @@ use crate::db::{
     models::{CostSummary, DailyUsage, RequestLog, TaskStats},
     queries, DbState,
 };
+use crate::services::budget::{self, BudgetStatus};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -15,8 +16,6 @@ pub struct DateRange {
 pub struct LogFilter {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    pub provider_id: Option<String>,
-    pub model: Option<String>,
 }
 
 #[tauri::command]
@@ -109,4 +108,73 @@ pub fn get_task_runs(
     let limit = limit.unwrap_or(20).clamp(1, 200);
     queries::list_task_runs(&conn, &project_id.unwrap_or_default(), status.as_deref(), limit)
         .map_err(|e| e.to_string())
+}
+
+/// 预算状态查询（前端成本页展示）：provider_id 为 None 时跨 Provider 汇总
+#[tauri::command]
+pub fn get_budget_status(db: State<DbState>, provider_id: Option<String>) -> Result<BudgetStatus, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    Ok(budget::budget_status(&conn, provider_id.as_deref()))
+}
+
+/// 全部 Provider 的预算状态（成本页"全部"概览用）
+#[derive(Debug, serde::Serialize)]
+pub struct AllBudgetStatus {
+    pub providers: Vec<BudgetStatus>,
+    /// 跨 Provider 汇总：日已用、月已用、合计日上限、合计月上限
+    pub used_today_cny: f64,
+    pub used_month_cny: f64,
+    pub daily_limit_cny: Option<f64>,
+    pub monthly_limit_cny: Option<f64>,
+}
+
+#[tauri::command]
+pub fn get_all_budget_status(db: State<DbState>) -> Result<AllBudgetStatus, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 拉所有 provider 的预算使用情况
+    let mut stmt = conn
+        .prepare("SELECT id, limit_daily_cny, limit_monthly_cny FROM providers WHERE enabled = 1")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, Option<f64>, Option<f64>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    let mut providers = Vec::new();
+    let mut sum_today = 0.0;
+    let mut sum_month = 0.0;
+    let mut sum_daily: Option<f64> = Some(0.0);
+    let mut sum_monthly: Option<f64> = Some(0.0);
+    for (pid, dl, ml) in &rows {
+        let s = budget::budget_status(&conn, Some(pid));
+        providers.push(s);
+        sum_today += providers.last().unwrap().used_today_cny;
+        sum_month += providers.last().unwrap().used_month_cny;
+        if let Some(d) = dl {
+            sum_daily = sum_daily.map(|x| x + d);
+        } else {
+            sum_daily = None;
+        }
+        if let Some(m) = ml {
+            sum_monthly = sum_monthly.map(|x| x + m);
+        } else {
+            sum_monthly = None;
+        }
+    }
+    // 修正：只要有一个 provider 没设上限，合计上限就为 None
+    if rows.iter().any(|(_, d, _)| d.is_none()) {
+        sum_daily = None;
+    }
+    if rows.iter().any(|(_, _, m)| m.is_none()) {
+        sum_monthly = None;
+    }
+    Ok(AllBudgetStatus {
+        providers,
+        used_today_cny: sum_today,
+        used_month_cny: sum_month,
+        daily_limit_cny: sum_daily,
+        monthly_limit_cny: sum_monthly,
+    })
 }

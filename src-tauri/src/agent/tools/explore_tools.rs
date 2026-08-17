@@ -345,15 +345,17 @@ pub(super) async fn capture_and_analyze(
     from_page: Option<usize>,
     action: &str,
 ) -> Result<ExploredPage, String> {
-    // 截图
+    // 截图（snapshot_display 默认输出 jpeg 且按后缀校验，须显式 -t png 才能写 .png）
     let dev_png = format!("/data/local/tmp/explore_{page_id}.png");
-    let _ = run_hdc_shell(device, &["snapshot_display", &dev_png], 10).await;
+    let _ = run_hdc_shell(device, &["snapshot_display", "-t", "png", dev_png.as_str()], 10).await;
     let local_screenshot = format!("{out_dir}/page_{page_id:03}.png");
     let hdc_args: Vec<String> = vec![
         "-s".to_string(), device.to_string(), "file".to_string(), "recv".to_string(),
         dev_png.clone(), local_screenshot.clone(),
     ];
     let _ = run_cmd("hdc", &hdc_args, None, 15).await;
+    // 清理设备端临时文件
+    let _ = run_hdc_shell(device, &["rm", dev_png.as_str()], 10).await;
 
     // 控件树
     let dev_json = format!("/data/local/tmp/explore_{page_id}.json");
@@ -370,10 +372,8 @@ pub(super) async fn capture_and_analyze(
     let clickable = count_clickable(&content);
 
     Ok(ExploredPage {
-        id: page_id,
         depth,
         screenshot: local_screenshot,
-        tree_file: local_tree,
         tree_summary: summary,
         clickable_count: clickable,
         title: String::new(),
@@ -406,10 +406,8 @@ pub(super) fn count_clickable(json: &str) -> usize {
 }
 
 pub(super) struct ExploredPage {
-    id: usize,
     depth: usize,
     screenshot: String,
-    tree_file: String,
     tree_summary: String,
     clickable_count: usize,
     title: String,
@@ -474,7 +472,9 @@ pub(super) fn search_api(args: &Value, db: &crate::db::DbState) -> Result<String
         change_type: args["change_type"].as_str().map(|s| s.to_string()),
         limit: Some((args["limit"].as_u64().unwrap_or(50) as usize).min(200)),
     };
-    // 向量增强块会按 RRF 融合结果重排 entries（见下），故声明为可变
+    // 向量增强块会按 RRF 融合结果重排 entries（见下），故声明为可变；
+    // 未启用 embedding feature 时无重排代码，编译期放行 unused_mut
+    #[cfg_attr(not(feature = "embedding"), allow(unused_mut))]
     let mut entries = crate::services::harmony_api_diff::search(&conn, &query)?;
     // 向量增强：有 keyword 时用语义向量召回与关键词命中做 RRF 融合重排，
     // 让"语义相关但无字面命中"的 API 也能浮上来；向量索引/模型不可用时自动降级为纯关键词结果。
@@ -555,7 +555,9 @@ pub(super) fn search_api(args: &Value, db: &crate::db::DbState) -> Result<String
     Ok(out)
 }
 
-/// 按 doc_id 取单条 api_docs 记录（search_api 向量增强时补全"向量独有命中"用）
+/// 按 doc_id 取单条 api_docs 记录（search_api 向量增强时补全"向量独有命中"用）。
+/// 仅 embedding feature 下被 search_api 的向量增强块调用。
+#[cfg(feature = "embedding")]
 pub(super) fn fetch_api_entry_by_id(
     conn: &rusqlite::Connection,
     id: i64,

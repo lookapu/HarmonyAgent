@@ -29,12 +29,6 @@ fn store() -> std::sync::MutexGuard<'static, HashMap<String, Ring>> {
         .unwrap()
 }
 
-#[derive(serde::Serialize, Clone)]
-pub struct RuntimeAnomaly {
-    pub category: String,
-    pub summary: String,
-    pub detail: String,
-}
 
 /// 启动指定项目在指定设备上的运行日志监听（幂等：重复调用会先停掉旧监听）。
 /// 监听 `hdc shell hilog -L E` 并按 bundle 关键字过滤，写入环形缓存；
@@ -153,6 +147,45 @@ pub fn recent(project_path: &str, max: usize) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 日志查询 DSL：在环形缓存上按关键字/正则过滤（grep on the fly）。
+/// `filter` 为大小写不敏感子串；`regex` 为正则（filter 优先）；`context` 为命中行前后附加行数。
+/// 两者都空时退化为 recent()。
+pub fn search(project_path: &str, max: usize, filter: Option<&str>, regex: Option<&str>, context: usize) -> String {
+    let s = store();
+    let Some(ring) = s.get(project_path) else { return String::new() };
+    let lines: Vec<&String> = ring.lines.iter().collect();
+    let start = lines.len().saturating_sub(max.max(1));
+    let window = &lines[start..];
+    let Some(f) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
+        // 无过滤条件：原样返回最近 max 行
+        return window.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n");
+    };
+    let re = regex.map(str::trim).filter(|r| !r.is_empty()).and_then(|r| {
+        regex::Regex::new(r).ok()
+    });
+    let lower_f = f.to_lowercase();
+    let ctx_n = context.clamp(0, 10);
+    let mut out: Vec<String> = Vec::new();
+    for (i, l) in window.iter().enumerate() {
+        let hit = re.as_ref().map(|re| re.is_match(l)).unwrap_or_else(|| l.to_lowercase().contains(&lower_f));
+        if !hit {
+            continue;
+        }
+        // 附带上下文行（不重复输出已输出的行）
+        let lo = i.saturating_sub(ctx_n);
+        let hi = (i + ctx_n + 1).min(window.len());
+        for j in lo..hi {
+            let line = window[j].as_str();
+            if out.last().map(|x: &String| x.as_str()) == Some(line) {
+                continue;
+            }
+            let marker = if j == i { "> " } else { "  " };
+            out.push(format!("{marker}{line}"));
+        }
+    }
+    out.join("\n")
 }
 
 fn push_line(key: &str, line: &str) {

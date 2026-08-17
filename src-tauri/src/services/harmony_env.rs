@@ -76,8 +76,10 @@ pub struct HarmonyEnv {
     pub sdk_versions: Vec<String>,
     /// command-line-tools 信息
     pub cli: Option<CommandLineTools>,
-    /// hdc 可执行文件绝对路径（优先取 command-line-tools/hdc，回退 PATH）
+    /// hdc 可执行文件绝对路径（优先取 command-line-tools/hdc，回退 SDK/PATH）
     pub hdc_path: Option<String>,
+    /// hdc 实际来源：cli=command-line-tools / sdk=SDK toolchains / deveco=DevEco 安装目录 / path=系统 PATH
+    pub hdc_source: Option<String>,
     /// ohpm 可执行文件绝对路径
     pub ohpm_path: Option<String>,
     /// hvigorw 包装脚本绝对路径（若在工程外能找到）
@@ -112,6 +114,43 @@ pub fn set_bundled_cli_dir(dir: Option<PathBuf>) {
 /// 读取软件内置工具链目录（探测时作为 cli 候选）
 pub fn get_bundled_cli_dir() -> Option<PathBuf> {
     BUNDLED_CLI_DIR.lock().unwrap().clone()
+}
+
+/// 读取最近一次探测缓存中的 command-line-tools 根目录（盘符扫描/手动配置/软件内置均可能）。
+/// 供构建端复用：探测报告 hvigorw 可用时，构建必须能真正找到它（避免“纸面工具链”）。
+pub fn cached_cli_root() -> Option<PathBuf> {
+    CACHE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|e| e.cli.as_ref())
+        .map(|c| PathBuf::from(&c.root))
+}
+
+/// 测试用：注入探测缓存（模拟已探测到指定 command-line-tools）
+#[cfg(test)]
+pub fn set_cached_cli_root_for_test(root: Option<PathBuf>) {
+    let mut cache = CACHE.lock().unwrap();
+    *cache = root.map(|r| HarmonyEnv {
+        cli: Some(CommandLineTools {
+            root: r.to_string_lossy().to_string(),
+            bin: String::new(),
+            has_hdc: false,
+            has_ohpm: false,
+            has_hvigorw: false,
+        }),
+        sdk_root: None,
+        default_api: None,
+        sdk_variants: Vec::new(),
+        sdk_versions: Vec::new(),
+        hdc_path: None,
+        hdc_source: None,
+        ohpm_path: None,
+        hvigorw_path: None,
+        studio_dir: None,
+        source: "test".to_string(),
+        suggestions: Vec::new(),
+    });
 }
 
 // ---------- 配置持久化 ----------
@@ -244,6 +283,30 @@ fn looks_like_sdk_root(dir: &Path) -> bool {
     false
 }
 
+/// 探测 DevEco Studio 内置 SDK（与构建 hvigor 注入的 DEVECO_SDK_HOME 一致）：
+/// 要求存在 hvigorw.js 与 sdk/default/sdk-pkg.json（hvigor 的 SDK 扫描布局）
+fn discover_deveco_bundled_sdk() -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = discover_studio_dir().into_iter().collect();
+    if cfg!(target_os = "windows") {
+        for p in [
+            r"C:\Program Files\Huawei\DevEco Studio",
+            r"D:\Program Files\Huawei\DevEco Studio",
+            r"D:\DevEco Studio",
+        ] {
+            roots.push(PathBuf::from(p));
+        }
+    }
+    for r in roots {
+        let sdk = r.join("sdk");
+        if r.join("tools").join("hvigor").join("bin").join("hvigorw.js").is_file()
+            && sdk.join("default").join("sdk-pkg.json").is_file()
+        {
+            return Some(sdk);
+        }
+    }
+    None
+}
+
 /// 解析一个变体目录（openharmony 或 hms）为 SdkVariant。
 /// 新版扁平布局：<variant>/ets/...；旧版版本目录：<variant>/<apiVersion>/ets/...
 fn parse_variant(variant_dir: &Path, name: &str, is_default: bool) -> Option<SdkVariant> {
@@ -320,6 +383,42 @@ fn parse_sdk(sdk_root: &Path) -> (Vec<SdkVariant>, Option<String>) {
         .and_then(|v| v.api_version.clone())
         .or_else(|| variants.first().and_then(|v| v.api_version.clone()));
     (variants, default_api)
+}
+
+/// 在 SDK 根目录下查找 hdc：布局 `sdk/<variant>/toolchains/hdc.exe` 或
+/// `sdk/<variant>/<os>/toolchains/hdc.exe`（如 default/openharmony/toolchains/hdc.exe）。
+/// DevEco Studio 安装后 hdc 往往不进 PATH、也不在 command-line-tools 里，
+/// 只藏在 SDK 的 toolchains 目录，需主动扫描（否则设备面板报找不到程序）。
+fn find_hdc_in_sdk(sdk_root: &Path) -> Option<PathBuf> {
+    let exe = exe_name("hdc");
+    let variants: Vec<PathBuf> = std::fs::read_dir(sdk_root)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path())
+        .collect();
+    // 一层：<variant>/toolchains/hdc.exe
+    for v in &variants {
+        let one = v.join("toolchains").join(&exe);
+        if one.is_file() {
+            return Some(one);
+        }
+    }
+    // 两层：<variant>/<os>/toolchains/hdc.exe
+    for v in variants {
+        if let Ok(entries) = std::fs::read_dir(&v) {
+            for e in entries.flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                let two = e.path().join("toolchains").join(&exe);
+                if two.is_file() {
+                    return Some(two);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 校验是否为 command-line-tools 目录：含 bin/hdc 或 bin/ohpm
@@ -432,12 +531,26 @@ pub fn detect_with(manual: &HarmonyEnvConfig) -> HarmonyEnv {
         v
     };
 
-    // SDK 根目录：用户手动 > 常见候选 > DevEco 目录树扫描
-    let mut sdk_root: Option<PathBuf> = manual
-        .sdk_root
-        .as_ref()
-        .filter(|p| looks_like_sdk_root(Path::new(p)))
-        .map(PathBuf::from);
+    // SDK 根目录：DEVECO_SDK_HOME（构建实际使用）> 用户手动 > DevEco 内置 SDK > 常见候选
+    let mut sdk_root: Option<PathBuf> = std::env::var("DEVECO_SDK_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| looks_like_sdk_root(p));
+
+    if sdk_root.is_none() {
+        sdk_root = manual
+            .sdk_root
+            .as_ref()
+            .filter(|p| looks_like_sdk_root(Path::new(p)))
+            .map(PathBuf::from);
+    }
+    // 与构建 hvigor 对齐：未显式指定时优先 DevEco Studio 内置 SDK
+    // （hvigor_env 构建时会注入它，环境检测必须与构建实际使用的 SDK 一致）
+    if sdk_root.is_none() {
+        if let Some(bundled) = discover_deveco_bundled_sdk().filter(|p| looks_like_sdk_root(p)) {
+            sdk_root = Some(bundled);
+        }
+    }
 
     let mut sdk_suggestions = Vec::new();
     if sdk_root.is_none() {
@@ -498,9 +611,10 @@ pub fn detect_with(manual: &HarmonyEnvConfig) -> HarmonyEnv {
         .collect();
     sdk_versions.sort_by(|a, b| b.cmp(a));
 
-    // hdc / ohpm：优先 command-line-tools/bin，再 PATH
+    // hdc / ohpm：优先 command-line-tools/bin，再 SDK toolchains，最后 PATH
     let mut hdc_path = None;
     let mut ohpm_path = None;
+    let mut hdc_source: Option<&'static str> = None;
     let mut cli_info = None;
     if let Some(cr) = &cli_root {
         let bin = cr.join("bin");
@@ -526,6 +640,9 @@ pub fn detect_with(manual: &HarmonyEnvConfig) -> HarmonyEnv {
         ]
         .into_iter()
         .find(|p| p.is_file());
+        if hdc.is_some() {
+            hdc_source = Some("cli");
+        }
         hdc_path = hdc.clone();
         ohpm_path = ohpm.clone();
         cli_info = Some(CommandLineTools {
@@ -536,8 +653,29 @@ pub fn detect_with(manual: &HarmonyEnvConfig) -> HarmonyEnv {
             has_hvigorw: hvigorw.is_some(),
         });
     }
+    // hdc 不在 command-line-tools 时，扫 SDK toolchains（sdk/<variant>/<os>/toolchains/hdc.exe）
+    if hdc_path.is_none() {
+        if let Some(sdk) = &sdk_root {
+            hdc_path = find_hdc_in_sdk(sdk);
+            if hdc_path.is_some() {
+                hdc_source = Some("sdk");
+            }
+        }
+    }
+    // 兜底：sdk_root 未探测到时，直接扫 DevEco Studio 安装目录的 sdk 子目录
+    if hdc_path.is_none() {
+        if let Some(s) = &studio {
+            hdc_path = find_hdc_in_sdk(&s.join("sdk"));
+            if hdc_path.is_some() {
+                hdc_source = Some("deveco");
+            }
+        }
+    }
     if hdc_path.is_none() {
         hdc_path = find_in_path("hdc");
+        if hdc_path.is_some() {
+            hdc_source = Some("path");
+        }
     }
     if ohpm_path.is_none() {
         ohpm_path = find_in_path("ohpm");
@@ -566,6 +704,7 @@ pub fn detect_with(manual: &HarmonyEnvConfig) -> HarmonyEnv {
         sdk_versions,
         cli: cli_info,
         hdc_path: hdc_path.map(|p| p.to_string_lossy().to_string()),
+        hdc_source: hdc_source.map(String::from),
         ohpm_path: ohpm_path.map(|p| p.to_string_lossy().to_string()),
         hvigorw_path: None,
         studio_dir: studio.map(|p| p.to_string_lossy().to_string()),
@@ -843,10 +982,9 @@ fn extract_compatible(text: &str) -> Option<(String, Option<i64>)> {
     let after = rest[colon + 1..].trim_start();
     // 字符串形式
     if after.starts_with('"') {
-        let val_start = after[1..].find('"')? + 1;
-        let val = &after[val_start + 1..];
-        let end = val.find('"')?;
-        let raw = val[..end].trim().to_string();
+        let inner = &after[1..];
+        let end = inner.find('"')?;
+        let raw = inner[..end].trim().to_string();
         let num = parse_compatible_version(&raw);
         Some((raw, num))
     } else {
@@ -933,6 +1071,80 @@ pub fn search_harmony_docs(
         .ok_or_else(|| "文档库未下载，请先在健康检查页点击「下载 OpenHarmony 文档」".to_string())?;
     let idx = crate::services::harmony_docs::index_docs(&root);
     Ok(crate::services::harmony_docs::search(&idx, &query, limit.unwrap_or(20)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("deveco-env-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn find_hdc_in_sdk_two_level_layout() {
+        // DevEco 6.x 默认布局：sdk/default/openharmony/toolchains/hdc.exe
+        let root = tmp_dir("hdc-2");
+        let p = root.join("default").join("openharmony").join("toolchains");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join(exe_name("hdc")), "fake").unwrap();
+        assert!(find_hdc_in_sdk(&root).is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn extract_compatible_parses_string_form() {
+        // 回归：字符串形式 "6.1.1(24)" 必须解析出 API 24（曾因越位取串解析失败 → check_sdk_alignment 报 unknown）
+        let text = r#"{ "app": { "products": [ { "name": "default", "compatibleSdkVersion": "6.1.1(24)" } ] } }"#;
+        let (raw, num) = extract_compatible(text).expect("字符串形式应解析成功");
+        assert_eq!(raw, "6.1.1(24)");
+        assert_eq!(num, Some(24));
+    }
+
+    #[test]
+    fn extract_compatible_parses_numeric_form() {
+        let text = r#"{ "app": { "products": [ { "name": "default", "compatibleSdkVersion": 12 } ] } }"#;
+        let (raw, num) = extract_compatible(text).expect("数字形式应解析成功");
+        assert_eq!(raw, "12");
+        assert_eq!(num, Some(12));
+    }
+
+    #[test]
+    fn extract_compatible_parses_with_trailing_comma() {
+        // 字符串后跟逗号/其他字段（真实 build-profile.json5 常见）不能影响取值
+        let text = "\"compatibleSdkVersion\": \"5.0.0(13)\",\n\"runtimeOS\": \"HarmonyOS\"";
+        let (raw, num) = extract_compatible(text).expect("带尾逗号应解析成功");
+        assert_eq!(raw, "5.0.0(13)");
+        assert_eq!(num, Some(13));
+    }
+
+    #[test]
+    fn extract_compatible_missing_returns_none() {
+        assert!(extract_compatible("{ \"products\": [] }").is_none());
+    }
+
+    #[test]
+    fn find_hdc_in_sdk_one_level_layout() {
+        // 一层布局：sdk/api10/toolchains/hdc.exe
+        let root = tmp_dir("hdc-1");
+        let p = root.join("api10").join("toolchains");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join(exe_name("hdc")), "fake").unwrap();
+        assert!(find_hdc_in_sdk(&root).is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_hdc_in_sdk_missing_returns_none() {
+        let root = tmp_dir("hdc-0");
+        std::fs::create_dir_all(root.join("default").join("openharmony")).unwrap();
+        assert!(find_hdc_in_sdk(&root).is_none());
+        assert!(find_hdc_in_sdk(&root.join("nonexistent")).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 /// Tauri 命令：读取本地文档某篇的完整 Markdown 原文（Agent 需要精读时调用）。

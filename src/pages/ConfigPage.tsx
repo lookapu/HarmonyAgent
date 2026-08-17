@@ -122,7 +122,7 @@ export default function ConfigPage() {
           {error && <span className="text-xs text-[var(--danger)]">{error}</span>}
           <button
             onClick={handleSave}
-            className="px-4 py-2 bg-[var(--accent)] text-white rounded-lg text-sm hover:bg-[var(--accent-hover)] transition-colors"
+            className="px-4 py-2 btn-primary rounded-lg text-sm  transition-colors"
           >
             {t('config.save')}
           </button>
@@ -133,7 +133,7 @@ export default function ConfigPage() {
         value={config}
         onChange={(e) => setConfig(e.target.value)}
         spellCheck={false}
-        className="min-h-[40vh] flex-1 w-full bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 font-mono text-sm text-[var(--text-primary)] resize-none focus:outline-none focus:border-[var(--accent)]"
+        className="min-h-[40vh] flex-1 w-full modern-card rounded-lg p-4 font-mono text-sm text-[var(--text-primary)] resize-none focus:outline-none focus:border-[var(--accent)]"
       />
 
       {/* 数据管理区 */}
@@ -186,3 +186,6 @@ export default function ConfigPage() {
     </div>
   )
 }
+
+
+

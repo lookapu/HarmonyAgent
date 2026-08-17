@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { ToolRun, AgentRun } from '../../stores/projectStore'
 import Icon from '../../icons/Icon'
@@ -6,7 +6,7 @@ import { AnsiText, hasAnsi } from '../../components/AnsiText'
 import { fmtElapsed } from '../chatUtils'
 
 /* ============ 工具调用折叠组：一行展示（最后一次调用），点击展开全部 ============ */
-export function ToolRunGroup({ runs, onRetry }: { runs: ToolRun[]; onRetry?: (run: ToolRun) => void }) {
+export const ToolRunGroup = memo(function ToolRunGroup({ runs, onRetry, onCancel }: { runs: ToolRun[]; onRetry?: (run: ToolRun) => void; onCancel?: (run: ToolRun) => void }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const last = runs[runs.length - 1]
@@ -15,15 +15,35 @@ export function ToolRunGroup({ runs, onRetry }: { runs: ToolRun[]; onRetry?: (ru
   const doneCount = runs.filter((r) => r.status === 'done').length
 
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden animate-fade-in-up tool-group">
+    <div
+      className={`overflow-hidden animate-fade-in-up tool-group ${
+        running
+          ? 'task-progress'
+          : errCount > 0
+            ? 'task-failed'
+            : 'task-complete'
+      }`}
+    >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[var(--bg-hover)] transition-colors"
+        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-transparent transition-colors"
         title={t('home.toggleToolCalls')}
       >
-        <div className="w-6 h-6 rounded-md bg-[var(--accent-soft)] flex items-center justify-center shrink-0">
-          <Icon name="bolt" size={12} className="text-[var(--accent)]" />
+        <div
+          className={`w-6 h-6 rounded-md flex items-center justify-center shrink-0 ${
+            running
+              ? 'bg-[var(--warning)]/15'
+              : errCount > 0
+                ? 'bg-[var(--danger)]/10'
+                : 'bg-[var(--success)]/15'
+          }`}
+        >
+          <Icon
+            name="bolt"
+            size={12}
+            className={running ? 'text-[var(--warning)]' : errCount > 0 ? 'text-[var(--danger)]' : 'text-[var(--success)]'}
+          />
         </div>
         <div className="flex-1 min-w-0">
           <div className="text-[12px] font-medium truncate">
@@ -47,12 +67,12 @@ export function ToolRunGroup({ runs, onRetry }: { runs: ToolRun[]; onRetry?: (ru
             />
           ))}
         </div>
-        <span className="text-[11px] shrink-0 flex items-center gap-1 ml-1">
+        <span className="text-[11px] shrink-0 flex items-center gap-1 ml-1 tnum">
           {errCount > 0 ? (
             <span className="text-[var(--danger)]">{t('home.toolFailed')} ×{errCount}</span>
           ) : running ? (
-            <span className="text-[var(--accent)]">
-              <span className="inline-block w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle mr-1" />
+            <span className="text-[var(--warning)]">
+              <span className="inline-block w-3 h-3 rounded-full border border-[var(--warning)] border-t-transparent animate-spin align-middle mr-1" />
               {t('home.toolRunning')}
             </span>
           ) : (
@@ -64,23 +84,30 @@ export function ToolRunGroup({ runs, onRetry }: { runs: ToolRun[]; onRetry?: (ru
       {open && (
         <div className="border-t border-[var(--border)] divide-y divide-[var(--border)] max-h-80 overflow-y-auto">
           {runs.map((r) => (
-            <ToolRunRow key={r.id} run={r} onRetry={onRetry} />
+            <ToolRunRow key={r.id} run={r} onRetry={onRetry} onCancel={onCancel} />
           ))}
         </div>
       )}
     </div>
   )
-}
+})
 
-/** 展开区单行：工具名 + 参数 + 状态，点击展开执行输出（终端样式）；失败时提供一键重试 */
-export function ToolRunRow({ run, onRetry }: { run: ToolRun; onRetry?: (run: ToolRun) => void }) {
+/** 展开区单行：工具名 + 参数 + 状态，点击展开执行输出（终端样式）；失败时提供一键重试，运行中提供取消 */
+export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: { run: ToolRun; onRetry?: (run: ToolRun) => void; onCancel?: (run: ToolRun) => void }) {
   const { t } = useTranslation()
-  // 命令类工具默认展开终端输出；其余工具折叠。用户手动展开/折叠后按工具名记忆（localStorage）
+  // 默认展开规则（用户可手动覆盖，状态写到 localStorage）：
+  // 1) 命令类（run_command 等）：用户大概率想看输出
+  // 2) 失败状态：需要立即看到失败原因
+  // 3) 其他：默认折叠（长任务视觉清爽）
   const isCommandTool = ['run_command', 'run_script', 'exec_command', 'terminal', 'run_command_shell'].includes(run.tool)
+  const isFailed = run.status === 'error'
   const memKey = `deveco-tool-open-${run.tool}`
   const [open, setOpen] = useState<boolean>(() => {
     const saved = localStorage.getItem(memKey)
-    return saved === null ? isCommandTool : saved === '1'
+    // 失败状态每次都强制展开（不被用户历史记忆覆盖）
+    if (isFailed && saved === null) return true
+    if (saved === null) return isCommandTool
+    return saved === '1'
   })
   const toggleOpen = () => {
     setOpen((v) => {
@@ -211,6 +238,18 @@ export function ToolRunRow({ run, onRetry }: { run: ToolRun; onRetry?: (run: Too
             >
               <Icon name="copy" size={11} className={copied ? 'text-[#3fb950]' : ''} />
             </button>
+            {/* [59] 单工具取消：运行中显示 abort 按钮（后端 stop_tool 会话级中断） */}
+            {running && onCancel && (
+              <button
+                type="button"
+                onClick={() => onCancel(run)}
+                title={t('home.stopTool')}
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#8b949e] hover:text-[#f85149] hover:bg-white/10 transition-colors text-[10px] shrink-0"
+              >
+                <Icon name="close" size={10} />
+                {t('home.stopTool')}
+              </button>
+            )}
             {/* 失败工具一键重试：注入指令让 Agent 重新执行（失败输出截断后附给模型） */}
             {isErr && onRetry && (
               <button
@@ -244,10 +283,10 @@ export function ToolRunRow({ run, onRetry }: { run: ToolRun; onRetry?: (run: Too
       )}
     </div>
   )
-}
+})
 
 /* ============ 子 Agent 卡片（并行委派，Claude Code subagent 式） ============ */
-export function AgentRunCard({ run }: { run: AgentRun }) {
+export const AgentRunCard = memo(function AgentRunCard({ run }: { run: AgentRun }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const isErr = run.status === 'error'
@@ -257,23 +296,39 @@ export function AgentRunCard({ run }: { run: AgentRun }) {
   const statusColor = run.status === 'running' ? 'text-[var(--accent)]' : isErr ? 'text-[var(--danger)]' : 'text-[var(--success)]'
 
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden animate-fade-in-up">
+    <div
+      className={`overflow-hidden animate-fade-in-up ${
+        run.status === 'done'
+          ? 'task-complete task-complete-pulse'
+          : isErr
+            ? 'task-failed'
+            : 'task-progress'
+      }`}
+    >
       <button
         onClick={() => done && setOpen((v) => !v)}
-        className={`w-full flex items-center gap-2.5 px-3 py-2 text-left transition-colors ${done ? 'hover:bg-[var(--bg-hover)]' : ''}`}
+        className={`w-full flex items-center gap-2.5 px-3 py-2 text-left transition-colors ${done ? 'hover:bg-transparent' : ''}`}
       >
         <div
           className={`w-6 h-6 rounded-md flex items-center justify-center shrink-0 ${
-            isErr ? 'bg-[var(--danger)]/10' : 'bg-[var(--accent-soft)]'
+            isErr
+              ? 'bg-[var(--danger)]/10'
+              : run.status === 'done'
+                ? 'bg-[var(--success)]/15'
+                : 'bg-[var(--warning)]/15'
           }`}
         >
-          <Icon name="spark" size={12} className={isErr ? 'text-[var(--danger)]' : 'text-[var(--accent)]'} />
+          <Icon
+            name="spark"
+            size={12}
+            className={isErr ? 'text-[var(--danger)]' : run.status === 'done' ? 'text-[var(--success)]' : 'text-[var(--warning)]'}
+          />
         </div>
         <div className="flex-1 min-w-0">
           <div className="text-[12px] font-medium truncate">{run.name}</div>
           <div className="text-[10px] text-[var(--text-muted)] truncate font-mono mt-px">{run.model}</div>
         </div>
-        <span className={`text-[11px] shrink-0 ${statusColor}`}>
+        <span className={`text-[11px] shrink-0 tnum ${statusColor}`}>
           {run.status === 'running' && (
             <span className="inline-block w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle mr-1" />
           )}
@@ -288,4 +343,4 @@ export function AgentRunCard({ run }: { run: AgentRun }) {
       )}
     </div>
   )
-}
+})

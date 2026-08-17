@@ -2,8 +2,11 @@ import { listen } from '@tauri-apps/api/event'
 import { sendNotification } from '../../api/desktop'
 import {
   listConversations,
+  getConversation,
   createConversation,
+  forkConversation,
   listMessages,
+  listMessagesPage,
   streamChat as streamChatApi,
   stopChat as stopChatApi,
   stopTool as stopToolApi,
@@ -16,88 +19,175 @@ import {
   resolvePlanReview as resolvePlanReviewApi,
   getTodos as getTodosApi,
   getAsk as getAskApi,
+  listPendingConfirmations as listPendingConfirmationsApi,
   resolveAskUser as resolveAskUserApi,
   renameConversation as renameConversationApi,
   deleteConversation as deleteConversationApi,
   pinConversation as pinConversationApi,
   archiveConversation as archiveConversationApi,
   rollbackConversation,
+  conversationRoot,
 } from '../../api/project'
-import type { ChatMessage, TodoItem } from '../../api/project'
+import type { ChatMessage, TodoItem, PendingConfirmation } from '../../api/project'
 import type { StateCreator } from 'zustand'
-import type { ChatSlice, DiagnoseCard, ProjectState } from '../projectStoreTypes'
+import type { ChatSlice, DiagnoseCard, ProjectState, StreamingState } from '../projectStoreTypes'
 import { advancePlan } from './chatUtils'
+import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 
-/** 后端异常兜底看门狗句柄（模块级，armStreamWatchdog 使用） */
-let streamWatchdog: ReturnType<typeof setTimeout> | null = null
+/** localStorage key 前缀：持久化每个项目上次打开的会话 ID */
+const LS_LAST_CONV_PREFIX = 'deveco-switch:last-conv:'
+
+/** 看门狗静默阈值：超过该时长无内容/思考增量且无运行中工具/挂起审批，判定后端挂起 */
+const STREAM_WATCHDOG_MS = 4 * 60 * 1000
 
 // Agent 工具 / 子 Agent 事件自增序号（模块级）
 let toolSeq = 0
 let agentSeq = 0
 
+/** 发送消息性能追踪：convId → trace（首个 delta 标记 TTFB，chat-done 结束） */
+const sendTraces = new Map<string, ReturnType<typeof startPerfTrace>>()
+
+/** 空流式状态 */
+const emptyStreaming = (): StreamingState => ({
+  conversationId: null,
+  content: '',
+  reasoning: '',
+  error: null,
+  errorDetail: null,
+  startedAt: null,
+  lastDeltaAt: null,
+  toolRunning: 0,
+})
+
 /** 会话/消息/流式/审批/计划切片实现（含全局事件监听注册，store 创建时执行一次） */
 export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (set, get) => {
   /**
-   * 后端异常兜底看门狗：发送后若长时间（4 分钟）无任何内容且无工具/审批事件，
-   * 自动结束流式状态并提示——防止后端异常挂起时前端永久停留在"正在输入…"。
-   * 正常流式（有内容/工具事件）不会触发；chat-done/error/stopped 后状态已重置也不会触发。
+   * 流式分桶更新：真源 streamings[convId]，streaming 派生为当前会话的桶（无则空态）。
+   * patch=null 删除分桶（任务结束）。事件监听不再依赖"当前流式会话"判断——
+   * 后台会话（用户已切走）的增量/结束也写入自己的桶，切回时内容不丢。
    */
-  const armStreamWatchdog = (convId: string) => {
-    if (streamWatchdog) clearTimeout(streamWatchdog)
-    streamWatchdog = setTimeout(() => {
-      const s = get()
-      if (
-        s.streaming.conversationId === convId &&
-        !s.streaming.content &&
-        s.toolRuns.length === 0 &&
-        s.toolApprovals.length === 0
-      ) {
+  const setBucket = (convId: string, patch: Partial<StreamingState> | null) =>
+    set((s) => {
+      const streamings = { ...s.streamings }
+      if (patch === null) {
+        delete streamings[convId]
+      } else {
+        const prev = streamings[convId]
+        streamings[convId] = {
+          ...(prev ?? { ...emptyStreaming(), startedAt: Date.now() }),
+          ...patch,
+          conversationId: convId,
+          lastDeltaAt: Date.now(),
+        }
+      }
+      return {
+        streamings,
+        streaming: s.currentConversation ? streamings[s.currentConversation.id] ?? emptyStreaming() : emptyStreaming(),
+      }
+    })
+
+  /**
+   * 按会话维护待确认项（审批/计划/提问）：后台会话事件不再丢弃，统一记录到
+   * pendingConfirmations，会话列表据此渲染“待确认”角标，切回会话时据此恢复弹窗/卡片。
+   */
+  const upsertPending = (item: PendingConfirmation) =>
+    set((s) => {
+      const arr = s.pendingConfirmations[item.conversation_id] ?? []
+      const exists = arr.some((p) => p.request_id === item.request_id)
+      const next = exists
+        ? arr.map((p) => (p.request_id === item.request_id ? item : p))
+        : [...arr, item]
+      return { pendingConfirmations: { ...s.pendingConfirmations, [item.conversation_id]: next } }
+    })
+
+  /** 按 request_id 从待确认表中移除一项（审批/计划/提问答复后调用） */
+  const removePendingByRequestId = (requestId: string) =>
+    set((s) => {
+      let changed = false
+      const next: Record<string, PendingConfirmation[]> = {}
+      for (const [cid, arr] of Object.entries(s.pendingConfirmations)) {
+        const filtered = arr.filter((p) => p.request_id !== requestId)
+        if (filtered.length !== arr.length) changed = true
+        if (filtered.length > 0) next[cid] = filtered
+      }
+      return changed ? { pendingConfirmations: next } : {}
+    })
+
+  /**
+   * 后端异常兜底看门狗（多会话安全）：周期巡检所有流式分桶，静默超阈值
+   * （无内容/思考增量、无运行中工具、当前会话无挂起审批）的桶判定后端挂起，
+   * 自动置错释放——防止会话永久停留在"正在输入/后台生成中"。
+   * chat-tool-start/done 按会话维护 toolRunning 计数，长任务/后台会话不误杀；
+   * chat-done/error/stopped 清桶后自然不再触发。
+   */
+  setInterval(() => {
+    const s = get()
+    for (const [convId, bucket] of Object.entries(s.streamings)) {
+      if (bucket.error) continue
+      const ref = bucket.lastDeltaAt ?? bucket.startedAt
+      if (!ref || Date.now() - ref < STREAM_WATCHDOG_MS) continue
+      // 已有内容/思考的静默属于模型侧长思考，交由后端超时兜底
+      if (bucket.content || bucket.reasoning) continue
+      // 工具执行中（含后台会话）：后端仍在工作
+      if (bucket.toolRunning > 0) continue
+      const isCurrent = s.currentConversation?.id === convId
+      // 当前会话有挂起审批：在等用户操作，不判挂起
+      if (isCurrent && s.toolApprovals.length > 0) continue
+      setBucket(convId, {
+        ...emptyStreaming(),
+        error: '后端长时间无响应，已自动停止等待。请检查模型配置与网络后重试',
+      })
+      if (isCurrent) {
         set({
-          streaming: {
-            conversationId: null,
-            content: '',
-            reasoning: '',
-            error: '后端长时间无响应，已自动停止等待。请检查模型配置与网络后重试',
-            errorDetail: null,
-            startedAt: null,
-            lastDeltaAt: null,
-          },
           toolRuns: [],
           agentRuns: [],
           // 超时停止：进度卡定档保留（展示已完成部分）
           plan: s.plan && s.plan.phase === 'running' ? { ...s.plan, phase: 'error' } : s.plan,
         })
       }
-    }, 4 * 60 * 1000)
-  }
+    }
+    // 周期同步待确认项：后端超时会自动清除审批/计划/提问，前端角标需跟随刷新避免残留。
+    // 仅在存在待确认项时刷新（无待确认时不可能有残留角标），查询开销可忽略。
+    if (Object.keys(s.pendingConfirmations).length > 0) {
+      get().refreshPendingConfirmations().catch(() => {})
+    }
+  }, 30 * 1000)
 
   // ---------- 流式事件监听（全局一次性注册） ----------
+  // 增量写入分桶（不要求是当前会话）：用户切走再切回，流式内容不丢
   listen<{ conversation_id: string; delta: string }>('chat-stream', (event) => {
     const { conversation_id, delta } = event.payload
-    const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
-    set({
-      streaming: { ...state.streaming, content: state.streaming.content + delta, lastDeltaAt: Date.now() },
-    })
+    const bucket = get().streamings[conversation_id]
+    if (!bucket) return
+    // 首个内容 delta：标记 TTFB（首个 token 到达时间）
+    if (!bucket.content && !bucket.reasoning) {
+      const t = sendTraces.get(conversation_id)
+      t?.mark('ttfb')
+    }
+    setBucket(conversation_id, { content: bucket.content + delta })
   }).catch(() => {})
 
-  // 思考过程流式增量（推理模型 reasoning_content 透传）
+  // 思考过程流式增量（推理模型 reasoning_content 透传；同样分桶）
   listen<{ conversation_id: string; delta: string }>('chat-reasoning', (event) => {
     const { conversation_id, delta } = event.payload
-    const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
-    set({
-      streaming: { ...state.streaming, reasoning: state.streaming.reasoning + delta, lastDeltaAt: Date.now() },
-    })
+    const bucket = get().streamings[conversation_id]
+    if (!bucket) return
+    // 首个思考 delta 也算 TTFB（推理模型可能先吐 thinking 再吐 content）
+    if (!bucket.content && !bucket.reasoning) {
+      const t = sendTraces.get(conversation_id)
+      t?.mark('ttfb')
+    }
+    setBucket(conversation_id, { reasoning: bucket.reasoning + delta })
   }).catch(() => {})
 
   listen<{ conversation_id: string; message: ChatMessage; unfinished: boolean }>('chat-done', (event) => {
     const { conversation_id, message, unfinished } = event.payload
     const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
-    // 任务结束摘要（ChatGPT 式收尾统计）：耗时 + 工具调用数 + 修改文件数
-    const toolCount = state.toolRuns.length
-    const durationMs = state.streaming.startedAt ? Date.now() - state.streaming.startedAt : 0
+    // 分桶清理无条件执行（后台会话结束也释放流式槽位）；视图状态仅当前会话更新
+    const bucket = state.streamings[conversation_id]
+    if (!bucket) return
+    const isCurrent = state.currentConversation?.id === conversation_id
+    const durationMs = bucket.startedAt ? Date.now() - bucket.startedAt : 0
     const fileCount = (() => {
       try {
         const v = message.modified_files_json ? JSON.parse(message.modified_files_json) : []
@@ -106,24 +196,35 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         return 0
       }
     })()
-    set({
-      messages: [...state.messages, message],
-      streaming: { conversationId: null, content: '', reasoning: '', error: null, errorDetail: null, startedAt: null, lastDeltaAt: null },
-      // 完成后保留过程记录：顶部"已处理 N 个操作"徽章可展开回看（新任务/切会话时清空）
-      lastTaskSummary: {
-        durationMs,
-        toolCount,
-        fileCount,
-        // 后端把任务累计 token 持久化到结束消息（每轮求和），此处直接取用
-        tokensIn: message.tokens_in ?? 0,
-        tokensOut: message.tokens_out ?? 0,
-      },
-      // 任务正常结束：进度卡定档保留
-      plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'done' } : state.plan,
-      // 任务未完成（上限中止/用户停止/中途失败，有工具成果无最终总结）：
-      // 保留"继续任务"按钮断点续跑；正常完成则清空
-      unfinishedConv: unfinished ? { conversationId: conversation_id } : null,
-    })
+    setBucket(conversation_id, null)
+    // 结束发送性能追踪
+    const sendTrace = sendTraces.get(conversation_id)
+    if (sendTrace) {
+      sendTraces.delete(conversation_id)
+      sendTrace.mark('done')
+      sendTrace.end()
+    }
+    if (isCurrent) {
+      // 任务结束摘要（ChatGPT 式收尾统计）：耗时 + 工具调用数 + 修改文件数
+      const toolCount = state.toolRuns.length
+      set({
+        messages: [...state.messages, message],
+        // 完成后保留过程记录：顶部"已处理 N 个操作"徽章可展开回看（新任务/切会话时清空）
+        lastTaskSummary: {
+          durationMs,
+          toolCount,
+          fileCount,
+          // 后端把任务累计 token 持久化到结束消息（每轮求和），此处直接取用
+          tokensIn: message.tokens_in ?? 0,
+          tokensOut: message.tokens_out ?? 0,
+        },
+        // 任务正常结束：进度卡定档保留
+        plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'done' } : state.plan,
+        // 任务未完成（上限中止/用户停止/中途失败，有工具成果无最终总结）：
+        // 保留"继续任务"按钮断点续跑；正常完成则清空
+        unfinishedConv: unfinished ? { conversationId: conversation_id } : null,
+      })
+    }
     // 刷新会话列表（标题/时间变化；保持搜索关键字过滤）
     const projectId = state.currentConversation?.project_id
     if (projectId) {
@@ -157,18 +258,21 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     (event) => {
       const { conversation_id, error, kind, title, reason, suggestion, retryable, status_code } = event.payload
       const state = get()
-      if (state.streaming.conversationId !== conversation_id) return
-      set({
-        streaming: {
-          ...state.streaming,
-          error,
-          errorDetail: { kind, title, reason, suggestion, retryable, statusCode: status_code ?? null },
-        },
-        // 任务出错：进度卡立即定档（保留已完成步骤）
-        plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'error' } : state.plan,
-        // 任务结束：挂起的提问卡无意义，一并关闭
-        askCard: null,
+      const bucket = state.streamings[conversation_id]
+      if (!bucket) return
+      const isCurrent = state.currentConversation?.id === conversation_id
+      setBucket(conversation_id, {
+        error,
+        errorDetail: { kind, title, reason, suggestion, retryable, statusCode: status_code ?? null },
       })
+      if (isCurrent) {
+        set({
+          // 任务出错：进度卡立即定档（保留已完成步骤）
+          plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'error' } : state.plan,
+          // 任务结束：挂起的提问卡无意义，一并关闭
+          askCard: null,
+        })
+      }
     },
   ).catch(() => {})
 
@@ -176,42 +280,46 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   listen<{ conversation_id: string; unfinished: boolean }>('chat-stopped', (event) => {
     const { conversation_id, unfinished } = event.payload
     const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
-    const partial = state.streaming.content.trim()
-    // 已流式输出的内容不因无正文入库而消失：作为临时消息追加展示（不落库，刷新会话后回到真实历史）
-    const messages =
-      partial.length > 0
-        ? [
-            ...state.messages,
-            {
-              id: `local-stop-${Date.now()}`,
-              conversation_id,
-              role: 'assistant' as const,
-              content: partial,
-              references_json: null,
-              model: null,
-              tokens_in: null,
-              tokens_out: null,
-              reasoning: state.streaming.reasoning || null,
-              queued: 0,
-              agent_owned: 0,
-              modified_files_json: null,
-              duration_ms: null,
-              created_at: Math.floor(Date.now() / 1000),
-            } satisfies ChatMessage,
-          ]
-        : state.messages
-    set({
-      messages,
-      streaming: { conversationId: null, content: '', reasoning: '', error: null, errorDetail: null, startedAt: null, lastDeltaAt: null },
-      // 停止后同样保留过程记录：已执行部分可在徽章中展开回看
-      // 用户停止：进度卡定档保留（展示已完成部分）
-      plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'done' } : state.plan,
-      // 停止且未完成：展示"继续任务"按钮断点续跑（有已执行工具成果可接续）
-      unfinishedConv: unfinished ? { conversationId: conversation_id } : state.unfinishedConv,
-      // 停止任务：挂起的提问卡同步关闭（后端已关闭通道）
-      askCard: null,
-    })
+    const bucket = state.streamings[conversation_id]
+    if (!bucket) return
+    const isCurrent = state.currentConversation?.id === conversation_id
+    const partial = bucket.content.trim()
+    setBucket(conversation_id, null)
+    if (isCurrent) {
+      // 已流式输出的内容不因无正文入库而消失：作为临时消息追加展示（不落库，刷新会话后回到真实历史）
+      const messages =
+        partial.length > 0
+          ? [
+              ...state.messages,
+              {
+                id: `local-stop-${Date.now()}`,
+                conversation_id,
+                role: 'assistant' as const,
+                content: partial,
+                references_json: null,
+                model: null,
+                tokens_in: null,
+                tokens_out: null,
+                reasoning: bucket.reasoning || null,
+                queued: 0,
+                agent_owned: 0,
+                modified_files_json: null,
+                duration_ms: null,
+                created_at: Math.floor(Date.now() / 1000),
+              } satisfies ChatMessage,
+            ]
+          : state.messages
+      set({
+        messages,
+        // 停止后同样保留过程记录：已执行部分可在徽章中展开回看
+        // 用户停止：进度卡定档保留（展示已完成部分）
+        plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'done' } : state.plan,
+        // 停止且未完成：展示"继续任务"按钮断点续跑（有已执行工具成果可接续）
+        unfinishedConv: unfinished ? { conversationId: conversation_id } : state.unfinishedConv,
+        // 停止任务：挂起的提问卡同步关闭（后端已关闭通道）
+        askCard: null,
+      })
+    }
   }).catch(() => {})
 
   // ---------- Agent 工具事件 ----------
@@ -220,7 +328,11 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     (event) => {
       const { conversation_id, tool, args, round, total, level, desc } = event.payload
       const state = get()
-      if (state.streaming.conversationId !== conversation_id) return
+      // 工具活动按会话计数（看门狗判据，后台会话同样生效）
+      const bucket = state.streamings[conversation_id]
+      if (bucket) setBucket(conversation_id, { toolRunning: bucket.toolRunning + 1 })
+      // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
+    if (state.currentConversation?.id !== conversation_id) return
       set({
         toolRuns: [
           ...state.toolRuns,
@@ -258,7 +370,11 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   listen<{ conversation_id: string; tool: string; ok: boolean; output: string; duration_ms?: number }>('chat-tool-done', (event) => {
     const { conversation_id, tool, ok, output, duration_ms } = event.payload
     const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
+    // 工具活动按会话计数（看门狗判据，后台会话同样生效）
+    const bucket = state.streamings[conversation_id]
+    if (bucket) setBucket(conversation_id, { toolRunning: Math.max(0, bucket.toolRunning - 1) })
+    // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
+    if (state.currentConversation?.id !== conversation_id) return
     set({
       toolRuns: state.toolRuns.map((r) =>
         r.tool === tool && r.status === 'running'
@@ -307,11 +423,23 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     'chat-tool-approval',
     (event) => {
       const { conversation_id, request_id, tool, args } = event.payload
-      const state = get()
-      if (state.streaming.conversationId !== conversation_id) return
-      set({
-        toolApprovals: [...state.toolApprovals, { requestId: request_id, tool, args }],
+      const isCurrent = get().currentConversation?.id === conversation_id
+      // 后台会话同样记录到待确认表（列表角标 + 切回恢复）；弹窗视图仅当前会话刷新
+      upsertPending({
+        conversation_id,
+        kind: 'approval',
+        request_id,
+        tool,
+        args,
+        plan: null,
+        question: null,
+        options: null,
       })
+      if (isCurrent) {
+        set((s) => ({
+          toolApprovals: [...s.toolApprovals, { requestId: request_id, tool, args }],
+        }))
+      }
     },
   ).catch(() => {})
 
@@ -343,23 +471,46 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   // 计划/审查模式：Agent 输出计划后等待用户确认
   listen<{ conversation_id: string; request_id: string; plan: string }>('chat-plan', (event) => {
     const { conversation_id, request_id, plan } = event.payload
-    const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
-    set({
-      pendingPlan: { requestId: request_id, conversationId: conversation_id, plan },
+    const isCurrent = get().currentConversation?.id === conversation_id
+    upsertPending({
+      conversation_id,
+      kind: 'plan',
+      request_id,
+      tool: null,
+      args: null,
+      plan,
+      question: null,
+      options: null,
     })
+    if (isCurrent) {
+      set({ pendingPlan: { requestId: request_id, conversationId: conversation_id, plan } })
+    }
   }).catch(() => {})
 
-  // 计划已被处理（批准/驳回）：清空待确认状态；批准时把计划保留为"已批准计划"执行中展示
+  // 计划已被处理（批准/驳回）：清空待确认状态；批准时把计划保留为"已批准计划"执行中展示。
+  // 后台会话的计划被处理时（如超时自动驳回）也要从待确认表移除，避免角标残留。
   listen<{ conversation_id: string; approved: boolean }>('chat-plan-resolved', (event) => {
-    const state = get()
-    if (state.pendingPlan?.conversationId !== event.payload.conversation_id) return
-    const plan = state.pendingPlan.plan
-    set({
-      pendingPlan: null,
-      approvedPlan: event.payload.approved
-        ? { conversationId: event.payload.conversation_id, plan }
-        : state.approvedPlan,
+    const { conversation_id, approved } = event.payload
+    set((s) => {
+      const arr = s.pendingConfirmations[conversation_id]
+      let pendingConfirmations = s.pendingConfirmations
+      if (arr) {
+        const filtered = arr.filter((p) => p.kind !== 'plan')
+        if (filtered.length !== arr.length) {
+          pendingConfirmations = { ...s.pendingConfirmations }
+          if (filtered.length > 0) pendingConfirmations[conversation_id] = filtered
+          else delete pendingConfirmations[conversation_id]
+        }
+      }
+      const isCurrentPlan = s.pendingPlan?.conversationId === conversation_id
+      return {
+        pendingConfirmations,
+        pendingPlan: isCurrentPlan ? null : s.pendingPlan,
+        approvedPlan:
+          isCurrentPlan && approved
+            ? { conversationId: conversation_id, plan: s.pendingPlan?.plan ?? '' }
+            : s.approvedPlan,
+      }
     })
   }).catch(() => {})
 
@@ -367,7 +518,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   listen<{ conversation_id: string; name: string; model: string }>('chat-agent-start', (event) => {
     const { conversation_id, name, model } = event.payload
     const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
+    // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
+    if (state.currentConversation?.id !== conversation_id) return
     set({
       agentRuns: [
         ...state.agentRuns,
@@ -381,7 +533,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     (event) => {
       const { conversation_id, name, ok, output } = event.payload
       const state = get()
-      if (state.streaming.conversationId !== conversation_id) return
+      // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
+    if (state.currentConversation?.id !== conversation_id) return
       set({
         agentRuns: state.agentRuns.map((r) =>
           r.name === name && r.status === 'running' ? { ...r, status: ok ? 'done' : 'error', output } : r,
@@ -415,7 +568,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   listen<{ conversation_id: string; stream: string; line: string }>('agent:log', (event) => {
     const { conversation_id, stream, line } = event.payload
     const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
+    // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
+    if (state.currentConversation?.id !== conversation_id) return
     const next = [...state.buildLogs, { stream, line, ts: Date.now() }]
     // 超长时丢弃旧的头部，避免长时间构建导致内存膨胀
     const trimmed = next.length > 2000 ? next.slice(next.length - 2000) : next
@@ -455,7 +609,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   listen<{ conversation_id: string; todos: TodoItem[] }>('agent:todo', (event) => {
     const { conversation_id, todos } = event.payload
     const state = get()
-    if (state.streaming.conversationId !== conversation_id) return
+    // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
+    if (state.currentConversation?.id !== conversation_id) return
     set({ todos })
   }).catch(() => {})
 
@@ -464,18 +619,26 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     'chat-ask',
     (event) => {
       const { conversation_id, request_id, question, options } = event.payload
-      const state = get()
-      if (state.streaming.conversationId !== conversation_id) return
-      set({
-        askCard: { requestId: request_id, conversationId: conversation_id, question, options },
+      const isCurrent = get().currentConversation?.id === conversation_id
+      upsertPending({
+        conversation_id,
+        kind: 'ask',
+        request_id,
+        tool: null,
+        args: null,
+        plan: null,
+        question,
+        options,
       })
-      // 后端 5 分钟超时兜底：超时后前端残留卡片自动关闭
-      setTimeout(() => {
-        const cur = get()
-        if (cur.askCard?.requestId === request_id) {
-          set({ askCard: null })
-        }
-      }, 5 * 60 * 1000)
+      if (isCurrent) {
+        set({ askCard: { requestId: request_id, conversationId: conversation_id, question, options } })
+        // 后端 5 分钟超时兜底：超时后前端残留卡片自动关闭
+        setTimeout(() => {
+          if (get().askCard?.requestId === request_id) {
+            set({ askCard: null })
+          }
+        }, 5 * 60 * 1000)
+      }
     },
   ).catch(() => {})
 
@@ -483,13 +646,17 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     conversations: [],
     currentConversation: null,
     messages: [],
-    streaming: { conversationId: null, content: '', reasoning: '', error: null, errorDetail: null, startedAt: null, lastDeltaAt: null },
+    olderHasMore: false,
+    loadingOlder: false,
+    streaming: emptyStreaming(),
+    streamings: {},
     toolRuns: [],
     terminalEntries: [],
     buildLogs: [],
     agentRuns: [],
     plan: null,
     toolApprovals: [],
+    pendingConfirmations: {},
     diagnoseCards: [],
     dismissDiagnoseCard: (id) => set((s) => ({ diagnoseCards: s.diagnoseCards.filter((c) => c.id !== id) })),
     pendingPlan: null,
@@ -528,53 +695,194 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       return info
     },
 
-    newConversation: async () => {
+    newConversation: async (worktree) => {
       const project = get().currentProject
       if (!project) return
-      const conv = await createConversation(project.id)
+      const prevRoot = conversationRoot(get().currentConversation)
+      const t = startPerfTrace('newConversation', { pid: project.id.slice(0, 8) })
+      const conv = await createConversation(project.id, undefined, worktree)
+      t.mark('created')
       const conversations = await listConversations(project.id)
+      t.mark('convs-listed')
       // 新会话：清空上一会话的过程记录（完成态徽章不复用）
       set({ conversations, currentConversation: conv, messages: [], plan: null, toolRuns: [], agentRuns: [], approvedPlan: null, unfinishedConv: null, todos: [], askCard: null })
+      // 持久化会话选择
+      try { localStorage.setItem(LS_LAST_CONV_PREFIX + project.id, conv.id) } catch { /* ignore */ }
+      // 工作目录变化（local ↔ worktree / 不同 worktree）：重载文件树跟随新会话
+      if (prevRoot !== conversationRoot(conv)) {
+        get().rebuildIndex().catch(() => {})
+      }
+      t.end()
+    },
+
+    forkCurrentConversation: async (untilMessageId) => {
+      const cur = get().currentConversation
+      const project = get().currentProject
+      if (!cur || !project) return
+      const conv = await forkConversation(cur.id, untilMessageId)
+      // 先刷新列表（openConversation 从列表查找会话对象）
+      const conversations = await listConversations(project.id)
+      set({ conversations })
+      await get().openConversation(conv.id)
     },
 
     openConversation: async (id) => {
+      const trace = startPerfTrace('openConversation', { convId: id.slice(0, 8) })
+      const prevConv = get().currentConversation
+      // 搜索命中跳转：目标会话可能不在当前可见列表（如已归档/被归档视图隐藏），按 id 兜底拉取
+      let target = get().conversations.find((c) => c.id === id) ?? null
+      if (!target) {
+        target = await getConversation(id).catch(() => null)
+      }
+      // 从待确认表恢复本会话的审批/计划（后台会话事件已按会话记录；提问由下方 getAsk 异步恢复）
+      const pendings = get().pendingConfirmations[id] ?? []
+      const restoredApprovals = pendings
+        .filter((p) => p.kind === 'approval')
+        .map((p) => ({ requestId: p.request_id, tool: p.tool ?? '', args: p.args ?? '' }))
+      const restoredPlan = (() => {
+        const p = pendings.find((p) => p.kind === 'plan')
+        return p ? { requestId: p.request_id, conversationId: p.conversation_id, plan: p.plan ?? '' } : null
+      })()
       set({
-        currentConversation: get().conversations.find((c) => c.id === id) ?? null,
+        currentConversation: target,
         plan: null,
         lastTaskSummary: null,
         approvedPlan: null,
         unfinishedConv: null,
-        // 切换会话：清空上一会话的过程记录，避免完成态徽章残留
+        // 切换会话：恢复目标会话的流式分桶视图（后台流式中切回，内容/状态不丢）
+        streaming: get().streamings[id] ?? emptyStreaming(),
+        // 不清空 messages：保留旧会话内容直到新会话消息就绪后一次性替换，
+        // 避免切换瞬间出现 loading→消息列表 两次渲染（ChatGPT 风格无缝切换）
+        olderHasMore: true,
+        loadingOlder: false,
+        // 会话级运行态立即重置（这些字段不被消息列表项订阅，不触发 MessageItem 重渲染）
         toolRuns: [],
         agentRuns: [],
         todos: [],
         askCard: null,
+        // 审批/计划视图同样按会话恢复（旧会话的待确认弹窗不泄漏到新会话）
+        toolApprovals: restoredApprovals,
+        pendingPlan: restoredPlan,
+        // 注意：feedbackMap / versionMap / tokenStats 不在此处清空——它们是 MessageItem 的订阅依赖，
+        // 立即清空会导致旧消息列表（等待新消息加载期间仍在显示）全量重渲染且丢失反馈状态，
+        // 纯属浪费一次渲染；延迟到新消息 set 时一并清空，把两次重渲染（清字段→换消息）合并为一次
       })
-      const messages = await listMessages(id)
-      set({ messages })
-      await get().loadFeedback(id)
-      await get().loadVersions(id)
-      await get().loadTokenStats(id)
+      trace.mark('state-set')
+
+      // 会话工作目录变化（同项目内 local ↔ worktree / 不同 worktree）：重载文件树跟随；
+      // 跨项目切换由 openProject 的侧边栏加载处理，这里跳过避免重复加载
+      if (target && prevConv?.project_id === target.project_id && conversationRoot(prevConv) !== conversationRoot(target)) {
+        get().rebuildIndex().catch(() => {})
+      }
+
+      // 持久化会话选择（下次打开该项目时恢复）
+      const pid = get().currentProject?.id
+      if (pid) {
+        try { localStorage.setItem(LS_LAST_CONV_PREFIX + pid, id) } catch { /* ignore */ }
+      }
+
+      // 分页加载：只取最近一页，向上滚动时再按游标加载更早历史，避免长会话全量加载渲染
+      const page = await listMessagesPage(id)
+      trace.mark('messages-loaded')
+      // 竞态保护：期间用户可能已切到其他会话，过期结果直接丢弃，
+      // 否则旧会话消息/反馈/版本会覆盖新会话（快速连续切换时必现）
+      if (get().currentConversation?.id !== id) {
+        trace.end()
+        return
+      }
+      set({
+        messages: page.messages,
+        olderHasMore: page.hasMore,
+        // 新消息落地时一并清空旧会话的反馈/版本/统计：与 messages 同批更新只触发一次 React 渲染
+        feedbackMap: {},
+        versionMap: {},
+        tokenStats: null,
+      })
+      trace.mark('messages-state-set')
+      // 三个数据查询（feedback / versions / tokenStats）互相独立，立即并行触发，
+      // 各自返回后单独 setState，不因某个慢查询阻塞首次渲染。
+      const sameConv = () => get().currentConversation?.id === id
+      void get().loadFeedback(id).then(() => sameConv() || undefined).catch(() => {})
+      void get().loadVersions(id).then(() => sameConv() || undefined).catch(() => {})
+      void get().loadTokenStats(id).catch(() => {})
       // 恢复该会话的任务清单与挂起提问（若有）
-      void getTodosApi(id).then((todos) => set({ todos })).catch(() => {})
+      void getTodosApi(id)
+        .then((todos) => {
+          if (get().currentConversation?.id === id) set({ todos })
+        })
+        .catch(() => {})
       void getAskApi(id)
-        .then((ask) =>
+        .then((ask) => {
+          if (get().currentConversation?.id !== id) return
           set({
             askCard: ask
               ? { requestId: ask.request_id, conversationId: ask.conversation_id, question: ask.question, options: ask.options }
               : null,
-          }),
-        )
+          })
+        })
         .catch(() => {})
+      // 等待 React commit + 浏览器 paint 完成：set() 只是调度了状态更新，
+      // 真正的 DOM 渲染和屏幕绘制发生在之后；双 rAF 后用户才真正看到新消息列表，
+      // 此时标记才反映真实可感知耗时。
+      await waitForNextPaint()
+      if (get().currentConversation?.id !== id) {
+        trace.end()
+        return
+      }
+      trace.mark('messages-painted')
+      trace.end()
+    },
+
+    // 加载更早的历史消息：以当前第一条消息为游标拉取上一页，prepend 到头部。
+    // 返回新增条数（调用方用于滚动锚定：新内容插入后保持视口位置不跳动）。
+    loadOlderMessages: async (conversationId) => {
+      const s = get()
+      if (s.loadingOlder || !s.olderHasMore || s.currentConversation?.id !== conversationId) return 0
+      const first = s.messages[0]
+      if (!first) return 0
+      set({ loadingOlder: true })
+      const t = startPerfTrace('loadOlderMessages', { conv: conversationId.slice(0, 8) })
+      try {
+        const page = await listMessagesPage(conversationId, first.id)
+        t.mark('page-loaded')
+        if (get().currentConversation?.id !== conversationId) { t.end(); return 0 }
+        if (page.messages.length === 0) {
+          // 游标失效（消息已删除）或确无更早：终止分页
+          set({ olderHasMore: false })
+          t.end()
+          return 0
+        }
+        // await 期间可能已追加新消息（流式/排队），以其为尾部，避免覆盖丢失
+        const tail = get().messages
+        set({ messages: [...page.messages, ...tail], olderHasMore: page.hasMore })
+        t.mark('merged')
+        t.end()
+        return page.messages.length
+      } catch {
+        t.mark('error')
+        t.end()
+        return 0
+      } finally {
+        // 失败或已切会话：恢复可重试状态（防重入锁释放）
+        if (get().currentConversation?.id === conversationId) {
+          set({ loadingOlder: false })
+        }
+      }
     },
 
     // 新任务开始时清空上次任务摘要（防止跨任务残留展示）
     sendUserMessage: async (content, options, references, images) => {
       const conv = get().currentConversation
       if (!conv) return
-      if (get().streaming.conversationId) return // 流式中防重
+      // 同会话流式中防重（error 态允许重发；跨会话放行——后端同项目任务排队机制生效）
+      const existing = get().streamings[conv.id]
+      if (existing && !existing.error) return
+      // 开始发送消息性能追踪
+      const sendTrace = startPerfTrace('sendMessage', { conv: conv.id.slice(0, 8) })
+      sendTraces.set(conv.id, sendTrace)
       // 乐观展示 user 消息（Rust 端同样入库）
       const now = Math.floor(Date.now() / 1000)
+      const fresh: StreamingState = { ...emptyStreaming(), conversationId: conv.id, startedAt: Date.now(), lastDeltaAt: Date.now() }
       set({
         messages: [
           ...get().messages,
@@ -595,7 +903,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             created_at: now,
           },
         ],
-        streaming: { conversationId: conv.id, content: '', reasoning: '', error: null, errorDetail: null, startedAt: Date.now(), lastDeltaAt: Date.now() },
+        streamings: { ...get().streamings, [conv.id]: fresh },
+        streaming: fresh,
         toolRuns: [],
         terminalEntries: [],
         buildLogs: [],
@@ -607,11 +916,14 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         approvedPlan: null,
         unfinishedConv: null,
       })
-      armStreamWatchdog(conv.id)
+      sendTrace.mark('optimistic-rendered')
       try {
         await streamChatApi(conv.id, content, options, false, references, images)
       } catch (e) {
-        set({ streaming: { conversationId: null, content: '', reasoning: '', error: String(e), errorDetail: null, startedAt: null, lastDeltaAt: null } })
+        sendTraces.delete(conv.id)
+        sendTrace.mark('error')
+        sendTrace.end()
+        setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
       }
     },
 
@@ -674,13 +986,14 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     editMessage: async (messageId, content) => {
       await updateMessageApi(messageId, content)
       const conv = get().currentConversation
-      if (conv) set({ messages: await listMessages(conv.id) })
+      // 全量刷新（编辑影响消息位置未知）：已加载全部，终止分页
+      if (conv) set({ messages: await listMessages(conv.id), olderHasMore: false })
     },
 
     removeMessage: async (messageId) => {
       await deleteMessageApi(messageId)
       const conv = get().currentConversation
-      if (conv) set({ messages: await listMessages(conv.id) })
+      if (conv) set({ messages: await listMessages(conv.id), olderHasMore: false })
     },
 
     /** 回复工具权限审核：true=允许执行 / false=拒绝（可附理由）；remember 勾选后本会话同工具免审，scope=project 额外写入项目白名单 */
@@ -690,7 +1003,26 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       } catch {
         // 超时/失效请求：后端按拒绝处理，这里同样移除即可
       } finally {
-        set({ toolApprovals: get().toolApprovals.filter((a) => a.requestId !== requestId) })
+        removePendingByRequestId(requestId)
+        set((s) => ({ toolApprovals: s.toolApprovals.filter((a) => a.requestId !== requestId) }))
+      }
+    },
+
+    /** 拉取项目内所有会话的待确认项（审批/计划/提问），刷新会话列表角标与恢复数据 */
+    refreshPendingConfirmations: async () => {
+      const project = get().currentProject
+      if (!project) return
+      try {
+        const items = await listPendingConfirmationsApi(project.id)
+        const map: Record<string, PendingConfirmation[]> = {}
+        for (const it of items) {
+          const list = map[it.conversation_id] ?? []
+          list.push(it)
+          map[it.conversation_id] = list
+        }
+        set({ pendingConfirmations: map })
+      } catch {
+        // 后端不可用时保留旧数据
       }
     },
 
@@ -706,6 +1038,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         // 超时/失效：后端按驳回处理
       } finally {
         // 驳回时保留计划内容直到收到 resolved 事件也无妨；这里先清空，事件里再兜底
+        removePendingByRequestId(requestId)
         if (pending?.requestId === requestId) {
           set({ pendingPlan: null })
         }
@@ -719,6 +1052,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       } catch {
         // 已超时或已处理：忽略后端错误
       } finally {
+        removePendingByRequestId(requestId)
         if (get().askCard?.requestId === requestId) {
           set({ askCard: null })
         }
@@ -730,15 +1064,22 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     regenerateLast: async (options, messageId) => {
       const conv = get().currentConversation
       if (!conv) return
-      if (get().streaming.conversationId) return
+      // 同会话流式中防重（error 态允许重试；跨会话流式不影响本会话重新生成）
+      const existing = get().streamings[conv.id]
+      if (existing && !existing.error) return
+      // 开始重新生成性能追踪
+      const sendTrace = startPerfTrace('regenerateMessage', { conv: conv.id.slice(0, 8) })
+      sendTraces.set(conv.id, sendTrace)
       // 分支模式：校验指定消息存在；否则取最后一条 user 消息
       const all = get().messages
       const lastUser = messageId
         ? all.find((m) => m.id === messageId && m.role === 'user')
         : [...all].reverse().find((m) => m.role === 'user')
       if (!lastUser) return
+      const fresh: StreamingState = { ...emptyStreaming(), conversationId: conv.id, startedAt: Date.now(), lastDeltaAt: Date.now() }
       set({
-        streaming: { conversationId: conv.id, content: '', reasoning: '', error: null, errorDetail: null, startedAt: Date.now(), lastDeltaAt: Date.now() },
+        streamings: { ...get().streamings, [conv.id]: fresh },
+        streaming: fresh,
         toolRuns: [],
         terminalEntries: [],
         buildLogs: [],
@@ -748,17 +1089,22 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         askCard: null,
         lastTaskSummary: null,
       })
-      armStreamWatchdog(conv.id)
+      sendTrace.mark('stream-started')
       try {
-        // 后端 regenerate 模式会删除旧回复，先刷新消息列表保持界面一致
+        // 后端 regenerate 模式会删除旧回复，先刷新消息列表保持界面一致（全量：终止分页）
         await streamChatApi(conv.id, lastUser.content, options, true, undefined, undefined, messageId)
+        sendTrace.mark('stream-finished')
         const messages = await listMessages(conv.id)
-        set({ messages })
+        set({ messages, olderHasMore: false })
         await get().loadVersions(conv.id)
+        sendTrace.mark('post-refresh')
       } catch (e) {
+        sendTraces.delete(conv.id)
+        sendTrace.mark('error')
+        sendTrace.end()
         // 失败时也刷新消息（regenerate 模式可能已删除旧回复），保持界面一致
-        set({ messages: await listMessages(conv.id).catch(() => get().messages) })
-        set({ streaming: { conversationId: null, content: '', reasoning: '', error: String(e), errorDetail: null, startedAt: null, lastDeltaAt: null } })
+        set({ messages: await listMessages(conv.id).catch(() => get().messages), olderHasMore: false })
+        setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
       }
     },
 
@@ -803,9 +1149,15 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       if (!projectId) return
       const isCurrent = get().currentConversation?.id === id
       const conversations = await listConversations(projectId)
+      // 流式分桶随会话清理（防泄漏；删除正在流式的会话由后端停止任务）
+      {
+        const streamings = { ...get().streamings }
+        delete streamings[id]
+        set({ streamings })
+      }
       if (isCurrent) {
         // 删除当前会话后自动打开第一个会话
-        set({ conversations, currentConversation: null, messages: [] })
+        set({ conversations, currentConversation: null, messages: [], streaming: emptyStreaming() })
         if (conversations.length > 0) {
           await get().openConversation(conversations[0].id)
         }

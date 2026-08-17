@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#171717" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f0f12" media="(prefers-color-scheme: dark)">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="DevEco LAN">
+<meta name="format-detection" content="telephone=no">
+<meta name="color-scheme" content="light dark">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="apple-touch-startup-image" href="/icon.svg">
+<title>DevEco Switch · 局域网访问</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ========== 登录视图 ========== -->
+<div id="view-login" class="view">
+  <div class="login-box">
+    <h1 class="brand">DevEco <span class="dot">Switch</span></h1>
+    <p class="sub">局域网访问</p>
+    <div class="token-grid" id="tokenGrid"></div>
+    <button id="loginBtn" class="btn primary">进入</button>
+    <p id="loginHint" class="hint"></p>
+  </div>
+</div>
+
+<!-- ========== 会话列表视图 ========== -->
+<div id="view-list" class="view" hidden>
+  <header class="app-bar">
+    <button id="projectSelect" class="select select-btn" title="切换项目" aria-label="切换项目">
+      <span id="projectSelectLabel" class="ellipsis"></span>
+      <svg class="caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
+    <div class="actions">
+      <button id="refreshBtn" class="icon-btn" title="刷新" aria-label="刷新">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+      </button>
+      <button id="newConvBtn" class="icon-btn primary-ic" title="新建会话" aria-label="新建会话">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+    </div>
+  </header>
+  <div class="search-bar">
+    <svg class="search-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    <input id="searchInput" type="search" placeholder="搜索消息…" autocomplete="off" inputmode="search">
+  </div>
+  <div id="searchResults" class="search-results" hidden></div>
+  <ul id="convList" class="conv-list"></ul>
+  <div id="listSkeleton" class="conv-list" hidden>
+    <div class="skeleton-card"><div class="skeleton skeleton-line" style="width:60%"></div><div class="skeleton skeleton-line" style="width:30%"></div></div>
+    <div class="skeleton-card"><div class="skeleton skeleton-line" style="width:75%"></div><div class="skeleton skeleton-line" style="width:25%"></div></div>
+    <div class="skeleton-card"><div class="skeleton skeleton-line" style="width:50%"></div><div class="skeleton skeleton-line" style="width:35%"></div></div>
+    <div class="skeleton-card"><div class="skeleton skeleton-line" style="width:65%"></div><div class="skeleton skeleton-line" style="width:20%"></div></div>
+  </div>
+  <p id="listEmpty" class="empty" hidden>
+    <svg class="empty-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    暂无会话，点击 ＋ 新建
+  </p>
+</div>
+
+<!-- ========== 会话视图 ========== -->
+<div id="view-chat" class="view" hidden>
+  <header class="app-bar">
+    <button id="backBtn" class="icon-btn" title="返回" aria-label="返回">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+    </button>
+    <div id="chatTitle" class="title ellipsis"></div>
+    <div class="actions">
+      <span id="connDot" class="conn-dot" title="实时连接状态"></span>
+      <button id="chatMenuBtn" class="icon-btn" title="更多" aria-label="更多">
+        <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
+      </button>
+    </div>
+  </header>
+  <div id="chatMenu" class="menu" hidden>
+    <button data-act="rename" class="write-only">
+      <svg style="width:14px;height:14px;vertical-align:-2px;margin-right:6px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+      重命名
+    </button>
+    <button data-act="pin" class="write-only">
+      <svg style="width:14px;height:14px;vertical-align:-2px;margin-right:6px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14l-1.7-1.7a2 2 0 0 1 0-2.8L18 11H6l1.7 1.5a2 2 0 0 1 0 2.8L5 17z"/></svg>
+      <span id="pinLabel">置顶 / 取消</span>
+    </button>
+    <button data-act="archive" class="write-only">
+      <svg style="width:14px;height:14px;vertical-align:-2px;margin-right:6px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+      <span id="archiveLabel">归档 / 取消</span>
+    </button>
+    <button data-act="files">
+      <svg style="width:14px;height:14px;vertical-align:-2px;margin-right:6px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      修改的文件
+    </button>
+    <hr>
+    <button data-act="delete" class="danger-text write-only">
+      <svg style="width:14px;height:14px;vertical-align:-2px;margin-right:6px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+      删除会话
+    </button>
+  </div>
+  <div id="toolBar" class="tool-bar" hidden></div>
+  <div id="pendingCards" class="pending-cards"></div>
+  <div id="msgList" class="msg-list"></div>
+  <button id="scrollBottom" class="scroll-bottom" title="回到底部" aria-label="回到底部">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    <span class="unread" hidden>0</span>
+  </button>
+  <footer class="composer" id="composer">
+    <div id="imgPreview" class="img-preview" hidden></div>
+    <div class="composer-row">
+      <input id="imgInput" type="file" accept="image/*" multiple hidden>
+      <button id="imgBtn" class="icon-btn composer-ic" title="发送图片" aria-label="发送图片">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+      </button>
+      <button id="micBtn" class="icon-btn composer-ic" title="语音输入" aria-label="语音输入">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+      </button>
+      <textarea id="input" rows="1" placeholder="输入消息，Enter 发送" autocomplete="off"></textarea>
+      <button id="sendBtn" class="btn primary send-btn" aria-label="发送">
+        <span class="send-text">发送</span>
+        <svg class="send-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      </button>
+      <button id="stopBtn" class="btn danger stop-btn" hidden>
+        <span class="stop-text">停止</span>
+        <span class="stop-dot" aria-hidden="true"></span>
+      </button>
+    </div>
+  </footer>
+</div>
+
+<!-- ========== 文件查看弹层 ========== -->
+<div id="fileModal" class="modal" hidden>
+  <div class="modal-box">
+    <header class="modal-head">
+      <span id="fileTitle" class="ellipsis"></span>
+      <button id="fileClose" class="icon-btn" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </header>
+    <pre id="fileBody" class="file-body"></pre>
+  </div>
+</div>
+
+<!-- ========== 项目切换弹层（底部抽屉） ========== -->
+<div id="projectDrawer" class="drawer" hidden>
+  <div class="drawer-backdrop"></div>
+  <div class="drawer-panel">
+    <header class="drawer-head">
+      <h3>切换项目</h3>
+      <button class="icon-btn drawer-close" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </header>
+    <div class="drawer-search">
+      <svg class="search-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input id="projectSearchInput" type="search" placeholder="搜索项目…" autocomplete="off">
+    </div>
+    <div id="projectDrawerList" class="drawer-list"></div>
+  </div>
+</div>
+
+<!-- ========== 新建会话引导弹层 ========== -->
+<div id="newConvModal" class="modal" hidden>
+  <div class="modal-box modal-box-md">
+    <header class="modal-head">
+      <h3>新建会话</h3>
+      <button id="newConvClose" class="icon-btn" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </header>
+    <div class="modal-body">
+      <label class="form-label">Agent</label>
+      <div id="agentChips" class="chip-group"></div>
+      <label class="form-label">模型 <span class="muted">（可选）</span></label>
+      <div id="modelChips" class="chip-group"></div>
+      <label class="form-label">首条消息 <span class="muted">（可选）</span></label>
+      <textarea id="newConvFirstMsg" class="form-textarea" rows="3" placeholder="输入会话的初始目标…（不填也可以，建好再发）"></textarea>
+      <p class="form-hint" id="newConvHint"></p>
+    </div>
+    <footer class="modal-foot">
+      <button class="btn" id="newConvCancel">取消</button>
+      <button class="btn primary" id="newConvSubmit">创建</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ========== 自定义对话框（confirm/alert/prompt） ========== -->
+<div id="customDialog" class="modal" hidden>
+  <div class="modal-box modal-box-sm">
+    <div class="modal-body">
+      <h3 id="dlgTitle" class="dlg-title">提示</h3>
+      <p id="dlgMsg" class="dlg-msg"></p>
+      <input id="dlgInput" class="form-input" type="text" hidden>
+    </div>
+    <footer class="modal-foot">
+      <button class="btn" id="dlgCancel">取消</button>
+      <button class="btn primary" id="dlgOk">确定</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ========== 搜索结果预览 ========== -->
+<div id="searchPreview" class="modal" hidden>
+  <div class="modal-box modal-box-md">
+    <header class="modal-head">
+      <div>
+        <div id="previewTitle" class="dlg-title" style="margin:0;font-size:14px"></div>
+        <div id="previewMeta" class="muted" style="font-size:11.5px;margin-top:2px"></div>
+      </div>
+      <button id="previewClose" class="icon-btn" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </header>
+    <div id="previewBody" class="preview-body"></div>
+    <footer class="modal-foot">
+      <button class="btn" id="previewCancel">关闭</button>
+      <button class="btn primary" id="previewOpen">打开会话</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ========== 长按上下文菜单（会话项） ========== -->
+<div id="contextMenu" class="menu context-menu" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

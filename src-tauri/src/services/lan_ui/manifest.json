@@ -1,0 +1,16 @@
+{
+  "name": "DevEco Switch 局域网访问",
+  "short_name": "DevEco LAN",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#171717",
+  "theme_color": "#4b3fe3",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

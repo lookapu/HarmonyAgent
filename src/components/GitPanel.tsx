@@ -9,20 +9,32 @@ import {
   gitWorktreeCreate,
   gitWorktreeRemove,
   gitWorktreeMerge,
-  setProjectWorktree,
   type GitBranchInfo,
   type WorktreeInfo,
 } from '../api/git'
 import type { Project } from '../api/project'
 
+/** localStorage key 前缀：持久化每个项目在 Git 面板选中的仓库目录（一个根目录下多个 git 仓库时） */
+const LS_GIT_REPO_PREFIX = 'deveco-switch:git-repo:'
+
+function readGitRepo(projectId: string): string | null {
+  try { return localStorage.getItem(LS_GIT_REPO_PREFIX + projectId) } catch { return null }
+}
+
+function writeGitRepo(projectId: string, repo: string) {
+  try { localStorage.setItem(LS_GIT_REPO_PREFIX + projectId, repo) } catch { /* ignore */ }
+}
+
 interface Props {
   project: Project
-  /** 绑定/解除绑定后由外层刷新项目（worktree_path 变更） */
-  onProjectUpdated: () => void
+  /** 当前会话绑定的 worktree（只读指示，null=本地模式） */
+  sessionWorktree?: { path: string; branch: string | null } | null
+  /** 在指定 worktree 上新建会话（worktree 模式） */
+  onNewWorktreeConversation: (wt: { path: string; branch: string }) => void
 }
 
 /** 右侧面板：Git（分支切换 + worktree 管理）。绑定 worktree 后 Agent 任务在 worktree 目录执行。 */
-export default function GitPanel({ project, onProjectUpdated }: Props) {
+export default function GitPanel({ project, sessionWorktree, onNewWorktreeConversation }: Props) {
   const { t } = useTranslation()
   const [info, setInfo] = useState<GitBranchInfo | null>(null)
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([])
@@ -46,7 +58,13 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
       // 仓库发现：根目录是仓库返回原路径；否则下沉一级子目录收集，供多仓库切换
       const discovered = await gitDiscoverRepos(project.path).catch(() => [] as string[])
       setRepos(discovered)
-      const target = activeRepo && discovered.includes(activeRepo) ? activeRepo : (discovered[0] ?? project.path)
+      // 优先恢复本项目上次选中的仓库；其次沿用当前 activeRepo；最后回退到第一个仓库
+      const persisted = readGitRepo(project.id)
+      const target = (persisted && discovered.includes(persisted))
+        ? persisted
+        : (activeRepo && discovered.includes(activeRepo))
+          ? activeRepo
+          : (discovered[0] ?? project.path)
       if (target !== activeRepo) setActiveRepo(target)
       const [b, w] = await Promise.all([
         gitBranchInfo(target).catch(() => null),
@@ -57,7 +75,7 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
     } finally {
       setLoading(false)
     }
-  }, [project.path, activeRepo])
+  }, [project.path, project.id, activeRepo])
 
   useEffect(() => {
     setErr(null)
@@ -101,23 +119,14 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
   const removeWt = (wt: WorktreeInfo) =>
     run(`remove:${wt.path}`, () => gitWorktreeRemove(gitRoot, wt.path))
 
-  const bindWt = (wt: WorktreeInfo) =>
-    run(`bind:${wt.path}`, async () => {
-      await setProjectWorktree(project.id, wt.path)
-      onProjectUpdated()
-    })
-
-  const unbind = () =>
-    run('unbind', async () => {
-      await setProjectWorktree(project.id, null)
-      onProjectUpdated()
-    })
+  const newConvWt = (wt: WorktreeInfo) => {
+    onNewWorktreeConversation({ path: wt.path, branch: wt.branch })
+  }
 
   const mergeWt = (wt: WorktreeInfo) =>
     run(`merge:${wt.path}`, () => gitWorktreeMerge(gitRoot, wt.path))
 
   const isRepo = !!info?.is_repo
-  const boundPath = project.worktree_path
   const branchOptions = info?.branches.filter((b) => !b.is_remote) ?? []
 
   /** 仓库显示名：项目目录内的相对路径，越界时用绝对路径 */
@@ -156,14 +165,36 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
         </div>
       )}
 
+      {/* ============ 当前会话 worktree 指示（只读） ============ */}
+      {sessionWorktree && (
+        <div className="rounded-xl border border-[var(--accent)]/25 bg-[var(--accent-soft)]/40 p-2.5">
+          <div className="flex items-center gap-1.5">
+            <Icon name="git-branch" size={12} className="text-[var(--accent)] shrink-0" />
+            <span className="text-[10.5px] font-medium text-[var(--accent)]">{t('home.gitSessionWorktree')}</span>
+            {sessionWorktree.branch && (
+              <span className="ml-auto shrink-0 text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--accent)]/10 text-[var(--accent)] font-mono">
+                {sessionWorktree.branch}
+              </span>
+            )}
+          </div>
+          <div className="mt-1 text-[10px] font-mono text-[var(--text-muted)] truncate" title={sessionWorktree.path}>
+            {sessionWorktree.path}
+          </div>
+        </div>
+      )}
+
       {/* ============ 多仓库选择（根目录非仓库时下沉一级发现） ============ */}
       {repos.length > 1 && (
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-2">
+        <div className="rounded-xl modern-card p-2">
           <div className="flex items-center gap-1.5">
             <Icon name="git-branch" size={12} className="text-[var(--text-secondary)] shrink-0" />
             <select
               value={activeRepo ?? project.path}
-              onChange={(e) => setActiveRepo(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value
+                setActiveRepo(v)
+                writeGitRepo(project.id, v)
+              }}
               title={t('home.gitSelectRepo')}
               className="flex-1 min-w-0 h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)] transition-colors"
             >
@@ -178,7 +209,7 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
       )}
 
       {/* ============ 分支区 ============ */}
-      <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-3">
+      <div className="rounded-xl modern-card p-3">
         <div className="flex items-center gap-1.5 mb-2.5">
           <Icon name="git-branch" size={13} className="text-[var(--text-secondary)]" />
           <span className="text-[12px] font-medium">{t('home.gitBranches')}</span>
@@ -276,41 +307,17 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
 
       {/* ============ Worktree 区 ============ */}
       {isRepo && (
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-3">
+        <div className="rounded-xl modern-card p-3">
           <div className="flex items-center gap-1.5 mb-1">
             <Icon name="folder" size={13} className="text-[var(--text-secondary)]" />
             <span className="text-[12px] font-medium">{t('home.gitWorktrees')}</span>
           </div>
           <p className="text-[10.5px] text-[var(--text-muted)] leading-relaxed mb-2.5">{t('home.gitWorktreeTip')}</p>
 
-          {/* 已绑定提示 */}
-          {boundPath && (
-            <div className="mb-2 rounded-lg border border-[var(--accent)]/25 bg-[var(--accent)]/8 p-2">
-              <div className="flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
-                <span className="text-[10.5px] text-[var(--accent)] font-medium">{t('home.gitBoundHint')}</span>
-              </div>
-              <div className="mt-1 flex items-center gap-1.5">
-                <span className="flex-1 min-w-0 text-[10.5px] font-mono text-[var(--text-secondary)] truncate" title={boundPath}>
-                  {boundPath}
-                </span>
-                <button
-                  onClick={unbind}
-                  disabled={busy !== null}
-                  className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
-                >
-                  {busy === 'unbind' ? '…' : t('home.gitUnbind')}
-                </button>
-              </div>
-            </div>
-          )}
-
           {/* worktree 列表 */}
           <div className="space-y-1.5">
-            {worktrees.map((wt) => {
-              const isBound = !!boundPath && wt.path.trimEnd().replace(/[\\/]+$/, '') === boundPath.trimEnd().replace(/[\\/]+$/, '')
-              return (
-                <div key={wt.path} className={`rounded-lg border p-2 ${isBound ? 'border-[var(--accent)]/30 bg-[var(--accent)]/5' : 'border-[var(--border)] bg-[var(--bg-window)]/50'}`}>
+            {worktrees.map((wt) => (
+                <div key={wt.path} className="rounded-lg border p-2 border-[var(--border)] bg-[var(--bg-window)]/50">
                   <div className="flex items-center gap-1.5 min-w-0">
                     <Icon name={wt.is_main ? 'bolt' : 'folder'} size={11} className="shrink-0 opacity-50" />
                     <span className="text-[11px] font-mono font-medium truncate" title={wt.path}>
@@ -323,15 +330,12 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
                   {!wt.is_main && (
                     <div className="mt-1.5 flex items-center gap-1">
                       <button
-                        onClick={() => bindWt(wt)}
-                        disabled={busy !== null || isBound}
-                        className={`flex-1 text-[10px] px-1.5 py-1 rounded-md transition-colors disabled:opacity-40 ${
-                          isBound
-                            ? 'text-[var(--accent)] bg-[var(--accent-soft)] cursor-default'
-                            : 'text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
-                        }`}
+                        onClick={() => newConvWt(wt)}
+                        disabled={busy !== null}
+                        title={t('home.newConversation')}
+                        className="flex-1 text-[10px] px-1.5 py-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
                       >
-                        {isBound ? t('home.gitBound') : t('home.gitBind')}
+                        {t('home.newConversation')}
                       </button>
                       <button
                         onClick={() => mergeWt(wt)}
@@ -352,8 +356,7 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
                     </div>
                   )}
                 </div>
-              )
-            })}
+              ))}
             {worktrees.length === 0 && (
               <div className="py-3 text-center text-[11px] text-[var(--text-muted)]">{t('home.gitWorktreeEmpty')}</div>
             )}
@@ -381,7 +384,7 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
               <button
                 onClick={createWt}
                 disabled={!createBranch.trim() || busy !== null}
-                className="shrink-0 h-7 px-3 rounded-lg bg-[var(--accent)] text-white text-[11px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
+                className="shrink-0 h-7 px-3 rounded-lg btn-primary text-[11px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
               >
                 {busy === 'create' ? '…' : t('home.gitCreate')}
               </button>
@@ -398,3 +401,5 @@ export default function GitPanel({ project, onProjectUpdated }: Props) {
     </div>
   )
 }
+
+

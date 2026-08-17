@@ -28,3 +28,31 @@ src-tauri/target/
 *.njsproj
 *.sln
 *.sw?
+
+# 开发期临时调试产物（已归档到 scripts/legacy/ 留档）
+# OCR 临时输出
+ocr_*.txt
+# 像素扫描临时输出
+pixel_*.txt
+# 屏幕区域扫描临时输出
+scan_*.txt
+# Vite 构建日志
+vite.log
+# Rust 编译试验产物
+min_test.exe
+min_test.pdb
+# 0 字节误建文件
+/-
+# 一次性标记文件
+*.flag
+
+# 备份文件
+*.bak
+
+# ohpm 面板运行时缓存（IDE 拉取数据，可重建）
+_ide.json
+
+# 开发期截图与测试脚手架（不对外发布）
+screenshots/
+_e2e_new_harmony/
+_lsp_test/

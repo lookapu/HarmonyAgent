@@ -10,6 +10,10 @@ pub(super) struct ReadFileRequest {
     pub path: Option<String>,
     /// 骨架模式：只输出结构定义行（import/类/函数等），快速了解大文件
     pub outline: Option<bool>,
+    /// 骨架分页（1 起，缺省第 1 页；每页 200 条，大文件结构项多时翻页查看）
+    pub outline_page: Option<u32>,
+    /// 骨架类型过滤（如 "函数"/"类型"/"组件"）：只显示标签含该词的条目，分页在过滤后集合上进行
+    pub outline_filter: Option<String>,
     /// 起始行号（1 起，缺省 1）
     pub start: Option<u64>,
     /// 读取行数（缺省读到文件尾，单次最多 2000 行）
@@ -28,7 +32,7 @@ impl ReadFileRequest {
         if raw.is_empty() {
             return Err("read_file 需要参数 {\"path\":\"<文件路径>\"}".into());
         }
-        let p = resolve_in_roots(roots, raw)?;
+        let p = resolve_readable(roots, raw)?;
         if !p.is_file() {
             return Err(format!("路径不是文件: {}", p.display()));
         }
@@ -42,6 +46,8 @@ impl ReadFileRequest {
         Ok(ReadFileSpec {
             path: p,
             outline: self.outline.unwrap_or(false),
+            outline_page: self.outline_page.unwrap_or(1).max(1),
+            outline_filter: self.outline_filter.filter(|f| !f.trim().is_empty()),
             start: self.start.unwrap_or(1).max(1),
             lines: self.lines.unwrap_or(0),
         })
@@ -54,6 +60,10 @@ pub(super) struct ReadFileSpec {
     pub path: PathBuf,
     /// 是否骨架模式
     pub outline: bool,
+    /// 骨架分页（≥1，缺省 1）
+    pub outline_page: u32,
+    /// 骨架类型过滤（None = 不过滤）
+    pub outline_filter: Option<String>,
     /// 起始行号（≥1）
     pub start: u64,
     /// 读取行数（0 表示读到文件尾）
@@ -117,6 +127,17 @@ pub(super) struct EditFileRequest {
     /// 代码块模式：按该行号定位所在完整方法/函数/代码块并整体替换（new 为空 = 整块删除）。
     /// 语言感知成对匹配：不固定行数，块有多长就替换多长，杜绝漏掉结束符。
     pub start: Option<u64>,
+    /// 块锚签名（可选，start 模式）：期望的块定义行内容片段（如 "fn parse"）。
+    /// 行号因先前编辑漂移时不致改错块：定位到的块首行不含 anchor 时，
+    /// 在 ±100 行内搜索含 anchor 的块根行重新定位；找不到则拒绝。
+    pub anchor: Option<String>,
+    /// 批量块模式：多个行号一次定位多个完整块整体替换（与 old/start 互斥）。
+    /// 与 news 一一对应；全部块先在原文上定位（行号互不漂移）再统一拼接。
+    pub starts: Option<Vec<u64>>,
+    /// 批量模式的各块新内容（空串 = 整块删除），与 starts 等长
+    pub news: Option<Vec<String>>,
+    /// 批量模式各块的锚签名（可选，与 starts 等长；元素可为 null）
+    pub anchors: Option<Vec<Option<String>>>,
 }
 
 impl EditFileRequest {
@@ -130,12 +151,43 @@ impl EditFileRequest {
         if raw.is_empty() {
             return Err("edit_file 需要参数 {\"path\":\"<文件路径>\",\"old\":\"<原文>\",\"new\":\"<新文>\"}".into());
         }
+        let batch = self.starts.is_some();
+        if batch && (self.old.is_some() || self.start.is_some()) {
+            return Err("edit_file 的 starts（批量块替换）与 old/start 参数互斥：批量模式只认 starts/news/anchors".into());
+        }
         if self.old.is_some() && self.start.is_some() {
             return Err("edit_file 的 old 与 start 参数互斥：old=精确文本替换；start=按代码块整体替换（start 定位所在完整方法/块，不固定行数）".into());
         }
+        // 批量模式参数校验：starts 非空、news 等长、anchors 可选但须等长
+        let starts = self.starts.clone();
+        let news = self.news.clone();
+        let anchors = self.anchors.clone();
+        if batch {
+            let st = starts.as_deref().unwrap_or(&[]);
+            if st.is_empty() {
+                return Err("edit_file 批量模式 starts 数组不能为空".into());
+            }
+            let ns = news.as_deref().unwrap_or(&[]);
+            if ns.len() != st.len() {
+                return Err(format!(
+                    "edit_file 批量模式 starts（{} 项）与 news（{} 项）长度必须一致",
+                    st.len(),
+                    ns.len()
+                ));
+            }
+            if let Some(an) = anchors.as_deref() {
+                if an.len() != st.len() {
+                    return Err(format!(
+                        "edit_file 批量模式 anchors（{} 项）与 starts（{} 项）长度必须一致（无需锚的项传 null）",
+                        an.len(),
+                        st.len()
+                    ));
+                }
+            }
+        }
         let old = self.old.unwrap_or_default();
-        if old.is_empty() && self.start.is_none() {
-            return Err("edit_file 需要 old 参数（原文片段），或用 start 参数按代码块整体替换".into());
+        if old.is_empty() && self.start.is_none() && !batch {
+            return Err("edit_file 需要 old 参数（原文片段），或用 start 参数按代码块整体替换，或用 starts/news 批量替换多个块".into());
         }
         let p = resolve_in_roots(roots, raw)?;
         if let Some(reason) = is_protected_file(&p) {
@@ -154,6 +206,17 @@ impl EditFileRequest {
             new: self.new.unwrap_or_default(),
             replace_all: self.replace_all.unwrap_or(false),
             start: self.start,
+            anchor: self.anchor.filter(|a| !a.trim().is_empty()),
+            starts: if batch { starts } else { None },
+            news: if batch { news.unwrap_or_default() } else { Vec::new() },
+            anchors: if batch {
+                anchors.unwrap_or_default()
+                    .into_iter()
+                    .map(|a| a.filter(|s| !s.trim().is_empty()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -170,6 +233,14 @@ pub(super) struct EditFileSpec {
     pub replace_all: bool,
     /// 代码块模式定位行（Some = 按完整代码块替换，忽略 old/replace_all）
     pub start: Option<u64>,
+    /// 块锚签名（start 模式防行号漂移；见 EditFileRequest.anchor）
+    pub anchor: Option<String>,
+    /// 批量块模式行号组（Some = 批量替换，忽略 old/start）
+    pub starts: Option<Vec<u64>>,
+    /// 批量模式各块新内容（与 starts 等长；空串 = 整块删除）
+    pub news: Vec<String>,
+    /// 批量模式各块锚签名（与 starts 等长；None = 该块不用锚）
+    pub anchors: Vec<Option<String>>,
 }
 
 pub(super) async fn delete_file(args: &Value, roots: &[String]) -> Result<String, String> {
@@ -206,6 +277,15 @@ pub(super) async fn delete_file(args: &Value, roots: &[String]) -> Result<String
     }
     if !target.exists() {
         return Err(format!("文件不存在: {rel}"));
+    }
+    // [58] dry-run：预览将删除的路径，不落盘、不移动
+    if args["dry_run"].as_bool().unwrap_or(false) {
+        return Ok(format!(
+            "【dry_run 预览】将删除（移入回收站可恢复）：{}（{}，{}）",
+            target.display(),
+            if target.is_dir() { "目录" } else { "文件" },
+            if let Ok(m) = std::fs::metadata(&target) { super::ui_tools::format_bytes(m.len()) } else { "未知大小".to_string() }
+        ));
     }
     // 移到回收站（保留相对路径结构以便恢复）
     let trash_root = root.join(".deveco-agent").join("trash");
@@ -292,11 +372,23 @@ pub(super) async fn move_file(args: &Value, roots: &[String]) -> Result<String, 
         }
     }
     if dst.exists() {
-        return Err(format!("目标已存在，拒绝覆盖: {}", dst.display()));
+        return Err(format!(
+            "目标已存在，拒绝覆盖: {}\n源路径: {}\n请先 list_dir 核对实际目录结构：若源路径拼错（如 entry/entry/src 出现嵌套重复），按真实结构重发；确认确实需要替换/合并时，先删除或清空旧目标再移动。",
+            dst.display(),
+            src.display()
+        ));
     }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("创建目标父目录失败 {}: {e}", parent.display()))?;
+    }
+    // [58] dry-run：预览移动目标（校验全部通过后，仅报告不执行）
+    if args["dry_run"].as_bool().unwrap_or(false) {
+        return Ok(format!(
+            "【dry_run 预览】将移动 {}\n             → {}\n（校验已通过：非受保护路径、目标不存在）",
+            src.display(),
+            dst.display()
+        ));
     }
     // 跨设备移动兜底：先 rename，失败则 copy + remove（与 delete_file 同模式）
     match std::fs::rename(&src, &dst) {
@@ -314,18 +406,26 @@ pub(super) async fn move_file(args: &Value, roots: &[String]) -> Result<String, 
     }
 }
 
-/// undo_edit：按栈序（LIFO）恢复最近一次文件修改前的快照
+/// undo_edit：按栈序（LIFO）恢复最近一次文件修改前的快照；
+/// preview=true 时只展示将恢复的 diff 不落盘（撤销预览）。
 pub(super) async fn undo_edit(args: &Value, roots: &[String], conversation_id: &str) -> Result<String, String> {
     let count = args["count"].as_u64().unwrap_or(1).clamp(1, 10) as usize;
+    let preview = args["preview"].as_bool().unwrap_or(false);
+    if preview {
+        return undo_preview(conversation_id, roots, count);
+    }
     let mut restored: Vec<String> = Vec::new();
     for _ in 0..count {
         let Some(s) = crate::agent::undo::pop_undo(conversation_id) else {
             break;
         };
-        // 恢复前校验路径仍在会话可见根内（跨项目快照不可恢复）
+        // 恢复前校验路径仍在会话可见根内（跨项目快照不可恢复）。
+        // 注意：canonicalize 在 Windows 返回 \\?\ 前缀路径，而快照路径已 normalize
+        // 剥掉前缀——直接 starts_with 会永远失配（undo 静默失效），须同口径归一化。
         let allowed = roots.iter().any(|r| {
             let rc = std::fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r));
-            s.path.starts_with(&rc)
+            let rc = PathBuf::from(crate::utils::path::normalize_path(&rc.to_string_lossy()));
+            crate::utils::path::path_within(&s.path, &rc)
         });
         if !allowed {
             continue;
@@ -352,6 +452,97 @@ pub(super) async fn undo_edit(args: &Value, roots: &[String], conversation_id: &
         out.push_str(&format!("- {p}\n"));
     }
     Ok(out)
+}
+
+/// 撤销预览：不弹出快照，逐条展示将恢复的改动（行级 diff），供模型/用户确认后再真正撤销。
+fn undo_preview(conversation_id: &str, roots: &[String], count: usize) -> Result<String, String> {
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..count {
+        let Some(s) = crate::agent::undo::peek_at(conversation_id, i) else { break };
+        let allowed = roots.iter().any(|r| {
+            let rc = std::fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r));
+            s.path.starts_with(&rc)
+        });
+        if !allowed {
+            continue;
+        }
+        parts.push(format_undo_diff(&s));
+    }
+    if parts.is_empty() {
+        return Ok("没有可撤销的修改（本会话尚无 Agent 文件写入记录）".into());
+    }
+    let remain = crate::agent::undo::undo_count(conversation_id);
+    let mut out = format!(
+        "撤销预览（将恢复 {} 处，剩余可撤销 {remain} 步；确认后去掉 preview 参数重新调用即可真正恢复）：\n",
+        parts.len()
+    );
+    for p in parts {
+        out.push_str(&p);
+    }
+    Ok(out)
+}
+
+/// 生成单文件撤销 diff：修改时间 + 行数对比 + 中间变化段（- 旧行 / + 新行 / 空格上下文行）。
+fn format_undo_diff(s: &crate::agent::undo::Snapshot) -> String {
+    let cur = std::fs::read(&s.path).unwrap_or_default();
+    let old_lines: Vec<String> = String::from_utf8_lossy(&s.content).lines().map(String::from).collect();
+    let cur_lines: Vec<String> = String::from_utf8_lossy(&cur).lines().map(String::from).collect();
+    let at = chrono::DateTime::from_timestamp(s.at, 0)
+        .map(|d| d.format("%H:%M:%S").to_string())
+        .unwrap_or_default();
+    // 裁剪共同前缀/后缀，只对比中间变化段（大文件/小幅改动时输出最小化）
+    let mut i = 0usize;
+    while i < old_lines.len() && i < cur_lines.len() && old_lines[i] == cur_lines[i] {
+        i += 1;
+    }
+    let mut j_old = old_lines.len();
+    let mut j_cur = cur_lines.len();
+    while j_old > i && j_cur > i && old_lines[j_old - 1] == cur_lines[j_cur - 1] {
+        j_old -= 1;
+        j_cur -= 1;
+    }
+    let mut out = format!(
+        "\n- {}（修改于 {at}，旧 {} 行 → 当前 {} 行）\n",
+        s.path.display(),
+        old_lines.len(),
+        cur_lines.len()
+    );
+    const MAX_SHOWN: usize = 40;
+    let mut o = i;
+    let mut c = i;
+    let mut shown = 0;
+    while o < j_old || c < j_cur {
+        if shown >= MAX_SHOWN {
+            out.push_str(&format!(
+                "  …（其余 {} 行变化省略）\n",
+                (j_old - o) + (j_cur - c)
+            ));
+            break;
+        }
+        if o < j_old && (c >= j_cur || old_lines[o] != cur_lines[c]) {
+            out.push_str(&format!("- {}\n", trunc_line(&old_lines[o])));
+            o += 1;
+        } else if c < j_cur && (o >= j_old || old_lines[o] != cur_lines[c]) {
+            out.push_str(&format!("+ {}\n", trunc_line(&cur_lines[c])));
+            c += 1;
+        } else {
+            out.push_str(&format!("  {}\n", trunc_line(&cur_lines[c])));
+            o += 1;
+            c += 1;
+        }
+        shown += 1;
+    }
+    out
+}
+
+/// 单行截断（预览护栏：每行最多 120 字符）
+fn trunc_line(s: &str) -> String {
+    let t: String = s.chars().take(120).collect();
+    if t.chars().count() < s.chars().count() {
+        format!("{t}…")
+    } else {
+        t
+    }
 }
 
 /// get_diagnostics：返回近期构建/部署失败的结构化归因清单（进程内缓存，1 小时 TTL）
@@ -685,7 +876,7 @@ pub(super) async fn list_dir(args: &Value, roots: &[String]) -> Result<String, S
     }
     let raw = args["path"].as_str().unwrap_or(".");
     let depth = args["depth"].as_u64().unwrap_or(1).clamp(1, 3) as u32;
-    let root = resolve_in_roots(roots, raw)?;
+    let root = resolve_readable(roots, raw)?;
     if !root.is_dir() {
         return Err(format!("路径不是目录: {}", root.display()));
     }
@@ -955,7 +1146,7 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
 
     // 骨架模式：只提取结构（导入/类/函数/接口/组件/装饰器等），帮助 Agent 先了解大文件
     if spec.outline {
-        return Ok(render_outline(p, &lines, meta.len()));
+        return Ok(render_outline(p, &lines, meta.len(), spec.outline_page, spec.outline_filter.as_deref()));
     }
 
     let start = spec.start as usize;
@@ -1151,9 +1342,72 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     ))
 }
 
+/// outline 条目的块区间：定义行 idx 所开块的首尾行（0 起，含）。
+/// 花括号语言：从定义行起找第一个「深度 0 的 `{`」（支持多行签名 fn foo(\\n..\\n) -> Bar {），
+/// 再取其配对闭合行；Python：def/class 缩进块。找不到（声明 `;`、属性等）返回 None。
+/// bindex：预构建的块索引（Some 时闭行查 open_close 表 O(1)，替代逐次 find_matching_close O(n)；
+/// None 时回退逐次扫描。两者语义等价：都取 b 行「最后一个未闭合开括号」的闭合行）。
+fn outline_block_range(
+    lines: &[&str],
+    idx: usize,
+    ext: &str,
+    bindex: Option<&BlockIndex>,
+) -> Option<(usize, usize)> {
+    // 声明（`;` 结尾）/属性/装饰器行无块体：直接无区间，
+    // 否则向前搜 `{` 会误吞下一个定义的块
+    let t = lines.get(idx)?.trim();
+    if t.ends_with(';') || t.starts_with("#[") || t.starts_with('@') {
+        return None;
+    }
+    match block_style(ext) {
+        BlockStyle::Indent => find_indent_block(lines, idx),
+        BlockStyle::None => None,
+        BlockStyle::Brace => {
+            // 从定义行起做括号深度扫描，找方法体 `{`（签名内 () 的深度已计入）
+            let mut depth: i32 = 0;
+            let mut sc = LineScanner::default();
+            let mut brace_line: Option<usize> = None;
+            let search_end = (idx + 40).min(lines.len());
+            for (i, line) in lines.iter().enumerate().take(search_end).skip(idx) {
+                let mut found = false;
+                sc.scan(line, ext, |c| {
+                    if found {
+                        return;
+                    }
+                    match c {
+                        '{' if depth == 0 => {
+                            brace_line = Some(i);
+                            found = true;
+                        }
+                        '{' | '(' | '[' => depth += 1,
+                        '}' | ')' | ']' => depth -= 1,
+                        _ => {}
+                    }
+                });
+                if found {
+                    break;
+                }
+            }
+            let b = brace_line?;
+            let close = match bindex {
+                Some(bi) => BlockIndex::get(&bi.open_close, b)?,
+                None => find_matching_close(lines, b, ext)?,
+            };
+            Some((idx.min(b), close))
+        }
+    }
+}
+
 /// 生成代码文件骨架：仅保留结构定义行（导入、类/接口/struct/enum、函数/方法、组件、装饰器），
 /// 帮助 Agent 在不读取全文的情况下快速了解大文件结构，再决定精读哪段。
-pub(super) fn render_outline(p: &Path, lines: &[&str], byte_len: u64) -> String {
+/// 行号列为「定义行-块尾行」区间（语言感知块对齐联动）：可直接按区间整读/整块编辑。
+pub(super) fn render_outline(
+    p: &Path,
+    lines: &[&str],
+    byte_len: u64,
+    page: u32,
+    filter: Option<&str>,
+) -> String {
     let ext = p
         .extension()
         .and_then(|e| e.to_str())
@@ -1162,10 +1416,36 @@ pub(super) fn render_outline(p: &Path, lines: &[&str], byte_len: u64) -> String 
     let mut out = String::new();
     let mut last_was_import = false;
     let mut import_count = 0usize;
-    let mut shown = 0usize;
-    const MAX_ENTRIES: usize = 200;
+    let mut total_entries = 0usize; // 全量结构项数（分页统计用，不随页截断；filter 时只计匹配项）
+    let mut shown = 0usize; // 本页已显示条数
+    const MAX_ENTRIES: usize = 200; // 每页条数
+    let skip = (page as usize - 1) * MAX_ENTRIES;
+    // 块索引复用：花括号语言一次 O(n) 构建，200 条区间的闭行查询从 O(200n) 降为 O(n)+O(1)
+    let style = block_style(&ext);
+    let bindex = if style == BlockStyle::Brace {
+        Some(BlockIndex::build(lines, &ext))
+    } else {
+        None
+    };
+    // 层级跟踪：花括号语言按未闭括号深度，Python 按行首缩进/4；本行处理前的深度 = 该行定义的结构层级
+    let mut depth: usize = 0;
+    let mut dsc = LineScanner::default();
 
     for (idx, raw) in lines.iter().enumerate() {
+        let depth_here = match style {
+            BlockStyle::Brace => depth.min(10),
+            BlockStyle::Indent => (raw.chars().take_while(|&c| c == ' ').count() / 4).min(10),
+            BlockStyle::None => 0,
+        };
+        if style == BlockStyle::Brace {
+            dsc.scan(raw, &ext, |c| {
+                if matches!(c, '{' | '(' | '[') {
+                    depth += 1;
+                } else {
+                    depth = depth.saturating_sub(1);
+                }
+            });
+        }
         let line = raw.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with('*') || line.starts_with("/*") {
             continue;
@@ -1183,37 +1463,71 @@ pub(super) fn render_outline(p: &Path, lines: &[&str], byte_len: u64) -> String 
             last_was_import = true;
             continue;
         } else if last_was_import {
-            out.push_str(&format!("  … ({import_count} 条导入已折叠)…\n"));
+            if skip == 0 {
+                // 导入折叠摘要只在第 1 页显示（后续页的导入统计意义不大）
+                out.push_str(&format!("  … ({import_count} 条导入已折叠)…\n"));
+            }
             last_was_import = false;
-        }
-
-        if shown >= MAX_ENTRIES {
-            continue;
         }
 
         let kind = outline_kind(line, &ext);
         if let Some(label) = kind {
-            let snippet: String = raw.chars().take(160).collect();
-            out.push_str(&format!("{lineno:>5} │ {label} {}\n", snippet.trim()));
-            shown += 1;
+            // kind 过滤：不匹配的条目不渲染也不计数（分页在过滤后的集合上进行）
+            if let Some(f) = filter {
+                if !label.contains(f) {
+                    continue;
+                }
+            }
+            // 分页：先数全量序号，再决定本页是否渲染
+            if total_entries >= skip && shown < MAX_ENTRIES {
+                let snippet: String = raw.chars().take(160).collect();
+                // 块区间联动：定义行 → 完整块首尾（声明/属性等由 helper 判无块）
+                let loc = match outline_block_range(lines, idx, &ext, bindex.as_ref()) {
+                    Some((o, c)) if c > o => format!("{:>5}-{}", o + 1, c + 1),
+                    _ => format!("{lineno:>5}"),
+                };
+                // 层级缩进：嵌套定义（类内方法等）按深度缩进，骨架结构一眼可读
+                let indent = if depth_here > 0 { "  ".repeat(depth_here) } else { String::new() };
+                out.push_str(&format!("{loc} │ {indent}{label} {}\n", snippet.trim()));
+                shown += 1;
+            }
+            total_entries += 1;
         }
     }
-    if last_was_import {
+    if last_was_import && skip == 0 {
         out.push_str(&format!("  … ({import_count} 条导入已折叠)…\n"));
     }
 
+    let pages = total_entries.div_ceil(MAX_ENTRIES);
     let mut header = format!(
-        "文件 {}（{}，共 {} 行）骨架：\n",
+        "文件 {}（{}，共 {} 行）骨架（行号列为 定义行-块尾行 区间）：\n",
         p.display(),
         human_size(byte_len),
         lines.len()
     );
+    if pages > 1 {
+        let page = page.min(pages as u32); // 超界页码钳到末页
+        header.push_str(&format!("共 {total_entries} 条结构项 / {pages} 页，当前第 {page} 页（每页 {MAX_ENTRIES} 条）。\n"));
+    }
+    if let Some(f) = filter {
+        header.push_str(&format!("（已按类型过滤：仅显示「{f}」类条目，共 {total_entries} 条；去掉 outline_filter 查看全部）\n"));
+    }
+    header.push_str("提示：按区间整块操作——read_file {\"start\":区间起点,\"lines\":区间长度} 精读整个方法；edit_file {\"start\":区间起点} 整块替换/删除。\n");
     if out.is_empty() {
-        header.push_str("（未能识别出结构化定义，可能是非代码文件或使用了非常规语法；请用 start/lines 直接读取）\n");
+        if total_entries == 0 {
+            header.push_str("（未能识别出结构化定义，可能是非代码文件或使用了非常规语法；请用 start/lines 直接读取）\n");
+        } else {
+            header.push_str(&format!(
+                "outline_page={page} 超出总页数（共 {pages} 页）；请传 1–{pages} 之间的页码\n"
+            ));
+        }
     } else {
         header.push_str(&out);
-        if shown >= MAX_ENTRIES {
-            header.push_str(&format!("…(结构项超过 {MAX_ENTRIES}，已截断；可用 start/lines 精读目标段落)\n"));
+        if pages > 1 && (page as usize) < pages {
+            header.push_str(&format!(
+                "…（还有下一页：read_file 传 outline=true,outline_page={} 查看后续 {MAX_ENTRIES} 条）\n",
+                page + 1
+            ));
         }
     }
     truncate_out_max(&header, 12000)
@@ -1289,10 +1603,10 @@ pub(super) fn outline_kind(line: &str, ext: &str) -> Option<&'static str> {
 
     // Python
     if ext == "py" {
-        if starts_with_word(line, "def ") || starts_with_word(line, "async def ") {
+        if starts_with_word(line, "def") || starts_with_word(line, "async def") {
             return Some("函数");
         }
-        if starts_with_word(line, "class ") {
+        if starts_with_word(line, "class") {
             return Some("类型");
         }
         return None;
@@ -1300,8 +1614,8 @@ pub(super) fn outline_kind(line: &str, ext: &str) -> Option<&'static str> {
 
     // C/C++/Java/Kotlin/Swift
     if matches!(ext, "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "java" | "kt" | "swift") {
-        if starts_with_word(line, "class ") || starts_with_word(line, "interface ")
-            || starts_with_word(line, "struct ") || starts_with_word(line, "enum ")
+        if starts_with_word(line, "class") || starts_with_word(line, "interface")
+            || starts_with_word(line, "struct") || starts_with_word(line, "enum")
         {
             return Some("类型");
         }
@@ -1316,11 +1630,40 @@ pub(super) fn outline_kind(line: &str, ext: &str) -> Option<&'static str> {
 
     // Go
     if ext == "go" {
-        if starts_with_word(line, "func ") {
+        // 注意用 starts_with（"func " 自带空格已保证整词）：starts_with_word 要求
+        // word 后非标识符字符，带空格调用会因函数名紧跟而恒 false（历史 bug）
+        if line.starts_with("func ") {
             return Some("函数");
         }
-        if starts_with_word(line, "type ") {
+        if line.starts_with("type ") {
             return Some("类型");
+        }
+        return None;
+    }
+
+    // Dart/C#/PHP/Scala/Groovy（block_style 认识但此前 outline 不识别 → 骨架为空）
+    if matches!(ext, "dart" | "cs" | "php" | "scala" | "groovy") {
+        // 剥离修饰符前缀后按定义关键字判定
+        let mut t = line;
+        loop {
+            let stripped = ["public ", "private ", "protected ", "internal ", "static ",
+                "final ", "abstract ", "open ", "override ", "async ", "sealed ", "case ", "extern "]
+                .iter()
+                .find_map(|p| t.strip_prefix(p));
+            match stripped {
+                Some(s) => t = s,
+                None => break,
+            }
+        }
+        if starts_with_any(t, &["class ", "interface ", "struct ", "enum ", "object ", "trait ", "mixin "]) {
+            return Some("类型");
+        }
+        if t.starts_with("def ") || t.starts_with("function ") || t.starts_with("func ") {
+            return Some("函数");
+        }
+        // 通用方法签名：含 ( 且以 { 结尾（void main() { / Future<void> f() { / void F() {）
+        if t.contains('(') && line.ends_with('{') && looks_like_method(line) {
+            return Some("函数");
         }
         return None;
     }
@@ -1398,20 +1741,65 @@ pub(super) fn block_style(ext: &str) -> BlockStyle {
     }
 }
 
-/// 跨行扫描状态：块注释（/* */）与多行字符串（` 模板串等）跨行持续
+/// 跨行扫描状态：块注释（/* */）与多行字符串（` 模板串、三引号等）跨行持续
 #[derive(Default)]
 pub(super) struct LineScanner {
     in_block_comment: bool,
     in_str: Option<char>,
+    /// Rust 原始字符串（r"…" / r#"…"# / r##"…"##，含 br/cr 前缀）：
+    /// 记录开头的 `#` 数量，闭合 = `"` 后跟同等数量 `#`；无转义语义。
+    in_raw: Option<u32>,
+    /// 三引号字符串（Kotlin/Dart/Scala/Groovy 的 `"""`、Python 的 `"""`/`'''`）：
+    /// 记录定界引号字符，闭合 = 同种三连引号；无转义语义，可跨行。
+    in_triple: Option<char>,
+    /// JS 系正则字面量（/…/）：字符类 [ ] 内的 `/` 不闭合。
+    /// 正则字面量不允许裸换行，行尾自动退出（防止一行误判吞掉后续行）。
+    in_regex: bool,
+    in_regex_class: bool,
+    /// 上一个非空白字符（正则/除法消歧启发式用，跨行保留）
+    prev_char: Option<char>,
 }
 
 impl LineScanner {
     /// 逐字符扫描一行，把「有意义的括号字符」按出现顺序交给 cb；
-    /// 字符串（" ' `）、转义、行注释（//，Python/Shell 的 #）、块注释（/* */）内的字符全部跳过。
+    /// 字符串（" ' `）、三引号字符串、Rust 原始字符串、正则字面量、转义、
+    /// 行注释（//，Python/Shell 的 #）、块注释（/* */）内的字符全部跳过。
     pub(super) fn scan(&mut self, line: &str, ext: &str, mut cb: impl FnMut(char)) {
         let hash_comment = matches!(ext, "py" | "pyw" | "sh" | "bash" | "zsh" | "fish");
+        let raw_str = ext == "rs";
+        // 三引号字符串语言：Python 双/三单引号，JVM/Dart 系仅三双引号
+        let triple: &[u8] = match ext {
+            "py" | "pyw" => b"\"'",
+            "kt" | "kts" | "dart" | "scala" | "groovy" => b"\"",
+            _ => b"",
+        };
+        // 正则字面量语言（JS 系）：`/` 可为除法或正则开头，用前驱字符消歧
+        let regex_lang = matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "ets" | "vue" | "svelte");
         let mut chars = line.char_indices().peekable();
-        while let Some((_, c)) = chars.next() {
+        while let Some((i, c)) = chars.next() {
+            // 原始字符串内：无转义，唯一出口是 `"` + N 个 `#`
+            if let Some(n) = self.in_raw {
+                if c == '"' {
+                    let rest = &line[i + 1..];
+                    let hashes: String = rest.chars().take(n as usize).collect();
+                    if hashes.len() == n as usize && hashes.chars().all(|h| h == '#') {
+                        for _ in 0..n {
+                            chars.next(); // 消费闭合的 #
+                        }
+                        self.in_raw = None;
+                    }
+                }
+                continue;
+            }
+            // 三引号字符串内：无转义，唯一出口是同种三连引号
+            if let Some(q) = self.in_triple {
+                if c == q && line[i..].starts_with(&format!("{q}{q}{q}")) {
+                    chars.next();
+                    chars.next(); // 消费闭合的其余两个引号
+                    self.in_triple = None;
+                }
+                continue;
+            }
             if let Some(q) = self.in_str {
                 if c == '\\' {
                     chars.next(); // 转义：跳过下一字符
@@ -1422,6 +1810,19 @@ impl LineScanner {
                 }
                 continue;
             }
+            if self.in_regex {
+                match c {
+                    '\\' => {
+                        chars.next(); // 转义：跳过下一字符
+                        continue;
+                    }
+                    '[' => self.in_regex_class = true,
+                    ']' => self.in_regex_class = false,
+                    '/' if !self.in_regex_class => self.in_regex = false,
+                    _ => {}
+                }
+                continue;
+            }
             if self.in_block_comment {
                 if c == '*' && chars.peek().map(|(_, n)| *n) == Some('/') {
                     chars.next();
@@ -1429,8 +1830,65 @@ impl LineScanner {
                 }
                 continue;
             }
+            // Rust 原始字符串开头：r 后跟 N 个 # 再跟 "（br#"/cr#" 的 b/c 作普通字符略过）。
+            // 检测时把开头的 # 与 " 一并消费（否则 n=0 时开头 " 会被误判为闭合）。
+            if raw_str && c == 'r' {
+                let rest = &line[i + 1..];
+                let n = rest.chars().take_while(|&h| h == '#').count() as u32;
+                if rest.chars().nth(n as usize) == Some('"') {
+                    for _ in 0..n {
+                        chars.next(); // 消费开头的 #
+                    }
+                    chars.next(); // 消费开头的 "
+                    self.in_raw = Some(n);
+                    continue;
+                }
+                // r#ident（原始标识符，如 r#type）不由此处理，落入普通字符
+            }
+            // 三引号字符串开头：`"""` / `'''` 整体进入（先于单引号字符串判定，
+            // 否则三连引号被拆成 开+闭+开，内容含单引号即泄漏为代码）
+            if triple.contains(&(c as u8)) && line[i..].starts_with(&format!("{c}{c}{c}")) {
+                chars.next();
+                chars.next(); // 消费开头的其余两个引号
+                self.in_triple = Some(c);
+                continue;
+            }
+            // JS 系 `/` 消歧：前驱是 = ( , : [ ! & | ? ; { } 或行首 → 正则字面量
+            // （除法两侧 prev 必是标识符/数字/`)`；`/[{]/` 等字符类内括号不参与配对）
+            if regex_lang && c == '/' {
+                let next_is_comment = chars.peek().map(|(_, n)| *n) == Some('/') || chars.peek().map(|(_, n)| *n) == Some('*');
+                if !next_is_comment
+                    && self.prev_char.map_or(true, |p| matches!(p, '=' | '(' | ',' | ':' | '[' | '!' | '&' | '|' | '?' | ';' | '{' | '}' | '\n' | '+' | '-' | '*' | '%' | '<' | '>' | '~' | '^'))
+                {
+                    self.in_regex = true;
+                    self.in_regex_class = false;
+                    self.prev_char = Some('/');
+                    continue;
+                }
+            }
+            let is_sig = !c.is_whitespace();
             match c {
-                '"' | '\'' | '`' => self.in_str = Some(c),
+                // 单引号歧义消解：Rust 里 ' 只用于字符字面量（'x'/'\\x'，必闭合），
+                // `'ident` 后不跟 ' 的是生命周期（&'a str）→ 跳过；非 Rust 语言行内
+                // 找不到后续 ' 的是撇号（JSX 文本 don't）→ 跳过。否则按字符串开引号。
+                '\'' if ext == "rs" => {
+                    let rest = &line[i + 1..];
+                    let run: usize = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .map(|c| c.len_utf8())
+                        .sum();
+                    let after = rest[run..].chars().next();
+                    if !(run > 0 && after != Some('\'')) {
+                        self.in_str = Some(c);
+                    }
+                }
+                '\'' => {
+                    if line[i + 1..].contains('\'') {
+                        self.in_str = Some(c);
+                    }
+                }
+                '"' | '`' => self.in_str = Some(c),
                 '/' if chars.peek().map(|(_, n)| *n) == Some('/') => break, // 行注释
                 '/' if chars.peek().map(|(_, n)| *n) == Some('*') => {
                     chars.next();
@@ -1440,7 +1898,13 @@ impl LineScanner {
                 '{' | '}' | '(' | ')' | '[' | ']' => cb(c),
                 _ => {}
             }
+            if is_sig {
+                self.prev_char = Some(c);
+            }
         }
+        // 正则字面量不允许裸换行：行尾强制退出，防误判吞掉后续行
+        self.in_regex = false;
+        self.in_regex_class = false;
     }
 }
 
@@ -1524,7 +1988,32 @@ pub(super) fn find_matching_close(lines: &[&str], open_idx: usize, ext: &str) ->
     None
 }
 
-/// Python 缩进块：向上找最近的 def/class 定义行，向下到缩进归位前的最后一行。
+/// 去掉 Python 行内注释（# 起，字符串内的 # 不算）——判定签名结束 `:` 时用
+fn strip_py_comment(line: &str) -> &str {
+    let mut in_str: Option<char> = None;
+    let mut chars = line.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = in_str {
+            if c == '\\' {
+                chars.next();
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => in_str = Some(c),
+            '#' => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Python 缩进块：向上找最近的 def/class 定义行，签名（含跨行参数表）闭合后，
+/// 向下到缩进归位前的最后一行。
 fn find_indent_block(lines: &[&str], idx: usize) -> Option<(usize, usize)> {
     if lines.is_empty() {
         return None;
@@ -1548,9 +2037,41 @@ fn find_indent_block(lines: &[&str], idx: usize) -> Option<(usize, usize)> {
         open -= 1;
     }
     let base_indent = indent_of(lines[open]);
-    // 向下找缩进回到 base（或更浅）的第一行 → 其上一行是块尾
-    let mut close = open + 1;
-    let mut last_body = open;
+    // 签名结束行：从定义行起做括号配对（字符串/注释感知），平衡归零且
+    // （去行尾注释后）以 : 结尾 → 签名完整；兼容单行体 def foo(): return 1。
+    // 多行签名（def foo(\\n  参数\\n):）必须先找到 `):` 行再量主体缩进，
+    // 否则 `):` 行缩进归位会被误当块尾、函数体被截掉。
+    let mut sig_end = open;
+    {
+        let mut depth: i32 = 0;
+        let mut sc = LineScanner::default();
+        let mut closed = false;
+        for (i, line) in lines.iter().enumerate().skip(open) {
+            sc.scan(line, "py", |c| match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            });
+            if depth <= 0 {
+                let t = strip_py_comment(line).trim_end();
+                if t.ends_with(':') {
+                    sig_end = i;
+                    closed = true;
+                    break;
+                }
+                // 单行体：签名已闭合且同行即函数体（def foo(): return 1）
+                if i == open && t.contains("):") {
+                    return Some((open, open));
+                }
+            }
+        }
+        if !closed {
+            return None;
+        }
+    }
+    // 主体：sig_end 之后缩进 > base 的连续行；块尾 = 缩进归位前最后一个非空行
+    let mut last_body = sig_end;
+    let mut close = sig_end + 1;
     while close < lines.len() {
         let t = lines[close].trim();
         if t.is_empty() || t.starts_with('#') {
@@ -1580,6 +2101,95 @@ pub(super) fn find_root_block(lines: &[&str], idx: usize, ext: &str) -> Option<(
     let root = opens.iter().rev().find(|&&o| is_block_root(lines[o], ext)).copied()?;
     let close = find_matching_close(lines, root, ext)?;
     Some((root, close))
+}
+
+/// 单遍块索引：一次 O(n) 扫描预计算每行所属块，供多查询场景（grep block 模式
+/// 每命中一次 find_enclosing_block 都要从头 O(n) 重扫，50 命中 = O(50n)）。
+/// 语义与 find_enclosing_block 完全一致：最内层根块优先，无根块回退最外层块。
+/// 内存紧凑编码：行号存 u32（文件上限 1MB → 行数远小于 u32::MAX），
+/// u32::MAX 作 None 哨兵，每个数组元素 4B（Option<usize> 是 16B，省 4 倍）。
+pub(super) struct BlockIndex {
+    /// 每行处理完后的「栈内最近块根开行」（NONE = 无根块在栈中）
+    line_root: Vec<u32>,
+    /// 每行处理完后的「栈底（最外层未闭开行）」
+    line_outer: Vec<u32>,
+    /// 开行 → 闭行（NONE = 未闭合，查询返回 None 与 find_matching_close 一致）
+    open_close: Vec<u32>,
+}
+
+/// u32 行号编码的 None 哨兵
+const BI_NONE: u32 = u32::MAX;
+/// 行数超过此值不再构建索引（回退逐次 find_enclosing_block，防 u32 溢出）
+const BI_MAX_LINES: usize = u32::MAX as usize - 1;
+
+impl BlockIndex {
+    pub(super) fn build(lines: &[&str], ext: &str) -> Self {
+        let n = lines.len();
+        let mut idx = BlockIndex {
+            line_root: vec![BI_NONE; n],
+            line_outer: vec![BI_NONE; n],
+            open_close: vec![BI_NONE; n],
+        };
+        if block_style(ext) != BlockStyle::Brace || n > BI_MAX_LINES {
+            return idx; // Python（Indent）/None/超限：查询走回退路径
+        }
+        // 栈存唯一 id（同行的多个开括号各有独立 id），对齐 find_matching_close
+        // 的 target 语义：open_close 只记「开行最后一个未闭合括号」的闭合行，
+        // 同行配平的 ()（如 `fn foo() {`）不污染，未闭合到文件尾保持哨兵。
+        let mut stack: Vec<usize> = Vec::new();
+        let mut line_of: Vec<usize> = Vec::new(); // id → 开行
+        let mut target_of: Vec<Option<usize>> = vec![None; n]; // 行 → 该行最后未闭括号 id
+        let mut sc = LineScanner::default();
+        for (i, line) in lines.iter().enumerate() {
+            sc.scan(line, ext, |c| match c {
+                '{' | '(' | '[' => {
+                    line_of.push(i);
+                    stack.push(line_of.len() - 1);
+                }
+                '}' | ')' | ']' => {
+                    if let Some(popped) = stack.pop() {
+                        let ln = line_of[popped];
+                        if target_of[ln] == Some(popped) {
+                            idx.open_close[ln] = i as u32;
+                        }
+                    }
+                }
+                _ => {}
+            });
+            idx.line_outer[i] = stack.first().map(|&id| line_of[id] as u32).unwrap_or(BI_NONE);
+            idx.line_root[i] = stack
+                .iter()
+                .rev()
+                .map(|&id| line_of[id])
+                .find(|&o| is_block_root(lines[o], ext))
+                .map(|o| o as u32)
+                .unwrap_or(BI_NONE);
+            target_of[i] = stack.iter().rev().find(|&&id| line_of[id] == i).copied();
+        }
+        idx
+    }
+
+    /// 紧凑编码取值：哨兵 → None
+    fn get(arr: &[u32], i: usize) -> Option<usize> {
+        match arr.get(i) {
+            Some(&v) if v != BI_NONE => Some(v as usize),
+            _ => None,
+        }
+    }
+
+    /// 查询 idx 行所在的完整块（与 find_enclosing_block 等价）。
+    /// Python 回退 find_indent_block（缩进制无栈概念，O(n) 可接受）。
+    pub(super) fn enclosing(&self, lines: &[&str], idx: usize, ext: &str) -> Option<(usize, usize)> {
+        if idx >= lines.len() {
+            return None;
+        }
+        if block_style(ext) == BlockStyle::Indent {
+            return find_indent_block(lines, idx);
+        }
+        let open = Self::get(&self.line_root, idx).or_else(|| Self::get(&self.line_outer, idx))?;
+        let close = Self::get(&self.open_close, open)?;
+        Some((open, close))
+    }
 }
 
 /// 找到 idx 所在的完整块：最内层根块优先；无根块则最外层块（括号组）。
@@ -1736,6 +2346,18 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
     const MAX_BLOCK_HITS: usize = 5;
     let (ignore_rules, start_rel) = load_project_ignore(&root, roots);
     let lower = pattern.to_lowercase();
+    // regex=true：pattern 按正则解释（如 foo\s*\(、Vec<\w+>），
+    // 大小写敏感性由 case_sensitive 统一控制；非法正则提前报错
+    let re = if args["regex"].as_bool().unwrap_or(false) {
+        Some(
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(!case_sensitive)
+                .build()
+                .map_err(|e| format!("正则表达式无效（{pattern:?}）：{e}。常见问题：反斜杠在 JSON 参数中需双重转义（\\d 写作 \\\\d）；或去掉 regex 参数用纯文本搜索"))?,
+        )
+    } else {
+        None
+    };
     let mut hits: Vec<String> = Vec::new();
     let mut files_checked = 0u32;
     let mut skipped = 0u32;
@@ -1749,6 +2371,7 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
         pattern: &str,
         lower: &str,
         case_sensitive: bool,
+        re: Option<&regex::Regex>,
         glob: &str,
         block_mode: bool,
         block_shown: &mut usize,
@@ -1781,6 +2404,7 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
                     pattern,
                     lower,
                     case_sensitive,
+                    re,
                     glob,
                     block_mode,
                     block_shown,
@@ -1813,16 +2437,28 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
                     .to_lowercase();
                 // 同一文件内已展开过的块区间（同一方法多条命中不重复整块展开）
                 let mut seen_blocks: Vec<(usize, usize)> = Vec::new();
+                // 单遍块索引：50 命中场景从 O(50n) 降为 O(n)，语义与逐次 find_enclosing_block 等价
+                let bindex_built = if block_mode { Some(BlockIndex::build(&flines, &ext)) } else { None };
+                let bindex = bindex_built.as_ref();
                 for (i, line) in flines.iter().enumerate() {
-                    let matched = if case_sensitive {
-                        line.contains(pattern)
-                    } else {
-                        line.to_lowercase().contains(lower)
+                    let matched = match re {
+                        Some(r) => r.is_match(line),
+                        None => {
+                            if case_sensitive {
+                                line.contains(pattern)
+                            } else {
+                                line.to_lowercase().contains(lower)
+                            }
+                        }
                     };
                     if matched {
                         // block 模式：展开所在完整代码块（成对 {}() 语言感知，整方法不截断）
                         if block_mode && *block_shown < MAX_BLOCK_HITS {
-                            if let Some((o, c)) = find_enclosing_block(&flines, i, &ext) {
+                            let blk = match bindex {
+                                Some(bi) => bi.enclosing(&flines, i, &ext),
+                                None => find_enclosing_block(&flines, i, &ext),
+                            };
+                            if let Some((o, c)) = blk {
                                 if seen_blocks.contains(&(o, c)) {
                                     continue;
                                 }
@@ -1861,6 +2497,7 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
         pattern,
         &lower,
         case_sensitive,
+        re.as_ref(),
         glob,
         block_mode,
         &mut block_shown,
@@ -1892,6 +2529,35 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
 
 // ---------- 写文件 / 编辑文件 ----------
 
+/// 检测"连续重复目录段"（如 entry/entry/、src/src/）：模块目录嵌套的典型错误，
+/// 根因是工程根被误判为模块目录时路径多拼了一层模块名。
+/// 命中时返回错误并给出鸿蒙标准结构指引，避免把测试/源码写进 <模块>/<模块>/src 后难以清理。
+fn check_nested_module_path(p: &Path, roots: &[String]) -> Result<(), String> {
+    // Windows canonicalize 会带 \\?\ verbatim 前缀，strip_prefix 前统一去前缀
+    let p_clean = PathBuf::from(crate::utils::path::normalize_path(&p.to_string_lossy()));
+    for r in roots {
+        let rc_raw = std::fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r));
+        let rc = PathBuf::from(crate::utils::path::normalize_path(&rc_raw.to_string_lossy()));
+        if let Ok(rel) = p_clean.strip_prefix(&rc) {
+            let segs: Vec<String> = rel
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(i) = (1..segs.len()).find(|&i| segs[i] == segs[i - 1]) {
+                return Err(format!(
+                    "路径疑似模块目录嵌套：{}（目录段 \"{}\" 连续重复）。\n鸿蒙标准结构：模块根 = <工程根>/<模块名>，配置与源码直接位于模块根下，测试代码在 <模块根>/src/test 与 <模块根>/src/ohosTest。若目标模块是 entry，正确路径形如 <工程根>/entry/src/...，而不是 entry/entry/src/...。\n请核对路径后重试。",
+                    p.display(),
+                    segs[i]
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 写入/覆盖文本文件（UTF-8，单次 ≤1MB，自动创建父目录）
 pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: &str) -> Result<String, String> {
     if roots.is_empty() {
@@ -1899,6 +2565,7 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
     }
     // Request/Spec 分离：宽松参数 WriteFileRequest → 显式 resolve() 产出严格规范 WriteFileSpec
     let spec = WriteFileRequest::from_args(args)?.resolve(roots)?;
+    check_nested_module_path(&spec.path, roots)?;
     let p = &spec.path;
     let content = spec.content.as_str();
     let existed = p.exists();
@@ -1930,6 +2597,35 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("创建目录失败 {}: {e}", parent.display()))?;
     }
+    // 配平守卫（与 edit_file 同口径）：代码文件写入后必须配平——
+    // 新文件不存在（旧内容为空串，视为配平基准），内容缺结束符（漏 } 等）→ 拒绝落盘
+    {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let old_text = std::fs::read_to_string(p).unwrap_or_default(); // 不存在/读取失败 → 空串
+        balance_guard(&old_text, &content_out, &ext)?;
+    }
+    // [58] dry-run：预览将写入的内容，不落盘、不写 undo
+    if args["dry_run"].as_bool().unwrap_or(false) {
+        let preview: String = {
+            let n = content_out.chars().count();
+            if n > 1200 {
+                format!("{}…（共 {n} 字符）", content_out.chars().take(1200).collect::<String>())
+            } else {
+                content_out.clone()
+            }
+        };
+        return Ok(format!(
+            "【dry_run 预览】将{}文件 {}（{} 字节，未落盘）\n{}",
+            if existed { "覆盖" } else { "创建" },
+            p.display(),
+            content_out.len(),
+            preview
+        ));
+    }
     std::fs::write(p, content_out.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
     if let Ok(meta) = std::fs::metadata(p) {
         stamp_put(p, &meta, content_out.as_bytes());
@@ -1939,6 +2635,167 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
         if existed { "覆盖" } else { "创建" },
         p.display(),
         content.len()
+    ))
+}
+
+/// 全文括号配平检查（字符串/注释/正则感知）：净栈为零且无悬空字符串态。
+/// 用于编辑落盘前的完整性守卫——「原本配平的文件被改失衡」说明替换内容
+/// 残缺（如漏块结束符），拒绝写回。病态文件（原本就失衡）不由此判断。
+fn is_balanced(text: &str, ext: &str) -> bool {
+    let mut depth: i64 = 0;
+    let mut sc = LineScanner::default();
+    for line in text.lines() {
+        sc.scan(line, ext, |c| {
+            depth += match c {
+                '{' | '(' | '[' => 1,
+                _ => -1,
+            };
+        });
+    }
+    depth == 0 && sc.in_str.is_none() && sc.in_raw.is_none() && sc.in_triple.is_none() && !sc.in_block_comment
+}
+
+/// start 模式块定位（edit_file / preview_edit 共用口径）：
+/// 超界显式报错（绝不静默钳到末行改错块）→ 语言感知定位完整块（成对 {}()，
+/// Python 按缩进）→ anchor 块锚签名校验（行号漂移时 ±100 行内按签名重定位，
+/// 找不到则拒绝）。返回 (块首行, 块尾行)（0 起，含两端）。
+fn locate_edit_block(
+    body_lines: &[&str],
+    start_line: u64,
+    anchor: Option<&str>,
+    ext: &str,
+) -> Result<(usize, usize), String> {
+    let total = body_lines.len();
+    if total == 0 {
+        return Err("文件为空，没有可替换的代码块".into());
+    }
+    // 超界显式报错：绝不静默钳制到末行（会改到无关块）
+    if (start_line as usize) > total {
+        return Err(format!(
+            "start={start_line} 超出文件总行数（共 {total} 行）。行号可能已因先前编辑漂移：请重新 read_file/outline 确认，或提供 anchor 参数（块定义行内容片段）自动重定位"
+        ));
+    }
+    let idx = (start_line as usize - 1).min(total - 1);
+    let (mut o, mut c) = find_enclosing_block(body_lines, idx, ext).ok_or_else(|| {
+        format!(
+            "无法识别第 {start_line} 行所在的代码块：未找到成对的 {{}}/()（该行可能在字符串/注释中，或文件不是结构化代码；请改用 old 参数精确替换）"
+        )
+    })?;
+    // 块锚签名：定位到的块与预期不符（行号漂移）→ ±100 行内按签名重定位
+    if let Some(anchor) = anchor {
+        if !body_lines[o].contains(anchor) {
+            let from = idx.saturating_sub(100);
+            let to = (idx + 100).min(total - 1);
+            let relocated = (from..=to)
+                .find(|&i| is_block_root(body_lines[i], ext) && body_lines[i].contains(anchor))
+                .and_then(|i| find_enclosing_block(body_lines, i, ext).filter(|&(no, _)| no == i));
+            match relocated {
+                Some((no, nc)) => {
+                    o = no;
+                    c = nc;
+                }
+                None => {
+                    return Err(format!(
+                        "anchor 定位失败：第 {start_line} 行所在块首行不含 {:?}（实际：{:?}），且 ±100 行内未找到含该签名的块根行。\n可能行号漂移过大或签名不符，请重新 read_file/outline 确认",
+                        anchor,
+                        body_lines[o].trim()
+                    ));
+                }
+            }
+        }
+    }
+    Ok((o, c))
+}
+
+/// 批量块编辑计划（edit_file / preview_edit 共用）：
+/// 所有块先在「原文」上定位（locate_edit_block 同口径：超界报错 + anchor 重定位），
+/// 校验互不重叠后按行序一次性拼接——各块行号基于同一份原文，不存在先后漂移问题。
+/// 返回 (最终正文, 各块区间按 starts 原顺序的 (开行, 闭行) 列表)（0 起，含两端）。
+fn plan_batch_blocks(
+    body: &str,
+    starts: &[u64],
+    news: &[String],
+    anchors: &[Option<String>],
+    ext: &str,
+) -> Result<(String, Vec<(usize, usize)>), String> {
+    let body_lines: Vec<&str> = body.split('\n').collect();
+    // 1. 逐块定位（原文坐标系）
+    let mut located: Vec<((usize, usize), usize)> = Vec::with_capacity(starts.len()); // (区间, starts 下标)
+    for (k, &s) in starts.iter().enumerate() {
+        let a = anchors.get(k).and_then(|x| x.as_deref());
+        let (o, c) = locate_edit_block(&body_lines, s, a, ext)?;
+        located.push(((o, c), k));
+    }
+    // 2. 重叠校验：同一块重复或区间相交 → 拒绝（拼接语义不明确）
+    let mut sorted = located.clone();
+    sorted.sort_by_key(|((o, _), _)| *o);
+    for w in sorted.windows(2) {
+        let ((o1, c1), k1) = w[0];
+        let ((o2, _), k2) = w[1];
+        if o2 <= c1 {
+            return Err(format!(
+                "批量编辑的块重叠：starts[{}] 定位到 L{}-L{}，starts[{}] 定位到 L{} 起，两者相交（同一块只需出现一次）",
+                k1,
+                o1 + 1,
+                c1 + 1,
+                k2,
+                o2 + 1
+            ));
+        }
+    }
+    // 3. 行序拼接（CRLF 保留：按原文字节边界切）
+    let mut line_starts: Vec<usize> = Vec::with_capacity(body_lines.len());
+    let mut off = 0usize;
+    for l in body.split_inclusive('\n') {
+        line_starts.push(off);
+        off += l.len();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut cursor = 0usize;
+    for ((o, c), k) in &sorted {
+        let s_off = line_starts[*o];
+        out.push_str(&body[cursor..s_off]);
+        out.push_str(&news[*k]);
+        cursor = if c + 1 < line_starts.len() { line_starts[c + 1] } else { body.len() };
+    }
+    out.push_str(&body[cursor..]);
+    // 返回区间按 starts 原顺序（报告与参数一一对应）
+    let ranges = located.iter().map(|(r, _)| *r).collect();
+    Ok((out, ranges))
+}
+
+/// 编辑落盘守卫：原文件配平而新内容失衡 → 拒绝（返回 Err 带定位提示）。
+/// 原文件本就失衡（病态/片段文件）时放行（允许修复），仅代码类扩展名适用。
+fn balance_guard(old_text: &str, new_text: &str, ext: &str) -> Result<(), String> {
+    if !is_code_ext(ext) {
+        return Ok(());
+    }
+    if !is_balanced(old_text, ext) {
+        return Ok(()); // 原本就不配平：不拦修复
+    }
+    if is_balanced(new_text, ext) {
+        return Ok(());
+    }
+    // 定位失衡位置：逐行累计深度，首个越界负值或末尾未归零点
+    let mut depth: i64 = 0;
+    let mut sc = LineScanner::default();
+    let mut first_bad: Option<usize> = None;
+    for (i, line) in new_text.lines().enumerate() {
+        sc.scan(line, ext, |c| {
+            depth += match c {
+                '{' | '(' | '[' => 1,
+                _ => -1,
+            };
+        });
+        if depth < 0 && first_bad.is_none() {
+            first_bad = Some(i + 1);
+        }
+    }
+    let dangling = sc.in_str.is_some() || sc.in_raw.is_some() || sc.in_triple.is_some() || sc.in_block_comment;
+    Err(format!(
+        "替换被配平守卫拒绝：原文件括号配平，替换后失衡（净差 {depth:+}{}{}）。\n新内容疑似残缺（漏块结束符/引号未闭合），请补全后重试；如确要写入病态片段，请先确认原文。",
+        first_bad.map(|l| format!("，第 {l} 行首次越界")).unwrap_or_default(),
+        if dangling { "，存在未闭合字符串/注释" } else { "" },
     ))
 }
 
@@ -1973,7 +2830,7 @@ pub(super) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
         }
     }
     if occurrences == 0 {
-        return Err(format!("old 内容在文件中未找到（{old:?}），请先 read_file 确认原文（注意缩进/引号/空白）"));
+        return Err(format!("old 内容在文件中未找到（{old:?}），请先 read_file 确认原文（注意缩进/引号/空白；若含反斜杠或正则如 \\n，确认 JSON 参数中已双重转义为 \\\\n）"));
     }
     let count = if replace_all { occurrences } else { 1 };
     let replaced = if replace_all {
@@ -1991,6 +2848,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
     }
     // Request/Spec 分离：宽松参数 EditFileRequest → 显式 resolve() 产出严格规范 EditFileSpec
     let spec = EditFileRequest::from_args(args)?.resolve(roots)?;
+    check_nested_module_path(&spec.path, roots)?;
     let p = &spec.path;
     let old = spec.old.as_str();
     let new = spec.new.as_str();
@@ -2022,6 +2880,56 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         None => (false, text.as_str()),
     };
 
+    // ---- starts 批量模式：多个完整块一次定位、统一拼接（重构场景减少往返） ----
+    // 所有块都在同一份原文上定位（行号互不漂移），互不重叠校验后按行序拼接；
+    // 与单块模式同口径：超界报错、anchor 重定位、配平守卫、undo 快照、dry_run。
+    if let Some(starts) = spec.starts.as_deref() {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let (final_body, ranges) = plan_batch_blocks(body, starts, &spec.news, &spec.anchors, &ext)?;
+        balance_guard(body, &final_body, &ext)?;
+        let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body.clone() };
+        if args["dry_run"].as_bool().unwrap_or(false) {
+            let old_lines: Vec<&str> = body.split('\n').collect();
+            let new_lines: Vec<&str> = final_body.split('\n').collect();
+            let (diff, add_l, del_l) = build_unified_diff(&old_lines, &new_lines, &p.display().to_string(), 0, 0);
+            let mut sum = String::new();
+            for (k, (o, c)) in ranges.iter().enumerate() {
+                sum.push_str(&format!(
+                    "  starts[{k}]：L{}-L{}（{} 行）→ {}\n",
+                    o + 1,
+                    c + 1,
+                    c - o + 1,
+                    if spec.news[k].is_empty() { "删除" } else { "替换" }
+                ));
+            }
+            return Ok(format!(
+                "【dry_run 预览】将批量编辑 {} 个块，预计 +{add_l} −{del_l} 行（未落盘）\n{sum}{diff}",
+                ranges.len()
+            ));
+        }
+        crate::agent::undo::snapshot(conversation_id, p, &bytes);
+        std::fs::write(p, final_text.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
+        if let Ok(meta) = std::fs::metadata(p) {
+            stamp_put(p, &meta, final_text.as_bytes());
+        }
+        let mut report = String::new();
+        for (k, (o, c)) in ranges.iter().enumerate() {
+            report.push_str(&format!(
+                "  starts[{k}]：L{}-L{}（{} 行）→ {}（新内容 {} 行）\n",
+                o + 1,
+                c + 1,
+                c - o + 1,
+                if spec.news[k].is_empty() { "已删除" } else { "已替换" },
+                spec.news[k].split('\n').count()
+            ));
+        }
+        return Ok(format!("已批量编辑 {} 个块：\n{report}文件：{}", ranges.len(), p.display()));
+    }
+
     // ---- start 模式：按语言感知的「完整代码块」整体替换/删除 ----
     // 不固定行数：块有多长就操作多长（{}() 成对匹配，Python 按缩进），
     // 从块首行到结束符一整套替换/删除，杜绝漏掉块结束符。
@@ -2032,16 +2940,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             .unwrap_or("")
             .to_lowercase();
         let body_lines: Vec<&str> = body.split('\n').collect();
-        let total = body_lines.len();
-        if total == 0 {
-            return Err("文件为空，没有可替换的代码块".into());
-        }
-        let idx = ((start_line as usize).saturating_sub(1)).min(total - 1);
-        let (o, c) = find_enclosing_block(&body_lines, idx, &ext).ok_or_else(|| {
-            format!(
-                "无法识别第 {start_line} 行所在的代码块：未找到成对的 {{}}/()（该行可能在字符串/注释中，或文件不是结构化代码；请改用 old 参数精确替换）"
-            )
-        })?;
+        let (o, c) = locate_edit_block(&body_lines, start_line, spec.anchor.as_deref(), &ext)?;
         // 按字节边界切出完整块（split('\n') 保留 CRLF 的 \r，替换后保持原换行风格）
         let mut line_starts: Vec<usize> = Vec::with_capacity(body_lines.len());
         let mut off = 0usize;
@@ -2053,7 +2952,23 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         let end_off = if c + 1 < line_starts.len() { line_starts[c + 1] } else { body.len() };
         let block_lines = c - o + 1;
         let final_body = format!("{}{}{}", &body[..start_off], spec.new, &body[end_off..]);
-        let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body };
+        // 先构造 final_text 时不再 move final_body（dry_run 分支仍需借用）
+        let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body.clone() };
+        // [58] dry-run：内存 diff 预览，不落盘、不写 undo
+        if args["dry_run"].as_bool().unwrap_or(false) {
+            let old_lines: Vec<&str> = body.split('\n').collect();
+            let new_lines: Vec<&str> = final_body.split('\n').collect();
+            let (diff, add_l, del_l) = build_unified_diff(&old_lines, &new_lines, &p.display().to_string(), 0, 0);
+            return Ok(format!(
+                "【dry_run 预览】将{}完整代码块（第 {}–{} 行，共 {} 行）预计 +{add_l} −{del_l} 行（未落盘）\n{diff}",
+                if spec.new.is_empty() { "删除" } else { "替换" },
+                o + 1,
+                c + 1,
+                block_lines
+            ));
+        }
+        // 配平守卫：原文件配平而替换后失衡 → 拒绝落盘（新内容残缺，如漏结束符）
+        balance_guard(body, &final_body, &ext)?;
         // 撤销快照：落盘前记录旧内容（会话级，undo_edit 工具按栈序恢复）
         crate::agent::undo::snapshot(conversation_id, p, &bytes);
         std::fs::write(p, final_text.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
@@ -2088,7 +3003,27 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
 
     let (replaced, count) = apply_edit(body, old, new, replace_all)
         .map_err(|e| with_advice("edit_file", e))?;
-    let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced };
+    // 配平守卫：原文件配平而替换后失衡 → 拒绝落盘（新内容残缺，如漏结束符）
+    {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        balance_guard(body, &replaced, &ext)?;
+    }
+    // 先构造 final_text 时不再 move replaced（dry_run 分支仍需借用）
+    let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced.clone() };
+    // [58] dry-run：内存 diff 预览，不落盘、不写 undo
+    if args["dry_run"].as_bool().unwrap_or(false) {
+        let old_lines: Vec<&str> = body.split('\n').collect();
+        let new_lines: Vec<&str> = replaced.split('\n').collect();
+        let (diff, add_l, del_l) = build_unified_diff(&old_lines, &new_lines, &p.display().to_string(), 0, 0);
+        return Ok(format!(
+            "【dry_run 预览】将替换 {count} 处（{}）预计 +{add_l} −{del_l} 行（未落盘）\n{diff}",
+            if replace_all { "全部替换" } else { "仅第一处" }
+        ));
+    }
     // 撤销快照：落盘前记录旧内容（会话级，undo_edit 工具按栈序恢复）
     crate::agent::undo::snapshot(conversation_id, p, &bytes);
     std::fs::write(p, final_text.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
@@ -2110,6 +3045,240 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         if replace_all { "全部替换" } else { "仅第一处" },
         show(old),
         show(new),
+        p.display()
+    ))
+}
+
+// ---------- diff 预览（preview_edit） ----------
+
+/// 全量行级 LCS 的行数上限：超过则只 diff 变化区域（防大文件 O(n×m) 内存爆）
+const MAX_DIFF_LINES: usize = 600;
+/// unified diff 上下文行数
+const DIFF_CONTEXT: usize = 3;
+
+/// 行级 LCS 回溯 → unified diff 文本。
+/// `old_base / new_base`：窗口切片的起始行偏移（大文件窗口 diff 时行号对齐用）。
+/// 返回 (diff 文本, 新增行数, 删除行数)。
+pub(crate) fn build_unified_diff(
+    old_lines: &[&str],
+    new_lines: &[&str],
+    path: &str,
+    old_base: usize,
+    new_base: usize,
+) -> (String, usize, usize) {
+    let n = old_lines.len();
+    let m = new_lines.len();
+    // LCS DP（行相等判定；调用方保证窗口 ≤ MAX_DIFF_LINES）
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if old_lines[i] == new_lines[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    // 回溯 → 编辑序列（' ' 相同 / '-' 删除 / '+' 新增）
+    let mut ops: Vec<(char, usize, usize)> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut add = 0usize;
+    let mut del = 0usize;
+    while i < n && j < m {
+        if old_lines[i] == new_lines[j] {
+            ops.push((' ', i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push(('-', i, usize::MAX));
+            del += 1;
+            i += 1;
+        } else {
+            ops.push(('+', usize::MAX, j));
+            add += 1;
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(('-', i, usize::MAX));
+        del += 1;
+        i += 1;
+    }
+    while j < m {
+        ops.push(('+', usize::MAX, j));
+        add += 1;
+        j += 1;
+    }
+    if ops.is_empty() {
+        return (String::new(), 0, 0); // 无变化
+    }
+    // 每步操作前的行号游标（@@ 头计算用）
+    let mut old_pos = vec![0usize; ops.len() + 1];
+    let mut new_pos = vec![0usize; ops.len() + 1];
+    for (idx, op) in ops.iter().enumerate() {
+        old_pos[idx + 1] = old_pos[idx] + usize::from(op.0 != '+');
+        new_pos[idx + 1] = new_pos[idx] + usize::from(op.0 != '-');
+    }
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+    let mut k = 0usize;
+    while k < ops.len() {
+        if ops[k].0 == ' ' {
+            k += 1;
+            continue;
+        }
+        // hunk 起点：往前补 context 行
+        let start = k.saturating_sub(DIFF_CONTEXT);
+        // hunk 终点：从 k 向后，连续空格超过 2×context 视为上下文断层（尾部留给下一 hunk）
+        let mut end = k;
+        let mut run = 0usize;
+        while end < ops.len() {
+            if ops[end].0 == ' ' {
+                run += 1;
+                if run > DIFF_CONTEXT * 2 {
+                    break;
+                }
+            } else {
+                run = 0;
+            }
+            end += 1;
+        }
+        if run > DIFF_CONTEXT * 2 {
+            // 断点落在 run 个连续空格内：hunk 尾部只保留 context 行
+            end -= run - DIFF_CONTEXT;
+        }
+        // @@ 行号：hunk 内第一条 old/new 行（全新增/全删除块用 0 计数写法）
+        let has_old = ops[start..end].iter().any(|o| o.0 != '+');
+        let has_new = ops[start..end].iter().any(|o| o.0 != '-');
+        let old_start = if has_old {
+            let fi = ops[start..end].iter().position(|o| o.0 != '+').unwrap() + start;
+            old_pos[fi] + old_base + 1
+        } else {
+            old_pos[start] + old_base
+        };
+        let new_start = if has_new {
+            let fi = ops[start..end].iter().position(|o| o.0 != '-').unwrap() + start;
+            new_pos[fi] + new_base + 1
+        } else {
+            new_pos[start] + new_base
+        };
+        let old_cnt = old_pos[end] - old_pos[start];
+        let new_cnt = new_pos[end] - new_pos[start];
+        out.push_str(&format!("@@ -{},{} +{},{} @@\n", old_start, old_cnt, new_start, new_cnt));
+        for op in &ops[start..end] {
+            match op.0 {
+                ' ' => out.push_str(&format!(" {}\n", old_lines[op.1])),
+                '-' => out.push_str(&format!("-{}\n", old_lines[op.1])),
+                _ => out.push_str(&format!("+{}\n", new_lines[op.2])),
+            }
+        }
+        k = end;
+    }
+    (out, add, del)
+}
+
+/// 生成新旧文本的 unified diff：大文件（任一侧 > MAX_DIFF_LINES）只 diff 变化区域。
+fn limited_diff_text(old_text: &str, new_text: &str, path: &str) -> (String, usize, usize) {
+    let old_lines: Vec<&str> = old_text.split('\n').collect();
+    let new_lines: Vec<&str> = new_text.split('\n').collect();
+    if old_lines.len() <= MAX_DIFF_LINES && new_lines.len() <= MAX_DIFF_LINES {
+        return build_unified_diff(&old_lines, &new_lines, path, 0, 0);
+    }
+    // 大文件：定位首尾差异，取 ±10 行窗口做 diff
+    let n = old_lines.len();
+    let m = new_lines.len();
+    let mut first = 0usize;
+    while first < n.min(m) && old_lines[first] == new_lines[first] {
+        first += 1;
+    }
+    let mut last = 0usize;
+    while last < n.min(m) && old_lines[n - 1 - last] == new_lines[m - 1 - last] {
+        last += 1;
+    }
+    let ws = first.saturating_sub(10);
+    let we_old = (n - last + 10).min(n);
+    let we_new = (m - last + 10).min(m);
+    let (diff, add, del) =
+        build_unified_diff(&old_lines[ws..we_old], &new_lines[ws..we_new], path, ws, ws);
+    (
+        format!("（文件行数超 {MAX_DIFF_LINES}，仅展示变化区域）\n{diff}"),
+        add,
+        del,
+    )
+}
+
+/// preview_edit：与 edit_file 相同的参数与校验，但只计算并返回 unified diff（不落盘）。
+/// 模型先预览改动给用户确认，确认后再调用 edit_file 应用同一修改；
+/// 配合审批流水线（approval_mode=ask）可形成"危险编辑先预览、人工 OK 再落盘"闭环。
+pub(super) async fn preview_edit(args: &Value, roots: &[String], _conversation_id: &str) -> Result<String, String> {
+    if roots.is_empty() {
+        return Err("当前会话未绑定项目目录，无法预览编辑".into());
+    }
+    let spec = EditFileRequest::from_args(args)?.resolve(roots)?;
+    let p = &spec.path;
+    if !p.is_file() {
+        return Err(format!(
+            "文件不存在（preview_edit 只预览已有文件的编辑；新建文件请直接用 write_file）：{}",
+            p.display()
+        ));
+    }
+    let bytes = std::fs::read(p).map_err(|e| format!("读取文件失败: {e}"))?;
+    if bytes[..bytes.len().min(8192)].contains(&0) {
+        return Err("文件是二进制，无法以文本方式编辑".into());
+    }
+    // 严格 UTF-8 校验（与 edit_file 同口径，防 GBK 文件预览后写坏）
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| {
+            format!(
+                "文件 {} 非 UTF-8 编码（可能是 GBK/GB2312），为避免中文被写坏已拒绝预览。请先转 UTF-8 再编辑",
+                p.display()
+            )
+        })?
+        .to_string();
+    // BOM 剥离比较（写回时保留，与 edit_file 一致）
+    let body = match text.strip_prefix('\u{feff}') {
+        Some(b) => b,
+        None => text.as_str(),
+    };
+    // 计算编辑后的正文（不落盘；与 edit_file 同口径：old 精确替换 / start 语言感知块替换 /
+    // starts 批量块替换，块定位走共用 locate_edit_block / plan_batch_blocks：
+    // 超界显式报错 + anchor 漂移重定位 + 重叠校验，预览即拦截）
+    let final_body: String = if let Some(starts) = spec.starts.as_deref() {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        plan_batch_blocks(body, starts, &spec.news, &spec.anchors, &ext)?.0
+    } else if let Some(start_line) = spec.start {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let body_lines: Vec<&str> = body.split('\n').collect();
+        let (o, c) = locate_edit_block(&body_lines, start_line, spec.anchor.as_deref(), &ext)?;
+        let mut line_starts: Vec<usize> = Vec::with_capacity(body_lines.len());
+        let mut off = 0usize;
+        for l in body.split_inclusive('\n') {
+            line_starts.push(off);
+            off += l.len();
+        }
+        let start_off = line_starts[o];
+        let end_off = if c + 1 < line_starts.len() { line_starts[c + 1] } else { body.len() };
+        format!("{}{}{}", &body[..start_off], spec.new, &body[end_off..])
+    } else {
+        let (replaced, _count) = apply_edit(body, &spec.old, &spec.new, spec.replace_all)
+            .map_err(|e| with_advice("preview_edit", e))?;
+        replaced
+    };
+    if final_body == body {
+        return Ok(format!("【edit 预览】文件 {}：无实际变化（old 与 new 内容相同）", p.display()));
+    }
+    // 生成 unified diff（大文件只 diff 变化区域）
+    let (diff, add, del) = limited_diff_text(body, &final_body, &p.display().to_string());
+    Ok(format!(
+        "【edit 预览】（未落盘，文件：{}，预计 +{add} −{del} 行）\n{diff}\n确认无误后用 edit_file 应用同一修改（old/new 参数保持不变）；如需调整请重新调用 preview_edit。",
         p.display()
     ))
 }
@@ -2207,6 +3376,7 @@ pub(super) fn apply_single_edit(
         return Err(format!("{raw}: old 参数不能为空"));
     }
     let p = resolve_in_roots(roots, raw)?;
+    check_nested_module_path(&p, roots)?;
     if let Some(reason) = is_protected_file(&p) {
         return Err(format!("{raw}: 被安全策略拒绝：{reason}"));
     }
@@ -2370,6 +3540,33 @@ mod tests {
         (f, vec![dir.to_string_lossy().to_string()])
     }
 
+    #[test]
+    fn nested_module_path_detected() {
+        // 回归：模块目录嵌套（entry/entry/）必须被拦截并给出标准结构指引
+        let dir = std::env::temp_dir().join(format!(
+            "nested_path_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("entry/src")).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        // 正常模块路径放行
+        let ok = dir.join("entry/src/test/List.test.ets");
+        assert!(check_nested_module_path(&ok, &roots).is_ok(), "正常模块路径应放行");
+        // 嵌套路径拦截（目录不存在也应拦截——检查的是路径拼接而非磁盘状态）
+        let bad = dir.join("entry/entry/src/test/List.test.ets");
+        let err = check_nested_module_path(&bad, &roots).unwrap_err();
+        assert!(err.contains("嵌套") && err.contains("entry/entry"), "错误应说明嵌套段: {err}");
+        assert!(err.contains("entry/src"), "错误应给出正确路径示例: {err}");
+        // 任意连续重复段都拦截
+        let weird = dir.join("a/b/b/c.txt");
+        assert!(check_nested_module_path(&weird, &roots).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ---------- 成对代码块核心 ----------
 
     #[test]
@@ -2432,6 +3629,556 @@ mod tests {
         assert_eq!(find_enclosing_block(&l, 3, "py"), Some((0, 4)));
         assert_eq!(find_enclosing_block(&l, 7, "py"), Some((6, 7)));
         assert_eq!(find_root_block(&l, 3, "py"), Some((0, 4)));
+    }
+
+    #[test]
+    fn block_python_multiline_signature() {
+        // 多行参数表：`):` 行缩进归位，不得被误当块尾截掉函数体
+        let src = "def foo(\n    a,\n    b,\n):\n    return a + b\n\nx = 1\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_root_block(&l, 1, "py"), Some((0, 4)));
+        assert_eq!(find_root_block(&l, 4, "py"), Some((0, 4)));
+    }
+
+    #[test]
+    fn block_python_signature_trailing_comment() {
+        // def 行带行尾注释：`:` 判定须去注释后再看行尾
+        let src = "def foo():  # note\n    return 1\n\nx = 2\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_root_block(&l, 1, "py"), Some((0, 1)));
+    }
+
+    #[test]
+    fn block_python_oneliner_def() {
+        let src = "def add(a, b): return a + b\n\nz = add(1, 2)\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_root_block(&l, 0, "py"), Some((0, 0)));
+    }
+
+    #[test]
+    fn block_rust_lifetime_quotes_ignored() {
+        // 生命周期 'a（奇数个）不得被当字符串开引号吞掉方法开 {
+        let src = "fn foo<'a>(x: &'a str) -> &'a str {\n    x\n}\nfn bar() {\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_root_block(&l, 1, "rs"), Some((0, 2)));
+        assert_eq!(find_matching_close(&l, 0, "rs"), Some(2));
+    }
+
+    #[test]
+    fn block_jsx_apostrophe_in_text_ignored() {
+        // JSX 文本撇号（It's）不得开启字符串模式吞掉后续行的 }
+        let src = "function Greet() {\n  return <p>It's fine</p>;\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_root_block(&l, 1, "tsx"), Some((0, 2)));
+        assert_eq!(find_matching_close(&l, 0, "tsx"), Some(2));
+    }
+
+    #[test]
+    fn scanner_rust_char_literals_still_strings() {
+        // 字符字面量里的括号仍按字符串内容跳过
+        let mut sc = LineScanner::default();
+        let mut out = String::new();
+        sc.scan("let c = '{'; let d = '\\'';", "rs", |c| out.push(c));
+        assert_eq!(out, "", "字符字面量内的 {{ 与 '' 不参与配对");
+        // 生命周期行：(){} 正常参与配对
+        let mut sc2 = LineScanner::default();
+        let mut out2 = String::new();
+        sc2.scan("fn f<'a>(x: &'a str) -> &'a str {", "rs", |c| out2.push(c));
+        assert_eq!(out2, "(){");
+    }
+
+    #[test]
+    fn scanner_rust_raw_strings() {
+        // 三种原始字符串内的括号都不参与配对；检测时消费开头 " 后正常闭合
+        let mut sc = LineScanner::default();
+        let mut out = String::new();
+        sc.scan("let a = r\"{(}\"; let b = r#\"{[\"#; let c = r##\"a\"#b\"##; foo();", "rs", |ch| out.push(ch));
+        assert_eq!(out, "()", "r\"..\"/r#\"..\"#/r##\"..\"## 内括号跳过，仅 foo() 参与");
+        // r#"..."# 内的引号不闭合（旧逻辑会当普通字符串开引号而错乱）；r"..." 遇 " 即闭合是正确语义
+        let mut sc2 = LineScanner::default();
+        let mut out2 = String::new();
+        sc2.scan("let s = r#\"he said \"hi\" ok\"#; g();", "rs", |ch| out2.push(ch));
+        assert_eq!(out2, "()");
+    }
+
+    #[test]
+    fn block_rust_raw_string_multiline() {
+        // 跨行原始字符串含未配对 { " ( ：不得污染后续行配对
+        let src = "fn f() {\n    let s = r#\"\n        { \" (\n    \"#;\n    g();\n}\nfn next() {\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_matching_close(&l, 0, "rs"), Some(5));
+        assert_eq!(find_root_block(&l, 4, "rs"), Some((0, 5)));
+        assert_eq!(find_root_block(&l, 6, "rs"), Some((6, 7)), "fn next 块不受上方原始字符串影响");
+    }
+
+    #[test]
+    fn scanner_rust_raw_identifier_not_raw_string() {
+        // 原始标识符 r#type：r 后 # 后不是 " → 不按原始字符串处理
+        let mut sc = LineScanner::default();
+        let mut out = String::new();
+        sc.scan("let r#type = r#\"}\"#; call();", "rs", |ch| out.push(ch));
+        assert_eq!(out, "()", "r#type 中的字符不影响配对，r#\"}}\"# 内 }} 跳过");
+    }
+
+    #[test]
+    fn outline_block_range_multiline_sig() {
+        // 多行签名：fn 定义行 → 完整方法体区间（含签名与闭合 }）
+        let src = "fn foo(\n    a: u32,\n    b: u32,\n) -> u32 {\n    a + b\n}\nfn bar() {\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(outline_block_range(&l, 0, "rs", None), Some((0, 5)));
+        assert_eq!(outline_block_range(&l, 6, "rs", None), Some((6, 7)));
+    }
+
+    #[test]
+    fn outline_block_range_trait_decl_and_attrs_none() {
+        // trait 声明（; 结尾）与属性行无块区间
+        let src = "pub trait T {\n    fn a(&self);\n    fn b(&self) {\n        self.a();\n    }\n}\n#[test]\nfn t() {\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(outline_block_range(&l, 1, "rs", None), None, "fn a(&self); 无块");
+        assert_eq!(outline_block_range(&l, 2, "rs", None), Some((2, 4)));
+        assert_eq!(outline_block_range(&l, 0, "rs", None), Some((0, 5)), "trait 块整体");
+    }
+
+    #[test]
+    fn outline_block_range_python_def() {
+        let src = "def foo(\n    a,\n):\n    return a\n\nx = 1\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(outline_block_range(&l, 0, "py", None), Some((0, 3)));
+    }
+
+    #[test]
+    fn outline_renders_block_ranges() {
+        let src = "fn a() {\n    x();\n}\nfn b(\n    p: u32,\n) -> u32 {\n    p\n}\nfn c(&self);\n";
+        let l: Vec<&str> = src.lines().collect();
+        let out = render_outline(std::path::Path::new("t.rs"), &l, 128, 1, None);
+        assert!(out.contains("1-3") || out.contains("    1-3"), "fn a 区间 L1-L3: {out}");
+        assert!(out.contains("4-8"), "fn b 多行签名区间 L4-L8: {out}");
+        assert!(out.contains("区间"), "头部应说明区间用法: {out}");
+        assert!(!out.contains("9-"), "fn c(&self); 声明不显示区间: {out}");
+    }
+
+    // ---------- 核验组：先证明薄弱点存在，再修复转绿 ----------
+
+    #[test]
+    fn scanner_kotlin_triple_quote_string() {
+        // Kotlin 三引号字符串内的 { 与内嵌 " 不参与配对
+        let src = "fun f() {\n    val s = \"\"\"a \"b\" { c\"\"\".length\n    g()\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_matching_close(&l, 0, "kt"), Some(3), "三引号内 {{ 不应推栈");
+        // 跨行三引号
+        let src2 = "fun h() {\n    val t = \"\"\"\n        { \" (\n    \"\"\"\n    g()\n}\n";
+        let l2: Vec<&str> = src2.lines().collect();
+        assert_eq!(find_matching_close(&l2, 0, "kt"), Some(5), "跨行三引号不污染配对");
+    }
+
+    #[test]
+    fn scanner_js_regex_char_class() {
+        // JS 正则字符类内的单个 { 不参与配对：/[{]/ 若按块字符处理，{ 入栈后方法的 }
+        // 弹的是字符类的 {，目标永不闭合 → 整个文件块结构错位
+        let src = "function f() {\n  const re = /[{]/;\n  g();\n}\nfunction next() {\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_matching_close(&l, 0, "ts"), Some(3), "正则字符类内 {{ 应跳过");
+        assert_eq!(find_matching_close(&l, 4, "ts"), Some(5), "后续方法不受污染");
+        // 除法上下文（a / b）不得误判为正则
+        let mut sc = LineScanner::default();
+        let mut out = String::new();
+        sc.scan("let x = a / b[0] / c;", "ts", |ch| out.push(ch));
+        assert_eq!(out, "[]", "除法两侧的 [] 正常参与，/ 不触发正则模式");
+    }
+
+    #[test]
+    fn python_docstring_with_quotes_safe() {
+        // 免修证明：Python 为缩进制块，docstring 内引号/花括号不影响块识别
+        let src = "def f():\n    \"\"\"He said \"hi\" {ok}\"\"\"\n    return 1\n\nx = 2\n";
+        let l: Vec<&str> = src.lines().collect();
+        assert_eq!(find_root_block(&l, 1, "py"), Some((0, 2)));
+    }
+
+    #[test]
+    fn edit_start_out_of_range_errors() {
+        // 无尾随换行：start=999 钳到末行 `}`（fn b 块内）→ 会静默删掉 fn b，必须报错
+        let content = "fn a() {\n    x();\n}\nfn b() {\n    y();\n}";
+        let (f, roots) = tmp_file("edit_oor", content, "rs");
+        let rel = f.to_string_lossy().to_string();
+        let args = serde_json::json!({"path": rel, "start": 999, "new": ""});
+        let out = block_on_rt(edit_file(&args, &roots, "conv"));
+        assert!(out.is_err(), "start 超界应报错: {out:?}");
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(after, content, "文件不应被改动");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_anchor_relocates_drifted_lineno() {
+        // 行号漂移：旧 start=4 本指向 fn b，但 fn a 上方插了 2 行 → start=4 落在 fn a 内。
+        // anchor="fn b" 应重定位到真正的 fn b 块（从第 6 行起），删掉的是 fn b 不是 fn a。
+        let content = "// note1\n// note2\nfn a() {\n    x();\n}\nfn b() {\n    y();\n    z();\n}\n";
+        let (f, roots) = tmp_file("edit_anchor", content, "rs");
+        let rel = f.to_string_lossy().to_string();
+        let args = serde_json::json!({"path": rel, "start": 4, "new": "", "anchor": "fn b"});
+        let out = block_on_rt(edit_file(&args, &roots, "conv")).expect("anchor 重定位应成功");
+        assert!(out.contains("fn b() {"), "报告应含被删块首行: {out}");
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert!(after.contains("fn a()"), "fn a 不应被误删: {after}");
+        assert!(!after.contains("fn b()"), "fn b 应被删除: {after}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_anchor_mismatch_rejected() {
+        // anchor 与实际块不符且附近找不到 → 拒绝（防改错块）
+        let content = "fn a() {\n    x();\n}\nfn b() {\n    y();\n}\n";
+        let (f, roots) = tmp_file("edit_anchor_bad", content, "rs");
+        let rel = f.to_string_lossy().to_string();
+        let args = serde_json::json!({"path": rel, "start": 4, "new": "", "anchor": "fn nonexistent"});
+        let out = block_on_rt(edit_file(&args, &roots, "conv"));
+        assert!(out.is_err(), "anchor 不符应拒绝: {out:?}");
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(after, content, "文件不应被改动");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_balance_guard_rejects_broken_new() {
+        // 原文件配平、替换后失衡 → 拒绝落盘（防模型生成残缺块直接写坏文件）
+        let content = "fn a() {\n    x();\n}\nfn b() {\n    y();\n}\n";
+        let (f, roots) = tmp_file("edit_bal", content, "rs");
+        let rel = f.to_string_lossy().to_string();
+        // start=4（fn b 行），new 缺闭合 }
+        let args = serde_json::json!({"path": rel, "start": 4, "new": "fn b() {\n    y();\n"});
+        let out = block_on_rt(edit_file(&args, &roots, "conv"));
+        assert!(out.is_err(), "失衡替换应被拒绝: {out:?}");
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(after, content, "文件不应被写坏");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_balance_guard_allows_balanced_and_none_style() {
+        // 正常配平替换放行；非结构化文件（txt）不做配平校验
+        let content = "fn a() {\n    x();\n}\n";
+        let (f, roots) = tmp_file("edit_ok", content, "rs");
+        let rel = f.to_string_lossy().to_string();
+        let args = serde_json::json!({"path": rel, "start": 1, "new": "fn a() {\n    z();\n}\n"});
+        block_on_rt(edit_file(&args, &roots, "conv")).expect("配平替换应成功");
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert!(after.contains("z();"));
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+
+        let (f2, roots2) = tmp_file("edit_txt", "a\nb\n", "txt");
+        let rel2 = f2.to_string_lossy().to_string();
+        let args2 = serde_json::json!({"path": rel2, "old": "a", "new": "A["});
+        block_on_rt(edit_file(&args2, &roots2, "conv")).expect("txt 不做配平校验");
+        std::fs::remove_dir_all(f2.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn outline_kinds_dart_cs_php_scala() {
+        assert_eq!(outline_kind("void main() {", "dart"), Some("函数"));
+        assert_eq!(outline_kind("class Foo {", "dart"), Some("类型"));
+        assert_eq!(outline_kind("void F() {", "cs"), Some("函数"));
+        assert_eq!(outline_kind("public class Foo {", "cs"), Some("类型"));
+        assert_eq!(outline_kind("function foo() {", "php"), Some("函数"));
+        assert_eq!(outline_kind("class Foo {", "php"), Some("类型"));
+        assert_eq!(outline_kind("def main() = {", "scala"), Some("函数"));
+        assert_eq!(outline_kind("class Foo {", "scala"), Some("类型"));
+        // Go 原有覆盖不回退
+        assert_eq!(outline_kind("func main() {", "go"), Some("函数"));
+    }
+
+    #[test]
+    fn outline_kinds_py_cfamily_word_boundary() {
+        // 回归锁定：starts_with_word 带尾随空格调用恒 false 的历史 bug
+        //（Python def/class、C-family class 等此前 outline 全为空）
+        assert_eq!(outline_kind("def main():", "py"), Some("函数"));
+        assert_eq!(outline_kind("async def fetch(x):", "py"), Some("函数"));
+        assert_eq!(outline_kind("class Foo:", "py"), Some("类型"));
+        assert_eq!(outline_kind("class Foo {", "java"), Some("类型"));
+        assert_eq!(outline_kind("public interface Bar {", "java"), None, "public 前缀不剥（c-family 原语义）");
+        // render_outline 全链路：Python 文件骨架不再为空
+        let src = "import os\n\ndef a():\n    return 1\n\nclass B:\n    pass\n";
+        let l: Vec<&str> = src.lines().collect();
+        let out = render_outline(std::path::Path::new("t.py"), &l, 64, 1, None);
+        assert!(out.contains("函数") && out.contains("类型"), "py outline 应识别 def/class: {out}");
+        assert!(out.contains("3-4") && out.contains("6-7"), "py 块区间: {out}");
+    }
+
+    #[test]
+    fn block_index_equivalent_to_find_enclosing() {
+        // 索引查询与 find_enclosing_block 全行等价（嵌套/else/字符串/未闭合/顶层）
+        let src = "fn a() {\n    let s = \"{\";\n    if x { y(); }\n    g();\n}\nif (a) {\n  foo();\n} else {\n  bar();\n}\nfn unclosed() {\n    x();\n";
+        let l: Vec<&str> = src.lines().collect();
+        let bi = BlockIndex::build(&l, "rs");
+        for i in 0..l.len() {
+            assert_eq!(bi.enclosing(&l, i, "rs"), find_enclosing_block(&l, i, "rs"), "行 {i} 结果应一致");
+        }
+        // Python 回退路径
+        let pysrc = "def a():\n    x = 1\n\ndef b():\n    z()\n";
+        let pl: Vec<&str> = pysrc.lines().collect();
+        let pbi = BlockIndex::build(&pl, "py");
+        for i in 0..pl.len() {
+            assert_eq!(pbi.enclosing(&pl, i, "py"), find_enclosing_block(&pl, i, "py"), "py 行 {i}");
+        }
+    }
+
+    #[test]
+    fn block_index_compact_encoding_equivalence() {
+        // 紧凑编码（u32+哨兵）在多页场景下仍与 find_enclosing_block 全行等价：
+        // 深嵌套、行号超 255（验证非 u8 也能存）、同文件多方法
+        let mut src = String::new();
+        for m in 0..60 {
+            src.push_str(&format!("fn m{m}() {{\n    if x {{\n        y();\n    }}\n}}\n"));
+        }
+        let l: Vec<&str> = src.lines().collect();
+        assert!(l.len() > 255, "行数应超过 255 验证 u32 编码非平凡");
+        let bi = BlockIndex::build(&l, "rs");
+        for i in 0..l.len() {
+            assert_eq!(
+                bi.enclosing(&l, i, "rs"),
+                find_enclosing_block(&l, i, "rs"),
+                "行 {} 结果应一致",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn outline_pagination_pages_and_hints() {
+        // 250 个函数 → 2 页；第 1 页含前 200 条 + 翻页提示，第 2 页含后 50 条
+        let mut src = String::new();
+        for m in 0..250 {
+            src.push_str(&format!("fn f{m}() {{\n    x();\n}}\n"));
+        }
+        let l: Vec<&str> = src.lines().collect();
+        let p1 = render_outline(std::path::Path::new("t.rs"), &l, 4096, 1, None);
+        assert!(p1.contains("共 250 条结构项 / 2 页"), "分页统计: {p1}");
+        assert!(p1.contains("当前第 1 页"), "页码标注: {p1}");
+        assert!(p1.contains("fn f199"), "第 1 页末条 f199: {p1}");
+        assert!(!p1.contains("fn f200"), "第 1 页不含 f200: {p1}");
+        assert!(p1.contains("outline_page=2"), "翻页提示: {p1}");
+        let p2 = render_outline(std::path::Path::new("t.rs"), &l, 4096, 2, None);
+        assert!(p2.contains("当前第 2 页"), "第 2 页页码: {p2}");
+        assert!(p2.contains("fn f200"), "第 2 页首条 f200: {p2}");
+        assert!(p2.contains("fn f249"), "第 2 页末条 f249: {p2}");
+        assert!(!p2.contains("fn f199()"), "第 2 页不含 f199: {p2}");
+        // 小文件单页：不显示分页信息（与旧版输出一致）
+        let small = "fn a() {\n}\n";
+        let sl: Vec<&str> = small.lines().collect();
+        let ps = render_outline(std::path::Path::new("t.rs"), &sl, 16, 1, None);
+        assert!(!ps.contains("页"), "单页无分页字样: {ps}");
+    }
+
+    #[test]
+    fn locate_edit_block_shared_semantics() {
+        // edit_file / preview_edit 共用口径：超界报错、anchor 重定位、anchor 失败拒绝
+        let src = "fn a() {\n    x();\n}\nfn b() {\n    y();\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        // 常规定位：start 行所在块
+        assert_eq!(locate_edit_block(&l, 1, None, "rs").unwrap(), (0, 2));
+        assert_eq!(locate_edit_block(&l, 5, None, "rs").unwrap(), (3, 5));
+        // 超界显式报错（含 anchor 提示）
+        let err = locate_edit_block(&l, 99, None, "rs").unwrap_err();
+        assert!(err.contains("超出文件总行数") && err.contains("anchor"), "{err}");
+        // anchor 校验通过：块首行含签名
+        assert_eq!(locate_edit_block(&l, 1, Some("fn a"), "rs").unwrap(), (0, 2));
+        // anchor 重定位：start 漂移到 b 内但签名是 fn a → ±100 行内重定位回 a 块
+        assert_eq!(locate_edit_block(&l, 5, Some("fn a"), "rs").unwrap(), (0, 2));
+        // anchor 失败：签名不存在 → 拒绝（不会静默改错块）
+        let err2 = locate_edit_block(&l, 1, Some("fn not_exist"), "rs").unwrap_err();
+        assert!(err2.contains("anchor 定位失败"), "{err2}");
+        // Python 缩进块同口径
+        let pysrc = "def a():\n    x = 1\n\ndef b():\n    z()\n";
+        let pl: Vec<&str> = pysrc.lines().collect();
+        assert_eq!(locate_edit_block(&pl, 2, Some("def a"), "py").unwrap(), (0, 1));
+    }
+
+    #[test]
+    fn write_file_balance_guard_rejects_unbalanced() {
+        // 新建文件：残缺代码（漏 }）拒绝落盘；完整代码正常创建
+        let dir = std::env::temp_dir().join(format!("wf_bal_new_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let f = dir.join("t.rs");
+        let args = serde_json::json!({"path": f.to_string_lossy(), "content": "fn a() {\n    x();\n"});
+        let out = block_on_rt(write_file(&args, &roots, "conv"));
+        assert!(out.is_err(), "新建残缺 rs 应拒绝: {out:?}");
+        assert!(!f.exists(), "残缺文件不应落盘");
+        let args_ok = serde_json::json!({"path": f.to_string_lossy(), "content": "fn a() {\n    x();\n}\n"});
+        block_on_rt(write_file(&args_ok, &roots, "conv")).expect("完整代码应可创建");
+        // 覆盖已有配平文件为残缺内容 → 拒绝且原文件不变
+        let args_bad = serde_json::json!({"path": f.to_string_lossy(), "content": "fn a() {\n    y();\n"});
+        let out2 = block_on_rt(write_file(&args_bad, &roots, "conv"));
+        assert!(out2.is_err(), "覆盖为残缺应拒绝: {out2:?}");
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert!(after.contains('}'), "原文件不应被改坏: {after}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_file_batch_replace_and_delete() {
+        // 批量模式：一次替换 fn a、删除 fn c，中间 fn b 不受影响
+        let dir = std::env::temp_dir().join(format!("ef_batch_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let f = dir.join("t.rs");
+        std::fs::write(&f, "fn a() {\n    old_a();\n}\nfn b() {\n    keep();\n}\nfn c() {\n    old_c();\n}\n").unwrap();
+        // 先 read_file 解除外部修改保护；会话 id 用唯一值防并行测试互相污染 undo 栈
+        let conv = format!("conv_batch_{}", std::process::id());
+        let rd = serde_json::json!({"path": f.to_string_lossy()});
+        block_on_rt(read_file(&rd, &roots)).expect("read ok");
+        let args = serde_json::json!({
+            "path": f.to_string_lossy(),
+            "starts": [1, 7],
+            "news": ["fn a() {\n    new_a();\n}", ""]
+        });
+        let out = block_on_rt(edit_file(&args, &roots, &conv)).expect("批量编辑应成功");
+        assert!(out.contains("已批量编辑 2 个块"), "报告: {out}");
+        assert!(out.contains("starts[0]：L1-L3") && out.contains("已替换"), "{out}");
+        assert!(out.contains("starts[1]：L7-L9") && out.contains("已删除"), "{out}");
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert!(after.contains("new_a();") && !after.contains("old_a();"), "a 已替换: {after}");
+        assert!(after.contains("fn b() {\n    keep();\n}"), "b 保持原样: {after}");
+        assert!(!after.contains("fn c") && !after.contains("old_c();"), "c 已删除: {after}");
+        // undo 一次恢复全部（批量只写一个快照）
+        let undo = serde_json::json!({});
+        block_on_rt(undo_edit(&undo, &roots, &conv)).expect("undo ok");
+        let restored = std::fs::read_to_string(&f).unwrap();
+        assert!(restored.contains("old_a();") && restored.contains("old_c();"), "undo 恢复原样: {restored}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_file_batch_validation_errors() {
+        let dir = std::env::temp_dir().join(format!("ef_bve_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let f = dir.join("t.rs");
+        let src = "fn a() {\n    x();\n}\nfn b() {\n    y();\n}\n";
+        std::fs::write(&f, src).unwrap();
+        let rd = serde_json::json!({"path": f.to_string_lossy()});
+        block_on_rt(read_file(&rd, &roots)).expect("read ok");
+        // starts 与 old 互斥
+        let e1 = block_on_rt(edit_file(&serde_json::json!({"path": f.to_string_lossy(), "old": "x", "new": "z", "starts": [1], "news": [""]}), &roots, "conv")).unwrap_err();
+        assert!(e1.contains("互斥"), "{e1}");
+        // starts/news 长度不一致
+        let e2 = block_on_rt(edit_file(&serde_json::json!({"path": f.to_string_lossy(), "starts": [1, 5], "news": [""]}), &roots, "conv")).unwrap_err();
+        assert!(e2.contains("长度必须一致"), "{e2}");
+        // anchors 长度不一致
+        let e3 = block_on_rt(edit_file(&serde_json::json!({"path": f.to_string_lossy(), "starts": [1], "news": [""], "anchors": []}), &roots, "conv")).unwrap_err();
+        assert!(e3.contains("anchors"), "{e3}");
+        // 同一块出现两次 → 重叠拒绝
+        let e4 = block_on_rt(edit_file(&serde_json::json!({"path": f.to_string_lossy(), "starts": [1, 2], "news": ["", ""]}), &roots, "conv")).unwrap_err();
+        assert!(e4.contains("重叠"), "{e4}");
+        // anchors 校验失败（签名不存在）
+        let e5 = block_on_rt(edit_file(&serde_json::json!({"path": f.to_string_lossy(), "starts": [1], "news": [""], "anchors": ["fn not_exist"]}), &roots, "conv")).unwrap_err();
+        assert!(e5.contains("anchor 定位失败"), "{e5}");
+        // 超界
+        let e6 = block_on_rt(edit_file(&serde_json::json!({"path": f.to_string_lossy(), "starts": [99], "news": [""]}), &roots, "conv")).unwrap_err();
+        assert!(e6.contains("超出文件总行数"), "{e6}");
+        // 配平守卫：批量替换后失衡 → 拒绝
+        let e7 = block_on_rt(edit_file(&serde_json::json!({"path": f.to_string_lossy(), "starts": [1], "news": ["fn a() {\n    x();\n"]}), &roots, "conv")).unwrap_err();
+        assert!(e7.contains("配平") || e7.contains("失衡"), "{e7}");
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(after, src, "所有失败路径都不应改动文件");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_file_batch_dry_run_and_preview() {
+        // dry_run 不落盘；preview_edit 批量同口径出 diff
+        let dir = std::env::temp_dir().join(format!("ef_bdr_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let f = dir.join("t.rs");
+        let src = "fn a() {\n    x();\n}\nfn b() {\n    y();\n}\n";
+        std::fs::write(&f, src).unwrap();
+        let rd = serde_json::json!({"path": f.to_string_lossy()});
+        block_on_rt(read_file(&rd, &roots)).expect("read ok");
+        let args = serde_json::json!({"path": f.to_string_lossy(), "starts": [1, 4], "news": ["fn a() {\n    x2();\n}", "fn b() {\n    y2();\n}"], "dry_run": true});
+        let out = block_on_rt(edit_file(&args, &roots, "conv")).expect("dry_run ok");
+        assert!(out.contains("【dry_run 预览】") && out.contains("2 个块"), "{out}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), src, "dry_run 不落盘");
+        let pv = block_on_rt(preview_edit(&serde_json::json!({"path": f.to_string_lossy(), "starts": [1, 4], "news": ["fn a() {\n    x2();\n}", "fn b() {\n    y2();\n}"]}), &roots, "conv")).expect("preview ok");
+        assert!(pv.contains("+") && pv.contains("-") || pv.contains("x2"), "diff 内容: {pv}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), src, "preview 不落盘");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grep_regex_ci_debug() {
+        let r = regex::RegexBuilder::new("foo\\(").case_insensitive(true).build().unwrap();
+        assert!(r.is_match("FOO("), "ci literal");
+        let r2 = regex::RegexBuilder::new("foo\\s*\\(").case_insensitive(true).build().unwrap();
+        assert!(r2.is_match("fn foo() {"));
+    }
+
+    #[test]
+    fn grep_files_regex_mode() {
+        let dir = std::env::temp_dir().join(format!("gp_re_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        std::fs::write(dir.join("a.rs"), "fn foo() {\n    call_foo (x);\n}\nlet v: Vec<String> = Vec::new();\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "foo (not code)\nplain text\n").unwrap();
+        // 正则匹配：foo 后跟可选空格再 (（命中 .rs 的 L1/L2；.txt 也会命中行，先不 glob 过滤）
+        let out = block_on_rt(grep_files(&serde_json::json!({"pattern": "foo\\s*\\(", "path": dir.to_string_lossy(), "glob": "*.rs", "regex": true}), &roots)).expect("regex grep ok");
+        assert!(out.contains("fn foo()") && out.contains("call_foo (x)"), "两行命中: {out}");
+        // 类型模式：Vec<\w+>
+        let out2 = block_on_rt(grep_files(&serde_json::json!({"pattern": "Vec<\\w+>", "path": dir.to_string_lossy(), "glob": "*.rs", "regex": true}), &roots)).expect("regex grep 2 ok");
+        assert!(out2.contains("Vec<String>"), "泛型命中: {out2}");
+        // 大小写不敏感（缺省）：FOO 也命中
+        std::fs::write(dir.join("c.rs"), "FOO(\n").unwrap();
+        let out3 = block_on_rt(grep_files(&serde_json::json!({"pattern": "foo\\(", "path": dir.to_string_lossy(), "glob": "c.rs", "regex": true}), &roots)).expect("ci ok");
+        assert!(out3.contains("FOO("), "大小写不敏感: {out3}");
+        // case_sensitive=true 时不再命中
+        let out4 = block_on_rt(grep_files(&serde_json::json!({"pattern": "foo\\(", "path": dir.to_string_lossy(), "glob": "c.rs", "regex": true, "case_sensitive": true}), &roots)).expect("cs ok");
+        assert!(out4.contains("未找到"), "大小写敏感应无命中: {out4}");
+        // 非法正则：明确报错并提示转义
+        let e = block_on_rt(grep_files(&serde_json::json!({"pattern": "foo(", "path": dir.to_string_lossy(), "regex": true}), &roots)).unwrap_err();
+        assert!(e.contains("正则表达式无效") && e.contains("双重转义"), "{e}");
+        // 不传 regex：纯文本语义，foo\s*\( 找不到字面量
+        let out5 = block_on_rt(grep_files(&serde_json::json!({"pattern": "foo\\s*\\(", "path": dir.to_string_lossy(), "glob": "*.rs"}), &roots)).expect("plain ok");
+        assert!(out5.contains("未找到"), "纯文本模式不应正则命中: {out5}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn outline_block_range_bindex_matches_fallback() {
+        // 快路径（BlockIndex O(1) 查询）与回退路径（逐次 find_matching_close）全定义行等价
+        let src = "struct S {\n    x: u32,\n}\nimpl S {\n    fn a(&self) {\n        self.x();\n    }\n    fn b(\n        p: u32,\n    ) -> u32 {\n        p\n    }\n}\nfn top() {\n    z();\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        let bi = BlockIndex::build(&l, "rs");
+        for i in 0..l.len() {
+            assert_eq!(
+                outline_block_range(&l, i, "rs", Some(&bi)),
+                outline_block_range(&l, i, "rs", None),
+                "定义行 {} 两条路径结果应一致",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn outline_filter_and_hierarchy_indent() {
+        // 类型过滤：filter="函数" 只显示 fn 条目并标注过滤信息
+        let src = "struct S {\n    x: u32,\n}\nimpl S {\n    fn a(&self) {\n        g();\n    }\n}\nfn top() {\n    z();\n}\n";
+        let l: Vec<&str> = src.lines().collect();
+        let out = render_outline(std::path::Path::new("t.rs"), &l, 128, 1, Some("函数"));
+        assert!(out.contains("已按类型过滤"), "过滤标注: {out}");
+        assert!(out.contains("fn a") && out.contains("fn top"), "函数条目保留: {out}");
+        assert!(!out.contains("struct S"), "类型条目被过滤: {out}");
+        assert!(!out.contains("impl S"), "impl 被过滤: {out}");
+        // 层级缩进：impl 内的 fn a 缩进 2 格，顶层 fn top 不缩进
+        let full = render_outline(std::path::Path::new("t.rs"), &l, 128, 1, None);
+        let fn_a_line = full.lines().find(|s| s.contains("fn a")).unwrap();
+        let fn_top_line = full.lines().find(|s| s.contains("fn top")).unwrap();
+        assert!(fn_a_line.contains("│   函数 fn a"), "类内方法应缩进: {fn_a_line}");
+        assert!(fn_top_line.contains("│ 函数 fn top"), "顶层函数不缩进: {fn_top_line}");
+        // Python 层级：类内 def 按缩进层级显示
+        let pysrc = "class B:\n    def m(self):\n        return 1\n\ndef top():\n    pass\n";
+        let pl: Vec<&str> = pysrc.lines().collect();
+        let pyout = render_outline(std::path::Path::new("t.py"), &pl, 64, 1, None);
+        let def_m = pyout.lines().find(|s| s.contains("def m")).unwrap();
+        assert!(def_m.contains("│   函数 def m"), "py 类内方法应缩进: {def_m}");
     }
 
     #[test]

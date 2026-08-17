@@ -101,9 +101,9 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
   }, [inspect, modules, t])
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+    <div className="modal-backdrop flex items-center justify-center" onClick={onClose}>
       <div
-        className="w-[560px] max-h-[85vh] flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl shadow-black/40 animate-modal-in"
+        className="w-[560px] max-h-[85vh] flex flex-col rounded-2xl glass-card animate-modal-in"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2.5 px-5 py-4 border-b border-[var(--border)]">
@@ -150,7 +150,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
           )}
 
           {inspect && typeBadge && (
-            <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-4 space-y-2.5 text-[13px] animate-fade-in-up">
+            <div className="rounded-xl modern-card p-4 space-y-2.5 text-[13px] animate-fade-in-up">
               <div className="flex items-center gap-2">
                 <span className="text-[var(--text-secondary)] w-16 shrink-0">{t('dialog.projectName')}</span>
                 <span className="font-medium truncate">{inspect.name}</span>
@@ -165,7 +165,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
                 <span className="text-[var(--text-secondary)] w-16 shrink-0">{t('dialog.fileCount')}</span>
                 <span>{inspect.file_count}</span>
                 {inspect.has_git && (
-                  <span className="px-2 py-0.5 rounded-full text-[11px] bg-[var(--accent)]/15 text-[var(--accent)] font-medium">
+                  <span className="px-2 py-0.5 rounded-full text-[11px] bg-[var(--success-100)] text-[var(--success)] font-medium">
                     git
                   </span>
                 )}
@@ -228,7 +228,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
           <button
             onClick={confirm}
             disabled={!inspect || inspect.already_added || busy || scanning}
-            className="px-4 h-9 rounded-[10px] text-[13px] font-medium bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] disabled:opacity-35 disabled:cursor-not-allowed transition-all active:scale-[0.98]"
+            className="px-4 h-9 rounded-[10px] text-[13px] font-medium btn-primary  disabled:opacity-35 disabled:cursor-not-allowed transition-all active:scale-[0.98]"
           >
             {busy ? '…' : t('dialog.confirmAdd')}
           </button>
@@ -237,3 +237,6 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
     </div>
   )
 }
+
+
+

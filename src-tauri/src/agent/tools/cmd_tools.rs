@@ -32,13 +32,9 @@ impl CommandRequest {
         if is_dangerous_command(command) {
             return Err("命令被安全策略拒绝（危险命令黑名单）：删除/格式化/系统级操作禁止执行，请改用 write_file/edit_file 或 git 工具".into());
         }
-        // 命令白名单：仅允许开发工具链可执行程序；未在白名单的命令需通过 L2 审批（在对话审核层拦截），
-        // 这里对"明显非开发命令"给出明确拒绝，提示用户改用专用工具或通过权限审核。
-        if !crate::services::permissions::is_command_allowed(command) {
-            return Err(format!(
-                "命令不在允许的工具链白名单内（git/node/npm/ohpm/hvigorw/hdc/java/python 等）：{command}。\n如需执行其他程序，请在权限提示中确认，或使用专用工具（write_file/edit_file/read_file 等）。"
-            ));
-        }
+        // 命令白名单不再在此硬拦截：未在白名单的命令交由审批层（pre_approval 钩子）按权限模式裁决——
+        // allow_all（默认）直接放行；ask/auto 模式弹窗确认（command_level 判为 L2）；first_write 非写工具放行。
+        // 此处仅保留危险命令黑名单（rm -rf / format 等系统级破坏操作，任何权限模式都拦截的安全底线）。
         let timeout = self.timeout.unwrap_or(60).clamp(1, 300);
         let cwd_raw = self.cwd.as_deref().unwrap_or(".");
         let cwd = resolve_in_roots(roots, cwd_raw)?;
@@ -66,7 +62,7 @@ pub(super) struct CommandSpec {
     pub run_in_background: bool,
 }
 
-/// 危险命令黑名单（run_command 拦截）
+/// 危险命令黑名单（run_command 拦截，任何权限模式均生效的安全底线）
 pub(super) fn is_dangerous_command(cmd: &str) -> bool {
     let c = cmd.trim().to_lowercase();
     const DANGEROUS: [&str; 17] = [
@@ -99,6 +95,63 @@ pub(super) fn split_command(line: &str) -> Vec<String> {
     parts
 }
 
+/// 解析命令为 (program, args, envs)：
+/// - Windows 下 .bat/.cmd 脚本必须经 cmd /C 执行（CreateProcess 无法直接运行批处理，
+///   直接 spawn 会“退出码 1 无输出”）；整条命令交给 cmd 以保留参数语义；
+/// - 批处理若依赖 node（hvigorw.bat/ohpm 等）且 PATH 无 node，自动注入 DevEco 内置 node。
+fn resolve_program(command: &str, cwd: &Path) -> (String, Vec<String>, Option<Vec<(String, String)>>) {
+    let parts = split_command(command);
+    let (prog, cargs) = (parts[0].clone(), parts[1..].to_vec());
+    let local = cwd.join(&prog);
+    let program = if local.is_file() {
+        local.to_string_lossy().to_string()
+    } else {
+        prog
+    };
+    #[cfg(windows)]
+    if program.to_lowercase().ends_with(".bat") || program.to_lowercase().ends_with(".cmd") {
+        return (
+            "cmd".to_string(),
+            vec!["/C".to_string(), command.to_string()],
+            deveco_node_env(),
+        );
+    }
+    (program, cargs, None)
+}
+
+/// PATH 中无 node 且探测到 DevEco Studio 内置 node 时，返回注入其目录的 PATH（供 .bat 脚本链）。
+#[cfg(windows)]
+fn deveco_node_env() -> Option<Vec<(String, String)>> {
+    let path_has_node = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("node.exe").is_file()))
+        .unwrap_or(false);
+    if path_has_node {
+        return None;
+    }
+    const CANDIDATES: [&str; 2] = [
+        r"C:\Program Files\Huawei\DevEco Studio\tools\node",
+        r"C:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\node",
+    ];
+    for cand in CANDIDATES {
+        let p = std::path::Path::new(cand);
+        if p.join("node.exe").is_file() {
+            let mut dirs = vec![p.to_path_buf()];
+            if let Some(cur) = std::env::var_os("PATH") {
+                dirs.extend(std::env::split_paths(&cur));
+            }
+            if let Ok(joined) = std::env::join_paths(dirs) {
+                return Some(vec![("PATH".to_string(), joined.to_string_lossy().to_string())]);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn deveco_node_env() -> Option<Vec<(String, String)>> {
+    None
+}
+
 /// run_command：在项目内静默执行命令（危险命令黑名单 + 超时 + 输出截断）
 /// 把流式命令的完整输出转成 run_cmd 语义的文本（退出码判断 + 字符上限截断），
 /// 供 run_command 在流式执行（agent:log 实时推送）后保持原有结果格式
@@ -125,6 +178,73 @@ pub(super) fn cmd_output_text(o: &std::process::Output, max_chars: usize) -> Res
     }
 }
 
+/// 命令失败信息增强：给 Agent 可操作线索，避免“退出码 1 无输出”这类零信息失败
+/// （testhy 会话实证：hvigorw.bat 连续 3 次“退出码 1 无输出”，Agent 无法判断原因只能盲试）。
+/// - 鸿蒙构建命令（hvigorw/hvigorw.bat）→ 提示改用 build_project 专用工具（node 直调更可靠）；
+/// - 无输出失败 → 自动附带工程内最近构建日志尾部（.hvigor 下），失败也有据可查。
+fn enrich_run_error(e: String, command: &str, cwd: &Path) -> String {
+    let lower = command.to_lowercase();
+    let mut extra = String::new();
+    if lower.contains("hvigorw") {
+        extra.push_str(
+            "\n提示：鸿蒙工程构建请改用 build_project 专用工具（node 直调 hvigor-wrapper，比手动跑 hvigorw.bat 更可靠，能自动注入 SDK/node 环境并保存日志）；部署请用 deploy。",
+        );
+    }
+    if e.contains("无输出") {
+        if let Some(log) = latest_hvigor_log(cwd) {
+            let tail = read_tail(&log, 1500);
+            extra.push_str(&format!("\n（最近构建日志 {} 尾部：\n{}\n）", log.display(), tail));
+        }
+    }
+    if extra.is_empty() {
+        e
+    } else {
+        format!("{e}{extra}")
+    }
+}
+
+/// 工程内最近修改的 hvigor 构建日志（.hvigor 下递归扫描 *.log，取 mtime 最新）
+fn latest_hvigor_log(cwd: &Path) -> Option<std::path::PathBuf> {
+    let hv = cwd.join(".hvigor");
+    if !hv.is_dir() {
+        return None;
+    }
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let mut stack = vec![hv.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("log") {
+                let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                    best = Some((mtime, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 读取文件尾部字符（按 UTF-8 字符计数）
+fn read_tail(p: &Path, max_chars: usize) -> String {
+    let Ok(bytes) = std::fs::read(p) else {
+        return "(读取失败)".to_string();
+    };
+    let text = smart_decode(&bytes);
+    let total = text.chars().count();
+    if total <= max_chars {
+        text
+    } else {
+        let skip = total - max_chars;
+        let mut out: String = text.chars().skip(skip).collect();
+        out.insert_str(0, &format!("…(前 {} 字符省略)\n", skip));
+        out
+    }
+}
+
 pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法执行命令".into());
@@ -139,20 +259,14 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     // 后台模式：解析为 (program, args) 后交给 jobs 托管进程生命周期，立即返回 job_id；
     // 任务完成时结果注入会话队列（模型下一轮请求自动看到），并可 job_output/job_kill 管理
     if spec.run_in_background {
-        let (program, args) = if needs_shell(&command) {
+        // 注：后台任务暂不注入环境变量（jobs 模块无 env 支持），.bat 经 cmd /C 执行即可
+        let (program, args, _envs) = if needs_shell(&command) {
             #[cfg(windows)]
-            { ("cmd".to_string(), vec!["/C".to_string(), command.to_string()]) }
+            { ("cmd".to_string(), vec!["/C".to_string(), command.to_string()], None) }
             #[cfg(not(windows))]
-            { ("sh".to_string(), vec!["-c".to_string(), command.clone()]) }
+            { ("sh".to_string(), vec!["-c".to_string(), command.clone()], None) }
         } else {
-            let parts = split_command(&command);
-            let (prog, cargs) = (parts[0].clone(), parts[1..].to_vec());
-            let local = cwd.join(&prog);
-            if local.is_file() {
-                (local.to_string_lossy().to_string(), cargs)
-            } else {
-                (prog, cargs)
-            }
+            resolve_program(&command, &cwd)
         };
         let job_id = crate::agent::jobs::start_background(
             program,
@@ -183,24 +297,22 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         let shell_prog = "sh";
         #[cfg(not(windows))]
         let shell_args = vec!["-c".to_string(), command.clone()];
-        crate::agent::exec_ctx::run_cmd_streaming(ctx, shell_prog, &shell_args, Some(&cwd), timeout, None)
-            .await
-            .and_then(|o| cmd_output_text(&o, 30000))
-            .map_err(|e| with_advice("run_command", e))
+        let envs = deveco_node_env();
+        crate::agent::exec_ctx::run_cmd_streaming_env(
+            ctx, shell_prog, &shell_args, Some(&cwd), timeout, None, envs.as_deref(),
+        )
+        .await
+        .and_then(|o| cmd_output_text(&o, 30000))
+        .map_err(|e| with_advice("run_command", e))
     } else {
-        let parts = split_command(&command);
-        let (prog, cargs) = (parts[0].clone(), parts[1..].to_vec());
-        // 工程内脚本（如 hvigorw.bat）优先本地路径解析，否则走 PATH
-        let local = cwd.join(&prog);
-        let (program, full_args) = if local.is_file() {
-            (local.to_string_lossy().to_string(), cargs)
-        } else {
-            (prog, cargs)
-        };
-        crate::agent::exec_ctx::run_cmd_streaming(ctx, &program, &full_args, Some(&cwd), timeout, None)
-            .await
-            .and_then(|o| cmd_output_text(&o, 30000))
-            .map_err(|e| with_advice("run_command", e))
+        // 工程内脚本（如 hvigorw.bat）优先本地路径解析；.bat/.cmd 经 cmd /C 执行（见 resolve_program）
+        let (program, full_args, envs) = resolve_program(&command, &cwd);
+        crate::agent::exec_ctx::run_cmd_streaming_env(
+            ctx, &program, &full_args, Some(&cwd), timeout, None, envs.as_deref(),
+        )
+        .await
+        .and_then(|o| cmd_output_text(&o, 30000))
+        .map_err(|e| with_advice("run_command", e))
     };
     match result {
         Ok(out) => {
@@ -219,7 +331,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
                 ))
             }
         }
-        Err(e) => Err(e),
+        Err(e) => Err(enrich_run_error(e, command, cwd)),
     }
 }
 
@@ -253,6 +365,14 @@ pub(super) async fn deep_scan_tool(args: &Value, roots: &[String]) -> Result<Str
     let root = scan_root(roots)?;
     let path = args["path"].as_str();
     crate::agent::scanner::deep_scan(root, path).map_err(|e| with_advice("deep_scan", e))
+}
+
+/// secret_scan：密钥泄露专项扫描（源码 + 配置文件）
+pub(super) async fn secret_scan_tool(args: &Value, roots: &[String]) -> Result<String, String> {
+    let root = scan_root(roots)?;
+    let path = args["path"].as_str();
+    let include_config = args["include_config"].as_bool();
+    crate::agent::scanner::secret_scan(root, path, include_config).map_err(|e| with_advice("secret_scan", e))
 }
 
 /// codebase_search：全库混合检索

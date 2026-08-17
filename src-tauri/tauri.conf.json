@@ -59,7 +59,7 @@
   },
   "plugins": {
     "shell": {
-      "open": true
+      "open": "(https?://|mailto:|tel:|[a-zA-Z]:[\\\\/]|/|\\\\).*"
     },
     "updater": {
       "endpoints": [

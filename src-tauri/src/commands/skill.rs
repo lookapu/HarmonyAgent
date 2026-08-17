@@ -4,11 +4,15 @@ use serde::Deserialize;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
-use crate::db::{models::Skill, queries, DbState};
+use crate::db::{
+    models::{Skill, SkillUsageEvent, SkillUsageStat},
+    queries, DbState,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ImportSkillInput {
-    /// GitHub 仓库地址：https://github.com/owner/name、git@github.com:owner/name.git 或 owner/name
+    /// Git 仓库地址：支持 GitHub/Gitee——https://github.com/owner/name、git@github.com:owner/name.git、
+    /// owner/name（缺省 github）、https://gitee.com/owner/name、git@gitee.com:owner/name.git
     pub repo: String,
     /// 分支（可选，缺省使用仓库默认分支）
     pub branch: Option<String>,
@@ -21,17 +25,30 @@ pub struct ImportSkillInput {
     pub project_id: Option<String>,
 }
 
-/// 解析 GitHub 仓库地址 -> (owner, name)
-fn parse_github_repo(repo: &str) -> Result<(String, String), String> {
+/// 解析 Git 仓库地址 -> (host, owner, name)，支持 GitHub/Gitee：
+/// https://github.com/owner/name、git@github.com:owner/name.git、owner/name（缺省 github）；
+/// gitee 同理（https://gitee.com/owner/name、git@gitee.com:owner/name.git）。
+fn parse_git_repo(repo: &str) -> Result<(String, String, String), String> {
     let trimmed = repo.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("仓库地址不能为空".into());
     }
-    let rest = trimmed
+    let (host, rest) = if let Some(rest) = trimmed
         .strip_prefix("https://github.com/")
         .or_else(|| trimmed.strip_prefix("http://github.com/"))
         .or_else(|| trimmed.strip_prefix("git@github.com:"))
-        .unwrap_or(trimmed);
+    {
+        ("github".to_string(), rest)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("https://gitee.com/")
+        .or_else(|| trimmed.strip_prefix("http://gitee.com/"))
+        .or_else(|| trimmed.strip_prefix("git@gitee.com:"))
+    {
+        ("gitee".to_string(), rest)
+    } else {
+        // 无平台前缀（owner/name 简写）：默认 GitHub
+        ("github".to_string(), trimmed)
+    };
     let mut parts = rest.split('/').filter(|s| !s.is_empty());
     let owner = parts.next().ok_or_else(|| format!("无法解析仓库地址: {repo}"))?.to_string();
     let name = parts
@@ -42,7 +59,7 @@ fn parse_github_repo(repo: &str) -> Result<(String, String), String> {
     if owner.is_empty() || name.is_empty() {
         return Err(format!("无法解析仓库地址: {repo}"));
     }
-    Ok((owner, name))
+    Ok((host, owner, name))
 }
 
 /// 解析 SKILL.md frontmatter 中的 name / description（支持引号、单行与多行折叠描述）
@@ -97,15 +114,15 @@ fn parse_skill_meta(content: &str) -> (Option<String>, Option<String>) {
     (name, desc.filter(|d| !d.is_empty()))
 }
 
-/// 从 GitHub 导入 Skill：
-/// git clone 到数据目录 skills/{owner}__{name}，读取 SKILL.md 元信息后入库。
+/// 从 GitHub/Gitee 导入 Skill：
+/// git clone 到数据目录 skills/{host}__{owner}__{name}，读取 SKILL.md 元信息后入库。
 #[tauri::command]
 pub async fn import_skill_from_github(
     app: AppHandle,
     db: State<'_, DbState>,
     input: ImportSkillInput,
 ) -> Result<Skill, String> {
-    let (owner, name) = parse_github_repo(&input.repo)?;
+    let (host, owner, name) = parse_git_repo(&input.repo)?;
     let branch = input.branch.unwrap_or_default();
     let branch = branch.trim();
 
@@ -116,13 +133,13 @@ pub async fn import_skill_from_github(
         .join("skills");
     std::fs::create_dir_all(&skills_dir).map_err(|e| format!("创建 skills 目录失败: {e}"))?;
 
-    let dest = skills_dir.join(format!("{owner}__{name}"));
+    let dest = skills_dir.join(format!("{host}__{owner}__{name}"));
     // 已存在则清空后重新拉取（保证与远程一致）
     if dest.exists() {
         std::fs::remove_dir_all(&dest).map_err(|e| format!("清理旧目录失败: {e}"))?;
     }
 
-    let url = format!("https://github.com/{owner}/{name}.git");
+    let url = format!("https://{host}.com/{owner}/{name}.git");
     let mut args = vec!["clone".to_string(), "--depth".to_string(), "1".to_string()];
     if !branch.is_empty() {
         args.push("--branch".to_string());
@@ -217,18 +234,19 @@ pub async fn import_skill_from_github(
     };
 
     let skill_name = meta_name.unwrap_or_else(|| name.clone());
-    let description = meta_desc.or_else(|| Some(format!("{owner}/{name} 仓库中安装的 Skill")));
+    let description = meta_desc.or_else(|| Some(format!("{host}/{owner}/{name} 仓库中安装的 Skill")));
     let directory = skill_root.to_string_lossy().to_string();
 
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
 
-    // 已存在同一仓库同一子目录的 Skill：更新目录/描述/时间
-    let existing = queries::find_skill_by_repo(&conn, &owner, &name, &subdir, input.project_id.as_deref()).map_err(|e| e.to_string())?;
+    // 已存在同一仓库同一子目录的 Skill：更新目录/描述/时间（按平台+仓库查重）
+    let existing = queries::find_skill_by_repo(&conn, &host, &owner, &name, &subdir, input.project_id.as_deref()).map_err(|e| e.to_string())?;
     let skill = if let Some(mut s) = existing {
         s.name = skill_name;
         s.description = description;
         s.directory = Some(directory);
+        s.repo_host = Some(host.clone());
         s.repo_branch = actual_branch.clone();
         s.updated_at = Some(now);
         queries::update_skill(&conn, &s).map_err(|e| e.to_string())?;
@@ -241,6 +259,7 @@ pub async fn import_skill_from_github(
             directory: Some(directory),
             repo_owner: Some(owner.clone()),
             repo_name: Some(name.clone()),
+            repo_host: Some(host.clone()),
             repo_branch: actual_branch.clone(),
             subdir: if subdir.is_empty() { None } else { Some(subdir.clone()) },
             enabled: true,
@@ -253,10 +272,10 @@ pub async fn import_skill_from_github(
         s
     };
 
-    // 记录到 skill_repos（幂等）
+    // 记录到 skill_repos（幂等，按平台+仓库）
     conn.execute(
-        "INSERT OR REPLACE INTO skill_repos (owner, name, branch, enabled) VALUES (?1, ?2, ?3, 1)",
-        rusqlite::params![owner, name, actual_branch],
+        "INSERT OR REPLACE INTO skill_repos (host, owner, name, branch, enabled) VALUES (?1, ?2, ?3, ?4, 1)",
+        rusqlite::params![host, owner, name, actual_branch],
     )
     .map_err(|e| e.to_string())?;
 
@@ -280,14 +299,20 @@ pub fn remove_skill(app: AppHandle, db: State<DbState>, id: String) -> Result<()
             if dir_path.is_dir() {
                 let _ = std::fs::remove_dir_all(dir_path);
             }
-            // 仓库根目录若已空，也顺手清理（{owner}__{name}）
+            // 仓库根目录若已空，也顺手清理（{host}__{owner}__{name}，兼容旧格式 {owner}__{name}）
             if let (Some(owner), Some(name)) = (&skill.repo_owner, &skill.repo_name) {
                 let skills_dir = app
                     .path()
                     .app_data_dir()
                     .map_err(|e| e.to_string())?
                     .join("skills");
-                let repo_dir = skills_dir.join(format!("{owner}__{name}"));
+                let host = skill.repo_host.as_deref().unwrap_or("github");
+                let repo_dir = skills_dir.join(format!("{host}__{owner}__{name}"));
+                let repo_dir = if repo_dir.is_dir() {
+                    repo_dir
+                } else {
+                    skills_dir.join(format!("{owner}__{name}"))
+                };
                 let empty = std::fs::read_dir(&repo_dir)
                     .map(|mut it| it.next().is_none())
                     .unwrap_or(false);
@@ -335,7 +360,8 @@ pub fn clone_skill(
 
     let subdir = src.subdir.clone().unwrap_or_default();
     if let (Some(owner), Some(name)) = (src.repo_owner.as_deref(), src.repo_name.as_deref()) {
-        if queries::find_skill_by_repo(&conn, owner, name, &subdir, target_project_id.as_deref())
+        let host = src.repo_host.as_deref().unwrap_or("github");
+        if queries::find_skill_by_repo(&conn, host, owner, name, &subdir, target_project_id.as_deref())
             .map_err(|e| e.to_string())?
             .is_some()
         {
@@ -350,4 +376,28 @@ pub fn clone_skill(
     src.updated_at = None;
     queries::insert_skill(&conn, &src).map_err(|e| e.to_string())?;
     Ok(src)
+}
+
+/// Skill 调用统计（按技能聚合：次数 / 最近调用时间）。project_id 空 = 全部项目。
+#[tauri::command]
+pub fn list_skill_usage(
+    db: State<DbState>,
+    project_id: Option<String>,
+) -> Result<Vec<SkillUsageStat>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::list_skill_usage_stats(&conn, project_id.as_deref().filter(|s| !s.is_empty()))
+        .map_err(|e| e.to_string())
+}
+
+/// 最近 Skill 调用明细（时间线，limit 缺省 100）。project_id 空 = 全部项目。
+#[tauri::command]
+pub fn list_skill_usage_events(
+    db: State<DbState>,
+    project_id: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<SkillUsageEvent>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let limit = limit.unwrap_or(100).clamp(1, 500);
+    queries::list_skill_usage_events(&conn, project_id.as_deref().filter(|s| !s.is_empty()), limit)
+        .map_err(|e| e.to_string())
 }

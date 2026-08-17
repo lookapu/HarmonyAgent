@@ -14,6 +14,9 @@ export interface BaseUpdateInfo {
 }
 
 export const getCurrentVersion = () => invoke<string>('get_current_version')
-export const listAvailableVersions = () => invoke<VersionInfo[]>('list_available_versions')
-export const installVersion = (version: string) => invoke<string>('install_version', { version })
-export const checkBaseUpdate = () => invoke<BaseUpdateInfo>('check_base_update')
+export const listAvailableVersions = (useProxy: boolean | null = null) =>
+  invoke<VersionInfo[]>('list_available_versions', { useProxy })
+export const installVersion = (version: string, useProxy: boolean | null = null) =>
+  invoke<string>('install_version', { version, useProxy })
+export const checkBaseUpdate = (useProxy: boolean | null = null) =>
+  invoke<BaseUpdateInfo>('check_base_update', { useProxy })

@@ -56,22 +56,30 @@ async fn pre_budget(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
 }
 
 /// 失败黑名单预检：同一动作签名连续失败多次后，本轮不再重复执行，
-/// 直接提示模型换方案（避免反复撞同一堵墙）
+/// 提示模型换方案（避免反复撞同一堵墙；阈值可在设置页调整，正常排查不受影响）
 async fn pre_blacklist(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     if task_guard::is_blacklisted(inv.conversation_id, inv.name, inv.args) {
+        let threshold = crate::services::agent_limits::current()
+            .blacklist_fail_threshold()
+            .unwrap_or(4);
         return Err(Intercept::new(
             InterceptKind::Blacklist,
-            "（系统拦截：该操作在本任务中已连续失败多次，已被暂时拉黑。请更换工具、调整参数或改用其它方案，不要重复同样的尝试。）",
+            format!(
+                "（系统拦截：该操作在本任务中已连续失败 {threshold} 次，继续原样重试大概率仍失败。请更换工具、调整参数或改用其它方案；如需再次尝试同一操作，请先向用户说明新的思路。）"
+            ),
         ));
     }
     Ok(())
 }
 
 /// 权限分级审核：
-/// - allow_all 模式：直接执行（但 run_command 仍受命令白名单/黑名单约束）
+/// - allow_all 模式：直接执行（危险命令黑名单仍在工具内部硬拦截，安全底线）
 /// - ask 模式：已信任项目的 L0/L1 自动放行；L2 或未信任项目弹窗确认
 /// - auto 模式：不依赖项目信任，L0/L1 一律免审，仅 L2 弹窗确认
 /// - first_write 模式：写文件类工具首次弹窗确认，本任务后续写操作免审；其他工具直接放行
+///
+/// run_command 的命令白名单裁决在此完成：白名单内命令 → L1 免审；白名单外 → L2 弹窗
+/// （ask/auto 模式）或直接放行（allow_all/first_write）。
 async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     let Some(app) = inv.ctx.app.as_ref() else {
         return Ok(()); // 无事件环境（测试/离线）：直接放行
@@ -294,7 +302,7 @@ pub(crate) async fn request_tool_approval(
         let mut map = state.0.lock().map_err(|e| e.to_string())?;
         map.insert(
             request_id.clone(),
-            (tx, tool.to_string(), conversation_id.to_string()),
+            (tx, tool.to_string(), conversation_id.to_string(), args.to_string()),
         );
     }
     let _ = app.emit(

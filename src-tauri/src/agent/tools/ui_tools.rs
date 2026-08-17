@@ -9,7 +9,6 @@ struct BenchSnapshot {
     cpu: f64,
     pss: f64,
     sys_cpu: f64,
-    sys_mem: f64,
     temp: f64,
     fps: Option<f64>,
 }
@@ -78,7 +77,6 @@ pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result
         cpu: mean(&proc_cpu),
         pss: mean(&pss_vals),
         sys_cpu: mean(&sys_cpu),
-        sys_mem: mean(&sys_mem),
         temp: mean(&temp_vals),
         fps,
     };
@@ -997,8 +995,6 @@ static RECORD_UI_STORE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Rec
 
 #[derive(Clone)]
 struct RecordUiHandle {
-    name: String,
-    start_ts: u64,
     device_file: String,
 }
 
@@ -1056,7 +1052,7 @@ pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, 
         if guard.contains_key(&store_key) {
             return Err(format!("设备 {device} 已有名为 \"{name}\" 的录制进行中，请先调用 record_ui action=stop 结束。"));
         }
-        guard.insert(store_key, RecordUiHandle { name: name.clone(), start_ts: ts, device_file: dev_file });
+        guard.insert(store_key, RecordUiHandle { device_file: dev_file });
         Ok(format!(
             "UI 录制已开始（设备 {device}，名称：{name}）\n请在设备上操作你想录制的流程，完成后调用 record_ui action=stop 结束录制。"
         ))
@@ -1295,6 +1291,72 @@ pub(super) async fn replay_ui(args: &Value, roots: &[String]) -> Result<String, 
     Ok(out)
 }
 
+/// [54] gesture_perform：单次触摸/输入手势注入（tap/swipe/longPress/doubleTap/text/key）。
+/// 坐标可直接使用 ui_locator 输出中的推荐点击坐标（bounds 中心点）。
+pub(super) async fn gesture_perform(args: &Value, roots: &[String]) -> Result<String, String> {
+    let device = match args["device"].as_str() {
+        Some(d) => d.to_string(),
+        None => default_device_id().await?,
+    };
+    let action = args["action"].as_str().ok_or("需要参数 {\"action\":\"tap|swipe|longPress|doubleTap|text|key\", ...}")?;
+    let _ = roots;
+    let mut step = serde_json::json!({});
+    match action {
+        "tap" | "click" => {
+            let x = args["x"].as_i64().ok_or("tap 需要参数 x（像素坐标）")?;
+            let y = args["y"].as_i64().ok_or("tap 需要参数 y（像素坐标）")?;
+            step = serde_json::json!({"action": "tap", "x": x, "y": y});
+        }
+        "swipe" => {
+            let x1 = args["x1"].as_i64().ok_or("swipe 需要参数 x1/y1（起点）")?;
+            let y1 = args["y1"].as_i64().ok_or("swipe 需要参数 y1")?;
+            let x2 = args["x2"].as_i64().ok_or("swipe 需要参数 x2/y2（终点）")?;
+            let y2 = args["y2"].as_i64().ok_or("swipe 需要参数 y2")?;
+            let speed = args["speed"].as_i64().unwrap_or(600);
+            step = serde_json::json!({"action": "swipe", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "speed": speed});
+        }
+        "longPress" | "long_press" => {
+            let x = args["x"].as_i64().ok_or("longPress 需要参数 x/y（像素坐标）")?;
+            let y = args["y"].as_i64().ok_or("longPress 需要参数 y")?;
+            step = serde_json::json!({"action": "long_press", "x": x, "y": y});
+        }
+        "doubleTap" | "double_tap" => {
+            let x = args["x"].as_i64().ok_or("doubleTap 需要参数 x/y（像素坐标）")?;
+            let y = args["y"].as_i64().ok_or("doubleTap 需要参数 y")?;
+            // 双击：两次 tap，间隔 80ms（就地执行，不回传 step）
+            for _ in 0..2 {
+                super::test_tools::execute_ui_step(
+                    &device,
+                    &serde_json::json!({"action": "tap", "x": x, "y": y}),
+                )
+                .await?;
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+            return Ok(format!("双击完成（设备 {device}，坐标 {x},{y}）"));
+        }
+        "text" => {
+            let t = args["text"].as_str().ok_or("text 需要参数 text（要输入的文本）")?;
+            step = serde_json::json!({"action": "text", "text": t});
+        }
+        "key" => {
+            let name = args["name"].as_str().unwrap_or("back");
+            step = serde_json::json!({"action": "key", "name": name});
+        }
+        other => {
+            return Err(format!(
+                "未知 action \"{other}\"。可用：tap/swipe/longPress/doubleTap/text/key"
+            ))
+        }
+    }
+    super::test_tools::execute_ui_step(&device, &step).await.map(|info| {
+        let mut out = format!("手势已执行（设备 {device}，action={action}）\n");
+        if !info.is_empty() {
+            out.push_str(&format!("补充：{info}\n"));
+        }
+        out
+    })
+}
+
 /// analyze_hap_size：分析 HAP 包大小构成。
 pub(super) async fn analyze_hap_size(args: &Value, roots: &[String]) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
@@ -1366,6 +1428,298 @@ pub(super) async fn analyze_hap_size(args: &Value, roots: &[String]) -> Result<S
         out.push_str(&format!("  • {s}\n"));
     }
     Ok(out)
+}
+
+/// [34] size_diff：对比两个 HAP 包（或同一工程两次构建产物）的大小构成差异。
+/// 输出总大小变化、分类占比变化、文件级增删/变大/变小 Top 清单，
+/// 用于定位“这次构建为什么大了 X MB”。
+pub(super) fn size_diff(args: &Value, roots: &[String]) -> Result<String, String> {
+    let raw_a = args["path_a"].as_str().ok_or("需要参数 {\"path_a\":\"<基线 HAP>\",\"path_b\":\"<新 HAP>\"}")?;
+    let raw_b = args["path_b"].as_str().ok_or("需要参数 path_b（新 HAP 路径）")?;
+    let top_n = args["top"].as_u64().unwrap_or(10) as usize;
+    let pa = resolve_in_roots(roots, raw_a)?;
+    let pb = resolve_in_roots(roots, raw_b)?;
+    let (total_a, cats_a, files_a) = scan_hap_sizes(&pa)?;
+    let (total_b, cats_b, files_b) = scan_hap_sizes(&pb)?;
+
+    let mut out = String::new();
+    out.push_str(&format!("HAP 大小对比：\n  {}  {}（{:.2} MB）\n  {}  {}（{:.2} MB）\n",
+        pa.display(), format_bytes(total_a), total_a as f64 / (1024.0 * 1024.0),
+        pb.display(), format_bytes(total_b), total_b as f64 / (1024.0 * 1024.0)));
+    let delta = total_b as i64 - total_a as i64;
+    let sign = if delta >= 0 { "+" } else { "-" };
+    out.push_str(&format!("总大小变化：{sign}{}（{:.2} MB，{}{:.2}%）\n\n",
+        format_bytes(delta.unsigned_abs()),
+        delta.unsigned_abs() as f64 / (1024.0 * 1024.0),
+        if delta >= 0 { "+" } else { "-" },
+        if total_a > 0 { delta as f64 / total_a as f64 * 100.0 } else { 0.0 }));
+
+    // 分类变化
+    out.push_str("分类变化：\n");
+    let mut all_cats: Vec<String> = cats_a.keys().chain(cats_b.keys()).cloned().collect();
+    all_cats.sort();
+    all_cats.dedup();
+    for cat in all_cats {
+        let sa = cats_a.get(&cat).copied().unwrap_or(0);
+        let sb = cats_b.get(&cat).copied().unwrap_or(0);
+        if sb == sa {
+            continue;
+        }
+        let d = sb as i64 - sa as i64;
+        let mark = if d > 0 { "▲" } else { "▼" };
+        out.push_str(&format!("  {mark} {cat:<20} {} → {}（{}）\n",
+            format_bytes(sa), format_bytes(sb),
+            if d > 0 { format!("+{}", format_bytes(d as u64)) } else { format!("-{}", format_bytes(d.unsigned_abs())) }));
+    }
+
+    // 文件级：新增 / 删除 / 变大 / 变小
+    let map_a: std::collections::HashMap<&str, u64> = files_a.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    let map_b: std::collections::HashMap<&str, u64> = files_b.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    let mut added: Vec<(&str, u64)> = map_b.iter().filter(|(n, _)| !map_a.contains_key(*n)).map(|(n, s)| (*n, *s)).collect();
+    let mut removed: Vec<(&str, u64)> = map_a.iter().filter(|(n, _)| !map_b.contains_key(*n)).map(|(n, s)| (*n, *s)).collect();
+    let mut grew: Vec<(&str, i64)> = map_a
+        .iter()
+        .filter_map(|(n, sa)| map_b.get(n).map(|sb| (*n, *sb as i64 - *sa as i64)))
+        .filter(|(_, d)| *d > 0)
+        .collect();
+    let mut shrank: Vec<(&str, i64)> = map_a
+        .iter()
+        .filter_map(|(n, sa)| map_b.get(n).map(|sb| (*n, *sb as i64 - *sa as i64)))
+        .filter(|(_, d)| *d < 0)
+        .collect();
+    added.sort_by(|a, b| b.1.cmp(&a.1));
+    removed.sort_by(|a, b| b.1.cmp(&a.1));
+    grew.sort_by(|a, b| b.1.cmp(&a.1));
+    shrank.sort_by(|a, b| a.1.cmp(&b.1));
+
+    out.push_str(&format!("\n新增文件（{} 个）：\n", added.len()));
+    for (n, s) in added.iter().take(top_n) {
+        out.push_str(&format!("  + {}  {}\n", format_bytes(*s), shorten_path(n, 80)));
+    }
+    if added.len() > top_n {
+        out.push_str(&format!("  … 其余 {} 个\n", added.len() - top_n));
+    }
+    out.push_str(&format!("\n删除文件（{} 个）：\n", removed.len()));
+    for (n, s) in removed.iter().take(top_n) {
+        out.push_str(&format!("  − {}  {}\n", format_bytes(*s), shorten_path(n, 80)));
+    }
+    if removed.len() > top_n {
+        out.push_str(&format!("  … 其余 {} 个\n", removed.len() - top_n));
+    }
+    out.push_str(&format!("\n变大 Top {}：\n", top_n.min(grew.len())));
+    for (n, d) in grew.iter().take(top_n) {
+        out.push_str(&format!("  ▲ +{}  {}\n", format_bytes(*d as u64), shorten_path(n, 80)));
+    }
+    out.push_str(&format!("\n变小 Top {}：\n", top_n.min(shrank.len())));
+    for (n, d) in shrank.iter().take(top_n) {
+        out.push_str(&format!("  ▼ −{}  {}\n", format_bytes(d.unsigned_abs()), shorten_path(n, 80)));
+    }
+
+    // 结论
+    if delta > 0 && !grew.is_empty() {
+        let top = grew.first().unwrap();
+        out.push_str(&format!("\n主要增长来源：{}（+{}）→ 优先检查该文件是否可压缩/按需加载。\n",
+            shorten_path(top.0, 60), format_bytes(top.1 as u64)));
+    } else if delta < 0 {
+        out.push_str("\n包体变小，无异常增长。\n");
+    }
+    Ok(out)
+}
+
+/// 扫描单个 HAP 的 (总大小, 分类大小, 文件清单)
+fn scan_hap_sizes(path: &std::path::Path) -> Result<(u64, std::collections::BTreeMap<String, u64>, Vec<(String, u64)>), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("打开 {} 失败: {e}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("解析 HAP/ZIP {} 失败: {e}", path.display()))?;
+    let mut total: u64 = 0;
+    let mut cats: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut files: Vec<(String, u64)> = Vec::new();
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i).map_err(|e| format!("读取 zip 条目失败: {e}"))?;
+        let size = entry.size();
+        let name = entry.name().to_string();
+        if entry.is_dir() || size == 0 {
+            continue;
+        }
+        total += size;
+        files.push((name.clone(), size));
+        *cats.entry(classify_hap_entry(&name)).or_insert(0) += size;
+    }
+    Ok((total, cats, files))
+}
+
+/// [53] ui_locator：按文字/类型在设备当前界面控件树中定位元素，返回坐标与可点击信息。
+/// 数据来源：path 参数给本地 dumpLayout JSON（离线复用），或现场 hdc 采集后自动清理。
+/// 输出匹配项清单 + 推荐项中心坐标（可直接给 run_ui_flow 的 tap 使用）。
+pub(super) async fn ui_locator(args: &Value, roots: &[String]) -> Result<String, String> {
+    let text = args["text"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let ctype = args["type"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let index = args["index"].as_u64().unwrap_or(0) as usize;
+    if text.is_none() && ctype.is_none() {
+        return Err("需要筛选条件：{\"text\":\"<文字>\"} 或 {\"type\":\"<控件类型>\"}，可选 {\"index\":<第几个匹配>,\"path\":\"<本地控件树 JSON>\"}".into());
+    }
+    // 1. 获取控件树 JSON 文本
+    let json_text = match args["path"].as_str() {
+        Some(p) => {
+            let resolved = resolve_in_roots(roots, p)?;
+            std::fs::read_to_string(&resolved).map_err(|e| format!("读取 {} 失败: {e}", resolved.display()))?
+        }
+        None => {
+            let device = match args["device"].as_str() {
+                Some(d) => d.to_string(),
+                None => default_device_id().await?,
+            };
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let dev_file = format!("/data/local/tmp/ui_dump_{}.json", ts);
+            run_hdc_shell(&device, &["uitest", "dumpLayout", "-p", &dev_file], 30).await
+                .map_err(|e| format!("控件树导出失败：{e}"))?;
+            let tmp = std::env::temp_dir().join(format!("ui_dump_{ts}.json"));
+            let hdc_args = vec![
+                "-s".to_string(), device.clone(), "file".to_string(), "recv".to_string(),
+                dev_file.clone(), tmp.to_string_lossy().to_string(),
+            ];
+            run_cmd("hdc", &hdc_args, None, 30).await
+                .map_err(|e| format!("拉取控件树失败: {e}"))?;
+            let content = std::fs::read_to_string(&tmp).map_err(|e| format!("读取控件树失败: {e}"))?;
+            let _ = std::fs::remove_file(&tmp);
+            content
+        }
+    };
+    // 2. 解析节点（递归收集 attributes 节点）
+    let root: serde_json::Value =
+        serde_json::from_str(&json_text).map_err(|e| format!("控件树 JSON 解析失败: {e}"))?;
+    let mut nodes: Vec<UiNode> = Vec::new();
+    collect_ui_nodes(&root, &mut nodes);
+    if nodes.is_empty() {
+        return Err("控件树为空或格式不识别（确认是 uitest dumpLayout 输出）".into());
+    }
+    // 3. 按 text（部分匹配，含 content-desc）与 type（忽略大小写）过滤
+    let matched: Vec<&UiNode> = nodes
+        .iter()
+        .filter(|n| {
+            let t_ok = text.as_deref().map(|t| n.text.contains(t) || n.desc.contains(t)).unwrap_or(true);
+            let c_ok = ctype.as_deref().map(|c| n.ctype.eq_ignore_ascii_case(c)).unwrap_or(true);
+            t_ok && c_ok
+        })
+        .collect();
+    if matched.is_empty() {
+        let cond = match (&text, &ctype) {
+            (Some(t), Some(c)) => format!("type={c} 且文字含「{t}」"),
+            (Some(t), None) => format!("文字含「{t}」"),
+            (None, Some(c)) => format!("type={c}"),
+            (None, None) => String::new(),
+        };
+        return Ok(format!(
+            "未找到匹配控件（共解析 {} 个节点，条件：{cond}）。\n建议：① 文字支持部分匹配，可换更短的关键字 ② 用 dump_ui_hierarchy 查看实际控件类型与文字 ③ 界面可能未加载完，稍后重试。",
+            nodes.len()
+        ));
+    }
+    // 4. 输出清单（最多 10 个）+ 推荐项
+    let mut out = format!("控件定位成功：条件 {}，共 {} 个匹配（共 {} 节点）\n",
+        match (&text, &ctype) {
+            (Some(t), Some(c)) => format!("type={c} 且文字含「{t}」"),
+            (Some(t), None) => format!("文字含「{t}」"),
+            (None, Some(c)) => format!("type={c}"),
+            (None, None) => String::new(),
+        },
+        matched.len(),
+        nodes.len());
+    for (i, n) in matched.iter().take(10).enumerate() {
+        let b = match n.bounds {
+            Some((x1, y1, x2, y2)) => format!("[{x1},{y1}][{x2},{y2}] → 中心 ({}, {})", (x1 + x2) / 2, (y1 + y2) / 2),
+            None => "无坐标".to_string(),
+        };
+        out.push_str(&format!(
+            "  [{i}] {} 文字「{}」{} {} {}\n",
+            n.ctype,
+            truncate_text(&n.text, 24),
+            if n.clickable { "[可点击]" } else { "" },
+            if n.desc.is_empty() { String::new() } else { format!("desc「{}」", truncate_text(&n.desc, 24)) },
+            b
+        ));
+    }
+    if matched.len() > 10 {
+        out.push_str(&format!("  … 其余 {} 个匹配\n", matched.len() - 10));
+    }
+    // 推荐项（index 指定或第一个可点击）
+    let pick = matched.get(index).or_else(|| matched.iter().find(|n| n.clickable)).unwrap_or(&matched[0]);
+    if let Some((x1, y1, x2, y2)) = pick.bounds {
+        let (cx, cy) = ((x1 + x2) / 2, (y1 + y2) / 2);
+        out.push_str(&format!(
+            "\n推荐点击坐标：({cx}, {cy})（{}\n调用 run_ui_flow {{\"action\":\"tap\",\"x\":{cx},\"y\":{cy},\"desc\":\"点击 {}\"}} 执行。",
+            match &pick.text {
+                t if !t.is_empty() => format!("文字「{}」）", truncate_text(t, 20)),
+                _ => format!("type={}）", pick.ctype),
+            },
+            truncate_text(&pick.text, 20)
+        ));
+    } else {
+        out.push_str("\n匹配项无坐标信息（容器节点），可尝试更具体的文字/类型条件。\n");
+    }
+    Ok(out)
+}
+
+/// 控件树节点（扁平化后的最小信息）
+struct UiNode {
+    ctype: String,
+    text: String,
+    desc: String,
+    bounds: Option<(i32, i32, i32, i32)>,
+    clickable: bool,
+}
+
+/// 递归收集控件树 JSON 中所有 attributes 节点（兼容顶层 attributes / node 包装两种格式）。
+fn collect_ui_nodes(value: &serde_json::Value, out: &mut Vec<UiNode>) {
+    if let Some(attrs) = value.get("attributes") {
+        let get = |k: &str| attrs.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let bounds = parse_bounds(&get("bounds"));
+        out.push(UiNode {
+            ctype: get("type"),
+            text: get("text"),
+            desc: get("content-desc"),
+            bounds,
+            clickable: get("clickable") == "true" || get("clickable") == "1",
+        });
+    }
+    if let Some(arr) = value.as_array() {
+        for c in arr {
+            collect_ui_nodes(c, out);
+        }
+    }
+    if let Some(obj) = value.as_object() {
+        for (_, v) in obj {
+            if v.is_array() || v.is_object() {
+                collect_ui_nodes(v, out);
+            }
+        }
+    }
+}
+
+/// 解析 "[x1,y1][x2,y2]" 形式 bounds → (x1, y1, x2, y2)
+fn parse_bounds(s: &str) -> Option<(i32, i32, i32, i32)> {
+    let nums: Vec<i32> = s
+        .split(|c: char| !c.is_ascii_digit() && c != '-')
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if nums.len() >= 4 {
+        Some((nums[0], nums[1], nums[2], nums[3]))
+    } else {
+        None
+    }
+}
+
+/// 截断文本（按字符数，超长加省略号）
+fn truncate_text(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max).collect();
+        t.push('…');
+        t
+    }
 }
 
 pub(super) fn classify_hap_entry(path: &str) -> String {
@@ -1453,5 +1807,107 @@ pub(super) fn gen_size_suggestions(cats: &std::collections::BTreeMap<String, u64
         suggestions.push("包大小分布较健康，继续保持。若需进一步瘦身，可考虑：①资源按需分包 ②移除未用依赖 ③开启混淆/压缩".to_string());
     }
     suggestions
+}
+
+/// [31] screenshot_diff：逐像素对比两张截图（PNG），输出差异率、差异区域包围盒与位置提示。
+/// 用于 UI 改动前后验证（先 take_screenshot 存基线，改动后再截一张对比）。
+/// 纯只读：不写盘、不连设备，本地解码比较。
+pub(super) fn screenshot_diff(args: &Value, roots: &[String]) -> Result<String, String> {
+    let raw_a = args["path_a"].as_str().ok_or("需要参数 {\"path_a\":\"<基线截图>\",\"path_b\":\"<变更截图>\",\"threshold\":<可选容差>}")?;
+    let raw_b = args["path_b"].as_str().ok_or("需要参数 path_b（变更截图路径）")?;
+    let threshold = args["threshold"].as_u64().unwrap_or(10) as i64;
+    let pa = crate::agent::tools::resolve_in_roots(roots, raw_a)?;
+    let pb = crate::agent::tools::resolve_in_roots(roots, raw_b)?;
+    if !pa.exists() || !pb.exists() {
+        return Err(format!(
+            "截图不存在：{} / {}",
+            if pa.exists() { "".to_string() } else { pa.display().to_string() },
+            if pb.exists() { "".to_string() } else { pb.display().to_string() }
+        ));
+    }
+    let data_a = std::fs::read(&pa).map_err(|e| format!("读取 {} 失败: {e}", pa.display()))?;
+    let data_b = std::fs::read(&pb).map_err(|e| format!("读取 {} 失败: {e}", pb.display()))?;
+    let img_a = crate::utils::png::decode_png(&data_a, 4096).map_err(|e| format!("解析 {} 失败: {e}", pa.display()))?;
+    let img_b = crate::utils::png::decode_png(&data_b, 4096).map_err(|e| format!("解析 {} 失败: {e}", pb.display()))?;
+    if img_a.width != img_b.width || img_a.height != img_b.height {
+        return Err(format!(
+            "两张截图尺寸不一致：{} {}x{} vs {} {}x{}（先确认分辨率相同，或用 image_inspect 检查）",
+            pa.display(),
+            img_a.width,
+            img_a.height,
+            pb.display(),
+            img_b.width,
+            img_b.height
+        ));
+    }
+    let w = img_a.width as usize;
+    let h = img_a.height as usize;
+    let rgb_a = &img_a.rgb;
+    let rgb_b = &img_b.rgb;
+    let mut diff_count = 0usize;
+    let mut min_x = usize::MAX;
+    let mut min_y = usize::MAX;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            let d = (rgb_a[i] as i64 - rgb_b[i] as i64).abs()
+                + (rgb_a[i + 1] as i64 - rgb_b[i + 1] as i64).abs()
+                + (rgb_a[i + 2] as i64 - rgb_b[i + 2] as i64).abs();
+            if d > threshold {
+                diff_count += 1;
+                if x < min_x {
+                    min_x = x;
+                }
+                if y < min_y {
+                    min_y = y;
+                }
+                if x > max_x {
+                    max_x = x;
+                }
+                if y > max_y {
+                    max_y = y;
+                }
+            }
+        }
+    }
+    let total = w * h;
+    if diff_count == 0 {
+        return Ok(format!(
+            "两张截图完全一致（{}x{}，共 {total} 像素，阈值 {threshold}），界面无变化。\n路径：{} | {}",
+            w,
+            h,
+            pa.display(),
+            pb.display()
+        ));
+    }
+    // 差异区域粗定位：按上下左右半区归属
+    let mid_x = w / 2;
+    let mid_y = h / 2;
+    let mut zone = Vec::new();
+    if min_y <= mid_y {
+        zone.push("上方");
+    }
+    if max_y >= mid_y {
+        zone.push("下方");
+    }
+    if min_x <= mid_x {
+        zone.push("左侧");
+    }
+    if max_x >= mid_x {
+        zone.push("右侧");
+    }
+    let zone_desc = zone.join("、");
+    let pct = diff_count as f64 / total as f64 * 100.0;
+    Ok(format!(
+        "截图对比完成（阈值 {threshold}）：差异像素 {diff_count} / {total}（{pct:.2}%）\n\
+         差异区域包围盒：x {min_x}..{max_x}，y {min_y}..{max_y}（集中于{zone_desc}）\n\
+         基线：{}\n变更：{}\n\
+         判读：差异 <0.1% 多为状态栏时钟/滚动条等动态元素可忽略；\
+         若与预期不符，用 dump_ui_hierarchy + verify_ui 定位具体控件。",
+        pa.display(),
+        pb.display()
+    ))
 }
 

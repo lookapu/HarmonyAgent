@@ -4,6 +4,8 @@ export interface ProviderBalance {
   provider_id: string
   provider_name: string
   ok: boolean
+  /** 该服务商未提供余额查询接口（前端据此直接不展示余额卡片） */
+  unsupported: boolean
   currency: string | null
   total: number | null
   used: number | null

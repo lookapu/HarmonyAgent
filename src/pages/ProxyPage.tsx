@@ -97,22 +97,22 @@ export default function ProxyPage() {
 
       {isRunning && status && (
         <div className="grid grid-cols-3 gap-4 mb-6">
-          <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4">
+          <div className="modern-card rounded-lg p-4">
             <p className="text-xs text-[var(--text-secondary)]">{t('proxy.listenAddr')}</p>
             <p className="text-sm font-mono mt-1">{status.listen_address}:{status.listen_port}</p>
           </div>
-          <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4">
+          <div className="modern-card rounded-lg p-4">
             <p className="text-xs text-[var(--text-secondary)]">{t('proxy.totalRequests')}</p>
             <p className="text-lg font-semibold mt-1">{status.total_requests}</p>
           </div>
-          <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4">
+          <div className="modern-card rounded-lg p-4">
             <p className="text-xs text-[var(--text-secondary)]">{t('proxy.activeProvider')}</p>
             <p className="text-sm mt-1">{status.active_provider || '-'}</p>
           </div>
         </div>
       )}
 
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-6">
+      <div className="modern-card rounded-lg p-4 mb-6">
         <h3 className="text-sm font-medium mb-4">{t('proxy.config')}</h3>
         <div className="grid grid-cols-2 gap-4">
           <div>
@@ -121,7 +121,7 @@ export default function ProxyPage() {
               value={config.listen_address}
               onChange={(e) => setConfig({ ...config, listen_address: e.target.value })}
               disabled={isRunning}
-              className="w-full px-3 py-2 bg-[var(--bg-card)] border border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
+              className="w-full px-3 py-2 modern-card border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
             />
           </div>
           <div>
@@ -131,7 +131,7 @@ export default function ProxyPage() {
               value={config.listen_port}
               onChange={(e) => setConfig({ ...config, listen_port: parseInt(e.target.value) || 15800 })}
               disabled={isRunning}
-              className="w-full px-3 py-2 bg-[var(--bg-card)] border border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
+              className="w-full px-3 py-2 modern-card border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
             />
           </div>
           <div>
@@ -141,7 +141,7 @@ export default function ProxyPage() {
               value={config.max_retries}
               onChange={(e) => setConfig({ ...config, max_retries: parseInt(e.target.value) || 3 })}
               disabled={isRunning}
-              className="w-full px-3 py-2 bg-[var(--bg-card)] border border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
+              className="w-full px-3 py-2 modern-card border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
             />
           </div>
           <div>
@@ -151,7 +151,7 @@ export default function ProxyPage() {
               value={config.non_streaming_timeout_s}
               onChange={(e) => setConfig({ ...config, non_streaming_timeout_s: parseInt(e.target.value) || 600 })}
               disabled={isRunning}
-              className="w-full px-3 py-2 bg-[var(--bg-card)] border border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
+              className="w-full px-3 py-2 modern-card border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
             />
           </div>
           <div>
@@ -161,7 +161,7 @@ export default function ProxyPage() {
               value={config.streaming_first_byte_timeout_s}
               onChange={(e) => setConfig({ ...config, streaming_first_byte_timeout_s: parseInt(e.target.value) || 60 })}
               disabled={isRunning}
-              className="w-full px-3 py-2 bg-[var(--bg-card)] border border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
+              className="w-full px-3 py-2 modern-card border-[var(--border)] rounded text-sm text-[var(--text-primary)] disabled:opacity-50"
             />
           </div>
           <div className="flex items-center gap-2 pt-5">
@@ -199,7 +199,7 @@ export default function ProxyPage() {
         </div>
       </div>
 
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4">
+      <div className="modern-card rounded-lg p-4">
         <h3 className="text-sm font-medium mb-3">{t('proxy.usage')}</h3>
         <div className="text-xs text-[var(--text-secondary)] space-y-2">
           <p>{t('proxy.usage1')}</p>
@@ -213,3 +213,5 @@ export default function ProxyPage() {
     </div>
   )
 }
+
+

@@ -15,6 +15,8 @@ pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<Stri
     let keyword = args["keyword"].as_str().unwrap_or("").to_string();
     let use_regex = args["regex"].as_bool().unwrap_or(false);
     let since_min = args["since"].as_u64().unwrap_or(5).min(60 * 24);
+    // until：时间上限（分钟），只保留 N 分钟以前的日志；与 since 组合成 [since, until] 时间窗口（默认 0=无上限）
+    let until_min = args["until"].as_u64().unwrap_or(0).min(60 * 24);
     let max_lines = args["max_lines"].as_u64().unwrap_or(200).min(2000) as usize;
     let context = args["context"].as_u64().unwrap_or(2).min(10) as usize;
 
@@ -57,6 +59,10 @@ pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<Stri
         if !log_line_recent_enough(l, since_min) {
             continue;
         }
+        // 时间上限：until=N 只保留 N 分钟以前的日志（与 since 组合成时间窗口）
+        if !log_line_older_than(l, until_min) {
+            continue;
+        }
         // 级别过滤（epoch 格式下级别仍在第 4 列，双保险，设备端 -L 已过滤）
         if !line_matches_level(l, level_flag) {
             continue;
@@ -85,7 +91,12 @@ pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<Stri
         }
     }
 
-    let mut out = format!("hilog 搜索结果（设备 {device}，级别 ≥ {level_flag}）\n");
+    let window = if until_min > 0 {
+        format!("，时间窗口 [now-{until_min}min, now-{since_min}min]")
+    } else {
+        format!("，最近 {since_min} 分钟")
+    };
+    let mut out = format!("hilog 搜索结果（设备 {device}，级别 ≥ {level_flag}{window}）\n");
     out.push_str(&format!("匹配到 {} 条（显示前 {max_lines} 条，上下文 ±{context} 行）\n\n", matches.len()));
 
     if matches.is_empty() {
@@ -124,26 +135,47 @@ pub(super) fn line_matches_level(line: &str, min_level: &str) -> bool {
     true
 }
 
-/// 按行首 epoch 时间戳过滤最近 since_min 分钟的日志。
-/// -v epoch 输出行首为「秒[.毫秒]」；解析失败（设备回退默认 MM-DD 格式）或时间异常时保守保留。
-pub(super) fn log_line_recent_enough(line: &str, since_min: u64) -> bool {
-    let Some(first) = line.split_whitespace().next() else { return true };
-    let Some(secs_str) = first.split('.').next() else { return true };
+/// 解析行首 epoch 时间戳（秒；毫秒级自动折算）。解析失败返回 None（保守保留策略由调用方决定）。
+fn parse_line_epoch_secs(line: &str) -> Option<u64> {
+    let first = line.split_whitespace().next()?;
+    let secs_str = first.split('.').next()?;
     if secs_str.len() < 10 || !secs_str.chars().all(|c| c.is_ascii_digit()) {
-        return true;
+        return None;
     }
-    let mut ts: u64 = secs_str.parse().unwrap_or(0);
+    let mut ts: u64 = secs_str.parse().ok()?;
     if secs_str.len() >= 13 {
         ts /= 1000; // 毫秒级时间戳
     }
-    let now = std::time::SystemTime::now()
+    Some(ts)
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX);
+        .unwrap_or(u64::MAX)
+}
+
+/// 按行首 epoch 时间戳过滤最近 since_min 分钟的日志。
+/// -v epoch 输出行首为「秒[.毫秒]」；解析失败（设备回退默认 MM-DD 格式）或时间异常时保守保留。
+pub(super) fn log_line_recent_enough(line: &str, since_min: u64) -> bool {
+    let Some(ts) = parse_line_epoch_secs(line) else { return true };
+    let now = now_epoch_secs();
     if ts == 0 || ts > now {
         return true; // 设备时钟异常或超前 → 保守保留
     }
     now.saturating_sub(ts) <= since_min.saturating_mul(60)
+}
+
+/// 时间上限过滤：until=N 分钟时只保留比 now-N 分钟更早的日志（与 since 组合成 [since, until] 窗口）；
+/// until=0 表示无上限；解析失败保守保留。
+pub(super) fn log_line_older_than(line: &str, until_min: u64) -> bool {
+    if until_min == 0 {
+        return true;
+    }
+    let Some(ts) = parse_line_epoch_secs(line) else { return true };
+    let now = now_epoch_secs();
+    ts <= now.saturating_sub(until_min.saturating_mul(60))
 }
 
 /// run_lint：运行 ArkTS 代码静态检查。
@@ -740,6 +772,365 @@ pub(super) async fn scan_api_compat(args: &Value, roots: &[String], db: &crate::
         out.push_str("  3. 寻找低版本可用的等价 API 替代\n");
         out.push_str("  4. 用 search_api 查该模块各版本的具体声明，确认是否有 API 变更\n");
     }
+    Ok(out)
+}
+
+// ---------- debug_probe：hilog 插桩（软件断点，无需 DevEco 闭源调试协议） ----------
+
+/// 插桩点记录（会话级，cleanup 按此精确还原）
+#[derive(Clone)]
+struct ProbePoint {
+    /// 工程内相对路径（POSIX 分隔符）
+    file: String,
+    /// 插桩行号（1 起）
+    line: usize,
+    /// 插入的整行文本（cleanup 按内容匹配删除）
+    inserted: String,
+    /// 所在函数/方法名
+    target: String,
+}
+
+static PROBES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<ProbePoint>>>> =
+    std::sync::OnceLock::new();
+
+fn probe_table() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<ProbePoint>>> {
+    PROBES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// debug_probe：在 .ets 源文件中按函数/方法名插桩 hilog 日志（入口 + 变量值），
+/// 测试完成后 cleanup 一键还原。action: insert（缺省）/ cleanup / list。
+pub(super) async fn debug_probe(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    match args["action"].as_str().unwrap_or("insert") {
+        "cleanup" => cleanup_probes(&ctx.conversation_id, roots),
+        "list" => list_probes(&ctx.conversation_id),
+        _ => insert_probe(args, roots, &ctx.conversation_id),
+    }
+}
+
+/// 插入插桩：定位函数体 → 确保 hilog import → 函数体首行插入日志 → 记录插桩点
+fn insert_probe(args: &Value, roots: &[String], conv: &str) -> Result<String, String> {
+    let raw = args["path"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("debug_probe 需要参数 {\"path\":\"<文件>\",\"target\":\"<函数/方法名>\",\"vars\":[\"<可选变量名>\"]}")?;
+    let target = args["target"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("debug_probe 缺少 target（要插桩的函数/方法名）")?;
+    let vars: Vec<String> = args["vars"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let p = resolve_in_roots(roots, raw)?;
+    if !p.is_file() {
+        return Err(format!("路径不是文件: {}", p.display()));
+    }
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("读取失败: {e}"))?;
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+
+    // 1) 定位函数体起始行（含 { 的行）
+    let body_idx = find_function_body(&lines, target).ok_or_else(|| {
+        format!(
+            "未找到函数/方法 {target}（支持 `function {target}(` 与类方法 `{target}(` 签名；请确认 target 与源码一致）"
+        )
+    })?;
+
+    // 2) 生成插桩行（ArkTS 字符串拼接 + JSON.stringify 防对象打印 [object Object]）
+    let probe = if vars.is_empty() {
+        format!("hilog.info(0x0000, 'devecoProbe', 'PROBE enter {target}');")
+    } else {
+        let parts: Vec<String> = vars
+            .iter()
+            .map(|v| format!("{v}=' + JSON.stringify({v}) + '"))
+            .collect();
+        format!(
+            "hilog.info(0x0000, 'devecoProbe', 'PROBE enter {target} {}');",
+            parts.join(" ")
+        )
+    };
+
+    // 3) 确保 hilog 已导入（缺 import 时在 import 区插入，记录行号偏移）
+    let import_added = ensure_hilog_import(&mut lines);
+    let offset = if import_added { 1 } else { 0 };
+
+    // 4) 函数体首行插入（body_idx 是含 { 的行；probe 放其下一行 = 函数体第一行）
+    let insert_at = body_idx + 1 + offset;
+    lines.insert(insert_at, probe.clone());
+
+    // 5) 写回 + 记录插桩点
+    std::fs::write(&p, lines.join("\n") + "\n").map_err(|e| format!("写入失败: {e}"))?;
+    let rel = normalize_rel(&p, roots);
+    let mut t = probe_table().lock().unwrap_or_else(|x| x.into_inner());
+    t.entry(conv.to_string()).or_default().push(ProbePoint {
+        file: rel.clone(),
+        line: insert_at + 1,
+        inserted: probe.clone(),
+        target: target.to_string(),
+    });
+    let count = t.get(conv).map(|v| v.len()).unwrap_or(0);
+
+    Ok(format!(
+        "已插桩 {rel}:{}（{target}）\n插入内容：{probe}\n当前会话累计 {count} 处插桩。\n后续流程：build_project → deploy → 操作复现 → query_hilog(tag=\"devecoProbe\", level=\"INFO\") 查看日志 → debug_probe(action=\"cleanup\") 清理还原。",
+        insert_at + 1
+    ))
+}
+
+/// 行级启发式定位函数体起始行：行内出现 `<target>(` 且不是调用语句/箭头函数/控制流，
+/// `{` 可在本行或紧随其后（签名跨行最多看 3 行）。
+fn find_function_body(lines: &[String], target: &str) -> Option<usize> {
+    let sig = format!("{target}(");
+    for (i, line) in lines.iter().enumerate() {
+        let Some(idx) = line.find(&sig) else { continue };
+        // target 前不能是标识符字符（避免 fooBar 命中 foo）
+        let before_ok = idx == 0
+            || !line[..idx]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !before_ok {
+            continue;
+        }
+        let ts = line.trim_start();
+        if ts.starts_with("//")
+            || line.contains("=>")
+            || [
+                "if ", "for ", "while ", "switch ", "catch ", "return ", "const ", "let ",
+                "var ", "this.",
+            ]
+            .iter()
+            .any(|k| ts.starts_with(k))
+        {
+            continue;
+        }
+        if line.contains('{') {
+            return Some(i);
+        }
+        // 签名跨行：后续 3 行内找 {（排除注释行）
+        for j in (i + 1)..(i + 4).min(lines.len()) {
+            let tj = lines[j].trim_start();
+            if tj.starts_with("//") {
+                continue;
+            }
+            if lines[j].contains('{') {
+                return Some(j);
+            }
+        }
+    }
+    None
+}
+
+/// 确保文件已导入 hilog；缺省时在 import 区插入（返回是否新增）。
+/// 新 SDK（API 12+）用 @kit.PerformanceAnalysisKit；文件整体是旧式 @ohos. import 时用 @ohos.hilog。
+fn ensure_hilog_import(lines: &mut Vec<String>) -> bool {
+    if lines.iter().any(|l| l.contains("import") && l.contains("hilog")) {
+        return false;
+    }
+    let joined = lines.join("\n");
+    let use_kit = !joined.contains("from '@ohos.") || joined.contains("@kit.");
+    let import_line = if use_kit {
+        "import { hilog } from '@kit.PerformanceAnalysisKit';".to_string()
+    } else {
+        "import hilog from '@ohos.hilog';".to_string()
+    };
+    if let Some(pos) = lines.iter().position(|l| l.trim_start().starts_with("import ")) {
+        lines.insert(pos + 1, import_line);
+    } else {
+        // 无 import：跳过文件头注释/空行后插入
+        let mut pos = 0;
+        while pos < lines.len() {
+            let t = lines[pos].trim_start();
+            if t.is_empty() || t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        lines.insert(pos, import_line);
+    }
+    true
+}
+
+/// 工程内相对路径（POSIX 分隔符）；roots 匹配失败时返回原始显示路径
+fn normalize_rel(p: &std::path::Path, roots: &[String]) -> String {
+    for r in roots {
+        if let Ok(rc) = std::fs::canonicalize(r) {
+            if let Ok(pc) = p.canonicalize() {
+                if let Ok(rel) = pc.strip_prefix(&rc) {
+                    return rel.to_string_lossy().replace('\\', "/");
+                }
+            }
+        }
+    }
+    p.to_string_lossy().to_string()
+}
+
+/// 按记录删除插桩行（多文件分组、行号从大到小删除避免偏移；行号失配时按内容匹配兜底）
+fn cleanup_probes(conv: &str, roots: &[String]) -> Result<String, String> {
+    let mut t = probe_table().lock().unwrap_or_else(|x| x.into_inner());
+    let Some(points) = t.get_mut(conv) else {
+        return Ok("当前会话没有插桩记录（可能已清理）".into());
+    };
+    if points.is_empty() {
+        return Ok("当前会话没有插桩记录（可能已清理）".into());
+    }
+    // 按文件分组
+    let mut by_file: std::collections::BTreeMap<String, Vec<ProbePoint>> = std::collections::BTreeMap::new();
+    for p in points.drain(..) {
+        by_file.entry(p.file.clone()).or_default().push(p);
+    }
+    let mut removed = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for (file, mut pts) in by_file {
+        let Ok(abs) = resolve_in_roots(roots, &file) else {
+            errors.push(format!("{file}: 无法定位（项目目录可能已变更）"));
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&abs) else {
+            errors.push(format!("{file}: 读取失败"));
+            continue;
+        };
+        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+        pts.sort_by_key(|p| std::cmp::Reverse(p.line));
+        for p in &pts {
+            let by_line = p
+                .line
+                .checked_sub(1)
+                .filter(|&i| i < lines.len())
+                .is_some_and(|i| lines[i].trim() == p.inserted.trim());
+            if by_line {
+                lines.remove(p.line - 1);
+                removed += 1;
+            } else if let Some(real) = lines.iter().position(|l| l.trim() == p.inserted.trim()) {
+                lines.remove(real);
+                removed += 1;
+            }
+        }
+        if let Err(e) = std::fs::write(&abs, lines.join("\n") + "\n") {
+            errors.push(format!("{file}: 写回失败 {e}"));
+        }
+    }
+    // 清理空会话记录
+    if let Some(v) = t.get(conv) {
+        if v.is_empty() {
+            t.remove(conv);
+        }
+    }
+    let mut out = format!("已清理 {removed} 处插桩。");
+    if !errors.is_empty() {
+        out.push_str(&format!("\n部分文件处理失败：\n{}", errors.join("\n")));
+    }
+    Ok(out)
+}
+
+fn list_probes(conv: &str) -> Result<String, String> {
+    let t = probe_table().lock().unwrap_or_else(|x| x.into_inner());
+    let Some(points) = t.get(conv) else {
+        return Ok("当前会话没有插桩记录".into());
+    };
+    if points.is_empty() {
+        return Ok("当前会话没有插桩记录".into());
+    }
+    let mut out = format!("当前会话共 {} 处插桩：\n", points.len());
+    for p in points {
+        out.push_str(&format!("  {}:{}  {}\n", p.file, p.line, p.target));
+    }
+    out.push_str("测试完成后调用 debug_probe(action=\"cleanup\") 一键清理还原。");
+    Ok(out)
+}
+
+// ---------- stack_dump：进程/线程级运行快照 ----------
+
+/// stack_dump：定位应用进程并采集线程快照（ps 找 pid → /proc 线程枚举 → hidumper 进程详情）。
+/// 完整 JS 函数级调用栈依赖 DevEco Profiler 闭源协议，本工具提供可达的最强进程/线程快照，
+/// 需要函数级执行顺序时配合 debug_probe 插桩观察。
+pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String, String> {
+    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    let device = match args["device"].as_str() {
+        Some(d) => d.to_string(),
+        None => default_device_id().await?,
+    };
+    let bundle = match args["package"].as_str().map(String::from) {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => {
+            if project_path.is_empty() {
+                return Err(
+                    "未指定 package 且当前会话未绑定工程（无法推导 bundleName）。参数：{\"device\":\"<可选>\",\"package\":\"<包名>\"}"
+                        .into(),
+                );
+            }
+            crate::services::harmony::parse_project(std::path::Path::new(project_path))
+                .bundle_name
+                .ok_or("当前工程无法解析 bundleName（未找到 AppScope/app.json5 的 app.bundleName）")?
+        }
+    };
+
+    // 1) 定位主进程 pid：ps -A 中 CMD 含包名
+    let ps = run_hdc_shell(&device, &["ps", "-A"], 30).await?;
+    let mut pids: Vec<String> = Vec::new();
+    for line in ps.lines() {
+        if line.contains(&bundle) {
+            if let Some(pid) = line
+                .split_whitespace()
+                .next()
+                .filter(|p| p.chars().all(|c| c.is_ascii_digit()))
+            {
+                if !pids.contains(&pid.to_string()) {
+                    pids.push(pid.to_string());
+                }
+            }
+        }
+    }
+    if pids.is_empty() {
+        let bm = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 30).await?;
+        if hdc_shell_failed(&bm) || !bm.contains("bundleName") {
+            return Err(format!(
+                "设备 {device} 上未找到应用 {bundle}（可能未安装；请先 deploy）"
+            ));
+        }
+        return Err(format!(
+            "应用 {bundle} 已安装但进程未运行（先 start_app 或手动打开应用，再调用本工具）"
+        ));
+    }
+
+    let mut out = format!("应用 {bundle} 进程快照（设备 {device}，{} 个进程）：\n", pids.len());
+    for pid in &pids {
+        // 2) 线程列表：/proc/<pid>/task 枚举 + comm 名称（比 ps -T 更可靠）
+        let ls_cmd = format!("ls /proc/{pid}/task");
+        let ls_args = vec!["sh", "-c", ls_cmd.as_str()];
+        let tasks = run_hdc_shell(&device, &ls_args, 30).await.unwrap_or_default();
+        let mut tids: Vec<String> = tasks.split_whitespace().map(String::from).collect();
+        tids.sort_by_key(|t| t.parse::<u32>().unwrap_or(0));
+        let mut thread_lines: Vec<String> = Vec::new();
+        for tid in tids.iter().take(60) {
+            let cat_cmd = format!("cat /proc/{pid}/task/{tid}/comm");
+            let cat_args = vec!["sh", "-c", cat_cmd.as_str()];
+            if let Ok(comm) = run_hdc_shell(&device, &cat_args, 20).await {
+                let name = comm.trim();
+                if !name.is_empty() {
+                    thread_lines.push(format!("    tid {tid}: {name}"));
+                }
+            }
+        }
+        // 3) 进程详情（CPU/内存/线程状态）
+        let detail = run_hdc_shell(&device, &["hidumper", "-p", pid], 40)
+            .await
+            .unwrap_or_else(|e| format!("(hidumper 不可用: {e})"));
+        out.push_str(&format!(
+            "\n=== PID {pid} ===\n线程数：{}（展示前 60）\n{}\n进程详情：\n{}\n",
+            tids.len(),
+            thread_lines.join("\n"),
+            truncate_out(&detail)
+        ));
+    }
+    out.push_str(
+        "\n说明：这是进程/线程级快照；需要函数级执行顺序时，在关键路径用 debug_probe 插桩 hilog 后在 hilog 中观察。",
+    );
     Ok(out)
 }
 

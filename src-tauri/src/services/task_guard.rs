@@ -6,18 +6,23 @@
 //!   触发一次强制建议（构建验证 / 重新规划 / 终止）。
 //! - **同文件反复修改**：同一文件被连续编辑达到阈值时，强制要求先构建验证再继续改。
 //! - **失败方案黑名单**：记录已失败的命令/动作签名，阻止模型用完全相同的方式重试。
+//!
+//! 各项阈值默认值定义在 agent_limits，运行时以其动态配置为准（设置页可调，0/-1 表示不限制），
+//! 此处常量仅作默认值与测试引用。
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// 触发"同文件反复编辑后强制构建"的连续编辑次数阈值
-pub const REPEAT_EDIT_THRESHOLD: usize = 3;
-/// 触发失速检测的"无进展"工具调用次数
-pub const STALL_TOOL_THRESHOLD: usize = 6;
-/// 目标锚定重注入间隔（每 N 轮工具调用）
-pub const GOAL_REINJECT_INTERVAL: usize = 8;
-/// 构建连续失败达到此次数时强制收敛：停止盲目重试，要求换方案或向用户汇报
-pub const BUILD_FAIL_CONVERGE_THRESHOLD: usize = 3;
+/// 触发"同文件反复编辑后强制构建"的连续编辑次数阈值（默认值；运行时以 agent_limits 配置为准）
+pub const REPEAT_EDIT_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_REPEAT_EDIT_THRESHOLD as usize;
+/// 触发失速检测的"无进展"工具调用次数（默认值；运行时以 agent_limits 配置为准）
+pub const STALL_TOOL_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_STALL_TOOL_THRESHOLD as usize;
+/// 目标锚定重注入间隔（每 N 轮工具调用，默认值；运行时以 agent_limits 配置为准）
+pub const GOAL_REINJECT_INTERVAL: usize = crate::services::agent_limits::DEFAULT_GOAL_REINJECT_INTERVAL as usize;
+/// 构建连续失败达到此次数时强制收敛（默认值；运行时以 agent_limits 配置为准）
+pub const BUILD_FAIL_CONVERGE_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_BUILD_FAIL_CONVERGE_THRESHOLD as usize;
+/// 失败动作黑名单阈值（默认值；运行时以 agent_limits 配置为准）
+pub const BLACKLIST_FAIL_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_BLACKLIST_FAIL_THRESHOLD as usize;
 
 #[derive(Default, Debug)]
 struct ConversationGuard {
@@ -63,12 +68,14 @@ pub fn begin_task(conversation_id: &str, goal: &str) {
 
 /// 记录一次工具调用，返回该调用应附加到模型的护栏提示（可能为空）。
 /// `progress` 表示该工具是否构成"实质进展"（写文件/构建/部署/测试成功等）。
+/// 各项阈值取自 agent_limits 动态配置（0/-1 表示不限制）。
 pub fn record_tool(
     conversation_id: &str,
     tool: &str,
     args: &serde_json::Value,
     ok: bool,
 ) -> GuardHint {
+    let limits = crate::services::agent_limits::current();
     guard_mut(conversation_id, |g| {
         g.tool_count += 1;
 
@@ -110,33 +117,41 @@ pub fn record_tool(
         let mut hint = GuardHint::default();
         if let Some(f) = &g.last_edited {
             if let Some(n) = g.edit_counts.get(f) {
-                if *n >= REPEAT_EDIT_THRESHOLD
-                    && !matches!(tool, "build_project" | "deploy" | "run_tests")
-                {
-                    hint.force_verify = Some(format!(
-                        "文件 {f} 已被连续修改 {n} 次但未经验证。请立即调用 build_project 构建验证（若构建失败，依据错误定位修复），不要继续盲目编辑同一文件。"
-                    ));
+                if let Some(threshold) = limits.repeat_edit_threshold() {
+                    if *n >= threshold
+                        && !matches!(tool, "build_project" | "deploy" | "run_tests")
+                    {
+                        hint.force_verify = Some(format!(
+                            "文件 {f} 已被连续修改 {n} 次但未经验证。请立即调用 build_project 构建验证（若构建失败，依据错误定位修复），不要继续盲目编辑同一文件。"
+                        ));
+                    }
                 }
             }
         }
-        if g.since_progress >= STALL_TOOL_THRESHOLD && hint.force_verify.is_none() {
-            hint.stall_warning = Some(format!(
-                "已连续 {} 次工具调用未产生实质进展（无写文件/构建/部署/测试）。请：1) 若已有代码改动，立即 build_project 验证；2) 若方向不对，向用户说明并调整方案；3) 不要继续重复只读探索。",
-                g.since_progress
-            ));
+        if let Some(threshold) = limits.stall_tool_threshold() {
+            if g.since_progress >= threshold && hint.force_verify.is_none() {
+                hint.stall_warning = Some(format!(
+                    "已连续 {} 次工具调用未产生实质进展（无写文件/构建/部署/测试）。若仍在排查请继续推进，但建议尽快进入验证环节（有代码改动就 build_project，能部署就 deploy）；不要长时间停留在只读探索上。",
+                    g.since_progress
+                ));
+            }
         }
         // 构建连续失败收敛：达到阈值后强制换思路或汇报，避免无限"改→构建失败→再改"循环
-        if g.build_fail_streak >= BUILD_FAIL_CONVERGE_THRESHOLD {
-            hint.converge_warning = Some(format!(
-                "已连续 {} 次构建失败。请停止盲目重试：1) 回看最近几次构建错误是否同一根因、当前修复是否真正命中；2) 若超出能力或需要用户决策（依赖缺失、签名/环境问题），直接向用户汇报并给出建议；3) 不要再用相同方式重复构建。",
-                g.build_fail_streak
-            ));
-        }
-        if g.tool_count % GOAL_REINJECT_INTERVAL == 0 {
-            if let Some(goal) = &g.goal {
-                hint.goal_reminder = Some(format!(
-                    "【目标锚定】用户的原始任务是：{goal}\n请确认当前工具调用仍在服务该目标；若已偏离，回到目标或向用户确认。"
+        if let Some(threshold) = limits.build_fail_converge_threshold() {
+            if g.build_fail_streak >= threshold {
+                hint.converge_warning = Some(format!(
+                    "已连续 {} 次构建失败。请换一种方式排查：1) 回看最近几次构建错误是否同一根因、当前修复是否真正命中（读完整 build.log 而非只看尾）；2) 检查环境层面（SDK 路径/签名/依赖安装）而非只改代码；3) 若确实无法推进，向用户汇报现状并给出建议。",
+                    g.build_fail_streak
                 ));
+            }
+        }
+        if let Some(interval) = limits.goal_reinject_interval() {
+            if g.tool_count % interval == 0 {
+                if let Some(goal) = &g.goal {
+                    hint.goal_reminder = Some(format!(
+                        "【目标锚定】用户的原始任务是：{goal}\n请确认当前工具调用仍在服务该目标；若已偏离，回到目标或向用户确认。"
+                    ));
+                }
             }
         }
         hint
@@ -144,10 +159,14 @@ pub fn record_tool(
 }
 
 /// 检查某动作签名是否已在本任务失败过（用于阻止完全相同的重试）。
+/// 阈值取自 agent_limits 动态配置（0/-1 表示关闭黑名单）。
 pub fn is_blacklisted(conversation_id: &str, tool: &str, args: &serde_json::Value) -> bool {
+    let Some(threshold) = crate::services::agent_limits::current().blacklist_fail_threshold() else {
+        return false;
+    };
     guard_mut(conversation_id, |g| {
         let sig = action_signature(tool, args);
-        g.failed_actions.get(&sig).copied().unwrap_or(0) >= 2
+        g.failed_actions.get(&sig).copied().unwrap_or(0) >= threshold
     })
 }
 
@@ -236,9 +255,9 @@ mod tests {
     fn stall_and_verify() {
         let cid = "test-conv-1";
         begin_task(cid, "做一个记账页");
-        // 连续 6 次只读 → 失速
+        // 连续 10 次只读 → 失速
         let v = serde_json::Value::Null;
-        for _ in 0..5 {
+        for _ in 0..STALL_TOOL_THRESHOLD - 1 {
             let h = record_tool(cid, "list_dir", &v, true);
             assert!(h.stall_warning.is_none());
         }
@@ -267,8 +286,10 @@ mod tests {
         let cid = "test-conv-3";
         begin_task(cid, "跑测试");
         let args = serde_json::json!({"command":"npm run test -- --watchAll=false"});
-        record_tool(cid, "run_command", &args, false);
-        assert!(!is_blacklisted(cid, "run_command", &args));
+        for _ in 0..BLACKLIST_FAIL_THRESHOLD - 1 {
+            record_tool(cid, "run_command", &args, false);
+            assert!(!is_blacklisted(cid, "run_command", &args));
+        }
         record_tool(cid, "run_command", &args, false);
         assert!(is_blacklisted(cid, "run_command", &args));
     }
@@ -278,12 +299,12 @@ mod tests {
         let cid = "test-conv-build";
         begin_task(cid, "修复构建错误");
         let args = serde_json::Value::Null;
-        // 前两次构建失败：尚未触发收敛
-        let h = record_tool(cid, "build_project", &args, false);
-        assert!(h.converge_warning.is_none());
-        let h = record_tool(cid, "build_project", &args, false);
-        assert!(h.converge_warning.is_none());
-        // 连续第三次失败：触发收敛警告
+        // 前四次构建失败：尚未触发收敛
+        for _ in 0..BUILD_FAIL_CONVERGE_THRESHOLD - 1 {
+            let h = record_tool(cid, "build_project", &args, false);
+            assert!(h.converge_warning.is_none());
+        }
+        // 连续第五次失败：触发收敛警告
         let h = record_tool(cid, "build_project", &args, false);
         assert!(h.converge_warning.is_some());
         // 构建成功后清零，下一次失败不再收敛

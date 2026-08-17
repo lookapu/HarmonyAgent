@@ -888,10 +888,3 @@ pub fn api_kb_embed_index(app: AppHandle, db: State<'_, DbState>) -> Result<(), 
     }
 }
 
-// ───────────────────────── 工具函数（供测试复用） ─────────────────────────
-
-/// 统计 api_docs 行数，方便前端展示。
-pub fn count_docs(conn: &Connection) -> i64 {
-    conn.query_row("SELECT COUNT(*) FROM api_docs", [], |r| r.get(0))
-        .unwrap_or(0)
-}

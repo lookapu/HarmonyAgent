@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { useProjectStore } from '../../stores/projectStore'
@@ -30,6 +31,8 @@ import {
   startHdcService,
   stopHdcService,
   captureDeviceScreenshot,
+  listDeviceScreenshots,
+  deleteDeviceScreenshot,
   listInstalledApps,
   launchApp,
   stopApp,
@@ -44,11 +47,23 @@ import {
   type InstalledApp,
   type DeviceProcess,
   type DevicePerf,
+  type ShotFile,
 } from '../../api/devices'
 import Icon, { type IconName } from '../../icons/Icon'
 
 /* ============ 设备面板：列出 hdc 设备、型号、在线状态、设为默认 ============ */
-export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onChanged: () => void }) {
+export function DevicesPanel({
+  projectId,
+  projectName,
+  onChanged,
+  onSendImage,
+}: {
+  projectId?: string
+  projectName?: string
+  onChanged: () => void
+  /** 发送图片到对话（截图右键菜单「发送到对话」，data URL 注入输入框附件） */
+  onSendImage?: (dataUrl: string) => void
+}) {
   const { t } = useTranslation()
   const [devices, setDevices] = useState<DeviceInfo[]>([])
   const [loading, setLoading] = useState(false)
@@ -65,6 +80,9 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
   const [shotBusy, setShotBusy] = useState<string | null>(null)
   const [shotPreview, setShotPreview] = useState<string | null>(null)
   const [shotError, setShotError] = useState<string | null>(null)
+  // 截图记录：项目截图目录列表（时间倒序）+ 右键菜单（复制/发送/删除）
+  const [shots, setShots] = useState<ShotFile[]>([])
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; file: ShotFile } | null>(null)
   // 应用/进程管理：每个设备的子 tab（apps | procs | log | perf）+ 数据缓存
   const [tabMap, setTabMap] = useState<Record<string, 'apps' | 'procs' | 'log' | 'perf'>>({})
   const [appsMap, setAppsMap] = useState<Record<string, InstalledApp[]>>({})
@@ -250,26 +268,112 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
         setDetailMap((m) => ({ ...m, [d.id]: det }))
       } catch {
         // 详情查询失败：缓存空对象，展开区显示失败提示
-        setDetailMap((m) => ({ ...m, [d.id]: { brand: '', manufacturer: '', model: '', os_version: '', resolution: '', battery: '', ram: '' } }))
+        setDetailMap((m) => ({ ...m, [d.id]: { brand: '', manufacturer: '', model: '', os_version: '', resolution: '', battery: '', battery_status: '', battery_temp: '', storage: '', cpu_freq: '', ram: '' } }))
       } finally {
         setDetailBusy(null)
       }
     }
   }
 
-  /** 截取设备屏幕：截图到项目 screenshots 目录并预览 */
+  /** 截取设备屏幕：截图到项目 screenshots 目录并预览，完成后刷新截图记录 */
   const handleCapture = async (deviceId: string) => {
     if (!projectId) return
     setShotBusy(deviceId)
     setShotError(null)
     try {
-      const path = await captureDeviceScreenshot(projectId, deviceId)
+      const path = await captureDeviceScreenshot(projectId, deviceId, projectName)
       setShotPreview(path)
+      void loadShots()
     } catch (e) {
       setShotError(e instanceof Error ? e.message : String(e))
     } finally {
       setShotBusy(null)
     }
+  }
+
+  /** 加载项目截图记录（时间倒序），projectId 变化/截图完成后调用 */
+  const loadShots = useCallback(async () => {
+    if (!projectId) return
+    try {
+      const list = await listDeviceScreenshots(projectId)
+      setShots(list)
+    } catch {
+      // 静默：截图目录不存在等场景不打扰
+    }
+  }, [projectId])
+  useEffect(() => {
+    void loadShots()
+  }, [loadShots])
+
+  /** 复制截图图片到剪贴板（fetch asset → ClipboardItem；失败回退复制路径） */
+  const copyShotImage = async (f: ShotFile) => {
+    try {
+      const res = await fetch(convertFileSrc(f.path))
+      const blob = await res.blob()
+      await navigator.clipboard.write([
+        new ClipboardItem({ [blob.type || 'image/png']: blob }),
+      ])
+    } catch {
+      await navigator.clipboard.writeText(f.path)
+    } finally {
+      setCtxMenu(null)
+    }
+  }
+
+  /** 复制截图文件路径 */
+  const copyShotPath = async (f: ShotFile) => {
+    try {
+      await navigator.clipboard.writeText(f.path)
+    } catch {
+      // 忽略
+    } finally {
+      setCtxMenu(null)
+    }
+  }
+
+  /** 发送截图到对话（data URL 注入输入框附件，随消息多模态上传） */
+  const sendShotToChat = async (f: ShotFile) => {
+    try {
+      const res = await fetch(convertFileSrc(f.path))
+      const blob = await res.blob()
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const r = new FileReader()
+        r.onload = () => resolve(String(r.result))
+        r.onerror = () => reject(r.error)
+        r.readAsDataURL(blob)
+      })
+      onSendImage?.(dataUrl)
+    } catch {
+      // 读取失败静默（用户可改用复制路径）
+    } finally {
+      setCtxMenu(null)
+    }
+  }
+
+  /** 删除一张截图（本地删除 + 列表移除） */
+  const deleteShotItem = async (f: ShotFile) => {
+    if (!projectId) return
+    try {
+      await deleteDeviceScreenshot(projectId, f.name)
+      setShots((cur) => cur.filter((s) => s.name !== f.name))
+      if (shotPreview === f.path) setShotPreview(null)
+    } catch {
+      // 忽略
+    } finally {
+      setCtxMenu(null)
+    }
+  }
+
+  // 截图删除两击确认：首次点击进入确认态（3 秒后自动恢复），再次点击才真正删除
+  const [confirmDeleteShot, setConfirmDeleteShot] = useState<string | null>(null)
+  const deleteShot = async (f: ShotFile) => {
+    if (confirmDeleteShot !== f.path) {
+      setConfirmDeleteShot(f.path)
+      setTimeout(() => setConfirmDeleteShot((c) => (c === f.path ? null : c)), 3000)
+      return
+    }
+    setConfirmDeleteShot(null)
+    await deleteShotItem(f)
   }
 
   /** 切换设备子 tab（apps/procs/log），首次进入时加载数据 */
@@ -386,7 +490,7 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
           return (
             <div
               key={d.id}
-              className={`rounded-xl border bg-[var(--bg-card)] p-3 transition-all ${
+              className={`rounded-xl modern-card p-3 transition-all ${
                 d.is_default
                   ? 'border-[var(--accent)]/50 shadow-md shadow-[var(--accent)]/10'
                   : 'border-[var(--border)] hover:border-[var(--border-strong)]'
@@ -443,6 +547,32 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
                   <Icon name={shotBusy === d.id ? 'refresh' : 'devices'} size={11} className={shotBusy === d.id ? 'animate-spin' : ''} />
                   {shotBusy === d.id ? t('home.deviceShooting') : t('home.deviceShot')}
                 </button>
+              )}
+              {/* 截图记录：横向滚动缩略图（时间倒序），点击放大、右键更多操作 */}
+              {shots.length > 0 && (
+                <div className="mt-2">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] text-[var(--text-muted)]">{t('home.deviceShots')}</span>
+                    <span className="text-[9.5px] text-[var(--text-muted)]">{shots.length}</span>
+                  </div>
+                  <div className="flex gap-1.5 overflow-x-auto pb-1">
+                    {shots.map((f) => (
+                      <div key={f.name} className="relative group/shot shrink-0">
+                        <img
+                          src={convertFileSrc(f.path)}
+                          alt={f.name}
+                          title={f.name}
+                          onClick={() => { setCtxMenu(null); setShotPreview(f.path) }}
+                          onContextMenu={(e) => {
+                            e.preventDefault()
+                            setCtxMenu({ x: e.clientX, y: e.clientY, file: f })
+                          }}
+                          className="w-14 h-10 object-cover rounded-md border border-[var(--border)] cursor-zoom-in hover:border-[var(--accent)] transition-colors"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
               )}
               {/* 详情展开按钮 */}
               <button
@@ -527,7 +657,7 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
                           value={appFilter}
                           onChange={(e) => setAppFilter(e.target.value)}
                           placeholder={t('home.deviceAppFilter')}
-                          className="w-full h-6 pl-6 pr-2 rounded-md bg-[var(--bg-card)] border border-[var(--border)] text-[10.5px] outline-none focus:border-[var(--accent)]"
+                          className="w-full h-6 pl-6 pr-2 rounded-md modern-card border-[var(--border)] text-[10.5px] outline-none focus:border-[var(--accent)]"
                         />
                         <Icon name="search" size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
                       </div>
@@ -588,27 +718,27 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
                   )}
                   {tabMap[d.id] === 'log' && (
                     <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-primary)]/60 flex flex-col">
-                      {/* 过滤条件 + 启停/清空 */}
-                      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
+                      {/* 过滤条件 + 启停/清空（flex-wrap：右侧栏过窄时换行，避免横向溢出） */}
+                      <div className="flex flex-wrap items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                         <input
                           value={hilogOpts[d.id]?.pkg ?? ''}
                           onChange={(e) => setHilogOpts((m) => ({ ...m, [d.id]: { ...(m[d.id] ?? { tag: '', level: '' }), pkg: e.target.value } }))}
                           placeholder={t('home.deviceHilogPkg')}
                           disabled={hilogActive[d.id]}
-                          className="w-24 h-6 px-1.5 rounded-md bg-[var(--bg-card)] border border-[var(--border)] text-[10px] font-mono outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                          className="flex-1 min-w-0 basis-20 h-6 px-1.5 rounded-md modern-card border-[var(--border)] text-[10px] font-mono outline-none focus:border-[var(--accent)] disabled:opacity-50"
                         />
                         <input
                           value={hilogOpts[d.id]?.tag ?? ''}
                           onChange={(e) => setHilogOpts((m) => ({ ...m, [d.id]: { ...(m[d.id] ?? { pkg: '', level: '' }), tag: e.target.value } }))}
                           placeholder={t('home.deviceHilogTag')}
                           disabled={hilogActive[d.id]}
-                          className="w-20 h-6 px-1.5 rounded-md bg-[var(--bg-card)] border border-[var(--border)] text-[10px] font-mono outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                          className="flex-1 min-w-0 basis-16 h-6 px-1.5 rounded-md modern-card border-[var(--border)] text-[10px] font-mono outline-none focus:border-[var(--accent)] disabled:opacity-50"
                         />
                         <select
                           value={hilogOpts[d.id]?.level ?? ''}
                           onChange={(e) => setHilogOpts((m) => ({ ...m, [d.id]: { ...(m[d.id] ?? { pkg: '', tag: '' }), level: e.target.value } }))}
                           disabled={hilogActive[d.id]}
-                          className="h-6 px-1 rounded-md bg-[var(--bg-card)] border border-[var(--border)] text-[10px] outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                          className="h-6 px-1 rounded-md modern-card border-[var(--border)] text-[10px] outline-none focus:border-[var(--accent)] disabled:opacity-50"
                         >
                           <option value="">{t('home.deviceHilogLevelAll')}</option>
                           <option value="D">D</option>
@@ -720,20 +850,67 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
           )
         })}
       </div>
-      {/* 截图预览浮层 */}
-      {shotPreview && (
+      {/* 截图右键菜单（复制图片/复制路径/发送到对话/删除）；portal 到 body 顶层，菜单跟随鼠标不受父容器影响 */}
+      {ctxMenu &&
+        createPortal(
+        <>
+          <div className="fixed inset-0 z-[59]" onClick={() => setCtxMenu(null)} onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null) }} />
+          <div
+            className="fixed z-[60] w-40 rounded-lg modern-card shadow-lg py-1 text-[11px] animate-fade-in-up"
+            style={{
+              left: Math.min(ctxMenu.x, window.innerWidth - 176),
+              top: Math.min(ctxMenu.y, window.innerHeight - 180),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              onClick={() => void copyShotImage(ctxMenu.file)}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors"
+            >
+              <Icon name="copy" size={11} /> {t('home.deviceShotCopy')}
+            </button>
+            <button
+              onClick={() => void copyShotPath(ctxMenu.file)}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors"
+            >
+              <Icon name="file" size={11} /> {t('home.deviceShotCopyPath')}
+            </button>
+            {onSendImage && (
+              <button
+                onClick={() => void sendShotToChat(ctxMenu.file)}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors"
+              >
+                <Icon name="send" size={11} /> {t('home.deviceShotSend')}
+              </button>
+            )}
+            <div className="my-1 border-t border-[var(--border)]" />
+            <button
+              onClick={() => void deleteShotItem(ctxMenu.file)}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
+            >
+              <Icon name="delete" size={11} /> {t('home.deviceShotDelete')}
+            </button>
+          </div>
+        </>,
+          document.body,
+        )}
+      {/* 截图预览浮层（截图失败时也弹出，避免无反馈）；portal 到 body 顶层，不受父容器裁剪 */}
+      {(shotPreview || shotError) && (() => {
+        // 当前预览的文件（截图失败时无文件，仅展示错误）
+        const previewFile = shotPreview ? shots.find((s) => s.path === shotPreview) : undefined
+        return createPortal(
         <div
-          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-6"
-          onClick={() => setShotPreview(null)}
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6"
+          onClick={() => { setShotPreview(null); setShotError(null) }}
         >
           <div
-            className="relative max-w-[80vw] rounded-xl overflow-hidden bg-[var(--bg-card)] border border-[var(--border)] shadow-2xl animate-fade-in-up"
+            className="relative max-w-[80vw] rounded-xl overflow-hidden modern-card border-[var(--border)] shadow-2xl animate-fade-in-up"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)]">
               <Icon name="devices" size={13} className="text-[var(--accent)]" />
               <span className="text-[11px] font-mono truncate text-[var(--text-secondary)]">
-                {shotPreview.split(/[\\/]/).pop()}
+                {shotPreview ? shotPreview.split(/[\\/]/).pop() : t('home.deviceShotFailed')}
               </span>
               {shotError && <span className="text-[10.5px] text-[var(--danger)] ml-1">{shotError}</span>}
               <button
@@ -743,13 +920,61 @@ export function DevicesPanel({ projectId, onChanged }: { projectId?: string; onC
                 <Icon name="close" size={14} />
               </button>
             </div>
-            <img src={convertFileSrc(shotPreview)} alt="设备截图" className="max-w-full max-h-[72vh] object-contain" />
-            <div className="px-3 py-1.5 text-[10px] text-[var(--text-muted)] border-t border-[var(--border)]">
-              {t('home.deviceShotSaved')}
-            </div>
+            {shotPreview && (
+              <img
+                src={convertFileSrc(shotPreview)}
+                alt="设备截图"
+                className="block mx-auto max-w-full max-h-[72vh] object-contain"
+                onContextMenu={(e) => {
+                  if (!previewFile) return
+                  e.preventDefault()
+                  setCtxMenu({ x: e.clientX, y: e.clientY, file: previewFile })
+                }}
+              />
+            )}
+            {/* 操作按钮条：复制/发送/删除（与缩略图右键菜单一致；flex-wrap 小窗口时换行） */}
+            {previewFile && (
+              <div className="flex flex-wrap items-center gap-1 px-3 py-2 border-t border-[var(--border)]">
+                <button
+                  onClick={() => void copyShotImage(previewFile)}
+                  className="flex items-center gap-1 px-2 h-6 rounded-md text-[10.5px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
+                >
+                  <Icon name="copy" size={11} /> {t('home.deviceShotCopy')}
+                </button>
+                <button
+                  onClick={() => void copyShotPath(previewFile)}
+                  className="flex items-center gap-1 px-2 h-6 rounded-md text-[10.5px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
+                >
+                  <Icon name="file" size={11} /> {t('home.deviceShotCopyPath')}
+                </button>
+                {onSendImage && (
+                  <button
+                    onClick={() => void sendShotToChat(previewFile)}
+                    className="flex items-center gap-1 px-2 h-6 rounded-md text-[10.5px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-colors shrink-0"
+                  >
+                    <Icon name="send" size={11} /> {t('home.deviceShotSend')}
+                  </button>
+                )}
+                {/* 危险操作分隔线 + 两击确认：删除不可恢复，与常规操作拉开距离 */}
+                <span className="mx-0.5 w-px h-4 bg-[var(--border)] shrink-0" aria-hidden="true" />
+                <button
+                  onClick={() => void deleteShot(previewFile)}
+                  className={`flex items-center gap-1 px-2 h-6 rounded-md text-[10.5px] transition-colors shrink-0 ${
+                    confirmDeleteShot === previewFile.path
+                      ? 'text-[var(--danger)] bg-[var(--danger)]/15'
+                      : 'text-[var(--danger)] opacity-70 hover:opacity-100 hover:bg-[var(--danger)]/10'
+                  }`}
+                >
+                  <Icon name="delete" size={11} /> {confirmDeleteShot === previewFile.path ? t('home.deviceShotDeleteConfirm') : t('home.deviceShotDelete')}
+                </button>
+                <span className="ml-auto shrink-0 text-[10px] text-[var(--text-muted)]">{t('home.deviceShotSaved')}</span>
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        </div>,
+          document.body,
+        )
+      })()}
     </div>
   )
 }
@@ -766,6 +991,7 @@ export function AnalyzePanel({
   moduleScanTick,
   agentBusy,
   onHarmonyRootChanged,
+  root,
 }: {
   projectPath: string
   projectId: string
@@ -777,6 +1003,8 @@ export function AnalyzePanel({
   moduleScanTick: number
   agentBusy: boolean
   onHarmonyRootChanged: () => void
+  /** 会话工作目录（worktree 模式为 worktree 路径，本地模式为 undefined） */
+  root?: string
 }) {
   const { t } = useTranslation()
   const [data, setData] = useState<ProjectCapability | null>(null)
@@ -810,7 +1038,7 @@ export function AnalyzePanel({
     setRootLoading(true)
     void (async () => {
       try {
-        let info = await getHarmonyRoot(projectId)
+        let info = await getHarmonyRoot(projectId, root)
         if (
           !cancelled &&
           !rescannedRef.current &&
@@ -821,7 +1049,7 @@ export function AnalyzePanel({
           rescannedRef.current = true
           try {
             await rescanWorkspaceModules(projectId)
-            if (!cancelled) info = await getHarmonyRoot(projectId)
+            if (!cancelled) info = await getHarmonyRoot(projectId, root)
           } catch {
             // 扫描失败静默，保留原解析结果
           }
@@ -836,7 +1064,7 @@ export function AnalyzePanel({
     return () => {
       cancelled = true
     }
-  }, [projectId, projectPath, moduleScanTick])
+  }, [projectId, projectPath, root, moduleScanTick])
 
   // 实际分析目录：解析后的鸿蒙主工程根（=项目根本身时行为不变）
   const effPath = rootInfo?.root ?? projectPath
@@ -864,9 +1092,9 @@ export function AnalyzePanel({
   // 切换"鸿蒙主工程"：持久化并触发父级刷新项目引用，随后重新分析
   const handleRootChange = async (value: string) => {
     try {
-      await setHarmonyProjectPath(projectId, value === projectPath ? '' : value)
+      await setHarmonyProjectPath(projectId, value === projectPath ? '' : value, root)
       onHarmonyRootChanged()
-      setRootInfo(await getHarmonyRoot(projectId).catch(() => null))
+      setRootInfo(await getHarmonyRoot(projectId, root).catch(() => null))
       setData(null)
       setGenericOverview(null)
       setDepChecks(null)
@@ -995,7 +1223,7 @@ export function AnalyzePanel({
       {/* 鸿蒙主工程选择器：混合工作区（项目根非鸿蒙工程）时切换实际分析的子工程 */}
       {rootInfo &&
         (rootInfo.candidates.length > 0 || rootInfo.configured != null || rootInfo.auto) && (
-          <div className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1.5">
+          <div className="flex items-center gap-1.5 rounded-lg modern-card px-2 py-1.5">
             <span className="shrink-0 text-[10px] text-[var(--text-muted)]">
               {t('home.analyzeHarmonyRoot')}
             </span>
@@ -1031,7 +1259,7 @@ export function AnalyzePanel({
             title={tb.badge ? `${tb.label} (${tb.badge})` : tb.label}
             className={`flex items-center justify-center gap-1 flex-1 h-6 rounded-[6px] text-[10.5px] transition-all border ${
               sub === tb.key
-                ? 'bg-[var(--bg-card)] text-[var(--accent)] font-medium shadow-sm border-[var(--border)]'
+                ? 'tab-soft font-medium border-[var(--border)]'
                 : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] border-transparent'
             }`}
           >
@@ -1067,7 +1295,7 @@ export function AnalyzePanel({
         <>
           {/* 通用工程概览：非鸿蒙子工程（Node/Go/Rust/Python/Java/C/C++/Flutter/.NET 等） */}
           {genericOverview && !data && !error && (
-            <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-2.5">
+            <div className="rounded-lg modern-card p-2.5">
               <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-[var(--text-secondary)] leading-relaxed">
                 {genericOverview}
               </pre>
@@ -1091,13 +1319,13 @@ export function AnalyzePanel({
                   </div>
                 )}
                 {errCount === 0 ? (
-                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-2.5 py-3 text-center text-[11px] text-[var(--text-muted)]">
+                  <div className="rounded-lg modern-card px-2.5 py-3 text-center text-[11px] text-[var(--text-muted)]">
                     {t('home.analyzeNoErrors')}
                   </div>
                 ) : (
                   <>
                     {data.build_errors.map((e, i) => (
-                      <div key={i} className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-2.5 space-y-1">
+                      <div key={i} className="rounded-lg modern-card p-2.5 space-y-1">
                         <div className="flex items-center gap-1.5 flex-wrap">
                           <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-medium ${errColor(e.kind)}`}>
                             {e.kind}
@@ -1164,10 +1392,11 @@ export function AnalyzePanel({
             {sub === 'cap' && (
               <div className="space-y-2.5">
                 {/* 工程摘要：网格统计卡 */}
-                <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-2">
+                <div className="rounded-lg modern-card p-2">
                   <div className="grid grid-cols-2 gap-1.5">
                     {[
                       { label: t('home.analyzeBundle'), value: data.project.bundle_name ?? '--', mono: true, full: true },
+                      { label: t('home.analyzeSdk'), value: data.project.sdk_version ?? (data.project.api_version != null ? `API ${data.project.api_version}` : '--'), mono: true, full: false },
                       { label: t('home.analyzeApi'), value: data.project.api_version != null ? `API ${data.project.api_version}` : '--', mono: true, full: false },
                       { label: t('home.analyzeModules'), value: `${data.modules.length}`, mono: true, full: false },
                       { label: t('home.analyzeKits'), value: `${data.kit_usage.length}`, mono: true, full: false },
@@ -1188,7 +1417,7 @@ export function AnalyzePanel({
 
                 {/* 模块列表 */}
                 {data.modules.length > 0 && (
-                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-2.5 space-y-2">
+                  <div className="rounded-lg modern-card p-2.5 space-y-2">
                     <div className="flex items-center gap-1.5">
                       <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.analyzeModuleList')}</span>
                       <span className="px-1.5 py-0.5 rounded-full text-[9px] font-medium bg-[var(--accent)]/10 text-[var(--accent)]">
@@ -1233,7 +1462,7 @@ export function AnalyzePanel({
                 {data.kit_usage.length > 0 && (() => {
                   const maxCount = data.kit_usage[0]?.count ?? 1
                   return (
-                    <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-2.5">
+                    <div className="rounded-lg modern-card p-2.5">
                       <div className="text-[11px] font-medium text-[var(--text-secondary)] mb-1.5">{t('home.analyzeKitUsage')}</div>
                       <div className="space-y-1.5">
                         {data.kit_usage.slice(0, 12).map((k) => (
@@ -1259,7 +1488,7 @@ export function AnalyzePanel({
 
                 {/* 权限 */}
                 {data.permissions.length > 0 && (
-                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-2.5">
+                  <div className="rounded-lg modern-card p-2.5">
                     <div className="text-[11px] font-medium text-[var(--text-secondary)] mb-1.5">{t('home.analyzePermissions')}</div>
                     <div className="space-y-1">
                       {data.permissions.map((p) => (
@@ -1299,16 +1528,16 @@ export function AnalyzePanel({
                   )}
                 </div>
                 {depsMsg && (
-                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-2.5 py-2 text-[10px] font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-all max-h-40 overflow-y-auto">
+                  <div className="rounded-lg modern-card px-2.5 py-2 text-[10px] font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-all max-h-40 overflow-y-auto">
                     {depsMsg}
                   </div>
                 )}
                 {depChecks === null && !depsLoading ? (
-                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-2.5 py-3 text-center text-[11px] text-[var(--text-muted)]">
+                  <div className="rounded-lg modern-card px-2.5 py-3 text-center text-[11px] text-[var(--text-muted)]">
                     {t('home.analyzeNoDeps')}
                   </div>
                 ) : depChecks && depChecks.length === 0 ? (
-                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-2.5 py-3 text-center text-[11px] text-[var(--text-muted)]">
+                  <div className="rounded-lg modern-card px-2.5 py-3 text-center text-[11px] text-[var(--text-muted)]">
                     {t('home.analyzeNoDeps')}
                   </div>
                 ) : (
@@ -1322,7 +1551,7 @@ export function AnalyzePanel({
                         groups.get(key)!.push(d)
                       }
                       return [...groups.entries()].map(([mod, deps]) => (
-                        <div key={mod} className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-2.5">
+                        <div key={mod} className="rounded-lg modern-card p-2.5">
                           <div className="flex items-center gap-1.5 mb-1">
                             <Icon name="package" size={10} className="text-[var(--accent)] shrink-0" />
                             <span className="font-mono text-[10.5px] text-[var(--text-secondary)] truncate flex-1">{mod}</span>
@@ -1392,7 +1621,7 @@ export function PerfCard({
   const valid = data.filter((v) => v >= 0)
   const show = value >= 0
   return (
-    <div className="rounded-md bg-[var(--bg-card)] border border-[var(--border)] px-2 py-1.5">
+    <div className="rounded-md modern-card border-[var(--border)] px-2 py-1.5">
       <div className="flex items-baseline justify-between gap-1">
         <span className="text-[9.5px] text-[var(--text-muted)]">{label}</span>
         <span className="text-[11px] font-mono font-medium" style={{ color: show ? color : 'var(--text-muted)' }}>
@@ -1433,7 +1662,11 @@ function deviceDetailRows(t: (key: string) => string, d?: DeviceDetail): { label
     { label: t('home.detailManufacturer'), value: d.manufacturer },
     { label: t('home.detailOs'), value: d.os_version },
     { label: t('home.detailResolution'), value: d.resolution },
-    { label: t('home.detailBattery'), value: d.battery ? `${d.battery}%` : '' },
+    { label: t('home.detailBattery'), value: d.battery },
+    { label: t('home.detailBatteryStatus'), value: d.battery_status },
+    { label: t('home.detailBatteryTemp'), value: d.battery_temp },
+    { label: t('home.detailCpuFreq'), value: d.cpu_freq },
+    { label: t('home.detailStorage'), value: d.storage },
     { label: t('home.detailRam'), value: ram },
   ]
 }
@@ -1476,10 +1709,13 @@ export function SymbolsPanel({
   projectId,
   projectName,
   onReference,
+  root,
 }: {
   projectId: string
   projectName?: string
   onReference: (path: string) => void
+  /** 会话工作目录（worktree 模式为 worktree 路径，本地模式为 undefined） */
+  root?: string
 }) {
   const { t } = useTranslation()
   const [query, setQuery] = useState('')
@@ -1564,7 +1800,7 @@ export function SymbolsPanel({
     setRefreshing(true)
     setError(null)
     try {
-      const list = await refreshProjectSymbols(projectId)
+      const list = await refreshProjectSymbols(projectId, root)
       setSymbols(list)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -1577,7 +1813,7 @@ export function SymbolsPanel({
   useEffect(() => {
     if (scope !== 'project' || loading || refreshing) return
     let cancelled = false
-    symbolIndexMeta(projectId)
+    symbolIndexMeta(projectId, root)
       .then((m) => {
         if (!cancelled) setMeta(m)
       })
@@ -1585,7 +1821,7 @@ export function SymbolsPanel({
     return () => {
       cancelled = true
     }
-  }, [projectId, scope, loading, refreshing])
+  }, [projectId, root, scope, loading, refreshing])
 
   // 首次进入：构建当前项目索引（全量扫描；「全部项目」范围不预加载，等用户输入检索）
   useEffect(() => {
@@ -1593,7 +1829,7 @@ export function SymbolsPanel({
     let cancelled = false
     setLoading(true)
     setError(null)
-    indexProjectSymbols(projectId)
+    indexProjectSymbols(projectId, root)
       .then((list) => {
         if (!cancelled) setSymbols(list)
       })
@@ -1606,7 +1842,7 @@ export function SymbolsPanel({
     return () => {
       cancelled = true
     }
-  }, [projectId, scope])
+  }, [projectId, root, scope])
 
   // 输入防抖检索（当前项目或全部项目）
   useEffect(() => {
@@ -1619,7 +1855,7 @@ export function SymbolsPanel({
       const p =
         scope === 'all'
           ? searchSymbolsAll(query.trim(), kind || undefined)
-          : searchSymbolsApi(projectId, query.trim(), kind || undefined)
+          : searchSymbolsApi(projectId, query.trim(), kind || undefined, root)
       if (!cancelled) setSearching(true)
       p.then((list) => {
         if (!cancelled) setSymbols(list)
@@ -1633,14 +1869,14 @@ export function SymbolsPanel({
       }
     }, 220)
     return () => clearTimeout(handle)
-  }, [query, kind, projectId, scope])
+  }, [query, kind, projectId, root, scope])
 
   const openSymbol = async (sym: CodeSymbol) => {
     setViewer({ file: sym.file, line: sym.line, content: '' })
     setViewerLoading(true)
     try {
-      const text = await readProjectFile(projectId, sym.file)
-      setViewer({ file: sym.file, line: sym.line, content: text })
+      const res = await readProjectFile(projectId, sym.file, root)
+      setViewer({ file: sym.file, line: sym.line, content: res.content })
       // 等行渲染后滚动到目标行
       requestAnimationFrame(() => {
         viewerRef.current
@@ -1924,3 +2160,4 @@ export function SymbolsPanel({
     </div>
   )
 }
+

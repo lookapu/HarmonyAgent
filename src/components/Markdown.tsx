@@ -1,5 +1,6 @@
-import { createElement, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import ReactMarkdown from 'react-markdown'
+import { createElement, memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import ReactMarkdown, { type Components } from 'react-markdown'
+import type { PluggableList } from 'unified'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
 import remarkMath from 'remark-math'
@@ -8,8 +9,12 @@ import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import hljs from 'highlight.js'
 import { open as shellOpen } from '@tauri-apps/plugin-shell'
+import { save as dialogSave } from '@tauri-apps/plugin-dialog'
+import { writeTextFile } from '@tauri-apps/plugin-fs'
+import { useTranslation } from 'react-i18next'
 import { useThemeStore } from '../stores/themeStore'
 import Icon from '../icons/Icon'
+import { detectGpu, getCodeHighlightLimit, getMarkdownLightThreshold } from '../utils/gpuDetect'
 import 'katex/dist/katex.min.css'
 
 // 常用语言注册（按需加载，避免全量包体积）
@@ -37,19 +42,41 @@ import ini from 'highlight.js/lib/languages/ini'
 import diff from 'highlight.js/lib/languages/diff'
 import dockerfile from 'highlight.js/lib/languages/dockerfile'
 import plaintext from 'highlight.js/lib/languages/plaintext'
+import scala from 'highlight.js/lib/languages/scala'
+import lua from 'highlight.js/lib/languages/lua'
+import protobuf from 'highlight.js/lib/languages/protobuf'
+import graphql from 'highlight.js/lib/languages/graphql'
+import handlebars from 'highlight.js/lib/languages/handlebars'
+import powershell from 'highlight.js/lib/languages/powershell'
 
 const languages: Record<string, unknown> = {
   rust, groovy, properties, bash, shell, xml, json, typescript, javascript, css, sql,
   python, java, kotlin, go, c, cpp, csharp, markdown, yaml, ini, diff, dockerfile,
-  'docker': dockerfile, 'ts': typescript, 'js': javascript, 'py': python, 'yml': yaml, 'sh': shell, plaintext,
+  scala, lua, protobuf, graphql, handlebars, powershell, plaintext,
+  'docker': dockerfile, 'ts': typescript, 'js': javascript, 'py': python, 'yml': yaml, 'sh': shell,
+  'ps1': powershell, 'proto': protobuf, 'hbs': handlebars,
 }
 Object.entries(languages).forEach(([name, lang]) => {
   if (lang) hljs.registerLanguage(name, lang as never)
 })
 
+/** 超长内容轻量模式阈值：超过后跳过数学公式/原始 HTML 解析与代码语法高亮。
+ * 长日志/长输出中 `$` 符号会触发 remarkMath→Katex 渲染、raw HTML 解析与 hljs 高亮都是主线程卡点，
+ * 超长内容降级渲染可避免窗口卡死（单条消息仍有折叠保护，此处兜底展开后的渲染成本）。
+ * 阈值根据 GPU 能力动态调整：high tier 30000、medium 15000、low 6000 */
+
+/** HTML 转义：避免 XSS 并防止标签被浏览器解释 */
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/** isTreeText 结果缓存：同一段文本可能被多次检测（code 组件 / p 组件），缓存避免重复扫描 */
+const treeTextCache = new Map<string, boolean>()
+const TREE_TEXT_CACHE_MAX = 500
+
 /** 语言展示名（角标用） */
 function langLabel(lang: string): string {
-  const map: Record<string, string> = { typescript: 'TS', javascript: 'JS', properties: 'INI', plaintext: 'TXT', dockerfile: 'Docker', yaml: 'YAML' }
+  const map: Record<string, string> = { typescript: 'TS', javascript: 'JS', properties: 'INI', plaintext: 'TXT', dockerfile: 'Docker', yaml: 'YAML', powershell: 'PS1', protobuf: 'Proto', graphql: 'GQL', handlebars: 'HBS', scala: 'Scala', lua: 'Lua', zig: 'Zig', ejs: 'EJS' }
   return map[lang] ?? lang.slice(0, 8)
 }
 
@@ -101,13 +128,14 @@ const sanitizeSchema = {
  * 代码块：折叠 / 行号 / 全屏 / 下载 / 语言标签 / 语法高亮（hljs 自管理）
  * Mermaid 图表（失败兜底显示原文）；图片 Lightbox 预览 + 加载失败占位
  */
-export default function Markdown({
+export default memo(function Markdown({
   children,
   className = '',
   onOpenFile,
   focusLine,
   selectedLines,
   onLineClick,
+  streaming,
 }: {
   children: string
   className?: string
@@ -119,20 +147,41 @@ export default function Markdown({
   selectedLines?: [number, number]
   /** 点击代码块行号回调（含鼠标事件，用于 Shift 范围选择） */
   onLineClick?: (line: number, e: React.MouseEvent) => void
+  /** 流式渲染中：代码块跳过语法高亮（内容未写完时高亮浪费且闪烁，结束后再高亮） */
+  streaming?: boolean
 }) {
   const [lightbox, setLightbox] = useState<string | null>(null)
   // 引用角标预处理（跳过代码块区域）：[1] / [1,2] → <sup> 角标
   const content = useMemo(() => preprocessCitations(normalizeMarkdown(children)), [children])
-  return (
-    <div className={`md-body ${className}`}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkBreaks, remarkMath]}
-        rehypePlugins={[
-          [rehypeKatex, { throwOnError: false }],
-          rehypeRaw,
-          [rehypeSanitize, sanitizeSchema],
-        ]}
-        components={{
+  // 超长内容轻量模式：跳过 remarkMath/rehypeKatex（日志中的 $ 变量会误触发 Katex 渲染，长文本下极慢）
+  // 与 rehypeRaw（原始 HTML 解析开销大），代码块同步跳过高亮（streaming 语义）。
+  // 阈值根据 GPU 能力动态分级：high=30000 / medium=15000 / low=6000
+  const lightThreshold = useMemo(() => getMarkdownLightThreshold(detectGpu().tier), [])
+  const lightMode = children.length > lightThreshold
+  // 使用 ref 避免 streaming/lightMode 变化导致 components 对象重建
+  // streaming 每帧 token 变化都会触发 components 重建，导致 ReactMarkdown 子树全部卸载重建
+  const streamingRef = useRef(streaming)
+  const lightModeRef = useRef(lightMode)
+  streamingRef.current = streaming
+  lightModeRef.current = lightMode
+  const remarkPlugins = useMemo<PluggableList>(
+    () => (lightMode ? [remarkGfm, remarkBreaks] : [remarkGfm, remarkBreaks, remarkMath]),
+    [lightMode],
+  )
+  const rehypePlugins = useMemo<PluggableList>(
+    () =>
+      lightMode
+        ? [[rehypeSanitize, sanitizeSchema]]
+        : [
+            [rehypeKatex, { throwOnError: false }],
+            rehypeRaw,
+            [rehypeSanitize, sanitizeSchema],
+          ],
+    [lightMode],
+  )
+  // 渲染组件对象缓存：避免每次渲染都重建（headingRender 工厂 + 大量闭包），流式更新时减少子组件重挂载
+  const components = useMemo<Components>(
+    () => ({
           /** 总结/结论/注意事项等收尾标题 → 强调色卡片式标题（各 AI 输出习惯差异较大，按关键词识别） */
           h1: headingRender('h1'),
           h2: headingRender('h2'),
@@ -174,7 +223,7 @@ export default function Markdown({
               if (['text', 'plaintext', 'txt', 'tree'].includes(lang) && isTreeText(text)) {
                 return <TreeBlock code={text} />
               }
-              return <CodeBlock lang={lang} code={text} onOpenFile={onOpenFile} focusLine={focusLine} selectedLines={selectedLines} onLineClick={onLineClick} />
+              return <CodeBlock lang={lang} code={text} onOpenFile={onOpenFile} focusLine={focusLine} selectedLines={selectedLines} onLineClick={onLineClick} streaming={streamingRef.current || lightModeRef.current} />
             }
             // 无语言多行代码块：内容为目录树时也美化
             if (text.includes('\n') && isTreeText(text)) {
@@ -182,7 +231,7 @@ export default function Markdown({
             }
             // 无语言多行代码块：逐行渲染（HTML 会折叠 <code> 内的换行，导致多行内容挤成一行）
             if (text.includes('\n')) {
-              return <CodeBlock lang="plaintext" code={text} onOpenFile={onOpenFile} focusLine={focusLine} selectedLines={selectedLines} onLineClick={onLineClick} />
+              return <CodeBlock lang="plaintext" code={text} onOpenFile={onOpenFile} focusLine={focusLine} selectedLines={selectedLines} onLineClick={onLineClick} streaming={streamingRef.current || lightModeRef.current} />
             }
             return (
               <code className={className} {...props}>
@@ -222,14 +271,22 @@ export default function Markdown({
           sup({ children, ...props }) {
             return <sup {...props}>{children}</sup>
           },
-        }}
+    }),
+    [onOpenFile, focusLine, selectedLines, onLineClick],
+  )
+  return (
+    <div className={`md-body ${className}`}>
+      <ReactMarkdown
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
+        components={components}
       >
         {content}
       </ReactMarkdown>
       {lightbox && <Lightbox src={lightbox} onClose={() => setLightbox(null)} />}
     </div>
   )
-}
+})
 
 /**
  * 归一化各家 AI 的 Markdown 输出差异，使渲染更稳健美观（跳过围栏代码块/行内代码）：
@@ -237,9 +294,12 @@ export default function Markdown({
  * 2. GitHub 风格 callout（> [!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]）→ 带类名 blockquote
  * 3. 裸 URL 不做处理（react-markdown 会自动链接）；统一过多连续空行为最多两行
  * 4. 移除标题前多余的 # 后无空格情况（"#标题" → "# 标题"）
+ * 超大文本（>10000字符）跳过归一化：正则替换在大文本上开销大，且长回复通常格式已规范
  */
 export function normalizeMarkdown(md: string): string {
   if (!md) return md
+  // 超大文本跳过重处理：长日志/长回复通常格式规范，归一化成本高于收益
+  if (md.length > 10000) return md
   // 按围栏代码块切分，奇数段为代码块内部，原样保留
   const fence = md.split(/(```[\s\S]*?```)/g)
   return fence
@@ -304,8 +364,10 @@ function normalizeSegment(text: string): string {
   return out
 }
 
-/** 引用角标预处理：把 [1] / [1,2] 替换为 <sup>（跳过 ``` 代码块区域，避免误伤 URL/数字列表） */
+/** 引用角标预处理：把 [1] / [1,2] 替换为 <sup>（跳过 ``` 代码块区域，避免误伤 URL/数字列表）
+ * 超大文本跳除以避免正则扫描开销 */
 export function preprocessCitations(md: string): string {
+  if (md.length > 10000) return md
   const parts = md.split('```')
   return parts
     .map((part, i) => {
@@ -335,17 +397,27 @@ function isTreeLine(line: string): boolean {
 /**
  * 是否整体为目录树文本：至少 2 行树行，且非树行不超过 1 个（根目录名/说明行）。
  * 普通文本/表格/diff 等不含树形连接符，不会误伤。
+ * 使用缓存避免同文本多次扫描导致的性能问题
  */
 export function isTreeText(text: string): boolean {
+  const cached = treeTextCache.get(text)
+  if (cached !== undefined) return cached
   const lines = text.split('\n').filter((l) => l.trim() !== '')
-  if (lines.length < 2) return false
+  if (lines.length < 2) {
+    treeTextCache.set(text, false)
+    if (treeTextCache.size > TREE_TEXT_CACHE_MAX) treeTextCache.clear()
+    return false
+  }
   let treeRows = 0
   let nonTree = 0
   lines.forEach((l) => {
     if (isTreeLine(l)) treeRows++
     else nonTree++
   })
-  return treeRows >= 2 && nonTree <= 1
+  const result = treeRows >= 2 && nonTree <= 1
+  treeTextCache.set(text, result)
+  if (treeTextCache.size > TREE_TEXT_CACHE_MAX) treeTextCache.clear()
+  return result
 }
 
 /** 解析树行：去掉行首连接符，得到名称与是否目录 */
@@ -368,9 +440,10 @@ function pText(node: ReactNode): string {
 
 /* ============ 目录树：图标 + 目录高亮 + 折叠/复制（保留原始连线，等宽渲染） ============ */
 function TreeBlock({ code }: { code: string }) {
+  const { t } = useTranslation()
   const [copied, setCopied] = useState(false)
-  const [collapsed, setCollapsed] = useState(code.split('\n').length > COLLAPSE_THRESHOLD)
   const lines = useMemo(() => code.replace(/\n$/, '').split('\n'), [code])
+  const [collapsed, setCollapsed] = useState(() => lines.length > COLLAPSE_THRESHOLD)
   const shownLines = collapsed ? lines.slice(0, 10) : lines
 
   const copy = async () => {
@@ -388,19 +461,19 @@ function TreeBlock({ code }: { code: string }) {
       <div className="md-codeblock-head">
         <span className="md-codeblock-lang">
           <span className="md-codeblock-lang-dot" />
-          目录结构
+          {t('md.directoryStructure')}
         </span>
         <div className="flex items-center gap-0.5">
           {lines.length > COLLAPSE_THRESHOLD && (
-            <button type="button" className="md-codeblock-btn" onClick={() => setCollapsed((v) => !v)} title={collapsed ? '展开' : '折叠'}>
+            <button type="button" className="md-codeblock-btn" onClick={() => setCollapsed((v) => !v)} title={collapsed ? t('md.expand') : t('md.collapse')}>
               <Icon name="chevron-right" size={13} className={collapsed ? '' : 'rotate-90 transition-transform'} />
-              {collapsed ? `展开 (${lines.length} 行)` : '折叠'}
+              {collapsed ? t('md.expandLines', { count: lines.length }) : t('md.collapse')}
             </button>
           )}
-          <button type="button" className="md-codeblock-btn" onClick={copy} title="复制">
+          <button type="button" className="md-codeblock-btn" onClick={copy} title={t('md.copy')}>
             {copied ? (
               <span className="md-copied-ok">
-                <Icon name="check" size={13} />已复制
+                <Icon name="check" size={13} />{t('md.copied')}
               </span>
             ) : (
               <Icon name="copy" size={13} />
@@ -487,6 +560,7 @@ function CodeBlock({
   focusLine,
   selectedLines,
   onLineClick,
+  streaming,
 }: {
   lang: string
   code: string
@@ -494,9 +568,17 @@ function CodeBlock({
   focusLine?: number
   selectedLines?: [number, number]
   onLineClick?: (line: number, e: React.MouseEvent) => void
+  /** 流式渲染中：跳过 hljs 高亮，用纯文本转义（写完才高亮，避免每帧全量高亮） */
+  streaming?: boolean
 }) {
+  const { t } = useTranslation()
   const [copied, setCopied] = useState(false)
-  const lineCount = code.split('\n').length
+  const [fullscreen, setFullscreen] = useState(false)
+  // 首行路径注释识别：AI 常输出 "// src/foo.ts" / "# src/foo.py" / "<!-- src/x -->" 作为文件标识。
+  // 识别后在头部展示路径，并从代码中剥离该行，避免污染语法高亮与复制内容。
+  const { filePath, bodyCode } = useMemo(() => extractFilePath(code), [code])
+  const lines = useMemo(() => bodyCode.replace(/\n$/, '').split('\n'), [bodyCode])
+  const lineCount = lines.length
   // 指定了 focusLine 或 selectedLines 且行号在范围内时，强制展开代码块以保证目标行可见
   const inRange = (n?: number) => n != null && n >= 1 && n <= lineCount
   const [collapsed, setCollapsed] = useState(
@@ -509,19 +591,59 @@ function CodeBlock({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusLine, selectedLines])
-  const [fullscreen, setFullscreen] = useState(false)
-  // 首行路径注释识别：AI 常输出 "// src/foo.ts" / "# src/foo.py" / "<!-- src/x -->" 作为文件标识。
-  // 识别后在头部展示路径，并从代码中剥离该行，避免污染语法高亮与复制内容。
-  const { filePath, bodyCode } = useMemo(() => extractFilePath(code), [code])
-  const highlighted = useMemo(() => {
-    try {
-      const langName = hljs.getLanguage(lang) ? lang : 'plaintext'
-      return hljs.highlight(bodyCode, { language: langName, ignoreIllegals: true }).value
-    } catch {
-      return bodyCode.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  // 高亮上限：hljs.highlight 是 CPU 密集操作（虽在 idle 回调中执行，但超大代码块仍会长时间占用），
+  // 阈值根据 GPU/CPU 能力动态分级：high=6000字符/300行、medium=3000字符/200行、low=1200字符/80行
+  const highlightMaxChars = useMemo(() => getCodeHighlightLimit(detectGpu().tier), [])
+  const highlightMaxLines = useMemo(() => {
+    switch (detectGpu().tier) {
+      case 'high': return 300
+      case 'medium': return 200
+      case 'low': return 80
     }
-  }, [bodyCode, lang])
-  const lines = useMemo(() => bodyCode.replace(/\n$/, '').split('\n'), [bodyCode])
+  }, [])
+  const tooLargeForHighlight = bodyCode.length > highlightMaxChars || lines.length > highlightMaxLines
+  // 懒高亮：首帧先用纯文本转义快速挂载（避免同步 hljs 阻塞主线程导致切换会话卡顿），
+  // 挂载后用 requestIdleCallback 调度 hljs 高亮，完成后再 setState 替换为高亮 HTML。
+  // streaming / 超大代码块保持纯文本不高亮。
+  const [highlighted, setHighlighted] = useState<string>(() => escapeHtml(bodyCode))
+  useEffect(() => {
+    // streaming 或超大代码块：保持纯文本，不调度高亮
+    if (streaming || tooLargeForHighlight) {
+      setHighlighted(escapeHtml(bodyCode))
+      return
+    }
+    let cancelled = false
+    // 初始纯文本（首帧已在 useState init 中设置，这里重置以处理 bodyCode 变化场景）
+    const plain = escapeHtml(bodyCode)
+    setHighlighted(plain)
+    // requestIdleCallback 让浏览器先完成首帧绘制，再在空闲时段执行 CPU 密集的高亮；
+    // 不支持时降级为 setTimeout(0)（下一事件循环），仍能让出首帧
+    const ric: (cb: () => void) => number =
+      typeof window !== 'undefined' && 'requestIdleCallback' in window
+        ? (cb) => (window as unknown as { requestIdleCallback: (cb: () => void) => number }).requestIdleCallback(cb)
+        : (cb) => window.setTimeout(cb, 0) as unknown as number
+    const cancelRic: (id: number) => void =
+      typeof window !== 'undefined' && 'cancelIdleCallback' in window
+        ? (id) => (window as unknown as { cancelIdleCallback: (id: number) => void }).cancelIdleCallback(id)
+        : (id) => window.clearTimeout(id)
+    const id = ric(() => {
+      if (cancelled) return
+      let html: string
+      try {
+        const langName = hljs.getLanguage(lang) ? lang : 'plaintext'
+        html = hljs.highlight(bodyCode, { language: langName, ignoreIllegals: true }).value
+      } catch {
+        html = plain
+      }
+      if (!cancelled) setHighlighted(html)
+    })
+    return () => {
+      cancelled = true
+      cancelRic(id)
+    }
+  }, [bodyCode, lang, streaming, tooLargeForHighlight])
+  // 缓存高亮后按行切分的结果，避免 shownLines.map 中每行都 split('\n')
+  const highlightedLines = useMemo(() => highlighted.split('\n'), [highlighted])
   const shownLines = collapsed ? lines.slice(0, 10) : lines
   // diff 语言：按行首 + / - 标记增改行，高亮整行（绿/红底）
   const isDiff = lang === 'diff' || lang === 'patch'
@@ -551,18 +673,26 @@ function CodeBlock({
     }
   }
 
-  const download = () => {
+  const download = async () => {
     try {
-      const blob = new Blob([bodyCode], { type: 'text/plain;charset=utf-8' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
       const ext = filePath ? filePath.split(/[\\/]/).pop() ?? '' : ''
-      a.download = ext || `code.${lang === 'plaintext' ? 'txt' : lang}`
-      a.click()
-      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      const filename = ext || `code.${lang === 'plaintext' ? 'txt' : lang}`
+      // Tauri 环境：原生保存对话框 + fs 写入（WebView2 对 Blob URL + a.download 支持不稳，静默失效）
+      if ('__TAURI_INTERNALS__' in window) {
+        const dest = await dialogSave({ title: t('md.downloadCode'), defaultPath: filename })
+        if (!dest) return
+        await writeTextFile(dest, bodyCode)
+      } else {
+        const blob = new Blob([bodyCode], { type: 'text/plain;charset=utf-8' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = filename
+        a.click()
+        setTimeout(() => URL.revokeObjectURL(url), 1000)
+      }
     } catch {
-      // 下载失败静默
+      // 下载失败静默（保存对话框取消不算失败）
     }
   }
 
@@ -598,21 +728,21 @@ function CodeBlock({
       </span>
       <div className="flex items-center gap-0.5">
         {lines.length > COLLAPSE_THRESHOLD && (
-          <button type="button" className="md-codeblock-btn" onClick={() => setCollapsed((v) => !v)} title={collapsed ? '展开' : '折叠'}>
+          <button type="button" className="md-codeblock-btn" onClick={() => setCollapsed((v) => !v)} title={collapsed ? t('md.expand') : t('md.collapse')}>
             <Icon name="chevron-right" size={13} className={collapsed ? '' : 'rotate-90 transition-transform'} />
-            {collapsed ? `展开 (${lines.length} 行)` : '折叠'}
+            {collapsed ? t('md.expandLines', { count: lines.length }) : t('md.collapse')}
           </button>
         )}
-        <button type="button" className="md-codeblock-btn" onClick={download} title="下载代码">
+        <button type="button" className="md-codeblock-btn" onClick={download} title={t('md.downloadCode')}>
           <Icon name="download" size={13} />
         </button>
-        <button type="button" className="md-codeblock-btn" onClick={() => setFullscreen((v) => !v)} title={fullscreen ? '退出全屏' : '全屏'}>
+        <button type="button" className="md-codeblock-btn" onClick={() => setFullscreen((v) => !v)} title={fullscreen ? t('md.exitFullscreen') : t('md.fullscreen')}>
           <Icon name="chevron-right" size={13} className="rotate-[-45deg]" />
         </button>
-        <button type="button" className="md-codeblock-btn" onClick={copy} title="复制代码">
+        <button type="button" className="md-codeblock-btn" onClick={copy} title={t('md.copyCode')}>
           {copied ? (
             <span className="md-copied-ok">
-              <Icon name="check" size={13} />已复制
+              <Icon name="check" size={13} />{t('md.copied')}
             </span>
           ) : (
             <Icon name="copy" size={13} />
@@ -660,7 +790,7 @@ function CodeBlock({
             <span
               className="md-code-line-content"
               dangerouslySetInnerHTML={{
-                __html: i === shownLines.length - 1 && line === '' ? '<br/>' : line === '' ? ' ' : highlighted.split('\n')[i] ?? '',
+                __html: i === shownLines.length - 1 && line === '' ? '<br/>' : line === '' ? ' ' : highlightedLines[i] ?? '',
               }}
             />
           </div>
@@ -683,7 +813,7 @@ function CodeBlock({
   }
 
   return (
-    <div className="md-codeblock">
+    <div className={`md-codeblock${streaming ? ' codeblock-streaming' : ''}`}>
       {toolbar()}
       {body}
       {collapsed && lines.length > 10 && (
@@ -701,7 +831,7 @@ let mermaidSeq = 0
 const MINIMAP_W = 160
 
 function MermaidBlock({ code }: { code: string }) {
-  const theme = useThemeStore((s) => s.theme)
+  const theme = useThemeStore((s) => s.resolved)
   const [svg, setSvg] = useState('')
   const [error, setError] = useState<string | null>(null)
   const idRef = useRef(`md-mermaid-${++mermaidSeq}-${Math.random().toString(36).slice(2)}`)

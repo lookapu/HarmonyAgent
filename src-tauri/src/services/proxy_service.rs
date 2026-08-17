@@ -206,6 +206,13 @@ async fn handle_request(
 
     let start = std::time::Instant::now();
 
+    // [69] 工具维度 token 统计：调用方（直连请求方）可在请求头带 x-deveco-tool 标注当前工具名
+    let tool_name = req
+        .headers()
+        .get("x-deveco-tool")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
     let (_parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -279,6 +286,7 @@ async fn handle_request(
             status_code.as_u16() as i32,
             provider.cost_multiplier,
             is_streaming,
+            tool_name.as_deref(),
         );
     }
 
@@ -357,6 +365,7 @@ fn log_request(
     status_code: i32,
     cost_multiplier: f64,
     is_streaming: bool,
+    tool_name: Option<&str>,
 ) {
     let conn = match state.db.lock() {
         Ok(c) => c,
@@ -377,12 +386,12 @@ fn log_request(
     let _ = conn.execute(
         "INSERT INTO request_logs (id, provider_id, model, input_tokens, output_tokens,
             cache_read_tokens, cache_creation_tokens, total_cost_cny, latency_ms,
-            status_code, is_streaming, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            status_code, is_streaming, created_at, tool_name)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         rusqlite::params![
             id, provider_id, model, usage.input_tokens, usage.output_tokens,
             usage.cache_read_tokens, usage.cache_creation_tokens, total_cost,
-            latency_ms, status_code, is_streaming as i32, now
+            latency_ms, status_code, is_streaming as i32, now, tool_name
         ],
     );
 

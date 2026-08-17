@@ -1,6 +1,6 @@
 /* eslint-disable no-control-regex */
 // ANSI 转义序列解析是本文件核心功能，正则中控制字符（\x1b）为功能必需
-import { Fragment, type ReactNode } from 'react'
+import { Fragment, memo, type ReactNode } from 'react'
 
 /**
  * 轻量 ANSI SGR 转 React 节点：
@@ -148,8 +148,9 @@ export function hasAnsi(text: string): boolean {
 /**
  * 将带 ANSI 转义码的字符串渲染为带样式的 React 节点。
  * 非 ANSI 的控制序列（光标移动/清屏等）直接剥离。
+ * memo：工具输出逐行追加时父组件高频重渲染，文本未变则跳过重新解析（大段输出解析成本可观）
  */
-export function AnsiText({ text, className }: { text: string; className?: string }): ReactNode {
+export const AnsiText = memo(function AnsiText({ text, className }: { text: string; className?: string }): ReactNode {
   // 先剥离非 SGR 的 CSI 序列
   const cleaned = text.replace(CSI_STRIP_RE, '')
   const parts: ReactNode[] = []
@@ -173,7 +174,7 @@ export function AnsiText({ text, className }: { text: string; className?: string
     parts.push(run(cleaned.slice(last), style, key))
   }
   return <span className={className}>{parts.length === 0 ? text : parts}</span>
-}
+})
 
 function run(text: string, style: Style, key: number): ReactNode {
   if (!text) return null

@@ -9,7 +9,42 @@ import {
   switchGitBranch,
   listProjectDir,
   listConversations,
+  buildProjectIndex,
+  conversationRoot,
 } from '../../api/project'
+import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
+
+/** localStorage key：持久化最近选中的项目/会话 */
+const LS_LAST_PROJECT = 'deveco-switch:last-project-id'
+const LS_LAST_CONV_PREFIX = 'deveco-switch:last-conv:'
+
+/** 记住项目/会话选择（下次打开时恢复） */
+function persistLastProject(projectId: string, convId?: string) {
+  try {
+    localStorage.setItem(LS_LAST_PROJECT, projectId)
+    if (convId) localStorage.setItem(LS_LAST_CONV_PREFIX + projectId, convId)
+  } catch {
+    /* 无痕模式等环境下 localStorage 可能不可用，静默失败 */
+  }
+}
+
+/** 获取上次项目 ID；不存在返回 null */
+export function getLastProjectId(): string | null {
+  try {
+    return localStorage.getItem(LS_LAST_PROJECT)
+  } catch {
+    return null
+  }
+}
+
+/** 获取项目上次打开的会话 ID */
+export function getLastConversationId(projectId: string): string | null {
+  try {
+    return localStorage.getItem(LS_LAST_CONV_PREFIX + projectId)
+  } catch {
+    return null
+  }
+}
 
 /** 项目/文件树/分支切片实现 */
 export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice> = (set, get) => ({
@@ -33,19 +68,82 @@ export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice
   },
 
   openProject: async (id) => {
+    const trace = startPerfTrace('openProject', { projectId: id.slice(0, 8) })
     const { projects } = get()
     const project = projects.find((p) => p.id === id)
-    if (!project) return
-    set({ currentProject: project, currentConversation: null, messages: [] })
-    const conversations = await listConversations(id)
-    set({ conversations })
-    if (conversations.length > 0) {
-      await get().openConversation(conversations[0].id)
+    if (!project) {
+      trace.end()
+      return
     }
-    await get().refreshGitBranches()
-    await get().loadFileTree()
-    await get().loadMemories()
-    await get().loadToolStats()
+
+    // 只清空项目相关的侧边栏/运行态数据；
+    // messages / conversations / currentConversation 保持旧值，
+    // 等新会话消息加载完成后一次性替换（ChatGPT 风格无缝切换，避免清空闪烁）。
+    // openConversation 内部也是同样策略：不清空 messages 直到新消息落地。
+    set({
+      currentProject: project,
+      gitBranches: null,
+      fileTree: null,
+      dirCache: {},
+      memories: [],
+      toolStats: [],
+      toolRuns: [],
+      agentRuns: [],
+      plan: null,
+      pendingPlan: null,
+      toolApprovals: [],
+      pendingConfirmations: {},
+      approvedPlan: null,
+      unfinishedConv: null,
+      todos: [],
+      askCard: null,
+      diagnoseCards: [],
+      buildLogs: [],
+      terminalEntries: [],
+      lastTaskSummary: null,
+      // feedbackMap/versionMap/tokenStats 延迟到新消息 set 时一并清空，合并为一次渲染
+    })
+    trace.mark('project-set')
+
+    // 持久化当前项目选择
+    persistLastProject(id)
+
+    // 1. 加载会话列表
+    const conversations = await listConversations(id)
+    trace.mark('convs-loaded')
+    set({ conversations })
+    trace.markAfterPaint('convs-painted')
+
+    // 1.5 加载各会话待确认项（审批/计划/提问）→ 会话列表角标 + 切回会话恢复
+    void get().refreshPendingConfirmations().catch(() => {})
+
+    // 2. 打开最近会话（优先恢复上次选中的，否则第一个）
+    //    openConversation 内部会等待 React commit + paint 后才 resolve，
+    //    所以这里 await 返回时，用户已经能看到新会话的消息列表
+    const lastConvId = getLastConversationId(id)
+    const targetConv =
+      (lastConvId && conversations.find((c) => c.id === lastConvId)) || conversations[0]
+    if (targetConv) {
+      await get().openConversation(targetConv.id)
+      persistLastProject(id, targetConv.id)
+      trace.mark('conv-painted')
+    } else {
+      trace.mark('no-conv')
+    }
+
+    // 3. 侧边栏数据（Git/文件树/记忆/工具统计）全部并行加载，不阻塞聊天视图
+    //    这些数据只影响左右侧边栏，聊天内容已经可以交互
+    const sidebarTasks = Promise.all([
+      get().refreshGitBranches().catch(() => {}),
+      get().loadFileTree().catch(() => {}),
+      get().loadMemories().catch(() => {}),
+      get().loadToolStats().catch(() => {}),
+    ])
+    sidebarTasks.then(() => trace.mark('sidebar-loaded')).catch(() => {})
+
+    // 4. 等待一帧确保所有状态更新都已渲染，然后结束追踪
+    await waitForNextPaint()
+    trace.end()
   },
 
   loadFileTree: async () => {
@@ -55,19 +153,32 @@ export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice
       return
     }
     set({ indexBuilding: true })
+    const t = startPerfTrace('loadFileTree', { pid: project.id.slice(0, 8) })
+    // 会话工作目录：worktree 会话用 worktree_path，否则回退项目主路径
+    const root = conversationRoot(get().currentConversation)
+    const basePath = root ?? project.path
     try {
       // 懒加载：只读根目录一层，展开时逐级按需请求（无全量索引，不截断）
-      const children = await listProjectDir(project.id, '')
-      const name = project.path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || project.name
+      const children = await listProjectDir(project.id, '', root)
+      t.mark('root-listed')
+      const name = basePath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || project.name
       set({
         fileTree: { name, path: '', type: 'dir', children },
         dirCache: { '': children },
         indexBuilding: false,
         currentProject: { ...project, index_state: 'ready' },
       })
-      get().refreshProjects().catch(() => {})
+      t.mark('state-set')
+      // 后台构建全量索引：真正更新 DB 的 index_state（pending→ready）并写入文件树缓存，
+      // 完成后刷新项目状态，让右侧栏"工程概览"的索引状态显示真实结果；失败不影响懒加载文件树
+      buildProjectIndex(project.id, root)
+        .then(() => get().refreshProjects().catch(() => {}))
+        .catch(() => {})
+      t.end()
     } catch {
       set({ fileTree: null, indexBuilding: false, dirCache: {} })
+      t.mark('error')
+      t.end()
     }
   },
 
@@ -76,7 +187,8 @@ export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice
     if (!project?.path) return []
     const cache = get().dirCache
     if (cache[path]) return cache[path]
-    const children = await listProjectDir(project.id, path)
+    const root = conversationRoot(get().currentConversation)
+    const children = await listProjectDir(project.id, path, root)
     set({ dirCache: { ...cache, [path]: children } })
     return children
   },
@@ -144,5 +256,6 @@ export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice
       memories: [],
       toolStats: [],
       plan: null,
+      streamings: {},
     }),
 })

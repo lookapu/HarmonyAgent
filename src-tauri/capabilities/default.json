@@ -4,11 +4,14 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-set-theme",
     "shell:allow-execute",
     "shell:allow-open",
     "fs:default",
     "fs:allow-read",
+    "fs:allow-read-text-file",
     "fs:allow-write",
+    "fs:allow-write-text-file",
     "fs:allow-exists",
     "fs:allow-watch",
     {

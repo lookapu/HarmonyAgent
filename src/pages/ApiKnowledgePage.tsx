@@ -344,7 +344,7 @@ export default function ApiKnowledgePage() {
 
       {/* Semantic index */}
       {embedStatus && (
-        <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-3">
+        <div className="modern-card rounded-xl p-3">
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <div className="flex items-center gap-2.5 flex-wrap min-w-0">
               <span className="text-[11px] text-[var(--text-muted)]">🧠 {t('apiKb.embedTitle')}</span>
@@ -401,7 +401,7 @@ export default function ApiKnowledgePage() {
 
       {/* Version distribution */}
       {stats && stats.versions.length > 0 && (
-        <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-3">
+        <div className="modern-card rounded-xl p-3">
           <div className="text-[11px] text-[var(--text-muted)] mb-2">{t('apiKb.versionDist')}</div>
           <div className="flex flex-wrap gap-2">
             {stats.versions.map((v) => (
@@ -410,7 +410,7 @@ export default function ApiKnowledgePage() {
                 onClick={() => { setTab('docs'); setVersion(version === v.version_label ? '' : v.version_label); setPage(1) }}
                 className={`px-2.5 py-1 rounded-lg border text-[11px] transition-colors ${
                   version === v.version_label
-                    ? 'bg-[var(--accent)] text-white border-[var(--accent)]'
+                    ? 'tab-active border-[var(--accent)]'
                     : 'bg-[var(--bg-card)] text-[var(--text-secondary)] border-[var(--border)] hover:border-[var(--accent)]/40'
                 }`}
                 title={`API ${v.api_level ?? '-'} · +${v.added} -${v.removed} ~${v.modified}`}
@@ -449,11 +449,11 @@ export default function ApiKnowledgePage() {
       )}
 
       {/* Tabs */}
-      <div className="inline-flex bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-0.5 text-[12px]">
+      <div className="inline-flex modern-card rounded-lg p-0.5 text-[12px]">
         <button
           onClick={() => setTab('docs')}
           className={`px-4 h-8 rounded-md transition-colors ${
-            tab === 'docs' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            tab === 'docs' ? 'tab-active' : 'tab-inactive'
           }`}
         >
           {t('apiKb.tabDocs')} ({stats?.docs_total ?? 0})
@@ -461,7 +461,7 @@ export default function ApiKnowledgePage() {
         <button
           onClick={() => setTab('details')}
           className={`px-4 h-8 rounded-md transition-colors ${
-            tab === 'details' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            tab === 'details' ? 'tab-active' : 'tab-inactive'
           }`}
         >
           {t('apiKb.tabDetails')} ({stats?.details_total ?? 0})
@@ -469,7 +469,7 @@ export default function ApiKnowledgePage() {
       </div>
 
       {/* Filters */}
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-3 space-y-3">
+      <div className="modern-card rounded-xl p-3 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex-1 min-w-[200px] flex items-center gap-1">
             <input
@@ -477,11 +477,11 @@ export default function ApiKnowledgePage() {
               onChange={(e) => setSearchInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
               placeholder={tab === 'docs' ? t('apiKb.searchDocsPlaceholder') : t('apiKb.searchDetailsPlaceholder')}
-              className="flex-1 h-8 px-3 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              className="flex-1 h-8 px-3 modern-card rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
             />
             <button
               onClick={handleSearch}
-              className="h-8 px-3 rounded-lg bg-[var(--accent)] text-white text-[12px] hover:bg-[var(--accent-hover)] transition-colors"
+              className="h-8 px-3 rounded-lg btn-primary text-[12px]  transition-colors"
             >
               {t('apiKb.search')}
             </button>
@@ -490,7 +490,7 @@ export default function ApiKnowledgePage() {
           <select
             value={kit}
             onChange={(e) => setKit(e.target.value)}
-            className="h-8 px-2 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+            className="h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
           >
             <option value="">{t('apiKb.allKits')}</option>
             {kits.map((k) => <option key={k} value={k}>{k}</option>)}
@@ -501,7 +501,7 @@ export default function ApiKnowledgePage() {
               <select
                 value={version}
                 onChange={(e) => setVersion(e.target.value)}
-                className="h-8 px-2 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                className="h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
               >
                 <option value="">{t('apiKb.allVersions')}</option>
                 {filters?.versions.map((v) => <option key={v} value={v}>{v}</option>)}
@@ -509,7 +509,7 @@ export default function ApiKnowledgePage() {
               <select
                 value={changeType}
                 onChange={(e) => setChangeType(e.target.value)}
-                className="h-8 px-2 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                className="h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
               >
                 <option value="">{t('apiKb.allChangeTypes')}</option>
                 <option value="added">{t('apiKb.ctAdded')}</option>
@@ -521,7 +521,7 @@ export default function ApiKnowledgePage() {
                 value={apiLevel}
                 onChange={(e) => setApiLevel(e.target.value.replace(/\D/g, ''))}
                 placeholder={t('apiKb.apiLevel')}
-                className="w-20 h-8 px-2 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-20 h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </>
           )}
@@ -542,7 +542,7 @@ export default function ApiKnowledgePage() {
             value={moduleFilter}
             onChange={(e) => setModuleFilter(e.target.value)}
             placeholder={t('apiKb.moduleFilter')}
-            className="w-36 h-8 px-2 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+            className="w-36 h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
           />
 
           <button
@@ -567,7 +567,7 @@ export default function ApiKnowledgePage() {
           {tab === 'docs' && (
             <button
               onClick={() => setShowDocForm(true)}
-              className="h-8 px-3 rounded-lg bg-[var(--accent)] text-white text-[12px] hover:bg-[var(--accent-hover)] transition-colors"
+              className="h-8 px-3 rounded-lg btn-primary text-[12px]  transition-colors"
             >
               + {t('apiKb.addDoc')}
             </button>
@@ -575,7 +575,7 @@ export default function ApiKnowledgePage() {
           {tab === 'details' && (
             <button
               onClick={() => { setEditingDetail(null); setShowDetailForm(true) }}
-              className="h-8 px-3 rounded-lg bg-[var(--accent)] text-white text-[12px] hover:bg-[var(--accent-hover)] transition-colors"
+              className="h-8 px-3 rounded-lg btn-primary text-[12px]  transition-colors"
             >
               + {t('apiKb.addDetail')}
             </button>
@@ -583,7 +583,7 @@ export default function ApiKnowledgePage() {
           <select
             value={pageSize}
             onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1) }}
-            className="h-8 px-2 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+            className="h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
           >
             {PAGE_SIZE_OPTIONS.map((n) => <option key={n} value={n}>{n}/page</option>)}
           </select>
@@ -591,7 +591,7 @@ export default function ApiKnowledgePage() {
       </div>
 
       {/* Table */}
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg overflow-hidden">
+      <div className="modern-card rounded-lg overflow-hidden">
         {loading && !hasData ? (
           <div className="p-8 text-center text-sm text-[var(--text-secondary)]">{t('apiKb.loading')}</div>
         ) : (
@@ -697,7 +697,7 @@ export default function ApiKnowledgePage() {
 
 function StatCard({ label, value, small }: { label: string; value: string; small?: boolean }) {
   return (
-    <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl px-3 py-2.5">
+    <div className="modern-card rounded-xl px-3 py-2.5">
       <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide">{label}</div>
       <div className={`mt-1 font-semibold text-[var(--text-primary)] ${small ? 'text-[11px]' : 'text-[18px]'} truncate`} title={value}>
         {value}
@@ -714,7 +714,7 @@ function DocsTable({ items, onDelete }: { items: ApiEntry[]; onDelete: (e: ApiEn
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-[12px]">
-        <thead className="bg-[var(--bg-card)] border-b border-[var(--border)]">
+        <thead className="modern-card-b border-[var(--border)]">
           <tr className="text-left text-[var(--text-muted)]">
             <th className="px-3 py-2 font-medium whitespace-nowrap">{t('apiKb.colKit')}</th>
             <th className="px-3 py-2 font-medium whitespace-nowrap">{t('apiKb.colModule')}</th>
@@ -778,7 +778,7 @@ function DetailsTable({
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-[12px]">
-        <thead className="bg-[var(--bg-card)] border-b border-[var(--border)]">
+        <thead className="modern-card-b border-[var(--border)]">
           <tr className="text-left text-[var(--text-muted)]">
             <th className="px-3 py-2 font-medium whitespace-nowrap">{t('apiKb.colModule')}</th>
             <th className="px-3 py-2 font-medium whitespace-nowrap">{t('apiKb.colTitle')}</th>
@@ -881,7 +881,7 @@ function DetailDrawer({
 
             {detail.import_snippet && (
               <Section title={t('apiKb.importSnippet')}>
-                <pre className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap">
+                <pre className="modern-card rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap">
                   {detail.import_snippet}
                 </pre>
               </Section>
@@ -889,14 +889,14 @@ function DetailDrawer({
 
             {detail.permissions && (
               <Section title={t('apiKb.permissions')}>
-                <pre className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap">
+                <pre className="modern-card rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap">
                   {detail.permissions}
                 </pre>
               </Section>
             )}
 
             <Section title={t('apiKb.body')}>
-              <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3 text-[12px] text-[var(--text-primary)] whitespace-pre-wrap leading-relaxed max-h-96 overflow-y-auto">
+              <div className="modern-card rounded-lg p-3 text-[12px] text-[var(--text-primary)] whitespace-pre-wrap leading-relaxed max-h-96 overflow-y-auto">
                 {detail.body}
               </div>
             </Section>
@@ -905,7 +905,7 @@ function DetailDrawer({
               <Section title={t('apiKb.members', { n: detail.members.length })}>
                 <div className="space-y-1.5">
                   {detail.members.map((m, i) => (
-                    <div key={i} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-2.5">
+                    <div key={i} className="modern-card rounded-lg p-2.5">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="px-1.5 py-0.5 rounded bg-[var(--bg-secondary)] text-[var(--text-muted)] text-[9px] border border-[var(--border)]">
                           {m.kind}
@@ -942,7 +942,7 @@ function DetailDrawer({
 
             {detail.examples && (
               <Section title={t('apiKb.examples')}>
-                <pre className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap max-h-96 overflow-y-auto">
+                <pre className="modern-card rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap max-h-96 overflow-y-auto">
                   {detail.examples}
                 </pre>
               </Section>
@@ -1182,7 +1182,7 @@ function DetailFormModal({
   )
 }
 
-const inputCls = "w-full h-9 px-3 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+const inputCls = "w-full h-9 px-3 modern-card rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
 
 function Field({ label, required, children }: { label: string; required?: boolean; children: React.ReactNode }) {
   return (
@@ -1225,10 +1225,17 @@ function ModalActions({ onClose, onSave, saving, saveLabel }: { onClose: () => v
       <button
         onClick={onSave}
         disabled={saving}
-        className="h-9 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px] hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+        className="h-9 px-4 rounded-lg btn-primary text-[12px]  disabled:opacity-50 transition-colors"
       >
         {saving ? '...' : saveLabel}
       </button>
     </div>
   )
 }
+
+
+
+
+
+
+

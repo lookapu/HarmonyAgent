@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use commands::proxy::{ProxyLock, ProxyState};
 use commands::chat::{ChatCancel, ChatLock, ToolApprovalState};
+use commands::lan::LanServerState;
 use services::proxy_service::{ProxyConfig, ProxyServer};
 
 /// 随应用启动自动开启本地代理（proxy_config.enabled = 1 时）
@@ -82,6 +83,33 @@ fn auto_start_proxy(app: &tauri::AppHandle, db_path: &std::path::Path) {
     });
 }
 
+/// 随应用启动自动开启局域网访问服务（lan_config.enabled = 1 时）
+fn auto_start_lan(app: &tauri::AppHandle, db_path: &std::path::Path) {
+    // 读取自动启动开关
+    let enabled = match rusqlite::Connection::open(db_path) {
+        Ok(conn) => conn
+            .query_row("SELECT enabled FROM lan_config WHERE id = 1", [], |row| {
+                row.get::<_, i32>(0)
+            })
+            .unwrap_or(0)
+            != 0,
+        Err(_) => false,
+    };
+    if !enabled {
+        return;
+    }
+
+    let app2 = app.clone();
+    tauri::async_runtime::block_on(async move {
+        let db = app2.state::<crate::db::DbState>();
+        let state = app2.state::<LanServerState>();
+        // clone 传入所有权参数，State 借用 app2 不受影响
+        if let Err(e) = commands::lan::start_lan_server(app2.clone(), db, state).await {
+            eprintln!("[lan] auto-start failed: {}", e);
+        }
+    });
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -147,9 +175,16 @@ pub fn run() {
             );
 
             let pool = db::init(&db_path).expect("failed to initialize database");
+            let pool_arc = std::sync::Arc::new(pool);
+
+            // 注册全局 DB 单例（todo 持久化等无 State 上下文的模块使用同一连接）
+            db::register_global(std::sync::Arc::clone(&pool_arc));
+
+            // Agent 护栏参数动态配置：从 settings 表加载用户设置（无配置时用默认值）
+            services::agent_limits::init_from_db();
 
             // 启动时数据维护：按保留策略滚动清理日志/成本明细（不阻塞启动）
-            if let Ok(conn) = pool.lock() {
+            if let Ok(conn) = pool_arc.lock() {
                 services::maintenance::run_startup_maintenance(&conn);
             }
 
@@ -161,6 +196,22 @@ pub fn run() {
                 app_handle.path().resource_dir().ok(),
             );
 
+            // ohpm 三方库推荐缓存：超过 7 天未更新时启动后后台静默刷新
+            // （一次 GET 全量替换，秒级；失败静默，不影响启动）
+            {
+                let db_arc = std::sync::Arc::clone(&pool_arc);
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    let need = {
+                        let Ok(conn) = db_arc.lock() else { return };
+                        services::ohpm_landscape::needs_refresh(&conn, 7)
+                    };
+                    if need {
+                        let _ = services::ohpm_landscape::refresh(&db_arc).await;
+                    }
+                });
+            }
+
             // 注入资源目录给 embedding 模块（打包后语义模型在 resource_dir/embedding/…）
             #[cfg(feature = "embedding")]
             services::embedding::set_resource_dir(
@@ -170,7 +221,7 @@ pub fn run() {
             // 确保全局项目存在（未添加任何项目时的默认工作区）；
             // 默认工作目录：用户主目录下的 DevecoSwitch 子目录（启动时自动创建），
             // 仅在 path 为空时写入，不覆盖用户后续自定义的路径
-            if let Ok(conn) = pool.lock() {
+            if let Ok(conn) = pool_arc.lock() {
                 conn.execute(
                     "INSERT OR IGNORE INTO projects
                         (id, name, path, kind, trusted, index_state, created_at, last_opened_at)
@@ -193,9 +244,12 @@ pub fn run() {
                 }
             }
 
-            app.manage(db::DbState(std::sync::Arc::new(pool)));
+            app.manage(db::DbState(pool_arc));
 
             app.manage(ProxyState(tokio::sync::Mutex::new(ProxyServer::new())));
+            app.manage(LanServerState(tokio::sync::Mutex::new(
+                services::lan_server::LanServer::new(),
+            )));
             app.manage(ChatLock::default());
             app.manage(ChatCancel::default());
             app.manage(ToolApprovalState::default());
@@ -259,9 +313,13 @@ pub fn run() {
             // 配置了自动启动时，随应用启动本地代理（端口被占用会自动顺延）
             auto_start_proxy(&app_handle, &db_path);
 
+            // 配置了自动启动时，随应用启动局域网访问服务（enabled=1）
+            auto_start_lan(&app_handle, &db_path);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::command_palette::list_palette_commands,
             commands::project::list_projects,
             commands::project::add_project,
             commands::project::scan_workspace_modules,
@@ -274,10 +332,16 @@ pub fn run() {
             commands::project::delete_project,
             commands::project::project_scoped_counts,
             commands::project::list_conversations,
+            commands::project::get_conversation,
             commands::project::create_conversation,
+            commands::project::fork_conversation,
             commands::project::update_conversation,
+            commands::project::list_conversations_by_tag,
+            commands::project::list_conversation_tags,
             commands::project::list_messages,
+            commands::project::list_messages_page,
             commands::project::search_messages,
+            commands::project::search_messages_all_projects,
             commands::project::send_message,
             commands::chat::stream_chat,
             commands::chat::stop_chat,
@@ -295,6 +359,7 @@ pub fn run() {
             commands::chat::resolve_ask_user,
             commands::chat::get_todos,
             commands::chat::get_ask,
+            commands::chat::list_pending_confirmations,
             commands::chat::rename_conversation,
             commands::chat::compact_conversation,
             commands::chat::conversation_context,
@@ -322,13 +387,22 @@ pub fn run() {
             commands::git::git_diff_stat,
             commands::preview::open_preview_window,
             commands::terminal::open_terminal,
+            commands::terminal::terminal_exec,
+            commands::terminal::terminal_kill,
+            commands::terminal::terminal_status,
             commands::rules::get_global_rules,
             commands::rules::set_global_rules,
             commands::rules::update_project_rules,
+            commands::limits::get_agent_limits,
+            commands::limits::set_agent_limits,
+            commands::limits::reset_agent_limits,
             commands::index::build_project_index,
             commands::index::get_project_file_tree,
             commands::index::list_project_dir,
+            commands::index::search_project_files,
             commands::index::read_project_file,
+            commands::index::save_project_file,
+            commands::index::delete_project_file,
             commands::index::index_project_symbols,
             commands::index::refresh_project_symbols,
             commands::index::project_outline,
@@ -346,6 +420,9 @@ pub fn run() {
             commands::provider::update_model,
             commands::provider::add_model,
             commands::provider::remove_model,
+            commands::provider::reorder_provider_models,
+            commands::provider::reorder_providers,
+            commands::provider::sync_provider_models,
             commands::version::get_current_version,
             commands::version::list_available_versions,
             commands::version::install_version,
@@ -358,6 +435,8 @@ pub fn run() {
             commands::cost::get_daily_usage,
             commands::cost::get_task_stats,
             commands::cost::get_task_runs,
+            commands::cost::get_budget_status,
+            commands::cost::get_all_budget_status,
             commands::devices::list_devices,
             commands::devices::set_default_device,
             commands::devices::get_device_detail,
@@ -365,6 +444,8 @@ pub fn run() {
             commands::devices::start_hdc_service,
             commands::devices::stop_hdc_service,
             commands::devices::capture_device_screenshot,
+            commands::devices::list_device_screenshots,
+            commands::devices::delete_device_screenshot,
             commands::devices::list_installed_apps,
             commands::devices::launch_app,
             commands::devices::stop_app,
@@ -383,11 +464,14 @@ pub fn run() {
             commands::mcp::export_mcp_config,
             commands::mcp::import_mcp_config,
             commands::mcp::fetch_mcp_from_url,
+            commands::mcp::list_mcp_usage_stats,
             commands::skill::list_skills,
             commands::skill::import_skill_from_github,
             commands::skill::toggle_skill,
             commands::skill::remove_skill,
             commands::skill::clone_skill,
+            commands::skill::list_skill_usage,
+            commands::skill::list_skill_usage_events,
             commands::knowledge::list_knowledge,
             commands::knowledge::add_knowledge,
             commands::knowledge::update_knowledge,
@@ -410,11 +494,23 @@ pub fn run() {
             commands::api_knowledge::api_kb_refresh_details,
             commands::api_knowledge::api_kb_embed_status,
             commands::api_knowledge::api_kb_embed_index,
+            // ohpm 三方库推荐缓存（官方 landscape 镜像）
+            commands::ohpm_landscape::ohpm_landscape_status,
+            commands::ohpm_landscape::ohpm_landscape_refresh,
+            commands::ohpm_landscape::ohpm_landscape_search,
+            commands::ohpm_landscape::ohpm_landscape_hot,
+            commands::ohpm_landscape::ohpm_landscape_by_category,
+            commands::ohpm_landscape::ohpm_landscape_count,
+            commands::ohpm_landscape::ohpm_landscape_categories,
+            commands::ohpm_landscape::ohpm_landscape_repo_url,
             commands::memory::list_memories,
             commands::memory::save_memory,
             commands::memory::delete_memory,
             commands::memory::set_memory_enabled,
             commands::memory::list_tool_stats,
+            commands::memory::list_tool_token_stats,
+            commands::tools::list_tool_groups,
+            commands::tools::tools_health,
             commands::maintenance::clear_content_data,
             commands::maintenance::run_maintenance,
             commands::maintenance::data_scale,
@@ -442,6 +538,15 @@ pub fn run() {
             commands::proxy::get_proxy_status,
             commands::proxy::get_proxy_config,
             commands::proxy::update_proxy_config,
+            // 局域网访问（LAN Access）
+            commands::lan::start_lan_server,
+            commands::lan::stop_lan_server,
+            commands::lan::get_lan_server_status,
+            commands::lan::update_lan_server_config,
+            commands::lan::create_lan_token,
+            commands::lan::list_lan_tokens,
+            commands::lan::revoke_lan_token,
+            commands::lan::get_lan_ips,
             commands::update::begin_update_proxy,
             commands::update::end_update_proxy,
             commands::update::get_system_proxy,
@@ -484,6 +589,11 @@ pub fn run() {
                         return;
                     }
                     if let Some(state) = handle.try_state::<ProxyState>() {
+                        let mut server = state.0.lock().await;
+                        let _ = server.stop().await;
+                    }
+                    // 停止局域网访问服务（多开时仅锁持有者启动过；与代理同分支）
+                    if let Some(state) = handle.try_state::<commands::lan::LanServerState>() {
                         let mut server = state.0.lock().await;
                         let _ = server.stop().await;
                     }

@@ -261,7 +261,20 @@ pub async fn git_worktree_list(project_path: String) -> Result<Vec<WorktreeInfo>
     Ok(list)
 }
 
-/// 创建 worktree：目录放在项目同级 `<项目名>-<分支名>`。
+/// 把分支名清洗成安全的目录段：路径分隔符与 Windows 非法字符统一替换为 '-'，
+/// 避免 `feature/foo` 这类分支名被当成嵌套路径，导致 worktree 目录错乱。
+fn sanitize_dir_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let ok = !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            && !c.is_control();
+        out.push(if ok { c } else { '-' });
+    }
+    let trimmed = out.trim_matches(|c: char| c == '-' || c == ' ');
+    if trimmed.is_empty() { "branch".to_string() } else { trimmed.to_string() }
+}
+
+/// 创建 worktree：目录放在项目同级 `<项目名>-<分支名>`（分支名经清洗，`/` 等替换为 `-`）。
 /// branch 为已有分支名（或起始点）；new_branch 提供时用 -b 从 branch 新建分支。
 /// 返回新 worktree 的绝对路径。
 #[tauri::command]
@@ -279,10 +292,11 @@ pub async fn git_worktree_create(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".into());
+    let dir_branch = sanitize_dir_segment(&branch);
     let wt_dir = project
         .parent()
         .unwrap_or(project)
-        .join(format!("{name}-{branch}"));
+        .join(format!("{name}-{dir_branch}"));
     if wt_dir.exists() {
         return Err(format!("worktree 目录已存在：{}", wt_dir.display()));
     }
@@ -429,7 +443,7 @@ pub async fn rollback_conversation(
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         let row = conn
             .query_row(
-                "SELECT p.path, p.worktree_path FROM conversations c JOIN projects p ON p.id = c.project_id
+                "SELECT p.path, c.worktree_path FROM conversations c JOIN projects p ON p.id = c.project_id
                  WHERE c.id = ?1",
                 [&conversation_id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),

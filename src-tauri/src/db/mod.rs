@@ -4,10 +4,23 @@ pub mod queries;
 
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 应用全局数据库状态：Arc 允许后台线程（如向量索引重建）短暂持锁分批读写。
 pub struct DbState(pub Arc<Mutex<Connection>>);
+
+/// 全局 DB 单例：供无 tauri State 上下文的模块（todo 持久化、诊断缓存等）访问同一连接。
+/// 由 lib.rs 在启动时经 register_global 注册；未注册时返回 None（如 full_fetch 工具进程）。
+static GLOBAL_DB: OnceLock<Arc<Mutex<Connection>>> = OnceLock::new();
+
+pub fn register_global(conn: Arc<Mutex<Connection>>) {
+    let _ = GLOBAL_DB.set(conn);
+}
+
+/// 获取全局 DB 连接（Arc 克隆，锁语义与 tauri 托管 DbState 一致）。
+pub fn global() -> Option<Arc<Mutex<Connection>>> {
+    GLOBAL_DB.get().cloned()
+}
 
 pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     let conn = Connection::open(path)?;
@@ -15,6 +28,59 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     run_migrations(&conn)?;
     Ok(Mutex::new(conn))
 }
+
+/// 全部迁移清单（id, 名称, SQL）。启动迁移与 db_migrate 工具共用同一清单。
+pub static MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "001_initial", include_str!("../../migrations/001_initial.sql")),
+    (2, "002_request_logs", include_str!("../../migrations/002_request_logs.sql")),
+    (3, "003_mcp_skills", include_str!("../../migrations/003_mcp_skills.sql")),
+    (4, "004_agent", include_str!("../../migrations/004_agent.sql")),
+    (5, "005_provider_proxy", include_str!("../../migrations/005_provider_proxy.sql")),
+    (6, "006_conversation_skills", include_str!("../../migrations/006_conversation_skills.sql")),
+    (7, "007_model_enabled", include_str!("../../migrations/007_model_enabled.sql")),
+    (8, "008_project_memories", include_str!("../../migrations/008_project_memories.sql")),
+    (9, "009_provider_endpoints", include_str!("../../migrations/009_provider_endpoints.sql")),
+    (10, "010_task_runs", include_str!("../../migrations/010_task_runs.sql")),
+    (11, "011_proxy_auto_start", include_str!("../../migrations/011_proxy_auto_start.sql")),
+    (12, "012_message_feedback_versions", include_str!("../../migrations/012_message_feedback_versions.sql")),
+    (13, "013_message_queue", include_str!("../../migrations/013_message_queue.sql")),
+    (14, "014_conversation_summary", include_str!("../../migrations/014_conversation_summary.sql")),
+    (15, "015_message_modified_files", include_str!("../../migrations/015_message_modified_files.sql")),
+    (16, "016_project_worktree", include_str!("../../migrations/016_project_worktree.sql")),
+    (17, "017_mcp_server_health", include_str!("../../migrations/017_mcp_server_health.sql")),
+    (18, "018_message_duration", include_str!("../../migrations/018_message_duration.sql")),
+    (19, "019_drop_endpoint_health", include_str!("../../migrations/019_drop_endpoint_health.sql")),
+    (20, "020_cleanup_ghosts", include_str!("../../migrations/020_cleanup_ghosts.sql")),
+    (21, "021_harmony_subprojects", include_str!("../../migrations/021_harmony_subprojects.sql")),
+    (22, "022_workspace_modules", include_str!("../../migrations/022_workspace_modules.sql")),
+    (23, "023_tool_approval_whitelist", include_str!("../../migrations/023_tool_approval_whitelist.sql")),
+    (24, "024_compact_keep", include_str!("../../migrations/024_compact_keep.sql")),
+    (25, "025_scope_project", include_str!("../../migrations/025_scope_project.sql")),
+    (26, "026_knowledge_entries", include_str!("../../migrations/026_knowledge_entries.sql")),
+    (27, "027_knowledge_hit_count", include_str!("../../migrations/027_knowledge_hit_count.sql")),
+    (28, "028_api_docs", include_str!("../../migrations/028_api_docs.sql")),
+    (29, "029_api_details", include_str!("../../migrations/029_api_details.sql")),
+    (30, "030_project_harmony_root", include_str!("../../migrations/030_project_harmony_root.sql")),
+    (31, "031_api_docs_embeddings", include_str!("../../migrations/031_api_docs_embeddings.sql")),
+    (32, "032_session_events", include_str!("../../migrations/032_session_events.sql")),
+    (33, "033_conversation_todos", include_str!("../../migrations/033_conversation_todos.sql")),
+    (34, "034_session_events_trace", include_str!("../../migrations/034_session_events_trace.sql")),
+    (35, "035_skill_repo_host", include_str!("../../migrations/035_skill_repo_host.sql")),
+    (36, "036_snippets", include_str!("../../migrations/036_snippets.sql")),
+    (37, "037_request_logs_tool", include_str!("../../migrations/037_request_logs_tool.sql")),
+    (38, "038_conversation_tags", include_str!("../../migrations/038_conversation_tags.sql")),
+    (39, "039_message_paging_index", include_str!("../../migrations/039_message_paging_index.sql")),
+    (40, "040_conversation_worktree", include_str!("../../migrations/040_conversation_worktree.sql")),
+    (41, "041_skill_usage", include_str!("../../migrations/041_skill_usage.sql")),
+    (42, "042_lan_config", include_str!("../../migrations/042_lan_config.sql")),
+    (43, "043_lan_tokens", include_str!("../../migrations/043_lan_tokens.sql")),
+    (44, "044_lan_sessions", include_str!("../../migrations/044_lan_sessions.sql")),
+    (45, "045_model_sort_order", include_str!("../../migrations/045_model_sort_order.sql")),
+    (46, "046_lan_token_plain", include_str!("../../migrations/046_lan_token_plain.sql")),
+    (47, "047_model_default_dedupe", include_str!("../../migrations/047_model_default_dedupe.sql")),
+    (48, "048_ohpm_landscape", include_str!("../../migrations/048_ohpm_landscape.sql")),
+    (49, "049_ohpm_landscape_sort", include_str!("../../migrations/049_ohpm_landscape_sort.sql")),
+];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
@@ -25,42 +91,7 @@ fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         );"
     )?;
 
-    let migrations = [
-        (1, "001_initial", include_str!("../../migrations/001_initial.sql")),
-        (2, "002_request_logs", include_str!("../../migrations/002_request_logs.sql")),
-        (3, "003_mcp_skills", include_str!("../../migrations/003_mcp_skills.sql")),
-        (4, "004_agent", include_str!("../../migrations/004_agent.sql")),
-        (5, "005_provider_proxy", include_str!("../../migrations/005_provider_proxy.sql")),
-        (6, "006_conversation_skills", include_str!("../../migrations/006_conversation_skills.sql")),
-        (7, "007_model_enabled", include_str!("../../migrations/007_model_enabled.sql")),
-        (8, "008_project_memories", include_str!("../../migrations/008_project_memories.sql")),
-        (9, "009_provider_endpoints", include_str!("../../migrations/009_provider_endpoints.sql")),
-        (10, "010_task_runs", include_str!("../../migrations/010_task_runs.sql")),
-        (11, "011_proxy_auto_start", include_str!("../../migrations/011_proxy_auto_start.sql")),
-        (12, "012_message_feedback_versions", include_str!("../../migrations/012_message_feedback_versions.sql")),
-        (13, "013_message_queue", include_str!("../../migrations/013_message_queue.sql")),
-        (14, "014_conversation_summary", include_str!("../../migrations/014_conversation_summary.sql")),
-        (15, "015_message_modified_files", include_str!("../../migrations/015_message_modified_files.sql")),
-        (16, "016_project_worktree", include_str!("../../migrations/016_project_worktree.sql")),
-        (17, "017_mcp_server_health", include_str!("../../migrations/017_mcp_server_health.sql")),
-        (18, "018_message_duration", include_str!("../../migrations/018_message_duration.sql")),
-        (19, "019_drop_endpoint_health", include_str!("../../migrations/019_drop_endpoint_health.sql")),
-        (20, "020_cleanup_ghosts", include_str!("../../migrations/020_cleanup_ghosts.sql")),
-        (21, "021_harmony_subprojects", include_str!("../../migrations/021_harmony_subprojects.sql")),
-        (22, "022_workspace_modules", include_str!("../../migrations/022_workspace_modules.sql")),
-        (23, "023_tool_approval_whitelist", include_str!("../../migrations/023_tool_approval_whitelist.sql")),
-        (24, "024_compact_keep", include_str!("../../migrations/024_compact_keep.sql")),
-        (25, "025_scope_project", include_str!("../../migrations/025_scope_project.sql")),
-        (26, "026_knowledge_entries", include_str!("../../migrations/026_knowledge_entries.sql")),
-        (27, "027_knowledge_hit_count", include_str!("../../migrations/027_knowledge_hit_count.sql")),
-        (28, "028_api_docs", include_str!("../../migrations/028_api_docs.sql")),
-        (29, "029_api_details", include_str!("../../migrations/029_api_details.sql")),
-        (30, "030_project_harmony_root", include_str!("../../migrations/030_project_harmony_root.sql")),
-        (31, "031_api_docs_embeddings", include_str!("../../migrations/031_api_docs_embeddings.sql")),
-        (32, "032_session_events", include_str!("../../migrations/032_session_events.sql")),
-    ];
-
-    for (id, name, sql) in migrations {
+    for (id, name, sql) in MIGRATIONS {
         let applied: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM _migrations WHERE id = ?1",
@@ -82,4 +113,55 @@ fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     }
 
     Ok(())
+}
+
+/// 查询迁移状态：返回 (id, name, 是否已应用, 应用时间)
+pub fn migration_status(conn: &Connection) -> Result<Vec<(i64, String, bool, Option<i64>)>, rusqlite::Error> {
+    let mut out = Vec::with_capacity(MIGRATIONS.len());
+    for (id, name, _) in MIGRATIONS {
+        let (applied, at): (bool, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*) > 0, MAX(applied_at) FROM _migrations WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((false, None));
+        out.push((*id, name.to_string(), applied, at));
+    }
+    Ok(out)
+}
+
+/// 应用所有未执行的迁移，返回本次应用的数量（db_migrate 工具入口）
+pub fn apply_pending_migrations(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let before: usize = conn
+        .query_row("SELECT COUNT(*) FROM _migrations", [], |r| r.get(0))
+        .unwrap_or(0);
+    run_migrations(conn)?;
+    let after: usize = conn
+        .query_row("SELECT COUNT(*) FROM _migrations", [], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(after.saturating_sub(before))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 迁移清单必须完整注册：执行后 ohpm_landscape 应含排序三列
+    /// （防止新增迁移文件但忘记注册到 MIGRATIONS 清单导致线上缺列）
+    #[test]
+    fn migrations_apply_ohpm_sort_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(ohpm_landscape)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in ["likes", "popularity", "latest_publish_time"] {
+            assert!(cols.iter().any(|x| x == c), "迁移后缺少列 {c}: {cols:?}");
+        }
+    }
 }

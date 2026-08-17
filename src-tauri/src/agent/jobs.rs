@@ -432,6 +432,110 @@ pub fn drop_conversation_jobs(conversation_id: &str) {
     }
 }
 
+// ---------------- 任务模板（job_template 工具） ----------------
+
+/// 一条预置任务模板（build/test/lint 一键组合）
+#[derive(Clone, serde::Serialize)]
+pub struct JobTemplate {
+    /// 模板名（build / test / lint / clean）
+    pub name: &'static str,
+    /// 建议命令（可直接作为 run_command 的 command 参数）
+    pub command: &'static str,
+    /// 说明
+    pub desc: &'static str,
+}
+
+/// 探测项目类型：hvigor（HarmonyOS ArkTS）> npm 工程 > 未知
+pub fn project_kind(project_path: &str) -> &'static str {
+    let root = std::path::Path::new(project_path);
+    let has = |name: &str| root.join(name).is_file();
+    if has("hvigorfile.ts") || has("hvigorfile.js") || has("build-profile.json5") {
+        "harmony"
+    } else if has("package.json") {
+        "npm"
+    } else {
+        "unknown"
+    }
+}
+
+/// 按项目类型返回 build/test/lint 预置模板（unknown 返回空）。
+/// Harmony 用 hvigorw 直调（无需先 cd：run_command 自带 cwd）；npm 用 node 直调 npm-cli。
+/// 模板是建议组合，模型可修改后交给 run_command / run_in_background 执行。
+pub fn templates(project_path: &str) -> Vec<JobTemplate> {
+    match project_kind(project_path) {
+        "harmony" => vec![
+            JobTemplate {
+                name: "build".into(),
+                command: "hvigorw assembleHap".into(),
+                desc: "全量构建 HAP（等价 DevEco 的 Build）",
+            },
+            JobTemplate {
+                name: "build-module".into(),
+                command: "hvigorw --mode module -p module=entry@default -p product=default assembleHap".into(),
+                desc: "只构建 entry 模块（更快，适合快速验证）",
+            },
+            JobTemplate {
+                name: "test".into(),
+                command: "hvigorw test".into(),
+                desc: "运行单元测试（ohosTest 工程测试）",
+            },
+            JobTemplate {
+                name: "lint".into(),
+                command: "hvigorw --mode module -p module=entry@default -p product=default assembleHap --info".into(),
+                desc: "静态检查+构建（hvigor 无独立 lint 任务，用 --info 输出检查告警）",
+            },
+            JobTemplate {
+                name: "clean".into(),
+                command: "hvigorw clean".into(),
+                desc: "清理构建产物后重建（解决缓存导致的假错误）",
+            },
+        ],
+        "npm" => vec![
+            JobTemplate {
+                name: "build".into(),
+                command: "npm run build".into(),
+                desc: "构建（package.json scripts.build）",
+            },
+            JobTemplate {
+                name: "test".into(),
+                command: "npm test".into(),
+                desc: "运行测试（package.json scripts.test）",
+            },
+            JobTemplate {
+                name: "lint".into(),
+                command: "npm run lint".into(),
+                desc: "静态检查（package.json scripts.lint）",
+            },
+        ],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests_templates {
+    use super::*;
+
+    #[test]
+    fn templates_by_project_kind() {
+        // 临时目录模拟 harmony 工程（hvigorfile 存在即命中）
+        let dir = std::env::temp_dir().join(format!("jobs-tpl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(dir.join("hvigorfile.ts"), "").ok();
+        assert_eq!(project_kind(dir.to_str().unwrap()), "harmony");
+        assert!(templates(dir.to_str().unwrap()).iter().any(|t| t.name == "build"));
+        // npm 工程
+        std::fs::remove_file(dir.join("hvigorfile.ts")).ok();
+        std::fs::write(dir.join("package.json"), "{}").ok();
+        assert_eq!(project_kind(dir.to_str().unwrap()), "npm");
+        assert!(templates(dir.to_str().unwrap()).iter().any(|t| t.name == "lint"));
+        // 未知工程
+        std::fs::remove_file(dir.join("package.json")).ok();
+        assert_eq!(project_kind(dir.to_str().unwrap()), "unknown");
+        assert!(templates(dir.to_str().unwrap()).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

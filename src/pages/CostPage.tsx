@@ -1,9 +1,18 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { getCostSummary, getDailyUsage, getTaskStats, getTaskRuns, type CostSummary, type DailyUsage, type TaskStats, type TaskRun } from '../api/cost'
+import { getCostSummary, getDailyUsage, getTaskStats, getTaskRuns, getAllBudgetStatus, getRequestLogs, type CostSummary, type DailyUsage, type TaskStats, type TaskRun, type AllBudgetStatus, type RequestLog } from '../api/cost'
 import { queryBalances, type ProviderBalance } from '../api/balance'
 import { sendNotification } from '../api/desktop'
+import { useNotificationStore } from '../stores/notificationStore'
+import { save as dialogSave } from '@tauri-apps/plugin-dialog'
+import { writeTextFile } from '@tauri-apps/plugin-fs'
 import Icon from '../icons/Icon'
+
+/** CSV 字段转义：含逗号/引号/换行的字段用双引号包裹，内部双引号 → 双重转义 */
+const csvEscape = (s: string) => {
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+  return s
+}
 
 export default function CostPage() {
   const { t } = useTranslation()
@@ -15,20 +24,35 @@ export default function CostPage() {
   // 服务商余额/额度（实时查询各 provider 的 billing 接口）
   const [balances, setBalances] = useState<ProviderBalance[]>([])
   const [balanceLoading, setBalanceLoading] = useState(false)
+  // 是否存在"已配置但未提供余额接口"的服务商（决定空态文案：无服务商 vs 全不支持）
+  const [hasBalanceUnsupported, setHasBalanceUnsupported] = useState(false)
   // 余额查询是否走系统代理（默认直连）
   const [balanceUseProxy, setBalanceUseProxy] = useState(false)
+  // 预算状态（跨 Provider 汇总）
+  const [budget, setBudget] = useState<AllBudgetStatus | null>(null)
+  // LLM 请求级 trace：每次 LLM 调用一行（比 task_runs 更细：能看到 latency_ms / first_token_ms / cache 命中）
+  const [requestLogs, setRequestLogs] = useState<RequestLog[]>([])
+  const [requestLogsLoading, setRequestLogsLoading] = useState(false)
+  // 请求日志状态过滤：all / success / error
+  const [logStatusFilter, setLogStatusFilter] = useState<'all' | 'success' | 'error'>('all')
+  // 请求日志分页
+  const [logPage, setLogPage] = useState(0)
+  const LOG_PAGE_SIZE = 50
 
   const loadBalances = useCallback(async () => {
     setBalanceLoading(true)
     try {
       const list = await queryBalances(undefined, balanceUseProxy)
-      setBalances(list)
+      // 未提供余额查询接口的服务商（unsupported）直接过滤，不展示余额卡片
+      const supported = list.filter((b) => !b.unsupported)
+      setHasBalanceUnsupported(list.length > supported.length)
+      setBalances(supported)
       // 低余额告警：剩余 < 总额 10% 或剩余 < 1（按币种）视为低余额；每服务商 24h 提醒一次
       const now = Date.now()
       const alerted: Record<string, number> = JSON.parse(
         localStorage.getItem('deveco-balance-alerted') ?? '{}',
       )
-      for (const b of list) {
+      for (const b of supported) {
         if (!b.ok || b.remaining == null) continue
         const total = b.total ?? 0
         const ratio = total > 0 ? b.remaining / total : b.remaining > 0 ? 1 : 0
@@ -90,8 +114,36 @@ export default function CostPage() {
     }
   }
 
+  const loadBudget = useCallback(async () => {
+    try {
+      setBudget(await getAllBudgetStatus())
+    } catch (e) {
+      console.error(e)
+    }
+  }, [])
+
+  /** 加载请求级 trace（按 status 过滤、按分页偏移拉）
+   *  - 一次性拉到 200 条（满足前端翻 4 页），按 client 端 status 过滤，避免每页都打后端
+   *  - status_code 2xx → success；4xx/5xx 或有 error_message → error
+   */
+  const loadRequestLogs = useCallback(async (page = 0) => {
+    setRequestLogsLoading(true)
+    try {
+      const offset = page * LOG_PAGE_SIZE
+      const list = await getRequestLogs({ limit: LOG_PAGE_SIZE, offset })
+      setRequestLogs(list)
+    } catch (e) {
+      console.error(e)
+      setRequestLogs([])
+    } finally {
+      setRequestLogsLoading(false)
+    }
+  }, [])
+
   useEffect(() => { load() }, [])
   useEffect(() => { loadBalances() }, [loadBalances])
+  useEffect(() => { loadBudget() }, [loadBudget])
+  useEffect(() => { loadRequestLogs(logPage) }, [loadRequestLogs, logPage])
 
   /** 错误分类 → 可读标签（与后端 errors::ErrorKind::as_str 对应） */
   const errKindLabel = (kind: string) => {
@@ -109,9 +161,105 @@ export default function CostPage() {
     return map[kind] ?? kind
   }
 
+  /** 导出当前显示范围的账单为 CSV（纯前端：组装当前 summary/daily 字段 → 写文件）
+   *  - 包含两个段：按模型汇总 + 按日汇总，用空行分隔
+   *  - CSV 用逗号分隔 + 双引号包裹文本字段（BOM 头让 Excel 中文不乱码）
+   */
+  const exportBillingCsv = async () => {
+    try {
+      const lines: string[] = []
+      lines.push('\uFEFF') // UTF-8 BOM
+      // 段 1：按模型汇总
+      lines.push('Section,Model,Requests,Input Tokens,Output Tokens,Total Cost (CNY)')
+      if (summary) {
+        for (const m of summary.by_model) {
+          lines.push([
+            'by_model',
+            csvEscape(m.model),
+            String(m.request_count),
+            String(m.input_tokens),
+            String(m.output_tokens),
+            m.total_cost_cny.toFixed(6),
+          ].join(','))
+        }
+      }
+      lines.push('')
+      // 段 2：按 Provider 汇总
+      lines.push('Section,Provider,Requests,Total Cost (CNY)')
+      if (summary) {
+        for (const p of summary.by_provider) {
+          lines.push([
+            'by_provider',
+            csvEscape(p.provider_name),
+            String(p.request_count),
+            p.total_cost_cny.toFixed(6),
+          ].join(','))
+        }
+      }
+      lines.push('')
+      // 段 3：按日汇总
+      lines.push('Section,Date,Provider,Model,Requests,Input Tokens,Output Tokens,Total Cost (CNY)')
+      for (const d of daily) {
+        lines.push([
+          'daily',
+          d.date,
+          csvEscape(d.provider_id ?? ''),
+          csvEscape(d.model ?? ''),
+          String(d.request_count),
+          String(d.input_tokens),
+          String(d.output_tokens),
+          d.total_cost_cny.toFixed(6),
+        ].join(','))
+      }
+      const csv = lines.join('\n')
+      const ts = new Date()
+      const fname = `billing-${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}${String(ts.getDate()).padStart(2, '0')}.csv`
+      const path = await dialogSave({
+        defaultPath: fname,
+        filters: [{ name: 'CSV', extensions: ['csv'] }],
+      })
+      if (!path) return
+      await writeTextFile(path, csv)
+      useNotificationStore.getState().push({
+        tone: 'success',
+        title: t('cost.exportSuccess'),
+        body: fname,
+      })
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
   return (
     <div>
-      <h2 className="text-xl font-semibold mb-6">{t('cost.title')}</h2>
+      <div className="flex items-center justify-between mb-6">
+        <h2 className="text-xl font-semibold">{t('cost.title')}</h2>
+        <button
+          onClick={exportBillingCsv}
+          disabled={!summary || summary.total_requests === 0}
+          className="flex items-center gap-1.5 h-8 px-3 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-[12px] text-[var(--text-secondary)] transition-colors"
+          title={t('cost.exportBilling')}
+        >
+          <Icon name="download" size={13} />
+          {t('cost.exportBilling')}
+        </button>
+      </div>
+
+      {/* 预算总览：日/月已用 vs 限额——后端预算门控已达上限时这里会先看到红色告警 */}
+      {budget && (
+        <div className="grid grid-cols-2 gap-3 mb-6">
+          <BudgetMeter
+            label={t('cost.budgetDaily')}
+            used={budget.used_today_cny}
+            limit={budget.daily_limit_cny}
+          />
+          <BudgetMeter
+            label={t('cost.budgetMonthly')}
+            used={budget.used_month_cny}
+            limit={budget.monthly_limit_cny}
+          />
+        </div>
+      )}
 
       {/* 服务商余额/额度：实时查询各 provider 的 billing 接口 */}
       <div className="flex items-center justify-between mb-3">
@@ -143,7 +291,7 @@ export default function CostPage() {
           ))
         ) : balances.length === 0 ? (
           <div className="col-span-3 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] px-4 py-6 text-center text-sm text-[var(--text-secondary)]">
-            {t('cost.noProviders')}
+            {hasBalanceUnsupported ? t('cost.noBalances') : t('cost.noProviders')}
           </div>
         ) : (
           balances.map((b) => (
@@ -161,7 +309,7 @@ export default function CostPage() {
 
       {/* 任务级指标：Agent 任务成功率 / 耗时分布 / 错误分类 */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mb-3">{t('cost.taskStats')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-6">
+      <div className="modern-card rounded-lg p-4 mb-6">
         {!taskStats || taskStats.total_tasks === 0 ? (
           <p className="text-sm text-[var(--text-secondary)]">{t('cost.taskEmpty')}</p>
         ) : (
@@ -225,7 +373,7 @@ export default function CostPage() {
 
       {/* 按模型统计：费用追踪按模型分组（请求数 / Token / 费用） */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mb-3">{t('cost.byModel')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg overflow-hidden mb-6">
+      <div className="modern-card rounded-lg overflow-hidden mb-6">
         {!summary || summary.by_model.length === 0 ? (
           <p className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]">{t('cost.noData')}</p>
         ) : (
@@ -233,10 +381,10 @@ export default function CostPage() {
             <thead>
               <tr className="border-b border-[var(--border)] text-[var(--text-secondary)]">
                 <th className="text-left px-4 py-2">{t('cost.model')}</th>
-                <th className="text-right px-4 py-2">{t('cost.requests')}</th>
-                <th className="text-right px-4 py-2">{t('cost.input')}</th>
-                <th className="text-right px-4 py-2">{t('cost.output')}</th>
-                <th className="text-right px-4 py-2">{t('cost.fee')}</th>
+                <th className="text-right px-4 py-2 tnum">{t('cost.requests')}</th>
+                <th className="text-right px-4 py-2 tnum">{t('cost.input')}</th>
+                <th className="text-right px-4 py-2 tnum">{t('cost.output')}</th>
+                <th className="text-right px-4 py-2 tnum">{t('cost.fee')}</th>
                 <th className="text-left px-4 py-2 w-1/3">{t('cost.share')}</th>
               </tr>
             </thead>
@@ -278,7 +426,7 @@ export default function CostPage() {
 
       {/* 最近任务明细（trace 列表：每次 Agent 任务一行） */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mb-3">{t('cost.recentTasks')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg overflow-hidden mb-6">
+      <div className="modern-card rounded-lg overflow-hidden mb-6">
         <div className="flex items-center gap-2 px-4 py-2 border-b border-[var(--border)]">
           <span className="text-xs text-[var(--text-secondary)]">{t('cost.filter')}</span>
           {['', 'success', 'error', 'cancelled'].map((s) => (
@@ -292,8 +440,8 @@ export default function CostPage() {
               }}
               className={`px-2 py-0.5 rounded-md text-[11px] transition-colors ${
                 runFilter === s
-                  ? 'bg-[var(--accent)] text-white'
-                  : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+                  ? 'tab-active'
+                  : 'tab-inactive'
               }`}
             >
               {s === '' ? t('cost.all') : s === 'success' ? t('cost.success') : s === 'error' ? t('cost.failed') : t('cost.cancelled')}
@@ -311,10 +459,10 @@ export default function CostPage() {
                 <th className="text-left px-4 py-2">{t('cost.time')}</th>
                 <th className="text-left px-4 py-2">{t('cost.status')}</th>
                 <th className="text-left px-4 py-2">{t('cost.model')}</th>
-                <th className="text-right px-4 py-2">{t('cost.duration')}</th>
-                <th className="text-right px-4 py-2">{t('cost.retry')}</th>
-                <th className="text-right px-4 py-2">{t('cost.toolRounds')}</th>
-                <th className="text-right px-4 py-2">{t('cost.cost')}</th>
+                <th className="text-right px-4 py-2 tnum">{t('cost.duration')}</th>
+                <th className="text-right px-4 py-2 tnum">{t('cost.retry')}</th>
+                <th className="text-right px-4 py-2 tnum">{t('cost.toolRounds')}</th>
+                <th className="text-right px-4 py-2 tnum">{t('cost.cost')}</th>
                 <th className="text-left px-4 py-2">{t('cost.error')}</th>
               </tr>
             </thead>
@@ -369,16 +517,159 @@ export default function CostPage() {
         )}
       </div>
 
+      {/* LLM 请求级 trace：单次 API 调用 = 一行；status_code 2xx = 成功；4xx/5xx 或有 error_message = 失败
+       *  - 比 task_runs 更细：latency / first_token_ms / cache_read+creation 都能看到
+       *  - 状态过滤 + 分页翻页（每页 50 条）
+       */}
+      <div className="flex items-center justify-between mb-3 mt-2">
+        <h3 className="text-sm font-medium text-[var(--text-secondary)]">{t('cost.requestLogs')}</h3>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5 text-[11px]">
+            {(['all', 'success', 'error'] as const).map((s) => (
+              <button
+                key={s}
+                onClick={() => setLogStatusFilter(s)}
+                className={`px-2 py-0.5 rounded-md transition-colors ${
+                  logStatusFilter === s ? 'tab-active' : 'tab-inactive'
+                }`}
+              >
+                {s === 'all' ? t('cost.all') : s === 'success' ? t('cost.success') : t('cost.failed')}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => loadRequestLogs(logPage)}
+            disabled={requestLogsLoading}
+            className="flex items-center gap-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-50"
+            title={t('cost.refreshBalance')}
+          >
+            <Icon name="refresh" size={12} className={requestLogsLoading ? 'animate-spin' : ''} />
+            {t('cost.refresh')}
+          </button>
+        </div>
+      </div>
+      <div className="modern-card rounded-lg overflow-hidden mb-6">
+        {(() => {
+          // 前端过滤：status_code 2xx 视为 success；非 2xx 或有 error_message 视为 error
+          const filtered = requestLogs.filter((r) => {
+            if (logStatusFilter === 'all') return true
+            const codeOk = r.status_code != null && r.status_code >= 200 && r.status_code < 300
+            const isError = !codeOk || (r.error_message != null && r.error_message.length > 0)
+            return logStatusFilter === 'success' ? !isError : isError
+          })
+          if (requestLogsLoading && requestLogs.length === 0) {
+            return <p className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+          }
+          if (filtered.length === 0) {
+            return <p className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]">{t('cost.requestLogsEmpty')}</p>
+          }
+          return (
+            <>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-[var(--border)] text-[var(--text-secondary)]">
+                    <th className="text-left px-3 py-2">{t('cost.time')}</th>
+                    <th className="text-left px-3 py-2">{t('cost.status')}</th>
+                    <th className="text-left px-3 py-2">{t('cost.model')}</th>
+                    <th className="text-right px-3 py-2 tnum">{t('cost.input')}</th>
+                    <th className="text-right px-3 py-2 tnum">{t('cost.output')}</th>
+                    <th className="text-right px-3 py-2 tnum">{t('cost.cacheRead')}</th>
+                    <th className="text-right px-3 py-2 tnum">{t('cost.ttfb')}</th>
+                    <th className="text-right px-3 py-2 tnum">{t('cost.latency')}</th>
+                    <th className="text-right px-3 py-2 tnum">{t('cost.fee')}</th>
+                    <th className="text-left px-3 py-2 max-w-[200px]">{t('cost.error')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map((r) => {
+                    const codeOk = r.status_code != null && r.status_code >= 200 && r.status_code < 300
+                    const isError = !codeOk || (r.error_message != null && r.error_message.length > 0)
+                    const statusTone = isError ? 'var(--danger)' : r.is_streaming ? 'var(--accent)' : 'var(--success)'
+                    return (
+                      <tr key={r.id} className="border-b border-[var(--border)] last:border-0 align-top">
+                        <td className="px-3 py-2 whitespace-nowrap">{formatDateTime(r.created_at)}</td>
+                        <td className="px-3 py-2">
+                          <span
+                            className="px-1.5 py-0.5 rounded text-[10.5px] font-mono"
+                            style={{ background: statusTone, color: '#fff', opacity: isError ? 1 : 0.85 }}
+                            title={r.status_code != null ? `HTTP ${r.status_code}` : t('cost.noStatusCode')}
+                          >
+                            {r.status_code ?? (r.error_message ? 'ERR' : '—')}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 max-w-[160px] truncate" title={r.model ?? ''}>
+                          {r.model ?? '—'}
+                        </td>
+                        <td className="px-3 py-2 text-right tnum">{formatTokens(r.input_tokens)}</td>
+                        <td className="px-3 py-2 text-right tnum">{formatTokens(r.output_tokens)}</td>
+                        <td className="px-3 py-2 text-right tnum">
+                          {r.cache_read_tokens > 0 ? (
+                            <span className="text-[var(--success)]">{formatTokens(r.cache_read_tokens)}</span>
+                          ) : (
+                            <span className="text-[var(--text-muted)]">—</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-right tnum">
+                          {r.first_token_ms != null ? `${(r.first_token_ms / 1000).toFixed(2)}s` : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-right tnum">
+                          {r.latency_ms != null ? `${(r.latency_ms / 1000).toFixed(2)}s` : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-right tnum whitespace-nowrap">
+                          ¥{r.total_cost_cny.toFixed(4)}
+                        </td>
+                        <td className="px-3 py-2 max-w-[200px]">
+                          {r.error_message ? (
+                            <span
+                              className="text-[10.5px] text-[var(--danger)] line-clamp-2"
+                              title={r.error_message}
+                            >
+                              {r.error_message}
+                            </span>
+                          ) : (
+                            <span className="text-[var(--text-muted)] text-[10.5px]">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+              {/* 分页：← / → + 当前页 / 是否有下一页 */}
+              <div className="flex items-center justify-between px-3 py-2 border-t border-[var(--border)] text-[11px] text-[var(--text-muted)] tnum">
+                <span>{t('cost.page', { page: logPage + 1 })}</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setLogPage((p) => Math.max(0, p - 1))}
+                    disabled={logPage === 0 || requestLogsLoading}
+                    className="px-2 py-0.5 rounded-md border border-[var(--border)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    ←
+                  </button>
+                  <button
+                    onClick={() => setLogPage((p) => p + 1)}
+                    disabled={requestLogs.length < LOG_PAGE_SIZE || requestLogsLoading}
+                    className="px-2 py-0.5 rounded-md border border-[var(--border)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    →
+                  </button>
+                </div>
+              </div>
+            </>
+          )
+        })()}
+      </div>
+
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mb-3">{t('cost.daily')}</h3>
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg overflow-hidden">
+      <div className="modern-card rounded-lg overflow-hidden">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-[var(--border)] text-[var(--text-secondary)]">
               <th className="text-left px-4 py-2">{t('cost.date')}</th>
-              <th className="text-right px-4 py-2">{t('cost.requests')}</th>
-              <th className="text-right px-4 py-2">{t('cost.input')}</th>
-              <th className="text-right px-4 py-2">{t('cost.output')}</th>
-              <th className="text-right px-4 py-2">{t('cost.fee')}</th>
+              <th className="text-right px-4 py-2 tnum">{t('cost.requests')}</th>
+              <th className="text-right px-4 py-2 tnum">{t('cost.input')}</th>
+              <th className="text-right px-4 py-2 tnum">{t('cost.output')}</th>
+              <th className="text-right px-4 py-2 tnum">{t('cost.fee')}</th>
             </tr>
           </thead>
           <tbody>
@@ -419,7 +710,7 @@ function BalanceCard({ b }: { b: ProviderBalance }) {
         ? 'var(--warning)'
         : 'var(--success)'
   return (
-    <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4">
+    <div className="modern-card rounded-lg p-4">
       <div className="flex items-center justify-between mb-2">
         <p className="text-xs text-[var(--text-secondary)] truncate" title={b.provider_name}>{b.provider_name}</p>
         {b.ok ? (
@@ -460,9 +751,52 @@ function BalanceCard({ b }: { b: ProviderBalance }) {
 function StatCard({ label, value, tone }: { label: string; value: string | number; tone?: 'ok' | 'warn' | 'bad' }) {
   const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : tone === 'bad' ? 'var(--danger)' : undefined
   return (
-    <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4">
+    <div className="modern-card p-4 transition-all hover:border-[var(--border-strong)]">
       <p className="text-xs text-[var(--text-secondary)]">{label}</p>
-      <p className="text-lg font-semibold mt-1" style={color ? { color } : undefined}>{value}</p>
+      <p className="text-lg font-semibold mt-1 tnum" style={color ? { color } : undefined}>{value}</p>
+    </div>
+  )
+}
+
+/** 预算进度卡：日/月预算已用 vs 上限；上限为 null 时显示"未设上限" */
+function BudgetMeter({ label, used, limit }: { label: string; used: number; limit: number | null }) {
+  const { t } = useTranslation()
+  const hasLimit = limit != null && limit > 0
+  const pct = hasLimit ? Math.min(100, (used / (limit as number)) * 100) : 0
+  // 颜色随占比：<60 绿、60-85 黄、>85 红
+  const level = !hasLimit ? 'normal' : pct >= 85 ? 'danger' : pct >= 60 ? 'warn' : 'normal'
+  const remaining = hasLimit ? Math.max(0, (limit as number) - used) : null
+  return (
+    <div className="modern-card p-4">
+      <div className="flex items-center justify-between mb-1.5">
+        <p className="text-xs text-[var(--text-secondary)]">{label}</p>
+        {hasLimit ? (
+          <span
+            className={`badge-tone ${level === 'danger' ? 'badge-tone-bad' : level === 'warn' ? 'badge-tone-warn' : 'badge-tone-ok'}`}
+            title={t('cost.budgetUsedOf', { used: used.toFixed(2), limit: (limit as number).toFixed(2) })}
+          >
+            {pct.toFixed(0)}%
+          </span>
+        ) : (
+          <span className="badge-tone badge-tone-info">{t('cost.budgetUnlimited')}</span>
+        )}
+      </div>
+      <p className="text-lg font-semibold tnum">
+        ¥{used.toFixed(2)}
+        {hasLimit && <span className="text-xs text-[var(--text-muted)] font-normal ml-2">/ ¥{(limit as number).toFixed(2)}</span>}
+      </p>
+      <div className="context-meter mt-2.5" style={{ height: 3 }}>
+        <div
+          className="context-meter-fill"
+          data-level={level}
+          style={{ width: hasLimit ? `${Math.max(pct, 1)}%` : '100%', opacity: hasLimit ? 1 : 0.3 }}
+        />
+      </div>
+      <p className="text-[11px] text-[var(--text-muted)] mt-1.5 tnum">
+        {hasLimit
+          ? t('cost.budgetRemaining', { amount: remaining!.toFixed(2) })
+          : t('cost.budgetUnlimitedHint')}
+      </p>
     </div>
   )
 }
@@ -488,3 +822,4 @@ function formatDateTime(ts: number): string {
   const mi = String(d.getMinutes()).padStart(2, '0')
   return `${mm}/${dd} ${hh}:${mi}`
 }
+

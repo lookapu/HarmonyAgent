@@ -1,6 +1,7 @@
 import type {
   Project,
   Conversation,
+  NewConversationWorktree,
   ChatMessage,
   GitBranchInfo,
   FileTreeNode,
@@ -8,12 +9,14 @@ import type {
   TodoItem,
   ProjectMemory,
   ToolStat,
+  ToolTokenStat,
   MessageFeedback,
   MessageVersion,
   MemoryDraft,
   QueuedMessageInfo,
   RollbackInfo,
   ConversationCostStats,
+  PendingConfirmation,
 } from '../api/project'
 import type { TaskRun } from '../api/cost'
 
@@ -31,6 +34,8 @@ export interface StreamingState {
   startedAt: number | null
   /** 最近一次内容/思考增量时间戳（静默检测：长时间无增量时提示“模型思考中”） */
   lastDeltaAt: number | null
+  /** 该会话运行中工具数（chat-tool-start +1 / chat-tool-done -1；看门狗巡检不误杀执行中任务） */
+  toolRunning: number
 }
 
 /** 结构化友好错误（对应后端 errors::FriendlyError） */
@@ -181,7 +186,13 @@ export interface ChatSlice {
   conversations: Conversation[]
   currentConversation: Conversation | null
   messages: ChatMessage[]
+  /** 会话消息分页：游标（messages[0]）之前是否还有更早消息未加载 */
+  olderHasMore: boolean
+  /** 正在加载更早的历史消息（向上翻页，防重入） */
+  loadingOlder: boolean
   streaming: StreamingState
+  /** 多会话并行流式分桶（真源）：conversationId → 流式状态；streaming 为当前会话的派生视图 */
+  streamings: Record<string, StreamingState>
   toolRuns: ToolRun[]
   /** 终端面板：工具执行实时记录（新任务开始时清空，结束后保留供查看） */
   terminalEntries: TerminalEntry[]
@@ -192,6 +203,8 @@ export interface ChatSlice {
   plan: TaskPlan | null
   /** 待用户审核的工具调用（自动审核模式） */
   toolApprovals: ToolApproval[]
+  /** 各会话待确认项（按 conversationId 聚合）：会话列表角标 + 切回会话恢复弹窗 */
+  pendingConfirmations: Record<string, PendingConfirmation[]>
   /** Agent 推送的诊断引导卡片（签名/SDK/依赖等需用户决策） */
   diagnoseCards: DiagnoseCard[]
   /** 计划/审查模式：待用户确认的任务计划 */
@@ -216,14 +229,20 @@ export interface ChatSlice {
   resolvePlanReview: (requestId: string, approved: boolean, feedback?: string) => Promise<void>
   /** 回复审核结果：true=允许执行 / false=拒绝（可附理由反馈模型）；remember=本会话始终允许该工具 */
   resolveToolApproval: (requestId: string, approved: boolean, remember?: boolean, feedback?: string, scope?: 'session' | 'project') => Promise<void>
+  /** 拉取项目内所有会话的待确认项（审批/计划/提问），刷新会话列表角标与恢复数据 */
+  refreshPendingConfirmations: () => Promise<void>
   /** 清空终端面板记录 */
   clearTerminal: () => void
   /** 清空构建日志 */
   clearBuildLogs: () => void
   /** 会话搜索：更新关键字并刷新列表 */
   setConversationKeyword: (kw: string) => Promise<void>
-  newConversation: () => Promise<void>
+  newConversation: (worktree?: NewConversationWorktree) => Promise<void>
   openConversation: (id: string) => Promise<void>
+  /** 会话 Fork：从当前会话派生新会话（复制截至 untilMessageId 含该条的消息与事件；缺省全部），完成后切换到新会话 */
+  forkCurrentConversation: (untilMessageId?: string) => Promise<void>
+  /** 加载更早的历史消息（prepend 到 messages 头部），返回新增条数；无更多或已加载返回 0 */
+  loadOlderMessages: (conversationId: string) => Promise<number>
   sendUserMessage: (content: string, options?: ChatOptions, references?: string[], images?: string[]) => Promise<void>
   /** 流式运行中提交消息进入排队：agentOwned=true 发送到 Agent；false 任务结束后自动续跑 */
   queueUserMessage: (content: string, agentOwned: boolean, references?: string[], images?: string[]) => Promise<void>
@@ -254,6 +273,9 @@ export interface MemorySlice {
   memories: ProjectMemory[]
   /** 工具调用统计（按工具聚合） */
   toolStats: ToolStat[]
+  /** 工具 token 消耗排行（[69]：request_logs.tool_name 按工具聚合） */
+  toolTokenStats: ToolTokenStat[]
+  loadToolTokenStats: () => Promise<void>
   /** 消息反馈：message_id -> 反馈记录 */
   feedbackMap: Record<string, MessageFeedback>
   /** 回复版本：user_message_id -> 旧版本列表（重新生成保留） */

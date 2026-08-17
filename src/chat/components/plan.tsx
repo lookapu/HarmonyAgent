@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import type { TaskPlan, ToolRun, AgentRun } from '../../stores/projectStore'
@@ -6,6 +6,7 @@ import type { ChatOptions } from '../../api/project'
 import type { ProviderModel } from '../../api/provider'
 import Icon from '../../icons/Icon'
 import { ToolRunRow, AgentRunCard } from './toolRuns'
+import { getRequestLogs, type RequestLog } from '../../api/cost'
 
 /* ============ 分支选择器（顶部栏） ============ */
 export function BranchSelector({
@@ -56,7 +57,7 @@ export function BranchSelector({
         }`}
       >
         <Icon name="git-branch" size={12} />
-        <span className="max-w-28 truncate font-mono">{current ?? '—'}</span>
+        <span className="max-w-28 truncate font-mono">{busy ? t('home.switchingBranch') : (current ?? '—')}</span>
         {busy ? (
           <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
         ) : (
@@ -64,7 +65,7 @@ export function BranchSelector({
         )}
       </button>
       {open && (
-        <div className="absolute left-0 top-full mt-1.5 w-60 max-h-72 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 py-1 z-50 animate-modal-in">
+        <div className="absolute left-0 top-full mt-1.5 w-60 max-h-72 overflow-y-auto rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 animate-modal-in">
           {err && (
             <div className="px-3 py-2 text-[11px] text-[var(--danger)] break-all border-b border-[var(--border)] whitespace-pre-wrap">
               {err}
@@ -107,6 +108,51 @@ export function ModelSettingsPopover({
   const { t } = useTranslation()
   const navigate = useNavigate()
   const totalModels = catalog.reduce((n, g) => n + g.models.length, 0)
+  // 模型推荐：打开弹层时拉最近 200 条 request_logs，按 model 分组打分（成功率 + 平均成本 + 平均延迟）
+  // 打分公式：success_rate * 0.6 + cost_efficiency * 0.3 + speed_score * 0.1
+  // - cost_efficiency = min(1, 0.001 / avg_cost_cny)（¥0.001 = 满分基准，贵的递减）
+  // - speed_score = min(1, 3000 / avg_latency_ms)（3 秒内 = 满分基准，慢的递减）
+  const [recLogs, setRecLogs] = useState<RequestLog[]>([])
+  const [recLoading, setRecLoading] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    setRecLoading(true)
+    getRequestLogs({ limit: 200, offset: 0 })
+      .then((logs) => !cancelled && setRecLogs(logs))
+      .catch(() => !cancelled && setRecLogs([]))
+      .finally(() => !cancelled && setRecLoading(false))
+    return () => { cancelled = true }
+  }, [])
+  const recommendation = useMemo(() => {
+    if (recLogs.length === 0) return null
+    // 按 model 分组
+    const byModel = new Map<string, { ok: number; total: number; costSum: number; latSum: number; latCount: number }>()
+    for (const r of recLogs) {
+      const m = r.model ?? '(unknown)'
+      const cur = byModel.get(m) ?? { ok: 0, total: 0, costSum: 0, latSum: 0, latCount: 0 }
+      cur.total++
+      const codeOk = r.status_code != null && r.status_code >= 200 && r.status_code < 300
+      if (codeOk && !(r.error_message && r.error_message.length > 0)) cur.ok++
+      cur.costSum += r.total_cost_cny
+      if (r.latency_ms != null) { cur.latSum += r.latency_ms; cur.latCount++ }
+      byModel.set(m, cur)
+    }
+    // 打分
+    const scored = Array.from(byModel.entries())
+      .filter(([, s]) => s.total >= 3) // 至少 3 次调用才进推荐
+      .map(([model, s]) => {
+        const successRate = s.ok / s.total
+        const avgCost = s.costSum / s.total
+        const avgLat = s.latCount > 0 ? s.latSum / s.latCount : 99999
+        const costEff = Math.min(1, 0.001 / Math.max(avgCost, 0.0001))
+        const speed = Math.min(1, 3000 / Math.max(avgLat, 100))
+        const score = successRate * 0.6 + costEff * 0.3 + speed * 0.1
+        return { model, score, successRate, avgCost, avgLat, samples: s.total }
+      })
+      .sort((a, b) => b.score - a.score)
+    if (scored.length === 0) return null
+    return scored
+  }, [recLogs])
 
   const setNum = (key: 'temperature' | 'top_p' | 'max_tokens', raw: string) => {
     const v = raw.trim()
@@ -116,11 +162,66 @@ export function ModelSettingsPopover({
   const proxyState = options.use_proxy === true ? 'on' : 'off'
 
   return (
-    <div className="absolute bottom-full left-0 mb-2 w-[360px] rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 z-50 animate-modal-in overflow-hidden">
+    <div className="absolute bottom-full left-0 mb-2 w-[360px] rounded-xl modern-card shadow-2xl shadow-black/40 z-50 animate-modal-in overflow-hidden">
       <div className="px-3 py-2 text-[11px] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
         {t('home.modelSettings')}
       </div>
       <div className="p-3 space-y-3.5 max-h-[55vh] overflow-y-auto">
+        {/* 模型推荐：基于历史 request_logs 计算成功率/成本/延迟综合分数
+         * - 拉最近 200 条：足够统计可信度，又不会让弹层等太久
+         * - 推荐模型若在 catalog 中 → 显示"应用"按钮；不在 → 仅显示"未配置"提示 */}
+        {recommendation && recommendation.length > 0 && (
+          <div className="rounded-lg bg-[var(--accent)]/5 border border-[var(--accent)]/20 px-2.5 py-2">
+            <div className="flex items-center gap-1.5 mb-1.5">
+              <Icon name="lightbulb" size={11} className="text-[var(--accent)]" />
+              <span className="text-[10.5px] font-medium text-[var(--accent)]">{t('home.modelRec')}</span>
+            </div>
+            {(() => {
+              const top = recommendation[0]
+              // 查 catalog：找到 model.id 等于该 model 名的项
+              const found = catalog.find((g) => g.models.some((m) => m.model_id === top.model || m.id === top.model))
+              const inUse = options.model_id === (found?.models.find((m) => m.model_id === top.model || m.id === top.model)?.id)
+              return (
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[12px] font-medium truncate" title={top.model}>
+                      {top.model}
+                    </div>
+                    <div className="text-[10px] text-[var(--text-muted)] tnum mt-0.5 flex items-center gap-2 flex-wrap">
+                      <span>{(top.successRate * 100).toFixed(0)}% ✓</span>
+                      <span>¥{top.avgCost.toFixed(4)}/次</span>
+                      {top.avgLat < 99999 && <span>{(top.avgLat / 1000).toFixed(1)}s</span>}
+                      <span>· {top.samples} 次样本</span>
+                    </div>
+                  </div>
+                  {found ? (
+                    inUse ? (
+                      <span className="text-[10px] px-2 py-0.5 rounded-md bg-[var(--success)]/15 text-[var(--success)] font-medium shrink-0">
+                        {t('home.modelRecInUse')}
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => {
+                          const m = found.models.find((m) => m.model_id === top.model || m.id === top.model)
+                          if (m) onChange({ ...options, model_id: m.id })
+                        }}
+                        className="h-6 px-2 rounded-md btn-primary text-[10.5px] font-medium active:scale-[0.98] shrink-0"
+                      >
+                        {t('home.modelRecApply')}
+                      </button>
+                    )
+                  ) : (
+                    <span className="text-[10px] text-[var(--text-muted)] shrink-0">{t('home.modelRecNotConfigured')}</span>
+                  )}
+                </div>
+              )
+            })()}
+          </div>
+        )}
+        {recLoading && recommendation === null && (
+          <div className="text-[10.5px] text-[var(--text-muted)] tnum">{t('home.modelRecLoading')}</div>
+        )}
+
         {/* 模型选择 */}
         <div>
           <div className="text-[10px] font-medium text-[var(--text-muted)] mb-1.5">{t('home.currentModel')}</div>
@@ -129,7 +230,7 @@ export function ModelSettingsPopover({
               {t('home.noModels')}
               <button
                 onClick={() => navigate('/providers')}
-                className="block mx-auto mt-2 px-3 py-1 rounded-md bg-[var(--accent)] text-white text-[11px] font-medium hover:bg-[var(--accent-hover)] transition-colors"
+                className="block mx-auto mt-2 px-3 py-1 rounded-md btn-primary text-[11px] font-medium transition-colors"
               >
                 {t('home.goProviders')}
               </button>
@@ -425,7 +526,7 @@ export function NumField({
 }
 
 /* ============ 任务进度清单（计划卡）：Agent 计划列表 + 工具执行联动，任务结束保留展示 ============ */
-export function PlanCard({ plan }: { plan: TaskPlan }) {
+export const PlanCard = memo(function PlanCard({ plan }: { plan: TaskPlan }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(true)
   const doneCount = plan.steps.filter((s) => s.status === 'done').length
@@ -437,7 +538,7 @@ export function PlanCard({ plan }: { plan: TaskPlan }) {
   const statusColor = plan.phase === 'error' ? 'text-[var(--danger)]' : running ? 'text-[var(--accent)]' : 'text-[var(--success)]'
 
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden">
+    <div className="rounded-xl modern-card overflow-hidden">
       {/* 常驻进度条：完成比例 */}
       <div className="h-0.5 bg-[var(--bg-hover)]">
         <div
@@ -514,12 +615,12 @@ export function PlanCard({ plan }: { plan: TaskPlan }) {
       )}
     </div>
   )
-}
+})
 
 /* ============ 任务过程徽章（ChatGPT 式）：中间所有过程折叠为一行，点击展开明细 ============ */
 /** 任务过程徽章：流式时显示“已处理 N 个操作中 · mm:ss”，完成后显示“已处理 N 个操作”；
  * 展开后展示全部工具明细（ToolRunRow）+ 子 Agent 卡片，对话流保持干净不中断。 */
-export function TaskOpsBadge({
+export const TaskOpsBadge = memo(function TaskOpsBadge({
   running,
   count,
   time,
@@ -581,4 +682,6 @@ export function TaskOpsBadge({
       )}
     </div>
   )
-}
+})
+
+

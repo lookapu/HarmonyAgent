@@ -20,6 +20,8 @@ pub struct HarmonyProject {
     pub main_element: Option<String>,
     pub entry_module: Option<String>,
     pub api_version: Option<i64>,
+    /// compatibleSdkVersion 原文（如 "6.1.1(24)"；未识别时为 None）
+    pub sdk_version: Option<String>,
     pub signing_configured: bool,
     /// entry 模块构建产物目录（推导，不一定存在）
     pub hap_output_dir: Option<PathBuf>,
@@ -95,12 +97,48 @@ fn classify_message(kind: &str, message: &str) -> String {
     "other".to_string()
 }
 
+/// 目录是否为鸿蒙"工程根"（AppScope/app.json5 存在，或根级 build-profile.json5 顶层含 "app" 键），
+/// 区别于仅有 oh-package.json5 / 模块级 build-profile.json5 的纯模块目录（如 entry / features/* 子模块）。
+/// 用于主工程兜底判定：纯模块目录没有 bundleName/SDK 信息，不应作为分析根。
+///
+/// 注意：模块级 build-profile.json5 只有 apiType/buildOption/targets 等字段、没有顶层 "app" 键，
+/// 不能仅凭 build-profile.json5 存在判定工程根——否则 entry 模块目录会被误判为工程根，
+/// 导致构建/部署/Agent 工作根全部错位（典型事故：测试文件写进 entry/entry/src/ 嵌套目录）。
+pub fn is_project_root(dir: &Path) -> bool {
+    // AppScope/app.json5 是工程根最可靠标志（模块目录不会有）
+    if dir.join("AppScope").join("app.json5").is_file() {
+        return true;
+    }
+    // 兼容无 AppScope 的旧布局：build-profile.json5 顶层必须含 "app" 键（products/signingConfigs/modules）
+    let bp = dir.join("build-profile.json5");
+    bp.is_file()
+        && read_to_string_opt(&bp).is_some_and(|t| parse_json5(&t).is_ok_and(|v| v.get("app").is_some()))
+}
+
 /// 解析鸿蒙工程的关键信息（部署与构建闭环所需的最小集合）。
 pub fn parse_project(root: &Path) -> HarmonyProject {
     let mut info = HarmonyProject::default();
 
-    // AppScope/app.json5
+    // AppScope/app.json5（标准位置）；找不到时检查根目录 app.json5，再扫描一层子目录（布局差异）
+    let mut app_scope_texts: Vec<String> = Vec::new();
     if let Some(text) = read_to_string_opt(&root.join("AppScope").join("app.json5")) {
+        app_scope_texts.push(text);
+    } else {
+        if let Some(text) = read_to_string_opt(&root.join("app.json5")) {
+            app_scope_texts.push(text);
+        } else if let Ok(entries) = std::fs::read_dir(root) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if let Some(text) = read_to_string_opt(&p.join("AppScope").join("app.json5")) {
+                        app_scope_texts.push(text);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for text in app_scope_texts {
         if let Ok(v) = parse_json5(&text) {
             if let Some(app) = v.get("app") {
                 info.bundle_name = app.get("bundleName").and_then(|x| x.as_str()).map(String::from);
@@ -111,20 +149,30 @@ pub fn parse_project(root: &Path) -> HarmonyProject {
                 }
             }
         }
-    }
-    // 部分工程把 app.json5 放在根目录
-    if info.bundle_name.is_none() {
-        if let Some(text) = read_to_string_opt(&root.join("app.json5")) {
-            if let Ok(v) = parse_json5(&text) {
-                if let Some(app) = v.get("app") {
-                    info.bundle_name = app.get("bundleName").and_then(|x| x.as_str()).map(String::from);
-                }
-            }
+        if info.bundle_name.is_some() {
+            break;
         }
     }
 
-    // build-profile.json5
-    if let Some(text) = read_to_string_opt(&root.join("build-profile.json5")) {
+    // build-profile.json5（标准位置）；找不到时扫描一层子目录
+    let build_profile_texts: Vec<String> = {
+        let mut v = Vec::new();
+        if let Some(text) = read_to_string_opt(&root.join("build-profile.json5")) {
+            v.push(text);
+        } else if let Ok(entries) = std::fs::read_dir(root) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if let Some(text) = read_to_string_opt(&p.join("build-profile.json5")) {
+                        v.push(text);
+                        break;
+                    }
+                }
+            }
+        }
+        v
+    };
+    for text in build_profile_texts {
         if let Ok(v) = parse_json5(&text) {
             if let Some(app) = v.get("app") {
                 // 签名：存在 signingConfigs 且至少一个 product 引用了签名配置
@@ -143,11 +191,30 @@ pub fn parse_project(root: &Path) -> HarmonyProject {
                 info.signing_configured = has_signing_configs && product_uses_signing;
 
                 if let Some(products) = app.get("products").and_then(|x| x.as_array()) {
-                    if let Some(p) = products.first() {
+                    // 遍历所有 product：取第一个携带 SDK 版本信息的（多 product 工程可能只有其一声明）
+                    for p in products {
                         if let Some(v) = p.get("compatibleSdkVersion").and_then(|x| x.as_str()) {
+                            info.sdk_version = Some(v.to_string());
                             info.api_version = parse_api_version(v);
+                            break;
                         } else if let Some(n) = p.get("compatibleSdkVersion").and_then(|x| x.as_i64()) {
+                            info.sdk_version = Some(n.to_string());
                             info.api_version = Some(n);
+                            break;
+                        }
+                    }
+                    // 兜底：compileSdkVersion（部分工程仅声明编译版本）
+                    if info.api_version.is_none() {
+                        for p in products {
+                            if let Some(v) = p.get("compileSdkVersion").and_then(|x| x.as_str()) {
+                                info.sdk_version = Some(v.to_string());
+                                info.api_version = parse_api_version(v);
+                                break;
+                            } else if let Some(n) = p.get("compileSdkVersion").and_then(|x| x.as_i64()) {
+                                info.sdk_version = Some(n.to_string());
+                                info.api_version = Some(n);
+                                break;
+                            }
                         }
                     }
                 }
@@ -174,6 +241,9 @@ pub fn parse_project(root: &Path) -> HarmonyProject {
                     }
                 }
             }
+        }
+        if info.entry_module.is_some() {
+            break;
         }
     }
 
@@ -332,9 +402,11 @@ pub struct HvigorCommand {
 /// Windows 下解析顺序：
 /// 1. 工程内 `hvigor/hvigor-wrapper.js` → 内置/系统 node 直调（绕过 cmd/.bat 弹窗与解析开销）
 /// 2. 工程内 `hvigorw.bat`（完整路径，由 process::command 经 cmd /C 执行）
-/// 3. DevEco Studio 内置 hvigor 工具链（tools/hvigor/bin/hvigorw.js，node 直调）——
+/// 3. 软件内置工具链（app_data/toolkits/<name>/，官方 Command Line Tools 自带
+///    hvigor 引擎，node 直调）——未安装 DevEco Studio 时也能构建
+/// 4. DevEco Studio 内置 hvigor 工具链（tools/hvigor/bin/hvigorw.js，node 直调）——
 ///    工程因 .gitignore/拷贝丢失 hvigorw 脚本时仍可构建
-/// 4. 均未找到 → Err（明确提示，避免让调用方拿到一个必然启动失败的程序名）
+/// 5. 均未找到 → Err（明确提示，避免让调用方拿到一个必然启动失败的程序名）
 ///
 /// env 注入 DEVECO_SDK_HOME：hvigor 解析 HarmonyOS SDK 路径时只认该环境变量
 /// （HarmonyOS 模式下 Property 不读 local.properties 的 hwsdk.dir），未设置且探测到
@@ -350,7 +422,7 @@ pub fn hvigor_command(project_path: &Path) -> Result<HvigorCommand, String> {
         });
     }
     let bat = project_path.join("hvigorw.bat");
-    if cfg!(windows) && bat.is_file() {
+    if cfg!(windows) && bat.is_file() && hvigorw_bat_usable(&bat, &wrapper) {
         return Ok(HvigorCommand {
             program: bat.to_string_lossy().to_string(),
             args: Vec::new(),
@@ -358,6 +430,23 @@ pub fn hvigor_command(project_path: &Path) -> Result<HvigorCommand, String> {
         });
     }
     if cfg!(windows) {
+        // 软件内置工具链：官方 Command Line Tools 自带 hvigor 引擎
+        if let Some(toolkit_hvigorw) = find_toolkit_hvigorw() {
+            return Ok(HvigorCommand {
+                program: "node".to_string(),
+                args: vec![toolkit_hvigorw.to_string_lossy().to_string()],
+                env,
+            });
+        }
+        // 环境探测已发现 command-line-tools（盘符扫描/手动配置/软件内置）：复用其 hvigor 引擎，
+        // 避免“探测报告可用、构建却不用”的纸面工具链
+        if let Some(cli_hvigorw) = find_cli_hvigorw() {
+            return Ok(HvigorCommand {
+                program: "node".to_string(),
+                args: vec![cli_hvigorw.to_string_lossy().to_string()],
+                env,
+            });
+        }
         if let Some(dev_hvigorw) = find_deveco_toolchain().map(|(h, _)| h) {
             return Ok(HvigorCommand {
                 program: "node".to_string(),
@@ -374,11 +463,71 @@ pub fn hvigor_command(project_path: &Path) -> Result<HvigorCommand, String> {
             env,
         });
     }
-    Err("工程缺少 hvigor 启动脚本（hvigor/hvigor-wrapper.js 或 hvigorw.bat 均不存在），且未找到 DevEco Studio 内置 hvigor 工具链。\n请在 DevEco Studio 中打开工程让其补全构建脚本，或确认 DevEco Studio 已安装（默认路径 C:\\Program Files\\Huawei\\DevEco Studio）".into())
+    Err("工程缺少 hvigor 启动脚本（hvigor/hvigor-wrapper.js 或 hvigorw.bat 均不存在），且未找到可用的 hvigor 引擎。\n请任选其一：\n1. 在软件 设置 → 环境 页安装官方 Command Line Tools（自带 hvigor/ohpm/hdc 工具链）；\n2. 确认 DevEco Studio 已安装（默认路径 C:\\Program Files\\Huawei\\DevEco Studio）；\n3. 在 DevEco Studio 中打开工程让其补全构建脚本。".into())
+}
+
+/// 复用环境探测缓存的 command-line-tools hvigor 引擎
+/// （<cli_root>/hvigor/bin/hvigorw.js 或 <cli_root>/hvigor/hvigorw.js）。
+#[cfg(windows)]
+fn find_cli_hvigorw() -> Option<PathBuf> {
+    let cli = crate::services::harmony_env::cached_cli_root()?;
+    [
+        cli.join("hvigor").join("bin").join("hvigorw.js"),
+        cli.join("hvigor").join("hvigorw.js"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+/// 在软件内置工具链目录（app_data/toolkits/）下查找 hvigor 引擎。
+/// 官方 Command Line Tools 包布局：<toolkits>/<name>/hvigor/bin/hvigorw.js；
+/// 兼容 <name>/hvigor/hvigorw.js 与 <name>/bin/hvigorw.js 两种直装布局。
+#[cfg(windows)]
+fn find_toolkit_hvigorw() -> Option<PathBuf> {
+    let bundled = crate::services::harmony_env::get_bundled_cli_dir()?;
+    let mut bases = vec![bundled.clone()];
+    if let Some(parent) = bundled.parent() {
+        bases.push(parent.to_path_buf()); // toolkits 根：扫描全部已安装工具包
+    }
+    let mut seen = std::collections::HashSet::new();
+    for base in bases {
+        // 单个 base 不存在（如仅装了 hvigor-engine 未装 command-line-tools）时
+        // 继续扫下一个，不能直接返回
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() || !seen.insert(p.clone()) {
+                continue;
+            }
+            for cand in [
+                p.join("hvigor").join("bin").join("hvigorw.js"),
+                p.join("hvigor").join("hvigorw.js"),
+                p.join("bin").join("hvigorw.js"),
+            ] {
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// hvigorw.bat 是 DevEco 模板脚本：wrapper 存在时它只负责转发给
+/// hvigor/hvigor-wrapper.js；wrapper 缺失时回退调用全局 hvigorw 命令（通常不在
+/// PATH 中，且 Windows 下 cmd 报错可能被吞掉、看不到任何输出）。因此 bat 存在
+/// 但引用缺失的 wrapper 时应判定不可用，跳过它改走 DevEco 内置工具链。
+fn hvigorw_bat_usable(bat: &Path, wrapper: &Path) -> bool {
+    wrapper.is_file()
+        || read_to_string_opt(bat)
+            .map_or(true, |t| !t.contains("hvigor-wrapper.js"))
 }
 
 /// 构建 hvigor 所需环境变量：用户显式设置了 DEVECO_SDK_HOME 时不覆盖，
-/// 否则探测 DevEco Studio 内置 SDK 根目录（sdk/default/sdk-pkg.json 布局）注入。
+/// 否则探测 DevEco Studio 内置 SDK 根目录（sdk/default/sdk-pkg.json 布局），
+/// 未发现时回退复用环境探测的 command-line-tools 内置 SDK。
 #[cfg(windows)]
 fn hvigor_env() -> Vec<(String, String)> {
     if std::env::var("DEVECO_SDK_HOME").is_ok() {
@@ -386,6 +535,13 @@ fn hvigor_env() -> Vec<(String, String)> {
     }
     if let Some(sdk) = find_deveco_toolchain().map(|(_, sdk)| sdk) {
         return vec![("DEVECO_SDK_HOME".to_string(), sdk.to_string_lossy().to_string())];
+    }
+    // command-line-tools 内置 SDK（官方包自带 sdk/ 目录）
+    if let Some(cli) = crate::services::harmony_env::cached_cli_root() {
+        let sdk = cli.join("sdk");
+        if sdk.join("default").join("sdk-pkg.json").is_file() {
+            return vec![("DEVECO_SDK_HOME".to_string(), sdk.to_string_lossy().to_string())];
+        }
     }
     Vec::new()
 }
@@ -397,7 +553,7 @@ fn hvigor_env() -> Vec<(String, String)> {
 /// 必须指向 sdk-pkg.json 所在目录（default）的父目录，指向 sdk/default 或
 /// sdk/default/openharmony 都会报 00303312）。
 #[cfg(windows)]
-fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
     fn probe(root: &Path) -> Option<(PathBuf, PathBuf)> {
         let hvigorw = root.join("tools").join("hvigor").join("bin").join("hvigorw.js");
         let sdk = root.join("sdk");
@@ -838,6 +994,29 @@ mod tests {
     }
 
     #[test]
+    fn test_is_project_root_distinguishes_module_dir() {
+        // 回归：模块级 build-profile.json5（无顶层 "app" 键）不得被误判为工程根，
+        // 否则 entry 模块目录会抢占主工程根，导致 Agent 写文件/构建全部错位（entry/entry 嵌套事故）
+        let dir = std::env::temp_dir().join(format!("isprojroot-{}", std::process::id()));
+        let proj = dir.join("proj");
+        let modu = proj.join("entry");
+        std::fs::create_dir_all(modu.join("src/main")).unwrap();
+        std::fs::create_dir_all(proj.join("AppScope")).unwrap();
+        std::fs::write(proj.join("AppScope/app.json5"), r#"{"app":{"bundleName":"com.x"}}"#).unwrap();
+        // 根级 build-profile：含 app 键（products/signingConfigs/modules）
+        std::fs::write(proj.join("build-profile.json5"), r#"{"app":{"signingConfigs":[]},"modules":[]}"#).unwrap();
+        // 模块级 build-profile：只有 apiType/buildOption/targets，无 app 键
+        std::fs::write(modu.join("build-profile.json5"), r#"{"apiType":"stageMode","buildOption":{},"targets":[{"name":"default"}]}"#).unwrap();
+        std::fs::write(modu.join("oh-package.json5"), r#"{"name":"entry"}"#).unwrap();
+        std::fs::write(modu.join("hvigorfile.ts"), "").unwrap();
+
+        assert!(is_project_root(&proj), "工程根（AppScope + 含 app 键的根 build-profile）应判定为 true");
+        assert!(!is_project_root(&modu), "entry 模块目录不得被误判为工程根");
+        assert!(!is_project_root(&proj.join("src")), "无配置的普通目录应为 false");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_strip_comments_and_trailing() {
         let s = r#"{
             "a": 1, // comment
@@ -912,6 +1091,65 @@ mod tests {
         if std::env::var("DEVECO_SDK_HOME").is_ok() {
             assert!(hvigor_env().is_empty(), "用户显式配置时应保持不注入");
         }
+    }
+
+    #[test]
+    fn test_hvigor_command_skips_broken_bat() {
+        // bat 引用缺失的 hvigor-wrapper.js（如拷贝/被忽略丢失）时不应选 bat 分支，
+        // 否则 bat 回退调用全局 hvigorw 命令静默失败；应落到 DevEco 内置工具链或报错。
+        let root = std::env::temp_dir().join(format!("hvigor-broken-bat-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("hvigor")).unwrap();
+        std::fs::write(
+            root.join("hvigorw.bat"),
+            "@echo off\r\nif exist \"%~dp0hvigor\\hvigor-wrapper.js\" (\r\n  node \"%~dp0hvigor\\hvigor-wrapper.js\" %*\r\n) else (\r\n  hvigorw %*\r\n)\r\n",
+        )
+        .unwrap();
+        let bat_path = root.join("hvigorw.bat").to_string_lossy().to_string();
+        match hvigor_command(&root) {
+            Ok(cmd) => assert_ne!(
+                cmd.program, bat_path,
+                "不应选择引用缺失 wrapper 的 bat 分支"
+            ),
+            Err(e) => assert!(e.contains("hvigor"), "错误信息应提示构建脚本缺失: {}", e),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_hvigor_command_uses_toolkit_engine() {
+        // 软件内置 toolkits 自带 hvigor 引擎时（未装 DevEco Studio 也能构建），
+        // 工程无启动脚本也应落到 <toolkits>/<name>/hvigor/bin/hvigorw.js
+        let root = std::env::temp_dir().join(format!("hvigor-toolkit-{}", std::process::id()));
+        let tk = root.join("toolkits").join("command-line-tools");
+        std::fs::create_dir_all(tk.join("hvigor").join("bin")).unwrap();
+        std::fs::write(tk.join("hvigor").join("bin").join("hvigorw.js"), "// engine").unwrap();
+        let prev = crate::services::harmony_env::get_bundled_cli_dir();
+        crate::services::harmony_env::set_bundled_cli_dir(Some(tk.clone()));
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cmd = hvigor_command(&proj).expect("应落到 toolkits hvigor 引擎");
+        assert_eq!(cmd.program, "node");
+        assert!(cmd.args[0].ends_with("hvigorw.js"), "args={:?}", cmd.args);
+        crate::services::harmony_env::set_bundled_cli_dir(prev);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_hvigor_command_uses_cli_root_engine() {
+        // 环境探测发现 command-line-tools（如盘符根目录 H:\command-line-tools）时，
+        // 工程无启动脚本也应复用其 hvigor 引擎，而非纸面可用
+        let root = std::env::temp_dir().join(format!("hvigor-cli-{}", std::process::id()));
+        let cli = root.join("command-line-tools");
+        std::fs::create_dir_all(cli.join("hvigor").join("bin")).unwrap();
+        std::fs::write(cli.join("hvigor").join("bin").join("hvigorw.js"), "// engine").unwrap();
+        crate::services::harmony_env::set_cached_cli_root_for_test(Some(cli.clone()));
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cmd = hvigor_command(&proj).expect("应复用 command-line-tools hvigor 引擎");
+        assert_eq!(cmd.program, "node");
+        assert!(cmd.args[0].ends_with("hvigorw.js"), "args={:?}", cmd.args);
+        crate::services::harmony_env::set_cached_cli_root_for_test(None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

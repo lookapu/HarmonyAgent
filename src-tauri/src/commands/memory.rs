@@ -2,7 +2,10 @@ use serde::Deserialize;
 use tauri::State;
 use uuid::Uuid;
 
-use crate::db::{models::{ProjectMemory, ToolStat}, queries, DbState};
+use crate::db::{
+    models::{ProjectMemory, ToolStat, ToolTokenStat},
+    queries, DbState,
+};
 
 /// 记忆保存入参（新增时无 id；编辑时带 id 走更新）
 #[derive(Debug, Deserialize)]
@@ -75,4 +78,11 @@ pub fn set_memory_enabled(db: State<DbState>, id: String, enabled: bool) -> Resu
 pub fn list_tool_stats(db: State<DbState>, project_id: String) -> Result<Vec<ToolStat>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::list_tool_stats(&conn, &project_id).map_err(|e| e.to_string())
+}
+
+/// 工具 token 消耗排行（[69]：request_logs.tool_name 按工具聚合，代理链路口径）
+#[tauri::command]
+pub fn list_tool_token_stats(db: State<DbState>, days: i64) -> Result<Vec<ToolTokenStat>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::list_tool_token_stats(&conn, days).map_err(|e| e.to_string())
 }

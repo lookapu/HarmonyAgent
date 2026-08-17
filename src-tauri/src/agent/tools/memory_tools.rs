@@ -42,6 +42,112 @@ pub(super) async fn save_memory(args: &Value, project_id: &str, db: &crate::db::
     Ok(format!("已保存项目记忆「{}」（分类 {}），后续对话会自动参考该经验", m.title, m.category))
 }
 
+/// 字符级相似度（0~1）：公共字符集合占比，用于事实去重粗筛。
+fn char_overlap(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let ca: Vec<char> = a.chars().collect();
+    let cb_orig = b.chars().count();
+    let mut cb: Vec<char> = b.chars().collect();
+    let mut common = 0usize;
+    for ch in &ca {
+        if let Some(i) = cb.iter().position(|c| c == ch) {
+            cb.remove(i);
+            common += 1;
+        }
+    }
+    common as f64 / ca.len().max(cb_orig) as f64
+}
+
+/// fact_extract：自动事实抽取与沉淀。模型在任务收尾时把值得长期记住的事实
+/// （架构约定/技术决策/踩坑结论/构建命令等）交给本工具：自动生成标题、与已有记忆
+/// 去重（相似度高的不重复入库，防止知识库膨胀），确认唯一后才写入 project_memories。
+/// 参数：{"fact":"<事实/经验文本>"（必填），"category":"<可选 general|code|build|deploy|decision|pitfall>",
+///  "title":"<可选，缺省从 fact 自动截取>","dedupe":<可选，缺省 true>}。
+pub(super) async fn fact_extract(args: &Value, project_id: &str, db: &crate::db::DbState) -> Result<String, String> {
+    if project_id.is_empty() {
+        return Err("当前会话未绑定项目目录，无法沉淀事实".into());
+    }
+    let fact = args["fact"].as_str().unwrap_or("").trim().to_string();
+    if fact.is_empty() {
+        return Err("fact_extract 需要参数 {\"fact\":\"<要沉淀的事实/经验文本>\"}".into());
+    }
+    if fact.chars().count() > 2000 {
+        return Err(format!("fact 过长（{} 字符），请精简到 2000 字符内", fact.chars().count()));
+    }
+    // 1) 标题：显式参数 > 自动截取（去首尾空白与常见口头前缀）
+    let mut title = args["title"].as_str().unwrap_or("").trim().to_string();
+    if title.is_empty() {
+        let t = fact.trim();
+        let t = t.strip_prefix("我们").unwrap_or(t);
+        let t = t.strip_prefix('我').unwrap_or(t);
+        title = t.trim().chars().take(30).collect::<String>();
+        if title.chars().count() == 30 {
+            title.push('…');
+        }
+    }
+    if title.chars().count() > 60 {
+        return Err(format!("title 过长（{} 字符），请精简到 60 字符内", title.chars().count()));
+    }
+    let raw_cat = args["category"].as_str().unwrap_or("general").trim().to_string();
+    let category = if matches!(raw_cat.as_str(), "general" | "code" | "build" | "deploy" | "decision" | "pitfall") {
+        raw_cat
+    } else {
+        "general".to_string()
+    };
+    // 2) 去重：与该项目已有记忆比对（标题/正文重合度），高相似返回"已存在"不重复入库
+    let dedupe = args["dedupe"].as_bool().unwrap_or(true);
+    if dedupe {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let existing = crate::db::queries::list_memories(&conn, project_id).map_err(|e| e.to_string())?;
+        drop(conn);
+        let needle = format!("{title} {fact}");
+        let mut best: Option<(String, f64)> = None;
+        for m in &existing {
+            let hay = format!("{} {}", m.title, m.content);
+            let sim = char_overlap(&needle, &hay);
+            if best.as_ref().map(|(_, s)| sim > *s).unwrap_or(true) {
+                best = Some((m.title.clone(), sim));
+            }
+        }
+        if let Some((t, sim)) = best {
+            if sim > 0.7 {
+                return Ok(format!(
+                    "事实与已有记忆「{}」高度重复（相似度 {:.0}%），未重复入库。\n已有内容开头：{}…\n如需强制保存请传 dedupe=false",
+                    t,
+                    sim * 100.0,
+                    existing
+                        .iter()
+                        .find(|m| m.title == t)
+                        .map(|m| m.content.chars().take(60).collect::<String>())
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+    // 3) 入库（与 save_memory 同表同结构）
+    let now = chrono::Utc::now().timestamp();
+    let m = crate::db::models::ProjectMemory {
+        id: uuid::Uuid::new_v4().to_string(),
+        project_id: project_id.to_string(),
+        category,
+        title,
+        content: fact,
+        enabled: true,
+        created_at: now,
+        updated_at: now,
+    };
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::db::queries::insert_memory(&conn, &m).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "事实已沉淀为项目记忆「{}」（分类 {}，已去重确认唯一），后续对话会自动参考。\n内容：{}…",
+        m.title,
+        m.category,
+        m.content.chars().take(80).collect::<String>()
+    ))
+}
+
 /// search_knowledge：主动查询知识库（团队经验/已知问题的解决方案），按命中次数排序。
 pub(super) async fn search_knowledge(args: &Value, project_id: &str, db: &crate::db::DbState) -> Result<String, String> {
     let keyword = args["keyword"].as_str().unwrap_or("").trim();
@@ -508,6 +614,107 @@ pub(super) async fn get_cost_summary(args: &Value, db: &crate::db::DbState) -> R
         if by_model.len() > 8 {
             out.push_str(&format!("（另有 {} 个模型未列出）\n", by_model.len() - 8));
         }
+    }
+    Ok(out)
+}
+
+/// [38] conversation_search：全局历史对话语义搜索（LIKE 关键词方案，无需向量库）。
+/// 跨会话检索 user/assistant 消息，输出命中片段 + 会话标题 + 时间，供回忆历史决策/排查记录。
+/// 参数：{"query":"<关键词>","project":"<可选项目 id，缺省全部项目>","role":"user|assistant|all（可选缺省 all）","limit":<可选 1-20 缺省 8>}。
+pub(super) async fn conversation_search(
+    args: &Value,
+    project_id: &str,
+    db: &crate::db::DbState,
+) -> Result<String, String> {
+    let query = args["query"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let Some(query) = query else {
+        return Err("conversation_search 需要参数 {\"query\":\"<关键词>\"}".into());
+    };
+    if query.len() > 100 {
+        return Err("关键词过长（≤100 字符）".into());
+    }
+    let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 20) as usize;
+    let role = args["role"].as_str().unwrap_or("all");
+    if !matches!(role, "all" | "user" | "assistant") {
+        return Err("role 只接受 all|user|assistant".into());
+    }
+    let proj_filter = args["project"].as_str().map(|p| p.to_string()).unwrap_or_else(|| project_id.to_string());
+    // LIKE 特殊字符转义（% _ \ → \% \_ \\）
+    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pat = format!("%{escaped}%");
+    let role_filter = if role == "all" {
+        "AND (?4 IS NULL OR m.role = ?4)"
+    } else {
+        "AND m.role = ?4"
+    };
+    let sql = format!(
+        "SELECT m.role, m.content, m.created_at, c.title, c.id
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         WHERE m.content LIKE ?1 ESCAPE '\\' {role_filter}
+         AND c.project_id = ?2
+         ORDER BY m.created_at DESC
+         LIMIT ?3"
+    );
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let role_param: Option<&str> = if role == "all" { None } else { Some(role) };
+    // 参数数量恒定 4 个（role=all 时 ?4 传 NULL），避免 if/else 两分支闭包类型不一致
+    let rows = stmt
+        .query_map(
+            rusqlite::params![pat, proj_filter, limit as i64, role_param],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let hits: Vec<(String, String, i64, String, String)> =
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    if hits.is_empty() {
+        return Ok(format!(
+            "未找到包含 \"{query}\" 的历史消息（搜索范围：当前项目{}）。\n可尝试更短关键词，或加 role 参数限定 user/assistant。",
+            if proj_filter == project_id && project_id.is_empty() { "（全部项目）".to_string() } else { String::new() }
+        ));
+    }
+    let mut out = format!("历史对话搜索 \"{query}\"：{} 条命中\n", hits.len());
+    for (i, (role, content, ts, title, conv_id)) in hits.iter().enumerate() {
+        let time = chrono::DateTime::from_timestamp(*ts, 0)
+            .map(|d| d.format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-".into());
+        let role_cn = match role.as_str() {
+            "user" => "用户",
+            "assistant" => "助手",
+            _ => "系统",
+        };
+        // 命中片段：截取关键词前后各 60 字符（按字符安全截取，避免中文 UTF-8 边界切坏）
+        let content_flat = content.replace(['\n', '\r'], " ");
+        let snippet = if let Some(pos) = content_flat.to_lowercase().find(&query.to_lowercase()) {
+            let start = pos.saturating_sub(60);
+            let end = (pos + query.len() + 120).min(content_flat.len());
+            let s: String = content_flat
+                .chars()
+                .skip(start)
+                .take(end - start)
+                .collect();
+            format!("…{}…", s.trim())
+        } else {
+            content_flat.chars().take(160).collect::<String>()
+        };
+        out.push_str(&format!(
+            "\n{}. [{}] {}（{}）会话：{}（{conv_id}）\n  {}\n",
+            i + 1,
+            role_cn,
+            time,
+            title,
+            "查看详情可打开该会话",
+            snippet
+        ));
     }
     Ok(out)
 }

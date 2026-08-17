@@ -35,6 +35,7 @@ export interface HarmonyEnv {
   sdk_versions: string[]
   cli: CommandLineTools | null
   hdc_path: string | null
+  hdc_source: 'cli' | 'sdk' | 'deveco' | 'path' | null
   ohpm_path: string | null
   hvigorw_path: string | null
   studio_dir: string | null
@@ -143,3 +144,92 @@ export function searchHarmonyDocs(query: string, limit?: number): Promise<DocEnt
 export function readHarmonyDoc(relPath: string): Promise<string> {
   return invoke<string>('read_harmony_doc', { relPath })
 }
+
+// ---------- ohpm 三方库推荐缓存（官方 landscape 镜像） ----------
+
+/** 单个三方库条目 */
+export interface OhpmPkg {
+  package_name: string
+  version: string
+  author_name: string
+  score: number
+  license: string
+  down_count_60d: number
+  description: string
+  keywords: string
+  file_nums: number
+  file_size: number
+  level1_cn: string
+  level1_en: string
+  level2_cn: string
+  level2_en: string
+  level3_cn: string
+  level3_en: string
+  level4_cn: string
+  level4_en: string
+  likes: number
+  popularity: number
+  latest_publish_time: number
+}
+
+/** 缓存状态 */
+export interface OhpmLandscapeStatus {
+  total: number
+  updated_at: number | null
+  categories: number
+}
+
+/** 刷新报告 */
+export interface OhpmRefreshReport {
+  total: number
+  updated_at: number
+}
+
+/** 一二级分类树节点 */
+export interface OhpmCategoryStat {
+  name_cn: string
+  name_en: string
+  count: number
+  children: OhpmCategoryStat[]
+}
+
+/** 查询本地三方库推荐缓存状态 */
+export function getOhpmLandscapeStatus(): Promise<OhpmLandscapeStatus> {
+  return invoke<OhpmLandscapeStatus>('ohpm_landscape_status')
+}
+
+/** 拉取官方接口并全量刷新本地缓存 */
+export function refreshOhpmLandscape(): Promise<OhpmRefreshReport> {
+  return invoke<OhpmRefreshReport>('ohpm_landscape_refresh')
+}
+
+/** 关键词检索（包名/描述/关键词/作者/分类）；order 可选：likes/popularity/latest（默认下载量）；offset 用于分页 */
+export function searchOhpmLandscape(query: string, order?: string | null, limit?: number, offset?: number): Promise<OhpmPkg[]> {
+  return invoke<OhpmPkg[]>('ohpm_landscape_search', { query, order: order ?? null, limit: limit ?? null, offset: offset ?? null })
+}
+
+/** 热门推荐；order 可选：likes/popularity/latest（默认下载量）；offset 用于分页 */
+export function hotOhpmLandscape(order?: string | null, limit?: number, offset?: number): Promise<OhpmPkg[]> {
+  return invoke<OhpmPkg[]>('ohpm_landscape_hot', { order: order ?? null, limit: limit ?? null, offset: offset ?? null })
+}
+
+/** 按分类取包（下载量排序）；level2 非空时进一步按二级分类过滤；order 可选：likes/popularity/latest；offset 用于分页 */
+export function byCategoryOhpmLandscape(category: string, level2?: string | null, order?: string | null, limit?: number, offset?: number): Promise<OhpmPkg[]> {
+  return invoke<OhpmPkg[]>('ohpm_landscape_by_category', { category, level2: level2 ?? null, order: order ?? null, limit: limit ?? null, offset: offset ?? null })
+}
+
+/** 统计匹配包数（过滤条件与检索/分类一致），用于页码分页 */
+export function countOhpmLandscape(query?: string, category?: string | null, level2?: string | null): Promise<number> {
+  return invoke<number>('ohpm_landscape_count', { query: query ?? null, category: category ?? null, level2: level2 ?? null })
+}
+
+/** 一二级分类树 */
+export function getOhpmLandscapeCategories(): Promise<{ categories: OhpmCategoryStat[] }> {
+  return invoke<{ categories: OhpmCategoryStat[] }>('ohpm_landscape_categories')
+}
+
+/** 查询指定包的最新版元数据，返回仓库主页 URL（无仓库返回 null，由前端回退官网详情页） */
+export function getOhpmLandscapeRepoUrl(packageName: string): Promise<string | null> {
+  return invoke<string | null>('ohpm_landscape_repo_url', { packageName })
+}
+

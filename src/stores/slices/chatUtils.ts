@@ -1,5 +1,11 @@
 import type { ChatMessage } from '../../api/project'
 import type { TaskPlan } from '../projectStoreTypes'
+import { unified } from 'unified'
+import remarkParse from 'remark-parse'
+import remarkGfm from 'remark-gfm'
+import remarkRehype from 'remark-rehype'
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
+import rehypeStringify from 'rehype-stringify'
 
 /** 从 Agent 正文解析"计划列表"（Markdown 有序列表，2~10 项，含工具标记/代码块的列表块不采用）。
  * 模型常以有序列表给出任务步骤；无匹配返回 null（不显示进度卡，工具卡已足够）。 */
@@ -67,8 +73,48 @@ export function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-/** 轻量 Markdown → HTML（导出用；覆盖常用元素即可，不做完整解析） */
+/** rehype-sanitize 白名单：与 Markdown.tsx 保持一致（kbd / sup / blockquote 类名放行） */
+const exportSanitizeSchema = {
+  ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames ?? []), 'kbd'],
+  attributes: {
+    ...(defaultSchema.attributes ?? {}),
+    sup: [...(defaultSchema.attributes?.sup ?? []), 'className'],
+    kbd: ['className'],
+    blockquote: [...(defaultSchema.attributes?.blockquote ?? []), 'className'],
+  },
+}
+
+/** 导出用的统一 Markdown 解析管线：与 UI Markdown 渲染走同一套 remark/rehype 插件，
+ *  保证导出 HTML 与界面渲染一致（代码块、表格、任务列表、删除线、链接等全支持）。
+ *  同步实现（全部 plugin 同步），可直接用于非异步上下文。 */
+const exportProcessor = unified()
+  .use(remarkParse)
+  .use(remarkGfm)
+  .use(remarkRehype, { allowDangerousHtml: false })
+  .use(rehypeSanitize, exportSanitizeSchema)
+  .use(rehypeStringify)
+
+/** Markdown → HTML（导出用）。
+ *  之前是手写 replace 串，存在代码块嵌套错乱、列表无 ul 包裹等问题；
+ *  改用 unified pipeline 后结构正确，浏览器渲染自然恢复正常。 */
 export function toHtml(md: string): string {
+  if (!md) return ''
+  // 极大文档（>50k）退回原始手写：unified 同步处理大文档会阻塞主线程；导出仅本地存档用
+  if (md.length > 50_000) {
+    return legacyToHtml(md)
+  }
+  try {
+    const file = exportProcessor.processSync(md)
+    return String(file)
+  } catch {
+    // unified 解析异常时回退到手写版本（避免导出整体失败）
+    return legacyToHtml(md)
+  }
+}
+
+/** 旧手写实现：保留作为超大文档和解析异常的兜底，行为与之前保持一致。 */
+function legacyToHtml(md: string): string {
   let html = escapeHtml(md)
   // 代码块
   html = html.replace(/```([\s\S]*?)```/g, (_, code: string) => `<pre>${code.replace(/\n$/, '')}</pre>`)

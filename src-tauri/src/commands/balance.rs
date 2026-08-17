@@ -22,6 +22,8 @@ pub struct ProviderBalance {
     pub provider_name: String,
     /// 查询是否成功（端点可达且返回可解析）
     pub ok: bool,
+    /// 该服务商是否未提供余额查询接口（前端据此直接不展示余额卡片）
+    pub unsupported: bool,
     /// 原始币种（USD / CNY 等）；无法识别时为 null
     pub currency: Option<String>,
     /// 总额度
@@ -71,12 +73,23 @@ pub async fn query_balances(
                 })
         };
         let base = p.base_url.trim_end_matches('/').to_string();
-        let res = query_one(&client, &base, api_key.as_deref()).await;
+        let (protocol, base) = (p.protocol.clone(), base);
+
+        // 未开放余额查询接口的服务商（按 host + 协议预判）：不发起请求，直接标记 unsupported
+        let unsupported_reason = unsupported_reason(&base, &protocol);
+        let unsupported = unsupported_reason.is_some();
+
+        let res = if unsupported {
+            Err(unsupported_reason.unwrap_or_default())
+        } else {
+            query_one(&client, &base, api_key.as_deref(), &protocol).await
+        };
         results.push(match res {
             Ok(b) => ProviderBalance {
                 provider_id: p.id.clone(),
                 provider_name: p.name.clone(),
                 ok: true,
+                unsupported: false,
                 currency: b.currency,
                 total: b.total,
                 used: b.used,
@@ -88,6 +101,7 @@ pub async fn query_balances(
                 provider_id: p.id.clone(),
                 provider_name: p.name.clone(),
                 ok: false,
+                unsupported,
                 currency: None,
                 total: None,
                 used: None,
@@ -127,10 +141,35 @@ fn num(v: &serde_json::Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
 }
 
+/// 预判该服务商是否未提供余额查询接口（按 host 判断，避免发起无意义的请求）。
+/// 返回 None=可能支持，继续探测；Some(原因)=确定不支持，直接标记 unsupported。
+fn unsupported_reason(base: &str, _protocol: &str) -> Option<String> {
+    let host = base
+        .replace("https://", "")
+        .replace("http://", "")
+        .to_lowercase();
+    let host = host.split('/').next().unwrap_or(&host);
+    if host.contains("bigmodel.cn") {
+        return Some("智谱 GLM 暂未开放余额查询接口，请到 open.bigmodel.cn 控制台查看".into());
+    }
+    if host.contains("dashscope.aliyuncs.com") {
+        return Some("阿里云百炼暂未开放余额查询接口，请到百炼控制台查看".into());
+    }
+    if host.contains("volces.com") {
+        return Some("火山方舟暂未开放余额查询接口，请到方舟控制台查看".into());
+    }
+    // MiniMax（含 Coding Plan）：官方未开放余额查询接口
+    if host.contains("minimaxi.com") || host.contains("minimax.io") {
+        return Some("MiniMax 暂未开放余额查询接口，请到平台控制台查看".into());
+    }
+    None
+}
+
 async fn query_one(
     client: &reqwest::Client,
     base: &str,
     api_key: Option<&str>,
+    protocol: &str,
 ) -> Result<BalanceInfo, String> {
     let host = base
         .replace("https://", "")
@@ -138,7 +177,7 @@ async fn query_one(
         .to_lowercase();
     let host = host.split('/').next().unwrap_or(&host);
 
-    // DeepSeek 官方
+    // DeepSeek 官方（含 anthropic 端点：余额接口按 origin 查询，与协议无关）
     if host.contains("deepseek.com") {
         return deepseek(client, base, api_key).await;
     }
@@ -154,15 +193,9 @@ async fn query_one(
     if host.contains("openrouter.ai") {
         return openrouter(client, base, api_key).await;
     }
-    // 未开放余额查询接口的服务商：直接给出明确提示，避免走通用端点返回怪异错误
-    if host.contains("bigmodel.cn") {
-        return Err("智谱 GLM 暂未开放余额查询接口，请到 open.bigmodel.cn 控制台查看".into());
-    }
-    if host.contains("dashscope.aliyuncs.com") {
-        return Err("阿里云百炼暂未开放余额查询接口，请到百炼控制台查看".into());
-    }
-    if host.contains("volces.com") {
-        return Err("火山方舟暂未开放余额查询接口，请到方舟控制台查看".into());
+    // Anthropic / Gemini 原生协议端点（含 Coding Plan 等订阅类端点）不走 OpenAI 兼容 billing 接口
+    if protocol == "anthropic" || protocol == "gemini" {
+        return Err("该服务商为订阅/原生协议，未提供 OpenAI 兼容的余额查询接口".into());
     }
     // one-api / new-api 网关与其他 OpenAI 兼容端点：尝试 billing 接口
     openai_compatible_billing(client, base, api_key).await
@@ -201,7 +234,13 @@ async fn openai_compatible_billing(
     api_key: Option<&str>,
 ) -> Result<BalanceInfo, String> {
     let sub_url = format!("{base}/dashboard/billing/subscription");
-    let sub = auth_get(client, &sub_url, api_key).await?;
+    // 通用端点常无 billing 路由（404），降级为明确提示，避免展示裸 404
+    let sub = match auth_get(client, &sub_url, api_key).await {
+        Err(e) if e.starts_with("HTTP 404") => {
+            return Err("该服务商未提供余额查询接口（billing 端点不可用）".into());
+        }
+        r => r?,
+    };
 
     // 总额度：优先 hard_limit_usd（OpenAI），其次 system_hard_limit_usd
     let total = sub

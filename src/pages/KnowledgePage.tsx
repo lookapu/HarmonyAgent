@@ -102,7 +102,7 @@ export default function KnowledgePage() {
         </div>
         <button
           onClick={() => { resetForm(); setShowForm(!showForm) }}
-          className="h-9 px-4 rounded-[10px] bg-[var(--accent)] text-white text-[13px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all"
+          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium  active:scale-[0.98] transition-all"
         >
           <span className="flex items-center gap-1.5">
             <Icon name={showForm ? 'close' : 'plus'} size={14} white />
@@ -118,7 +118,7 @@ export default function KnowledgePage() {
             className={`h-7 px-3 rounded-md text-[12px] transition-all ${
               effectiveScope === 'global'
                 ? 'bg-[var(--bg-card)] text-[var(--text-primary)] shadow-sm'
-                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                : 'tab-inactive'
             }`}
           >
             {t('common.scopeGlobal')}
@@ -128,7 +128,7 @@ export default function KnowledgePage() {
             className={`h-7 px-3 rounded-md text-[12px] transition-all ${
               effectiveScope === 'project'
                 ? 'bg-[var(--bg-card)] text-[var(--text-primary)] shadow-sm'
-                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                : 'tab-inactive'
             }`}
           >
             {t('common.scopeProject')}
@@ -143,7 +143,7 @@ export default function KnowledgePage() {
       )}
 
       {showForm && (
-        <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-xl p-4 space-y-3">
+        <div className="modern-card rounded-xl p-4 space-y-3">
           <div>
             <label className="block text-xs text-[var(--text-secondary)] mb-1">{t('knowledge.keywords')}</label>
             <input
@@ -186,7 +186,7 @@ export default function KnowledgePage() {
           <button
             onClick={handleSave}
             disabled={saving}
-            className="h-9 px-4 rounded-lg bg-[var(--accent)] text-white text-[13px] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+            className="h-9 px-4 rounded-lg btn-primary text-[13px]  disabled:opacity-50"
           >
             {editingId ? t('knowledge.saveEdit') : t('knowledge.save')}
           </button>
@@ -195,12 +195,12 @@ export default function KnowledgePage() {
 
       <div className="space-y-2">
         {entries.length === 0 && (
-          <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-8 text-center text-sm text-[var(--text-secondary)]">
+          <div className="modern-card rounded-lg p-8 text-center text-sm text-[var(--text-secondary)]">
             {t('knowledge.empty')}
           </div>
         )}
         {entries.map((e) => (
-          <div key={e.id} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-xl p-4">
+          <div key={e.id} className="modern-card rounded-xl p-4">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 flex-wrap">
@@ -269,3 +269,8 @@ export default function KnowledgePage() {
     </div>
   )
 }
+
+
+
+
+

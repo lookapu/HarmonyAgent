@@ -22,9 +22,38 @@
   --accent-glow: rgba(91, 140, 255, 0.28);
   --accent-strong: #7aa2ff;
 
+  /* Accent 色阶：hover/active/selected 状态用不同明度，比纯调透明度更专业 */
+  --accent-50: rgba(91, 140, 255, 0.06);
+  --accent-100: rgba(91, 140, 255, 0.12);
+  --accent-500: #5b8cff;
+  --accent-600: #4a7bff;
+  --accent-700: #3d6bf0;
+  --accent-900: #2548a8;
+
   --success: #34d399;
   --warning: #fbbf24;
   --danger: #f87171;
+
+  /* 语义色阶：同 accent 一致，状态色也分多档 */
+  --success-50: rgba(52, 211, 153, 0.10);
+  --success-100: rgba(52, 211, 153, 0.18);
+  --success-500: #34d399;
+  --warning-50: rgba(251, 191, 36, 0.12);
+  --warning-100: rgba(251, 191, 36, 0.22);
+  --warning-500: #fbbf24;
+  --warning-600: #d97706;
+  --danger-50: rgba(248, 113, 113, 0.10);
+  --danger-500: #f87171;
+
+  /* 消息角色专用色（user / agent / system / tool） */
+  --role-user: #5b8cff;
+  --role-user-soft: rgba(91, 140, 255, 0.10);
+  --role-agent: #a78bfa;
+  --role-agent-soft: rgba(167, 139, 250, 0.10);
+  --role-system: #94a3b8;
+  --role-system-soft: rgba(148, 163, 184, 0.10);
+  --role-tool: #34d399;
+  --role-tool-soft: rgba(52, 211, 153, 0.10);
 
   --border: rgba(255, 255, 255, 0.07);
   --border-strong: rgba(255, 255, 255, 0.12);
@@ -35,6 +64,23 @@
   --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
   --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
   --ring: 0 0 0 3px var(--accent-soft);
+
+  /* 动效常量：统一在 CSS 里管理，避免组件各自写魔法数 */
+  --motion-fast: 0.12s;
+  --motion-base: 0.18s;
+  --motion-slow: 0.25s;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* 圆角层级 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+
+  /* 等宽数字：用于 token/时长/计数 */
+  --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  --tabular-nums: font-variant-numeric: tabular-nums;
 }
 
 [data-theme="light"] {
@@ -55,19 +101,60 @@
   --accent-glow: rgba(59, 111, 245, 0.22);
   --accent-strong: #2f5fe6;
 
+  /* Accent 色阶（亮色） */
+  --accent-50: rgba(59, 111, 245, 0.05);
+  --accent-100: rgba(59, 111, 245, 0.10);
+  --accent-500: #3b6ff5;
+  --accent-600: #2f5fe6;
+  --accent-700: #244ed4;
+  --accent-900: #1a3999;
+
   --success: #16a34a;
   --warning: #d97706;
   --danger: #dc2626;
+
+  /* 语义色阶（亮色） */
+  --success-50: rgba(22, 163, 74, 0.08);
+  --success-100: rgba(22, 163, 74, 0.14);
+  --success-500: #16a34a;
+  --warning-50: rgba(217, 119, 6, 0.10);
+  --warning-100: rgba(217, 119, 6, 0.18);
+  --warning-500: #d97706;
+  --warning-600: #b45309;
+  --danger-50: rgba(220, 38, 38, 0.08);
+  --danger-500: #dc2626;
+
+  /* 消息角色专用色（亮色） */
+  --role-user: #3b6ff5;
+  --role-user-soft: rgba(59, 111, 245, 0.08);
+  --role-agent: #7c3aed;
+  --role-agent-soft: rgba(124, 58, 237, 0.08);
+  --role-system: #64748b;
+  --role-system-soft: rgba(100, 116, 139, 0.08);
+  --role-tool: #16a34a;
+  --role-tool-soft: rgba(22, 163, 74, 0.08);
 
   --border: rgba(15, 23, 42, 0.08);
   --border-strong: rgba(15, 23, 42, 0.14);
   --scrollbar: rgba(15, 23, 42, 0.18);
   --icon-filter: brightness(0);
 
-  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
-  --shadow-md: 0 4px 16px rgba(15, 23, 42, 0.08);
-  --shadow-lg: 0 12px 32px rgba(15, 23, 42, 0.12);
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 2px 8px rgba(15, 23, 42, 0.06), 0 6px 20px rgba(15, 23, 42, 0.08);
+  --shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.10), 0 16px 48px rgba(15, 23, 42, 0.10);
   --ring: 0 0 0 3px var(--accent-soft);
+
+  /* 动效常量 + 圆角 + 等宽数字：与暗色主题一致 */
+  --motion-fast: 0.12s;
+  --motion-base: 0.18s;
+  --motion-slow: 0.25s;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
 }
 
 /* 基础重置（放入 base 层，避免覆盖 Tailwind utilities） */
@@ -148,7 +235,10 @@ button:not(:disabled) {
   }
   to {
     opacity: 1;
-    transform: translateY(0);
+    /* transform 必须为 none：fill-mode: both 会永久保留 to 帧，
+       非 none 的 transform（即使 translateY(0)）会让容器成为 fixed 后代的包含块，
+       导致右栏内弹窗（文件预览/截图放大）被限制在右栏区域内 */
+    transform: none;
   }
 }
 
@@ -187,7 +277,8 @@ button:not(:disabled) {
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    /* 同上：to 帧保持 transform: none，避免弹窗自身成为内部 fixed 后代的包含块 */
+    transform: none;
   }
 }
 
@@ -642,7 +733,8 @@ button:focus-visible {
   overflow-x: auto;
   font-size: 0.8em;
   line-height: 1.6;
-  font-family: ui-monospace, SFMono-Regular, Consolas, 'Cascadia Code', monospace;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 .md-codeblock-pre code {
   background: transparent !important;
@@ -686,6 +778,10 @@ button:focus-visible {
   --hljs-tag: #116329;
   --hljs-meta: #0550ae;
   --hljs-var: #953800;
+}
+/* 亮色主题代码块字号略大（白底阅读密度低），保持可读性 */
+[data-theme='light'] .md-codeblock-pre {
+  font-size: 0.86em;
 }
 
 .hljs-comment,
@@ -1544,5 +1640,795 @@ button:focus-visible {
 }
 .no-scrollbar::-webkit-scrollbar {
   display: none;
+}
+
+/* ============ UI 美化 2.0：消息角色 / 任务脉冲 / 流式高亮 / 等宽数字 ============ */
+
+/* 等宽数字：用于 token/时长/计数/百分比（所有数据展示） */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* 消息角色：左 3px 强调条 + 极淡角色色背景（user 消息右对齐 + 角色色） */
+.msg-role {
+  position: relative;
+  padding: 0.65rem 0.9rem 0.65rem 1.05rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+}
+.msg-role::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.6rem;
+  bottom: 0.6rem;
+  width: 3px;
+  border-radius: 2px;
+}
+.msg-role-user {
+  background: var(--role-user-soft);
+  border-color: color-mix(in srgb, var(--role-user) 22%, var(--border));
+}
+.msg-role-user::before { background: var(--role-user); }
+.msg-role-agent {
+  background: var(--bg-card);
+}
+.msg-role-agent::before { background: var(--role-agent); }
+.msg-role-system {
+  background: var(--role-system-soft);
+  border-color: var(--border);
+  border-style: dashed;
+}
+.msg-role-system::before { background: var(--role-system); }
+.msg-role-tool {
+  background: var(--role-tool-soft);
+  border-color: color-mix(in srgb, var(--role-tool) 22%, var(--border));
+}
+.msg-role-tool::before { background: var(--role-tool); }
+
+/* 角色名标签（小帽徽章，跟在头像后面） */
+.role-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.5rem;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.role-tag-user {
+  color: var(--role-user);
+  background: color-mix(in srgb, var(--role-user) 12%, transparent);
+  border-color: color-mix(in srgb, var(--role-user) 30%, var(--border));
+}
+.role-tag-agent {
+  color: var(--role-agent);
+  background: color-mix(in srgb, var(--role-agent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--role-agent) 30%, var(--border));
+}
+.role-tag-system {
+  color: var(--role-system);
+  background: var(--role-system-soft);
+  border-color: var(--border);
+}
+.role-tag-tool {
+  color: var(--role-tool);
+  background: color-mix(in srgb, var(--role-tool) 12%, transparent);
+  border-color: color-mix(in srgb, var(--role-tool) 30%, var(--border));
+}
+
+/* 任务完成：左侧成功色竖条 + 抬升 + 短暂脉冲高亮（流式结束触发） */
+.task-complete {
+  position: relative;
+  padding: 0.65rem 1rem 0.65rem 1.1rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in srgb, var(--success) 35%, var(--border));
+  background: var(--success-50);
+  box-shadow: var(--shadow-sm);
+}
+.task-complete::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.5rem;
+  bottom: 0.5rem;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--success);
+}
+@keyframes task-complete-pulse {
+  0% { box-shadow: 0 0 0 0 var(--success-100), var(--shadow-sm); }
+  50% { box-shadow: 0 0 0 6px transparent, var(--shadow-md); }
+  100% { box-shadow: 0 0 0 0 transparent, var(--shadow-sm); }
+}
+.task-complete-pulse {
+  animation: task-complete-pulse 0.8s var(--ease-out) 1;
+}
+
+/* 任务进行中（淡黄色脉动） */
+.task-progress {
+  position: relative;
+  padding: 0.45rem 0.85rem 0.45rem 0.95rem;
+  border-radius: var(--radius-md);
+  border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border));
+  background: var(--warning-50);
+}
+.task-progress::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.4rem;
+  bottom: 0.4rem;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--warning);
+  animation: status-pulse 1.6s ease-out infinite;
+}
+
+/* 任务失败 */
+.task-failed {
+  position: relative;
+  padding: 0.45rem 0.85rem 0.45rem 0.95rem;
+  border-radius: var(--radius-md);
+  border: 1px solid color-mix(in srgb, var(--danger) 32%, var(--border));
+  background: var(--danger-50);
+}
+.task-failed::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.4rem;
+  bottom: 0.4rem;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--danger);
+}
+
+/* 上下文进度条：横在输入框上方，细 2px，按占比变色 */
+.context-meter {
+  position: relative;
+  height: 2px;
+  background: var(--border);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.context-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent);
+  border-radius: 1px;
+  transition: width 0.3s var(--ease-out), background-color 0.3s;
+}
+.context-meter-fill[data-level='warn'] {
+  background: var(--warning);
+}
+.context-meter-fill[data-level='danger'] {
+  background: var(--danger);
+  animation: status-pulse 1.4s ease-out infinite;
+  --pulse-color: var(--danger-50);
+}
+
+/* 代码块流式高亮：左侧 2px 渐变流动条（流式未完成时显示） */
+.codeblock-streaming {
+  position: relative;
+}
+.codeblock-streaming::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--accent) 50%,
+    transparent 100%
+  );
+  background-size: 100% 200%;
+  animation: code-stream-flow 1.5s linear infinite;
+  pointer-events: none;
+  z-index: 1;
+}
+@keyframes code-stream-flow {
+  0% { background-position: 0 -100%; }
+  100% { background-position: 0 100%; }
+}
+
+/* 按钮 active 双反馈：scale + 内阴影 */
+button:active:not(:disabled),
+[role='button']:active:not(:disabled) {
+  transform: scale(0.97);
+  box-shadow: inset 0 0 0 2px var(--accent-100);
+}
+
+/* 主操作按钮在原有渐变基础上加更精致的内阴影 */
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent-500), var(--accent-700));
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--accent-hover), var(--accent-600));
+  box-shadow:
+    0 4px 14px var(--accent-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+/* 浮窗卡片：现代玻璃感（背景 + backdrop-filter + 强调描边） */
+.glass-card {
+  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  backdrop-filter: blur(16px) saturate(150%);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+}
+
+/* 渐变光晕装饰（输入框聚焦时四角微光） */
+.glow-accent {
+  position: relative;
+}
+.glow-accent::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, var(--accent-glow), transparent 60%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--motion-base) var(--ease-out);
+  z-index: -1;
+}
+.glow-accent:focus-within::after {
+  opacity: 1;
+}
+
+/* 列表项 hover：左侧 accent 滑入（用于会话/工作区/文件列表） */
+.list-row {
+  position: relative;
+  transition: background-color var(--motion-fast) var(--ease-out);
+}
+.list-row::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  transform: scaleY(0);
+  transform-origin: center;
+  transition: transform var(--motion-base) var(--ease-spring);
+}
+.list-row:hover::before,
+.list-row.is-active::before {
+  transform: scaleY(1);
+}
+
+/* 时间分组标题：会话列表"今天/昨天/更早" */
+.group-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.5rem 0.35rem;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.group-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* 标签徽章语言色（统一管理：Java/Vue/HarmonyOS/静态站点等） */
+.lang-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.45rem;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+}
+.lang-badge-java { color: #f59e0b; background: color-mix(in srgb, #f59e0b 14%, transparent); }
+.lang-badge-vue { color: #16a34a; background: color-mix(in srgb, #16a34a 14%, transparent); }
+.lang-badge-go { color: #06b6d4; background: color-mix(in srgb, #06b6d4 14%, transparent); }
+.lang-badge-rust { color: #ef4444; background: color-mix(in srgb, #ef4444 14%, transparent); }
+.lang-badge-ts { color: #3b82f6; background: color-mix(in srgb, #3b82f6 14%, transparent); }
+.lang-badge-harmonyos { color: #5b8cff; background: var(--accent-soft); }
+.lang-badge-static { color: #94a3b8; background: color-mix(in srgb, #94a3b8 14%, transparent); }
+.lang-badge-default { color: var(--text-secondary); background: var(--bg-hover); }
+
+/* 回到最新浮动按钮 */
+.scroll-to-bottom {
+  position: absolute;
+  right: 1.2rem;
+  bottom: 1.2rem;
+  z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 500;
+  box-shadow: var(--shadow-md);
+  transition: opacity var(--motion-base) var(--ease-out),
+    transform var(--motion-base) var(--ease-out),
+    color var(--motion-fast) var(--ease-out);
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+}
+.scroll-to-bottom.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+.scroll-to-bottom:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+}
+
+/* 通用 modal backdrop（黑半透明 + 模糊） */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, #000 50%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  z-index: 100;
+  animation: fade-in 0.15s var(--ease-out) both;
+}
+/* 命令面板 backdrop（居中、顶部 12vh 偏移——⌘K 视觉上更靠近顶部触发点） */
+.cmdk-backdrop {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, #000 50%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  z-index: 100;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  animation: fade-in 0.15s var(--ease-out) both;
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* 消息时间戳（hover 消息时浮现，弱化常驻视觉噪声） */
+.msg-timestamp {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity var(--motion-fast) var(--ease-out);
+  font-variant-numeric: tabular-nums;
+}
+.msg-row:hover .msg-timestamp {
+  opacity: 1;
+}
+
+/* 工具调用卡片折叠/展开 */
+.tool-card-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-out),
+    border-color var(--motion-fast) var(--ease-out);
+}
+.tool-card-summary:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+.tool-card-summary .chevron {
+  transition: transform var(--motion-base) var(--ease-out);
+  color: var(--text-muted);
+}
+.tool-card-summary[aria-expanded='true'] .chevron {
+  transform: rotate(90deg);
+}
+.tool-card-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--motion-base) var(--ease-out);
+}
+.tool-card-body > div {
+  overflow: hidden;
+  min-height: 0;
+}
+.tool-card-summary[aria-expanded='true'] + .tool-card-body {
+  grid-template-rows: 1fr;
+}
+
+/* ============ 亮色主题深度优化：让所有页面在白底下更精致 ============ */
+
+/* 亮色主题下：按钮渐变调整（避免深色专属的深色渐变在白底变脏） */
+[data-theme='light'] .btn-primary {
+  background: linear-gradient(135deg, var(--accent-500), var(--accent-600));
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+[data-theme='light'] .btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--accent-600), var(--accent-700));
+  box-shadow:
+    0 4px 14px var(--accent-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4);
+}
+
+/* 亮色主题下：次级按钮在白底上需要更明确的边界 */
+[data-theme='light'] .btn-ghost {
+  background: #ffffff;
+  border-color: rgba(15, 23, 42, 0.10);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+[data-theme='light'] .btn-ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border-strong));
+}
+
+/* 亮色主题下：现代卡片的白底要稍微区分层次 */
+[data-theme='light'] .modern-card {
+  background: #ffffff;
+  border-color: rgba(15, 23, 42, 0.07);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+/* 亮色主题下：lift-card 悬停阴影更轻 */
+[data-theme='light'] .lift-card:hover {
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+}
+
+/* 亮色主题下：键盘键帽（kbd）更立体 */
+[data-theme='light'] kbd {
+  background: #ffffff;
+  border-color: rgba(15, 23, 42, 0.12);
+  box-shadow: 0 1px 0 rgba(15, 23, 42, 0.08);
+  color: var(--text-secondary);
+}
+
+/* 亮色主题下：玻璃卡片用白底+阴影，不用 backdrop-filter（白底背景模糊效果弱） */
+[data-theme='light'] .glass-card {
+  background: rgba(255, 255, 255, 0.85);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  backdrop-filter: blur(12px) saturate(150%);
+  border-color: rgba(15, 23, 42, 0.10);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+}
+
+/* 亮色主题下：上下文进度条轨道颜色用更柔和的灰 */
+[data-theme='light'] .context-meter {
+  background: rgba(15, 23, 42, 0.08);
+}
+
+/* 亮色主题下：input/select/textarea 默认边框强化一点（白底上更醒目） */
+[data-theme='light'] input,
+[data-theme='light'] select,
+[data-theme='light'] textarea {
+  border-color: rgba(15, 23, 42, 0.12);
+}
+
+/* 亮色主题下：任务完成/进行/失败卡片背景更淡（白底叠加） */
+[data-theme='light'] .task-complete {
+  background: rgba(22, 163, 74, 0.06);
+  border-color: rgba(22, 163, 74, 0.32);
+}
+[data-theme='light'] .task-progress {
+  background: rgba(217, 119, 6, 0.08);
+  border-color: rgba(217, 119, 6, 0.28);
+}
+[data-theme='light'] .task-failed {
+  background: rgba(220, 38, 38, 0.06);
+  border-color: rgba(220, 38, 38, 0.30);
+}
+
+/* 亮色主题下：消息角色卡片背景更淡 */
+[data-theme='light'] .msg-role {
+  background: #ffffff;
+  border-color: rgba(15, 23, 42, 0.08);
+}
+[data-theme='light'] .msg-role-user {
+  background: rgba(59, 111, 245, 0.05);
+  border-color: rgba(59, 111, 245, 0.22);
+}
+[data-theme='light'] .msg-role-tool {
+  background: rgba(22, 163, 74, 0.05);
+  border-color: rgba(22, 163, 74, 0.22);
+}
+
+/* 亮色主题下：flow-status-pulse 颜色调淡 */
+[data-theme='light'] .status-dot {
+  --pulse-color: rgba(59, 111, 245, 0.20);
+}
+
+/* 亮色主题下：代码块头部颜色用更柔和的过渡 */
+[data-theme='light'] .md-codeblock-head {
+  background: linear-gradient(180deg, #f9fafb, #eef1f6);
+}
+
+/* 亮色主题下：滚动条颜色更深（白底上更醒目） */
+[data-theme='light'] ::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.20);
+}
+[data-theme='light'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.35);
+}
+
+/* 亮色主题下：语言徽章颜色加亮（白底反差更大） */
+[data-theme='light'] .lang-badge-java { color: #b45309; background: rgba(245, 158, 11, 0.16); }
+[data-theme='light'] .lang-badge-vue { color: #15803d; background: rgba(22, 163, 74, 0.16); }
+[data-theme='light'] .lang-badge-go { color: #0e7490; background: rgba(6, 182, 212, 0.16); }
+[data-theme='light'] .lang-badge-rust { color: #b91c1c; background: rgba(239, 68, 68, 0.16); }
+[data-theme='light'] .lang-badge-ts { color: #1d4ed8; background: rgba(59, 130, 246, 0.16); }
+[data-theme='light'] .lang-badge-harmonyos { color: var(--accent-600); background: var(--accent-100); }
+[data-theme='light'] .lang-badge-static { color: #475569; background: rgba(148, 163, 184, 0.16); }
+
+/* ============ 通用：Tab 激活态 / 筛选激活态（统一封装） ============ */
+.tab-active {
+  background: var(--accent);
+  color: #ffffff;
+  transition: background-color var(--motion-fast) var(--ease-out);
+}
+.tab-inactive {
+  color: var(--text-secondary);
+  transition: color var(--motion-fast) var(--ease-out), background-color var(--motion-fast) var(--ease-out);
+}
+.tab-inactive:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+/* 弱化 Tab 激活态（不强调，只是 hover 底色 + 文字色）—— 用于子 Tab/二级切换 */
+.tab-soft {
+  background: var(--bg-card);
+  color: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+.tab-soft:hover {
+  background: var(--bg-card);
+}
+
+/* 状态徽章统一：info/ok/warn/bad 四色 */
+.badge-tone {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.5rem;
+  font-size: 10.5px;
+  font-weight: 600;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.badge-tone-info { color: var(--accent); background: var(--accent-100); }
+.badge-tone-ok { color: var(--success); background: var(--success-100); }
+.badge-tone-warn { color: var(--warning-600); background: var(--warning-50); }
+.badge-tone-bad { color: var(--danger); background: var(--danger-50); }
+
+/* 亮色主题下徽章颜色加深 */
+[data-theme='light'] .badge-tone-warn { color: #b45309; background: rgba(217, 119, 6, 0.14); }
+[data-theme='light'] .badge-tone-ok { color: #15803d; background: rgba(22, 163, 74, 0.14); }
+
+/* ============ GPU 合成层优化：按渲染分级启停硬件加速 ============ */
+
+/*
+ * 核心思路：
+ * - high/medium tier（硬件加速可用）：将滚动容器、虚拟列表项、弹窗等提升到 GPU 合成层，
+ *   使用 will-change + transform: translateZ(0) 触发独立合成层，滚动/动画走 GPU 不阻塞主线程；
+ *   contain: layout paint size 限制重排/重绘范围；content-visibility 跳过离屏元素渲染。
+ * - low tier（软件渲染/无 GPU）：禁用 will-change、backdrop-filter、阴影、复杂动画等效果，
+ *   避免在 CPU 软件光栅化路径上产生额外合成开销（软件渲染下合成层越多越慢）。
+ * - Mac 平台额外优化：Core Animation 合成器对 transform 动画效率极高，可放心使用更多合成层。
+ */
+
+/* ---- 通用合成层提示：high/medium tier 启用，low tier 禁用 ---- */
+
+/* 聊天滚动容器：独立合成层 + 滚动锚定，避免滚动时整棵子树重排 */
+.render-tier-high .chat-scroll,
+.render-tier-medium .chat-scroll {
+  will-change: scroll-position;
+  contain: strict;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+/* 虚拟列表项：提升到合成层，滚动时 GPU 直接移动纹理无需重绘 */
+.render-tier-high .chat-scroll > *,
+.render-tier-medium .chat-scroll > * {
+  contain: layout paint;
+  content-visibility: auto;
+  contain-intrinsic-size: 1px 200px;
+}
+
+/* high tier 更激进：消息气泡也提升到合成层，滚动时完全不触发 paint */
+.render-tier-high .msg-role,
+.render-tier-high .md-codeblock,
+.render-tier-high .thinking-block,
+.render-tier-high .tool-card-summary {
+  contain: layout paint;
+  will-change: transform;
+}
+
+/* 弹窗/浮层：独立合成层避免 backdrop-filter 时底层重绘 */
+.render-tier-high .glass-card,
+.render-tier-medium .glass-card,
+.render-tier-high .modal-backdrop,
+.render-tier-medium .modal-backdrop,
+.render-tier-high .cmdk-backdrop,
+.render-tier-medium .cmdk-backdrop,
+.render-tier-high .glass-bar,
+.render-tier-medium .glass-bar {
+  will-change: transform, opacity;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+}
+
+/* ---- low tier（软件渲染/无 GPU 加速）：降级策略 ---- */
+
+/* 禁用 will-change（软件渲染下合成层无意义，反而增加内存占用和 CPU 合成开销） */
+.render-tier-low .chat-scroll,
+.render-tier-low .chat-scroll > *,
+.render-tier-low .msg-role,
+.render-tier-low .glass-card,
+.render-tier-low .modal-backdrop,
+.render-tier-low .cmdk-backdrop,
+.render-tier-low .glass-bar {
+  will-change: auto !important;
+  transform: none !important;
+  contain: none !important;
+  content-visibility: visible !important;
+}
+
+/* 禁用 backdrop-filter（软件渲染下高斯模糊是灾难性性能杀手） */
+.render-tier-low .glass-card,
+.render-tier-low .glass-bar,
+.render-tier-low .modal-backdrop,
+.render-tier-low .cmdk-backdrop,
+.render-tier-low .animate-modal-in {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+/* 简化玻璃卡片为实色背景（无模糊无透明叠加） */
+.render-tier-low .glass-card {
+  background: var(--bg-elevated) !important;
+}
+.render-tier-low .glass-bar {
+  background: var(--bg-secondary) !important;
+}
+.render-tier-low .modal-backdrop,
+.render-tier-low .cmdk-backdrop {
+  background: rgba(0, 0, 0, 0.6) !important;
+}
+
+/* 禁用/简化阴影（软件渲染下多层 box-shadow 是逐像素计算，开销大） */
+.render-tier-low .shadow-md,
+.render-tier-low .shadow-lg,
+.render-tier-low .glass-card,
+.render-tier-low .btn-primary,
+.render-tier-low .scroll-to-bottom {
+  box-shadow: var(--shadow-sm) !important;
+}
+.render-tier-low .glow-accent::after {
+  display: none !important;
+}
+
+/* 禁用复杂动画/脉冲效果（减少主线程定时器和重绘） */
+.render-tier-low .thinking-block-icon {
+  animation: none !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent) !important;
+}
+.render-tier-low .status-dot {
+  animation: none !important;
+}
+.render-tier-low .codeblock-streaming::before {
+  animation: none !important;
+  opacity: 0.5;
+}
+.render-tier-low .shimmer::after {
+  animation-duration: 3s !important;
+}
+
+/* 禁用 smooth 滚动（软件渲染下 smooth 动画每帧都要重绘） */
+.render-tier-low .chat-scroll {
+  scroll-behavior: auto !important;
+}
+.render-tier-low .right-tabbar {
+  scroll-behavior: auto !important;
+}
+
+/* 降低按钮 active 动效复杂度（取消 scale，只用内阴影反馈） */
+.render-tier-low button:active:not(:disabled),
+.render-tier-low [role='button']:active:not(:disabled) {
+  transform: none !important;
+}
+.render-tier-low .lift-card:hover {
+  transform: none !important;
+}
+
+/* ---- Mac 平台专属优化：Core Animation 合成器效率高，可更激进使用合成层 ---- */
+[data-platform='mac'].render-tier-high .chat-scroll > * {
+  /* Mac Metal 下合成层开销极低，所有消息项都提升到独立层 */
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+}
+
+/* ---- Windows 平台专属优化：注意远程桌面/软件渲染场景已在 low tier 处理 ---- */
+/* Windows 下硬件加速正常时使用标准配置，无需额外调整；
+   Microsoft Basic Render Driver / SwiftShader 已被识别为 low tier 走降级路径 */
+
+/* ---- 代码块：硬件加速下启用子像素抗锯齿，软件渲染下禁用以减少 CPU 开销 ---- */
+.render-tier-high .md-codeblock-pre,
+.render-tier-medium .md-codeblock-pre {
+  -webkit-font-smoothing: subpixel-antialiased;
+}
+.render-tier-low .md-codeblock-pre {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeSpeed;
+}
+
+/* ---- 流式光标：low tier 降低闪烁频率减少重绘 ---- */
+.render-tier-low .typing-cursor {
+  animation-duration: 1.8s !important;
+  box-shadow: none !important;
+}
+
+/* ============ 调试 ID 徽章：用于排查问题时查看/复制会话/消息/项目 ID ============ */
+
+.debug-id-badge {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  user-select: all;
+  -webkit-user-select: all;
+  line-height: 1.4;
+  cursor: pointer;
+  /* 防止选中时文本颜色被覆盖 */
+  -webkit-tap-highlight-color: transparent;
+}
+
+.debug-id-badge:active {
+  transform: scale(0.95);
+}
+
+/* 顶部栏 ID 徽章：始终可见，风格与 token 徽章一致 */
+header .debug-id-badge {
+  font-size: 9.5px;
+  padding: 2px 6px;
+}
+
+/* 消息头部 ID 徽章：低透明度，不干扰阅读，hover 时高亮 */
+.debug-id-badge:hover {
+  opacity: 1 !important;
+}
+
+/* 复制成功时的短暂高亮 */
+.debug-id-badge .text-\[var\(--success\)\] {
+  display: inline-flex;
+  align-items: center;
 }
 

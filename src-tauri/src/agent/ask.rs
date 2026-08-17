@@ -8,6 +8,8 @@
 //! run_tool 无 State 访问，静态表避免改 run_tool 签名；挂起期间 stop_chat 通过
 //! cancel_conversation 关闭通道实现立即退出。
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use tokio::sync::oneshot;
 
 #[derive(Clone, serde::Serialize)]
@@ -16,6 +18,21 @@ pub struct AskEvent {
     pub request_id: String,
     pub question: String,
     pub options: Vec<String>,
+}
+
+/// 一条已答复的提问记录（问题历史）
+#[derive(Clone, serde::Serialize)]
+pub struct AskRecord {
+    pub question: String,
+    pub options: Vec<String>,
+    /// 用户的实际回答（跳过/超时为空串）
+    pub answer: String,
+    /// 答复时的 unix 秒
+    pub at: i64,
+}
+
+fn now_sec() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// 访问会话级提问等待表（统一收敛到 SessionContext，锁由进程级单例持有）
@@ -64,16 +81,42 @@ pub fn remove(request_id: &str) {
     table().ask_waiters.remove(request_id);
 }
 
-/// 用户回答：把回答文本送回通道。
+/// 用户回答：把回答文本送回通道，并写入该会话的问题历史。
 pub fn resolve(request_id: &str, answer: String) -> bool {
-    let tx = table().ask_waiters.remove(request_id).map(|(_, tx)| tx);
-    match tx {
-        Some(tx) => {
-            let _ = tx.send(answer);
+    let removed = table().ask_waiters.remove(request_id);
+    match removed {
+        Some((ev, tx)) => {
+            let _ = tx.send(answer.clone());
+            record_history(&ev.conversation_id, &ev, &answer);
             true
         }
         None => false,
     }
+}
+
+/// 记录一条已答复的提问（每会话最多保留 20 条，超出丢弃最旧）。
+pub fn record_history(conversation_id: &str, ev: &AskEvent, answer: &str) {
+    let mut ctx = table();
+    let list = ctx.ask_history.entry(conversation_id.to_string()).or_default();
+    list.push(AskRecord {
+        question: ev.question.clone(),
+        options: ev.options.clone(),
+        answer: answer.to_string(),
+        at: now_sec(),
+    });
+    if list.len() > 20 {
+        let drop_n = list.len() - 20;
+        list.drain(0..drop_n);
+    }
+}
+
+/// 查询会话内已答复的提问历史（新 → 旧，最多 limit 条）。
+pub fn history(conversation_id: &str, limit: usize) -> Vec<AskRecord> {
+    table()
+        .ask_history
+        .get(conversation_id)
+        .map(|l| l.iter().rev().take(limit.clamp(1, 20)).cloned().collect())
+        .unwrap_or_default()
 }
 
 /// 停止任务时关闭该会话所有未答复的提问（通道关闭 → 工具按"用户已停止"返回）。
@@ -104,6 +147,18 @@ mod tests {
         assert!(rx.blocking_recv().unwrap() == "是");
         assert!(!resolve(&rid, "again".into()));
         assert!(pending("ask-c1").is_none());
+    }
+
+    #[test]
+    fn history_records_answered() {
+        let rid = "ask-r3".to_string();
+        let _rx = wait("ask-c3", rid.clone(), "选哪个？".into(), vec!["A".into(), "B".into()]);
+        assert!(resolve(&rid, "A".into()));
+        let h = history("ask-c3", 10);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].question, "选哪个？");
+        assert_eq!(h[0].answer, "A");
+        assert_eq!(h[0].options.len(), 2);
     }
 
     #[test]

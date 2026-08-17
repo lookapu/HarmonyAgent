@@ -45,15 +45,19 @@ futures-util = "0.3"
 thiserror = "1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
 keyring = { version = "3", features = ["windows-native"] }
 zip = "2"
+pdf-extract = { version = "0.7", default-features = false }
 fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
 encoding_rs = "0.8"
 sha2 = "0.10"
+regex = "1"
+local-ip-address = "0.6"
 candle-core = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
 # default-features = false 关闭 esaxx_fast(esaxx-rs/cpp 的 C++ 实现)与 progressbar，
@@ -65,4 +69,16 @@ winreg = "0.55"
 # 隐藏控制台（AllocConsole + SW_HIDE）：构建类子进程（hvigor worker 等孙进程）
 # 继承隐藏控制台而非新建窗口，解决 GUI 程序调用命令行工具时弹出 cmd 窗口的问题
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
+[target."cfg(any(windows, macos))".dependencies]
+trash = "5.2.6"
+
+# ── release 构建加速 ─────────────────────────────────────────────
+# incremental：大 crate（agent 工具链等单 crate 数千行）改动少量代码时只重编受影响文件，
+#   日常增量打包显著提速（代价：target 体积增大、产物优化略降）。
+# strip：去掉符号表，产物更小、链接更快。
+# 全量重建（cargo clean 后）建议用 scripts/build-quick.ps1 -Full（sccache 缓存）。
+[profile.release]
+incremental = true
+strip = true
 

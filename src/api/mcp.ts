@@ -47,6 +47,28 @@ export interface McpDraft {
   description: string | null
 }
 
+/** MCP 服务器使用统计（按服务器聚合 tool_runs 中 mcp__ 前缀工具的调用） */
+export interface McpUsageStat {
+  server_name: string
+  call_count: number
+  success_count: number
+  fail_count: number
+  avg_duration_ms: number | null
+  last_called_at: number | null
+  /** 该服务器下各工具明细 */
+  tools: McpToolUsage[]
+}
+
+/** MCP 单个工具的使用明细 */
+export interface McpToolUsage {
+  tool_name: string
+  call_count: number
+  success_count: number
+  fail_count: number
+  avg_duration_ms: number | null
+  last_called_at: number | null
+}
+
 export const listMcpServers = (projectId?: string | null) =>
   invoke<McpServer[]>('list_mcp_servers', { projectId: projectId ?? null })
 export const addMcpServer = (input: CreateMcpInput) => invoke<McpServer>('add_mcp_server', { input })
@@ -65,3 +87,6 @@ export const importMcpConfig = (json: string, targetProjectId: string | null, ov
   invoke<number>('import_mcp_config', { json, targetProjectId: targetProjectId ?? null, overwrite })
 export const fetchMcpFromUrl = (url: string, useProxy = false) =>
   invoke<McpDraft[]>('fetch_mcp_from_url', { url, useProxy })
+/** MCP 服务器使用统计；projectId 为空=全部项目（全局服务器跨项目调用也计入） */
+export const listMcpUsageStats = (projectId?: string | null) =>
+  invoke<McpUsageStat[]>('list_mcp_usage_stats', { projectId: projectId ?? null })

@@ -1,14 +1,26 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { JSX } from 'react'
+import { useVirtualizer } from '@tanstack/react-virtual'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
+import { useShallow } from 'zustand/react/shallow'
 import { listen } from '@tauri-apps/api/event'
-import { watch } from '@tauri-apps/plugin-fs'
+import { watch, writeTextFile, readTextFile } from '@tauri-apps/plugin-fs'
+import { save as dialogSave, open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import { open as shellOpen } from '@tauri-apps/plugin-shell'
 import { useProjectStore, type ToolRun } from '../stores/projectStore'
 import { useThemeStore } from '../stores/themeStore'
+import { useNotificationStore } from '../stores/notificationStore'
+import NotificationBell from '../components/NotificationBell'
+import { useAuditStore, type AuditCategory } from '../stores/auditStore'
+import { usePinStore, PIN_MAX_PER_CONV } from '../stores/pinStore'
+import { useRatingStore } from '../stores/ratingStore'
+import { useNoteStore, NOTE_MAX_LEN } from '../stores/noteStore'
 import {
   inspectProject,
   listConversations,
+  listConversationTags,
+  type TagCount,
   type ProjectInspect,
   type ChatOptions,
   type ChatMessage,
@@ -20,6 +32,7 @@ import {
   getConversationContext,
   type ConversationContextInfo,
   searchMessages,
+  searchMessagesAllProjects,
   type MessageSearchHit,
   rescanWorkspaceModules,
   setWorkspaceModules,
@@ -37,9 +50,16 @@ import {
   setConversationModel,
   projectScopedCounts,
   getHarmonyRoot,
+  type Project,
+  type Conversation,
+  listToolGroups,
+  queueMessage,
+  conversationRoot,
 } from '../api/project'
+import { toolsHealth } from '../api/health'
 import { sendNotification } from '../api/desktop'
 import { listProviders, listProviderModels, type ProviderModel } from '../api/provider'
+import { listPaletteCommands, type PaletteEntry } from '../api/palette'
 import { openTerminal } from '../api/terminal'
 import { getHarmonyEnv } from '../api/harmonyEnv'
 import { saveKnowledgeFromText } from '../api/knowledge'
@@ -68,9 +88,20 @@ import {
 import { BranchSelector, ModelSettingsPopover, PlanCard, TaskOpsBadge } from '../chat/components/plan'
 import { ToolRunGroup } from '../chat/components/toolRuns'
 import { FeedbackDialog, VersionDiffDialog, MemoryDraftDialog, EditMessageDialog, RulesDialog } from '../chat/components/dialogs'
-import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, PreviewPanel, TerminalPanel } from '../chat/components/panels'
+import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, PreviewPanel, TerminalPanel, ShellPanel } from '../chat/components/panels'
+import CommandPalette, { type PaletteCommand } from '../components/CommandPalette'
+import TimelinePanel from '../components/TimelinePanel'
 import { DevicesPanel, AnalyzePanel, SymbolsPanel } from '../chat/components/devicePanels'
 import { fmtElapsed, restoreSelectionRange, sanitizeToolMarkers } from '../chat/chatUtils'
+import { detectGpu, getRecommendedOverscan, shouldUseSmoothScroll } from '../utils/gpuDetect'
+import { getLastProjectId } from '../stores/slices/projectSlice'
+
+/** 消息区渲染条目：消息 / 工具组 / 日期分隔线 / 尾部动态区（流式消息、计划卡、工具徽章等，高度动态测量） */
+type RenderItem =
+  | { kind: 'msg'; key: string; message: ChatMessage; userMessageId: string }
+  | { kind: 'tools'; key: string; runs: ToolRun[] }
+  | { kind: 'divider'; key: string; label: string }
+  | { kind: 'tail'; key: string }
 
 /** 斜杠快捷指令清单：输入 / 触发，插入预置 prompt；action 触发额外行为（plan=开启计划模式，compact=手动压缩历史） */
 function getSlashCommands(t: (key: string) => string): { id: string; icon: IconName; title: string; prompt: string; action?: 'plan' | 'compact' }[] {
@@ -129,10 +160,33 @@ function compressImage(dataUrl: string): Promise<string> {
   })
 }
 
+/** 草稿持久化（按项目分区，localStorage；空串剔除避免残留） */
+const readDraftMap = (pid: string): Record<string, string> => {
+  try {
+    const raw = localStorage.getItem(`deveco-switch-drafts:${pid}`)
+    return raw ? (JSON.parse(raw) as Record<string, string>) : {}
+  } catch {
+    return {}
+  }
+}
+const writeDraftMap = (pid: string, m: Record<string, string>) => {
+  try {
+    const cleaned: Record<string, string> = {}
+    for (const [k, v] of Object.entries(m)) if (v) cleaned[k] = v
+    if (Object.keys(cleaned).length === 0) localStorage.removeItem(`deveco-switch-drafts:${pid}`)
+    else localStorage.setItem(`deveco-switch-drafts:${pid}`, JSON.stringify(cleaned))
+  } catch {
+    /* 容量满等，忽略 */
+  }
+}
+
 export default function Home() {
   const { t } = useTranslation()
   const navigate = useNavigate()
 
+  // useShallow：只在选出的字段对象浅比较变化时才触发 Home 重渲染，
+  // 否则裸 useProjectStore() 订阅整个 store，任何子切片变更（流式 content/思考增量、
+  // 未读数、标签计数等）都会让 Home 整棵子树重新执行，造成流式/切换会话期间卡顿。
   const {
     projects,
     currentProject,
@@ -140,10 +194,12 @@ export default function Home() {
     currentConversation,
     messages,
     streaming,
+    streamings,
     toolRuns,
     agentRuns,
     plan,
     toolApprovals,
+    pendingConfirmations,
     resolveToolApproval,
     diagnoseCards,
     dismissDiagnoseCard,
@@ -178,11 +234,13 @@ export default function Home() {
     rebuildIndex,
     memories,
     toolStats,
+    toolTokenStats,
     saveMemory,
     deleteMemory,
     setMemoryEnabled,
     loadMemories,
     loadToolStats,
+    loadToolTokenStats,
     rateMessage,
     summarizing,
     queueUserMessage,
@@ -201,8 +259,90 @@ export default function Home() {
     queuedList,
     refreshQueued,
     removeQueued,
-  } = useProjectStore()
-  const theme = useThemeStore((s) => s.theme)
+    olderHasMore,
+    loadingOlder,
+    loadOlderMessages,
+    forkCurrentConversation,
+  } = useProjectStore(useShallow((s) => ({
+    projects: s.projects,
+    currentProject: s.currentProject,
+    conversations: s.conversations,
+    currentConversation: s.currentConversation,
+    messages: s.messages,
+    streaming: s.streaming,
+    streamings: s.streamings,
+    toolRuns: s.toolRuns,
+    agentRuns: s.agentRuns,
+    plan: s.plan,
+    toolApprovals: s.toolApprovals,
+    pendingConfirmations: s.pendingConfirmations,
+    resolveToolApproval: s.resolveToolApproval,
+    diagnoseCards: s.diagnoseCards,
+    dismissDiagnoseCard: s.dismissDiagnoseCard,
+    pendingPlan: s.pendingPlan,
+    resolvePlanReview: s.resolvePlanReview,
+    approvedPlan: s.approvedPlan,
+    unfinishedConv: s.unfinishedConv,
+    todos: s.todos,
+    askCard: s.askCard,
+    resolveAskUser: s.resolveAskUser,
+    refreshProjects: s.refreshProjects,
+    openProject: s.openProject,
+    addProjectByPath: s.addProjectByPath,
+    confirmTrust: s.confirmTrust,
+    removeProject: s.removeProject,
+    newConversation: s.newConversation,
+    openConversation: s.openConversation,
+    sendUserMessage: s.sendUserMessage,
+    stopGeneration: s.stopGeneration,
+    stopCurrentTool: s.stopCurrentTool,
+    regenerateLast: s.regenerateLast,
+    renameConversation: s.renameConversation,
+    deleteConversation: s.deleteConversation,
+    pinConversation: s.pinConversation,
+    archiveConversation: s.archiveConversation,
+    gitBranches: s.gitBranches,
+    switchBranch: s.switchBranch,
+    fileTree: s.fileTree,
+    indexBuilding: s.indexBuilding,
+    dirCache: s.dirCache,
+    loadDirChildren: s.loadDirChildren,
+    rebuildIndex: s.rebuildIndex,
+    memories: s.memories,
+    toolStats: s.toolStats,
+    toolTokenStats: s.toolTokenStats,
+    saveMemory: s.saveMemory,
+    deleteMemory: s.deleteMemory,
+    setMemoryEnabled: s.setMemoryEnabled,
+    loadMemories: s.loadMemories,
+    loadToolStats: s.loadToolStats,
+    loadToolTokenStats: s.loadToolTokenStats,
+    rateMessage: s.rateMessage,
+    summarizing: s.summarizing,
+    queueUserMessage: s.queueUserMessage,
+    editMessage: s.editMessage,
+    removeMessage: s.removeMessage,
+    tokenStats: s.tokenStats,
+    rollbackTask: s.rollbackTask,
+    setConversationKeyword: s.setConversationKeyword,
+    recentRuns: s.recentRuns,
+    loadRecentRuns: s.loadRecentRuns,
+    terminalEntries: s.terminalEntries,
+    clearTerminal: s.clearTerminal,
+    buildLogs: s.buildLogs,
+    clearBuildLogs: s.clearBuildLogs,
+    lastTaskSummary: s.lastTaskSummary,
+    queuedList: s.queuedList,
+    refreshQueued: s.refreshQueued,
+    removeQueued: s.removeQueued,
+    olderHasMore: s.olderHasMore,
+    loadingOlder: s.loadingOlder,
+    loadOlderMessages: s.loadOlderMessages,
+    forkCurrentConversation: s.forkCurrentConversation,
+  })))
+  // 会话工作目录：worktree 会话指向 worktree 路径，本地会话为 undefined（后端回退主仓库）
+  const convRoot = conversationRoot(currentConversation)
+  const themeResolved = useThemeStore((s) => s.resolved)
   const toggleTheme = useThemeStore((s) => s.toggle)
 
   const [showAddDialog, setShowAddDialog] = useState(false)
@@ -211,7 +351,7 @@ export default function Home() {
   const [showRightPanel, setShowRightPanel] = useState(
     () => localStorage.getItem('deveco-switch-right-panel') !== 'collapsed',
   )
-  const [rightTab, setRightTab] = useState<'overview' | 'files' | 'memories' | 'stats' | 'git' | 'preview' | 'devices' | 'symbols' | 'terminal' | 'analyze'>('overview')
+  const [rightTab, setRightTab] = useState<'overview' | 'files' | 'memories' | 'stats' | 'git' | 'preview' | 'devices' | 'symbols' | 'terminal' | 'shell' | 'analyze' | 'timeline'>('overview')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => localStorage.getItem('deveco-switch-sidebar-collapsed') === '1',
   )
@@ -231,10 +371,22 @@ export default function Home() {
   // 会话搜索（侧栏搜索框；Ctrl+K 聚焦）
   const [searchText, setSearchText] = useState('')
   const searchInputRef = useRef<HTMLInputElement>(null)
-  // 消息全文搜索：conv=按会话标题/首条消息；msg=按消息正文
-  const [searchMode, setSearchMode] = useState<'conv' | 'msg'>('conv')
+  // 搜索模式：conv=按会话标题/首条消息；msg=当前项目内消息；all=跨项目消息全文
+  const [searchMode, setSearchMode] = useState<'conv' | 'msg' | 'all'>('conv')
+  /** 消息搜索范围：all=项目全部会话；current=仅当前会话 */
+  const [msgSearchScope, setMsgSearchScope] = useState<'all' | 'current'>('all')
   const [msgHits, setMsgHits] = useState<MessageSearchHit[]>([])
   const [msgSearching, setMsgSearching] = useState(false)
+  // 跨项目搜索结果（searchMode='all' 时使用，msgHits 复用也行但语义不同：单独 state 更清晰）
+  const [allProjectHits, setAllProjectHits] = useState<MessageSearchHit[]>([])
+  const [allProjectSearching, setAllProjectSearching] = useState(false)
+  // 搜索请求序号：每次防抖触发 +1；响应回来时序号不匹配（期间又改了关键字/模式）则丢弃，
+  // 防止慢响应乱序覆盖新结果
+  const searchSeqRef = useRef(0)
+  // 标签筛选：null = 全部；string = 该 tag
+  const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null)
+  // 项目下所有出现过的标签 + 频次（用于筛选下拉）
+  const [tagCounts, setTagCounts] = useState<TagCount[]>([])
   // 消息搜索命中后高亮某条消息（3 秒后自动清除）
   const [highlightMsgId, setHighlightMsgId] = useState<string | null>(null)
   // 斜杠快捷指令：输入 / 弹出候选（构建/部署/新建页面/解释代码/审查等）
@@ -257,8 +409,31 @@ export default function Home() {
   const [rollbackBusy, setRollbackBusy] = useState(false)
   // 任务已运行时长（秒，每秒刷新；会话列表/右侧面板展示，静默期也能看到任务在走）
   const [taskElapsed, setTaskElapsed] = useState(0)
+  // 时间线刷新信号：任务流式结束时 +1（复盘刚完成的任务，事件已全部落库）
+  const [timelineTick, setTimelineTick] = useState(0)
+  const prevStreamingRef = useRef(streaming.conversationId)
+  useEffect(() => {
+    if (prevStreamingRef.current && !streaming.conversationId) {
+      setTimelineTick((n) => n + 1)
+    }
+    prevStreamingRef.current = streaming.conversationId
+  }, [streaming.conversationId])
   // 任务过程徽章展开态：流式“已处理 N 个操作中”与完成后回看共用
   const [opsOpen, setOpsOpen] = useState(false)
+  // 任务清单开合：首个进行中任务出现时自动展开一次；用户手动收起后本轮不再干预；全部完成收起并复位
+  const [todoOpen, setTodoOpen] = useState(false)
+  const todoAutoRef = useRef(false)
+  useEffect(() => {
+    const hasActive = todos.some((t) => t.status === 'in_progress')
+    const allDone = todos.length > 0 && todos.every((t) => t.status === 'done')
+    if (hasActive && !todoAutoRef.current) {
+      setTodoOpen(true)
+      todoAutoRef.current = true
+    } else if (allDone) {
+      setTodoOpen(false)
+      todoAutoRef.current = false
+    }
+  }, [todos])
   // 静默时长（秒）：流式期间距最近一次内容/思考增量的秒数，超阈值提示“模型思考中”
   const [silentSeconds, setSilentSeconds] = useState(0)
   // 右侧栏 Web 预览：待打开地址 + 当前 iframe 地址
@@ -268,6 +443,7 @@ export default function Home() {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renamingText, setRenamingText] = useState('')
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+  const [confirmDeleteProjectId, setConfirmDeleteProjectId] = useState<string | null>(null)
   const [showArchived, setShowArchived] = useState(false)
   const [showSettingsMenu, setShowSettingsMenu] = useState(false)
   // 构建/部署由失败转成功时后端推送的"修复经验候选"（toast + 保存弹窗）
@@ -285,8 +461,47 @@ export default function Home() {
   } | null>(null)
   // 部署后运行日志监听中（后端成功启动监听时置 true，用于 UI 指示）
   const [runtimeWatching, setRuntimeWatching] = useState(false)
+  // 项目标识文件（框架标志文件）变更 → 项目类型自动重新分类的提示（toast，4 秒自动消失）
+  const [projectMetaToast, setProjectMetaToast] = useState<{
+    project_id: string
+    old_kind: string
+    new_kind: string
+  } | null>(null)
+  // 最近项目右键菜单（打开文件夹 / 刷新项目信息）
+  const [projectMenu, setProjectMenu] = useState<{ x: number; y: number; project: Project } | null>(null)
+  const projectMenuRef = useRef<HTMLDivElement>(null)
+  // 右键菜单关闭：点击菜单外 / Escape / 任意滚动
+  useEffect(() => {
+    if (!projectMenu) return
+    const onDown = (e: MouseEvent) => {
+      if (projectMenuRef.current && !projectMenuRef.current.contains(e.target as Node)) {
+        setProjectMenu(null)
+      }
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setProjectMenu(null)
+    }
+    const onScroll = () => setProjectMenu(null)
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    window.addEventListener('scroll', onScroll, true)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+      window.removeEventListener('scroll', onScroll, true)
+    }
+  }, [projectMenu])
+  useEffect(() => {
+    if (!projectMetaToast) return
+    const timer = setTimeout(() => setProjectMetaToast(null), 4000)
+    return () => clearTimeout(timer)
+  }, [projectMetaToast])
   // 鸿蒙工具链健康状态：ok=齐全 / warn=部分缺失 / bad=关键工具缺失，用于设置菜单红点提示
   const [envHealth, setEnvHealth] = useState<'ok' | 'warn' | 'bad' | null>(null)
+  // [75] 工具 → task_group 映射（后端 TOOL_GROUP 同源，统计面板分组折叠 UI）
+  const [toolGroupMap, setToolGroupMap] = useState<Record<string, string>>({})
+  // [66] 工具链体检横幅：启动 5s 后自动 ping，缺失关键工具链（hvigorw/hdc/ohpm）时展示，点击跳转体检页
+  const [toolHealthMissing, setToolHealthMissing] = useState<string[]>([])
   // 各项目的项目级专属配置数量（MCP/技能），用于项目列表徽标
   const [scopedCounts, setScopedCounts] = useState<Record<string, { mcp: number; skills: number }>>({})
   const refreshScopedCounts = useCallback(() => {
@@ -304,7 +519,31 @@ export default function Home() {
     }).catch(() => !cancelled && setEnvHealth('bad'))
     return () => { cancelled = true }
   }, [])
+  // [75] 工具分组映射为静态全量数据（TOOL_GROUP），挂载时拉取一次即可
+  useEffect(() => {
+    listToolGroups()
+      .then((pairs) => setToolGroupMap(Object.fromEntries(pairs)))
+      .catch(() => {})
+  }, [])
+  // [66] 启动 5s 后自动 ping 工具链；缺失关键项时展示顶部横幅（点击跳转体检页）
+  useEffect(() => {
+    let cancelled = false
+    const timer = setTimeout(() => {
+      toolsHealth()
+        .then((checks) => {
+          if (!cancelled) setToolHealthMissing(checks.filter((c) => !c.found).map((c) => c.name))
+        })
+        .catch(() => {})
+    }, 5000)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [])
   const [showModelSettings, setShowModelSettings] = useState(false)
+  // 工具栏"更多"菜单：sm-md 把 1x / 发给 Agent / 批量任务 三个次要按钮收进浮层
+  // （与顶栏 moreMenuOpen 区分——顶栏是会话级导出/回滚）
+  const [toolbarMoreOpen, setToolbarMoreOpen] = useState(false)
   // 划词菜单（复制/解释/翻译/搜索/引用回复）
   const [selectionMenu, setSelectionMenu] = useState<{ x: number; y: number; text: string } | null>(null)
   // 划词选区快照：点击菜单按钮时浏览器可能清除选区高亮，操作前用快照恢复，保证用户能看到选中内容
@@ -340,6 +579,36 @@ export default function Home() {
   // 拖拽调宽中的侧栏（拖拽时禁用宽度过渡动画，避免拖尾）
   const [resizing, setResizing] = useState<'sidebar' | 'right' | null>(null)
   const [modelCatalog, setModelCatalog] = useState<{ providerName: string; models: ProviderModel[] }[]>([])
+  // 命令面板（Cmd+K）：后端静态命令 + 前端动态命令（会话/模型/斜杠）合并后 fuzzy 搜索
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  // 快捷键速查浮层（? 触发 / Esc 关闭）
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  // 项目快速切换器（Ctrl+Shift+P 触发）
+  const [projectSwitcherOpen, setProjectSwitcherOpen] = useState(false)
+  // 批量任务浮层（每行一条 → 串行入队）
+  const [batchOpen, setBatchOpen] = useState(false)
+  // 会话导入弹层：纯前端解析 md/json 文件 → 创建新会话
+  const [importDialog, setImportDialog] = useState<{ open: boolean; title: string; messages: Array<{ role: string; content: string }> } | null>(null)
+  // 审计日志查看页（顶部"审计"按钮触发）
+  const [auditOpen, setAuditOpen] = useState(false)
+  // 通用确认弹层：用于替代 window.confirm，按危险等级显示不同色调
+  const [confirmCfg, setConfirmCfg] = useState<{
+    open: boolean
+    title: string
+    body: string
+    tone: 'danger' | 'warn' | 'info'
+    requireInput?: string
+    confirmLabel?: string
+    cancelLabel?: string
+    onConfirm: () => void
+    onCancel?: () => void
+  }>({ open: false, title: '', body: '', tone: 'danger', onConfirm: () => {} })
+  /** 触发确认弹层（封装 onConfirm/onCancel + 默认 tone=danger） */
+  const askConfirm = (cfg: Omit<typeof confirmCfg, 'open'>) =>
+    setConfirmCfg({ ...cfg, open: true })
+  // 流式输出速度倍率：0.5x / 1x / 2x / 4x（前端节流倍率，0.5x 让长回复更慢可读，4x 让等待秒过）
+  const [streamSpeed, setStreamSpeed] = useState<number>(1)
+  const [backendCmds, setBackendCmds] = useState<PaletteEntry[]>([])
   const [modelOptions, setModelOptions] = useState<ChatOptions>(() => {
     try {
       return JSON.parse(localStorage.getItem('deveco-switch-chat-options') || '{}')
@@ -416,7 +685,9 @@ export default function Home() {
   // 当前项目路径：目录监视与后续依赖使用（避免 effect 内直接引用项目对象）
   const projectPath = currentProject?.path
   useEffect(() => {
-    if (!projectPath) return
+    // 监视会话实际工作目录（worktree 会话监视 worktree，本地会话监视项目主路径）
+    const watchPath = convRoot ?? projectPath
+    if (!watchPath) return
     let cancelled = false
     let unwatch: (() => void) | undefined
     let lastRefresh = 0
@@ -426,7 +697,7 @@ export default function Home() {
       return IGNORE_SEG.some((s) => lower.includes(`/${s}/`) || lower.includes(`\\${s}\\`))
     }
     watch(
-      projectPath,
+      watchPath,
       (event) => {
         if (cancelled) return
         const paths = event.paths ?? []
@@ -450,7 +721,7 @@ export default function Home() {
       cancelled = true
       unwatch?.()
     }
-  }, [projectPath])
+  }, [projectPath, convRoot])
   // 排队中消息列表：消息/任务状态变化时刷新（任务结束后排队消息被消费清空）
   const [queuedOpen, setQueuedOpen] = useState(false)
   useEffect(() => {
@@ -473,6 +744,8 @@ export default function Home() {
   const modelSettingsRef = useRef<HTMLDivElement>(null)
   const exportMenuRef = useRef<HTMLDivElement>(null)
   const moreMenuRef = useRef<HTMLDivElement>(null)
+  // 工具栏"更多"菜单 ref（与顶栏 moreMenuRef 区分）
+  const toolbarMoreRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const dragRef = useRef<{ startY: number; startH: number } | null>(null)
@@ -480,15 +753,68 @@ export default function Home() {
   const rightDragRef = useRef<{ startX: number; startW: number } | null>(null)
   const settingsRef = useRef<HTMLDivElement>(null)
 
+  // —— 草稿按会话隔离 + localStorage 持久化 ——
+  // 内存真源 draftsRef[conversationId]；切换会话/项目时：旧草稿立即落盘 → 载入新项目草稿集 → 恢复新会话草稿；
+  // skip 标志防止切换 commit 里同步 effect 用"旧会话草稿值"脏写新会话键
+  const draftsRef = useRef<Record<string, string>>({})
+  const draftCtxRef = useRef<{ conv: string | null; proj: string | null }>({ conv: null, proj: null })
+  const skipDraftSyncRef = useRef(false)
+
+  // 会话/项目切换：保存旧草稿（含防抖切断兜底）→ 载入新项目草稿集 → 恢复新会话草稿
+  useEffect(() => {
+    const cur = currentConversation?.id ?? null
+    const pid = currentProject?.id ?? null
+    const prev = draftCtxRef.current
+    if (prev.conv === cur && prev.proj === pid) return
+    // 旧会话草稿写回旧项目 map 并立即落盘（600ms 防抖可能被切换切断）
+    if (prev.proj && prev.conv && prev.conv !== cur) {
+      draftsRef.current[prev.conv] = draft
+      writeDraftMap(prev.proj, draftsRef.current)
+    }
+    // 跨项目：载入新项目的草稿集（同项目切会话则复用当前 map）
+    if (pid && prev.proj !== pid) draftsRef.current = readDraftMap(pid)
+    draftCtxRef.current = { conv: cur, proj: pid }
+    setDraft(cur ? draftsRef.current[cur] ?? '' : '')
+    skipDraftSyncRef.current = true
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentConversation?.id, currentProject?.id])
+
+  // 草稿变化：写回内存 map + 防抖落盘（空草稿在 writeDraftMap 内剔除）
+  useEffect(() => {
+    if (skipDraftSyncRef.current) {
+      skipDraftSyncRef.current = false
+      return
+    }
+    const cur = currentConversation?.id
+    const pid = currentProject?.id
+    if (!cur || !pid) return
+    draftsRef.current[cur] = draft
+    const h = setTimeout(() => writeDraftMap(pid, draftsRef.current), 600)
+    return () => clearTimeout(h)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, currentConversation?.id, currentProject?.id])
+
+  // 输入框自动增高：内容超过当前高度时增高（上限与拖拽一致 360），不自动缩小（尊重手动拖拽调低）
+  // 注意：必须先重置为 auto 再读 scrollHeight——否则未溢出时 scrollHeight 等于当前高度，
+  // 每敲一个字 target 都 +8px，导致单行输入高度也不断增长（自引用漂移）
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    const prev = el.style.height
+    el.style.height = 'auto'
+    const target = Math.min(360, Math.max(64, el.scrollHeight + 8))
+    el.style.height = prev
+    if (target > inputHeight) setInputHeight(target)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft])
+
   // 渲染分组：连续 tool 消息合并为工具折叠组（历史工具记录一行展示，点击展开全部）；
   // 其余消息保持原序，并附带回复归属的 userMessageId（版本分组键）；日期变化处插入分隔线
-  const renderItems = useMemo(() => {
-    type Item =
-      | { kind: 'msg'; message: ChatMessage; userMessageId: string }
-      | { kind: 'tools'; key: string; runs: ToolRun[] }
-      | { kind: 'divider'; key: string; label: string }
-    const items: Item[] = []
+  const renderItems = useMemo<RenderItem[]>(() => {
+    const items: RenderItem[] = []
     let lastDayKey = ''
+    // 回复归属缓存：最近一条 user 消息 id（顺序扫描均摊 O(1)，避免长会话下每条消息向前查找的 O(n²)）
+    let lastUserMessageId = ''
     const dayKeyOf = (ts: number) => {
       const d = new Date(ts * 1000)
       return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
@@ -502,7 +828,7 @@ export default function Home() {
       if (diff === 1) return t('home.dayYesterday')
       return d.toLocaleDateString()
     }
-    messages.forEach((m, idx) => {
+    messages.forEach((m) => {
       // 日期变化：插入分隔线（跨天分组，历史会话快速定位）
       const dk = dayKeyOf(m.created_at)
       if (dk !== lastDayKey) {
@@ -528,19 +854,13 @@ export default function Home() {
         }
         return
       }
-      // 回复归属：向前找最近一条 user 消息（版本分组键）
-      let userMessageId = ''
-      for (let i = idx; i >= 0; i--) {
-        if (messages[i].role === 'user') {
-          userMessageId = messages[i].id
-          break
-        }
-      }
-      items.push({ kind: 'msg', message: m, userMessageId })
+      // 回复归属：最近一条 user 消息（版本分组键；user 消息自身归属自己）
+      if (m.role === 'user') lastUserMessageId = m.id
+      items.push({ kind: 'msg', key: m.id, message: m, userMessageId: lastUserMessageId })
     })
     // 旧数据兼容：历史版本中 tool 消息时间戳晚于正文（工具入库在正文之后），
     // 把位于 assistant 正文之后的工具组前移到正文之前（工具先执行后输出的自然顺序）
-    const reordered: Item[] = []
+    const reordered: RenderItem[] = []
     for (const item of items) {
       if (item.kind === 'tools' && reordered.length > 0) {
         const prev = reordered[reordered.length - 1]
@@ -554,6 +874,92 @@ export default function Home() {
     }
     return reordered
   }, [messages, t])
+  // ===== 消息列表虚拟滚动 =====
+  // 只挂载可视区域附近的条目（含 overscan），几千条长会话也能流畅滚动与切换；
+  // 条目高度动态测量（measureElement + ResizeObserver），按 key 缓存测量结果，
+  // 同会话来回切换滚动位置时可精确还原（estimateSize 命中缓存即准）。
+  // estimateSize 按条目类型给出差异化初值：用户气泡短、助手回复长、工具组折叠、分隔线矮，
+  // 减少首次挂载后因估计偏差过大导致的 totalSize 跳变和多轮 ResizeObserver 重测量
+  const sizeCacheRef = useRef(new Map<string, number>())
+  // 尾部动态区（流式消息/计划卡/工具徽章/任务摘要等）作为最后一个虚拟条目，高度随内容自动测量；
+  // key 携带会话 id：不同会话尾部内容高度差异大，避免高度缓存跨会话污染导致切换后布局跳动
+  const virtualItems = useMemo<RenderItem[]>(
+    () => [...renderItems, { kind: 'tail', key: `tail-${currentConversation?.id ?? 'none'}` }],
+    [renderItems, currentConversation?.id],
+  )
+  // 渲染性能分级检测（GPU/CPU）：根据硬件能力自动调整虚拟列表参数
+  // - high（独显/Apple Silicon）：overscan=6，启用 smooth 滚动
+  // - medium（集显/基本硬件加速）：overscan=4，平衡配置
+  // - low（软件渲染/远程桌面/虚拟机）：overscan=2，禁用 smooth 滚动，减少动画
+  const gpuTier = useMemo(() => detectGpu().tier, [])
+  const overscan = useMemo(() => getRecommendedOverscan(gpuTier), [gpuTier])
+  const smoothScrollEnabled = useMemo(() => shouldUseSmoothScroll(gpuTier), [gpuTier])
+  const estimateItemSize = useCallback((index: number) => {
+    const cached = sizeCacheRef.current.get(virtualItems[index]?.key ?? '')
+    if (cached != null) return cached
+    const item = virtualItems[index]
+    if (!item) return 250
+    switch (item.kind) {
+      case 'msg':
+        return item.message.role === 'user' ? 120 : 380
+      case 'tools':
+        return 60
+      case 'divider':
+        return 36
+      case 'tail':
+        return 200
+      default:
+        return 250
+    }
+  }, [virtualItems])
+  const virtualizer = useVirtualizer({
+    count: virtualItems.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: estimateItemSize,
+    measureElement: (el) => {
+      const key = el.getAttribute('data-vkey')
+      const size = el.getBoundingClientRect().height
+      if (key) sizeCacheRef.current.set(key, size)
+      return size
+    },
+    overscan,
+    getItemKey: (index) => virtualItems[index]?.key ?? String(index),
+  })
+
+  const currentConvId = currentConversation?.id
+
+  // 消息搜索命中定位：分页场景下目标消息可能尚未加载，先按需加载旧页直到包含（或已无更早），
+  // 再居中定位（纯 DOM 校正），3 秒后清除高亮；消息不存在时同样到时清除
+  useEffect(() => {
+    if (!highlightMsgId || !currentConvId) return
+    if (messages.some((m) => m.id === highlightMsgId)) {
+      // 已加载：等渲染后居中定位，3 秒后清除高亮
+      const timer = setTimeout(() => locateMessageCenter(highlightMsgId), 120)
+      const clear = setTimeout(() => setHighlightMsgId(null), 3000)
+      return () => {
+        clearTimeout(timer)
+        clearTimeout(clear)
+      }
+    }
+    if (!olderHasMore || loadingOlder) return
+    let cancelled = false
+    void (async () => {
+      let guard = 0
+      while (guard++ < 100 && !cancelled) {
+        const s = useProjectStore.getState()
+        if (s.currentConversation?.id !== currentConvId) return
+        if (s.messages.some((m) => m.id === highlightMsgId)) break
+        if (!s.olderHasMore || s.loadingOlder) break
+        const added = await loadOlderMessages(currentConvId)
+        if (!added) break
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // locateMessageCenter 每次渲染重建：加入依赖会导致定位 effect 反复触发，此处按需引用
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightMsgId, currentConvId, messages, olderHasMore, loadingOlder, loadOlderMessages])
 
   // 启动加载项目列表
   useEffect(() => {
@@ -583,6 +989,39 @@ export default function Home() {
     listen<{ source: string; project_path: string; title: string; error_text: string; fix: string }>('knowledge-candidate', (e) => {
       const payload = e.payload as { title: string; error_text: string; fix: string }
       setKnowledgeCandidate(payload)
+    }).then((u) => !cancelled && unlisteners.push(u)).catch(() => {})
+    // 项目新增/删除等变更：刷新列表；若变更的是当前项目，同步重载其动态数据
+    // （对话框顶部信息、右侧栏各 tab 内容随之更新）
+    listen<{ project_id?: string }>('projects-changed', (e) => {
+      void refreshProjects()
+      const pid = (e.payload as { project_id?: string })?.project_id
+      if (pid && useProjectStore.getState().currentProject?.id === pid) {
+        void useProjectStore.getState().loadFileTree()
+        void loadMemories()
+        void loadToolStats()
+        void loadToolTokenStats()
+        void useProjectStore.getState().refreshGitBranches()
+        void loadRecentRuns()
+      }
+    }).then((u) => !cancelled && unlisteners.push(u)).catch(() => {})
+    // 项目标识文件（框架标志文件）变更：刷新各处项目信息；类型变化时弹提示——
+    // 新增/删除 build-profile.json5、package.json、go.mod 等会改变项目身份，
+    // 后端已重新分类并更新 kind，这里同步刷新列表/顶部徽标/概览/右侧栏。
+    listen<{ project_id: string; old_kind: string; new_kind: string }>('project-meta-changed', (e) => {
+      const payload = e.payload as { project_id: string; old_kind: string; new_kind: string }
+      void refreshProjects()
+      const pid = payload.project_id
+      if (pid && useProjectStore.getState().currentProject?.id === pid) {
+        void useProjectStore.getState().loadFileTree()
+        void loadMemories()
+        void loadToolStats()
+        void loadToolTokenStats()
+        void useProjectStore.getState().refreshGitBranches()
+        void loadRecentRuns()
+      }
+      if (payload.old_kind && payload.new_kind && payload.old_kind !== payload.new_kind) {
+        setProjectMetaToast({ project_id: pid, old_kind: payload.old_kind, new_kind: payload.new_kind })
+      }
     }).then((u) => !cancelled && unlisteners.push(u)).catch(() => {})
     return () => {
       cancelled = true
@@ -677,6 +1116,9 @@ export default function Home() {
       if (moreMenuRef.current && !moreMenuRef.current.contains(e.target as Node)) {
         setShowMoreMenu(false)
       }
+      if (toolbarMoreRef.current && !toolbarMoreRef.current.contains(e.target as Node)) {
+        setToolbarMoreOpen(false)
+      }
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
@@ -697,11 +1139,19 @@ export default function Home() {
       .catch(() => {})
   }, [])
 
-  // 自动打开最近项目（仅首次加载后且未选中）
+  // 命令面板静态命令（后端注册表：导航 + 动作）
   useEffect(() => {
-    if (projects.length > 0 && !currentProject) {
-      openProject(projects[0].id).catch(() => {})
-    }
+    listPaletteCommands()
+      .then(setBackendCmds)
+      .catch(() => {})
+  }, [])
+
+  // 自动打开最近项目（优先恢复上次选中的项目；若无记录则打开第一个）
+  useEffect(() => {
+    if (projects.length === 0 || currentProject) return
+    const lastId = getLastProjectId()
+    const target = (lastId && projects.find((p) => p.id === lastId)) || projects[0]
+    if (target) openProject(target.id).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projects.length])
 
@@ -709,7 +1159,30 @@ export default function Home() {
   // 智能贴底：流式输出期间，仅当用户已在底部附近时才自动跟随；用户上滑查看历史时不打断
   const scrollRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
+  /** 会话切换标记：切换后首次内容落地时恢复该会话上次滚动位置（无记录则直跳底部，无动画） */
+  const switchPendingRef = useRef(false)
+  /** 滚动位置恢复流程进行中：恢复内部会按需加载旧页（触发 messages 变化），此标志抑制 effect 重复介入 */
+  const restoringRef = useRef(false)
+  // 每个会话的滚动位置记忆（conversationId → 位置）：切换会话后恢复到上次离开的位置，
+  // 避免新消息从顶部逐条渲染造成的"从上到下"观感；跨会话持久化到 localStorage。
+  // anchorId 为离开时视口顶部的消息 id（分页场景恢复时按需加载旧页后精确定位），null 表示贴底。
+  interface ScrollPos { top: number; anchorId: string | null }
+  const scrollPosMapRef = useRef<Record<string, ScrollPos | number>>(
+    (() => {
+      try {
+        const raw = localStorage.getItem('deveco-scroll-pos')
+        return raw ? JSON.parse(raw) : {}
+      } catch {
+        return {}
+      }
+    })(),
+  )
+  const persistScrollPosRef = useRef<number | null>(null)
   const [showScrollBottom, setShowScrollBottom] = useState(false)
+  const showScrollBottomRef = useRef(false)
+  showScrollBottomRef.current = showScrollBottom
+  /** 会话切换中标志：messages 已被清空、新会话消息尚未加载完成时抑制空状态闪烁，加载完成后复位 */
+  const [switchingConv, setSwitchingConv] = useState(false)
   // 未读数按对话维度统计（conversationId → count）：滚离底部期间该对话新消息到达时累加，回到底部/切换对话清零。
   // 跨会话持久化到 localStorage，应用重启后对话列表仍保留未读标记。
   const [unreadMap, setUnreadMap] = useState<Record<string, number>>(() => {
@@ -731,9 +1204,19 @@ export default function Home() {
       }
     }, { timeout: 2000 })
   }, [unreadMap])
-  const currentConvId = currentConversation?.id
   const unreadCount = currentConvId ? unreadMap[currentConvId] ?? 0 : 0
-  const scrollRafRef = useRef<number | null>(null)
+
+  /** idle 节流持久化滚动位置（scroll 高频事件下避免频繁写 localStorage） */
+  const persistScrollPos = () => {
+    if (persistScrollPosRef.current) cancelIdleCallback(persistScrollPosRef.current)
+    persistScrollPosRef.current = requestIdleCallback(() => {
+      try {
+        localStorage.setItem('deveco-scroll-pos', JSON.stringify(scrollPosMapRef.current))
+      } catch {
+        // 忽略写入失败
+      }
+    }, { timeout: 2000 })
+  }
 
   const isNearBottom = () => {
     const el = scrollRef.current
@@ -745,10 +1228,14 @@ export default function Home() {
   const scrollToBottom = (smooth = true) => {
     const el = scrollRef.current
     if (!el) return
-    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+    // low tier（软件渲染/无 GPU）禁用 smooth 动画，减少主线程合成压力
+    const useSmooth = smooth && smoothScrollEnabled
+    el.scrollTo({ top: el.scrollHeight, behavior: useSmooth ? 'smooth' : 'auto' })
     stickToBottomRef.current = true
     setShowScrollBottom(false)
     if (currentConvId) {
+      // 到底部即记录当前位置（切走再切回时恢复到底部）：anchorId=null 表示贴底
+      scrollPosMapRef.current[currentConvId] = { top: el.scrollHeight, anchorId: null }
       setUnreadMap((m) => {
         if (!m[currentConvId]) return m
         const next = { ...m }
@@ -756,54 +1243,332 @@ export default function Home() {
         return next
       })
     }
+    if (!smooth) {
+      // 虚拟列表测量异步（ResizeObserver 帧末回调）：初次渲染 totalSize 是估计值，
+      // 多轮 rAF 校正直至真正贴底（测量完成后 scrollHeight 增长，一次设置会停在估计位置）。
+      // 帧内检查用户意图：用户主动上滚（stick 失效）或正在恢复历史位置时立即停止追赶。
+      // estimateSize 已按消息类型给出差异化初值（user=120/assistant=380/...），
+      // 测量收敛更快，最多 6 帧即可校正到位（原 12 帧偏保守）
+      let attempts = 0
+      const tick = () => {
+        const el2 = scrollRef.current
+        if (!el2 || attempts >= 6) return
+        if (!stickToBottomRef.current || restoringRef.current) return
+        attempts++
+        const dist = el2.scrollHeight - el2.scrollTop - el2.clientHeight
+        if (dist < 4) {
+          // 已贴底：记录真实高度（测量完成后的值），避免切走再切回时恢复位置偏上
+          if (currentConvId) {
+            scrollPosMapRef.current[currentConvId] = { top: el2.scrollHeight, anchorId: null }
+            persistScrollPos()
+          }
+          return
+        }
+        el2.scrollTo({ top: el2.scrollHeight, behavior: 'auto' })
+        requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    } else {
+      // smooth 动画目标基于测量前的高度：动画结束后若仍处于贴底状态则校正一次
+      setTimeout(() => {
+        const el2 = scrollRef.current
+        if (el2 && stickToBottomRef.current) {
+          el2.scrollTo({ top: el2.scrollHeight, behavior: 'auto' })
+          if (currentConvId) {
+            scrollPosMapRef.current[currentConvId] = { top: el2.scrollHeight, anchorId: null }
+            persistScrollPos()
+          }
+        }
+      }, 350)
+    }
+  }
+
+  /** CSS 属性选择器转义：消息 key 作为 data-vkey 查询时避免特殊字符注入 */
+  const cssEscape = (s: string) => (window.CSS ? CSS.escape(s) : s.replace(/["\\]/g, (c) => `\\${c}`))
+
+  /** 视口顶部第一条内容条目 key（消息/工具组 id；分隔线与尾部动态区跳过） */
+  const topAnchorKey = () => {
+    const el = scrollRef.current
+    if (!el) return null
+    const st = el.scrollTop
+    for (const vi of virtualizer.getVirtualItems()) {
+      if (vi.end < st) continue
+      const item = virtualItems[vi.index]
+      if (item.kind === 'divider' || item.kind === 'tail') continue
+      return item.key
+    }
+    return null
+  }
+
+  /** 指定条目相对滚动容器顶部的偏移（未挂载返回 null） */
+  const anchorViewportOffset = (key: string) => {
+    const el = scrollRef.current
+    if (!el) return null
+    const dom = document.querySelector(`[data-vkey="${cssEscape(key)}"]`)
+    if (!dom) return null
+    return dom.getBoundingClientRect().top - el.getBoundingClientRect().top
+  }
+
+  /** 触顶加载更早消息并保持视口不跳动：记录加载前视口顶部锚点条目的位置，
+   *  prepend 渲染后按锚点 DOM 实际位移补偿 scrollTop（估算高度偏差由测量值修正） */
+  const loadOlderAnchored = async (convId: string) => {
+    const el = scrollRef.current
+    if (!el) return
+    const anchorKey = topAnchorKey()
+    const anchorViewTop = anchorKey ? anchorViewportOffset(anchorKey) : null
+    const added = await loadOlderMessages(convId)
+    if (!added || currentConvId !== convId) return
+    if (anchorKey != null && anchorViewTop != null) {
+      let attempts = 0
+      const tick = () => {
+        const el2 = scrollRef.current
+        if (!el2 || currentConvId !== convId) return
+        // 加载期间用户已滚离触顶区：放弃修正（避免把视口拉回加载前位置）
+        if (el2.scrollTop > 400) return
+        const dom = document.querySelector(`[data-vkey="${cssEscape(anchorKey)}"]`)
+        if (dom) {
+          const top = dom.getBoundingClientRect().top - el2.getBoundingClientRect().top
+          el2.scrollTo({ top: el2.scrollTop + (anchorViewTop - top), behavior: 'auto' })
+          return
+        }
+        if (attempts++ < 5) requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    }
+  }
+
+  /** 按 scrollTop 恢复（虚拟列表初次渲染 totalSize 是估计值，多帧校正直至位置可达或贴底兜底） */
+  const restoreTop = (saved: number) => {
+    const el = scrollRef.current
+    if (!el) return
+    el.scrollTo({ top: saved, behavior: 'auto' })
+    let attempts = 0
+    const correct = () => {
+      const el2 = scrollRef.current
+      if (!el2) return
+      const maxTop2 = el2.scrollHeight - el2.clientHeight
+      if (saved <= maxTop2) {
+        el2.scrollTo({ top: saved, behavior: 'auto' })
+        const near = el2.scrollHeight - el2.scrollTop - el2.clientHeight < 120
+        stickToBottomRef.current = near
+        setShowScrollBottom(!near)
+        // estimateSize 更精准后 4 帧足够校正到位
+        if (attempts < 4) {
+          attempts++
+          requestAnimationFrame(correct)
+        }
+      } else if (attempts < 4) {
+        // 估计高度 < 真实高度时 saved 暂超界：等待后续帧测量完成再判
+        attempts++
+        requestAnimationFrame(correct)
+      } else {
+        // 测量完成仍超界：内容确实变短，贴底即可，并同步位置记录
+        stickToBottomRef.current = true
+        setShowScrollBottom(false)
+        el2.scrollTo({ top: el2.scrollHeight, behavior: 'auto' })
+        if (currentConvId) {
+          scrollPosMapRef.current[currentConvId] = { top: el2.scrollTop, anchorId: null }
+          persistScrollPos()
+        }
+      }
+    }
+    requestAnimationFrame(correct)
+  }
+
+  /** 定位到指定消息（顶部对齐视口）：纯 DOM 校正，不依赖虚拟列表测量状态 */
+  const locateAnchor = (anchorId: string) => {
+    stickToBottomRef.current = false
+    setShowScrollBottom(true)
+    let attempts = 0
+    const tick = () => {
+      const el2 = scrollRef.current
+      if (!el2) return
+      const dom = document.querySelector(`[data-vkey="${cssEscape(anchorId)}"]`)
+      if (dom) {
+        el2.scrollTop = dom.getBoundingClientRect().top - el2.getBoundingClientRect().top
+        return
+      }
+      if (attempts++ < 20) requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  }
+
+  /** 定位到指定消息（视口居中）：搜索命中高亮用，纯 DOM 校正 */
+  const locateMessageCenter = (msgId: string) => {
+    let attempts = 0
+    const tick = () => {
+      const el2 = scrollRef.current
+      if (!el2) return
+      const dom = document.querySelector(`[data-vkey="${cssEscape(msgId)}"]`)
+      if (dom) {
+        const rel = dom.getBoundingClientRect().top - el2.getBoundingClientRect().top
+        el2.scrollTop = rel - (el2.clientHeight - dom.getBoundingClientRect().height) / 2
+        return
+      }
+      if (attempts++ < 20) requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  }
+
+  /** 恢复会话上次滚动位置：锚点消息未加载时先按需加载旧页直到包含，再定位到视口顶部；
+   *  贴底记录（anchorId=null）直跳底部；旧版纯数字记录按 scrollTop 恢复（超界兜底贴底） */
+  const restoreScrollPosition = async (convId?: string) => {
+    if (!convId || restoringRef.current) return
+    restoringRef.current = true
+    try {
+      const el = scrollRef.current
+      if (!el) return
+      const raw = scrollPosMapRef.current[convId]
+      if (typeof raw === 'number') {
+        // 旧版数据兼容：纯 scrollTop
+        restoreTop(raw)
+        return
+      }
+      if (!raw) {
+        scrollToBottom(false)
+        return
+      }
+      if (!raw.anchorId) {
+        // 贴底记录：直跳底部（scrollToBottom 已内置多帧贴底校正）
+        scrollToBottom(false)
+        return
+      }
+      // 锚点消息可能未加载（上次浏览位置在更早历史页）：循环加载旧页直到包含或已无更早
+      let guard = 0
+      while (guard++ < 100) {
+        const s = useProjectStore.getState()
+        if (s.currentConversation?.id !== convId) return
+        if (s.messages.some((m) => m.id === raw.anchorId)) break
+        if (!s.olderHasMore || s.loadingOlder) break
+        const added = await loadOlderMessages(convId)
+        if (!added) break
+      }
+      const s = useProjectStore.getState()
+      if (s.currentConversation?.id !== convId) return
+      if (s.messages.some((m) => m.id === raw.anchorId)) {
+        locateAnchor(raw.anchorId)
+      } else {
+        // 锚点消息已被删除：回退 scrollTop 恢复（超界时兜底贴底）
+        restoreTop(raw.top)
+      }
+    } finally {
+      restoringRef.current = false
+    }
   }
 
   const handleScroll = () => {
+    const el = scrollRef.current
+    if (!el) return
     const near = isNearBottom()
     stickToBottomRef.current = near
-    setShowScrollBottom(!near)
+    // showScrollBottom 仅在底部可见性切换时更新，避免每次滚动都触发全量重渲染
+    if (near !== showScrollBottomRef.current) {
+      showScrollBottomRef.current = near
+      setShowScrollBottom(!near)
+    }
+    // 记录当前会话滚动位置（切走后再切回时恢复）：记录视口顶部消息 id 作为锚点，
+    // 分页场景下恢复时按锚点加载旧页后精确定位
+    if (currentConvId) {
+      scrollPosMapRef.current[currentConvId] = { top: el.scrollTop, anchorId: topAnchorKey() }
+      persistScrollPos()
+    }
+    // 触顶自动加载更早历史（微信式上翻翻页）：距顶部一屏内且仍有更早消息时触发，
+    // 加载完成 prepend 后由 loadOlderAnchored 做视口锚定补偿，不会跳动
+    if (currentConvId && olderHasMore && !loadingOlder && el.scrollTop < 200) {
+      void loadOlderAnchored(currentConvId)
+    }
   }
 
-  /** rAF 节流的贴底滚动：流式内容高频更新时每帧最多滚动一次，避免卡顿 */
-  const rafScrollToBottom = () => {
-    if (scrollRafRef.current != null) return
-    scrollRafRef.current = requestAnimationFrame(() => {
-      scrollRafRef.current = null
-      const el = scrollRef.current
-      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
-    })
-  }
+  // 切换会话消息落地：ChatGPT/Minmax 风格——首屏直接停在底部，无可见滚动过程。
+  // useLayoutEffect 在 DOM 更新后、绘制前同步把 scrollTop 设为 scrollHeight，
+  // 用户第一眼看到的就是最新（底部）内容，没有任何「从上滚到下」的中间帧。
+  // 后续帧的测量校正（虚拟列表从 estimateSize → 真实高度）统一由下方 useEffect 调用
+  // scrollToBottom(false)/restoreScrollPosition 负责，不在此启动 rAF 循环——
+  // 否则会与 scrollToBottom 自身的多帧校正循环（最多 12 帧）竞争，造成双倍布局抖动。
+  // 依赖 messages（数组引用）而非 messages.length：openConversation 不立即清空 messages，
+  // 新旧会话消息数可能相同，仅靠 length 无法检测到切换后的消息替换。
+  useLayoutEffect(() => {
+    if (!switchPendingRef.current) return
+    if (messages.length === 0) return
+    const el = scrollRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+  }, [messages])
 
   useEffect(() => {
-    // 新消息入库（条数变化）时，如果之前贴底则跟随；否则给当前对话累计未读数
+    // 会话切换完成（messages 引用变化）：恢复滚动位置或贴底
+    if (switchPendingRef.current) {
+      switchPendingRef.current = false
+      setSwitchingConv(false)
+      // 空会话：无需恢复滚动位置，switchingConv 已清除即可显示空状态
+      if (messages.length === 0) return
+      // 异步恢复：内部可能按需加载旧页（触发本 effect 重入），restoringRef 抑制重复介入
+      void restoreScrollPosition(currentConvId)
+      return
+    }
+    // 非切换场景的 messages 变化（新消息入库 / loadOlder prepend）
+    if (messages.length === 0) return
+    setSwitchingConv(false)
+    if (restoringRef.current) return
     if (stickToBottomRef.current) {
       scrollToBottom(true)
     } else if (currentConvId) {
       setUnreadMap((m) => ({ ...m, [currentConvId]: (m[currentConvId] ?? 0) + 1 }))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages.length, currentConvId])
+  }, [messages, currentConvId])
 
   // 流式内容增长（含思考过程/工具运行数变化）时，贴底状态下持续跟随（rAF 节流）
+  // streamingActive 保护不能移除：切会话时虚拟列表 totalSize 变化也会触发本 effect，
+  // 若无条件跟随会把刚恢复的滚动位置（switchPending 分支）再次拉到底部
   const streamingLen = streaming.content.length + streaming.reasoning.length
   const streamingActive = streaming.conversationId === currentConversation?.id
+  // 流式贴底：仅依赖 streamingLen 变化（新 token 到达），totalSize 变化由 rAF 循环自动跟随
+  // 避免 totalSize 高频变化（每帧测量多次）触发 effect 过度重渲染
+  const streamScrollRafRef = useRef<number | null>(null)
+  const streamScrollActiveRef = useRef(false)
   useEffect(() => {
     if (stickToBottomRef.current && streamingActive) {
-      rafScrollToBottom()
+      if (streamScrollRafRef.current == null) {
+        streamScrollActiveRef.current = true
+        const loop = () => {
+          streamScrollRafRef.current = null
+          if (!streamScrollActiveRef.current || !stickToBottomRef.current) return
+          const el = scrollRef.current
+          if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
+          streamScrollRafRef.current = requestAnimationFrame(loop)
+        }
+        streamScrollRafRef.current = requestAnimationFrame(loop)
+      }
+    } else if (!streamingActive) {
+      streamScrollActiveRef.current = false
+      if (streamScrollRafRef.current != null) {
+        cancelAnimationFrame(streamScrollRafRef.current)
+        streamScrollRafRef.current = null
+      }
     }
-  }, [streamingLen, streamingActive, toolRuns.length, agentRuns.length])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamingLen, streamingActive])
 
-  // 组件卸载时清理 rAF
+  // 组件卸载时清理 rAF 与滚动位置持久化
   useEffect(() => {
     return () => {
-      if (scrollRafRef.current != null) cancelAnimationFrame(scrollRafRef.current)
+      if (persistScrollPosRef.current != null) cancelIdleCallback(persistScrollPosRef.current)
+      streamScrollActiveRef.current = false
+      if (streamScrollRafRef.current != null) cancelAnimationFrame(streamScrollRafRef.current)
     }
   }, [])
 
-  // 切换对话时：重置贴底状态并清除该对话的未读数，下次内容加载后自动滚到底部
+  // 切换对话时：重置贴底状态、标记待恢复并清除该对话的未读数，
+  // 新会话消息加载落地后（messages.length 变化）由上方 effect 恢复滚动位置或直跳底部
   useEffect(() => {
     stickToBottomRef.current = true
     setShowScrollBottom(false)
+    switchPendingRef.current = true
+    // 切换中标志：抑制 messages 清空瞬间到新会话消息落地的空状态闪烁；
+    // 新会话无消息（无 length 变化信号）时由下方超时兜底复位
+    setSwitchingConv(true)
+    const timer = setTimeout(() => setSwitchingConv(false), 1500)
     if (currentConvId) {
       setUnreadMap((m) => {
         if (!m[currentConvId]) return m
@@ -812,10 +1577,7 @@ export default function Home() {
         return next
       })
     }
-    // 等消息渲染后再滚一次
-    const t = setTimeout(() => scrollToBottom(false), 60)
-    return () => clearTimeout(t)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => clearTimeout(timer)
   }, [currentConvId])
 
   const handleAddConfirm = async (path: string) => {
@@ -829,6 +1591,13 @@ export default function Home() {
     setTrustBusy(true)
     try {
       await confirmTrust(pendingTrust.projectId)
+      // 写 audit：信任项目 = 授予文件读写权限
+      useAuditStore.getState().log({
+        category: 'project.trust',
+        label: t('home.auditLabelProjectTrust'),
+        detail: pendingTrust.inspect.path,
+        projectId: pendingTrust.projectId,
+      })
       setPendingTrust(null)
       await openProject(pendingTrust.projectId)
       // 信任并打开后，后台异步扫描工作区模块（大目录递归遍历可能耗时，
@@ -859,14 +1628,22 @@ export default function Home() {
   }
 
   // 文件树引用：把文件路径插入输入框并加入引用列表（发送时 references 落库注入文件内容）
-  const handleReference = (path: string) => {
+  const handleReference = useCallback((path: string) => {
     setDraft((d) => (d ? `${d} @${path} ` : `@${path} `))
     setReferences((r) => (r.includes(path) ? r : [...r, path]))
     inputRef.current?.focus()
-  }
+  }, [])
 
   /** 当前会话是否正在流式生成（派生值：供下方处理函数与 effect 使用，声明需在使用前） */
   const isStreaming = streaming.conversationId === currentConversation?.id
+  // 预计算最后一条助手消息 ID，供虚拟列表复用，避免每条消息渲染时都访问数组
+  const lastAssistantId = useMemo(() => {
+    if (isStreaming) return null
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === 'assistant') return messages[i].id
+    }
+    return null
+  }, [messages, isStreaming])
 
   /** 构建错误一键修复：将结构化错误摘要注入对话输入框并聚焦，让用户直接交给 Agent 修复 */
   const handleFixBuildErrors = (errors: AnalyzedBuildError[]) => {
@@ -888,23 +1665,32 @@ export default function Home() {
     inputRef.current?.focus()
   }
 
-  /** 失败工具一键重试：注入指令让 Agent 重新执行该工具（失败输出头尾截断后附给模型参考） */
-  const retryTool = (run: ToolRun) => {
-    // 头尾保留：命令/环境信息多在头部，错误原因多在尾部，中段省略
-    const out = run.output
-    const head = 500
-    const tailN = 800
-    const tail =
-      out.length <= head + tailN ? out : `${out.slice(0, head)}\n…(中段省略)…\n${out.slice(-tailN)}`
-    const text =
-      `请重试刚才失败的 ${run.tool} 工具。上次失败信息如下：\n${tail}\n\n` +
-      '请先分析失败原因（参数/环境/前置步骤），修正后重新执行该工具，并继续后续步骤。'
-    if (isStreaming) {
-      void queueUserMessage(text, true)
-    } else {
-      void sendUserMessage(text, modelOptions)
-    }
-  }
+  /** 失败工具一键重试：注入指令让 Agent 重新执行该工具（失败输出头尾截断后附给模型参考）
+   * useCallback：ToolRunGroup 按 memo 浅比较 props，回调稳定才能阻止流式/工具输出更新时历史工具组全量重渲染 */
+  const retryTool = useCallback(
+    (run: ToolRun) => {
+      // 头尾保留：命令/环境信息多在头部，错误原因多在尾部，中段省略
+      const out = run.output
+      const head = 500
+      const tailN = 800
+      const tail =
+        out.length <= head + tailN ? out : `${out.slice(0, head)}\n…(中段省略)…\n${out.slice(-tailN)}`
+      const text =
+        `请重试刚才失败的 ${run.tool} 工具。上次失败信息如下：\n${tail}\n\n` +
+        '请先分析失败原因（参数/环境/前置步骤），修正后重新执行该工具，并继续后续步骤。'
+      if (isStreaming) {
+        void queueUserMessage(text, true)
+      } else {
+        void sendUserMessage(text, modelOptions)
+      }
+    },
+    [isStreaming, modelOptions, queueUserMessage, sendUserMessage],
+  )
+
+  /** 取消正在运行的工具（稳定引用，避免 ToolRunGroup 因 onCancel 每次都是新函数而全量重渲染） */
+  const cancelToolRun = useCallback(() => {
+    stopCurrentTool()
+  }, [stopCurrentTool])
 
   /** 构建错误自动修复闭环：直接向 Agent 发送修复任务（自动改代码 + 重新构建验证），无需手动发送 */
   const handleAutoFixErrors = async (errors: AnalyzedBuildError[]) => {
@@ -992,7 +1778,7 @@ export default function Home() {
    * 代码块文件路径/行号点击：派发全局事件，由文件树面板打开预览并定位到行；
    * 同时将该文件加入 @ 引用，便于继续追问。rawPath 形如 "src/foo.ts:42"。
    */
-  const openCodeFile = (rawPath: string) => {
+  const openCodeFile = useCallback((rawPath: string) => {
     const lineMatch = rawPath.match(/:(\d+)$/)
     const line = lineMatch ? parseInt(lineMatch[1], 10) : undefined
     const path = rawPath.replace(/:\d+$/, '')
@@ -1001,7 +1787,7 @@ export default function Home() {
     window.dispatchEvent(
       new CustomEvent('deveco:open-file', { detail: { path, line } }),
     )
-  }
+  }, [handleReference])
 
   /** 收集引用列表：显式 @ 选择 + 输入框内残留的 @path 文本（容错手动输入） */
   const collectRefs = (): string[] => {
@@ -1118,6 +1904,7 @@ export default function Home() {
       await newConversation()
     }
     const refs = collectRefs()
+    if (pendingQuote) refs.push(`msg:${pendingQuote.id}`)
     const imgs = pickedImages
     // 先清空输入框：invoke 要等整个 Agent 任务结束后才 resolve，若 await 发送则任务期间输入框不会清空
     setDraft('')
@@ -1125,6 +1912,7 @@ export default function Home() {
     setPickedImages([])
     setRefCandidates(null)
     setSlashCandidates(null)
+    setPendingQuote(null)
     if (isStreaming) {
       void queueUserMessage(text, false, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
     } else {
@@ -1137,25 +1925,37 @@ export default function Home() {
     const text = draft.trim()
     if (!text || !currentProject || !currentConversation || !isStreaming) return
     const refs = collectRefs()
+    if (pendingQuote) refs.push(`msg:${pendingQuote.id}`)
     const imgs = pickedImages
     // 同 handleSend：先清空输入框，不 await 排队接口
     setDraft('')
     setReferences([])
     setPickedImages([])
     setRefCandidates(null)
+    setPendingQuote(null)
     void queueUserMessage(text, true, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
   }
 
   /** 删除消息（二次确认：第一次点击进入确认态，3 秒内再点执行；级联删除其后所有消息） */
-  const handleDeleteMessage = async (msg: ChatMessage) => {
+  const handleDeleteMessage = useCallback(async (msg: ChatMessage) => {
     if (confirmDeleteMsgId !== msg.id) {
       setConfirmDeleteMsgId(msg.id)
       setTimeout(() => setConfirmDeleteMsgId((cur) => (cur === msg.id ? null : cur)), 3000)
       return
     }
     setConfirmDeleteMsgId(null)
-    await removeMessage(msg.id)
-  }
+    const target = msg // 捕获到 const，audit 里使用不依赖 useCallback deps
+    await removeMessage(target.id)
+    // 写 audit
+    useAuditStore.getState().log({
+      category: 'message.delete',
+      label: t('home.auditLabelMessageDelete'),
+      detail: `${target.role}: ${target.content.slice(0, 60)}${target.content.length > 60 ? '…' : ''}`,
+      conversationId: currentConversation?.id,
+      projectId: currentProject?.id,
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [confirmDeleteMsgId, removeMessage, currentConversation?.id, currentProject?.id, t])
 
   /** 更新对话级模型设置（持久化到 localStorage，随消息发送；同时绑定到当前会话使上下文预算实时生效） */
   const updateModelOptions = (next: ChatOptions) => {
@@ -1266,38 +2066,80 @@ export default function Home() {
   /** 会话搜索：本地输入即时响应，300ms 防抖后请求后端 LIKE 过滤；消息模式走全文检索 */
   useEffect(() => {
     const h = setTimeout(() => {
+      // 本批请求序号：响应回来时若序号已变（又改了关键字/模式）则丢弃，防乱序覆盖
+      const seq = ++searchSeqRef.current
       if (searchMode === 'msg') {
         const pid = currentProject?.id
         const kw = searchText.trim()
         if (!pid || kw.length < 2) {
           setMsgHits([])
           setMsgSearching(false)
+          setAllProjectSearching(false)
           return
         }
+        setAllProjectSearching(false)
         setMsgSearching(true)
-        searchMessages(pid, kw)
-          .then((hits) => setMsgHits(hits))
-          .catch(() => setMsgHits([]))
-          .finally(() => setMsgSearching(false))
+        searchMessages(pid, kw, msgSearchScope === 'current' ? currentConversation?.id : undefined)
+          .then((hits) => {
+            if (seq === searchSeqRef.current) setMsgHits(hits)
+          })
+          .catch(() => {
+            if (seq === searchSeqRef.current) setMsgHits([])
+          })
+          .finally(() => {
+            if (seq === searchSeqRef.current) setMsgSearching(false)
+          })
+      } else if (searchMode === 'all') {
+        // 跨项目全文搜索
+        const kw = searchText.trim()
+        if (kw.length < 2) {
+          setAllProjectHits([])
+          setAllProjectSearching(false)
+          setMsgSearching(false)
+          return
+        }
+        setMsgSearching(false)
+        setAllProjectSearching(true)
+        searchMessagesAllProjects(kw)
+          .then((hits) => {
+            if (seq === searchSeqRef.current) setAllProjectHits(hits)
+          })
+          .catch(() => {
+            if (seq === searchSeqRef.current) setAllProjectHits([])
+          })
+          .finally(() => {
+            if (seq === searchSeqRef.current) setAllProjectSearching(false)
+          })
       } else {
         setMsgHits([])
+        setAllProjectHits([])
+        setMsgSearching(false)
+        setAllProjectSearching(false)
         void setConversationKeyword(searchText)
       }
     }, 300)
     return () => clearTimeout(h)
-  }, [searchText, searchMode, setConversationKeyword, currentProject?.id])
+  }, [searchText, searchMode, msgSearchScope, currentConversation?.id, setConversationKeyword, currentProject?.id])
+
+  // 加载项目下所有出现过的标签 + 频次（用于标签筛选下拉）
+  useEffect(() => {
+    const pid = currentProject?.id
+    if (!pid) {
+      setTagCounts([])
+      return
+    }
+    listConversationTags(pid)
+      .then(setTagCounts)
+      .catch(() => setTagCounts([]))
+  }, [currentProject?.id, conversations.length])
 
   /** 点击消息搜索命中：打开对应会话并高亮目标消息 */
   const openMessageHit = async (hit: MessageSearchHit) => {
     setSearchText('')
     setMsgHits([])
     await openConversation(hit.conversation_id)
+    // 定位由 highlightMsgId effect 完成（虚拟列表就绪后 scrollToIndex 居中，3 秒后清除高亮）
     setHighlightMsgId(hit.message_id)
-    setTimeout(() => {
-      const el = document.querySelector(`[data-msg-id="${hit.message_id}"]`) as HTMLElement | null
-      el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }, 120)
-    setTimeout(() => setHighlightMsgId(null), 3000)
   }
 
   /** 高亮消息片段中的命中关键字 */
@@ -1317,7 +2159,8 @@ export default function Home() {
     )
   }
 
-  // 快捷键：Ctrl+K 聚焦会话搜索；Ctrl+Shift+B 构建 / Ctrl+Shift+D 部署 / Ctrl+Shift+N 新会话
+  // 快捷键：Ctrl+K 打开命令面板；Ctrl+Shift+K 聚焦会话搜索；Ctrl+Shift+B 构建 / Ctrl+Shift+D 部署 / Ctrl+Shift+N 新会话
+  // [72] 工具级快捷键：Ctrl+Shift+S 截图验证（take_screenshot）/ Ctrl+Shift+R 运行命令（run_command）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey
@@ -1331,13 +2174,33 @@ export default function Home() {
           e.preventDefault()
           setDraft(t('home.quickDeployPrompt'))
           inputRef.current?.focus()
+        } else if (k === 's') {
+          e.preventDefault()
+          setDraft(t('home.quickScreenshotPrompt'))
+          inputRef.current?.focus()
+        } else if (k === 'r') {
+          e.preventDefault()
+          setDraft(t('home.quickRunPrompt'))
+          inputRef.current?.focus()
         } else if (k === 'n') {
           e.preventDefault()
           void newConversation()
+        } else if (k === 'k') {
+          e.preventDefault()
+          searchInputRef.current?.focus()
+        } else if (k === 'p') {
+          e.preventDefault()
+          setProjectSwitcherOpen(true)
         }
       } else if (mod && e.key.toLowerCase() === 'k') {
         e.preventDefault()
-        searchInputRef.current?.focus()
+        setPaletteOpen(true)
+      } else if (e.key === '?' && !mod && !e.shiftKey) {
+        // ? 打开快捷键速查（输入框聚焦时不触发，避免误触）
+        if (document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+          e.preventDefault()
+          setShowShortcuts(true)
+        }
       }
     }
     window.addEventListener('keydown', onKey)
@@ -1353,18 +2216,39 @@ export default function Home() {
     setRightTab('preview')
   }
 
-  /** 符号索引预热：项目切换/启动后在后台线程池预热（磁盘缓存命中 + 增量校正），
+  /** 符号索引预热：项目切换/启动后延迟到浏览器空闲时预热，避免抢占首帧渲染 CPU；
    *  让符号面板与首轮对话构建工程概要时秒出结果；静默执行不阻塞界面。 */
   // 当前项目 ID/类型：符号索引预热触发条件（避免 effect 内直接引用项目对象）
   const projectId = currentProject?.id
   const projectKind = currentProject?.kind
   useEffect(() => {
     if (!projectId || projectKind === 'global') return
-    warmupSymbolIndex(projectId).catch(() => {})
-  }, [projectId, projectKind])
+    // 延迟到首帧渲染完成后再启动后台预热，避免消息列表首屏渲染时竞争主线程
+    // 拆开两路以保证 cleanup 拿到正确句柄类型（setTimeout 返回 number / requestIdleCallback 返回 IdleCallbackHandle）
+    const hasRic = typeof window !== 'undefined' && 'requestIdleCallback' in window
+    let timerId: number | null = null
+    let idleId: number | null = null
+    if (hasRic) {
+      idleId = window.requestIdleCallback(() => {
+        warmupSymbolIndex(projectId, convRoot).catch(() => {})
+      })
+    } else {
+      timerId = window.setTimeout(() => {
+        warmupSymbolIndex(projectId, convRoot).catch(() => {})
+      }, 300)
+    }
+    return () => {
+      if (idleId !== null && 'cancelIdleCallback' in window) {
+        window.cancelIdleCallback(idleId)
+      } else if (timerId !== null) {
+        window.clearTimeout(timerId)
+      }
+    }
+  }, [projectId, projectKind, convRoot])
 
   /** 自动补扫：旧项目（添加时未做工作区扫描）或新添加项目模块为空时，
-   *  在后台异步扫描一次，不阻塞界面；扫描完成后刷新列表以更新类型标签与模块卡。 */
+   *  在首帧渲染完成后的空闲时间异步扫描一次，不阻塞界面；
+   *  扫描完成后刷新列表以更新类型标签与模块卡。 */
   useEffect(() => {
     if (!currentProject || currentProject.kind === 'global') return
     const isEmpty =
@@ -1373,20 +2257,37 @@ export default function Home() {
       currentProject.workspace_modules === ''
     if (!isEmpty) return
     let cancelled = false
-    void (async () => {
-      try {
-        await rescanWorkspaceModules(currentProject.id)
-        if (!cancelled) {
-          await refreshProjects()
-          // 通知工程分析面板重新解析候选、模块卡刷新主工程徽标
-          setModuleScanTick((n) => n + 1)
+    // 延迟到首帧渲染完成后再执行，避免项目切换瞬间的重扫描与消息渲染竞争主线程
+    const hasRic = typeof window !== 'undefined' && 'requestIdleCallback' in window
+    let timerId: number | null = null
+    let idleId: number | null = null
+    const run = () => {
+      if (cancelled) return
+      void (async () => {
+        try {
+          await rescanWorkspaceModules(currentProject.id)
+          if (!cancelled) {
+            await refreshProjects()
+            // 通知工程分析面板重新解析候选、模块卡刷新主工程徽标
+            setModuleScanTick((n) => n + 1)
+          }
+        } catch {
+          // 静默失败：用户可在概览手动重新扫描
         }
-      } catch {
-        // 静默失败：用户可在概览手动重新扫描
-      }
-    })()
+      })()
+    }
+    if (hasRic) {
+      idleId = window.requestIdleCallback(run)
+    } else {
+      timerId = window.setTimeout(run, 500)
+    }
     return () => {
       cancelled = true
+      if (idleId !== null && 'cancelIdleCallback' in window) {
+        window.cancelIdleCallback(idleId)
+      } else if (timerId !== null) {
+        window.clearTimeout(timerId)
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentProject?.id])
@@ -1395,10 +2296,16 @@ export default function Home() {
   const handleOpenTerminal = async () => {
     if (!currentProject) return
     try {
-      await openTerminal(currentProject.path)
+      await openTerminal(convRoot ?? currentProject.path)
     } catch (e) {
       alert(`${t('home.openTerminalFail')}: ${String(e)}`)
     }
+  }
+
+  /** 打开右侧栏内置终端面板（在项目目录执行命令） */
+  const handleOpenShell = () => {
+    if (!currentProject) return
+    setRightTab('shell')
   }
 
   /** 诊断卡片操作：install_deps→切到工程分析面板执行 ohpm install；其他→打开 DevEco 或提示。
@@ -1408,14 +2315,15 @@ export default function Home() {
     let note = ''
     if (card.action === 'install_deps' && currentProject) {
       setRightTab('analyze')
+      const installDir = convRoot ?? currentProject.path
       try {
-        const log = await runOhpmInstall(currentProject.path)
+        const log = await runOhpmInstall(installDir)
         completed = true
         note = '依赖安装完成'
         useProjectStore.setState((s) => ({
           terminalEntries: [
             ...s.terminalEntries,
-            { id: `diag-${Date.now()}`, tool: 'ohpm install', args: currentProject.path, status: 'done' as const, output: log, startedAt: Date.now(), durationMs: 0 },
+            { id: `diag-${Date.now()}`, tool: 'ohpm install', args: installDir, status: 'done' as const, output: log, startedAt: Date.now(), durationMs: 0 },
           ],
         }))
       } catch (e) {
@@ -1465,7 +2373,7 @@ export default function Home() {
     setMainRootAbs(null)
     if (!currentProject) return
     let cancelled = false
-    getHarmonyRoot(currentProject.id)
+    getHarmonyRoot(currentProject.id, convRoot)
       .then((r) => {
         if (!cancelled) setMainRootAbs(r.root)
       })
@@ -1474,7 +2382,7 @@ export default function Home() {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentProject?.id, moduleScanTick])
+  }, [currentProject?.id, convRoot, moduleScanTick])
   const handleRescanModules = async () => {
     if (!currentProject || rescanning) return
     setRescanning(true)
@@ -1562,7 +2470,7 @@ export default function Home() {
     }
   }
 
-  /** 任务回滚：dry_run 预览 → confirm 确认 → git reset --hard 回起点 */
+  /** 任务回滚：dry_run 预览 → ConfirmDialog 确认 → git reset --hard 回起点 → 写 audit */
   const handleRollback = async () => {
     if (!currentConversation || rollbackBusy) return
     setRollbackBusy(true)
@@ -1572,19 +2480,43 @@ export default function Home() {
         alert(t('home.rollbackNoRepo'))
         return
       }
-      const ok = window.confirm(
-        t('home.rollbackConfirm', {
-          date: info.commit_date || '-',
-          changed: String(info.changed),
-          untracked: String(info.untracked),
-        }),
-      )
-      if (!ok) return
-      const res = await rollbackTask(currentConversation.id, false)
-      alert(t('home.rollbackDone', { commit: res.commit.slice(0, 8), date: res.commit_date || '-' }))
+      const detail = t('home.rollbackConfirm', {
+        date: info.commit_date || '-',
+        changed: String(info.changed),
+        untracked: String(info.untracked),
+      })
+      // 用 ConfirmDialog 替代 window.confirm（更一致 UX + 危险色调 + 详细面板）
+      // 通过 capture 闭包：onConfirm 内部展开后续逻辑，onCancel 直接终止
+      askConfirm({
+        title: t('home.rollbackTitle'),
+        body: detail,
+        tone: 'danger',
+        confirmLabel: t('home.rollbackDoIt'),
+        onConfirm: () => {
+          // 二次保护：如果 onConfirm 时当前不在流式（rollbackBusy 已置 true），则执行
+          void (async () => {
+            try {
+              const res = await rollbackTask(currentConversation.id, false)
+              useAuditStore.getState().log({
+                category: 'task.rollback',
+                label: t('home.rollbackTitle'),
+                detail: `${res.commit.slice(0, 8)} · ${res.commit_date || '-'} · ${currentProject?.name ?? ''}`,
+                projectId: currentProject?.id,
+                conversationId: currentConversation.id,
+              })
+              alert(t('home.rollbackDone', { commit: res.commit.slice(0, 8), date: res.commit_date || '-' }))
+            } catch (e) {
+              alert(`${t('home.rollbackFail')}\n${String(e)}`)
+            } finally {
+              setRollbackBusy(false)
+            }
+          })()
+        },
+        // 关闭时（包括取消）若还没执行 → 释放 busy，避免按钮永远转圈
+        onCancel: () => setRollbackBusy(false),
+      })
     } catch (e) {
-      alert(`${t('home.rollbackFail')}\n${String(e)}`)
-    } finally {
+      alert(`${t('home.rollbackNoRepo')}\n${String(e)}`)
       setRollbackBusy(false)
     }
   }
@@ -1666,14 +2598,20 @@ export default function Home() {
       const text = raw.trim()
       if (text && text.length > 1 && text.length <= 500) {
         const range = captureRangeRef.current ?? sel!.getRangeAt(0)
+        // 划词菜单仅服务对话内容：选区须位于消息正文（.md-body）内，其它界面元素（文件树/设置/终端等）不弹菜单
+        let anchor: Node | null = range.commonAncestorContainer
+        if (anchor.nodeType === Node.TEXT_NODE) anchor = anchor.parentElement
+        const msgBody = (anchor as Element | null)?.closest?.('.md-body')
+        if (!msgBody) {
+          setSelectionMenu(null)
+          return
+        }
         // 保存选区快照（点击菜单按钮后选区可能被浏览器清除，供操作前恢复高亮）
         selectionRangeRef.current = range.cloneRange()
         // 同步保存完整文本与容器：消息 DOM 被重建后 live Range 端点归一化收缩，
         // 恢复时若检测到文本变短，按文本在容器内重新定位端点
         selectionTextRef.current = raw
-        let anchor: Node | null = range.commonAncestorContainer
-        if (anchor.nodeType === Node.TEXT_NODE) anchor = anchor.parentElement
-        selectionContainerRef.current = (anchor as Element | null)?.closest?.('.md-body') ?? anchor
+        selectionContainerRef.current = msgBody
         const rect = range.getBoundingClientRect()
         // 菜单出现在选区上方居中（底部越界时上移，顶部越界时下移）
         let y = rect.top - 44
@@ -1759,7 +2697,7 @@ export default function Home() {
   }
 
   /** 语音朗读（Web Speech API；再次点击停止） */
-  const toggleSpeak = (messageId: string, text: string) => {
+  const toggleSpeak = useCallback((messageId: string, text: string) => {
     if (!('speechSynthesis' in window)) return
     if (speakingId === messageId) {
       window.speechSynthesis.cancel()
@@ -1776,20 +2714,31 @@ export default function Home() {
     utter.onerror = () => setSpeakingId((cur) => (cur === messageId ? null : cur))
     setSpeakingId(messageId)
     window.speechSynthesis.speak(utter)
-  }
+  }, [speakingId])
 
   /** 导出会话：下载 md/txt/html 或复制全文 */
-  const exportConversationFile = (format: 'md' | 'txt' | 'html') => {
+  const exportConversationFile = async (format: 'md' | 'txt' | 'html') => {
     const store = useProjectStore.getState()
     const text = store.exportConversation(format)
     const ext = format === 'html' ? 'html' : format === 'txt' ? 'txt' : 'md'
-    const blob = new Blob([text], { type: format === 'html' ? 'text/html;charset=utf-8' : 'text/plain;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${currentConversation?.title ?? '对话记录'}.${ext}`
-    a.click()
-    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    const filename = `${currentConversation?.title ?? '对话记录'}.${ext}`
+    // Tauri 环境走原生保存对话框（WebView2 对 Blob URL + a.download 支持不稳，会静默失效）
+    if ('__TAURI_INTERNALS__' in window) {
+      try {
+        const dest = await dialogSave({ title: t('home.export'), defaultPath: filename })
+        if (dest) await writeTextFile(dest, text)
+      } catch {
+        // 保存失败/取消静默
+      }
+    } else {
+      const blob = new Blob([text], { type: format === 'html' ? 'text/html;charset=utf-8' : 'text/plain;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    }
     setShowExportMenu(false)
   }
 
@@ -1831,9 +2780,42 @@ export default function Home() {
   }
 
   /** 打开版本 diff 弹窗（assistant 消息操作栏） */
-  const openVersionDialog = (message: ChatMessage, userMessageId: string) => {
+  const openVersionDialog = useCallback((message: ChatMessage, userMessageId: string) => {
     setVersionDialog({ userMessageId, current: message.content })
-  }
+  }, [])
+
+  // 稳定回调（MessageItem memo 化配套）：避免每轮渲染重建内联箭头导致全部历史消息重渲染
+  const openFeedbackDialog = useCallback((id: string) => setFeedbackDialog({ messageId: id }), [])
+  const regenerateLatest = useCallback(() => regenerateLast(modelOptions), [modelOptions, regenerateLast])
+  const branchFrom = useCallback((msg: ChatMessage) => regenerateLast(modelOptions, msg.id), [modelOptions, regenerateLast])
+  const toggleOps = useCallback(() => setOpsOpen((v) => !v), [])
+
+  // —— 消息引用（Quote）：引用内容以 > 行插入草稿（模型可见），msg:{id} 落 references_json 供点击定位 ——
+  const [pendingQuote, setPendingQuote] = useState<{ id: string; preview: string } | null>(null)
+  const quoteMessage = useCallback(
+    (m: ChatMessage) => {
+      const body = m.content.trim().slice(0, 400)
+      const quoted = body
+        .split('\n')
+        .slice(0, 8)
+        .map((l) => `> ${l}`)
+        .join('\n')
+      setPendingQuote({ id: m.id, preview: body.split('\n')[0].slice(0, 60) })
+      setDraft((d) => (d ? `${d}\n\n${quoted}\n\n` : `${quoted}\n\n`))
+      inputRef.current?.focus()
+    },
+    [],
+  )
+  /** 点击引用标签：定位并高亮被引用消息（复用搜索命中的定位机制） */
+  const locateQuotedMessage = useCallback((msgId: string) => setHighlightMsgId(msgId), [])
+  /** 从该 user 消息派生新会话（Fork：复制至此消息，原会话保持不动） */
+  const forkFromHere = useCallback(
+    (msg: ChatMessage) => {
+      if (confirmDeleteMsgId) return
+      void forkCurrentConversation(msg.id)
+    },
+    [confirmDeleteMsgId, forkCurrentConversation],
+  )
 
   /** 会话重命名提交 */
   const submitRename = async (id: string) => {
@@ -1852,17 +2834,122 @@ export default function Home() {
       return
     }
     setConfirmDeleteId(null)
+    // 记录被删除的会话元信息（用于 audit），删除后查不到
+    const target = conversations.find((c) => c.id === id)
     await deleteConversation(id)
+    useAuditStore.getState().log({
+      category: 'conversation.delete',
+      label: t('home.auditLabelConvDelete'),
+      detail: target ? `${target.title} (${target.messages_count ?? '?'} messages)` : id,
+      conversationId: id,
+      projectId: currentProject?.id,
+    })
+  }
+
+  /** 项目移除（二次确认）：第一击进入确认态（3 秒自动恢复），第二击执行删除。
+   * 仅移除软件内记录（会话/消息/权限等），不影响磁盘上的项目文件 */
+  const handleDeleteProject = async (id: string) => {
+    if (confirmDeleteProjectId !== id) {
+      setConfirmDeleteProjectId(id)
+      setTimeout(() => setConfirmDeleteProjectId((cur) => (cur === id ? null : cur)), 3000)
+      return
+    }
+    setConfirmDeleteProjectId(null)
+    const target = projects.find((p) => p.id === id)
+    await removeProject(id)
+    useAuditStore.getState().log({
+      category: 'project.remove',
+      label: t('home.auditLabelProjectRemove'),
+      detail: target?.name ?? id,
+      projectId: id,
+    })
+  }
+
+  /** 打开项目所在文件夹：系统默认文件管理器（Windows 资源管理器 / macOS Finder） */
+  const handleOpenProjectFolder = async (p: Project) => {
+    try {
+      await shellOpen(p.path)
+    } catch (e) {
+      sendNotification(t('home.openFolderFail'), String(e), 'error')
+    }
+  }
+
+  /** 刷新项目所有信息：工作区模块重扫 + 项目列表刷新；
+   * 当前打开的项目联动刷新文件树 / 记忆 / 统计 / 分支 / 最近任务 */
+  const handleRefreshProjectAll = async (p: Project) => {
+    try {
+      await rescanWorkspaceModules(p.id)
+    } catch {
+      // 扫描失败静默：不阻塞后续刷新
+    }
+    await refreshProjects()
+    if (currentProject?.id === p.id) {
+      await useProjectStore.getState().loadFileTree()
+      await loadMemories()
+      await loadToolStats()
+      void loadToolTokenStats()
+      void useProjectStore.getState().refreshGitBranches()
+      void loadRecentRuns()
+    }
+    sendNotification(t('home.projectRefreshed'), p.name)
   }
 
   /** 置顶 / 取消置顶 */
   const togglePin = async (id: string, pinned: boolean) => {
     await pinConversation(id, !pinned)
+    const target = conversations.find((c) => c.id === id)
+    useAuditStore.getState().log({
+      category: 'conversation.pin',
+      label: pinned ? t('home.auditLabelConvUnpin') : t('home.auditLabelConvPin'),
+      detail: target?.title ?? id,
+      conversationId: id,
+      projectId: currentProject?.id,
+    })
   }
 
   /** 归档 / 取消归档（归档后按当前视图刷新） */
   const toggleArchive = async (id: string, archived: boolean) => {
     await archiveConversation(id, !archived)
+    const target = conversations.find((c) => c.id === id)
+    useAuditStore.getState().log({
+      category: 'conversation.archive',
+      label: archived ? t('home.auditLabelConvUnarchive') : t('home.auditLabelConvArchive'),
+      detail: target?.title ?? id,
+      conversationId: id,
+      projectId: currentProject?.id,
+    })
+  }
+
+  /** 导入会话为只读预览（纯前端：解析 md/json 文件 → 弹窗显示 → 提供"复制全文"按钮）
+   *  - 不写数据库（避免污染历史/触发 agent）
+   *  - 用户可复制后粘贴到任意会话作为参考
+   *  - 支持格式：
+   *     1) Markdown 标题 + ## User/Assistant 分段（导出自家格式）
+   *     2) JSON 数组：[{role, content, reasoning?}, ...]（通用格式）
+   */
+  const handleImport = async () => {
+    try {
+      const path = await dialogOpen({
+        multiple: false,
+        filters: [
+          { name: 'Conversation', extensions: ['md', 'txt', 'json'] },
+          { name: 'All', extensions: ['*'] },
+        ],
+      })
+      if (!path || Array.isArray(path)) return
+      // Tauri 2 plugin-dialog 返回 string | string[]，上面已 narrow
+      const filePath = path as string
+      const text = await readTextFile(filePath)
+      const title = filePath.split(/[\\/]/).pop() ?? 'imported'
+      const parsed = parseImportText(text)
+      if (parsed.length === 0) {
+        sendNotification(t('home.importFail'), t('home.importEmpty'), 'error')
+        return
+      }
+      setImportDialog({ open: true, title, messages: parsed })
+    } catch (e) {
+      sendNotification(t('home.importFail'), String(e), 'error')
+    }
   }
 
   /** 切换归档视图：重新拉取对应列表 */
@@ -1934,6 +3021,128 @@ export default function Home() {
     return d.toLocaleString(undefined, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
   }
 
+  /** ID 展示与复制工具：取前 8 位作为短 ID，点击复制完整 ID 并显示 1.5s 成功反馈 */
+  const shortId = (id: string) => id.slice(0, 8)
+  const [copiedId, setCopiedId] = useState<string | null>(null)
+  const copyId = useCallback(async (id: string, _label?: string) => {
+    try {
+      await navigator.clipboard.writeText(id)
+      setCopiedId(id)
+      setTimeout(() => setCopiedId((cur) => (cur === id ? null : cur)), 1500)
+    } catch {
+      /* 剪贴板不可用时静默失败 */
+    }
+  }, [])
+
+  /** 解析导入文件文本 → 消息列表（role + content）
+   *  - 优先尝试 JSON：[{role, content, reasoning?}, ...] 或 {messages: [...]}
+   *  - 回退 Markdown：按 ## User/## Assistant 分段（与 exportConversationMd 输出一致）
+   *  - 返回：只读预览结构，不入库
+   */
+  const parseImportText = (text: string): Array<{ role: string; content: string }> => {
+    const trimmed = text.trim()
+    // 1) JSON 优先
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+      try {
+        const obj = JSON.parse(trimmed)
+        const arr: unknown[] = Array.isArray(obj) ? obj : Array.isArray((obj as { messages?: unknown[] })?.messages) ? (obj as { messages: unknown[] }).messages : []
+        const out: Array<{ role: string; content: string }> = []
+        for (const item of arr) {
+          if (!item || typeof item !== 'object') continue
+          const o = item as { role?: unknown; content?: unknown }
+          const role = typeof o.role === 'string' ? o.role : 'user'
+          const content = typeof o.content === 'string' ? o.content : ''
+          if (content.trim()) out.push({ role, content })
+        }
+        return out
+      } catch {
+        // JSON 解析失败 → 走 markdown
+      }
+    }
+    // 2) Markdown：按 ## 行分段
+    const lines = text.split(/\r?\n/)
+    const out: Array<{ role: string; content: string }> = []
+    let cur: { role: string; content: string } | null = null
+    const flush = () => { if (cur && cur.content.trim()) out.push(cur) }
+    for (const ln of lines) {
+      const h = /^\s*#{1,3}\s*(👤\s*User|🤖\s*Assistant|⚙️\s*\S+|\*\*\s*(User|Assistant)\s*\*\*|User|Assistant)\s*$/i.exec(ln)
+      if (h) {
+        flush()
+        const label = h[1].toLowerCase()
+        const role = label.includes('user') ? 'user' : label.includes('assistant') ? 'assistant' : 'system'
+        cur = { role, content: '' }
+        continue
+      }
+      if (cur) {
+        // 跳过 HTML sub 行（导出自带的元数据）
+        if (/^<sub>.*<\/sub>$/i.test(ln)) continue
+        // 跳过水平分割线
+        if (/^---+\s*$/.test(ln)) continue
+        cur.content += (cur.content ? '\n' : '') + ln
+      }
+    }
+    flush()
+    return out
+  }
+
+  // 会话列表时间分组：今天 / 昨天 / 本周 / 更早；用于左侧会话列表快速定位
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  const convGroupKey = (ts: number) => {
+    const diffDays = Math.round((startOfDay(new Date()) - startOfDay(new Date(ts * 1000))) / 86400000)
+    if (diffDays <= 0) return 'today'
+    if (diffDays === 1) return 'yesterday'
+    if (diffDays < 7) return 'week'
+    return 'earlier'
+  }
+  const convGroupLabel = (key: string) => {
+    if (key === 'today') return t('home.dayToday')
+    if (key === 'yesterday') return t('home.dayYesterday')
+    if (key === 'week') return t('home.dayThisWeek')
+    return t('home.dayEarlier')
+  }
+  // 智能归档建议：7+ 天无活动且未置顶 → 建议归档；30+ 天 → 强烈建议（前端标记，后端不自动改）
+  // 阈值用户可在 ConfigPage 调整（本期先用默认值 7/30）
+  const ARCHIVE_SUGGEST_DAYS = 7
+  const ARCHIVE_STRONG_DAYS = 30
+  const suggestArchive = (c: Conversation): 'normal' | 'suggest' | 'strong' => {
+    if (c.is_pinned || c.archived) return 'normal'
+    const days = Math.floor((Date.now() / 1000 - c.updated_at) / 86400)
+    if (days >= ARCHIVE_STRONG_DAYS) return 'strong'
+    if (days >= ARCHIVE_SUGGEST_DAYS) return 'suggest'
+    return 'normal'
+  }
+  // 按置顶 + 分组 + 时间倒序排好，并在组边界插入 {kind:'header'} 标签项
+  // 置顶项按时间倒序排成"置顶"虚拟组（不显示标签）；其余按"今天/昨天/本周/更早"分组显示
+  const groupedConversations = useMemo(() => {
+    // 标签过滤：null 不过滤；string 时只保留 tags 包含该值的会话
+    const filtered = activeTagFilter
+      ? conversations.filter((c) => (c.tags ?? '').split(',').map((s) => s.trim()).includes(activeTagFilter))
+      : conversations
+    const sorted = [...filtered].sort((a, b) => {
+      if (Number(a.is_pinned) !== Number(b.is_pinned)) return Number(b.is_pinned) - Number(a.is_pinned)
+      return b.updated_at - a.updated_at
+    })
+    const out: Array<
+      | { kind: 'header'; key: string; label: string }
+      | { kind: 'item'; conv: Conversation; key: string }
+    > = []
+    let lastKey = ''
+    for (const c of sorted) {
+      if (c.is_pinned) {
+        // 置顶项：直接追加，不参与分组
+        out.push({ kind: 'item', conv: c, key: c.id })
+        continue
+      }
+      const gk = convGroupKey(c.updated_at)
+      if (gk !== lastKey) {
+        lastKey = gk
+        out.push({ kind: 'header', key: `gh-${gk}`, label: convGroupLabel(gk) })
+      }
+      out.push({ kind: 'item', conv: c, key: c.id })
+    }
+    return out
+  }, [conversations, t, activeTagFilter])
+
   // token 数缩写（1.2k / 3.4w），标题下累计展示用
   const fmtTokens = (n: number) =>
     n >= 10000 ? `${(n / 10000).toFixed(1)}w` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
@@ -1978,8 +3187,114 @@ export default function Home() {
     return t('provider.modelDefault')
   })()
 
+  // ---------- 命令面板（Cmd+K）：后端静态命令 + 前端动态命令（会话/模型） ----------
+  // 依赖会话/模型/当前会话 ID，变化时重建命令列表；run 回调在点击时才执行，捕获最新闭包
+  const paletteCommands = useMemo<PaletteCommand[]>(() => {
+    // 后端 action:<name> → 本地回调映射（未知动作静默忽略，向后兼容后端新增命令）
+    const runAction = (name: string) => {
+      switch (name) {
+        case 'new_chat':
+          void newConversation()
+          break
+        case 'compact':
+          void handleCompact()
+          break
+        case 'rollback':
+          void handleRollback()
+          break
+        case 'rules':
+          void openRulesDialog()
+          break
+        case 'slash_build':
+          setDraft(t('home.quickBuildPrompt'))
+          inputRef.current?.focus()
+          break
+        case 'slash_deploy':
+          setDraft(t('home.quickDeployPrompt'))
+          inputRef.current?.focus()
+          break
+        case 'slash_plan':
+          updateModelOptions({ ...modelOptions, plan_mode: true })
+          setDraft(t('home.slashPlanPrompt'))
+          inputRef.current?.focus()
+          break
+        case 'slash_fix':
+          setDraft(t('home.slashFixPrompt'))
+          inputRef.current?.focus()
+          break
+        case 'slash_review':
+          setDraft(t('home.slashReviewPrompt'))
+          inputRef.current?.focus()
+          break
+        case 'toggle_theme':
+          toggleTheme()
+          break
+      }
+    }
+    const cmds: PaletteCommand[] = []
+    // 后端静态命令：nav:<path> 跳转；action:<name> 本地执行
+    for (const b of backendCmds) {
+      cmds.push({
+        id: b.id,
+        title: b.title,
+        subtitle: b.subtitle,
+        group: b.group,
+        icon: (b.icon || 'check') as IconName,
+        run: () => {
+          if (b.id.startsWith('nav:')) navigate(b.id.slice(4))
+          else if (b.id.startsWith('action:')) runAction(b.id.slice(7))
+        },
+      })
+    }
+    // 动态命令：切换会话（置顶优先展示）
+    const convs = [...conversations].sort((a, b) => Number(b.is_pinned) - Number(a.is_pinned))
+    for (const c of convs) {
+      cmds.push({
+        id: `conv:${c.id}`,
+        title: c.title || '(未命名会话)',
+        subtitle: c.is_pinned ? '置顶会话' : new Date(c.updated_at).toLocaleString(),
+        group: '切换会话',
+        icon: 'chat',
+        keywords: c.title,
+        run: () => {
+          void openConversation(c.id)
+        },
+      })
+    }
+    // 动态命令：切换模型（按 Provider 分组展示）
+    for (const g of modelCatalog) {
+      for (const m of g.models) {
+        if (!m.enabled) continue
+        cmds.push({
+          id: `model:${m.id}`,
+          title: m.display_name ?? m.model_id,
+          subtitle: g.providerName,
+          group: '切换模型',
+          icon: 'spark',
+          keywords: m.model_id,
+          run: () => {
+            // 函数式更新避免捕获过期 modelOptions
+            setModelOptions((prev) => {
+              const next = { ...prev, model_id: m.id }
+              localStorage.setItem('deveco-switch-chat-options', JSON.stringify(next))
+              return next
+            })
+          },
+        })
+      }
+    }
+    return cmds
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backendCmds, conversations, modelCatalog, currentConversation?.id, t])
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[var(--bg-window)]">
+      {/* 全局命令面板（Cmd+K）：后端静态命令 + 会话/模型动态命令 */}
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        commands={paletteCommands}
+      />
       {/* ============ 左侧栏：项目 + 会话 ============ */}
       <aside
         style={{ width: sidebarCollapsed ? 56 : sidebarWidth }}
@@ -2005,7 +3320,7 @@ export default function Home() {
           <button
             onClick={() => setShowAddDialog(true)}
             title={t('home.addProject')}
-            className={`h-9 flex items-center justify-center gap-1.5 rounded-[10px] bg-[var(--accent)] text-white text-[13px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all shadow-lg shadow-[var(--accent)]/15 ${sidebarCollapsed ? 'w-9 mx-auto' : 'w-full'}`}
+            className={`h-9 flex items-center justify-center gap-1.5 rounded-[10px] btn-primary text-[13px] font-medium active:scale-[0.98] transition-all ${sidebarCollapsed ? 'w-9 mx-auto' : 'w-full'}`}
           >
             <Icon name="plus" size={15} white /> {!sidebarCollapsed && t('home.addProject')}
           </button>
@@ -2032,6 +3347,11 @@ export default function Home() {
                   <button
                     key={p.id}
                     onClick={() => openProject(p.id)}
+                    onContextMenu={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setProjectMenu({ x: e.clientX, y: e.clientY, project: p })
+                    }}
                     title={p.name}
                     className={`group relative flex items-center gap-2 rounded-lg text-left transition-colors ${
                       sidebarCollapsed ? 'w-9 h-9 justify-center' : 'w-full pl-3 pr-2 py-[7px]'
@@ -2061,6 +3381,35 @@ export default function Home() {
                             {total}
                           </span>
                         )}
+                        {/* 会话数：项目维度统计，与模块能力计数区分展示 */}
+                        {p.conversation_count > 0 && (
+                          <span
+                            className="shrink-0 min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full modern-card border-[var(--border)] text-[var(--text-muted)] text-[10px] font-medium tabular-nums"
+                            title={t('home.conversationCount', { n: p.conversation_count })}
+                          >
+                            {p.conversation_count}
+                          </span>
+                        )}
+                        {/* 分隔线：危险操作与常规操作拉开视觉距离，降低误触 */}
+                        <span className="mx-0.5 w-px h-3.5 bg-[var(--border)] shrink-0" aria-hidden="true" />
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void handleDeleteProject(p.id)
+                          }}
+                          className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
+                            confirmDeleteProjectId === p.id
+                              ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)] opacity-100'
+                              : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
+                          }`}
+                          title={
+                            confirmDeleteProjectId === p.id
+                              ? t('home.confirmDeleteProject')
+                              : t('home.deleteProject')
+                          }
+                        >
+                          <Icon name="delete" size={13} white={confirmDeleteProjectId === p.id} />
+                        </button>
                         <span
                           className={`shrink-0 w-1.5 h-1.5 rounded-full ${p.trusted ? 'bg-[var(--success)]' : 'bg-[var(--warning)]'} ${
                             active ? '' : 'opacity-0 group-hover:opacity-60'
@@ -2075,6 +3424,46 @@ export default function Home() {
             </div>
           )}
         </div>
+
+        {/* 最近项目右键菜单：打开项目所在文件夹 / 刷新项目信息 */}
+        {projectMenu && (
+          <div
+            ref={projectMenuRef}
+            className="fixed z-[80] w-52 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
+            style={{
+              left: Math.min(projectMenu.x, window.innerWidth - 220),
+              top: Math.min(projectMenu.y, window.innerHeight - 140),
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="px-3 py-1.5 text-[11px] font-medium text-[var(--text-muted)] truncate" title={projectMenu.project.path}>
+              {projectMenu.project.name}
+            </div>
+            <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+            <button
+              onClick={() => {
+                if (!projectMenu) return
+                void handleOpenProjectFolder(projectMenu.project)
+                setProjectMenu(null)
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="folder" size={13} />
+              {t('home.openProjectFolder')}
+            </button>
+            <button
+              onClick={() => {
+                if (!projectMenu) return
+                void handleRefreshProjectAll(projectMenu.project)
+                setProjectMenu(null)
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="refresh" size={13} />
+              {t('home.refreshProjectInfo')}
+            </button>
+          </div>
+        )}
 
         {/* 会话列表 */}
         <div className="flex-1 flex flex-col min-h-0 mt-1">
@@ -2103,6 +3492,14 @@ export default function Home() {
                   title={t('home.newConversation')}
                 >
                   <Icon name="plus" size={14} />
+                </button>
+                {/* 导入会话（只读预览：解析 md/json 文件，弹窗显示 + 复制全文） */}
+                <button
+                  onClick={handleImport}
+                  className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                  title={t('home.import')}
+                >
+                  <Icon name="file" size={14} />
                 </button>
               </div>
             )}
@@ -2169,10 +3566,68 @@ export default function Home() {
                 >
                   {t('home.searchModeMsg')}
                 </button>
+                <button
+                  onClick={() => {
+                    setSearchMode('all')
+                    void setConversationKeyword('')
+                    setMsgHits([])
+                  }}
+                  className={`flex-1 h-6 rounded-md text-[10.5px] transition-colors ${
+                    searchMode === 'all'
+                      ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
+                      : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+                  }`}
+                >
+                  {t('home.searchModeAll')}
+                </button>
               </div>
+              {/* 消息搜索范围：全部会话 / 仅本会话（有当前会话时才可限定） */}
+              {searchMode === 'msg' && currentConversation && (
+                <div className="flex gap-1 mt-1">
+                  <button
+                    onClick={() => setMsgSearchScope(msgSearchScope === 'current' ? 'all' : 'current')}
+                    className={`h-5 px-2 rounded text-[10px] transition-colors ${
+                      msgSearchScope === 'current'
+                        ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
+                        : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+                    }`}
+                    title={t('home.msgScopeCurrent')}
+                  >
+                    {msgSearchScope === 'current' ? `⌖ ${t('home.msgScopeCurrent')}` : t('home.msgScopeAll')}
+                  </button>
+                </div>
+              )}
+              {/* 标签筛选下拉：拉取项目下所有出现过的标签，点击过滤会话列表 */}
+              {currentProject && tagCounts.length > 0 && (
+                <div className="mt-1.5 px-1 flex flex-wrap gap-1">
+                  <button
+                    onClick={() => setActiveTagFilter(null)}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                      activeTagFilter === null
+                        ? 'tab-active'
+                        : 'tab-inactive'
+                    }`}
+                  >
+                    {t('home.tagAll')}
+                  </button>
+                  {tagCounts.slice(0, 8).map((tc) => (
+                    <button
+                      key={tc.tag}
+                      onClick={() => setActiveTagFilter(activeTagFilter === tc.tag ? null : tc.tag)}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                        activeTagFilter === tc.tag
+                          ? 'tab-active'
+                          : 'tab-inactive'
+                      }`}
+                    >
+                      {tc.tag} <span className="opacity-60 ml-0.5 tnum">{tc.count}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
               {/* 消息全文搜索结果下拉 */}
               {searchMode === 'msg' && searchText.trim().length >= 2 && (
-                <div className="mt-1.5 max-h-72 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-card)] shadow-lg shadow-black/20 py-1">
+                <div className="mt-1.5 max-h-72 overflow-y-auto rounded-lg modern-card shadow-lg shadow-black/20 py-1">
                   {msgSearching && msgHits.length === 0 && (
                     <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.searching')}</div>
                   )}
@@ -2203,6 +3658,63 @@ export default function Home() {
                   ))}
                 </div>
               )}
+              {/* 跨项目全文搜索结果下拉：按项目分组 */}
+              {searchMode === 'all' && searchText.trim().length >= 2 && (
+                <div className="mt-1.5 max-h-72 overflow-y-auto rounded-lg modern-card shadow-lg shadow-black/20 py-1">
+                  {allProjectSearching && allProjectHits.length === 0 && (
+                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.searching')}</div>
+                  )}
+                  {!allProjectSearching && allProjectHits.length === 0 && (
+                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.noMessageHits')}</div>
+                  )}
+                  {(() => {
+                    // 按项目分组
+                    const groups = new Map<string, MessageSearchHit[]>()
+                    for (const h of allProjectHits) {
+                      const key = h.project_id ?? '_'
+                      const arr = groups.get(key) ?? []
+                      arr.push(h)
+                      groups.set(key, arr)
+                    }
+                    const out: JSX.Element[] = []
+                    for (const [pid, hits] of groups) {
+                      const first = hits[0]
+                      out.push(
+                        <div key={`gh-${pid}`} className="group-label" style={{ paddingLeft: 10, paddingRight: 10, paddingTop: 6, paddingBottom: 2 }}>
+                          <span className="truncate">{first.project_name ?? pid} · {hits.length}</span>
+                        </div>
+                      )
+                      for (const hit of hits.slice(0, 5)) {
+                        out.push(
+                          <button
+                            key={hit.message_id}
+                            onClick={() => {
+                              // 跨项目跳转：先切项目，再打开会话，最后定位高亮目标消息
+                              const pj = useProjectStore.getState().projects.find((p) => p.id === hit.project_id)
+                              if (pj) {
+                                openProject(pj.id)
+                                  .then(() => openConversation(hit.conversation_id))
+                                  .then(() => setHighlightMsgId(hit.message_id))
+                                  .catch(() => {})
+                              }
+                              setSearchText('')
+                              setAllProjectHits([])
+                            }}
+                            className="w-full text-left px-2.5 py-1.5 hover:bg-[var(--bg-hover)] transition-colors"
+                          >
+                            <div className="flex items-center gap-1.5 text-[10.5px] text-[var(--text-muted)]">
+                              <span className="truncate font-medium">{hit.conversation_title}</span>
+                              <span className="shrink-0">{hit.role === 'user' ? '👤' : '✨'}</span>
+                            </div>
+                            <div className="text-[11px] text-[var(--text-secondary)] line-clamp-2 mt-0.5">{hit.snippet}</div>
+                          </button>
+                        )
+                      }
+                    }
+                    return out
+                  })()}
+                </div>
+              )}
             </div>
           )}
           <div className={`flex-1 overflow-y-auto pb-2 space-y-0.5 ${sidebarCollapsed ? 'px-2' : 'px-2'}`}>
@@ -2211,14 +3723,23 @@ export default function Home() {
                 {currentProject ? t('home.noConversation') : t('home.selectProjectFirst')}
               </p>
             )}
-            {conversations.map((c) => {
+            {groupedConversations.map((row) => {
+              if (row.kind === 'header') {
+                return (
+                  <div key={row.key} className="group-label" style={{ paddingLeft: 10, paddingRight: 10, paddingTop: 10, paddingBottom: 4 }}>
+                    <span>{row.label}</span>
+                  </div>
+                )
+              }
+              const c = row.conv
               const active = c.id === currentConversation?.id
               const renaming = renamingId === c.id
+              const pendingItems = pendingConfirmations[c.id] ?? []
               return (
                 <div
                   key={c.id}
-                  className={`group w-full flex items-center rounded-lg transition-colors ${
-                    active ? 'bg-[var(--bg-card)]' : 'hover:bg-[var(--bg-hover)]'
+                  className={`list-row group w-full flex items-center rounded-lg transition-colors ${
+                    active ? 'bg-[var(--bg-card)] is-active' : 'hover:bg-[var(--bg-hover)]'
                   } ${sidebarCollapsed ? 'justify-center py-1' : 'pl-2.5 pr-1.5 py-1.5'}`}
                 >
                   {renaming ? (
@@ -2244,22 +3765,117 @@ export default function Home() {
                   ) : (
                     <>
                       <button onClick={() => openConversation(c.id)} className="flex-1 min-w-0 text-left">
-                        <span
-                          className={`block text-[13px] truncate ${c.is_pinned ? 'text-[var(--accent)]' : active ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)] group-hover:text-[var(--text-primary)]'}`}
-                        >
-                          {c.is_pinned && <Icon name="pin" size={11} className="mr-1 text-[var(--accent)] align-[-1px]" />}
-                          {c.title}
+                        <span className="flex items-center gap-1.5">
+                          <span
+                            className={`block text-[13px] truncate min-w-0 ${c.is_pinned ? 'text-[var(--accent)]' : active ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)] group-hover:text-[var(--text-primary)]'}`}
+                          >
+                            {c.is_pinned && <Icon name="pin" size={11} className="mr-1 text-[var(--accent)] align-[-1px]" />}
+                            {c.title}
+                          </span>
+                          {c.work_mode === 'worktree' && (
+                            <span
+                              className="shrink-0 inline-flex items-center gap-1 text-[9.5px] px-1 py-px rounded font-medium bg-[var(--accent)]/10 text-[var(--accent)]"
+                              title={c.worktree_path ?? c.worktree_branch ?? 'worktree'}
+                            >
+                              <Icon name="git-branch" size={9} />
+                              {c.worktree_branch || 'worktree'}
+                            </span>
+                          )}
                         </span>
-                        {streaming.conversationId === c.id ? (
+                        {/* 待确认角标：审批(危险=红) / 计划(待批准=橙) / 提问(待回答=蓝)，醒目提示该会话在等你 */}
+                        {pendingItems.length > 0 && (
+                          <span className="flex items-center gap-1 mt-0.5 flex-wrap">
+                            {pendingItems.some((p) => p.kind === 'approval') && (
+                              <span
+                                className="flex items-center gap-1 px-1.5 py-px rounded text-[9.5px] font-medium bg-[var(--danger-50)] text-[var(--danger)]"
+                                title={t('home.pendingApprovalTip')}
+                              >
+                                <Icon name="bolt" size={9} />
+                                {t('home.pendingApproval')}
+                              </span>
+                            )}
+                            {pendingItems.some((p) => p.kind === 'plan') && (
+                              <span
+                                className="flex items-center gap-1 px-1.5 py-px rounded text-[9.5px] font-medium bg-[var(--warning-50)] text-[var(--warning-600)]"
+                                title={t('home.pendingPlanTip')}
+                              >
+                                <Icon name="lightbulb" size={9} />
+                                {t('home.pendingPlan')}
+                              </span>
+                            )}
+                            {pendingItems.some((p) => p.kind === 'ask') && (
+                              <span
+                                className="flex items-center gap-1 px-1.5 py-px rounded text-[9.5px] font-medium bg-[var(--accent-soft)] text-[var(--accent)]"
+                                title={t('home.pendingAskTip')}
+                              >
+                                <Icon name="headphones" size={9} />
+                                {t('home.pendingAsk')}
+                              </span>
+                            )}
+                          </span>
+                        )}
+                        {/* 标签 chip 行（最多显示 3 个，超出 +N） */}
+                        {c.tags && (
+                          <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                            {c.tags.split(',').slice(0, 3).map((tag) => (
+                              <span
+                                key={tag}
+                                className="px-1.5 py-px rounded text-[9.5px] font-medium bg-[var(--accent-soft)] text-[var(--accent)] border border-[var(--accent)]/20"
+                              >
+                                {tag.trim()}
+                              </span>
+                            ))}
+                            {c.tags.split(',').length > 3 && (
+                              <span className="text-[9.5px] text-[var(--text-muted)]">+{c.tags.split(',').length - 3}</span>
+                            )}
+                          </div>
+                        )}
+                        {streamings[c.id] ? (
                           <span className="flex items-center gap-1.5 text-[11px] text-[var(--accent)] mt-0.5 tabular-nums">
                             <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
-                            {t('home.taskElapsed', { time: fmtElapsed(taskElapsed) })}
+                            {streaming.conversationId === c.id
+                              ? t('home.taskElapsed', { time: fmtElapsed(taskElapsed) })
+                              : t('home.bgStreaming')}
                           </span>
                         ) : (
                           <span className="flex items-center gap-1.5 mt-0.5">
                             <span className="text-[11px] text-[var(--text-muted)]">{formatTime(c.updated_at)}</span>
+                            {/* 会话短 ID：hover 可见，点击复制 */}
+                            <button
+                              onClick={(e) => { e.stopPropagation(); copyId(c.id) }}
+                              className="debug-id-badge font-mono text-[8.5px] px-1 py-px rounded border border-transparent text-[var(--text-muted)]/70 hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-all opacity-0 group-hover:opacity-100"
+                              title={`${t('home.convId')}: ${c.id}\n${t('home.clickToCopy')}`}
+                            >
+                              {copiedId === c.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
+                              {shortId(c.id)}
+                            </button>
+                            {/* 智能归档建议徽章：7+ 天未活动弱提醒，30+ 天强提醒（强建议时背景更显眼） */}
+                            {(() => {
+                              const sug = suggestArchive(c)
+                              if (sug === 'suggest') {
+                                return (
+                                  <span
+                                    className="text-[9.5px] px-1 rounded font-medium bg-[var(--warning-50)] text-[var(--warning-600)]"
+                                    title={t('home.suggestArchiveHint')}
+                                  >
+                                    {t('home.suggestArchive')}
+                                  </span>
+                                )
+                              }
+                              if (sug === 'strong') {
+                                return (
+                                  <span
+                                    className="text-[9.5px] px-1 rounded font-medium bg-[var(--danger-50)] text-[var(--danger)]"
+                                    title={t('home.strongArchiveHint')}
+                                  >
+                                    {t('home.strongArchive')}
+                                  </span>
+                                )
+                              }
+                              return null
+                            })()}
                             {!active && (unreadMap[c.id] ?? 0) > 0 && (
-                              <span className="min-w-[16px] h-[16px] px-1 flex items-center justify-center rounded-full bg-[var(--accent)] text-white text-[9.5px] font-semibold leading-none">
+                              <span className="min-w-[16px] h-[16px] px-1 flex items-center justify-center rounded-full btn-primary text-[9.5px] font-semibold leading-none">
                                 {unreadMap[c.id] > 99 ? '99+' : unreadMap[c.id]}
                               </span>
                             )}
@@ -2301,19 +3917,25 @@ export default function Home() {
                       >
                         <Icon name="edit" size={13} />
                       </button>
+                      {/* 分隔线：危险操作与常规操作拉开视觉距离，降低误触 */}
+                      <span className="mx-0.5 w-px h-3.5 bg-[var(--border)] shrink-0" aria-hidden="true" />
                       <button
                         onClick={(e) => {
                           e.stopPropagation()
                           handleDeleteConversation(c.id)
                         }}
-                        className={`p-1 rounded-md transition-all shrink-0 ${
+                        className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
                           confirmDeleteId === c.id
-                            ? 'text-[var(--danger)] bg-[var(--danger)]/10 opacity-100'
+                            ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)] opacity-100'
                             : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
                         }`}
-                        title={t('home.deleteConversation')}
+                        title={
+                          confirmDeleteId === c.id
+                            ? t('home.confirmDeleteConversation')
+                            : t('home.deleteConversation')
+                        }
                       >
-                        <Icon name="delete" size={13} />
+                        <Icon name="delete" size={13} white={confirmDeleteId === c.id} />
                       </button>
                     </>
                   )}
@@ -2339,7 +3961,7 @@ export default function Home() {
             </button>
             {showSettingsMenu && (
               <div
-                className={`absolute bottom-full mb-1.5 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 py-1 z-50 animate-modal-in ${sidebarCollapsed ? 'left-0' : 'left-0'} w-52`}
+                className={`absolute bottom-full mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 animate-modal-in ${sidebarCollapsed ? 'left-0' : 'left-0'} w-52`}
               >
                 <div className="px-3 py-1.5 text-[10px] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
                   {t('home.settings')}
@@ -2363,6 +3985,22 @@ export default function Home() {
                     )}
                   </button>
                 ))}
+                {/* 审计日志：弹层形式打开（不走导航），与 settings 平级 */}
+                <div className="border-t border-[var(--border)] mt-1 pt-1">
+                  <button
+                    onClick={() => {
+                      setShowSettingsMenu(false)
+                      setAuditOpen(true)
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                  >
+                    <Icon name="history" size={14} />
+                    <span className="flex-1 text-left">{t('home.audit')}</span>
+                    <span className="text-[10px] text-[var(--text-muted)] tnum">
+                      {useAuditStore.getState().entries.length}
+                    </span>
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -2371,8 +4009,9 @@ export default function Home() {
             title={t('home.theme')}
             className={`p-2 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 flex items-center justify-center' : ''}`}
           >
-            <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={15} />
+            <Icon name={themeResolved === 'dark' ? 'sun' : 'moon'} size={15} />
           </button>
+          <NotificationBell fixed />
           {currentProject && !sidebarCollapsed && (
             <span
               className={`w-2 h-2 rounded-full shrink-0 ${currentProject.trusted ? 'bg-[var(--success)]' : 'bg-[var(--warning)]'}`}
@@ -2418,6 +4057,28 @@ export default function Home() {
             <span className="text-[13.5px] font-medium truncate">
               {currentConversation?.title ?? (currentProject ? currentProject.name : t('home.welcome'))}
             </span>
+            {/* 会话 ID：点击复制完整 ID，排查问题用 */}
+            {currentConversation && (
+              <button
+                onClick={() => copyId(currentConversation.id)}
+                className="debug-id-badge shrink-0 font-mono text-[9.5px] px-1.5 py-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]/40 transition-colors"
+                title={`${t('home.convId')}: ${currentConversation.id}\n${t('home.clickToCopy')}`}
+              >
+                {copiedId === currentConversation.id ? <Icon name="check" size={9} className="text-[var(--success)]" /> : '#'}
+                {shortId(currentConversation.id)}
+              </button>
+            )}
+            {/* 项目 ID：点击复制，排查问题用 */}
+            {currentProject && (
+              <button
+                onClick={() => copyId(currentProject.id)}
+                className="debug-id-badge shrink-0 hidden sm:inline-flex font-mono text-[9.5px] px-1.5 py-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]/40 transition-colors"
+                title={`${t('home.projId')}: ${currentProject.id}\n${t('home.clickToCopy')}`}
+              >
+                {copiedId === currentProject.id ? <Icon name="check" size={9} className="text-[var(--success)]" /> : 'P:'}
+                {shortId(currentProject.id)}
+              </button>
+            )}
             {/* 会话内 token/成本累计（会话打开时加载，任务结束后刷新） */}
             {currentConversation && tokenStats && tokenStats.messages_count > 0 && (
               <span
@@ -2447,7 +4108,7 @@ export default function Home() {
                 value={modelOptions.model_id ?? ''}
                 onChange={(e) => updateModelOptions({ ...modelOptions, model_id: e.target.value || undefined })}
                 title={t('home.switchModel')}
-                className="h-7 max-w-[8.5rem] rounded-lg bg-[var(--bg-card)] border border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)] transition-colors cursor-pointer"
+                className="h-7 max-w-[8.5rem] rounded-lg modern-card border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)] transition-colors cursor-pointer"
               >
                 <option value="">{t('provider.modelDefault')}</option>
                 {modelCatalog.map((g) => (
@@ -2476,7 +4137,7 @@ export default function Home() {
                   <Icon name="more-vert" size={16} />
                 </button>
                 {showMoreMenu && (
-                  <div className="absolute right-0 top-full mt-1.5 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 py-1 z-50 w-52 animate-modal-in">
+                  <div className="absolute right-0 top-full mt-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 w-52 animate-modal-in">
                     {/* 导出会话：hover/focus 展开格式子菜单 */}
                     <div className="relative" ref={exportMenuRef}>
                       <button
@@ -2491,7 +4152,7 @@ export default function Home() {
                         <Icon name="chevron-right" size={12} className="opacity-60" />
                       </button>
                       {showExportMenu && (
-                        <div className="absolute right-full top-0 mr-1 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 py-1 w-44 animate-modal-in">
+                        <div className="absolute right-full top-0 mr-1 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 w-44 animate-modal-in">
                           {([
                             ['md', t('home.exportMd')],
                             ['txt', t('home.exportTxt')],
@@ -2559,12 +4220,12 @@ export default function Home() {
                       <button
                         onClick={() => {
                           setShowMoreMenu(false)
-                          void handleOpenTerminal()
+                          handleOpenShell()
                         }}
                         className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                       >
                         <Icon name="terminal" size={14} />
-                        {t('home.openTerminal')}
+                        {t('home.openShell')}
                       </button>
                     )}
                   </div>
@@ -2592,130 +4253,245 @@ export default function Home() {
           </div>
         </header>
 
+        {/* [66] 工具链缺失横幅：启动自动 ping 发现关键工具链缺失时展示，点击跳转体检页 */}
+        {toolHealthMissing.length > 0 && (
+          <button
+            onClick={() => navigate('/health')}
+            className="shrink-0 flex items-center justify-center gap-2 px-4 py-1.5 text-[11px] bg-[var(--warning)]/15 text-[var(--warning)] border-b border-[var(--border)] hover:bg-[var(--warning)]/25 transition-colors"
+          >
+            <Icon name="health" size={12} />
+            {t('home.toolsHealthBanner', { missing: toolHealthMissing.join(' / ') })}
+          </button>
+        )}
+
         {/* 消息区 / 空状态 */}
-        <div ref={scrollRef} onScroll={handleScroll} className="chat-scroll flex-1 overflow-y-auto px-6 py-6 scroll-smooth">
+        <div ref={scrollRef} onScroll={handleScroll} className="chat-scroll flex-1 overflow-y-auto px-6 py-6">
           {!currentProject ? (
-            <EmptyState onAdd={() => setShowAddDialog(true)} />
+            <EmptyState
+              onAdd={() => setShowAddDialog(true)}
+              onImport={() => void handleImport()}
+              onAudit={() => setAuditOpen(true)}
+              onCost={() => navigate('/cost')}
+            />
           ) : messages.length === 0 && !isStreaming ? (
-            <ChatEmptyState onQuick={(text) => fillDraft(text)} />
+            switchingConv ? (
+              // 会话切换中：messages 已清空、新会话消息尚未加载完成，轻量占位避免空状态闪烁
+              <div className="h-full flex flex-col items-center justify-center text-center">
+                <div className="w-8 h-8 rounded-full border-2 border-[var(--border)] border-t-[var(--accent)] animate-spin" />
+                <p className="text-[12px] text-[var(--text-muted)] mt-3">{t('home.loadingConv')}</p>
+              </div>
+            ) : (
+              <ChatEmptyState onQuick={(text) => fillDraft(text)} />
+            )
           ) : (
-            <div className="max-w-3xl mx-auto space-y-6 animate-fade-in-up">
-              {/* 任务过程徽章（ChatGPT 式）：中间所有过程折叠为“已处理 N 个操作中”，点击展开明细，对话流不中断 */}
-              {isStreaming && streaming.startedAt && (
-                <TaskOpsBadge
-                  running
-                  count={toolRuns.length + agentRuns.length}
-                  time={fmtElapsed(taskElapsed)}
-                  toolName={
-                    toolRuns.some((r) => r.status === 'running') ? toolRuns[toolRuns.length - 1]?.tool : undefined
-                  }
-                  open={opsOpen}
-                  onToggle={() => setOpsOpen((v) => !v)}
-                  runs={toolRuns}
-                  agents={agentRuns}
-                />
+            <div className="max-w-3xl mx-auto">
+              {/* Pinned 消息条：纯前端 localStorage，会话顶部钉住关键消息
+               * - 只展示当前会话已 pin 且仍存在的消息
+               * - 点 chip 滚动到该消息（用 scrollIntoView + 高亮 2 秒）
+               * - 点 × 取消 pin */}
+              {currentConversation && (
+              <>
+              {/* 会话笔记：用户写"这次会话的目标/约定"，纯前端 localStorage
+               * - 默认收起，点编辑/查看展开
+               * - 自动保存（debounce 600ms） */}
+              <ConvNoteBar convId={currentConversation.id} />
+              <PinnedBar convId={currentConversation.id} onJump={(msgId) => {
+                const el = document.querySelector(`[data-msg-id="${msgId}"]`) as HTMLElement | null
+                if (el) {
+                  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                  setHighlightMsgId(msgId)
+                  setTimeout(() => setHighlightMsgId((cur) => (cur === msgId ? null : cur)), 2000)
+                }
+              }} />
+              </>
               )}
-              {renderItems.map((item) => {
-                // 日期分隔线：今天/昨天/具体日期
-                if (item.kind === 'divider') {
+              {/* 虚拟滚动容器：只挂载可视区域附近的条目，条目绝对定位 + translateY 排列；
+                  height 为全部条目累计高度，滚动容器据此产生真实滚动条；measureElement 动态测量并缓存 */}
+              <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+                {virtualizer.getVirtualItems().map((vi) => {
+                  const item = virtualItems[vi.index]
                   return (
-                    <div key={item.key} className="flex items-center gap-3 my-1">
-                      <span className="flex-1 h-px bg-[var(--border)]" />
-                      <span className="text-[10.5px] text-[var(--text-muted)] px-2 py-0.5 rounded-full bg-[var(--bg-card)] border border-[var(--border)] shrink-0">
-                        {item.label}
-                      </span>
-                      <span className="flex-1 h-px bg-[var(--border)]" />
+                    <div
+                      key={vi.key}
+                      ref={virtualizer.measureElement}
+                      data-index={vi.index}
+                      data-vkey={item.key}
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        transform: `translateY(${vi.start}px)`,
+                        paddingBottom: 24,
+                      }}
+                    >
+                      {item.kind === 'divider' && (
+                        <div className="group-label">
+                          <span>{item.label}</span>
+                        </div>
+                      )}
+                      {item.kind === 'tools' && (
+                        <ToolRunGroup runs={item.runs} onRetry={retryTool} onCancel={cancelToolRun} />
+                      )}
+                      {item.kind === 'msg' && (
+                        <MessageItem
+                          message={item.message}
+                          time={formatTime(item.message.created_at)}
+                          userMessageId={item.userMessageId}
+                          isLastAssistant={ item.message.role === 'assistant' && lastAssistantId === item.message.id }
+                          onRegenerate={regenerateLatest}
+                          onBranch={branchFrom}
+                          onRate={rateMessage}
+                          onDislike={openFeedbackDialog}
+                          onOpenVersions={openVersionDialog}
+                          onSpeak={toggleSpeak}
+                          speaking={speakingId === item.message.id}
+                          onEditMessage={setEditTarget}
+                          onDeleteMessage={handleDeleteMessage}
+                          confirmDeleteMsgId={confirmDeleteMsgId}
+                          projectPath={convRoot ?? currentProject?.path}
+                          highlighted={highlightMsgId === item.message.id}
+                          onOpenFile={openCodeFile}
+                          onQuoteMessage={quoteMessage}
+                          onLocateMessage={locateQuotedMessage}
+                          onForkFrom={forkFromHere}
+                          onCopyId={copyId}
+                          shortId={shortId}
+                          copiedId={copiedId}
+                        />
+                      )}
+                      {/* 尾部动态区：流式消息/计划卡/工具徽章/任务摘要等（内容变化由 ResizeObserver 重新测量高度） */}
+                      {item.kind === 'tail' && (
+                        <>
+                          {/* 任务过程徽章（ChatGPT 式）：中间所有过程折叠为“已处理 N 个操作中”，点击展开明细，对话流不中断 */}
+                          {isStreaming && streaming.startedAt && (
+                            <TaskOpsBadge
+                              running
+                              count={toolRuns.length + agentRuns.length}
+                              time={fmtElapsed(taskElapsed)}
+                              toolName={
+                                toolRuns.some((r) => r.status === 'running') ? toolRuns[toolRuns.length - 1]?.tool : undefined
+                              }
+                              open={opsOpen}
+                              onToggle={toggleOps}
+                              runs={toolRuns}
+                              agents={agentRuns}
+                            />
+                          )}
+                          {/* 任务进度清单（计划卡）：工具联动推进，任务结束后保留展示 */}
+                          {plan && <PlanCard plan={plan} />}
+                          {/* 任务清单（todo_write 工具，可收起，实时进度）：内嵌消息流，任务结束后保留展示，避免小窗口悬浮遮挡 */}
+                          {todos.length > 0 && (() => {
+                            const done = todos.filter((t) => t.status === 'done').length
+                            const pct = Math.round((done / todos.length) * 100)
+                            return (
+                              <details
+                                className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 overflow-hidden animate-fade-in-up"
+                                open={todoOpen}
+                                onToggle={(e) => {
+                                  setTodoOpen(e.currentTarget.open)
+                                  todoAutoRef.current = true
+                                }}
+                              >
+                                <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
+                                  <Icon name="check" size={12} className="text-[var(--accent)] shrink-0" />
+                                  <span className="text-[12px] font-semibold">{t('home.todoTitle')}</span>
+                                  <span className="text-[11px] text-[var(--text-muted)]">{done}/{todos.length}</span>
+                                  <div className="ml-auto h-1.5 w-14 rounded-full bg-[var(--bg-hover)] overflow-hidden">
+                                    <div className="h-full rounded-full bg-[var(--accent)] transition-all" style={{ width: `${pct}%` }} />
+                                  </div>
+                                </summary>
+                                <div className="px-3 pb-3 pt-1 border-t border-[var(--border)] max-h-56 overflow-y-auto space-y-1.5">
+                                  {todos.map((td) => (
+                                    <div key={td.id} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+                                      {td.status === 'done' ? (
+                                        <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
+                                      ) : td.status === 'in_progress' ? (
+                                        <span className="w-2.5 h-2.5 rounded-full border-2 border-[var(--accent)] bg-[var(--accent)]/30 animate-pulse shrink-0 mt-0.5" />
+                                      ) : (
+                                        <span className="w-2.5 h-2.5 rounded-full border border-[var(--border)] shrink-0 mt-0.5" />
+                                      )}
+                                      <span
+                                        className={
+                                          td.status === 'done'
+                                            ? 'line-through text-[var(--text-muted)]'
+                                            : td.status === 'in_progress'
+                                              ? 'text-[var(--accent)] font-medium'
+                                              : 'text-[var(--text-secondary)]'
+                                        }
+                                      >
+                                        {td.content}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </details>
+                            )
+                          })()}
+                          {/* 任务过程回看（ChatGPT 式）：完成后“已处理 N 个操作”徽章，点击展开全部过程 */}
+                          {!isStreaming && (toolRuns.length > 0 || agentRuns.length > 0) && (
+                            <TaskOpsBadge
+                              count={toolRuns.length + agentRuns.length}
+                              open={opsOpen}
+                              onToggle={toggleOps}
+                              runs={toolRuns}
+                              agents={agentRuns}
+                            />
+                          )}
+                          {/* 任务完成摘要（ChatGPT 式收尾统计）：耗时 + 工具调用 + 文件变更 */}
+                          {lastTaskSummary && !isStreaming && (
+                            <div className="md-task-summary animate-fade-in-up">
+                              <div className="md-task-summary-icon">
+                                <Icon name="check" size={13} white />
+                              </div>
+                              <div className="min-w-0">
+                                <span className="md-task-summary-title">{t('home.taskDoneTitle')}</span>
+                                <span className="md-task-summary-meta tabular-nums">
+                                  {t('home.taskSummary', {
+                                    time: fmtElapsed(lastTaskSummary.durationMs / 1000),
+                                    tools: lastTaskSummary.toolCount,
+                                    files: lastTaskSummary.fileCount,
+                                    tokens: (lastTaskSummary.tokensIn + lastTaskSummary.tokensOut).toLocaleString(),
+                                  })}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+                          {/* 工具过程已收进顶部“已处理 N 个操作”徽章（展开查看），对话流不再平铺工具卡 */}
+                          {isStreaming && <StreamingMessage content={streaming.content} reasoning={streaming.reasoning} speed={streamSpeed} />}
+                          {isStreaming && silentSeconds >= 15 && !toolRuns.some((r) => r.status === 'running') && (
+                            <div className="flex items-center gap-2 text-[11.5px] text-[var(--text-muted)] animate-pulse">
+                              <Icon name="spark" size={12} />
+                              {t('home.silentHint', { time: fmtElapsed(silentSeconds) })}
+                            </div>
+                          )}
+                          {streaming.error && (
+                            <ErrorCard
+                              error={streaming.error}
+                              detail={streaming.errorDetail}
+                              onRetry={() => regenerateLast(modelOptions)}
+                              retryLabel={t('home.retry')}
+                            />
+                          )}
+                          <div ref={bottomRef} />
+                        </>
+                      )}
                     </div>
                   )
-                }
-                // 工具记录折叠组（历史连续工具调用合并为一行）
-                if (item.kind === 'tools') {
-                  return <ToolRunGroup key={item.key} runs={item.runs} onRetry={retryTool} />
-                }
-                const m = item.message
-                return (
-                  <MessageItem
-                    key={m.id}
-                    message={m}
-                    time={formatTime(m.created_at)}
-                    userMessageId={item.userMessageId}
-                    isLastAssistant={m.role === 'assistant' && !isStreaming && messages[messages.length - 1]?.id === m.id}
-                    onRegenerate={() => regenerateLast(modelOptions)}
-                    onBranch={(msg) => regenerateLast(modelOptions, msg.id)}
-                    onRate={rateMessage}
-                    onDislike={(id) => setFeedbackDialog({ messageId: id })}
-                    onOpenVersions={(msg) => openVersionDialog(msg, item.userMessageId)}
-                    onSpeak={toggleSpeak}
-                    speaking={speakingId === m.id}
-                    onEditMessage={setEditTarget}
-                    onDeleteMessage={handleDeleteMessage}
-                    confirmDeleteMsgId={confirmDeleteMsgId}
-                    projectPath={currentProject?.path}
-                    highlighted={highlightMsgId === m.id}
-                    onOpenFile={openCodeFile}
-                  />
-                )
-              })}
-              {/* 任务进度清单（计划卡）：工具联动推进，任务结束后保留展示 */}
-              {plan && <PlanCard plan={plan} />}
-              {/* 任务过程回看（ChatGPT 式）：完成后“已处理 N 个操作”徽章，点击展开全部过程 */}
-              {!isStreaming && (toolRuns.length > 0 || agentRuns.length > 0) && (
-                <TaskOpsBadge
-                  count={toolRuns.length + agentRuns.length}
-                  open={opsOpen}
-                  onToggle={() => setOpsOpen((v) => !v)}
-                  runs={toolRuns}
-                  agents={agentRuns}
-                />
-              )}
-              {/* 任务完成摘要（ChatGPT 式收尾统计）：耗时 + 工具调用 + 文件变更 */}
-              {lastTaskSummary && !isStreaming && (
-                <div className="md-task-summary animate-fade-in-up">
-                  <div className="md-task-summary-icon">
-                    <Icon name="check" size={13} white />
-                  </div>
-                  <div className="min-w-0">
-                    <span className="md-task-summary-title">{t('home.taskDoneTitle')}</span>
-                    <span className="md-task-summary-meta tabular-nums">
-                      {t('home.taskSummary', {
-                        time: fmtElapsed(lastTaskSummary.durationMs / 1000),
-                        tools: lastTaskSummary.toolCount,
-                        files: lastTaskSummary.fileCount,
-                        tokens: (lastTaskSummary.tokensIn + lastTaskSummary.tokensOut).toLocaleString(),
-                      })}
-                    </span>
-                  </div>
-                </div>
-              )}
-              {/* 工具过程已收进顶部“已处理 N 个操作”徽章（展开查看），对话流不再平铺工具卡 */}
-              {isStreaming && <StreamingMessage content={streaming.content} reasoning={streaming.reasoning} />}
-              {isStreaming && silentSeconds >= 15 && !toolRuns.some((r) => r.status === 'running') && (
-                <div className="flex items-center gap-2 text-[11.5px] text-[var(--text-muted)] animate-pulse">
-                  <Icon name="spark" size={12} />
-                  {t('home.silentHint', { time: fmtElapsed(silentSeconds) })}
-                </div>
-              )}
-              {streaming.error && (
-                <ErrorCard
-                  error={streaming.error}
-                  detail={streaming.errorDetail}
-                  onRetry={() => regenerateLast(modelOptions)}
-                  retryLabel={t('home.retry')}
-                />
-              )}
-              <div ref={bottomRef} />
+                })}
+              </div>
             </div>
           )}
           {/* 回到底部：流式中或用户上滑时显示 */}
           {showScrollBottom && (
             <button
               onClick={() => scrollToBottom(true)}
-              className="sticky bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 pl-3 pr-2 h-8 rounded-full bg-[var(--bg-elevated)] border border-[var(--border)] shadow-lg text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-card)] transition-all z-10 animate-fade-in-up"
+              className="sticky bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 pl-3 pr-2 h-8 rounded-full glass-card text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[color-mix(in_srgb,var(--accent)_50%,var(--border))] transition-all z-10 animate-fade-in-up tnum"
             >
               <Icon name="chevron-right" size={13} className="rotate-90" />
               {isStreaming ? t('home.scrollToLatest') : t('home.scrollBottom')}
               {unreadCount > 0 && (
-                <span className="ml-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-[var(--accent)] text-white text-[10px] font-semibold leading-none">
+                <span className="ml-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full btn-primary text-[10px] font-semibold leading-none shadow-[0_0_0_3px_var(--accent-soft)]">
                   {unreadCount > 99 ? '99+' : unreadCount}
                 </span>
               )}
@@ -2763,7 +4539,12 @@ export default function Home() {
                 {/* token 预算进度条：估算占用 / 模型上下文窗口（>85% 触发自动压缩） */}
                 {ctxInfo.context_limit > 0 && (() => {
                   const pct = Math.min(100, Math.round((ctxInfo.estimated_tokens / ctxInfo.context_limit) * 100))
-                  const barColor = pct > 85 ? 'bg-[var(--danger)]' : pct > 60 ? 'bg-[var(--warning)]' : 'bg-[var(--success)]'
+                  const level = pct > 85 ? 'danger' : pct > 60 ? 'warn' : 'normal'
+                  // 上下文"剩余消息数"预测：平均 user 消息约 200 token、assistant 平均 800 token
+                  // 简单估算：剩余预算 ÷ 单轮平均 (200+800=1000) = 还能发几轮
+                  const remaining = Math.max(0, ctxInfo.context_limit - ctxInfo.estimated_tokens)
+                  const avgPerTurn = 1000
+                  const turnsLeft = Math.floor(remaining / avgPerTurn)
                   return (
                     <span
                       className="flex items-center gap-1.5"
@@ -2773,13 +4554,27 @@ export default function Home() {
                         pct,
                       })}
                     >
-                      <span className="w-16 h-1.5 rounded-full bg-[var(--bg-hover)] overflow-hidden shrink-0">
+                      <span className="context-meter w-16 shrink-0" style={{ height: 2 }}>
                         <span
-                          className={`block h-full rounded-full transition-all ${barColor}`}
+                          className="context-meter-fill"
+                          data-level={level}
                           style={{ width: `${Math.max(pct, 2)}%` }}
                         />
                       </span>
-                      <span className="tabular-nums">{pct}%</span>
+                      <span className="tnum">{pct}%</span>
+                      {/* 剩余轮数预测：<5 轮时变橙提醒，<2 变红 */}
+                      {turnsLeft > 0 && turnsLeft <= 5 && (
+                        <span
+                          className={`tnum text-[10.5px] px-1 rounded ${
+                            turnsLeft <= 2
+                              ? 'text-[var(--danger)] bg-[var(--danger-50)]'
+                              : 'text-[var(--warning)] bg-[var(--warning-50)]'
+                          }`}
+                          title={t('home.ctxTurnsLeftHint', { count: turnsLeft })}
+                        >
+                          ~{turnsLeft}{t('home.ctxTurnsLeftUnit')}
+                        </span>
+                      )}
                     </span>
                   )
                 })()}
@@ -2815,7 +4610,7 @@ export default function Home() {
                   {queuedList.map((q) => (
                     <div
                       key={q.id}
-                      className="flex items-center gap-2 rounded-lg bg-[var(--bg-card)] border border-[var(--border)] px-2.5 py-1.5"
+                      className="flex items-center gap-2 rounded-lg modern-card border-[var(--border)] px-2.5 py-1.5"
                     >
                       <span className="text-[11px] text-[var(--text-primary)] truncate flex-1" title={q.content}>
                         {q.content}
@@ -2850,7 +4645,7 @@ export default function Home() {
           >
             {/* 斜杠快捷指令面板（行首 / 后弹出） */}
             {slashCandidates && (
-              <div className="absolute bottom-full left-3 right-3 mb-1.5 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 py-1 z-50 max-h-72 overflow-y-auto animate-modal-in">
+              <div className="absolute bottom-full left-3 right-3 mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 max-h-72 overflow-y-auto animate-modal-in">
                 <div className="px-3 py-1.5 text-[10px] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
                   {t('home.slashHint')}
                 </div>
@@ -2879,7 +4674,7 @@ export default function Home() {
             )}
             {/* @ 引用候选面板（@ 后输入路径片段时弹出） */}
             {refCandidates && (
-              <div className="absolute bottom-full left-3 right-3 mb-1.5 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 py-1 z-50 max-h-60 overflow-y-auto animate-modal-in">
+              <div className="absolute bottom-full left-3 right-3 mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 max-h-60 overflow-y-auto animate-modal-in">
                 <div className="px-3 py-1.5 text-[10px] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
                   {t('home.refHint')}「@{refQuery}」
                 </div>
@@ -2970,6 +4765,26 @@ export default function Home() {
               style={{ height: inputHeight }}
               className="w-full resize-none bg-transparent px-4 pt-3.5 pb-1 text-sm outline-none placeholder:text-[var(--text-muted)] disabled:opacity-40 overflow-y-auto"
             />
+            {/* 消息引用条（Quote 后展示；× 仅移除 msg: 标记，正文引用行可手动编辑） */}
+            {pendingQuote && (
+              <div className="flex items-center gap-1.5 mx-3 mt-1 px-2 py-1 rounded-md bg-[var(--accent-soft)] text-[10.5px] text-[var(--accent)]">
+                <Icon name="quote" size={10} className="shrink-0" />
+                <button
+                  onClick={() => locateQuotedMessage(pendingQuote.id)}
+                  className="truncate hover:text-[var(--accent-hover)]"
+                  title={t('home.locateQuoted')}
+                >
+                  {t('home.quotingLabel')}: {pendingQuote.preview}
+                </button>
+                <button
+                  onClick={() => setPendingQuote(null)}
+                  className="ml-auto shrink-0 hover:text-[var(--danger)] transition-colors"
+                  title={t('home.removeQuote')}
+                >
+                  <Icon name="close" size={10} />
+                </button>
+              </div>
+            )}
             {/* 引用标签（@ 选择后展示，可移除） */}
             {references.length > 0 && (
               <div className="flex flex-wrap gap-1 px-3 pt-1">
@@ -2999,7 +4814,7 @@ export default function Home() {
                     <img src={img} alt="" className="w-12 h-12 object-cover rounded-lg border border-[var(--border)]" />
                     <button
                       onClick={() => removePickedImage(i)}
-                      className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-[var(--bg-card)] border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--danger)] flex items-center justify-center opacity-0 group-hover/img:opacity-100 transition-opacity"
+                      className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full modern-card border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--danger)] flex items-center justify-center opacity-0 group-hover/img:opacity-100 transition-opacity"
                       title={t('home.removeImage')}
                     >
                       <Icon name="close" size={9} />
@@ -3008,8 +4823,9 @@ export default function Home() {
                 ))}
               </div>
             )}
-            <div className="flex items-center justify-between px-3 pb-2.5 pt-1">
-              <div className="flex items-center gap-1.5">
+            {/* 工具栏：sm 以下允许换行（左侧状态+右侧按钮分两行），md+ 单行排布 */}
+            <div className="flex flex-wrap items-center justify-between gap-y-1.5 px-3 pb-2.5 pt-1">
+              <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
                 {/* Rules 编辑：全局指令 + 项目级 rules（注入 system_prompt） */}
                 <button
                   onClick={() => void openRulesDialog()}
@@ -3030,7 +4846,7 @@ export default function Home() {
                     }`}
                   >
                     <Icon name="bolt" size={12} />
-                    <span className="max-w-32 truncate">{currentModelLabel}</span>
+                    <span className="max-w-24 md:max-w-32 truncate">{currentModelLabel}</span>
                     <Icon name="chevron-right" size={10} className="rotate-90 opacity-60" />
                   </button>
                   {showModelSettings && (
@@ -3039,50 +4855,82 @@ export default function Home() {
                 </div>
                 {/* Web 预览已移至右侧栏 Preview 面板 */}
                 {isStreaming && (
-                  <span className="flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)]">
-                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
-                    {t('home.agentWorking')}
+                  <span
+                    className="flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] shrink-0"
+                    title={t('home.queuedHint')}
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
+                    {/* 状态文字：xl 以下折叠成"工作中"三字，xl+ 才显示完整 "Agent 正在工作..." */}
+                    <span className="inline xl:hidden whitespace-nowrap">{t('home.working')}</span>
+                    <span className="hidden xl:inline whitespace-nowrap">{t('home.agentWorking')}</span>
                   </span>
                 )}
-                <span className="text-[11px] text-[var(--text-muted)] hidden sm:block">
+                {/* 快捷键提示：仅 2xl 显示完整说明，避免窄屏挤压 */}
+                <span className="hidden 2xl:inline whitespace-nowrap text-[11px] text-[var(--text-muted)] shrink-0">
                   {isStreaming
                     ? t('home.queuedHint')
                     : `Enter ${t('home.send')} · Shift+Enter ${t('home.newline')}`}
                 </span>
               </div>
-              <div className="flex items-center gap-2.5">
+              {/* 右侧操作按钮：sm 以下也允许换行（避免与左侧状态挤一行） */}
+              <div className="flex items-center gap-1.5 flex-wrap justify-end">
                 {!isStreaming && (
-                  <span className="text-[11px] tabular-nums text-[var(--text-muted)]">{draft.length}</span>
+                  <span className="hidden sm:inline text-[11px] tabular-nums text-[var(--text-muted)]">{draft.length}</span>
                 )}
                 {isStreaming ? (
                   <>
+                    {/* 停止当前工具：xl 以下折叠到更多菜单，xl+ 展开（危险操作，但仅在工具运行时显示，频次低） */}
                     {toolRuns.some((r) => r.status === 'running') && (
                       <button
                         onClick={() => stopCurrentTool()}
-                        className="h-8 px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] flex items-center gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-all text-[12px] font-medium"
+                        className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] items-center justify-start gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-all text-[12px] font-medium"
                         title={t('home.stopTool')}
                       >
-                        <Icon name="bolt" size={12} />
-                        {t('home.stopTool')}
+                        <Icon name="bolt" size={12} className="shrink-0" />
+                        <span>{t('home.stopTool')}</span>
                       </button>
                     )}
+                    {/* 流式速度切换：xl 以下折叠到更多菜单，xl+ 展开 */}
                     <button
-                      onClick={() => stopGeneration()}
-                      className="h-8 px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 transition-all text-[12px] font-medium"
+                      onClick={() => {
+                        const cycle = [1, 2, 4, 0.5]
+                        const next = cycle[(cycle.indexOf(streamSpeed) + 1) % cycle.length]
+                        setStreamSpeed(next)
+                      }}
+                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center gap-1 hover:bg-[var(--bg-hover)] active:scale-95 transition-all text-[12px] font-mono font-medium tnum"
+                      title={t('home.streamSpeedHint')}
+                    >
+                      {streamSpeed}x
+                    </button>
+                    {/* 停止生成：危险操作，xl 以下也常驻（用户必须能随时停） */}
+                    <button
+                      onClick={() => {
+                        stopGeneration()
+                        useAuditStore.getState().log({
+                          category: 'task.stop',
+                          label: t('home.auditLabelTaskStop'),
+                          detail: currentConversation?.title,
+                          conversationId: currentConversation?.id,
+                          projectId: currentProject?.id,
+                        })
+                      }}
+                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 transition-all text-[12px] font-medium"
                       title={t('home.stopGenerating')}
                     >
-                      <span className="w-2.5 h-2.5 rounded-[3px] bg-[var(--danger)]" />
-                      {t('home.stopGenerating')}
+                      <span className="w-2.5 h-2.5 rounded-[3px] bg-[var(--danger)] shrink-0" />
+                      <span className="hidden md:inline">{t('home.stopGenerating')}</span>
                     </button>
+                    {/* 发给 Agent：折叠到更多菜单，xl+ 展开 */}
                     <button
                       onClick={handleSendToAgent}
                       disabled={!draft.trim()}
-                      className="h-8 px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] flex items-center gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
+                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] items-center justify-start gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
                       title={t('home.sendToAgent')}
                     >
-                      <Icon name="bolt" size={12} />
-                      {t('home.sendToAgent')}
+                      <Icon name="bolt" size={12} className="shrink-0" />
+                      <span>{t('home.sendToAgent')}</span>
                     </button>
+                    {/* 发送：主操作，xl 以下也常驻 */}
                     <button
                       onClick={handleSend}
                       disabled={!draft.trim()}
@@ -3091,6 +4939,100 @@ export default function Home() {
                     >
                       <Icon name="send" size={14} white />
                     </button>
+                    {/* 批量任务：折叠到更多菜单，xl+ 展开 */}
+                    <button
+                      onClick={() => setBatchOpen(true)}
+                      disabled={!draft.trim()}
+                      className="hidden xl:flex h-8 xl:px-2.5 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center justify-start gap-1 hover:bg-[var(--bg-hover)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
+                      title={t('home.batchSend')}
+                    >
+                      <Icon name="package" size={12} />
+                      <span>{t('home.batch')}</span>
+                    </button>
+                    {/* 工具栏"更多"菜单：xl 以下显示，xl+ 隐藏（其他次要按钮已展开） */}
+                    <div ref={toolbarMoreRef} className="relative xl:hidden">
+                      <button
+                        onClick={() => setToolbarMoreOpen((v) => !v)}
+                        title={t('home.moreActions')}
+                        aria-label={t('home.moreActions')}
+                        className={`h-8 w-8 rounded-full flex items-center justify-center transition-colors ${
+                          toolbarMoreOpen
+                            ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
+                            : 'text-[var(--text-secondary)] bg-[var(--bg-card)] hover:bg-[var(--bg-hover)]'
+                        }`}
+                      >
+                        <Icon name="more-vert" size={14} />
+                      </button>
+                      {toolbarMoreOpen && (
+                        <div className="absolute right-0 bottom-full mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 w-44 animate-modal-in">
+                          {/* 停止当前工具：仅在工具运行时显示 */}
+                          {toolRuns.some((r) => r.status === 'running') && (
+                            <button
+                              onClick={() => {
+                                stopCurrentTool()
+                                setToolbarMoreOpen(false)
+                              }}
+                              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--warning)] hover:bg-[var(--bg-hover)] transition-colors"
+                            >
+                              <Icon name="bolt" size={14} className="shrink-0" />
+                              {t('home.stopTool')}
+                            </button>
+                          )}
+                          {/* 流式速度：弹层里做成横向 chip 选择 */}
+                          <div className="px-3 py-2">
+                            <div className="text-[10px] text-[var(--text-muted)] mb-1.5 flex items-center gap-1.5">
+                              <Icon name="bolt" size={11} />
+                              {t('home.streamSpeedHint')}
+                            </div>
+                            <div className="flex items-center gap-1">
+                              {[0.5, 1, 2, 4].map((s) => (
+                                <button
+                                  key={s}
+                                  onClick={() => {
+                                    setStreamSpeed(s)
+                                    setToolbarMoreOpen(false)
+                                  }}
+                                  className={`flex-1 h-7 rounded-md text-[11px] font-mono font-medium tnum transition-colors ${
+                                    streamSpeed === s
+                                      ? 'bg-[var(--accent)] text-white'
+                                      : 'bg-[var(--bg-hover)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                                  }`}
+                                >
+                                  {s}x
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <div className="h-px bg-[var(--border)] mx-2 my-0.5" />
+                          {/* 发给 Agent */}
+                          <button
+                            onClick={() => {
+                              if (draft.trim()) {
+                                handleSendToAgent()
+                                setToolbarMoreOpen(false)
+                              }
+                            }}
+                            disabled={!draft.trim()}
+                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            <Icon name="bolt" size={14} className="shrink-0" />
+                            {t('home.sendToAgent')}
+                          </button>
+                          {/* 批量任务 */}
+                          <button
+                            onClick={() => {
+                              setBatchOpen(true)
+                              setToolbarMoreOpen(false)
+                            }}
+                            disabled={!draft.trim()}
+                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            <Icon name="package" size={14} className="shrink-0" />
+                            {t('home.batchSend')}
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </>
                 ) : (
                   <button
@@ -3144,7 +5086,9 @@ export default function Home() {
               { key: 'devices', icon: 'phone', label: t('home.devices') },
               { key: 'symbols', icon: 'search', label: t('home.symbols') },
               { key: 'analyze', icon: 'spark', label: t('home.analyze') },
-              { key: 'terminal', icon: 'terminal', label: t('home.terminal') },
+              { key: 'shell', icon: 'terminal', label: t('home.terminal') },
+              { key: 'terminal', icon: 'receipt', label: t('home.terminalLogs') },
+              { key: 'timeline', icon: 'archive', label: t('home.timeline') },
             ]
             return (
               <div
@@ -3159,14 +5103,20 @@ export default function Home() {
                       key={tb.key}
                       onClick={() => setRightTab(tb.key)}
                       title={tb.label}
-                      className={`flex items-center gap-2 h-9 shrink-0 rounded-lg text-[12.5px] font-medium transition-colors ${
+                      className={`relative flex items-center gap-2 h-9 shrink-0 rounded-lg text-[12.5px] font-medium transition-colors ${
                         active
                           ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
-                          : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+                          : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
                       } ${rightCompact ? 'w-9 justify-center px-0' : 'px-3.5'}`}
                     >
                       <Icon name={tb.icon} size={15} />
                       {!rightCompact && <span className="whitespace-nowrap">{tb.label}</span>}
+                      {active && (
+                        <span
+                          className="absolute left-1/2 -translate-x-1/2 bottom-0.5 w-4 h-[2px] rounded-full bg-[var(--accent)]"
+                          style={{ boxShadow: '0 0 6px var(--accent-glow)' }}
+                        />
+                      )}
                     </button>
                   )
                 })}
@@ -3179,7 +5129,7 @@ export default function Home() {
             {rightTab === 'overview' ? (
               <div className="p-3 space-y-2.5">
                 {/* 项目信息卡 */}
-                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-3.5">
+                <div className="rounded-xl modern-card p-3.5">
                   <div className="flex items-center gap-2.5">
                     <div className="w-9 h-9 rounded-[10px] bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shrink-0 shadow-md shadow-[var(--accent)]/20">
                       <Icon name="bolt" size={16} white />
@@ -3193,6 +5143,9 @@ export default function Home() {
                   </div>
                   <div className="mt-3 pt-3 border-t border-[var(--border)] space-y-2.5">
                     <OverviewRow icon="folder" label={t('home.projectPath')} value={currentProject.path} mono />
+                    {convRoot && (
+                      <OverviewRow icon="folder" label={t('home.worktreePath')} value={convRoot} mono />
+                    )}
                     <OverviewRow
                       icon="health"
                       label={t('home.indexState')}
@@ -3212,17 +5165,17 @@ export default function Home() {
                     />
                     <button
                       type="button"
-                      onClick={() => void handleOpenTerminal()}
+                      onClick={handleOpenShell}
                       className="w-full flex items-center justify-center gap-1.5 mt-1 px-2.5 py-2 rounded-lg text-[11px] text-[var(--text-secondary)] bg-[var(--bg-hover)]/60 border border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
                     >
                       <Icon name="terminal" size={12} />
-                      {t('home.openTerminal')}
+                      {t('home.openShell')}
                     </button>
                   </div>
                 </div>
 
                 {/* Git 变更摘要：当前工作区状态入口（点击跳转 Git 面板） */}
-                <OverviewGitSummary projectPath={currentProject.path} onOpenGit={() => setRightTab('git')} />
+                <OverviewGitSummary projectPath={convRoot ?? currentProject.path} onOpenGit={() => setRightTab('git')} />
 
                 {/* 工作区模块：混合工作区中识别到的各类型子工程（Vue/Java/Go/HarmonyOS 等），支持手动绑定 */}
                 {(() => {
@@ -3259,18 +5212,18 @@ export default function Home() {
                   const filteredMods =
                     moduleFilter === 'all' ? mods : mods.filter((m) => kindGroup(m.kind) === moduleFilter)
                   // 解析后的鸿蒙主工程相对路径（非项目根时模块行显示“主工程”徽标）
+                  const workBase = (convRoot ?? currentProject.path).replace(/[\\/]+$/, '')
                   const mainRel = (() => {
-                    if (!mainRootAbs || !currentProject.path || mainRootAbs === currentProject.path) return null
-                    const base = currentProject.path.replace(/[\\/]+$/, '')
+                    if (!mainRootAbs || !workBase || mainRootAbs === workBase) return null
                     const norm = mainRootAbs.replace(/\\/g, '/')
-                    const normBase = base.replace(/\\/g, '/')
+                    const normBase = workBase.replace(/\\/g, '/')
                     return norm.startsWith(normBase + '/') ? norm.slice(normBase.length + 1) : null
                   })()
                   const openInExplorer = (rel: string) => {
-                    void shellOpen((currentProject.path.replace(/[\\/]+$/, '') + '/' + rel).replace(/\\/g, '/')).catch(() => {})
+                    void shellOpen((workBase + '/' + rel).replace(/\\/g, '/')).catch(() => {})
                   }
                   return (
-                    <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-3">
+                    <div className="rounded-xl modern-card p-3">
                       <div className="flex items-center gap-1.5">
                         <Icon name="folder" size={12} className="text-[var(--accent)]" />
                         <span className="text-[12px] font-medium">{t('home.workspaceModules')}</span>
@@ -3422,7 +5375,7 @@ export default function Home() {
                               type="button"
                               onClick={() => void saveModules()}
                               disabled={savingModules}
-                              className="px-2.5 h-7 rounded-md text-[11px] font-medium bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                              className="px-2.5 h-7 rounded-md text-[11px] font-medium btn-primary  disabled:opacity-50"
                             >
                               {savingModules ? '…' : t('dialog.save')}
                             </button>
@@ -3434,7 +5387,7 @@ export default function Home() {
                 })()}
 
                 {/* 最近任务：task_runs 明细，点击跳转对应会话 */}
-                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-3">
+                <div className="rounded-xl modern-card p-3">
                   <div className="flex items-center gap-1.5">
                     <Icon name="receipt" size={12} className="text-[var(--text-secondary)]" />
                     <span className="text-[12px] font-medium">{t('home.recentTasks')}</span>
@@ -3498,11 +5451,12 @@ export default function Home() {
               </div>
             ) : rightTab === 'files' ? (
               <FileTreePanel
-                key={currentProject.id}
+                key={`${currentProject.id}:${convRoot ?? ''}`}
                 tree={fileTree}
                 building={indexBuilding}
                 projectId={currentProject.id}
-                projectPath={currentProject.path}
+                projectPath={convRoot ?? currentProject.path}
+                root={convRoot}
                 dirCache={dirCache}
                 onLoadDir={(path) => loadDirChildren(path)}
                 onRefresh={() => rebuildIndex()}
@@ -3518,7 +5472,11 @@ export default function Home() {
                 onRefresh={() => loadMemories()}
               />
             ) : rightTab === 'git' ? (
-              <GitPanel project={currentProject} onProjectUpdated={() => refreshProjects()} />
+              <GitPanel
+                project={currentProject}
+                sessionWorktree={convRoot ? { path: convRoot, branch: currentConversation?.worktree_branch ?? null } : null}
+                onNewWorktreeConversation={(wt) => newConversation({ work_mode: 'worktree', worktree_path: wt.path, worktree_branch: wt.branch })}
+              />
             ) : rightTab === 'preview' ? (
               <PreviewPanel
                 url={previewUrl}
@@ -3527,13 +5485,22 @@ export default function Home() {
                 onOpen={handleOpenPreview}
               />
             ) : rightTab === 'devices' ? (
-              <DevicesPanel projectId={currentProject?.id} onChanged={() => {}} />
+              <DevicesPanel
+                key={currentProject.id}
+                projectId={currentProject?.id}
+                projectName={currentProject?.name}
+                onChanged={() => {}}
+                onSendImage={(url) => setPickedImages((cur) => (cur.length >= 4 ? cur : [...cur, url]))}
+              />
+            ) : rightTab === 'shell' ? (
+              <ShellPanel key={`${currentProject.id}:${convRoot ?? ''}`} projectId={currentProject.id} projectPath={convRoot ?? currentProject.path} />
             ) : rightTab === 'analyze' ? (
               <AnalyzePanel
-                key={currentProject.id}
-                projectPath={currentProject.path}
+                key={`${currentProject.id}:${convRoot ?? ''}`}
+                projectPath={convRoot ?? currentProject.path}
                 projectId={currentProject.id}
                 projectName={currentProject.name}
+                root={convRoot}
                 onRunBuild={handleOpenTerminal}
                 onFixErrors={handleFixBuildErrors}
                 onAutoFix={handleAutoFixErrors}
@@ -3544,13 +5511,24 @@ export default function Home() {
               />
             ) : rightTab === 'symbols' ? (
               <SymbolsPanel
-                key={currentProject.id}
+                key={`${currentProject.id}:${convRoot ?? ''}`}
                 projectId={currentProject.id}
                 projectName={currentProject.name}
+                root={convRoot}
                 onReference={handleReference}
               />
             ) : rightTab === 'stats' ? (
-              <ToolStatsPanel stats={toolStats} onRefresh={() => loadToolStats()} />
+              <ToolStatsPanel
+                stats={toolStats}
+                tokenStats={toolTokenStats}
+                toolGroupMap={toolGroupMap}
+                onRefresh={() => {
+                  void loadToolStats()
+                  void loadToolTokenStats()
+                }}
+              />
+            ) : rightTab === 'timeline' ? (
+              <TimelinePanel conversationId={convId ?? null} refreshTick={timelineTick} />
             ) : (
               <TerminalPanel
                 entries={terminalEntries}
@@ -3589,7 +5567,7 @@ export default function Home() {
                 title={t('home.planEdit')}
               >
                 <Icon name={planEditing ? 'check' : 'edit'} size={11} />
-                {planEditing ? t('home.planDone') : t('home.planEdit')}
+                {planEditing ? t('home.planEditDone') : t('home.planEdit')}
               </button>
             </div>
             {planEditing ? (
@@ -3645,7 +5623,7 @@ export default function Home() {
                   void resolvePlanReview(pendingPlan.requestId, true, fb || undefined)
                   setPlanFeedback('')
                 }}
-                className="h-8 px-5 rounded-lg bg-[var(--accent)] text-white text-[12px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all flex items-center gap-1.5"
+                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all flex items-center gap-1.5"
               >
                 <Icon name="check" size={14} />
                 {t('home.planApprove')}
@@ -3699,7 +5677,7 @@ export default function Home() {
                 <button type="button" onClick={() => handleDiagnoseDismiss(card)} className="h-7 px-2.5 rounded-lg text-[10.5px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors">
                   {t('home.diagnoseLater')}
                 </button>
-                <button type="button" onClick={() => void handleDiagnoseAction(card)} className="h-7 px-3 rounded-lg text-[10.5px] font-medium bg-[var(--accent)] text-white hover:opacity-90 transition-opacity">
+                <button type="button" onClick={() => void handleDiagnoseAction(card)} className="h-7 px-3 rounded-lg text-[10.5px] font-medium btn-primary hover:opacity-90 transition-opacity">
                   {actionLabel}
                 </button>
               </div>
@@ -3708,52 +5686,7 @@ export default function Home() {
         )
       })}
 
-      {/* ============ 任务清单（todo_write 工具，可收起，实时进度） ============ */}
-      {todos.length > 0 && (() => {
-        const done = todos.filter((t) => t.status === 'done').length
-        const pct = Math.round((done / todos.length) * 100)
-        return (
-          <div
-            className="fixed bottom-24 z-[52] w-[280px] max-w-[calc(100vw-2rem)]"
-            style={{ left: sidebarCollapsed ? 16 : sidebarWidth + 16 }}
-          >
-            <details className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 animate-modal-in overflow-hidden" open={false}>
-              <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
-                <Icon name="check" size={12} className="text-[var(--accent)] shrink-0" />
-                <span className="text-[12px] font-semibold">{t('home.todoTitle')}</span>
-                <span className="text-[11px] text-[var(--text-muted)]">{done}/{todos.length}</span>
-                <div className="ml-auto h-1.5 w-14 rounded-full bg-[var(--bg-hover)] overflow-hidden">
-                  <div className="h-full rounded-full bg-[var(--accent)] transition-all" style={{ width: `${pct}%` }} />
-                </div>
-              </summary>
-              <div className="px-3 pb-3 pt-1 border-t border-[var(--border)] max-h-56 overflow-y-auto space-y-1.5">
-                {todos.map((t) => (
-                  <div key={t.id} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
-                    {t.status === 'done' ? (
-                      <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
-                    ) : t.status === 'in_progress' ? (
-                      <span className="w-2.5 h-2.5 rounded-full border-2 border-[var(--accent)] bg-[var(--accent)]/30 animate-pulse shrink-0 mt-0.5" />
-                    ) : (
-                      <span className="w-2.5 h-2.5 rounded-full border border-[var(--border)] shrink-0 mt-0.5" />
-                    )}
-                    <span
-                      className={
-                        t.status === 'done'
-                          ? 'line-through text-[var(--text-muted)]'
-                          : t.status === 'in_progress'
-                            ? 'text-[var(--accent)] font-medium'
-                            : 'text-[var(--text-secondary)]'
-                      }
-                    >
-                      {t.content}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </details>
-          </div>
-        )
-      })()}
+
 
       {/* ============ Agent 提问卡（ask_user 工具，自由文本回答闭环） ============ */}
       {askCard && askCard.conversationId === currentConversation?.id && (
@@ -3793,7 +5726,7 @@ export default function Home() {
               rows={3}
               autoFocus
               spellCheck={false}
-              className="mt-3 w-full rounded-lg bg-[var(--bg-card)] border border-[var(--border)] px-3 py-2 text-[12px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
+              className="mt-3 w-full rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[12px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
             />
             <div className="mt-3 flex items-center justify-end gap-2">
               <span className="text-[10.5px] text-[var(--text-muted)] mr-auto">Ctrl+Enter ↵</span>
@@ -3807,7 +5740,7 @@ export default function Home() {
               <button
                 type="button"
                 onClick={handleAskSubmit}
-                className="h-8 px-5 rounded-lg bg-[var(--accent)] text-white text-[12px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all flex items-center gap-1.5"
+                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all flex items-center gap-1.5"
               >
                 <Icon name="send" size={12} />
                 {t('home.askSubmit')}
@@ -3837,7 +5770,7 @@ export default function Home() {
                   {t('home.toolApprovalArgs')}
                 </span>
               </div>
-              <pre className="tool-output max-h-32 overflow-y-auto rounded-lg bg-[var(--bg-card)] border border-[var(--border)] p-2.5 text-[11px] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]">
+              <pre className="tool-output max-h-32 overflow-y-auto rounded-lg modern-card border-[var(--border)] p-2.5 text-[11px] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]">
                 {toolApprovals[0].args || '{}'}
               </pre>
               <textarea
@@ -3845,7 +5778,7 @@ export default function Home() {
                 onChange={(e) => setApprovalFeedback(e.target.value)}
                 placeholder={t('home.toolApprovalFeedbackPlaceholder')}
                 rows={2}
-                className="w-full rounded-lg bg-[var(--bg-card)] border border-[var(--border)] px-3 py-2 text-[11px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
+                className="w-full rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[11px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
               />
               {/* 记忆范围：仅本次 / 本会话 / 本项目持久化（白名单跨会话重启生效） */}
               <div className="flex items-center gap-3 select-none">
@@ -3886,7 +5819,7 @@ export default function Home() {
               </button>
               <button
                 onClick={() => resolveToolApproval(toolApprovals[0].requestId, true, approvalScope !== '', undefined, approvalScope || undefined)}
-                className="h-8 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all"
+                className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all"
               >
                 {t('home.toolApprovalAllow')}
               </button>
@@ -3911,7 +5844,7 @@ export default function Home() {
           }}
           onMouseUp={(e) => e.stopPropagation()}
         >
-          <div className="flex items-center gap-0.5 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl shadow-black/40 py-1 px-1">
+          <div className="flex items-center gap-0.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 px-1">
             <button
               onClick={copySelection}
               className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -3995,7 +5928,7 @@ export default function Home() {
               {whitelist.map((w) => (
                 <div
                   key={w.tool}
-                  className="flex items-center gap-2 rounded-lg bg-[var(--bg-card)] border border-[var(--border)] px-2.5 py-1.5"
+                  className="flex items-center gap-2 rounded-lg modern-card border-[var(--border)] px-2.5 py-1.5"
                 >
                   <span className="text-[11px] font-mono text-[var(--text-primary)] flex-1 truncate">{w.tool}</span>
                   <span className="text-[10px] text-[var(--text-muted)] shrink-0">{formatTime(w.created_at)}</span>
@@ -4073,9 +6006,81 @@ export default function Home() {
         />
       )}
 
+      {/* ============ 快捷键速查（? 触发） ============
+       * 增强：顶部搜索框过滤；点击键位行复制组合到剪贴板（方便用户写培训文档） */}
+      {showShortcuts && <ShortcutsPanel onClose={() => setShowShortcuts(false)} />}
+
+      {/* ============ 批量任务浮层：每行一条入队 ============ */}
+      {batchOpen && (
+        <BatchSendDialog
+          initial={draft}
+          onClose={() => setBatchOpen(false)}
+          onSubmit={async (lines) => {
+            setBatchOpen(false)
+            if (!currentProject || !currentConversation) return
+            let ok = 0
+            for (const line of lines) {
+              try {
+                await queueMessage(currentConversation.id, line, false)
+                ok++
+              } catch {
+                // 跳过失败
+              }
+            }
+            setDraft('')
+            useNotificationStore.getState().push({
+              tone: ok === lines.length ? 'success' : 'warn',
+              title: t('home.batchSent'),
+              body: t('home.batchSentBody', { ok, total: lines.length }),
+            })
+            void refreshQueued(currentConversation.id)
+          }}
+        />
+      )}
+
+      {/* ============ 导入会话预览（只读 + 复制全文） ============ */}
+      {importDialog && (
+        <ImportDialog
+          data={{ title: importDialog.title, messages: importDialog.messages }}
+          onClose={() => setImportDialog(null)}
+        />
+      )}
+
+      {/* ============ 审计日志查看 ============ */}
+      {auditOpen && <AuditDialog onClose={() => setAuditOpen(false)} />}
+
+      {/* ============ 通用确认弹层（替代 window.confirm） ============ */}
+      {confirmCfg.open && (
+        <ConfirmDialog
+          open={confirmCfg.open}
+          title={confirmCfg.title}
+          body={confirmCfg.body}
+          tone={confirmCfg.tone}
+          requireInput={confirmCfg.requireInput}
+          onConfirm={() => {
+            confirmCfg.onConfirm()
+            setConfirmCfg((c) => ({ ...c, open: false }))
+          }}
+          onCancel={() => setConfirmCfg((c) => ({ ...c, open: false }))}
+        />
+      )}
+
+      {/* ============ 项目快速切换器（Ctrl+Shift+P） ============ */}
+      {projectSwitcherOpen && (
+        <div className="cmdk-backdrop" onClick={() => setProjectSwitcherOpen(false)}>
+          <ProjectSwitcher
+            onClose={() => setProjectSwitcherOpen(false)}
+            onSelect={(id) => {
+              setProjectSwitcherOpen(false)
+              openProject(id)
+            }}
+          />
+        </div>
+      )}
+
       {/* ============ 运行时异常提示（部署后监听捕获，一键修复） ============ */}
       {runtimeAnomaly && (
-        <div className="fixed bottom-6 right-6 z-50 w-[400px] max-w-[92vw] rounded-xl bg-[var(--bg-card)] border border-red-500/60 shadow-2xl p-4 space-y-3">
+        <div className="fixed bottom-6 right-6 z-50 w-[400px] max-w-[92vw] rounded-xl modern-card border-red-500/60 shadow-2xl p-4 space-y-3">
           <div className="flex items-start gap-2">
             <span className="text-red-500 text-[16px] leading-none mt-0.5">⚠️</span>
             <div className="flex-1 min-w-0">
@@ -4112,10 +6117,38 @@ export default function Home() {
         </div>
       )}
 
+      {/* ============ 项目类型自动重新分类提示（框架标志文件变更时） ============ */}
+      {projectMetaToast && (
+        <div className="fixed bottom-6 right-6 z-50 w-[360px] max-w-[92vw] rounded-xl modern-card border-[var(--accent)]/50 shadow-2xl p-4 space-y-2.5">
+          <div className="flex items-start gap-2">
+            <span className="text-[var(--accent)] text-[16px] leading-none mt-0.5">🔄</span>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-[13px] font-semibold">{t('projectMeta.title')}</h3>
+              <p className="text-[11px] text-[var(--text-muted)] mt-0.5">{t('projectMeta.body')}</p>
+            </div>
+            <button
+              onClick={() => setProjectMetaToast(null)}
+              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[14px] leading-none"
+            >
+              ×
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="px-2 py-0.5 rounded-md bg-[var(--bg-hover)] text-[12px] font-medium">
+              {t(`projectMeta.kind.${projectMetaToast.old_kind}`)}
+            </span>
+            <span className="text-[var(--text-muted)] text-[12px]">→</span>
+            <span className="px-2 py-0.5 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] text-[12px] font-medium">
+              {t(`projectMeta.kind.${projectMetaToast.new_kind}`)}
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* ============ 修复经验候选弹窗（构建/部署由失败转成功时） ============ */}
       {knowledgeCandidate && (
         <div
-          className="fixed bottom-6 right-6 z-50 w-[380px] max-w-[92vw] rounded-xl bg-[var(--bg-card)] border border-[var(--border)] shadow-2xl p-4 space-y-3"
+          className="fixed bottom-6 right-6 z-50 w-[380px] max-w-[92vw] rounded-xl modern-card border-[var(--border)] shadow-2xl p-4 space-y-3"
         >
           <div className="flex items-start gap-2">
             <span className="text-[var(--accent)] text-[16px] leading-none mt-0.5">💡</span>
@@ -4162,7 +6195,7 @@ export default function Home() {
             <button
               onClick={saveKnowledgeCandidate}
               disabled={candidateSaving}
-              className="h-8 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+              className="h-8 px-4 rounded-lg btn-primary text-[12px]  disabled:opacity-50"
             >
               {t('knowledge.candidateSave')}
             </button>
@@ -4177,7 +6210,9 @@ export default function Home() {
 
 
 /* ============ 消息（无气泡，Claude/Qoder 风格） ============ */
-function MessageItem({
+/** 无版本历史时的稳定空数组引用：避免在 MessageItem 内每次渲染创建新数组破坏子组件 memo */
+const EMPTY_VERSIONS: ChatMessage[] = []
+const MessageItem = memo(function MessageItem({
   message,
   time,
   userMessageId,
@@ -4195,6 +6230,12 @@ function MessageItem({
   projectPath,
   highlighted,
   onOpenFile,
+  onQuoteMessage,
+  onLocateMessage,
+  onForkFrom,
+  onCopyId,
+  shortId,
+  copiedId,
 }: {
   message: ChatMessage
   time: string
@@ -4205,7 +6246,7 @@ function MessageItem({
   onBranch?: (message: ChatMessage) => void
   onRate: (messageId: string, feedback: 'like' | 'dislike' | 'neutral', reason?: string) => void
   onDislike: (messageId: string) => void
-  onOpenVersions: (message: ChatMessage) => void
+  onOpenVersions: (message: ChatMessage, userMessageId: string) => void
   onSpeak: (messageId: string, text: string) => void
   speaking: boolean
   onEditMessage?: (message: ChatMessage) => void
@@ -4217,12 +6258,47 @@ function MessageItem({
   highlighted?: boolean
   /** 代码块文件路径点击：在项目中定位/引用该文件 */
   onOpenFile?: (path: string) => void
+  /** 引用该消息到输入框（Quote） */
+  onQuoteMessage?: (message: ChatMessage) => void
+  /** 点击消息引用标签：定位并高亮被引用消息 */
+  onLocateMessage?: (msgId: string) => void
+  /** 从该 user 消息派生新会话（Fork：复制至此的消息，原会话不动） */
+  onForkFrom?: (message: ChatMessage) => void
+  /** 复制 ID 到剪贴板（排查问题用） */
+  onCopyId?: (id: string) => void
+  shortId: (id: string) => string
+  copiedId: string | null
 }) {
   const { t } = useTranslation()
-  const feedbackMap = useProjectStore((s) => s.feedbackMap)
-  const versionMap = useProjectStore((s) => s.versionMap)
+  // 按消息粒度订阅：整表订阅会在任意一条消息点赞/版本更新时触发全部历史消息重渲染
+  const feedback = useProjectStore((s) => s.feedbackMap[message.id])
+  const versions = useProjectStore((s) => s.versionMap[userMessageId] ?? EMPTY_VERSIONS)
   const { role, content, reasoning, model } = message
   const [copied, setCopied] = useState(false)
+  // 右键菜单：x/y 定位
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null)
+
+  // 右键菜单：x/y + 菜单项动作（直接挂在 onContextMenu）
+  const onContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault()
+      setCtxMenu({ x: e.clientX, y: e.clientY })
+    },
+    [],
+  )
+  // 点击其他位置/滚动/失焦时关闭菜单
+  useEffect(() => {
+    if (!ctxMenu) return
+    const close = () => setCtxMenu(null)
+    window.addEventListener('click', close)
+    window.addEventListener('scroll', close, true)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('scroll', close, true)
+    }
+  }, [ctxMenu])
+  // 超长回复折叠：超过 2 万字符时默认收起，仅渲染纯文本摘要（避免单条消息数千行拖慢列表渲染与滚动）
+  const [expanded, setExpanded] = useState(false)
   // “记住这次修复”弹窗：把当前对话里的错误+解法沉淀为知识库条目
   const [rememberOpen, setRememberOpen] = useState(false)
   const [rememberSaving, setRememberSaving] = useState(false)
@@ -4242,25 +6318,36 @@ function MessageItem({
     }
   }, [message.modified_files_json])
 
-  // 本条 user 消息的 @ 引用列表（references_json，气泡下方标签展示）
-  const userRefs = useMemo(() => {
-    if (!message.references_json) return []
+  // 本条 user 消息的 @ 引用列表（references_json，气泡下方标签展示）；
+  // "msg:{id}" 前缀条目为消息引用（Quote 功能），与文件引用分开渲染
+  const { fileRefs, quotedMsgIds } = useMemo(() => {
+    const fileRefs: string[] = []
+    const quotedMsgIds: string[] = []
+    if (!message.references_json) return { fileRefs, quotedMsgIds }
     try {
       const v = JSON.parse(message.references_json)
-      return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []
+      if (!Array.isArray(v)) return { fileRefs, quotedMsgIds }
+      for (const x of v) {
+        if (typeof x !== 'string') continue
+        if (x.startsWith('msg:')) quotedMsgIds.push(x.slice(4))
+        else fileRefs.push(x)
+      }
     } catch {
-      return []
+      /* 忽略损坏数据 */
     }
+    return { fileRefs, quotedMsgIds }
   }, [message.references_json])
 
   // 注：role === 'tool' 的消息已在 renderItems 中合并为 ToolRunGroup 折叠组，不会进入本组件
 
   const isUser = role === 'user'
-  const feedback = feedbackMap[message.id]
-  const versions = versionMap[userMessageId] ?? []
   const previewVersion = previewVersionId ? versions.find((v) => v.id === previewVersionId) ?? null : null
   const displayContent = previewVersion ? previewVersion.content : content
   const displayReasoning = previewVersion ? (previewVersion.reasoning ?? undefined) : reasoning
+  const isLong = displayContent.length > 20000
+  // 缓存 sanitizeToolMarkers 结果：长文本正则替换是 O(n) 开销，memoise 避免 MessageItem 因无关
+  // props 变化（如 speaking/highlighted/confirmDeleteMsgId）重渲染时重复执行
+  const sanitizedContent = useMemo(() => sanitizeToolMarkers(displayContent), [displayContent])
 
   /** 复制消息内容（带 1.5s 成功反馈） */
   const copyMessage = async () => {
@@ -4314,28 +6401,70 @@ function MessageItem({
     return (
       <div
         data-msg-id={message.id}
-        className={`flex justify-end gap-2.5 group animate-fade-in-up ${highlighted ? 'msg-highlight' : ''}`}
+        onContextMenu={onContextMenu}
+        className={`flex justify-end gap-2.5 group ${highlighted ? 'msg-highlight' : ''}`}
       >
         <div className="max-w-[80%] rounded-2xl rounded-tr-md bg-[var(--accent-soft)] border border-[var(--accent)]/20 px-4 py-2.5 shadow-sm transition-shadow hover:shadow-md">
           <div className="flex items-center gap-2 mb-1">
             <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.you')}</span>
             <span className="text-[10px] text-[var(--text-muted)]">{time}</span>
+            {/* 消息 ID：点击复制完整 ID，排查问题用 */}
+            {onCopyId && (
+              <button
+                onClick={() => onCopyId(message.id)}
+                className="debug-id-badge font-mono text-[9px] px-1 py-px rounded border border-[var(--border)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors opacity-60 hover:opacity-100"
+                title={`${t('home.msgId')}: ${message.id}\n${t('home.clickToCopy')}`}
+              >
+                {copiedId === message.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
+                {shortId(message.id)}
+              </button>
+            )}
             {queued && (
               <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--accent)]/10 text-[var(--accent)]">
                 {message.agent_owned === 1 ? t('home.queuedAgentLabel') : t('home.queuedLabel')}
               </span>
             )}
             {/* @ 引用标签（references_json 落库展示） */}
-            {userRefs.length > 0 && (
+            {fileRefs.length > 0 && (
               <span
                 className="flex items-center gap-1 text-[10px] text-[var(--text-muted)] max-w-52 overflow-hidden"
-                title={userRefs.join('\n')}
+                title={fileRefs.join('\n')}
               >
                 <Icon name="file" size={10} className="shrink-0" />
-                <span className="truncate">{userRefs.join(', ')}</span>
+                <span className="truncate">{fileRefs.join(', ')}</span>
               </span>
             )}
-            <div className="ml-auto flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            {/* 消息引用标签（Quote 落库 msg:{id}；点击定位被引用消息） */}
+            {quotedMsgIds.length > 0 && onLocateMessage && quotedMsgIds.map((mid) => (
+              <button
+                key={mid}
+                onClick={() => onLocateMessage(mid)}
+                className="flex items-center gap-1 text-[10px] text-[var(--accent)] hover:text-[var(--accent-hover)] max-w-40"
+                title={t('home.locateQuoted')}
+              >
+                <Icon name="quote" size={10} className="shrink-0" />
+                <span className="truncate">{t('home.quotedMsgLabel')}</span>
+              </button>
+            ))}
+            <div className="ml-auto flex items-center gap-0.5 opacity-0 group-hover:opacity-100 max-md:opacity-100 transition-opacity">
+              {onQuoteMessage && (
+                <button
+                  onClick={() => onQuoteMessage(message)}
+                  className="text-[10px] text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] rounded-md px-1.5 py-0.5 flex items-center gap-0.5"
+                  title={t('home.quoteMessage')}
+                >
+                  <Icon name="quote" size={11} />{t('home.quoteMessage')}
+                </button>
+              )}
+              {onForkFrom && (
+                <button
+                  onClick={() => onForkFrom(message)}
+                  className="text-[10px] text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] rounded-md px-1.5 py-0.5 flex items-center gap-0.5"
+                  title={t('home.forkFromHere')}
+                >
+                  <Icon name="git-branch" size={11} />{t('home.forkFromHere')}
+                </button>
+              )}
               <button
                 onClick={copyMessage}
                 className={`text-[10px] rounded-md px-1.5 py-0.5 flex items-center gap-0.5 ${
@@ -4357,12 +6486,16 @@ function MessageItem({
               {onDeleteMessage && (
                 <button
                   onClick={() => onDeleteMessage(message)}
-                  className={`text-[10px] px-1.5 py-0.5 rounded-md ${
+                  className={`text-[10px] px-1.5 py-0.5 rounded-md transition-all ${
                     confirmDeleteMsgId === message.id
-                      ? 'text-[var(--danger)] bg-[var(--danger)]/10'
+                      ? 'text-white bg-[var(--danger)] shadow-[0_0_0_3px_var(--danger-50)]'
                       : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
                   }`}
-                  title={t('home.deleteMessage')}
+                  title={
+                    confirmDeleteMsgId === message.id
+                      ? t('home.deleteMessageConfirm')
+                      : t('home.deleteMessage')
+                  }
                 >
                   {confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
                 </button>
@@ -4380,10 +6513,26 @@ function MessageItem({
             </div>
           </div>
           <div className="text-sm break-words leading-relaxed">
-            <Markdown>{content}</Markdown>
+            {/* 超长消息折叠（粘贴大段日志等）：与助手分支同规则 */}
+            {isLong && !expanded ? (
+              <div>
+                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-[var(--text-secondary)] max-h-48 overflow-y-auto">
+                  {content.slice(0, 2000)}
+                </pre>
+                <span className="text-[10.5px] text-[var(--text-muted)]">…</span>
+                <button
+                  onClick={() => setExpanded(true)}
+                  className="ml-1 text-[11px] text-[var(--accent)] hover:underline"
+                >
+                  {t('home.expandFullMessage', { count: content.length.toLocaleString() })}
+                </button>
+              </div>
+            ) : (
+              <Markdown onOpenFile={onOpenFile}>{content}</Markdown>
+            )}
           </div>
         </div>
-        <div className="w-7 h-7 shrink-0 rounded-lg bg-[var(--bg-card)] border border-[var(--border)] flex items-center justify-center text-[11px] font-medium text-[var(--text-secondary)]">
+        <div className="w-7 h-7 shrink-0 rounded-lg modern-card border-[var(--border)] flex items-center justify-center text-[11px] font-medium text-[var(--text-secondary)]">
           {t('home.you').charAt(0)}
         </div>
       </div>
@@ -4393,7 +6542,8 @@ function MessageItem({
   return (
     <div
       data-msg-id={message.id}
-      className={`flex gap-2.5 group animate-fade-in-up ${highlighted ? 'msg-highlight' : ''}`}
+      onContextMenu={onContextMenu}
+      className={`flex gap-2.5 group ${highlighted ? 'msg-highlight' : ''}`}
     >
       <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shrink-0 mt-0.5 shadow-md shadow-[var(--accent)]/20">
         <Icon name="spark" size={13} white />
@@ -4402,11 +6552,23 @@ function MessageItem({
         <div className="flex items-center gap-2 mb-1.5">
           <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.agent')}</span>
           <span className="text-[10px] text-[var(--text-muted)]">{time}</span>
-          {model && <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)] text-[var(--text-muted)]">{model}</span>}
+          {/* 消息 ID：点击复制完整 ID，排查问题用 */}
+          {onCopyId && (
+            <button
+              onClick={() => onCopyId(message.id)}
+              className="debug-id-badge font-mono text-[9px] px-1 py-px rounded border border-[var(--border)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors opacity-60 hover:opacity-100"
+              title={`${t('home.msgId')}: ${message.id}\n${t('home.clickToCopy')}`}
+            >
+              {copiedId === message.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
+              {shortId(message.id)}
+            </button>
+          )}
+          {/* 窄窗口隐藏次要徽章（模型/耗时/token），避免头部拥挤换行 */}
+          {model && <span className="hidden md:inline-flex text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)] text-[var(--text-muted)]">{model}</span>}
           {/* 本条回复用时（ChatGPT 式“已处理 mm:ss”）：任务耗时持久化到消息，历史对话同样可见 */}
           {message.duration_ms != null && message.duration_ms > 0 && (
             <span
-              className="text-[10px] tabular-nums px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)]/60 text-[var(--text-muted)]"
+              className="hidden sm:inline-flex text-[10px] tabular-nums px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)]/60 text-[var(--text-muted)]"
               title={t('home.replyDurationHint')}
             >
               ⏱ {fmtElapsed(message.duration_ms / 1000)}
@@ -4415,7 +6577,7 @@ function MessageItem({
           {/* 本条回复 token 消耗（入库 tokens_in/tokens_out，悬浮提示） */}
           {(message.tokens_in != null || message.tokens_out != null) && (
             <span
-              className="text-[10px] tabular-nums px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)]/60 text-[var(--text-muted)]"
+              className="hidden lg:inline-flex text-[10px] tabular-nums px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)]/60 text-[var(--text-muted)]"
               title={`${t('home.tokenHint')}：${t('home.tokenIn')} ${message.tokens_in ?? 0} / ${t('home.tokenOut')} ${message.tokens_out ?? 0}`}
             >
               ↑{(message.tokens_in ?? 0).toLocaleString()} ↓{(message.tokens_out ?? 0).toLocaleString()}
@@ -4435,7 +6597,22 @@ function MessageItem({
         )}
         {displayReasoning && <ThinkingBlock content={displayReasoning} />}
         <div className="text-sm break-words leading-relaxed text-[var(--text-primary)]">
-          <Markdown onOpenFile={onOpenFile}>{sanitizeToolMarkers(displayContent)}</Markdown>
+          {isLong && !expanded ? (
+            <div>
+              <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-[var(--text-secondary)] max-h-48 overflow-y-auto">
+                {displayContent.slice(0, 2000)}
+              </pre>
+              <span className="text-[10.5px] text-[var(--text-muted)]">…</span>
+              <button
+                onClick={() => setExpanded(true)}
+                className="ml-1 text-[11px] text-[var(--accent)] hover:underline"
+              >
+                {t('home.expandFullMessage', { count: displayContent.length.toLocaleString() })}
+              </button>
+            </div>
+          ) : (
+            <Markdown onOpenFile={onOpenFile}>{sanitizedContent}</Markdown>
+          )}
         </div>
         {modifiedFiles.length > 0 && <ModifiedFilesCard files={modifiedFiles} projectPath={projectPath} />}
         {/* 分支切换面板（对话内预览历史版本，点击版本直接切换显示） */}
@@ -4473,7 +6650,7 @@ function MessageItem({
                 <Icon name="close" size={12} />
               </button>
               <button
-                onClick={() => onOpenVersions(message)}
+                onClick={() => onOpenVersions(message, userMessageId)}
                 className="px-2.5 py-1 rounded-lg text-[11px] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
               >
                 {t('home.branchCompareDiff')}
@@ -4481,8 +6658,8 @@ function MessageItem({
             </div>
           </div>
         )}
-        {/* 操作栏：复制 / 重新生成 / 点赞 / 点踩 / 朗读 / 版本对比 */}
-        <div className="flex items-center gap-0.5 mt-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        {/* 操作栏：复制 / 引用 / 重新生成 / 点赞 / 点踩 / 朗读 / 版本对比 */}
+        <div className="flex items-center gap-0.5 mt-1.5 opacity-0 group-hover:opacity-100 max-md:opacity-100 transition-opacity">
           <button
             onClick={copyMessage}
             className={`p-1 rounded-md transition-colors ${copied ? 'text-[var(--success)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'}`}
@@ -4490,6 +6667,15 @@ function MessageItem({
           >
             {copied ? <Icon name="check" size={13} /> : <Icon name="copy" size={13} />}
           </button>
+          {onQuoteMessage && (
+            <button
+              onClick={() => onQuoteMessage(message)}
+              className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+              title={t('home.quoteMessage')}
+            >
+              <Icon name="quote" size={13} />
+            </button>
+          )}
           <button
             onClick={openRemember}
             className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -4548,10 +6734,10 @@ function MessageItem({
           {onDeleteMessage && (
             <button
               onClick={() => onDeleteMessage(message)}
-              className={`p-1 rounded-md transition-colors ${confirmDeleteMsgId === message.id ? 'text-[var(--danger)] bg-[var(--danger)]/10' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
+              className={`p-1 rounded-md transition-all ${confirmDeleteMsgId === message.id ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
               title={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
             >
-              <Icon name="delete" size={13} />
+              <Icon name="delete" size={13} white={confirmDeleteMsgId === message.id} />
             </button>
           )}
         </div>
@@ -4563,7 +6749,7 @@ function MessageItem({
           onClick={() => setRememberOpen(false)}
         >
           <div
-            className="w-[480px] max-w-[92vw] rounded-xl bg-[var(--bg-card)] border border-[var(--border)] shadow-2xl p-4 space-y-3"
+            className="w-[480px] max-w-[92vw] rounded-xl modern-card border-[var(--border)] shadow-2xl p-4 space-y-3"
             onClick={(e) => e.stopPropagation()}
           >
             <h3 className="text-[14px] font-semibold">{t('knowledge.rememberTitle')}</h3>
@@ -4606,7 +6792,7 @@ function MessageItem({
               <button
                 onClick={saveRemember}
                 disabled={rememberSaving}
-                className="h-8 px-4 rounded-lg bg-[var(--accent)] text-white text-[12px] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                className="h-8 px-4 rounded-lg btn-primary text-[12px]  disabled:opacity-50"
               >
                 {t('knowledge.save')}
               </button>
@@ -4614,6 +6800,1216 @@ function MessageItem({
           </div>
         </div>
       )}
+
+      {/* 右键菜单：复制 / 重新生成（仅 assistant 最后一条）/ 编辑（仅 user）/ 删除 */}
+      {ctxMenu && (
+        <div
+          role="menu"
+          onClick={(e) => e.stopPropagation()}
+          className="fixed z-[200] min-w-[180px] glass-card rounded-lg py-1 animate-modal-in text-[12.5px]"
+          style={{ left: ctxMenu.x, top: ctxMenu.y }}
+        >
+          <button
+            onClick={() => {
+              copyMessage()
+              setCtxMenu(null)
+            }}
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            <Icon name={copied ? 'check' : 'copy'} size={13} />
+            {copied ? t('home.copied') : t('home.copyMessage')}
+          </button>
+          {message.role === 'user' && onEditMessage && (
+            <button
+              onClick={() => {
+                onEditMessage(message)
+                setCtxMenu(null)
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="edit" size={13} />
+              {t('home.edit')}
+            </button>
+          )}
+          {message.role === 'user' && onDeleteMessage && (
+            <button
+              onClick={() => {
+                onDeleteMessage(message)
+                setCtxMenu(null)
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--danger)] hover:bg-[var(--danger-50)] transition-colors"
+            >
+              <Icon name="delete" size={13} />
+              {t('home.delete')}
+            </button>
+          )}
+          {message.role === 'assistant' && isLastAssistant && onRegenerate && (
+            <button
+              onClick={() => {
+                onRegenerate()
+                setCtxMenu(null)
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="refresh" size={13} />
+              {t('home.regenerate')}
+            </button>
+          )}
+          {message.role === 'assistant' && onBranch && (
+            <button
+              onClick={() => {
+                onBranch(message)
+                setCtxMenu(null)
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="git-branch" size={13} />
+              {t('home.forkFromHere')}
+            </button>
+          )}
+          {/* Pin 到会话顶部：纯前端 localStorage，会话维度持久化（最多 8 条） */}
+          <button
+            onClick={() => {
+              const convId = message.conversation_id
+              const isP = usePinStore.getState().isPinned(convId, message.id)
+              usePinStore.getState().toggle(convId, message.id)
+              // toast 反馈
+              useNotificationStore.getState().push({
+                tone: isP ? 'info' : 'success',
+                title: isP ? t('home.unpinned') : t('home.pinned'),
+                body: isP
+                  ? t('home.unpinnedBody')
+                  : t('home.pinnedBody', { count: (usePinStore.getState().pins[convId]?.length ?? 0), max: PIN_MAX_PER_CONV }),
+              })
+              setCtxMenu(null)
+            }}
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            <Icon name={usePinStore.getState().isPinned(message.conversation_id, message.id) ? 'check' : 'pin'} size={13} />
+            {usePinStore.getState().isPinned(message.conversation_id, message.id) ? t('home.unpinFromTop') : t('home.pinToTop')}
+          </button>
+          {/* 复制消息链接：hash 锚点格式 #msg={id}，贴到任意位置再点 → 切到该会话并滚动高亮 */}
+          <button
+            onClick={async () => {
+              const link = `${window.location.origin}${window.location.pathname}#msg=${message.id}`
+              try {
+                await navigator.clipboard.writeText(link)
+                useNotificationStore.getState().push({
+                  tone: 'success',
+                  title: t('home.linkCopied'),
+                  body: t('home.linkCopiedBody'),
+                })
+              } catch {
+                useNotificationStore.getState().push({
+                  tone: 'error',
+                  title: t('home.linkCopyFail'),
+                  body: '',
+                })
+              }
+              setCtxMenu(null)
+            }}
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            <Icon name="quote" size={13} />
+            {t('home.copyMessageLink')}
+          </button>
+          {message.role === 'assistant' && onOpenVersions && versions.length > 0 && (
+            <button
+              onClick={() => {
+                onOpenVersions(message, userMessageId)
+                setCtxMenu(null)
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="history" size={13} />
+              {t('home.viewVersions')} ({versions.length})
+            </button>
+          )}
+          {/* 1-5 星评分（纯前端 localStorage；与 like/dislike 互不干扰）—— 仅 assistant 消息 */}
+          {message.role === 'assistant' && (
+            <div className="border-t border-[var(--border)] mt-1 pt-1">
+              <div className="px-3 py-1 text-[10px] font-medium text-[var(--text-muted)] uppercase tracking-wider flex items-center justify-between">
+                <span>{t('home.rateTitle')}</span>
+                {useRatingStore.getState().get(message.id) && (
+                  <button
+                    onClick={() => {
+                      useRatingStore.getState().remove(message.id)
+                      useNotificationStore.getState().push({ tone: 'info', title: t('home.rateCleared'), body: '' })
+                      setCtxMenu(null)
+                    }}
+                    className="text-[10px] text-[var(--text-muted)] hover:text-[var(--danger)] normal-case tracking-normal"
+                  >
+                    {t('home.rateClear')}
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center justify-around px-2 py-1.5">
+                {[1, 2, 3, 4, 5].map((n) => {
+                  const cur = useRatingStore.getState().get(message.id)
+                  const active = cur?.score === n
+                  return (
+                    <button
+                      key={n}
+                      onClick={() => {
+                        useRatingStore.getState().set(message.id, { score: n, comment: null })
+                        useNotificationStore.getState().push({
+                          tone: 'success',
+                          title: t('home.rateSaved'),
+                          body: t('home.rateSavedBody', { n }),
+                        })
+                        setCtxMenu(null)
+                      }}
+                      className={`w-7 h-7 rounded-md flex items-center justify-center text-[14px] font-semibold transition-all active:scale-90 ${
+                        active
+                          ? 'bg-[var(--warning)] text-white shadow-sm'
+                          : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--warning)]'
+                      }`}
+                      title={t('home.rateStar', { n })}
+                    >
+                      {n}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+})
+
+
+/* ============ 快捷键速查：键帽行（键 + 描述） ============ */
+export function ShortcutRow({ keys, desc }: { keys: string[]; desc: string }) {
+  return (
+    <div className="flex items-center justify-between gap-2 py-1">
+      <span className="text-[var(--text-secondary)] text-[12px]">{desc}</span>
+      <span className="flex items-center gap-1 shrink-0">
+        {keys.map((k, i) => (
+          <span key={i} className="inline-flex items-center">
+            <kbd className="px-1.5 py-0.5 text-[10.5px] font-mono font-medium rounded border border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-primary)] min-w-[22px] text-center tnum">
+              {k}
+            </kbd>
+            {i < keys.length - 1 && <span className="text-[var(--text-muted)] text-[10.5px] mx-0.5">+</span>}
+          </span>
+        ))}
+      </span>
+    </div>
+  )
+}
+
+
+/* ============ 快捷键速查面板（? 触发）：分组 + 搜索 + 一键复制键位 ============
+ * - 数据结构硬编码在组件内：每组若干 { keys, desc, groupKey }
+ * - 顶部搜索框：模糊匹配 desc / keys
+ * - 点击行复制键位组合到剪贴板（如 "Ctrl+Shift+P"），toast 反馈
+ * - Esc 关闭
+ */
+function ShortcutsPanel({ onClose }: { onClose: () => void }) {
+  const { t } = useTranslation()
+  const [query, setQuery] = useState('')
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  // 全部快捷键（硬编码）：分组 → [{ keys, desc, descKey }]
+  const groups: { titleKey: string; items: { keys: string[]; descKey: string; copyKey: string }[] }[] = [
+    {
+      titleKey: 'home.shortcutGroupNav',
+      items: [
+        { keys: ['Ctrl', 'K'], descKey: 'home.shortcutCommandPalette', copyKey: 'Ctrl+K' },
+        { keys: ['Ctrl', 'Shift', 'K'], descKey: 'home.shortcutFocusSearch', copyKey: 'Ctrl+Shift+K' },
+        { keys: ['Ctrl', 'Shift', 'P'], descKey: 'home.shortcutProjectSwitcher', copyKey: 'Ctrl+Shift+P' },
+        { keys: ['Ctrl', 'Shift', 'N'], descKey: 'home.shortcutNewConv', copyKey: 'Ctrl+Shift+N' },
+        { keys: ['?'], descKey: 'home.shortcutThisPanel', copyKey: '?' },
+        { keys: ['Esc'], descKey: 'home.shortcutClose', copyKey: 'Esc' },
+      ],
+    },
+    {
+      titleKey: 'home.shortcutGroupQuick',
+      items: [
+        { keys: ['Ctrl', 'Shift', 'B'], descKey: 'home.shortcutBuild', copyKey: 'Ctrl+Shift+B' },
+        { keys: ['Ctrl', 'Shift', 'D'], descKey: 'home.shortcutDeploy', copyKey: 'Ctrl+Shift+D' },
+        { keys: ['Ctrl', 'Shift', 'S'], descKey: 'home.shortcutScreenshot', copyKey: 'Ctrl+Shift+S' },
+        { keys: ['Ctrl', 'Shift', 'R'], descKey: 'home.shortcutRunCommand', copyKey: 'Ctrl+Shift+R' },
+      ],
+    },
+    {
+      titleKey: 'home.shortcutGroupInput',
+      items: [
+        { keys: ['Enter'], descKey: 'home.shortcutSend', copyKey: 'Enter' },
+        { keys: ['Shift', 'Enter'], descKey: 'home.shortcutNewline', copyKey: 'Shift+Enter' },
+        { keys: ['Ctrl', 'Enter'], descKey: 'home.shortcutSendCmd', copyKey: 'Ctrl+Enter' },
+      ],
+    },
+    {
+      titleKey: 'home.shortcutGroupMessage',
+      items: [
+        { keys: ['右键'], descKey: 'home.shortcutContextMenu', copyKey: 'RightClick' },
+      ],
+    },
+  ]
+
+  // 过滤：query 命中 keys 或 desc
+  const q = query.trim().toLowerCase()
+  const filtered = q
+    ? groups
+        .map((g) => ({
+          ...g,
+          items: g.items.filter((it) => {
+            const desc = t(it.descKey).toLowerCase()
+            const keyStr = it.copyKey.toLowerCase()
+            return desc.includes(q) || keyStr.includes(q)
+          }),
+        }))
+        .filter((g) => g.items.length > 0)
+    : groups
+
+  // 复制键位
+  const copyKey = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedKey(text)
+      setTimeout(() => setCopiedKey((cur) => (cur === text ? null : cur)), 1200)
+    } catch {
+      // 剪贴板不可用 → 静默
+    }
+  }
+
+  // 自动聚焦搜索框 + Esc 关闭
+  useEffect(() => {
+    inputRef.current?.focus()
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div className="cmdk-backdrop" onClick={onClose}>
+      <div
+        className="w-[560px] max-w-[92vw] max-h-[82vh] flex flex-col glass-card p-5 animate-modal-in"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 标题 + 关闭 */}
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Icon name="bolt" size={15} />
+            <h2 className="text-[14px] font-semibold">{t('home.shortcuts')}</h2>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            <Icon name="close" size={14} />
+          </button>
+        </div>
+
+        {/* 搜索框 */}
+        <div className="mb-3 flex items-center gap-2 px-2.5 h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] focus-within:border-[var(--accent)] transition-colors">
+          <Icon name="search" size={12} className="text-[var(--text-muted)]" />
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={t('home.shortcutSearchPlaceholder')}
+            spellCheck={false}
+            className="flex-1 bg-transparent outline-none text-[12.5px] placeholder:text-[var(--text-muted)]"
+          />
+          {query && (
+            <button
+              onClick={() => setQuery('')}
+              className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+            >
+              <Icon name="close" size={11} />
+            </button>
+          )}
+        </div>
+
+        {/* 分组列表 */}
+        <div className="space-y-3 text-[12.5px] overflow-y-auto min-h-0 flex-1">
+          {filtered.length === 0 ? (
+            <p className="text-center text-[12px] text-[var(--text-muted)] py-6">{t('home.shortcutNoResults')}</p>
+          ) : (
+            filtered.map((g) => (
+              <div key={g.titleKey}>
+                <p className="text-[10.5px] font-medium text-[var(--text-muted)] uppercase tracking-wider mb-1.5">
+                  {t(g.titleKey)}
+                </p>
+                {g.items.map((it) => {
+                  const isCopied = copiedKey === it.copyKey
+                  return (
+                    <div
+                      key={it.copyKey}
+                      onClick={() => void copyKey(it.copyKey)}
+                      title={t('home.shortcutCopyHint')}
+                      className="group flex items-center justify-between gap-2 py-1 px-1.5 -mx-1.5 rounded-md hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+                    >
+                      <span className="text-[var(--text-secondary)] text-[12px]">{t(it.descKey)}</span>
+                      <span className="flex items-center gap-0.5 shrink-0">
+                        {it.keys.map((k, i) => (
+                          <span key={i} className="flex items-center gap-0.5">
+                            {i > 0 && <span className="text-[10px] text-[var(--text-muted)]">+</span>}
+                            <kbd className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] tnum">
+                              {k}
+                            </kbd>
+                          </span>
+                        ))}
+                        <Icon
+                          name={isCopied ? 'check' : 'copy'}
+                          size={10}
+                          className={`ml-1.5 transition-all ${isCopied ? 'text-[var(--success)] opacity-100' : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100'}`}
+                        />
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* 底部提示 */}
+        <p className="mt-3 pt-2.5 border-t border-[var(--border)] text-[10.5px] text-[var(--text-muted)]">
+          {t('home.shortcutFooter')}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+
+/* ============ 项目快速切换器：Ctrl+Shift+P 触发，fuzzy 搜项目 + 最近 5 个置顶 ============ */
+function ProjectSwitcher({ onClose, onSelect }: { onClose: () => void; onSelect: (id: string) => void }) {
+  const { t } = useTranslation()
+  const projects = useProjectStore((s) => s.projects) as Project[]
+  const currentProject = useProjectStore((s) => s.currentProject)
+  const [query, setQuery] = useState('')
+  const [sel, setSel] = useState(0)
+  const listRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  // fuzzy 过滤：项目名 / 路径包含 query
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    const list = !q
+      ? projects
+      : projects.filter((p) => p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q))
+    // 当前项目置顶 + 最近 5 个靠前
+    return [...list].sort((a, b) => {
+      if (a.id === currentProject?.id) return -1
+      if (b.id === currentProject?.id) return 1
+      return (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)
+    })
+  }, [projects, query, currentProject?.id])
+
+  // 打开时聚焦输入框
+  useEffect(() => {
+    const h = setTimeout(() => inputRef.current?.focus(), 30)
+    return () => clearTimeout(h)
+  }, [])
+
+  // 键盘：↑↓ 移动 / Enter 选择 / Esc 关闭
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        onClose()
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setSel((s) => Math.min(filtered.length - 1, s + 1))
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setSel((s) => Math.max(0, s - 1))
+      } else if (e.key === 'Enter') {
+        e.preventDefault()
+        const p = filtered[sel]
+        if (p) onSelect(p.id)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [filtered, sel, onSelect, onClose])
+
+  return (
+    <div
+      className="w-[520px] max-w-[92vw] rounded-2xl glass-card overflow-hidden animate-modal-in"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center gap-2.5 px-4 h-12 border-b border-[var(--border)]">
+        <Icon name="folder" size={16} className="text-[var(--text-muted)] shrink-0" />
+        <input
+          ref={inputRef}
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value)
+            setSel(0)
+          }}
+          placeholder={t('home.projectSwitcherPlaceholder')}
+          className="flex-1 bg-transparent outline-none text-[14px] placeholder:text-[var(--text-muted)]"
+          spellCheck={false}
+        />
+        <kbd className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] tnum">Esc</kbd>
+      </div>
+      <div ref={listRef} className="max-h-[50vh] overflow-y-auto py-1.5">
+        {filtered.length === 0 ? (
+          <div className="px-4 py-8 text-center text-[13px] text-[var(--text-muted)]">{t('home.projectSwitcherEmpty')}</div>
+        ) : (
+          filtered.map((p, i) => {
+            const active = i === sel
+            const isCurrent = p.id === currentProject?.id
+            return (
+              <button
+                key={p.id}
+                onClick={() => onSelect(p.id)}
+                onMouseEnter={() => setSel(i)}
+                className={`w-full flex items-center gap-2.5 px-4 py-2 text-left transition-colors ${
+                  active ? 'bg-[var(--accent-soft)]' : 'hover:bg-[var(--bg-hover)]'
+                }`}
+              >
+                <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shrink-0">
+                  <Icon name="folder" size={13} white />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[13px] truncate flex items-center gap-1.5">
+                    {p.name}
+                    {isCurrent && (
+                      <span className="text-[10px] px-1 rounded bg-[var(--accent)]/15 text-[var(--accent)]">{t('home.projectSwitcherCurrent')}</span>
+                    )}
+                  </div>
+                  <div className="text-[10.5px] text-[var(--text-muted)] truncate font-mono">{p.path}</div>
+                </div>
+                {p.index_state && (
+                  <span className="text-[10px] text-[var(--text-muted)] tnum shrink-0">
+                    {p.index_state === 'ready' ? '✓' : '…'}
+                  </span>
+                )}
+              </button>
+            )
+          })
+        )}
+      </div>
+      <div className="flex items-center gap-3 px-4 h-9 border-t border-[var(--border)] text-[11px] text-[var(--text-muted)] tnum">
+        <span><kbd className="px-1 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)]">↑</kbd> <kbd className="px-1 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)]">↓</kbd> {t('home.projectSwitcherNavigate')}</span>
+        <span><kbd className="px-1 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)]">Enter</kbd> {t('home.projectSwitcherOpen')}</span>
+      </div>
+    </div>
+  )
+}
+
+
+/* ============ 批量任务浮层：每行一条入队（agentOwned=false 让任务结束后自动续跑） ============
+ * - 多行文本 → 逐行入队 → Agent 串行处理
+ * - 入参 initial：当前输入框草稿（默认填入，用户可继续编辑）
+ * - 入参 onSubmit：用户点"入队"时触发，把行数组交给外层
+ * - Esc 关闭、Cmd/Ctrl+Enter 直接入队
+ */
+function BatchSendDialog({ initial, onClose, onSubmit }: {
+  initial: string
+  onClose: () => void
+  onSubmit: (lines: string[]) => void | Promise<void>
+}) {
+  const { t } = useTranslation()
+  const [text, setText] = useState(initial)
+  // 拆行：去空白、去空行；保留用户原顺序
+  const lines = useMemo(
+    () => text.split('\n').map((s) => s.trim()).filter(Boolean),
+    [text]
+  )
+  const submittingRef = useRef(false)
+
+  // 提交：避免重复触发（点按钮 / 按快捷键同时按）
+  const submit = async () => {
+    if (submittingRef.current) return
+    if (lines.length === 0) return
+    submittingRef.current = true
+    try {
+      await onSubmit(lines)
+    } finally {
+      submittingRef.current = false
+    }
+  }
+
+  // 快捷键：Esc 关闭 / Ctrl+Enter 提交
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        onClose()
+      } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault()
+        void submit()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lines.length, onClose]) // submit 是稳定闭包，但依赖 lines 让 Enter 触发时拿到最新行数
+
+  return (
+    <div className="cmdk-backdrop" onClick={onClose}>
+      <div
+        className="w-[600px] max-w-[92vw] glass-card p-4 animate-modal-in"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 标题栏 */}
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] flex items-center justify-center">
+              <Icon name="package" size={13} />
+            </div>
+            <h2 className="text-[14px] font-semibold">{t('home.batch')}</h2>
+          </div>
+          <button
+            onClick={onClose}
+            className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center"
+            title={t('home.cancel')}
+          >
+            <Icon name="close" size={13} />
+          </button>
+        </div>
+
+        <p className="text-[11.5px] text-[var(--text-muted)] mb-2.5 leading-relaxed">
+          {t('home.batchHint')}
+        </p>
+
+        {/* 多行输入框：等宽字体，按行解析 */}
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={10}
+          autoFocus
+          spellCheck={false}
+          className="w-full rounded-lg modern-card p-3 text-[13px] font-mono leading-relaxed outline-none focus:border-[var(--accent)] resize-y min-h-[180px] max-h-[50vh]"
+          placeholder={t('home.batchPlaceholder')}
+        />
+
+        {/* 底部状态行 + 操作按钮 */}
+        <div className="flex items-center justify-between mt-3">
+          <div className="flex items-center gap-3 text-[11px] text-[var(--text-muted)] tnum">
+            <span className="flex items-center gap-1">
+              {t('home.batchLines', { count: lines.length })}
+            </span>
+            {lines.length > 1 && (
+              <span className="text-[10.5px] px-1.5 py-0.5 rounded bg-[var(--accent)]/10 text-[var(--accent)]">
+                {t('home.batchQueue', { count: lines.length })}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <kbd className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] tnum">
+              Ctrl+Enter
+            </kbd>
+            <button
+              onClick={onClose}
+              className="h-7 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              {t('home.cancel')}
+            </button>
+            <button
+              onClick={submit}
+              disabled={lines.length === 0}
+              className="h-7 px-3 rounded-lg btn-primary text-[12px] active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {t('home.batchSend')}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+/* ============ 会话导入预览弹层：解析 md/json → 只读预览 → 复制全文 ============
+ * - 不写数据库（避免污染历史/触发 agent）
+ * - 用户可复制后粘贴到任意会话作为参考上下文
+ * - 顶部展示元信息（文件名 / 消息数 / 角色分布）+ 中间消息列表 + 底部"复制全文"按钮
+ */
+function ImportDialog({ data, onClose }: {
+  data: { title: string; messages: Array<{ role: string; content: string }> }
+  onClose: () => void
+}) {
+  const { t } = useTranslation()
+  const [copied, setCopied] = useState(false)
+  const copyRef = useRef<HTMLButtonElement>(null)
+
+  // 复制全文为 markdown（与 exportConversationMd 输出格式兼容）
+  const copyAll = async () => {
+    const md = data.messages
+      .map((m) => {
+        const role = m.role === 'user' ? '👤 User' : m.role === 'assistant' ? '🤖 Assistant' : `⚙️ ${m.role}`
+        return `## ${role}\n\n${m.content}`
+      })
+      .join('\n\n---\n\n')
+    try {
+      await navigator.clipboard.writeText(md)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch (e) {
+      console.error('copy failed', e)
+    }
+  }
+
+  // 统计
+  const stats = useMemo(() => {
+    let user = 0, assistant = 0, other = 0
+    for (const m of data.messages) {
+      if (m.role === 'user') user++
+      else if (m.role === 'assistant') assistant++
+      else other++
+    }
+    return { user, assistant, other }
+  }, [data.messages])
+
+  // Esc 关闭
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div className="cmdk-backdrop" onClick={onClose}>
+      <div
+        className="w-[720px] max-w-[94vw] max-h-[86vh] flex flex-col glass-card animate-modal-in"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 标题栏 */}
+        <div className="flex items-center justify-between px-4 h-12 border-b border-[var(--border)] shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-6 h-6 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] flex items-center justify-center shrink-0">
+              <Icon name="file" size={13} />
+            </div>
+            <h2 className="text-[14px] font-semibold truncate" title={data.title}>{data.title}</h2>
+            <span className="text-[10.5px] text-[var(--text-muted)] shrink-0 tnum">
+              {t('home.importMsgCount', { count: data.messages.length })}
+            </span>
+          </div>
+          <button
+            onClick={onClose}
+            className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center shrink-0"
+            title={t('home.cancel')}
+          >
+            <Icon name="close" size={13} />
+          </button>
+        </div>
+
+        {/* 角色分布小条 */}
+        <div className="flex items-center gap-3 px-4 py-2 border-b border-[var(--border)] text-[10.5px] text-[var(--text-muted)] tnum shrink-0">
+          <span className="flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]" />
+            {t('home.importRoleUser')}: {stats.user}
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)]" />
+            {t('home.importRoleAssistant')}: {stats.assistant}
+          </span>
+          {stats.other > 0 && (
+            <span className="flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-[var(--text-muted)]" />
+              {t('home.importRoleOther')}: {stats.other}
+            </span>
+          )}
+          <span className="ml-auto text-[10px] text-[var(--text-muted)]">{t('home.importPreviewHint')}</span>
+        </div>
+
+        {/* 消息列表（只读） */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0">
+          {data.messages.map((m, i) => {
+            const isUser = m.role === 'user'
+            return (
+              <div key={i} className={`flex gap-2.5 ${isUser ? 'flex-row-reverse' : ''}`}>
+                <div
+                  className={`shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-[11px] ${
+                    isUser
+                      ? 'bg-[var(--accent)]/15 text-[var(--accent)]'
+                      : 'bg-[var(--success)]/15 text-[var(--success)]'
+                  }`}
+                  title={m.role}
+                >
+                  {isUser ? '👤' : '🤖'}
+                </div>
+                <div
+                  className={`flex-1 min-w-0 rounded-lg p-2.5 text-[12.5px] leading-relaxed whitespace-pre-wrap break-words modern-card ${
+                    isUser ? 'bg-[var(--accent)]/5' : ''
+                  }`}
+                >
+                  {m.content || <span className="text-[var(--text-muted)] italic">（空消息）</span>}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        {/* 底部操作栏 */}
+        <div className="flex items-center justify-between px-4 h-12 border-t border-[var(--border)] shrink-0">
+          <span className="text-[11px] text-[var(--text-muted)]">{t('home.importReadOnly')}</span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onClose}
+              className="h-7 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              {t('home.cancel')}
+            </button>
+            <button
+              ref={copyRef}
+              onClick={copyAll}
+              className="h-7 px-3 rounded-lg btn-primary text-[12px] active:scale-[0.98] flex items-center gap-1.5"
+            >
+              <Icon name={copied ? 'check' : 'copy'} size={12} white />
+              {copied ? t('home.importCopied') : t('home.importCopyAll')}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+/* ============ Pinned 消息条：会话顶部钉住关键消息（仅前端 localStorage） ============
+ * - 会话长了之后找回"报错信息/关键决策/成功命令"很痛 → 让用户手动 pin
+ * - 数据结构：usePinStore（per conversationId，localStorage 持久化，最多 8 条）
+ * - 点 chip 滚动到该消息（onJump 回调）；点 × 取消 pin
+ * - 静默跳过"已 pin 但消息被删"的孤儿 id
+ */
+
+
+/* ============ 会话笔记（顶部笔记区，per conversation 持久化） ============
+ * - 默认收起（点 "📝 写笔记" 展开）
+ * - 自动保存（debounce 600ms）
+ * - 上限 4000 字（NOTE_MAX_LEN）
+ * - 写过的会话：标题行显示 "📝" 标识 + 摘要预览
+ * - 切换会话时表单值正确同步
+ */
+function ConvNoteBar({ convId }: { convId: string }) {
+  const { t } = useTranslation()
+  const note = useNoteStore((s) => s.notes[convId] ?? null)
+  const setNote = useNoteStore((s) => s.set)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(note?.text ?? '')
+  const debounceRef = useRef<number | null>(null)
+
+  // 切换会话：同步当前 draft 到最新值
+  useEffect(() => {
+    setDraft(note?.text ?? '')
+    setEditing(false)
+  }, [convId, note?.text])
+
+  // debounce 自动保存
+  useEffect(() => {
+    if (!editing) return
+    if (draft === (note?.text ?? '')) return
+    if (debounceRef.current) window.clearTimeout(debounceRef.current)
+    debounceRef.current = window.setTimeout(() => {
+      setNote(convId, draft)
+    }, 600)
+    return () => {
+      if (debounceRef.current) window.clearTimeout(debounceRef.current)
+    }
+  }, [draft, editing, convId, note?.text, setNote])
+
+  // 编辑模式：全屏 textarea
+  if (editing) {
+    return (
+      <div className="mb-3 rounded-lg glass-card border border-[var(--accent)]/30 p-2.5 animate-fade-in">
+        <div className="flex items-center justify-between mb-1.5">
+          <div className="flex items-center gap-1.5 text-[10.5px] font-medium text-[var(--accent)]">
+            <Icon name="edit" size={11} />
+            {t('home.noteEditingTitle')}
+          </div>
+          <div className="flex items-center gap-2">
+            <span className={`text-[10px] tnum ${draft.length > NOTE_MAX_LEN * 0.9 ? 'text-[var(--warning)]' : 'text-[var(--text-muted)]'}`}>
+              {draft.length}/{NOTE_MAX_LEN}
+            </span>
+            <button
+              onClick={() => {
+                setNote(convId, draft)
+                setEditing(false)
+              }}
+              className="text-[10.5px] h-6 px-2 rounded-md btn-primary active:scale-[0.98]"
+            >
+              {t('home.noteDone')}
+            </button>
+          </div>
+        </div>
+        <textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value.slice(0, NOTE_MAX_LEN))}
+          rows={4}
+          autoFocus
+          spellCheck={false}
+          className="w-full resize-y rounded-md bg-[var(--bg-primary)] border border-[var(--border)] px-2.5 py-1.5 text-[12.5px] leading-relaxed outline-none focus:border-[var(--accent)] min-h-[80px] max-h-[200px]"
+          placeholder={t('home.notePlaceholder')}
+        />
+      </div>
+    )
+  }
+
+  // 折叠态：未写过 → 灰提示；写过 → 显示摘要 + 时间
+  return (
+    <div
+      className={`mb-2 rounded-lg border transition-colors ${
+        note
+          ? 'border-[var(--accent)]/20 bg-[var(--accent)]/5'
+          : 'border-dashed border-[var(--border)] bg-[var(--bg-secondary)]/40 hover:border-[var(--accent)]/30'
+      }`}
+    >
+      <button
+        onClick={() => setEditing(true)}
+        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left"
+      >
+        <Icon name="edit" size={11} className={note ? 'text-[var(--accent)]' : 'text-[var(--text-muted)]'} />
+        {note ? (
+          <div className="flex-1 min-w-0">
+            <div className="text-[11.5px] text-[var(--text-primary)] truncate">{note.text.split('\n')[0]}</div>
+            <div className="text-[10px] text-[var(--text-muted)] tnum mt-0.5">
+              {t('home.noteUpdated', { time: new Date(note.updatedAt).toLocaleString() })}
+            </div>
+          </div>
+        ) : (
+          <span className="text-[11.5px] text-[var(--text-muted)] flex-1">{t('home.noteAdd')}</span>
+        )}
+        {note && (
+          <span
+            onClick={(e) => {
+              e.stopPropagation()
+              if (window.confirm(t('home.noteClearConfirm'))) {
+                useNoteStore.getState().clear(convId)
+              }
+            }}
+            className="p-1 text-[var(--text-muted)] hover:text-[var(--danger)] opacity-0 group-hover:opacity-100"
+            title={t('home.noteClear')}
+          >
+            <Icon name="close" size={11} />
+          </span>
+        )}
+      </button>
+    </div>
+  )
+}
+function PinnedBar({ convId, onJump }: { convId: string; onJump: (msgId: string) => void }) {
+  const { t } = useTranslation()
+  // ⚠️ ?? [] 必须在 selector 外：写在 selector 内时无 pin 会话每次返回新数组引用，
+  // useSyncExternalStore 判定快照持续变化 → 无限重渲染（Maximum update depth exceeded）
+  const pins = usePinStore((s) => s.pins[convId]) ?? []
+  const unpin = usePinStore((s) => s.unpin)
+  // 从 store 取消息（避免 prop drilling）
+  const messages = useProjectStore((s) => s.messages)
+  if (pins.length === 0) return null
+  // 过滤已删除的消息 + 按 pin 顺序展示
+  const items = pins
+    .map((id) => messages.find((m) => m.id === id))
+    .filter((m): m is NonNullable<typeof m> => m != null)
+  if (items.length === 0) return null
+  return (
+    <div className="mb-3 rounded-lg glass-card p-2 animate-fade-in">
+      <div className="flex items-center gap-1.5 px-1 mb-1.5">
+        <Icon name="pin" size={11} className="text-[var(--accent)]" />
+        <span className="text-[10.5px] font-medium text-[var(--text-muted)] uppercase tracking-wider">
+          {t('home.pinnedTitle')} · {items.length}
+        </span>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {items.map((m) => {
+          const isUser = m.role === 'user'
+          const preview = m.content.replace(/[#*`>_~\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60)
+          const tone = isUser ? 'var(--accent)' : 'var(--success)'
+          return (
+            <div
+              key={m.id}
+              className="group flex items-center gap-1.5 max-w-[280px] rounded-md bg-[var(--bg-card)] border border-[var(--border)] hover:border-[var(--accent)]/40 transition-colors"
+            >
+              <button
+                onClick={() => onJump(m.id)}
+                className="flex-1 min-w-0 flex items-center gap-1.5 px-2 py-1 text-left"
+                title={m.content}
+              >
+                <span
+                  className="shrink-0 w-1.5 h-1.5 rounded-full"
+                  style={{ background: tone }}
+                />
+                <span className="text-[10.5px] text-[var(--text-muted)] shrink-0">
+                  {isUser ? '👤' : '🤖'}
+                </span>
+                <span className="text-[11.5px] text-[var(--text-primary)] truncate">
+                  {preview || t('home.pinnedEmpty')}
+                </span>
+              </button>
+              <button
+                onClick={() => unpin(convId, m.id)}
+                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger)] transition-all shrink-0"
+                title={t('home.unpinFromTop')}
+              >
+                <Icon name="close" size={10} />
+              </button>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+
+/* ============ 通用确认弹层：替代 window.confirm，支持危险级别 + 自定义文案 ============
+ * - tone: danger（红）/ warn（黄）/ info（蓝）
+ * - confirmLabel: 主按钮文案（默认"确定"）
+ * - requireInput: 需要用户输入指定短语才解锁确认按钮（最严级）
+ * - 用法：调用方用 state 持有回调函数 + 参数 → 渲染时挂 onConfirm/onCancel
+ */
+function ConfirmDialog({ open, title, body, tone = 'danger', confirmLabel, cancelLabel, requireInput, onConfirm, onCancel }: {
+  open: boolean
+  title: string
+  body: string | React.ReactNode
+  tone?: 'danger' | 'warn' | 'info'
+  confirmLabel?: string
+  cancelLabel?: string
+  /** 若提供此短语，用户必须在输入框中键入完全匹配的字符串才解锁确认 */
+  requireInput?: string
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const { t } = useTranslation()
+  const [typed, setTyped] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+  const confirmBtnRef = useRef<HTMLButtonElement>(null)
+
+  // 重置输入态
+  useEffect(() => {
+    if (open) {
+      setTyped('')
+      setTimeout(() => (requireInput ? inputRef.current?.focus() : confirmBtnRef.current?.focus()), 30)
+    }
+  }, [open, requireInput])
+
+  // Esc 取消 / Enter 确认
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        onCancel()
+      } else if (e.key === 'Enter' && !requireInput) {
+        e.preventDefault()
+        onConfirm()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onConfirm, onCancel, requireInput])
+
+  if (!open) return null
+  const canConfirm = !requireInput || typed === requireInput
+  const accent = tone === 'danger' ? 'var(--danger)' : tone === 'warn' ? 'var(--warning)' : 'var(--accent)'
+  const confirmStyle = canConfirm
+    ? { background: accent, color: '#fff' }
+    : { background: 'var(--bg-hover)', color: 'var(--text-muted)' }
+
+  return (
+    <div className="cmdk-backdrop" onClick={onCancel}>
+      <div
+        className="w-[440px] max-w-[92vw] glass-card p-4 animate-modal-in"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 图标 + 标题 */}
+        <div className="flex items-start gap-3 mb-3">
+          <div
+            className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
+            style={{ background: `${accent}20`, color: accent }}
+          >
+            <Icon name={tone === 'info' ? 'info' : 'archive'} size={18} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-[14px] font-semibold leading-snug">{title}</h3>
+            <div className="mt-1.5 text-[12.5px] text-[var(--text-secondary)] leading-relaxed">{body}</div>
+          </div>
+        </div>
+
+        {/* 危险操作需要用户输入确认短语（防误触） */}
+        {requireInput && (
+          <div className="mb-3">
+            <label className="block text-[11px] text-[var(--text-muted)] mb-1.5">
+              {t('home.confirmTypePhrase', { phrase: requireInput })}
+            </label>
+            <input
+              ref={inputRef}
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              spellCheck={false}
+              autoComplete="off"
+              className="w-full rounded-lg modern-card px-2.5 py-1.5 text-[12.5px] font-mono outline-none focus:border-[var(--accent)]"
+              placeholder={requireInput}
+            />
+          </div>
+        )}
+
+        {/* 操作按钮 */}
+        <div className="flex items-center justify-end gap-2 mt-1">
+          <button
+            onClick={onCancel}
+            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12.5px] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            {cancelLabel ?? t('home.cancel')}
+          </button>
+          <button
+            ref={confirmBtnRef}
+            onClick={onConfirm}
+            disabled={!canConfirm}
+            style={confirmStyle}
+            className="h-8 px-3 rounded-lg text-[12.5px] font-medium active:scale-[0.98] disabled:cursor-not-allowed transition-colors"
+          >
+            {confirmLabel ?? t('home.confirm')}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+/* ============ 审计日志查看页：表格列出所有敏感操作（localStorage 持久化，上限 200） ============
+ * - 顶部：标题 + 清空按钮 + 分类过滤 chips
+ * - 主体：时间 / 分类 / 名称 / 详情（按时间倒序）
+ * - 底部：记录条数
+ */
+function AuditDialog({ onClose }: { onClose: () => void }) {
+  const { t } = useTranslation()
+  const entries = useAuditStore((s) => s.entries)
+  const clear = useAuditStore((s) => s.clear)
+  const [filter, setFilter] = useState<'all' | AuditCategory>('all')
+
+  // Esc 关闭
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const filtered = useMemo(
+    () => (filter === 'all' ? entries : entries.filter((e) => e.category === filter)).slice().sort((a, b) => b.ts - a.ts),
+    [entries, filter],
+  )
+
+  // 分类 chips 计数
+  const counts = useMemo(() => {
+    const map: Record<string, number> = { all: entries.length }
+    for (const e of entries) map[e.category] = (map[e.category] ?? 0) + 1
+    return map
+  }, [entries])
+
+  // 时间格式：YYYY-MM-DD HH:mm:ss
+  const fmtTs = (ts: number) => {
+    const d = new Date(ts)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  }
+
+  // 分类 → i18n label
+  const catLabel = (c: AuditCategory) => t(`home.auditCat.${c}`)
+
+  return (
+    <div className="cmdk-backdrop" onClick={onClose}>
+      <div
+        className="w-[820px] max-w-[94vw] max-h-[86vh] flex flex-col glass-card animate-modal-in"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 标题栏 */}
+        <div className="flex items-center justify-between px-4 h-12 border-b border-[var(--border)] shrink-0">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] flex items-center justify-center">
+              <Icon name="history" size={13} />
+            </div>
+            <h2 className="text-[14px] font-semibold">{t('home.auditTitle')}</h2>
+            <span className="text-[10.5px] text-[var(--text-muted)] tnum">
+              {t('home.auditCount', { count: entries.length })}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                if (entries.length === 0) return
+                if (window.confirm(t('home.auditClearConfirm'))) clear()
+              }}
+              disabled={entries.length === 0}
+              className="h-7 px-2.5 rounded-md border border-[var(--border)] text-[11.5px] text-[var(--danger)] hover:bg-[var(--danger)]/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              {t('home.auditClear')}
+            </button>
+            <button
+              onClick={onClose}
+              className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center"
+              title={t('home.cancel')}
+            >
+              <Icon name="close" size={13} />
+            </button>
+          </div>
+        </div>
+
+        {/* 分类过滤 chips */}
+        <div className="flex items-center gap-1.5 px-4 py-2 border-b border-[var(--border)] overflow-x-auto shrink-0">
+          <button
+            onClick={() => setFilter('all')}
+            className={`shrink-0 px-2 py-0.5 rounded-md text-[11px] transition-colors ${
+              filter === 'all' ? 'tab-active' : 'tab-inactive'
+            }`}
+          >
+            {t('home.auditCatAll')} ({counts.all ?? 0})
+          </button>
+          {(Object.keys(counts) as string[]).filter((c) => c !== 'all' && counts[c] > 0).map((c) => (
+            <button
+              key={c}
+              onClick={() => setFilter(c as AuditCategory)}
+              className={`shrink-0 px-2 py-0.5 rounded-md text-[11px] transition-colors ${
+                filter === c ? 'tab-active' : 'tab-inactive'
+              }`}
+            >
+              {catLabel(c as AuditCategory)} ({counts[c]})
+            </button>
+          ))}
+        </div>
+
+        {/* 列表 */}
+        <div className="flex-1 overflow-y-auto min-h-0">
+          {filtered.length === 0 ? (
+            <p className="px-4 py-12 text-center text-[13px] text-[var(--text-muted)]">
+              {t('home.auditEmpty')}
+            </p>
+          ) : (
+            <table className="w-full text-[12px]">
+              <thead className="sticky top-0 bg-[var(--bg-card)] z-10">
+                <tr className="border-b border-[var(--border)] text-[var(--text-muted)]">
+                  <th className="text-left px-3 py-2 font-medium">{t('home.auditTime')}</th>
+                  <th className="text-left px-3 py-2 font-medium">{t('home.auditCategory')}</th>
+                  <th className="text-left px-3 py-2 font-medium">{t('home.auditName')}</th>
+                  <th className="text-left px-3 py-2 font-medium">{t('home.auditDetail')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((e) => (
+                  <tr key={e.id} className="border-b border-[var(--border)] last:border-0 align-top hover:bg-[var(--bg-hover)]">
+                    <td className="px-3 py-2 whitespace-nowrap font-mono text-[11px] text-[var(--text-secondary)] tnum">{fmtTs(e.ts)}</td>
+                    <td className="px-3 py-2">
+                      <span className="px-1.5 py-0.5 rounded text-[10.5px] bg-[var(--accent)]/10 text-[var(--accent)]">
+                        {catLabel(e.category)}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 max-w-[180px] truncate" title={e.label}>{e.label}</td>
+                    <td className="px-3 py-2 max-w-[320px] text-[var(--text-secondary)]">
+                      {e.detail ? (
+                        <span className="line-clamp-2" title={e.detail}>{e.detail}</span>
+                      ) : (
+                        <span className="text-[var(--text-muted)]">—</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -4621,9 +8017,11 @@ function MessageItem({
 
 /* ============ 设置菜单项 ============ */
 const settingsItems: { path: string; labelKey: string; icon: IconName }[] = [
+  { path: '/lan', labelKey: 'nav.lan', icon: 'devices' },
   { path: '/providers', labelKey: 'nav.provider', icon: 'bolt' },
   { path: '/versions', labelKey: 'nav.version', icon: 'package' },
   { path: '/config', labelKey: 'nav.config', icon: 'settings' },
+  { path: '/limits', labelKey: 'nav.limits', icon: 'tune' },
   { path: '/cost', labelKey: 'nav.cost', icon: 'payments' },
   { path: '/proxy', labelKey: 'nav.proxy', icon: 'proxy' },
   { path: '/mcp', labelKey: 'nav.mcp', icon: 'mcp' },
@@ -4631,4 +8029,8 @@ const settingsItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/knowledge', labelKey: 'nav.knowledge', icon: 'skill' },
   { path: '/api-knowledge', labelKey: 'nav.apiKnowledge', icon: 'package' },
   { path: '/health', labelKey: 'nav.health', icon: 'health' },
+  { path: '/ohpm', labelKey: 'nav.ohpm', icon: 'apps' },
 ]
+
+
+

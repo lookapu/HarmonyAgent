@@ -429,6 +429,27 @@ export const mcpTemplates: McpTemplate[] = [
     description: 'npm 包搜索：查询包信息、版本、描述（无需 API Key）',
     homepage: 'https://modelcontextprotocol.io/',
   },
+  {
+    key: 'deveco-mcp',
+    name: 'DevEco Toolbox',
+    command: ['npx', '-y', 'deveco-mcp-server'],
+    description: '鸿蒙开发工具集（open-deveco 社区）：ArkTS 语法检查 check_ets_files（基于官方 LSP）、构建、启动应用、UI 树、hilog/faultlog 日志，依赖 DevEco Studio',
+    recommended: 'popular',
+    envHint: 'PROJECT_PATH=<鸿蒙工程根目录>, DEVECO_PATH=<DevEco Studio 安装路径>',
+    envDefs: [
+      {
+        key: 'PROJECT_PATH',
+        placeholder: 'D:/work/harmony-project',
+        hint: '鸿蒙工程根目录（含 oh-package.json5 的目录）；若 IDE 不支持 ${workspaceFolder} 需手动替换为实际路径',
+      },
+      {
+        key: 'DEVECO_PATH',
+        placeholder: 'C:/Program Files/Huawei/DevEco Studio',
+        hint: 'DevEco Studio 安装路径（必填，工具箱依赖其 SDK 与内置 LSP；缺失时 check_ets_files 等工具不可用）。若启动报 "Platform package deveco-mcp-server-xxx not found"，说明 npm 镜像未同步，需在命令中加入 --registry= 参数',
+      },
+    ],
+    homepage: 'https://github.com/open-deveco/deveco-toolbox',
+  },
 ]
 
 /** 根据命令字符串智能识别模板 */

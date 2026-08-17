@@ -26,6 +26,7 @@ mod pipeline;
 mod project_tools;
 mod protocol;
 mod quality_tools;
+mod skill_tools;
 mod test_tools;
 mod ui_tools;
 mod web_tools;
@@ -81,6 +82,7 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("diff_api_versions", "build"),
     ("oh_package", "build"),
     ("ohpm_install", "build"),
+    ("ohpm_recommend", "build"),
     ("ohpm_search", "build"),
     ("refresh_api_db", "build"),
     ("refresh_api_details", "build"),
@@ -300,6 +302,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "拉取设备 faultlog 中最近的崩溃记录并归因（JS Crash / Native Crash / App Freeze）。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省当前工程>\",\"limit\":<可选最近 N 条 1-10，缺省 3>}。\n流程：扫描 /data/log/faultlog 下崩溃文件 → 按 bundle 过滤取最近 N 条 → 拉到工程 .deveco-agent/crashes/ → 提取异常类型/Reason/堆栈关键行。\n与 read_runtime_logs 互补：本工具看的是崩溃发生后的历史取证（含退出时的完整堆栈）；目录权限受限时回退用 read_runtime_logs。\n副作用：在工程 .deveco-agent/crashes 写入崩溃文件副本。\n返回：每条崩溃的类型、时间、关键堆栈与本地文件路径。",
     },
     ToolSpec {
+        name: "ohpm_recommend",
+        desc: "基于 ohpm 官方 landscape（开源技术图谱）的本地缓存，离线推荐/检索三方库——含四级分类、描述、关键词、60 天下载量与官方点赞/流行度/发布时间，支持热度/最受欢迎/最流行/最新发布排序。\n参数：{\"keyword\":\"<可选，包名或关键字，如 router、图表 chart>\",\"category\":\"<可选，一级分类名，如 网络通信、UI框架，中文英文皆可>\",\"order\":\"<可选排序：likes=最受欢迎 / popularity=最流行 / latest=最新发布，缺省按下载量>\",\"top\":<可选返回条数，缺省 8>}。\n适合：写代码前选库（哪个库热门/分类匹配）、快速了解生态现状；不带任何参数时返回当前最热门三方库。\n数据由应用定期从官方接口拉取缓存（健康检查页可手动刷新），可能滞后于仓库实时状态；需要确认最新版本/依赖时改用 ohpm_search（在线查询）或直接 ohpm_install 安装。\n副作用：无（只读本地缓存）。\n返回：匹配/热门包列表（包名、版本、60天下载量、许可证、分类、描述）与后续安装/查询指引。",
+    },
+    ToolSpec {
         name: "ohpm_search",
         desc: "在 ohpm 官方仓库搜索三方库（ohpm search），确认包是否存在与可用版本。\n参数：{\"keyword\":\"<包名或关键字>\",\"detail\":<可选 true 时追加 ohpm info 查询版本/依赖详情>}。\n适合：写代码前确认三方库在 ohpm 仓库的可用性/版本、查依赖包说明；确认后可 ohpm_install package=<包名> 安装。\n副作用：无（只读仓库索引）。\n返回：搜索/详情结果。",
     },
@@ -401,7 +407,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "read_file",
-        desc: "读取文本文件内容（UTF-8，自动识别二进制并拒绝；超过 1MB 的文件拒绝整读）。\n参数：{\"path\":\"<文件路径，相对项目根或用户指明目录，或绝对路径>\",\"start\":<可选起始行号，从 1 起，缺省 1>,\"lines\":<可选读取行数，缺省全部>,\"outline\":<可选，true 时只返回文件骨架（类/函数/接口/组件等签名及行号），用于先快速了解大文件结构再精读>}。\n读取窗口按语言代码块自动对齐（语言感知）：起点若落在方法/函数内部会从方法首行开始，末尾若仍在块内会补齐到块结束符——绝不把方法截断在中间漏掉结束符；块补齐场景输出上限放宽到 40000 字符。\n注释清洗：代码文件注释占比高时，连续长注释块（≥8 行，如 license/文件头说明）自动折叠为一行摘要，避免注释吃掉预算导致代码本身被截断；折叠处提示行号区间，可用 start/lines 精读原文，文件头会标注注释占比与折叠统计。\n普通模式单次最多 2000 行 / 15000 字符，超出自动截断并提示续读方式。\n大文件建议先 outline=true 看骨架，再用 start/lines 精读目标段落。\n适合查看源码、配置文件、日志。\n副作用：无（只读）。\n返回：带行号的文件内容（完整代码块）；outline 模式返回结构大纲。",
+        desc: "读取文本文件（UTF-8；二进制/超 1MB 拒绝整读）。\n参数：{\"path\":\"<路径，相对项目根或绝对路径>\",\"start\":<可选起始行号，1 起>,\"lines\":<可选行数，缺省全部>,\"outline\":<可选 true 只返回骨架（类/函数/组件等签名，嵌套定义按层级缩进），先快速了解大文件结构再精读>,\"outline_page\":<可选骨架分页（1 起，每页 200 条），结构项多时翻页查看，输出标注总页数与翻页提示>,\"outline_filter\":<可选类型过滤，如 \"函数\"/\"类型\"/\"组件\"：只显示该类条目，分页在过滤后集合上进行>}。\n读取窗口按语言代码块自动对齐：起点落在方法内部会从方法首行开始，末尾仍在块内会补齐到块结束符——绝不把方法截断在中间；块补齐场景输出上限放宽到 40000 字符。\n注释清洗：连续长注释块（≥8 行，如 license 头）自动折叠为一行摘要（标注行号区间，可 start/lines 精读原文），文件头标注折叠统计。\noutline 行号列为「定义行-块尾行」区间（块对齐联动）：read_file {\"start\":区间起点,\"lines\":区间长度} 整读该方法；edit_file {\"start\":区间起点} 整块替换/删除。\n普通模式单次最多 2000 行 / 15000 字符，超出自动截断并提示续读。大文件建议先 outline 看骨架再按区间精读。\n副作用：无（只读）。\n返回：带行号的文件内容（完整代码块）；outline 模式返回结构大纲（含块区间）。",
     },
     ToolSpec {
         name: "find_files",
@@ -409,19 +415,19 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "grep_files",
-        desc: "在项目文件中按文本内容搜索（缺省不区分大小写）。\n参数：{\"pattern\":\"<搜索关键词>\",\"path\":<可选搜索起点，缺省项目根>,\"glob\":<可选文件类型过滤，如 *.ets>,\"case_sensitive\":<可选，true 区分大小写>,\"block\":<可选，true 时命中给出所在完整代码块（方法/函数整体，语言感知成对匹配），最多展开前 5 条，便于直接编辑整个方法>}。\n自动跳过忽略目录（遵循项目 .gitignore，含子目录）、二进制文件与超大文件，最多返回 50 条命中；命中行为注释时标注 [注释]，便于区分代码逻辑位置与说明性位置。\n适合查找 API 用法、错误信息出处。\n副作用：无（只读）。\n返回：文件路径:行号: 命中行（block=true 时含完整代码块）。",
+        desc: "在项目文件中按内容搜索（缺省不区分大小写）。\n参数：{\"pattern\":\"<搜索关键词或正则>\",\"path\":<可选搜索起点，缺省项目根>,\"glob\":<可选文件类型过滤，如 *.ets>,\"case_sensitive\":<可选，true 区分大小写>,\"regex\":<可选 true：pattern 按正则解释（如 foo\\s*\\(、Vec<\\w+>），大小写仍由 case_sensitive 控制；反斜杠在 JSON 参数中需双写（\\d 写作 \\\\d），非法正则会报错并提示>},\"block\":<可选，true 时命中给出所在完整代码块（方法/函数整体，语言感知成对匹配），最多展开前 5 条，便于直接编辑整个方法>}。\n自动跳过忽略目录（遵循 .gitignore 含子目录）、二进制与超大文件，最多返回 50 条命中；命中行为注释时标注 [注释]。\n适合查找 API 用法、错误信息出处、按模式批量定位（正则 + block 组合可先看整个方法再决定怎么改）。\n副作用：无（只读）。\n返回：文件路径:行号: 命中行（block=true 时含完整代码块）。",
     },
     ToolSpec {
         name: "write_file",
-        desc: "写入/覆盖文本文件（UTF-8，单次 ≤1MB，自动创建父目录）。\n参数：{\"path\":\"<文件路径，相对项目根>\",\"content\":\"<完整文件内容>\",\"dry_run\":<可选 true 只预览不落盘>}。\n注意：会覆盖目标文件现有内容，写入前请先用 read_file 确认现有内容（需要修改少量内容时优先用 edit_file）；先 dry_run 预览再落盘可避免误覆盖。\n转义提示：content 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行。若文件自上次读取后被外部修改（IDE/用户/其他会话），写入会被拒绝并提示重新读取。\n副作用：修改/创建项目内文件（dry_run=true 时无副作用）。\n返回：写入结果与字节数。",
+        desc: "写入/覆盖文本文件（UTF-8，单次 ≤1MB，自动创建父目录）。\n参数：{\"path\":\"<文件路径，相对项目根>\",\"content\":\"<完整文件内容>\",\"dry_run\":<可选 true 只预览不落盘>}。\n注意：会覆盖目标文件现有内容，写入前请先用 read_file 确认现有内容（需要修改少量内容时优先用 edit_file）；先 dry_run 预览再落盘可避免误覆盖。\n转义提示：content 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行。代码文件内置配平守卫：内容括号失衡（漏 } 等）会拒绝落盘（与 edit_file 同口径）。若文件自上次读取后被外部修改（IDE/用户/其他会话），写入会被拒绝并提示重新读取。\n副作用：修改/创建项目内文件（dry_run=true 时无副作用）。\n返回：写入结果与字节数。",
     },
     ToolSpec {
         name: "edit_file",
-        desc: "修改文件，两种模式：old 精确文本替换，或 start 按「完整代码块」整体替换（推荐编辑/删除整个方法，不固定行数、不会漏块结束符）。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文片段（模式一），须与文件内容完全一致>\",\"new\":\"<替换后内容；模式二 new 为空=整块删除>\",\"replace_all\":<可选，true 替换全部出现处，缺省仅替换第一处>,\"start\":<可选行号（模式二）：按语言感知的成对 {}() 匹配定位该行所在「完整方法/代码块」并整体替换，块有多长操作多长>,\"dry_run\":<可选 true 只返回 unified diff 不落盘>}。\nold 与 start 互斥（不能同时给）；改动前建议先 dry_run 预览 diff。\n转义提示：old/new 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行，old 会匹配失败。\n文件 ≤1MB；old 不匹配时返回错误并提示附近内容。若文件自上次读取后被外部修改（IDE/用户/其他会话），编辑会被拒绝并提示重新读取。\n副作用：修改项目内文件（dry_run=true 时无副作用）。\n返回：替换处数与位置（start 模式返回块行区间）。",
+        desc: "修改文件，三种模式：old 精确文本替换、start 按「完整代码块」整体替换（推荐编辑/删除整个方法，不固定行数、不漏块结束符）、starts 批量块替换（一次改多个方法）。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文片段（模式一），须与文件内容完全一致>\",\"new\":\"<替换后内容；模式二 new 为空=整块删除>\",\"replace_all\":<可选，true 替换全部出现处，缺省仅第一处>,\"start\":<可选行号（模式二）：语言感知成对 {}() 定位该行所在完整代码块整体替换，块多长操作多长>,\"anchor\":<可选块锚签名（模式二）：块定义行内容片段（如 \"fn parse\"），行号漂移时 ±100 行内自动重定位，找不到则拒绝，防改错块>,\"starts\":<可选行号数组（模式三）：一次定位多个完整块批量替换/删除，与 news 一一对应>,\"news\":<模式三各块新内容数组（空串=整块删除）>,\"anchors\":<可选模式三各块锚签名数组，与 starts 等长（不用锚的项传 null）>,\"dry_run\":<可选 true 只返回 diff 不落盘>}。\nold/start/starts 互斥；块模式内置配平守卫（新内容漏 } 拒绝落盘）；批量块重叠拒绝、只写一个 undo 快照（一次全恢复）；建议先 dry_run 或 preview_edit 预览。\n转义提示：换行写 \\n；字面量「反斜杠+n」（如 [^\\n]*）须写 \\\\n 双重转义。\n文件 ≤1MB；old 不匹配报错并提示附近内容；文件被外部修改后编辑被拒，需重新 read_file。\n副作用：修改项目内文件（dry_run 无副作用）。\n返回：替换处数与位置（块模式返回各块行区间明细）。",
     },
     ToolSpec {
         name: "preview_edit",
-        desc: "预览文件编辑的 diff（不落盘，只读）：与 edit_file 相同的参数（path/old/new/replace_all/start），但只计算并返回 unified diff（含 @@ 行号、上下文、新增/删除行统计），文件不会被修改。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文本，需唯一>\",\"new\":\"<新文本>\",\"replace_all\":<可选，全部替换>,\"start\":<可选起始行>}。\n适合：编辑前先给用户展示改动（信任感），确认后同参数调用 edit_file 应用；或连续编辑出错时先预览再落盘。\n副作用：无（只读）。\n返回：unified diff 文本 + 统计；确认后必须用 edit_file 应用同一修改。",
+        desc: "预览文件编辑的 diff（不落盘，只读）：与 edit_file 相同的参数（path/old/new/replace_all/start/anchor/starts/news/anchors），只计算并返回 unified diff（含 @@ 行号、上下文、增删行统计），文件不会被修改。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文本，需唯一>\",\"new\":\"<新文本>\",\"replace_all\":<可选，全部替换>,\"start\":<可选行号：语言感知定位该行所在完整代码块，diff 即整块替换效果>,\"anchor\":<可选块锚签名：块定义行内容片段，行号漂移时自动重定位>,\"starts\":<可选批量模式：行号数组一次预览多个块的替换/删除，与 news 一一对应>}。\n与 edit_file 完全同口径：超界显式报错、anchor 重定位、块重叠校验——预览即拦截错误定位，不用等落盘才发现改错块。\n适合：编辑前先展示改动（信任感），确认后同参数调用 edit_file 应用；批量重构前先整体过目 diff。\n副作用：无（只读）。\n返回：unified diff 文本 + 统计；确认后必须用 edit_file 应用同一修改。",
     },
     ToolSpec {
         name: "run_command",
@@ -658,6 +664,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_mcp_servers",
         desc: "列出当前项目可用的 MCP 服务器及其工具清单、连接健康状态。\n参数：{\"detail\":<可选 true 时逐个连接并列出每台服务器的工具名（缺省 false 只列服务器元数据与最近测试状态）>}。\n与 mcp__服务器__工具 直接调用配合：先本工具摸底有哪些服务器/工具可用，再决定调用哪个；服务器连接失败时返回具体原因（如命令不存在、端口被占）。\n副作用：detail=true 时会尝试连接所有已启用服务器（失败的会被标记，本次运行内不再重试）。\n返回：服务器列表（名称/启用状态/描述/最近测试结果）+ 可选工具清单。",
+    },
+    ToolSpec {
+        name: "use_skill",
+        desc: "声明正在使用某个 Skill 并记录一次调用，返回该技能的完整指令（SKILL.md）。\n参数：{\"name\":\"<技能名>\"}（与技能管理页展示的名称一致，同名时项目级技能优先）。\n用法：系统提示的技能库中出现、且当前任务适用该技能时，先调用本工具声明，再严格按返回的指令执行；调用后该技能计入调用统计。\n副作用：写入一条技能调用记录（skill_usage 表，供技能管理页/统计页展示）。\n返回：技能描述与完整指令；技能未安装或未启用时返回错误（可在技能管理页启用）。",
     },
     ToolSpec {
         name: "plan_task",
@@ -1102,7 +1112,7 @@ pub async fn run_tool(
         // roots.first() 即自动落到鸿蒙工程上；未配置时鸿蒙根=项目根本身，去重不重复插入。
         if !project_id.trim().is_empty() {
             if let Ok(conn) = db.0.lock() {
-                if let Ok(info) = crate::commands::project::resolve_harmony_root(&conn, project_id) {
+                if let Ok(info) = crate::commands::project::resolve_harmony_root(&conn, project_id, Some(project_path)) {
                     if !info.root.is_empty() && !roots.iter().any(|r| r == &info.root) {
                         roots.push(info.root);
                     }
@@ -1136,6 +1146,7 @@ pub async fn run_tool(
         "device_shell" => device_tools::device_shell(&args).await,
         "analyze_crash" => device_tools::analyze_crash(&args, &roots).await,
         "ohpm_search" => build_tools::ohpm_search(&args).await,
+        "ohpm_recommend" => build_tools::ohpm_recommend(&args, db).await,
         "build_project" => build_tools::build_project(&args, &roots, ctx, project_id).await,
         "deploy" => build_tools::deploy(&args, &roots, ctx, project_id).await,
         "ohpm_install" => build_tools::ohpm_install(&args, &roots).await,
@@ -1220,6 +1231,7 @@ pub async fn run_tool(
         "manage_memory" => memory_tools::manage_memory(&args, project_id, db).await,
         "manage_knowledge" => memory_tools::manage_knowledge(&args, project_id, db).await,
         "list_mcp_servers" => memory_tools::list_mcp_servers(&args, project_id, db, mcp).await,
+        "use_skill" => skill_tools::use_skill(&args, &ctx.conversation_id, project_id, db).await,
         "review_changes" => git_tools::review_changes(&args, &roots).await,
         "plan_task" => memory_tools::plan_task(&args, ctx).await,
         "update_progress" => memory_tools::update_progress(&args, ctx).await,
@@ -4043,7 +4055,7 @@ mod tests {
             "}",
         ];
         let lines: Vec<&str> = src.iter().copied().collect();
-        let out = super::fs_tools::render_outline(Path::new("Index.ets"), &lines, 500);
+        let out = super::fs_tools::render_outline(Path::new("Index.ets"), &lines, 500, 1, None);
         assert!(out.contains("装饰器"), "应识别 @Entry/@Component：{out}");
         assert!(out.contains("组件"), "应识别 struct Index：{out}");
         assert!(out.contains("aboutToAppear"), "应识别方法：{out}");
@@ -4067,7 +4079,7 @@ mod tests {
             "fn helper() -> bool { true }",
         ];
         let lines: Vec<&str> = src.iter().copied().collect();
-        let out = super::fs_tools::render_outline(Path::new("a.rs"), &lines, 200);
+        let out = super::fs_tools::render_outline(Path::new("a.rs"), &lines, 200, 1, None);
         assert!(out.contains("pub struct Foo"));
         assert!(out.contains("pub async fn run"));
         assert!(out.contains("fn helper"));

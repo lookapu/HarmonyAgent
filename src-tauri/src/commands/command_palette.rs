@@ -54,6 +54,7 @@ pub fn list_palette_commands() -> Vec<PaletteEntry> {
     items.push(nav("/proxy", "代理设置", "导航", "proxy"));
     items.push(nav("/mcp", "MCP 服务", "导航", "mcp"));
     items.push(nav("/skills", "技能管理", "导航", "skill"));
+    items.push(nav("/skills/stats", "技能调用统计", "导航", "history"));
     items.push(nav("/knowledge", "知识库", "导航", "skill"));
     items.push(nav("/api-knowledge", "API 知识库", "导航", "package"));
     items.push(nav("/health", "运行健康检查", "导航", "health"));

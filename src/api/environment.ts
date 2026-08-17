@@ -46,6 +46,7 @@ export interface ToolCandidate {
 export const installToolkitFromZip = (name: string, zipPath: string) =>
   invoke<string>('install_toolkit_from_zip', { name, zipPath })
 
+
 /** 枚举某工具的所有候选环境目录（自定义 > 软件内置 > DevEco Studio > 系统 PATH） */
 export const getToolchainCandidates = (name: string, customPaths: string[]) =>
   invoke<ToolCandidate[]>('get_toolchain_candidates', { name, customPaths: customPaths ?? [] })

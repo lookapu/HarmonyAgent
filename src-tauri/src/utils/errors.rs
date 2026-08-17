@@ -165,6 +165,16 @@ pub fn provider_error(status: u16, body: &str) -> FriendlyError {
     } else {
         classify_status(status)
     };
+    // 图片类 4xx（模型不支持多模态输入，如纯文本模型收到 image_url）：给针对性建议
+    let image_related = lower.contains("image_url")
+        || lower.contains("unknown variant")
+        || lower.contains("multimodal")
+        || lower.contains("image input");
+    let suggestion = if image_related && kind == ErrorKind::Client {
+        "当前模型不支持图片输入（多模态），请切换到支持图片的模型，或移除图片后重试".to_string()
+    } else {
+        kind.suggestion().to_string()
+    };
     let reason = extract_error_message(body).unwrap_or_else(|| {
         let t = body.trim();
         if t.is_empty() {
@@ -177,7 +187,7 @@ pub fn provider_error(status: u16, body: &str) -> FriendlyError {
         kind,
         title: kind.title().to_string(),
         reason,
-        suggestion: kind.suggestion().to_string(),
+        suggestion,
         status_code: Some(status),
         retry_after_secs: None,
     }
@@ -314,6 +324,22 @@ mod tests {
         assert_eq!(fe.kind, ErrorKind::Auth);
         assert_eq!(fe.reason, "Invalid API key");
         assert_eq!(fe.status_code, Some(401));
+    }
+
+    #[test]
+    fn test_provider_error_image_not_supported_suggestion() {
+        let body = r#"{"error":{"message":"Failed to deserialize the JSON body into the target type: messages[62]: unknown variant `image_url`, expected `text`"}}"#;
+        let fe = provider_error(400, body);
+        assert_eq!(fe.kind, ErrorKind::Client);
+        assert!(fe.suggestion.contains("图片"), "suggestion: {}", fe.suggestion);
+        assert!(fe.reason.contains("image_url"));
+    }
+
+    #[test]
+    fn test_provider_error_normal_client_suggestion_unchanged() {
+        let fe = provider_error(400, r#"{"error":{"message":"bad request"}}"#);
+        assert_eq!(fe.kind, ErrorKind::Client);
+        assert_eq!(fe.suggestion, ErrorKind::Client.suggestion());
     }
 
     #[test]

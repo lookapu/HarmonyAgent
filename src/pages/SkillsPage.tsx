@@ -1,22 +1,40 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { listSkills, importSkillFromGithub, toggleSkill, removeSkill, cloneSkill, type Skill } from '../api/skill'
+import {
+  listSkills,
+  importSkillFromGithub,
+  toggleSkill,
+  removeSkill,
+  cloneSkill,
+  listSkillUsage,
+  listSkillUsageEvents,
+  type Skill,
+  type SkillUsageEvent,
+  type SkillUsageStat,
+} from '../api/skill'
 import { skillTemplates, type SkillTemplate } from '../data/skillTemplates'
 import { useProjectStore } from '../stores/projectStore'
 import Icon from '../icons/Icon'
 
-/** 从 GitHub 地址（URL / git@ / owner/name）提取 owner 和 name */
+/** 从 Git 仓库地址（GitHub/Gitee 的 URL / git@ / owner/name）提取 owner 和 name */
 function parseGithubUrl(input: string): { owner: string; name: string } | null {
   const s = input.trim().replace(/\/+$/, '')
   if (!s) return null
   let rest = s
-    .replace(/^https?:\/\/github\.com\//i, '')
-    .replace(/^git@github\.com:/, '')
+    .replace(/^https?:\/\/(github|gitee)\.com\//i, '')
+    .replace(/^git@(github|gitee)\.com:/, '')
     .replace(/\.git$/i, '')
   rest = rest.split(/[?#]/)[0]
   const parts = rest.split('/').filter(Boolean)
   if (parts.length >= 2) return { owner: parts[0], name: parts[1] }
   return null
+}
+
+/** unix 秒 → 本地日期 + 时分 */
+function fmtTime(t: number | null): string {
+  if (!t) return '—'
+  const d = new Date(t * 1000)
+  return `${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
 }
 
 export default function SkillsPage() {
@@ -26,7 +44,15 @@ export default function SkillsPage() {
   const projectId = currentProject ? currentProject.id : null
   const [scope, setScope] = useState<'global' | 'project'>('global')
   const effectiveScope: 'global' | 'project' = projectId ? scope : 'global'
+  /** 视图切换：技能列表 / 使用统计 */
+  const [view, setView] = useState<'skills' | 'usage'>('skills')
   const [skills, setSkills] = useState<Skill[]>([])
+  // skill_id -> 调用统计（use_skill 工具落库）
+  const [usageMap, setUsageMap] = useState<Record<string, SkillUsageStat>>({})
+  /** 使用统计（按技能聚合 + 最近调用时间线） */
+  const [usageStats, setUsageStats] = useState<SkillUsageStat[]>([])
+  const [usageEvents, setUsageEvents] = useState<SkillUsageEvent[]>([])
+  const [usageLoading, setUsageLoading] = useState(false)
   const [showForm, setShowForm] = useState(false)
   const [repoUrl, setRepoUrl] = useState('')
   const [branch, setBranch] = useState('')
@@ -39,14 +65,40 @@ export default function SkillsPage() {
   // useCallback 稳定引用：projectId 变化时 load 重建触发 effect，避免每次渲染重复加载
   const load = useCallback(async () => {
     try {
-      const list = await listSkills(projectId)
+      // 技能列表与调用统计并行加载，避免串行阻塞
+      const [list, usage] = await Promise.all([listSkills(projectId), listSkillUsage(projectId)])
       setSkills(list)
+      setUsageMap(Object.fromEntries(usage.map((u) => [u.skill_id, u])))
     } catch (e) {
       console.error(e)
     }
   }, [projectId])
 
   useEffect(() => { load() }, [load])
+
+  // 使用统计：全局视图统计全部项目，项目视图仅当前项目；进入统计视图时才拉取
+  const loadUsage = useCallback(async () => {
+    const pid = effectiveScope === 'project' ? projectId : null
+    setUsageLoading(true)
+    try {
+      const [usage, evs] = await Promise.all([
+        listSkillUsage(pid),
+        listSkillUsageEvents(pid, 200),
+      ])
+      setUsageStats(usage)
+      setUsageEvents(evs)
+    } catch (e) {
+      console.error(e)
+      setUsageStats([])
+      setUsageEvents([])
+    } finally {
+      setUsageLoading(false)
+    }
+  }, [effectiveScope, projectId])
+
+  useEffect(() => {
+    if (view === 'usage') void loadUsage()
+  }, [view, loadUsage])
 
   const visibleSkills = useMemo(
     () => skills.filter((s) => effectiveScope === 'global' ? !s.project_id : s.project_id === projectId),
@@ -129,30 +181,61 @@ export default function SkillsPage() {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h2 className="text-xl font-semibold">{t('skill.title')}</h2>
-          <p className="text-xs text-[var(--text-secondary)] mt-1">{t('skill.importTitle')}</p>
+          <p className="text-xs text-[var(--text-secondary)] mt-1">
+            {view === 'usage' ? t('skillStats.desc') : t('skill.importTitle')}
+          </p>
         </div>
+        {view === 'skills' && (
+          <button
+            onClick={() => setShowForm(!showForm)}
+            className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium  active:scale-[0.98] transition-all shadow-lg shadow-[var(--accent)]/15"
+          >
+            <span className="flex items-center gap-1.5">
+              <Icon name={showForm ? 'close' : 'download'} size={14} white />
+              {showForm ? t('mcp.cancel') : t('skill.installHint')}
+            </span>
+          </button>
+        )}
+      </div>
+
+      {/* 视图切换：技能列表 / 使用统计 */}
+      <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[12px]">
         <button
-          onClick={() => setShowForm(!showForm)}
-          className="h-9 px-4 rounded-[10px] bg-[var(--accent)] text-white text-[13px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all shadow-lg shadow-[var(--accent)]/15"
+          onClick={() => setView('skills')}
+          className={`px-3 h-7 rounded-md transition-colors ${view === 'skills' ? 'tab-active' : 'tab-inactive'}`}
         >
-          <span className="flex items-center gap-1.5">
-            <Icon name={showForm ? 'close' : 'download'} size={14} white />
-            {showForm ? t('mcp.cancel') : t('skill.installHint')}
-          </span>
+          {t('skill.skillsView')}
+        </button>
+        <button
+          onClick={() => setView('usage')}
+          className={`px-3 h-7 rounded-md transition-colors ${view === 'usage' ? 'tab-active' : 'tab-inactive'}`}
+        >
+          {t('skill.usageView')}
         </button>
       </div>
 
+      {view === 'usage' ? (
+        <SkillUsageView
+          skills={skills}
+          stats={usageStats}
+          events={usageEvents}
+          loading={usageLoading}
+          onRefresh={() => void loadUsage()}
+          scope={effectiveScope}
+        />
+      ) : (
+        <>
       {projectId && (
-        <div className="inline-flex bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-0.5 mb-4 text-[12px]">
+        <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[12px]">
           <button
             onClick={() => setScope('global')}
-            className={`px-3 h-7 rounded-md transition-colors ${scope === 'global' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'}`}
+            className={`px-3 h-7 rounded-md transition-colors ${scope === 'global' ? 'tab-active' : 'tab-inactive'}`}
           >
             {t('common.scopeGlobal')}
           </button>
           <button
             onClick={() => setScope('project')}
-            className={`px-3 h-7 rounded-md transition-colors ${scope === 'project' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'}`}
+            className={`px-3 h-7 rounded-md transition-colors ${scope === 'project' ? 'tab-active' : 'tab-inactive'}`}
           >
             {t('common.scopeProject')}
           </button>
@@ -168,14 +251,14 @@ export default function SkillsPage() {
       )}
 
       {showForm && (
-        <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-2xl p-4 mb-6 space-y-3 animate-fade-in-up">
+        <div className="modern-card rounded-2xl p-4 mb-6 space-y-3 animate-fade-in-up">
           <div className="space-y-1.5">
             <label className="text-[11px] text-[var(--text-muted)]">{t('skill.repoUrl')}</label>
             <input
               placeholder={t('skill.repoUrlPlaceholder')}
               value={repoUrl}
               onChange={(e) => setRepoUrl(e.target.value)}
-              className="w-full h-9 px-3 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              className="w-full h-9 px-3 modern-card rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
             />
             {parsed && (
               <p className="text-[11px] text-[var(--success)] font-mono">
@@ -189,7 +272,7 @@ export default function SkillsPage() {
               placeholder="main"
               value={branch}
               onChange={(e) => setBranch(e.target.value)}
-              className="w-full h-9 px-3 bg-[var(--bg-card)] border border-[var(--border)] rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              className="w-full h-9 px-3 modern-card rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
             />
           </div>
           {/* 走系统代理克隆（国内网络访问 GitHub 时常用） */}
@@ -216,7 +299,7 @@ export default function SkillsPage() {
       )}
 
       {/* 内置技能库：GitHub 热门精选，一键导入 */}
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-2xl p-4 mb-6">
+      <div className="modern-card rounded-2xl p-4 mb-6">
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-[11px] font-medium text-[var(--text-muted)]">{t('skill.builtinTitle')}</div>
@@ -274,7 +357,7 @@ export default function SkillsPage() {
 
       <div className="space-y-3">
         {visibleSkills.length === 0 && (
-          <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-8 text-center">
+          <div className="modern-card rounded-lg p-8 text-center">
             <p className="text-[var(--text-secondary)] text-sm">{t('skill.empty')}</p>
             <p className="text-xs text-[var(--text-secondary)] mt-2">
               {t('skill.importTitle')}：{t('skill.importHint')}
@@ -282,7 +365,7 @@ export default function SkillsPage() {
           </div>
         )}
         {visibleSkills.map((s) => (
-          <div key={s.id} className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 flex items-center justify-between">
+          <div key={s.id} className="modern-card rounded-lg p-4 flex items-center justify-between">
             <div>
               <div className="flex items-center gap-2">
                 <span className="font-medium">{s.name}</span>
@@ -294,6 +377,12 @@ export default function SkillsPage() {
               {s.repo_owner && (
                 <p className="text-xs text-[var(--text-secondary)] mt-1 font-mono">
                   {s.repo_owner}/{s.repo_name} ({s.repo_branch})
+                </p>
+              )}
+              {usageMap[s.id] && usageMap[s.id].call_count > 0 && (
+                <p className="text-xs mt-1 text-[var(--accent)]">
+                  {t('skill.calledTimes', { n: usageMap[s.id].call_count })} · {t('skill.lastCalled')}:{' '}
+                  {fmtTime(usageMap[s.id].last_called_at)}
                 </p>
               )}
             </div>
@@ -324,6 +413,178 @@ export default function SkillsPage() {
           </div>
         ))}
       </div>
+        </>
+      )}
     </div>
   )
 }
+
+/** 使用统计视图：调用汇总 + 技能排行 + 最近调用时间线 */
+function SkillUsageView({
+  skills,
+  stats,
+  events,
+  loading,
+  onRefresh,
+  scope,
+}: {
+  skills: Skill[]
+  stats: SkillUsageStat[]
+  events: SkillUsageEvent[]
+  loading: boolean
+  onRefresh: () => void
+  scope: 'global' | 'project'
+}) {
+  const { t } = useTranslation()
+
+  // 汇总卡片
+  const summary = useMemo(() => {
+    const totalCalls = stats.reduce((s, u) => s + u.call_count, 0)
+    const usedCount = stats.length
+    const top = stats[0] ?? null
+    return { totalCalls, usedCount, top }
+  }, [stats])
+
+  // 技能排行：全部已安装技能 + 调用统计合并（按次数降序；未调用过的排最后）
+  const ranking = useMemo(() => {
+    const byId = new Map(stats.map((s) => [s.skill_id, s]))
+    const rows = skills.map((s) => ({
+      skill: s,
+      stat: byId.get(s.id) ?? null,
+    }))
+    // 已删除技能的调用记录也展示（用快照名），置于已安装之后
+    const ghosts = stats
+      .filter((s) => !skills.some((k) => k.id === s.skill_id))
+      .map((s) => ({ skill: null as Skill | null, stat: s }))
+    return [...rows, ...ghosts].sort((a, b) => {
+      const ca = a.stat?.call_count ?? 0
+      const cb = b.stat?.call_count ?? 0
+      return cb - ca
+    })
+  }, [skills, stats])
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[11px] text-[var(--text-muted)]">
+          {scope === 'project' ? t('skill.usageProjectHint') : t('skill.usageGlobalHint')}
+        </p>
+        <button
+          onClick={onRefresh}
+          className="shrink-0 px-3 py-1 text-xs border border-[var(--border)] rounded hover:bg-[var(--bg-card)] transition-colors"
+        >
+          {t('mcp.refresh')}
+        </button>
+      </div>
+
+      {loading && <p className="text-xs text-[var(--text-muted)]">{t('common.loading')}</p>}
+
+      {/* 汇总卡片 */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="modern-card rounded-2xl p-4">
+          <div className="text-[11px] text-[var(--text-muted)]">{t('skillStats.installedCount')}</div>
+          <div className="text-2xl font-bold mt-1 tnum">{skills.length}</div>
+        </div>
+        <div className="modern-card rounded-2xl p-4">
+          <div className="text-[11px] text-[var(--text-muted)]">{t('skillStats.totalCalls')}</div>
+          <div className="text-2xl font-bold mt-1 tnum">{summary.totalCalls}</div>
+        </div>
+        <div className="modern-card rounded-2xl p-4">
+          <div className="text-[11px] text-[var(--text-muted)]">{t('skillStats.usedCount')}</div>
+          <div className="text-2xl font-bold mt-1 tnum">{summary.usedCount}</div>
+        </div>
+        <div className="modern-card rounded-2xl p-4">
+          <div className="text-[11px] text-[var(--text-muted)]">{t('skillStats.mostUsed')}</div>
+          {summary.top ? (
+            <>
+              <div className="text-lg font-semibold mt-1 truncate">{summary.top.skill_name}</div>
+              <div className="text-[11px] text-[var(--accent)] mt-0.5 tnum">
+                {t('skillStats.callsUnit', { n: summary.top.call_count })}
+              </div>
+            </>
+          ) : (
+            <div className="text-sm text-[var(--text-muted)] mt-1">{t('skillStats.noCalls')}</div>
+          )}
+        </div>
+      </div>
+
+      {/* 技能调用排行 */}
+      <div className="modern-card rounded-2xl p-4">
+        <div className="text-[13px] font-semibold mb-3">{t('skillStats.ranking')}</div>
+        {ranking.length === 0 ? (
+          <p className="text-xs text-[var(--text-muted)] py-6 text-center">{t('skill.empty')}</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[12.5px]">
+              <thead>
+                <tr className="text-left text-[11px] text-[var(--text-muted)] border-b border-[var(--border)]">
+                  <th className="py-2 pr-3 font-medium">{t('skillStats.colSkill')}</th>
+                  <th className="py-2 pr-3 font-medium">{t('skillStats.colScope')}</th>
+                  <th className="py-2 pr-3 font-medium">{t('skillStats.colStatus')}</th>
+                  <th className="py-2 pr-3 font-medium text-right">{t('skillStats.colCalls')}</th>
+                  <th className="py-2 font-medium">{t('skillStats.colLastCalled')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ranking.map(({ skill, stat }) => (
+                  <tr key={stat?.skill_id ?? skill!.id} className="border-b border-[var(--border)] last:border-b-0">
+                    <td className="py-2 pr-3">
+                      <span className="font-medium">{skill?.name ?? stat!.skill_name}</span>
+                      {!skill && (
+                        <span className="ml-1.5 px-1.5 py-0.5 rounded bg-[var(--bg-card)] text-[10px] text-[var(--text-muted)]">
+                          {t('skillStats.removed')}
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-2 pr-3 text-[var(--text-secondary)]">
+                      {skill ? (skill.project_id ? t('common.scopeProject') : t('common.scopeGlobal')) : '—'}
+                    </td>
+                    <td className="py-2 pr-3">
+                      {skill ? (
+                        <span className={`px-2 py-0.5 rounded text-[11px] ${skill.enabled ? 'bg-[var(--success)]/15 text-[var(--success)]' : 'bg-[var(--bg-card)] text-[var(--text-secondary)]'}`}>
+                          {skill.enabled ? t('skill.enabled') : t('skill.disabled')}
+                        </span>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                    <td className="py-2 pr-3 text-right tnum font-semibold text-[var(--accent)]">
+                      {stat?.call_count ?? 0}
+                    </td>
+                    <td className="py-2 text-[var(--text-secondary)] tnum">{fmtTime(stat?.last_called_at ?? null)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* 最近调用时间线 */}
+      <div className="modern-card rounded-2xl p-4">
+        <div className="text-[13px] font-semibold mb-3">{t('skillStats.recentCalls')}</div>
+        {events.length === 0 ? (
+          <p className="text-xs text-[var(--text-muted)] py-6 text-center">{t('skillStats.noEvents')}</p>
+        ) : (
+          <ul className="space-y-2">
+            {events.map((e) => (
+              <li key={e.id} className="flex items-center gap-3 text-[12.5px] py-1.5 border-b border-[var(--border)] last:border-b-0">
+                <span className="shrink-0 w-24 text-[11px] text-[var(--text-muted)] tnum">{fmtTime(e.created_at)}</span>
+                <span className="px-2 py-0.5 rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[11px] font-medium shrink-0">
+                  {e.skill_name}
+                </span>
+                <span className="truncate text-[var(--text-secondary)]">{e.conversation_title || '—'}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
+
+
+
+

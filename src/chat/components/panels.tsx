@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { TerminalEntry, BuildLogLine } from '../../stores/projectStore'
-import type { ProjectMemory, ToolStat } from '../../api/project'
+import type { ProjectMemory, ToolStat, ToolTokenStat } from '../../api/project'
 import { gitBranchInfo, type GitBranchInfo } from '../../api/git'
+import { terminalExec, terminalKill, terminalStatus } from '../../api/terminal'
 import Icon from '../../icons/Icon'
 import { AnsiText, hasAnsi } from '../../components/AnsiText'
 import { fmtElapsed } from '../chatUtils'
@@ -52,7 +53,7 @@ export function OverviewGitSummary({ projectPath, onOpenGit }: { projectPath: st
   }, [projectPath])
 
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-3">
+    <div className="rounded-xl modern-card p-3">
       <div className="flex items-center gap-1.5">
         <Icon name="git-branch" size={12} className="text-[var(--text-secondary)]" />
         <span className="text-[12px] font-medium">{t('home.gitChanges')}</span>
@@ -199,7 +200,7 @@ export function MemoriesPanel({
             <button
               onClick={submit}
               disabled={busy || !title.trim() || !content.trim()}
-              className="h-7 px-3 rounded-lg bg-[var(--accent)] text-white text-[11px] font-medium hover:bg-[var(--accent-hover)] active:scale-95 disabled:opacity-40 transition-all"
+              className="h-7 px-3 rounded-lg btn-primary text-[11px] font-medium active:scale-95 disabled:opacity-40 transition-all"
             >
               {t('common.save')}
             </button>
@@ -216,7 +217,7 @@ export function MemoriesPanel({
         memories.map((m) => (
           <div
             key={m.id}
-            className={`rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-3 transition-opacity ${m.enabled ? '' : 'opacity-55'}`}
+            className={`rounded-xl modern-card p-3 transition-opacity ${m.enabled ? '' : 'opacity-55'}`}
           >
             <div className="flex items-center gap-2">
               <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)]">
@@ -246,10 +247,14 @@ export function MemoriesPanel({
               </button>
               <button
                 onClick={() => handleDelete(m.id)}
-                className={`shrink-0 p-1 rounded-md transition-colors ${confirmDeleteId === m.id ? 'text-[var(--danger)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
+                className={`shrink-0 p-1 rounded-md transition-all ${
+                  confirmDeleteId === m.id
+                    ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]'
+                    : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
+                }`}
                 title={confirmDeleteId === m.id ? t('home.memoryDeleteConfirm') : t('home.memoryDelete')}
               >
-                <Icon name="delete" size={12} />
+                <Icon name="delete" size={12} white={confirmDeleteId === m.id} />
               </button>
             </div>
             <p className="mt-1.5 text-[11px] text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap break-all">
@@ -271,10 +276,60 @@ export function MemoriesPanel({
 }
 
 /* ============ 工具调用统计面板（Evaluation） ============ */
-export function ToolStatsPanel({ stats, onRefresh }: { stats: ToolStat[]; onRefresh: () => Promise<void> }) {
+/** token 数缩写（1.2k / 3.4w），与 Home 顶栏口径一致 */
+const fmtTokens = (n: number) =>
+  n >= 10000 ? `${(n / 10000).toFixed(1)}w` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+
+/** 任务分组固定顺序（与后端 TASK_GROUPS 一致），未登记工具落 other */
+const TASK_GROUP_ORDER = ['build', 'fix', 'explore', 'deploy', 'refactor', 'test', 'other'] as const
+const TASK_GROUP_LABEL_KEY: Record<string, string> = {
+  build: 'home.statsGroupBuild',
+  fix: 'home.statsGroupFix',
+  explore: 'home.statsGroupExplore',
+  deploy: 'home.statsGroupDeploy',
+  refactor: 'home.statsGroupRefactor',
+  test: 'home.statsGroupTest',
+  other: 'home.statsGroupOther',
+}
+
+export function ToolStatsPanel({
+  stats,
+  tokenStats,
+  toolGroupMap,
+  onRefresh,
+}: {
+  stats: ToolStat[]
+  /** [69] 最耗 token 工具排行（request_logs 按工具聚合） */
+  tokenStats: ToolTokenStat[]
+  /** [75] 工具 → task_group 映射（后端 list_tool_groups） */
+  toolGroupMap: Record<string, string>
+  onRefresh: () => void
+}) {
   const { t } = useTranslation()
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const totalCalls = stats.reduce((s, x) => s + x.call_count, 0)
   const totalFail = stats.reduce((s, x) => s + x.fail_count, 0)
+
+  // [75] 按 task_group 分组（固定顺序；未登记工具归 other；空组不渲染）
+  const grouped = useMemo(() => {
+    const map = new Map<string, ToolStat[]>()
+    for (const g of TASK_GROUP_ORDER) map.set(g, [])
+    for (const s of stats) {
+      const g = toolGroupMap[s.tool_name] ?? 'other'
+      if (!map.has(g)) map.set(g, [])
+      map.get(g)!.push(s)
+    }
+    return [...map.entries()].filter(([, list]) => list.length > 0)
+  }, [stats, toolGroupMap])
+
+  const toggleGroup = (g: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(g)) next.delete(g)
+      else next.add(g)
+      return next
+    })
+  }
 
   return (
     <div className="p-3 space-y-2.5">
@@ -291,51 +346,106 @@ export function ToolStatsPanel({ stats, onRefresh }: { stats: ToolStat[]; onRefr
 
       {/* 汇总 */}
       <div className="grid grid-cols-3 gap-2">
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-2.5 text-center">
+        <div className="rounded-xl modern-card p-2.5 text-center">
           <div className="text-lg font-semibold tabular-nums">{totalCalls}</div>
           <div className="text-[10px] text-[var(--text-muted)]">{t('home.statsTotalCalls')}</div>
         </div>
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-2.5 text-center">
+        <div className="rounded-xl modern-card p-2.5 text-center">
           <div className="text-lg font-semibold tabular-nums text-[var(--success)]">{totalCalls - totalFail}</div>
           <div className="text-[10px] text-[var(--text-muted)]">{t('home.statsSuccess')}</div>
         </div>
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-2.5 text-center">
+        <div className="rounded-xl modern-card p-2.5 text-center">
           <div className="text-lg font-semibold tabular-nums text-[var(--danger)]">{totalFail}</div>
           <div className="text-[10px] text-[var(--text-muted)]">{t('home.statsFailed')}</div>
         </div>
       </div>
 
-      {/* 按工具明细 */}
+      {/* [69] 最耗 token 工具排行（仅代理链路有记录时展示） */}
+      {tokenStats.length > 0 && (
+        <div className="rounded-xl modern-card p-3">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">{t('home.statsTokenTip')}</p>
+            <span className="shrink-0 text-[10px] tabular-nums text-[var(--text-muted)]">
+              {t('home.statsTokenRequests', { count: tokenStats.length })}
+            </span>
+          </div>
+          <div className="mt-2 space-y-1.5">
+            {tokenStats.slice(0, 8).map((ts) => {
+              const total = ts.input_tokens + ts.output_tokens
+              const max = tokenStats[0] ? tokenStats[0].input_tokens + tokenStats[0].output_tokens : 1
+              return (
+                <div key={ts.tool_name} className="flex items-center gap-2">
+                  <span className="w-28 shrink-0 text-[11px] font-mono truncate" title={ts.tool_name}>{ts.tool_name}</span>
+                  <div className="flex-1 h-1 rounded-full bg-[var(--bg-primary)] overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-[var(--accent)] to-[#8b5cf6]"
+                      style={{ width: `${max > 0 ? Math.max(4, Math.round((total / max) * 100)) : 0}%` }}
+                    />
+                  </div>
+                  <span className="shrink-0 text-[10px] tabular-nums text-[var(--text-muted)]">
+                    {t('home.statsTokenIn', { tokens: fmtTokens(ts.input_tokens) })} · {t('home.statsTokenOut', { tokens: fmtTokens(ts.output_tokens) })}
+                    {ts.total_cost_cny > 0.001 && <span> · {t('home.statsTokenCost', { cost: ts.total_cost_cny.toFixed(2) })}</span>}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* [75] 按任务分组折叠的工具明细 */}
       {stats.length === 0 ? (
         <div className="rounded-xl border border-dashed border-[var(--border)] p-5 text-center">
           <p className="text-[12px] text-[var(--text-muted)]">{t('home.statsEmpty')}</p>
         </div>
       ) : (
         <div className="space-y-2">
-          {stats.map((s) => {
-            const rate = s.call_count > 0 ? Math.round((s.success_count / s.call_count) * 100) : 0
+          {grouped.map(([group, list]) => {
+            const collapsed = collapsedGroups.has(group)
+            const groupCalls = list.reduce((s, x) => s + x.call_count, 0)
             return (
-              <div key={s.tool_name} className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-3">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[12px] font-medium font-mono truncate">{s.tool_name}</span>
-                  <span className="shrink-0 text-[11px] tabular-nums">
-                    {s.call_count}×
+              <div key={group} className="rounded-xl modern-card overflow-hidden">
+                <button
+                  onClick={() => toggleGroup(group)}
+                  className="w-full flex items-center justify-between gap-2 px-3 py-2 text-left hover:bg-[var(--bg-hover)] transition-colors"
+                  title={collapsed ? t('home.statsGroupExpand') : t('home.statsGroupCollapse')}
+                >
+                  <span className="flex items-center gap-1.5 text-[11px] font-medium">
+                    <Icon name="chevron-right" size={12} className={`transition-transform ${collapsed ? '' : 'rotate-90'}`} />
+                    {t(TASK_GROUP_LABEL_KEY[group] ?? 'home.statsGroupOther')}
+                    <span className="text-[10px] tabular-nums text-[var(--text-muted)]">{list.length} 个 · {groupCalls}×</span>
                   </span>
-                </div>
-                <div className="mt-2 h-1.5 rounded-full bg-[var(--bg-primary)] overflow-hidden">
-                  <div
-                    className={`h-full rounded-full transition-all ${rate >= 80 ? 'bg-[var(--success)]' : rate >= 50 ? 'bg-[var(--warning)]' : 'bg-[var(--danger)]'}`}
-                    style={{ width: `${rate}%` }}
-                  />
-                </div>
-                <div className="mt-1.5 flex items-center justify-between text-[10px] text-[var(--text-muted)]">
-                  <span>
-                    {t('home.statsRate', { rate })} · {t('home.statsAvgMs', { ms: s.avg_duration_ms ?? '—' })}
-                  </span>
-                  {s.last_called_at && (
-                    <span>{t('home.statsLastAt', { time: new Date(s.last_called_at * 1000).toLocaleDateString() })}</span>
-                  )}
-                </div>
+                  {collapsed && <span className="text-[10px] text-[var(--text-muted)]">{t('home.statsGroupExpand')}</span>}
+                </button>
+                {!collapsed && (
+                  <div className="px-3 pb-3 space-y-2">
+                    {list.map((s) => {
+                      const rate = s.call_count > 0 ? Math.round((s.success_count / s.call_count) * 100) : 0
+                      return (
+                        <div key={s.tool_name} className="rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-2.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[12px] font-medium font-mono truncate">{s.tool_name}</span>
+                            <span className="shrink-0 text-[11px] tabular-nums">{s.call_count}×</span>
+                          </div>
+                          <div className="mt-2 h-1.5 rounded-full bg-[var(--bg-hover)] overflow-hidden">
+                            <div
+                              className={`h-full rounded-full transition-all ${rate >= 80 ? 'bg-[var(--success)]' : rate >= 50 ? 'bg-[var(--warning)]' : 'bg-[var(--danger)]'}`}
+                              style={{ width: `${rate}%` }}
+                            />
+                          </div>
+                          <div className="mt-1.5 flex items-center justify-between text-[10px] text-[var(--text-muted)]">
+                            <span>
+                              {t('home.statsRate', { rate })} · {t('home.statsAvgMs', { ms: s.avg_duration_ms ?? '—' })}
+                            </span>
+                            {s.last_called_at && (
+                              <span>{t('home.statsLastAt', { time: new Date(s.last_called_at * 1000).toLocaleDateString() })}</span>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
             )
           })}
@@ -374,7 +484,7 @@ export function PreviewPanel({
           onClick={onOpen}
           disabled={!url.trim()}
           title={t('home.open')}
-          className="h-8 px-3 rounded-lg bg-[var(--accent)] text-white text-[12px] font-medium hover:bg-[var(--accent-hover)] active:scale-[0.98] transition-all disabled:opacity-40 shrink-0"
+          className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all disabled:opacity-40 shrink-0"
         >
           {t('home.open')}
         </button>
@@ -408,7 +518,7 @@ export function PreviewPanel({
   )
 }
 
-/* ============ 终端面板：工具执行实时记录（黑底终端样式，自动滚动） ============ */
+/* ============ 执行记录面板：工具执行实时记录（黑底终端样式，自动滚动） ============ */
 export function TerminalPanel({
   entries,
   onClear,
@@ -477,10 +587,10 @@ export function TerminalPanel({
         <div className="flex items-center gap-1">
           <button
             onClick={() => setTab('tools')}
-            className={`px-2 h-6 rounded-md text-[11px] transition-colors flex items-center gap-1.5 ${tab === 'tools' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'}`}
+            className={`px-2 h-6 rounded-md text-[11px] transition-colors flex items-center gap-1.5 ${tab === 'tools' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'tab-inactive'}`}
           >
             <Icon name="terminal" size={12} />
-            {t('home.terminal')}
+            {t('home.terminalLogs')}
             {runningNow > 0 && (
               <span className="flex items-center gap-1 text-[var(--accent)]">
                 <span className="w-1 h-1 rounded-full bg-[var(--accent)] animate-pulse" />
@@ -490,7 +600,7 @@ export function TerminalPanel({
           </button>
           <button
             onClick={() => setTab('build')}
-            className={`px-2 h-6 rounded-md text-[11px] transition-colors flex items-center gap-1.5 ${tab === 'build' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'}`}
+            className={`px-2 h-6 rounded-md text-[11px] transition-colors flex items-center gap-1.5 ${tab === 'build' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'tab-inactive'}`}
           >
             <Icon name="package" size={12} />
             {t('home.buildLog')}
@@ -602,3 +712,181 @@ export function TerminalPanel({
     </div>
   )
 }
+
+/* ============ 内置终端面板：在项目目录内执行命令（简易命令终端，复用后端 terminal_* 命令） ============ */
+export function ShellPanel({ projectId, projectPath }: { projectId: string; projectPath: string }) {
+  const { t } = useTranslation()
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  // 输出行：cmd=输入的命令 / out=stdout / err=异常 / sys=系统提示
+  const [lines, setLines] = useState<{ kind: 'cmd' | 'out' | 'err' | 'sys'; text: string }[]>([])
+  const [cwd, setCwd] = useState(projectPath)
+  const [busy, setBusy] = useState(false)
+  const [input, setInput] = useState('')
+  const [history, setHistory] = useState<string[]>([])
+  const [histIdx, setHistIdx] = useState(-1)
+
+  // 初始化：查询后端会话当前目录/是否已有命令在运行
+  useEffect(() => {
+    let alive = true
+    void terminalStatus(projectId, projectPath)
+      .then((s) => {
+        if (!alive) return
+        setCwd(s.cwd)
+        if (s.running) {
+          setBusy(true)
+          setLines((ls) => [...ls, { kind: 'sys', text: t('home.shellRunning') }])
+        }
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, projectPath])
+
+  // 输出增长时自动滚动到底部
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [lines])
+
+  const run = async (raw: string) => {
+    const cmd = raw.trim()
+    if (!cmd || busy) return
+    setHistory((h) => (h[h.length - 1] === cmd ? h : [...h, cmd]))
+    setHistIdx(-1)
+    setInput('')
+    setLines((ls) => [...ls, { kind: 'cmd', text: cmd }])
+    setBusy(true)
+    try {
+      const r = await terminalExec(projectId, projectPath, cmd)
+      if (r.cwd) setCwd(r.cwd)
+      if (r.output) setLines((ls) => [...ls, { kind: 'out', text: r.output }])
+      if (r.timed_out) setLines((ls) => [...ls, { kind: 'sys', text: t('home.shellTimeout') }])
+      else if (!r.running && r.exit_code !== null)
+        setLines((ls) => [...ls, { kind: 'sys', text: t('home.shellExit', { code: r.exit_code }) }])
+    } catch (e) {
+      setLines((ls) => [...ls, { kind: 'err', text: String(e) }])
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const stop = async () => {
+    setBusy(false)
+    setLines((ls) => [...ls, { kind: 'sys', text: t('home.shellStopped') }])
+    try {
+      await terminalKill(projectId)
+    } catch {
+      // 忽略
+    }
+  }
+
+  // 输入高度自适应：多行命令换行展示，超高内部滚动（高度上限 96px）
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 96) + 'px'
+  }, [input])
+
+  // Enter 执行 / Shift+Enter 换行；↑↓ 历史导航（仅单行输入时，多行保留光标移动）；Ctrl+L 清屏。
+  // 与主对话输入框互不冲突：键盘事件只作用于焦点所在的输入框
+  const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      void run(input)
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      if (input.includes('\n')) return
+      e.preventDefault()
+      if (history.length === 0) return
+      const idx = histIdx < 0 ? history.length - 1 : Math.max(0, histIdx - 1)
+      setHistIdx(idx)
+      setInput(history[idx])
+    } else if (e.key === 'ArrowDown') {
+      if (input.includes('\n')) return
+      e.preventDefault()
+      if (histIdx < 0) return
+      const idx = histIdx + 1
+      if (idx >= history.length) {
+        setHistIdx(-1)
+        setInput('')
+      } else {
+        setHistIdx(idx)
+        setInput(history[idx])
+      }
+    } else if (e.key === 'l' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault()
+      setLines([])
+    }
+  }
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-[var(--border)] shrink-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <Icon name="terminal" size={12} className="text-[var(--accent)] shrink-0" />
+          <span className="text-[10.5px] text-[var(--text-muted)] shrink-0">{t('home.terminal')}</span>
+          <span className="text-[10px] font-mono text-[var(--text-secondary)] truncate">{cwd}</span>
+        </div>
+        {busy && (
+          <button
+            onClick={() => void stop()}
+            className="px-2 h-6 rounded-md text-[11px] border border-[var(--border)] text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors flex items-center gap-1 shrink-0"
+          >
+            <Icon name="close" size={10} /> {t('home.shellStop')}
+          </button>
+        )}
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto bg-[#0d1117] p-2.5 font-mono text-[11.5px] leading-relaxed">
+        {lines.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center gap-2 text-center px-6">
+            <Icon name="terminal" size={26} className="opacity-30" />
+            <span className="text-[11.5px] text-[#8b949e]">{t('home.shellHint')}</span>
+          </div>
+        ) : (
+          <div className="space-y-0.5">
+            {lines.map((l, i) =>
+              l.kind === 'cmd' ? (
+                <div key={i} className="flex items-start gap-2">
+                  <span className="text-[#3fb950] select-none shrink-0">❯</span>
+                  <span className="text-[#e6edf3] break-all">{l.text}</span>
+                </div>
+              ) : l.kind === 'err' ? (
+                <div key={i} className="whitespace-pre-wrap break-all text-[#f85149]">{l.text}</div>
+              ) : l.kind === 'sys' ? (
+                <div key={i} className="whitespace-pre-wrap break-all text-[#58a6ff]">{l.text}</div>
+              ) : (
+                <div key={i} className="whitespace-pre-wrap break-all text-[#c9d1d9]">
+                  {hasAnsi(l.text) ? <AnsiText text={l.text} /> : l.text}
+                </div>
+              ),
+            )}
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+      {/* 输入区固定深色底：与输出区一致，明暗主题下文字均为亮色可读 */}
+      <div className="flex items-end gap-2 px-2.5 py-2 border-t border-[var(--border)] bg-[#0d1117] shrink-0">
+        <span className="text-[#3fb950] font-mono text-[12px] select-none leading-6">❯</span>
+        <textarea
+          ref={inputRef}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={onKeyDown}
+          onFocus={() => inputRef.current?.scrollIntoView({ block: 'nearest' })}
+          placeholder={t('home.shellHint')}
+          spellCheck={false}
+          rows={1}
+          style={{ color: '#e6edf3', caretColor: '#e6edf3', WebkitTextFillColor: '#e6edf3' }}
+          className="flex-1 min-w-0 bg-transparent font-mono text-[11.5px] placeholder:text-[#484f58] outline-none resize-none leading-6 max-h-24 overflow-y-auto py-0.5"
+        />
+      </div>
+    </div>
+  )
+}
+
+
+

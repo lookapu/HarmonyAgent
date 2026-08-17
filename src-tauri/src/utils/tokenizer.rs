@@ -86,20 +86,6 @@ pub fn estimate_messages_tokens(messages: &[serde_json::Value]) -> usize {
     total + 32 // system 指令与协议固定开销
 }
 
-/// 预估输出 token 数：按字符数/3 保守估算（中文 1 字≈1 token、英文 3 字符≈1 token），
-/// 用于成本预估。输出规模不可预知，这里仅给一个量级参考。
-pub fn estimate_output_tokens(text: &str) -> usize {
-    let mut cjk = 0usize;
-    let mut other = 0usize;
-    for c in text.chars() {
-        if is_cjk(c) {
-            cjk += 1;
-        } else if !c.is_whitespace() {
-            other += 1;
-        }
-    }
-    cjk + other.div_ceil(3) + 8
-}
 
 #[cfg(test)]
 mod tests {

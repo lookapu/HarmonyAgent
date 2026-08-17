@@ -99,6 +99,137 @@ pub(super) async fn run_tests(args: &Value, roots: &[String]) -> Result<String, 
     }
 }
 
+/// [32] flaky_test_detect：重复执行测试 N 次（缺省 3），对比各轮结果识别不稳定用例。
+/// 输出每轮摘要 + 稳定性结论（稳定通过/稳定失败/波动）+ 波动测试清单。
+pub(super) async fn flaky_test_detect(args: &Value, roots: &[String]) -> Result<String, String> {
+    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录，无法运行测试".into());
+    }
+    let root = Path::new(project_path);
+    let (program, mut full_args, hvigor_env) = test_command_for(root).ok_or_else(|| {
+        format!(
+            "未识别到该目录的工程类型（{}），无法自动选择测试命令。\n请先用 run_command 手动执行测试命令确认可用。",
+            root.display()
+        )
+    })?;
+    // 鸿蒙专有参数：module 仅对 hvigor 测试有效
+    if let Some(m) = args["module"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if program.contains("node") || program.contains("hvigor") {
+            full_args.extend([
+                "--mode".into(),
+                "module".into(),
+                "-p".into(),
+                format!("module={m}@default"),
+            ]);
+        }
+    }
+    let runs = args["runs"].as_u64().unwrap_or(3).clamp(2, 5) as usize;
+    let _gate = crate::services::tool_limits::acquire_gate("run_tests").await;
+
+    let mut rounds: Vec<(bool, String)> = Vec::with_capacity(runs); // (是否成功, 摘要)
+    for i in 0..runs {
+        let out = if hvigor_env.is_empty() {
+            run_cmd(&program, &full_args, Some(root), 600).await
+        } else {
+            run_cmd_env(&program, &full_args, Some(root), 600, Some(&hvigor_env)).await
+        };
+        match out {
+            Ok(o) => rounds.push((true, extract_test_summary(&o))),
+            Err(e) => rounds.push((false, extract_test_summary(&e))),
+        }
+        // 轮次间小间隔，避免连续执行互相干扰（热启动/端口占用等）
+        if i + 1 < runs {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+    }
+
+    let ok_n = rounds.iter().filter(|(ok, _)| *ok).count();
+    let fail_n = runs - ok_n;
+    let mut out = format!(
+        "测试稳定性检测（{} 轮，{}）\n",
+        runs,
+        full_args.join(" ")
+    );
+    for (i, (ok, summary)) in rounds.iter().enumerate() {
+        out.push_str(&format!(
+            "  第 {} 轮：{}{}\n",
+            i + 1,
+            if *ok { "✅ 通过" } else { "❌ 失败" },
+            if summary.is_empty() { String::new() } else { format!("（{summary}") }
+        ));
+    }
+    // 结论
+    if fail_n == 0 {
+        out.push_str(&format!("\n结论：连续 {runs} 轮全部通过，未发现波动。\n"));
+    } else if ok_n == 0 {
+        out.push_str(
+            &format!("\n结论：连续 {runs} 轮全部失败，属于稳定失败（大概率是环境/代码问题而非波动，先用 get_diagnostics/read_logcat 定位）。\n"),
+        );
+    } else {
+        out.push_str(&format!(
+            "\n结论：发现波动（{} 轮成功 / {} 轮失败）。\n",
+            ok_n, fail_n
+        ));
+        // 提取失败轮次中的失败测试线索（FAILED/失败/✗/error 行，去重）
+        let mut clues: Vec<String> = Vec::new();
+        for (i, (ok, summary)) in rounds.iter().enumerate() {
+            if *ok {
+                continue;
+            }
+            for line in summary.lines() {
+                let l = line.to_lowercase();
+                let is_fail_line = l.contains("failed")
+                    || l.contains("failures")
+                    || l.contains("error")
+                    || l.contains("✗")
+                    || l.contains("❌")
+                    || l.contains("not ok");
+                if is_fail_line && !clues.iter().any(|c| *c == line.trim()) {
+                    clues.push(line.trim().to_string());
+                }
+            }
+            out.push_str(&format!(
+                "  第 {} 轮失败摘要：{}\n",
+                i + 1,
+                if summary.is_empty() { "（无摘要，见完整输出）".to_string() } else { summary.to_string() }
+            ));
+        }
+        if !clues.is_empty() {
+            out.push_str(&format!("\n失败线索（去重）：\n  - {}\n", clues.join("\n  - ")));
+        }
+        out.push_str("\n建议：对波动用例可临时跳过/重试；连续波动 3 次以上应定位根因（时序依赖/资源泄漏/端口冲突常见）。");
+    }
+    Ok(out)
+}
+
+/// 从测试输出提取摘要行（尾部关键行，最多 6 行）
+fn extract_test_summary(raw: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in raw.lines().rev().take(120) {
+        let t = line.trim();
+        let l = t.to_lowercase();
+        let hit = l.contains("test result")
+            || l.contains("tests run")
+            || l.contains("tests passed")
+            || l.contains("test cases")
+            || l.contains("build successful")
+            || l.contains("build failed")
+            || l.contains("failed")
+            || l.contains("failures")
+            || l.contains("not ok")
+            || (l.contains("passed") && !l.contains("assets"))
+            || (l.contains("finished") && l.contains("test"));
+        if hit && t.chars().count() < 160 && !lines.iter().any(|x| *x == t) {
+            lines.push(t.to_string());
+        }
+        if lines.len() >= 6 {
+            break;
+        }
+    }
+    lines.join(" ｜ ")
+}
+
 /// read_logcat：读取设备最近 N 行日志（hdc logcat -T N，可选指定设备与关键词过滤）
 pub(super) async fn read_logcat(args: &Value) -> Result<String, String> {
     let lines = args["lines"].as_u64().unwrap_or(200).clamp(10, 1000);
@@ -274,6 +405,7 @@ pub(super) fn html_to_text(html: &str) -> String {
 }
 
 /// read_runtime_logs：读取部署后自动回流的应用运行期错误日志（环形缓存）。
+/// 支持日志查询 DSL：filter 关键字（大小写不敏感子串）/ regex 正则 + context 上下文行。
 pub(super) async fn read_runtime_logs(
     args: &Value,
     roots: &[String],
@@ -284,11 +416,22 @@ pub(super) async fn read_runtime_logs(
         return Err("当前会话未绑定项目目录，无法读取运行日志".into());
     }
     let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(100).clamp(20, 400) as usize;
-    let logs = crate::agent::runtime_log::recent(project_path, n);
+    let filter = args["filter"].as_str();
+    let regex = args["regex"].as_str();
+    let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let logs = if filter.is_some_and(|f| !f.trim().is_empty()) || regex.is_some_and(|r| !r.trim().is_empty()) {
+        crate::agent::runtime_log::search(project_path, n, filter, regex, context)
+    } else {
+        crate::agent::runtime_log::recent(project_path, n)
+    };
     if logs.trim().is_empty() {
         return Ok("（暂无可读的运行期错误日志：尚未部署/应用未运行，或运行期没有 error 级日志。部署应用后会自动监听。）".to_string());
     }
-    Ok(format!("最近 {n} 行运行期错误日志：\n{logs}"))
+    if filter.is_some_and(|f| !f.trim().is_empty()) || regex.is_some_and(|r| !r.trim().is_empty()) {
+        Ok(format!("日志过滤结果（{} 行内命中，> 标记命中行）：\n{logs}", n))
+    } else {
+        Ok(format!("最近 {n} 行运行期错误日志：\n{logs}"))
+    }
 }
 
 /// web_fetch：抓取网页正文纯文本（自动代理，≤2MB，截断 max_chars）

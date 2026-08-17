@@ -20,14 +20,34 @@ export interface DeviceDetail {
   resolution: string
   battery: string
   ram: string
+  /** 存储用量文本（如 "28.2GB / 220.3GB（13%）"） */
+  storage: string
+  /** CPU 当前频率（如 "1.62GHz"） */
+  cpu_freq: string
+  /** 电池状态文本（充电状态 + 电压 + 电流 + 电芯技术） */
+  battery_status: string
+  /** 电池温度 ℃（如 "30.0℃"） */
+  battery_temp: string
 }
 export const getDeviceDetail = (deviceId: string) =>
   invoke<DeviceDetail>('get_device_detail', { deviceId })
 export const hdcAvailable = () => invoke<boolean>('hdc_available')
 export const startHdcService = () => invoke<string>('start_hdc_service')
 export const stopHdcService = () => invoke<string>('stop_hdc_service')
-export const captureDeviceScreenshot = (projectId: string, deviceId?: string) =>
-  invoke<string>('capture_device_screenshot', { projectId, deviceId: deviceId ?? null })
+export const captureDeviceScreenshot = (projectId: string, deviceId?: string, projectName?: string) =>
+  invoke<string>('capture_device_screenshot', { projectId, deviceId: deviceId ?? null, projectName: projectName ?? null })
+
+/** 项目截图文件条目 */
+export interface ShotFile {
+  name: string
+  path: string
+  size: number
+  mtime: number
+}
+export const listDeviceScreenshots = (projectId: string) =>
+  invoke<ShotFile[]>('list_device_screenshots', { projectId })
+export const deleteDeviceScreenshot = (projectId: string, name: string) =>
+  invoke<void>('delete_device_screenshot', { projectId, name })
 
 export interface InstalledApp {
   package: string
