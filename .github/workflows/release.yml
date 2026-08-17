@@ -180,8 +180,16 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/v}
           DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          MAC_SIG=$(cat artifacts/macos/*.sig 2>/dev/null || echo "")
-          WIN_SIG=$(cat artifacts/windows/*.sig 2>/dev/null || echo "")
+          # download-artifact 保留上传时的目录结构（bundle/dmg、bundle/msi 等嵌套），递归查找真实产物名；
+          # 文件名含空格（productName "DevEco Switch"），URL 中需 %20 编码
+          MAC_TAR=$(find artifacts/macos -name '*.app.tar.gz' | head -1)
+          WIN_ZIP=$(find artifacts/windows -name '*.msi.zip' | head -1)
+          MAC_SIG=$(find artifacts/macos -name '*.app.tar.gz.sig' | head -1)
+          WIN_SIG=$(find artifacts/windows -name '*.msi.zip.sig' | head -1)
+          MAC_NAME=$(basename "$MAC_TAR" | sed 's/ /%20/g')
+          WIN_NAME=$(basename "$WIN_ZIP" | sed 's/ /%20/g')
+          MAC_SIG_CONTENT=$(cat "$MAC_SIG" 2>/dev/null || echo "")
+          WIN_SIG_CONTENT=$(cat "$WIN_SIG" 2>/dev/null || echo "")
 
           cat > artifacts/latest.json << ENDJSON
           {
@@ -190,16 +198,16 @@ jobs:
             "pub_date": "${DATE}",
             "platforms": {
               "darwin-aarch64": {
-                "signature": "${MAC_SIG}",
-                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/DevEco-Switch.app.tar.gz"
+                "signature": "${MAC_SIG_CONTENT}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/${MAC_NAME}"
               },
               "darwin-x86_64": {
-                "signature": "${MAC_SIG}",
-                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/DevEco-Switch.app.tar.gz"
+                "signature": "${MAC_SIG_CONTENT}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/${MAC_NAME}"
               },
               "windows-x86_64": {
-                "signature": "${WIN_SIG}",
-                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/DevEco-Switch_${VERSION}_x64-setup.msi.zip"
+                "signature": "${WIN_SIG_CONTENT}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/${WIN_NAME}"
               }
             }
           }
@@ -210,7 +218,13 @@ jobs:
         with:
           draft: false
           prerelease: false
+          # download-artifact 保留嵌套目录（bundle/dmg、bundle/msi），用 **/* 递归匹配全部产物
           files: |
-            artifacts/macos/*
-            artifacts/windows/*
+            artifacts/**/*.dmg
+            artifacts/**/*.app.tar.gz
+            artifacts/**/*.app.tar.gz.sig
+            artifacts/**/*.msi
+            artifacts/**/*.msi.zip
+            artifacts/**/*.msi.zip.sig
+            artifacts/**/*.exe
             artifacts/latest.json
