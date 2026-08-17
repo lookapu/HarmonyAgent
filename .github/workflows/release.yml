@@ -217,6 +217,25 @@ jobs:
           }
           ENDJSON
 
+      # 重打同 tag 时旧 release 会残留（action-gh-release 遇同名 release 直接失败），
+      # 先用 GITHUB_TOKEN 幂等删除旧 release，保证 tag 重打可重入
+      - name: Delete existing release for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          TAG=${GITHUB_REF#refs/tags/}
+          RESP=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+          REL_ID=$(printf '%s' "$RESP" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("id","") or "")' 2>/dev/null)
+          if [ -n "$REL_ID" ]; then
+            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$REL_ID" >/dev/null
+            echo "Deleted existing release id=$REL_ID"
+          else
+            echo "No existing release for tag $TAG"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
