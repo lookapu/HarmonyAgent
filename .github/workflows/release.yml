@@ -114,9 +114,12 @@ jobs:
           Remove-Item node.zip, node_tmp -Recurse -Force
 
           # PortableGit（GitHub 最新 release，SFX 静默解压平铺到 runtime/git）
-          $gitTag = (Invoke-RestMethod @proxyArg -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest').tag_name
-          $gitVer = $gitTag.TrimStart('v')
-          Get-FileRetry -Uri "https://github.com/git-for-windows/git/releases/download/$gitTag/PortableGit-$gitVer-64-bit.7z.exe" -OutFile git.exe
+          # 注意：asset 名与 tag 名不一致（如 tag v2.55.0.windows.4 → PortableGit-2.55.0.4-64-bit.7z.exe），
+          # 从 release assets 列表取官方 URL，避免拼字符串 404
+          $gitRel = Invoke-RestMethod @proxyArg -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest'
+          $gitAsset = $gitRel.assets | Where-Object { $_.name -match '^PortableGit-.*-64-bit\.7z\.exe$' } | Select-Object -First 1
+          if (-not $gitAsset) { throw 'PortableGit asset not found in latest release' }
+          Get-FileRetry -Uri $gitAsset.browser_download_url -OutFile git.exe
           New-Item -ItemType Directory -Force -Path git_tmp | Out-Null
           Start-Process -Wait -FilePath "$PWD\git.exe" -ArgumentList '-o', "$PWD\git_tmp", '-y'
           New-Item -ItemType Directory -Force -Path src-tauri/runtime/git | Out-Null
@@ -135,14 +138,6 @@ jobs:
             $p = Join-Path 'src-tauri/runtime/jdk' $d
             if (Test-Path $p) { Remove-Item $p -Recurse -Force }
           }
-
-      - name: Override config for Windows CI (bundle runtimes only, no seed/embedding)
-        shell: pwsh
-        # --config 深合并无法用空 map 清除 bundle.resources，需直接改写配置文件；
-        # seed/embedding（知识库种子与向量模型，约 340MB）无公开下载源，CI 产物仅捆绑上方下载的运行时
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python -c "import json; p='src-tauri/tauri.conf.json'; d=json.load(open(p,encoding='utf-8')); d['bundle']['resources']={'runtime/node':'node','runtime/git':'git','runtime/jdk':'jdk'}; json.dump(d,open(p,'w',encoding='utf-8'),indent=2,ensure_ascii=False)"
 
       - name: Build Tauri
         env:
