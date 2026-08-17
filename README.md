@@ -269,6 +269,14 @@ npx tauri build
 - 数据库迁移：`src-tauri/migrations/`（49 个版本，已执行的迁移不可修改，新增请递增编号）
 - 旧调试脚本：`scripts/legacy/`（仅留档，请勿引用）
 
+## 打赏支持
+
+如果 HarmonyAgent 对你有帮助，欢迎打赏支持，开源维护不易：
+
+<p align="center">
+  <img src="docs/alipay-qr.jpg" alt="支付宝打赏二维码" width="200" />
+</p>
+
 ## License
 
 MIT
