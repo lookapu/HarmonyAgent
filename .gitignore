@@ -48,6 +48,7 @@ min_test.pdb
 
 # 备份文件
 *.bak
+*.before-rewrite
 
 # ohpm 面板运行时缓存（IDE 拉取数据，可重建）
 _ide.json
