@@ -264,7 +264,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
             #[cfg(windows)]
             { ("cmd".to_string(), vec!["/C".to_string(), command.to_string()], None) }
             #[cfg(not(windows))]
-            { ("sh".to_string(), vec!["-c".to_string(), command.clone()], None) }
+            { ("sh".to_string(), vec!["-c".to_string(), command.to_string()], None) }
         } else {
             resolve_program(&command, &cwd)
         };
@@ -296,7 +296,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         #[cfg(not(windows))]
         let shell_prog = "sh";
         #[cfg(not(windows))]
-        let shell_args = vec!["-c".to_string(), command.clone()];
+        let shell_args = vec!["-c".to_string(), command.to_string()];
         let envs = deveco_node_env();
         crate::agent::exec_ctx::run_cmd_streaming_env(
             ctx, shell_prog, &shell_args, Some(&cwd), timeout, None, envs.as_deref(),

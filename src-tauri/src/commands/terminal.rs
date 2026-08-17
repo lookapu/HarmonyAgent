@@ -276,16 +276,23 @@ fn home_or(cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| cwd.to_path_buf())
 }
 
-/// 构造 cmd /C 子进程：隐藏窗口 + 当前目录 + 注入鸿蒙工具链 PATH 与 JDK 环境
+/// 构造系统 shell 子进程：隐藏窗口（Windows）+ 当前目录 + 注入鸿蒙工具链 PATH 与 JDK 环境
 /// （与 process::command 对齐：hdc/ohpm 未进系统 PATH 时终端里也能直接用）。
 fn build_term_child(command: &str, cwd: &Path) -> Result<tokio::process::Child, String> {
-    let mut cmd = tokio::process::Command::new("cmd.exe");
     #[cfg(windows)]
-    {
-        cmd.creation_flags(crate::utils::process::CREATE_NO_WINDOW);
-    }
-    // raw_arg 原样传参：Rust 默认 arg 会把内部引号转义成 \"，cmd 不识别
-    cmd.raw_arg(format!("/C {command}"));
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("cmd.exe");
+        c.creation_flags(crate::utils::process::CREATE_NO_WINDOW);
+        // raw_arg 原样传参：Rust 默认 arg 会把内部引号转义成 \"，cmd 不识别
+        c.raw_arg(format!("/C {command}"));
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("/bin/sh");
+        c.arg("-c").arg(command);
+        c
+    };
     cmd.current_dir(cwd);
     // 鸿蒙工具链目录前置到 PATH，再叠加系统 PATH
     let mut paths = crate::utils::process::extra_path_dirs();

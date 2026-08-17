@@ -412,7 +412,10 @@ pub struct HvigorCommand {
 /// （HarmonyOS 模式下 Property 不读 local.properties 的 hwsdk.dir），未设置且探测到
 /// DevEco Studio 内置 SDK 时自动注入，否则构建会以 00303217/00303312 失败。
 pub fn hvigor_command(project_path: &Path) -> Result<HvigorCommand, String> {
-    let env = if cfg!(windows) { hvigor_env() } else { Vec::new() };
+    #[cfg(windows)]
+    let env = hvigor_env();
+    #[cfg(not(windows))]
+    let env: Vec<(String, String)> = Vec::new();
     let wrapper = project_path.join("hvigor").join("hvigor-wrapper.js");
     if cfg!(windows) && wrapper.is_file() {
         return Ok(HvigorCommand {
@@ -429,7 +432,8 @@ pub fn hvigor_command(project_path: &Path) -> Result<HvigorCommand, String> {
             env,
         });
     }
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         // 软件内置工具链：官方 Command Line Tools 自带 hvigor 引擎
         if let Some(toolkit_hvigorw) = find_toolkit_hvigorw() {
             return Ok(HvigorCommand {
@@ -544,6 +548,12 @@ fn hvigor_env() -> Vec<(String, String)> {
         }
     }
     Vec::new()
+}
+
+/// 非 Windows 平台无 DevEco Studio 桌面端（hvigor 依赖 HarmonyOS CLI 工具链），返回 None。
+#[cfg(not(windows))]
+pub(crate) fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
+    None
 }
 
 /// 探测 DevEco Studio 内置工具链：hvigor 启动器 + HarmonyOS SDK 根目录。

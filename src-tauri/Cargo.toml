@@ -70,7 +70,7 @@ winreg = "0.55"
 # 继承隐藏控制台而非新建窗口，解决 GUI 程序调用命令行工具时弹出 cmd 窗口的问题
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
-[target."cfg(any(windows, macos))".dependencies]
+[target."cfg(any(windows, target_os = \"macos\"))".dependencies]
 trash = "5.2.6"
 
 # ── release 构建加速 ─────────────────────────────────────────────
