@@ -66,3 +66,6 @@ _lsp_test/
 src-tauri/runtime/
 src-tauri/resources/
 portable-build/
+
+# 参考代码（本地研读用，含嵌套 .git，不入库）
+references/deepseek-harness/
