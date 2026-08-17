@@ -1,15 +1,15 @@
 //! 全量抓取鸿蒙官方 API 知识库（diff + 参考正文）并写入真实 SQLite 库。
 //!
-//! 用法（在 src-tauri 目录下）：
-//!   cargo run --bin full_fetch                       # 用默认生产库路径
-//!   cargo run --bin full_fetch -- --seed             # 更新出厂种子库（自动备份 .bak）
-//!   cargo run --bin full_fetch -- --seed --diff-only # 只刷新种子库的版本 diff
-//!   cargo run --bin full_fetch -- --embed-only       # 只构建/重建语义向量索引
-//!   $env:DEVECO_DB="H:\path\to\deveco-switch.db"; cargo run --bin full_fetch
+//! 用法（在 src-tauri 目录下；full_fetch 需显式启用 full-fetch feature）：
+//!   cargo run --bin full_fetch --features full-fetch                       # 用默认生产库路径
+//!   cargo run --bin full_fetch --features full-fetch -- --seed             # 更新出厂种子库（自动备份 .bak）
+//!   cargo run --bin full_fetch --features full-fetch -- --seed --diff-only # 只刷新种子库的版本 diff
+//!   cargo run --bin full_fetch --features full-fetch -- --embed-only       # 只构建/重建语义向量索引
+//!   $env:DEVECO_DB="H:\path\to\deveco-switch.db"; cargo run --bin full_fetch --features full-fetch
 //!
 //! 也可只跑某一阶段：
-//!   cargo run --bin full_fetch -- --diff-only
-//!   cargo run --bin full_fetch -- --ref-only
+//!   cargo run --bin full_fetch --features full-fetch -- --diff-only
+//!   cargo run --bin full_fetch --features full-fetch -- --ref-only
 //!
 //! 默认会先抓 14 个版本的 diff（约 200+ 个 Kit 页），再根据 diff 聚合出的模块
 //! 列表抓参考正文（约 100~300 个页面），整体需联网，耗时几分钟到十几分钟。
@@ -292,7 +292,7 @@ fn run_embed(db: &DbState) -> bool {
 #[cfg(not(feature = "embedding"))]
 fn run_embed(_db: &DbState) -> bool {
     eprintln!("⚠️ 当前构建未启用 embedding feature，跳过向量索引。");
-    eprintln!("   如需建索引：cargo run --bin full_fetch --features embedding -- --embed-only");
+    eprintln!("   如需建索引：cargo run --bin full_fetch --features full-fetch,embedding -- --embed-only");
     false
 }
 

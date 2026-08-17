@@ -3,7 +3,9 @@ name = "deveco-switch"
 version = "2.0.0"
 edition = "2021"
 description = "DevEco Code Provider Manager"
-# 多二进制（deveco-switch 主程序 / full_fetch 数据脚本）时让 cargo run/tauri dev 默认选中主程序
+# 多二进制（deveco-switch 主程序 / full_fetch 数据脚本）时让 cargo run/tauri dev 默认选中主程序；
+# full_fetch 通过 required-features 门控：不启用 full-fetch feature 时 cargo build/tauri build
+# 只编译主程序（macOS universal 打包不会因缺失 full_fetch 产物而失败），需手动用时加 --features full-fetch
 default-run = "deveco-switch"
 
 # 推理加速 feature：
@@ -17,6 +19,8 @@ default-run = "deveco-switch"
 default = []
 embedding = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:tokenizers"]
 cuda = ["embedding", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# 数据抓取工具 full_fetch 的独立开关（见 [[bin]] required-features）
+full-fetch = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -64,6 +68,11 @@ candle-transformers = { version = "0.11", optional = true }
 # 避免引入 C++ 运行时(VCRUNTIME140_1/__CxxFrameHandler4)。保留 onig(纯 C 正则，WordPiece 分词仍可用)。
 tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
 candle-nn = { version = "0.11", optional = true }
+
+[[bin]]
+name = "full_fetch"
+path = "src/bin/full_fetch.rs"
+required-features = ["full-fetch"]
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 # 隐藏控制台（AllocConsole + SW_HIDE）：构建类子进程（hvigor worker 等孙进程）
