@@ -154,8 +154,7 @@ jobs:
           name: windows-artifacts
           path: |
             src-tauri/target/release/bundle/msi/*.msi
-            src-tauri/target/release/bundle/msi/*.msi.zip
-            src-tauri/target/release/bundle/msi/*.msi.zip.sig
+            src-tauri/target/release/bundle/msi/*.msi.sig
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/nsis/*.exe.sig
 
@@ -185,13 +184,15 @@ jobs:
           DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           # download-artifact 保留上传时的目录结构（bundle/dmg、bundle/msi 等嵌套），递归查找真实产物名；
-          # 文件名含空格（productName "DevEco Switch"），URL 中需 %20 编码
+          # Windows msi/exe 是自包含 updater（tauri 不产 .msi.zip，直接对安装器签名），用 nsis exe + exe.sig；
+          # macOS 用 .app.tar.gz（universal，darwin 两架构共用）；
+          # GitHub 上传资产时会把文件名中的空格替换为点（"DevEco Switch" → "DevEco.Switch"），URL 必须用点，%20 会 404
           MAC_TAR=$(find artifacts/macos -name '*.app.tar.gz' | head -1)
-          WIN_ZIP=$(find artifacts/windows -name '*.msi.zip' | head -1)
+          WIN_EXE=$(find artifacts/windows -name '*.exe' | head -1)
           MAC_SIG=$(find artifacts/macos -name '*.app.tar.gz.sig' | head -1)
-          WIN_SIG=$(find artifacts/windows -name '*.msi.zip.sig' | head -1)
-          MAC_NAME=$(basename "$MAC_TAR" | sed 's/ /%20/g')
-          WIN_NAME=$(basename "$WIN_ZIP" | sed 's/ /%20/g')
+          WIN_SIG=$(find artifacts/windows -name '*.exe.sig' | head -1)
+          MAC_NAME=$(basename "$MAC_TAR" | sed 's/ /./g')
+          WIN_NAME=$(basename "$WIN_EXE" | sed 's/ /./g')
           MAC_SIG_CONTENT=$(cat "$MAC_SIG" 2>/dev/null || echo "")
           WIN_SIG_CONTENT=$(cat "$WIN_SIG" 2>/dev/null || echo "")
 
@@ -247,8 +248,7 @@ jobs:
             artifacts/**/*.app.tar.gz
             artifacts/**/*.app.tar.gz.sig
             artifacts/**/*.msi
-            artifacts/**/*.msi.zip
-            artifacts/**/*.msi.zip.sig
+            artifacts/**/*.msi.sig
             artifacts/**/*.exe
             artifacts/**/*.exe.sig
             artifacts/**/*.dmg.sig
