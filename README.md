@@ -8,8 +8,6 @@
 
 面向 HarmonyOS / OpenHarmony 开发者的桌面 AI 编程 IDE。把多 Provider 路由、Agent 工具链、鸿蒙工程理解、设备调试、API 知识库、本地代理熔断塞进一个原生应用，让模型真正"懂"鸿蒙项目、能干活。
 
-![Agent Workspace](observation_shots/shot08_final_summary.png)
-
 ## 它是什么
 
 不是简单的 Provider 切换器。**193 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
@@ -109,8 +107,6 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 5. 部署：deploy → start_ability → read_runtime_logs
 6. 异常捕获：hilog 检测到 TypeError → 自动落诊断 → Agent 主动修
 ```
-
-![工作流](observation_shots/shot05_after_continue_wait.png)
 
 ## 技术架构
 
