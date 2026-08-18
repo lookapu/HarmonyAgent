@@ -69,3 +69,7 @@ portable-build/
 
 # 参考代码（本地研读用，含嵌套 .git，不入库）
 references/deepseek-harness/
+
+# Python 编译缓存
+__pycache__/
+*.pyc

@@ -1,5 +1,5 @@
 /// Windows 路径规范化：去掉 `std::fs::canonicalize` 产生的 `\\?\` verbatim 前缀，
-/// 还原为普通 Win32 路径（`\\?\<REF_PROJECT>` → `<REF_PROJECT>`，`\\?\UNC\host\share` → `\\host\share`），
+/// 还原为普通 Win32 路径（`\\?\D:\projects` → `D:\projects`，`\\?\UNC\host\share` → `\\host\share`），
 /// 便于界面展示与传给外部工具（git / hvigorw / hdc / cmd 等对 verbatim 路径支持不佳）。
 /// 非 Windows 或无前缀时原样返回。
 pub fn normalize_path(p: &str) -> String {
@@ -39,11 +39,11 @@ mod tests {
 
     #[test]
     fn strip_verbatim_prefix() {
-        assert_eq!(normalize_path(r"\\?\<REF_PROJECT>"), r"<REF_PROJECT>");
+        assert_eq!(normalize_path(r"\\?\D:\proj"), r"D:\proj");
         assert_eq!(normalize_path(r"\\?\C:\a\b"), r"C:\a\b");
         assert_eq!(normalize_path(r"\\?\UNC\host\share\dir"), r"\\host\share\dir");
         // 无前缀原样返回
-        assert_eq!(normalize_path(r"<REF_PROJECT>"), r"<REF_PROJECT>");
+        assert_eq!(normalize_path(r"D:\proj"), r"D:\proj");
         assert_eq!(normalize_path(r"relative/path"), r"relative/path");
         assert_eq!(normalize_path(""), "");
     }

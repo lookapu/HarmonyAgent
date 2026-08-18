@@ -417,7 +417,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// 根目录自身是鸿蒙工程，其下又嵌套多个鸿蒙/前端子工程（如 <REF_PROJECT>）。
+    /// 根目录自身是鸿蒙工程，其下又嵌套多个鸿蒙/前端子工程（如 D:\projects\harmony-app）。
     /// 命中工程根不应剪枝，子工程应被全部识别。
     #[test]
     fn detects_nested_modules_under_harmony_root() {

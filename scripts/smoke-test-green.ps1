@@ -1,7 +1,7 @@
 # 绿色版冒烟测试：启动 → 存活 60 秒 → CloseMainWindow 优雅退出
 # 注意：不能用 Stop-Process -Force（残留 SQLite WAL/.cookies 句柄锁 → 下次启动 http 插件 os error 5）
 $ErrorActionPreference = "Stop"
-$exe = "<PROJECT_ROOT>\portable-build\DevEco Switch 绿色版\deveco-switch.exe"
+$exe = Join-Path $PSScriptRoot "..\portable-build\DevEco Switch 绿色版\deveco-switch.exe"
 
 Write-Host "==> 启动绿色版 ..."
 $p = Start-Process -FilePath $exe -PassThru

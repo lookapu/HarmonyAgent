@@ -1221,19 +1221,21 @@ mod tests {
     #[tokio::test]
     async fn e2e_create_project_with_signing_reuse() {
         // 端到端：空目录 → create_harmony_project（copy_signing_from 复用参考工程签名/包名）
-        // 参考工程取真实 I:\\SNS\\harmony-sns；SDK/工具链缺失时跳过。
-        // 产物保留在 H:\\work\\code\\_e2e_new_harmony 供后续构建/部署验证。
+        // 参考工程由环境变量 E2E_REF_PROJECT 指定（开发者本机路径）；SDK/工具链缺失时跳过。
+        // 产物保留在系统临时目录供后续构建/部署验证。
         if crate::services::harmony::find_deveco_toolchain().is_none() {
             eprintln!("skip: 未找到 DevEco Studio 工具链");
             return;
         }
-        let ref_proj = Path::new(r"<REF_PROJECT>\harmony-sns");
+        let ref_proj = std::path::PathBuf::from(std::env::var("E2E_REF_PROJECT").unwrap_or_default());
         if !ref_proj.is_dir() {
-            eprintln!("skip: 参考工程不存在");
+            eprintln!("skip: 未设置 E2E_REF_PROJECT 或参考工程不存在");
             return;
         }
-        let target = Path::new(r"<PROJECT_ROOT>\_e2e_new_harmony");
-        let roots = [r"<PROJECT_ROOT>".to_string()];
+        let target = std::env::temp_dir().join("deveco_e2e_new_harmony");
+        let roots = [std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()];
         let _ = std::fs::remove_dir_all(target);
         let args = serde_json::json!({
             "path": target.to_string_lossy(),
