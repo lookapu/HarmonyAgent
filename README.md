@@ -275,7 +275,10 @@ npx tauri build
 
 <p align="center">
   <img src="docs/alipay-qr.jpg" alt="支付宝打赏二维码" width="200" />
+  <img src="docs/wechat-qr.jpg" alt="微信支付打赏二维码" width="200" />
 </p>
+
+<p align="center">支付宝 &nbsp;·&nbsp; 微信支付</p>
 
 ## License
 
