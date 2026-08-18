@@ -73,3 +73,6 @@ references/deepseek-harness/
 # Python 编译缓存
 __pycache__/
 *.pyc
+
+# 个人私有排障笔记（仅本机参考，勿提交）
+docs/PITFALLS.private.md
