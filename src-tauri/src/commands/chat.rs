@@ -3549,7 +3549,15 @@ async fn stream_chat_inner(
             crate::agent::tools::parse_tool_calls(&text)
         };
         if !outcome.tool_calls.is_empty() {
-            calls.extend(outcome.tool_calls.clone());
+            // 连接中断时原生 function calling 的参数 JSON 也可能不完整（被截断在半截），
+            // 仅保留参数可解析为合法 JSON 的调用，其余交给续写轮补全
+            let safe_calls: Vec<(String, String)> = outcome
+                .tool_calls
+                .iter()
+                .filter(|(_, args)| serde_json::from_str::<serde_json::Value>(args).is_ok())
+                .cloned()
+                .collect();
+            calls.extend(safe_calls);
         }
         if !calls.is_empty() {
             // 计划/审查模式：执行首个工具前必须取得用户对计划的批准
@@ -5439,12 +5447,19 @@ async fn stream_once(
             tool_calls: finalize_tool_calls(&native_tool_calls),
         });
     }
-    // 无结束标记的响应不静默入库，明确报错供重试
+    // 无结束标记但已有部分正文：连接被提前关闭（网络/代理抖动、服务商静默断流等）。
+    // 不直接报错丢失半截内容，也不静默入库，而是标记 interrupted 交主循环自动续写"请继续"，
+    // 由 MAX_INTERRUPT_RETRY_ROUNDS 兜底；完全空响应才视为异常报错。
     if !finished && !full.is_empty() {
-        return Err(FriendlyError::new(
-            ErrorKind::Network,
-            "流式响应不完整（未收到结束标记），可能丢失尾部内容，请重试",
-        ));
+        return Ok(StreamOutcome {
+            text: full,
+            reasoning: reasoning_full,
+            stopped: false,
+            truncated: false,
+            interrupted: true,
+            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
+            tool_calls: finalize_tool_calls(&native_tool_calls),
+        });
     }
     // 录制模式：仅正常结束路径落盘（截断/中止/报错不录，保证重放数据完整可重放）
     if let (crate::services::llm_replay::ReplayMode::Record(dir), Some(key), Some(buf)) =
