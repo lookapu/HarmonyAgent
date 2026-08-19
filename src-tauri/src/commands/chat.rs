@@ -5165,6 +5165,11 @@ async fn stream_once(
     // 同时记录最近收包时间：连接悬挂（无任何字节）超过阈值时判死退出，
     // 否则表现为“思考完不吐字、无限转圈”且无提示。
     let mut last_chunk_at = tokio::time::Instant::now();
+    // 最近“有效产出”时间：仅在收到首字节或解析出正文/思考/工具增量/结束标记时刷新。
+    // 不能用 last_chunk_at 判断停滞——服务商常在模型卡住时持续发送 SSE 心跳
+    // （: keep-alive / 空 data 行），这些字节会刷新收包时间，导致静默超时永不触发，
+    // 表现为“首字节后无限转圈、既不结束也不报错”。
+    let mut last_progress_at = tokio::time::Instant::now();
     // 首字节打点：报告从 stream_send_begin 到收到首个网络块的耗时（连接建立/TLS/代理慢）
     let mut first_byte_logged = false;
     // 同步行解析防护：每批最多处理 STREAM_YIELD_LINES 行就让出控制权，批间 touch 心跳、
@@ -5218,6 +5223,7 @@ async fn stream_once(
                         if let Some(delta) = crate::utils::net::extract_stream_delta(protocol, &json) {
                             if !delta.is_empty() {
                                 full.push_str(&delta);
+                                last_progress_at = tokio::time::Instant::now();
                                 let _ = app.emit(
                                     "chat-stream",
                                     ChatStreamEvent {
@@ -5231,6 +5237,7 @@ async fn stream_once(
                         if let Some(r) = crate::utils::net::extract_reasoning_delta(protocol, &json) {
                             if !r.is_empty() {
                                 reasoning_full.push_str(&r);
+                                last_progress_at = tokio::time::Instant::now();
                                 let _ = app.emit(
                                     "chat-reasoning",
                                     ChatReasoningEvent {
@@ -5242,6 +5249,7 @@ async fn stream_once(
                         }
                         // 原生 function calling 增量（OpenAI 兼容协议流式 tool_calls）：按 index 合并
                         if let Some((idx, name, args)) = crate::utils::net::extract_tool_call_delta(&json) {
+                            last_progress_at = tokio::time::Instant::now();
                             match native_tool_calls.iter_mut().find(|(i, _, _)| *i == idx) {
                                 Some((_, n, a)) => {
                                     if let Some(nm) = name {
@@ -5256,10 +5264,14 @@ async fn stream_once(
                             }
                         }
                         match detect_finish(protocol, &json) {
-                            FinishKind::Done => finished = true,
+                            FinishKind::Done => {
+                                finished = true;
+                                last_progress_at = tokio::time::Instant::now();
+                            }
                             FinishKind::Truncated => {
                                 truncated = true;
                                 finished = true;
+                                last_progress_at = tokio::time::Instant::now();
                             }
                             FinishKind::None => {}
                         }
@@ -5334,6 +5346,7 @@ async fn stream_once(
             Ok(Some(c)) => {
                 if !first_byte_logged {
                     first_byte_logged = true;
+                    last_progress_at = tokio::time::Instant::now();
                     crate::utils::logger::log_event(
                         "stream_first_byte",
                         serde_json::json!({
@@ -5362,14 +5375,28 @@ async fn stream_once(
                     });
                 }
                 // 连接静默超时：保留已收到内容标记中断（主循环自动续写“请继续”，
-                // 让模型从断点继续输出而不是直接报错）；半截 tool_calls 一律丢弃防误执行
-                if last_chunk_at.elapsed() > STREAM_SILENT_TIMEOUT {
+                // 让模型从断点继续输出而不是直接报错）；半截 tool_calls 一律丢弃防误执行。
+                // 判定基准用“最近有效产出”而非最近收包：模型卡住时服务商仍可能持续发送
+                // SSE 心跳字节刷新收包时间，导致停滞永远不被发现（首字节后无限转圈）。
+                // 首字节到达前仍以收包时间为准（连接/TLS 建立阶段本就没有正文）。
+                let stalled = if first_byte_logged {
+                    last_progress_at.elapsed() > STREAM_SILENT_TIMEOUT
+                } else {
+                    last_chunk_at.elapsed() > STREAM_SILENT_TIMEOUT
+                };
+                if stalled {
+                    let silent_ms = if first_byte_logged {
+                        last_progress_at.elapsed().as_millis() as i64
+                    } else {
+                        last_chunk_at.elapsed().as_millis() as i64
+                    };
                     crate::utils::logger::log_event(
                         "stream_silent_dead",
                         serde_json::json!({
                             "conversation_id": conversation_id,
                             "chars": full.chars().count(),
-                            "silent_ms": last_chunk_at.elapsed().as_millis() as i64,
+                            "silent_ms": silent_ms,
+                            "after_first_byte": first_byte_logged,
                             "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
                         }),
                     );
