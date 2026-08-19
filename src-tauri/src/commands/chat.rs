@@ -5338,7 +5338,62 @@ async fn stream_once(
                 continue; // 缓冲还有完整行：立即处理下一批，不等待网络
             }
         }
-        // ── 等待网络块（200ms 轮询停止/判死）────────────────────────────
+        // ── 停滞/停止检查（每轮必检，不能只放在轮询超时分支）──────────────
+        // 服务商在模型卡住时可能持续以 <200ms 的间隔发送 SSE 心跳/空 data 行，
+        // 若只在 timeout 的 Err 分支检查停滞，就会因一直收到字节而永远走 Ok 分支，
+        // 导致 60s 静默超时永不触发（首字节后无限转圈，8 分钟后才被看门狗杀）。
+        registry.touch(conversation_id, PHASE_STREAMING);
+        if is_cancelled(cancel, conversation_id) {
+            crate::utils::logger::log_event(
+                "stop_effective",
+                serde_json::json!({
+                    "phase": "stream_pre_poll",
+                    "conversation_id": conversation_id,
+                    "chars": full.chars().count(),
+                }),
+            );
+            return Ok(StreamOutcome {
+                text: full,
+                reasoning: reasoning_full,
+                stopped: true,
+                truncated: false,
+                interrupted: false,
+                usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
+                tool_calls: Vec::new(),
+            });
+        }
+        let stalled = if first_byte_logged {
+            last_progress_at.elapsed() > STREAM_SILENT_TIMEOUT
+        } else {
+            last_chunk_at.elapsed() > STREAM_SILENT_TIMEOUT
+        };
+        if stalled {
+            let silent_ms = if first_byte_logged {
+                last_progress_at.elapsed().as_millis() as i64
+            } else {
+                last_chunk_at.elapsed().as_millis() as i64
+            };
+            crate::utils::logger::log_event(
+                "stream_silent_dead",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "chars": full.chars().count(),
+                    "silent_ms": silent_ms,
+                    "after_first_byte": first_byte_logged,
+                    "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
+                }),
+            );
+            return Ok(StreamOutcome {
+                text: full,
+                reasoning: reasoning_full,
+                stopped: false,
+                truncated: false,
+                interrupted: true,
+                usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
+                tool_calls: Vec::new(),
+            });
+        }
+        // ── 等待网络块（200ms 轮询，仅用于把停止/停滞检查粒度压到 200ms）─────
         let chunk = match tokio::time::timeout(
             std::time::Duration::from_millis(200),
             stream.next(),
@@ -5363,57 +5418,7 @@ async fn stream_once(
                 })?
             }
             Ok(None) => break 'outer,
-            Err(_) => {
-                registry.touch(conversation_id, PHASE_STREAMING);
-                if is_cancelled(cancel, conversation_id) {
-                    return Ok(StreamOutcome {
-                        text: full,
-                        reasoning: reasoning_full,
-                        stopped: true,
-                        truncated: false,
-                        interrupted: false,
-                        usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-                        tool_calls: Vec::new(),
-                    });
-                }
-                // 连接静默超时：保留已收到内容标记中断（主循环自动续写“请继续”，
-                // 让模型从断点继续输出而不是直接报错）；半截 tool_calls 一律丢弃防误执行。
-                // 判定基准用“最近有效产出”而非最近收包：模型卡住时服务商仍可能持续发送
-                // SSE 心跳字节刷新收包时间，导致停滞永远不被发现（首字节后无限转圈）。
-                // 首字节到达前仍以收包时间为准（连接/TLS 建立阶段本就没有正文）。
-                let stalled = if first_byte_logged {
-                    last_progress_at.elapsed() > STREAM_SILENT_TIMEOUT
-                } else {
-                    last_chunk_at.elapsed() > STREAM_SILENT_TIMEOUT
-                };
-                if stalled {
-                    let silent_ms = if first_byte_logged {
-                        last_progress_at.elapsed().as_millis() as i64
-                    } else {
-                        last_chunk_at.elapsed().as_millis() as i64
-                    };
-                    crate::utils::logger::log_event(
-                        "stream_silent_dead",
-                        serde_json::json!({
-                            "conversation_id": conversation_id,
-                            "chars": full.chars().count(),
-                            "silent_ms": silent_ms,
-                            "after_first_byte": first_byte_logged,
-                            "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
-                        }),
-                    );
-                    return Ok(StreamOutcome {
-                        text: full,
-                        reasoning: reasoning_full,
-                        stopped: false,
-                        truncated: false,
-                        interrupted: true,
-                        usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-                        tool_calls: Vec::new(),
-                    });
-                }
-                continue;
-            }
+            Err(_) => continue,
         };
         total_bytes += chunk.len();
         // 响应体积超限：立即中断报错（可重试），防止异常巨大流持续烧资源
