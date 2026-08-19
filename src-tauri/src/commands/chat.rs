@@ -5186,6 +5186,11 @@ async fn stream_once(
     let mut total_bytes: usize = 0;
     let mut lines_parsed: usize = 0;
     let parse_started = tokio::time::Instant::now();
+    // 停滞 wall-clock deadline：独立于流读取 future 计时。即便 stream.next()
+    // 在某些挂起连接上不响应取消/不被唤醒（实测会导致内部 200ms 轮询与 reqwest
+    // 120s 总超时双双失效、8 分钟后才被看门狗杀），select! 也会在此 deadline
+    // 到达时强制跳出。每收到有效产出就重置。
+    let mut stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
     'outer: loop {
         // ── 优先消化缓冲行（分批，批间让出）────────────────────────────
         // 同步解析期间不 await：必须分批让出，否则海量行响应长时间无心跳
@@ -5193,6 +5198,7 @@ async fn stream_once(
         if !buffer.is_empty() {
             let mut consumed = 0;
             let mut batch = 0;
+            let progress_before = last_progress_at;
             while batch < STREAM_YIELD_LINES {
                 let Some(pos) = buffer[consumed..].iter().position(|b| *b == b'\n') else {
                     break; // 尾部残片（无换行），留待后续 chunk 合并后再处理
@@ -5285,6 +5291,11 @@ async fn stream_once(
             // 海量行时总拷贝量 O(n²) 成为长同步处理的主要耗时）
             buffer.drain(..consumed);
             registry.touch(conversation_id, PHASE_STREAMING);
+            // 仅当本批解析出有效产出（正文/思考/工具增量/结束标记）时才重置停滞 deadline，
+            // 避免纯心跳/空 data 行持续刷新导致永不超时（退回无限转圈的老 bug）。
+            if last_progress_at > progress_before {
+                stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+            }
             // 总时长上限：即使体积/行数均未超限，同步解析累计超过阈值也强制中断
             // （防每行处理开销大的异常响应把线程拖垮），中断后可重试。
             if parse_started.elapsed().as_secs() > STREAM_PARSE_MAX_SECS {
@@ -5338,10 +5349,10 @@ async fn stream_once(
                 continue; // 缓冲还有完整行：立即处理下一批，不等待网络
             }
         }
-        // ── 停滞/停止检查（每轮必检，不能只放在轮询超时分支）──────────────
-        // 服务商在模型卡住时可能持续以 <200ms 的间隔发送 SSE 心跳/空 data 行，
-        // 若只在 timeout 的 Err 分支检查停滞，就会因一直收到字节而永远走 Ok 分支，
-        // 导致 60s 静默超时永不触发（首字节后无限转圈，8 分钟后才被看门狗杀）。
+        // ── 停止检查（停滞硬截止由下方 select! 的 sleep_until 权威处理）──────
+        // 注意：不能只靠 elapsed 判断——若代码卡在 stream.next().await 内部
+        // （挂起连接上 future 不被唤醒），根本到不了这里。wall-clock deadline
+        // 独立于流 future 计时，是真正可靠的兜底。
         registry.touch(conversation_id, PHASE_STREAMING);
         if is_cancelled(cancel, conversation_id) {
             crate::utils::logger::log_event(
@@ -5362,64 +5373,84 @@ async fn stream_once(
                 tool_calls: Vec::new(),
             });
         }
-        let stalled = if first_byte_logged {
-            last_progress_at.elapsed() > STREAM_SILENT_TIMEOUT
-        } else {
-            last_chunk_at.elapsed() > STREAM_SILENT_TIMEOUT
-        };
-        if stalled {
-            let silent_ms = if first_byte_logged {
-                last_progress_at.elapsed().as_millis() as i64
-            } else {
-                last_chunk_at.elapsed().as_millis() as i64
-            };
-            crate::utils::logger::log_event(
-                "stream_silent_dead",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "chars": full.chars().count(),
-                    "silent_ms": silent_ms,
-                    "after_first_byte": first_byte_logged,
-                    "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
-                }),
-            );
-            return Ok(StreamOutcome {
-                text: full,
-                reasoning: reasoning_full,
-                stopped: false,
-                truncated: false,
-                interrupted: true,
-                usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-                tool_calls: Vec::new(),
-            });
-        }
-        // ── 等待网络块（200ms 轮询，仅用于把停止/停滞检查粒度压到 200ms）─────
-        let chunk = match tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            stream.next(),
-        )
-        .await
-        {
-            Ok(Some(c)) => {
-                if !first_byte_logged {
-                    first_byte_logged = true;
-                    last_progress_at = tokio::time::Instant::now();
+        // ── 等待网络块：select! 三路竞速 ──────────────────────────────
+        // 1) stream.next()     收到数据
+        // 2) 200ms tick        轮询停止标志（让点击停止 200ms 内生效）
+        // 3) stall_deadline    wall-clock 停滞硬截止（60s 无有效产出），
+        //    独立于 reqest 流：即便 stream.next() 在挂起连接上不被唤醒，
+        //    tokio::time::sleep 也会触发，彻底避免无限转圈
+        let chunk = tokio::select! {
+            c = stream.next() => match c {
+                Some(Ok(bytes)) => {
+                    if !first_byte_logged {
+                        first_byte_logged = true;
+                        last_progress_at = tokio::time::Instant::now();
+                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+                        crate::utils::logger::log_event(
+                            "stream_first_byte",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "elapsed_ms": last_chunk_at.elapsed().as_millis() as i64,
+                            }),
+                        );
+                    }
+                    last_chunk_at = tokio::time::Instant::now();
+                    Some(bytes)
+                }
+                Some(Err(e)) => {
+                    return Err(FriendlyError::new(
+                        ErrorKind::Network,
+                        format!("读取响应失败: {e}"),
+                    ));
+                }
+                None => None,
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                registry.touch(conversation_id, PHASE_STREAMING);
+                if is_cancelled(cancel, conversation_id) {
                     crate::utils::logger::log_event(
-                        "stream_first_byte",
+                        "stop_effective",
                         serde_json::json!({
+                            "phase": "stream_poll_tick",
                             "conversation_id": conversation_id,
-                            "elapsed_ms": last_chunk_at.elapsed().as_millis() as i64,
+                            "chars": full.chars().count(),
                         }),
                     );
+                    return Ok(StreamOutcome {
+                        text: full,
+                        reasoning: reasoning_full,
+                        stopped: true,
+                        truncated: false,
+                        interrupted: false,
+                        usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
+                        tool_calls: Vec::new(),
+                    });
                 }
-                last_chunk_at = tokio::time::Instant::now();
-                c.map_err(|e| {
-                    FriendlyError::new(ErrorKind::Network, format!("读取响应失败: {e}"))
-                })?
+                continue;
             }
-            Ok(None) => break 'outer,
-            Err(_) => continue,
+            _ = tokio::time::sleep_until(stall_deadline) => {
+                crate::utils::logger::log_event(
+                    "stream_silent_dead",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "chars": full.chars().count(),
+                        "after_first_byte": first_byte_logged,
+                        "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
+                        "via": "wall_clock_deadline",
+                    }),
+                );
+                return Ok(StreamOutcome {
+                    text: full,
+                    reasoning: reasoning_full,
+                    stopped: false,
+                    truncated: false,
+                    interrupted: true,
+                    usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
+                    tool_calls: Vec::new(),
+                });
+            }
         };
+        let Some(chunk) = chunk else { break 'outer };
         total_bytes += chunk.len();
         // 响应体积超限：立即中断报错（可重试），防止异常巨大流持续烧资源
         if total_bytes > STREAM_MAX_BYTES {
