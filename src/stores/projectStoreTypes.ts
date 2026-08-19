@@ -86,6 +86,8 @@ export interface TerminalEntry {
 
 /** 构建/部署流式日志行（来自后端 agent:log 事件） */
 export interface BuildLogLine {
+  /** 稳定自增 id，用作 React key，避免下标 key 在丢弃头部时整列重渲染 */
+  id: number
   /** "stdout" | "stderr" | "system" */
   stream: string
   line: string

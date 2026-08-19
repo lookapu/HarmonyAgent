@@ -37,6 +37,19 @@ import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
 
+/**
+ * agent:log 高频日志的 rAF 批处理缓冲。
+ * hvigor/hdc 在构建/部署期可每秒输出数百上千行，若逐行 set 三份大状态并牵连 Home
+ * 整树重渲染，会把主线程占满导致交互卡死。这里把日志行攒到缓冲，用 requestAnimationFrame
+ * 每帧（约 16ms）合并一次 set，把每秒数百次更新压到约 60 次，且一次只做一次字符串拼接。
+ */
+type PendingLogLine = { stream: string; line: string; ts: number; convId: string }
+let pendingLogLines: PendingLogLine[] = []
+let logFlushScheduled = false
+/** buildLogs 全局自增 id，用作稳定 React key（清屏后归零无妨，key 仅在当前列表内唯一） */
+let buildLogSeq = 0
+const nextBuildLogId = () => ++buildLogSeq
+
 /** localStorage key 前缀：持久化每个项目上次打开的会话 ID（统一见 src/constants.ts 的 STORAGE_KEYS.LAST_CONV_PREFIX） */
 
 /** 看门狗静默阈值：超过该时长无内容/思考增量且无运行中工具/挂起审批，判定后端挂起 */
@@ -634,7 +647,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     const { job_id, command, ok, summary } = event.payload
     const state = get()
     const line = `[后台任务 ${job_id}] ${ok ? '完成' : '失败'}：${command}（${summary}）`
-    const next = [...state.buildLogs, { stream: 'system' as const, line, ts: Date.now() }]
+    const next = [...state.buildLogs, { id: nextBuildLogId(), stream: 'system' as const, line, ts: Date.now() }]
     const trimmed = next.length > 2000 ? next.slice(next.length - 2000) : next
     set({ buildLogs: trimmed })
     sendNotification(ok ? '后台任务完成' : '后台任务失败', `${command}｜${summary}`, ok ? 'success' : 'error').catch(
@@ -643,45 +656,61 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   }).catch(() => {})
 
   // 构建/部署流式日志（agent:log）：按行累积到 buildLogs，任务开始时清空，保留最近 2000 行；
-  // 同时把行追加到当前运行中工具的 liveOutput（工具卡片实时可见执行过程）
+  // 同时把行追加到当前运行中工具的 liveOutput（工具卡片实时可见执行过程）。
+  // 高频输出下用 rAF 批处理：日志先进缓冲，每帧合并一次 set，避免逐行 set 卡死主线程。
+  const flushPendingLogs = () => {
+    logFlushScheduled = false
+    const batch = pendingLogLines
+    pendingLogLines = []
+    if (batch.length === 0) return
+    const state = get()
+    const convId = state.currentConversation?.id
+    if (!convId) return
+    // 批内可能混入已切换会话后的残留事件，按当前会话过滤
+    const lines = batch.filter((l) => l.convId === convId)
+    if (lines.length === 0) return
+
+    // buildLogs 追加（保留最近 2000 行）
+    const merged = [
+      ...state.buildLogs,
+      ...lines.map(({ stream, line, ts }) => ({ id: nextBuildLogId(), stream, line, ts })),
+    ]
+    const trimmed = merged.length > 2000 ? merged.slice(merged.length - 2000) : merged
+
+    // 把本批 stdout/stderr 行一次性拼到运行中工具/终端的 liveOutput 尾部，避免每行 O(n) 复制
+    const appendLive = (entries: { status: string; liveOutput?: string }[]) => {
+      const lastRunning = entries.reduce((acc, x, i) => (x.status === 'running' ? i : acc), -1)
+      if (lastRunning < 0) return entries
+      let acc = ''
+      for (const l of lines) {
+        if (l.stream !== 'system') acc += l.line + '\n'
+      }
+      if (!acc) return entries
+      return entries.map((r, idx) => {
+        if (idx !== lastRunning) return r
+        const prev = r.liveOutput ?? ''
+        const capped = prev.length > 80000 ? prev.slice(prev.length - 40000) : prev
+        return { ...r, liveOutput: capped + acc }
+      })
+    }
+
+    set({
+      buildLogs: trimmed,
+      toolRuns: appendLive(state.toolRuns) as typeof state.toolRuns,
+      terminalEntries: appendLive(state.terminalEntries) as typeof state.terminalEntries,
+    })
+  }
+
   listen<{ conversation_id: string; stream: string; line: string }>('agent:log', (event) => {
     const { conversation_id, stream, line } = event.payload
     const state = get()
     // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
     if (state.currentConversation?.id !== conversation_id) return
-    const next = [...state.buildLogs, { stream, line, ts: Date.now() }]
-    // 超长时丢弃旧的头部，避免长时间构建导致内存膨胀
-    const trimmed = next.length > 2000 ? next.slice(next.length - 2000) : next
-    set({
-      buildLogs: trimmed,
-      // 追加到最近一个运行中工具的实时输出（仅 stdout/stderr；system 提示不进卡片）
-      toolRuns: stream === 'system'
-        ? state.toolRuns
-        : (() => {
-            const lastRunning = state.toolRuns.reduce((acc, x, i) => (x.status === 'running' ? i : acc), -1)
-            if (lastRunning < 0) return state.toolRuns
-            return state.toolRuns.map((r, idx) => {
-              if (idx !== lastRunning) return r
-              const prev = r.liveOutput ?? ''
-              // 保留尾部（约 8 万字符），避免超长构建撑爆渲染
-              const capped = prev.length > 80000 ? prev.slice(prev.length - 40000) : prev
-              return { ...r, liveOutput: capped + line + '\n' }
-            })
-          })(),
-      // 终端面板同步：同一运行中条目的实时输出
-      terminalEntries: stream === 'system'
-        ? state.terminalEntries
-        : (() => {
-            const lastRunning = state.terminalEntries.reduce((acc, x, i) => (x.status === 'running' ? i : acc), -1)
-            if (lastRunning < 0) return state.terminalEntries
-            return state.terminalEntries.map((e, idx) => {
-              if (idx !== lastRunning) return e
-              const prev = e.liveOutput ?? ''
-              const capped = prev.length > 80000 ? prev.slice(prev.length - 40000) : prev
-              return { ...e, liveOutput: capped + line + '\n' }
-            })
-          })(),
-    })
+    pendingLogLines.push({ stream, line, ts: Date.now(), convId: conversation_id })
+    if (!logFlushScheduled) {
+      logFlushScheduled = true
+      requestAnimationFrame(flushPendingLogs)
+    }
   }).catch(() => {})
 
   // 任务清单（todo_write）：后端推送合并后的完整清单，前端实时渲染进度

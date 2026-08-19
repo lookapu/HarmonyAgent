@@ -547,8 +547,10 @@ export function TerminalPanel({
     )
   }, [entries, kw])
   const filteredBuild = useMemo(() => (kw ? buildLogs.filter((l) => l.line.toLowerCase().includes(kw)) : buildLogs), [buildLogs, kw])
-  // 构建/部署进行中（system 行出现开始标记，或最近 2s 内有新日志）时自动切到构建日志
-  const building = buildLogs.some((l) => l.stream === 'system' && /开始|部署|安装|启动/.test(l.line))
+  // 构建/部署进行中（最近 60 行出现开始标记，或最近 2s 内有新日志）时自动切到构建日志。
+  // 只扫尾部，避免每次 render 遍历最多 2000 行。
+  const tailBuild = buildLogs.slice(-60)
+  const building = tailBuild.some((l) => l.stream === 'system' && /开始|部署|安装|启动/.test(l.line))
   useEffect(() => {
     if (building) setTab('build')
   }, [building])
@@ -562,7 +564,8 @@ export function TerminalPanel({
   // 新条目追加/运行中输出增长时自动滚动到底部，追踪最新执行输出
   const lastEntry = filteredEntries[filteredEntries.length - 1]
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    // 即时跳转：构建/部署期日志高频追加，smooth 滚动会持续产生合成帧叠加渲染导致掉帧
+    bottomRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
   }, [
     filteredEntries.length,
     lastEntry?.status,
@@ -688,7 +691,7 @@ export function TerminalPanel({
             </div>
           ) : (
             <div>
-              {filteredBuild.map((l, i) => {
+              {filteredBuild.map((l) => {
                 const hasColor = hasAnsi(l.line)
                 const color =
                   hasColor
@@ -699,7 +702,7 @@ export function TerminalPanel({
                         ? 'text-[#58a6ff] font-semibold'
                         : 'text-[#c9d1d9]'
                 return (
-                  <div key={i} className={`whitespace-pre-wrap break-all ${color}`}>
+                  <div key={l.id} className={`whitespace-pre-wrap break-all ${color}`}>
                     {hasColor ? <AnsiText text={l.line} /> : l.line}
                   </div>
                 )
