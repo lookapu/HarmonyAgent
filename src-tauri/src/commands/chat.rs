@@ -5434,7 +5434,29 @@ async fn stream_once(
         }
         buffer.extend_from_slice(&chunk);
     }
-    // 截断：不报错退出，保留已输出内容并标记 truncated，由主循环决定追加“请继续”续写。
+    // 流读取结束（连接关闭/读完）后，优先检查用户是否在此期间点了停止。
+    // 否则连接恰在停止前关闭会落到下方 interrupted 分支，主循环自动续写"请继续"，
+    // 表现为"点了停止却停不下来、重试提示已有任务进行中"。
+    if is_cancelled(cancel, conversation_id) {
+        crate::utils::logger::log_event(
+            "stop_effective",
+            serde_json::json!({
+                "phase": "stream_after_break",
+                "conversation_id": conversation_id,
+                "chars": full.chars().count(),
+            }),
+        );
+        return Ok(StreamOutcome {
+            text: full,
+            reasoning: reasoning_full,
+            stopped: true,
+            truncated: false,
+            interrupted: false,
+            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
+            tool_calls: Vec::new(),
+        });
+    }
+    // 截断：不报错退出，保留已输出内容并标记 truncated，由主循环决定追加"请继续"续写。
     // 注意：输出截断不等于上下文超限，裁剪历史对其无效，必须续写才能继续。
     if truncated {
         return Ok(StreamOutcome {
