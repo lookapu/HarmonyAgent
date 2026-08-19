@@ -16,6 +16,23 @@ function closeOpenFence(md: string): string {
   return md
 }
 
+/** 流式过程中，模型可能正在写入工具标记（如结尾停在“【TO”“【TOOL|read_file|{”），
+ *  sanitizeToolMarkers 只能清理结构完整的标记，未写完整的标记前缀会作为正文碎片闪烁。
+ *  仅在“最后一个【TOOL 起始符之后再无结束符】且其后内容看起来是标记体（无句号/段落边界）”时，
+ *  从该前缀起截断展示（真实内容不变，下一块到达后会重新计算）。 */
+function hideIncompleteToolMarker(md: string): string {
+  const lastStart = md.lastIndexOf('【TOOL')
+  if (lastStart < 0) return md
+  const tail = md.slice(lastStart)
+  // 已有完整标记结束符就交给 sanitizeToolMarkers，不在此处理
+  if (tail.includes('】') || tail.includes(']}')) return md
+  // 标记前缀之后出现了明显的正文结束标点/段落，说明【TOOL 可能是正文内容而非标记，保留
+  if (/[。！？\n]/.test(tail)) return md
+  // 标记体过长（超过 400 字符仍无结束符），多半是正文，不再截断避免误删
+  if (tail.length > 400) return md
+  return md.slice(0, lastStart)
+}
+
 /** diff 文本按行着色：+ 绿 / - 红 / @@ 蓝（未跟踪新文件预览保持默认色） */
 export function DiffText({ text }: { text: string }) {
   return (
@@ -534,7 +551,7 @@ export const StreamingMessage = memo(function StreamingMessage({ content, reason
   const shown = display
   // 缓存 sanitizeToolMarkers + closeOpenFence 结果：节流渲染时避免重复正则处理长文本
   const processedContent = useMemo(
-    () => closeOpenFence(sanitizeToolMarkers(shown.content)),
+    () => hideIncompleteToolMarker(closeOpenFence(sanitizeToolMarkers(shown.content))),
     [shown.content],
   )
   return (

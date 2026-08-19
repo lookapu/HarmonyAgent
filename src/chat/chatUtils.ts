@@ -74,14 +74,121 @@ function locate(nodes: Text[], globalOffset: number): [Node, number] {
   return [last, last.textContent!.length]
 }
 
-/** 渲染 Agent 文本：去掉残留的工具标记（工具调用已由 ToolRunGroup 折叠卡片展示，正文不重复显示）
- * 结束符容错：模型偶发把【TOOL|...】的】写成 ]} 或 ]，或整行漏写，一并清理；
- * 标记参数若被截断泄漏，后端 JSON 结构扫描（tools.rs mark_end_offset）为权威清理，此处仅实时渲染兜底 */
+/** 渲染 Agent 文本：去掉残留的工具标记（工具调用已由 ToolRunGroup 折叠卡片展示，正文不重复显示）。
+ * 采用字符扫描器（移植自 Rust 端 strip_tool_calls/mark_end_offset），可跨行识别 JSON 参数边界，
+ * 避免正则方案在多行参数（如 edit_file 的 old/new 含换行）时把后续行的 {"path":...、}、】 泄漏成正文碎片。
+ * 结束符容错：】 / ]} / ] / 漏写结束符但 JSON 完整；JSON 残缺（流式截断）时丢弃该标记及其后全部内容。 */
+const TOOL_MARK_START = '【TOOL|'
+const TOOL_MARK_END = '】'
+
 export function sanitizeToolMarkers(text: string): string {
-  // 第一遍：清理完整标记（】/]} 结束，或标记独立成行自然到行尾/串尾）。
-  // 注意不使用 `](?=\s|$)` 作为结束符：JSON 参数内 `] `（如 "arr[1] = 2"）会被误截断产生碎片
-  text = text.replace(/【TOOL\|[^|】\n]+(?:\|[^】\n]*?)?(?:】|]}|(?=\n|$))/g, '')
-  // 第二遍：清理残缺标记（流式截断/漏写结束符且后跟同行正文）：从【TOOL| 删到行尾。
-  // 与后端 strip_tool_calls 的 None 分支一致：宁丢少量正文也不把代码碎片展示给用户
-  return text.replace(/【TOOL\|[^\n]*/g, '')
+  let out = ''
+  let rest = text
+  while (true) {
+    const start = rest.indexOf(TOOL_MARK_START)
+    if (start < 0) {
+      out += rest
+      break
+    }
+    out += rest.slice(0, start)
+    const after = rest.slice(start + TOOL_MARK_START.length)
+    const boundary = findMarkerEnd(after)
+    if (boundary == null) {
+      // 参数残缺且无任何结束符（流式截断）：丢弃标记及其后全部内容（与 Rust None 分支一致）
+      break
+    }
+    rest = after.slice(boundary)
+  }
+  return out
+}
+
+/** 在 【TOOL| 之后的文本中定位标记结束位置（返回相对 after 的偏移）。
+ * 先按 JSON 结构定位参数末尾，再识别结束符 】 > ]} > ]；JSON 完整但漏写结束符时以 JSON 末尾为界；
+ * JSON 无法识别时回退到首个 】 / ]} / 换行。完全无法定位返回 null（整段丢弃）。 */
+function findMarkerEnd(after: string): number | null {
+  // 跳过工具名段，找第一个 | 作为参数起点（允许跨行）
+  const pipe = after.indexOf('|')
+  const paramFrom = pipe >= 0 ? pipe + 1 : 0
+  let i = paramFrom
+  while (i < after.length && /\s/.test(after[i])) i++
+  if (i < after.length) {
+    const jsonEnd = scanJsonValue(after, i)
+    if (jsonEnd > i) {
+      let p = jsonEnd
+      while (p < after.length && /[ \t]/.test(after[p])) p++
+      // 结束符变体：】 / ]} / ]
+      if (after.startsWith(TOOL_MARK_END, p)) return p + TOOL_MARK_END.length
+      if (after.startsWith(']}', p)) return p + 2
+      if (after[p] === ']') return p + 1
+      // 容错：JSON 后又跟一段 |...】（模型多写了一段尾注），吞到结束符/换行
+      if (after[p] === '|') {
+        const rest = after.slice(p)
+        const e = rest.indexOf(TOOL_MARK_END)
+        if (e >= 0) return p + e + TOOL_MARK_END.length
+        const nl = rest.indexOf('\n')
+        if (nl >= 0) return p + nl + 1
+        return after.length
+      }
+      // JSON 完整但漏写结束符：以 JSON 末尾为界，保留其后正文
+      return jsonEnd
+    }
+  }
+  // 回退：非完整 JSON（残缺/纯文本）时按结束符/换行定位
+  const e1 = after.indexOf(TOOL_MARK_END)
+  if (e1 >= 0) return e1 + TOOL_MARK_END.length
+  const e2 = after.indexOf(']}')
+  if (e2 >= 0) return e2 + 2
+  const nl = after.indexOf('\n')
+  if (nl >= 0) return nl + 1
+  return null
+}
+
+/** 从 pos 起扫描一个 JSON 值（对象/数组/字符串/字面量/数字），返回值结束后的偏移；无法识别返回 pos。
+ * 字符串内的括号/引号按内容跳过，深度上限 64 防异常输入。 */
+function scanJsonValue(s: string, pos: number): number {
+  let i = pos
+  const ch = s[i]
+  if (ch === '{' || ch === '[') {
+    let depth = 0
+    while (i < s.length) {
+      const c = s[i]
+      if (c === '"') {
+        i = scanJsonString(s, i)
+        continue
+      }
+      if (c === '{' || c === '[') {
+        depth++
+        if (depth > 64) return pos
+      } else if (c === '}' || c === ']') {
+        depth--
+        if (depth === 0) return i + 1
+      }
+      i++
+    }
+    return pos // 未闭合
+  }
+  if (ch === '"') return scanJsonString(s, pos)
+  if (ch === 't' || ch === 'f' || ch === 'n') {
+    const m = /^(true|false|null)/.exec(s.slice(pos))
+    return m ? pos + m[0].length : pos
+  }
+  if (ch === '-' || (ch >= '0' && ch <= '9')) {
+    let j = pos + 1
+    while (j < s.length && /[-0-9.eE+]/.test(s[j])) j++
+    return j
+  }
+  return pos
+}
+
+function scanJsonString(s: string, pos: number): number {
+  let i = pos + 1
+  while (i < s.length) {
+    if (s[i] === '\\') {
+      i += 2
+      continue
+    }
+    if (s[i] === '"') return i + 1
+    i++
+  }
+  return pos
 }

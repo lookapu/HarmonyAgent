@@ -4379,47 +4379,47 @@ export default function Home() {
                             const done = todos.filter((t) => t.status === 'done').length
                             const pct = Math.round((done / todos.length) * 100)
                             return (
-                              <details
-                                className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 overflow-hidden animate-fade-in-up"
-                                open={todoOpen}
-                                onToggle={(e) => {
-                                  setTodoOpen(e.currentTarget.open)
-                                  todoAutoRef.current = true
-                                }}
-                              >
-                                <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
-                                  <Icon name="check" size={12} className="text-[var(--accent)] shrink-0" />
-                                  <span className="text-[12px] font-semibold">{t('home.todoTitle')}</span>
-                                  <span className="text-[11px] text-[var(--text-muted)]">{done}/{todos.length}</span>
-                                  <div className="ml-auto h-1.5 w-14 rounded-full bg-[var(--bg-hover)] overflow-hidden">
+                              <div className="overflow-hidden animate-fade-in-up">
+                                <button
+                                  type="button"
+                                  onClick={() => setTodoOpen((v) => !v)}
+                                  className="w-full flex items-center gap-2 py-1.5 text-left hover:opacity-80 transition-opacity"
+                                >
+                                  <Icon name="check" size={11} className="text-[var(--accent)] shrink-0" />
+                                  <span className="text-[12px] text-[var(--text-secondary)]">{t('home.todoTitle')}</span>
+                                  <span className="text-[11px] text-[var(--text-muted)] tabular-nums">{done}/{todos.length}</span>
+                                  <div className="ml-auto h-1 w-12 rounded-full bg-[var(--bg-hover)] overflow-hidden">
                                     <div className="h-full rounded-full bg-[var(--accent)] transition-all" style={{ width: `${pct}%` }} />
                                   </div>
-                                </summary>
-                                <div className="px-3 pb-3 pt-1 border-t border-[var(--border)] max-h-56 overflow-y-auto space-y-1.5">
-                                  {todos.map((td) => (
-                                    <div key={td.id} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
-                                      {td.status === 'done' ? (
-                                        <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
-                                      ) : td.status === 'in_progress' ? (
-                                        <span className="w-2.5 h-2.5 rounded-full border-2 border-[var(--accent)] bg-[var(--accent)]/30 animate-pulse shrink-0 mt-0.5" />
-                                      ) : (
-                                        <span className="w-2.5 h-2.5 rounded-full border border-[var(--border)] shrink-0 mt-0.5" />
-                                      )}
-                                      <span
-                                        className={
-                                          td.status === 'done'
-                                            ? 'line-through text-[var(--text-muted)]'
-                                            : td.status === 'in_progress'
-                                              ? 'text-[var(--accent)] font-medium'
-                                              : 'text-[var(--text-secondary)]'
-                                        }
-                                      >
-                                        {td.content}
-                                      </span>
-                                    </div>
-                                  ))}
-                                </div>
-                              </details>
+                                  <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform shrink-0 ${todoOpen ? 'rotate-90' : ''}`} />
+                                </button>
+                                {todoOpen && (
+                                  <div className="border-t border-[var(--border)]/60 py-1.5 space-y-0.5">
+                                    {todos.map((td) => (
+                                      <div key={td.id} className="flex items-start gap-2 py-0.5 text-[12px] leading-relaxed">
+                                        {td.status === 'done' ? (
+                                          <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
+                                        ) : td.status === 'in_progress' ? (
+                                          <span className="w-2.5 h-2.5 mt-0.5 rounded-full border-2 border-[var(--accent)] border-t-transparent animate-spin shrink-0" />
+                                        ) : (
+                                          <span className="w-2.5 h-2.5 mt-1 rounded-full border border-[var(--border)] shrink-0" />
+                                        )}
+                                        <span
+                                          className={
+                                            td.status === 'done'
+                                              ? 'text-[var(--text-muted)] line-through'
+                                              : td.status === 'in_progress'
+                                                ? 'text-[var(--accent)] font-medium'
+                                                : 'text-[var(--text-secondary)]'
+                                          }
+                                        >
+                                          {td.content}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
                             )
                           })()}
                           {/* 任务账本（Ledger 协议）：目标/已验证/待解决/下一步，每轮实时刷新；任务中断后保留展示 */}

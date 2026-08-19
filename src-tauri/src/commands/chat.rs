@@ -3938,15 +3938,17 @@ async fn stream_chat_inner(
                 let retried = retry_with_backoff(
                     &TOOL_POLICY,
                     &mut || {
-                        crate::agent::tools::run_tool(
+                        run_tool_with_guard(
                             &tool,
                             &args_raw,
                             &project_path,
                             &path_hints,
                             &project_id,
-                            &*state,
+                            &state,
                             &mcp,
                             &tool_ctx,
+                            &cancel,
+                            &conversation_id,
                         )
                     },
                     |e: &String| crate::agent::tools::is_retryable_err(e),
@@ -6225,17 +6227,27 @@ async fn run_subagent(
             if let Err(intercept) = crate::agent::tools::run_pre_hooks(&inv).await {
                 return Err(format!("子任务工具调用被拦截，已终止: {}", intercept.message));
             }
-            let mut result = crate::agent::tools::run_tool(
-                &tool,
-                &args_raw,
-                project_path,
-                path_hints,
-                project_id,
-                &*state,
-                &mcp,
-                &tool_ctx,
+            let mut result = match tokio::time::timeout(
+                TOOL_EXEC_TIMEOUT,
+                crate::agent::tools::run_tool(
+                    &tool,
+                    &args_raw,
+                    project_path,
+                    path_hints,
+                    project_id,
+                    &*state,
+                    &mcp,
+                    &tool_ctx,
+                ),
             )
-            .await;
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(format!(
+                    "工具执行超时（>{}s）：{tool}",
+                    TOOL_EXEC_TIMEOUT.as_secs()
+                )),
+            };
             // 统一护栏后处理：护栏记录/大输出落盘（与主 Agent 同套 post 钩子）
             crate::agent::tools::run_post_hooks(&inv, &mut result).await;
             tool_limits::record_tool_call(conversation_id, &tool, &args_raw);
@@ -6270,6 +6282,49 @@ async fn run_subagent(
 
 /// 单批次并发工具数上限（只读工具并行，写工具串行 barrier）
 const MAX_TOOL_CONCURRENCY: usize = 4;
+
+/// 单个工具执行硬超时：兜底防止某个工具因同步 IO 阻塞（网络盘/被占用文件/设备句柄）
+/// 或第三方调用永久挂起，拖死整个并行批次（join_all 无超时会一直等待）。
+/// 超时按可重试错误处理（is_retryable_err 识别“超时”），由上层退避重试。
+/// 注：长任务工具（build/deploy/run_command）内部自有更细的超时与后台任务机制，
+/// 此值是“最终安全阀”，设得足够大不影响正常长工具。
+const TOOL_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// 执行单个工具（带硬超时 + 用户停止检查）。
+/// 取消时返回 Err 让上层走 stopped 收尾；超时返回带“超时”字样的 Err（可重试）。
+async fn run_tool_with_guard(
+    tool: &str,
+    args_raw: &str,
+    project_path: &str,
+    path_hints: &[String],
+    project_id: &str,
+    state: &tauri::State<'_, DbState>,
+    mcp: &crate::services::mcp_manager::McpManager,
+    tool_ctx: &crate::agent::exec_ctx::ToolCtx,
+    cancel: &ChatCancel,
+    conversation_id: &str,
+) -> Result<String, String> {
+    if is_cancelled(cancel, conversation_id) {
+        return Err("用户已停止生成".into());
+    }
+    let fut = crate::agent::tools::run_tool(
+        tool,
+        args_raw,
+        project_path,
+        path_hints,
+        project_id,
+        &*state,
+        mcp,
+        tool_ctx,
+    );
+    match tokio::time::timeout(TOOL_EXEC_TIMEOUT, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(format!(
+            "工具执行超时（>{}s）：{tool}，已自动跳过；如为构建/部署等长任务请在参数中指定更长 timeout",
+            TOOL_EXEC_TIMEOUT.as_secs()
+        )),
+    }
+}
 
 /// 工具是否可与其他工具并行执行：L0 只读级别，且无交互/状态副作用
 /// （弹窗交互类与设备 shell 顺序敏感，保守串行）
@@ -6319,6 +6374,7 @@ async fn execute_tool_batch_one(
     path_hints: &[String],
     project_id: &str,
     conversation_id: &str,
+    cancel: &ChatCancel,
     registry: &TaskRegistry,
 ) -> BatchToolResult {
     let tool_begin = std::time::Instant::now();
@@ -6385,15 +6441,17 @@ async fn execute_tool_batch_one(
     let retried = retry_with_backoff(
         &TOOL_POLICY,
         &mut || {
-            crate::agent::tools::run_tool(
+            run_tool_with_guard(
                 tool,
                 args_raw,
                 project_path,
                 path_hints,
                 project_id,
-                &*state,
+                state,
                 mcp,
                 tool_ctx,
+                cancel,
+                conversation_id,
             )
         },
         |e: &String| crate::agent::tools::is_retryable_err(e),
@@ -6496,6 +6554,7 @@ async fn run_tool_batch(
                     path_hints,
                     project_id,
                     conversation_id,
+                    cancel,
                     registry,
                 )
             })
