@@ -1812,102 +1812,111 @@ pub(super) fn gen_size_suggestions(cats: &std::collections::BTreeMap<String, u64
 /// [31] screenshot_diff：逐像素对比两张截图（PNG），输出差异率、差异区域包围盒与位置提示。
 /// 用于 UI 改动前后验证（先 take_screenshot 存基线，改动后再截一张对比）。
 /// 纯只读：不写盘、不连设备，本地解码比较。
-pub(super) fn screenshot_diff(args: &Value, roots: &[String]) -> Result<String, String> {
+/// PNG 解码（上限 4096）+ 逐像素对比为 CPU 密集操作（千万级像素），整体放
+/// spawn_blocking，避免钉死 tokio worker（timer driver 停转 → 流式超时全部失效）。
+pub(super) async fn screenshot_diff(args: &Value, roots: &[String]) -> Result<String, String> {
     let raw_a = args["path_a"].as_str().ok_or("需要参数 {\"path_a\":\"<基线截图>\",\"path_b\":\"<变更截图>\",\"threshold\":<可选容差>}")?;
     let raw_b = args["path_b"].as_str().ok_or("需要参数 path_b（变更截图路径）")?;
     let threshold = args["threshold"].as_u64().unwrap_or(10) as i64;
-    let pa = crate::agent::tools::resolve_in_roots(roots, raw_a)?;
-    let pb = crate::agent::tools::resolve_in_roots(roots, raw_b)?;
-    if !pa.exists() || !pb.exists() {
-        return Err(format!(
-            "截图不存在：{} / {}",
-            if pa.exists() { "".to_string() } else { pa.display().to_string() },
-            if pb.exists() { "".to_string() } else { pb.display().to_string() }
-        ));
-    }
-    let data_a = std::fs::read(&pa).map_err(|e| format!("读取 {} 失败: {e}", pa.display()))?;
-    let data_b = std::fs::read(&pb).map_err(|e| format!("读取 {} 失败: {e}", pb.display()))?;
-    let img_a = crate::utils::png::decode_png(&data_a, 4096).map_err(|e| format!("解析 {} 失败: {e}", pa.display()))?;
-    let img_b = crate::utils::png::decode_png(&data_b, 4096).map_err(|e| format!("解析 {} 失败: {e}", pb.display()))?;
-    if img_a.width != img_b.width || img_a.height != img_b.height {
-        return Err(format!(
-            "两张截图尺寸不一致：{} {}x{} vs {} {}x{}（先确认分辨率相同，或用 image_inspect 检查）",
-            pa.display(),
-            img_a.width,
-            img_a.height,
-            pb.display(),
-            img_b.width,
-            img_b.height
-        ));
-    }
-    let w = img_a.width as usize;
-    let h = img_a.height as usize;
-    let rgb_a = &img_a.rgb;
-    let rgb_b = &img_b.rgb;
-    let mut diff_count = 0usize;
-    let mut min_x = usize::MAX;
-    let mut min_y = usize::MAX;
-    let mut max_x = 0usize;
-    let mut max_y = 0usize;
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y * w + x) * 3;
-            let d = (rgb_a[i] as i64 - rgb_b[i] as i64).abs()
-                + (rgb_a[i + 1] as i64 - rgb_b[i + 1] as i64).abs()
-                + (rgb_a[i + 2] as i64 - rgb_b[i + 2] as i64).abs();
-            if d > threshold {
-                diff_count += 1;
-                if x < min_x {
-                    min_x = x;
-                }
-                if y < min_y {
-                    min_y = y;
-                }
-                if x > max_x {
-                    max_x = x;
-                }
-                if y > max_y {
-                    max_y = y;
+    let roots_owned: Vec<String> = roots.to_vec();
+    let raw_a_owned = raw_a.to_string();
+    let raw_b_owned = raw_b.to_string();
+    tokio::task::spawn_blocking(move || {
+        let pa = crate::agent::tools::resolve_in_roots(&roots_owned, &raw_a_owned)?;
+        let pb = crate::agent::tools::resolve_in_roots(&roots_owned, &raw_b_owned)?;
+        if !pa.exists() || !pb.exists() {
+            return Err(format!(
+                "截图不存在：{} / {}",
+                if pa.exists() { "".to_string() } else { pa.display().to_string() },
+                if pb.exists() { "".to_string() } else { pb.display().to_string() }
+            ));
+        }
+        let data_a = std::fs::read(&pa).map_err(|e| format!("读取 {} 失败: {e}", pa.display()))?;
+        let data_b = std::fs::read(&pb).map_err(|e| format!("读取 {} 失败: {e}", pb.display()))?;
+        let img_a = crate::utils::png::decode_png(&data_a, 4096).map_err(|e| format!("解析 {} 失败: {e}", pa.display()))?;
+        let img_b = crate::utils::png::decode_png(&data_b, 4096).map_err(|e| format!("解析 {} 失败: {e}", pb.display()))?;
+        if img_a.width != img_b.width || img_a.height != img_b.height {
+            return Err(format!(
+                "两张截图尺寸不一致：{} {}x{} vs {} {}x{}（先确认分辨率相同，或用 image_inspect 检查）",
+                pa.display(),
+                img_a.width,
+                img_a.height,
+                pb.display(),
+                img_b.width,
+                img_b.height
+            ));
+        }
+        let w = img_a.width as usize;
+        let h = img_a.height as usize;
+        let rgb_a = &img_a.rgb;
+        let rgb_b = &img_b.rgb;
+        let mut diff_count = 0usize;
+        let mut min_x = usize::MAX;
+        let mut min_y = usize::MAX;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                let d = (rgb_a[i] as i64 - rgb_b[i] as i64).abs()
+                    + (rgb_a[i + 1] as i64 - rgb_b[i + 1] as i64).abs()
+                    + (rgb_a[i + 2] as i64 - rgb_b[i + 2] as i64).abs();
+                if d > threshold {
+                    diff_count += 1;
+                    if x < min_x {
+                        min_x = x;
+                    }
+                    if y < min_y {
+                        min_y = y;
+                    }
+                    if x > max_x {
+                        max_x = x;
+                    }
+                    if y > max_y {
+                        max_y = y;
+                    }
                 }
             }
         }
-    }
-    let total = w * h;
-    if diff_count == 0 {
-        return Ok(format!(
-            "两张截图完全一致（{}x{}，共 {total} 像素，阈值 {threshold}），界面无变化。\n路径：{} | {}",
-            w,
-            h,
+        let total = w * h;
+        if diff_count == 0 {
+            return Ok(format!(
+                "两张截图完全一致（{}x{}，共 {total} 像素，阈值 {threshold}），界面无变化。\n路径：{} | {}",
+                w,
+                h,
+                pa.display(),
+                pb.display()
+            ));
+        }
+        // 差异区域粗定位：按上下左右半区归属
+        let mid_x = w / 2;
+        let mid_y = h / 2;
+        let mut zone = Vec::new();
+        if min_y <= mid_y {
+            zone.push("上方");
+        }
+        if max_y >= mid_y {
+            zone.push("下方");
+        }
+        if min_x <= mid_x {
+            zone.push("左侧");
+        }
+        if max_x >= mid_x {
+            zone.push("右侧");
+        }
+        let zone_desc = zone.join("、");
+        let pct = diff_count as f64 / total as f64 * 100.0;
+        Ok(format!(
+            "截图对比完成（阈值 {threshold}）：差异像素 {diff_count} / {total}（{pct:.2}%）\n\
+             差异区域包围盒：x {min_x}..{max_x}，y {min_y}..{max_y}（集中于{zone_desc}）\n\
+             基线：{}\n变更：{}\n\
+             判读：差异 <0.1% 多为状态栏时钟/滚动条等动态元素可忽略；\
+             若与预期不符，用 dump_ui_hierarchy + verify_ui 定位具体控件。",
             pa.display(),
             pb.display()
-        ));
-    }
-    // 差异区域粗定位：按上下左右半区归属
-    let mid_x = w / 2;
-    let mid_y = h / 2;
-    let mut zone = Vec::new();
-    if min_y <= mid_y {
-        zone.push("上方");
-    }
-    if max_y >= mid_y {
-        zone.push("下方");
-    }
-    if min_x <= mid_x {
-        zone.push("左侧");
-    }
-    if max_x >= mid_x {
-        zone.push("右侧");
-    }
-    let zone_desc = zone.join("、");
-    let pct = diff_count as f64 / total as f64 * 100.0;
-    Ok(format!(
-        "截图对比完成（阈值 {threshold}）：差异像素 {diff_count} / {total}（{pct:.2}%）\n\
-         差异区域包围盒：x {min_x}..{max_x}，y {min_y}..{max_y}（集中于{zone_desc}）\n\
-         基线：{}\n变更：{}\n\
-         判读：差异 <0.1% 多为状态栏时钟/滚动条等动态元素可忽略；\
-         若与预期不符，用 dump_ui_hierarchy + verify_ui 定位具体控件。",
-        pa.display(),
-        pb.display()
-    ))
+        ))
+    })
+    .await
+    .map_err(|e| format!("截图对比任务异常: {e}"))?
 }
 

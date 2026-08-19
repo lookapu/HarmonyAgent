@@ -23,11 +23,17 @@ pub(super) async fn view_image(args: &Value, roots: &[String]) -> Result<String,
             crate::agent::tools::fs_tools::human_size(meta.len())
         ));
     }
-    // 预编码验证（与 chat.rs 视觉闭环同源）：解码失败直接报错而非只给路径
-    let data_url = encode_vision_image(&p)?;
-    let bytes = std::fs::read(&p).map_err(|e| format!("读取图片失败: {e}"))?;
-    let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
-    let (w, h) = (img.width(), img.height());
+    // 预编码验证（与 chat.rs 视觉闭环同源）：解码失败直接报错而非只给路径。
+    // 图像解码+压缩为 CPU 密集操作（数百 ms），放 spawn_blocking 避免钉死 tokio worker。
+    let p_buf = p.clone();
+    let (data_url, w, h) = tokio::task::spawn_blocking(move || {
+        let data_url = encode_vision_image(&p_buf)?;
+        let bytes = std::fs::read(&p_buf).map_err(|e| format!("读取图片失败: {e}"))?;
+        let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+        Ok::<(String, u32, u32), String>((data_url, img.width(), img.height()))
+    })
+    .await
+    .map_err(|e| format!("视觉编码任务异常: {e}"))??;
     Ok(format!(
         "已读取图片: {}\n（分辨率 {}x{}，原大小 {}，压缩后约 {:.0}KB，随下轮请求进入模型视野）\n[VISION_IMAGE: {}]",
         p.display(),
@@ -86,15 +92,24 @@ pub(super) async fn chart_extract(args: &Value, roots: &[String]) -> Result<Stri
                 crate::agent::tools::fs_tools::human_size(meta.len())
             ));
         }
-        let data_url = encode_vision_image(&p)?;
-        let bytes = std::fs::read(&p).map_err(|e| format!("读取图片失败: {e}"))?;
-        let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+        // 图像解码+压缩为 CPU 密集操作（每张数百 ms），放 spawn_blocking 避免钉死
+        // tokio worker（timer driver 停转 → 流式超时全部失效）。闭包内一次完成
+        // 编码与宽高解析，避免二次解码。
+        let p_buf = p.clone();
+        let (data_url, w, h) = tokio::task::spawn_blocking(move || {
+            let data_url = encode_vision_image(&p_buf)?;
+            let bytes = std::fs::read(&p_buf).map_err(|e| format!("读取图片失败: {e}"))?;
+            let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+            Ok::<(String, u32, u32), String>((data_url, img.width(), img.height()))
+        })
+        .await
+        .map_err(|e| format!("视觉编码任务异常: {e}"))??;
         out.push_str(&format!(
             "  图[{}]: {}（{}x{}，原 {}，压缩后约 {:.0}KB）\n",
             i + 1,
             p.display(),
-            img.width(),
-            img.height(),
+            w,
+            h,
             crate::agent::tools::fs_tools::human_size(meta.len()),
             data_url.len() as f64 / 1024.0
         ));

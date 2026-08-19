@@ -458,20 +458,29 @@ pub(super) async fn refresh_api_db(
 }
 
 /// search_api：在官方 API 知识库中搜索。
-pub(super) fn search_api(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let total = crate::services::harmony_api_diff::count(&conn)?;
-    if total == 0 {
-        return Err("API 知识库为空，请先调用 refresh_api_db 从官方文档抓取数据（首次抓取需联网，耗时较长）。".into());
-    }
-    let query = crate::services::harmony_api_diff::SearchQuery {
-        keyword: args["keyword"].as_str().map(|s| s.to_string()),
-        module: args["module"].as_str().map(|s| s.to_string()),
-        kit: args["kit"].as_str().map(|s| s.to_string()),
-        api_level: args["api_level"].as_u64().map(|n| n as u32),
-        change_type: args["change_type"].as_str().map(|s| s.to_string()),
-        limit: Some((args["limit"].as_u64().unwrap_or(50) as usize).min(200)),
-    };
+pub(super) async fn search_api(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+    let db = db.0.clone();
+    let keyword = args["keyword"].as_str().map(|s| s.to_string());
+    let module = args["module"].as_str().map(|s| s.to_string());
+    let kit = args["kit"].as_str().map(|s| s.to_string());
+    let api_level = args["api_level"].as_u64().map(|n| n as u32);
+    let change_type = args["change_type"].as_str().map(|s| s.to_string());
+    let limit = Some((args["limit"].as_u64().unwrap_or(50) as usize).min(200));
+    // 全表 SQL 检索 + embedding 向量余弦（CPU 密集）在 blocking 线程池执行，避免钉死 tokio worker
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let total = crate::services::harmony_api_diff::count(&conn)?;
+        if total == 0 {
+            return Err("API 知识库为空，请先调用 refresh_api_db 从官方文档抓取数据（首次抓取需联网，耗时较长）。".into());
+        }
+        let query = crate::services::harmony_api_diff::SearchQuery {
+            keyword,
+            module,
+            kit,
+            api_level,
+            change_type,
+            limit,
+        };
     // 向量增强块会按 RRF 融合结果重排 entries（见下），故声明为可变；
     // 未启用 embedding feature 时无重排代码，编译期放行 unused_mut
     #[cfg_attr(not(feature = "embedding"), allow(unused_mut))]
@@ -553,6 +562,9 @@ pub(super) fn search_api(args: &Value, db: &crate::db::DbState) -> Result<String
         out.push_str(&format!("... 还有 {} 条，可缩小关键词或加 module/kit 过滤。\n", entries.len() - 50));
     }
     Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 按 doc_id 取单条 api_docs 记录（search_api 向量增强时补全"向量独有命中"用）。

@@ -4046,9 +4046,16 @@ async fn stream_chat_inner(
                                     .replace(&format!("[VISION_IMAGE: {img_path}]"), "")
                                     .trim_end()
                                     .to_string();
-                                if let Ok(data_url) =
-                                    crate::agent::tools::encode_vision_image(std::path::Path::new(&img_path))
-                                {
+                                // 图像解码+缩放+JPEG 编码是 CPU 密集操作（单张可达数百 ms），
+                                // 必须在 spawn_blocking 中执行，否则会钉死 tokio worker
+                                // （timer driver 停转 → 流式超时全部失效）。
+                                let path_buf = std::path::PathBuf::from(&img_path);
+                                let encoded = tokio::task::spawn_blocking(move || {
+                                    crate::agent::tools::encode_vision_image(&path_buf)
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(format!("视觉编码任务异常: {e}")));
+                                if let Ok(data_url) = encoded {
                                     images.get_or_insert_with(Vec::new).push(data_url);
                                 }
                             } else if supports_image {

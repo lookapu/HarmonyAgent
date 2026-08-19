@@ -433,12 +433,21 @@ pub(super) async fn undo_edit(args: &Value, roots: &[String], conversation_id: &
         if let Some(parent) = s.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(&s.path, &s.content)
-            .map_err(|e| format!("恢复 {} 失败: {e}", s.path.display()))?;
-        if let Ok(meta) = std::fs::metadata(&s.path) {
-            stamp_put(&s.path, &meta, &s.content);
+        // 恢复写盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
+        let path_buf = s.path.clone();
+        let content_buf = s.content.clone();
+        let restored_path = tokio::task::spawn_blocking(move || {
+            std::fs::write(&path_buf, &content_buf)
+                .map_err(|e| format!("恢复 {} 失败: {e}", path_buf.display()))?;
+            let meta = std::fs::metadata(&path_buf).ok();
+            Ok::<(String, Option<std::fs::Metadata>), String>((path_buf.display().to_string(), meta))
+        })
+        .await
+        .map_err(|e| format!("撤销恢复任务异常: {e}"))??;
+        if let Some(meta) = &restored_path.1 {
+            stamp_put(&s.path, meta, &s.content);
         }
-        restored.push(s.path.display().to_string());
+        restored.push(restored_path.0);
     }
     if restored.is_empty() {
         return Ok("没有可撤销的修改（本会话尚无 Agent 文件写入记录）".into());
@@ -880,204 +889,211 @@ pub(super) async fn list_dir(args: &Value, roots: &[String]) -> Result<String, S
     if !root.is_dir() {
         return Err(format!("路径不是目录: {}", root.display()));
     }
-    // .gitignore 规则：项目根规则 + 浏览目标自身规则
-    // （root 非项目根时，其自身 .gitignore 由 walk 首层按子规则加载，基准为 root 自身，语义等价）
-    let (ignore_rules, start_rel) = load_project_ignore(&root, roots);
-
-    let mut out = String::new();
-    // 浏览项目根时附带项目类型识别，帮助模型快速定位技术栈；
-    // Git 仓库提示：list_dir 只反映文件系统现状，查变更/历史应转用 git 工具（自 root 向上查找 .git）
-    let in_git = root.ancestors().any(|a| a.join(".git").exists());
-    if let Some((kind, mark)) = detect_project_type(&root) {
-        let hint = if in_git {
-            "；目录在 Git 仓库内，可用 git status 查变更、git log 查历史"
-        } else {
-            ""
-        };
-        out.push_str(&format!("（项目类型：{kind}，依据：{mark}{hint}）\n"));
-    } else if in_git {
-        out.push_str("（目录在 Git 仓库内，可用 git status 查变更、git log 查历史）\n");
-    }
-    let mut skipped = 0u32;
-    let mut stats = ListStats::default();
-    fn walk(
-        dir: &Path,
-        rel: &str,
-        depth: u32,
-        max_depth: u32,
-        shell_left: usize,
-        chain: String,
-        rules: &[IgnoreRule],
-        stats: &mut ListStats,
-        skipped: &mut u32,
-        out: &mut String,
-    ) -> Result<(), String> {
-        // 本目录的 .gitignore（多模块工程/子仓库常见）：规则只对其所在子树生效，
-        // 与父规则合并后向下传递（项目根已在外层加载，rel 为空时跳过）
-        let child_rules = load_child_rules(rules, dir, rel);
-        let entries =
-            std::fs::read_dir(dir).map_err(|e| format!("读取目录失败 {}: {e}", dir.display()))?;
-        let mut items: Vec<(String, bool, u64, std::time::SystemTime)> = Vec::new();
-        let mut agg: std::collections::BTreeMap<&'static str, (usize, u64)> =
-            std::collections::BTreeMap::new();
-        let mut folded = 0usize; // 超出 DIR_SHOW_MAX 后折叠的条目数
-        let mut folded_dirs: Vec<String> = Vec::new(); // 被折叠的目录名（前几个，提示模型可继续深入）
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            let Ok(ft) = e.file_type() else { continue };
-            let is_dir = ft.is_dir();
-            // 隐藏目录（. 开头，白名单除外）+ 已知忽略目录 + .gitignore 命中 → 跳过
-            // 注意：含 / 的规则（如 src/main/）按条目自身相对路径匹配，而不是父目录路径
-            let hidden =
-                is_dir && name.starts_with('.') && !HIDDEN_ALLOW.contains(&name.as_str());
-            let entry_rel = if rel.is_empty() {
-                name.clone()
+    // 目录遍历 + metadata 为 IO 密集操作，放 spawn_blocking 避免钉死 tokio worker
+    let root_buf = root.clone();
+    let roots_owned: Vec<String> = roots.to_vec();
+    let (mut out, stats, skipped) = tokio::task::spawn_blocking(move || {
+        // .gitignore 规则：项目根规则 + 浏览目标自身规则
+        // （root 非项目根时，其自身 .gitignore 由 walk 首层按子规则加载，基准为 root 自身，语义等价）
+        let (ignore_rules, start_rel) = load_project_ignore(&root_buf, &roots_owned);
+        let mut out = String::new();
+        // 浏览项目根时附带项目类型识别，帮助模型快速定位技术栈；
+        // Git 仓库提示：list_dir 只反映文件系统现状，查变更/历史应转用 git 工具（自 root 向上查找 .git）
+        let in_git = root_buf.ancestors().any(|a| a.join(".git").exists());
+        if let Some((kind, mark)) = detect_project_type(&root_buf) {
+            let hint = if in_git {
+                "；目录在 Git 仓库内，可用 git status 查变更、git log 查历史"
             } else {
-                format!("{rel}/{name}")
+                ""
             };
-            if hidden || should_skip_dir(&name)
-                || gitignore_ignored(&child_rules, &name, &entry_rel, is_dir)
-            {
-                *skipped += 1;
-                continue;
-            }
-            if is_dir {
-                stats.dirs += 1;
-                if items.len() < DIR_SHOW_MAX {
-                    items.push((name, true, 0, std::time::UNIX_EPOCH));
-                } else {
-                    folded += 1;
-                    if folded_dirs.len() < 5 {
-                        folded_dirs.push(name);
-                    }
-                }
-            } else if let Some(cat) = agg_category(&name) {
-                // 低价值文件：只聚合统计，不逐条列出（大图/字体/压缩包对结构理解无益）
-                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                let ent = agg.entry(cat).or_insert((0, 0));
-                ent.0 += 1;
-                ent.1 += size;
-                stats.files += 1;
-                stats.bytes += size;
-            } else if is_mark_file(&name) || items.len() < DIR_SHOW_MAX {
-                // 关键配置/清单文件（★）不受折叠限制：结构信息永远可见
-                let Ok(meta) = e.metadata() else { continue };
-                let size = meta.len();
-                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                stats.files += 1;
-                stats.bytes += size;
-                items.push((name, false, size, mtime));
-            } else {
-                folded += 1;
-                // 折叠文件也计入统计，保证汇总数字真实
-                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                stats.files += 1;
-                stats.bytes += size;
-            }
+            out.push_str(&format!("（项目类型：{kind}，依据：{mark}{hint}）\n"));
+        } else if in_git {
+            out.push_str("（目录在 Git 仓库内，可用 git status 查变更、git log 查历史）\n");
         }
-        for (k, (n, sz)) in agg {
-            let ent = stats.agg.entry(k).or_insert((0, 0));
-            ent.0 += n;
-            ent.1 += sz;
-        }
-        // 单壳目录穿透：仅 1 个子目录且无文件/聚合/折叠时，合并路径继续深入（不消耗 depth）
-        if shell_left > 0 && items.len() == 1 && items[0].1 && folded == 0 {
-            let sub = items[0].0.clone();
-            let child_rel = if rel.is_empty() {
-                sub.clone()
-            } else {
-                format!("{rel}/{sub}")
-            };
-            // 先借用 sub 构造路径，再 move 进 new_chain（顺序敏感：sub 随后被转移）
-            let joined = dir.join(&sub);
-            let new_chain = if chain.is_empty() {
-                sub
-            } else {
-                format!("{chain}/{sub}")
-            };
-            return walk(
-                &joined,
-                &child_rel,
-                depth,
-                max_depth,
-                shell_left - 1,
-                new_chain,
-                &child_rules,
-                stats,
-                skipped,
-                out,
-            );
-        }
-        // 目录优先，同级按名称排序
-        items.sort_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-        });
-        let indent = "  ".repeat(depth as usize);
-        for (name, is_dir, size, mtime) in &items {
-            if *is_dir {
-                let disp = if chain.is_empty() {
+        let mut skipped = 0u32;
+        let mut stats = ListStats::default();
+        fn walk(
+            dir: &Path,
+            rel: &str,
+            depth: u32,
+            max_depth: u32,
+            shell_left: usize,
+            chain: String,
+            rules: &[IgnoreRule],
+            stats: &mut ListStats,
+            skipped: &mut u32,
+            out: &mut String,
+        ) -> Result<(), String> {
+            // 本目录的 .gitignore（多模块工程/子仓库常见）：规则只对其所在子树生效，
+            // 与父规则合并后向下传递（项目根已在外层加载，rel 为空时跳过）
+            let child_rules = load_child_rules(rules, dir, rel);
+            let entries =
+                std::fs::read_dir(dir).map_err(|e| format!("读取目录失败 {}: {e}", dir.display()))?;
+            let mut items: Vec<(String, bool, u64, std::time::SystemTime)> = Vec::new();
+            let mut agg: std::collections::BTreeMap<&'static str, (usize, u64)> =
+                std::collections::BTreeMap::new();
+            let mut folded = 0usize; // 超出 DIR_SHOW_MAX 后折叠的条目数
+            let mut folded_dirs: Vec<String> = Vec::new(); // 被折叠的目录名（前几个，提示模型可继续深入）
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let Ok(ft) = e.file_type() else { continue };
+                let is_dir = ft.is_dir();
+                // 隐藏目录（. 开头，白名单除外）+ 已知忽略目录 + .gitignore 命中 → 跳过
+                // 注意：含 / 的规则（如 src/main/）按条目自身相对路径匹配，而不是父目录路径
+                let hidden =
+                    is_dir && name.starts_with('.') && !HIDDEN_ALLOW.contains(&name.as_str());
+                let entry_rel = if rel.is_empty() {
                     name.clone()
                 } else {
-                    format!("{chain}/{name}")
+                    format!("{rel}/{name}")
                 };
-                out.push_str(&format!("{indent}[目录] {disp}/\n"));
-                // 目录超限（folded>0）时结构不完整，不再深入，避免输出缺块误导模型
-                if depth < max_depth && folded == 0 {
-                    let child_rel = if rel.is_empty() {
+                if hidden || should_skip_dir(&name)
+                    || gitignore_ignored(&child_rules, &name, &entry_rel, is_dir)
+                {
+                    *skipped += 1;
+                    continue;
+                }
+                if is_dir {
+                    stats.dirs += 1;
+                    if items.len() < DIR_SHOW_MAX {
+                        items.push((name, true, 0, std::time::UNIX_EPOCH));
+                    } else {
+                        folded += 1;
+                        if folded_dirs.len() < 5 {
+                            folded_dirs.push(name);
+                        }
+                    }
+                } else if let Some(cat) = agg_category(&name) {
+                    // 低价值文件：只聚合统计，不逐条列出（大图/字体/压缩包对结构理解无益）
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    let ent = agg.entry(cat).or_insert((0, 0));
+                    ent.0 += 1;
+                    ent.1 += size;
+                    stats.files += 1;
+                    stats.bytes += size;
+                } else if is_mark_file(&name) || items.len() < DIR_SHOW_MAX {
+                    // 关键配置/清单文件（★）不受折叠限制：结构信息永远可见
+                    let Ok(meta) = e.metadata() else { continue };
+                    let size = meta.len();
+                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    stats.files += 1;
+                    stats.bytes += size;
+                    items.push((name, false, size, mtime));
+                } else {
+                    folded += 1;
+                    // 折叠文件也计入统计，保证汇总数字真实
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    stats.files += 1;
+                    stats.bytes += size;
+                }
+            }
+            for (k, (n, sz)) in agg {
+                let ent = stats.agg.entry(k).or_insert((0, 0));
+                ent.0 += n;
+                ent.1 += sz;
+            }
+            // 单壳目录穿透：仅 1 个子目录且无文件/聚合/折叠时，合并路径继续深入（不消耗 depth）
+            if shell_left > 0 && items.len() == 1 && items[0].1 && folded == 0 {
+                let sub = items[0].0.clone();
+                let child_rel = if rel.is_empty() {
+                    sub.clone()
+                } else {
+                    format!("{rel}/{sub}")
+                };
+                // 先借用 sub 构造路径，再 move 进 new_chain（顺序敏感：sub 随后被转移）
+                let joined = dir.join(&sub);
+                let new_chain = if chain.is_empty() {
+                    sub
+                } else {
+                    format!("{chain}/{sub}")
+                };
+                return walk(
+                    &joined,
+                    &child_rel,
+                    depth,
+                    max_depth,
+                    shell_left - 1,
+                    new_chain,
+                    &child_rules,
+                    stats,
+                    skipped,
+                    out,
+                );
+            }
+            // 目录优先，同级按名称排序
+            items.sort_by(|a, b| {
+                b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+            });
+            let indent = "  ".repeat(depth as usize);
+            for (name, is_dir, size, mtime) in &items {
+                if *is_dir {
+                    let disp = if chain.is_empty() {
                         name.clone()
                     } else {
-                        format!("{rel}/{name}")
+                        format!("{chain}/{name}")
                     };
-                    walk(
-                        &dir.join(name),
-                        &child_rel,
-                        depth + 1,
-                        max_depth,
-                        SHELL_PENETRATE_MAX,
-                        String::new(),
-                        &child_rules,
-                        stats,
-                        skipped,
-                        out,
-                    )?;
+                    out.push_str(&format!("{indent}[目录] {disp}/\n"));
+                    // 目录超限（folded>0）时结构不完整，不再深入，避免输出缺块误导模型
+                    if depth < max_depth && folded == 0 {
+                        let child_rel = if rel.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{rel}/{name}")
+                        };
+                        walk(
+                            &dir.join(name),
+                            &child_rel,
+                            depth + 1,
+                            max_depth,
+                            SHELL_PENETRATE_MAX,
+                            String::new(),
+                            &child_rules,
+                            stats,
+                            skipped,
+                            out,
+                        )?;
+                    }
+                } else {
+                    let star = if is_mark_file(name) { "★" } else { "" };
+                    out.push_str(&format!(
+                        "{indent}{star}[文件] {name}  {}  {}\n",
+                        human_size(*size),
+                        fmt_time(*mtime)
+                    ));
                 }
-            } else {
-                let star = if is_mark_file(name) { "★" } else { "" };
+            }
+            if folded > 0 {
+                let dir_hint = if folded_dirs.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "（含目录：{} 等）",
+                        folded_dirs.iter().map(|d| format!("{d}/")).collect::<Vec<_>>().join("、")
+                    )
+                };
                 out.push_str(&format!(
-                    "{indent}{star}[文件] {name}  {}  {}\n",
-                    human_size(*size),
-                    fmt_time(*mtime)
+                    "{indent}…（该目录共 {} 项，其余 {folded} 项省略{dir_hint}；如需查看请直接对该目录再调 list_dir）\n",
+                    items.len() + folded
                 ));
             }
+            Ok(())
         }
-        if folded > 0 {
-            let dir_hint = if folded_dirs.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "（含目录：{} 等）",
-                    folded_dirs.iter().map(|d| format!("{d}/")).collect::<Vec<_>>().join("、")
-                )
-            };
-            out.push_str(&format!(
-                "{indent}…（该目录共 {} 项，其余 {folded} 项省略{dir_hint}；如需查看请直接对该目录再调 list_dir）\n",
-                items.len() + folded
-            ));
-        }
-        Ok(())
-    }
-    walk(
-        &root,
-        &start_rel,
-        0,
-        depth,
-        SHELL_PENETRATE_MAX,
-        String::new(),
-        &ignore_rules,
-        &mut stats,
-        &mut skipped,
-        &mut out,
-    )?;
+        walk(
+            &root_buf,
+            &start_rel,
+            0,
+            depth,
+            SHELL_PENETRATE_MAX,
+            String::new(),
+            &ignore_rules,
+            &mut stats,
+            &mut skipped,
+            &mut out,
+        )?;
+        Ok::<(String, ListStats, u32), String>((out, stats, skipped))
+    })
+    .await
+    .map_err(|e| format!("目录遍历任务异常: {e}"))??;
     if out.is_empty() {
         out.push_str("（空目录）\n");
     }
@@ -1111,8 +1127,16 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     // Request/Spec 分离：宽松参数 ReadFileRequest → 显式 resolve() 产出严格规范 ReadFileSpec
     let spec = ReadFileRequest::from_args(args)?.resolve(roots)?;
     let p = &spec.path;
-    let meta = std::fs::metadata(p).map_err(|e| e.to_string())?;
-    let bytes = std::fs::read(p).map_err(|e| format!("读取文件失败: {e}"))?;
+    // 整文件读取 + metadata 为 IO 操作（大文件/日志可达数 MB~数十 MB），
+    // 放 spawn_blocking 避免钉死 tokio worker
+    let p_buf = p.clone();
+    let (meta, bytes) = tokio::task::spawn_blocking(move || -> Result<(std::fs::Metadata, Vec<u8>), String> {
+        let meta = std::fs::metadata(&p_buf).map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(&p_buf).map_err(|e| format!("读取文件失败: {e}"))?;
+        Ok((meta, bytes))
+    })
+    .await
+    .map_err(|e| format!("读取文件任务异常: {e}"))??;
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return Err(format!(
             "文件是二进制（{}），无法以文本方式读取",
@@ -2262,58 +2286,67 @@ pub(super) async fn find_files(args: &Value, roots: &[String]) -> Result<String,
     if !root.is_dir() {
         return Err(format!("路径不是目录: {}", root.display()));
     }
-    let (ignore_rules, start_rel) = load_project_ignore(&root, roots);
-    let mut hits: Vec<PathBuf> = Vec::new();
-    let mut skipped = 0u32;
-    fn walk(
-        dir: &Path,
-        root: &Path,
-        rel: &str,
-        rules: &[IgnoreRule],
-        pattern: &str,
-        hits: &mut Vec<PathBuf>,
-        skipped: &mut u32,
-    ) {
-        // 子目录 .gitignore（与 list_dir 同口径）
-        let child_rules = load_child_rules(rules, dir, rel);
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for e in entries.flatten() {
-            let p = e.path();
-            let name = e.file_name().to_string_lossy().to_string();
-            if p.is_dir() {
-                let entry_rel = if rel.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{rel}/{name}")
-                };
-                if should_skip_dir(&name)
-                    || gitignore_ignored(&child_rules, &name, &entry_rel, true)
-                {
-                    *skipped += 1;
-                    continue;
-                }
-                walk(&p, root, &entry_rel, &child_rules, pattern, hits, skipped);
-                if hits.len() >= 100 {
-                    return;
-                }
-            } else {
-                // pattern 可匹配文件名（*.ets）或相对路径（src/**/*.ets）
-                let rel = p
-                    .strip_prefix(root)
-                    .map(|r| r.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| name.clone());
-                if glob_match(pattern, &name) || glob_match(pattern, &rel) {
-                    hits.push(p);
+    // 全树递归遍历为 IO 密集操作，放 spawn_blocking 避免钉死 tokio worker
+    let root_buf = root.clone();
+    let roots_owned: Vec<String> = roots.to_vec();
+    let pattern_owned = pattern.to_string();
+    let (hits, skipped) = tokio::task::spawn_blocking(move || {
+        let (ignore_rules, start_rel) = load_project_ignore(&root_buf, &roots_owned);
+        let mut hits: Vec<PathBuf> = Vec::new();
+        let mut skipped = 0u32;
+        fn walk(
+            dir: &Path,
+            root: &Path,
+            rel: &str,
+            rules: &[IgnoreRule],
+            pattern: &str,
+            hits: &mut Vec<PathBuf>,
+            skipped: &mut u32,
+        ) {
+            // 子目录 .gitignore（与 list_dir 同口径）
+            let child_rules = load_child_rules(rules, dir, rel);
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if p.is_dir() {
+                    let entry_rel = if rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel}/{name}")
+                    };
+                    if should_skip_dir(&name)
+                        || gitignore_ignored(&child_rules, &name, &entry_rel, true)
+                    {
+                        *skipped += 1;
+                        continue;
+                    }
+                    walk(&p, root, &entry_rel, &child_rules, pattern, hits, skipped);
                     if hits.len() >= 100 {
                         return;
+                    }
+                } else {
+                    // pattern 可匹配文件名（*.ets）或相对路径（src/**/*.ets）
+                    let rel = p
+                        .strip_prefix(root)
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| name.clone());
+                    if glob_match(pattern, &name) || glob_match(pattern, &rel) {
+                        hits.push(p);
+                        if hits.len() >= 100 {
+                            return;
+                        }
                     }
                 }
             }
         }
-    }
-    walk(&root, &root, &start_rel, &ignore_rules, pattern, &mut hits, &mut skipped);
-    // 排序：按路径字典序，同级目录聚拢、结果可预测（read_dir 顺序是随机的）
-    hits.sort();
+        walk(&root_buf, &root_buf, &start_rel, &ignore_rules, &pattern_owned, &mut hits, &mut skipped);
+        // 排序：按路径字典序，同级目录聚拢、结果可预测（read_dir 顺序是随机的）
+        hits.sort();
+        (hits, skipped)
+    })
+    .await
+    .unwrap_or_default();
     if hits.is_empty() {
         return Ok(format!(
             "未找到匹配 {pattern} 的文件（已跳过 {skipped} 个忽略目录）"
@@ -2338,19 +2371,19 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
     }
     let raw = args["path"].as_str().unwrap_or(".");
     let root = resolve_in_roots(roots, raw)?;
-    let glob = args["glob"].as_str().unwrap_or("").trim();
+    let glob = args["glob"].as_str().unwrap_or("").trim().to_string();
     let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(false);
     // block=true：命中时给出所在「完整代码块」（方法/函数整体，语言感知成对匹配），
     // 便于直接了解/编辑整个方法而不只看单行；最多展开前 5 条防输出爆炸
     let block_mode = args["block"].as_bool().unwrap_or(false);
     const MAX_BLOCK_HITS: usize = 5;
-    let (ignore_rules, start_rel) = load_project_ignore(&root, roots);
+    let pattern = pattern.to_string();
     let lower = pattern.to_lowercase();
     // regex=true：pattern 按正则解释（如 foo\s*\(、Vec<\w+>），
     // 大小写敏感性由 case_sensitive 统一控制；非法正则提前报错
     let re = if args["regex"].as_bool().unwrap_or(false) {
         Some(
-            regex::RegexBuilder::new(pattern)
+            regex::RegexBuilder::new(&pattern)
                 .case_insensitive(!case_sensitive)
                 .build()
                 .map_err(|e| format!("正则表达式无效（{pattern:?}）：{e}。常见问题：反斜杠在 JSON 参数中需双重转义（\\d 写作 \\\\d）；或去掉 regex 参数用纯文本搜索"))?,
@@ -2358,153 +2391,164 @@ pub(super) async fn grep_files(args: &Value, roots: &[String]) -> Result<String,
     } else {
         None
     };
-    let mut hits: Vec<String> = Vec::new();
-    let mut files_checked = 0u32;
-    let mut skipped = 0u32;
-    let mut block_shown = 0usize;
-    // 单文件搜索大小上限：超大文本文件跳过（防读入内存爆炸）
-    const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
-    fn walk(
-        dir: &Path,
-        rel: &str,
-        rules: &[IgnoreRule],
-        pattern: &str,
-        lower: &str,
-        case_sensitive: bool,
-        re: Option<&regex::Regex>,
-        glob: &str,
-        block_mode: bool,
-        block_shown: &mut usize,
-        hits: &mut Vec<String>,
-        files_checked: &mut u32,
-        skipped: &mut u32,
-    ) {
-        // 子目录 .gitignore（与 list_dir 同口径）：规则只对其子树生效
-        let child_rules = load_child_rules(rules, dir, rel);
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for e in entries.flatten() {
-            let p = e.path();
-            let name = e.file_name().to_string_lossy().to_string();
-            if p.is_dir() {
-                let entry_rel = if rel.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{rel}/{name}")
-                };
-                if should_skip_dir(&name)
-                    || gitignore_ignored(&child_rules, &name, &entry_rel, true)
-                {
-                    *skipped += 1;
-                    continue;
-                }
-                walk(
-                    &p,
-                    &entry_rel,
-                    &child_rules,
-                    pattern,
-                    lower,
-                    case_sensitive,
-                    re,
-                    glob,
-                    block_mode,
-                    block_shown,
-                    hits,
-                    files_checked,
-                    skipped,
-                );
-                if hits.len() >= 50 {
-                    return;
-                }
-            } else {
-                if !glob.is_empty() && !glob_match(glob, &name) {
-                    continue;
-                }
-                let Ok(meta) = std::fs::metadata(&p) else { continue };
-                if meta.len() > MAX_FILE_BYTES {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&p) else { continue };
-                if bytes[..bytes.len().min(4096)].contains(&0) {
-                    continue;
-                }
-                *files_checked += 1;
-                let text = smart_decode(&bytes);
-                let flines: Vec<&str> = text.lines().collect();
-                let ext = p
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                // 同一文件内已展开过的块区间（同一方法多条命中不重复整块展开）
-                let mut seen_blocks: Vec<(usize, usize)> = Vec::new();
-                // 单遍块索引：50 命中场景从 O(50n) 降为 O(n)，语义与逐次 find_enclosing_block 等价
-                let bindex_built = if block_mode { Some(BlockIndex::build(&flines, &ext)) } else { None };
-                let bindex = bindex_built.as_ref();
-                for (i, line) in flines.iter().enumerate() {
-                    let matched = match re {
-                        Some(r) => r.is_match(line),
-                        None => {
-                            if case_sensitive {
-                                line.contains(pattern)
-                            } else {
-                                line.to_lowercase().contains(lower)
-                            }
-                        }
+    // 全树递归遍历 + 逐文件正则匹配为 CPU/IO 密集操作（大项目可达数百 ms~秒级），
+    // 整体放 spawn_blocking，避免钉死 tokio worker（timer driver 停转 → 流式超时全部失效）。
+    let root_buf = root.clone();
+    let pattern_buf = pattern.clone();
+    let roots_owned: Vec<String> = roots.to_vec();
+    let (hits, files_checked, skipped, block_shown) = tokio::task::spawn_blocking(move || {
+        let (ignore_rules, start_rel) = load_project_ignore(&root_buf, &roots_owned);
+        let mut hits: Vec<String> = Vec::new();
+        let mut files_checked = 0u32;
+        let mut skipped = 0u32;
+        let mut block_shown = 0usize;
+        // 单文件搜索大小上限：超大文本文件跳过（防读入内存爆炸）
+        const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+        fn walk(
+            dir: &Path,
+            rel: &str,
+            rules: &[IgnoreRule],
+            pattern: &str,
+            lower: &str,
+            case_sensitive: bool,
+            re: Option<&regex::Regex>,
+            glob: &str,
+            block_mode: bool,
+            block_shown: &mut usize,
+            hits: &mut Vec<String>,
+            files_checked: &mut u32,
+            skipped: &mut u32,
+        ) {
+            // 子目录 .gitignore（与 list_dir 同口径）：规则只对其子树生效
+            let child_rules = load_child_rules(rules, dir, rel);
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if p.is_dir() {
+                    let entry_rel = if rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel}/{name}")
                     };
-                    if matched {
-                        // block 模式：展开所在完整代码块（成对 {}() 语言感知，整方法不截断）
-                        if block_mode && *block_shown < MAX_BLOCK_HITS {
-                            let blk = match bindex {
-                                Some(bi) => bi.enclosing(&flines, i, &ext),
-                                None => find_enclosing_block(&flines, i, &ext),
-                            };
-                            if let Some((o, c)) = blk {
-                                if seen_blocks.contains(&(o, c)) {
+                    if should_skip_dir(&name)
+                        || gitignore_ignored(&child_rules, &name, &entry_rel, true)
+                    {
+                        *skipped += 1;
+                        continue;
+                    }
+                    walk(
+                        &p,
+                        &entry_rel,
+                        &child_rules,
+                        pattern,
+                        lower,
+                        case_sensitive,
+                        re,
+                        glob,
+                        block_mode,
+                        block_shown,
+                        hits,
+                        files_checked,
+                        skipped,
+                    );
+                    if hits.len() >= 50 {
+                        return;
+                    }
+                } else {
+                    if !glob.is_empty() && !glob_match(glob, &name) {
+                        continue;
+                    }
+                    let Ok(meta) = std::fs::metadata(&p) else { continue };
+                    if meta.len() > MAX_FILE_BYTES {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(&p) else { continue };
+                    if bytes[..bytes.len().min(4096)].contains(&0) {
+                        continue;
+                    }
+                    *files_checked += 1;
+                    let text = smart_decode(&bytes);
+                    let flines: Vec<&str> = text.lines().collect();
+                    let ext = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    // 同一文件内已展开过的块区间（同一方法多条命中不重复整块展开）
+                    let mut seen_blocks: Vec<(usize, usize)> = Vec::new();
+                    // 单遍块索引：50 命中场景从 O(50n) 降为 O(n)，语义与逐次 find_enclosing_block 等价
+                    let bindex_built = if block_mode { Some(BlockIndex::build(&flines, &ext)) } else { None };
+                    let bindex = bindex_built.as_ref();
+                    for (i, line) in flines.iter().enumerate() {
+                        let matched = match re {
+                            Some(r) => r.is_match(line),
+                            None => {
+                                if case_sensitive {
+                                    line.contains(pattern)
+                                } else {
+                                    line.to_lowercase().contains(lower)
+                                }
+                            }
+                        };
+                        if matched {
+                            // block 模式：展开所在完整代码块（成对 {}() 语言感知，整方法不截断）
+                            if block_mode && *block_shown < MAX_BLOCK_HITS {
+                                let blk = match bindex {
+                                    Some(bi) => bi.enclosing(&flines, i, &ext),
+                                    None => find_enclosing_block(&flines, i, &ext),
+                                };
+                                if let Some((o, c)) = blk {
+                                    if seen_blocks.contains(&(o, c)) {
+                                        continue;
+                                    }
+                                    seen_blocks.push((o, c));
+                                    *block_shown += 1;
+                                    let mut b = String::new();
+                                    b.push_str(&format!("{}（完整代码块 L{}-L{}）\n", p.display(), o + 1, c + 1));
+                                    for (li, l) in flines[o..=c].iter().enumerate() {
+                                        let s: String = l.trim_end().chars().take(200).collect();
+                                        b.push_str(&format!("{:>5} │ {s}\n", o + li + 1));
+                                    }
+                                    b.push_str(&format!("…块结束 L{}\n", c + 1));
+                                    hits.push(b);
+                                    if hits.len() >= 50 {
+                                        return;
+                                    }
                                     continue;
                                 }
-                                seen_blocks.push((o, c));
-                                *block_shown += 1;
-                                let mut b = String::new();
-                                b.push_str(&format!("{}（完整代码块 L{}-L{}）\n", p.display(), o + 1, c + 1));
-                                for (li, l) in flines[o..=c].iter().enumerate() {
-                                    let s: String = l.trim_end().chars().take(200).collect();
-                                    b.push_str(&format!("{:>5} │ {s}\n", o + li + 1));
-                                }
-                                b.push_str(&format!("…块结束 L{}\n", c + 1));
-                                hits.push(b);
-                                if hits.len() >= 50 {
-                                    return;
-                                }
-                                continue;
                             }
-                        }
-                        let snippet: String = line.trim().chars().take(160).collect();
-                        // 注释命中标注：模型据此区分代码逻辑位置与说明性位置，避免误读
-                        let tag = if is_comment_line(line, &ext) { "[注释] " } else { "" };
-                        hits.push(format!("{}:{}: {tag}{snippet}", p.display(), i + 1));
-                        if hits.len() >= 50 {
-                            return;
+                            let snippet: String = line.trim().chars().take(160).collect();
+                            // 注释命中标注：模型据此区分代码逻辑位置与说明性位置，避免误读
+                            let tag = if is_comment_line(line, &ext) { "[注释] " } else { "" };
+                            hits.push(format!("{}:{}: {tag}{snippet}", p.display(), i + 1));
+                            if hits.len() >= 50 {
+                                return;
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    walk(
-        &root,
-        &start_rel,
-        &ignore_rules,
-        pattern,
-        &lower,
-        case_sensitive,
-        re.as_ref(),
-        glob,
-        block_mode,
-        &mut block_shown,
-        &mut hits,
-        &mut files_checked,
-        &mut skipped,
-    );
+        walk(
+            &root_buf,
+            &start_rel,
+            &ignore_rules,
+            &pattern_buf,
+            &lower,
+            case_sensitive,
+            re.as_ref(),
+            &glob,
+            block_mode,
+            &mut block_shown,
+            &mut hits,
+            &mut files_checked,
+            &mut skipped,
+        );
+        (hits, files_checked, skipped, block_shown)
+    })
+    .await
+    .unwrap_or_default();
     if hits.is_empty() {
         return Ok(format!(
             "未找到包含「{pattern}」的内容（检查了 {files_checked} 个文件，跳过 {skipped} 个忽略目录）"
@@ -2571,8 +2615,14 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
     let existed = p.exists();
     let mut content_out = content.to_string();
     if existed {
-        // 冲突保护：文件自上次读取后被外部修改（IDE/用户/其他会话）→ 拒绝覆盖，要求重读确认
-        if let Ok(bytes) = std::fs::read(p) {
+        // 冲突保护：文件自上次读取后被外部修改（IDE/用户/其他会话）→ 拒绝覆盖，要求重读确认。
+        // 整文件读取在 spawn_blocking 中执行，避免大文件读钉死 tokio worker。
+        let p_buf = p.clone();
+        let old_bytes = tokio::task::spawn_blocking(move || std::fs::read(&p_buf))
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        if let Some(bytes) = old_bytes {
             if has_external_change(p, &bytes) {
                 return Err(format!(
                     "写入冲突：文件 {} 自上次读取后被修改（可能被外部编辑器/IDE、其他会话或命令间接改动）。\n请先 read_file 查看最新内容、确认意图后再写入（重新读取会解除冲突保护）。",
@@ -2626,8 +2676,17 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
             preview
         ));
     }
-    std::fs::write(p, content_out.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
-    if let Ok(meta) = std::fs::metadata(p) {
+    // 落盘 + 指纹登记：文件写入为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
+    let p_buf = p.clone();
+    let content_buf = content_out.clone();
+    let (wmeta, _) = tokio::task::spawn_blocking(move || {
+        std::fs::write(&p_buf, content_buf.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
+        let meta = std::fs::metadata(&p_buf).ok();
+        Ok::<(Option<std::fs::Metadata>, ()), String>((meta, ()))
+    })
+    .await
+    .map_err(|e| format!("写入文件任务异常: {e}"))??;
+    if let Some(meta) = wmeta {
         stamp_put(p, &meta, content_out.as_bytes());
     }
     Ok(format!(
@@ -2853,7 +2912,12 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
     let old = spec.old.as_str();
     let new = spec.new.as_str();
     let replace_all = spec.replace_all;
-    let bytes = std::fs::read(p).map_err(|e| format!("读取文件失败: {e}"))?;
+    // 整文件读取为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
+    let p_buf = p.clone();
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&p_buf))
+        .await
+        .map_err(|e| format!("读取文件任务异常: {e}"))?
+        .map_err(|e| format!("读取文件失败: {e}"))?;
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return Err("文件是二进制，无法以文本方式编辑".into());
     }
@@ -2912,8 +2976,16 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             ));
         }
         crate::agent::undo::snapshot(conversation_id, p, &bytes);
-        std::fs::write(p, final_text.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
-        if let Ok(meta) = std::fs::metadata(p) {
+        // 落盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
+        let p_buf = p.clone();
+        let final_buf = final_text.clone();
+        let (wmeta, _) = tokio::task::spawn_blocking(move || {
+            std::fs::write(&p_buf, final_buf.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
+            Ok::<(Option<std::fs::Metadata>, ()), String>((std::fs::metadata(&p_buf).ok(), ()))
+        })
+        .await
+        .map_err(|e| format!("写入文件任务异常: {e}"))??;
+        if let Some(meta) = wmeta {
             stamp_put(p, &meta, final_text.as_bytes());
         }
         let mut report = String::new();
@@ -2971,8 +3043,16 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         balance_guard(body, &final_body, &ext)?;
         // 撤销快照：落盘前记录旧内容（会话级，undo_edit 工具按栈序恢复）
         crate::agent::undo::snapshot(conversation_id, p, &bytes);
-        std::fs::write(p, final_text.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
-        if let Ok(meta) = std::fs::metadata(p) {
+        // 落盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
+        let p_buf = p.clone();
+        let final_buf = final_text.clone();
+        let (wmeta, _) = tokio::task::spawn_blocking(move || {
+            std::fs::write(&p_buf, final_buf.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
+            Ok::<(Option<std::fs::Metadata>, ()), String>((std::fs::metadata(&p_buf).ok(), ()))
+        })
+        .await
+        .map_err(|e| format!("写入文件任务异常: {e}"))??;
+        if let Some(meta) = wmeta {
             stamp_put(p, &meta, final_text.as_bytes());
         }
         let show = |s: &str| -> String {
@@ -3026,8 +3106,16 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
     }
     // 撤销快照：落盘前记录旧内容（会话级，undo_edit 工具按栈序恢复）
     crate::agent::undo::snapshot(conversation_id, p, &bytes);
-    std::fs::write(p, final_text.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
-    if let Ok(meta) = std::fs::metadata(p) {
+    // 落盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
+    let p_buf = p.clone();
+    let final_buf = final_text.clone();
+    let (wmeta, _) = tokio::task::spawn_blocking(move || {
+        std::fs::write(&p_buf, final_buf.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
+        Ok::<(Option<std::fs::Metadata>, ()), String>((std::fs::metadata(&p_buf).ok(), ()))
+    })
+    .await
+    .map_err(|e| format!("写入文件任务异常: {e}"))??;
+    if let Some(meta) = wmeta {
         stamp_put(p, &meta, final_text.as_bytes());
     }
     // 原文/新文各截 200 字符展示，避免大段替换把结果撑爆上下文

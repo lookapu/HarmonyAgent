@@ -112,10 +112,12 @@ pub async fn get_current_version() -> Result<String, String> {
             dir.join("deveco")
         };
         if shim.is_file() {
-            let out = crate::utils::process::output_blocking(
-                &shim.to_string_lossy().to_string(),
-                &["--version".to_string()],
-            )?;
+            let shim_str = shim.to_string_lossy().to_string();
+            let out = tokio::task::spawn_blocking(move || {
+                crate::utils::process::output_blocking(&shim_str, &["--version".to_string()])
+            })
+            .await
+            .map_err(|e| format!("执行 deveco --version 失败: {e}"))??;
             if out.status.success() {
                 let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !v.is_empty() {

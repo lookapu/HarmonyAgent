@@ -476,100 +476,114 @@ pub(super) async fn web_fetch(args: &Value) -> Result<String, String> {
 use crate::services::sdk_api;
 
 /// search_sdk_api 工具：检索本地 SDK 的 @ohos.*.d.ts 模块
-pub(super) fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if query.is_empty() {
-        return Err("query 不能为空".to_string());
-    }
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(20)
-        .min(50);
-    let env = crate::services::harmony_env::detect(db);
-    let dir = crate::services::harmony_env::default_api_dir(&env)
-        .ok_or_else(|| "未找到 SDK 的 ets/api 目录，请在健康检查页配置 SDK".to_string())?;
-    let idx = sdk_api::index_api_dir(&dir);
-    let hits = sdk_api::search(&idx, &query, limit);
-    if hits.is_empty() {
-        return Ok(format!("未在本地 SDK 中找到与「{query}」相关的 API 模块。"));
-    }
-    let mut out = format!(
-        "本地 SDK（API {}, {} 个模块）中匹配「{query}」的结果：\n\n",
-        env.default_api.as_deref().unwrap_or("?"),
-        idx.modules.len()
-    );
-    for m in hits {
-        out.push_str(&format!("## {} ", m.module));
-        if let Some(k) = &m.kit {
-            out.push_str(&format!("[{k}]"));
+/// （内部 detect 首次走 reg query、index_api_dir 扫描 .d.ts 均为同步 IO，放入 blocking 线程池）
+pub(super) async fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+    let args_owned = args.clone();
+    let db2 = crate::db::DbState(db.0.clone());
+    tokio::task::spawn_blocking(move || {
+        let query = args_owned
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if query.is_empty() {
+            return Err("query 不能为空".to_string());
         }
-        out.push('\n');
-        if let Some(s) = &m.syscap {
-            out.push_str(&format!("syscap: {s}\n"));
+        let limit = args_owned
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(20)
+            .min(50);
+        let env = crate::services::harmony_env::detect(&db2);
+        let dir = crate::services::harmony_env::default_api_dir(&env)
+            .ok_or_else(|| "未找到 SDK 的 ets/api 目录，请在健康检查页配置 SDK".to_string())?;
+        let idx = sdk_api::index_api_dir(&dir);
+        let hits = sdk_api::search(&idx, &query, limit);
+        if hits.is_empty() {
+            return Ok(format!("未在本地 SDK 中找到与「{query}」相关的 API 模块。"));
         }
-        match (m.since_min, m.since_max) {
-            (Some(a), Some(b)) if a != b => out.push_str(&format!("since: API {a}（更新至 API {b}）\n")),
-            (Some(a), _) => out.push_str(&format!("since: API {a}\n")),
-            _ => {}
-        }
-        if m.deprecated {
-            out.push_str("⚠️ 已废弃（@deprecated）\n");
-        }
-        if !m.declarations.is_empty() {
-            let preview: Vec<&str> = m.declarations.iter().take(20).map(|s| s.as_str()).collect();
-            out.push_str(&format!("声明: {}\n", preview.join(", ")));
-            if m.declarations.len() > 20 {
-                out.push_str(&format!("  …及另外 {} 个\n", m.declarations.len() - 20));
+        let mut out = format!(
+            "本地 SDK（API {}, {} 个模块）中匹配「{query}」的结果：\n\n",
+            env.default_api.as_deref().unwrap_or("?"),
+            idx.modules.len()
+        );
+        for m in hits {
+            out.push_str(&format!("## {} ", m.module));
+            if let Some(k) = &m.kit {
+                out.push_str(&format!("[{k}]"));
             }
+            out.push('\n');
+            if let Some(s) = &m.syscap {
+                out.push_str(&format!("syscap: {s}\n"));
+            }
+            match (m.since_min, m.since_max) {
+                (Some(a), Some(b)) if a != b => out.push_str(&format!("since: API {a}（更新至 API {b}）\n")),
+                (Some(a), _) => out.push_str(&format!("since: API {a}\n")),
+                _ => {}
+            }
+            if m.deprecated {
+                out.push_str("⚠️ 已废弃（@deprecated）\n");
+            }
+            if !m.declarations.is_empty() {
+                let preview: Vec<&str> = m.declarations.iter().take(20).map(|s| s.as_str()).collect();
+                out.push_str(&format!("声明: {}\n", preview.join(", ")));
+                if m.declarations.len() > 20 {
+                    out.push_str(&format!("  …及另外 {} 个\n", m.declarations.len() - 20));
+                }
+            }
+            out.push('\n');
         }
-        out.push('\n');
-    }
-    out.push_str("提示：需要某个模块的精确签名时，调用 read_sdk_api_module 并传入模块名。");
-    Ok(out)
+        out.push_str("提示：需要某个模块的精确签名时，调用 read_sdk_api_module 并传入模块名。");
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("SDK API 检索任务失败: {e}"))?
 }
 
 /// read_sdk_api_module 工具：读取完整 .d.ts 声明
-pub(super) fn read_sdk_api_module(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
-    let module = args
-        .get("module")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if module.is_empty() {
-        return Err("module 不能为空".to_string());
-    }
-    let env = crate::services::harmony_env::detect(db);
-    let dir = crate::services::harmony_env::default_api_dir(&env)
-        .ok_or_else(|| "未找到 SDK 的 ets/api 目录".to_string())?;
-    // 规范化文件名：补 .d.ts 后缀，防目录穿越
-    let fname = std::path::Path::new(&module)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or(module.clone());
-    let fname = if fname.ends_with(".d.ts") { fname } else { format!("{fname}.d.ts") };
-    let path = std::path::PathBuf::from(&dir).join(&fname);
-    if !path.is_file() {
-        return Err(format!("未找到声明文件：{fname}（请先用 search_sdk_api 确认模块名）"));
-    }
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    // 大文件截断到合理长度（d.ts 通常几十 KB，限制 60KB 避免撑爆上下文）
-    const MAX: usize = 60_000;
-    if content.len() <= MAX {
-        Ok(format!("// {fname}\n{content}"))
-    } else {
-        let cut: String = content.chars().take(MAX).collect();
-        Ok(format!(
-            "// {fname}（文件较大，仅显示前 {MAX} 字符）\n{cut}\n// …已截断，可用 read_file 配合 start/lines 精读特定段落"
-        ))
-    }
+/// （内部 detect 首次走 reg query 等同步 IO，放入 blocking 线程池）
+pub(super) async fn read_sdk_api_module(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+    let args_owned = args.clone();
+    let db2 = crate::db::DbState(db.0.clone());
+    tokio::task::spawn_blocking(move || {
+        let module = args_owned
+            .get("module")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if module.is_empty() {
+            return Err("module 不能为空".to_string());
+        }
+        let env = crate::services::harmony_env::detect(&db2);
+        let dir = crate::services::harmony_env::default_api_dir(&env)
+            .ok_or_else(|| "未找到 SDK 的 ets/api 目录".to_string())?;
+        // 规范化文件名：补 .d.ts 后缀，防目录穿越
+        let fname = std::path::Path::new(&module)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or(module.clone());
+        let fname = if fname.ends_with(".d.ts") { fname } else { format!("{fname}.d.ts") };
+        let path = std::path::PathBuf::from(&dir).join(&fname);
+        if !path.is_file() {
+            return Err(format!("未找到声明文件：{fname}（请先用 search_sdk_api 确认模块名）"));
+        }
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        // 大文件截断到合理长度（d.ts 通常几十 KB，限制 60KB 避免撑爆上下文）
+        const MAX: usize = 60_000;
+        if content.len() <= MAX {
+            Ok(format!("// {fname}\n{content}"))
+        } else {
+            let cut: String = content.chars().take(MAX).collect();
+            Ok(format!(
+                "// {fname}（文件较大，仅显示前 {MAX} 字符）\n{cut}\n// …已截断，可用 read_file 配合 start/lines 精读特定段落"
+            ))
+        }
+    })
+    .await
+    .map_err(|e| format!("SDK API 模块读取任务失败: {e}"))?
 }
 
 /// search_harmony_docs 工具：检索本地 OpenHarmony 文档库
@@ -594,7 +608,10 @@ pub(super) async fn search_harmony_docs_tool(args: &Value, ctx: &crate::agent::e
     };
     let root = crate::services::harmony_docs::docs_root(app)
         .ok_or_else(|| "本地 OpenHarmony 文档库未下载。请先让用户在健康检查页点击「下载/更新 OpenHarmony 文档」，或用 web_search 检索公开资料。".to_string())?;
-    let idx = crate::services::harmony_docs::index_docs(&root);
+    // 全量扫描 md 建索引在 blocking 线程池执行，避免钉死 tokio worker
+    let idx = tokio::task::spawn_blocking(move || crate::services::harmony_docs::index_docs(&root))
+        .await
+        .map_err(|e| e.to_string())?;
     let hits = crate::services::harmony_docs::search(&idx, &query, limit);
     if hits.is_empty() {
         return Ok(format!(

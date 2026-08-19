@@ -86,29 +86,42 @@ pub async fn audio_transcribe(
     }
 
     // 找 whisper 二进制（PATH 优先，再找 resources/whisper/）
-    let whisper_bin = find_whisper_binary().ok_or_else(|| {
-        "未找到 whisper.cpp 二进制。请按以下步骤安装：\n  \
-         1. git clone https://github.com/ggerganov/whisper.cpp\n  \
-         2. cd whisper.cpp && make\n  \
-         3. 把 main 二进制加到 PATH 或复制到 resources/whisper/\n  \
-         4. 下载模型：bash models/download-ggml-model.sh base\n  \
-         5. 放 ~/.cache/whisper/ggml-base.bin"
-            .to_string()
-    })?;
-    let model = find_whisper_model().ok_or_else(|| {
-        "未找到 whisper 模型。运行 bash models/download-ggml-model.sh base 并把 ggml-base.bin 放到 ~/.cache/whisper/".to_string()
-    })?;
+    // find_whisper_binary 内部有同步 `which` 调用，放入 blocking 线程池
+    let whisper_bin = tokio::task::spawn_blocking(find_whisper_binary)
+        .await
+        .map_err(|e| format!("查找 whisper 二进制任务失败: {e}"))?
+        .ok_or_else(|| {
+            "未找到 whisper.cpp 二进制。请按以下步骤安装：\n  \
+             1. git clone https://github.com/ggerganov/whisper.cpp\n  \
+             2. cd whisper.cpp && make\n  \
+             3. 把 main 二进制加到 PATH 或复制到 resources/whisper/\n  \
+             4. 下载模型：bash models/download-ggml-model.sh base\n  \
+             5. 放 ~/.cache/whisper/ggml-base.bin"
+                .to_string()
+        })?;
+    let model = tokio::task::spawn_blocking(find_whisper_model)
+        .await
+        .map_err(|e| format!("查找 whisper 模型任务失败: {e}"))?
+        .ok_or_else(|| {
+            "未找到 whisper 模型。运行 bash models/download-ggml-model.sh base 并把 ggml-base.bin 放到 ~/.cache/whisper/".to_string()
+        })?;
 
-    // 转绝对路径 + 调命令行
+    // 转绝对路径 + 调命令行（whisper 转写可达分钟级，放入 blocking 线程池）
     let audio_str = resolved.to_string_lossy().into_owned();
     let start = std::time::Instant::now();
-    let out = std::process::Command::new(&whisper_bin)
-        .arg("-m").arg(&model)
-        .arg("-f").arg(&audio_str)
-        .arg("--no-timestamps") // 简化输出
-        .arg("-l").arg("auto")
-        .output()
-        .map_err(|e| format!("执行 whisper 失败: {e}（请确认二进制可执行）"))?;
+    let whisper_bin_owned = whisper_bin.clone();
+    let model_owned = model.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&whisper_bin_owned)
+            .arg("-m").arg(&model_owned)
+            .arg("-f").arg(&audio_str)
+            .arg("--no-timestamps") // 简化输出
+            .arg("-l").arg("auto")
+            .output()
+            .map_err(|e| format!("执行 whisper 失败: {e}（请确认二进制可执行）"))
+    })
+    .await
+    .map_err(|e| format!("转写任务失败: {e}"))??;
     let elapsed = start.elapsed();
     if !out.status.success() {
         return Err(format!(

@@ -1151,8 +1151,8 @@ pub async fn run_tool(
         "deploy" => build_tools::deploy(&args, &roots, ctx, project_id).await,
         "ohpm_install" => build_tools::ohpm_install(&args, &roots).await,
         "web_search" => web_tools::web_search(&args).await,
-        "search_sdk_api" => test_tools::search_sdk_api(&args, db),
-        "read_sdk_api_module" => test_tools::read_sdk_api_module(&args, db),
+        "search_sdk_api" => test_tools::search_sdk_api(&args, db).await,
+        "read_sdk_api_module" => test_tools::read_sdk_api_module(&args, db).await,
         "check_sdk_alignment" => check_sdk_alignment(&args, &roots, db),
         "create_harmony_project" => project_tools::create_harmony_project(&args, &roots).await,
         "show_diagnose_card" => show_diagnose_card(&args, ctx).await,
@@ -1210,7 +1210,7 @@ pub async fn run_tool(
         "gesture_perform" => ui_tools::gesture_perform(&args, &roots).await,
         "analyze_hap_size" => ui_tools::analyze_hap_size(&args, &roots).await,
         "size_diff" => ui_tools::size_diff(&args, &roots),
-        "screenshot_diff" => ui_tools::screenshot_diff(&args, &roots),
+        "screenshot_diff" => ui_tools::screenshot_diff(&args, &roots).await,
         "search_hilog" => debug_tools::search_hilog(&args, &roots).await,
         "log_query" => quality_tools::log_query(&args, &roots, ctx).await,
         "run_lint" => debug_tools::run_lint(&args, &roots).await,
@@ -1221,7 +1221,7 @@ pub async fn run_tool(
         "scan_api_compat" => debug_tools::scan_api_compat(&args, &roots, db).await,
         "auto_explore" => explore_tools::auto_explore(&args, &roots).await,
         "refresh_api_db" => explore_tools::refresh_api_db(db, ctx).await,
-        "search_api" => explore_tools::search_api(&args, db),
+        "search_api" => explore_tools::search_api(&args, db).await,
         "refresh_api_details" => explore_tools::refresh_api_details(db, ctx).await,
         "get_api_detail" => explore_tools::get_api_detail(&args, db),
         "diff_api_versions" => explore_tools::diff_api_versions(&args, db),
@@ -2663,13 +2663,20 @@ async fn run_app(args: &Value, roots: &[String]) -> Result<String, String> {
             Ok(cmd_tools::cut_str(&out, 4000))
         }
         "stop" => {
-            let mut map = running_apps().lock().map_err(|e| e.to_string())?;
-            let Some(proc) = map.remove(&key) else {
+            // 块作用域内取进程并释放锁：MutexGuard 非 Send，不能跨 await
+            let proc = {
+                let mut map = running_apps().lock().map_err(|e| e.to_string())?;
+                map.remove(&key)
+            };
+            let Some(proc) = proc else {
                 return Err(format!(
                     "没有名为 {name} 的运行中进程（先 run_app action=status 查看）"
                 ));
             };
-            crate::utils::process::kill_tree(Some(proc.pid));
+            let pid = proc.pid;
+            tokio::task::spawn_blocking(move || crate::utils::process::kill_tree(Some(pid)))
+                .await
+                .map_err(|e| format!("停止进程树失败: {e}"))?;
             let tail_log = read_log_tail(&proc.log_path, 1500);
             Ok(format!(
                 "已停止 {name}（pid {}，工作目录 {}）。\n日志尾部：\n{}",
@@ -2679,8 +2686,13 @@ async fn run_app(args: &Value, roots: &[String]) -> Result<String, String> {
         "start" | "restart" => {
             // restart：先停止现有同名进程（进程树强杀；wait 任务会把注册表存活位置为 false）
             if action == "restart" {
-                if let Some(proc) = running_apps().lock().map_err(|e| e.to_string())?.remove(&key) {
-                    crate::utils::process::kill_tree(Some(proc.pid));
+                // 先取出进程再释放锁：MutexGuard 非 Send，不能跨 await
+                let removed = running_apps().lock().map_err(|e| e.to_string())?.remove(&key);
+                if let Some(proc) = removed {
+                    let pid = proc.pid;
+                    tokio::task::spawn_blocking(move || crate::utils::process::kill_tree(Some(pid)))
+                        .await
+                        .map_err(|e| format!("停止进程树失败: {e}"))?;
                 }
             }
             // ---- start ----
@@ -2928,7 +2940,11 @@ const DEVICE_SHELL_FORBIDDEN_TOKENS: &[&str] = &[
 
 /// environment_check：一次性体检 HarmonyOS 开发环境（工具链/设备/代理/工程对齐）。
 async fn environment_check(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
-    let env = crate::services::harmony_env::detect(db);
+    // detect 首次会走 reg query 等同步 IO（后续走 CACHE），放入 blocking 线程池
+    let db2 = crate::db::DbState(db.0.clone());
+    let env = tokio::task::spawn_blocking(move || crate::services::harmony_env::detect(&db2))
+        .await
+        .map_err(|e| format!("环境探测失败: {e}"))?;
     let mut out = String::from("环境体检（HarmonyOS 开发工具链）：\n");
 
     out.push_str("\n[工具链]\n");
@@ -3311,11 +3327,13 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录".into());
     }
-    let root = Path::new(project_path);
+    let root = Path::new(project_path).to_path_buf();
     let query = args["query"].as_str().unwrap_or("").to_string();
     let kind = args["kind"].as_str().map(|s| s.to_string());
     // 复用带 60 秒 TTL 的缓存索引（连续检索/多文件定位时避免重复全量扫描）
-    let syms = crate::services::symbol_index::index_project_cached(root);
+    let syms = tokio::task::spawn_blocking(move || crate::services::symbol_index::index_project_cached(&root))
+        .await
+        .map_err(|e| e.to_string())?;
     let found = crate::services::symbol_index::filter_symbols(&syms, &query, kind.as_deref());
     if found.is_empty() {
         return Ok(format!("未找到匹配 \"{query}\" 的符号"));

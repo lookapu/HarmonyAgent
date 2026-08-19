@@ -48,28 +48,35 @@ pub async fn code_metrics(args: &Value, roots: &[String]) -> Result<String, Stri
         return Err(format!("路径不存在: {}", p.display()));
     }
     let top_n = args["top"].as_u64().unwrap_or(10).min(50) as usize;
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    if p.is_file() {
-        files.push(p.clone());
-    } else {
-        collect_source_files(&p, &mut files, 0);
-    }
-    if files.is_empty() {
-        return Err(format!("未在 {} 下找到源码文件（扩展名: {}）", p.display(), SOURCE_EXTS.join("/")));
-    }
-    let mut total = FileMetrics::default();
-    let mut per_file: Vec<(PathBuf, FileMetrics)> = Vec::new();
-    for f in &files {
-        match analyze_source_file(f) {
-            Ok(m) => {
-                total.merge(&m);
-                per_file.push((f.clone(), m));
-            }
-            Err(e) => errors.push(e),
+    // 全量收集源码文件 + 逐文件扫描（CPU/IO 密集）在 blocking 线程池执行，避免钉死 tokio worker
+    let scan_p = p.clone();
+    let (errors, total, per_file) = tokio::task::spawn_blocking(move || {
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        if scan_p.is_file() {
+            files.push(scan_p.clone());
+        } else {
+            collect_source_files(&scan_p, &mut files, 0);
         }
-    }
-    per_file.sort_by(|a, b| b.1.cyclomatic_delta.cmp(&a.1.cyclomatic_delta));
+        if files.is_empty() {
+            return Err(format!("未在 {} 下找到源码文件（扩展名: {}）", scan_p.display(), SOURCE_EXTS.join("/")));
+        }
+        let mut total = FileMetrics::default();
+        let mut per_file: Vec<(PathBuf, FileMetrics)> = Vec::new();
+        for f in &files {
+            match analyze_source_file(f) {
+                Ok(m) => {
+                    total.merge(&m);
+                    per_file.push((f.clone(), m));
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        per_file.sort_by(|a, b| b.1.cyclomatic_delta.cmp(&a.1.cyclomatic_delta));
+        Ok((errors, total, per_file))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let comment_rate = if total.code_lines + total.comment_lines > 0 {
         total.comment_lines as f64 * 100.0 / (total.code_lines + total.comment_lines) as f64
     } else {

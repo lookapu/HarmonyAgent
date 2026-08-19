@@ -399,6 +399,17 @@ pub fn check_harmony_toolchain(
     project_id: Option<String>,
     custom_paths: Option<Vec<String>>,
 ) -> Result<Vec<ToolchainCheck>, String> {
+    check_harmony_toolchain_impl(&app, db.inner(), project_id, custom_paths)
+}
+
+/// 内部实现（不带 State 包装）：供 get_environment_info 在 blocking 线程池中调用。
+/// 内部有注册表/目录扫描等同步 IO，需避免在 async 上下文中直接调用。
+pub(crate) fn check_harmony_toolchain_impl(
+    app: &tauri::AppHandle,
+    db: &DbState,
+    project_id: Option<String>,
+    custom_paths: Option<Vec<String>>,
+) -> Result<Vec<ToolchainCheck>, String> {
     // 自定义目录：去空白、去引号，仅保留存在的目录（用户显式选择，最高优先级）
     let mut search_dirs: Vec<String> = custom_paths
         .unwrap_or_default()
@@ -473,7 +484,7 @@ pub fn check_harmony_toolchain(
 
     // 2. hdc（调试/部署依赖）：优先自定义目录，其次复用环境探测结果
     //    （与顶部环境/设备面板同源；避免递归扫描误命中历史遗留 SDK 的旧 hdc），最后 PATH
-    let env = crate::services::harmony_env::detect(db.inner());
+    let env = crate::services::harmony_env::detect(db);
     let hdc = find_in_dirs("hdc", &search_dirs)
         .or_else(|| env.hdc_path.as_ref().map(PathBuf::from))
         .or_else(|| find_in_path("hdc"));

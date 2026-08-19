@@ -277,8 +277,12 @@ pub async fn refresh(db: &Arc<Mutex<Connection>>) -> Result<RefreshReport, Strin
     let client = build_client_auto()?;
     let meta = fetch_search_meta(&client).await;
     let now = chrono::Utc::now().timestamp();
-    {
-        let mut conn = db.lock().map_err(|e| e.to_string())?;
+    let total = pkgs.len();
+    // 锁内 500+ 条批量写为 IO/DB 密集操作，放 spawn_blocking 避免钉死 tokio worker
+    // （std Mutex 在 async 中等待锁也会阻塞 worker）
+    let db_clone = db.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut conn = db_clone.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM ohpm_landscape", [])
             .map_err(|e| e.to_string())?;
@@ -310,9 +314,12 @@ pub async fn refresh(db: &Arc<Mutex<Connection>>) -> Result<RefreshReport, Strin
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
-    }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("ohpm 缓存刷新任务异常: {e}"))??;
     Ok(RefreshReport {
-        total: pkgs.len(),
+        total,
         updated_at: now,
     })
 }

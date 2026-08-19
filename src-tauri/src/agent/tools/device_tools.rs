@@ -45,8 +45,11 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
     if !matches!(action, "start" | "stop" | "restart" | "status") {
         return Err("action 仅支持 start|stop|restart|status".into());
     }
-    // hdc 路径：优先探测到的工具链，回退 PATH
-    let env = crate::services::harmony_env::detect(db);
+    // hdc 路径：优先探测到的工具链，回退 PATH（detect 首次走 reg query 等同步 IO，放入 blocking 线程池）
+    let db2 = crate::db::DbState(db.0.clone());
+    let env = tokio::task::spawn_blocking(move || crate::services::harmony_env::detect(&db2))
+        .await
+        .map_err(|e| format!("环境探测失败: {e}"))?;
     let hdc = env.hdc_path.clone().unwrap_or_else(|| "hdc".to_string());
     // 服务状态探测：能执行 list targets 即视为在线
     let probe = async || {
@@ -138,7 +141,11 @@ pub(super) fn emulator_exe() -> Option<PathBuf> {
 }
 
 pub(super) async fn list_emulators() -> Result<String, String> {
-    let Some(emu) = emulator_exe() else {
+    // emulator_exe 内部走 discover_deveco_dirs（reg query 等同步 IO），放入 blocking 线程池
+    let emu = tokio::task::spawn_blocking(emulator_exe)
+        .await
+        .map_err(|e| format!("查找模拟器任务失败: {e}"))?;
+    let Some(emu) = emu else {
         return Err(
             "未找到 DevEco Studio 模拟器（Emulator.exe）。请先安装 DevEco Studio 并创建至少一个模拟器实例（DevEco Studio → Device Manager → 新建模拟器）。"
                 .into(),

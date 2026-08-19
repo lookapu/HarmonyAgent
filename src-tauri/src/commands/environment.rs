@@ -67,13 +67,30 @@ pub async fn get_environment_info(
     custom_paths: Option<Vec<String>>,
 ) -> Result<EnvironmentInfo, String> {
     let app_info = get_app_info(app.clone());
-    let node = crate::services::node_runtime::get_node_runtime_info(&app);
+    // 三个同步检查（版本探测 / 工具链扫描含注册表查询）放入 blocking 线程池，避免钉死 tokio worker
+    let node_app = app.clone();
+    let node = tokio::task::spawn_blocking(move || {
+        crate::services::node_runtime::get_node_runtime_info(&node_app)
+    })
+    .await
+    .map_err(|e| format!("查询 Node 运行时失败: {e}"))?;
     let node_latest_lts = crate::services::node_runtime::fetch_latest_lts(None).await.ok();
-    let git = crate::services::git_runtime::get_git_runtime_info(&app);
+    let git_app = app.clone();
+    let git = tokio::task::spawn_blocking(move || {
+        crate::services::git_runtime::get_git_runtime_info(&git_app)
+    })
+    .await
+    .map_err(|e| format!("查询 Git 运行时失败: {e}"))?;
     let git_latest = crate::services::git_runtime::fetch_latest_tag(None).await.ok();
     // 工具链检查复用健康页命令（含自定义目录与 toolkit 目录查找）
-    let toolchain =
-        crate::commands::health::check_harmony_toolchain(app, db, None, custom_paths).unwrap_or_default();
+    let toolchain_app = app;
+    let db_state = crate::db::DbState(db.inner().0.clone());
+    let toolchain = tokio::task::spawn_blocking(move || {
+        crate::commands::health::check_harmony_toolchain_impl(&toolchain_app, &db_state, None, custom_paths)
+    })
+    .await
+    .map_err(|e| format!("工具链检查任务失败: {e}"))?
+    .unwrap_or_default();
     Ok(EnvironmentInfo {
         app: app_info,
         node,

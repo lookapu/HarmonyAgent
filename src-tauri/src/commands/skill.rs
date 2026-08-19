@@ -174,7 +174,12 @@ pub async fn import_skill_from_github(
             "--abbrev-ref".to_string(),
             "HEAD".to_string(),
         ];
-        let out = crate::utils::process::output_blocking("git", &args).ok();
+        let out = tokio::task::spawn_blocking(move || {
+            crate::utils::process::output_blocking("git", &args)
+        })
+        .await
+        .map_err(|e| format!("git rev-parse 任务失败: {e}"))?
+        .ok();
         out.and_then(|o| {
             if o.status.success() {
                 Some(String::from_utf8_lossy(&o.stdout).trim().to_string())

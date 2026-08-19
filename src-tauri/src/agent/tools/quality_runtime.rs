@@ -13,13 +13,17 @@ struct MockRoute {
     response: serde_json::Value,
 }
 
-/// 包装 output_blocking：返回 stdout 字符串
+/// 包装 output_blocking：返回 stdout 字符串（阻塞调用放入 blocking 线程池，避免钉死 tokio worker）
 /// 接受任意 AsRef<str> 切片，支持混合 &str / &String
-fn hdc_shell<S: AsRef<str>>(args: &[S]) -> Result<String, String> {
+async fn hdc_shell<S: AsRef<str>>(args: &[S]) -> Result<String, String> {
     let owned: Vec<String> = args.iter().map(|s| s.as_ref().to_string()).collect();
-    let out = crate::utils::process::output_blocking("hdc", &owned)
-        .map_err(|e| format!("hdc 执行失败: {e}"))?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    tokio::task::spawn_blocking(move || {
+        let out = crate::utils::process::output_blocking("hdc", &owned)
+            .map_err(|e| format!("hdc 执行失败: {e}"))?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+    .await
+    .map_err(|e| format!("hdc 任务失败: {e}"))?
 }
 pub async fn api_test(args: &Value, roots: &[String]) -> Result<String, String> {
     let spec_raw = args["spec"].as_str().ok_or("api_test 需要参数 {\"spec\":\"<OpenAPI JSON 路径或内联>\"}")?;
@@ -203,7 +207,12 @@ pub async fn api_mock(
 
     // 3) 用内置 Node 后台启动（常驻 12h，可 job_kill 终止）
     let node = if let Some(app) = ctx.app.as_ref() {
-        let info = crate::services::node_runtime::get_node_runtime_info(app);
+        let app = app.clone();
+        let info = tokio::task::spawn_blocking(move || {
+            crate::services::node_runtime::get_node_runtime_info(&app)
+        })
+        .await
+        .map_err(|e| format!("查询 Node 运行时失败: {e}"))?;
         info.dir
             .as_ref()
             .map(|d| {
@@ -294,6 +303,7 @@ pub async fn attach_debugger(
         None => {
             // 默认设备：从 hdc 找 ★ 标记的
             hdc_shell(&["list", "targets"])
+                .await
                 .map_err(|e| format!("hdc list targets 失败: {e}"))?
                 .lines()
                 .find(|l| l.contains('\t') || l.contains("[empty]"))
@@ -317,7 +327,7 @@ pub async fn attach_debugger(
     let wait_secs = args["wait_secs"].as_u64().unwrap_or(30);
 
     // 1) 拿 pid
-    let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).map_err(|e| format!("hdc pidof 失败: {e}"))?;
+    let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).await.map_err(|e| format!("hdc pidof 失败: {e}"))?;
     let pid = pid_out.trim();
     if pid.is_empty() {
         return Err(format!("应用未运行或 pidof 返回空（先 deploy 启动应用）"));
@@ -326,7 +336,7 @@ pub async fn attach_debugger(
     // 2) attach 调试器（hdc shell debuggerd attach <pid>，系统服务）
     //    注：DevEco 工程的 attach 通常用 `aa debug -b <bundle>` 启动开发模式；
     //    这里是运行时 attach，更轻量。
-    let attach_out = hdc_shell(&["-t", &device, "shell", "debuggerd", &format!("-p {pid}")]).map_err(|e| format!("debuggerd attach 失败: {e}"));
+    let attach_out = hdc_shell(&["-t", &device, "shell", "debuggerd", &format!("-p {pid}")]).await.map_err(|e| format!("debuggerd attach 失败: {e}"));
 
     match attach_out {
         Ok(out) => Ok(format!(
@@ -335,7 +345,7 @@ pub async fn attach_debugger(
         )),
         Err(e) => {
             // 退路：尝试 aa debug 启动开发模式
-            let aa = hdc_shell(&["-t", &device, "shell", "aa", "debug", "-b", &bundle]);
+            let aa = hdc_shell(&["-t", &device, "shell", "aa", "debug", "-b", &bundle]).await;
             match aa {
                 Ok(out2) => Ok(format!(
                     "调试器已通过 aa debug 启动：设备 {device} / 包 {bundle} / PID {pid}\n输出：{}\n",
@@ -357,6 +367,7 @@ pub async fn step_debug(
         Some(d) => d.to_string(),
         None => {
             hdc_shell(&["list", "targets"])
+                .await
                 .map_err(|e| format!("hdc list targets 失败: {e}"))?
                 .lines()
                 .find(|l| !l.trim().is_empty())
@@ -374,7 +385,7 @@ pub async fn step_debug(
             let bundle = crate::services::harmony::parse_project(std::path::Path::new(project_path))
                 .bundle_name
                 .ok_or_else(|| "无法确定应用包名".to_string())?;
-            let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).map_err(|e| format!("hdc pidof 失败: {e}"))?;
+            let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).await.map_err(|e| format!("hdc pidof 失败: {e}"))?;
             let p = pid_out.trim().to_string();
             if p.is_empty() {
                 return Err("应用未运行（先 deploy 启动或 attach_debugger）".into());
@@ -394,7 +405,7 @@ pub async fn step_debug(
         other => return Err(format!("不支持的 step_debug action: {other}（step/next/continue/interrupt/where/info）")),
     };
 
-    let out = hdc_shell(&["-t", &device, "shell", "debuggerd", &format!("-p {pid} -c {cmd}")]).map_err(|e| format!("debuggerd 命令失败: {e}"))?;
+    let out = hdc_shell(&["-t", &device, "shell", "debuggerd", &format!("-p {pid} -c {cmd}")]).await.map_err(|e| format!("debuggerd 命令失败: {e}"))?;
 
     Ok(format!(
         "单步调试（设备 {device} / PID {pid} / action={action}）：\n{}",
@@ -431,20 +442,28 @@ pub async fn ota_pack(
 
     // 3) 构造命令（hmos app packager 打 OTA 包）
     //    实际命令：java -jar <packager> --mode ota --hap <hap> --out <pkg> --profile <profile>
-    let mut cmd = std::process::Command::new("java");
-    cmd.arg("-jar").arg(&packager);
-    cmd.arg("--mode").arg("ota");
-    cmd.arg("--hap").arg(&hap_full);
-    cmd.arg("--out").arg(out_path);
-    if let Some(pp) = profile_path {
-        cmd.arg("--profile").arg(pp);
-    }
-    cmd.arg("--force"); // 覆盖已存在
-
+    //    java 打包可能耗时数秒~数十秒，放入 blocking 线程池避免钉死 tokio worker
     let start = std::time::Instant::now();
-    let output = cmd.output().map_err(|e| format!(
-        "启动 packaging_tool 失败: {e}（确认 java 在 PATH 且 packaging_tool.jar 可访问）"
-    ))?;
+    let packager_owned = packager.clone();
+    let hap_full_owned = hap_full.clone();
+    let out_path_owned = out_path.to_string();
+    let profile_owned = profile_path.map(|s| s.to_string());
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("java");
+        cmd.arg("-jar").arg(&packager_owned);
+        cmd.arg("--mode").arg("ota");
+        cmd.arg("--hap").arg(&hap_full_owned);
+        cmd.arg("--out").arg(&out_path_owned);
+        if let Some(pp) = &profile_owned {
+            cmd.arg("--profile").arg(pp);
+        }
+        cmd.arg("--force"); // 覆盖已存在
+        cmd.output().map_err(|e| format!(
+            "启动 packaging_tool 失败: {e}（确认 java 在 PATH 且 packaging_tool.jar 可访问）"
+        ))
+    })
+    .await
+    .map_err(|e| format!("打包任务失败: {e}"))??;
     let elapsed = start.elapsed();
 
     if !output.status.success() {

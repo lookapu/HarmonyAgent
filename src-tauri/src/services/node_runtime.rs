@@ -193,7 +193,14 @@ pub async fn upgrade_node_runtime(
 
     let _ = std::fs::remove_file(&zip_path);
     init_node_runtime(app);
-    Ok(get_node_runtime_info(app))
+    // get_node_runtime_info 内部会同步执行 node/npx --version，放入 blocking 线程池
+    let app_for_task = app.clone();
+    let info = tokio::task::spawn_blocking(move || {
+        crate::services::node_runtime::get_node_runtime_info(&app_for_task)
+    })
+    .await
+    .map_err(|e| format!("查询 Node 运行时状态失败: {e}"))?;
+    Ok(info)
 }
 
 /// 恢复出厂：删除升级版，回到捆绑版（无捆绑版时回到 none）

@@ -191,9 +191,13 @@ fn latest_build_log(project_path: &str) -> String {
 }
 
 /// Tauri 命令：解析最近一次构建日志的结构化错误列表。
+/// 构建日志可能达数十 MB，读取+正则解析为 IO/CPU 密集操作，async + spawn_blocking
+/// 避免阻塞 UI 主线程（同步 command 会冻结调用它的前端交互）。
 #[tauri::command]
-pub fn analyze_build_errors(project_path: String) -> Result<Vec<AnalyzedBuildError>, String> {
-    let log = latest_build_log(&project_path);
+pub async fn analyze_build_errors(project_path: String) -> Result<Vec<AnalyzedBuildError>, String> {
+    let log = tokio::task::spawn_blocking(move || latest_build_log(&project_path))
+        .await
+        .map_err(|e| format!("读取构建日志任务异常: {e}"))?;
     if log.trim().is_empty() {
         return Err("暂无构建日志（先执行一次构建，或检查 .deveco-agent/logs 目录）".into());
     }

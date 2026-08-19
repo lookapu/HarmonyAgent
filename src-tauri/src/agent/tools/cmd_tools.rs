@@ -316,8 +316,14 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     };
     match result {
         Ok(out) => {
-            // 扫描命令间接修改/创建的文件（写文件类命令也受文件列表追踪，与 edit_file/write_file 一致）
-            let changed = scan_recent_changes(roots, cmd_start, 200);
+            // 扫描命令间接修改/创建的文件（写文件类命令也受文件列表追踪，与 edit_file/write_file 一致）。
+            // 全项目递归遍历在 spawn_blocking 中执行，避免钉死 tokio worker。
+            let roots_owned = roots.to_vec();
+            let changed = tokio::task::spawn_blocking(move || {
+                scan_recent_changes(&roots_owned, cmd_start, 200)
+            })
+            .await
+            .unwrap_or_default();
             if changed.is_empty() {
                 Ok(out)
             } else {
@@ -353,50 +359,71 @@ pub(super) fn needs_shell(command: &str) -> bool {
 
 /// check_code：静态检查（规则式 lint）
 pub(super) async fn check_code_tool(args: &Value, roots: &[String]) -> Result<String, String> {
-    let root = scan_root(roots)?;
-    let path = args["path"].as_str();
-    let kind = args["kind"].as_str();
-    crate::agent::scanner::check_code(root, path, kind)
-        .map_err(|e| with_advice("check_code", e))
+    let root = scan_root(roots)?.to_path_buf();
+    let path = args["path"].as_str().map(str::to_string);
+    let kind = args["kind"].as_str().map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        crate::agent::scanner::check_code(&root, path.as_deref(), kind.as_deref())
+            .map_err(|e| with_advice("check_code", e))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// deep_scan：深度扫描报告
 pub(super) async fn deep_scan_tool(args: &Value, roots: &[String]) -> Result<String, String> {
-    let root = scan_root(roots)?;
-    let path = args["path"].as_str();
-    crate::agent::scanner::deep_scan(root, path).map_err(|e| with_advice("deep_scan", e))
+    let root = scan_root(roots)?.to_path_buf();
+    let path = args["path"].as_str().map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        crate::agent::scanner::deep_scan(&root, path.as_deref()).map_err(|e| with_advice("deep_scan", e))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// secret_scan：密钥泄露专项扫描（源码 + 配置文件）
 pub(super) async fn secret_scan_tool(args: &Value, roots: &[String]) -> Result<String, String> {
-    let root = scan_root(roots)?;
-    let path = args["path"].as_str();
+    let root = scan_root(roots)?.to_path_buf();
+    let path = args["path"].as_str().map(str::to_string);
     let include_config = args["include_config"].as_bool();
-    crate::agent::scanner::secret_scan(root, path, include_config).map_err(|e| with_advice("secret_scan", e))
+    tokio::task::spawn_blocking(move || {
+        crate::agent::scanner::secret_scan(&root, path.as_deref(), include_config)
+            .map_err(|e| with_advice("secret_scan", e))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// codebase_search：全库混合检索
 pub(super) async fn codebase_search_tool(args: &Value, roots: &[String]) -> Result<String, String> {
-    let root = scan_root(roots)?;
-    let query = args["query"].as_str().ok_or("codebase_search 需要参数 {\"query\":\"<查询词>\"}")?.trim();
+    let root = scan_root(roots)?.to_path_buf();
+    let query = args["query"].as_str().ok_or("codebase_search 需要参数 {\"query\":\"<查询词>\"}")?.trim().to_string();
     if query.is_empty() {
         return Err("codebase_search 需要参数 {\"query\":\"<查询词>\"}".into());
     }
     let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 30) as usize;
-    crate::agent::scanner::codebase_search(root, query, limit)
-        .map_err(|e| with_advice("codebase_search", e))
+    tokio::task::spawn_blocking(move || {
+        crate::agent::scanner::codebase_search(&root, &query, limit)
+            .map_err(|e| with_advice("codebase_search", e))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// get_symbol_details：符号详情 + 引用反查
 pub(super) async fn get_symbol_details_tool(args: &Value, roots: &[String]) -> Result<String, String> {
-    let root = scan_root(roots)?;
-    let name = args["name"].as_str().ok_or("get_symbol_details 需要参数 {\"name\":\"<符号名>\"}")?.trim();
+    let root = scan_root(roots)?.to_path_buf();
+    let name = args["name"].as_str().ok_or("get_symbol_details 需要参数 {\"name\":\"<符号名>\"}")?.trim().to_string();
     if name.is_empty() {
         return Err("get_symbol_details 需要参数 {\"name\":\"<符号名>\"}".into());
     }
-    let file = args["file"].as_str();
-    crate::agent::scanner::symbol_details(root, name, file)
-        .map_err(|e| with_advice("get_symbol_details", e))
+    let file = args["file"].as_str().map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        crate::agent::scanner::symbol_details(&root, &name, file.as_deref())
+            .map_err(|e| with_advice("get_symbol_details", e))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------- 后台任务管理（jobs） ----------
