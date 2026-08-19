@@ -13,9 +13,9 @@
 
 | 项 | 数值 |
 |---|---|
-| 对外工具（TOOL_SPECS） | **182** |
+| 对外工具（TOOL_SPECS） | **193** |
 | 工具分派分支（含内部命令） | 170 |
-| 自动跑框架（已有） | Reflexion（agent/reflexion.rs）、cost_guard、LSP 常驻、任务看门狗（task_guard） |
+| 自动跑框架（已有） | Reflexion（agent/reflexion.rs）、cost_guard、LSP 常驻、任务看门狗（utils/task_registry.rs） |
 | 关键基础设施（已有） | undo 可逆性（undo.rs + undo_edit 工具）、job 系统（job_list/kill/output）、HealthPage（check_all_health）、tool_stats 统计（list_tool_stats + list_tool_token_stats）、session_events 事件流、secret 钥匙串（secret_store/get/delete）、Reflexion 反思卡片、tool_cache 响应缓存、redact 脱敏、TOOL_GROUP 分组 |
 | txt 计划项（A 56 + B 20） | 76 |
 | 其中 ✅ 已有 | 39 |

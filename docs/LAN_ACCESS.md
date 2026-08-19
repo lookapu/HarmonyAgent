@@ -184,8 +184,8 @@ chat-error             chat-stopped            chat-tool-start
 chat-tool-done         chat-tool-approval      chat-plan
 chat-plan-resolved     chat-ask                agent:todo
 agent:log              chat-agent-start        chat-agent-done
-chat-job-done          conversation-renamed    projects-changed
-chat-compact
+chat-job-done          conversation-renamed    conversation-deleted
+projects-changed       chat-compact
 ```
 
 ### 3.7 关键事件通知（P3，浏览器通知替代 Web Push）
@@ -233,7 +233,7 @@ chat-compact
 | POST | `/api/conversations/:id/rename` | `rename_conversation` | 改名 |
 | POST | `/api/conversations/:id/pin` | `update_conversation` | 置顶/取消 |
 | POST | `/api/conversations/:id/archive` | `update_conversation` | 归档/取消 |
-| POST | `/api/conversations/:id/delete` | `delete_conversation` | 删除 |
+| POST | `/api/conversations/:id/delete` | `delete_conversation` | 删除；若会话有任务运行中，会先停止 + abort 任务并释放项目锁再级联删除 |
 
 > ~~`/api/push/subscribe` / `/api/push/unsubscribe`~~：Web Push 在 HTTP 局域网不可用，P3 不实现（见 §3.7）。
 

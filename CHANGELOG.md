@@ -5,6 +5,46 @@
 
 ---
 
+## v2.1 — 对话流转加固 + 极简留白 UI（2026-08-19）
+
+定位：围绕"对话能否正常流转"做一次全面体检与修复，解决停止/删除/审批/错误态等边界场景的状态不一致，并把对话区视觉改为极简留白风格。
+
+### 🐛 对话流转修复（后端）
+
+- **停止语义修复**：用户点停止后，不再自动续跑排队消息（`stream_chat_body` 在 `stats.stopped` 时终止队列消费），避免"点了停止，过会儿 AI 又自己开始干活"。
+- **删除运行中会话**：`delete_conversation` 改为先停止 + abort 后台任务（新增 `TaskRegistry::abort_conversation`）+ 释放项目锁，再删库，消除孤儿任务、继续写文件和项目锁长期占用问题。删除时同步清理 `tool_limits` / `task_guard` 进程内状态，修复内存随会话数单调增长。
+- **审批/计划审查中停止**：新增 `InterceptKind::Cancelled`、`ApprovalOutcome::Cancelled`、`PlanReview.cancelled`，工具审批/计划审查等待期间点停止，现在按"停止"收尾（`chat-stopped`），而非被当成"拒绝"导致任务继续跑一轮或显示为正常完成。串行与批处理工具路径均已覆盖。
+- **任务看门狗**：`TaskRegistry` 统一登记所有 `stream_chat` 任务，8 分钟无心跳 / 40 秒停止未生效时强制 abort 并 emit `chat-error`；`stream_once` 内按阶段（发送→首字节→流式→解析）高频 touch。
+- **新增迁移 `050_task_ledger.sql`**：持久化 `task_runs.target_text / target_passed / target_evidence`。
+- `chat-done` 事件新增 `user_message_id` 字段，供前端替换乐观占位。
+
+### 🐛 对话流转修复（前端）
+
+- **错误态与流式残影共存**：出错时清 `conversationId` / `startedAt`，打字光标/三点动画立即消失，只保留已生成内容 + 错误卡。
+- **乐观 user 消息 ID 不替换**：`chat-done` 用真实 `user_message_id` 替换 `local-` 占位，当前会话周期内的编辑/删除/分支重生成/Fork 立即生效。
+- **停止兜底计时器误杀新任务**：`stopGeneration` 的 60s 兜底用 `startedAt` 代次 token 校验，停止后立即重发不再被旧计时器置错。
+- **看门狗误杀后台审批会话**：改为按 `pendingConfirmations[convId]` 判断（含后台会话），而非仅当前会话视图数组。
+- 乐观消息 ID 加随机后缀避免跨会话同秒碰撞；排队失败弹错误通知；`chat-done` 按完成会话自身 `project_id` 刷新列表；新增 `conversation-deleted` 事件监听（多端/LAN 删除时同步清理并切换会话）。
+
+### 🎨 对话区极简留白样式
+
+- 消息头模型/耗时/token/消息ID 徽章**默认隐藏，悬浮显示**；assistant 头像去紫色渐变改朴素圆点；用户气泡去彩边/阴影改中性背景。
+- 工具卡 / 子 Agent / 计划卡 / 账本卡 / 任务过程条统一为**纯文字行 + 折叠**：去掉彩色背景、左侧竖条、图标底色块、阴影和完成脉冲。
+- 思考块（ThinkingBlock）改左侧细竖线；错误卡弱化为中性边框；CSS 中 `.task-*` 类去背景/竖条/阴影。
+
+### ✅ 验证
+
+- `cargo check`：0 error / 0 warning
+- `cargo test --lib`：**418 passed / 0 failed**（含 ask/guards/pipeline）
+- 前端 `tsc --noEmit`：通过
+
+### 🔄 迁移要点
+
+- 新增迁移 `050_task_ledger.sql`（已执行库自动应用，无破坏性变更）。
+- `delete_conversation` 命令由同步改为 `async`，签名新增 `app/cancel/lock/registry` 状态参数；LAN 服务改用同步内部函数 `delete_conversation_sync`，HTTP 行为不变（删除仍会级联清理运行中任务）。
+
+---
+
 ## v2.0 — Agent Workspace 收尾（2026-08-16）
 
 定位：从"Provider 切换器"升级为**完整 Agent Workspace**——工具集 117 → **191**，覆盖鸿蒙开发全链路；新增 9 个能力工具 + ToolError 结构化错误；命令面板与 i18n 同步落地；超大单文件按职责拆分。

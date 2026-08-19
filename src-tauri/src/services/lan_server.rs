@@ -51,6 +51,7 @@ const EVENT_WHITELIST: &[&str] = &[
     "chat-agent-done",
     "chat-job-done",
     "conversation-renamed",
+    "conversation-deleted",
     "projects-changed",
     "chat-compact",
 ];
