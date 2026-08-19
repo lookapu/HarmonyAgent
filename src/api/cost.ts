@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 export interface RequestLog {
   id: string
@@ -86,16 +86,16 @@ export interface TaskRun {
   finished_at: number
 }
 
-export const getCostSummary = (range: DateRange) => invoke<CostSummary>('get_cost_summary', { range })
-export const getRequestLogs = (filter: LogFilter) => invoke<RequestLog[]>('get_request_logs', { filter })
-export const getDailyUsage = (range: DateRange) => invoke<DailyUsage[]>('get_daily_usage', { range })
+export const getCostSummary = (range: DateRange) => invokeWithError<CostSummary>('get_cost_summary', { range })
+export const getRequestLogs = (filter: LogFilter) => invokeWithError<RequestLog[]>('get_request_logs', { filter })
+export const getDailyUsage = (range: DateRange) => invokeWithError<DailyUsage[]>('get_daily_usage', { range })
 /** 任务级指标聚合；project_id 为空 = 全局，days 缺省 30 */
 export const getTaskStats = (projectId?: string, days = 30) =>
-  invoke<TaskStats>('get_task_stats', { projectId: projectId ?? '', days })
+  invokeWithError<TaskStats>('get_task_stats', { projectId: projectId ?? '', days })
 
 /** 最近任务列表；project_id 为空 = 全局；status 可选过滤（success/error/cancelled） */
 export const getTaskRuns = (projectId?: string, status?: string, limit = 20) =>
-  invoke<TaskRun[]>('get_task_runs', { projectId: projectId ?? '', status: status ?? '', limit })
+  invokeWithError<TaskRun[]>('get_task_runs', { projectId: projectId ?? '', status: status ?? '', limit })
 
 /** 单 Provider 预算状态：当日/当月已用 + 日/月上限 */
 export interface BudgetStatus {
@@ -117,7 +117,7 @@ export interface AllBudgetStatus {
 
 /** 查询某 Provider 预算状态；provider_id 缺省 = 跨 Provider 汇总 */
 export const getBudgetStatus = (providerId?: string) =>
-  invoke<BudgetStatus>('get_budget_status', { providerId: providerId ?? null })
+  invokeWithError<BudgetStatus>('get_budget_status', { providerId: providerId ?? null })
 
 /** 全部 Provider 预算概览（成本页顶部预算总览卡片用） */
-export const getAllBudgetStatus = () => invoke<AllBudgetStatus>('get_all_budget_status')
+export const getAllBudgetStatus = () => invokeWithError<AllBudgetStatus>('get_all_budget_status')

@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** 多协议端点（同一厂商可提供 OpenAI / Anthropic / Gemini 多套端点，如 DeepSeek） */
 export interface EndpointDef {
@@ -109,21 +109,21 @@ export interface SyncModelsResult {
   error: string | null
 }
 
-export const listProviders = () => invoke<Provider[]>('list_providers')
+export const listProviders = () => invokeWithError<Provider[]>('list_providers')
 /** 手动排序 Provider：orderedIds 为全部 Provider 的新顺序（含当前激活的），返回排序后的列表 */
-export const reorderProviders = (orderedIds: string[]) => invoke<Provider[]>('reorder_providers', { orderedIds })
-export const createProvider = (input: CreateProviderInput) => invoke<Provider>('create_provider', { input })
-export const updateProvider = (id: string, input: UpdateProviderInput) => invoke<Provider>('update_provider', { id, input })
-export const deleteProvider = (id: string) => invoke<void>('delete_provider', { id })
-export const switchProvider = (id: string) => invoke<void>('switch_provider', { id })
-export const testProvider = (id: string) => invoke<string>('test_provider', { id })
-export const listProviderModels = (providerId: string) => invoke<ProviderModel[]>('list_provider_models', { providerId })
-export const updateModel = (id: string, input: UpdateModelInput) => invoke<ProviderModel>('update_model', { id, input })
+export const reorderProviders = (orderedIds: string[]) => invokeWithError<Provider[]>('reorder_providers', { orderedIds })
+export const createProvider = (input: CreateProviderInput) => invokeWithError<Provider>('create_provider', { input })
+export const updateProvider = (id: string, input: UpdateProviderInput) => invokeWithError<Provider>('update_provider', { id, input })
+export const deleteProvider = (id: string) => invokeWithError<void>('delete_provider', { id })
+export const switchProvider = (id: string) => invokeWithError<void>('switch_provider', { id })
+export const testProvider = (id: string) => invokeWithError<string>('test_provider', { id })
+export const listProviderModels = (providerId: string) => invokeWithError<ProviderModel[]>('list_provider_models', { providerId })
+export const updateModel = (id: string, input: UpdateModelInput) => invokeWithError<ProviderModel>('update_model', { id, input })
 export const addModel = (providerId: string, input: CreateModelInput) =>
-  invoke<ProviderModel>('add_model', { providerId, input })
-export const removeModel = (id: string) => invoke<void>('remove_model', { id })
+  invokeWithError<ProviderModel>('add_model', { providerId, input })
+export const removeModel = (id: string) => invokeWithError<void>('remove_model', { id })
 /** 手动排序模型：orderedIds 为该 Provider 下模型的新顺序（需包含全部模型 ID），返回排序后的模型列表 */
 export const reorderProviderModels = (providerId: string, orderedIds: string[]) =>
-  invoke<ProviderModel[]>('reorder_provider_models', { providerId, orderedIds })
+  invokeWithError<ProviderModel[]>('reorder_provider_models', { providerId, orderedIds })
 export const syncProviderModels = (providerId: string) =>
-  invoke<SyncModelsResult>('sync_provider_models', { id: providerId })
+  invokeWithError<SyncModelsResult>('sync_provider_models', { id: providerId })

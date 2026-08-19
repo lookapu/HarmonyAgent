@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export interface Project {
@@ -120,14 +120,14 @@ export const resolveToolApproval = (
   remember?: boolean,
   feedback?: string,
   scope?: 'session' | 'project',
-) => invoke<void>('resolve_tool_approval', { requestId, approved, remember, feedback, scope })
+) => invokeWithError<void>('resolve_tool_approval', { requestId, approved, remember, feedback, scope })
 
 /** 回复诊断引导卡片结果（完成操作或稍后关闭后调用，唤醒等待中的 Agent） */
 export const resolveDiagnoseCard = (
   requestId: string,
   completed: boolean,
   note?: string,
-) => invoke<void>('resolve_diagnose_card', { requestId, completed, note })
+) => invokeWithError<void>('resolve_diagnose_card', { requestId, completed, note })
 
 /** 回复计划审查结果（计划模式下由计划卡片调用） */
 export const resolvePlanReview = (
@@ -136,7 +136,7 @@ export const resolvePlanReview = (
   approved: boolean,
   feedback?: string,
 ) =>
-  invoke<void>('resolve_plan_review', {
+  invokeWithError<void>('resolve_plan_review', {
     conversationId,
     requestId,
     approved,
@@ -152,7 +152,26 @@ export interface TodoItem {
 
 /** 读取会话当前任务清单（切换会话/刷新后恢复展示） */
 export const getTodos = (conversationId: string) =>
-  invoke<TodoItem[]>('get_todos', { conversationId })
+  invokeWithError<TodoItem[]>('get_todos', { conversationId })
+
+/** 任务账本条目（Ledger 协议）：n=执行序号（append-only 续接），tool=绑定工具名，text=结果摘要 */
+export interface LedgerEntry {
+  n: number
+  tool: string
+  text: string
+}
+
+/** 任务账本（Ledger 协议）：目标/已验证/待解决/下一步 四段式，由工具执行轨迹派生 */
+export interface TaskLedger {
+  goal: string
+  verified: LedgerEntry[]
+  open: LedgerEntry[]
+  next: string
+}
+
+/** 读取会话任务账本（任务未完成时落库，切回会话/刷新时恢复展示；完成时清空返回 null） */
+export const getTaskLedger = (conversationId: string) =>
+  invokeWithError<TaskLedger | null>('get_task_ledger', { conversationId })
 
 /** Agent 挂起的提问（ask_user 工具推送） */
 export interface PendingAsk {
@@ -164,7 +183,7 @@ export interface PendingAsk {
 
 /** 查询会话内挂起的提问（切回会话时恢复提问卡） */
 export const getAsk = (conversationId: string) =>
-  invoke<PendingAsk | null>('get_ask', { conversationId })
+  invokeWithError<PendingAsk | null>('get_ask', { conversationId })
 
 /** 会话待确认项（会话列表角标 + 切回会话恢复弹窗）：审批 / 计划 / 提问三类 */
 export interface PendingConfirmation {
@@ -180,11 +199,11 @@ export interface PendingConfirmation {
 
 /** 查询项目内所有会话的待确认项（审批/计划/提问） */
 export const listPendingConfirmations = (projectId: string) =>
-  invoke<PendingConfirmation[]>('list_pending_confirmations', { projectId })
+  invokeWithError<PendingConfirmation[]>('list_pending_confirmations', { projectId })
 
 /** 回复 Agent 的提问（answer 为空串表示跳过） */
 export const resolveAskUser = (requestId: string, answer: string) =>
-  invoke<void>('resolve_ask_user', { requestId, answer })
+  invokeWithError<void>('resolve_ask_user', { requestId, answer })
 
 /** 会话上下文状态（输入区上下文可视条：消息数/摘要状态） */
 export interface ConversationContextInfo {
@@ -206,7 +225,7 @@ export interface ConversationContextInfo {
 }
 
 export const getConversationContext = (conversationId: string) =>
-  invoke<ConversationContextInfo>('conversation_context', { conversationId })
+  invokeWithError<ConversationContextInfo>('conversation_context', { conversationId })
 
 /** 会话事件日志条目（回放视图） */
 export interface SessionEvent {
@@ -236,7 +255,7 @@ export interface SessionEventsView {
 }
 
 export const getSessionEvents = (conversationId: string) =>
-  invoke<SessionEventsView>('get_session_events', { conversationId })
+  invokeWithError<SessionEventsView>('get_session_events', { conversationId })
 
 export interface FileTreeNode {
   name: string
@@ -247,11 +266,11 @@ export interface FileTreeNode {
   children?: FileTreeNode[]
 }
 
-export const listProjects = () => invoke<Project[]>('list_projects')
+export const listProjects = () => invokeWithError<Project[]>('list_projects')
 
-export const inspectProject = (path: string) => invoke<ProjectInspect>('inspect_project', { path })
+export const inspectProject = (path: string) => invokeWithError<ProjectInspect>('inspect_project', { path })
 
-export const addProject = (path: string) => invoke<Project>('add_project', { path })
+export const addProject = (path: string) => invokeWithError<Project>('add_project', { path })
 
 /** 工作区模块类型（与后端 ModuleKind 一一对应，小写） */
 export type ModuleKind =
@@ -303,15 +322,15 @@ export type ScannedModuleEntry = WorkspaceModule & { inspect: ProjectInspect }
 
 /** 预览扫描：列出所选目录下识别到的所有模块（不落库） */
 export const scanWorkspaceModules = (path: string) =>
-  invoke<ScannedModuleEntry[]>('scan_workspace_modules', { path })
+  invokeWithError<ScannedModuleEntry[]>('scan_workspace_modules', { path })
 
 /** 重新扫描已添加项目的工作区模块（保留手动绑定项） */
 export const rescanWorkspaceModules = (projectId: string) =>
-  invoke<Project>('rescan_workspace_modules', { projectId })
+  invokeWithError<Project>('rescan_workspace_modules', { projectId })
 
 /** 手动设置工作区模块列表（增删改、修改类型） */
 export const setWorkspaceModules = (projectId: string, modules: WorkspaceModule[]) =>
-  invoke<Project>('set_workspace_modules', { projectId, modules })
+  invokeWithError<Project>('set_workspace_modules', { projectId, modules })
   
   /** 会话"鸿蒙主工程"解析结果 */
   export interface HarmonyRootInfo {
@@ -327,11 +346,11 @@ export const setWorkspaceModules = (projectId: string, modules: WorkspaceModule[
   
   /** 查询项目的"鸿蒙主工程"解析结果 */
   export const getHarmonyRoot = (projectId: string, root?: string) =>
-    invoke<HarmonyRootInfo>('get_harmony_root', { projectId, root: root ?? null })
+    invokeWithError<HarmonyRootInfo>('get_harmony_root', { projectId, root: root ?? null })
   
   /** 设置会话"鸿蒙主工程"（空串=清除，回退项目根本身）；返回更新后的项目 */
   export const setHarmonyProjectPath = (projectId: string, path: string, root?: string) =>
-    invoke<Project>('set_harmony_project_path', { projectId, path, root: root ?? null })
+    invokeWithError<Project>('set_harmony_project_path', { projectId, path, root: root ?? null })
 
 /** 解析 project.workspace_modules JSON 字符串为数组 */
 export const parseWorkspaceModules = (json: string | null | undefined): WorkspaceModule[] => {
@@ -416,21 +435,21 @@ export const projectTypeBadgeClass = (kind: ProjectTypeBadge['kind']): string =>
   }
 }
 
-export const trustProject = (id: string) => invoke<Project>('trust_project', { id })
+export const trustProject = (id: string) => invokeWithError<Project>('trust_project', { id })
 
-export const deleteProject = (id: string) => invoke<void>('delete_project', { id })
+export const deleteProject = (id: string) => invokeWithError<void>('delete_project', { id })
 
 export interface ScopedCounts { mcp: number; skills: number }
 /** 各项目的项目级专属 MCP/技能数量 */
 export const projectScopedCounts = () =>
-  invoke<Record<string, ScopedCounts>>('project_scoped_counts')
+  invokeWithError<Record<string, ScopedCounts>>('project_scoped_counts')
 
 export const listConversations = (projectId: string, includeArchived = false, keyword = '') =>
-  invoke<Conversation[]>('list_conversations', { projectId, includeArchived, keyword })
+  invokeWithError<Conversation[]>('list_conversations', { projectId, includeArchived, keyword })
 
 /** 按 id 查询单个会话（不区分归档状态）：搜索命中跳转兜底用，查不到返回 null */
 export const getConversation = (conversationId: string) =>
-  invoke<Conversation | null>('get_conversation', { id: conversationId })
+  invokeWithError<Conversation | null>('get_conversation', { id: conversationId })
 
 export interface NewConversationWorktree {
   /** 'local' | 'worktree' */
@@ -440,7 +459,7 @@ export interface NewConversationWorktree {
 }
 
 export const createConversation = (projectId: string, title?: string, worktree?: NewConversationWorktree) =>
-  invoke<Conversation>('create_conversation', {
+  invokeWithError<Conversation>('create_conversation', {
     projectId,
     title,
     workMode: worktree?.work_mode ?? null,
@@ -450,10 +469,10 @@ export const createConversation = (projectId: string, title?: string, worktree?:
 
 /** 会话 Fork：从既有会话派生新会话（复制截至 untilMessageId 含该条的消息与事件；缺省全部） */
 export const forkConversation = (fromId: string, untilMessageId?: string) =>
-  invoke<Conversation>('fork_conversation', { fromId, untilMessageId: untilMessageId ?? null })
+  invokeWithError<Conversation>('fork_conversation', { fromId, untilMessageId: untilMessageId ?? null })
 
 export const listMessages = (conversationId: string) =>
-  invoke<ChatMessage[]>('list_messages', { conversationId })
+  invokeWithError<ChatMessage[]>('list_messages', { conversationId })
 
 /** 消息分页结果（messages 正序，hasMore 表示游标之前是否还有更早消息） */
 export interface MessagePage {
@@ -463,7 +482,7 @@ export interface MessagePage {
 
 /** 游标分页加载消息：beforeId 为空返回最近 limit 条，否则返回该消息之前（更早）的 limit 条 */
 export const listMessagesPage = (conversationId: string, beforeId?: string, limit?: number) =>
-  invoke<MessagePage>('list_messages_page', { conversationId, beforeId: beforeId ?? null, limit: limit ?? 60 })
+  invokeWithError<MessagePage>('list_messages_page', { conversationId, beforeId: beforeId ?? null, limit: limit ?? 60 })
 
 /** 消息全文搜索命中 */
 export interface MessageSearchHit {
@@ -481,14 +500,14 @@ export interface MessageSearchHit {
 
 /** 在项目内（或指定会话）全文检索消息内容，返回命中片段 */
 export const searchMessages = (projectId: string, query: string, conversationId?: string) =>
-  invoke<MessageSearchHit[]>('search_messages', { projectId, query, conversationId: conversationId ?? null })
+  invokeWithError<MessageSearchHit[]>('search_messages', { projectId, query, conversationId: conversationId ?? null })
 
 /** 跨项目全文检索：搜所有项目，结果带 project_id/project_name 用于分组展示 */
 export const searchMessagesAllProjects = (query: string) =>
-  invoke<MessageSearchHit[]>('search_messages_all_projects', { query })
+  invokeWithError<MessageSearchHit[]>('search_messages_all_projects', { query })
 
 export const sendMessage = (conversationId: string, content: string) =>
-  invoke<ChatMessage>('send_message', { conversationId, content })
+  invokeWithError<ChatMessage>('send_message', { conversationId, content })
 
 export const streamChat = (
   conversationId: string,
@@ -498,11 +517,11 @@ export const streamChat = (
   references?: string[],
   images?: string[],
   regenerateUserId?: string,
-) => invoke<void>('stream_chat', { conversationId, content, options, regenerate, references, images, regenerateUserId })
+) => invokeWithError<void>('stream_chat', { conversationId, content, options, regenerate, references, images, regenerateUserId })
 
 /** 运行中提交消息进入排队：agentOwned=true 由 Agent 安全点并入当前任务；false 任务结束后自动续跑 */
 export const queueMessage = (conversationId: string, content: string, agentOwned: boolean, references?: string[], images?: string[]) =>
-  invoke<ChatMessage>('queue_message', { conversationId, content, agentOwned, references, images })
+  invokeWithError<ChatMessage>('queue_message', { conversationId, content, agentOwned, references, images })
 
 /** 会话排队中消息（前端“排队中”条展示） */
 export interface QueuedMessageInfo {
@@ -514,11 +533,11 @@ export interface QueuedMessageInfo {
 
 /** 查询会话排队中消息列表 */
 export const listQueuedMessages = (conversationId: string) =>
-  invoke<QueuedMessageInfo[]>('list_queued_messages', { conversationId })
+  invokeWithError<QueuedMessageInfo[]>('list_queued_messages', { conversationId })
 
 /** 移除会话排队中的一条消息（不再续跑） */
 export const removeQueuedMessage = (conversationId: string, messageId: string) =>
-  invoke<void>('remove_queued_message', { conversationId, messageId })
+  invokeWithError<void>('remove_queued_message', { conversationId, messageId })
 
 /** 项目审批白名单条目 */
 export interface WhitelistEntry {
@@ -528,47 +547,47 @@ export interface WhitelistEntry {
 
 /** 查询项目的工具审批白名单 */
 export const listToolWhitelist = (projectId: string) =>
-  invoke<WhitelistEntry[]>('list_tool_whitelist', { projectId })
+  invokeWithError<WhitelistEntry[]>('list_tool_whitelist', { projectId })
 
 /** 移除项目审批白名单中的一条记录 */
 export const removeToolWhitelist = (projectId: string, tool: string) =>
-  invoke<void>('remove_tool_whitelist', { projectId, tool })
+  invokeWithError<void>('remove_tool_whitelist', { projectId, tool })
 
 /** 编辑已发送的用户消息内容 */
 export const updateMessage = (messageId: string, content: string) =>
-  invoke<void>('update_message', { messageId, content })
+  invokeWithError<void>('update_message', { messageId, content })
 
 /** 删除单条消息及其之后的所有消息 */
-export const deleteMessage = (messageId: string) => invoke<number>('delete_message', { messageId })
+export const deleteMessage = (messageId: string) => invokeWithError<number>('delete_message', { messageId })
 
 /** 停止当前流式生成（后端在安全点退出，部分内容会入库） */
-export const stopChat = (conversationId: string) => invoke<void>('stop_chat', { conversationId })
+export const stopChat = (conversationId: string) => invokeWithError<void>('stop_chat', { conversationId })
 
 /** 停止当前正在执行的工具（不终止整个任务）：强杀子进程，模型拿到中断反馈后继续生成结论 */
-export const stopTool = (conversationId: string) => invoke<void>('stop_tool', { conversationId })
+export const stopTool = (conversationId: string) => invokeWithError<void>('stop_tool', { conversationId })
 
 export const renameConversation = (id: string, title: string) =>
-  invoke<void>('rename_conversation', { id, title })
+  invokeWithError<void>('rename_conversation', { id, title })
 
 /** 置顶 / 取消置顶 */
 export const pinConversation = (id: string, pinned: boolean) =>
-  invoke<Conversation>('update_conversation', { id, isPinned: pinned, archived: null, modelId: null })
+  invokeWithError<Conversation>('update_conversation', { id, isPinned: pinned, archived: null, modelId: null })
 
 /** 归档/取消归档会话 */
 export const archiveConversation = (id: string, archived: boolean) =>
-  invoke<Conversation>('update_conversation', { id, isPinned: null, archived, modelId: null })
+  invokeWithError<Conversation>('update_conversation', { id, isPinned: null, archived, modelId: null })
 
 /** 会话绑定模型（空串清除绑定；上下文可视条按会话模型查 context_limit） */
 export const setConversationModel = (id: string, modelId: string) =>
-  invoke<Conversation>('update_conversation', { id, isPinned: null, archived: null, modelId })
+  invokeWithError<Conversation>('update_conversation', { id, isPinned: null, archived: null, modelId })
 
 /** 会话标签更新（覆盖；空串清除；后端自动去重 + trim + 限制 10 个） */
 export const setConversationTags = (id: string, tags: string) =>
-  invoke<Conversation>('update_conversation', { id, isPinned: null, archived: null, modelId: null, tags })
+  invokeWithError<Conversation>('update_conversation', { id, isPinned: null, archived: null, modelId: null, tags })
 
 /** 按标签筛选会话（项目内） */
 export const listConversationsByTag = (projectId: string, tag: string, includeArchived = false) =>
-  invoke<Conversation[]>('list_conversations_by_tag', { projectId, tag, includeArchived })
+  invokeWithError<Conversation[]>('list_conversations_by_tag', { projectId, tag, includeArchived })
 
 /** 列出项目下所有出现过的标签 + 频次（按频次倒序），用于标签筛选下拉 */
 export interface TagCount {
@@ -576,16 +595,16 @@ export interface TagCount {
   count: number
 }
 export const listConversationTags = (projectId: string) =>
-  invoke<TagCount[]>('list_conversation_tags', { projectId })
+  invokeWithError<TagCount[]>('list_conversation_tags', { projectId })
 
 export const deleteConversation = (id: string) =>
-  invoke<void>('delete_conversation', { id })
+  invokeWithError<void>('delete_conversation', { id })
 
 export const getGitBranches = (projectId: string) =>
-  invoke<GitBranchInfo>('get_git_branches', { projectId })
+  invokeWithError<GitBranchInfo>('get_git_branches', { projectId })
 
 export const switchGitBranch = (projectId: string, branch: string) =>
-  invoke<GitBranchInfo>('switch_git_branch', { projectId, branch })
+  invokeWithError<GitBranchInfo>('switch_git_branch', { projectId, branch })
 
 /** 从会话推导文件操作根目录：worktree 模式返回 worktree_path，否则 undefined（后端回退项目主路径） */
 export const conversationRoot = (
@@ -594,7 +613,7 @@ export const conversationRoot = (
   conv?.work_mode === 'worktree' && conv.worktree_path ? conv.worktree_path : undefined
 
 export const buildProjectIndex = (projectId: string, root?: string) =>
-  invoke<FileTreeNode>('build_project_index', { projectId, root: root ?? null })
+  invokeWithError<FileTreeNode>('build_project_index', { projectId, root: root ?? null })
 
 /** 文件树索引进度/完成事件 payload */
 export interface FileTreeIndexProgress {
@@ -613,11 +632,11 @@ export function onFileTreeIndexDone(cb: (p: FileTreeIndexProgress) => void): Pro
 }
 
 export const getProjectFileTree = (projectId: string) =>
-  invoke<FileTreeNode | null>('get_project_file_tree', { projectId })
+  invokeWithError<FileTreeNode | null>('get_project_file_tree', { projectId })
 
 /** 读取单层目录内容（文件树懒加载：根目录 → 展开时逐级按需请求） */
 export const listProjectDir = (projectId: string, path: string, root?: string) =>
-  invoke<FileTreeNode[]>('list_project_dir', { projectId, path, root: root ?? null })
+  invokeWithError<FileTreeNode[]>('list_project_dir', { projectId, path, root: root ?? null })
 
 /** 文件搜索结果项（仅文件名匹配，不含目录名） */
 export interface FileSearchHit {
@@ -628,7 +647,7 @@ export interface FileSearchHit {
 
 /** 按文件名（不含目录路径）不区分大小写子串搜索，最多返回 limit 条；仅匹配文件名，目录名不参与匹配 */
 export const searchProjectFiles = (projectId: string, query: string, root?: string, limit = 200) =>
-  invoke<FileSearchHit[]>('search_project_files', { projectId, query, root: root ?? null, limit })
+  invokeWithError<FileSearchHit[]>('search_project_files', { projectId, query, root: root ?? null, limit })
 
 /** 预览读取结果：content 为渲染文本；truncated 表示是否因过大截断；totalChars 为截断前总字符数 */
 export interface PreviewResult {
@@ -639,15 +658,15 @@ export interface PreviewResult {
 
 /** 读取项目内文件内容（文本 ≤5MB 完整返回；大文件/文档智能截断保留头尾），供预览面板使用 */
 export const readProjectFile = (projectId: string, path: string, root?: string) =>
-  invoke<PreviewResult>('read_project_file', { projectId, path, root: root ?? null })
+  invokeWithError<PreviewResult>('read_project_file', { projectId, path, root: root ?? null })
 
 /** 预览窗口下载：复制项目内文件到用户选择的保存位置（返回字节数） */
 export const saveProjectFile = (projectId: string, path: string, dest: string, root?: string) =>
-  invoke<number>('save_project_file', { projectId, path, dest, root: root ?? null })
+  invokeWithError<number>('save_project_file', { projectId, path, dest, root: root ?? null })
 
 /** 预览窗口删除：把项目内文件移入系统回收站（Windows/macOS 可恢复） */
 export const deleteProjectFile = (projectId: string, path: string, root?: string) =>
-  invoke<string>('delete_project_file', { projectId, path, root: root ?? null })
+  invokeWithError<string>('delete_project_file', { projectId, path, root: root ?? null })
 
 /* ============ 项目记忆（Memory） ============ */
 
@@ -664,16 +683,16 @@ export interface ProjectMemory {
 }
 
 export const listMemories = (projectId: string) =>
-  invoke<ProjectMemory[]>('list_memories', { projectId })
+  invokeWithError<ProjectMemory[]>('list_memories', { projectId })
 
 /** 保存记忆（id 为空 = 新增，否则更新） */
 export const saveMemory = (input: { id?: string; project_id: string; category: string; title: string; content: string }) =>
-  invoke<ProjectMemory>('save_memory', { input })
+  invokeWithError<ProjectMemory>('save_memory', { input })
 
-export const deleteMemory = (id: string) => invoke<void>('delete_memory', { id })
+export const deleteMemory = (id: string) => invokeWithError<void>('delete_memory', { id })
 
 export const setMemoryEnabled = (id: string, enabled: boolean) =>
-  invoke<void>('set_memory_enabled', { id, enabled })
+  invokeWithError<void>('set_memory_enabled', { id, enabled })
 
 /* ============ 工具调用统计（Evaluation） ============ */
 
@@ -687,10 +706,10 @@ export interface ToolStat {
 }
 
 export const listToolStats = (projectId: string) =>
-  invoke<ToolStat[]>('list_tool_stats', { projectId })
+  invokeWithError<ToolStat[]>('list_tool_stats', { projectId })
 
 /** 全部工具 → task_group 映射（[75] 工具面板按任务分组折叠 UI） */
-export const listToolGroups = () => invoke<Array<[string, string]>>('list_tool_groups')
+export const listToolGroups = () => invokeWithError<Array<[string, string]>>('list_tool_groups')
 
 /** 工具 token 消耗排行（[69]：request_logs.tool_name 按工具聚合，代理链路口径） */
 export interface ToolTokenStat {
@@ -702,7 +721,7 @@ export interface ToolTokenStat {
 }
 
 export const listToolTokenStats = (days: number) =>
-  invoke<ToolTokenStat[]>('list_tool_token_stats', { days })
+  invokeWithError<ToolTokenStat[]>('list_tool_token_stats', { days })
 
 /* ============ 消息反馈（点赞/点踩） ============ */
 
@@ -724,10 +743,10 @@ export const saveMessageFeedback = (input: {
   feedback: 'like' | 'dislike' | 'neutral'
   reason?: string
   comment?: string
-}) => invoke<MessageFeedback | null>('save_message_feedback', { input })
+}) => invokeWithError<MessageFeedback | null>('save_message_feedback', { input })
 
 export const listMessageFeedback = (conversationId: string) =>
-  invoke<MessageFeedback[]>('list_message_feedback', { conversationId })
+  invokeWithError<MessageFeedback[]>('list_message_feedback', { conversationId })
 
 /* ============ 回复版本（重新生成保留旧版 + diff） ============ */
 
@@ -742,7 +761,7 @@ export interface MessageVersion {
 }
 
 export const listMessageVersions = (conversationId: string) =>
-  invoke<MessageVersion[]>('list_message_versions', { conversationId })
+  invokeWithError<MessageVersion[]>('list_message_versions', { conversationId })
 
 /* ============ 记忆自动总结（草稿） ============ */
 
@@ -754,11 +773,11 @@ export interface MemoryDraft {
 
 /** 由 LLM 提取会话要点，返回待确认的记忆草稿（不落库） */
 export const summarizeMemory = (conversationId: string) =>
-  invoke<MemoryDraft>('summarize_memory', { conversationId })
+  invokeWithError<MemoryDraft>('summarize_memory', { conversationId })
 
 /** 手动压缩会话历史：用经济模型把较早历史总结为结构化摘要，返回新摘要 */
 export const compactConversation = (conversationId: string, keep?: number) =>
-  invoke<string>('compact_conversation', { conversationId, keep })
+  invokeWithError<string>('compact_conversation', { conversationId, keep })
 
 /* ============ 会话 token/成本统计 + 任务回滚 + Rules 指令 ============ */
 
@@ -771,7 +790,7 @@ export interface ConversationCostStats {
 }
 
 export const getConversationCostStats = (conversationId: string) =>
-  invoke<ConversationCostStats>('conversation_cost_stats', { conversationId })
+  invokeWithError<ConversationCostStats>('conversation_cost_stats', { conversationId })
 
 /** 任务回滚目标信息（dryRun=true 时仅预览） */
 export interface RollbackInfo {
@@ -783,14 +802,14 @@ export interface RollbackInfo {
 }
 
 export const rollbackConversation = (conversationId: string, dryRun: boolean) =>
-  invoke<RollbackInfo>('rollback_conversation', { conversationId, dryRun })
+  invokeWithError<RollbackInfo>('rollback_conversation', { conversationId, dryRun })
 
 /** 读取全局指令（未配置返回空串） */
-export const getGlobalRules = () => invoke<string>('get_global_rules')
+export const getGlobalRules = () => invokeWithError<string>('get_global_rules')
 
 /** 保存全局指令（传空串即清空） */
-export const setGlobalRules = (rules: string) => invoke<void>('set_global_rules', { rules })
+export const setGlobalRules = (rules: string) => invokeWithError<void>('set_global_rules', { rules })
 
 /** 保存项目级指令（覆盖写入 projects.rules；传空串即清空） */
 export const updateProjectRules = (projectId: string, rules: string) =>
-  invoke<void>('update_project_rules', { projectId, rules })
+  invokeWithError<void>('update_project_rules', { projectId, rules })

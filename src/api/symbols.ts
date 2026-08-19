@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** 代码符号（组件/类/接口/函数/方法/路由等） */
 export interface CodeSymbol {
@@ -21,25 +21,25 @@ export interface ProjectOutline {
 
 /** 全量扫描项目符号（较重，建议首次加载/刷新时调用） */
 export const indexProjectSymbols = (projectId: string, root?: string) =>
-  invoke<CodeSymbol[]>('index_project_symbols', { projectId, root: root ?? null })
+  invokeWithError<CodeSymbol[]>('index_project_symbols', { projectId, root: root ?? null })
 
 /** 强制刷新项目符号索引（失效内存缓存后重新扫描） */
 export const refreshProjectSymbols = (projectId: string, root?: string) =>
-  invoke<CodeSymbol[]>('refresh_project_symbols', { projectId, root: root ?? null })
+  invokeWithError<CodeSymbol[]>('refresh_project_symbols', { projectId, root: root ?? null })
 
 /** 项目大纲：组件、路由页面、符号总数 */
 export const projectOutline = (projectId: string, root?: string) =>
-  invoke<ProjectOutline>('project_outline', { projectId, root: root ?? null })
+  invokeWithError<ProjectOutline>('project_outline', { projectId, root: root ?? null })
 
 /** 按名称/类型检索符号 */
 export const searchSymbols = (projectId: string, query: string, kind?: string, root?: string) =>
-  invoke<CodeSymbol[]>('search_symbols', { projectId, query, kind: kind ?? null, root: root ?? null })
+  invokeWithError<CodeSymbol[]>('search_symbols', { projectId, query, kind: kind ?? null, root: root ?? null })
 /** 跨项目检索符号（附项目名，供「全部项目」范围使用） */
 export interface CrossProjectSymbol extends CodeSymbol {
   project_name: string
 }
 export const searchSymbolsAll = (query: string, kind?: string) =>
-  invoke<CrossProjectSymbol[]>('search_symbols_all', { query, kind: kind ?? null })
+  invokeWithError<CrossProjectSymbol[]>('search_symbols_all', { query, kind: kind ?? null })
 
 /** 符号索引元信息（符号/文件数量与数据来源） */
 export interface SymbolIndexMeta {
@@ -58,12 +58,12 @@ export interface SymbolCount {
 
 /** 后台预热符号索引：磁盘缓存命中 + 增量校正，静默执行不返回符号 */
 export const warmupSymbolIndex = (projectId: string, root?: string) =>
-  invoke<void>('warmup_symbol_index', { projectId, root: root ?? null })
+  invokeWithError<void>('warmup_symbol_index', { projectId, root: root ?? null })
 
 /** 查询符号索引元信息 */
 export const symbolIndexMeta = (projectId: string, root?: string) =>
-  invoke<SymbolIndexMeta>('symbol_index_meta', { projectId, root: root ?? null })
+  invokeWithError<SymbolIndexMeta>('symbol_index_meta', { projectId, root: root ?? null })
 
 /** 查询文件级符号数量（供文件树面板徽标） */
 export const symbolCounts = (projectId: string, root?: string) =>
-  invoke<SymbolCount[]>('symbol_counts', { projectId, root: root ?? null })
+  invokeWithError<SymbolCount[]>('symbol_counts', { projectId, root: root ?? null })

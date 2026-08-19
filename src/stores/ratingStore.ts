@@ -12,40 +12,32 @@
 // - localStorage 持久化，按 messageId 索引
 // - 支持统计：所有评分的平均分、按 model 分组（可选增强）
 import { create } from 'zustand'
+import { getJSON, setJSON } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
-const STORAGE_KEY = 'deveco-switch-message-ratings'
 const MAX_COMMENT = 280
 
 const loadFromStorage = (): Record<string, RatingEntry> => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return {}
-    const obj = JSON.parse(raw)
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {}
-    const out: Record<string, RatingEntry> = {}
-    for (const [k, v] of Object.entries(obj)) {
-      if (!v || typeof v !== 'object') continue
-      const r = v as { score?: unknown; comment?: unknown; ts?: unknown }
-      if (typeof r.score === 'number' && r.score >= 1 && r.score <= 5) {
-        out[k] = {
-          score: r.score,
-          comment: typeof r.comment === 'string' ? r.comment.slice(0, MAX_COMMENT) : null,
-          ts: typeof r.ts === 'number' ? r.ts : Date.now(),
-        }
+  const raw = getJSON<unknown>(STORAGE_KEYS.RATINGS, null)
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const obj = raw as Record<string, { score?: unknown; comment?: unknown; ts?: unknown }>
+  const out: Record<string, RatingEntry> = {}
+  for (const [k, v] of Object.entries(obj)) {
+    if (!v || typeof v !== 'object') continue
+    const r = v as { score?: unknown; comment?: unknown; ts?: unknown }
+    if (typeof r.score === 'number' && r.score >= 1 && r.score <= 5) {
+      out[k] = {
+        score: r.score,
+        comment: typeof r.comment === 'string' ? r.comment.slice(0, MAX_COMMENT) : null,
+        ts: typeof r.ts === 'number' ? r.ts : Date.now(),
       }
     }
-    return out
-  } catch {
-    return {}
   }
+  return out
 }
 
 const saveToStorage = (map: Record<string, RatingEntry>) => {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(map))
-  } catch {
-    // 满/禁用 → 静默
-  }
+  setJSON(STORAGE_KEYS.RATINGS, map)
 }
 
 export interface RatingEntry {

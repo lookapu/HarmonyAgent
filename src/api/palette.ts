@@ -3,7 +3,7 @@
  * 后端 command_palette.rs 注册静态命令（导航/动作），前端 CommandPalette 打开时拉取，
  * 与前端动态命令（会话/模型切换）合并后做 fuzzy 搜索。
  */
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** 后端命令面板条目（静态注册表） */
 export interface PaletteEntry {
@@ -16,4 +16,4 @@ export interface PaletteEntry {
 }
 
 /** 拉取全部静态命令（导航 + 动作） */
-export const listPaletteCommands = () => invoke<PaletteEntry[]>('list_palette_commands')
+export const listPaletteCommands = () => invokeWithError<PaletteEntry[]>('list_palette_commands')

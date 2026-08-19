@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** Agent 护栏参数。字段为 0 或 -1 表示不限制（关闭该项护栏） */
 export interface AgentLimits {
@@ -27,8 +27,8 @@ export interface AgentLimits {
 }
 
 /** 读取当前生效的护栏配置 */
-export const getAgentLimits = () => invoke<AgentLimits>('get_agent_limits')
+export const getAgentLimits = () => invokeWithError<AgentLimits>('get_agent_limits')
 /** 保存护栏配置（0/-1 表示不限制）；返回归一化后的配置 */
-export const setAgentLimits = (limits: AgentLimits) => invoke<AgentLimits>('set_agent_limits', { limits })
+export const setAgentLimits = (limits: AgentLimits) => invokeWithError<AgentLimits>('set_agent_limits', { limits })
 /** 恢复全部护栏参数为默认值 */
-export const resetAgentLimits = () => invoke<AgentLimits>('reset_agent_limits')
+export const resetAgentLimits = () => invokeWithError<AgentLimits>('reset_agent_limits')

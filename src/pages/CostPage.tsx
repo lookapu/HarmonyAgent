@@ -7,6 +7,8 @@ import { useNotificationStore } from '../stores/notificationStore'
 import { save as dialogSave } from '@tauri-apps/plugin-dialog'
 import { writeTextFile } from '@tauri-apps/plugin-fs'
 import Icon from '../icons/Icon'
+import { getJSON, setJSON } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
 /** CSV 字段转义：含逗号/引号/换行的字段用双引号包裹，内部双引号 → 双重转义 */
 const csvEscape = (s: string) => {
@@ -49,9 +51,7 @@ export default function CostPage() {
       setBalances(supported)
       // 低余额告警：剩余 < 总额 10% 或剩余 < 1（按币种）视为低余额；每服务商 24h 提醒一次
       const now = Date.now()
-      const alerted: Record<string, number> = JSON.parse(
-        localStorage.getItem('deveco-balance-alerted') ?? '{}',
-      )
+      const alerted: Record<string, number> = getJSON<Record<string, number>>(STORAGE_KEYS.BALANCE_ALERTED, {})
       for (const b of supported) {
         if (!b.ok || b.remaining == null) continue
         const total = b.total ?? 0
@@ -73,7 +73,7 @@ export default function CostPage() {
           b.exhausted ? 'error' : 'info',
         )
       }
-      localStorage.setItem('deveco-balance-alerted', JSON.stringify(alerted))
+      setJSON(STORAGE_KEYS.BALANCE_ALERTED, alerted)
     } catch (e) {
       console.error(e)
       setBalances([])

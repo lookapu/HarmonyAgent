@@ -76,3 +76,8 @@ __pycache__/
 
 # 个人私有排障笔记（仅本机参考，勿提交）
 docs/PITFALLS.private.md
+
+# 本地 Agent 工作记忆与异常文件（勿提交）
+.workbuddy/
+/=ro
+

@@ -4,6 +4,8 @@ import type { ToolRun, AgentRun } from '../../stores/projectStore'
 import Icon from '../../icons/Icon'
 import { AnsiText, hasAnsi } from '../../components/AnsiText'
 import { fmtElapsed } from '../chatUtils'
+import { getItem, setItem } from '../../utils/storage'
+import { STORAGE_KEYS } from '../../constants'
 
 /* ============ 工具调用折叠组：一行展示（最后一次调用），点击展开全部 ============ */
 export const ToolRunGroup = memo(function ToolRunGroup({ runs, onRetry, onCancel }: { runs: ToolRun[]; onRetry?: (run: ToolRun) => void; onCancel?: (run: ToolRun) => void }) {
@@ -15,74 +17,38 @@ export const ToolRunGroup = memo(function ToolRunGroup({ runs, onRetry, onCancel
   const doneCount = runs.filter((r) => r.status === 'done').length
 
   return (
-    <div
-      className={`overflow-hidden animate-fade-in-up tool-group ${
-        running
-          ? 'task-progress'
-          : errCount > 0
-            ? 'task-failed'
-            : 'task-complete'
-      }`}
-    >
+    <div className="animate-fade-in-up tool-group">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-transparent transition-colors"
+        className="w-full flex items-center gap-2 py-1.5 text-left transition-colors hover:opacity-80"
         title={t('home.toggleToolCalls')}
       >
-        <div
-          className={`w-6 h-6 rounded-md flex items-center justify-center shrink-0 ${
-            running
-              ? 'bg-[var(--warning)]/15'
-              : errCount > 0
-                ? 'bg-[var(--danger)]/10'
-                : 'bg-[var(--success)]/15'
-          }`}
-        >
-          <Icon
-            name="bolt"
-            size={12}
-            className={running ? 'text-[var(--warning)]' : errCount > 0 ? 'text-[var(--danger)]' : 'text-[var(--success)]'}
-          />
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="text-[12px] font-medium truncate">
-            {t('home.toolCalls', { count: runs.length })}
-            {last && <span className="text-[var(--text-muted)] font-normal"> · {last.tool}</span>}
-          </div>
-          {last?.args && <div className="text-[10px] text-[var(--text-muted)] truncate font-mono mt-px">{last.args}</div>}
-        </div>
-        {/* 工具步骤状态点：已完成绿、运行中脉冲、失败红，最多显示 8 个 */}
-        <div className="hidden sm:flex items-center gap-1 shrink-0">
-          {runs.slice(-8).map((r) => (
-            <span
-              key={r.id}
-              className={`w-1.5 h-1.5 rounded-full ${
-                r.status === 'running'
-                  ? 'bg-[var(--accent)] animate-pulse'
-                  : r.status === 'error'
-                    ? 'bg-[var(--danger)]'
-                    : 'bg-[var(--success)]'
-              }`}
-            />
-          ))}
-        </div>
-        <span className="text-[11px] shrink-0 flex items-center gap-1 ml-1 tnum">
+        <Icon
+          name="bolt"
+          size={11}
+          className={running ? 'text-[var(--warning)]' : errCount > 0 ? 'text-[var(--danger)]' : 'text-[var(--success)]'}
+        />
+        <span className="text-[12px] text-[var(--text-secondary)] truncate">
+          {t('home.toolCalls', { count: runs.length })}
+          {last && <span className="text-[var(--text-muted)]"> · {last.tool}</span>}
+        </span>
+        <span className="text-[11px] shrink-0 tabular-nums ml-auto">
           {errCount > 0 ? (
             <span className="text-[var(--danger)]">{t('home.toolFailed')} ×{errCount}</span>
           ) : running ? (
             <span className="text-[var(--warning)]">
-              <span className="inline-block w-3 h-3 rounded-full border border-[var(--warning)] border-t-transparent animate-spin align-middle mr-1" />
+              <span className="inline-block w-2.5 h-2.5 rounded-full border border-[var(--warning)] border-t-transparent animate-spin align-middle mr-1" />
               {t('home.toolRunning')}
             </span>
           ) : (
-            <span className="text-[var(--success)]">{t('home.toolDone')} ×{doneCount}</span>
+            <span className="text-[var(--text-muted)]">{t('home.toolDone')} ×{doneCount}</span>
           )}
         </span>
-        <Icon name="chevron-right" size={12} className={`opacity-50 transition-transform ${open ? 'rotate-90' : ''}`} />
+        <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />
       </button>
       {open && (
-        <div className="border-t border-[var(--border)] divide-y divide-[var(--border)] max-h-80 overflow-y-auto">
+        <div className="border-t border-[var(--border)]/60 divide-y divide-[var(--border)]/50 max-h-80 overflow-y-auto">
           {runs.map((r) => (
             <ToolRunRow key={r.id} run={r} onRetry={onRetry} onCancel={onCancel} />
           ))}
@@ -101,9 +67,9 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
   // 3) 其他：默认折叠（长任务视觉清爽）
   const isCommandTool = ['run_command', 'run_script', 'exec_command', 'terminal', 'run_command_shell'].includes(run.tool)
   const isFailed = run.status === 'error'
-  const memKey = `deveco-tool-open-${run.tool}`
+  const memKey = STORAGE_KEYS.TOOL_OPEN_PREFIX + run.tool
   const [open, setOpen] = useState<boolean>(() => {
-    const saved = localStorage.getItem(memKey)
+    const saved = getItem(memKey)
     // 失败状态每次都强制展开（不被用户历史记忆覆盖）
     if (isFailed && saved === null) return true
     if (saved === null) return isCommandTool
@@ -112,11 +78,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
   const toggleOpen = () => {
     setOpen((v) => {
       const next = !v
-      try {
-        localStorage.setItem(memKey, next ? '1' : '0')
-      } catch {
-        // localStorage 不可用时静默
-      }
+      setItem(memKey, next ? '1' : '0')
       return next
     })
   }
@@ -180,29 +142,24 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
       <button
         type="button"
         onClick={() => (done || running) && toggleOpen()}
-        className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${done || running ? 'hover:bg-[var(--bg-hover)]' : ''}`}
+        className={`w-full flex items-center gap-2 py-1.5 text-left transition-colors ${done || running ? 'hover:opacity-80' : ''}`}
       >
-        <div
-          className={`w-5 h-5 rounded flex items-center justify-center shrink-0 ${isErr ? 'bg-[var(--danger)]/10' : 'bg-[var(--accent-soft)]'}`}
-        >
-          <Icon name={isErr ? 'close' : 'bolt'} size={10} className={isErr ? 'text-[var(--danger)]' : 'text-[var(--accent)]'} />
-        </div>
+        <Icon
+          name={isErr ? 'close' : 'bolt'}
+          size={10}
+          className={isErr ? 'text-[var(--danger)]' : running ? 'text-[var(--accent)]' : 'text-[var(--text-muted)]'}
+        />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 min-w-0">
-            <div className="text-[12px] font-medium truncate">{run.tool}</div>
+            <div className="text-[12px] truncate text-[var(--text-secondary)]">{run.tool}</div>
             {run.level && (
               <span
-                className={`text-[9px] px-1 py-px rounded shrink-0 font-semibold ${levelColor}`}
+                className={`text-[9px] font-semibold shrink-0 ${levelColor}`}
                 title={run.level === 'L2' ? t('home.toolLevelL2') : run.level === 'L1' ? t('home.toolLevelL1') : t('home.toolLevelL0')}
               >
                 {run.level}
               </span>
             )}
-            {run.round && run.total ? (
-              <span className="text-[9px] px-1 py-px rounded bg-[var(--bg-primary)] text-[var(--text-muted)] shrink-0">
-                {t('home.toolRound', { round: run.round, total: run.total })}
-              </span>
-            ) : null}
           </div>
           {run.args && (
             <div className="text-[10px] text-[var(--text-muted)] truncate font-mono mt-px" title={run.desc || run.args}>
@@ -212,11 +169,11 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
         </div>
         <span className={`text-[11px] shrink-0 tabular-nums ${statusColor}`}>
           {running && (
-            <span className="inline-block w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle mr-1" />
+            <span className="inline-block w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle mr-1" />
           )}
           {durationLabel}
         </span>
-        {(done || running) && <Icon name="chevron-right" size={12} className={`opacity-50 transition-transform ${open ? 'rotate-90' : ''}`} />}
+        {(done || running) && <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />}
       </button>
       {(done || running) && open && (
         <div className="bg-[#0d1117] border-t border-[var(--border)]">
@@ -296,48 +253,29 @@ export const AgentRunCard = memo(function AgentRunCard({ run }: { run: AgentRun 
   const statusColor = run.status === 'running' ? 'text-[var(--accent)]' : isErr ? 'text-[var(--danger)]' : 'text-[var(--success)]'
 
   return (
-    <div
-      className={`overflow-hidden animate-fade-in-up ${
-        run.status === 'done'
-          ? 'task-complete task-complete-pulse'
-          : isErr
-            ? 'task-failed'
-            : 'task-progress'
-      }`}
-    >
+    <div className="animate-fade-in-up">
       <button
         onClick={() => done && setOpen((v) => !v)}
-        className={`w-full flex items-center gap-2.5 px-3 py-2 text-left transition-colors ${done ? 'hover:bg-transparent' : ''}`}
+        className="w-full flex items-center gap-2 py-1.5 text-left transition-colors hover:opacity-80"
       >
-        <div
-          className={`w-6 h-6 rounded-md flex items-center justify-center shrink-0 ${
-            isErr
-              ? 'bg-[var(--danger)]/10'
-              : run.status === 'done'
-                ? 'bg-[var(--success)]/15'
-                : 'bg-[var(--warning)]/15'
-          }`}
-        >
-          <Icon
-            name="spark"
-            size={12}
-            className={isErr ? 'text-[var(--danger)]' : run.status === 'done' ? 'text-[var(--success)]' : 'text-[var(--warning)]'}
-          />
-        </div>
+        <Icon
+          name="spark"
+          size={11}
+          className={isErr ? 'text-[var(--danger)]' : run.status === 'done' ? 'text-[var(--success)]' : 'text-[var(--warning)]'}
+        />
         <div className="flex-1 min-w-0">
-          <div className="text-[12px] font-medium truncate">{run.name}</div>
-          <div className="text-[10px] text-[var(--text-muted)] truncate font-mono mt-px">{run.model}</div>
+          <div className="text-[12px] truncate text-[var(--text-secondary)]">{run.name}</div>
         </div>
-        <span className={`text-[11px] shrink-0 tnum ${statusColor}`}>
+        <span className={`text-[11px] shrink-0 tabular-nums ${statusColor}`}>
           {run.status === 'running' && (
-            <span className="inline-block w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle mr-1" />
+            <span className="inline-block w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle mr-1" />
           )}
           {statusLabel}
         </span>
-        {done && <Icon name="chevron-right" size={12} className={`opacity-50 transition-transform ${open ? 'rotate-90' : ''}`} />}
+        {done && <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />}
       </button>
       {done && open && (
-        <pre className="tool-output px-3.5 pb-3 pt-1 text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed text-[var(--text-secondary)] max-h-64 overflow-y-auto border-t border-[var(--border)] animate-fade-in-up">
+        <pre className="text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed text-[var(--text-muted)] max-h-64 overflow-y-auto pb-2 animate-fade-in-up">
           {run.output}
         </pre>
       )}

@@ -533,63 +533,50 @@ export const PlanCard = memo(function PlanCard({ plan }: { plan: TaskPlan }) {
   const errCount = plan.steps.filter((s) => s.status === 'error').length
   const running = plan.phase === 'running'
   const total = plan.steps.length
-  const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0
   const statusLabel = plan.phase === 'error' ? t('home.planFailed') : running ? t('home.planRunning') : t('home.planDone')
   const statusColor = plan.phase === 'error' ? 'text-[var(--danger)]' : running ? 'text-[var(--accent)]' : 'text-[var(--success)]'
 
   return (
-    <div className="rounded-xl modern-card overflow-hidden">
-      {/* 常驻进度条：完成比例 */}
-      <div className="h-0.5 bg-[var(--bg-hover)]">
-        <div
-          className={`h-full transition-all duration-500 ${
-            plan.phase === 'error' ? 'bg-[var(--danger)]' : running ? 'bg-[var(--accent)]' : 'bg-[var(--success)]'
-          }`}
-          style={{ width: `${pct}%` }}
-        />
-      </div>
+    <div className="overflow-hidden">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[var(--bg-hover)] transition-colors"
+        className="w-full flex items-center gap-2 py-1.5 text-left hover:opacity-80 transition-opacity"
         title={t('home.planToggle')}
       >
-        <div className="w-6 h-6 rounded-md bg-[var(--accent-soft)] flex items-center justify-center shrink-0">
-          <Icon name="check" size={12} className="text-[var(--accent)]" />
-        </div>
+        <Icon
+          name="check"
+          size={11}
+          className={plan.phase === 'error' ? 'text-[var(--danger)]' : running ? 'text-[var(--accent)]' : 'text-[var(--success)]'}
+        />
         <div className="flex-1 min-w-0">
-          <div className="text-[12px] font-medium">{t('home.planTitle')}</div>
-          <div className="text-[10px] text-[var(--text-muted)] mt-px">
-            {t('home.planProgress', { done: doneCount, total: plan.steps.length })}
-            {errCount > 0 && <span className="text-[var(--danger)]"> · {t('home.planStepFailed', { count: errCount })}</span>}
-          </div>
+          <span className="text-[12px] text-[var(--text-secondary)]">{t('home.planTitle')}</span>
+          <span className="text-[11px] text-[var(--text-muted)] ml-2">
+            {doneCount}/{total}
+            {errCount > 0 && <span className="text-[var(--danger)] ml-1">· {errCount}×</span>}
+          </span>
         </div>
         <span className={`text-[11px] shrink-0 flex items-center gap-1 ${statusColor}`}>
           {running && (
-            <span className="inline-block w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle" />
+            <span className="inline-block w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle" />
           )}
           {statusLabel}
         </span>
-        <Icon name="chevron-right" size={12} className={`opacity-50 transition-transform ${open ? 'rotate-90' : ''}`} />
+        <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />
       </button>
       {open && (
-        <ol className="border-t border-[var(--border)] px-3.5 py-2 space-y-1">
+        <ol className="border-t border-[var(--border)]/60 py-1.5 space-y-0.5">
           {plan.steps.map((s, i) => (
-            <li
-              key={i}
-              className={`flex items-start gap-2 rounded-lg transition-colors ${
-                s.status === 'running' ? 'bg-[var(--accent-soft)]/60 px-2 py-1 -mx-1' : ''
-              }`}
-            >
+            <li key={i} className="flex items-start gap-2 py-0.5">
               <span
                 className={`w-4 h-4 rounded-full flex items-center justify-center shrink-0 mt-px text-[9px] font-semibold ${
                   s.status === 'done'
-                    ? 'bg-[var(--success)]/15 text-[var(--success)]'
+                    ? 'text-[var(--success)]'
                     : s.status === 'error'
-                      ? 'bg-[var(--danger)]/15 text-[var(--danger)]'
+                      ? 'text-[var(--danger)]'
                       : s.status === 'running'
-                        ? 'bg-[var(--accent-soft)] text-[var(--accent)]'
-                        : 'bg-[var(--bg-primary)] text-[var(--text-muted)] border border-[var(--border)]'
+                        ? 'text-[var(--accent)]'
+                        : 'text-[var(--text-muted)]'
                 }`}
               >
                 {s.status === 'done' ? (
@@ -604,7 +591,7 @@ export const PlanCard = memo(function PlanCard({ plan }: { plan: TaskPlan }) {
               </span>
               <span
                 className={`flex-1 min-w-0 text-[12px] leading-relaxed ${
-                  s.status === 'pending' ? 'text-[var(--text-muted)]' : 'text-[var(--text-primary)]'
+                  s.status === 'pending' ? 'text-[var(--text-muted)]' : 'text-[var(--text-secondary)]'
                 }`}
               >
                 {s.text}
@@ -642,36 +629,36 @@ export const TaskOpsBadge = memo(function TaskOpsBadge({
   const { t } = useTranslation()
   const hasDetail = runs.length > 0 || agents.length > 0
   return (
-    <div className="rounded-lg border border-[var(--accent)]/20 bg-[var(--accent-soft)]/50 overflow-hidden">
+    <div className="overflow-hidden">
       <button
         type="button"
         onClick={onToggle}
-        className={`w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors ${hasDetail ? 'hover:bg-[var(--bg-hover)]' : ''}`}
+        className={`w-full flex items-center gap-2 py-1.5 text-left transition-opacity ${hasDetail ? 'hover:opacity-80' : ''}`}
         title={t('home.toggleTaskOps')}
       >
         {running ? (
           <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
         ) : (
-          <Icon name="check" size={12} className="text-[var(--success)] shrink-0" />
+          <Icon name="check" size={11} className="text-[var(--success)] shrink-0" />
         )}
-        <span className="text-[var(--text-secondary)] text-[11px] tabular-nums shrink-0">
+        <span className="text-[var(--text-muted)] text-[11px] tabular-nums shrink-0">
           {running && count === 0
             ? t('home.taskProcessing', { time })
             : running
               ? t('home.taskOpsProcessing', { count, time })
               : t('home.taskOpsDone', { count })}
         </span>
-        {toolName && <span className="text-[var(--text-muted)] truncate font-mono">· {toolName}</span>}
+        {toolName && <span className="text-[var(--text-muted)] truncate font-mono text-[11px]">· {toolName}</span>}
         {hasDetail && (
           <Icon
             name="chevron-right"
-            size={12}
-            className={`ml-auto opacity-50 transition-transform shrink-0 ${open ? 'rotate-90' : ''}`}
+            size={11}
+            className={`ml-auto text-[var(--text-muted)] transition-transform shrink-0 ${open ? 'rotate-90' : ''}`}
           />
         )}
       </button>
       {open && hasDetail && (
-        <div className="border-t border-[var(--border)] divide-y divide-[var(--border)] max-h-80 overflow-y-auto">
+        <div className="border-t border-[var(--border)]/60 divide-y divide-[var(--border)]/50 max-h-80 overflow-y-auto">
           {runs.map((r) => (
             <ToolRunRow key={r.id} run={r} />
           ))}

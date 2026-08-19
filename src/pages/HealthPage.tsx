@@ -19,6 +19,8 @@ import RuntimeProgressBar from '../components/RuntimeProgressBar'
 import { getAppInfo, fetchNodeLatestLts, installToolkitFromZip, getToolchainCandidates, getToolVersion, type AppInfo, type ToolCandidate } from '../api/environment'
 import { checkWithProxy, withProxy } from '../api/updateProxy'
 import { useProjectStore } from '../stores/projectStore'
+import { getJSON, setItem } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
 /** 版本号比较：v22.14.0 vs 22.13.0；返回 a-b 差值（>0 表示 a 新）。
  *  非数字段（如 git 的 windows 段）退化为字符串比较，兼容 Git for Windows 版本号。 */
@@ -58,7 +60,7 @@ export default function HealthPage() {
   // 自定义工具链目录（逗号/换行分隔多个），localStorage 持久化
   const [customPaths, setCustomPaths] = useState<string>(() => {
     try {
-      return JSON.parse(localStorage.getItem('deveco-switch-toolchain-paths') || '""')
+      return getJSON<string>(STORAGE_KEYS.TOOLCHAIN_PATHS, '')
     } catch {
       return ''
     }
@@ -542,7 +544,7 @@ export default function HealthPage() {
         .filter(Boolean)
       const next = existing.includes(picked) ? existing.join('\n') : [...existing, picked].join('\n')
       setCustomPaths(next)
-      localStorage.setItem('deveco-switch-toolchain-paths', JSON.stringify(next))
+      setItem(STORAGE_KEYS.TOOLCHAIN_PATHS, JSON.stringify(next))
       load()
     } catch (e) {
       alert(t('health.pickDirFailed', { err: String(e) }))
@@ -592,7 +594,7 @@ export default function HealthPage() {
       .filter(Boolean)
     const next = existing.includes(path) ? existing.join('\n') : [...existing, path].join('\n')
     setCustomPaths(next)
-    localStorage.setItem('deveco-switch-toolchain-paths', JSON.stringify(next))
+    setItem(STORAGE_KEYS.TOOLCHAIN_PATHS, JSON.stringify(next))
     setCandMenu(null)
     load()
   }
@@ -1401,7 +1403,7 @@ export default function HealthPage() {
             value={customPaths}
             onChange={(e) => {
               setCustomPaths(e.target.value)
-              localStorage.setItem('deveco-switch-toolchain-paths', JSON.stringify(e.target.value))
+              setItem(STORAGE_KEYS.TOOLCHAIN_PATHS, JSON.stringify(e.target.value))
             }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {

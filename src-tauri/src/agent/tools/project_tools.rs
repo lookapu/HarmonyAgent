@@ -1236,7 +1236,7 @@ mod tests {
         let roots = [std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default()];
-        let _ = std::fs::remove_dir_all(target);
+        let _ = std::fs::remove_dir_all(&target);
         let args = serde_json::json!({
             "path": target.to_string_lossy(),
             "copy_signing_from": ref_proj.to_string_lossy(),

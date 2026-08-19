@@ -9,34 +9,26 @@
 // - 限制：每个会话最多 8 条 pin（多了反而成噪音）
 // - 不持久化"已删除消息"的 id：渲染时如果消息不存在则静默跳过
 import { create } from 'zustand'
+import { getJSON, setJSON } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
-const STORAGE_KEY = 'deveco-switch-pinned-messages'
 const MAX_PER_CONV = 8
 
 const loadFromStorage = (): Record<string, string[]> => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return {}
-    const obj = JSON.parse(raw)
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {}
-    const out: Record<string, string[]> = {}
-    for (const [k, v] of Object.entries(obj)) {
-      if (Array.isArray(v) && v.every((x) => typeof x === 'string')) {
-        out[k] = v.slice(0, MAX_PER_CONV)
-      }
+  const raw = getJSON<unknown>(STORAGE_KEYS.PINNED, null)
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const obj = raw as Record<string, unknown>
+  const out: Record<string, string[]> = {}
+  for (const [k, v] of Object.entries(obj)) {
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) {
+      out[k] = v.slice(0, MAX_PER_CONV)
     }
-    return out
-  } catch {
-    return {}
   }
+  return out
 }
 
 const saveToStorage = (map: Record<string, string[]>) => {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(map))
-  } catch {
-    // localStorage 满 / 禁用 → 静默失败
-  }
+  setJSON(STORAGE_KEYS.PINNED, map)
 }
 
 interface PinStore {

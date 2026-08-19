@@ -73,6 +73,15 @@ pub fn reset_task_budget(conversation_id: &str) {
     }
 }
 
+/// 会话删除等场景：清理该会话的工具预算计数，避免进程内状态单调增长
+pub fn clear_task_budget(conversation_id: &str) {
+    if let Ok(mut map) = BUDGETS.lock() {
+        if let Some(m) = map.as_mut() {
+            m.remove(conversation_id);
+        }
+    }
+}
+
 /// 工具调用前检查预算：总次数 / 重操作次数任一超限即拒绝继续；
 /// 连续重复调用（同一工具同一参数）达到阈值判定打转，引导模型换策略或总结。
 /// 各项阈值取自 agent_limits 动态配置（0/-1 表示不限制）。

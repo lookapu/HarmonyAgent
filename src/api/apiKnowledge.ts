@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 // ───────────────────────── 类型 ─────────────────────────
@@ -208,42 +208,42 @@ export interface EmbedDonePayload {
 
 // ───────────────────────── 调用封装 ─────────────────────────
 
-export const apiKbStats = () => invoke<ApiKbStats>('api_kb_stats')
+export const apiKbStats = () => invokeWithError<ApiKbStats>('api_kb_stats')
 
-export const apiKbFilters = () => invoke<KbFilters>('api_kb_filters')
+export const apiKbFilters = () => invokeWithError<KbFilters>('api_kb_filters')
 
 export const apiDocsList = (query: DocsQuery) =>
-  invoke<DocsPage>('api_docs_list', { query })
+  invokeWithError<DocsPage>('api_docs_list', { query })
 
 export const apiDetailsList = (query: DetailsQuery) =>
-  invoke<DetailsPage>('api_details_list', { query })
+  invokeWithError<DetailsPage>('api_details_list', { query })
 
 export const apiDetailGet = (slug: string) =>
-  invoke<ApiDetailFull>('api_detail_get', { slug })
+  invokeWithError<ApiDetailFull>('api_detail_get', { slug })
 
 export const apiDocAdd = (input: DocInput) =>
-  invoke<number>('api_doc_add', { input })
+  invokeWithError<number>('api_doc_add', { input })
 
 export const apiDocDelete = (id: number) =>
-  invoke<void>('api_doc_delete', { id })
+  invokeWithError<void>('api_doc_delete', { id })
 
 export const apiDetailUpsert = (input: DetailInput) =>
-  invoke<void>('api_detail_upsert', { input })
+  invokeWithError<void>('api_detail_upsert', { input })
 
 export const apiDetailDelete = (slug: string) =>
-  invoke<void>('api_detail_delete', { slug })
+  invokeWithError<void>('api_detail_delete', { slug })
 
-export const apiKbClear = () => invoke<void>('api_kb_clear')
+export const apiKbClear = () => invokeWithError<void>('api_kb_clear')
 
 export const apiKbRefreshDocs = () =>
-  invoke<DiffRefreshReport>('api_kb_refresh_docs')
+  invokeWithError<DiffRefreshReport>('api_kb_refresh_docs')
 
 export const apiKbRefreshDetails = () =>
-  invoke<RefRefreshReport>('api_kb_refresh_details')
+  invokeWithError<RefRefreshReport>('api_kb_refresh_details')
 
-export const apiKbEmbedStatus = () => invoke<EmbedStatus>('api_kb_embed_status')
+export const apiKbEmbedStatus = () => invokeWithError<EmbedStatus>('api_kb_embed_status')
 
-export const apiKbEmbedIndex = () => invoke<void>('api_kb_embed_index')
+export const apiKbEmbedIndex = () => invokeWithError<void>('api_kb_embed_index')
 
 // ───────────────────────── 进度监听 ─────────────────────────
 

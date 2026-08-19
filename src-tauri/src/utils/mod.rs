@@ -8,4 +8,5 @@ pub mod process;
 pub mod redact;
 pub mod relevance;
 pub mod retry;
+pub mod task_registry;
 pub mod tokenizer;

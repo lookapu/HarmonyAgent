@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 export interface Skill {
   id: string
@@ -20,7 +20,7 @@ export interface Skill {
 }
 
 export const listSkills = (projectId?: string | null) =>
-  invoke<Skill[]>('list_skills', { projectId: projectId ?? null })
+  invokeWithError<Skill[]>('list_skills', { projectId: projectId ?? null })
 /** 从 GitHub/Gitee 仓库导入 Skill：repo 支持 https://github.com/owner/name、
  *  https://gitee.com/owner/name、git@gitee.com:owner/name.git 或 owner/name（缺省 github） */
 export const importSkillFromGithub = (
@@ -30,14 +30,14 @@ export const importSkillFromGithub = (
   subdir?: string,
   projectId?: string | null,
 ) =>
-  invoke<Skill>('import_skill_from_github', {
+  invokeWithError<Skill>('import_skill_from_github', {
     input: { repo, branch, use_proxy: useProxy, subdir, project_id: projectId ?? null },
   })
-export const toggleSkill = (id: string, enabled: boolean) => invoke<void>('toggle_skill', { id, enabled })
-export const removeSkill = (id: string) => invoke<void>('remove_skill', { id })
+export const toggleSkill = (id: string, enabled: boolean) => invokeWithError<void>('toggle_skill', { id, enabled })
+export const removeSkill = (id: string) => invokeWithError<void>('remove_skill', { id })
 /** 把技能复制到另一作用域：targetProjectId 传 null=全局，传项目 id=该项目 */
 export const cloneSkill = (id: string, targetProjectId: string | null) =>
-  invoke<Skill>('clone_skill', { id, targetProjectId: targetProjectId ?? null })
+  invokeWithError<Skill>('clone_skill', { id, targetProjectId: targetProjectId ?? null })
 
 /* ============ Skill 调用记录（use_skill 工具落库） ============ */
 
@@ -62,11 +62,11 @@ export interface SkillUsageEvent {
 
 /** 技能调用统计；projectId 空 = 全部项目 */
 export const listSkillUsage = (projectId?: string | null) =>
-  invoke<SkillUsageStat[]>('list_skill_usage', { projectId: projectId ?? null })
+  invokeWithError<SkillUsageStat[]>('list_skill_usage', { projectId: projectId ?? null })
 
 /** 最近技能调用明细；projectId 空 = 全部项目 */
 export const listSkillUsageEvents = (projectId?: string | null, limit?: number) =>
-  invoke<SkillUsageEvent[]>('list_skill_usage_events', {
+  invokeWithError<SkillUsageEvent[]>('list_skill_usage_events', {
     projectId: projectId ?? null,
     limit: limit ?? 100,
   })

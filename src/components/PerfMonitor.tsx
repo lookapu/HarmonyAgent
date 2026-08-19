@@ -10,6 +10,8 @@ import {
   type PerfRecordKind,
 } from '../utils/perfTrace'
 import Icon from '../icons/Icon'
+import { getItem, setItem } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
 /**
  * 性能监控浮窗：右下角悬浮按钮，点击展开显示最近的性能追踪记录。
@@ -32,7 +34,7 @@ export default function PerfMonitor() {
   const [copied, setCopied] = useState(false)
   const [enabled, setEnabled] = useState(() => {
     try {
-      return localStorage.getItem('deveco-switch:perf-monitor') === '1'
+      return getItem(STORAGE_KEYS.PERF_MONITOR) === '1'
     } catch {
       return false
     }
@@ -61,7 +63,7 @@ export default function PerfMonitor() {
         e.preventDefault()
         setEnabled((v) => {
           const next = !v
-          try { localStorage.setItem('deveco-switch:perf-monitor', next ? '1' : '0') } catch { /* ignore */ }
+          setItem(STORAGE_KEYS.PERF_MONITOR, next ? '1' : '0')
           if (next) setOpen(true)
           return next
         })
@@ -90,7 +92,7 @@ export default function PerfMonitor() {
         onClick={() => {
           setEnabled(true)
           setOpen(true)
-          try { localStorage.setItem('deveco-switch:perf-monitor', '1') } catch { /* ignore */ }
+          setItem(STORAGE_KEYS.PERF_MONITOR, '1')
         }}
         title="性能监控 (Ctrl+Shift+P)"
         className="fixed bottom-2 right-2 z-[9998] w-5 h-5 rounded-full flex items-center justify-center text-[var(--text-muted)]/40 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -203,7 +205,7 @@ export default function PerfMonitor() {
                 onClick={() => {
                   setEnabled(false)
                   setOpen(false)
-                  try { localStorage.setItem('deveco-switch:perf-monitor', '0') } catch { /* ignore */ }
+                  setItem(STORAGE_KEYS.PERF_MONITOR, '0')
                 }}
                 className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                 title="关闭面板"

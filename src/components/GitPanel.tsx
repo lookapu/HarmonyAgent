@@ -13,16 +13,16 @@ import {
   type WorktreeInfo,
 } from '../api/git'
 import type { Project } from '../api/project'
+import { getItem, setItem } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
 /** localStorage key 前缀：持久化每个项目在 Git 面板选中的仓库目录（一个根目录下多个 git 仓库时） */
-const LS_GIT_REPO_PREFIX = 'deveco-switch:git-repo:'
-
 function readGitRepo(projectId: string): string | null {
-  try { return localStorage.getItem(LS_GIT_REPO_PREFIX + projectId) } catch { return null }
+  return getItem(STORAGE_KEYS.GIT_REPO_PREFIX + projectId)
 }
 
 function writeGitRepo(projectId: string, repo: string) {
-  try { localStorage.setItem(LS_GIT_REPO_PREFIX + projectId, repo) } catch { /* ignore */ }
+  setItem(STORAGE_KEYS.GIT_REPO_PREFIX + projectId, repo)
 }
 
 interface Props {

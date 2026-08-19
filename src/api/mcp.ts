@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 export interface McpServer {
   id: string
@@ -70,23 +70,23 @@ export interface McpToolUsage {
 }
 
 export const listMcpServers = (projectId?: string | null) =>
-  invoke<McpServer[]>('list_mcp_servers', { projectId: projectId ?? null })
-export const addMcpServer = (input: CreateMcpInput) => invoke<McpServer>('add_mcp_server', { input })
-export const updateMcpServer = (id: string, input: UpdateMcpInput) => invoke<McpServer>('update_mcp_server', { id, input })
-export const testMcpServer = (id: string) => invoke<string>('test_mcp_server', { id })
-export const toggleMcpServer = (id: string, enabled: boolean) => invoke<void>('toggle_mcp_server', { id, enabled })
-export const removeMcpServer = (id: string) => invoke<void>('remove_mcp_server', { id })
+  invokeWithError<McpServer[]>('list_mcp_servers', { projectId: projectId ?? null })
+export const addMcpServer = (input: CreateMcpInput) => invokeWithError<McpServer>('add_mcp_server', { input })
+export const updateMcpServer = (id: string, input: UpdateMcpInput) => invokeWithError<McpServer>('update_mcp_server', { id, input })
+export const testMcpServer = (id: string) => invokeWithError<string>('test_mcp_server', { id })
+export const toggleMcpServer = (id: string, enabled: boolean) => invokeWithError<void>('toggle_mcp_server', { id, enabled })
+export const removeMcpServer = (id: string) => invokeWithError<void>('remove_mcp_server', { id })
 /** 把 MCP 服务器复制到另一作用域：targetProjectId 传 null=全局，传项目 id=该项目 */
 export const cloneMcpServer = (id: string, targetProjectId: string | null) =>
-  invoke<McpServer>('clone_mcp_server', { id, targetProjectId: targetProjectId ?? null })
+  invokeWithError<McpServer>('clone_mcp_server', { id, targetProjectId: targetProjectId ?? null })
 /** 导出指定作用域的 MCP 配置为 JSON 文本 */
 export const exportMcpConfig = (projectId: string | null) =>
-  invoke<string>('export_mcp_config', { projectId: projectId ?? null })
+  invokeWithError<string>('export_mcp_config', { projectId: projectId ?? null })
 /** 从 JSON 文本导入 MCP 配置到目标作用域；overwrite=true 同名覆盖 */
 export const importMcpConfig = (json: string, targetProjectId: string | null, overwrite = false) =>
-  invoke<number>('import_mcp_config', { json, targetProjectId: targetProjectId ?? null, overwrite })
+  invokeWithError<number>('import_mcp_config', { json, targetProjectId: targetProjectId ?? null, overwrite })
 export const fetchMcpFromUrl = (url: string, useProxy = false) =>
-  invoke<McpDraft[]>('fetch_mcp_from_url', { url, useProxy })
+  invokeWithError<McpDraft[]>('fetch_mcp_from_url', { url, useProxy })
 /** MCP 服务器使用统计；projectId 为空=全部项目（全局服务器跨项目调用也计入） */
 export const listMcpUsageStats = (projectId?: string | null) =>
-  invoke<McpUsageStat[]>('list_mcp_usage_stats', { projectId: projectId ?? null })
+  invokeWithError<McpUsageStat[]>('list_mcp_usage_stats', { projectId: projectId ?? null })

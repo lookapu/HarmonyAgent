@@ -75,6 +75,8 @@ import FileTreePanel from '../components/FileTreePanel'
 import GitPanel from '../components/GitPanel'
 import Markdown from '../components/Markdown'
 import { toPinyinInitials, toPinyinFull } from '../utils/pinyin'
+import { getItem, setItem, removeItem, getJSON, setJSON } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 import {
   ThinkingBlock,
   ThumbUpIcon,
@@ -86,6 +88,7 @@ import {
   ChatEmptyState,
 } from '../chat/components/messageBlocks'
 import { BranchSelector, ModelSettingsPopover, PlanCard, TaskOpsBadge } from '../chat/components/plan'
+import { LedgerCard } from '../chat/components/ledger'
 import { ToolRunGroup } from '../chat/components/toolRuns'
 import { FeedbackDialog, VersionDiffDialog, MemoryDraftDialog, EditMessageDialog, RulesDialog } from '../chat/components/dialogs'
 import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, PreviewPanel, TerminalPanel, ShellPanel } from '../chat/components/panels'
@@ -161,23 +164,13 @@ function compressImage(dataUrl: string): Promise<string> {
 }
 
 /** 草稿持久化（按项目分区，localStorage；空串剔除避免残留） */
-const readDraftMap = (pid: string): Record<string, string> => {
-  try {
-    const raw = localStorage.getItem(`deveco-switch-drafts:${pid}`)
-    return raw ? (JSON.parse(raw) as Record<string, string>) : {}
-  } catch {
-    return {}
-  }
-}
+const readDraftMap = (pid: string): Record<string, string> =>
+  getJSON<Record<string, string>>(STORAGE_KEYS.DRAFTS_PREFIX + pid, {})
 const writeDraftMap = (pid: string, m: Record<string, string>) => {
-  try {
-    const cleaned: Record<string, string> = {}
-    for (const [k, v] of Object.entries(m)) if (v) cleaned[k] = v
-    if (Object.keys(cleaned).length === 0) localStorage.removeItem(`deveco-switch-drafts:${pid}`)
-    else localStorage.setItem(`deveco-switch-drafts:${pid}`, JSON.stringify(cleaned))
-  } catch {
-    /* 容量满等，忽略 */
-  }
+  const cleaned: Record<string, string> = {}
+  for (const [k, v] of Object.entries(m)) if (v) cleaned[k] = v
+  if (Object.keys(cleaned).length === 0) removeItem(STORAGE_KEYS.DRAFTS_PREFIX + pid)
+  else setJSON(STORAGE_KEYS.DRAFTS_PREFIX + pid, cleaned)
 }
 
 export default function Home() {
@@ -200,6 +193,7 @@ export default function Home() {
     plan,
     toolApprovals,
     pendingConfirmations,
+    taskLedgers,
     resolveToolApproval,
     diagnoseCards,
     dismissDiagnoseCard,
@@ -276,6 +270,7 @@ export default function Home() {
     plan: s.plan,
     toolApprovals: s.toolApprovals,
     pendingConfirmations: s.pendingConfirmations,
+    taskLedgers: s.taskLedgers,
     resolveToolApproval: s.resolveToolApproval,
     diagnoseCards: s.diagnoseCards,
     dismissDiagnoseCard: s.dismissDiagnoseCard,
@@ -342,6 +337,8 @@ export default function Home() {
   })))
   // 会话工作目录：worktree 会话指向 worktree 路径，本地会话为 undefined（后端回退主仓库）
   const convRoot = conversationRoot(currentConversation)
+  // 当前会话的任务账本（Ledger 协议）：进行中实时刷新/中断保留/切回恢复；无账本不展示
+  const ledgerCard = currentConversation ? taskLedgers[currentConversation.id] : undefined
   const themeResolved = useThemeStore((s) => s.resolved)
   const toggleTheme = useThemeStore((s) => s.toggle)
 
@@ -349,19 +346,19 @@ export default function Home() {
   const [pendingTrust, setPendingTrust] = useState<{ projectId: string; inspect: ProjectInspect } | null>(null)
   const [trustBusy, setTrustBusy] = useState(false)
   const [showRightPanel, setShowRightPanel] = useState(
-    () => localStorage.getItem('deveco-switch-right-panel') !== 'collapsed',
+    () => getItem(STORAGE_KEYS.RIGHT_PANEL) !== 'collapsed',
   )
   const [rightTab, setRightTab] = useState<'overview' | 'files' | 'memories' | 'stats' | 'git' | 'preview' | 'devices' | 'symbols' | 'terminal' | 'shell' | 'analyze' | 'timeline'>('overview')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
-    () => localStorage.getItem('deveco-switch-sidebar-collapsed') === '1',
+    () => getItem(STORAGE_KEYS.SIDEBAR_COLLAPSED) === '1',
   )
   // 侧栏宽度（可拖拽调宽，记忆上次调整）
   const [sidebarWidth, setSidebarWidth] = useState(() => {
-    const v = Number(localStorage.getItem('deveco-switch-sidebar-width'))
+    const v = Number(getItem(STORAGE_KEYS.SIDEBAR_WIDTH))
     return Number.isFinite(v) && v >= 180 && v <= 420 ? v : 256
   })
   const [rightWidth, setRightWidth] = useState(() => {
-    const v = Number(localStorage.getItem('deveco-switch-right-width'))
+    const v = Number(getItem(STORAGE_KEYS.RIGHT_WIDTH))
     const max = Math.min(900, Math.floor(window.innerWidth * 0.65))
     return Number.isFinite(v) && v >= 240 && v <= max ? v : 288
   })
@@ -437,7 +434,7 @@ export default function Home() {
   // 静默时长（秒）：流式期间距最近一次内容/思考增量的秒数，超阈值提示“模型思考中”
   const [silentSeconds, setSilentSeconds] = useState(0)
   // 右侧栏 Web 预览：待打开地址 + 当前 iframe 地址
-  const [previewUrl, setPreviewUrl] = useState(() => localStorage.getItem('deveco-switch-preview-url') || 'http://localhost:5173')
+  const [previewUrl, setPreviewUrl] = useState(() => getItem(STORAGE_KEYS.PREVIEW_URL) || 'http://localhost:5173')
   const [previewSrc, setPreviewSrc] = useState('')
   const [inputHeight, setInputHeight] = useState(96)
   const [renamingId, setRenamingId] = useState<string | null>(null)
@@ -609,13 +606,9 @@ export default function Home() {
   // 流式输出速度倍率：0.5x / 1x / 2x / 4x（前端节流倍率，0.5x 让长回复更慢可读，4x 让等待秒过）
   const [streamSpeed, setStreamSpeed] = useState<number>(1)
   const [backendCmds, setBackendCmds] = useState<PaletteEntry[]>([])
-  const [modelOptions, setModelOptions] = useState<ChatOptions>(() => {
-    try {
-      return JSON.parse(localStorage.getItem('deveco-switch-chat-options') || '{}')
-    } catch {
-      return {}
-    }
-  })
+  const [modelOptions, setModelOptions] = useState<ChatOptions>(() =>
+    getJSON<ChatOptions>(STORAGE_KEYS.CHAT_OPTIONS, {}),
+  )
   const [planFeedback, setPlanFeedback] = useState('')
   // 工具审批弹窗：选择记忆范围（空=仅本次；session=本会话免审；project=本项目持久化免审）；拒绝理由反馈给模型
   const [approvalScope, setApprovalScope] = useState<'' | 'session' | 'project'>('')
@@ -674,7 +667,7 @@ export default function Home() {
       setModelOptions((prev) => {
         if (prev.model_id === currentConversation.model_id) return prev
         const next = { ...prev, model_id: currentConversation.model_id ?? undefined }
-        localStorage.setItem('deveco-switch-chat-options', JSON.stringify(next))
+        setJSON(STORAGE_KEYS.CHAT_OPTIONS, next)
         return next
       })
     }
@@ -1168,14 +1161,7 @@ export default function Home() {
   // anchorId 为离开时视口顶部的消息 id（分页场景恢复时按需加载旧页后精确定位），null 表示贴底。
   interface ScrollPos { top: number; anchorId: string | null }
   const scrollPosMapRef = useRef<Record<string, ScrollPos | number>>(
-    (() => {
-      try {
-        const raw = localStorage.getItem('deveco-scroll-pos')
-        return raw ? JSON.parse(raw) : {}
-      } catch {
-        return {}
-      }
-    })(),
+    getJSON<Record<string, ScrollPos | number>>(STORAGE_KEYS.SCROLL_POS, {}),
   )
   const persistScrollPosRef = useRef<number | null>(null)
   const [showScrollBottom, setShowScrollBottom] = useState(false)
@@ -1185,23 +1171,14 @@ export default function Home() {
   const [switchingConv, setSwitchingConv] = useState(false)
   // 未读数按对话维度统计（conversationId → count）：滚离底部期间该对话新消息到达时累加，回到底部/切换对话清零。
   // 跨会话持久化到 localStorage，应用重启后对话列表仍保留未读标记。
-  const [unreadMap, setUnreadMap] = useState<Record<string, number>>(() => {
-    try {
-      const raw = localStorage.getItem('deveco-unread-map')
-      return raw ? JSON.parse(raw) : {}
-    } catch {
-      return {}
-    }
-  })
+  const [unreadMap, setUnreadMap] = useState<Record<string, number>>(() =>
+    getJSON<Record<string, number>>(STORAGE_KEYS.UNREAD_MAP, {}),
+  )
   const persistUnreadMap = useRef<number | null>(null)
   useEffect(() => {
     if (persistUnreadMap.current) cancelIdleCallback(persistUnreadMap.current)
     persistUnreadMap.current = requestIdleCallback(() => {
-      try {
-        localStorage.setItem('deveco-unread-map', JSON.stringify(unreadMap))
-      } catch {
-        // 忽略写入失败
-      }
+      setJSON(STORAGE_KEYS.UNREAD_MAP, unreadMap)
     }, { timeout: 2000 })
   }, [unreadMap])
   const unreadCount = currentConvId ? unreadMap[currentConvId] ?? 0 : 0
@@ -1210,11 +1187,7 @@ export default function Home() {
   const persistScrollPos = () => {
     if (persistScrollPosRef.current) cancelIdleCallback(persistScrollPosRef.current)
     persistScrollPosRef.current = requestIdleCallback(() => {
-      try {
-        localStorage.setItem('deveco-scroll-pos', JSON.stringify(scrollPosMapRef.current))
-      } catch {
-        // 忽略写入失败
-      }
+      setJSON(STORAGE_KEYS.SCROLL_POS, scrollPosMapRef.current)
     }, { timeout: 2000 })
   }
 
@@ -1645,6 +1618,24 @@ export default function Home() {
     return null
   }, [messages, isStreaming])
 
+  // 中断回复检测：最后一条消息是已提交（queued=0）的 user 消息且其后无任何回复
+  // （任务因应用退出/崩溃中断，assistant 内容从未入库——用户消息已在库，回复丢失）
+  // 排队中（queued=1）或流式中不算；命中后尾部渲染“继续生成回复”横幅，一键重新生成
+  const orphanUserMessage = useMemo(() => {
+    if (isStreaming || messages.length === 0) return null
+    const last = messages[messages.length - 1]
+    // 场景 B：最后一条是 assistant 占位消息（duration_ms=NULL 表示任务中断未完成、
+    // 仅部分正文已入库）→ 显示“回复被中断，部分内容已保存”横幅，可一键继续生成
+    if (last.role === 'assistant' && last.duration_ms == null) return last
+    if (last.role !== 'user' || last.queued === 1) return null
+    // 双保险：最后一条 user 后确实无 assistant/tool 回复（从后向前找首个非 user 消息）
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') continue
+      return null // 已有回复/工具进展，不算中断
+    }
+    return last
+  }, [messages, isStreaming])
+
   /** 构建错误一键修复：将结构化错误摘要注入对话输入框并聚焦，让用户直接交给 Agent 修复 */
   const handleFixBuildErrors = (errors: AnalyzedBuildError[]) => {
     const lines = errors.map((e) => {
@@ -1914,7 +1905,13 @@ export default function Home() {
     setSlashCandidates(null)
     setPendingQuote(null)
     if (isStreaming) {
-      void queueUserMessage(text, false, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
+      queueUserMessage(text, false, refs.length ? refs : undefined, imgs.length ? imgs : undefined).catch((e) => {
+        useNotificationStore.getState().push({
+          tone: 'error',
+          title: t('chat.queueFailed', '排队消息发送失败'),
+          body: String(e ?? ''),
+        })
+      })
     } else {
       void sendUserMessage(text, modelOptions, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
     }
@@ -1933,7 +1930,13 @@ export default function Home() {
     setPickedImages([])
     setRefCandidates(null)
     setPendingQuote(null)
-    void queueUserMessage(text, true, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
+    queueUserMessage(text, true, refs.length ? refs : undefined, imgs.length ? imgs : undefined).catch((e) => {
+      useNotificationStore.getState().push({
+        tone: 'error',
+        title: t('chat.queueFailed', '排队消息发送失败'),
+        body: String(e ?? ''),
+      })
+    })
   }
 
   /** 删除消息（二次确认：第一次点击进入确认态，3 秒内再点执行；级联删除其后所有消息） */
@@ -1960,7 +1963,7 @@ export default function Home() {
   /** 更新对话级模型设置（持久化到 localStorage，随消息发送；同时绑定到当前会话使上下文预算实时生效） */
   const updateModelOptions = (next: ChatOptions) => {
     setModelOptions(next)
-    localStorage.setItem('deveco-switch-chat-options', JSON.stringify(next))
+    setJSON(STORAGE_KEYS.CHAT_OPTIONS, next)
     if (currentConversation) {
       // 后端写入完成后再刷新可视条（避免竞态读到旧 model_id 的 context_limit）
       void setConversationModel(currentConversation.id, next.model_id ?? '')
@@ -1994,22 +1997,13 @@ export default function Home() {
   }, [dirCache])
 
   // @ 引用最近使用（MRU）：pickReference 时记录，按路径记忆最多 30 条，用于候选排序加权
-  const [mruRefs, setMruRefs] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem('deveco-ref-mru')
-      return raw ? JSON.parse(raw) : []
-    } catch {
-      return []
-    }
-  })
+  const [mruRefs, setMruRefs] = useState<string[]>(() =>
+    getJSON<string[]>(STORAGE_KEYS.REF_MRU, []),
+  )
   const recordMruRef = (path: string) => {
     setMruRefs((prev) => {
       const next = [path, ...prev.filter((p) => p !== path)].slice(0, 30)
-      try {
-        localStorage.setItem('deveco-ref-mru', JSON.stringify(next))
-      } catch {
-        // 忽略写入失败
-      }
+      setJSON(STORAGE_KEYS.REF_MRU, next)
       return next
     })
   }
@@ -2211,7 +2205,7 @@ export default function Home() {
   const handleOpenPreview = () => {
     const url = previewUrl.trim()
     if (!url) return
-    localStorage.setItem('deveco-switch-preview-url', url)
+    setItem(STORAGE_KEYS.PREVIEW_URL, url)
     setPreviewSrc(url)
     setRightTab('preview')
   }
@@ -2991,7 +2985,7 @@ export default function Home() {
   const onSidebarDragEnd = () => {
     sidebarDragRef.current = null
     setResizing(null)
-    localStorage.setItem('deveco-switch-sidebar-width', String(sidebarWidth))
+    setItem(STORAGE_KEYS.SIDEBAR_WIDTH, String(sidebarWidth))
   }
 
   /** 右侧栏拖拽调宽（拖左边缘，向右拖变窄） */
@@ -3013,7 +3007,7 @@ export default function Home() {
   const onRightDragEnd = () => {
     rightDragRef.current = null
     setResizing(null)
-    localStorage.setItem('deveco-switch-right-width', String(rightWidth))
+    setItem(STORAGE_KEYS.RIGHT_WIDTH, String(rightWidth))
   }
 
   const formatTime = (ts: number) => {
@@ -3276,7 +3270,7 @@ export default function Home() {
             // 函数式更新避免捕获过期 modelOptions
             setModelOptions((prev) => {
               const next = { ...prev, model_id: m.id }
-              localStorage.setItem('deveco-switch-chat-options', JSON.stringify(next))
+              setJSON(STORAGE_KEYS.CHAT_OPTIONS, next)
               return next
             })
           },
@@ -4022,7 +4016,7 @@ export default function Home() {
             onClick={() =>
               setSidebarCollapsed((v) => {
                 const next = !v
-                localStorage.setItem('deveco-switch-sidebar-collapsed', next ? '1' : '0')
+                setItem(STORAGE_KEYS.SIDEBAR_COLLAPSED, next ? '1' : '0')
                 return next
               })
             }
@@ -4237,7 +4231,7 @@ export default function Home() {
               onClick={() =>
                 setShowRightPanel((v) => {
                   const next = !v
-                  localStorage.setItem('deveco-switch-right-panel', next ? 'expanded' : 'collapsed')
+                  setItem(STORAGE_KEYS.RIGHT_PANEL, next ? 'expanded' : 'collapsed')
                   return next
                 })
               }
@@ -4428,6 +4422,8 @@ export default function Home() {
                               </details>
                             )
                           })()}
+                          {/* 任务账本（Ledger 协议）：目标/已验证/待解决/下一步，每轮实时刷新；任务中断后保留展示 */}
+                          {ledgerCard && ledgerCard.ledger && <LedgerCard state={ledgerCard} />}
                           {/* 任务过程回看（ChatGPT 式）：完成后“已处理 N 个操作”徽章，点击展开全部过程 */}
                           {!isStreaming && (toolRuns.length > 0 || agentRuns.length > 0) && (
                             <TaskOpsBadge
@@ -4472,6 +4468,33 @@ export default function Home() {
                               onRetry={() => regenerateLast(modelOptions)}
                               retryLabel={t('home.retry')}
                             />
+                          )}
+                          {/* 中断回复恢复横幅：最后一条 user 消息已提交但回复从未入库，或
+                              最后一条 assistant 是占位消息（duration_ms=NULL，部分内容已保存）——
+                              均为任务中断所致，一键重新生成/继续生成回复 */}
+                          {orphanUserMessage && (
+                            <div className="flex items-center gap-3 rounded-xl border border-dashed border-[var(--warning)]/50 bg-[var(--warning)]/8 px-3.5 py-2.5 animate-fade-in-up">
+                              <Icon name="refresh" size={14} className="shrink-0 text-[var(--warning)]" />
+                              <div className="min-w-0 flex-1">
+                                <div className="text-[12px] font-semibold text-[var(--text-secondary)]">
+                                  {orphanUserMessage.role === 'assistant'
+                                    ? t('home.interruptedBannerPartial')
+                                    : t('home.interruptedBanner')}
+                                </div>
+                                <div className="text-[11px] text-[var(--text-muted)] leading-relaxed">
+                                  {orphanUserMessage.role === 'assistant'
+                                    ? t('home.interruptedBannerPartialDesc')
+                                    : t('home.interruptedBannerDesc')}
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => void regenerateLatest()}
+                                className="shrink-0 h-7 px-3 rounded-full btn-primary text-[11.5px] font-medium flex items-center gap-1"
+                              >
+                                <Icon name="refresh" size={11} />
+                                {t('home.resumeGenerate')}
+                              </button>
+                            </div>
                           )}
                           <div ref={bottomRef} />
                         </>
@@ -6402,17 +6425,17 @@ const MessageItem = memo(function MessageItem({
       <div
         data-msg-id={message.id}
         onContextMenu={onContextMenu}
-        className={`flex justify-end gap-2.5 group ${highlighted ? 'msg-highlight' : ''}`}
+        className={`flex justify-end gap-3 group msg-row ${highlighted ? 'msg-highlight' : ''}`}
       >
-        <div className="max-w-[80%] rounded-2xl rounded-tr-md bg-[var(--accent-soft)] border border-[var(--accent)]/20 px-4 py-2.5 shadow-sm transition-shadow hover:shadow-md">
+        <div className="max-w-[80%] rounded-2xl rounded-tr-md bg-[var(--bg-secondary)] px-4 py-2 transition-colors">
           <div className="flex items-center gap-2 mb-1">
             <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.you')}</span>
-            <span className="text-[10px] text-[var(--text-muted)]">{time}</span>
-            {/* 消息 ID：点击复制完整 ID，排查问题用 */}
+            <span className="text-[10px] text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">{time}</span>
+            {/* 消息 ID：默认隐藏，悬浮时显示（排查问题用） */}
             {onCopyId && (
               <button
                 onClick={() => onCopyId(message.id)}
-                className="debug-id-badge font-mono text-[9px] px-1 py-px rounded border border-[var(--border)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors opacity-60 hover:opacity-100"
+                className="font-mono text-[9px] px-1 py-px rounded text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors opacity-0 group-hover:opacity-100"
                 title={`${t('home.msgId')}: ${message.id}\n${t('home.clickToCopy')}`}
               >
                 {copiedId === message.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
@@ -6543,46 +6566,45 @@ const MessageItem = memo(function MessageItem({
     <div
       data-msg-id={message.id}
       onContextMenu={onContextMenu}
-      className={`flex gap-2.5 group ${highlighted ? 'msg-highlight' : ''}`}
+      className={`flex gap-3 group msg-row ${highlighted ? 'msg-highlight' : ''}`}
     >
-      <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shrink-0 mt-0.5 shadow-md shadow-[var(--accent)]/20">
-        <Icon name="spark" size={13} white />
+      <div className="w-6 h-6 rounded-full bg-[var(--bg-hover)] flex items-center justify-center shrink-0 mt-0.5">
+        <Icon name="spark" size={12} className="text-[var(--text-muted)]" />
       </div>
-      <div className="max-w-[85%] min-w-0 flex-1">
-        <div className="flex items-center gap-2 mb-1.5">
-          <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.agent')}</span>
-          <span className="text-[10px] text-[var(--text-muted)]">{time}</span>
-          {/* 消息 ID：点击复制完整 ID，排查问题用 */}
-          {onCopyId && (
-            <button
-              onClick={() => onCopyId(message.id)}
-              className="debug-id-badge font-mono text-[9px] px-1 py-px rounded border border-[var(--border)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors opacity-60 hover:opacity-100"
-              title={`${t('home.msgId')}: ${message.id}\n${t('home.clickToCopy')}`}
-            >
-              {copiedId === message.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
-              {shortId(message.id)}
-            </button>
-          )}
-          {/* 窄窗口隐藏次要徽章（模型/耗时/token），避免头部拥挤换行 */}
-          {model && <span className="hidden md:inline-flex text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)] text-[var(--text-muted)]">{model}</span>}
-          {/* 本条回复用时（ChatGPT 式“已处理 mm:ss”）：任务耗时持久化到消息，历史对话同样可见 */}
-          {message.duration_ms != null && message.duration_ms > 0 && (
-            <span
-              className="hidden sm:inline-flex text-[10px] tabular-nums px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)]/60 text-[var(--text-muted)]"
-              title={t('home.replyDurationHint')}
-            >
-              ⏱ {fmtElapsed(message.duration_ms / 1000)}
-            </span>
-          )}
-          {/* 本条回复 token 消耗（入库 tokens_in/tokens_out，悬浮提示） */}
-          {(message.tokens_in != null || message.tokens_out != null) && (
-            <span
-              className="hidden lg:inline-flex text-[10px] tabular-nums px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)]/60 text-[var(--text-muted)]"
-              title={`${t('home.tokenHint')}：${t('home.tokenIn')} ${message.tokens_in ?? 0} / ${t('home.tokenOut')} ${message.tokens_out ?? 0}`}
-            >
-              ↑{(message.tokens_in ?? 0).toLocaleString()} ↓{(message.tokens_out ?? 0).toLocaleString()}
-            </span>
-          )}
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-[12px] font-medium text-[var(--text-primary)]">{t('home.agent')}</span>
+          <span className="text-[11px] text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">{time}</span>
+          {/* 次要元信息：默认隐藏，悬浮消息时显示，保持清爽 */}
+          <div className="flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            {onCopyId && (
+              <button
+                onClick={() => onCopyId(message.id)}
+                className="font-mono text-[9px] px-1 py-px rounded text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"
+                title={`${t('home.msgId')}: ${message.id}\n${t('home.clickToCopy')}`}
+              >
+                {copiedId === message.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
+                {shortId(message.id)}
+              </button>
+            )}
+            {model && <span className="text-[10px] text-[var(--text-muted)]">{model}</span>}
+            {message.duration_ms != null && message.duration_ms > 0 && (
+              <span
+                className="text-[10px] tabular-nums text-[var(--text-muted)]"
+                title={t('home.replyDurationHint')}
+              >
+                {fmtElapsed(message.duration_ms / 1000)}
+              </span>
+            )}
+            {(message.tokens_in != null || message.tokens_out != null) && (
+              <span
+                className="text-[10px] tabular-nums text-[var(--text-muted)]"
+                title={`${t('home.tokenHint')}：${t('home.tokenIn')} ${message.tokens_in ?? 0} / ${t('home.tokenOut')} ${message.tokens_out ?? 0}`}
+              >
+                ↑{(message.tokens_in ?? 0).toLocaleString()} ↓{(message.tokens_out ?? 0).toLocaleString()}
+              </span>
+            )}
+          </div>
         </div>
         {previewVersion && (
           <div className="flex items-center gap-2 mb-1.5">

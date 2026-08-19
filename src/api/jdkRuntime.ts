@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 import type { RuntimeProgress } from './runtimeProgress'
 
 /** JDK 安装/更新进度（事件 `jdk-install-progress`，与 Node/Git 共用 RuntimeProgress 形状） */
@@ -34,25 +34,25 @@ export interface JdkUpdateInfo {
 }
 
 /** 查询 JDK 运行时状态（版本列表、默认版本、系统 JAVA_HOME） */
-export const getJdkRuntime = () => invoke<JdkRuntimeInfo>('get_jdk_runtime')
+export const getJdkRuntime = () => invokeWithError<JdkRuntimeInfo>('get_jdk_runtime')
 
 /** 查询可安装的 feature 版本（Adoptium LTS 列表，如 8/11/17/21/25）；
  * useProxy: true=强制走系统代理 / false=直连；缺省=自动（优先系统代理，无则直连） */
 export const fetchJdkReleases = (useProxy?: boolean) =>
-  invoke<string[]>('fetch_jdk_releases', { useProxy: useProxy ?? null })
+  invokeWithError<string[]>('fetch_jdk_releases', { useProxy: useProxy ?? null })
 
 /** 在线安装/更新指定 feature 版本的 JDK（同 feature 已装时为覆盖更新）；
  * 下载进度通过 `jdk-install-progress` 事件推送；useProxy 缺省=自动（优先系统代理，无则直连） */
 export const installJdk = (feature: string, useProxy?: boolean) =>
-  invoke<JdkRuntimeInfo>('install_jdk', { feature, useProxy: useProxy ?? null })
+  invokeWithError<JdkRuntimeInfo>('install_jdk', { feature, useProxy: useProxy ?? null })
 
 /** 检查已装 JDK 是否有可用的补丁更新（网络不可达时 reject，前端静默降级） */
-export const checkJdkUpdates = () => invoke<JdkUpdateInfo[]>('check_jdk_updates')
+export const checkJdkUpdates = () => invokeWithError<JdkUpdateInfo[]>('check_jdk_updates')
 
 /** 设置默认 JDK 版本（多版本并存时切换构建/命令使用的 JDK） */
 export const setDefaultJdk = (feature: string) =>
-  invoke<JdkRuntimeInfo>('set_default_jdk', { feature })
+  invokeWithError<JdkRuntimeInfo>('set_default_jdk', { feature })
 
 /** 卸载升级版 JDK（捆绑版不可卸载）；卸载默认版本时自动回落其他版本 */
 export const uninstallJdk = (feature: string) =>
-  invoke<JdkRuntimeInfo>('uninstall_jdk', { feature })
+  invokeWithError<JdkRuntimeInfo>('uninstall_jdk', { feature })

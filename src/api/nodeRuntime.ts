@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** Node 运行时状态（来源：system=系统已装 / upgraded=内置升级版 / bundled=出厂捆绑版 / none=不可用） */
 export interface NodeRuntimeInfo {
@@ -15,11 +15,11 @@ export interface NodeRuntimeInfo {
 }
 
 /** 查询 Node 运行时状态（版本、来源、目录） */
-export const getNodeRuntime = () => invoke<NodeRuntimeInfo>('get_node_runtime')
+export const getNodeRuntime = () => invokeWithError<NodeRuntimeInfo>('get_node_runtime')
 
 /** 升级 Node 运行时；version 缺省时自动取最新 LTS；useProxy: true=走系统代理 / false=直连 */
 export const upgradeNodeRuntime = (version?: string, useProxy?: boolean) =>
-  invoke<NodeRuntimeInfo>('upgrade_node_runtime', { version: version ?? null, useProxy: useProxy ?? null })
+  invokeWithError<NodeRuntimeInfo>('upgrade_node_runtime', { version: version ?? null, useProxy: useProxy ?? null })
 
 /** 删除升级版，回到出厂捆绑版本 */
-export const resetNodeRuntime = () => invoke<NodeRuntimeInfo>('reset_node_runtime')
+export const resetNodeRuntime = () => invokeWithError<NodeRuntimeInfo>('reset_node_runtime')

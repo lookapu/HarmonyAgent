@@ -17,6 +17,7 @@ import type {
   RollbackInfo,
   ConversationCostStats,
   PendingConfirmation,
+  TaskLedger,
 } from '../api/project'
 import type { TaskRun } from '../api/cost'
 
@@ -112,6 +113,13 @@ export interface TaskPlan {
   phase: 'running' | 'done' | 'error'
 }
 
+/** 会话任务账本展示状态（chat-ledger 事件按会话聚合；切回会话恢复展示） */
+export interface TaskLedgerState {
+  ledger: TaskLedger | null
+  /** 任务是否已结束（true=最终状态：中断保留/完成清空；false=进行中每轮实时刷新） */
+  finished: boolean
+}
+
 /** 工具权限审核请求（自动审核模式下待用户确认） */
 export interface ToolApproval {
   requestId: string
@@ -205,6 +213,8 @@ export interface ChatSlice {
   toolApprovals: ToolApproval[]
   /** 各会话待确认项（按 conversationId 聚合）：会话列表角标 + 切回会话恢复弹窗 */
   pendingConfirmations: Record<string, PendingConfirmation[]>
+  /** 各会话任务账本（Ledger 协议，按 conversationId 聚合）：实时刷新/中断保留/切回恢复展示 */
+  taskLedgers: Record<string, TaskLedgerState>
   /** Agent 推送的诊断引导卡片（签名/SDK/依赖等需用户决策） */
   diagnoseCards: DiagnoseCard[]
   /** 计划/审查模式：待用户确认的任务计划 */

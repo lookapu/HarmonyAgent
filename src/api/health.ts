@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 export interface HealthResult {
   provider_id: string
@@ -32,12 +32,12 @@ export interface ToolchainCheck {
   structure?: ProjectStructure | null
 }
 
-export const checkAllHealth = () => invoke<HealthResult[]>('check_all_health')
+export const checkAllHealth = () => invokeWithError<HealthResult[]>('check_all_health')
 /** 轻量工具链体检（[66]：只查 hvigorw/hdc/ohpm，不查工程结构；启动自动 ping 用） */
-export const toolsHealth = () => invoke<ToolchainCheck[]>('tools_health')
+export const toolsHealth = () => invokeWithError<ToolchainCheck[]>('tools_health')
 /** 鸿蒙工具链检查（hvigorw / hdc / ohpm / 工程结构）；projectId 可选，customPaths 为自定义工具链目录 */
 export const checkHarmonyToolchain = (projectId?: string, customPaths?: string[]) =>
-  invoke<ToolchainCheck[]>('check_harmony_toolchain', {
+  invokeWithError<ToolchainCheck[]>('check_harmony_toolchain', {
     projectId: projectId ?? '',
     customPaths: customPaths ?? [],
   })

@@ -28,6 +28,8 @@ pub enum InterceptKind {
     Blacklist,
     /// 用户审批拒绝或审批等待超时
     Approval,
+    /// 用户主动停止生成（区别于"拒绝"：任务应按停止收尾，而非正常完成）
+    Cancelled,
     /// 其他拦截（钩子内部错误等）
     Generic,
 }

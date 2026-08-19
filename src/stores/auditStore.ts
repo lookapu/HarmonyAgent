@@ -8,6 +8,8 @@
 // - localStorage 持久化：用户清缓存/卸载前可见；上限 200 条 FIFO
 // - 不与 notifications 重复：通知是"我刚做完"的瞬时提示；审计是"历史可查"
 import { create } from 'zustand'
+import { getJSON, setJSON } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
 export type AuditCategory =
   | 'conversation.delete'   // 删除会话
@@ -41,33 +43,21 @@ export interface AuditEntry {
   conversationId?: string
 }
 
-const STORAGE_KEY = 'deveco-switch-audit-log'
 const MAX_ENTRIES = 200
 
 const loadFromStorage = (): AuditEntry[] => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return []
-    const arr = JSON.parse(raw)
-    if (!Array.isArray(arr)) return []
-    return arr.slice(-MAX_ENTRIES)
-  } catch {
-    return []
-  }
+  const arr = getJSON<unknown>(STORAGE_KEYS.AUDIT_LOG, null)
+  return Array.isArray(arr) ? (arr as AuditEntry[]).slice(-MAX_ENTRIES) : []
 }
 
 const saveToStorage = (list: AuditEntry[]) => {
-  try {
-    // 限长 + 限制字段大小（防 XSS 把 audit 撑爆）
-    const trimmed = list.slice(-MAX_ENTRIES).map((e) => ({
-      ...e,
-      label: e.label.slice(0, 100),
-      detail: e.detail ? e.detail.slice(0, 500) : undefined,
-    }))
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed))
-  } catch {
-    // localStorage 满了或被禁用 → 静默失败
-  }
+  // 限长 + 限制字段大小（防 XSS 把 audit 撑爆）
+  const trimmed = list.slice(-MAX_ENTRIES).map((e) => ({
+    ...e,
+    label: e.label.slice(0, 100),
+    detail: e.detail ? e.detail.slice(0, 500) : undefined,
+  }))
+  setJSON(STORAGE_KEYS.AUDIT_LOG, trimmed)
 }
 
 let _seq = 0

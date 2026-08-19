@@ -6,6 +6,8 @@ import Markdown from '../../components/Markdown'
 import { gitDiffStat, gitFileDiff, gitAcceptChanges, gitRevertFile } from '../../api/git'
 import { sanitizeToolMarkers } from '../chatUtils'
 import { createPortal } from 'react-dom'
+import { getItem, setItem } from '../../utils/storage'
+import { STORAGE_KEYS } from '../../constants'
 
 /** 流式补全未闭合的代码围栏：``` 未配对时补一个闭合，否则 react-markdown 把整块当纯文本，
  *  代码块刚开头时裸露 ``` 符号闪烁；只影响展示层，不改真实内容 */
@@ -37,21 +39,11 @@ export function DiffText({ text }: { text: string }) {
 export const ThinkingBlock = memo(function ThinkingBlock({ content }: { content: string }) {
   const { t } = useTranslation()
   // 展开偏好记忆：用户手动开合后跨会话记住（localStorage）
-  const [open, setOpen] = useState(() => {
-    try {
-      return localStorage.getItem('deveco-thinking-open') === '1'
-    } catch {
-      return false
-    }
-  })
+  const [open, setOpen] = useState(() => getItem(STORAGE_KEYS.THINKING_OPEN) === '1')
   const toggle = () => {
     setOpen((v) => {
       const next = !v
-      try {
-        localStorage.setItem('deveco-thinking-open', next ? '1' : '0')
-      } catch {
-        // localStorage 不可用时静默
-      }
+      setItem(STORAGE_KEYS.THINKING_OPEN, next ? '1' : '0')
       return next
     })
   }
@@ -600,11 +592,11 @@ export const ErrorCard = memo(function ErrorCard({
   const showRetry = !detail || detail.retryable
   return (
     <div
-      className="msg-role task-failed px-3.5 py-3 text-[12px] animate-fade-in-up"
+      className="px-3 py-2.5 text-[12px] animate-fade-in-up rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60"
       style={{ color }}
     >
       <div className="flex items-start gap-2">
-        <Icon name="info" size={14} className="shrink-0 mt-0.5" />
+        <Icon name="info" size={13} className="shrink-0 mt-0.5" />
         <div className="flex-1 min-w-0 space-y-1">
           {detail ? (
             <>

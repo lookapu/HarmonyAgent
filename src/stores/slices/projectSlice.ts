@@ -13,37 +13,25 @@ import {
   conversationRoot,
 } from '../../api/project'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
+import { getItem, setItem } from '../../utils/storage'
+import { STORAGE_KEYS } from '../../constants'
 
-/** localStorage key：持久化最近选中的项目/会话 */
-const LS_LAST_PROJECT = 'deveco-switch:last-project-id'
-const LS_LAST_CONV_PREFIX = 'deveco-switch:last-conv:'
+/** localStorage key：持久化最近选中的项目/会话（统一见 src/constants.ts 的 STORAGE_KEYS） */
 
 /** 记住项目/会话选择（下次打开时恢复） */
 function persistLastProject(projectId: string, convId?: string) {
-  try {
-    localStorage.setItem(LS_LAST_PROJECT, projectId)
-    if (convId) localStorage.setItem(LS_LAST_CONV_PREFIX + projectId, convId)
-  } catch {
-    /* 无痕模式等环境下 localStorage 可能不可用，静默失败 */
-  }
+  setItem(STORAGE_KEYS.LAST_PROJECT, projectId)
+  if (convId) setItem(STORAGE_KEYS.LAST_CONV_PREFIX + projectId, convId)
 }
 
 /** 获取上次项目 ID；不存在返回 null */
 export function getLastProjectId(): string | null {
-  try {
-    return localStorage.getItem(LS_LAST_PROJECT)
-  } catch {
-    return null
-  }
+  return getItem(STORAGE_KEYS.LAST_PROJECT)
 }
 
 /** 获取项目上次打开的会话 ID */
 export function getLastConversationId(projectId: string): string | null {
-  try {
-    return localStorage.getItem(LS_LAST_CONV_PREFIX + projectId)
-  } catch {
-    return null
-  }
+  return getItem(STORAGE_KEYS.LAST_CONV_PREFIX + projectId)
 }
 
 /** 项目/文件树/分支切片实现 */

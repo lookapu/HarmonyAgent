@@ -20,7 +20,7 @@
 | 📚 **API 知识库** | 内置 HarmonyOS API 索引（向量检索 + 符号索引） + 跨版本 diff + 兼容性扫描 + 用户笔记（knowledge entries） |
 | 🛡 **安全治理** | 工具调用白名单 / 工具限额（按任务组） / 任务守卫 / 预算控制 / 权限管理 / 审批拦截流水线（pre/post hooks） |
 | 📦 **内置运行时** | 便携版 Node + JDK + Git 随安装包捆绑（构建时由 CI 从官方源自动下载），用户机器无需预装开发环境 |
-| 💬 **会话管理** | 多会话 / 上下文压缩（compact） / LLM 调用回放（llm_replay） / 事件溯源（session_events） / 会话标签 / 置顶 / 消息队列 |
+| 💬 **会话管理** | 多会话 / 上下文压缩（compact） / LLM 调用回放（llm_replay） / 事件溯源（session_events） / 会话标签 / 置顶 / 消息队列 / 任务看门狗（卡死自动 abort） |
 | 🧠 **代码理解** | LSP 语义级分析（ArkTS 语言服务器） + 分级扫描（check_code / deep_scan / codebase_search / get_symbol_details） / 符号索引 / 文件系统工具集 |
 | 🌐 **生态能力** | MCP 服务器管理 / Skill 启停与使用统计 / ohpm 生态面板 / 鸿蒙官方文档检索 / Web 搜索与抓取 / 知识库导入导出 |
 | 📡 **LAN 访问** | 内置局域网服务，手机/平板浏览器即可查看会话、发消息、管理会话（token 鉴权 + 只读文件查看） |
@@ -122,7 +122,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 30+ commands · 36 services · 16 agent 子模块     │
 │  - tools/ 目录：27 文件，193 个 Agent 工具           │
-│  - SQLite + 49 个迁移版本 · 事件溯源（session_events）│
+│  - SQLite + 50 个迁移版本 · 事件溯源（session_events）│
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -188,8 +188,8 @@ src-tauri/src/
 │   ├── tool_cache.rs       #   - 工具结果缓存
 │   ├── harmony_*.rs        #   - 鸿蒙集成（6 文件）
 │   └── ...
-├── db/                     # SQLite + 49 个迁移
-├── utils/                  # 工具（10 文件）
+├── db/                     # SQLite + 50 个迁移
+├── utils/                  # 工具（13 文件，含任务看门狗）
 ├── tray/                   # 系统托盘
 └── runtime/                # 内置 Node + JDK + Git（约 700MB，不入库，见下）
 ```
@@ -262,7 +262,7 @@ npx tauri build
 - 前端入口：`src/App.tsx` + `src/pages/Home.tsx`（Agent Workspace 主界面）
 - 后端入口：`src-tauri/src/lib.rs` + `src-tauri/src/main.rs`
 - Agent 工具注册：`src-tauri/src/agent/tools/mod.rs` 的 `TOOL_SPECS` 数组
-- 数据库迁移：`src-tauri/migrations/`（49 个版本，已执行的迁移不可修改，新增请递增编号）
+- 数据库迁移：`src-tauri/migrations/`（50 个版本，已执行的迁移不可修改，新增请递增编号）
 - 旧调试脚本：`scripts/legacy/`（仅留档，请勿引用）
 
 ## 打赏支持

@@ -66,6 +66,13 @@ pub fn begin_task(conversation_id: &str, goal: &str) {
     );
 }
 
+/// 会话删除等场景：清理该会话的护栏状态，避免进程内状态单调增长
+pub fn clear_task(conversation_id: &str) {
+    if let Ok(mut map) = guards().lock() {
+        map.remove(conversation_id);
+    }
+}
+
 /// 记录一次工具调用，返回该调用应附加到模型的护栏提示（可能为空）。
 /// `progress` 表示该工具是否构成"实质进展"（写文件/构建/部署/测试成功等）。
 /// 各项阈值取自 agent_limits 动态配置（0/-1 表示不限制）。

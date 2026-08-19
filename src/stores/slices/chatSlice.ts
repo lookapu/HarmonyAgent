@@ -18,6 +18,7 @@ import {
   resolveToolApproval as resolveToolApprovalApi,
   resolvePlanReview as resolvePlanReviewApi,
   getTodos as getTodosApi,
+  getTaskLedger as getTaskLedgerApi,
   getAsk as getAskApi,
   listPendingConfirmations as listPendingConfirmationsApi,
   resolveAskUser as resolveAskUserApi,
@@ -28,17 +29,21 @@ import {
   rollbackConversation,
   conversationRoot,
 } from '../../api/project'
-import type { ChatMessage, TodoItem, PendingConfirmation } from '../../api/project'
+import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger } from '../../api/project'
 import type { StateCreator } from 'zustand'
 import type { ChatSlice, DiagnoseCard, ProjectState, StreamingState } from '../projectStoreTypes'
 import { advancePlan } from './chatUtils'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
+import { setItem } from '../../utils/storage'
+import { STORAGE_KEYS } from '../../constants'
 
-/** localStorage key 前缀：持久化每个项目上次打开的会话 ID */
-const LS_LAST_CONV_PREFIX = 'deveco-switch:last-conv:'
+/** localStorage key 前缀：持久化每个项目上次打开的会话 ID（统一见 src/constants.ts 的 STORAGE_KEYS.LAST_CONV_PREFIX） */
 
 /** 看门狗静默阈值：超过该时长无内容/思考增量且无运行中工具/挂起审批，判定后端挂起 */
 const STREAM_WATCHDOG_MS = 4 * 60 * 1000
+/** 已有内容/思考的桶放宽阈值：后端 60s 静默判死+主循环续写会刷新 lastDeltaAt，
+ * 8 分钟无事件必为后端 join 永不返回（invoke 永不 reject），前端必须自行释放 */
+const STREAM_WATCHDOG_LONG_MS = 8 * 60 * 1000
 
 // Agent 工具 / 子 Agent 事件自增序号（模块级）
 let toolSeq = 0
@@ -73,11 +78,16 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         delete streamings[convId]
       } else {
         const prev = streamings[convId]
+        // 出错时视为流式结束：清空 conversationId（isStreaming 变 false）与 startedAt
+        // （停止计时），但保留已生成 content/reasoning 与 error，供错误卡和部分内容共存展示，
+        // 避免打字光标/三点动画与错误卡同时出现。
+        const isError = patch.error !== undefined && patch.error !== null
         streamings[convId] = {
           ...(prev ?? { ...emptyStreaming(), startedAt: Date.now() }),
           ...patch,
-          conversationId: convId,
-          lastDeltaAt: Date.now(),
+          conversationId: isError ? null : convId,
+          startedAt: isError ? null : (patch.startedAt ?? prev?.startedAt ?? null),
+          lastDeltaAt: isError ? (prev?.lastDeltaAt ?? null) : Date.now(),
         }
       }
       return {
@@ -125,13 +135,20 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     for (const [convId, bucket] of Object.entries(s.streamings)) {
       if (bucket.error) continue
       const ref = bucket.lastDeltaAt ?? bucket.startedAt
-      if (!ref || Date.now() - ref < STREAM_WATCHDOG_MS) continue
-      // 已有内容/思考的静默属于模型侧长思考，交由后端超时兜底
-      if (bucket.content || bucket.reasoning) continue
+      if (!ref) continue
+      // 已有内容/思考的桶：后端 60s 静默判死+续写会刷新 lastDeltaAt，8 分钟无事件
+      // 必为后端 join 永不返回（invoke 永不 reject，前端永久转圈），须放宽阈值兜底释放；
+      // 无内容桶保持 4 分钟（首字节前的卡死更早暴露）
+      const threshold = bucket.content || bucket.reasoning ? STREAM_WATCHDOG_LONG_MS : STREAM_WATCHDOG_MS
+      if (Date.now() - ref < threshold) continue
       // 工具执行中（含后台会话）：后端仍在工作
       if (bucket.toolRunning > 0) continue
       const isCurrent = s.currentConversation?.id === convId
-      // 当前会话有挂起审批：在等用户操作，不判挂起
+      // 任意会话（含后台）有挂起的审批/计划/提问：在等用户操作，不判挂起。
+      // pendingConfirmations 按会话聚合，后台会话弹窗也会记录，避免误杀。
+      const pending = s.pendingConfirmations[convId]
+      if (pending && pending.length > 0) continue
+      // 当前会话视图级挂起（兜底，历史数据无 pendingConfirmations 时）
       if (isCurrent && s.toolApprovals.length > 0) continue
       setBucket(convId, {
         ...emptyStreaming(),
@@ -180,8 +197,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     setBucket(conversation_id, { reasoning: bucket.reasoning + delta })
   }).catch(() => {})
 
-  listen<{ conversation_id: string; message: ChatMessage; unfinished: boolean }>('chat-done', (event) => {
-    const { conversation_id, message, unfinished } = event.payload
+  listen<{ conversation_id: string; message: ChatMessage; unfinished: boolean; user_message_id?: string | null }>('chat-done', (event) => {
+    const { conversation_id, message, unfinished, user_message_id } = event.payload
     const state = get()
     // 分桶清理无条件执行（后台会话结束也释放流式槽位）；视图状态仅当前会话更新
     const bucket = state.streamings[conversation_id]
@@ -207,8 +224,23 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     if (isCurrent) {
       // 任务结束摘要（ChatGPT 式收尾统计）：耗时 + 工具调用数 + 修改文件数
       const toolCount = state.toolRuns.length
+      // 用后端返回的真实 user 消息 ID 替换乐观插入的 local- 占位，
+      // 避免编辑/删除/分支重生成在当前会话周期内拿到不存在的本地 ID
+      let nextMessages = state.messages
+      if (user_message_id) {
+        const lastLocalUserIdx = [...state.messages]
+          .map((m, i) => ({ m, i }))
+          .reverse()
+          .find(({ m }) => m.role === 'user' && typeof m.id === 'string' && m.id.startsWith('local-'))?.i
+        if (lastLocalUserIdx !== undefined) {
+          const localMsg = state.messages[lastLocalUserIdx]
+          nextMessages = state.messages.map((m, i) =>
+            i === lastLocalUserIdx ? { ...localMsg, id: user_message_id } : m,
+          )
+        }
+      }
       set({
-        messages: [...state.messages, message],
+        messages: [...nextMessages, message],
         // 完成后保留过程记录：顶部"已处理 N 个操作"徽章可展开回看（新任务/切会话时清空）
         lastTaskSummary: {
           durationMs,
@@ -225,8 +257,11 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         unfinishedConv: unfinished ? { conversationId: conversation_id } : null,
       })
     }
-    // 刷新会话列表（标题/时间变化；保持搜索关键字过滤）
-    const projectId = state.currentConversation?.project_id
+    // 刷新会话列表（标题/时间变化；保持搜索关键字过滤）。
+    // 以本轮完成的会话所属项目为准（后台会话完成时，当前会话可能属于另一项目），
+    // 从已加载会话列表中反查 project_id；查不到说明不在当前项目，跳过。
+    const completedConv = get().conversations.find((c) => c.id === conversation_id)
+    const projectId = completedConv?.project_id ?? state.currentConversation?.project_id
     if (projectId) {
       const kw = get().conversationKeyword.trim()
       const includeArchived = get().conversations.some((c) => c.archived)
@@ -251,6 +286,43 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       currentConversation:
         state.currentConversation?.id === conversation_id ? { ...state.currentConversation, title } : state.currentConversation,
     })
+  }).catch(() => {})
+
+  // 会话被删除（含另一客户端/LAN、或删除运行中会话后端清理后）：同步清理前端状态
+  listen<{ conversation_id: string }>('conversation-deleted', (event) => {
+    const { conversation_id } = event.payload
+    const state = get()
+    const streamings = { ...state.streamings }
+    delete streamings[conversation_id]
+    const pendingConfirmations = { ...state.pendingConfirmations }
+    delete pendingConfirmations[conversation_id]
+    if (state.currentConversation?.id === conversation_id) {
+      // 删除的是当前会话：清空视图，打开同项目第一个会话
+      const remaining = state.conversations.filter((c) => c.id !== conversation_id)
+      set({
+        streamings,
+        pendingConfirmations,
+        conversations: remaining,
+        currentConversation: null,
+        messages: [],
+        streaming: emptyStreaming(),
+        toolRuns: [],
+        agentRuns: [],
+        plan: null,
+        todos: [],
+        askCard: null,
+        unfinishedConv: null,
+      })
+      if (remaining.length > 0) {
+        get().openConversation(remaining[0].id).catch(() => {})
+      }
+    } else {
+      set({
+        streamings,
+        pendingConfirmations,
+        conversations: state.conversations.filter((c) => c.id !== conversation_id),
+      })
+    }
   }).catch(() => {})
 
   listen<{ conversation_id: string; error: string; kind: string; title: string; reason: string; suggestion: string; retryable: boolean; status_code?: number | null }>(
@@ -416,6 +488,13 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       const body = ok ? '任务已成功结束' : (output || '').slice(-160) || '请查看构建日志'
       sendNotification(ok ? titleOk : titleErr, body, ok ? 'success' : 'error').catch(() => {})
     }
+  }).catch(() => {})
+
+  // 任务账本推送（Ledger 协议）：每轮工具执行后实时刷新（finished=false）；任务结束时最终态
+  // （finished=true：完成→ledger=null 收起；中断→保留展示）。按会话聚合，切回会话恢复展示
+  listen<{ conversation_id: string; ledger: TaskLedger | null; finished: boolean }>('chat-ledger', (event) => {
+    const { conversation_id, ledger, finished } = event.payload
+    set((s) => ({ taskLedgers: { ...s.taskLedgers, [conversation_id]: { ledger, finished } } }))
   }).catch(() => {})
 
   // 工具权限审核请求（自动审核模式）：入队等待用户确认弹窗
@@ -657,6 +736,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     plan: null,
     toolApprovals: [],
     pendingConfirmations: {},
+    taskLedgers: {},
     diagnoseCards: [],
     dismissDiagnoseCard: (id) => set((s) => ({ diagnoseCards: s.diagnoseCards.filter((c) => c.id !== id) })),
     pendingPlan: null,
@@ -707,7 +787,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       // 新会话：清空上一会话的过程记录（完成态徽章不复用）
       set({ conversations, currentConversation: conv, messages: [], plan: null, toolRuns: [], agentRuns: [], approvedPlan: null, unfinishedConv: null, todos: [], askCard: null })
       // 持久化会话选择
-      try { localStorage.setItem(LS_LAST_CONV_PREFIX + project.id, conv.id) } catch { /* ignore */ }
+      setItem(STORAGE_KEYS.LAST_CONV_PREFIX + project.id, conv.id)
       // 工作目录变化（local ↔ worktree / 不同 worktree）：重载文件树跟随新会话
       if (prevRoot !== conversationRoot(conv)) {
         get().rebuildIndex().catch(() => {})
@@ -778,7 +858,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       // 持久化会话选择（下次打开该项目时恢复）
       const pid = get().currentProject?.id
       if (pid) {
-        try { localStorage.setItem(LS_LAST_CONV_PREFIX + pid, id) } catch { /* ignore */ }
+        setItem(STORAGE_KEYS.LAST_CONV_PREFIX + pid, id)
       }
 
       // 分页加载：只取最近一页，向上滚动时再按游标加载更早历史，避免长会话全量加载渲染
@@ -809,6 +889,13 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       void getTodosApi(id)
         .then((todos) => {
           if (get().currentConversation?.id === id) set({ todos })
+        })
+        .catch(() => {})
+      // 恢复该会话的任务账本（未完成任务落库；完成时已清空返回 null，不展示）
+      void getTaskLedgerApi(id)
+        .then((ledger) => {
+          if (get().currentConversation?.id !== id) return
+          set((s) => ({ taskLedgers: { ...s.taskLedgers, [id]: { ledger, finished: true } } }))
         })
         .catch(() => {})
       void getAskApi(id)
@@ -880,14 +967,15 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       // 开始发送消息性能追踪
       const sendTrace = startPerfTrace('sendMessage', { conv: conv.id.slice(0, 8) })
       sendTraces.set(conv.id, sendTrace)
-      // 乐观展示 user 消息（Rust 端同样入库）
+      // 乐观展示 user 消息（Rust 端同样入库）。ID 带随机后缀，避免跨会话同秒发送碰撞
       const now = Math.floor(Date.now() / 1000)
+      const localId = `local-${now}-${Math.random().toString(36).slice(2, 8)}`
       const fresh: StreamingState = { ...emptyStreaming(), conversationId: conv.id, startedAt: Date.now(), lastDeltaAt: Date.now() }
       set({
         messages: [
           ...get().messages,
           {
-            id: `local-${now}`,
+            id: localId,
             conversation_id: conv.id,
             role: 'user',
             content,
@@ -930,11 +1018,34 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     stopGeneration: async () => {
       const conv = get().currentConversation
       if (!conv) return
+      const cid = conv.id
       try {
-        await stopChatApi(conv.id)
+        await stopChatApi(cid)
       } catch {
         // 忽略：后端在安全点自行退出
       }
+      // 停止兜底：后端任务若已死（线程卡死、join 永不返回），invoke 永不 reject，
+      // 前端须在宽限期后自行释放流式桶，否则界面永久转圈且无法再发消息。
+      // 用代次 token（startedAt）校验：用户停止后若立即重新发送，新桶的 startedAt
+      // 不同，旧计时器不会误杀新任务。
+      const bucket = get().streamings[cid]
+      if (!bucket) return
+      const token = bucket.startedAt
+      const deadline = Date.now() + 60 * 1000
+      const timer = setInterval(() => {
+        const cur = get().streamings[cid]
+        if (!cur || cur.startedAt !== token) {
+          clearInterval(timer)
+          return
+        }
+        if (Date.now() >= deadline) {
+          clearInterval(timer)
+          setBucket(cid, {
+            ...emptyStreaming(),
+            error: '停止未生效：后端任务已无响应。请查看应用日志定位卡点，或重启应用后重试',
+          })
+        }
+      }, 10 * 1000)
     },
 
     /** 停止当前正在执行的工具：强杀子进程，模型拿到中断反馈后继续生成结论（不终止任务） */

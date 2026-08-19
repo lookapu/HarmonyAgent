@@ -17,6 +17,11 @@ default-run = "deveco-switch"
 #   默认不启用：裸 cargo 构建（如无 CUDA 的机器/CI）不会失败；macOS 无法编译 CUDA。
 [features]
 default = []
+# custom-protocol：Tauri release 构建嵌入前端资源必需。tauri-macros 的 generate_context!
+# 以 cfg!(feature="custom-protocol") 判定 dev 模式：未启用时嵌入空资源、运行时加载
+# devUrl(http://localhost:5173) → 双击 exe 报 "localhost 拒绝连接"。tauri CLI build 会
+# 自动附加该 feature，但裸 cargo build（build-quick.ps1）必须显式带上。
+custom-protocol = ["tauri/custom-protocol"]
 embedding = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:tokenizers"]
 cuda = ["embedding", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 # 数据抓取工具 full_fetch 的独立开关（见 [[bin]] required-features）

@@ -146,28 +146,31 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     }
     let approval = app.state::<ToolApprovalState>();
     let cancel = app.state::<ChatCancel>();
-    let (approved, feedback) = request_tool_approval(
-        app,
-        &approval,
-        &cancel,
-        conversation_id,
-        tool,
-        inv.args_raw,
-    )
-    .await
-    .map_err(|e| Intercept::new(InterceptKind::Generic, e))?;
-    if !approved {
-        // 拒绝理由（用户可附）反馈给模型，帮助其调整方案而非盲目重试
-        let reason = feedback
-            .filter(|f| !f.trim().is_empty())
-            .map(|f| format!("拒绝理由：{f}\n"))
-            .unwrap_or_default();
-        return Err(Intercept::new(
-            InterceptKind::Approval,
-            format!(
-                "用户拒绝了该工具调用（权限审核未通过）。{reason}请停止该工具调用，直接给出结论或替代建议"
-            ),
-        ));
+    match request_tool_approval(app, &approval, &cancel, conversation_id, tool, inv.args_raw)
+        .await
+    {
+        Ok(ApprovalOutcome::Approved) => {}
+        Ok(ApprovalOutcome::Rejected(feedback)) => {
+            // 拒绝理由（用户可附）反馈给模型，帮助其调整方案而非盲目重试
+            let reason = feedback
+                .filter(|f| !f.trim().is_empty())
+                .map(|f| format!("拒绝理由：{f}\n"))
+                .unwrap_or_default();
+            return Err(Intercept::new(
+                InterceptKind::Approval,
+                format!(
+                    "用户拒绝了该工具调用（权限审核未通过）。{reason}请停止该工具调用，直接给出结论或替代建议"
+                ),
+            ));
+        }
+        Ok(ApprovalOutcome::Cancelled) => {
+            // 用户在审批等待期间主动停止：按停止收尾（区别于拒绝，任务应终止）
+            return Err(Intercept::new(
+                InterceptKind::Cancelled,
+                "用户已停止生成".to_string(),
+            ));
+        }
+        Err(e) => return Err(Intercept::new(InterceptKind::Generic, e)),
     }
     // first_write 模式：用户确认首次写文件后，本任务后续写操作免审
     if approval_mode_str == "first_write" && is_write_tool {
@@ -276,6 +279,16 @@ pub(crate) fn is_cancelled(cancel: &ChatCancel, conversation_id: &str) -> bool {
 
 /// 等待用户审核（自动审核模式）：发事件给前端并等待确认；超时按拒绝处理。
 /// 命中会话级“始终允许”记忆直接放行。返回 (是否允许, 用户拒绝理由)。
+/// 工具审批等待结果
+pub(crate) enum ApprovalOutcome {
+    /// 用户/策略批准
+    Approved,
+    /// 用户拒绝（附理由）
+    Rejected(Option<String>),
+    /// 用户在等待期间主动停止生成
+    Cancelled,
+}
+
 pub(crate) async fn request_tool_approval(
     app: &AppHandle,
     state: &State<'_, ToolApprovalState>,
@@ -283,7 +296,7 @@ pub(crate) async fn request_tool_approval(
     conversation_id: &str,
     tool: &str,
     args: &str,
-) -> Result<(bool, Option<String>), String> {
+) -> Result<ApprovalOutcome, String> {
     // 会话级“始终允许此工具”记忆：本会话已勾选允许则直接放行，不再弹窗
     {
         let session_allowed = app
@@ -293,7 +306,7 @@ pub(crate) async fn request_tool_approval(
             .map(|m| m.contains(&(conversation_id.to_string(), tool.to_string())))
             .unwrap_or(false);
         if session_allowed {
-            return Ok((true, None));
+            return Ok(ApprovalOutcome::Approved);
         }
     }
     let request_id = Uuid::new_v4().to_string();
@@ -322,18 +335,19 @@ pub(crate) async fn request_tool_approval(
             r = &mut rx => {
                 let _ = state.0.lock().map(|mut m| m.remove(&request_id));
                 return match r {
-                    Ok((approved, feedback)) => Ok((approved, feedback)),
-                    Err(_) => Ok((false, None)),
+                    Ok((true, _feedback)) => Ok(ApprovalOutcome::Approved),
+                    Ok((false, feedback)) => Ok(ApprovalOutcome::Rejected(feedback)),
+                    Err(_) => Ok(ApprovalOutcome::Rejected(None)),
                 };
             }
             _ = tokio::time::sleep_until(deadline) => {
                 let _ = state.0.lock().map(|mut m| m.remove(&request_id));
-                return Ok((false, None));
+                return Ok(ApprovalOutcome::Rejected(None));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if is_cancelled(cancel, conversation_id) {
                     let _ = state.0.lock().map(|mut m| m.remove(&request_id));
-                    return Ok((false, Some("用户已停止生成".to_string())));
+                    return Ok(ApprovalOutcome::Cancelled);
                 }
             }
         }

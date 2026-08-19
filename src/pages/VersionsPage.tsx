@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { getCurrentVersion, listAvailableVersions, installVersion, type VersionInfo } from '../api/version'
 import { getSystemProxy } from '../api/update'
-
-const PROXY_KEY = 'deveco-switch-version-proxy'
+import { getItem, setItem } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
 export default function VersionsPage() {
   const { t } = useTranslation()
@@ -12,7 +12,7 @@ export default function VersionsPage() {
   const [loading, setLoading] = useState(false)
   const [installing, setInstalling] = useState<string | null>(null)
   // 走系统代理：默认开启，记住上次选择
-  const [useProxy, setUseProxy] = useState(() => localStorage.getItem(PROXY_KEY) !== '0')
+  const [useProxy, setUseProxy] = useState(() => getItem(STORAGE_KEYS.VERSION_PROXY) !== '0')
   const [systemProxy, setSystemProxy] = useState<string | null>(null)
   const [fetchError, setFetchError] = useState<string | null>(null)
 
@@ -51,7 +51,7 @@ export default function VersionsPage() {
 
   const handleToggleProxy = (checked: boolean) => {
     setUseProxy(checked)
-    localStorage.setItem(PROXY_KEY, checked ? '1' : '0')
+    setItem(STORAGE_KEYS.VERSION_PROXY, checked ? '1' : '0')
   }
 
   const handleInstall = async (version: string) => {

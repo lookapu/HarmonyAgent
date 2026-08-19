@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** 单个构建错误（结构化） */
 export interface AnalyzedBuildError {
@@ -69,15 +69,15 @@ export interface ProjectCapability {
 
 /** 解析最近一次构建日志的结构化错误列表 */
 export const analyzeBuildErrors = (projectPath: string) =>
-  invoke<AnalyzedBuildError[]>('analyze_build_errors', { projectPath })
+  invokeWithError<AnalyzedBuildError[]>('analyze_build_errors', { projectPath })
 
 /** 盘点工程能力（模块 / Kit 使用 / 权限 / 依赖 / 最近构建错误） */
 export const analyzeHarmonyProject = (projectPath: string) =>
-  invoke<ProjectCapability>('analyze_harmony_project', { projectPath })
+  invokeWithError<ProjectCapability>('analyze_harmony_project', { projectPath })
 
 /** 通用工程概览：识别非鸿蒙工程类型（Node/Go/Rust/Python/Java/C/C++/Flutter/.NET 等） */
 export const analyzeGenericProject = (projectPath: string) =>
-  invoke<string>('analyze_generic_project', { projectPath })
+  invokeWithError<string>('analyze_generic_project', { projectPath })
 
 /** ohpm 依赖版本核对：声明约束 vs 实际安装版本 */
 export interface OhpmDepCheck {
@@ -88,8 +88,8 @@ export interface OhpmDepCheck {
   module: string
 }
 export const checkOhpmDeps = (projectPath: string) =>
-  invoke<OhpmDepCheck[]>('check_ohpm_deps', { projectPath })
+  invokeWithError<OhpmDepCheck[]>('check_ohpm_deps', { projectPath })
 
 /** 在工程目录执行 ohpm install，返回过程日志 */
 export const runOhpmInstall = (projectPath: string) =>
-  invoke<string>('run_ohpm_install', { projectPath })
+  invokeWithError<string>('run_ohpm_install', { projectPath })

@@ -1,7 +1,7 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** 在当前项目根目录打开系统终端（cmd 窗口），供用户手动执行命令 */
-export const openTerminal = (projectPath: string) => invoke<void>('open_terminal', { projectPath })
+export const openTerminal = (projectPath: string) => invokeWithError<void>('open_terminal', { projectPath })
 
 /** 内置终端执行结果 */
 export interface TermResult {
@@ -18,10 +18,10 @@ export interface TermResult {
 }
 /** 在内置终端执行一条命令（cd 命令更新会话目录；上一条未结束时需先停止） */
 export const terminalExec = (projectId: string, projectPath: string, command: string) =>
-  invoke<TermResult>('terminal_exec', { projectId, projectPath, command })
+  invokeWithError<TermResult>('terminal_exec', { projectId, projectPath, command })
 /** 停止当前正在运行的终端命令 */
 export const terminalKill = (projectId: string) =>
-  invoke<void>('terminal_kill', { projectId })
+  invokeWithError<void>('terminal_kill', { projectId })
 /** 终端会话状态 */
 export const terminalStatus = (projectId: string, projectPath: string) =>
-  invoke<{ cwd: string; running: boolean }>('terminal_status', { projectId, projectPath })
+  invokeWithError<{ cwd: string; running: boolean }>('terminal_status', { projectId, projectPath })

@@ -1,5 +1,7 @@
 import { create } from 'zustand'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { getItem, setItem } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
 /** 主题：auto 跟随系统；dark/light 显式指定 */
 export type Theme = 'dark' | 'light' | 'auto'
@@ -33,20 +35,17 @@ const resolveTheme = (mode: Theme, last: ResolvedTheme): ResolvedTheme => {
 }
 
 const getInitialMode = (): Theme => {
-  const stored = localStorage.getItem('deveco-switch-theme')
+  const stored = getItem(STORAGE_KEYS.THEME)
   if (stored === 'dark' || stored === 'light' || stored === 'auto') return stored
   return 'auto'
 }
 
-const STORAGE_KEY = 'deveco-switch-theme'
-const LAST_RESOLVED_KEY = 'deveco-switch-theme-last'
-
 const apply = (mode: Theme) => {
-  const last = (localStorage.getItem(LAST_RESOLVED_KEY) as ResolvedTheme) || 'dark'
+  const last = (getItem(STORAGE_KEYS.THEME_LAST) as ResolvedTheme) || 'dark'
   const resolved = resolveTheme(mode, last)
   document.documentElement.setAttribute('data-theme', resolved)
-  localStorage.setItem(STORAGE_KEY, mode)
-  localStorage.setItem(LAST_RESOLVED_KEY, resolved)
+  setItem(STORAGE_KEYS.THEME, mode)
+  setItem(STORAGE_KEYS.THEME_LAST, resolved)
   syncWindowTheme(resolved)
   return resolved
 }
@@ -58,8 +57,8 @@ export const useThemeStore = create<ThemeStore>((set, get) => ({
     const cur = get().resolved
     const next: ResolvedTheme = cur === 'dark' ? 'light' : 'dark'
     document.documentElement.setAttribute('data-theme', next)
-    localStorage.setItem(STORAGE_KEY, next)
-    localStorage.setItem(LAST_RESOLVED_KEY, next)
+    setItem(STORAGE_KEYS.THEME, next)
+    setItem(STORAGE_KEYS.THEME_LAST, next)
     syncWindowTheme(next)
     set({ theme: next, resolved: next })
   },

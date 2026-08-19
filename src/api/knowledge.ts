@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 export interface KnowledgeEntry {
   id: string
@@ -23,17 +23,17 @@ export interface KnowledgeInput {
 }
 
 export const listKnowledge = (projectId: string | null) =>
-  invoke<KnowledgeEntry[]>('list_knowledge', { projectId: projectId ?? null })
+  invokeWithError<KnowledgeEntry[]>('list_knowledge', { projectId: projectId ?? null })
 export const addKnowledge = (input: KnowledgeInput, projectId: string | null) =>
-  invoke<KnowledgeEntry>('add_knowledge', { input, projectId: projectId ?? null })
+  invokeWithError<KnowledgeEntry>('add_knowledge', { input, projectId: projectId ?? null })
 export const updateKnowledge = (id: string, input: KnowledgeInput, projectId: string | null) =>
-  invoke<void>('update_knowledge', { id, input, projectId: projectId ?? null })
+  invokeWithError<void>('update_knowledge', { id, input, projectId: projectId ?? null })
 export const toggleKnowledge = (id: string, enabled: boolean, projectId: string | null) =>
-  invoke<void>('toggle_knowledge', { id, enabled, projectId: projectId ?? null })
+  invokeWithError<void>('toggle_knowledge', { id, enabled, projectId: projectId ?? null })
 export const deleteKnowledge = (id: string) =>
-  invoke<void>('delete_knowledge', { id })
+  invokeWithError<void>('delete_knowledge', { id })
 export const cloneKnowledge = (id: string, targetProjectId: string | null) =>
-  invoke<KnowledgeEntry>('clone_knowledge', { id, targetProjectId: targetProjectId ?? null })
+  invokeWithError<KnowledgeEntry>('clone_knowledge', { id, targetProjectId: targetProjectId ?? null })
 
 export interface SaveFromTextInput {
   title?: string
@@ -42,4 +42,4 @@ export interface SaveFromTextInput {
   cause?: string
 }
 export const saveKnowledgeFromText = (input: SaveFromTextInput, projectId: string | null) =>
-  invoke<KnowledgeEntry>('save_knowledge_from_text', { input, projectId: projectId ?? null })
+  invokeWithError<KnowledgeEntry>('save_knowledge_from_text', { input, projectId: projectId ?? null })

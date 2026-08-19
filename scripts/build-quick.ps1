@@ -5,7 +5,7 @@ DevEco Switch 快速构建脚本：按改动范围跳过不必要步骤，测试
 
 用法（在项目根目录执行 ./scripts/build-quick.ps1）：
   ./scripts/build-quick.ps1                 # 自动检测 git 改动范围，只构建涉及的部分（默认推荐）
-  ./scripts/build-quick.ps1 -Backend        # 只构建后端（cargo build --release --features embedding），前端复用现有 dist
+  ./scripts/build-quick.ps1 -Backend        # 只构建后端（cargo build --release --features embedding,custom-protocol），前端复用现有 dist
   ./scripts/build-quick.ps1 -Frontend       # 只构建前端 + 重新链接后端（嵌入新资源）
   ./scripts/build-quick.ps1 -SkipTsc        # 跳过 tsc 类型检查，仅 vite build（更快的 UI 调试循环）
   ./scripts/build-quick.ps1 -Nsis           # 构建后打 NSIS 安装包（发版用，等价完整 tauri build）
@@ -13,7 +13,10 @@ DevEco Switch 快速构建脚本：按改动范围跳过不必要步骤，测试
 
 说明：
 - 普通模式（无 -Nsis/-Full）只产出绿色版 exe，跳过 NSIS 打包（测试用绿色 exe 即可，省时）。
-- 后端命令带 --features embedding（与 tauri.conf.json build.features 一致），否则 embedding 功能缺失。
+- 后端命令带 --features embedding,custom-protocol（与 tauri.conf.json build.features 一致）：
+  embedding 提供本地语义向量；custom-protocol 是前端资源嵌入必需开关——tauri-macros 的
+  generate_context! 以 cfg!(feature="custom-protocol") 判定 dev 模式，未启用时嵌入空资源、
+  运行时改加载 devUrl(http://localhost:5173)，绿色版双击即报 "localhost 拒绝连接"。
 - ⚠️ 必须串行（前端 → 后端）：cargo build 的 build.rs 在编译早期把 ../dist 资源嵌入 exe，
   若与 vite build 并行（vite 启动会先清空 dist），嵌入的是不完整资源，exe 运行时报
   "localhost 拒绝连接"。前端改动后必须重新链接后端，exe 才会包含最新前端。
@@ -94,7 +97,7 @@ if (-not $failed -and $needBackend) {
     Remove-Item Env:CARGO_INCREMENTAL -ErrorAction SilentlyContinue
     Write-Host '==> 步骤 2/2：后端增量构建中（release incremental）...' -ForegroundColor Cyan
   }
-  $p = Start-Process -FilePath 'cargo' -ArgumentList 'build', '--release', '--features', 'embedding' `
+  $p = Start-Process -FilePath 'cargo' -ArgumentList 'build', '--release', '--features', 'embedding,custom-protocol' `
     -WorkingDirectory $tauriDir -RedirectStandardOutput $backLog -RedirectStandardError "$backLog.err" `
     -PassThru -WindowStyle Hidden
   Wait-Process -Id $p.Id

@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** SDK 单个组件（ets/native/js/toolchains/previewer） */
 export interface SdkComponent {
@@ -73,17 +73,17 @@ export interface ProjectSdkAlignment {
 
 /** 获取当前环境（持久化配置 + 自动探测，带缓存） */
 export function getHarmonyEnv(): Promise<HarmonyEnv> {
-  return invoke<HarmonyEnv>('get_harmony_env')
+  return invokeWithError<HarmonyEnv>('get_harmony_env')
 }
 
 /** 仅自动探测（忽略手动配置），用于展示"自动发现结果" */
 export function detectHarmonyEnv(): Promise<HarmonyEnv> {
-  return invoke<HarmonyEnv>('detect_harmony_env')
+  return invokeWithError<HarmonyEnv>('detect_harmony_env')
 }
 
 /** 保存手动指定的 SDK / command-line-tools 路径，返回最新环境 */
 export function saveHarmonyEnv(sdkRoot: string | null, cliRoot: string | null): Promise<HarmonyEnv> {
-  return invoke<HarmonyEnv>('save_harmony_env', {
+  return invokeWithError<HarmonyEnv>('save_harmony_env', {
     sdkRoot: sdkRoot || null,
     cliRoot: cliRoot || null,
   })
@@ -91,22 +91,22 @@ export function saveHarmonyEnv(sdkRoot: string | null, cliRoot: string | null): 
 
 /** 列出 SDK API 模块（可按 kit 过滤） */
 export function listSdkApiModules(kit?: string): Promise<ApiIndex> {
-  return invoke<ApiIndex>('list_sdk_api_modules', { kit: kit || null })
+  return invokeWithError<ApiIndex>('list_sdk_api_modules', { kit: kit || null })
 }
 
 /** 按关键字检索 SDK API 模块 */
 export function searchSdkApi(query: string, limit?: number): Promise<ApiModule[]> {
-  return invoke<ApiModule[]>('search_sdk_api', { query, limit: limit ?? null })
+  return invokeWithError<ApiModule[]>('search_sdk_api', { query, limit: limit ?? null })
 }
 
 /** 读取某个 API 模块的完整 .d.ts 声明 */
 export function readSdkApiModule(module: string): Promise<string> {
-  return invoke<string>('read_sdk_api_module', { module })
+  return invokeWithError<string>('read_sdk_api_module', { module })
 }
 
 /** 检查工程 compatibleSdkVersion 与已装 SDK 是否对齐 */
 export function checkProjectSdkAlignment(projectPath: string): Promise<ProjectSdkAlignment> {
-  return invoke<ProjectSdkAlignment>('check_project_sdk_alignment', { projectPath })
+  return invokeWithError<ProjectSdkAlignment>('check_project_sdk_alignment', { projectPath })
 }
 
 // ---------- OpenHarmony 文档本地镜像（替代需登录的华为文档站） ----------
@@ -127,22 +127,22 @@ export interface DocEntry {
 
 /** 查询本地文档库状态 */
 export function getHarmonyDocsStatus(): Promise<HarmonyDocsStatus> {
-  return invoke<HarmonyDocsStatus>('get_harmony_docs_status')
+  return invokeWithError<HarmonyDocsStatus>('get_harmony_docs_status')
 }
 
 /** 下载/更新 OpenHarmony 文档（耗时较长）；useProxy=true 时 git 走系统代理 */
 export function updateHarmonyDocs(preferGitee = true, useProxy = false): Promise<HarmonyDocsStatus> {
-  return invoke<HarmonyDocsStatus>('update_harmony_docs', { preferGitee, useProxy })
+  return invokeWithError<HarmonyDocsStatus>('update_harmony_docs', { preferGitee, useProxy })
 }
 
 /** 检索本地 OpenHarmony 文档 */
 export function searchHarmonyDocs(query: string, limit?: number): Promise<DocEntry[]> {
-  return invoke<DocEntry[]>('search_harmony_docs', { query, limit: limit ?? null })
+  return invokeWithError<DocEntry[]>('search_harmony_docs', { query, limit: limit ?? null })
 }
 
 /** 读取某篇文档完整 Markdown 原文 */
 export function readHarmonyDoc(relPath: string): Promise<string> {
-  return invoke<string>('read_harmony_doc', { relPath })
+  return invokeWithError<string>('read_harmony_doc', { relPath })
 }
 
 // ---------- ohpm 三方库推荐缓存（官方 landscape 镜像） ----------
@@ -195,41 +195,41 @@ export interface OhpmCategoryStat {
 
 /** 查询本地三方库推荐缓存状态 */
 export function getOhpmLandscapeStatus(): Promise<OhpmLandscapeStatus> {
-  return invoke<OhpmLandscapeStatus>('ohpm_landscape_status')
+  return invokeWithError<OhpmLandscapeStatus>('ohpm_landscape_status')
 }
 
 /** 拉取官方接口并全量刷新本地缓存 */
 export function refreshOhpmLandscape(): Promise<OhpmRefreshReport> {
-  return invoke<OhpmRefreshReport>('ohpm_landscape_refresh')
+  return invokeWithError<OhpmRefreshReport>('ohpm_landscape_refresh')
 }
 
 /** 关键词检索（包名/描述/关键词/作者/分类）；order 可选：likes/popularity/latest（默认下载量）；offset 用于分页 */
 export function searchOhpmLandscape(query: string, order?: string | null, limit?: number, offset?: number): Promise<OhpmPkg[]> {
-  return invoke<OhpmPkg[]>('ohpm_landscape_search', { query, order: order ?? null, limit: limit ?? null, offset: offset ?? null })
+  return invokeWithError<OhpmPkg[]>('ohpm_landscape_search', { query, order: order ?? null, limit: limit ?? null, offset: offset ?? null })
 }
 
 /** 热门推荐；order 可选：likes/popularity/latest（默认下载量）；offset 用于分页 */
 export function hotOhpmLandscape(order?: string | null, limit?: number, offset?: number): Promise<OhpmPkg[]> {
-  return invoke<OhpmPkg[]>('ohpm_landscape_hot', { order: order ?? null, limit: limit ?? null, offset: offset ?? null })
+  return invokeWithError<OhpmPkg[]>('ohpm_landscape_hot', { order: order ?? null, limit: limit ?? null, offset: offset ?? null })
 }
 
 /** 按分类取包（下载量排序）；level2 非空时进一步按二级分类过滤；order 可选：likes/popularity/latest；offset 用于分页 */
 export function byCategoryOhpmLandscape(category: string, level2?: string | null, order?: string | null, limit?: number, offset?: number): Promise<OhpmPkg[]> {
-  return invoke<OhpmPkg[]>('ohpm_landscape_by_category', { category, level2: level2 ?? null, order: order ?? null, limit: limit ?? null, offset: offset ?? null })
+  return invokeWithError<OhpmPkg[]>('ohpm_landscape_by_category', { category, level2: level2 ?? null, order: order ?? null, limit: limit ?? null, offset: offset ?? null })
 }
 
 /** 统计匹配包数（过滤条件与检索/分类一致），用于页码分页 */
 export function countOhpmLandscape(query?: string, category?: string | null, level2?: string | null): Promise<number> {
-  return invoke<number>('ohpm_landscape_count', { query: query ?? null, category: category ?? null, level2: level2 ?? null })
+  return invokeWithError<number>('ohpm_landscape_count', { query: query ?? null, category: category ?? null, level2: level2 ?? null })
 }
 
 /** 一二级分类树 */
 export function getOhpmLandscapeCategories(): Promise<{ categories: OhpmCategoryStat[] }> {
-  return invoke<{ categories: OhpmCategoryStat[] }>('ohpm_landscape_categories')
+  return invokeWithError<{ categories: OhpmCategoryStat[] }>('ohpm_landscape_categories')
 }
 
 /** 查询指定包的最新版元数据，返回仓库主页 URL（无仓库返回 null，由前端回退官网详情页） */
 export function getOhpmLandscapeRepoUrl(packageName: string): Promise<string | null> {
-  return invoke<string | null>('ohpm_landscape_repo_url', { packageName })
+  return invokeWithError<string | null>('ohpm_landscape_repo_url', { packageName })
 }
 

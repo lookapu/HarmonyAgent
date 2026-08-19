@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 export interface LocaleInfo {
   locale: string
@@ -6,11 +6,11 @@ export interface LocaleInfo {
 }
 
 export async function detectSystemLocale(): Promise<LocaleInfo> {
-  return invoke<LocaleInfo>('detect_system_locale')
+  return invokeWithError<LocaleInfo>('detect_system_locale')
 }
 
 export type NotifyKind = 'success' | 'error' | 'info'
 
 export async function sendNotification(title: string, body: string, kind: NotifyKind = 'info'): Promise<void> {
-  return invoke('send_notification', { title, body, kind })
+  return invokeWithError('send_notification', { title, body, kind })
 }

@@ -12,6 +12,7 @@ import { useThemeStore } from './stores/themeStore'
 import { detectSystemLocale } from './api/desktop'
 import { LANG_STORAGE_KEY } from './i18n'
 import { detectGpu, getTierClass } from './utils/gpuDetect'
+import { getItem, setItem } from './utils/storage'
 import Home from './pages/Home'
 import LanPage from './pages/LanPage'
 import ProvidersPage from './pages/ProvidersPage'
@@ -64,7 +65,7 @@ export default function App() {
 
   // 语言"跟随系统"：设置为 auto 时，启动后异步探测系统语言并应用
   useEffect(() => {
-    const saved = localStorage.getItem(LANG_STORAGE_KEY)
+    const saved = getItem(LANG_STORAGE_KEY)
     if (saved !== 'auto') {
       setSysTick((n) => n + 1)
       return
@@ -176,14 +177,14 @@ function AdminLayout() {
 
 function LangToggle() {
   const { i18n, t } = useTranslation()
-  const saved = localStorage.getItem(LANG_STORAGE_KEY)
+  const saved = getItem(LANG_STORAGE_KEY)
   const mode: 'auto' | 'zh' | 'en' = saved === 'auto' ? 'auto' : i18n.language === 'en' ? 'en' : 'zh'
 
   const cycle = async () => {
     // 中 → EN → 自动 → 中
     const nextMode = mode === 'zh' ? 'en' : mode === 'en' ? 'auto' : 'zh'
     if (nextMode === 'auto') {
-      localStorage.setItem(LANG_STORAGE_KEY, 'auto')
+      setItem(LANG_STORAGE_KEY, 'auto')
       try {
         const info = await detectSystemLocale()
         i18n.changeLanguage(info.is_zh ? 'zh' : 'en')
@@ -191,7 +192,7 @@ function LangToggle() {
         i18n.changeLanguage('zh')
       }
     } else {
-      localStorage.setItem(LANG_STORAGE_KEY, nextMode)
+      setItem(LANG_STORAGE_KEY, nextMode)
       i18n.changeLanguage(nextMode)
     }
   }

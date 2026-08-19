@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 export interface ProxyStatus {
   running: boolean
@@ -29,8 +29,8 @@ export interface ProxyConfigInfo {
   non_streaming_timeout_s: number
 }
 
-export const startProxy = () => invoke<void>('start_proxy')
-export const stopProxy = () => invoke<void>('stop_proxy')
-export const getProxyStatus = () => invoke<ProxyStatus>('get_proxy_status')
-export const getProxyConfig = () => invoke<ProxyConfigInfo>('get_proxy_config')
-export const updateProxyConfig = (config: ProxyConfigInput) => invoke<void>('update_proxy_config', { input: config })
+export const startProxy = () => invokeWithError<void>('start_proxy')
+export const stopProxy = () => invokeWithError<void>('stop_proxy')
+export const getProxyStatus = () => invokeWithError<ProxyStatus>('get_proxy_status')
+export const getProxyConfig = () => invokeWithError<ProxyConfigInfo>('get_proxy_config')
+export const updateProxyConfig = (config: ProxyConfigInput) => invokeWithError<void>('update_proxy_config', { input: config })

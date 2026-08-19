@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invokeWithError } from './invoke'
 
 /** 令牌元数据 */
 export interface LanTokenInfo {
@@ -36,15 +36,15 @@ export interface LanConfigInput {
   read_only?: boolean
 }
 
-export const startLanServer = () => invoke<void>('start_lan_server')
-export const stopLanServer = () => invoke<void>('stop_lan_server')
-export const getLanServerStatus = () => invoke<LanStatusInfo>('get_lan_server_status')
+export const startLanServer = () => invokeWithError<void>('start_lan_server')
+export const stopLanServer = () => invokeWithError<void>('stop_lan_server')
+export const getLanServerStatus = () => invokeWithError<LanStatusInfo>('get_lan_server_status')
 export const updateLanServerConfig = (input: LanConfigInput) =>
-  invoke<void>('update_lan_server_config', { input })
+  invokeWithError<void>('update_lan_server_config', { input })
 /** 创建令牌：name 备注名，expires_at 到期时间戳（0=永久）。返回 6 位明文，仅此一次 */
 export const createLanToken = (name: string, expiresAt: number) =>
-  invoke<string>('create_lan_token', { name, expiresAt })
-export const listLanTokens = () => invoke<LanTokenInfo[]>('list_lan_tokens')
+  invokeWithError<string>('create_lan_token', { name, expiresAt })
+export const listLanTokens = () => invokeWithError<LanTokenInfo[]>('list_lan_tokens')
 /** 撤销令牌：立即失效并断开其全部连接 */
-export const revokeLanToken = (id: number) => invoke<void>('revoke_lan_token', { id })
-export const getLanIps = () => invoke<string[]>('get_lan_ips')
+export const revokeLanToken = (id: number) => invokeWithError<void>('revoke_lan_token', { id })
+export const getLanIps = () => invokeWithError<string[]>('get_lan_ips')

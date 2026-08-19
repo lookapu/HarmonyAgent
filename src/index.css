@@ -844,10 +844,10 @@ button:focus-visible {
 
 /* ============ 思考过程折叠（推理模型 reasoning） ============ */
 .thinking-block {
-  margin: 0.4em 0 0.6em;
-  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
-  border-radius: 12px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--accent-soft) 60%, var(--bg-card)), var(--bg-card));
+  margin: 0.3em 0 0.5em;
+  border-left: 2px solid color-mix(in srgb, var(--text-muted) 30%, transparent);
+  border-radius: 0;
+  background: transparent;
   overflow: hidden;
 }
 .thinking-block-head {
@@ -855,31 +855,35 @@ button:focus-visible {
   display: flex;
   align-items: center;
   gap: 0.5em;
-  padding: 0.55em 0.85em;
+  padding: 0.3em 0.7em;
   cursor: pointer;
-  color: var(--text-secondary);
-  transition: background 0.15s;
+  color: var(--text-muted);
+  transition: color 0.15s;
   user-select: none;
 }
 .thinking-block-head:hover {
-  background: color-mix(in srgb, var(--accent-soft) 50%, transparent);
+  color: var(--text-secondary);
+  background: transparent;
 }
 .thinking-block-icon {
-  width: 18px;
-  height: 18px;
-  border-radius: 6px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, var(--accent), #8b5cf6);
-  color: #fff;
+  background: transparent;
+  color: var(--text-muted);
   flex-shrink: 0;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
-  animation: thinking-icon-glow 2s ease-in-out infinite;
+  box-shadow: none;
+  animation: none;
 }
 @keyframes thinking-icon-glow {
-  0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
-  50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 22%, transparent); }
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+.thinking-block:not(.open) .thinking-block-icon {
+  animation: thinking-icon-glow 2s ease-in-out infinite;
 }
 .thinking-block.open .thinking-block-icon {
   animation: none;
@@ -900,11 +904,12 @@ button:focus-visible {
   color: var(--text-muted);
 }
 .thinking-block-content {
-  padding: 0.4em 0.8em 0.8em;
-  border-top: 1px solid var(--border);
-  background: var(--bg-window);
+  padding: 0.2em 0.8em 0.6em;
+  border-top: none;
+  background: transparent;
   max-height: 360px;
   overflow-y: auto;
+  color: var(--text-secondary);
 }
 .md-body-sm {
   font-size: 0.78em;
@@ -1722,71 +1727,23 @@ button:focus-visible {
   border-color: color-mix(in srgb, var(--role-tool) 30%, var(--border));
 }
 
-/* 任务完成：左侧成功色竖条 + 抬升 + 短暂脉冲高亮（流式结束触发） */
-.task-complete {
-  position: relative;
-  padding: 0.65rem 1rem 0.65rem 1.1rem;
-  border-radius: var(--radius-lg);
-  border: 1px solid color-mix(in srgb, var(--success) 35%, var(--border));
-  background: var(--success-50);
-  box-shadow: var(--shadow-sm);
+/* 任务卡片（工具调用/子 Agent/计划步骤）—— 已改为极简纯文字行风格，
+   这些类名仅保留为空规则以兼容历史 class 引用，不再添加背景/边框/左侧竖条/阴影 */
+.task-complete,
+.task-progress,
+.task-failed {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
 }
-.task-complete::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0.5rem;
-  bottom: 0.5rem;
-  width: 3px;
-  border-radius: 2px;
-  background: var(--success);
-}
-@keyframes task-complete-pulse {
-  0% { box-shadow: 0 0 0 0 var(--success-100), var(--shadow-sm); }
-  50% { box-shadow: 0 0 0 6px transparent, var(--shadow-md); }
-  100% { box-shadow: 0 0 0 0 transparent, var(--shadow-sm); }
+.task-complete::before,
+.task-progress::before,
+.task-failed::before {
+  content: none;
 }
 .task-complete-pulse {
-  animation: task-complete-pulse 0.8s var(--ease-out) 1;
-}
-
-/* 任务进行中（淡黄色脉动） */
-.task-progress {
-  position: relative;
-  padding: 0.45rem 0.85rem 0.45rem 0.95rem;
-  border-radius: var(--radius-md);
-  border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border));
-  background: var(--warning-50);
-}
-.task-progress::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0.4rem;
-  bottom: 0.4rem;
-  width: 3px;
-  border-radius: 2px;
-  background: var(--warning);
-  animation: status-pulse 1.6s ease-out infinite;
-}
-
-/* 任务失败 */
-.task-failed {
-  position: relative;
-  padding: 0.45rem 0.85rem 0.45rem 0.95rem;
-  border-radius: var(--radius-md);
-  border: 1px solid color-mix(in srgb, var(--danger) 32%, var(--border));
-  background: var(--danger-50);
-}
-.task-failed::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0.4rem;
-  bottom: 0.4rem;
-  width: 3px;
-  border-radius: 2px;
-  background: var(--danger);
+  animation: none;
 }
 
 /* 上下文进度条：横在输入框上方，细 2px，按占比变色 */

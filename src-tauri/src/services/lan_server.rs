@@ -1202,7 +1202,8 @@ fn dispatch_api(
         }
         ("POST", ["api", "conversations", id, "stop"]) => {
             let cancel = app.state::<ChatCancel>();
-            cmd_response(chat::stop_chat(id.to_string(), cancel))
+            let registry = app.state::<crate::utils::task_registry::TaskRegistry>();
+            cmd_response(chat::stop_chat(id.to_string(), cancel, registry))
         }
         ("POST", ["api", "approvals", request_id]) => {
             dispatch_approval(app, request_id, body)
@@ -1241,7 +1242,7 @@ fn dispatch_api(
         }
         ("POST", ["api", "conversations", id, "delete"]) => {
             let st = app.state::<DbState>();
-            cmd_response(chat::delete_conversation(id.to_string(), st))
+            cmd_response(chat::delete_conversation_sync(id, &app, &st))
         }
 
         _ => err_response(StatusCode::NOT_FOUND, "not found"),

@@ -8,39 +8,31 @@
 // - 结构：Record<conversationId, { text, updatedAt }>
 // - 上限 4000 字（防止 localStorage 撑爆）
 import { create } from 'zustand'
+import { getJSON, setJSON } from '../utils/storage'
+import { STORAGE_KEYS } from '../constants'
 
-const STORAGE_KEY = 'deveco-switch-conv-notes'
 const MAX_LEN = 4000
 
 const loadFromStorage = (): Record<string, NoteEntry> => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return {}
-    const obj = JSON.parse(raw)
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {}
-    const out: Record<string, NoteEntry> = {}
-    for (const [k, v] of Object.entries(obj)) {
-      if (!v || typeof v !== 'object') continue
-      const r = v as { text?: unknown; updatedAt?: unknown }
-      if (typeof r.text === 'string') {
-        out[k] = {
-          text: r.text.slice(0, MAX_LEN),
-          updatedAt: typeof r.updatedAt === 'number' ? r.updatedAt : Date.now(),
-        }
+  const raw = getJSON<unknown>(STORAGE_KEYS.CONV_NOTES, null)
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const obj = raw as Record<string, { text?: unknown; updatedAt?: unknown }>
+  const out: Record<string, NoteEntry> = {}
+  for (const [k, v] of Object.entries(obj)) {
+    if (!v || typeof v !== 'object') continue
+    const r = v as { text?: unknown; updatedAt?: unknown }
+    if (typeof r.text === 'string') {
+      out[k] = {
+        text: r.text.slice(0, MAX_LEN),
+        updatedAt: typeof r.updatedAt === 'number' ? r.updatedAt : Date.now(),
       }
     }
-    return out
-  } catch {
-    return {}
   }
+  return out
 }
 
 const saveToStorage = (map: Record<string, NoteEntry>) => {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(map))
-  } catch {
-    // 满/禁用 → 静默
-  }
+  setJSON(STORAGE_KEYS.CONV_NOTES, map)
 }
 
 export interface NoteEntry {

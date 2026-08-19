@@ -1,5 +1,6 @@
 mod agent;
-mod commands;
+// pub：tauri 命令宏要求命令返回类型（如 chat::TaskLedger）在 crate 外可见
+pub mod commands;
 pub mod db;
 pub mod services;
 mod tray;
@@ -9,6 +10,7 @@ use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use commands::proxy::{ProxyLock, ProxyState};
 use commands::chat::{ChatCancel, ChatLock, ToolApprovalState};
+use utils::task_registry::TaskRegistry;
 use commands::lan::LanServerState;
 use services::proxy_service::{ProxyConfig, ProxyServer};
 
@@ -257,6 +259,8 @@ pub fn run() {
             app.manage(commands::chat::FirstWriteApprovedState::default());
             app.manage(commands::chat::DiagnoseCardState::default());
             app.manage(commands::chat::PlanApprovalState::default());
+            // 任务监管注册表：心跳 + 看门狗强杀（卡死/停止失效兜底）
+            app.manage(TaskRegistry::default());
             // MCP 连接管理器：按服务器缓存长驻子进程客户端（惰性连接，退出时统一清理）
             app.manage(services::mcp_manager::McpManager::default());
 
@@ -358,6 +362,7 @@ pub fn run() {
             commands::chat::resolve_plan_review,
             commands::chat::resolve_ask_user,
             commands::chat::get_todos,
+            commands::chat::get_task_ledger,
             commands::chat::get_ask,
             commands::chat::list_pending_confirmations,
             commands::chat::rename_conversation,
