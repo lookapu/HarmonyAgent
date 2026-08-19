@@ -5295,6 +5295,10 @@ async fn stream_once(
             // 避免纯心跳/空 data 行持续刷新导致永不超时（退回无限转圈的老 bug）。
             if last_progress_at > progress_before {
                 stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+                // 同步更新独立 OS 线程看门狗的"有效产出"时间戳。这是唯一不依赖
+                // tokio timer 的停滞判据：即便 worker 被同步代码钉死、上面的
+                // sleep_until 无法触发，看门狗也能在 60s 内强杀。
+                registry.touch_stream_progress(conversation_id);
             }
             // 总时长上限：即使体积/行数均未超限，同步解析累计超过阈值也强制中断
             // （防每行处理开销大的异常响应把线程拖垮），中断后可重试。
@@ -5386,6 +5390,8 @@ async fn stream_once(
                         first_byte_logged = true;
                         last_progress_at = tokio::time::Instant::now();
                         stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+                        // 初始化独立看门狗的流式进度基线（首字节即视为一次产出）
+                        registry.touch_stream_progress(conversation_id);
                         crate::utils::logger::log_event(
                             "stream_first_byte",
                             serde_json::json!({

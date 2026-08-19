@@ -28,10 +28,14 @@ pub const PHASE_TOOL: i64 = 6;
 /// 正常请求阶段每 200~300ms 有 PHASE_SEND/STREAMING 心跳，工具阶段有 PHASE_TOOL 心跳，
 /// 仅同步卡死/线程死锁才会持续无心跳，故比 10 分钟更早兜底）
 const TASK_STALL_MS: i64 = 480_000;
+/// 流式阶段无有效产出强杀阈值：60 秒。
+/// 流式读取期即使 tokio worker 被同步阻塞代码钉死（timer driver 停转、tokio::time 超时
+/// 全部失效），独立 OS 线程看门狗也能据此在 60s 内强杀，不再等满 8 分钟。
+const STREAM_STALL_MS: i64 = 60_000;
 /// 点停止后未生效强杀宽限：40 秒
 const STOP_GRACE_MS: i64 = 40_000;
 /// 看门狗扫描周期
-const SCAN_INTERVAL_SECS: u64 = 20;
+const SCAN_INTERVAL_SECS: u64 = 5;
 
 pub fn phase_name(p: i64) -> &'static str {
     match p {
@@ -57,6 +61,10 @@ pub struct TaskHandle {
     pub heartbeat_ms: AtomicI64,
     pub phase: AtomicI64,
     pub stop_requested_at: AtomicI64,
+    /// 流式阶段最近一次"有效产出"时间戳（正文/思考/工具增量/首字节/结束标记）。
+    /// 独立于 heartbeat_ms：心跳会被 200ms tick 刷新，但有效产出只在解析到真内容时更新，
+    /// 供独立 OS 线程看门狗判断流式是否真正停滞。0 表示尚未进入流式产出。
+    pub stream_progress_ms: AtomicI64,
     pub started_at: i64,
 }
 
@@ -75,6 +83,7 @@ impl TaskRegistry {
                     heartbeat_ms: AtomicI64::new(now),
                     phase: AtomicI64::new(PHASE_START),
                     stop_requested_at: AtomicI64::new(0),
+                    stream_progress_ms: AtomicI64::new(0),
                     started_at: now,
                 },
             );
@@ -94,6 +103,20 @@ impl TaskRegistry {
             if let Some(h) = m.get(conversation_id) {
                 h.heartbeat_ms.store(now_ms(), Ordering::Relaxed);
                 h.phase.store(phase, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// 流式有效产出打点：仅在解析到正文/思考/工具增量/首字节/结束标记时调用。
+    /// 独立 OS 线程看门狗据此判断流式是否真正停滞（不依赖 tokio timer，worker 被
+    /// 同步代码钉死时也能触发强杀）。
+    pub fn touch_stream_progress(&self, conversation_id: &str) {
+        if let Ok(m) = self.0.lock() {
+            if let Some(h) = m.get(conversation_id) {
+                let now = now_ms();
+                h.heartbeat_ms.store(now, Ordering::Relaxed);
+                h.stream_progress_ms.store(now, Ordering::Relaxed);
+                h.phase.store(PHASE_STREAMING, Ordering::Relaxed);
             }
         }
     }
@@ -156,6 +179,21 @@ fn watchdog_loop(app: AppHandle) {
                     let last = h.heartbeat_ms.load(Ordering::Relaxed);
                     let phase = h.phase.load(Ordering::Relaxed);
                     let stop_at = h.stop_requested_at.load(Ordering::Relaxed);
+                    // 流式阶段：以"有效产出时间戳"为基准，60s 无真内容即强杀。
+                    // 此检查跑在独立 OS 线程上，不依赖 tokio timer——即便 worker 被同步阻塞
+                    // 代码钉死、tokio::time 超时全部失效，这里仍能触发。
+                    if phase == PHASE_STREAMING {
+                        let prog = h.stream_progress_ms.load(Ordering::Relaxed);
+                        let base = if prog > 0 { prog } else { last };
+                        if now - base > STREAM_STALL_MS {
+                            to_kill.push((
+                                cid.clone(),
+                                "stream_no_progress".to_string(),
+                                now - h.started_at,
+                            ));
+                            continue;
+                        }
+                    }
                     if now - last > TASK_STALL_MS {
                         to_kill.push((
                             cid.clone(),
