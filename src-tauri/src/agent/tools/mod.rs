@@ -4914,7 +4914,7 @@ mod tests {
         let req = super::cmd_tools::CommandRequest::from_args(&serde_json::json!({"command":"git status","timeout":9999,"cwd":"sub"})).unwrap();
         let spec = req.resolve(&roots).unwrap();
          assert_eq!(spec.timeout, 300);
-         let root_c = std::path::PathBuf::from(crate::utils::path::normalize_path(&root.to_string_lossy()));
+         let root_c = std::fs::canonicalize(&root).unwrap();
          assert_eq!(spec.cwd, root_c.join("sub"));
         // cwd 不是目录 → 报错
         let req = super::cmd_tools::CommandRequest::from_args(&serde_json::json!({"command":"git status","cwd":"not_a_dir"})).unwrap();
@@ -4929,7 +4929,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "hello\nworld\n").unwrap();
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let roots = [root.to_string_lossy().to_string()];
-        let root_c = std::path::PathBuf::from(crate::utils::path::normalize_path(&root.to_string_lossy()));
+        let root_c = std::fs::canonicalize(&root).unwrap();
         // read：默认值（outline=false / start=1 / lines=0）+ 相对路径归一化
         let req = super::fs_tools::ReadFileRequest::from_args(&serde_json::json!({"path":"a.txt"})).unwrap();
         let spec = req.resolve(&roots).unwrap();
@@ -5193,7 +5193,7 @@ mod tests {
         assert!(p.is_absolute());
         // Windows 下分隔符可能混合（join 用 /，canonicalize 用 \），统一后再比较
         let norm = |s: &str| s.replace('/', "\\").to_lowercase();
-        let expected = root.join(sub);
+        let expected = std::fs::canonicalize(&root).unwrap().join(sub);
         assert_eq!(norm(&p.to_string_lossy()), norm(&expected.to_string_lossy()));
         // 已存在文件：两者结果一致
         let existing = root.join("README.md");

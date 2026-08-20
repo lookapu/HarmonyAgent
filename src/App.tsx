@@ -1,5 +1,5 @@
 import { Routes, Route, NavLink, useNavigate } from 'react-router-dom'
-import { useEffect, useLayoutEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import Icon, { type IconName } from './icons/Icon'
 import UpdateChecker from './components/UpdateChecker'
@@ -13,20 +13,23 @@ import { detectSystemLocale } from './api/desktop'
 import { LANG_STORAGE_KEY } from './i18n'
 import { detectGpu, getTierClass } from './utils/gpuDetect'
 import { getItem, setItem } from './utils/storage'
-import Home from './pages/Home'
-import LanPage from './pages/LanPage'
-import ProvidersPage from './pages/ProvidersPage'
-import VersionsPage from './pages/VersionsPage'
-import ConfigPage from './pages/ConfigPage'
-import LimitsPage from './pages/LimitsPage'
-import CostPage from './pages/CostPage'
-import McpPage from './pages/McpPage'
-import SkillsPage from './pages/SkillsPage'
-import KnowledgePage from './pages/KnowledgePage'
-import ApiKnowledgePage from './pages/ApiKnowledgePage'
-import HealthPage from './pages/HealthPage'
-import OhpmPage from './pages/OhpmPage'
-import ProxyPage from './pages/ProxyPage'
+
+// 页面级拆包：避免 Recharts、Markdown/KaTeX、设备诊断等全部阻塞首个可交互帧。
+// Tauri 资源来自本地，懒加载没有网络不确定性，只把 JS 解析/执行摊到实际进入页面时。
+const Home = lazy(() => import('./pages/Home'))
+const LanPage = lazy(() => import('./pages/LanPage'))
+const ProvidersPage = lazy(() => import('./pages/ProvidersPage'))
+const VersionsPage = lazy(() => import('./pages/VersionsPage'))
+const ConfigPage = lazy(() => import('./pages/ConfigPage'))
+const LimitsPage = lazy(() => import('./pages/LimitsPage'))
+const CostPage = lazy(() => import('./pages/CostPage'))
+const McpPage = lazy(() => import('./pages/McpPage'))
+const SkillsPage = lazy(() => import('./pages/SkillsPage'))
+const KnowledgePage = lazy(() => import('./pages/KnowledgePage'))
+const ApiKnowledgePage = lazy(() => import('./pages/ApiKnowledgePage'))
+const HealthPage = lazy(() => import('./pages/HealthPage'))
+const OhpmPage = lazy(() => import('./pages/OhpmPage'))
+const ProxyPage = lazy(() => import('./pages/ProxyPage'))
 
 const navItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/lan', labelKey: 'nav.lan', icon: 'devices' },
@@ -98,14 +101,24 @@ export default function App() {
   return (
     <div className="flex h-screen w-screen">
       <ErrorBoundary>
-        <Routes>
-          <Route path="/" element={<ErrorBoundary><Home /></ErrorBoundary>} />
-          <Route path="/*" element={<ErrorBoundary><AdminLayout /></ErrorBoundary>} />
-        </Routes>
+        <Suspense fallback={<PageFallback />}>
+          <Routes>
+            <Route path="/" element={<ErrorBoundary><Home /></ErrorBoundary>} />
+            <Route path="/*" element={<ErrorBoundary><AdminLayout /></ErrorBoundary>} />
+          </Routes>
+        </Suspense>
       </ErrorBoundary>
       <UpdateChecker />
       <DesktopNotifyToast />
       <PerfMonitor />
+    </div>
+  )
+}
+
+function PageFallback() {
+  return (
+    <div className="flex h-full w-full items-center justify-center bg-[var(--bg-primary)] text-[var(--text-secondary)]">
+      <span className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--border)] border-t-[var(--accent)]" />
     </div>
   )
 }
@@ -155,21 +168,23 @@ function AdminLayout() {
       </aside>
 
       <main className="flex-1 overflow-y-auto p-6">
-        <Routes>
-          <Route path="/lan" element={<LanPage />} />
-          <Route path="/providers" element={<ProvidersPage />} />
-          <Route path="/versions" element={<VersionsPage />} />
-          <Route path="/config" element={<ConfigPage />} />
-          <Route path="/limits" element={<LimitsPage />} />
-          <Route path="/cost" element={<CostPage />} />
-          <Route path="/proxy" element={<ProxyPage />} />
-          <Route path="/mcp" element={<McpPage />} />
-          <Route path="/skills" element={<SkillsPage />} />
-          <Route path="/knowledge" element={<KnowledgePage />} />
-          <Route path="/api-knowledge" element={<ApiKnowledgePage />} />
-          <Route path="/health" element={<HealthPage />} />
-          <Route path="/ohpm" element={<OhpmPage />} />
-        </Routes>
+        <Suspense fallback={<PageFallback />}>
+          <Routes>
+            <Route path="/lan" element={<LanPage />} />
+            <Route path="/providers" element={<ProvidersPage />} />
+            <Route path="/versions" element={<VersionsPage />} />
+            <Route path="/config" element={<ConfigPage />} />
+            <Route path="/limits" element={<LimitsPage />} />
+            <Route path="/cost" element={<CostPage />} />
+            <Route path="/proxy" element={<ProxyPage />} />
+            <Route path="/mcp" element={<McpPage />} />
+            <Route path="/skills" element={<SkillsPage />} />
+            <Route path="/knowledge" element={<KnowledgePage />} />
+            <Route path="/api-knowledge" element={<ApiKnowledgePage />} />
+            <Route path="/health" element={<HealthPage />} />
+            <Route path="/ohpm" element={<OhpmPage />} />
+          </Routes>
+        </Suspense>
       </main>
     </div>
   )

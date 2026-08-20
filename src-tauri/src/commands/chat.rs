@@ -1521,6 +1521,42 @@ pub struct ChatOptions {
 /// 流程：入库 user 消息 → 逐 delta 推送 `chat-stream` → 完成后入库 assistant 消息
 /// 并推送 `chat-done`（携带完整消息）；中途失败推送 `chat-error` 并返回结构化错误。
 /// 当前任务结束后自动续跑排队消息（流式运行时提交的普通排队消息依次处理）。
+struct RegisteredChatTask {
+    app: AppHandle,
+    conversation_id: String,
+    generation: u64,
+    abort: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl RegisteredChatTask {
+    fn finish(&mut self) {
+        self.app
+            .state::<TaskRegistry>()
+            .unregister(&self.conversation_id, self.generation);
+        self.armed = false;
+    }
+}
+
+impl Drop for RegisteredChatTask {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // WebView 重载/窗口销毁会取消 invoke Future。JoinHandle 被 drop 默认会让任务
+        // 脱离后台继续运行并永久占用 registry；这里同步 abort + 条件注销，避免幽灵任务
+        // 阻塞下一次发送。已入库的正文占位仍可由“继续任务”恢复。
+        self.abort.abort();
+        self.app
+            .state::<TaskRegistry>()
+            .unregister(&self.conversation_id, self.generation);
+        crate::utils::logger::log_event(
+            "task_invoke_dropped",
+            serde_json::json!({ "conversation_id": &self.conversation_id }),
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn stream_chat(
     app: AppHandle,
@@ -1577,19 +1613,27 @@ pub async fn stream_chat(
         )
         .await
     });
+    let abort_handle = join.abort_handle();
     let generation = {
         let registry = app.state::<TaskRegistry>();
-        let Some(generation) = registry.register(&conversation_id, join.abort_handle()) else {
+        let Some(generation) = registry.register(&conversation_id, abort_handle.clone()) else {
             join.abort();
             return Err("该会话已有任务进行中，请等待完成或停止后重试".to_string());
         };
         TaskRegistry::ensure_watchdog(app.clone());
         generation
     };
+    let mut registered = RegisteredChatTask {
+        app: app.clone(),
+        conversation_id: conversation_id.clone(),
+        generation,
+        abort: abort_handle,
+        armed: true,
+    };
     // 登记成功后才放行；接收端若已异常退出，join 会返回实际错误。
     let _ = start_tx.send(());
     let result = join.await;
-    app.state::<TaskRegistry>().unregister(&conversation_id, generation);
+    registered.finish();
     match result {
         Ok(r) => r,
         Err(e) if e.is_cancelled() => {

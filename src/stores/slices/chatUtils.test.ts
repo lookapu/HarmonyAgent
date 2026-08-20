@@ -8,6 +8,7 @@ import {
   acceptsRunEvent,
   firstRunningIndex,
   reconcileRunUserMessage,
+  upsertMessageById,
 } from './chatUtils'
 import type { ChatMessage } from '../../api/project'
 
@@ -57,6 +58,15 @@ describe('stream lifecycle reconciliation', () => {
       { tool: 'read_file', status: 'running' },
     ]
     expect(firstRunningIndex(entries, (entry) => entry.tool === 'read_file')).toBe(0)
+  })
+
+  it('最终消息按数据库 ID 替换占位项且不会重复追加', () => {
+    const placeholder = { ...msg('assistant', 'partial'), id: 'assistant-1', duration_ms: null }
+    const done = { ...msg('assistant', 'complete'), id: 'assistant-1', duration_ms: 1200 }
+    const next = upsertMessageById([placeholder], done)
+    expect(next).toHaveLength(1)
+    expect(next[0]).toEqual(done)
+    expect(upsertMessageById([], done)).toEqual([done])
   })
 })
 

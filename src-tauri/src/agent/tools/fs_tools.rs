@@ -2612,9 +2612,15 @@ fn check_nested_module_path(p: &Path, roots: &[String]) -> Result<(), String> {
     // Windows canonicalize 会带 \\?\ verbatim 前缀，strip_prefix 前统一去前缀
     let p_clean = PathBuf::from(crate::utils::path::normalize_path(&p.to_string_lossy()));
     for r in roots {
-        let rc_raw = std::fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r));
-        let rc = PathBuf::from(crate::utils::path::normalize_path(&rc_raw.to_string_lossy()));
-        if let Ok(rel) = p_clean.strip_prefix(&rc) {
+        // macOS 的 /var 与 /private/var、Windows 的 verbatim 前缀都可能让“同一路径”
+        // 出现两种文本形式。原始根与规范根都检查，防止尚不存在的待写路径绕过检测。
+        let raw_root = PathBuf::from(r);
+        let canonical_root = std::fs::canonicalize(&raw_root).unwrap_or_else(|_| raw_root.clone());
+        for root in [raw_root, canonical_root] {
+            let rc = PathBuf::from(crate::utils::path::normalize_path(&root.to_string_lossy()));
+            let Ok(rel) = p_clean.strip_prefix(&rc) else {
+                continue;
+            };
             let segs: Vec<String> = rel
                 .components()
                 .filter_map(|c| match c {
@@ -4519,4 +4525,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-

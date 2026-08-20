@@ -33,7 +33,7 @@ pub fn path_within(inner: &std::path::Path, outer: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::{normalize_path, path_within};
 

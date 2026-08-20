@@ -35,6 +35,14 @@ export function reconcileRunUserMessage(
   return messages.map((m, i) => (i === localIdx ? { ...m, id: userMessageId } : m))
 }
 
+/** 最终消息按数据库 ID 幂等收敛。WebView 重载后历史里可能已经含占位消息，
+ * chat-done 必须替换该项而非再次追加，否则界面会出现两条相同回复。 */
+export function upsertMessageById(messages: ChatMessage[], message: ChatMessage): ChatMessage[] {
+  const index = messages.findIndex((item) => item.id === message.id)
+  if (index < 0) return [...messages, message]
+  return messages.map((item, i) => (i === index ? message : item))
+}
+
 /** 一次完成事件只收敛一个运行项；同名工具并发时不能批量结束全部卡片。 */
 export function firstRunningIndex<T extends { status: string }>(entries: T[], matches: (entry: T) => boolean): number {
   return entries.findIndex((entry) => entry.status === 'running' && matches(entry))

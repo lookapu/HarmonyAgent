@@ -38,6 +38,7 @@ const EVENT_WHITELIST: &[&str] = &[
     "chat-stream-batch",
     "chat-reasoning",
     "chat-run-started",
+    "chat-heartbeat",
     "chat-done",
     "chat-error",
     "chat-stopped",

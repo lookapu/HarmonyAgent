@@ -41,6 +41,10 @@ const STOP_GRACE_MS: i64 = 40_000;
 /// 看门狗扫描周期
 const SCAN_INTERVAL_SECS: u64 = 5;
 
+fn is_resume_gap(scan_gap_ms: i64) -> bool {
+    scan_gap_ms > (SCAN_INTERVAL_SECS as i64 * 4 * 1000)
+}
+
 pub fn phase_name(p: i64) -> &'static str {
     match p {
         PHASE_START => "start",
@@ -227,18 +231,50 @@ impl TaskRegistry {
 }
 
 fn watchdog_loop(app: AppHandle) {
+    let mut last_scan_ms = now_ms();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(SCAN_INTERVAL_SECS));
         let registry = app.state::<TaskRegistry>();
         let now = now_ms();
+        let scan_gap_ms = now.saturating_sub(last_scan_ms);
+        last_scan_ms = now;
+        // Windows 现代待机/macOS 睡眠期间 wall clock 会继续前进，但任务线程、网络和
+        // 看门狗都被冻结。唤醒后的第一次扫描若直接比较 wall clock，会把所有健康任务
+        // 误判成 8 分钟卡死。检测到扫描间隔异常时给活跃任务一次完整宽限再继续巡检。
+        if is_resume_gap(scan_gap_ms) {
+            if let Ok(m) = registry.0.lock() {
+                for h in m.values() {
+                    h.heartbeat_ms.store(now, Ordering::Relaxed);
+                    if h.stream_data_ms.load(Ordering::Relaxed) > 0 {
+                        h.stream_data_ms.store(now, Ordering::Relaxed);
+                    }
+                    if h.stream_progress_ms.load(Ordering::Relaxed) > 0 {
+                        h.stream_progress_ms.store(now, Ordering::Relaxed);
+                    }
+                }
+            }
+            crate::utils::logger::log_event(
+                "watchdog_resume_grace",
+                serde_json::json!({ "scan_gap_ms": scan_gap_ms }),
+            );
+            continue;
+        }
         // 收集待杀任务（先快照后杀，避免遍历中修改）
         let mut to_kill: Vec<(String, String, i64)> = Vec::new();
+        let mut heartbeats: Vec<(String, String, i64, i64, u64)> = Vec::new();
         {
             if let Ok(m) = registry.0.lock() {
                 for (cid, h) in m.iter() {
                     let last = h.heartbeat_ms.load(Ordering::Relaxed);
                     let phase = h.phase.load(Ordering::Relaxed);
                     let stop_at = h.stop_requested_at.load(Ordering::Relaxed);
+                    let run_id = h
+                        .run_id
+                        .lock()
+                        .ok()
+                        .and_then(|id| id.clone())
+                        .unwrap_or_default();
+                    heartbeats.push((cid.clone(), run_id, phase, h.started_at, h.generation));
                     // 流式阶段：以“数据到达时间戳”为基准，60s 无任何数据即强杀。
                     // 判据是数据而非产出：模型输出大/长响应时解析可能长时间无产出，
                     // 但只要数据仍在到达就说明流存活，不应强杀；数据完全停滞
@@ -271,6 +307,30 @@ fn watchdog_loop(app: AppHandle) {
                     }
                 }
             }
+        }
+        // 心跳既刷新桌面端前端活性，也让 WebView2/WKWebView 重载后能自动重新挂接
+        // 仍在运行的 Rust 任务。事件很小且 5 秒一次，不携带正文。
+        for (cid, run_id, phase, started_at, generation) in heartbeats {
+            // 快照后任务可能已完成或因 WebView 重载被 RAII 注销；再次核对代次，
+            // 禁止把最后一帧过期心跳投递给新前端并复活已结束任务。
+            let still_active = registry
+                .0
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&cid).map(|h| h.generation == generation))
+                .unwrap_or(false);
+            if !still_active {
+                continue;
+            }
+            let _ = app.emit(
+                "chat-heartbeat",
+                serde_json::json!({
+                    "conversation_id": cid,
+                    "run_id": run_id,
+                    "phase": phase_name(phase),
+                    "started_at": started_at,
+                }),
+            );
         }
         for (cid, reason, elapsed_ms) in to_kill {
             let task = if let Ok(mut m) = registry.0.lock() {
@@ -373,5 +433,13 @@ mod tests {
         registry.unregister("conv-run", generation);
         assert_eq!(registry.run_id("conv-run"), "");
         task.abort();
+    }
+
+    #[test]
+    fn grants_grace_after_system_sleep_but_not_normal_jitter() {
+        assert!(!is_resume_gap(5_000));
+        assert!(!is_resume_gap(20_000));
+        assert!(is_resume_gap(90_000));
+        assert!(is_resume_gap(8 * 60 * 1000));
     }
 }

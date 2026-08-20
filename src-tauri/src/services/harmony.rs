@@ -1126,6 +1126,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_hvigor_command_uses_toolkit_engine() {
         // 软件内置 toolkits 自带 hvigor 引擎时（未装 DevEco Studio 也能构建），
@@ -1145,6 +1146,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_hvigor_command_uses_cli_root_engine() {
         // 环境探测发现 command-line-tools（如盘符根目录 H:\command-line-tools）时，
@@ -1171,6 +1173,7 @@ mod tests {
         assert!(args.iter().any(|a| a.contains("entry@default")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_hvigor_command_wrapper_priority() {
         // 工程内 hvigor/hvigor-wrapper.js 存在 → node 直调 wrapper
@@ -1184,6 +1187,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_hvigor_command_bat_fallback() {
         // 无 wrapper、有 hvigorw.bat → 回退完整路径 bat

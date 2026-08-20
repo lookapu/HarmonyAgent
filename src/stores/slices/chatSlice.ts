@@ -34,7 +34,7 @@ import {
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger } from '../../api/project'
 import type { StateCreator } from 'zustand'
 import type { ChatSlice, DiagnoseCard, ProjectState, StreamingState } from '../projectStoreTypes'
-import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage } from './chatUtils'
+import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, upsertMessageById } from './chatUtils'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
@@ -60,6 +60,9 @@ const STREAM_WATCHDOG_MS = 4 * 60 * 1000
 /** 已有内容/思考的桶放宽阈值：后端 60s 静默判死+主循环续写会刷新 lastDeltaAt，
  * 8 分钟无事件必为后端 join 永不返回（invoke 永不 reject），前端必须自行释放 */
 const STREAM_WATCHDOG_LONG_MS = 8 * 60 * 1000
+/** 定时器自身停顿超过该值通常意味着系统休眠或 WebView 被操作系统冻结。 */
+const WATCHDOG_RESUME_GAP_MS = 90 * 1000
+let lastWatchdogSweepAt = Date.now()
 
 // Agent 工具 / 子 Agent 事件自增序号（模块级）
 let toolSeq = 0
@@ -80,6 +83,16 @@ const MAX_PENDING_LOG_LINES = 4000
 const sendTraces = new Map<string, ReturnType<typeof startPerfTrace>>()
 /** 普通发送的乐观 user 占位；终态用真实 DB id 精确替换，不能误改随后排队的 local 消息。 */
 const optimisticRunUserIds = new Map<string, string>()
+/** 最近终态代次墓碑：拦截监管线程/IPC 队列在 done/error/stopped 后迟到的 started/heartbeat。 */
+const terminalRunIds = new Map<string, string>()
+
+const markRunTerminal = (conversationId: string, runId?: string) => {
+  if (!runId) return
+  terminalRunIds.set(conversationId, runId)
+  setTimeout(() => {
+    if (terminalRunIds.get(conversationId) === runId) terminalRunIds.delete(conversationId)
+  }, 60 * 1000)
+}
 
 /** 空流式状态 */
 const emptyStreaming = (): StreamingState => ({
@@ -224,6 +237,28 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
    */
   setInterval(() => {
     const s = get()
+    const now = Date.now()
+    const sweepGap = now - lastWatchdogSweepAt
+    lastWatchdogSweepAt = now
+    // 系统休眠/窗口冻结期间 Date.now 继续前进，恢复后不能把所有任务立刻判死。
+    // 后端独立看门狗会继续做权威判断；前端仅重置展示层活性宽限。
+    if (sweepGap > WATCHDOG_RESUME_GAP_MS) {
+      set((current) => {
+        const streamings = Object.fromEntries(
+          Object.entries(current.streamings).map(([id, bucket]) => [
+            id,
+            bucket.error ? bucket : { ...bucket, lastDeltaAt: now },
+          ]),
+        )
+        return {
+          streamings,
+          streaming: current.currentConversation
+            ? streamings[current.currentConversation.id] ?? emptyStreaming()
+            : emptyStreaming(),
+        }
+      })
+      return
+    }
     for (const [convId, bucket] of Object.entries(s.streamings)) {
       if (bucket.error) continue
       const ref = bucket.lastDeltaAt ?? bucket.startedAt
@@ -232,7 +267,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       // 必为后端 join 永不返回（invoke 永不 reject，前端永久转圈），须放宽阈值兜底释放；
       // 无内容桶保持 4 分钟（首字节前的卡死更早暴露）
       const threshold = bucket.content || bucket.reasoning ? STREAM_WATCHDOG_LONG_MS : STREAM_WATCHDOG_MS
-      if (Date.now() - ref < threshold) continue
+      if (now - ref < threshold) continue
       // 工具执行中（含后台会话）：后端仍在工作
       if (bucket.toolRunning > 0) continue
       const isCurrent = s.currentConversation?.id === convId
@@ -274,6 +309,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   // ---------- 流式事件监听（全局一次性注册） ----------
   listen<{ conversation_id: string; run_id: string }>('chat-run-started', (event) => {
     const { conversation_id, run_id } = event.payload
+    if (terminalRunIds.get(conversation_id) === run_id) return
+    // 不同代次是真正的新任务，旧墓碑不应阻挡。
+    terminalRunIds.delete(conversation_id)
     const bucket = get().streamings[conversation_id]
     if (bucket) {
       // 活跃桶已有代次时，延迟/重复的 started 不能接管当前运行。
@@ -306,6 +344,30 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         lastTaskSummary: null,
       })
     }
+  }).catch(() => {})
+
+  // 后端监管线程每 5 秒发一次轻量心跳：刷新前端看门狗，并让 WebView 重载后
+  // 自动重建活跃桶继续接收后续增量/终态，不要求用户重启或手动“继续任务”。
+  listen<{ conversation_id: string; run_id?: string; phase: string; started_at: number }>('chat-heartbeat', (event) => {
+    const { conversation_id, run_id, started_at } = event.payload
+    if (run_id && terminalRunIds.get(conversation_id) === run_id) return
+    const bucket = get().streamings[conversation_id]
+    if (bucket?.runId && run_id && bucket.runId !== run_id) return
+    if (bucket) {
+      setBucket(conversation_id, {
+        runId: run_id || bucket.runId,
+        error: null,
+        errorDetail: null,
+      })
+      return
+    }
+    setBucket(conversation_id, {
+      ...emptyStreaming(),
+      conversationId: conversation_id,
+      runId: run_id || null,
+      startedAt: started_at || Date.now(),
+      lastDeltaAt: Date.now(),
+    })
   }).catch(() => {})
 
   // 增量写入分桶（不要求是当前会话）：用户切走再切回，流式内容不丢
@@ -356,6 +418,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   listen<{ conversation_id: string; run_id?: string; message: ChatMessage; unfinished: boolean; user_message_id?: string | null }>('chat-done', (event) => {
     const { conversation_id, run_id, message, unfinished, user_message_id } = event.payload
     if (!acceptsRun(conversation_id, run_id)) return
+    markRunTerminal(conversation_id, run_id)
     flushStreamDeltas(conversation_id)
     const state = get()
     // 分桶清理无条件执行（后台会话结束也释放流式槽位）；视图状态仅当前会话更新
@@ -394,7 +457,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       }
       optimisticRunUserIds.delete(conversation_id)
       set({
-        messages: [...nextMessages, message],
+        messages: upsertMessageById(nextMessages, message),
         // 完成后保留过程记录：顶部"已处理 N 个操作"徽章可展开回看（新任务/切会话时清空）
         lastTaskSummary: {
           status: unfinished ? 'incomplete' : 'completed',
@@ -493,6 +556,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     (event) => {
       const { conversation_id, run_id, error, kind, title, reason, suggestion, retryable, status_code } = event.payload
       if (!acceptsRun(conversation_id, run_id)) return
+      markRunTerminal(conversation_id, run_id)
       flushStreamDeltas(conversation_id)
       const state = get()
       const bucket = state.streamings[conversation_id]
@@ -537,6 +601,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   listen<{ conversation_id: string; run_id?: string; unfinished: boolean; user_message_id?: string | null }>('chat-stopped', (event) => {
     const { conversation_id, run_id, unfinished, user_message_id } = event.payload
     if (!acceptsRun(conversation_id, run_id)) return
+    markRunTerminal(conversation_id, run_id)
     flushStreamDeltas(conversation_id)
     const state = get()
     const bucket = state.streamings[conversation_id]
@@ -1194,7 +1259,19 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       }
 
       // 分页加载：只取最近一页，向上滚动时再按游标加载更早历史，避免长会话全量加载渲染
-      const page = await listMessagesPage(id)
+      let page
+      try {
+        page = await listMessagesPage(id)
+      } catch {
+        // 平滑切换会暂留上一会话消息，但加载失败后继续显示会造成严重的会话错觉。
+        // 失败时清空旧内容，等待用户重试打开；不能把 A 会话内容挂在 B 会话标题下。
+        if (openSeq === openConversationSeq && get().currentConversation?.id === id) {
+          set({ messages: [], olderHasMore: false })
+        }
+        trace.mark('messages-error')
+        trace.end()
+        return
+      }
       trace.mark('messages-loaded')
       // 竞态保护：期间用户可能已切到其他会话，过期结果直接丢弃，
       // 否则旧会话消息/反馈/版本会覆盖新会话（快速连续切换时必现）
@@ -1347,6 +1424,22 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         // 看门狗报错后用户可能已立即重试；旧 invoke 的延迟 reject 不得覆盖新任务桶。
         if (get().streamings[conv.id]?.startedAt === fresh.startedAt) {
           setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
+          // invoke 可能在 user 入库前失败，也可能在入库后模型请求失败。以数据库为
+          // 真源刷新最近一页，既移除幽灵乐观消息，也保留已真实入库的用户请求。
+          const page = await listMessagesPage(conv.id).catch(() => null)
+          if (page && get().currentConversation?.id === conv.id) {
+            const pendingQueued = get().messages.filter(
+              (message) => message.queued === 1 && message.id.startsWith('local-'),
+            )
+            const persistedIds = new Set(page.messages.map((message) => message.id))
+            set({
+              messages: [
+                ...page.messages,
+                ...pendingQueued.filter((message) => !persistedIds.has(message.id)),
+              ],
+              olderHasMore: page.hasMore,
+            })
+          }
         }
       }
     },
@@ -1529,7 +1622,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       const lastUser = messageId
         ? all.find((m) => m.id === messageId && m.role === 'user')
         : [...all].reverse().find((m) => m.role === 'user')
-      if (!lastUser) return
+      if (!lastUser) {
+        sendTraces.delete(conv.id)
+        sendTrace.mark('no-user-message')
+        sendTrace.end()
+        return
+      }
       const fresh: StreamingState = { ...emptyStreaming(), conversationId: conv.id, startedAt: Date.now(), lastDeltaAt: Date.now() }
       set({
         streamings: { ...get().streamings, [conv.id]: fresh },

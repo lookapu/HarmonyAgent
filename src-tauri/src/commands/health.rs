@@ -640,6 +640,9 @@ fn check_project_structure(root: &std::path::Path, display_path: &str) -> Toolch
             }
         }
     }
+    // read_dir 顺序由文件系统决定，Windows/macOS 上都不稳定。固定排序可避免
+    // 健康检查重复刷新时项目列表跳动，也让前端缓存与测试结果保持确定性。
+    projects.sort_unstable();
     if !projects.is_empty() {
         let total = projects.len();
         let shown: Vec<String> = projects.into_iter().take(8).collect();
