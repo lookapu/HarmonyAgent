@@ -1102,6 +1102,32 @@ const MAX_INTERRUPT_RETRY_ROUNDS: usize = 3;
 /// 用冻结请求原样重发（对齐 DeepSeek-Reasonix 冻结请求重放机制：模型无需重新思考、
 /// prompt 缓存不失效）；连续 5 次 0 产出中断多为本地网络故障，超过后走下方续写收尾
 const MAX_STREAM_REPLAYS: usize = 5;
+/// 累计响应字节上限（仅异常无限流兜底；正常任务百倍裕量）
+const STREAM_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// 单行字节上限（覆盖超大 JSON 工具参数；超限行跳过解析防烧 CPU）
+const STREAM_MAX_LINE: usize = 4 * 1024 * 1024;
+/// 每批最大处理行数（批间让出执行权/检查预算）
+const STREAM_YIELD_LINES: usize = 512;
+/// 单轮流式累计处理时长（超过仅记录日志，不中断：大输出/长响应是正常行为）
+const STREAM_PARSE_MAX_SECS: u64 = 120;
+/// 解析线程单批时间预算（毫秒）：保险丝——任何输入最多连续解析该时长即暂停等下一块，
+/// 同步死循环无法被 abort 中断，预算机制保证线程空烧被限制在可接受范围
+const STREAM_PARSE_BATCH_BUDGET_MS: u128 = 2000;
+/// 行缓冲上限（字节）：模型吐无换行残片时 buffer 无限膨胀导致每次 find('\n') 全量扫描
+/// 呈 O(n²) 烧 CPU（保险丝管不住单次扫描内部），超限截断丢弃最旧部分保解析线程活性
+const STREAM_BUFFER_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 投递等待上限（轮数×200ms=5s）：解析线程被病态输入拖住时通道打满，主循环
+/// 无限等待会钉死事件转发/停滞判定/停止响应（保险丝在解析线程内不影响投递侧），
+/// 超限丢弃该块保主循环活性（事件推送优先于不丢字节）
+const STREAM_DELIVER_MAX_WAITS: u32 = 25;
+/// reasoning 增量合并阈值（字节）：解析线程缓冲到该量才发一条事件。病态流逐条
+/// 推送会导致前端思考区每行重渲染 + 后端 IPC 堆积（实测 4096 条事件 renderer 烧满核），
+/// 合并后事件量降两个数量级；块边界强制 flush 保证正常流显示延迟 <100ms
+const STREAM_REASONING_MERGE_BYTES: usize = 2048;
+/// reasoning-only 护栏：纯思考流（无正文产出）最长允许时长。正常深度思考 <3 分钟；
+/// 超过视为病态（模型只吐思考不吐正文，停滞线被 Reasoning 持续刷新而永不触发），
+/// 中断后由自动续写接管。正文 Delta 出现后按正常停滞线继续
+const REASONING_ONLY_GRACE_SECS: u64 = 180;
 /// 工具循环检测阈值（对齐 qwen-code LoopDetectionService 轻量版）：
 /// - 连续相同调用（同工具名+同参数）达到该次数即判定打转——重复调用必得相同结果，
 ///   低于 DashScope 服务端 "Repetitive tool calls detected" 阈值，客户端先断循环防服务端 400；
@@ -4043,7 +4069,7 @@ async fn stream_chat_inner(
         // 正文即时入库：每轮累积后同步占位消息（防“最后一次入库”丢正文）——
         // 本任务任一轮正文已可见；任务中断后占位消息保留部分内容，前端识别后可继续生成
         upsert_placeholder_message(
-            &state,
+            &state.0,
             &conversation_id,
             &model_choice.model,
             &mut placeholder_msg_id,
@@ -5147,7 +5173,7 @@ fn persist_tool_run_immediate(
 /// 正常结束时 persist_turn 用最终内容 UPDATE 同一消息补全；任务中断（应用退出/崩溃/
 /// 看门狗强杀）时已生成部分保留在库中，前端据此识别“回复被中断”并提示一键继续生成。
 fn upsert_placeholder_message(
-    state: &tauri::State<'_, DbState>,
+    state: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
     conversation_id: &str,
     model: &str,
     placeholder: &mut Option<String>,
@@ -5162,7 +5188,7 @@ fn upsert_placeholder_message(
     } else {
         Some(reasoning.to_string())
     };
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let conn = state.lock().map_err(|e| e.to_string())?;
     match placeholder {
         Some(id) => {
             // 已存在：更新为最新累计正文（幂等，崩溃后保留最近一次快照）
@@ -6042,284 +6068,115 @@ async fn stream_once(
         });
     }
 
-    // 逐块解析 SSE，推送增量；同时检测结束/截断标记
-    let mut full = String::new();
-    let mut reasoning_full = String::new();
-    // 行缓冲用原始字节累积：网络 chunk 边界可能切在多字节 UTF-8 字符中间，
-    // 若逐 chunk 解码会产生 U+FFFD 替换符并永久写入消息，必须整行拼好后再统一解码。
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut usage_chunks: Vec<String> = Vec::new(); // 收集含 usage 的块（成本统计）
+    // ── 流式解析移入独立 OS 线程（worker 隔离 + 时间预算保险丝）────────────────
+    // 原同步解析循环（serde_json 解析/增量提取/占位落库/录制缓冲）整体搬入
+    // stream_parse_thread：tokio worker 只做“读块→投递”与“收事件→推送”两个轻量动作，
+    // 任何病态输入最坏烧满解析线程 1 核，worker/timer/停止/看门狗全部不受影响
+    // （同步死循环无法被 abort 中断，线程化后不再钉死调度器）；解析线程内置每批
+    // 时间预算保险丝 STREAM_PARSE_BATCH_BUDGET_MS，同步死循环的空烧被限制在预算内。
+    // 块通道有界（256 块，背压：解析慢时投递 await，期间仍可响应停止），事件无界。
+    // 通道元素用 reqwest 的 Bytes（零拷贝：网络块直接进通道，不再转 Vec<u8>）。
+    struct StreamOnceTrace<'a> {
+        conversation_id: &'a str,
+    }
+    impl Drop for StreamOnceTrace<'_> {
+        fn drop(&mut self) {
+            crate::utils::logger::log_event(
+                "stream_once_dropped",
+                serde_json::json!({
+                    "conversation_id": self.conversation_id,
+                    "tid": format!("{:?}", std::thread::current().id()),
+                }),
+            );
+        }
+    }
+    let _trace = StreamOnceTrace { conversation_id };
+    crate::utils::logger::log_event(
+        "stream_once_enter",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "tid": format!("{:?}", std::thread::current().id()),
+        }),
+    );
+    let mut tick_count: u64 = 0;
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<StreamParserEvent>();
+    let parse_state = state.0.clone();
+    let parse_placeholder = placeholder.clone();
+    let parse_conv = conversation_id.to_string();
+    let parse_model = model_choice.model.clone();
+    let parse_protocol = protocol.to_string();
+    let parse_rec_enabled = replay_key.is_some();
+    crate::utils::logger::log_event(
+        "stream_parse_spawned",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "caller_tid": format!("{:?}", std::thread::current().id()),
+        }),
+    );
+    std::thread::spawn(move || {
+        stream_parse_thread(
+            chunk_rx,
+            event_tx,
+            parse_state,
+            parse_conv,
+            parse_model,
+            parse_protocol,
+            parse_placeholder,
+            parse_rec_enabled,
+        );
+    });
+
+    let mut stream = resp.bytes_stream();
     let mut finished = false; // 收到正常结束标记（finish_reason / [DONE] / message_stop）
     let mut truncated = false; // 收到 length / max_tokens 截断标记
-    // 原生 function calling 累积：按 index 合并 name（覆盖）与 arguments（拼接）
-    let mut native_tool_calls: Vec<(usize, String, String)> = Vec::new();
-    let mut stream = resp.bytes_stream();
+    let mut stalled = false; // wall-clock 停滞 deadline 命中（无有效产出）
+    // 解析线程最终产物（Done 事件）：收尾组装 outcome 用
+    let mut done: Option<StreamParserEvent> = None;
+    // 保留本地 run_id 隔离与 Rust 侧 32ms/8KB IPC 合批，避免前端事件洪峰。
     let mut event_batcher = StreamEventBatcher::new(
         app,
         conversation_id,
         stats.run_id.clone().unwrap_or_default(),
     );
-    // 录制缓冲（Record 模式）：原始 SSE 块逐字节收集，正常结束后落盘
-    let mut rec_buf: Option<Vec<u8>> = replay_key.as_ref().map(|_| Vec::new());
-    // 正文增量落库水位：full/reasoning 累计超过阈值即同步占位消息。
-    // 看门狗 abort 直接取消任务、主循环收尾不会执行，流循环内定期落库是
-    // 强杀/崩溃前唯一能保住已产出内容的路径；阈值防每次 delta 都触发 DB 写
-    let mut persist_watermark = 0usize;
-    let mut reasoning_watermark = 0usize;
+    // 主循环已交付快照供解析线程异常/超时收尾使用，禁止已显示内容被空值覆盖。
+    let mut delivered_content = String::new();
+    let mut delivered_reasoning = String::new();
     // 等待网络块期间也要能响应停止：每 200ms 轮询一次取消标志。
-    // 原实现只在收到下一个 chunk 后检查，模型长时间不吐块（思考中/网络静默）时
-    // 点击“停止生成”要等下一个块到达才生效，表现为停止不响应。
+    // 模型长时间不吐块（思考中/网络静默）时点击“停止生成”也能在 200ms 内生效。
     // 同时记录最近收包时间：连接悬挂（无任何字节）超过阈值时判死退出，
     // 否则表现为“思考完不吐字、无限转圈”且无提示。
     let mut last_chunk_at = tokio::time::Instant::now();
-    // 最近“有效产出”时间：仅在收到首字节或解析出正文/思考/工具增量/结束标记时刷新。
-    // 不能用 last_chunk_at 判断停滞——服务商常在模型卡住时持续发送 SSE 心跳
-    // （: keep-alive / 空 data 行），这些字节会刷新收包时间，导致静默超时永不触发，
-    // 表现为“首字节后无限转圈、既不结束也不报错”。
-    let mut last_progress_at = tokio::time::Instant::now();
     // 首字节打点：报告从 stream_send_begin 到收到首个网络块的耗时（连接建立/TLS/代理慢）
     let mut first_byte_logged = false;
-    // 同步行解析防护：每批最多处理 STREAM_YIELD_LINES 行就让出控制权，批间 touch 心跳、
-    // 检查停止、记录进度——否则海量行响应会把线程拖进无心跳的长时间同步处理
-    // （曾实测：单轮异常响应 → 同步解析 13 分钟无心跳，看门狗 8 分钟误杀，abort 因
-    // 同步循环无法中断，线程继续空烧约 5 分钟才自行结束）。
-    // 体量类上限仅防异常无限流兜底：正常大输出/长响应（体积、时长、单行）不强制关闭，
-    // 停滞由看门狗“数据到达”判据与下方 STREAM_SILENT_TIMEOUT 负责。
-    const STREAM_MAX_BYTES: usize = 256 * 1024 * 1024; // 累计响应字节上限（256MB，仅异常无限流兜底；正常任务百倍裕量）
-    const STREAM_MAX_LINE: usize = 4 * 1024 * 1024; // 单行字节上限（4MB，覆盖超大 JSON 工具参数；超限行跳过解析防烧 CPU）
-    const STREAM_YIELD_LINES: usize = 512; // 每批最大处理行数
-    const STREAM_PARSE_MAX_SECS: u64 = 120; // 单轮流式累计处理时长（超过仅记录日志，不中断：大输出/长响应是正常行为）
     let mut total_bytes: usize = 0;
-    let mut lines_parsed: usize = 0;
-    let parse_started = tokio::time::Instant::now();
     // 停滞 wall-clock deadline：独立于流读取 future 计时。即便 stream.next()
     // 在某些挂起连接上不响应取消/不被唤醒（实测会导致内部 200ms 轮询与 reqwest
     // 120s 总超时双双失效、8 分钟后才被看门狗杀），select! 也会在此 deadline
     // 到达时强制跳出。每收到有效产出就重置。
     let mut stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+    // reasoning-only 护栏基线：首个 Reasoning 事件时间。纯思考流停滞线最多顺延到
+    // 该基线 + REASONING_ONLY_GRACE_SECS，防止模型只吐思考不吐正文时无限转圈
+    let mut first_reasoning_at: Option<tokio::time::Instant> = None;
     'outer: loop {
-        // ── 优先消化缓冲行（分批，批间让出）────────────────────────────
-        // 同步解析期间不 await：必须分批让出，否则海量行响应长时间无心跳
-        // （看门狗误杀）且 abort/停止均无法中断同步循环。
-        if !buffer.is_empty() {
-            let mut consumed = 0;
-            let mut batch = 0;
-            let progress_before = last_progress_at;
-            while batch < STREAM_YIELD_LINES {
-                // 每 64 行让出一次执行权：批处理是纯同步循环，若整批无 yield，看门狗
-                // abort 只能在下个 await 点生效，异常巨大响应会把线程钉死数分钟满核空烧。
-                // 被 abort 的任务在下一次 poll 直接终止，无需显式检查取消。
-                if batch % 64 == 0 {
-                    tokio::task::yield_now().await;
-                }
-                let Some(pos) = buffer[consumed..].iter().position(|b| *b == b'\n') else {
-                    break; // 尾部残片（无换行），留待后续 chunk 合并后再处理
-                };
-                batch += 1;
-                lines_parsed += 1;
-                let line = String::from_utf8_lossy(&buffer[consumed..consumed + pos]);
-                let line = line.trim();
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data == "[DONE]" {
-                        buffer.clear();
-                        finished = true;
-                        break 'outer;
-                    }
-                    // 单行超限：跳过解析（防超大 JSON 行解析烧 CPU），仅记录
-                    if data.len() > STREAM_MAX_LINE {
-                        crate::utils::logger::log_event(
-                            "stream_line_skipped",
-                            serde_json::json!({
-                                "conversation_id": conversation_id,
-                                "line_bytes": data.len(),
-                            }),
-                        );
-                        consumed += pos + 1;
-                        continue;
-                    }
-                    // Usage 通常只在流首尾出现。保留开头 8 条和最近 56 条，避免
-                    // 长回答为成本统计额外复制全部 SSE JSON，造成线性内存膨胀。
-                    retain_usage_chunk(&mut usage_chunks, data);
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(delta) = crate::utils::net::extract_stream_delta(protocol, &json) {
-                            if !delta.is_empty() {
-                                full.push_str(&delta);
-                                last_progress_at = tokio::time::Instant::now();
-                                event_batcher.push_content(&delta);
-                            }
-                        }
-                        // 思考过程增量（推理模型）：单独事件推送 + 聚合入库
-                        if let Some(r) = crate::utils::net::extract_reasoning_delta(protocol, &json) {
-                            if !r.is_empty() {
-                                reasoning_full.push_str(&r);
-                                last_progress_at = tokio::time::Instant::now();
-                                event_batcher.push_reasoning(&r);
-                            }
-                        }
-                        // 原生 function calling 增量（OpenAI 兼容协议流式 tool_calls）：按 index 合并
-                        if let Some((idx, name, args)) = crate::utils::net::extract_tool_call_delta(&json) {
-                            last_progress_at = tokio::time::Instant::now();
-                            match native_tool_calls.iter_mut().find(|(i, _, _)| *i == idx) {
-                                Some((_, n, a)) => {
-                                    if let Some(nm) = name {
-                                        n.push_str(&nm);
-                                    }
-                                    if let Some(ar) = args {
-                                        a.push_str(&ar);
-                                    }
-                                }
-                                None => native_tool_calls
-                                    .push((idx, name.unwrap_or_default(), args.unwrap_or_default())),
-                            }
-                        }
-                        match detect_finish(protocol, &json) {
-                            FinishKind::Done => {
-                                finished = true;
-                                last_progress_at = tokio::time::Instant::now();
-                            }
-                            FinishKind::Truncated => {
-                                truncated = true;
-                                finished = true;
-                                last_progress_at = tokio::time::Instant::now();
-                            }
-                            FinishKind::None => {}
-                        }
-                    }
-                }
-                consumed += pos + 1;
-            }
-            // 已消费的行一次性移除（游标式解析：避免原实现每行 drain 整体前移，
-            // 海量行时总拷贝量 O(n²) 成为长同步处理的主要耗时）
-            buffer.drain(..consumed);
-            registry.touch(conversation_id, PHASE_STREAMING);
-            // 正文增量落库：产出每累计 ~8KB 同步一次占位消息（duration_ms=NULL 标记未完成）。
-            // 看门狗强杀/崩溃无法执行主循环收尾时，此处保住已产出内容（abort 在下一个
-            // await 点生效，同步落库能在取消前完成）；622KB 约 76 次 UPDATE，毫秒级无感。
-            if full.len() - persist_watermark >= 8192 || reasoning_full.len() - reasoning_watermark >= 8192
-            {
-                persist_watermark = full.len();
-                reasoning_watermark = reasoning_full.len();
-                if let Err(e) = upsert_placeholder_message(
-                    state,
-                    conversation_id,
-                    &model_choice.model,
-                    placeholder,
-                    &full,
-                    &reasoning_full,
-                ) {
-                    crate::utils::logger::log_event(
-                        "stream_persist_error",
-                        serde_json::json!({
-                            "conversation_id": conversation_id,
-                            "error": e,
-                        }),
-                    );
-                }
-            }
-            // 仅当本批解析出有效产出（正文/思考/工具增量/结束标记）时才重置停滞 deadline，
-            // 避免纯心跳/空 data 行持续刷新导致永不超时（退回无限转圈的老 bug）。
-            if last_progress_at > progress_before {
-                stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
-                // 有效产出时间戳仅作排障信息；独立 OS 线程看门狗改用“数据到达”
-                // 时间戳（touch_stream_data）判停滞——大输出解析期间即使长时间无产出，
-                // 只要数据仍在到达就不强杀，避免大响应被误判为无产出而强关。
-                registry.touch_stream_progress(conversation_id);
-            }
-            // 累计处理时长超过阈值仅记录日志（供排障），不中断：模型输出大/长响应时
-            // 解析耗时超过阈值是正常现象，强制中断会丢失已收内容；异常无限流由
-            // 看门狗“数据停滞”与下方 select! 停滞 deadline 兜底。
-            if parse_started.elapsed().as_secs() > STREAM_PARSE_MAX_SECS {
-                crate::utils::logger::log_event(
-                    "stream_parse_slow",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "lines_parsed": lines_parsed,
-                        "total_bytes": total_bytes,
-                        "elapsed_secs": parse_started.elapsed().as_secs(),
-                        "note": "large_output_not_closed",
-                    }),
-                );
-            }
-            // 进度日志：每 4096 行记录一次，异常巨大响应时留下可定位证据
-            if lines_parsed % (STREAM_YIELD_LINES * 8) == 0 {
-                crate::utils::logger::log_event(
-                    "stream_parse_progress",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "lines_parsed": lines_parsed,
-                        "total_bytes": total_bytes,
-                        "buffer_pending": buffer.len(),
-                        "produced_chars": full.len(),
-                        // 数据形态样本：首批 data 行与已产出尾部。零产出（produced_chars=0）
-                        // 时据此区分“格式不识别”（head 非空但字段没提取到）与“纯心跳/空行”。
-                        "head_chunk": usage_chunks.first().map(|s| s.chars().take(200).collect::<String>()),
-                        "tail_produced": full.chars().rev().take(200).collect::<String>(),
-                    }),
-                );
-            }
-            if is_cancelled(cancel, conversation_id) {
-                crate::utils::logger::log_event(
-                    "stop_effective",
-                    serde_json::json!({
-                        "phase": "stream_line_batch",
-                        "conversation_id": conversation_id,
-                        "chars": full.chars().count(),
-                    }),
-                );
-                return Ok(StreamOutcome {
-                    text: full,
-                    reasoning: reasoning_full,
-                    stopped: true,
-                    truncated: false,
-                    interrupted: false,
-                    usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-                    tool_calls: Vec::new(),
-                });
-            }
-            if batch == STREAM_YIELD_LINES {
-                // 批间让出执行权：缓冲持续有货时此分支是纯同步循环，不经下方 select!
-                // 的 await 点，必须显式 yield 才能让停止/abort/看门狗强杀生效
-                tokio::task::yield_now().await;
-                continue; // 缓冲还有完整行：立即处理下一批，不等待网络
-            }
-        }
-        // ── 停止检查（停滞硬截止由下方 select! 的 sleep_until 权威处理）──────
-        // 注意：不能只靠 elapsed 判断——若代码卡在 stream.next().await 内部
-        // （挂起连接上 future 不被唤醒），根本到不了这里。wall-clock deadline
-        // 独立于流 future 计时，是真正可靠的兜底。
+        // ── 停止检查：任何等待前先看是否已点停止 ────────────────────────
         registry.touch(conversation_id, PHASE_STREAMING);
         if is_cancelled(cancel, conversation_id) {
             crate::utils::logger::log_event(
                 "stop_effective",
                 serde_json::json!({
-                    "phase": "stream_pre_poll",
+                    "phase": "stream_worker_poll",
                     "conversation_id": conversation_id,
-                    "chars": full.chars().count(),
                 }),
             );
-            return Ok(StreamOutcome {
-                text: full,
-                reasoning: reasoning_full,
-                stopped: true,
-                truncated: false,
-                interrupted: false,
-                usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-                tool_calls: Vec::new(),
-            });
+            break 'outer;
         }
-        // ── 等待网络块：select! 三路竞速 ──────────────────────────────
-        // 1) stream.next()     收到数据
-        // 2) 200ms tick        轮询停止标志（让点击停止 200ms 内生效）
-        // 3) stall_deadline    wall-clock 停滞硬截止（60s 无有效产出），
-        //    独立于 reqest 流：即便 stream.next() 在挂起连接上不被唤醒，
-        //    tokio::time::sleep 也会触发，彻底避免无限转圈
-        let chunk = tokio::select! {
+        tokio::select! {
+            // 1) stream.next() 收到网络数据 → 投递解析线程
             c = stream.next() => match c {
                 Some(Ok(bytes)) => {
                     if !first_byte_logged {
                         first_byte_logged = true;
-                        last_progress_at = tokio::time::Instant::now();
                         stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
                         // 首字节即视为一次数据到达+有效产出：初始化看门狗的流式
                         // 判据基线（数据到达），并保留产出基线供排障日志。
@@ -6338,7 +6195,29 @@ async fn stream_once(
                     // 看门狗以它为停滞判据：大输出/长响应传输中数据持续到达，
                     // 即使长时间无解析产出也不会被强杀；数据停滞才触发兜底。
                     registry.touch_stream_data(conversation_id);
-                    Some(bytes)
+                    total_bytes += bytes.len();
+                    // 响应体积超限：立即中断报错（可重试），防止异常巨大流持续烧资源
+                    if total_bytes > STREAM_MAX_BYTES {
+                        crate::utils::logger::log_event(
+                            "stream_too_large",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "total_bytes": total_bytes,
+                                "max_bytes": STREAM_MAX_BYTES,
+                            }),
+                        );
+                        return Err(FriendlyError::new(
+                            ErrorKind::Network,
+                            format!(
+                                "流式响应体积超限(>{:.1}MB)，已中断防止持续卡死",
+                                STREAM_MAX_BYTES as f64 / 1024.0 / 1024.0
+                            ),
+                        ));
+                    }
+                    // 投递解析线程：有界通道背压下等待，期间每 200ms 检查停止（不丢字节）
+                    if !deliver_chunk(&chunk_tx, bytes, cancel, conversation_id).await {
+                        break 'outer; // 解析线程已退出（异常）：流继续读无意义
+                    }
                 }
                 Some(Err(e)) => {
                     // 错误链展开：reqwest 外层错误往往只是 "error decoding response body"，
@@ -6358,7 +6237,6 @@ async fn stream_once(
                             "error": error_chain,
                             "bytes_received": total_bytes,
                             "ms_since_last_chunk": last_chunk_at.elapsed().as_millis() as i64,
-                            "produced_chars": full.chars().count(),
                             "headers": stream_headers,
                         }),
                     );
@@ -6367,9 +6245,85 @@ async fn stream_once(
                         format!("读取响应失败: {e}"),
                     ));
                 }
-                None => None,
+                None => break 'outer,
             },
+            // 2) 解析线程回传事件：增量透传前端 + 刷新产出打点
+            ev = event_rx.recv() => {
+                let Some(ev) = ev else { break 'outer }; // 解析线程已退出且未发 Done（极端）
+                match ev {
+                    StreamParserEvent::Delta(delta) => {
+                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+                        // 正文到达后退出 pure-reasoning 模式，恢复普通静默超时语义。
+                        first_reasoning_at = None;
+                        registry.touch_stream_progress(conversation_id);
+                        delivered_content.push_str(&delta);
+                        event_batcher.push_content(&delta);
+                    }
+                    StreamParserEvent::Reasoning(r) => {
+                        registry.touch_stream_progress(conversation_id);
+                        // reasoning-only 护栏：停滞线最多顺延到首次思考 + 宽限期，
+                        // 之后即使 reasoning 持续到达也强制判死（正文 Delta 恢复常规刷新）
+                        if first_reasoning_at.is_none() {
+                            first_reasoning_at = Some(tokio::time::Instant::now());
+                        }
+                        let now = tokio::time::Instant::now();
+                        let grace_end = first_reasoning_at.unwrap()
+                            + tokio::time::Duration::from_secs(REASONING_ONLY_GRACE_SECS);
+                        // 持续 reasoning 可推进静默线，但绝不能越过首次思考后的硬上限。
+                        stall_deadline = std::cmp::min(now + STREAM_SILENT_TIMEOUT, grace_end);
+                        delivered_reasoning.push_str(&r);
+                        event_batcher.push_reasoning(&r);
+                    }
+                    StreamParserEvent::ToolCall => {
+                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+                        first_reasoning_at = None;
+                        registry.touch_stream_progress(conversation_id);
+                    }
+                    StreamParserEvent::Finish { truncated: t } => {
+                        finished = true;
+                        truncated = t;
+                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+                        registry.touch_stream_progress(conversation_id);
+                    }
+                    StreamParserEvent::PersistWatermark { placeholder: p } => {
+                        // 解析线程已把占位消息落库：同步 id，收尾 persist_turn 沿用同一条
+                        *placeholder = p;
+                    }
+                    StreamParserEvent::Done { .. } => {
+                        done = Some(ev);
+                        break 'outer;
+                    }
+                }
+            },
+            // 3) 200ms tick：轮询停止（点击停止 200ms 内生效）+ 心跳
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                tick_count += 1;
+                // 停滞兜底双保险：事件洪峰长期压制 sleep_until 分支调度时，tick 仍按
+                // 200ms 粒度 wall-clock 判死（不依赖 select! 分支公平性）
+                if tokio::time::Instant::now() >= stall_deadline {
+                    stalled = true;
+                    crate::utils::logger::log_event(
+                        "stream_silent_dead",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "after_first_byte": first_byte_logged,
+                            "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
+                            "via": "tick_backstop",
+                        }),
+                    );
+                    break 'outer;
+                }
+                if tick_count % 50 == 0 {
+                    // 诊断心跳：每 10s 自报存活 + 所在线程，区分主循环卡死/正常轮询
+                    crate::utils::logger::log_event(
+                        "stream_loop_alive",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "tid": format!("{:?}", std::thread::current().id()),
+                            "tick": tick_count,
+                        }),
+                    );
+                }
                 registry.touch(conversation_id, PHASE_STREAMING);
                 // Provider 暂停发送时也及时交付尾部小批次；最大感知延迟 200ms。
                 event_batcher.flush();
@@ -6379,95 +6333,75 @@ async fn stream_once(
                         serde_json::json!({
                             "phase": "stream_poll_tick",
                             "conversation_id": conversation_id,
-                            "chars": full.chars().count(),
                         }),
                     );
-                    return Ok(StreamOutcome {
-                        text: full,
-                        reasoning: reasoning_full,
-                        stopped: true,
-                        truncated: false,
-                        interrupted: false,
-                        usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-                        tool_calls: Vec::new(),
-                    });
+                    break 'outer;
                 }
-                continue;
             }
+            // 4) 停滞 wall-clock 硬截止（60s 无有效产出）：独立于 reqwest 流，
+            //    即便 stream.next() 在挂起连接上不被唤醒，tokio::time::sleep 也会
+            //    触发，彻底避免无限转圈。与旧实现直接返回不同：统一 break 走收尾，
+            //    取回解析线程 flush 后的产物（半截正文保留给续写，不丢内容）。
             _ = tokio::time::sleep_until(stall_deadline) => {
+                stalled = true;
                 crate::utils::logger::log_event(
                     "stream_silent_dead",
                     serde_json::json!({
                         "conversation_id": conversation_id,
-                        "chars": full.chars().count(),
                         "after_first_byte": first_byte_logged,
                         "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
                         "via": "wall_clock_deadline",
                     }),
                 );
-                return Ok(StreamOutcome {
-                    text: full,
-                    reasoning: reasoning_full,
-                    stopped: false,
-                    truncated: false,
-                    interrupted: true,
-                    usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-                    tool_calls: Vec::new(),
-                });
+                break 'outer;
             }
         };
-        let Some(chunk) = chunk else { break 'outer };
-        total_bytes += chunk.len();
-        // 响应体积超限：立即中断报错（可重试），防止异常巨大流持续烧资源
-        if total_bytes > STREAM_MAX_BYTES {
-            let head = String::from_utf8_lossy(&buffer[..buffer.len().min(500)]).to_string();
-            crate::utils::logger::log_event(
-                "stream_too_large",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "total_bytes": total_bytes,
-                    "lines_parsed": lines_parsed,
-                    "max_bytes": STREAM_MAX_BYTES,
-                    "head": head,
-                }),
-            );
-            return Err(FriendlyError::new(
-                ErrorKind::Network,
-                format!(
-                    "流式响应体积超限(>{:.1}MB)，已中断防止持续卡死",
-                    STREAM_MAX_BYTES as f64 / 1024.0 / 1024.0
-                ),
-            ));
-        }
-        // 用户停止：立即退出，返回已收到的部分内容（块到达路径的快速检查，无需等下一轮询）
-        registry.touch(conversation_id, PHASE_STREAMING);
-        if is_cancelled(cancel, conversation_id) {
-            crate::utils::logger::log_event(
-                "stop_effective",
-                serde_json::json!({
-                    "phase": "stream_loop",
-                    "conversation_id": conversation_id,
-                    "chars": full.chars().count(),
-                }),
-            );
-            return Ok(StreamOutcome {
-                text: full,
-                reasoning: reasoning_full,
-                stopped: true,
-                truncated: false,
-                interrupted: false,
-                usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-                tool_calls: Vec::new(),
-            });
-        }
-        if let Some(buf) = &mut rec_buf {
-            buf.extend_from_slice(&chunk);
-        }
-        buffer.extend_from_slice(&chunk);
     }
-    // 流读取结束（连接关闭/读完）后，优先检查用户是否在此期间点了停止。
-    // 否则连接恰在停止前关闭会落到下方 interrupted 分支，主循环自动续写"请继续"，
-    // 表现为"点了停止却停不下来、重试提示已有任务进行中"。
+    // ── 收尾：关投递通道 → 解析线程 flush 剩余缓冲 → 回传 Done ──────────
+    crate::utils::logger::log_event(
+        "stream_once_exit",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "tid": format!("{:?}", std::thread::current().id()),
+            "finished": finished,
+            "truncated": truncated,
+            "stalled": stalled,
+            "total_bytes": total_bytes,
+        }),
+    );
+    drop(chunk_tx);
+    let final_ev = match done {
+        Some(ev) => Some(ev),
+        None => {
+            await_parse_done(
+                event_rx,
+                placeholder,
+                delivered_content,
+                delivered_reasoning,
+            )
+            .await
+        }
+    };
+    let (full, reasoning_full, usage_chunks, native_tool_calls, rec_buf) = match final_ev {
+        Some(StreamParserEvent::Done {
+            text,
+            reasoning,
+            usage_chunks,
+            tool_calls,
+            rec_buf,
+            finished: f,
+            truncated: t,
+        }) => {
+            finished = f;
+            truncated = t;
+            (text, reasoning, usage_chunks, tool_calls, rec_buf)
+        }
+        // Done 丢失（等待超时/通道异常）：用主循环快照兜底，不无限等待
+        _ => (String::new(), String::new(), Vec::new(), Vec::new(), None),
+    };
+    // 流读取结束/退出后，优先检查用户是否在此期间点了停止。
+    // 否则连接恰在停止前关闭会落到下方 interrupted 分支，主循环自动续写“请继续”，
+    // 表现为“点了停止却停不下来、重试提示已有任务进行中”。
     if is_cancelled(cancel, conversation_id) {
         crate::utils::logger::log_event(
             "stop_effective",
@@ -6487,7 +6421,7 @@ async fn stream_once(
             tool_calls: Vec::new(),
         });
     }
-    // 截断：不报错退出，保留已输出内容并标记 truncated，由主循环决定追加"请继续"续写。
+    // 截断：不报错退出，保留已输出内容并标记 truncated，由主循环决定追加“请继续”续写。
     // 注意：输出截断不等于上下文超限，裁剪历史对其无效，必须续写才能继续。
     if truncated {
         return Ok(StreamOutcome {
@@ -6500,10 +6434,11 @@ async fn stream_once(
             tool_calls: finalize_tool_calls(&native_tool_calls),
         });
     }
-    // 无结束标记但已有部分正文：连接被提前关闭（网络/代理抖动、服务商静默断流等）。
-    // 不直接报错丢失半截内容，也不静默入库，而是标记 interrupted 交主循环自动续写"请继续"，
-    // 由 MAX_INTERRUPT_RETRY_ROUNDS 兜底；完全空响应才视为异常报错。
-    if !finished && !full.is_empty() {
+    // 无结束标记但已有部分正文 / 停滞命中：连接被提前关闭（网络/代理抖动、服务商静默
+    // 断流等）或 60s 无有效产出。不直接报错丢失半截内容，也不静默入库，而是标记
+    // interrupted 交主循环自动续写“请继续”，由 MAX_INTERRUPT_RETRY_ROUNDS 兜底；
+    // 完全空响应且未停滞才走下方正常收尾（空回复场景）。
+    if stalled || (!finished && !full.is_empty()) {
         return Ok(StreamOutcome {
             text: full,
             reasoning: reasoning_full,
@@ -6532,6 +6467,412 @@ async fn stream_once(
         usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
         tool_calls: finalize_tool_calls(&native_tool_calls),
     })
+}
+
+/// 投递网络块到解析线程：有界通道背压时等待（try_send 失败返回字节本身，永不丢失），
+/// 期间每 200ms 检查停止——解析线程被病态输入拖住时投递方仍可响应停止。
+/// 返回 false 表示解析线程已退出（通道关闭），调用方应停止读流。
+async fn deliver_chunk(
+    chunk_tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    bytes: bytes::Bytes,
+    cancel: &ChatCancel,
+    conversation_id: &str,
+) -> bool {
+    let mut pending = Some(bytes);
+    let mut waits: u32 = 0;
+    while let Some(b) = pending.take() {
+        match chunk_tx.try_send(b) {
+            Ok(()) => return true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(b)) => {
+                waits += 1;
+                if waits >= STREAM_DELIVER_MAX_WAITS {
+                    // 解析线程被病态输入拖住 5s：丢弃该块保主循环活性——事件转发/
+                    // 停滞判定/停止响应优先于不丢字节（病态流本身无有效产出，丢块无损）
+                    crate::utils::logger::log_event(
+                        "stream_chunk_dropped",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "dropped_bytes": b.len(),
+                            "waited_ms": STREAM_DELIVER_MAX_WAITS * 200,
+                        }),
+                    );
+                    return true;
+                }
+                pending = Some(b);
+                // 解析线程忙（病态输入正在烧保险丝预算）：等其消化后重投
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if is_cancelled(cancel, conversation_id) {
+                    return true; // 停止：调用方循环顶部统一走停止收尾
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+    unreachable!()
+}
+
+/// 等待解析线程回传最终产物（Done 事件）：关闭投递通道后线程 flush 剩余缓冲即发 Done。
+/// 期间同步 PersistWatermark 占位 id（收尾 persist_turn 沿用同一消息补全，避免重复插入），
+/// 并累积增量快照；10s 超时兜底（线程被极端输入拖住时）：用快照组装伪 Done，
+/// 保住前端已实时收到、不能因落库丢失的半截正文，不无限等待。
+async fn await_parse_done(
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<StreamParserEvent>,
+    placeholder: &mut Option<String>,
+    delivered_content: String,
+    delivered_reasoning: String,
+) -> Option<StreamParserEvent> {
+    // 从主循环已交付给前端的内容开始累积；收尾超时不能只保住队列尾部。
+    let mut snapshot = (delivered_content, delivered_reasoning);
+    let fut = async {
+        loop {
+            match event_rx.recv().await {
+                Some(StreamParserEvent::Delta(d)) => snapshot.0.push_str(&d),
+                Some(StreamParserEvent::Reasoning(r)) => snapshot.1.push_str(&r),
+                Some(StreamParserEvent::PersistWatermark { placeholder: p }) => {
+                    *placeholder = p;
+                }
+                Some(ev @ StreamParserEvent::Done { .. }) => return Some(ev),
+                Some(_) => {}
+                // 解析线程异常退出也要保住已展示内容，禁止后续持久化为空。
+                None => {
+                    return Some(StreamParserEvent::Done {
+                        text: snapshot.0.clone(),
+                        reasoning: snapshot.1.clone(),
+                        usage_chunks: Vec::new(),
+                        tool_calls: Vec::new(),
+                        rec_buf: None,
+                        finished: false,
+                        truncated: false,
+                    });
+                }
+            }
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            // 超时兜底：用快照组装伪 Done（usage/tool_calls/rec_buf 缺失，仅保正文）
+            crate::utils::logger::log_event(
+                "stream_done_timeout",
+                serde_json::json!({
+                    "chars": snapshot.0.chars().count(),
+                    "note": "parse_thread_stuck_fallback_snapshot",
+                }),
+            );
+            Some(StreamParserEvent::Done {
+                text: snapshot.0,
+                reasoning: snapshot.1,
+                usage_chunks: Vec::new(),
+                tool_calls: Vec::new(),
+                rec_buf: None,
+                finished: false,
+                truncated: false,
+            })
+        }
+    }
+}
+
+/// 流式解析线程事件（解析线程 → async 主循环）
+enum StreamParserEvent {
+    /// 正文增量（透传 emit chat-stream）
+    Delta(String),
+    /// 思考增量（透传 emit chat-reasoning）
+    Reasoning(String),
+    /// 原生工具调用增量到达（解析线程累积；async 侧仅刷新产出打点）
+    ToolCall,
+    /// 流内结束/截断标记（finish_reason / message_stop）
+    Finish { truncated: bool },
+    /// 占位消息落库水位：回传最新占位 id（async 侧收尾沿用同一条消息补全）
+    PersistWatermark { placeholder: Option<String> },
+    /// 解析线程结束：回传全部产物与录制缓冲
+    Done {
+        text: String,
+        reasoning: String,
+        usage_chunks: Vec<String>,
+        tool_calls: Vec<(usize, String, String)>,
+        rec_buf: Option<Vec<u8>>,
+        finished: bool,
+        truncated: bool,
+    },
+}
+
+/// 流式解析线程主体：独立 OS 线程承载全部同步解析（JSON 解析/增量提取/占位落库）。
+/// - 与 tokio worker 物理隔离：输入触发病理路径最坏烧满 1 核，worker/timer/停止/看门狗
+///   全部不受影响（同步死循环无法被 abort 中断，线程化后不再钉死调度器）；
+/// - 保险丝：每批解析时间预算 STREAM_PARSE_BATCH_BUDGET_MS，超预算暂停等下一块——
+///   任何输入最多连续解析预算时长，杜绝"同步段无限空烧"；
+/// - 通道关闭（async 侧停止/中断/流读完）后 flush 剩余缓冲并回传 Done。
+fn stream_parse_thread(
+    mut chunk_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<StreamParserEvent>,
+    state: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    conversation_id: String,
+    model: String,
+    protocol: String,
+    mut placeholder: Option<String>,
+    rec_enabled: bool,
+) {
+    // 行缓冲用原始字节累积：网络 chunk 边界可能切在多字节 UTF-8 字符中间，
+    // 若逐 chunk 解码会产生 U+FFFD 替换符并永久写入消息，必须整行拼好后再统一解码。
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut full = String::new();
+    let mut reasoning_full = String::new();
+    // reasoning 增量合并缓冲：满 STREAM_REASONING_MERGE_BYTES 发一条事件，
+    // 块边界强制 flush（防病态流逐条 IPC 推送堆积烧前端渲染）
+    let mut reasoning_pending = String::new();
+    let mut usage_chunks: Vec<String> = Vec::new(); // 收集含 usage 的块（成本统计）
+    let mut native_tool_calls: Vec<(usize, String, String)> = Vec::new();
+    let mut rec_buf: Option<Vec<u8>> = rec_enabled.then(Vec::new);
+    let mut finished = false;
+    let mut truncated = false;
+    let mut persist_watermark = 0usize;
+    let mut reasoning_watermark = 0usize;
+    let mut lines_parsed: usize = 0;
+    let parse_started = std::time::Instant::now();
+    let mut parse_slow_logged = false;
+
+    crate::utils::logger::log_event(
+        "stream_parse_thread_start",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "tid": format!("{:?}", std::thread::current().id()),
+        }),
+    );
+
+    'outer: loop {
+        // 收块（阻塞等待；async 侧停止/中断/流读完会关闭通道 → None 触发 flush）
+        let closed = match chunk_rx.blocking_recv() {
+            Some(chunk) => {
+                if let Some(buf) = &mut rec_buf {
+                    buf.extend_from_slice(&chunk);
+                }
+                buffer.extend_from_slice(&chunk);
+                // 残片超限保护：模型吐无换行块时 buffer 无限膨胀，每次 find('\n')
+                // 全量扫描呈 O(n²) 烧 CPU。丢弃最旧一半（残片通常是病态垃圾，无内容损失）
+                if buffer.len() > STREAM_BUFFER_MAX_BYTES {
+                    let keep = STREAM_BUFFER_MAX_BYTES / 2;
+                    let dropped = buffer.len() - keep;
+                    buffer.drain(..dropped);
+                    crate::utils::logger::log_event(
+                        "stream_buffer_truncated",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "dropped_bytes": dropped,
+                            "remaining": buffer.len(),
+                        }),
+                    );
+                }
+                false
+            }
+            None => true, // 通道关闭（async 侧停止/中断/流读完）：flush 后退出
+        };
+
+        // 某些 Provider 关闭连接前不会给最后一条 SSE 补换行。关闭时补行尾，
+        // 让末尾正文、usage 与 finish_reason 仍走正常解析路径。
+        if closed && !buffer.is_empty() && !buffer.ends_with(b"\n") {
+            buffer.push(b'\n');
+        }
+
+        // 批处理：解析到缓冲空 / 残片 / 预算耗尽 / [DONE]
+        while !buffer.is_empty() {
+            let batch_started = std::time::Instant::now();
+            let mut consumed = 0;
+            let mut batch = 0;
+            while batch < STREAM_YIELD_LINES {
+                if batch % 64 == 0 {
+                    std::thread::yield_now();
+                }
+                // 保险丝：批时间预算耗尽 → 剩余行留待下一块（防任何输入连续空烧）
+                if batch_started.elapsed().as_millis() > STREAM_PARSE_BATCH_BUDGET_MS {
+                    break;
+                }
+                let Some(pos) = buffer[consumed..].iter().position(|b| *b == b'\n') else {
+                    break; // 尾部残片（无换行），留待后续 chunk 合并后再处理
+                };
+                batch += 1;
+                lines_parsed += 1;
+                let line = String::from_utf8_lossy(&buffer[consumed..consumed + pos]);
+                let line = line.trim();
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.trim();
+                    if data == "[DONE]" {
+                        buffer.clear();
+                        finished = true;
+                        break 'outer; // 与旧实现 break 'outer 等价：不再等流
+                    }
+                    // 单行超限：跳过解析（防超大 JSON 行解析烧 CPU），仅记录
+                    if data.len() > STREAM_MAX_LINE {
+                        crate::utils::logger::log_event(
+                            "stream_line_skipped",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "line_bytes": data.len(),
+                            }),
+                        );
+                        consumed += pos + 1;
+                        continue;
+                    }
+                    // Usage 只需首尾少量帧；有界保留避免长任务复制全部 token JSON。
+                    retain_usage_chunk(&mut usage_chunks, data);
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(delta) =
+                            crate::utils::net::extract_stream_delta(&protocol, &json)
+                        {
+                            if !delta.is_empty() {
+                                full.push_str(&delta);
+                                let _ = event_tx.send(StreamParserEvent::Delta(delta));
+                            }
+                        }
+                        // 思考过程增量（推理模型）：合并缓冲，满阈值发一条事件（前端逐条
+                        // 重渲染思考区是 renderer 烧核根因，合并后事件量降两个数量级）
+                        if let Some(r) = crate::utils::net::extract_reasoning_delta(&protocol, &json) {
+                            if !r.is_empty() {
+                                reasoning_pending.push_str(&r);
+                                if reasoning_pending.len() >= STREAM_REASONING_MERGE_BYTES {
+                                    reasoning_full.push_str(&reasoning_pending);
+                                    let _ = event_tx.send(StreamParserEvent::Reasoning(
+                                        std::mem::take(&mut reasoning_pending),
+                                    ));
+                                }
+                            }
+                        }
+                        // 原生 function calling 增量：先透传事件（async 侧刷新产出打点），
+                        // 再按 index 合并累积（name 覆盖 + arguments 拼接）
+                        if let Some((idx, name, args)) =
+                            crate::utils::net::extract_tool_call_delta(&json)
+                        {
+                            let _ = event_tx.send(StreamParserEvent::ToolCall);
+                            match native_tool_calls.iter_mut().find(|(i, _, _)| *i == idx) {
+                                Some((_, n, a)) => {
+                                    if let Some(nm) = name {
+                                        n.push_str(&nm);
+                                    }
+                                    if let Some(ar) = args {
+                                        a.push_str(&ar);
+                                    }
+                                }
+                                None => native_tool_calls.push((
+                                    idx,
+                                    name.unwrap_or_default(),
+                                    args.unwrap_or_default(),
+                                )),
+                            }
+                        }
+                        match detect_finish(&protocol, &json) {
+                            FinishKind::Done => {
+                                finished = true;
+                                let _ = event_tx.send(StreamParserEvent::Finish { truncated: false });
+                            }
+                            FinishKind::Truncated => {
+                                truncated = true;
+                                finished = true;
+                                let _ = event_tx.send(StreamParserEvent::Finish { truncated: true });
+                            }
+                            FinishKind::None => {}
+                        }
+                    }
+                }
+                consumed += pos + 1;
+            }
+            // 已消费的行一次性移除（游标式解析：避免每行 drain 整体前移，海量行 O(n²)）
+            buffer.drain(..consumed);
+
+            // 正文增量落库：产出每累计 ~8KB 同步一次占位消息（duration_ms=NULL 标记未完成）。
+            // 看门狗强杀/崩溃无法执行主循环收尾时，此处保住已产出内容。
+            if full.len() - persist_watermark >= 8192
+                || reasoning_full.len() - reasoning_watermark >= 8192
+            {
+                persist_watermark = full.len();
+                reasoning_watermark = reasoning_full.len();
+                match upsert_placeholder_message(
+                    &state,
+                    &conversation_id,
+                    &model,
+                    &mut placeholder,
+                    &full,
+                    &reasoning_full,
+                ) {
+                    Ok(()) => {
+                        let _ = event_tx.send(StreamParserEvent::PersistWatermark {
+                            placeholder: placeholder.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        crate::utils::logger::log_event(
+                            "stream_persist_error",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "error": e,
+                            }),
+                        );
+                    }
+                }
+            }
+            // 累计处理时长超过阈值仅记录日志（供排障），不中断：大输出/长响应是正常行为
+            if !parse_slow_logged && parse_started.elapsed().as_secs() > STREAM_PARSE_MAX_SECS {
+                parse_slow_logged = true;
+                crate::utils::logger::log_event(
+                    "stream_parse_slow",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "lines_parsed": lines_parsed,
+                        "elapsed_secs": parse_started.elapsed().as_secs(),
+                        "note": "large_output_not_closed",
+                    }),
+                );
+            }
+            // 进度日志：每 4096 行记录一次，异常巨大响应时留下可定位证据
+            if lines_parsed % (STREAM_YIELD_LINES * 8) == 0 {
+                crate::utils::logger::log_event(
+                    "stream_parse_progress",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "lines_parsed": lines_parsed,
+                        "buffer_pending": buffer.len(),
+                        "produced_chars": full.len(),
+                        "head_chunk": usage_chunks
+                            .first()
+                            .map(|s| s.chars().take(200).collect::<String>()),
+                        "tail_produced": full.chars().rev().take(200).collect::<String>(),
+                    }),
+                );
+            }
+            // 保险丝预算耗尽或残片：本批无进展 → 等下一块
+            if batch_started.elapsed().as_millis() > STREAM_PARSE_BATCH_BUDGET_MS || consumed == 0 {
+                break;
+            }
+            // 缓冲还有完整行：立即处理下一批（不等网络）
+        }
+
+        // 块边界强制 flush 剩余 reasoning（低延迟：正常流单条即时显示）
+        if !reasoning_pending.is_empty() {
+            reasoning_full.push_str(&reasoning_pending);
+            let _ = event_tx.send(StreamParserEvent::Reasoning(std::mem::take(
+                &mut reasoning_pending,
+            )));
+        }
+
+        if closed {
+            break 'outer; // 通道关闭 + 缓冲已清空（或预算耗尽）：flush 完成
+        }
+    }
+
+    // 收尾：flush 残余 reasoning 后回传全部产物（async 侧据此组装 outcome）
+    if !reasoning_pending.is_empty() {
+        reasoning_full.push_str(&reasoning_pending);
+        let _ = event_tx.send(StreamParserEvent::Reasoning(std::mem::take(
+            &mut reasoning_pending,
+        )));
+    }
+    let _ = event_tx.send(StreamParserEvent::Done {
+        text: full,
+        reasoning: reasoning_full,
+        usage_chunks,
+        tool_calls: native_tool_calls,
+        rec_buf,
+        finished,
+        truncated,
+    });
 }
 
 /// 重放响应构造：把录制的 SSE 文本流包装成 reqwest::Response
