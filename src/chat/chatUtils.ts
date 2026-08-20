@@ -115,7 +115,9 @@ function findMarkerEnd(after: string): number | null {
     const jsonEnd = scanJsonValue(after, i)
     if (jsonEnd > i) {
       let p = jsonEnd
-      while (p < after.length && /[ \t]/.test(after[p])) p++
+      // 结束符常被模型放到下一行；允许跨空白寻找，但未命中结束符时仍从
+      // jsonEnd 返回，以保留原始正文换行。
+      while (p < after.length && /\s/.test(after[p])) p++
       // 结束符变体：】 / ]} / ]
       if (after.startsWith(TOOL_MARK_END, p)) return p + TOOL_MARK_END.length
       if (after.startsWith(']}', p)) return p + 2
@@ -123,6 +125,8 @@ function findMarkerEnd(after: string): number | null {
       // 容错：JSON 后又跟一段 |...】（模型多写了一段尾注），吞到结束符/换行
       if (after[p] === '|') {
         const rest = after.slice(p)
+        // 常见残缺尾标是 `|]}`；只吞掉尾标本身，保留其后的同一行正文。
+        if (rest.startsWith('|]}')) return p + 3
         const e = rest.indexOf(TOOL_MARK_END)
         if (e >= 0) return p + e + TOOL_MARK_END.length
         const nl = rest.indexOf('\n')
@@ -153,7 +157,10 @@ function scanJsonValue(s: string, pos: number): number {
     while (i < s.length) {
       const c = s[i]
       if (c === '"') {
-        i = scanJsonString(s, i)
+        const next = scanJsonString(s, i)
+        // 未闭合字符串返回原位置；若继续会在同一个引号上无限循环并冻结 UI。
+        if (next <= i) return pos
+        i = next
         continue
       }
       if (c === '{' || c === '[') {

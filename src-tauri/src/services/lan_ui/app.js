@@ -1449,9 +1449,20 @@ function connectSSE() {
   const on = (name, fn) => es.addEventListener(name, (e) => {
     try { fn(JSON.parse(e.data)); } catch { /* ignore */ }
   });
-  on('chat-stream', (p) => appendStream(p.conversation_id, p.delta || ''));
+  const acceptsRun = (p) => !p.run_id || !S.streaming || S.streaming.convId !== p.conversation_id
+    || S.streaming.runId === p.run_id;
+  on('chat-run-started', (p) => {
+    if (S.streaming && S.streaming.convId === p.conversation_id) S.streaming.runId = p.run_id;
+  });
+  on('chat-stream', (p) => {
+    if (acceptsRun(p)) appendStream(p.conversation_id, p.delta || '');
+  });
+  on('chat-stream-batch', (p) => {
+    if (acceptsRun(p) && p.content) appendStream(p.conversation_id, p.content);
+  });
   on('chat-reasoning', () => { /* keep alive */ });
   on('chat-done', (p) => {
+    if (!acceptsRun(p)) return;
     if (S.conv && p.conversation_id === S.conv.id) {
       endStreaming();
       reloadMessages().catch(() => {});
@@ -1459,6 +1470,7 @@ function connectSSE() {
     maybeNotify(p.conversation_id, '任务完成', (p.message && (p.message.content || '').slice(0, 60)) || '');
   });
   on('chat-error', (p) => {
+    if (!acceptsRun(p)) return;
     if (S.conv && p.conversation_id === S.conv.id) {
       endStreaming();
       const list = $('msgList');
@@ -1471,6 +1483,7 @@ function connectSSE() {
     maybeNotify(p.conversation_id, '任务出错', p.title || p.error || '');
   });
   on('chat-stopped', (p) => {
+    if (!acceptsRun(p)) return;
     if (S.conv && p.conversation_id === S.conv.id) {
       endStreaming();
       reloadMessages().catch(() => {});

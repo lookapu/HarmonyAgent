@@ -9,7 +9,7 @@
 //! 心跳为纯原子写（高频调用路径，不落日志），看门狗杀任务时统一落 watchdog_kill 日志。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -61,6 +61,10 @@ fn now_ms() -> i64 {
 }
 
 pub struct TaskHandle {
+    /// 同一会话多次运行的代次；旧任务收尾不得注销随后启动的新任务。
+    pub generation: u64,
+    /// 前后端事件代次 ID；任务主体启动后写入，供看门狗终态事件隔离旧任务。
+    pub run_id: StdMutex<Option<String>>,
     pub abort: tokio::task::AbortHandle,
     pub heartbeat_ms: AtomicI64,
     pub phase: AtomicI64,
@@ -79,13 +83,21 @@ pub struct TaskHandle {
 pub struct TaskRegistry(pub StdMutex<HashMap<String, TaskHandle>>);
 
 impl TaskRegistry {
-    /// 登记运行中任务（任务 spawn 后立即调用）
-    pub fn register(&self, conversation_id: &str, abort: tokio::task::AbortHandle) {
+    /// 尝试登记运行中任务。已存在时拒绝，避免并发 stream_chat 覆盖原任务的 AbortHandle。
+    /// 返回本次代次，正常收尾时必须带回该值做条件注销。
+    pub fn register(&self, conversation_id: &str, abort: tokio::task::AbortHandle) -> Option<u64> {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         if let Ok(mut m) = self.0.lock() {
+            if m.contains_key(conversation_id) {
+                return None;
+            }
             let now = now_ms();
+            let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
             m.insert(
                 conversation_id.to_string(),
                 TaskHandle {
+                    generation,
+                    run_id: StdMutex::new(None),
                     abort,
                     heartbeat_ms: AtomicI64::new(now),
                     phase: AtomicI64::new(PHASE_START),
@@ -95,13 +107,28 @@ impl TaskRegistry {
                     started_at: now,
                 },
             );
+            Some(generation)
+        } else {
+            None
         }
     }
 
-    /// 任务正常收尾注销
-    pub fn unregister(&self, conversation_id: &str) {
+    /// 任务正常收尾注销；只移除自己的代次，防看门狗强杀后的旧 join 误删新任务。
+    pub fn unregister(&self, conversation_id: &str, generation: u64) {
         if let Ok(mut m) = self.0.lock() {
-            m.remove(conversation_id);
+            if m.get(conversation_id).map(|h| h.generation) == Some(generation) {
+                m.remove(conversation_id);
+            }
+        }
+    }
+
+    pub fn set_run_id(&self, conversation_id: &str, run_id: &str) {
+        if let Ok(m) = self.0.lock() {
+            if let Some(h) = m.get(conversation_id) {
+                if let Ok(mut current) = h.run_id.lock() {
+                    *current = Some(run_id.to_string());
+                }
+            }
         }
     }
 
@@ -234,17 +261,42 @@ fn watchdog_loop(app: AppHandle) {
             }
         }
         for (cid, reason, elapsed_ms) in to_kill {
-            let abort = if let Ok(mut m) = registry.0.lock() {
-                m.remove(&cid).map(|h| h.abort)
+            let task = if let Ok(mut m) = registry.0.lock() {
+                m.remove(&cid)
             } else {
                 None
             };
-            if let Some(abort) = abort {
-                abort.abort();
+            if let Some(task) = task {
+                let run_id = task
+                    .run_id
+                    .lock()
+                    .ok()
+                    .and_then(|id| id.clone())
+                    .unwrap_or_default();
+                // abort 会跳过审批/计划 Future 内的正常 remove 收尾；先删除对应 Sender，
+                // 防止待确认表永久残留并让前端一直显示“待确认”。
+                if let Ok(mut approvals) = app
+                    .state::<crate::commands::chat::ToolApprovalState>()
+                    .0
+                    .lock()
+                {
+                    approvals.retain(|_, (_, _, conversation_id, _)| conversation_id != &cid);
+                }
+                if let Ok(mut plans) = app
+                    .state::<crate::commands::chat::PlanApprovalState>()
+                    .0
+                    .lock()
+                {
+                    plans.retain(|_, pending| pending.conversation_id != cid);
+                }
+                crate::agent::ask::cancel_conversation(&cid);
+                crate::agent::exec_ctx::request_stop_tool(&cid);
+                task.abort.abort();
                 crate::utils::logger::log_event(
                     "watchdog_kill",
                     serde_json::json!({
                         "conversation_id": cid,
+                        "run_id": run_id,
                         "reason": reason,
                         "elapsed_ms": elapsed_ms,
                     }),
@@ -264,5 +316,36 @@ fn watchdog_loop(app: AppHandle) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn duplicate_registration_is_rejected() {
+        let registry = TaskRegistry::default();
+        let first = tokio::spawn(std::future::pending::<()>());
+        let second = tokio::spawn(std::future::pending::<()>());
+        let generation = registry.register("conv", first.abort_handle()).expect("first register");
+        assert!(registry.register("conv", second.abort_handle()).is_none());
+        registry.unregister("conv", generation);
+        first.abort();
+        second.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_unregister_does_not_remove_newer_task() {
+        let registry = TaskRegistry::default();
+        let first = tokio::spawn(std::future::pending::<()>());
+        let generation = registry.register("conv", first.abort_handle()).expect("register");
+
+        registry.unregister("conv", generation.wrapping_add(1));
+        assert!(registry.0.lock().unwrap().contains_key("conv"));
+
+        registry.unregister("conv", generation);
+        assert!(!registry.0.lock().unwrap().contains_key("conv"));
+        first.abort();
     }
 }

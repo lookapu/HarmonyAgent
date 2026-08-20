@@ -133,48 +133,11 @@ pub async fn terminal_exec(
         (child, stdout, stderr)
     };
 
-    // 读输出（stdout/stderr 串行行级读取，smart_decode 处理 GBK）；超 3000 行丢头部防内存膨胀
-    let mut lines: Vec<String> = Vec::new();
-    if let Some(pipe) = stdout {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let mut reader = BufReader::new(pipe);
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-                        buf.pop();
-                    }
-                    lines.push(crate::agent::tools::smart_decode(&buf));
-                    if lines.len() > 3000 {
-                        lines.drain(..500);
-                    }
-                }
-            }
-        }
-    }
-    if let Some(pipe) = stderr {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let mut reader = BufReader::new(pipe);
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-                        buf.pop();
-                    }
-                    lines.push(crate::agent::tools::smart_decode(&buf));
-                    if lines.len() > 3000 {
-                        lines.drain(..500);
-                    }
-                }
-            }
-        }
-    }
+    // stdout/stderr 必须与 child.wait 并发排空；串行读取会在另一条 Windows 管道填满时
+    // 形成互等死锁，并且让下面的 900s 超时永远没有机会开始计时。
+    let stdout_task = tokio::spawn(read_terminal_pipe(stdout));
+    let stderr_task = tokio::spawn(read_terminal_pipe(stderr));
+
     // 等待结束（900s 超时后强杀进程树）
     let wait = tokio::time::timeout(Duration::from_secs(900), child.wait()).await;
     let (exit_code, timed_out) = match wait {
@@ -182,10 +145,15 @@ pub async fn terminal_exec(
         Ok(Err(e)) => return Err(format!("等待命令结束失败: {e}")),
         Err(_) => {
             crate::utils::process::kill_tree(child.id());
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
             (None, true)
         }
     };
+    let mut lines = finish_terminal_pipe(stdout_task).await;
+    lines.extend(finish_terminal_pipe(stderr_task).await);
+    if lines.len() > 3000 {
+        lines.drain(..lines.len() - 3000);
+    }
     // 清会话运行状态
     let cwd_now = {
         let mut map = sessions().lock().unwrap();
@@ -204,6 +172,47 @@ pub async fn terminal_exec(
         exit_code,
         timed_out,
     })
+}
+
+async fn read_terminal_pipe<R>(pipe: Option<R>) -> Vec<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = Vec::new();
+    let Some(pipe) = pipe else { return lines };
+    let mut reader = BufReader::new(pipe);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                    buf.pop();
+                }
+                if buf.len() > 64 * 1024 {
+                    let drop_n = buf.len() - 64 * 1024;
+                    buf.drain(..drop_n);
+                }
+                lines.push(crate::agent::tools::smart_decode(&buf));
+                if lines.len() > 3500 {
+                    lines.drain(..500);
+                }
+            }
+        }
+    }
+    lines
+}
+
+async fn finish_terminal_pipe(mut task: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
+    match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+        Ok(v) => v.unwrap_or_default(),
+        Err(_) => {
+            task.abort();
+            Vec::new()
+        }
+    }
 }
 
 /// 停止当前正在运行的终端命令（强杀进程树）。

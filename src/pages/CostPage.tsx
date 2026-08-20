@@ -429,7 +429,7 @@ export default function CostPage() {
       <div className="modern-card rounded-lg overflow-hidden mb-6">
         <div className="flex items-center gap-2 px-4 py-2 border-b border-[var(--border)]">
           <span className="text-xs text-[var(--text-secondary)]">{t('cost.filter')}</span>
-          {['', 'success', 'error', 'cancelled'].map((s) => (
+          {['', 'success', 'incomplete', 'error', 'cancelled'].map((s) => (
             <button
               key={s}
               onClick={() => {
@@ -444,7 +444,15 @@ export default function CostPage() {
                   : 'tab-inactive'
               }`}
             >
-              {s === '' ? t('cost.all') : s === 'success' ? t('cost.success') : s === 'error' ? t('cost.failed') : t('cost.cancelled')}
+              {s === ''
+                ? t('cost.all')
+                : s === 'success'
+                  ? t('cost.success')
+                  : s === 'incomplete'
+                    ? t('cost.incomplete')
+                    : s === 'error'
+                      ? t('cost.failed')
+                      : t('cost.cancelled')}
             </button>
           ))}
         </div>
@@ -477,6 +485,8 @@ export default function CostPage() {
                         backgroundColor:
                           r.status === 'success'
                             ? 'var(--success)'
+                            : r.status === 'incomplete'
+                              ? 'var(--warning)'
                             : r.status === 'cancelled'
                               ? 'var(--text-secondary)'
                               : 'var(--danger)',
@@ -484,7 +494,13 @@ export default function CostPage() {
                         opacity: r.status === 'cancelled' ? 0.6 : 1,
                       }}
                     >
-                      {r.status === 'success' ? t('cost.success') : r.status === 'cancelled' ? t('cost.cancelled') : t('cost.failed')}
+                      {r.status === 'success'
+                        ? t('cost.success')
+                        : r.status === 'incomplete'
+                          ? t('cost.incomplete')
+                          : r.status === 'cancelled'
+                            ? t('cost.cancelled')
+                            : t('cost.failed')}
                     </span>
                   </td>
                   <td className="px-4 py-2 max-w-[180px] truncate" title={r.model ?? ''}>
@@ -822,4 +838,3 @@ function formatDateTime(ts: number): string {
   const mi = String(d.getMinutes()).padStart(2, '0')
   return `${mm}/${dd} ${hh}:${mi}`
 }
-

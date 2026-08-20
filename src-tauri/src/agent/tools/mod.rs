@@ -1477,8 +1477,10 @@ pub(crate) async fn run_cmd_capped_env(program: &str, args: &[String], cwd: Opti
     }
     let mut child = cmd.spawn().map_err(|e| format!("无法启动命令 {program}: {e}"))?;
     let pid = child.id();
-    let out_task = read_pipe(child.stdout.take());
-    let err_task = read_pipe(child.stderr.take());
+    // 必须立即并发排空两条管道。仅创建 Future、等 child.wait 后才 poll 会在输出填满
+    // Windows 管道缓冲时形成经典死锁：子进程等写空间，父进程等子进程退出。
+    let out_task = tokio::spawn(read_pipe(child.stdout.take()));
+    let err_task = tokio::spawn(read_pipe(child.stderr.take()));
     // 等待结束：同时监听超时与“停止当前工具”请求（轮询中断标志，命中强杀进程树）
     let wait_fut = child.wait();
     tokio::pin!(wait_fut);
@@ -1489,6 +1491,7 @@ pub(crate) async fn run_cmd_capped_env(program: &str, args: &[String], cwd: Opti
             _ = tokio::time::sleep_until(deadline) => {
                 // 超时：强杀整个进程树，避免残留进程继续占用管道/端口
                 crate::utils::process::kill_tree(pid);
+                let _ = finish_pipe_readers(out_task, err_task).await;
                 return Err(format!("命令超时（>{timeout_secs}s），已终止: {program}"));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
@@ -1498,13 +1501,14 @@ pub(crate) async fn run_cmd_capped_env(program: &str, args: &[String], cwd: Opti
                 for sid in crate::agent::exec_ctx::active_tool_sessions() {
                     if crate::agent::exec_ctx::take_stop_tool(&sid) {
                         crate::utils::process::kill_tree(pid);
+                        let _ = finish_pipe_readers(out_task, err_task).await;
                         return Err("用户已停止当前工具".into());
                     }
                 }
             }
         }
     };
-    let (out, err) = tokio::join!(out_task, err_task);
+    let (out, err) = finish_pipe_readers(out_task, err_task).await;
     let mut text = out.trim().to_string();
     let err = err.trim().to_string();
     if !err.is_empty() {
@@ -1525,6 +1529,29 @@ pub(crate) async fn run_cmd_capped_env(program: &str, args: &[String], cwd: Opti
             if text.is_empty() { "无输出".to_string() } else { text }
         ))
     }
+}
+
+/// 有些 Windows 孙进程会在父包装器退出后继续持有继承管道，EOF 不会及时到达。
+/// 对两条读取任务分别限时收尾，避免工具完成阶段永久卡住。
+async fn finish_pipe_readers(
+    mut out_task: tokio::task::JoinHandle<String>,
+    mut err_task: tokio::task::JoinHandle<String>,
+) -> (String, String) {
+    let out = match tokio::time::timeout(Duration::from_secs(5), &mut out_task).await {
+        Ok(v) => v.unwrap_or_default(),
+        Err(_) => {
+            out_task.abort();
+            String::new()
+        }
+    };
+    let err = match tokio::time::timeout(Duration::from_secs(5), &mut err_task).await {
+        Ok(v) => v.unwrap_or_default(),
+        Err(_) => {
+            err_task.abort();
+            String::new()
+        }
+    };
+    (out, err)
 }
 
 async fn read_pipe<R>(mut pipe: Option<R>) -> String

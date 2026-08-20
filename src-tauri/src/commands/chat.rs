@@ -22,6 +22,7 @@ use crate::agent::tools::guards::is_cancelled;
 #[derive(Clone, Serialize)]
 pub struct ChatStreamEvent {
     pub conversation_id: String,
+    pub run_id: String,
     pub delta: String,
 }
 
@@ -29,13 +30,97 @@ pub struct ChatStreamEvent {
 #[derive(Clone, Serialize)]
 pub struct ChatReasoningEvent {
     pub conversation_id: String,
+    pub run_id: String,
     pub delta: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ChatRunStartedEvent {
+    pub conversation_id: String,
+    pub run_id: String,
+}
+
+/// 高频模型增量批次。正文与思考在 Rust 侧先合并，再跨 Tauri IPC 发送；
+/// 避免按 token 触发数千次 WebView2/WKWebView 事件。
+#[derive(Clone, Serialize)]
+pub struct ChatStreamBatchEvent {
+    pub conversation_id: String,
+    pub run_id: String,
+    pub content: String,
+    pub reasoning: String,
+}
+
+struct StreamEventBatcher<'a> {
+    app: &'a AppHandle,
+    conversation_id: &'a str,
+    run_id: String,
+    content: String,
+    reasoning: String,
+    last_emit: std::time::Instant,
+}
+
+impl<'a> StreamEventBatcher<'a> {
+    const MAX_BYTES: usize = 8 * 1024;
+    const MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(32);
+
+    fn new(app: &'a AppHandle, conversation_id: &'a str, run_id: String) -> Self {
+        Self {
+            app,
+            conversation_id,
+            run_id,
+            content: String::new(),
+            reasoning: String::new(),
+            // 首个增量立即显示；后续增量进入 32ms/8KB 批次。
+            last_emit: std::time::Instant::now() - Self::MAX_DELAY,
+        }
+    }
+
+    fn push_content(&mut self, delta: &str) {
+        self.content.push_str(delta);
+        self.flush_if_needed();
+    }
+
+    fn push_reasoning(&mut self, delta: &str) {
+        self.reasoning.push_str(delta);
+        self.flush_if_needed();
+    }
+
+    fn flush_if_needed(&mut self) {
+        if self.content.len() + self.reasoning.len() >= Self::MAX_BYTES
+            || self.last_emit.elapsed() >= Self::MAX_DELAY
+        {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.content.is_empty() && self.reasoning.is_empty() {
+            return;
+        }
+        let _ = self.app.emit(
+            "chat-stream-batch",
+            ChatStreamBatchEvent {
+                conversation_id: self.conversation_id.to_string(),
+                run_id: self.run_id.clone(),
+                content: std::mem::take(&mut self.content),
+                reasoning: std::mem::take(&mut self.reasoning),
+            },
+        );
+        self.last_emit = std::time::Instant::now();
+    }
+}
+
+impl Drop for StreamEventBatcher<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 /// 流式完成事件（携带已入库的完整 assistant 消息）
 #[derive(Clone, Serialize)]
 pub struct ChatDoneEvent {
     pub conversation_id: String,
+    pub run_id: String,
     pub message: ChatMessage,
     /// 任务未完成（因上限中止/用户停止/中途失败，工具执行过但无最终总结）；
     /// 前端据此展示"继续任务"断点续跑按钮
@@ -61,6 +146,7 @@ pub struct ChatLedgerEvent {
 #[derive(Clone, Serialize)]
 pub struct ChatErrorEvent {
     pub conversation_id: String,
+    pub run_id: String,
     /// 完整可读错误文本（兼容旧逻辑）
     pub error: String,
     /// 错误分类（errors::ErrorKind::as_str）
@@ -81,6 +167,7 @@ pub struct ChatErrorEvent {
 #[derive(Clone, Serialize)]
 pub struct ChatStoppedEvent {
     pub conversation_id: String,
+    pub run_id: String,
     /// 是否未完成：已执行过工具但未产出总结文本（前端据此展示“继续任务”按钮断点续跑）
     pub unfinished: bool,
 }
@@ -624,6 +711,7 @@ impl From<ChatFlowError> for String {
 /// 单次任务运行统计（供 task_runs 记录：耗时/重试/工具轮次/token 用量）
 #[derive(Default)]
 struct ChatRunStats {
+    run_id: Option<String>,
     provider_id: Option<String>,
     model: Option<String>,
     tool_rounds: i64,
@@ -632,6 +720,8 @@ struct ChatRunStats {
     output_tokens: i64,
     /// 用户主动停止（含部分内容已入库的情况）
     stopped: bool,
+    /// 主流程正常返回但验收未完成（护栏收尾、复核未通过等）。
+    unfinished: bool,
 }
 
 /// 单次工具执行记录（任务内累积）：工具执行完成即入库（persisted=true），
@@ -1421,7 +1511,13 @@ pub async fn stream_chat(
     // 此处 join 返回 Cancelled 并转成明确错误提示（前端收到 chat-error + invoke reject）。
     let conv_for_spawn = conversation_id.clone();
     let app_for_spawn = app.clone();
+    // 启动闸门：先 spawn 取得 AbortHandle 并完成唯一登记，再允许任务主体运行。
+    // 否则两个同会话请求竞态时，后来的 register 会覆盖先前任务的看门狗句柄。
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
     let join = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return Err("任务启动已取消".to_string());
+        }
         let state = app_for_spawn.state::<DbState>();
         let lock = app_for_spawn.state::<ChatLock>();
         let cancel = app_for_spawn.state::<ChatCancel>();
@@ -1446,13 +1542,19 @@ pub async fn stream_chat(
         )
         .await
     });
-    {
+    let generation = {
         let registry = app.state::<TaskRegistry>();
-        registry.register(&conversation_id, join.abort_handle());
+        let Some(generation) = registry.register(&conversation_id, join.abort_handle()) else {
+            join.abort();
+            return Err("该会话已有任务进行中，请等待完成或停止后重试".to_string());
+        };
         TaskRegistry::ensure_watchdog(app.clone());
-    }
+        generation
+    };
+    // 登记成功后才放行；接收端若已异常退出，join 会返回实际错误。
+    let _ = start_tx.send(());
     let result = join.await;
-    app.state::<TaskRegistry>().unregister(&conversation_id);
+    app.state::<TaskRegistry>().unregister(&conversation_id, generation);
     match result {
         Ok(r) => r,
         Err(e) if e.is_cancelled() => {
@@ -1554,6 +1656,7 @@ async fn stream_chat_body(
                 "chat-error",
                 ChatErrorEvent {
                     conversation_id: conversation_id.clone(),
+                    run_id: stats.run_id.clone().unwrap_or_default(),
                     error: e.message.clone(),
                     kind: e.kind.as_str().to_string(),
                     title: e.title.clone(),
@@ -1612,6 +1715,12 @@ fn record_task_run(
     let finished_ms = chrono::Utc::now().timestamp_millis();
     let (status, error_kind, error_message) = if stats.stopped {
         ("cancelled".to_string(), None, None)
+    } else if stats.unfinished && result.is_ok() {
+        (
+            "incomplete".to_string(),
+            Some("incomplete".to_string()),
+            Some("任务正常收尾，但完成验收未通过；已保留任务账本供继续执行".to_string()),
+        )
     } else {
         match result {
             Ok(()) => ("success".to_string(), None, None),
@@ -1786,6 +1895,15 @@ async fn stream_chat_inner(
     // 任务级 Trace ID：本次任务（一次用户消息触发的完整执行）的全部会话事件共享同一 ID，
     // 全链路可 grep（session_events.trace_id），前端 timeline 按它折叠
     let trace_id = Uuid::new_v4().to_string();
+    stats.run_id = Some(trace_id.clone());
+    registry.set_run_id(&conversation_id, &trace_id);
+    let _ = app.emit(
+        "chat-run-started",
+        ChatRunStartedEvent {
+            conversation_id: conversation_id.clone(),
+            run_id: trace_id.clone(),
+        },
+    );
     // 清除该会话历史停止标志（一次性标志，避免残留影响本次请求）
     if let Ok(mut set) = cancel.0.lock() {
         set.remove(&conversation_id);
@@ -1855,6 +1973,7 @@ async fn stream_chat_inner(
                         "chat-stream",
                         ChatStreamEvent {
                             conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
                             delta: "（该项目有其他会话的任务执行中，已排队等待，完成后自动开始；可随时点停止取消）".into(),
                         },
                     );
@@ -1871,6 +1990,9 @@ async fn stream_chat_inner(
         if queue_wait.elapsed().as_secs() > 600 {
             return Err("排队等待超时（10 分钟）：该项目的前序任务未完成，请稍后再试".into());
         }
+        // 排队本身是健康状态：持续刷新心跳，避免 8 分钟通用看门狗先于这里的
+        // 10 分钟排队上限误杀等待任务。
+        registry.touch(&conversation_id, PHASE_START);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     };
 
@@ -3163,6 +3285,7 @@ async fn stream_chat_inner(
                 "chat-stream",
                 ChatStreamEvent {
                     conversation_id: conversation_id.clone(),
+                    run_id: trace_id.clone(),
                     delta: "\n\n> 📌 已收到你的新指令，Agent 将在当前步骤完成后处理。".to_string(),
                 },
             );
@@ -3208,6 +3331,10 @@ async fn stream_chat_inner(
         seam_count += 1;
         // 账本实时推送（前端“任务账本”卡）：每轮刷新当前执行轨迹派生账本
         if let Some(ref ledger_now) = ledger_now {
+            // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
+            // 应用崩溃、系统重启或看门狗强杀时，下一次任务仍能从最近一次
+            // 已执行工具及下一步继续，避免复杂任务回到起点。
+            save_task_ledger(state, &conversation_id, Some(ledger_now))?;
             let _ = app.emit(
                 "chat-ledger",
                 ChatLedgerEvent {
@@ -3510,6 +3637,7 @@ async fn stream_chat_inner(
                 "chat-stream",
                 ChatStreamEvent {
                     conversation_id: conversation_id.clone(),
+                    run_id: trace_id.clone(),
                     delta: format!(
                         "（上下文接近模型窗口上限，已压缩早期对话为摘要，保留最近 {} 条）",
                         history_limit
@@ -3599,6 +3727,7 @@ async fn stream_chat_inner(
                                 "chat-stream",
                                 ChatStreamEvent {
                                     conversation_id: conversation_id.clone(),
+                                    run_id: trace_id.clone(),
                                     delta: format!(
                                         "（预算软预警：已用达 90%，已自动降级到经济模型 {econ_model} 继续任务）"
                                     ),
@@ -3617,6 +3746,7 @@ async fn stream_chat_inner(
                                 "chat-stream",
                                 ChatStreamEvent {
                                     conversation_id: conversation_id.clone(),
+                                    run_id: trace_id.clone(),
                                     delta: format!(
                                         "（⚠️ 预算软预警：已用 ¥{used_cny:.2} / ¥{limit_cny:.2}（{:.0}%），请注意控制用量）",
                                         ratio * 100.0
@@ -3631,6 +3761,7 @@ async fn stream_chat_inner(
                         "chat-stream",
                         ChatStreamEvent {
                             conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
                             delta: format!(
                                 "⛔ 已达今日预算上限（已用 ¥{used_cny:.2} / ¥{limit_cny:.2}，本次约 ¥{est_cny:.2}），已停止发送。可在 Provider 设置中调高日预算或等待明日重置。"
                             ),
@@ -3649,6 +3780,7 @@ async fn stream_chat_inner(
                         "chat-stream",
                         ChatStreamEvent {
                             conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
                             delta: format!(
                                 "⛔ 已达本月预算上限（已用 ¥{used_cny:.2} / ¥{limit_cny:.2}，本次约 ¥{est_cny:.2}），已停止发送。可在 Provider 设置中调高月预算或等待下月重置。"
                             ),
@@ -3731,6 +3863,7 @@ async fn stream_chat_inner(
                     "chat-stream",
                     ChatStreamEvent {
                         conversation_id: conversation_id.clone(),
+                        run_id: trace_id.clone(),
                         delta: format!(
                             "（上下文超长，已{}后重试，保留最近 {} 条）",
                             if context_summary.is_some() {
@@ -3771,6 +3904,7 @@ async fn stream_chat_inner(
                             "chat-stream",
                             ChatStreamEvent {
                                 conversation_id: conversation_id.clone(),
+                                run_id: trace_id.clone(),
                                 delta: format!(
                                     "（主模型连续失败，已自动切换备用模型 {fb_name} 重试）"
                                 ),
@@ -4777,7 +4911,10 @@ async fn stream_chat_inner(
         break;
     }
 
-    // 6. 入库本轮工具结果与回复并推送完成事件
+    // 6. 先计算真实完成态，再入库并推送终态。此前这里固定传 unfinished=false，
+    // 会造成“账本仍未完成，但 UI 显示任务完成”的协议分裂。
+    let task_done = !exhausted && (is_completion_confirmation(&last_model_text) || tool_runs.is_empty());
+    stats.unfinished = !task_done;
     persist_turn(
         &state,
         &conversation_id,
@@ -4792,14 +4929,13 @@ async fn stream_chat_inner(
         stats.input_tokens,
         stats.output_tokens,
         task_started.elapsed().as_millis() as i64,
-        false,
+        !task_done,
         &placeholder_msg_id,
     )
     .await?;
 
     // 账本持久化（Ledger 协议）：任务确认完成（模型明确确认或纯问答无工具）则清空账本；
     // 否则保存当前账本（含断点续跑合并），下次续跑继承——完成/未完成状态不静默丢失
-    let task_done = !exhausted && (is_completion_confirmation(&last_model_text) || tool_runs.is_empty());
     if task_done {
         save_task_ledger(&state, &conversation_id, None)?;
         // 账本最终态推送：任务完成 → 清空账本（前端收起账本卡，任务摘要接管展示）
@@ -5139,6 +5275,7 @@ async fn persist_turn(
                 "chat-done",
                 ChatDoneEvent {
                     conversation_id: conversation_id.to_string(),
+                    run_id: trace_id.to_string(),
                     message,
                     unfinished,
                     user_message_id,
@@ -5149,6 +5286,7 @@ async fn persist_turn(
                 "chat-stopped",
                 ChatStoppedEvent {
                     conversation_id: conversation_id.to_string(),
+                    run_id: trace_id.to_string(),
                     unfinished: !tool_runs.is_empty(),
                 },
             );
@@ -5171,6 +5309,18 @@ struct StreamOutcome {
     usage: crate::services::cost_calculator::UsageInfo,
     /// 原生 function calling 调用（OpenAI 兼容协议流式 tool_calls 累积；(工具名, 参数 JSON)）
     tool_calls: Vec<(String, String)>,
+}
+
+/// Usage 提取只需要流首/流尾事件；有界保存可防超长响应重复缓存全部 JSON。
+fn retain_usage_chunk(chunks: &mut Vec<String>, data: &str) {
+    const MAX: usize = 64;
+    const KEEP_HEAD: usize = 8;
+    if chunks.len() < MAX {
+        chunks.push(data.to_string());
+    } else {
+        chunks.remove(KEEP_HEAD);
+        chunks.push(data.to_string());
+    }
 }
 
 /// 选备用模型：同 Provider 下其他启用模型（默认模型优先），用于主模型连续失败后的自动降级
@@ -5830,6 +5980,11 @@ async fn stream_once(
     // 原生 function calling 累积：按 index 合并 name（覆盖）与 arguments（拼接）
     let mut native_tool_calls: Vec<(usize, String, String)> = Vec::new();
     let mut stream = resp.bytes_stream();
+    let mut event_batcher = StreamEventBatcher::new(
+        app,
+        conversation_id,
+        stats.run_id.clone().unwrap_or_default(),
+    );
     // 录制缓冲（Record 模式）：原始 SSE 块逐字节收集，正常结束后落盘
     let mut rec_buf: Option<Vec<u8>> = replay_key.as_ref().map(|_| Vec::new());
     // 正文增量落库水位：full/reasoning 累计超过阈值即同步占位消息。
@@ -5909,19 +6064,15 @@ async fn stream_once(
                         consumed += pos + 1;
                         continue;
                     }
-                    usage_chunks.push(data.to_string());
+                    // Usage 通常只在流首尾出现。保留开头 8 条和最近 56 条，避免
+                    // 长回答为成本统计额外复制全部 SSE JSON，造成线性内存膨胀。
+                    retain_usage_chunk(&mut usage_chunks, data);
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                         if let Some(delta) = crate::utils::net::extract_stream_delta(protocol, &json) {
                             if !delta.is_empty() {
                                 full.push_str(&delta);
                                 last_progress_at = tokio::time::Instant::now();
-                                let _ = app.emit(
-                                    "chat-stream",
-                                    ChatStreamEvent {
-                                        conversation_id: conversation_id.to_string(),
-                                        delta: delta.to_string(),
-                                    },
-                                );
+                                event_batcher.push_content(&delta);
                             }
                         }
                         // 思考过程增量（推理模型）：单独事件推送 + 聚合入库
@@ -5929,13 +6080,7 @@ async fn stream_once(
                             if !r.is_empty() {
                                 reasoning_full.push_str(&r);
                                 last_progress_at = tokio::time::Instant::now();
-                                let _ = app.emit(
-                                    "chat-reasoning",
-                                    ChatReasoningEvent {
-                                        conversation_id: conversation_id.to_string(),
-                                        delta: r,
-                                    },
-                                );
+                                event_batcher.push_reasoning(&r);
                             }
                         }
                         // 原生 function calling 增量（OpenAI 兼容协议流式 tool_calls）：按 index 合并
@@ -6152,6 +6297,8 @@ async fn stream_once(
             },
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
                 registry.touch(conversation_id, PHASE_STREAMING);
+                // Provider 暂停发送时也及时交付尾部小批次；最大感知延迟 200ms。
+                event_batcher.flush();
                 if is_cancelled(cancel, conversation_id) {
                     crate::utils::logger::log_event(
                         "stop_effective",
@@ -6478,13 +6625,15 @@ fn has_action_commitment_phrase(text: &str) -> bool {
 /// “任务已完成/任务全部完成/任务已经完成”（复核轮本身即确认语境，弱信号安全）即视为确认完成。
 /// 仅在 completion_reviews > 0（复核已注入）时由主循环调用，非复核轮不受影响。
 fn is_completion_confirmation(text: &str) -> bool {
-    let t = text.trim_start();
-    ["✅ 任务已完成", "✅ 任务完成", "✅ 任务全部完成"]
-        .iter()
-        .any(|s| t.contains(s))
-        || t.contains("任务已完成")
-        || t.contains("任务全部完成")
-        || t.contains("任务已经完成")
+    text.lines().any(|line| {
+        let line = line.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '*' | '>' | '#'));
+        ["✅ 任务已完成", "✅ 任务完成", "✅ 任务全部完成"]
+            .iter()
+            .any(|s| line.contains(s))
+            || line.starts_with("任务已完成")
+            || line.starts_with("任务全部完成")
+            || line.starts_with("任务已经完成")
+    })
 }
 
 // ---------- 子 Agent（spawn_agents 工具） ----------
@@ -9333,9 +9482,23 @@ mod completion_confirmation_tests {
     #[test]
     fn rejects_non_confirmations() {
         assert!(!is_completion_confirmation("任务未完成，还需继续执行"));
+        assert!(!is_completion_confirmation("如果任务已完成，请告诉用户"));
+        assert!(!is_completion_confirmation("尚未确认任务已完成，需要继续验证"));
         assert!(!is_completion_confirmation("（工具结果）构建失败，正在排查"));
         assert!(!is_completion_confirmation("好的，我继续读取文件"));
         assert!(!is_completion_confirmation(""));
+    }
+
+    #[test]
+    fn usage_chunk_retention_is_bounded_and_keeps_edges() {
+        let mut chunks = Vec::new();
+        for i in 0..200 {
+            retain_usage_chunk(&mut chunks, &format!("chunk-{i}"));
+        }
+        assert_eq!(chunks.len(), 64);
+        assert_eq!(chunks.first().map(String::as_str), Some("chunk-0"));
+        assert!(chunks.iter().any(|s| s == "chunk-7"));
+        assert_eq!(chunks.last().map(String::as_str), Some("chunk-199"));
     }
 }
 

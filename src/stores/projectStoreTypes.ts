@@ -26,6 +26,8 @@ import type { TaskRun } from '../api/cost'
 /** 流式回复状态 */
 export interface StreamingState {
   conversationId: string | null
+  /** 后端任务运行代次；用于丢弃停止/重试后的旧流式与终态事件。 */
+  runId: string | null
   content: string
   /** 思考过程（推理模型 reasoning 流，无则空串） */
   reasoning: string

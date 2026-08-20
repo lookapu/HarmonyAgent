@@ -1098,6 +1098,7 @@ mod tests {
                 sdk.join("default").join("sdk-pkg.json").display()
             );
         }
+        #[cfg(windows)]
         if std::env::var("DEVECO_SDK_HOME").is_ok() {
             assert!(hvigor_env().is_empty(), "用户显式配置时应保持不注入");
         }

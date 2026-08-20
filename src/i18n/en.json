@@ -1257,6 +1257,7 @@
     "filter": "Filter:",
     "all": "All",
     "success": "Success",
+    "incomplete": "Incomplete",
     "failed": "Failed",
     "cancelled": "Cancelled",
     "runsEmpty": "No task records yet (auto-generated after chatting)",

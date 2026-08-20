@@ -222,8 +222,7 @@ async fn run_job(
                 // 先置停止中（job_list 立即反映终止意图），再强杀进程树
                 mark_stopping(job);
                 crate::utils::process::kill_tree(pid);
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                finish_job_readers(stdout_task, stderr_task).await;
                 let summary = format!("命令超时（>{timeout_secs}s），已终止: {program}");
                 finish_job(job, false, summary.clone());
                 notify(&app, &conv, &job_id, &command, false, &summary);
@@ -231,8 +230,7 @@ async fn run_job(
             }
         }
     };
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    finish_job_readers(stdout_task, stderr_task).await;
 
     let ok = status.success();
     let summary = if ok {
@@ -247,6 +245,20 @@ async fn run_job(
         .map(|j| j.summary.clone().unwrap_or_else(|| summary.clone()))
         .unwrap_or_else(|_| summary.clone());
     notify(&app, &conv, &job_id, &command, ok, &final_summary);
+}
+
+/// Windows 包装命令退出后，孙进程可能继续持有管道句柄。限制 EOF 收尾等待时间，
+/// 避免后台 job 永久停在 running/stopping 并持续占用 agent 流转状态。
+async fn finish_job_readers(
+    mut stdout_task: tokio::task::JoinHandle<()>,
+    mut stderr_task: tokio::task::JoinHandle<()>,
+) {
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut stdout_task).await.is_err() {
+        stdout_task.abort();
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut stderr_task).await.is_err() {
+        stderr_task.abort();
+    }
 }
 
 /// 结束收尾：注入会话队列（模型下一轮请求自动看到）+ 前端事件
@@ -319,6 +331,15 @@ async fn read_line_smart<R: tokio::io::AsyncBufRead + Unpin>(
     }
     while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
         buf.pop();
+    }
+    const MAX_LINE_BYTES: usize = 64 * 1024;
+    if buf.len() > MAX_LINE_BYTES {
+        let drop_n = buf.len() - MAX_LINE_BYTES;
+        buf.drain(..drop_n);
+        return Some(format!(
+            "[单行输出过长，已省略前 {drop_n} 字节] {}",
+            crate::agent::tools::smart_decode(buf)
+        ));
     }
     Some(crate::agent::tools::smart_decode(buf))
 }

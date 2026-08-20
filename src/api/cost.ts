@@ -72,7 +72,7 @@ export interface TaskRun {
   project_id: string
   provider_id: string | null
   model: string | null
-  /** success | error | cancelled */
+  /** success | incomplete | error | cancelled */
   status: string
   error_kind: string | null
   error_message: string | null
@@ -93,7 +93,7 @@ export const getDailyUsage = (range: DateRange) => invokeWithError<DailyUsage[]>
 export const getTaskStats = (projectId?: string, days = 30) =>
   invokeWithError<TaskStats>('get_task_stats', { projectId: projectId ?? '', days })
 
-/** 最近任务列表；project_id 为空 = 全局；status 可选过滤（success/error/cancelled） */
+/** 最近任务列表；project_id 为空 = 全局；status 可选过滤（success/incomplete/error/cancelled） */
 export const getTaskRuns = (projectId?: string, status?: string, limit = 20) =>
   invokeWithError<TaskRun[]>('get_task_runs', { projectId: projectId ?? '', status: status ?? '', limit })
 

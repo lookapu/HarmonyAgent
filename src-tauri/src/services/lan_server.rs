@@ -35,7 +35,9 @@ use crate::db::DbState;
 /// 事件桥转发白名单（与前端 chatSlice 监听的桌面事件一致）
 const EVENT_WHITELIST: &[&str] = &[
     "chat-stream",
+    "chat-stream-batch",
     "chat-reasoning",
+    "chat-run-started",
     "chat-done",
     "chat-error",
     "chat-stopped",
@@ -47,6 +49,7 @@ const EVENT_WHITELIST: &[&str] = &[
     "chat-ask",
     "agent:todo",
     "agent:log",
+    "agent:log-batch",
     "chat-agent-start",
     "chat-agent-done",
     "chat-job-done",
@@ -623,7 +626,17 @@ impl LanServer {
                     });
 
                 match name.as_str() {
-                    "chat-stream" | "chat-reasoning" => {
+                    "chat-run-started" => {
+                        if let Some(cid) = &conv {
+                            if let Ok(mut buf) = buffer.lock() {
+                                let cb = buf.entry(cid.clone()).or_default();
+                                cb.entries.clear();
+                                cb.bytes = 0;
+                                cb.push(name.clone(), payload.clone(), now);
+                            }
+                        }
+                    }
+                    "chat-stream" | "chat-stream-batch" | "chat-reasoning" => {
                         if let Some(cid) = &conv {
                             if let Ok(mut buf) = buffer.lock() {
                                 let cb = buf.entry(cid.clone()).or_default();
@@ -1561,4 +1574,3 @@ mod tests {
         assert_eq!(cb.entries.len(), 1);
     }
 }
-

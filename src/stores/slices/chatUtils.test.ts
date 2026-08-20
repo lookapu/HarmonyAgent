@@ -5,10 +5,23 @@ import {
   advancePlan,
   escapeHtml,
   toHtml,
+  acceptsRunEvent,
 } from './chatUtils'
 import type { ChatMessage } from '../../api/project'
 
 const msg = (role: string, content: string): ChatMessage => ({ role, content } as ChatMessage)
+
+describe('acceptsRunEvent', () => {
+  it('拒绝旧任务延迟事件', () => {
+    expect(acceptsRunEvent('run-new', 'run-old')).toBe(false)
+    expect(acceptsRunEvent('run-new', 'run-new')).toBe(true)
+  })
+
+  it('握手前拒绝带代次事件，同时兼容旧后端无代次事件', () => {
+    expect(acceptsRunEvent(null, 'run-new')).toBe(false)
+    expect(acceptsRunEvent('run-new')).toBe(true)
+  })
+})
 
 describe('parsePlanSteps', () => {
   it('解析连续有序列表为步骤', () => {

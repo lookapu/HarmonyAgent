@@ -34,7 +34,7 @@ import {
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger } from '../../api/project'
 import type { StateCreator } from 'zustand'
 import type { ChatSlice, DiagnoseCard, ProjectState, StreamingState } from '../projectStoreTypes'
-import { advancePlan } from './chatUtils'
+import { acceptsRunEvent, advancePlan } from './chatUtils'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
@@ -48,6 +48,7 @@ import { STORAGE_KEYS } from '../../constants'
 type PendingLogLine = { stream: string; line: string; ts: number; convId: string }
 let pendingLogLines: PendingLogLine[] = []
 let logFlushScheduled = false
+let logFlushTimer: ReturnType<typeof setTimeout> | null = null
 /** buildLogs 全局自增 id，用作稳定 React key（清屏后归零无妨，key 仅在当前列表内唯一） */
 let buildLogSeq = 0
 const nextBuildLogId = () => ++buildLogSeq
@@ -64,12 +65,22 @@ const STREAM_WATCHDOG_LONG_MS = 8 * 60 * 1000
 let toolSeq = 0
 let agentSeq = 0
 
+/** Provider 往往按 token 发送 Tauri 事件；按动画帧合并状态更新，避免长回答压满 WebView2 主线程。 */
+type PendingStreamDelta = { content: string; reasoning: string }
+const pendingStreamDeltas = new Map<string, PendingStreamDelta>()
+let streamFlushScheduled = false
+let streamFlushTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 后台标签页的 rAF 会被限频；给尚未刷新的日志设硬上限，防事件洪峰无限占用内存。 */
+const MAX_PENDING_LOG_LINES = 4000
+
 /** 发送消息性能追踪：convId → trace（首个 delta 标记 TTFB，chat-done 结束） */
 const sendTraces = new Map<string, ReturnType<typeof startPerfTrace>>()
 
 /** 空流式状态 */
 const emptyStreaming = (): StreamingState => ({
   conversationId: null,
+  runId: null,
   content: '',
   reasoning: '',
   error: null,
@@ -110,6 +121,68 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         streaming: s.currentConversation ? streamings[s.currentConversation.id] ?? emptyStreaming() : emptyStreaming(),
       }
     })
+
+  /** 把一个或全部会话积攒的正文/思考增量一次性写入 Zustand。 */
+  const flushStreamDeltas = (onlyConversationId?: string) => {
+    if (!onlyConversationId) {
+      streamFlushScheduled = false
+      if (streamFlushTimer !== null) {
+        clearTimeout(streamFlushTimer)
+        streamFlushTimer = null
+      }
+    }
+    if (pendingStreamDeltas.size === 0) return
+    const batch = new Map<string, PendingStreamDelta>()
+    if (onlyConversationId) {
+      const delta = pendingStreamDeltas.get(onlyConversationId)
+      if (!delta) return
+      batch.set(onlyConversationId, delta)
+      pendingStreamDeltas.delete(onlyConversationId)
+    } else {
+      for (const entry of pendingStreamDeltas) batch.set(...entry)
+      pendingStreamDeltas.clear()
+    }
+    set((s) => {
+      let changed = false
+      const streamings = { ...s.streamings }
+      const now = Date.now()
+      for (const [convId, delta] of batch) {
+        const bucket = streamings[convId]
+        if (!bucket) continue
+        streamings[convId] = {
+          ...bucket,
+          content: bucket.content + delta.content,
+          reasoning: bucket.reasoning + delta.reasoning,
+          lastDeltaAt: now,
+        }
+        changed = true
+      }
+      if (!changed) return {}
+      return {
+        streamings,
+        streaming: s.currentConversation ? streamings[s.currentConversation.id] ?? emptyStreaming() : emptyStreaming(),
+      }
+    })
+  }
+
+  const queueStreamDelta = (convId: string, kind: keyof PendingStreamDelta, delta: string) => {
+    const prev = pendingStreamDeltas.get(convId) ?? { content: '', reasoning: '' }
+    pendingStreamDeltas.set(convId, { ...prev, [kind]: prev[kind] + delta })
+    if (!streamFlushScheduled) {
+      streamFlushScheduled = true
+      requestAnimationFrame(() => flushStreamDeltas())
+      // macOS/Windows 窗口最小化或失焦后 rAF 可能降到极低频率；定时器保证流式
+      // 状态仍持续收敛，避免缓冲一直增长、切回窗口时一次性大渲染。
+      streamFlushTimer = setTimeout(() => flushStreamDeltas(), 50)
+    }
+  }
+
+  /** 新任务开始后，任何旧 run_id 的延迟事件都不得修改当前桶。空 run_id 兼容旧 LAN 客户端。 */
+  const acceptsRun = (convId: string, runId?: string) => {
+    const bucket = get().streamings[convId]
+    if (!bucket) return false
+    return acceptsRunEvent(bucket.runId, runId)
+  }
 
   /**
    * 按会话维护待确认项（审批/计划/提问）：后台会话事件不再丢弃，统一记录到
@@ -169,6 +242,15 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         ...emptyStreaming(),
         error: '后端长时间无响应，已自动停止等待。请检查模型配置与网络后重试',
       })
+      // UI 释放必须与后端任务收敛同步；否则用户重试时旧任务仍持有项目锁，
+      // 只会得到“已有任务进行中”，形成假恢复。停止命令失败仍由后端看门狗兜底。
+      void stopChatApi(convId).catch(() => {})
+      const trace = sendTraces.get(convId)
+      if (trace) {
+        sendTraces.delete(convId)
+        trace.mark('watchdog-timeout')
+        trace.end()
+      }
       if (isCurrent) {
         set({
           toolRuns: [],
@@ -186,34 +268,64 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   }, 30 * 1000)
 
   // ---------- 流式事件监听（全局一次性注册） ----------
-  // 增量写入分桶（不要求是当前会话）：用户切走再切回，流式内容不丢
-  listen<{ conversation_id: string; delta: string }>('chat-stream', (event) => {
-    const { conversation_id, delta } = event.payload
+  listen<{ conversation_id: string; run_id: string }>('chat-run-started', (event) => {
+    const { conversation_id, run_id } = event.payload
     const bucket = get().streamings[conversation_id]
     if (!bucket) return
+    // 新代次是权威边界：清除可能由已终止旧任务残留在帧队列中的增量。
+    pendingStreamDeltas.delete(conversation_id)
+    setBucket(conversation_id, { runId: run_id })
+  }).catch(() => {})
+
+  // 增量写入分桶（不要求是当前会话）：用户切走再切回，流式内容不丢
+  listen<{ conversation_id: string; run_id?: string; delta: string }>('chat-stream', (event) => {
+    const { conversation_id, run_id, delta } = event.payload
+    if (!acceptsRun(conversation_id, run_id)) return
+    const bucket = get().streamings[conversation_id]
+    if (!bucket) return
+    const pending = pendingStreamDeltas.get(conversation_id)
     // 首个内容 delta：标记 TTFB（首个 token 到达时间）
-    if (!bucket.content && !bucket.reasoning) {
+    if (!bucket.content && !bucket.reasoning && !pending?.content && !pending?.reasoning) {
       const t = sendTraces.get(conversation_id)
       t?.mark('ttfb')
     }
-    setBucket(conversation_id, { content: bucket.content + delta })
+    queueStreamDelta(conversation_id, 'content', delta)
+  }).catch(() => {})
+
+  // Rust 侧已按 32ms/8KB 合并模型 token，进一步降低 Tauri IPC 压力；
+  // 仍进入同一个前端帧级队列，统一保证后台窗口和多会话行为。
+  listen<{ conversation_id: string; run_id?: string; content: string; reasoning: string }>('chat-stream-batch', (event) => {
+    const { conversation_id, run_id, content, reasoning } = event.payload
+    if (!acceptsRun(conversation_id, run_id)) return
+    const bucket = get().streamings[conversation_id]
+    if (!bucket) return
+    const pending = pendingStreamDeltas.get(conversation_id)
+    if (!bucket.content && !bucket.reasoning && !pending?.content && !pending?.reasoning && (content || reasoning)) {
+      sendTraces.get(conversation_id)?.mark('ttfb')
+    }
+    if (content) queueStreamDelta(conversation_id, 'content', content)
+    if (reasoning) queueStreamDelta(conversation_id, 'reasoning', reasoning)
   }).catch(() => {})
 
   // 思考过程流式增量（推理模型 reasoning_content 透传；同样分桶）
-  listen<{ conversation_id: string; delta: string }>('chat-reasoning', (event) => {
-    const { conversation_id, delta } = event.payload
+  listen<{ conversation_id: string; run_id?: string; delta: string }>('chat-reasoning', (event) => {
+    const { conversation_id, run_id, delta } = event.payload
+    if (!acceptsRun(conversation_id, run_id)) return
     const bucket = get().streamings[conversation_id]
     if (!bucket) return
+    const pending = pendingStreamDeltas.get(conversation_id)
     // 首个思考 delta 也算 TTFB（推理模型可能先吐 thinking 再吐 content）
-    if (!bucket.content && !bucket.reasoning) {
+    if (!bucket.content && !bucket.reasoning && !pending?.content && !pending?.reasoning) {
       const t = sendTraces.get(conversation_id)
       t?.mark('ttfb')
     }
-    setBucket(conversation_id, { reasoning: bucket.reasoning + delta })
+    queueStreamDelta(conversation_id, 'reasoning', delta)
   }).catch(() => {})
 
-  listen<{ conversation_id: string; message: ChatMessage; unfinished: boolean; user_message_id?: string | null }>('chat-done', (event) => {
-    const { conversation_id, message, unfinished, user_message_id } = event.payload
+  listen<{ conversation_id: string; run_id?: string; message: ChatMessage; unfinished: boolean; user_message_id?: string | null }>('chat-done', (event) => {
+    const { conversation_id, run_id, message, unfinished, user_message_id } = event.payload
+    if (!acceptsRun(conversation_id, run_id)) return
+    flushStreamDeltas(conversation_id)
     const state = get()
     // 分桶清理无条件执行（后台会话结束也释放流式槽位）；视图状态仅当前会话更新
     const bucket = state.streamings[conversation_id]
@@ -265,8 +377,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           tokensIn: message.tokens_in ?? 0,
           tokensOut: message.tokens_out ?? 0,
         },
-        // 任务正常结束：进度卡定档保留
-        plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'done' } : state.plan,
+        // 只有通过后端完成验收才标记 done；护栏收尾/复核未通过保持 error，
+        // 避免“继续任务”按钮与绿色完成进度卡相互矛盾。
+        plan:
+          state.plan && state.plan.phase === 'running'
+            ? { ...state.plan, phase: unfinished ? 'error' : 'done' }
+            : state.plan,
         // 任务未完成（上限中止/用户停止/中途失败，有工具成果无最终总结）：
         // 保留"继续任务"按钮断点续跑；正常完成则清空
         unfinishedConv: unfinished ? { conversationId: conversation_id } : null,
@@ -309,6 +425,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     const state = get()
     const streamings = { ...state.streamings }
     delete streamings[conversation_id]
+    pendingStreamDeltas.delete(conversation_id)
+    const deletedTrace = sendTraces.get(conversation_id)
+    sendTraces.delete(conversation_id)
+    deletedTrace?.end()
     const pendingConfirmations = { ...state.pendingConfirmations }
     delete pendingConfirmations[conversation_id]
     if (state.currentConversation?.id === conversation_id) {
@@ -340,17 +460,39 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     }
   }).catch(() => {})
 
-  listen<{ conversation_id: string; error: string; kind: string; title: string; reason: string; suggestion: string; retryable: boolean; status_code?: number | null }>(
+  listen<{ conversation_id: string; run_id?: string; error: string; kind: string; title: string; reason: string; suggestion: string; retryable: boolean; status_code?: number | null }>(
     'chat-error',
     (event) => {
-      const { conversation_id, error, kind, title, reason, suggestion, retryable, status_code } = event.payload
+      const { conversation_id, run_id, error, kind, title, reason, suggestion, retryable, status_code } = event.payload
+      if (!acceptsRun(conversation_id, run_id)) return
+      flushStreamDeltas(conversation_id)
       const state = get()
       const bucket = state.streamings[conversation_id]
       if (!bucket) return
+      const trace = sendTraces.get(conversation_id)
+      if (trace) {
+        sendTraces.delete(conversation_id)
+        trace.mark('backend-error')
+        trace.end()
+      }
       const isCurrent = state.currentConversation?.id === conversation_id
       setBucket(conversation_id, {
         error,
         errorDetail: { kind, title, reason, suggestion, retryable, statusCode: status_code ?? null },
+      })
+      set((s) => {
+        const pendingConfirmations = { ...s.pendingConfirmations }
+        delete pendingConfirmations[conversation_id]
+        const current = s.currentConversation?.id === conversation_id
+        return {
+          pendingConfirmations,
+          ...(current
+            ? {
+                toolApprovals: [],
+                pendingPlan: s.pendingPlan?.conversationId === conversation_id ? null : s.pendingPlan,
+              }
+            : {}),
+        }
       })
       if (isCurrent) {
         set({
@@ -364,14 +506,35 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   ).catch(() => {})
 
   // 用户停止且无内容可入库：清空流式状态（有内容时后端走 chat-done）
-  listen<{ conversation_id: string; unfinished: boolean }>('chat-stopped', (event) => {
-    const { conversation_id, unfinished } = event.payload
+  listen<{ conversation_id: string; run_id?: string; unfinished: boolean }>('chat-stopped', (event) => {
+    const { conversation_id, run_id, unfinished } = event.payload
+    if (!acceptsRun(conversation_id, run_id)) return
+    flushStreamDeltas(conversation_id)
     const state = get()
     const bucket = state.streamings[conversation_id]
     if (!bucket) return
+    const trace = sendTraces.get(conversation_id)
+    if (trace) {
+      sendTraces.delete(conversation_id)
+      trace.mark('stopped')
+      trace.end()
+    }
     const isCurrent = state.currentConversation?.id === conversation_id
     const partial = bucket.content.trim()
     setBucket(conversation_id, null)
+    set((s) => {
+      const pendingConfirmations = { ...s.pendingConfirmations }
+      delete pendingConfirmations[conversation_id]
+      return {
+        pendingConfirmations,
+        ...(isCurrent
+          ? {
+              toolApprovals: [],
+              pendingPlan: s.pendingPlan?.conversationId === conversation_id ? null : s.pendingPlan,
+            }
+          : {}),
+      }
+    })
     if (isCurrent) {
       // 已流式输出的内容不因无正文入库而消失：作为临时消息追加展示（不落库，刷新会话后回到真实历史）
       const messages =
@@ -414,6 +577,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     'chat-tool-start',
     (event) => {
       const { conversation_id, tool, args, round, total, level, desc } = event.payload
+      flushStreamDeltas(conversation_id)
       const state = get()
       // 工具活动按会话计数（看门狗判据，后台会话同样生效）
       const bucket = state.streamings[conversation_id]
@@ -662,6 +826,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   // 高频输出下用 rAF 批处理：日志先进缓冲，每帧合并一次 set，避免逐行 set 卡死主线程。
   const flushPendingLogs = () => {
     logFlushScheduled = false
+    if (logFlushTimer !== null) {
+      clearTimeout(logFlushTimer)
+      logFlushTimer = null
+    }
     const batch = pendingLogLines
     pendingLogLines = []
     if (batch.length === 0) return
@@ -703,16 +871,36 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     })
   }
 
+  const scheduleLogFlush = () => {
+    if (logFlushScheduled) return
+    logFlushScheduled = true
+    requestAnimationFrame(flushPendingLogs)
+    // 后台/最小化窗口中 rAF 会被节流；100ms 兜底同时适用于 WKWebView 与 WebView2。
+    logFlushTimer = setTimeout(flushPendingLogs, 100)
+  }
+
   listen<{ conversation_id: string; stream: string; line: string }>('agent:log', (event) => {
     const { conversation_id, stream, line } = event.payload
     const state = get()
     // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
     if (state.currentConversation?.id !== conversation_id) return
     pendingLogLines.push({ stream, line, ts: Date.now(), convId: conversation_id })
-    if (!logFlushScheduled) {
-      logFlushScheduled = true
-      requestAnimationFrame(flushPendingLogs)
+    if (pendingLogLines.length > MAX_PENDING_LOG_LINES) {
+      pendingLogLines.splice(0, pendingLogLines.length - MAX_PENDING_LOG_LINES)
     }
+    scheduleLogFlush()
+  }).catch(() => {})
+
+  // Rust 命令执行器把高频 stdout/stderr 合并成批量 IPC；单行事件仍用于系统提示并保持兼容。
+  listen<{ conversation_id: string; stream: string; lines: string[] }>('agent:log-batch', (event) => {
+    const { conversation_id, stream, lines } = event.payload
+    if (get().currentConversation?.id !== conversation_id || lines.length === 0) return
+    const ts = Date.now()
+    for (const line of lines) pendingLogLines.push({ stream, line, ts, convId: conversation_id })
+    if (pendingLogLines.length > MAX_PENDING_LOG_LINES) {
+      pendingLogLines.splice(0, pendingLogLines.length - MAX_PENDING_LOG_LINES)
+    }
+    scheduleLogFlush()
   }).catch(() => {})
 
   // 任务清单（todo_write）：后端推送合并后的完整清单，前端实时渲染进度
@@ -1085,7 +1273,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         sendTraces.delete(conv.id)
         sendTrace.mark('error')
         sendTrace.end()
-        setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
+        // 看门狗报错后用户可能已立即重试；旧 invoke 的延迟 reject 不得覆盖新任务桶。
+        if (get().streamings[conv.id]?.startedAt === fresh.startedAt) {
+          setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
+        }
       }
     },
 
@@ -1289,7 +1480,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         sendTrace.end()
         // 失败时也刷新消息（regenerate 模式可能已删除旧回复），保持界面一致
         set({ messages: await listMessages(conv.id).catch(() => get().messages), olderHasMore: false })
-        setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
+        if (get().streamings[conv.id]?.startedAt === fresh.startedAt) {
+          setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
+        }
       }
     },
 

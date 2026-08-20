@@ -511,6 +511,9 @@ pub fn command(program: &str, args: &[String]) -> Result<tokio::process::Command
             cmd.args(args);
         }
         apply_jdk_env(&mut cmd);
+        // Agent task被看门狗 abort 时 Child 会被直接 drop；默认行为会把进程遗留在后台。
+        // 至少终止直接子进程，正常的超时/停止路径仍用 kill_tree 处理完整进程树。
+        cmd.kill_on_drop(true);
         Ok(cmd)
     }
 
@@ -523,6 +526,7 @@ pub fn command(program: &str, args: &[String]) -> Result<tokio::process::Command
             cmd.args(args);
         }
         apply_jdk_env(&mut cmd);
+        cmd.kill_on_drop(true);
         Ok(cmd)
     }
 }
@@ -537,6 +541,10 @@ fn apply_jdk_env(cmd: &mut tokio::process::Command) {
 /// 强杀整个子进程树（Windows 用 taskkill /T /F，其他平台 kill -9）。
 /// 解决 cmd.exe / npx 包装启动的子进程只杀直接子进程时孙进程残留的问题
 /// （残留进程会继续占用管道/端口，且 npx 下载卡住时反复 spawn 会堆积）。
+///
+/// 这里只负责发起终止，不同步等待 taskkill/kill 退出。该函数会被 Tauri 同步命令和
+/// async worker 共同调用；Windows 上 `.output()` 偶尔会被系统进程查询/安全软件拖住，
+/// 进而直接冻结命令处理线程乃至界面。调用方通过 child.wait/管道收尾观察最终退出。
 pub fn kill_tree(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     if pid == 0 {
@@ -548,13 +556,25 @@ pub fn kill_tree(pid: Option<u32>) {
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .creation_flags(CREATE_NO_WINDOW)
-            .output();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
     #[cfg(not(windows))]
     {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output();
+        // macOS/Linux 同样可能有 shell/node/hvigor 孙进程继续持有管道。先终止直接
+        // 子进程，再终止包装器本身；通过 sh 顺序执行，避免父进程先死后子进程被
+        // reparent 导致 `pkill -P` 再也找不到。pkill 不存在/无匹配时仍继续 kill 父进程。
+        let script = format!(
+            "pkill -KILL -P {pid} >/dev/null 2>&1 || true; kill -KILL {pid} >/dev/null 2>&1 || true"
+        );
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
 

@@ -7,6 +7,11 @@ import remarkRehype from 'remark-rehype'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import rehypeStringify from 'rehype-stringify'
 
+/** 运行代次匹配：无事件 ID 兼容旧后端；有 ID 时必须与当前任务一致。 */
+export function acceptsRunEvent(activeRunId: string | null | undefined, eventRunId?: string): boolean {
+  return !eventRunId || activeRunId === eventRunId
+}
+
 /** 从 Agent 正文解析"计划列表"（Markdown 有序列表，2~10 项，含工具标记/代码块的列表块不采用）。
  * 模型常以有序列表给出任务步骤；无匹配返回 null（不显示进度卡，工具卡已足够）。 */
 export function parsePlanSteps(text: string): string[] | null {

@@ -838,7 +838,7 @@ pub fn insert_task_run(conn: &Connection, t: &TaskRun) -> Result<(), rusqlite::E
     Ok(())
 }
 
-/// 最近任务列表（倒序分页）：project_id 为空表示全局；status 可选过滤（success/error/cancelled）
+/// 最近任务列表（倒序分页）：project_id 为空表示全局；status 可选过滤（success/incomplete/error/cancelled）
 pub fn list_task_runs(
     conn: &Connection,
     project_id: &str,
@@ -1134,4 +1134,3 @@ fn row_to_knowledge(row: &rusqlite::Row) -> rusqlite::Result<KnowledgeEntry> {
         updated_at: row.get(10)?,
     })
 }
-

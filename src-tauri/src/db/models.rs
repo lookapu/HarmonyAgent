@@ -421,7 +421,7 @@ pub struct TaskRun {
     pub project_id: String,
     pub provider_id: Option<String>,
     pub model: Option<String>,
-    /// success | error | cancelled
+    /// success | incomplete | error | cancelled
     pub status: String,
     /// 错误分类（errors::ErrorKind::as_str）
     pub error_kind: Option<String>,

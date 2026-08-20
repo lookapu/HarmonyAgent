@@ -116,6 +116,33 @@ pub struct LogEvent {
     pub line: String,
 }
 
+/// 高频子进程输出批量事件。把几十行合为一次 IPC，避免 Windows WebView2 事件泵被
+/// hvigor/hdc 的逐行输出淹没；系统提示仍使用单行 LogEvent 以保证即时性。
+#[derive(serde::Serialize, Clone)]
+pub struct LogBatchEvent {
+    pub conversation_id: String,
+    pub stream: String,
+    pub lines: Vec<String>,
+}
+
+impl ToolCtx {
+    fn emit_log_batch(&self, stream: &str, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(app) = &self.app {
+            let _ = app.emit(
+                "agent:log-batch",
+                LogBatchEvent {
+                    conversation_id: self.conversation_id.clone(),
+                    stream: stream.to_string(),
+                    lines: lines.to_vec(),
+                },
+            );
+        }
+    }
+}
+
 /// 构建日志落盘目录：{project}/.deveco-agent/logs
 pub fn log_dir(project_path: &str) -> PathBuf {
     PathBuf::from(project_path).join(".deveco-agent").join("logs")
@@ -164,7 +191,7 @@ pub async fn run_cmd_streaming_env(
     log_file: Option<&std::path::Path>,
     envs: Option<&[(String, String)]>,
 ) -> Result<Output, String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut cmd = crate::utils::process::command(program, args)?;
     if let Some(envs) = envs {
@@ -197,50 +224,114 @@ pub async fn run_cmd_streaming_env(
         while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
             buf.pop();
         }
+        const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
+        if buf.len() > MAX_EVENT_LINE_BYTES {
+            let drop_n = buf.len() - MAX_EVENT_LINE_BYTES;
+            buf.drain(..drop_n);
+            return Some(format!(
+                "[单行输出过长，已省略前 {drop_n} 字节] {}",
+                crate::agent::tools::smart_decode(buf)
+            ));
+        }
         Some(crate::agent::tools::smart_decode(buf))
     }
 
-    // 每个流读取任务持有 ctx 的 clone 与 log_file 的 clone
+    // 日志目录只同步创建一次；文件写入由 Tokio 文件句柄批量完成，避免每一行都在
+    // async worker 上同步 open/write/close（Windows Defender 下该模式尤其容易卡顿）。
+    if let Some(path) = log_file {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
+    // 每个流读取任务持有 ctx 的 clone 与独立 append 句柄。stdout/stderr 原本就是并发流，
+    // 因此跨流的严格行顺序不作保证；单个批次内顺序保持不变。
+    let stdout_snapshot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_for_task = stdout_snapshot.clone();
     let ctx_out = ctx.clone();
     let log_out = log_file.map(|p| p.to_path_buf());
     let stdout_task = tokio::spawn(async move {
-        let mut collected = String::new();
+        let mut log = match log_out {
+            Some(path) => tokio::fs::OpenOptions::new().create(true).append(true).open(path).await.ok(),
+            None => None,
+        };
         if let Some(pipe) = stdout {
             let mut reader = BufReader::new(pipe);
             let mut buf: Vec<u8> = Vec::new();
+            let mut event_lines: Vec<String> = Vec::with_capacity(32);
+            let mut last_event_flush = tokio::time::Instant::now() - std::time::Duration::from_millis(50);
             while let Some(line) = read_line_smart(&mut reader, &mut buf).await {
-                collected.push_str(&line);
-                collected.push('\n');
-                // 收集缓冲上限：构建输出可达数十 MB，只保留尾部供工具结果解析
-                // （完整日志已逐行落盘 + 推送事件，不依赖此缓冲）
-                keep_tail_of_collected(&mut collected);
-                ctx_out.emit_log("stdout", &line);
-                if let Some(p) = &log_out {
-                    append_log(p, &(line + "\n"));
+                if let Ok(mut collected) = stdout_for_task.lock() {
+                    collected.push_str(&line);
+                    collected.push('\n');
+                    // 收集缓冲上限：构建输出可达数十 MB，只保留尾部供工具结果解析
+                    // （完整日志已逐行落盘 + 推送事件，不依赖此缓冲）
+                    keep_tail_of_collected(&mut collected);
+                }
+                event_lines.push(line);
+                if event_lines.len() >= 32 || last_event_flush.elapsed() >= std::time::Duration::from_millis(50) {
+                    ctx_out.emit_log_batch("stdout", &event_lines);
+                    if let Some(file) = &mut log {
+                        let chunk = event_lines.join("\n") + "\n";
+                        let _ = file.write_all(chunk.as_bytes()).await;
+                    }
+                    event_lines.clear();
+                    last_event_flush = tokio::time::Instant::now();
                 }
             }
+            ctx_out.emit_log_batch("stdout", &event_lines);
+            if let Some(file) = &mut log {
+                if !event_lines.is_empty() {
+                    let chunk = event_lines.join("\n") + "\n";
+                    let _ = file.write_all(chunk.as_bytes()).await;
+                }
+                let _ = file.flush().await;
+            }
         }
-        collected
+        stdout_for_task.lock().map(|s| s.clone()).unwrap_or_default()
     });
 
+    let stderr_snapshot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_for_task = stderr_snapshot.clone();
     let ctx_err = ctx.clone();
     let log_err = log_file.map(|p| p.to_path_buf());
     let stderr_task = tokio::spawn(async move {
-        let mut collected = String::new();
+        let mut log = match log_err {
+            Some(path) => tokio::fs::OpenOptions::new().create(true).append(true).open(path).await.ok(),
+            None => None,
+        };
         if let Some(pipe) = stderr {
             let mut reader = BufReader::new(pipe);
             let mut buf: Vec<u8> = Vec::new();
+            let mut event_lines: Vec<String> = Vec::with_capacity(32);
+            let mut last_event_flush = tokio::time::Instant::now() - std::time::Duration::from_millis(50);
             while let Some(line) = read_line_smart(&mut reader, &mut buf).await {
-                collected.push_str(&line);
-                collected.push('\n');
-                keep_tail_of_collected(&mut collected);
-                ctx_err.emit_log("stderr", &line);
-                if let Some(p) = &log_err {
-                    append_log(p, &(line + "\n"));
+                if let Ok(mut collected) = stderr_for_task.lock() {
+                    collected.push_str(&line);
+                    collected.push('\n');
+                    keep_tail_of_collected(&mut collected);
+                }
+                event_lines.push(line);
+                if event_lines.len() >= 32 || last_event_flush.elapsed() >= std::time::Duration::from_millis(50) {
+                    ctx_err.emit_log_batch("stderr", &event_lines);
+                    if let Some(file) = &mut log {
+                        let chunk = event_lines.join("\n") + "\n";
+                        let _ = file.write_all(chunk.as_bytes()).await;
+                    }
+                    event_lines.clear();
+                    last_event_flush = tokio::time::Instant::now();
                 }
             }
+            ctx_err.emit_log_batch("stderr", &event_lines);
+            if let Some(file) = &mut log {
+                if !event_lines.is_empty() {
+                    let chunk = event_lines.join("\n") + "\n";
+                    let _ = file.write_all(chunk.as_bytes()).await;
+                }
+                let _ = file.flush().await;
+            }
         }
-        collected
+        stderr_for_task.lock().map(|s| s.clone()).unwrap_or_default()
     });
 
     // 等待结束：同时监听超时与“停止当前工具”请求（轮询中断标志，命中强杀进程树）
@@ -252,16 +343,14 @@ pub async fn run_cmd_streaming_env(
             r = &mut wait_fut => break r.map_err(|e| format!("等待命令失败: {e}"))?,
             _ = tokio::time::sleep_until(deadline) => {
                 crate::utils::process::kill_tree(pid);
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = finish_output_readers(stdout_task, stderr_task, &stdout_snapshot, &stderr_snapshot).await;
                 return Err(format!("命令超时（>{timeout_secs}s），已终止: {program}"));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
                 // 消费式检查：中断后清除标志，避免下一次工具调用被误中断
                 if take_stop_tool(&ctx.conversation_id) {
                     crate::utils::process::kill_tree(pid);
-                    let _ = stdout_task.await;
-                    let _ = stderr_task.await;
+                    let _ = finish_output_readers(stdout_task, stderr_task, &stdout_snapshot, &stderr_snapshot).await;
                     ctx.emit_log("system", "命令已由用户中断");
                     return Err("用户已停止当前工具".into());
                 }
@@ -269,14 +358,39 @@ pub async fn run_cmd_streaming_env(
         }
     };
 
-    let out = stdout_task.await.unwrap_or_default();
-    let err = stderr_task.await.unwrap_or_default();
+    let (out, err) = finish_output_readers(stdout_task, stderr_task, &stdout_snapshot, &stderr_snapshot).await;
 
     Ok(Output {
         status,
         stdout: out.into_bytes(),
         stderr: err.into_bytes(),
     })
+}
+
+/// 子进程/包装器已退出后，孙进程在 Windows 上仍可能持有继承的 stdout/stderr 句柄，
+/// 导致读取任务永远等不到 EOF。收尾最多等待 5 秒，之后中止读取任务；完整实时日志已
+/// 在读取过程中落盘/推送，宁可丢失极少量尾部也不能让整个 Agent 对话永久挂起。
+async fn finish_output_readers(
+    mut stdout_task: tokio::task::JoinHandle<String>,
+    mut stderr_task: tokio::task::JoinHandle<String>,
+    stdout_snapshot: &std::sync::Mutex<String>,
+    stderr_snapshot: &std::sync::Mutex<String>,
+) -> (String, String) {
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut stdout_task).await {
+        Ok(v) => v.unwrap_or_default(),
+        Err(_) => {
+            stdout_task.abort();
+            stdout_snapshot.lock().map(|s| s.clone()).unwrap_or_default()
+        }
+    };
+    let err = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut stderr_task).await {
+        Ok(v) => v.unwrap_or_default(),
+        Err(_) => {
+            stderr_task.abort();
+            stderr_snapshot.lock().map(|s| s.clone()).unwrap_or_default()
+        }
+    };
+    (out, err)
 }
 
 /// 收集缓冲超过阈值时丢弃前半（保留尾部，错误结论通常在日志末尾）：
