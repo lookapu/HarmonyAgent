@@ -230,6 +230,7 @@ pub async fn api_mock(
         std::path::PathBuf::from(&dir),
         12 * 3600,
         ctx,
+        None,
     )?;
 
     // 4) 返回使用说明
@@ -646,4 +647,3 @@ fn find_packaging_tool() -> Option<String> {
     }
     None
 }
-

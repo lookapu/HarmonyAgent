@@ -214,7 +214,9 @@ async fn post_spill(inv: &ToolInvocation<'_>, result: &mut Result<String, String
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    let fname = format!("{ts}-{safe_name}.txt");
+    // 秒级时间戳不足以区分同批并行的同名工具，追加随机后缀避免互相覆盖。
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let fname = format!("{ts}-{safe_name}-{}.txt", &suffix[..8]);
     if std::fs::write(spill_dir.join(&fname), out.as_str()).is_err() {
         return;
     }
@@ -263,18 +265,14 @@ pub(crate) fn tool_whitelisted(state: &DbState, project_id: &str, tool: &str) ->
         .unwrap_or(false)
 }
 
-/// 检查并消费停止请求（一次性：读取后清除，避免影响后续请求）
+/// 检查任务停止请求。标志在整个任务生命周期保持粘性，并在下一任务启动时统一清除；
+/// 并行工具不能由第一个检查者消费掉，否则其余工具会继续执行。
 pub(crate) fn is_cancelled(cancel: &ChatCancel, conversation_id: &str) -> bool {
-    if let Ok(set) = cancel.0.lock() {
-        if set.contains(conversation_id) {
-            drop(set);
-            if let Ok(mut set) = cancel.0.lock() {
-                set.remove(conversation_id);
-            }
-            return true;
-        }
-    }
-    false
+    cancel
+        .0
+        .lock()
+        .map(|set| set.contains(conversation_id))
+        .unwrap_or(false)
 }
 
 /// 等待用户审核（自动审核模式）：发事件给前端并等待确认；超时按拒绝处理。
@@ -325,10 +323,13 @@ pub(crate) async fn request_tool_approval(
             request_id: request_id.clone(),
             tool: tool.to_string(),
             args: args.to_string(),
+            level: permissions::tool_level(tool).as_str().to_string(),
+            desc: super::tool_short_desc(tool).to_string(),
         },
     );
-    // 60 秒未回复按拒绝处理（避免卡死任务）；等待期间用户点停止则立即返回
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    // 给复杂任务/后台窗口留足确认时间；前端可从 pending 状态恢复弹窗。仍设上限避免
+    // 无人值守任务永久占用会话，等待期间用户点停止会立即返回。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
     let mut rx = rx;
     loop {
         tokio::select! {

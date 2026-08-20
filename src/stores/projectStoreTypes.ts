@@ -131,6 +131,8 @@ export interface ToolApproval {
   requestId: string
   tool: string
   args: string
+  level?: string
+  desc?: string
 }
 
 /** Agent 推送的诊断引导卡片（需用户在 IDE/系统中手动操作的问题） */

@@ -1,10 +1,9 @@
-//! 工具响应缓存（[67]）：仅缓存 L0 只读工具（list_dir/read_file/search 等），
-//! 10-30s TTL，避免 Agent 在同一任务里重复调用只读工具时的重复 IO/计算。
+//! 工具响应缓存：仅缓存明确列入白名单的稳定查询工具，短 TTL 避免重复 IO/计算。
 //!
 //! 安全边界：
-//! - 只有 `permissions::tool_level == L0` 的工具才读写缓存（L1/L2 有副作用，绝不缓存）；
-//! - 缓存键含 project_id 与参数序列化（防跨项目/跨参数脏读）；
-//! - 写文件类工具成功后由调用方负责失效（本模块只按 TTL 过期，不感知文件系统）。
+//! - L0 只是必要条件，调用方还必须通过 `permissions::is_cacheable` 白名单；
+//! - 缓存键含 project_id、有效根目录范围与参数（防跨项目/跨权限范围脏读）；
+//! - 任意成功的非缓存工具调用都会由调用方清空缓存，正确性优先于命中率。
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -37,17 +36,18 @@ fn cache() -> std::sync::MutexGuard<'static, Option<HashMap<String, Entry>>> {
     guard
 }
 
-fn key(tool: &str, project_id: &str, args: &Value) -> String {
+fn key(tool: &str, project_id: &str, scope: &[String], args: &Value) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    scope.hash(&mut h);
     args.to_string().hash(&mut h);
     format!("{tool}\u{0}{project_id}\u{0}{}", h.finish())
 }
 
 /// 查询缓存（未命中或已过期返回 None；过期条目顺带清理）
-pub fn get(tool: &str, project_id: &str, args: &Value) -> Option<String> {
+pub fn get(tool: &str, project_id: &str, scope: &[String], args: &Value) -> Option<String> {
     let mut guard = cache();
     let now = now_sec();
-    let k = key(tool, project_id, args);
+    let k = key(tool, project_id, scope, args);
     let hit = guard
         .as_ref()
         .and_then(|m| m.get(&k))
@@ -61,8 +61,8 @@ pub fn get(tool: &str, project_id: &str, args: &Value) -> Option<String> {
     hit
 }
 
-/// 写入缓存（仅 L0 工具由调用方把关；TTL 固定 15s）
-pub fn put(tool: &str, project_id: &str, args: &Value, value: &str) {
+/// 写入缓存（仅稳定查询工具由调用方把关；TTL 固定 15s）
+pub fn put(tool: &str, project_id: &str, scope: &[String], args: &Value, value: &str) {
     let mut guard = cache();
     let m = guard.as_mut().expect("cache() 已初始化");
     if m.len() > 512 {
@@ -77,7 +77,7 @@ pub fn put(tool: &str, project_id: &str, args: &Value, value: &str) {
         }
     }
     m.insert(
-        key(tool, project_id, args),
+        key(tool, project_id, scope, args),
         Entry {
             expires_at: now_sec() + TTL_SECS,
             value: value.to_string(),
@@ -91,5 +91,23 @@ pub fn clear() {
         if let Some(m) = guard.as_mut() {
             m.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_isolated_by_effective_roots_and_clearable() {
+        clear();
+        let args = serde_json::json!({"path":"a.txt"});
+        let root_a = vec!["/workspace/a".to_string()];
+        let root_b = vec!["/workspace/b".to_string()];
+        put("read_harmony_doc", "p", &root_a, &args, "A");
+        assert_eq!(get("read_harmony_doc", "p", &root_a, &args).as_deref(), Some("A"));
+        assert!(get("read_harmony_doc", "p", &root_b, &args).is_none());
+        clear();
+        assert!(get("read_harmony_doc", "p", &root_a, &args).is_none());
     }
 }

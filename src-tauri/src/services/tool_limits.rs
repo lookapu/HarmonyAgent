@@ -1,7 +1,8 @@
 //! 工具资源限制（防 Agent 打转烧资源）。
 //!
 //! 三层护栏（原则：只拦真正的卡死/打转，不限制正常的深度任务）：
-//! - 全局并发：`build_project` / `deploy` 等重操作同一时间只允许 1 个（信号量排队）；
+//! - 工作区并发：同一项目的构建、命令、测试与 Git 写操作共享互斥门控，
+//!   不同项目仍可并行，后台进程会持有门控直到真实退出；
 //! - 打转检测：同一任务内连续 N 次“同一工具 + 同一参数”的重复调用判定打转，
 //!   只拦截无进展的原地踏步，连续读不同文件/搜索等正常推进不受限（单任务可达数百次）；
 //! - 重操作频率：同一任务内 build/deploy 最多调用 N 次（有副作用且耗时，反复执行无意义）。
@@ -32,7 +33,7 @@ const CONCURRENT_TOOLS: &[&str] = &[
     "build_project", "deploy", "run_command", "run_tests", "git_commit", "ohpm_install", "git_stash",
 ];
 
-/// 重操作并发信号量（每工具 1 个 permit → 全局同一时间只有一个构建/部署）
+/// 兼容旧调用的每工具信号量；实际工作区操作优先使用下方动态命名门控。
 static TOOL_GATES: OnceLock<HashMap<&'static str, Arc<Semaphore>>> = OnceLock::new();
 /// 动态命名信号量（如 per-device 部署门控）：key 为运行时字符串
 static NAMED_GATES: OnceLock<Mutex<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
@@ -45,6 +46,28 @@ struct TaskBudget {
     last_call: Option<(String, String)>,
     /// 与 last_call 相同的连续次数
     repeat_count: usize,
+}
+
+fn canonical_args(raw: &str) -> String {
+    fn render(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort_unstable();
+                let body = keys
+                    .into_iter()
+                    .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), render(&map[k])))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{{body}}}")
+            }
+            serde_json::Value::Array(items) => format!("[{}]", items.iter().map(render).collect::<Vec<_>>().join(",")),
+            _ => serde_json::to_string(v).unwrap_or_default(),
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map(|v| render(&v))
+        .unwrap_or_else(|_| raw.trim().to_string())
 }
 static BUDGETS: Mutex<Option<HashMap<String, TaskBudget>>> = Mutex::new(None);
 
@@ -107,9 +130,8 @@ pub fn check_task_budget(conversation_id: &str, tool: &str, args: &str) -> Resul
                 }
             }
             // 打转检测：连续重复调用同一工具同一参数
-            let same = b.last_call.as_ref().is_some_and(|(t, a)| {
-                t == tool && a == args.trim()
-            });
+            let signature = canonical_args(args);
+            let same = b.last_call.as_ref().is_some_and(|(t, a)| t == tool && a == &signature);
             let repeat = if same { b.repeat_count + 1 } else { 0 };
             if let Some(limit) = limits.repeat_calls() {
                 if repeat >= limit {
@@ -131,11 +153,10 @@ pub fn record_tool_call(conversation_id: &str, tool: &str, args: &str) {
             if GATED_TOOLS.contains(&tool) {
                 b.heavy_calls += 1;
             }
-            let same = b.last_call.as_ref().is_some_and(|(t, a)| {
-                t == tool && a == args.trim()
-            });
+            let signature = canonical_args(args);
+            let same = b.last_call.as_ref().is_some_and(|(t, a)| t == tool && a == &signature);
             b.repeat_count = if same { b.repeat_count + 1 } else { 0 };
-            b.last_call = Some((tool.to_string(), args.trim().to_string()));
+            b.last_call = Some((tool.to_string(), signature));
         }
     }
 }
@@ -158,6 +179,17 @@ pub async fn acquire_named_gate(name: &str) -> OwnedSemaphorePermit {
             .clone()
     };
     gate.acquire_owned().await.expect("named gate semaphore closed")
+}
+
+/// 工作区级互斥：同一工程内所有可能写工作树、构建目录或 Git 索引的工具共享一把锁，
+/// 不同工程仍可并行。取规范路径避免 /var 别名、大小写或相对路径产生两把锁。
+pub async fn acquire_workspace_gate(path: &std::path::Path) -> OwnedSemaphorePermit {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut key = canonical.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        key = key.to_lowercase();
+    }
+    acquire_named_gate(&format!("workspace:{key}")).await
 }
 
 #[cfg(test)]
@@ -235,6 +267,27 @@ mod tests {
         }
         record_tool_call("c6", "read_file", "{\"path\":\"b.json\"}");
         assert!(check_task_budget("c6", "read_file", "{\"path\":\"b.json\"}").is_ok());
+    }
+
+    #[test]
+    fn equivalent_json_arguments_share_repeat_signature() {
+        assert_eq!(canonical_args(r#"{"path":"a","lines":20}"#), canonical_args(r#"{ "lines": 20, "path": "a" }"#));
+    }
+
+    #[tokio::test]
+    async fn workspace_gate_serializes_same_root_not_different_roots() {
+        let base = std::env::temp_dir().join(format!("workspace-gate-{}", uuid::Uuid::new_v4()));
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let first = acquire_workspace_gate(&a).await;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), acquire_workspace_gate(&a)).await.is_err());
+        let other = tokio::time::timeout(std::time::Duration::from_millis(100), acquire_workspace_gate(&b)).await;
+        assert!(other.is_ok());
+        drop(first);
+        drop(other);
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

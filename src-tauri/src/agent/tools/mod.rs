@@ -42,7 +42,7 @@ pub(crate) use pipeline::{
 pub use protocol::{
     mcp_tools_hint, parse_mcp_tool_name, parse_tool_calls,
     sanitize_markers, sanitize_tool_output, skill_hint, split_instance_name, strip_tool_calls,
-    system_hint, tool_short_desc, tool_schemas,
+    system_hint_for, tool_short_desc, tool_schemas_for,
 };
 use errors::with_advice;
 use protocol::truncate_chars;
@@ -1080,21 +1080,12 @@ pub async fn run_tool(
     mcp: &crate::services::mcp_manager::McpManager,
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    // “停止当前工具”请求：已设置则直接打断本次工具调用，不执行
-    if crate::agent::exec_ctx::take_stop_tool(&ctx.conversation_id) {
-        return Err("用户已停止当前工具".into());
-    }
+    let stop_generation = crate::agent::exec_ctx::stop_generation(&ctx.conversation_id);
     let args: Value = if args.trim().is_empty() {
         Value::Null
     } else {
         serde_json::from_str(args).unwrap_or(Value::Null)
     };
-    // [67] 工具响应缓存：仅 L0 只读工具命中缓存直接返回（TTL 15s，键含项目+参数）
-    if crate::services::permissions::tool_level(name) == crate::services::permissions::Level::L0 {
-        if let Some(hit) = crate::services::tool_cache::get(name, project_id, &args) {
-            return Ok(hit);
-        }
-    }
     // MCP 工具：转发到对应服务器执行（tools/call）
     // 同名多实例：hint 中带 #n 后缀（mysql#2），按同一排序规则查 DB 定位实例后按 id 精确调用
     if let Some((server, tool)) = parse_mcp_tool_name(name) {
@@ -1146,18 +1137,16 @@ pub async fn run_tool(
             roots.push(project_path.trim().to_string());
         }
     }
-    // 标记当前工具归属会话（长任务命令执行器据此轮询“停止当前工具”中断）
-    crate::agent::exec_ctx::enter_tool_session(&ctx.conversation_id);
-    struct ActiveSessionGuard {
-        conversation_id: String,
-    }
-    impl Drop for ActiveSessionGuard {
-        fn drop(&mut self) {
-            crate::agent::exec_ctx::exit_tool_session(&self.conversation_id);
+    // 仅显式纯查询工具允许缓存；键包含有效根目录，避免同项目不同 worktree/path hint
+    // 使用相同相对参数时串读。文件/设备/UI/状态类工具始终执行。
+    if crate::services::permissions::is_cacheable(name) {
+        if let Some(hit) = crate::services::tool_cache::get(name, project_id, &roots, &args) {
+            return Ok(hit);
         }
     }
-    let _active_guard = ActiveSessionGuard { conversation_id: ctx.conversation_id.clone() };
-    let result = match name {
+    // 记录本工具启动时的停止代次；同批并行工具各自观察后续代次变化。
+    let result = crate::agent::exec_ctx::scope_tool_session(ctx.conversation_id.clone(), stop_generation, async {
+      match name {
         "list_devices" => list_devices().await,
         "connect_device" => device_tools::connect_device(&args).await,
         "manage_hdc" => device_tools::manage_hdc(&args, db).await,
@@ -1361,18 +1350,21 @@ pub async fn run_tool(
         "step_debug" => quality_tools::step_debug(&args, &roots).await,
         "ota_pack" => quality_tools::ota_pack(&args, &roots).await,
         other => Err(format!("未知工具: {other}")),
-    };
+      }
+    }).await;
     // 统一出口脱敏（[57]）：所有工具返回文本过文本级遮罩（密钥/JWT/邮箱/手机号/身份证等）
     let result = result.map(|ok| crate::utils::redact::redact_text(&ok));
     // 统一错误信封（[65]）：所有工具的 Err 自动套上 category/可重试/advice 头
     let result = result.map_err(|e| errors::ToolError::enrich(name, e).to_envelope());
     // [67] 写缓存：仅 L0 只读工具（有副作用的 L1/L2 绝不缓存）
-    if result.is_ok()
-        && crate::services::permissions::tool_level(name) == crate::services::permissions::Level::L0
-    {
+    if result.is_ok() && crate::services::permissions::is_cacheable(name) {
         if let Ok(ok) = &result {
-            crate::services::tool_cache::put(name, project_id, &args, ok);
+            crate::services::tool_cache::put(name, project_id, &roots, &args, ok);
         }
+    } else if result.is_ok() {
+        // 任何非纯查询成功后都可能改变文件、设备或数据库真源；缓存规模很小，统一
+        // 失效比维护不完整的工具→资源依赖图更可靠。
+        crate::services::tool_cache::clear();
     }
     // 修改类工具成功后增量失效符号缓存：只重扫被改动的文件，其余文件复用缓存。
     // git_commit/git_stash/run_command 等无法枚举改动面的不显式失效，
@@ -1495,15 +1487,11 @@ pub(crate) async fn run_cmd_capped_env(program: &str, args: &[String], cwd: Opti
                 return Err(format!("命令超时（>{timeout_secs}s），已终止: {program}"));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                // 消费式检查：中断后清除标志，避免下一次工具调用被误中断
-                // 跨项目可并行执行工具，遍历所有活跃会话（run_cmd 无会话信息，
-                // 只能轮询全局活跃集；误消费其他会话标志的概率极低且可重试）
-                for sid in crate::agent::exec_ctx::active_tool_sessions() {
-                    if crate::agent::exec_ctx::take_stop_tool(&sid) {
-                        crate::utils::process::kill_tree(pid);
-                        let _ = finish_pipe_readers(out_task, err_task).await;
-                        return Err("用户已停止当前工具".into());
-                    }
+                // 只消费当前命令所属会话的停止标志；并行会话之间绝不交叉杀进程。
+                if crate::agent::exec_ctx::current_tool_stop_requested() {
+                    crate::utils::process::kill_tree(pid);
+                    let _ = finish_pipe_readers(out_task, err_task).await;
+                    return Err("用户已停止当前工具".into());
                 }
             }
         }
@@ -1518,7 +1506,8 @@ pub(crate) async fn run_cmd_capped_env(program: &str, args: &[String], cwd: Opti
         text.push_str(&err);
     }
     if text.chars().count() > max_chars {
-        text = text.chars().take(max_chars).collect::<String>() + "\n…(输出已截断)";
+        // 编译器/命令真正的根因通常在尾部；只保留开头会让 Agent 看不到错误并盲试。
+        text = truncate_out_head_tail(&text, max_chars);
     }
     if status.success() {
         Ok(if text.is_empty() { "命令执行成功".to_string() } else { text })
@@ -2431,7 +2420,7 @@ async fn build_generic(
         )
     })?;
     // 全局并发护栏：与鸿蒙构建/部署互斥，避免并发写产物目录
-    let _gate = crate::services::tool_limits::acquire_gate("build_generic").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(&root).await;
     let root_s = root.to_string_lossy().to_string();
     let log_path = crate::agent::exec_ctx::log_dir(&root_s)
         .join(format!("build-generic-{}.log", chrono::Local::now().format("%Y%m%d-%H%M%S")));
@@ -3765,7 +3754,7 @@ async fn ask_user(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result
                 return Ok("用户未在 5 分钟内回复，跳过该问题（如需确认可再次 ask_user 或换用更具体的选项）。".into());
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                if crate::agent::exec_ctx::take_stop_tool(&ctx.conversation_id) {
+                if crate::agent::exec_ctx::current_tool_stop_requested() {
                     crate::agent::ask::remove(&request_id);
                     return Err("用户已停止当前工具".into());
                 }

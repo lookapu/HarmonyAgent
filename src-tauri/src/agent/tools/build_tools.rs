@@ -90,7 +90,7 @@ pub(super) async fn build_project(
     // clean=true 时先执行 hvigor clean 清理缓存，用于缓存导致的诡异构建失败
     let do_clean = spec.clean;
     // 全局并发护栏：同一时间只允许一个构建（其他调用排队等待）
-    let _gate = crate::services::tool_limits::acquire_gate("build_project").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(root).await;
     // 构建耗时统计（含 clean，供成功提示展示）
     let build_started = std::time::Instant::now();
 
@@ -416,7 +416,7 @@ pub(super) async fn deploy(
     }
 
     // 全局并发护栏：同一时间只允许一个部署
-    let _gate = crate::services::tool_limits::acquire_gate("deploy").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
 
     // 1. 选择设备：优先参数指定，否则取默认设备记忆 / 第一个在线设备
     let device_id = if let Some(d) = args["device"].as_str() {
@@ -1027,7 +1027,7 @@ pub(super) async fn ohpm_install(args: &Value, roots: &[String]) -> Result<Strin
         return Err("当前会话未绑定项目目录，无法安装依赖".into());
     }
     // 全局并发护栏：与构建/部署互斥，避免并发写 .ohpm
-    let _gate = crate::services::tool_limits::acquire_gate("ohpm_install").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
     let mut cmd_args = vec!["install".to_string()];
     if let Some(pkg) = args["package"].as_str() {
         cmd_args.push(pkg.to_string());
@@ -1265,4 +1265,3 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
     }
     Ok(out)
 }
-

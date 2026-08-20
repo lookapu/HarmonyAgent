@@ -9,7 +9,7 @@ pub(super) async fn git_stash(args: &Value, roots: &[String]) -> Result<String, 
         return Err("当前会话未绑定项目目录，无法执行 git stash".into());
     }
     // 并发护栏：与 git_commit/构建互斥（stash 会清理工作区，不能与提交/构建并发）
-    let _gate = crate::services::tool_limits::acquire_gate("git_stash").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
     let action = args["action"].as_str().unwrap_or("push");
     let cmd_args: Vec<String> = match action {
         "list" => vec!["stash".to_string(), "list".to_string()],
@@ -81,7 +81,7 @@ pub(super) async fn git_commit(args: &Value, roots: &[String]) -> Result<String,
     }
     let cwd = Path::new(project_path);
     // 并发护栏：提交与构建互斥（git add -A 会暂存 build 产物变化）
-    let _gate = crate::services::tool_limits::acquire_gate("git_commit").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(cwd).await;
     let add = run_cmd("git", &["add".into(), "-A".into()], Some(cwd), 30)
         .await
         .map_err(|e| with_advice("git_commit", e))?;
@@ -138,7 +138,7 @@ pub(super) async fn git_restore(args: &Value, roots: &[String]) -> Result<String
     } else {
         cargs.push(path.to_string());
     }
-    let _gate = crate::services::tool_limits::acquire_gate("git_restore").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
     run_cmd("git", &cargs, Some(Path::new(project_path)), 30)
         .await
         .map_err(|e| with_advice("git_restore", e))
@@ -281,7 +281,7 @@ pub(super) async fn git_pull(args: &Value, roots: &[String]) -> Result<String, S
             dirty.lines().take(10).collect::<Vec<_>>().join("\n")
         ));
     }
-    let _gate = crate::services::tool_limits::acquire_gate("git_pull").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
     let mut cargs = vec!["pull".to_string(), "--ff-only".into()];
     if autostash {
         cargs.push("--autostash".into());
@@ -343,7 +343,7 @@ pub(super) async fn git_push(args: &Value, roots: &[String]) -> Result<String, S
             sb.lines().next().unwrap_or("")
         ));
     }
-    let _gate = crate::services::tool_limits::acquire_gate("git_push").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
     let mut cargs = vec!["push".to_string()];
     if set_upstream {
         cargs.push("-u".into());
@@ -401,7 +401,7 @@ pub(super) async fn review_changes(args: &Value, roots: &[String]) -> Result<Str
     if matches!(scope, "all" | "staged") {
         pending.push(("staged", true));
     }
-    let _gate = crate::services::tool_limits::acquire_gate("review_changes").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(cwd).await;
     for (label, cached) in &pending {
         let mut cargs = vec!["diff".to_string()];
         if *cached {
@@ -484,4 +484,3 @@ pub(super) async fn git_tag(args: &Value, roots: &[String]) -> Result<String, St
         }
     }
 }
-

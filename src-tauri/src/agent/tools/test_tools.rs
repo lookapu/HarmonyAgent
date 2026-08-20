@@ -81,7 +81,7 @@ pub(super) async fn run_tests(args: &Value, roots: &[String]) -> Result<String, 
                     .to_string(),
         }
     }
-    let _gate = crate::services::tool_limits::acquire_gate("run_tests").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(root).await;
     let out = if hvigor_env.is_empty() {
         run_cmd(&program, &full_args, Some(root), 600).await
     } else {
@@ -125,7 +125,7 @@ pub(super) async fn flaky_test_detect(args: &Value, roots: &[String]) -> Result<
         }
     }
     let runs = args["runs"].as_u64().unwrap_or(3).clamp(2, 5) as usize;
-    let _gate = crate::services::tool_limits::acquire_gate("run_tests").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(root).await;
 
     let mut rounds: Vec<(bool, String)> = Vec::with_capacity(runs); // (是否成功, 摘要)
     for i in 0..runs {
@@ -1350,4 +1350,3 @@ pub(super) fn describe_step(s: &Value) -> String {
         other => format!("未知操作 {other}"),
     }
 }
-

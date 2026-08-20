@@ -787,10 +787,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   }).catch(() => {})
 
   // 工具权限审核请求（自动审核模式）：入队等待用户确认弹窗
-  listen<{ conversation_id: string; request_id: string; tool: string; args: string }>(
+  listen<{ conversation_id: string; request_id: string; tool: string; args: string; level?: string; desc?: string }>(
     'chat-tool-approval',
     (event) => {
-      const { conversation_id, request_id, tool, args } = event.payload
+      const { conversation_id, request_id, tool, args, level, desc } = event.payload
       const isCurrent = get().currentConversation?.id === conversation_id
       // 后台会话同样记录到待确认表（列表角标 + 切回恢复）；弹窗视图仅当前会话刷新
       upsertPending({
@@ -805,7 +805,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       })
       if (isCurrent) {
         set((s) => ({
-          toolApprovals: [...s.toolApprovals, { requestId: request_id, tool, args }],
+          toolApprovals: [...s.toolApprovals, { requestId: request_id, tool, args, level, desc }],
         }))
       }
     },

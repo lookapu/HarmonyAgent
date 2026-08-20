@@ -662,7 +662,10 @@ export default function Home() {
     setApprovalFeedback('')
   }, [firstApprovalRequestId])
   // 工具风险分级展示：L0 只读=绿 / L1 写入=橙 / L2 危险=红
-  const approvalRisk = (tool: string): { label: string; cls: string } => {
+  const approvalRisk = (tool: string, authoritativeLevel?: string): { label: string; cls: string } => {
+    if (authoritativeLevel === 'L2') return { label: 'L2 高风险', cls: 'bg-[var(--danger)]/15 text-[var(--danger)]' }
+    if (authoritativeLevel === 'L1') return { label: 'L1 写入', cls: 'bg-[var(--warning)]/15 text-[var(--warning)]' }
+    if (authoritativeLevel === 'L0') return { label: 'L0 只读', cls: 'bg-[var(--success)]/15 text-[var(--success)]' }
     if (/^(bash|exec|run_command|delete_|remove_|spawn_agents|git_push|publish|deploy|format_)/.test(tool)) {
       return { label: 'L2 高风险', cls: 'bg-[var(--danger)]/15 text-[var(--danger)]' }
     }
@@ -5945,7 +5948,7 @@ export default function Home() {
 
       {/* ============ 工具权限审核浮层（自动审核模式，逐个确认） ============ */}
       {toolApprovals.length > 0 && (() => {
-        const risk = approvalRisk(toolApprovals[0].tool)
+        const risk = approvalRisk(toolApprovals[0].tool, toolApprovals[0].level)
         return (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[460px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
@@ -5963,6 +5966,11 @@ export default function Home() {
                   {t('home.toolApprovalArgs')}
                 </span>
               </div>
+              {toolApprovals[0].desc && (
+                <p className="rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)]/60 px-3 py-2 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                  {toolApprovals[0].desc}
+                </p>
+              )}
               <pre className="tool-output max-h-32 overflow-y-auto rounded-lg modern-card border-[var(--border)] p-2.5 text-[11px] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]">
                 {toolApprovals[0].args || '{}'}
               </pre>

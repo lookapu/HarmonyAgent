@@ -260,7 +260,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     let timeout = spec.timeout;
     let cwd: &Path = &spec.cwd;
     // 全局并发护栏：与构建/部署互斥，避免并发写 build 目录
-    let _gate = crate::services::tool_limits::acquire_gate("run_command").await;
+    let _gate = crate::services::tool_limits::acquire_workspace_gate(cwd).await;
     // 后台模式：解析为 (program, args) 后交给 jobs 托管进程生命周期，立即返回 job_id；
     // 任务完成时结果注入会话队列（模型下一轮请求自动看到），并可 job_output/job_kill 管理
     if spec.run_in_background {
@@ -280,6 +280,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
             cwd.to_path_buf(),
             timeout,
             ctx,
+            Some(_gate),
         )?;
         return Ok(format!(
             "命令已在后台启动（任务 {job_id}）：{command}\n工作目录：{}\n超时：{timeout}s\n可调用 job_output 查询输出、job_kill 终止；任务完成时结果会自动反馈。",
@@ -732,4 +733,3 @@ pub(super) fn cut_str(s: &str, max: usize) -> String {
     let head: String = chars[..max].iter().collect();
     format!("{head}\n…（截断）")
 }
-

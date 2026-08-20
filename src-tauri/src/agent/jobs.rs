@@ -103,6 +103,7 @@ pub fn start_background(
     cwd: PathBuf,
     timeout_secs: u64,
     ctx: &ToolCtx,
+    workspace_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<String, String> {
     // 会话活跃任务上限：超过拒绝启动（防无限堆积）
     {
@@ -141,6 +142,9 @@ pub fn start_background(
     let spawn_job_id = job_id.clone();
     let spawn_command = command.clone();
     tokio::spawn(async move {
+        // 后台命令返回 job_id 后仍可能持续写工作区；许可必须跟随进程生命周期，
+        // 不能在 run_command 返回时提前释放并与构建/Git 操作并发踩踏。
+        let _workspace_permit = workspace_permit;
         run_job(&job, &program, &args, &cwd, timeout_secs, app, conv, spawn_job_id, spawn_command).await;
     });
     Ok(job_id)

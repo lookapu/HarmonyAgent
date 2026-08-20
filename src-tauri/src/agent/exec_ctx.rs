@@ -5,72 +5,74 @@ use std::path::PathBuf;
 use std::process::Output;
 use tauri::{AppHandle, Emitter};
 
-/// 会话级“停止当前工具”请求集合：chat.rs 的 stop_tool 命令写入，工具执行处消费（一次性）。
-/// 与 ChatCancel（停止整个任务）独立：只打断当前工具，模型拿到中断反馈后继续生成结论。
-static STOP_TOOL_FLAGS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+/// 会话级“停止当前工具”代次：每次请求递增。工具启动时记录基线，运行中发现代次
+/// 改变就中断。相比一次性 HashSet，同批并行工具都能观察到停止且后续新工具不会误停。
+static STOP_TOOL_GENERATIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
     std::sync::OnceLock::new();
 
-/// 当前正在执行工具的会话 id 集合（跨项目可并行：多会话可同时执行工具；
-/// 引用计数处理嵌套 run_tool 场景，避免一个会话退出时清掉其他会话的标记）
-static ACTIVE_TOOL_SESSIONS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, usize>>,
-> = std::sync::OnceLock::new();
+tokio::task_local! {
+    /// 当前异步工具调用所属会话与启动时停止代次。
+    static CURRENT_TOOL_SESSION: (String, u64);
+}
 
-/// 请求停止会话当前正在执行的工具（一次性标志）
+pub async fn scope_tool_session<F: std::future::Future>(
+    conversation_id: String,
+    stop_generation: u64,
+    future: F,
+) -> F::Output {
+    CURRENT_TOOL_SESSION.scope((conversation_id, stop_generation), future).await
+}
+
+pub fn stop_generation(conversation_id: &str) -> u64 {
+    STOP_TOOL_GENERATIONS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|m| m.get(conversation_id).copied())
+        .unwrap_or(0)
+}
+
+/// 请求停止会话当前正在执行的全部工具。
 pub fn request_stop_tool(conversation_id: &str) {
-    if let Ok(mut set) = STOP_TOOL_FLAGS
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-        .lock()
-    {
-        set.insert(conversation_id.to_string());
-    }
-}
-
-/// 检查并消费“停止当前工具”请求（一次性：读取后清除）
-pub fn take_stop_tool(conversation_id: &str) -> bool {
-    let Some(flag) = STOP_TOOL_FLAGS.get() else {
-        return false;
-    };
-    if let Ok(mut set) = flag.lock() {
-        if set.remove(conversation_id) {
-            return true;
-        }
-    }
-    false
-}
-
-/// run_tool 入口登记：会话进入工具执行（嵌套调用计数 +1）
-pub fn enter_tool_session(conversation_id: &str) {
-    if let Ok(mut map) = ACTIVE_TOOL_SESSIONS
+    if let Ok(mut generations) = STOP_TOOL_GENERATIONS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock()
     {
-        *map.entry(conversation_id.to_string()).or_insert(0) += 1;
+        let generation = generations.entry(conversation_id.to_string()).or_insert(0);
+        *generation = generation.wrapping_add(1);
     }
 }
 
-/// run_tool 结束退出：计数 -1，归零移除
-pub fn exit_tool_session(conversation_id: &str) {
-    let Some(m) = ACTIVE_TOOL_SESSIONS.get() else {
-        return;
-    };
-    if let Ok(mut map) = m.lock() {
-        if let Some(n) = map.get_mut(conversation_id) {
-            *n -= 1;
-            if *n == 0 {
-                map.remove(conversation_id);
-            }
-        }
-    }
+/// 当前工具是否在启动后收到停止请求。无工具作用域时返回 false。
+pub fn current_tool_stop_requested() -> bool {
+    CURRENT_TOOL_SESSION
+        .try_with(|(conversation_id, baseline)| stop_generation(conversation_id) != *baseline)
+        .unwrap_or(false)
 }
 
-/// 当前正在执行工具的会话 id 列表（供无会话信息的命令执行器轮询中断）
-pub fn active_tool_sessions() -> Vec<String> {
-    ACTIVE_TOOL_SESSIONS
-        .get()
-        .and_then(|s| s.lock().ok())
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default()
+#[cfg(test)]
+mod stop_generation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn one_stop_is_seen_by_all_current_tools_but_not_future_tools() {
+        let conversation_id = format!("stop-generation-{}", uuid::Uuid::new_v4());
+        let baseline = stop_generation(&conversation_id);
+        request_stop_tool(&conversation_id);
+        let first = scope_tool_session(conversation_id.clone(), baseline, async {
+            current_tool_stop_requested()
+        });
+        let second = scope_tool_session(conversation_id.clone(), baseline, async {
+            current_tool_stop_requested()
+        });
+        assert!(first.await);
+        assert!(second.await);
+
+        let latest = stop_generation(&conversation_id);
+        assert!(!scope_tool_session(conversation_id, latest, async {
+            current_tool_stop_requested()
+        })
+        .await);
+    }
 }
 
 /// 工具执行上下文（无事件能力时也可使用 empty）
@@ -353,8 +355,7 @@ pub async fn run_cmd_streaming_env(
                 return Err(format!("命令超时（>{timeout_secs}s），已终止: {program}"));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                // 消费式检查：中断后清除标志，避免下一次工具调用被误中断
-                if take_stop_tool(&ctx.conversation_id) {
+                if current_tool_stop_requested() {
                     crate::utils::process::kill_tree(pid);
                     let _ = finish_output_readers(stdout_task, stderr_task, &stdout_snapshot, &stderr_snapshot).await;
                     ctx.emit_log("system", "命令已由用户中断");

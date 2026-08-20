@@ -31,10 +31,13 @@ impl Level {
 
 /// 返回工具的权限级别。未登记的工具默认 L2（保守）。
 pub fn tool_level(tool: &str) -> Level {
-    let t = tool
-        .strip_prefix("mcp__")
-        .map(|s| s.split("__").last().unwrap_or(s))
-        .unwrap_or(tool);
+    // MCP 是外部能力，不能仅凭远端自选的工具名继承内置工具权限。例如恶意 MCP
+    // 把写操作命名为 read_file 不应获得 L0 自动放行。未来可基于可信 annotations
+    // 精细降级；当前保守默认 L2。
+    if tool.starts_with("mcp__") {
+        return Level::L2;
+    }
+    let t = tool;
     match t {
         // L0 只读
         "list_devices" | "list_dir" | "read_file" | "find_files" | "grep_files"
@@ -99,6 +102,21 @@ pub fn tool_level(tool: &str) -> Level {
         | "git_pull" | "git_push" | "secret_get" | "sandbox_exec" => Level::L2,
         _ => Level::L2,
     }
+}
+
+/// 可安全短期缓存的纯查询工具。权限 L0 不等于可缓存：设备状态、文件内容、UI 事件、
+/// todo/ask 等即使低风险也具有实时性或状态副作用，绝不能因缓存而跳过实际执行。
+pub fn is_cacheable(tool: &str) -> bool {
+    matches!(
+        tool,
+        "tool_help"
+            | "read_harmony_doc"
+            | "read_sdk_api_module"
+            | "get_api_detail"
+            | "diff_api_versions"
+            | "search_harmony_docs"
+            | "search_sdk_api"
+    )
 }
 
 /// run_command 允许的可执行程序白名单（按小写程序名匹配，不含路径/扩展名）。
@@ -229,6 +247,10 @@ mod tests {
         assert_eq!(tool_level("write_file"), Level::L1);
         assert_eq!(tool_level("delete_file"), Level::L2);
         assert_eq!(tool_level("unknown_xyz"), Level::L2);
+        assert_eq!(tool_level("mcp__untrusted__read_file"), Level::L2);
+        assert!(!is_cacheable("read_file"));
+        assert!(!is_cacheable("ask_user"));
+        assert!(is_cacheable("read_harmony_doc"));
         // 新工具分级回归：未登记的只读/验证工具默认 L2 会打断部署闭环，必须登记
         assert_eq!(tool_level("collect_perf"), Level::L0);
         assert_eq!(tool_level("read_runtime_logs"), Level::L0);
