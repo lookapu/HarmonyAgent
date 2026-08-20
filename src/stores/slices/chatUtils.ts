@@ -12,6 +12,34 @@ export function acceptsRunEvent(activeRunId: string | null | undefined, eventRun
   return !eventRunId || activeRunId === eventRunId
 }
 
+/** 把一次运行对应的用户消息收敛到已入库/已执行状态。
+ * 普通发送用后端 ID 替换 local 占位；排队自动续跑已有真实 ID，只需清 queued。 */
+export function reconcileRunUserMessage(
+  messages: ChatMessage[],
+  userMessageId: string,
+  preferredLocalId?: string,
+): ChatMessage[] {
+  const persistedIdx = messages.findIndex((m) => m.id === userMessageId)
+  if (persistedIdx >= 0) {
+    return messages.map((m, i) => (i === persistedIdx ? { ...m, queued: 0 } : m))
+  }
+  const preferredIdx = preferredLocalId ? messages.findIndex((m) => m.id === preferredLocalId) : -1
+  const localIdx =
+    preferredIdx >= 0
+      ? preferredIdx
+      : [...messages]
+          .map((m, i) => ({ m, i }))
+          .reverse()
+          .find(({ m }) => m.role === 'user' && typeof m.id === 'string' && m.id.startsWith('local-'))?.i
+  if (localIdx === undefined) return messages
+  return messages.map((m, i) => (i === localIdx ? { ...m, id: userMessageId } : m))
+}
+
+/** 一次完成事件只收敛一个运行项；同名工具并发时不能批量结束全部卡片。 */
+export function firstRunningIndex<T extends { status: string }>(entries: T[], matches: (entry: T) => boolean): number {
+  return entries.findIndex((entry) => entry.status === 'running' && matches(entry))
+}
+
 /** 从 Agent 正文解析"计划列表"（Markdown 有序列表，2~10 项，含工具标记/代码块的列表块不采用）。
  * 模型常以有序列表给出任务步骤；无匹配返回 null（不显示进度卡，工具卡已足够）。 */
 export function parsePlanSteps(text: string): string[] | null {

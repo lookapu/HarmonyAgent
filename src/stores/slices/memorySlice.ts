@@ -97,7 +97,7 @@ export const createMemorySlice: StateCreator<ProjectState, [], [], MemorySlice> 
       list.forEach((f) => {
         map[f.message_id] = f
       })
-      set({ feedbackMap: map })
+      if (get().currentConversation?.id === conversationId) set({ feedbackMap: map })
     } catch {
       // 加载失败保留旧数据
     }
@@ -113,6 +113,7 @@ export const createMemorySlice: StateCreator<ProjectState, [], [], MemorySlice> 
         feedback,
         reason,
       })
+      if (get().currentConversation?.id !== conv.id) return
       set((s) => {
         const next = { ...s.feedbackMap }
         if (saved) {
@@ -134,7 +135,7 @@ export const createMemorySlice: StateCreator<ProjectState, [], [], MemorySlice> 
       list.forEach((v) => {
         ;(map[v.user_message_id] ??= []).push(v)
       })
-      set({ versionMap: map })
+      if (get().currentConversation?.id === conversationId) set({ versionMap: map })
     } catch {
       // 加载失败保留旧数据
     }
@@ -310,9 +311,9 @@ export const createMemorySlice: StateCreator<ProjectState, [], [], MemorySlice> 
   loadTokenStats: async (conversationId) => {
     try {
       const stats = await getConversationCostStats(conversationId)
-      set({ tokenStats: stats })
+      if (get().currentConversation?.id === conversationId) set({ tokenStats: stats })
     } catch {
-      set({ tokenStats: null })
+      if (get().currentConversation?.id === conversationId) set({ tokenStats: null })
     }
   },
 })

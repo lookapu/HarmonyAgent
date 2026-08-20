@@ -1452,7 +1452,15 @@ function connectSSE() {
   const acceptsRun = (p) => !p.run_id || !S.streaming || S.streaming.convId !== p.conversation_id
     || S.streaming.runId === p.run_id;
   on('chat-run-started', (p) => {
-    if (S.streaming && S.streaming.convId === p.conversation_id) S.streaming.runId = p.run_id;
+    if (S.streaming && S.streaming.convId === p.conversation_id) {
+      S.streaming.runId = p.run_id;
+    } else if (S.conv && S.conv.id === p.conversation_id) {
+      // 排队消息自动续跑时上一轮已 endStreaming；新代次必须重建占位和停止按钮。
+      S.streaming = { convId: p.conversation_id, runId: p.run_id, text: '', el: null };
+      ensureStreamingPlaceholder(p.conversation_id);
+      $('sendBtn').hidden = true;
+      $('stopBtn').hidden = false;
+    }
   });
   on('chat-stream', (p) => {
     if (acceptsRun(p)) appendStream(p.conversation_id, p.delta || '');
@@ -1490,8 +1498,13 @@ function connectSSE() {
       toast('已停止', 'ok');
     }
   });
-  on('chat-tool-start', (p) => { S.tool = p; renderTool(p.conversation_id, p); });
+  on('chat-tool-start', (p) => {
+    if (!acceptsRun(p)) return;
+    S.tool = p;
+    renderTool(p.conversation_id, p);
+  });
   on('chat-tool-done', (p) => {
+    if (!acceptsRun(p)) return;
     if (S.tool && S.tool.conversation_id === p.conversation_id) {
       S.tool = null;
       $('toolBar').hidden = true;

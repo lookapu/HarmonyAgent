@@ -504,7 +504,17 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
 })
 
 /* ============ 流式回复（打字机效果 + 思考过程） ============ */
-export const StreamingMessage = memo(function StreamingMessage({ content, reasoning, speed = 1 }: { content: string; reasoning: string; speed?: number }) {
+export const StreamingMessage = memo(function StreamingMessage({
+  content,
+  reasoning,
+  speed = 1,
+  active = true,
+}: {
+  content: string
+  reasoning: string
+  speed?: number
+  active?: boolean
+}) {
   const { t } = useTranslation()
   // 流式渲染节流：高频 delta 先缓存，按内容长度自适应间隔（短文本 60ms，长文本降频），
   // 避免每个 token 都触发重型 Markdown 全量解析（长回复时渲染跟不上会卡顿，显得响应慢）
@@ -562,25 +572,27 @@ export const StreamingMessage = memo(function StreamingMessage({ content, reason
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 mb-1.5">
           <span className="role-tag role-tag-agent">{t('home.agent')}</span>
-          <span className="text-[10px] text-[var(--text-muted)] flex items-center gap-1 tnum">
-            <span className="inline-flex gap-0.5">
-              <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '0ms' }} />
-              <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '150ms' }} />
-              <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '300ms' }} />
+          {active && (
+            <span className="text-[10px] text-[var(--text-muted)] flex items-center gap-1 tnum">
+              <span className="inline-flex gap-0.5">
+                <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '300ms' }} />
+              </span>
+              {t('home.typing')}
             </span>
-            {t('home.typing')}
-          </span>
+          )}
           <span className="msg-timestamp ml-auto tnum">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
         </div>
         {shown.reasoning && <ThinkingBlock content={shown.reasoning} />}
         {shown.content.trim() ? (
           <div className="text-sm break-words leading-relaxed text-[var(--text-primary)]">
-            <Markdown streaming>{processedContent}</Markdown>
-            <span className="typing-cursor" />
+            <Markdown streaming={active}>{processedContent}</Markdown>
+            {active && <span className="typing-cursor" />}
           </div>
-        ) : (
+        ) : active ? (
           <div className="text-sm text-[var(--text-muted)] italic">{t('home.thinkingShort')}</div>
-        )}
+        ) : null}
       </div>
     </div>
   )
@@ -790,5 +802,4 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
     </div>
   )
 })
-
 

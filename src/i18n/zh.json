@@ -92,6 +92,7 @@
     "send": "发送",
     "newline": "换行",
     "stopGenerating": "停止生成",
+    "stopping": "正在停止…",
     "stopTool": "停止工具",
     "streamSpeedHint": "流式输出速度（仅影响前端渲染节流）",
     "retry": "重试",
@@ -901,6 +902,7 @@
     "toggleTaskOps": "展开/折叠任务操作过程",
     "taskSummary": "用时 {{time}} · 工具调用 {{tools}} 次 · 修改 {{files}} 个文件 · {{tokens}} tokens",
     "taskDoneTitle": "任务完成",
+    "taskIncompleteTitle": "任务未完成",
     "replyDurationHint": "本条回复用时（任务从开始到完成）"
   },
   "dialog": {

@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { fmtElapsed, sanitizeToolMarkers } from './chatUtils'
+import { fmtElapsed, interruptedTailMessage, sanitizeToolMarkers, shouldSubmitComposerKey } from './chatUtils'
+import type { ChatMessage } from '../api/project'
+
+const chatMsg = (role: ChatMessage['role'], id: string, extra: Partial<ChatMessage> = {}): ChatMessage =>
+  ({ id, role, content: id, ...extra }) as ChatMessage
 
 describe('fmtElapsed', () => {
   it('格式化秒数为 mm:ss', () => {
@@ -17,6 +21,33 @@ describe('fmtElapsed', () => {
   it('负值与小数容错（取整、钳制到 0）', () => {
     expect(fmtElapsed(-5)).toBe('0:00')
     expect(fmtElapsed(1.9)).toBe('0:01')
+  })
+})
+
+describe('interruptedTailMessage', () => {
+  it('识别已有历史回复之后新出现的孤立 user 消息', () => {
+    const tail = chatMsg('user', 'u2', { queued: 0 })
+    expect(interruptedTailMessage([chatMsg('user', 'u1'), chatMsg('assistant', 'a1'), tail], false)).toBe(tail)
+  })
+
+  it('流式中和排队消息不提示中断恢复', () => {
+    const queued = chatMsg('user', 'q1', { queued: 1 })
+    expect(interruptedTailMessage([queued], false)).toBeNull()
+    expect(interruptedTailMessage([chatMsg('user', 'u1')], true)).toBeNull()
+  })
+
+  it('识别未完成的 assistant 占位消息', () => {
+    const partial = chatMsg('assistant', 'a1', { duration_ms: null })
+    expect(interruptedTailMessage([partial], false)).toBe(partial)
+  })
+})
+
+describe('shouldSubmitComposerKey', () => {
+  it('仅普通 Enter 发送，Shift+Enter 与输入法选词 Enter 均不发送', () => {
+    expect(shouldSubmitComposerKey('Enter', false, false)).toBe(true)
+    expect(shouldSubmitComposerKey('Enter', true, false)).toBe(false)
+    expect(shouldSubmitComposerKey('Enter', false, true)).toBe(false)
+    expect(shouldSubmitComposerKey('a', false, false)).toBe(false)
   })
 })
 

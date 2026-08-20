@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { JSX } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useNavigate } from 'react-router-dom'
@@ -84,20 +84,29 @@ import {
   ThumbUpIcon,
   ThumbDownIcon,
   ModifiedFilesCard,
-  StreamingMessage,
   ErrorCard,
   EmptyState,
   ChatEmptyState,
 } from '../chat/components/messageBlocks'
 import { BranchSelector, ModelSettingsPopover, PlanCard, TaskOpsBadge } from '../chat/components/plan'
+import {
+  ConversationRunStatus,
+  RunningTaskOpsBadge,
+  SilentStreamHint,
+  StreamingOutput,
+} from '../chat/components/streamingStatus'
 import { LedgerCard } from '../chat/components/ledger'
 import { ToolRunGroup } from '../chat/components/toolRuns'
 import { FeedbackDialog, VersionDiffDialog, MemoryDraftDialog, EditMessageDialog, RulesDialog } from '../chat/components/dialogs'
 import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, PreviewPanel, TerminalPanel, ShellPanel } from '../chat/components/panels'
 import CommandPalette, { type PaletteCommand } from '../components/CommandPalette'
-import TimelinePanel from '../components/TimelinePanel'
-import { DevicesPanel, AnalyzePanel, SymbolsPanel } from '../chat/components/devicePanels'
-import { fmtElapsed, restoreSelectionRange, sanitizeToolMarkers } from '../chat/chatUtils'
+import {
+  fmtElapsed,
+  interruptedTailMessage,
+  restoreSelectionRange,
+  sanitizeToolMarkers,
+  shouldSubmitComposerKey,
+} from '../chat/chatUtils'
 import { detectGpu, getRecommendedOverscan, shouldUseSmoothScroll } from '../utils/gpuDetect'
 import { getLastProjectId } from '../stores/slices/projectSlice'
 
@@ -107,6 +116,12 @@ type RenderItem =
   | { kind: 'tools'; key: string; runs: ToolRun[] }
   | { kind: 'divider'; key: string; label: string }
   | { kind: 'tail'; key: string }
+
+// 设备/工程分析/时间线仅在右侧对应 Tab 打开时加载，避免约 100KB 的低频组件源码进入首页首屏执行路径。
+const DevicesPanel = lazy(() => import('../chat/components/devicePanels').then((m) => ({ default: m.DevicesPanel })))
+const AnalyzePanel = lazy(() => import('../chat/components/devicePanels').then((m) => ({ default: m.AnalyzePanel })))
+const SymbolsPanel = lazy(() => import('../chat/components/devicePanels').then((m) => ({ default: m.SymbolsPanel })))
+const TimelinePanel = lazy(() => import('../components/TimelinePanel'))
 
 /** 斜杠快捷指令清单：输入 / 触发，插入预置 prompt；action 触发额外行为（plan=开启计划模式，compact=手动压缩历史） */
 function getSlashCommands(t: (key: string) => string): { id: string; icon: IconName; title: string; prompt: string; action?: 'plan' | 'compact' }[] {
@@ -175,6 +190,9 @@ const writeDraftMap = (pid: string, m: Record<string, string>) => {
   else setJSON(STORAGE_KEYS.DRAFTS_PREFIX + pid, cleaned)
 }
 
+/** 稳定的短 ID 格式化函数：作为 MessageItem prop 时不因 Home 重渲染改变引用。 */
+const shortId = (id: string) => id.slice(0, 8)
+
 export default function Home() {
   const { t } = useTranslation()
   const navigate = useNavigate()
@@ -188,8 +206,9 @@ export default function Home() {
     conversations,
     currentConversation,
     messages,
-    streaming,
-    streamings,
+    streamingConversationId,
+    streamingError,
+    streamingErrorDetail,
     toolRuns,
     agentRuns,
     plan,
@@ -269,8 +288,9 @@ export default function Home() {
     conversations: s.conversations,
     currentConversation: s.currentConversation,
     messages: s.messages,
-    streaming: s.streaming,
-    streamings: s.streamings,
+    streamingConversationId: s.streaming.conversationId,
+    streamingError: s.streaming.error,
+    streamingErrorDetail: s.streaming.errorDetail,
     toolRuns: s.toolRuns,
     agentRuns: s.agentRuns,
     plan: s.plan,
@@ -345,6 +365,18 @@ export default function Home() {
     loadOlderMessages: s.loadOlderMessages,
     forkCurrentConversation: s.forkCurrentConversation,
   })))
+  // 只订阅运行会话 ID 集合。流式正文变化时选择器结果保持相同字符串，Home 不会重渲染。
+  const runningConversationKey = useProjectStore((s) =>
+    Object.entries(s.streamings)
+      .filter(([, bucket]) => !bucket.error)
+      .map(([id]) => id)
+      .sort()
+      .join('\u0000'),
+  )
+  const runningConversationIds = useMemo(
+    () => new Set(runningConversationKey ? runningConversationKey.split('\u0000') : []),
+    [runningConversationKey],
+  )
   // 会话工作目录：worktree 会话指向 worktree 路径，本地会话为 undefined（后端回退主仓库）
   const convRoot = conversationRoot(currentConversation)
   // 当前会话的任务账本（Ledger 协议）：进行中实时刷新/中断保留/切回恢复；无账本不展示
@@ -414,17 +446,15 @@ export default function Home() {
   const [rulesSaving, setRulesSaving] = useState(false)
   // 任务回滚（git 硬重置到任务起点前最后一次提交）
   const [rollbackBusy, setRollbackBusy] = useState(false)
-  // 任务已运行时长（秒，每秒刷新；会话列表/右侧面板展示，静默期也能看到任务在走）
-  const [taskElapsed, setTaskElapsed] = useState(0)
   // 时间线刷新信号：任务流式结束时 +1（复盘刚完成的任务，事件已全部落库）
   const [timelineTick, setTimelineTick] = useState(0)
-  const prevStreamingRef = useRef(streaming.conversationId)
+  const prevStreamingRef = useRef(streamingConversationId)
   useEffect(() => {
-    if (prevStreamingRef.current && !streaming.conversationId) {
+    if (prevStreamingRef.current && !streamingConversationId) {
       setTimelineTick((n) => n + 1)
     }
-    prevStreamingRef.current = streaming.conversationId
-  }, [streaming.conversationId])
+    prevStreamingRef.current = streamingConversationId
+  }, [streamingConversationId])
   // 任务过程徽章展开态：流式“已处理 N 个操作中”与完成后回看共用
   const [opsOpen, setOpsOpen] = useState(false)
   // 任务清单开合：首个进行中任务出现时自动展开一次；用户手动收起后本轮不再干预；全部完成收起并复位
@@ -441,8 +471,8 @@ export default function Home() {
       todoAutoRef.current = false
     }
   }, [todos])
-  // 静默时长（秒）：流式期间距最近一次内容/思考增量的秒数，超阈值提示“模型思考中”
-  const [silentSeconds, setSilentSeconds] = useState(0)
+  // 用户点击停止后立即进入本地“停止中”状态，直到对应流式桶真正收敛。
+  const [stopRequested, setStopRequested] = useState(false)
   // 右侧栏 Web 预览：待打开地址 + 当前 iframe 地址
   const [previewUrl, setPreviewUrl] = useState(() => getItem(STORAGE_KEYS.PREVIEW_URL) || 'http://localhost:5173')
   const [previewSrc, setPreviewSrc] = useState('')
@@ -733,7 +763,7 @@ export default function Home() {
     if (!currentConversation) return
     refreshQueued(currentConversation.id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentConversation?.id, messages.length, streaming.conversationId])
+  }, [currentConversation?.id, messages.length, streamingConversationId])
   // 项目审批白名单管理弹窗（查看/移除已永久放行的工具）
   const [whitelistOpen, setWhitelistOpen] = useState(false)
   const [whitelist, setWhitelist] = useState<WhitelistEntry[]>([])
@@ -1503,13 +1533,11 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages, currentConvId])
 
-  // 流式内容增长（含思考过程/工具运行数变化）时，贴底状态下持续跟随（rAF 节流）
+  // 流式期间贴底状态下持续跟随（rAF 节流）。正文增量已下沉到 StreamingOutput，
+  // 此处只依赖任务开始/结束，避免每批 token 让 Home 重渲染。
   // streamingActive 保护不能移除：切会话时虚拟列表 totalSize 变化也会触发本 effect，
   // 若无条件跟随会把刚恢复的滚动位置（switchPending 分支）再次拉到底部
-  const streamingLen = streaming.content.length + streaming.reasoning.length
-  const streamingActive = streaming.conversationId === currentConversation?.id
-  // 流式贴底：仅依赖 streamingLen 变化（新 token 到达），totalSize 变化由 rAF 循环自动跟随
-  // 避免 totalSize 高频变化（每帧测量多次）触发 effect 过度重渲染
+  const streamingActive = streamingConversationId === currentConversation?.id
   const streamScrollRafRef = useRef<number | null>(null)
   const streamScrollActiveRef = useRef(false)
   useEffect(() => {
@@ -1533,7 +1561,7 @@ export default function Home() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [streamingLen, streamingActive])
+  }, [streamingActive])
 
   // 组件卸载时清理 rAF 与滚动位置持久化
   useEffect(() => {
@@ -1620,7 +1648,10 @@ export default function Home() {
   }, [])
 
   /** 当前会话是否正在流式生成（派生值：供下方处理函数与 effect 使用，声明需在使用前） */
-  const isStreaming = streaming.conversationId === currentConversation?.id
+  const isStreaming = streamingConversationId === currentConversation?.id
+  useEffect(() => {
+    if (!isStreaming) setStopRequested(false)
+  }, [isStreaming])
   // 预计算最后一条助手消息 ID，供虚拟列表复用，避免每条消息渲染时都访问数组
   const lastAssistantId = useMemo(() => {
     if (isStreaming) return null
@@ -1634,18 +1665,7 @@ export default function Home() {
   // （任务因应用退出/崩溃中断，assistant 内容从未入库——用户消息已在库，回复丢失）
   // 排队中（queued=1）或流式中不算；命中后尾部渲染“继续生成回复”横幅，一键重新生成
   const orphanUserMessage = useMemo(() => {
-    if (isStreaming || messages.length === 0) return null
-    const last = messages[messages.length - 1]
-    // 场景 B：最后一条是 assistant 占位消息（duration_ms=NULL 表示任务中断未完成、
-    // 仅部分正文已入库）→ 显示“回复被中断，部分内容已保存”横幅，可一键继续生成
-    if (last.role === 'assistant' && last.duration_ms == null) return last
-    if (last.role !== 'user' || last.queued === 1) return null
-    // 双保险：最后一条 user 后确实无 assistant/tool 回复（从后向前找首个非 user 消息）
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'user') continue
-      return null // 已有回复/工具进展，不算中断
-    }
-    return last
+    return interruptedTailMessage(messages, isStreaming)
   }, [messages, isStreaming])
 
   /** 构建错误一键修复：将结构化错误摘要注入对话输入框并聚焦，让用户直接交给 Agent 修复 */
@@ -1740,7 +1760,7 @@ export default function Home() {
     setDraft('')
     setReferences([])
     // 有进行中任务时排队并入，否则直接发送（sendUserMessage 内部读取最新会话状态）
-    const busy = !!streaming.conversationId
+    const busy = !!streamingConversationId
     // 自动修复默认使用 first_write 审批：首次写文件前确认，本任务后续写操作免审，
     // 平衡自动化效率与代码安全；若用户已设为更严格的 ask 则尊重用户设置
     const fixOptions: ChatOptions =
@@ -1924,13 +1944,18 @@ export default function Home() {
 
   const handleSend = async () => {
     const text = draft.trim()
-    if (!text) return
+    if (!text || stopRequested) return
     if (!currentProject) return
     if (!currentConversation) {
       await newConversation()
     }
+    const targetConversation = useProjectStore.getState().currentConversation
+    if (!targetConversation) return
+    const projectId = currentProject.id
+    const selectedRefs = references
+    const quote = pendingQuote
     const refs = collectRefs()
-    if (pendingQuote) refs.push(`msg:${pendingQuote.id}`)
+    if (quote) refs.push(`msg:${quote.id}`)
     const imgs = pickedImages
     // 先清空输入框：invoke 要等整个 Agent 任务结束后才 resolve，若 await 发送则任务期间输入框不会清空
     setDraft('')
@@ -1941,6 +1966,18 @@ export default function Home() {
     setPendingQuote(null)
     if (isStreaming) {
       queueUserMessage(text, false, refs.length ? refs : undefined, imgs.length ? imgs : undefined).catch((e) => {
+        // 排队落库失败时不能吞掉用户输入；仍停留在原会话则完整恢复编辑器，否则保存到原会话草稿。
+        if (useProjectStore.getState().currentConversation?.id === targetConversation.id) {
+          setDraft((cur) => (cur.trim() ? `${text}\n\n${cur}` : text))
+          setReferences((cur) => Array.from(new Set([...selectedRefs, ...cur])))
+          setPickedImages((cur) => [...imgs, ...cur].slice(0, 4))
+          if (quote) setPendingQuote(quote)
+        } else {
+          const targetDrafts = draftCtxRef.current.proj === projectId ? draftsRef.current : readDraftMap(projectId)
+          const existing = targetDrafts[targetConversation.id] ?? ''
+          targetDrafts[targetConversation.id] = existing.trim() ? `${text}\n\n${existing}` : text
+          writeDraftMap(projectId, targetDrafts)
+        }
         useNotificationStore.getState().push({
           tone: 'error',
           title: t('chat.queueFailed', '排队消息发送失败'),
@@ -1955,9 +1992,13 @@ export default function Home() {
   /** 发送到 Agent：流式运行时提交为挂起消息，由 Agent 在任务内安全点并入当前任务 */
   const handleSendToAgent = async () => {
     const text = draft.trim()
-    if (!text || !currentProject || !currentConversation || !isStreaming) return
+    if (!text || !currentProject || !currentConversation || !isStreaming || stopRequested) return
+    const conversationId = currentConversation.id
+    const projectId = currentProject.id
+    const selectedRefs = references
+    const quote = pendingQuote
     const refs = collectRefs()
-    if (pendingQuote) refs.push(`msg:${pendingQuote.id}`)
+    if (quote) refs.push(`msg:${quote.id}`)
     const imgs = pickedImages
     // 同 handleSend：先清空输入框，不 await 排队接口
     setDraft('')
@@ -1966,6 +2007,17 @@ export default function Home() {
     setRefCandidates(null)
     setPendingQuote(null)
     queueUserMessage(text, true, refs.length ? refs : undefined, imgs.length ? imgs : undefined).catch((e) => {
+      if (useProjectStore.getState().currentConversation?.id === conversationId) {
+        setDraft((cur) => (cur.trim() ? `${text}\n\n${cur}` : text))
+        setReferences((cur) => Array.from(new Set([...selectedRefs, ...cur])))
+        setPickedImages((cur) => [...imgs, ...cur].slice(0, 4))
+        if (quote) setPendingQuote(quote)
+      } else {
+        const targetDrafts = draftCtxRef.current.proj === projectId ? draftsRef.current : readDraftMap(projectId)
+        const existing = targetDrafts[conversationId] ?? ''
+        targetDrafts[conversationId] = existing.trim() ? `${text}\n\n${existing}` : text
+        writeDraftMap(projectId, targetDrafts)
+      }
       useNotificationStore.getState().push({
         tone: 'error',
         title: t('chat.queueFailed', '排队消息发送失败'),
@@ -3111,9 +3163,8 @@ export default function Home() {
   }
 
   /** ID 展示与复制工具：取前 8 位作为短 ID，点击复制完整 ID 并显示 1.5s 成功反馈 */
-  const shortId = (id: string) => id.slice(0, 8)
   const [copiedId, setCopiedId] = useState<string | null>(null)
-  const copyId = useCallback(async (id: string, _label?: string) => {
+  const copyId = useCallback(async (id: string) => {
     try {
       await navigator.clipboard.writeText(id)
       setCopiedId(id)
@@ -3235,29 +3286,6 @@ export default function Home() {
   // token 数缩写（1.2k / 3.4w），标题下累计展示用
   const fmtTokens = (n: number) =>
     n >= 10000 ? `${(n / 10000).toFixed(1)}w` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
-
-  // 任务计时 + 静默检测：每秒刷新。任务在任意会话运行时都持续计时（切走会话不影响），
-  // 会话列表对运行中的会话显示“已运行 mm:ss”；静默超阈值时消息流提示模型仍在工作
-  useEffect(() => {
-    if (!streaming.startedAt) {
-      setTaskElapsed(0)
-      setSilentSeconds(0)
-      return
-    }
-    setTaskElapsed(Math.floor((Date.now() - streaming.startedAt) / 1000))
-    const timer = setInterval(() => {
-      const s = useProjectStore.getState()
-      if (!s.streaming.startedAt) {
-        setTaskElapsed(0)
-        setSilentSeconds(0)
-        return
-      }
-      setTaskElapsed(Math.floor((Date.now() - s.streaming.startedAt) / 1000))
-      const ref = s.streaming.lastDeltaAt ?? s.streaming.startedAt
-      setSilentSeconds(Math.floor((Date.now() - ref) / 1000))
-    }, 1000)
-    return () => clearInterval(timer)
-  }, [streaming.startedAt])
 
   // 概览面板：切换到 overview 时刷新最近任务（task_runs 明细）
   useEffect(() => {
@@ -3919,13 +3947,11 @@ export default function Home() {
                             )}
                           </div>
                         )}
-                        {streamings[c.id] ? (
-                          <span className="flex items-center gap-1.5 text-[11px] text-[var(--accent)] mt-0.5 tabular-nums">
-                            <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
-                            {streaming.conversationId === c.id
-                              ? t('home.taskElapsed', { time: fmtElapsed(taskElapsed) })
-                              : t('home.bgStreaming')}
-                          </span>
+                        {runningConversationIds.has(c.id) ? (
+                          <ConversationRunStatus
+                            conversationId={c.id}
+                            foreground={streamingConversationId === c.id}
+                          />
                         ) : (
                           <span className="flex items-center gap-1.5 mt-0.5">
                             <span className="text-[11px] text-[var(--text-muted)]">{formatTime(c.updated_at)}</span>
@@ -4137,6 +4163,17 @@ export default function Home() {
 
       {/* ============ 中间：对话区 ============ */}
       <main className="flex-1 flex flex-col min-w-0 bg-[var(--bg-primary)]">
+        <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {stopRequested
+            ? t('home.stopping')
+            : isStreaming
+              ? t('home.agentWorking')
+              : streamingError
+                ? streamingError
+                : lastTaskSummary
+                  ? t(lastTaskSummary.status === 'incomplete' ? 'home.taskIncompleteTitle' : 'home.taskDoneTitle')
+                  : ''}
+        </div>
         {/* 顶部栏 */}
         <header className="glass-bar h-14 shrink-0 border-b border-[var(--border)] flex items-center justify-between px-4 z-20">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -4464,13 +4501,12 @@ export default function Home() {
                       {item.kind === 'tail' && (
                         <>
                           {/* 任务过程徽章（ChatGPT 式）：中间所有过程折叠为“已处理 N 个操作中”，点击展开明细，对话流不中断 */}
-                          {isStreaming && streaming.startedAt && (
-                            <TaskOpsBadge
-                              running
+                          {isStreaming && currentConversation && (
+                            <RunningTaskOpsBadge
+                              conversationId={currentConversation.id}
                               count={toolRuns.length + agentRuns.length}
-                              time={fmtElapsed(taskElapsed)}
                               toolName={
-                                toolRuns.some((r) => r.status === 'running') ? toolRuns[toolRuns.length - 1]?.tool : undefined
+                                toolRuns.find((r) => r.status === 'running')?.tool
                               }
                               open={opsOpen}
                               onToggle={toggleOps}
@@ -4489,6 +4525,7 @@ export default function Home() {
                                 <button
                                   type="button"
                                   onClick={() => setTodoOpen((v) => !v)}
+                                  aria-expanded={todoOpen}
                                   className="w-full flex items-center gap-2 py-1.5 text-left hover:opacity-80 transition-opacity"
                                 >
                                   <Icon name="check" size={11} className="text-[var(--accent)] shrink-0" />
@@ -4540,14 +4577,18 @@ export default function Home() {
                               agents={agentRuns}
                             />
                           )}
-                          {/* 任务完成摘要（ChatGPT 式收尾统计）：耗时 + 工具调用 + 文件变更 */}
+                          {/* 任务收尾摘要：明确区分正常完成与达到上限/被停止后的未完成状态。 */}
                           {lastTaskSummary && !isStreaming && (
-                            <div className="md-task-summary animate-fade-in-up">
+                            <div
+                              className={`md-task-summary animate-fade-in-up ${lastTaskSummary.status === 'incomplete' ? 'is-incomplete' : ''}`}
+                            >
                               <div className="md-task-summary-icon">
-                                <Icon name="check" size={13} white />
+                                <Icon name={lastTaskSummary.status === 'incomplete' ? 'info' : 'check'} size={13} white />
                               </div>
                               <div className="min-w-0">
-                                <span className="md-task-summary-title">{t('home.taskDoneTitle')}</span>
+                                <span className="md-task-summary-title">
+                                  {t(lastTaskSummary.status === 'incomplete' ? 'home.taskIncompleteTitle' : 'home.taskDoneTitle')}
+                                </span>
                                 <span className="md-task-summary-meta tabular-nums">
                                   {t('home.taskSummary', {
                                     time: fmtElapsed(lastTaskSummary.durationMs / 1000),
@@ -4560,17 +4601,15 @@ export default function Home() {
                             </div>
                           )}
                           {/* 工具过程已收进顶部“已处理 N 个操作”徽章（展开查看），对话流不再平铺工具卡 */}
-                          {isStreaming && <StreamingMessage content={streaming.content} reasoning={streaming.reasoning} speed={streamSpeed} />}
-                          {isStreaming && silentSeconds >= 15 && !toolRuns.some((r) => r.status === 'running') && (
-                            <div className="flex items-center gap-2 text-[11.5px] text-[var(--text-muted)] animate-pulse">
-                              <Icon name="spark" size={12} />
-                              {t('home.silentHint', { time: fmtElapsed(silentSeconds) })}
-                            </div>
-                          )}
-                          {streaming.error && (
+                          <StreamingOutput conversationId={currentConversation?.id ?? null} speed={streamSpeed} />
+                          <SilentStreamHint
+                            conversationId={currentConversation?.id ?? null}
+                            active={isStreaming && !toolRuns.some((r) => r.status === 'running') && !pendingPlan && !askCard && toolApprovals.length === 0}
+                          />
+                          {streamingError && (
                             <ErrorCard
-                              error={streaming.error}
-                              detail={streaming.errorDetail}
+                              error={streamingError}
+                              detail={streamingErrorDetail}
                               onRetry={() => regenerateLast(modelOptions)}
                               retryLabel={t('home.retry')}
                             />
@@ -4724,6 +4763,7 @@ export default function Home() {
             <div className="max-w-3xl mx-auto pb-1.5">
               <button
                 onClick={() => setQueuedOpen((v) => !v)}
+                aria-expanded={queuedOpen}
                 className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
               >
                 <Icon name="terminal" size={11} />
@@ -4833,6 +4873,8 @@ export default function Home() {
               value={draft}
               onChange={(e) => handleDraftChange(e.target.value)}
               onKeyDown={(e) => {
+                // IME 候选确认也会发出 Enter；组合输入阶段不处理快捷键，避免中文输入误发送。
+                if (e.nativeEvent.isComposing || e.key === 'Process') return
                 // 斜杠候选面板打开时：上下选择、回车/Tab 确认、Esc 关闭
                 if (slashCandidates && slashCandidates.length > 0) {
                   if (e.key === 'ArrowDown') {
@@ -4879,9 +4921,9 @@ export default function Home() {
                     return
                   }
                 }
-                if (e.key === 'Enter' && !e.shiftKey) {
+                if (shouldSubmitComposerKey(e.key, e.shiftKey, e.nativeEvent.isComposing)) {
                   e.preventDefault()
-                  handleSend()
+                  void handleSend()
                 }
               }}
               onPaste={(e) => {
@@ -5042,7 +5084,8 @@ export default function Home() {
                     {/* 停止生成：危险操作，xl 以下也常驻（用户必须能随时停） */}
                     <button
                       onClick={() => {
-                        stopGeneration()
+                        setStopRequested(true)
+                        void stopGeneration()
                         useAuditStore.getState().log({
                           category: 'task.stop',
                           label: t('home.auditLabelTaskStop'),
@@ -5051,16 +5094,18 @@ export default function Home() {
                           projectId: currentProject?.id,
                         })
                       }}
-                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 transition-all text-[12px] font-medium"
-                      title={t('home.stopGenerating')}
+                      disabled={stopRequested}
+                      aria-label={t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}
+                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 disabled:opacity-60 disabled:cursor-wait transition-all text-[12px] font-medium"
+                      title={t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}
                     >
-                      <span className="w-2.5 h-2.5 rounded-[3px] bg-[var(--danger)] shrink-0" />
-                      <span className="hidden md:inline">{t('home.stopGenerating')}</span>
+                      <span className={`w-2.5 h-2.5 rounded-[3px] bg-[var(--danger)] shrink-0 ${stopRequested ? 'animate-pulse' : ''}`} />
+                      <span className="hidden md:inline">{t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}</span>
                     </button>
                     {/* 发给 Agent：折叠到更多菜单，xl+ 展开 */}
                     <button
                       onClick={handleSendToAgent}
-                      disabled={!draft.trim()}
+                      disabled={!draft.trim() || stopRequested}
                       className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] items-center justify-start gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
                       title={t('home.sendToAgent')}
                     >
@@ -5070,7 +5115,8 @@ export default function Home() {
                     {/* 发送：主操作，xl 以下也常驻 */}
                     <button
                       onClick={handleSend}
-                      disabled={!draft.trim()}
+                      disabled={!draft.trim() || stopRequested}
+                      aria-label={t('home.queueSend')}
                       className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
                       title={t('home.queueSend')}
                     >
@@ -5079,7 +5125,7 @@ export default function Home() {
                     {/* 批量任务：折叠到更多菜单，xl+ 展开 */}
                     <button
                       onClick={() => setBatchOpen(true)}
-                      disabled={!draft.trim()}
+                      disabled={!draft.trim() || stopRequested}
                       className="hidden xl:flex h-8 xl:px-2.5 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center justify-start gap-1 hover:bg-[var(--bg-hover)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
                       title={t('home.batchSend')}
                     >
@@ -5092,6 +5138,7 @@ export default function Home() {
                         onClick={() => setToolbarMoreOpen((v) => !v)}
                         title={t('home.moreActions')}
                         aria-label={t('home.moreActions')}
+                        aria-expanded={toolbarMoreOpen}
                         className={`h-8 w-8 rounded-full flex items-center justify-center transition-colors ${
                           toolbarMoreOpen
                             ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
@@ -5149,7 +5196,7 @@ export default function Home() {
                                 setToolbarMoreOpen(false)
                               }
                             }}
-                            disabled={!draft.trim()}
+                            disabled={!draft.trim() || stopRequested}
                             className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             <Icon name="bolt" size={14} className="shrink-0" />
@@ -5161,7 +5208,7 @@ export default function Home() {
                               setBatchOpen(true)
                               setToolbarMoreOpen(false)
                             }}
-                            disabled={!draft.trim()}
+                            disabled={!draft.trim() || stopRequested}
                             className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             <Icon name="package" size={14} className="shrink-0" />
@@ -5175,6 +5222,7 @@ export default function Home() {
                   <button
                     onClick={handleSend}
                     disabled={!draft.trim() || !currentProject}
+                    aria-label={t('home.send')}
                     className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
                     title={t('home.send')}
                   >
@@ -5263,6 +5311,13 @@ export default function Home() {
 
           {/* Tab 内容 */}
           <div className="flex-1 overflow-y-auto">
+            <Suspense
+              fallback={(
+                <div className="h-full min-h-40 flex items-center justify-center" role="status" aria-live="polite">
+                  <span className="w-6 h-6 rounded-full border-2 border-[var(--border)] border-t-[var(--accent)] animate-spin" />
+                </div>
+              )}
+            >
             {rightTab === 'overview' ? (
               <div className="p-3 space-y-2.5">
                 {/* 项目信息卡 */}
@@ -5674,6 +5729,7 @@ export default function Home() {
                 onClearBuild={clearBuildLogs}
               />
             )}
+            </Suspense>
           </div>
         </aside>
         </>
@@ -8224,6 +8280,3 @@ const settingsItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/health', labelKey: 'nav.health', icon: 'health' },
   { path: '/ohpm', labelKey: 'nav.ohpm', icon: 'apps' },
 ]
-
-
-

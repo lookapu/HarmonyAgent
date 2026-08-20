@@ -162,6 +162,7 @@ export interface AskCard {
 
 /** 任务结束摘要（ChatGPT 式收尾统计）：耗时 + 工具调用数 + 修改文件数 + token 成本 */
 export interface TaskSummary {
+  status: 'completed' | 'incomplete'
   durationMs: number
   toolCount: number
   fileCount: number

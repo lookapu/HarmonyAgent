@@ -1,3 +1,5 @@
+import type { ChatMessage } from '../api/project'
+
 /** 任务/工具耗时格式化：mm:ss（超 1 小时 h:mm:ss），模块级供工具卡复用 */
 export function fmtElapsed(sec: number) {
   const s = Math.max(0, Math.floor(sec))
@@ -5,6 +7,21 @@ export function fmtElapsed(sec: number) {
   const m = Math.floor((s % 3600) / 60)
   const rest = String(s % 60).padStart(2, '0')
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${rest}` : `${m}:${rest}`
+}
+
+/** 检测会话尾部是否存在可恢复的中断回复。
+ * 最后一条已提交 user 天然表示其后没有回复，不能被更早的 assistant 误判为“已有回复”。 */
+export function interruptedTailMessage(messages: ChatMessage[], streaming: boolean): ChatMessage | null {
+  if (streaming || messages.length === 0) return null
+  const last = messages[messages.length - 1]
+  if (last.role === 'assistant' && last.duration_ms == null) return last
+  if (last.role === 'user' && last.queued !== 1) return last
+  return null
+}
+
+/** 输入框 Enter 发送判定。中文/日文等 IME 确认候选时也会触发 Enter，必须等待组合输入结束。 */
+export function shouldSubmitComposerKey(key: string, shiftKey: boolean, isComposing: boolean): boolean {
+  return key === 'Enter' && !shiftKey && !isComposing
 }
 
 /** 恢复划词选区高亮。快照 Range 的边界节点可能因 DOM 更新失效：Chromium 会把失效边界

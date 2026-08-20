@@ -92,6 +92,7 @@
     "send": "Send",
     "newline": "newline",
     "stopGenerating": "Stop",
+    "stopping": "Stopping…",
     "stopTool": "Stop tool",
     "streamSpeedHint": "Stream speed (UI throttling only)",
     "retry": "Retry",
@@ -900,6 +901,7 @@
     "toggleTaskOps": "Toggle task operations",
     "taskSummary": "{{time}} · {{tools}} tool calls · {{files}} files changed · {{tokens}} tokens",
     "taskDoneTitle": "Task complete",
+    "taskIncompleteTitle": "Task incomplete",
     "replyDurationHint": "Time taken for this reply (task start to finish)"
   },
   "dialog": {

@@ -170,12 +170,17 @@ pub struct ChatStoppedEvent {
     pub run_id: String,
     /// 是否未完成：已执行过工具但未产出总结文本（前端据此展示“继续任务”按钮断点续跑）
     pub unfinished: bool,
+    /// 若停止发生在正式执行前，返回刚持久化的用户消息 ID，供前端收敛乐观占位。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<String>,
 }
 
 /// 工具开始执行事件
 #[derive(Clone, Serialize)]
 pub struct ChatToolStartEvent {
     pub conversation_id: String,
+    pub run_id: String,
+    pub call_id: String,
     pub tool: String,
     pub args: String,
     /// 当前工具轮次（第几轮，从 1 开始）
@@ -192,6 +197,8 @@ pub struct ChatToolStartEvent {
 #[derive(Clone, Serialize)]
 pub struct ChatToolDoneEvent {
     pub conversation_id: String,
+    pub run_id: String,
+    pub call_id: String,
     pub tool: String,
     pub ok: bool,
     pub output: String,
@@ -203,6 +210,7 @@ pub struct ChatToolDoneEvent {
 #[derive(Clone, Serialize)]
 pub struct ChatAgentStartEvent {
     pub conversation_id: String,
+    pub run_id: String,
     pub name: String,
     pub model: String,
 }
@@ -211,6 +219,7 @@ pub struct ChatAgentStartEvent {
 #[derive(Clone, Serialize)]
 pub struct ChatAgentDoneEvent {
     pub conversation_id: String,
+    pub run_id: String,
     pub name: String,
     pub model: String,
     pub ok: bool,
@@ -1985,7 +1994,54 @@ async fn stream_chat_inner(
         }
         // 等待期间响应停止请求；超时释放（防僵尸任务永久阻塞队列）
         if is_cancelled(&cancel, &conversation_id) {
-            return Err("已取消".into());
+            // 尚未取得项目锁时普通 user 消息还未走到下方入库；停止前先持久化，
+            // 避免前端乐观消息刷新后消失。重新生成/自动续跑的 user 消息已在库，不重复写。
+            let user_message_id = if !regenerate.unwrap_or(false) && persist_user {
+                let id = Uuid::new_v4().to_string();
+                let ts = now();
+                let content_with_images = match &images {
+                    Some(imgs) if !imgs.is_empty() => {
+                        format!("{content}\n\n（本次请求附带 {} 张图片，多模态输入）", imgs.len())
+                    }
+                    _ => content.clone(),
+                };
+                let refs_json = references
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .map(|r| serde_json::to_string(r).unwrap_or_default());
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                conn.execute(
+                    "INSERT INTO messages (id, conversation_id, role, content, references_json, created_at)
+                     VALUES (?1, ?2, 'user', ?3, ?4, ?5)",
+                    params![id, conversation_id, content_with_images, refs_json, ts],
+                )
+                .map_err(|e| e.to_string())?;
+                let _ = crate::agent::session_events::append_event(
+                    &conn,
+                    &conversation_id,
+                    crate::agent::session_events::SessionEventType::UserMessage,
+                    serde_json::json!({ "content": content_with_images }),
+                    Some(&trace_id),
+                );
+                let _ = conn.execute(
+                    "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+                    params![ts, conversation_id],
+                );
+                Some(id)
+            } else {
+                None
+            };
+            stats.stopped = true;
+            let _ = app.emit(
+                "chat-stopped",
+                ChatStoppedEvent {
+                    conversation_id: conversation_id.clone(),
+                    run_id: trace_id.clone(),
+                    unfinished: false,
+                    user_message_id,
+                },
+            );
+            return Ok(());
         }
         if queue_wait.elapsed().as_secs() > 600 {
             return Err("排队等待超时（10 分钟）：该项目的前序任务未完成，请稍后再试".into());
@@ -4082,10 +4138,15 @@ async fn stream_chat_inner(
             // 写工具串行 barrier；结果按模型序提交（行为与串行一致，只读工具提速）
             let mut pending: Vec<(String, String, u32)> = Vec::new();
             // 工具执行上下文（并发批次与串行工具共享；主 Agent 可委派 1 层子 Agent）
-            let tool_ctx = crate::agent::exec_ctx::ToolCtx::new(app.clone(), conversation_id.clone());
+            let tool_ctx = crate::agent::exec_ctx::ToolCtx::new(
+                app.clone(),
+                conversation_id.clone(),
+                trace_id.clone(),
+            );
             for (tool, args_raw) in calls {
                 // 每个工具独立计时：覆盖审批等待与重试，作为 done 事件的精确耗时
                 let tool_begin = std::time::Instant::now();
+                let call_id = Uuid::new_v4().to_string();
                 // 工具心跳：长工具执行（build/run 可达数分钟）期间保持心跳，防看门狗误杀
                 registry.touch(&conversation_id, PHASE_TOOL);
                 // 工具执行跟踪（含批处理路径：本循环所有工具均经过此处）
@@ -4157,6 +4218,8 @@ async fn stream_chat_inner(
                         "chat-tool-start",
                         ChatToolStartEvent {
                             conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
                             tool: tool.clone(),
                             args: args_raw.clone(),
                             round,
@@ -4169,6 +4232,8 @@ async fn stream_chat_inner(
                         "chat-tool-done",
                         ChatToolDoneEvent {
                             conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
                             tool: tool.clone(),
                             ok: false,
                             output: format!(
@@ -4310,6 +4375,8 @@ async fn stream_chat_inner(
                     "chat-tool-start",
                     ChatToolStartEvent {
                         conversation_id: conversation_id.clone(),
+                        run_id: trace_id.clone(),
+                        call_id: call_id.clone(),
                         tool: tool.clone(),
                         args: args_raw.clone(),
                         round,
@@ -4348,6 +4415,8 @@ async fn stream_chat_inner(
                         "chat-tool-done",
                         ChatToolDoneEvent {
                             conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
                             tool: tool.clone(),
                             ok: false,
                             output: intercept.message.clone(),
@@ -4585,6 +4654,8 @@ async fn stream_chat_inner(
                         "chat-tool-done",
                         ChatToolDoneEvent {
                             conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
                             tool: tool.clone(),
                             ok: true,
                             output: output.clone(),
@@ -4621,6 +4692,8 @@ async fn stream_chat_inner(
                         "chat-tool-done",
                         ChatToolDoneEvent {
                             conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
                             tool: tool.clone(),
                             ok: false,
                             output: e.clone(),
@@ -5288,6 +5361,7 @@ async fn persist_turn(
                     conversation_id: conversation_id.to_string(),
                     run_id: trace_id.to_string(),
                     unfinished: !tool_runs.is_empty(),
+                    user_message_id,
                 },
             );
         }
@@ -6867,10 +6941,12 @@ async fn run_one_subagent_emitted(
         return (name.to_string(), Err("子任务未执行（用户已停止生成）".to_string()));
     }
     let t0 = std::time::Instant::now();
+    let run_id = app.state::<TaskRegistry>().run_id(conversation_id);
     let _ = app.emit(
         "chat-agent-start",
         ChatAgentStartEvent {
             conversation_id: conversation_id.to_string(),
+            run_id: run_id.clone(),
             name: name.to_string(),
             model: mc.model.clone(),
         },
@@ -6897,6 +6973,7 @@ async fn run_one_subagent_emitted(
         "chat-agent-done",
         ChatAgentDoneEvent {
             conversation_id: conversation_id.to_string(),
+            run_id,
             name: name.to_string(),
             model: mc.model.clone(),
             ok: r.is_ok(),
@@ -7166,6 +7243,7 @@ async fn run_subagent(
             let tool_ctx = crate::agent::exec_ctx::ToolCtx {
                 app: Some(app.clone()),
                 conversation_id: conversation_id.to_string(),
+                run_id: app.state::<TaskRegistry>().run_id(conversation_id),
                 spawn_remaining: limits.max_depth.unwrap_or(0),
             };
             let args_val: serde_json::Value =
@@ -7334,10 +7412,13 @@ async fn execute_tool_batch_one(
     registry: &TaskRegistry,
 ) -> BatchToolResult {
     let tool_begin = std::time::Instant::now();
+    let call_id = Uuid::new_v4().to_string();
     let _ = app.emit(
         "chat-tool-start",
         ChatToolStartEvent {
             conversation_id: conversation_id.to_string(),
+            run_id: tool_ctx.run_id.clone(),
+            call_id: call_id.clone(),
             tool: tool.to_string(),
             args: args_raw.to_string(),
             round,
@@ -7364,6 +7445,8 @@ async fn execute_tool_batch_one(
             "chat-tool-done",
             ChatToolDoneEvent {
                 conversation_id: conversation_id.to_string(),
+                run_id: tool_ctx.run_id.clone(),
+                call_id: call_id.clone(),
                 tool: tool.to_string(),
                 ok: false,
                 output: intercept.message.clone(),
@@ -7454,6 +7537,8 @@ async fn execute_tool_batch_one(
         "chat-tool-done",
         ChatToolDoneEvent {
             conversation_id: conversation_id.to_string(),
+            run_id: tool_ctx.run_id.clone(),
+            call_id,
             tool: tool.to_string(),
             ok,
             output: output.clone(),

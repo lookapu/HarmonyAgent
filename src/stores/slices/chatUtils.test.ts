@@ -6,6 +6,8 @@ import {
   escapeHtml,
   toHtml,
   acceptsRunEvent,
+  firstRunningIndex,
+  reconcileRunUserMessage,
 } from './chatUtils'
 import type { ChatMessage } from '../../api/project'
 
@@ -20,6 +22,41 @@ describe('acceptsRunEvent', () => {
   it('握手前拒绝带代次事件，同时兼容旧后端无代次事件', () => {
     expect(acceptsRunEvent(null, 'run-new')).toBe(false)
     expect(acceptsRunEvent('run-new')).toBe(true)
+  })
+})
+
+describe('stream lifecycle reconciliation', () => {
+  it('把自动续跑的真实排队消息标记为已执行', () => {
+    const queued = { ...msg('user', 'queued'), id: 'user-2', queued: 1 }
+    const next = reconcileRunUserMessage([queued], 'user-2')
+    expect(next[0].queued).toBe(0)
+  })
+
+  it('普通发送用后端 ID 替换最后一个本地 user 占位', () => {
+    const messages = [
+      { ...msg('user', 'old'), id: 'local-old' },
+      msg('assistant', 'answer'),
+      { ...msg('user', 'new'), id: 'local-new' },
+    ]
+    const next = reconcileRunUserMessage(messages, 'persisted-new')
+    expect(next.map((m) => m.id)).toEqual(['local-old', undefined, 'persisted-new'])
+  })
+
+  it('有随后排队的本地消息时精确替换当前运行占位', () => {
+    const messages = [
+      { ...msg('user', 'running'), id: 'local-running' },
+      { ...msg('user', 'queued'), id: 'local-queued', queued: 1 },
+    ]
+    const next = reconcileRunUserMessage(messages, 'persisted-running', 'local-running')
+    expect(next.map((m) => m.id)).toEqual(['persisted-running', 'local-queued'])
+  })
+
+  it('同名并发运行项一次只匹配一个', () => {
+    const entries = [
+      { tool: 'read_file', status: 'running' },
+      { tool: 'read_file', status: 'running' },
+    ]
+    expect(firstRunningIndex(entries, (entry) => entry.tool === 'read_file')).toBe(0)
   })
 })
 

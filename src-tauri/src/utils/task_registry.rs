@@ -132,6 +132,18 @@ impl TaskRegistry {
         }
     }
 
+    /// 读取当前任务代次，供工具/子 Agent 的过程事件绑定到正确运行。
+    pub fn run_id(&self, conversation_id: &str) -> String {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|m| {
+                m.get(conversation_id)
+                    .and_then(|h| h.run_id.lock().ok().and_then(|id| id.clone()))
+            })
+            .unwrap_or_default()
+    }
+
     /// 心跳打点：更新最后活跃时间与阶段（原子写，高频路径）
     pub fn touch(&self, conversation_id: &str, phase: i64) {
         if let Ok(m) = self.0.lock() {
@@ -305,6 +317,7 @@ fn watchdog_loop(app: AppHandle) {
                     "chat-error",
                     serde_json::json!({
                         "conversation_id": cid,
+                        "run_id": run_id,
                         "error": "任务异常卡死或停止未生效，已被强制终止。请重试；若复现，可查看应用日志定位卡点。",
                         "kind": "timeout",
                         "title": "任务被强制终止",
@@ -347,5 +360,18 @@ mod tests {
         registry.unregister("conv", generation);
         assert!(!registry.0.lock().unwrap().contains_key("conv"));
         first.abort();
+    }
+
+    #[tokio::test]
+    async fn exposes_current_run_id_for_process_events() {
+        let registry = TaskRegistry::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let generation = registry.register("conv-run", task.abort_handle()).expect("register");
+        assert_eq!(registry.run_id("conv-run"), "");
+        registry.set_run_id("conv-run", "run-123");
+        assert_eq!(registry.run_id("conv-run"), "run-123");
+        registry.unregister("conv-run", generation);
+        assert_eq!(registry.run_id("conv-run"), "");
+        task.abort();
     }
 }
