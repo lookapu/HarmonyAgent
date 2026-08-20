@@ -26,6 +26,7 @@ mod pipeline;
 mod project_tools;
 mod protocol;
 mod quality_tools;
+mod schedule_tools;
 mod skill_tools;
 mod test_tools;
 mod ui_tools;
@@ -221,6 +222,8 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("db_migrate", "other"),
     ("state_snapshot", "other"),
     ("prompt_optimize", "other"),
+    ("ui_focus", "other"),
+    ("memorize", "other"),
     ("export_tools_meta", "other"),
     ("compose", "other"),
     ("chart_extract", "explore"),
@@ -398,8 +401,28 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "当问题需要用户在 IDE/系统中手动操作（配置签名、安装缺失 SDK、安装依赖）时，向用户展示一张可操作的诊断引导卡片。\n仅在你确认根因属于以下类别、且无法仅靠改代码解决时调用：\n  - signing：签名/证书缺失或不匹配（需在 DevEco Studio 配置签名）\n  - sdk：工程要求的 SDK API 未安装（需在 DevEco SDK Manager 安装）\n  - dependency：依赖缺失（需执行 ohpm install 或检查 oh-package.json5）\n参数：{\"category\":\"signing|sdk|dependency\",\"title\":\"<卡片标题>\",\"message\":\"<问题说明与建议操作>\",\"action\":\"<建议一键操作，如 install_deps|open_sdk_manager|open_signing_config>\"}。\naction 取值：install_deps（安装依赖）、open_sdk_manager（打开 SDK 管理）、open_signing_config（打开签名配置）、none（仅提示）。\n副作用：向界面推送一张诊断卡片（不修改任何文件）。\n返回：卡片已展示的确认信息。",
     },
     ToolSpec {
+        name: "memorize",
+        desc: "主动记忆重要信息（用户约束/关键决策/失败教训等），供本任务后续轮次与续跑参考。\n参数：{\"operate\":\"put|update|delete|scan\"（缺省 put）,\"key\":\"<记忆键，简洁关键词如 build_cmd 或 签名配置>\",\"value\":\"<记忆内容，put/update 需要，≤200 字符>\"}。\n同 key 再次 put 即覆盖；delete 删除。已记忆内容会自动注入后续轮次系统提示，无需再读取。\n适合：长任务中记录跨轮必须记住的关键事实（用户原始约束、确定的方案、踩过的坑），防止上下文滚动摘要稀释后遗忘。\n副作用：仅记录到本会话消息历史（不跨会话共享）。\n返回：操作结果。",
+    },
+    ToolSpec {
+        name: "ui_focus",
+        desc: "把用户视线引导到你本次的产出：用户不会主动注意到你写入的文件/生成的图片/终端输出，除非调用本工具切换右侧面板或打开文件预览；写总结前调用一次，同一逻辑步骤内不要对同一文件/面板重复调用。\n参数：{\"command\":\"navigate_to_file|open_tab|show_preview\",\"path\":\"<工作区相对路径>\",\"tab\":\"files|git|preview|terminal|devices|overview|symbols|analyze\"}。\ncommand 必填：navigate_to_file（打开 path 的文件预览）、show_preview（预览 path 的产物——截图/报告/图片等，图片/音频/视频直接播放，md 走 Markdown 渲染）、open_tab（切换右侧面板到 tab）。\n副作用：仅切换界面展示（不修改任何文件）。\n返回：聚焦结果的确认信息。",
+    },
+    ToolSpec {
         name: "save_memory",
         desc: "保存一条项目长期记忆（工程经验，注入后续每轮对话供参考）。\n参数：{\"title\":\"<60 字内标题>\",\"content\":\"<经验描述，2000 字内>\",\"category\":\"general|code|build|deploy|decision|pitfall\"（缺省 general）}。\n仅当发现值得长期记住的经验（构建命令、错误解法、架构约定、踩坑结论）时使用，避免保存一次性对话内容。\n副作用：写入项目记忆库（用户可在记忆面板管理）。\n返回：保存结果。",
+    },
+    ToolSpec {
+        name: "schedule_create",
+        desc: "创建会话内定时提醒，到期后以普通对话消息提醒（不打断当前任务，下次请求自动看到）。\n参数：{\"kind\":\"after|at|every\"（缺省 after）,\"prompt\":\"<提醒内容，≤500 字符>\",\"after_seconds\":<kind=after 的延时秒数，≥1>,\"at\":\"<kind=at 的 RFC3339 时点，如 2026-08-21T10:00:00+08:00，必须未来>\",\"every_seconds\":<kind=every 的间隔秒数，≥300（5 分钟下限）>}。\n适合：构建/部署/长任务进行中需要稍后跟进时（如\"10 分钟后提醒检查构建日志\"、\"每 30 分钟提醒进度汇报\"），比 memorize 更适合时间触发型待办。\n副作用：写入本会话提醒表（应用运行期间每 30 秒检查派发）。\n返回：提醒 id 与确认信息。",
+    },
+    ToolSpec {
+        name: "schedule_list",
+        desc: "列出本会话全部定时提醒（类型、内容、剩余时间、是否已失效），含 id 用于删除。\n参数：无。\n适合：忘记设过哪些提醒、需要核对或删除时先用本工具查看。\n副作用：无（只读）。\n返回：提醒列表。",
+    },
+    ToolSpec {
+        name: "schedule_delete",
+        desc: "删除指定定时提醒（终结性：删除不存在的 id 也视为成功）。\n参数：{\"id\":\"<提醒 id，先用 schedule_list 查看>\"}。\n适合：不再需要某条提醒、或用户要求取消时调用。\n副作用：删除该提醒记录，不再投递。\n返回：删除结果。",
     },
     ToolSpec {
         name: "list_dir",
@@ -1156,9 +1179,14 @@ pub async fn run_tool(
         "check_sdk_alignment" => check_sdk_alignment(&args, &roots, db),
         "create_harmony_project" => project_tools::create_harmony_project(&args, &roots).await,
         "show_diagnose_card" => show_diagnose_card(&args, ctx).await,
+        "ui_focus" => ui_focus(&args, ctx).await,
+        "memorize" => memorize(&args).await,
         "search_harmony_docs" => test_tools::search_harmony_docs_tool(&args, ctx).await,
         "read_harmony_doc" => test_tools::read_harmony_doc_tool(&args, ctx).await,
         "save_memory" => memory_tools::save_memory(&args, project_id, db).await,
+        "schedule_create" => schedule_tools::schedule_create(&args, ctx, db).await,
+        "schedule_list" => schedule_tools::schedule_list(&args, ctx, db).await,
+        "schedule_delete" => schedule_tools::schedule_delete(&args, ctx, db).await,
         "conversation_search" => memory_tools::conversation_search(&args, project_id, db).await,
         "list_dir" => fs_tools::list_dir(&args, &roots).await,
         "read_file" => fs_tools::read_file(&args, &roots).await,
@@ -1278,7 +1306,7 @@ pub async fn run_tool(
         "lsp_diagnostics" => crate::agent::lsp_client::lsp_diagnostics(&args, &roots, &ctx.conversation_id).await,
         "debug_probe" => debug_tools::debug_probe(&args, &roots, ctx).await,
         "stack_dump" => debug_tools::stack_dump(&args, &roots).await,
-        "http_request" => cmd_tools::http_request(&args).await,
+        "http_request" => cmd_tools::http_request(&args, &roots).await,
         "multi_edit" => fs_tools::multi_edit(&args, &roots, &ctx.conversation_id).await,
         "device_perf" => cmd_tools::device_perf(&args).await,
         // ---- 工具自我管理域（meta_tools）----
@@ -3158,6 +3186,98 @@ async fn show_diagnose_card(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx)
     }
 }
 
+/// ui_focus：把用户视线引导到 Agent 本次产出（对齐 OpenHands canvas_ui_control 设计）——
+/// 切换右侧面板 / 打开文件预览 / 展示产物。纯 UI 聚焦无副作用：推送事件后立即返回，
+/// 不等用户操作（区别于 show_diagnose_card 的阻塞等待）；L0 幂等缓存天然防止
+/// 同参数 15s 内重复聚焦（对齐 OpenHands 的 idempotentHint）。
+async fn ui_focus(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
+    let command = args["command"].as_str().unwrap_or("").trim().to_string();
+    let path = args["path"].as_str().unwrap_or("").trim().to_string();
+    let tab = args["tab"].as_str().unwrap_or("").trim().to_string();
+    // 参数校验失败返回修正指导（对齐 OpenHands validateLaunchParams 的 guidance：直接说清允许值）
+    let allowed_tabs = [
+        "files", "git", "preview", "terminal", "devices", "overview", "symbols", "analyze",
+    ];
+    let (command, tab) = match command.as_str() {
+        "navigate_to_file" | "show_preview" => {
+            if path.is_empty() {
+                return Err(format!("ui_focus {command} 需要 path（工作区相对路径），收到空 path"));
+            }
+            (command, String::new())
+        }
+        "open_tab" => {
+            if !allowed_tabs.contains(&tab.as_str()) {
+                return Err(format!(
+                    "ui_focus open_tab 的 tab 必须是 {:?} 之一，收到 {tab:?}",
+                    allowed_tabs
+                ));
+            }
+            (command, tab)
+        }
+        other => {
+            return Err(format!(
+                "ui_focus 的 command 必须是 navigate_to_file/open_tab/show_preview 之一，收到 {other:?}；path 需工作区相对路径，tab 需右侧面板名"
+            ));
+        }
+    };
+    let app = ctx
+        .app
+        .as_ref()
+        .ok_or_else(|| "ui_focus 需要应用上下文".to_string())?;
+    use tauri::Emitter;
+    app.emit(
+        "ui-focus",
+        serde_json::json!({
+            "conversation_id": ctx.conversation_id,
+            "command": command,
+            "path": path,
+            "tab": tab,
+        }),
+    )
+    .map_err(|e| format!("推送 UI 聚焦事件失败：{e}"))?;
+    Ok(match command.as_str() {
+        "navigate_to_file" => format!("已在右侧文件面板打开 {path} 的预览"),
+        "show_preview" => format!("已在文件预览中展示产物 {path}"),
+        _ => format!("已将右侧面板切换到「{tab}」"),
+    })
+}
+
+/// memorize：主动记忆工具（对齐 Qwen-Agent MemoAssistant 的 storage 工具）。
+/// 实际存储不在本工具（零存储成本）：工具调用会随消息落库，主循环每轮从消息历史
+/// 回放 put/update/delete 重建键值状态并注入系统提示——状态天然与消息一致，
+/// 时间旅行/回滚后自动正确，无需单独建表同步。
+async fn memorize(args: &Value) -> Result<String, String> {
+    let operate = args["operate"].as_str().unwrap_or("put").trim();
+    let key = args["key"].as_str().unwrap_or("").trim();
+    match operate {
+        "put" | "update" => {
+            if key.is_empty() {
+                return Err("memorize put/update 需要非空 key（简洁关键词，如 build_cmd 或 签名配置）".into());
+            }
+            let value = args["value"].as_str().unwrap_or("").trim();
+            if value.is_empty() {
+                return Err(format!("memorize {operate} 需要非空 value（记忆内容，≤200 字符）"));
+            }
+            Ok(format!(
+                "已记忆「{key}」：{value}\n（同 key 再次 put 即覆盖；已记忆内容会自动注入后续轮次系统提示，无需再读取）"
+            ))
+        }
+        "delete" => {
+            if key.is_empty() {
+                return Err("memorize delete 需要非空 key".into());
+            }
+            Ok(format!("已删除记忆「{key}」"))
+        }
+        "scan" => Ok(
+            "当前已记忆的全部 key-value 已自动注入每轮系统提示（## 关键记忆 块），无需调用 scan；如需删除某条用 delete 指定 key。"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "memorize 的 operate 必须是 put/update/delete/scan 之一，收到 {other:?}"
+        )),
+    }
+}
+
 /// list_modules：列出工作区已识别的子工程模块（读 DB 元数据，缺失时实时扫描）。
 async fn list_modules(
     args: &Value,
@@ -3834,6 +3954,89 @@ fn truncate_out_head_tail(s: &str, n: usize) -> String {
     out
 }
 
+/// 大输出外部化存储（对齐 opencode tool-output-store）：超过 max 的输出全文落盘到
+/// {project}/.deveco-agent/tool-output/，上下文只留头尾采样 + 落盘路径标记，
+/// agent 需要完整内容时可 read_file 读回（目录在项目根内，读回受路径白名单约束），
+/// 避免重跑命令/重读文件（run_command 重跑耗时且可能产生副作用）。
+/// project_path 为空（无项目绑定）时退回纯截断（保持旧行为）。
+pub(super) fn store_overflow(text: &str, max: usize, project_path: &str, label: &str) -> String {
+    let total = text.chars().count();
+    if total <= max || project_path.trim().is_empty() {
+        return truncate_out_max(text, max);
+    }
+    // 落盘全文（与截图/控件树同口径：.deveco-agent 目录，避免 IDE 清缓存丢产物）
+    let dir = Path::new(project_path).join(".deveco-agent").join("tool-output");
+    let _ = std::fs::create_dir_all(&dir);
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
+    let safe_label: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(24)
+        .collect();
+    let file = dir.join(format!("{safe_label}-{ts}.txt"));
+    let path_str = file.to_string_lossy().to_string();
+    if std::fs::write(&file, text).is_ok() {
+        cleanup_tool_outputs(&dir);
+        // 头尾采样（对齐 opencode head/tail 各半：错误结论通常在日志末尾，尾部必须保留）；
+        // 替换文本预算预留（对齐 deepseek-harness spill-policy）：提示标记（省略计数/路径/读回
+        // 指引）的字节成本先从 max 里扣掉，保证"预览+提示"替换后总长不超过 max（不变量），
+        // 否则替换后比原文还长，上下文膨胀与限流预算双双失守。省略计数用 total 的位数
+        // 做上界预留（实际省略数 ≤ total），提示实际长度 ≤ 预留长度，总长必不超 max
+        let notice = format!(
+            "\n…(输出过长：中间 {total} 字符已省略，共 {total} 字符；完整内容已保存到 {path_str}，可 read_file 读取)\n"
+        );
+        let budget = max.saturating_sub(notice.chars().count());
+        if budget == 0 {
+            // notice 本身已超出预算（极小 max 或长路径）：无法在不超限的前提下给出
+            // 读回指引，退回纯截断（替换后总长 ≤ max 的不变量优先，与 spill-policy 同规则）
+            return truncate_out_max(text, max);
+        }
+        let head = budget * 3 / 5;
+        let tail = budget - head;
+        let mut out: String = text.chars().take(head).collect();
+        out.push_str(&format!(
+            "\n…(输出过长：中间 {} 字符已省略，共 {total} 字符；完整内容已保存到 {path_str}，可 read_file 读取)\n",
+            total.saturating_sub(head).saturating_sub(tail)
+        ));
+        out.push_str(&text.chars().skip(total - tail).collect::<String>());
+        out
+    } else {
+        // best-effort（对齐 deepseek-harness spill-policy）：落盘失败（权限/磁盘满）绝不
+        // 影响工具成功语义，退回纯截断，调用方不感知落盘动作
+        truncate_out_max(text, max)
+    }
+}
+
+/// 工具输出目录清理（写入时顺带，无需定时任务）：删除 7 天前的旧文件；
+/// 文件数超 100 时删最旧至 50，防止长期使用磁盘无限增长。
+fn cleanup_tool_outputs(dir: &std::path::Path) {
+    use std::fs;
+    use std::time::SystemTime;
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let now = SystemTime::now();
+    let week = Duration::from_secs(7 * 24 * 3600);
+    let mut files: Vec<(SystemTime, std::path::PathBuf)> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("txt") {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&p) else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if now.duration_since(mtime).map(|d| d > week).unwrap_or(false) {
+            let _ = fs::remove_file(&p);
+            continue;
+        }
+        files.push((mtime, p));
+    }
+    if files.len() > 100 {
+        files.sort_by_key(|(t, _)| *t);
+        for (_, p) in files.iter().take(files.len() - 50) {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
 /// list_dir：列出目录内容（深度 1-3，目录优先排序，跳过忽略目录）
 
 // ---------- 文件指纹乐观锁 ----------
@@ -4312,6 +4515,72 @@ mod tests {
         assert_eq!(super::fs_tools::human_size(512), "512B");
         assert_eq!(super::fs_tools::human_size(2048), "2.0KB");
         assert_eq!(super::fs_tools::human_size(5 * 1024 * 1024), "5.0MB");
+    }
+
+    #[test]
+    fn store_overflow_writes_full_text_and_samples() {
+        // 超限：全文落盘到 {project}/.deveco-agent/tool-output/，上下文只留头尾采样 + 路径标记
+        let root = std::env::temp_dir().join("deveco-tool-store-overflow");
+        let _ = std::fs::remove_dir_all(&root);
+        let root_s = root.to_string_lossy().to_string();
+        let long: String = (0..2000).map(|i| format!("第{i:04}行数据\n")).collect();
+        let out = store_overflow(&long, 400, &root_s, "cmd");
+        assert!(out.contains("第0000行数据")); // 头部保留
+        assert!(out.contains("第1999行数据")); // 尾部保留
+        assert!(out.contains("完整内容已保存到"));
+        assert!(out.contains("可 read_file 读取"));
+        // 替换文本不变量（对齐 spill-policy）：预览+提示总长不超过 max
+        assert!(out.chars().count() <= 400, "替换后总长 {} 超出预算 400", out.chars().count());
+        // 落盘文件与上下文内容一致（全文可读回）
+        let dir = root.join(".deveco-agent").join("tool-output");
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let saved = std::fs::read_to_string(&files[0]).unwrap();
+        assert_eq!(saved, long);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn store_overflow_tiny_cap_degrades_to_truncate() {
+        // 预算预留极端场景：max 小于提示标记本身长度时，无法在不超限的前提下给出
+        // 读回指引，退回纯截断（替换后总长 ≤ max 的不变量优先）；全文仍已落盘可读回
+        let root = std::env::temp_dir().join("deveco-tool-store-overflow-tiny");
+        let _ = std::fs::remove_dir_all(&root);
+        let root_s = root.to_string_lossy().to_string();
+        let long = "x".repeat(5000);
+        let out = store_overflow(&long, 20, &root_s, "cmd");
+        assert!(out.contains("输出已截断"));
+        assert!(out.chars().count() <= 20 + 100); // 截断文本 + 截断提示（提示本身不受 20 约束）
+        let dir = root.join(".deveco-agent").join("tool-output");
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(files.len(), 1); // 全文仍已落盘
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn store_overflow_within_limit_returns_as_is() {
+        // 未超限：原样返回，不落盘
+        let root = std::env::temp_dir().join("deveco-tool-store-overflow-limit");
+        let _ = std::fs::remove_dir_all(&root);
+        let root_s = root.to_string_lossy().to_string();
+        let short = "短输出".repeat(10);
+        let out = store_overflow(&short, 1000, &root_s, "cmd");
+        assert_eq!(out, short);
+        assert!(!root.join(".deveco-agent").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn store_overflow_without_project_falls_back() {
+        // 无项目绑定：退回纯截断（旧行为），不落盘
+        let long = "x".repeat(5000);
+        let out = store_overflow(&long, 100, "", "cmd");
+        assert!(out.contains("输出已截断"));
+        assert!(!out.contains("完整内容已保存到"));
     }
 
     #[test]
@@ -4928,6 +5197,39 @@ mod tests {
     /// 同步构造 tokio runtime 跑 async 工具（copy_file/move_file/write_file 回归用）
     fn block_on_rt<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn memorize_ops_and_errors() {
+        // put：正常记忆
+        let args = serde_json::json!({"operate": "put", "key": "构建命令", "value": "hvigorw assembleHap"});
+        let out = block_on_rt(super::memorize(&args)).expect("put 应成功");
+        assert!(out.contains("已记忆「构建命令」"), "{out}");
+        // update：覆盖语义（工具侧接受，覆盖由回放侧保证）
+        let args = serde_json::json!({"operate": "update", "key": "构建命令", "value": "hvigorw assembleHap --mode module"});
+        let out = block_on_rt(super::memorize(&args)).expect("update 应成功");
+        assert!(out.contains("已记忆「构建命令」"), "{out}");
+        // delete：删除记忆
+        let args = serde_json::json!({"operate": "delete", "key": "构建命令"});
+        let out = block_on_rt(super::memorize(&args)).expect("delete 应成功");
+        assert!(out.contains("已删除记忆「构建命令」"), "{out}");
+        // scan：无需调用，直接说明状态已自动注入
+        let args = serde_json::json!({"operate": "scan"});
+        let out = block_on_rt(super::memorize(&args)).expect("scan 应成功");
+        assert!(out.contains("## 关键记忆"), "{out}");
+        // 错误分支：空 key / 空 value / 非法 operate
+        let args = serde_json::json!({"operate": "put", "key": "", "value": "v"});
+        assert!(block_on_rt(super::memorize(&args)).is_err(), "空 key 应报错");
+        let args = serde_json::json!({"operate": "put", "key": "k"});
+        assert!(block_on_rt(super::memorize(&args)).is_err(), "空 value 应报错");
+        let args = serde_json::json!({"operate": "delete", "key": ""});
+        assert!(block_on_rt(super::memorize(&args)).is_err(), "delete 空 key 应报错");
+        let args = serde_json::json!({"operate": "rm", "key": "k"});
+        assert!(block_on_rt(super::memorize(&args)).is_err(), "非法 operate 应报错");
+        // 缺省 operate 视为 put
+        let args = serde_json::json!({"key": "k", "value": "v"});
+        let out = block_on_rt(super::memorize(&args)).expect("缺省 operate 视为 put");
+        assert!(out.contains("已记忆「k」"), "{out}");
     }
 
     #[test]

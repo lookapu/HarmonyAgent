@@ -5,6 +5,70 @@
 
 ---
 
+## v2.2 — 八仓库盘点落地：混合检索 + 时间旅行 + 定时提醒 + 跨会话引用（2026-08-20）
+
+定位：对 8 个参考仓库（deepseek-harness / qwen-code / Qwen-Agent / langgraph / OpenHands 等）做全量盘点后的能力落地——检索、会话管理、任务编排、工具集各补一批高价值能力，工具集 **193 → 198**。
+
+### 🔍 检索与记忆升级（desA，对齐 Qwen-Agent）
+
+- **BM25 重排**：新增 `utils/tokenizer.rs`（中文 2-4 字滑窗 n-gram + 英文整词 + 停用词过滤）与 `utils/relevance.rs` Okapi BM25 索引（k1=1.2 / b=0.75，与 rank_bm25 一致）；`keyword_search` / 记忆检索结果从 SQL 字典序改为 **BM25 相关性重排**（标题双份注入近似位置权重 + 时间衰减 + 类别加权）。
+- **front_page 置顶**：记忆注入预算充足时，最近更新的 2 条记忆无条件置顶（对齐 Qwen-Agent front_page_search），预算不足自动跳过。
+- **RRF 融合**：embedding 向量检索与 BM25 关键词检索双路 RRF 融合（对齐 Qwen-Agent hybrid_search 的混合检索三件套）。
+- **pitfall 加权前置**：构建错误修复任务中 build 类历史记忆加权前置，Agent 动手前先看到本工程踩过的同类坑。
+
+### 🧭 会话时间旅行（对齐 langgraph checkpoint）
+
+- **快照自动保存**（migration `051_conversation_snapshots.sql`）：每轮工具执行后保存状态锚点（可见消息 rowid + 账本 + 模型输出摘要），每会话上限 50 条，首轮无执行痕迹不保存。
+- **双向恢复**：`restore_snapshot` 归档锚点后的消息（hidden，旧分支保留可回溯）、重现锚点前的归档段、账本写回快照时刻（续跑继承该点执行轨迹）；任务运行中拒绝恢复（防写消息竞态）。
+- **前端时间线**：更多菜单 →「会话时间线」弹窗，快照点列表（标签/时间/工具数/当前标记），「回到此处」warn 确认后恢复并刷新消息/账本/审计留痕（`task.timeline`）。
+
+### ⏰ 定时提醒（对齐 deepseek-harness schedule）
+
+- 新工具 `schedule_create`（after / at / every 三类，错误码含 invalid_prompt / invalid_selector / not_future / frequency_too_high）/ `schedule_list` / `schedule_delete`；every 锚点推进（错过不枚举历史周期）。
+- 新服务 `services/reminders.rs` + migration `052_reminders_feedback_terms.sql`（`message_reminders` 表）；lib.rs setup 30s 轮询派发到期提醒 → 会话队列注入（`inject_message`，session-local 不中断当前轮次）+ 桌面通知。
+
+### 📊 消息反馈纠偏（A2）
+
+- 点踩（dislike）消息内容高频词（词频 ≥2 取前 5）写入 `feedback_terms` 词袋；记忆注入前加载负反馈词袋，命中 ≥2 个不同词的记忆剔除不注入、命中 1 个的排到末尾——用户不期望的内容不再反复出现在上下文。
+
+### 🛡 不变式守卫（A5）
+
+- 新增 `agent/invariants.rs` 注册表（`Invariant { name, check }` + 静态数组 + `check_write` 统一入口），3 条不变式：`.env*` 前缀文件、8 种密钥/证书后缀（`.key/.pem/.pfx/.p12/.keystore` 等）、已存在的 `migrations/*.sql`（已执行迁移不可修改，新建允许）；`fs_tools::is_protected_file` 收拢为委托注册表，含 2 个测试。
+
+### 🔗 跨会话引用（B6）
+
+- `references_json` 支持 `conv:<id>` 前缀：历史重放时注入会话标题 + 摘要（`messages.summary` 非空优先，回退最后一条 assistant 内容，单会话 2000 字符 / 总 8000 上限）；前端 @ 面板追加会话候选（同项目、排除当前、标题模糊匹配、chat 图标），选中即把标题 + 最近内容插入草稿，与消息引用（Quote）同构。
+
+### 🛠 流式健壮性加固
+
+- **无产出静默超时**：连接保持但 60s 解析不到有效内容 → 保留已收内容自动续写（与截断续写同链路）。
+- **产出前中断冻结重放**：流在输出任何内容前中断 → 冻结请求原样重发（≤5 次，对齐 DeepSeek-Reasonix 机制，模型无需重新思考、prompt 缓存不失效）。
+- **工具循环检测**（对齐 qwen-code LoopDetectionService 轻量版）：连续相同调用（name+args）/ 连续同名调用（参数抖动）/ 每轮工具总数软硬上限，命中注入纠正提示，最多打断两次后收尾。
+- **行动承诺假完成纠正**：模型宣布开始开发/仅输出方案计划但无任何工具标记时，注入纠正提示要求立即执行（上限防死循环）。
+- **reasoning_content 多轮合规**：DeepSeek 推理模型携带 tools 的请求完整回传思考链（缺失导致 400/思考链断裂）；V4 thinking 模式 content 数组块解析（text 块进正文 / thinking 块归推理）；仅带工具调用的 assistant 消息回传 reasoning（纯文本回答不回传、不占输入预算）。
+- **run_command 输出超限落盘**：响应超限时全文落盘 + 头尾采样 + `store_overflow` 路径标记，Agent 可按需读回完整输出。
+
+### 🧰 其他
+
+- `ui_focus` 工具（对齐 OpenHands canvas_ui_control）：Agent 产出后驱动 UI 聚焦（切换右侧面板 / 打开文件预览，L0 权限）。
+- `memorize` 工具 + `replay_memories`（对齐 Qwen-Agent MemoAssistant）：从历史消息重放 memorize 调用重建键值状态，每轮作为 system 注入。
+- 文件树面板：展开但缓存缺失时自动重新加载（刷新后已展开目录免手动再点）。
+- logger 测试隔离修复（pid 复用残留文件导致偶发断言失败）。
+
+### ✅ 验证
+
+- `cargo check`：0 error / 0 warning
+- `cargo test --lib`：**446 passed / 0 failed**（新增 reminders 2 + invariants 2 + 检索/协议若干）
+- 前端 `tsc --noEmit`：通过
+
+### 🔄 迁移要点
+
+- 新增迁移 `051_conversation_snapshots.sql`、`052_reminders_feedback_terms.sql`（已执行库自动应用，无破坏性变更）。
+- 工具总数 193 → **198**（+memorize / ui_focus / schedule_create / schedule_list / schedule_delete）；`TOOL_SPECS` 数量以 `src-tauri/src/agent/tools/mod.rs` 为准。
+- `inject_references` 签名新增 `conn` 参数（conv: 会话摘要查询）；内部调用点已同步。
+
+---
+
 ## v2.1 — 对话流转加固 + 极简留白 UI（2026-08-19）
 
 定位：围绕"对话能否正常流转"做一次全面体检与修复，解决停止/删除/审批/错误态等边界场景的状态不一致，并把对话区视觉改为极简留白风格。
@@ -169,7 +233,7 @@
 
 ## 维护说明
 
-- 工具总数以 `src-tauri/src/agent/tools/mod.rs` 中 `TOOL_SPECS` 数组长度为准（当前 191）。
+- 工具总数以 `src-tauri/src/agent/tools/mod.rs` 中 `TOOL_SPECS` 数组长度为准（当前 198）。
 - 任务分组以 `TASK_GROUPS` 常量为准（当前 8 个：`build` / `fix` / `explore` / `deploy` / `refactor` / `test` / `debug` / `other`）。
 - `quality_tools::*` 通过 facade 暴露，**禁止**直接 import 4 个子文件（`quality_metrics` 等）—— 内部模块，外部耦合面随 facade 走。
 - 任何对工具的"按行数切分"禁止。**必须按方法完整切片**，签名 + 函数体在同一文件内。脚本辅助可见 `scripts/legacy/_split_quality.py`。

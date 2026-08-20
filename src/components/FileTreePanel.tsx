@@ -539,6 +539,15 @@ function TreeNodeItem({
     }
   }
 
+  // 展开但缓存缺失时自动重新加载：刷新（rebuildIndex 清空 dirCache 后仅重载根目录）
+  // 后已展开目录无需手动再点一次即可恢复子项内容
+  useEffect(() => {
+    if (isDir && isOpen && !cached && !loading && !failed) {
+      ensureLoaded()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDir, isOpen, cached, loading, failed])
+
   const handleClick = () => {
     if (isDir) {
       onToggle(node.path)

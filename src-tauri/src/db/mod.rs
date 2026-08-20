@@ -81,6 +81,8 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (48, "048_ohpm_landscape", include_str!("../../migrations/048_ohpm_landscape.sql")),
     (49, "049_ohpm_landscape_sort", include_str!("../../migrations/049_ohpm_landscape_sort.sql")),
     (50, "050_task_ledger", include_str!("../../migrations/050_task_ledger.sql")),
+    (51, "051_conversation_snapshots", include_str!("../../migrations/051_conversation_snapshots.sql")),
+    (52, "052_reminders_feedback_terms", include_str!("../../migrations/052_reminders_feedback_terms.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {

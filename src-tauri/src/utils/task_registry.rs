@@ -28,10 +28,14 @@ pub const PHASE_TOOL: i64 = 6;
 /// 正常请求阶段每 200~300ms 有 PHASE_SEND/STREAMING 心跳，工具阶段有 PHASE_TOOL 心跳，
 /// 仅同步卡死/线程死锁才会持续无心跳，故比 10 分钟更早兜底）
 const TASK_STALL_MS: i64 = 480_000;
-/// 流式阶段无有效产出强杀阈值：60 秒。
-/// 流式读取期即使 tokio worker 被同步阻塞代码钉死（timer driver 停转、tokio::time 超时
-/// 全部失效），独立 OS 线程看门狗也能据此在 60s 内强杀，不再等满 8 分钟。
-const STREAM_STALL_MS: i64 = 60_000;
+/// 流式阶段无数据到达强杀阈值：300 秒（对齐 DeepSeek-Reasonix 的 5 分钟流空闲超时）。
+/// 必须大于 tokio 层软机制 STREAM_SILENT_TIMEOUT（60s 无有效产出→保留已收内容自动续写）
+/// 与产出前中断重放（0 产出时冻结请求原样重发，最多 5 次）：正常断流由软机制与重放
+/// 先行恢复，看门狗仅兜底软机制失效的场景——worker 被同步代码钉死（tokio timer 停转、
+/// 续写/重放都无法触发）时在 300s 内强杀。判据是“数据到达”而非“有效产出”：
+/// 模型输出大/长响应（体积、行数远超常态，解析需要更长时间）时，只要网络仍在到达
+/// 数据就不强杀——输出量级不是关闭理由。独立 OS 线程不依赖 tokio timer。
+const STREAM_STALL_MS: i64 = 300_000;
 /// 点停止后未生效强杀宽限：40 秒
 const STOP_GRACE_MS: i64 = 40_000;
 /// 看门狗扫描周期
@@ -61,9 +65,12 @@ pub struct TaskHandle {
     pub heartbeat_ms: AtomicI64,
     pub phase: AtomicI64,
     pub stop_requested_at: AtomicI64,
-    /// 流式阶段最近一次"有效产出"时间戳（正文/思考/工具增量/首字节/结束标记）。
-    /// 独立于 heartbeat_ms：心跳会被 200ms tick 刷新，但有效产出只在解析到真内容时更新，
-    /// 供独立 OS 线程看门狗判断流式是否真正停滞。0 表示尚未进入流式产出。
+    /// 流式阶段最近一次“数据到达”时间戳（收到任何网络 chunk 即刷新，无论是否解析出内容）。
+    /// 大输出/长响应时数据持续到达但解析可能长时间无产出，故以数据到达为看门狗判据：
+    /// 只要数据还在到达就说明流仍存活，不强制关闭；数据停滞才判定挂起。
+    pub stream_data_ms: AtomicI64,
+    /// 流式阶段最近一次“有效产出”时间戳（正文/思考/工具增量/首字节/结束标记）。
+    /// 仅信息用途（排障日志），不作为强杀判据——产出慢不等于流挂起。
     pub stream_progress_ms: AtomicI64,
     pub started_at: i64,
 }
@@ -83,6 +90,7 @@ impl TaskRegistry {
                     heartbeat_ms: AtomicI64::new(now),
                     phase: AtomicI64::new(PHASE_START),
                     stop_requested_at: AtomicI64::new(0),
+                    stream_data_ms: AtomicI64::new(0),
                     stream_progress_ms: AtomicI64::new(0),
                     started_at: now,
                 },
@@ -107,9 +115,22 @@ impl TaskRegistry {
         }
     }
 
+    /// 流式数据到达打点：每收到一个网络 chunk 即调用（无论是否解析出内容）。
+    /// 独立 OS 线程看门狗据此判断流是否仍在传输（大输出/长响应处理中不误杀）；
+    /// 同时刷新心跳，避免大输出解析期间触发无心跳兜底。
+    pub fn touch_stream_data(&self, conversation_id: &str) {
+        if let Ok(m) = self.0.lock() {
+            if let Some(h) = m.get(conversation_id) {
+                let now = now_ms();
+                h.heartbeat_ms.store(now, Ordering::Relaxed);
+                h.stream_data_ms.store(now, Ordering::Relaxed);
+                h.phase.store(PHASE_STREAMING, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// 流式有效产出打点：仅在解析到正文/思考/工具增量/首字节/结束标记时调用。
-    /// 独立 OS 线程看门狗据此判断流式是否真正停滞（不依赖 tokio timer，worker 被
-    /// 同步代码钉死时也能触发强杀）。
+    /// 保留用于排障信息（stream_progress_ms），不再作为看门狗强杀判据。
     pub fn touch_stream_progress(&self, conversation_id: &str) {
         if let Ok(m) = self.0.lock() {
             if let Some(h) = m.get(conversation_id) {
@@ -179,16 +200,18 @@ fn watchdog_loop(app: AppHandle) {
                     let last = h.heartbeat_ms.load(Ordering::Relaxed);
                     let phase = h.phase.load(Ordering::Relaxed);
                     let stop_at = h.stop_requested_at.load(Ordering::Relaxed);
-                    // 流式阶段：以"有效产出时间戳"为基准，60s 无真内容即强杀。
-                    // 此检查跑在独立 OS 线程上，不依赖 tokio timer——即便 worker 被同步阻塞
-                    // 代码钉死、tokio::time 超时全部失效，这里仍能触发。
+                    // 流式阶段：以“数据到达时间戳”为基准，60s 无任何数据即强杀。
+                    // 判据是数据而非产出：模型输出大/长响应时解析可能长时间无产出，
+                    // 但只要数据仍在到达就说明流存活，不应强杀；数据完全停滞
+                    // （网络挂起/worker 被同步代码钉死不再读流）才触发兜底。
+                    // 此检查跑在独立 OS 线程上，不依赖 tokio timer。
                     if phase == PHASE_STREAMING {
-                        let prog = h.stream_progress_ms.load(Ordering::Relaxed);
-                        let base = if prog > 0 { prog } else { last };
+                        let data = h.stream_data_ms.load(Ordering::Relaxed);
+                        let base = if data > 0 { data } else { last };
                         if now - base > STREAM_STALL_MS {
                             to_kill.push((
                                 cid.clone(),
-                                "stream_no_progress".to_string(),
+                                "stream_no_data".to_string(),
                                 now - h.started_at,
                             ));
                             continue;

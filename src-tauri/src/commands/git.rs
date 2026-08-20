@@ -462,7 +462,7 @@ pub async fn rollback_conversation(
     let start_ts = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT MIN(created_at) FROM messages WHERE conversation_id = ?1 AND role = 'user' AND queued = 0",
+            "SELECT MIN(created_at) FROM messages WHERE conversation_id = ?1 AND role = 'user' AND queued = 0 AND hidden = 0",
             [&conversation_id],
             |r| r.get::<_, Option<i64>>(0),
         )

@@ -48,7 +48,7 @@ pub fn tool_level(tool: &str) -> Level {
         | "device_perf" | "collect_perf" | "read_runtime_logs"
         | "list_modules" | "read_module_config" | "search_sdk_api" | "read_sdk_api_module"
         | "check_sdk_alignment" | "search_harmony_docs" | "read_harmony_doc"
-        | "show_diagnose_card"
+        | "show_diagnose_card" | "ui_focus"
         | "dump_ui_hierarchy" | "ui_locator" | "dump_memory" | "get_installed_apps" | "get_app_info"
         | "analyze_hap_size" | "search_hilog" | "run_lint" | "check_signature"
         | "size_diff" | "screenshot_diff"
@@ -240,6 +240,7 @@ mod tests {
         assert_eq!(tool_level("read_sdk_api_module"), Level::L0);
         assert_eq!(tool_level("check_sdk_alignment"), Level::L0);
         assert_eq!(tool_level("show_diagnose_card"), Level::L0);
+        assert_eq!(tool_level("ui_focus"), Level::L0);
         assert_eq!(tool_level("verify_ui"), Level::L1);
         assert_eq!(tool_level("deploy_all"), Level::L1);
         assert_eq!(tool_level("write_unit_tests"), Level::L1);

@@ -485,6 +485,41 @@ pub(super) async fn search_api(args: &Value, db: &crate::db::DbState) -> Result<
     // 未启用 embedding feature 时无重排代码，编译期放行 unused_mut
     #[cfg_attr(not(feature = "embedding"), allow(unused_mut))]
     let mut entries = crate::services::harmony_api_diff::search(&conn, &query)?;
+    // 关键词命中结果按 BM25 相关性重排（替代 SQL 字典序）：SQL LIKE 只负责召回，
+    // 排序交给 BM25（declaration/api_name/module 等字段打分）——对齐 Qwen-Agent
+    // keyword_search 的 BM25 语义；embedding 块 RRF 融合的 kw 侧 rank 也因此更有
+    // 区分度（原为字典序 rank，会掩盖真实相关度）。全 0 分时稳定排序退化为原顺序
+    if let Some(kw) = query.keyword.clone().filter(|k| !k.trim().is_empty()) {
+        let docs: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} {} {} {} {}",
+                    e.declaration,
+                    e.api_name.as_deref().unwrap_or(""),
+                    e.module.as_deref().unwrap_or(""),
+                    e.class_name.as_deref().unwrap_or(""),
+                    e.kit
+                )
+            })
+            .collect();
+        let keywords = crate::utils::relevance::tokenize_query(&kw);
+        if !keywords.is_empty() {
+            let bm25 = crate::utils::relevance::Bm25Index::build(&docs);
+            let mut scored: Vec<(f64, usize)> = bm25
+                .score_many(&keywords, &docs)
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| (s, i))
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut reordered = Vec::with_capacity(entries.len());
+            for (_, i) in scored {
+                reordered.push(entries[i].clone());
+            }
+            entries = reordered;
+        }
+    }
     // 向量增强：有 keyword 时用语义向量召回与关键词命中做 RRF 融合重排，
     // 让"语义相关但无字面命中"的 API 也能浮上来；向量索引/模型不可用时自动降级为纯关键词结果。
     // 注意：依赖 candle 的 vector_search 仅在 embedding feature 下可用（见 embedding 模块说明），

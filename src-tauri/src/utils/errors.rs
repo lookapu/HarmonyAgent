@@ -204,6 +204,27 @@ pub fn provider_error_with_retry_after(
     fe
 }
 
+/// 解析 Retry-After 头（RFC 7231）为“还需等待的秒数”（对齐 qwen-code retryPolicy 的
+/// getRetryAfterDelayMs 口径）：
+/// - 延迟秒数：纯数字，如 "120"；
+/// - HTTP-date：IMF-fixdate 格式，如 "Wed, 21 Oct 2015 07:28:00 GMT"，
+///   返回距该时刻的秒数（已过期返回 0，由退避层兜底）；
+/// 两种形态都无法解析时返回 None（调用方退回指数退避）。
+pub fn parse_retry_after_secs(v: &str) -> Option<u64> {
+    let s = v.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 延迟秒数：RFC 7231 为 1*DIGIT，部分实现带小数，按整数解析即可
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs);
+    }
+    // HTTP-date：chrono 的 RFC 2822 解析器覆盖 IMF-fixdate 固定格式
+    let dt = chrono::DateTime::parse_from_rfc2822(s).ok()?;
+    let now = chrono::Utc::now();
+    Some((dt.with_timezone(&chrono::Utc) - now).num_seconds().max(0) as u64)
+}
+
 /// 从响应体提取 error.message / message 等常见错误字段
 fn extract_error_message(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -347,6 +368,25 @@ mod tests {
         let fe = provider_error_with_retry_after(429, "slow down", Some(5));
         assert_eq!(fe.retry_after_ms(), Some(5000));
         assert!(fe.retryable());
+    }
+
+    #[test]
+    fn test_parse_retry_after() {
+        // 延迟秒数
+        assert_eq!(parse_retry_after_secs("120"), Some(120));
+        assert_eq!(parse_retry_after_secs(" 5 "), Some(5));
+        // 无法解析
+        assert_eq!(parse_retry_after_secs("abc"), None);
+        assert_eq!(parse_retry_after_secs(""), None);
+        // HTTP-date 未来时刻 → 正秒数
+        let future = chrono::Utc::now() + chrono::Duration::seconds(90);
+        let header = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let parsed = parse_retry_after_secs(&header).unwrap();
+        assert!(parsed >= 80 && parsed <= 100, "parsed={parsed}");
+        // HTTP-date 过去时刻 → 0（退避层兜底）
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let past_header = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert_eq!(parse_retry_after_secs(&past_header), Some(0));
     }
 
     #[test]

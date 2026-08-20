@@ -5,6 +5,7 @@ pub mod diagnostics;
 pub mod crash;
 pub mod runtime_log;
 pub mod exec_ctx;
+pub mod invariants;
 pub mod jobs;
 pub mod scanner;
 pub mod session_ctx;

@@ -26,6 +26,7 @@ pub mod node_runtime;
 pub mod ohpm_landscape;
 pub mod permissions;
 pub mod proxy_service;
+pub mod reminders;
 pub mod runtime_progress;
 pub mod seed;
 pub mod symbol_index;

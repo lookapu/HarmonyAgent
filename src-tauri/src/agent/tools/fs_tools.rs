@@ -1317,6 +1317,34 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     );
     // 截断提示：优先给出“块没读完”的完整区间与结束符行号（防模型基于残缺片段编辑）；
     // 普通截断则告知已读到第几行、从哪继续。
+    // 截断时把完整窗口落盘（对齐 opencode tool-output-store），模型可 read_file 读回全量。
+    // read 豁免（对齐 deepseek-harness spill-policy）：目标文件本身就在 tool-output 目录内
+    // （模型读回落盘产物的场景）时不再落盘——否则会形成 read → spill → read 死循环
+    // （读回 5000 行落盘文件 → 又截断又落盘新文件），直接给截断提示让模型用 start/lines 续读。
+    let p_str = p.to_string_lossy();
+    let in_tool_output =
+        p_str.contains("\\.deveco-agent\\tool-output\\") || p_str.contains("/.deveco-agent/tool-output/");
+    let overflow_path: Option<String> = if !in_tool_output && shown_lines < win_end - win_begin {
+        // 完整窗口（带行号）落盘到 .deveco-agent/tool-output/，路径标记喂给模型
+        let full_win: String = lines[win_begin..win_end]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{:>5} │ {}\n", win_begin + i + 1, l))
+            .collect();
+        let dir = Path::new(roots.first().map(String::as_str).unwrap_or(""))
+            .join(".deveco-agent")
+            .join("tool-output");
+        std::fs::create_dir_all(&dir).ok();
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
+        let file = dir.join(format!("read-{ts}.txt"));
+        if std::fs::write(&file, full_win).is_ok() {
+            Some(file.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if shown_lines < win_end - win_begin {
         if let Some((o, c)) = cut_block.filter(|(_, c)| *c >= (win_begin + shown_lines).saturating_sub(1)) {
             let block_lines = c - o + 1;
@@ -1332,8 +1360,12 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
                 block_lines
             ));
         } else {
+            let path_hint = overflow_path
+                .as_deref()
+                .map(|p| format!("；完整内容已保存到 {p}，可 read_file 读取"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "…(已截断，共 {total} 行，仅显示到第 {} 行；可传 start={} 继续读取)\n",
+                "…(已截断，共 {total} 行，仅显示到第 {} 行{path_hint}；可传 start={} 继续读取)\n",
                 win_begin + shown_lines,
                 win_begin + shown_lines + 1
             ));
@@ -3373,37 +3405,10 @@ pub(super) async fn preview_edit(args: &Value, roots: &[String], _conversation_i
 
 // ---------- 命令执行工具 ----------
 
-/// 敏感文件保护（write_file/edit_file 代码级拦截）：命中返回拒绝原因。
-/// 环境约束 > Prompt 约束：密钥类文件一律拒绝；已执行的迁移 SQL 不可修改（新建文件允许）。
+/// 敏感文件保护（write_file/edit_file 等写路径代码级拦截）：命中返回拒绝原因。
+/// 委托不变式注册表（crate::agent::invariants）：新增约束只注册不散改调用点。
 pub(super) fn is_protected_file(p: &std::path::Path) -> Option<&'static str> {
-    let name = p.file_name()?.to_string_lossy().to_lowercase();
-    if name.starts_with(".env") {
-        return Some("环境变量文件（.env*）禁止写入：密钥类配置不应由 Agent 修改，请手动编辑");
-    }
-    if name.ends_with(".key")
-        || name.ends_with(".pem")
-        || name.ends_with(".pfx")
-        || name.ends_with(".p12")
-        || name.ends_with(".keystore")
-        || name.ends_with(".cer")
-        || name.ends_with(".p7b")
-        || name.ends_with(".jks")
-    {
-        return Some("密钥/证书文件禁止写入（*.key/*.pem/*.pfx/*.p12/*.keystore/*.cer/*.p7b/*.jks，含鸿蒙签名材料）");
-    }
-    // 已执行的数据库迁移 SQL 不可修改（须新建递增编号文件）；新建文件允许。
-    // 按父目录组件名判断（避免项目路径本身含 migrations 字样时误伤全部 .sql 文件）
-    if p.exists() && name.ends_with(".sql") {
-        let parent_name = p
-            .parent()
-            .and_then(|d| d.file_name())
-            .map(|n| n.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        if parent_name == "migrations" || parent_name == "migration" {
-            return Some("已执行的数据库迁移 SQL 不可修改：请新建递增编号的迁移文件（如 014_xxx.sql）");
-        }
-    }
-    None
+    crate::agent::invariants::check_write(p).map(|(_, reason)| reason)
 }
 
 pub(super) async fn multi_edit(

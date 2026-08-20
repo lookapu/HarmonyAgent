@@ -154,8 +154,13 @@ fn deveco_node_env() -> Option<Vec<(String, String)>> {
 
 /// run_command：在项目内静默执行命令（危险命令黑名单 + 超时 + 输出截断）
 /// 把流式命令的完整输出转成 run_cmd 语义的文本（退出码判断 + 字符上限截断），
-/// 供 run_command 在流式执行（agent:log 实时推送）后保持原有结果格式
-pub(super) fn cmd_output_text(o: &std::process::Output, max_chars: usize) -> Result<String, String> {
+/// 供 run_command 在流式执行（agent:log 实时推送）后保持原有结果格式。
+/// 超限时全文落盘 + 头尾采样 + 路径标记（store_overflow），agent 可按需读回完整输出。
+pub(super) fn cmd_output_text(
+    o: &std::process::Output,
+    max_chars: usize,
+    project_path: &str,
+) -> Result<String, String> {
     let mut text = smart_decode(&o.stdout).trim().to_string();
     let err = smart_decode(&o.stderr).trim().to_string();
     if !err.is_empty() {
@@ -165,7 +170,7 @@ pub(super) fn cmd_output_text(o: &std::process::Output, max_chars: usize) -> Res
         text.push_str(&err);
     }
     if text.chars().count() > max_chars {
-        text = text.chars().take(max_chars).collect::<String>() + "\n…(输出已截断)";
+        text = store_overflow(&text, max_chars, project_path, "cmd");
     }
     if o.status.success() {
         Ok(if text.is_empty() { "命令执行成功".to_string() } else { text })
@@ -302,7 +307,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
             ctx, shell_prog, &shell_args, Some(&cwd), timeout, None, envs.as_deref(),
         )
         .await
-        .and_then(|o| cmd_output_text(&o, 30000))
+        .and_then(|o| cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or("")))
         .map_err(|e| with_advice("run_command", e))
     } else {
         // 工程内脚本（如 hvigorw.bat）优先本地路径解析；.bat/.cmd 经 cmd /C 执行（见 resolve_program）
@@ -311,7 +316,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
             ctx, &program, &full_args, Some(&cwd), timeout, None, envs.as_deref(),
         )
         .await
-        .and_then(|o| cmd_output_text(&o, 30000))
+        .and_then(|o| cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or("")))
         .map_err(|e| with_advice("run_command", e))
     };
     match result {
@@ -504,7 +509,8 @@ pub(crate) fn encode_vision_image(path: &std::path::Path) -> Result<String, Stri
 
 /// http_request：通用 HTTP 客户端（接口联调），GET/POST/PUT/DELETE + 自定义头 + JSON 文本体。
 /// 响应自动识别编码（BOM > header charset > UTF-8 严格验证 > GBK 回退），中文接口不乱码。
-pub(super) async fn http_request(args: &Value) -> Result<String, String> {
+/// 响应超限时全文落盘 + 头尾采样 + 路径标记（store_overflow）。
+pub(super) async fn http_request(args: &Value, roots: &[String]) -> Result<String, String> {
     let url = args["url"].as_str().ok_or(
         "http_request 需要参数 {\"url\":\"<http(s)://…>\",\"method\":\"<GET|POST|PUT|DELETE，缺省 GET>\",\"body\":\"<可选请求体>\",\"headers\":{<可选请求头>},\"timeout_secs\":<可选超时秒，缺省 30>}",
     )?;
@@ -562,7 +568,7 @@ pub(super) async fn http_request(args: &Value) -> Result<String, String> {
         "HTTP {}（{url}，耗时 {elapsed}ms）\nContent-Type: {}\n\n{}",
         status.as_u16(),
         if content_type.is_empty() { "未知".to_string() } else { content_type },
-        truncate_chars(&text, 6000)
+        store_overflow(&text, 6000, roots.first().map(String::as_str).unwrap_or(""), "http")
     ))
 }
 

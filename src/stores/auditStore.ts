@@ -23,6 +23,7 @@ export type AuditCategory =
   | 'queue.clear'           // 清空排队
   | 'task.stop'             // 停止任务
   | 'task.rollback'         // 任务回滚
+  | 'task.timeline'         // 会话时间旅行（回到历史快照点）
   | 'rules.update'          // 更新规则
   | 'config.update'         // 更新配置
 

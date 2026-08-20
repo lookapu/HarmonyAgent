@@ -53,9 +53,30 @@ pub fn estimate_text_tokens(text: &str) -> usize {
     cjk + other_tokens + seg_overhead + 4 // +4 固定开销（BOS/格式）
 }
 
+/// 判断消息是否携带工具调用：原生 tool_calls 字段，或文本含【TOOL| 标记。
+/// 用于 reasoning_content 的计入判定——官方 thinking_mode 要求只有带工具调用的
+/// assistant 消息才回传思考链，纯文本回答的 reasoning 不回传、不占用输入预算。
+fn message_has_tool_call(m: &serde_json::Value) -> bool {
+    if m.get("tool_calls").is_some() {
+        return true;
+    }
+    match m.get("content") {
+        Some(serde_json::Value::String(s)) => s.contains("【TOOL|"),
+        Some(serde_json::Value::Array(parts)) => parts.iter().any(|p| {
+            p.get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.contains("【TOOL|"))
+        }),
+        _ => false,
+    }
+}
+
 /// 估算一组 LLM 消息的 token 数。
 /// `messages` 为 serde_json::Value 数组，每项含 "content"（文本）与可选 "role"。
 /// 每条消息按 role/结构加少量固定开销，与 OpenAI 兼容协议的口径接近。
+/// reasoning_content（DeepSeek 思考链回传）：仅当该 assistant 消息带工具调用时计入——
+/// 官方 thinking_mode 要求只有这类消息回传 reasoning，纯文本回答的思考链不回传、
+/// 不占用输入预算（对齐 DeepSeek-TUI estimate_tokens_for_message 的 include_thinking 口径）。
 pub fn estimate_messages_tokens(messages: &[serde_json::Value]) -> usize {
     let mut total = 0usize;
     for m in messages {
@@ -81,7 +102,14 @@ pub fn estimate_messages_tokens(messages: &[serde_json::Value]) -> usize {
                     * 1200,
             _ => 0,
         };
-        total += content_tokens + 12; // 每条消息 role/name/结构开销
+        let reasoning_tokens = m
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
+            .filter(|_| message_has_tool_call(m))
+            .map(estimate_text_tokens)
+            .unwrap_or(0);
+        total += content_tokens + reasoning_tokens + 12; // 每条消息 role/name/结构开销
     }
     total + 32 // system 指令与协议固定开销
 }
@@ -128,5 +156,51 @@ mod tests {
     fn estimate_never_zero_for_empty() {
         assert!(estimate_text_tokens("") >= 4);
         assert!(estimate_messages_tokens(&[]) >= 32);
+    }
+
+    #[test]
+    fn reasoning_counted_only_for_tool_call_messages() {
+        // 带原生 tool_calls 字段：reasoning 计入
+        let with_tool_calls = serde_json::json!([{
+            "role": "assistant",
+            "content": "我来搜索",
+            "reasoning_content": "用户想搜索，需要调用工具",
+            "tool_calls": [{"id": "call_1", "function": {"name": "grep", "arguments": "{}"}}]
+        }]);
+        // 带【TOOL| 文本标记：reasoning 计入
+        let with_marker = serde_json::json!([{
+            "role": "assistant",
+            "content": "【TOOL|grep|{\"pattern\":\"x\"}】",
+            "reasoning_content": "先搜索再回答"
+        }]);
+        // 纯文本回答：reasoning 不回传，不计入
+        let text_only = serde_json::json!([{
+            "role": "assistant",
+            "content": "好的，这是答案",
+            "reasoning_content": "思考过程不回传"
+        }]);
+        let no_reasoning = serde_json::json!([{
+            "role": "assistant",
+            "content": "好的，这是答案"
+        }]);
+        let r_tokens = estimate_text_tokens("思考过程不回传");
+        assert!(
+            estimate_messages_tokens(with_tool_calls.as_array().unwrap())
+                >= estimate_messages_tokens(text_only.as_array().unwrap())
+                + r_tokens,
+            "带 tool_calls 的 reasoning 应计入预算"
+        );
+        assert!(
+            estimate_messages_tokens(with_marker.as_array().unwrap())
+                >= estimate_messages_tokens(text_only.as_array().unwrap())
+                + r_tokens,
+            "带【TOOL| 标记的 reasoning 应计入预算"
+        );
+        // 纯文本回答的 reasoning 不计入：与不含 reasoning 的同款消息估算一致
+        assert_eq!(
+            estimate_messages_tokens(text_only.as_array().unwrap()),
+            estimate_messages_tokens(no_reasoning.as_array().unwrap()),
+            "纯文本 assistant 的 reasoning 不应计入预算"
+        );
     }
 }

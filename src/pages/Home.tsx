@@ -19,6 +19,7 @@ import { useNoteStore, NOTE_MAX_LEN } from '../stores/noteStore'
 import {
   inspectProject,
   listConversations,
+  listMessages,
   listConversationTags,
   type TagCount,
   type ProjectInspect,
@@ -52,6 +53,7 @@ import {
   getHarmonyRoot,
   type Project,
   type Conversation,
+  type SnapshotInfo,
   listToolGroups,
   queueMessage,
   conversationRoot,
@@ -242,6 +244,10 @@ export default function Home() {
     removeMessage,
     tokenStats,
     rollbackTask,
+    snapshots,
+    loadingSnapshots,
+    loadSnapshots,
+    restoreToSnapshot,
     setConversationKeyword,
     recentRuns,
     loadRecentRuns,
@@ -319,6 +325,10 @@ export default function Home() {
     removeMessage: s.removeMessage,
     tokenStats: s.tokenStats,
     rollbackTask: s.rollbackTask,
+    snapshots: s.snapshots,
+    loadingSnapshots: s.loadingSnapshots,
+    loadSnapshots: s.loadSnapshots,
+    restoreToSnapshot: s.restoreToSnapshot,
     setConversationKeyword: s.setConversationKeyword,
     recentRuns: s.recentRuns,
     loadRecentRuns: s.loadRecentRuns,
@@ -567,6 +577,8 @@ export default function Home() {
   const [showExportMenu, setShowExportMenu] = useState(false)
   // 顶栏"更多操作"折叠菜单（小屏友好：回滚/导出/记忆/压缩/终端收进此处）
   const [showMoreMenu, setShowMoreMenu] = useState(false)
+  // 会话时间线弹窗（快照点列表 → 回到历史决策点重新引导）
+  const [timelineOpen, setTimelineOpen] = useState(false)
   // 正在朗读的消息 id
   const [speakingId, setSpeakingId] = useState<string | null>(null)
   // 编辑消息弹窗目标（仅 user 消息可编辑）
@@ -1837,7 +1849,12 @@ export default function Home() {
           .sort((a, b) => b.rank - a.rank)
           .slice(0, 8)
           .map((x) => x.f)
-        setRefCandidates(list)
+        // 会话引用候选：同项目会话（排除当前会话），标题模糊匹配，追加在文件候选之后
+        const convCands = conversations
+          .filter((c) => c.id !== currentConversation?.id && (q === '' || c.title.toLowerCase().includes(q)))
+          .slice(0, 5)
+          .map((c) => ({ path: `conv:${c.id}`, name: c.title }))
+        setRefCandidates([...list, ...convCands])
         setRefIdx(0)
         return
       }
@@ -1876,14 +1893,32 @@ export default function Home() {
     inputRef.current?.focus()
   }
 
-  /** 选中候选：替换 @query 为 @path，加入引用列表 */
+  /** 选中候选：替换 @query 为 @path，加入引用列表。会话引用（conv:）同时把
+   *  标题+最近内容插入草稿（模型可见），与消息引用（Quote）同构 */
   const pickReference = (path: string) => {
     const atIdx = draft.lastIndexOf('@')
     if (atIdx < 0) return
     setDraft(draft.slice(0, atIdx) + `@${path} `)
+    if (path.startsWith('conv:')) {
+      const convId = path.slice(5)
+      const conv = conversations.find((c) => c.id === convId)
+      const title = conv?.title ?? convId
+      // 异步取该会话最近内容注入草稿（失败不阻塞引用本身）
+      void (async () => {
+        try {
+          const msgs = await listMessages(convId)
+          const last = [...msgs].reverse().find((m) => m.role === 'assistant' || m.role === 'user')
+          const snippet = (last?.content ?? '').trim().slice(0, 400)
+          setDraft((d) => `${d}\n\n【引用会话 ${title}】\n${snippet || '（该会话暂无内容）'}\n\n`)
+        } catch {
+          setDraft((d) => `${d}\n\n【引用会话 ${title}】（摘要获取失败）\n\n`)
+        }
+      })()
+    } else {
+      recordMruRef(path)
+    }
     setReferences((r) => (r.includes(path) ? r : [...r, path]))
     setRefCandidates(null)
-    recordMruRef(path)
     inputRef.current?.focus()
   }
 
@@ -2210,6 +2245,31 @@ export default function Home() {
     setRightTab('preview')
   }
 
+  // Agent UI 聚焦（ui_focus 工具，对齐 OpenHands canvas_ui_control）：agent 产出后主动
+  // 把用户视线引到成果——切换右侧面板/打开文件预览。文件预览复用 deveco:open-file 机制
+  // （FileTreePanel 监听：自动展开目录并弹出 FilePreviewDialog），需等面板挂载后再派发。
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    listen<{ conversation_id: string; command: string; path: string; tab: string }>('ui-focus', (event) => {
+      const { command, path, tab } = event.payload
+      if (command === 'navigate_to_file' || command === 'show_preview') {
+        if (!path) return
+        setShowRightPanel(true)
+        setRightTab('files')
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('deveco:open-file', { detail: { path } }))
+        }, 80)
+      } else if (command === 'open_tab' && tab) {
+        const allowed = ['files', 'git', 'preview', 'terminal', 'devices', 'overview', 'symbols', 'analyze'] as const
+        if ((allowed as readonly string[]).includes(tab)) {
+          setShowRightPanel(true)
+          setRightTab(tab as typeof rightTab)
+        }
+      }
+    }).then((fn) => { unlisten = fn }).catch(() => {})
+    return () => unlisten?.()
+  }, [])
+
   /** 符号索引预热：项目切换/启动后延迟到浏览器空闲时预热，避免抢占首帧渲染 CPU；
    *  让符号面板与首轮对话构建工程概要时秒出结果；静默执行不阻塞界面。 */
   // 当前项目 ID/类型：符号索引预热触发条件（避免 effect 内直接引用项目对象）
@@ -2513,6 +2573,41 @@ export default function Home() {
       alert(`${t('home.rollbackNoRepo')}\n${String(e)}`)
       setRollbackBusy(false)
     }
+  }
+
+  // ---------- 会话时间线（时间旅行）：快照点列表 → 回到历史决策点重新引导 ----------
+  const handleOpenTimeline = () => {
+    if (!currentConversation) return
+    setTimelineOpen(true)
+    void loadSnapshots(currentConversation.id)
+  }
+
+  const handleRestoreSnapshot = (snap: SnapshotInfo) => {
+    if (!currentConversation) return
+    // 用 ConfirmDialog 确认：warn 色调提示后续消息将被归档隐藏（工作区/账本随之重置为快照时刻）
+    askConfirm({
+      title: t('home.timelineRestoreTitle'),
+      body: t('home.timelineRestoreConfirm', { time: formatTime(snap.created_at), label: snap.label }),
+      tone: 'warn',
+      confirmLabel: t('home.timelineRestoreDoIt'),
+      onConfirm: () => {
+        void (async () => {
+          try {
+            const res = await restoreToSnapshot(currentConversation.id, snap.id)
+            useAuditStore.getState().log({
+              category: 'task.timeline',
+              label: t('home.timelineTitle'),
+              detail: `${snap.label} · ${formatTime(snap.created_at)} · ${currentProject?.name ?? ''}`,
+              projectId: currentProject?.id,
+              conversationId: currentConversation.id,
+            })
+            alert(t('home.timelineRestored', { archived: String(res.archived), restored: String(res.restored) }))
+          } catch (e) {
+            alert(`${t('home.timelineFail')}\n${String(e)}`)
+          }
+        })()
+      },
+    })
   }
 
   // ---------- 划词菜单：选中文本后弹出（复制/解释/翻译/搜索/引用回复） ----------
@@ -4191,6 +4286,17 @@ export default function Home() {
                     <button
                       onClick={() => {
                         setShowMoreMenu(false)
+                        handleOpenTimeline()
+                      }}
+                      disabled={messages.length === 0}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+                    >
+                      <Icon name="history" size={14} />
+                      {t('home.timeline')}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowMoreMenu(false)
                         void handleSummarizeMemory()
                       }}
                       disabled={summarizing || messages.length === 0}
@@ -4704,19 +4810,22 @@ export default function Home() {
                 {refCandidates.length === 0 && (
                   <div className="px-3 py-2.5 text-[11px] text-[var(--text-muted)]">{t('home.refNoMatch')}</div>
                 )}
-                {refCandidates.map((c, i) => (
-                  <button
-                    key={c.path}
-                    onMouseEnter={() => setRefIdx(i)}
-                    onClick={() => pickReference(c.path)}
-                    className={`w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors ${
-                      i === refIdx ? 'bg-[var(--bg-hover)]' : 'hover:bg-[var(--bg-hover)]'
-                    }`}
-                  >
-                    <Icon name="file" size={12} className="text-[var(--text-muted)] shrink-0" />
-                    <span className="text-[11.5px] text-[var(--text-primary)] truncate">{c.path}</span>
-                  </button>
-                ))}
+                {refCandidates.map((c, i) => {
+                  const isConv = c.path.startsWith('conv:')
+                  return (
+                    <button
+                      key={c.path}
+                      onMouseEnter={() => setRefIdx(i)}
+                      onClick={() => pickReference(c.path)}
+                      className={`w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors ${
+                        i === refIdx ? 'bg-[var(--bg-hover)]' : 'hover:bg-[var(--bg-hover)]'
+                      }`}
+                    >
+                      <Icon name={isConv ? 'chat' : 'file'} size={12} className="text-[var(--text-muted)] shrink-0" />
+                      <span className="text-[11.5px] text-[var(--text-primary)] truncate">{isConv ? `会话：${c.name}` : c.path}</span>
+                    </button>
+                  )
+                })}
               </div>
             )}
             <textarea
@@ -4811,22 +4920,27 @@ export default function Home() {
             {/* 引用标签（@ 选择后展示，可移除） */}
             {references.length > 0 && (
               <div className="flex flex-wrap gap-1 px-3 pt-1">
-                {references.map((p) => (
-                  <span
-                    key={p}
-                    className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[10.5px] text-[var(--accent)] max-w-56"
-                  >
-                    <Icon name="file" size={10} className="shrink-0" />
-                    <span className="truncate">{p}</span>
-                    <button
-                      onClick={() => setReferences((r) => r.filter((x) => x !== p))}
-                      className="shrink-0 hover:text-[var(--danger)] transition-colors"
-                      title={t('home.removeReference')}
+                {references.map((p) => {
+                  const convTitle = p.startsWith('conv:')
+                    ? (conversations.find((c) => c.id === p.slice(5))?.title ?? null)
+                    : null
+                  return (
+                    <span
+                      key={p}
+                      className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[10.5px] text-[var(--accent)] max-w-56"
                     >
-                      <Icon name="close" size={10} />
-                    </button>
-                  </span>
-                ))}
+                      <Icon name={convTitle ? 'chat' : 'file'} size={10} className="shrink-0" />
+                      <span className="truncate">{convTitle ? `会话：${convTitle}` : p}</span>
+                      <button
+                        onClick={() => setReferences((r) => r.filter((x) => x !== p))}
+                        className="shrink-0 hover:text-[var(--danger)] transition-colors"
+                        title={t('home.removeReference')}
+                      >
+                        <Icon name="close" size={10} />
+                      </button>
+                    </span>
+                  )
+                })}
               </div>
             )}
             {/* 待发送图片（粘贴/拖入，最多 4 张） */}
@@ -5918,6 +6032,63 @@ export default function Home() {
             setFeedbackDialog(null)
           }}
         />
+      )}
+
+      {/* ============ 会话时间线弹窗（快照点列表 → 回到历史决策点） ============ */}
+      {timelineOpen && currentConversation && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+          <div className="w-[520px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
+            <div className="flex items-center gap-2">
+              <Icon name="history" size={15} />
+              <span className="text-[13px] font-semibold">{t('home.timelineTitle')}</span>
+              <button
+                onClick={() => setTimelineOpen(false)}
+                className="ml-auto p-1 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <Icon name="close" size={13} />
+              </button>
+            </div>
+            <div className="mt-2 text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.timelineDesc')}</div>
+            <div className="mt-3 space-y-1 max-h-80 overflow-y-auto">
+              {loadingSnapshots && snapshots.length === 0 ? (
+                <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('common.loading')}</div>
+              ) : snapshots.length === 0 ? (
+                <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('home.timelineEmpty')}</div>
+              ) : (
+                snapshots.map((snap) => {
+                  const isCurrent = snap.is_current
+                  return (
+                    <div
+                      key={snap.id}
+                      className={`flex items-center gap-2 rounded-lg modern-card border-[var(--border)] px-2.5 py-2 ${isCurrent ? 'opacity-75' : ''}`}
+                    >
+                      <Icon name="history" size={13} className="mt-0.5 shrink-0 text-[var(--text-muted)]" />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[12px] text-[var(--text-primary)] truncate">
+                          {snap.label || t('home.timelineToolRound')}
+                        </div>
+                        <div className="text-[10px] text-[var(--text-muted)] mt-0.5">
+                          {formatTime(snap.created_at)} · {t('home.timelineTools', { count: String(snap.tool_count) })}
+                          {isCurrent && <span className="ml-1.5 text-[var(--success)]">{t('home.timelineCurrent')}</span>}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => {
+                          setTimelineOpen(false)
+                          handleRestoreSnapshot(snap)
+                        }}
+                        disabled={isCurrent}
+                        className="shrink-0 px-2.5 py-1 rounded-lg text-[11px] text-[var(--accent)] bg-[var(--accent-soft)] hover:opacity-80 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {t('home.timelineRestore')}
+                      </button>
+                    </div>
+                  )
+                })
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* ============ 回复版本 diff 对比弹窗 ============ */}

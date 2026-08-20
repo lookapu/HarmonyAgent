@@ -10,7 +10,7 @@
 
 ## 它是什么
 
-不是简单的 Provider 切换器。**193 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
+不是简单的 Provider 切换器。**198 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
 
 | 维度 | 能力 |
 |------|------|
@@ -20,7 +20,7 @@
 | 📚 **API 知识库** | 内置 HarmonyOS API 索引（向量检索 + 符号索引） + 跨版本 diff + 兼容性扫描 + 用户笔记（knowledge entries） |
 | 🛡 **安全治理** | 工具调用白名单 / 工具限额（按任务组） / 任务守卫 / 预算控制 / 权限管理 / 审批拦截流水线（pre/post hooks） |
 | 📦 **内置运行时** | 便携版 Node + JDK + Git 随安装包捆绑（构建时由 CI 从官方源自动下载），用户机器无需预装开发环境 |
-| 💬 **会话管理** | 多会话 / 上下文压缩（compact） / LLM 调用回放（llm_replay） / 事件溯源（session_events） / 会话标签 / 置顶 / 消息队列 / 任务看门狗（卡死自动 abort） |
+| 💬 **会话管理** | 多会话 / 上下文压缩（compact） / LLM 调用回放（llm_replay） / 事件溯源（session_events） / 会话标签 / 置顶 / 消息队列 / 任务看门狗（卡死自动 abort） / **会话时间旅行（快照回溯）** / **跨会话引用（@ 会话）** / **定时提醒（schedule）** |
 | 🧠 **代码理解** | LSP 语义级分析（ArkTS 语言服务器） + 分级扫描（check_code / deep_scan / codebase_search / get_symbol_details） / 符号索引 / 文件系统工具集 |
 | 🌐 **生态能力** | MCP 服务器管理 / Skill 启停与使用统计 / ohpm 生态面板 / 鸿蒙官方文档检索 / Web 搜索与抓取 / 知识库导入导出 |
 | 📡 **LAN 访问** | 内置局域网服务，手机/平板浏览器即可查看会话、发消息、管理会话（token 鉴权 + 只读文件查看） |
@@ -33,8 +33,10 @@
 - **任务计划**：`plan_task` 把复杂任务拆步骤，前端实时渲染进度（todo → doing → done/failed）
 - **主动提问**：`ask_user` 中断 Agent 流程等你回答（oneshot 通道，停止时自动取消）
 - **撤销栈**：`undo_edit` 给 Agent 的 edit_file/write_file 加快照栈（每会话最多 40 条，FIFO 淘汰）
-- **跨轮诊断**：构建/部署/崩溃的根因结论按项目缓存，system prompt 自动注入，避免模型"重复踩坑"
+- **跨轮诊断**：构建/部署/崩溃的根因结论按项目缓存，system prompt 自动注入，避免模型"重复踩坑"；记忆注入带 **BM25 相关性排序 + 最近更新置顶（front_page）+ 负反馈词袋纠偏**（点踩过的内容不再反复出现）
 - **失败反思**：工具调用失败后自动沉淀反思片段注入下一轮 system prompt，让 Agent 记住自己的失败模式
+- **时间旅行**：每轮工具执行后自动保存会话快照（消息锚点 + 账本 + 摘要），可回到任意历史决策点重新引导（对齐 langgraph checkpoint）
+- **定时提醒**：`schedule_create`（after/at/every）设定会话内提醒，到期自动注入对话 + 桌面通知
 - **后台任务**：`run_command --background` 长任务立即返回 job_id，完成时摘要注入下一轮请求
 - **运行时日志**：部署后自动 `hdc shell hilog -L E` 监听，异常时自动落诊断 → 前端事件
 
@@ -89,6 +91,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 ### 7. 生产力工具
 
 - **命令面板**：`Cmd/Ctrl+K` 唤起，28 个高频工具 action 即时触发（调试/重构/构建/安全/知识/数据/治理/多模态）
+- **@ 引用**：输入框 `@` 引用项目文件（MRU 排序）或**同项目其他会话**（`conv:` 前缀注入标题 + 摘要）
 - **会话标签与置顶**：给会话打标签、置顶常用项目会话
 - **时间线面板**：会话事件溯源可视化（session_events）
 - **通知中心**：Agent 任务完成/失败推送
@@ -121,8 +124,8 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 30+ commands · 36 services · 16 agent 子模块     │
-│  - tools/ 目录：27 文件，193 个 Agent 工具           │
-│  - SQLite + 50 个迁移版本 · 事件溯源（session_events）│
+│  - tools/ 目录：27 文件，198 个 Agent 工具           │
+│  - SQLite + 52 个迁移版本 · 事件溯源（session_events）│
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -146,8 +149,9 @@ src-tauri/src/
 │   ├── runtime_log.rs       #   - 设备运行日志环形缓冲
 │   ├── exec_ctx.rs          #   - 工具执行上下文（停止标志）
 │   ├── session_ctx.rs       #   - 会话级运行态（统一收敛）
+│   ├── invariants.rs         #   - 写操作不变式（.env/证书/迁移 SQL）
 │   ├── session_events.rs    #   - 会话事件溯源
-│   └── tools/               #   - 193 个 Agent 工具（27 文件）
+│   └── tools/               #   - 198 个 Agent 工具（27 文件）
 │       ├── mod.rs               # 工具注册表（TOOL_SPECS）+ 协议分发
 │       ├── protocol.rs          # 工具调用标记解析
 │       ├── errors.rs            # 结构化错误信封（ToolError 7 类）
@@ -175,6 +179,7 @@ src-tauri/src/
 │       ├── quality_security.rs  #   安全扫描（4 工具）
 │       ├── quality_runtime.rs   #   运行时质量（6 工具）
 │       └── quality_media.rs     #   媒体质量（2 工具）
+│       └── schedule_tools.rs    # 定时提醒（schedule_create/list/delete）
 ├── commands/               # Tauri command 入口（30+）
 ├── services/               # 业务服务（36 个）
 │   ├── proxy_service.rs    #   - 本地代理
@@ -186,9 +191,10 @@ src-tauri/src/
 │   ├── ohpm_landscape.rs   #   - ohpm 生态数据
 │   ├── agent_limits.rs     #   - Agent 限额（按任务组）
 │   ├── tool_cache.rs       #   - 工具结果缓存
+│   ├── reminders.rs        #   - 定时提醒派发（30s 轮询）
 │   ├── harmony_*.rs        #   - 鸿蒙集成（6 文件）
 │   └── ...
-├── db/                     # SQLite + 50 个迁移
+├── db/                     # SQLite + 52 个迁移
 ├── utils/                  # 工具（13 文件，含任务看门狗）
 ├── tray/                   # 系统托盘
 └── runtime/                # 内置 Node + JDK + Git（约 700MB，不入库，见下）
@@ -196,7 +202,7 @@ src-tauri/src/
 
 > **关于大文件**：`src-tauri/runtime/`（便携运行时）、`src-tauri/resources/`（种子知识库 + embedding 模型，约 340MB）与 `portable-build/`（绿色版产物）共约 1GB，属构建产物/下载资源，**不随 Git 仓库分发**（见 `.gitignore`）。本机构建请保留这些目录；克隆用户可从 Release 安装包获取完整运行时，或参照 [release.yml](.github/workflows/release.yml) 的下载逻辑自行准备。
 
-## 193 个 Agent 工具按域分组
+## 198 个 Agent 工具按域分组
 
 | 域（TOOL_GROUP） | 代表工具 |
 |------|------|
@@ -207,7 +213,7 @@ src-tauri/src/
 | **refactor（重构）** | `deep_scan` `check_code` `lsp_definition` `lsp_references` `lsp_symbols` `lsp_hover` `lsp_diagnostics` |
 | **test（测试）** | `run_tests` `write_unit_tests` `api_test` `api_mock` `api_health` |
 | **debug（调试）** | `attach_debugger` `step_debug` `log_query` `read_logcat` `search_hilog` `memory_snapshot` `dump_battery` |
-| **other（其他）** | `web_search` `web_fetch` `http_request` `save_memory` `search_knowledge` `spawn_agents` `plan_task` `ask_user` `license_check` `vuln_scan` `docx_read` `audio_transcribe` |
+| **other（其他）** | `web_search` `web_fetch` `http_request` `save_memory` `search_knowledge` `spawn_agents` `plan_task` `ask_user` `license_check` `vuln_scan` `docx_read` `audio_transcribe` `memorize` `ui_focus` `schedule_create` `schedule_list` `schedule_delete` |
 
 完整清单见 `src-tauri/src/agent/tools/mod.rs` 的 `TOOL_SPECS` 数组（含中英文描述与 side_effect 标注）。
 
@@ -255,6 +261,7 @@ npx tauri build
 - [架构文档 v2](docs/ARCHITECTURE.md) — 产品定位、模块边界、设计取舍
 - [LAN 访问说明](docs/LAN_ACCESS.md) — 局域网服务的启用、token 管理与安全边界
 - [工具集增强清单](docs/TOOL_ENHANCEMENTS.md) — 工具能力演进与兑现状态
+- [Harness 增强清单](docs/HARNESS_ENHANCEMENTS.md) — 外部参考仓库能力对齐记录
 - [更新日志](CHANGELOG.md) — 版本变更、迁移要点与回滚指引
 
 ## 开发指南
@@ -262,7 +269,7 @@ npx tauri build
 - 前端入口：`src/App.tsx` + `src/pages/Home.tsx`（Agent Workspace 主界面）
 - 后端入口：`src-tauri/src/lib.rs` + `src-tauri/src/main.rs`
 - Agent 工具注册：`src-tauri/src/agent/tools/mod.rs` 的 `TOOL_SPECS` 数组
-- 数据库迁移：`src-tauri/migrations/`（50 个版本，已执行的迁移不可修改，新增请递增编号）
+- 数据库迁移：`src-tauri/migrations/`（52 个版本，已执行的迁移不可修改，新增请递增编号）
 - 旧调试脚本：`scripts/legacy/`（仅留档，请勿引用）
 
 ## 打赏支持

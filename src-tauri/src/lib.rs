@@ -214,6 +214,40 @@ pub fn run() {
                 });
             }
 
+            // 会话内定时提醒轮询：每 30 秒派发到期提醒到对应会话队列
+            // （对齐 deepseek-harness schedule：session-local 投递，不中断当前轮次，
+            //   注入后模型下一轮请求自动看到；应用退出即不再投递）
+            {
+                let db_arc = std::sync::Arc::clone(&pool_arc);
+                let app2 = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+                    loop {
+                        ticker.tick().await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let due = {
+                            let Ok(conn) = db_arc.lock() else { continue };
+                            match crate::services::reminders::dispatch_due(&conn, now) {
+                                Ok(d) => d,
+                                Err(_) => continue,
+                            }
+                        };
+                        for (conv_id, prompt) in due {
+                            crate::agent::session_ctx::inject_message(&conv_id, prompt.clone());
+                            crate::commands::desktop::send_notification(
+                                app2.clone(),
+                                "定时提醒".to_string(),
+                                prompt,
+                                Some("reminder".to_string()),
+                            );
+                        }
+                    }
+                });
+            }
+
             // 注入资源目录给 embedding 模块（打包后语义模型在 resource_dir/embedding/…）
             #[cfg(feature = "embedding")]
             services::embedding::set_resource_dir(
@@ -357,6 +391,8 @@ pub fn run() {
             commands::chat::remove_queued_message,
             commands::chat::update_message,
             commands::chat::delete_message,
+            commands::chat::list_snapshots,
+            commands::chat::restore_snapshot,
             commands::chat::resolve_tool_approval,
             commands::chat::resolve_diagnose_card,
             commands::chat::resolve_plan_review,

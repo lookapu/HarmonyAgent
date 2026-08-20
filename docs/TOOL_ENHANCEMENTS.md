@@ -6,6 +6,7 @@
 > - 工具分派表 dispatch：170 个匹配分支（多 9 个为内部标记命令）
 > - 状态三档：✅ 已有（能力已实现）｜🟡 部分（有相近能力，缺关键特性）｜❌ 缺失（需新实现）
 > - **2026-08-16 第二批实施完成**：9 个新工具（06/07/16/17/19/20/35/70/73）+ 6 项 B 类治理（61/66/69/74/75/76），详见 §11 实施记录
+> - **2026-08-20 第四批（八仓库盘点）**：+5 个新工具（memorize / ui_focus / schedule_create / schedule_list / schedule_delete），TOOL_SPECS 达 **198**，详见 §11
 
 ---
 
@@ -13,8 +14,8 @@
 
 | 项 | 数值 |
 |---|---|
-| 对外工具（TOOL_SPECS） | **193** |
-| 工具分派分支（含内部命令） | 170 |
+| 对外工具（TOOL_SPECS） | **198** |
+| 工具分派分支（含内部命令） | 170+ |
 | 自动跑框架（已有） | Reflexion（agent/reflexion.rs）、cost_guard、LSP 常驻、任务看门狗（utils/task_registry.rs） |
 | 关键基础设施（已有） | undo 可逆性（undo.rs + undo_edit 工具）、job 系统（job_list/kill/output）、HealthPage（check_all_health）、tool_stats 统计（list_tool_stats + list_tool_token_stats）、session_events 事件流、secret 钥匙串（secret_store/get/delete）、Reflexion 反思卡片、tool_cache 响应缓存、redact 脱敏、TOOL_GROUP 分组 |
 | txt 计划项（A 56 + B 20） | 76 |
@@ -391,6 +392,17 @@ P1 [59] 取消 UI（独立）─────► [70] replay（事件完备性）
 - **部分实现（🟡）**：[28] attach_debugger（已有崩溃栈分析闭环，hdc 交互断点依赖调试协议）
 - **风险项**：[71] runtime 加载未做（export_tools_meta 导出已实现；动态加载风险高，保留 Rust 静态数组为唯一事实源）
 
+### 第四批（2026-08-20，八仓库盘点落地）
+
+| # | 工具/能力 | 实现 | 关键点 |
+|---|---|---|---|
+| — | memorize | memory_tools.rs + chat.rs `replay_memories` | 对齐 Qwen-Agent MemoAssistant：从历史消息重放 memorize 调用重建键值状态，每轮作为 system 注入 |
+| — | ui_focus | ui_tools.rs + Home.tsx | 对齐 OpenHands canvas_ui_control：Agent 产出后驱动 UI 聚焦（切右面板/开文件预览），L0 权限 |
+| — | schedule_create / list / delete | schedule_tools.rs + services/reminders.rs | 对齐 deepseek-harness schedule：after/at/every 三类会话内提醒，30s 轮询派发 + 桌面通知 |
+
+- 新工具全部登记：TOOL_SPECS（含「副作用」段）、dispatch 分支、permissions.rs 级别（memorize L0 / ui_focus L0 / schedule_* L1）
+- 新 migration：051_conversation_snapshots.sql、052_reminders_feedback_terms.sql（见 CHANGELOG v2.2）
+
 ---
 
-*生成日期：2026-08-16（第三批实施后更新）。源文件：docs/tool-enhancement-backlog.txt（v1 终版）。盘点基于工作区代码实测（TOOL_SPECS=182）。*
+*生成日期：2026-08-20（第四批实施后更新）。源文件：docs/tool-enhancement-backlog.txt（v1 终版）。盘点基于工作区代码实测（TOOL_SPECS=198）。*

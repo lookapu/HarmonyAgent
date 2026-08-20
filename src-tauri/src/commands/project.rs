@@ -1116,7 +1116,7 @@ pub fn list_messages(conversation_id: String, state: State<DbState>) -> Result<V
         .prepare(
             "SELECT id, conversation_id, role, content, references_json, model,
                     tokens_in, tokens_out, created_at, reasoning, queued, agent_owned, modified_files_json, duration_ms
-             FROM messages WHERE conversation_id = ?1 ORDER BY created_at ASC",
+             FROM messages WHERE conversation_id = ?1 AND hidden = 0 ORDER BY created_at ASC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -1177,7 +1177,7 @@ fn list_messages_page_impl(
                FROM messages";
     let mut out: Vec<ChatMessage> = if let Some((ts, bid)) = &cursor {
         let sql = format!(
-            "{sql} WHERE conversation_id = ?1 AND (created_at, id) < (?2, ?3)\n               ORDER BY created_at DESC, id DESC LIMIT ?4"
+            "{sql} WHERE conversation_id = ?1 AND hidden = 0 AND (created_at, id) < (?2, ?3)\n               ORDER BY created_at DESC, id DESC LIMIT ?4"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
@@ -1186,7 +1186,7 @@ fn list_messages_page_impl(
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
     } else {
         let sql = format!(
-            "{sql} WHERE conversation_id = ?1\n               ORDER BY created_at DESC, id DESC LIMIT ?2"
+            "{sql} WHERE conversation_id = ?1 AND hidden = 0\n               ORDER BY created_at DESC, id DESC LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt

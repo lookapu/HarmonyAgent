@@ -10,7 +10,10 @@ use uuid::Uuid;
 use crate::db::models::{ChatMessage, McpServer, TaskRun};
 use crate::db::DbState;
 use crate::services::{model_router, tool_limits};
-use crate::utils::errors::{classify_text, provider_error_with_retry_after, transport_error, ErrorKind, FriendlyError};
+use crate::utils::errors::{
+    classify_text, parse_retry_after_secs, provider_error_with_retry_after, transport_error, ErrorKind,
+    FriendlyError,
+};
 use crate::utils::retry::{retry_with_backoff, STREAM_REQUEST_POLICY, TOOL_POLICY};
 use crate::utils::task_registry::{TaskRegistry, PHASE_MAIN_LOOP, PHASE_ROUND_REQUEST, PHASE_SEND, PHASE_START, PHASE_STREAMING, PHASE_TOOL};
 use crate::agent::tools::guards::is_cancelled;
@@ -794,6 +797,189 @@ fn save_task_ledger(
     Ok(())
 }
 
+// ---------- 会话时间旅行（快照 + 分支归档，对齐 langgraph checkpoint） ----------
+/// 每会话快照保留上限：超限删最旧（快照很小：锚点 rowid + 账本 JSON + 摘要，50 个足够回溯）
+const MAX_SNAPSHOTS_PER_CONVERSATION: usize = 50;
+
+/// 快照信息（前端时间轴展示）
+#[derive(Clone, Serialize)]
+pub struct SnapshotInfo {
+    pub id: String,
+    pub label: String,
+    pub tool_count: i64,
+    pub created_at: i64,
+    /// 快照点是否当前可见消息末端（前端标记“当前”快照）
+    pub is_current: bool,
+}
+
+/// 保存会话快照：每轮工具执行后调用（上轮模型输出已入库、账本已派生）。
+/// 快照 = 可见消息末端 rowid 锚点 + 当时账本 + 模型输出摘要；超限删最旧。
+/// 首轮（无任何执行痕迹）不保存——空会话快照无回溯意义。
+fn save_conversation_snapshot(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    ledger: Option<&TaskLedger>,
+    last_model_text: &str,
+    tool_count: usize,
+) -> Result<(), String> {
+    if tool_count == 0 && last_model_text.trim().is_empty() {
+        return Ok(());
+    }
+    // 锚点 = 当前可见消息最大 rowid（hidden 归档段不参与）
+    let msg_rowid: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE conversation_id = ?1 AND hidden = 0",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    // 摘要：模型输出去换行后前 40 字符（时间轴展示用，不落正文）
+    let mut label: String = last_model_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.chars().count() > 40 {
+        label = label.chars().take(40).collect::<String>() + "…";
+    }
+    if label.trim().is_empty() {
+        label = "（工具执行轮）".to_string();
+    }
+    let ledger_json = ledger
+        .map(|l| serde_json::to_string(l).ok())
+        .flatten();
+    conn.execute(
+        "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, label, ledger_json, tool_count, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            Uuid::new_v4().to_string(),
+            conversation_id,
+            msg_rowid,
+            label,
+            ledger_json,
+            tool_count as i64,
+            now()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    // 保留上限：删除最旧超限快照（按 created_at 排序保最新）
+    conn.execute(
+        "DELETE FROM conversation_snapshots WHERE conversation_id = ?1 AND id NOT IN (
+             SELECT id FROM conversation_snapshots WHERE conversation_id = ?1
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2
+         )",
+        params![conversation_id, MAX_SNAPSHOTS_PER_CONVERSATION as i64],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 会话快照列表（时间轴，最新在前）；is_current 标记可见消息末端对应的快照
+#[tauri::command]
+pub fn list_snapshots(
+    state: State<'_, DbState>,
+    conversation_id: String,
+) -> Result<Vec<SnapshotInfo>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, msg_rowid, label, tool_count, created_at FROM conversation_snapshots
+             WHERE conversation_id = ?1 ORDER BY created_at DESC, rowid DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let current_rowid: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE conversation_id = ?1 AND hidden = 0",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let items = stmt
+        .query_map(params![conversation_id], |r| {
+            Ok(SnapshotInfo {
+                id: r.get(0)?,
+                tool_count: r.get(3)?,
+                created_at: r.get(4)?,
+                label: r.get(2)?,
+                is_current: r.get::<_, i64>(1)? >= current_rowid,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(items)
+}
+
+/// 恢复结果（前端提示条展示）
+#[derive(Clone, Serialize)]
+pub struct RestoreSnapshotResult {
+    pub label: String,
+    /// 归档（隐藏）的消息条数
+    pub archived: i64,
+    /// 重新可见（取消隐藏）的消息条数
+    pub restored: i64,
+    /// 是否回退（true=回到更早；false=前进到更晚）
+    pub went_back: bool,
+}
+
+/// 恢复会话到某快照点（时间旅行）：
+/// - rowid > 锚点的可见消息 → 归档（hidden=1）；rowid <= 锚点的归档消息 → 重新可见（hidden=0），
+///   双向切换：回退更早点时中间归档段恢复显示，前进到更晚点时旧分支重新可见。
+/// - 账本写回快照时刻（续跑继承该点执行轨迹），归档分支不参与模型上下文组装。
+/// 任务运行中拒绝恢复（避免与执行中的主循环写消息竞态）。
+#[tauri::command]
+pub fn restore_snapshot(
+    state: State<'_, DbState>,
+    lock: State<'_, ChatLock>,
+    conversation_id: String,
+    snapshot_id: String,
+) -> Result<RestoreSnapshotResult, String> {
+    // 任务运行检查：ChatLock 记录 project_id → 正在执行的会话 id
+    {
+        let guard = lock.0.lock().map_err(|e| e.to_string())?;
+        if guard.values().any(|c| c == &conversation_id) {
+            return Err("会话任务正在运行，请先停止任务再回到历史点".into());
+        }
+    }
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let (anchor, label, ledger_json): (i64, String, Option<String>) = conn
+        .query_row(
+            "SELECT msg_rowid, label, ledger_json FROM conversation_snapshots
+             WHERE id = ?1 AND conversation_id = ?2",
+            params![snapshot_id, conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|e| format!("快照不存在或不属于该会话: {e}"))?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    // 1. 归档：锚点之后的可见消息 → hidden（旧分支保留可回溯，不硬删）
+    let archived = tx
+        .execute(
+            "UPDATE messages SET hidden = 1 WHERE conversation_id = ?1 AND hidden = 0 AND rowid > ?2",
+            params![conversation_id, anchor],
+        )
+        .map_err(|e| e.to_string())?;
+    // 2. 重新可见：锚点之前的归档消息 → 取消 hidden（回退更早点时中间段恢复；
+    //    前进到更晚点时旧分支重新出现——双向时间旅行）
+    let restored = tx
+        .execute(
+            "UPDATE messages SET hidden = 0 WHERE conversation_id = ?1 AND hidden = 1 AND rowid <= ?2",
+            params![conversation_id, anchor],
+        )
+        .map_err(|e| e.to_string())?;
+    // 3. 账本写回快照时刻（断点续跑/继续任务继承该点执行轨迹）
+    tx.execute(
+        "UPDATE conversations SET ledger = ?1 WHERE id = ?2",
+        params![ledger_json, conversation_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(RestoreSnapshotResult {
+        label,
+        archived: archived as i64,
+        restored: restored as i64,
+        went_back: restored > 0,
+    })
+}
+
 /// 任务时长护栏由 agent_limits 动态配置（设置页可调，0/-1 表示不限制），见主循环超时检测。
 /// 历史消息加载上限已改为动态：按模型上下文预算动态初始（见 dynamic_history_limit），
 /// 主动压缩/上下文超限时自动减半，直到 MIN_HISTORY_KEEP 下限。
@@ -804,19 +990,40 @@ const MAX_CONTINUATION_ROUNDS: usize = 8;
 /// 空响应重试上限：模型连续多轮输出为空（服务端静默失败/异常截断）时最多重试
 /// 两次即收尾提示，防止进入无限空轮循环导致界面长时间无输出看起来卡死
 const MAX_EMPTY_ROUNDS: usize = 2;
-/// 流式无数据静默超时：连接保持但长时间收不到任何字节（代理悬挂/服务端异常）时
-/// 视为连接中断，保留已收内容触发自动续写（与截断续写机制同链路）；
-/// 续写轮模型无需重新思考，60 秒足够判定；过长会让“不吐字”的感知持续更久
+/// 流式无产出静默超时：连接保持但长时间解析不到有效内容（服务端只发心跳/空数据行、
+/// 模型卡住不吐字）时视为中断，保留已收内容触发自动续写（与截断续写机制同链路）；
+/// 续写轮模型无需重新思考，60 秒足够判定；过长会让“不吐字”的感知持续更久。
+/// 注意：仅“无有效产出”触发——大输出/长响应解析期间产出持续刷新不会触发，
+/// 数据仍到达但无产出由独立看门狗以数据停滞判据兜底。
 const STREAM_SILENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// 连接中断自动续写次数上限：网络问题重试 3 次无意义（多为本地代理/网络故障），
 /// 超过后收尾并明确提示，避免无限续写空转
 const MAX_INTERRUPT_RETRY_ROUNDS: usize = 3;
+/// 产出前中断重放次数上限：流在输出任何内容前即中断（服务端断流/代理重置）时，
+/// 用冻结请求原样重发（对齐 DeepSeek-Reasonix 冻结请求重放机制：模型无需重新思考、
+/// prompt 缓存不失效）；连续 5 次 0 产出中断多为本地网络故障，超过后走下方续写收尾
+const MAX_STREAM_REPLAYS: usize = 5;
+/// 工具循环检测阈值（对齐 qwen-code LoopDetectionService 轻量版）：
+/// - 连续相同调用（同工具名+同参数）达到该次数即判定打转——重复调用必得相同结果，
+///   低于 DashScope 服务端 "Repetitive tool calls detected" 阈值，客户端先断循环防服务端 400；
+/// - 连续同名调用（不管参数）达到该次数判定参数抖动循环（模型反复调同一工具换参数试探）；
+/// - 每轮工具调用总数：软上限（仅停滞信号时生效）/ 硬上限（无条件中止，防参数变化逃逸检测）
+const TOOL_CALL_LOOP_THRESHOLD: usize = 5;
+const TOOL_NAME_STAGNATION_THRESHOLD: usize = 8;
+const MAX_TOOL_CALLS_PER_TURN: usize = 100;
+const MAX_TOOL_CALLS_HARD: usize = 1000;
+/// 循环检测命中后注入纠正提示的轮数上限：模型收到提示仍循环时最多打断两次，
+/// 之后直接收尾（防“纠正-循环-再纠正”空转）
+const MAX_LOOP_BREAKS: usize = 2;
 /// “叙述式假调用”纠正次数上限：模型在正文里写“已调用工具”却不输出标记时，
 /// 自动注入纠正提示继续（历史格式污染导致模型模仿，纠正后重走标记协议）
 const MAX_FAKE_CALL_CORRECTIONS: usize = 3;
 /// “未完话术”纠正次数上限：模型承诺“还需读取/继续查看”等下一步动作但未输出工具标记时，
 /// 自动注入纠正提示继续（任务实际未完成却正常收尾，纠正后要求立即输出标记或总结）
 const MAX_PENDING_ACTION_CORRECTIONS: usize = 5;
+/// “行动承诺假完成”纠正次数上限：模型宣布开始开发/创建/实现或仅输出方案计划但未输出
+/// 任何工具标记时，自动注入纠正提示继续（任务实际未执行却正常收尾，纠正后要求立即执行）
+const MAX_ACTION_COMMITMENT_CORRECTIONS: usize = 5;
 /// 任务收尾复核次数上限：执行过工具的任务在模型主动收尾时注入“任务是否真完成”确认，
 /// 未确认则继续执行（长任务防提前收尾）；达上限仍未确认则收尾并提示（防“复核-收尾-复核”空转）
 const MAX_COMPLETION_REVIEWS: usize = 2;
@@ -885,7 +1092,7 @@ fn take_next_queued(
     let mut stmt = conn
         .prepare(
             "SELECT id, content FROM messages
-             WHERE conversation_id = ?1 AND queued = 1 AND role = 'user'
+             WHERE conversation_id = ?1 AND queued = 1 AND role = 'user' AND hidden = 0
                AND (?2 = 0 OR agent_owned = 1)
              ORDER BY created_at ASC, rowid ASC LIMIT 1",
         )
@@ -917,7 +1124,7 @@ fn take_all_queued(
     let mut stmt = conn
         .prepare(
             "SELECT id, content FROM messages
-             WHERE conversation_id = ?1 AND queued = 1 AND role = 'user'
+             WHERE conversation_id = ?1 AND queued = 1 AND role = 'user' AND hidden = 0
              ORDER BY created_at ASC, rowid ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -1034,7 +1241,7 @@ pub fn list_queued_messages(
     let mut stmt = conn
         .prepare(
             "SELECT id, content, agent_owned, created_at FROM messages
-             WHERE conversation_id = ?1 AND queued = 1 AND role = 'user'
+             WHERE conversation_id = ?1 AND queued = 1 AND role = 'user' AND hidden = 0
              ORDER BY created_at ASC, rowid ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -1099,11 +1306,12 @@ pub fn delete_message(state: State<'_, DbState>, message_id: String) -> Result<u
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    // 按 rowid（插入顺序）级联删除该消息及其后的全部消息（含排队/工具/回复）
+    // 按 rowid（插入顺序）级联删除该消息及其后的全部可见消息（hidden 归档分支保留，
+    // 时间旅行后不误删旧分支；含排队/工具/回复）
     let removed = conn
         .execute(
             "DELETE FROM messages
-             WHERE conversation_id = ?1 AND rowid >= (SELECT rowid FROM messages WHERE id = ?2)",
+             WHERE conversation_id = ?1 AND hidden = 0 AND rowid >= (SELECT rowid FROM messages WHERE id = ?2)",
             rusqlite::params![conversation_id, message_id],
         )
         .map_err(|e| e.to_string())?;
@@ -2470,62 +2678,122 @@ async fn stream_chat_inner(
         String::new()
     } else {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
-        // 记忆相关性排序：从当前任务消息提取关键词，用 TF 加权 + 位置权重 +
-        // 时间衰减的相关性打分排前（无关键词时回退按更新时间倒序取最近候选）
-        let memories: Vec<(String, String, String)> = {
-            let keywords = extract_memory_keywords(&content);
-            // 构建错误修复任务：pitfall/build 类历史记忆与本任务高度相关，加权前置，
-            // 让 Agent 在动手修复前优先看到本工程历史上踩过的同类坑与已验证解法
-            let is_build_fix = content.contains("构建错误")
-                || content.contains("build") && content.contains("错误")
-                || content.contains("ArkTS")
-                || content.contains("自动修复");
-            let cat_boost = if is_build_fix { 3.0 } else { 0.0 };
-            // 候选：最多拉 100 条（enabled=1、非 path），关键词为空时按时间倒序取最近
+        // 记忆相关性排序：从当前任务消息提取关键词，用 BM25 + 位置权重（标题双份
+        // 注入） + 时间衰减的相关性打分排前（无关键词时回退按更新时间倒序取最近候选）
+        let keywords = extract_memory_keywords(&content);
+        // 构建错误修复任务：pitfall/build 类历史记忆与本任务高度相关，加权前置，
+        // 让 Agent 在动手修复前优先看到本工程历史上踩过的同类坑与已验证解法
+        let is_build_fix = content.contains("构建错误")
+            || content.contains("build") && content.contains("错误")
+            || content.contains("ArkTS")
+            || content.contains("自动修复");
+        let cat_boost = if is_build_fix { 3.0 } else { 0.0 };
+        // 候选：最多拉 100 条（enabled=1、非 path），关键词为空时按时间倒序取最近
+        let mut stmt = conn
+            .prepare(
+                "SELECT category, title, content, updated_at FROM project_memories
+                 WHERE project_id = ?1 AND enabled = 1 AND category != 'path'
+                 ORDER BY updated_at DESC LIMIT 100",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([&project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let cands: Vec<(String, String, String, i64)> =
+            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+        // 纠偏（反馈联动）：加载本项目负反馈词袋（用户点踩过的历史回复高频词），
+        // 命中 ≥2 个不同词的记忆与不期望内容强相关，剔除不注入；命中 1 个的排到
+        // 末尾（弱相关降权），让"踩过的坑"不再反复出现在上下文中
+        let neg_terms: Vec<String> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT category, title, content, updated_at FROM project_memories
-                     WHERE project_id = ?1 AND enabled = 1 AND category != 'path'
-                     ORDER BY updated_at DESC LIMIT 100",
+                    "SELECT term FROM feedback_terms WHERE project_id = ?1 AND polarity = 'neg'",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
-                .query_map([&project_id], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                })
+                .query_map([&project_id], |r| r.get::<_, String>(0))
                 .map_err(|e| e.to_string())?;
-            let cands: Vec<(String, String, String, i64)> =
-                rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-            if cands.is_empty() {
-                Vec::new()
-            } else if keywords.is_empty() {
-                cands.into_iter().map(|(c, t, b, _)| (c, t, b)).collect()
-            } else {
-                // 内存打分：TF + 标题权重 + 时间衰减 + 构建场景类别加权
-                let params = crate::utils::relevance::RankParams {
-                    cat_boost,
-                    ..Default::default()
-                };
-                let refs: Vec<(String, String, Option<i64>)> = cands
+            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+        };
+        let cands = if neg_terms.is_empty() {
+            cands
+        } else {
+            let mut keep: Vec<(String, String, String, i64)> = Vec::new();
+            let mut weak: Vec<(String, String, String, i64)> = Vec::new();
+            for c in cands {
+                let hits = neg_terms
                     .iter()
-                    .map(|(_, t, c, u)| (t.clone(), c.clone(), Some(*u)))
-                    .collect();
-                let idxs = crate::utils::relevance::rank_candidates(&keywords, &refs, &params, 30);
-                idxs.into_iter().map(|i| (cands[i].0.clone(), cands[i].1.clone(), cands[i].2.clone())).collect()
+                    .filter(|w| c.1.contains(w.as_str()) || c.2.contains(w.as_str()))
+                    .count();
+                if hits >= 2 {
+                    continue;
+                }
+                if hits == 1 {
+                    weak.push(c);
+                } else {
+                    keep.push(c);
+                }
             }
+            keep.extend(weak);
+            keep
+        };
+        let memories: Vec<(String, String, String)> = if cands.is_empty() {
+            Vec::new()
+        } else if keywords.is_empty() {
+            cands.iter().map(|(c, t, b, _)| (c.clone(), t.clone(), b.clone())).collect()
+        } else {
+            // 内存打分：BM25（rank_candidates 内部）+ 时间衰减 + 构建场景类别加权
+            let params = crate::utils::relevance::RankParams {
+                cat_boost,
+                ..Default::default()
+            };
+            let refs: Vec<(String, String, Option<i64>)> = cands
+                .iter()
+                .map(|(_, t, c, u)| (t.clone(), c.clone(), Some(*u)))
+                .collect();
+            let idxs = crate::utils::relevance::rank_candidates(&keywords, &refs, &params, 30);
+            idxs.into_iter().map(|i| (cands[i].0.clone(), cands[i].1.clone(), cands[i].2.clone())).collect()
         };
         if memories.is_empty() {
             String::new()
         } else {
+            // front_page 置顶（对齐 Qwen-Agent front_page_search）：注入预算充足时，
+            // 把最近更新的 2 条记忆无条件置顶（最近更新 ≈ 当前工程状态总览，类似
+            // 单文档检索的“前 2 页 +∞ 置顶”）；预算不足（置顶估算将占满预算）时跳过
+            // 置顶（Qwen 同样 break）。关键词为空时候选已按时间倒序（前部兜底），
+            // 置顶无额外意义
+            let front: Vec<(String, String, String)> = if !keywords.is_empty() && cands.len() >= 2 {
+                cands.iter().take(2).map(|(c, t, b, _)| (c.clone(), t.clone(), b.clone())).collect()
+            } else {
+                Vec::new()
+            };
             // 注入护栏：每条内容截断 200 字符，总注入 ≤8000 字符（防记忆膨胀拖慢首字响应）
             let mut s = String::from("项目记忆（用户沉淀的工程经验，任务相关时优先参考）：\n");
             let mut total = 0usize;
+            // 预算充足检查：置顶 2 条估算 ×2 ≤ 总预算（Qwen：前 2 页 token×2 ≤ max_ref_token）
+            let front_est: usize = front
+                .iter()
+                .map(|(_, t, b)| t.chars().count() + b.trim().chars().take(200).count() + 12)
+                .sum();
+            if !front.is_empty() && front_est * 2 <= 8000 {
+                for (_, title, content) in front {
+                    let c: String = content.trim().chars().take(200).collect();
+                    total += title.chars().count() + c.chars().count() + 12;
+                    s.push_str(&format!("- [最近更新] {title}：{c}\n"));
+                }
+            }
             for (cat, title, content) in memories {
+                // 置顶条目已在头部，跳过重复注入
+                if s.contains(&format!("- [最近更新] {title}：")) {
+                    continue;
+                }
                 let c: String = content.trim().chars().take(200).collect();
                 total += title.chars().count() + c.chars().count() + 12;
                 if total > 8000 {
@@ -2706,6 +2974,16 @@ async fn stream_chat_inner(
     let mut empty_rounds = 0;
     // 连接中断自动续写计数：流式中途无数据超时后的“请继续”重试次数（上限 MAX_INTERRUPT_RETRY_ROUNDS）
     let mut interrupted_rounds = 0;
+    // 产出前中断重放计数：0 产出中断时冻结请求原样重发（上限 MAX_STREAM_REPLAYS）
+    let mut stream_replays = 0;
+    // 工具循环检测状态（对齐 qwen-code LoopDetectionService 轻量版）：
+    // 连续相同调用（name+args）/ 连续同名调用（不管参数）/ 每轮工具调用总数
+    let mut turn_tool_calls: usize = 0;
+    let mut last_tool_call_key: Option<String> = None;
+    let mut tool_call_repeat: usize = 0;
+    let mut last_tool_name: Option<String> = None;
+    let mut same_name_streak: usize = 0;
+    let mut loop_breaks: usize = 0;
     let mut continuation_text = String::new();
     // 多模态图片附加计数：已附加到请求的图片数（用户首轮上传 + 工具轮次 take_screenshot 产生的截图），
     // 每轮只附加新增部分到最新 user 消息（通常是刚注入的工具结果），避免重复注入历史图
@@ -2714,6 +2992,8 @@ async fn stream_chat_inner(
     let mut fake_corrections = 0;
     // 未完话术纠正次数（防死循环）：模型承诺“还需读取/继续查看”但未输出标记时注入纠正提示
     let mut pending_action_corrections = 0;
+    // 行动承诺假完成纠正次数（防死循环）：模型宣布开始开发/创建/实现或仅输出方案计划但未输出标记时注入纠正提示
+    let mut action_commitment_corrections = 0;
     // 纠正注入状态（假调用/未完话术共用）：检测发生在 stream 之后，下一轮组装消息时注入，
     // 避免直接 push 到 messages 后因每轮重建而丢失
     let mut correction_text = String::new();
@@ -2897,6 +3177,15 @@ async fn stream_chat_inner(
         };
         let mut messages: Vec<serde_json::Value> =
             vec![serde_json::json!({ "role": "system", "content": prompt_now.clone() })];
+        // 关键记忆回放注入（对齐 Qwen-Agent MemoAssistant）：从历史消息重放 memorize
+        // 工具调用重建键值状态，每轮作为 system 注入（量小成本低），模型无需专门
+        // 读取——状态与消息历史天然一致，滚动摘要/时间旅行后自动正确
+        if let Some(memo) = {
+            let conn = state.0.lock().ok();
+            conn.as_ref().and_then(|c| replay_memories(c, &conversation_id))
+        } {
+            messages.push(serde_json::json!({ "role": "system", "content": memo }));
+        }
         // 任务账本（Ledger 协议）：从工具执行轨迹派生，每轮作为 system 消息注入（状态外部化，
         // 防长任务“忘记已做过什么/卡在哪一步”）；首轮无执行轨迹时若有上次未完成任务账本
         // （断点续跑）先注入旧账本，续跑期间按新执行轨迹更新；同时构造 ledger_now 供事件推送
@@ -2928,6 +3217,19 @@ async fn stream_chat_inner(
                 },
             );
         }
+        // 会话快照（时间旅行）：每轮执行后保存状态锚点（消息 rowid + 账本 + 摘要），
+        // 用户可“回到此处”从历史决策点重新引导；无执行痕迹的首轮不保存。
+        // 失败不阻塞主循环（快照是增值能力，丢一轮无碍）
+        {
+            let Ok(conn) = state.0.lock() else { return Err("数据库锁不可用".into()) };
+            let _ = save_conversation_snapshot(
+                &conn,
+                &conversation_id,
+                ledger_now.as_ref(),
+                &last_model_text,
+                tool_runs.len(),
+            );
+        }
         // 早期对话滚动摘要（上下文超限时生成）：作为 system 消息注入，保住被裁剪历史的决策信息
         if let Some(ref summary) = context_summary {
             messages.push(serde_json::json!({
@@ -2947,24 +3249,24 @@ async fn stream_chat_inner(
             let conn = state.0.lock().map_err(|e| e.to_string())?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT role, content, references_json FROM messages
-                     WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0
+                    "SELECT role, content, references_json, reasoning FROM messages
+                     WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0 AND hidden = 0
                      ORDER BY created_at DESC LIMIT ?2",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map(
                     rusqlite::params![&conversation_id, history_limit as i64],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?)),
                 )
                 .map_err(|e| e.to_string())?;
-            let mut history: Vec<(String, String, Option<String>)> =
+            let mut history: Vec<(String, String, Option<String>, Option<String>)> =
                 rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
             history.reverse();
             // 释放锁后注入引用（读文件 IO 不放锁内）；先释放 stmt 借用再解锁
             drop(stmt);
             drop(conn);
-            for (role, text, refs_json) in history {
+            for (role, text, refs_json, reasoning) in history {
                 match role.as_str() {
                     "assistant" => {
                         let cleaned = crate::agent::tools::sanitize_markers(&text);
@@ -2973,7 +3275,17 @@ async fn stream_chat_inner(
                         if cleaned.chars().count() < 300 && has_pending_action_phrase(&cleaned) {
                             messages.push(serde_json::json!({ "role": "user", "content": "（此前有一轮未执行的过渡回复，已省略）" }));
                         } else {
-                            messages.push(serde_json::json!({ "role": "assistant", "content": cleaned }));
+                            // DeepSeek 推理模型多轮合规（官方 thinking_mode 文档硬性要求）：
+                            // 携带 tools 参数的请求在后续所有请求中必须完整回传 reasoning_content，
+                            // 缺失会导致 400 报错或思考链断裂（Reasonix missing_reasoning_watch 同源）；
+                            // 未携带 tools 时服务端忽略该字段，回传双向安全。
+                            let mut m = serde_json::json!({ "role": "assistant", "content": cleaned });
+                            if let Some(r) = reasoning.as_deref() {
+                                if !r.trim().is_empty() {
+                                    m["reasoning_content"] = serde_json::json!(r);
+                                }
+                            }
+                            messages.push(m);
                         }
                     }
                     "tool" => {
@@ -2987,8 +3299,13 @@ async fn stream_chat_inner(
                         messages.push(serde_json::json!({ "role": "user", "content": format!("[工具执行结果 - {name}]\n{out_trimmed}{suffix}") }));
                     }
                     _ => {
-                        // @ 引用重放：历史 user 消息带 references_json 时注入对应文件内容
-                        let injected = inject_references(&project_path, &text, refs_json.as_deref())?;
+                        // @ 引用重放：历史 user 消息带 references_json 时注入对应内容
+                        // （文件内容 / conv: 会话摘要），不阻塞发送；本循环已在锁外运行，
+                        // conv: 会话摘要的 DB 查询现场取锁（点查开销极小）
+                        let injected = {
+                            let conn = state.0.lock().map_err(|e| e.to_string())?;
+                            inject_references(&conn, &project_path, &text, refs_json.as_deref())?
+                        };
                         messages.push(serde_json::json!({ "role": "user", "content": injected }));
                     }
                 }
@@ -3179,6 +3496,7 @@ async fn stream_chat_inner(
                 &provider,
                 &model_choice,
                 &conversation_id,
+                context_budget,
                 old_limit,
                 history_limit,
                 context_summary.take(),
@@ -3371,6 +3689,8 @@ async fn stream_chat_inner(
             &cancel,
             registry,
             stats,
+            &state,
+            &mut placeholder_msg_id,
         )
         .await
         {
@@ -3397,6 +3717,7 @@ async fn stream_chat_inner(
                     &provider,
                     &model_choice,
                     &conversation_id,
+                    context_budget,
                     old_limit,
                     history_limit,
                     context_summary.take(),
@@ -3537,6 +3858,7 @@ async fn stream_chat_inner(
             &model_choice.model,
             &mut placeholder_msg_id,
             &full,
+            &reasoning_full,
         )?;
 
         // 原生 function calling（OpenAI 兼容协议 tool_calls）与文本标记协议合并：
@@ -3642,6 +3964,58 @@ async fn stream_chat_inner(
                         "elapsed_ms": task_started.elapsed().as_millis() as i64,
                     }),
                 );
+                // 工具循环检测（对齐 qwen-code LoopDetectionService 轻量版）：
+                // 连续相同调用（name+args）≥5 次或连续同名（不管参数）≥8 次判定打转，
+                // 命中后清空已排队批次并注入纠正提示让模型换方案（不重复执行）；
+                // 每轮总调用超硬上限（1000）无条件中止，防参数变化逃逸重复检测；
+                // 纠正提示后模型仍循环时最多打断 MAX_LOOP_BREAKS 次，之后直接收尾
+                turn_tool_calls += 1;
+                let call_key = format!("{tool}|{args_raw}");
+                if last_tool_call_key.as_deref() == Some(call_key.as_str()) {
+                    tool_call_repeat += 1;
+                } else {
+                    last_tool_call_key = Some(call_key);
+                    tool_call_repeat = 1;
+                }
+                if last_tool_name.as_deref() == Some(tool.as_str()) {
+                    same_name_streak += 1;
+                } else {
+                    last_tool_name = Some(tool.to_string());
+                    same_name_streak = 1;
+                }
+                let stuck = tool_call_repeat >= TOOL_CALL_LOOP_THRESHOLD
+                    || same_name_streak >= TOOL_NAME_STAGNATION_THRESHOLD;
+                // 软上限（100）：超过后只要存在弱重复信号（连续 3 次相同调用）即中止——
+                // 长任务后期模型容易在收尾阶段重复同一验证命令，不必等满 5 次；
+                // 硬上限（1000）：无条件中止，防参数变化逃逸重复检测
+                let halt = stuck
+                    || (turn_tool_calls > MAX_TOOL_CALLS_PER_TURN && tool_call_repeat >= 3)
+                    || turn_tool_calls > MAX_TOOL_CALLS_HARD;
+                if halt {
+                    loop_breaks += 1;
+                    crate::utils::logger::log_event(
+                        "tool_loop_detected",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "tool": tool,
+                            "repeat": tool_call_repeat,
+                            "same_name": same_name_streak,
+                            "turn_calls": turn_tool_calls,
+                            "breaks": loop_breaks,
+                        }),
+                    );
+                    pending.clear();
+                    if loop_breaks > MAX_LOOP_BREAKS {
+                        exhausted = true;
+                    } else {
+                        correction_text = String::new();
+                        correction_hint = format!(
+                            "（系统检测到工具调用循环：工具 {tool} 已连续重复调用 {} 次（连续同名 {} 次，本轮共 {} 次调用）。重复执行只会得到相同结果。请立即停止当前路径，改用其他工具/思路推进；若确实无法推进，请直接给出结论总结与所需条件。）",
+                            tool_call_repeat, same_name_streak, turn_tool_calls
+                        );
+                    }
+                    break;
+                }
                 // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
                 if tool_runs.len() + pending.len() >= max_tool_rounds {
                     let round = (tool_runs.len() + 1) as u32;
@@ -3681,6 +4055,8 @@ async fn stream_chat_inner(
                         &cancel,
                         registry,
                         stats,
+                        &state,
+                        &mut placeholder_msg_id,
                     )
                     .await;
                     if !summary.trim().is_empty() {
@@ -3884,6 +4260,8 @@ async fn stream_chat_inner(
                             &cancel,
                             registry,
                             stats,
+                            &state,
+                            &mut placeholder_msg_id,
                         )
                         .await;
                         if !summary.trim().is_empty() {
@@ -4273,6 +4651,31 @@ async fn stream_chat_inner(
                     .to_string();
             continue;
         }
+        // 产出前中断重放（冻结请求）：流在输出任何可见内容（正文/工具调用）之前就中断
+        // （服务端断流/代理重置）时，直接以完全相同的 payload 重发原始请求——
+        // 模型无需重新思考、prompt 缓存不失效（对齐 DeepSeek-Reasonix 冻结请求重放）。
+        // 思考链（reasoning）产出不阻塞重放（对齐 qwen-code #7832）：reasoning 是瞬态内容、
+        // 不进入对话历史，重放不会重复任何可见输出；且思考模型在思考阶段往往耗时数分钟，
+        // 正是网关关闭长 SSE 连接的高发期——此时冻结重放比“请继续”续写更可靠
+        // （续写依赖服务端保留会话状态，断流后可能失效）。已产出正文/工具调用的中断
+        // 走下方续写分支（保留已收内容从断点继续）。重放时 messages 自上次请求以来
+        // 未被修改，payload 与首次请求一致。
+        if outcome.interrupted
+            && text.trim().is_empty()
+            && outcome.tool_calls.is_empty()
+            && stream_replays < MAX_STREAM_REPLAYS
+        {
+            stream_replays += 1;
+            crate::utils::logger::log_event(
+                "stream_replay",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "attempt": stream_replays,
+                    "total": MAX_STREAM_REPLAYS,
+                }),
+            );
+            continue;
+        }
         // 连接中断自动续写：流式无数据超时（代理悬挂/服务端异常）时保留已收内容，
         // 自动重发“请继续”让模型从断点续写；连续多次仍中断则收尾并明确提示（不静默）
         if outcome.interrupted && interrupted_rounds < MAX_INTERRUPT_RETRY_ROUNDS {
@@ -4318,6 +4721,21 @@ async fn stream_chat_inner(
         if has_pending_action_phrase(&text) && pending_action_corrections > 0 {
             full.push_str("\n\n> ⚠️ 模型多次表示要继续执行但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
         }
+        // 防“行动承诺假完成”静默收尾：模型宣布“开始开发/创建/新建/实现”或仅输出方案计划
+        // （如“方案如下：新建 pages/Login.ets …”）但本轮未输出任何【TOOL】标记、无任何工具
+        // 被执行时，不结束任务（任务实际未执行却正常收尾），注入纠正提示要求立即输出标记执行
+        if has_action_commitment_phrase(&text)
+            && action_commitment_corrections < MAX_ACTION_COMMITMENT_CORRECTIONS
+        {
+            action_commitment_corrections += 1;
+            correction_text = crate::agent::tools::strip_tool_calls(&text);
+            correction_hint = "（系统检测到你的回复宣布了开始执行开发动作（如开始开发/创建/新建/实现/修改文件等）或仅输出了方案计划，但本轮没有输出任何工具调用标记，系统未执行任何操作。若任务未完成，请立即输出【TOOL|工具名|JSON参数】标记行实际执行（新建/修改文件、注册路由、构建部署等），不要只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
+            continue;
+        }
+        // 纠正多次后模型仍只输出方案不执行：向用户明确提示任务可能未完成，不再静默收尾
+        if has_action_commitment_phrase(&text) && action_commitment_corrections > 0 {
+            full.push_str("\n\n> ⚠️ 模型多次宣布开始执行/输出方案但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
+        }
         // ship 注册表审计：模型收尾总结中“已验证/测试通过/已修复”等完成声明未绑定具体
         // 验证范围（文件/模块/命令/截图等）时注入纠正要求补充或实际验证——防“声称完成却
         // 没验证”的虚假收尾（与收尾复核互补：复核问“是否真完成”，ship 查“完成声明是否
@@ -4342,7 +4760,15 @@ async fn stream_chat_inner(
         if !tool_runs.is_empty() && !outcome.interrupted && completion_reviews < MAX_COMPLETION_REVIEWS {
             completion_reviews += 1;
             correction_text = crate::agent::tools::strip_tool_calls(&text);
-            correction_hint = "（系统检测到你的回复为任务总结，但本任务此前已执行过工具。请确认任务是否已真正全部完成（含构建/部署/验证等必要步骤）：若确认已完成，请以『✅ 任务已完成』开头给出最终结论；若仍有未完成步骤或未经验证的环节，请直接输出【TOOL|工具名|JSON参数】标记行继续执行，本轮不要输出总结。）".to_string();
+            // 证据化完成确认（对齐 deepseek-harness goal-round-driver）：复核时带上任务
+            // 原始目标并要求引用完成证据（构建/测试/文件/截图），防“完成声明无验证背书”
+            // 的假收尾——与 task_guard 每轮 <goal_round> 注入、ship 注册表审计同一口径
+            let goal_note = crate::services::task_guard::current_goal(&conversation_id)
+                .map(|g| format!("本任务的目标是：{g}\n"))
+                .unwrap_or_default();
+            correction_hint = format!(
+                "（系统检测到你的回复为任务总结，但本任务此前已执行过工具。{goal_note}请对照目标逐项核对完成情况，并引用完成证据（构建成功输出/测试通过/文件内容/截图等）后再确认：若确认已完成，请以『✅ 任务已完成』开头给出最终结论（含证据）；若仍有未完成步骤或未经验证的环节，请直接输出【TOOL|工具名|JSON参数】标记行继续执行，本轮不要输出总结。）"
+            );
             continue;
         }
         if !tool_runs.is_empty() && !outcome.interrupted && completion_reviews >= MAX_COMPLETION_REVIEWS {
@@ -4418,6 +4844,8 @@ async fn request_final_summary(
     cancel: &ChatCancel,
     registry: &TaskRegistry,
     stats: &mut ChatRunStats,
+    state: &tauri::State<'_, DbState>,
+    placeholder: &mut Option<String>,
 ) -> String {
     let mut msgs = messages.to_vec();
     msgs.push(serde_json::json!({
@@ -4436,6 +4864,8 @@ async fn request_final_summary(
         cancel,
         registry,
         stats,
+        state,
+        placeholder,
     )
     .await
     {
@@ -4503,35 +4933,41 @@ fn persist_tool_run_immediate(
     );
 }
 
-/// 正文占位消息即时入库（防“最后一次入库”丢正文）：任务生成中每轮正文累积后
-/// 创建/更新一条 assistant 占位消息（duration_ms=NULL 标记未完成），任务正常结束时
-/// persist_turn 用最终内容 UPDATE 同一消息补全；任务中断（应用退出/崩溃/强杀）时
-/// 已生成部分保留在库中，前端据此识别“回复被中断”并提示一键继续生成。
+/// 正文占位消息即时入库（防“最后一次入库”丢正文）：任务生成中正文/reasoning 每累计
+/// 一定量同步创建/更新一条 assistant 占位消息（duration_ms=NULL 标记未完成），任务
+/// 正常结束时 persist_turn 用最终内容 UPDATE 同一消息补全；任务中断（应用退出/崩溃/
+/// 看门狗强杀）时已生成部分保留在库中，前端据此识别“回复被中断”并提示一键继续生成。
 fn upsert_placeholder_message(
     state: &tauri::State<'_, DbState>,
     conversation_id: &str,
     model: &str,
     placeholder: &mut Option<String>,
     full: &str,
+    reasoning: &str,
 ) -> Result<(), String> {
-    if full.trim().is_empty() {
+    if full.trim().is_empty() && reasoning.trim().is_empty() {
         return Ok(());
     }
+    let reasoning_val = if reasoning.trim().is_empty() {
+        None::<String>
+    } else {
+        Some(reasoning.to_string())
+    };
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     match placeholder {
         Some(id) => {
             // 已存在：更新为最新累计正文（幂等，崩溃后保留最近一次快照）
             let _ = conn.execute(
-                "UPDATE messages SET content = ?1 WHERE id = ?2 AND role = 'assistant'",
-                params![full, id.as_str()],
+                "UPDATE messages SET content = ?1, reasoning = ?2 WHERE id = ?3 AND role = 'assistant'",
+                params![full, reasoning_val, id.as_str()],
             );
         }
         None => {
             let id = Uuid::new_v4().to_string();
             conn.execute(
-                "INSERT INTO messages (id, conversation_id, role, content, model, created_at)
-                 VALUES (?1, ?2, 'assistant', ?3, ?4, ?5)",
-                params![id, conversation_id, full, model, now()],
+                "INSERT INTO messages (id, conversation_id, role, content, reasoning, model, created_at)
+                 VALUES (?1, ?2, 'assistant', ?3, ?4, ?5, ?6)",
+                params![id, conversation_id, full, reasoning_val, model, now()],
             )
             .map_err(|e| e.to_string())?;
             *placeholder = Some(id);
@@ -4767,6 +5203,133 @@ fn pick_fallback_model(state: &tauri::State<'_, DbState>, current: &ModelChoice)
 /// LLM 提供方能力接缝（Capability Seam）：协议特有的"流式请求构造"抽象为 trait。
 /// 主循环（stream_once）依赖抽象而非具体协议分支；新增协议 = 实现 LlmProvider 并注册到工厂。
 /// 增量解析（SSE 增量/思考/结束标记）由 utils::net 按协议字符串统一处理，此处不再重复。
+// ---------- DeepSeek 推理模型 reasoning 合规（对齐 DeepSeek-TUI 最终净化器） ----------
+// 官方 thinking_mode 文档硬性要求：携带 tools 参数的请求在后续所有请求中必须完整回传
+// reasoning_content，缺失会 400。但历史/续写/纠正等路径构造的 assistant 消息并不保证
+// 带 reasoning（如关闭思考模式时期产生的旧消息），因此发送前做统一裁决：
+// - 非推理模型：剥离 reasoning_content（其他模型的兼容端点不认识该字段，回传反而可能 400）；
+// - 推理模型且 effort 未显式关闭：缺失/为空的 assistant 消息填 "(reasoning omitted)" 占位符
+//   （占位符在无工具调用时被服务端忽略，双向安全）。
+
+/// 模型名判定是否为 DeepSeek 推理模型（v3.2/v4/reasoner/-reasoning/-thinking/deepseek-r 数字系列）
+fn requires_reasoning_content(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("deepseek-v3.2")
+        || lower.contains("deepseek-v4")
+        || lower.contains("reasoner")
+        || lower.contains("-reasoning")
+        || lower.contains("-thinking")
+        || {
+            // deepseek-r 后接数字（deepseek-r1 / deepseek-r2 等）
+            const PREFIX: &str = "deepseek-r";
+            lower
+                .match_indices(PREFIX)
+                .any(|(idx, _)| lower[idx + PREFIX.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
+        }
+}
+
+/// 是否应回传/占位 reasoning_content：推理模型且 effort 未显式关闭（off/disabled/none/false）
+fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
+    let disabled = effort.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "disabled" | "none" | "false"
+        )
+    });
+    !disabled && requires_reasoning_content(model)
+}
+
+/// 最终净化器：返回净化后的消息副本（不修改入参）。
+/// 返回 (净化后消息, 占位符替换数, 回传 reasoning 总字符数)。
+fn sanitize_thinking_messages(
+    messages: &[serde_json::Value],
+    model: &str,
+    effort: Option<&str>,
+) -> (Vec<serde_json::Value>, u32, u64) {
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+    let mut substitutions: u32 = 0;
+    let mut replay_chars: u64 = 0;
+    let replay = should_replay_reasoning_content(model, effort);
+    for m in messages {
+        let mut mm = m.clone();
+        if !replay {
+            // 非推理模型：剥离字段，防兼容端点不认识而报错
+            if let serde_json::Value::Object(map) = &mut mm {
+                map.remove("reasoning_content");
+            }
+        } else if let serde_json::Value::Object(map) = &mut mm {
+            let missing = map
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|s| s.trim().is_empty());
+            if map.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                && missing
+            {
+                map.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::json!("(reasoning omitted)"),
+                );
+                substitutions = substitutions.saturating_add(1);
+            }
+            if let Some(r) = map.get("reasoning_content").and_then(serde_json::Value::as_str) {
+                replay_chars = replay_chars.saturating_add(r.len() as u64);
+            }
+        }
+        out.push(mm);
+    }
+    (out, substitutions, replay_chars)
+}
+
+/// 400 诊断：遍历消息，输出仍缺 reasoning_content 的 assistant 消息（标注是否带 tool_calls），
+/// 用于定位绕过净化器的代码路径（对齐 DeepSeek-TUI log_thinking_mode_violations）。
+fn log_thinking_mode_violations(messages: &[serde_json::Value]) {
+    let mut violations: Vec<String> = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let reasoning = msg
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if reasoning.trim().is_empty() {
+            violations.push(format!(
+                "assistant[{idx}] (reasoning_content missing, tool_calls={})",
+                msg.get("tool_calls").is_some()
+            ));
+        }
+    }
+    crate::utils::logger::log_event(
+        "thinking_mode_400_diagnosis",
+        serde_json::json!({
+            "violations": violations,
+            "note": if violations.is_empty() {
+                "all assistant messages have reasoning_content — rejected for another reason"
+            } else {
+                "assistant messages lacking reasoning_content"
+            },
+        }),
+    );
+}
+
+/// 渲染传输层头部（解码/断流错误日志用）：区分 gzip 压缩损坏 / chunked 截断 / HTTP/2 RST_STREAM
+fn format_stream_headers(headers: &reqwest::header::HeaderMap) -> String {
+    const FIELDS: &[&str] = &["content-encoding", "transfer-encoding", "connection", "server"];
+    FIELDS
+        .iter()
+        .map(|f| {
+            format!(
+                "{f}={}",
+                headers
+                    .get(*f)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("(absent)")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 trait LlmProvider: Send + Sync {
     /// 构造流式请求（URL/headers/body 由协议决定），返回可发送的 RequestBuilder。
     /// native_tools：原生 function calling 工具 schema（OpenAI 兼容协议注入 tools；
@@ -4813,9 +5376,27 @@ impl LlmProvider for OpenAiProvider {
         native_tools: Option<&[serde_json::Value]>,
     ) -> reqwest::RequestBuilder {
         let base = provider.base_url.trim_end_matches('/');
+        // DeepSeek 推理模型多轮合规最终净化器（对齐 DeepSeek-TUI sanitize_thinking_mode_messages）：
+        // 发送前统一裁决——非推理模型剥离 reasoning_content；推理模型对缺失/为空的 assistant
+        // 消息填 "(reasoning omitted)" 占位符（携带 tools 的请求缺失会 400）。历史构造、续写、
+        // 纠正等任意来源的 assistant 消息都经此兜底，历史构造处的回传只是第一层。
+        let (messages_san, substitutions, replay_chars) =
+            sanitize_thinking_messages(messages, &model_choice.model, opts.reasoning_effort.as_deref());
+        if substitutions > 0 || replay_chars > 0 {
+            crate::utils::logger::log_event(
+                "reasoning_replay",
+                serde_json::json!({
+                    "model": model_choice.model,
+                    "substitutions": substitutions,
+                    "replay_chars": replay_chars,
+                    // ~4 字符/token 粗估：让输入预算消耗可见（对齐 DeepSeek-TUI 回传量遥测）
+                    "approx_tokens": replay_chars / 4,
+                }),
+            );
+        }
         let mut body = serde_json::json!({
             "model": model_choice.model,
-            "messages": messages,
+            "messages": messages_san,
             "stream": true,
             // 显式默认输出上限：Kimi K3 等经网关且不传 max_tokens 会静默截断；
             // 取模型配置 output_limit（推理模型 reasoning 很耗预算，4096 容易被思考耗尽、正文出不来）
@@ -4853,7 +5434,17 @@ impl LlmProvider for AnthropicProvider {
     ) -> reqwest::RequestBuilder {
         let base = provider.base_url.trim_end_matches('/');
         let system = messages[0]["content"].as_str().unwrap_or("").to_string();
-        let history: Vec<serde_json::Value> = messages[1..].to_vec();
+        // Anthropic 协议不认识 OpenAI 的 reasoning_content 字段，剥离（reasoning 合规回传仅 OpenAI 协议）
+        let history: Vec<serde_json::Value> = messages[1..]
+            .iter()
+            .map(|m| {
+                let mut mm = m.clone();
+                if let serde_json::Value::Object(map) = &mut mm {
+                    map.remove("reasoning_content");
+                }
+                mm
+            })
+            .collect();
         let mut body = serde_json::json!({
             "model": model_choice.model,
             "max_tokens": opts.max_tokens.unwrap_or(model_choice.output_limit),
@@ -4884,7 +5475,17 @@ impl LlmProvider for GeminiProvider {
     ) -> reqwest::RequestBuilder {
         let base = provider.base_url.trim_end_matches('/');
         let system = messages[0]["content"].as_str().unwrap_or("").to_string();
-        let history: Vec<serde_json::Value> = messages[1..].to_vec();
+        // Gemini 协议不认识 OpenAI 的 reasoning_content 字段，剥离（净化器统一裁决非推理模型剥离）
+        let history: Vec<serde_json::Value> = messages[1..]
+            .iter()
+            .map(|m| {
+                let mut mm = m.clone();
+                if let serde_json::Value::Object(map) = &mut mm {
+                    map.remove("reasoning_content");
+                }
+                mm
+            })
+            .collect();
         let contents: Vec<serde_json::Value> = history
             .iter()
             .map(|m| {
@@ -4996,13 +5597,64 @@ mod llm_provider_tests {
     fn openai_request_without_tools_has_no_tools_field() {
         let client = reqwest::Client::new();
         let opts = ChatOptions::default();
-        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let messages = vec![serde_json::json!({ "role": "user", "content": "hi" })];
         let req = llm_provider_for("openai")
             .build_stream_request(&client, &sample_provider("openai"), &sample_model(), &opts, &messages, None)
             .build()
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn requires_reasoning_content_matches_deepseek_reasoning_models() {
+        assert!(requires_reasoning_content("deepseek-v4-flash"));
+        assert!(requires_reasoning_content("deepseek-v3.2"));
+        assert!(requires_reasoning_content("deepseek-reasoner"));
+        assert!(requires_reasoning_content("deepseek-r1"));
+        assert!(requires_reasoning_content("some-model-thinking"));
+        assert!(!requires_reasoning_content("gpt-4o"));
+        assert!(!requires_reasoning_content("qwen2.5-coder"));
+        // deepseek-r 后无数字不算推理系列
+        assert!(!requires_reasoning_content("deepseek-rmod"));
+    }
+
+    #[test]
+    fn should_replay_reasoning_content_respects_effort() {
+        // 推理模型 + effort 未关闭 → 回传
+        assert!(should_replay_reasoning_content("deepseek-v4-flash", None));
+        assert!(should_replay_reasoning_content("deepseek-v4-flash", Some("high")));
+        // effort 显式关闭 → 不回传
+        assert!(!should_replay_reasoning_content("deepseek-v4-flash", Some("off")));
+        assert!(!should_replay_reasoning_content("deepseek-v4-flash", Some("disabled")));
+        assert!(!should_replay_reasoning_content("deepseek-v4-flash", Some("FALSE")));
+        // 非推理模型 → 不回传
+        assert!(!should_replay_reasoning_content("gpt-4o", None));
+    }
+
+    #[test]
+    fn sanitizer_places_placeholder_and_strips_for_non_reasoning_models() {
+        let messages = vec![
+            serde_json::json!({ "role": "user", "content": "hi" }),
+            serde_json::json!({ "role": "assistant", "content": "旧消息无 reasoning" }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "新消息",
+                "reasoning_content": "已有思考链"
+            }),
+        ];
+        // 推理模型：缺失/为空的 assistant 消息填占位符，已有 reasoning 原样保留
+        let (san, subs, replay_chars) = sanitize_thinking_messages(&messages, "deepseek-v4-flash", None);
+        assert_eq!(subs, 1, "应替换 1 条缺失 reasoning 的 assistant 消息");
+        assert_eq!(san[1]["reasoning_content"], "(reasoning omitted)");
+        assert_eq!(san[2]["reasoning_content"], "已有思考链");
+        assert_eq!(san[0].get("reasoning_content"), None, "user 消息不动");
+        assert!(replay_chars > 0, "应统计回传字符数");
+        // 非推理模型：全部剥离 reasoning_content（防兼容端点不认识而 400）
+        let (san2, subs2, _) = sanitize_thinking_messages(&messages, "gpt-4o", None);
+        assert_eq!(subs2, 0, "非推理模型不占位");
+        assert_eq!(san2[2].get("reasoning_content"), None, "应剥离 reasoning_content");
+        assert_eq!(san2[1].get("reasoning_content"), None);
     }
 }
 
@@ -5019,6 +5671,8 @@ async fn stream_once(
     cancel: &ChatCancel,
     registry: &TaskRegistry,
     stats: &mut ChatRunStats,
+    state: &tauri::State<'_, DbState>,
+    placeholder: &mut Option<String>,
 ) -> Result<StreamOutcome, FriendlyError> {
     // 能力接缝：按协议解析出提供方实现，协议特有的请求构造由 trait 承担
     let provider_impl = llm_provider_for(protocol);
@@ -5093,13 +5747,20 @@ async fn stream_once(
             let resp = build_req().send().await.map_err(|e| transport_error(&e))?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                // 尊重 Provider 的 Retry-After（限流时按服务端建议等待）
+                // 尊重 Provider 的 Retry-After（限流时按服务端建议等待；对齐 qwen-code
+                // retryPolicy：数字秒与 HTTP-date 双形态解析，解析失败退回指数退避）
                 let retry_after = resp
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<u64>().ok());
+                    .and_then(parse_retry_after_secs);
                 let text = resp.text().await.unwrap_or_default();
+                // DeepSeek 思考模式 400 诊断：报错提及 reasoning_content 时遍历消息，
+                // 输出仍缺该字段的 assistant 消息（定位绕过净化器的代码路径，
+                // 对齐 DeepSeek-TUI log_thinking_mode_violations）
+                if text.contains("reasoning_content") {
+                    log_thinking_mode_violations(messages);
+                }
                 return Err(provider_error_with_retry_after(status.as_u16(), &text, retry_after));
             }
             Ok(resp)
@@ -5141,6 +5802,9 @@ async fn stream_once(
     };
     stats.retry_count += (retried.attempts - 1) as i64;
     let resp = retried.value?;
+    // 传输头快照：解码/断流错误日志带 content-encoding 等字段，
+    // 区分 gzip 压缩损坏 / chunked 截断 / HTTP/2 RST_STREAM（对齐 DeepSeek-TUI #103 诊断）
+    let stream_headers = format_stream_headers(resp.headers());
     // 请求前用户已点停止：不再消费响应
     if is_cancelled(cancel, conversation_id) {
         return Ok(StreamOutcome {
@@ -5168,6 +5832,11 @@ async fn stream_once(
     let mut stream = resp.bytes_stream();
     // 录制缓冲（Record 模式）：原始 SSE 块逐字节收集，正常结束后落盘
     let mut rec_buf: Option<Vec<u8>> = replay_key.as_ref().map(|_| Vec::new());
+    // 正文增量落库水位：full/reasoning 累计超过阈值即同步占位消息。
+    // 看门狗 abort 直接取消任务、主循环收尾不会执行，流循环内定期落库是
+    // 强杀/崩溃前唯一能保住已产出内容的路径；阈值防每次 delta 都触发 DB 写
+    let mut persist_watermark = 0usize;
+    let mut reasoning_watermark = 0usize;
     // 等待网络块期间也要能响应停止：每 200ms 轮询一次取消标志。
     // 原实现只在收到下一个 chunk 后检查，模型长时间不吐块（思考中/网络静默）时
     // 点击“停止生成”要等下一个块到达才生效，表现为停止不响应。
@@ -5185,11 +5854,12 @@ async fn stream_once(
     // 检查停止、记录进度——否则海量行响应会把线程拖进无心跳的长时间同步处理
     // （曾实测：单轮异常响应 → 同步解析 13 分钟无心跳，看门狗 8 分钟误杀，abort 因
     // 同步循环无法中断，线程继续空烧约 5 分钟才自行结束）。
-    // 同时设响应体积/单行上限：超限立即中断报错，防止异常巨大流持续消耗资源。
-    const STREAM_MAX_BYTES: usize = 16 * 1024 * 1024; // 累计响应字节上限（16MB ≈ 正常任务响应的百倍裕量）
-    const STREAM_MAX_LINE: usize = 1024 * 1024; // 单行字节上限（超限行跳过解析）
+    // 体量类上限仅防异常无限流兜底：正常大输出/长响应（体积、时长、单行）不强制关闭，
+    // 停滞由看门狗“数据到达”判据与下方 STREAM_SILENT_TIMEOUT 负责。
+    const STREAM_MAX_BYTES: usize = 256 * 1024 * 1024; // 累计响应字节上限（256MB，仅异常无限流兜底；正常任务百倍裕量）
+    const STREAM_MAX_LINE: usize = 4 * 1024 * 1024; // 单行字节上限（4MB，覆盖超大 JSON 工具参数；超限行跳过解析防烧 CPU）
     const STREAM_YIELD_LINES: usize = 512; // 每批最大处理行数
-    const STREAM_PARSE_MAX_SECS: u64 = 300; // 单轮流式总处理时长上限（超时中断，兜底最坏情况）
+    const STREAM_PARSE_MAX_SECS: u64 = 120; // 单轮流式累计处理时长（超过仅记录日志，不中断：大输出/长响应是正常行为）
     let mut total_bytes: usize = 0;
     let mut lines_parsed: usize = 0;
     let parse_started = tokio::time::Instant::now();
@@ -5207,6 +5877,12 @@ async fn stream_once(
             let mut batch = 0;
             let progress_before = last_progress_at;
             while batch < STREAM_YIELD_LINES {
+                // 每 64 行让出一次执行权：批处理是纯同步循环，若整批无 yield，看门狗
+                // abort 只能在下个 await 点生效，异常巨大响应会把线程钉死数分钟满核空烧。
+                // 被 abort 的任务在下一次 poll 直接终止，无需显式检查取消。
+                if batch % 64 == 0 {
+                    tokio::task::yield_now().await;
+                }
                 let Some(pos) = buffer[consumed..].iter().position(|b| *b == b'\n') else {
                     break; // 尾部残片（无换行），留待后续 chunk 合并后再处理
                 };
@@ -5298,32 +5974,53 @@ async fn stream_once(
             // 海量行时总拷贝量 O(n²) 成为长同步处理的主要耗时）
             buffer.drain(..consumed);
             registry.touch(conversation_id, PHASE_STREAMING);
+            // 正文增量落库：产出每累计 ~8KB 同步一次占位消息（duration_ms=NULL 标记未完成）。
+            // 看门狗强杀/崩溃无法执行主循环收尾时，此处保住已产出内容（abort 在下一个
+            // await 点生效，同步落库能在取消前完成）；622KB 约 76 次 UPDATE，毫秒级无感。
+            if full.len() - persist_watermark >= 8192 || reasoning_full.len() - reasoning_watermark >= 8192
+            {
+                persist_watermark = full.len();
+                reasoning_watermark = reasoning_full.len();
+                if let Err(e) = upsert_placeholder_message(
+                    state,
+                    conversation_id,
+                    &model_choice.model,
+                    placeholder,
+                    &full,
+                    &reasoning_full,
+                ) {
+                    crate::utils::logger::log_event(
+                        "stream_persist_error",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "error": e,
+                        }),
+                    );
+                }
+            }
             // 仅当本批解析出有效产出（正文/思考/工具增量/结束标记）时才重置停滞 deadline，
             // 避免纯心跳/空 data 行持续刷新导致永不超时（退回无限转圈的老 bug）。
             if last_progress_at > progress_before {
                 stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
-                // 同步更新独立 OS 线程看门狗的"有效产出"时间戳。这是唯一不依赖
-                // tokio timer 的停滞判据：即便 worker 被同步代码钉死、上面的
-                // sleep_until 无法触发，看门狗也能在 60s 内强杀。
+                // 有效产出时间戳仅作排障信息；独立 OS 线程看门狗改用“数据到达”
+                // 时间戳（touch_stream_data）判停滞——大输出解析期间即使长时间无产出，
+                // 只要数据仍在到达就不强杀，避免大响应被误判为无产出而强关。
                 registry.touch_stream_progress(conversation_id);
             }
-            // 总时长上限：即使体积/行数均未超限，同步解析累计超过阈值也强制中断
-            // （防每行处理开销大的异常响应把线程拖垮），中断后可重试。
+            // 累计处理时长超过阈值仅记录日志（供排障），不中断：模型输出大/长响应时
+            // 解析耗时超过阈值是正常现象，强制中断会丢失已收内容；异常无限流由
+            // 看门狗“数据停滞”与下方 select! 停滞 deadline 兜底。
             if parse_started.elapsed().as_secs() > STREAM_PARSE_MAX_SECS {
                 crate::utils::logger::log_event(
-                    "stream_parse_timeout",
+                    "stream_parse_slow",
                     serde_json::json!({
                         "conversation_id": conversation_id,
                         "lines_parsed": lines_parsed,
                         "total_bytes": total_bytes,
                         "elapsed_secs": parse_started.elapsed().as_secs(),
-                        "max_secs": STREAM_PARSE_MAX_SECS,
+                        "note": "large_output_not_closed",
                     }),
                 );
-                return Err(FriendlyError::new(
-                    ErrorKind::Network,
-                    format!("流式响应处理超时(>{STREAM_PARSE_MAX_SECS}s)，已中断防止持续卡死"),
-                ));
             }
             // 进度日志：每 4096 行记录一次，异常巨大响应时留下可定位证据
             if lines_parsed % (STREAM_YIELD_LINES * 8) == 0 {
@@ -5334,6 +6031,11 @@ async fn stream_once(
                         "lines_parsed": lines_parsed,
                         "total_bytes": total_bytes,
                         "buffer_pending": buffer.len(),
+                        "produced_chars": full.len(),
+                        // 数据形态样本：首批 data 行与已产出尾部。零产出（produced_chars=0）
+                        // 时据此区分“格式不识别”（head 非空但字段没提取到）与“纯心跳/空行”。
+                        "head_chunk": usage_chunks.first().map(|s| s.chars().take(200).collect::<String>()),
+                        "tail_produced": full.chars().rev().take(200).collect::<String>(),
                     }),
                 );
             }
@@ -5357,6 +6059,9 @@ async fn stream_once(
                 });
             }
             if batch == STREAM_YIELD_LINES {
+                // 批间让出执行权：缓冲持续有货时此分支是纯同步循环，不经下方 select!
+                // 的 await 点，必须显式 yield 才能让停止/abort/看门狗强杀生效
+                tokio::task::yield_now().await;
                 continue; // 缓冲还有完整行：立即处理下一批，不等待网络
             }
         }
@@ -5397,7 +6102,9 @@ async fn stream_once(
                         first_byte_logged = true;
                         last_progress_at = tokio::time::Instant::now();
                         stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
-                        // 初始化独立看门狗的流式进度基线（首字节即视为一次产出）
+                        // 首字节即视为一次数据到达+有效产出：初始化看门狗的流式
+                        // 判据基线（数据到达），并保留产出基线供排障日志。
+                        registry.touch_stream_data(conversation_id);
                         registry.touch_stream_progress(conversation_id);
                         crate::utils::logger::log_event(
                             "stream_first_byte",
@@ -5408,9 +6115,34 @@ async fn stream_once(
                         );
                     }
                     last_chunk_at = tokio::time::Instant::now();
+                    // 数据到达打点：每收到一个 chunk 都刷新（无论是否解析出内容）。
+                    // 看门狗以它为停滞判据：大输出/长响应传输中数据持续到达，
+                    // 即使长时间无解析产出也不会被强杀；数据停滞才触发兜底。
+                    registry.touch_stream_data(conversation_id);
                     Some(bytes)
                 }
                 Some(Err(e)) => {
+                    // 错误链展开：reqwest 外层错误往往只是 "error decoding response body"，
+                    // 底层 hyper/h2/io 原因藏在 source 链里，展开后日志才能定位根因
+                    // （对齐 DeepSeek-TUI #103 诊断）；同时带字节/时间遥测与传输头。
+                    let mut error_chain = format!("{e}");
+                    let mut current: Option<&(dyn std::error::Error + 'static)> =
+                        std::error::Error::source(&e);
+                    while let Some(source) = current {
+                        error_chain.push_str(&format!(" -> {source}"));
+                        current = std::error::Error::source(source);
+                    }
+                    crate::utils::logger::log_event(
+                        "stream_read_error",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "error": error_chain,
+                            "bytes_received": total_bytes,
+                            "ms_since_last_chunk": last_chunk_at.elapsed().as_millis() as i64,
+                            "produced_chars": full.chars().count(),
+                            "headers": stream_headers,
+                        }),
+                    );
                     return Err(FriendlyError::new(
                         ErrorKind::Network,
                         format!("读取响应失败: {e}"),
@@ -5713,6 +6445,32 @@ fn has_pending_action_phrase(text: &str) -> bool {
         "创建", "删除", "更新", "看看", "处理", "读一下", "看下",
     ];
     PLAN_WORDS.iter().any(|p| text.contains(p)) && ACTION_WORDS.iter().any(|a| text.contains(a))
+}
+
+/// 行动承诺检测：模型宣布“开始开发/创建/新建/实现”等当前行动或仅输出方案计划（如
+/// “方案如下：新建 pages/Login.ets …”）但未输出任何【TOOL】标记时命中（任务实际未执行
+/// 却正常收尾），由主循环注入纠正提示继续。与 has_pending_action_phrase（承诺“还需/继续”
+/// 做某事）互补：本函数针对“现在就开始做”的承诺式表达与“只给计划不给执行”的假完成，
+/// 防“输出方案即收尾”静默结束。含总结/交付信号的不算。
+fn has_action_commitment_phrase(text: &str) -> bool {
+    // 总结/交付信号：命中即视为收尾，不再纠正（与未完话术检测同口径）
+    const DONE_SIGNALS: &[&str] = &[
+        "总结", "结论", "已完成", "以上就是", "以上是", "最终版", "效果如下",
+        "全部完成", "修改完成", "实施完成", "核查完成", "检查完成", "报告如下", "综上所述",
+    ];
+    if DONE_SIGNALS.iter().any(|s| text.contains(s)) {
+        return false;
+    }
+    // 承诺词：宣布“现在/即将开始做某事”或给出实施方案
+    const COMMIT_WORDS: &[&str] = &[
+        "开始", "我先", "我来", "现在", "继续", "接下来", "下一步", "准备", "方案",
+    ];
+    // 行动词：需要工具落地的开发动作（与未完话术的动作词互补，覆盖新建/开发/注册等）
+    const ACTION_WORDS: &[&str] = &[
+        "开发", "创建", "新建", "实现", "编写", "修改", "调整", "美化", "完善",
+        "优化", "部署", "构建", "接入", "注册", "增加", "添加", "设计", "迁移",
+    ];
+    COMMIT_WORDS.iter().any(|c| text.contains(c)) && ACTION_WORDS.iter().any(|a| text.contains(a))
 }
 
 /// 收尾复核的完成确认信号：复核轮模型被要求“若确认已完成，以『✅ 任务已完成』开头”，
@@ -6202,7 +6960,7 @@ async fn run_subagent(
         if is_cancelled(cancel, conversation_id) {
             return Err("子任务已终止（用户停止生成）".to_string());
         }
-        let text = non_stream_request(client, provider, model_choice, &messages, Some(cancel), conversation_id).await?;
+        let text = non_stream_request(client, provider, model_choice, &messages, Some(cancel), conversation_id, None).await?;
         crate::utils::logger::log_event(
             "subagent_round",
             serde_json::json!({
@@ -6695,7 +7453,10 @@ async fn apply_tool_batch(
                 crate::agent::tools::InterceptKind::Budget
                     | crate::agent::tools::InterceptKind::Blacklist
             ) {
-                // 给模型最后一次总结机会，避免输出戛然而止（与串行路径一致）
+                // 给模型最后一次总结机会，避免输出戛然而止（与串行路径一致）；
+                // 本路径不持有占位消息（总结由主循环统一落库），用局部变量满足签名：
+                // 总结文本短（远低于流内落库阈值 8KB），不会产生孤儿占位消息
+                let mut local_placeholder = None;
                 let summary = request_final_summary(
                     app,
                     client,
@@ -6708,6 +7469,8 @@ async fn apply_tool_batch(
                     cancel,
                     registry,
                     stats,
+                    &state,
+                    &mut local_placeholder,
                 )
                 .await;
                 if !summary.trim().is_empty() {
@@ -7031,12 +7794,14 @@ fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
 /// 上下文超限时的滚动摘要：取将被裁剪的最旧历史，用经济模型压成结构化摘要。
 /// 失败（网络/解析/无历史）时返回 None，调用方降级为纯裁剪，不阻塞主流程。
 /// cancel：摘要请求期间可被用户停止中断（压缩请求此前无停止检查/超时，是“空跑+停止无效”的卡点之一）
+/// context_budget：模型上下文窗口（token），用于计算摘要请求的输出预算（窗口余量，防小窗口超窗 400）
 async fn summarize_rolling_history(
     state: &tauri::State<'_, DbState>,
     client: &reqwest::Client,
     provider: &ProviderEndpoint,
     model_choice: &ModelChoice,
     conversation_id: &str,
+    context_budget: i64,
     old_limit: usize,
     keep: usize,
     prev_summary: Option<String>,
@@ -7045,6 +7810,10 @@ async fn summarize_rolling_history(
     // 1. 取最近 old_limit 条中最旧的 (old_limit - keep) 条作为待摘要文本（DB 借用限定在块内）
     let dropped = {
         let conn = state.0.lock().ok()?;
+        // 多取 PAIR_LOOKBACK 条旧消息作为工具配对余量：窗口最旧端若切开"调用→结果"对
+        // （最旧一条是 tool 结果、其调用在窗口外），靠余量把起点前移到配对调用处；
+        // 余量内找不到配对时按孤立结果丢弃（tool-pairing，见下方窗口起点修正）
+        const PAIR_LOOKBACK: i64 = 8;
         let mut stmt = conn
             .prepare(
                 "SELECT role, content FROM (
@@ -7056,7 +7825,11 @@ async fn summarize_rolling_history(
             .ok()?;
         let rows = stmt
             .query_map(
-                rusqlite::params![conversation_id, old_limit as i64, (old_limit - keep) as i64],
+                rusqlite::params![
+                    conversation_id,
+                    old_limit as i64 + PAIR_LOOKBACK,
+                    (old_limit - keep) as i64 + PAIR_LOOKBACK
+                ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .ok()?;
@@ -7065,22 +7838,144 @@ async fn summarize_rolling_history(
             return None;
         }
         list.reverse();
+        // 窗口起点配对修正（tool-pairing）：最旧端若以 tool 结果开头，其配对调用（更旧）
+        // 必然在窗口外（ASC 顺序下调用在前、结果在后），属孤立结果直接丢弃；
+        // 多取的余量若以 assistant 工具调用开头则起点天然配对完整。
+        // 防摘要输入出现"有结果无调用"的残缺配对误导模型
+        while list.first().is_some_and(|(r, _)| r == "tool") {
+            list.remove(0);
+        }
+        if list.is_empty() {
+            return None;
+        }
+        // 2. 待摘要消息分级（对齐 DeepSeek-TUI should_pin_message + enforce_tool_call_pairs 的
+        //    轻量版）：错误标记与补丁标记的消息全文保留原文——错误细节与补丁是最容易被摘要
+        //    稀释的关键信息；assistant 工具调用消息（【TOOL| 标记）与其紧随的 tool 结果消息
+        //    配对全文保留（工具参数与原始结果不截断，防止成对上下文被摘要破坏）；
+        //    其余消息头尾截断（防单条长工具输出反复撑大摘要输入）。
+        //    我们压缩后不保留原文消息列表（与 DeepSeek-TUI 不同），“全文进摘要输入 + 提示词
+        //    要求原文保留”是保住关键细节的等价轻量路径。
+        const PIN_ERROR_MARKERS: &[&str] = &[
+            "error:", "failed", "panic", "traceback", "stack trace", "assertion failed",
+            "test failed",
+        ];
+        const PIN_PATCH_MARKERS: &[&str] = &[
+            "diff --git", "+++ b/", "--- a/", "*** begin patch", "*** update file:",
+            "*** add file:", "*** delete file:", "```diff", "apply_patch",
+        ];
         let mut out = String::new();
+        let mut pin_next_tool_result = false;
+        // 消息跨度表（字符偏移 + 类型：0=普通 / 1=工具调用 / 2=工具结果）：
+        // 全局预算裁剪后按配对平衡吸附 head/tail 边界（tool-pairing），
+        // 防止剪切点落在"调用→结果"对中间破坏配对完整性
+        let mut spans: Vec<(usize, usize, u8)> = Vec::new();
         for (role, text) in list {
+            let lower = text.to_lowercase();
+            let is_tool_call = role == "assistant" && text.contains("【TOOL|");
+            let pinned = (role == "tool" && pin_next_tool_result)
+                || is_tool_call
+                || PIN_ERROR_MARKERS.iter().any(|m| lower.contains(m))
+                || PIN_PATCH_MARKERS.iter().any(|m| lower.contains(m));
+            let body = if pinned {
+                text
+            } else {
+                let cnt = text.chars().count();
+                if cnt > 1200 {
+                    let head: String = text.chars().take(600).collect();
+                    let tail: String = text.chars().skip(cnt - 600).collect();
+                    format!("{head}\n…(中段已省略，共 {cnt} 字符)…\n{tail}")
+                } else {
+                    text
+                }
+            };
             let who = match role.as_str() {
                 "user" => "用户",
                 "assistant" => "AI",
                 _ => "工具",
             };
-            out.push_str(&format!(
-                "{who}: {}\n\n",
-                text.chars().take(600).collect::<String>()
-            ));
+            let span_start = out.chars().count();
+            out.push_str(&format!("{who}: {body}\n\n"));
+            let span_kind = if is_tool_call {
+                1
+            } else if role == "tool" {
+                2
+            } else {
+                0
+            };
+            spans.push((span_start, out.chars().count(), span_kind));
+            if is_tool_call {
+                pin_next_tool_result = true;
+            } else if role == "tool" {
+                pin_next_tool_result = false;
+            }
+        }
+        // 3. 全局输入预算：超出时保头尾（对齐 DeepSeek-TUI head+tail 预算），中段省略计数——
+        //    逐条截断只能控单条，海量短消息拼接后仍会超限。head/tail 剪切点做配对平衡吸附：
+        //    - head 边界落在工具调用消息内 → 扩展 head 到其配对结果之后（配对完整进 head）；
+        //      落在孤立工具结果内（前一条不是调用）→ 收缩 head 到该消息前（丢弃残缺结果）；
+        //    - tail 边界落在工具调用消息内（调用在省略区、结果在尾部）→ 扩展 tail 到调用起点；
+        //      落在配对完整的结果内 → 从调用消息起点开始；落在孤立结果内 → 跳过该结果
+        const SUMMARY_INPUT_MAX_CHARS: usize = 24_000;
+        const SUMMARY_INPUT_HEAD_CHARS: usize = 14_000;
+        const SUMMARY_INPUT_TAIL_CHARS: usize = 6_000;
+        let chars = out.chars().count();
+        if chars > SUMMARY_INPUT_MAX_CHARS {
+            let mut head_end = SUMMARY_INPUT_HEAD_CHARS;
+            let mut tail_start = chars.saturating_sub(SUMMARY_INPUT_TAIL_CHARS);
+            if let Some(idx) = spans.iter().position(|(s, e, _)| *s <= head_end && head_end < *e) {
+                let (s, e, kind) = spans[idx];
+                match kind {
+                    1 => {
+                        // 工具调用未闭合：head 扩展到其配对结果之后（结果在省略区/尾部）
+                        if let Some((_, re, _)) = spans.iter().skip(idx + 1).find(|(_, _, k)| *k == 2) {
+                            head_end = *re;
+                        } else {
+                            head_end = e;
+                        }
+                    }
+                    2 => {
+                        // 孤立结果（前一条不是调用）收缩到消息前；配对完整则对齐消息结束
+                        if idx == 0 || spans[idx - 1].2 != 1 {
+                            head_end = s;
+                        } else {
+                            head_end = e;
+                        }
+                    }
+                    _ => head_end = e,
+                }
+            }
+            if let Some(idx) = spans.iter().position(|(s, e, _)| *s <= tail_start && tail_start < *e) {
+                let (s, _, kind) = spans[idx];
+                match kind {
+                    1 => tail_start = s,
+                    2 => {
+                        if idx == 0 || spans[idx - 1].2 != 1 {
+                            // 孤立结果：跳过（从下一条消息开始），尾部不留残缺结果
+                            if let Some((ns, _, _)) = spans.get(idx + 1) {
+                                tail_start = *ns;
+                            }
+                        } else {
+                            // 配对完整：tail 从调用消息起点开始（调用+结果都在尾部）
+                            tail_start = spans[idx - 1].0;
+                        }
+                    }
+                    _ => tail_start = s,
+                }
+            }
+            // 吸附后 head/tail 可能重叠（预算内消息不足）：退化为纯头部，省略计数归零
+            if head_end >= tail_start {
+                head_end = chars.min(head_end.max(tail_start));
+                tail_start = chars;
+            }
+            let head: String = out.chars().take(head_end).collect();
+            let tail: String = out.chars().skip(tail_start).collect();
+            let omitted = tail_start.saturating_sub(head_end);
+            out = format!("{head}\n\n[… {omitted} 字符已省略（早期对话）…]\n\n{tail}");
         }
         out
     };
 
-    // 2. 经济模型（非核心推理：有更便宜模型时用它省主模型预算；无则回退主模型）
+    // 4. 经济模型（非核心推理：有更便宜模型时用它省主模型预算；无则回退主模型）
     let summary_model = {
         let conn = state.0.lock().ok()?;
         model_router::pick_economy_model(&conn, &provider.provider_id, &model_choice.model)
@@ -7089,7 +7984,7 @@ async fn summarize_rolling_history(
     let mut summary_choice = model_choice.clone();
     summary_choice.model = summary_model;
 
-    // 3. 结构化摘要（4 段式模板；已有旧摘要时增量更新）
+    // 5. 结构化摘要（4 段式模板；已有旧摘要时增量更新）
     let prev_note = match prev_summary {
         Some(p) if !p.trim().is_empty() => {
             format!("（已有早期摘要，请结合其内容更新为最新状态，不要重复旧信息：\n{p}\n）\n")
@@ -7103,17 +7998,57 @@ async fn summarize_rolling_history(
          3. 待解决问题 / 失败教训\n\
          4. 重要工具调用结果（只留工具名和结论，如「build_project：构建成功」）\n\
          5. 用户原始约束（文件路径、命令、格式要求等）必须完整保留，不得精简丢失\n\
-         {prev_note}\
-         对话历史：\n{dropped}"
+         6. 标注了「原文保留」的消息为关键上下文（错误细节/补丁/工具参数），必须原样并入摘要，不得精简\n\
+         {prev_note}\n\
+         对话历史（【原文保留】标记后的消息请完整保留）：\n{dropped}"
     );
     let messages = vec![
         serde_json::json!({ "role": "system", "content": "你是对话历史摘要器，只输出结构化中文摘要。" }),
         serde_json::json!({ "role": "user", "content": prompt }),
     ];
-    let raw = non_stream_request(client, provider, &summary_choice, &messages, cancel, conversation_id)
-        .await
-        .ok()?;
-    let summary = raw.trim().chars().take(2000).collect::<String>();
+    // 6. 摘要请求输出预算（对齐 qwen-code computeCompactionOutputBudget）：摘要 max_tokens 取
+    //    window - 输入 - 1024 安全余量——固定 4096 在小窗口模型上会超窗被 400 拒绝
+    //    （PTL/context overflow，摘要输入已按 24000 字符封顶，两者叠加必超）；
+    //    上限 20K 防经济模型输出过度膨胀，下限 1024 保证能产出完整摘要
+    let summary_max_tokens = (context_budget as usize)
+        .saturating_sub(estimate_tokens(&messages) + 1024)
+        .clamp(1024, 20_000);
+    // 7. 摘要请求：瞬态错误重试（对齐 DeepSeek-TUI compact_messages_safe）——仅网络/超时/
+    //    限流/5xx 类错误重试 3 次（1s/2s/4s 退避，取消检查由 non_stream_request 内部承担），
+    //    其余（鉴权/解析等）直接失败降级为纯裁剪
+    let mut raw: Option<String> = None;
+    for attempt in 0..3usize {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1000 << (attempt - 1))).await;
+        }
+        match non_stream_request(client, provider, &summary_choice, &messages, cancel, conversation_id, Some(summary_max_tokens))
+            .await
+        {
+            Ok(s) => {
+                raw = Some(s);
+                break;
+            }
+            Err(e) => {
+                let l = e.to_lowercase();
+                let transient = l.contains("连接 provider 失败")
+                    || l.contains("超时")
+                    || l.contains("429")
+                    || (l.contains("provider 返回 5") && !l.contains("501"));
+                if !transient {
+                    break;
+                }
+                crate::utils::logger::log_event(
+                    "summary_retry",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "attempt": attempt + 1,
+                        "error": e,
+                    }),
+                );
+            }
+        }
+    }
+    let summary = raw?.trim().chars().take(2000).collect::<String>();
     if summary.is_empty() {
         None
     } else {
@@ -7121,52 +8056,97 @@ async fn summarize_rolling_history(
     }
 }
 
-/// 从用户消息提取记忆检索关键词：2-4 字滑窗 n-gram 近似中文分词，过滤停用词，
-/// 按出现次数取前 8 个（用于 project_memories 注入的相关性排序）
-fn extract_memory_keywords(text: &str) -> Vec<String> {
-    const STOPS: &[&str] = &[
-        "的", "了", "我", "你", "他", "她", "它", "是", "在", "有", "和", "与", "就", "都", "而", "及",
-        "或", "个", "这", "那", "一", "不", "要", "会", "能", "也", "很", "把", "被", "从", "到", "对",
-        "为", "等", "上", "下", "中", "我们", "你们", "他们", "可以", "需要", "使用", "进行", "一下",
-        "什么", "怎么", "如何", "为什么", "请", "帮我", "帮忙", "相关", "问题", "情况", "目前", "现在",
-        "这个", "那个", "已经", "还是", "一下",
-    ];
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut cur = String::new();
-    for ch in text.chars().take(2000) {
-        let is_word = ch.is_alphanumeric() || (ch as u32) >= 0x4e00 && (ch as u32) <= 0x9fff;
-        if is_word {
-            cur.push(ch);
-        } else {
-            push_grams(&mut cur, &mut counts, STOPS);
-        }
-    }
-    push_grams(&mut cur, &mut counts, STOPS);
-    let mut items: Vec<(String, usize)> = counts.into_iter().collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    items.into_iter().take(8).map(|(k, _)| k).collect()
-}
-
-/// 对一段连续字符做 2-4 字滑窗 n-gram（中文场景近似分词），过滤停用词后计入计数
-fn push_grams(
-    seg: &mut String,
-    counts: &mut HashMap<String, usize>,
-    stops: &[&str],
-) {
-    if seg.is_empty() {
-        return;
-    }
-    let chars: Vec<char> = seg.chars().collect();
-    let n = chars.len();
-    for w in 2..=4.min(n) {
-        for i in 0..=(n - w) {
-            let gram: String = chars[i..i + w].iter().collect();
-            if !stops.contains(&gram.as_str()) {
-                *counts.entry(gram).or_insert(0) += 1;
+/// 从本会话历史消息回放 memorize 工具调用，重建记忆键值表并格式化为系统注入文本
+/// （对齐 Qwen-Agent MemoAssistant：不单独建表存储，状态从消息日志重放——零存储成本、
+/// 天然与消息历史一致，时间旅行/回滚后状态自动正确）。
+/// 扫描最近 REPLAY_SCAN_LIMIT 条 assistant 消息，按时间顺序重放 put/update（覆盖）/delete，
+/// 输出最新 20 条、总长 2000 字符以内的记忆清单；无记忆时返回 None（不注入）。
+fn replay_memories(conn: &rusqlite::Connection, conversation_id: &str) -> Option<String> {
+    const REPLAY_SCAN_LIMIT: i64 = 200;
+    const MAX_ITEMS: usize = 20;
+    const MAX_TOTAL_CHARS: usize = 2000;
+    let mut stmt = conn
+        .prepare(
+            "SELECT content FROM messages \
+             WHERE conversation_id = ?1 AND role = 'assistant' AND queued = 0 \
+             ORDER BY created_at DESC LIMIT ?2",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![conversation_id, REPLAY_SCAN_LIMIT], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()?;
+    let mut msgs: Vec<String> = rows.collect::<Result<_, _>>().ok()?;
+    msgs.reverse(); // 时间正序：从旧到新重放，保证 delete/覆盖语义与消息顺序一致
+    let mut kv: Vec<(String, String)> = Vec::new();
+    for m in msgs {
+        for (name, args) in crate::agent::tools::parse_tool_calls(&m) {
+            if name != "memorize" {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&args) else {
+                continue;
+            };
+            let operate = v.get("operate").and_then(|x| x.as_str()).unwrap_or("put");
+            let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            match operate {
+                "put" | "update" => {
+                    let value = v
+                        .get("value")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    kv.retain(|(k, _)| *k != key); // 同 key 覆盖：移除旧条目保持最新在前
+                    kv.push((key, value));
+                }
+                "delete" => {
+                    kv.retain(|(k, _)| *k != key);
+                }
+                _ => {}
             }
         }
     }
-    seg.clear();
+    if kv.is_empty() {
+        return None;
+    }
+    // 输出最新 MAX_ITEMS 条（kv 尾部为最新）；总量超限时丢弃最旧条目
+    let mut lines: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for (k, v) in kv.iter().rev().take(MAX_ITEMS) {
+        let line = format!("- {k}: {v}");
+        total += line.chars().count() + 1;
+        if total > MAX_TOTAL_CHARS {
+            break;
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "## 关键记忆（对话中主动记录的信息，来自 memorize 调用回放）：\n{}\n请持续参考这些记忆；与用户最新指令冲突时以用户最新指令为准。",
+        lines.join("\n")
+    ))
+}
+
+/// 从用户消息提取记忆检索关键词：复用 relevance::tokenize_query 的 2-4 字滑窗
+/// n-gram 分词（中文）+ 英文整词（与 BM25 词袋同源），按出现次数取前 8 个
+/// （用于 project_memories 注入的相关性排序）
+fn extract_memory_keywords(text: &str) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for g in crate::utils::relevance::tokenize_query(text) {
+        *counts.entry(g).or_insert(0) += 1;
+    }
+    let mut items: Vec<(String, usize)> = counts.into_iter().collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    items.into_iter().take(8).map(|(k, _)| k).collect()
 }
 
 /// 非流式请求（子 Agent / 上下文压缩 / 标题生成 / 记忆提取 共用）：
@@ -7175,6 +8155,7 @@ fn push_grams(
 /// 表现为任务空跑、点停止无效、task_deadline 无法到达（主循环卡死在请求内）。
 /// cancel/conversation_id：传 Some(cancel) 且 conversation_id 非空时轮询停止；
 /// 后台任务（标题/记忆）传 None / 空串，仅超时兜底。
+/// max_tokens：Some(v) 覆盖默认 4096 输出上限（压缩摘要按窗口余量计算，防小窗口超窗 400）。
 async fn non_stream_request(
     client: &reqwest::Client,
     provider: &ProviderEndpoint,
@@ -7182,6 +8163,7 @@ async fn non_stream_request(
     messages: &[serde_json::Value],
     cancel: Option<&ChatCancel>,
     conversation_id: &str,
+    max_tokens: Option<usize>,
 ) -> Result<String, String> {
     // LLM 录制/重放接缝（与 stream_once 同口径）：重放命中直接返回录制文本，不发起真实请求
     let replay_mode = crate::services::llm_replay::mode();
@@ -7204,13 +8186,23 @@ async fn non_stream_request(
     }
     let base = provider.base_url.trim_end_matches('/');
     let system = messages[0]["content"].as_str().unwrap_or("").to_string();
-    let history: Vec<serde_json::Value> = messages[1..].to_vec();
+    // Anthropic 协议不认识 OpenAI 的 reasoning_content 字段，剥离（reasoning 合规回传仅 OpenAI 协议）
+    let history: Vec<serde_json::Value> = messages[1..]
+        .iter()
+        .map(|m| {
+            let mut mm = m.clone();
+            if let serde_json::Value::Object(map) = &mut mm {
+                map.remove("reasoning_content");
+            }
+            mm
+        })
+        .collect();
     let (url, body) = match provider.protocol.as_str() {
         "anthropic" => (
             format!("{base}/v1/messages"),
             serde_json::json!({
                 "model": model_choice.model,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens.unwrap_or(4096),
                 "system": system,
                 "messages": history,
             }),
@@ -7228,13 +8220,20 @@ async fn non_stream_request(
                     })
                     .collect::<Vec<_>>(),
                 "systemInstruction": {"parts": [{"text": system}]},
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": max_tokens.unwrap_or(4096),
             }),
         ),
-        _ => (
-            format!("{base}/chat/completions"),
-            serde_json::json!({ "model": model_choice.model, "messages": messages, "max_tokens": 4096 }),
-        ),
+        _ => {
+            // DeepSeek 推理模型合规净化（与流式同口径）：非推理模型剥离 reasoning_content、
+            // 推理模型对缺失/为空的 assistant 消息填占位符（子 Agent/压缩等调用方消息
+            // 可能来自任意来源，发送前统一兜底防 400）
+            let (messages_san, _, _) =
+                sanitize_thinking_messages(messages, &model_choice.model, None);
+            (
+                format!("{base}/chat/completions"),
+                serde_json::json!({ "model": model_choice.model, "messages": messages_san, "max_tokens": max_tokens.unwrap_or(4096) }),
+            )
+        }
     };
     let mut req = client.post(&url).json(&body);
     if let Some(ref key) = provider.api_key {
@@ -7339,21 +8338,43 @@ fn model_supports_image(conn: &rusqlite::Connection, provider_id: &str, model_id
         .unwrap_or(false)
 }
 
-/// 把引用文件内容注入消息正文：读取每个相对路径文件（路径安全检查 + 截断护栏），
-/// 以【引用文件 path】代码块追加到正文；文件不存在/不可读/超限时静默跳过，不阻塞发送。
-/// 单文件 ≤2000 字符，总注入 ≤8000 字符（防上下文膨胀）。
-fn inject_references(project_path: &str, content: &str, refs_json: Option<&str>) -> Result<String, String> {
+/// 把引用内容注入消息正文：
+/// - 文件引用（相对路径）：路径安全检查 + 截断护栏，以【引用文件 path】代码块追加
+/// - 会话引用（conv:<id>）：注入该会话标题 + 最近摘要/结论，以【引用会话 title】块追加
+/// 不存在的引用静默跳过，不阻塞发送。单条 ≤2000 字符，总注入 ≤8000 字符（防上下文膨胀）。
+fn inject_references(
+    conn: &rusqlite::Connection,
+    project_path: &str,
+    content: &str,
+    refs_json: Option<&str>,
+) -> Result<String, String> {
     let Some(rj) = refs_json else {
         return Ok(content.to_string());
     };
     let refs: Vec<String> = serde_json::from_str(rj).unwrap_or_default();
-    if refs.is_empty() || project_path.trim().is_empty() {
+    if refs.is_empty() {
         return Ok(content.to_string());
     }
     let mut injected = String::new();
     let mut total = 0usize;
     for p in &refs {
-        // 路径安全检查：仅允许项目内文件（防 .. 逃逸/绝对路径越界）
+        // 会话引用：注入标题 + 最近摘要（压缩摘要优先，其次最后一条 assistant 回复）
+        if let Some(conv_id) = p.strip_prefix("conv:") {
+            let Some((title, body)) = conversation_snippet(conn, conv_id) else {
+                continue;
+            };
+            let trimmed: String = body.trim().chars().take(2000).collect();
+            total += trimmed.chars().count();
+            if total > 8000 {
+                break;
+            }
+            injected.push_str(&format!("\n\n【引用会话 {title}】\n{trimmed}"));
+            continue;
+        }
+        // 文件引用（仅限项目内文件，防 .. 逃逸/绝对路径越界）
+        if project_path.trim().is_empty() {
+            break;
+        }
         let Ok(full) = crate::agent::tools::resolve_in_project(project_path, p) else {
             continue;
         };
@@ -7372,6 +8393,37 @@ fn inject_references(project_path: &str, content: &str, refs_json: Option<&str>)
     } else {
         Ok(format!("{content}{injected}"))
     }
+}
+
+/// 取会话引用摘要：标题 + 最近摘要（messages.summary 非空优先，其次最后一条 assistant 内容）
+fn conversation_snippet(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Option<(String, String)> {
+    let title: String = conn
+        .query_row(
+            "SELECT title FROM conversations WHERE id = ?1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let summary: Option<String> = conn
+        .query_row(
+            "SELECT summary FROM messages WHERE conversation_id = ?1 AND summary IS NOT NULL AND summary != '' ORDER BY created_at DESC LIMIT 1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(s) = summary.filter(|s| !s.trim().is_empty()) {
+        return Some((title, s));
+    }
+    conn.query_row(
+        "SELECT content FROM messages WHERE conversation_id = ?1 AND role = 'assistant' AND content != '' ORDER BY created_at DESC LIMIT 1",
+        [conversation_id],
+        |r| r.get(0),
+    )
+    .ok()
+    .map(|l| (title, l))
 }
 
 /// 从用户消息中提取一个用于 SDK API 自动检索的查询词。
@@ -7552,7 +8604,7 @@ async fn generate_conversation_title(
         "为以下用户任务生成一个简短的中文会话标题（不超过 20 字；直接输出标题本身，不要引号、不要解释、不要以“标题：”开头）：\n\n{snippet}"
     );
     let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
-    let text = non_stream_request(&client, &ep, &ModelChoice { provider_id, model: model.clone(), use_proxy, output_limit: 8192 }, &messages, None, "").await?;
+    let text = non_stream_request(&client, &ep, &ModelChoice { provider_id, model: model.clone(), use_proxy, output_limit: 8192 }, &messages, None, "", None).await?;
     let title: String = text
         .trim()
         .trim_matches(|c| matches!(c, '"' | '“' | '”' | '「' | '」' | '\''))
@@ -7735,12 +8787,25 @@ pub async fn compact_conversation(
         )
     };
     let client = crate::utils::net::build_client(model_choice.use_proxy)?;
+    let ctx_limit: Option<i64> = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT m.context_limit FROM models m
+             JOIN providers p ON m.provider_id = p.id
+             WHERE p.is_active = 1 AND m.enabled = 1
+             ORDER BY m.is_default DESC, m.created_at ASC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+    };
     let summary = summarize_rolling_history(
         &state,
         &client,
         &provider,
         &model_choice,
         &conversation_id,
+        ctx_limit.unwrap_or(200000),
         total,
         keep,
         prev_summary,
@@ -7893,7 +8958,61 @@ pub fn save_message_feedback(input: FeedbackInput, state: State<DbState>) -> Res
         ],
     )
     .map_err(|e| e.to_string())?;
+    // 记忆纠偏联动：把反馈消息内容的高频词写入词袋（dislike→neg / like→pos），
+    // 供项目记忆注入时对 dislike 内容降权（避免"踩过的坑"反复注入）
+    record_feedback_terms(&conn, &input.conversation_id, &input.message_id, &input.feedback);
     Ok(())
+}
+
+/// 把反馈消息内容的高频词（词频 ≥2 取前 5）写入纠偏词袋。
+/// 静默失败：词袋只是记忆注入的增强项，写入失败不影响反馈本身保存。
+fn record_feedback_terms(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    message_id: &str,
+    feedback: &str,
+) {
+    let Ok(content): Result<String, _> = conn.query_row(
+        "SELECT content FROM messages WHERE id = ?1 AND conversation_id = ?2",
+        params![message_id, conversation_id],
+        |r| r.get(0),
+    ) else {
+        return;
+    };
+    if content.trim().is_empty() {
+        return;
+    }
+    let Ok(project_id): Result<String, _> = conn.query_row(
+        "SELECT project_id FROM conversations WHERE id = ?1",
+        [conversation_id],
+        |r| r.get(0),
+    ) else {
+        return;
+    };
+    // 滑窗分词 + 词频统计：单次出现多为噪声（代码标识符/语气词），词频 ≥2 才计入
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for t in crate::utils::relevance::tokenize_query(&content) {
+        *freq.entry(t).or_default() += 1;
+    }
+    let mut top: Vec<(String, usize)> = freq.into_iter().filter(|(_, n)| *n >= 2).collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.truncate(5);
+    if top.is_empty() {
+        return;
+    }
+    let polarity = if feedback == "dislike" { "neg" } else { "pos" };
+    let ts = now();
+    for (term, n) in top {
+        // 累加计数（封顶 999 防溢出），updated_at 推进
+        let _ = conn.execute(
+            "INSERT INTO feedback_terms (project_id, term, polarity, count, updated_at)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(project_id, term, polarity) DO UPDATE SET
+                count = MIN(999, count + excluded.count),
+                updated_at = excluded.updated_at",
+            params![project_id, term, polarity, n as i64, ts],
+        );
+    }
 }
 
 /// 列出会话全部消息反馈（前端打开会话时加载，恢复点赞/点踩状态）
@@ -8054,7 +9173,7 @@ pub async fn summarize_memory(
         serde_json::json!({ "role": "system", "content": "你是工程经验提取器，只输出 JSON。" }),
         serde_json::json!({ "role": "user", "content": prompt }),
     ];
-    let raw = non_stream_request(&client, &provider, &model_choice, &messages, None, "").await?;
+    let raw = non_stream_request(&client, &provider, &model_choice, &messages, None, "", None).await?;
     let trimmed = raw.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     let parsed: serde_json::Value = serde_json::from_str(trimmed)
         .or_else(|_| {
@@ -8311,5 +9430,242 @@ mod ledger_and_ship_tests {
         assert!(hint.contains("目标：g"));
         assert!(hint.contains("[build_project] 构建成功"));
         assert!(hint.contains("下一步：n"));
+    }
+}
+
+#[cfg(test)]
+mod replay_memories_tests {
+    use super::*;
+
+    /// 最小 schema：只建 replay_memories 依赖的 messages 表
+    fn setup() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+             role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
+             queued INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_msg(conn: &rusqlite::Connection, role: &str, content: &str, ts: i64, queued: i64) {
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, created_at)
+             VALUES (?1, 'c1', ?2, ?3, ?4, ?5)",
+            params![format!("m-{ts}"), role, content, queued, ts],
+        )
+        .unwrap();
+    }
+
+    fn memo_call(operate: &str, key: &str, value: &str) -> String {
+        format!(
+            "正文【TOOL|memorize|{{\"operate\":\"{operate}\",\"key\":\"{key}\",\"value\":\"{value}\"}}】正文"
+        )
+    }
+
+    #[test]
+    fn replay_put_update_delete() {
+        let conn = setup();
+        // put 新增
+        insert_msg(&conn, "assistant", &memo_call("put", "目标", "修复编译错误"), 1, 0);
+        let out = replay_memories(&conn, "c1").expect("put 后应有记忆");
+        assert!(out.contains("## 关键记忆"));
+        assert!(out.contains("- 目标: 修复编译错误"));
+        // 同 key update 覆盖：旧值不再出现
+        insert_msg(&conn, "assistant", &memo_call("update", "目标", "改为部署真机"), 2, 0);
+        let out = replay_memories(&conn, "c1").unwrap();
+        assert!(!out.contains("修复编译错误"), "同 key 覆盖后旧值应消失: {out}");
+        assert!(out.contains("- 目标: 改为部署真机"));
+        // delete 移除：回到无记忆
+        insert_msg(&conn, "assistant", &memo_call("delete", "目标", ""), 3, 0);
+        assert!(replay_memories(&conn, "c1").is_none(), "delete 后应无记忆");
+    }
+
+    #[test]
+    fn replay_ignores_unrelated_and_queued() {
+        let conn = setup();
+        assert!(replay_memories(&conn, "c1").is_none(), "空历史返回 None");
+        insert_msg(&conn, "assistant", "普通回复无工具调用", 1, 0);
+        insert_msg(&conn, "assistant", "【TOOL|read_file|{\"path\":\"a.ets\"}】", 2, 0);
+        assert!(replay_memories(&conn, "c1").is_none(), "非 memorize 调用不产生记忆");
+        // user 消息中的 memorize 标记不参与回放（只扫 assistant）
+        insert_msg(&conn, "user", &memo_call("put", "用户侧", "不应被扫描"), 3, 0);
+        assert!(replay_memories(&conn, "c1").is_none(), "user 消息不参与回放");
+        // queued=1（待发送挂起消息）不参与回放
+        insert_msg(&conn, "assistant", &memo_call("put", "待发", "不应被扫描"), 4, 1);
+        assert!(replay_memories(&conn, "c1").is_none(), "queued 消息不参与回放");
+    }
+
+    #[test]
+    fn replay_caps_items_and_chars() {
+        let conn = setup();
+        // 25 条 put，时间正序；重放后最新 20 条输出，最旧 5 条丢弃
+        for i in 1..=25 {
+            insert_msg(
+                &conn,
+                "assistant",
+                &memo_call("put", &format!("k{i:02}"), &format!("v{i:02}")),
+                i,
+                0,
+            );
+        }
+        let out = replay_memories(&conn, "c1").unwrap();
+        assert!(out.contains("- k25: v25"), "最新应保留: {out}");
+        assert!(out.contains("- k06: v06"), "最新 20 条起点应保留: {out}");
+        assert!(!out.contains("- k05: v05"), "最旧 5 条应被丢弃: {out}");
+        assert!(!out.contains("- k01: v01"));
+        // 总量上限：主体 ≤ 2000 字符（头尾注入文本少量溢出）
+        assert!(out.chars().count() < 2200, "总长受控: {}", out.chars().count());
+        // value 超长在回放侧截断到 200 字符
+        let long = "长".repeat(300);
+        insert_msg(&conn, "assistant", &memo_call("put", "长值", &long), 26, 0);
+        let out = replay_memories(&conn, "c1").unwrap();
+        let line = out.lines().find(|l| l.contains("长值")).unwrap();
+        assert!(line.chars().count() <= 210, "value 应截断: {line}");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// 最小 schema：conversations + messages + conversation_snapshots（含 hidden 列）
+    fn setup() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, ledger TEXT);
+             CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+                 content TEXT NOT NULL DEFAULT '', queued INTEGER NOT NULL DEFAULT 0, agent_owned INTEGER NOT NULL DEFAULT 0,
+                 hidden INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+             CREATE TABLE conversation_snapshots (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                 msg_rowid INTEGER NOT NULL, label TEXT NOT NULL DEFAULT '', ledger_json TEXT,
+                 tool_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+             INSERT INTO conversations (id, ledger) VALUES ('c1', NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_msg(conn: &rusqlite::Connection, role: &str, content: &str, ts: i64) {
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, created_at)
+             VALUES (?1, 'c1', ?2, ?3, 0, ?4)",
+            params![format!("m-{ts}"), role, content, ts],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn save_skips_empty_round() {
+        // 首轮无执行痕迹：不保存快照
+        let conn = setup();
+        save_conversation_snapshot(&conn, "c1", None, "", 0).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(1) FROM conversation_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn save_anchors_visible_tail_and_caps() {
+        let conn = setup();
+        insert_msg(&conn, "user", "修复构建", 1);
+        insert_msg(&conn, "assistant", "先看日志", 2);
+        // 归档段（hidden=1）不参与锚点：rowid 更大但不影响
+        conn.execute("UPDATE messages SET hidden = 1 WHERE content = '先看日志'", []).unwrap();
+        insert_msg(&conn, "tool", "run_command\n输出", 3);
+        let ledger = TaskLedger::from_tool_runs("修复构建", &[], "看日志", 0);
+        save_conversation_snapshot(&conn, "c1", Some(&ledger), " 已读取构建日志，正在排查  ", 1).unwrap();
+        let (rowid, label, tc): (i64, String, i64) = conn
+            .query_row(
+                "SELECT msg_rowid, label, tool_count FROM conversation_snapshots WHERE conversation_id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rowid, 3); // 锚点 = 可见消息最大 rowid（hidden 的 rowid 2 不参与）
+        assert_eq!(label, "已读取构建日志，正在排查"); // 摘要压缩空白
+        assert_eq!(tc, 1);
+        // 保留上限：超过 MAX_SNAPSHOTS 删最旧
+        let conn2 = setup();
+        for i in 0..(MAX_SNAPSHOTS_PER_CONVERSATION + 5) {
+            insert_msg(&conn2, "assistant", &format!("轮次 {i}"), 100 + i as i64);
+            save_conversation_snapshot(&conn2, "c1", None, &format!("轮次 {i}"), i).unwrap();
+        }
+        let n: i64 = conn2
+            .query_row("SELECT COUNT(1) FROM conversation_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, MAX_SNAPSHOTS_PER_CONVERSATION as i64);
+    }
+
+    #[test]
+    fn restore_switches_visibility_bidirectionally() {
+        let conn = setup();
+        // 阶段 A：3 条消息
+        insert_msg(&conn, "user", "任务", 1);
+        insert_msg(&conn, "assistant", "A1", 2);
+        insert_msg(&conn, "tool", "read_file\nx", 3);
+        save_conversation_snapshot(&conn, "c1", None, "A 阶段", 1).unwrap();
+        let snap_a: String = conn
+            .query_row("SELECT id FROM conversation_snapshots", [], |r| r.get(0))
+            .unwrap();
+        // 阶段 B：追加 2 条
+        insert_msg(&conn, "assistant", "B1", 4);
+        insert_msg(&conn, "tool", "edit_file\ny", 5);
+        save_conversation_snapshot(&conn, "c1", None, "B 阶段", 2).unwrap();
+        let snap_b: String = conn
+            .query_row(
+                "SELECT id FROM conversation_snapshots WHERE label = 'B 阶段'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let visible = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(1) FROM messages WHERE conversation_id = 'c1' AND hidden = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(visible(&conn), 5);
+        // 回退到 A：B 段归档
+        let anchor: i64 = conn
+            .query_row("SELECT msg_rowid FROM conversation_snapshots WHERE id = ?1", [&snap_a], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "UPDATE messages SET hidden = 1 WHERE conversation_id = 'c1' AND hidden = 0 AND rowid > ?1",
+            params![anchor],
+        )
+        .unwrap();
+        assert_eq!(visible(&conn), 3);
+        // 前进回 B：归档段重新可见（双向时间旅行）
+        let anchor_b: i64 = conn
+            .query_row("SELECT msg_rowid FROM conversation_snapshots WHERE id = ?1", [&snap_b], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "UPDATE messages SET hidden = 0 WHERE conversation_id = 'c1' AND hidden = 1 AND rowid <= ?1",
+            params![anchor_b],
+        )
+        .unwrap();
+        assert_eq!(visible(&conn), 5);
+        // 恢复账本写回：ledger_json 非空时覆盖 conversations.ledger
+        let ledger = TaskLedger::from_tool_runs("任务", &[], "A 阶段", 0);
+        let ledger_json = serde_json::to_string(&ledger).unwrap();
+        conn.execute(
+            "UPDATE conversation_snapshots SET ledger_json = ?1 WHERE id = ?2",
+            params![ledger_json, snap_a],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE conversations SET ledger = ?1 WHERE id = 'c1'",
+            params![Some(ledger_json.clone())],
+        )
+        .unwrap();
+        let stored: Option<String> = conn
+            .query_row("SELECT ledger FROM conversations WHERE id = 'c1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(ledger_json.as_str()));
     }
 }

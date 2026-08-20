@@ -18,6 +18,8 @@ import type {
   ConversationCostStats,
   PendingConfirmation,
   TaskLedger,
+  SnapshotInfo,
+  RestoreSnapshotResult,
 } from '../api/project'
 import type { TaskRun } from '../api/cost'
 
@@ -277,6 +279,13 @@ export interface ChatSlice {
   archiveConversation: (id: string, archived: boolean) => Promise<void>
   /** 任务回滚（dryRun=true 仅预览）：git 硬重置到任务起点前最后一次提交 */
   rollbackTask: (conversationId: string, dryRun: boolean) => Promise<RollbackInfo>
+  /** 会话快照列表（时间轴，最新在前；当前可见末端对应 is_current=true） */
+  snapshots: SnapshotInfo[]
+  /** 快照列表加载中（防抖重复打开） */
+  loadingSnapshots: boolean
+  loadSnapshots: (conversationId: string) => Promise<void>
+  /** 恢复会话到历史快照点（时间旅行）：归档后续消息、重现旧分支、账本写回 */
+  restoreToSnapshot: (conversationId: string, snapshotId: string) => Promise<RestoreSnapshotResult>
 }
 
 /** 记忆/统计/反馈/版本切片 */

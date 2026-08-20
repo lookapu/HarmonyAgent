@@ -173,6 +173,31 @@ export interface TaskLedger {
 export const getTaskLedger = (conversationId: string) =>
   invokeWithError<TaskLedger | null>('get_task_ledger', { conversationId })
 
+/** 会话时间旅行快照（每轮工具执行后自动保存：消息锚点 + 账本 + 模型输出摘要） */
+export interface SnapshotInfo {
+  id: string
+  label: string
+  tool_count: number
+  created_at: number
+  /** 是否当前可见消息末端对应的快照 */
+  is_current: boolean
+}
+
+/** 会话快照列表（时间轴，最新在前） */
+export const listSnapshots = (conversationId: string) =>
+  invokeWithError<SnapshotInfo[]>('list_snapshots', { conversationId })
+
+/** 恢复会话到某快照点（时间旅行）：快照点之后消息归档，之前归档段重新可见，账本写回 */
+export interface RestoreSnapshotResult {
+  label: string
+  archived: number
+  restored: number
+  went_back: boolean
+}
+
+export const restoreSnapshot = (conversationId: string, snapshotId: string) =>
+  invokeWithError<RestoreSnapshotResult>('restore_snapshot', { conversationId, snapshotId })
+
 /** Agent 挂起的提问（ask_user 工具推送） */
 export interface PendingAsk {
   conversation_id: string

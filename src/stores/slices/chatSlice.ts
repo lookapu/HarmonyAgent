@@ -28,6 +28,8 @@ import {
   archiveConversation as archiveConversationApi,
   rollbackConversation,
   conversationRoot,
+  listSnapshots as listSnapshotsApi,
+  restoreSnapshot as restoreSnapshotApi,
 } from '../../api/project'
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger } from '../../api/project'
 import type { StateCreator } from 'zustand'
@@ -766,6 +768,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     toolApprovals: [],
     pendingConfirmations: {},
     taskLedgers: {},
+    snapshots: [],
+    loadingSnapshots: false,
     diagnoseCards: [],
     dismissDiagnoseCard: (id) => set((s) => ({ diagnoseCards: s.diagnoseCards.filter((c) => c.id !== id) })),
     pendingPlan: null,
@@ -792,6 +796,47 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
 
     clearBuildLogs: () => {
       set({ buildLogs: [] })
+    },
+
+    loadSnapshots: async (conversationId) => {
+      const s = get()
+      if (s.loadingSnapshots || s.currentConversation?.id !== conversationId) return
+      set({ loadingSnapshots: true })
+      try {
+        const snapshots = await listSnapshotsApi(conversationId)
+        if (get().currentConversation?.id === conversationId) set({ snapshots })
+      } catch {
+        // 快照是增值能力：加载失败不阻塞时间线弹窗（空列表可重试打开）
+      } finally {
+        if (get().currentConversation?.id === conversationId) set({ loadingSnapshots: false })
+      }
+    },
+
+    // 恢复会话到历史快照点（时间旅行）：成功后刷新消息/账本/快照列表，
+    // 返回归档与恢复条数（调用方展示提示）
+    restoreToSnapshot: async (conversationId, snapshotId) => {
+      const result = await restoreSnapshotApi(conversationId, snapshotId)
+      const same = () => get().currentConversation?.id === conversationId
+      // 刷新可见消息（分页重拉：归档段消失、恢复段重现）
+      const page = await listMessagesPage(conversationId)
+      if (same()) {
+        set({
+          messages: page.messages,
+          olderHasMore: page.hasMore,
+          feedbackMap: {},
+          versionMap: {},
+          tokenStats: null,
+        })
+      }
+      // 刷新账本（写回快照时刻的执行轨迹，续跑/继续任务继承）
+      void getTaskLedgerApi(conversationId)
+        .then((ledger) => {
+          if (same()) set((s) => ({ taskLedgers: { ...s.taskLedgers, [conversationId]: { ledger, finished: true } } }))
+        })
+        .catch(() => {})
+      // 刷新快照列表（is_current 标记变化）
+      await get().loadSnapshots(conversationId)
+      return result
     },
 
     rollbackTask: async (conversationId, dryRun) => {

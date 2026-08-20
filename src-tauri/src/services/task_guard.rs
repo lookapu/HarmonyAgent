@@ -28,6 +28,8 @@ pub const BLACKLIST_FAIL_THRESHOLD: usize = crate::services::agent_limits::DEFAU
 struct ConversationGuard {
     /// 本轮任务的用户目标（用于锚定重注入）
     goal: Option<String>,
+    /// 目标重注入轮次计数（goal-round：每注入一次 +1，注入文案带轮次）
+    goal_rounds: usize,
     /// 工具调用计数（本轮任务内累计）
     tool_count: usize,
     /// 距离上次"实质进展"的工具调用数
@@ -155,14 +157,24 @@ pub fn record_tool(
         if let Some(interval) = limits.goal_reinject_interval() {
             if g.tool_count % interval == 0 {
                 if let Some(goal) = &g.goal {
+                    g.goal_rounds += 1;
+                    // 目标轮次注入（对齐 deepseek-harness goal-round-driver 的 <goal_round> 提示）：
+                    // 轮次计数 + 证据化完成要求——宣告完成前必须核对证据（构建/测试/文件/截图），
+                    // 防“完成声明无验证背书”的假收尾（与收尾复核的 ship 审计互补）
                     hint.goal_reminder = Some(format!(
-                        "【目标锚定】用户的原始任务是：{goal}\n请确认当前工具调用仍在服务该目标；若已偏离，回到目标或向用户确认。"
+                        "<goal_round>\n目标：{goal}\n轮次：{}\n继续推进：以当前工作区、工具结果与会话状态为准，不要假设早期叙述仍然有效；每次工具调用都要产出实质进展并验证结果。\n在宣告任务完成之前，必须先核对完成证据（构建输出/测试结果/文件内容/截图等）并在总结中明确引用；若还有未完成或未验证的环节，继续调用工具推进，不要提前收尾。\n</goal_round>",
+                        g.goal_rounds
                     ));
                 }
             }
         }
         hint
     })
+}
+
+/// 读取当前任务锚定目标（收尾复核/完成判定用；任务未开始或无目标时返回 None）
+pub fn current_goal(conversation_id: &str) -> Option<String> {
+    guard_mut(conversation_id, |g| g.goal.clone())
 }
 
 /// 检查某动作签名是否已在本任务失败过（用于阻止完全相同的重试）。

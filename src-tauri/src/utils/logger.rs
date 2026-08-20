@@ -56,6 +56,8 @@ mod tests {
     #[test]
     fn test_log_event_appends_json_lines() {
         let dir = std::env::temp_dir().join(format!("ds-log-test-{}", std::process::id()));
+        // 先清理残留（pid 复用/上次中断会留下旧文件，append 模式会把旧行带进断言）
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok();
         init(dir.clone());
         log_event("task_finished", serde_json::json!({"status": "success", "n": 1}));

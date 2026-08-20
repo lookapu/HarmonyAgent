@@ -116,7 +116,39 @@ pub fn extract_stream_delta(protocol: &str, json: &serde_json::Value) -> Option<
             .as_str()
             .map(String::from),
         // OpenAI 兼容: {"choices":[{"delta":{"content":"..."}}]}
-        _ => json["choices"][0]["delta"]["content"].as_str().map(String::from),
+        // DeepSeek V4 等新模型 thinking 模式 content 为数组块：
+        // {"delta":{"content":[{"type":"text","text":"..."},{"type":"thinking","thinking":"..."}]}}
+        // text 块视为正文增量；纯 thinking 块归 reasoning 提取器，这里返回 None。
+        _ => extract_openai_content(&json["choices"][0]["delta"]["content"]),
+    }
+}
+
+/// OpenAI 兼容协议 content 字段提取：兼容字符串与块数组两种形态。
+/// 数组形态仅拼接 type=text 的文本块（V4 thinking 模式的 thinking 块不在正文内）。
+/// 空串/全 thinking 块返回 None（本批无正文增量，与旧 as_str 对 null 的行为一致）。
+pub fn extract_openai_content(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = String::new();
+            for it in items {
+                if let Some(t) = it["text"].as_str() {
+                    out.push_str(t);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
     }
 }
 
@@ -135,11 +167,31 @@ pub fn extract_reasoning_delta(protocol: &str, json: &serde_json::Value) -> Opti
                     .and_then(|p| p["text"].as_str().map(String::from))
             }),
         // OpenAI 兼容: {"choices":[{"delta":{"reasoning_content":"..."}}]}（DeepSeek 推理模型）
+        // 以及 DeepSeek V4 thinking 模式：content 数组中的 thinking 块、delta.thinking 字段：
+        // {"delta":{"content":[{"type":"thinking","thinking":"..."}]}}
         _ => json["choices"][0]["delta"]["reasoning_content"]
             .as_str()
             .map(String::from)
-            .or_else(|| json["choices"][0]["delta"]["reasoning"].as_str().map(String::from)),
+            .or_else(|| json["choices"][0]["delta"]["reasoning"].as_str().map(String::from))
+            .or_else(|| extract_openai_thinking(&json["choices"][0]["delta"])),
     }
+}
+
+/// OpenAI 兼容协议思考增量提取：content 数组中的 thinking 块 / delta.thinking 字段。
+/// 兼容 DeepSeek V4 等新模型 thinking 模式的数组形态（与正文 text 块同级）。
+pub fn extract_openai_thinking(delta: &serde_json::Value) -> Option<String> {
+    if let Some(items) = delta["content"].as_array() {
+        let mut out = String::new();
+        for it in items {
+            if let Some(t) = it["thinking"].as_str() {
+                out.push_str(t);
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    delta["thinking"].as_str().map(String::from)
 }
 
 /// 从非流式 JSON 响应中提取文本（子 Agent 使用，按协议分派）
@@ -178,6 +230,34 @@ pub fn extract_tool_call_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_openai_content_array_text_block() {
+        // DeepSeek V4 thinking 模式：content 为数组块，text 块进正文，thinking 块归推理
+        let json = serde_json::json!({
+            "choices": [{ "delta": { "content": [
+                {"type": "text", "text": "你好"},
+                {"type": "thinking", "thinking": "思考中"}
+            ] } }]
+        });
+        assert_eq!(extract_stream_delta("openai", &json).as_deref(), Some("你好"));
+        assert_eq!(extract_reasoning_delta("openai", &json).as_deref(), Some("思考中"));
+    }
+
+    #[test]
+    fn extract_openai_thinking_array_and_field() {
+        // 纯 thinking 块：正文无增量（None），推理有增量
+        let arr = serde_json::json!({
+            "choices": [{ "delta": { "content": [{"type": "thinking", "thinking": "思考中"}] } }]
+        });
+        assert_eq!(extract_stream_delta("openai", &arr), None);
+        assert_eq!(extract_reasoning_delta("openai", &arr).as_deref(), Some("思考中"));
+        // delta.thinking 字段兜底
+        let field = serde_json::json!({
+            "choices": [{ "delta": { "thinking": "另一种思考字段" } }]
+        });
+        assert_eq!(extract_reasoning_delta("openai", &field).as_deref(), Some("另一种思考字段"));
+    }
 
     #[test]
     fn extract_tool_call_delta_first_chunk_with_name_and_args() {
