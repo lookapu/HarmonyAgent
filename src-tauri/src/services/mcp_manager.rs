@@ -1,11 +1,13 @@
 //! MCP 连接管理器：全局 AppState，按服务器缓存长驻子进程客户端。
 //! - 惰性连接：首次用到（拉取工具清单 / 调用工具）时启动，之后复用；
 //! - 进程异常退出：call 失败时移除缓存，下次调用自动重新拉起；
-//! - 失败标记：连接失败的服务器在本次运行期间跳过，避免每次对话反复尝试拖慢主流程；
+//! - 失败退避：连接失败后指数冷却并自动重试，避免瞬时故障永久禁用，也防反复拉起；
+//! - 并发单飞：同一服务器首连只启动一个子进程，其余调用等待并复用结果；
 //! - 应用退出：shutdown_all 统一终止全部子进程（含孙进程）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -16,36 +18,84 @@ use crate::db::models::McpServer;
 pub struct McpManager {
     /// 服务器 id → 长驻连接
     clients: StdMutex<HashMap<String, Arc<McpClient>>>,
-    /// 本次运行期间连接失败的服务器 id（测试连接成功后清除）
-    failed: StdMutex<HashSet<String>>,
+    /// 连接失败状态：短期冷却后自动重试，不因一次临时故障永久禁用整个应用生命周期。
+    failed: StdMutex<HashMap<String, FailureState>>,
+    /// 每个实例独立的首连单飞门控，避免并发工具清单请求重复拉起同一个 MCP 子进程。
+    connect_gates: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+#[derive(Clone)]
+struct FailureState {
+    attempts: u32,
+    failed_at: Instant,
+    last_error: String,
+}
+
+fn failure_cooldown(attempts: u32) -> Duration {
+    Duration::from_secs(5_u64.saturating_mul(1_u64 << attempts.saturating_sub(1).min(4)))
 }
 
 impl McpManager {
     /// 获取或建立服务器连接（已缓存且存活则复用）。
     /// 并发首连时后到者丢弃自己新建的连接（Drop 自动终止子进程），保证缓存唯一。
-    /// 连接失败会记入失败标记，本次运行期间不再重试（见 struct 注释）。
+    /// 连接失败进入有界指数冷却，冷却结束后自动重试。
     pub async fn get_or_connect(&self, server: &McpServer) -> Result<Arc<McpClient>, String> {
-        if let Some(c) = self.clients.lock().unwrap().get(&server.id) {
+        if let Some(c) = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&server.id) {
             return Ok(c.clone());
         }
-        if self.failed.lock().unwrap().contains(&server.id) {
-            return Err("连接已标记失败（本次运行跳过，可在 MCP 页重新测试连接恢复）".into());
+        let gate = self
+            .connect_gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(server.id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _connect_guard = gate.lock().await;
+        // 等待单飞门控期间，前一个调用可能已经完成连接。
+        if let Some(c) = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&server.id) {
+            return Ok(c.clone());
+        }
+        if let Some(failure) = self.failed.lock().unwrap_or_else(|e| e.into_inner()).get(&server.id).cloned() {
+            let cooldown = failure_cooldown(failure.attempts);
+            if let Some(remaining) = cooldown.checked_sub(failure.failed_at.elapsed()) {
+                return Err(format!(
+                    "MCP 连接冷却中（{}s 后自动重试，已失败 {} 次）：{}",
+                    remaining.as_secs().saturating_add(1),
+                    failure.attempts,
+                    failure.last_error
+                ));
+            }
         }
         let client = match McpClient::connect(server).await {
             Ok(c) => c,
             Err(e) => {
-                self.failed.lock().unwrap().insert(server.id.clone());
+                self.record_failure(&server.id, &e);
                 return Err(e);
             }
         };
         let client = Arc::new(client);
-        let mut map = self.clients.lock().unwrap();
-        Ok(map.entry(server.id.clone()).or_insert(client).clone())
+        self.failed.lock().unwrap_or_else(|e| e.into_inner()).remove(&server.id);
+        let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(server.id.clone(), client.clone());
+        Ok(client)
+    }
+
+    fn record_failure(&self, server_id: &str, error: &str) {
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        let attempts = failed.get(server_id).map_or(1, |f| f.attempts.saturating_add(1));
+        failed.insert(
+            server_id.to_string(),
+            FailureState {
+                attempts,
+                failed_at: Instant::now(),
+                last_error: error.chars().take(300).collect(),
+            },
+        );
     }
 
     /// 连接测试成功：清除失败标记（用户修复配置后恢复参与工具注入）
     pub fn mark_connected(&self, server_id: &str) {
-        self.failed.lock().unwrap().remove(server_id);
+        self.failed.lock().unwrap_or_else(|e| e.into_inner()).remove(server_id);
     }
 
     /// 调用 MCP 工具（工具名格式 mcp__服务器名__工具名）。
@@ -60,7 +110,7 @@ impl McpManager {
     ) -> Result<String, String> {
         // 按服务器名查找（连接缓存以 id 为 key，名称仅作展示层匹配）
         let client = {
-            let map = self.clients.lock().unwrap();
+            let map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
             map.values()
                 .filter(|c| c.server_name == server_name)
                 .find(|c| c.project_id.as_deref() == project_id)
@@ -78,7 +128,8 @@ impl McpManager {
             Ok(out) => Ok(out),
             Err(e) => {
                 // 进程级故障（退出/超时）移除缓存，允许下次调用重新拉起
-                self.clients.lock().unwrap().remove(&client.server_id);
+                self.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&client.server_id);
+                self.record_failure(&client.server_id, &e);
                 Err(e)
             }
         }
@@ -86,14 +137,15 @@ impl McpManager {
 
     /// 按服务器 id 精确调用（同名多实例路由：name#n 已由调用方解析为具体实例 id）
     pub async fn call_by_id(&self, server_id: &str, tool: &str, args: Value) -> Result<String, String> {
-        let client = self.clients.lock().unwrap().get(server_id).cloned();
+        let client = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(server_id).cloned();
         let Some(client) = client else {
             return Err(format!("MCP 服务器实例（{server_id}）未连接，请重试"));
         };
         match client.call_tool(tool, args).await {
             Ok(out) => Ok(out),
             Err(e) => {
-                self.clients.lock().unwrap().remove(&client.server_id);
+                self.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&client.server_id);
+                self.record_failure(&client.server_id, &e);
                 Err(e)
             }
         }
@@ -111,7 +163,11 @@ impl McpManager {
                 match self.get_or_connect(server).await {
                     Ok(c) => match c.list_tools().await {
                         Ok(tools) => (name, tools, Ok(())),
-                        Err(e) => (name, Vec::new(), Err(e)),
+                        Err(e) => {
+                            self.clients.lock().unwrap_or_else(|p| p.into_inner()).remove(&c.server_id);
+                            self.record_failure(&c.server_id, &e);
+                            (name, Vec::new(), Err(e))
+                        }
                     },
                     Err(e) => (name, Vec::new(), Err(e)),
                 }
@@ -123,7 +179,7 @@ impl McpManager {
     /// 终止全部 MCP 子进程（应用退出时调用；缓存清空，下次启动重新连接）
     pub fn shutdown_all(&self) {
         let clients: Vec<Arc<McpClient>> =
-            self.clients.lock().unwrap().drain().map(|(_, c)| c).collect();
+            self.clients.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, c)| c).collect();
         drop(clients); // Arc 释放触发 Drop → 进程树强杀
     }
 
@@ -133,14 +189,40 @@ impl McpManager {
             return;
         }
         {
-            let mut clients = self.clients.lock().unwrap();
+            let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
             for id in ids {
                 clients.remove(id); // Arc 释放触发 Drop → 进程树强杀
             }
         }
-        let mut failed = self.failed.lock().unwrap();
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
         for id in ids {
             failed.remove(id);
         }
+        let mut gates = self.connect_gates.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ids {
+            gates.remove(id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_cooldown_is_bounded_exponential_backoff() {
+        assert_eq!(failure_cooldown(1), Duration::from_secs(5));
+        assert_eq!(failure_cooldown(2), Duration::from_secs(10));
+        assert_eq!(failure_cooldown(5), Duration::from_secs(80));
+        assert_eq!(failure_cooldown(99), Duration::from_secs(80));
+    }
+
+    #[test]
+    fn mark_connected_recovers_failed_instance() {
+        let manager = McpManager::default();
+        manager.record_failure("server", "temporary");
+        assert!(manager.failed.lock().unwrap().contains_key("server"));
+        manager.mark_connected("server");
+        assert!(!manager.failed.lock().unwrap().contains_key("server"));
     }
 }

@@ -539,6 +539,8 @@ pub struct PendingConfirmation {
     pub request_id: String,
     pub tool: Option<String>,
     pub args: Option<String>,
+    pub level: Option<String>,
+    pub desc: Option<String>,
     pub plan: Option<String>,
     pub question: Option<String>,
     pub options: Option<Vec<String>>,
@@ -580,6 +582,8 @@ pub fn list_pending_confirmations(
                     request_id: request_id.clone(),
                     tool: Some(tool.clone()),
                     args: Some(args.clone()),
+                    level: Some(crate::services::permissions::tool_level(tool).as_str().to_string()),
+                    desc: Some(crate::agent::tools::tool_short_desc(tool).to_string()),
                     plan: None,
                     question: None,
                     options: None,
@@ -599,6 +603,8 @@ pub fn list_pending_confirmations(
                     request_id: request_id.clone(),
                     tool: None,
                     args: None,
+                    level: None,
+                    desc: None,
                     plan: Some(req.plan.clone()),
                     question: None,
                     options: None,
@@ -616,6 +622,8 @@ pub fn list_pending_confirmations(
                 request_id: ev.request_id,
                 tool: None,
                 args: None,
+                level: None,
+                desc: None,
                 plan: None,
                 question: Some(ev.question),
                 options: Some(ev.options),
@@ -1873,29 +1881,96 @@ fn record_task_run(
     let _ = crate::db::queries::insert_task_run(&conn, &run);
 }
 
-/// 工具执行落库（tool_runs 表，Evaluation 统计来源）：失败不影响主流程
-fn insert_tool_run(
+const TOOL_AUDIT_TEXT_LIMIT: usize = 120_000;
+
+fn bounded_tool_audit_text(value: &str) -> String {
+    let redacted = crate::utils::redact::redact_text(value);
+    let count = redacted.chars().count();
+    if count <= TOOL_AUDIT_TEXT_LIMIT {
+        return redacted;
+    }
+    let edge = TOOL_AUDIT_TEXT_LIMIT / 2;
+    let head: String = redacted.chars().take(edge).collect();
+    let tail: String = redacted
+        .chars()
+        .rev()
+        .take(edge)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}\n…（审计记录省略 {} 字符）…\n{tail}", count - TOOL_AUDIT_TEXT_LIMIT)
+}
+
+fn tool_audit_payload(tool: &str, input: &str, output: &str, status: &str) -> (String, String) {
+    if tool == "secret_get" || tool == "secret_store" {
+        return (
+            "[密钥参数已隐藏]".into(),
+            if tool == "secret_get" && status == "ok" {
+                "[密钥已读取（明文不落库）]".into()
+            } else {
+                bounded_tool_audit_text(output)
+            },
+        );
+    }
+    (bounded_tool_audit_text(input), bounded_tool_audit_text(output))
+}
+
+/// 工具开始即落一条 running 记录。进程崩溃时该记录会保留下来，诊断层可明确识别
+/// 未收尾调用；call_id 同时作为主键与前端事件关联键，重复事件天然幂等。
+fn begin_tool_run(
     state: &tauri::State<'_, DbState>,
     conversation_id: &str,
+    trace_id: &str,
+    call_id: &str,
+    tool: &str,
+    input: &str,
+) {
+    let (input, _) = tool_audit_payload(tool, input, "", "running");
+    let Ok(conn) = state.0.lock() else { return };
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO tool_runs
+         (id, conversation_id, tool_name, input_json, status, duration_ms, created_at, trace_id, call_id)
+         VALUES (?1,?2,?3,?4,'running',0,?5,?6,?1)",
+        params![call_id, conversation_id, tool, input, now(), trace_id],
+    );
+}
+
+/// 工具终态落库（Evaluation/审计统计来源）：有 begin 记录则原位更新；子 Agent 等
+/// 无前端 call_id 的调用直接插入终态。数据库失败不阻断主任务。
+fn finish_tool_run(
+    state: &tauri::State<'_, DbState>,
+    conversation_id: &str,
+    trace_id: &str,
+    call_id: Option<&str>,
     tool: &str,
     input: &str,
     output: &str,
     status: &str,
     duration_ms: i64,
 ) {
-    // secret_get 的明文密钥不落库：对话历史可见即可，避免密钥明文持久化到 SQLite
-    // （secret_store 的 value 参数同样含密钥，一并隐藏参数）
-    let (input, output) = if tool == "secret_get" || tool == "secret_store" {
-        ("[密钥参数已隐藏]", if tool == "secret_get" && status == "ok" { "[密钥已读取（明文不落库）]" } else { output })
-    } else {
-        (input, output)
-    };
+    let (input, output) = tool_audit_payload(tool, input, output, status);
     let Ok(conn) = state.0.lock() else { return };
+    if let Some(id) = call_id {
+        if conn
+            .execute(
+                "UPDATE tool_runs SET result_json=?1, status=?2, duration_ms=?3,
+                 trace_id=?4, call_id=?5 WHERE id=?5",
+                params![output, status, duration_ms, trace_id, id],
+            )
+            .unwrap_or(0)
+            > 0
+        {
+            return;
+        }
+    }
+    let id = call_id.map(str::to_string).unwrap_or_else(|| Uuid::new_v4().to_string());
     let _ = conn.execute(
-        "INSERT INTO tool_runs (id, conversation_id, tool_name, input_json, result_json, status, duration_ms, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        "INSERT OR REPLACE INTO tool_runs
+         (id, conversation_id, tool_name, input_json, result_json, status, duration_ms, created_at, trace_id, call_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
-            Uuid::new_v4().to_string(),
+            id,
             conversation_id,
             tool,
             input,
@@ -1903,6 +1978,8 @@ fn insert_tool_run(
             status,
             duration_ms,
             now(),
+            trace_id,
+            call_id,
         ],
     );
 }
@@ -4300,6 +4377,10 @@ async fn stream_chat_inner(
                             desc: crate::agent::tools::tool_short_desc(&tool).to_string(),
                         },
                     );
+                    begin_tool_run(&state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
+                    let limit_output = format!(
+                        "工具调用已达轮次上限（{max_tool_rounds} 轮），本次调用未执行"
+                    );
                     let _ = app.emit(
                         "chat-tool-done",
                         ChatToolDoneEvent {
@@ -4308,11 +4389,20 @@ async fn stream_chat_inner(
                             call_id: call_id.clone(),
                             tool: tool.clone(),
                             ok: false,
-                            output: format!(
-                                "工具调用已达轮次上限（{max_tool_rounds} 轮），本次调用未执行"
-                            ),
+                            output: limit_output.clone(),
                             duration_ms: tool_begin.elapsed().as_millis() as i64,
                         },
+                    );
+                    finish_tool_run(
+                        &state,
+                        &conversation_id,
+                        &trace_id,
+                        Some(&call_id),
+                        &tool,
+                        &args_raw,
+                        &limit_output,
+                        "blocked",
+                        tool_begin.elapsed().as_millis() as i64,
                     );
                     let summary = request_final_summary(
                         &app,
@@ -4457,6 +4547,7 @@ async fn stream_chat_inner(
                         desc: crate::agent::tools::tool_short_desc(&tool).to_string(),
                     },
                 );
+                begin_tool_run(&state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
                 // 统一护栏预检：任务预算/失败黑名单/权限分级审批由 pipeline pre 钩子裁决
                 // （guards.rs 注册），拦截后按 InterceptKind 收尾：
                 // - Budget/Blacklist：发 done 事件 + 请求模型总结后终止（不静默收尾）
@@ -4503,6 +4594,21 @@ async fn stream_chat_inner(
                         &tool,
                         &args_raw,
                         &intercept.message,
+                    );
+                    finish_tool_run(
+                        &state,
+                        &conversation_id,
+                        &trace_id,
+                        Some(&call_id),
+                        &tool,
+                        &args_raw,
+                        &intercept.message,
+                        if intercept.kind == crate::agent::tools::InterceptKind::Cancelled {
+                            "cancelled"
+                        } else {
+                            "blocked"
+                        },
+                        tool_begin.elapsed().as_millis() as i64,
                     );
                     tool_runs.push(ToolRunItem {
                         tool: tool.clone(),
@@ -4557,7 +4663,6 @@ async fn stream_chat_inner(
             // 子 Agent 委派：并发执行、可指定模型，结果汇总后继续主 Agent 循环
             let result = if tool == "spawn_agents" {
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
-                let agent_started = std::time::Instant::now();
                 let r = run_spawn_agents(
                     &app,
                     &state,
@@ -4575,19 +4680,9 @@ async fn stream_chat_inner(
                     tool_ctx.spawn_remaining,
                 )
                 .await;
-                insert_tool_run(
-                    &state,
-                    &conversation_id,
-                    &tool,
-                    &args_raw,
-                    r.as_ref().unwrap_or_else(|e| e),
-                    if r.is_ok() { "ok" } else { "error" },
-                    agent_started.elapsed().as_millis() as i64,
-                );
                 r
             } else {
                 // 执行工具：超时/网络类错误按指数退避自动重试（可恢复错误白名单）
-                let tool_started = std::time::Instant::now();
                 let retried = retry_with_backoff(
                     &TOOL_POLICY,
                     &mut || {
@@ -4611,16 +4706,6 @@ async fn stream_chat_inner(
                 .await;
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
                 stats.retry_count += (retried.attempts - 1) as i64;
-                // 工具执行落库（Evaluation 统计；结果与状态取自最终尝试）
-                insert_tool_run(
-                    &state,
-                    &conversation_id,
-                    &tool,
-                    &args_raw,
-                    retried.value.as_ref().unwrap_or_else(|e| e),
-                    if retried.value.is_ok() { "ok" } else { "error" },
-                    tool_started.elapsed().as_millis() as i64,
-                );
                 match retried.value {
                     Ok(out) if retried.attempts > 1 => Ok(format!(
                         "（首次执行超时/网络错误，已自动重试 {} 次）\n{out}",
@@ -4633,6 +4718,22 @@ async fn stream_chat_inner(
             // post 钩子改写结果（guards.rs 注册），可追加强制验证/失速/目标锚定提示或预览截断
             let mut result = result;
             crate::agent::tools::run_post_hooks(&inv, &mut result).await;
+            let audit_status = match &result {
+                Ok(_) => "ok",
+                Err(e) if e.contains("用户已停止") => "cancelled",
+                Err(_) => "error",
+            };
+            finish_tool_run(
+                &state,
+                &conversation_id,
+                &trace_id,
+                Some(&call_id),
+                &tool,
+                &args_raw,
+                result.as_ref().unwrap_or_else(|e| e),
+                audit_status,
+                tool_begin.elapsed().as_millis() as i64,
+            );
             // 工具完成跟踪（覆盖串行 + spawn_agents 两条路径；批处理路径在 execute_tool_batch_one 内）
             crate::utils::logger::log_event(
                 "tool_finished",
@@ -7680,10 +7781,12 @@ async fn run_subagent(
             // 统一护栏后处理：护栏记录/大输出落盘（与主 Agent 同套 post 钩子）
             crate::agent::tools::run_post_hooks(&inv, &mut result).await;
             tool_limits::record_tool_call(conversation_id, &tool, &args_raw);
-            // 子 Agent 工具执行落库（Evaluation 统计，归属同一会话）
-            insert_tool_run(
+            // 子 Agent 没有前端 call_id，直接插入终态审计记录并关联主任务 trace。
+            finish_tool_run(
                 state,
                 conversation_id,
+                &tool_ctx.run_id,
+                None,
                 &tool,
                 &args_raw,
                 result.as_ref().unwrap_or_else(|e| e),
@@ -7843,6 +7946,21 @@ mod tool_execution_policy_tests {
         assert_eq!(tool_exec_timeout("build_project", "{}").as_secs(), 900);
         assert_eq!(tool_exec_timeout("run_command", r#"{"timeout":300}"#).as_secs(), 330);
     }
+
+    #[test]
+    fn durable_tool_audit_is_redacted_and_bounded() {
+        let (input, _) = tool_audit_payload(
+            "run_command",
+            r#"{"authorization":"Bearer abcdefghijklmnopqrstuvwxyz"}"#,
+            "",
+            "running",
+        );
+        assert!(!input.contains("abcdefghijklmnopqrstuvwxyz"));
+        let huge = "x".repeat(TOOL_AUDIT_TEXT_LIMIT + 500);
+        let bounded = bounded_tool_audit_text(&huge);
+        assert!(bounded.contains("审计记录省略"));
+        assert!(bounded.chars().count() < huge.chars().count());
+    }
 }
 
 /// 拦截信息（pre 钩子拒绝；kind 决定终止收尾语义；拦截文案随 output 透出）
@@ -7900,6 +8018,7 @@ async fn execute_tool_batch_one(
             desc: crate::agent::tools::tool_short_desc(tool).to_string(),
         },
     );
+    begin_tool_run(state, conversation_id, &tool_ctx.run_id, &call_id, tool, args_raw);
     let args_val: serde_json::Value =
         serde_json::from_str(args_raw).unwrap_or(serde_json::Value::Null);
     let inv = crate::agent::tools::ToolInvocation {
@@ -7925,6 +8044,21 @@ async fn execute_tool_batch_one(
                 output: intercept.message.clone(),
                 duration_ms: tool_begin.elapsed().as_millis() as i64,
             },
+        );
+        finish_tool_run(
+            state,
+            conversation_id,
+            &tool_ctx.run_id,
+            Some(&call_id),
+            tool,
+            args_raw,
+            &intercept.message,
+            if intercept.kind == crate::agent::tools::InterceptKind::Cancelled {
+                "cancelled"
+            } else {
+                "blocked"
+            },
+            tool_begin.elapsed().as_millis() as i64,
         );
         return BatchToolResult {
             tool: tool.to_string(),
@@ -7973,16 +8107,6 @@ async fn execute_tool_batch_one(
     .await;
     tool_limits::record_tool_call(conversation_id, tool, args_raw);
     let duration_ms = tool_started.elapsed().as_millis() as i64;
-    // 工具执行落库（Evaluation 统计；结果与状态取自最终尝试）
-    insert_tool_run(
-        state,
-        conversation_id,
-        tool,
-        args_raw,
-        retried.value.as_ref().unwrap_or_else(|e| e),
-        if retried.value.is_ok() { "ok" } else { "error" },
-        duration_ms,
-    );
     let mut result = match retried.value {
         Ok(out) if retried.attempts > 1 => Ok(format!(
             "（首次执行超时/网络错误，已自动重试 {} 次）\n{out}",
@@ -7996,6 +8120,23 @@ async fn execute_tool_batch_one(
         Ok(o) => (true, o.clone()),
         Err(e) => (false, format!("执行失败: {e}")),
     };
+    finish_tool_run(
+        state,
+        conversation_id,
+        &tool_ctx.run_id,
+        Some(&call_id),
+        tool,
+        args_raw,
+        &output,
+        if ok {
+            "ok"
+        } else if output.contains("用户已停止") {
+            "cancelled"
+        } else {
+            "error"
+        },
+        duration_ms,
+    );
     // 工具完成跟踪（批处理路径）
     crate::utils::logger::log_event(
         "tool_finished",

@@ -85,8 +85,14 @@ const sendTraces = new Map<string, ReturnType<typeof startPerfTrace>>()
 const optimisticRunUserIds = new Map<string, string>()
 /** 最近终态代次墓碑：拦截监管线程/IPC 队列在 done/error/stopped 后迟到的 started/heartbeat。 */
 const terminalRunIds = new Map<string, string>()
+/** 当前批次活跃工具 call_id：IPC 重复投递时保证 start/done 计数与卡片幂等。 */
+const activeToolCallIds = new Map<string, Set<string>>()
+/** 已完成工具墓碑：拦截跨事件通道乱序到达的迟到 start / 重复 done。 */
+const completedToolCallIds = new Map<string, Set<string>>()
 
 const markRunTerminal = (conversationId: string, runId?: string) => {
+  activeToolCallIds.delete(conversationId)
+  completedToolCallIds.delete(conversationId)
   if (!runId) return
   terminalRunIds.set(conversationId, runId)
   setTimeout(() => {
@@ -114,7 +120,11 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
    * patch=null 删除分桶（任务结束）。事件监听不再依赖"当前流式会话"判断——
    * 后台会话（用户已切走）的增量/结束也写入自己的桶，切回时内容不丢。
    */
-  const setBucket = (convId: string, patch: Partial<StreamingState> | null) =>
+  const setBucket = (convId: string, patch: Partial<StreamingState> | null) => {
+    if (patch === null) {
+      activeToolCallIds.delete(convId)
+      completedToolCallIds.delete(convId)
+    }
     set((s) => {
       const streamings = { ...s.streamings }
       if (patch === null) {
@@ -138,6 +148,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         streaming: s.currentConversation ? streamings[s.currentConversation.id] ?? emptyStreaming() : emptyStreaming(),
       }
     })
+  }
 
   /** 把一个或全部会话积攒的正文/思考增量一次性写入 Zustand。 */
   const flushStreamDeltas = (onlyConversationId?: string) => {
@@ -312,6 +323,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     if (terminalRunIds.get(conversation_id) === run_id) return
     // 不同代次是真正的新任务，旧墓碑不应阻挡。
     terminalRunIds.delete(conversation_id)
+    activeToolCallIds.delete(conversation_id)
+    completedToolCallIds.delete(conversation_id)
     const bucket = get().streamings[conversation_id]
     if (bucket) {
       // 活跃桶已有代次时，延迟/重复的 started 不能接管当前运行。
@@ -358,6 +371,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         runId: run_id || bucket.runId,
         error: null,
         errorDetail: null,
+        lastDeltaAt: Date.now(),
       })
       return
     }
@@ -680,6 +694,13 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     (event) => {
       const { conversation_id, run_id, call_id, tool, args, round, total, level, desc } = event.payload
       if (!acceptsRun(conversation_id, run_id)) return
+      if (call_id) {
+        if (completedToolCallIds.get(conversation_id)?.has(call_id)) return
+        const active = activeToolCallIds.get(conversation_id) ?? new Set<string>()
+        if (active.has(call_id)) return
+        active.add(call_id)
+        activeToolCallIds.set(conversation_id, active)
+      }
       flushStreamDeltas(conversation_id)
       const state = get()
       // 工具活动按会话计数（看门狗判据，后台会话同样生效）
@@ -724,10 +745,20 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   listen<{ conversation_id: string; run_id?: string; call_id?: string; tool: string; ok: boolean; output: string; duration_ms?: number }>('chat-tool-done', (event) => {
     const { conversation_id, run_id, call_id, tool, ok, output, duration_ms } = event.payload
     if (!acceptsRun(conversation_id, run_id)) return
+    let countedActive = !call_id
+    if (call_id) {
+      if (completedToolCallIds.get(conversation_id)?.has(call_id)) return
+      const active = activeToolCallIds.get(conversation_id)
+      countedActive = active?.delete(call_id) ?? false
+      if (active?.size === 0) activeToolCallIds.delete(conversation_id)
+      const completed = completedToolCallIds.get(conversation_id) ?? new Set<string>()
+      completed.add(call_id)
+      completedToolCallIds.set(conversation_id, completed)
+    }
     const state = get()
     // 工具活动按会话计数（看门狗判据，后台会话同样生效）
     const bucket = state.streamings[conversation_id]
-    if (bucket) setBucket(conversation_id, { toolRunning: Math.max(0, bucket.toolRunning - 1) })
+    if (bucket && countedActive) setBucket(conversation_id, { toolRunning: Math.max(0, bucket.toolRunning - 1) })
     // 视图级过程状态（toolRuns/plan/todos/ask…）仅反映当前会话；后台会话事件不污染当前视图
     if (state.currentConversation?.id !== conversation_id) return
     const runningToolIdx = call_id
@@ -799,13 +830,19 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         request_id,
         tool,
         args,
+        level: level ?? null,
+        desc: desc ?? null,
         plan: null,
         question: null,
         options: null,
       })
       if (isCurrent) {
         set((s) => ({
-          toolApprovals: [...s.toolApprovals, { requestId: request_id, tool, args, level, desc }],
+          toolApprovals: s.toolApprovals.some((item) => item.requestId === request_id)
+            ? s.toolApprovals.map((item) =>
+                item.requestId === request_id ? { requestId: request_id, tool, args, level, desc } : item,
+              )
+            : [...s.toolApprovals, { requestId: request_id, tool, args, level, desc }],
         }))
       }
     },
@@ -846,6 +883,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       request_id,
       tool: null,
       args: null,
+      level: null,
+      desc: null,
       plan,
       question: null,
       options: null,
@@ -1041,6 +1080,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         request_id,
         tool: null,
         args: null,
+        level: null,
+        desc: null,
         plan: null,
         question,
         options,
@@ -1215,7 +1256,13 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       const pendings = get().pendingConfirmations[id] ?? []
       const restoredApprovals = pendings
         .filter((p) => p.kind === 'approval')
-        .map((p) => ({ requestId: p.request_id, tool: p.tool ?? '', args: p.args ?? '' }))
+        .map((p) => ({
+          requestId: p.request_id,
+          tool: p.tool ?? '',
+          args: p.args ?? '',
+          level: p.level ?? undefined,
+          desc: p.desc ?? undefined,
+        }))
       const restoredPlan = (() => {
         const p = pendings.find((p) => p.kind === 'plan')
         return p ? { requestId: p.request_id, conversationId: p.conversation_id, plan: p.plan ?? '' } : null

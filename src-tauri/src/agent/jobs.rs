@@ -19,6 +19,10 @@ use crate::agent::exec_ctx::ToolCtx;
 
 /// 会话活跃后台任务上限（防无限堆积：每个会话最多同时跑 4 个）
 pub const MAX_JOBS_PER_CONVERSATION: usize = 4;
+/// 每个会话保留的已结束任务数；避免长期运行时历史输出无限常驻内存。
+const MAX_FINISHED_JOBS_PER_CONVERSATION: usize = 30;
+/// 全应用保留的已结束任务总数（运行中任务不受此限）。
+const MAX_FINISHED_JOBS_GLOBAL: usize = 200;
 /// 任务输出尾部缓冲上限（字节）：超限丢弃前半（结论通常在末尾）
 const JOB_OUTPUT_CAP: usize = 512 * 1024;
 
@@ -50,6 +54,9 @@ pub struct Job {
     pub ok: bool,
     /// 结束摘要（未结束时为 None）
     pub summary: Option<String>,
+    /// 创建/结束时间（Unix 毫秒），用于稳定排序和终态记录回收。
+    pub created_at: u64,
+    pub finished_at: Option<u64>,
 }
 
 /// 任务生命周期状态（dsh 式 running→stopping→terminal 三态）
@@ -92,6 +99,42 @@ pub struct JobInfo {
     pub ok: bool,
     pub summary: Option<String>,
     pub output_len: usize,
+    pub created_at: u64,
+    pub finished_at: Option<u64>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn prune_finished_jobs(map: &mut HashMap<String, Arc<Mutex<Job>>>) {
+    let mut finished: Vec<(String, String, u64)> = map
+        .iter()
+        .filter_map(|(id, job)| {
+            let job = job.lock().ok()?;
+            (job.status == JobStatus::Finished).then(|| {
+                (id.clone(), job.conversation_id.clone(), job.finished_at.unwrap_or(job.created_at))
+            })
+        })
+        .collect();
+    finished.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut per_conversation: HashMap<String, usize> = HashMap::new();
+    let mut keep = std::collections::HashSet::new();
+    for (id, conversation_id, _) in finished {
+        let count = per_conversation.entry(conversation_id).or_default();
+        if keep.len() < MAX_FINISHED_JOBS_GLOBAL && *count < MAX_FINISHED_JOBS_PER_CONVERSATION {
+            keep.insert(id);
+            *count += 1;
+        }
+    }
+    map.retain(|id, job| {
+        job.lock()
+            .map(|job| job.status != JobStatus::Finished || keep.contains(id))
+            .unwrap_or(false)
+    });
 }
 
 /// 后台启动命令：立即返回 job_id；完成后注入会话队列 + 发前端事件。
@@ -107,7 +150,8 @@ pub fn start_background(
 ) -> Result<String, String> {
     // 会话活跃任务上限：超过拒绝启动（防无限堆积）
     {
-        let map = jobs().lock().map_err(|e| e.to_string())?;
+        let mut map = jobs().lock().map_err(|e| e.to_string())?;
+        prune_finished_jobs(&mut map);
         let active = map
             .values()
             .filter(|j| {
@@ -132,6 +176,8 @@ pub fn start_background(
         status: JobStatus::Running,
         ok: false,
         summary: None,
+        created_at: now_ms(),
+        finished_at: None,
     }));
     {
         let mut map = jobs().lock().map_err(|e| e.to_string())?;
@@ -215,10 +261,13 @@ async fn run_job(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let status = loop {
         tokio::select! {
-            r = &mut wait_fut => break match r {
-                Ok(s) => s,
+            r = &mut wait_fut => match r {
+                Ok(s) => break s,
                 Err(e) => {
-                    finish_job(job, false, format!("等待命令失败: {e}"));
+                    finish_job_readers(stdout_task, stderr_task).await;
+                    let summary = format!("等待命令失败: {e}");
+                    finish_job(job, false, summary.clone());
+                    notify(&app, &conv, &job_id, &command, false, &summary);
                     return;
                 }
             },
@@ -244,11 +293,11 @@ async fn run_job(
     };
     finish_job(job, ok, summary.clone());
     // 结束摘要以任务记录为准（job_kill 已先置“已被终止”时不被退出码覆盖）
-    let final_summary = job
+    let (final_ok, final_summary) = job
         .lock()
-        .map(|j| j.summary.clone().unwrap_or_else(|| summary.clone()))
-        .unwrap_or_else(|_| summary.clone());
-    notify(&app, &conv, &job_id, &command, ok, &final_summary);
+        .map(|j| (j.ok, j.summary.clone().unwrap_or_else(|| summary.clone())))
+        .unwrap_or_else(|_| (ok, summary.clone()));
+    notify(&app, &conv, &job_id, &command, final_ok, &final_summary);
 }
 
 /// Windows 包装命令退出后，孙进程可能继续持有管道句柄。限制 EOF 收尾等待时间，
@@ -305,6 +354,7 @@ fn finish_job(job: &Arc<Mutex<Job>>, ok: bool, summary: String) {
         j.status = JobStatus::Finished;
         j.ok = ok;
         j.summary = Some(summary);
+        j.finished_at = Some(now_ms());
     }
 }
 
@@ -375,11 +425,13 @@ pub fn list_jobs(conversation_id: &str) -> Vec<JobInfo> {
                 ok: j.ok,
                 summary: j.summary.clone(),
                 output_len: j.output.len(),
+                created_at: j.created_at,
+                finished_at: j.finished_at,
             })
         })
         .flatten()
         .collect();
-    out.sort_by(|a, b| b.job_id.cmp(&a.job_id));
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.job_id.cmp(&a.job_id)));
     out
 }
 
@@ -436,24 +488,31 @@ fn find_job(conversation_id: &str, job_id: &str) -> Result<Arc<Mutex<Job>>, Stri
     Ok(job)
 }
 
-/// 清理会话的全部后台任务（会话删除/重置时调用）：强杀未完成任务并移除记录
+/// 清理会话的全部后台任务（会话删除/重置时调用）：强杀未完成任务并移除全部记录。
 pub fn drop_conversation_jobs(conversation_id: &str) {
-    if let Ok(mut map) = jobs().lock() {
-        let to_kill: Vec<(String, Option<u32>)> = map
+    let to_kill = if let Ok(mut map) = jobs().lock() {
+        let pids: Vec<Option<u32>> = map
             .iter()
             .filter(|(_, j)| {
                 j.lock()
                     .map(|j| j.conversation_id == conversation_id && j.status != JobStatus::Finished)
                     .unwrap_or(false)
             })
-            .map(|(id, j)| (id.clone(), j.lock().map(|j| j.pid).unwrap_or(None)))
+            .map(|(_, j)| j.lock().map(|j| j.pid).unwrap_or(None))
             .collect();
-        for (_, pid) in &to_kill {
-            crate::utils::process::kill_tree(*pid);
-        }
-        for (id, _) in to_kill {
-            map.remove(&id);
-        }
+        map.retain(|_, job| {
+            job.lock()
+                .map(|job| job.conversation_id != conversation_id)
+                .unwrap_or(false)
+        });
+        pids
+    } else {
+        Vec::new()
+    };
+    // kill_tree 在 Windows 可能调用 taskkill 并阻塞；释放全局任务表锁后再做系统调用，
+    // 避免会话删除期间 job_list/job_output 连带卡住。
+    for pid in to_kill {
+        crate::utils::process::kill_tree(pid);
     }
 }
 
@@ -597,6 +656,8 @@ mod tests {
             status: JobStatus::Running,
             ok: false,
             summary: None,
+            created_at: now_ms(),
+            finished_at: None,
         }));
         // 先写头部块再写超大尾部块：裁剪后应只保留尾部（头部全部丢弃）
         let head = "b".repeat(JOB_OUTPUT_CAP + 100);
@@ -621,6 +682,8 @@ mod tests {
             status: JobStatus::Running,
             ok: false,
             summary: None,
+            created_at: now_ms(),
+            finished_at: None,
         }));
         assert_eq!(job.lock().unwrap().status.as_str(), "running");
         // kill 先置 stopping：job_list 立即反映终止意图，且收尾前状态可查
@@ -633,5 +696,48 @@ mod tests {
         assert_eq!(j.status.as_str(), "finished");
         assert!(!j.ok, "幂等：已结束任务的 ok 不被后续覆盖");
         assert_eq!(j.summary.as_deref(), Some("已被 job_kill 终止"));
+        assert!(j.finished_at.is_some());
+    }
+
+    #[test]
+    fn pruning_keeps_running_and_caps_finished_history() {
+        let mut map = HashMap::new();
+        for i in 0..(MAX_FINISHED_JOBS_PER_CONVERSATION + 7) {
+            map.insert(
+                format!("done-{i}"),
+                Arc::new(Mutex::new(Job {
+                    conversation_id: "conv".into(),
+                    command: "x".into(),
+                    cwd: PathBuf::from("."),
+                    pid: None,
+                    output: "large output".into(),
+                    status: JobStatus::Finished,
+                    ok: true,
+                    summary: Some("done".into()),
+                    created_at: i as u64,
+                    finished_at: Some(i as u64),
+                })),
+            );
+        }
+        map.insert(
+            "running".into(),
+            Arc::new(Mutex::new(Job {
+                conversation_id: "conv".into(),
+                command: "watch".into(),
+                cwd: PathBuf::from("."),
+                pid: None,
+                output: String::new(),
+                status: JobStatus::Running,
+                ok: false,
+                summary: None,
+                created_at: 999,
+                finished_at: None,
+            })),
+        );
+        prune_finished_jobs(&mut map);
+        assert!(map.contains_key("running"));
+        assert_eq!(map.len(), MAX_FINISHED_JOBS_PER_CONVERSATION + 1);
+        assert!(map.contains_key(&format!("done-{}", MAX_FINISHED_JOBS_PER_CONVERSATION + 6)));
+        assert!(!map.contains_key("done-0"));
     }
 }

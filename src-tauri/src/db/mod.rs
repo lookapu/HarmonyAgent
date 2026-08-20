@@ -26,7 +26,19 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     run_migrations(&conn)?;
+    recover_interrupted_tool_runs(&conn)?;
     Ok(Mutex::new(conn))
+}
+
+/// 应用异常退出时，执行前已落库但未写终态的工具会残留 running。启动恢复将其明确
+/// 标记为 cancelled，避免审计/评估长期误判仍在执行，也为“继续任务”保留真实原因。
+fn recover_interrupted_tool_runs(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "UPDATE tool_runs SET status='cancelled',
+         result_json=COALESCE(NULLIF(result_json, ''), '应用在工具执行期间退出，调用未完成')
+         WHERE status='running'",
+        [],
+    )
 }
 
 /// 全部迁移清单（id, 名称, SQL）。启动迁移与 db_migrate 工具共用同一清单。
@@ -83,6 +95,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (50, "050_task_ledger", include_str!("../../migrations/050_task_ledger.sql")),
     (51, "051_conversation_snapshots", include_str!("../../migrations/051_conversation_snapshots.sql")),
     (52, "052_reminders_feedback_terms", include_str!("../../migrations/052_reminders_feedback_terms.sql")),
+    (53, "053_tool_run_lifecycle", include_str!("../../migrations/053_tool_run_lifecycle.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -150,8 +163,7 @@ pub fn apply_pending_migrations(conn: &Connection) -> Result<usize, rusqlite::Er
 mod tests {
     use super::*;
 
-    /// 迁移清单必须完整注册：执行后 ohpm_landscape 应含排序三列
-    /// （防止新增迁移文件但忘记注册到 MIGRATIONS 清单导致线上缺列）
+    /// 迁移清单必须完整注册：验证关键后期迁移列，防止新增迁移文件却未登记。
     #[test]
     fn migrations_apply_ohpm_sort_columns() {
         let conn = Connection::open_in_memory().unwrap();
@@ -166,5 +178,47 @@ mod tests {
         for c in ["likes", "popularity", "latest_publish_time"] {
             assert!(cols.iter().any(|x| x == c), "迁移后缺少列 {c}: {cols:?}");
         }
+        let tool_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(tool_runs)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in ["trace_id", "call_id"] {
+            assert!(tool_cols.iter().any(|x| x == c), "tool_runs 迁移后缺少列 {c}: {tool_cols:?}");
+        }
+    }
+
+    #[test]
+    fn startup_recovers_unfinished_tool_audit_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id,name,path,kind,trusted,created_at) VALUES ('p','p','/tmp/p','other',0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES ('c','p','c',0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tool_runs (id,conversation_id,tool_name,status,created_at,trace_id,call_id)
+             VALUES ('call','c','run_command','running',0,'trace','call')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(recover_interrupted_tool_runs(&conn).unwrap(), 1);
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT status,result_json FROM tool_runs WHERE id='call'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "cancelled");
+        assert!(row.1.contains("未完成"));
     }
 }

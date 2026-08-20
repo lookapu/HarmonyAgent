@@ -217,6 +217,8 @@ export interface PendingConfirmation {
   request_id: string
   tool: string | null
   args: string | null
+  level: string | null
+  desc: string | null
   plan: string | null
   question: string | null
   options: string[] | null
