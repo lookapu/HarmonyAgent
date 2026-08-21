@@ -4,7 +4,7 @@
 
 | 验收项 | 自动化证据 | 结论 |
 | --- | --- | --- |
-| 全部注册工具具有完整元数据和结构化结果 | `every_registered_tool_has_complete_execution_metadata`、`every_registered_tool_emits_complete_v2_shape`、`v2_reads_legacy_records_and_preserves_unknown_fields` | 198 个注册工具共享契约真源；旧 V2 和未知未来字段可读 |
+| 全部注册工具具有完整元数据和结构化结果 | `every_registered_tool_has_complete_execution_metadata`、`every_registered_tool_emits_complete_v2_shape`、`v2_reads_legacy_records_and_preserves_unknown_fields` | 201 个注册工具共享契约真源；旧 V2 和未知未来字段可读 |
 | 高频工具覆盖成功、失败、超时、取消、重试和恢复 | `high_frequency_tools_cover_success_failure_timeout_cancel_retry_and_recovery_protocols`；真实卡死、取消与崩溃测试见 `TOOL_ISOLATION.md` | 12 个高频工具通过统一故障协议矩阵，执行内核另有真实故障注入 |
 | 工具暴露数量下降且典型任务仍可完成 | `selection_is_bounded_and_task_specific`、`phase_selection_unlocks_side_effects_only_when_needed`、`bounded_phase_selection_keeps_representative_tasks_acceptable` | 每阶段最多暴露 32 个工具；编译修复、部署和 Git 交付的验收证据仍全部可达 |
 | 副作用重复可度量且崩溃时为零 | `duplicate_side_effect_is_blocked_before_execution`、`crashed_tool_worker_leaves_effect_for_verification`、`side_effect_repeat_rate` SLO | 重复成功副作用进入指标；幂等门禁和崩溃恢复阻止盲目重放 |

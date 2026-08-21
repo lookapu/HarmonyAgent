@@ -10,7 +10,7 @@
 
 ## 它是什么
 
-不是简单的 Provider 切换器。**198 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
+不是简单的 Provider 切换器。**201 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
 
 | 维度 | 能力 |
 |------|------|
@@ -132,9 +132,9 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 281 个 Tauri IPC 入口 · 36 个 service 模块        │
-│  - agent/ 29 个顶层模块 · tools/ 29 文件 · 198 工具  │
-│  - SQLite + 68 个迁移 · Run/步骤/工具全链路事件溯源  │
+│  - 286 个 Tauri IPC 入口 · 54 个 service 模块        │
+│  - agent/ 37 个顶层模块 · tools/ 29 文件 · 201 工具  │
+│  - SQLite + 75 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -143,7 +143,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 
 ```
 src-tauri/src/
-├── agent/                  # AI Agent 内核（29 个顶层模块）
+├── agent/                  # AI Agent 内核（37 个顶层模块）
 │   ├── runtime.rs           #   - Durable Run 状态机与事件游标
 │   ├── scheduler.rs         #   - 持久队列、Worker 租约与 fencing
 │   ├── coordinator.rs       #   - 执行步骤与恢复检查点
@@ -172,7 +172,7 @@ src-tauri/src/
 │   ├── session_ctx.rs       #   - 会话级运行态（统一收敛）
 │   ├── invariants.rs         #   - 写操作不变式（.env/证书/迁移 SQL）
 │   ├── session_events.rs    #   - 会话事件溯源
-│   └── tools/               #   - 198 个 Agent 工具（29 文件）
+│   └── tools/               #   - 201 个 Agent 工具（29 文件）
 │       ├── mod.rs               # 工具注册表（TOOL_SPECS）+ 协议分发
 │       ├── protocol.rs          # 工具调用标记解析
 │       ├── errors.rs            # 结构化错误信封（ToolError 7 类）
@@ -201,8 +201,8 @@ src-tauri/src/
 │       ├── quality_runtime.rs   #   运行时质量（6 工具）
 │       ├── quality_media.rs     #   媒体质量（2 工具）
 │       └── schedule_tools.rs    # 定时提醒（schedule_create/list/delete）
-├── commands/               # 33 个命令模块（合计 281 个 IPC 注册入口）
-├── services/               # 业务服务（36 个）
+├── commands/               # 36 个命令模块（合计 286 个 IPC 注册入口）
+├── services/               # 业务服务（54 个）
 │   ├── proxy_service.rs    #   - 本地代理
 │   ├── circuit_breaker.rs  #   - 熔断器
 │   ├── model_router.rs     #   - 模型路由
@@ -223,7 +223,7 @@ src-tauri/src/
 
 > **关于大文件**：`src-tauri/runtime/`（便携运行时）、`src-tauri/resources/`（种子知识库 + embedding 模型，约 340MB）与 `portable-build/`（绿色版产物）共约 1GB，属构建产物/下载资源，**不随 Git 仓库分发**（见 `.gitignore`）。本机构建请保留这些目录；克隆用户可从 Release 安装包获取完整运行时，或参照 [release.yml](.github/workflows/release.yml) 的下载逻辑自行准备。
 
-## 198 个 Agent 工具按域分组
+## 201 个 Agent 工具按域分组
 
 | 域（TOOL_GROUP） | 代表工具 |
 |------|------|

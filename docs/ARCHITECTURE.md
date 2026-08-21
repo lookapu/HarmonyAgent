@@ -32,14 +32,14 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 │   Run 状态机 / 执行步骤 / 调度队列 / DAG / 恢复 / 治理       │
 │                                                              │
 │ Tool Execution Kernel                                       │
-│   198 工具 / 审批流水线 / 专用线程 / 租约 / fencing / 幂等   │
+│   201 工具 / 审批流水线 / 专用线程 / 租约 / fencing / 幂等   │
 │                                                              │
 │ Services                                                     │
 │   Provider/代理/熔断/成本、鸿蒙环境、知识库、MCP、LAN         │
 └────────────────────────────┬─────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────┐
-│ SQLite（68 个迁移） + 本地文件/钥匙串 + 外部工具链           │
+│ SQLite（75 个迁移） + 本地文件/钥匙串 + 外部工具链           │
 │ HarmonyOS SDK / hvigor / ohpm / hdc / ArkTS LSP              │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -48,14 +48,14 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 
 | 项目 | 实际值 |
 |---|---:|
-| Agent 对外工具 | 198 |
-| `agent/` 顶层模块（不含 `mod.rs`） | 29 |
-| `agent/tools/` Rust 文件（含 `mod.rs`） | 29 |
-| `commands/` 命令模块（不含 `mod.rs`） | 33 |
-| `services/` 服务模块（不含 `mod.rs`） | 36 |
-| Tauri IPC 注册入口 | 281 |
+| Agent 对外工具 | 201 |
+| `agent/` 顶层模块（不含 `mod.rs`） | 37 |
+| `agent/tools/` Rust 文件（含 `mod.rs`） | 30 |
+| `commands/` 命令模块（不含 `mod.rs`） | 36 |
+| `services/` 服务模块（不含 `mod.rs`） | 54 |
+| Tauri IPC 注册入口 | 286 |
 | 数据库迁移 | 75 |
-| React 页面 | 14 |
+| React 页面 | 16 |
 
 以上计数会随代码演进变化；工具数以 `TOOL_SPECS`、IPC 入口以 `lib.rs` 的 `generate_handler!`、迁移数以 `src-tauri/migrations/` 为准。
 

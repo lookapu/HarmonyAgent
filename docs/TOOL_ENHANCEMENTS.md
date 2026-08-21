@@ -6,7 +6,7 @@
 
 | 项目 | 当前值 | 权威来源 |
 |---|---:|---|
-| 对外 Agent 工具 | 198 | `agent/tools/mod.rs::TOOL_SPECS` |
+| 对外 Agent 工具 | 201 | `agent/tools/mod.rs::TOOL_SPECS` |
 | 工具实现文件 | 29 | `src-tauri/src/agent/tools/*.rs` |
 | 任务分组 | 8 | `TOOL_GROUP` / `TASK_GROUPS` |
 | 权限等级 | L0/L1/L2 | `services/permissions.rs` 与工具 hooks |
@@ -138,12 +138,13 @@
 | 2026-08-16 | 工具扩展至 191，补齐日志查询、文档/音频、调试、内存、OTA、许可证和漏洞扫描，并拆分质量模块 |
 | 2026-08-20 | 增至 198：`memorize`、`ui_focus`、`schedule_create/list/delete`，并加入时间旅行、混合检索与循环检测 |
 | 2026-08-21 | 工具数不变；新增证据契约、持久调度、DAG、多 Worker、Tool Execution Kernel、专用执行线程和可靠性控制面 |
+| 2026-08-22 | 增至 201：`workflow_template`、`team_share`、`reproduction_bundle`，随工作流治理、团队共享与复现包批次落地 |
 
 工具数量只描述对外能力数；2026-08-21 的重点是让已有工具在崩溃、超时、多实例和副作用场景下可恢复，而不是继续增加工具名。
 
 ## 7. 明确暂缓项
 
-以下外部服务集成不属于当前 198 工具，保持暂缓：
+以下外部服务集成不属于当前 201 工具，保持暂缓：
 
 - Figma 导入；
 - 飞书任务同步；
