@@ -539,6 +539,14 @@ export default function OhpmPage() {
                             {p.author_name && (
                               <span className="shrink-0 text-[10px] text-[var(--text-muted)] truncate">· {p.author_name}</span>
                             )}
+                            {p.license && (
+                              <span
+                                className="shrink-0 rounded px-1 py-0.5 text-[9px] font-mono bg-[var(--bg-hover)] text-[var(--text-secondary)]"
+                                title={`License: ${p.license}`}
+                              >
+                                {p.license}
+                              </span>
+                            )}
                             {opening === p.package_name && (
                               <span className="shrink-0 text-[10px] text-[var(--accent)]">{t('ohpm.opening')}</span>
                             )}

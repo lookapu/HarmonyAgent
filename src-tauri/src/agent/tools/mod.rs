@@ -315,7 +315,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "ohpm_search",
-        desc: "在 ohpm 官方仓库搜索三方库（ohpm search），确认包是否存在与可用版本。\n参数：{\"keyword\":\"<包名或关键字>\",\"detail\":<可选 true 时追加 ohpm info 查询版本/依赖详情>}。\n适合：写代码前确认三方库在 ohpm 仓库的可用性/版本、查依赖包说明；确认后可 ohpm_install package=<包名> 安装。\n副作用：无（只读仓库索引）。\n返回：搜索/详情结果。",
+        desc: "在 ohpm 官方 registry 查询并审计三方库，确认包、版本关系、HarmonyOS API 兼容范围、许可证和供应链风险。\n参数：{\"keyword\":\"<精确包名>\",\"version\":\"<可选待比较版本>\",\"api_level\":<可选工程 API，缺省读取绑定工程 compatible API>,\"detail\":<可选 true 展开最近版本与原始兼容声明>}。\n适合：写代码或安装前确认版本是否落后、包声明是否兼容当前工程、许可证义务、完整性摘要、安装期脚本与外部来源依赖。registry 不提供可核验漏洞公告时会明确标为未知，不把“未发现”误报成安全。\n副作用：无（只读官方 registry 与本地工程配置）。\n返回：registry 来源证据、版本比较、兼容判定、许可证风险、安全边界和验证建议。",
     },
     ToolSpec {
         name: "create_harmony_project",
@@ -1169,7 +1169,7 @@ pub async fn run_tool(
         "stop_app" => device_tools::stop_app(&args, &roots).await,
         "device_shell" => device_tools::device_shell(&args).await,
         "analyze_crash" => device_tools::analyze_crash(&args, &roots).await,
-        "ohpm_search" => build_tools::ohpm_search(&args).await,
+        "ohpm_search" => build_tools::ohpm_search(&args, &roots, db).await,
         "ohpm_recommend" => build_tools::ohpm_recommend(&args, db).await,
         "build_project" => build_tools::build_project(&args, &roots, ctx, project_id).await,
         "deploy" => build_tools::deploy(&args, &roots, ctx, project_id).await,

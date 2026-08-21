@@ -1759,7 +1759,11 @@ pub(super) fn classify_deploy_error(output: &str, is_signed: bool) -> (String, S
     (category.to_string(), out)
 }
 
-pub(super) async fn ohpm_search(args: &Value) -> Result<String, String> {
+pub(super) async fn ohpm_search(
+    args: &Value,
+    roots: &[String],
+    db: &crate::db::DbState,
+) -> Result<String, String> {
     let keyword = args["keyword"]
         .as_str()
         .map(|s| s.trim())
@@ -1768,47 +1772,49 @@ pub(super) async fn ohpm_search(args: &Value) -> Result<String, String> {
         return Err("ohpm_search 需要 keyword（包名或关键字）".into());
     };
     let detail = args["detail"].as_bool().unwrap_or(false);
-    // ohpm 6.x 已移除 search 子命令：优先 view 查询包信息（返回版本/描述/依赖），
-    // 兼容旧版先试 search、报 unknown command 时自动回退 view
-    let search_out = match run_cmd("ohpm", &["search".into(), keyword.to_string()], None, 60).await
-    {
-        Ok(o) => o,
-        Err(e) if e.contains("unknown command") || e.contains("unknown option") => String::new(),
-        Err(e) => return Err(with_advice("ohpm_search", e)),
-    };
-    let search_out = search_out.trim();
-    let mut s = String::new();
-    if search_out.is_empty() {
-        s.push_str(&format!(
-            "ohpm 无 search 命令（6.x 起移除），改用 view 查询包「{keyword}」信息：\n"
-        ));
-    } else {
-        s.push_str(&format!("ohpm 搜索结果（{keyword}）：\n{}\n", search_out));
+    let explicit_version = args["version"].as_str().map(str::trim).filter(|value| !value.is_empty());
+    let explicit_api = args["api_level"].as_u64().and_then(|value| u32::try_from(value).ok());
+    let env = crate::services::harmony_env::detect(db);
+    let project_root = roots.first().map(Path::new).filter(|root| root.is_dir());
+    let project_api = project_root.map(|root| {
+        crate::services::sdk_api::project_api_context(Some(root), None, env.default_api.as_deref())
+    });
+    let project_dependency = project_root
+        .map(crate::services::harmony_model::cached)
+        .and_then(|model| model.dependencies.into_iter().find(|dependency| dependency.name == keyword));
+    let comparison_version = explicit_version
+        .map(str::to_string)
+        .or_else(|| project_dependency.as_ref().and_then(|dependency| dependency.locked_version.clone()));
+    let target_api = explicit_api.or_else(|| project_api.as_ref().and_then(|context| context.compatible_api));
+    match crate::services::ohpm_audit::fetch(keyword, comparison_version.as_deref(), target_api).await {
+        Ok(audit) => {
+            let mut out = crate::services::ohpm_audit::render(&audit, detail);
+            if let Some(dependency) = &project_dependency {
+                out.push_str(&format!(
+                    "- 工程依赖证据: {} 声明 {}{}（{}）\n",
+                    dependency.from_module,
+                    dependency.requirement,
+                    dependency.locked_version.as_ref().map(|value| format!("；锁定 {value}")).unwrap_or_default(),
+                    dependency.scope,
+                ));
+            }
+            out.push_str(&format!(
+                "\n采用前闭环：核对源码/公告 → 锁定 {} → ohpm_install → check_sdk_alignment → lint/test/build_project。",
+                audit.selected_version
+            ));
+            return Ok(out);
+        }
+        Err(registry_error) => {
+            // registry 结构变化或网络异常时保留旧 CLI 只读降级，不能丢掉可用性查询能力。
+            let mut fallback = format!("官方 registry 审计不可用：{registry_error}\n降级到本机 ohpm CLI（许可证/安全/兼容状态均未验证）：\n");
+            let view = run_cmd("ohpm", &["view".into(), keyword.to_string()], None, 60)
+                .await
+                .map_err(|error| with_advice("ohpm_search", format!("{registry_error}；CLI 降级也失败：{error}")))?;
+            fallback.push_str(view.trim_end());
+            fallback.push_str("\n结论：仅确认 CLI 可查询，禁止据此宣称许可证、兼容性或安全性已通过。");
+            return Ok(fallback);
+        }
     }
-    let view = run_cmd("ohpm", &["view".into(), keyword.to_string()], None, 60)
-        .await
-        .unwrap_or_else(|e| format!("ohpm view 失败：{e}"));
-    if view.contains("error") || view.contains("not found") {
-        s.push_str(&format!("ohpm 仓库未找到与「{keyword}」匹配的包（view 无结果）。\n建议：检查包名拼写；用 web_search 查该库的鸿蒙支持情况；或考虑替代库。\n"));
-        return Ok(s);
-    }
-    s.push_str(&format!(
-        "--- ohpm view {keyword} ---\n{}\n",
-        view.trim_end()
-    ));
-    if detail {
-        let info = run_cmd("ohpm", &["info".into(), keyword.to_string()], None, 60)
-            .await
-            .unwrap_or_else(|e| format!("ohpm info 失败：{e}"));
-        s.push_str(&format!(
-            "\n--- ohpm info {keyword} ---\n{}\n",
-            info.trim_end()
-        ));
-    }
-    s.push_str(&format!(
-        "\n确认可用后：ohpm_install package={keyword}（或先 edit_file 更新 oh-package.json5 依赖再 ohpm_install）。"
-    ));
-    Ok(s)
 }
 
 /// 截断展示用文本（保留前 n 字符）

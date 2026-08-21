@@ -31,6 +31,7 @@ pub mod mcp_manager;
 pub mod model_router;
 pub mod node_runtime;
 pub mod ohpm_landscape;
+pub mod ohpm_audit;
 pub mod permissions;
 pub mod proxy_service;
 pub mod reminders;
