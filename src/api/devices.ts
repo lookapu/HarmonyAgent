@@ -6,6 +6,13 @@ export interface DeviceInfo {
   state: string
   model: string
   os_version: string
+  connection?: 'online' | 'offline' | 'unauthorized' | 'unknown'
+  authorized?: boolean
+  api_level?: number | null
+  architecture?: string
+  resolution?: string
+  capabilities?: string[]
+  observed_at?: number
   is_default: boolean
 }
 

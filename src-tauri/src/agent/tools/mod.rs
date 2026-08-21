@@ -271,7 +271,7 @@ pub fn tool_group(name: &str) -> &'static str {
 pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_devices",
-        desc: "列出已连接的 HarmonyOS 设备（含在线状态、型号、系统 API 版本、是否默认设备）。\n参数：无。\n副作用：无（只读）。\n返回：结构化设备列表；多台在线设备时会提示用 device 参数显式指定部署/截图/日志目标，★ 标记默认设备。无设备时给出连接建议。",
+        desc: "列出统一 HarmonyOS 设备快照：保留 hdc 原始状态，并归一连接/授权状态、型号、系统/API Level、ABI 架构、物理屏幕、可用能力、观测时间和默认设备。\n参数：无。\n副作用：无（只读；在线设备的属性/能力探测并发执行且有超时）。\n返回：结构化设备列表；能力含 shell/install/ability/hilog，以及有真实探测证据时的 screenshot/ui_automation/diagnostics/performance。多台在线设备时提示显式指定 device，★ 标记默认设备。",
     },
     ToolSpec {
         name: "connect_device",
@@ -1616,7 +1616,26 @@ async fn list_devices() -> Result<String, String> {
                 let flag = if d.is_default { "★默认" } else { "" };
                 let model = if d.model.is_empty() { String::new() } else { format!(" 型号:{}", d.model) };
                 let os = if d.os_version.is_empty() { String::new() } else { format!(" 系统:{}", d.os_version) };
-                s.push_str(&format!("- {} [{}]{}{}{}\n", d.id, d.state, model, os, flag));
+                let architecture = if d.architecture.is_empty() { String::new() } else { format!(" 架构:{}", d.architecture) };
+                let screen = if d.resolution.is_empty() { String::new() } else { format!(" 屏幕:{}", d.resolution) };
+                let capabilities = if d.capabilities.is_empty() {
+                    String::new()
+                } else {
+                    format!(" 能力:{}", d.capabilities.join(","))
+                };
+                s.push_str(&format!(
+                    "- {} [raw={} connection={} authorized={}]{}{}{}{}{}{}\n",
+                    d.id,
+                    d.state,
+                    d.connection,
+                    d.authorized,
+                    model,
+                    os,
+                    architecture,
+                    screen,
+                    capabilities,
+                    flag
+                ));
             }
             if online.len() > 1 {
                 s.push_str("\n检测到多台在线设备，部署/截图/日志时请用 device 参数显式指定目标（默认设备会被标记★），避免误操作。\n");
@@ -1762,11 +1781,6 @@ fn save_default_device(device_id: &str) {
     }
 }
 
-fn load_default_device() -> Option<String> {
-    let path = default_device_file()?;
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
 fn default_device_file() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     let home = std::env::var("APPDATA").ok();
@@ -1777,29 +1791,20 @@ fn default_device_file() -> Option<std::path::PathBuf> {
 
 /// 选取默认设备：优先持久化记忆且在线的设备，否则第一个在线设备
 async fn default_device_id() -> Result<String, String> {
-    let out = run_cmd("hdc", &["list".to_string(), "targets".to_string()], None, 30)
+    let devices = crate::commands::devices::list_devices()
         .await
         .map_err(|e| format!("hdc 不可用: {}", with_advice("list_devices", e)))?;
-    let mut online: Vec<String> = Vec::new();
-    for line in out.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.eq_ignore_ascii_case("[Empty]") {
-            continue;
-        }
-        let first = line.split_whitespace().next().unwrap_or("").to_string();
-        if !first.is_empty() && !first.starts_with('[') {
-            online.push(first);
-        }
-    }
+    let online: Vec<_> = devices
+        .iter()
+        .filter(|device| device.connection == "online" && device.authorized)
+        .collect();
     if online.is_empty() {
-        return Err("未检测到在线设备，请连接设备或开启无线调试".into());
+        return Err("未检测到已授权在线设备，请连接设备并确认调试授权".into());
     }
-    if let Some(saved) = load_default_device() {
-        if online.contains(&saved) {
-            return Ok(saved);
-        }
+    if let Some(default) = online.iter().find(|device| device.is_default) {
+        return Ok(default.id.clone());
     }
-    Ok(online.into_iter().next().unwrap())
+    Ok(online[0].id.clone())
 }
 
 /// 在指定设备上执行 `hdc -t <device> shell <args...>`

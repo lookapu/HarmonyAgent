@@ -488,7 +488,9 @@ export function DevicesPanel({
           </div>
         )}
         {devices.map((d) => {
-          const online = d.state === 'Connected' || d.state === 'Ready' || d.state === 'Online'
+          const online = d.connection
+            ? d.connection === 'online' && d.authorized !== false
+            : d.state === 'Connected' || d.state === 'Ready' || d.state === 'Online'
           return (
             <div
               key={d.id}
@@ -527,8 +529,27 @@ export function DevicesPanel({
                       <span className="text-[10.5px] text-[var(--text-muted)]">{d.os_version}</span>
                     )}
                   </div>
+                  {(d.architecture || d.resolution) && (
+                    <div className="flex items-center gap-1.5 mt-1 text-[9.5px] text-[var(--text-muted)]">
+                      {d.architecture && <span className="font-mono">{d.architecture}</span>}
+                      {d.architecture && d.resolution && <span>·</span>}
+                      {d.resolution && <span>{d.resolution}</span>}
+                    </div>
+                  )}
                 </div>
               </div>
+              {online && d.capabilities && d.capabilities.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1" title={`Observed at ${d.observed_at ?? 0}`}>
+                  {d.capabilities.map((capability) => (
+                    <span
+                      key={capability}
+                      className="px-1.5 py-0.5 rounded bg-[var(--bg-hover)] text-[9px] text-[var(--text-muted)] font-mono"
+                    >
+                      {capability}
+                    </span>
+                  ))}
+                </div>
+              )}
               {!d.is_default && online && (
                 <button
                   onClick={() => handleSetDefault(d.id)}

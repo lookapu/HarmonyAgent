@@ -19,6 +19,20 @@ pub struct DeviceInfo {
     pub model: String,
     /// 系统版本（const.product.name 或 os_version），取不到为空
     pub os_version: String,
+    /// 归一化连接状态：online / offline / unauthorized / unknown
+    pub connection: String,
+    /// hdc shell 是否已授权可用
+    pub authorized: bool,
+    /// 系统 API Level
+    pub api_level: Option<i64>,
+    /// 主 ABI/架构（如 arm64-v8a）
+    pub architecture: String,
+    /// 物理屏幕分辨率（如 1080x2400）
+    pub resolution: String,
+    /// 已用设备证据确认可用的能力
+    pub capabilities: Vec<String>,
+    /// 快照观测时间（Unix 秒）
+    pub observed_at: i64,
     /// 是否为当前默认设备
     pub is_default: bool,
 }
@@ -28,7 +42,11 @@ fn default_device_file() -> Option<std::path::PathBuf> {
     let home = std::env::var("APPDATA").ok();
     #[cfg(not(windows))]
     let home = std::env::var("HOME").ok();
-    home.map(|h| std::path::PathBuf::from(h).join("deveco-code-switch").join("default_device.txt"))
+    home.map(|h| {
+        std::path::PathBuf::from(h)
+            .join("deveco-code-switch")
+            .join("default_device.txt")
+    })
 }
 
 fn load_default_device() -> Option<String> {
@@ -48,12 +66,21 @@ fn save_default_device(device_id: &str) {
     }
 }
 
-async fn run_hdc(args: &[&str], _timeout: u64) -> Result<String, String> {
+async fn run_hdc(args: &[&str], timeout_secs: u64) -> Result<String, String> {
     let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let output = process::command("hdc", &owned)?
-        .output()
-        .await
-        .map_err(|e| format!("hdc 不可用: {e}"))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs.max(1)),
+        process::command("hdc", &owned)?.output(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "hdc 命令超时（{} 秒）：{}",
+            timeout_secs.max(1),
+            owned.join(" ")
+        )
+    })?
+    .map_err(|e| format!("hdc 不可用: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -61,13 +88,63 @@ async fn run_hdc(args: &[&str], _timeout: u64) -> Result<String, String> {
 }
 
 async fn shell_param(device: &str, key: &str) -> String {
-    let out = run_hdc(
-        &["-t", device, "shell", "param", "get", key],
-        15,
-    )
-    .await
-    .unwrap_or_default();
+    let out = run_hdc(&["-t", device, "shell", "param", "get", key], 15)
+        .await
+        .unwrap_or_default();
     out.trim().to_string()
+}
+
+fn parse_target_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.eq_ignore_ascii_case("[Empty]") {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let id = parts.next()?;
+    if id.starts_with('[') {
+        return None;
+    }
+    Some((id.to_string(), parts.next().unwrap_or("Online").to_string()))
+}
+
+fn normalize_connection(state: &str) -> (&'static str, bool) {
+    match state.to_ascii_lowercase().as_str() {
+        "connected" | "ready" | "online" => ("online", true),
+        value if value.contains("unauthor") || value.contains("reject") => ("unauthorized", false),
+        "offline" | "disconnected" => ("offline", false),
+        _ => ("unknown", false),
+    }
+}
+
+fn parse_resolution(output: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("Physical size:")
+                .unwrap_or_else(|| line.trim())
+                .trim();
+            let (width, height) = value.split_once('x')?;
+            (width.trim().parse::<u32>().is_ok() && height.trim().parse::<u32>().is_ok())
+                .then(|| format!("{}x{}", width.trim(), height.trim()))
+        })
+        .unwrap_or_default()
+}
+
+fn parse_api_level(value: &str) -> Option<i64> {
+    value
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|part| !part.is_empty())?
+        .parse()
+        .ok()
+}
+
+fn observed_at() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// 列出所有已连接设备及在线状态、型号、系统版本。
@@ -77,32 +154,100 @@ pub async fn list_devices() -> Result<Vec<DeviceInfo>, String> {
     let default = load_default_device();
     let mut devices: Vec<DeviceInfo> = Vec::new();
     for line in out.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.eq_ignore_ascii_case("[Empty]") {
+        let Some((id, state)) = parse_target_line(line) else {
             continue;
-        }
-        let mut parts = line.split_whitespace();
-        let id = match parts.next() {
-            Some(id) if !id.starts_with('[') => id.to_string(),
-            _ => continue,
         };
-        // hdc list targets 第二列可能是 Connected/Ready 等状态词
-        let state = parts.next().unwrap_or("Online").to_string();
-        let is_online = state.eq_ignore_ascii_case("Connected")
-            || state.eq_ignore_ascii_case("Ready")
-            || state.eq_ignore_ascii_case("Online");
+        let (connection, authorized) = normalize_connection(&state);
         let is_default = default.as_deref() == Some(id.as_str());
-        // 在线设备才查询型号/系统版本（离线设备查询会超时）
-        let (model, os_version) = if is_online {
-            let model = shell_param(&id, "const.product.model").await;
-            let os = shell_param(&id, "const.ohos.apiversion").await;
-            let name = shell_param(&id, "const.product.name").await;
-            let os_version = if !os.is_empty() { format!("API {os}") } else { name };
-            (model, os_version)
+        let (model, os_version, api_level, architecture, resolution, capabilities) = if authorized {
+            let (
+                model,
+                fullname,
+                version,
+                product_name,
+                api,
+                abi_list,
+                abi,
+                screen,
+                snapshot,
+                uitest,
+                hidumper,
+            ) = tokio::join!(
+                shell_param(&id, "const.product.model"),
+                shell_param(&id, "const.ohos.fullname"),
+                shell_param(&id, "const.ohos.version"),
+                shell_param(&id, "const.product.name"),
+                shell_param(&id, "const.ohos.apiversion"),
+                shell_param(&id, "const.product.cpu.abilist"),
+                shell_param(&id, "const.product.cpu.abi"),
+                shell_exec(&id, "wm size"),
+                shell_exec(&id, "command -v snapshot_display"),
+                shell_exec(&id, "command -v uitest"),
+                shell_exec(&id, "command -v hidumper"),
+            );
+            let api_level = parse_api_level(&api);
+            let base_version = [fullname, version, product_name]
+                .into_iter()
+                .find(|value| !value.is_empty())
+                .unwrap_or_default();
+            let os_version = match (base_version.is_empty(), api_level) {
+                (false, Some(level)) => format!("{base_version} · API {level}"),
+                (false, None) => base_version,
+                (true, Some(level)) => format!("API {level}"),
+                (true, None) => String::new(),
+            };
+            let architecture = if abi_list.is_empty() { abi } else { abi_list };
+            let resolution = parse_resolution(&screen);
+            let mut capabilities = vec![
+                "shell".into(),
+                "install".into(),
+                "ability".into(),
+                "hilog".into(),
+            ];
+            if !snapshot.is_empty() || !resolution.is_empty() {
+                capabilities.push("screenshot".into());
+            }
+            if !uitest.is_empty() {
+                capabilities.push("ui_automation".into());
+            }
+            if !hidumper.is_empty() {
+                capabilities.push("diagnostics".into());
+                capabilities.push("performance".into());
+            }
+            capabilities.sort();
+            capabilities.dedup();
+            (
+                model,
+                os_version,
+                api_level,
+                architecture,
+                resolution,
+                capabilities,
+            )
         } else {
-            (String::new(), String::new())
+            (
+                String::new(),
+                String::new(),
+                None,
+                String::new(),
+                String::new(),
+                Vec::new(),
+            )
         };
-        devices.push(DeviceInfo { id, state, model, os_version, is_default });
+        devices.push(DeviceInfo {
+            id,
+            state,
+            model,
+            os_version,
+            connection: connection.into(),
+            authorized,
+            api_level,
+            architecture,
+            resolution,
+            capabilities,
+            observed_at: observed_at(),
+            is_default,
+        });
     }
     Ok(devices)
 }
@@ -170,7 +315,11 @@ pub async fn get_device_detail(device_id: String) -> Result<DeviceDetail, String
     let resolution = shell_exec(d, "wm size")
         .await
         .lines()
-        .find_map(|l| l.trim().strip_prefix("Physical size:").map(|s| s.trim().to_string()))
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("Physical size:")
+                .map(|s| s.trim().to_string())
+        })
         .unwrap_or_default();
     // 电池：hidumper BatteryService（鸿蒙 shell 无权限读 /sys/class/power_supply，
     // 实测 cat capacity 报 No such file / Permission denied；hidumper 是授权通道）
@@ -181,7 +330,11 @@ pub async fn get_device_detail(device_id: String) -> Result<DeviceDetail, String
     } else {
         String::new()
     };
-    let battery_temp = if temp >= 0.0 { format!("{temp:.1}℃") } else { String::new() };
+    let battery_temp = if temp >= 0.0 {
+        format!("{temp:.1}℃")
+    } else {
+        String::new()
+    };
     let battery_status = {
         let mut parts: Vec<String> = Vec::new();
         match charging {
@@ -242,7 +395,9 @@ fn parse_battery_info(out: &str) -> (f64, f64, i64, u64, i64, String) {
     let mut tech = String::new();
     for line in out.lines() {
         let l = line.trim();
-        let Some((k, v)) = l.split_once(':') else { continue };
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
         let v = v.trim();
         match k.trim() {
             "capacity" => capacity = v.parse().unwrap_or(-1.0),
@@ -341,7 +496,13 @@ pub async fn get_device_perf(device_id: String) -> Result<DevicePerf, String> {
     // ---- 电池/温度：hidumper BatteryService（鸿蒙 shell 读 sysfs 权限不足）----
     let (battery, temp) = sample_battery_via_hidumper(d).await;
 
-    Ok(DevicePerf { cpu, mem, battery, temp, ts })
+    Ok(DevicePerf {
+        cpu,
+        mem,
+        battery,
+        temp,
+        ts,
+    })
 }
 
 /// 通过 hidumper BatteryService -i 读取电量与温度。
@@ -429,7 +590,10 @@ pub async fn stop_hdc_service() -> Result<String, String> {
 /// 错误只体现在输出文本里（如 snapshot_display 的 error: 行、screencap 的 not found），
 /// 不能只信 status，须按文本特征判断。
 fn hdc_shell_failed(out: &str) -> bool {
-    out.contains("error:") || out.contains("[Fail]") || out.contains("not found") || out.contains("No such file")
+    out.contains("error:")
+        || out.contains("[Fail]")
+        || out.contains("not found")
+        || out.contains("No such file")
 }
 
 /// 截取设备屏幕：截图保存到项目 `.deveco-agent/screenshots/` 目录，返回本地绝对路径。
@@ -470,7 +634,16 @@ pub async fn capture_device_screenshot(
     // 失败判断用文本特征（hdc shell 失败时 exit 仍为 0），最终以拉取到文件为唯一标准。
     let remote = "/data/local/tmp/deveco_agent_shot.png";
     let shot = run_hdc(
-        &["-t", device.as_str(), "shell", "snapshot_display", "-t", "png", "-f", remote],
+        &[
+            "-t",
+            device.as_str(),
+            "shell",
+            "snapshot_display",
+            "-t",
+            "png",
+            "-f",
+            remote,
+        ],
         30,
     )
     .await
@@ -491,13 +664,21 @@ pub async fn capture_device_screenshot(
     }
 
     // 拉取到项目 screenshots 目录（文件名带设备号与项目名；项目名清洗非法字符）
-    let dir = Path::new(&project_path).join(".deveco-agent").join("screenshots");
+    let dir = Path::new(&project_path)
+        .join(".deveco-agent")
+        .join("screenshots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let safe_name: String = project_name
         .unwrap_or_default()
         .chars()
-        .map(|c| if "<>:\"/\\|?*".contains(c) || c.is_whitespace() { '-' } else { c })
+        .map(|c| {
+            if "<>:\"/\\|?*".contains(c) || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
         .take(24)
         .collect::<String>()
         .trim_matches('-')
@@ -523,14 +704,20 @@ pub async fn capture_device_screenshot(
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    if !local.exists() || std::fs::metadata(&local).map(|m| m.len() == 0).unwrap_or(true) {
+    if !local.exists()
+        || std::fs::metadata(&local)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+    {
         return Err("截图文件未生成（设备端截图可能失败）".into());
     }
     // 清理设备端临时文件，避免多次截图累积
     let _ = run_hdc(&["-t", device.as_str(), "shell", "rm", remote], 10).await;
 
     // 项目目录注册为资源访问范围（前端 convertFileSrc 预览）
-    let _ = app.asset_protocol_scope().allow_directory(Path::new(&project_path), true);
+    let _ = app
+        .asset_protocol_scope()
+        .allow_directory(Path::new(&project_path), true);
     Ok(local.to_string_lossy().to_string())
 }
 
@@ -548,7 +735,10 @@ pub struct ShotFile {
 }
 
 /// 项目截图目录（.deveco-agent/screenshots）；项目不存在时报错。
-fn screenshots_dir(project_id: &str, state: &State<'_, DbState>) -> Result<std::path::PathBuf, String> {
+fn screenshots_dir(
+    project_id: &str,
+    state: &State<'_, DbState>,
+) -> Result<std::path::PathBuf, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     let p: String = conn
         .query_row(
@@ -689,7 +879,17 @@ pub async fn launch_app(device_id: String, package: String) -> Result<String, St
     }
     // 先尝试 EntryAbility（HarmonyOS 标准入口），失败回退 MainAbility
     let out = run_hdc(
-        &["-t", d, "shell", "aa", "start", "-a", "EntryAbility", "-b", pkg],
+        &[
+            "-t",
+            d,
+            "shell",
+            "aa",
+            "start",
+            "-a",
+            "EntryAbility",
+            "-b",
+            pkg,
+        ],
         20,
     )
     .await;
@@ -697,7 +897,17 @@ pub async fn launch_app(device_id: String, package: String) -> Result<String, St
         Ok(s) if !s.contains("error") && !s.contains("failed") => Ok(s),
         _ => {
             let s = run_hdc(
-                &["-t", d, "shell", "aa", "start", "-a", ".MainAbility", "-b", pkg],
+                &[
+                    "-t",
+                    d,
+                    "shell",
+                    "aa",
+                    "start",
+                    "-a",
+                    ".MainAbility",
+                    "-b",
+                    pkg,
+                ],
                 20,
             )
             .await?;
@@ -762,12 +972,14 @@ pub async fn list_device_processes(device_id: String) -> Result<Vec<DeviceProces
 /// 正在运行的 hilog 抓取任务句柄（按设备 id 索引）。
 /// start 时写入，stop/任务退出时移除；用 JoinHandle 以便中止后台读取任务。
 /// OnceLock 惰性初始化（HashMap 非 const，不能直接放 static）。
-static HILOG_TASKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>> =
-    std::sync::OnceLock::new();
+static HILOG_TASKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+> = std::sync::OnceLock::new();
 
 /// 取出全局 hilog 任务表
 fn hilog_tasks_lock(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, tokio::task::JoinHandle<()>>> {
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, tokio::task::JoinHandle<()>>>
+{
     HILOG_TASKS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock()
@@ -805,7 +1017,9 @@ pub async fn start_hilog_stream(
 
     // 包名 → pid（在启动前解析一次；实时流期间进程重启需重新开启）
     let pids = if !pkg.is_empty() {
-        let out = run_hdc(&["-t", &d, "shell", "pidof", &pkg], 15).await.unwrap_or_default();
+        let out = run_hdc(&["-t", &d, "shell", "pidof", &pkg], 15)
+            .await
+            .unwrap_or_default();
         let p: Vec<String> = out
             .split(|c: char| c.is_whitespace())
             .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
@@ -902,6 +1116,33 @@ mod tests {
     }
 
     #[test]
+    fn target_state_is_normalized_without_losing_raw_state() {
+        assert_eq!(
+            parse_target_line("ABC123 Connected"),
+            Some(("ABC123".into(), "Connected".into()))
+        );
+        assert_eq!(normalize_connection("Ready"), ("online", true));
+        assert_eq!(
+            normalize_connection("Unauthorized"),
+            ("unauthorized", false)
+        );
+        assert_eq!(normalize_connection("Offline"), ("offline", false));
+        assert!(parse_target_line("[Empty]").is_none());
+    }
+
+    #[test]
+    fn screen_and_api_evidence_are_parsed_conservatively() {
+        assert_eq!(
+            parse_resolution("Physical size: 1080x2400\nOverride size: 720x1600"),
+            "1080x2400"
+        );
+        assert_eq!(parse_resolution("permission denied"), "");
+        assert_eq!(parse_api_level("14"), Some(14));
+        assert_eq!(parse_api_level("OpenHarmony API 18"), Some(18));
+        assert_eq!(parse_api_level("unknown"), None);
+    }
+
+    #[test]
     fn calc_cpu_usage_50_percent() {
         let s1 = stat_line(1000, 0, 500, 8000, 500);
         let s2 = stat_line(1300, 0, 700, 8100, 800);
@@ -909,7 +1150,10 @@ mod tests {
         // 占用率 = (900-400)/900 ≈ 55.56%
         let cpu = calc_cpu_usage(&s1, &s2);
         let expected: f64 = 500.0 / 900.0 * 100.0;
-        assert!((cpu - expected).abs() < 0.01, "got {cpu}, expected {expected}");
+        assert!(
+            (cpu - expected).abs() < 0.01,
+            "got {cpu}, expected {expected}"
+        );
     }
 
     #[test]
@@ -948,4 +1192,3 @@ mod tests {
         assert_eq!(parse_kb("", "MemTotal:"), None);
     }
 }
-
