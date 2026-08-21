@@ -2456,7 +2456,39 @@ mod tests {
                 )
                 .unwrap();
             }
+            let contract = crate::agent::acceptance::GoalContract::compile(
+                "修复 src/main.ets，运行测试，但暂不提交",
+            );
+            conn.execute(
+                "INSERT INTO agent_runs(run_id,conversation_id,goal,state,phase,goal_contract_json,error,started_at,updated_at)
+                 VALUES ('run-long','c',?1,'interrupted','recovery_required',?2,'等待修复失败测试',1,200)",
+                params![contract.original_goal, serde_json::to_string(&contract).unwrap()],
+            ).unwrap();
+            conn.execute_batch(
+                "INSERT INTO execution_steps(step_id,run_id,conversation_id,ordinal,title,state,result_summary,updated_at)
+                   VALUES ('done','run-long','c',1,'读取目标文件','completed','已读取',100),
+                          ('open','run-long','c',2,'修复实现','pending',NULL,101),
+                          ('blocked','run-long','c',3,'运行测试','blocked','测试失败',102);",
+            ).unwrap();
             upsert_fact(&conn, &fact(serde_json::json!("head-a"))).unwrap();
+            let mut verification = fact(serde_json::json!({"passed": false, "summary": "tests failed"}));
+            verification.fact_kind = "verification".into();
+            verification.fact_key = "run_tests".into();
+            verification.source_ref = "tool:test-1".into();
+            upsert_fact(&conn, &verification).unwrap();
+            let mut dirty = fact(serde_json::json!({"clean": false, "files": ["src/main.ets"]}));
+            dirty.fact_key = "git_status".into();
+            dirty.source_ref = "tool:git-status-1".into();
+            upsert_fact(&conn, &dirty).unwrap();
+            set_context_pin(
+                &conn,
+                "c",
+                "decision",
+                "user:no-commit",
+                "用户约束",
+                "暂不提交",
+                true,
+            ).unwrap();
             persist_runtime_checkpoint(
                 &conn,
                 "c",
@@ -2472,13 +2504,19 @@ mod tests {
             let restored = load_context_v2(&conn, "c", 64_000).unwrap();
             assert_eq!(restored.summary_to_message_rowid, 100);
             assert_eq!(restored.summary.as_deref(), Some("前 100 条消息的增量摘要"));
-            assert_eq!(restored.facts[0].value, serde_json::json!("head-a"));
+            assert_eq!(restored.task.goal, "修复 src/main.ets，运行测试，但暂不提交");
+            assert_eq!(restored.task.completed_steps, vec!["读取目标文件: 已读取"]);
+            assert_eq!(restored.task.open_steps, vec!["修复实现"]);
+            assert_eq!(restored.task.blocked_steps, vec!["运行测试: 测试失败"]);
+            assert!(restored.task.constraints.iter().any(|item| item.contains("完成声明")));
+            assert!(restored.pins.iter().any(|item| item.content == "暂不提交"));
+            assert!(restored.facts.iter().any(|item| item.fact_key == "run_tests" && item.value["passed"] == false));
+            assert!(restored.facts.iter().any(|item| item.fact_key == "git_status" && item.value["clean"] == false));
 
             let changed = upsert_fact(&conn, &fact(serde_json::json!("head-b"))).unwrap();
             assert_eq!(changed.version, 2);
             let reconciled = load_context_v2(&conn, "c", 64_000).unwrap();
-            assert_eq!(reconciled.facts.len(), 1);
-            assert_eq!(reconciled.facts[0].value, serde_json::json!("head-b"));
+            assert!(reconciled.facts.iter().any(|item| item.fact_key == "git_head" && item.value == serde_json::json!("head-b")));
         }
         std::fs::remove_file(path).ok();
     }

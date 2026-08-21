@@ -985,4 +985,42 @@ mod tests {
         assert_eq!(new.claim_epoch, old.claim_epoch + 1);
         assert_eq!(get(&conn, "f").unwrap().unwrap().recovery_count, 1);
     }
+
+    #[test]
+    fn multi_hour_checkpoint_recovers_once_with_fencing() {
+        let conn = conn();
+        conn.execute("INSERT INTO agent_runs(run_id) VALUES('soak')", []).unwrap();
+        enqueue(&conn, &EnqueueSpec {
+            run_id: "soak".into(), conversation_id: "c".into(), goal: "long task".into(),
+            priority: 50, max_attempts: 3, concurrency_key: None,
+            payload: serde_json::json!({}), budget: serde_json::json!({}),
+        }).unwrap();
+        register_worker(&conn, "worker-soak", "test", 1).unwrap();
+        let first = claim_next_for_worker(&conn, "worker-soak", 60_000).unwrap().unwrap();
+        let four_hours_ago = now_ms() - 4 * 60 * 60 * 1000;
+        conn.execute(
+            "UPDATE agent_task_queue SET checkpoint_json='{\"step\":42}',last_checkpoint_at=?1,
+             lease_expires_at=?1 WHERE run_id='soak'",
+            [four_hours_ago],
+        ).unwrap();
+        conn.execute(
+            "UPDATE agent_workers SET last_heartbeat_at=?1 WHERE worker_id='worker-soak'",
+            [four_hours_ago],
+        ).unwrap();
+
+        assert_eq!(recover_stale_owners(&conn, 60_000).unwrap(), 1);
+        assert_eq!(recover_stale_owners(&conn, 60_000).unwrap(), 0);
+        let recovered = get(&conn, "soak").unwrap().unwrap();
+        assert_eq!(recovered.state, "recovery_required");
+        assert!(recovered.checkpoint_json.contains("42"));
+        assert!(request_resume(&conn, "soak", recovered.resume_token.as_deref().unwrap()).unwrap());
+        register_worker(&conn, "worker-next", "test", 1).unwrap();
+        let next = claim_next_for_worker(&conn, "worker-next", 60_000).unwrap().unwrap();
+        assert_eq!(next.attempt, 2);
+        assert_ne!(next.lease_token, first.lease_token);
+        assert!(checkpoint_owned(
+            &conn, "soak", "worker-soak", first.lease_token.as_deref().unwrap(),
+            &serde_json::json!({"late": true}), 60_000,
+        ).is_err());
+    }
 }
