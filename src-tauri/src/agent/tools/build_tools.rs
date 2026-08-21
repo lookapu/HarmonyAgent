@@ -11,6 +11,10 @@ pub(super) struct BuildRequest {
     pub mode: Option<String>,
     /// 指定模块名（缺省用工程 entry 模块）
     pub module: Option<String>,
+    /// 指定产品名（缺省 default 或工程首个产品）
+    pub product: Option<String>,
+    /// 本次待验证的变更文件；提供后自动计算最小模块/产品集合
+    pub changed_files: Option<Vec<String>>,
     /// 构建前先 hvigor clean 清理缓存（缺省 false）
     pub clean: Option<bool>,
     /// 依赖阶段：auto（缺失时安装）/ force（始终安装）/ skip（显式跳过）
@@ -23,36 +27,28 @@ impl BuildRequest {
         serde_json::from_value(args.clone()).map_err(|e| format!("build_project 参数解析失败：{e}"))
     }
 
-    /// 显式 resolve：默认值落地 + 参数校验（mode 枚举、module 存在性），产出执行用严格规范。
+    /// 显式 resolve：默认值落地 + 基础枚举校验；模块/产品归属由统一语义模型规划器校验。
     pub(super) fn resolve(
         self,
-        root: &Path,
+        _root: &Path,
         entry_module: Option<&str>,
     ) -> Result<BuildSpec, String> {
         let mode = self.mode.unwrap_or_else(|| "debug".to_string());
         if mode != "debug" && mode != "release" {
             return Err("mode 仅支持 debug 或 release".into());
         }
+        let module_explicit = self
+            .module
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
         let module = match self
             .module
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(m) => {
-                let available = harmony_modules(root);
-                if !available.iter().any(|x| x == m) {
-                    return Err(format!(
-                        "指定模块 {m} 不存在，工程可构建模块：{}",
-                        if available.is_empty() {
-                            "(未能识别，请检查 build-profile.json5 的 modules 配置)".to_string()
-                        } else {
-                            available.join(", ")
-                        }
-                    ));
-                }
-                Some(m.to_string())
-            }
+            Some(m) => Some(m.to_string()),
             None => entry_module.map(|s| s.to_string()),
         };
         let dependencies = self.dependencies.unwrap_or_else(|| "auto".into());
@@ -62,6 +58,18 @@ impl BuildRequest {
         Ok(BuildSpec {
             mode,
             module,
+            module_explicit,
+            product: self
+                .product
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            changed_files: self
+                .changed_files
+                .unwrap_or_default()
+                .into_iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect(),
             clean: self.clean.unwrap_or(false),
             dependencies,
         })
@@ -72,8 +80,14 @@ impl BuildRequest {
 pub(super) struct BuildSpec {
     /// 已校验的构建模式（debug/release）
     pub mode: String,
-    /// 已校验存在的模块名（None 表示交给构建系统按工程默认处理）
+    /// 规范化后的模块名；存在性与产品归属在构建计划阶段校验
     pub module: Option<String>,
+    /// module 是否由调用方显式指定（与缺省 entry 区分）
+    pub module_explicit: bool,
+    /// 调用方显式指定的产品
+    pub product: Option<String>,
+    /// 用于影响分析的变更文件
+    pub changed_files: Vec<String>,
     /// 是否先执行 clean
     pub clean: bool,
     /// 依赖安装策略（auto/force/skip）
@@ -108,18 +122,32 @@ pub(super) async fn build_project(
     // （默认值/校验集中于此，run 内不再出现隐式 ?? 默认）
     let spec = BuildRequest::from_args(args)?.resolve(root, info.entry_module.as_deref())?;
     let mode = spec.mode.as_str();
-    let module = spec.module.as_deref();
-    let cmd_args = crate::services::harmony::assemble_args(module, mode);
+    let requested_module = if spec.module_explicit {
+        spec.module.as_deref()
+    } else {
+        None
+    };
+    let plan = crate::services::harmony_build::plan_build(
+        root,
+        &semantic_model,
+        requested_module,
+        spec.product.as_deref(),
+        mode,
+        &spec.changed_files,
+    )?;
     // clean=true 时先执行 hvigor clean 清理缓存，用于缓存导致的诡异构建失败
     let do_clean = spec.clean;
     // 全局并发护栏：同一时间只允许一个构建（其他调用排队等待）
     let _gate = crate::services::tool_limits::acquire_workspace_gate(root).await;
+    let target_key = plan
+        .targets
+        .iter()
+        .map(|target| format!("{}@{}:{}", target.module, target.product, target.mode))
+        .collect::<Vec<_>>()
+        .join(",");
     let workflow_key = format!(
-        "{}:{}:{}:{}",
-        module.unwrap_or("default"),
-        mode,
-        spec.clean,
-        spec.dependencies
+        "{}:{}:{}:{}:{}",
+        plan.scope, target_key, mode, spec.clean, spec.dependencies
     );
     let fingerprint = crate::services::harmony_build::project_fingerprint(root);
     let (mut checkpoint, resumed) =
@@ -268,41 +296,83 @@ pub(super) async fn build_project(
             }
         }
     }
-    let mut full_args = prefix;
-    full_args.extend(cmd_args);
     ctx.emit_log(
         "system",
-        &format!("开始构建（{mode}）：{program} {}", full_args.join(" ")),
+        &format!(
+            "构建计划：scope={}，{} 个目标：{}",
+            plan.scope,
+            plan.targets.len(),
+            plan.targets
+                .iter()
+                .map(|target| format!(
+                    "{}@{}/{}({})",
+                    target.module, target.product, target.mode, target.task
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     );
-    let output = crate::agent::exec_ctx::run_cmd_streaming_env(
-        ctx,
-        &program,
-        &full_args,
-        Some(root),
-        600,
-        Some(&log_path),
-        envs,
-    )
-    .await;
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => {
-            ctx.emit_log("system", &format!("构建异常：{e}"));
-            crate::services::harmony_build::stage_failed(root, &mut checkpoint, "build", &e);
-            return Err(with_advice("build_project", e));
+    let mut combined_parts = Vec::new();
+    let mut build_succeeded = true;
+    let mut failed_exit_code = None;
+    for (index, target) in plan.targets.iter().enumerate() {
+        let mut full_args = prefix.clone();
+        full_args.extend(crate::services::harmony::assemble_target_args(
+            &target.task,
+            Some(&target.module),
+            &target.product,
+            &target.mode,
+        ));
+        ctx.emit_log(
+            "system",
+            &format!(
+                "开始构建目标 {}/{}（{}@{} / {}）：{program} {}",
+                index + 1,
+                plan.targets.len(),
+                target.module,
+                target.product,
+                target.mode,
+                full_args.join(" ")
+            ),
+        );
+        let output = match crate::agent::exec_ctx::run_cmd_streaming_env(
+            ctx,
+            &program,
+            &full_args,
+            Some(root),
+            600,
+            Some(&log_path),
+            envs,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                ctx.emit_log("system", &format!("构建异常：{error}"));
+                crate::services::harmony_build::stage_failed(
+                    root,
+                    &mut checkpoint,
+                    "build",
+                    &error,
+                );
+                return Err(with_advice("build_project", error));
+            }
+        };
+        let stdout = smart_decode(&output.stdout);
+        let stderr = smart_decode(&output.stderr);
+        combined_parts.push(format!(
+            "===== {}@{} / {} =====\n{}\n{}",
+            target.module, target.product, target.mode, stdout, stderr
+        ));
+        if !output.status.success() {
+            build_succeeded = false;
+            failed_exit_code = output.status.code();
+            break;
         }
-    };
-    let stdout = smart_decode(&output.stdout);
-    let stderr = smart_decode(&output.stderr);
-    let combined = if stderr.trim().is_empty() {
-        stdout.clone()
-    } else if stdout.trim().is_empty() {
-        stderr.clone()
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
+    }
+    let combined = combined_parts.join("\n");
 
-    if output.status.success() {
+    if build_succeeded {
         crate::services::harmony_build::stage_completed(root, &mut checkpoint, "build");
         let artifacts = crate::services::harmony_build::discover_artifacts(root);
         if artifacts.is_empty() {
@@ -312,7 +382,19 @@ pub(super) async fn build_project(
         }
         crate::services::harmony_build::completed(root, &mut checkpoint, artifacts.clone());
         let elapsed = build_started.elapsed().as_secs_f32();
-        let mut summary = format!("构建成功（{mode}，耗时 {elapsed:.1}s）。\n");
+        let mut summary = format!(
+            "构建成功（{mode}，{} 个目标，耗时 {elapsed:.1}s）。\n",
+            plan.targets.len()
+        );
+        summary.push_str(&format!(
+            "影响计划：scope={}；{}\n",
+            plan.scope,
+            plan.targets
+                .iter()
+                .map(|target| format!("{}@{}/{}", target.module, target.product, target.mode))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
         summary.push_str(&format!(
             "工作流完成：environment → dependencies → build → artifacts（发现 {} 个产物）\n",
             artifacts.len()
@@ -357,7 +439,7 @@ pub(super) async fn build_project(
         let errors = crate::services::harmony::parse_build_errors(&combined);
         ctx.emit_log(
             "system",
-            &format!("构建失败（退出码 {:?}）", output.status.code()),
+            &format!("构建失败（退出码 {failed_exit_code:?}）"),
         );
         if errors.is_empty() {
             return Err(with_advice(
@@ -512,65 +594,6 @@ pub(super) async fn build_project(
         );
         Err(err)
     }
-}
-
-pub(super) fn harmony_modules(root: &Path) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    // 1) build-profile.json5 的 modules 数组
-    if let Some(text) = std::fs::read_to_string(root.join("build-profile.json5")).ok() {
-        let trimmed = text.trim();
-        // 取 "modules": [ {"name": "xxx", ...} ... ] 中的 name 值（不引入 json5 解析器依赖）；
-        // 兼容 JSON5 无引号键（modules: / name:）与带注释的写法
-        let modules_idx = trimmed
-            .find("\"modules\"")
-            .or_else(|| trimmed.find("modules"));
-        if let Some(idx) = modules_idx {
-            let rest = &trimmed[idx..];
-            if let Some(start) = rest.find('[') {
-                if let Some(end) = rest[start..].find(']') {
-                    let arr = &rest[start + 1..start + end];
-                    for seg in arr.split('{') {
-                        let name_idx = seg.find("\"name\"").or_else(|| seg.find("name"));
-                        if let Some(ni) = name_idx {
-                            // 从命中的 name 起找冒号，统一从冒号后取字符串值（兼容有无引号键）
-                            let after = &seg[ni..];
-                            let Some(c) = after.find(':') else { continue };
-                            let v = after[c + 1..].trim();
-                            let v = v.trim_start_matches('"').trim_start_matches('\'');
-                            let end_q = v.find('"').or_else(|| v.find('\'')).unwrap_or(v.len());
-                            let n = v[..end_q].trim();
-                            if !n.is_empty() && !n.starts_with("//") {
-                                names.push(n.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // 2) 回退：扫描直接子目录（含 oh-package.json5 / build-profile.json5 / src/main/module.json5 的目录）
-    if names.is_empty() {
-        if let Ok(rd) = std::fs::read_dir(root) {
-            for e in rd.flatten() {
-                if !e.path().is_dir() {
-                    continue;
-                }
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') || name.eq_ignore_ascii_case("AppScope") {
-                    continue;
-                }
-                if e.path().join("oh-package.json5").is_file()
-                    || e.path().join("build-profile.json5").is_file()
-                    || e.path().join("src/main/module.json5").is_file()
-                {
-                    names.push(name);
-                }
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
 }
 
 pub(super) async fn deploy(
@@ -1704,10 +1727,12 @@ mod build_workflow_tests {
             .resolve(&root, Some("entry"))
             .unwrap();
         assert_eq!(spec.dependencies, "auto");
-        assert!(BuildRequest::from_args(&serde_json::json!({"dependencies":"sometimes"}))
-            .unwrap()
-            .resolve(&root, Some("entry"))
-            .is_err());
+        assert!(
+            BuildRequest::from_args(&serde_json::json!({"dependencies":"sometimes"}))
+                .unwrap()
+                .resolve(&root, Some("entry"))
+                .is_err()
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

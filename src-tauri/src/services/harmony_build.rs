@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const CHECKPOINT_SCHEMA: u32 = 1;
@@ -40,6 +41,264 @@ pub struct HarmonyBuildArtifact {
 pub struct HarmonyDependencyState {
     pub declared: usize,
     pub missing: Vec<String>,
+}
+
+/// 一次 Hvigor 调用对应的最小可构建目标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarmonyBuildTarget {
+    pub module: String,
+    pub module_path: String,
+    pub product: String,
+    pub mode: String,
+    /// assembleHap / assembleHsp / assembleHar
+    pub task: String,
+    pub reason: String,
+}
+
+/// 构建前由工程模型和文件影响范围生成的可审计计划。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyBuildPlan {
+    /// explicit / incremental / full / default
+    pub scope: String,
+    pub changed_files: Vec<String>,
+    pub targets: Vec<HarmonyBuildTarget>,
+}
+
+/// 将用户约束与影响分析合并为最小顶层产物集合。
+///
+/// 依赖模块本身不重复构建：如果受影响的 HAR/HSP 还有受影响的上游 HAP，
+/// 只构建该 HAP，由 Hvigor 在同一依赖闭包内完成底层产物。
+pub fn plan_build(
+    root: &Path,
+    model: &crate::services::harmony_model::HarmonySemanticModel,
+    requested_module: Option<&str>,
+    requested_product: Option<&str>,
+    requested_mode: &str,
+    changed_files: &[String],
+) -> Result<HarmonyBuildPlan, String> {
+    let explicit_module = requested_module.and_then(|requested| {
+        model
+            .modules
+            .iter()
+            .find(|module| module.name == requested || module.rel_path == requested)
+    });
+    if let Some(requested) = requested_module {
+        if explicit_module.is_none() {
+            let available = model
+                .modules
+                .iter()
+                .map(|module| module.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "指定模块 {requested} 不存在，工程可构建模块：{}",
+                if available.is_empty() {
+                    "(未识别)"
+                } else {
+                    &available
+                }
+            ));
+        }
+    }
+
+    let explicit_product = requested_product.and_then(|requested| {
+        model
+            .products
+            .iter()
+            .find(|product| product.name == requested)
+    });
+    if let Some(requested) = requested_product {
+        if explicit_product.is_none() && !model.products.is_empty() {
+            return Err(format!(
+                "指定产品 {requested} 不存在，工程产品：{}",
+                model
+                    .products
+                    .iter()
+                    .map(|product| product.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    if !model.build_modes.is_empty() && !model.build_modes.iter().any(|mode| mode == requested_mode)
+    {
+        return Err(format!(
+            "构建模式 {requested_mode} 不在工程 buildModeSet 中：{}",
+            model.build_modes.join(", ")
+        ));
+    }
+
+    let impact = (!changed_files.is_empty())
+        .then(|| crate::services::harmony_model::analyze_impact(root, model, changed_files));
+    let scope = if requested_module.is_some() || requested_product.is_some() {
+        "explicit".to_string()
+    } else if let Some(impact) = &impact {
+        impact.mode.clone()
+    } else {
+        "default".to_string()
+    };
+
+    let product_names = if let Some(requested) = requested_product {
+        vec![requested.to_string()]
+    } else if let Some(impact) = &impact {
+        if impact.verification.products.is_empty() {
+            default_product_names(model)
+        } else {
+            impact.verification.products.clone()
+        }
+    } else {
+        default_product_names(model)
+    };
+
+    let affected = impact
+        .as_ref()
+        .map(|item| {
+            item.affected_modules
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let base_modules = if let Some(module) = explicit_module {
+        vec![module]
+    } else if !affected.is_empty() {
+        let buildable = model
+            .modules
+            .iter()
+            .filter(|module| {
+                affected.contains(&module.rel_path)
+                    && artifact_task(&module.artifact_kind).is_some()
+            })
+            .collect::<Vec<_>>();
+        let top_level = buildable
+            .iter()
+            .copied()
+            .filter(|module| !has_affected_downstream(model, &module.rel_path, &affected))
+            .collect::<Vec<_>>();
+        if top_level.is_empty() {
+            buildable
+        } else {
+            top_level
+        }
+    } else {
+        model
+            .modules
+            .iter()
+            .find(|module| module.kind == "entry")
+            .or_else(|| {
+                model
+                    .modules
+                    .iter()
+                    .find(|module| module.artifact_kind == "hap")
+            })
+            .or_else(|| {
+                model
+                    .modules
+                    .iter()
+                    .find(|module| artifact_task(&module.artifact_kind).is_some())
+            })
+            .into_iter()
+            .collect()
+    };
+    if base_modules.is_empty() {
+        return Err("工程模型中没有可构建的 HAP/HSP/HAR 模块".into());
+    }
+
+    let mut targets = Vec::new();
+    let mut seen = BTreeSet::new();
+    for product_name in product_names {
+        let product = model
+            .products
+            .iter()
+            .find(|product| product.name == product_name);
+        for module in &base_modules {
+            if product.is_some_and(|product| {
+                !product.modules.is_empty() && !product.modules.contains(&module.rel_path)
+            }) {
+                if requested_module.is_some() || requested_product.is_some() {
+                    return Err(format!("模块 {} 不属于产品 {product_name}", module.name));
+                }
+                continue;
+            }
+            if !module.build_modes.is_empty()
+                && !module.build_modes.iter().any(|mode| mode == requested_mode)
+            {
+                return Err(format!(
+                    "模块 {} 不支持构建模式 {requested_mode}；可用模式：{}",
+                    module.name,
+                    module.build_modes.join(", ")
+                ));
+            }
+            let Some(task) = artifact_task(&module.artifact_kind) else {
+                continue;
+            };
+            let key = format!("{}@{}:{requested_mode}", module.name, product_name);
+            if seen.insert(key) {
+                targets.push(HarmonyBuildTarget {
+                    module: module.name.clone(),
+                    module_path: module.rel_path.clone(),
+                    product: product_name.clone(),
+                    mode: requested_mode.into(),
+                    task: task.into(),
+                    reason: if requested_module.is_some() {
+                        "用户显式指定".into()
+                    } else if impact.is_some() {
+                        "文件影响范围的顶层产物".into()
+                    } else {
+                        "默认入口产物".into()
+                    },
+                });
+            }
+        }
+    }
+    targets.sort_by(|a, b| {
+        a.product
+            .cmp(&b.product)
+            .then_with(|| a.module_path.cmp(&b.module_path))
+    });
+    if targets.is_empty() {
+        return Err("影响范围没有映射到所选产品中的可构建模块".into());
+    }
+    Ok(HarmonyBuildPlan {
+        scope,
+        changed_files: impact.map(|item| item.changed_files).unwrap_or_default(),
+        targets,
+    })
+}
+
+fn default_product_names(
+    model: &crate::services::harmony_model::HarmonySemanticModel,
+) -> Vec<String> {
+    vec![model
+        .products
+        .iter()
+        .find(|product| product.name == "default")
+        .or_else(|| model.products.first())
+        .map(|product| product.name.clone())
+        .unwrap_or_else(|| "default".into())]
+}
+
+fn artifact_task(kind: &str) -> Option<&'static str> {
+    match kind {
+        "hap" => Some("assembleHap"),
+        "hsp" => Some("assembleHsp"),
+        "har" => Some("assembleHar"),
+        _ => None,
+    }
+}
+
+fn has_affected_downstream(
+    model: &crate::services::harmony_model::HarmonySemanticModel,
+    module_path: &str,
+    affected: &BTreeSet<String>,
+) -> bool {
+    model.dependencies.iter().any(|dependency| {
+        dependency.target_module.as_deref() == Some(module_path)
+            && affected.contains(&dependency.from_module)
+    }) || model.graph.cross_module_refs.iter().any(|reference| {
+        reference.to_module == module_path && affected.contains(&reference.from_module)
+    })
 }
 
 pub fn begin(root: &Path, workflow_key: &str, fingerprint: &str) -> (HarmonyBuildCheckpoint, bool) {
@@ -273,6 +532,48 @@ fn now() -> i64 {
 mod tests {
     use super::*;
 
+    fn module(name: &str, path: &str, kind: &str) -> crate::services::harmony_model::HarmonyModule {
+        crate::services::harmony_model::HarmonyModule {
+            name: name.into(),
+            rel_path: path.into(),
+            kind: if kind == "hap" { "entry" } else { "shared" }.into(),
+            artifact_kind: kind.into(),
+            build_modes: vec!["debug".into(), "release".into()],
+            ..Default::default()
+        }
+    }
+
+    fn planning_model() -> crate::services::harmony_model::HarmonySemanticModel {
+        crate::services::harmony_model::HarmonySemanticModel {
+            build_modes: vec!["debug".into(), "release".into()],
+            products: vec![
+                crate::services::harmony_model::HarmonyProduct {
+                    name: "default".into(),
+                    modules: vec!["entry".into(), "libs/core".into(), "shared/kit".into()],
+                    ..Default::default()
+                },
+                crate::services::harmony_model::HarmonyProduct {
+                    name: "paid".into(),
+                    modules: vec!["entry".into(), "libs/core".into()],
+                    ..Default::default()
+                },
+            ],
+            modules: vec![
+                module("entry", "entry", "hap"),
+                module("core", "libs/core", "har"),
+                module("kit", "shared/kit", "hsp"),
+            ],
+            dependencies: vec![crate::services::harmony_model::HarmonyDependency {
+                from_module: "entry".into(),
+                name: "core".into(),
+                requirement: "file:../libs/core".into(),
+                target_module: Some("libs/core".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
     fn root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("harmony-build-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -335,5 +636,91 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].kind, "hap");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn impact_plan_collapses_dependency_modules_into_top_level_artifacts() {
+        let model = planning_model();
+        let plan = plan_build(
+            Path::new("/workspace"),
+            &model,
+            None,
+            None,
+            "debug",
+            &["libs/core/src/main/ets/Core.ets".into()],
+        )
+        .unwrap();
+        assert_eq!(plan.scope, "incremental");
+        assert_eq!(plan.targets.len(), 2);
+        assert!(plan.targets.iter().all(|target| target.module == "entry"));
+        assert_eq!(
+            plan.targets
+                .iter()
+                .map(|target| target.product.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "paid"]
+        );
+        assert!(plan
+            .targets
+            .iter()
+            .all(|target| target.task == "assembleHap"));
+    }
+
+    #[test]
+    fn impact_plan_builds_independent_hsp_without_unrelated_hap() {
+        let model = planning_model();
+        let plan = plan_build(
+            Path::new("/workspace"),
+            &model,
+            None,
+            None,
+            "release",
+            &["shared/kit/src/main/ets/Kit.ets".into()],
+        )
+        .unwrap();
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].module, "kit");
+        assert_eq!(plan.targets[0].product, "default");
+        assert_eq!(plan.targets[0].task, "assembleHsp");
+    }
+
+    #[test]
+    fn explicit_target_rejects_product_membership_and_unknown_mode() {
+        let model = planning_model();
+        assert!(plan_build(
+            Path::new("/workspace"),
+            &model,
+            Some("kit"),
+            Some("paid"),
+            "debug",
+            &[],
+        )
+        .unwrap_err()
+        .contains("不属于产品"));
+        assert!(plan_build(
+            Path::new("/workspace"),
+            &model,
+            Some("entry"),
+            None,
+            "profile",
+            &[],
+        )
+        .unwrap_err()
+        .contains("buildModeSet"));
+    }
+
+    #[test]
+    fn planned_target_maps_to_exact_hvigor_parameters() {
+        let args = crate::services::harmony::assemble_target_args(
+            "assembleHar",
+            Some("core"),
+            "paid",
+            "release",
+        );
+        assert_eq!(args[0], "assembleHar");
+        assert!(args.contains(&"module=core@paid".to_string()));
+        assert!(args.contains(&"product=paid".to_string()));
+        assert!(args.contains(&"buildMode=release".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("@default")));
     }
 }

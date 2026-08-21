@@ -323,7 +323,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "build_project",
-        desc: "运行可恢复的 HarmonyOS 构建工作流（环境预检 → OHPM 依赖核对/安装 → Hvigor assembleHap → HAP/HSP/HAR 产物发现）。\n参数：{\"mode\":\"debug\"|\"release\",\"clean\":bool,\"module\":\"<可选模块名，如 entry/feature，缺省 entry>\",\"dependencies\":\"auto\"|\"force\"|\"skip\"}；dependencies 缺省 auto，仅在声明依赖缺失时安装，force 强制同步，skip 明确跳过。clean=true 时先 hvigor clean 清缓存；module 指定后只构建该模块。相同参数与工程指纹的中断/失败任务会从安全 checkpoint 恢复，工程变化后自动重开。\n副作用：可能更新 OHPM 锁文件/oh_modules，并在 build 目录生成产物；耗时可能数分钟。\n返回：工作流阶段、产物清单、构建日志尾部与结论。失败时返回结构化错误（含 category 根因分类：type/syntax/dependency/sdk/api_level/signing/ohpm/resource）与推荐下一步。",
+        desc: "运行可恢复的 HarmonyOS 构建工作流（环境预检 → OHPM 依赖核对/安装 → 影响范围规划 → Hvigor 构建 → HAP/HSP/HAR 产物发现）。\n参数：{\"mode\":\"debug\"|\"release\",\"clean\":bool,\"module\":\"<可选模块名，如 entry/feature>\",\"product\":\"<可选产品名>\",\"changed_files\":[\"<可选变更文件>\"],\"dependencies\":\"auto\"|\"force\"|\"skip\"}；提供 changed_files 且未显式指定模块/产品时，沿工程依赖与真实 import 选择各受影响产品的最小顶层产物，并按类型运行 assembleHap/assembleHsp/assembleHar；显式 module/product 始终优先。dependencies 缺省 auto，仅在声明依赖缺失时安装，force 强制同步，skip 明确跳过。clean=true 时先 hvigor clean 清缓存。相同计划与工程指纹的中断/失败任务会从安全 checkpoint 恢复，工程变化后自动重开。\n副作用：可能更新 OHPM 锁文件/oh_modules，并在 build 目录生成产物；耗时可能数分钟。\n返回：可审计的 scope/目标计划、工作流阶段、产物清单、构建日志尾部与结论。失败时返回结构化错误（含 category 根因分类：type/syntax/dependency/sdk/api_level/signing/ohpm/resource）与推荐下一步。",
     },
     ToolSpec {
         name: "deploy",

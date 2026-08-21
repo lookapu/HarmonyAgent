@@ -288,15 +288,25 @@ fn find_latest_hap_fallback(root: &Path) -> Option<PathBuf> {
 
 /// 构建 hvigorw 命令参数（单 entry 模块工程用 assembleHap，多模块按文档加 --mode module）。
 pub fn assemble_args(module: Option<&str>, mode: &str) -> Vec<String> {
-    let mut args = vec!["assembleHap".to_string(), "--no-daemon".to_string()];
+    assemble_target_args("assembleHap", module, "default", mode)
+}
+
+/// 为构建计划中的一个模块/产品/模式组合生成 Hvigor 参数。
+pub fn assemble_target_args(
+    task: &str,
+    module: Option<&str>,
+    product: &str,
+    mode: &str,
+) -> Vec<String> {
+    let mut args = vec![task.to_string(), "--no-daemon".to_string()];
     if let Some(m) = module {
         args.push("--mode".to_string());
         args.push("module".to_string());
         args.push("-p".to_string());
-        args.push(format!("module={m}@default"));
+        args.push(format!("module={m}@{product}"));
     }
     args.push("-p".to_string());
-    args.push("product=default".to_string());
+    args.push(format!("product={product}"));
     args.push("-p".to_string());
     args.push(format!("buildMode={mode}"));
     args

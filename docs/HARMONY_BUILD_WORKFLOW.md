@@ -9,13 +9,29 @@
 
 ## 参数与依赖策略
 
-既有 `mode`、`module` 和 `clean` 参数保持兼容，新增 `dependencies`：
+既有 `mode`、`module` 和 `clean` 参数保持兼容，并支持 `product`、`changed_files` 与 `dependencies`：
+
+- `module` / `product`：显式指定时形成严格构建边界，并校验模块是否属于产品、模式是否受工程和模块支持；
+- `changed_files`：未显式限定模块/产品时，从统一语义模型计算直接模块、依赖/import 反向闭包及受影响产品；
+- `mode`：缺省 `debug`，显式 `release` 可用于发布验证；不在根或模块 build mode 中的值会在执行前拒绝；
 
 - `auto`（默认）：仅在声明的外部依赖未出现在模块级或根级 `oh_modules` 时运行 `ohpm install`；
 - `force`：无论当前安装状态如何都同步依赖；
 - `skip`：明确跳过安装，适合离线或由外部流程管理依赖的场景；若发现缺失依赖会在日志中预警。
 
 工作区内 `file:`/`link:` 依赖和已解析到本地模块的依赖不要求出现在 `oh_modules`，不会触发错误安装。
+
+## 影响驱动的构建计划
+
+构建执行前会生成并记录 `scope` 和目标列表，每个目标包含模块、产品、模式与 Hvigor task：
+
+- HAP、HSP、HAR 分别使用 `assembleHap`、`assembleHsp`、`assembleHar`，不再把所有模块都误作 HAP；
+- 变化从 HAR/HSP 传播到上游 HAP 时，只保留受影响依赖图中的顶层产物，由 Hvigor 在该闭包内构建底层模块，避免重复构建；
+- 两个互不依赖的顶层产物或多个受影响产品会形成多个确定性目标，并按产品、模块路径稳定排序；
+- 根配置等结构变化使用 `full` 影响范围，但仍按产品与顶层产物拆分，不退回无边界的全工程猜测；
+- 没有 `changed_files` 时保持兼容，选择 default（或首个）产品的入口 HAP；显式 `module` / `product` 优先于自动规划。
+
+目标集合进入 checkpoint workflow key，因此产品、模块、模式或影响计划变化后不会错误恢复旧构建。
 
 ## Checkpoint 与恢复
 
@@ -57,4 +73,4 @@ Hvigor 与 ArkTS 日志统一解析为 `BuildError`：
 
 ## 验收
 
-自动化测试覆盖参数策略校验、相同指纹失败恢复、源码变化拒绝恢复、外部依赖缺失/安装证据、HAP 产物发现、ArkTS 跨行错误、命名/数字错误码和 Hvigor 阶段继承。全仓 Rust、崩溃 E2E、前端测试、lint 和生产构建作为阶段门禁。
+自动化测试覆盖参数策略校验、影响闭包到顶层产物的收敛、多产品目标、独立 HSP 任务、产品/模式拒绝、相同指纹失败恢复、源码变化拒绝恢复、外部依赖缺失/安装证据、HAP 产物发现、ArkTS 跨行错误、命名/数字错误码和 Hvigor 阶段继承。全仓 Rust、崩溃 E2E、前端测试、lint 和生产构建作为阶段门禁。

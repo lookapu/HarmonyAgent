@@ -21,6 +21,7 @@
 - `build_project` 升级为 environment → dependencies → build → artifacts 可恢复工作流：按统一模型核对并可自动安装 OHPM 依赖，持久记录工程指纹与脱敏 checkpoint，构建成功后必须发现 HAP/HSP/HAR 才完成。
 - Hvigor/ArkTS 错误统一补齐源码位置、数字或命名错误码、构建阶段和根因类别，支持从 task 行继承阶段及读取下一行 `Error Message:`；Agent 错误证据与 Workspace 卡片使用同一结构。
 - 构建失败新增日志—语义模型联合专项诊断：识别依赖版本冲突、缓存/完整性损坏、SDK 缺失、签名失败和 API Level 不兼容，并输出置信度、脱敏证据、自动恢复边界与顺序化修复步骤。
+- `build_project` 新增影响驱动的构建计划：接受产品与变更文件约束，沿依赖/import 闭包选择各产品的最小顶层产物，分别调度 HAP/HSP/HAR 任务，并把确定性目标集合纳入恢复键。
 
 ### 长会话 Context V2（M1 基础）
 
