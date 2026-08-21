@@ -2448,11 +2448,14 @@ async fn stream_chat_inner(
             .map(|parent| crate::agent::recovery::build_plan(&conn, &conversation_id, parent))
             .transpose()?
     };
-    let contract_goal = recovery_plan
-        .as_ref()
-        .map(|plan| plan.original_goal.as_str())
-        .unwrap_or_else(|| content.trim());
-    let goal_contract = crate::agent::acceptance::GoalContract::compile(contract_goal);
+    let (goal_contract, goal_diff) = if let Some(plan) = recovery_plan.as_ref() {
+        let previous = plan.original_contract.clone()
+            .unwrap_or_else(|| crate::agent::acceptance::GoalContract::compile(&plan.original_goal));
+        let (contract, diff) = crate::agent::acceptance::GoalContract::reconcile(&previous, content.trim());
+        (contract, Some(diff))
+    } else {
+        (crate::agent::acceptance::GoalContract::compile(content.trim()), None)
+    };
     let execution_budget = crate::agent::governance::ExecutionBudget::for_contract(
         &goal_contract,
         usize::from(recovery_plan.is_some()),
@@ -2464,7 +2467,7 @@ async fn stream_chat_inner(
             &conn,
             &trace_id,
             &conversation_id,
-            content.trim(),
+            &goal_contract.original_goal,
             recovery_plan.as_ref(),
             Some(&goal_contract),
             execution_budget.lease_ms,
@@ -2494,6 +2497,14 @@ async fn stream_chat_inner(
                 &trace_id,
                 &conversation_id,
             )?;
+            if let Some(diff) = goal_diff.as_ref() {
+                crate::agent::coordinator::reconcile_goal_change(
+                    &conn,
+                    &trace_id,
+                    &conversation_id,
+                    diff,
+                )?;
+            }
         }
     }
     let _ = app.emit(

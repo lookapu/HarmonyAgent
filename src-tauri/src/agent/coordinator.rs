@@ -273,6 +273,70 @@ pub fn inherit_plan_steps(
     Ok(todos.len())
 }
 
+/// Cancel inherited plan items that no longer belong to the amended goal.
+/// A full replacement invalidates every unfinished parent plan item. For an
+/// incremental amendment, only items that clearly name a removed criterion are
+/// cancelled; ambiguous work remains pending for the Agent to inspect.
+pub fn reconcile_goal_change(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    diff: &crate::agent::acceptance::GoalContractDiff,
+) -> Result<usize, String> {
+    if !diff.changed {
+        return Ok(0);
+    }
+    let steps = list_steps(conn, run_id)?;
+    let mut cancelled = 0usize;
+    for step in steps.into_iter().filter(|step| {
+        step.source == "plan" && matches!(step.state.as_str(), "pending" | "running" | "blocked")
+    }) {
+        let title = step.title.to_lowercase();
+        let removed_match = diff.removed.iter().any(|criterion| {
+            criterion_keywords(&criterion.kind).iter().any(|word| title.contains(word))
+        });
+        if diff.replacement || removed_match {
+            cancelled += conn.execute(
+                "UPDATE execution_steps SET state='cancelled',verification_state='not_applicable',
+                 result_summary='目标契约变更后该计划项不再适用',updated_at=?1,finished_at=?1
+                 WHERE step_id=?2 AND run_id=?3 AND state IN ('pending','running','blocked')",
+                params![now_ms(), step.step_id, run_id],
+            ).map_err(|e| e.to_string())?;
+        }
+    }
+    let _ = crate::agent::runtime::append_event(
+        conn,
+        run_id,
+        conversation_id,
+        "goal.changed",
+        serde_json::json!({"diff": diff, "cancelled_steps": cancelled}),
+    );
+    let _ = crate::agent::enterprise::audit(
+        conn,
+        Some(run_id),
+        Some(conversation_id),
+        "user",
+        "goal.change",
+        "goal_contract",
+        "reconciled",
+        &serde_json::json!({"diff": diff, "cancelled_steps": cancelled}),
+    );
+    Ok(cancelled)
+}
+
+fn criterion_keywords(kind: &crate::agent::acceptance::CriterionKind) -> &'static [&'static str] {
+    use crate::agent::acceptance::CriterionKind;
+    match kind {
+        CriterionKind::Mutation => &["修改", "变更", "实现", "edit", "change", "implement"],
+        CriterionKind::Verification => &["验证", "检查", "verify", "check"],
+        CriterionKind::Build => &["构建", "编译", "build", "compile"],
+        CriterionKind::Tests => &["测试", "用例", "test"],
+        CriterionKind::Deploy => &["部署", "安装", "deploy", "install"],
+        CriterionKind::GitCommit => &["提交", "commit"],
+        CriterionKind::GitPush => &["推送", "push"],
+    }
+}
+
 /// 进程重启恢复。prepared 明确表示尚未进入工具 Future，可安全标为未执行；running 才需要
 /// 根据契约核验副作用。返回发生状态变化的步骤数。
 pub fn recover_interrupted_steps(conn: &Connection) -> Result<usize, String> {
@@ -429,6 +493,35 @@ mod tests {
         finish_tool_step(&c, "r", "c", "a", "ok", "done").unwrap();
         finish_tool_step(&c, "r", "c", "a", "error", "late").unwrap();
         assert_eq!(list_steps(&c, "r").unwrap()[0].state, "completed");
+    }
+
+    #[test]
+    fn replacement_goal_cancels_only_unfinished_inherited_plan() {
+        let c = conn();
+        sync_todos(
+            &c,
+            "r",
+            "c",
+            &[
+                crate::agent::todo::TodoItem { id: "done".into(), content: "实现功能".into(), status: "done".into() },
+                crate::agent::todo::TodoItem { id: "deploy".into(), content: "部署到设备".into(), status: "pending".into() },
+            ],
+        ).unwrap();
+        let previous = crate::agent::acceptance::GoalContract::compile("实现并部署");
+        let (_, diff) = crate::agent::acceptance::GoalContract::reconcile(
+            &previous,
+            "目标改为只需要解释现有实现",
+        );
+        assert_eq!(reconcile_goal_change(&c, "r", "c", &diff).unwrap(), 1);
+        let steps = list_steps(&c, "r").unwrap();
+        assert_eq!(steps[0].state, "completed");
+        assert_eq!(steps[1].state, "cancelled");
+        assert_eq!(steps[1].verification_state, "not_applicable");
+        let event: String = c.query_row(
+            "SELECT event_type FROM run_events WHERE run_id='r' ORDER BY seq DESC LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(event, "goal.changed");
     }
 
     #[test]

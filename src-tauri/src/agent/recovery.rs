@@ -52,6 +52,8 @@ pub struct RecoveryDecision {
 pub struct RecoveryPlan {
     pub parent_run_id: String,
     pub original_goal: String,
+    #[serde(default)]
+    pub original_contract: Option<crate::agent::acceptance::GoalContract>,
     pub policy: String,
     pub decisions: Vec<RecoveryDecision>,
     pub completed_count: usize,
@@ -272,6 +274,8 @@ pub fn build_plan(
     Ok(RecoveryPlan {
         parent_run_id: parent.run_id,
         original_goal: parent.goal,
+        original_contract: parent.goal_contract_json.as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
         policy: policy.into(),
         decisions,
         completed_count,

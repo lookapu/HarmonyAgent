@@ -680,6 +680,7 @@ mod tests {
         let plan = crate::agent::recovery::RecoveryPlan {
             parent_run_id: "parent".into(),
             original_goal: "ship product".into(),
+            original_contract: None,
             policy: "verify_effects".into(),
             decisions: Vec::new(),
             completed_count: 0,
