@@ -327,57 +327,9 @@ fn truncate_cell(s: &str, max: usize) -> String {
 
 // ---------------- share_session / import_session ----------------
 
-/// 字段名是否含敏感词（递归脱敏用）
-fn is_sensitive_field(k: &str) -> bool {
-    let lower = k.to_lowercase();
-    ["api_key", "apikey", "secret", "token", "password", "authorization"]
-        .iter()
-        .any(|kw| lower.contains(kw))
-}
-
-/// 值是否像密钥明文（常见密钥前缀模式）
-fn looks_like_secret(v: &str) -> bool {
-    let t = v.trim();
-    t.starts_with("sk-") || t.starts_with("ghp_") || t.starts_with("gho_")
-        || t.starts_with("Bearer ") || t.starts_with("bearer ")
-        || t.starts_with("api_key=") || t.starts_with("apikey=")
-}
-
-/// 递归脱敏：键名匹配 + name/value 结构 + 值级密钥模式（分享/导出时防止密钥泄漏）
+/// 会话分享、快照等 JSON 出口统一使用全局脱敏策略。
 fn redact(v: &mut serde_json::Value) {
-    match v {
-        serde_json::Value::Object(map) => {
-            // name/value 结构：name 值含敏感词时替换 value（如 headers 里的 Authorization）
-            if map.contains_key("value")
-                && map.get("name").and_then(|x| x.as_str()).is_some_and(
-                    |n| is_sensitive_field(n) || n.eq_ignore_ascii_case("authorization"),
-                )
-            {
-                if let Some(val) = map.get_mut("value") {
-                    *val = serde_json::Value::String("***".into());
-                }
-            }
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for k in keys {
-                if is_sensitive_field(&k) {
-                    map.insert(k, serde_json::Value::String("***".into()));
-                } else if let Some(child) = map.get_mut(&k) {
-                    redact(child);
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                redact(item);
-            }
-        }
-        serde_json::Value::String(s) => {
-            if looks_like_secret(s) {
-                *s = "***".into();
-            }
-        }
-        _ => {}
-    }
+    *v = crate::utils::redact::redact_json_value(v);
 }
 
 /// share_session：把会话导出为 JSON 文件（消息 + 事件，脱敏后），默认写项目 .deveco-agent/shared/ 目录。
@@ -1542,4 +1494,3 @@ pub(super) async fn export_tools_meta(args: &Value, roots: &[String]) -> Result<
     std::fs::write(&out_path, text).map_err(|e| format!("写入失败：{e}"))?;
     Ok(format!("已导出 {} 个工具元数据 → {}", tools.len(), out_path.display()))
 }
-

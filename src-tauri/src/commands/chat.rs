@@ -2056,7 +2056,10 @@ fn record_task_run(
 const TOOL_AUDIT_TEXT_LIMIT: usize = 120_000;
 
 fn bounded_tool_audit_text(value: &str) -> String {
-    let redacted = crate::utils::redact::redact_text(value);
+    let redacted = serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .map(|json| crate::utils::redact::redact_json_value(&json).to_string())
+        .unwrap_or_else(|| crate::utils::redact::redact_text(value));
     let count = redacted.chars().count();
     if count <= TOOL_AUDIT_TEXT_LIMIT {
         return redacted;

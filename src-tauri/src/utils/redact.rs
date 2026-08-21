@@ -24,6 +24,11 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             re: Regex::new(r"(?s)-----BEGIN [A-Z ]+PRIVATE KEY-----.*?-----END [A-Z ]+PRIVATE KEY-----").unwrap(),
             to: "[PRIVATE KEY REDACTED]",
         },
+        // 签名证书块（证书链可能包含组织和设备身份；审计/分享默认隐藏）
+        Rule {
+            re: Regex::new(r"(?s)-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----").unwrap(),
+            to: "[CERTIFICATE REDACTED]",
+        },
         // JWT（三段式）
         Rule {
             re: Regex::new(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}").unwrap(),
@@ -51,13 +56,27 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         },
         // 密钥字段赋值（api_key=xxx / secret: xxx / token=xxx 等，值 ≥6 字符）
         Rule {
-            re: Regex::new(r#"(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?key|client[_-]?secret|app[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|authorization)(\s*[=:]\s*)([^,\s"'{}]{6,120})"#).unwrap(),
+            re: Regex::new(r#"(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?key|client[_-]?secret|app[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|authorization)(\s*[=:]\s*)([^,\s"'{}\[]{6,120})"#).unwrap(),
             to: "$1$2***",
         },
         // 密码字段赋值
         Rule {
-            re: Regex::new(r#"(?i)(password|passwd|pwd)(\s*[=:]\s*)([^,\s"'{}]{4,120})"#).unwrap(),
+            re: Regex::new(r#"(?i)(password|passwd|pwd)(\s*[=:]\s*)([^,\s"'{}\[]{4,120})"#).unwrap(),
             to: "$1$2***",
+        },
+        // 敏感环境变量、签名材料路径/口令与设备唯一标识
+        Rule {
+            re: Regex::new(r#"(?i)([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE_KEY)|keystore(?:_?file|_?path|_?password)?|store_?password|key_?password|certificate(?:_?file|_?path)?|provisioning_?profile)(\s*[=:]\s*)([^,\s"'{}\[]{4,500})"#).unwrap(),
+            to: "$1$2***",
+        },
+        Rule {
+            re: Regex::new(r#"(?i)(device_?id|device_?serial|serial_?number|udid)(\s*[=:]\s*)([^,\s"'{}]{6,160})"#).unwrap(),
+            to: "$1$2[DEVICE ID REDACTED]",
+        },
+        // 带明文用户名/口令的连接 URL
+        Rule {
+            re: Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+(@)").unwrap(),
+            to: "$1***$2",
         },
     ]
 });
@@ -133,6 +152,44 @@ pub fn redact_text(input: &str) -> String {
     out
 }
 
+fn is_sensitive_field(key: &str) -> bool {
+    let lower = key.to_lowercase().replace('-', "_");
+    [
+        "api_key", "apikey", "secret", "token", "password", "passwd", "pwd",
+        "authorization", "credential", "private_key", "keystore", "store_password",
+        "key_password", "certificate", "cert_path", "profile_path", "provisioning_profile",
+        "device_id", "deviceid", "device_serial", "deviceserial", "serial_number",
+        "serialnumber", "udid",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+}
+
+/// JSON 级统一脱敏：按字段语义隐藏值，同时对自由文本叶子应用同一规则集。
+pub fn redact_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let name_marks_value = fields
+                .get("name")
+                .and_then(|item| item.as_str())
+                .is_some_and(is_sensitive_field);
+            serde_json::Value::Object(fields.iter().map(|(key, value)| {
+                let redacted = if is_sensitive_field(key) || (key == "value" && name_marks_value) {
+                    serde_json::Value::String("***".into())
+                } else {
+                    redact_json_value(value)
+                };
+                (key.clone(), redacted)
+            }).collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_json_value).collect())
+        }
+        serde_json::Value::String(text) => serde_json::Value::String(redact_text(text)),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +233,37 @@ mod tests {
         // 普通代码/URL 不应被误伤
         let out = redact_text("const url = \"https://example.com/api/v1?page=2&size=20\";\nlet count = 13800138000 / 100;");
         assert!(out.contains("https://example.com/api/v1"), "URL 不应被遮: {out}");
+    }
+
+    #[test]
+    fn test_redact_signing_env_device_and_connection_material() {
+        let input = "HAP_SIGNING_TOKEN=very-secret-token\nkeystoreFile=/Users/me/release.p12\n\
+device_id: ABCDEF0123456789\nDATABASE_URL=postgres://alice:plainpass@db.local/app\n\
+-----BEGIN CERTIFICATE-----\nMIICSECRET\n-----END CERTIFICATE-----";
+        let out = redact_text(input);
+        for secret in [
+            "very-secret-token", "/Users/me/release.p12", "ABCDEF0123456789",
+            "plainpass", "MIICSECRET",
+        ] {
+            assert!(!out.contains(secret), "仍包含敏感值 {secret}: {out}");
+        }
+        assert!(out.contains("[DEVICE ID REDACTED]"));
+        assert!(out.contains("[CERTIFICATE REDACTED]"));
+    }
+
+    #[test]
+    fn test_json_redaction_uses_keys_and_name_value_pairs() {
+        let input = serde_json::json!({
+            "env": {"PATH": "/usr/bin", "SIGNING_PASSWORD": "open-sesame"},
+            "deviceSerial": "DEVICE-123456",
+            "headers": [{"name": "Authorization", "value": "Bearer abcdefghijklmnop"}],
+            "message": "api_key=abcdefghijklmnop"
+        });
+        let out = redact_json_value(&input);
+        assert_eq!(out["env"]["PATH"], "/usr/bin");
+        assert_eq!(out["env"]["SIGNING_PASSWORD"], "***");
+        assert_eq!(out["deviceSerial"], "***");
+        assert_eq!(out["headers"][0]["value"], "***");
+        assert!(!out["message"].as_str().unwrap().contains("abcdefghijklmnop"));
     }
 }

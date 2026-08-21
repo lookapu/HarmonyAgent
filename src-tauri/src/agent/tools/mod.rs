@@ -1105,13 +1105,17 @@ pub async fn run_tool(
             if let Some(id) = instance_id {
                 let mcp_result = mcp.call_by_id(&id, &tool, args.clone()).await;
                 // 统一出口脱敏（[57]）：MCP 返回同样过文本级遮罩
-                return mcp_result.map(|ok| crate::utils::redact::redact_text(&ok));
+                return mcp_result
+                    .map(|ok| crate::utils::redact::redact_text(&ok))
+                    .map_err(|err| crate::utils::redact::redact_text(&err));
             }
             // 查不到编号实例：可能是用户实例名本身含 #n（唯一实例），回退旧路径按全名匹配
         }
         let mcp_result = mcp.call(&server, &tool, args.clone(), Some(project_id)).await;
         // 统一出口脱敏（[57]）：MCP 返回同样过文本级遮罩
-        return mcp_result.map(|ok| crate::utils::redact::redact_text(&ok));
+        return mcp_result
+            .map(|ok| crate::utils::redact::redact_text(&ok))
+            .map_err(|err| crate::utils::redact::redact_text(&err));
     }
     // 有效根：用户指明目录优先（按消息先后顺序），会话项目根兜底（去重）。
     // 文件工具相对路径按此顺序逐个尝试，绝对路径在任一有效根内放行。
@@ -1355,7 +1359,9 @@ pub async fn run_tool(
       }
     }).await;
     // 统一出口脱敏（[57]）：所有工具返回文本过文本级遮罩（密钥/JWT/邮箱/手机号/身份证等）
-    let result = result.map(|ok| crate::utils::redact::redact_text(&ok));
+    let result = result
+        .map(|ok| crate::utils::redact::redact_text(&ok))
+        .map_err(|err| crate::utils::redact::redact_text(&err));
     // 统一错误信封（[65]）：所有工具的 Err 自动套上 category/可重试/advice 头
     let result = result.map_err(|e| errors::ToolError::enrich(name, e).to_envelope());
     // [67] 写缓存：仅 L0 只读工具（有副作用的 L1/L2 绝不缓存）

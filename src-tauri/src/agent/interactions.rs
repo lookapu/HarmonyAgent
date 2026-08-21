@@ -12,24 +12,6 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn redact_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(text) => {
-            serde_json::Value::String(crate::utils::redact::redact_text(text))
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(redact_value).collect())
-        }
-        serde_json::Value::Object(fields) => serde_json::Value::Object(
-            fields
-                .iter()
-                .map(|(key, value)| (key.clone(), redact_value(value)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
 pub fn begin(
     request_id: &str,
     conversation_id: &str,
@@ -54,7 +36,7 @@ pub fn begin_with_conn(
     payload: &serde_json::Value,
 ) -> Result<(), String> {
     let at = now_ms();
-    let payload_json = redact_value(payload).to_string();
+    let payload_json = crate::utils::redact::redact_json_value(payload).to_string();
     conn.execute(
         "INSERT INTO pending_interactions
          (request_id,conversation_id,run_id,kind,state,payload_json,owner_worker_id,
@@ -90,7 +72,7 @@ pub fn finish_with_conn(
     response: &serde_json::Value,
 ) -> Result<bool, String> {
     let at = now_ms();
-    let response_json = redact_value(response).to_string();
+    let response_json = crate::utils::redact::redact_json_value(response).to_string();
     let changed = conn
         .execute(
             "UPDATE pending_interactions SET state=?1,response_json=?2,updated_at=?3,resolved_at=?3
