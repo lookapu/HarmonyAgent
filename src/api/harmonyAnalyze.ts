@@ -201,6 +201,18 @@ export interface HarmonySemanticModel {
   graph: HarmonyProjectGraph
 }
 
+export interface HarmonyModelUpdate {
+  mode: 'incremental' | 'full'
+  changed_files: string[]
+  affected_modules: string[]
+  verification: {
+    modules: string[]
+    products: string[]
+    checks: string[]
+  }
+  model: HarmonySemanticModel
+}
+
 /** 工程能力分析结果 */
 export interface ProjectCapability {
   project: ProjectBasic

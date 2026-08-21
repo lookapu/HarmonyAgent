@@ -16,6 +16,7 @@
 - 语义模型 schema 升级为 v2：结构化记录根/模块清单来源与解析错误，兼容 OHPM v1/v3 及 targetName 锁文件，并在依赖边同时保留声明约束、锁定版本和锁文件来源。
 - 语义模型 schema 升级为 v3：全模块聚合 main pages、router map、权限 usedScene、SystemCapability 检查和 ArkTS/TS 跨模块 import，并生成带清单或源码位置的工程关系边；旧页面摘要改由该图派生。
 - 语义模型 schema 升级为 v4：补齐产品 API Level、runtime OS、根与模块 build mode、apiType、设备类型、脱敏签名完整度和相对默认产品的差异字段。
+- Agent 文件变更接入语义模型增量缓存：只重解析所属模块，沿 OHPM 依赖与真实 import 反向计算受影响模块、产品和建议验证；根结构变化或缺少缓存基线时安全回退全量解析。
 
 ### 长会话 Context V2（M1 基础）
 

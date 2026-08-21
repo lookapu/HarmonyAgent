@@ -186,7 +186,7 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
     if !root.is_dir() {
         return Err(format!("项目目录不存在：{project_path}"));
     }
-    let semantic_model = crate::services::harmony_model::parse(root);
+    let semantic_model = crate::services::harmony_model::cached(root);
     let project = crate::services::harmony::project_summary(root, &semantic_model);
     let module_rels = semantic_model
         .modules

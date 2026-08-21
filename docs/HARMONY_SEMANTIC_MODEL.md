@@ -45,8 +45,20 @@ OHPM 锁文件兼容常见 v1/v3 的 `specifiers` + `packages` 结构，也识�
 
 能力分析命令额外返回完整 `semantic_model`，前端可在不重新猜测工程结构的前提下展示产品、模块与依赖关系。
 
+## 增量更新与影响范围
+
+语义模型按工程根缓存。Agent 的文件写入、编辑、删除、移动、复制和批量编辑成功后，会使用真实变更路径刷新缓存：
+
+- 普通模块文件只重解析所属模块，并重建依赖、锁文件、清单来源和关系图；未受影响模块沿用上一版本的结构化记录；
+- 根 `build-profile.json5`、`AppScope/app.json5` 或无法归属模块的结构清单发生变化时，回退全量解析；首次收到变更但尚无缓存基线时同样全量解析，不伪装成增量更新；
+- 受影响模块从直接变更模块开始，沿 OHPM 工作区依赖和真实跨模块 import 反向闭包扩展；
+- 验证范围同时给出相关模块、产品和建议检查。ArkTS/TS 变化要求 build、lint、test，依赖与 profile 变化额外要求 dependency sync 或 configuration 检查；
+- 绝对路径和相对路径统一规范化为工程内相对路径，供审计、Workspace 展示和后续验证复用。
+
+增量结果使用独立的 `HarmonyModelUpdate` 信封，包含 `mode`、`changed_files`、`affected_modules`、`verification` 和更新后的 `model`。语义模型自身字段未变化，因此 schema 仍为 v4。
+
 ## 验证基线
 
 自动化夹具包含两个产品、四个嵌套模块、HAP/HSP/HAR 三类产物、普通 Ability、ExtensionAbility、权限 usedScene、main pages、router map、SystemCapability 检查、真实跨模块 import、两级本地依赖边、v1 targetName 锁、v3 根锁和损坏清单，并验证旧部署摘要与统一模型一致。
 
-后续 HM-05 在此模型上增加增量更新、受影响模块和验证范围。
+夹具还会修改嵌套 feature 的 ArkTS import，验证只重解析直接模块、反向标记依赖它的 entry、保留无关模块、更新真实引用图，并覆盖根配置全量回退、绝对路径规范化与缓存失效链路。

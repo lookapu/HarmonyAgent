@@ -1414,6 +1414,18 @@ pub async fn run_tool(
                 }
             }
         }
+        if !changed_paths.is_empty() {
+            let changed = changed_paths
+                .iter()
+                .map(|path| path.to_string())
+                .collect::<Vec<_>>();
+            for root in &roots {
+                let path = Path::new(root);
+                if path.is_dir() && crate::services::harmony::is_project_root(path) {
+                    crate::services::harmony_model::invalidate_files(path, &changed);
+                }
+            }
+        }
         // 项目标识文件（框架标志文件）变更：重新分类项目身份并广播刷新——
         // 新增/删除 build-profile.json5、package.json、go.mod 等会改变项目类型，
         // 前端据此刷新对话框顶部徽标、概览、右侧栏各 tab。
@@ -2144,7 +2156,7 @@ async fn get_project_info(roots: &[String]) -> Result<String, String> {
         return Err("当前会话未绑定项目目录".into());
     }
     let root = Path::new(project_path);
-    let model = crate::services::harmony_model::parse(root);
+    let model = crate::services::harmony_model::cached(root);
     let mut info = crate::services::harmony::project_summary(root, &model);
     let pages = crate::services::harmony::routes_from_model(&model, info.entry_module.as_deref());
     let payload = serde_json::json!({

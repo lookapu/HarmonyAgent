@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -16,6 +17,9 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "oh_modules",
 ];
+
+static MODEL_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, HarmonySemanticModel>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarmonySemanticModel {
@@ -217,6 +221,22 @@ pub struct HarmonyManifestSource {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyModelUpdate {
+    pub mode: String,
+    pub changed_files: Vec<String>,
+    pub affected_modules: Vec<String>,
+    pub verification: HarmonyVerificationScope,
+    pub model: HarmonySemanticModel,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyVerificationScope {
+    pub modules: Vec<String>,
+    pub products: Vec<String>,
+    pub checks: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct RootModuleDecl {
     name: String,
@@ -265,6 +285,233 @@ pub fn parse(root: &Path) -> HarmonySemanticModel {
     model.manifests = collect_manifest_sources(root, &manifest_paths);
     model.graph = build_project_graph(root, &model);
     model
+}
+
+pub fn cached(root: &Path) -> HarmonySemanticModel {
+    let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut cache = MODEL_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.entry(key).or_insert_with(|| parse(root)).clone()
+}
+
+pub fn invalidate_files(root: &Path, changed_files: &[String]) -> HarmonyModelUpdate {
+    let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut cache = MODEL_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let update = if let Some(previous) = cache.get(&key) {
+        refresh_after_changes(root, previous, changed_files)
+    } else {
+        let model = parse(root);
+        let changed_files = changed_files
+            .iter()
+            .map(|path| normalize_changed_path(root, path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let affected_modules = model
+            .modules
+            .iter()
+            .map(|module| module.rel_path.clone())
+            .collect::<Vec<_>>();
+        HarmonyModelUpdate {
+            mode: "full".into(),
+            verification: verification_scope(&model, &affected_modules, &changed_files),
+            changed_files,
+            affected_modules,
+            model,
+        }
+    };
+    cache.insert(key, update.model.clone());
+    update
+}
+
+/// 按文件变化增量刷新模型，并沿声明依赖与真实 import 反向计算验证范围。
+pub fn refresh_after_changes(
+    root: &Path,
+    previous: &HarmonySemanticModel,
+    changed_files: &[String],
+) -> HarmonyModelUpdate {
+    let mut changed_files = changed_files
+        .iter()
+        .map(|path| normalize_changed_path(root, path))
+        .collect::<Vec<_>>();
+    changed_files.sort();
+    changed_files.dedup();
+    let root_structural = changed_files.iter().any(|path| {
+        matches!(
+            path.as_str(),
+            "build-profile.json5" | "AppScope/app.json5" | "app.json5"
+        )
+    });
+    let owners = changed_files
+        .iter()
+        .map(|path| owning_module(path, &previous.modules))
+        .collect::<Vec<_>>();
+    let unknown_structural = changed_files.iter().zip(&owners).any(|(path, owner)| {
+        owner.is_none()
+            && (path.ends_with("module.json5")
+                || path.ends_with("build-profile.json5")
+                || path.ends_with("oh-package.json5"))
+    });
+    if root_structural || unknown_structural {
+        let model = parse(root);
+        let affected_modules = model
+            .modules
+            .iter()
+            .map(|module| module.rel_path.clone())
+            .collect::<Vec<_>>();
+        return HarmonyModelUpdate {
+            mode: "full".into(),
+            verification: verification_scope(&model, &affected_modules, &changed_files),
+            changed_files,
+            affected_modules,
+            model,
+        };
+    }
+
+    let mut model = previous.clone();
+    let directly_changed = owners.into_iter().flatten().collect::<BTreeSet<_>>();
+    for rel_path in &directly_changed {
+        let previous_module = previous
+            .modules
+            .iter()
+            .find(|module| &module.rel_path == rel_path);
+        let declaration = previous_module.map(|module| RootModuleDecl {
+            name: module.name.clone(),
+            rel_path: module.rel_path.clone(),
+            targets: module.targets.clone(),
+        });
+        let reparsed = parse_module(root, rel_path, declaration.as_ref());
+        model.modules.retain(|module| &module.rel_path != rel_path);
+        if let Some(module) = reparsed {
+            model.modules.push(module);
+        }
+    }
+    model.modules.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    for product in &mut model.products {
+        product.modules.clear();
+    }
+    assign_product_modules(&mut model.products, &model.modules);
+    model.product_differences = product_differences(&model.products);
+
+    let mut manifest_paths = model
+        .modules
+        .iter()
+        .map(|module| module.rel_path.clone())
+        .chain(
+            previous
+                .manifests
+                .iter()
+                .filter(|source| source.owner_module != ".")
+                .map(|source| source.owner_module.clone()),
+        )
+        .collect::<Vec<_>>();
+    manifest_paths.sort();
+    manifest_paths.dedup();
+    model.lockfiles = parse_lockfiles(root, &manifest_paths);
+    model.dependencies =
+        parse_dependencies(root, &model.modules, &manifest_paths, &model.lockfiles);
+    model.manifests = collect_manifest_sources(root, &manifest_paths);
+    model.graph = build_project_graph(root, &model);
+
+    let affected_modules = affected_module_closure(previous, &directly_changed);
+    let verification = verification_scope(&model, &affected_modules, &changed_files);
+    HarmonyModelUpdate {
+        mode: "incremental".into(),
+        changed_files,
+        affected_modules,
+        verification,
+        model,
+    }
+}
+
+fn owning_module(path: &str, modules: &[HarmonyModule]) -> Option<String> {
+    modules
+        .iter()
+        .filter(|module| {
+            module.rel_path == "."
+                || path == module.rel_path
+                || path
+                    .strip_prefix(&module.rel_path)
+                    .is_some_and(|tail| tail.starts_with('/'))
+        })
+        .max_by_key(|module| module.rel_path.matches('/').count())
+        .map(|module| module.rel_path.clone())
+}
+
+fn affected_module_closure(
+    model: &HarmonySemanticModel,
+    directly_changed: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut affected = directly_changed.clone();
+    loop {
+        let before = affected.len();
+        for dependency in &model.dependencies {
+            if dependency
+                .target_module
+                .as_ref()
+                .is_some_and(|target| affected.contains(target))
+            {
+                affected.insert(dependency.from_module.clone());
+            }
+        }
+        for reference in &model.graph.cross_module_refs {
+            if affected.contains(&reference.to_module) {
+                affected.insert(reference.from_module.clone());
+            }
+        }
+        if affected.len() == before {
+            break;
+        }
+    }
+    affected.into_iter().collect()
+}
+
+fn verification_scope(
+    model: &HarmonySemanticModel,
+    modules: &[String],
+    changed_files: &[String],
+) -> HarmonyVerificationScope {
+    let module_set = modules.iter().collect::<BTreeSet<_>>();
+    let products = model
+        .products
+        .iter()
+        .filter(|product| {
+            product
+                .modules
+                .iter()
+                .any(|module| module_set.contains(module))
+        })
+        .map(|product| product.name.clone())
+        .collect::<Vec<_>>();
+    let mut checks = BTreeSet::new();
+    checks.insert("build".to_string());
+    if changed_files
+        .iter()
+        .any(|path| path.ends_with(".ets") || path.ends_with(".ts"))
+    {
+        checks.insert("lint".into());
+        checks.insert("test".into());
+    }
+    if changed_files
+        .iter()
+        .any(|path| path.contains("oh-package") || path.ends_with("build-profile.json5"))
+    {
+        checks.insert("dependency_sync".into());
+    }
+    if changed_files
+        .iter()
+        .any(|path| path.ends_with("module.json5") || path.ends_with("build-profile.json5"))
+    {
+        checks.insert("configuration".into());
+    }
+    HarmonyVerificationScope {
+        modules: modules.to_vec(),
+        products,
+        checks: checks.into_iter().collect(),
+    }
 }
 
 fn parse_app(root: &Path) -> HarmonyApp {
@@ -1308,6 +1555,16 @@ fn normalize_rel(path: &str) -> String {
     }
 }
 
+fn normalize_changed_path(root: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root).unwrap_or(path)
+    } else {
+        path
+    };
+    normalize_rel(&relative.to_string_lossy())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1541,6 +1798,76 @@ mod tests {
         let legacy_routes = crate::services::harmony::routes_from_model(&model, Some("entry"));
         assert!(legacy_routes.contains(&"pages/Index".to_string()));
         assert!(legacy_routes.contains(&"pages/PayPage".to_string()));
+
+        let unchanged_runtime = serde_json::to_value(
+            model
+                .modules
+                .iter()
+                .find(|module| module.rel_path == "shared/runtime")
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("features/pay/src/main/ets/Pay.ets"),
+            "import { Design } from '@app/design'\nexport struct Pay {}\n",
+        )
+        .unwrap();
+        let update =
+            refresh_after_changes(&root, &model, &["features/pay/src/main/ets/Pay.ets".into()]);
+        assert_eq!(update.mode, "incremental");
+        assert!(update
+            .affected_modules
+            .contains(&"features/pay".to_string()));
+        assert!(update.affected_modules.contains(&"entry".to_string()));
+        assert!(update.verification.checks.contains(&"lint".to_string()));
+        assert!(update.verification.checks.contains(&"test".to_string()));
+        assert!(update
+            .model
+            .graph
+            .cross_module_refs
+            .iter()
+            .any(|reference| {
+                reference.from_module == "features/pay" && reference.to_module == "libs/design"
+            }));
+        assert_eq!(
+            serde_json::to_value(
+                update
+                    .model
+                    .modules
+                    .iter()
+                    .find(|module| module.rel_path == "shared/runtime")
+                    .unwrap()
+            )
+            .unwrap(),
+            unchanged_runtime
+        );
+        let full = refresh_after_changes(&root, &update.model, &["build-profile.json5".into()]);
+        assert_eq!(full.mode, "full");
+        assert_eq!(full.affected_modules.len(), full.model.modules.len());
+
+        let cached_model = cached(&root);
+        assert!(cached_model
+            .graph
+            .cross_module_refs
+            .iter()
+            .any(|reference| reference.to_module == "libs/design"));
+        std::fs::write(
+            root.join("features/pay/src/main/ets/Pay.ets"),
+            "import { Runtime } from '@app/runtime'\nexport struct Pay {}\n",
+        )
+        .unwrap();
+        let changed_path = root.join("features/pay/src/main/ets/Pay.ets");
+        let cached_update = invalidate_files(&root, &[changed_path.to_string_lossy().into()]);
+        assert_eq!(cached_update.mode, "incremental");
+        assert_eq!(
+            cached_update.changed_files,
+            vec!["features/pay/src/main/ets/Pay.ets"]
+        );
+        assert!(cached(&root)
+            .graph
+            .cross_module_refs
+            .iter()
+            .any(|reference| reference.to_module == "shared/runtime"));
         std::fs::remove_dir_all(root).ok();
     }
 }
