@@ -33,6 +33,12 @@ pub struct BuildError {
     pub kind: String,
     /// 根因分类：type / dependency / signing / sdk / api_level / resource / ohpm / syntax / other
     pub category: String,
+    /// Hvigor/ArkTS 稳定错误码（如 00303312、ArkTSCheckError），无法提取时为空。
+    #[serde(default)]
+    pub error_code: Option<String>,
+    /// environment / dependency / configuration / compile / package / signing / build
+    #[serde(default)]
+    pub stage: String,
     pub file: Option<String>,
     pub line: Option<i64>,
     pub column: Option<i64>,
@@ -84,7 +90,11 @@ fn classify_message(kind: &str, message: &str) -> String {
         return "resource".to_string();
     }
     // 签名类
-    if kind == "signing" || m.contains("signing") || m.contains("certificate") || m.contains("profile not match") {
+    if kind == "signing"
+        || m.contains("signing")
+        || m.contains("certificate")
+        || m.contains("profile not match")
+    {
         return "signing".to_string();
     }
     // SDK/ohpm 类
@@ -112,7 +122,8 @@ pub fn is_project_root(dir: &Path) -> bool {
     // 兼容无 AppScope 的旧布局：build-profile.json5 顶层必须含 "app" 键（products/signingConfigs/modules）
     let bp = dir.join("build-profile.json5");
     bp.is_file()
-        && read_to_string_opt(&bp).is_some_and(|t| parse_json5(&t).is_ok_and(|v| v.get("app").is_some()))
+        && read_to_string_opt(&bp)
+            .is_some_and(|t| parse_json5(&t).is_ok_and(|v| v.get("app").is_some()))
 }
 
 /// 解析鸿蒙工程的关键信息（部署与构建闭环所需的最小集合）。
@@ -146,7 +157,12 @@ pub fn project_summary(
         .iter()
         .find(|module| module.kind == "entry")
         .or_else(|| model.modules.iter().find(|module| module.name == "entry"))
-        .or_else(|| model.modules.iter().find(|module| module.artifact_kind == "hap"));
+        .or_else(|| {
+            model
+                .modules
+                .iter()
+                .find(|module| module.artifact_kind == "hap")
+        });
     let sdk_version = sdk_product.and_then(|product| {
         product
             .compatible_sdk_version
@@ -168,10 +184,12 @@ pub fn project_summary(
         api_version: sdk_version.as_deref().and_then(parse_api_version),
         sdk_version,
         signing_configured: model.products.iter().any(|product| {
-            product
-                .signing_config
-                .as_ref()
-                .is_some_and(|name| model.signing_configs.iter().any(|config| config.name == *name))
+            product.signing_config.as_ref().is_some_and(|name| {
+                model
+                    .signing_configs
+                    .iter()
+                    .any(|config| config.name == *name)
+            })
         }),
         hap_output_dir: entry.map(|module| {
             root.join(&module.rel_path)
@@ -230,7 +248,9 @@ fn latest_hap_in_dir(dir: &Path) -> Option<PathBuf> {
 
 fn find_latest_hap_fallback(root: &Path) -> Option<PathBuf> {
     fn walk(dir: &Path, best: &mut Option<(PathBuf, SystemTime)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in entries.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
@@ -244,7 +264,10 @@ fn find_latest_hap_fallback(root: &Path) -> Option<PathBuf> {
                 }
                 walk(&p, best);
             } else if p.extension().is_some_and(|x| x == "hap") {
-                let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                let mtime = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
                 // signed 优先：给 signed 加一个时间权重
                 let is_signed = name.contains("-signed");
                 let score = if is_signed {
@@ -417,9 +440,7 @@ fn find_toolkit_hvigorw() -> Option<PathBuf> {
 /// PATH 中，且 Windows 下 cmd 报错可能被吞掉、看不到任何输出）。因此 bat 存在
 /// 但引用缺失的 wrapper 时应判定不可用，跳过它改走 DevEco 内置工具链。
 fn hvigorw_bat_usable(bat: &Path, wrapper: &Path) -> bool {
-    wrapper.is_file()
-        || read_to_string_opt(bat)
-            .map_or(true, |t| !t.contains("hvigor-wrapper.js"))
+    wrapper.is_file() || read_to_string_opt(bat).map_or(true, |t| !t.contains("hvigor-wrapper.js"))
 }
 
 /// 构建 hvigor 所需环境变量：用户显式设置了 DEVECO_SDK_HOME 时不覆盖，
@@ -431,13 +452,19 @@ fn hvigor_env() -> Vec<(String, String)> {
         return Vec::new();
     }
     if let Some(sdk) = find_deveco_toolchain().map(|(_, sdk)| sdk) {
-        return vec![("DEVECO_SDK_HOME".to_string(), sdk.to_string_lossy().to_string())];
+        return vec![(
+            "DEVECO_SDK_HOME".to_string(),
+            sdk.to_string_lossy().to_string(),
+        )];
     }
     // command-line-tools 内置 SDK（官方包自带 sdk/ 目录）
     if let Some(cli) = crate::services::harmony_env::cached_cli_root() {
         let sdk = cli.join("sdk");
         if sdk.join("default").join("sdk-pkg.json").is_file() {
-            return vec![("DEVECO_SDK_HOME".to_string(), sdk.to_string_lossy().to_string())];
+            return vec![(
+                "DEVECO_SDK_HOME".to_string(),
+                sdk.to_string_lossy().to_string(),
+            )];
         }
     }
     Vec::new()
@@ -458,7 +485,11 @@ pub(crate) fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
 #[cfg(windows)]
 pub(crate) fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
     fn probe(root: &Path) -> Option<(PathBuf, PathBuf)> {
-        let hvigorw = root.join("tools").join("hvigor").join("bin").join("hvigorw.js");
+        let hvigorw = root
+            .join("tools")
+            .join("hvigor")
+            .join("bin")
+            .join("hvigorw.js");
         let sdk = root.join("sdk");
         (hvigorw.is_file() && sdk.join("default").join("sdk-pkg.json").is_file())
             .then(|| (hvigorw, sdk))
@@ -481,7 +512,10 @@ pub(crate) fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
             .filter(|e| e.file_name().to_string_lossy().starts_with("DevEco"))
             .filter_map(|e| {
                 let p = probe(&e.path())?;
-                let t = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                let t = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
                 Some((p, t))
             })
             .collect();
@@ -520,7 +554,9 @@ pub(crate) fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
 pub fn collect_ohpm_deps(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut scan = |path: &Path, module: &str| {
-        let Some(text) = read_to_string_opt(&path.join("oh-package.json5")) else { return };
+        let Some(text) = read_to_string_opt(&path.join("oh-package.json5")) else {
+            return;
+        };
         let Ok(v) = parse_json5(&text) else { return };
         for key in ["dependencies", "devDependencies"] {
             if let Some(map) = v.get(key).and_then(|x| x.as_object()) {
@@ -566,7 +602,10 @@ pub fn verify_ohpm_install(root: &Path, log: &str) -> String {
         let dirs: Vec<PathBuf> = if module.is_empty() {
             vec![root.join("oh_modules")]
         } else {
-            vec![root.join(module).join("oh_modules"), root.join("oh_modules")]
+            vec![
+                root.join(module).join("oh_modules"),
+                root.join("oh_modules"),
+            ]
         };
         let ok = dirs.iter().any(|om| {
             let target = if let Some((scope, pkg)) = name.split_once('/') {
@@ -608,13 +647,33 @@ pub fn verify_ohpm_install(root: &Path, log: &str) -> String {
 /// 解析构建日志，返回结构化错误（按 HARMONY_INTEGRATION.md §4.1 正则库）。
 pub fn parse_build_errors(log: &str) -> Vec<BuildError> {
     let mut errors = Vec::new();
-    for line in log.lines() {
-        if let Some(e) = match_error_line(line) {
-            errors.push(e);
+    let lines = log.lines().collect::<Vec<_>>();
+    let mut stage_hint = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(stage) = detect_stage_hint(line) {
+            stage_hint = stage;
+        }
+        if let Some(mut error) = match_error_line(line) {
+            if error.stage == "build" && !stage_hint.is_empty() {
+                error.stage = stage_hint.clone();
+            }
+            if error.message.is_empty() {
+                if let Some(message) = lines
+                    .get(index + 1)
+                    .and_then(|next| next.trim().strip_prefix("Error Message:"))
+                {
+                    error.message = message.trim().to_string();
+                    error.category = classify_message(&error.kind, &error.message);
+                    error.suggestion = suggestion_for(&error.category);
+                }
+            }
+            errors.push(error);
         }
     }
     // 去重
-    errors.dedup_by(|a, b| a.kind == b.kind && a.file == b.file && a.line == b.line && a.message == b.message);
+    errors.dedup_by(|a, b| {
+        a.kind == b.kind && a.file == b.file && a.line == b.line && a.message == b.message
+    });
     errors
 }
 
@@ -632,7 +691,11 @@ fn match_error_line(line: &str) -> Option<BuildError> {
         return Some(BuildError {
             kind: "dependency".into(),
             category: "dependency".into(),
-            file: None, line: None, column: None,
+            error_code: extract_error_code(line),
+            stage: "dependency".into(),
+            file: None,
+            line: None,
+            column: None,
             message: line.trim().to_string(),
             suggestion: "执行 ohpm install 后重试；检查 oh-package.json5 依赖声明".into(),
         });
@@ -644,9 +707,14 @@ fn match_error_line(line: &str) -> Option<BuildError> {
         return Some(BuildError {
             kind: "signing".into(),
             category: "signing".into(),
-            file: None, line: None, column: None,
+            error_code: extract_error_code(line),
+            stage: "signing".into(),
+            file: None,
+            line: None,
+            column: None,
             message: line.trim().to_string(),
-            suggestion: "检查 build-profile.json5 的 signingConfigs，在 DevEco Studio 重新配置签名".into(),
+            suggestion: "检查 build-profile.json5 的 signingConfigs，在 DevEco Studio 重新配置签名"
+                .into(),
         });
     }
     if lower.contains("sdk not found")
@@ -656,7 +724,11 @@ fn match_error_line(line: &str) -> Option<BuildError> {
         return Some(BuildError {
             kind: "sdk".into(),
             category: "sdk".into(),
-            file: None, line: None, column: None,
+            error_code: extract_error_code(line),
+            stage: "environment".into(),
+            file: None,
+            line: None,
+            column: None,
             message: line.trim().to_string(),
             suggestion: "检查 compatibleSdkVersion 与已安装 HarmonyOS SDK 是否匹配".into(),
         });
@@ -667,6 +739,8 @@ fn match_error_line(line: &str) -> Option<BuildError> {
         return Some(BuildError {
             kind: "sdk".into(),
             category: "sdk".into(),
+            error_code: extract_error_code(line),
+            stage: "environment".into(),
             file: None, line: None, column: None,
             message: line.trim().to_string(),
             suggestion: "DEVECO_SDK_HOME 须指向 DevEco Studio 的 sdk 根目录（含 default\\sdk-pkg.json 的父目录），如 C:\\Program Files\\Huawei\\DevEco Studio\\sdk；指向 sdk\\default 或其子目录会扫描不到 SDK 组件（00303312）。应用会自动探测注入；若手动设置了该变量，请取消设置或修正指向".into(),
@@ -676,9 +750,32 @@ fn match_error_line(line: &str) -> Option<BuildError> {
         return Some(BuildError {
             kind: "ohpm".into(),
             category: "ohpm".into(),
-            file: None, line: None, column: None,
+            error_code: extract_error_code(line),
+            stage: "dependency".into(),
+            file: None,
+            line: None,
+            column: None,
             message: line.trim().to_string(),
             suggestion: "检查 ohpm 工具链路径，或在 DevEco Studio 中重新安装 ohpm".into(),
+        });
+    }
+    let error_code = extract_error_code(line);
+    if lower.contains("hvigor error")
+        || lower.starts_with("error:")
+        || lower.contains(" error:")
+        || error_code.is_some()
+    {
+        let category = classify_message("hvigor", line);
+        return Some(BuildError {
+            kind: "hvigor".into(),
+            stage: detect_stage_hint(line).unwrap_or_else(|| stage_for_category(&category)),
+            error_code,
+            suggestion: suggestion_for(&category),
+            category,
+            file: None,
+            line: None,
+            column: None,
+            message: line.trim().to_string(),
         });
     }
     None
@@ -727,6 +824,8 @@ fn parse_arkts_error(line: &str, marker: &str) -> Option<BuildError> {
     let category = classify_message("arkts", &message);
     Some(BuildError {
         kind: "arkts".into(),
+        error_code: extract_error_code(line),
+        stage: "compile".into(),
         category,
         file: Some(file.to_string()),
         line: Some(line_num),
@@ -734,6 +833,101 @@ fn parse_arkts_error(line: &str, marker: &str) -> Option<BuildError> {
         message,
         suggestion: "读取对应文件行号，修复 ArkTS 语法/类型错误后重新构建".into(),
     })
+}
+
+fn extract_error_code(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'[' {
+            continue;
+        }
+        let Some(end) = bytes[index + 1..].iter().position(|item| *item == b']') else {
+            continue;
+        };
+        let candidate = &line[index + 1..index + 1 + end];
+        if candidate.len() >= 4
+            && candidate.len() <= 32
+            && candidate
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            && (candidate.chars().any(|ch| ch.is_ascii_digit())
+                || (candidate.to_ascii_lowercase().ends_with("error")
+                    && !candidate.eq_ignore_ascii_case("error")))
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    let lower = line.to_ascii_lowercase();
+    for marker in ["error code:", "errorcode:", "code:"] {
+        let Some(index) = lower.find(marker) else {
+            continue;
+        };
+        let candidate = line[index + marker.len()..]
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn detect_stage_hint(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let stage = if lower.contains("ohpm") || lower.contains("resolve depend") {
+        "dependency"
+    } else if lower.contains("compilearkts") || lower.contains("arkts") || lower.contains("compile")
+    {
+        "compile"
+    } else if lower.contains("processprofile")
+        || lower.contains("module.json5")
+        || lower.contains("build-profile")
+    {
+        "configuration"
+    } else if lower.contains("assemblehap")
+        || lower.contains("packagehap")
+        || lower.contains("packagehsp")
+        || lower.contains("packagehar")
+        || lower.contains("pack")
+    {
+        "package"
+    } else if lower.contains("sign") || lower.contains("certificate") {
+        "signing"
+    } else if lower.contains("sdk") || lower.contains("deveco_sdk_home") {
+        "environment"
+    } else if lower.contains("hvigor") || lower.contains("build") {
+        "build"
+    } else {
+        return None;
+    };
+    Some(stage.into())
+}
+
+fn stage_for_category(category: &str) -> String {
+    match category {
+        "dependency" | "ohpm" => "dependency",
+        "sdk" | "api_level" => "environment",
+        "signing" => "signing",
+        "type" | "syntax" | "resource" => "compile",
+        _ => "build",
+    }
+    .into()
+}
+
+fn suggestion_for(category: &str) -> String {
+    match category {
+        "dependency" => "执行 ohpm install 并核对依赖声明、锁文件与模块路径",
+        "ohpm" => "检查 OHPM 工具链、registry 与缓存状态后重新同步依赖",
+        "sdk" | "api_level" => "核对本机 SDK、产品 API Level 与使用 API 的兼容范围",
+        "signing" => "核对 signingConfigs、证书、profile、keystore 与产品引用",
+        "type" | "syntax" => "读取对应源码位置，修复 ArkTS 类型或语法错误后重新构建",
+        "resource" => "核对资源声明、限定词目录与源码中的资源引用",
+        _ => "读取当前阶段前后的完整构建日志，定位首个根因后再重试",
+    }
+    .into()
 }
 
 /// 容错 JSON5 解析：剥离 // 与 /* */ 注释、去除尾逗号后用 serde_json 解析。
@@ -812,7 +1006,9 @@ fn strip_trailing_commas(text: &str) -> String {
         if !in_string && c == b',' {
             // 向后看，跳过空白后是否为 } 或 ]
             let mut j = i + 1;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+            while j < bytes.len()
+                && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
+            {
                 j += 1;
             }
             if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
@@ -901,17 +1097,35 @@ mod tests {
         let modu = proj.join("entry");
         std::fs::create_dir_all(modu.join("src/main")).unwrap();
         std::fs::create_dir_all(proj.join("AppScope")).unwrap();
-        std::fs::write(proj.join("AppScope/app.json5"), r#"{"app":{"bundleName":"com.x"}}"#).unwrap();
+        std::fs::write(
+            proj.join("AppScope/app.json5"),
+            r#"{"app":{"bundleName":"com.x"}}"#,
+        )
+        .unwrap();
         // 根级 build-profile：含 app 键（products/signingConfigs/modules）
-        std::fs::write(proj.join("build-profile.json5"), r#"{"app":{"signingConfigs":[]},"modules":[]}"#).unwrap();
+        std::fs::write(
+            proj.join("build-profile.json5"),
+            r#"{"app":{"signingConfigs":[]},"modules":[]}"#,
+        )
+        .unwrap();
         // 模块级 build-profile：只有 apiType/buildOption/targets，无 app 键
-        std::fs::write(modu.join("build-profile.json5"), r#"{"apiType":"stageMode","buildOption":{},"targets":[{"name":"default"}]}"#).unwrap();
+        std::fs::write(
+            modu.join("build-profile.json5"),
+            r#"{"apiType":"stageMode","buildOption":{},"targets":[{"name":"default"}]}"#,
+        )
+        .unwrap();
         std::fs::write(modu.join("oh-package.json5"), r#"{"name":"entry"}"#).unwrap();
         std::fs::write(modu.join("hvigorfile.ts"), "").unwrap();
 
-        assert!(is_project_root(&proj), "工程根（AppScope + 含 app 键的根 build-profile）应判定为 true");
+        assert!(
+            is_project_root(&proj),
+            "工程根（AppScope + 含 app 键的根 build-profile）应判定为 true"
+        );
         assert!(!is_project_root(&modu), "entry 模块目录不得被误判为工程根");
-        assert!(!is_project_root(&proj.join("src")), "无配置的普通目录应为 false");
+        assert!(
+            !is_project_root(&proj.join("src")),
+            "无配置的普通目录应为 false"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -934,6 +1148,7 @@ mod tests {
         let errs = parse_build_errors(line);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].kind, "arkts");
+        assert_eq!(errs[0].stage, "compile");
         assert_eq!(errs[0].line, Some(23));
         assert!(errs[0].file.as_ref().unwrap().ends_with("Home.ets"));
     }
@@ -945,27 +1160,73 @@ mod tests {
         let errs = parse_build_errors(line);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].kind, "sdk");
-        assert!(errs[0].suggestion.contains("DEVECO_SDK_HOME"), "建议应指向 SDK 根目录");
+        assert_eq!(errs[0].error_code.as_deref(), Some("00303312"));
+        assert_eq!(errs[0].stage, "environment");
+        assert!(
+            errs[0].suggestion.contains("DEVECO_SDK_HOME"),
+            "建议应指向 SDK 根目录"
+        );
         assert!(errs[0].suggestion.contains("sdk"));
         // 00303217：环境变量未设置/路径无效
         let line2 = "[00303217] Invalid value of DEVECO_SDK_HOME in the system environment path";
         let errs2 = parse_build_errors(line2);
         assert_eq!(errs2.len(), 1);
         assert_eq!(errs2[0].kind, "sdk");
+        assert_eq!(errs2[0].error_code.as_deref(), Some("00303217"));
         assert!(errs2[0].suggestion.contains("DEVECO_SDK_HOME"));
     }
 
     #[test]
+    fn test_parse_hvigor_stage_code_and_multiline_arkts_message() {
+        let log = "> hvigor ERROR: Failed :entry:default@CompileArkTS\n\
+ERROR: [ArkTSCheckError] ArkTS:ERROR File: /workspace/entry/src/main/ets/Index.ets:8:12:\n\
+Error Message: Type 'string' is not assignable to type 'number'";
+        let errors = parse_build_errors(log);
+        let arkts = errors.iter().find(|error| error.kind == "arkts").unwrap();
+        assert_eq!(arkts.error_code.as_deref(), Some("ArkTSCheckError"));
+        assert_eq!(arkts.stage, "compile");
+        assert_eq!(
+            arkts.file.as_deref(),
+            Some("/workspace/entry/src/main/ets/Index.ets")
+        );
+        assert_eq!(arkts.line, Some(8));
+        assert_eq!(arkts.column, Some(12));
+        assert_eq!(arkts.category, "type");
+        assert!(arkts.message.contains("not assignable"));
+    }
+
+    #[test]
     fn test_classify_message() {
-        assert_eq!(classify_message("arkts", "Cannot find module 'ohos.router'"), "dependency");
-        assert_eq!(classify_message("arkts", "Type 'string' is not assignable to type 'number'"), "type");
-        assert_eq!(classify_message("arkts", "Syntax error: unexpected token"), "syntax");
-        assert_eq!(classify_message("arkts", "Resource not found: app.string.title"), "resource");
-        assert_eq!(classify_message("arkts", "This API requires API version 12 or higher"), "api_level");
-        assert_eq!(classify_message("signing", "Signing configuration error"), "signing");
+        assert_eq!(
+            classify_message("arkts", "Cannot find module 'ohos.router'"),
+            "dependency"
+        );
+        assert_eq!(
+            classify_message("arkts", "Type 'string' is not assignable to type 'number'"),
+            "type"
+        );
+        assert_eq!(
+            classify_message("arkts", "Syntax error: unexpected token"),
+            "syntax"
+        );
+        assert_eq!(
+            classify_message("arkts", "Resource not found: app.string.title"),
+            "resource"
+        );
+        assert_eq!(
+            classify_message("arkts", "This API requires API version 12 or higher"),
+            "api_level"
+        );
+        assert_eq!(
+            classify_message("signing", "Signing configuration error"),
+            "signing"
+        );
         assert_eq!(classify_message("sdk", "SDK not found"), "sdk");
         assert_eq!(classify_message("ohpm", "ohpm install failed"), "ohpm");
-        assert_eq!(classify_message("arkts", "some unknown weird failure"), "other");
+        assert_eq!(
+            classify_message("arkts", "some unknown weird failure"),
+            "other"
+        );
     }
 
     #[test]
@@ -1023,7 +1284,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hvigor-toolkit-{}", std::process::id()));
         let tk = root.join("toolkits").join("command-line-tools");
         std::fs::create_dir_all(tk.join("hvigor").join("bin")).unwrap();
-        std::fs::write(tk.join("hvigor").join("bin").join("hvigorw.js"), "// engine").unwrap();
+        std::fs::write(
+            tk.join("hvigor").join("bin").join("hvigorw.js"),
+            "// engine",
+        )
+        .unwrap();
         let prev = crate::services::harmony_env::get_bundled_cli_dir();
         crate::services::harmony_env::set_bundled_cli_dir(Some(tk.clone()));
         let proj = root.join("proj");
@@ -1043,7 +1308,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hvigor-cli-{}", std::process::id()));
         let cli = root.join("command-line-tools");
         std::fs::create_dir_all(cli.join("hvigor").join("bin")).unwrap();
-        std::fs::write(cli.join("hvigor").join("bin").join("hvigorw.js"), "// engine").unwrap();
+        std::fs::write(
+            cli.join("hvigor").join("bin").join("hvigorw.js"),
+            "// engine",
+        )
+        .unwrap();
         crate::services::harmony_env::set_cached_cli_root_for_test(Some(cli.clone()));
         let proj = root.join("proj");
         std::fs::create_dir_all(&proj).unwrap();

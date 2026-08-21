@@ -1362,6 +1362,14 @@ export function AnalyzePanel({
                           <span className="px-1.5 py-0.5 rounded text-[9px] bg-[var(--bg-hover)] text-[var(--text-muted)]">
                             {t(`home.cat_${e.category}`, { defaultValue: e.category })}
                           </span>
+                          <span className="px-1.5 py-0.5 rounded text-[9px] bg-[var(--bg-hover)] text-[var(--text-muted)] font-mono">
+                            {e.stage || 'build'}
+                          </span>
+                          {e.error_code && (
+                            <span className="px-1.5 py-0.5 rounded text-[9px] bg-[var(--accent-soft)] text-[var(--accent)] font-mono">
+                              {e.error_code}
+                            </span>
+                          )}
                           {e.file && (
                             <span className="font-mono text-[10px] text-[var(--text-secondary)] truncate flex-1 min-w-0" title={e.file}>
                               {e.file}

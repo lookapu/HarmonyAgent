@@ -5,6 +5,9 @@ export interface AnalyzedBuildError {
   kind: string
   /** 根因分类：type / dependency / signing / sdk / api_level / resource / ohpm / syntax / other */
   category: string
+  error_code?: string | null
+  /** environment / dependency / configuration / compile / package / signing / build */
+  stage: string
   file?: string | null
   line?: number | null
   column?: number | null

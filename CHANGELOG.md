@@ -19,6 +19,7 @@
 - Agent 文件变更接入语义模型增量缓存：只重解析所属模块，沿 OHPM 依赖与真实 import 反向计算受影响模块、产品和建议验证；根结构变化或缺少缓存基线时安全回退全量解析。
 - Workspace 工程分析新增可追溯产品矩阵、模块产物/Ability、清单状态与关系证据，并提供只读的文件变更影响预览，逐模块解释直接变化、OHPM 依赖、真实 import 或工程结构传播来源。
 - `build_project` 升级为 environment → dependencies → build → artifacts 可恢复工作流：按统一模型核对并可自动安装 OHPM 依赖，持久记录工程指纹与脱敏 checkpoint，构建成功后必须发现 HAP/HSP/HAR 才完成。
+- Hvigor/ArkTS 错误统一补齐源码位置、数字或命名错误码、构建阶段和根因类别，支持从 task 行继承阶段及读取下一行 `Error Message:`；Agent 错误证据与 Workspace 卡片使用同一结构。
 
 ### 长会话 Context V2（M1 基础）
 

@@ -29,6 +29,18 @@
 
 Checkpoint 写入失败不会遮蔽真实构建结果；构建失败仍由结构化错误与完整日志负责诊断。
 
+## 结构化错误
+
+Hvigor 与 ArkTS 日志统一解析为 `BuildError`：
+
+- `file`、`line`、`column` 保存可定位源码位置，并兼容 Windows 盘符路径；
+- `error_code` 提取方括号或 `Error Code:` 形式的数字/命名错误码，例如 `00303312`、`ArkTSCheckError`；
+- `stage` 归一为 environment、dependency、configuration、compile、package、signing 或 build，并可从前序 Hvigor task 行继承；
+- `category` 是根因类别，覆盖 type、syntax、dependency、ohpm、sdk、api_level、signing、resource 和 other；
+- ArkTS 定位行没有内联消息时，会读取紧随其后的 `Error Message:`，再据此完成根因分类和建议。
+
+`build_project` 的 Agent 错误信封会把 stage 与 error code 写入每条定位证据；Workspace 构建错误卡也展示相同字段，避免两端使用不同解析口径。
+
 ## 验收
 
-自动化测试覆盖参数策略校验、相同指纹失败恢复、源码变化拒绝恢复、外部依赖缺失/安装证据以及 HAP 产物发现。全仓 Rust、崩溃 E2E、前端测试、lint 和生产构建作为阶段门禁。
+自动化测试覆盖参数策略校验、相同指纹失败恢复、源码变化拒绝恢复、外部依赖缺失/安装证据、HAP 产物发现、ArkTS 跨行错误、命名/数字错误码和 Hvigor 阶段继承。全仓 Rust、崩溃 E2E、前端测试、lint 和生产构建作为阶段门禁。

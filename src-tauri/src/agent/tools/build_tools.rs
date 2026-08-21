@@ -385,10 +385,14 @@ pub(super) async fn build_project(
             .iter()
             .take(8)
             .map(|e| {
+                let trace = match &e.error_code {
+                    Some(code) => format!("[stage={} code={code}] ", e.stage),
+                    None => format!("[stage={}] ", e.stage),
+                };
                 let msg = if e.suggestion.trim().is_empty() {
-                    e.message.clone()
+                    format!("{trace}{}", e.message)
                 } else {
-                    format!("{}（建议: {}）", e.message, e.suggestion)
+                    format!("{trace}{}（建议: {}）", e.message, e.suggestion)
                 };
                 ErrorLocation {
                     file: e.file.clone(),
