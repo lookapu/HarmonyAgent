@@ -197,6 +197,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 发布说明需要对比上一标签的完整历史
+          fetch-depth: 0
 
       - name: Download macOS artifacts
         uses: actions/download-artifact@v4
@@ -250,6 +253,14 @@ jobs:
           }
           ENDJSON
 
+      # EC-17：自动汇总迁移、工具协议、风险、兼容性与回滚方式；
+      # 无历史标签时脚本自动降级为首次提交对比
+      - name: Generate release notes
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          python3 scripts/gen-release-notes.py --out artifacts/release-notes.md
+          sed -i "1s/.*/# HarmonyAgent v${VERSION} 发布说明/" artifacts/release-notes.md
+
       # 重打同 tag 时旧 release 会残留（action-gh-release 遇同名 release 直接失败），
       # 先用 GITHUB_TOKEN 幂等删除旧 release，保证 tag 重打可重入
       - name: Delete existing release for this tag
@@ -274,6 +285,8 @@ jobs:
         with:
           draft: false
           prerelease: false
+          # EC-17：发布说明由 gen-release-notes.py 自动汇总
+          body_path: artifacts/release-notes.md
           # download-artifact 保留嵌套目录（bundle/dmg、bundle/msi），用 **/* 递归匹配全部产物
           files: |
             artifacts/**/*.dmg

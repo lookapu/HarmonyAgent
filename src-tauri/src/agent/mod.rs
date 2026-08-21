@@ -18,6 +18,7 @@ pub mod tool_runtime;
 pub mod tool_governance;
 pub mod tool_metrics;
 pub mod tool_ranking;
+pub mod versioning;
 pub mod verification_planner;
 pub mod crash;
 pub mod runtime_log;

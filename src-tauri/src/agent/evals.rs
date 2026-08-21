@@ -246,6 +246,187 @@ pub fn default_execution_snapshot() -> EvalExecutionSnapshot {
     }
 }
 
+/// EC-15：评测基线。CI 把上一次通过的运行指标保存为基线，下一次运行与之比较，
+/// 阻止任务完成率、评测覆盖或关键延迟出现显著回退。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalBaseline {
+    pub schema_version: u32,
+    pub suite: String,
+    pub platform: String,
+    pub producer_version: String,
+    pub tool_registry_digest: String,
+    pub tool_registry_count: usize,
+    pub total_cases: usize,
+    pub score: f64,
+    pub duration_ms: u64,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BaselineViolation {
+    pub metric: String,
+    pub severity: String,
+    pub baseline: f64,
+    pub current: f64,
+    pub allowed: f64,
+    pub message: String,
+}
+
+/// 基线比较容差。默认值来自 EVALUATION_CI_GATES.md：分数允许 5 个百分点波动，
+/// 评测覆盖不允许缩水超过 5%，关键延迟不允许超过基线 1.5 倍。
+#[derive(Clone, Debug)]
+pub struct BaselineTolerance {
+    pub score_drop: f64,
+    pub case_shrink: f64,
+    pub duration_factor: f64,
+}
+
+impl Default for BaselineTolerance {
+    fn default() -> Self {
+        Self {
+            score_drop: 0.05,
+            case_shrink: 0.05,
+            duration_factor: 1.5,
+        }
+    }
+}
+
+pub const BASELINE_SCHEMA_VERSION: u32 = 1;
+
+/// 从一次评测运行提取可跨机器比较的基线。只保留纯内核指标，
+/// 不包含 SDK/设备探测等环境依赖字段，避免 runner 波动污染基线。
+pub fn baseline_from_run(run: &EvalRun) -> EvalBaseline {
+    EvalBaseline {
+        schema_version: BASELINE_SCHEMA_VERSION,
+        suite: run.suite.clone(),
+        platform: run.platform.clone(),
+        producer_version: run.snapshot.producer_version.clone(),
+        tool_registry_digest: run.snapshot.tools.registry_digest.clone(),
+        tool_registry_count: run.snapshot.tools.registry_count,
+        total_cases: run.total_cases,
+        score: run.score,
+        duration_ms: run.snapshot.metrics.duration_ms,
+        created_at: run.created_at,
+    }
+}
+
+/// 比较当前运行与基线，返回违规清单。工具注册表摘要和应用版本变化只告警不失败：
+/// 工具集演进是正常开发行为，不应让 CI 常红；分数、覆盖与延迟回退才阻断。
+/// 基线套件与当前套件不一致时同样只告警，由下一次保存的基线接管。
+pub fn compare_with_baseline(
+    current: &EvalRun,
+    baseline: &EvalBaseline,
+    tolerance: &BaselineTolerance,
+) -> Vec<BaselineViolation> {
+    let mut violations = Vec::new();
+    if current.suite != baseline.suite {
+        violations.push(BaselineViolation {
+            metric: "suite".into(),
+            severity: "warn".into(),
+            baseline: 0.0,
+            current: 0.0,
+            allowed: 0.0,
+            message: format!("评测套件由 {} 变为 {}，旧基线将重建", baseline.suite, current.suite),
+        });
+        return violations;
+    }
+    let allowed_score = (baseline.score - tolerance.score_drop).max(0.0);
+    if current.score < allowed_score {
+        violations.push(BaselineViolation {
+            metric: "score".into(),
+            severity: "fail".into(),
+            baseline: baseline.score,
+            current: current.score,
+            allowed: allowed_score,
+            message: format!(
+                "任务完成率回退：基线 {:.3}，当前 {:.3}，允许下限 {:.3}",
+                baseline.score, current.score, allowed_score
+            ),
+        });
+    }
+    let allowed_cases = baseline.total_cases as f64 * (1.0 - tolerance.case_shrink);
+    if (current.total_cases as f64) < allowed_cases {
+        violations.push(BaselineViolation {
+            metric: "total_cases".into(),
+            severity: "fail".into(),
+            baseline: baseline.total_cases as f64,
+            current: current.total_cases as f64,
+            allowed: allowed_cases,
+            message: format!(
+                "评测覆盖回退：基线 {} 个场景，当前 {} 个，允许下限 {:.1}",
+                baseline.total_cases, current.total_cases, allowed_cases
+            ),
+        });
+    }
+    let duration = current.snapshot.metrics.duration_ms;
+    let allowed_duration = baseline.duration_ms as f64 * tolerance.duration_factor;
+    if baseline.duration_ms >= 50 && duration as f64 > allowed_duration {
+        violations.push(BaselineViolation {
+            metric: "duration_ms".into(),
+            severity: "fail".into(),
+            baseline: baseline.duration_ms as f64,
+            current: duration as f64,
+            allowed: allowed_duration,
+            message: format!(
+                "关键延迟回退：基线 {} ms，当前 {} ms，允许上限 {:.0} ms",
+                baseline.duration_ms, duration, allowed_duration
+            ),
+        });
+    }
+    if current.snapshot.tools.registry_digest != baseline.tool_registry_digest {
+        violations.push(BaselineViolation {
+            metric: "tool_registry_digest".into(),
+            severity: "warn".into(),
+            baseline: 0.0,
+            current: 0.0,
+            allowed: 0.0,
+            message: format!(
+                "工具注册表摘要变化（基线 {} 个工具 → 当前 {} 个），需人工确认预期",
+                baseline.tool_registry_count, current.snapshot.tools.registry_count
+            ),
+        });
+    }
+    if current.snapshot.producer_version != baseline.producer_version {
+        violations.push(BaselineViolation {
+            metric: "producer_version".into(),
+            severity: "warn".into(),
+            baseline: 0.0,
+            current: 0.0,
+            allowed: 0.0,
+            message: format!(
+                "应用版本由 {} 变为 {}，基线继续生效",
+                baseline.producer_version, current.snapshot.producer_version
+            ),
+        });
+    }
+    violations
+}
+
+pub fn has_failing_violations(violations: &[BaselineViolation]) -> bool {
+    violations.iter().any(|violation| violation.severity == "fail")
+}
+
+pub fn baseline_report(violations: &[BaselineViolation]) -> String {
+    if violations.is_empty() {
+        return "基线比较通过：无违规项".into();
+    }
+    violations
+        .iter()
+        .map(|violation| {
+            format!(
+                "[{}] {}（基线={:.2} 当前={:.2} 允许={:.2}）{}",
+                violation.severity.to_uppercase(),
+                violation.metric,
+                violation.baseline,
+                violation.current,
+                violation.allowed,
+                violation.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn scenarios() -> Vec<ReliabilityScenario> {
     let mut scenarios: Vec<ReliabilityScenario> = serde_json::from_str(include_str!(
         "../../tests/fixtures/agent_reliability_scenarios.json"
@@ -903,6 +1084,100 @@ mod tests {
     fn unknown_scenario_fails_closed() {
         assert_eq!(disposition_for_id("new_unhandled_failure"), None);
     }
+
+    /// EC-15 CI 门禁：由 quality.yml 注入 EVAL_BASELINE_IN/EVAL_BASELINE_OUT 激活。
+    /// 本地或未注入时静默跳过，避免无意义地读写文件。
+    #[test]
+    fn ci_baseline_gate() {
+        let baseline_path = std::env::var("EVAL_BASELINE_IN").ok();
+        let out_path = std::env::var("EVAL_BASELINE_OUT").ok();
+        let (Some(baseline_path), Some(out_path)) = (baseline_path, out_path) else {
+            eprintln!("skipped: EVAL_BASELINE_IN/EVAL_BASELINE_OUT 未设置");
+            return;
+        };
+        let run = run_suite(None, DEFAULT_RELIABILITY_THRESHOLD).unwrap();
+        let baseline: Option<EvalBaseline> = std::fs::read_to_string(&baseline_path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        if let Some(baseline) = baseline {
+            let violations = compare_with_baseline(&run, &baseline, &BaselineTolerance::default());
+            let report = baseline_report(&violations);
+            eprintln!("\n=== CI baseline gate ===\n{report}");
+            assert!(
+                !has_failing_violations(&violations),
+                "CI 基线回退：\n{report}"
+            );
+        } else {
+            eprintln!("未找到基线 {baseline_path}，本次运行将保存为基线");
+        }
+        std::fs::write(&out_path, serde_json::to_string_pretty(&baseline_from_run(&run)).unwrap())
+            .expect("write baseline");
+    }
+
+    #[test]
+    fn baseline_comparison_detects_regressions() {
+        let tolerance = BaselineTolerance::default();
+        let make_run = |score: f64, total_cases: usize, duration_ms: u64, digest: &str| {
+            let mut run = run_suite(None, DEFAULT_RELIABILITY_THRESHOLD).unwrap();
+            run.score = score;
+            run.total_cases = total_cases;
+            run.passed_cases = (score * total_cases as f64).round() as usize;
+            run.snapshot.metrics.duration_ms = duration_ms;
+            run.snapshot.tools.registry_digest = digest.into();
+            run
+        };
+        let baseline = baseline_from_run(&make_run(1.0, 26, 200, "sha256:old"));
+
+        // 分数回退超过 5 个百分点 → fail
+        let regressed = make_run(0.90, 26, 200, "sha256:old");
+        let violations = compare_with_baseline(&regressed, &baseline, &tolerance);
+        assert!(has_failing_violations(&violations));
+        assert!(violations.iter().any(|v| v.metric == "score"));
+
+        // 小波动（1 个百分点）不阻断
+        let waved = make_run(0.99, 26, 200, "sha256:old");
+        assert!(!has_failing_violations(&compare_with_baseline(
+            &waved, &baseline, &tolerance
+        )));
+
+        // 评测覆盖缩水 → fail
+        let shrunk = make_run(1.0, 24, 200, "sha256:old");
+        let violations = compare_with_baseline(&shrunk, &baseline, &tolerance);
+        assert!(has_failing_violations(&violations));
+        assert!(violations.iter().any(|v| v.metric == "total_cases"));
+
+        // 关键延迟超过 1.5 倍 → fail
+        let slow = make_run(1.0, 26, 400, "sha256:old");
+        let violations = compare_with_baseline(&slow, &baseline, &tolerance);
+        assert!(has_failing_violations(&violations));
+        assert!(violations.iter().any(|v| v.metric == "duration_ms"));
+
+        // 工具注册表摘要变化只告警不阻断
+        let tools_changed = make_run(1.0, 26, 200, "sha256:new");
+        let violations = compare_with_baseline(&tools_changed, &baseline, &tolerance);
+        assert!(!has_failing_violations(&violations));
+        assert!(violations.iter().any(|v| v.metric == "tool_registry_digest"));
+
+        // 完全一致 → 无违规
+        let same = make_run(1.0, 26, 200, "sha256:old");
+        assert!(compare_with_baseline(&same, &baseline, &tolerance).is_empty());
+
+        // 套件变化 → 只告警并停止比较
+        let mut other_suite = make_run(0.5, 3, 1, "sha256:old");
+        other_suite.suite = "agent_other_v1".into();
+        let violations = compare_with_baseline(&other_suite, &baseline, &tolerance);
+        assert!(!has_failing_violations(&violations));
+        assert!(violations.iter().any(|v| v.metric == "suite"));
+
+        // 基线过短（<50ms）时不比较延迟，避免机器噪声误报
+        let fast_baseline = baseline_from_run(&make_run(1.0, 26, 10, "sha256:old"));
+        let slow_anyway = make_run(1.0, 26, 1000, "sha256:old");
+        assert!(compare_with_baseline(&slow_anyway, &fast_baseline, &tolerance).is_empty());
+
+        assert!(baseline_report(&[]).contains("通过"));
+        assert!(baseline_report(&violations).contains("suite"));
+    }
+
 
     #[test]
     fn environment_snapshot_omits_paths_and_hashes_device_ids() {

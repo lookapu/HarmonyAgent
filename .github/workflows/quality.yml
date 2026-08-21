@@ -39,6 +39,28 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
       - name: Agent reliability gate
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked agent::evals::tests::reliability_gate
+      # EC-15：基线回退门禁。restore 命中 main 分支最近一次保存的基线（缺失时不阻断，
+      # 本次运行会作为新基线保存）；比较失败时测试退出非零并阻断合并；
+      # 只有 main 分支保存新基线，PR 只比较不污染基线。
+      - name: Restore evaluation baseline
+        id: eval-baseline-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: src-tauri/target/eval-baseline.json
+          key: eval-baseline-${{ matrix.os }}-${{ github.sha }}
+          restore-keys: |
+            eval-baseline-${{ matrix.os }}-
+      - name: Fixed evaluation with CI baseline gate
+        env:
+          EVAL_BASELINE_IN: src-tauri/target/eval-baseline.json
+          EVAL_BASELINE_OUT: src-tauri/target/eval-baseline.json
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked agent::evals::tests::ci_baseline_gate -- --exact --nocapture
+      - name: Save evaluation baseline (main only)
+        if: github.ref == 'refs/heads/main' && steps.eval-baseline-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: src-tauri/target/eval-baseline.json
+          key: eval-baseline-${{ matrix.os }}-${{ github.sha }}
       - name: Agent execution kernel V2 gate
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked agent::
       - name: Multi-process worker crash recovery gate

@@ -54,7 +54,7 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 | `commands/` 命令模块（不含 `mod.rs`） | 33 |
 | `services/` 服务模块（不含 `mod.rs`） | 36 |
 | Tauri IPC 注册入口 | 281 |
-| 数据库迁移 | 67 |
+| 数据库迁移 | 75 |
 | React 页面 | 14 |
 
 以上计数会随代码演进变化；工具数以 `TOOL_SPECS`、IPC 入口以 `lib.rs` 的 `generate_handler!`、迁移数以 `src-tauri/migrations/` 为准。
@@ -211,7 +211,7 @@ Worker 每 5 秒写心跳并回收过期 Owner。认领任务会生成 lease tok
 
 `governance.rs` 根据目标复杂度生成动态工具轮次、最长时长、补救次数、租约和模型回退策略，并在终态生成质量分。
 
-`enterprise.rs` 提供本地 tenant 的 SLO、告警、审计和配额累计；`evals.rs` 运行 16 个执行内核可靠性场景和 10 个鸿蒙固定任务场景，并把逐场景 expected/actual 写入评测历史。成本页通过 `commands/reliability.rs` 展示：
+`enterprise.rs` 提供本地 tenant 的 SLO、告警、审计和配额累计；`evals.rs` 运行 16 个执行内核可靠性场景和 10 个鸿蒙固定任务场景，并把逐场景 expected/actual 与 schema v1 执行快照（模型/工具/SDK/设备/Token/成本/证据摘要）写入评测历史；`versioning.rs` 汇总数据库、工具协议、Skill/工作流规范、知识索引与评测 schema 的当前版本和兼容承诺。成本页通过 `commands/reliability.rs` 展示：
 
 - Run 状态和验收率；
 - 调度队列、恢复任务和 DAG 节点；
@@ -244,7 +244,7 @@ Provider 和 model 保存于 SQLite，API key 通过系统钥匙串管理。会�
 
 ## 12. 数据与存储
 
-SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 74 个迁移覆盖：
+SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 75 个迁移覆盖：
 
 - Provider、模型、代理、成本和请求日志；
 - 项目、会话、消息、引用、标签、反馈和版本；
@@ -253,6 +253,7 @@ SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 74 �
 - Durable Run、execution step、恢复计划；
 - 调度队列、DAG、Worker、尝试账本；
 - SLO、告警、审计、配额和工具执行 Worker。
+- 固定评测结果、版本化执行快照、环境/资源元数据和最终证据摘要。
 - 长会话 Context V2 状态、来源化事实、产物引用和摘要检查点。
 - 待审批、计划审查和 Agent 提问的持久生命周期及失联恢复依据。
 - 模型摘要与结构化事实的压缩后对账、冲突码和纠偏审计。
@@ -289,6 +290,7 @@ Tauri setup 依次完成：
 - `npm test`、ESLint、前端生产构建；
 - `cargo test --locked` 与 Clippy；
 - Agent reliability gate；
+- 固定评测 CI 基线门禁（`ci_baseline_gate`）：保存/恢复可跨机器比较的基线，阻止任务完成率、评测覆盖或关键延迟显著回退，主分支保存基线、PR 只比较；
 - Execution Kernel 模块测试；
 - 多进程 Worker 崩溃恢复 E2E；
 - 工具 Worker 崩溃与副作用恢复 E2E。
@@ -301,7 +303,7 @@ Tauri setup 依次完成：
 
 1. `commands/chat.rs` 同时承担协议、上下文、工具循环、恢复和持久化，文件过大，后续应按不破坏状态机边界的方式拆分；
 2. `pages/Home.tsx` 仍然庞大，虽已拆出多组 chat components，但布局和交互状态仍高度集中；
-3. `agent/tools/mod.rs` 同时承担 198 个 schema 与总分发，新增工具时必须同步验证注册、权限、分组和结构化结果；
+3. `agent/tools/mod.rs` 同时承担 201 个 schema 与总分发，新增工具时必须同步验证注册、权限、分组和结构化结果；
 4. README/CHANGELOG 中的能力批次版本与应用 manifest `2.0.0` 不是同一口径，发布前应统一正式版本策略；
 5. 内置 runtime/resources 不随 Git 分发，干净克隆只能运行不依赖这些资源的测试和精简构建。
 
