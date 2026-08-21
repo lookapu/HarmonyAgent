@@ -71,6 +71,8 @@ pub struct ToolResultV2 {
     pub tool: String,
     pub status: String,
     pub summary: String,
+    /// 对用户说明本次结果对真实状态的影响；旧 V2 记录缺失时由 serde default 兼容。
+    pub impact: String,
     pub modifications: Vec<ModificationEvidence>,
     pub recovery: RecoveryEvidence,
     pub suggestions: Vec<String>,
@@ -148,13 +150,17 @@ impl ToolResultV2 {
         } else {
             Vec::new()
         };
-        let suggestions = result_suggestions(tool, status, output, error.as_ref(), compensation.as_ref());
+        let mut suggestions = result_suggestions(tool, status, output, error.as_ref(), compensation.as_ref());
         let recovery = RecoveryEvidence {
             policy: contract.recovery.as_str().into(),
             retry_safe: contract.retry_safe,
             compensation: compensation.clone(),
             instruction: recovery_instruction(contract.recovery.as_str(), error.as_ref(), compensation.as_ref()),
         };
+        if !succeeded && !suggestions.contains(&recovery.instruction) {
+            suggestions.push(recovery.instruction.clone());
+        }
+        suggestions.truncate(8);
         let metrics = ToolMetrics {
             duration_ms: duration_ms.max(0),
             output_chars: output.chars().count(),
@@ -166,6 +172,7 @@ impl ToolResultV2 {
             tool: tool.into(),
             status: normalized.into(),
             summary: first_line(output),
+            impact: result_impact(status, contract.effect.as_str(), &modifications),
             modifications,
             recovery,
             suggestions,
@@ -192,6 +199,24 @@ impl ToolResultV2 {
         let mut digest = Sha256::new();
         digest.update(bytes);
         format!("{:x}", digest.finalize())
+    }
+}
+
+fn result_impact(status: &str, effect_kind: &str, modifications: &[ModificationEvidence]) -> String {
+    if matches!(status, "partial" | "partial_success") {
+        return format!("已完成 {} 项修改，其余步骤未确认完成", modifications.len());
+    }
+    if status == "ok" {
+        return if effect_kind == "read" {
+            "只读取真实状态，未产生外部修改".into()
+        } else {
+            format!("已提交 {} 项可追踪修改或副作用", modifications.len().max(1))
+        };
+    }
+    if effect_kind == "read" {
+        "读取未完成，未提交外部状态变更".into()
+    } else {
+        "副作用结果未完全确认；重试前必须按恢复指引核验真实状态".into()
     }
 }
 
@@ -629,11 +654,40 @@ mod tests {
                 spec.name, "{}", "ok", "ok",
             )).unwrap();
             for field in [
-                "status", "modifications", "artifacts", "verification", "recovery",
+                "status", "impact", "modifications", "artifacts", "verification", "recovery",
                 "suggestions", "error",
             ] {
                 assert!(value.get(field).is_some(), "{} 缺少 {field}", spec.name);
             }
+        }
+    }
+
+    #[test]
+    fn high_frequency_tools_cover_success_failure_timeout_cancel_retry_and_recovery_protocols() {
+        let tools = [
+            "read_file", "list_dir", "grep_files", "codebase_search", "edit_file", "write_file",
+            "run_command", "build_project", "run_tests", "git_status", "git_diff", "list_devices",
+        ];
+        for tool in tools {
+            let success = ToolResultV2::from_execution(tool, "{}", "ok", "ok");
+            assert_eq!(success.status, "succeeded", "{tool}");
+            assert!(!success.impact.is_empty(), "{tool}");
+
+            let failure = ToolResultV2::from_execution(tool, "{}", "permanent failure", "error");
+            assert!(failure.error.is_some(), "{tool}");
+            assert!(!failure.recovery.instruction.is_empty(), "{tool}");
+            assert!(!failure.suggestions.is_empty(), "{tool}");
+
+            let timeout = ToolResultV2::from_execution(tool, "{}", "tool timeout", "error");
+            assert_eq!(timeout.error.as_ref().unwrap().code, "TOOL_TIMEOUT", "{tool}");
+            assert_eq!(timeout.error.as_ref().unwrap().retryable, timeout.retry_safe, "{tool}");
+
+            let cancelled = ToolResultV2::from_execution(
+                tool, "{}", "用户已停止当前工具", "cancelled",
+            );
+            assert_eq!(cancelled.status, "cancelled", "{tool}");
+            assert_eq!(cancelled.error.as_ref().unwrap().code, "TOOL_CANCELLED", "{tool}");
+            assert!(!cancelled.recovery.instruction.is_empty(), "{tool}");
         }
     }
 }

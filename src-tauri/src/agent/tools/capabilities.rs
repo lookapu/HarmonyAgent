@@ -248,4 +248,49 @@ mod tests {
         assert!(tools.contains(&"git_commit"));
         assert!(!tools.contains(&"git_push"));
     }
+
+    #[test]
+    fn bounded_phase_selection_keeps_representative_tasks_acceptable() {
+        let cases: &[(&str, &[(&str, &str, &str)])] = &[
+            (
+                "修复代码，运行测试并构建",
+                &[
+                    ("edit_file", r#"{"path":"src/a.rs"}"#, "ok"),
+                    ("run_tests", "{}", "tests passed"),
+                    ("build_project", "{}", "build passed"),
+                ],
+            ),
+            (
+                "部署应用到设备",
+                &[
+                    ("deploy", "{}", "installed"),
+                    ("take_screenshot", "{}", "device UI captured"),
+                ],
+            ),
+            (
+                "提交并推送 git 交付",
+                &[
+                    ("git_commit", "{}", "committed"),
+                    ("git_status", "{}", "clean"),
+                    ("git_push", "{}", "pushed"),
+                    ("git_status", "{}", "up to date"),
+                ],
+            ),
+        ];
+        for (goal, evidence_rows) in cases {
+            let exposed = [TaskPhase::Explore, TaskPhase::Modify, TaskPhase::Verify, TaskPhase::Deliver]
+                .into_iter()
+                .flat_map(|phase| selected_tool_names_for_phase(goal, phase, 32))
+                .collect::<std::collections::HashSet<_>>();
+            assert!(exposed.len() < crate::agent::tools::TOOL_SPECS.len());
+            assert!(evidence_rows.iter().all(|(tool, _, _)| exposed.contains(tool)), "{goal}");
+            let evidence = evidence_rows.iter().map(|(tool, args, output)| {
+                crate::agent::acceptance::ToolEvidence {
+                    tool, args, output, succeeded: true,
+                }
+            }).collect::<Vec<_>>();
+            let report = crate::agent::acceptance::evaluate(goal, &evidence);
+            assert!(report.passed, "{goal}: {:?}", report.blockers);
+        }
+    }
 }
