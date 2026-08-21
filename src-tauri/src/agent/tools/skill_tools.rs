@@ -50,11 +50,16 @@ pub async fn use_skill(
         ));
     }
     if skill.content_hash.as_deref().is_some_and(|hash| hash != manifest.content_hash) {
+        crate::services::extension_governance::mark_drifted(
+            &conn, "skill", &skill.id, &manifest.content_hash,
+        );
         return Err(format!(
             "Skill「{}」的 SKILL.md 在导入后发生变化，内容哈希不匹配；请审核来源并重新导入",
             skill.name
         ));
     }
+
+    crate::services::extension_governance::before_call(&conn, "skill", &skill.id)?;
 
     // 只有通过版本/哈希复验后才记录调用。
     let _ = crate::db::queries::record_skill_usage(
@@ -87,5 +92,8 @@ pub async fn use_skill(
     );
     let content: String = content.chars().take(6000).collect();
     out.push_str(&format!("\n\n=== 技能指令（SKILL.md） ===\n{content}"));
+    crate::services::extension_governance::record_result(
+        &conn, "skill", &skill.id, &Ok(out.clone()),
+    );
     Ok(out)
 }

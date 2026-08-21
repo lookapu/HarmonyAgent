@@ -1137,7 +1137,14 @@ pub async fn run_tool(
             &tool,
             &args,
         )?;
+        {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            crate::services::extension_governance::before_call(&conn, "mcp", &id)?;
+        }
         let mcp_result = mcp.call_by_id(&id, &tool, args.clone()).await;
+        if let Ok(conn) = db.0.lock() {
+            crate::services::extension_governance::record_result(&conn, "mcp", &id, &mcp_result);
+        }
         // 统一出口脱敏（[57]）：MCP 返回同样过文本级遮罩
         return mcp_result
             .map(|ok| crate::utils::redact::redact_text(&ok))
@@ -1320,7 +1327,9 @@ pub async fn run_tool(
         "agent_publish" => crate::agent::agent_board::agent_publish(&args, ctx).await,
         "agent_subscribe" => crate::agent::agent_board::agent_subscribe(&args, ctx).await,
         "job_template" => job_template(&args, &roots).await,
-        "workflow_template" => crate::services::workflow_templates::handle(&args, &roots),
+        "workflow_template" => crate::services::workflow_templates::handle(
+            &args, &roots, db, project_id, &ctx.run_id, &ctx.conversation_id,
+        ),
         "lsp_definition" => crate::agent::lsp_client::lsp_definition(&args, &roots, &ctx.conversation_id).await,
         "lsp_references" => crate::agent::lsp_client::lsp_references(&args, &roots, &ctx.conversation_id).await,
         "lsp_symbols" => crate::agent::lsp_client::lsp_symbols(&args, &roots, &ctx.conversation_id).await,

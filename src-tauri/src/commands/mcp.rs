@@ -45,6 +45,19 @@ pub struct McpAuthorizationInput {
     pub network_policy: String,
     #[serde(default)]
     pub credential_keys: Vec<String>,
+    /// Optional detached Ed25519 attestation over the normalized launch config.
+    #[serde(default)]
+    pub attestation: Option<crate::services::extension_governance::ExtensionAttestation>,
+}
+
+fn governance_payload(server: &McpServer) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&serde_json::json!({
+        "name": server.name,
+        "server_type": server.server_type,
+        "command": serde_json::from_str::<serde_json::Value>(&server.command).unwrap_or_else(|_| serde_json::Value::String(server.command.clone())),
+        "args": serde_json::from_str::<serde_json::Value>(&server.args).unwrap_or_else(|_| serde_json::Value::String(server.args.clone())),
+        "homepage": server.homepage,
+    })).map_err(|error| error.to_string())
 }
 
 /// 从 HTTP(S) URL 获取 MCP 配置 JSON 并解析为服务器列表。
@@ -127,6 +140,13 @@ pub fn update_mcp_server(
     )
     .map_err(|e| e.to_string())?;
     let server = queries::get_mcp_server(&conn, &id).map_err(|e| e.to_string())?;
+    let attestation = crate::services::extension_governance::ExtensionAttestation {
+        source_uri: server.homepage.clone(), ..Default::default()
+    };
+    crate::services::extension_governance::register(
+        &conn, "mcp", &server.id, server.project_id.as_deref(),
+        &governance_payload(&server)?, Some(&attestation),
+    )?;
     drop(conn);
     manager.disconnect(&[id]);
     Ok(server)
@@ -464,6 +484,13 @@ pub fn add_mcp_server(db: State<DbState>, input: CreateMcpInput) -> Result<McpSe
     };
 
     queries::insert_mcp_server(&conn, &server).map_err(|e| e.to_string())?;
+    let attestation = crate::services::extension_governance::ExtensionAttestation {
+        source_uri: server.homepage.clone(), ..Default::default()
+    };
+    crate::services::extension_governance::register(
+        &conn, "mcp", &server.id, server.project_id.as_deref(),
+        &governance_payload(&server)?, Some(&attestation),
+    )?;
     Ok(server)
 }
 
@@ -476,6 +503,10 @@ pub fn toggle_mcp_server(
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::toggle_mcp_server(&conn, &id, enabled).map_err(|e| e.to_string())?;
+    let _ = crate::agent::enterprise::audit(
+        &conn, None, None, "user", "extension.toggle", &format!("mcp:{id}"),
+        if enabled { "enabled" } else { "disabled" }, &serde_json::json!({}),
+    );
     drop(conn);
     if !enabled {
         manager.disconnect(&[id]);
@@ -497,9 +528,16 @@ pub fn authorize_mcp_server(
         &input.credential_keys,
     )?;
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let existing = queries::get_mcp_server(&tx, &id).map_err(|e| e.to_string())?;
+    let existing = queries::get_mcp_server(&conn, &id).map_err(|e| e.to_string())?;
     crate::services::mcp_policy::validate_server_command(&existing)?;
+    if existing.project_id.as_deref() != Some(input.project_id.as_str()) {
+        return Err("只能授权已绑定到当前项目的 MCP；请先克隆全局配置到项目".into());
+    }
+    crate::services::extension_governance::register(
+        &conn, "mcp", &id, Some(&input.project_id), &governance_payload(&existing)?,
+        input.attestation.as_ref(),
+    )?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
     let changed = queries::authorize_mcp_server(
         &tx,
         &id,
@@ -544,6 +582,14 @@ pub fn remove_mcp_server(
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::delete_mcp_server(&conn, &id).map_err(|e| e.to_string())?;
+    let _ = crate::agent::enterprise::audit(
+        &conn, None, None, "user", "extension.remove", &format!("mcp:{id}"),
+        "success", &serde_json::json!({}),
+    );
+    let _ = conn.execute(
+        "DELETE FROM extension_governance WHERE extension_kind='mcp' AND extension_id=?1",
+        [&id],
+    );
     // 断开已缓存连接：删除后立即终止子进程，不残留到应用退出
     manager.disconnect(&[id]);
     Ok(())
@@ -578,6 +624,13 @@ pub fn clone_mcp_server(
     src.network_policy = "deny".into();
     src.credential_keys = "[]".into();
     queries::insert_mcp_server(&conn, &src).map_err(|e| e.to_string())?;
+    let attestation = crate::services::extension_governance::ExtensionAttestation {
+        source_uri: src.homepage.clone(), ..Default::default()
+    };
+    crate::services::extension_governance::register(
+        &conn, "mcp", &src.id, src.project_id.as_deref(), &governance_payload(&src)?,
+        Some(&attestation),
+    )?;
     Ok(src)
 }
 
@@ -645,6 +698,10 @@ pub fn import_mcp_config(
         if let Some(s) = same_name {
             if overwrite {
                 queries::delete_mcp_server(&conn, &s.id).map_err(|e| e.to_string())?;
+                let _ = conn.execute(
+                    "DELETE FROM extension_governance WHERE extension_kind='mcp' AND extension_id=?1",
+                    [&s.id],
+                );
             } else {
                 continue;
             }
@@ -672,6 +729,13 @@ pub fn import_mcp_config(
             credential_keys: "[]".into(),
         };
         queries::insert_mcp_server(&conn, &server).map_err(|e| e.to_string())?;
+        let attestation = crate::services::extension_governance::ExtensionAttestation {
+            source_uri: server.homepage.clone(), ..Default::default()
+        };
+        crate::services::extension_governance::register(
+            &conn, "mcp", &server.id, server.project_id.as_deref(),
+            &governance_payload(&server)?, Some(&attestation),
+        )?;
         imported += 1;
     }
     Ok(imported)

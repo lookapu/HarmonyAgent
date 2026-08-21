@@ -1,5 +1,7 @@
 # HarmonyAgent Skill 与能力包规范 v1
 
+第三方 Skill 的来源、分离签名、调用配额、熔断和审计另见 [第三方扩展供应链与运行治理](EXTENSION_GOVERNANCE.md)。
+
 本规范定义 EC07 的稳定边界：Skill 是可安装的指令包，能力包是应用内置的最小工具选择策略。两者都必须独立版本化、声明兼容范围与权限上限，但声明本身不能扩大 HarmonyAgent 的实际授权。
 
 ## Skill manifest v1

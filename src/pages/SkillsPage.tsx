@@ -15,6 +15,7 @@ import {
 import { skillTemplates, type SkillTemplate } from '../data/skillTemplates'
 import { useProjectStore } from '../stores/projectStore'
 import Icon from '../icons/Icon'
+import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
 
 /** 从 Git 仓库地址（GitHub/Gitee 的 URL / git@ / owner/name）提取 owner 和 name */
 function parseGithubUrl(input: string): { owner: string; name: string } | null {
@@ -47,6 +48,7 @@ export default function SkillsPage() {
   /** 视图切换：技能列表 / 使用统计 */
   const [view, setView] = useState<'skills' | 'usage'>('skills')
   const [skills, setSkills] = useState<Skill[]>([])
+  const [governance, setGovernance] = useState<Record<string, ExtensionGovernanceRecord>>({})
   // skill_id -> 调用统计（use_skill 工具落库）
   const [usageMap, setUsageMap] = useState<Record<string, SkillUsageStat>>({})
   /** 使用统计（按技能聚合 + 最近调用时间线） */
@@ -66,9 +68,10 @@ export default function SkillsPage() {
   const load = useCallback(async () => {
     try {
       // 技能列表与调用统计并行加载，避免串行阻塞
-      const [list, usage] = await Promise.all([listSkills(projectId), listSkillUsage(projectId)])
+      const [list, usage, governed] = await Promise.all([listSkills(projectId), listSkillUsage(projectId), listExtensionGovernance()])
       setSkills(list)
       setUsageMap(Object.fromEntries(usage.map((u) => [u.skill_id, u])))
+      setGovernance(Object.fromEntries(governed.filter((item) => item.extension_kind === 'skill').map((item) => [item.extension_id, item])))
     } catch (e) {
       console.error(e)
     }
@@ -386,6 +389,12 @@ export default function SkillsPage() {
                   {s.repo_owner}/{s.repo_name} ({s.repo_branch})
                 </p>
               )}
+              {governance[s.id] && (
+                <p className={`text-[10px] mt-1 ${governance[s.id].verification_state === 'verified' ? 'text-[var(--success)]' : governance[s.id].verification_state === 'drifted' || governance[s.id].verification_state === 'invalid' ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]'}`}>
+                  扩展治理：{governance[s.id].verification_state === 'verified' ? 'Ed25519 签名有效（发布者身份未钉住）' : governance[s.id].verification_state === 'unsigned' ? '未签名' : '已隔离'}
+                  {' · '}{governance[s.id].calls_per_minute}/分钟 · 连续失败 {governance[s.id].consecutive_failures}/{governance[s.id].failure_threshold}
+                </p>
+              )}
               {usageMap[s.id] && usageMap[s.id].call_count > 0 && (
                 <p className="text-xs mt-1 text-[var(--accent)]">
                   {t('skill.calledTimes', { n: usageMap[s.id].call_count })} · {t('skill.lastCalled')}:{' '}
@@ -591,7 +600,6 @@ function SkillUsageView({
     </div>
   )
 }
-
 
 
 

@@ -8,6 +8,7 @@ pub mod desktop;
 pub mod devices;
 pub mod environment;
 pub mod git;
+pub mod governance;
 pub mod health;
 pub mod harmony_analyze;
 pub mod index;

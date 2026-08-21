@@ -149,6 +149,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (69, "069_tool_quality_governance", include_str!("../../migrations/069_tool_quality_governance.sql")),
     (70, "070_skill_manifest_v1", include_str!("../../migrations/070_skill_manifest_v1.sql")),
     (71, "071_mcp_project_authorization", include_str!("../../migrations/071_mcp_project_authorization.sql")),
+    (72, "072_extension_governance", include_str!("../../migrations/072_extension_governance.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -295,6 +296,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(control_tables, 13);
+        let extension_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='extension_governance'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(extension_tables, 1);
         let queue_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(agent_task_queue)")
             .unwrap()

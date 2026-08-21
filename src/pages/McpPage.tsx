@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { listMcpServers, addMcpServer, updateMcpServer, testMcpServer, toggleMcpServer, authorizeMcpServer, removeMcpServer, cloneMcpServer, exportMcpConfig, importMcpConfig, fetchMcpFromUrl, listMcpUsageStats, type McpServer, type CreateMcpInput, type McpDraft, type McpUsageStat } from '../api/mcp'
 import { mcpTemplates, matchMcpTemplate, templateEnvDefaults, type McpTemplate } from '../data/mcpTemplates'
 import { useProjectStore } from '../stores/projectStore'
+import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
 
 /**
  * 解析环境变量文本为对象（每行一个 KEY=value，兼容旧的逗号分隔）。
@@ -65,6 +66,7 @@ export default function McpPage() {
   // 未打开具体项目时，强制只显示全局
   const effectiveScope: 'global' | 'project' = projectId ? scope : 'global'
   const [servers, setServers] = useState<McpServer[]>([])
+  const [governance, setGovernance] = useState<Record<string, ExtensionGovernanceRecord>>({})
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({ name: '', command: '', description: '', env: '' })
   const [addedKeys, setAddedKeys] = useState<Set<string>>(new Set())
@@ -87,8 +89,9 @@ export default function McpPage() {
   const load = useCallback(async () => {
     try {
       // 加载全局 + 当前项目，前端按作用域 tab 过滤展示
-      const list = await listMcpServers(projectId)
+      const [list, governed] = await Promise.all([listMcpServers(projectId), listExtensionGovernance()])
       setServers(list)
+      setGovernance(Object.fromEntries(governed.filter((item) => item.extension_kind === 'mcp').map((item) => [item.extension_id, item])))
     } catch (e) {
       console.error(e)
     }
@@ -674,6 +677,12 @@ export default function McpPage() {
                 </p>
               )}
               <p className="text-[10px] text-[var(--text-muted)] mt-0.5">{t('mcp.createdAt', { time: formatTime(s.created_at) })}</p>
+              {governance[s.id] && (
+                <p className={`text-[10px] mt-1 ${governance[s.id].verification_state === 'verified' ? 'text-[var(--success)]' : governance[s.id].verification_state === 'drifted' || governance[s.id].verification_state === 'invalid' ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]'}`}>
+                  扩展治理：{governance[s.id].verification_state === 'verified' ? 'Ed25519 签名有效（发布者身份未钉住）' : governance[s.id].verification_state === 'unsigned' ? '未签名' : '已隔离'}
+                  {' · '}{governance[s.id].calls_per_minute}/分钟 · 连续失败 {governance[s.id].consecutive_failures}/{governance[s.id].failure_threshold}
+                </p>
+              )}
               {usageMap.get(s.name.toLowerCase()) && (
                 <UsageSummaryLine stat={usageMap.get(s.name.toLowerCase())!} />
               )}
@@ -912,5 +921,4 @@ function McpUsageView({
     </div>
   )
 }
-
 

@@ -527,6 +527,8 @@ pub fn run() {
             commands::reliability::cancel_agent_dag_descendants,
             commands::reliability::get_agent_slo_policy,
             commands::reliability::update_agent_slo_policy,
+            commands::governance::list_extension_governance,
+            commands::governance::configure_extension_governance,
             commands::devices::list_devices,
             commands::devices::set_default_device,
             commands::devices::get_device_detail,

@@ -191,6 +191,16 @@ pub async fn import_skill_from_github(
     } else {
         branch.to_string()
     };
+    let revision = {
+        let args = vec![
+            "-C".to_string(), dest.to_string_lossy().to_string(),
+            "rev-parse".to_string(), "HEAD".to_string(),
+        ];
+        tokio::task::spawn_blocking(move || crate::utils::process::output_blocking("git", &args))
+            .await.map_err(|error| format!("git revision 任务失败: {error}"))?
+            .map_err(|error| format!("读取 Skill revision 失败: {error}"))
+            .and_then(|output| output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()).ok_or("读取 Skill revision 失败".into()))?
+    };
 
     // 技能实际所在目录：仓库根或仓库内子目录（如 skills/docx）
     let subdir = input.subdir.unwrap_or_default().trim().trim_matches('/').to_string();
@@ -233,6 +243,17 @@ pub async fn import_skill_from_github(
         .map_err(|e| format!("读取 SKILL.md 失败 {}：{e}", skill_md_path.display()))?;
     let (meta_name, meta_desc) = parse_skill_meta(&skill_content);
     let manifest = crate::services::skill_manifest::parse_and_validate(&skill_content)?;
+    let signature_path = skill_root.join("SKILL.md.sig.json");
+    let mut attestation: crate::services::extension_governance::ExtensionAttestation =
+        if signature_path.is_file() {
+            serde_json::from_str(&std::fs::read_to_string(&signature_path)
+                .map_err(|error| format!("读取 Skill 签名失败：{error}"))?)
+                .map_err(|error| format!("Skill 签名文件格式错误：{error}"))?
+        } else {
+            Default::default()
+        };
+    attestation.source_uri.get_or_insert_with(|| url.clone());
+    attestation.source_revision.get_or_insert_with(|| revision.clone());
 
     let skill_name = meta_name.unwrap_or_else(|| name.clone());
     let description = meta_desc.or_else(|| Some(format!("{host}/{owner}/{name} 仓库中安装的 Skill")));
@@ -292,6 +313,11 @@ pub async fn import_skill_from_github(
     )
     .map_err(|e| e.to_string())?;
 
+    crate::services::extension_governance::register(
+        &conn, "skill", &skill.id, skill.project_id.as_deref(), skill_content.as_bytes(),
+        Some(&attestation),
+    )?;
+
     Ok(skill)
 }
 
@@ -302,6 +328,14 @@ pub fn remove_skill(app: AppHandle, db: State<DbState>, id: String) -> Result<()
     let skill = queries::get_skill(&conn, &id).map_err(|e| e.to_string())?;
     let directory = skill.directory.clone();
     queries::delete_skill(&conn, &id).map_err(|e| e.to_string())?;
+    let _ = crate::agent::enterprise::audit(
+        &conn, None, None, "user", "extension.remove", &format!("skill:{id}"),
+        "success", &serde_json::json!({"name":skill.name}),
+    );
+    let _ = conn.execute(
+        "DELETE FROM extension_governance WHERE extension_kind='skill' AND extension_id=?1",
+        [&id],
+    );
 
     // 目录清理：仅当没有其他 Skill 引用同一目录时才删除，避免误删共享仓库
     if let Some(dir) = directory {
@@ -362,6 +396,10 @@ pub fn toggle_skill(db: State<DbState>, id: String, enabled: bool) -> Result<(),
         rusqlite::params![id, enabled],
     )
     .map_err(|e| e.to_string())?;
+    let _ = crate::agent::enterprise::audit(
+        &conn, None, None, "user", "extension.toggle", &format!("skill:{id}"),
+        if enabled { "enabled" } else { "disabled" }, &serde_json::json!({}),
+    );
     Ok(())
 }
 
@@ -398,6 +436,26 @@ pub fn clone_skill(
     src.installed_at = chrono::Utc::now().timestamp();
     src.updated_at = None;
     queries::insert_skill(&conn, &src).map_err(|e| e.to_string())?;
+    if let Some(directory) = src.directory.as_deref() {
+        let root = std::path::Path::new(directory);
+        let content = ["SKILL.md", "skill.md"].iter()
+            .map(|name| root.join(name))
+            .find_map(|path| std::fs::read_to_string(path).ok());
+        if let Some(content) = content {
+            let attestation = crate::services::extension_governance::ExtensionAttestation {
+                source_uri: match (&src.repo_host, &src.repo_owner, &src.repo_name) {
+                    (Some(host), Some(owner), Some(name)) => Some(format!("https://{host}.com/{owner}/{name}")),
+                    _ => None,
+                },
+                source_revision: Some(src.repo_branch.clone()),
+                ..Default::default()
+            };
+            crate::services::extension_governance::register(
+                &conn, "skill", &src.id, src.project_id.as_deref(), content.as_bytes(),
+                Some(&attestation),
+            )?;
+        }
+    }
     Ok(src)
 }
 

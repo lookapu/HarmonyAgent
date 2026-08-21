@@ -50,6 +50,14 @@ export interface McpAuthorizationInput {
   allowed_roots: string[]
   network_policy: 'deny' | 'allow'
   credential_keys: string[]
+  attestation?: {
+    source_uri?: string
+    source_revision?: string
+    algorithm?: 'ed25519'
+    signer_key_id?: string
+    public_key_base64?: string
+    signature_base64?: string
+  }
 }
 
 /** 从 URL 获取到的 MCP 服务器草稿 */

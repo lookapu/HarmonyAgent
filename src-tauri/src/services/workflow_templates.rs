@@ -35,7 +35,14 @@ fn enabled_default() -> bool {
     true
 }
 
-pub fn handle(args: &Value, roots: &[String]) -> Result<String, String> {
+pub fn handle(
+    args: &Value,
+    roots: &[String],
+    db: &crate::db::DbState,
+    project_id: &str,
+    run_id: &str,
+    conversation_id: &str,
+) -> Result<String, String> {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
     let root = roots
         .first()
@@ -59,27 +66,49 @@ pub fn handle(args: &Value, roots: &[String]) -> Result<String, String> {
                     template.id
                 ));
             }
+            let payload = serde_json::to_vec(&template).map_err(|error| error.to_string())?;
+            let attestation = attestation_arg(args)?;
+            {
+                let conn = db.0.lock().map_err(|error| error.to_string())?;
+                crate::services::extension_governance::register(
+                    &conn, "workflow", &template.id, nonempty(project_id), &payload,
+                    attestation.as_ref(),
+                )?;
+                audit(&conn, run_id, conversation_id, "workflow.import", &template.id, "accepted");
+            }
             write_template(&path, &template)?;
             Ok(render(&template, "已导入"))
         }
         "enable" | "disable" => {
             let id = id_arg(args)?;
+            {
+                let conn = db.0.lock().map_err(|error| error.to_string())?;
+                crate::services::extension_governance::before_call(&conn, "workflow", id)?;
+            }
             let path = template_path(&store, id)?;
             let mut template = read_template(&path)?;
             template.enabled = action == "enable";
-            write_template(&path, &template)?;
-            Ok(render(
+            let result = write_template(&path, &template).map(|_| render(
                 &template,
                 if template.enabled {
                     "已启用"
                 } else {
                     "已禁用"
                 },
-            ))
+            ));
+            if let Ok(conn) = db.0.lock() {
+                crate::services::extension_governance::record_result(&conn, "workflow", id, &result);
+                audit(&conn, run_id, conversation_id, &format!("workflow.{action}"), id, if result.is_ok() { "success" } else { "failure" });
+            }
+            result
         }
         "upgrade" => {
             let template = template_arg(args)?;
             validate(&template)?;
+            {
+                let conn = db.0.lock().map_err(|error| error.to_string())?;
+                crate::services::extension_governance::before_call(&conn, "workflow", &template.id)?;
+            }
             let path = template_path(&store, &template.id)?;
             let previous = read_template(&path)?;
             if crate::services::skill_manifest::compare_versions(
@@ -109,8 +138,19 @@ pub fn handle(args: &Value, roots: &[String]) -> Result<String, String> {
                     added.join(", ")
                 ));
             }
+            let payload = serde_json::to_vec(&template).map_err(|error| error.to_string())?;
+            let attestation = attestation_arg(args)?;
+            crate::services::extension_governance::verify(&payload, attestation.as_ref())?;
             archive(&store, &previous)?;
             write_template(&path, &template)?;
+            {
+                let conn = db.0.lock().map_err(|error| error.to_string())?;
+                crate::services::extension_governance::register(
+                    &conn, "workflow", &template.id, nonempty(project_id), &payload,
+                    attestation.as_ref(),
+                )?;
+                audit(&conn, run_id, conversation_id, "workflow.upgrade", &template.id, "success");
+            }
             Ok(format!(
                 "{}\n上一版本 {} 已归档，可人工回滚。",
                 render(&template, "已升级"),
@@ -121,6 +161,22 @@ pub fn handle(args: &Value, roots: &[String]) -> Result<String, String> {
             "未知 action={other}；支持 list|validate|import|enable|disable|upgrade"
         )),
     }
+}
+
+fn attestation_arg(args: &Value) -> Result<Option<crate::services::extension_governance::ExtensionAttestation>, String> {
+    args.get("attestation").map(|value| serde_json::from_value(value.clone())
+        .map_err(|error| format!("扩展签名格式错误：{error}"))).transpose()
+}
+
+fn nonempty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn audit(conn: &rusqlite::Connection, run_id: &str, conversation_id: &str, action: &str, id: &str, outcome: &str) {
+    let _ = crate::agent::enterprise::audit(
+        conn, nonempty(run_id), nonempty(conversation_id), "agent", action,
+        &format!("workflow:{id}"), outcome, &serde_json::json!({}),
+    );
 }
 
 fn template_arg(args: &Value) -> Result<WorkflowTemplate, String> {
@@ -342,6 +398,14 @@ fn render(template: &WorkflowTemplate, state: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn database() -> crate::db::DbState {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE skills(id TEXT,project_id TEXT,repo_host TEXT,repo_owner TEXT,repo_name TEXT,repo_branch TEXT,content_hash TEXT,installed_at INTEGER,updated_at INTEGER); CREATE TABLE mcp_servers(id TEXT,project_id TEXT,homepage TEXT,created_at INTEGER);").unwrap();
+        conn.execute_batch(include_str!("../../migrations/072_extension_governance.sql")).unwrap();
+        crate::db::DbState(Arc::new(Mutex::new(conn)))
+    }
 
     fn template(version: &str, permissions: &[&str]) -> WorkflowTemplate {
         WorkflowTemplate {
@@ -376,25 +440,29 @@ mod tests {
         let root = std::env::temp_dir().join(format!("workflow-template-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let roots = [root.to_string_lossy().to_string()];
+        let db = database();
         let initial = template("1.0.0", &["project.read"]);
         handle(
             &serde_json::json!({"action":"import","template":initial}),
             &roots,
+            &db, "p", "", "",
         )
         .unwrap();
         handle(
             &serde_json::json!({"action":"disable","id":"build-check"}),
             &roots,
+            &db, "p", "", "",
         )
         .unwrap();
         let upgraded = template("1.1.0", &["project.read", "project.write"]);
         let err = handle(
             &serde_json::json!({"action":"upgrade","template":upgraded}),
             &roots,
+            &db, "p", "", "",
         )
         .unwrap_err();
         assert!(err.contains("allow_permission_escalation"));
-        handle(&serde_json::json!({"action":"upgrade","template":upgraded,"allow_permission_escalation":true}), &roots).unwrap();
+        handle(&serde_json::json!({"action":"upgrade","template":upgraded,"allow_permission_escalation":true}), &roots, &db, "p", "", "").unwrap();
         assert!(root
             .join(".deveco-agent/workflow-templates/history/build-check/1.0.0.json")
             .is_file());
