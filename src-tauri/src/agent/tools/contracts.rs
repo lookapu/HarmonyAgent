@@ -50,6 +50,41 @@ pub enum ApprovalPolicy {
     Always,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatorKind {
+    ArtifactRead,
+    Diff,
+    Tests,
+    Build,
+    Deploy,
+    Command,
+}
+
+impl ValidatorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ArtifactRead => "artifact_read",
+            Self::Diff => "diff",
+            Self::Tests => "tests",
+            Self::Build => "build",
+            Self::Deploy => "deploy",
+            Self::Command => "command",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAction {
+    None,
+    RestoreSnapshot,
+    GitRevert,
+    RedeployPrevious,
+    VerifyThenCompensate,
+    ManualReview,
+}
+
 impl RecoveryPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -69,6 +104,8 @@ pub struct ToolContract {
     pub timeout_ms: u64,
     pub cancellation: CancellationMode,
     pub approval: ApprovalPolicy,
+    pub validator: Option<ValidatorKind>,
+    pub recovery_action: RecoveryAction,
 }
 
 const MANUAL_RECOVERY: &[&str] = &[
@@ -135,6 +172,31 @@ pub fn contract(tool: &str) -> ToolContract {
         timeout_ms: timeout_ms(tool),
         cancellation: CancellationMode::Cooperative,
         approval,
+        validator: validator(tool),
+        recovery_action: recovery_action(tool, effect),
+    }
+}
+
+fn validator(tool: &str) -> Option<ValidatorKind> {
+    match tool {
+        "read_file" => Some(ValidatorKind::ArtifactRead),
+        "git_diff" | "git_status" => Some(ValidatorKind::Diff),
+        "run_tests" | "test_project" => Some(ValidatorKind::Tests),
+        "build_project" | "build_generic" => Some(ValidatorKind::Build),
+        "deploy" => Some(ValidatorKind::Deploy),
+        "run_command" => Some(ValidatorKind::Command),
+        _ => None,
+    }
+}
+
+fn recovery_action(tool: &str, effect: EffectKind) -> RecoveryAction {
+    match tool {
+        "write_file" | "edit_file" | "apply_patch" | "delete_file" => RecoveryAction::RestoreSnapshot,
+        "git_commit" => RecoveryAction::GitRevert,
+        "deploy" | "deploy_all" => RecoveryAction::RedeployPrevious,
+        _ if effect == EffectKind::Read => RecoveryAction::None,
+        _ if effect == EffectKind::Destructive => RecoveryAction::ManualReview,
+        _ => RecoveryAction::VerifyThenCompensate,
     }
 }
 
@@ -219,11 +281,14 @@ mod tests {
             let value = serde_json::to_value(contract(spec.name)).unwrap();
             for field in [
                 "effect", "recovery", "retry_safe", "idempotency", "timeout_ms",
-                "cancellation", "approval",
+                "cancellation", "approval", "validator", "recovery_action",
             ] {
                 assert!(value.get(field).is_some(), "{} 缺少 {field}", spec.name);
             }
             assert!(value["timeout_ms"].as_u64().unwrap_or(0) > 0);
+            if contract(spec.name).effect != EffectKind::Read {
+                assert_ne!(contract(spec.name).recovery_action, RecoveryAction::None);
+            }
         }
     }
 }

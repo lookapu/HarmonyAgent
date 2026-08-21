@@ -111,9 +111,9 @@ impl ToolResultV2 {
         merge_native_artifacts(output, &mut artifacts);
         merge_spilled_artifacts(output, &mut artifacts);
         let mut verification = Vec::new();
-        if is_verifier(tool, args) {
+        if let Some(kind) = declared_validator(tool, args) {
             verification.push(VerificationEvidence {
-                kind: verification_kind(tool).into(),
+                kind: kind.into(),
                 passed: succeeded,
                 detail: first_line(output),
             });
@@ -130,7 +130,7 @@ impl ToolResultV2 {
         };
         let error = (!succeeded && !matches!(status, "waiting_approval" | "pending_approval"))
             .then(|| classify_error(status, output, contract.retry_safe));
-        let compensation = compensation(tool, contract.recovery.as_str(), succeeded, &artifacts);
+        let compensation = compensation(contract.recovery_action, succeeded, &artifacts);
         let modifications = if committed && contract.effect.as_str() != "read" {
             if artifacts.is_empty() {
                 vec![ModificationEvidence {
@@ -285,32 +285,42 @@ fn recovery_instruction(
 }
 
 fn compensation(
-    tool: &str,
-    recovery: &str,
+    action: crate::agent::tools::contracts::RecoveryAction,
     succeeded: bool,
     artifacts: &[ArtifactEvidence],
 ) -> Option<CompensationEvidence> {
-    if !succeeded || recovery == "replay" {
+    use crate::agent::tools::contracts::RecoveryAction;
+    if !succeeded || action == RecoveryAction::None {
         return None;
     }
-    let (strategy, approval, instruction) = match tool {
-        "write_file" | "edit_file" | "apply_patch" | "delete_file" => (
+    let (strategy, approval, instruction) = match action {
+        RecoveryAction::RestoreSnapshot => (
             "restore_snapshot",
             false,
             "Restore the pre-tool file snapshot",
         ),
-        "git_commit" => ("git_revert", true, "Create a compensating revert commit"),
-        "deploy" | "deploy_all" => (
+        RecoveryAction::GitRevert => ("git_revert", true, "Create a compensating revert commit"),
+        RecoveryAction::RedeployPrevious => (
             "redeploy_previous",
             true,
             "Verify device state and redeploy the previous artifact",
         ),
-        _ if !artifacts.is_empty() => (
+        RecoveryAction::VerifyThenCompensate if !artifacts.is_empty() => (
             "verify_then_compensate",
             true,
             "Verify external state before applying a compensating action",
         ),
-        _ => return None,
+        RecoveryAction::VerifyThenCompensate => (
+            "verify_then_compensate",
+            true,
+            "Verify external state before applying a compensating action",
+        ),
+        RecoveryAction::ManualReview => (
+            "manual_review",
+            true,
+            "Inspect the real external state and follow the tool-specific recovery guide",
+        ),
+        RecoveryAction::None => return None,
     };
     Some(CompensationEvidence {
         strategy: strategy.into(),
@@ -452,32 +462,17 @@ fn artifact_kind(path: &str) -> &'static str {
     }
 }
 
-fn is_verifier(tool: &str, args: &str) -> bool {
-    matches!(
-        tool,
-        "read_file"
-            | "git_diff"
-            | "git_status"
-            | "build_project"
-            | "build_generic"
-            | "run_tests"
-            | "test_project"
-            | "deploy"
-    ) || (tool == "run_command"
-        && ["test", "build", "cargo check", "git diff", "git status"]
+fn declared_validator(tool: &str, args: &str) -> Option<&'static str> {
+    use crate::agent::tools::contracts::ValidatorKind;
+    let validator = crate::agent::tools::contracts::contract(tool).validator?;
+    if validator == ValidatorKind::Command
+        && !["test", "build", "cargo check", "git diff", "git status"]
             .iter()
-            .any(|word| args.to_lowercase().contains(word)))
-}
-
-fn verification_kind(tool: &str) -> &'static str {
-    match tool {
-        "run_tests" | "test_project" => "tests",
-        "build_project" | "build_generic" => "build",
-        "deploy" => "deploy",
-        "git_diff" | "git_status" => "diff",
-        "read_file" => "artifact_read",
-        _ => "command",
+            .any(|word| args.to_lowercase().contains(word))
+    {
+        return None;
     }
+    Some(validator.as_str())
 }
 
 #[cfg(test)]
@@ -548,6 +543,21 @@ mod tests {
             item.kind == "tool_output" && item.path == ".deveco-agent/spill/tests.txt"
         }));
         assert!(value.raw_excerpt.chars().count() <= 1000);
+    }
+
+    #[test]
+    fn validators_and_recovery_actions_come_from_tool_contracts() {
+        let test = ToolResultV2::from_execution(
+            "run_command", r#"{"command":"cargo test"}"#, "ok", "ok",
+        );
+        assert_eq!(test.verification[0].kind, "command");
+        assert_eq!(test.recovery.compensation.as_ref().unwrap().strategy, "manual_review");
+
+        let arbitrary = ToolResultV2::from_execution(
+            "run_command", r#"{"command":"generate assets"}"#, "ok", "ok",
+        );
+        assert!(arbitrary.verification.is_empty());
+        assert!(!arbitrary.recovery.instruction.is_empty());
     }
 
     #[test]

@@ -108,9 +108,10 @@ pub(super) async fn tool_help(args: &Value, _roots: &[String]) -> Result<String,
         out.push_str(&format!("执行预期：{}\n", meta));
     }
     out.push_str(&format!(
-        "执行契约：副作用={:?} / 幂等={:?} / 超时={}ms / 取消={:?} / 重试安全={} / 审批={:?} / 恢复={:?}\n",
+        "执行契约：副作用={:?} / 幂等={:?} / 超时={}ms / 取消={:?} / 重试安全={} / 审批={:?} / 恢复={:?} / 验证器={:?} / 恢复动作={:?}\n",
         contract.effect, contract.idempotency, contract.timeout_ms, contract.cancellation,
-        contract.retry_safe, contract.approval, contract.recovery,
+        contract.retry_safe, contract.approval, contract.recovery, contract.validator,
+        contract.recovery_action,
     ));
     // 参数提示：从 desc 中的 JSON 示例提取（若描述里给了 { ... } 片段）
     if let Some(start) = t.desc.find('{') {

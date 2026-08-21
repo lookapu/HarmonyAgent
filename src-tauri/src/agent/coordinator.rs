@@ -421,7 +421,8 @@ pub fn list_steps(conn: &Connection, run_id: &str) -> Result<Vec<ExecutionStep>,
 mod tests {
     use super::*;
     use crate::agent::tools::contracts::{
-        ApprovalPolicy, CancellationMode, EffectKind, IdempotencyKind, RecoveryPolicy,
+        ApprovalPolicy, CancellationMode, EffectKind, IdempotencyKind, RecoveryAction,
+        RecoveryPolicy,
     };
 
     fn conn() -> Connection {
@@ -449,6 +450,8 @@ mod tests {
             timeout_ms: 180_000,
             cancellation: CancellationMode::Cooperative,
             approval: ApprovalPolicy::ProjectTrust,
+            validator: None,
+            recovery_action: RecoveryAction::VerifyThenCompensate,
         }
     }
 
