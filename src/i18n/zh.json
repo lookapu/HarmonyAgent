@@ -387,6 +387,13 @@
     "ctxPinDecision": "人工决策",
     "ctxPinDecisionPlaceholder": "输入必须长期保留的决策",
     "ctxPinAdd": "固定",
+    "ctxConflictTitle": "上下文冲突已纠偏",
+    "ctxConflictBody": "结构化事实已覆盖冲突摘要：{{conflicts}}",
+    "ctxWarning": {
+      "default": "上下文状态提醒",
+      "compression_imminent": "上下文即将压缩",
+      "context_overflow_recovery": "上下文超限恢复"
+    },
     "ctxBudgetTitle": "上下文占用约 {{tokens}} / {{limit}} tokens（{{pct}}%）；超过 85% 将自动压缩早期消息",
     "ctxStats": "本会话 {{total}} tokens（入 {{tin}} / 出 {{tout}}）· 耗时 {{time}}",
     "ctxEvents": "事件日志 {{count}}",

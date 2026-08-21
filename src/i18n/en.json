@@ -386,6 +386,13 @@
     "ctxPinDecision": "Decision",
     "ctxPinDecisionPlaceholder": "Decision that must survive compression",
     "ctxPinAdd": "Pin",
+    "ctxConflictTitle": "Context conflict corrected",
+    "ctxConflictBody": "Structured facts overrode the conflicting summary: {{conflicts}}",
+    "ctxWarning": {
+      "default": "Context status",
+      "compression_imminent": "Context compression imminent",
+      "context_overflow_recovery": "Recovering from context overflow"
+    },
     "ctxBudgetTitle": "Context ~{{tokens}} / {{limit}} tokens ({{pct}}%); early messages auto-compact above 85%",
     "ctxStats": "Session {{total}} tokens (in {{tin}} / out {{tout}}) · {{time}}",
     "ctxEvents": "{{count}} events logged",

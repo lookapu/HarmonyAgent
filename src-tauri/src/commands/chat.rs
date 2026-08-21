@@ -4332,6 +4332,14 @@ async fn stream_chat_inner(
         {
             let old_limit = history_limit;
             history_limit = (history_limit / 2).max(MIN_HISTORY_KEEP);
+            let _ = app.emit(
+                "chat-context-warning",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "kind": "compression_imminent",
+                    "message": "上下文使用超过 85%，正在保留固定项和结构化事实后压缩早期历史",
+                }),
+            );
             crate::utils::logger::log_event(
                 "context_compress",
                 serde_json::json!({
@@ -4568,6 +4576,14 @@ async fn stream_chat_inner(
                 let old_limit = history_limit;
                 history_limit = (history_limit / 2).max(MIN_HISTORY_KEEP);
                 stats.retry_count += 1;
+                let _ = app.emit(
+                    "chat-context-warning",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "kind": "context_overflow_recovery",
+                        "message": "模型上下文已超限，正在对账固定项和事实并压缩历史后重试",
+                    }),
+                );
                 crate::utils::logger::log_event(
                     "context_compress",
                     serde_json::json!({

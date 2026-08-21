@@ -703,6 +703,7 @@ export default function Home() {
   const [ctxV2Detail, setCtxV2Detail] = useState<ConversationContextV2 | null>(null)
   const [ctxV2Open, setCtxV2Open] = useState(false)
   const [ctxDecisionDraft, setCtxDecisionDraft] = useState('')
+  const reconciliationNoticeRef = useRef('')
   // 当前会话 ID：上下文可视条刷新依赖（避免 effect 内直接引用会话对象）
   const convId = currentConversation?.id
   useEffect(() => {
@@ -775,6 +776,19 @@ export default function Home() {
       })
     })).then(() => getConversationContextV2(convId)).then(setCtxV2Detail).catch(() => {})
   }, [convId, ctxV2Detail, messages])
+  useEffect(() => {
+    if (!convId || ctxV2Detail?.reconciliation.latest_status !== 'corrected') return
+    const key = `${convId}:${ctxV2Detail.reconciliation.latest_at ?? 0}`
+    if (reconciliationNoticeRef.current === key) return
+    reconciliationNoticeRef.current = key
+    useNotificationStore.getState().push({
+      tone: 'warn',
+      title: t('home.ctxConflictTitle'),
+      body: t('home.ctxConflictBody', {
+        conflicts: ctxV2Detail.reconciliation.latest_conflicts.join(' · '),
+      }),
+    })
+  }, [convId, ctxV2Detail?.reconciliation, t])
   // 会话跟随模型：切换会话时恢复该会话绑定的模型（未绑定的会话保持当前全局选择）
   useEffect(() => {
     if (currentConversation?.model_id) {
@@ -1191,6 +1205,30 @@ export default function Home() {
       dispose?.()
     }
   }, [])
+
+  // 压缩前、超限恢复和恢复验证失败都通过统一警告事件明确提示，
+  // 避免后台纠偏看起来像消息或执行状态静默消失。
+  useEffect(() => {
+    let cancelled = false
+    let dispose: (() => void) | undefined
+    listen<{ conversation_id: string; kind: string; message: string }>('chat-context-warning', (event) => {
+      const conv = useProjectStore.getState().currentConversation
+      if (cancelled || !conv || event.payload.conversation_id !== conv.id) return
+      useNotificationStore.getState().push({
+        tone: event.payload.kind === 'compression_imminent' ? 'info' : 'warn',
+        title: t(`home.ctxWarning.${event.payload.kind}`, { defaultValue: t('home.ctxWarning.default') }),
+        body: event.payload.message,
+      })
+    })
+      .then((unlisten) => {
+        if (!cancelled) dispose = unlisten
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+      dispose?.()
+    }
+  }, [t])
 
   // 设置菜单外部点击关闭
   useEffect(() => {
