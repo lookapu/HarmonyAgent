@@ -12,6 +12,8 @@ Create Release 步骤使用，也可本地预览。
   python3 scripts/gen-release-notes.py --self-test        # 合成仓库自测
 """
 
+from __future__ import annotations
+
 import argparse
 import re
 import subprocess
