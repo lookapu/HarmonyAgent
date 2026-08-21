@@ -327,7 +327,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "deploy",
-        desc: "把构建产物安装到已连接设备并拉起应用（hdc install + aa start）。\n参数：{\"hap\":\"<可选 hap 文件路径，相对项目根或绝对路径>\",\"device\":\"<可选设备序列号，缺省默认设备>\"}，hap 缺省自动找工程内最新的 .hap 产物。\n副作用：覆盖安装应用到设备，可能替换现有版本。\n返回：设备信息、安装/启动结果。安装失败时返回结构化错误（category：device_offline/signing/version_downgrade/insufficient_storage/incompatible/install_failed）与推荐下一步：设备问题调用 list_devices；签名问题调用 show_diagnose_card(category=signing) 或重新 release 构建；版本降级提示卸载旧版。不要盲目重复部署。",
+        desc: "把构建产物安装到已连接设备并拉起应用（hdc install + aa start）。\n参数：{\"hap\":\"<可选 hap 文件路径，相对项目根或绝对路径>\",\"product\":\"<可选产品>\",\"module\":\"<可选模块>\",\"device\":\"<可选设备序列号，缺省默认设备>\"}。hap 缺省时只从最近构建 manifest 选择工程指纹未过期、内容 SHA-256 复验一致、签名结构已验证且有 build 来源的最新 HAP；跨产品/模块或同时间多候选会拒绝并要求用户用 hap 或 product+module 确认，不再递归猜包。显式 hap 表示用户确认该文件，但明确 unsigned 仍拒绝。\n副作用：覆盖安装应用到设备，可能替换现有版本。\n返回：产物选择证据、设备信息、安装/启动结果。安装失败时返回结构化错误（category：device_offline/signing/version_downgrade/insufficient_storage/incompatible/install_failed）与推荐下一步：设备问题调用 list_devices；签名问题调用 diagnose_signing 或重新构建；版本降级提示卸载旧版。不要盲目重复部署。",
     },
     ToolSpec {
         name: "ohpm_install",
@@ -523,7 +523,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "deploy_all",
-        desc: "把当前 HAP 一次性并行部署到所有在线设备（多设备验证）。\n参数：{\"hap\":\"<可选 HAP 路径，缺省取最新构建产物>\",\"devices\":<可选字符串数组，指定要部署的设备序列号；缺省部署到全部在线设备>}。\n流程：定位 hap → 列出在线设备 → 并行安装、拉起、存活探测、崩溃归因（与单设备 deploy 相同的自动诊断），最后汇总每台设备结果（成功/失败及原因）。\n需要在多台真机上同时验证兼容性时使用；单台设备仍可用 deploy_hap。\n副作用：在多台设备上安装/启动应用。\n返回：各设备部署结果汇总。",
+        desc: "把同一 HAP 一次性并行部署到所有在线设备（多设备验证）。\n参数：{\"hap\":\"<可选 HAP 路径>\",\"product\":\"<可选产品>\",\"module\":\"<可选模块>\",\"devices\":<可选字符串数组，指定设备序列号；缺省全部在线设备>}。缺省 HAP 使用与 deploy 相同的 manifest 指纹、SHA-256、签名和歧义门禁；有多个产品/模块候选时必须显式确认。\n流程：安全选择 hap → 列出在线设备 → 并行安装、拉起、存活探测、崩溃归因，最后汇总每台设备结果。\n需要在多台真机上同时验证兼容性时使用；单台设备使用 deploy。\n副作用：在多台设备上安装/启动应用。\n返回：产物选择证据与各设备部署结果汇总。",
     },
     ToolSpec {
         name: "verify_ui",

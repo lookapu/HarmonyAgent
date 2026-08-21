@@ -64,6 +64,19 @@ pub struct HarmonyArtifactManifest {
     pub artifacts: Vec<HarmonyBuildArtifact>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HarmonyDeployArtifact {
+    pub absolute_path: PathBuf,
+    pub artifact: HarmonyBuildArtifact,
+}
+
+#[derive(Debug, Clone)]
+pub struct HarmonyArtifactVerification {
+    pub sha256: String,
+    pub signing_status: String,
+    pub signature_evidence: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarmonyDependencyState {
     pub declared: usize,
@@ -507,6 +520,155 @@ pub fn load_artifact_manifest(root: &Path) -> Option<HarmonyArtifactManifest> {
     serde_json::from_str(&text).ok()
 }
 
+/// 从最近一次成功构建清单选择默认部署产物。
+///
+/// 只接受内容哈希仍匹配、签名结构仍可验证且有本次 build 来源的 HAP。
+/// 跨产品/模块或同一时间存在多个候选时返回要求显式确认的错误。
+pub fn select_deploy_artifact(
+    root: &Path,
+    requested_product: Option<&str>,
+    requested_module: Option<&str>,
+) -> Result<HarmonyDeployArtifact, String> {
+    let manifest = load_artifact_manifest(root)
+        .ok_or_else(|| "缺少持久产物清单；请先运行 build_project，再部署".to_string())?;
+    let current_fingerprint = project_fingerprint(root);
+    if manifest.project_fingerprint != current_fingerprint {
+        return Err(
+            "产物清单生成后工程源码或配置已变化；请先重新运行 build_project，或显式传 hap 确认部署旧产物"
+                .into(),
+        );
+    }
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut candidates = Vec::new();
+    let mut rejected = Vec::new();
+    for artifact in manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == "hap")
+        .filter(|artifact| artifact.source_step.starts_with("build:"))
+        .filter(|artifact| {
+            requested_product.map_or(true, |product| artifact.product.as_deref() == Some(product))
+        })
+        .filter(|artifact| {
+            requested_module.map_or(true, |module| artifact.module.as_deref() == Some(module))
+        })
+    {
+        let relative = Path::new(&artifact.path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            rejected.push(format!("{}: unsafe_path", artifact.path));
+            continue;
+        }
+        let absolute = root.join(relative);
+        let canonical = match std::fs::canonicalize(&absolute) {
+            Ok(path) if path.starts_with(&canonical_root) => path,
+            _ => {
+                rejected.push(format!("{}: missing_or_outside_root", artifact.path));
+                continue;
+            }
+        };
+        let verification = match verify_artifact_file(&canonical, "hap") {
+            Ok(verification) => verification,
+            Err(error) => {
+                rejected.push(format!("{}: {error}", artifact.path));
+                continue;
+            }
+        };
+        if verification.sha256 != artifact.sha256 {
+            rejected.push(format!("{}: hash_mismatch", artifact.path));
+            continue;
+        }
+        if verification.signing_status != "verified_signed" {
+            rejected.push(format!(
+                "{}: signing={}",
+                artifact.path, verification.signing_status
+            ));
+            continue;
+        }
+        if artifact.module.is_none() || artifact.product.is_none() {
+            rejected.push(format!("{}: ambiguous_provenance", artifact.path));
+            continue;
+        }
+        candidates.push(HarmonyDeployArtifact {
+            absolute_path: canonical,
+            artifact: artifact.clone(),
+        });
+    }
+    if candidates.is_empty() {
+        let filter = format!(
+            "product={}, module={}",
+            requested_product.unwrap_or("*"),
+            requested_module.unwrap_or("*")
+        );
+        return Err(format!(
+            "没有满足 {filter} 的可验证最新签名 HAP；请重新 build_project 或显式传 hap。拒绝证据：{}",
+            if rejected.is_empty() {
+                "清单内没有本次构建来源的 HAP".into()
+            } else {
+                rejected.into_iter().take(6).collect::<Vec<_>>().join("; ")
+            }
+        ));
+    }
+    candidates.sort_by(|a, b| {
+        b.artifact
+            .modified_at
+            .cmp(&a.artifact.modified_at)
+            .then_with(|| a.artifact.path.cmp(&b.artifact.path))
+    });
+    let groups = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}@{}",
+                candidate.artifact.module.as_deref().unwrap_or("unknown"),
+                candidate.artifact.product.as_deref().unwrap_or("unknown")
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let newest_time = candidates[0].artifact.modified_at;
+    let newest_count = candidates
+        .iter()
+        .take_while(|candidate| candidate.artifact.modified_at == newest_time)
+        .count();
+    if groups.len() > 1 || newest_count > 1 {
+        let choices = candidates
+            .iter()
+            .take(8)
+            .map(|candidate| {
+                format!(
+                    "{} [module={} product={} mtime={} sha256={}]",
+                    candidate.artifact.path,
+                    candidate.artifact.module.as_deref().unwrap_or("unknown"),
+                    candidate.artifact.product.as_deref().unwrap_or("unknown"),
+                    candidate.artifact.modified_at,
+                    &candidate.artifact.sha256[..12]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "部署产物存在歧义，需要用户确认：{choices}。请再次调用 deploy/deploy_all 并显式传 hap，或用 product + module 缩小范围"
+        ));
+    }
+    Ok(candidates.remove(0))
+}
+
+pub fn verify_artifact_file(
+    path: &Path,
+    kind: &str,
+) -> Result<HarmonyArtifactVerification, String> {
+    let sha256 = file_sha256(path).ok_or_else(|| format!("无法读取产物：{}", path.display()))?;
+    let (signing_status, signature_evidence) = signature_status(path, kind);
+    Ok(HarmonyArtifactVerification {
+        sha256,
+        signing_status,
+        signature_evidence,
+    })
+}
+
 fn discover_artifacts_with_context(
     root: &Path,
     model: Option<&crate::services::harmony_model::HarmonySemanticModel>,
@@ -827,6 +989,22 @@ mod tests {
         }
     }
 
+    fn write_signed_hap(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+        archive.start_file("module.json", options).unwrap();
+        archive.write_all(b"{}").unwrap();
+        archive.start_file("META-INF/APP.RSA", options).unwrap();
+        archive.write_all(b"signature").unwrap();
+        archive.start_file("META-INF/APP.SF", options).unwrap();
+        archive.write_all(b"manifest digest").unwrap();
+        archive.finish().unwrap();
+    }
+
     fn root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("harmony-build-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -983,16 +1161,7 @@ mod tests {
         let output = root.join("entry/build/default/outputs/default");
         std::fs::create_dir_all(&output).unwrap();
         let hap = output.join("entry-default-release.hap");
-        let file = std::fs::File::create(&hap).unwrap();
-        let mut archive = zip::ZipWriter::new(file);
-        let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
-        archive.start_file("module.json", options).unwrap();
-        archive.write_all(b"{}").unwrap();
-        archive.start_file("META-INF/APP.RSA", options).unwrap();
-        archive.write_all(b"signature").unwrap();
-        archive.start_file("META-INF/APP.SF", options).unwrap();
-        archive.write_all(b"manifest digest").unwrap();
-        archive.finish().unwrap();
+        write_signed_hap(&hap);
 
         let model = crate::services::harmony_model::HarmonySemanticModel {
             products: vec![crate::services::harmony_model::HarmonyProduct {
@@ -1015,8 +1184,11 @@ mod tests {
             }],
             ..Default::default()
         };
+        let source = root.join("entry/src/main/ets/Index.ets");
+        std::fs::write(&source, "@Entry struct Before {}").unwrap();
+        let fingerprint = project_fingerprint(&root);
         let manifest =
-            record_artifact_manifest(&root, &model, &plan, "workflow", "fingerprint").unwrap();
+            record_artifact_manifest(&root, &model, &plan, "workflow", &fingerprint).unwrap();
         assert_eq!(manifest.artifacts.len(), 1);
         let artifact = &manifest.artifacts[0];
         assert_eq!(artifact.signing_status, "verified_signed");
@@ -1032,6 +1204,70 @@ mod tests {
             load_artifact_manifest(&root).unwrap().workflow_key,
             "workflow"
         );
+        let selected = select_deploy_artifact(&root, None, None).unwrap();
+        assert_eq!(selected.artifact.path, artifact.path);
+        std::fs::write(&source, "@Entry struct After {}").unwrap();
+        assert!(select_deploy_artifact(&root, None, None)
+            .unwrap_err()
+            .contains("源码或配置已变化"));
+        std::fs::write(&source, "@Entry struct Before {}").unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&hap).unwrap();
+        file.write_all(b"tampered").unwrap();
+        assert!(select_deploy_artifact(&root, None, None)
+            .unwrap_err()
+            .contains("hash_mismatch"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn deploy_selection_requires_confirmation_across_products() {
+        let root = root("deploy-ambiguity");
+        write_signed_hap(&root.join("entry/build/default/outputs/default/app-default.hap"));
+        write_signed_hap(&root.join("entry/build/paid/outputs/paid/app-paid.hap"));
+        let model = crate::services::harmony_model::HarmonySemanticModel {
+            products: vec![
+                crate::services::harmony_model::HarmonyProduct {
+                    name: "default".into(),
+                    modules: vec!["entry".into()],
+                    ..Default::default()
+                },
+                crate::services::harmony_model::HarmonyProduct {
+                    name: "paid".into(),
+                    modules: vec!["entry".into()],
+                    ..Default::default()
+                },
+            ],
+            modules: vec![module("entry", "entry", "hap")],
+            ..Default::default()
+        };
+        let plan = HarmonyBuildPlan {
+            scope: "full".into(),
+            targets: ["default", "paid"]
+                .into_iter()
+                .map(|product| HarmonyBuildTarget {
+                    module: "entry".into(),
+                    module_path: "entry".into(),
+                    product: product.into(),
+                    mode: "debug".into(),
+                    task: "assembleHap".into(),
+                    reason: "test".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        record_artifact_manifest(
+            &root,
+            &model,
+            &plan,
+            "workflow",
+            &project_fingerprint(&root),
+        )
+        .unwrap();
+        assert!(select_deploy_artifact(&root, None, None)
+            .unwrap_err()
+            .contains("需要用户确认"));
+        let selected = select_deploy_artifact(&root, Some("paid"), Some("entry")).unwrap();
+        assert_eq!(selected.artifact.product.as_deref(), Some("paid"));
         std::fs::remove_dir_all(root).ok();
     }
 }

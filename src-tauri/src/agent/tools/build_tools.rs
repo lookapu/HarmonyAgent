@@ -620,6 +620,61 @@ pub(super) async fn build_project(
     }
 }
 
+fn resolve_hap_for_deploy(args: &Value, root: &Path) -> Result<(String, bool, String), String> {
+    if let Some(requested) = args["hap"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let path = PathBuf::from(requested);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        };
+        if !path.exists() {
+            return Err(format!("hap 文件不存在: {}", path.display()));
+        }
+        let verification = crate::services::harmony_build::verify_artifact_file(&path, "hap")?;
+        if verification.signing_status == "unsigned" {
+            return Err(format!(
+                "{} 是明确未签名产物——真机安装将报签名校验失败。请修复 signingConfigs 后重新 build_project",
+                path.display()
+            ));
+        }
+        let is_signed = matches!(
+            verification.signing_status.as_str(),
+            "verified_signed" | "claimed_signed"
+        );
+        return Ok((
+            path.to_string_lossy().to_string(),
+            is_signed,
+            format!(
+                "使用用户显式确认的 HAP：{}（signing={} sha256={}）",
+                path.display(),
+                verification.signing_status,
+                &verification.sha256[..12]
+            ),
+        ));
+    }
+    let selected = crate::services::harmony_build::select_deploy_artifact(
+        root,
+        args["product"].as_str(),
+        args["module"].as_str(),
+    )?;
+    Ok((
+        selected.absolute_path.to_string_lossy().to_string(),
+        true,
+        format!(
+            "从清单选择已复验签名 HAP：{}（module={} product={} sha256={}）",
+            selected.artifact.path,
+            selected.artifact.module.as_deref().unwrap_or("unknown"),
+            selected.artifact.product.as_deref().unwrap_or("unknown"),
+            &selected.artifact.sha256[..12]
+        ),
+    ))
+}
+
 pub(super) async fn deploy(
     args: &Value,
     roots: &[String],
@@ -633,37 +688,8 @@ pub(super) async fn deploy(
     let root = Path::new(project_path);
     let info = crate::services::harmony::parse_project(root);
 
-    // 定位 hap：优先使用用户指定路径（相对路径基于项目根解析，进程 CWD 不是项目根），
-    // 其次推导产物目录，最后递归查找
-    let hap = if let Some(h) = args["hap"].as_str() {
-        let p = PathBuf::from(h);
-        if p.is_absolute() { p } else { root.join(p) }
-            .to_string_lossy()
-            .to_string()
-    } else {
-        crate::services::harmony::find_latest_hap(root, info.hap_output_dir.as_deref())
-            .ok_or_else(|| "未找到 .hap 构建产物，请先执行 build_project".to_string())?
-            .to_string_lossy()
-            .to_string()
-    };
-    if !Path::new(&hap).exists() {
-        return Err(format!("hap 文件不存在: {hap}"));
-    }
-    let is_signed = Path::new(&hap)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.contains("-signed") && !s.contains("unsigned"));
-    // 明确未签名的产物直接拒绝部署（unsigned 产物上真机必然 9568319，早报早修）
-    if !is_signed
-        && Path::new(&hap)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.contains("unsigned"))
-    {
-        return Err(format!(
-            "{hap} 是未签名产物（unsigned）——真机安装将报 9568319 签名校验失败。\n请先确认工程签名配置（build-profile.json5 signingConfigs，可调用 diagnose_signing 自检）后 build_project 重新构建，再 deploy。"
-        ));
-    }
+    let (hap, is_signed, selection_note) = resolve_hap_for_deploy(args, root)?;
+    ctx.emit_log("system", &selection_note);
 
     // 全局并发护栏：同一时间只允许一个部署
     let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
@@ -679,6 +705,7 @@ pub(super) async fn deploy(
         crate::services::tool_limits::acquire_named_gate(&format!("deploy:{device_id}")).await;
     ctx.emit_log("system", &format!("部署到设备: {device_id}"));
     let mut out = String::new();
+    out.push_str(&format!("{selection_note}\n"));
     out.push_str(&format!("目标设备: {device_id}\n"));
     if let Some(b) = &info.bundle_name {
         out.push_str(&format!("应用包名: {b}\n"));
@@ -951,25 +978,8 @@ pub(super) async fn deploy_all(
     let root = Path::new(project_path);
     let info = crate::services::harmony::parse_project(root);
 
-    // 定位 hap（与 deploy 一致）
-    let hap = if let Some(h) = args["hap"].as_str() {
-        let p = PathBuf::from(h);
-        if p.is_absolute() { p } else { root.join(p) }
-            .to_string_lossy()
-            .to_string()
-    } else {
-        crate::services::harmony::find_latest_hap(root, info.hap_output_dir.as_deref())
-            .ok_or_else(|| "未找到 .hap 构建产物，请先执行 build_project".to_string())?
-            .to_string_lossy()
-            .to_string()
-    };
-    if !Path::new(&hap).exists() {
-        return Err(format!("hap 文件不存在: {hap}"));
-    }
-    let is_signed = Path::new(&hap)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.contains("-signed"));
+    let (hap, is_signed, selection_note) = resolve_hap_for_deploy(args, root)?;
+    ctx.emit_log("system", &selection_note);
     let bundle = info.bundle_name.clone().unwrap_or_default();
     let ability = info
         .main_element
@@ -1036,7 +1046,11 @@ pub(super) async fn deploy_all(
     // 按设备门控：同一设备的 deploy_all 不与单设备 deploy 并发（靠 per-device gate 名）
     let mut ok_count = 0usize;
     let mut fail_count = 0usize;
-    let mut summary = format!("多设备部署结果（共 {} 台）：\n", devices.len());
+    let mut summary = format!(
+        "多设备部署结果（共 {} 台）：\n{}\n",
+        devices.len(),
+        selection_note
+    );
     for item in &results {
         match item {
             Ok((dev, Ok(msg))) => {
