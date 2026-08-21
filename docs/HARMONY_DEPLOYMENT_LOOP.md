@@ -17,7 +17,7 @@
 
 - `start_ability` 在命令返回后最多观测三次 Ability 栈。显式 bundle 从未出现时，返回失败和相关 Hilog，而不是模糊的成功文本。
 - `uninstall_app` 在卸载后用 `bm dump` 复验。仍能查到 bundle 时返回失败；确认卸载后停止该项目旧的运行日志监听。
-- `deploy_all` 对显式和自动发现的设备执行相同门禁，去重后受控并行；每台设备独立安装、确认、取证和恢复。
+- `deploy_all` 对显式和自动发现的设备执行相同门禁并去重。`strategy=serial` 固定逐台执行；`strategy=parallel` 使用 `max_parallel` 有界并发（缺省 2、硬上限 4），不会一次性 spawn 全部设备。每台设备独立安装、确认、取证和恢复，最终按设备 id 确定性排序。
 
 ## 安全边界
 

@@ -3,6 +3,7 @@
 //! 本模块通过 `use super::*` 继承访问。
 
 use super::*;
+use futures_util::StreamExt;
 
 /// 构建请求（宽松）：LLM 直接给出的参数，字段均可选；默认值与校验集中在 `resolve()` 显式落地。
 #[derive(serde::Deserialize, Default)]
@@ -815,6 +816,25 @@ fn should_recover_fresh_install(already_installed: bool) -> bool {
     !already_installed
 }
 
+fn multi_deploy_concurrency(
+    args: &Value,
+    device_count: usize,
+) -> Result<(&'static str, usize), String> {
+    let strategy = args["strategy"].as_str().unwrap_or("parallel");
+    match strategy {
+        "serial" => Ok(("serial", 1)),
+        "parallel" => Ok((
+            "parallel",
+            args["max_parallel"]
+                .as_u64()
+                .unwrap_or(2)
+                .clamp(1, 4)
+                .min(device_count.max(1) as u64) as usize,
+        )),
+        _ => Err("strategy 仅支持 serial 或 parallel".into()),
+    }
+}
+
 async fn start_failure_evidence(device_id: &str, bundle: &str) -> String {
     let hilog = run_hdc_shell(device_id, &["hilog", "-x"], 25)
         .await
@@ -1271,6 +1291,8 @@ pub(super) async fn deploy_all(
         );
     }
 
+    let (strategy, concurrency) = multi_deploy_concurrency(args, devices.len())?;
+
     let hap = hap.clone();
     let ctx = ctx.clone();
     let bundle_c = bundle.clone();
@@ -1278,21 +1300,32 @@ pub(super) async fn deploy_all(
     ctx.emit_log(
         "system",
         &format!(
-            "并行部署到 {} 台设备: {}",
+            "按 {strategy} 策略部署到 {} 台设备（并发上限 {concurrency}）: {}",
             devices.len(),
             devices.join(", ")
         ),
     );
+    ctx.record_run_event(
+        "harmony.deploy.batch.started",
+        serde_json::json!({
+            "project_path": project_path,
+            "project_id": project_id,
+            "strategy": strategy,
+            "max_parallel": concurrency,
+            "devices": devices,
+            "artifact_path": hap,
+        }),
+    );
 
-    // 每设备一个并行任务
-    let futures = devices.iter().cloned().map(|dev| {
+    // 有界并发：不预先 spawn 全部设备；serial 使用同一路径但并发数为 1。
+    let futures = futures_util::stream::iter(devices.iter().cloned().map(|dev| {
         let hap = hap.clone();
         let ctx = ctx.clone();
         let bundle = bundle_c.clone();
         let ability = ability_c.clone();
         let project_path = project_path.to_string();
         let project_id = project_id.to_string();
-        tokio::spawn(async move {
+        async move {
             let res = deploy_one_device(
                 &ctx,
                 &project_path,
@@ -1305,9 +1338,11 @@ pub(super) async fn deploy_all(
             )
             .await;
             (dev, res)
-        })
-    });
-    let results = futures_util::future::join_all(futures).await;
+        }
+    }))
+    .buffer_unordered(concurrency);
+    let mut results: Vec<(String, Result<String, String>)> = futures.collect().await;
+    results.sort_by(|left, right| left.0.cmp(&right.0));
 
     // 按设备门控：同一设备的 deploy_all 不与单设备 deploy 并发（靠 per-device gate 名）
     let mut ok_count = 0usize;
@@ -1319,7 +1354,7 @@ pub(super) async fn deploy_all(
     );
     for item in &results {
         match item {
-            Ok((dev, Ok(msg))) => {
+            (dev, Ok(msg)) => {
                 ok_count += 1;
                 summary.push_str(&format!("\n✓ {dev}\n"));
                 for line in msg.lines().filter(|l| {
@@ -1328,17 +1363,29 @@ pub(super) async fn deploy_all(
                     summary.push_str(&format!("  {line}\n"));
                 }
             }
-            Ok((dev, Err(e))) => {
+            (dev, Err(e)) => {
                 fail_count += 1;
                 summary.push_str(&format!("\n✗ {dev}: {}\n", tail(e, 300)));
-            }
-            Err(join_err) => {
-                fail_count += 1;
-                summary.push_str(&format!("\n✗ 任务异常: {join_err}\n"));
             }
         }
     }
     summary.push_str(&format!("\n成功 {ok_count} 台，失败 {fail_count} 台。"));
+    ctx.record_run_event(
+        "harmony.deploy.batch.completed",
+        serde_json::json!({
+            "project_path": project_path,
+            "project_id": project_id,
+            "strategy": strategy,
+            "max_parallel": concurrency,
+            "succeeded": ok_count,
+            "failed": fail_count,
+            "results": results.iter().map(|(device, result)| serde_json::json!({
+                "device_id": device,
+                "status": if result.is_ok() { "completed" } else { "failed" },
+                "summary": match result { Ok(output) => tail(output, 500), Err(error) => tail(error, 500) },
+            })).collect::<Vec<_>>(),
+        }),
+    );
     ctx.emit_log(
         "system",
         &format!("多设备部署完成：成功 {ok_count}，失败 {fail_count}"),
@@ -2184,5 +2231,26 @@ mod build_workflow_tests {
     fn recovery_only_removes_an_app_created_by_this_deploy() {
         assert!(should_recover_fresh_install(false));
         assert!(!should_recover_fresh_install(true));
+    }
+
+    #[test]
+    fn multi_device_strategy_is_bounded_and_explicit() {
+        assert_eq!(
+            multi_deploy_concurrency(&serde_json::json!({}), 8).unwrap(),
+            ("parallel", 2)
+        );
+        assert_eq!(
+            multi_deploy_concurrency(
+                &serde_json::json!({"strategy":"parallel","max_parallel":99}),
+                3,
+            )
+            .unwrap(),
+            ("parallel", 3)
+        );
+        assert_eq!(
+            multi_deploy_concurrency(&serde_json::json!({"strategy":"serial"}), 4).unwrap(),
+            ("serial", 1)
+        );
+        assert!(multi_deploy_concurrency(&serde_json::json!({"strategy":"burst"}), 2).is_err());
     }
 }

@@ -14,6 +14,8 @@ HarmonyOS 不维护独立于 Agent 的“第二套 Run”。构建、部署和�
 | `harmony.deploy.completed` | Ability、稳定状态和运行日志监听状态 |
 | `harmony.deploy.failed` | 失败阶段、类别、Hilog 证据与补偿恢复结果 |
 | `harmony.runtime.anomaly` | Hilog 或 faultlog 来源、ArkTS/Native/AppFreeze 类别、摘要、位置与有界证据 |
+| `harmony.deploy.batch.started` | 多设备策略、并发上限、确定性设备集合和 HAP |
+| `harmony.deploy.batch.completed` | 每台设备的独立终态与有界摘要、成功/失败计数 |
 
 每条事件由数据库事务分配单调序号，因此同一 Run 内可以按 `seq` 重建“构建 → 安装 → 启动 → 状态 → 异常”的真实先后关系。多设备部署共享 Run，但每条设备事件都带独立 `device_id`，不会把一台设备的结论套到另一台。
 
