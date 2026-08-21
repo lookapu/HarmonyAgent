@@ -175,20 +175,34 @@ pub(super) async fn search_knowledge(args: &Value, project_id: &str, db: &crate:
         return Err("search_knowledge 需要参数 {\"keyword\":\"<搜索关键词>\"}".into());
     }
     let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 20) as usize;
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let rows = crate::db::queries::search_knowledge(
-        &conn,
-        if project_id.is_empty() { None } else { Some(project_id) },
-        keyword,
+    let rows = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        crate::db::queries::search_knowledge(
+            &conn,
+            if project_id.is_empty() { None } else { Some(project_id) },
+            keyword,
+            limit,
+        )
+        .map_err(|e| format!("查询知识库失败：{e}"))?
+    };
+    let ecosystem = crate::services::harmony_ecosystem_knowledge::search(
+        &crate::services::harmony_ecosystem_knowledge::KnowledgeQuery {
+            keyword,
+            api_level: args["api_level"].as_u64().and_then(|value| u32::try_from(value).ok()),
+            device_type: args["device_type"].as_str().map(str::trim).filter(|value| !value.is_empty()),
+            error_code: args["error_code"].as_str().map(str::trim).filter(|value| !value.is_empty()),
+        },
         limit,
-    )
-    .map_err(|e| format!("查询知识库失败：{e}"))?;
-    if rows.is_empty() {
+    );
+    if rows.is_empty() && ecosystem.is_empty() {
         return Ok(format!(
             "知识库中没有匹配「{keyword}」的条目。\n若刚解决了相关问题，可调用 save_memory 把经验记入知识库（分类 build/deploy/code/pitfall 等），下次同类问题即可命中。"
         ));
     }
-    let mut out = format!("知识库命中 {} 条（关键词「{keyword}」）：\n", rows.len());
+    let mut out = format!(
+        "知识库命中团队经验 {} 条、生态证据 {} 条（关键词「{keyword}」）：\n",
+        rows.len(), ecosystem.len()
+    );
     for (i, e) in rows.iter().enumerate() {
         out.push_str(&format!(
             "\n[{}] {}\n  关键词: {}\n  问题: {}\n  解决: {}\n  命中次数: {} | 作用域: {}\n",
@@ -201,6 +215,7 @@ pub(super) async fn search_knowledge(args: &Value, project_id: &str, db: &crate:
             if e.project_id.is_some() { "本项目" } else { "全局" }
         ));
     }
+    out.push_str(&crate::services::harmony_ecosystem_knowledge::render(&ecosystem));
     Ok(out)
 }
 

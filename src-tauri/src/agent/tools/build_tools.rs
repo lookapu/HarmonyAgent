@@ -1859,6 +1859,8 @@ pub(super) async fn ohpm_search(
     match crate::services::ohpm_audit::fetch(keyword, comparison_version.as_deref(), target_api).await {
         Ok(audit) => {
             let mut out = crate::services::ohpm_audit::render(&audit, detail);
+            let ecosystem_record =
+                crate::services::harmony_ecosystem_knowledge::from_package_audit(&audit);
             if let Some(dependency) = &project_dependency {
                 out.push_str(&format!(
                     "- 工程依赖证据: {} 声明 {}{}（{}）\n",
@@ -1872,6 +1874,12 @@ pub(super) async fn ohpm_search(
                 "\n采用前闭环：核对源码/公告 → 锁定 {} → ohpm_install → check_sdk_alignment → lint/test/build_project。",
                 audit.selected_version
             ));
+            if detail {
+                out.push_str("\n\n结构化生态知识记录：");
+                out.push_str(&crate::services::harmony_ecosystem_knowledge::render(&[
+                    ecosystem_record,
+                ]));
+            }
             return Ok(out);
         }
         Err(registry_error) => {

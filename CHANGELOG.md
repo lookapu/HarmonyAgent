@@ -41,6 +41,7 @@
 - `environment_check` 新增 SDK/官方资料来源证明：统一展示本机 `.d.ts`、官方 API 变更与参考库、OpenHarmony 文档镜像的来源、版本、更新时间、条目和覆盖率，并把超过 30 天、缺失来源或缺少版本的索引显式降级，禁止作为生成代码的唯一依据。
 - `ohpm_search` 升级为采用前包审计：用官方 registry 元数据比较显式或工程锁定版本与 latest，按工程 compatible API 核验包声明，分类许可证，并检查完整性摘要、废弃状态、安装期脚本和外部来源依赖；registry 没有漏洞公告证据时明确标为未知。OHPM 候选列表同步展示许可证。
 - `get_project_info patterns=true` 新增 GitHub/Gitee 鸿蒙开源工程模式分析：绑定脱敏 origin、分支和 commit，只用语义模型与精确源码证据提取模块化、product、路由、Ability、依赖、状态、网络、存储、测试、Native 和多设备模式，并逐项给出适用边界、复用步骤与风险；扫描有确定性上限、不跟随符号链接且不执行第三方代码。
+- `search_knowledge` 建立统一鸿蒙生态知识记录：团队经验之外可按 API Level、设备类型和错误指纹检索三方包兼容规则、常见错误与设备差异，每条记录绑定适用条件、回归来源、验证状态和未知边界；`ohpm_search detail=true` 将实时 registry 审计转换为同一版本化记录。
 
 ### 长会话 Context V2（M1 基础）
 

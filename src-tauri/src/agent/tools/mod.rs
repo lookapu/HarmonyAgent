@@ -687,7 +687,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_knowledge",
-        desc: "主动检索项目知识库（save_memory/知识面板沉淀的团队经验与踩坑结论），按关键字模糊匹配标题/关键词/症状/解法。\n参数：{\"keyword\":\"<关键字，如 签名、hvigor 缓存、黑屏>\",\"limit\":<可选返回条数 1-20，缺省 5>}。\n适合：开始新任务前查团队约定、遇到问题先查是否有人踩过、想快速了解某个模块的已知坑。\n与构建/部署失败时的自动匹配互补：本工具是主动查询。\n副作用：无（只读，命中条目会累计 hit_count）。\n返回：匹配条目列表（标题/分类/症状/解法）。",
+        desc: "主动检索项目知识库与可审计的鸿蒙生态知识：团队经验、三方包兼容规则、常见错误和设备差异。\n参数：{\"keyword\":\"<关键字，如 签名、hvigor、unauthorized>\",\"api_level\":<可选工程 API>,\"device_type\":\"<可选 default|tablet|2in1|wearable|tv|car>\",\"error_code\":\"<可选错误码/指纹>\",\"limit\":<可选 1-20，缺省 5>}。\n生态条目绑定适用条件、验证状态、来源与未知边界；具体 ohpm 包版本仍用 ohpm_search 获取官方 registry 实时审计。\n适合：开始任务前查团队约定，或按 API/设备/错误指纹检索已验证处理路径。\n副作用：无（只读）。\n返回：团队条目与生态证据条目，包含现象、根因、处理、适用条件、来源和限制。",
     },
     ToolSpec {
         name: "list_mcp_servers",
