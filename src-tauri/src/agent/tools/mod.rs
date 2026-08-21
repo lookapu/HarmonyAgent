@@ -383,11 +383,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_sdk_api",
-        desc: "检索本机 HarmonyOS SDK 声明索引，覆盖 @ohos/@kit 模块、类型、权限、SystemCapability 和 @since/@deprecated 版本元数据。\n参数：{\"query\":\"<模块、Kit、类型、权限或能力关键字>\",\"limit\":<可选，缺省 20>}。索引每次查询按文件时间戳/大小增量刷新：未变复用、变化重扫、删除失效，并报告本轮统计；结果只来自当前配置的本机 SDK。\n副作用：无（只读本地 SDK）。\n返回：匹配模块、全部能力/权限、版本范围、类型声明与增量扫描统计；精确成员签名再用 read_sdk_api_module。",
+        desc: "检索本机 HarmonyOS SDK 声明索引，覆盖模块、类型、权限、SystemCapability 和版本元数据。\n参数：{\"query\":\"<模块、Kit、类型、权限或能力关键字>\",\"product\":\"<可选工程产品>\",\"limit\":<可选，缺省 20>}。结果绑定当前工程 product 的 compile/compatible/target API 和本机 SDK，逐项标注可用、需运行时守卫、高于编译 SDK或废弃；仅在本机 @useinstead 明示时给替代。\n副作用：无（只读本地 SDK）。\n返回：工程 API 上下文、匹配模块/符号判定、能力/权限与增量扫描统计。",
     },
     ToolSpec {
         name: "read_sdk_api_module",
-        desc: "读取本地 HarmonyOS SDK 中某个 API 模块的完整 .d.ts 声明内容（含所有接口/方法签名、@since、@syscap、权限说明）。\n参数：{\"module\":\"<模块文件名，如 @ohos.abilityAccessCtrl.d.ts 或 @ohos.abilityAccessCtrl>\"}。\n应在 search_sdk_api 定位到模块后，需要查看精确的方法签名/参数/返回值时调用；不要在未搜索前直接猜模块名。\n副作用：无（只读本地 SDK）。\n返回：该模块的完整 TypeScript 声明文本（较大，可能数千行）。",
+        desc: "读取本机 SDK 某个 API 模块的完整 .d.ts 声明（含精确签名与 @since/@deprecated/@useinstead）。\n参数：{\"module\":\"<模块名>\",\"product\":\"<可选工程产品>\"}。返回头部绑定当前工程与本机 SDK API 上下文；应先用 search_sdk_api 定位。\n副作用：无（只读本地 SDK）。\n返回：API 上下文与完整 TypeScript 声明（超大文件有界截断）。",
     },
     ToolSpec {
         name: "search_harmony_docs",
@@ -659,7 +659,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_api",
-        desc: "在已抓取的鸿蒙官方 API 知识库中搜索 API 声明、版本与所属模块。\n参数：{\"keyword\":\"<关键字，函数名/类名/模块名片段>\",\"module\":\"<可选过滤 @ohos.xxx>\",\"kit\":\"<可选过滤 Kit 名>\",\"api_level\":<可选只看某版本>,\"change_type\":\"added|removed|deprecated|modified\",\"limit\":<可选返回条数，缺省 50>}。\n返回匹配的 API 列表，每条包含：所属 Kit / d.ts 文件 / 模块 / 类名 / 完整声明 / 变更类型 / 版本标签 / API level / 官方文档链接。\n适合：写代码时查 API 签名与最低版本、判断某 API 是否兼容目标版本、找废弃 API 的替代、确认某功能属于哪个 Kit。\n前提：需要先 refresh_api_db 抓取过数据（若库为空会提示）。\n副作用：无（只读本地知识库）。",
+        desc: "搜索已抓取的官方 API 变更库。\n参数：{\"keyword\":\"<关键字>\",\"module\":\"<可选>\",\"kit\":\"<可选>\",\"product\":\"<可选工程产品>\",\"api_level\":<可选变更版本过滤>,\"change_type\":\"added|removed|deprecated|modified\",\"limit\":<可选>}。每条结果绑定工程 compile/compatible/target API 与本机 SDK，标注可用性、废弃或移除；官方未明确替代时不臆造。\n前提：需要先 refresh_api_db。\n副作用：无（只读本地知识库）。\n返回：API 上下文、变更证据、工程可用性和官方链接。",
     },
     ToolSpec {
         name: "refresh_api_details",
@@ -667,7 +667,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "get_api_detail",
-        desc: "查询某个鸿蒙 API 模块/类/方法的官方参考详情（描述、导入方式、系统能力、权限、示例、成员列表）。\n参数：{\"module\":\"<可选，模块名片段，如 @ohos.file.fs 或 file.fs>\",\"keyword\":\"<可选，任意关键字，会在正文里搜索并返回片段>\",\"limit\":<可选，缺省 5>}。\nmodule/keyword 至少给一个。返回每个命中模块的标题、Kit、首批 API 版本、导入语句、系统能力、权限、设备类型、示例代码、以及子项（类/接口/枚举/方法/属性）列表。\n适合：写代码前确认 API 签名与用法、查看需要申请的权限、复制示例、判断某 API 支持哪些设备。\n前提：先调用 refresh_api_details 抓取正文；未抓取时仅能返回知识库中已有的模块元数据。\n副作用：无（只读本地知识库）。",
+        desc: "查询 API 模块/类/方法的官方参考详情。\n参数：{\"module\":\"<可选>\",\"keyword\":\"<可选>\",\"product\":\"<可选工程产品>\",\"limit\":<可选>}。module/keyword 至少一个；模块和成员均按当前工程与本机 SDK API 标注可用、条件可用或废弃，并保留导入、能力、权限、设备、示例和官方来源。\n前提：先调用 refresh_api_details。\n副作用：无（只读本地知识库）。\n返回：API 上下文与带逐项兼容性判定的参考详情。",
     },
     ToolSpec {
         name: "diff_api_versions",
@@ -1175,8 +1175,8 @@ pub async fn run_tool(
         "deploy" => build_tools::deploy(&args, &roots, ctx, project_id).await,
         "ohpm_install" => build_tools::ohpm_install(&args, &roots).await,
         "web_search" => web_tools::web_search(&args).await,
-        "search_sdk_api" => test_tools::search_sdk_api(&args, db).await,
-        "read_sdk_api_module" => test_tools::read_sdk_api_module(&args, db).await,
+        "search_sdk_api" => test_tools::search_sdk_api(&args, &roots, db).await,
+        "read_sdk_api_module" => test_tools::read_sdk_api_module(&args, &roots, db).await,
         "check_sdk_alignment" => check_sdk_alignment(&args, &roots, db),
         "create_harmony_project" => project_tools::create_harmony_project(&args, &roots).await,
         "show_diagnose_card" => show_diagnose_card(&args, ctx).await,
@@ -1250,9 +1250,9 @@ pub async fn run_tool(
         "scan_api_compat" => debug_tools::scan_api_compat(&args, &roots, db).await,
         "auto_explore" => explore_tools::auto_explore(&args, &roots).await,
         "refresh_api_db" => explore_tools::refresh_api_db(db, ctx).await,
-        "search_api" => explore_tools::search_api(&args, db).await,
+        "search_api" => explore_tools::search_api(&args, &roots, db).await,
         "refresh_api_details" => explore_tools::refresh_api_details(db, ctx).await,
-        "get_api_detail" => explore_tools::get_api_detail(&args, db),
+        "get_api_detail" => explore_tools::get_api_detail(&args, &roots, db),
         "diff_api_versions" => explore_tools::diff_api_versions(&args, db),
         "get_project_info" => get_project_info(&roots).await,
         "environment_check" => environment_check(&args, db).await,

@@ -458,7 +458,13 @@ pub(super) async fn refresh_api_db(
 }
 
 /// search_api：在官方 API 知识库中搜索。
-pub(super) async fn search_api(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+pub(super) async fn search_api(args: &Value, roots: &[String], db: &crate::db::DbState) -> Result<String, String> {
+    let env = crate::services::harmony_env::detect(db);
+    let context = crate::services::sdk_api::project_api_context(
+        roots.first().map(|root| std::path::Path::new(root)),
+        args["product"].as_str(),
+        env.default_api.as_deref(),
+    );
     let db = db.0.clone();
     let keyword = args["keyword"].as_str().map(|s| s.to_string());
     let module = args["module"].as_str().map(|s| s.to_string());
@@ -569,8 +575,7 @@ pub(super) async fn search_api(args: &Value, db: &crate::db::DbState) -> Result<
     }
     drop(conn);
 
-    let mut out = String::new();
-    out.push_str(&format!("共找到 {} 条匹配（知识库总量 {total} 条）：\n\n", entries.len()));
+    let mut out = format!("API 上下文：{}\n共找到 {} 条匹配（知识库总量 {total} 条）：\n\n", context.describe(), entries.len());
     for (i, e) in entries.iter().take(50).enumerate() {
         out.push_str(&format!("{}. [{}] {}\n", i + 1, e.change_type, e.declaration));
         out.push_str(&format!(
@@ -583,6 +588,12 @@ pub(super) async fn search_api(args: &Value, db: &crate::db::DbState) -> Result<
             "   版本：{} (API level {:?})\n",
             e.version_label, e.api_level
         ));
+        let status = match e.change_type.as_str() {
+            "removed" => "不可用：官方变更记录标记已移除",
+            "deprecated" => "可用但已废弃",
+            _ => context.availability(e.api_level, false),
+        };
+        out.push_str(&format!("   工程判定：{status}\n"));
         if let Some(dts) = &e.dts_file {
             out.push_str(&format!("   d.ts：{dts}\n"));
         }
@@ -681,12 +692,18 @@ pub(super) async fn refresh_api_details(
 }
 
 /// get_api_detail：查询 API 参考详情。
-pub(super) fn get_api_detail(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+pub(super) fn get_api_detail(args: &Value, roots: &[String], db: &crate::db::DbState) -> Result<String, String> {
     let module = args["module"].as_str().map(|s| s.to_string());
     let keyword = args["keyword"].as_str().map(|s| s.to_string());
     if module.is_none() && keyword.is_none() {
         return Err("必须提供 module 或 keyword 之一。".into());
     }
+    let env = crate::services::harmony_env::detect(db);
+    let context = crate::services::sdk_api::project_api_context(
+        roots.first().map(|root| std::path::Path::new(root)),
+        args["product"].as_str(),
+        env.default_api.as_deref(),
+    );
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let (d_count, m_count) = crate::services::harmony_api_ref::count_details(&conn)?;
     if d_count == 0 {
@@ -709,7 +726,7 @@ pub(super) fn get_api_detail(args: &Value, db: &crate::db::DbState) -> Result<St
         ));
     }
 
-    let mut out = String::new();
+    let mut out = format!("API 上下文：{}\n", context.describe());
     out.push_str(&format!(
         "在 {d_count} 个模块 / {m_count} 个子项中找到 {} 个匹配：\n\n",
         hits.len()
@@ -730,6 +747,7 @@ pub(super) fn get_api_detail(args: &Value, db: &crate::db::DbState) -> Result<St
         if h.deprecated {
             out.push_str("⚠️ 该模块已标记废弃\n");
         }
+        out.push_str(&format!("工程判定：{}\n", context.availability(h.since_api_level, h.deprecated)));
         if let Some(devs) = &h.device_types {
             out.push_str(&format!("设备：{devs}\n"));
         }
@@ -759,8 +777,8 @@ pub(super) fn get_api_detail(args: &Value, db: &crate::db::DbState) -> Result<St
                     .map(|v| format!("(API {v}+)"))
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "  • [{}{}] {}{}{deprec}{since}\n",
-                    parent, m.kind, m.member_name, ""
+                    "  • [{}{}] {}{}{deprec}{since} — {}\n",
+                    parent, m.kind, m.member_name, "", context.availability(m.since_api_level, m.deprecated)
                 ));
                 if let Some(desc) = &m.description {
                     let brief: String = desc.chars().take(120).collect();

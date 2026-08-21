@@ -58,6 +58,97 @@ pub struct ApiSymbol {
     pub deprecated: bool,
     pub syscap: Option<String>,
     pub permissions: Vec<String>,
+    #[serde(default)]
+    pub replacement: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectApiContext {
+    pub project_path: String,
+    pub product: Option<String>,
+    pub compile_api: Option<u32>,
+    pub compatible_api: Option<u32>,
+    pub target_api: Option<u32>,
+    pub installed_api: Option<u32>,
+}
+
+impl ProjectApiContext {
+    pub fn describe(&self) -> String {
+        format!(
+            "工程 {} | product {} | compile API {} | compatible API {} | target API {} | 本机 SDK API {}",
+            if self.project_path.is_empty() { "（未绑定）" } else { &self.project_path },
+            self.product.as_deref().unwrap_or("default/unknown"),
+            self.compile_api.map(|value| value.to_string()).as_deref().unwrap_or("?"),
+            self.compatible_api.map(|value| value.to_string()).as_deref().unwrap_or("?"),
+            self.target_api.map(|value| value.to_string()).as_deref().unwrap_or("?"),
+            self.installed_api.map(|value| value.to_string()).as_deref().unwrap_or("?"),
+        )
+    }
+
+    pub fn availability(&self, since: Option<u32>, deprecated: bool) -> &'static str {
+        if since
+            .zip(self.compile_api.or(self.installed_api))
+            .is_some_and(|(since, compile)| since > compile)
+        {
+            "不可用：高于当前编译 SDK"
+        } else if deprecated {
+            "可用但已废弃"
+        } else if since
+            .zip(self.compatible_api)
+            .is_some_and(|(since, compatible)| since > compatible)
+        {
+            "条件可用：需 API Level 运行时守卫"
+        } else {
+            "可用"
+        }
+    }
+}
+
+pub fn project_api_context(
+    root: Option<&Path>,
+    requested_product: Option<&str>,
+    installed_api: Option<&str>,
+) -> ProjectApiContext {
+    let project_path = root
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let model = root
+        .filter(|path| path.is_dir())
+        .map(crate::services::harmony_model::parse);
+    let product = model.as_ref().and_then(|model| {
+        requested_product
+            .and_then(|name| model.products.iter().find(|product| product.name == name))
+            .or_else(|| {
+                model
+                    .products
+                    .iter()
+                    .find(|product| product.name == "default")
+            })
+            .or_else(|| model.products.first())
+    });
+    ProjectApiContext {
+        project_path,
+        product: product
+            .map(|product| product.name.clone())
+            .or_else(|| requested_product.map(str::to_string)),
+        compile_api: product
+            .and_then(|product| product.compile_api_level)
+            .and_then(|value| u32::try_from(value).ok()),
+        compatible_api: product
+            .and_then(|product| product.compatible_api_level)
+            .and_then(|value| u32::try_from(value).ok()),
+        target_api: product
+            .and_then(|product| product.target_api_level)
+            .and_then(|value| u32::try_from(value).ok()),
+        installed_api: installed_api.and_then(parse_api_level),
+    }
+}
+
+fn parse_api_level(value: &str) -> Option<u32> {
+    value
+        .rsplit_once('(')
+        .and_then(|(_, suffix)| suffix.trim_end_matches(')').parse().ok())
+        .or_else(|| value.trim().parse().ok())
 }
 
 /// 一次扫描的完整索引
@@ -238,6 +329,7 @@ fn extract_symbols(content: &str) -> Vec<ApiSymbol> {
     let mut deprecated = false;
     let mut syscap = None;
     let mut permissions = Vec::new();
+    let mut replacement = None;
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(index) = trimmed.find("@since") {
@@ -256,6 +348,10 @@ fn extract_symbols(content: &str) -> Vec<ApiSymbol> {
             syscap = Some(value);
         }
         permissions.extend(extract_tag_values(trimmed, "@permission"));
+        replacement = extract_tag_values(trimmed, "@useinstead")
+            .into_iter()
+            .next()
+            .or(replacement);
         if let Some((kind, name)) = declaration_at_line(trimmed) {
             permissions.sort();
             permissions.dedup();
@@ -266,11 +362,13 @@ fn extract_symbols(content: &str) -> Vec<ApiSymbol> {
                 deprecated,
                 syscap: syscap.clone(),
                 permissions: permissions.clone(),
+                replacement: replacement.clone(),
             });
             since = None;
             deprecated = false;
             syscap = None;
             permissions.clear();
+            replacement = None;
         }
     }
     symbols.sort_by(|a, b| (&a.name, &a.kind).cmp(&(&b.name, &b.kind)));
@@ -619,6 +717,7 @@ export declare class ExtendedDemoType { value: string }
                 deprecated: false,
                 syscap: Some("SystemCapability.Demo.Core".into()),
                 permissions: vec!["ohos.permission.DEMO".into()],
+                replacement: None,
             }],
             deprecated: false,
             path: "/sdk/@ohos.demo.d.ts".into(),
@@ -630,5 +729,25 @@ export declare class ExtendedDemoType { value: string }
         assert_eq!(search(&index, "DemoType", 10).len(), 1);
         assert_eq!(search(&index, "ohos.permission.DEMO", 10).len(), 1);
         assert_eq!(search(&index, "SystemCapability.Demo.Core", 10).len(), 1);
+    }
+
+    #[test]
+    fn project_api_context_marks_unavailable_conditional_and_deprecated() {
+        let context = ProjectApiContext {
+            compile_api: Some(20),
+            compatible_api: Some(12),
+            installed_api: Some(20),
+            ..ProjectApiContext::default()
+        };
+        assert_eq!(
+            context.availability(Some(21), false),
+            "不可用：高于当前编译 SDK"
+        );
+        assert_eq!(
+            context.availability(Some(18), false),
+            "条件可用：需 API Level 运行时守卫"
+        );
+        assert_eq!(context.availability(Some(10), true), "可用但已废弃");
+        assert_eq!(context.availability(Some(10), false), "可用");
     }
 }

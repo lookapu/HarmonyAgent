@@ -477,8 +477,9 @@ use crate::services::sdk_api;
 
 /// search_sdk_api 工具：检索本地 SDK 的 @ohos.*.d.ts 模块
 /// （内部 detect 首次走 reg query、index_api_dir 扫描 .d.ts 均为同步 IO，放入 blocking 线程池）
-pub(super) async fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+pub(super) async fn search_sdk_api(args: &Value, roots: &[String], db: &crate::db::DbState) -> Result<String, String> {
     let args_owned = args.clone();
+    let roots_owned = roots.to_vec();
     let db2 = crate::db::DbState(db.0.clone());
     tokio::task::spawn_blocking(move || {
         let query = args_owned
@@ -501,12 +502,17 @@ pub(super) async fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Res
             .ok_or_else(|| "未找到 SDK 的 ets/api 目录，请在健康检查页配置 SDK".to_string())?;
         let idx = sdk_api::index_api_dir(&dir);
         let hits = sdk_api::search(&idx, &query, limit);
+        let context = sdk_api::project_api_context(
+            roots_owned.first().map(|root| std::path::Path::new(root)),
+            args_owned.get("product").and_then(|value| value.as_str()),
+            env.default_api.as_deref(),
+        );
         if hits.is_empty() {
             return Ok(format!("未在本地 SDK 中找到与「{query}」相关的 API 模块。"));
         }
         let mut out = format!(
-            "本地 SDK（API {}, {} 个模块；本轮重扫 {}、复用 {}、移除 {}）中匹配「{query}」的结果：\n\n",
-            env.default_api.as_deref().unwrap_or("?"),
+            "API 上下文：{}\n本机索引共 {} 个模块；本轮重扫 {}、复用 {}、移除 {}。匹配「{query}」：\n\n",
+            context.describe(),
             idx.modules.len(), idx.rescanned_modules, idx.reused_modules, idx.removed_modules
         );
         for m in hits {
@@ -529,6 +535,7 @@ pub(super) async fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Res
             if m.deprecated {
                 out.push_str("⚠️ 已废弃（@deprecated）\n");
             }
+            out.push_str(&format!("工程判定: {}\n", context.availability(m.since_min, m.deprecated)));
             if !m.declarations.is_empty() {
                 let preview: Vec<&str> = m.declarations.iter().take(20).map(|s| s.as_str()).collect();
                 out.push_str(&format!("声明: {}\n", preview.join(", ")));
@@ -536,9 +543,15 @@ pub(super) async fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Res
                     out.push_str(&format!("  …及另外 {} 个\n", m.declarations.len() - 20));
                 }
             }
+            let matched_symbols = m.symbols.iter().filter(|symbol| symbol.name.to_lowercase().contains(&query.to_lowercase())).take(10).collect::<Vec<_>>();
+            for symbol in matched_symbols {
+                out.push_str(&format!("  - {} {}: {}", symbol.kind, symbol.name, context.availability(symbol.since, symbol.deprecated)));
+                if let Some(replacement) = &symbol.replacement { out.push_str(&format!("；替代：{replacement}")); }
+                out.push('\n');
+            }
             out.push('\n');
         }
-        out.push_str("提示：需要某个模块的精确签名时，调用 read_sdk_api_module 并传入模块名。");
+        out.push_str("提示：条件可用 API 必须增加 API Level 运行时守卫；需要精确签名与 @useinstead 时调用 read_sdk_api_module。");
         Ok(out)
     })
     .await
@@ -547,8 +560,9 @@ pub(super) async fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Res
 
 /// read_sdk_api_module 工具：读取完整 .d.ts 声明
 /// （内部 detect 首次走 reg query 等同步 IO，放入 blocking 线程池）
-pub(super) async fn read_sdk_api_module(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+pub(super) async fn read_sdk_api_module(args: &Value, roots: &[String], db: &crate::db::DbState) -> Result<String, String> {
     let args_owned = args.clone();
+    let roots_owned = roots.to_vec();
     let db2 = crate::db::DbState(db.0.clone());
     tokio::task::spawn_blocking(move || {
         let module = args_owned
@@ -561,6 +575,11 @@ pub(super) async fn read_sdk_api_module(args: &Value, db: &crate::db::DbState) -
             return Err("module 不能为空".to_string());
         }
         let env = crate::services::harmony_env::detect(&db2);
+        let context = sdk_api::project_api_context(
+            roots_owned.first().map(|root| std::path::Path::new(root)),
+            args_owned.get("product").and_then(|value| value.as_str()),
+            env.default_api.as_deref(),
+        );
         let dir = crate::services::harmony_env::default_api_dir(&env)
             .ok_or_else(|| "未找到 SDK 的 ets/api 目录".to_string())?;
         // 规范化文件名：补 .d.ts 后缀，防目录穿越
@@ -579,11 +598,11 @@ pub(super) async fn read_sdk_api_module(args: &Value, db: &crate::db::DbState) -
         // 大文件截断到合理长度（d.ts 通常几十 KB，限制 60KB 避免撑爆上下文）
         const MAX: usize = 60_000;
         if content.len() <= MAX {
-            Ok(format!("// {fname}\n{content}"))
+            Ok(format!("// API 上下文：{}\n// {fname}\n{content}", context.describe()))
         } else {
             let cut: String = content.chars().take(MAX).collect();
             Ok(format!(
-                "// {fname}（文件较大，仅显示前 {MAX} 字符）\n{cut}\n// …已截断，可用 read_file 配合 start/lines 精读特定段落"
+                "// API 上下文：{}\n// {fname}（文件较大，仅显示前 {MAX} 字符）\n{cut}\n// …已截断，可用 read_file 配合 start/lines 精读特定段落", context.describe()
             ))
         }
     })
