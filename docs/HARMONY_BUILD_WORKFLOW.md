@@ -41,6 +41,20 @@ Hvigor 与 ArkTS 日志统一解析为 `BuildError`：
 
 `build_project` 的 Agent 错误信封会把 stage 与 error code 写入每条定位证据；Workspace 构建错误卡也展示相同字段，避免两端使用不同解析口径。
 
+## 专项诊断
+
+结构化错误之后会执行日志—模型联合诊断，并按置信度输出证据和顺序化恢复步骤：
+
+| 诊断 | 日志证据 | 模型证据 | 恢复边界 |
+| --- | --- | --- | --- |
+| `dependency_conflict` | version/conflicting/resolve/peer dependency | 同一包在不同模块的约束或锁定版本分裂 | 先统一约束再受控同步；不自动猜版本 |
+| `cache_corruption` | corrupt/integrity/checksum/unexpected EOF | 无需伪造模型结论 | 可先自动执行 Hvigor clean；禁止删除整个工程或 SDK |
+| `sdk_missing` | SDK 错误类别、`DEVECO_SDK_HOME`、SDK not found | 各产品 compile/compatible/target SDK | 必须先补齐外部 SDK 条件，不用改源码掩盖 |
+| `signing_failure` | signing/certificate/profile 失败 | 脱敏的签名材料完整度，不读取密码、私钥或路径 | 运行签名自检，需账号生成材料时交还用户 |
+| `api_incompatible` | requires API / unsupported version | 各产品 compatible/target API Level | 优先替代 API 或版本守卫，谨慎提高最低版本 |
+
+专项证据会进入 `build_project` 失败信封，恢复步骤追加在通用类别建议之后。日志证据在持久化或返回前统一脱敏；只有缓存损坏的保守 clean 被标记为可自动恢复，其余涉及版本选择、SDK、签名身份或产品兼容策略的决策不会静默执行。
+
 ## 验收
 
 自动化测试覆盖参数策略校验、相同指纹失败恢复、源码变化拒绝恢复、外部依赖缺失/安装证据、HAP 产物发现、ArkTS 跨行错误、命名/数字错误码和 Hvigor 阶段继承。全仓 Rust、崩溃 E2E、前端测试、lint 和生产构建作为阶段门禁。

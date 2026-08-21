@@ -381,7 +381,7 @@ pub(super) async fn build_project(
             *cat_count.entry(e.category.as_str()).or_insert(0) += 1;
         }
         let dominant = cat_count.iter().max_by_key(|(_, &v)| v).map(|(k, _)| *k);
-        let locations: Vec<ErrorLocation> = errors
+        let mut locations: Vec<ErrorLocation> = errors
             .iter()
             .take(8)
             .map(|e| {
@@ -401,7 +401,25 @@ pub(super) async fn build_project(
                 }
             })
             .collect();
-        let next: Vec<&str> = match dominant {
+        let diagnoses = crate::services::harmony_diagnosis::diagnose_failure(
+            root,
+            &semantic_model,
+            &combined,
+            &errors,
+        );
+        for diagnosis in &diagnoses {
+            for evidence in diagnosis.evidence.iter().take(3) {
+                locations.push(ErrorLocation {
+                    file: None,
+                    line: None,
+                    message: format!(
+                        "[diagnosis={} confidence={:.2}] {evidence}",
+                        diagnosis.kind, diagnosis.confidence
+                    ),
+                });
+            }
+        }
+        let mut next: Vec<&str> = match dominant {
             Some("dependency") => vec![
                 "调用 ohpm_install 安装缺失依赖",
                 "若依赖声明有误，edit_file 修正 oh-package.json5",
@@ -431,7 +449,15 @@ pub(super) async fn build_project(
             ],
             _ => vec!["阅读定位与完整日志找到根因后再修复，不要直接重复相同构建"],
         };
+        for diagnosis in &diagnoses {
+            next.extend(diagnosis.recovery_steps.iter().map(String::as_str));
+        }
         let dom_cat = dominant.unwrap_or("build_failed");
+        let diagnosis_summary = diagnoses
+            .iter()
+            .map(|diagnosis| diagnosis.kind.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         crate::agent::diagnostics::record(
             project_path,
             crate::agent::diagnostics::Diagnosis {
@@ -470,8 +496,13 @@ pub(super) async fn build_project(
             "build_project",
             dom_cat,
             &format!(
-                "{mode} 构建失败，检测到 {} 个错误（主导类别: {dom_cat}）",
-                errors.len()
+                "{mode} 构建失败，检测到 {} 个错误（主导类别: {dom_cat}{}）",
+                errors.len(),
+                if diagnosis_summary.is_empty() {
+                    String::new()
+                } else {
+                    format!("；专项诊断: {diagnosis_summary}")
+                }
             ),
             &locations,
             &next,
