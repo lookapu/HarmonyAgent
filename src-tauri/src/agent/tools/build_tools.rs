@@ -747,7 +747,7 @@ fn collect_arkts_api_mappings(
     mappings
 }
 
-fn resolve_hap_for_deploy(args: &Value, root: &Path) -> Result<(String, bool, String), String> {
+fn resolve_hap_for_deploy(args: &Value, root: &Path) -> Result<(String, bool, String, String), String> {
     if let Some(requested) = args["hap"]
         .as_str()
         .map(str::trim)
@@ -782,6 +782,7 @@ fn resolve_hap_for_deploy(args: &Value, root: &Path) -> Result<(String, bool, St
                 verification.signing_status,
                 &verification.sha256[..12]
             ),
+            verification.sha256,
         ));
     }
     let selected = crate::services::harmony_build::select_deploy_artifact(
@@ -799,7 +800,54 @@ fn resolve_hap_for_deploy(args: &Value, root: &Path) -> Result<(String, bool, St
             selected.artifact.product.as_deref().unwrap_or("unknown"),
             &selected.artifact.sha256[..12]
         ),
+        selected.artifact.sha256,
     ))
+}
+
+fn successful_deploy_devices(
+    events: &[crate::agent::runtime::RunEvent],
+    artifact_sha256: &str,
+) -> std::collections::BTreeSet<String> {
+    events
+        .iter()
+        .filter(|event| event.event_type == "harmony.deploy.batch.completed")
+        .filter(|event| event.payload["artifact_sha256"].as_str() == Some(artifact_sha256))
+        .flat_map(|event| event.payload["results"].as_array().into_iter().flatten())
+        .filter(|result| result["status"].as_str() == Some("completed"))
+        .filter_map(|result| result["device_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn recovered_successful_deploy_devices(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    artifact_sha256: &str,
+) -> std::collections::BTreeSet<String> {
+    use tauri::Manager;
+
+    if ctx.run_id.is_empty() {
+        return Default::default();
+    }
+    let Some(app) = ctx.app.as_ref() else {
+        return Default::default();
+    };
+    let db: tauri::State<crate::db::DbState> = app.state();
+    let Ok(conn) = db.0.lock() else {
+        return Default::default();
+    };
+    let mut run_id = Some(ctx.run_id.clone());
+    let mut events = Vec::new();
+    // 恢复 Run 沿 parent_run_id 读取成功事实；限制深度避免异常 lineage 无限遍历。
+    for _ in 0..8 {
+        let Some(current) = run_id.take() else { break };
+        if let Ok(mut current_events) = crate::agent::runtime::events_after(&conn, &current, 0, 1000) {
+            events.append(&mut current_events);
+        }
+        run_id = crate::agent::runtime::get_run(&conn, &current)
+            .ok()
+            .flatten()
+            .and_then(|run| run.parent_run_id);
+    }
+    successful_deploy_devices(&events, artifact_sha256)
 }
 
 fn ensure_deploy_device_ready(device: &crate::commands::devices::DeviceInfo) -> Result<(), String> {
@@ -931,7 +979,7 @@ pub(super) async fn deploy(
     let root = Path::new(project_path);
     let info = crate::services::harmony::parse_project(root);
 
-    let (hap, is_signed, selection_note) = resolve_hap_for_deploy(args, root)?;
+    let (hap, is_signed, selection_note, _artifact_sha256) = resolve_hap_for_deploy(args, root)?;
     ctx.emit_log("system", &selection_note);
 
     // 全局并发护栏：同一时间只允许一个部署
@@ -1311,7 +1359,7 @@ pub(super) async fn deploy_all(
     let root = Path::new(project_path);
     let info = crate::services::harmony::parse_project(root);
 
-    let (hap, is_signed, selection_note) = resolve_hap_for_deploy(args, root)?;
+    let (hap, is_signed, selection_note, artifact_sha256) = resolve_hap_for_deploy(args, root)?;
     ctx.emit_log("system", &selection_note);
     let bundle = info.bundle_name.clone().unwrap_or_default();
     let ability = info
@@ -1355,6 +1403,21 @@ pub(super) async fn deploy_all(
         );
     }
 
+    let recovered_successes = recovered_successful_deploy_devices(ctx, &artifact_sha256);
+    let skipped = devices
+        .iter()
+        .filter(|device| recovered_successes.contains(*device))
+        .cloned()
+        .collect::<Vec<_>>();
+    devices.retain(|device| !recovered_successes.contains(device));
+    if devices.is_empty() {
+        return Ok(format!(
+            "多设备部署恢复：当前产物 sha256={} 在所选设备上均已有成功证据，跳过重复安装：{}",
+            &artifact_sha256[..12],
+            skipped.join(", ")
+        ));
+    }
+
     let (strategy, concurrency) = multi_deploy_concurrency(args, devices.len())?;
 
     let hap = hap.clone();
@@ -1378,6 +1441,8 @@ pub(super) async fn deploy_all(
             "max_parallel": concurrency,
             "devices": devices,
             "artifact_path": hap,
+            "artifact_sha256": artifact_sha256,
+            "skipped_completed_devices": skipped,
         }),
     );
 
@@ -1412,10 +1477,13 @@ pub(super) async fn deploy_all(
     let mut ok_count = 0usize;
     let mut fail_count = 0usize;
     let mut summary = format!(
-        "多设备部署结果（共 {} 台）：\n{}\n",
-        devices.len(),
+        "多设备部署结果（本轮执行 {} 台，恢复跳过 {} 台）：\n{}\n",
+        devices.len(), skipped.len(),
         selection_note
     );
+    if !skipped.is_empty() {
+        summary.push_str(&format!("已复用同一产物的成功证据：{}\n", skipped.join(", ")));
+    }
     for item in &results {
         match item {
             (dev, Ok(msg)) => {
@@ -1443,6 +1511,8 @@ pub(super) async fn deploy_all(
             "max_parallel": concurrency,
             "succeeded": ok_count,
             "failed": fail_count,
+            "artifact_sha256": artifact_sha256,
+            "skipped_completed_devices": skipped,
             "results": results.iter().map(|(device, result)| serde_json::json!({
                 "device_id": device,
                 "status": if result.is_ok() { "completed" } else { "failed" },
@@ -2341,5 +2411,28 @@ mod build_workflow_tests {
             ("serial", 1)
         );
         assert!(multi_deploy_concurrency(&serde_json::json!({"strategy":"burst"}), 2).is_err());
+    }
+
+    #[test]
+    fn multi_device_recovery_skips_only_successes_for_the_same_artifact() {
+        let event = crate::agent::runtime::RunEvent {
+            event_id: "event-1".into(),
+            run_id: "run-1".into(),
+            conversation_id: "conversation-1".into(),
+            seq: 3,
+            event_type: "harmony.deploy.batch.completed".into(),
+            payload: serde_json::json!({
+                "artifact_sha256": "same-hash",
+                "results": [
+                    {"device_id":"device-ok","status":"completed"},
+                    {"device_id":"device-failed","status":"failed"}
+                ]
+            }),
+            created_at: 1,
+        };
+        let same = successful_deploy_devices(std::slice::from_ref(&event), "same-hash");
+        assert!(same.contains("device-ok"));
+        assert!(!same.contains("device-failed"));
+        assert!(successful_deploy_devices(&[event], "changed-hash").is_empty());
     }
 }
