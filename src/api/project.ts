@@ -334,6 +334,12 @@ export interface ConversationContextV2 {
   budget: NonNullable<ConversationContextInfo['context_v2']>['budget']
   facts_digest: string | null
   invalidation_epoch: number
+  reconciliation: {
+    count: number
+    latest_status: string | null
+    latest_conflicts: string[]
+    latest_at: number | null
+  }
   updated_at: number
 }
 

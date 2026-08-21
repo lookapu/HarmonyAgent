@@ -377,6 +377,8 @@
     "ctxV2PanelTitle": "长会话 Context V2",
     "ctxV2Goal": "目标：{{goal}}（{{state}} / {{phase}}）",
     "ctxV2Cursor": "摘要消息游标 {{from}}–{{to}}，事件游标 {{seq}}",
+    "ctxV2Reconciled": "最近摘要已按结构化事实纠偏（累计对账 {{count}} 次）",
+    "ctxV2Consistent": "最近摘要与结构化事实一致（累计对账 {{count}} 次）",
     "ctxV2Budget": "预算：热上下文 {{hot}} · 任务 {{task}} · 项目 {{project}} · 归档 {{archive}} tokens",
     "ctxV2Empty": "当前没有来源化事实或产物。",
     "ctxBudgetTitle": "上下文占用约 {{tokens}} / {{limit}} tokens（{{pct}}%）；超过 85% 将自动压缩早期消息",

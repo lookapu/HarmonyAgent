@@ -4774,6 +4774,27 @@ export default function Home() {
                             seq: ctxV2Detail.summary_event_seq,
                           })}
                         </span>
+                        {ctxV2Detail.reconciliation.count > 0 && (
+                          <span
+                            className={`mb-2 block rounded px-2 py-1 ${
+                              ctxV2Detail.reconciliation.latest_status === 'corrected'
+                                ? 'bg-[var(--warning)]/10 text-[var(--warning)]'
+                                : 'bg-[var(--success)]/10 text-[var(--success)]'
+                            }`}
+                          >
+                            {t(
+                              ctxV2Detail.reconciliation.latest_status === 'corrected'
+                                ? 'home.ctxV2Reconciled'
+                                : 'home.ctxV2Consistent',
+                              { count: ctxV2Detail.reconciliation.count },
+                            )}
+                            {ctxV2Detail.reconciliation.latest_conflicts.length > 0 && (
+                              <span className="mt-1 block break-all text-[10px]">
+                                {ctxV2Detail.reconciliation.latest_conflicts.join(' · ')}
+                              </span>
+                            )}
+                          </span>
+                        )}
                         <span className="mb-2 block">
                           {t('home.ctxV2Budget', {
                             hot: ctxV2Detail.budget.hot_tokens.toLocaleString(),

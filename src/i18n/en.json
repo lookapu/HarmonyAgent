@@ -376,6 +376,8 @@
     "ctxV2PanelTitle": "Long-session Context V2",
     "ctxV2Goal": "Goal: {{goal}} ({{state}} / {{phase}})",
     "ctxV2Cursor": "Summary messages {{from}}–{{to}}, event cursor {{seq}}",
+    "ctxV2Reconciled": "Latest summary was corrected from structured facts ({{count}} reconciliations)",
+    "ctxV2Consistent": "Latest summary matches structured facts ({{count}} reconciliations)",
     "ctxV2Budget": "Budget: hot {{hot}} · task {{task}} · project {{project}} · archive {{archive}} tokens",
     "ctxV2Empty": "No sourced facts or artifacts yet.",
     "ctxBudgetTitle": "Context ~{{tokens}} / {{limit}} tokens ({{pct}}%); early messages auto-compact above 85%",

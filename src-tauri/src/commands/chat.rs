@@ -9940,10 +9940,34 @@ async fn summarize_rolling_history(
             }
         }
     }
-    let summary = raw?.trim().chars().take(2000).collect::<String>();
+    let mut summary = raw?.trim().chars().take(2000).collect::<String>();
     if summary.is_empty() {
         None
     } else {
+        if let Ok(conn) = state.0.lock() {
+            match crate::agent::context::reconcile_summary(&conn, conversation_id, &summary) {
+                Ok(reconciled) => {
+                    if !reconciled.conflicts.is_empty() {
+                        crate::utils::logger::log_event(
+                            "context_summary_reconciled",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "status": reconciled.status,
+                                "conflicts": reconciled.conflicts,
+                            }),
+                        );
+                    }
+                    summary = reconciled.summary;
+                }
+                Err(error) => crate::utils::logger::log_event(
+                    "context_summary_reconciliation_failed",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "error": error,
+                    }),
+                ),
+            }
+        }
         Some(summary)
     }
 }
@@ -10713,6 +10737,14 @@ pub async fn compact_conversation(
             params![summary, keep as i64, now(), conversation_id],
         )
         .map_err(|e| e.to_string())?;
+        crate::agent::context::persist_runtime_checkpoint(
+            &conn,
+            &conversation_id,
+            None,
+            Some(&summary),
+            keep,
+            ctx_limit.unwrap_or(200000),
+        )?;
     }
     // 广播压缩完成：前端刷新上下文可视条（压缩不删消息，消息数不变时 effect 依赖不会触发）
     let _ = app.emit(

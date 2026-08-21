@@ -4,6 +4,8 @@
 
 待审批、计划审查和 `ask_user` 的生命周期由 `064_pending_interactions.sql` 持久化。实时回复仍通过进程内通道完成；SQLite 保存经过递归脱敏的请求载荷与回答，以及 Run、Owner、超时和终态。启动恢复仅将已经进入 `interrupted/recovery_required` 的失联 Run 所属等待标为 `interrupted`，不会自动批准，也不会中断其他健康 Worker 的等待。
 
+每次自动或手动压缩完成后，`065_context_reconciliation.sql` 保存摘要与事实对账审计。系统会在模型摘要后附加有界的“结构化事实对账”块，覆盖 Run 状态、用户约束、待确认项、文件/产物、测试/构建、Git 与设备事实；检测到摘要成功声明和失败事实冲突时记录 `corrected` 与冲突码。后续上下文以该机器生成块和来源事实为准。
+
 ## 1. 设计目标
 
 Context V2 解决三个问题：

@@ -142,6 +142,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (62, "062_tool_execution_threads", include_str!("../../migrations/062_tool_execution_threads.sql")),
     (63, "063_conversation_context_v2", include_str!("../../migrations/063_conversation_context_v2.sql")),
     (64, "064_pending_interactions", include_str!("../../migrations/064_pending_interactions.sql")),
+    (65, "065_context_reconciliation", include_str!("../../migrations/065_context_reconciliation.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -343,6 +344,15 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _migrations WHERE id=64", [], |row| row.get(0))
             .unwrap();
         assert_eq!(applied_064, 1, "重复迁移不得重复登记或破坏新表");
+        let reconciliation_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+                 AND name='conversation_context_reconciliations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reconciliation_tables, 1);
     }
 
     #[test]

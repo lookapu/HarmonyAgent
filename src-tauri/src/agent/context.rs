@@ -181,7 +181,24 @@ pub struct ConversationContextV2 {
     pub budget: ContextBudgetV2,
     pub facts_digest: Option<String>,
     pub invalidation_epoch: i64,
+    pub reconciliation: ContextReconciliationState,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SummaryReconciliation {
+    pub summary: String,
+    pub status: String,
+    pub conflicts: Vec<String>,
+    pub authoritative_block: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContextReconciliationState {
+    pub count: i64,
+    pub latest_status: Option<String>,
+    pub latest_conflicts: Vec<String>,
+    pub latest_at: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -847,6 +864,167 @@ fn active_facts_digest(conn: &Connection, conversation_id: &str) -> Result<Optio
     Ok((count > 0).then(|| format!("{:x}", hasher.finalize())))
 }
 
+/// Reconcile a model-written summary against durable facts and append a bounded,
+/// machine-generated block. Natural language can provide navigation, but this block
+/// is authoritative whenever the two disagree.
+pub fn reconcile_summary(
+    conn: &Connection,
+    conversation_id: &str,
+    summary: &str,
+) -> Result<SummaryReconciliation, String> {
+    const MARKER: &str = "【结构化事实对账（机器生成，以此为准）】";
+    let base = summary
+        .split(MARKER)
+        .next()
+        .unwrap_or(summary)
+        .trim()
+        .chars()
+        .take(1_600)
+        .collect::<String>();
+    let task = capture_task_snapshot(conn, conversation_id)?;
+    let facts = load_active_facts(conn, conversation_id, 40)?;
+    let artifacts = load_valid_artifacts(conn, conversation_id, 20)?;
+    let pending = load_hot_context(conn, conversation_id)?.pending_interactions;
+
+    let mut lines = Vec::new();
+    if !task.goal.trim().is_empty() {
+        lines.push(format!("任务状态：{} / {}；目标：{}", task.state, task.phase, task.goal));
+    }
+    if !task.constraints.is_empty() {
+        lines.push(format!("不可丢失约束：{}", task.constraints.join("；")));
+    }
+    if !pending.is_empty() {
+        lines.push(format!(
+            "仍待用户确认：{}",
+            pending
+                .iter()
+                .map(|item| format!("{}:{}", item.kind, item.request_id))
+                .collect::<Vec<_>>()
+                .join("；")
+        ));
+    }
+    for fact in facts.iter().take(20) {
+        let value: String = fact.value.to_string().chars().take(300).collect();
+        lines.push(format!(
+            "事实 {}/{}={}（{}:{}，v{}）",
+            fact.fact_kind,
+            fact.fact_key,
+            value,
+            fact.source.kind,
+            fact.source.reference,
+            fact.version
+        ));
+    }
+    if !artifacts.is_empty() {
+        lines.push(format!(
+            "有效产物：{}",
+            artifacts
+                .iter()
+                .take(12)
+                .map(|item| format!("{}:{}", item.artifact_kind, item.uri))
+                .collect::<Vec<_>>()
+                .join("；")
+        ));
+    }
+    let authoritative_block = lines.join("\n").chars().take(2_400).collect::<String>();
+
+    let lower = base.to_lowercase();
+    let contains_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+    let mut conflicts = Vec::new();
+    if !task.goal.trim().is_empty()
+        && task.state != "completed"
+        && contains_any(&["任务已完成", "全部完成", "fully completed", "task completed"])
+    {
+        conflicts.push("summary_claims_completed_but_run_is_non_terminal".into());
+    }
+    if !pending.is_empty()
+        && contains_any(&["已批准", "无需审批", "无需确认", "approval completed", "no approval"])
+    {
+        conflicts.push("summary_claims_approval_resolved_but_interaction_is_pending".into());
+    }
+    if !task.constraints.is_empty()
+        && !task.constraints.iter().any(|constraint| base.contains(constraint))
+    {
+        conflicts.push("summary_omits_durable_constraints".into());
+    }
+    for fact in &facts {
+        if fact.value["passed"].as_bool() != Some(false) {
+            continue;
+        }
+        let positive_claim = if fact.fact_key.contains("build") || fact.fact_key.contains("hvigor") {
+            contains_any(&["构建成功", "编译通过", "build passed", "build succeeded"])
+        } else if fact.fact_key.contains("test") || fact.fact_key.contains("lint") {
+            contains_any(&["测试通过", "检查通过", "tests passed", "lint passed"])
+        } else if fact.fact_kind == "device" {
+            contains_any(&["部署成功", "安装成功", "设备验证通过", "deploy succeeded"])
+        } else if fact.fact_kind == "workspace" {
+            contains_any(&["工作区干净", "无未提交", "working tree clean"])
+        } else {
+            contains_any(&["全部验证通过", "验证均成功", "all checks passed"])
+        };
+        if positive_claim {
+            conflicts.push(format!(
+                "summary_positive_claim_conflicts_with_failed_fact:{}/{}",
+                fact.fact_kind, fact.fact_key
+            ));
+        }
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    let status = if conflicts.is_empty() { "consistent" } else { "corrected" };
+    let summary = if authoritative_block.is_empty() {
+        base
+    } else {
+        format!("{base}\n\n{MARKER}\n{authoritative_block}")
+    };
+    let summary_digest = format!("{:x}", Sha256::digest(summary.as_bytes()));
+    let run_id = task.run_id.as_deref();
+    conn.execute(
+        "INSERT INTO conversation_context_reconciliations
+         (id,conversation_id,run_id,summary_digest,facts_digest,status,conflicts_json,
+          authoritative_block,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            conversation_id,
+            run_id,
+            summary_digest,
+            active_facts_digest(conn, conversation_id)?,
+            status,
+            serde_json::to_string(&conflicts).map_err(|e| e.to_string())?,
+            authoritative_block,
+            now_ms(),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    if !conflicts.is_empty()
+        && matches!(
+            task.state.as_str(),
+            "queued" | "running" | "delegated_running" | "waiting_approval" | "waiting_user" | "verifying"
+        )
+    {
+        if let Some(run_id) = run_id {
+            let _ = crate::agent::runtime::append_event(
+                conn,
+                run_id,
+                conversation_id,
+                "context.summary_reconciled",
+                serde_json::json!({
+                    "status": status,
+                    "conflicts": conflicts,
+                    "facts_digest": active_facts_digest(conn, conversation_id)?,
+                }),
+            );
+        }
+    }
+    Ok(SummaryReconciliation {
+        summary,
+        status: status.into(),
+        conflicts,
+        authoritative_block,
+    })
+}
+
 pub fn load_context_v2(
     conn: &Connection,
     conversation_id: &str,
@@ -953,7 +1131,45 @@ pub fn load_context_v2(
         budget,
         facts_digest,
         invalidation_epoch: epoch,
+        reconciliation: load_reconciliation_state(conn, conversation_id)?,
         updated_at,
+    })
+}
+
+fn load_reconciliation_state(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<ContextReconciliationState, String> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_context_reconciliations WHERE conversation_id=?1",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let latest = conn
+        .query_row(
+            "SELECT status,conflicts_json,created_at FROM conversation_context_reconciliations
+             WHERE conversation_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            [conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((status, conflicts, at)) = latest else {
+        return Ok(ContextReconciliationState { count, ..Default::default() });
+    };
+    Ok(ContextReconciliationState {
+        count,
+        latest_status: Some(status),
+        latest_conflicts: serde_json::from_str(&conflicts).unwrap_or_default(),
+        latest_at: Some(at),
     })
 }
 
@@ -1310,7 +1526,11 @@ mod tests {
              CREATE TABLE agent_runs(
                run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,goal TEXT NOT NULL,
                state TEXT NOT NULL,phase TEXT NOT NULL,goal_contract_json TEXT,error TEXT,
-               started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL
+               started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,last_event_seq INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE run_events(
+               event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,conversation_id TEXT NOT NULL,
+               seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL
              );
              CREATE TABLE execution_steps(
                step_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,conversation_id TEXT NOT NULL,
@@ -1341,6 +1561,10 @@ mod tests {
         .unwrap();
         conn.execute_batch(include_str!(
             "../../migrations/064_pending_interactions.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/065_context_reconciliation.sql"
         ))
         .unwrap();
     }
@@ -1509,6 +1733,55 @@ mod tests {
         assert!(loaded.hot.active_files.iter().any(|path| path == "src/main.ets"));
         assert_eq!(loaded.hot.pending_interactions[0].request_id, "ask-hot");
         assert!(render_context_hint(&loaded).unwrap().contains("不得被摘要覆盖"));
+    }
+
+    #[test]
+    fn summary_reconciliation_corrects_claims_that_conflict_with_failed_facts() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO agent_runs
+             (run_id,conversation_id,goal,state,phase,started_at,updated_at)
+             VALUES ('run-failed','c','修复构建','running','verifying',1,1)",
+            [],
+        )
+        .unwrap();
+        record_tool_evidence(
+            &conn,
+            "c",
+            "run-failed",
+            "build_project",
+            "{}",
+            "ArkTS compile failed",
+            false,
+        )
+        .unwrap();
+        let result = reconcile_summary(&conn, "c", "构建成功，所有工作已经完成。").unwrap();
+        assert_eq!(result.status, "corrected");
+        assert!(result.summary.contains("结构化事实对账"));
+        assert!(result.summary.contains("\"passed\":false"));
+        assert!(result.conflicts.iter().any(|item| item.contains("failed_fact")));
+        let stored: (String, String) = conn
+            .query_row(
+                "SELECT status,conflicts_json FROM conversation_context_reconciliations
+                 WHERE conversation_id='c' ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "corrected");
+        assert!(stored.1.contains("build_project"));
+        let loaded = load_context_v2(&conn, "c", 16_000).unwrap();
+        assert_eq!(loaded.reconciliation.count, 1);
+        assert_eq!(loaded.reconciliation.latest_status.as_deref(), Some("corrected"));
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_events WHERE run_id='run-failed'
+                 AND event_type='context.summary_reconciled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
     }
 
     #[test]
