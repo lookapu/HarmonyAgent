@@ -215,40 +215,26 @@ fn clean_args_tail(args: &str) -> String {
 
 /// 生成系统提示中的工具说明
 fn selected_specs(query: &str) -> Vec<&'static super::ToolSpec> {
-    const CORE: &[&str] = &[
-        "list_dir", "read_file", "find_files", "grep_files", "codebase_search",
-        "get_symbol_details", "search_symbols", "write_file", "edit_file", "multi_edit",
-        "preview_edit", "run_command", "job_list", "job_output", "job_kill", "git_status",
-        "git_diff", "todo_write", "todo_get", "ask_user", "plan_task", "update_progress",
-        "tool_list", "tool_help", "tool_history", "environment_check", "check_code",
-        "deep_scan", "ui_focus", "memorize", "run_tests", "build_generic",
-        "build_project", "review_changes",
-    ];
-    let q = query.to_lowercase();
-    let mut groups = std::collections::HashSet::new();
-    let has = |words: &[&str]| words.iter().any(|w| q.contains(w));
-    if has(&["build", "compile", "package", "构建", "编译", "依赖", "cargo", "npm", "ohpm", "hap"]) { groups.insert("build"); }
-    if has(&["deploy", "device", "install", "部署", "设备", "真机", "模拟器", "安装"]) { groups.insert("deploy"); }
-    if has(&["test", "ui", "perf", "测试", "界面", "截图", "性能", "回归"]) { groups.insert("test"); }
-    if has(&["bug", "error", "crash", "debug", "卡死", "错误", "崩溃", "日志", "修复"]) {
-        groups.insert("debug"); groups.insert("fix");
-    }
-    if has(&["git", "commit", "push", "pull", "refactor", "提交", "推送", "拉取", "重构"]) { groups.insert("refactor"); }
-    if has(&["read", "search", "inspect", "review", "检查", "查看", "搜索", "分析", "文档", "api"]) { groups.insert("explore"); }
-    if groups.is_empty() { groups.extend(["fix", "explore"]); }
-    let mut selected: Vec<&super::ToolSpec> = TOOL_SPECS
-        .iter()
-        .filter(|spec| CORE.contains(&spec.name))
-        .collect();
-    for spec in TOOL_SPECS.iter().filter(|spec| groups.contains(super::tool_group(spec.name))) {
-        if selected.len() >= 64 { break; }
-        if !selected.iter().any(|item| item.name == spec.name) { selected.push(spec); }
-    }
-    selected
+    let names = super::capabilities::selected_tool_names(query, 40);
+    names.into_iter().filter_map(|name| {
+        TOOL_SPECS.iter().find(|spec| spec.name == name)
+    }).collect()
 }
 
 pub fn system_hint_for(query: &str) -> String {
-    system_hint_from_specs(selected_specs(query).into_iter())
+    let mut hint = String::from("本轮能力包（按最小工具集执行）：\n");
+    for pack in super::capabilities::select(query) {
+        hint.push_str(&format!(
+            "- {}：顺序 {}；停止条件 {}；验收 {}\n",
+            pack.id,
+            pack.recommended_order.join(" → "),
+            pack.stop_conditions.join(" / "),
+            pack.acceptance.join(" / "),
+        ));
+    }
+    hint.push('\n');
+    hint.push_str(&system_hint_from_specs(selected_specs(query).into_iter()));
+    hint
 }
 
 fn system_hint_from_specs<'a>(specs: impl Iterator<Item = &'a super::ToolSpec>) -> String {
@@ -711,8 +697,17 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"edit_file"));
         assert!(names.contains(&"run_tests"));
-        assert!(names.len() <= 64);
+        assert!(names.len() <= 40);
         assert!(names.len() < TOOL_SPECS.len());
+    }
+
+    #[test]
+    fn system_hint_contains_selected_pack_controls() {
+        let hint = system_hint_for("构建并部署到真机");
+        assert!(hint.contains("build_deploy"));
+        assert!(hint.contains("停止条件"));
+        assert!(hint.contains("验收"));
+        assert!(hint.contains("list_devices"));
     }
 
     #[test]

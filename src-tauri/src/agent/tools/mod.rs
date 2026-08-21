@@ -12,6 +12,7 @@ mod build_tools;
 mod cmd_tools;
 mod compose_tools;
 pub mod contracts;
+pub mod capabilities;
 mod debug_tools;
 pub(crate) mod doc_tools;
 mod device_tools;
