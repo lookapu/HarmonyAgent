@@ -267,6 +267,8 @@ export default function CostPage() {
     }
   }
 
+  const latestEvalSnapshot = reliability?.latest_eval?.snapshot
+
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
@@ -450,6 +452,33 @@ export default function CostPage() {
               : t('cost.notRun')}
           </span>
         </div>
+        {latestEvalSnapshot && latestEvalSnapshot.schema_version > 0 && (
+          <div className="flex flex-wrap gap-1.5 text-[11px] text-[var(--text-muted)]">
+            <span className="badge-tone badge-tone-info">
+              {t('cost.evalDuration')} · {latestEvalSnapshot.metrics.duration_ms} ms
+            </span>
+            <span className="badge-tone badge-tone-info">
+              {t('cost.evalTools')} · {latestEvalSnapshot.tools.registry_count}
+            </span>
+            <span className="badge-tone badge-tone-info">
+              SDK · {latestEvalSnapshot.sdk.default_api ?? latestEvalSnapshot.sdk.status}
+            </span>
+            <span className="badge-tone badge-tone-info">
+              {t('cost.evalDevices')} · {latestEvalSnapshot.device_inventory.devices.length}
+            </span>
+            <span className="badge-tone badge-tone-info">
+              {t('cost.evalModel')} · {latestEvalSnapshot.model.used
+                ? latestEvalSnapshot.model.model_id
+                : t('cost.evalNotUsed')}
+            </span>
+            <span
+              className="badge-tone badge-tone-info font-mono"
+              title={latestEvalSnapshot.evidence.final_digest}
+            >
+              {t('cost.evalEvidence')} · {latestEvalSnapshot.evidence.final_digest.slice(7, 19)}
+            </span>
+          </div>
+        )}
         {(reliability?.tool_governance.length ?? 0) > 0 && (
           <div className="border-t border-[var(--border)] pt-3">
             <p className="text-xs text-[var(--text-secondary)] mb-2">{t('cost.toolGovernance')}</p>

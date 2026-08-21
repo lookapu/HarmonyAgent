@@ -152,6 +152,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (72, "072_extension_governance", include_str!("../../migrations/072_extension_governance.sql")),
     (73, "073_team_sharing", include_str!("../../migrations/073_team_sharing.sql")),
     (74, "074_reproduction_bundles", include_str!("../../migrations/074_reproduction_bundles.sql")),
+    (75, "075_eval_execution_snapshots", include_str!("../../migrations/075_eval_execution_snapshots.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -322,6 +323,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reproduction_tables, 1);
+        let eval_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(agent_eval_runs)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in ["snapshot_schema_version", "snapshot_json", "duration_ms", "evidence_digest"] {
+            assert!(eval_cols.iter().any(|x| x == c), "agent_eval_runs 迁移后缺少列 {c}");
+        }
         let queue_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(agent_task_queue)")
             .unwrap()

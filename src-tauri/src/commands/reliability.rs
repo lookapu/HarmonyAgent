@@ -281,14 +281,41 @@ pub fn update_agent_slo_policy(
 }
 
 #[tauri::command]
-pub fn run_reliability_evaluation(
-    db: State<DbState>,
+pub async fn run_reliability_evaluation(
+    db: State<'_, DbState>,
     threshold: Option<f64>,
 ) -> Result<crate::agent::evals::EvalRun, String> {
+    let started = std::time::Instant::now();
+    let env = tokio::task::spawn_blocking(crate::services::harmony_env::detect_auto)
+        .await
+        .map_err(|error| error.to_string())?;
+    let devices = crate::commands::devices::list_devices()
+        .await
+        .map(|devices| {
+            devices
+                .into_iter()
+                .map(|device| crate::agent::evals::EvalDeviceSnapshot {
+                    id_digest: crate::agent::evals::hash_device_id(&device.id),
+                    connection: device.connection,
+                    authorized: device.authorized,
+                    model: device.model,
+                    os_version: device.os_version,
+                    api_level: device.api_level,
+                    architecture: device.architecture,
+                    capabilities: device.capabilities,
+                })
+                .collect()
+        });
+    let mut snapshot = crate::agent::evals::default_execution_snapshot();
+    snapshot.sdk = crate::agent::evals::sdk_snapshot(&env);
+    snapshot.device_inventory = crate::agent::evals::device_snapshot(devices);
+    let preparation_duration_ms = started.elapsed().as_millis() as u64;
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    crate::agent::evals::run_suite(
+    crate::agent::evals::run_suite_with_snapshot(
         Some(&conn),
         threshold.unwrap_or(crate::agent::evals::DEFAULT_RELIABILITY_THRESHOLD),
+        snapshot,
+        preparation_duration_ms,
     )
 }
 
@@ -440,13 +467,15 @@ fn latest_eval(
 ) -> Result<Option<crate::agent::evals::EvalRun>, String> {
     use rusqlite::OptionalExtension;
     conn.query_row(
-        "SELECT eval_run_id,suite,platform,passed,total_cases,passed_cases,score,threshold,results_json,created_at
+        "SELECT eval_run_id,suite,platform,passed,total_cases,passed_cases,score,threshold,results_json,created_at,snapshot_json
          FROM agent_eval_runs ORDER BY created_at DESC LIMIT 1", [], |row| {
             let raw: String = row.get(8)?;
+            let snapshot_raw: String = row.get(10)?;
             Ok(crate::agent::evals::EvalRun {
                 eval_run_id: row.get(0)?, suite: row.get(1)?, platform: row.get(2)?, passed: row.get(3)?,
                 total_cases: row.get::<_, i64>(4)? as usize, passed_cases: row.get::<_, i64>(5)? as usize,
                 score: row.get(6)?, threshold: row.get(7)?, results: serde_json::from_str(&raw).unwrap_or_default(),
+                snapshot: serde_json::from_str(&snapshot_raw).unwrap_or_default(),
                 created_at: row.get(9)?,
             })
         },

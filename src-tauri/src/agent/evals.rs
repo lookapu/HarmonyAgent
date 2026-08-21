@@ -3,8 +3,101 @@
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::time::Instant;
 
 pub const DEFAULT_RELIABILITY_THRESHOLD: f64 = 0.95;
+pub const EVAL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalModelSnapshot {
+    pub used: bool,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub protocol: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalPromptSnapshot {
+    pub used: bool,
+    pub profile_version: String,
+    pub digest: String,
+    pub content_included: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalToolSnapshot {
+    pub registry_version: String,
+    pub registry_count: usize,
+    pub registry_digest: String,
+    pub external_calls: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalSdkVariantSnapshot {
+    pub variant: String,
+    pub api_version: Option<String>,
+    pub component_versions: Vec<String>,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalSdkSnapshot {
+    pub status: String,
+    pub source: String,
+    pub default_api: Option<String>,
+    pub variants: Vec<EvalSdkVariantSnapshot>,
+    pub has_hdc: bool,
+    pub has_ohpm: bool,
+    pub has_hvigorw: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalDeviceSnapshot {
+    pub id_digest: String,
+    pub connection: String,
+    pub authorized: bool,
+    pub model: String,
+    pub os_version: String,
+    pub api_level: Option<i64>,
+    pub architecture: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalDeviceInventorySnapshot {
+    pub status: String,
+    pub error: Option<String>,
+    pub devices: Vec<EvalDeviceSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalMetricsSnapshot {
+    pub duration_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_cny: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalEvidenceSnapshot {
+    pub passed_case_digests: Vec<String>,
+    pub failed_case_digests: Vec<String>,
+    pub final_digest: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalExecutionSnapshot {
+    pub schema_version: u32,
+    pub producer_version: String,
+    pub model: EvalModelSnapshot,
+    pub prompt: EvalPromptSnapshot,
+    pub tools: EvalToolSnapshot,
+    pub sdk: EvalSdkSnapshot,
+    pub device_inventory: EvalDeviceInventorySnapshot,
+    pub metrics: EvalMetricsSnapshot,
+    pub evidence: EvalEvidenceSnapshot,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReliabilityScenario {
@@ -33,7 +126,124 @@ pub struct EvalRun {
     pub score: f64,
     pub threshold: f64,
     pub results: Vec<EvalCaseResult>,
+    pub snapshot: EvalExecutionSnapshot,
     pub created_at: i64,
+}
+
+fn sha256(value: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(value))
+}
+
+fn tool_snapshot() -> EvalToolSnapshot {
+    let canonical = crate::agent::tools::TOOL_SPECS
+        .iter()
+        .map(|spec| format!("{}\n{}", spec.name, spec.desc))
+        .collect::<Vec<_>>()
+        .join("\n--\n");
+    EvalToolSnapshot {
+        registry_version: env!("CARGO_PKG_VERSION").into(),
+        registry_count: crate::agent::tools::TOOL_SPECS.len(),
+        registry_digest: sha256(canonical.as_bytes()),
+        external_calls: 0,
+    }
+}
+
+pub fn sdk_snapshot(env: &crate::services::harmony_env::HarmonyEnv) -> EvalSdkSnapshot {
+    let variants = env
+        .sdk_variants
+        .iter()
+        .map(|variant| EvalSdkVariantSnapshot {
+            variant: variant.variant.clone(),
+            api_version: variant.api_version.clone(),
+            component_versions: variant
+                .components
+                .iter()
+                .map(|component| {
+                    format!(
+                        "{}:{}:{}",
+                        component.name,
+                        component.api_version,
+                        component.version.as_deref().unwrap_or("unknown")
+                    )
+                })
+                .collect(),
+            is_default: variant.is_default,
+        })
+        .collect::<Vec<_>>();
+    EvalSdkSnapshot {
+        status: if variants.is_empty() {
+            "unavailable"
+        } else {
+            "available"
+        }
+        .into(),
+        source: env.source.clone(),
+        default_api: env.default_api.clone(),
+        variants,
+        has_hdc: env.hdc_path.is_some(),
+        has_ohpm: env.ohpm_path.is_some(),
+        has_hvigorw: env.hvigorw_path.is_some(),
+    }
+}
+
+pub fn device_snapshot(
+    devices: Result<Vec<EvalDeviceSnapshot>, String>,
+) -> EvalDeviceInventorySnapshot {
+    match devices {
+        Ok(mut devices) => {
+            devices.truncate(20);
+            EvalDeviceInventorySnapshot {
+                status: if devices.is_empty() {
+                    "none"
+                } else {
+                    "available"
+                }
+                .into(),
+                error: None,
+                devices,
+            }
+        }
+        Err(error) => EvalDeviceInventorySnapshot {
+            status: "unavailable".into(),
+            error: Some(
+                crate::utils::redact::redact_text(&error)
+                    .chars()
+                    .take(240)
+                    .collect(),
+            ),
+            devices: Vec::new(),
+        },
+    }
+}
+
+pub fn hash_device_id(id: &str) -> String {
+    sha256(id.as_bytes())
+}
+
+pub fn default_execution_snapshot() -> EvalExecutionSnapshot {
+    let profile = "agent_harmony_fixed_v3:no_model:v1";
+    EvalExecutionSnapshot {
+        schema_version: EVAL_SNAPSHOT_SCHEMA_VERSION,
+        producer_version: env!("CARGO_PKG_VERSION").into(),
+        model: EvalModelSnapshot::default(),
+        prompt: EvalPromptSnapshot {
+            used: false,
+            profile_version: "fixed_eval_no_model_v1".into(),
+            digest: sha256(profile.as_bytes()),
+            content_included: false,
+        },
+        tools: tool_snapshot(),
+        sdk: EvalSdkSnapshot {
+            status: "not_probed".into(),
+            ..Default::default()
+        },
+        device_inventory: EvalDeviceInventorySnapshot {
+            status: "not_probed".into(),
+            ..Default::default()
+        },
+        metrics: EvalMetricsSnapshot::default(),
+        evidence: EvalEvidenceSnapshot::default(),
+    }
 }
 
 pub fn scenarios() -> Vec<ReliabilityScenario> {
@@ -51,6 +261,16 @@ pub fn scenarios() -> Vec<ReliabilityScenario> {
 }
 
 pub fn run_suite(conn: Option<&Connection>, threshold: f64) -> Result<EvalRun, String> {
+    run_suite_with_snapshot(conn, threshold, default_execution_snapshot(), 0)
+}
+
+pub fn run_suite_with_snapshot(
+    conn: Option<&Connection>,
+    threshold: f64,
+    mut snapshot: EvalExecutionSnapshot,
+    preparation_duration_ms: u64,
+) -> Result<EvalRun, String> {
+    let started = Instant::now();
     let threshold = threshold.clamp(0.0, 1.0);
     let results = scenarios()
         .into_iter()
@@ -72,6 +292,28 @@ pub fn run_suite(conn: Option<&Connection>, threshold: f64) -> Result<EvalRun, S
         passed_cases as f64 / results.len() as f64
     };
     let created_at = chrono::Utc::now().timestamp_millis();
+    snapshot.metrics.duration_ms =
+        preparation_duration_ms.saturating_add(started.elapsed().as_millis() as u64);
+    let mut evidence = EvalEvidenceSnapshot::default();
+    for result in &results {
+        let digest = sha256(serde_json::to_string(result).unwrap_or_default().as_bytes());
+        if result.passed {
+            evidence.passed_case_digests.push(digest);
+        } else {
+            evidence.failed_case_digests.push(digest);
+        }
+    }
+    let final_material = serde_json::json!({
+        "suite": "agent_harmony_fixed_v3", "platform": std::env::consts::OS,
+        "score": score, "threshold": threshold, "results": results,
+        "execution_snapshot": &snapshot,
+    });
+    evidence.final_digest = sha256(
+        serde_json::to_vec(&final_material)
+            .unwrap_or_default()
+            .as_slice(),
+    );
+    snapshot.evidence = evidence;
     let run = EvalRun {
         eval_run_id: uuid::Uuid::new_v4().to_string(),
         suite: "agent_harmony_fixed_v3".into(),
@@ -82,15 +324,18 @@ pub fn run_suite(conn: Option<&Connection>, threshold: f64) -> Result<EvalRun, S
         score,
         threshold,
         results,
+        snapshot,
         created_at,
     };
     if let Some(conn) = conn {
         conn.execute(
             "INSERT INTO agent_eval_runs
-             (eval_run_id,suite,platform,passed,total_cases,passed_cases,score,threshold,results_json,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             (eval_run_id,suite,platform,passed,total_cases,passed_cases,score,threshold,results_json,created_at,snapshot_schema_version,snapshot_json,duration_ms,evidence_digest)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![run.eval_run_id, run.suite, run.platform, run.passed, run.total_cases as i64,
-                run.passed_cases as i64, run.score, run.threshold, serde_json::to_string(&run.results).unwrap_or_default(), run.created_at],
+                run.passed_cases as i64, run.score, run.threshold, serde_json::to_string(&run.results).unwrap_or_default(), run.created_at,
+                run.snapshot.schema_version, serde_json::to_string(&run.snapshot).unwrap_or_default(),
+                run.snapshot.metrics.duration_ms as i64, run.snapshot.evidence.final_digest],
         ).map_err(|e| e.to_string())?;
     }
     Ok(run)
@@ -628,6 +873,18 @@ mod tests {
                 >= 8
         );
         assert!(run.total_cases >= 26);
+        assert_eq!(run.snapshot.schema_version, EVAL_SNAPSHOT_SCHEMA_VERSION);
+        assert!(!run.snapshot.model.used);
+        assert!(!run.snapshot.prompt.used);
+        assert_eq!(run.snapshot.metrics.input_tokens, 0);
+        assert_eq!(run.snapshot.metrics.output_tokens, 0);
+        assert_eq!(run.snapshot.metrics.cost_cny, 0.0);
+        assert_eq!(run.snapshot.tools.external_calls, 0);
+        assert_eq!(
+            run.snapshot.evidence.passed_case_digests.len(),
+            run.total_cases
+        );
+        assert!(run.snapshot.evidence.final_digest.starts_with("sha256:"));
         for domain in [
             "new_project",
             "compile_repair",
@@ -645,5 +902,43 @@ mod tests {
     #[test]
     fn unknown_scenario_fails_closed() {
         assert_eq!(disposition_for_id("new_unhandled_failure"), None);
+    }
+
+    #[test]
+    fn environment_snapshot_omits_paths_and_hashes_device_ids() {
+        let env = crate::services::harmony_env::HarmonyEnv {
+            sdk_root: Some("/private/sdk".into()),
+            default_api: Some("14".into()),
+            sdk_variants: vec![crate::services::harmony_env::SdkVariant {
+                variant: "hms".into(),
+                path: "/private/sdk/hms".into(),
+                components: vec![crate::services::harmony_env::SdkComponent {
+                    name: "ets".into(),
+                    api_version: "14".into(),
+                    version: Some("5.0.0.1".into()),
+                    path: "/private/sdk/hms/ets".into(),
+                    api_dir: Some("/private/sdk/hms/ets/api".into()),
+                }],
+                api_version: Some("14".into()),
+                is_default: true,
+            }],
+            sdk_versions: vec!["14".into()],
+            cli: None,
+            hdc_path: Some("/private/hdc".into()),
+            hdc_source: Some("sdk".into()),
+            ohpm_path: None,
+            hvigorw_path: None,
+            studio_dir: Some("/private/studio".into()),
+            source: "auto".into(),
+            suggestions: vec!["/private/suggestion".into()],
+        };
+        let snapshot = sdk_snapshot(&env);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("/private/"));
+        assert_eq!(snapshot.default_api.as_deref(), Some("14"));
+
+        let digest = hash_device_id("192.0.2.10:5555");
+        assert!(digest.starts_with("sha256:"));
+        assert!(!digest.contains("192.0.2.10"));
     }
 }

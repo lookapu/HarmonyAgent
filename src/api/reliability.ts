@@ -23,7 +23,41 @@ export interface EvalRun {
   score: number
   threshold: number
   results: EvalCaseResult[]
+  snapshot: EvalExecutionSnapshot
   created_at: number
+}
+
+export interface EvalExecutionSnapshot {
+  schema_version: number
+  producer_version: string
+  model: { used: boolean; provider_id: string | null; model_id: string | null; protocol: string | null }
+  prompt: { used: boolean; profile_version: string; digest: string; content_included: boolean }
+  tools: { registry_version: string; registry_count: number; registry_digest: string; external_calls: number }
+  sdk: {
+    status: string
+    source: string
+    default_api: string | null
+    variants: Array<{ variant: string; api_version: string | null; component_versions: string[]; is_default: boolean }>
+    has_hdc: boolean
+    has_ohpm: boolean
+    has_hvigorw: boolean
+  }
+  device_inventory: {
+    status: string
+    error: string | null
+    devices: Array<{
+      id_digest: string
+      connection: string
+      authorized: boolean
+      model: string
+      os_version: string
+      api_level: number | null
+      architecture: string
+      capabilities: string[]
+    }>
+  }
+  metrics: { duration_ms: number; input_tokens: number; output_tokens: number; cost_cny: number }
+  evidence: { passed_case_digests: string[]; failed_case_digests: string[]; final_digest: string }
 }
 
 export interface QualityRunRow {
