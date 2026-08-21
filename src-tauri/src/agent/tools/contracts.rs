@@ -28,6 +28,28 @@ pub enum RecoveryPolicy {
     Manual,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdempotencyKind {
+    Natural,
+    Keyed,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationMode {
+    Cooperative,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    None,
+    ProjectTrust,
+    Always,
+}
+
 impl RecoveryPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -43,6 +65,10 @@ pub struct ToolContract {
     pub effect: EffectKind,
     pub recovery: RecoveryPolicy,
     pub retry_safe: bool,
+    pub idempotency: IdempotencyKind,
+    pub timeout_ms: u64,
+    pub cancellation: CancellationMode,
+    pub approval: ApprovalPolicy,
 }
 
 const MANUAL_RECOVERY: &[&str] = &[
@@ -65,33 +91,61 @@ const MANUAL_RECOVERY: &[&str] = &[
 
 /// 只从注册表的结构化约定派生契约。未知/MCP 工具默认按写入处理，禁止自动重放。
 pub fn contract(tool: &str) -> ToolContract {
-    if MANUAL_RECOVERY.contains(&tool) {
-        return ToolContract {
-            effect: EffectKind::Destructive,
-            recovery: RecoveryPolicy::Manual,
-            retry_safe: false,
-        };
-    }
-    let declared_read_only = !tool.starts_with("mcp__")
-        && super::TOOL_SPECS
-            .iter()
-            .find(|spec| spec.name == tool)
-            .and_then(|spec| spec.desc.split("副作用：").nth(1))
-            .map(str::trim_start)
-            .is_some_and(|side_effect| side_effect.starts_with('无'));
-    if declared_read_only {
-        ToolContract {
-            effect: EffectKind::Read,
-            recovery: RecoveryPolicy::Replay,
-            retry_safe: retry_allowlist(tool),
-        }
+    let (effect, recovery, retry_safe, idempotency) = if MANUAL_RECOVERY.contains(&tool) {
+        (
+            EffectKind::Destructive,
+            RecoveryPolicy::Manual,
+            false,
+            IdempotencyKind::None,
+        )
     } else {
-        ToolContract {
-            effect: EffectKind::Write,
-            recovery: RecoveryPolicy::Verify,
-            retry_safe: false,
+        let declared_read_only = !tool.starts_with("mcp__")
+            && super::TOOL_SPECS
+                .iter()
+                .find(|spec| spec.name == tool)
+                .and_then(|spec| spec.desc.split("副作用：").nth(1))
+                .map(str::trim_start)
+                .is_some_and(|side_effect| side_effect.starts_with('无'));
+        if declared_read_only {
+            (
+                EffectKind::Read,
+                RecoveryPolicy::Replay,
+                retry_allowlist(tool),
+                IdempotencyKind::Natural,
+            )
+        } else {
+            (
+                EffectKind::Write,
+                RecoveryPolicy::Verify,
+                false,
+                IdempotencyKind::Keyed,
+            )
         }
+    };
+    let approval = match crate::services::permissions::tool_level(tool) {
+        crate::services::permissions::Level::L0 => ApprovalPolicy::None,
+        crate::services::permissions::Level::L1 => ApprovalPolicy::ProjectTrust,
+        crate::services::permissions::Level::L2 => ApprovalPolicy::Always,
+    };
+    ToolContract {
+        effect,
+        recovery,
+        retry_safe,
+        idempotency,
+        timeout_ms: timeout_ms(tool),
+        cancellation: CancellationMode::Cooperative,
+        approval,
     }
+}
+
+fn timeout_ms(tool: &str) -> u64 {
+    let seconds = match tool {
+        "build_project" | "deploy" | "deploy_all" | "run_tests" | "flaky_test_detect"
+        | "build_generic" | "run_perf_benchmark" | "auto_explore" => 15 * 60,
+        "spawn_agents" => 20 * 60,
+        _ => 3 * 60,
+    };
+    seconds * 1000
 }
 
 /// 网络/设备查询并非都适合自动重试；保留经过验证的幂等白名单，但由契约统一暴露。
@@ -136,6 +190,8 @@ mod tests {
         assert_eq!(contract("run_command").recovery, RecoveryPolicy::Manual);
         assert_eq!(contract("secret_delete").recovery, RecoveryPolicy::Manual);
         assert_eq!(contract("mcp__unknown").effect, EffectKind::Write);
+        assert_eq!(contract("mcp__unknown").approval, ApprovalPolicy::Always);
+        assert_eq!(contract("mcp__unknown").idempotency, IdempotencyKind::Keyed);
     }
 
     #[test]
@@ -154,6 +210,20 @@ mod tests {
                     spec.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_registered_tool_has_complete_execution_metadata() {
+        for spec in super::super::TOOL_SPECS {
+            let value = serde_json::to_value(contract(spec.name)).unwrap();
+            for field in [
+                "effect", "recovery", "retry_safe", "idempotency", "timeout_ms",
+                "cancellation", "approval",
+            ] {
+                assert!(value.get(field).is_some(), "{} 缺少 {field}", spec.name);
+            }
+            assert!(value["timeout_ms"].as_u64().unwrap_or(0) > 0);
         }
     }
 }

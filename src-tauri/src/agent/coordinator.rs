@@ -420,7 +420,9 @@ pub fn list_steps(conn: &Connection, run_id: &str) -> Result<Vec<ExecutionStep>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::tools::contracts::{EffectKind, RecoveryPolicy};
+    use crate::agent::tools::contracts::{
+        ApprovalPolicy, CancellationMode, EffectKind, IdempotencyKind, RecoveryPolicy,
+    };
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -443,6 +445,10 @@ mod tests {
             },
             recovery,
             retry_safe: false,
+            idempotency: IdempotencyKind::Keyed,
+            timeout_ms: 180_000,
+            cancellation: CancellationMode::Cooperative,
+            approval: ApprovalPolicy::ProjectTrust,
         }
     }
 

@@ -8693,20 +8693,16 @@ const MAX_TOOL_CONCURRENCY: usize = 4;
 /// 超时按可重试错误处理（is_retryable_err 识别“超时”），由上层退避重试。
 /// 注：长任务工具（build/deploy/run_command）内部自有更细的超时与后台任务机制，
 /// 此值是“最终安全阀”，设得足够大不影响正常长工具。
-const TOOL_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
 fn tool_exec_timeout(tool: &str, args_raw: &str) -> std::time::Duration {
     let requested = serde_json::from_str::<serde_json::Value>(args_raw)
         .ok()
         .and_then(|v| v.get("timeout").and_then(|n| n.as_u64()))
         .unwrap_or(0);
-    let secs = match tool {
-        // 这些工具内部已有进程树终止与细粒度超时；外层只做更宽的最终保险丝。
-        "build_project" | "deploy" | "deploy_all" | "run_tests" | "flaky_test_detect"
-        | "build_generic" | "run_perf_benchmark" | "auto_explore" => 15 * 60,
-        "run_command" | "sandbox_exec" => requested.saturating_add(30).clamp(180, 15 * 60),
-        "spawn_agents" => 20 * 60,
-        _ => TOOL_EXEC_TIMEOUT.as_secs(),
+    let declared = crate::agent::tools::contracts::contract(tool).timeout_ms / 1000;
+    let secs = if matches!(tool, "run_command" | "sandbox_exec") {
+        requested.saturating_add(30).clamp(declared, 15 * 60)
+    } else {
+        declared
     };
     std::time::Duration::from_secs(secs)
 }

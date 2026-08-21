@@ -94,6 +94,7 @@ pub(super) async fn tool_help(args: &Value, _roots: &[String]) -> Result<String,
         return Err(format!("未找到工具 \"{name}\"。可用 tool_list 查看全部工具清单。"));
     };
     let level = crate::services::permissions::tool_level(name).as_str();
+    let contract = crate::agent::tools::contracts::contract(name);
     let mut out = format!("【{name}】{}\n", t.desc);
     out.push_str(&format!("任务分组：{}\n", super::tool_group(name)));
     out.push_str(&format!("权限级别：{}（{}）\n", level,
@@ -106,6 +107,11 @@ pub(super) async fn tool_help(args: &Value, _roots: &[String]) -> Result<String,
     if !meta.is_empty() {
         out.push_str(&format!("执行预期：{}\n", meta));
     }
+    out.push_str(&format!(
+        "执行契约：副作用={:?} / 幂等={:?} / 超时={}ms / 取消={:?} / 重试安全={} / 审批={:?} / 恢复={:?}\n",
+        contract.effect, contract.idempotency, contract.timeout_ms, contract.cancellation,
+        contract.retry_safe, contract.approval, contract.recovery,
+    ));
     // 参数提示：从 desc 中的 JSON 示例提取（若描述里给了 { ... } 片段）
     if let Some(start) = t.desc.find('{') {
         let mut depth = 0;
@@ -1513,6 +1519,7 @@ pub(super) async fn export_tools_meta(args: &Value, roots: &[String]) -> Result<
         .iter()
         .map(|t| {
             let meta = meta_for(t.name);
+            let contract = crate::agent::tools::contracts::contract(t.name);
             serde_json::json!({
                 "name": t.name,
                 "desc": t.desc,
@@ -1521,6 +1528,7 @@ pub(super) async fn export_tools_meta(args: &Value, roots: &[String]) -> Result<
                 "timeout_hint": meta.map(|m| m.timeout_hint).unwrap_or(""),
                 "retry_policy": meta.map(|m| m.retry_policy).unwrap_or(""),
                 "cost_hint": meta.map(|m| m.cost_hint).unwrap_or(""),
+                "contract": contract,
             })
         })
         .collect();
@@ -1534,5 +1542,4 @@ pub(super) async fn export_tools_meta(args: &Value, roots: &[String]) -> Result<
     std::fs::write(&out_path, text).map_err(|e| format!("写入失败：{e}"))?;
     Ok(format!("已导出 {} 个工具元数据 → {}", tools.len(), out_path.display()))
 }
-
 
