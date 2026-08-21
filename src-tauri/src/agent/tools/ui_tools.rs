@@ -27,25 +27,29 @@ pub(super) async fn resolve_authorized_device(requested: Option<&str>, capabilit
 /// 性能基准快照（同设备同应用对比用）。
 #[derive(Clone)]
 struct BenchSnapshot {
+    startup_ms: Option<f64>,
     cpu: f64,
     pss: f64,
     sys_cpu: f64,
     temp: f64,
     fps: Option<f64>,
+    battery_delta: Option<f64>,
+    package_bytes: Option<u64>,
 }
 
 static BENCH_STORE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, BenchSnapshot>>> = std::sync::OnceLock::new();
 
 /// run_perf_benchmark：运行操作流程 + 采样性能，与上一次基准做差值对比。
-pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn run_perf_benchmark(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法运行性能基准".into());
     }
-    let device = match args["device"].as_str() {
-        Some(d) => d.to_string(),
-        None => default_device_id().await?,
-    };
+    let device = resolve_authorized_device(args["device"].as_str(), "ability").await?;
     let bundle = match args["package"].as_str() {
         Some(p) => p.to_string(),
         None => crate::services::harmony::parse_project(Path::new(project_path)).bundle_name.unwrap_or_default(),
@@ -53,11 +57,25 @@ pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result
     let label = args["label"].as_str().unwrap_or("").trim().to_string();
     let seconds = args["seconds"].as_u64().unwrap_or(6).clamp(3, 30) as usize;
 
+    let ability = crate::services::harmony::parse_project(Path::new(project_path))
+        .main_element
+        .unwrap_or_else(|| "EntryAbility".into());
+    let startup_ms = if !bundle.is_empty() && args["measure_startup"].as_bool().unwrap_or(true) {
+        measure_startup(&device, &bundle, &ability).await.ok()
+    } else {
+        None
+    };
+    let battery_before = sample_battery_percent(&device).await.ok();
+    let package_bytes = benchmark_package_bytes(args, Path::new(project_path));
+
     // 1. 可选：先跑一遍 UI 操作流程（让应用进入被测状态）
     let mut flow_report = String::new();
     if let Some(steps) = args["steps"].as_array() {
         if !steps.is_empty() {
             flow_report = super::test_tools::execute_ui_steps(&device, steps).await.join("\n");
+            if flow_report.contains("→ 失败") {
+                return Err(format!("性能基准的前置 UI 流程失败，已停止采样：\n{flow_report}"));
+            }
         }
     }
 
@@ -93,13 +111,18 @@ pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result
 
     // 3. FPS（尽力而为，设备/系统不支持时跳过）
     let fps = sample_fps(&device).await.ok();
+    let battery_after = sample_battery_percent(&device).await.ok();
+    let battery_delta = battery_before.zip(battery_after).map(|(before, after)| after - before);
 
     let snap = BenchSnapshot {
+        startup_ms,
         cpu: mean(&proc_cpu),
         pss: mean(&pss_vals),
         sys_cpu: mean(&sys_cpu),
         temp: mean(&temp_vals),
         fps,
+        battery_delta,
+        package_bytes,
     };
 
     // 4. 读取上一次基准并写入本次（同锁内读改写，并发 benchmark 不会覆盖彼此基准）
@@ -120,6 +143,10 @@ pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result
     }
     if !bundle.is_empty() {
         out.push_str(&format!("- 应用包名：{bundle}\n"));
+    }
+    match snap.startup_ms {
+        Some(value) => out.push_str(&format!("- 冷启动状态确认：{value:.0}ms\n")),
+        None => out.push_str("- 冷启动状态确认：不可用\n"),
     }
     // 均值/峰值展示：采样为空时显示「不可用」，避免把无数据误导成 0%
     let fmt_avg = |v: &[f64], unit: &str| -> String {
@@ -152,6 +179,14 @@ pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result
         Some(f) => out.push_str(&format!("- FPS：{f:.1}\n")),
         None => out.push_str("- FPS：无法采集（设备不支持 hidumper RenderService）\n"),
     }
+    match snap.battery_delta {
+        Some(value) => out.push_str(&format!("- 采样窗口电量变化：{value:+.1}%\n")),
+        None => out.push_str("- 采样窗口电量变化：不可用\n"),
+    }
+    match snap.package_bytes {
+        Some(value) => out.push_str(&format!("- HAP 文件大小：{}\n", format_bytes(value))),
+        None => out.push_str("- HAP 文件大小：不可用（未能唯一选择产物）\n"),
+    }
 
     if let Some(p) = &prev {
         out.push_str("\n与上次基准对比（Δ = 本次 − 上次）：\n");
@@ -161,6 +196,12 @@ pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result
         out.push_str(&format!("- 设备温度：{:.1}℃ → {:.1}℃（{:+.1}℃）\n", p.temp, snap.temp, snap.temp - p.temp));
         if let (Some(pf), Some(sf)) = (p.fps, snap.fps) {
             out.push_str(&format!("- FPS：{pf:.1} → {sf:.1}（{:+}）\n", sf - pf));
+        }
+        if let (Some(before), Some(after)) = (p.startup_ms, snap.startup_ms) {
+            out.push_str(&format!("- 启动：{before:.0}ms → {after:.0}ms（{:+.0}ms）\n", after - before));
+        }
+        if let (Some(before), Some(after)) = (p.package_bytes, snap.package_bytes) {
+            out.push_str(&format!("- HAP：{} → {}（{:+} bytes）\n", format_bytes(before), format_bytes(after), after as i128 - before as i128));
         }
         let mut verdict = Vec::new();
         if snap.cpu - p.cpu > 15.0 {
@@ -176,6 +217,12 @@ pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result
         if snap.temp - p.temp > 3.0 {
             verdict.push("温度明显上升，关注发热");
         }
+        if p.startup_ms.zip(snap.startup_ms).is_some_and(|(before, after)| after - before > 300.0) {
+            verdict.push("启动状态确认变慢超过 300ms");
+        }
+        if p.package_bytes.zip(snap.package_bytes).is_some_and(|(before, after)| after > before + 512 * 1024) {
+            verdict.push("HAP 增长超过 512KB");
+        }
         if verdict.is_empty() {
             verdict.push("各项指标变化在噪声范围内，未见明显回归");
         }
@@ -183,7 +230,81 @@ pub(super) async fn run_perf_benchmark(args: &Value, roots: &[String]) -> Result
     } else {
         out.push_str("\n（首次基准，已记录；再跑一次可自动对比前后变化）\n");
     }
+    ctx.record_run_event(
+        "harmony.performance.measured",
+        serde_json::json!({
+            "project_path": project_path,
+            "device_id": device,
+            "bundle": bundle,
+            "label": label,
+            "samples": samples,
+            "startup_ms": snap.startup_ms,
+            "app_cpu_avg": snap.cpu,
+            "app_cpu_peak": (!proc_cpu.is_empty()).then(|| max_of(&proc_cpu)),
+            "app_pss_mb": snap.pss,
+            "app_pss_peak_mb": (!pss_vals.is_empty()).then(|| max_of(&pss_vals)),
+            "system_cpu_avg": snap.sys_cpu,
+            "system_memory_avg": (!sys_mem.is_empty()).then(|| mean(&sys_mem)),
+            "temperature_c": snap.temp,
+            "fps": snap.fps,
+            "battery_delta_percent": snap.battery_delta,
+            "package_bytes": snap.package_bytes,
+        }),
+    );
     Ok(out)
+}
+
+async fn measure_startup(device: &str, bundle: &str, ability: &str) -> Result<f64, String> {
+    let _ = run_hdc_shell(device, &["aa", "force-stop", bundle], 20).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    run_hdc_shell(device, &["aa", "start", "-b", bundle, "-a", ability], 30).await?;
+    for _ in 0..40 {
+        if run_hdc_shell(device, &["aa", "dump", "-l"], 10)
+            .await
+            .is_ok_and(|dump| dump.contains(bundle))
+        {
+            return Ok(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err("10 秒内未观察到 Ability 状态".into())
+}
+
+async fn sample_battery_percent(device: &str) -> Result<f64, String> {
+    let output = run_hdc_shell(device, &["hidumper", "-s", "BatteryService", "-a", "-i"], 20).await?;
+    parse_battery_percent(&output).ok_or_else(|| "未读取到有效电量".into())
+}
+
+fn parse_battery_percent(output: &str) -> Option<f64> {
+    output
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "capacity").then(|| value.trim().parse::<f64>().ok()).flatten()
+        })
+        .filter(|value| (0.0..=100.0).contains(value))
+}
+
+fn benchmark_package_bytes(args: &Value, root: &Path) -> Option<u64> {
+    let canonical_root = root.canonicalize().ok()?;
+    let path = if let Some(raw) = args["hap"].as_str().map(str::trim).filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() { path } else { root.join(path) }
+    } else {
+        crate::services::harmony_build::select_deploy_artifact(
+            root,
+            args["product"].as_str(),
+            args["module"].as_str(),
+        )
+        .ok()?
+        .absolute_path
+    };
+    let canonical_path = path.canonicalize().ok()?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return None;
+    }
+    std::fs::metadata(canonical_path).ok().map(|metadata| metadata.len())
 }
 
 /// 采样当前窗口 FPS（hidumper RenderService fps），不支持时返回 Err。
@@ -228,6 +349,22 @@ pub(super) fn first_number(s: &str) -> Option<f64> {
 
 pub(super) fn max_of(vals: &[f64]) -> f64 {
     vals.iter().cloned().fold(0.0f64, f64::max)
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::parse_battery_percent;
+
+    #[test]
+    fn parses_battery_capacity() {
+        assert_eq!(parse_battery_percent("BatteryService:\n  capacity: 87\n"), Some(87.0));
+    }
+
+    #[test]
+    fn rejects_invalid_battery_capacity() {
+        assert_eq!(parse_battery_percent("capacity: 101\n"), None);
+        assert_eq!(parse_battery_percent("capacity: unknown\n"), None);
+    }
 }
 
 // ---------- UI 控件树 / 启动 Ability / 应用数据清理 / 内存分析 / 应用查询 / 卸载 / 权限 / 网络 / 录屏 ----------

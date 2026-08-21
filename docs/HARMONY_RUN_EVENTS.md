@@ -17,6 +17,7 @@ HarmonyOS 不维护独立于 Agent 的“第二套 Run”。构建、部署和�
 | `harmony.deploy.batch.started` | 多设备策略、并发上限、确定性设备集合和 HAP |
 | `harmony.deploy.batch.completed` | 每台设备的独立终态与有界摘要、成功/失败计数 |
 | `harmony.ui_flow.completed` | 设备、步骤/断言数量、真实终态、UI 树和截图证据路径 |
+| `harmony.performance.measured` | 设备、应用、标签、采样数、启动、CPU/内存均值与峰值、电量、温度、FPS 和 HAP 大小 |
 
 每条事件由数据库事务分配单调序号，因此同一 Run 内可以按 `seq` 重建“构建 → 安装 → 启动 → 状态 → 异常”的真实先后关系。多设备部署共享 Run，但每条设备事件都带独立 `device_id`，不会把一台设备的结论套到另一台。
 

@@ -539,7 +539,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "run_perf_benchmark",
-        desc: "一键性能基准：运行一遍操作流程并采样应用性能，支持与上一次基准对比，量化 CPU/内存/温度变化。\n参数：{\"device\":\"<可选设备序列号>\",\"package\":\"<可选包名，缺省取当前工程 bundleName>\",\"steps\":[<可选 UI 操作流程，同 run_ui_flow 的 steps>],\"seconds\":<可选采样秒数 3-30，缺省 6>,\"label\":\"<可选基准标签，如 baseline 或 v2>\"}。\n流程：可选执行 steps 操作流程 → 采样应用进程 CPU/内存(PSS 近似)与系统指标（均值/峰值）→ 尝试读取 FPS（hidumper RenderService，设备不支持时跳过）→ 与上一次同设备同应用的基准做差值对比并给出回归/优化结论。\n适合：部署新版本前后各跑一次量化性能变化，或对比不同改动的卡顿/发热/内存表现。\n副作用：可能注入 UI 操作；性能数据只读。\n返回：本次指标 + 与上次基准的对比报告。",
+        desc: "一键性能基准：测量冷启动状态确认、CPU、内存、电量、FPS、温度和 HAP 包体积，并与上一次基准对比。\n参数：{\"device\":\"<可选设备序列号>\",\"package\":\"<可选包名，缺省取当前工程 bundleName>\",\"hap\":\"<可选 HAP 路径>\",\"product\":\"<可选产物 product>\",\"module\":\"<可选产物 module>\",\"measure_startup\":<可选，缺省 true>,\"steps\":[<可选 UI 操作流程，同 run_ui_flow 的 steps>],\"seconds\":<可选采样秒数 3-30，缺省 6>,\"label\":\"<可选基准标签>\"}。\n流程：停止并重新启动应用以确认冷启动状态（可关闭）→ 可选执行 steps，失败即停止 → 采样应用 CPU/内存及系统指标 → 尽力读取电量/FPS/温度和唯一 HAP 产物 → 对比同设备同应用的上一次基准并记录到当前 Agent run。\n副作用：默认会停止并启动目标应用，也可能注入 UI 操作；采样本身只读。\n返回：本次指标、可用性说明、与上次基准的差值和回归结论。",
     },
     ToolSpec {
         name: "dump_ui_hierarchy",
@@ -1220,7 +1220,7 @@ pub async fn run_tool(
         "deploy_all" => build_tools::deploy_all(&args, &roots, ctx, project_id).await,
         "write_unit_tests" => test_tools::write_unit_tests(&args, &roots).await,
         "run_ui_flow" => test_tools::run_ui_flow(&args, &roots, ctx).await,
-        "run_perf_benchmark" => ui_tools::run_perf_benchmark(&args, &roots).await,
+        "run_perf_benchmark" => ui_tools::run_perf_benchmark(&args, &roots, ctx).await,
         "dump_ui_hierarchy" => ui_tools::dump_ui_hierarchy(&args, &roots).await,
         "ui_locator" => ui_tools::ui_locator(&args, &roots).await,
         "start_ability" => ui_tools::start_ability(&args, &roots).await,

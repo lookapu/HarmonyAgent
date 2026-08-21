@@ -29,6 +29,7 @@
 - HarmonyOS 构建与运行证据接入 Agent 持久 Run 事件流：构建计划/结果/产物、逐设备安装与状态、Hilog、ArkTS 异常、Native 崩溃、AppFreeze/ANR 使用同一 `run_id` 和单调序号；后台旧监听受现有 Worker 租约 fencing 约束。
 - `deploy_all` 增加 `serial|parallel` 多设备策略：串行固定逐台执行，并行缺省上限 2、硬上限 4，不再一次性 spawn 全部设备；设备结果确定性排序，并以逐设备事件和批次汇总写入当前 Run。
 - `run_ui_flow` 打通操作、UI 树、关键页面断言与截图证据：支持 text/type/id/bundle 的存在/不存在和精确/包含匹配；操作或断言失败现在真实返回失败，`smoke_test` 不再把失败步骤误判为通过，并将证据路径写入当前 Run。
+- `run_perf_benchmark` 补齐 Ability 启动状态确认、CPU/内存均值与峰值、电量变化、温度、FPS 和可信 HAP 包体积；前置 UI 流程失败不再产生无效基准，结果与可用性证据写入当前 Run。
 
 ### 长会话 Context V2（M1 基础）
 
