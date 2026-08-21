@@ -111,6 +111,8 @@ export interface ChatOptions {
   protocol?: string
   /** 原生工具调用（function calling）：true 时 OpenAI 兼容协议注入 tools、解析原生 tool_calls（与文本标记并行）；缺省 false 保持纯文本标记协议 */
   native_tools?: boolean
+  /** 精确恢复的父 Run；只应由安全恢复入口临时设置，不写入持久化模型偏好。 */
+  resume_run_id?: string
 }
 
 /** 回复工具权限审核请求（自动审核模式下由确认弹窗调用）；remember=始终允许该工具，feedback=拒绝理由，scope=project 时持久化到项目白名单 */
@@ -291,6 +293,9 @@ export interface AgentRun {
   last_event_seq: number
   recovery_count: number
   resume_policy: string
+  parent_run_id: string | null
+  recovery_plan_json: string | null
+  recovery_mode: 'fresh' | 'resume' | string
   acceptance_json: string | null
   error: string | null
   started_at: number

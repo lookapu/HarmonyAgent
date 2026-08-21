@@ -17,6 +17,9 @@ pub struct AgentRun {
     pub last_event_seq: i64,
     pub recovery_count: i64,
     pub resume_policy: String,
+    pub parent_run_id: Option<String>,
+    pub recovery_plan_json: Option<String>,
+    pub recovery_mode: String,
     pub acceptance_json: Option<String>,
     pub error: Option<String>,
     pub started_at: i64,
@@ -39,11 +42,22 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+#[cfg(test)]
 pub fn begin_run(
     conn: &Connection,
     run_id: &str,
     conversation_id: &str,
     goal: &str,
+) -> Result<(), String> {
+    begin_run_with_recovery(conn, run_id, conversation_id, goal, None)
+}
+
+pub fn begin_run_with_recovery(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    goal: &str,
+    recovery: Option<&crate::agent::recovery::RecoveryPlan>,
 ) -> Result<(), String> {
     let now = now_ms();
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -60,9 +74,21 @@ pub fn begin_run(
     tx.execute(
         "INSERT INTO agent_runs
          (run_id,conversation_id,goal,state,phase,attempt,last_event_seq,recovery_count,
-          resume_policy,metadata_json,started_at,updated_at)
-         VALUES (?1,?2,?3,'running','initializing',1,0,0,'continue','{}',?4,?4)",
-        params![run_id, conversation_id, goal, now],
+          resume_policy,metadata_json,started_at,updated_at,parent_run_id,recovery_plan_json,recovery_mode)
+         VALUES (?1,?2,?3,'running',?4,
+                 COALESCE((SELECT attempt+1 FROM agent_runs WHERE run_id=?7),1),
+                 0,0,?5,'{}',?6,?6,?7,?8,?9)",
+        params![
+            run_id,
+            conversation_id,
+            goal,
+            if recovery.is_some() { "recovering" } else { "initializing" },
+            recovery.map(|r| r.policy.as_str()).unwrap_or("continue"),
+            now,
+            recovery.map(|r| r.parent_run_id.as_str()),
+            recovery.and_then(|r| serde_json::to_string(r).ok()),
+            if recovery.is_some() { "resume" } else { "fresh" },
+        ],
     )
     .map_err(|e| e.to_string())?;
     append_event_tx(
@@ -70,9 +96,24 @@ pub fn begin_run(
         run_id,
         conversation_id,
         "run.started",
-        &serde_json::json!({ "goal": goal, "state": "running", "phase": "initializing" }),
+        &serde_json::json!({
+            "goal": goal,
+            "state": "running",
+            "phase": if recovery.is_some() { "recovering" } else { "initializing" },
+            "parent_run_id": recovery.map(|r| r.parent_run_id.as_str()),
+        }),
         now,
     )?;
+    if let Some(plan) = recovery {
+        append_event_tx(
+            &tx,
+            run_id,
+            conversation_id,
+            "recovery.planned",
+            &serde_json::to_value(plan).unwrap_or_default(),
+            now,
+        )?;
+    }
     tx.commit().map_err(|e| e.to_string())
 }
 
@@ -133,15 +174,15 @@ pub fn transition(
 ) -> Result<i64, String> {
     // 终态不可逆：迟到的 watchdog、Drop 或 IPC 收尾不得把已完成任务重新标成中断，
     // 也不得把已取消任务改写成成功。SQLite 连接锁保证检查与更新不会并发穿透。
-    let current: Option<(String, i64)> = conn
+    let current: Option<(String, i64, String, Option<String>)> = conn
         .query_row(
-            "SELECT state,last_event_seq FROM agent_runs WHERE run_id=?1",
+            "SELECT state,last_event_seq,recovery_mode,parent_run_id FROM agent_runs WHERE run_id=?1",
             [run_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    let Some((current_state, current_seq)) = current else {
+    let Some((current_state, current_seq, recovery_mode, parent_run_id)) = current else {
         return Err(format!("运行不存在：{run_id}"));
     };
     if matches!(
@@ -178,6 +219,25 @@ pub fn transition(
         &serde_json::json!({ "state": state, "phase": phase, "error": error }),
         now,
     )?;
+    if terminal && recovery_mode == "resume" {
+        append_event_tx(
+            &tx,
+            run_id,
+            conversation_id,
+            if state == "completed" {
+                "recovery.completed"
+            } else {
+                "recovery.terminated"
+            },
+            &serde_json::json!({
+                "parent_run_id": parent_run_id,
+                "state": state,
+                "phase": phase,
+                "error": error,
+            }),
+            now,
+        )?;
+    }
     // 模型 delta 仅服务运行中断后的补拉；正常完成的正文已经进入 messages，重复的
     // checkpoint 可安全删除。失败/取消/中断仍保留，以便诊断和恢复部分输出。
     if state == "completed" {
@@ -222,7 +282,8 @@ pub fn set_acceptance(
 pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<AgentRun>, String> {
     conn.query_row(
         "SELECT run_id,conversation_id,goal,state,phase,attempt,last_event_seq,recovery_count,
-                resume_policy,acceptance_json,error,started_at,updated_at,finished_at
+                resume_policy,acceptance_json,error,started_at,updated_at,finished_at,
+                parent_run_id,recovery_plan_json,recovery_mode
          FROM agent_runs WHERE run_id=?1",
         [run_id],
         |r| {
@@ -241,6 +302,9 @@ pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<AgentRun>, Stri
                 started_at: r.get(11)?,
                 updated_at: r.get(12)?,
                 finished_at: r.get(13)?,
+                parent_run_id: r.get(14)?,
+                recovery_plan_json: r.get(15)?,
+                recovery_mode: r.get(16)?,
             })
         },
     )
@@ -351,7 +415,7 @@ mod tests {
             "PRAGMA foreign_keys=ON;
              CREATE TABLE conversations(id TEXT PRIMARY KEY);
              INSERT INTO conversations(id) VALUES ('c');
-             CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER);
+             CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh');
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
              CREATE TABLE tool_runs(trace_id TEXT,status TEXT,recovery_policy TEXT);
              CREATE TABLE execution_steps(run_id TEXT,state TEXT,recovery_policy TEXT);",
@@ -410,5 +474,47 @@ mod tests {
         assert_eq!(run.state, "completed");
         assert_eq!(run.phase, "done");
         assert_eq!(run.last_event_seq, 2);
+    }
+
+    #[test]
+    fn recovery_run_records_lineage_attempt_and_terminal_events() {
+        let c = conn();
+        begin_run(&c, "parent", "c", "ship product").unwrap();
+        transition(
+            &c,
+            "parent",
+            "c",
+            "interrupted",
+            "recovery_required",
+            Some("process exited"),
+        )
+        .unwrap();
+        let plan = crate::agent::recovery::RecoveryPlan {
+            parent_run_id: "parent".into(),
+            original_goal: "ship product".into(),
+            policy: "verify_effects".into(),
+            decisions: Vec::new(),
+            completed_count: 0,
+            pending_count: 0,
+            verification_count: 0,
+            confirmation_count: 0,
+            created_at: 1,
+        };
+        begin_run_with_recovery(&c, "child", "c", "continue", Some(&plan)).unwrap();
+
+        let child = get_run(&c, "child").unwrap().unwrap();
+        assert_eq!(child.parent_run_id.as_deref(), Some("parent"));
+        assert_eq!(child.recovery_mode, "resume");
+        assert_eq!(child.resume_policy, "verify_effects");
+        assert_eq!(child.attempt, 2);
+        assert!(child.recovery_plan_json.is_some());
+        let events = events_after(&c, "child", 0, 20).unwrap();
+        assert_eq!(events[0].event_type, "run.started");
+        assert_eq!(events[1].event_type, "recovery.planned");
+
+        transition(&c, "child", "c", "completed", "done", None).unwrap();
+        let events = events_after(&c, "child", 0, 20).unwrap();
+        assert_eq!(events.last().unwrap().event_type, "recovery.completed");
+        assert_eq!(get_run(&c, "child").unwrap().unwrap().last_event_seq, 4);
     }
 }

@@ -109,6 +109,7 @@ const markRunTerminal = (conversationId: string, runId?: string) => {
 const emptyStreaming = (): StreamingState => ({
   conversationId: null,
   runId: null,
+  recoveryParentRunId: null,
   content: '',
   reasoning: '',
   error: null,
@@ -501,7 +502,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             : state.plan,
         // 任务未完成（上限中止/用户停止/中途失败，有工具成果无最终总结）：
         // 保留"继续任务"按钮断点续跑；正常完成则清空
-        unfinishedConv: unfinished ? { conversationId: conversation_id } : null,
+        unfinishedConv: unfinished ? { conversationId: conversation_id, runId: run_id } : null,
       })
     }
     // 刷新会话列表（标题/时间变化；保持搜索关键字过滤）。
@@ -692,7 +693,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         // 用户停止：进度卡定档保留（展示已完成部分）
         plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'error' } : state.plan,
         // 停止且未完成：展示"继续任务"按钮断点续跑（有已执行工具成果可接续）
-        unfinishedConv: unfinished ? { conversationId: conversation_id } : state.unfinishedConv,
+        unfinishedConv: unfinished ? { conversationId: conversation_id, runId: run_id } : state.unfinishedConv,
         // 停止任务：挂起的提问卡同步关闭（后端已关闭通道）
         askCard: null,
       })
@@ -1427,6 +1428,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
                 toolRuns: restoredToolRuns,
                 unfinishedConv: {
                   conversationId: id,
+                  runId: run.run_id,
                   recoveryPolicy: run.resume_policy,
                   error: run.error ?? undefined,
                   recoverySteps: durableSteps,
@@ -1440,6 +1442,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             ...emptyStreaming(),
             conversationId: id,
             runId: run.run_id,
+            recoveryParentRunId: run.parent_run_id,
             content,
             reasoning,
             startedAt: run.started_at,
@@ -1601,7 +1604,13 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       const now = Math.floor(Date.now() / 1000)
       const localId = `local-${now}-${Math.random().toString(36).slice(2, 8)}`
       optimisticRunUserIds.set(conv.id, localId)
-      const fresh: StreamingState = { ...emptyStreaming(), conversationId: conv.id, startedAt: Date.now(), lastDeltaAt: Date.now() }
+      const fresh: StreamingState = {
+        ...emptyStreaming(),
+        conversationId: conv.id,
+        recoveryParentRunId: options?.resume_run_id ?? null,
+        startedAt: Date.now(),
+        lastDeltaAt: Date.now(),
+      }
       set({
         messages: [
           ...get().messages,

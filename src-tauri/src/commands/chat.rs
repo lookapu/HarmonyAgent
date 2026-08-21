@@ -1585,6 +1585,9 @@ pub struct ChatOptions {
     /// 原生工具调用（function calling）：true 时 OpenAI 兼容协议请求注入 tools、
     /// 响应解析原生 tool_calls（与文本标记协议并行，模型任选其一）；缺省 false 保持纯文本标记协议
     pub native_tools: Option<bool>,
+    /// 明确恢复某次非完成 Run。仅由“安全恢复”入口设置；后端校验会话归属和终态，
+    /// 不接受模型或普通消息隐式猜测恢复对象。
+    pub resume_run_id: Option<String>,
 }
 
 /// 发送消息并获得 Agent 流式回复。
@@ -2277,9 +2280,31 @@ async fn stream_chat_inner(
     let trace_id = Uuid::new_v4().to_string();
     stats.run_id = Some(trace_id.clone());
     registry.set_run_id(&conversation_id, &trace_id);
+    let recovery_plan = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        options
+            .as_ref()
+            .and_then(|opts| opts.resume_run_id.as_deref())
+            .map(|parent| crate::agent::recovery::build_plan(&conn, &conversation_id, parent))
+            .transpose()?
+    };
     {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
-        crate::agent::runtime::begin_run(&conn, &trace_id, &conversation_id, content.trim())?;
+        crate::agent::runtime::begin_run_with_recovery(
+            &conn,
+            &trace_id,
+            &conversation_id,
+            content.trim(),
+            recovery_plan.as_ref(),
+        )?;
+        if let Some(plan) = recovery_plan.as_ref() {
+            crate::agent::coordinator::inherit_plan_steps(
+                &conn,
+                &plan.parent_run_id,
+                &trace_id,
+                &conversation_id,
+            )?;
+        }
     }
     let _ = app.emit(
         "chat-run-started",
@@ -2295,7 +2320,13 @@ async fn stream_chat_inner(
     // 重置任务级工具预算（防打转护栏，每次任务独立计数）
     tool_limits::reset_task_budget(&conversation_id);
     // 重置任务护栏（目标锚定/失速检测/失败黑名单），以用户最新消息为目标
-    crate::services::task_guard::begin_task(&conversation_id, content.trim());
+    crate::services::task_guard::begin_task(
+        &conversation_id,
+        recovery_plan
+            .as_ref()
+            .map(|plan| plan.original_goal.as_str())
+            .unwrap_or_else(|| content.trim()),
+    );
     // 清理上一任务遗留的"首次写文件已确认"标记，新任务重新确认
     if let Ok(mut s) = app.state::<FirstWriteApprovedState>().0.lock() {
         s.remove(&conversation_id);
@@ -3471,6 +3502,9 @@ async fn stream_chat_inner(
         if !skill_hint.is_empty() {
             *p = format!("{p}\n\n{skill_hint}");
         }
+        if let Some(plan) = recovery_plan.as_ref() {
+            *p = format!("{p}\n\n{}", crate::agent::recovery::directive(plan));
+        }
         if plan_mode_enabled(&opts) {
             *p = format!(
                 "{p}\n\n## 计划/审查模式（当前已开启）\n\
@@ -3571,7 +3605,13 @@ async fn stream_chat_inner(
         .unwrap_or(i64::MAX);
     // 任务账本（Ledger 协议）状态：目标=首轮用户消息摘要；prev_ledger 为上次未完成任务
     // 落库的账本（断点续跑继承，编号从旧账本最大编号续接）；任务结束按完成/未完成保存或清空
-    let task_goal = content.trim().chars().take(200).collect::<String>();
+    let task_goal = recovery_plan
+        .as_ref()
+        .map(|plan| plan.original_goal.as_str())
+        .unwrap_or_else(|| content.trim())
+        .chars()
+        .take(200)
+        .collect::<String>();
     let mut prev_ledger = load_task_ledger(&state, &conversation_id);
     let ledger_base_n = prev_ledger
         .as_ref()
@@ -4817,6 +4857,51 @@ async fn stream_chat_inner(
                     approval_mode: approval_mode(&opts),
                     ctx: &tool_ctx,
                 };
+                if let Some(message) =
+                    crate::agent::recovery::verification_block_global(&trace_id, &tool)
+                {
+                    let duration_ms = tool_begin.elapsed().as_millis() as i64;
+                    let _ = app.emit(
+                        "chat-tool-done",
+                        ChatToolDoneEvent {
+                            conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
+                            tool: tool.clone(),
+                            ok: false,
+                            output: message.clone(),
+                            duration_ms,
+                        },
+                    );
+                    persist_tool_run_immediate(
+                        &state,
+                        &conversation_id,
+                        &trace_id,
+                        &tool,
+                        &args_raw,
+                        &message,
+                    );
+                    finish_tool_run(
+                        &state,
+                        &conversation_id,
+                        &trace_id,
+                        Some(&call_id),
+                        &tool,
+                        &args_raw,
+                        &message,
+                        "blocked",
+                        duration_ms,
+                    );
+                    tool_runs.push(ToolRunItem {
+                        tool: tool.clone(),
+                        args: args_raw.clone(),
+                        output: message,
+                        succeeded: false,
+                        persisted: true,
+                    });
+                    consecutive_failures += 1;
+                    continue;
+                }
                 if let Err(intercept) = crate::agent::tools::run_pre_hooks(&inv).await {
                     crate::utils::logger::log_event(
                         "tool_intercepted",

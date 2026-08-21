@@ -248,6 +248,31 @@ pub fn sync_todos(
     Ok(())
 }
 
+/// 将父 Run 的计划骨架继承到恢复 Run。完成项保持完成，其余一律回到 pending；工具步骤
+/// 不复制，新的真实调用会在当前 Run 中重新落图，避免伪造已经执行过的调用。
+pub fn inherit_plan_steps(
+    conn: &Connection,
+    parent_run_id: &str,
+    run_id: &str,
+    conversation_id: &str,
+) -> Result<usize, String> {
+    let todos: Vec<crate::agent::todo::TodoItem> = list_steps(conn, parent_run_id)?
+        .into_iter()
+        .filter(|step| step.source == "plan")
+        .map(|step| crate::agent::todo::TodoItem {
+            id: step.external_id,
+            content: step.title,
+            status: if step.state == "completed" {
+                "done".into()
+            } else {
+                "pending".into()
+            },
+        })
+        .collect();
+    sync_todos(conn, run_id, conversation_id, &todos)?;
+    Ok(todos.len())
+}
+
 /// 进程重启恢复。prepared 明确表示尚未进入工具 Future，可安全标为未执行；running 才需要
 /// 根据契约核验副作用。返回发生状态变化的步骤数。
 pub fn recover_interrupted_steps(conn: &Connection) -> Result<usize, String> {

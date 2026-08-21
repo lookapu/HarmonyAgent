@@ -87,8 +87,12 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     let approval_mode_str = inv.approval_mode;
     let tool = inv.name;
     let conversation_id = inv.conversation_id;
+    let recovery_forces_approval =
+        crate::agent::recovery::requires_confirmation_global(&inv.ctx.run_id, tool);
     let is_write_tool = matches!(tool, "edit_file" | "write_file" | "delete_file");
-    let needs_approval = if approval_mode_str == "first_write" && is_write_tool {
+    let needs_approval = if recovery_forces_approval {
+        true
+    } else if approval_mode_str == "first_write" && is_write_tool {
         let approved = app
             .state::<FirstWriteApprovedState>()
             .0

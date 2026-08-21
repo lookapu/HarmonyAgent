@@ -16,6 +16,7 @@ pub mod session_events;
 pub mod subagents;
 pub mod agent_board;
 pub mod lsp_client;
+pub mod recovery;
 pub mod reflexion;
 pub mod todo;
 pub mod tools;

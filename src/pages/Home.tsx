@@ -207,6 +207,7 @@ export default function Home() {
     currentConversation,
     messages,
     streamingConversationId,
+    streamingRecoveryParentRunId,
     streamingError,
     streamingErrorDetail,
     toolRuns,
@@ -289,6 +290,7 @@ export default function Home() {
     currentConversation: s.currentConversation,
     messages: s.messages,
     streamingConversationId: s.streaming.conversationId,
+    streamingRecoveryParentRunId: s.streaming.recoveryParentRunId,
     streamingError: s.streaming.error,
     streamingErrorDetail: s.streaming.errorDetail,
     toolRuns: s.toolRuns,
@@ -4683,6 +4685,15 @@ export default function Home() {
                 {t('runtime.watching')}
               </span>
             )}
+            {isStreaming && streamingRecoveryParentRunId && (
+              <span
+                className="flex items-center gap-1 px-1.5 py-px rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px]"
+                title={streamingRecoveryParentRunId}
+              >
+                <Icon name="refresh" size={10} />
+                {t('home.recoveryRunning')}
+              </span>
+            )}
             {ctxInfo && currentConversation && (
               <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]">
                 <Icon name="info" size={11} />
@@ -4774,7 +4785,12 @@ export default function Home() {
                       : unfinishedConv.recoveryPolicy === 'verify_effects'
                         ? t('home.recoveryVerifyPrompt')
                         : t('home.continuePrompt')
-                    void sendUserMessage(affected ? `${base}\n\n${t('home.recoveryAffectedSteps')}:\n${affected}` : base, modelOptions)
+                    void sendUserMessage(
+                      affected ? `${base}\n\n${t('home.recoveryAffectedSteps')}:\n${affected}` : base,
+                      unfinishedConv.runId
+                        ? { ...modelOptions, resume_run_id: unfinishedConv.runId }
+                        : modelOptions,
+                    )
                   }}
                   className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-all"
                 >

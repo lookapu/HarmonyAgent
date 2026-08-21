@@ -28,6 +28,8 @@ export interface StreamingState {
   conversationId: string | null
   /** 后端任务运行代次；用于丢弃停止/重试后的旧流式与终态事件。 */
   runId: string | null
+  /** 非空表示当前任务是从该父 Run 安全恢复而来。 */
+  recoveryParentRunId: string | null
   content: string
   /** 思考过程（推理模型 reasoning 流，无则空串） */
   reasoning: string
@@ -237,6 +239,7 @@ export interface ChatSlice {
   /** 上次任务被停止且未完成；恢复策略用于阻止有副作用工具被盲目重放。 */
   unfinishedConv: {
     conversationId: string
+    runId?: string
     recoveryPolicy?: 'continue' | 'verify_effects' | 'manual' | string
     error?: string
     recoverySteps?: import('../api/project').ExecutionStep[]

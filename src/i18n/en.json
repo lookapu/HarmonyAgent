@@ -363,6 +363,7 @@
     "recoveryManualPrompt": "Recover the interrupted task. A non-replayable tool operation may have partially completed: inspect the real system and file state first and report what you find. Do not repeat side-effecting operations until their safety is confirmed, then finish the task.",
     "recoveryVerifyPrompt": "Recover the interrupted task. First use read-only tools to verify whether the previous tool call already produced side effects, then continue from the real state. Do not blindly replay writes.",
     "recoveryAffectedSteps": "Durable step snapshot from the previous run (do not repeat completed steps)",
+    "recoveryRunning": "Recovering safely",
     "recoverSafely": "Recover safely",
     "slashSummary": "Summarize chat",
     "slashSummaryPrompt": "Summarize key decisions, completed work and remaining issues of this conversation",
