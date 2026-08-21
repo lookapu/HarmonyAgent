@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as StdMutex;
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -5259,6 +5259,7 @@ async fn stream_chat_inner(
                             &cancel,
                             &conversation_id,
                             registry,
+                            &call_id,
                         )
                     },
                     |e: &String| tool_retry_safe(&tool) && crate::agent::tools::is_retryable_err(e),
@@ -8496,27 +8497,22 @@ async fn run_subagent(
                 return Err(format!("子任务工具执行器未能取得租约，已安全停止：{reason}"));
             }
             let sub_tool_timeout = tool_exec_timeout(&tool, &args_raw);
-            let mut result = match tokio::time::timeout(
+            let mut result = run_tool_in_lane(
+                &tool,
+                &args_raw,
+                project_path,
+                path_hints,
+                project_id,
+                state,
+                &mcp,
+                &tool_ctx,
+                &call_id,
                 sub_tool_timeout,
-                crate::agent::tools::run_tool(
-                    &tool,
-                    &args_raw,
-                    project_path,
-                    path_hints,
-                    project_id,
-                    &*state,
-                    &mcp,
-                    &tool_ctx,
-                ),
+                conversation_id,
+                None,
+                None,
             )
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(format!(
-                    "工具执行超时（>{}s）：{tool}",
-                    sub_tool_timeout.as_secs()
-                )),
-            };
+            .await;
             // 统一护栏后处理：护栏记录/大输出落盘（与主 Agent 同套 post 钩子）
             crate::agent::tools::run_post_hooks(&inv, &mut result).await;
             tool_limits::record_tool_call(conversation_id, &tool, &args_raw);
@@ -8610,6 +8606,7 @@ async fn run_tool_with_guard(
     cancel: &ChatCancel,
     conversation_id: &str,
     registry: &TaskRegistry,
+    call_id: &str,
 ) -> Result<String, String> {
     if is_cancelled(cancel, conversation_id) {
         return Err("用户已停止生成".into());
@@ -8634,49 +8631,114 @@ async fn run_tool_with_guard(
             );
         }
     }
-    let fut = std::panic::AssertUnwindSafe(async {
+    let timeout = tool_exec_timeout(tool, args_raw);
+    run_tool_in_lane(
+        tool,
+        args_raw,
+        project_path,
+        path_hints,
+        project_id,
+        state,
+        mcp,
+        tool_ctx,
+        call_id,
+        timeout,
+        conversation_id,
+        Some(cancel),
+        Some(registry),
+    )
+    .await
+}
+
+/// 在专用 Tool Worker 线程中执行工具：真实 OS 线程隔离（panic 只杀执行线程，
+/// 不拖垮 UI/主进程）+ 硬超时 + 卡死归因。取消/超时放弃等待时标记 stuck
+/// （执行线程可能仍在运行，控制面可见停滞指标）。
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_in_lane(
+    tool: &str,
+    args_raw: &str,
+    project_path: &str,
+    path_hints: &[String],
+    project_id: &str,
+    state: &tauri::State<'_, DbState>,
+    mcp: &crate::services::mcp_manager::McpManager,
+    tool_ctx: &crate::agent::exec_ctx::ToolCtx,
+    call_id: &str,
+    timeout: std::time::Duration,
+    conversation_id: &str,
+    cancel: Option<&ChatCancel>,
+    registry: Option<&TaskRegistry>,
+) -> Result<String, String> {
+    let db_owned = crate::db::DbState(state.inner().0.clone());
+    // MCP 管理器由 tauri 以应用生命周期托管（lib.rs app.manage），此处只提升借用
+    // 生命周期以便移交专用执行线程；托管对象在应用退出前不会释放，转换安全。
+    let mcp_static: &'static crate::services::mcp_manager::McpManager =
+        unsafe { &*(mcp as *const crate::services::mcp_manager::McpManager) };
+    let tool_owned = tool.to_string();
+    let args_owned = args_raw.to_string();
+    let path_owned = project_path.to_string();
+    let hints_owned = path_hints.to_vec();
+    let pid_owned = project_id.to_string();
+    let ctx_owned = tool_ctx.clone();
+    let fut = async move {
         if crate::agent::evals::take_fault("tool_worker_panic") {
             panic!("reliability fault injection: tool_worker_panic");
         }
         crate::agent::tools::run_tool(
-            tool,
-            args_raw,
-            project_path,
-            path_hints,
-            project_id,
-            &*state,
-            mcp,
-            tool_ctx,
-        ).await
-    }).catch_unwind();
-    tokio::pin!(fut);
-    let timeout = tool_exec_timeout(tool, args_raw);
+            &tool_owned,
+            &args_owned,
+            &path_owned,
+            &hints_owned,
+            &pid_owned,
+            &db_owned,
+            mcp_static,
+            &ctx_owned,
+        )
+        .await
+    };
+    let mut lane = crate::agent::tool_runtime::spawn_execution(
+        call_id,
+        tool,
+        fut,
+        Some(state.inner().0.clone()),
+    );
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            res = &mut fut => return match res {
-                Ok(result) => result,
-                Err(_) => {
-                    crate::agent::exec_ctx::request_stop_tool(conversation_id);
-                    Err(format!("工具执行器发生 panic，已隔离当前调用：{tool}"))
-                }
+            res = &mut lane.result => return match res {
+                Ok(Ok(out)) => Ok(out),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(format!("工具执行线程终止但未返回结果：{tool}")),
             },
             _ = &mut deadline => {
+                // 超时：先请求停止（消费停止标志并杀进程树），再放弃等待并归因卡死。
                 crate::agent::exec_ctx::request_stop_tool(conversation_id);
-                // 给命令执行器时间消费停止标志并杀进程树，避免超时后留下幽灵进程。
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut fut).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut lane.result).await;
+                mark_tool_stuck(state, call_id);
                 return Err(format!("工具执行超时（>{}s）：{tool}，已请求终止；不会自动重试有副作用工具", timeout.as_secs()));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                registry.touch(conversation_id, PHASE_TOOL);
-                if is_cancelled(cancel, conversation_id) {
-                    crate::agent::exec_ctx::request_stop_tool(conversation_id);
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut fut).await;
-                    return Err("用户已停止生成".into());
+                if let Some(registry) = registry {
+                    registry.touch(conversation_id, PHASE_TOOL);
+                }
+                if let Some(cancel) = cancel {
+                    if is_cancelled(cancel, conversation_id) {
+                        crate::agent::exec_ctx::request_stop_tool(conversation_id);
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut lane.result).await;
+                        mark_tool_stuck(state, call_id);
+                        return Err("用户已停止生成".into());
+                    }
                 }
             }
         }
+    }
+}
+
+/// 调用方放弃等待（超时/取消）时标记卡死：执行线程可能仍在运行，控制面可观测。
+fn mark_tool_stuck(state: &tauri::State<'_, DbState>, call_id: &str) {
+    if let Ok(conn) = state.0.lock() {
+        let _ = crate::agent::tool_runtime::mark_stuck(&conn, call_id);
     }
 }
 
@@ -8896,6 +8958,7 @@ async fn execute_tool_batch_one(
                 cancel,
                 conversation_id,
                 registry,
+                &call_id,
             )
         },
         |e: &String| tool_retry_safe(tool) && crate::agent::tools::is_retryable_err(e),

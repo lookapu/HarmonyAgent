@@ -389,6 +389,7 @@ export default function CostPage() {
           <ReliabilityValue label={t('cost.toolManualReview')} value={String(reliability?.tool_runtime.manual_review_required ?? 0)} />
           <ReliabilityValue label={t('cost.toolTimeouts')} value={String(reliability?.tool_runtime.timed_out_tools ?? 0)} />
           <ReliabilityValue label={t('cost.toolWorkerPanics')} value={String(reliability?.tool_runtime.worker_panics ?? 0)} />
+          <ReliabilityValue label={t('cost.toolStuckTools')} value={String(reliability?.tool_runtime.stuck_tools ?? 0)} />
         </div>
         <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3 text-[11px]">
           <span className="text-[var(--text-muted)]">{t('cost.schedulerStates')}</span>

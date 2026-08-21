@@ -205,6 +205,8 @@ pub fn run() {
                         );
                         let _ = crate::agent::scheduler::recover_stale_owners(&conn, 60_000);
                         let _ = crate::agent::tool_runtime::heartbeat_current_worker(&conn);
+                        // 卡死归因先于恢复：租约过期且未被调用方标记的调用记 stuck（卡顿指标）
+                        let _ = crate::agent::tool_runtime::detect_stuck(&conn, 60_000);
                         let _ = crate::agent::tool_runtime::recover_stale(&conn, 60_000);
                     }
                 });

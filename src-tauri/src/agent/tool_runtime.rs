@@ -7,6 +7,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 const DEFAULT_CAPACITY: i64 = 4;
@@ -33,6 +34,9 @@ pub struct ToolWorkerInfo {
     pub started_at: i64,
     pub last_heartbeat_at: i64,
     pub stopped_at: Option<i64>,
+    pub thread_id: Option<i64>,
+    pub thread_name: Option<String>,
+    pub stuck_count: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -45,6 +49,7 @@ pub struct ToolRuntimeStats {
     pub recovered_tools: i64,
     pub timed_out_tools: i64,
     pub worker_panics: i64,
+    pub stuck_tools: i64,
 }
 
 fn now_ms() -> i64 {
@@ -387,6 +392,56 @@ pub fn finish_prepared(conn: &Connection, call_id: &str, status: &str) -> Result
     Ok(changed > 0)
 }
 
+/// Marks calls stuck: the caller already gave up (timeout/cancel) but the execution thread may
+/// still be running. Attribution only — recovery still follows `recover_stale` by effect type.
+pub fn mark_stuck(conn: &Connection, call_id: &str) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE tool_runs SET verification_state='stuck_detected'
+             WHERE id=?1 AND status IN ('running','verifying')
+             AND verification_state NOT IN ('stuck_detected','required','manual')",
+            [call_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE tool_execution_workers SET stuck_count=stuck_count+1
+         WHERE worker_id=?1 AND state='active'",
+        [current_worker_id()],
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = crate::agent::enterprise::audit(
+        conn,
+        None,
+        None,
+        "tool_supervisor",
+        "tool.worker_stuck",
+        "tool_runs",
+        "stuck_detected",
+        &serde_json::json!({"call_id": call_id}),
+    );
+    Ok(true)
+}
+
+/// Background stuck scan: leases expired without the caller marking them (e.g. the awaiting task
+/// crashed first). Attribution only; run before `recover_stale` so stuck vs recovered stays
+/// distinguishable in the control plane.
+pub fn detect_stuck(conn: &Connection, stale_after_ms: i64) -> Result<usize, String> {
+    let now = now_ms();
+    let cutoff = now.saturating_sub(stale_after_ms.max(DEFAULT_LEASE_MS));
+    let changed = conn
+        .execute(
+            "UPDATE tool_runs SET verification_state='stuck_detected'
+             WHERE status IN ('running','verifying') AND lease_expires_at<?1
+             AND verification_state NOT IN ('stuck_detected','required','manual')",
+            [cutoff],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
 /// Recovers only calls whose executor heartbeat and lease have both expired. Read calls can be
 /// replayed, write calls require observation, and destructive/manual calls fail closed.
 pub fn recover_stale(conn: &Connection, stale_after_ms: i64) -> Result<usize, String> {
@@ -446,7 +501,8 @@ pub fn runtime_stats(conn: &Connection) -> Result<ToolRuntimeStats, String> {
           (SELECT COUNT(*) FROM tool_runs WHERE status='manual_review'),
           (SELECT COALESCE(SUM(recovery_count),0) FROM tool_runs),
           (SELECT COUNT(*) FROM tool_runs WHERE error_code='TOOL_TIMEOUT'),
-          (SELECT COUNT(*) FROM tool_runs WHERE error_code='TOOL_WORKER_PANIC')",
+          (SELECT COUNT(*) FROM tool_runs WHERE error_code='TOOL_WORKER_PANIC'),
+          (SELECT COALESCE(SUM(stuck_count),0) FROM tool_execution_workers)",
         [],
         |row| {
             Ok(ToolRuntimeStats {
@@ -458,6 +514,7 @@ pub fn runtime_stats(conn: &Connection) -> Result<ToolRuntimeStats, String> {
                 recovered_tools: row.get(5)?,
                 timed_out_tools: row.get(6)?,
                 worker_panics: row.get(7)?,
+                stuck_tools: row.get(8)?,
             })
         },
     )
@@ -468,8 +525,8 @@ pub fn list_workers(conn: &Connection, limit: usize) -> Result<Vec<ToolWorkerInf
     let mut stmt = conn
         .prepare(
             "SELECT worker_id,process_worker_id,pid,platform,state,capacity,active_tools,
-             started_at,last_heartbeat_at,stopped_at FROM tool_execution_workers
-             ORDER BY last_heartbeat_at DESC LIMIT ?1",
+             started_at,last_heartbeat_at,stopped_at,thread_id,thread_name,stuck_count
+             FROM tool_execution_workers ORDER BY last_heartbeat_at DESC LIMIT ?1",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -485,12 +542,104 @@ pub fn list_workers(conn: &Connection, limit: usize) -> Result<Vec<ToolWorkerInf
                 started_at: row.get(7)?,
                 last_heartbeat_at: row.get(8)?,
                 stopped_at: row.get(9)?,
+                thread_id: row.get(10)?,
+                thread_name: row.get(11)?,
+                stuck_count: row.get(12)?,
             })
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     Ok(rows)
+}
+
+// ---------------- 专用工具执行线程（Execution Lane） ----------------
+
+static NEXT_EXECUTION_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 专用工具执行线程的句柄：run_tool 在独立 OS 线程中 block_on 执行，与调用方
+/// tokio 任务、UI 线程和共享任务池隔离；panic 在线程内被捕获并转为错误返回，
+/// 线程死亡不会拖垮主进程。调用方超时/取消放弃后线程可能仍在运行，由
+/// `mark_stuck` 归因（卡顿指标），恢复语义不变（recover_stale 按 effect 分类）。
+pub struct ExecutionLane {
+    thread_name: String,
+    handle: Option<std::thread::JoinHandle<()>>,
+    pub(crate) result: tokio::sync::oneshot::Receiver<Result<String, String>>,
+}
+
+impl ExecutionLane {
+    /// 执行线程是否已结束（panic 或正常完成）。
+    pub fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
+    }
+
+    /// 等待执行结果；超时返回 Err（调用方应放弃并标记卡死）。
+    pub async fn await_result(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        match tokio::time::timeout(timeout, &mut self.result).await {
+            Ok(Ok(Ok(out))) => Ok(out),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err(format!(
+                "工具执行线程终止但未返回结果：{}",
+                self.thread_name
+            )),
+            Err(_) => Err(format!("工具执行超时：{}", self.thread_name)),
+        }
+    }
+}
+
+/// 在专用 OS 线程中执行工具 future。线程启动后把真实线程身份登记到
+/// tool_execution_workers（thread_id/thread_name），使控制面可见真实执行单元。
+/// `db` 供线程内登记身份用（无 State 上下文时走全局 DB 单例）。
+/// 必须在 tokio 运行时上下文中调用（内部取 Handle 供线程 block_on）。
+pub fn spawn_execution<F>(
+    _call_id: &str,
+    tool: &str,
+    fut: F,
+    db: Option<std::sync::Arc<std::sync::Mutex<Connection>>>,
+) -> ExecutionLane
+where
+    F: std::future::Future<Output = Result<String, String>> + Send + 'static,
+{
+    let rt = tokio::runtime::Handle::current();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let thread_name = format!("tool-exec:{tool}");
+    let thread_name_clone = thread_name.clone();
+    let thread_name_owned = thread_name.clone();
+    let tool_owned = tool.to_string();
+    let db = db.or_else(crate::db::global);
+    let handle = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            // 登记真实线程身份（供控制面观测与卡死归因）
+            if let Some(conn) = db {
+                if let Ok(conn) = conn.lock() {
+                    let tid = NEXT_EXECUTION_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+                    let _ = conn.execute(
+                        "UPDATE tool_execution_workers SET thread_id=?1,thread_name=?2,
+                         state='active',last_heartbeat_at=?3 WHERE worker_id=?4",
+                        params![tid as i64, thread_name_clone, now_ms(), current_worker_id()],
+                    );
+                }
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(fut)
+            }))
+            .unwrap_or_else(|_| {
+                Err(format!("工具执行器发生 panic，已隔离当前调用：{tool_owned}"))
+            });
+            let _ = tx.send(result);
+        })
+        .expect("spawn tool execution thread");
+    ExecutionLane {
+        thread_name: thread_name_owned,
+        handle: Some(handle),
+        result: rx,
+    }
 }
 
 #[cfg(test)]
@@ -508,7 +657,8 @@ mod tests {
                finished_at INTEGER,outcome_committed_at INTEGER,error_code TEXT);
              CREATE TABLE tool_execution_workers(worker_id TEXT PRIMARY KEY,process_worker_id TEXT,pid INTEGER,
                platform TEXT,state TEXT,capacity INTEGER,active_tools INTEGER,started_at INTEGER,
-               last_heartbeat_at INTEGER,stopped_at INTEGER,metadata_json TEXT);
+               last_heartbeat_at INTEGER,stopped_at INTEGER,metadata_json TEXT,thread_id INTEGER,
+               thread_name TEXT,stuck_count INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE tool_execution_attempts(call_id TEXT,attempt INTEGER,worker_id TEXT,lease_token TEXT,
                state TEXT,started_at INTEGER,last_heartbeat_at INTEGER,finished_at INTEGER,outcome_digest TEXT,
                error TEXT,PRIMARY KEY(call_id,attempt));",
@@ -594,5 +744,130 @@ mod tests {
                 "manual_review"
             ]
         );
+    }
+
+    #[test]
+    fn execution_thread_registers_real_identity() {
+        let db_arc = std::sync::Arc::new(std::sync::Mutex::new(db()));
+        register_current_worker(&db_arc.lock().unwrap()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut lane = spawn_execution(
+                "c",
+                "read_file",
+                async { Ok("ok".to_string()) },
+                Some(db_arc.clone()),
+            );
+            assert_eq!(
+                lane.await_result(std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+        });
+        let conn = db_arc.lock().unwrap();
+        let (tid, tname): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT thread_id,thread_name FROM tool_execution_workers WHERE worker_id=?1",
+                [current_worker_id()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(tid.is_some() && tid.unwrap() > 0);
+        assert!(tname.as_deref().unwrap_or("").contains("tool-exec:read_file"));
+    }
+
+    #[test]
+    fn panicked_execution_thread_is_isolated_and_reported() {
+        let db_arc = std::sync::Arc::new(std::sync::Mutex::new(db()));
+        register_current_worker(&db_arc.lock().unwrap()).unwrap();
+        db_arc
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO tool_runs(id,status,recovery_policy,trace_id,idempotency_key,effect_kind)
+                 VALUES('p','prepared','verify','r','k','write')",
+                [],
+            )
+            .unwrap();
+        let lease = start_attempt(&db_arc.lock().unwrap(), "p", 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.attempt, 1);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut lane = rt.block_on(async {
+            let lane = spawn_execution(
+                "p",
+                "edit_file",
+                async {
+                    panic!("boom");
+                },
+                Some(db_arc.clone()),
+            );
+            lane
+        });
+        let err = rt
+            .block_on(lane.await_result(std::time::Duration::from_secs(5)))
+            .unwrap_err();
+        assert!(err.contains("panic"), "{err}");
+        // panic 被隔离：调用仍处 running，由恢复协议接管
+        assert_eq!(mark_stuck(&db_arc.lock().unwrap(), "p").unwrap(), true);
+        let state: String = db_arc
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT verification_state FROM tool_runs WHERE id='p'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "stuck_detected");
+        assert_eq!(runtime_stats(&db_arc.lock().unwrap()).unwrap().stuck_tools, 1);
+        // 心跳过期后按 effect 分类恢复
+        db_arc
+            .lock()
+            .unwrap()
+            .execute("UPDATE tool_execution_workers SET last_heartbeat_at=0", [])
+            .unwrap();
+        db_arc
+            .lock()
+            .unwrap()
+            .execute("UPDATE tool_runs SET lease_expires_at=0", [])
+            .unwrap();
+        assert_eq!(recover_stale(&db_arc.lock().unwrap(), 30_000).unwrap(), 1);
+        let status: String = db_arc
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM tool_runs WHERE id='p'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "verification_required");
+    }
+
+    #[test]
+    fn stale_scan_marks_stuck_without_recovery() {
+        let conn = db();
+        register_current_worker(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO tool_runs(id,status,recovery_policy)
+             VALUES('s','prepared','verify')",
+            [],
+        )
+        .unwrap();
+        start_attempt(&conn, "s", 30_000).unwrap();
+        conn.execute("UPDATE tool_runs SET lease_expires_at=0", [])
+            .unwrap();
+        assert_eq!(detect_stuck(&conn, 30_000).unwrap(), 1);
+        let state: String = conn
+            .query_row(
+                "SELECT verification_state FROM tool_runs WHERE id='s'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "stuck_detected");
+        // 标记后不重复累计
+        assert_eq!(detect_stuck(&conn, 30_000).unwrap(), 0);
     }
 }

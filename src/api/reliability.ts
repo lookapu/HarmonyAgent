@@ -76,6 +76,7 @@ export interface ToolRuntimeStats {
   recovered_tools: number
   timed_out_tools: number
   worker_panics: number
+  stuck_tools: number
 }
 
 export interface ToolExecutionWorker {
