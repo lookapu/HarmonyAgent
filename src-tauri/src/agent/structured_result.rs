@@ -1,24 +1,26 @@
 //! 统一工具结果协议。验收、恢复、评测与 UI 都消费同一份机器可读证据，
 //! 自然语言输出仅作为有界诊断附件，不能单独证明任务完成。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactEvidence {
     pub path: String,
     pub kind: String,
     pub operation: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationEvidence {
     pub kind: String,
     pub passed: bool,
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolErrorEvidence {
     pub code: String,
     pub retryable: bool,
@@ -26,7 +28,7 @@ pub struct ToolErrorEvidence {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompensationEvidence {
     pub strategy: String,
     pub requires_approval: bool,
@@ -40,12 +42,38 @@ pub struct ToolMetrics {
     pub artifact_count: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ToolResultEnvelope {
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModificationEvidence {
+    pub target: String,
+    pub operation: String,
+    pub effect_kind: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryEvidence {
+    pub policy: String,
+    pub retry_safe: bool,
+    pub compensation: Option<CompensationEvidence>,
+    pub instruction: String,
+}
+
+fn protocol_v2() -> u32 { 2 }
+
+/// 所有内置、MCP 与子 Agent 工具的统一结果契约。
+///
+/// `serde(default)` 可读取迁移前的不完整 V2 记录；`extensions` 保留未来新增字段，
+/// 因而协议消费者无需与生产者同步升级。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolResultV2 {
+    #[serde(default = "protocol_v2")]
     pub schema_version: u32,
     pub tool: String,
     pub status: String,
     pub summary: String,
+    pub modifications: Vec<ModificationEvidence>,
+    pub recovery: RecoveryEvidence,
+    pub suggestions: Vec<String>,
     pub effect_kind: String,
     pub recovery_policy: String,
     pub retry_safe: bool,
@@ -57,9 +85,14 @@ pub struct ToolResultEnvelope {
     pub error: Option<ToolErrorEvidence>,
     pub compensation: Option<CompensationEvidence>,
     pub metrics: ToolMetrics,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
-impl ToolResultEnvelope {
+/// 兼容内部旧调用名；序列化协议统一以 `ToolResultV2` 为准。
+pub type ToolResultEnvelope = ToolResultV2;
+
+impl ToolResultV2 {
     pub fn from_execution(tool: &str, args: &str, output: &str, status: &str) -> Self {
         Self::from_execution_with_metrics(tool, args, output, status, 0)
     }
@@ -73,6 +106,7 @@ impl ToolResultEnvelope {
     ) -> Self {
         let contract = crate::agent::tools::contracts::contract(tool);
         let succeeded = status == "ok";
+        let committed = matches!(status, "ok" | "partial" | "partial_success");
         let mut artifacts = argument_artifacts(tool, args);
         merge_native_artifacts(output, &mut artifacts);
         let mut verification = Vec::new();
@@ -83,7 +117,7 @@ impl ToolResultEnvelope {
                 detail: first_line(output),
             });
         }
-        let side_effects = if contract.effect.as_str() == "read" || !succeeded {
+        let side_effects = if contract.effect.as_str() == "read" || !committed {
             Vec::new()
         } else if artifacts.is_empty() {
             vec![format!("{} operation completed", contract.effect.as_str())]
@@ -93,18 +127,47 @@ impl ToolResultEnvelope {
                 .map(|artifact| format!("{}:{}", artifact.operation, artifact.path))
                 .collect()
         };
-        let error = (!succeeded).then(|| classify_error(status, output, contract.retry_safe));
+        let error = (!succeeded && !matches!(status, "waiting_approval" | "pending_approval"))
+            .then(|| classify_error(status, output, contract.retry_safe));
         let compensation = compensation(tool, contract.recovery.as_str(), succeeded, &artifacts);
+        let modifications = if committed && contract.effect.as_str() != "read" {
+            if artifacts.is_empty() {
+                vec![ModificationEvidence {
+                    target: tool.into(),
+                    operation: "execute".into(),
+                    effect_kind: contract.effect.as_str().into(),
+                }]
+            } else {
+                artifacts.iter().map(|artifact| ModificationEvidence {
+                    target: artifact.path.clone(),
+                    operation: artifact.operation.clone(),
+                    effect_kind: contract.effect.as_str().into(),
+                }).collect()
+            }
+        } else {
+            Vec::new()
+        };
+        let suggestions = result_suggestions(tool, status, output, error.as_ref(), compensation.as_ref());
+        let recovery = RecoveryEvidence {
+            policy: contract.recovery.as_str().into(),
+            retry_safe: contract.retry_safe,
+            compensation: compensation.clone(),
+            instruction: recovery_instruction(contract.recovery.as_str(), error.as_ref(), compensation.as_ref()),
+        };
         let metrics = ToolMetrics {
             duration_ms: duration_ms.max(0),
             output_chars: output.chars().count(),
             artifact_count: artifacts.len(),
         };
+        let normalized = normalized_status(status, &verification, error.as_ref());
         Self {
             schema_version: 2,
             tool: tool.into(),
-            status: status.into(),
+            status: normalized.into(),
             summary: first_line(output),
+            modifications,
+            recovery,
+            suggestions,
             effect_kind: contract.effect.as_str().into(),
             recovery_policy: contract.recovery.as_str().into(),
             retry_safe: contract.retry_safe,
@@ -112,17 +175,11 @@ impl ToolResultEnvelope {
             side_effects,
             verification,
             raw_excerpt: output.chars().take(1000).collect(),
-            outcome: if succeeded {
-                "succeeded"
-            } else if status == "cancelled" {
-                "cancelled"
-            } else {
-                "failed"
-            }
-            .into(),
+            outcome: normalized.into(),
             error,
             compensation,
             metrics,
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -162,6 +219,67 @@ fn classify_error(status: &str, output: &str, retry_safe: bool) -> ToolErrorEvid
         retryable: retry_safe && transient,
         category: category.into(),
         message: first_line(output),
+    }
+}
+
+fn normalized_status(
+    status: &str,
+    verification: &[VerificationEvidence],
+    error: Option<&ToolErrorEvidence>,
+) -> &'static str {
+    match status {
+        "ok" if verification.iter().any(|item| !item.passed) => "verification_failed",
+        "ok" => "succeeded",
+        "partial" | "partial_success" => "partial_success",
+        "verification_failed" => "verification_failed",
+        "waiting_approval" | "pending_approval" => "waiting_approval",
+        "cancelled" => "cancelled",
+        _ if error.is_some_and(|item| item.retryable) => "retryable_failure",
+        _ => "permanent_failure",
+    }
+}
+
+fn result_suggestions(
+    tool: &str,
+    status: &str,
+    output: &str,
+    error: Option<&ToolErrorEvidence>,
+    compensation: Option<&CompensationEvidence>,
+) -> Vec<String> {
+    let mut items = Vec::new();
+    if status == "waiting_approval" || status == "pending_approval" {
+        items.push("等待用户审批；审批前不要执行该副作用操作".into());
+    }
+    if let Some(advice) = crate::agent::tools::diagnose_tool_error(tool, output) {
+        items.push(advice.into());
+    }
+    if error.is_some_and(|item| item.retryable) {
+        items.push("确认环境状态后，可使用相同幂等参数重试一次".into());
+    }
+    if let Some(item) = compensation {
+        items.push(item.instruction.clone());
+    }
+    items.sort();
+    items.dedup();
+    items.truncate(8);
+    items
+}
+
+fn recovery_instruction(
+    policy: &str,
+    error: Option<&ToolErrorEvidence>,
+    compensation: Option<&CompensationEvidence>,
+) -> String {
+    if let Some(item) = compensation {
+        return item.instruction.clone();
+    }
+    if error.is_some_and(|item| item.retryable) {
+        return "确认调用未产生副作用后，允许按原幂等键重试".into();
+    }
+    match policy {
+        "replay" => "该只读调用可安全重放".into(),
+        "verify" => "先读取真实状态确认副作用，再决定继续或补偿".into(),
+        _ => "需要人工核对真实状态，不得自动重放".into(),
     }
 }
 
@@ -348,6 +466,9 @@ mod tests {
         );
         assert_eq!(value.artifacts[0].path, "src/a.rs");
         assert_eq!(value.side_effects, vec!["write:src/a.rs"]);
+        assert_eq!(value.status, "succeeded");
+        assert_eq!(value.modifications[0].target, "src/a.rs");
+        assert_eq!(value.recovery.policy, "verify");
         assert_eq!(value.schema_version, 2);
         assert_eq!(
             value.compensation.as_ref().unwrap().strategy,
@@ -368,6 +489,7 @@ mod tests {
     fn failed_test_is_structured_verification() {
         let value = ToolResultEnvelope::from_execution("run_tests", "{}", "2 failed", "error");
         assert!(!value.verification[0].passed);
+        assert_eq!(value.status, "permanent_failure");
         assert!(value.side_effects.is_empty());
         assert_eq!(value.error.as_ref().unwrap().code, "TOOL_EXECUTION_FAILED");
     }
@@ -394,5 +516,57 @@ mod tests {
         let error = value.error.unwrap();
         assert_eq!(error.code, "TOOL_WORKER_PANIC");
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn v2_distinguishes_partial_approval_and_retryable_failures() {
+        let partial = ToolResultV2::from_execution(
+            "edit_file", r#"{"path":"src/a.rs"}"#, "one edit applied", "partial",
+        );
+        assert_eq!(partial.status, "partial_success");
+        assert_eq!(partial.modifications.len(), 1);
+
+        let approval = ToolResultV2::from_execution(
+            "git_push", "{}", "waiting for approval", "waiting_approval",
+        );
+        assert_eq!(approval.status, "waiting_approval");
+        assert!(approval.error.is_none());
+        assert!(!approval.suggestions.is_empty());
+
+        let retryable = ToolResultV2::from_execution(
+            "web_fetch", "{}", "network timeout", "error",
+        );
+        assert_eq!(retryable.status, "retryable_failure");
+        assert!(!retryable.suggestions.is_empty());
+    }
+
+    #[test]
+    fn v2_reads_legacy_records_and_preserves_unknown_fields() {
+        let value: ToolResultV2 = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "tool": "read_file",
+            "status": "ok",
+            "summary": "legacy",
+            "future_evidence": {"version": 3}
+        })).unwrap();
+        assert!(value.modifications.is_empty());
+        assert_eq!(value.extensions["future_evidence"]["version"], 3);
+        let encoded = serde_json::to_value(value).unwrap();
+        assert_eq!(encoded["future_evidence"]["version"], 3);
+    }
+
+    #[test]
+    fn every_registered_tool_emits_complete_v2_shape() {
+        for spec in crate::agent::tools::TOOL_SPECS {
+            let value = serde_json::to_value(ToolResultV2::from_execution(
+                spec.name, "{}", "ok", "ok",
+            )).unwrap();
+            for field in [
+                "status", "modifications", "artifacts", "verification", "recovery",
+                "suggestions", "error",
+            ] {
+                assert!(value.get(field).is_some(), "{} 缺少 {field}", spec.name);
+            }
+        }
     }
 }

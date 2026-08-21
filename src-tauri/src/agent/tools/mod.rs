@@ -46,6 +46,7 @@ pub use protocol::{
     system_hint_for, tool_short_desc, tool_schemas_for,
 };
 use errors::with_advice;
+pub(crate) use errors::diagnose_tool_error;
 use protocol::truncate_chars;
 
 pub(crate) use cmd_tools::encode_vision_image;
