@@ -234,8 +234,12 @@ export interface ChatSlice {
   todos: TodoItem[]
   /** Agent 挂起的提问卡（ask_user 工具；5 分钟超时自动关闭） */
   askCard: AskCard | null
-  /** 上次任务被停止且未完成（有工具成果无总结）；展示“继续任务”断点续跑按钮 */
-  unfinishedConv: { conversationId: string } | null
+  /** 上次任务被停止且未完成；恢复策略用于阻止有副作用工具被盲目重放。 */
+  unfinishedConv: {
+    conversationId: string
+    recoveryPolicy?: 'continue' | 'verify_effects' | 'manual' | string
+    error?: string
+  } | null
   /** 会话排队中消息列表（流式运行中提交、任务结束后续跑） */
   queuedList: QueuedMessageInfo[]
   /** 会话搜索关键字（侧栏搜索框，后端 LIKE 匹配标题/首条消息） */

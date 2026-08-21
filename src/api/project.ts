@@ -101,7 +101,7 @@ export interface ChatOptions {
   sub_model_id?: string
   /** 子 Agent 最大并发数（缺省 3） */
   max_concurrency?: number
-  /** 工具权限模式：ask=每次确认；auto=分级审核；allow_all=完全放任（缺省）；first_write=首次写文件确认、本任务后续放行 */
+  /** 工具权限模式：ask=每次确认；auto=分级审核（缺省）；allow_all=显式完全放任；first_write=首次写文件确认、本任务后续放行 */
   tool_approval?: 'ask' | 'auto' | 'allow_all' | 'first_write'
   /** 计划/审查模式：true 时 Agent 先出任务计划，用户确认后才执行工具 */
   plan_mode?: boolean
@@ -280,6 +280,39 @@ export interface SessionEventsView {
   messages: DerivedMessage[]
   total: number
 }
+
+export interface AgentRun {
+  run_id: string
+  conversation_id: string
+  goal: string
+  state: 'queued' | 'running' | 'waiting_approval' | 'waiting_user' | 'verifying' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  phase: string
+  attempt: number
+  last_event_seq: number
+  recovery_count: number
+  resume_policy: string
+  acceptance_json: string | null
+  error: string | null
+  started_at: number
+  updated_at: number
+  finished_at: number | null
+}
+
+export interface AgentRunEvent {
+  event_id: string
+  run_id: string
+  conversation_id: string
+  seq: number
+  event_type: string
+  payload: unknown
+  created_at: number
+}
+
+export const getLatestAgentRun = (conversationId: string) =>
+  invokeWithError<AgentRun | null>('get_latest_agent_run', { conversationId })
+
+export const getAgentRunEvents = (runId: string, afterSeq = 0, limit = 200) =>
+  invokeWithError<AgentRunEvent[]>('get_agent_run_events', { runId, afterSeq, limit })
 
 export const getSessionEvents = (conversationId: string) =>
   invokeWithError<SessionEventsView>('get_session_events', { conversationId })

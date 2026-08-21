@@ -4752,13 +4752,34 @@ export default function Home() {
               </div>
             )}
             {unfinishedConv && unfinishedConv.conversationId === currentConversation?.id && !isStreaming && (
-              <button
-                onClick={() => void sendUserMessage(t('home.continuePrompt'), modelOptions)}
-                className="ml-auto flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-all"
-              >
-                <Icon name="arrow-down" size={11} />
-                {t('home.continueTask')}
-              </button>
+              <div className="ml-auto flex items-center gap-2 min-w-0">
+                {unfinishedConv.recoveryPolicy === 'manual' && (
+                  <span className="truncate text-[10.5px] text-[var(--warning)]" title={unfinishedConv.error || t('home.recoveryManualHint')}>
+                    {t('home.recoveryManual')}
+                  </span>
+                )}
+                {unfinishedConv.recoveryPolicy === 'verify_effects' && (
+                  <span className="truncate text-[10.5px] text-[var(--warning)]" title={unfinishedConv.error || t('home.recoveryVerifyHint')}>
+                    {t('home.recoveryVerify')}
+                  </span>
+                )}
+                <button
+                  onClick={() => void sendUserMessage(
+                    unfinishedConv.recoveryPolicy === 'manual'
+                      ? t('home.recoveryManualPrompt')
+                      : unfinishedConv.recoveryPolicy === 'verify_effects'
+                        ? t('home.recoveryVerifyPrompt')
+                        : t('home.continuePrompt'),
+                    modelOptions,
+                  )}
+                  className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-all"
+                >
+                  <Icon name="arrow-down" size={11} />
+                  {unfinishedConv.recoveryPolicy === 'manual' || unfinishedConv.recoveryPolicy === 'verify_effects'
+                    ? t('home.recoverSafely')
+                    : t('home.continueTask')}
+                </button>
+              </div>
             )}
           </div>
           {/* 排队中消息条：运行中提交的消息，任务结束后续跑；支持单条移除 */}

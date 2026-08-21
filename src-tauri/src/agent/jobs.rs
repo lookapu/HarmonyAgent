@@ -259,28 +259,26 @@ async fn run_job(
     let wait_fut = child.wait();
     tokio::pin!(wait_fut);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let status = loop {
-        tokio::select! {
-            r = &mut wait_fut => match r {
-                Ok(s) => break s,
-                Err(e) => {
-                    finish_job_readers(stdout_task, stderr_task).await;
-                    let summary = format!("等待命令失败: {e}");
-                    finish_job(job, false, summary.clone());
-                    notify(&app, &conv, &job_id, &command, false, &summary);
-                    return;
-                }
-            },
-            _ = tokio::time::sleep_until(deadline) => {
-                // 先置停止中（job_list 立即反映终止意图），再强杀进程树
-                mark_stopping(job);
-                crate::utils::process::kill_tree(pid);
+    let status = tokio::select! {
+        r = &mut wait_fut => match r {
+            Ok(s) => s,
+            Err(e) => {
                 finish_job_readers(stdout_task, stderr_task).await;
-                let summary = format!("命令超时（>{timeout_secs}s），已终止: {program}");
+                let summary = format!("等待命令失败: {e}");
                 finish_job(job, false, summary.clone());
                 notify(&app, &conv, &job_id, &command, false, &summary);
                 return;
             }
+        },
+        _ = tokio::time::sleep_until(deadline) => {
+            // 先置停止中（job_list 立即反映终止意图），再强杀进程树
+            mark_stopping(job);
+            crate::utils::process::kill_tree(pid);
+            finish_job_readers(stdout_task, stderr_task).await;
+            let summary = format!("命令超时（>{timeout_secs}s），已终止: {program}");
+            finish_job(job, false, summary.clone());
+            notify(&app, &conv, &job_id, &command, false, &summary);
+            return;
         }
     };
     finish_job_readers(stdout_task, stderr_task).await;

@@ -364,6 +364,15 @@ fn watchdog_loop(app: AppHandle) {
                 crate::agent::ask::cancel_conversation(&cid);
                 crate::agent::exec_ctx::request_stop_tool(&cid);
                 task.abort.abort();
+                if !run_id.is_empty() {
+                    crate::agent::runtime::transition_global(
+                        &run_id,
+                        &cid,
+                        "interrupted",
+                        "watchdog_terminated",
+                        Some(&format!("看门狗强制终止：{reason}")),
+                    );
+                }
                 crate::utils::logger::log_event(
                     "watchdog_kill",
                     serde_json::json!({

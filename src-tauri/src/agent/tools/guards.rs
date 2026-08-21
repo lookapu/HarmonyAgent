@@ -146,9 +146,27 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     }
     let approval = app.state::<ToolApprovalState>();
     let cancel = app.state::<ChatCancel>();
-    match request_tool_approval(app, &approval, &cancel, conversation_id, tool, inv.args_raw)
-        .await
-    {
+    if !inv.ctx.run_id.is_empty() {
+        crate::agent::runtime::transition_global(
+            &inv.ctx.run_id,
+            conversation_id,
+            "waiting_approval",
+            "tool_approval",
+            None,
+        );
+    }
+    let approval_result =
+        request_tool_approval(app, &approval, &cancel, conversation_id, tool, inv.args_raw).await;
+    if !inv.ctx.run_id.is_empty() {
+        crate::agent::runtime::transition_global(
+            &inv.ctx.run_id,
+            conversation_id,
+            "running",
+            "approval_resolved",
+            None,
+        );
+    }
+    match approval_result {
         Ok(ApprovalOutcome::Approved) => {}
         Ok(ApprovalOutcome::Rejected(feedback)) => {
             // 拒绝理由（用户可附）反馈给模型，帮助其调整方案而非盲目重试

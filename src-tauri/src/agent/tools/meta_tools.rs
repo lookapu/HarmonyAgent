@@ -1143,7 +1143,8 @@ fn md_to_html(md: &str) -> String {
         // **粗体** / *斜体*（非贪婪配对）
         let bold = regex::Regex::new(r"\*\*(.+?)\*\*").unwrap();
         let buf = bold.replace_all(&buf, "<b>$1</b>").to_string();
-        let italic = regex::Regex::new(r"(?<!\*)\*([^*]+)\*(?!\*)").unwrap();
+        // Rust regex 不支持 look-around；粗体已先替换完，此时剩余成对星号可直接处理。
+        let italic = regex::Regex::new(r"\*([^*]+)\*").unwrap();
         italic.replace_all(&buf, "<i>$1</i>").to_string()
     };
 
@@ -1533,7 +1534,6 @@ pub(super) async fn export_tools_meta(args: &Value, roots: &[String]) -> Result<
     std::fs::write(&out_path, text).map_err(|e| format!("写入失败：{e}"))?;
     Ok(format!("已导出 {} 个工具元数据 → {}", tools.len(), out_path.display()))
 }
-
 
 
 

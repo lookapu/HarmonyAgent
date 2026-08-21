@@ -27,15 +27,25 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     run_migrations(&conn)?;
     recover_interrupted_tool_runs(&conn)?;
+    // 上次进程已经不存在，非终态 durable run 不得继续伪装为运行中。
+    // 恢复失败不应静默启动；映射回 rusqlite 错误较笨重，因此使用 SQL 侧同等收敛，
+    // 详细 run.recovered 事件由 runtime 恢复函数在正常路径补齐。
+    crate::agent::runtime::recover_interrupted_runs(&conn)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     Ok(Mutex::new(conn))
 }
 
 /// 应用异常退出时，执行前已落库但未写终态的工具会残留 running。启动恢复将其明确
-/// 标记为 cancelled，避免审计/评估长期误判仍在执行，也为“继续任务”保留真实原因。
+/// 标记为 interrupted，并按副作用策略说明后续动作；绝不把未知副作用调用自动当作失败重跑。
 fn recover_interrupted_tool_runs(conn: &Connection) -> Result<usize, rusqlite::Error> {
     conn.execute(
-        "UPDATE tool_runs SET status='cancelled',
-         result_json=COALESCE(NULLIF(result_json, ''), '应用在工具执行期间退出，调用未完成')
+        "UPDATE tool_runs SET status='interrupted', finished_at=unixepoch(),
+         result_json=COALESCE(NULLIF(result_json, ''),
+           CASE recovery_policy
+             WHEN 'replay' THEN '应用退出导致调用中断；该工具为只读，可安全重新执行'
+             WHEN 'verify' THEN '应用退出导致调用中断，实际状态未知；恢复前必须核验副作用'
+             ELSE '应用退出导致调用中断，实际状态未知；需要用户确认后处理'
+           END)
          WHERE status='running'",
         [],
     )
@@ -96,6 +106,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (51, "051_conversation_snapshots", include_str!("../../migrations/051_conversation_snapshots.sql")),
     (52, "052_reminders_feedback_terms", include_str!("../../migrations/052_reminders_feedback_terms.sql")),
     (53, "053_tool_run_lifecycle", include_str!("../../migrations/053_tool_run_lifecycle.sql")),
+    (54, "054_agent_runtime", include_str!("../../migrations/054_agent_runtime.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -185,9 +196,17 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        for c in ["trace_id", "call_id"] {
+        for c in ["trace_id", "call_id", "idempotency_key", "effect_kind", "recovery_policy"] {
             assert!(tool_cols.iter().any(|x| x == c), "tool_runs 迁移后缺少列 {c}: {tool_cols:?}");
         }
+        let run_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('agent_runs','run_events')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_tables, 2);
     }
 
     #[test]
@@ -218,7 +237,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row.0, "cancelled");
-        assert!(row.1.contains("未完成"));
+        assert_eq!(row.0, "interrupted");
+        assert!(row.1.contains("中断"));
     }
 }

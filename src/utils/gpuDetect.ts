@@ -67,7 +67,7 @@ function detectPlatform(): 'mac' | 'windows' | 'other' {
 function detectWebGL(): { renderer: string; accelerated: boolean } {
   if (typeof document === 'undefined') return { renderer: '', accelerated: false }
   const canvas = document.createElement('canvas')
-  let gl: WebGLRenderingContext | WebGL2RenderingContext | null = null
+  let gl: WebGLRenderingContext | WebGL2RenderingContext | null
   try {
     gl = canvas.getContext('webgl2') || canvas.getContext('webgl')
   } catch {

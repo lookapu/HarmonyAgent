@@ -30,6 +30,8 @@ import {
   conversationRoot,
   listSnapshots as listSnapshotsApi,
   restoreSnapshot as restoreSnapshotApi,
+  getLatestAgentRun as getLatestAgentRunApi,
+  getAgentRunEvents as getAgentRunEventsApi,
 } from '../../api/project'
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger } from '../../api/project'
 import type { StateCreator } from 'zustand'
@@ -89,6 +91,8 @@ const terminalRunIds = new Map<string, string>()
 const activeToolCallIds = new Map<string, Set<string>>()
 /** 已完成工具墓碑：拦截跨事件通道乱序到达的迟到 start / 重复 done。 */
 const completedToolCallIds = new Map<string, Set<string>>()
+/** durable run 事件游标：WebView 重载后从 SQLite 补拉，活跃期用于忽略旧 checkpoint。 */
+const durableRunCursors = new Map<string, number>()
 
 const markRunTerminal = (conversationId: string, runId?: string) => {
   activeToolCallIds.delete(conversationId)
@@ -401,9 +405,15 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
 
   // Rust 侧已按 32ms/8KB 合并模型 token，进一步降低 Tauri IPC 压力；
   // 仍进入同一个前端帧级队列，统一保证后台窗口和多会话行为。
-  listen<{ conversation_id: string; run_id?: string; content: string; reasoning: string }>('chat-stream-batch', (event) => {
-    const { conversation_id, run_id, content, reasoning } = event.payload
+  listen<{ conversation_id: string; run_id?: string; content: string; reasoning: string; checkpoint_seq?: number | null }>('chat-stream-batch', (event) => {
+    const { conversation_id, run_id, content, reasoning, checkpoint_seq } = event.payload
     if (!acceptsRun(conversation_id, run_id)) return
+    if (run_id && checkpoint_seq != null) {
+      const prev = durableRunCursors.get(run_id) ?? 0
+      // 相同 checkpoint 的迟到/重复 IPC 已包含在补拉结果中，也必须丢弃。
+      if (checkpoint_seq <= prev) return
+      durableRunCursors.set(run_id, checkpoint_seq)
+    }
     const bucket = get().streamings[conversation_id]
     if (!bucket) return
     const pending = pendingStreamDeltas.get(conversation_id)
@@ -1334,6 +1344,77 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         versionMap: {},
         tokenStats: null,
       })
+      // Durable run 对账：终态事件即使在 WebView 重载时丢失，也从 SQLite 恢复真实状态。
+      // 非终态 run 可按游标补拉已 checkpoint 的模型增量；正常启动恢复会先将旧 run
+      // 收敛为 interrupted，因此不会把已死亡任务误显示成仍在运行。
+      void getLatestAgentRunApi(id)
+        .then(async (run) => {
+          if (!run || get().currentConversation?.id !== id) return
+          durableRunCursors.set(run.run_id, run.last_event_seq)
+          const active = ['queued', 'running', 'waiting_approval', 'waiting_user', 'verifying'].includes(run.state)
+          const interrupted = run.state === 'interrupted'
+          if ((!active && !interrupted) || get().streamings[id]) return
+          let after = 0
+          let content = ''
+          let reasoning = ''
+          for (;;) {
+            const events = await getAgentRunEventsApi(run.run_id, after, 1000)
+            for (const item of events) {
+              after = Math.max(after, item.seq)
+              if (item.event_type !== 'model.delta' || !item.payload || typeof item.payload !== 'object') continue
+              const payload = item.payload as { content?: unknown; reasoning?: unknown }
+              if (typeof payload.content === 'string') content += payload.content
+              if (typeof payload.reasoning === 'string') reasoning += payload.reasoning
+            }
+            if (events.length < 1000) break
+          }
+          if (get().currentConversation?.id !== id || get().streamings[id]) return
+          if (interrupted) {
+            set((state) => {
+              const recoveredId = `recovered-${run.run_id}`
+              const hasRecovered = state.messages.some((message) => message.id === recoveredId)
+              const recoveredMessage: ChatMessage | null = content.trim()
+                ? {
+                    id: recoveredId,
+                    conversation_id: id,
+                    role: 'assistant',
+                    content: `> ⚠️ 已恢复的中断输出 / Recovered partial output (incomplete)\n\n${content}`,
+                    references_json: null,
+                    model: null,
+                    tokens_in: null,
+                    tokens_out: null,
+                    reasoning: reasoning || null,
+                    queued: 0,
+                    agent_owned: 0,
+                    modified_files_json: null,
+                    duration_ms: null,
+                    created_at: Math.floor(run.updated_at / 1000),
+                  }
+                : null
+              return {
+                messages: recoveredMessage && !hasRecovered
+                  ? [...state.messages, recoveredMessage]
+                  : state.messages,
+                unfinishedConv: {
+                  conversationId: id,
+                  recoveryPolicy: run.resume_policy,
+                  error: run.error ?? undefined,
+                },
+              }
+            })
+            return
+          }
+          setBucket(id, {
+            ...emptyStreaming(),
+            conversationId: id,
+            runId: run.run_id,
+            content,
+            reasoning,
+            startedAt: run.started_at,
+            lastDeltaAt: Date.now(),
+          })
+        })
+        .catch(() => {})
       trace.mark('messages-state-set')
       // 三个数据查询（feedback / versions / tokenStats）互相独立，立即并行触发，
       // 各自返回后单独 setState，不因某个慢查询阻塞首次渲染。

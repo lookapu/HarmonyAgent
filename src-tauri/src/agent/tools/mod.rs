@@ -3725,6 +3725,15 @@ async fn ask_user(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result
         question.clone(),
         options.clone(),
     );
+    if !ctx.run_id.is_empty() {
+        crate::agent::runtime::transition_global(
+            &ctx.run_id,
+            &ctx.conversation_id,
+            "waiting_user",
+            "ask_user",
+            None,
+        );
+    }
     {
         use tauri::Emitter;
         let _ = app.emit("chat-ask", event);
@@ -3733,11 +3742,11 @@ async fn ask_user(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result
     // 用户点停止立即返回）；任务级停止由 stop_chat → ask::cancel_conversation 关闭通道。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let mut rx = rx;
-    loop {
+    let result = loop {
         tokio::select! {
             r = &mut rx => {
                 crate::agent::ask::remove(&request_id);
-                return match r {
+                break match r {
                     Ok(a) => {
                         let a = a.trim();
                         if a.is_empty() {
@@ -3751,16 +3760,26 @@ async fn ask_user(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result
             }
             _ = tokio::time::sleep_until(deadline) => {
                 crate::agent::ask::remove(&request_id);
-                return Ok("用户未在 5 分钟内回复，跳过该问题（如需确认可再次 ask_user 或换用更具体的选项）。".into());
+                break Ok("用户未在 5 分钟内回复，跳过该问题（如需确认可再次 ask_user 或换用更具体的选项）。".into());
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if crate::agent::exec_ctx::current_tool_stop_requested() {
                     crate::agent::ask::remove(&request_id);
-                    return Err("用户已停止当前工具".into());
+                    break Err("用户已停止当前工具".into());
                 }
             }
         }
+    };
+    if !ctx.run_id.is_empty() {
+        crate::agent::runtime::transition_global(
+            &ctx.run_id,
+            &ctx.conversation_id,
+            "running",
+            "user_response_resolved",
+            None,
+        );
     }
+    result
 }
 
 /// git_stash：push/pop/list

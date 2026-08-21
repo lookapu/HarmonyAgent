@@ -48,6 +48,8 @@ pub struct ChatStreamBatchEvent {
     pub run_id: String,
     pub content: String,
     pub reasoning: String,
+    /// 最近一次 durable checkpoint 的事件序号；None 表示本批仅为低延迟 IPC 增量。
+    pub checkpoint_seq: Option<i64>,
 }
 
 struct StreamEventBatcher<'a> {
@@ -56,7 +58,10 @@ struct StreamEventBatcher<'a> {
     run_id: String,
     content: String,
     reasoning: String,
+    durable_content: String,
+    durable_reasoning: String,
     last_emit: std::time::Instant,
+    last_checkpoint: std::time::Instant,
 }
 
 impl<'a> StreamEventBatcher<'a> {
@@ -70,8 +75,11 @@ impl<'a> StreamEventBatcher<'a> {
             run_id,
             content: String::new(),
             reasoning: String::new(),
+            durable_content: String::new(),
+            durable_reasoning: String::new(),
             // 首个增量立即显示；后续增量进入 32ms/8KB 批次。
             last_emit: std::time::Instant::now() - Self::MAX_DELAY,
+            last_checkpoint: std::time::Instant::now(),
         }
     }
 
@@ -97,22 +105,64 @@ impl<'a> StreamEventBatcher<'a> {
         if self.content.is_empty() && self.reasoning.is_empty() {
             return;
         }
+        let content = std::mem::take(&mut self.content);
+        let reasoning = std::mem::take(&mut self.reasoning);
+        self.durable_content.push_str(&content);
+        self.durable_reasoning.push_str(&reasoning);
+        // SQLite checkpoint 限频到 500ms/64KB；IPC 仍保持 32ms，兼顾不卡 UI 与崩溃恢复。
+        let should_checkpoint = self.last_checkpoint.elapsed() >= std::time::Duration::from_millis(500)
+            || self.durable_content.len() + self.durable_reasoning.len() >= 64 * 1024;
+        let checkpoint_seq = if should_checkpoint {
+            self.checkpoint()
+        } else {
+            None
+        };
         let _ = self.app.emit(
             "chat-stream-batch",
             ChatStreamBatchEvent {
                 conversation_id: self.conversation_id.to_string(),
                 run_id: self.run_id.clone(),
-                content: std::mem::take(&mut self.content),
-                reasoning: std::mem::take(&mut self.reasoning),
+                content,
+                reasoning,
+                checkpoint_seq,
             },
         );
         self.last_emit = std::time::Instant::now();
+    }
+
+    fn checkpoint(&mut self) -> Option<i64> {
+        if self.durable_content.is_empty() && self.durable_reasoning.is_empty() {
+            return None;
+        }
+        let content = std::mem::take(&mut self.durable_content);
+        let reasoning = std::mem::take(&mut self.durable_reasoning);
+        let seq = crate::db::global()
+            // checkpoint 是增强恢复能力的旁路，绝不能因 SQLite 正忙反向阻塞模型流。
+            // 抢不到锁就保留缓冲，下一批再重试。
+            .and_then(|db| db.try_lock().ok().and_then(|conn| {
+                crate::agent::runtime::append_event(
+                    &conn,
+                    &self.run_id,
+                    self.conversation_id,
+                    "model.delta",
+                    serde_json::json!({ "content": content, "reasoning": reasoning }),
+                )
+                .ok()
+            }));
+        if seq.is_none() {
+            // 数据库短暂繁忙时不丢 checkpoint，下一批继续合并重试。
+            self.durable_content = content;
+            self.durable_reasoning = reasoning;
+        }
+        self.last_checkpoint = std::time::Instant::now();
+        seq
     }
 }
 
 impl Drop for StreamEventBatcher<'_> {
     fn drop(&mut self) {
         self.flush();
+        let _ = self.checkpoint();
     }
 }
 
@@ -344,9 +394,9 @@ pub fn resolve_diagnose_card(
     Ok(())
 }
 
-/// 工具权限模式：ask=自动审核（逐次确认）；其他（含缺省）=完全放任
+/// 工具权限模式：缺省采用 auto 分级审核；完全放任必须由用户显式选择。
 fn approval_mode(opts: &ChatOptions) -> &str {
-    opts.tool_approval.as_deref().unwrap_or("allow_all")
+    opts.tool_approval.as_deref().unwrap_or("auto")
 }
 
 /// 计划/审查模式开关
@@ -409,8 +459,16 @@ async fn request_plan_review(
     state: &State<'_, PlanApprovalState>,
     cancel: &ChatCancel,
     conversation_id: &str,
+    run_id: &str,
     plan: &str,
 ) -> Result<PlanReview, String> {
+    crate::agent::runtime::transition_global(
+        run_id,
+        conversation_id,
+        "waiting_approval",
+        "plan_review",
+        None,
+    );
     let request_id = Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
     {
@@ -749,6 +807,8 @@ struct ToolRunItem {
     tool: String,
     args: String,
     output: String,
+    /// 真实执行结果；不能再从自然语言 output 猜测（审批拦截也可能不含“失败”字样）。
+    succeeded: bool,
     /// 是否已即时入库（persist_tool_run_immediate 落库后置 true）
     persisted: bool,
 }
@@ -1514,7 +1574,7 @@ pub struct ChatOptions {
     pub sub_model_id: Option<String>,
     /// 子 Agent 最大并发数（缺省 3）
     pub max_concurrency: Option<u32>,
-    /// 工具权限模式：ask=自动审核（每次执行前弹窗确认）；auto=分级审核（L0/L1 免审，仅 L2 危险工具弹窗）；allow_all=完全放任（缺省，直接执行）；first_write=自动修复模式（首次写文件前确认，本任务后续写操作免审，其他工具直接放行）
+    /// 工具权限模式：ask=每次确认；auto=分级审核（缺省，L0/L1 免审，仅 L2 危险工具确认）；allow_all=显式完全放任；first_write=首次写文件确认
     pub tool_approval: Option<String>,
     /// 计划/审查模式：true 时 Agent 先输出【PLAN】...【/PLAN】任务计划，等待用户确认后才执行工具
     pub plan_mode: Option<bool>,
@@ -1556,7 +1616,17 @@ impl Drop for RegisteredChatTask {
         // WebView 重载/窗口销毁会取消 invoke Future。JoinHandle 被 drop 默认会让任务
         // 脱离后台继续运行并永久占用 registry；这里同步 abort + 条件注销，避免幽灵任务
         // 阻塞下一次发送。已入库的正文占位仍可由“继续任务”恢复。
+        let run_id = self.app.state::<TaskRegistry>().run_id(&self.conversation_id);
         self.abort.abort();
+        if !run_id.is_empty() {
+            crate::agent::runtime::transition_global(
+                &run_id,
+                &self.conversation_id,
+                "interrupted",
+                "invoke_dropped",
+                Some("前端调用被释放，任务已安全中断"),
+            );
+        }
         self.app
             .state::<TaskRegistry>()
             .unregister(&self.conversation_id, self.generation);
@@ -1643,6 +1713,18 @@ pub async fn stream_chat(
     // 登记成功后才放行；接收端若已异常退出，join 会返回实际错误。
     let _ = start_tx.send(());
     let result = join.await;
+    if matches!(&result, Err(e) if !e.is_cancelled()) {
+        let run_id = app.state::<TaskRegistry>().run_id(&conversation_id);
+        if !run_id.is_empty() {
+            crate::agent::runtime::transition_global(
+                &run_id,
+                &conversation_id,
+                "failed",
+                "task_panicked",
+                Some("任务执行线程异常退出"),
+            );
+        }
+    }
     registered.finish();
     match result {
         Ok(r) => r,
@@ -1715,6 +1797,30 @@ async fn stream_chat_body(
             imgs_this,
         )
         .await;
+
+        // Durable run 终态必须先于 task_runs 指标收尾落库。即使前端漏掉终态事件，重连
+        // 也能从 agent_runs 得到真实状态；unfinished 与 success 明确区分。
+        if let Some(run_id) = stats.run_id.as_deref() {
+            let (run_state, phase, error) = if stats.stopped {
+                ("cancelled", "cancelled", Some("用户停止任务"))
+            } else if let Err(err) = &result {
+                ("failed", "failed", Some(err.message.as_str()))
+            } else if stats.unfinished {
+                ("interrupted", "continuation_required", Some("任务尚未满足完成条件"))
+            } else {
+                ("completed", "done", None)
+            };
+            if let Ok(conn) = state.0.lock() {
+                let _ = crate::agent::runtime::transition(
+                    &conn,
+                    run_id,
+                    &conversation_id,
+                    run_state,
+                    phase,
+                    error,
+                );
+            }
+        }
 
         // 任务级 Trace：成功/失败/取消 + 耗时 + 重试 + token 成本（记录失败不影响主流程）
         record_task_run(state, &conversation_id, started_ms, &stats, &result);
@@ -1916,6 +2022,27 @@ fn tool_audit_payload(tool: &str, input: &str, output: &str, status: &str) -> (S
     (bounded_tool_audit_text(input), bounded_tool_audit_text(output))
 }
 
+/// 工具副作用与崩溃恢复契约。未知工具一律按可能有副作用处理，禁止自动重放。
+fn tool_recovery_profile(tool: &str) -> (&'static str, &'static str) {
+    if is_concurrency_safe(tool)
+        || matches!(
+            tool,
+            "job_list" | "job_output" | "tool_list" | "tool_help" | "tool_history"
+                | "list_devices" | "device_info" | "environment_check" | "read_runtime_logs"
+        )
+    {
+        ("read", "replay")
+    } else if matches!(
+        tool,
+        "delete_file" | "git_push" | "git_commit" | "git_merge" | "git_rebase"
+            | "deploy" | "install_app" | "uninstall_app" | "secret_store"
+    ) {
+        ("destructive", "manual")
+    } else {
+        ("write", "verify")
+    }
+}
+
 /// 工具开始即落一条 running 记录。进程崩溃时该记录会保留下来，诊断层可明确识别
 /// 未收尾调用；call_id 同时作为主键与前端事件关联键，重复事件天然幂等。
 fn begin_tool_run(
@@ -1927,13 +2054,29 @@ fn begin_tool_run(
     input: &str,
 ) {
     let (input, _) = tool_audit_payload(tool, input, "", "running");
+    let (effect_kind, recovery_policy) = tool_recovery_profile(tool);
     let Ok(conn) = state.0.lock() else { return };
-    let _ = conn.execute(
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO tool_runs
-         (id, conversation_id, tool_name, input_json, status, duration_ms, created_at, trace_id, call_id)
-         VALUES (?1,?2,?3,?4,'running',0,?5,?6,?1)",
-        params![call_id, conversation_id, tool, input, now(), trace_id],
-    );
+         (id, conversation_id, tool_name, input_json, status, duration_ms, created_at, trace_id,
+          call_id, idempotency_key, effect_kind, recovery_policy, prepared_at)
+         VALUES (?1,?2,?3,?4,'running',0,?5,?6,?1,?1,?7,?8,?5)",
+        params![call_id, conversation_id, tool, input, now(), trace_id, effect_kind, recovery_policy],
+    ).unwrap_or(0);
+    if inserted > 0 {
+        let _ = crate::agent::runtime::append_event(
+            &conn,
+            trace_id,
+            conversation_id,
+            "tool.prepared",
+            serde_json::json!({
+                "call_id": call_id,
+                "tool": tool,
+                "effect_kind": effect_kind,
+                "recovery_policy": recovery_policy,
+            }),
+        );
+    }
 }
 
 /// 工具终态落库（Evaluation/审计统计来源）：有 begin 记录则原位更新；子 Agent 等
@@ -1955,20 +2098,34 @@ fn finish_tool_run(
         if conn
             .execute(
                 "UPDATE tool_runs SET result_json=?1, status=?2, duration_ms=?3,
-                 trace_id=?4, call_id=?5 WHERE id=?5",
-                params![output, status, duration_ms, trace_id, id],
+                 trace_id=?4, call_id=?5, finished_at=?6 WHERE id=?5",
+                params![output, status, duration_ms, trace_id, id, now()],
             )
             .unwrap_or(0)
             > 0
         {
+            let _ = crate::agent::runtime::append_event(
+                &conn,
+                trace_id,
+                conversation_id,
+                "tool.finished",
+                serde_json::json!({
+                    "call_id": id,
+                    "tool": tool,
+                    "status": status,
+                    "duration_ms": duration_ms,
+                }),
+            );
             return;
         }
     }
     let id = call_id.map(str::to_string).unwrap_or_else(|| Uuid::new_v4().to_string());
-    let _ = conn.execute(
+    let (effect_kind, recovery_policy) = tool_recovery_profile(tool);
+    let inserted = conn.execute(
         "INSERT OR REPLACE INTO tool_runs
-         (id, conversation_id, tool_name, input_json, result_json, status, duration_ms, created_at, trace_id, call_id)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+         (id, conversation_id, tool_name, input_json, result_json, status, duration_ms, created_at,
+          trace_id, call_id, idempotency_key, effect_kind, recovery_policy, prepared_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?1,?11,?12,?8,?13)",
         params![
             id,
             conversation_id,
@@ -1980,8 +2137,25 @@ fn finish_tool_run(
             now(),
             trace_id,
             call_id,
+            effect_kind,
+            recovery_policy,
+            now(),
         ],
-    );
+    ).unwrap_or(0);
+    if inserted > 0 {
+        let _ = crate::agent::runtime::append_event(
+            &conn,
+            trace_id,
+            conversation_id,
+            "tool.finished",
+            serde_json::json!({
+                "call_id": call_id,
+                "tool": tool,
+                "status": status,
+                "duration_ms": duration_ms,
+            }),
+        );
+    }
 }
 
 /// 组装规则文本：全局指令 + 项目规则 + 工程根规则文件自动发现（AGENTS.md 等）。
@@ -2055,6 +2229,10 @@ async fn stream_chat_inner(
     let trace_id = Uuid::new_v4().to_string();
     stats.run_id = Some(trace_id.clone());
     registry.set_run_id(&conversation_id, &trace_id);
+    {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        crate::agent::runtime::begin_run(&conn, &trace_id, &conversation_id, content.trim())?;
+    }
     let _ = app.emit(
         "chat-run-started",
         ChatRunStartedEvent {
@@ -3361,6 +3539,16 @@ async fn stream_chat_inner(
     // 声明在循环外：主流程据此判定任务是否被护栏强制收尾（强制收尾时账本需保留））
     let mut exhausted = false;
     loop {
+        if let Ok(conn) = state.0.lock() {
+            let _ = crate::agent::runtime::transition(
+                &conn,
+                &trace_id,
+                &conversation_id,
+                "running",
+                "orchestrating",
+                None,
+            );
+        }
         // 任务心跳打点（每轮循环顶部）：配合工具/请求/压缩日志，任何卡点都能从最后一条
         // 心跳定位到所在阶段——此前卡在无超时请求内时日志静默，事后无法定位“空跑”位置
         registry.touch(&conversation_id, PHASE_MAIN_LOOP);
@@ -4014,6 +4202,16 @@ async fn stream_chat_inner(
                 "elapsed_ms": task_started.elapsed().as_millis() as i64,
             }),
         );
+        if let Ok(conn) = state.0.lock() {
+            let _ = crate::agent::runtime::transition(
+                &conn,
+                &trace_id,
+                &conversation_id,
+                "running",
+                "requesting_model",
+                None,
+            );
+        }
         let outcome = match stream_once(
             &app,
             &client,
@@ -4231,13 +4429,20 @@ async fn stream_chat_inner(
                 } else {
                     plan_text
                 };
-                let review = request_plan_review(&app, plan_review, cancel.inner(), &conversation_id, &plan_text)
+                let review = request_plan_review(&app, plan_review, cancel.inner(), &conversation_id, &trace_id, &plan_text)
                     .await
                     .unwrap_or(PlanReview {
                         approved: false,
                         feedback: "计划审查通道异常，已暂停".to_string(),
                         cancelled: false,
                     });
+                crate::agent::runtime::transition_global(
+                    &trace_id,
+                    &conversation_id,
+                    "running",
+                    "plan_review_resolved",
+                    None,
+                );
                 // 用户在审查等待期间点了停止：按停止收尾，不重新规划
                 if review.cancelled {
                     let _ = app.emit("chat-plan-resolved", serde_json::json!({
@@ -4614,6 +4819,7 @@ async fn stream_chat_inner(
                         tool: tool.clone(),
                         args: args_raw.clone(),
                         output: intercept.message.clone(),
+                        succeeded: false,
                         persisted: true,
                     });
                     // 用户在工具审批等待期间主动停止：按停止收尾（不再请求模型总结，
@@ -4849,6 +5055,7 @@ async fn stream_chat_inner(
                         tool: tool.clone(),
                         args: args_raw.clone(),
                         output,
+                        succeeded: true,
                         persisted: true,
                     });
                 }
@@ -4891,6 +5098,7 @@ async fn stream_chat_inner(
                         output: format!(
                             "执行失败: {e}\n（工具失败。请按障碍处理协议：①一句话失败诊断；②下一步具体动作——换工具/换参数/换思路后继续推进；确实无法推进时说明卡点与所需条件。）"
                         ),
+                        succeeded: false,
                         persisted: true,
                     });
                 }
@@ -4959,13 +5167,20 @@ async fn stream_chat_inner(
             } else {
                 plan_text
             };
-            let review = request_plan_review(&app, plan_review, cancel.inner(), &conversation_id, &plan_text)
+            let review = request_plan_review(&app, plan_review, cancel.inner(), &conversation_id, &trace_id, &plan_text)
                 .await
                 .unwrap_or(PlanReview {
                     approved: false,
                     feedback: "计划审查通道异常，已暂停".to_string(),
                     cancelled: false,
                 });
+            crate::agent::runtime::transition_global(
+                &trace_id,
+                &conversation_id,
+                "running",
+                "plan_review_resolved",
+                None,
+            );
             // 用户在审查等待期间点了停止：按停止收尾，不重新规划
             if review.cancelled {
                 let _ = app.emit("chat-plan-resolved", serde_json::json!({
@@ -5158,9 +5373,47 @@ async fn stream_chat_inner(
         break;
     }
 
-    // 6. 先计算真实完成态，再入库并推送终态。此前这里固定传 unfinished=false，
-    // 会造成“账本仍未完成，但 UI 显示任务完成”的协议分裂。
-    let task_done = !exhausted && (is_completion_confirmation(&last_model_text) || tool_runs.is_empty());
+    // 6. 证据驱动验收：模型的“任务已完成”只是一份完成申请，最终状态由原始目标与
+    // 真实工具轨迹计算。显式要求构建/测试/部署或修改却无对应成功证据时保持未完成。
+    if let Ok(conn) = state.0.lock() {
+        let _ = crate::agent::runtime::transition(
+            &conn,
+            &trace_id,
+            &conversation_id,
+            "verifying",
+            "acceptance",
+            None,
+        );
+    }
+    let acceptance_evidence = tool_runs
+        .iter()
+        .map(|item| crate::agent::acceptance::ToolEvidence {
+            tool: &item.tool,
+            args: &item.args,
+            succeeded: item.succeeded,
+        })
+        .collect::<Vec<_>>();
+    let acceptance = crate::agent::acceptance::evaluate(&task_goal, &acceptance_evidence);
+    if let Ok(conn) = state.0.lock() {
+        let value = serde_json::to_value(&acceptance).unwrap_or_else(|_| serde_json::json!({}));
+        let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
+        let _ = crate::agent::runtime::append_event(
+            &conn,
+            &trace_id,
+            &conversation_id,
+            "run.acceptance",
+            value,
+        );
+    }
+    if !acceptance.passed {
+        full.push_str(&format!(
+            "\n\n> ⚠️ 自动验收未通过：{}。任务已保留为未完成，可继续执行并补齐证据。",
+            acceptance.blockers.join("、")
+        ));
+    }
+    let task_done = !exhausted
+        && acceptance.passed
+        && (is_completion_confirmation(&last_model_text) || tool_runs.is_empty());
     stats.unfinished = !task_done;
     persist_turn(
         &state,
@@ -7871,6 +8124,18 @@ async fn run_tool_with_guard(
     if is_cancelled(cancel, conversation_id) {
         return Err("用户已停止生成".into());
     }
+    if !tool_ctx.run_id.is_empty() {
+        if let Ok(conn) = state.0.lock() {
+            let _ = crate::agent::runtime::transition(
+                &conn,
+                &tool_ctx.run_id,
+                conversation_id,
+                "running",
+                "executing_tool",
+                None,
+            );
+        }
+    }
     let fut = crate::agent::tools::run_tool(
         tool,
         args_raw,
@@ -7938,6 +8203,15 @@ mod tool_execution_policy_tests {
         assert!(!tool_retry_safe("build_project"));
         assert!(!tool_retry_safe("git_push"));
         assert!(!tool_retry_safe("mcp__server__read_file"));
+    }
+
+    #[test]
+    fn recovery_contract_is_conservative_and_default_approval_is_safe() {
+        assert_eq!(tool_recovery_profile("read_file"), ("read", "replay"));
+        assert_eq!(tool_recovery_profile("edit_file"), ("write", "verify"));
+        assert_eq!(tool_recovery_profile("git_push"), ("destructive", "manual"));
+        assert_eq!(tool_recovery_profile("mcp__unknown"), ("write", "verify"));
+        assert_eq!(approval_mode(&ChatOptions::default()), "auto");
     }
 
     #[test]
@@ -8269,6 +8543,7 @@ async fn apply_tool_batch(
             tool: r.tool.clone(),
             args: r.args_raw.clone(),
             output,
+            succeeded: r.ok,
             persisted: true,
         });
         stats.retry_count += r.retries as i64;
@@ -8507,6 +8782,34 @@ pub struct SessionEventsView {
     pub messages: Vec<crate::agent::session_events::DerivedMessage>,
     /// 事件总数
     pub total: i64,
+}
+
+/// 查询会话最近一次 durable Agent Run。前端重载后以此恢复真实终态，
+/// 不再仅依赖可能丢失的 Tauri 终态事件。
+#[tauri::command]
+pub fn get_latest_agent_run(
+    conversation_id: String,
+    state: State<'_, DbState>,
+) -> Result<Option<crate::agent::runtime::AgentRun>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::runtime::latest_run(&conn, &conversation_id)
+}
+
+/// 按单调序号补拉运行事件；limit 硬限制 1000，防错误客户端一次拉爆内存。
+#[tauri::command]
+pub fn get_agent_run_events(
+    run_id: String,
+    after_seq: Option<i64>,
+    limit: Option<usize>,
+    state: State<'_, DbState>,
+) -> Result<Vec<crate::agent::runtime::RunEvent>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::runtime::events_after(
+        &conn,
+        &run_id,
+        after_seq.unwrap_or(0).max(0),
+        limit.unwrap_or(200),
+    )
 }
 
 /// 查询会话事件日志（回放/统计），与写入侧的 append_event 构成完整的事件溯源闭环
@@ -10232,9 +10535,9 @@ mod ledger_and_ship_tests {
     #[test]
     fn ledger_from_tool_runs_split_and_cap() {
         let runs = vec![
-            ToolRunItem { tool: "read_file".into(), args: String::new(), output: "内容读取成功".into(), persisted: true },
-            ToolRunItem { tool: "build_project".into(), args: String::new(), output: "执行失败: 编译错误".into(), persisted: true },
-            ToolRunItem { tool: "edit_file".into(), args: String::new(), output: "已修改".into(), persisted: true },
+            ToolRunItem { tool: "read_file".into(), args: String::new(), output: "内容读取成功".into(), succeeded: true, persisted: true },
+            ToolRunItem { tool: "build_project".into(), args: String::new(), output: "执行失败: 编译错误".into(), succeeded: false, persisted: true },
+            ToolRunItem { tool: "edit_file".into(), args: String::new(), output: "已修改".into(), succeeded: true, persisted: true },
         ];
         let l = TaskLedger::from_tool_runs("修复编译错误", &runs, "继续修复", 0);
         assert_eq!(l.goal, "修复编译错误");
@@ -10251,6 +10554,7 @@ mod ledger_and_ship_tests {
                 tool: "run_command".into(),
                 args: String::new(),
                 output: format!("ok {i}"),
+                succeeded: true,
                 persisted: true,
             })
             .collect::<Vec<_>>();
@@ -10261,11 +10565,11 @@ mod ledger_and_ship_tests {
     #[test]
     fn ledger_merge_continuation_renumbers_and_caps() {
         let base_runs = vec![
-            ToolRunItem { tool: "read_file".into(), args: String::new(), output: "a".into(), persisted: true },
-            ToolRunItem { tool: "build_project".into(), args: String::new(), output: "执行失败: x".into(), persisted: true },
+            ToolRunItem { tool: "read_file".into(), args: String::new(), output: "a".into(), succeeded: true, persisted: true },
+            ToolRunItem { tool: "build_project".into(), args: String::new(), output: "执行失败: x".into(), succeeded: false, persisted: true },
         ];
         let base = TaskLedger::from_tool_runs("旧目标", &base_runs, "旧下一步", 0);
-        let new_runs = vec![ToolRunItem { tool: "edit_file".into(), args: String::new(), output: "b".into(), persisted: true }];
+        let new_runs = vec![ToolRunItem { tool: "edit_file".into(), args: String::new(), output: "b".into(), succeeded: true, persisted: true }];
         // 编号从旧账本最大编号续接：旧 1,2 → 新 3
         let derived = TaskLedger::from_tool_runs("新目标", &new_runs, "新下一步", 2);
         assert_eq!(derived.verified[0].n, 3);
@@ -10286,7 +10590,7 @@ mod ledger_and_ship_tests {
         assert!(is_tool_failed("执行失败: 超时"));
         assert!(is_tool_failed("【工具失败】构建失败"));
         assert!(!is_tool_failed("构建成功"));
-        let runs = vec![ToolRunItem { tool: "build_project".into(), args: String::new(), output: "构建成功".into(), persisted: true }];
+        let runs = vec![ToolRunItem { tool: "build_project".into(), args: String::new(), output: "构建成功".into(), succeeded: true, persisted: true }];
         let l = TaskLedger::from_tool_runs("g", &runs, "n", 0);
         let hint = l.to_hint();
         assert!(hint.contains("## 任务账本"));

@@ -391,11 +391,11 @@ export function ModelSettingsPopover({
         <div className="pt-3 border-t border-[var(--border)]">
           <div className="text-[10px] font-medium text-[var(--text-muted)] mb-1.5">{t('home.toolApproval')}</div>
           <select
-            value={options.tool_approval ?? 'allow_all'}
+            value={options.tool_approval ?? 'auto'}
             onChange={(e) =>
               onChange({
                 ...options,
-                tool_approval: e.target.value === 'allow_all' ? undefined : (e.target.value as 'ask' | 'auto' | 'first_write' | 'allow_all'),
+                tool_approval: e.target.value === 'auto' ? undefined : (e.target.value as 'ask' | 'auto' | 'first_write' | 'allow_all'),
               })
             }
             className="w-full h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-2 text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
@@ -670,5 +670,4 @@ export const TaskOpsBadge = memo(function TaskOpsBadge({
     </div>
   )
 })
-
 
