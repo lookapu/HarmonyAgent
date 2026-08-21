@@ -42,6 +42,7 @@ pub struct ReliabilityDashboard {
     pub critical_alert_count: i64,
     pub quota: crate::agent::enterprise::QuotaUsage,
     pub worker_runtime: crate::agent::scheduler::WorkerRuntimeStats,
+    pub tool_runtime: crate::agent::tool_runtime::ToolRuntimeStats,
 }
 
 #[tauri::command]
@@ -159,11 +160,13 @@ pub fn get_reliability_dashboard(
     ).unwrap_or(0);
     let structured_tools: i64 = conn.query_row(
         "SELECT COUNT(*) FROM tool_runs WHERE created_at>=?1 AND structured_result_json IS NOT NULL
+         AND (protocol_version<2 OR outcome_committed_at IS NOT NULL)
          AND status IN ('ok','error','blocked','cancelled','interrupted')", [since / 1000], |row| row.get(0),
     ).unwrap_or(0);
     let duplicate_side_effect_count: i64 = conn.query_row(
         "SELECT COALESCE(SUM(n-1),0) FROM (SELECT COUNT(*) n FROM tool_runs WHERE created_at>=?1
-         AND effect_kind!='read' AND status='ok' AND evidence_digest IS NOT NULL GROUP BY trace_id,evidence_digest HAVING COUNT(*)>1)",
+         AND effect_kind!='read' AND status='ok' AND idempotency_key IS NOT NULL
+         GROUP BY trace_id,idempotency_key HAVING COUNT(*)>1)",
         [since / 1000], |row| row.get(0),
     ).unwrap_or(0);
     let scheduler_states = named_counts(
@@ -201,6 +204,7 @@ pub fn get_reliability_dashboard(
         critical_alert_count,
         quota: crate::agent::enterprise::quota(&conn)?,
         worker_runtime: crate::agent::scheduler::runtime_stats(&conn)?,
+        tool_runtime: crate::agent::tool_runtime::runtime_stats(&conn)?,
     })
 }
 
@@ -230,6 +234,15 @@ pub fn list_agent_workers(
 ) -> Result<Vec<crate::agent::scheduler::WorkerInfo>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     crate::agent::scheduler::list_workers(&conn, limit.unwrap_or(100))
+}
+
+#[tauri::command]
+pub fn list_tool_execution_workers(
+    db: State<DbState>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::agent::tool_runtime::ToolWorkerInfo>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::tool_runtime::list_workers(&conn, limit.unwrap_or(100))
 }
 
 #[tauri::command]

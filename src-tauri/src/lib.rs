@@ -204,6 +204,8 @@ pub fn run() {
                             crate::agent::scheduler::current_worker_id(),
                         );
                         let _ = crate::agent::scheduler::recover_stale_owners(&conn, 60_000);
+                        let _ = crate::agent::tool_runtime::heartbeat_current_worker(&conn);
+                        let _ = crate::agent::tool_runtime::recover_stale(&conn, 60_000);
                     }
                 });
             }
@@ -506,6 +508,7 @@ pub fn run() {
             commands::reliability::list_agent_alerts,
             commands::reliability::list_agent_audit_events,
             commands::reliability::list_agent_workers,
+            commands::reliability::list_tool_execution_workers,
             commands::reliability::get_scheduled_agent_task,
             commands::reliability::claim_next_scheduled_agent_task,
             commands::reliability::retry_scheduled_agent_task,
@@ -663,6 +666,7 @@ pub fn run() {
                     if let Some(db) = handle.try_state::<db::DbState>() {
                         if let Ok(conn) = db.0.try_lock() {
                             let _ = crate::agent::scheduler::stop_current_worker(&conn);
+                            let _ = crate::agent::tool_runtime::stop_current_worker(&conn);
                         }
                     }
                     // MCP 子进程属于当前桌面 Worker，每个实例都应独立回收。

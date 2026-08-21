@@ -7,6 +7,7 @@ pub enum FailureSignal {
     StreamBeforeDelta, StreamAfterDelta, ModelTruncated, ReadTimeout, WriteTimeout,
     RestartPreparedEffect, ApprovalTimeout, StaleTerminal, MissingEvidence,
     BudgetExhausted, SubagentMissingEvidence,
+    ToolWorkerCrash, StaleToolOutcome, DuplicateSideEffect, DatabaseBusy, ToolWorkerPanic,
 }
 
 pub fn reliability_disposition(signal: FailureSignal) -> &'static str {
@@ -22,6 +23,11 @@ pub fn reliability_disposition(signal: FailureSignal) -> &'static str {
         FailureSignal::MissingEvidence => "automatic_remediation",
         FailureSignal::BudgetExhausted => "unfinished_with_checkpoint",
         FailureSignal::SubagentMissingEvidence => "reject_claim",
+        FailureSignal::ToolWorkerCrash => "effect_aware_recovery",
+        FailureSignal::StaleToolOutcome => "owner_fenced",
+        FailureSignal::DuplicateSideEffect => "idempotency_blocked",
+        FailureSignal::DatabaseBusy => "bounded_backpressure",
+        FailureSignal::ToolWorkerPanic => "isolate_call_and_continue",
     }
 }
 
@@ -133,6 +139,9 @@ mod tests {
             FailureSignal::ApprovalTimeout, FailureSignal::StaleTerminal,
             FailureSignal::MissingEvidence, FailureSignal::BudgetExhausted,
             FailureSignal::SubagentMissingEvidence,
+            FailureSignal::ToolWorkerCrash, FailureSignal::StaleToolOutcome,
+            FailureSignal::DuplicateSideEffect, FailureSignal::DatabaseBusy,
+            FailureSignal::ToolWorkerPanic,
         ];
         assert_eq!(rows.len(), signals.len());
         for (row, signal) in rows.iter().zip(signals) {

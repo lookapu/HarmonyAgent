@@ -141,6 +141,8 @@ fn classify_error(status: &str, output: &str, retry_safe: bool) -> ToolErrorEvid
     let lower = output.to_lowercase();
     let (code, category, transient) = if status == "cancelled" {
         ("TOOL_CANCELLED", "cancelled", false)
+    } else if lower.contains("panic") {
+        ("TOOL_WORKER_PANIC", "worker_crash", false)
     } else if lower.contains("timeout") || lower.contains("超时") {
         ("TOOL_TIMEOUT", "timeout", true)
     } else if lower.contains("permission") || lower.contains("权限") {
@@ -382,5 +384,15 @@ mod tests {
             "ok",
         );
         assert_eq!(native.artifacts[0].path, "dist/app.exe");
+    }
+
+    #[test]
+    fn worker_panic_is_non_retryable_and_machine_readable() {
+        let value = ToolResultEnvelope::from_execution(
+            "read_file", "{}", "工具执行器发生 panic，已隔离当前调用", "error",
+        );
+        let error = value.error.unwrap();
+        assert_eq!(error.code, "TOOL_WORKER_PANIC");
+        assert!(!error.retryable);
     }
 }

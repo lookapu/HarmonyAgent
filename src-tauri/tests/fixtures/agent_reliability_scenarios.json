@@ -9,5 +9,10 @@
   {"id":"stale_terminal_event","domain":"runtime","expected":"terminal_state_immutable"},
   {"id":"completion_without_evidence","domain":"acceptance","expected":"automatic_remediation"},
   {"id":"budget_exhaustion","domain":"governance","expected":"unfinished_with_checkpoint"},
-  {"id":"subagent_claim_without_tools","domain":"subagent","expected":"reject_claim"}
+  {"id":"subagent_claim_without_tools","domain":"subagent","expected":"reject_claim"},
+  {"id":"tool_worker_crash","domain":"tool_worker","expected":"effect_aware_recovery"},
+  {"id":"stale_tool_outcome","domain":"tool_worker","expected":"owner_fenced"},
+  {"id":"duplicate_side_effect","domain":"idempotency","expected":"idempotency_blocked"},
+  {"id":"database_busy","domain":"storage","expected":"bounded_backpressure"},
+  {"id":"tool_worker_panic","domain":"tool_worker","expected":"isolate_call_and_continue"}
 ]

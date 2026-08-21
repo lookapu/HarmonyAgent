@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as StdMutex;
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -2059,18 +2059,21 @@ fn begin_tool_run(
     tool: &str,
     input: &str,
 ) {
-    let (input, _) = tool_audit_payload(tool, input, "", "running");
     let contract = crate::agent::tools::contracts::contract(tool);
     let effect_kind = contract.effect.as_str();
     let recovery_policy = contract.recovery.as_str();
+    let idempotency_key = crate::agent::tool_runtime::idempotency_key(
+        trace_id, call_id, tool, input,
+    );
+    let (input, _) = tool_audit_payload(tool, input, "", "running");
     let Ok(conn) = state.0.lock() else { return };
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO tool_runs
          (id, conversation_id, tool_name, input_json, status, duration_ms, created_at, trace_id,
           call_id, idempotency_key, effect_kind, recovery_policy, prepared_at,dag_node_id)
-         VALUES (?1,?2,?3,?4,'prepared',0,?5,?6,?1,?1,?7,?8,?5,
+         VALUES (?1,?2,?3,?4,'prepared',0,?5,?6,?1,?9,?7,?8,?5,
                  (SELECT dag_node_id FROM agent_runs WHERE run_id=?6))",
-        params![call_id, conversation_id, tool, input, now(), trace_id, effect_kind, recovery_policy],
+        params![call_id, conversation_id, tool, input, now(), trace_id, effect_kind, recovery_policy, idempotency_key],
     ).unwrap_or(0);
     if inserted > 0 {
         let _ = crate::agent::coordinator::prepare_tool_step(
@@ -2092,18 +2095,23 @@ fn mark_tool_run_started(
     conversation_id: &str,
     trace_id: &str,
     call_id: &str,
-) {
-    let Ok(conn) = state.0.lock() else { return };
-    let _ = conn.execute(
-        "UPDATE tool_runs SET status='running' WHERE id=?1 AND status='prepared'",
-        [call_id],
-    );
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let started = crate::agent::tool_runtime::start_attempt(&conn, call_id, 180_000)
+        .ok()
+        .flatten()
+        .is_some();
+    if !started {
+        return Err(crate::agent::tool_runtime::start_denial_reason(&conn, call_id)
+            .unwrap_or_else(|| "工具执行器当前不可用或调用已被其他 Worker 接管，本次未执行".into()));
+    }
     let _ = crate::agent::coordinator::start_tool_step(
         &conn,
         trace_id,
         conversation_id,
         call_id,
     );
+    Ok(())
 }
 
 /// 工具终态落库（Evaluation/审计统计来源）：有 begin 记录则原位更新；子 Agent 等
@@ -2119,27 +2127,40 @@ fn finish_tool_run(
     output: &str,
     status: &str,
     duration_ms: i64,
-) {
+) -> bool {
     let (input, output) = tool_audit_payload(tool, input, output, status);
     let structured = crate::agent::structured_result::ToolResultEnvelope::from_execution_with_metrics(
         tool, &input, &output, status, duration_ms,
     );
     let structured_json = serde_json::to_string(&structured).unwrap_or_default();
     let evidence_digest = structured.digest();
-    let Ok(conn) = state.0.lock() else { return };
+    let Ok(conn) = state.0.lock() else { return false };
     if let Some(id) = call_id {
+        let _ = crate::agent::tool_runtime::mark_verifying(&conn, id);
         let updated = conn
             .execute(
                 "UPDATE tool_runs SET result_json=?1, status=?2, duration_ms=?3,
                  trace_id=?4, call_id=?5, finished_at=?6,structured_result_json=?7,
                  evidence_digest=?8,dag_node_id=COALESCE(dag_node_id,(SELECT dag_node_id FROM agent_runs WHERE run_id=?4)),
-                 protocol_version=2,error_code=?9,compensation_json=?10,metrics_json=?11 WHERE id=?5
-                 AND status NOT IN ('ok','error','blocked','cancelled','interrupted')",
+                 protocol_version=2,error_code=?9,compensation_json=?10,metrics_json=?11,
+                 outcome_committed_at=?12 WHERE id=?5
+                 AND (status='prepared' OR (status='verifying' AND execution_worker_id=?13 AND lease_token IS NOT NULL))
+                 AND (NOT EXISTS(SELECT 1 FROM agent_task_queue q WHERE q.run_id=?4)
+                   OR EXISTS(SELECT 1 FROM agent_task_queue q WHERE q.run_id=?4 AND q.state='running' AND q.worker_id=?14))",
                 params![output, status, duration_ms, trace_id, id, now(), structured_json, evidence_digest,
-                    structured.error.as_ref().map(|e|e.code.as_str()),serde_json::to_string(&structured.compensation).ok(),serde_json::to_string(&structured.metrics).ok()],
+                    structured.error.as_ref().map(|e|e.code.as_str()),serde_json::to_string(&structured.compensation).ok(),
+                    serde_json::to_string(&structured.metrics).ok(),chrono::Utc::now().timestamp_millis(),
+                    crate::agent::tool_runtime::current_worker_id(),crate::agent::scheduler::current_worker_id()],
             )
             .unwrap_or(0);
         if updated > 0 {
+            let _ = crate::agent::tool_runtime::close_committed_attempt(
+                &conn,
+                id,
+                status,
+                Some(&evidence_digest),
+                structured.error.as_ref().map(|e| e.message.as_str()),
+            );
             let _ = crate::agent::coordinator::finish_tool_step(
                 &conn,
                 trace_id,
@@ -2189,7 +2210,7 @@ fn finish_tool_run(
                     "artifacts": structured.artifacts,
                 }),
             );
-            return;
+            return true;
         }
         // 已存在的终态调用拒绝迟到/重复收尾。不能继续走 INSERT OR REPLACE，后者会
         // 破坏终态不可变性，并让诊断与恢复策略取决于事件到达顺序。
@@ -2201,7 +2222,7 @@ fn finish_tool_run(
             )
             .unwrap_or(false);
         if exists {
-            return;
+            return false;
         }
     }
     let id = call_id.map(str::to_string).unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -2306,6 +2327,7 @@ fn finish_tool_run(
             }),
         );
     }
+    inserted > 0
 }
 
 /// 组装规则文本：全局指令 + 项目规则 + 工程根规则文件自动发现（AGENTS.md 等）。
@@ -5182,7 +5204,23 @@ async fn stream_chat_inner(
                     exhausted = true;
                     break;
                 }
-            mark_tool_run_started(&state, &conversation_id, &trace_id, &call_id);
+            if let Err(output) = mark_tool_run_started(&state, &conversation_id, &trace_id, &call_id) {
+                finish_tool_run(
+                    app, &state, &conversation_id, &trace_id, Some(&call_id), &tool,
+                    &args_raw, &output, "error", tool_begin.elapsed().as_millis() as i64,
+                );
+                let _ = app.emit("chat-tool-done", ChatToolDoneEvent {
+                    conversation_id: conversation_id.clone(), run_id: trace_id.clone(),
+                    call_id: call_id.clone(), tool: tool.clone(), ok: false,
+                    output: output.clone(), duration_ms: tool_begin.elapsed().as_millis() as i64,
+                });
+                tool_runs.push(ToolRunItem {
+                    tool: tool.clone(), args: args_raw.clone(), output,
+                    succeeded: false, persisted: true,
+                });
+                consecutive_failures += 1;
+                continue;
+            }
             // 子 Agent 委派：并发执行、可指定模型，结果汇总后继续主 Agent 循环
             let result = if tool == "spawn_agents" {
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
@@ -5246,7 +5284,7 @@ async fn stream_chat_inner(
                 Err(e) if e.contains("用户已停止") => "cancelled",
                 Err(_) => "error",
             };
-            finish_tool_run(
+            let committed = finish_tool_run(
                 app,
                 &state,
                 &conversation_id,
@@ -5258,6 +5296,9 @@ async fn stream_chat_inner(
                 audit_status,
                 tool_begin.elapsed().as_millis() as i64,
             );
+            if !committed {
+                result = Err("工具结果未通过执行器 Owner fencing，已丢弃迟到结果".into());
+            }
             // 工具完成跟踪（覆盖串行 + spawn_agents 两条路径；批处理路径在 execute_tool_batch_one 内）
             crate::utils::logger::log_event(
                 "tool_finished",
@@ -8414,6 +8455,8 @@ async fn run_subagent(
         }));
         for (tool, args_raw) in calls {
             let tool_started = std::time::Instant::now();
+            let call_id = Uuid::new_v4().to_string();
+            begin_tool_run(state, conversation_id, child_run_id, &call_id, &tool, &args_raw);
             // 统一护栏：任务预算/失败黑名单/权限审批由 pipeline pre 钩子裁决（与主 Agent
             // 同一套护栏、同一份预算），拦截即终止子任务（防并发打转/越权）
             let tool_ctx = crate::agent::exec_ctx::ToolCtx {
@@ -8435,7 +8478,22 @@ async fn run_subagent(
                 ctx: &tool_ctx,
             };
             if let Err(intercept) = crate::agent::tools::run_pre_hooks(&inv).await {
+                finish_tool_run(
+                    app,
+                    state,
+                    conversation_id,
+                    child_run_id,
+                    Some(&call_id),
+                    &tool,
+                    &args_raw,
+                    &intercept.message,
+                    "blocked",
+                    tool_started.elapsed().as_millis() as i64,
+                );
                 return Err(format!("子任务工具调用被拦截，已终止: {}", intercept.message));
+            }
+            if let Err(reason) = mark_tool_run_started(state, conversation_id, child_run_id, &call_id) {
+                return Err(format!("子任务工具执行器未能取得租约，已安全停止：{reason}"));
             }
             let sub_tool_timeout = tool_exec_timeout(&tool, &args_raw);
             let mut result = match tokio::time::timeout(
@@ -8462,19 +8520,21 @@ async fn run_subagent(
             // 统一护栏后处理：护栏记录/大输出落盘（与主 Agent 同套 post 钩子）
             crate::agent::tools::run_post_hooks(&inv, &mut result).await;
             tool_limits::record_tool_call(conversation_id, &tool, &args_raw);
-            // 子 Agent 没有前端 call_id，直接插入终态审计记录并关联主任务 trace。
-            finish_tool_run(
+            let committed = finish_tool_run(
                 app,
                 state,
                 conversation_id,
                 &tool_ctx.run_id,
-                None,
+                Some(&call_id),
                 &tool,
                 &args_raw,
                 result.as_ref().unwrap_or_else(|e| e),
                 if result.is_ok() { "ok" } else { "error" },
                 tool_started.elapsed().as_millis() as i64,
             );
+            if !committed {
+                result = Err("子任务工具结果未通过执行器 Owner fencing，已丢弃迟到结果".into());
+            }
             let succeeded = result.is_ok();
             let out = match result {
                 Ok(o) => o,
@@ -8574,23 +8634,34 @@ async fn run_tool_with_guard(
             );
         }
     }
-    let fut = crate::agent::tools::run_tool(
-        tool,
-        args_raw,
-        project_path,
-        path_hints,
-        project_id,
-        &*state,
-        mcp,
-        tool_ctx,
-    );
+    let fut = std::panic::AssertUnwindSafe(async {
+        if crate::agent::evals::take_fault("tool_worker_panic") {
+            panic!("reliability fault injection: tool_worker_panic");
+        }
+        crate::agent::tools::run_tool(
+            tool,
+            args_raw,
+            project_path,
+            path_hints,
+            project_id,
+            &*state,
+            mcp,
+            tool_ctx,
+        ).await
+    }).catch_unwind();
     tokio::pin!(fut);
     let timeout = tool_exec_timeout(tool, args_raw);
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            res = &mut fut => return res,
+            res = &mut fut => return match res {
+                Ok(result) => result,
+                Err(_) => {
+                    crate::agent::exec_ctx::request_stop_tool(conversation_id);
+                    Err(format!("工具执行器发生 panic，已隔离当前调用：{tool}"))
+                }
+            },
             _ = &mut deadline => {
                 crate::agent::exec_ctx::request_stop_tool(conversation_id);
                 // 给命令执行器时间消费停止标志并杀进程树，避免超时后留下幽灵进程。
@@ -8690,6 +8761,7 @@ struct BatchToolResult {
     /// 执行输出文本（成功原文/失败“执行失败: …”/拦截文案，与串行路径同口径）
     output: String,
     ok: bool,
+    committed: bool,
     retries: u32,
 }
 
@@ -8782,10 +8854,20 @@ async fn execute_tool_batch_one(
             }),
             output: intercept.message,
             ok: false,
+            committed: true,
             retries: 0,
         };
     }
-    mark_tool_run_started(state, conversation_id, &tool_ctx.run_id, &call_id);
+    if let Err(output) = mark_tool_run_started(state, conversation_id, &tool_ctx.run_id, &call_id) {
+        finish_tool_run(
+            app, state, conversation_id, &tool_ctx.run_id, Some(&call_id), tool,
+            args_raw, &output, "error", tool_begin.elapsed().as_millis() as i64,
+        );
+        return BatchToolResult {
+            tool: tool.to_string(), args_raw: args_raw.to_string(), intercept: None,
+            output, ok: false, committed: false, retries: 0,
+        };
+    }
     // 执行：超时/网络类错误按指数退避自动重试（与串行路径同策略）
     let tool_started = std::time::Instant::now();
     // 工具心跳：长工具执行期间保持心跳，防看门狗误杀
@@ -8835,7 +8917,7 @@ async fn execute_tool_batch_one(
         Ok(o) => (true, o.clone()),
         Err(e) => (false, format!("执行失败: {e}")),
     };
-    finish_tool_run(
+    let committed = finish_tool_run(
         app,
         state,
         conversation_id,
@@ -8859,7 +8941,7 @@ async fn execute_tool_batch_one(
         serde_json::json!({
             "conversation_id": conversation_id,
             "tool": tool,
-            "ok": ok,
+            "ok": ok && committed,
             "elapsed_ms": tool_begin.elapsed().as_millis() as i64,
             "output_chars": output.chars().count(),
         }),
@@ -8871,7 +8953,7 @@ async fn execute_tool_batch_one(
             run_id: tool_ctx.run_id.clone(),
             call_id,
             tool: tool.to_string(),
-            ok,
+            ok: ok && committed,
             output: output.clone(),
             duration_ms: tool_begin.elapsed().as_millis() as i64,
         },
@@ -8881,7 +8963,8 @@ async fn execute_tool_batch_one(
         args_raw: args_raw.to_string(),
         intercept: None,
         output,
-        ok,
+        ok: ok && committed,
+        committed,
         retries: (retried.attempts - 1) as u32,
     }
 }
@@ -8963,17 +9046,21 @@ async fn apply_tool_batch(
 ) -> bool {
     for r in results {
         // 批次结果同样即时入库（与串行路径一致：任务中断时执行轨迹不丢）
-        persist_tool_run_immediate(
-            state,
-            conversation_id,
-            trace_id,
-            &r.tool,
-            &r.args_raw,
-            &r.output,
-        );
+        if r.committed {
+            persist_tool_run_immediate(
+                state,
+                conversation_id,
+                trace_id,
+                &r.tool,
+                &r.args_raw,
+                &r.output,
+            );
+        }
         // Marker 绑定动作：失败结果附带障碍处理协议要求（与串行路径同口径），
         // 防模型对失败只描述不行动；成功结果保持原文注入
-        let output = if r.ok {
+        let output = if !r.committed {
+            "工具结果未通过执行器 Owner fencing，迟到结果未计入任务证据".to_string()
+        } else if r.ok {
             r.output.clone()
         } else {
             format!(
@@ -8986,6 +9073,8 @@ async fn apply_tool_batch(
             args: r.args_raw.clone(),
             output,
             succeeded: r.ok,
+            // 即使 fencing 拒绝也已有 prepared/attempt 审计行，禁止 legacy 收尾路径
+            // 再插入一条无 Owner 的伪终态记录。
             persisted: true,
         });
         stats.retry_count += r.retries as i64;

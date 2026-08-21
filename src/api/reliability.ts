@@ -57,6 +57,7 @@ export interface ReliabilityDashboard {
   critical_alert_count: number
   quota: QuotaUsage
   worker_runtime: WorkerRuntimeStats
+  tool_runtime: ToolRuntimeStats
 }
 
 export interface WorkerRuntimeStats {
@@ -64,6 +65,30 @@ export interface WorkerRuntimeStats {
   lost_workers: number
   running_tasks: number
   recovered_tasks: number
+}
+
+export interface ToolRuntimeStats {
+  active_workers: number
+  lost_workers: number
+  running_tools: number
+  verification_required: number
+  manual_review_required: number
+  recovered_tools: number
+  timed_out_tools: number
+  worker_panics: number
+}
+
+export interface ToolExecutionWorker {
+  worker_id: string
+  process_worker_id: string
+  pid: number
+  platform: string
+  state: string
+  capacity: number
+  active_tools: number
+  started_at: number
+  last_heartbeat_at: number
+  stopped_at: number | null
 }
 
 export interface AgentWorker {
@@ -138,5 +163,7 @@ export const listAgentAlerts = (limit = 100) => invokeWithError<AgentAlert[]>('l
 export const listAgentAuditEvents = (runId?: string, limit = 200) =>
   invokeWithError<AuditEvent[]>('list_agent_audit_events', { runId, limit })
 export const listAgentWorkers = (limit = 100) => invokeWithError<AgentWorker[]>('list_agent_workers', { limit })
+export const listToolExecutionWorkers = (limit = 100) =>
+  invokeWithError<ToolExecutionWorker[]>('list_tool_execution_workers', { limit })
 export const getAgentSloPolicy = () => invokeWithError<SloPolicy | null>('get_agent_slo_policy')
 export const updateAgentSloPolicy = (policy: SloPolicy) => invokeWithError<void>('update_agent_slo_policy', { policy })

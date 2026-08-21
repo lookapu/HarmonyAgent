@@ -360,7 +360,8 @@ pub fn evaluate_run(
     contract: &crate::agent::acceptance::GoalContract,
 ) -> Result<crate::agent::acceptance::AcceptanceReport, String> {
     let mut stmt = conn.prepare(
-        "SELECT tool_name,input_json,result_json,status FROM tool_runs WHERE trace_id=?1 ORDER BY created_at,id",
+        "SELECT tool_name,input_json,result_json,status FROM tool_runs WHERE trace_id=?1
+         AND (protocol_version<2 OR outcome_committed_at IS NOT NULL) ORDER BY created_at,id",
     ).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([run_id], |row| {
@@ -401,6 +402,7 @@ pub fn evaluate_root_with_children(
             "SELECT tr.tool_name,tr.input_json,tr.result_json,tr.status
          FROM agent_dag_nodes node JOIN tool_runs tr ON tr.trace_id=node.run_id
          WHERE node.root_run_id=?1 AND node.state='completed' AND node.run_id!=?1
+         AND (tr.protocol_version<2 OR tr.outcome_committed_at IS NOT NULL)
          ORDER BY node.created_at,tr.created_at,tr.id",
         )
         .map_err(|e| e.to_string())?;

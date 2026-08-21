@@ -105,6 +105,11 @@ fn disposition_for_id(id: &str) -> Option<&'static str> {
         "completion_without_evidence" => MissingEvidence,
         "budget_exhaustion" => BudgetExhausted,
         "subagent_claim_without_tools" => SubagentMissingEvidence,
+        "tool_worker_crash" => ToolWorkerCrash,
+        "stale_tool_outcome" => StaleToolOutcome,
+        "duplicate_side_effect" => DuplicateSideEffect,
+        "database_busy" => DatabaseBusy,
+        "tool_worker_panic" => ToolWorkerPanic,
         _ => return None,
     }))
 }
@@ -222,6 +227,10 @@ fn simulate_scenario(id: &str) -> Option<&'static str> {
             } else {
                 "accept_claim"
             })
+        }
+        "tool_worker_crash" | "stale_tool_outcome" | "duplicate_side_effect" | "database_busy"
+        | "tool_worker_panic" => {
+            Some(disposition_for_id(id)?)
         }
         _ => None,
     }

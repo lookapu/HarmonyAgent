@@ -382,6 +382,13 @@ export default function CostPage() {
           <ReliabilityValue label={t('cost.runningWorkerTasks')} value={String(reliability?.worker_runtime.running_tasks ?? 0)} />
           <ReliabilityValue label={t('cost.recoveredWorkerTasks')} value={String(reliability?.worker_runtime.recovered_tasks ?? 0)} />
           <ReliabilityValue label={t('cost.lostWorkers')} value={String(reliability?.worker_runtime.lost_workers ?? 0)} />
+          <ReliabilityValue label={t('cost.activeToolWorkers')} value={String(reliability?.tool_runtime.active_workers ?? 0)} />
+          <ReliabilityValue label={t('cost.runningTools')} value={String(reliability?.tool_runtime.running_tools ?? 0)} />
+          <ReliabilityValue label={t('cost.toolRecoveries')} value={String(reliability?.tool_runtime.recovered_tools ?? 0)} />
+          <ReliabilityValue label={t('cost.toolVerificationRequired')} value={String(reliability?.tool_runtime.verification_required ?? 0)} />
+          <ReliabilityValue label={t('cost.toolManualReview')} value={String(reliability?.tool_runtime.manual_review_required ?? 0)} />
+          <ReliabilityValue label={t('cost.toolTimeouts')} value={String(reliability?.tool_runtime.timed_out_tools ?? 0)} />
+          <ReliabilityValue label={t('cost.toolWorkerPanics')} value={String(reliability?.tool_runtime.worker_panics ?? 0)} />
         </div>
         <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3 text-[11px]">
           <span className="text-[var(--text-muted)]">{t('cost.schedulerStates')}</span>

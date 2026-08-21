@@ -28,7 +28,11 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     run_migrations(&conn)?;
     crate::agent::scheduler::register_current_worker(&conn)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
+    crate::agent::tool_runtime::register_current_worker(&conn)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     crate::agent::scheduler::recover_orphaned_on_startup(&conn)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
+    crate::agent::tool_runtime::recover_stale(&conn, 60_000)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     crate::agent::coordinator::recover_interrupted_steps(&conn)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
@@ -43,8 +47,8 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     Ok(Mutex::new(conn))
 }
 
-/// 应用异常退出时，执行前已落库但未写终态的工具会残留 running。启动恢复将其明确
-/// 标记为 interrupted，并按副作用策略说明后续动作；绝不把未知副作用调用自动当作失败重跑。
+/// 兼容旧版没有 Tool Worker 租约的审计行。V2 调用由 tool_runtime 根据执行器心跳回收；
+/// 这里只处理没有 Owner 的遗留调用，避免第二个应用实例中断仍然存活的工具。
 fn recover_interrupted_tool_runs(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let prepared = conn.execute(
         "UPDATE tool_runs SET status='cancelled', finished_at=unixepoch(),
@@ -62,7 +66,7 @@ fn recover_interrupted_tool_runs(conn: &Connection) -> Result<usize, rusqlite::E
              WHEN 'verify' THEN '应用退出导致调用中断，实际状态未知；恢复前必须核验副作用'
              ELSE '应用退出导致调用中断，实际状态未知；需要用户确认后处理'
            END)
-         WHERE status='running' AND (trace_id IS NULL OR NOT EXISTS(
+         WHERE status='running' AND execution_worker_id IS NULL AND (trace_id IS NULL OR NOT EXISTS(
            SELECT 1 FROM agent_runs r WHERE r.run_id=tool_runs.trace_id) OR EXISTS(
            SELECT 1 FROM agent_task_queue q WHERE q.run_id=tool_runs.trace_id AND q.state='recovery_required'))",
         [],
@@ -132,6 +136,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (58, "058_reliability_control_plane", include_str!("../../migrations/058_reliability_control_plane.sql")),
     (59, "059_execution_kernel_v2", include_str!("../../migrations/059_execution_kernel_v2.sql")),
     (60, "060_multi_worker_runtime", include_str!("../../migrations/060_multi_worker_runtime.sql")),
+    (61, "061_tool_execution_kernel_v2", include_str!("../../migrations/061_tool_execution_kernel_v2.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -249,12 +254,12 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
                  ('agent_task_queue','agent_dag_nodes','agent_dag_edges','agent_eval_runs',
                   'agent_slo_policies','agent_alerts','agent_audit_events','agent_quota_usage',
-                  'agent_workers','agent_task_attempts')",
+                  'agent_workers','agent_task_attempts','tool_execution_workers','tool_execution_attempts')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(control_tables, 10);
+        assert_eq!(control_tables, 12);
         let queue_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(agent_task_queue)")
             .unwrap()
@@ -264,6 +269,19 @@ mod tests {
             .unwrap();
         for c in ["lease_token", "claim_epoch", "last_worker_id", "recovery_count"] {
             assert!(queue_cols.iter().any(|x| x == c), "task queue 迁移后缺少列 {c}");
+        }
+        let tool_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(tool_runs)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in [
+            "execution_worker_id", "lease_token", "attempt", "heartbeat_at",
+            "lease_expires_at", "verification_state", "recovery_count", "outcome_committed_at",
+        ] {
+            assert!(tool_cols.iter().any(|x| x == c), "tool_runs 迁移后缺少列 {c}");
         }
         let run_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(agent_runs)")
