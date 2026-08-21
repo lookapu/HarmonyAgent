@@ -56,6 +56,29 @@ export interface ReliabilityDashboard {
   open_alert_count: number
   critical_alert_count: number
   quota: QuotaUsage
+  worker_runtime: WorkerRuntimeStats
+}
+
+export interface WorkerRuntimeStats {
+  active_workers: number
+  lost_workers: number
+  running_tasks: number
+  recovered_tasks: number
+}
+
+export interface AgentWorker {
+  worker_id: string
+  worker_kind: string
+  pid: number
+  hostname: string
+  version: string
+  state: string
+  capacity: number
+  active_tasks: number
+  started_at: number
+  last_heartbeat_at: number
+  draining_at: number | null
+  stopped_at: number | null
 }
 
 export interface QuotaUsage {
@@ -114,5 +137,6 @@ export const runReliabilityEvaluation = (threshold = 0.95) =>
 export const listAgentAlerts = (limit = 100) => invokeWithError<AgentAlert[]>('list_agent_alerts', { limit })
 export const listAgentAuditEvents = (runId?: string, limit = 200) =>
   invokeWithError<AuditEvent[]>('list_agent_audit_events', { runId, limit })
+export const listAgentWorkers = (limit = 100) => invokeWithError<AgentWorker[]>('list_agent_workers', { limit })
 export const getAgentSloPolicy = () => invokeWithError<SloPolicy | null>('get_agent_slo_policy')
 export const updateAgentSloPolicy = (policy: SloPolicy) => invokeWithError<void>('update_agent_slo_policy', { policy })

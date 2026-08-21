@@ -201,7 +201,9 @@ pub fn recover_orphaned_nodes(conn: &Connection) -> Result<usize, String> {
         "UPDATE agent_dag_nodes SET state=CASE WHEN attempt<max_attempts THEN 'retry_wait' ELSE 'failed' END,
          next_attempt_at=CASE WHEN attempt<max_attempts THEN ?1 ELSE NULL END,
          output_summary=COALESCE(output_summary,'应用重启，节点等待局部恢复'),updated_at=?1
-         WHERE state='running' AND parent_node_id IS NOT NULL",
+         WHERE state='running' AND parent_node_id IS NOT NULL AND EXISTS(
+           SELECT 1 FROM agent_task_queue q WHERE q.state='recovery_required'
+           AND (q.run_id=agent_dag_nodes.run_id OR q.run_id=agent_dag_nodes.root_run_id))",
         [now],
     ).map_err(|e|e.to_string())
 }

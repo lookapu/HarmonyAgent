@@ -176,6 +176,33 @@ fn append_event_tx(
     Ok(seq)
 }
 
+/// 在同一写事务内校验 durable queue Owner。无队列的旧数据/建 Run 阶段保持兼容；
+/// 一旦进入调度器，只有持有当前租约的 Worker 能继续写 Run 事件或终态。
+fn fence_run_write(conn: &Connection, run_id: &str) -> Result<(), String> {
+    let has_queue = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_task_queue')",
+        [], |row| row.get::<_,bool>(0),
+    ).unwrap_or(false);
+    if !has_queue {
+        return Ok(());
+    }
+    let managed = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_task_queue WHERE run_id=?1)",
+        [run_id], |row| row.get::<_,bool>(0),
+    ).unwrap_or(false);
+    if !managed {
+        return Ok(());
+    }
+    let changed = conn.execute(
+        "UPDATE agent_task_queue SET updated_at=updated_at WHERE run_id=?1 AND state='running' AND worker_id=?2",
+        params![run_id,crate::agent::scheduler::current_worker_id()],
+    ).map_err(|e|e.to_string())?;
+    if changed == 0 {
+        return Err("STALE_LEASE: 当前 Worker 已失去 Run 写入权".into());
+    }
+    Ok(())
+}
+
 pub fn append_event(
     conn: &Connection,
     run_id: &str,
@@ -185,6 +212,7 @@ pub fn append_event(
 ) -> Result<i64, String> {
     let now = now_ms();
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
     let seq = append_event_tx(&tx, run_id, conversation_id, event_type, &payload, now)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(seq)
@@ -220,6 +248,7 @@ pub fn transition(
     let terminal = matches!(state, "completed" | "failed" | "cancelled" | "interrupted");
     let now = now_ms();
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
     let changed = tx
         .execute(
             "UPDATE agent_runs SET state=?1, phase=?2, error=?3, updated_at=?4,
@@ -298,11 +327,14 @@ pub fn set_acceptance(
     run_id: &str,
     acceptance: &serde_json::Value,
 ) -> Result<(), String> {
-    conn.execute(
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    tx.execute(
         "UPDATE agent_runs SET acceptance_json=?1, updated_at=?2 WHERE run_id=?3",
         params![acceptance.to_string(), now_ms(), run_id],
     )
     .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -315,16 +347,20 @@ pub fn renew_lease(
 ) -> Result<i64, String> {
     let now = now_ms();
     let expires = now.saturating_add(lease_ms.max(10_000));
+    let scheduled = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_task_queue WHERE run_id=?1)",
+        [run_id], |row| row.get::<_,bool>(0),
+    ).unwrap_or(false);
+    if scheduled && !crate::agent::scheduler::renew_owned(
+        conn, run_id, crate::agent::scheduler::current_worker_id(), lease_ms,
+    )? {
+        return Err("STALE_LEASE: 当前 Worker 已失去任务所有权".into());
+    }
     conn.execute(
         "UPDATE agent_runs SET heartbeat_at=?1,lease_expires_at=?2,phase=?3,updated_at=?1
          WHERE run_id=?4 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
         params![now, expires, phase, run_id],
     ).map_err(|e| e.to_string())?;
-    let _ = conn.execute(
-        "UPDATE agent_task_queue SET lease_expires_at=?1,updated_at=?2
-         WHERE run_id=?3 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
-        params![expires, now, run_id],
-    );
     append_event(conn, run_id, conversation_id, "run.heartbeat", serde_json::json!({
         "phase": phase, "lease_expires_at": expires,
     }))
@@ -335,15 +371,19 @@ pub fn touch_lease_global(run_id: &str, phase: &str, lease_ms: i64) {
     let Some(db) = crate::db::global() else { return };
     let Ok(conn) = db.lock() else { return };
     let now = now_ms();
+    let scheduled = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_task_queue WHERE run_id=?1)",
+        [run_id], |row| row.get::<_,bool>(0),
+    ).unwrap_or(false);
+    if scheduled && !crate::agent::scheduler::renew_owned(
+        &conn, run_id, crate::agent::scheduler::current_worker_id(), lease_ms,
+    ).unwrap_or(false) {
+        return;
+    }
     let _ = conn.execute(
         "UPDATE agent_runs SET heartbeat_at=?1,lease_expires_at=?2,phase=?3,updated_at=?1
          WHERE run_id=?4 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
         params![now, now.saturating_add(lease_ms.max(10_000)), phase, run_id],
-    );
-    let _ = conn.execute(
-        "UPDATE agent_task_queue SET lease_expires_at=?1,updated_at=?2
-         WHERE run_id=?3 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
-        params![now.saturating_add(lease_ms.max(10_000)), now, run_id],
     );
 }
 
@@ -353,18 +393,33 @@ pub fn record_remediation(
     conversation_id: &str,
     blockers: &[String],
 ) -> Result<i64, String> {
-    conn.execute(
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    tx.execute(
         "UPDATE agent_runs SET remediation_count=remediation_count+1,phase='remediating',updated_at=?1 WHERE run_id=?2",
-        params![now_ms(), run_id],
+        params![now, run_id],
     ).map_err(|e| e.to_string())?;
-    append_event(conn, run_id, conversation_id, "acceptance.remediation_requested", serde_json::json!({ "blockers": blockers }))
+    let seq = append_event_tx(
+        &tx,
+        run_id,
+        conversation_id,
+        "acceptance.remediation_requested",
+        &serde_json::json!({ "blockers": blockers }),
+        now,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(seq)
 }
 
 pub fn set_quality(conn: &Connection, run_id: &str, quality: &serde_json::Value) -> Result<(), String> {
-    conn.execute(
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    tx.execute(
         "UPDATE agent_runs SET quality_json=?1,updated_at=?2 WHERE run_id=?3",
         params![quality.to_string(), now_ms(), run_id],
     ).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -457,11 +512,21 @@ pub fn events_after(
 /// UI 可基于 resume_policy/phase 提供“继续任务”，禁止显示为仍在运行。
 pub fn recover_interrupted_runs(conn: &Connection) -> Result<usize, String> {
     let now = now_ms();
+    let has_queue = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_task_queue')",
+        [], |row| row.get::<_,bool>(0),
+    ).unwrap_or(false);
     let ids = {
         let mut stmt = conn
             .prepare(
-                "SELECT run_id,conversation_id FROM agent_runs
-                 WHERE state IN ('queued','running','delegated_running','waiting_approval','waiting_user','verifying')",
+                if has_queue {
+                    "SELECT r.run_id,r.conversation_id FROM agent_runs r JOIN agent_task_queue q ON q.run_id=r.run_id
+                     WHERE r.state IN ('queued','running','delegated_running','waiting_approval','waiting_user','verifying')
+                     AND q.state='recovery_required'"
+                } else {
+                    "SELECT run_id,conversation_id FROM agent_runs
+                     WHERE state IN ('queued','running','delegated_running','waiting_approval','waiting_user','verifying')"
+                },
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -569,6 +634,20 @@ mod tests {
         assert_eq!(run.state, "completed");
         assert_eq!(run.phase, "done");
         assert_eq!(run.last_event_seq, 2);
+    }
+
+    #[test]
+    fn stale_worker_cannot_write_managed_run_terminal_state() {
+        let c = conn();
+        begin_run(&c, "owned", "c", "goal").unwrap();
+        c.execute_batch(
+            "CREATE TABLE agent_task_queue(run_id TEXT PRIMARY KEY,state TEXT,worker_id TEXT,updated_at INTEGER);
+             INSERT INTO agent_task_queue VALUES('owned','running','another-worker',0);",
+        ).unwrap();
+        let err = transition(&c,"owned","c","completed","done",None).unwrap_err();
+        assert!(err.contains("STALE_LEASE"));
+        assert_eq!(get_run(&c,"owned").unwrap().unwrap().state,"running");
+        assert!(append_event(&c,"owned","c","model.delta",serde_json::json!({"content":"late"})).is_err());
     }
 
     #[test]

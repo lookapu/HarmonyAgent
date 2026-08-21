@@ -277,23 +277,30 @@ pub fn inherit_plan_steps(
 /// 根据契约核验副作用。返回发生状态变化的步骤数。
 pub fn recover_interrupted_steps(conn: &Connection) -> Result<usize, String> {
     let now = now_ms();
+    let has_queue = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_task_queue')",
+        [], |row| row.get::<_,bool>(0),
+    ).unwrap_or(false);
+    let recoverable = if has_queue {
+        " AND run_id IN (SELECT run_id FROM agent_task_queue WHERE state='recovery_required')"
+    } else { "" };
     let prepared = conn
         .execute(
-            "UPDATE execution_steps SET state='cancelled',verification_state='not_started',
+            &format!("UPDATE execution_steps SET state='cancelled',verification_state='not_started',
              result_summary='应用退出时工具尚未开始执行',updated_at=?1,finished_at=?1
-             WHERE source='tool' AND state='prepared'",
+             WHERE source='tool' AND state='prepared'{recoverable}"),
             [now],
         )
         .map_err(|e| e.to_string())?;
     let running = conn
         .execute(
-            "UPDATE execution_steps SET state='interrupted',
+            &format!("UPDATE execution_steps SET state='interrupted',
              verification_state=CASE recovery_policy
                WHEN 'replay' THEN 'safe_to_replay'
                WHEN 'verify' THEN 'needs_verification'
                ELSE 'needs_manual_confirmation' END,
              result_summary='应用退出时工具仍在执行，实际副作用需按契约处理',
-             updated_at=?1,finished_at=?1 WHERE source='tool' AND state='running'",
+             updated_at=?1,finished_at=?1 WHERE source='tool' AND state='running'{recoverable}"),
             [now],
         )
         .map_err(|e| e.to_string())?;
@@ -301,9 +308,9 @@ pub fn recover_interrupted_steps(conn: &Connection) -> Result<usize, String> {
     // 由新一轮 Agent 根据真实产物和验收条件决定从哪里继续。
     let plans = conn
         .execute(
-            "UPDATE execution_steps SET state='pending',verification_state='not_started',
+            &format!("UPDATE execution_steps SET state='pending',verification_state='not_started',
              result_summary='应用退出时计划项仍在进行，恢复后需重新核验',updated_at=?1,
-             started_at=NULL,finished_at=NULL WHERE source='plan' AND state='running'",
+             started_at=NULL,finished_at=NULL WHERE source='plan' AND state='running'{recoverable}"),
             [now],
         )
         .map_err(|e| e.to_string())?;

@@ -41,6 +41,7 @@ pub struct ReliabilityDashboard {
     pub open_alert_count: i64,
     pub critical_alert_count: i64,
     pub quota: crate::agent::enterprise::QuotaUsage,
+    pub worker_runtime: crate::agent::scheduler::WorkerRuntimeStats,
 }
 
 #[tauri::command]
@@ -199,6 +200,7 @@ pub fn get_reliability_dashboard(
         open_alert_count,
         critical_alert_count,
         quota: crate::agent::enterprise::quota(&conn)?,
+        worker_runtime: crate::agent::scheduler::runtime_stats(&conn)?,
     })
 }
 
@@ -219,6 +221,15 @@ pub fn list_agent_audit_events(
 ) -> Result<Vec<crate::agent::enterprise::AuditEvent>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     crate::agent::enterprise::list_audit(&conn, run_id.as_deref(), limit.unwrap_or(200))
+}
+
+#[tauri::command]
+pub fn list_agent_workers(
+    db: State<DbState>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::agent::scheduler::WorkerInfo>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::scheduler::list_workers(&conn, limit.unwrap_or(100))
 }
 
 #[tauri::command]

@@ -1,4 +1,4 @@
-mod agent;
+pub mod agent;
 // pub：tauri 命令宏要求命令返回类型（如 chat::TaskLedger）在 crate 外可见
 pub mod commands;
 pub mod db;
@@ -188,6 +188,24 @@ pub fn run() {
             // 启动时数据维护：按保留策略滚动清理日志/成本明细（不阻塞启动）
             if let Ok(conn) = pool_arc.lock() {
                 services::maintenance::run_startup_maintenance(&conn);
+            }
+
+            // Execution Kernel Worker 心跳：每个桌面进程都有唯一实例身份。恢复扫描只回收
+            // 真正过期/失联的所有者，因此第二个实例启动不会中断第一个实例的任务。
+            {
+                let worker_db = std::sync::Arc::clone(&pool_arc);
+                tauri::async_runtime::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    loop {
+                        ticker.tick().await;
+                        let Ok(conn) = worker_db.try_lock() else { continue };
+                        let _ = crate::agent::scheduler::heartbeat_worker(
+                            &conn,
+                            crate::agent::scheduler::current_worker_id(),
+                        );
+                        let _ = crate::agent::scheduler::recover_stale_owners(&conn, 60_000);
+                    }
+                });
             }
 
             // 内置 API 知识库种子数据：主库三张 API 表为空（从未抓取过）时，
@@ -487,6 +505,7 @@ pub fn run() {
             commands::reliability::list_agent_dag_nodes,
             commands::reliability::list_agent_alerts,
             commands::reliability::list_agent_audit_events,
+            commands::reliability::list_agent_workers,
             commands::reliability::get_scheduled_agent_task,
             commands::reliability::claim_next_scheduled_agent_task,
             commands::reliability::retry_scheduled_agent_task,
@@ -641,6 +660,15 @@ pub fn run() {
             if let RunEvent::ExitRequested { .. } | RunEvent::Exit = event {
                 let handle = app_handle.clone();
                 tauri::async_runtime::block_on(async move {
+                    if let Some(db) = handle.try_state::<db::DbState>() {
+                        if let Ok(conn) = db.0.try_lock() {
+                            let _ = crate::agent::scheduler::stop_current_worker(&conn);
+                        }
+                    }
+                    // MCP 子进程属于当前桌面 Worker，每个实例都应独立回收。
+                    if let Some(mcp) = handle.try_state::<services::mcp_manager::McpManager>() {
+                        mcp.shutdown_all();
+                    }
                     let is_owner = handle
                         .try_state::<ProxyLock>()
                         .map(|l| l.0.try_lock().map(|g| g.is_some()).unwrap_or(false))
@@ -656,10 +684,6 @@ pub fn run() {
                     if let Some(state) = handle.try_state::<commands::lan::LanServerState>() {
                         let mut server = state.0.lock().await;
                         let _ = server.stop().await;
-                    }
-                    // 终止全部 MCP 服务器子进程（长驻进程，退出时统一回收）
-                    if let Some(mcp) = handle.try_state::<services::mcp_manager::McpManager>() {
-                        mcp.shutdown_all();
                     }
                 });
             }

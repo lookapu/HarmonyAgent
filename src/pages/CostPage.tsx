@@ -377,6 +377,12 @@ export default function CostPage() {
           <ReliabilityValue label={t('cost.monthlyRuns')} value={String(reliability?.quota.runs ?? 0)} />
           <ReliabilityValue label={t('cost.monthlyToolCalls')} value={String(reliability?.quota.tool_calls ?? 0)} />
         </div>
+        <div className="grid grid-cols-4 gap-4 text-sm border-t border-[var(--border)] pt-3">
+          <ReliabilityValue label={t('cost.activeWorkers')} value={String(reliability?.worker_runtime.active_workers ?? 0)} />
+          <ReliabilityValue label={t('cost.runningWorkerTasks')} value={String(reliability?.worker_runtime.running_tasks ?? 0)} />
+          <ReliabilityValue label={t('cost.recoveredWorkerTasks')} value={String(reliability?.worker_runtime.recovered_tasks ?? 0)} />
+          <ReliabilityValue label={t('cost.lostWorkers')} value={String(reliability?.worker_runtime.lost_workers ?? 0)} />
+        </div>
         <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3 text-[11px]">
           <span className="text-[var(--text-muted)]">{t('cost.schedulerStates')}</span>
           {(reliability?.scheduler_states ?? []).map((item) => (
