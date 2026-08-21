@@ -399,7 +399,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "check_sdk_alignment",
-        desc: "检查鸿蒙工程的 compatibleSdkVersion（build-profile.json5）与本地已安装 SDK 的 API 级别是否匹配，返回对齐状态（ok/behind/ahead/unknown）与说明。\n当构建报 compatibleSdkVersion 相关错误、或用户询问工程与 SDK 版本是否匹配、需要为工程选取 SDK 版本时使用。\n参数：{\"project_path\":\"<工程目录绝对路径>\"}，缺省用当前绑定项目。\n副作用：无（只读工程配置与 SDK 探测）。\n返回：工程要求 API / 已安装 API / 状态 / 说明。",
+        desc: "检查鸿蒙工程 SDK/API 对齐及 API 使用一致性：比较 compatibleSdkVersion 与本机 SDK，并扫描源码 import，核对当前 product 的 compile API、本机 .d.ts 类型/权限/SystemCapability、module.json5 权限与 usedScene、deviceTypes、mainElement 和产品模块归属。\n参数：{\"project_path\":\"<可选工程目录绝对路径，缺省当前绑定项目>\",\"product\":\"<可选产品名>\"}。确定性问题标为 error，能力守卫/配置风险标为 warning，无法精确到成员的模块级权限只提示 info；官方参考库可用时追加设备类型证据。\n副作用：无（只读工程配置、源码、本机 SDK 与本地官方知识库）。\n返回：SDK 对齐状态，以及带源码/配置位置和证据的完整一致性审计。",
     },
     ToolSpec {
         name: "show_diagnose_card",
@@ -3126,13 +3126,39 @@ fn check_sdk_alignment(args: &Value, roots: &[String], db: &crate::db::DbState) 
         return Err("check_sdk_alignment 需要 {\"project_path\":\"<工程目录>\"} 或绑定项目".into());
     }
     let r = crate::services::harmony_env::project_sdk_alignment(&project_path, db)?;
+    let root = Path::new(&project_path);
+    let env = crate::services::harmony_env::detect(db);
+    let context = crate::services::sdk_api::project_api_context(
+        Some(root),
+        args["product"].as_str(),
+        env.default_api.as_deref(),
+    );
+    let index = crate::services::harmony_env::default_api_dir(&env)
+        .map(|api_dir| crate::services::sdk_api::index_api_dir(&api_dir));
+    let model = crate::services::harmony_model::cached(root);
+    let report = match db.0.lock() {
+        Ok(conn) => crate::services::harmony_consistency::analyze(
+            root,
+            &model,
+            &context,
+            index.as_ref(),
+            Some(&conn),
+        ),
+        Err(_) => crate::services::harmony_consistency::analyze(
+            root,
+            &model,
+            &context,
+            index.as_ref(),
+            None,
+        ),
+    };
     Ok(format!(
         "SDK 对齐检查：\n- 工程要求 compatibleSdkVersion：{}\n- 已安装 SDK API：{}\n- 状态：{}\n- 说明：{}",
         r.project_compatible.as_deref().unwrap_or("未解析到"),
         r.installed_api.as_deref().unwrap_or("未检测到"),
         r.status,
         r.message,
-    ))
+    ) + "\n\n" + &crate::services::harmony_consistency::render(&report))
 }
 
 /// show_diagnose_card：向前端推送可操作诊断卡片（签名/SDK/依赖等需用户决策的问题），
