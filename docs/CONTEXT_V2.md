@@ -75,6 +75,18 @@ Context V2 是投影层，不取代消息、事件、Run、工具结果或工作
 
 同一事实值和来源重复观察时只更新时间；发生变化时旧版本标记失效，新版本递增，历史不会被覆盖。
 
+### 4.4 结构化项目记忆
+
+`project_memories` 是 Context V2 的项目层，不再只是拼接进 system prompt 的自由文本。每条记忆包含来源、作用域、可信度、版本、确认状态、固定标记和显式失效条件，并使用以下稳定分类：
+
+- `architecture`：架构边界与工程约定；
+- `build_command`：已验证的构建、测试和发布命令；
+- `module_role`：模块职责和依赖方向；
+- `user_preference`：用户明确表达的协作偏好；
+- `decision`：已经确认的技术或产品决策。
+
+兼容分类 `general/code/build/deploy/pitfall/path` 继续可用。只有启用、已确认且未失效的条目会跨会话进入 Context V2；固定条目优先加载。Agent 自动沉淀、用户编辑和历史迁移都保留可解释来源，编辑时版本递增。
+
 ### `conversation_context_artifacts`
 
 保存文件、Diff、构建包、报告、截图、日志等产物引用。表内只保存 URI、digest、元数据和来源，不复制大型内容。

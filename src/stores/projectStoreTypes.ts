@@ -335,7 +335,7 @@ export interface MemorySlice {
   /** 加载项目记忆列表 */
   loadMemories: () => Promise<void>
   /** 新增/更新记忆（saveMemory 后端自动区分 id 有无） */
-  saveMemory: (input: { id?: string; category: string; title: string; content: string }) => Promise<void>
+  saveMemory: (input: { id?: string; category: string; title: string; content: string; pinned?: boolean; invalidation_condition?: string }) => Promise<void>
   /** 删除记忆 */
   deleteMemory: (id: string) => Promise<void>
   /** 启用/禁用记忆 */

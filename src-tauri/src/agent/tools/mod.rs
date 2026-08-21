@@ -411,7 +411,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "save_memory",
-        desc: "保存一条项目长期记忆（工程经验，注入后续每轮对话供参考）。\n参数：{\"title\":\"<60 字内标题>\",\"content\":\"<经验描述，2000 字内>\",\"category\":\"general|code|build|deploy|decision|pitfall\"（缺省 general）}。\n仅当发现值得长期记住的经验（构建命令、错误解法、架构约定、踩坑结论）时使用，避免保存一次性对话内容。\n副作用：写入项目记忆库（用户可在记忆面板管理）。\n返回：保存结果。",
+        desc: "保存一条可追溯的项目长期记忆，跨会话进入 Context V2。\n参数：{\"title\":\"<60 字内标题>\",\"content\":\"<经验描述，2000 字内>\",\"category\":\"general|architecture|build_command|module_role|user_preference|decision|code|build|deploy|pitfall\"（缺省 general）,\"confidence\":<可选 0-1>,\"confirmed\":<可选，缺省 true>,\"pinned\":<可选>,\"invalidation_condition\":\"<可选失效条件>\"}。\n仅保存值得长期记住的架构约定、构建命令、模块职责、用户偏好、已确认决策或踩坑结论。\n副作用：写入项目记忆库（用户可在记忆面板管理）。\n返回：保存结果及来源分类。",
     },
     ToolSpec {
         name: "schedule_create",
@@ -980,7 +980,7 @@ name: "ask_history",
     // ---- 事实抽取（batch2）----
     ToolSpec {
         name: "fact_extract",
-        desc: "把任务收尾时值得长期记住的事实（架构约定/技术决策/踩坑根因/构建命令）沉淀为项目记忆。\n参数：{\"fact\":\"<事实/经验文本>\"（必填，≤2000 字符）,\"category\":\"<可选 general|code|build|deploy|decision|pitfall>\",\"title\":\"<可选，缺省自动截取>\",\"dedupe\":<可选 true/false，缺省 true 自动去重>}。\n适合：本轮任务产出了对后续同类任务有复用价值的结论时调用。\n副作用：写入项目记忆库（后续对话自动参考）。\n返回：保存确认或与已有记忆重复的提示。",
+        desc: "把任务收尾时值得长期记住的事实（架构约定/技术决策/踩坑根因/构建命令）沉淀为项目记忆。\n参数：{\"fact\":\"<事实/经验文本>\"（必填，≤2000 字符）,\"category\":\"<可选 general|architecture|build_command|module_role|user_preference|decision|code|build|deploy|pitfall>\",\"title\":\"<可选，缺省自动截取>\",\"dedupe\":<可选，缺省 true>,\"confidence\":<可选 0-1>,\"confirmed\":<可选，缺省 true>,\"pinned\":<可选>,\"invalidation_condition\":\"<可选失效条件>\"}。\n适合：本轮任务产出了对后续同类任务有复用价值的结论时调用。\n副作用：写入带来源、版本与失效条件的项目记忆库。\n返回：保存确认或与已有记忆重复的提示。",
     },
     // ---- Reflexion 反思卡查询/钉住（batch2）----
     ToolSpec {

@@ -39,7 +39,7 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 └────────────────────────────┬─────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────┐
-│ SQLite（65 个迁移） + 本地文件/钥匙串 + 外部工具链           │
+│ SQLite（66 个迁移） + 本地文件/钥匙串 + 外部工具链           │
 │ HarmonyOS SDK / hvigor / ohpm / hdc / ArkTS LSP              │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -54,7 +54,7 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 | `commands/` 命令模块（不含 `mod.rs`） | 33 |
 | `services/` 服务模块（不含 `mod.rs`） | 36 |
 | Tauri IPC 注册入口 | 276 |
-| 数据库迁移 | 63 |
+| 数据库迁移 | 66 |
 | React 页面 | 14 |
 
 以上计数会随代码演进变化；工具数以 `TOOL_SPECS`、IPC 入口以 `lib.rs` 的 `generate_handler!`、迁移数以 `src-tauri/migrations/` 为准。
@@ -243,7 +243,7 @@ Provider 和 model 保存于 SQLite，API key 通过系统钥匙串管理。会�
 
 ## 12. 数据与存储
 
-SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 65 个迁移覆盖：
+SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 66 个迁移覆盖：
 
 - Provider、模型、代理、成本和请求日志；
 - 项目、会话、消息、引用、标签、反馈和版本；

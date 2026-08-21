@@ -134,7 +134,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 276 个 Tauri IPC 入口 · 36 个 service 模块        │
 │  - agent/ 29 个顶层模块 · tools/ 29 文件 · 198 工具  │
-│  - SQLite + 65 个迁移 · Run/步骤/工具全链路事件溯源  │
+│  - SQLite + 66 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -215,7 +215,7 @@ src-tauri/src/
 │   ├── reminders.rs        #   - 定时提醒派发（30s 轮询）
 │   ├── harmony_*.rs        #   - 鸿蒙集成（6 文件）
 │   └── ...
-├── db/                     # SQLite + 65 个顺序迁移
+├── db/                     # SQLite + 66 个顺序迁移
 ├── utils/                  # 工具（13 文件，含任务看门狗）
 ├── tray/                   # 系统托盘
 └── runtime/                # 内置 Node + JDK + Git（约 700MB，不入库，见下）
@@ -292,7 +292,7 @@ npx tauri build
 - 前端入口：`src/App.tsx` + `src/pages/Home.tsx`（Agent Workspace 主界面）
 - 后端入口：`src-tauri/src/lib.rs` + `src-tauri/src/main.rs`
 - Agent 工具注册：`src-tauri/src/agent/tools/mod.rs` 的 `TOOL_SPECS` 数组
-- 数据库迁移：`src-tauri/migrations/`（当前 65 个，已执行的迁移不可修改，新增请递增编号）
+- 数据库迁移：`src-tauri/migrations/`（当前 66 个，已执行的迁移不可修改，新增请递增编号）
 - 旧调试脚本：`scripts/legacy/`（仅留档，请勿引用）
 
 ## 打赏支持

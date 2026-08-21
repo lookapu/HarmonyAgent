@@ -143,6 +143,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (63, "063_conversation_context_v2", include_str!("../../migrations/063_conversation_context_v2.sql")),
     (64, "064_pending_interactions", include_str!("../../migrations/064_pending_interactions.sql")),
     (65, "065_context_reconciliation", include_str!("../../migrations/065_context_reconciliation.sql")),
+    (66, "066_structured_project_memories", include_str!("../../migrations/066_structured_project_memories.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -353,6 +354,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reconciliation_tables, 1);
+        let memory_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(project_memories)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for column in [
+            "source_kind",
+            "source_ref",
+            "scope",
+            "confidence",
+            "version",
+            "confirmed",
+            "pinned",
+            "invalidation_condition",
+            "invalidated_at",
+            "invalidation_reason",
+        ] {
+            assert!(memory_cols.iter().any(|item| item == column), "project_memories missing {column}");
+        }
     }
 
     #[test]

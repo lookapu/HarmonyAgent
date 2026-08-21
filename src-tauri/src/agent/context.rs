@@ -861,6 +861,46 @@ fn active_facts_digest(conn: &Connection, conversation_id: &str) -> Result<Optio
         hasher.update(version.to_le_bytes());
         count += 1;
     }
+    drop(stmt);
+    let project_id = conn
+        .query_row(
+            "SELECT project_id FROM conversations WHERE id=?1",
+            [conversation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(project_id) = project_id {
+        let mut memories = conn
+            .prepare(
+                "SELECT id,category,title,content,version,updated_at FROM project_memories
+                 WHERE project_id=?1 AND enabled=1 AND confirmed=1 AND invalidated_at IS NULL
+                 ORDER BY pinned DESC,updated_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = memories
+            .query_map([project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, category, title, content, version, updated_at) = row.map_err(|e| e.to_string())?;
+            for value in [id, category, title, content] {
+                hasher.update(value);
+                hasher.update([0]);
+            }
+            hasher.update(version.to_le_bytes());
+            hasher.update(updated_at.to_le_bytes());
+            count += 1;
+        }
+    }
     Ok((count > 0).then(|| format!("{:x}", hasher.finalize())))
 }
 
@@ -1392,7 +1432,71 @@ fn load_active_facts(
             },
         )
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    let mut facts = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    drop(stmt);
+
+    // Project memories are the durable project layer of Context V2. They are
+    // queried at read time so edits, disabling and invalidation are visible in
+    // every conversation without copying stale rows into each conversation.
+    let project_id = conn
+        .query_row(
+            "SELECT project_id FROM conversations WHERE id=?1",
+            [conversation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(project_id) = project_id {
+        let remaining = limit.saturating_sub(facts.len());
+        if remaining > 0 {
+            let mut memories = conn
+                .prepare(
+                    "SELECT id,category,title,content,source_kind,source_ref,scope,confidence,
+                     version,updated_at,pinned,invalidation_condition
+                     FROM project_memories
+                     WHERE project_id=?1 AND enabled=1 AND confirmed=1 AND invalidated_at IS NULL
+                     ORDER BY pinned DESC,updated_at DESC LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = memories
+                .query_map(params![project_id, remaining as i64], |row| {
+                    let id: String = row.get(0)?;
+                    let category: String = row.get(1)?;
+                    let title: String = row.get(2)?;
+                    let source_ref: String = row.get(5)?;
+                    let updated_at: i64 = row.get(9)?;
+                    Ok(ContextFactV2 {
+                        id: format!("memory:{id}"),
+                        conversation_id: conversation_id.to_string(),
+                        project_id: Some(project_id.clone()),
+                        run_id: None,
+                        fact_kind: "project_memory".into(),
+                        fact_key: format!("{category}:{id}"),
+                        value: serde_json::json!({
+                            "category": category,
+                            "title": title,
+                            "content": row.get::<_, String>(3)?,
+                            "pinned": row.get::<_, i64>(10)? != 0,
+                            "invalidation_condition": row.get::<_, String>(11)?,
+                        }),
+                        source: ContextSource {
+                            kind: row.get(4)?,
+                            reference: if source_ref.is_empty() { format!("memory:{id}") } else { source_ref },
+                            observed_at: updated_at,
+                        },
+                        scope: row.get(6)?,
+                        confidence: row.get(7)?,
+                        version: row.get(8)?,
+                        invalidated_at: None,
+                        invalidation_reason: None,
+                        updated_at,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            facts.extend(rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(facts)
 }
 
 fn load_valid_artifacts(
@@ -1556,6 +1660,10 @@ mod tests {
         )
         .unwrap();
         conn.execute_batch(include_str!(
+            "../../migrations/008_project_memories.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(include_str!(
             "../../migrations/063_conversation_context_v2.sql"
         ))
         .unwrap();
@@ -1565,6 +1673,10 @@ mod tests {
         .unwrap();
         conn.execute_batch(include_str!(
             "../../migrations/065_context_reconciliation.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/066_structured_project_memories.sql"
         ))
         .unwrap();
     }
@@ -1589,6 +1701,25 @@ mod tests {
             confidence: 1.0,
             observed_at: Some(10),
         }
+    }
+
+    fn insert_project_memory(
+        conn: &Connection,
+        id: &str,
+        confirmed: bool,
+        pinned: bool,
+        invalidated_at: Option<i64>,
+    ) {
+        conn.execute(
+            "INSERT INTO project_memories
+             (id,project_id,category,title,content,enabled,source_kind,source_ref,scope,
+              confidence,version,confirmed,pinned,invalidation_condition,invalidated_at,
+              created_at,updated_at)
+             VALUES (?1,'p','architecture','模块边界','UI 不直接访问 SQLite',1,'user',?2,
+                     'project',1.0,2,?3,?4,'module graph changes',?5,1,2)",
+            params![id, format!("memory:{id}"), confirmed as i64, pinned as i64, invalidated_at],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1627,6 +1758,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!((active, invalid), (1, 1));
+    }
+
+    #[test]
+    fn confirmed_project_memory_is_shared_but_unconfirmed_or_stale_memory_is_hidden() {
+        let conn = conn();
+        insert_project_memory(&conn, "shared", true, true, None);
+        insert_project_memory(&conn, "draft", false, false, None);
+        insert_project_memory(&conn, "stale", true, false, Some(3));
+        conn.execute(
+            "INSERT INTO conversations(id,project_id,updated_at) VALUES ('other','p',1)",
+            [],
+        )
+        .unwrap();
+
+        let first = load_context_v2(&conn, "c", 20_000).unwrap();
+        let second = load_context_v2(&conn, "other", 20_000).unwrap();
+        for context in [&first, &second] {
+            let memories = context
+                .facts
+                .iter()
+                .filter(|fact| fact.fact_kind == "project_memory")
+                .collect::<Vec<_>>();
+            assert_eq!(memories.len(), 1);
+            assert_eq!(memories[0].id, "memory:shared");
+            assert_eq!(memories[0].version, 2);
+            assert_eq!(memories[0].value["pinned"], true);
+            assert_eq!(memories[0].source.reference, "memory:shared");
+        }
+        assert_eq!(first.facts_digest, second.facts_digest);
+        assert!(first.facts_digest.is_some());
     }
 
     #[test]

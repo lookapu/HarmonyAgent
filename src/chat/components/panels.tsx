@@ -95,7 +95,7 @@ export function MemoriesPanel({
   onRefresh,
 }: {
   memories: ProjectMemory[]
-  onSave: (input: { id?: string; category: string; title: string; content: string }) => Promise<void>
+  onSave: (input: { id?: string; category: string; title: string; content: string; pinned?: boolean; invalidation_condition?: string }) => Promise<void>
   onDelete: (id: string) => Promise<void>
   onToggle: (id: string, enabled: boolean) => Promise<void>
   onRefresh: () => Promise<void>
@@ -106,16 +106,20 @@ export function MemoriesPanel({
   const [title, setTitle] = useState('')
   const [category, setCategory] = useState('general')
   const [content, setContent] = useState('')
+  const [pinned, setPinned] = useState(false)
+  const [invalidationCondition, setInvalidationCondition] = useState('')
   const [busy, setBusy] = useState(false)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
 
-  const categories = ['general', 'code', 'build', 'deploy', 'decision', 'pitfall', 'path']
+  const categories = ['general', 'architecture', 'build_command', 'module_role', 'user_preference', 'decision', 'code', 'build', 'deploy', 'pitfall', 'path']
 
   const startEdit = (m: ProjectMemory) => {
     setEditing(m)
     setTitle(m.title)
     setCategory(m.category)
     setContent(m.content)
+    setPinned(m.pinned)
+    setInvalidationCondition(m.invalidation_condition)
     setShowForm(true)
   }
 
@@ -124,6 +128,8 @@ export function MemoriesPanel({
     setTitle('')
     setCategory('general')
     setContent('')
+    setPinned(false)
+    setInvalidationCondition('')
     setShowForm(true)
   }
 
@@ -131,7 +137,7 @@ export function MemoriesPanel({
     if (!title.trim() || !content.trim()) return
     setBusy(true)
     try {
-      await onSave({ id: editing?.id, category, title: title.trim(), content: content.trim() })
+      await onSave({ id: editing?.id, category, title: title.trim(), content: content.trim(), pinned, invalidation_condition: invalidationCondition.trim() })
       setShowForm(false)
       setEditing(null)
     } finally {
@@ -190,6 +196,16 @@ export function MemoriesPanel({
             rows={4}
             className="w-full px-2.5 py-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] transition-colors resize-y"
           />
+          <input
+            value={invalidationCondition}
+            onChange={(e) => setInvalidationCondition(e.target.value)}
+            placeholder={t('home.memoryInvalidationPlaceholder')}
+            className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
+          />
+          <label className="flex items-center gap-2 text-[11px] text-[var(--text-secondary)]">
+            <input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} />
+            {t('home.memoryPinned')}
+          </label>
           <div className="flex items-center justify-end gap-2">
             <button
               onClick={() => setShowForm(false)}
@@ -229,6 +245,7 @@ export function MemoriesPanel({
                 </span>
               )}
               <span className="flex-1 min-w-0 text-[12px] font-medium truncate">{m.title}</span>
+              {m.pinned && <Icon name="pin" size={11} />}
               <button
                 onClick={() => onToggle(m.id, !m.enabled)}
                 className={`shrink-0 w-7 h-4 rounded-full transition-colors relative ${m.enabled ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'}`}
@@ -890,6 +907,5 @@ export function ShellPanel({ projectId, projectPath }: { projectId: string; proj
     </div>
   )
 }
-
 
 

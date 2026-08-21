@@ -299,11 +299,21 @@ pub struct ProjectInspect {
 pub struct ProjectMemory {
     pub id: String,
     pub project_id: String,
-    /// general|code|build|deploy|decision|pitfall
+    /// general|architecture|build_command|module_role|user_preference|decision|...
     pub category: String,
     pub title: String,
     pub content: String,
     pub enabled: bool,
+    pub source_kind: String,
+    pub source_ref: String,
+    pub scope: String,
+    pub confidence: f64,
+    pub version: i64,
+    pub confirmed: bool,
+    pub pinned: bool,
+    pub invalidation_condition: String,
+    pub invalidated_at: Option<i64>,
+    pub invalidation_reason: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

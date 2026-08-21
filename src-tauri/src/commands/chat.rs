@@ -2667,6 +2667,7 @@ async fn stream_chat_inner(
             .prepare(
                 "SELECT content FROM project_memories
                  WHERE project_id = ?1 AND category = 'path' AND enabled = 1
+                   AND confirmed = 1 AND invalidated_at IS NULL
                  ORDER BY updated_at DESC LIMIT 5",
             )
             .map_err(|e| e.to_string())?;
@@ -3477,7 +3478,8 @@ async fn stream_chat_inner(
         let mut stmt = conn
             .prepare(
                 "SELECT category, title, content, updated_at FROM project_memories
-                 WHERE project_id = ?1 AND enabled = 1 AND category != 'path'
+                 WHERE project_id = ?1 AND enabled = 1 AND confirmed = 1
+                   AND invalidated_at IS NULL AND category != 'path'
                  ORDER BY updated_at DESC LIMIT 100",
             )
             .map_err(|e| e.to_string())?;
@@ -3597,6 +3599,7 @@ async fn stream_chat_inner(
             .prepare(
                 "SELECT content FROM project_memories
                  WHERE project_id = ?1 AND category = 'path' AND enabled = 1
+                   AND confirmed = 1 AND invalidated_at IS NULL
                  ORDER BY updated_at DESC LIMIT 5",
             )
             .map_err(|e| e.to_string())?;
@@ -9422,6 +9425,16 @@ fn remember_path_hints(
             title: format!("实际项目目录：{title}"),
             content: format!("{h}\n（用户指明的项目实际路径，文件工具相对路径请优先基于此解析）"),
             enabled: true,
+            source_kind: "user_message".into(),
+            source_ref: "path_hint".into(),
+            scope: "project".into(),
+            confidence: 1.0,
+            version: 1,
+            confirmed: true,
+            pinned: false,
+            invalidation_condition: "project_path_changed".into(),
+            invalidated_at: None,
+            invalidation_reason: None,
             created_at: now,
             updated_at: now,
         };

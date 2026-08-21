@@ -546,7 +546,9 @@ pub fn list_skill_usage_events(
 /// 列出项目的全部记忆（按更新时间倒序）
 pub fn list_memories(conn: &Connection, project_id: &str) -> Result<Vec<ProjectMemory>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, category, title, content, enabled, created_at, updated_at
+        "SELECT id, project_id, category, title, content, enabled,
+                source_kind,source_ref,scope,confidence,version,confirmed,pinned,
+                invalidation_condition,invalidated_at,invalidation_reason,created_at,updated_at
          FROM project_memories WHERE project_id = ?1 ORDER BY updated_at DESC"
     )?;
     let rows = stmt.query_map([project_id], |row| {
@@ -557,8 +559,18 @@ pub fn list_memories(conn: &Connection, project_id: &str) -> Result<Vec<ProjectM
             title: row.get(3)?,
             content: row.get(4)?,
             enabled: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            source_kind: row.get(6)?,
+            source_ref: row.get(7)?,
+            scope: row.get(8)?,
+            confidence: row.get(9)?,
+            version: row.get(10)?,
+            confirmed: row.get(11)?,
+            pinned: row.get(12)?,
+            invalidation_condition: row.get(13)?,
+            invalidated_at: row.get(14)?,
+            invalidation_reason: row.get(15)?,
+            created_at: row.get(16)?,
+            updated_at: row.get(17)?,
         })
     })?;
     rows.collect()
@@ -567,9 +579,13 @@ pub fn list_memories(conn: &Connection, project_id: &str) -> Result<Vec<ProjectM
 /// 插入一条记忆
 pub fn insert_memory(conn: &Connection, m: &ProjectMemory) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO project_memories (id, project_id, category, title, content, enabled, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![m.id, m.project_id, m.category, m.title, m.content, m.enabled as i64, m.created_at, m.updated_at],
+        "INSERT INTO project_memories
+         (id,project_id,category,title,content,enabled,source_kind,source_ref,scope,confidence,
+          version,confirmed,pinned,invalidation_condition,invalidated_at,invalidation_reason,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+        params![m.id,m.project_id,m.category,m.title,m.content,m.enabled as i64,m.source_kind,
+            m.source_ref,m.scope,m.confidence,m.version,m.confirmed as i64,m.pinned as i64,
+            m.invalidation_condition,m.invalidated_at,m.invalidation_reason,m.created_at,m.updated_at],
     )?;
     Ok(())
 }
@@ -577,8 +593,11 @@ pub fn insert_memory(conn: &Connection, m: &ProjectMemory) -> Result<(), rusqlit
 /// 更新记忆内容（标题/分类/内容）
 pub fn update_memory(conn: &Connection, m: &ProjectMemory) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "UPDATE project_memories SET category = ?2, title = ?3, content = ?4, updated_at = ?5 WHERE id = ?1",
-        params![m.id, m.category, m.title, m.content, m.updated_at],
+        "UPDATE project_memories SET category=?2,title=?3,content=?4,source_kind=?5,source_ref=?6,
+         scope=?7,confidence=?8,version=version+1,confirmed=?9,pinned=?10,
+         invalidation_condition=?11,invalidated_at=NULL,invalidation_reason=NULL,updated_at=?12 WHERE id=?1",
+        params![m.id,m.category,m.title,m.content,m.source_kind,m.source_ref,m.scope,m.confidence,
+            m.confirmed as i64,m.pinned as i64,m.invalidation_condition,m.updated_at],
     )?;
     Ok(())
 }

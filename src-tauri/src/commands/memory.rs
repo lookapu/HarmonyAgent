@@ -16,6 +16,10 @@ pub struct MemoryInput {
     pub category: String,
     pub title: String,
     pub content: String,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub invalidation_condition: String,
 }
 
 /// 列出项目的全部记忆（按更新时间倒序）
@@ -40,6 +44,11 @@ pub fn save_memory(db: State<DbState>, input: MemoryInput) -> Result<ProjectMemo
         m.category = input.category;
         m.title = input.title;
         m.content = input.content;
+        m.source_kind = "user".into();
+        m.source_ref = format!("memory:{id}");
+        m.confirmed = true;
+        m.pinned = input.pinned;
+        m.invalidation_condition = input.invalidation_condition;
         m.updated_at = now;
         queries::update_memory(&conn, &m).map_err(|e| e.to_string())?;
         Ok(m)
@@ -51,6 +60,16 @@ pub fn save_memory(db: State<DbState>, input: MemoryInput) -> Result<ProjectMemo
             title: input.title,
             content: input.content,
             enabled: true,
+            source_kind: "user".into(),
+            source_ref: "memory_panel".into(),
+            scope: "project".into(),
+            confidence: 1.0,
+            version: 1,
+            confirmed: true,
+            pinned: input.pinned,
+            invalidation_condition: input.invalidation_condition,
+            invalidated_at: None,
+            invalidation_reason: None,
             created_at: now,
             updated_at: now,
         };

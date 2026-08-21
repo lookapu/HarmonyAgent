@@ -506,6 +506,10 @@
     "memoryContentPlaceholder": "Facts or conventions worth remembering",
     "memoryCat": {
       "general": "General",
+      "architecture": "Architecture",
+      "build_command": "Build command",
+      "module_role": "Module role",
+      "user_preference": "User preference",
       "code": "Code",
       "build": "Build",
       "deploy": "Deploy",
@@ -513,6 +517,8 @@
       "pitfall": "Pitfall",
       "path": "Path"
     },
+    "memoryPinned": "Pin as key project context",
+    "memoryInvalidationPlaceholder": "Invalidation condition (e.g. branch or build config changes)",
     "memoryEnable": "Enable this memory",
     "memoryDisable": "Disable (no longer injected)",
     "memoryEdit": "Edit",

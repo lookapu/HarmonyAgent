@@ -507,6 +507,10 @@
     "memoryContentPlaceholder": "内容：值得长期记住的工程事实或约定",
     "memoryCat": {
       "general": "通用",
+      "architecture": "架构约定",
+      "build_command": "构建命令",
+      "module_role": "模块职责",
+      "user_preference": "用户偏好",
       "code": "代码",
       "build": "构建",
       "deploy": "部署",
@@ -514,6 +518,8 @@
       "pitfall": "坑点",
       "path": "路径"
     },
+    "memoryPinned": "固定为关键项目上下文",
+    "memoryInvalidationPlaceholder": "失效条件（如：切换分支或修改 build-profile.json5）",
     "memoryEnable": "启用此记忆",
     "memoryDisable": "禁用此记忆（不再注入对话）",
     "memoryEdit": "编辑",

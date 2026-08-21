@@ -21,7 +21,7 @@ pub(super) async fn save_memory(args: &Value, project_id: &str, db: &crate::db::
         return Err(format!("content 过长（{} 字符），请精简到 2000 字符内", content.chars().count()));
     }
     let raw_cat = args["category"].as_str().unwrap_or("general").trim().to_string();
-    let category = if matches!(raw_cat.as_str(), "general" | "code" | "build" | "deploy" | "decision" | "pitfall") {
+    let category = if matches!(raw_cat.as_str(), "general" | "architecture" | "build_command" | "module_role" | "user_preference" | "code" | "build" | "deploy" | "decision" | "pitfall" | "path") {
         raw_cat
     } else {
         "general".to_string()
@@ -34,6 +34,16 @@ pub(super) async fn save_memory(args: &Value, project_id: &str, db: &crate::db::
         title,
         content,
         enabled: true,
+        source_kind: "agent_tool".into(),
+        source_ref: "tool:save_memory".into(),
+        scope: "project".into(),
+        confidence: args["confidence"].as_f64().unwrap_or(0.9).clamp(0.0, 1.0),
+        version: 1,
+        confirmed: args["confirmed"].as_bool().unwrap_or(true),
+        pinned: args["pinned"].as_bool().unwrap_or(false),
+        invalidation_condition: args["invalidation_condition"].as_str().unwrap_or("").trim().to_string(),
+        invalidated_at: None,
+        invalidation_reason: None,
         created_at: now,
         updated_at: now,
     };
@@ -91,7 +101,7 @@ pub(super) async fn fact_extract(args: &Value, project_id: &str, db: &crate::db:
         return Err(format!("title 过长（{} 字符），请精简到 60 字符内", title.chars().count()));
     }
     let raw_cat = args["category"].as_str().unwrap_or("general").trim().to_string();
-    let category = if matches!(raw_cat.as_str(), "general" | "code" | "build" | "deploy" | "decision" | "pitfall") {
+    let category = if matches!(raw_cat.as_str(), "general" | "architecture" | "build_command" | "module_role" | "user_preference" | "code" | "build" | "deploy" | "decision" | "pitfall") {
         raw_cat
     } else {
         "general".to_string()
@@ -135,6 +145,16 @@ pub(super) async fn fact_extract(args: &Value, project_id: &str, db: &crate::db:
         title,
         content: fact,
         enabled: true,
+        source_kind: "agent_extraction".into(),
+        source_ref: "tool:fact_extract".into(),
+        scope: "project".into(),
+        confidence: args["confidence"].as_f64().unwrap_or(0.8).clamp(0.0, 1.0),
+        version: 1,
+        confirmed: args["confirmed"].as_bool().unwrap_or(true),
+        pinned: args["pinned"].as_bool().unwrap_or(false),
+        invalidation_condition: args["invalidation_condition"].as_str().unwrap_or("").trim().to_string(),
+        invalidated_at: None,
+        invalidation_reason: None,
         created_at: now,
         updated_at: now,
     };

@@ -856,11 +856,21 @@ export const deleteProjectFile = (projectId: string, path: string, root?: string
 export interface ProjectMemory {
   id: string
   project_id: string
-  /** general|code|build|deploy|decision|pitfall */
+  /** Structured Context V2 project-memory category. */
   category: string
   title: string
   content: string
   enabled: boolean
+  source_kind: string
+  source_ref: string
+  scope: string
+  confidence: number
+  version: number
+  confirmed: boolean
+  pinned: boolean
+  invalidation_condition: string
+  invalidated_at: number | null
+  invalidation_reason: string | null
   created_at: number
   updated_at: number
 }
@@ -869,7 +879,7 @@ export const listMemories = (projectId: string) =>
   invokeWithError<ProjectMemory[]>('list_memories', { projectId })
 
 /** 保存记忆（id 为空 = 新增，否则更新） */
-export const saveMemory = (input: { id?: string; project_id: string; category: string; title: string; content: string }) =>
+export const saveMemory = (input: { id?: string; project_id: string; category: string; title: string; content: string; pinned?: boolean; invalidation_condition?: string }) =>
   invokeWithError<ProjectMemory>('save_memory', { input })
 
 export const deleteMemory = (id: string) => invokeWithError<void>('delete_memory', { id })
