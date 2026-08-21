@@ -233,7 +233,7 @@ export function MemoriesPanel({
         memories.map((m) => (
           <div
             key={m.id}
-            className={`rounded-xl modern-card p-3 transition-opacity ${m.enabled ? '' : 'opacity-55'}`}
+            className={`rounded-xl modern-card p-3 transition-opacity ${m.enabled && !m.invalidated_at ? '' : 'opacity-55'}`}
           >
             <div className="flex items-center gap-2">
               <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)]">
@@ -246,6 +246,11 @@ export function MemoriesPanel({
               )}
               <span className="flex-1 min-w-0 text-[12px] font-medium truncate">{m.title}</span>
               {m.pinned && <Icon name="pin" size={11} />}
+              {m.invalidated_at && (
+                <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500">
+                  {t('home.memoryInvalidated')}
+                </span>
+              )}
               <button
                 onClick={() => onToggle(m.id, !m.enabled)}
                 className={`shrink-0 w-7 h-4 rounded-full transition-colors relative ${m.enabled ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'}`}
@@ -278,8 +283,10 @@ export function MemoriesPanel({
               {m.content}
             </p>
             <div className="mt-1.5 flex items-center justify-between">
-              <span className="text-[9px] text-[var(--text-muted)]">
-                {new Date(m.updated_at * 1000).toLocaleDateString()}
+              <span className="text-[9px] text-[var(--text-muted)]" title={m.invalidated_at ? m.invalidation_reason ?? '' : `${m.source_kind} · v${m.version} · ${Math.round(m.confidence * 100)}%`}>
+                {m.invalidated_at
+                  ? `${t('home.memoryInvalidatedReason')}: ${m.invalidation_reason ?? '-'}`
+                  : `${new Date(m.updated_at * 1000).toLocaleDateString()} · ${m.source_kind} · v${m.version}`}
               </span>
               <button onClick={onRefresh} className="text-[9px] text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors">
                 {t('home.refresh')}
@@ -907,5 +914,4 @@ export function ShellPanel({ projectId, projectPath }: { projectId: string; proj
     </div>
   )
 }
-
 

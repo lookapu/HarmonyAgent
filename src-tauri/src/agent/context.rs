@@ -557,6 +557,123 @@ pub fn invalidate_project_facts(
     Ok(changed)
 }
 
+/// Invalidate durable project memories only when their declared condition
+/// matches the observed event or one of its concrete references. Stable user
+/// preferences and decisions with no condition are intentionally preserved.
+pub fn invalidate_project_memories(
+    conn: &Connection,
+    project_id: &str,
+    event: &str,
+    references: &[String],
+) -> Result<usize, String> {
+    let event = event.trim().to_lowercase();
+    let aliases: &[&str] = match event.as_str() {
+        "project_changed" | "project_identity_changed" => &["project", "worktree", "项目", "工程"],
+        "branch_changed" | "git_branch_changed" => &["branch", "git", "分支"],
+        "file_changed" => &["file_changed", "file change", "文件变更", "文件变化"],
+        "device_changed" => &["device", "hdc", "设备", "系统版本", "权限", "安装状态"],
+        _ => &[],
+    };
+    let refs = references
+        .iter()
+        .flat_map(|reference| {
+            let normalized = reference.trim().to_lowercase();
+            let name = std::path::Path::new(&normalized)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_string();
+            [normalized, name]
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,invalidation_condition FROM project_memories
+             WHERE project_id=?1 AND enabled=1 AND invalidated_at IS NULL
+               AND TRIM(invalidation_condition)!=''",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+    let ids = rows
+        .into_iter()
+        .filter_map(|(id, condition)| {
+            let condition = condition.to_lowercase();
+            (condition.contains(&event)
+                || aliases.iter().any(|alias| condition.contains(alias))
+                || refs.iter().any(|reference| condition.contains(reference)))
+            .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let now = now_ms();
+    let reason = if references.is_empty() {
+        event.clone()
+    } else {
+        format!("{}:{}", event, references.iter().take(5).cloned().collect::<Vec<_>>().join(","))
+    };
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    for id in &ids {
+        tx.execute(
+            "UPDATE project_memories SET invalidated_at=?1,invalidation_reason=?2,updated_at=?1
+             WHERE id=?3 AND invalidated_at IS NULL",
+            params![now, reason, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "INSERT INTO conversation_context_state
+         (conversation_id,schema_version,invalidation_epoch,created_at,updated_at)
+         SELECT id,?1,1,?2,?2 FROM conversations WHERE project_id=?3
+         ON CONFLICT(conversation_id) DO UPDATE SET
+           invalidation_epoch=invalidation_epoch+1,updated_at=excluded.updated_at",
+        params![CONTEXT_SCHEMA_VERSION, now, project_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(ids.len())
+}
+
+fn tool_file_references(args: &str) -> Vec<String> {
+    fn collect(value: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (name, child) in map {
+                    collect(child, Some(name), out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect(item, key, out);
+                }
+            }
+            serde_json::Value::String(text)
+                if matches!(key, Some("path" | "file" | "target" | "dest" | "old_path" | "new_path")) =>
+            {
+                out.push(text.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(value) = serde_json::from_str(args) {
+        collect(&value, None, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out.truncate(20);
+    out
+}
+
 fn invalidate_fact_kinds(
     conn: &Connection,
     conversation_id: &str,
@@ -679,6 +796,26 @@ pub fn record_tool_evidence(
             invalidated_kinds,
             &format!("tool_mutation:{tool}"),
         );
+        if let Some(project_id) = project_id.as_deref() {
+            let (event, references) = if matches!(
+                tool,
+                "write_file" | "edit_file" | "multi_edit" | "apply_patch" | "delete_file"
+            ) {
+                (Some("file_changed"), tool_file_references(args))
+            } else if matches!(tool, "git_branch" | "git_pull" | "git_merge" | "git_restore") {
+                (Some("git_branch_changed"), Vec::new())
+            } else if matches!(
+                tool,
+                "deploy" | "deploy_all" | "uninstall_app" | "clear_app_data" | "grant_permission"
+            ) {
+                (Some("device_changed"), Vec::new())
+            } else {
+                (None, Vec::new())
+            };
+            if let Some(event) = event {
+                let _ = invalidate_project_memories(conn, project_id, event, &references);
+            }
+        }
     }
 
     for artifact in &envelope.artifacts {
@@ -1709,6 +1846,7 @@ mod tests {
         confirmed: bool,
         pinned: bool,
         invalidated_at: Option<i64>,
+        invalidation_condition: &str,
     ) {
         conn.execute(
             "INSERT INTO project_memories
@@ -1716,8 +1854,15 @@ mod tests {
               confidence,version,confirmed,pinned,invalidation_condition,invalidated_at,
               created_at,updated_at)
              VALUES (?1,'p','architecture','模块边界','UI 不直接访问 SQLite',1,'user',?2,
-                     'project',1.0,2,?3,?4,'module graph changes',?5,1,2)",
-            params![id, format!("memory:{id}"), confirmed as i64, pinned as i64, invalidated_at],
+                     'project',1.0,2,?3,?4,?5,?6,1,2)",
+            params![
+                id,
+                format!("memory:{id}"),
+                confirmed as i64,
+                pinned as i64,
+                invalidation_condition,
+                invalidated_at
+            ],
         )
         .unwrap();
     }
@@ -1763,9 +1908,9 @@ mod tests {
     #[test]
     fn confirmed_project_memory_is_shared_but_unconfirmed_or_stale_memory_is_hidden() {
         let conn = conn();
-        insert_project_memory(&conn, "shared", true, true, None);
-        insert_project_memory(&conn, "draft", false, false, None);
-        insert_project_memory(&conn, "stale", true, false, Some(3));
+        insert_project_memory(&conn, "shared", true, true, None, "module graph changes");
+        insert_project_memory(&conn, "draft", false, false, None, "");
+        insert_project_memory(&conn, "stale", true, false, Some(3), "");
         conn.execute(
             "INSERT INTO conversations(id,project_id,updated_at) VALUES ('other','p',1)",
             [],
@@ -1788,6 +1933,64 @@ mod tests {
         }
         assert_eq!(first.facts_digest, second.facts_digest);
         assert!(first.facts_digest.is_some());
+    }
+
+    #[test]
+    fn declared_memory_conditions_invalidate_only_matching_project_knowledge() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO conversations(id,project_id,updated_at) VALUES ('other','p',1)",
+            [],
+        )
+        .unwrap();
+        insert_project_memory(&conn, "branch", true, false, None, "切换 Git 分支");
+        insert_project_memory(
+            &conn,
+            "file",
+            true,
+            false,
+            None,
+            "build-profile.json5 修改时失效",
+        );
+        insert_project_memory(&conn, "device", true, false, None, "设备系统版本变化");
+        insert_project_memory(&conn, "stable", true, true, None, "");
+
+        assert_eq!(
+            invalidate_project_memories(&conn, "p", "git_branch_changed", &[]).unwrap(),
+            1
+        );
+        assert_eq!(
+            invalidate_project_memories(
+                &conn,
+                "p",
+                "file_changed",
+                &["entry/build-profile.json5".into()],
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            invalidate_project_memories(&conn, "p", "device_changed", &[]).unwrap(),
+            1
+        );
+        let active = load_active_facts(&conn, "c", 20).unwrap();
+        let memory_ids = active
+            .iter()
+            .filter(|fact| fact.fact_kind == "project_memory")
+            .map(|fact| fact.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(memory_ids, vec!["memory:stable"]);
+        let epochs = conn
+            .prepare(
+                "SELECT invalidation_epoch FROM conversation_context_state
+                 WHERE conversation_id IN ('c','other') ORDER BY conversation_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(epochs, vec![3, 3]);
     }
 
     #[test]

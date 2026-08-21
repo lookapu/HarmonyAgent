@@ -520,6 +520,8 @@
     },
     "memoryPinned": "固定为关键项目上下文",
     "memoryInvalidationPlaceholder": "失效条件（如：切换分支或修改 build-profile.json5）",
+    "memoryInvalidated": "已失效",
+    "memoryInvalidatedReason": "失效原因",
     "memoryEnable": "启用此记忆",
     "memoryDisable": "禁用此记忆（不再注入对话）",
     "memoryEdit": "编辑",

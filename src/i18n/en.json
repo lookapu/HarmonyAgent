@@ -519,6 +519,8 @@
     },
     "memoryPinned": "Pin as key project context",
     "memoryInvalidationPlaceholder": "Invalidation condition (e.g. branch or build config changes)",
+    "memoryInvalidated": "Invalidated",
+    "memoryInvalidatedReason": "Reason",
     "memoryEnable": "Enable this memory",
     "memoryDisable": "Disable (no longer injected)",
     "memoryEdit": "Edit",

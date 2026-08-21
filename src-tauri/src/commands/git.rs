@@ -3,7 +3,7 @@
 
 use crate::db::models::Project;
 use crate::db::DbState;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use std::path::Path;
 use tauri::State;
@@ -220,6 +220,12 @@ pub async fn git_switch_branch(
                         &project_id,
                         "git_branch_changed",
                     );
+                    let _ = crate::agent::context::invalidate_project_memories(
+                        &conn,
+                        &project_id,
+                        "git_branch_changed",
+                        &[],
+                    );
                 }
             }
             Ok(format!("✅ 已切换到分支 {branch}\n{o}"))
@@ -369,11 +375,33 @@ pub fn set_project_worktree(
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
+    let previous: Option<String> = conn
+        .query_row(
+            "SELECT worktree_path FROM projects WHERE id=?1",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE projects SET worktree_path = ?1 WHERE id = ?2",
         params![wp, project_id],
     )
     .map_err(|e| e.to_string())?;
+    if previous.as_deref() != wp {
+        let _ = crate::agent::context::invalidate_project_facts(
+            &conn,
+            &project_id,
+            "project_worktree_changed",
+        );
+        let refs = wp.map(str::to_string).into_iter().collect::<Vec<_>>();
+        let _ = crate::agent::context::invalidate_project_memories(
+            &conn,
+            &project_id,
+            "project_changed",
+            &refs,
+        );
+    }
     drop(conn);
     crate::commands::project::get_project_by_id(&state, &project_id)
 }

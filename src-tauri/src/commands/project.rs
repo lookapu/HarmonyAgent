@@ -757,6 +757,12 @@ pub async fn switch_git_branch(
             &project_id,
             "git_branch_changed",
         );
+        let _ = crate::agent::context::invalidate_project_memories(
+            &conn,
+            &project_id,
+            "git_branch_changed",
+            &[],
+        );
     }
     Ok(GitBranchInfo {
         error: if msg.is_empty() { None } else { Some(msg) },
@@ -1530,18 +1536,23 @@ pub fn on_project_meta_files_changed(
         let Ok(conn) = state.0.lock() else { return };
         conn.query_row("SELECT kind FROM projects WHERE id = ?1", [project_id], |r| r.get(0)).ok()
     };
-    if old_kind.as_deref() != Some(db_kind) {
+    let identity_changed = old_kind.as_deref() != Some(db_kind);
+    if identity_changed {
         let Ok(conn) = state.0.lock() else { return };
         let _ = conn.execute(
             "UPDATE projects SET kind = ?1 WHERE id = ?2",
             rusqlite::params![db_kind, project_id],
         );
-    }
-    if let Ok(conn) = state.0.lock() {
         let _ = crate::agent::context::invalidate_project_facts(
             &conn,
             project_id,
             "project_identity_changed",
+        );
+        let _ = crate::agent::context::invalidate_project_memories(
+            &conn,
+            project_id,
+            "project_identity_changed",
+            &[],
         );
     }
     // 通知前端刷新：kind 变化时附带旧/新类型供提示
