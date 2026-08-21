@@ -552,6 +552,25 @@ pub(super) async fn build_project(
                 }
             })
             .collect();
+        let api_mappings = collect_arkts_api_mappings(
+            ctx,
+            root,
+            spec.product.as_deref(),
+            &errors,
+        );
+        for mapping in &api_mappings {
+            let source = errors.get(mapping.error_index);
+            for evidence in mapping.evidence.iter().take(6) {
+                locations.push(ErrorLocation {
+                    file: source.and_then(|error| error.file.clone()),
+                    line: source.and_then(|error| error.line),
+                    message: format!(
+                        "[arkts_api={} confidence={:.2}] {evidence}",
+                        mapping.kind, mapping.confidence
+                    ),
+                });
+            }
+        }
         let diagnoses = crate::services::harmony_diagnosis::diagnose_failure(
             root,
             &semantic_model,
@@ -602,6 +621,9 @@ pub(super) async fn build_project(
         };
         for diagnosis in &diagnoses {
             next.extend(diagnosis.recovery_steps.iter().map(String::as_str));
+        }
+        for mapping in &api_mappings {
+            next.extend(mapping.recovery_steps.iter().map(String::as_str));
         }
         let dom_cat = dominant.unwrap_or("build_failed");
         let diagnosis_summary = diagnoses
@@ -677,10 +699,52 @@ pub(super) async fn build_project(
                     "line": error.line,
                     "message": error.message,
                 })).collect::<Vec<_>>(),
+                "arkts_api_mappings": api_mappings,
             }),
         );
         Err(err)
     }
+}
+
+fn collect_arkts_api_mappings(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    root: &Path,
+    product: Option<&str>,
+    errors: &[crate::services::harmony::BuildError],
+) -> Vec<crate::services::harmony_api_diagnosis::ArktsApiMapping> {
+    let Some(app) = ctx.app.as_ref() else {
+        let context = crate::services::sdk_api::project_api_context(Some(root), product, None);
+        return crate::services::harmony_api_diagnosis::map_errors(
+            errors,
+            &context,
+            None,
+            None,
+        );
+    };
+    let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
+    let env = crate::services::harmony_env::detect(&db);
+    let context = crate::services::sdk_api::project_api_context(
+        Some(root),
+        product,
+        env.default_api.as_deref(),
+    );
+    let index = crate::services::harmony_env::default_api_dir(&env)
+        .map(|api_dir| crate::services::sdk_api::index_api_dir(&api_dir));
+    let mappings = match db.0.lock() {
+        Ok(conn) => crate::services::harmony_api_diagnosis::map_errors(
+            errors,
+            &context,
+            index.as_ref(),
+            Some(&conn),
+        ),
+        Err(_) => crate::services::harmony_api_diagnosis::map_errors(
+            errors,
+            &context,
+            index.as_ref(),
+            None,
+        ),
+    };
+    mappings
 }
 
 fn resolve_hap_for_deploy(args: &Value, root: &Path) -> Result<(String, bool, String), String> {

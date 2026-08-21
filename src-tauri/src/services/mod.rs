@@ -9,6 +9,7 @@ pub mod git_runtime;
 pub mod generic_project;
 pub mod harmony;
 pub mod harmony_build;
+pub mod harmony_api_diagnosis;
 pub mod harmony_diagnosis;
 pub mod harmony_model;
 pub mod harmony_api_diff;
