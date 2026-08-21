@@ -143,41 +143,6 @@ fn scan_kits_in_dir(dir: &Path, out: &mut Vec<String>, budget: &mut usize) {
     }
 }
 
-/// 读取模块 module.json5 的能力字段
-fn parse_module_json(root: &Path, module_rel: &str) -> (String, Vec<String>, Option<String>, Vec<PermissionInfo>) {
-    let p = root.join(module_rel).join("src/main/module.json5");
-    let mut kind = String::new();
-    let mut device_types = Vec::new();
-    let mut main_element = None;
-    let mut permissions = Vec::new();
-    let Ok(text) = std::fs::read_to_string(&p) else {
-        return (kind, device_types, main_element, permissions);
-    };
-    let Ok(v) = crate::services::harmony::parse_json5(&text) else {
-        return (kind, device_types, main_element, permissions);
-    };
-    if let Some(m) = v.get("module") {
-        kind = m.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        device_types = m
-            .get("deviceTypes")
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        main_element = m.get("mainElement").and_then(|x| x.as_str()).map(String::from);
-        if let Some(perms) = m.get("requestPermissions").and_then(|x| x.as_array()) {
-            for per in perms {
-                let name = per.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                if name.is_empty() {
-                    continue;
-                }
-                let reason = per.get("reason").and_then(|x| x.as_str()).map(String::from);
-                permissions.push(PermissionInfo { name, reason });
-            }
-        }
-    }
-    (kind, device_types, main_element, permissions)
-}
-
 /// 取最新构建日志内容（无则空串）
 fn latest_build_log(project_path: &str) -> String {
     let log_dir = crate::agent::exec_ctx::log_dir(project_path);
@@ -258,13 +223,20 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
 
     for rel in &module_rels {
         let module_root = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
-        let (_, _, _, permissions) = parse_module_json(root, rel);
         let model_rel = if rel.is_empty() { "." } else { rel.as_str() };
         let model_module = semantic_model
             .modules
             .iter()
             .find(|module| module.rel_path == model_rel)
             .expect("module_rels derives from semantic_model");
+        let permissions = model_module
+            .permissions
+            .iter()
+            .map(|permission| PermissionInfo {
+                name: permission.name.clone(),
+                reason: permission.reason.clone(),
+            })
+            .collect::<Vec<_>>();
         let mut kits = Vec::new();
         let mut budget = 600usize;
         scan_kits_in_dir(&module_root.join("src"), &mut kits, &mut budget);

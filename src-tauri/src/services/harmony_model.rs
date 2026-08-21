@@ -27,6 +27,7 @@ pub struct HarmonySemanticModel {
     pub dependencies: Vec<HarmonyDependency>,
     pub lockfiles: Vec<HarmonyLockfile>,
     pub manifests: Vec<HarmonyManifestSource>,
+    pub graph: HarmonyProjectGraph,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -62,6 +63,7 @@ pub struct HarmonyModule {
     pub targets: Vec<HarmonyTarget>,
     pub abilities: Vec<HarmonyAbility>,
     pub extension_abilities: Vec<HarmonyExtensionAbility>,
+    pub permissions: Vec<HarmonyPermission>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,6 +85,57 @@ pub struct HarmonyExtensionAbility {
     pub extension_type: Option<String>,
     pub src_entry: Option<String>,
     pub exported: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyPermission {
+    pub name: String,
+    pub reason: Option<String>,
+    pub abilities: Vec<String>,
+    pub when: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyProjectGraph {
+    pub pages: Vec<HarmonyPage>,
+    pub system_capabilities: Vec<HarmonySystemCapabilityRef>,
+    pub cross_module_refs: Vec<HarmonyCrossModuleRef>,
+    pub edges: Vec<HarmonyGraphEdge>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyPage {
+    pub module: String,
+    pub path: String,
+    /// main_pages / router_map / decorator
+    pub source_kind: String,
+    pub source_file: String,
+    pub route_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonySystemCapabilityRef {
+    pub module: String,
+    pub capability: String,
+    pub source_file: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyCrossModuleRef {
+    pub from_module: String,
+    pub to_module: String,
+    pub specifier: String,
+    pub source_file: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyGraphEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -148,7 +201,7 @@ struct RootModuleDecl {
 /// 容错解析完整 HarmonyOS 工程。任一清单损坏只会使对应部分缺失，不阻断其它信息。
 pub fn parse(root: &Path) -> HarmonySemanticModel {
     let mut model = HarmonySemanticModel {
-        schema_version: 2,
+        schema_version: 3,
         ..HarmonySemanticModel::default()
     };
     model.app = parse_app(root);
@@ -182,6 +235,7 @@ pub fn parse(root: &Path) -> HarmonySemanticModel {
     model.dependencies =
         parse_dependencies(root, &model.modules, &manifest_paths, &model.lockfiles);
     model.manifests = collect_manifest_sources(root, &manifest_paths);
+    model.graph = build_project_graph(root, &model);
     model
 }
 
@@ -324,6 +378,7 @@ fn parse_module(
         targets,
         abilities: parse_abilities(module.get("abilities")),
         extension_abilities: parse_extension_abilities(module.get("extensionAbilities")),
+        permissions: parse_permissions(module.get("requestPermissions")),
     })
 }
 
@@ -367,6 +422,31 @@ fn parse_extension_abilities(value: Option<&serde_json::Value>) -> Vec<HarmonyEx
                 extension_type: string(ability, "type"),
                 src_entry: string(ability, "srcEntry"),
                 exported: ability.get("exported").and_then(|v| v.as_bool()),
+            })
+        })
+        .collect()
+}
+
+fn parse_permissions(value: Option<&serde_json::Value>) -> Vec<HarmonyPermission> {
+    value
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|permission| {
+            let used_scene = permission.get("usedScene");
+            Some(HarmonyPermission {
+                name: string(permission, "name")?,
+                reason: string(permission, "reason"),
+                abilities: used_scene
+                    .and_then(|scene| scene.get("abilities"))
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(|single| vec![single.to_string()])
+                            .unwrap_or_else(|| string_array(Some(value)))
+                    })
+                    .unwrap_or_default(),
+                when: used_scene.and_then(|scene| string(scene, "when")),
             })
         })
         .collect()
@@ -664,6 +744,374 @@ fn manifest_source(
     }
 }
 
+fn build_project_graph(root: &Path, model: &HarmonySemanticModel) -> HarmonyProjectGraph {
+    let mut graph = HarmonyProjectGraph::default();
+    let packages = model
+        .modules
+        .iter()
+        .filter_map(|module| {
+            module
+                .package_name
+                .as_ref()
+                .map(|name| (name.clone(), module.rel_path.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let module_paths = model
+        .modules
+        .iter()
+        .map(|module| module.rel_path.clone())
+        .collect::<Vec<_>>();
+
+    for product in &model.products {
+        for module in &product.modules {
+            graph.edges.push(HarmonyGraphEdge {
+                from: format!("product:{}", product.name),
+                to: format!("module:{module}"),
+                kind: "includes".into(),
+                source: "build-profile.json5".into(),
+            });
+        }
+    }
+    for module in &model.modules {
+        let module_id = format!("module:{}", module.rel_path);
+        for ability in &module.abilities {
+            graph.edges.push(HarmonyGraphEdge {
+                from: module_id.clone(),
+                to: format!("ability:{}:{}", module.rel_path, ability.name),
+                kind: "contains".into(),
+                source: format!("{}/src/main/module.json5", module.rel_path),
+            });
+        }
+        for ability in &module.extension_abilities {
+            graph.edges.push(HarmonyGraphEdge {
+                from: module_id.clone(),
+                to: format!("extension:{}:{}", module.rel_path, ability.name),
+                kind: "contains".into(),
+                source: format!("{}/src/main/module.json5", module.rel_path),
+            });
+        }
+        for permission in &module.permissions {
+            graph.edges.push(HarmonyGraphEdge {
+                from: module_id.clone(),
+                to: format!("permission:{}", permission.name),
+                kind: "requests".into(),
+                source: format!("{}/src/main/module.json5", module.rel_path),
+            });
+        }
+        collect_profile_pages(root, module, &mut graph.pages);
+        scan_module_sources(root, module, &packages, &module_paths, &mut graph);
+    }
+    for dependency in &model.dependencies {
+        if let Some(target) = &dependency.target_module {
+            graph.edges.push(HarmonyGraphEdge {
+                from: format!("module:{}", dependency.from_module),
+                to: format!("module:{target}"),
+                kind: "depends_on".into(),
+                source: dependency
+                    .lockfile
+                    .clone()
+                    .unwrap_or_else(|| format!("{}/oh-package.json5", dependency.from_module)),
+            });
+        }
+    }
+    for page in &graph.pages {
+        graph.edges.push(HarmonyGraphEdge {
+            from: format!("module:{}", page.module),
+            to: format!("page:{}:{}", page.module, page.path),
+            kind: "contains".into(),
+            source: page.source_file.clone(),
+        });
+    }
+    for capability in &graph.system_capabilities {
+        graph.edges.push(HarmonyGraphEdge {
+            from: format!("module:{}", capability.module),
+            to: format!("syscap:{}", capability.capability),
+            kind: "checks".into(),
+            source: format!("{}:{}", capability.source_file, capability.line),
+        });
+    }
+    for reference in &graph.cross_module_refs {
+        graph.edges.push(HarmonyGraphEdge {
+            from: format!("module:{}", reference.from_module),
+            to: format!("module:{}", reference.to_module),
+            kind: "imports".into(),
+            source: format!("{}:{}", reference.source_file, reference.line),
+        });
+    }
+    graph.pages.sort_by(|a, b| {
+        (&a.module, &a.path, &a.source_kind).cmp(&(&b.module, &b.path, &b.source_kind))
+    });
+    graph.pages.dedup_by(|a, b| {
+        a.module == b.module && a.path == b.path && a.source_kind == b.source_kind
+    });
+    graph.system_capabilities.sort_by(|a, b| {
+        (&a.module, &a.capability, &a.source_file, a.line).cmp(&(
+            &b.module,
+            &b.capability,
+            &b.source_file,
+            b.line,
+        ))
+    });
+    graph.system_capabilities.dedup_by(|a, b| {
+        a.module == b.module
+            && a.capability == b.capability
+            && a.source_file == b.source_file
+            && a.line == b.line
+    });
+    graph.cross_module_refs.sort_by(|a, b| {
+        (&a.from_module, &a.to_module, &a.source_file, a.line).cmp(&(
+            &b.from_module,
+            &b.to_module,
+            &b.source_file,
+            b.line,
+        ))
+    });
+    graph.cross_module_refs.dedup_by(|a, b| {
+        a.from_module == b.from_module
+            && a.to_module == b.to_module
+            && a.source_file == b.source_file
+            && a.line == b.line
+    });
+    graph.edges.sort_by(|a, b| {
+        (&a.from, &a.to, &a.kind, &a.source).cmp(&(&b.from, &b.to, &b.kind, &b.source))
+    });
+    graph.edges.dedup_by(|a, b| {
+        a.from == b.from && a.to == b.to && a.kind == b.kind && a.source == b.source
+    });
+    graph
+}
+
+fn collect_profile_pages(root: &Path, module: &HarmonyModule, out: &mut Vec<HarmonyPage>) {
+    let module_root = module_root(root, &module.rel_path);
+    let profile = module_root.join("src/main/resources/base/profile");
+    let main_pages = profile.join("main_pages.json");
+    if let Some(value) = read_json5(&main_pages) {
+        if let Some(pages) = value.get("src").and_then(|value| value.as_array()) {
+            for page in pages.iter().filter_map(|value| value.as_str()) {
+                out.push(HarmonyPage {
+                    module: module.rel_path.clone(),
+                    path: normalize_source_path(page),
+                    source_kind: "main_pages".into(),
+                    source_file: relative_file(root, &main_pages),
+                    route_name: None,
+                });
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(&profile) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()).filter(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension == "json" || extension == "json5")
+    }) {
+        let Some(value) = read_json5(&path) else {
+            continue;
+        };
+        let Some(routes) = value.get("routerMap").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for route in routes {
+            let Some(page) = string(route, "pageSourceFile") else {
+                continue;
+            };
+            out.push(HarmonyPage {
+                module: module.rel_path.clone(),
+                path: normalize_source_path(&page),
+                source_kind: "router_map".into(),
+                source_file: relative_file(root, &path),
+                route_name: string(route, "name"),
+            });
+        }
+    }
+}
+
+fn scan_module_sources(
+    root: &Path,
+    module: &HarmonyModule,
+    packages: &BTreeMap<String, String>,
+    module_paths: &[String],
+    graph: &mut HarmonyProjectGraph,
+) {
+    let module_root = module_root(root, &module.rel_path);
+    let source_root = module_root.join("src/main");
+    let mut files = Vec::new();
+    collect_source_files(&source_root, 0, &mut files);
+    files.sort();
+    files.truncate(2_000);
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let source_file = relative_file(root, &path);
+        if text.contains("@Entry") || text.contains("@Router") {
+            let relative = path
+                .strip_prefix(module_root.join("src/main/ets"))
+                .or_else(|_| path.strip_prefix(&source_root))
+                .unwrap_or(&path)
+                .with_extension("")
+                .to_string_lossy()
+                .replace('\\', "/");
+            graph.pages.push(HarmonyPage {
+                module: module.rel_path.clone(),
+                path: relative,
+                source_kind: "decorator".into(),
+                source_file: source_file.clone(),
+                route_name: None,
+            });
+        }
+        for (index, line) in text.lines().enumerate() {
+            for capability in extract_system_capabilities(line) {
+                graph.system_capabilities.push(HarmonySystemCapabilityRef {
+                    module: module.rel_path.clone(),
+                    capability,
+                    source_file: source_file.clone(),
+                    line: index + 1,
+                });
+            }
+            let Some(specifier) = extract_import_specifier(line) else {
+                continue;
+            };
+            if let Some(target) =
+                resolve_import_target(root, &path, &specifier, packages, module_paths)
+            {
+                if target != module.rel_path {
+                    graph.cross_module_refs.push(HarmonyCrossModuleRef {
+                        from_module: module.rel_path.clone(),
+                        to_module: target,
+                        specifier,
+                        source_file: source_file.clone(),
+                        line: index + 1,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn collect_source_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 12 || out.len() >= 2_000 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            collect_source_files(&path, depth + 1, out);
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension == "ets" || extension == "ts")
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn extract_system_capabilities(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut remaining = line;
+    while let Some(index) = remaining.find("SystemCapability.") {
+        let candidate = &remaining[index..];
+        let end = candidate
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || character == '.' || character == '_')
+            })
+            .unwrap_or(candidate.len());
+        let capability = &candidate[..end];
+        if capability.len() > "SystemCapability.".len() {
+            out.push(capability.to_string());
+        }
+        remaining = &candidate[end..];
+    }
+    out
+}
+
+fn extract_import_specifier(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("import ") && !trimmed.starts_with("export ") {
+        return None;
+    }
+    let tail = trimmed
+        .find(" from ")
+        .map(|index| &trimmed[index + 6..])
+        .unwrap_or(trimmed.trim_start_matches("import "));
+    let quote_index = tail.find(['\'', '"'])?;
+    let quote = tail.as_bytes()[quote_index] as char;
+    let value = &tail[quote_index + 1..];
+    let end = value.find(quote)?;
+    Some(value[..end].to_string())
+}
+
+fn resolve_import_target(
+    root: &Path,
+    source_file: &Path,
+    specifier: &str,
+    packages: &BTreeMap<String, String>,
+    module_paths: &[String],
+) -> Option<String> {
+    if specifier.starts_with('.') {
+        let target = lexical_normalize(&source_file.parent()?.join(specifier));
+        return module_path_for_file(root, &target, module_paths.iter());
+    }
+    packages
+        .iter()
+        .filter(|(package, _)| {
+            specifier == package.as_str()
+                || specifier
+                    .strip_prefix(package.as_str())
+                    .is_some_and(|tail| tail.starts_with('/'))
+        })
+        .max_by_key(|(package, _)| package.len())
+        .map(|(_, module)| module.clone())
+}
+
+fn module_path_for_file<'a>(
+    root: &Path,
+    path: &Path,
+    modules: impl Iterator<Item = &'a String>,
+) -> Option<String> {
+    modules
+        .filter_map(|module| {
+            let module_root = module_root(root, module);
+            path.starts_with(&module_root)
+                .then_some((module_root.components().count(), module.clone()))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, module)| module)
+}
+
+fn module_root(root: &Path, rel_path: &str) -> PathBuf {
+    if rel_path == "." {
+        root.to_path_buf()
+    } else {
+        root.join(rel_path)
+    }
+}
+
+fn relative_file(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn normalize_source_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches(".ets")
+        .to_string()
+}
+
 fn local_dependency_path(root: &Path, source_dir: &Path, requirement: &str) -> Option<String> {
     let raw = requirement
         .strip_prefix("file:")
@@ -748,6 +1196,9 @@ mod tests {
             std::fs::create_dir_all(root.join(module).join("src/main")).unwrap();
         }
         std::fs::create_dir_all(root.join("AppScope")).unwrap();
+        std::fs::create_dir_all(root.join("entry/src/main/ets/pages")).unwrap();
+        std::fs::create_dir_all(root.join("entry/src/main/resources/base/profile")).unwrap();
+        std::fs::create_dir_all(root.join("features/pay/src/main/ets")).unwrap();
         std::fs::write(
             root.join("AppScope/app.json5"),
             r#"{"app":{"bundleName":"com.example.graph","versionCode":7,"versionName":"2.0","label":"Graph"}}"#,
@@ -783,7 +1234,7 @@ mod tests {
         let manifests = [
             (
                 "entry",
-                r#"{"module":{"name":"entry","type":"entry","deviceTypes":["phone"],"mainElement":"EntryAbility","abilities":[{"name":"EntryAbility","srcEntry":"./ets/EntryAbility.ets","exported":true}],"extensionAbilities":[{"name":"BackupExt","type":"backup","srcEntry":"./ets/BackupExt.ets"}]}}"#,
+                r#"{"module":{"name":"entry","type":"entry","deviceTypes":["phone"],"mainElement":"EntryAbility","abilities":[{"name":"EntryAbility","srcEntry":"./ets/EntryAbility.ets","exported":true}],"extensionAbilities":[{"name":"BackupExt","type":"backup","srcEntry":"./ets/BackupExt.ets"}],"requestPermissions":[{"name":"ohos.permission.CAMERA","reason":"take photo","usedScene":{"abilities":["EntryAbility"],"when":"inuse"}}]}}"#,
                 r#"{"name":"@app/entry","dependencies":{"@app/pay":"file:../features/pay"}}"#,
             ),
             (
@@ -814,6 +1265,26 @@ mod tests {
         std::fs::write(root.join("entry/oh-package-bad-lock.json5"), "{ invalid").unwrap();
         std::fs::write(root.join("libs/design/build-profile.json5"), "{ invalid").unwrap();
         std::fs::write(root.join("broken/src/main/module.json5"), "{ invalid").unwrap();
+        std::fs::write(
+            root.join("entry/src/main/resources/base/profile/main_pages.json"),
+            r#"{"src":["pages/Index"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("entry/src/main/resources/base/profile/route_map.json"),
+            r#"{"routerMap":[{"name":"PayPage","pageSourceFile":"pages/PayPage.ets","buildFunction":"PayBuilder"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("entry/src/main/ets/pages/Index.ets"),
+            "import { PayPage } from '@app/pay'\n@Entry\n@Component\nstruct Index { check = canIUse('SystemCapability.Communication.NetStack') }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("features/pay/src/main/ets/Pay.ets"),
+            "import { Runtime } from '@app/runtime'\nexport struct Pay {}\n",
+        )
+        .unwrap();
         root
     }
 
@@ -850,6 +1321,7 @@ mod tests {
             .unwrap();
         assert_eq!(entry.abilities[0].name, "EntryAbility");
         assert_eq!(entry.extension_abilities[0].name, "BackupExt");
+        assert_eq!(entry.permissions[0].name, "ohos.permission.CAMERA");
         assert!(model.dependencies.iter().any(|d| {
             d.from_module == "entry" && d.target_module.as_deref() == Some("features/pay")
         }));
@@ -883,6 +1355,28 @@ mod tests {
         assert!(model.manifests.iter().any(|source| {
             source.path == "broken/src/main/module.json5" && source.status == "invalid"
         }));
+        assert!(model.graph.pages.iter().any(|page| {
+            page.module == "entry" && page.path == "pages/Index" && page.source_kind == "main_pages"
+        }));
+        assert!(model.graph.pages.iter().any(|page| {
+            page.route_name.as_deref() == Some("PayPage") && page.source_kind == "router_map"
+        }));
+        assert!(model.graph.system_capabilities.iter().any(|reference| {
+            reference.capability == "SystemCapability.Communication.NetStack"
+        }));
+        assert!(model.graph.cross_module_refs.iter().any(|reference| {
+            reference.from_module == "entry"
+                && reference.to_module == "features/pay"
+                && reference.specifier == "@app/pay"
+        }));
+        assert!(model.graph.cross_module_refs.iter().any(|reference| {
+            reference.from_module == "features/pay" && reference.to_module == "shared/runtime"
+        }));
+        assert!(model.graph.edges.iter().any(|edge| {
+            edge.from == "module:entry"
+                && edge.to == "permission:ohos.permission.CAMERA"
+                && edge.kind == "requests"
+        }));
         let default = model.products.iter().find(|p| p.name == "default").unwrap();
         assert!(default.modules.contains(&"entry".to_string()));
         let tablet = model.products.iter().find(|p| p.name == "tablet").unwrap();
@@ -898,6 +1392,9 @@ mod tests {
             summary.hap_output_dir.as_deref(),
             Some(root.join("entry/build/default/outputs/default").as_path())
         );
+        let legacy_routes = crate::services::harmony::routes_from_model(&model, Some("entry"));
+        assert!(legacy_routes.contains(&"pages/Index".to_string()));
+        assert!(legacy_routes.contains(&"pages/PayPage".to_string()));
         std::fs::remove_dir_all(root).ok();
     }
 }

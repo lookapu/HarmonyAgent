@@ -84,6 +84,12 @@ export interface HarmonyModuleModel {
   targets: HarmonyTarget[]
   abilities: HarmonyAbility[]
   extension_abilities: HarmonyExtensionAbility[]
+  permissions: Array<{
+    name: string
+    reason?: string | null
+    abilities: string[]
+    when?: string | null
+  }>
 }
 
 export interface HarmonyProductModel {
@@ -129,6 +135,35 @@ export interface HarmonyManifestSource {
   error?: string | null
 }
 
+export interface HarmonyProjectGraph {
+  pages: Array<{
+    module: string
+    path: string
+    source_kind: 'main_pages' | 'router_map' | 'decorator'
+    source_file: string
+    route_name?: string | null
+  }>
+  system_capabilities: Array<{
+    module: string
+    capability: string
+    source_file: string
+    line: number
+  }>
+  cross_module_refs: Array<{
+    from_module: string
+    to_module: string
+    specifier: string
+    source_file: string
+    line: number
+  }>
+  edges: Array<{
+    from: string
+    to: string
+    kind: string
+    source: string
+  }>
+}
+
 export interface HarmonySemanticModel {
   schema_version: number
   app: {
@@ -143,6 +178,7 @@ export interface HarmonySemanticModel {
   dependencies: HarmonyDependencyModel[]
   lockfiles: HarmonyLockfileModel[]
   manifests: HarmonyManifestSource[]
+  graph: HarmonyProjectGraph
 }
 
 /** 工程能力分析结果 */

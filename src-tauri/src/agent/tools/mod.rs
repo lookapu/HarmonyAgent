@@ -2144,9 +2144,9 @@ async fn get_project_info(roots: &[String]) -> Result<String, String> {
         return Err("当前会话未绑定项目目录".into());
     }
     let root = Path::new(project_path);
-    let mut info = crate::services::harmony::parse_project(root);
-    // 附加页面路由（main_pages.json + @Router 扫描）
-    let pages = crate::services::harmony::collect_routes(root, info.entry_module.as_deref());
+    let model = crate::services::harmony_model::parse(root);
+    let mut info = crate::services::harmony::project_summary(root, &model);
+    let pages = crate::services::harmony::routes_from_model(&model, info.entry_module.as_deref());
     let payload = serde_json::json!({
         "bundle_name": info.bundle_name,
         "version_code": info.version_code,

@@ -830,59 +830,36 @@ fn read_to_string_opt(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// 收集页面路由：main_pages.json 的 src 列表 + .ets 文件中的 @Router / @Entry 装饰器扫描，
-/// 合并去重。返回相对项目根的页面路径列表。
+/// 从统一语义图收集指定模块页面，兼容旧 `get_project_info.pages` 字段。
 pub fn collect_routes(root: &Path, entry_module: Option<&str>) -> Vec<String> {
-    let mut routes = Vec::new();
-    // 1. main_pages.json
-    let module = entry_module.unwrap_or("entry");
-    let main_pages = root.join(module).join("src/main/resources/base/profile/main_pages.json");
-    if let Some(text) = read_to_string_opt(&main_pages) {
-        if let Ok(v) = parse_json5(&text) {
-            if let Some(arr) = v.get("src").and_then(|x| x.as_array()) {
-                for item in arr {
-                    if let Some(s) = item.as_str() {
-                        routes.push(normalize_page_path(s));
-                    }
-                }
-            }
-        }
-    }
-    // 2. 扫描 ets 目录下的 @Router 装饰器
-    let ets_root = root.join(module).join("src/main/ets");
-    if ets_root.is_dir() {
-        scan_router_decorators(&ets_root, &ets_root, &mut routes, 0);
-    }
+    let model = crate::services::harmony_model::parse(root);
+    routes_from_model(&model, entry_module)
+}
+
+pub fn routes_from_model(
+    model: &crate::services::harmony_model::HarmonySemanticModel,
+    entry_module: Option<&str>,
+) -> Vec<String> {
+    let module = entry_module
+        .map(String::from)
+        .or_else(|| {
+            model
+                .modules
+                .iter()
+                .find(|module| module.kind == "entry")
+                .map(|module| module.rel_path.clone())
+        })
+        .unwrap_or_else(|| "entry".into());
+    let mut routes = model
+        .graph
+        .pages
+        .iter()
+        .filter(|page| page.module == module)
+        .map(|page| page.path.clone())
+        .collect::<Vec<_>>();
     routes.sort();
     routes.dedup();
     routes
-}
-
-fn normalize_page_path(s: &str) -> String {
-    let s = s.trim_start_matches("./").trim_start_matches('/');
-    // main_pages 里通常是 "pages/Index"，归一化为带后缀或不带后缀统一格式
-    s.to_string()
-}
-
-fn scan_router_decorators(dir: &Path, base: &Path, out: &mut Vec<String>, depth: u32) {
-    if depth > 8 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            scan_router_decorators(&p, base, out, depth + 1);
-        } else if p.extension().is_some_and(|x| x == "ets") {
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                if text.contains("@Router") || text.contains("@Entry") {
-                    if let Ok(rel) = p.strip_prefix(base) {
-                        out.push(rel.with_extension("").to_string_lossy().replace('\\', "/"));
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
