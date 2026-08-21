@@ -403,6 +403,47 @@ pub fn tool_short_desc(name: &str) -> &'static str {
         .unwrap_or("")
 }
 
+fn parameter_segment(desc: &str) -> String {
+    desc.find("参数：")
+        .map(|i| {
+            let rest = &desc[i + "参数：".len()..];
+            let mut seg = String::new();
+            for line in rest.lines() {
+                let t = line.trim();
+                if seg.is_empty() {
+                    seg = t.to_string();
+                } else if t.starts_with(',') || t.starts_with('{') {
+                    seg.push_str(t);
+                } else {
+                    break;
+                }
+            }
+            seg.trim()
+                .trim_end_matches(['。', '.', '；', ';', ' '])
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+fn parameter_map(seg: &str) -> serde_json::Map<String, serde_json::Value> {
+    if !seg.starts_with('{') {
+        return serde_json::Map::new();
+    }
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(seg)
+        .unwrap_or_else(|_| extract_param_keys(seg))
+}
+
+fn required_parameter_keys(seg: &str, keys: impl Iterator<Item = String>) -> Vec<String> {
+    keys.filter(|key| {
+        let marker = format!("\"{key}\"");
+        let Some(start) = seg.find(&marker) else { return false };
+        let tail = &seg[start + marker.len()..];
+        let end = tail.find(",\"").or_else(|| tail.find(", \"")).unwrap_or(tail.len());
+        let declaration = &tail[..end];
+        declaration.contains("必填") || declaration.contains("required")
+    }).collect()
+}
+
 /// 生成 OpenAI function calling 工具 schema（工具协议标准化 Phase 1：原生工具调用）。
 /// 从 ToolSpec.desc 的「参数：{...}」段提取参数对象：优先严格 JSON 解析；
 /// desc 中参数值常带中文注解（如 `"host":"<设备 IP>"（connect/disconnect 需要）`，非严格 JSON），
@@ -416,31 +457,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             // 参数段：从「参数：」起按 JSON 行接续规则提取——首行即参数 JSON 开头，
             // 后续行仅当以 `,`/`{` 起始（JSON 跨行延续）时拼接，遇到其他段落标题即停止。
             // 相比按段落标题截断更稳：desc 段落标题不止 副作用/返回/适合/前提（还有"比 read_file…"等叙述行）
-            let params_seg = desc
-                .find("参数：")
-                .map(|i| {
-                    let rest = &desc[i + "参数：".len()..];
-                    let mut seg = String::new();
-                    for line in rest.lines() {
-                        let t = line.trim();
-                        if seg.is_empty() {
-                            seg = t.to_string();
-                        } else if t.starts_with(',') || t.starts_with('{') {
-                            seg.push_str(t);
-                        } else {
-                            break;
-                        }
-                    }
-                    // 清理 JSON 末尾的中文句号/分号等注释尾缀，提高严格解析成功率
-                    seg.trim().trim_end_matches(['。', '.', '；', ';', ' ']).to_string()
-                })
-                .unwrap_or_default();
-            let params = if params_seg.starts_with('{') {
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&params_seg)
-                    .unwrap_or_else(|_| extract_param_keys(&params_seg))
-            } else {
-                serde_json::Map::new()
-            };
+            let params_seg = parameter_segment(desc);
+            let params = parameter_map(&params_seg);
             // 参数 schema：值统一 string 类型并保留原始说明文本（含缺省值提示）；
             // 数字/布尔由工具执行侧宽松解析兜底（字符串可 as_str/parse 回原始类型）
             let properties = params
@@ -453,6 +471,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     )
                 })
                 .collect::<serde_json::Map<_, _>>();
+            let required = required_parameter_keys(&params_seg, params.keys().cloned());
             serde_json::json!({
                 "type": "function",
                 "function": {
@@ -461,11 +480,132 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "parameters": {
                         "type": "object",
                         "properties": properties,
+                        "required": required,
+                        "additionalProperties": false,
                     }
                 }
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ToolArgumentIssue {
+    pub code: &'static str,
+    pub field: Option<String>,
+    pub suggestion: String,
+    pub sensitive: bool,
+}
+
+/// 按注册表 schema 检查原生工具参数并返回纠错建议。
+///
+/// 此函数只诊断、从不改写参数。MCP 工具的 schema 由运行期服务提供，不在静态注册表
+/// 内，因此仍交给 MCP 服务校验。建议文本不包含参数值，避免敏感信息二次扩散。
+pub fn validate_tool_arguments(name: &str, args_raw: &str) -> Vec<ToolArgumentIssue> {
+    let Some(spec) = TOOL_SPECS.iter().find(|spec| spec.name == name) else {
+        return Vec::new();
+    };
+    let seg = parameter_segment(spec.desc);
+    let params = parameter_map(&seg);
+    let required = required_parameter_keys(&seg, params.keys().cloned());
+    let value = if args_raw.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str::<serde_json::Value>(args_raw) {
+            Ok(value) => value,
+            Err(err) => return vec![ToolArgumentIssue {
+                code: "invalid_json",
+                field: None,
+                suggestion: format!("请传入合法 JSON 对象（解析错误位于第 {} 行第 {} 列）", err.line(), err.column()),
+                sensitive: false,
+            }],
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return vec![ToolArgumentIssue {
+            code: "expected_object",
+            field: None,
+            suggestion: "工具参数必须是 JSON 对象，例如 {}".to_string(),
+            sensitive: false,
+        }];
+    };
+    let mut issues = Vec::new();
+    for key in &required {
+        if !object.contains_key(key) {
+            issues.push(ToolArgumentIssue {
+                code: "missing_required",
+                field: Some(key.clone()),
+                suggestion: format!("补充必填字段 `{key}` 后重试"),
+                sensitive: is_sensitive_parameter(key),
+            });
+        }
+    }
+    for key in object.keys() {
+        if params.contains_key(key) {
+            continue;
+        }
+        let candidate = params.keys()
+            .map(|known| (edit_distance(key, known), known))
+            .min_by_key(|(distance, _)| *distance)
+            .filter(|(distance, known)| {
+                *distance <= 3
+                    || known.starts_with(key)
+                    || key.starts_with(known.as_str())
+            })
+            .map(|(_, known)| known.clone());
+        let sensitive = is_sensitive_parameter(key)
+            || candidate.as_deref().is_some_and(is_sensitive_parameter);
+        let suggestion = match candidate {
+            Some(candidate) if sensitive => format!(
+                "未知字段 `{key}` 可能是敏感字段 `{candidate}`；请显式核对字段名和值，系统不会自动修正"
+            ),
+            Some(candidate) => format!("未知字段 `{key}`；是否应为 `{candidate}`？请修正后重试"),
+            None => format!("移除未知字段 `{key}`，或先查看 `{name}` 的参数 schema"),
+        };
+        issues.push(ToolArgumentIssue {
+            code: "unknown_field",
+            field: Some(key.clone()),
+            suggestion,
+            sensitive,
+        });
+    }
+    issues
+}
+
+pub fn tool_argument_error(name: &str, args_raw: &str) -> Option<String> {
+    let issues = validate_tool_arguments(name, args_raw);
+    if issues.is_empty() {
+        return None;
+    }
+    let details = issues.iter().map(|issue| {
+        let marker = if issue.sensitive { " [敏感参数：禁止自动修正]" } else { "" };
+        format!("- {}{}", issue.suggestion, marker)
+    }).collect::<Vec<_>>().join("\n");
+    Some(format!(
+        "工具 `{name}` 参数未通过 schema 校验，本次未执行且未自动改写：\n{details}"
+    ))
+}
+
+fn is_sensitive_parameter(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["token", "secret", "password", "passwd", "private", "certificate", "cert", "profile", "keystore", "sign", "device", "serial", "sn"]
+        .iter()
+        .any(|marker| key.contains(marker))
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    for (i, left_char) in left.chars().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, right_char) in right_chars.iter().enumerate() {
+            current.push((previous[j + 1] + 1).min(current[j] + 1).min(
+                previous[j] + usize::from(left_char != *right_char),
+            ));
+        }
+        previous = current;
+    }
+    previous[right_chars.len()]
 }
 
 pub fn tool_schemas_for(query: &str) -> Vec<serde_json::Value> {
@@ -807,5 +947,43 @@ mod tests {
             let props = &cfg["function"]["parameters"]["properties"];
             assert!(props.get("module").is_some() || props.get("file").is_some());
         }
+    }
+
+    #[test]
+    fn argument_validation_suggests_schema_field_without_rewriting() {
+        let issues = validate_tool_arguments("read_file", r#"{"pth":"src/main.rs"}"#);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "unknown_field");
+        assert_eq!(issues[0].field.as_deref(), Some("pth"));
+        assert!(issues[0].suggestion.contains("`path`"));
+        assert!(!issues[0].sensitive);
+    }
+
+    #[test]
+    fn argument_validation_reports_required_and_sensitive_fields() {
+        let issues = validate_tool_arguments("ota_pack", r#"{"profile_pth":"demo.p7b"}"#);
+        assert!(issues.iter().any(|issue| {
+            issue.code == "missing_required" && issue.field.as_deref() == Some("hap_path")
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.code == "missing_required" && issue.field.as_deref() == Some("out_path")
+        }));
+        let sensitive = issues.iter().find(|issue| issue.field.as_deref() == Some("profile_pth"))
+            .expect("sensitive typo issue missing");
+        assert!(sensitive.sensitive);
+        assert!(sensitive.suggestion.contains("不会自动修正"));
+    }
+
+    #[test]
+    fn argument_validation_rejects_malformed_or_non_object_json() {
+        let malformed = validate_tool_arguments("read_file", r#"{"path":}"#);
+        assert_eq!(malformed[0].code, "invalid_json");
+        let array = validate_tool_arguments("read_file", "[]");
+        assert_eq!(array[0].code, "expected_object");
+    }
+
+    #[test]
+    fn argument_validation_leaves_dynamic_mcp_tools_to_runtime() {
+        assert!(validate_tool_arguments("mcp__demo__search", r#"{"anything":1}"#).is_empty());
     }
 }

@@ -45,6 +45,7 @@ pub use protocol::{
     mcp_tools_hint, parse_mcp_tool_name, parse_tool_calls,
     sanitize_markers, sanitize_tool_output, skill_hint, split_instance_name, strip_tool_calls,
     phase_hint_for, system_hint_for, tool_short_desc, tool_schemas_for, tool_schemas_for_phase,
+    tool_argument_error, validate_tool_arguments, ToolArgumentIssue,
 };
 use errors::with_advice;
 pub(crate) use errors::diagnose_tool_error;
@@ -1084,6 +1085,9 @@ pub async fn run_tool(
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
     let stop_generation = crate::agent::exec_ctx::stop_generation(&ctx.conversation_id);
+    if let Some(error) = protocol::tool_argument_error(name, args) {
+        return Err(error);
+    }
     let args: Value = if args.trim().is_empty() {
         Value::Null
     } else {
