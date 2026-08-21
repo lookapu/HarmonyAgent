@@ -137,7 +137,7 @@
 - [x] `HM-01` 统一解析工程、产品、模块、HAP/HSP/HAR、Ability、ExtensionAbility 和依赖关系。
 - [x] `HM-02` 结构化解析 `build-profile.json5`、`module.json5`、`oh-package.json5` 和锁文件。
 - [x] `HM-03` 建立路由、页面、权限、系统能力和跨模块引用图。
-- [ ] `HM-04` 识别 SDK/API Level、设备类型、编译模式、签名配置和产品差异。
+- [x] `HM-04` 识别 SDK/API Level、设备类型、编译模式、签名配置和产品差异。
 - [ ] `HM-05` 文件变更后增量更新工程模型，并标记可能受影响的模块和验证范围。
 - [ ] `HM-06` 在 Workspace 提供可追溯的工程概览与影响分析。
 

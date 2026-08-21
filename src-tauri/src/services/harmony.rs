@@ -171,7 +171,7 @@ pub fn project_summary(
             product
                 .signing_config
                 .as_ref()
-                .is_some_and(|name| model.signing_configs.contains(name))
+                .is_some_and(|name| model.signing_configs.iter().any(|config| config.name == *name))
         }),
         hap_output_dir: entry.map(|module| {
             root.join(&module.rel_path)

@@ -21,8 +21,10 @@ const SKIP_DIRS: &[&str] = &[
 pub struct HarmonySemanticModel {
     pub schema_version: u32,
     pub app: HarmonyApp,
-    pub signing_configs: Vec<String>,
+    pub signing_configs: Vec<HarmonySigningConfig>,
+    pub build_modes: Vec<String>,
     pub products: Vec<HarmonyProduct>,
+    pub product_differences: Vec<HarmonyProductDifference>,
     pub modules: Vec<HarmonyModule>,
     pub dependencies: Vec<HarmonyDependency>,
     pub lockfiles: Vec<HarmonyLockfile>,
@@ -44,9 +46,31 @@ pub struct HarmonyProduct {
     pub compile_sdk_version: Option<String>,
     pub compatible_sdk_version: Option<String>,
     pub target_sdk_version: Option<String>,
+    pub compile_api_level: Option<i64>,
+    pub compatible_api_level: Option<i64>,
+    pub target_api_level: Option<i64>,
+    pub runtime_os: Option<String>,
     pub signing_config: Option<String>,
     /// 由 module target 的 applyToProducts 反向计算；没有显式约束时模块属于全部产品。
     pub modules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonySigningConfig {
+    pub name: String,
+    pub material_configured: bool,
+    pub certificate_configured: bool,
+    pub profile_configured: bool,
+    pub keystore_configured: bool,
+    pub key_alias_configured: bool,
+    pub sign_alg: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyProductDifference {
+    pub baseline: String,
+    pub product: String,
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -55,6 +79,8 @@ pub struct HarmonyModule {
     pub rel_path: String,
     pub src_path: String,
     pub kind: String,
+    pub api_type: Option<String>,
+    pub build_modes: Vec<String>,
     /// hap / hsp / har / unknown
     pub artifact_kind: String,
     pub package_name: Option<String>,
@@ -201,12 +227,13 @@ struct RootModuleDecl {
 /// 容错解析完整 HarmonyOS 工程。任一清单损坏只会使对应部分缺失，不阻断其它信息。
 pub fn parse(root: &Path) -> HarmonySemanticModel {
     let mut model = HarmonySemanticModel {
-        schema_version: 3,
+        schema_version: 4,
         ..HarmonySemanticModel::default()
     };
     model.app = parse_app(root);
-    let (mut products, declarations, signing_configs) = parse_root_profile(root);
+    let (mut products, declarations, signing_configs, build_modes) = parse_root_profile(root);
     model.signing_configs = signing_configs;
+    model.build_modes = build_modes;
 
     let mut module_paths = declarations
         .iter()
@@ -230,6 +257,7 @@ pub fn parse(root: &Path) -> HarmonySemanticModel {
     model.modules.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     assign_product_modules(&mut products, &model.modules);
+    model.product_differences = product_differences(&products);
     model.products = products;
     model.lockfiles = parse_lockfiles(root, &manifest_paths);
     model.dependencies =
@@ -258,9 +286,16 @@ fn parse_app(root: &Path) -> HarmonyApp {
     HarmonyApp::default()
 }
 
-fn parse_root_profile(root: &Path) -> (Vec<HarmonyProduct>, Vec<RootModuleDecl>, Vec<String>) {
+fn parse_root_profile(
+    root: &Path,
+) -> (
+    Vec<HarmonyProduct>,
+    Vec<RootModuleDecl>,
+    Vec<HarmonySigningConfig>,
+    Vec<String>,
+) {
     let Some(value) = read_json5(&root.join("build-profile.json5")) else {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     let products = value
         .pointer("/app/products")
@@ -268,19 +303,28 @@ fn parse_root_profile(root: &Path) -> (Vec<HarmonyProduct>, Vec<RootModuleDecl>,
         .into_iter()
         .flatten()
         .enumerate()
-        .map(|(index, product)| HarmonyProduct {
-            name: string(product, "name").unwrap_or_else(|| {
-                if index == 0 {
-                    "default".into()
-                } else {
-                    format!("product-{}", index + 1)
-                }
-            }),
-            compile_sdk_version: scalar_string(product.get("compileSdkVersion")),
-            compatible_sdk_version: scalar_string(product.get("compatibleSdkVersion")),
-            target_sdk_version: scalar_string(product.get("targetSdkVersion")),
-            signing_config: string(product, "signingConfig"),
-            modules: Vec::new(),
+        .map(|(index, product)| {
+            let compile_sdk_version = scalar_string(product.get("compileSdkVersion"));
+            let compatible_sdk_version = scalar_string(product.get("compatibleSdkVersion"));
+            let target_sdk_version = scalar_string(product.get("targetSdkVersion"));
+            HarmonyProduct {
+                name: string(product, "name").unwrap_or_else(|| {
+                    if index == 0 {
+                        "default".into()
+                    } else {
+                        format!("product-{}", index + 1)
+                    }
+                }),
+                compile_api_level: compile_sdk_version.as_deref().and_then(parse_api_level),
+                compatible_api_level: compatible_sdk_version.as_deref().and_then(parse_api_level),
+                target_api_level: target_sdk_version.as_deref().and_then(parse_api_level),
+                compile_sdk_version,
+                compatible_sdk_version,
+                target_sdk_version,
+                runtime_os: string(product, "runtimeOS"),
+                signing_config: string(product, "signingConfig"),
+                modules: Vec::new(),
+            }
         })
         .collect();
     let modules = value
@@ -307,9 +351,31 @@ fn parse_root_profile(root: &Path) -> (Vec<HarmonyProduct>, Vec<RootModuleDecl>,
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
-        .filter_map(|config| string(config, "name"))
+        .filter_map(parse_signing_config)
         .collect();
-    (products, modules, signing_configs)
+    let build_modes = value
+        .pointer("/app/buildModeSet")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|mode| string(mode, "name"))
+        .collect();
+    (products, modules, signing_configs, build_modes)
+}
+
+fn parse_signing_config(value: &serde_json::Value) -> Option<HarmonySigningConfig> {
+    let material = value.get("material");
+    Some(HarmonySigningConfig {
+        name: string(value, "name")?,
+        material_configured: material
+            .and_then(|value| value.as_object())
+            .is_some_and(|value| !value.is_empty()),
+        certificate_configured: material.is_some_and(|value| value.get("certpath").is_some()),
+        profile_configured: material.is_some_and(|value| value.get("profile").is_some()),
+        keystore_configured: material.is_some_and(|value| value.get("storeFile").is_some()),
+        key_alias_configured: material.is_some_and(|value| value.get("keyAlias").is_some()),
+        sign_alg: material.and_then(|value| string(value, "signAlg")),
+    })
 }
 
 fn discover_module_paths(root: &Path, dir: &Path, depth: usize, out: &mut BTreeSet<String>) {
@@ -351,14 +417,18 @@ fn parse_module(
     let value = read_json5(&module_root.join("src/main/module.json5"))?;
     let module = value.get("module")?;
     let kind = string(module, "type").unwrap_or_default();
+    let module_profile = read_json5(&module_root.join("build-profile.json5"));
     let name = string(module, "name")
         .or_else(|| declaration.map(|d| d.name.clone()))
         .unwrap_or_else(|| rel_path.rsplit('/').next().unwrap_or(rel_path).to_string());
-    let manifest_targets = parse_targets(module.get("targets"));
-    let targets = if manifest_targets.is_empty() {
+    let profile_targets = module_profile
+        .as_ref()
+        .map(|profile| parse_targets(profile.get("targets")))
+        .unwrap_or_default();
+    let targets = if profile_targets.is_empty() {
         declaration.map(|d| d.targets.clone()).unwrap_or_default()
     } else {
-        manifest_targets
+        profile_targets
     };
     Some(HarmonyModule {
         name,
@@ -370,6 +440,17 @@ fn parse_module(
         },
         artifact_kind: artifact_kind(&kind).into(),
         kind,
+        api_type: module_profile
+            .as_ref()
+            .and_then(|profile| string(profile, "apiType")),
+        build_modes: module_profile
+            .as_ref()
+            .and_then(|profile| profile.get("buildOptionSet"))
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|mode| string(mode, "name"))
+            .collect(),
         package_name: read_json5(&module_root.join("oh-package.json5"))
             .as_ref()
             .and_then(|v| string(v, "name")),
@@ -465,6 +546,46 @@ fn assign_product_modules(products: &mut [HarmonyProduct], modules: &[HarmonyMod
             }
         }
     }
+}
+
+fn product_differences(products: &[HarmonyProduct]) -> Vec<HarmonyProductDifference> {
+    let Some(baseline) = products
+        .iter()
+        .find(|product| product.name == "default")
+        .or_else(|| products.first())
+    else {
+        return Vec::new();
+    };
+    products
+        .iter()
+        .filter(|product| product.name != baseline.name)
+        .filter_map(|product| {
+            let mut fields = Vec::new();
+            if product.compile_sdk_version != baseline.compile_sdk_version {
+                fields.push("compileSdkVersion".into());
+            }
+            if product.compatible_sdk_version != baseline.compatible_sdk_version {
+                fields.push("compatibleSdkVersion".into());
+            }
+            if product.target_sdk_version != baseline.target_sdk_version {
+                fields.push("targetSdkVersion".into());
+            }
+            if product.runtime_os != baseline.runtime_os {
+                fields.push("runtimeOS".into());
+            }
+            if product.signing_config != baseline.signing_config {
+                fields.push("signingConfig".into());
+            }
+            if product.modules != baseline.modules {
+                fields.push("modules".into());
+            }
+            (!fields.is_empty()).then(|| HarmonyProductDifference {
+                baseline: baseline.name.clone(),
+                product: product.name.clone(),
+                fields,
+            })
+        })
+        .collect()
 }
 
 fn manifest_roots(root: &Path, module_paths: &[String]) -> Vec<(String, PathBuf)> {
@@ -1161,6 +1282,14 @@ fn scalar_string(value: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+fn parse_api_level(value: &str) -> Option<i64> {
+    if let Some(start) = value.find('(') {
+        let end = value[start + 1..].find(')')? + start + 1;
+        return value[start + 1..end].trim().parse().ok();
+    }
+    value.trim().parse().ok()
+}
+
 fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
     value
         .and_then(|v| v.as_array())
@@ -1207,9 +1336,9 @@ mod tests {
         std::fs::write(
             root.join("build-profile.json5"),
             r#"{
-              "app":{"signingConfigs":[{"name":"release"}],"products":[
-                {"name":"default","compileSdkVersion":"6.0.0(20)","compatibleSdkVersion":"5.0.0(12)","signingConfig":"release"},
-                {"name":"tablet","targetSdkVersion":20}
+              "app":{"signingConfigs":[{"name":"release","material":{"certpath":"configured","profile":"configured","storeFile":"configured","keyAlias":"release","signAlg":"SHA256withECDSA"}}],"buildModeSet":[{"name":"debug"},{"name":"release"}],"products":[
+                {"name":"default","compileSdkVersion":"6.0.0(20)","compatibleSdkVersion":"5.0.0(12)","targetSdkVersion":"6.0.0(20)","runtimeOS":"HarmonyOS","signingConfig":"release"},
+                {"name":"tablet","compileSdkVersion":20,"compatibleSdkVersion":18,"targetSdkVersion":20,"runtimeOS":"OpenHarmony"}
               ]},
               "modules":[
                 {"name":"entry","srcPath":"./entry","targets":[{"name":"default","applyToProducts":["default"]}]},
@@ -1262,6 +1391,11 @@ mod tests {
             r#"{"lockfileVersion":1,"specifiers":{"@app/pay@file:../features/pay":"@app/pay@1.0.0"},"packages":{"@app/pay@1.0.0":{"name":"@app/pay","version":"1.0.0","resolved":"../features/pay","registryType":"local"}}}"#,
         )
         .unwrap();
+        std::fs::write(
+            root.join("entry/build-profile.json5"),
+            r#"{"apiType":"stageMode","buildOptionSet":[{"name":"debug"},{"name":"release"}],"targets":[{"name":"default","applyToProducts":["default"]}]}"#,
+        )
+        .unwrap();
         std::fs::write(root.join("entry/oh-package-bad-lock.json5"), "{ invalid").unwrap();
         std::fs::write(root.join("libs/design/build-profile.json5"), "{ invalid").unwrap();
         std::fs::write(root.join("broken/src/main/module.json5"), "{ invalid").unwrap();
@@ -1294,7 +1428,9 @@ mod tests {
         let model = parse(&root);
         assert_eq!(model.app.bundle_name.as_deref(), Some("com.example.graph"));
         assert_eq!(model.products.len(), 2);
-        assert_eq!(model.signing_configs, vec!["release"]);
+        assert_eq!(model.build_modes, vec!["debug", "release"]);
+        assert_eq!(model.signing_configs[0].name, "release");
+        assert!(model.signing_configs[0].material_configured);
         assert_eq!(model.modules.len(), 4);
         assert_eq!(model.lockfiles.len(), 2);
         let root_lock = model
@@ -1322,6 +1458,8 @@ mod tests {
         assert_eq!(entry.abilities[0].name, "EntryAbility");
         assert_eq!(entry.extension_abilities[0].name, "BackupExt");
         assert_eq!(entry.permissions[0].name, "ohos.permission.CAMERA");
+        assert_eq!(entry.api_type.as_deref(), Some("stageMode"));
+        assert_eq!(entry.build_modes, vec!["debug", "release"]);
         assert!(model.dependencies.iter().any(|d| {
             d.from_module == "entry" && d.target_module.as_deref() == Some("features/pay")
         }));
@@ -1380,8 +1518,16 @@ mod tests {
         let default = model.products.iter().find(|p| p.name == "default").unwrap();
         assert!(default.modules.contains(&"entry".to_string()));
         let tablet = model.products.iter().find(|p| p.name == "tablet").unwrap();
+        assert_eq!(tablet.compile_api_level, Some(20));
+        assert_eq!(tablet.compatible_api_level, Some(18));
+        assert_eq!(tablet.runtime_os.as_deref(), Some("OpenHarmony"));
         assert!(!tablet.modules.contains(&"entry".to_string()));
         assert!(tablet.modules.contains(&"features/pay".to_string()));
+        assert!(model.product_differences.iter().any(|difference| {
+            difference.product == "tablet"
+                && difference.fields.contains(&"runtimeOS".to_string())
+                && difference.fields.contains(&"modules".to_string())
+        }));
 
         let summary = crate::services::harmony::project_summary(&root, &model);
         assert_eq!(summary.entry_module.as_deref(), Some("entry"));

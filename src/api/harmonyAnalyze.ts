@@ -77,6 +77,8 @@ export interface HarmonyModuleModel {
   rel_path: string
   src_path: string
   kind: string
+  api_type?: string | null
+  build_modes: string[]
   artifact_kind: 'hap' | 'hsp' | 'har' | 'unknown'
   package_name?: string | null
   device_types: string[]
@@ -97,6 +99,10 @@ export interface HarmonyProductModel {
   compile_sdk_version?: string | null
   compatible_sdk_version?: string | null
   target_sdk_version?: string | null
+  compile_api_level?: number | null
+  compatible_api_level?: number | null
+  target_api_level?: number | null
+  runtime_os?: string | null
   signing_config?: string | null
   modules: string[]
 }
@@ -172,8 +178,22 @@ export interface HarmonySemanticModel {
     version_name?: string | null
     label?: string | null
   }
-  signing_configs: string[]
+  signing_configs: Array<{
+    name: string
+    material_configured: boolean
+    certificate_configured: boolean
+    profile_configured: boolean
+    keystore_configured: boolean
+    key_alias_configured: boolean
+    sign_alg?: string | null
+  }>
+  build_modes: string[]
   products: HarmonyProductModel[]
+  product_differences: Array<{
+    baseline: string
+    product: string
+    fields: string[]
+  }>
   modules: HarmonyModuleModel[]
   dependencies: HarmonyDependencyModel[]
   lockfiles: HarmonyLockfileModel[]

@@ -15,6 +15,7 @@
 - 部署所需的 bundle、入口模块、API Level、签名状态和 HAP 输出目录改为从统一模型派生；工程能力面板复用同一模块与依赖口径，不再只扫描根下一层目录。
 - 语义模型 schema 升级为 v2：结构化记录根/模块清单来源与解析错误，兼容 OHPM v1/v3 及 targetName 锁文件，并在依赖边同时保留声明约束、锁定版本和锁文件来源。
 - 语义模型 schema 升级为 v3：全模块聚合 main pages、router map、权限 usedScene、SystemCapability 检查和 ArkTS/TS 跨模块 import，并生成带清单或源码位置的工程关系边；旧页面摘要改由该图派生。
+- 语义模型 schema 升级为 v4：补齐产品 API Level、runtime OS、根与模块 build mode、apiType、设备类型、脱敏签名完整度和相对默认产品的差异字段。
 
 ### 长会话 Context V2（M1 基础）
 

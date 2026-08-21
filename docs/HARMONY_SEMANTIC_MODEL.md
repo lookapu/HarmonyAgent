@@ -4,7 +4,7 @@
 
 ## 模型边界
 
-当前 schema 版本为 `3`，统一表示：
+当前 schema 版本为 `4`，统一表示：
 
 | 实体 | 主要来源 | 关键字段 |
 | --- | --- | --- |
@@ -18,6 +18,7 @@
 | 锁文件 | 根/模块/targetName `oh-package-*-lock.json5` | lock 版本、specifier、精确包版本、来源、完整性和传递依赖 |
 | 清单来源 | 所有上述 JSON5 文件 | 相对路径、Owner、解析状态和错误 |
 | 工程关系图 | profile、模块清单、OHPM 与 ArkTS/TS 源码 | 页面、权限、系统能力、模块依赖和真实 import 边 |
+| 构建矩阵 | 根/模块 `build-profile.json5` | SDK/API Level、runtime OS、apiType、build mode、签名完整度与产品差异 |
 
 模块发现支持最多八层嵌套，并跳过依赖、构建缓存和 IDE 目录。本地 `file:`/`link:` 依赖与包名依赖都会尽可能解析到工作区模块；解析不到时仍保留外部依赖声明。
 
@@ -30,6 +31,8 @@ OHPM 锁文件兼容常见 v1/v3 的 `specifiers` + `packages` 结构，也识�
 - 源码中的 `SystemCapability.*` 运行时检查形成模块—系统能力边；
 - 工作区包名 import 与跨模块相对 import 形成真实引用边，OHPM 本地依赖形成声明依赖边；
 - 每条边保存清单路径或源码 `file:line`，Workspace 无需从展示文本反推来源。
+
+构建矩阵将 `compileSdkVersion`、`compatibleSdkVersion` 和 `targetSdkVersion` 同时保留原文与解析后的 API Level；模块记录 `apiType`、设备类型和可用 build mode。签名模型只记录材料、证书、profile、keystore、alias 是否配置以及签名算法，不读取或返回密码、私钥内容与材料路径。非默认产品会列出相对基线发生变化的 SDK、runtime OS、签名和模块集合字段。
 
 ## 兼容视图
 
@@ -46,4 +49,4 @@ OHPM 锁文件兼容常见 v1/v3 的 `specifiers` + `packages` 结构，也识�
 
 自动化夹具包含两个产品、四个嵌套模块、HAP/HSP/HAR 三类产物、普通 Ability、ExtensionAbility、权限 usedScene、main pages、router map、SystemCapability 检查、真实跨模块 import、两级本地依赖边、v1 targetName 锁、v3 根锁和损坏清单，并验证旧部署摘要与统一模型一致。
 
-后续 HM-04 在此模型上补齐编译模式、产品差异与更完整的签名配置语义。
+后续 HM-05 在此模型上增加增量更新、受影响模块和验证范围。
