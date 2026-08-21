@@ -5,6 +5,67 @@
 
 ---
 
+## Unreleased — 证据驱动治理与双层执行内核（2026-08-21）
+
+定位：把“模型能调用很多工具”升级为“任务和工具都可持久调度、可验收、可恢复、可观测”。本批不新增对外工具，`TOOL_SPECS` 仍为 **198**；新增迁移 `057`—`062`，数据库迁移总数达到 **62**。
+
+### 目标契约与证据验收
+
+- 用户目标编译为结构化 `GoalContract`，识别修改、验证、构建、测试、部署、commit 和 push 等必需条件。
+- 工具结果转为结构化证据，记录产物、验证范围、错误、补偿策略、指标和 evidence digest。
+- 模型只能申请完成；运行内核依据真实工具轨迹裁决。修改后的验证必须发生在最后一次写操作之后，缺证据会自动进入补救循环。
+- 达到补救预算仍未满足契约时，Run 收敛为 `interrupted/continuation_required`，不再把自然语言完成声明当作成功。
+
+### Durable Run、调度队列与 DAG
+
+- `agent_runs` 扩展目标契约、动态预算、租约、恢复信息与质量快照；Run 终态不可逆。
+- 新增持久化 `agent_task_queue`，支持优先级、claim、退避重试、checkpoint、resume token、并发键和 tenant。
+- 新增 Agent DAG 节点/边：主任务和子 Agent 记录依赖条件、失败策略、独立尝试与验收结果；根验收合并子节点证据。
+- 新增 execution step 协调与副作用感知恢复：读取可安全重试，写入/命令/部署先验证效果，无法判定时要求人工确认。
+
+### 多进程 Agent Worker
+
+- 每个桌面进程登记唯一 Worker、PID、主机、容量和心跳；启动第二实例不会中断仍健康的第一实例任务。
+- 队列 claim 生成 lease token 与递增 epoch，checkpoint、续租和终态写入执行 Owner fencing，旧 Worker 的迟到写入被拒绝。
+- 心跳扫描仅回收真正过期或失联 Owner；新增真实进程崩溃 E2E 覆盖认领、进程退出、租约过期和接管恢复。
+
+### Tool Execution Kernel
+
+- `tool_runs` 增加协议版本、结构化结果、幂等键、执行 Worker、租约、尝试、验证状态、恢复次数与 outcome commit 时间。
+- 副作用工具采用 prepared → running/verifying → committed 语义；同 Run 的重复副作用按幂等键阻止，迟到结果按 lease fencing 丢弃。
+- 实际工具 future 迁到命名专用 OS 线程执行；线程 panic 由 `catch_unwind` 隔离，不拖垮主进程。
+- 调用方超时/取消但线程仍运行时标记 stuck，后台同时扫描租约过期调用；控制面新增 `stuck_tools` 指标和 Worker 线程身份。
+- 新增工具线程 panic、进程崩溃、副作用恢复与重复执行防护 E2E。
+
+### 可靠性控制面与质量门禁
+
+- 新增 SLO policy、告警、审计事件、配额和评测历史；成本页展示验收率、质量分、恢复率、结构化证据覆盖率、队列/DAG、Agent Worker、Tool Worker 和卡死工具。
+- CI 在 macOS/Windows 上新增 reliability、Execution Kernel、多进程 Worker crash 和 Tool Worker crash E2E gate。
+
+### 文档校准
+
+- 重写架构文档，以 Rust 后端 Agent 主循环和双层执行内核替换已过时的“前端 TS 编排”方案。
+- README 代码规模更新为 198 工具、27 个 Agent 顶层模块、29 个工具文件、33 个命令模块、36 个服务模块、275 个 IPC 入口、62 个迁移和 14 个页面。
+- 明确能力批次版本与应用 manifest 版本的口径差异；本批不修改应用发布版本，`package.json`、Cargo 和 Tauri manifest 仍为 `2.0.0`。
+
+### 修复
+
+- 统一首选 HAP 输出目录与递归 fallback 的产物排序：`-signed.hap` 优先于较新的未签名包，避免部署阶段误选不可直接安装的 unsigned 产物；新增回归测试。
+- 管理侧栏移除硬编码 `v0.1.0`，改为通过 Tauri `getVersion()` 显示当前 manifest 版本，并保留 `2.0.0` 启动 fallback。
+
+### 迁移
+
+| 编号 | 内容 |
+|---|---|
+| `057_agent_governance.sql` | 目标契约、补救、Run 租约和质量快照 |
+| `058_reliability_control_plane.sql` | 结构化证据、调度队列、DAG、评测 |
+| `059_execution_kernel_v2.sql` | 队列协议、工具协议 V2、SLO/告警/审计/配额 |
+| `060_multi_worker_runtime.sql` | Agent Worker、lease token、claim epoch、尝试账本 |
+| `061_tool_execution_kernel_v2.sql` | Tool Worker、执行租约、验证/恢复与尝试账本 |
+| `062_tool_execution_threads.sql` | 工具线程身份与 stuck 计数 |
+
+---
+
 ## v2.2 — 八仓库盘点落地：混合检索 + 时间旅行 + 定时提醒 + 跨会话引用（2026-08-20）
 
 定位：对 8 个参考仓库（deepseek-harness / qwen-code / Qwen-Agent / langgraph / OpenHands 等）做全量盘点后的能力落地——检索、会话管理、任务编排、工具集各补一批高价值能力，工具集 **193 → 198**。

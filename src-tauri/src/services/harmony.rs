@@ -320,16 +320,24 @@ fn latest_hap_in_dir(dir: &Path) -> Option<PathBuf> {
     for e in entries.flatten() {
         let p = e.path();
         if p.extension().is_some_and(|x| x == "hap") {
-            let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-            if best.as_ref().map_or(true, |(_, t)| mtime > *t) {
-                best = Some((p, mtime));
+            let mtime = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            // 与递归 fallback 保持同一排序：签名产物优先，同类产物再按修改时间。
+            // 给 signed 加固定权重，避免刚生成的 unsigned 包覆盖仍可部署的 signed 包。
+            let is_signed = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.contains("-signed"));
+            let score = if is_signed {
+                mtime + std::time::Duration::from_secs(365 * 24 * 3600)
+            } else {
+                mtime
+            };
+            if best.as_ref().map_or(true, |(_, t)| score > *t) {
+                best = Some((p, score));
             }
-        }
-    }
-    // 优先 signed
-    if let Some((p, _)) = &best {
-        if p.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("-signed")) {
-            return best.map(|(p, _)| p);
         }
     }
     best.map(|(p, _)| p)
@@ -1001,6 +1009,25 @@ mod tests {
         assert_eq!(parse_api_version("5.0.0(12)"), Some(12));
         assert_eq!(parse_api_version("4.1.0(11)"), Some(11));
         assert_eq!(parse_api_version("12"), Some(12));
+    }
+
+    #[test]
+    fn test_preferred_hap_dir_keeps_signed_artifact_priority() {
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("harmony-signed-hap-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let signed = dir.join("entry-default-signed.hap");
+        let unsigned = dir.join("entry-default-unsigned.hap");
+        std::fs::write(&signed, b"signed").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&unsigned, b"unsigned").unwrap();
+
+        assert_eq!(latest_hap_in_dir(&dir).as_deref(), Some(signed.as_path()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

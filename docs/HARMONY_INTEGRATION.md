@@ -1,440 +1,215 @@
-# DevEco Agent — 鸿蒙集成设计（M3 实现细节）
+# DevEco Switch HarmonyOS 集成说明
 
-> 本文是 [ARCHITECTURE.md](ARCHITECTURE.md) §7.3 的展开实现规格，覆盖三块：
-> **① 工程结构解析器规则 ② hvigor 命令矩阵 ③ hdc 部署流程**，外加构建错误解析与工具链探测。
-> 目标：按本文可实现、可测试，无需再查鸿蒙资料（版本差异容错除外）。
+> 当前状态：已实现。本文描述 2026-08-21 `main` 分支中的工程解析、环境探测、构建、部署、调试和知识能力；具体行为以 Rust 实现为准。
 
----
+## 1. 模块边界
 
-## 1. 工程结构解析器规则
-
-### 1.1 扫描范围与优先级
-
-打开项目（`add_project`）后，Rust 后台异步扫描。扫描根 = 项目根目录，**不递归扫描依赖目录**（`oh_modules` / `node_modules` / `build` / `.git` 排除）。
-
-| 目标文件 | 用途 | 解析出 |
-|---|---|---|
-| `AppScope/app.json5` | 应用级信息 | bundleName / versionCode / versionName / 应用名(label) |
-| `build-profile.json5`（根） | 构建配置 | 签名、products、compatibleSdkVersion、modules |
-| `oh-package.json5`（根） | 依赖 | dependencies 列表 |
-| `*/src/main/module.json5` | 模块 | name / type / mainElement / abilities / deviceTypes |
-| `*/src/main/ets/**/*.ets` | 页面源码 | 页面清单 + @Router 路径 |
-| `*/src/main/resources/base/profile/main_pages.json` | 路由表 | 权威路由列表 |
-| `hvigorfile.ts` / `hvigor-config.json5` | 构建脚本 | 构建信息（可选，失败不阻塞） |
-| `.git` 存在性 + `git branch` | 版本控制 | isRepo / branch |
-
-模块发现规则：遍历根目录**一层**子目录，存在 `src/main/module.json5` 即视为模块；`type` 字段区分 `entry`（isEntry=true）/ `feature` / `har` / `hsp`。若多个 entry 或没有 entry，取 `deviceTypes` 含 phone 的第一个作构建入口，并在索引中标记 warning。
-
-### 1.2 逐文件解析细则
-
-#### 1.2.1 `AppScope/app.json5`
-
-```json5
-{ "app": { "bundleName": "com.example.myapp", "vendor": "example",
-           "versionCode": 1000000, "versionName": "1.0.0",
-           "icon": "$media:app_icon", "label": "$string:app_name" } }
-```
-
-解析字段：`bundleName`（部署必需）、`versionCode/versionName`（部署汇报用）、`label`。
-注意 JSON5 允许注释与尾逗号 —— Rust 侧用 `json5` crate 或复用现有 `strip_jsonc_comments` + serde_json。
-
-#### 1.2.2 `build-profile.json5`（工程根）
-
-```json5
-{
-  "app": {
-    "signingConfigs": [ { "name": "default", "type": "HarmonyOS", "material": { "certpath": "...", "storeFile": "..." } } ],
-    "products": [
-      { "name": "default", "signingConfig": "default",
-        "compatibleSdkVersion": "5.0.0(12)", "runtimeOS": "HarmonyOS" }
-    ],
-    "buildModeSet": [ { "name": "debug" }, { "name": "release" } ]
-  },
-  "modules": [ { "name": "entry", "srcPath": "./entry",
-                 "targets": [ { "name": "default", "applyToProducts": ["default"] } ] } ]
-}
-```
-
-解析字段：
-- `signing.signingConfigs` 非空 且 存在被某 product 引用的配置 → `signing.configured = true`；否则 false
-- `products[0].compatibleSdkVersion` → `apiVersion`（见 1.4 推断）
-- `products[].name` → 可用产品列表（构建参数 `-p product=`）
-- `modules[].targets[]` → 模块目标（如 `entry@default`）
-
-#### 1.2.3 `oh-package.json5`（工程根）
-
-```json5
-{ "name": "myapp", "version": "1.0.0",
-  "dependencies": { "@ohos/hypium": "1.0.19" },
-  "devDependencies": {} }
-```
-
-解析 `dependencies` 并入 `dependencies[]`；`@ohos/*` 前缀标记为 SDK 内置包（错误解析时用于区分"缺依赖"与"缺 SDK"）。
-
-#### 1.2.4 `module.json5`（每模块）
-
-```json5
-{ "module": { "name": "entry", "type": "entry", "mainElement": "EntryAbility",
-              "deviceTypes": ["phone", "tablet"], "pages": "$profile:main_pages",
-              "abilities": [ { "name": "EntryAbility", "srcEntry": "./ets/entryability/EntryAbility.ets" } ] } }
-```
-
-解析字段：
-- `name` / `type` / `mainElement`（**启动 Ability，部署必需**）
-- `abilities[].name` + `srcEntry` → abilityNames + srcEntry 路径
-- `pages` 值如 `$profile:main_pages` → 定位到 `resources/base/profile/main_pages.json`
-- `deviceTypes` 是否含 phone/tablet（无 phone 模块标记 warning）
-
-#### 1.2.5 `main_pages.json`（路由权威源）
-
-```json
-{ "src": [ "pages/Index", "pages/Login" ] }
-```
-
-解析 `src[]` 每个元素 → 路由路径（如 `pages/Login`），并映射到文件：
-`{模块}/src/main/ets/{路径}.ets`（如 `entry/src/main/ets/pages/Login.ets`），文件不存在时标记 `missingFile: true`（路由在但文件缺失 → 构建必败，提示 Agent）。
-
-#### 1.2.6 装饰器扫描（路由兜底源）
-
-对每个 `.ets` 文件做轻量正则扫描（不解析 AST，性能优先）：
-
-| 装饰器 | 正则（Rust） | 含义 |
-|---|---|---|
-| @Entry | `(?m)^\s*@Entry\b` | 页面入口 → 该文件加入 pages |
-| @Router | `@Router\s*\(\s*\{[^}]*?\bpath\s*:\s*['"]([^'"]+)['"]` | 注册路由路径 |
-| @Component | `(?m)^\s*@Component\b` | 组件（非页面） |
-| @Entry + @Component 同时存在 | 同上两个匹配 | 页面文件判定 = @Entry 存在 |
-
-文件 → 路由路径转换：`src/main/ets/` 之后去掉 `.ets` 后缀，如
-`entry/src/main/ets/pages/Login.ets` → `pages/Login`。
-
-### 1.3 路由合并算法（权威 + 兜底）
-
-```
-routes = []
-seen = {}
-
-for module in modules:
-    if main_pages.json 存在:
-        for path in main_pages.src:
-            合并，来源标记 'main_pages'
-    for file in module.ets 文件（@Entry 且含 @Router path）:
-        path = 转换后的路由路径
-        若 path 不在 seen → 合并，来源标记 '@Router'
-    # 纯 @Entry 无 @Router 的文件：
-    for file in module.ets 文件（@Entry 且无 @Router）:
-        路径由文件路径推导（去 ets 前缀），来源标记 'inferred'
-
-输出: routes[] 按模块分组、路径排序；same path 不同来源 → 保留 main_pages 优先
-```
-
-### 1.4 API 版本推断（三级）
-
-1. `build-profile.json5` products[].compatibleSdkVersion（如 `"5.0.0(12)"` → 取括号内数字 12，`"5.0.0(12)"` / `"4.1.0(11)"` 均适用）
-2. 缺失 → `oh-package.json5` 中 `@ohos/*` 依赖版本（如 `@ohos/hypium: 1.0.19` 不可靠，降级）
-3. 仍缺失 → `apiVersion = null`，标记 warning "无法推断 API 版本，可能影响构建参数"
-
-### 1.5 增量更新映射（notify 监听）
-
-| 变更事件 | 重建范围 | 触发条件 |
-|---|---|---|
-| `main_pages.json` 变化 | 该模块 routes | 路径含 `profile/main_pages.json` |
-| `module.json5` 变化 | 该模块信息（abilities/mainElement/type） | 路径含 `module.json5` |
-| `.ets` 新增/删除/修改 | 该模块 pages（重扫装饰器） | 扩展名 == .ets |
-| `build-profile.json5` 变化 | signing / apiVersion / build | 根目录下该文件 |
-| `app.json5` / `oh-package.json5` 变化 | project 基本信息 / dependencies | 对应文件 |
-| 其他 | 忽略（含 build/、oh_modules/ 排除） | — |
-
-- 更新采用**合并写**：改 `data_json` 中对应 kind 段，全量索引重建仅在 schemaVersion 升级时执行。
-- notify 事件节流：500ms 去抖窗口合并多次变更。
-
-### 1.6 容错与降级
-
-| 失败场景 | 行为 |
+| 能力 | 主要实现 |
 |---|---|
-| 某文件解析失败 | 该项置 `null` + `parsed: false`，索引其余部分照常 |
-| 非鸿蒙目录（无 module.json5） | `add_project` 拒绝并提示"不是鸿蒙工程（未找到 module.json5）"，或按"普通项目"降级（kind=other，仅文件工具可用） |
-| 全部解析失败 | index_state = failed，右侧面板显示原因 + 重试按钮 |
-| 解析成功但缺失关键字段 | warning 列表（如"无 entry 模块"），不阻塞 |
+| 工程最小解析 | `services/harmony.rs` |
+| 环境与 SDK 探测 | `services/harmony_env.rs` |
+| 官方文档 | `services/harmony_docs.rs` |
+| API 索引与版本 diff | `services/harmony_api_ref.rs`、`harmony_api_diff.rs` |
+| 构建错误知识 | `services/harmony_knowledge.rs` |
+| 工程能力面板 | `commands/harmony_analyze.rs`、`commands/project.rs` |
+| 构建/部署工具 | `agent/tools/build_tools.rs` |
+| 设备工具 | `agent/tools/device_tools.rs` |
+| 调试与 LSP | `agent/tools/debug_tools.rs`、`agent/lsp_client.rs` |
 
-### 1.7 ProjectIndex 完整 Schema（实现级）
+HarmonyOS 能力不是独立的第二套 Agent。它通过 `TOOL_SPECS` 进入统一工具执行内核，共享路径边界、权限、预算、租约、结构化结果、证据验收和恢复策略。
 
-```typescript
-interface ProjectIndex {
-  schemaVersion: 1
-  state: 'pending' | 'ready' | 'failed'           // 与 projects.index_state 同步
-  warnings: string[]
-  project: {
-    name: string                                   // 目录名
-    bundleName: string | null
-    versionCode?: number
-    versionName?: string
-    appLabel?: string
-  }
-  apiVersion: number | null
-  modules: ModuleInfo[]
-  routes: RouteInfo[]
-  dependencies: { name: string; version: string; builtin: boolean }[]
-  signing: {
-    configured: boolean
-    productUsed?: string                           // 引用了签名配置的产品名
-    certPath?: string                              // 从 signingConfigs material 取
-  }
-  build: {
-    entryModule: string | null
-    products: string[]                             // ["default", ...]
-    buildModes: string[]                           // ["debug", "release"]
-    assembleCmd: string                            // 见 §2.2 生成
-    hapOutputDir: string | null                    // 见 §2.3 推导
-  }
-  git: { isRepo: boolean; branch?: string; dirty?: boolean }
-  buildErrors: BuildError[]                        // 最近一次构建，见 §4.2
-}
+## 2. 工程根与项目解析
 
-interface ModuleInfo {
-  name: string
-  type: 'entry' | 'feature' | 'har' | 'hsp' | 'unknown'
-  isEntry: boolean
-  srcMain: string                                  // 绝对路径 {root}/{name}/src/main
-  etsRoot: string                                  // {srcMain}/ets
-  pages: PageInfo[]
-  abilityNames: string[]
-  mainElement: string | null                       // 启动 Ability
-  deviceTypes: string[]
-  parsed: boolean
-}
+### 2.1 工程根判定
 
-interface PageInfo {
-  routePath: string                                // 如 pages/Login
-  file: string                                     // 绝对路径
-  source: 'main_pages' | 'router' | 'inferred'
-  missingFile: boolean
-}
+`is_project_root` 优先检查：
 
-interface RouteInfo extends PageInfo { module: string }
+1. `AppScope/app.json5`；
+2. 根级 `build-profile.json5`，且顶层必须包含 `app`。
 
-interface BuildError {
-  kind: 'arkts' | 'resource' | 'dependency' | 'signing' | 'sdk' | 'ohpm' | 'other'
-  file?: string
-  line?: number
-  column?: number
-  message: string                                  // 原始消息，截断 500 字
-  suggestion: string
-  rawLine?: string
-}
+仅存在 `oh-package.json5` 或模块级 `build-profile.json5` 不足以判定工程根。这样可避免把 `entry/` 或 feature 模块误识别为主工程，进而把文件写到 `entry/entry/...`。
+
+### 2.2 最小工程信息
+
+`parse_project` 返回构建和部署需要的 `HarmonyProject`：
+
+- `bundle_name`、`version_code`、`version_name`、`app_label`；
+- `main_element`；
+- `entry_module`；
+- `api_version` 和 SDK 原始版本；
+- `signing_configured`；
+- 推导的 HAP 输出目录。
+
+解析采用容错策略：单个 JSON5 文件失败只使对应字段为空，不阻塞整个工程。当前 JSON5 helper 通过去注释、尾逗号容错后交给 `serde_json`，不承诺支持任意 JSON5 语法。
+
+### 2.3 配置来源
+
+| 文件 | 读取内容 |
+|---|---|
+| `AppScope/app.json5` | bundle、版本、label |
+| `build-profile.json5` | products、compatible/compile SDK、签名、modules |
+| `<module>/src/main/module.json5` | mainElement/ability |
+| `<module>/src/main/resources/base/profile/main_pages.json` | 页面路由 |
+| ArkTS 源文件 | 装饰器和符号兜底 |
+| `oh-package.json5` | ohpm 依赖 |
+
+entry 模块优先来自根 `build-profile.json5` 的 modules；无法确定时扫描一层子目录中的 `src/main/module.json5`。项目能力面板另有更完整的多模块扫描，不应把 `HarmonyProject` 当作完整 ProjectIndex schema。
+
+## 3. 环境探测
+
+`harmony_env.rs` 同时支持自动发现和用户手工配置。探测目标包括：
+
+- DevEco Studio；
+- HarmonyOS/OpenHarmony SDK variants 与 API 组件；
+- command-line-tools；
+- `hdc`、`ohpm`、`hvigor`/wrapper；
+- SDK API 声明目录。
+
+应用启动时会把找到的 HarmonyOS 可执行目录注入子进程 PATH。另有内置 Node、JDK 和 Git fallback；HarmonyOS SDK/hdc/ohpm 本身不随仓库捆绑，通常来自 DevEco Studio或用户安装的 command-line-tools。
+
+探测结果有缓存，保存手工配置或显式重新探测时失效。HealthPage 和环境页展示实际候选路径与版本。
+
+## 4. hvigor 与 ohpm
+
+### 4.1 构建命令
+
+`services/harmony.rs` 负责选择 wrapper 和生成基础参数：
+
+- 工程 wrapper 优先于全局命令；
+- `assembleHap` 支持 module 和 mode；
+- clean 使用独立参数；
+- 子进程继承探测后的 Node/JDK/HarmonyOS PATH；
+- Windows 子进程使用隐藏控制台配置，避免 GUI 应用弹出命令窗口。
+
+对外工具包括 `build_project`、`build_hap`、`build_generic`、`ohpm_install`、`run_lint`、`run_tests` 等。确切名称和参数以 `TOOL_SPECS` 为准。
+
+### 4.2 产物
+
+标准 HAP 目录推导为：
+
+```text
+<module>/build/default/outputs/default
 ```
 
----
+查找时优先推导目录并按修改时间选择；找不到后再递归工程、跳过依赖/缓存目录，递归 fallback 会提高 `-signed` 产物优先级。产物路径会进入结构化工具证据，供部署和验收使用。
 
-## 2. hvigor 命令矩阵
+### 4.3 ohpm
 
-### 2.1 命令基础
+`collect_ohpm_deps` 汇总依赖，`verify_ohpm_install` 结合退出状态、日志和 `oh_modules` 判断结果。依赖检查和安装均通过统一命令执行与输出截断/落盘策略。
 
-- **入口**：项目根目录 `hvigorw.bat`（wrapper，内部调用 DevEco 内置 node + `hvigor/hvigor-wrapper.js`）。执行时工作目录必须是项目根。（Windows 实际执行**不经过 bat**，直调 node 绕 cmd 防闪窗，见 §2.4。）
-- **环境**：wrapper 依赖 DevEco Studio 的 node 与 hvigor 库；若 `hvigorw.bat` 缺失（罕见），fallback 到 `{DevEco}\tools\hvigor\bin\hvigorw.bat`。
-- **通用参数**：
+## 5. 构建错误
 
-| 参数 | 说明 | 示例 |
-|---|---|---|
-| `--mode project\|module` | project=全工程（默认）；module=单模块，需配 `-p module=` | `--mode module` |
-| `-p module=entry@default` | 模块@目标 | `-p module=entry@default` |
-| `-p product=default` | 构建产品 | `-p product=default` |
-| `--no-daemon` | 单次执行不驻留（构建慢时可避免端口占用） | 默认加 |
-| `--parallel` | 并行任务 | 可选 |
-| `--stacktrace` | 详细堆栈（排查用） | 失败重试时加 |
+`parse_build_errors` 将日志归一化为：
 
-### 2.2 命令矩阵
-
-| 场景 | 命令 | 何时用 |
-|---|---|---|
-| 全量构建 | `hvigorw assembleHap --no-daemon` | 默认 `build_hap` 无参数时 |
-| 单模块构建 | `hvigorw --mode module -p module=entry@default assembleHap --no-daemon` | 多模块工程只改某模块 |
-| 指定产品 | 上述命令追加 `-p product=default` | 多产品工程 |
-| 清理 | `hvigorw clean --no-daemon` | 构建产物异常时（L2 警示） |
-| 任务列表 | `hvigorw tasks --no-daemon` | 诊断 |
-| 版本 | `hvigorw --version` | 工具链校验 |
-
-`assembleCmd` 生成规则（写入 ProjectIndex.build）：
-- 单 entry 模块 → `hvigorw assembleHap --no-daemon`
-- 多模块 → `hvigorw --mode module -p module={entryModule}@default assembleHap --no-daemon`
-- 用户可在设置页覆盖（存 settings 表 `project_{id}_assemble_cmd`）
-
-### 2.3 产物定位
-
-```
-{module}/build/{product}/outputs/{target}/{module}-{product}-{signed|unsigned}.hap
-例：entry/build/default/outputs/default/entry-default-signed.hap
+```text
+kind / category / file / line / column / message / suggestion
 ```
 
-- `hapOutputDir` 推导：`{entryModule}/build/{默认产品}/outputs/{默认目标}/`
-- 部署时文件选择优先级：`*-signed.hap` > `*-unsigned.hap`（unsigned 需提示"未签名，真机可能无法安装"）
-- 构建完成后扫描该目录最新 hap（按 mtime），避免文件名变体（如 `entry-default-signed.hap` vs `entry-phone-signed.hap`）
+category 包括：
 
-### 2.4 执行与日志
+- `type`；
+- `dependency`；
+- `signing`；
+- `sdk`；
+- `api_level`；
+- `resource`；
+- `ohpm`；
+- `syntax`；
+- `other`。
 
-- 执行：Rust `tokio::process::Command`，`creation_flags` 含 `CREATE_NO_WINDOW`；stdout/stderr 合并流式读行 → `agent:log` 事件（绑定构建卡片）+ 追加写盘 `{项目}/.deveco-agent/logs/build-{timestamp}.log`，同时维护 `latest.log` 软链接语义（复制）。
-- **Windows 防闪窗**：hvigorw 执行**不经过 `hvigorw.bat`/cmd.exe**——工具链探测时记录 DevEco 内置 node 路径（`{DevEco}\tools\node\node.exe`），直调 `node {项目}/hvigor/hvigor-wrapper.js [args]`（等价于 hvigorw.bat 内部逻辑）；仅在 node 直调失败时回退 `cmd /c hvigorw.bat` + CREATE_NO_WINDOW。
-- 退出码：0 成功；非 0 → 立即触发 §4 错误解析，构建卡片红色 + 错误摘要区块。
-- 超时：默认 600s（首构可能几分钟），设置可调；超时 kill 进程树并标记 cancelled。
-- 取消：用户点停止 → `taskkill /PID {pid} /T /F`。
+解析器处理 ArkTS/TypeScript 位置、模块/依赖、签名、SDK/API level、资源和 ohpm 常见模式。未命中规则的日志仍保留原始摘要，不因分类失败丢失构建结果。
 
-### 2.5 常见失败与提示（写入构建卡片）
+`harmony_knowledge.rs` 把内置根因知识与用户知识条目合并，为 Agent 提供修复建议；修复后的真实构建结果仍是验收依据，知识建议本身不是完成证据。
 
-| 失败现象 | 根因 | 处理 |
-|---|---|---|
-| `hvigor ERROR: Failed to resolve dependency` | 依赖缺失 | 建议 `ohpm install` 后重试 |
-| `hvigor ERROR: ... signed.hap` / sign 相关 | 签名配置错误/证书过期 | 检查 signingConfigs；提示在 DevEco 重新配置签名 |
-| `FAILURE: Build failed` + `SDK not found` | SDK 路径/版本不匹配 | 检查 build-profile compatibleSdkVersion vs 已装 SDK |
-| node 相关错误（wrapper 起不来） | DevEco node 缺失/路径错 | 重新探测工具链（§5） |
-| 端口占用 / daemon 冲突 | 上次构建未退出 | 加 `--no-daemon` 重试 |
+## 6. 部署闭环
 
----
+典型部署过程：
 
-## 3. hdc 部署流程
-
-### 3.1 设备管理
-
-| 操作 | 命令 | 说明 |
-|---|---|---|
-| 列出设备 | `hdc list targets` | 解析行如 `NLA-AN00 192.168.1.5:5555` 或 `NLA-AN00  device` |
-| 无线连接 | `hdc tconn {ip}:{port}`（默认 5555） | 需设备开启无线调试 |
-| 断开 | `hdc tdisconn {ip}:{port}` | — |
-| 设备信息 | `hdc shell param get const.product.model` | 型号确认 |
-
-`Device` 结构：`{ serial, model?, state: 'online'|'offline', wireless: bool }`。
-默认设备记忆：上次部署成功的设备 serial 存 settings（`default_device`），部署卡片下拉可选。
-
-### 3.2 安装
-
-| 操作 | 命令 | 说明 |
-|---|---|---|
-| 安装 | `hdc -t {serial} install {hap}` | 新装 |
-| 覆盖安装 | `hdc -t {serial} install -r {hap}` | 已存在同 bundleName 时（红色警示，见 §3.4） |
-| 卸载 | `hdc -t {serial} uninstall {bundleName}` | — |
-| 查询已装 | `hdc -t {serial} shell aa dump -l \| grep {bundleName}` | 冲突检测 |
-
-### 3.3 启动 App（重要：鸿蒙是 `aa start`，不是 Android 的 `am start`）
-
-```
-hdc -t {serial} shell aa start -b {bundleName} -a {MainAbility}
+```text
+解析工程
+  → 选择/构建 HAP
+  → list_devices / 选择默认设备
+  → hdc install
+  → aa start（bundleName + ability）
+  → 读取 hilog/runtime logs
 ```
 
-- `MainAbility` 解析：entry 模块 `module.json5` 的 `mainElement`（如 `EntryAbility`）→ 缺失则取 `abilities[0].name` → 再缺失则报错并建议 `aa dump -l` 查询。
-- **防呆**：启动后 2s 用 `hdc shell aa dump -l | grep {bundleName}` 验证进程/Ability 已拉起；失败给出 `hilog` 尾部日志。
-- 若用户习惯说"am start"（Android 术语）：系统提示词与错误提示中统一纠正为 aa start，避免 Agent 生成错误命令（命令白名单限制下会直接拒绝并提示）。
+关键规则：
 
-### 3.4 部署完整流程（install_launch 内部时序）
+- 多设备时使用显式 device id 或项目默认设备；
+- 安装和启动是不同副作用步骤，分别记录状态；
+- HarmonyOS 启动使用 `aa start`，不是 Android `am start`；
+- 部署工具受 L2/项目权限和全局互斥控制；
+- 中断或 Worker 崩溃后不能直接重复安装/启动，恢复计划会先验证设备侧效果；
+- 用户目标明确要求“部署”时，成功的 deploy 工具证据是目标契约必需项。
 
-```
-1. build_hap（若产物不存在或失败）→ 失败则中止，构建卡片给出错误摘要
-2. 定位 hap：hapOutputDir 下最新 *-signed.hap（无 signed 用 unsigned + 提示）
-3. 设备：list_devices → 取默认设备；无设备 → 部署卡片提示"未连接设备，请插线/开无线调试"
-4. 冲突检测：aa dump -l 查 bundleName
-   ├─ 不存在 → 直接 install
-   └─ 已存在 → 记录已装旧版本号（写入 tool_runs.result_json，汇报/回退提示用，对应 §3.2"覆盖安装先记录旧版本"）→ 红色警示卡片（默认模式自动 install -r；严格模式询问）
-5. 安装成功 → aa start 拉起
-6. 验证：aa dump -l 确认；可选 hilog 尾部 20 行附到部署卡片
-7. 汇报：设备 / bundleName / hap 路径 / 安装耗时 / 启动结果
-```
+部署产物和日志可能较大，超限内容会写入 `.deveco-agent/spill/`，工具结果保留摘要和路径。
 
-### 3.5 日志与崩溃定位
+## 7. 设备与运行时调试
 
-| 需求 | 命令 | 说明 |
-|---|---|---|
-| 应用日志 | `hdc -t {serial} shell hilog \| grep {bundleName}` | 部署后验证 |
-| 崩溃栈 | 上述 + `grep -E "FATAL\|Error"` | 崩溃时取尾部 50 行 |
-| 清空日志 | `hdc shell hilog -r` | 验证前清空便于过滤 |
+设备层覆盖：
 
-### 3.6 部署错误与解决建议（部署卡片内嵌）
+- hdc 服务启停、设备列举和无线连接；
+- 模拟器列举、启动和创建；
+- shell 与设备文件操作；
+- 应用列表、安装、启动、停止、卸载、清数据和授权；
+- 截图、录屏、UI hierarchy、手势和 UI flow；
+- Wi-Fi、飞行模式和网络条件；
+- CPU、内存、电池和性能采样。
 
-| 错误 | 根因 | 建议 |
-|---|---|---|
-| `Failed to install` / `INSTALL_PARSE_FAILED` | hap 损坏/签名不符 | 重新构建；unsigned 需签名 |
-| `INSTALL_FAILED_SIGNATURE_INVALID` | 签名与设备已装版本不一致 | 卸载旧版或用同签名 |
-| `no targets` / device offline | 未连接/未授权 | 检查 USB 调试授权；hdc tconn |
-| `aa start` 报 ability 不存在 | MainAbility 名错 | 读 module.json5 mainElement；aa dump -l 核对 |
-| 启动即闪退 | 运行时崩溃 | hilog 抓崩溃栈；检查 API 版本兼容 |
+日志来源包括 hilog、运行时日志缓冲和 faultlog。`analyze_crash` 对 JsError、CppCrash、NativeCrash、启动超时等根因进行结构化归类；`log_query` 支持时间、级别、关键词和正则过滤。
 
----
+调试工具提供 attach、step、next、continue、interrupt、where/info 等动作。具体可用性取决于设备版本、debuggable 构建和本机工具链；工具会返回明确的缺失条件，而不是假定所有设备都支持交互调试。
 
-## 4. 构建错误解析（正则库）
+## 8. ArkTS LSP
 
-### 4.1 错误模式表（Rust 正则，按序匹配，首中即止）
+`agent/lsp_client.rs` 通过 stdio JSON-RPC 启动 `@arkts/language-server`，维护 initialize、文档同步和请求响应。
 
-| # | 模式（正则） | kind | 提取 | suggestion |
-|---|---|---|---|---|
-| 1 | `(?m)ArkTS:ERROR\s+File:\s*(\S+?):(\d+):(\d+)\s*\n?(.*)` | arkts | file,line,col,message（多行捕获到下一个 ERROR 或空行） | "读 {file}:{line} 修复语法/类型错误后重建" |
-| 2 | `(?m)ERROR File:\s*(\S+?):(\d+):(\d+)` | arkts | file,line,col | 同上（旧版格式兜底） |
-| 3 | `(?i)failed to resolve dependency|Cannot find module ['"]@?(\w[\w\-/]*)` | dependency | module 名 | "执行 ohpm install 后重试；检查 oh-package.json5" |
-| 4 | `(?i)sign(ing)?\s+(fail|error)|Signing configuration ['"]([^'"]+)['"]\s+not found|certificate.*expired` | signing | 配置名 | "检查 build-profile.json5 signingConfigs，在 DevEco 重新配置" |
-| 5 | `(?i)SDK not found|compatibleSdkVersion.*(not|require)|cannot find sdk` | sdk | — | "检查 compatibleSdkVersion 与已装 SDK（设置页可查）" |
-| 6 | `(?i)resource.*not found|can't resolve resource|\\$r\(['"]app\.(\w+)\.(\w+)` | resource | 资源名 | "检查 resources/base/ 下对应资源文件" |
-| 7 | `(?i)ohpm.*(error|ENOENT)` | ohpm | message | "检查 ohpm 工具链路径（§5）" |
-| 8 | `(?m)^> hvigor ERROR:?\s*(.+)$` | other | message | "定位失败步骤，重试或查看完整日志" |
+对外能力包括 definition、references、symbols、hover、diagnostics，以及注册表中的 rename/format/code action/completion/signature 等扩展工具。找不到 language server 时，代码库搜索与符号索引作为降级路径。
 
-- 匹配在**日志流式到达时**进行（不等待结束），命中即产出 BuildError 并立即随 `agent:log` 推送，Agent 可提前开始修复；构建退出码确认失败后再次汇总 `buildErrors[]` 写 ProjectIndex 缓存。
-- 日志行号仅取 **ArkTS 编译错误**（模式 1/2）；其余错误 kind 无 file/line。
+LSP 结果受 SDK、工程配置和 language server 版本影响；“无诊断”不能单独证明项目可构建，最终仍应运行构建或测试。
 
-### 4.2 BuildError 输出（写 ProjectIndex.buildErrors + 构建卡片）
+## 9. API 与文档知识
 
-```json
-{
-  "kind": "arkts",
-  "file": "D:/apps/MyApp/entry/src/main/ets/pages/Home.ets",
-  "line": 23, "column": 5,
-  "message": "ArkTS:ERROR: Object literal must correspond to some explicitly declared class or interface.",
-  "suggestion": "读 Home.ets:23 修复语法/类型错误后重建",
-  "rawLine": "> hvigor ERROR: ArkTS:ERROR File: D:/apps/MyApp/.../Home.ets:23:5"
-}
-```
+项目有三类互补数据源：
 
----
+1. 本机 SDK `.d.ts`：`list/search/read_sdk_api_*`；
+2. 官方文档本地镜像：同步、索引、搜索和读取；
+3. SQLite API 知识库：模块、详情、版本引入信息和 embedding。
 
-## 5. 工具链探测
+API diff 服务支持查询某 API 的引入版本、跨版本变化和模块最低版本；`check_project_sdk_alignment` 对比工程 SDK 声明与本机安装版本。
 
-### 5.1 探测顺序（Windows 为主，macOS 类比）
+新安装时，如果主库 API 表为空，应用会从打包资源中的 seed knowledge DB 后台导入。embedding 是可选 feature：未启用或模型不可用时回退关键词/BM25 检索。
 
-| 工具 | 探测顺序 | 备注 |
-|---|---|---|
-| DevEco Studio 根 | ① 注册表 `HKCU\Software\Huawei\DevEcoStudio` 与 `HKLM\SOFTWARE\Huawei\DevEcoStudio`（version 键） ② 常见路径 `C:\Program Files\Huawei\DevEco Studio*` ③ `%LOCALAPPDATA%\Huawei\DevEco Studio*` | 找到即缓存 |
-| hdc | ① DevEco 设置中 SDK 路径（settings 表缓存） ② `{DevEco}\sdk\*\*\toolchains\hdc.exe` 递归 glob ③ `%USERPROFILE%\AppData\Local\Huawei\Sdk\*\toolchains\hdc.exe` ④ PATH | 取第一个存在 |
-| ohpm | ① `{DevEco}\tools\ohpm\bin\ohpm.exe` ② `{DevEco}\ohpm\bin\ohpm.exe` ③ PATH | DevEco Studio 自带 |
-| hvigorw | ① 项目内 `hvigorw.bat` ② `{DevEco}\tools\hvigor\bin\hvigorw.bat` | 项目 wrapper 优先 |
+## 10. ohpm 生态
 
-### 5.2 SDK 目录结构参考（API 12+，HarmonyOS SDK）
+`ohpm_landscape.rs` 缓存官方 landscape 数据，支持状态、刷新、搜索、热度、分类和仓库链接。缓存超过 7 天时应用启动后延迟刷新，失败不阻塞主流程。
 
-```
-{SDK 根}/
-  default/
-    openharmony/          # OpenHarmony SDK（hdc 在 toolchains/）
-      toolchains/hdc.exe
-    hms/                  # HMS SDK
-    ...
-  12/ 或 5.0.0(12)/       # 按版本目录（部分安装布局）
-```
+Agent 工具 `ohpm_search` / `ohpm_recommend` 与前端生态页共享数据源。推荐结果是候选信息，安装后仍需通过 `ohpm_install` 和真实构建验证兼容性。
 
-> 版本差异容错：`toolchains/hdc.exe` 的查找用递归 glob，不硬编码版本目录名。
+## 11. 安全与恢复
 
-> **macOS 类比**：DevEco Studio 默认 `/Applications/DevEco Studio.app/Contents`（内置 node 在 `Contents/tools/node/bin/node`，hvigor/ohpm 同 tools 目录结构）；hdc 仍在 SDK toolchains；git 用系统（Xcode CLT / homebrew），探测顺序先 PATH。
+HarmonyOS 工具继续遵循通用执行内核：
 
-### 5.3 缓存与失效校验
+- 工程路径必须位于受信任 workspace；
+- 构建、部署、设备写操作按权限等级审批；
+- build/deploy 等资源使用互斥/并发键，避免并行抢占；
+- command 参数经过危险模式检查；
+- 工具结果脱敏并限制大小；
+- 工具调用保存 idempotency、lease、产物和验证证据；
+- 读操作可安全重试，部署/安装/写设备等先验证效果；
+- 旧 Worker 迟到结果由 fencing 拒绝。
 
-- 结果存 `settings` 表：`toolchain_deveco` / `toolchain_hdc` / `toolchain_ohpm` / `toolchain_hvigor`。
-- 应用启动时校验存在性（`Path::exists`），全部有效 → 跳过探测；任一失效 → 全量重探测。
-- 设置页：显示探测结果 + 手动指定路径 + 「重新探测」按钮。
-- **UI 联动**：探测结果统一走 `check_environment`（状态分级 🟢/🔴/🟠/🟡 + 下载地址/教程引导），渲染在设置页「环境健康」区（ARCHITECTURE.md §7.4.3）；启动时必需项缺失会出顶部横幅引导。
+## 12. 验证建议
 
----
+纯代码测试可以覆盖解析器、命令生成、错误分类、路径、状态机和恢复策略，但无法替代真实环境。涉及 HarmonyOS 的变更应按风险选择：
 
-## 6. M3 验收用例
+1. 解析 fixture/真实多模块工程；
+2. 运行 Rust 单测和 Clippy；
+3. 在安装 DevEco Studio/SDK 的机器执行环境健康检查；
+4. 运行 `ohpm install` 和 debug/release 构建；
+5. 在至少一台真实设备或匹配 API 的模拟器安装并启动；
+6. 读取日志，确认 bundle/ability、签名和 API level；
+7. 对部署/设备写操作测试停止、超时和恢复，确认不会重复副作用。
 
-| # | 用例 | 通过标准 |
-|---|---|---|
-| TC1 | 打开真实 API 12/13 工程（多模块） | ProjectIndex ready；模块/类型/entry 识别 100%；bundleName/签名状态正确 |
-| TC2 | 路由合并 | main_pages.json 与 @Router 合并去重，missingFile 标记正确 |
-| TC3 | 增量更新 | 修改 main_pages.json 后 2s 内 routes 更新，全量索引不重建 |
-| TC4 | 构建 | `build_hap` 成功，构建卡片流式日志，hap 产物正确定位（signed 优先） |
-| TC5 | 部署闭环 | NLA-AN00：install → aa start → 验证拉起；覆盖安装走红色警示路径 |
-| TC6 | 错误修复循环 | 注入编译错误 → buildErrors 正确解析（file/line）→ Agent 修复 ≤3 轮 |
-| TC7 | 容错 | 删除 module.json5 模拟损坏 → 索引 failed 但不崩溃，右侧面板显示原因 |
-| TC8 | 工具链 | 无 DevEco 环境 → 探测失败给出引导；有 → 全部工具链就绪 |
+任何文档示例都不能替代当前 `TOOL_SPECS` 参数 schema、环境探测结果和实际设备输出。

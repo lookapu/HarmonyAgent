@@ -1,408 +1,178 @@
-# DevEco Switch 工具集增强规划（全面版 · 对齐 tool-enhancement-backlog）
+# DevEco Switch 工具能力盘点
 
-> 参考 `docs/tool-enhancement-backlog.txt`（工具集增强完整清单 v1 终版），对本项目工具能力做全量盘点、逐项映射与分批实施规划。
-> 盘点口径（2026-08-16 工作区代码实测）：
-> - `TOOL_SPECS`（`src-tauri/src/agent/tools/mod.rs`）：**182 个对外工具声明**（name + desc，全部含「副作用」段）
-> - 工具分派表 dispatch：170 个匹配分支（多 9 个为内部标记命令）
-> - 状态三档：✅ 已有（能力已实现）｜🟡 部分（有相近能力，缺关键特性）｜❌ 缺失（需新实现）
-> - **2026-08-16 第二批实施完成**：9 个新工具（06/07/16/17/19/20/35/70/73）+ 6 项 B 类治理（61/66/69/74/75/76），详见 §11 实施记录
-> - **2026-08-20 第四批（八仓库盘点）**：+5 个新工具（memorize / ui_focus / schedule_create / schedule_list / schedule_delete），TOOL_SPECS 达 **198**，详见 §11
+> 当前状态：2026-08-21，`main` 分支。历史需求来源见 `tool-enhancement-backlog.txt`；本文件只描述已经落地的能力、事实源和仍明确暂缓的边界。
 
----
+## 1. 权威口径
 
-## 1. 现状总览
+| 项目 | 当前值 | 权威来源 |
+|---|---:|---|
+| 对外 Agent 工具 | 198 | `agent/tools/mod.rs::TOOL_SPECS` |
+| 工具实现文件 | 29 | `src-tauri/src/agent/tools/*.rs` |
+| 任务分组 | 8 | `TOOL_GROUP` / `TASK_GROUPS` |
+| 权限等级 | L0/L1/L2 | `services/permissions.rs` 与工具 hooks |
+| 工具协议 | 文本标记 + 原生 function calling | `protocol.rs` / `commands/chat.rs` |
 
-| 项 | 数值 |
+`TOOL_SPECS` 是工具名称、描述和副作用标记的唯一事实源；本文不复制 198 项完整数组，避免新增工具后出现双份清单漂移。
+
+## 2. 八个任务域
+
+| 域 | 用途 | 代表工具 |
+|---|---|---|
+| `build` | 工程创建、依赖、构建与产物 | `create_harmony_project`、`ohpm_install`、`build_project`、`ota_pack`、`analyze_hap_size` |
+| `fix` | 修改、撤销、诊断和修复 | `edit_file`、`multi_edit`、`undo_edit`、`show_diagnose_card`、`analyze_crash` |
+| `explore` | 文件、代码库、知识和 API 探索 | `read_file`、`list_dir`、`grep_files`、`codebase_search`、`search_sdk_api` |
+| `deploy` | 设备连接、安装和启动 | `list_devices`、`connect_device`、`deploy`、`deploy_all`、`start_ability` |
+| `refactor` | 扫描、符号和 LSP 语义操作 | `deep_scan`、`check_code`、`lsp_definition`、`lsp_references`、`lsp_rename` |
+| `test` | 单测、冒烟、API/UI/性能验证 | `run_tests`、`write_unit_tests`、`smoke_test`、`api_test`、`run_ui_flow` |
+| `debug` | 日志、调试器、性能与内存 | `attach_debugger`、`step_debug`、`log_query`、`memory_snapshot`、`dump_battery` |
+| `other` | Git、Web、MCP、Skill、记忆和治理 | `git_diff`、`web_fetch`、`use_skill`、`spawn_agents`、`schedule_create`、`license_check` |
+
+任务分组同时用于限额、成本统计、权限展示和命令面板，不应在前端维护第二套映射。
+
+## 3. 实现模块
+
+`src-tauri/src/agent/tools/` 按职责拆分：
+
+- `mod.rs`：`TOOL_SPECS`、分组、schema 和总分发；
+- `protocol.rs`：文本工具标记解析；
+- `contracts.rs`：工具 schema/契约辅助；
+- `pipeline.rs` / `guards.rs`：pre/post hook 和审批/预算/安全护栏；
+- `errors.rs`：结构化错误与建议；
+- `fs_tools.rs` / `explore_tools.rs`：文件读写、搜索、代码扫描；
+- `cmd_tools.rs` / `build_tools.rs` / `test_tools.rs`：命令、构建和测试；
+- `device_tools.rs` / `debug_tools.rs` / `ui_tools.rs`：设备、调试与 UI 自动化；
+- `project_tools.rs` / `compose_tools.rs`：工程分析和组合工作流；
+- `git_tools.rs` / `web_tools.rs`：Git 与网络；
+- `memory_tools.rs` / `skill_tools.rs` / `meta_tools.rs`：记忆、Skill、Agent 元能力；
+- `doc_tools.rs` / `media_tools.rs`：文档与多模态；
+- `quality_tools.rs`：质量工具 facade；具体实现拆到 metrics/security/runtime/media 四个文件；
+- `schedule_tools.rs`：会话内提醒。
+
+外部模块应通过 facade 或总分发访问质量工具，不直接耦合 `quality_*` 内部文件。
+
+## 4. 已落地能力
+
+### 4.1 文件与编辑
+
+- 项目根路径约束和 canonical path 校验；
+- `.gitignore` 感知的目录、glob、grep 与代码库搜索；
+- `write_file`、`edit_file`、`multi_edit`、copy/move/delete、Diff 预览和 dry-run；
+- 会话级撤销快照；
+- `.env*`、密钥/证书和已存在迁移 SQL 的不变式保护；
+- 大文件分段读取、长注释折叠和超大输出落盘。
+
+### 4.2 HarmonyOS 工程与构建
+
+- Stage 工程创建、HAP/HAR/HSP 模块识别和 workspace 扫描；
+- hvigor/ohpm 调用、通用工程构建、构建错误解析和依赖诊断；
+- HAP 大小分析、版本 size diff、签名检查/诊断和 OTA `.pkg` 打包；
+- HarmonyOS SDK 对齐、API 兼容扫描和跨版本 API diff。
+
+### 4.3 设备、调试与 UI
+
+- hdc 服务、无线设备、模拟器、应用安装/启动/停止/卸载；
+- shell、设备文件、截图、录屏、UI hierarchy、手势和 UI flow；
+- hilog/runtime log/faultlog 查询与崩溃分类；
+- debugger attach、step/next/continue/where 等调试动作；
+- CPU/内存/电池/性能采样与内存快照 diff；
+- 网络条件、Wi-Fi、飞行模式和权限设置。
+
+### 4.4 代码理解与知识
+
+- ArkTS LSP definition/references/rename/format/code action/completion/signature/hover/diagnostics/symbols；
+- 符号索引、分级扫描、代码度量和变更审查；
+- SDK API、HarmonyOS 官方文档、用户知识库和 ohpm landscape；
+- BM25 + embedding 的混合检索、RRF、front-page 置顶和负反馈纠偏。
+
+### 4.5 测试、质量与安全
+
+- 单元测试生成/执行、flaky detect、smoke test、UI flow 和性能基准；
+- OpenAPI 测试、mock 和健康检查；
+- license check、vulnerability scan、代码混淆和 sandbox exec；
+- 截图 diff、质量度量、日志聚合、trace replay 和指标导出；
+- 输出脱敏、危险命令黑名单、工具缓存、工具健康检查与统计。
+
+### 4.6 Agent 元能力
+
+- `plan_task`、Todo、主动提问、诊断卡和进度更新；
+- `spawn_agents`、tool filter、max depth、persona 和 Agent 消息板；
+- 后台 job、完成消息注入和 kill-tree；
+- 记忆保存/搜索、Reflexion、时间旅行和会话引用；
+- MCP 服务发现/调用、Skill 调用、Web 搜索/抓取和会话提醒。
+
+## 5. 工具执行的安全与可靠性
+
+所有工具并非直接从模型字符串进入实现函数，而是经过统一执行链：
+
+```text
+模型工具调用
+  → schema/参数解析
+  → 项目路径与不变式
+  → 任务预算/限额/危险命令
+  → 权限等级与用户审批
+  → execution step + tool lease + idempotency
+  → 专用 OS 线程执行
+  → 结构化结果/证据/补偿信息
+  → Owner fencing 后提交终态
+  → 审计、进度、缓存和大输出落盘
+```
+
+关键语义：
+
+- L0 且无交互副作用的连续读取可最多 4 路并发；写工具是串行 barrier；
+- 工具 future 在线程内 panic 时只失败当前调用；
+- 调用方超时/取消而线程未退出会标记 stuck；
+- 读取型工具可在崩溃后安全重试；
+- 修改、命令和部署等副作用先验证实际效果，不能盲目 replay；
+- 相同副作用以幂等键阻止重复执行；
+- 旧 Tool Worker 的迟到结果不能覆盖新 Owner；
+- 对外文本输出同时保留，结构化 V2 envelope 为验收和恢复提供机器可读证据。
+
+详细执行内核见 `ARCHITECTURE.md`。
+
+## 6. 历史增强批次
+
+| 日期 | 变化 |
 |---|---|
-| 对外工具（TOOL_SPECS） | **198** |
-| 工具分派分支（含内部命令） | 170+ |
-| 自动跑框架（已有） | Reflexion（agent/reflexion.rs）、cost_guard、LSP 常驻、任务看门狗（utils/task_registry.rs） |
-| 关键基础设施（已有） | undo 可逆性（undo.rs + undo_edit 工具）、job 系统（job_list/kill/output）、HealthPage（check_all_health）、tool_stats 统计（list_tool_stats + list_tool_token_stats）、session_events 事件流、secret 钥匙串（secret_store/get/delete）、Reflexion 反思卡片、tool_cache 响应缓存、redact 脱敏、TOOL_GROUP 分组 |
-| txt 计划项（A 56 + B 20） | 76 |
-| 其中 ✅ 已有 | 39 |
-| 其中 🟡 部分 | 17 |
-| 其中 ❌ 缺失 | 20 |
+| 2026-08-14 | 初版形成 117 个工具，覆盖文件、构建、设备、知识和 Agent 基础循环 |
+| 2026-08-16 | 工具扩展至 191，补齐日志查询、文档/音频、调试、内存、OTA、许可证和漏洞扫描，并拆分质量模块 |
+| 2026-08-20 | 增至 198：`memorize`、`ui_focus`、`schedule_create/list/delete`，并加入时间旅行、混合检索与循环检测 |
+| 2026-08-21 | 工具数不变；新增证据契约、持久调度、DAG、多 Worker、Tool Execution Kernel、专用执行线程和可靠性控制面 |
 
----
+工具数量只描述对外能力数；2026-08-21 的重点是让已有工具在崩溃、超时、多实例和副作用场景下可恢复，而不是继续增加工具名。
 
-## 2. 现有工具全景（152 个，按域分组）
+## 7. 明确暂缓项
 
-> 工具清单以 `TOOL_SPECS` 为准，按实现模块分组（`src-tauri/src/agent/tools/`）。
+以下外部服务集成不属于当前 198 工具，保持暂缓：
 
-### 2.1 设备域（device_tools.rs）
-`list_devices` / `connect_device` / `manage_hdc` / `list_emulators` / `start_emulator` / `create_emulator` / `device_shell` / `device_file` / `get_installed_apps` / `start_ability` / `stop_app` / `uninstall_app` / `clear_app_data` / `grant_permission` / `set_airplane_mode` / `set_network_condition` / `set_wifi_state` / `device_perf`
+- Figma 导入；
+- 飞书任务同步；
+- Jira 同步。
 
-### 2.2 工程域（project_tools.rs）
-`get_project_info` / `list_modules` / `read_module_config` / `create_harmony_project` / `analyze_generic_project` / `analyze_crash` / `scan_api_compat` / `diff_api_versions` / `check_sdk_alignment` / `diagnose_signing` / `check_signature` / `environment_check`
+原因是它们需要外部账号、token、权限模型和长期 API 兼容维护，且不影响鸿蒙本地开发闭环。若重新启动，应先定义连接凭据、权限边界、失败补偿和审计要求，而不是只增加一个网络调用工具。
 
-### 2.3 构建域（build_tools.rs）
-`build_project` / `build_generic` / `build_hap` / `build_profile` / `run_lint` / `check_code` / `ohpm_install` / `ohpm_search` / `oh_package` / `run_tests` / `write_unit_tests` / `analyze_hap_size`
+## 8. 新增或修改工具的检查清单
 
-### 2.4 文件与编辑域（fs_tools.rs + explore_tools.rs）
-`read_file` / `write_file` / `edit_file` / `multi_edit` / `delete_file` / `copy_file` / `move_file` / `undo_edit` / `preview_edit` / `list_dir` / `glob` / `grep_files` / `find_files` / `get_file_info` / `type_or_syntax` / `codebase_search` / `deep_scan` / `review_changes`
+1. 在 `TOOL_SPECS` 登记名称、参数、返回和副作用；
+2. 添加 schema 与 dispatcher，确认文本协议和 native tools 都可见；
+3. 登记 `TOOL_GROUP`、权限等级、timeout/retry/cost hint；
+4. 明确 effect kind、幂等输入、产物和验证方式；
+5. 接入路径、不变式、审批和输出脱敏；
+6. 为成功、参数错误、权限拒绝、超时和 panic/恢复补测试；
+7. 若新增数据库结构，只新增递增迁移，不修改既有迁移；
+8. 更新 README/CHANGELOG；不要在本文复制一份会漂移的完整工具数组。
 
-### 2.5 命令域（cmd_tools.rs）
-`run_command` / `check_code` / `http_request` / `job_list` / `job_output` / `job_kill` / `job_template`
+## 9. 验证口径
 
-### 2.6 Git 域（git_tools.rs）
-`git_status` / `git_commit` / `git_push` / `git_pull` / `git_fetch` / `git_branch` / `git_merge` / `git_stash` / `git_tag` / `git_log` / `git_diff` / `git_blame` / `git_restore` / `git_show`（分支策略：agent/* 前缀）
+工具相关变更至少通过：
 
-### 2.7 LSP 域（debug_tools.rs）
-`lsp_definition` / `lsp_references` / `lsp_rename` / `lsp_format` / `lsp_code_action` / `lsp_completion` / `lsp_signature` / `lsp_hover` / `lsp_diagnostics` / `lsp_symbols` / `search_symbols` / `get_symbol_details`
-
-### 2.8 调试 / 真机域（debug_tools.rs + device_tools.rs）
-`debug_probe` / `stack_dump` / `analyze_crash` / `collect_perf` / `run_perf_benchmark` / `dump_memory` / `dump_battery` / `read_logcat` / `read_runtime_logs` / `search_hilog` / `get_diagnostics` / `show_diagnose_card`
-
-### 2.9 UI / 媒体域（ui_tools.rs + media_tools.rs）
-`take_screenshot` / `read_clipboard_image` / `view_image` / `verify_ui` / `record_ui` / `replay_ui` / `run_ui_flow` / `dump_ui_hierarchy` / `screen_record` / `image_inspect` / `read_document` / `read_pdf`
-
-### 2.10 记忆 / 知识域（memory_tools.rs）
-`save_memory` / `manage_memory` / `search_knowledge` / `manage_knowledge` / `ask_history` / `plan_task` / `todo_get` / `todo_write` / `export_data` / `get_cost_summary`
-
-### 2.11 元能力域（meta_tools.rs）
-`tool_list` / `tool_help` / `tool_history` / `ask_user` / `ask_history`
-
-### 2.12 Web / 协作 / 其他
-`web_fetch` / `web_search` / `share_session` / `import_session` / `db_query` / `trace_export` / `secret_store` / `secret_get` / `secret_delete` / `list_mcp_servers` / `search_harmony_docs` / `read_harmony_doc` / `read_sdk_api_module` / `search_sdk_api` / `search_api` / `get_api_detail` / `refresh_api_db` / `refresh_api_details` / `list_agents` / `agent_publish` / `agent_subscribe` / `auto_explore` / `run_app` / `deploy` / `deploy_all` / `install_launch` / `get_build_log` / `get_app_info` / `get_env_info` / `get_api_detail` 等
-
----
-
-## 3. A 类映射（工具补全 56 项）
-
-### A1. 工具元能力 —— 3 项（全部 ✅）
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [01] | tool_list | ✅ | `meta_tools::tool_list`（按 TOOL_SPECS 输出，含 desc） |
-| [02] | tool_help | ✅ | `meta_tools::tool_help`（按名查参数/副作用/返回） |
-| [03] | tool_history | ✅ | `meta_tools::tool_history`（会话内最近调用含结果） |
-
-### A2. 编辑体验 —— 4 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [04] | preview_edit | ✅ | `preview_edit`（edit_file 前返回 diff 不落盘） |
-| [05] | format_file | ✅ | `lsp_client::format_file`（ArkTS 语言服务格式化：路径/规则/大小写/空格规范，`dry_run` 只返回 diff 不落盘） |
-| [06] | snippet_insert | ✅ | `quality_tools::snippet_insert`（snippets 表 + insert/list/get/search/update/delete CRUD，name 唯一、body≤64KB） |
-| [07] | code_metrics | ✅ | `quality_tools::code_metrics`（启发式：圈复杂度/注释率/最大嵌套/函数数，Top 文件 + JSON 输出） |
-
-### A3. LSP 能力补完 —— 5 项（全部 ✅，且超配）
-
-| # | 工具 | 状态 | 现状 |
-|---|---|---|---|
-| [08] | lsp_rename | ✅ | 符号+引用跨文件同步，可 undo_edit 回退 |
-| [09] | lsp_format | ✅ | 服务端格式化（tab_size 可调） |
-| [10] | lsp_code_action | ✅ | quick fix |
-| [11] | lsp_completion | ✅ | trigger 自动补全 |
-| [12] | lsp_signature | ✅ | 签名+文档提示 |
-
-> 超配：另有 lsp_definition / lsp_hover / lsp_references / lsp_diagnostics / lsp_symbols，LSP 域已全覆盖。
-
-### A4. 可观测 / 查询 —— 5 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [13] | db_query | ✅ | 只读白名单查 SQLite（30+ 表） |
-| [14] | log_query | ✅ | `search_hilog`（since/until/priority/keyword）+ `read_logcat` / `read_runtime_logs` |
-| [15] | trace_export | ✅ | 已有导出 |
-| [16] | metric_export | ✅ | `quality_tools::metric_export`（Prometheus text：tool 调用/耗时/失败 + LLM 请求/Token/费用 + 工具 token 维度） |
-| [17] | log_aggregate | ✅ | `quality_tools::log_aggregate`（hilog + runtime + faultlog 三源单次归并，max_lines/since 可调） |
-
-### A5. API 工作流闭环 —— 4 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [18] | api_mock | ✅ | `quality_tools::api_mock`（解析 OpenAPI 3 → 提取路由与响应样例（2xx 优先/default 兜底）→ 内置 node 起零依赖 mock 服务，后台任务常驻，返回端口/job_id/curl 示例） |
-| [19] | api_test | ✅ | `quality_tools::api_test`（OpenAPI 3 或显式 cases 批量断言：状态码 + 超时 + 自动提取 GET 冒烟） |
-| [20] | api_health | ✅ | `quality_tools::api_health`（批量 URL 探测：状态码 + 耗时健康表） |
-| [21] | figma_import | ❌ | **缺口**：Figma URL → 组件树 → ArkTS 骨架。依赖 Figma API token，成本高，排第 4 批 |
-
-### A6. 多模态 —— 6 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [22] | read_pdf | ✅ | read_document（pdf-extract 内存提取） |
-| [23] | docx_read | ✅ | read_document 支持 docx/pptx/xlsx/pdf/txt/md/csv |
-| [24] | ocr_image | ✅ | `media_tools::ocr_image`（Windows.Media.Ocr 系统引擎：内嵌 C# 源首次调用用 csc.exe 编译为 exe 缓存，纯 ASCII JSON 输出规避代码页乱码；png/jpg/jpeg/bmp，无需外置模型） |
-| [25] | image_inspect | ✅ | 尺寸/格式/EXIF 元数据 |
-| [26] | audio_transcribe | ❌ | **缺口**：语音转文字。依赖 whisper 模型（体积大），排第 4 批 |
-| [27] | chart_extract | ✅ | `doc_tools::chart_extract`（视觉模型多模态读图提取图表结构化数据，支持多图批量） |
-
-### A7. 调试 / 真机 —— 5 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [28] | attach_debugger | 🟡 | 已有 debug_probe/stack_dump/analyze_crash（崩溃栈分析闭环）。**缺口**：hdc 交互断点 attach；依赖 HarmonyOS 调试协议，排第 3 批 |
-| [29] | step_debug | ❌ | **缺口**：单步/继续。依赖 [28]，排第 3 批 |
-| [30] | memory_snapshot | ✅ | `dump_memory`（内存快照，泄漏定位） |
-| [31] | screenshot_diff | ✅ | `ui_tools::screenshot_diff`（逐像素对比 PNG：差异率/包围盒/位置提示，本地只读不连设备） |
-| [32] | flaky_test_detect | ✅ | 重复执行测试 N 次（2-5，默认 3）对比各轮结果，识别不稳定（flaky）用例（复用 run_tests） |
-
-### A8. 构建 / 部署 —— 5 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [33] | bundle_analyzer | ✅ | `analyze_hap_size`（HAP 内容/资源大小） |
-| [34] | size_diff | ✅ | 对比两个 HAP 大小：总量/目录占比变化 + 文件新增/删除/大小变化 Top 清单 |
-| [35] | obfuscate | ✅ | `quality_tools::obfuscate`（build-profile.json5 obfuscation 开关读写 status/enable/disable，写前备份到 .deveco-agent/backups/） |
-| [36] | ota_pack | ❌ | **缺口**：OTA 升级包。依赖签名/打包流程，排第 3 批 |
-| [37] | smoke_test | ✅ | 构建后自动冒烟链：可选 deploy + run_ui_flow 断言 → 冒烟报告（复用 [68] compose） |
-
-### A9. 知识 / 记忆 / 上下文 —— 4 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [38] | conversation_search | ✅ | 全库历史对话语义搜索（按消息内容/会话/时间过滤，复用 embedding 服务） |
-| [39] | fact_extract | ✅ | 任务收尾时把值得长期记住的事实（约定/偏好/踩坑）沉淀为项目记忆 |
-| [40] | prompt_optimize | ✅ | `meta_tools::prompt_optimize`（离线失败模式分析：tool_runs/task_runs 按错误聚合失败样本 + 复用 diagnose_tool_error 输出修复建议；不调 LLM 改写 system prompt） |
-| [41] | reflexion_query/pin | ✅ | `meta_tools` 显式查/钉 Reflexion 卡片（query 查失败模式与对策，pin 钉住 1 小时时间窗） |
-
-### A10. 协作 / 导出 —— 5 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [42] | share_session | ✅ | 脱敏导出 JSON/Markdown |
-| [43] | import_session | ✅ | 导入接续 |
-| [44] | export_report | ✅ | Markdown 报告导出 HTML/PDF（内置 node 渲染；PDF 走 Edge/Chrome headless 打印） |
-| [45] | feishu_task_sync | ❌ | 外部平台集成，第 4 批 |
-| [46] | jira_sync | ❌ | 外部平台集成，第 4 批 |
-
-### A11. 安全 / 合规 —— 4 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [47] | secret_scan | ✅ | 密钥泄漏专项扫描：全仓硬编码密钥/密码（复用 check_code 的 hardcoded-secret 规则）+ 敏感文件（.env/local.properties 等） |
-| [48] | license_check | ❌ | 依赖解析 oh-package.json + 许可证库，第 4 批 |
-| [49] | vuln_scan | ❌ | 依赖漏洞库对接（ohpm audit 若有），第 4 批 |
-| [50] | permission_audit | ✅ | 工具使用安全审计：聚合调用统计 + 权限分级（L0/L1/L2）审计报告（使用量/成功率/危险占比） |
-
-### A12. 安全存储 —— 2 项（全部 ✅）
-
-| # | 工具 | 状态 | 现状 |
-|---|---|---|---|
-| [51] | secret_store | ✅ | 系统钥匙串（keyring 已接入） |
-| [52] | secret_get | ✅ | 读取（另有 secret_delete） |
-
-### A13. UI 自动化 —— 2 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [53] | ui_locator | ✅ | `ui_locator`（hierarchy 解析 + 属性/文本过滤返回稳定定位元素与推荐坐标，可直接给 run_ui_flow 用） |
-| [54] | gesture_perform | ✅ | 单次手势注入：tap/swipe/longPress/doubleTap/text/key 直连设备屏幕（替代 record_ui/replay_ui 录制回放） |
-
-### A14. 数据库 / 状态 —— 2 项
-
-| # | 工具 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [55] | db_migrate | ✅ | 数据库迁移管理：status/apply 查看与执行未应用迁移（与启动自动迁移同一清单） |
-| [56] | state_snapshot | ✅ | 应用状态快照：关键表（settings/projects/project_memories/knowledge_entries/mcp_servers/providers 等）导出 JSON 备份 |
-
----
-
-## 4. B 类映射（健壮性 / 治理 20 项）
-
-| # | 能力 | 状态 | 现状与复用点 |
-|---|---|---|---|
-| [57] | 工具输出脱敏 redact | ✅ | `utils/redact.rs` 正则表（密钥/JWT/邮箱/手机号/身份证/私钥/内网 IP），mod.rs dispatch 统一出口包裹全部工具 |
-| [58] | dry-run 模式 | ✅ | fs_tools 写类工具（write_file/edit_file/delete_file/move_file/copy_file 等）全部支持 `dry_run: true`：返回 diff/影响清单不落盘 + git rollback 兜底 |
-| [59] | 单工具取消 UI | ✅ | toolRuns.tsx 工具卡片 abort 按钮 → invoke stop_tool（消费式中断标志，强杀进程树，后端 job_kill 就绪） |
-| [60] | 副作用标注 lint | ✅ | 测试静态断言：全部 TOOL_SPECS desc 必含「副作用：」与「参数：」段（新增工具缺失即测试失败，2 个用例） |
-| [61] | desc 长度规范 | ✅ | 测试断言 `desc_length_within_band`：全部 desc 80-800 字符（too_short/too_long 双断言，编译期保护） |
-| [62] | task_group 字段 | ✅ | `TOOL_GROUP`（pub const，182 条全量登记）+ `TASK_GROUPS` + `tool_group()` 查询，tool_list 已支持按组过滤 |
-| [63] | timeout_hint + cost_hint | ✅ | `meta_tools.rs` TOOL_META：timeout_hint/retry_policy/cost_hint 稀疏标注（tool_help 展示，未覆盖工具走默认值） |
-| [64] | fallback 链 | ✅ | 被 [68] compose 覆盖：组合链中单步失败自动给出修复建议与替代路径（不单独实现 try_with_fallback 宏） |
-| [65] | 结构化错误统一 | ✅ | `errors.rs::diagnose_tool_error`（错误模式→建议规则表）+ `with_advice` 统一包装：工具失败输出自动附修复建议（全工具生效） |
-| [66] | tools_health() ping | ✅ | 前端启动 5s 自动 ping `tools_health` 命令，关键工具链缺失时顶部横幅（点击跳转 HealthPage） |
-| [67] | 工具响应缓存 | ✅ | `services/tool_cache.rs`：仅 L0 只读工具按 (tool, project, args_hash) 缓存，dispatch 出口统一写入 |
-| [68] | 组合工具层 | ✅ | `compose` 工具：build_and_deploy / smoke / test_and_report 等预置链按序串行，每步成功/失败摘要，支持自定义链 |
-| [69] | 工具统计 | ✅ | list_tool_stats（次数/成功失败/平均耗时/最近调用）+ **list_tool_token_stats（最耗 token 维度**：request_logs.tool_name 按工具聚合，migration 037）+ 前端排行小节 |
-| [70] | 工具级 trace | ✅ | session_events（032 迁移）+ `replay_trace` 工具（quality_tools：按 trace_id 回放调用链，未指定时列出最近 10 个任务） |
-| [71] | TOOL_SPECS 抽 JSON | ✅ | `export_tools_meta` 导出全量工具声明 JSON（schema/desc/group/level/timeout_hint 等，写 .deveco-agent/tools_meta.json）供外部消费；runtime 加载未做（风险高，保持静态数组） |
-| [72] | 快捷键绑定 | ✅ | 窗口内快捷键：Ctrl+Shift+S 截图验证（take_screenshot）/ Ctrl+Shift+R 运行命令（run_command，填提示词并聚焦）；既有 Ctrl+Shift+B/D/N/K 保留 |
-| [73] | sandbox 模拟 | ✅ | `quality_tools::sandbox_exec`（危险命令静态分析 + preview/simulate：临时沙箱目录真执行，≤200 文件/50MB，白名单校验） |
-| [74] | tools_health 命令 | ✅ | `commands/tools.rs::tools_health`（复用 check_harmony_toolchain 过滤 project_structure，毫秒级，供 [66] 启动 ping） |
-| [75] | 按任务分组 UI | ✅ | `list_tool_groups` 命令暴露 TOOL_GROUP + 统计面板按 build/fix/explore/deploy/refactor/test/other 分组折叠 |
-| [76] | 工具调用链可视化 | ✅ | TimelinePanel「调用链」视图：tool_call/tool_result 配对建链，实线=顺序执行、虚线=失败重试，节点含耗时/输出展开 |
-
----
-
-## 5. 缺口统计
-
-| 批次 | ✅ 已有 | 🟡 部分 | ❌ 缺失 | 合计 |
-|---|---|---|---|---|
-| A 类（工具补全） | 47 | 1 | 8 | 56 |
-| B 类（健壮性） | 20 | 0 | 0 | 20 |
-| **合计** | **67** | **1** | **8** | **76** |
-
----
-
-## 6. 实施路线（价值密度 × 实现成本 × 依赖关系）
-
-### 第 1 批：立即价值（P0/P1，3-5 天）—— 已全部完成 ✅
-
-| 优先级 | 项 | 复用资产 | 估时 | 验收标准 |
-|---|---|---|---|---|
-| P0 | [57] redact 脱敏 | utils/errors.rs 风格 | 0.5 天 | 读含密钥 .env 返回 *** 遮蔽；正常内容零误伤（正则测试集） |
-| P1 | [58] dry-run 模式 | preview_edit 雏形 | 1 天 | write_file/edit_file 带 dry_run 返回 diff 不落盘；delete_file 返回影响清单 |
-| P1 | [60] 副作用标注 lint | TOOL_SPECS 146/152 | 0.5 天 | 新增工具缺「副作用」段编译期/测试报警 |
-| P1 | [62] task_group 字段 | ToolSpec 结构 | 1 天 | 152 工具全部有分组；tool_list 支持按组过滤 |
-| P1 | [05] format_file | lsp_format 内核 | 0.5 天 | 独立工具按 ArkTS 风格格式化单文件返回 diff |
-| P1 | [31] screenshot_diff | utils/png.rs | 0.5 天 | 两张截图输出像素差异率 + 差异图路径 |
-| P1 | [34] size_diff | analyze_hap_size | 0.5 天 | 两次构建输出大小 delta |
-| P1 | [53] ui_locator | dump_ui_hierarchy | 0.5 天 | 按 text/属性返回稳定定位信息 |
-| P1 | [59] 单工具取消 UI | job_kill 后端 | 0.5 天 | tool_run 卡片 abort 可停单个工具 |
-
-### 第 2 批：1 周（中成本，多数依赖第 1 批）—— 已全部完成 ✅
-
-| 项 | 复用资产 | 说明 |
-|---|---|---|
-| [06] snippet_insert | TOOL_SPECS + snippets 表 | 自定义片段库 + 插入 |
-| [07] code_metrics | lsp_symbols 解析链路 | 圈复杂度/注释率/嵌套深度 |
-| [16] metric_export | list_tool_stats SQL | Prometheus text 格式 |
-| [17] log_aggregate | search_hilog + read_runtime_logs | 三源归并 |
-| [27] chart_extract | 多模态 image_url 链路 | 视觉模型读图出数据 |
-| [32] flaky_test_detect | run_tests | N 次执行波动率 |
-| [37] smoke_test | run_ui_flow + [68] | 部署后自动冒烟（✅） |
-| [38] conversation_search | embedding 服务 | messages 语义检索（✅） |
-| [39] fact_extract | Reflexion 收尾钩子 | 自动事实沉淀（✅） |
-| [41] reflexion_query/pin | agent/reflexion.rs | 显式查/钉卡片（✅） |
-| [44] export_report | Markdown → PDF | 工作报告导出（✅） |
-| [47] secret_scan | scanner.rs 规则 | 独立全仓扫描（✅） |
-| [50] permission_audit | list_tool_stats + permissions | 审计报告（✅） |
-| [54] gesture_perform | record_ui 链路 | 单次手势注入（✅） |
-| [55] db_migrate | migrations runner | 手动迁移/回滚（✅） |
-| [56] state_snapshot | export_data 思路 | 状态备份/恢复（✅） |
-| [63] timeout_hint + cost_hint | ToolSpec（[62] 后） | 元数据字段（✅） |
-| [64] fallback 链 | guards.rs | 由 [68] compose 覆盖（✅） |
-| [67] 工具响应缓存 | L0 只读工具 | 10-30s 缓存（✅） |
-| [68] 组合工具层 | plan_task 模式 | build_and_deploy 等（✅） |
-| [69] 工具统计增强 | request_logs | 最耗 token 维度（✅） |
-
-### 第 3 批：1-2 周（重成本 / 高依赖）
-
-| 项 | 依赖 | 说明 |
-|---|---|---|
-| [28] attach_debugger / [29] step_debug | hdc 调试协议 | 交互调试（依赖外部调试协议，未做） |
-| [36] ota_pack | 签名/打包链路 | 发布链（依赖 DevEco OTA 签名流程，未做） |
-| [71] runtime 加载 | export_tools_meta（已做导出） | tools_meta.json runtime 加载（风险高，保持静态数组） |
-
-> 其余第 3 批项（[18][19][20][40][61][65][66][70][72][73][74][75][76]）均已实现，见第 11 节实施记录。
-
-### 第 4 批：持续（外部依赖 / 集成）
-
-[21] figma_import（Figma token）、[26] audio_transcribe（whisper 体积）、[45] feishu_task_sync、[46] jira_sync、[48] license_check、[49] vuln_scan（依赖 ohpm audit 生态）
-
----
-
-## 7. 依赖关系与执行顺序
-
-```
-P0 [57] redact ────────────► 全部批次（安全底座，最先做）
-P1 [62] task_group ────────► [75] 分组 UI
-P1 [60] 副作用 lint ───────► [61] desc 规范
-P1 [59] 取消 UI（独立）─────► [70] replay（事件完备性）
-[58] dry-run ──────────────► [73] sandbox（预览先行）
-[68] 组合层 ───────────────► [37] smoke_test
-[28] attach_debugger ──────► [29] step_debug
-[71] TOOL_SPECS JSON ──────► 用户自定义工具（远期）
+```bash
+npm test
+npm run lint
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked
+cargo test --manifest-path src-tauri/Cargo.toml --locked --test tool_worker_crash_e2e -- --test-threads=1
 ```
 
----
-
-## 8. 风险与注意事项
-
-| 风险 | 说明 | 缓解 |
-|---|---|---|
-| redact 误伤 | 正则过严会遮蔽正常代码（如示例密码、测试数据） | 只遮蔽「上下文明确」的模式（等号赋值/引号包裹/文件扩展名 .env 白名单文件全量遮蔽）；测试集覆盖误伤率 |
-| [67] 缓存脏读 | 工具响应缓存导致过期结果 | 仅缓存 L0 只读工具；TTL 10-30s；hash 含 project + args |
-| [71] 抽 JSON 回归 | 152 个工具声明迁移引入兼容问题 | 保留 Rust 静态数组为 fallback；JSON 加载失败自动回退；A/B 对比 tool_list 输出 |
-| [39] 事实抽取噪声 | 自动沉淀低价值记忆 | 模型评分阈值 + 用户确认入口（复用记忆草稿 UI） |
-| [40] prompt 优化失控 | 改写劣化 system prompt | 仅对失败会话生成「补丁段」而非整体改写；版本化可回退 |
-| [38] embedding 成本 | 全量历史消息建索引耗时 | 增量索引 + 后台任务（复用 job 系统） |
-
----
-
-## 9. 度量与验证体系
-
-| 维度 | 指标 | 数据来源 |
-|---|---|---|
-| 工具可靠性 | 失败率 / 平均耗时 / 重试率 | tool_runs（list_tool_stats 已支持） |
-| 安全 | 密钥泄露事件数（redact 拦截数） | redact 日志计数 |
-| 效率 | 工具调用节省 token（缓存命中率） | tool_cache 命中统计 |
-| 质量 | 副作用段覆盖率 100%、task_group 覆盖率 100% | 静态 lint 断言 |
-| 满意度 | 工具取消使用率、dry-run 预览率 | session_events |
-
----
-
-## 10. 建议下一步（按当前缺口优先级）
-
-**[57] redact 脱敏已完成**（dispatch 统一出口，全工具生效）。**第 1~3 批其余项也全部完成**（见第 11 节实施记录）。剩余缺口全部为外部依赖 / 调试协议类：
-1. **[28] attach_debugger / [29] step_debug**：hdc 交互断点 attach，依赖 HarmonyOS 调试协议（已有崩溃栈分析闭环 debug_probe/stack_dump/analyze_crash）
-2. **[36] ota_pack**：OTA 升级包，依赖 DevEco 签名/打包流程
-3. **第 4 批外部集成**：[21] figma_import（Figma token）、[26] audio_transcribe（whisper 体积）、[45] feishu_task_sync、[46] jira_sync、[48] license_check、[49] vuln_scan（ohpm audit 生态）
-
----
-
-## 11. 实施记录（2026-08-16 第三批）
-
-### 新工具（`src-tauri/src/agent/tools/quality_tools.rs`，9 个）
-
-| # | 工具 | 实现 | 关键点 |
-|---|---|---|---|
-| [06] | snippet_insert | snippets 表 CRUD | migration 036；name 唯一、body≤64KB |
-| [07] | code_metrics | 启发式静态度量 | 圈复杂度/注释率/最大嵌套/函数数，Top 文件 + JSON |
-| [16] | metric_export | Prometheus text | 工具调用/耗时/失败 + LLM 请求/Token/费用 + 工具 token |
-| [17] | log_aggregate | 三源归并 | hilog + runtime + faultlog 单次调用 |
-| [19] | api_test | OpenAPI 批量断言 | spec 文件/内联 + 显式 cases + 自动 GET 冒烟 |
-| [20] | api_health | URL 探测 | ≤10 端点状态码 + 耗时健康表 |
-| [35] | obfuscate | 混淆开关读写 | build-profile.json5，写前备份 backups/ |
-| [70] | replay_trace | 事件回放 | 按 trace_id 1:1 还原调用链；缺省列最近 10 任务 |
-| [73] | sandbox_exec | 危险命令干跑 | preview 静态分析 / simulate 临时沙箱真执行（≤200 文件/50MB） |
-
-### B 类治理
-
-| # | 能力 | 实现 |
-|---|---|---|
-| [61] | desc 长度规范 | 测试 `desc_length_within_band`：80-800 字符双断言 |
-| [66]+[74] | tools_health 启动 ping + 横幅 | `commands/tools.rs::tools_health`（复用 check_harmony_toolchain 过滤 project_structure）+ 前端启动 5s 自动 ping，缺失时顶部横幅跳转 HealthPage |
-| [69] | 最耗 token 维度 | migration 037（request_logs.tool_name）+ proxy_service 请求头 x-deveco-tool 标注 + list_tool_token_stats 命令 + 统计面板排行小节 |
-| [75] | 按 task_group 分组 UI | `list_tool_groups` 命令暴露 TOOL_GROUP + ToolStatsPanel 按 7 组折叠（组头 + 展开/收起） |
-| [76] | 调用链 DAG | TimelinePanel「调用链」视图：tool_call/tool_result 配对建链、失败重试虚线、节点耗时/输出展开 |
-
-### 登记与配套
-
-- 9 个新工具全部登记：TOOL_SPECS（含「副作用」段）、TOOL_GROUP（explore/other/test/build）、dispatch 分支、permissions.rs 级别（L0：code_metrics/metric_export/log_aggregate/replay_trace；L1：snippet_insert/obfuscate/api_test/api_health；L2：sandbox_exec）
-- 新 migration：036_snippets.sql、037_request_logs_tool.sql
-
-### 第三批（2026-08-16）：剩余缺口补齐
-
-| # | 工具/能力 | 实现 | 关键点 |
-|---|---|---|---|
-| [18] | api_mock | quality_tools.rs | OpenAPI 3 解析 → 路由/响应样例提取（2xx 优先/default 兜底）→ 内置 node 零依赖 mock 服务（jobs 后台常驻 12h），返回端口/job_id/curl 示例 |
-| [24] | ocr_image | media_tools.rs | Windows.Media.Ocr 系统引擎：内嵌 C# 源首次调用 csc.exe 编译为 exe 缓存（%TEMP%\deveco-agent\ocr_v1.exe）；stdout 纯 ASCII（\uXXXX 转义）规避代码页乱码；需系统 OCR 语言包 |
-| [40] | prompt_optimize | meta_tools.rs | 离线失败模式分析：tool_runs/task_runs 按错误聚合（days/min_fail/limit），复用 diagnose_tool_error 输出修复建议；不调 LLM 改写 |
-| [60] | 副作用 lint | mod.rs tests | 静态断言：全部 TOOL_SPECS desc 必含「副作用：」+「参数：」段（顺带修复 collect_perf/preview_edit 2 处真实违规） |
-| [71] | export_tools_meta | meta_tools.rs | 全量工具声明导出 JSON（schema: deveco-agent/tools_meta/v1，含 name/desc/group/level/hint），写 .deveco-agent/tools_meta.json |
-| [72] | 快捷键 | Home.tsx + i18n | Ctrl+Shift+S 截图验证 / Ctrl+Shift+R 运行命令：填入提示词并聚焦输入框（既有 B/D/N/K 保留） |
-
-### 剩余缺口（❌ 8 项 + 🟡 1 项）
-
-- **外部依赖（❌）**：[21] figma_import（Figma token）、[26] audio_transcribe（whisper 体积）、[45] feishu_task_sync、[46] jira_sync、[48] license_check、[49] vuln_scan（ohpm audit 生态）
-- **调试协议（❌）**：[29] step_debug（依赖 [28]）；[36] ota_pack（依赖 DevEco OTA 签名流程）
-- **部分实现（🟡）**：[28] attach_debugger（已有崩溃栈分析闭环，hdc 交互断点依赖调试协议）
-- **风险项**：[71] runtime 加载未做（export_tools_meta 导出已实现；动态加载风险高，保留 Rust 静态数组为唯一事实源）
-
-### 第四批（2026-08-20，八仓库盘点落地）
-
-| # | 工具/能力 | 实现 | 关键点 |
-|---|---|---|---|
-| — | memorize | memory_tools.rs + chat.rs `replay_memories` | 对齐 Qwen-Agent MemoAssistant：从历史消息重放 memorize 调用重建键值状态，每轮作为 system 注入 |
-| — | ui_focus | ui_tools.rs + Home.tsx | 对齐 OpenHands canvas_ui_control：Agent 产出后驱动 UI 聚焦（切右面板/开文件预览），L0 权限 |
-| — | schedule_create / list / delete | schedule_tools.rs + services/reminders.rs | 对齐 deepseek-harness schedule：after/at/every 三类会话内提醒，30s 轮询派发 + 桌面通知 |
-
-- 新工具全部登记：TOOL_SPECS（含「副作用」段）、dispatch 分支、permissions.rs 级别（memorize L0 / ui_focus L0 / schedule_* L1）
-- 新 migration：051_conversation_snapshots.sql、052_reminders_feedback_terms.sql（见 CHANGELOG v2.2）
-
----
-
-*生成日期：2026-08-20（第四批实施后更新）。源文件：docs/tool-enhancement-backlog.txt（v1 终版）。盘点基于工作区代码实测（TOOL_SPECS=198）。*
+CI 还会执行 Agent reliability、Execution Kernel 和多进程 Worker crash gate。测试通过只能证明已覆盖的不变量未回归；涉及真实 SDK、设备、签名和网络 Provider 的工具仍需对应环境验收。

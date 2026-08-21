@@ -10,13 +10,13 @@
 
 | 外部资料主张 | 项目现有实现 | 结论 |
 |---|---|---|
-| 工具描述写"什么不做/副作用/返回格式" | `agent/tools.rs` 每个工具 desc 含副作用声明与返回说明 | 已对齐 |
+| 工具描述写"什么不做/副作用/返回格式" | `agent/tools/mod.rs` 的 `TOOL_SPECS` 含描述与副作用声明 | 已对齐 |
 | 错误信息带 suggestion 让 LLM 自我修复 | `diagnose_tool_error` 失败输出追加【诊断建议】 | 已对齐 |
 | 危险命令黑名单 + 路径校验 + 输出截断 | `is_dangerous_command` + `resolve_in_project` 越界拦截 + 3000 字符截断 | 已对齐 |
 | 重试三件套：区分可恢复/不可恢复错误 | `is_retryable_err` 白名单 + 指数退避（`retry_with_backoff`） | 已对齐 |
 | 并行 Agent 抢资源要加锁 | `GATED_TOOLS` 信号量（build/deploy 全局互斥） | 已对齐 |
 | 子 Agent 用隔离模式，主 Agent 只看结果 | `spawn_agents` 独立上下文 + 结果汇总 | 已对齐 |
-| 上下文按 85% 触发压缩 | 历史加载 `HISTORY_LIMIT=30`，超限自动裁剪 | 基本对齐（见改进项 1） |
+| 上下文按压力触发压缩 | 动态历史预算 + 85% 阈值滚动摘要 + ContextOverflow 降级 | 已对齐（见改进项 1/12） |
 | 简单任务用便宜模型（动态路由） | `model_router::pick_economy_model`（子 Agent 已用） | 已对齐（见改进项 2 扩展） |
 
 ---
@@ -90,7 +90,7 @@
 
 **现状**：命令有黑名单，但文件写入工具无敏感清单。
 
-**方案**：`agent/tools.rs` 增加 `is_protected_file` 检查：
+**方案**：`agent/invariants.rs` 注册不变式，并由 `agent/tools/fs_tools.rs` 的写入路径统一调用：
 - 文件名以 `.env` 开头（`.env` / `.env.local` 等）→ 拒绝
 - 扩展名 `.key` / `.pem` / `.pfx` / `.p12` / `.keystore` → 拒绝
 - 路径含 `migrations` 且为已存在的 `.sql` 文件 → 拒绝（已执行迁移不可修改，须新建递增编号文件；**新建文件允许**）
@@ -221,6 +221,48 @@
 
 **验收**：点踩含"轮询"的方案后，含轮询关键词的同类记忆不再出现在上下文或沉底。
 
+### 17. 目标契约与证据验收（2026-08-21）✅
+
+**目标**：把“模型说完成了”与“任务真实完成”分离。
+
+**实现**：`acceptance.rs` 从原始目标编译修改、验证、构建、测试、部署、commit、push 等条件；工具轨迹转为带 digest 的证据。写操作之后必须出现覆盖对应产物的读取或全局构建/测试/Git 验证。缺证据自动补救，耗尽补救预算后保持未完成。
+
+### 18. Durable Run 与执行步骤（2026-08-21）✅
+
+**目标**：WebView 刷新、调用 future 被释放或进程异常后，任务状态仍可判断和恢复。
+
+**实现**：`agent_runs`、`run_events` 和 `execution_steps` 持久化状态、阶段、事件游标、prepared/started/finished、幂等键、checkpoint、验收和质量快照；终态不可逆，正常完成清理可重放 delta，异常终态保留诊断现场。
+
+### 19. 持久化调度与 Agent DAG（2026-08-21）✅
+
+**目标**：复杂任务不再只依赖进程内循环，主/子 Agent 的依赖、重试和完成条件可查询。
+
+**实现**：`agent_task_queue` 支持优先级、claim、退避、并发键、resume token 与 checkpoint；`agent_dag_nodes/edges` 记录父子节点、依赖条件、required、failure policy 和独立验收，根任务聚合子节点证据。
+
+### 20. 多进程 Worker 租约与 fencing（2026-08-21）✅
+
+**目标**：多开和进程崩溃时避免双重执行及旧 Owner 覆盖新结果。
+
+**实现**：每个桌面进程登记 Worker 心跳；任务 claim 生成 lease token 和递增 epoch，checkpoint/续租/终态写入均校验 Owner。仅心跳与租约同时过期时回收，并有真实进程崩溃 E2E。
+
+### 21. Tool Execution Kernel 与副作用恢复（2026-08-21）✅
+
+**目标**：工具 Worker 崩溃后，读操作可恢复，写操作不被盲目重放。
+
+**实现**：每次工具调用保存 Worker、lease、attempt、verification state 和 outcome commit；同 Run 副作用以稳定幂等键去重。读取可安全 replay，写入/命令/部署先 verify effect，无法判断时转人工确认；迟到工具结果由 fencing 拒绝。
+
+### 22. 专用 OS 执行线程与卡死归因（2026-08-21）✅
+
+**目标**：工具 panic 或永久阻塞不拖垮 Tokio 主任务池和桌面进程，并能在控制面定位。
+
+**实现**：工具 future 在命名 OS 线程中 `block_on`，panic 由 `catch_unwind` 转为结构化失败；线程 ID/名称登记到 Tool Worker。调用方超时/取消后仍运行的调用标记 stuck，后台租约扫描兜底，`stuck_tools` 进入可靠性面板。
+
+### 23. SLO、评测与可靠性控制面（2026-08-21）✅
+
+**目标**：可靠性不只依靠单元测试，而是有运行指标、故障场景和 CI 门禁。
+
+**实现**：新增 SLO policy、告警、审计、配额、质量分和评测历史；成本页显示验收率、恢复率、证据覆盖率、队列/DAG、Agent/Tool Worker 与卡死指标；CI 增加 reliability、执行内核、进程崩溃和工具线程崩溃 gate。
+
 ---
 
 ## 三、实施顺序
@@ -233,3 +275,4 @@
 | 第四批（执行循环改造） | 7 流水线钩子 + 8 后台任务协议 | ✅ |
 | 第五批（dsh 借鉴） | 9 并发调度 + 10 llm-replay + 11 jobs 状态机 + 12 压缩阈值（已存在）+ 13 subagent 约束 | ✅ |
 | 第六批（八仓库盘点） | 14 会话时间旅行 + 15 循环检测/冻结重放 + 16 记忆纠偏（+ 检索 BM25/front_page/RRF、定时提醒、跨会话引用，详见 CHANGELOG v2.2） | ✅ |
+| 第七批（商业可靠性内核） | 17 目标契约 + 18 Durable Run + 19 调度/DAG + 20 多 Worker + 21 工具恢复 + 22 专用线程 + 23 SLO/评测 | ✅ |

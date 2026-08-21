@@ -1,5 +1,6 @@
 import { Routes, Route, NavLink, useNavigate } from 'react-router-dom'
 import { lazy, Suspense, useEffect, useLayoutEffect, useState } from 'react'
+import { getVersion } from '@tauri-apps/api/app'
 import { useTranslation } from 'react-i18next'
 import Icon, { type IconName } from './icons/Icon'
 import UpdateChecker from './components/UpdateChecker'
@@ -126,6 +127,19 @@ function PageFallback() {
 function AdminLayout() {
   const { t } = useTranslation()
   const navigate = useNavigate()
+  const [appVersion, setAppVersion] = useState('2.0.0')
+
+  useEffect(() => {
+    let cancelled = false
+    getVersion()
+      .then((version) => {
+        if (!cancelled) setAppVersion(version)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   return (
     <div className="flex h-screen w-screen">
@@ -158,7 +172,7 @@ function AdminLayout() {
           ))}
         </nav>
         <div className="p-4 border-t border-[var(--border)] flex items-center justify-between">
-          <span className="text-xs text-[var(--text-secondary)]">v0.1.0</span>
+          <span className="text-xs text-[var(--text-secondary)]">v{appVersion}</span>
           <div className="flex items-center gap-1">
             <NotificationBell />
             <LangToggle />

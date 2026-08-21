@@ -14,11 +14,11 @@
 
 | 维度 | 能力 |
 |------|------|
-| 🤖 **AI Agent 内核** | 多轮对话、子 Agent 派生（spawn_agents）、任务计划（plan_task）、TodoWrite 进度跟踪、undo_edit 撤销栈、跨轮诊断记忆、ask_user 主动提问、失败反思（reflexion） |
+| 🤖 **AI Agent 内核** | Rust 后端多轮工具循环、子 Agent 派生、任务计划、TodoWrite、撤销栈、主动提问、失败反思与证据驱动验收 |
 | 📱 **鸿蒙深度集成** | hdc 设备管理 / 真机无线连接 / 模拟器启停 / hvigor 构建 / ohpm 依赖 / faultlog 崩溃归因 / hilog 实时回流 / 多模块工作区识别 |
 | 🔌 **多 Provider 路由** | 华为/智谱/通义等多家 LLM 接入 + 本地 HTTP 代理 + 熔断器 + 自动 failover + 费用追踪 + 请求日志 |
 | 📚 **API 知识库** | 内置 HarmonyOS API 索引（向量检索 + 符号索引） + 跨版本 diff + 兼容性扫描 + 用户笔记（knowledge entries） |
-| 🛡 **安全治理** | 工具调用白名单 / 工具限额（按任务组） / 任务守卫 / 预算控制 / 权限管理 / 审批拦截流水线（pre/post hooks） |
+| 🛡 **安全与可靠性** | 工具白名单 / 限额 / 预算 / 审批流水线 + 目标契约 / 持久队列 / DAG / Worker 租约 / 崩溃恢复 / SLO 与审计 |
 | 📦 **内置运行时** | 便携版 Node + JDK + Git 随安装包捆绑（构建时由 CI 从官方源自动下载），用户机器无需预装开发环境 |
 | 💬 **会话管理** | 多会话 / 上下文压缩（compact） / LLM 调用回放（llm_replay） / 事件溯源（session_events） / 会话标签 / 置顶 / 消息队列 / 任务看门狗（卡死自动 abort） / **会话时间旅行（快照回溯）** / **跨会话引用（@ 会话）** / **定时提醒（schedule）** |
 | 🧠 **代码理解** | LSP 语义级分析（ArkTS 语言服务器） + 分级扫描（check_code / deep_scan / codebase_search / get_symbol_details） / 符号索引 / 文件系统工具集 |
@@ -79,7 +79,16 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 - **工具限额**：tool_limits 按 8 个任务组（build / fix / explore / deploy / refactor / test / debug / other）限制调用次数，热门工具不再被全局压制
 - **权限管理**：permissions 模块按工具类型分级
 
-### 6. LAN 局域网访问
+### 6. 证据驱动的可靠执行
+
+- **目标契约**：从用户目标提取修改、验证、构建、测试、部署、提交和推送等必需条件；模型只能申请完成，运行内核依据真实工具证据裁决
+- **Durable Run**：任务状态、阶段、事件游标、执行步骤、检查点和验收结果写入 SQLite，WebView 刷新或进程异常后仍能判断真实终态
+- **持久化调度与 DAG**：任务队列支持优先级、租约、重试、恢复令牌和并发键；主任务与子 Agent 以 DAG 节点记录依赖、失败策略与验收结果
+- **多 Worker 防重**：桌面进程通过心跳、租约令牌和 fencing 控制写入权，过期 Worker 的迟到结果不能覆盖当前 Owner
+- **工具执行隔离**：工具调用运行在专用 OS 线程，panic 被隔离；副作用工具按幂等键、prepared/committed 状态和验证策略恢复，避免崩溃后重复执行
+- **可靠性控制面**：成本页展示 Run、队列、Worker、工具执行器、卡死调用和 SLO；内置故障场景评测及进程/线程崩溃 E2E 门禁
+
+### 7. LAN 局域网访问
 
 内置 HTML 服务（默认 `http://<本机IP>:12345/`），手机/平板/电脑浏览器直接使用：
 
@@ -88,7 +97,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 - **只读文件查看**：`read_project_file` 仅暴露项目内 ≤5MB 文本文件，任何写/删/移动操作不注册到 LAN 路由
 - 详情见 [docs/LAN_ACCESS.md](docs/LAN_ACCESS.md)
 
-### 7. 生产力工具
+### 8. 生产力工具
 
 - **命令面板**：`Cmd/Ctrl+K` 唤起，28 个高频工具 action 即时触发（调试/重构/构建/安全/知识/数据/治理/多模态）
 - **@ 引用**：输入框 `@` 引用项目文件（MRU 排序）或**同项目其他会话**（`conv:` 前缀注入标题 + 摘要）
@@ -118,14 +127,14 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 │  React 19 + TypeScript + Tailwind 4 + Vite 8        │
 │  - i18next (中/英/auto) + react-markdown + katex    │
 │  - Zustand store: project / theme / chat / memory   │
-│  - 11 pages + 1 Agent Workspace (Home)              │
+│  - 14 pages（Home 工作区 + 13 个管理页）              │
 └─────────────────────────────────────────────────────┘
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 30+ commands · 36 services · 16 agent 子模块     │
-│  - tools/ 目录：27 文件，198 个 Agent 工具           │
-│  - SQLite + 52 个迁移版本 · 事件溯源（session_events）│
+│  - 275 个 Tauri IPC 入口 · 36 个 service 模块        │
+│  - agent/ 27 个顶层模块 · tools/ 29 文件 · 198 工具  │
+│  - SQLite + 62 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -134,7 +143,18 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 
 ```
 src-tauri/src/
-├── agent/                  # AI Agent 内核（16 子模块）
+├── agent/                  # AI Agent 内核（27 个顶层模块）
+│   ├── runtime.rs           #   - Durable Run 状态机与事件游标
+│   ├── scheduler.rs         #   - 持久队列、Worker 租约与 fencing
+│   ├── coordinator.rs       #   - 执行步骤与恢复检查点
+│   ├── recovery.rs          #   - 副作用感知的恢复计划与验证要求
+│   ├── acceptance.rs        #   - 目标契约与工具证据验收
+│   ├── governance.rs        #   - 动态预算、可靠性策略与质量快照
+│   ├── dag.rs               #   - 主/子 Agent DAG 与依赖调度
+│   ├── tool_runtime.rs      #   - 工具 Worker、专用线程、租约与幂等
+│   ├── structured_result.rs #   - 工具结果 V2、产物/验证/补偿证据
+│   ├── enterprise.rs        #   - SLO、告警、审计与配额
+│   ├── evals.rs             #   - 可靠性场景评测与故障注入
 │   ├── ask.rs               #   - 主动提问（oneshot 通道）
 │   ├── jobs.rs              #   - 后台任务（kill_tree + 512KB 输出环）
 │   ├── subagents.rs         #   - 子 Agent 派生（最近 50 条）
@@ -151,7 +171,7 @@ src-tauri/src/
 │   ├── session_ctx.rs       #   - 会话级运行态（统一收敛）
 │   ├── invariants.rs         #   - 写操作不变式（.env/证书/迁移 SQL）
 │   ├── session_events.rs    #   - 会话事件溯源
-│   └── tools/               #   - 198 个 Agent 工具（27 文件）
+│   └── tools/               #   - 198 个 Agent 工具（29 文件）
 │       ├── mod.rs               # 工具注册表（TOOL_SPECS）+ 协议分发
 │       ├── protocol.rs          # 工具调用标记解析
 │       ├── errors.rs            # 结构化错误信封（ToolError 7 类）
@@ -178,9 +198,9 @@ src-tauri/src/
 │       ├── quality_metrics.rs   #   质量度量（7 工具）
 │       ├── quality_security.rs  #   安全扫描（4 工具）
 │       ├── quality_runtime.rs   #   运行时质量（6 工具）
-│       └── quality_media.rs     #   媒体质量（2 工具）
+│       ├── quality_media.rs     #   媒体质量（2 工具）
 │       └── schedule_tools.rs    # 定时提醒（schedule_create/list/delete）
-├── commands/               # Tauri command 入口（30+）
+├── commands/               # 33 个命令模块（合计 275 个 IPC 注册入口）
 ├── services/               # 业务服务（36 个）
 │   ├── proxy_service.rs    #   - 本地代理
 │   ├── circuit_breaker.rs  #   - 熔断器
@@ -194,7 +214,7 @@ src-tauri/src/
 │   ├── reminders.rs        #   - 定时提醒派发（30s 轮询）
 │   ├── harmony_*.rs        #   - 鸿蒙集成（6 文件）
 │   └── ...
-├── db/                     # SQLite + 52 个迁移
+├── db/                     # SQLite + 62 个顺序迁移
 ├── utils/                  # 工具（13 文件，含任务看门狗）
 ├── tray/                   # 系统托盘
 └── runtime/                # 内置 Node + JDK + Git（约 700MB，不入库，见下）
@@ -237,8 +257,8 @@ xattr -cr "/Applications/DevEco Switch.app"
 ## 从源码构建
 
 ```bash
-# 安装前端依赖
-npm install
+# 按锁文件安装前端依赖
+npm ci
 
 # 开发模式（热更新）
 npx tauri dev
@@ -253,7 +273,7 @@ npx tauri build
 
 ### 系统要求
 
-- **构建机**：Rust 1.75+、Node 18+、Tauri 2 依赖；打包完整版还需准备 `src-tauri/runtime/` 与 `src-tauri/resources/`（约 1GB）
+- **构建机**：Rust stable、Node 22（与 CI 基线一致）、Tauri 2 系统依赖；打包完整版还需准备 `src-tauri/runtime/` 与 `src-tauri/resources/`（约 1GB）
 - **运行机**：Windows 10+ / macOS 11+ / Ubuntu 22.04+
 
 ## 文档
@@ -269,7 +289,7 @@ npx tauri build
 - 前端入口：`src/App.tsx` + `src/pages/Home.tsx`（Agent Workspace 主界面）
 - 后端入口：`src-tauri/src/lib.rs` + `src-tauri/src/main.rs`
 - Agent 工具注册：`src-tauri/src/agent/tools/mod.rs` 的 `TOOL_SPECS` 数组
-- 数据库迁移：`src-tauri/migrations/`（52 个版本，已执行的迁移不可修改，新增请递增编号）
+- 数据库迁移：`src-tauri/migrations/`（当前 62 个，已执行的迁移不可修改，新增请递增编号）
 - 旧调试脚本：`scripts/legacy/`（仅留档，请勿引用）
 
 ## 打赏支持
