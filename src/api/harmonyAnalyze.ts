@@ -101,6 +101,32 @@ export interface HarmonyDependencyModel {
   requirement: string
   scope: string
   target_module?: string | null
+  locked_version?: string | null
+  lockfile?: string | null
+}
+
+export interface HarmonyLockfileModel {
+  path: string
+  owner_module: string
+  lockfile_version?: number | null
+  specifiers: Array<{ declared: string; locked: string }>
+  packages: Array<{
+    key: string
+    name?: string | null
+    version?: string | null
+    resolved?: string | null
+    integrity?: string | null
+    registry_type?: string | null
+    dependencies: Record<string, string>
+  }>
+}
+
+export interface HarmonyManifestSource {
+  kind: string
+  path: string
+  owner_module: string
+  status: 'parsed' | 'invalid'
+  error?: string | null
 }
 
 export interface HarmonySemanticModel {
@@ -115,6 +141,8 @@ export interface HarmonySemanticModel {
   products: HarmonyProductModel[]
   modules: HarmonyModuleModel[]
   dependencies: HarmonyDependencyModel[]
+  lockfiles: HarmonyLockfileModel[]
+  manifests: HarmonyManifestSource[]
 }
 
 /** 工程能力分析结果 */

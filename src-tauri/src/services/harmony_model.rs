@@ -25,6 +25,8 @@ pub struct HarmonySemanticModel {
     pub products: Vec<HarmonyProduct>,
     pub modules: Vec<HarmonyModule>,
     pub dependencies: Vec<HarmonyDependency>,
+    pub lockfiles: Vec<HarmonyLockfile>,
+    pub manifests: Vec<HarmonyManifestSource>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,6 +95,47 @@ pub struct HarmonyDependency {
     pub scope: String,
     /// 能解析到工作区内模块时给出目标模块路径。
     pub target_module: Option<String>,
+    /// 锁文件中解析到的精确版本；本地依赖或未锁定时为空。
+    pub locked_version: Option<String>,
+    pub lockfile: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyLockfile {
+    pub path: String,
+    pub owner_module: String,
+    pub lockfile_version: Option<i64>,
+    pub specifiers: Vec<HarmonyLockSpecifier>,
+    pub packages: Vec<HarmonyLockedPackage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyLockSpecifier {
+    pub declared: String,
+    pub locked: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyLockedPackage {
+    pub key: String,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub resolved: Option<String>,
+    pub integrity: Option<String>,
+    pub registry_type: Option<String>,
+    pub dependencies: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyManifestSource {
+    /// app / root-build-profile / module / oh-package / oh-package-lock
+    pub kind: String,
+    pub path: String,
+    /// `.` 表示工程根清单。
+    pub owner_module: String,
+    /// parsed / invalid
+    pub status: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,7 +148,7 @@ struct RootModuleDecl {
 /// 容错解析完整 HarmonyOS 工程。任一清单损坏只会使对应部分缺失，不阻断其它信息。
 pub fn parse(root: &Path) -> HarmonySemanticModel {
     let mut model = HarmonySemanticModel {
-        schema_version: 1,
+        schema_version: 2,
         ..HarmonySemanticModel::default()
     };
     model.app = parse_app(root);
@@ -120,6 +163,7 @@ pub fn parse(root: &Path) -> HarmonySemanticModel {
     if root.join("src/main/module.json5").is_file() {
         module_paths.insert(".".into());
     }
+    let manifest_paths = module_paths.iter().cloned().collect::<Vec<_>>();
 
     let declarations = declarations
         .into_iter()
@@ -134,7 +178,10 @@ pub fn parse(root: &Path) -> HarmonySemanticModel {
 
     assign_product_modules(&mut products, &model.modules);
     model.products = products;
-    model.dependencies = parse_dependencies(root, &model.modules);
+    model.lockfiles = parse_lockfiles(root, &manifest_paths);
+    model.dependencies =
+        parse_dependencies(root, &model.modules, &manifest_paths, &model.lockfiles);
+    model.manifests = collect_manifest_sources(root, &manifest_paths);
     model
 }
 
@@ -340,18 +387,121 @@ fn assign_product_modules(products: &mut [HarmonyProduct], modules: &[HarmonyMod
     }
 }
 
-fn parse_dependencies(root: &Path, modules: &[HarmonyModule]) -> Vec<HarmonyDependency> {
+fn manifest_roots(root: &Path, module_paths: &[String]) -> Vec<(String, PathBuf)> {
     let mut sources = vec![(".".to_string(), root.to_path_buf())];
-    sources.extend(modules.iter().map(|module| {
-        let dir = if module.rel_path == "." {
+    sources.extend(module_paths.iter().map(|rel_path| {
+        let dir = if rel_path == "." {
             root.to_path_buf()
         } else {
-            root.join(&module.rel_path)
+            root.join(rel_path)
         };
-        (module.rel_path.clone(), dir)
+        (rel_path.clone(), dir)
     }));
     sources.sort_by(|a, b| a.0.cmp(&b.0));
     sources.dedup_by(|a, b| a.0 == b.0);
+    sources
+}
+
+fn parse_lockfiles(root: &Path, module_paths: &[String]) -> Vec<HarmonyLockfile> {
+    let mut out = Vec::new();
+    for (owner_module, dir) in manifest_roots(root, module_paths) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(is_ohpm_lockfile)
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            let Some(value) = read_json5(&path) else {
+                continue;
+            };
+            let specifiers = value
+                .get("specifiers")
+                .and_then(|value| value.as_object())
+                .into_iter()
+                .flatten()
+                .map(|(declared, locked)| HarmonyLockSpecifier {
+                    declared: declared.clone(),
+                    locked: scalar_string(Some(locked)).unwrap_or_default(),
+                })
+                .collect();
+            let packages = value
+                .get("packages")
+                .and_then(|value| value.as_object())
+                .into_iter()
+                .flatten()
+                .map(|(key, package)| {
+                    let (derived_name, derived_version) = split_package_key(key);
+                    HarmonyLockedPackage {
+                        key: key.clone(),
+                        name: string(package, "name").or(derived_name),
+                        version: string(package, "version").or(derived_version),
+                        resolved: string(package, "resolved"),
+                        integrity: string(package, "integrity"),
+                        registry_type: string(package, "registryType"),
+                        dependencies: package
+                            .get("dependencies")
+                            .and_then(|value| value.as_object())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|(name, version)| {
+                                scalar_string(Some(version)).map(|version| (name.clone(), version))
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            out.push(HarmonyLockfile {
+                path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                owner_module: owner_module.clone(),
+                lockfile_version: value
+                    .get("lockfileVersion")
+                    .and_then(|value| value.as_i64()),
+                specifiers,
+                packages,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+fn is_ohpm_lockfile(name: &str) -> bool {
+    (name == "oh-package-lock.json5" || name == "oh-package-lock.json")
+        || name.starts_with("oh-package-") && name.ends_with("-lock.json5")
+}
+
+fn split_package_key(key: &str) -> (Option<String>, Option<String>) {
+    let Some((name, version)) = key.rsplit_once('@') else {
+        return (None, None);
+    };
+    if name.is_empty() || version.is_empty() {
+        (None, None)
+    } else {
+        (Some(name.to_string()), Some(version.to_string()))
+    }
+}
+
+fn parse_dependencies(
+    root: &Path,
+    modules: &[HarmonyModule],
+    module_paths: &[String],
+    lockfiles: &[HarmonyLockfile],
+) -> Vec<HarmonyDependency> {
+    let sources = manifest_roots(root, module_paths);
 
     let packages = modules
         .iter()
@@ -380,12 +530,16 @@ fn parse_dependencies(root: &Path, modules: &[HarmonyModule]) -> Vec<HarmonyDepe
                     local_dependency_path(root, &source_dir, &requirement)
                         .and_then(|rel| paths.get(&rel).cloned())
                 });
+                let (locked_version, lockfile) =
+                    resolve_locked_dependency(&from_module, name, &requirement, lockfiles);
                 out.push(HarmonyDependency {
                     from_module: from_module.clone(),
                     name: name.clone(),
                     requirement,
                     scope: scope.into(),
                     target_module,
+                    locked_version,
+                    lockfile,
                 });
             }
         }
@@ -394,6 +548,120 @@ fn parse_dependencies(root: &Path, modules: &[HarmonyModule]) -> Vec<HarmonyDepe
         (&a.from_module, &a.scope, &a.name).cmp(&(&b.from_module, &b.scope, &b.name))
     });
     out
+}
+
+fn resolve_locked_dependency(
+    owner_module: &str,
+    name: &str,
+    requirement: &str,
+    lockfiles: &[HarmonyLockfile],
+) -> (Option<String>, Option<String>) {
+    let declared = format!("{name}@{requirement}");
+    for lockfile in lockfiles
+        .iter()
+        .filter(|lockfile| lockfile.owner_module == owner_module)
+        .chain(
+            lockfiles
+                .iter()
+                .filter(|lockfile| lockfile.owner_module == "."),
+        )
+    {
+        let Some(specifier) = lockfile
+            .specifiers
+            .iter()
+            .find(|specifier| specifier.declared == declared)
+        else {
+            continue;
+        };
+        let version = lockfile
+            .packages
+            .iter()
+            .find(|package| package.key == specifier.locked)
+            .and_then(|package| package.version.clone())
+            .or_else(|| split_package_key(&specifier.locked).1);
+        return (version, Some(lockfile.path.clone()));
+    }
+    (None, None)
+}
+
+fn collect_manifest_sources(root: &Path, module_paths: &[String]) -> Vec<HarmonyManifestSource> {
+    let mut candidates = vec![
+        (
+            "app".to_string(),
+            ".".to_string(),
+            root.join("AppScope/app.json5"),
+        ),
+        ("app".to_string(), ".".to_string(), root.join("app.json5")),
+        (
+            "root-build-profile".to_string(),
+            ".".to_string(),
+            root.join("build-profile.json5"),
+        ),
+    ];
+    for (owner, dir) in manifest_roots(root, module_paths) {
+        candidates.push((
+            "oh-package".into(),
+            owner.clone(),
+            dir.join("oh-package.json5"),
+        ));
+        candidates.push((
+            "module".into(),
+            owner.clone(),
+            dir.join("src/main/module.json5"),
+        ));
+        if owner != "." {
+            candidates.push((
+                "module-build-profile".into(),
+                owner,
+                dir.join("build-profile.json5"),
+            ));
+        }
+    }
+    for (owner, dir) in manifest_roots(root, module_paths) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for path in entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_ohpm_lockfile)
+        }) {
+            candidates.push(("oh-package-lock".into(), owner.clone(), path));
+        }
+    }
+
+    let mut out = candidates
+        .into_iter()
+        .filter(|(_, _, path)| path.is_file())
+        .map(|(kind, owner_module, path)| manifest_source(root, &kind, &owner_module, &path))
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
+    out.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+    out
+}
+
+fn manifest_source(
+    root: &Path,
+    kind: &str,
+    owner_module: &str,
+    path: &Path,
+) -> HarmonyManifestSource {
+    let parsed = std::fs::read_to_string(path)
+        .map_err(|error| error.to_string())
+        .and_then(|text| crate::services::harmony::parse_json5(&text).map(|_| ()));
+    HarmonyManifestSource {
+        kind: kind.into(),
+        path: path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/"),
+        owner_module: owner_module.into(),
+        status: if parsed.is_ok() { "parsed" } else { "invalid" }.into(),
+        error: parsed.err(),
+    }
 }
 
 fn local_dependency_path(root: &Path, source_dir: &Path, requirement: &str) -> Option<String> {
@@ -470,7 +738,13 @@ mod tests {
     fn fixture(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("harmony-model-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for module in ["entry", "features/pay", "shared/runtime", "libs/design"] {
+        for module in [
+            "entry",
+            "features/pay",
+            "shared/runtime",
+            "libs/design",
+            "broken",
+        ] {
             std::fs::create_dir_all(root.join(module).join("src/main")).unwrap();
         }
         std::fs::create_dir_all(root.join("AppScope")).unwrap();
@@ -490,9 +764,20 @@ mod tests {
                 {"name":"entry","srcPath":"./entry","targets":[{"name":"default","applyToProducts":["default"]}]},
                 {"name":"pay","srcPath":"./features/pay"},
                 {"name":"runtime","srcPath":"./shared/runtime"},
-                {"name":"design","srcPath":"./libs/design"}
+                {"name":"design","srcPath":"./libs/design"},
+                {"name":"broken","srcPath":"./broken"}
               ]
             }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("oh-package.json5"),
+            r#"{"name":"@app/root","dependencies":{"@external/logger":"^1.2.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("oh-package-lock.json5"),
+            r#"{"meta":{"stableOrder":true},"lockfileVersion":3,"specifiers":{"@external/logger@^1.2.0":"@external/logger@1.2.4"},"packages":{"@external/logger@1.2.4":{"name":"@external/logger","version":"1.2.4","resolved":"https://example.invalid/logger.har","integrity":"sha512-test","registryType":"ohpm","dependencies":{"dayjs":"1.11.7"}}}}"#,
         )
         .unwrap();
         let manifests = [
@@ -521,6 +806,14 @@ mod tests {
             std::fs::write(root.join(path).join("src/main/module.json5"), manifest).unwrap();
             std::fs::write(root.join(path).join("oh-package.json5"), package).unwrap();
         }
+        std::fs::write(
+            root.join("entry/oh-package-default-lock.json5"),
+            r#"{"lockfileVersion":1,"specifiers":{"@app/pay@file:../features/pay":"@app/pay@1.0.0"},"packages":{"@app/pay@1.0.0":{"name":"@app/pay","version":"1.0.0","resolved":"../features/pay","registryType":"local"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("entry/oh-package-bad-lock.json5"), "{ invalid").unwrap();
+        std::fs::write(root.join("libs/design/build-profile.json5"), "{ invalid").unwrap();
+        std::fs::write(root.join("broken/src/main/module.json5"), "{ invalid").unwrap();
         root
     }
 
@@ -532,6 +825,14 @@ mod tests {
         assert_eq!(model.products.len(), 2);
         assert_eq!(model.signing_configs, vec!["release"]);
         assert_eq!(model.modules.len(), 4);
+        assert_eq!(model.lockfiles.len(), 2);
+        let root_lock = model
+            .lockfiles
+            .iter()
+            .find(|lockfile| lockfile.path == "oh-package-lock.json5")
+            .unwrap();
+        assert_eq!(root_lock.lockfile_version, Some(3));
+        assert_eq!(root_lock.packages[0].version.as_deref(), Some("1.2.4"));
         let kinds = model
             .modules
             .iter()
@@ -554,6 +855,33 @@ mod tests {
         }));
         assert!(model.dependencies.iter().any(|d| {
             d.from_module == "features/pay" && d.target_module.as_deref() == Some("shared/runtime")
+        }));
+        let external = model
+            .dependencies
+            .iter()
+            .find(|d| d.name == "@external/logger")
+            .unwrap();
+        assert_eq!(external.requirement, "^1.2.0");
+        assert_eq!(external.locked_version.as_deref(), Some("1.2.4"));
+        assert_eq!(external.lockfile.as_deref(), Some("oh-package-lock.json5"));
+        let local = model
+            .dependencies
+            .iter()
+            .find(|d| d.from_module == "entry" && d.name == "@app/pay")
+            .unwrap();
+        assert_eq!(local.locked_version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            local.lockfile.as_deref(),
+            Some("entry/oh-package-default-lock.json5")
+        );
+        assert!(model.manifests.iter().any(|source| {
+            source.path == "libs/design/build-profile.json5" && source.status == "invalid"
+        }));
+        assert!(model.manifests.iter().any(|source| {
+            source.path == "entry/oh-package-bad-lock.json5" && source.status == "invalid"
+        }));
+        assert!(model.manifests.iter().any(|source| {
+            source.path == "broken/src/main/module.json5" && source.status == "invalid"
         }));
         let default = model.products.iter().find(|p| p.name == "default").unwrap();
         assert!(default.modules.contains(&"entry".to_string()));
