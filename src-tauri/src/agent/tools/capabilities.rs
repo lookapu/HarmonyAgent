@@ -152,7 +152,18 @@ pub fn selected_tool_names_for_phase(
     limit: usize,
 ) -> Vec<&'static str> {
     use super::contracts::EffectKind;
-    let candidates = selected_tool_names(query, 64);
+    let mut candidates = selected_tool_names(query, 64);
+    if phase == TaskPhase::Verify {
+        for tool in [
+            "lsp_format", "format_file", "run_lint", "check_code", "run_tests",
+            "build_project", "build_generic", "git_diff",
+        ].into_iter().rev() {
+            if let Some(index) = candidates.iter().position(|candidate| *candidate == tool) {
+                candidates.remove(index);
+            }
+            candidates.insert(COMMON_TOOLS.len().min(candidates.len()), tool);
+        }
+    }
     let mut names = Vec::new();
     for tool in candidates {
         let contract = super::contracts::contract(tool);
@@ -161,7 +172,8 @@ pub fn selected_tool_names_for_phase(
             TaskPhase::Modify => contract.effect != EffectKind::Destructive,
             TaskPhase::Verify => contract.effect == EffectKind::Read
                 || contract.validator.is_some()
-                || matches!(tool, "edit_file" | "write_file" | "multi_edit" | "preview_edit"),
+                || matches!(tool, "edit_file" | "write_file" | "multi_edit" | "preview_edit"
+                    | "lsp_format" | "format_file" | "run_lint" | "check_code"),
             TaskPhase::Deliver => {
                 select("git delivery").iter().any(|pack| pack.id == "git_delivery" && pack.tools.contains(&tool))
                     && (contract.validator.is_some()
@@ -217,6 +229,9 @@ mod tests {
         assert!(!modify.contains(&"git_push"));
         let verify = selected_tool_names_for_phase(goal, TaskPhase::Verify, 32);
         assert!(verify.contains(&"run_tests"));
+        assert!(verify.contains(&"lsp_format"));
+        assert!(verify.contains(&"check_code"));
+        assert!(verify.contains(&"git_diff"));
         assert!(!verify.contains(&"git_push"));
         let deliver = selected_tool_names_for_phase(goal, TaskPhase::Deliver, 32);
         assert!(deliver.contains(&"git_commit"));

@@ -38,10 +38,12 @@ pub struct ExecutionLoopSnapshot {
     pub completed_evidence: usize,
     pub blockers: Vec<String>,
     pub acceptance: AcceptanceReport,
+    pub verification_plan: super::verification_planner::VerificationPlan,
 }
 
 pub fn snapshot(contract: &GoalContract, evidence: &[ToolEvidence<'_>]) -> ExecutionLoopSnapshot {
     let acceptance = super::acceptance::evaluate_contract(contract, evidence);
+    let verification_plan = super::verification_planner::plan(evidence);
     let successful = evidence.iter().filter(|item| item.succeeded).count();
     let has_plan = evidence.iter().any(|item| {
         item.succeeded && matches!(item.tool, "plan_task" | "todo_write")
@@ -99,6 +101,7 @@ pub fn snapshot(contract: &GoalContract, evidence: &[ToolEvidence<'_>]) -> Execu
         completed_evidence: successful,
         blockers: acceptance.blockers.clone(),
         acceptance,
+        verification_plan,
     }
 }
 
@@ -134,11 +137,14 @@ impl ExecutionLoopSnapshot {
         } else {
             self.blockers.join("；")
         };
+        let verification = self.verification_plan.directive()
+            .map(|value| format!("\n{value}"))
+            .unwrap_or_default();
         format!(
             "## 统一执行循环\n当前阶段：{}（工具阶段 {}）\n可验证计划：\n{}\n本阶段最小工具集：{}\n当前证据数：{}\n未通过项：{}\n规则：按 理解目标 → 可验证计划 → 最小工具集 → 执行 → 独立验证 → 验收 推进；不得用写入成功代替验证，也不得在验收未通过时宣称完成。",
             self.stage.as_str(), self.recommended_phase, plan,
             self.minimal_tools.join(", "), self.completed_evidence, blockers,
-        )
+        ) + &verification
     }
 }
 
