@@ -146,11 +146,25 @@ impl TaskPhase {
 }
 
 pub fn select(query: &str) -> Vec<&'static CapabilityPack> {
-    let query = query.to_lowercase();
+    let normalized = query.to_lowercase();
     let mut selected: Vec<&CapabilityPack> = CAPABILITY_PACKS
         .iter()
-        .filter(|pack| pack.triggers.iter().any(|trigger| query.contains(trigger)))
+        .filter(|pack| {
+            pack.triggers
+                .iter()
+                .any(|trigger| normalized.contains(trigger))
+        })
         .collect();
+    let fingerprint = crate::services::harmony_fingerprint::inspect_text(query, None);
+    if fingerprint.is_harmony() {
+        if let Some(pack) = CAPABILITY_PACKS.iter().find(|pack| {
+            pack.id == fingerprint.recommended_capability_pack
+        }) {
+            if !selected.iter().any(|selected| selected.id == pack.id) {
+                selected.insert(0, pack);
+            }
+        }
+    }
     if selected.is_empty() {
         selected.push(&PROJECT_UNDERSTANDING);
     }
@@ -263,6 +277,24 @@ mod tests {
         let delivery = selected_tool_names("提交并推送 git 交付", 40);
         assert!(delivery.contains(&"git_push"));
         assert!(delivery.len() <= 40);
+    }
+
+    #[test]
+    fn arkts_fingerprints_select_explainable_capability_packs() {
+        let source = select(
+            "import { router } from '@kit.ArkUI';\n@Entry\n@Component\nstruct Index { build() { Text('Hi') } }",
+        );
+        assert_eq!(source[0].id, "project_understanding");
+
+        let compile_log = select(
+            "ERROR: [ArkTSCheckError] ArkTS:ERROR File: entry/src/main/ets/Index.ets:8:12",
+        );
+        assert_eq!(compile_log[0].id, "compile_fix");
+
+        let native_fault = select(
+            "CppCrash /data/log/faultlog/temp/cppcrash-com.example.app SIGSEGV",
+        );
+        assert_eq!(native_fault[0].id, "device_diagnostics");
     }
 
     #[test]

@@ -1,0 +1,12 @@
+[
+  {"id":"harmony_fingerprint_project","domain":"harmony_recognition","expected":"project_with_explainable_evidence"},
+  {"id":"harmony_fingerprint_snippet","domain":"harmony_recognition","expected":"source_with_kit_style"},
+  {"id":"harmony_fingerprint_log","domain":"harmony_recognition","expected":"compile_fix_pack_from_arkts_error"},
+  {"id":"harmony_reject_generic_typescript","domain":"harmony_recognition","expected":"generic_without_false_positive"},
+  {"id":"harmony_new_project_semantics","domain":"new_project","expected":"entry_product_and_ability_resolved"},
+  {"id":"harmony_compile_api_repair","domain":"compile_repair","expected":"api_incompatibility_with_version_evidence"},
+  {"id":"harmony_cross_module_impact","domain":"cross_module_change","expected":"reverse_dependencies_verified"},
+  {"id":"harmony_native_crash_diagnosis","domain":"device_diagnosis","expected":"native_root_cause_without_arkts_guess"},
+  {"id":"harmony_mixed_workspace","domain":"workspace","expected":"nested_harmony_module_preserved"},
+  {"id":"harmony_long_session_recovery","domain":"long_session_recovery","expected":"bounded_context_and_manual_confirmation"}
+]

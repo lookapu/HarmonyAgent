@@ -35,6 +35,7 @@ mod ui_tools;
 mod web_tools;
 
 pub use errors::{ErrorLocation, is_retryable_err, structured_tool_error};
+pub(crate) use project_tools::create_harmony_project_sync;
 // 流水线钩子类型与执行入口：chat.rs 主循环/子任务循环在工具调用点构造
 // ToolInvocation 并运行 pre/post 钩子（拦截需要控制流配合：预算/黑名单 →
 // 请求总结并终止；审批拒绝 → 直接终止）；guards.rs 注册各钩子实现。
@@ -2211,6 +2212,7 @@ async fn get_project_info(args: &Value, roots: &[String]) -> Result<String, Stri
         return Err(format!("鸿蒙工程目录不存在：{}", root.display()));
     }
     let model = crate::services::harmony_model::cached(&root);
+    let fingerprint = crate::services::harmony_fingerprint::inspect_path(&root);
     let mut info = crate::services::harmony::project_summary(&root, &model);
     let pages = crate::services::harmony::routes_from_model(&model, info.entry_module.as_deref());
     let mut payload = serde_json::json!({
@@ -2225,6 +2227,7 @@ async fn get_project_info(args: &Value, roots: &[String]) -> Result<String, Stri
         "signing_configured": info.signing_configured,
         "hap_output_dir": info.hap_output_dir.take().map(|p| p.display().to_string()),
         "pages": pages,
+        "fingerprint": fingerprint,
     });
     if args["patterns"].as_bool().unwrap_or(false) {
         payload["ecosystem_analysis"] = serde_json::to_value(

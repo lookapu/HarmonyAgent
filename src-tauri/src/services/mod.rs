@@ -15,6 +15,7 @@ pub mod harmony_api_diagnosis;
 pub mod harmony_consistency;
 pub mod harmony_diagnosis;
 pub mod harmony_ecosystem_knowledge;
+pub mod harmony_fingerprint;
 pub mod harmony_model;
 pub mod harmony_migration;
 pub mod harmony_patterns;

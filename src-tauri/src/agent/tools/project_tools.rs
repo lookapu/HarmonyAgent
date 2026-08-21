@@ -14,6 +14,14 @@ use super::*;
 
 /// create_harmony_project：创建完整标准 HarmonyOS 工程（Stage 模型）。
 pub async fn create_harmony_project(args: &Value, roots: &[String]) -> Result<String, String> {
+    create_harmony_project_sync(args, roots)
+}
+
+/// 同步内核供固定评测复用；生产工具的异步入口与评测必须穿过同一实现。
+pub(crate) fn create_harmony_project_sync(
+    args: &Value,
+    roots: &[String],
+) -> Result<String, String> {
     // ---------- 参数解析 ----------
     let raw_path = args["path"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
     let root: PathBuf = match raw_path {

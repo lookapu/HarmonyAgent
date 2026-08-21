@@ -211,7 +211,7 @@ Worker 每 5 秒写心跳并回收过期 Owner。认领任务会生成 lease tok
 
 `governance.rs` 根据目标复杂度生成动态工具轮次、最长时长、补救次数、租约和模型回退策略，并在终态生成质量分。
 
-`enterprise.rs` 提供本地 tenant 的 SLO、告警、审计和配额累计；`evals.rs` 提供可靠性故障场景。成本页通过 `commands/reliability.rs` 展示：
+`enterprise.rs` 提供本地 tenant 的 SLO、告警、审计和配额累计；`evals.rs` 运行 16 个执行内核可靠性场景和 10 个鸿蒙固定任务场景，并把逐场景 expected/actual 写入评测历史。成本页通过 `commands/reliability.rs` 展示：
 
 - Run 状态和验收率；
 - 调度队列、恢复任务和 DAG 节点；
@@ -224,6 +224,7 @@ Worker 每 5 秒写心跳并回收过期 Owner。认领任务会生成 lease tok
 鸿蒙能力分布在 `services/harmony*.rs`、`agent/tools/build_tools.rs`、`device_tools.rs`、`debug_tools.rs` 和 `project_tools.rs`：
 
 - 探测 DevEco Studio、HarmonyOS SDK、command-line-tools、JDK、Node 和 Git；
+- 把工程清单、ArkTS/ArkUI、API 导入及构建/崩溃日志合并为带置信度和相对来源证据的鸿蒙指纹，供工程理解和能力包选择复用；
 - 扫描 HAP/HAR/HSP 模块、bundleName、API 版本、页面和签名配置；
 - 调用 hvigor/ohpm 构建并解析错误与产物；
 - 通过 hdc 管理设备、安装、启动、截图、日志、性能和文件；
@@ -231,7 +232,7 @@ Worker 每 5 秒写心跳并回收过期 Owner。认领任务会生成 lease tok
 - 查询内置 SDK API、官方文档、版本 diff 和兼容性；
 - 浏览 ohpm landscape 并提供依赖建议。
 
-详细规则见 `HARMONY_INTEGRATION.md`。
+详细规则见 `HARMONY_INTEGRATION.md`；指纹边界和固定评测见 `FIXED_EVALUATION_SUITE.md`。
 
 ## 11. Provider、代理与模型协议
 
@@ -243,7 +244,7 @@ Provider 和 model 保存于 SQLite，API key 通过系统钥匙串管理。会�
 
 ## 12. 数据与存储
 
-SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 68 个迁移覆盖：
+SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 74 个迁移覆盖：
 
 - Provider、模型、代理、成本和请求日志；
 - 项目、会话、消息、引用、标签、反馈和版本；
