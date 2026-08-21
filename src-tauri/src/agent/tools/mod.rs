@@ -46,6 +46,7 @@ pub use protocol::{
     sanitize_markers, sanitize_tool_output, skill_hint, split_instance_name, strip_tool_calls,
     phase_hint_for, system_hint_for, tool_short_desc, tool_schemas_for, tool_schemas_for_phase,
     tool_argument_error, validate_tool_arguments, ToolArgumentIssue,
+    phase_hint_for_names, tool_schemas_for_names,
 };
 use errors::with_advice;
 pub(crate) use errors::diagnose_tool_error;

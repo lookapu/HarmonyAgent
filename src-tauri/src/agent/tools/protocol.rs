@@ -255,6 +255,20 @@ pub fn phase_hint_for(query: &str, phase: super::capabilities::TaskPhase) -> Str
     )
 }
 
+pub fn phase_hint_for_names(
+    phase: super::capabilities::TaskPhase,
+    names: &[String],
+) -> String {
+    let specs = names.iter().filter_map(|name| {
+        TOOL_SPECS.iter().find(|spec| spec.name == name)
+    });
+    format!(
+        "当前工具阶段：{}。工具已结合历史成功率、预计成本/耗时、副作用与当前环境排序；本轮仅使用以下阶段工具。\n{}",
+        phase.as_str(),
+        system_hint_from_specs(specs),
+    )
+}
+
 fn system_hint_from_specs<'a>(specs: impl Iterator<Item = &'a super::ToolSpec>) -> String {
     let mut s = String::from(
         "你可以调用开发工具完成构建/部署等任务。需要调用工具时，在回复中单独输出一行标记（不要用 Markdown 代码块包裹，不要加解释）：\n\
@@ -638,6 +652,16 @@ pub fn tool_schemas_for_phase(
     }).collect()
 }
 
+pub fn tool_schemas_for_names(names: &[String]) -> Vec<serde_json::Value> {
+    let schemas = tool_schemas();
+    names.iter().filter_map(|name| {
+        schemas.iter().find(|schema| {
+            schema.pointer("/function/name").and_then(|value| value.as_str())
+                == Some(name.as_str())
+        }).cloned()
+    }).collect()
+}
+
 /// 参数段非严格 JSON（desc 里参数值常带中文注解）时的键名提取回退：
 /// 扫描 `"键名":` 模式（键为 ASCII 标识符），值为宽松 string schema。
 fn extract_param_keys(seg: &str) -> serde_json::Map<String, serde_json::Value> {
@@ -898,6 +922,17 @@ mod tests {
         assert!(!verify.contains(&"git_push".into()));
         assert!(deliver.contains(&"git_push".into()));
         assert!(explore.len() <= 32 && verify.len() <= 32 && deliver.len() <= 32);
+    }
+
+    #[test]
+    fn ranked_names_control_schema_and_hint_order() {
+        let names = vec!["git_status".to_string(), "read_file".to_string()];
+        let schemas = tool_schemas_for_names(&names);
+        assert_eq!(schemas[0]["function"]["name"], "git_status");
+        assert_eq!(schemas[1]["function"]["name"], "read_file");
+        let hint = phase_hint_for_names(super::super::capabilities::TaskPhase::Explore, &names);
+        assert!(hint.contains("历史成功率"));
+        assert!(hint.find("- git_status").unwrap() < hint.find("- read_file").unwrap());
     }
 
     #[test]

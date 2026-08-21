@@ -6925,15 +6925,40 @@ async fn stream_once(
         conversation_id,
         tool_query,
     );
+    let candidate_tools = crate::agent::tools::capabilities::selected_tool_names_for_phase(
+        tool_query,
+        tool_phase,
+        64,
+    );
+    let ranking = state.0.lock().ok().map(|conn| {
+        crate::agent::tool_ranking::rank_tools(
+            &conn,
+            conversation_id,
+            &candidate_tools,
+            tool_phase,
+        )
+    });
+    if let Some(ranking) = &ranking {
+        crate::utils::logger::log_event("tool_ranking", serde_json::json!({
+            "conversation_id": conversation_id,
+            "phase": tool_phase.as_str(),
+            "top": ranking.iter().take(8).collect::<Vec<_>>(),
+        }));
+    }
+    let ranked_tools = ranking.map(|items| {
+        items.into_iter().take(32).map(|rank| rank.tool).collect::<Vec<_>>()
+    }).unwrap_or_else(|| {
+        candidate_tools.into_iter().take(32).map(str::to_string).collect()
+    });
     let tool_schemas = if opts.native_tools.unwrap_or(false) && protocol == "openai" {
-        crate::agent::tools::tool_schemas_for_phase(tool_query, tool_phase)
+        crate::agent::tools::tool_schemas_for_names(&ranked_tools)
     } else {
         Vec::new()
     };
     let mut request_messages = messages.to_vec();
     request_messages.push(serde_json::json!({
         "role": "system",
-        "content": crate::agent::tools::phase_hint_for(tool_query, tool_phase),
+        "content": crate::agent::tools::phase_hint_for_names(tool_phase, &ranked_tools),
     }));
     let build_req = || {
         let tools_opt = if tool_schemas.is_empty() {
