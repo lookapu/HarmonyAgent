@@ -8168,18 +8168,8 @@ async fn run_spawn_agents(
         }
     }
 
-    // 汇总为 tool 结果反馈主 Agent
-    let total = outputs.len();
-    let mut summary = String::new();
-    for (name, r) in outputs {
-        summary.push_str(&format!("\n[子Agent完成 - {name}]\n"));
-        match r {
-            Ok(text) => summary.push_str(&text),
-            Err(e) => summary.push_str(&format!("执行失败: {e}")),
-        }
-        summary.push('\n');
-    }
-    Ok(format!("{} 个子 Agent 执行完毕：{}", total, summary))
+    // 主 Agent 只接收一个可机器解析的 V2 结果信封；启动前失败也会被规范化为错误结果。
+    Ok(crate::agent::subagents::aggregate_results(outputs))
 }
 
 /// 执行单个子 Agent：取消检查 → chat-agent-start 事件 → run_subagent →
@@ -8218,6 +8208,12 @@ async fn run_one_subagent_emitted(
     let t0 = std::time::Instant::now();
     let run_id = app.state::<TaskRegistry>().run_id(conversation_id);
     let child_contract = crate::agent::acceptance::GoalContract::compile(prompt);
+    let delegation = crate::agent::subagents::DelegatedTaskContractV2::new(
+        child_contract.clone(),
+        path_hints,
+        limits.tool_filter.clone(),
+        limits.max_depth.unwrap_or(0),
+    );
     let child_budget = crate::agent::governance::ExecutionBudget::for_contract(&child_contract, 0);
     let (node_id, child_run_id) = match state.0.lock() {
         Ok(conn) => match crate::agent::dag::begin_child(
@@ -8231,7 +8227,13 @@ async fn run_one_subagent_emitted(
             &child_contract,
             &child_budget,
         ) {
-            Ok(ids) => ids,
+            Ok(ids) => {
+                let _ = conn.execute(
+                    "UPDATE agent_runs SET metadata_json=?1 WHERE run_id=?2",
+                    rusqlite::params![serde_json::to_string(&delegation).unwrap_or_default(), ids.1],
+                );
+                ids
+            },
             Err(error) => return (name.to_string(), Err(format!("子 Agent 持久化启动失败：{error}"))),
         },
         Err(error) => return (name.to_string(), Err(format!("子 Agent 数据库锁失败：{error}"))),
@@ -8262,8 +8264,11 @@ async fn run_one_subagent_emitted(
         approval,
         approval_mode,
         &child_run_id,
+        &delegation,
     )
     .await;
+    let raw_succeeded = r.is_ok();
+    let mut structured_result = None;
     if let Ok(conn) = state.0.lock() {
         let report = crate::agent::dag::evaluate_run(&conn, &child_run_id, &child_contract)
             .unwrap_or_else(|_| crate::agent::acceptance::evaluate_contract(&child_contract, &[]));
@@ -8272,7 +8277,14 @@ async fn run_one_subagent_emitted(
         let _ = crate::agent::dag::finish_child(
             &conn, &run_id, conversation_id, &node_id, &child_run_id, &report, output, error,
         );
+        structured_result = Some(crate::agent::subagents::build_result(
+            &conn, name, &child_run_id, &report, output, error,
+        ));
     }
+    let r = structured_result
+        .and_then(|result| serde_json::to_string(&result).ok())
+        .map(|encoded| if raw_succeeded { Ok(encoded) } else { Err(encoded) })
+        .unwrap_or(r);
     let _ = app.emit(
         "chat-agent-done",
         ChatAgentDoneEvent {
@@ -8437,6 +8449,7 @@ async fn run_subagent(
     _approval: &tauri::State<'_, ToolApprovalState>,
     approval_mode: &str,
     child_run_id: &str,
+    delegation: &crate::agent::subagents::DelegatedTaskContractV2,
 ) -> Result<String, String> {
     let sub_contract = crate::agent::acceptance::GoalContract::compile(prompt);
     let sub_budget = crate::agent::governance::ExecutionBudget::for_contract(&sub_contract, 0);
@@ -8446,6 +8459,7 @@ async fn run_subagent(
         crate::agent::tools::system_hint_for(prompt)
     );
     system = format!("{system}\n\n{}", sub_contract.directive());
+    system = format!("{system}\n\n{}", delegation.directive());
     // 委派约束注入：角色约束 → 工具白名单 → 嵌套委派限制（模型能自省，过滤兜底）
     if let Some(p) = limits.persona.as_deref().filter(|p| !p.trim().is_empty()) {
         system = format!("{system}\n\n你被委派方指定了角色约束，请严格遵守：{p}");
