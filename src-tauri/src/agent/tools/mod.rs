@@ -924,7 +924,7 @@ name: "ask_history",
     },
     ToolSpec {
         name: "compose",
-        desc: "组合链执行：把多个工具按顺序串成一条链一次跑完（每步输出成功/失败与结果摘要）。\n参数：{\"chain\":\"build_and_deploy|smoke|test_and_report\"}（预置链）或 {\"steps\":[{\"tool\":\"<工具名>\",\"args\":{...},\"fallback\":\"<可选备选工具>\",\"fallback_args\":{...}},...],\"stop_on_error\":<可选缺省 true>}（自定义）；链级参数（如 device）自动合并进每一步；步骤可声明 fallback，主工具失败时自动执行备选工具并把失败原因一并返回。\n适合：固定套路（先构建再部署、先测试再出报告）不想分步调用时；想观察中间结果建议分步调用。\n副作用：等于链内各工具副作用之和。\n返回：每步结果（输出截断）+ 总结论。",
+        desc: "组合链执行：把多个工具按顺序串成一条可检查点恢复的逻辑事务。\n参数：{\"chain\":\"build_and_deploy|smoke|test_and_report\"}（预置链）或 {\"steps\":[{\"tool\":\"<工具名>\",\"args\":{...},\"fallback\":\"<可选降级工具>\",\"fallback_args\":{...},\"compensate\":{\"tool\":\"<可选补偿工具>\",\"args\":{...}}},...],\"stop_on_error\":<可选缺省 true>,\"transaction\":<可选，多步缺省 true>,\"rollback_on_error\":<可选，缺省同 transaction>}（自定义）。\n每个成功步骤写 Durable checkpoint；主工具失败可切换 fallback；事务失败时显式补偿按成功步骤逆序执行，未声明补偿的副作用会列为人工恢复项。禁止嵌套组合工具。\n适合：构建部署、测试报告等多步固定流程。\n副作用：等于链内工具与补偿动作副作用之和；逻辑事务不承诺外部系统原子性。\n返回：事务 ID、逐步结果、checkpoint、降级/补偿与未恢复清单；任一步未处理失败则整体返回失败。",
     },
     // ---- 多模态/密钥域（media_tools）----
     ToolSpec {

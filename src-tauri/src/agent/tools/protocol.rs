@@ -447,6 +447,13 @@ fn parameter_map(seg: &str) -> serde_json::Map<String, serde_json::Value> {
         .unwrap_or_else(|_| extract_param_keys(seg))
 }
 
+pub(crate) fn declared_parameter_names(tool: &str) -> Vec<String> {
+    TOOL_SPECS.iter().find(|spec| spec.name == tool)
+        .map(|spec| parameter_map(&parameter_segment(spec.desc)).into_iter()
+            .map(|(key, _)| key).collect())
+        .unwrap_or_default()
+}
+
 fn required_parameter_keys(seg: &str, keys: impl Iterator<Item = String>) -> Vec<String> {
     keys.filter(|key| {
         let marker = format!("\"{key}\"");
