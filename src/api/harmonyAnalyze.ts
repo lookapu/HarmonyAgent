@@ -213,6 +213,24 @@ export interface HarmonyModelUpdate {
   model: HarmonySemanticModel
 }
 
+export interface HarmonyImpactAnalysis {
+  mode: 'incremental' | 'full'
+  changed_files: string[]
+  direct_modules: string[]
+  affected_modules: string[]
+  verification: {
+    modules: string[]
+    products: string[]
+    checks: string[]
+  }
+  traces: Array<{
+    module: string
+    kind: 'direct' | 'dependency' | 'import' | 'project_structure'
+    source: string
+    depends_on?: string | null
+  }>
+}
+
 /** 工程能力分析结果 */
 export interface ProjectCapability {
   project: ProjectBasic
@@ -231,6 +249,10 @@ export const analyzeBuildErrors = (projectPath: string) =>
 /** 盘点工程能力（模块 / Kit 使用 / 权限 / 依赖 / 最近构建错误） */
 export const analyzeHarmonyProject = (projectPath: string) =>
   invokeWithError<ProjectCapability>('analyze_harmony_project', { projectPath })
+
+/** 预览文件变化对模块、产品与验证项的传播范围，不修改工程文件。 */
+export const analyzeHarmonyImpact = (projectPath: string, changedFiles: string[]) =>
+  invokeWithError<HarmonyImpactAnalysis>('analyze_harmony_impact', { projectPath, changedFiles })
 
 /** 通用工程概览：识别非鸿蒙工程类型（Node/Go/Rust/Python/Java/C/C++/Flutter/.NET 等） */
 export const analyzeGenericProject = (projectPath: string) =>

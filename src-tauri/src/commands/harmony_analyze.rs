@@ -87,16 +87,32 @@ fn parse_oh_deps(root: &Path, module_rel: &str) -> Vec<OhpmDep> {
     let Ok(v) = crate::services::harmony::parse_json5(&text) else {
         return out;
     };
-    let push = |out: &mut Vec<OhpmDep>, obj: Option<&serde_json::Value>, dev: bool, module: String| {
-        if let Some(o) = obj.and_then(|x| x.as_object()) {
-            for (name, ver) in o {
-                let version = ver.as_str().map(String::from).unwrap_or_default();
-                out.push(OhpmDep { name: name.clone(), version, dev, module: module.clone() });
+    let push =
+        |out: &mut Vec<OhpmDep>, obj: Option<&serde_json::Value>, dev: bool, module: String| {
+            if let Some(o) = obj.and_then(|x| x.as_object()) {
+                for (name, ver) in o {
+                    let version = ver.as_str().map(String::from).unwrap_or_default();
+                    out.push(OhpmDep {
+                        name: name.clone(),
+                        version,
+                        dev,
+                        module: module.clone(),
+                    });
+                }
             }
-        }
-    };
-    push(&mut out, v.get("dependencies"), false, module_rel.to_string());
-    push(&mut out, v.get("devDependencies"), true, module_rel.to_string());
+        };
+    push(
+        &mut out,
+        v.get("dependencies"),
+        false,
+        module_rel.to_string(),
+    );
+    push(
+        &mut out,
+        v.get("devDependencies"),
+        true,
+        module_rel.to_string(),
+    );
     out
 }
 
@@ -105,7 +121,9 @@ fn scan_kits_in_dir(dir: &Path, out: &mut Vec<String>, budget: &mut usize) {
     if *budget == 0 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         if *budget == 0 {
             return;
@@ -116,7 +134,14 @@ fn scan_kits_in_dir(dir: &Path, out: &mut Vec<String>, budget: &mut usize) {
             // 跳过依赖/构建产物/隐藏目录
             if matches!(
                 name,
-                "oh_modules" | "node_modules" | ".ohpm" | "build" | ".hvigor" | ".git" | ".idea" | "Pods"
+                "oh_modules"
+                    | "node_modules"
+                    | ".ohpm"
+                    | "build"
+                    | ".hvigor"
+                    | ".git"
+                    | ".idea"
+                    | "Pods"
             ) {
                 continue;
             }
@@ -146,12 +171,18 @@ fn scan_kits_in_dir(dir: &Path, out: &mut Vec<String>, budget: &mut usize) {
 /// 取最新构建日志内容（无则空串）
 fn latest_build_log(project_path: &str) -> String {
     let log_dir = crate::agent::exec_ctx::log_dir(project_path);
-    let Ok(rd) = std::fs::read_dir(&log_dir) else { return String::new() };
+    let Ok(rd) = std::fs::read_dir(&log_dir) else {
+        return String::new();
+    };
     let mut logs: Vec<_> = rd
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("build-"))
         .collect();
-    logs.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH));
+    logs.sort_by_key(|e| {
+        e.metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
     logs.last()
         .and_then(|e| std::fs::read_to_string(e.path()).ok())
         .unwrap_or_default()
@@ -202,7 +233,8 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
 
     let mut modules = Vec::new();
     let mut kit_usage: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut perm_map: std::collections::HashMap<String, PermissionInfo> = std::collections::HashMap::new();
+    let mut perm_map: std::collections::HashMap<String, PermissionInfo> =
+        std::collections::HashMap::new();
     let mut dep_map: std::collections::HashMap<(String, String, String), OhpmDep> =
         std::collections::HashMap::new();
     for dependency in &semantic_model.dependencies {
@@ -222,7 +254,11 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
     }
 
     for rel in &module_rels {
-        let module_root = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
+        let module_root = if rel.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(rel)
+        };
         let model_rel = if rel.is_empty() { "." } else { rel.as_str() };
         let model_module = semantic_model
             .modules
@@ -259,7 +295,11 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
             })
             .collect();
         modules.push(ModuleCapability {
-            rel_path: if rel.is_empty() { ".".to_string() } else { rel.clone() },
+            rel_path: if rel.is_empty() {
+                ".".to_string()
+            } else {
+                rel.clone()
+            },
             kind: model_module.kind.clone(),
             device_types: model_module.device_types.clone(),
             main_element: model_module.main_element.clone(),
@@ -281,7 +321,8 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
     let mut deps: Vec<OhpmDep> = dep_map.into_values().collect();
     deps.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let build_errors = crate::services::harmony::parse_build_errors(&latest_build_log(&project_path));
+    let build_errors =
+        crate::services::harmony::parse_build_errors(&latest_build_log(&project_path));
 
     Ok(ProjectCapability {
         project,
@@ -292,6 +333,27 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
         deps,
         build_errors,
     })
+}
+
+/// 基于当前统一语义模型预览文件变化的模块传播与建议验证范围。
+#[tauri::command]
+pub fn analyze_harmony_impact(
+    project_path: String,
+    changed_files: Vec<String>,
+) -> Result<crate::services::harmony_model::HarmonyImpactAnalysis, String> {
+    let root = Path::new(&project_path);
+    if !root.is_dir() {
+        return Err(format!("项目目录不存在：{project_path}"));
+    }
+    if changed_files.is_empty() {
+        return Err("请至少提供一个变更文件".into());
+    }
+    let model = crate::services::harmony_model::cached(root);
+    Ok(crate::services::harmony_model::analyze_impact(
+        root,
+        &model,
+        &changed_files,
+    ))
 }
 
 /// ohpm 依赖版本核对：声明的版本约束 vs oh_modules 中实际安装的版本
@@ -345,8 +407,12 @@ pub fn check_ohpm_deps(project_path: String) -> Result<Vec<OhpmDepCheck>, String
 fn scan_installed_versions(root: &Path) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let mut scan_one = |dir: &std::path::PathBuf| {
-        let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else { return };
-        let Ok(v) = crate::services::harmony::parse_json5(&text) else { return };
+        let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else {
+            return;
+        };
+        let Ok(v) = crate::services::harmony::parse_json5(&text) else {
+            return;
+        };
         if let (Some(n), Some(ver)) = (
             v.get("name").and_then(|x| x.as_str()),
             v.get("version").and_then(|x| x.as_str()),
@@ -368,7 +434,9 @@ fn scan_installed_versions(root: &Path) -> std::collections::HashMap<String, Str
         }
     }
     for om in om_dirs {
-        let Ok(rd) = std::fs::read_dir(&om) else { continue };
+        let Ok(rd) = std::fs::read_dir(&om) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if !p.is_dir() {
@@ -399,7 +467,8 @@ pub async fn run_ohpm_install(project_path: String) -> Result<String, String> {
     if !root.is_dir() {
         return Err(format!("项目目录不存在：{}", root.display()));
     }
-    let mut cmd = crate::utils::process::command("ohpm", &["install".to_string(), "--all".to_string()])?;
+    let mut cmd =
+        crate::utils::process::command("ohpm", &["install".to_string(), "--all".to_string()])?;
     cmd.current_dir(&root);
     cmd.kill_on_drop(true);
     let out = cmd
@@ -474,16 +543,40 @@ mod tests {
         assert_eq!(cap.modules.len(), 1);
         let entry = cap.modules.iter().find(|m| m.rel_path == "entry").unwrap();
         assert_eq!(entry.kind, "entry");
-        assert_eq!(entry.device_types, vec!["phone".to_string(), "tablet".to_string()]);
+        assert_eq!(
+            entry.device_types,
+            vec!["phone".to_string(), "tablet".to_string()]
+        );
         assert!(entry.kits.iter().any(|k| k == "@kit.ArkUI"));
         assert!(entry.kits.iter().any(|k| k == "@kit.CameraKit"));
-        assert!(entry.permissions.iter().any(|p| p.name == "ohos.permission.CAMERA"));
+        assert!(entry
+            .permissions
+            .iter()
+            .any(|p| p.name == "ohos.permission.CAMERA"));
         assert!(entry.deps.iter().any(|d| d.name == "@ohos/router"));
         // 聚合权限/依赖/Kit
-        assert!(cap.permissions.iter().any(|p| p.name == "ohos.permission.CAMERA"));
-        assert!(cap.deps.iter().any(|d| d.name == "@ohos/video_processing" && !d.dev));
+        assert!(cap
+            .permissions
+            .iter()
+            .any(|p| p.name == "ohos.permission.CAMERA"));
+        assert!(cap
+            .deps
+            .iter()
+            .any(|d| d.name == "@ohos/video_processing" && !d.dev));
         assert!(cap.deps.iter().any(|d| d.name == "@ohos/lottie" && d.dev));
-        assert!(cap.kit_usage.iter().any(|k| k.kit == "@kit.ArkUI" && k.count >= 1));
+        assert!(cap
+            .kit_usage
+            .iter()
+            .any(|k| k.kit == "@kit.ArkUI" && k.count >= 1));
+        let impact = analyze_harmony_impact(
+            dir.display().to_string(),
+            vec!["entry/src/main/ets/Index.ets".into()],
+        )
+        .unwrap();
+        assert_eq!(impact.mode, "incremental");
+        assert_eq!(impact.direct_modules, vec!["entry"]);
+        assert!(impact.verification.checks.contains(&"lint".to_string()));
+        assert!(analyze_harmony_impact(dir.display().to_string(), Vec::new()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

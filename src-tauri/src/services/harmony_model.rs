@@ -237,6 +237,25 @@ pub struct HarmonyVerificationScope {
     pub checks: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyImpactAnalysis {
+    pub mode: String,
+    pub changed_files: Vec<String>,
+    pub direct_modules: Vec<String>,
+    pub affected_modules: Vec<String>,
+    pub verification: HarmonyVerificationScope,
+    pub traces: Vec<HarmonyImpactTrace>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyImpactTrace {
+    pub module: String,
+    /// direct / dependency / import / project_structure
+    pub kind: String,
+    pub source: String,
+    pub depends_on: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct RootModuleDecl {
     name: String,
@@ -325,6 +344,126 @@ pub fn invalidate_files(root: &Path, changed_files: &[String]) -> HarmonyModelUp
     };
     cache.insert(key, update.model.clone());
     update
+}
+
+/// 预览一组文件变化的传播范围，不读取或修改文件，也不改变模型缓存。
+pub fn analyze_impact(
+    root: &Path,
+    model: &HarmonySemanticModel,
+    changed_files: &[String],
+) -> HarmonyImpactAnalysis {
+    let changed_files = changed_files
+        .iter()
+        .map(|path| normalize_changed_path(root, path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let owners = changed_files
+        .iter()
+        .map(|path| owning_module(path, &model.modules))
+        .collect::<Vec<_>>();
+    let structural = changed_files.iter().any(|path| {
+        matches!(
+            path.as_str(),
+            "build-profile.json5" | "AppScope/app.json5" | "app.json5"
+        ) || (path.ends_with("module.json5")
+            || path.ends_with("build-profile.json5")
+            || path.ends_with("oh-package.json5"))
+            && owning_module(path, &model.modules).is_none()
+    });
+    if structural {
+        let affected_modules = model
+            .modules
+            .iter()
+            .map(|module| module.rel_path.clone())
+            .collect::<Vec<_>>();
+        let source = changed_files.join(", ");
+        return HarmonyImpactAnalysis {
+            mode: "full".into(),
+            direct_modules: Vec::new(),
+            traces: affected_modules
+                .iter()
+                .map(|module| HarmonyImpactTrace {
+                    module: module.clone(),
+                    kind: "project_structure".into(),
+                    source: source.clone(),
+                    depends_on: None,
+                })
+                .collect(),
+            verification: verification_scope(model, &affected_modules, &changed_files),
+            changed_files,
+            affected_modules,
+        };
+    }
+
+    let direct_modules = owners.into_iter().flatten().collect::<BTreeSet<_>>();
+    let mut traces = BTreeMap::<String, HarmonyImpactTrace>::new();
+    for (file, module) in changed_files
+        .iter()
+        .filter_map(|file| owning_module(file, &model.modules).map(|module| (file, module)))
+    {
+        traces.entry(module.clone()).or_insert(HarmonyImpactTrace {
+            module,
+            kind: "direct".into(),
+            source: file.clone(),
+            depends_on: None,
+        });
+    }
+    let mut affected = direct_modules.clone();
+    loop {
+        let before = affected.len();
+        for dependency in &model.dependencies {
+            let Some(target) = &dependency.target_module else {
+                continue;
+            };
+            if affected.contains(target) && !affected.contains(&dependency.from_module) {
+                let module = dependency.from_module.clone();
+                affected.insert(module.clone());
+                traces.insert(
+                    module.clone(),
+                    HarmonyImpactTrace {
+                        module,
+                        kind: "dependency".into(),
+                        source: if dependency.from_module == "." {
+                            "oh-package.json5".into()
+                        } else {
+                            format!("{}/oh-package.json5", dependency.from_module)
+                        },
+                        depends_on: Some(target.clone()),
+                    },
+                );
+            }
+        }
+        for reference in &model.graph.cross_module_refs {
+            if affected.contains(&reference.to_module) && !affected.contains(&reference.from_module)
+            {
+                let module = reference.from_module.clone();
+                affected.insert(module.clone());
+                traces.insert(
+                    module.clone(),
+                    HarmonyImpactTrace {
+                        module,
+                        kind: "import".into(),
+                        source: format!("{}:{}", reference.source_file, reference.line),
+                        depends_on: Some(reference.to_module.clone()),
+                    },
+                );
+            }
+        }
+        if affected.len() == before {
+            break;
+        }
+    }
+    let affected_modules = affected.into_iter().collect::<Vec<_>>();
+    let verification = verification_scope(model, &affected_modules, &changed_files);
+    HarmonyImpactAnalysis {
+        mode: "incremental".into(),
+        changed_files,
+        direct_modules: direct_modules.into_iter().collect(),
+        verification,
+        affected_modules,
+        traces: traces.into_values().collect(),
+    }
 }
 
 /// 按文件变化增量刷新模型，并沿声明依赖与真实 import 反向计算验证范围。
@@ -1798,6 +1937,28 @@ mod tests {
         let legacy_routes = crate::services::harmony::routes_from_model(&model, Some("entry"));
         assert!(legacy_routes.contains(&"pages/Index".to_string()));
         assert!(legacy_routes.contains(&"pages/PayPage".to_string()));
+
+        let impact = analyze_impact(&root, &model, &["features/pay/src/main/ets/Pay.ets".into()]);
+        assert_eq!(impact.mode, "incremental");
+        assert_eq!(impact.direct_modules, vec!["features/pay"]);
+        assert!(impact.affected_modules.contains(&"entry".to_string()));
+        assert!(impact
+            .verification
+            .products
+            .contains(&"default".to_string()));
+        assert!(impact.verification.checks.contains(&"build".to_string()));
+        assert!(impact.verification.checks.contains(&"lint".to_string()));
+        assert!(impact.traces.iter().any(|trace| {
+            trace.module == "entry"
+                && trace.depends_on.as_deref() == Some("features/pay")
+                && (trace.kind == "dependency" || trace.kind == "import")
+        }));
+        let structural_impact = analyze_impact(&root, &model, &["build-profile.json5".into()]);
+        assert_eq!(structural_impact.mode, "full");
+        assert_eq!(
+            structural_impact.affected_modules.len(),
+            model.modules.len()
+        );
 
         let unchanged_runtime = serde_json::to_value(
             model

@@ -610,6 +610,7 @@ pub fn run() {
             commands::health::get_toolchain_candidates,
             commands::harmony_analyze::analyze_build_errors,
             commands::harmony_analyze::analyze_generic_project,
+            commands::harmony_analyze::analyze_harmony_impact,
             commands::harmony_analyze::analyze_harmony_project,
             commands::harmony_analyze::check_ohpm_deps,
             commands::harmony_analyze::run_ohpm_install,

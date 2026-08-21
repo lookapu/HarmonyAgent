@@ -57,6 +57,17 @@ OHPM 锁文件兼容常见 v1/v3 的 `specifiers` + `packages` 结构，也识�
 
 增量结果使用独立的 `HarmonyModelUpdate` 信封，包含 `mode`、`changed_files`、`affected_modules`、`verification` 和更新后的 `model`。语义模型自身字段未变化，因此 schema 仍为 v4。
 
+## Workspace 概览与影响分析
+
+Workspace 的“工程分析”面板直接消费统一模型，并提供以下可追溯视图：
+
+- 产品构建矩阵展示 SDK/API、runtime OS、签名状态、参与模块及相对基线的产品差异；
+- 模块视图展示 HAP/HSP/HAR 产物类型、源码根、设备类型和 Ability/ExtensionAbility；
+- 配置与源码证据视图逐项展示解析过或损坏的清单，并汇总关系边数量，解析错误不会被隐藏；
+- “影响”页接受每行一个工程内文件路径，只预览、不写文件，返回增量或全量验证模式、受影响模块与产品、建议检查和传播证据。
+
+影响传播证据区分直接文件、OHPM 依赖、真实 import 和工程结构四类来源。每个间接模块都会指向它所依赖的已受影响模块，并保留 `oh-package.json5` 或 ArkTS/TS `file:line` 来源；因此用户可以从验证结论回溯到真实配置或源码，而不是依赖黑盒评分。
+
 ## 验证基线
 
 自动化夹具包含两个产品、四个嵌套模块、HAP/HSP/HAR 三类产物、普通 Ability、ExtensionAbility、权限 usedScene、main pages、router map、SystemCapability 检查、真实跨模块 import、两级本地依赖边、v1 targetName 锁、v3 根锁和损坏清单，并验证旧部署摘要与统一模型一致。

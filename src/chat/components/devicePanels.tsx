@@ -6,10 +6,12 @@ import { useProjectStore } from '../../stores/projectStore'
 import { getHarmonyRoot, setHarmonyProjectPath, rescanWorkspaceModules, readProjectFile, type HarmonyRootInfo } from '../../api/project'
 import {
   analyzeHarmonyProject,
+  analyzeHarmonyImpact,
   analyzeGenericProject,
   checkOhpmDeps,
   runOhpmInstall,
   type ProjectCapability,
+  type HarmonyImpactAnalysis,
   type AnalyzedBuildError,
   type OhpmDepCheck,
 } from '../../api/harmonyAnalyze'
@@ -1012,7 +1014,7 @@ export function AnalyzePanel({
   const [error, setError] = useState<string | null>(null)
   // 非鸿蒙工程（混合工作区其它子工程 / 纯其它语言工程）的通用概览文本
   const [genericOverview, setGenericOverview] = useState<string | null>(null)
-  const [sub, setSub] = useState<'errors' | 'cap' | 'deps'>('errors')
+  const [sub, setSub] = useState<'errors' | 'cap' | 'impact' | 'deps'>('errors')
   const [fixing, setFixing] = useState(false)
   // 会话"鸿蒙主工程"：混合工作区中实际进行鸿蒙开发的子工程（未配置时自动兜底）
   const [rootInfo, setRootInfo] = useState<HarmonyRootInfo | null>(null)
@@ -1023,6 +1025,10 @@ export function AnalyzePanel({
   const [depsLoading, setDepsLoading] = useState(false)
   const [installing, setInstalling] = useState(false)
   const [depsMsg, setDepsMsg] = useState<string | null>(null)
+  const [impactInput, setImpactInput] = useState('')
+  const [impact, setImpact] = useState<HarmonyImpactAnalysis | null>(null)
+  const [impactLoading, setImpactLoading] = useState(false)
+  const [impactError, setImpactError] = useState<string | null>(null)
   // 修复闭环反馈：记录 Agent 修复前的错误数，刷新后若清零则显示成功提示
   const [fixedFrom, setFixedFrom] = useState(0)
   // 记录"点击自动修复"瞬间的错误数，作为修复成功判定基准
@@ -1073,6 +1079,8 @@ export function AnalyzePanel({
     setLoading(true)
     setError(null)
     setGenericOverview(null)
+    setImpact(null)
+    setImpactError(null)
     try {
       const cap = await analyzeHarmonyProject(effPath)
       setData(cap)
@@ -1147,6 +1155,26 @@ export function AnalyzePanel({
     }
   }
 
+  const handleImpact = async () => {
+    const changedFiles = impactInput
+      .split(/[\n,]/)
+      .map((path) => path.trim())
+      .filter(Boolean)
+    if (changedFiles.length === 0) {
+      setImpactError(t('home.analyzeImpactRequired'))
+      return
+    }
+    setImpactLoading(true)
+    setImpactError(null)
+    try {
+      setImpact(await analyzeHarmonyImpact(effPath, changedFiles))
+    } catch (e) {
+      setImpactError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setImpactLoading(false)
+    }
+  }
+
   const errCount = data?.build_errors.length ?? 0
 
   // 修复闭环反馈：Agent 修复前记录的错误数 > 0，刷新后错误清零 → 显示修复成功并沉淀工程记忆
@@ -1186,6 +1214,7 @@ export function AnalyzePanel({
   const subTabs: { key: typeof sub; label: string; badge?: number; icon: IconName }[] = [
     { key: 'errors', label: t('home.analyzeErrors'), badge: errCount, icon: 'close' },
     { key: 'cap', label: t('home.analyzeCap'), icon: 'spark' },
+    { key: 'impact', label: t('home.analyzeImpact'), icon: 'git-branch' },
     { key: 'deps', label: t('home.analyzeDeps'), icon: 'package' },
   ]
 
@@ -1415,6 +1444,38 @@ export function AnalyzePanel({
                   </div>
                 </div>
 
+                {/* 产品构建矩阵：保留配置来源中的 SDK、runtimeOS、签名和模块集合 */}
+                {data.semantic_model.products.length > 0 && (
+                  <div className="rounded-lg modern-card p-2.5 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.analyzeProducts')}</span>
+                      <span className="text-[9px] font-mono text-[var(--text-muted)]">schema v{data.semantic_model.schema_version}</span>
+                    </div>
+                    {data.semantic_model.products.map((product) => (
+                      <div key={product.name} className="rounded-md border border-[var(--border)]/50 bg-[var(--bg-hover)]/40 px-2 py-1.5 space-y-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-mono text-[10.5px] text-[var(--text-secondary)] flex-1 truncate">{product.name}</span>
+                          {product.runtime_os && <span className="text-[9px] text-[var(--text-muted)]">{product.runtime_os}</span>}
+                          {product.signing_config && <span className="text-[9px] text-emerald-500">{t('home.analyzeSigned')}</span>}
+                        </div>
+                        <div className="font-mono text-[9px] text-[var(--text-muted)]">
+                          compile {product.compile_sdk_version ?? '--'} · compatible {product.compatible_sdk_version ?? '--'} · target {product.target_sdk_version ?? '--'}
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {product.modules.map((module) => (
+                            <span key={module} className="rounded bg-[var(--accent-soft)] px-1 py-0.5 font-mono text-[9px] text-[var(--accent)]">{module}</span>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {data.semantic_model.product_differences.map((difference) => (
+                      <div key={`${difference.baseline}-${difference.product}`} className="text-[9px] text-[var(--text-muted)]">
+                        {difference.product} ↔ {difference.baseline}: {difference.fields.join(', ')}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {/* 模块列表 */}
                 {data.modules.length > 0 && (
                   <div className="rounded-lg modern-card p-2.5 space-y-2">
@@ -1453,6 +1514,17 @@ export function AnalyzePanel({
                             ))}
                           </div>
                         )}
+                        {(() => {
+                          const modelModule = data.semantic_model.modules.find((module) => module.rel_path === m.rel_path)
+                          if (!modelModule) return null
+                          const abilityNames = [...modelModule.abilities, ...modelModule.extension_abilities].map((ability) => ability.name)
+                          return (
+                            <div className="pl-4 text-[9px] text-[var(--text-muted)] space-y-0.5">
+                              <div className="font-mono">{modelModule.artifact_kind.toUpperCase()} · {modelModule.src_path}</div>
+                              {abilityNames.length > 0 && <div>{t('home.analyzeAbilities')}: {abilityNames.join(', ')}</div>}
+                            </div>
+                          )
+                        })()}
                       </div>
                     ))}
                   </div>
@@ -1505,6 +1577,83 @@ export function AnalyzePanel({
                       ))}
                     </div>
                   </div>
+                )}
+
+                {/* 可追溯来源：清单状态和关系图证据 */}
+                <div className="rounded-lg modern-card p-2.5 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.analyzeSources')}</span>
+                    <span className="text-[9px] text-[var(--text-muted)]">
+                      {data.semantic_model.graph.edges.length} {t('home.analyzeEdges')}
+                    </span>
+                  </div>
+                  {data.semantic_model.manifests.map((manifest) => (
+                    <div key={`${manifest.kind}-${manifest.path}`} className="flex items-center gap-1.5 text-[9.5px]">
+                      <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${manifest.status === 'parsed' ? 'bg-emerald-500' : 'bg-[var(--danger)]'}`} />
+                      <span className="font-mono text-[var(--text-secondary)] truncate flex-1" title={manifest.path}>{manifest.path}</span>
+                      <span className="text-[var(--text-muted)]">{manifest.kind}</span>
+                    </div>
+                  ))}
+                  {data.semantic_model.manifests.some((manifest) => manifest.status === 'invalid') && (
+                    <div className="rounded bg-[var(--danger)]/5 px-1.5 py-1 text-[9px] text-[var(--danger)]">
+                      {data.semantic_model.manifests.filter((manifest) => manifest.status === 'invalid').map((manifest) => `${manifest.path}: ${manifest.error ?? 'invalid'}`).join('\n')}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ============ 子 tab：变更影响 ============ */}
+            {sub === 'impact' && (
+              <div className="space-y-2">
+                <div className="rounded-lg modern-card p-2.5 space-y-2">
+                  <div className="text-[10px] text-[var(--text-muted)]">{t('home.analyzeImpactHint')}</div>
+                  <textarea
+                    value={impactInput}
+                    onChange={(event) => setImpactInput(event.target.value)}
+                    placeholder={t('home.analyzeImpactPlaceholder')}
+                    rows={4}
+                    className="w-full resize-y rounded-md border border-[var(--border)] bg-[var(--bg-window)] px-2 py-1.5 font-mono text-[10px] text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleImpact()}
+                    disabled={impactLoading}
+                    className="h-7 w-full rounded-md bg-[var(--accent-soft)] text-[10.5px] font-medium text-[var(--accent)] disabled:opacity-50"
+                  >
+                    {impactLoading ? t('home.analyzeImpactRunning') : t('home.analyzeImpactRun')}
+                  </button>
+                  {impactError && <div className="text-[10px] text-[var(--danger)]">{impactError}</div>}
+                </div>
+                {impact && (
+                  <>
+                    <div className="rounded-lg modern-card p-2.5 space-y-1.5">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`rounded px-1.5 py-0.5 text-[9px] font-medium ${impact.mode === 'full' ? 'bg-amber-500/10 text-amber-500' : 'bg-emerald-500/10 text-emerald-500'}`}>
+                          {impact.mode === 'full' ? t('home.analyzeImpactFull') : t('home.analyzeImpactIncremental')}
+                        </span>
+                        <span className="text-[10px] text-[var(--text-muted)]">{impact.affected_modules.length} {t('home.analyzeModules')}</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {impact.verification.checks.map((check) => <span key={check} className="rounded bg-[var(--accent-soft)] px-1 py-0.5 font-mono text-[9px] text-[var(--accent)]">{check}</span>)}
+                        {impact.verification.products.map((product) => <span key={product} className="rounded bg-[var(--bg-hover)] px-1 py-0.5 font-mono text-[9px] text-[var(--text-muted)]">product:{product}</span>)}
+                      </div>
+                    </div>
+                    <div className="rounded-lg modern-card p-2.5 space-y-1.5">
+                      <div className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.analyzeImpactTrace')}</div>
+                      {impact.traces.map((trace) => (
+                        <div key={`${trace.module}-${trace.kind}`} className="rounded-md border border-[var(--border)]/50 bg-[var(--bg-hover)]/40 px-2 py-1.5">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono text-[10px] text-[var(--text-secondary)] flex-1 truncate">{trace.module}</span>
+                            <span className="text-[9px] text-[var(--accent)]">{trace.kind}</span>
+                          </div>
+                          <div className="font-mono text-[9px] text-[var(--text-muted)] break-all">
+                            {trace.depends_on ? `← ${trace.depends_on} · ` : ''}{trace.source}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
                 )}
               </div>
             )}
@@ -2160,4 +2309,3 @@ export function SymbolsPanel({
     </div>
   )
 }
-
