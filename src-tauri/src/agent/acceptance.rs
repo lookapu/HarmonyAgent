@@ -253,6 +253,14 @@ pub fn evaluate_contract(contract: &GoalContract, tool_runs: &[ToolEvidence<'_>]
             .filter(|(index, item)| item.succeeded && matches_kind(&spec.kind, item)
                 && (spec.kind != CriterionKind::Verification || last_mutation.map(|mutation| *index > mutation).unwrap_or(false)))
             .map(|(index, item)| evidence_label(index, item)).collect::<Vec<_>>();
+        if matches!(spec.kind, CriterionKind::Deploy | CriterionKind::GitCommit | CriterionKind::GitPush) {
+            evidence = crate::agent::postconditions::criterion_evidence_indices(&spec.kind, tool_runs)
+                .map(|(write, read)| vec![
+                    evidence_label(write, &tool_runs[write]),
+                    evidence_label(read, &tool_runs[read]),
+                ])
+                .unwrap_or_default();
+        }
         if spec.kind == CriterionKind::Verification {
             let after = last_mutation.map(|index| &tool_runs[index + 1..]).unwrap_or(&[]);
             let global = after.iter().enumerate().find(|(_, item)| item.succeeded && is_global_verifier(item));
@@ -332,7 +340,27 @@ mod tests {
     #[test]
     fn git_push_is_a_distinct_requirement() {
         let report = evaluate("提交并推送", &[ev("git_commit", "{}", "committed", true), ev("git_push", "{}", "rejected", false)]);
-        assert_eq!(report.blockers, vec!["提交已推送到远端"]);
+        assert_eq!(report.blockers, vec!["变更已提交", "提交已推送到远端"]);
+    }
+
+    #[test]
+    fn external_side_effects_require_later_state_reads() {
+        assert!(!evaluate("部署应用", &[ev("deploy", "{}", "installed", true)]).passed);
+        assert!(evaluate("部署应用", &[
+            ev("deploy", "{}", "installed", true),
+            ev("verify_ui", "{}", "screen ok", true),
+        ]).passed);
+        assert!(!evaluate("提交并推送", &[
+            ev("git_commit", "{}", "committed", true),
+            ev("git_status", "{}", "clean", true),
+            ev("git_push", "{}", "pushed", true),
+        ]).passed);
+        assert!(evaluate("提交并推送", &[
+            ev("git_commit", "{}", "committed", true),
+            ev("git_status", "{}", "clean", true),
+            ev("git_push", "{}", "pushed", true),
+            ev("git_status", "{}", "up to date", true),
+        ]).passed);
     }
 
     #[test]

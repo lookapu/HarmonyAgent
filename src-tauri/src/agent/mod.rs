@@ -5,6 +5,7 @@ pub mod acceptance;
 pub mod coordinator;
 pub mod context;
 pub mod interactions;
+pub mod postconditions;
 pub mod diagnostics;
 pub mod governance;
 pub mod dag;

@@ -39,11 +39,13 @@ pub struct ExecutionLoopSnapshot {
     pub blockers: Vec<String>,
     pub acceptance: AcceptanceReport,
     pub verification_plan: super::verification_planner::VerificationPlan,
+    pub pending_postconditions: Vec<super::postconditions::PendingPostcondition>,
 }
 
 pub fn snapshot(contract: &GoalContract, evidence: &[ToolEvidence<'_>]) -> ExecutionLoopSnapshot {
     let acceptance = super::acceptance::evaluate_contract(contract, evidence);
     let verification_plan = super::verification_planner::plan(evidence);
+    let pending_postconditions = super::postconditions::pending(evidence);
     let successful = evidence.iter().filter(|item| item.succeeded).count();
     let has_plan = evidence.iter().any(|item| {
         item.succeeded && matches!(item.tool, "plan_task" | "todo_write")
@@ -102,6 +104,7 @@ pub fn snapshot(contract: &GoalContract, evidence: &[ToolEvidence<'_>]) -> Execu
         blockers: acceptance.blockers.clone(),
         acceptance,
         verification_plan,
+        pending_postconditions,
     }
 }
 
@@ -140,11 +143,20 @@ impl ExecutionLoopSnapshot {
         let verification = self.verification_plan.directive()
             .map(|value| format!("\n{value}"))
             .unwrap_or_default();
+        let postconditions = if self.pending_postconditions.is_empty() {
+            String::new()
+        } else {
+            format!("\n## 副作用写后读确认\n{}\n写入返回值不能自证真实状态。",
+                self.pending_postconditions.iter().map(|item| format!(
+                    "- {}：{}；确认工具 {}",
+                    item.tool, item.reason, item.verifiers.join(" / "),
+                )).collect::<Vec<_>>().join("\n"))
+        };
         format!(
             "## 统一执行循环\n当前阶段：{}（工具阶段 {}）\n可验证计划：\n{}\n本阶段最小工具集：{}\n当前证据数：{}\n未通过项：{}\n规则：按 理解目标 → 可验证计划 → 最小工具集 → 执行 → 独立验证 → 验收 推进；不得用写入成功代替验证，也不得在验收未通过时宣称完成。",
             self.stage.as_str(), self.recommended_phase, plan,
             self.minimal_tools.join(", "), self.completed_evidence, blockers,
-        ) + &verification
+        ) + &verification + &postconditions
     }
 }
 
