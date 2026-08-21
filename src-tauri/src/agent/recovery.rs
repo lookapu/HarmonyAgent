@@ -40,6 +40,12 @@ pub struct RecoveryDecision {
     pub verification_state: String,
     pub recovery_policy: String,
     pub action: RecoveryAction,
+    /// 写入副作用所属的核验域；恢复安全门只接受同域的只读证据。
+    #[serde(default)]
+    pub evidence_domain: Option<String>,
+    /// 从原工具参数提取的目标（路径、设备、包名等）；同域证据还需命中目标。
+    #[serde(default)]
+    pub target_hints: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,6 +78,125 @@ fn action_for(step: &ExecutionStep) -> RecoveryAction {
     RecoveryAction::ResumePending
 }
 
+fn effect_domain(tool: &str) -> &'static str {
+    if tool.starts_with("git_") {
+        "git"
+    } else if tool.starts_with("db_") {
+        "database"
+    } else if tool.starts_with("secret_") {
+        "secret"
+    } else if matches!(
+        tool,
+        "edit_file"
+            | "write_file"
+            | "delete_file"
+            | "copy_file"
+            | "move_file"
+            | "multi_edit"
+            | "undo_edit"
+            | "format_file"
+            | "snippet_insert"
+            | "create_harmony_project"
+    ) {
+        "filesystem"
+    } else if tool.contains("deploy")
+        || tool.contains("install_app")
+        || tool.contains("uninstall_app")
+        || tool.contains("device")
+        || matches!(
+            tool,
+            "start_ability"
+                | "start_emulator"
+                | "create_emulator"
+                | "run_app"
+                | "stop_app"
+                | "grant_permission"
+                | "clear_app_data"
+                | "set_wifi_state"
+                | "set_airplane_mode"
+                | "set_network_condition"
+        )
+    {
+        "device"
+    } else if tool.contains("build") || tool.contains("test") || tool == "run_lint" {
+        "project_quality"
+    } else if tool.starts_with("mcp__")
+        || matches!(tool, "http_request" | "agent_publish" | "schedule_create" | "schedule_delete")
+    {
+        "external"
+    } else {
+        "project"
+    }
+}
+
+fn evidence_domains(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "read_file" | "get_file_info" | "list_dir" | "find_files" | "grep_files"
+        | "review_changes" | "codebase_search" => &["filesystem", "project"],
+        "git_status" | "git_diff" | "git_log" | "git_blame" => {
+            &["git", "filesystem", "project"]
+        }
+        "db_query" => &["database"],
+        "secret_get" | "secret_scan" => &["secret"],
+        "get_build_log" | "check_code" | "run_lint" | "run_tests" | "smoke_test" => {
+            &["project_quality", "project"]
+        }
+        "list_devices" | "get_app_info" | "get_installed_apps" | "read_runtime_logs"
+        | "search_hilog" | "verify_ui" | "dump_ui_hierarchy" | "device_perf"
+        | "dump_memory" | "dump_battery" | "check_signature" => &["device"],
+        "get_project_info" | "list_modules" | "analyze_generic_project" => &["project"],
+        _ => &[],
+    }
+}
+
+fn normalize_hint(value: &str) -> Option<String> {
+    let normalized = value.trim().replace('\\', "/").to_lowercase();
+    (!normalized.is_empty() && normalized.len() <= 1024).then_some(normalized)
+}
+
+fn extract_target_hints(raw: &str, domain: &str) -> Vec<String> {
+    if !matches!(domain, "filesystem" | "device") {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    let key = key.to_lowercase();
+                    let is_target = [
+                        "path", "file", "source", "destination", "cwd", "root", "device",
+                        "bundle", "package", "app_id",
+                    ]
+                    .iter()
+                    .any(|needle| key.contains(needle));
+                    if is_target {
+                        if let Some(value) = value.as_str().and_then(normalize_hint) {
+                            out.push(value);
+                        }
+                    } else if value.is_object() || value.is_array() {
+                        walk(value, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(&value, &mut out);
+    out.sort();
+    out.dedup();
+    out.truncate(16);
+    out
+}
+
 pub fn build_plan(
     conn: &rusqlite::Connection,
     conversation_id: &str,
@@ -94,14 +219,30 @@ pub fn build_plan(
     let decisions: Vec<RecoveryDecision> =
         crate::agent::coordinator::list_steps(conn, parent_run_id)?
             .into_iter()
-            .map(|step| RecoveryDecision {
-                action: action_for(&step),
-                step_id: step.step_id,
-                source: step.source,
-                title: step.title,
-                previous_state: step.state,
-                verification_state: step.verification_state,
-                recovery_policy: step.recovery_policy,
+            .map(|step| {
+                let domain = (step.source == "tool").then(|| effect_domain(&step.title));
+                let input = conn
+                    .query_row(
+                        "SELECT input_json FROM tool_runs WHERE id=?1",
+                        [&step.external_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                RecoveryDecision {
+                    action: action_for(&step),
+                    step_id: step.step_id,
+                    source: step.source,
+                    title: step.title,
+                    previous_state: step.state,
+                    verification_state: step.verification_state,
+                    recovery_policy: step.recovery_policy,
+                    evidence_domain: domain.map(str::to_string),
+                    target_hints: domain
+                        .map(|domain| extract_target_hints(&input, domain))
+                        .unwrap_or_default(),
+                }
             })
             .collect();
     let completed_count = decisions
@@ -149,13 +290,21 @@ pub fn directive(plan: &RecoveryPlan) -> String {
         plan.parent_run_id, plan.original_goal, plan.policy
     );
     for decision in plan.decisions.iter().take(40) {
+        let evidence = match decision.evidence_domain.as_deref() {
+            Some(domain) if !decision.target_hints.is_empty() => {
+                format!("，证据域={domain}，目标={}", decision.target_hints.join(", "))
+            }
+            Some(domain) => format!("，证据域={domain}"),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "- [{}] {}（之前={}，核验={}，策略={}）\n",
+            "- [{}] {}（之前={}，核验={}，策略={}{}）\n",
             decision.action.as_str(),
             decision.title,
             decision.previous_state,
             decision.verification_state,
             decision.recovery_policy,
+            evidence,
         ));
     }
     if plan.decisions.len() > 40 {
@@ -202,27 +351,142 @@ fn verification_block(conn: &rusqlite::Connection, run_id: &str, tool: &str) -> 
         return None;
     }
     let plan = current_plan(conn, run_id)?;
-    let needs_verification = plan
-        .decisions
-        .iter()
-        .any(|item| item.action == RecoveryAction::VerifyEffect)
-        || (plan.decisions.is_empty() && plan.policy == "verify_effects");
-    if !needs_verification {
+    let unmet = unmet_verifications(conn, run_id, &plan);
+    if unmet.is_empty() {
         return None;
     }
-    let has_read_evidence: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM execution_steps
-             WHERE run_id=?1 AND source='tool' AND effect_kind='read' AND state='completed')",
-            [run_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    (!has_read_evidence).then(|| {
-        format!(
-            "恢复安全门已阻止写入工具 {tool}：父任务存在尚未核验的写入副作用。请先调用只读工具检查文件、Git、设备或外部系统的真实状态，再根据结果继续。"
-        )
+    let details = unmet.into_iter().take(4).collect::<Vec<_>>().join("；");
+    Some(format!(
+        "恢复安全门已阻止写入工具 {tool}：仍缺少与父任务副作用匹配的只读证据（{details}）。请读取对应文件、Git、设备或外部系统的真实状态，再根据结果继续。"
+    ))
+}
+
+#[derive(Debug)]
+struct EvidenceObservation {
+    tool: String,
+    input: String,
+}
+
+fn observations(conn: &rusqlite::Connection, run_id: &str) -> Vec<EvidenceObservation> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT es.title,COALESCE(tr.input_json,'') FROM execution_steps es
+         LEFT JOIN tool_runs tr ON tr.id=es.external_id
+         WHERE es.run_id=?1 AND es.source='tool' AND es.effect_kind='read'
+           AND es.state='completed'",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map([run_id], |row| {
+        Ok(EvidenceObservation {
+            tool: row.get(0)?,
+            input: row.get(1)?,
+        })
     })
+    .ok()
+    .into_iter()
+    .flatten()
+    .filter_map(Result::ok)
+    .collect()
+}
+
+fn hints_overlap(expected: &[String], actual: &[String]) -> bool {
+    expected.is_empty()
+        || actual.iter().any(|actual| {
+            expected.iter().any(|expected| {
+                actual == expected || actual.contains(expected) || expected.contains(actual)
+            })
+        })
+}
+
+fn decision_has_evidence(decision: &RecoveryDecision, evidence: &[EvidenceObservation]) -> bool {
+    let expected_domain = decision.evidence_domain.as_deref().unwrap_or("generic");
+    evidence.iter().any(|observation| {
+        let domains = evidence_domains(&observation.tool);
+        let domain_matches = expected_domain == "generic" || domains.contains(&expected_domain);
+        domain_matches
+            && hints_overlap(
+                &decision.target_hints,
+                &extract_target_hints(&observation.input, expected_domain),
+            )
+    })
+}
+
+fn unmet_verifications(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    plan: &RecoveryPlan,
+) -> Vec<String> {
+    let evidence = observations(conn, run_id);
+    let mut unmet = plan
+        .decisions
+        .iter()
+        .filter(|item| item.action == RecoveryAction::VerifyEffect)
+        .filter(|item| !decision_has_evidence(item, &evidence))
+        .map(|item| {
+            let domain = item.evidence_domain.as_deref().unwrap_or("generic");
+            if item.target_hints.is_empty() {
+                format!("{} [{}]", item.title, domain)
+            } else {
+                format!("{} [{}: {}]", item.title, domain, item.target_hints.join(", "))
+            }
+        })
+        .collect::<Vec<_>>();
+    if plan.decisions.is_empty() && plan.policy == "verify_effects" && evidence.is_empty() {
+        unmet.push("旧版本运行缺少步骤图，需要至少一条成功的只读证据".into());
+    }
+    unmet
+}
+
+/// 成功的只读工具完成后记录核验进度，供时间线和诊断界面观察恢复安全门是否收敛。
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoveryEvidenceProgress {
+    pub run_id: String,
+    pub total_count: usize,
+    pub verified_count: usize,
+    pub remaining_count: usize,
+}
+
+pub fn record_evidence_event(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    conversation_id: &str,
+    call_id: &str,
+    tool: &str,
+) -> Option<RecoveryEvidenceProgress> {
+    if crate::agent::tools::contracts::contract(tool).effect
+        != crate::agent::tools::contracts::EffectKind::Read
+    {
+        return None;
+    }
+    let plan = current_plan(conn, run_id)?;
+    let remaining = unmet_verifications(conn, run_id, &plan);
+    let total_count = plan
+        .decisions
+        .iter()
+        .filter(|item| item.action == RecoveryAction::VerifyEffect)
+        .count()
+        .max(usize::from(plan.decisions.is_empty() && plan.policy == "verify_effects"));
+    let progress = RecoveryEvidenceProgress {
+        run_id: run_id.to_string(),
+        total_count,
+        verified_count: total_count.saturating_sub(remaining.len()),
+        remaining_count: remaining.len(),
+    };
+    let _ = crate::agent::runtime::append_event(
+        conn,
+        run_id,
+        conversation_id,
+        "recovery.evidence_recorded",
+        serde_json::json!({
+            "call_id": call_id,
+            "tool": tool,
+            "total_count": progress.total_count,
+            "verified_count": progress.verified_count,
+            "remaining_count": remaining.len(),
+            "remaining": remaining,
+        }),
+    );
+    Some(progress)
 }
 
 /// 恢复计划包含未知写入副作用时，在本 Run 至少取得一条成功的只读工具证据之前，
@@ -241,6 +505,14 @@ pub fn verification_block_global(run_id: &str, tool: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Deserialize)]
+    struct FaultScenario {
+        name: String,
+        state: String,
+        policy: String,
+        expected: String,
+    }
 
     fn conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -262,6 +534,12 @@ mod tests {
                effect_kind TEXT NOT NULL, recovery_policy TEXT NOT NULL,
                verification_state TEXT NOT NULL, result_summary TEXT, started_at INTEGER,
                updated_at INTEGER NOT NULL, finished_at INTEGER
+             );
+             CREATE TABLE tool_runs(id TEXT PRIMARY KEY,input_json TEXT);
+             CREATE TABLE run_events(
+               event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,conversation_id TEXT NOT NULL,
+               seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,
+               created_at INTEGER NOT NULL,UNIQUE(run_id,seq)
              );",
         )
         .unwrap();
@@ -336,6 +614,24 @@ mod tests {
     }
 
     #[test]
+    fn fixture_driven_fault_matrix_stays_safe() {
+        let scenarios: Vec<FaultScenario> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/recovery_fault_scenarios.json"
+        ))
+        .unwrap();
+        assert!(scenarios.len() >= 10);
+        for scenario in scenarios {
+            let actual = action_for(&step(&scenario.state, &scenario.policy));
+            assert_eq!(
+                actual.as_str(),
+                scenario.expected,
+                "fault scenario failed: {}",
+                scenario.name
+            );
+        }
+    }
+
+    #[test]
     fn plan_rejects_cross_conversation_and_completed_runs() {
         let conn = conn();
         insert_run(&conn, "foreign", "other", "interrupted");
@@ -362,6 +658,13 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO tool_runs(id,input_json) VALUES
+             ('v','{\"path\":\"src/chat.ts\"}'),
+             ('m','{\"remote\":\"origin\"}')",
+            [],
+        )
+        .unwrap();
         let plan = build_plan(&conn, "c", "parent").unwrap();
         assert_eq!(plan.policy, "manual");
         assert_eq!(plan.verification_count, 1);
@@ -380,14 +683,44 @@ mod tests {
         assert!(verification_block(&conn, "child", "read_file").is_none());
 
         conn.execute(
+            "INSERT INTO tool_runs(id,input_json) VALUES ('wrong-read','{\"path\":\"README.md\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO execution_steps
              (step_id,run_id,conversation_id,source,external_id,ordinal,title,tool_name,state,
               effect_kind,recovery_policy,verification_state,updated_at)
-             VALUES ('read','child','c','tool','r',1,'read_file','read_file','completed','read','replay','verified',2)",
+             VALUES ('wrong','child','c','tool','wrong-read',1,'read_file','read_file','completed','read','replay','verified',2)",
+            [],
+        )
+        .unwrap();
+        assert!(verification_block(&conn, "child", "edit_file").is_some());
+
+        conn.execute(
+            "INSERT INTO tool_runs(id,input_json) VALUES ('matching-read','{\"path\":\"src/chat.ts\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO execution_steps
+             (step_id,run_id,conversation_id,source,external_id,ordinal,title,tool_name,state,
+              effect_kind,recovery_policy,verification_state,updated_at)
+             VALUES ('matching','child','c','tool','matching-read',2,'read_file','read_file','completed','read','replay','verified',3)",
             [],
         )
         .unwrap();
         assert!(verification_block(&conn, "child", "edit_file").is_none());
+        record_evidence_event(&conn, "child", "c", "matching-read", "read_file");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM run_events WHERE run_id='child'
+                 AND event_type='recovery.evidence_recorded'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&payload).unwrap()["remaining_count"], 0);
     }
 
     #[test]

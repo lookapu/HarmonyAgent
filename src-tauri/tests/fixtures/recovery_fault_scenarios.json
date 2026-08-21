@@ -1,0 +1,12 @@
+[
+  { "name": "completed write is never replayed", "state": "completed", "policy": "verify", "expected": "skip_completed" },
+  { "name": "crashed read may replay", "state": "interrupted", "policy": "replay", "expected": "replay_read" },
+  { "name": "crashed write requires evidence", "state": "interrupted", "policy": "verify", "expected": "verify_effect" },
+  { "name": "crashed external action requires approval", "state": "interrupted", "policy": "manual", "expected": "await_confirmation" },
+  { "name": "failed read may retry", "state": "failed", "policy": "replay", "expected": "replay_read" },
+  { "name": "failed write may have partial effects", "state": "failed", "policy": "verify", "expected": "verify_effect" },
+  { "name": "failed external action may have partial effects", "state": "failed", "policy": "manual", "expected": "await_confirmation" },
+  { "name": "cancelled write may have partial effects", "state": "cancelled", "policy": "verify", "expected": "verify_effect" },
+  { "name": "policy block is inspected instead of replayed", "state": "blocked", "policy": "manual", "expected": "inspect_failure" },
+  { "name": "prepared operation remains pending", "state": "prepared", "policy": "verify", "expected": "resume_pending" }
+]

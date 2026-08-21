@@ -110,6 +110,8 @@ const emptyStreaming = (): StreamingState => ({
   conversationId: null,
   runId: null,
   recoveryParentRunId: null,
+  recoveryVerificationTotal: null,
+  recoveryVerificationVerified: null,
   content: '',
   reasoning: '',
   error: null,
@@ -324,8 +326,18 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   }, 30 * 1000)
 
   // ---------- 流式事件监听（全局一次性注册） ----------
-  listen<{ conversation_id: string; run_id: string }>('chat-run-started', (event) => {
-    const { conversation_id, run_id } = event.payload
+  listen<{
+    conversation_id: string
+    run_id: string
+    recovery_parent_run_id?: string | null
+    recovery_verification_total?: number | null
+  }>('chat-run-started', (event) => {
+    const {
+      conversation_id,
+      run_id,
+      recovery_parent_run_id,
+      recovery_verification_total,
+    } = event.payload
     if (terminalRunIds.get(conversation_id) === run_id) return
     // 不同代次是真正的新任务，旧墓碑不应阻挡。
     terminalRunIds.delete(conversation_id)
@@ -337,7 +349,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       if (bucket.runId && bucket.runId !== run_id) return
       // 新代次是权威边界：清除可能由已终止旧任务残留在帧队列中的增量。
       pendingStreamDeltas.delete(conversation_id)
-      setBucket(conversation_id, { runId: run_id })
+      setBucket(conversation_id, {
+        runId: run_id,
+        recoveryParentRunId: recovery_parent_run_id ?? bucket.recoveryParentRunId,
+        recoveryVerificationTotal: recovery_verification_total ?? null,
+        recoveryVerificationVerified: recovery_verification_total ? 0 : null,
+      })
       return
     }
     pendingStreamDeltas.delete(conversation_id)
@@ -347,6 +364,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       ...emptyStreaming(),
       conversationId: conversation_id,
       runId: run_id,
+      recoveryParentRunId: recovery_parent_run_id ?? null,
+      recoveryVerificationTotal: recovery_verification_total ?? null,
+      recoveryVerificationVerified: recovery_verification_total ? 0 : null,
       startedAt: Date.now(),
       lastDeltaAt: Date.now(),
     }
@@ -820,6 +840,24 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       const body = ok ? '任务已成功结束' : (output || '').slice(-160) || '请查看构建日志'
       sendNotification(ok ? titleOk : titleErr, body, ok ? 'success' : 'error').catch(() => {})
     }
+  }).catch(() => {})
+
+  listen<{
+    conversation_id: string
+    run_id: string
+    total_count: number
+    verified_count: number
+    remaining_count: number
+  }>('chat-recovery-progress', (event) => {
+    const { conversation_id, run_id, total_count, verified_count } = event.payload
+    if (!acceptsRun(conversation_id, run_id)) return
+    const bucket = get().streamings[conversation_id]
+    if (!bucket || bucket.runId !== run_id) return
+    setBucket(conversation_id, {
+      recoveryVerificationTotal: total_count,
+      recoveryVerificationVerified: verified_count,
+      lastDeltaAt: Date.now(),
+    })
   }).catch(() => {})
 
   // 任务账本推送（Ledger 协议）：每轮工具执行后实时刷新（finished=false）；任务结束时最终态
@@ -1359,16 +1397,33 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           let after = 0
           let content = ''
           let reasoning = ''
+          let recoveryVerificationTotal: number | null = null
+          let recoveryVerificationVerified: number | null = null
           for (;;) {
             const events = await getAgentRunEventsApi(run.run_id, after, 1000)
             for (const item of events) {
               after = Math.max(after, item.seq)
+              if (item.event_type === 'recovery.evidence_recorded' && item.payload && typeof item.payload === 'object') {
+                const payload = item.payload as { total_count?: unknown; verified_count?: unknown }
+                if (typeof payload.total_count === 'number') recoveryVerificationTotal = payload.total_count
+                if (typeof payload.verified_count === 'number') recoveryVerificationVerified = payload.verified_count
+              }
               if (item.event_type !== 'model.delta' || !item.payload || typeof item.payload !== 'object') continue
               const payload = item.payload as { content?: unknown; reasoning?: unknown }
               if (typeof payload.content === 'string') content += payload.content
               if (typeof payload.reasoning === 'string') reasoning += payload.reasoning
             }
             if (events.length < 1000) break
+          }
+          if (recoveryVerificationTotal === null && run.recovery_plan_json) {
+            try {
+              const plan = JSON.parse(run.recovery_plan_json) as { verification_count?: unknown; policy?: unknown }
+              const count = typeof plan.verification_count === 'number' ? plan.verification_count : 0
+              recoveryVerificationTotal = count > 0 ? count : plan.policy === 'verify_effects' ? 1 : null
+              recoveryVerificationVerified = recoveryVerificationTotal === null ? null : 0
+            } catch {
+              // 旧版本或损坏的可选恢复元数据不应阻断会话恢复。
+            }
           }
           if (get().currentConversation?.id !== id || get().streamings[id]) return
           // 首轮补拉的最大序号才是已装载边界。latest_run 与事件查询之间仍可能产生新
@@ -1443,6 +1498,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             conversationId: id,
             runId: run.run_id,
             recoveryParentRunId: run.parent_run_id,
+            recoveryVerificationTotal,
+            recoveryVerificationVerified,
             content,
             reasoning,
             startedAt: run.started_at,

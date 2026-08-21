@@ -365,6 +365,7 @@
     "recoveryVerifyPrompt": "恢复上次中断的任务。先用只读工具核验上次工具调用是否已经产生副作用，再根据真实状态继续；不要盲目重放写入操作。",
     "recoveryAffectedSteps": "上次运行的持久化步骤快照（已完成项不得重复执行）",
     "recoveryRunning": "正在安全恢复",
+    "recoveryVerifying": "正在核验 {{verified}}/{{total}}",
     "recoverSafely": "安全恢复",
     "slashSummary": "总结对话",
     "slashSummaryPrompt": "请总结本次对话的关键决策、已完成事项与遗留问题",

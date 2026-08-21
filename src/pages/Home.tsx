@@ -208,6 +208,8 @@ export default function Home() {
     messages,
     streamingConversationId,
     streamingRecoveryParentRunId,
+    streamingRecoveryVerificationTotal,
+    streamingRecoveryVerificationVerified,
     streamingError,
     streamingErrorDetail,
     toolRuns,
@@ -291,6 +293,8 @@ export default function Home() {
     messages: s.messages,
     streamingConversationId: s.streaming.conversationId,
     streamingRecoveryParentRunId: s.streaming.recoveryParentRunId,
+    streamingRecoveryVerificationTotal: s.streaming.recoveryVerificationTotal,
+    streamingRecoveryVerificationVerified: s.streaming.recoveryVerificationVerified,
     streamingError: s.streaming.error,
     streamingErrorDetail: s.streaming.errorDetail,
     toolRuns: s.toolRuns,
@@ -4691,7 +4695,12 @@ export default function Home() {
                 title={streamingRecoveryParentRunId}
               >
                 <Icon name="refresh" size={10} />
-                {t('home.recoveryRunning')}
+                {streamingRecoveryVerificationTotal
+                  ? t('home.recoveryVerifying', {
+                      verified: streamingRecoveryVerificationVerified ?? 0,
+                      total: streamingRecoveryVerificationTotal,
+                    })
+                  : t('home.recoveryRunning')}
               </span>
             )}
             {ctxInfo && currentConversation && (

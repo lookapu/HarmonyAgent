@@ -1226,6 +1226,7 @@ src/
 - `execution_steps` 将 `todo_write` 计划项与实际工具调用统一建模；工具采用 `prepared → running → terminal` 两阶段启动语义，重启时能准确区分“从未调用”和“可能已产生副作用”。WebView 重载会从该执行图恢复工具卡片，安全恢复提示会携带具体待核验步骤。
 - 恢复不是一条普通“请继续”消息：新 Run 通过 `parent_run_id / attempt / recovery_mode` 形成可审计血缘，启动时由内核从父执行图生成并持久化 `recovery_plan_json`，继承原始目标和未完成计划项。
 - 恢复计划同时约束提示层和执行层：完成项禁止重跑；存在未知写入副作用时，至少取得一条成功的只读工具证据前阻止新写入；不可重放操作即使命中 `allow_all`、会话白名单或项目白名单，也必须重新审批。旧版本缺少步骤图的 Run 继续沿用持久化的保守策略。
+- 只读证据采用语义匹配而非“任意读取即放行”：内核从父工具参数提取路径、设备、包名等目标，并按 filesystem / Git / device / database / project-quality 等证据域逐项核验；读取无关文件不能解除目标文件写入的安全门。核验进度通过 durable event 与实时 IPC 同步给界面。
 - `recovery.planned / recovery.completed / recovery.terminated` 事件让前端和审计系统能区分新任务与恢复分支；前端只在用户点击明确的安全恢复入口时发送父 Run ID，普通对话不会意外接管历史任务。
 - 模型只能“申请完成”；运行内核根据原始目标与真实的写入、构建、测试、部署证据生成验收报告，证据不足时任务保持未完成。
 - 工具权限缺省为 `auto` 分级审核；`allow_all` 必须由用户显式选择。Windows/macOS 在 PR、主分支和发布前均执行前端测试、lint、生产构建、Rust 测试与 clippy。

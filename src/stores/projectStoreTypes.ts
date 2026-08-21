@@ -30,6 +30,9 @@ export interface StreamingState {
   runId: string | null
   /** 非空表示当前任务是从该父 Run 安全恢复而来。 */
   recoveryParentRunId: string | null
+  /** 恢复副作用核验进度；没有待核验步骤时均为 null。 */
+  recoveryVerificationTotal: number | null
+  recoveryVerificationVerified: number | null
   content: string
   /** 思考过程（推理模型 reasoning 流，无则空串） */
   reasoning: string

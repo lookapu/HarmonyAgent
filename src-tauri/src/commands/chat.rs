@@ -38,6 +38,8 @@ pub struct ChatReasoningEvent {
 pub struct ChatRunStartedEvent {
     pub conversation_id: String,
     pub run_id: String,
+    pub recovery_parent_run_id: Option<String>,
+    pub recovery_verification_total: Option<usize>,
 }
 
 /// 高频模型增量批次。正文与思考在 Rust 侧先合并，再跨 Tauri IPC 发送；
@@ -2084,6 +2086,7 @@ fn mark_tool_run_started(
 /// 工具终态落库（Evaluation/审计统计来源）：有 begin 记录则原位更新；子 Agent 等
 /// 无前端 call_id 的调用直接插入终态。数据库失败不阻断主任务。
 fn finish_tool_run(
+    app: &AppHandle,
     state: &tauri::State<'_, DbState>,
     conversation_id: &str,
     trace_id: &str,
@@ -2114,6 +2117,26 @@ fn finish_tool_run(
                 status,
                 &output,
             );
+            if status == "ok" {
+                if let Some(progress) = crate::agent::recovery::record_evidence_event(
+                    &conn,
+                    trace_id,
+                    conversation_id,
+                    id,
+                    tool,
+                ) {
+                    let _ = app.emit(
+                        "chat-recovery-progress",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "run_id": progress.run_id,
+                            "total_count": progress.total_count,
+                            "verified_count": progress.verified_count,
+                            "remaining_count": progress.remaining_count,
+                        }),
+                    );
+                }
+            }
             let _ = crate::agent::runtime::append_event(
                 &conn,
                 trace_id,
@@ -2194,6 +2217,26 @@ fn finish_tool_run(
             status,
             &output,
         );
+        if status == "ok" {
+            if let Some(progress) = crate::agent::recovery::record_evidence_event(
+                &conn,
+                trace_id,
+                conversation_id,
+                &id,
+                tool,
+            ) {
+                let _ = app.emit(
+                    "chat-recovery-progress",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "run_id": progress.run_id,
+                        "total_count": progress.total_count,
+                        "verified_count": progress.verified_count,
+                        "remaining_count": progress.remaining_count,
+                    }),
+                );
+            }
+        }
         let _ = crate::agent::runtime::append_event(
             &conn,
             trace_id,
@@ -2311,6 +2354,15 @@ async fn stream_chat_inner(
         ChatRunStartedEvent {
             conversation_id: conversation_id.clone(),
             run_id: trace_id.clone(),
+            recovery_parent_run_id: recovery_plan
+                .as_ref()
+                .map(|plan| plan.parent_run_id.clone()),
+            recovery_verification_total: recovery_plan.as_ref().and_then(|plan| {
+                let count = plan.verification_count.max(usize::from(
+                    plan.decisions.is_empty() && plan.policy == "verify_effects",
+                ));
+                (count > 0).then_some(count)
+            }),
         },
     );
     // 清除该会话历史停止标志（一次性标志，避免残留影响本次请求）
@@ -4687,6 +4739,7 @@ async fn stream_chat_inner(
                         },
                     );
                     finish_tool_run(
+                        app,
                         &state,
                         &conversation_id,
                         &trace_id,
@@ -4882,6 +4935,7 @@ async fn stream_chat_inner(
                         &message,
                     );
                     finish_tool_run(
+                        app,
                         &state,
                         &conversation_id,
                         &trace_id,
@@ -4934,6 +4988,7 @@ async fn stream_chat_inner(
                         &intercept.message,
                     );
                     finish_tool_run(
+                        app,
                         &state,
                         &conversation_id,
                         &trace_id,
@@ -5064,6 +5119,7 @@ async fn stream_chat_inner(
                 Err(_) => "error",
             };
             finish_tool_run(
+                app,
                 &state,
                 &conversation_id,
                 &trace_id,
@@ -8170,6 +8226,7 @@ async fn run_subagent(
             tool_limits::record_tool_call(conversation_id, &tool, &args_raw);
             // 子 Agent 没有前端 call_id，直接插入终态审计记录并关联主任务 trace。
             finish_tool_run(
+                app,
                 state,
                 conversation_id,
                 &tool_ctx.run_id,
@@ -8446,6 +8503,7 @@ async fn execute_tool_batch_one(
             },
         );
         finish_tool_run(
+            app,
             state,
             conversation_id,
             &tool_ctx.run_id,
@@ -8522,6 +8580,7 @@ async fn execute_tool_batch_one(
         Err(e) => (false, format!("执行失败: {e}")),
     };
     finish_tool_run(
+        app,
         state,
         conversation_id,
         &tool_ctx.run_id,
