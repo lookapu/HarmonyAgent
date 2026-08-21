@@ -120,10 +120,30 @@ pub fn selected_tool_names(query: &str, limit: usize) -> Vec<&'static str> {
     for pack in select(query) {
         for tool in pack.tools {
             if names.len() >= limit { return names; }
-            if !names.contains(tool) { names.push(tool); }
+            if !names.contains(tool) && !tool_explicitly_forbidden(query, tool) {
+                names.push(tool);
+            }
         }
     }
     names
+}
+
+fn tool_explicitly_forbidden(query: &str, tool: &str) -> bool {
+    let words: &[&str] = match tool {
+        "git_push" => &["推送", "push"],
+        "git_commit" => &["提交", "commit"],
+        "deploy" | "deploy_all" | "install_app" => &["部署", "安装", "deploy"],
+        _ => return false,
+    };
+    let query = query.to_lowercase();
+    words.iter().any(|word| {
+        ["不", "不要", "不用", "无需", "暂不", "别", "禁止"]
+            .iter().any(|prefix| query.contains(&format!("{prefix}{word}")))
+            || ["不用", "不需要", "暂时不用", "先不用", "取消"]
+                .iter().any(|suffix| query.contains(&format!("{word}{suffix}")))
+            || query.contains(&format!("do not {word}"))
+            || query.contains(&format!("without {word}"))
+    })
 }
 
 pub fn selected_tool_names_for_phase(
@@ -201,5 +221,16 @@ mod tests {
         let deliver = selected_tool_names_for_phase(goal, TaskPhase::Deliver, 32);
         assert!(deliver.contains(&"git_commit"));
         assert!(deliver.contains(&"git_push"));
+    }
+
+    #[test]
+    fn explicit_negative_requirement_never_exposes_forbidden_delivery_tool() {
+        let tools = selected_tool_names_for_phase(
+            "检查、测试并提交，推送暂时不用",
+            TaskPhase::Deliver,
+            32,
+        );
+        assert!(tools.contains(&"git_commit"));
+        assert!(!tools.contains(&"git_push"));
     }
 }

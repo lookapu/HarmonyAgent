@@ -3855,6 +3855,8 @@ async fn stream_chat_inner(
     let mut unverified_claim_corrections: usize = 0;
     // 模型最近一轮输出（账本“下一步”数据源，剥离工具标记）
     let mut last_model_text = String::new();
+    // 统一执行循环当前阶段：每次变化写 Durable Run 事件并注入本轮提示。
+    let mut workflow_stage: Option<crate::agent::execution_loop::LoopStage> = None;
     // 工具循环是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾；
     // 声明在循环外：主流程据此判定任务是否被护栏强制收尾（强制收尾时账本需保留））
     let mut exhausted = false;
@@ -3889,6 +3891,30 @@ async fn stream_chat_inner(
                 "history_limit": history_limit,
             }),
         );
+        let workflow_evidence = tool_runs.iter().map(|item| {
+            crate::agent::acceptance::ToolEvidence {
+                tool: &item.tool,
+                args: &item.args,
+                output: &item.output,
+                succeeded: item.succeeded,
+            }
+        }).collect::<Vec<_>>();
+        let workflow = crate::agent::execution_loop::snapshot(
+            &goal_contract,
+            &workflow_evidence,
+        );
+        if workflow_stage != Some(workflow.stage) {
+            if let Ok(conn) = state.0.lock() {
+                let _ = crate::agent::runtime::append_event(
+                    &conn,
+                    &trace_id,
+                    &conversation_id,
+                    "workflow.stage",
+                    serde_json::to_value(&workflow).unwrap_or_default(),
+                );
+            }
+            workflow_stage = Some(workflow.stage);
+        }
         // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
         if task_started.elapsed().as_millis() as i64 > task_deadline_ms {
             crate::utils::logger::log_event(
@@ -4038,6 +4064,10 @@ async fn stream_chat_inner(
         }) {
             messages.push(serde_json::json!({ "role": "system", "content": hint }));
         }
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": workflow.directive(),
+        }));
         // 任务账本（Ledger 协议）：从工具执行轨迹派生，每轮作为 system 消息注入（状态外部化，
         // 防长任务“忘记已做过什么/卡在哪一步”）；首轮无执行轨迹时若有上次未完成任务账本
         // （断点续跑）先注入旧账本，续跑期间按新执行轨迹更新；同时构造 ledger_now 供事件推送

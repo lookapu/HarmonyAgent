@@ -10,6 +10,7 @@ pub mod governance;
 pub mod dag;
 pub mod evals;
 pub mod enterprise;
+pub mod execution_loop;
 pub mod scheduler;
 pub mod structured_result;
 pub mod tool_runtime;
