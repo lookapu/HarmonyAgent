@@ -59,6 +59,44 @@ export interface ReliabilityDashboard {
   worker_runtime: WorkerRuntimeStats
   tool_runtime: ToolRuntimeStats
   tool_governance: ToolGovernanceItem[]
+  tool_quality: ToolQualitySummary
+  tool_metric_slices: ToolMetricSlice[]
+  tool_protocol_versions: ToolProtocolVersion[]
+}
+
+export interface ToolQualitySummary {
+  total_calls: number
+  successful_calls: number
+  success_rate: number
+  argument_error_rate: number
+  timeout_rate: number
+  retry_rate: number
+  cancellation_count: number
+  average_cancellation_latency_ms: number | null
+  average_duration_ms: number
+  contributing_success_rate: number
+  side_effect_repeat_rate: number
+  wrong_tool_selection_rate: number
+  ineffective_call_rate: number
+}
+
+export interface ToolMetricSlice {
+  dimension: 'tool' | 'capability_pack' | 'model' | 'project' | 'version' | string
+  value: string
+  calls: number
+  successes: number
+  success_rate: number
+  contribution_rate: number
+  average_duration_ms: number
+}
+
+export interface ToolProtocolVersion {
+  schema_version: number
+  status: string
+  min_reader_version: number
+  producer_version: string
+  compatibility: string
+  migration_notes: string
 }
 
 export interface ToolGovernanceItem {
@@ -161,6 +199,9 @@ export interface SloPolicy {
   acceptance_target: number
   recovery_target: number
   evidence_target: number
+  max_side_effect_repeat_rate: number
+  max_wrong_tool_selection_rate: number
+  max_ineffective_call_rate: number
   max_duration_ms: number
   max_cost_cny: number | null
   updated_at: number

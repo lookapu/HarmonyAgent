@@ -40,6 +40,7 @@ export default function CostPage() {
   const [reliabilityLoading, setReliabilityLoading] = useState(false)
   const [agentAlerts, setAgentAlerts] = useState<AgentAlert[]>([])
   const [sloPolicy, setSloPolicy] = useState<SloPolicy | null>(null)
+  const [toolMetricDimension, setToolMetricDimension] = useState<'tool' | 'capability_pack' | 'model' | 'project' | 'version'>('tool')
   // 请求日志状态过滤：all / success / error
   const [logStatusFilter, setLogStatusFilter] = useState<'all' | 'success' | 'error'>('all')
   // 请求日志分页
@@ -391,6 +392,52 @@ export default function CostPage() {
           <ReliabilityValue label={t('cost.toolWorkerPanics')} value={String(reliability?.tool_runtime.worker_panics ?? 0)} />
           <ReliabilityValue label={t('cost.toolStuckTools')} value={String(reliability?.tool_runtime.stuck_tools ?? 0)} />
         </div>
+        <div className="border-t border-[var(--border)] pt-3 space-y-3">
+          <p className="text-xs text-[var(--text-secondary)]">{t('cost.toolQualityMetrics')}</p>
+          <div className="grid grid-cols-4 gap-4 text-sm">
+            <ReliabilityValue label={t('cost.toolSuccessRate')} value={`${((reliability?.tool_quality.success_rate ?? 0) * 100).toFixed(1)}%`} />
+            <ReliabilityValue label={t('cost.toolArgumentErrors')} value={`${((reliability?.tool_quality.argument_error_rate ?? 0) * 100).toFixed(1)}%`} />
+            <ReliabilityValue label={t('cost.toolTimeoutRate')} value={`${((reliability?.tool_quality.timeout_rate ?? 0) * 100).toFixed(1)}%`} />
+            <ReliabilityValue label={t('cost.toolRetryRate')} value={`${((reliability?.tool_quality.retry_rate ?? 0) * 100).toFixed(1)}%`} />
+            <ReliabilityValue label={t('cost.toolCancelLatency')} value={reliability?.tool_quality.average_cancellation_latency_ms == null ? '—' : `${reliability.tool_quality.average_cancellation_latency_ms.toFixed(0)} ms`} />
+            <ReliabilityValue label={t('cost.toolAverageDuration')} value={`${(reliability?.tool_quality.average_duration_ms ?? 0).toFixed(0)} ms`} />
+            <ReliabilityValue label={t('cost.toolContributionRate')} value={`${((reliability?.tool_quality.contributing_success_rate ?? 0) * 100).toFixed(1)}%`} />
+            <ReliabilityValue label={t('cost.toolIneffectiveRate')} value={`${((reliability?.tool_quality.ineffective_call_rate ?? 0) * 100).toFixed(1)}%`} />
+            <ReliabilityValue label={t('cost.sideEffectRepeatRate')} value={`${((reliability?.tool_quality.side_effect_repeat_rate ?? 0) * 100).toFixed(2)}%`} />
+            <ReliabilityValue label={t('cost.wrongToolSelectionRate')} value={`${((reliability?.tool_quality.wrong_tool_selection_rate ?? 0) * 100).toFixed(1)}%`} />
+          </div>
+        </div>
+        <div className="border-t border-[var(--border)] pt-3">
+          <div className="flex items-center justify-between gap-3 mb-2">
+            <p className="text-xs text-[var(--text-secondary)]">{t('cost.toolMetricComparison')}</p>
+            <select
+              value={toolMetricDimension}
+              onChange={(event) => setToolMetricDimension(event.target.value as typeof toolMetricDimension)}
+              className="h-7 rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-2 text-[11px]"
+            >
+              {(['tool', 'capability_pack', 'model', 'project', 'version'] as const).map((dimension) => (
+                <option key={dimension} value={dimension}>{t(`cost.toolDimension_${dimension}`)}</option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-1.5 max-h-48 overflow-auto">
+            {(reliability?.tool_metric_slices ?? []).filter((row) => row.dimension === toolMetricDimension).slice(0, 20).map((row) => (
+              <div key={`${row.dimension}:${row.value}`} className="grid grid-cols-[minmax(0,1fr)_70px_80px_80px] gap-2 text-[11px]">
+                <span className="truncate font-mono text-[var(--text-secondary)]" title={row.value}>{row.value}</span>
+                <span>{row.calls} {t('cost.calls')}</span>
+                <span>{(row.success_rate * 100).toFixed(1)}% {t('cost.successShort')}</span>
+                <span>{(row.contribution_rate * 100).toFixed(1)}% {t('cost.contributionShort')}</span>
+              </div>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-1.5 mt-3">
+            {(reliability?.tool_protocol_versions ?? []).map((version) => (
+              <span key={version.schema_version} className="badge-tone badge-tone-info" title={version.migration_notes}>
+                v{version.schema_version} · {version.status} · reader ≥ v{version.min_reader_version}
+              </span>
+            ))}
+          </div>
+        </div>
         <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3 text-[11px]">
           <span className="text-[var(--text-muted)]">{t('cost.schedulerStates')}</span>
           {(reliability?.scheduler_states ?? []).map((item) => (
@@ -422,7 +469,7 @@ export default function CostPage() {
         )}
         {sloPolicy?.enabled && (
           <p className="text-[10.5px] text-[var(--text-muted)]">
-            {t('cost.sloTargets', { acceptance: (sloPolicy.acceptance_target * 100).toFixed(0), recovery: (sloPolicy.recovery_target * 100).toFixed(0), evidence: (sloPolicy.evidence_target * 100).toFixed(0) })}
+            {t('cost.sloTargets', { acceptance: (sloPolicy.acceptance_target * 100).toFixed(0), recovery: (sloPolicy.recovery_target * 100).toFixed(0), evidence: (sloPolicy.evidence_target * 100).toFixed(0), repeat: (sloPolicy.max_side_effect_repeat_rate * 100).toFixed(1), wrong: (sloPolicy.max_wrong_tool_selection_rate * 100).toFixed(0), ineffective: (sloPolicy.max_ineffective_call_rate * 100).toFixed(0) })}
           </p>
         )}
         {agentAlerts.length > 0 && (

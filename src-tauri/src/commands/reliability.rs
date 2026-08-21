@@ -44,6 +44,9 @@ pub struct ReliabilityDashboard {
     pub worker_runtime: crate::agent::scheduler::WorkerRuntimeStats,
     pub tool_runtime: crate::agent::tool_runtime::ToolRuntimeStats,
     pub tool_governance: Vec<crate::agent::tool_governance::ToolGovernanceItem>,
+    pub tool_quality: crate::agent::tool_metrics::ToolQualitySummary,
+    pub tool_metric_slices: Vec<crate::agent::tool_metrics::ToolMetricSlice>,
+    pub tool_protocol_versions: Vec<crate::agent::tool_metrics::ToolProtocolVersion>,
 }
 
 #[tauri::command]
@@ -207,6 +210,9 @@ pub fn get_reliability_dashboard(
         worker_runtime: crate::agent::scheduler::runtime_stats(&conn)?,
         tool_runtime: crate::agent::tool_runtime::runtime_stats(&conn)?,
         tool_governance: crate::agent::tool_governance::report(&conn, since / 1000)?,
+        tool_quality: crate::agent::tool_metrics::summary(&conn, since / 1000)?,
+        tool_metric_slices: crate::agent::tool_metrics::breakdown(&conn, since / 1000)?,
+        tool_protocol_versions: crate::agent::tool_metrics::protocol_versions(&conn)?,
     })
 }
 

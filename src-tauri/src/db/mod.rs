@@ -146,6 +146,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (66, "066_structured_project_memories", include_str!("../../migrations/066_structured_project_memories.sql")),
     (67, "067_context_pins", include_str!("../../migrations/067_context_pins.sql")),
     (68, "068_conversation_branches", include_str!("../../migrations/068_conversation_branches.sql")),
+    (69, "069_tool_quality_governance", include_str!("../../migrations/069_tool_quality_governance.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -239,6 +240,9 @@ mod tests {
             "trace_id", "call_id", "idempotency_key", "effect_kind", "recovery_policy",
             "structured_result_json", "evidence_digest", "dag_node_id",
             "protocol_version", "error_code", "compensation_json", "metrics_json",
+            "retry_count", "cancel_requested_at", "cancel_observed_at", "cancellation_latency_ms",
+            "contribution_state", "selection_state", "capability_pack", "model", "project_id",
+            "producer_version",
         ] {
             assert!(tool_cols.iter().any(|x| x == c), "tool_runs 迁移后缺少列 {c}: {tool_cols:?}");
         }
@@ -263,12 +267,13 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
                  ('agent_task_queue','agent_dag_nodes','agent_dag_edges','agent_eval_runs',
                   'agent_slo_policies','agent_alerts','agent_audit_events','agent_quota_usage',
-                  'agent_workers','agent_task_attempts','tool_execution_workers','tool_execution_attempts')",
+                  'agent_workers','agent_task_attempts','tool_execution_workers','tool_execution_attempts',
+                  'tool_protocol_versions')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(control_tables, 12);
+        assert_eq!(control_tables, 13);
         let queue_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(agent_task_queue)")
             .unwrap()

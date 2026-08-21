@@ -199,6 +199,10 @@ fn classify_error(status: &str, output: &str, retry_safe: bool) -> ToolErrorEvid
     let lower = output.to_lowercase();
     let (code, category, transient) = if status == "cancelled" {
         ("TOOL_CANCELLED", "cancelled", false)
+    } else if lower.contains("参数未通过 schema 校验")
+        || lower.contains("argument schema validation")
+    {
+        ("TOOL_ARGUMENT_INVALID", "argument", false)
     } else if lower.contains("panic") {
         ("TOOL_WORKER_PANIC", "worker_crash", false)
     } else if lower.contains("timeout") || lower.contains("超时") {
@@ -567,6 +571,17 @@ mod tests {
         );
         let error = value.error.unwrap();
         assert_eq!(error.code, "TOOL_WORKER_PANIC");
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn schema_validation_failure_has_stable_argument_error_code() {
+        let value = ToolResultEnvelope::from_execution(
+            "read_file", "{}", "工具 `read_file` 参数未通过 schema 校验，本次未执行", "error",
+        );
+        let error = value.error.unwrap();
+        assert_eq!(error.code, "TOOL_ARGUMENT_INVALID");
+        assert_eq!(error.category, "argument");
         assert!(!error.retryable);
     }
 

@@ -2196,6 +2196,12 @@ fn finish_tool_run(
             )
             .unwrap_or(0);
         if updated > 0 {
+            let _ = crate::agent::tool_metrics::record_attempt_metrics(
+                &conn,
+                id,
+                0,
+                crate::agent::exec_ctx::stop_requested_at_ms(conversation_id),
+            );
             let _ = crate::agent::tool_runtime::close_committed_attempt(
                 &conn,
                 id,
@@ -2300,6 +2306,12 @@ fn finish_tool_run(
         ],
     ).unwrap_or(0);
     if inserted > 0 {
+        let _ = crate::agent::tool_metrics::record_attempt_metrics(
+            &conn,
+            &id,
+            0,
+            crate::agent::exec_ctx::stop_requested_at_ms(conversation_id),
+        );
         // 子 Agent 工具没有前端 call_id，使用审计行 id 作为执行步骤外部键；这样所有
         // 真正发生过的工具调用都进入同一执行图，而不是只覆盖主 Agent 的可见卡片。
         let _ = crate::agent::coordinator::prepare_tool_step(
@@ -5353,7 +5365,7 @@ async fn stream_chat_inner(
                 continue;
             }
             // 子 Agent 委派：并发执行、可指定模型，结果汇总后继续主 Agent 循环
-            let result = if tool == "spawn_agents" {
+            let (result, retry_count) = if tool == "spawn_agents" {
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
                 let r = run_spawn_agents(
                     &app,
@@ -5372,7 +5384,7 @@ async fn stream_chat_inner(
                     tool_ctx.spawn_remaining,
                 )
                 .await;
-                r
+                (r, 0)
             } else {
                 // 执行工具：超时/网络类错误按指数退避自动重试（可恢复错误白名单）
                 let retried = retry_with_backoff(
@@ -5399,13 +5411,15 @@ async fn stream_chat_inner(
                 .await;
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
                 stats.retry_count += (retried.attempts - 1) as i64;
-                match retried.value {
+                let retry_count = (retried.attempts - 1) as i64;
+                let result = match retried.value {
                     Ok(out) if retried.attempts > 1 => Ok(format!(
                         "（首次执行超时/网络错误，已自动重试 {} 次）\n{out}",
                         retried.attempts - 1
                     )),
                     other => other,
-                }
+                };
+                (result, retry_count)
             };
             // 统一护栏后处理：任务护栏记录（进展/失败黑名单/失速）+ 大输出落盘由 pipeline
             // post 钩子改写结果（guards.rs 注册），可追加强制验证/失速/目标锚定提示或预览截断
@@ -5428,6 +5442,16 @@ async fn stream_chat_inner(
                 audit_status,
                 tool_begin.elapsed().as_millis() as i64,
             );
+            if committed {
+                if let Ok(conn) = state.0.lock() {
+                    let _ = crate::agent::tool_metrics::record_attempt_metrics(
+                        &conn,
+                        &call_id,
+                        retry_count,
+                        crate::agent::exec_ctx::stop_requested_at_ms(&conversation_id),
+                    );
+                }
+            }
             if !committed {
                 result = Err("工具结果未通过执行器 Owner fencing，已丢弃迟到结果".into());
             }
@@ -5925,6 +5949,14 @@ async fn stream_chat_inner(
     if let Ok(conn) = state.0.lock() {
         let value = serde_json::to_value(&acceptance).unwrap_or_else(|_| serde_json::json!({}));
         let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
+        let _ = crate::agent::tool_metrics::annotate_run_outcomes(
+            &conn,
+            &trace_id,
+            &task_goal,
+            &model_choice.model,
+            &project_id,
+            &acceptance,
+        );
         let _ = crate::agent::runtime::append_event(
             &conn,
             &trace_id,
@@ -9280,6 +9312,16 @@ async fn execute_tool_batch_one(
         },
         duration_ms,
     );
+    if committed {
+        if let Ok(conn) = state.0.lock() {
+            let _ = crate::agent::tool_metrics::record_attempt_metrics(
+                &conn,
+                &call_id,
+                (retried.attempts - 1) as i64,
+                crate::agent::exec_ctx::stop_requested_at_ms(conversation_id),
+            );
+        }
+    }
     // 工具完成跟踪（批处理路径）
     crate::utils::logger::log_event(
         "tool_finished",

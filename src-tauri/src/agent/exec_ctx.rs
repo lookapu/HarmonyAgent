@@ -7,7 +7,7 @@ use tauri::{AppHandle, Emitter};
 
 /// 会话级“停止当前工具”代次：每次请求递增。工具启动时记录基线，运行中发现代次
 /// 改变就中断。相比一次性 HashSet，同批并行工具都能观察到停止且后续新工具不会误停。
-static STOP_TOOL_GENERATIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+static STOP_TOOL_GENERATIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, i64)>>> =
     std::sync::OnceLock::new();
 
 tokio::task_local! {
@@ -27,8 +27,16 @@ pub fn stop_generation(conversation_id: &str) -> u64 {
     STOP_TOOL_GENERATIONS
         .get()
         .and_then(|m| m.lock().ok())
-        .and_then(|m| m.get(conversation_id).copied())
+        .and_then(|m| m.get(conversation_id).map(|(generation, _)| *generation))
         .unwrap_or(0)
+}
+
+/// 最近一次停止工具请求的 Unix 毫秒时间；仅用于计算取消生效延迟。
+pub fn stop_requested_at_ms(conversation_id: &str) -> Option<i64> {
+    STOP_TOOL_GENERATIONS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|m| m.get(conversation_id).map(|(_, requested_at)| *requested_at))
 }
 
 /// 请求停止会话当前正在执行的全部工具。
@@ -37,8 +45,11 @@ pub fn request_stop_tool(conversation_id: &str) {
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock()
     {
-        let generation = generations.entry(conversation_id.to_string()).or_insert(0);
+        let (generation, requested_at) = generations
+            .entry(conversation_id.to_string())
+            .or_insert((0, 0));
         *generation = generation.wrapping_add(1);
+        *requested_at = chrono::Utc::now().timestamp_millis();
     }
 }
 

@@ -50,6 +50,9 @@ pub struct SloPolicy {
     pub acceptance_target: f64,
     pub recovery_target: f64,
     pub evidence_target: f64,
+    pub max_side_effect_repeat_rate: f64,
+    pub max_wrong_tool_selection_rate: f64,
+    pub max_ineffective_call_rate: f64,
     pub max_duration_ms: i64,
     pub max_cost_cny: Option<f64>,
     pub updated_at: i64,
@@ -238,10 +241,14 @@ pub fn evaluate_run_slo(conn: &Connection, run_id: &str, duration_ms: i64) -> Re
 
 pub fn evaluate_window_slo(conn: &Connection, since_ms: i64) -> Result<(), String> {
     let policy = conn.query_row(
-        "SELECT policy_id,acceptance_target,recovery_target,evidence_target FROM agent_slo_policies WHERE tenant_id='local' AND enabled=1 ORDER BY updated_at DESC LIMIT 1",
-        [], |row| Ok((row.get::<_,String>(0)?,row.get::<_,f64>(1)?,row.get::<_,f64>(2)?,row.get::<_,f64>(3)?)),
+        "SELECT policy_id,acceptance_target,recovery_target,evidence_target,
+         max_side_effect_repeat_rate,max_wrong_tool_selection_rate,max_ineffective_call_rate
+         FROM agent_slo_policies WHERE tenant_id='local' AND enabled=1 ORDER BY updated_at DESC LIMIT 1",
+        [], |row| Ok((row.get::<_,String>(0)?,row.get::<_,f64>(1)?,row.get::<_,f64>(2)?,row.get::<_,f64>(3)?,
+            row.get::<_,f64>(4)?,row.get::<_,f64>(5)?,row.get::<_,f64>(6)?)),
     ).ok();
-    let Some((policy_id, acceptance_target, recovery_target, evidence_target)) = policy else {
+    let Some((policy_id, acceptance_target, recovery_target, evidence_target,
+        max_side_effect_repeat_rate, max_wrong_tool_selection_rate, max_ineffective_call_rate)) = policy else {
         return Ok(());
     };
     let (total, accepted, recovered, recovered_ok) = conn.query_row(
@@ -284,6 +291,28 @@ pub fn evaluate_window_slo(conn: &Connection, since_ms: i64) -> Result<(), Strin
             "warning",
             "Structured tool evidence coverage is below SLO",
             serde_json::json!({"structured":structured,"tools":tools,"target":evidence_target}),
+        )?;
+    }
+    let quality = crate::agent::tool_metrics::summary(conn, since_ms / 1000)?;
+    if quality.total_calls >= 5 && quality.side_effect_repeat_rate > max_side_effect_repeat_rate {
+        alert_once(
+            conn, &policy_id, "SLO_SIDE_EFFECT_REPEAT_BREACH", "critical",
+            "Tool side-effect repeat rate exceeded SLO",
+            serde_json::json!({"actual":quality.side_effect_repeat_rate,"maximum":max_side_effect_repeat_rate}),
+        )?;
+    }
+    if quality.total_calls >= 5 && quality.wrong_tool_selection_rate > max_wrong_tool_selection_rate {
+        alert_once(
+            conn, &policy_id, "SLO_WRONG_TOOL_SELECTION_BREACH", "warning",
+            "Out-of-capability tool selection rate exceeded SLO",
+            serde_json::json!({"actual":quality.wrong_tool_selection_rate,"maximum":max_wrong_tool_selection_rate}),
+        )?;
+    }
+    if quality.successful_calls >= 5 && quality.ineffective_call_rate > max_ineffective_call_rate {
+        alert_once(
+            conn, &policy_id, "SLO_INEFFECTIVE_TOOL_CALL_BREACH", "warning",
+            "Successful tool calls without direct acceptance contribution exceeded SLO",
+            serde_json::json!({"actual":quality.ineffective_call_rate,"maximum":max_ineffective_call_rate}),
         )?;
     }
     Ok(())
@@ -384,20 +413,38 @@ pub fn quota(conn: &Connection) -> Result<QuotaUsage, String> {
 
 pub fn get_policy(conn: &Connection) -> Result<Option<SloPolicy>, String> {
     use rusqlite::OptionalExtension;
-    conn.query_row("SELECT policy_id,name,enabled,acceptance_target,recovery_target,evidence_target,max_duration_ms,max_cost_cny,updated_at FROM agent_slo_policies WHERE tenant_id='local' ORDER BY updated_at DESC LIMIT 1",[],|row| Ok(SloPolicy { policy_id:row.get(0)?,name:row.get(1)?,enabled:row.get(2)?,acceptance_target:row.get(3)?,recovery_target:row.get(4)?,evidence_target:row.get(5)?,max_duration_ms:row.get(6)?,max_cost_cny:row.get(7)?,updated_at:row.get(8)? })).optional().map_err(|e|e.to_string())
+    conn.query_row("SELECT policy_id,name,enabled,acceptance_target,recovery_target,evidence_target,
+        max_side_effect_repeat_rate,max_wrong_tool_selection_rate,max_ineffective_call_rate,
+        max_duration_ms,max_cost_cny,updated_at FROM agent_slo_policies WHERE tenant_id='local'
+        ORDER BY updated_at DESC LIMIT 1",[],|row| Ok(SloPolicy {
+        policy_id:row.get(0)?,name:row.get(1)?,enabled:row.get(2)?,acceptance_target:row.get(3)?,
+        recovery_target:row.get(4)?,evidence_target:row.get(5)?,max_side_effect_repeat_rate:row.get(6)?,
+        max_wrong_tool_selection_rate:row.get(7)?,max_ineffective_call_rate:row.get(8)?,
+        max_duration_ms:row.get(9)?,max_cost_cny:row.get(10)?,updated_at:row.get(11)?
+    })).optional().map_err(|e|e.to_string())
 }
 
 pub fn update_policy(conn: &Connection, policy: &SloPolicy) -> Result<(), String> {
     if !(0.0..=1.0).contains(&policy.acceptance_target)
         || !(0.0..=1.0).contains(&policy.recovery_target)
         || !(0.0..=1.0).contains(&policy.evidence_target)
+        || !(0.0..=1.0).contains(&policy.max_side_effect_repeat_rate)
+        || !(0.0..=1.0).contains(&policy.max_wrong_tool_selection_rate)
+        || !(0.0..=1.0).contains(&policy.max_ineffective_call_rate)
     {
         return Err("SLO targets must be between 0 and 1".into());
     }
     if policy.max_duration_ms < 10_000 {
         return Err("SLO duration must be at least 10 seconds".into());
     }
-    conn.execute("UPDATE agent_slo_policies SET name=?1,enabled=?2,acceptance_target=?3,recovery_target=?4,evidence_target=?5,max_duration_ms=?6,max_cost_cny=?7,updated_at=?8 WHERE policy_id=?9 AND tenant_id='local'",params![policy.name,policy.enabled,policy.acceptance_target,policy.recovery_target,policy.evidence_target,policy.max_duration_ms,policy.max_cost_cny,now_ms(),policy.policy_id]).map_err(|e|e.to_string())?;
+    conn.execute("UPDATE agent_slo_policies SET name=?1,enabled=?2,acceptance_target=?3,
+        recovery_target=?4,evidence_target=?5,max_side_effect_repeat_rate=?6,
+        max_wrong_tool_selection_rate=?7,max_ineffective_call_rate=?8,max_duration_ms=?9,
+        max_cost_cny=?10,updated_at=?11 WHERE policy_id=?12 AND tenant_id='local'",
+        params![policy.name,policy.enabled,policy.acceptance_target,policy.recovery_target,
+            policy.evidence_target,policy.max_side_effect_repeat_rate,policy.max_wrong_tool_selection_rate,
+            policy.max_ineffective_call_rate,policy.max_duration_ms,policy.max_cost_cny,now_ms(),policy.policy_id]
+    ).map_err(|e|e.to_string())?;
     Ok(())
 }
 
@@ -415,5 +462,37 @@ mod tests {
         assert_eq!(quota(&conn).unwrap().tool_calls, 1);
         assert_eq!(list_alerts(&conn, 10).unwrap().len(), 2);
         assert_eq!(list_audit(&conn, Some("r"), 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn tool_quality_slo_alerts_on_repeat_wrong_selection_and_ineffective_success() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_slo_policies(policy_id TEXT,tenant_id TEXT,enabled INTEGER,
+             acceptance_target REAL,recovery_target REAL,evidence_target REAL,
+             max_side_effect_repeat_rate REAL,max_wrong_tool_selection_rate REAL,max_ineffective_call_rate REAL,
+             updated_at INTEGER);
+             INSERT INTO agent_slo_policies VALUES('p','local',1,.9,.9,.9,0,.05,.25,1);
+             CREATE TABLE agent_runs(run_id TEXT,parent_run_id TEXT,started_at INTEGER,acceptance_json TEXT,
+             recovery_mode TEXT,state TEXT);
+             CREATE TABLE agent_alerts(alert_id TEXT,tenant_id TEXT,run_id TEXT,policy_id TEXT,severity TEXT,
+             code TEXT,message TEXT,state TEXT,details_json TEXT,created_at INTEGER,resolved_at INTEGER);
+             CREATE TABLE tool_runs(status TEXT,created_at INTEGER,protocol_version INTEGER,
+             structured_result_json TEXT,error_code TEXT,retry_count INTEGER,cancellation_latency_ms INTEGER,
+             duration_ms INTEGER,contribution_state TEXT,selection_state TEXT,effect_kind TEXT,
+             idempotency_key TEXT,trace_id TEXT);
+             INSERT INTO tool_runs VALUES
+             ('ok',100,2,'{}',NULL,0,NULL,10,'no_direct_acceptance_evidence','out_of_capability_pack','write','same','r'),
+             ('ok',100,2,'{}',NULL,0,NULL,10,'no_direct_acceptance_evidence','out_of_capability_pack','write','same','r'),
+             ('ok',100,2,'{}',NULL,0,NULL,10,'no_direct_acceptance_evidence','out_of_capability_pack','write','same','r'),
+             ('ok',100,2,'{}',NULL,0,NULL,10,'no_direct_acceptance_evidence','out_of_capability_pack','write','same','r'),
+             ('ok',100,2,'{}',NULL,0,NULL,10,'no_direct_acceptance_evidence','out_of_capability_pack','write','same','r');"
+        ).unwrap();
+        evaluate_window_slo(&conn, 0).unwrap();
+        let codes = list_alerts(&conn, 10).unwrap().into_iter().map(|alert| alert.code)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(codes.contains("SLO_SIDE_EFFECT_REPEAT_BREACH"));
+        assert!(codes.contains("SLO_WRONG_TOOL_SELECTION_BREACH"));
+        assert!(codes.contains("SLO_INEFFECTIVE_TOOL_CALL_BREACH"));
     }
 }
