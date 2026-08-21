@@ -643,6 +643,22 @@ pub fn list_memories(conn: &Connection, project_id: &str) -> Result<Vec<ProjectM
     rows.collect()
 }
 
+/// 按 id 读取记忆，供可撤销共享导入复验当前内容；不存在时返回 None。
+pub fn list_memories_for_revert(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<ProjectMemory>, String> {
+    conn.query_row(
+        "SELECT id,project_id,category,title,content,enabled,source_kind,source_ref,scope,
+         confidence,version,confirmed,pinned,invalidation_condition,invalidated_at,
+         invalidation_reason,created_at,updated_at FROM project_memories WHERE id=?1",
+        [id],
+        |row| Ok(ProjectMemory {
+            id:row.get(0)?,project_id:row.get(1)?,category:row.get(2)?,title:row.get(3)?,content:row.get(4)?,enabled:row.get(5)?,source_kind:row.get(6)?,source_ref:row.get(7)?,scope:row.get(8)?,confidence:row.get(9)?,version:row.get(10)?,confirmed:row.get(11)?,pinned:row.get(12)?,invalidation_condition:row.get(13)?,invalidated_at:row.get(14)?,invalidation_reason:row.get(15)?,created_at:row.get(16)?,updated_at:row.get(17)?,
+        }),
+    ).optional().map_err(|error| error.to_string())
+}
+
 /// 插入一条记忆
 pub fn insert_memory(conn: &Connection, m: &ProjectMemory) -> Result<(), rusqlite::Error> {
     conn.execute(

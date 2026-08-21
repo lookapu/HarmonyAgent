@@ -254,6 +254,7 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("attach_debugger", "debug"),
     ("step_debug", "debug"),
     ("ota_pack", "build"),
+    ("team_share", "other"),
 ];
 
 /// 全部任务分组（tool_list 过滤与前端分组 UI 用）
@@ -352,6 +353,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "workflow_template",
         desc: "管理项目级、版本化工作流模板。\n参数：{\"action\":\"list|validate|import|enable|disable|upgrade\",\"id\":\"<enable/disable 必填>\",\"template\":{\"schema\":1,\"id\":\"build-check\",\"name\":\"Build check\",\"version\":\"1.0.0\",\"harmony_agent_compat\":\">=2.0.0,<3.0.0\",\"permissions\":[\"project.read\"],\"enabled\":true,\"steps\":[{\"id\":\"inspect\",\"tool\":\"read_file\",\"args\":{\"path\":\"README.md\"},\"acceptance\":\"文件可读\"}]},\"allow_permission_escalation\":false}。\n校验 schema/SemVer/Agent 兼容范围、权限、已注册工具、参数对象、步骤 id 和验收条件；import/upgrade 每次显式审批，升级只接受更高版本，新增权限需显式 allow_permission_escalation=true，旧版本归档供回滚。模板不能递归调用本工具，且不会自动执行步骤。\n副作用：validate/list 无写入；import/enable/disable/upgrade 写入项目 .deveco-agent/workflow-templates。\n返回：模板版本、启用状态、步骤和权限摘要。",
+    },
+    ToolSpec {
+        name: "team_share",
+        desc: "管理版本化团队共享包（项目记忆、工程约定、固定评测集）。\n参数：{\"action\":\"validate|preview|apply|revert|list|export|run_eval\",\"package\":<validate/preview/apply 的 schema=1 对象>,\"batch_id\":\"<revert>\",\"set_id\":\"<run_eval>\",\"package_id\":\"<export>\",\"name\":\"<export>\",\"version\":\"<SemVer>\",\"source_uri\":\"<来源>\",\"source_revision\":\"<精确修订>\"}。apply/revert 每次要求显式审批；preview 会列出新增、同源更新、本地冲突和未变化项。本地冲突只以禁用且未确认的副本并存，绝不覆盖本地事实；revert 只恢复仍保持导入状态的项，用户编辑过的项保留。评测集只能组合本机已注册场景，不能携带可执行代码。\n副作用：validate/preview/list/export/run_eval 只读；apply 写入共享记忆、约定和评测集，revert 按批次恢复或删除未被用户修改的导入项。\n返回：校验/冲突预览、导入批次与来源、撤销数量、共享包 JSON 或评测结果。",
     },
     ToolSpec {
         name: "debug_probe",
@@ -1330,6 +1335,7 @@ pub async fn run_tool(
         "workflow_template" => crate::services::workflow_templates::handle(
             &args, &roots, db, project_id, &ctx.run_id, &ctx.conversation_id,
         ),
+        "team_share" => crate::services::team_sharing::handle_tool(&args, project_id, db),
         "lsp_definition" => crate::agent::lsp_client::lsp_definition(&args, &roots, &ctx.conversation_id).await,
         "lsp_references" => crate::agent::lsp_client::lsp_references(&args, &roots, &ctx.conversation_id).await,
         "lsp_symbols" => crate::agent::lsp_client::lsp_symbols(&args, &roots, &ctx.conversation_id).await,

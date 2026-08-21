@@ -236,6 +236,29 @@ fn simulate_scenario(id: &str) -> Option<&'static str> {
     }
 }
 
+/// Execute one registered deterministic scenario for a project-scoped shared suite.
+/// Unknown ids fail closed; shared packages cannot inject executable evaluators.
+pub(crate) fn evaluate_registered_scenario(
+    id: &str,
+    expected: &str,
+) -> Result<EvalCaseResult, String> {
+    let scenario = scenarios()
+        .into_iter()
+        .find(|scenario| scenario.id == id)
+        .ok_or_else(|| format!("未注册评测场景：{id}"))?;
+    if scenario.expected != expected {
+        return Err(format!("评测场景 {id} 的期望契约不一致"));
+    }
+    let actual = simulate_scenario(id).ok_or_else(|| format!("评测场景 {id} 没有执行器"))?;
+    Ok(EvalCaseResult {
+        id: id.into(),
+        domain: scenario.domain,
+        expected: expected.into(),
+        actual: actual.into(),
+        passed: actual == expected,
+    })
+}
+
 /// 调试/评测构建使用的显式故障点。发布构建永远返回 false，防止环境变量误伤用户任务。
 pub fn fault_enabled(point: &str) -> bool {
     cfg!(debug_assertions) && std::env::var("HARMONY_AGENT_FAULT").ok().as_deref() == Some(point)

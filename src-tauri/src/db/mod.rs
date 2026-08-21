@@ -150,6 +150,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (70, "070_skill_manifest_v1", include_str!("../../migrations/070_skill_manifest_v1.sql")),
     (71, "071_mcp_project_authorization", include_str!("../../migrations/071_mcp_project_authorization.sql")),
     (72, "072_extension_governance", include_str!("../../migrations/072_extension_governance.sql")),
+    (73, "073_team_sharing", include_str!("../../migrations/073_team_sharing.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -304,6 +305,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(extension_tables, 1);
+        let team_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('team_share_imports','team_share_changes','team_eval_sets')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(team_tables, 3);
         let queue_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(agent_task_queue)")
             .unwrap()

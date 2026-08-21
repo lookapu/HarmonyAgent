@@ -45,6 +45,7 @@ pub mod seed;
 pub mod skill_manifest;
 pub mod symbol_index;
 pub mod task_guard;
+pub mod team_sharing;
 pub mod tool_cache;
 pub mod tool_limits;
 pub mod workspace;

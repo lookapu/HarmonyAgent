@@ -29,6 +29,7 @@ pub mod reliability;
 pub mod rules;
 pub mod skill;
 pub mod terminal;
+pub mod team_sharing;
 pub mod tools;
 pub mod update;
 pub mod version;

@@ -95,7 +95,7 @@ pub fn tool_level(tool: &str) -> Level {
         | "db_migrate" | "state_snapshot"
         | "secret_store" | "secret_delete"
         | "fact_extract" | "reflexion_pin" | "export_report" | "use_skill" => Level::L1,
-        "workflow_template" => Level::L1,
+        "workflow_template" | "team_share" => Level::L1,
         // 质量/度量域写/外部请求工具（snippet 库、混淆开关、HTTP 探测）
         "snippet_insert" | "obfuscate" | "api_test" | "api_health" => Level::L1,
         // L2 危险/越界
@@ -130,6 +130,10 @@ pub fn requires_fresh_explicit_approval(tool: &str, args: &serde_json::Value) ->
             .get("action")
             .and_then(|value| value.as_str())
             .is_some_and(|action| matches!(action, "import" | "upgrade")),
+        "team_share" => args
+            .get("action")
+            .and_then(|value| value.as_str())
+            .is_some_and(|action| matches!(action, "apply" | "revert")),
         _ => false,
     }
 }
