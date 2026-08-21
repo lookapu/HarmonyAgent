@@ -495,7 +495,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "smoke_test",
-        desc: "部署后自动冒烟链：build（可选跳过）→ deploy → run_ui_flow 断言 → 截图验证，输出冒烟报告。\n参数：{\"steps\":[<run_ui_flow 的 UI 断言步骤，至少 1 条>]（必填），\"device\":\"<可选>\",\"hap\":\"<可选 HAP 路径，缺省自动找最新产物>\",\"verify\":<可选缺省 true，结束时截图供核对>,\"skip_build\":<可选缺省 false，true 时直接用已有产物部署>}。\n适合：改完核心流程后快速确认「能装、能起、能点」；步骤参考 dump_ui_hierarchy/ui_locator 得到的元素坐标。\n副作用：构建+部署应用并在设备上执行 UI 操作（与 run_ui_flow 相同）。\n返回：三阶段执行结果 + 冒烟结论。",
+        desc: "部署后自动冒烟链：build（可选跳过）→ deploy → run_ui_flow 操作与页面断言 → UI 树/截图验证，输出冒烟报告。\n参数：{\"steps\":[<run_ui_flow 操作，至少 1 条>]（必填），\"assertions\":[{\"kind\":\"text|type|id|bundle\",\"value\":\"<期望>\",\"present\":true,\"exact\":false}],\"device\":\"<可选>\",\"hap\":\"<可选 HAP>\",\"verify\":<可选缺省 true>,\"skip_build\":<可选缺省 false>}。assertions 原样传给 run_ui_flow；任一步操作或断言失败都会使冒烟失败。\n副作用：构建+部署应用并在设备上执行 UI 操作。\n返回：三阶段执行结果、UI 树/截图证据和机器判定的冒烟结论。",
     },
     ToolSpec {
         name: "read_logcat",
@@ -535,7 +535,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "run_ui_flow",
-        desc: "在设备上自动执行一串 UI 操作（模拟点击/滑动/长按/文本输入/按键），用于验证交互流程或端到端测试。\n参数：{\"device\":\"<可选设备序列号，缺省默认设备>\",\"steps\":[{\"action\":\"tap\",\"x\":<横坐标>,\"y\":<纵坐标>} | {\"action\":\"swipe\",\"x1\":..,\"y1\":..,\"x2\":..,\"y2\":..,\"speed\":<可选 1-2000>} | {\"action\":\"long_press\",\"x\":..,\"y\":..} | {\"action\":\"text\",\"text\":\"<输入内容>\"} | {\"action\":\"key\",\"name\":\"back\"|\"home\"} | {\"action\":\"wait\",\"ms\":<毫秒>}],\"verify\":<可选，true 时操作结束后截图返回画面>}。\n底层使用 hdc shell uitest uiInput 注入操作，坐标相对屏幕物理像素（先 verify_ui/take_screenshot 看当前界面确定坐标）。\n适合：用户要求“点一下/滑动/跑一遍操作流程/验证交互是否正常”时，按步骤执行，结束用 verify=true 截图核对结果。\n副作用：在设备上注入真实触摸/按键事件。\n返回：每步执行结果与（可选）最终截图路径。",
+        desc: "在具备 ui_automation 能力的设备上执行 UI 操作并对关键页面做机器断言。\n参数：{\"device\":\"<可选>\",\"steps\":[tap|swipe|long_press|text|key|wait 操作],\"assertions\":[{\"kind\":\"text|type|id|bundle\",\"value\":\"<期望>\",\"present\":<缺省 true>,\"exact\":<text 缺省 false，其它缺省 true>}],\"verify\":<可选截图>}。text 缺省包含匹配；type/id/bundle 缺省精确匹配；present=false 表示断言不存在。\n流程：逐步操作（失败即停止）→ 导出现场 UI 树 → 执行断言 → 失败或有断言时保存截图 → 写入当前 Run。\n副作用：在设备上注入真实触摸/按键事件，并在 .deveco-agent 保存 UI 树/截图。\n返回：每步结果、每条断言的通过/失败和证据路径；操作或断言失败时工具返回 Err，不再假报成功。",
     },
     ToolSpec {
         name: "run_perf_benchmark",
@@ -1219,7 +1219,7 @@ pub async fn run_tool(
         "collect_perf" => collect_perf(&args, &roots).await,
         "deploy_all" => build_tools::deploy_all(&args, &roots, ctx, project_id).await,
         "write_unit_tests" => test_tools::write_unit_tests(&args, &roots).await,
-        "run_ui_flow" => test_tools::run_ui_flow(&args, &roots).await,
+        "run_ui_flow" => test_tools::run_ui_flow(&args, &roots, ctx).await,
         "run_perf_benchmark" => ui_tools::run_perf_benchmark(&args, &roots).await,
         "dump_ui_hierarchy" => ui_tools::dump_ui_hierarchy(&args, &roots).await,
         "ui_locator" => ui_tools::ui_locator(&args, &roots).await,

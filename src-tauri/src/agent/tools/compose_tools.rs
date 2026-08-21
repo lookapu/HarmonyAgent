@@ -411,6 +411,9 @@ pub(super) async fn smoke_test(
             m.insert("device".into(), Value::String(d.into()));
         }
         m.insert("steps".into(), Value::Array(steps.clone()));
+        if let Some(assertions) = args["assertions"].as_array() {
+            m.insert("assertions".into(), Value::Array(assertions.clone()));
+        }
         m.insert("verify".into(), Value::Bool(verify));
         Value::Object(m)
     };

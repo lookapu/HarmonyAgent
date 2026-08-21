@@ -1234,11 +1234,16 @@ pub(super) fn build_test_content(source: &Path, module_root: &Path, exports: &[S
 }
 
 /// run_ui_flow：在设备上执行一串 UI 操作（uitest uiInput 注入）。
-pub(super) async fn run_ui_flow(args: &Value, roots: &[String]) -> Result<String, String> {
-    let device = match args["device"].as_str() {
-        Some(d) => d.to_string(),
-        None => default_device_id().await?,
-    };
+pub(super) async fn run_ui_flow(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let device = super::ui_tools::resolve_authorized_device(
+        args["device"].as_str(),
+        "ui_automation",
+    )
+    .await?;
     let steps = args["steps"].as_array().ok_or("run_ui_flow 需要参数 {\"steps\":[...]}")?;
     if steps.is_empty() {
         return Err("steps 不能为空".into());
@@ -1249,22 +1254,96 @@ pub(super) async fn run_ui_flow(args: &Value, roots: &[String]) -> Result<String
         out.push_str(r);
         out.push('\n');
     }
+    let mut failed = results.iter().any(|result| result.contains("→ 失败"));
+
+    // 关键页面断言统一基于操作后的现场 UI 树，并保留原始 JSON 作为证据。
+    let assertions = args["assertions"].as_array().cloned().unwrap_or_default();
+    let mut hierarchy_path: Option<PathBuf> = None;
+    if !assertions.is_empty() {
+        let project_path = roots.first().map(String::as_str).unwrap_or("");
+        let (path, hierarchy) = super::ui_tools::capture_ui_hierarchy(project_path, &device).await?;
+        let assertion_results = evaluate_ui_assertions(&hierarchy, &assertions)?;
+        out.push_str(&format!("\n页面断言（UI 树：{}）：\n", path.display()));
+        for (description, passed) in &assertion_results {
+            out.push_str(&format!("{} {description}\n", if *passed { "✓" } else { "✗" }));
+        }
+        failed |= assertion_results.iter().any(|(_, passed)| !passed);
+        hierarchy_path = Some(path);
+    }
 
     // 可选：结束后截图供多模态核对
-    let verify = args["verify"].as_bool().unwrap_or(false);
+    let verify = args["verify"].as_bool().unwrap_or(false) || !assertions.is_empty() || failed;
+    let mut screenshot_path: Option<PathBuf> = None;
     if verify {
         if let Some(project_path) = roots.first() {
             if !project_path.is_empty() {
                 match capture_screenshot(project_path, &device).await {
                     Ok((local, _)) => {
                         out.push_str(&format!("\n操作后截图：{}\n[VISION_IMAGE: {}]", local.display(), local.display()));
+                        screenshot_path = Some(local);
                     }
                     Err(e) => out.push_str(&format!("\n截图失败：{e}")),
                 }
             }
         }
     }
-    Ok(out)
+    ctx.record_run_event(
+        "harmony.ui_flow.completed",
+        serde_json::json!({
+            "device_id": device,
+            "status": if failed { "failed" } else { "completed" },
+            "steps": steps.len(),
+            "assertions": assertions.len(),
+            "ui_hierarchy": hierarchy_path,
+            "screenshot": screenshot_path,
+        }),
+    );
+    if failed { Err(out) } else { Ok(out) }
+}
+
+pub(super) fn evaluate_ui_assertions(
+    hierarchy: &str,
+    assertions: &[Value],
+) -> Result<Vec<(String, bool)>, String> {
+    let values_for = |fields: &[&str]| {
+        fields
+            .iter()
+            .flat_map(|field| super::ui_tools::scan_json_string_field(hierarchy, field))
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>()
+    };
+    let mut results = Vec::new();
+    for assertion in assertions {
+        let kind = assertion["kind"].as_str().unwrap_or("");
+        let expected = assertion["value"].as_str().unwrap_or("").trim();
+        if expected.is_empty() {
+            return Err("每条页面断言都需要非空 value".into());
+        }
+        let values = match kind {
+            "text" => values_for(&["text", "content", "accessibilityText"]),
+            "type" => values_for(&["type"]),
+            "id" => values_for(&["id", "resourceId"]),
+            "bundle" | "package" => values_for(&["bundleName", "package", "bundle"]),
+            _ => return Err(format!("未知页面断言 kind：{kind}；仅支持 text/type/id/bundle")),
+        };
+        let exact = assertion["exact"].as_bool().unwrap_or(kind != "text");
+        let present = assertion["present"].as_bool().unwrap_or(true);
+        let matched = values.iter().any(|value| {
+            if exact { value == expected } else { value.contains(expected) }
+        });
+        let passed = matched == present;
+        results.push((
+            format!(
+                "{} {}{}「{}」",
+                kind,
+                if present { "应存在" } else { "应不存在" },
+                if exact { "（精确）" } else { "（包含）" },
+                expected
+            ),
+            passed,
+        ));
+    }
+    Ok(results)
 }
 
 /// 逐条执行 UI 步骤，返回每步结果描述；任一步失败即停止（避免在错误界面继续乱点）。
@@ -1348,5 +1427,44 @@ pub(super) fn describe_step(s: &Value) -> String {
         "key" => format!("按键 {}", s["name"].as_str().unwrap_or("back")),
         "wait" => format!("等待 {}ms", s["ms"].as_u64().unwrap_or(500)),
         other => format!("未知操作 {other}"),
+    }
+}
+
+#[cfg(test)]
+mod ui_assertion_tests {
+    use super::*;
+
+    const TREE: &str = r#"{
+      "type":"Root",
+      "bundleName":"com.example.demo",
+      "children":[
+        {"type":"Text","text":"欢迎回来","resourceId":"welcome"},
+        {"type":"Button","text":"继续","resourceId":"continue"}
+      ]
+    }"#;
+
+    #[test]
+    fn page_assertions_cover_presence_absence_and_exactness() {
+        let assertions = vec![
+            serde_json::json!({"kind":"text","value":"欢迎"}),
+            serde_json::json!({"kind":"type","value":"Button"}),
+            serde_json::json!({"kind":"id","value":"error","present":false}),
+            serde_json::json!({"kind":"bundle","value":"com.example.demo"}),
+        ];
+        let results = evaluate_ui_assertions(TREE, &assertions).unwrap();
+        assert!(results.iter().all(|(_, passed)| *passed));
+
+        let failed = evaluate_ui_assertions(
+            TREE,
+            &[serde_json::json!({"kind":"text","value":"登录失败"})],
+        )
+        .unwrap();
+        assert!(!failed[0].1);
+    }
+
+    #[test]
+    fn malformed_page_assertion_is_rejected() {
+        assert!(evaluate_ui_assertions(TREE, &[serde_json::json!({"kind":"color","value":"red"})]).is_err());
+        assert!(evaluate_ui_assertions(TREE, &[serde_json::json!({"kind":"text","value":""})]).is_err());
     }
 }

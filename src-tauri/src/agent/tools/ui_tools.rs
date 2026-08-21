@@ -4,7 +4,7 @@
 
 use super::*;
 
-async fn resolve_authorized_device(requested: Option<&str>, capability: &str) -> Result<String, String> {
+pub(super) async fn resolve_authorized_device(requested: Option<&str>, capability: &str) -> Result<String, String> {
     let devices = crate::commands::devices::list_devices().await.map_err(|error| format!("无法发现设备：{error}"))?;
     let selected = if let Some(requested) = requested.map(str::trim).filter(|id| !id.is_empty()) {
         devices.iter().find(|device| device.id == requested).ok_or_else(|| format!("未发现指定设备 {requested}；请调用 list_devices 刷新设备状态。"))?
@@ -239,6 +239,22 @@ pub(super) async fn dump_ui_hierarchy(args: &Value, roots: &[String]) -> Result<
         Some(d) => d.to_string(),
         None => default_device_id().await?,
     };
+    let (local_path, content) = capture_ui_hierarchy(project_path, &device).await?;
+    let local_file = local_path.to_string_lossy();
+    let total_nodes = count_json_nodes(&content);
+    let summary = summarize_ui_tree(&content);
+
+    let mut out = format!("UI 控件树导出成功（设备 {device}）\n");
+    out.push_str(&format!("文件路径：{local_file}\n"));
+    out.push_str(&format!("节点总数（约）：{total_nodes}\n"));
+    out.push_str(&format!("{summary}\n"));
+    out.push_str("\n前 2000 字符预览：\n");
+    out.push_str(&tail(&content, 2000));
+    out.push_str("\n\n使用建议：结合 read_file 读取完整 JSON；要按文字/类型查找控件可用 search_file 搜索；要点击对应控件可用 dump 中的 centerX/centerY 配合 run_ui_flow 的 tap 操作。");
+    Ok(out)
+}
+
+pub(super) async fn capture_ui_hierarchy(project_path: &str, device: &str) -> Result<(PathBuf, String), String> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -264,31 +280,21 @@ pub(super) async fn dump_ui_hierarchy(args: &Value, roots: &[String]) -> Result<
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect();
-    let local_file = format!("{local_dir}/ui_hierarchy-{ts_ms}-{dev_safe}.json");
+    let local_file = PathBuf::from(format!("{local_dir}/ui_hierarchy-{ts_ms}-{dev_safe}.json"));
 
     // 通过 hdc file recv 拉到本地
     let hdc_args: Vec<String> = vec![
-        "-s".to_string(), device.clone(), "file".to_string(), "recv".to_string(),
-        dev_file.clone(), local_file.clone(),
+        "-s".to_string(), device.to_string(), "file".to_string(), "recv".to_string(),
+        dev_file.clone(), local_file.to_string_lossy().to_string(),
     ];
     run_cmd("hdc", &hdc_args, None, 30).await
         .map_err(|e| format!("拉取控件树文件失败: {e}"))?;
-    if !std::path::Path::new(&local_file).exists() {
+    if !local_file.exists() {
         return Err("拉取控件树文件失败：本地文件未生成".into());
     }
 
     let content = std::fs::read_to_string(&local_file).unwrap_or_default();
-    let total_nodes = count_json_nodes(&content);
-    let summary = summarize_ui_tree(&content);
-
-    let mut out = format!("UI 控件树导出成功（设备 {device}）\n");
-    out.push_str(&format!("文件路径：{local_file}\n"));
-    out.push_str(&format!("节点总数（约）：{total_nodes}\n"));
-    out.push_str(&format!("{summary}\n"));
-    out.push_str("\n前 2000 字符预览：\n");
-    out.push_str(&tail(&content, 2000));
-    out.push_str("\n\n使用建议：结合 read_file 读取完整 JSON；要按文字/类型查找控件可用 search_file 搜索；要点击对应控件可用 dump 中的 centerX/centerY 配合 run_ui_flow 的 tap 操作。");
-    Ok(out)
+    Ok((local_file, content))
 }
 
 /// 粗略统计 JSON 中对象节点数量（估算"{}"对数）。
