@@ -3683,7 +3683,7 @@ async fn stream_chat_inner(
     );
     let system_prompt_full = format!("{system_prompt_core}\n\n{low_freq_hints}");
     // MCP 服务器工具 + Skill 技能库：动态注入工具清单与技能指令（子 Agent 共用同一批逻辑）
-    let mcp_hint = load_mcp_hint(&state, &app, if project_id.is_empty() { None } else { Some(&project_id) }).await?;
+    let mcp_hint = load_mcp_hint(&state, &app, &project_id, &project_path).await?;
     let skill_hint = load_skill_hint(&state, if project_id.is_empty() { None } else { Some(&project_id) })?;
     // 打点：提示词构建完成（含 MCP 工具加载耗时），定位卡点用
     crate::utils::logger::log_event(
@@ -8653,7 +8653,7 @@ async fn run_subagent(
     }
     // 子 Agent 与主 Agent 共享 MCP 工具清单与技能库（失败时降级为仅内置工具）
     let sub_pid = if project_id.is_empty() { None } else { Some(project_id) };
-    if let Ok(hint) = load_mcp_hint(state, app, sub_pid).await {
+    if let Ok(hint) = load_mcp_hint(state, app, project_id, project_path).await {
         if !hint.is_empty() {
             system = format!("{system}\n\n{hint}");
         }
@@ -11410,40 +11410,23 @@ pub async fn summarize_memory(
 async fn load_mcp_hint(
     state: &tauri::State<'_, DbState>,
     app: &AppHandle,
-    project_id: Option<&str>,
+    project_id: &str,
+    project_path: &str,
 ) -> Result<String, String> {
+    if project_id.is_empty() || project_path.is_empty() {
+        return Ok(String::new());
+    }
     let servers: Vec<McpServer> = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, server_type, command, args, env, enabled, description, homepage, created_at,
-                        last_test_ok, last_test_at, last_test_error, project_id
-                 FROM mcp_servers WHERE enabled = 1
-                   AND (project_id IS NULL OR (?1 IS NOT NULL AND project_id = ?1))
-                 ORDER BY project_id IS NOT NULL, name, id",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([project_id], |r| {
-                Ok(McpServer {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    server_type: r.get(2)?,
-                    command: r.get(3)?,
-                    args: r.get(4)?,
-                    env: r.get(5)?,
-                    enabled: r.get(6)?,
-                    description: r.get(7)?,
-                    homepage: r.get(8)?,
-                    created_at: r.get(9)?,
-                    last_test_ok: r.get(10)?,
-                    last_test_at: r.get(11)?,
-                    last_test_error: r.get(12)?,
-                    project_id: r.get(13)?,
-                })
+        crate::db::queries::list_mcp_servers(&conn, Some(project_id))
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|server| {
+                server.enabled
+                    && server.project_id.as_deref() == Some(project_id)
+                    && server.authorization_state == "configured"
             })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+            .collect()
     };
     if servers.is_empty() {
         return Ok(String::new());
@@ -11453,7 +11436,7 @@ async fn load_mcp_hint(
     // 超时时子进程随 future drop 被回收，下次对话重新尝试）
     let collected = match tokio::time::timeout(
         std::time::Duration::from_secs(12),
-        manager.collect_tools(&servers),
+        manager.collect_tools(&servers, std::path::Path::new(project_path)),
     )
     .await
     {
@@ -11488,7 +11471,9 @@ async fn load_mcp_hint(
         match r {
             Ok(()) => {
                 for t in tools {
-                    entries.push((unique_name.clone(), t));
+                    if crate::services::mcp_policy::tool_allowed(s, &t.name).unwrap_or(false) {
+                        entries.push((unique_name.clone(), t));
+                    }
                 }
             }
             Err(e) => {

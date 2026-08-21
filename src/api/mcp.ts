@@ -15,8 +15,13 @@ export interface McpServer {
   last_test_ok: boolean | null
   last_test_at: number | null
   last_test_error: string | null
-  /** 作用域：null=用户级(全局，对所有项目生效)；非空=仅该项目生效 */
+  /** 作用域：null=全局配置模板（不直接进入 Agent）；非空=仅该项目可授权 */
   project_id: string | null
+  authorization_state: 'unconfigured' | 'configured'
+  allowed_tools: string
+  allowed_roots: string
+  network_policy: 'deny' | 'allow'
+  credential_keys: string
 }
 
 export interface CreateMcpInput {
@@ -37,6 +42,14 @@ export interface UpdateMcpInput {
   env?: Record<string, string>
   description?: string
   homepage?: string
+}
+
+export interface McpAuthorizationInput {
+  project_id: string
+  allowed_tools: string[]
+  allowed_roots: string[]
+  network_policy: 'deny' | 'allow'
+  credential_keys: string[]
 }
 
 /** 从 URL 获取到的 MCP 服务器草稿 */
@@ -75,6 +88,8 @@ export const addMcpServer = (input: CreateMcpInput) => invokeWithError<McpServer
 export const updateMcpServer = (id: string, input: UpdateMcpInput) => invokeWithError<McpServer>('update_mcp_server', { id, input })
 export const testMcpServer = (id: string) => invokeWithError<string>('test_mcp_server', { id })
 export const toggleMcpServer = (id: string, enabled: boolean) => invokeWithError<void>('toggle_mcp_server', { id, enabled })
+export const authorizeMcpServer = (id: string, input: McpAuthorizationInput) =>
+  invokeWithError<McpServer>('authorize_mcp_server', { id, input })
 export const removeMcpServer = (id: string) => invokeWithError<void>('remove_mcp_server', { id })
 /** 把 MCP 服务器复制到另一作用域：targetProjectId 传 null=全局，传项目 id=该项目 */
 export const cloneMcpServer = (id: string, targetProjectId: string | null) =>

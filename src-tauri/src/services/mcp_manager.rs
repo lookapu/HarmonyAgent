@@ -39,7 +39,16 @@ impl McpManager {
     /// 获取或建立服务器连接（已缓存且存活则复用）。
     /// 并发首连时后到者丢弃自己新建的连接（Drop 自动终止子进程），保证缓存唯一。
     /// 连接失败进入有界指数冷却，冷却结束后自动重试。
-    pub async fn get_or_connect(&self, server: &McpServer) -> Result<Arc<McpClient>, String> {
+    pub async fn get_or_connect(
+        &self,
+        server: &McpServer,
+        project_root: &std::path::Path,
+    ) -> Result<Arc<McpClient>, String> {
+        let project_id = server
+            .project_id
+            .as_deref()
+            .ok_or("全局 MCP 配置不能直接进入 Agent；请先克隆到项目并授权")?;
+        crate::services::mcp_policy::ensure_server_authorized(server, project_id)?;
         if let Some(c) = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&server.id) {
             return Ok(c.clone());
         }
@@ -66,7 +75,7 @@ impl McpManager {
                 ));
             }
         }
-        let client = match McpClient::connect(server).await {
+        let client = match McpClient::connect(server, project_root).await {
             Ok(c) => c,
             Err(e) => {
                 self.record_failure(&server.id, &e);
@@ -98,44 +107,8 @@ impl McpManager {
         self.failed.lock().unwrap_or_else(|e| e.into_inner()).remove(server_id);
     }
 
-    /// 调用 MCP 工具（工具名格式 mcp__服务器名__工具名）。
-    /// 同名服务器（全局 + 项目级）路由：优先同项目连接，其次全局连接；绝不跨项目路由。
-    /// 进程异常退出时移除缓存连接并报错（下次调用自动重连）。
-    pub async fn call(
-        &self,
-        server_name: &str,
-        tool: &str,
-        args: Value,
-        project_id: Option<&str>,
-    ) -> Result<String, String> {
-        // 按服务器名查找（连接缓存以 id 为 key，名称仅作展示层匹配）
-        let client = {
-            let map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
-            map.values()
-                .filter(|c| c.server_name == server_name)
-                .find(|c| c.project_id.as_deref() == project_id)
-                .or_else(|| {
-                    map.values()
-                        .filter(|c| c.server_name == server_name && c.project_id.is_none())
-                        .next()
-                })
-                .cloned()
-        };
-        let Some(client) = client else {
-            return Err(format!("MCP 服务器「{server_name}」未连接（可能启动失败或被移除），请重试"));
-        };
-        match client.call_tool(tool, args).await {
-            Ok(out) => Ok(out),
-            Err(e) => {
-                // 进程级故障（退出/超时）移除缓存，允许下次调用重新拉起
-                self.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&client.server_id);
-                self.record_failure(&client.server_id, &e);
-                Err(e)
-            }
-        }
-    }
-
-    /// 按服务器 id 精确调用（同名多实例路由：name#n 已由调用方解析为具体实例 id）
+    /// 按服务器 id 精确调用。调用方必须先从当前项目授权查询解析实例并复验策略；
+    /// 管理器不再提供按名称或全局回退路由，避免未来调用绕开项目绑定。
     pub async fn call_by_id(&self, server_id: &str, tool: &str, args: Value) -> Result<String, String> {
         let client = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(server_id).cloned();
         let Some(client) = client else {
@@ -155,12 +128,13 @@ impl McpManager {
     pub async fn collect_tools(
         &self,
         servers: &[McpServer],
+        project_root: &std::path::Path,
     ) -> Vec<(String, Vec<McpToolDef>, Result<(), String>)> {
         let futs: Vec<_> = servers
             .iter()
             .map(|server| async move {
                 let name = server.name.clone();
-                match self.get_or_connect(server).await {
+                match self.get_or_connect(server, project_root).await {
                     Ok(c) => match c.list_tools().await {
                         Ok(tools) => (name, tools, Ok(())),
                         Err(e) => {

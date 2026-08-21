@@ -315,19 +315,27 @@ pub(super) async fn manage_knowledge(args: &Value, project_id: &str, db: &crate:
 /// list_mcp_servers：列出项目可用的 MCP 服务器与工具清单、连接健康状态。
 pub(super) async fn list_mcp_servers(
     args: &Value,
+    project_path: &str,
     project_id: &str,
     db: &crate::db::DbState,
     mcp: &crate::services::mcp_manager::McpManager,
 ) -> Result<String, String> {
     let detail = args["detail"].as_bool().unwrap_or(false);
     // 锁仅用于读取服务器列表，作用域化保证在下方 await（collect_tools）前释放
-    let servers = {
+    let servers: Vec<_> = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         crate::db::queries::list_mcp_servers(
             &conn,
             if project_id.is_empty() { None } else { Some(project_id) },
         )
         .map_err(|e| format!("读取 MCP 服务器列表失败：{e}"))?
+        .into_iter()
+        .filter(|server| {
+            server.enabled
+                && server.project_id.as_deref() == Some(project_id)
+                && server.authorization_state == "configured"
+        })
+        .collect()
     };
     if servers.is_empty() {
         return Ok("当前没有配置任何 MCP 服务器（可在 MCP 页面添加；添加后可通过 mcp__服务器名__工具名 调用其工具）。".into());
@@ -335,7 +343,9 @@ pub(super) async fn list_mcp_servers(
     let mut out = format!("MCP 服务器（{} 个）：\n", servers.len());
     if detail {
         // 逐个连接并拉工具清单（失败单独标注，不影响其他服务器）
-        let collected = mcp.collect_tools(&servers).await;
+        let collected = mcp
+            .collect_tools(&servers, std::path::Path::new(project_path))
+            .await;
         for (i, server) in servers.iter().enumerate() {
             let status = if server.enabled { "启用" } else { "停用" };
             let (name, tools, conn_res) = &collected[i];
@@ -354,6 +364,9 @@ pub(super) async fn list_mcp_servers(
                 )),
             }
             for t in tools {
+                if !crate::services::mcp_policy::tool_allowed(server, &t.name).unwrap_or(false) {
+                    continue;
+                }
                 out.push_str(&format!(
                     "    - mcp__{name}__{}\n",
                     t.name

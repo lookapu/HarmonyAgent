@@ -168,8 +168,8 @@ pub fn find_mcp_instance_id(
 ) -> Result<Option<String>, rusqlite::Error> {
     conn.query_row(
         "SELECT id FROM mcp_servers WHERE enabled = 1 AND name = ?1
-           AND (project_id IS NULL OR (?2 IS NOT NULL AND project_id = ?2))
-         ORDER BY project_id IS NOT NULL, id
+           AND ?2 IS NOT NULL AND project_id = ?2 AND authorization_state = 'configured'
+         ORDER BY id
          LIMIT 1 OFFSET ?3",
         params![name, project_id, offset as i64],
         |r| r.get(0),
@@ -182,7 +182,8 @@ pub fn find_mcp_instance_id(
 pub fn list_mcp_servers(conn: &Connection, project_id: Option<&str>) -> Result<Vec<McpServer>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id, name, server_type, command, args, env, enabled, description, homepage, created_at,
-                last_test_ok, last_test_at, last_test_error, project_id
+                last_test_ok, last_test_at, last_test_error, project_id, authorization_state,
+                allowed_tools, allowed_roots, network_policy, credential_keys
          FROM mcp_servers
          WHERE project_id IS NULL OR (?1 IS NOT NULL AND project_id = ?1)
          ORDER BY project_id IS NOT NULL, name, id"
@@ -204,6 +205,11 @@ pub fn list_mcp_servers(conn: &Connection, project_id: Option<&str>) -> Result<V
             last_test_at: row.get(11)?,
             last_test_error: row.get(12)?,
             project_id: row.get(13)?,
+            authorization_state: row.get(14)?,
+            allowed_tools: row.get(15)?,
+            allowed_roots: row.get(16)?,
+            network_policy: row.get(17)?,
+            credential_keys: row.get(18)?,
         })
     })?;
 
@@ -213,7 +219,8 @@ pub fn list_mcp_servers(conn: &Connection, project_id: Option<&str>) -> Result<V
 pub fn get_mcp_server(conn: &Connection, id: &str) -> Result<McpServer, rusqlite::Error> {
     conn.query_row(
         "SELECT id, name, server_type, command, args, env, enabled, description, homepage, created_at,
-                last_test_ok, last_test_at, last_test_error, project_id
+                last_test_ok, last_test_at, last_test_error, project_id, authorization_state,
+                allowed_tools, allowed_roots, network_policy, credential_keys
          FROM mcp_servers WHERE id = ?1",
         [id],
         |row| {
@@ -232,6 +239,11 @@ pub fn get_mcp_server(conn: &Connection, id: &str) -> Result<McpServer, rusqlite
                 last_test_at: row.get(11)?,
                 last_test_error: row.get(12)?,
                 project_id: row.get(13)?,
+                authorization_state: row.get(14)?,
+                allowed_tools: row.get(15)?,
+                allowed_roots: row.get(16)?,
+                network_policy: row.get(17)?,
+                credential_keys: row.get(18)?,
             })
         },
     )
@@ -249,7 +261,8 @@ pub fn update_mcp_server(
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
         "UPDATE mcp_servers SET name = ?2, server_type = ?3, command = ?4, env = ?5,
-                description = ?6, homepage = ?7 WHERE id = ?1",
+                description = ?6, homepage = ?7, authorization_state = 'unconfigured'
+         WHERE id = ?1",
         params![id, name, server_type, command, env, description, homepage],
     )?;
     Ok(())
@@ -257,9 +270,11 @@ pub fn update_mcp_server(
 
 pub fn insert_mcp_server(conn: &Connection, s: &McpServer) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO mcp_servers (id, name, server_type, command, args, env, enabled, description, homepage, created_at, project_id)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-        params![s.id, s.name, s.server_type, s.command, s.args, s.env, s.enabled, s.description, s.homepage, s.created_at, s.project_id],
+        "INSERT INTO mcp_servers (id, name, server_type, command, args, env, enabled, description, homepage, created_at, project_id,
+                                  authorization_state, allowed_tools, allowed_roots, network_policy, credential_keys)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        params![s.id, s.name, s.server_type, s.command, s.args, s.env, s.enabled, s.description, s.homepage, s.created_at, s.project_id,
+                s.authorization_state, s.allowed_tools, s.allowed_roots, s.network_policy, s.credential_keys],
     )?;
     Ok(())
 }
@@ -267,6 +282,24 @@ pub fn insert_mcp_server(conn: &Connection, s: &McpServer) -> Result<(), rusqlit
 pub fn toggle_mcp_server(conn: &Connection, id: &str, enabled: bool) -> Result<(), rusqlite::Error> {
     conn.execute("UPDATE mcp_servers SET enabled = ?2 WHERE id = ?1", params![id, enabled])?;
     Ok(())
+}
+
+pub fn authorize_mcp_server(
+    conn: &Connection,
+    id: &str,
+    project_id: &str,
+    allowed_tools: &str,
+    allowed_roots: &str,
+    network_policy: &str,
+    credential_keys: &str,
+) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "UPDATE mcp_servers
+         SET authorization_state='configured', allowed_tools=?3, allowed_roots=?4,
+             network_policy=?5, credential_keys=?6
+         WHERE id=?1 AND project_id=?2",
+        params![id, project_id, allowed_tools, allowed_roots, network_policy, credential_keys],
+    )
 }
 
 /// 记录最近一次连接测试结果（成功时清空错误信息）

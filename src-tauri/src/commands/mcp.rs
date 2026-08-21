@@ -12,7 +12,7 @@ pub struct CreateMcpInput {
     pub env: Option<serde_json::Value>,
     pub description: Option<String>,
     pub homepage: Option<String>,
-    /// 作用域：None=用户级(全局)；Some=仅该项目生效
+    /// 作用域：None=全局配置模板；Some=仅该项目可授权
     #[serde(default)]
     pub project_id: Option<String>,
 }
@@ -35,6 +35,16 @@ pub struct UpdateMcpInput {
     pub env: Option<serde_json::Value>,
     pub description: Option<String>,
     pub homepage: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpAuthorizationInput {
+    pub project_id: String,
+    pub allowed_tools: Vec<String>,
+    pub allowed_roots: Vec<String>,
+    pub network_policy: String,
+    #[serde(default)]
+    pub credential_keys: Vec<String>,
 }
 
 /// 从 HTTP(S) URL 获取 MCP 配置 JSON 并解析为服务器列表。
@@ -100,6 +110,7 @@ pub async fn fetch_mcp_from_url(
 #[tauri::command]
 pub fn update_mcp_server(
     db: State<DbState>,
+    manager: State<'_, crate::services::mcp_manager::McpManager>,
     id: String,
     input: UpdateMcpInput,
 ) -> Result<McpServer, String> {
@@ -115,7 +126,10 @@ pub fn update_mcp_server(
         input.homepage.as_deref(),
     )
     .map_err(|e| e.to_string())?;
-    queries::get_mcp_server(&conn, &id).map_err(|e| e.to_string())
+    let server = queries::get_mcp_server(&conn, &id).map_err(|e| e.to_string())?;
+    drop(conn);
+    manager.disconnect(&[id]);
+    Ok(server)
 }
 
 /// 测试 MCP 服务器连接：以 stdio 方式启动进程并完成 initialize 握手。
@@ -147,39 +161,32 @@ async fn test_mcp_server_inner(
     db: &State<'_, DbState>,
     id: &str,
 ) -> Result<String, String> {
-    let server = {
+    let (server, project_root) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        queries::get_mcp_server(&conn, id).map_err(|e| e.to_string())?
+        let server = queries::get_mcp_server(&conn, id).map_err(|e| e.to_string())?;
+        let root = if let Some(project_id) = server.project_id.as_deref() {
+            conn.query_row(
+                "SELECT COALESCE(NULLIF(worktree_path, ''), path) FROM projects WHERE id=?1",
+                [project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(std::path::PathBuf::from)
+            .map_err(|e| format!("MCP 绑定项目不存在：{e}"))?
+        } else {
+            std::env::current_dir().map_err(|e| e.to_string())?
+        };
+        (server, root)
     };
 
     let command: Vec<String> = serde_json::from_str(&server.command)
         .unwrap_or_else(|_| vec![server.command.clone()]);
-    let env: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&server.env).unwrap_or_default();
     if command.is_empty() {
         return Err("启动命令为空".into());
     }
 
     let mut cmd = crate::utils::process::command(&command[0], &command[1..])?;
-    // MCP 子进程公共环境：移除 NODE_TLS_REJECT_UNAUTHORIZED 污染 + npx 独立 npm 缓存
-    // （测试与常驻连接并发 npx 时不再互相踩全局缓存导致 EPERM）；用户显式 env 后应用，可覆盖默认值
-    crate::utils::process::apply_mcp_child_env(&mut cmd, &command[0], id)?;
-    for (k, v) in &env {
-        if let Some(s) = v.as_str() {
-            cmd.env(k, s);
-        }
-    }
-    // 注入系统代理：npx/npm 首次拉取 MCP 依赖包时走代理（npm 原生读这些环境变量）。
-    // 用户显式配置的 env 优先——已设置代理变量时不再覆盖。
-    if !env.contains_key("HTTP_PROXY") && !env.contains_key("HTTPS_PROXY")
-        && !env.contains_key("http_proxy") && !env.contains_key("https_proxy")
-    {
-        if let Some(proxy) = crate::utils::net::read_system_proxy() {
-            for var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-                cmd.env(var, &proxy);
-            }
-        }
-    }
+    crate::services::mcp_policy::configure_test_environment(&mut cmd, &server, &command[0])?;
+    cmd.current_dir(project_root);
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -449,6 +456,11 @@ pub fn add_mcp_server(db: State<DbState>, input: CreateMcpInput) -> Result<McpSe
         last_test_at: None,
         last_test_error: None,
         project_id: input.project_id,
+        authorization_state: "unconfigured".into(),
+        allowed_tools: "[]".into(),
+        allowed_roots: "[\".\"]".into(),
+        network_policy: "deny".into(),
+        credential_keys: "[]".into(),
     };
 
     queries::insert_mcp_server(&conn, &server).map_err(|e| e.to_string())?;
@@ -456,9 +468,72 @@ pub fn add_mcp_server(db: State<DbState>, input: CreateMcpInput) -> Result<McpSe
 }
 
 #[tauri::command]
-pub fn toggle_mcp_server(db: State<DbState>, id: String, enabled: bool) -> Result<(), String> {
+pub fn toggle_mcp_server(
+    db: State<DbState>,
+    manager: State<'_, crate::services::mcp_manager::McpManager>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    queries::toggle_mcp_server(&conn, &id, enabled).map_err(|e| e.to_string())
+    queries::toggle_mcp_server(&conn, &id, enabled).map_err(|e| e.to_string())?;
+    drop(conn);
+    if !enabled {
+        manager.disconnect(&[id]);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn authorize_mcp_server(
+    db: State<DbState>,
+    manager: State<'_, crate::services::mcp_manager::McpManager>,
+    id: String,
+    input: McpAuthorizationInput,
+) -> Result<McpServer, String> {
+    crate::services::mcp_policy::validate_authorization(
+        &input.allowed_tools,
+        &input.allowed_roots,
+        &input.network_policy,
+        &input.credential_keys,
+    )?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let existing = queries::get_mcp_server(&tx, &id).map_err(|e| e.to_string())?;
+    crate::services::mcp_policy::validate_server_command(&existing)?;
+    let changed = queries::authorize_mcp_server(
+        &tx,
+        &id,
+        &input.project_id,
+        &serde_json::to_string(&input.allowed_tools).map_err(|e| e.to_string())?,
+        &serde_json::to_string(&input.allowed_roots).map_err(|e| e.to_string())?,
+        &input.network_policy,
+        &serde_json::to_string(&input.credential_keys).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if changed != 1 {
+        return Err("只能授权已绑定到当前项目的 MCP；请先克隆全局配置到项目".into());
+    }
+    crate::agent::enterprise::audit(
+        &tx,
+        None,
+        None,
+        "user",
+        "mcp.authorization.update",
+        &id,
+        "configured",
+        &serde_json::json!({
+            "project_id": input.project_id,
+            "allowed_tools": input.allowed_tools,
+            "allowed_roots": input.allowed_roots,
+            "network_policy": input.network_policy,
+            "credential_keys": input.credential_keys,
+        }),
+    )?;
+    let server = queries::get_mcp_server(&tx, &id).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    drop(conn);
+    manager.disconnect(&[id]);
+    Ok(server)
 }
 
 #[tauri::command]
@@ -497,6 +572,11 @@ pub fn clone_mcp_server(
     src.last_test_at = None;
     src.last_test_error = None;
     src.created_at = chrono::Utc::now().timestamp();
+    src.authorization_state = "unconfigured".into();
+    src.allowed_tools = "[]".into();
+    src.allowed_roots = "[\".\"]".into();
+    src.network_policy = "deny".into();
+    src.credential_keys = "[]".into();
     queries::insert_mcp_server(&conn, &src).map_err(|e| e.to_string())?;
     Ok(src)
 }
@@ -585,6 +665,11 @@ pub fn import_mcp_config(
             last_test_at: None,
             last_test_error: None,
             project_id: target_project_id.clone(),
+            authorization_state: "unconfigured".into(),
+            allowed_tools: "[]".into(),
+            allowed_roots: "[\".\"]".into(),
+            network_policy: "deny".into(),
+            credential_keys: "[]".into(),
         };
         queries::insert_mcp_server(&conn, &server).map_err(|e| e.to_string())?;
         imported += 1;

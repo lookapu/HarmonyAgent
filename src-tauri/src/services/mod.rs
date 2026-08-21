@@ -31,6 +31,7 @@ pub mod llm_replay;
 pub mod maintenance;
 pub mod mcp_client;
 pub mod mcp_manager;
+pub mod mcp_policy;
 pub mod model_router;
 pub mod node_runtime;
 pub mod ohpm_landscape;

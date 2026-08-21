@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { listMcpServers, addMcpServer, updateMcpServer, testMcpServer, toggleMcpServer, removeMcpServer, cloneMcpServer, exportMcpConfig, importMcpConfig, fetchMcpFromUrl, listMcpUsageStats, type McpServer, type CreateMcpInput, type McpDraft, type McpUsageStat } from '../api/mcp'
+import { listMcpServers, addMcpServer, updateMcpServer, testMcpServer, toggleMcpServer, authorizeMcpServer, removeMcpServer, cloneMcpServer, exportMcpConfig, importMcpConfig, fetchMcpFromUrl, listMcpUsageStats, type McpServer, type CreateMcpInput, type McpDraft, type McpUsageStat } from '../api/mcp'
 import { mcpTemplates, matchMcpTemplate, templateEnvDefaults, type McpTemplate } from '../data/mcpTemplates'
 import { useProjectStore } from '../stores/projectStore'
 
@@ -34,6 +34,22 @@ function envToText(json: string): string {
   }
 }
 
+function envKeys(json: string): string {
+  try {
+    return Object.keys(JSON.parse(json) as Record<string, string>).join(', ')
+  } catch {
+    return ''
+  }
+}
+
+function jsonArrayText(json: string): string {
+  try {
+    return (JSON.parse(json) as string[]).join(', ')
+  } catch {
+    return ''
+  }
+}
+
 /** 格式化时间戳为可读文本 */
 function formatTime(ts: number): string {
   const d = new Date(ts * 1000)
@@ -54,6 +70,8 @@ export default function McpPage() {
   const [addedKeys, setAddedKeys] = useState<Set<string>>(new Set())
   const [editingId, setEditingId] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<Record<string, string>>({})
+  const [authEditingId, setAuthEditingId] = useState<string | null>(null)
+  const [authForm, setAuthForm] = useState({ tools: '', roots: '.', network: 'deny' as 'deny' | 'allow', credentials: '' })
   const [fetchUrl, setFetchUrl] = useState('')
   const [fetchProxy, setFetchProxy] = useState(false)
   const [fetching, setFetching] = useState(false)
@@ -202,6 +220,31 @@ export default function McpPage() {
   const handleToggle = async (id: string, enabled: boolean) => {
     await toggleMcpServer(id, !enabled)
     load()
+  }
+
+  const parseList = (raw: string): string[] => raw.split(/[\n,]/).map((v) => v.trim()).filter(Boolean)
+
+  const openAuthorization = (server: McpServer) => {
+    setAuthEditingId(server.id)
+    setAuthForm({
+      tools: jsonArrayText(server.allowed_tools),
+      roots: jsonArrayText(server.allowed_roots) || '.',
+      network: server.network_policy === 'allow' ? 'allow' : 'deny',
+      credentials: jsonArrayText(server.credential_keys),
+    })
+  }
+
+  const saveAuthorization = async (server: McpServer) => {
+    if (!projectId || server.project_id !== projectId) return
+    await authorizeMcpServer(server.id, {
+      project_id: projectId,
+      allowed_tools: parseList(authForm.tools),
+      allowed_roots: parseList(authForm.roots),
+      network_policy: authForm.network,
+      credential_keys: parseList(authForm.credentials),
+    })
+    setAuthEditingId(null)
+    await load()
   }
 
   /** 当前表单命令匹配到的模板环境变量说明（用于智能填写指导） */
@@ -613,12 +656,21 @@ export default function McpPage() {
                     {s.last_test_at === null ? t('mcp.notTested') : s.last_test_ok ? t('mcp.healthOk') : t('mcp.healthBad')}
                   </span>
                 )}
+                <span className={`text-xs px-2 py-0.5 rounded border ${
+                  s.authorization_state === 'configured'
+                    ? 'bg-[var(--success)]/10 text-[var(--success)] border-[var(--success)]/30'
+                    : 'bg-[var(--warning)]/10 text-[var(--warning)] border-[var(--warning)]/30'
+                }`}>
+                  {s.project_id
+                    ? (s.authorization_state === 'configured' ? t('mcp.authorized') : t('mcp.authorizationRequired'))
+                    : t('mcp.globalTemplateOnly')}
+                </span>
               </div>
               {s.description && <p className="text-xs text-[var(--text-secondary)] mt-1">{s.description}</p>}
               <p className="text-xs text-[var(--text-secondary)] mt-1 font-mono break-all">{s.command}</p>
-              {envToText(s.env) && (
+              {envKeys(s.env) && (
                 <p className="text-[10px] text-[var(--text-muted)] mt-1 font-mono break-all">
-                  {t('mcp.envSummary', { env: envToText(s.env).replace(/\n/g, ', ') })}
+                  {t('mcp.envSummary', { env: envKeys(s.env) })}
                 </p>
               )}
               <p className="text-[10px] text-[var(--text-muted)] mt-0.5">{t('mcp.createdAt', { time: formatTime(s.created_at) })}</p>
@@ -630,6 +682,31 @@ export default function McpPage() {
                   {testResult[s.id]}
                 </p>
               )}
+              {s.authorization_state === 'configured' && s.project_id && (
+                <p className="text-[10px] text-[var(--text-muted)] mt-1">
+                  {t('mcp.authorizationSummary', {
+                    tools: jsonArrayText(s.allowed_tools),
+                    roots: jsonArrayText(s.allowed_roots),
+                    network: s.network_policy,
+                  })}
+                </p>
+              )}
+              {authEditingId === s.id && s.project_id === projectId && (
+                <div className="mt-3 p-3 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] space-y-2 max-w-2xl">
+                  <p className="text-[11px] text-[var(--warning)]">{t('mcp.authorizationHint')}</p>
+                  <input value={authForm.tools} onChange={(e) => setAuthForm({ ...authForm, tools: e.target.value })} placeholder={t('mcp.allowedToolsPlaceholder')} className="w-full h-8 px-2 rounded border border-[var(--border)] bg-transparent text-xs font-mono" />
+                  <input value={authForm.roots} onChange={(e) => setAuthForm({ ...authForm, roots: e.target.value })} placeholder={t('mcp.allowedRootsPlaceholder')} className="w-full h-8 px-2 rounded border border-[var(--border)] bg-transparent text-xs font-mono" />
+                  <div className="flex gap-2">
+                    <select value={authForm.network} onChange={(e) => setAuthForm({ ...authForm, network: e.target.value as 'deny' | 'allow' })} className="h-8 px-2 rounded border border-[var(--border)] bg-[var(--bg-card)] text-xs">
+                      <option value="deny">{t('mcp.networkDeny')}</option>
+                      <option value="allow">{t('mcp.networkAllow')}</option>
+                    </select>
+                    <input value={authForm.credentials} onChange={(e) => setAuthForm({ ...authForm, credentials: e.target.value })} placeholder={t('mcp.credentialKeysPlaceholder')} className="flex-1 h-8 px-2 rounded border border-[var(--border)] bg-transparent text-xs font-mono" />
+                    <button onClick={() => saveAuthorization(s)} className="px-3 h-8 rounded bg-[var(--accent)] text-white text-xs">{t('mcp.saveAuthorization')}</button>
+                    <button onClick={() => setAuthEditingId(null)} className="px-3 h-8 rounded border border-[var(--border)] text-xs">{t('mcp.cancel')}</button>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <button
@@ -638,6 +715,14 @@ export default function McpPage() {
               >
                 {t('mcp.test')}
               </button>
+              {s.project_id === projectId && (
+                <button
+                  onClick={() => openAuthorization(s)}
+                  className="px-3 py-1 text-xs border border-[var(--warning)] text-[var(--warning)] rounded hover:bg-[var(--warning)]/10 transition-colors"
+                >
+                  {t('mcp.authorization')}
+                </button>
+              )}
               <button
                 onClick={() => (editingId === s.id ? setEditingId(null) : handleEdit(s))}
                 className="px-3 py-1 text-xs border border-[var(--accent)] text-[var(--accent)] rounded hover:bg-[var(--accent-soft)] transition-colors"
@@ -827,8 +912,5 @@ function McpUsageView({
     </div>
   )
 }
-
-
-
 
 

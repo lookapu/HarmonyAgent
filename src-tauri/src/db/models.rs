@@ -108,8 +108,18 @@ pub struct McpServer {
     pub last_test_ok: Option<bool>,
     pub last_test_at: Option<i64>,
     pub last_test_error: Option<String>,
-    /// 作用域：NULL=用户级（全局，对所有项目生效）；非空=仅该项目生效
+    /// 作用域：NULL=全局配置模板（不直接进入 Agent）；非空=仅该项目可授权
     pub project_id: Option<String>,
+    /// EC09 项目授权。旧配置保持 unconfigured，不能进入 Agent 工具面。
+    pub authorization_state: String,
+    /// JSON 字符串数组；只暴露并允许调用列出的 MCP 工具。
+    pub allowed_tools: String,
+    /// JSON 字符串数组；相对路径以项目根解析，路径参数不得越界。
+    pub allowed_roots: String,
+    /// deny|allow；deny 时拒绝带 URL/网络语义的调用，且不注入代理。
+    pub network_policy: String,
+    /// JSON 字符串数组；敏感环境变量只有显式列出才传给 MCP 子进程。
+    pub credential_keys: String,
 }
 
 /// 用户自定义鸿蒙知识条目

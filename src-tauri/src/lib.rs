@@ -549,6 +549,7 @@ pub fn run() {
             commands::mcp::update_mcp_server,
             commands::mcp::test_mcp_server,
             commands::mcp::toggle_mcp_server,
+            commands::mcp::authorize_mcp_server,
             commands::mcp::remove_mcp_server,
             commands::mcp::clone_mcp_server,
             commands::mcp::export_mcp_config,

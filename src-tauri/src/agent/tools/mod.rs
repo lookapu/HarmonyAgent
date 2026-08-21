@@ -1101,27 +1101,43 @@ pub async fn run_tool(
     // MCP 工具：转发到对应服务器执行（tools/call）
     // 同名多实例：hint 中带 #n 后缀（mysql#2），按同一排序规则查 DB 定位实例后按 id 精确调用
     if let Some((server, tool)) = parse_mcp_tool_name(name) {
-        if let Some((base, n)) = split_instance_name(&server) {
-            let instance_id = {
-                let conn = db.0.lock().map_err(|e| e.to_string())?;
-                crate::db::queries::find_mcp_instance_id(
+        let (lookup_name, offset) = split_instance_name(&server)
+            .map(|(base, n)| (base, n - 1))
+            .unwrap_or((server.as_str(), 0));
+        let (id, policy) = {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            let mut id = crate::db::queries::find_mcp_instance_id(
+                &conn,
+                lookup_name,
+                Some(project_id),
+                offset,
+            )
+            .map_err(|e| e.to_string())?;
+            // 唯一实例名称本身可能含 #n；编号解析未命中时按完整名称回退。
+            if id.is_none() && lookup_name != server {
+                id = crate::db::queries::find_mcp_instance_id(
                     &conn,
-                    base,
+                    &server,
                     Some(project_id),
-                    n - 1,
+                    0,
                 )
-                .map_err(|e| e.to_string())?
-            };
-            if let Some(id) = instance_id {
-                let mcp_result = mcp.call_by_id(&id, &tool, args.clone()).await;
-                // 统一出口脱敏（[57]）：MCP 返回同样过文本级遮罩
-                return mcp_result
-                    .map(|ok| crate::utils::redact::redact_text(&ok))
-                    .map_err(|err| crate::utils::redact::redact_text(&err));
+                .map_err(|e| e.to_string())?;
             }
-            // 查不到编号实例：可能是用户实例名本身含 #n（唯一实例），回退旧路径按全名匹配
-        }
-        let mcp_result = mcp.call(&server, &tool, args.clone(), Some(project_id)).await;
+            let id = id.ok_or_else(|| {
+                format!("MCP 服务器 {server} 未绑定当前项目、未授权或未启用")
+            })?;
+            let policy = crate::db::queries::get_mcp_server(&conn, &id)
+                .map_err(|e| e.to_string())?;
+            (id, policy)
+        };
+        crate::services::mcp_policy::validate_call(
+            &policy,
+            project_id,
+            std::path::Path::new(project_path),
+            &tool,
+            &args,
+        )?;
+        let mcp_result = mcp.call_by_id(&id, &tool, args.clone()).await;
         // 统一出口脱敏（[57]）：MCP 返回同样过文本级遮罩
         return mcp_result
             .map(|ok| crate::utils::redact::redact_text(&ok))
@@ -1263,7 +1279,7 @@ pub async fn run_tool(
         "search_knowledge" => memory_tools::search_knowledge(&args, project_id, db).await,
         "manage_memory" => memory_tools::manage_memory(&args, project_id, db).await,
         "manage_knowledge" => memory_tools::manage_knowledge(&args, project_id, db).await,
-        "list_mcp_servers" => memory_tools::list_mcp_servers(&args, project_id, db, mcp).await,
+        "list_mcp_servers" => memory_tools::list_mcp_servers(&args, project_path, project_id, db, mcp).await,
         "use_skill" => skill_tools::use_skill(&args, &ctx.conversation_id, project_id, db).await,
         "review_changes" => git_tools::review_changes(&args, &roots).await,
         "plan_task" => memory_tools::plan_task(&args, ctx).await,

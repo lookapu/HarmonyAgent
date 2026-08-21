@@ -26,9 +26,6 @@ pub struct McpToolDef {
 /// MCP 服务器子进程客户端（请求串行化：帧读写非并发安全）
 pub struct McpClient {
     pub server_id: String,
-    pub server_name: String,
-    /// 作用域：None=用户级（全局），Some=仅该项目（调用路由时优先匹配）
-    pub project_id: Option<String>,
     child: Child,
     /// 内部可变性：request 通过共享引用读写（Arc 持有 + 串行锁）
     stdin: tokio::sync::Mutex<ChildStdin>,
@@ -47,38 +44,16 @@ pub struct McpClient {
 impl McpClient {
     /// 启动 MCP 服务器子进程并完成 initialize 握手。
     /// 启动命令解析、内置 Node 兜底、系统代理注入与 MCP 页测试连接保持一致。
-    pub async fn connect(server: &McpServer) -> Result<Self, String> {
+    pub async fn connect(server: &McpServer, project_root: &std::path::Path) -> Result<Self, String> {
         let command: Vec<String> = serde_json::from_str(&server.command)
             .unwrap_or_else(|_| vec![server.command.clone()]);
-        let env: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&server.env).unwrap_or_default();
         if command.is_empty() {
             return Err("启动命令为空".into());
         }
 
         let mut cmd = crate::utils::process::command(&command[0], &command[1..])?;
-        // MCP 子进程公共环境：移除 NODE_TLS_REJECT_UNAUTHORIZED 污染 + npx 独立 npm 缓存
-        // （与 MCP 页测试连接共用同一缓存目录，避免多进程并发写全局缓存导致 EPERM）；
-        // 用户显式 env 后应用，可覆盖默认值
-        crate::utils::process::apply_mcp_child_env(&mut cmd, &command[0], &server.id)?;
-        for (k, v) in &env {
-            if let Some(s) = v.as_str() {
-                cmd.env(k, s);
-            }
-        }
-        // 注入系统代理：npx/npm 首次拉取 MCP 依赖包时走代理（npm 原生读这些环境变量）。
-        // 用户显式配置的 env 优先——已设置代理变量时不再覆盖。
-        if !env.contains_key("HTTP_PROXY")
-            && !env.contains_key("HTTPS_PROXY")
-            && !env.contains_key("http_proxy")
-            && !env.contains_key("https_proxy")
-        {
-            if let Some(proxy) = crate::utils::net::read_system_proxy() {
-                for var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-                    cmd.env(var, &proxy);
-                }
-            }
-        }
+        crate::services::mcp_policy::configure_child_environment(&mut cmd, server, &command[0])?;
+        cmd.current_dir(project_root);
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -112,8 +87,6 @@ impl McpClient {
 
         let client = Self {
             server_id: server.id.clone(),
-            server_name: server.name.clone(),
-            project_id: server.project_id.clone(),
             child,
             stdin: tokio::sync::Mutex::new(stdin),
             stdout: tokio::sync::Mutex::new(BufReader::new(stdout)),

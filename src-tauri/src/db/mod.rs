@@ -148,9 +148,10 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (68, "068_conversation_branches", include_str!("../../migrations/068_conversation_branches.sql")),
     (69, "069_tool_quality_governance", include_str!("../../migrations/069_tool_quality_governance.sql")),
     (70, "070_skill_manifest_v1", include_str!("../../migrations/070_skill_manifest_v1.sql")),
+    (71, "071_mcp_project_authorization", include_str!("../../migrations/071_mcp_project_authorization.sql")),
 ];
 
-fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
             id INTEGER PRIMARY KEY,
