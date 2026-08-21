@@ -150,6 +150,22 @@ pub(super) async fn build_project(
         plan.scope, target_key, mode, spec.clean, spec.dependencies
     );
     let fingerprint = crate::services::harmony_build::project_fingerprint(root);
+    ctx.record_run_event(
+        "harmony.build.planned",
+        serde_json::json!({
+            "project_path": project_path,
+            "project_fingerprint": fingerprint,
+            "scope": plan.scope,
+            "mode": mode,
+            "targets": plan.targets.iter().map(|target| serde_json::json!({
+                "module": target.module,
+                "product": target.product,
+                "mode": target.mode,
+                "task": target.task,
+            })).collect::<Vec<_>>(),
+            "workflow_key": workflow_key,
+        }),
+    );
     let (mut checkpoint, resumed) =
         crate::services::harmony_build::begin(root, &workflow_key, &fingerprint);
     if resumed {
@@ -450,6 +466,23 @@ pub(super) async fn build_project(
         if !removed.is_empty() {
             emit_knowledge_candidate(ctx, project_path, "build_project", &removed, &combined);
         }
+        ctx.record_run_event(
+            "harmony.build.completed",
+            serde_json::json!({
+                "project_path": project_path,
+                "mode": mode,
+                "elapsed_ms": build_started.elapsed().as_millis(),
+                "log_path": log_path,
+                "artifacts": artifacts.iter().map(|artifact| serde_json::json!({
+                    "path": artifact.path,
+                    "kind": artifact.kind,
+                    "module": artifact.module,
+                    "product": artifact.product,
+                    "signing_status": artifact.signing_status,
+                    "sha256": artifact.sha256,
+                })).collect::<Vec<_>>(),
+            }),
+        );
         // 工具结果只回传尾部，避免上下文爆炸；完整日志可通过 get_build_log 读取
         summary.push_str(&tail(&combined, 2000));
         Ok(summary)
@@ -466,6 +499,17 @@ pub(super) async fn build_project(
             &format!("构建失败（退出码 {failed_exit_code:?}）"),
         );
         if errors.is_empty() {
+            ctx.record_run_event(
+                "harmony.build.failed",
+                serde_json::json!({
+                    "project_path": project_path,
+                    "mode": mode,
+                    "category": "build_failed",
+                    "exit_code": failed_exit_code,
+                    "log_path": log_path,
+                    "evidence": tail(&combined, 1500),
+                }),
+            );
             return Err(with_advice(
                 "build_project",
                 structured_tool_error(
@@ -615,6 +659,24 @@ pub(super) async fn build_project(
             Some(&log_path.display().to_string()),
             "",
             &matched,
+        );
+        ctx.record_run_event(
+            "harmony.build.failed",
+            serde_json::json!({
+                "project_path": project_path,
+                "mode": mode,
+                "category": dom_cat,
+                "exit_code": failed_exit_code,
+                "log_path": log_path,
+                "errors": errors.iter().take(20).map(|error| serde_json::json!({
+                    "category": error.category,
+                    "stage": error.stage,
+                    "code": error.error_code,
+                    "file": error.file,
+                    "line": error.line,
+                    "message": error.message,
+                })).collect::<Vec<_>>(),
+            }),
         );
         Err(err)
     }
@@ -828,6 +890,18 @@ pub(super) async fn deploy(
         out.push_str("检测到已安装同包名应用，执行覆盖安装（-r）\n");
         ctx.emit_log("system", "检测到已安装版本，覆盖安装");
     }
+    ctx.record_run_event(
+        "harmony.deploy.started",
+        serde_json::json!({
+            "project_path": project_path,
+            "device_id": device_id,
+            "bundle": info.bundle_name,
+            "artifact_path": hap,
+            "artifact_signed": is_signed,
+            "selection": selection_note,
+            "install_mode": if already_installed { "replace" } else { "fresh" },
+        }),
+    );
 
     // 3. 安装（流式推送安装输出）
     ctx.emit_log(
@@ -890,6 +964,17 @@ pub(super) async fn deploy(
                     .unwrap_or(0),
             },
         );
+        ctx.record_run_event(
+            "harmony.deploy.failed",
+            serde_json::json!({
+                "project_path": project_path,
+                "device_id": device_id,
+                "bundle": info.bundle_name,
+                "stage": "install",
+                "category": cat,
+                "evidence": tail(&install_text, 1200),
+            }),
+        );
         return Err(msg);
     }
     // 安装成功：清除该项目部署失败归因；若此前有失败，推送修复经验候选
@@ -897,6 +982,16 @@ pub(super) async fn deploy(
     if !removed.is_empty() {
         emit_knowledge_candidate(ctx, project_path, "deploy_hap", &removed, &install_text);
     }
+    ctx.record_run_event(
+        "harmony.deploy.installed",
+        serde_json::json!({
+            "project_path": project_path,
+            "device_id": device_id,
+            "bundle": info.bundle_name,
+            "install_mode": if already_installed { "replace" } else { "fresh" },
+            "evidence": tail(&install_text, 500),
+        }),
+    );
 
     // 4. 拉起应用（鸿蒙用 aa start，不是 am start）
     let bundle = match info.bundle_name.as_deref() {
@@ -925,6 +1020,18 @@ pub(super) async fn deploy(
             } else {
                 "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
             };
+            ctx.record_run_event(
+                "harmony.deploy.failed",
+                serde_json::json!({
+                    "project_path": project_path,
+                    "device_id": device_id,
+                    "bundle": bundle,
+                    "stage": "ability_start",
+                    "category": "ability_start_failed",
+                    "evidence": evidence,
+                    "recovery": recovery,
+                }),
+            );
             return Err(format!(
                 "拉起失败: {error}\n日志证据:\n{}\n{recovery}",
                 if evidence.is_empty() {
@@ -976,6 +1083,17 @@ pub(super) async fn deploy(
                 .join("\n");
             emit_knowledge_candidate(ctx, project_path, "crash_analysis", &removed, &crash_log);
         }
+        ctx.record_run_event(
+            "harmony.deploy.completed",
+            serde_json::json!({
+                "project_path": project_path,
+                "device_id": device_id,
+                "bundle": bundle,
+                "ability": ability,
+                "status": "stable",
+                "runtime_log": "watching",
+            }),
+        );
     } else {
         out.push_str("\n❌ 应用启动后崩溃（未在 ability 栈中持续存活）。\n");
         ctx.emit_log("system", "应用启动后崩溃，正在抓取 faultlog 与 hilog…");
@@ -1075,6 +1193,19 @@ pub(super) async fn deploy(
         } else {
             out.push_str("恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。\n");
         }
+        ctx.record_run_event(
+            "harmony.runtime.anomaly",
+            serde_json::json!({
+                "project_path": project_path,
+                "device_id": device_id,
+                "bundle": bundle,
+                "source": if faultlog.is_empty() { "hilog" } else { "faultlog+hilog" },
+                "category": report.category,
+                "summary": report.summary,
+                "locations": report.locations,
+                "evidence": tail(&report.snippet, 1200),
+            }),
+        );
         return Err(out);
     }
     // 记住本次使用的设备
@@ -1244,6 +1375,19 @@ pub(super) async fn deploy_one_device(
             }
         }
     }
+    ctx.record_run_event(
+        "harmony.deploy.started",
+        serde_json::json!({
+            "project_path": project_path,
+            "project_id": project_id,
+            "device_id": device_id,
+            "bundle": bundle,
+            "artifact_path": hap,
+            "artifact_signed": is_signed,
+            "install_mode": if already_installed { "replace" } else { "fresh" },
+            "multi_device": true,
+        }),
+    );
     let install_args: Vec<String> = if already_installed {
         vec!["-t", device_id, "install", "-r", hap]
             .into_iter()
@@ -1262,12 +1406,35 @@ pub(super) async fn deploy_one_device(
     let install_text = smart_decode(&install_out.stdout) + &smart_decode(&install_out.stderr);
     if !install_out.status.success() {
         let (cat, msg) = classify_deploy_error(&install_text, is_signed);
+        ctx.record_run_event(
+            "harmony.deploy.failed",
+            serde_json::json!({
+                "project_path": project_path,
+                "project_id": project_id,
+                "device_id": device_id,
+                "bundle": bundle,
+                "stage": "install",
+                "category": cat,
+                "evidence": tail(&install_text, 1200),
+                "multi_device": true,
+            }),
+        );
         return Err(format!(
             "[{cat}] {}",
             msg.lines().next().unwrap_or("安装失败")
         ));
     }
     out.push_str(" 安装成功\n");
+    ctx.record_run_event(
+        "harmony.deploy.installed",
+        serde_json::json!({
+            "project_path": project_path,
+            "device_id": device_id,
+            "bundle": bundle,
+            "install_mode": if already_installed { "replace" } else { "fresh" },
+            "multi_device": true,
+        }),
+    );
 
     if bundle.is_empty() {
         out.push_str("（未解析到 bundleName，跳过拉起）\n");
@@ -1284,6 +1451,19 @@ pub(super) async fn deploy_one_device(
         } else {
             "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
         };
+        ctx.record_run_event(
+            "harmony.deploy.failed",
+            serde_json::json!({
+                "project_path": project_path,
+                "device_id": device_id,
+                "bundle": bundle,
+                "stage": "ability_start",
+                "category": "ability_start_failed",
+                "evidence": evidence,
+                "recovery": recovery,
+                "multi_device": true,
+            }),
+        );
         return Err(format!(
             "拉起失败: {error}；日志证据: {}；{recovery}",
             if evidence.is_empty() {
@@ -1315,7 +1495,18 @@ pub(super) async fn deploy_one_device(
                 crate::agent::runtime_log::start(project_path, ctx, device_id, bundle);
             }
         }
-        let _ = project_id;
+        ctx.record_run_event(
+            "harmony.deploy.completed",
+            serde_json::json!({
+                "project_path": project_path,
+                "project_id": project_id,
+                "device_id": device_id,
+                "bundle": bundle,
+                "ability": ability,
+                "status": "stable",
+                "multi_device": true,
+            }),
+        );
         Ok(out)
     } else {
         // 崩溃归因
@@ -1352,6 +1543,21 @@ pub(super) async fn deploy_one_device(
         } else {
             "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
         };
+        ctx.record_run_event(
+            "harmony.runtime.anomaly",
+            serde_json::json!({
+                "project_path": project_path,
+                "project_id": project_id,
+                "device_id": device_id,
+                "bundle": bundle,
+                "source": if faultlog.is_empty() { "hilog" } else { "faultlog+hilog" },
+                "category": report.category,
+                "summary": report.summary,
+                "evidence": tail(&report.snippet, 1200),
+                "recovery": recovery,
+                "multi_device": true,
+            }),
+        );
         Err(format!(
             "启动后崩溃 [{}]: {}；{recovery}",
             report.category,

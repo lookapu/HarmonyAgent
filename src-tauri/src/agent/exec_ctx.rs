@@ -122,6 +122,23 @@ impl ToolCtx {
             );
         }
     }
+
+    /// 把领域事件追加到当前持久 Run；租约过期或无 Run 时静默拒绝，避免后台旧任务污染新 Run。
+    pub fn record_run_event(&self, event_type: &str, payload: serde_json::Value) {
+        if self.run_id.is_empty() || self.conversation_id.is_empty() {
+            return;
+        }
+        let Some(app) = self.app.as_ref() else { return };
+        let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
+        let Ok(conn) = db.0.lock() else { return };
+        let _ = crate::agent::runtime::append_event(
+            &conn,
+            &self.run_id,
+            &self.conversation_id,
+            event_type,
+            payload,
+        );
+    }
 }
 
 #[derive(serde::Serialize, Clone)]

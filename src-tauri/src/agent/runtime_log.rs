@@ -226,11 +226,23 @@ fn flush_anomaly(key: &str, ctx: &ToolCtx, kind: &str, lines: &[String]) {
         },
     );
 
+    ctx.record_run_event(
+        "harmony.runtime.anomaly",
+        serde_json::json!({
+            "project_path": key,
+            "category": kind,
+            "source": "hilog",
+            "summary": summary,
+            "detail": truncate(&joined, 1200),
+        }),
+    );
+
     if let Some(app) = &ctx.app {
         let _ = app.emit(
             "runtime-anomaly",
             serde_json::json!({
                 "conversation_id": ctx.conversation_id,
+                "run_id": ctx.run_id,
                 "project_path": key,
                 "category": kind,
                 "summary": summary,
@@ -251,7 +263,7 @@ fn classify(lower: &str) -> String {
         "arkts_range_error"
     } else if lower.contains("native crash") || lower.contains("sigsegv") || lower.contains("cppcrash") {
         "native_crash"
-    } else if lower.contains("appfreeze") {
+    } else if lower.contains("appfreeze") || lower.contains("anr") || lower.contains("not responding") {
         "app_freeze"
     } else if lower.contains("permission") {
         "permission_missing"
@@ -278,6 +290,7 @@ mod tests {
         assert_eq!(classify("f referenceerror bar"), "arkts_reference_error");
         assert_eq!(classify("native crash sigsegv"), "native_crash");
         assert_eq!(classify("appfreeze detected"), "app_freeze");
+        assert_eq!(classify("application not responding anr"), "app_freeze");
         assert_eq!(classify("permission denied"), "permission_missing");
         assert_eq!(classify("some weird error"), "runtime_error");
     }
