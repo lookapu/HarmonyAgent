@@ -198,4 +198,3 @@ fn expand_home(p: &str) -> Option<String> {
     }
     Some(p.to_string())
 }
-

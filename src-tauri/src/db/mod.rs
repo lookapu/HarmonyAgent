@@ -137,6 +137,8 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (59, "059_execution_kernel_v2", include_str!("../../migrations/059_execution_kernel_v2.sql")),
     (60, "060_multi_worker_runtime", include_str!("../../migrations/060_multi_worker_runtime.sql")),
     (61, "061_tool_execution_kernel_v2", include_str!("../../migrations/061_tool_execution_kernel_v2.sql")),
+    (62, "062_tool_execution_threads", include_str!("../../migrations/062_tool_execution_threads.sql")),
+    (63, "063_conversation_context_v2", include_str!("../../migrations/063_conversation_context_v2.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -300,6 +302,29 @@ mod tests {
                 "agent_runs 迁移后缺少列 {c}: {run_cols:?}"
             );
         }
+        let tool_worker_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(tool_execution_workers)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in ["thread_id", "thread_name", "stuck_count"] {
+            assert!(
+                tool_worker_cols.iter().any(|x| x == c),
+                "tool_execution_workers 迁移后缺少列 {c}: {tool_worker_cols:?}"
+            );
+        }
+        let context_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                 ('conversation_context_state','conversation_context_facts',
+                  'conversation_context_artifacts','conversation_context_snapshots')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(context_tables, 4);
     }
 
     #[test]

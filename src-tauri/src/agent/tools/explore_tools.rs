@@ -1021,4 +1021,3 @@ pub(super) fn diff_api_versions(args: &Value, db: &crate::db::DbState) -> Result
 
     Ok(out)
 }
-

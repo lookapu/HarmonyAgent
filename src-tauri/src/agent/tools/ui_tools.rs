@@ -1919,4 +1919,3 @@ pub(super) async fn screenshot_diff(args: &Value, roots: &[String]) -> Result<St
     .await
     .map_err(|e| format!("截图对比任务异常: {e}"))?
 }
-

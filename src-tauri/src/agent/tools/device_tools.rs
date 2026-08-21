@@ -645,4 +645,3 @@ pub(super) fn summarize_crash_file(content: &str) -> String {
     }
     s
 }
-

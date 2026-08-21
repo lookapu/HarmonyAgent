@@ -718,4 +718,3 @@ pub(super) async fn conversation_search(
     }
     Ok(out)
 }
-

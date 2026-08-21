@@ -178,4 +178,3 @@ pub(super) fn format_results(source: &str, results: &[SearchResult]) -> String {
     }
     s
 }
-

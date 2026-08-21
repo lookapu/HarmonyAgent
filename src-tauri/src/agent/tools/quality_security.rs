@@ -545,4 +545,3 @@ fn copy_tree(src: &Path, dst: &Path, depth: u32) -> Result<u32, String> {
     }
     Ok(copied)
 }
-

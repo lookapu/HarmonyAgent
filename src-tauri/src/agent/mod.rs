@@ -3,6 +3,7 @@
 pub mod ask;
 pub mod acceptance;
 pub mod coordinator;
+pub mod context;
 pub mod diagnostics;
 pub mod governance;
 pub mod dag;

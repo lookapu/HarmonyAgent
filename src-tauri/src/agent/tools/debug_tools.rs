@@ -1133,4 +1133,3 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
     );
     Ok(out)
 }
-

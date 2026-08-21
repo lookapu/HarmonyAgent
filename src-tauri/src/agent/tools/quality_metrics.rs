@@ -996,4 +996,3 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
     }
 }
 
-
