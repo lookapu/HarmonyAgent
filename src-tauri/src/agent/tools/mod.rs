@@ -383,7 +383,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_sdk_api",
-        desc: "检索本地 HarmonyOS SDK 的声明文件（@ohos.*.d.ts），查找可用的 API 模块、Kit、系统能力与顶层声明。\n在需要确认某个鸿蒙 API 是否存在、属于哪个 Kit、从哪个 API level 引入（@since）、或有哪些接口/方法时使用。\n参数：{\"query\":\"<关键字，如 notification、AbilityKit、camera、@ohos.nfc>\",\"limit\":<可选返回条数，缺省 20>}。\n副作用：无（只读本地 SDK）。\n返回：匹配的模块列表，含模块名、Kit、syscap、since 版本与顶层声明名。需要精确签名时再用 read_sdk_api_module 读取完整声明。",
+        desc: "检索本机 HarmonyOS SDK 声明索引，覆盖 @ohos/@kit 模块、类型、权限、SystemCapability 和 @since/@deprecated 版本元数据。\n参数：{\"query\":\"<模块、Kit、类型、权限或能力关键字>\",\"limit\":<可选，缺省 20>}。索引每次查询按文件时间戳/大小增量刷新：未变复用、变化重扫、删除失效，并报告本轮统计；结果只来自当前配置的本机 SDK。\n副作用：无（只读本地 SDK）。\n返回：匹配模块、全部能力/权限、版本范围、类型声明与增量扫描统计；精确成员签名再用 read_sdk_api_module。",
     },
     ToolSpec {
         name: "read_sdk_api_module",

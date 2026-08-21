@@ -843,7 +843,7 @@ pub fn read_sdk_api_module(
 ) -> Result<String, String> {
     let env = detect(&state);
     let dir = default_api_dir(&env).ok_or_else(|| "未找到 SDK 的 ets/api 目录".to_string())?;
-    // 防目录穿越：只取文件名部分
+    // 防目录穿越：只取文件名部分，并从本机索引解析真实路径（兼容嵌套声明目录）
     let mut fname = Path::new(&module)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -852,10 +852,12 @@ pub fn read_sdk_api_module(
     if !fname.ends_with(".d.ts") {
         fname.push_str(".d.ts");
     }
-    let path = PathBuf::from(&dir).join(&fname);
-    if !path.is_file() {
+    let module_name = fname.trim_end_matches(".d.ts");
+    let idx = sdk_api::index_api_dir(&dir);
+    let path = idx.modules.iter().find(|item| item.module == module_name).map(|item| PathBuf::from(&item.path));
+    let Some(path) = path.filter(|path| path.is_file()) else {
         return Err(format!("未找到声明文件：{fname}"));
-    }
+    };
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 

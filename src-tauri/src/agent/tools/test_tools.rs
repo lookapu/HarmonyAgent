@@ -505,9 +505,9 @@ pub(super) async fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Res
             return Ok(format!("未在本地 SDK 中找到与「{query}」相关的 API 模块。"));
         }
         let mut out = format!(
-            "本地 SDK（API {}, {} 个模块）中匹配「{query}」的结果：\n\n",
+            "本地 SDK（API {}, {} 个模块；本轮重扫 {}、复用 {}、移除 {}）中匹配「{query}」的结果：\n\n",
             env.default_api.as_deref().unwrap_or("?"),
-            idx.modules.len()
+            idx.modules.len(), idx.rescanned_modules, idx.reused_modules, idx.removed_modules
         );
         for m in hits {
             out.push_str(&format!("## {} ", m.module));
@@ -515,8 +515,11 @@ pub(super) async fn search_sdk_api(args: &Value, db: &crate::db::DbState) -> Res
                 out.push_str(&format!("[{k}]"));
             }
             out.push('\n');
-            if let Some(s) = &m.syscap {
-                out.push_str(&format!("syscap: {s}\n"));
+            if !m.system_capabilities.is_empty() {
+                out.push_str(&format!("syscap: {}\n", m.system_capabilities.join(", ")));
+            }
+            if !m.permissions.is_empty() {
+                out.push_str(&format!("permissions: {}\n", m.permissions.join(", ")));
             }
             match (m.since_min, m.since_max) {
                 (Some(a), Some(b)) if a != b => out.push_str(&format!("since: API {a}（更新至 API {b}）\n")),
@@ -566,10 +569,12 @@ pub(super) async fn read_sdk_api_module(args: &Value, db: &crate::db::DbState) -
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or(module.clone());
         let fname = if fname.ends_with(".d.ts") { fname } else { format!("{fname}.d.ts") };
-        let path = std::path::PathBuf::from(&dir).join(&fname);
-        if !path.is_file() {
+        let module_name = fname.trim_end_matches(".d.ts");
+        let idx = sdk_api::index_api_dir(&dir);
+        let path = idx.modules.iter().find(|item| item.module == module_name).map(|item| std::path::PathBuf::from(&item.path));
+        let Some(path) = path.filter(|path| path.is_file()) else {
             return Err(format!("未找到声明文件：{fname}（请先用 search_sdk_api 确认模块名）"));
-        }
+        };
         let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         // 大文件截断到合理长度（d.ts 通常几十 KB，限制 60KB 避免撑爆上下文）
         const MAX: usize = 60_000;
