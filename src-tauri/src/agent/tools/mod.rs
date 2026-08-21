@@ -44,7 +44,7 @@ pub(crate) use pipeline::{
 pub use protocol::{
     mcp_tools_hint, parse_mcp_tool_name, parse_tool_calls,
     sanitize_markers, sanitize_tool_output, skill_hint, split_instance_name, strip_tool_calls,
-    system_hint_for, tool_short_desc, tool_schemas_for,
+    phase_hint_for, system_hint_for, tool_short_desc, tool_schemas_for, tool_schemas_for_phase,
 };
 use errors::with_advice;
 pub(crate) use errors::diagnose_tool_error;

@@ -6829,6 +6829,67 @@ mod llm_provider_tests {
     }
 }
 
+fn classify_capability_phase(
+    goal: &str,
+    recovering: bool,
+    last: Option<(&str, &str, &str, bool)>,
+) -> crate::agent::tools::capabilities::TaskPhase {
+    use crate::agent::tools::capabilities::TaskPhase;
+    if recovering { return TaskPhase::Recover; }
+    let Some((tool, status, effect, verification_passed)) = last else {
+        return TaskPhase::Explore;
+    };
+    if status != "ok" { return TaskPhase::Modify; }
+    if tool == "git_commit" { return TaskPhase::Deliver; }
+    let wants_delivery = ["git", "commit", "push", "提交", "推送", "交付"]
+        .iter().any(|word| goal.to_lowercase().contains(word));
+    if verification_passed && wants_delivery {
+        return TaskPhase::Deliver;
+    }
+    if effect != "read" { TaskPhase::Verify } else { TaskPhase::Modify }
+}
+
+fn current_capability_phase(
+    state: &tauri::State<'_, DbState>,
+    run_id: Option<&str>,
+    conversation_id: &str,
+    goal: &str,
+) -> crate::agent::tools::capabilities::TaskPhase {
+    let Ok(conn) = state.0.lock() else {
+        return classify_capability_phase(goal, false, None);
+    };
+    let recovering = run_id.is_some_and(|run_id| {
+        conn.query_row(
+            "SELECT phase FROM agent_runs WHERE run_id=?1",
+            [run_id],
+            |row| row.get::<_, String>(0),
+        ).ok().is_some_and(|phase| phase.contains("recover"))
+    });
+    let last: Option<(String, String, String, Option<String>)> = if let Some(run_id) = run_id {
+        conn.query_row(
+            "SELECT tool_name,status,effect_kind,structured_result_json FROM tool_runs
+             WHERE trace_id=?1 ORDER BY created_at DESC,id DESC LIMIT 1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).ok()
+    } else {
+        conn.query_row(
+            "SELECT tool_name,status,effect_kind,structured_result_json FROM tool_runs
+             WHERE conversation_id=?1 ORDER BY created_at DESC,id DESC LIMIT 1",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).ok()
+    };
+    let last_ref = last.as_ref().map(|(tool, status, effect, structured)| {
+        let verified = structured.as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|value| value.get("verification").and_then(|item| item.as_array()).cloned())
+            .is_some_and(|items| items.iter().any(|item| item.get("passed") == Some(&serde_json::Value::Bool(true))));
+        (tool.as_str(), status.as_str(), effect.as_str(), verified)
+    });
+    classify_capability_phase(goal, recovering, last_ref)
+}
+
 /// 单轮流式请求：构造请求（发送/状态检查含指数退避重试）→ 解析 SSE → 推送增量
 async fn stream_once(
     app: &AppHandle,
@@ -6858,18 +6919,36 @@ async fn stream_once(
         .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
         .and_then(|m| m.get("content").and_then(|v| v.as_str()))
         .unwrap_or_default();
+    let tool_phase = current_capability_phase(
+        state,
+        stats.run_id.as_deref(),
+        conversation_id,
+        tool_query,
+    );
     let tool_schemas = if opts.native_tools.unwrap_or(false) && protocol == "openai" {
-        crate::agent::tools::tool_schemas_for(tool_query)
+        crate::agent::tools::tool_schemas_for_phase(tool_query, tool_phase)
     } else {
         Vec::new()
     };
+    let mut request_messages = messages.to_vec();
+    request_messages.push(serde_json::json!({
+        "role": "system",
+        "content": crate::agent::tools::phase_hint_for(tool_query, tool_phase),
+    }));
     let build_req = || {
         let tools_opt = if tool_schemas.is_empty() {
             None
         } else {
             Some(tool_schemas.as_slice())
         };
-        provider_impl.build_stream_request(client, provider, model_choice, opts, messages, tools_opt)
+        provider_impl.build_stream_request(
+            client,
+            provider,
+            model_choice,
+            opts,
+            &request_messages,
+            tools_opt,
+        )
     };
 
     // LLM 录制/重放接缝（无 key 回归测试；DEVS_LLM_REPLAY=record:dir|replay:dir）：
@@ -6879,7 +6958,7 @@ async fn stream_once(
         crate::services::llm_replay::ReplayMode::Off => None,
         _ => Some(crate::services::llm_replay::request_key(
             &model_choice.model,
-            messages,
+            &request_messages,
         )),
     };
 
@@ -6892,7 +6971,8 @@ async fn stream_once(
         serde_json::json!({
             "conversation_id": conversation_id,
             "model": model_choice.model,
-            "messages": messages.len(),
+            "messages": request_messages.len(),
+            "tool_phase": tool_phase.as_str(),
         }),
     );
     let retried = {
@@ -8915,6 +8995,29 @@ mod tool_execution_policy_tests {
         assert_eq!(tool_exec_timeout("read_file", "{}").as_secs(), 180);
         assert_eq!(tool_exec_timeout("build_project", "{}").as_secs(), 900);
         assert_eq!(tool_exec_timeout("run_command", r#"{"timeout":300}"#).as_secs(), 330);
+    }
+
+    #[test]
+    fn capability_phase_follows_durable_tool_evidence() {
+        use crate::agent::tools::capabilities::TaskPhase;
+        let goal = "修复后测试，提交并推送";
+        assert_eq!(classify_capability_phase(goal, false, None), TaskPhase::Explore);
+        assert_eq!(
+            classify_capability_phase(goal, false, Some(("read_file", "ok", "read", false))),
+            TaskPhase::Modify,
+        );
+        assert_eq!(
+            classify_capability_phase(goal, false, Some(("edit_file", "ok", "write", false))),
+            TaskPhase::Verify,
+        );
+        assert_eq!(
+            classify_capability_phase(goal, false, Some(("run_tests", "ok", "read", true))),
+            TaskPhase::Deliver,
+        );
+        assert_eq!(
+            classify_capability_phase(goal, true, Some(("edit_file", "ok", "write", false))),
+            TaskPhase::Recover,
+        );
     }
 
     #[test]

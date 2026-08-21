@@ -82,6 +82,27 @@ pub const COMMON_TOOLS: &[&str] = &[
     "plan_task", "todo_write", "todo_get", "ask_user", "tool_help", "tool_list", "tool_history",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskPhase {
+    Explore,
+    Modify,
+    Verify,
+    Deliver,
+    Recover,
+}
+
+impl TaskPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explore => "explore",
+            Self::Modify => "modify",
+            Self::Verify => "verify",
+            Self::Deliver => "deliver",
+            Self::Recover => "recover",
+        }
+    }
+}
+
 pub fn select(query: &str) -> Vec<&'static CapabilityPack> {
     let query = query.to_lowercase();
     let mut selected: Vec<&CapabilityPack> = CAPABILITY_PACKS
@@ -100,6 +121,36 @@ pub fn selected_tool_names(query: &str, limit: usize) -> Vec<&'static str> {
         for tool in pack.tools {
             if names.len() >= limit { return names; }
             if !names.contains(tool) { names.push(tool); }
+        }
+    }
+    names
+}
+
+pub fn selected_tool_names_for_phase(
+    query: &str,
+    phase: TaskPhase,
+    limit: usize,
+) -> Vec<&'static str> {
+    use super::contracts::EffectKind;
+    let candidates = selected_tool_names(query, 64);
+    let mut names = Vec::new();
+    for tool in candidates {
+        let contract = super::contracts::contract(tool);
+        let allowed = COMMON_TOOLS.contains(&tool) || match phase {
+            TaskPhase::Explore | TaskPhase::Recover => contract.effect == EffectKind::Read,
+            TaskPhase::Modify => contract.effect != EffectKind::Destructive,
+            TaskPhase::Verify => contract.effect == EffectKind::Read
+                || contract.validator.is_some()
+                || matches!(tool, "edit_file" | "write_file" | "multi_edit" | "preview_edit"),
+            TaskPhase::Deliver => {
+                select("git delivery").iter().any(|pack| pack.id == "git_delivery" && pack.tools.contains(&tool))
+                    && (contract.validator.is_some()
+                        || matches!(tool, "git_status" | "git_diff" | "review_changes" | "secret_scan" | "git_commit" | "git_push" | "git_log"))
+            }
+        };
+        if allowed && !names.contains(&tool) {
+            names.push(tool);
+            if names.len() >= limit { break; }
         }
     }
     names
@@ -132,5 +183,23 @@ mod tests {
         let delivery = selected_tool_names("提交并推送 git 交付", 40);
         assert!(delivery.contains(&"git_push"));
         assert!(delivery.len() <= 40);
+    }
+
+    #[test]
+    fn phase_selection_unlocks_side_effects_only_when_needed() {
+        let goal = "修复编译错误，测试通过后提交并推送";
+        let explore = selected_tool_names_for_phase(goal, TaskPhase::Explore, 32);
+        assert!(explore.contains(&"read_file"));
+        assert!(!explore.contains(&"edit_file"));
+        assert!(!explore.contains(&"git_push"));
+        let modify = selected_tool_names_for_phase(goal, TaskPhase::Modify, 32);
+        assert!(modify.contains(&"edit_file"));
+        assert!(!modify.contains(&"git_push"));
+        let verify = selected_tool_names_for_phase(goal, TaskPhase::Verify, 32);
+        assert!(verify.contains(&"run_tests"));
+        assert!(!verify.contains(&"git_push"));
+        let deliver = selected_tool_names_for_phase(goal, TaskPhase::Deliver, 32);
+        assert!(deliver.contains(&"git_commit"));
+        assert!(deliver.contains(&"git_push"));
     }
 }

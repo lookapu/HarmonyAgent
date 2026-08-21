@@ -221,6 +221,16 @@ fn selected_specs(query: &str) -> Vec<&'static super::ToolSpec> {
     }).collect()
 }
 
+fn selected_specs_for_phase(
+    query: &str,
+    phase: super::capabilities::TaskPhase,
+) -> Vec<&'static super::ToolSpec> {
+    super::capabilities::selected_tool_names_for_phase(query, phase, 32)
+        .into_iter()
+        .filter_map(|name| TOOL_SPECS.iter().find(|spec| spec.name == name))
+        .collect()
+}
+
 pub fn system_hint_for(query: &str) -> String {
     let mut hint = String::from("本轮能力包（按最小工具集执行）：\n");
     for pack in super::capabilities::select(query) {
@@ -235,6 +245,14 @@ pub fn system_hint_for(query: &str) -> String {
     hint.push('\n');
     hint.push_str(&system_hint_from_specs(selected_specs(query).into_iter()));
     hint
+}
+
+pub fn phase_hint_for(query: &str, phase: super::capabilities::TaskPhase) -> String {
+    format!(
+        "当前工具阶段：{}。本轮仅使用以下阶段工具；需要阶段外能力时先说明证据和切换理由。\n{}",
+        phase.as_str(),
+        system_hint_from_specs(selected_specs_for_phase(query, phase).into_iter()),
+    )
 }
 
 fn system_hint_from_specs<'a>(specs: impl Iterator<Item = &'a super::ToolSpec>) -> String {
@@ -463,6 +481,21 @@ pub fn tool_schemas_for(query: &str) -> Vec<serde_json::Value> {
                 .is_some_and(|name| selected.contains(name))
         })
         .collect()
+}
+
+pub fn tool_schemas_for_phase(
+    query: &str,
+    phase: super::capabilities::TaskPhase,
+) -> Vec<serde_json::Value> {
+    let selected: std::collections::HashSet<&str> = selected_specs_for_phase(query, phase)
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    tool_schemas().into_iter().filter(|schema| {
+        schema.pointer("/function/name")
+            .and_then(|value| value.as_str())
+            .is_some_and(|name| selected.contains(name))
+    }).collect()
 }
 
 /// 参数段非严格 JSON（desc 里参数值常带中文注解）时的键名提取回退：
@@ -708,6 +741,23 @@ mod tests {
         assert!(hint.contains("停止条件"));
         assert!(hint.contains("验收"));
         assert!(hint.contains("list_devices"));
+    }
+
+    #[test]
+    fn native_schemas_follow_execution_phase() {
+        use super::super::capabilities::TaskPhase;
+        let goal = "修复失败测试后提交并推送";
+        let names = |phase| tool_schemas_for_phase(goal, phase).into_iter()
+            .filter_map(|schema| schema.pointer("/function/name")?.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        let explore = names(TaskPhase::Explore);
+        let verify = names(TaskPhase::Verify);
+        let deliver = names(TaskPhase::Deliver);
+        assert!(!explore.contains(&"edit_file".into()));
+        assert!(verify.contains(&"run_tests".into()));
+        assert!(!verify.contains(&"git_push".into()));
+        assert!(deliver.contains(&"git_push".into()));
+        assert!(explore.len() <= 32 && verify.len() <= 32 && deliver.len() <= 32);
     }
 
     #[test]
