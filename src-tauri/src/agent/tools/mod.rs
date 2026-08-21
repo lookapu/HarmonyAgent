@@ -679,7 +679,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "environment_check",
-        desc: "一次性体检开发环境：hdc/ohpm/node/git/java 可用性与版本、hdc 服务端状态与在线设备数、代理设置、以及（传 path 时）鸿蒙工程的 hvigor 工具链与 SDK 版本对齐。\n参数：{\"path\":\"<可选工程目录，用于 SDK 对齐与 hvigor 检测>\"}。\n当遇到\"hdc 不可用\"\"ohpm 找不到\"等环境类错误、或部署/构建前想确认环境就绪时优先调用，比逐个工具碰运气更高效。\n副作用：无（只读）。\n返回：每项检查的结果（✓/✗）与原因、版本号、修复提示。",
+        desc: "一次性体检开发环境：hdc/ohpm/node/git/java 可用性与版本、hdc 服务端状态与在线设备数、代理设置、SDK/官方 API/文档索引的来源版本与新鲜度，以及（传 path 时）鸿蒙工程的 hvigor 工具链与 SDK 版本对齐。\n参数：{\"path\":\"<可选工程目录，用于 SDK 对齐与 hvigor 检测>\"}。\n当遇到\"hdc 不可用\"\"ohpm 找不到\"等环境类错误、生成代码前需要核验知识来源、或部署/构建前想确认环境就绪时优先调用。\n副作用：无（只读）。\n返回：每项检查的结果、来源、版本、更新时间、覆盖率与修复提示；过期或不可追溯索引不能作为生成代码的唯一依据。",
     },
     ToolSpec {
         name: "conversation_search",
@@ -1255,7 +1255,7 @@ pub async fn run_tool(
         "get_api_detail" => explore_tools::get_api_detail(&args, &roots, db),
         "diff_api_versions" => explore_tools::diff_api_versions(&args, db),
         "get_project_info" => get_project_info(&roots).await,
-        "environment_check" => environment_check(&args, db).await,
+        "environment_check" => environment_check(&args, db, ctx).await,
         "search_knowledge" => memory_tools::search_knowledge(&args, project_id, db).await,
         "manage_memory" => memory_tools::manage_memory(&args, project_id, db).await,
         "manage_knowledge" => memory_tools::manage_knowledge(&args, project_id, db).await,
@@ -3014,7 +3014,11 @@ const DEVICE_SHELL_FORBIDDEN_TOKENS: &[&str] = &[
 /// ohpm_search：在 ohpm 官方仓库搜索三方库（可选 ohpm info 详情）。
 
 /// environment_check：一次性体检 HarmonyOS 开发环境（工具链/设备/代理/工程对齐）。
-async fn environment_check(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+async fn environment_check(
+    args: &Value,
+    db: &crate::db::DbState,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     // detect 首次会走 reg query 等同步 IO（后续走 CACHE），放入 blocking 线程池
     let db2 = crate::db::DbState(db.0.clone());
     let env = tokio::task::spawn_blocking(move || crate::services::harmony_env::detect(&db2))
@@ -3081,6 +3085,29 @@ async fn environment_check(args: &Value, db: &crate::db::DbState) -> Result<Stri
     if !env.suggestions.is_empty() {
         out.push_str(&format!("- 建议检查路径: {}\n", env.suggestions.join("；")));
     }
+
+    let sdk_index = crate::services::harmony_env::default_api_dir(&env)
+        .map(|api_dir| crate::services::sdk_api::index_api_dir(&api_dir));
+    let docs_root = ctx
+        .app
+        .as_ref()
+        .and_then(crate::services::harmony_docs::docs_root);
+    let provenance = match db.0.lock() {
+        Ok(conn) => crate::services::harmony_provenance::collect(
+            &env,
+            sdk_index.as_ref(),
+            Some(&conn),
+            docs_root.as_deref(),
+        ),
+        Err(_) => crate::services::harmony_provenance::collect(
+            &env,
+            sdk_index.as_ref(),
+            None,
+            docs_root.as_deref(),
+        ),
+    };
+    out.push('\n');
+    out.push_str(&crate::services::harmony_provenance::render(&provenance));
 
     // 工程 SDK 对齐（可选 project_path，未指定则跳过）
     let project_path = args["project_path"].as_str().unwrap_or("").trim();

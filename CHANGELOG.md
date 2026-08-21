@@ -37,6 +37,7 @@
 - `check_sdk_alignment` 升级为工程一致性审计：扫描 SDK import 并核对 API Level、精确权限、SystemCapability 守卫、设备类型、入口 Ability、permission usedScene 与产品模块归属；确定性问题、风险和降级提示分级输出且不自动篡改配置。
 - `search_api` 新增 Android/Web/TypeScript 迁移模式：常见实现按架构语义映射到 HarmonyOS 候选，并用当前工程 API Level、本机 SDK 模块/符号和官方来源逐项标记 verified/conditional/unavailable/unverified，附风险边界与完整验证闭环。
 - ETS 写入后的验证计划升级为强制闭环：最后一次写入之后必须依次取得本机 SDK/一致性审计、逐文件无错误 LSP、lint、测试、Hvigor 构建和最终 diff 证据；缺少任一必需步骤时统一执行循环保持 Verify，删除文件不会产生不可达 LSP 门禁。
+- `environment_check` 新增 SDK/官方资料来源证明：统一展示本机 `.d.ts`、官方 API 变更与参考库、OpenHarmony 文档镜像的来源、版本、更新时间、条目和覆盖率，并把超过 30 天、缺失来源或缺少版本的索引显式降级，禁止作为生成代码的唯一依据。
 
 ### 长会话 Context V2（M1 基础）
 
