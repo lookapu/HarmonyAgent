@@ -13,6 +13,8 @@ pub(super) struct BuildRequest {
     pub module: Option<String>,
     /// 构建前先 hvigor clean 清理缓存（缺省 false）
     pub clean: Option<bool>,
+    /// 依赖阶段：auto（缺失时安装）/ force（始终安装）/ skip（显式跳过）
+    pub dependencies: Option<String>,
 }
 
 impl BuildRequest {
@@ -22,12 +24,21 @@ impl BuildRequest {
     }
 
     /// 显式 resolve：默认值落地 + 参数校验（mode 枚举、module 存在性），产出执行用严格规范。
-    pub(super) fn resolve(self, root: &Path, entry_module: Option<&str>) -> Result<BuildSpec, String> {
+    pub(super) fn resolve(
+        self,
+        root: &Path,
+        entry_module: Option<&str>,
+    ) -> Result<BuildSpec, String> {
         let mode = self.mode.unwrap_or_else(|| "debug".to_string());
         if mode != "debug" && mode != "release" {
             return Err("mode 仅支持 debug 或 release".into());
         }
-        let module = match self.module.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let module = match self
+            .module
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(m) => {
                 let available = harmony_modules(root);
                 if !available.iter().any(|x| x == m) {
@@ -44,7 +55,16 @@ impl BuildRequest {
             }
             None => entry_module.map(|s| s.to_string()),
         };
-        Ok(BuildSpec { mode, module, clean: self.clean.unwrap_or(false) })
+        let dependencies = self.dependencies.unwrap_or_else(|| "auto".into());
+        if !matches!(dependencies.as_str(), "auto" | "force" | "skip") {
+            return Err("dependencies 仅支持 auto、force 或 skip".into());
+        }
+        Ok(BuildSpec {
+            mode,
+            module,
+            clean: self.clean.unwrap_or(false),
+            dependencies,
+        })
     }
 }
 
@@ -56,6 +76,8 @@ pub(super) struct BuildSpec {
     pub module: Option<String>,
     /// 是否先执行 clean
     pub clean: bool,
+    /// 依赖安装策略（auto/force/skip）
+    pub dependencies: String,
 }
 
 pub(super) async fn build_project(
@@ -80,7 +102,8 @@ pub(super) async fn build_project(
     let project_id = project_id_for_path(ctx, project_path);
     let root = Path::new(project_path);
     // 解析工程以确定 entry 模块（多模块工程需要 --mode module）
-    let info = crate::services::harmony::parse_project(root);
+    let semantic_model = crate::services::harmony_model::cached(root);
+    let info = crate::services::harmony::project_summary(root, &semantic_model);
     // Request/Spec 分离：宽松参数 BuildRequest → 显式 resolve() 产出严格规范 BuildSpec
     // （默认值/校验集中于此，run 内不再出现隐式 ?? 默认）
     let spec = BuildRequest::from_args(args)?.resolve(root, info.entry_module.as_deref())?;
@@ -91,6 +114,26 @@ pub(super) async fn build_project(
     let do_clean = spec.clean;
     // 全局并发护栏：同一时间只允许一个构建（其他调用排队等待）
     let _gate = crate::services::tool_limits::acquire_workspace_gate(root).await;
+    let workflow_key = format!(
+        "{}:{}:{}:{}",
+        module.unwrap_or("default"),
+        mode,
+        spec.clean,
+        spec.dependencies
+    );
+    let fingerprint = crate::services::harmony_build::project_fingerprint(root);
+    let (mut checkpoint, resumed) =
+        crate::services::harmony_build::begin(root, &workflow_key, &fingerprint);
+    if resumed {
+        ctx.emit_log(
+            "system",
+            &format!(
+                "恢复构建工作流：已完成阶段 [{}]，从 {} 继续",
+                checkpoint.completed_stages.join(", "),
+                checkpoint.current_stage
+            ),
+        );
+    }
     // 构建耗时统计（含 clean，供成功提示展示）
     let build_started = std::time::Instant::now();
 
@@ -99,8 +142,19 @@ pub(super) async fn build_project(
     // Windows 下优先 node 直调 hvigor-wrapper.js 绕过 cmd/.bat 弹窗；找不到时回退工程内 hvigorw.bat，
     // 再兜底 DevEco Studio 内置 hvigor 工具链（工程缺构建脚本时仍可构建）；
     // env 自动注入 DEVECO_SDK_HOME（未设置且探测到 DevEco 内置 SDK 时），否则 hvigor 报 00303217/00303312
-    let hvigor = crate::services::harmony::hvigor_command(root)
-        .map_err(|e| with_advice("build_project", e))?;
+    let hvigor = match crate::services::harmony::hvigor_command(root) {
+        Ok(command) => command,
+        Err(error) => {
+            crate::services::harmony_build::stage_failed(
+                root,
+                &mut checkpoint,
+                "environment",
+                &error,
+            );
+            return Err(with_advice("build_project", error.to_string()));
+        }
+    };
+    crate::services::harmony_build::stage_completed(root, &mut checkpoint, "environment");
     let program = hvigor.program;
     let prefix = hvigor.args;
     let envs = if hvigor.env.is_empty() {
@@ -126,20 +180,88 @@ pub(super) async fn build_project(
             );
         }
     }
+    // 依赖阶段：默认只在声明的外部包缺失时执行 ohpm install；force 可强制同步，
+    // skip 用于离线或调用方明确管理依赖的场景。安装后必须再次核对文件系统证据。
+    let dependency_state = crate::services::harmony_build::dependency_state(root, &semantic_model);
+    let should_install = spec.dependencies == "force"
+        || (spec.dependencies == "auto" && !dependency_state.missing.is_empty());
+    if should_install {
+        ctx.emit_log(
+            "system",
+            &format!(
+                "同步 OHPM 依赖：声明 {} 项，缺失 {} 项",
+                dependency_state.declared,
+                dependency_state.missing.len()
+            ),
+        );
+        if let Err(error) = run_in_project(project_path, "ohpm", &["install".into()], 300).await {
+            crate::services::harmony_build::stage_failed(
+                root,
+                &mut checkpoint,
+                "dependencies",
+                &error,
+            );
+            return Err(with_advice("ohpm_install", error));
+        }
+        let refreshed_model = crate::services::harmony_model::invalidate_files(
+            root,
+            &["oh-package-lock.json5".into()],
+        )
+        .model;
+        let verified = crate::services::harmony_build::dependency_state(root, &refreshed_model);
+        if !verified.missing.is_empty() {
+            let error = format!(
+                "OHPM 安装后仍缺少 {} 项依赖：{}",
+                verified.missing.len(),
+                verified.missing.join(", ")
+            );
+            crate::services::harmony_build::stage_failed(
+                root,
+                &mut checkpoint,
+                "dependencies",
+                &error,
+            );
+            return Err(with_advice("ohpm_install", error));
+        }
+        checkpoint.project_fingerprint = crate::services::harmony_build::project_fingerprint(root);
+    } else if spec.dependencies == "skip" && !dependency_state.missing.is_empty() {
+        ctx.emit_log(
+            "system",
+            &format!(
+                "已按请求跳过 OHPM 安装；仍缺少 {} 项依赖，Hvigor 可能失败",
+                dependency_state.missing.len()
+            ),
+        );
+    }
+    crate::services::harmony_build::stage_completed(root, &mut checkpoint, "dependencies");
     // 可选：先 clean 清理构建缓存
     if do_clean {
         let mut clean_full = prefix.clone();
         clean_full.extend(crate::services::harmony::clean_args());
-        ctx.emit_log("system", &format!("清理构建缓存：{program} {}", clean_full.join(" ")));
+        ctx.emit_log(
+            "system",
+            &format!("清理构建缓存：{program} {}", clean_full.join(" ")),
+        );
         match crate::agent::exec_ctx::run_cmd_streaming_env(
-            ctx, &program, &clean_full, Some(root), 120, None, envs,
-        ).await {
+            ctx,
+            &program,
+            &clean_full,
+            Some(root),
+            120,
+            None,
+            envs,
+        )
+        .await
+        {
             Ok(o) if o.status.success() => {
                 ctx.emit_log("system", "缓存清理完成，开始构建");
             }
             Ok(o) => {
                 let err = smart_decode(&o.stderr);
-                ctx.emit_log("system", &format!("清理缓存失败（继续构建）：{}", tail(&err, 500)));
+                ctx.emit_log(
+                    "system",
+                    &format!("清理缓存失败（继续构建）：{}", tail(&err, 500)),
+                );
             }
             Err(e) => {
                 ctx.emit_log("system", &format!("清理缓存异常（继续构建）：{e}"));
@@ -148,7 +270,10 @@ pub(super) async fn build_project(
     }
     let mut full_args = prefix;
     full_args.extend(cmd_args);
-    ctx.emit_log("system", &format!("开始构建（{mode}）：{program} {}", full_args.join(" ")));
+    ctx.emit_log(
+        "system",
+        &format!("开始构建（{mode}）：{program} {}", full_args.join(" ")),
+    );
     let output = crate::agent::exec_ctx::run_cmd_streaming_env(
         ctx,
         &program,
@@ -163,6 +288,7 @@ pub(super) async fn build_project(
         Ok(o) => o,
         Err(e) => {
             ctx.emit_log("system", &format!("构建异常：{e}"));
+            crate::services::harmony_build::stage_failed(root, &mut checkpoint, "build", &e);
             return Err(with_advice("build_project", e));
         }
     };
@@ -177,8 +303,26 @@ pub(super) async fn build_project(
     };
 
     if output.status.success() {
+        crate::services::harmony_build::stage_completed(root, &mut checkpoint, "build");
+        let artifacts = crate::services::harmony_build::discover_artifacts(root);
+        if artifacts.is_empty() {
+            let error = "Hvigor 返回成功，但未发现 HAP/HSP/HAR 产物";
+            crate::services::harmony_build::stage_failed(root, &mut checkpoint, "artifacts", error);
+            return Err(with_advice("build_project", error.to_string()));
+        }
+        crate::services::harmony_build::completed(root, &mut checkpoint, artifacts.clone());
         let elapsed = build_started.elapsed().as_secs_f32();
         let mut summary = format!("构建成功（{mode}，耗时 {elapsed:.1}s）。\n");
+        summary.push_str(&format!(
+            "工作流完成：environment → dependencies → build → artifacts（发现 {} 个产物）\n",
+            artifacts.len()
+        ));
+        for artifact in artifacts.iter().take(8) {
+            summary.push_str(&format!(
+                "- {} · {} bytes · {}\n",
+                artifact.path, artifact.size, artifact.kind
+            ));
+        }
         // 未签名产物预警：构建日志出现 No signingConfig 说明产出 unsigned HAP，
         // 真机部署必然报 9568319——提前告知并给出自动修复路径，避免部署失败后再回查
         if combined.contains("No signingConfig") || combined.contains("no signingConfig found") {
@@ -204,8 +348,17 @@ pub(super) async fn build_project(
         summary.push_str(&tail(&combined, 2000));
         Ok(summary)
     } else {
+        crate::services::harmony_build::stage_failed(
+            root,
+            &mut checkpoint,
+            "build",
+            &tail(&combined, 2000),
+        );
         let errors = crate::services::harmony::parse_build_errors(&combined);
-        ctx.emit_log("system", &format!("构建失败（退出码 {:?}）", output.status.code()));
+        ctx.emit_log(
+            "system",
+            &format!("构建失败（退出码 {:?}）", output.status.code()),
+        );
         if errors.is_empty() {
             return Err(with_advice(
                 "build_project",
@@ -222,7 +375,8 @@ pub(super) async fn build_project(
             ));
         }
         // 按根因分类统计，取主导类别决定下一步
-        let mut cat_count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut cat_count: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for e in &errors {
             *cat_count.entry(e.category.as_str()).or_insert(0) += 1;
         }
@@ -236,7 +390,11 @@ pub(super) async fn build_project(
                 } else {
                     format!("{}（建议: {}）", e.message, e.suggestion)
                 };
-                ErrorLocation { file: e.file.clone(), line: e.line, message: msg }
+                ErrorLocation {
+                    file: e.file.clone(),
+                    line: e.line,
+                    message: msg,
+                }
             })
             .collect();
         let next: Vec<&str> = match dominant {
@@ -275,27 +433,42 @@ pub(super) async fn build_project(
             crate::agent::diagnostics::Diagnosis {
                 source: "build_project".into(),
                 category: dom_cat.into(),
-                summary: format!("{mode} 构建失败，{} 个错误（主导类别: {dom_cat}）", errors.len()),
-                detail: locations.iter().take(5).map(|l| {
-                    let pos = match (&l.file, l.line) {
-                        (Some(f), Some(n)) => format!("{f}:{n}"),
-                        (Some(f), None) => f.clone(),
-                        _ => "未知位置".into(),
-                    };
-                    format!("{pos}: {}", l.message)
-                }).collect::<Vec<_>>().join("\n"),
-                at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                summary: format!(
+                    "{mode} 构建失败，{} 个错误（主导类别: {dom_cat}）",
+                    errors.len()
+                ),
+                detail: locations
+                    .iter()
+                    .take(5)
+                    .map(|l| {
+                        let pos = match (&l.file, l.line) {
+                            (Some(f), Some(n)) => format!("{f}:{n}"),
+                            (Some(f), None) => f.clone(),
+                            _ => "未知位置".into(),
+                        };
+                        format!("{pos}: {}", l.message)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
             },
         );
         let user_kb = load_user_knowledge(ctx, project_id.as_deref());
-        let (matched, hit_ids) = crate::services::harmony_knowledge::match_knowledge_with_user(&combined, 3, &user_kb);
+        let (matched, hit_ids) =
+            crate::services::harmony_knowledge::match_knowledge_with_user(&combined, 3, &user_kb);
         for id in &hit_ids {
             bump_knowledge_hit(ctx, id);
         }
         let err = structured_tool_error(
             "build_project",
             dom_cat,
-            &format!("{mode} 构建失败，检测到 {} 个错误（主导类别: {dom_cat}）", errors.len()),
+            &format!(
+                "{mode} 构建失败，检测到 {} 个错误（主导类别: {dom_cat}）",
+                errors.len()
+            ),
             &locations,
             &next,
             Some(&log_path.display().to_string()),
@@ -322,19 +495,14 @@ pub(super) fn harmony_modules(root: &Path) -> Vec<String> {
                 if let Some(end) = rest[start..].find(']') {
                     let arr = &rest[start + 1..start + end];
                     for seg in arr.split('{') {
-                        let name_idx = seg
-                            .find("\"name\"")
-                            .or_else(|| seg.find("name"));
+                        let name_idx = seg.find("\"name\"").or_else(|| seg.find("name"));
                         if let Some(ni) = name_idx {
                             // 从命中的 name 起找冒号，统一从冒号后取字符串值（兼容有无引号键）
                             let after = &seg[ni..];
                             let Some(c) = after.find(':') else { continue };
                             let v = after[c + 1..].trim();
                             let v = v.trim_start_matches('"').trim_start_matches('\'');
-                            let end_q = v
-                                .find('"')
-                                .or_else(|| v.find('\''))
-                                .unwrap_or(v.len());
+                            let end_q = v.find('"').or_else(|| v.find('\'')).unwrap_or(v.len());
                             let n = v[..end_q].trim();
                             if !n.is_empty() && !n.starts_with("//") {
                                 names.push(n.to_string());
@@ -425,7 +593,8 @@ pub(super) async fn deploy(
         default_device_id().await?
     };
     // per-device 门控：与 deploy_all 中同设备的任务互斥，不同设备不阻塞
-    let _dev_gate = crate::services::tool_limits::acquire_named_gate(&format!("deploy:{device_id}")).await;
+    let _dev_gate =
+        crate::services::tool_limits::acquire_named_gate(&format!("deploy:{device_id}")).await;
     ctx.emit_log("system", &format!("部署到设备: {device_id}"));
     let mut out = String::new();
     out.push_str(&format!("目标设备: {device_id}\n"));
@@ -433,7 +602,8 @@ pub(super) async fn deploy(
         out.push_str(&format!("应用包名: {b}\n"));
     }
     // 设备信息
-    if let Ok(model) = run_hdc_shell(&device_id, &["param", "get", "const.product.model"], 15).await {
+    if let Ok(model) = run_hdc_shell(&device_id, &["param", "get", "const.product.model"], 15).await
+    {
         let m = model.trim();
         if !m.is_empty() {
             out.push_str(&format!("设备型号: {m}\n"));
@@ -458,28 +628,53 @@ pub(super) async fn deploy(
     }
 
     // 3. 安装（流式推送安装输出）
-    ctx.emit_log("system", &format!("安装 {}", Path::new(&hap).file_name().and_then(|s| s.to_str()).unwrap_or(&hap)));
+    ctx.emit_log(
+        "system",
+        &format!(
+            "安装 {}",
+            Path::new(&hap)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&hap)
+        ),
+    );
     let install_args = if already_installed {
-        vec!["-t".to_string(), device_id.clone(), "install".to_string(), "-r".to_string(), hap.clone()]
+        vec![
+            "-t".to_string(),
+            device_id.clone(),
+            "install".to_string(),
+            "-r".to_string(),
+            hap.clone(),
+        ]
     } else {
-        vec!["-t".to_string(), device_id.clone(), "install".to_string(), hap.clone()]
+        vec![
+            "-t".to_string(),
+            device_id.clone(),
+            "install".to_string(),
+            hap.clone(),
+        ]
     };
-    let install_out = crate::agent::exec_ctx::run_cmd_streaming(
-        ctx, "hdc", &install_args, None, 300, None,
-    )
-    .await
-    .map_err(|e| with_advice("deploy", e))?;
+    let install_out =
+        crate::agent::exec_ctx::run_cmd_streaming(ctx, "hdc", &install_args, None, 300, None)
+            .await
+            .map_err(|e| with_advice("deploy", e))?;
     let install_text = smart_decode(&install_out.stdout) + &smart_decode(&install_out.stderr);
     out.push_str(&install_text);
     if !install_out.status.success() {
         let (cat, msg) = classify_deploy_error(&install_text, is_signed);
         let user_kb = load_user_knowledge(ctx, Some(project_id));
-        let (matched, hit_ids) = crate::services::harmony_knowledge::match_knowledge_with_user(&install_text, 2, &user_kb);
+        let (matched, hit_ids) = crate::services::harmony_knowledge::match_knowledge_with_user(
+            &install_text,
+            2,
+            &user_kb,
+        );
         for id in &hit_ids {
             bump_knowledge_hit(ctx, id);
         }
         let mut msg = msg;
-        msg.push_str(&crate::services::harmony_knowledge::format_matched(&matched));
+        msg.push_str(&crate::services::harmony_knowledge::format_matched(
+            &matched,
+        ));
         crate::agent::diagnostics::record(
             project_path,
             crate::agent::diagnostics::Diagnosis {
@@ -487,7 +682,10 @@ pub(super) async fn deploy(
                 category: cat.clone(),
                 summary: format!("HAP 安装失败（{cat}）"),
                 detail: tail(&install_text, 600),
-                at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
             },
         );
         return Err(msg);
@@ -502,7 +700,9 @@ pub(super) async fn deploy(
     let bundle = match info.bundle_name.as_deref() {
         Some(b) => b,
         None => {
-            out.push_str("\n⚠ 未能从工程解析 bundleName，跳过自动拉起。请确认 AppScope/app.json5 配置。\n");
+            out.push_str(
+                "\n⚠ 未能从工程解析 bundleName，跳过自动拉起。请确认 AppScope/app.json5 配置。\n",
+            );
             return Ok(out);
         }
     };
@@ -542,11 +742,18 @@ pub(super) async fn deploy(
         ctx.emit_log("system", "应用已启动并稳定运行 ✓");
         // 成功启动：挂起运行日志监听，把用户操作期间的 error/崩溃实时回流
         crate::agent::runtime_log::start(project_path, ctx, &device_id, bundle);
-        ctx.emit_log("system", "已开启运行日志监听（error 级），运行期异常会自动回流");
+        ctx.emit_log(
+            "system",
+            "已开启运行日志监听（error 级），运行期异常会自动回流",
+        );
         // 清除该项目的历史崩溃归因；若此前有崩溃记录则推送修复经验候选
         let removed = crate::agent::diagnostics::clear_source(project_path, "crash_analysis");
         if !removed.is_empty() {
-            let crash_log = removed.iter().map(|d| format!("{}\n{}", d.summary, d.detail)).collect::<Vec<_>>().join("\n");
+            let crash_log = removed
+                .iter()
+                .map(|d| format!("{}\n{}", d.summary, d.detail))
+                .collect::<Vec<_>>()
+                .join("\n");
             emit_knowledge_candidate(ctx, project_path, "crash_analysis", &removed, &crash_log);
         }
     } else {
@@ -554,8 +761,12 @@ pub(super) async fn deploy(
         ctx.emit_log("system", "应用启动后崩溃，正在抓取 faultlog 与 hilog…");
 
         // 优先拉 faultlog（结构化程度高），回退 hilog -x
-        let faultlog = fetch_recent_faultlog(&device_id, bundle).await.unwrap_or_default();
-        let hilog = run_hdc_shell(&device_id, &["hilog", "-x"], 25).await.unwrap_or_default();
+        let faultlog = fetch_recent_faultlog(&device_id, bundle)
+            .await
+            .unwrap_or_default();
+        let hilog = run_hdc_shell(&device_id, &["hilog", "-x"], 25)
+            .await
+            .unwrap_or_default();
         let report = crate::agent::crash::analyze(bundle, &faultlog, &hilog);
         // 历史崩溃模式：同类崩溃反复出现时提示参考既往修复经验
         let nth = crate::agent::crash::record_pattern(project_path, &report);
@@ -567,16 +778,26 @@ pub(super) async fn deploy(
                 source: "crash_analysis".into(),
                 category: report.category.clone(),
                 summary: if nth > 1 {
-                    format!("{}（同类崩溃历史第 {nth} 次，建议参考既往修复经验避免重复踩坑）", report.summary)
+                    format!(
+                        "{}（同类崩溃历史第 {nth} 次，建议参考既往修复经验避免重复踩坑）",
+                        report.summary
+                    )
                 } else {
                     report.summary.clone()
                 },
                 detail: if report.locations.is_empty() {
                     tail(&report.snippet, 600)
                 } else {
-                    format!("定位: {}\n{}", report.locations.join(", "), tail(&report.snippet, 500))
+                    format!(
+                        "定位: {}\n{}",
+                        report.locations.join(", "),
+                        tail(&report.snippet, 500)
+                    )
                 },
-                at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
             },
         );
 
@@ -593,7 +814,13 @@ pub(super) async fn deploy(
 
         let mut next = vec![report.advice.clone()];
         if !report.locations.is_empty() {
-            next.insert(0, format!("根据以下定位读取并修复源码：{}", report.locations.join("; ")));
+            next.insert(
+                0,
+                format!(
+                    "根据以下定位读取并修复源码：{}",
+                    report.locations.join("; ")
+                ),
+            );
         }
         let err_locs: Vec<ErrorLocation> = report
             .locations
@@ -603,7 +830,11 @@ pub(super) async fn deploy(
                     Some((f, n)) => (Some(f.to_string()), n.parse::<i64>().ok()),
                     None => (Some(l.clone()), None),
                 };
-                ErrorLocation { file: f, line, message: report.message.clone() }
+                ErrorLocation {
+                    file: f,
+                    line,
+                    message: report.message.clone(),
+                }
             })
             .collect();
         let err = structured_tool_error(
@@ -642,36 +873,58 @@ pub(super) async fn deploy_all(
     let hap = if let Some(h) = args["hap"].as_str() {
         let p = PathBuf::from(h);
         if p.is_absolute() { p } else { root.join(p) }
-            .to_string_lossy().to_string()
+            .to_string_lossy()
+            .to_string()
     } else {
         crate::services::harmony::find_latest_hap(root, info.hap_output_dir.as_deref())
             .ok_or_else(|| "未找到 .hap 构建产物，请先执行 build_project".to_string())?
-            .to_string_lossy().to_string()
+            .to_string_lossy()
+            .to_string()
     };
     if !Path::new(&hap).exists() {
         return Err(format!("hap 文件不存在: {hap}"));
     }
-    let is_signed = Path::new(&hap).file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("-signed"));
+    let is_signed = Path::new(&hap)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.contains("-signed"));
     let bundle = info.bundle_name.clone().unwrap_or_default();
-    let ability = info.main_element.clone().unwrap_or_else(|| "EntryAbility".to_string());
+    let ability = info
+        .main_element
+        .clone()
+        .unwrap_or_else(|| "EntryAbility".to_string());
 
     // 解析目标设备列表
     let devices: Vec<String> = if let Some(arr) = args["devices"].as_array() {
-        arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()
     } else if let Ok(devs) = crate::commands::devices::list_devices().await {
-        devs.iter().filter(|d| is_device_online(&d.state)).map(|d| d.id.clone()).collect()
+        devs.iter()
+            .filter(|d| is_device_online(&d.state))
+            .map(|d| d.id.clone())
+            .collect()
     } else {
         Vec::new()
     };
     if devices.is_empty() {
-        return Err("没有可用的在线设备。请连接设备并开启 USB 调试，或用 list_devices 查看。".into());
+        return Err(
+            "没有可用的在线设备。请连接设备并开启 USB 调试，或用 list_devices 查看。".into(),
+        );
     }
 
     let hap = hap.clone();
     let ctx = ctx.clone();
     let bundle_c = bundle.clone();
     let ability_c = ability.clone();
-    ctx.emit_log("system", &format!("并行部署到 {} 台设备: {}", devices.len(), devices.join(", ")));
+    ctx.emit_log(
+        "system",
+        &format!(
+            "并行部署到 {} 台设备: {}",
+            devices.len(),
+            devices.join(", ")
+        ),
+    );
 
     // 每设备一个并行任务
     let futures = devices.iter().cloned().map(|dev| {
@@ -683,8 +936,16 @@ pub(super) async fn deploy_all(
         let project_id = project_id.to_string();
         tokio::spawn(async move {
             let res = deploy_one_device(
-                &ctx, &project_path, &project_id, &dev, &hap, is_signed, &bundle, &ability,
-            ).await;
+                &ctx,
+                &project_path,
+                &project_id,
+                &dev,
+                &hap,
+                is_signed,
+                &bundle,
+                &ability,
+            )
+            .await;
             (dev, res)
         })
     });
@@ -699,7 +960,9 @@ pub(super) async fn deploy_all(
             Ok((dev, Ok(msg))) => {
                 ok_count += 1;
                 summary.push_str(&format!("\n✓ {dev}\n"));
-                for line in msg.lines().filter(|l| l.starts_with("✓") || l.contains("启动") || l.starts_with("设备型号")) {
+                for line in msg.lines().filter(|l| {
+                    l.starts_with("✓") || l.contains("启动") || l.starts_with("设备型号")
+                }) {
                     summary.push_str(&format!("  {line}\n"));
                 }
             }
@@ -714,7 +977,10 @@ pub(super) async fn deploy_all(
         }
     }
     summary.push_str(&format!("\n成功 {ok_count} 台，失败 {fail_count} 台。"));
-    ctx.emit_log("system", &format!("多设备部署完成：成功 {ok_count}，失败 {fail_count}"));
+    ctx.emit_log(
+        "system",
+        &format!("多设备部署完成：成功 {ok_count}，失败 {fail_count}"),
+    );
     if fail_count > 0 && ok_count == 0 {
         Err(summary)
     } else {
@@ -748,17 +1014,27 @@ pub(super) async fn deploy_one_device(
         }
     }
     let install_args: Vec<String> = if already_installed {
-        vec!["-t", device_id, "install", "-r", hap].into_iter().map(String::from).collect()
+        vec!["-t", device_id, "install", "-r", hap]
+            .into_iter()
+            .map(String::from)
+            .collect()
     } else {
-        vec!["-t", device_id, "install", hap].into_iter().map(String::from).collect()
+        vec!["-t", device_id, "install", hap]
+            .into_iter()
+            .map(String::from)
+            .collect()
     };
-    let install_out = crate::agent::exec_ctx::run_cmd_streaming(
-        ctx, "hdc", &install_args, None, 300, None,
-    ).await.map_err(|e| with_advice("deploy", e))?;
+    let install_out =
+        crate::agent::exec_ctx::run_cmd_streaming(ctx, "hdc", &install_args, None, 300, None)
+            .await
+            .map_err(|e| with_advice("deploy", e))?;
     let install_text = smart_decode(&install_out.stdout) + &smart_decode(&install_out.stderr);
     if !install_out.status.success() {
         let (cat, msg) = classify_deploy_error(&install_text, is_signed);
-        return Err(format!("[{cat}] {}", msg.lines().next().unwrap_or("安装失败")));
+        return Err(format!(
+            "[{cat}] {}",
+            msg.lines().next().unwrap_or("安装失败")
+        ));
     }
     out.push_str(" 安装成功\n");
 
@@ -769,7 +1045,8 @@ pub(super) async fn deploy_one_device(
 
     // 拉起
     run_hdc_shell(device_id, &["aa", "start", "-b", bundle, "-a", ability], 30)
-        .await.map_err(|e| format!("拉起失败: {e}"))?;
+        .await
+        .map_err(|e| format!("拉起失败: {e}"))?;
 
     // 存活探测
     let mut alive = false;
@@ -777,7 +1054,10 @@ pub(super) async fn deploy_one_device(
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         match run_hdc_shell(device_id, &["aa", "dump", "-l"], 30).await {
             Ok(dump) if dump.contains(bundle) => alive = true,
-            _ => { alive = false; break; }
+            _ => {
+                alive = false;
+                break;
+            }
         }
     }
 
@@ -793,8 +1073,12 @@ pub(super) async fn deploy_one_device(
         Ok(out)
     } else {
         // 崩溃归因
-        let faultlog = fetch_recent_faultlog(device_id, bundle).await.unwrap_or_default();
-        let hilog = run_hdc_shell(device_id, &["hilog", "-x"], 25).await.unwrap_or_default();
+        let faultlog = fetch_recent_faultlog(device_id, bundle)
+            .await
+            .unwrap_or_default();
+        let hilog = run_hdc_shell(device_id, &["hilog", "-x"], 25)
+            .await
+            .unwrap_or_default();
         let report = crate::agent::crash::analyze(bundle, &faultlog, &hilog);
         let nth = crate::agent::crash::record_pattern(project_path, &report);
         crate::agent::diagnostics::record(
@@ -803,15 +1087,25 @@ pub(super) async fn deploy_one_device(
                 source: "crash_analysis".into(),
                 category: report.category.clone(),
                 summary: if nth > 1 {
-                    format!("{}（同类崩溃历史第 {nth} 次，建议参考既往修复经验避免重复踩坑）", report.summary)
+                    format!(
+                        "{}（同类崩溃历史第 {nth} 次，建议参考既往修复经验避免重复踩坑）",
+                        report.summary
+                    )
                 } else {
                     report.summary.clone()
                 },
                 detail: tail(&report.snippet, 600),
-                at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
             },
         );
-        Err(format!("启动后崩溃 [{}]: {}", report.category, tail(&report.summary, 200)))
+        Err(format!(
+            "启动后崩溃 [{}]: {}",
+            report.category,
+            tail(&report.summary, 200)
+        ))
     }
 }
 
@@ -821,7 +1115,10 @@ async fn fetch_recent_faultlog(device: &str, bundle: &str) -> Result<String, Str
     let candidates: Vec<&str> = ls
         .lines()
         .map(str::trim)
-        .filter(|l| l.contains(bundle) && (l.starts_with("JsError") || l.starts_with("CppCrash") || l.contains("crash")))
+        .filter(|l| {
+            l.contains(bundle)
+                && (l.starts_with("JsError") || l.starts_with("CppCrash") || l.contains("crash"))
+        })
         .collect();
     let Some(name) = candidates.first() else {
         return Ok(String::new());
@@ -857,7 +1154,10 @@ pub(super) fn classify_deploy_error(output: &str, is_signed: bool) -> (String, S
         || lower.contains("no space")
         || lower.contains("insufficient")
     {
-        ("insufficient_storage", "设备存储空间不足。提示用户清理设备空间后重试，不要改代码。")
+        (
+            "insufficient_storage",
+            "设备存储空间不足。提示用户清理设备空间后重试，不要改代码。",
+        )
     } else if lower.contains("incompatible")
         || lower.contains("abi")
         || lower.contains("architecture")
@@ -881,38 +1181,50 @@ pub(super) fn classify_deploy_error(output: &str, is_signed: bool) -> (String, S
 }
 
 pub(super) async fn ohpm_search(args: &Value) -> Result<String, String> {
-    let keyword = args["keyword"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+    let keyword = args["keyword"]
+        .as_str()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
     let Some(keyword) = keyword else {
         return Err("ohpm_search 需要 keyword（包名或关键字）".into());
     };
     let detail = args["detail"].as_bool().unwrap_or(false);
     // ohpm 6.x 已移除 search 子命令：优先 view 查询包信息（返回版本/描述/依赖），
     // 兼容旧版先试 search、报 unknown command 时自动回退 view
-    let search_out = match run_cmd("ohpm", &["search".into(), keyword.to_string()], None, 60).await {
+    let search_out = match run_cmd("ohpm", &["search".into(), keyword.to_string()], None, 60).await
+    {
         Ok(o) => o,
-        Err(e) if e.contains("unknown command") || e.contains("unknown option") => {
-            String::new()
-        }
+        Err(e) if e.contains("unknown command") || e.contains("unknown option") => String::new(),
         Err(e) => return Err(with_advice("ohpm_search", e)),
     };
     let search_out = search_out.trim();
     let mut s = String::new();
     if search_out.is_empty() {
-        s.push_str(&format!("ohpm 无 search 命令（6.x 起移除），改用 view 查询包「{keyword}」信息：\n"));
+        s.push_str(&format!(
+            "ohpm 无 search 命令（6.x 起移除），改用 view 查询包「{keyword}」信息：\n"
+        ));
     } else {
         s.push_str(&format!("ohpm 搜索结果（{keyword}）：\n{}\n", search_out));
     }
-    let view = run_cmd("ohpm", &["view".into(), keyword.to_string()], None, 60).await
+    let view = run_cmd("ohpm", &["view".into(), keyword.to_string()], None, 60)
+        .await
         .unwrap_or_else(|e| format!("ohpm view 失败：{e}"));
     if view.contains("error") || view.contains("not found") {
         s.push_str(&format!("ohpm 仓库未找到与「{keyword}」匹配的包（view 无结果）。\n建议：检查包名拼写；用 web_search 查该库的鸿蒙支持情况；或考虑替代库。\n"));
         return Ok(s);
     }
-    s.push_str(&format!("--- ohpm view {keyword} ---\n{}\n", view.trim_end()));
+    s.push_str(&format!(
+        "--- ohpm view {keyword} ---\n{}\n",
+        view.trim_end()
+    ));
     if detail {
-        let info = run_cmd("ohpm", &["info".into(), keyword.to_string()], None, 60).await
+        let info = run_cmd("ohpm", &["info".into(), keyword.to_string()], None, 60)
+            .await
             .unwrap_or_else(|e| format!("ohpm info 失败：{e}"));
-        s.push_str(&format!("\n--- ohpm info {keyword} ---\n{}\n", info.trim_end()));
+        s.push_str(&format!(
+            "\n--- ohpm info {keyword} ---\n{}\n",
+            info.trim_end()
+        ));
     }
     s.push_str(&format!(
         "\n确认可用后：ohpm_install package={keyword}（或先 edit_file 更新 oh-package.json5 依赖再 ohpm_install）。"
@@ -934,7 +1246,10 @@ fn display_truncate(s: &str, n: usize) -> String {
 /// ohpm_recommend：基于本地 landscape 缓存的离线三方库推荐/检索。
 /// 数据来自 ohpm 官方 landscape（开源技术图谱）接口的定期镜像：
 /// 含四级分类 / 描述 / 关键词 / 60 天下载量 / 评分，按热度排序。
-pub(super) async fn ohpm_recommend(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+pub(super) async fn ohpm_recommend(
+    args: &Value,
+    db: &crate::db::DbState,
+) -> Result<String, String> {
     use crate::services::ohpm_landscape as ls;
 
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -1003,7 +1318,11 @@ pub(super) async fn ohpm_recommend(args: &Value, db: &crate::db::DbState) -> Res
             p.package_name,
             p.version,
             p.down_count_60d,
-            if p.license.is_empty() { "-".to_string() } else { p.license.clone() },
+            if p.license.is_empty() {
+                "-".to_string()
+            } else {
+                p.license.clone()
+            },
             p.level1(),
             display_truncate(&p.description, 90),
         ));
@@ -1045,13 +1364,20 @@ fn parse_profile_meta(bytes: &[u8]) -> serde_json::Value {
     let mut meta = serde_json::Map::new();
     for key in ["bundle-name", "type", "developer-id", "device-ids"] {
         let needle = format!("\"{key}\"");
-        let Some(idx) = text.find(&needle) else { continue };
+        let Some(idx) = text.find(&needle) else {
+            continue;
+        };
         let after = &text[idx + needle.len()..];
-        let Some(colon) = after.find(':') else { continue };
+        let Some(colon) = after.find(':') else {
+            continue;
+        };
         let v = after[colon + 1..].trim_start();
         if v.starts_with('"') {
             if let Some(end) = v[1..].find('"') {
-                meta.insert(key.to_string(), serde_json::Value::String(v[1..1 + end].to_string()));
+                meta.insert(
+                    key.to_string(),
+                    serde_json::Value::String(v[1..1 + end].to_string()),
+                );
             }
         } else if v.starts_with('[') {
             // device-ids 数组：收集全部引号字符串
@@ -1081,7 +1407,9 @@ fn scan_sign_materials() -> Vec<(String, serde_json::Value)> {
         .map(std::path::PathBuf::from);
     let Some(home) = home else { return out };
     let dir = home.join(".ohos").join("config");
-    let Ok(rd) = std::fs::read_dir(&dir) else { return out };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return out;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let is_p7b = p
@@ -1093,8 +1421,18 @@ fn scan_sign_materials() -> Vec<(String, serde_json::Value)> {
         }
         if let Ok(bytes) = std::fs::read(&p) {
             let meta = parse_profile_meta(&bytes);
-            if meta.get("bundle-name").map(|v| v.is_string()).unwrap_or(false) {
-                out.push((p.file_name().unwrap_or_default().to_string_lossy().to_string(), meta));
+            if meta
+                .get("bundle-name")
+                .map(|v| v.is_string())
+                .unwrap_or(false)
+            {
+                out.push((
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    meta,
+                ));
             }
         }
     }
@@ -1105,14 +1443,22 @@ fn scan_sign_materials() -> Vec<(String, serde_json::Value)> {
 fn signing_material_status(cfg: &serde_json::Value, root: &Path) -> (Vec<String>, Vec<String>) {
     let mut ok = Vec::new();
     let mut missing = Vec::new();
-    for (key, field) in [("certpath", "证书"), ("profile", "profile"), ("storeFile", "密钥库")] {
+    for (key, field) in [
+        ("certpath", "证书"),
+        ("profile", "profile"),
+        ("storeFile", "密钥库"),
+    ] {
         let v = cfg.get(key).and_then(|v| v.as_str()).unwrap_or("");
         if v.is_empty() {
             missing.push(format!("{field}（{key}）未配置"));
             continue;
         }
         let p = Path::new(v);
-        let p = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
+        let p = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        };
         if p.is_file() {
             ok.push(field.to_string());
         } else {
@@ -1147,7 +1493,10 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
                 .and_then(|b| b.as_str())
                 .map(String::from)
         });
-    out.push_str(&format!("1. 工程 bundleName：{}\n", bundle.as_deref().unwrap_or("（未能解析 app.json5）")));
+    out.push_str(&format!(
+        "1. 工程 bundleName：{}\n",
+        bundle.as_deref().unwrap_or("（未能解析 app.json5）")
+    ));
 
     // 2) 当前签名配置
     let bp_text = std::fs::read_to_string(root.join("build-profile.json5")).unwrap_or_default();
@@ -1167,12 +1516,24 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
         for (i, cfg) in cfgs.iter().enumerate() {
             let name = cfg.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let (ok, missing) = signing_material_status(cfg, &root);
-            out.push_str(&format!("   [{i}] {name}：材料齐全（{}），缺失：{}\n", ok.join("+"), if missing.is_empty() { "无".to_string() } else { missing.join("; ") }));
+            out.push_str(&format!(
+                "   [{i}] {name}：材料齐全（{}），缺失：{}\n",
+                ok.join("+"),
+                if missing.is_empty() {
+                    "无".to_string()
+                } else {
+                    missing.join("; ")
+                }
+            ));
             if let Some(pp) = cfg.get("profile").and_then(|v| v.as_str()) {
                 let p = Path::new(pp);
-                if p.is_absolute() { p.to_path_buf() } else { root.join(p) }
-                    .is_file()
-                    .then(|| current_profile = Some(pp.to_string()));
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    root.join(p)
+                }
+                .is_file()
+                .then(|| current_profile = Some(pp.to_string()));
             }
         }
     }
@@ -1190,16 +1551,24 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
     }
     out.push_str(&format!(
         "3. 设备：{}（UDID：{})\n",
-        device.as_deref().unwrap_or("未检测到在线设备（请连接真机/模拟器）"),
+        device
+            .as_deref()
+            .unwrap_or("未检测到在线设备（请连接真机/模拟器）"),
         device_udid.as_deref().unwrap_or("未知")
     ));
 
     // 4) 签名材料库扫描（~/.ohos/config）
     let materials = scan_sign_materials();
-    out.push_str(&format!("4. 本地签名材料（~/.ohos/config）：{} 套\n", materials.len()));
+    out.push_str(&format!(
+        "4. 本地签名材料（~/.ohos/config）：{} 套\n",
+        materials.len()
+    ));
     let mut matched_material: Option<String> = None;
     for (fname, meta) in &materials {
-        let mb = meta.get("bundle-name").and_then(|v| v.as_str()).unwrap_or("");
+        let mb = meta
+            .get("bundle-name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let mtype = meta.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let ids: Vec<&str> = meta
             .get("device-ids")
@@ -1207,7 +1576,9 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
             .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
             .unwrap_or_default();
         let bundle_ok = bundle.as_deref().is_some_and(|b| mb == b);
-        let device_ok = device_udid.as_ref().is_some_and(|u| ids.contains(&u.as_str()));
+        let device_ok = device_udid
+            .as_ref()
+            .is_some_and(|u| ids.contains(&u.as_str()));
         let flag = if bundle_ok && device_ok {
             "✅ 完全匹配"
         } else if bundle_ok {
@@ -1217,7 +1588,14 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
         } else {
             "✗ 不匹配"
         };
-        out.push_str(&format!("   - {fname}：bundle={mb}，type={mtype}，绑定额外设备 {} 台，当前设备 {} → {flag}\n", ids.len(), device_udid.as_deref().map(|u| u.chars().take(12).collect::<String>() + "…").unwrap_or_default()));
+        out.push_str(&format!(
+            "   - {fname}：bundle={mb}，type={mtype}，绑定额外设备 {} 台，当前设备 {} → {flag}\n",
+            ids.len(),
+            device_udid
+                .as_deref()
+                .map(|u| u.chars().take(12).collect::<String>() + "…")
+                .unwrap_or_default()
+        ));
         if bundle_ok && device_ok && matched_material.is_none() {
             matched_material = Some(fname.clone());
         }
@@ -1232,7 +1610,11 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
             let ids: Vec<String> = m
                 .get("device-ids")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             bundle.as_deref().is_some_and(|b| b == mb)
                 && device_udid.as_ref().is_some_and(|u| ids.contains(u))
@@ -1242,9 +1624,7 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
     out.push_str("\n5. 结论与建议：\n");
     if cfgs.is_empty() {
         if let Some(m) = &matched_material {
-            out.push_str(&format!(
-                "   • 未配置签名，但材料库中存在匹配材料 {m}。\n"
-            ));
+            out.push_str(&format!("   • 未配置签名，但材料库中存在匹配材料 {m}。\n"));
             out.push_str("   • 修复路径：请在 build-profile.json5 的 app.signingConfigs 添加配置并引用该材料\n");
             out.push_str("     （certpath/profile/storeFile 指向 ~/.ohos/config 下对应 .cer/.p7b/.p12，keyAlias=debugKey，signAlg=SHA256withECDSA）；\n");
             out.push_str("     或复用工作区内其他鸿蒙工程（同 bundle）已配置的 signingConfigs（含密码字段，复制即可）。\n");
@@ -1255,13 +1635,44 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
         out.push_str("   • 建议：配置完成后调用 build_project 重新构建，再 deploy。\n");
     } else if current_ok {
         out.push_str("   ✅ 当前签名配置与 bundle、设备完全匹配——直接 build_project 重新构建即可产出已签名 HAP，随后 deploy。\n");
-        out.push_str("     注意：若此前部署报 9568319，多为部署了旧的 unsigned HAP 产物，重新构建可解决。\n");
+        out.push_str(
+            "     注意：若此前部署报 9568319，多为部署了旧的 unsigned HAP 产物，重新构建可解决。\n",
+        );
     } else if let Some(m) = &matched_material {
-        out.push_str(&format!("   • 当前配置的 profile 与设备/bundle 不匹配，但材料库 {m} 匹配。\n"));
+        out.push_str(&format!(
+            "   • 当前配置的 profile 与设备/bundle 不匹配，但材料库 {m} 匹配。\n"
+        ));
         out.push_str("   • 修复路径：用 edit_file 把 build-profile.json5 的 signingConfigs 中 certpath/profile/storeFile 改为材料库匹配项（或整体复用匹配工程的配置），再 build_project + deploy。\n");
     } else {
         out.push_str("   • 当前签名配置与设备/bundle 不匹配，且材料库无匹配项。\n");
         out.push_str("   • 可选：调整 AppScope/app.json5 的 bundleName 与现有 profile 一致（需评估应用身份影响）；或用 DevEco Studio 重新生成签名。\n");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod build_workflow_tests {
+    use super::*;
+
+    #[test]
+    fn build_request_validates_dependency_policy() {
+        let root = std::env::temp_dir().join(format!("build-request-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("entry")).unwrap();
+        std::fs::write(
+            root.join("build-profile.json5"),
+            r#"{"modules":[{"name":"entry","srcPath":"./entry"}]}"#,
+        )
+        .unwrap();
+        let spec = BuildRequest::from_args(&serde_json::json!({}))
+            .unwrap()
+            .resolve(&root, Some("entry"))
+            .unwrap();
+        assert_eq!(spec.dependencies, "auto");
+        assert!(BuildRequest::from_args(&serde_json::json!({"dependencies":"sometimes"}))
+            .unwrap()
+            .resolve(&root, Some("entry"))
+            .is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
 }

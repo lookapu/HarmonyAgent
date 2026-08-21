@@ -323,7 +323,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "build_project",
-        desc: "构建当前 HarmonyOS 工程（hvigorw assembleHap）。\n参数：{\"mode\":\"debug\"|\"release\",\"clean\":bool,\"module\":\"<可选模块名，如 entry/feature，缺省 entry>\"}，mode 缺省 debug；clean=true 时先 hvigor clean 清缓存再构建（用于缓存导致的诡异失败，不要每次都传）；module 指定后只构建该模块（多模块工程改库/功能模块后按需验证）。\n副作用：在工程 build 目录生成/更新 .hap 产物，耗时可能数分钟。\n返回：构建日志尾部与结论。失败时返回结构化错误（含 category 根因分类：type/syntax/dependency/sdk/api_level/signing/ohpm/resource）与\"推荐下一步\"，请按推荐选择后续工具（如 ohpm_install、check_sdk_alignment、show_diagnose_card、edit_file），不要盲目重复相同构建。",
+        desc: "运行可恢复的 HarmonyOS 构建工作流（环境预检 → OHPM 依赖核对/安装 → Hvigor assembleHap → HAP/HSP/HAR 产物发现）。\n参数：{\"mode\":\"debug\"|\"release\",\"clean\":bool,\"module\":\"<可选模块名，如 entry/feature，缺省 entry>\",\"dependencies\":\"auto\"|\"force\"|\"skip\"}；dependencies 缺省 auto，仅在声明依赖缺失时安装，force 强制同步，skip 明确跳过。clean=true 时先 hvigor clean 清缓存；module 指定后只构建该模块。相同参数与工程指纹的中断/失败任务会从安全 checkpoint 恢复，工程变化后自动重开。\n副作用：可能更新 OHPM 锁文件/oh_modules，并在 build 目录生成产物；耗时可能数分钟。\n返回：工作流阶段、产物清单、构建日志尾部与结论。失败时返回结构化错误（含 category 根因分类：type/syntax/dependency/sdk/api_level/signing/ohpm/resource）与推荐下一步。",
     },
     ToolSpec {
         name: "deploy",
