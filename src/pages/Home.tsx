@@ -8659,6 +8659,7 @@ const settingsItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/mcp', labelKey: 'nav.mcp', icon: 'mcp' },
   { path: '/skills', labelKey: 'nav.skill', icon: 'skill' },
   { path: '/team-sharing', labelKey: 'nav.teamSharing', icon: 'skill' },
+  { path: '/reproduction-bundles', labelKey: 'nav.reproductionBundles', icon: 'archive' },
   { path: '/knowledge', labelKey: 'nav.knowledge', icon: 'skill' },
   { path: '/api-knowledge', labelKey: 'nav.apiKnowledge', icon: 'package' },
   { path: '/health', labelKey: 'nav.health', icon: 'health' },

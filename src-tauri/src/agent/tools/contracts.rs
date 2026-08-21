@@ -130,6 +130,7 @@ const MANUAL_RECOVERY: &[&str] = &[
     "app_market_publish",
     "workflow_template",
     "team_share",
+    "reproduction_bundle",
 ];
 
 /// 只从注册表的结构化约定派生契约。未知/MCP 工具默认按写入处理，禁止自动重放。

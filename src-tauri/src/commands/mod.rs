@@ -30,6 +30,7 @@ pub mod rules;
 pub mod skill;
 pub mod terminal;
 pub mod team_sharing;
+pub mod reproduction_bundle;
 pub mod tools;
 pub mod update;
 pub mod version;

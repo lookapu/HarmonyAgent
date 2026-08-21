@@ -31,6 +31,7 @@ const ApiKnowledgePage = lazy(() => import('./pages/ApiKnowledgePage'))
 const HealthPage = lazy(() => import('./pages/HealthPage'))
 const OhpmPage = lazy(() => import('./pages/OhpmPage'))
 const TeamSharingPage = lazy(() => import('./pages/TeamSharingPage'))
+const ReproductionBundlesPage = lazy(() => import('./pages/ReproductionBundlesPage'))
 const ProxyPage = lazy(() => import('./pages/ProxyPage'))
 
 const navItems: { path: string; labelKey: string; icon: IconName }[] = [
@@ -44,6 +45,7 @@ const navItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/mcp', labelKey: 'nav.mcp', icon: 'mcp' },
   { path: '/skills', labelKey: 'nav.skill', icon: 'skill' },
   { path: '/team-sharing', labelKey: 'nav.teamSharing', icon: 'skill' },
+  { path: '/reproduction-bundles', labelKey: 'nav.reproductionBundles', icon: 'archive' },
   { path: '/knowledge', labelKey: 'nav.knowledge', icon: 'skill' },
   { path: '/api-knowledge', labelKey: 'nav.apiKnowledge', icon: 'package' },
   { path: '/health', labelKey: 'nav.health', icon: 'health' },
@@ -196,6 +198,7 @@ function AdminLayout() {
             <Route path="/mcp" element={<McpPage />} />
             <Route path="/skills" element={<SkillsPage />} />
             <Route path="/team-sharing" element={<TeamSharingPage />} />
+            <Route path="/reproduction-bundles" element={<ReproductionBundlesPage />} />
             <Route path="/knowledge" element={<KnowledgePage />} />
             <Route path="/api-knowledge" element={<ApiKnowledgePage />} />
             <Route path="/health" element={<HealthPage />} />

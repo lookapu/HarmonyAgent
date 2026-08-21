@@ -12,7 +12,7 @@
 | 权限等级 | L0/L1/L2 | `services/permissions.rs` 与工具 hooks |
 | 工具协议 | 文本标记 + 原生 function calling | `protocol.rs` / `commands/chat.rs` |
 
-`TOOL_SPECS` 是工具名称、描述和副作用标记的唯一事实源；本文不复制 200 项完整数组，避免新增工具后出现双份清单漂移。
+`TOOL_SPECS` 是工具名称、描述和副作用标记的唯一事实源；本文不复制 201 项完整数组，避免新增工具后出现双份清单漂移。
 
 ## 2. 八个任务域
 

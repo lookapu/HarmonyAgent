@@ -255,6 +255,7 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("step_debug", "debug"),
     ("ota_pack", "build"),
     ("team_share", "other"),
+    ("reproduction_bundle", "other"),
 ];
 
 /// 全部任务分组（tool_list 过滤与前端分组 UI 用）
@@ -357,6 +358,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "team_share",
         desc: "管理版本化团队共享包（项目记忆、工程约定、固定评测集）。\n参数：{\"action\":\"validate|preview|apply|revert|list|export|run_eval\",\"package\":<validate/preview/apply 的 schema=1 对象>,\"batch_id\":\"<revert>\",\"set_id\":\"<run_eval>\",\"package_id\":\"<export>\",\"name\":\"<export>\",\"version\":\"<SemVer>\",\"source_uri\":\"<来源>\",\"source_revision\":\"<精确修订>\"}。apply/revert 每次要求显式审批；preview 会列出新增、同源更新、本地冲突和未变化项。本地冲突只以禁用且未确认的副本并存，绝不覆盖本地事实；revert 只恢复仍保持导入状态的项，用户编辑过的项保留。评测集只能组合本机已注册场景，不能携带可执行代码。\n副作用：validate/preview/list/export/run_eval 只读；apply 写入共享记忆、约定和评测集，revert 按批次恢复或删除未被用户修改的导入项。\n返回：校验/冲突预览、导入批次与来源、撤销数量、共享包 JSON 或评测结果。",
+    },
+    ToolSpec {
+        name: "reproduction_bundle",
+        desc: "预览、生成和校验默认脱敏的问题复现包。\n参数：{\"action\":\"preview|generate|list|validate\",\"request\":{\"title\":\"问题标题\",\"description\":\"描述\",\"steps\":[\"步骤\"],\"expected\":\"预期\",\"actual\":\"实际\",\"conversation_id\":\"<可选，缺省当前会话>\",\"run_id\":\"<可选>\",\"include_messages\":true,\"include_tool_runs\":true,\"include_run_events\":true,\"attachments\":[\"项目内相对文本路径\"]},\"preview_digest\":\"<generate 必填>\",\"confirmed\":true,\"bundle_id\":\"<validate 必填>\"}。必须先 preview 查看精确条目、脱敏状态、遗漏附件和摘要；generate 每次要求用户显式审批，且内容必须仍与预览摘要一致。附件仅接受项目内、非敏感、≤1 MiB 的 UTF-8 文本；凭据、签名材料、二进制和越界路径默认拒绝。\n副作用：preview/list/validate 只读；generate 在 .deveco-agent/repro-bundles 写入带 SHA-256 清单的 ZIP，并登记审计。不会自动上传或分享。\n返回：预览清单、导出记录或逐条完整性校验结果。",
     },
     ToolSpec {
         name: "debug_probe",
@@ -1336,6 +1341,12 @@ pub async fn run_tool(
             &args, &roots, db, project_id, &ctx.run_id, &ctx.conversation_id,
         ),
         "team_share" => crate::services::team_sharing::handle_tool(&args, project_id, db),
+        "reproduction_bundle" => crate::services::reproduction_bundle::handle_tool(
+            &args,
+            project_id,
+            &ctx.conversation_id,
+            db,
+        ),
         "lsp_definition" => crate::agent::lsp_client::lsp_definition(&args, &roots, &ctx.conversation_id).await,
         "lsp_references" => crate::agent::lsp_client::lsp_references(&args, &roots, &ctx.conversation_id).await,
         "lsp_symbols" => crate::agent::lsp_client::lsp_symbols(&args, &roots, &ctx.conversation_id).await,
