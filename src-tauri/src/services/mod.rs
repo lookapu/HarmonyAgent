@@ -8,6 +8,7 @@ pub mod embedding;
 pub mod git_runtime;
 pub mod generic_project;
 pub mod harmony;
+pub mod harmony_model;
 pub mod harmony_api_diff;
 pub mod harmony_api_ref;
 pub mod harmony_docs;

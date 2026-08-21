@@ -116,185 +116,70 @@ pub fn is_project_root(dir: &Path) -> bool {
 }
 
 /// 解析鸿蒙工程的关键信息（部署与构建闭环所需的最小集合）。
+///
+/// 该兼容视图从统一语义模型派生，避免部署侧与工程分析侧分别猜测模块布局。
 pub fn parse_project(root: &Path) -> HarmonyProject {
-    let mut info = HarmonyProject::default();
-
-    // AppScope/app.json5（标准位置）；找不到时检查根目录 app.json5，再扫描一层子目录（布局差异）
-    let mut app_scope_texts: Vec<String> = Vec::new();
-    if let Some(text) = read_to_string_opt(&root.join("AppScope").join("app.json5")) {
-        app_scope_texts.push(text);
-    } else {
-        if let Some(text) = read_to_string_opt(&root.join("app.json5")) {
-            app_scope_texts.push(text);
-        } else if let Ok(entries) = std::fs::read_dir(root) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    if let Some(text) = read_to_string_opt(&p.join("AppScope").join("app.json5")) {
-                        app_scope_texts.push(text);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    for text in app_scope_texts {
-        if let Ok(v) = parse_json5(&text) {
-            if let Some(app) = v.get("app") {
-                info.bundle_name = app.get("bundleName").and_then(|x| x.as_str()).map(String::from);
-                info.version_code = app.get("versionCode").and_then(|x| x.as_i64());
-                info.version_name = app.get("versionName").and_then(|x| x.as_str()).map(String::from);
-                if let Some(label) = app.get("label").and_then(|x| x.as_str()) {
-                    info.app_label = Some(label.to_string());
-                }
-            }
-        }
-        if info.bundle_name.is_some() {
-            break;
-        }
-    }
-
-    // build-profile.json5（标准位置）；找不到时扫描一层子目录
-    let build_profile_texts: Vec<String> = {
-        let mut v = Vec::new();
-        if let Some(text) = read_to_string_opt(&root.join("build-profile.json5")) {
-            v.push(text);
-        } else if let Ok(entries) = std::fs::read_dir(root) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    if let Some(text) = read_to_string_opt(&p.join("build-profile.json5")) {
-                        v.push(text);
-                        break;
-                    }
-                }
-            }
-        }
-        v
-    };
-    for text in build_profile_texts {
-        if let Ok(v) = parse_json5(&text) {
-            if let Some(app) = v.get("app") {
-                // 签名：存在 signingConfigs 且至少一个 product 引用了签名配置
-                let has_signing_configs = app
-                    .get("signingConfigs")
-                    .and_then(|x| x.as_array())
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false);
-                let product_uses_signing = app
-                    .get("products")
-                    .and_then(|x| x.as_array())
-                    .map(|arr| {
-                        arr.iter().any(|p| p.get("signingConfig").is_some())
-                    })
-                    .unwrap_or(false);
-                info.signing_configured = has_signing_configs && product_uses_signing;
-
-                if let Some(products) = app.get("products").and_then(|x| x.as_array()) {
-                    // 遍历所有 product：取第一个携带 SDK 版本信息的（多 product 工程可能只有其一声明）
-                    for p in products {
-                        if let Some(v) = p.get("compatibleSdkVersion").and_then(|x| x.as_str()) {
-                            info.sdk_version = Some(v.to_string());
-                            info.api_version = parse_api_version(v);
-                            break;
-                        } else if let Some(n) = p.get("compatibleSdkVersion").and_then(|x| x.as_i64()) {
-                            info.sdk_version = Some(n.to_string());
-                            info.api_version = Some(n);
-                            break;
-                        }
-                    }
-                    // 兜底：compileSdkVersion（部分工程仅声明编译版本）
-                    if info.api_version.is_none() {
-                        for p in products {
-                            if let Some(v) = p.get("compileSdkVersion").and_then(|x| x.as_str()) {
-                                info.sdk_version = Some(v.to_string());
-                                info.api_version = parse_api_version(v);
-                                break;
-                            } else if let Some(n) = p.get("compileSdkVersion").and_then(|x| x.as_i64()) {
-                                info.sdk_version = Some(n.to_string());
-                                info.api_version = Some(n);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            // entry 模块：modules 数组中 type=entry 或 targets 含 phone
-            if let Some(modules) = v.get("modules").and_then(|x| x.as_array()) {
-                for m in modules {
-                    let name = m.get("name").and_then(|x| x.as_str());
-                    let src = m.get("srcPath").and_then(|x| x.as_str());
-                    if let Some(name) = name {
-                        // srcPath 形如 "./entry"，目录名即模块名
-                        let dir_name = src
-                            .map(|s| s.trim_start_matches("./").trim_start_matches('/'))
-                            .unwrap_or(name);
-                        let module_root = root.join(dir_name);
-                        if module_root.join("src/main/module.json5").is_file() {
-                            info.entry_module = Some(dir_name.to_string());
-                            break;
-                        }
-                        // 退化：只要名字叫 entry
-                        if name == "entry" {
-                            info.entry_module = Some(dir_name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        if info.entry_module.is_some() {
-            break;
-        }
-    }
-
-    // 若未从 build-profile 找到 entry，扫描一层子目录寻找 module.json5
-    if info.entry_module.is_none() {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() && p.join("src/main/module.json5").is_file() {
-                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                        info.entry_module = Some(name.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // entry 模块的 mainElement
-    if let Some(module) = &info.entry_module {
-        let module_json = root.join(module).join("src/main/module.json5");
-        if let Some(text) = read_to_string_opt(&module_json) {
-            if let Ok(v) = parse_json5(&text) {
-                if let Some(m) = v.get("module") {
-                    if let Some(me) = m.get("mainElement").and_then(|x| x.as_str()) {
-                        info.main_element = Some(me.to_string());
-                    } else if let Some(abilities) = m.get("abilities").and_then(|x| x.as_array()) {
-                        if let Some(first) = abilities.first() {
-                            if let Some(n) = first.get("name").and_then(|x| x.as_str()) {
-                                info.main_element = Some(n.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // hap 产物目录推导：{module}/build/default/outputs/default
-        let out_dir = root
-            .join(module)
-            .join("build")
-            .join("default")
-            .join("outputs")
-            .join("default");
-        info.hap_output_dir = Some(out_dir);
-    }
-
-    info
+    let model = crate::services::harmony_model::parse(root);
+    project_summary(root, &model)
 }
 
-/// 从形如 "5.0.0(12)" 中提取括号内 API 版本号；纯数字字符串直接解析。
+pub fn project_summary(
+    root: &Path,
+    model: &crate::services::harmony_model::HarmonySemanticModel,
+) -> HarmonyProject {
+    let preferred_product = model
+        .products
+        .iter()
+        .find(|product| product.name == "default")
+        .or_else(|| model.products.first());
+    let sdk_product = preferred_product
+        .filter(|product| {
+            product.compatible_sdk_version.is_some() || product.compile_sdk_version.is_some()
+        })
+        .or_else(|| {
+            model.products.iter().find(|product| {
+                product.compatible_sdk_version.is_some() || product.compile_sdk_version.is_some()
+            })
+        });
+    let entry = model
+        .modules
+        .iter()
+        .find(|module| module.kind == "entry")
+        .or_else(|| model.modules.iter().find(|module| module.name == "entry"))
+        .or_else(|| model.modules.iter().find(|module| module.artifact_kind == "hap"));
+    let sdk_version = sdk_product.and_then(|product| {
+        product
+            .compatible_sdk_version
+            .clone()
+            .or_else(|| product.compile_sdk_version.clone())
+    });
+    HarmonyProject {
+        bundle_name: model.app.bundle_name.clone(),
+        version_code: model.app.version_code,
+        version_name: model.app.version_name.clone(),
+        app_label: model.app.label.clone(),
+        main_element: entry.and_then(|module| {
+            module
+                .main_element
+                .clone()
+                .or_else(|| module.abilities.first().map(|ability| ability.name.clone()))
+        }),
+        entry_module: entry.map(|module| module.rel_path.clone()),
+        api_version: sdk_version.as_deref().and_then(parse_api_version),
+        sdk_version,
+        signing_configured: model.products.iter().any(|product| {
+            product
+                .signing_config
+                .as_ref()
+                .is_some_and(|name| model.signing_configs.contains(name))
+        }),
+        hap_output_dir: entry.map(|module| {
+            root.join(&module.rel_path)
+                .join("build/default/outputs/default")
+        }),
+    }
+}
+
 fn parse_api_version(s: &str) -> Option<i64> {
     if let Some(start) = s.find('(') {
         if let Some(end) = s.find(')') {

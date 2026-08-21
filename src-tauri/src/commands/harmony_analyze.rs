@@ -60,6 +60,8 @@ pub struct KitStat {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectCapability {
     pub project: crate::services::harmony::HarmonyProject,
+    /// 工程、产品、模块、产物、Ability 与依赖边的统一语义模型。
+    pub semantic_model: crate::services::harmony_model::HarmonySemanticModel,
     pub modules: Vec<ModuleCapability>,
     /// 聚合 Kit 使用（按出现模块数降序）
     pub kit_usage: Vec<KitStat>,
@@ -219,39 +221,50 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
     if !root.is_dir() {
         return Err(format!("项目目录不存在：{project_path}"));
     }
-    let project = crate::services::harmony::parse_project(root);
-
-    // 枚举鸿蒙模块：根下 src/main/module.json5（单模块）或子目录
-    let mut module_rels: Vec<String> = Vec::new();
-    if root.join("src/main/module.json5").is_file() {
-        module_rels.push(String::new()); // 根即模块
-    }
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() && p.join("src/main/module.json5").is_file() {
-                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                    if !name.starts_with('.') && name != "oh_modules" && name != "node_modules" {
-                        module_rels.push(name.to_string());
-                    }
-                }
+    let semantic_model = crate::services::harmony_model::parse(root);
+    let project = crate::services::harmony::project_summary(root, &semantic_model);
+    let module_rels = semantic_model
+        .modules
+        .iter()
+        .map(|module| {
+            if module.rel_path == "." {
+                String::new()
+            } else {
+                module.rel_path.clone()
             }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
 
     let mut modules = Vec::new();
     let mut kit_usage: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut perm_map: std::collections::HashMap<String, PermissionInfo> = std::collections::HashMap::new();
-    let mut dep_map: std::collections::HashMap<(String, String), OhpmDep> = std::collections::HashMap::new();
-
-    // 根级 oh-package（若根不是模块也常声明依赖）
-    for d in parse_oh_deps(root, "") {
-        dep_map.entry((d.name.clone(), d.version.clone())).or_insert(d);
+    let mut dep_map: std::collections::HashMap<(String, String, String), OhpmDep> =
+        std::collections::HashMap::new();
+    for dependency in &semantic_model.dependencies {
+        let dep = OhpmDep {
+            name: dependency.name.clone(),
+            version: dependency.requirement.clone(),
+            dev: dependency.scope == "devDependencies",
+            module: if dependency.from_module == "." {
+                String::new()
+            } else {
+                dependency.from_module.clone()
+            },
+        };
+        dep_map
+            .entry((dep.module.clone(), dep.name.clone(), dep.version.clone()))
+            .or_insert(dep);
     }
 
     for rel in &module_rels {
         let module_root = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
-        let (kind, device_types, main_element, permissions) = parse_module_json(root, rel);
+        let (_, _, _, permissions) = parse_module_json(root, rel);
+        let model_rel = if rel.is_empty() { "." } else { rel.as_str() };
+        let model_module = semantic_model
+            .modules
+            .iter()
+            .find(|module| module.rel_path == model_rel)
+            .expect("module_rels derives from semantic_model");
         let mut kits = Vec::new();
         let mut budget = 600usize;
         scan_kits_in_dir(&module_root.join("src"), &mut kits, &mut budget);
@@ -262,17 +275,25 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
         for p in &permissions {
             perm_map.entry(p.name.clone()).or_insert_with(|| p.clone());
         }
-        for d in parse_oh_deps(root, rel) {
-            dep_map.entry((d.name.clone(), d.version.clone())).or_insert(d);
-        }
+        let module_deps = semantic_model
+            .dependencies
+            .iter()
+            .filter(|dep| dep.from_module == model_rel)
+            .map(|dep| OhpmDep {
+                name: dep.name.clone(),
+                version: dep.requirement.clone(),
+                dev: dep.scope == "devDependencies",
+                module: rel.clone(),
+            })
+            .collect();
         modules.push(ModuleCapability {
             rel_path: if rel.is_empty() { ".".to_string() } else { rel.clone() },
-            kind,
-            device_types,
-            main_element,
+            kind: model_module.kind.clone(),
+            device_types: model_module.device_types.clone(),
+            main_element: model_module.main_element.clone(),
             kits,
             permissions,
-            deps: parse_oh_deps(root, rel),
+            deps: module_deps,
         });
     }
 
@@ -292,6 +313,7 @@ pub fn analyze_harmony_project(project_path: String) -> Result<ProjectCapability
 
     Ok(ProjectCapability {
         project,
+        semantic_model,
         modules,
         kit_usage,
         permissions,

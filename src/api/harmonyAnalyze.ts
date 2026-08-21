@@ -57,9 +57,70 @@ export interface ProjectBasic {
   signing_configured: boolean
 }
 
+export interface HarmonyAbility {
+  name: string
+  src_entry?: string | null
+  exported?: boolean | null
+}
+
+export interface HarmonyExtensionAbility extends HarmonyAbility {
+  extension_type?: string | null
+}
+
+export interface HarmonyTarget {
+  name: string
+  products: string[]
+}
+
+export interface HarmonyModuleModel {
+  name: string
+  rel_path: string
+  src_path: string
+  kind: string
+  artifact_kind: 'hap' | 'hsp' | 'har' | 'unknown'
+  package_name?: string | null
+  device_types: string[]
+  main_element?: string | null
+  targets: HarmonyTarget[]
+  abilities: HarmonyAbility[]
+  extension_abilities: HarmonyExtensionAbility[]
+}
+
+export interface HarmonyProductModel {
+  name: string
+  compile_sdk_version?: string | null
+  compatible_sdk_version?: string | null
+  target_sdk_version?: string | null
+  signing_config?: string | null
+  modules: string[]
+}
+
+export interface HarmonyDependencyModel {
+  from_module: string
+  name: string
+  requirement: string
+  scope: string
+  target_module?: string | null
+}
+
+export interface HarmonySemanticModel {
+  schema_version: number
+  app: {
+    bundle_name?: string | null
+    version_code?: number | null
+    version_name?: string | null
+    label?: string | null
+  }
+  signing_configs: string[]
+  products: HarmonyProductModel[]
+  modules: HarmonyModuleModel[]
+  dependencies: HarmonyDependencyModel[]
+}
+
 /** 工程能力分析结果 */
 export interface ProjectCapability {
   project: ProjectBasic
+  semantic_model: HarmonySemanticModel
   modules: ModuleCapability[]
   kit_usage: KitStat[]
   permissions: PermissionInfo[]

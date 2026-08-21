@@ -134,7 +134,7 @@
 
 ### 5.1 工程语义模型
 
-- [ ] `HM-01` 统一解析工程、产品、模块、HAP/HSP/HAR、Ability、ExtensionAbility 和依赖关系。
+- [x] `HM-01` 统一解析工程、产品、模块、HAP/HSP/HAR、Ability、ExtensionAbility 和依赖关系。
 - [ ] `HM-02` 结构化解析 `build-profile.json5`、`module.json5`、`oh-package.json5` 和锁文件。
 - [ ] `HM-03` 建立路由、页面、权限、系统能力和跨模块引用图。
 - [ ] `HM-04` 识别 SDK/API Level、设备类型、编译模式、签名配置和产品差异。
