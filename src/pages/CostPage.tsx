@@ -403,6 +403,23 @@ export default function CostPage() {
               : t('cost.notRun')}
           </span>
         </div>
+        {(reliability?.tool_governance.length ?? 0) > 0 && (
+          <div className="border-t border-[var(--border)] pt-3">
+            <p className="text-xs text-[var(--text-secondary)] mb-2">{t('cost.toolGovernance')}</p>
+            <div className="space-y-1.5 max-h-40 overflow-auto">
+              {reliability?.tool_governance.slice(0, 12).map((item) => (
+                <div key={`${item.issue}:${item.tool}:${item.related_tool ?? ''}`} className="flex items-center gap-2 text-[11px]">
+                  <span className={`badge-tone ${item.issue === 'high_failure_rate' ? 'badge-tone-bad' : 'badge-tone-warn'}`}>{item.action}</span>
+                  <span className="font-mono text-[var(--text-secondary)]">
+                    {item.tool}{item.related_tool ? ` ↔ ${item.related_tool}` : ''}
+                  </span>
+                  <span className="truncate text-[var(--text-muted)]" title={item.evidence}>{item.evidence}</span>
+                  {item.calls > 0 && <span className="ml-auto shrink-0">{item.failures}/{item.calls}</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {sloPolicy?.enabled && (
           <p className="text-[10.5px] text-[var(--text-muted)]">
             {t('cost.sloTargets', { acceptance: (sloPolicy.acceptance_target * 100).toFixed(0), recovery: (sloPolicy.recovery_target * 100).toFixed(0), evidence: (sloPolicy.evidence_target * 100).toFixed(0) })}

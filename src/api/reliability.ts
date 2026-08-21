@@ -58,6 +58,18 @@ export interface ReliabilityDashboard {
   quota: QuotaUsage
   worker_runtime: WorkerRuntimeStats
   tool_runtime: ToolRuntimeStats
+  tool_governance: ToolGovernanceItem[]
+}
+
+export interface ToolGovernanceItem {
+  tool: string
+  related_tool: string | null
+  issue: 'high_failure_rate' | 'long_unused' | 'overlap_candidate' | string
+  action: 'fix' | 'hide_candidate' | 'merge_review' | string
+  calls: number
+  failures: number
+  failure_rate: number
+  evidence: string
 }
 
 export interface WorkerRuntimeStats {

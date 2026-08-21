@@ -1323,6 +1323,7 @@
     "toolTimeouts": "工具超时",
     "toolWorkerPanics": "工具执行器异常",
     "toolStuckTools": "卡死工具",
+    "toolGovernance": "工具治理清单（修复 / 隐藏 / 合并审查）",
     "recentAlerts": "最近 Agent 告警",
     "sloTargets": "SLO 目标：验收 ≥ {{acceptance}}% · 恢复 ≥ {{recovery}}% · 证据覆盖 ≥ {{evidence}}%",
     "byModel": "按模型统计 (近30天)",

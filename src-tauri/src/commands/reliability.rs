@@ -43,6 +43,7 @@ pub struct ReliabilityDashboard {
     pub quota: crate::agent::enterprise::QuotaUsage,
     pub worker_runtime: crate::agent::scheduler::WorkerRuntimeStats,
     pub tool_runtime: crate::agent::tool_runtime::ToolRuntimeStats,
+    pub tool_governance: Vec<crate::agent::tool_governance::ToolGovernanceItem>,
 }
 
 #[tauri::command]
@@ -205,6 +206,7 @@ pub fn get_reliability_dashboard(
         quota: crate::agent::enterprise::quota(&conn)?,
         worker_runtime: crate::agent::scheduler::runtime_stats(&conn)?,
         tool_runtime: crate::agent::tool_runtime::runtime_stats(&conn)?,
+        tool_governance: crate::agent::tool_governance::report(&conn, since / 1000)?,
     })
 }
 

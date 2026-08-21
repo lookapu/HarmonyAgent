@@ -13,6 +13,7 @@ pub mod enterprise;
 pub mod scheduler;
 pub mod structured_result;
 pub mod tool_runtime;
+pub mod tool_governance;
 pub mod crash;
 pub mod runtime_log;
 pub mod runtime;

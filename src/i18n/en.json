@@ -1322,6 +1322,7 @@
     "toolTimeouts": "Tool Timeouts",
     "toolWorkerPanics": "Tool Worker Panics",
     "toolStuckTools": "Stuck tools",
+    "toolGovernance": "Tool governance (fix / hide / merge review)",
     "recentAlerts": "Recent Agent Alerts",
     "sloTargets": "SLO targets: acceptance ≥ {{acceptance}}% · recovery ≥ {{recovery}}% · evidence ≥ {{evidence}}%",
     "byModel": "By Model (Last 30 Days)",
