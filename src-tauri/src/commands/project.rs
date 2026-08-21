@@ -751,6 +751,13 @@ pub async fn switch_git_branch(
     }
     let msg = run_git_async(PathBuf::from(project.path.clone()), vec!["switch".into(), branch]).await?;
     let info = collect_git_branch_info(Path::new(&project.path)).await?;
+    if let Ok(conn) = state.0.lock() {
+        let _ = crate::agent::context::invalidate_project_facts(
+            &conn,
+            &project_id,
+            "git_branch_changed",
+        );
+    }
     Ok(GitBranchInfo {
         error: if msg.is_empty() { None } else { Some(msg) },
         ..info
@@ -1528,6 +1535,13 @@ pub fn on_project_meta_files_changed(
         let _ = conn.execute(
             "UPDATE projects SET kind = ?1 WHERE id = ?2",
             rusqlite::params![db_kind, project_id],
+        );
+    }
+    if let Ok(conn) = state.0.lock() {
+        let _ = crate::agent::context::invalidate_project_facts(
+            &conn,
+            project_id,
+            "project_identity_changed",
         );
     }
     // 通知前端刷新：kind 变化时附带旧/新类型供提示

@@ -190,7 +190,11 @@ pub async fn git_branch_info(project_path: String) -> Result<GitBranchInfo, Stri
 
 /// 切换分支（未提交改动冲突时返回友好错误，提示提交或改用 worktree）
 #[tauri::command]
-pub async fn git_switch_branch(project_path: String, branch: String) -> Result<String, String> {
+pub async fn git_switch_branch(
+    project_path: String,
+    branch: String,
+    state: State<'_, DbState>,
+) -> Result<String, String> {
     let branch = branch.trim().to_string();
     if branch.is_empty() {
         return Err("未指定分支".into());
@@ -204,7 +208,22 @@ pub async fn git_switch_branch(project_path: String, branch: String) -> Result<S
     )
     .await
     {
-        Ok(o) => Ok(format!("✅ 已切换到分支 {branch}\n{o}")),
+        Ok(o) => {
+            if let Ok(conn) = state.0.lock() {
+                if let Ok(project_id) = conn.query_row(
+                    "SELECT id FROM projects WHERE path=?1 OR worktree_path=?1 LIMIT 1",
+                    [&project_path],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    let _ = crate::agent::context::invalidate_project_facts(
+                        &conn,
+                        &project_id,
+                        "git_branch_changed",
+                    );
+                }
+            }
+            Ok(format!("✅ 已切换到分支 {branch}\n{o}"))
+        }
         Err(e) => Err(format!(
             "切换失败：{e}\n提示：若有未提交改动导致切换被拒，请先提交/暂存改动（可让 Agent 执行 git_commit），或使用 worktree 在独立目录操作该分支。"
         )),

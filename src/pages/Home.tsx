@@ -31,7 +31,9 @@ import {
   updateProjectRules,
   compactConversation,
   getConversationContext,
+  getConversationContextV2,
   type ConversationContextInfo,
+  type ConversationContextV2,
   searchMessages,
   searchMessagesAllProjects,
   type MessageSearchHit,
@@ -697,17 +699,25 @@ export default function Home() {
   }, [askCard])
   // 上下文可视条：消息数 + 摘要状态 + token 预算占用（切换会话/收到新消息后刷新）
   const [ctxInfo, setCtxInfo] = useState<ConversationContextInfo | null>(null)
+  const [ctxV2Detail, setCtxV2Detail] = useState<ConversationContextV2 | null>(null)
+  const [ctxV2Open, setCtxV2Open] = useState(false)
   // 当前会话 ID：上下文可视条刷新依赖（避免 effect 内直接引用会话对象）
   const convId = currentConversation?.id
   useEffect(() => {
     if (!convId) {
       setCtxInfo(null)
+      setCtxV2Detail(null)
+      setCtxV2Open(false)
       return
     }
     let cancelled = false
+    setCtxV2Open(false)
     getConversationContext(convId)
       .then((info) => !cancelled && setCtxInfo(info))
       .catch(() => {})
+    getConversationContextV2(convId)
+      .then((context) => !cancelled && setCtxV2Detail(context))
+      .catch(() => !cancelled && setCtxV2Detail(null))
     return () => {
       cancelled = true
     }
@@ -4725,6 +4735,69 @@ export default function Home() {
                 {ctxInfo.has_summary && (
                   <span className="px-1.5 py-px rounded-full bg-[var(--success)]/15 text-[var(--success)]">
                     {t('home.ctxSummaryBadge')}
+                  </span>
+                )}
+                {ctxInfo.context_v2 && (
+                  <span className="relative inline-flex">
+                    <button
+                      type="button"
+                      className="px-1.5 py-px rounded-full bg-[var(--accent)]/10 text-[var(--accent)] hover:bg-[var(--accent)]/15"
+                      title={t('home.ctxV2Title', {
+                        facts: ctxInfo.context_v2.fact_count,
+                        artifacts: ctxInfo.context_v2.artifact_count,
+                        invalidations: ctxInfo.context_v2.invalidation_epoch,
+                        state: ctxInfo.context_v2.task_state || '-',
+                        phase: ctxInfo.context_v2.task_phase || '-',
+                      })}
+                      onClick={() => setCtxV2Open((open) => !open)}
+                    >
+                      {t('home.ctxV2Badge', { count: ctxInfo.context_v2.fact_count })}
+                    </button>
+                    {ctxV2Open && ctxV2Detail && (
+                      <span className="absolute bottom-full left-0 z-50 mb-2 block w-80 max-h-80 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3 text-[11px] text-[var(--text-secondary)] shadow-xl">
+                        <span className="mb-2 block font-medium text-[var(--text-primary)]">
+                          {t('home.ctxV2PanelTitle')}
+                        </span>
+                        {ctxV2Detail.task.goal && (
+                          <span className="mb-2 block text-[var(--text-primary)]">
+                            {t('home.ctxV2Goal', {
+                              goal: ctxV2Detail.task.goal,
+                              state: ctxV2Detail.task.state || '-',
+                              phase: ctxV2Detail.task.phase || '-',
+                            })}
+                          </span>
+                        )}
+                        <span className="mb-2 block">
+                          {t('home.ctxV2Cursor', {
+                            from: ctxV2Detail.summary_from_message_rowid,
+                            to: ctxV2Detail.summary_to_message_rowid,
+                            seq: ctxV2Detail.summary_event_seq,
+                          })}
+                        </span>
+                        <span className="mb-2 block">
+                          {t('home.ctxV2Budget', {
+                            hot: ctxV2Detail.budget.hot_tokens.toLocaleString(),
+                            task: ctxV2Detail.budget.task_tokens.toLocaleString(),
+                            project: ctxV2Detail.budget.project_tokens.toLocaleString(),
+                            archive: ctxV2Detail.budget.archive_tokens.toLocaleString(),
+                          })}
+                        </span>
+                        {ctxV2Detail.facts.slice(0, 8).map((fact) => (
+                          <span key={fact.id} className="mb-1 block break-all">
+                            <span className="text-[var(--text-primary)]">{fact.fact_kind}/{fact.fact_key}</span>
+                            {' · '}{fact.source.kind}:{fact.source.reference} · v{fact.version}
+                          </span>
+                        ))}
+                        {ctxV2Detail.artifacts.slice(0, 5).map((artifact) => (
+                          <span key={artifact.id} className="mb-1 block break-all text-[var(--text-muted)]">
+                            [{artifact.artifact_kind}] {artifact.uri} · {artifact.source_ref}
+                          </span>
+                        ))}
+                        {ctxV2Detail.facts.length === 0 && ctxV2Detail.artifacts.length === 0 && (
+                          <span className="block text-[var(--text-muted)]">{t('home.ctxV2Empty')}</span>
+                        )}
+                      </span>
+                    )}
                   </span>
                 )}
                 {/* token 预算进度条：估算占用 / 模型上下文窗口（>85% 触发自动压缩） */}

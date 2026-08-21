@@ -53,7 +53,7 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 | `agent/tools/` Rust 文件（含 `mod.rs`） | 29 |
 | `commands/` 命令模块（不含 `mod.rs`） | 33 |
 | `services/` 服务模块（不含 `mod.rs`） | 36 |
-| Tauri IPC 注册入口 | 275 |
+| Tauri IPC 注册入口 | 276 |
 | 数据库迁移 | 63 |
 | React 页面 | 14 |
 
@@ -109,6 +109,19 @@ Agent 编排实际位于 `src-tauri/src/commands/chat.rs`，不是前端。
 - 只读工具最多 4 路并发，写工具作为串行 barrier；
 - 工具轮次与时长预算按目标复杂度动态计算，仅在持续取得证据时扩容；
 - 模型的“已修复/已验证/已完成”声明不能代替工具证据。
+
+### 4.1 长会话 Context V2
+
+`agent/context.rs` 将长会话拆成热消息、任务状态、项目事实和历史归档四层。它是可重建投影，不替代 `messages`、事件、Durable Run、工具结果或工作区真实状态。
+
+- `TaskSnapshotV2` 每轮从最新 Run、目标契约和 execution step 重建；旧会话兼容读取任务账本。
+- 摘要记录覆盖的消息 rowid 与事件 seq；Context 检查点保留最近 80 个版本。
+- 构建、Git、设备结果和工具产物转为来源化事实或引用，保存来源、digest、可信度、版本和作用域。
+- 事实变化时旧版本显式失效；文件修改、分支切换、项目标识变化和设备副作用会使相关事实失效并递增 epoch。
+- token 窗口先预留模型输出，再分配给系统、任务、项目、归档和最近消息；Workspace 可查看预算、摘要游标和事实来源。
+- Context V2 读取或写入失败时聊天继续走兼容路径，原始消息、Run 和事件仍可用于恢复。
+
+详细数据映射和裁决优先级见 `CONTEXT_V2.md`。
 
 ## 5. 目标契约与证据验收
 

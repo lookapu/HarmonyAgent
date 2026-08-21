@@ -3712,8 +3712,16 @@ async fn stream_chat_inner(
     let mut budget_warned = false;
     // 历史消息条数上限：按模型上下文预算动态初始（预算大窗口大），主动压缩/超限时自动减半
     let mut history_limit = dynamic_history_limit(context_budget);
-    // 早期对话滚动摘要：先加载上次任务持久化的摘要（跨任务继承），压缩时增量更新、任务结束写回
-    let mut context_summary: Option<String> = load_persisted_summary(&state, &conversation_id);
+    // 早期对话滚动摘要：优先读取 Context V2（含覆盖游标），尚未建立 V2 状态时
+    // 兼容 conversations.summary。压缩时增量更新，并在每轮安全点双写检查点。
+    let mut context_summary: Option<String> = state
+        .0
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            crate::agent::context::load_summary(&conn, &conversation_id, context_budget)
+        })
+        .or_else(|| load_persisted_summary(&state, &conversation_id));
     // 连续工具失败 replan 提示：连续失败 ≥2 时注入一次“重新规划”指令（重试/改策略/终止 三档）
     let mut consecutive_failures: u32 = 0;
     let mut replan_given = false;
@@ -3965,6 +3973,15 @@ async fn stream_chat_inner(
         } {
             messages.push(serde_json::json!({ "role": "system", "content": memo }));
         }
+        // Context V2 每轮从 Durable Run、执行步骤、来源化事实和产物引用重建，
+        // 不依赖可能过期的自然语言摘要；读取失败时保持旧路径继续执行。
+        if let Some(hint) = state.0.lock().ok().and_then(|conn| {
+            crate::agent::context::load_context_v2(&conn, &conversation_id, context_budget)
+                .ok()
+                .and_then(|context| crate::agent::context::render_context_hint(&context))
+        }) {
+            messages.push(serde_json::json!({ "role": "system", "content": hint }));
+        }
         // 任务账本（Ledger 协议）：从工具执行轨迹派生，每轮作为 system 消息注入（状态外部化，
         // 防长任务“忘记已做过什么/卡在哪一步”）；首轮无执行轨迹时若有上次未完成任务账本
         // （断点续跑）先注入旧账本，续跑期间按新执行轨迹更新；同时构造 ledger_now 供事件推送
@@ -4011,6 +4028,16 @@ async fn stream_chat_inner(
                 ledger_now.as_ref(),
                 &last_model_text,
                 tool_runs.len(),
+            );
+            // Context V2 检查点是可重建投影：保存任务状态、摘要覆盖游标和预算。
+            // 失败不阻断聊天主循环，旧消息/Run/事件仍是恢复真源。
+            let _ = crate::agent::context::persist_runtime_checkpoint(
+                &conn,
+                &conversation_id,
+                Some(&trace_id),
+                context_summary.as_deref(),
+                history_limit,
+                context_budget,
             );
         }
         // 早期对话滚动摘要（上下文超限时生成）：作为 system 消息注入，保住被裁剪历史的决策信息
@@ -5083,6 +5110,7 @@ async fn stream_chat_inner(
                         &tool,
                         &args_raw,
                         &message,
+                        false,
                     );
                     finish_tool_run(
                         app,
@@ -5136,6 +5164,7 @@ async fn stream_chat_inner(
                         &tool,
                         &args_raw,
                         &intercept.message,
+                        false,
                     );
                     finish_tool_run(
                         app,
@@ -5410,6 +5439,7 @@ async fn stream_chat_inner(
                         &tool,
                         &args_raw,
                         &output,
+                        true,
                     );
                     tool_runs.push(ToolRunItem {
                         tool: tool.clone(),
@@ -5449,6 +5479,7 @@ async fn stream_chat_inner(
                         &tool,
                         &args_raw,
                         &format!("执行失败: {e}"),
+                        false,
                     );
                     // Marker 绑定动作：失败结果附带障碍处理协议要求（诊断+具体动作），
                     // 与系统提示中的“障碍处理协议”呼应，防模型对失败只描述不行动
@@ -5946,6 +5977,7 @@ fn persist_tool_run_immediate(
     tool: &str,
     args_raw: &str,
     output: &str,
+    succeeded: bool,
 ) {
     let Ok(conn) = state.0.lock() else { return };
     let ts = now();
@@ -5972,6 +6004,16 @@ fn persist_tool_run_immediate(
     let _ = conn.execute(
         "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
         params![ts, conversation_id],
+    );
+    // 将产物和关键构建/Git/设备状态保存为来源化事实；失败不影响工具原始结果入库。
+    let _ = crate::agent::context::record_tool_evidence(
+        &conn,
+        conversation_id,
+        trace_id,
+        tool,
+        args_raw,
+        output,
+        succeeded,
     );
 }
 
@@ -9117,6 +9159,7 @@ async fn apply_tool_batch(
                 &r.tool,
                 &r.args_raw,
                 &r.output,
+                r.ok,
             );
         }
         // Marker 绑定动作：失败结果附带障碍处理协议要求（与串行路径同口径），
@@ -9365,6 +9408,22 @@ pub struct ConversationContextInfo {
     pub total_duration_ms: i64,
     /// 事件日志条数（session_events 表，只追加审计日志）
     pub event_count: i64,
+    /// 长会话 Context V2 投影；迁移未就绪或读取失败时为 None，前端保持旧视图。
+    pub context_v2: Option<ConversationContextV2Info>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ConversationContextV2Info {
+    pub schema_version: i64,
+    pub summary_from_message_rowid: i64,
+    pub summary_to_message_rowid: i64,
+    pub summary_event_seq: i64,
+    pub fact_count: usize,
+    pub artifact_count: usize,
+    pub invalidation_epoch: i64,
+    pub task_state: String,
+    pub task_phase: String,
+    pub budget: crate::agent::context::ContextBudgetV2,
 }
 
 /// 会话事件日志视图（读取侧）：事件流 + 消息历史投影 + 总数
@@ -9511,6 +9570,24 @@ pub fn conversation_context(
         .map_err(|e| e.to_string())?;
     // 事件日志条数（在 move conversation_id 之前取值）
     let event_count = crate::agent::session_events::count_events(&conn, &conversation_id);
+    let context_v2 = crate::agent::context::load_context_v2(
+        &conn,
+        &conversation_id,
+        context_limit,
+    )
+    .ok()
+    .map(|context| ConversationContextV2Info {
+        schema_version: context.schema_version,
+        summary_from_message_rowid: context.summary_from_message_rowid,
+        summary_to_message_rowid: context.summary_to_message_rowid,
+        summary_event_seq: context.summary_event_seq,
+        fact_count: context.facts.len(),
+        artifact_count: context.artifacts.len(),
+        invalidation_epoch: context.invalidation_epoch,
+        task_state: context.task.state,
+        task_phase: context.task.phase,
+        budget: context.budget,
+    });
     Ok(ConversationContextInfo {
         conversation_id,
         message_count,
@@ -9523,7 +9600,26 @@ pub fn conversation_context(
         total_tokens_out,
         total_duration_ms,
         event_count,
+        context_v2,
     })
+}
+
+/// 查询完整 Context V2 投影，供 Workspace 展示预算、摘要游标与事实来源。
+#[tauri::command]
+pub fn get_conversation_context_v2(
+    conversation_id: String,
+    state: State<'_, DbState>,
+) -> Result<crate::agent::context::ConversationContextV2, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let context_limit = conn
+        .query_row(
+            "SELECT COALESCE((SELECT context_limit FROM models WHERE id=conversations.model_id),200000)
+             FROM conversations WHERE id=?1",
+            [&conversation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(200_000);
+    crate::agent::context::load_context_v2(&conn, &conversation_id, context_limit)
 }
 
 /// 读取会话持久化摘要（上次任务压缩生成，跨任务继承早期对话要点）

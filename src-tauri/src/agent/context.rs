@@ -488,6 +488,69 @@ pub fn invalidate_facts(
     Ok(changed)
 }
 
+pub fn invalidate_project_facts(
+    conn: &Connection,
+    project_id: &str,
+    reason: &str,
+) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM conversations WHERE project_id=?1")
+        .map_err(|e| e.to_string())?;
+    let ids = stmt
+        .query_map([project_id], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+    let mut changed = 0;
+    for conversation_id in ids {
+        changed += invalidate_facts(conn, &conversation_id, Some("project"), reason)?;
+    }
+    Ok(changed)
+}
+
+fn invalidate_fact_kinds(
+    conn: &Connection,
+    conversation_id: &str,
+    kinds: &[&str],
+    reason: &str,
+) -> Result<usize, String> {
+    if kinds.is_empty() {
+        return Ok(0);
+    }
+    let now = now_ms();
+    let placeholders = std::iter::repeat("?")
+        .take(kinds.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "UPDATE conversation_context_facts SET invalidated_at=?1,invalidation_reason=?2,
+         updated_at=?1 WHERE conversation_id=?3 AND invalidated_at IS NULL
+         AND fact_kind IN ({placeholders})"
+    );
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        now.into(),
+        reason.to_string().into(),
+        conversation_id.to_string().into(),
+    ];
+    values.extend(kinds.iter().map(|kind| kind.to_string().into()));
+    let changed = conn
+        .execute(&sql, rusqlite::params_from_iter(values))
+        .map_err(|e| e.to_string())?;
+    if changed > 0 {
+        conn.execute(
+            "INSERT INTO conversation_context_state
+             (conversation_id,schema_version,invalidation_epoch,created_at,updated_at)
+             VALUES (?1,?2,1,?3,?3)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+               invalidation_epoch=invalidation_epoch+1,updated_at=excluded.updated_at",
+            params![conversation_id, CONTEXT_SCHEMA_VERSION, now],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
+
 pub fn record_artifact(conn: &Connection, artifact: &ContextArtifactRef) -> Result<(), String> {
     conn.execute(
         "INSERT INTO conversation_context_artifacts
@@ -513,6 +576,145 @@ pub fn record_artifact(conn: &Connection, artifact: &ContextArtifactRef) -> Resu
         ],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 将工具协议 V2 中的产物和关键状态投影为可追溯上下文。
+/// 原始输出仍保存在 tool_runs/messages；这里仅保存有界摘要、digest 和 URI。
+pub fn record_tool_evidence(
+    conn: &Connection,
+    conversation_id: &str,
+    run_id: &str,
+    tool: &str,
+    args: &str,
+    output: &str,
+    succeeded: bool,
+) -> Result<(), String> {
+    let status = if succeeded { "ok" } else { "error" };
+    let envelope = crate::agent::structured_result::ToolResultEnvelope::from_execution(
+        tool, args, output, status,
+    );
+    let digest = envelope.digest();
+    let source_ref = format!("tool:{run_id}:{tool}:{}", &digest[..12]);
+    let project_id = conn
+        .query_row(
+            "SELECT project_id FROM conversations WHERE id=?1",
+            [conversation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let observed_at = now_ms();
+
+    if succeeded {
+        let invalidated_kinds: &[&str] = if matches!(
+            tool,
+            "write_file" | "edit_file" | "multi_edit" | "apply_patch" | "delete_file"
+        ) {
+            &["verification", "workspace"]
+        } else if matches!(
+            tool,
+            "git_branch" | "git_pull" | "git_merge" | "git_restore"
+        ) {
+            &["workspace", "verification"]
+        } else if matches!(
+            tool,
+            "deploy" | "deploy_all" | "uninstall_app" | "clear_app_data"
+        ) {
+            &["device"]
+        } else {
+            &[]
+        };
+        let _ = invalidate_fact_kinds(
+            conn,
+            conversation_id,
+            invalidated_kinds,
+            &format!("tool_mutation:{tool}"),
+        );
+    }
+
+    for artifact in &envelope.artifacts {
+        record_artifact(
+            conn,
+            &ContextArtifactRef {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conversation_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                artifact_kind: artifact.kind.clone(),
+                uri: artifact.path.clone(),
+                label: format!("{}: {}", tool, artifact.operation),
+                digest: Some(digest.clone()),
+                metadata: serde_json::json!({
+                    "operation": artifact.operation,
+                    "tool_status": envelope.status,
+                }),
+                source_ref: source_ref.clone(),
+                valid: true,
+                updated_at: observed_at,
+            },
+        )?;
+    }
+
+    let fact_kind = if matches!(
+        tool,
+        "git_status" | "git_diff" | "git_log" | "git_branch" | "git_commit"
+    ) {
+        Some("workspace")
+    } else if matches!(
+        tool,
+        "build_project"
+            | "build_generic"
+            | "build_hap"
+            | "hvigor_build"
+            | "run_tests"
+            | "test_project"
+            | "run_lint"
+            | "check_signature"
+    ) || !envelope.verification.is_empty()
+    {
+        Some("verification")
+    } else if matches!(
+        tool,
+        "list_devices"
+            | "get_app_info"
+            | "deploy"
+            | "deploy_all"
+            | "start_ability"
+            | "read_runtime_logs"
+            | "search_hilog"
+    ) {
+        Some("device")
+    } else {
+        None
+    };
+
+    if let Some(fact_kind) = fact_kind {
+        upsert_fact(
+            conn,
+            &ContextFactInput {
+                conversation_id: conversation_id.to_string(),
+                project_id,
+                run_id: Some(run_id.to_string()),
+                fact_kind: fact_kind.into(),
+                fact_key: tool.to_string(),
+                value: serde_json::json!({
+                    "passed": succeeded,
+                    "outcome": envelope.outcome,
+                    "summary": envelope.summary,
+                    "evidence_digest": digest,
+                }),
+                source_kind: "tool_run".into(),
+                source_ref,
+                scope: if fact_kind == "device" {
+                    "environment".into()
+                } else {
+                    "project".into()
+                },
+                confidence: 1.0,
+                observed_at: Some(observed_at),
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -723,6 +925,71 @@ pub fn load_context_v2(
     })
 }
 
+/// 读取 Context V2 摘要；状态尚未建立时由 `load_context_v2` 自动兼容旧摘要。
+pub fn load_summary(
+    conn: &Connection,
+    conversation_id: &str,
+    context_limit: i64,
+) -> Option<String> {
+    load_context_v2(conn, conversation_id, context_limit)
+        .ok()
+        .and_then(|context| context.summary)
+        .filter(|summary| !summary.trim().is_empty())
+}
+
+/// 将当前 Run/步骤、摘要覆盖范围与预算保存为 Context V2 检查点。
+///
+/// `keep_recent` 与聊天历史裁剪口径一致：摘要覆盖游标指向被最近 N 条消息窗口排除的
+/// 最后一条消息。查询失败或尚无摘要时游标保持 0，不会伪造覆盖范围。
+pub fn persist_runtime_checkpoint(
+    conn: &Connection,
+    conversation_id: &str,
+    run_id: Option<&str>,
+    summary: Option<&str>,
+    keep_recent: usize,
+    context_limit: i64,
+) -> Result<(), String> {
+    let task = capture_task_snapshot(conn, conversation_id)?;
+    let budget = ContextBudgetV2::allocate(context_limit);
+    let (summary_from_message_rowid, summary_to_message_rowid) =
+        if summary.is_some_and(|value| !value.trim().is_empty()) {
+            conn.query_row(
+                "SELECT COALESCE(MIN(rowid),0),COALESCE(MAX(rowid),0) FROM messages
+             WHERE conversation_id=?1 AND role IN ('user','assistant','tool') AND queued=0
+               AND hidden=0 AND rowid NOT IN (
+                 SELECT rowid FROM messages WHERE conversation_id=?1
+                   AND role IN ('user','assistant','tool') AND queued=0 AND hidden=0
+                 ORDER BY created_at DESC,rowid DESC LIMIT ?2
+               )",
+                params![conversation_id, keep_recent.max(1) as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+    let summary_event_seq = conn
+        .query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM session_events WHERE conversation_id=?1",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    persist_checkpoint(
+        conn,
+        &ContextCheckpoint {
+            conversation_id,
+            run_id,
+            summary,
+            summary_from_message_rowid,
+            summary_to_message_rowid,
+            summary_event_seq,
+            task: &task,
+            budget: &budget,
+        },
+    )
+}
+
 fn load_active_facts(
     conn: &Connection,
     conversation_id: &str,
@@ -869,8 +1136,7 @@ pub fn render_context_hint(context: &ConversationContextV2) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+    fn init_conn(conn: &Connection) {
         conn.execute_batch(
             "PRAGMA foreign_keys=ON;
              CREATE TABLE projects(id TEXT PRIMARY KEY);
@@ -887,6 +1153,15 @@ mod tests {
                step_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,conversation_id TEXT NOT NULL,
                ordinal INTEGER NOT NULL,title TEXT NOT NULL,state TEXT NOT NULL,
                result_summary TEXT,updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE messages(
+               id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,role TEXT NOT NULL,
+               content TEXT NOT NULL,queued INTEGER NOT NULL DEFAULT 0,
+               hidden INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL
+             );
+             CREATE TABLE session_events(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,conversation_id TEXT NOT NULL,
+               seq INTEGER NOT NULL
              );",
         )
         .unwrap();
@@ -901,6 +1176,11 @@ mod tests {
             "../../migrations/063_conversation_context_v2.sql"
         ))
         .unwrap();
+    }
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_conn(&conn);
         conn
     }
 
@@ -1006,5 +1286,150 @@ mod tests {
         let loaded = load_context_v2(&conn, "c", 8_192).unwrap();
         assert!(loaded.facts.is_empty());
         assert_eq!(loaded.invalidation_epoch, 1);
+    }
+
+    #[test]
+    fn runtime_checkpoint_tracks_only_summarized_message_range() {
+        let conn = conn();
+        for index in 1..=6 {
+            conn.execute(
+                "INSERT INTO messages(id,conversation_id,role,content,created_at)
+                 VALUES (?1,'c','user',?2,?3)",
+                params![format!("m{index}"), format!("message-{index}"), index],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO session_events(conversation_id,seq) VALUES ('c',9)",
+            [],
+        )
+        .unwrap();
+        persist_runtime_checkpoint(&conn, "c", None, Some("前四条摘要"), 2, 16_000).unwrap();
+        let loaded = load_context_v2(&conn, "c", 16_000).unwrap();
+        assert_eq!(loaded.summary_from_message_rowid, 1);
+        assert_eq!(loaded.summary_to_message_rowid, 4);
+        assert_eq!(loaded.summary_event_seq, 9);
+    }
+
+    #[test]
+    fn tool_evidence_records_artifacts_and_supersedes_verification() {
+        let conn = conn();
+        record_tool_evidence(
+            &conn,
+            "c",
+            "run-1",
+            "build_project",
+            r#"{"path":"entry/build/default/outputs/default/entry.hap"}"#,
+            "构建成功",
+            true,
+        )
+        .unwrap();
+        let first = load_context_v2(&conn, "c", 16_000).unwrap();
+        assert_eq!(first.artifacts.len(), 1);
+        assert_eq!(first.facts.len(), 1);
+        assert_eq!(first.facts[0].fact_kind, "verification");
+        assert_eq!(first.facts[0].value["passed"], true);
+
+        record_tool_evidence(
+            &conn,
+            "c",
+            "run-2",
+            "build_project",
+            r#"{"path":"entry/build/default/outputs/default/entry.hap"}"#,
+            "执行失败: ArkTS 编译错误",
+            false,
+        )
+        .unwrap();
+        let second = load_context_v2(&conn, "c", 16_000).unwrap();
+        assert_eq!(second.facts.len(), 1);
+        assert_eq!(second.facts[0].version, 2);
+        assert_eq!(second.facts[0].value["passed"], false);
+
+        record_tool_evidence(
+            &conn,
+            "c",
+            "run-3",
+            "edit_file",
+            r#"{"path":"entry/src/main/ets/pages/Index.ets"}"#,
+            "已修改",
+            true,
+        )
+        .unwrap();
+        let after_edit = load_context_v2(&conn, "c", 16_000).unwrap();
+        assert!(after_edit.facts.is_empty());
+        assert_eq!(after_edit.invalidation_epoch, 1);
+    }
+
+    #[test]
+    fn project_invalidation_updates_every_conversation() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO conversations(id,project_id,updated_at) VALUES ('c2','p',1)",
+            [],
+        )
+        .unwrap();
+        upsert_fact(&conn, &fact(serde_json::json!("main"))).unwrap();
+        let mut other = fact(serde_json::json!("main"));
+        other.conversation_id = "c2".into();
+        upsert_fact(&conn, &other).unwrap();
+        assert_eq!(
+            invalidate_project_facts(&conn, "p", "git_branch_changed").unwrap(),
+            2
+        );
+        assert!(load_context_v2(&conn, "c", 8_192).unwrap().facts.is_empty());
+        assert!(load_context_v2(&conn, "c2", 8_192)
+            .unwrap()
+            .facts
+            .is_empty());
+    }
+
+    #[test]
+    fn long_session_checkpoint_survives_reopen_and_fact_reconciliation() {
+        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "harmony-context-v2-{}-{nonce}.sqlite",
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_conn(&conn);
+            for index in 1..=120 {
+                conn.execute(
+                    "INSERT INTO messages(id,conversation_id,role,content,created_at)
+                     VALUES (?1,'c',?2,?3,?4)",
+                    params![
+                        format!("m{index}"),
+                        if index % 2 == 0 { "assistant" } else { "user" },
+                        format!("long-session-message-{index}"),
+                        index,
+                    ],
+                )
+                .unwrap();
+            }
+            upsert_fact(&conn, &fact(serde_json::json!("head-a"))).unwrap();
+            persist_runtime_checkpoint(
+                &conn,
+                "c",
+                None,
+                Some("前 100 条消息的增量摘要"),
+                20,
+                64_000,
+            )
+            .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            let restored = load_context_v2(&conn, "c", 64_000).unwrap();
+            assert_eq!(restored.summary_to_message_rowid, 100);
+            assert_eq!(restored.summary.as_deref(), Some("前 100 条消息的增量摘要"));
+            assert_eq!(restored.facts[0].value, serde_json::json!("head-a"));
+
+            let changed = upsert_fact(&conn, &fact(serde_json::json!("head-b"))).unwrap();
+            assert_eq!(changed.version, 2);
+            let reconciled = load_context_v2(&conn, "c", 64_000).unwrap();
+            assert_eq!(reconciled.facts.len(), 1);
+            assert_eq!(reconciled.facts[0].value, serde_json::json!("head-b"));
+        }
+        std::fs::remove_file(path).ok();
     }
 }

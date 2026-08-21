@@ -251,10 +251,81 @@ export interface ConversationContextInfo {
   total_duration_ms: number
   /** 事件日志条数（session_events 只追加审计日志） */
   event_count: number
+  /** 长会话分层上下文投影；旧数据库或读取降级时为空 */
+  context_v2: {
+    schema_version: number
+    summary_from_message_rowid: number
+    summary_to_message_rowid: number
+    summary_event_seq: number
+    fact_count: number
+    artifact_count: number
+    invalidation_epoch: number
+    task_state: string
+    task_phase: string
+    budget: {
+      total_tokens: number
+      reserved_output_tokens: number
+      system_tokens: number
+      task_tokens: number
+      project_tokens: number
+      archive_tokens: number
+      hot_tokens: number
+    }
+  } | null
 }
 
 export const getConversationContext = (conversationId: string) =>
   invokeWithError<ConversationContextInfo>('conversation_context', { conversationId })
+
+export interface ConversationContextV2 {
+  schema_version: number
+  conversation_id: string
+  summary: string | null
+  summary_from_message_rowid: number
+  summary_to_message_rowid: number
+  summary_event_seq: number
+  task: {
+    run_id: string | null
+    goal: string
+    state: string
+    phase: string
+    required_conditions: string[]
+    completed_steps: string[]
+    open_steps: string[]
+    blocked_steps: string[]
+    next_action: string | null
+    last_error: string | null
+    updated_at: number
+  }
+  facts: Array<{
+    id: string
+    fact_kind: string
+    fact_key: string
+    value: unknown
+    source: { kind: string; reference: string; observed_at: number }
+    scope: string
+    confidence: number
+    version: number
+    updated_at: number
+  }>
+  artifacts: Array<{
+    id: string
+    artifact_kind: string
+    uri: string
+    label: string
+    digest: string | null
+    source_ref: string
+    valid: boolean
+    updated_at: number
+  }>
+  budget: NonNullable<ConversationContextInfo['context_v2']>['budget']
+  facts_digest: string | null
+  invalidation_epoch: number
+  updated_at: number
+}
+
+export const getConversationContextV2 = (conversationId: string) =>
+  invokeWithError<ConversationContextV2>('get_conversation_context_v2', { conversationId })
 
 /** 会话事件日志条目（回放视图） */
 export interface SessionEvent {
