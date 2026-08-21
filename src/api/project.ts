@@ -297,6 +297,11 @@ export interface AgentRun {
   recovery_plan_json: string | null
   recovery_mode: 'fresh' | 'resume' | string
   acceptance_json: string | null
+  goal_contract_json: string | null
+  remediation_count: number
+  heartbeat_at: number | null
+  lease_expires_at: number | null
+  quality_json: string | null
   error: string | null
   started_at: number
   updated_at: number

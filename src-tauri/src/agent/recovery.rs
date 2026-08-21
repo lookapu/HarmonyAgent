@@ -525,7 +525,9 @@ mod tests {
                last_event_seq INTEGER NOT NULL DEFAULT 0, recovery_count INTEGER NOT NULL DEFAULT 0,
                resume_policy TEXT NOT NULL DEFAULT 'continue', acceptance_json TEXT, error TEXT,
                started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, finished_at INTEGER,
-               parent_run_id TEXT, recovery_plan_json TEXT, recovery_mode TEXT NOT NULL DEFAULT 'fresh'
+               parent_run_id TEXT, recovery_plan_json TEXT, recovery_mode TEXT NOT NULL DEFAULT 'fresh',
+               goal_contract_json TEXT, remediation_count INTEGER NOT NULL DEFAULT 0,
+               heartbeat_at INTEGER, lease_expires_at INTEGER, quality_json TEXT
              );
              CREATE TABLE execution_steps(
                step_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, conversation_id TEXT NOT NULL,

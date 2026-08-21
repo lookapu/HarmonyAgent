@@ -40,6 +40,7 @@ const STREAM_STALL_MS: i64 = 300_000;
 const STOP_GRACE_MS: i64 = 40_000;
 /// 看门狗扫描周期
 const SCAN_INTERVAL_SECS: u64 = 5;
+const DURABLE_LEASE_MS: i64 = 180_000;
 
 fn is_resume_gap(scan_gap_ms: i64) -> bool {
     scan_gap_ms > (SCAN_INTERVAL_SECS as i64 * 4 * 1000)
@@ -242,6 +243,7 @@ fn watchdog_loop(app: AppHandle) {
         // 看门狗都被冻结。唤醒后的第一次扫描若直接比较 wall clock，会把所有健康任务
         // 误判成 8 分钟卡死。检测到扫描间隔异常时给活跃任务一次完整宽限再继续巡检。
         if is_resume_gap(scan_gap_ms) {
+            let mut resumed_runs = Vec::new();
             if let Ok(m) = registry.0.lock() {
                 for h in m.values() {
                     h.heartbeat_ms.store(now, Ordering::Relaxed);
@@ -251,7 +253,18 @@ fn watchdog_loop(app: AppHandle) {
                     if h.stream_progress_ms.load(Ordering::Relaxed) > 0 {
                         h.stream_progress_ms.store(now, Ordering::Relaxed);
                     }
+                    if let Some(run_id) = h.run_id.lock().ok().and_then(|id| id.clone()) {
+                        resumed_runs.push((run_id, h.phase.load(Ordering::Relaxed)));
+                    }
                 }
+            }
+            // 注册表锁释放后再取 SQLite 锁，维持全局固定锁序，避免睡眠恢复时反向死锁。
+            for (run_id, phase) in resumed_runs {
+                crate::agent::runtime::touch_lease_global(
+                    &run_id,
+                    phase_name(phase),
+                    DURABLE_LEASE_MS,
+                );
             }
             crate::utils::logger::log_event(
                 "watchdog_resume_grace",
@@ -321,6 +334,13 @@ fn watchdog_loop(app: AppHandle) {
                 .unwrap_or(false);
             if !still_active {
                 continue;
+            }
+            if !run_id.is_empty() {
+                crate::agent::runtime::touch_lease_global(
+                    &run_id,
+                    phase_name(phase),
+                    DURABLE_LEASE_MS,
+                );
             }
             let _ = app.emit(
                 "chat-heartbeat",

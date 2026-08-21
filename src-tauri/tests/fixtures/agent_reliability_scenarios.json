@@ -1,0 +1,13 @@
+[
+  {"id":"stream_disconnect_before_delta","domain":"stream","expected":"replay_same_request"},
+  {"id":"stream_disconnect_after_delta","domain":"stream","expected":"continue_from_checkpoint"},
+  {"id":"model_output_truncated","domain":"model","expected":"bounded_continuation"},
+  {"id":"readonly_tool_timeout","domain":"tool","expected":"safe_retry"},
+  {"id":"write_tool_timeout","domain":"tool","expected":"verify_before_replay"},
+  {"id":"restart_with_prepared_effect","domain":"recovery","expected":"verify_effects"},
+  {"id":"approval_timeout","domain":"approval","expected":"fail_closed"},
+  {"id":"stale_terminal_event","domain":"runtime","expected":"terminal_state_immutable"},
+  {"id":"completion_without_evidence","domain":"acceptance","expected":"automatic_remediation"},
+  {"id":"budget_exhaustion","domain":"governance","expected":"unfinished_with_checkpoint"},
+  {"id":"subagent_claim_without_tools","domain":"subagent","expected":"reject_claim"}
+]

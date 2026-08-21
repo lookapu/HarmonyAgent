@@ -21,6 +21,11 @@ pub struct AgentRun {
     pub recovery_plan_json: Option<String>,
     pub recovery_mode: String,
     pub acceptance_json: Option<String>,
+    pub goal_contract_json: Option<String>,
+    pub remediation_count: i64,
+    pub heartbeat_at: Option<i64>,
+    pub lease_expires_at: Option<i64>,
+    pub quality_json: Option<String>,
     pub error: Option<String>,
     pub started_at: i64,
     pub updated_at: i64,
@@ -43,6 +48,9 @@ fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
+pub const DEFAULT_LEASE_MS: i64 = 120_000;
+
+#[cfg(test)]
 pub fn begin_run(
     conn: &Connection,
     run_id: &str,
@@ -52,12 +60,25 @@ pub fn begin_run(
     begin_run_with_recovery(conn, run_id, conversation_id, goal, None)
 }
 
+#[cfg(test)]
 pub fn begin_run_with_recovery(
     conn: &Connection,
     run_id: &str,
     conversation_id: &str,
     goal: &str,
     recovery: Option<&crate::agent::recovery::RecoveryPlan>,
+) -> Result<(), String> {
+    begin_managed_run(conn, run_id, conversation_id, goal, recovery, None, DEFAULT_LEASE_MS)
+}
+
+pub fn begin_managed_run(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    goal: &str,
+    recovery: Option<&crate::agent::recovery::RecoveryPlan>,
+    contract: Option<&crate::agent::acceptance::GoalContract>,
+    lease_ms: i64,
 ) -> Result<(), String> {
     let now = now_ms();
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -74,10 +95,11 @@ pub fn begin_run_with_recovery(
     tx.execute(
         "INSERT INTO agent_runs
          (run_id,conversation_id,goal,state,phase,attempt,last_event_seq,recovery_count,
-          resume_policy,metadata_json,started_at,updated_at,parent_run_id,recovery_plan_json,recovery_mode)
+          resume_policy,metadata_json,started_at,updated_at,parent_run_id,recovery_plan_json,recovery_mode,
+          goal_contract_json,heartbeat_at,lease_expires_at)
          VALUES (?1,?2,?3,'running',?4,
                  COALESCE((SELECT attempt+1 FROM agent_runs WHERE run_id=?7),1),
-                 0,0,?5,'{}',?6,?6,?7,?8,?9)",
+                 0,0,?5,'{}',?6,?6,?7,?8,?9,?10,?6,?11)",
         params![
             run_id,
             conversation_id,
@@ -88,6 +110,8 @@ pub fn begin_run_with_recovery(
             recovery.map(|r| r.parent_run_id.as_str()),
             recovery.and_then(|r| serde_json::to_string(r).ok()),
             if recovery.is_some() { "resume" } else { "fresh" },
+            contract.and_then(|value| serde_json::to_string(value).ok()),
+            now.saturating_add(lease_ms.max(10_000)),
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -101,6 +125,8 @@ pub fn begin_run_with_recovery(
             "state": "running",
             "phase": if recovery.is_some() { "recovering" } else { "initializing" },
             "parent_run_id": recovery.map(|r| r.parent_run_id.as_str()),
+            "goal_contract_version": contract.map(|value| value.version),
+            "lease_expires_at": now.saturating_add(lease_ms.max(10_000)),
         }),
         now,
     )?;
@@ -197,7 +223,8 @@ pub fn transition(
     let changed = tx
         .execute(
             "UPDATE agent_runs SET state=?1, phase=?2, error=?3, updated_at=?4,
-             finished_at=CASE WHEN ?5=1 THEN ?4 ELSE NULL END WHERE run_id=?6",
+             finished_at=CASE WHEN ?5=1 THEN ?4 ELSE NULL END,
+             lease_expires_at=CASE WHEN ?5=1 THEN NULL ELSE lease_expires_at END WHERE run_id=?6",
             params![
                 state,
                 phase,
@@ -279,11 +306,64 @@ pub fn set_acceptance(
     Ok(())
 }
 
+pub fn renew_lease(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    phase: &str,
+    lease_ms: i64,
+) -> Result<i64, String> {
+    let now = now_ms();
+    let expires = now.saturating_add(lease_ms.max(10_000));
+    conn.execute(
+        "UPDATE agent_runs SET heartbeat_at=?1,lease_expires_at=?2,phase=?3,updated_at=?1
+         WHERE run_id=?4 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
+        params![now, expires, phase, run_id],
+    ).map_err(|e| e.to_string())?;
+    append_event(conn, run_id, conversation_id, "run.heartbeat", serde_json::json!({
+        "phase": phase, "lease_expires_at": expires,
+    }))
+}
+
+/// 高频看门狗心跳只续租，不追加事件，避免长任务每 5 秒膨胀事件表。
+pub fn touch_lease_global(run_id: &str, phase: &str, lease_ms: i64) {
+    let Some(db) = crate::db::global() else { return };
+    let Ok(conn) = db.lock() else { return };
+    let now = now_ms();
+    let _ = conn.execute(
+        "UPDATE agent_runs SET heartbeat_at=?1,lease_expires_at=?2,phase=?3,updated_at=?1
+         WHERE run_id=?4 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
+        params![now, now.saturating_add(lease_ms.max(10_000)), phase, run_id],
+    );
+}
+
+pub fn record_remediation(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    blockers: &[String],
+) -> Result<i64, String> {
+    conn.execute(
+        "UPDATE agent_runs SET remediation_count=remediation_count+1,phase='remediating',updated_at=?1 WHERE run_id=?2",
+        params![now_ms(), run_id],
+    ).map_err(|e| e.to_string())?;
+    append_event(conn, run_id, conversation_id, "acceptance.remediation_requested", serde_json::json!({ "blockers": blockers }))
+}
+
+pub fn set_quality(conn: &Connection, run_id: &str, quality: &serde_json::Value) -> Result<(), String> {
+    conn.execute(
+        "UPDATE agent_runs SET quality_json=?1,updated_at=?2 WHERE run_id=?3",
+        params![quality.to_string(), now_ms(), run_id],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<AgentRun>, String> {
     conn.query_row(
         "SELECT run_id,conversation_id,goal,state,phase,attempt,last_event_seq,recovery_count,
                 resume_policy,acceptance_json,error,started_at,updated_at,finished_at,
-                parent_run_id,recovery_plan_json,recovery_mode
+                parent_run_id,recovery_plan_json,recovery_mode,goal_contract_json,
+                remediation_count,heartbeat_at,lease_expires_at,quality_json
          FROM agent_runs WHERE run_id=?1",
         [run_id],
         |r| {
@@ -305,6 +385,11 @@ pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<AgentRun>, Stri
                 parent_run_id: r.get(14)?,
                 recovery_plan_json: r.get(15)?,
                 recovery_mode: r.get(16)?,
+                goal_contract_json: r.get(17)?,
+                remediation_count: r.get(18)?,
+                heartbeat_at: r.get(19)?,
+                lease_expires_at: r.get(20)?,
+                quality_json: r.get(21)?,
             })
         },
     )
@@ -415,7 +500,7 @@ mod tests {
             "PRAGMA foreign_keys=ON;
              CREATE TABLE conversations(id TEXT PRIMARY KEY);
              INSERT INTO conversations(id) VALUES ('c');
-             CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh');
+             CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT);
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
              CREATE TABLE tool_runs(trace_id TEXT,status TEXT,recovery_policy TEXT);
              CREATE TABLE execution_steps(run_id TEXT,state TEXT,recovery_policy TEXT);",
@@ -474,6 +559,20 @@ mod tests {
         assert_eq!(run.state, "completed");
         assert_eq!(run.phase, "done");
         assert_eq!(run.last_event_seq, 2);
+    }
+
+    #[test]
+    fn managed_run_persists_contract_lease_and_remediation() {
+        let c = conn();
+        let contract = crate::agent::acceptance::GoalContract::compile("修复并测试");
+        begin_managed_run(&c, "r", "c", "修复并测试", None, Some(&contract), 60_000).unwrap();
+        let started = get_run(&c, "r").unwrap().unwrap();
+        assert!(started.goal_contract_json.unwrap().contains("requested_change"));
+        assert!(started.lease_expires_at.unwrap() > started.started_at);
+        record_remediation(&c, "r", "c", &["测试通过".into()]).unwrap();
+        assert_eq!(get_run(&c, "r").unwrap().unwrap().remediation_count, 1);
+        transition(&c, "r", "c", "completed", "done", None).unwrap();
+        assert!(get_run(&c, "r").unwrap().unwrap().lease_expires_at.is_none());
     }
 
     #[test]

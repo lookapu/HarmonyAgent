@@ -112,6 +112,10 @@ const emptyStreaming = (): StreamingState => ({
   recoveryParentRunId: null,
   recoveryVerificationTotal: null,
   recoveryVerificationVerified: null,
+  goalCriteriaTotal: 0,
+  remediationCount: 0,
+  remediationBlockers: [],
+  leaseExpiresAt: null,
   content: '',
   reasoning: '',
   error: null,
@@ -331,12 +335,16 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     run_id: string
     recovery_parent_run_id?: string | null
     recovery_verification_total?: number | null
+    goal_criteria_total: number
+    lease_expires_at: number
   }>('chat-run-started', (event) => {
     const {
       conversation_id,
       run_id,
       recovery_parent_run_id,
       recovery_verification_total,
+      goal_criteria_total,
+      lease_expires_at,
     } = event.payload
     if (terminalRunIds.get(conversation_id) === run_id) return
     // 不同代次是真正的新任务，旧墓碑不应阻挡。
@@ -354,6 +362,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         recoveryParentRunId: recovery_parent_run_id ?? bucket.recoveryParentRunId,
         recoveryVerificationTotal: recovery_verification_total ?? null,
         recoveryVerificationVerified: recovery_verification_total ? 0 : null,
+        goalCriteriaTotal: goal_criteria_total,
+        remediationCount: 0,
+        remediationBlockers: [],
+        leaseExpiresAt: lease_expires_at,
       })
       return
     }
@@ -367,6 +379,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       recoveryParentRunId: recovery_parent_run_id ?? null,
       recoveryVerificationTotal: recovery_verification_total ?? null,
       recoveryVerificationVerified: recovery_verification_total ? 0 : null,
+      goalCriteriaTotal: goal_criteria_total,
+      remediationCount: 0,
+      remediationBlockers: [],
+      leaseExpiresAt: lease_expires_at,
       startedAt: Date.now(),
       lastDeltaAt: Date.now(),
     }
@@ -856,6 +872,23 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     setBucket(conversation_id, {
       recoveryVerificationTotal: total_count,
       recoveryVerificationVerified: verified_count,
+      lastDeltaAt: Date.now(),
+    })
+  }).catch(() => {})
+
+  listen<{
+    conversation_id: string
+    run_id: string
+    remediation_count: number
+    blockers: string[]
+  }>('chat-governance', (event) => {
+    const { conversation_id, run_id, remediation_count, blockers } = event.payload
+    if (!acceptsRun(conversation_id, run_id)) return
+    const bucket = get().streamings[conversation_id]
+    if (!bucket || bucket.runId !== run_id) return
+    setBucket(conversation_id, {
+      remediationCount: remediation_count,
+      remediationBlockers: blockers,
       lastDeltaAt: Date.now(),
     })
   }).catch(() => {})
@@ -1493,6 +1526,18 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             return
           }
           set({ toolRuns: restoredToolRuns })
+          let goalCriteriaTotal = 0
+          let remediationBlockers: string[] = []
+          try {
+            const contract = run.goal_contract_json ? JSON.parse(run.goal_contract_json) as { criteria?: unknown[] } : null
+            goalCriteriaTotal = Array.isArray(contract?.criteria) ? contract.criteria.length : 0
+            const acceptance = run.acceptance_json ? JSON.parse(run.acceptance_json) as { blockers?: unknown[] } : null
+            remediationBlockers = Array.isArray(acceptance?.blockers)
+              ? acceptance.blockers.filter((item): item is string => typeof item === 'string')
+              : []
+          } catch {
+            // 治理元数据损坏不影响正文与工具轨迹恢复。
+          }
           setBucket(id, {
             ...emptyStreaming(),
             conversationId: id,
@@ -1500,6 +1545,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             recoveryParentRunId: run.parent_run_id,
             recoveryVerificationTotal,
             recoveryVerificationVerified,
+            goalCriteriaTotal,
+            remediationCount: run.remediation_count,
+            remediationBlockers,
+            leaseExpiresAt: run.lease_expires_at,
             content,
             reasoning,
             startedAt: run.started_at,

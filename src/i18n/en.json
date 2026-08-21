@@ -904,6 +904,7 @@
     "detailCpuFreq": "CPU freq",
     "detailRam": "RAM",
     "silentHint": "Model is thinking, silent for {{time}}…",
+    "agentRemediating": "Acceptance found missing evidence; remediating (round {{count}})…",
     "editRerunHint": "Saving deletes this message and everything after it, then re-runs the task with the new content",
     "taskProcessing": "Processing {{time}}",
     "taskOpsProcessing": "Processing {{count}} ops · {{time}}",

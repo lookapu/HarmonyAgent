@@ -113,12 +113,14 @@ export const SilentStreamHint = memo(function SilentStreamHint({
   active: boolean
 }) {
   const { t } = useTranslation()
-  const { startedAt, lastDeltaAt } = useProjectStore(
+  const { startedAt, lastDeltaAt, remediationCount, remediationBlockers } = useProjectStore(
     useShallow((state) => {
       const bucket = conversationId ? state.streamings[conversationId] : undefined
       return {
         startedAt: bucket?.startedAt ?? null,
         lastDeltaAt: bucket?.lastDeltaAt ?? null,
+        remediationCount: bucket?.remediationCount ?? 0,
+        remediationBlockers: bucket?.remediationBlockers ?? [],
       }
     }),
   )
@@ -143,7 +145,18 @@ export const SilentStreamHint = memo(function SilentStreamHint({
     }
   }, [reference])
 
-  if (!active || silentSeconds < 15) return null
+  if (!active) return null
+  if (remediationCount > 0) {
+    return (
+      <div className="flex items-center gap-2 text-[11.5px] text-[var(--warning)]">
+        <Icon name="spark" size={12} />
+        <span title={remediationBlockers.join('、')}>
+          {t('home.agentRemediating', { count: remediationCount })}
+        </span>
+      </div>
+    )
+  }
+  if (silentSeconds < 15) return null
   return (
     <div className="flex items-center gap-2 text-[11.5px] text-[var(--text-muted)] animate-pulse">
       <Icon name="spark" size={12} />

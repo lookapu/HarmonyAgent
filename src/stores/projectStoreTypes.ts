@@ -33,6 +33,11 @@ export interface StreamingState {
   /** 恢复副作用核验进度；没有待核验步骤时均为 null。 */
   recoveryVerificationTotal: number | null
   recoveryVerificationVerified: number | null
+  /** 结构化目标与自动补救状态，来自运行内核而不是模型自述。 */
+  goalCriteriaTotal: number
+  remediationCount: number
+  remediationBlockers: string[]
+  leaseExpiresAt: number | null
   content: string
   /** 思考过程（推理模型 reasoning 流，无则空串） */
   reasoning: string

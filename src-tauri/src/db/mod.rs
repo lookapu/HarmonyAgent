@@ -118,6 +118,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (54, "054_agent_runtime", include_str!("../../migrations/054_agent_runtime.sql")),
     (55, "055_execution_steps", include_str!("../../migrations/055_execution_steps.sql")),
     (56, "056_recovery_orchestrator", include_str!("../../migrations/056_recovery_orchestrator.sql")),
+    (57, "057_agent_governance", include_str!("../../migrations/057_agent_governance.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -233,7 +234,10 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        for c in ["parent_run_id", "recovery_plan_json", "recovery_mode"] {
+        for c in [
+            "parent_run_id", "recovery_plan_json", "recovery_mode", "goal_contract_json",
+            "remediation_count", "heartbeat_at", "lease_expires_at", "quality_json",
+        ] {
             assert!(
                 run_cols.iter().any(|x| x == c),
                 "agent_runs 迁移后缺少列 {c}: {run_cols:?}"
