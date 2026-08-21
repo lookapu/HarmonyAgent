@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const CHECKPOINT_SCHEMA: u32 = 1;
@@ -35,6 +36,32 @@ pub struct HarmonyBuildArtifact {
     pub kind: String,
     pub size: u64,
     pub modified_at: i64,
+    #[serde(default)]
+    pub discovered_at: i64,
+    #[serde(default)]
+    pub sha256: String,
+    /// verified_signed / unsigned / claimed_signed / unknown / not_applicable
+    #[serde(default)]
+    pub signing_status: String,
+    #[serde(default)]
+    pub signature_evidence: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    #[serde(default)]
+    pub product: Option<String>,
+    #[serde(default)]
+    pub build_mode: Option<String>,
+    #[serde(default)]
+    pub source_step: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarmonyArtifactManifest {
+    pub schema_version: u32,
+    pub generated_at: i64,
+    pub workflow_key: String,
+    pub project_fingerprint: String,
+    pub artifacts: Vec<HarmonyBuildArtifact>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -439,7 +466,60 @@ pub fn dependency_state(
 }
 
 pub fn discover_artifacts(root: &Path) -> Vec<HarmonyBuildArtifact> {
-    fn walk(path: &Path, root: &Path, out: &mut Vec<HarmonyBuildArtifact>) {
+    discover_artifacts_with_context(root, None, None)
+}
+
+/// 发现产物、补齐可验证元数据并持久化本次构建清单。
+pub fn record_artifact_manifest(
+    root: &Path,
+    model: &crate::services::harmony_model::HarmonySemanticModel,
+    plan: &HarmonyBuildPlan,
+    workflow_key: &str,
+    project_fingerprint: &str,
+) -> Result<HarmonyArtifactManifest, String> {
+    let artifacts = discover_artifacts_with_context(root, Some(model), Some(plan));
+    if artifacts.is_empty() {
+        return Err("Hvigor 返回成功，但未发现 HAP/HSP/HAR 产物".into());
+    }
+    if artifacts.iter().any(|artifact| artifact.sha256.is_empty()) {
+        return Err("至少一个构建产物无法读取，未能生成完整 SHA-256 清单".into());
+    }
+    let manifest = HarmonyArtifactManifest {
+        schema_version: 1,
+        generated_at: now(),
+        workflow_key: workflow_key.into(),
+        project_fingerprint: project_fingerprint.into(),
+        artifacts,
+    };
+    let path = artifact_manifest_path(root);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "产物清单路径缺少父目录".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("创建产物清单目录失败：{error}"))?;
+    let text = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("序列化产物清单失败：{error}"))?;
+    std::fs::write(&path, text).map_err(|error| format!("写入产物清单失败：{error}"))?;
+    Ok(manifest)
+}
+
+pub fn load_artifact_manifest(root: &Path) -> Option<HarmonyArtifactManifest> {
+    let text = std::fs::read_to_string(artifact_manifest_path(root)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn discover_artifacts_with_context(
+    root: &Path,
+    model: Option<&crate::services::harmony_model::HarmonySemanticModel>,
+    plan: Option<&HarmonyBuildPlan>,
+) -> Vec<HarmonyBuildArtifact> {
+    fn walk(
+        path: &Path,
+        root: &Path,
+        model: Option<&crate::services::harmony_model::HarmonySemanticModel>,
+        plan: Option<&HarmonyBuildPlan>,
+        discovered_at: i64,
+        out: &mut Vec<HarmonyBuildArtifact>,
+    ) {
         let Ok(entries) = std::fs::read_dir(path) else {
             return;
         };
@@ -451,7 +531,7 @@ pub fn discover_artifacts(root: &Path) -> Vec<HarmonyBuildArtifact> {
                     .iter()
                     .any(|skip| *skip == name && name != "build")
                 {
-                    walk(&child, root, out);
+                    walk(&child, root, model, plan, discovered_at, out);
                 }
                 continue;
             }
@@ -468,26 +548,194 @@ pub fn discover_artifacts(root: &Path) -> Vec<HarmonyBuildArtifact> {
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs() as i64)
                 .unwrap_or(0);
+            let relative = child
+                .strip_prefix(root)
+                .unwrap_or(&child)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let provenance = artifact_provenance(&relative, kind, model, plan);
+            let (signing_status, signature_evidence) = signature_status(&child, kind);
             out.push(HarmonyBuildArtifact {
-                path: child
-                    .strip_prefix(root)
-                    .unwrap_or(&child)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
+                path: relative,
                 kind: kind.into(),
                 size: metadata.map(|item| item.len()).unwrap_or(0),
                 modified_at,
+                discovered_at,
+                sha256: file_sha256(&child).unwrap_or_default(),
+                signing_status,
+                signature_evidence,
+                module: provenance.as_ref().map(|item| item.module.clone()),
+                product: provenance.as_ref().and_then(|item| item.product.clone()),
+                build_mode: provenance.as_ref().and_then(|item| item.build_mode.clone()),
+                source_step: provenance
+                    .map(|item| item.source_step)
+                    .unwrap_or_else(|| "workspace_discovery".into()),
             });
         }
     }
     let mut artifacts = Vec::new();
-    walk(root, root, &mut artifacts);
+    walk(root, root, model, plan, now(), &mut artifacts);
     artifacts.sort_by(|a, b| {
         b.modified_at
             .cmp(&a.modified_at)
             .then_with(|| a.path.cmp(&b.path))
     });
     artifacts
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactProvenance {
+    module: String,
+    product: Option<String>,
+    build_mode: Option<String>,
+    source_step: String,
+}
+
+fn artifact_provenance(
+    relative: &str,
+    kind: &str,
+    model: Option<&crate::services::harmony_model::HarmonySemanticModel>,
+    plan: Option<&HarmonyBuildPlan>,
+) -> Option<ArtifactProvenance> {
+    let model = model?;
+    let module = model
+        .modules
+        .iter()
+        .filter(|module| {
+            relative == module.rel_path
+                || relative
+                    .strip_prefix(&module.rel_path)
+                    .is_some_and(|tail| tail.starts_with('/'))
+        })
+        .max_by_key(|module| module.rel_path.len())?;
+    let product = infer_product(relative, &module.rel_path, model);
+    let target = plan.and_then(|plan| {
+        plan.targets.iter().find(|target| {
+            target.module_path == module.rel_path
+                && artifact_task(kind) == Some(target.task.as_str())
+                && product
+                    .as_ref()
+                    .map_or(plan.targets.len() == 1, |name| name == &target.product)
+        })
+    });
+    Some(ArtifactProvenance {
+        module: module.name.clone(),
+        product: product.or_else(|| target.map(|item| item.product.clone())),
+        build_mode: target.map(|item| item.mode.clone()),
+        source_step: target
+            .map(|item| {
+                format!(
+                    "build:{}@{}/{}:{}",
+                    item.module, item.product, item.mode, item.task
+                )
+            })
+            .unwrap_or_else(|| "workspace_discovery".into()),
+    })
+}
+
+fn infer_product(
+    relative: &str,
+    module_path: &str,
+    model: &crate::services::harmony_model::HarmonySemanticModel,
+) -> Option<String> {
+    let tail = relative.strip_prefix(module_path).unwrap_or(relative);
+    let components = tail
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let filename = components.last().copied().unwrap_or_default();
+    let candidates = model
+        .products
+        .iter()
+        .filter(|product| {
+            product.modules.is_empty() || product.modules.iter().any(|path| path == module_path)
+        })
+        .filter(|product| {
+            components
+                .iter()
+                .any(|component| *component == product.name)
+                || filename.contains(&format!("-{}-", product.name))
+                || filename.starts_with(&format!("{}-", product.name))
+        })
+        .map(|product| product.name.clone())
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return candidates.into_iter().next();
+    }
+    let eligible = model
+        .products
+        .iter()
+        .filter(|product| {
+            product.modules.is_empty() || product.modules.iter().any(|path| path == module_path)
+        })
+        .collect::<Vec<_>>();
+    (eligible.len() == 1).then(|| eligible[0].name.clone())
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn signature_status(path: &Path, kind: &str) -> (String, Option<String>) {
+    if kind == "har" {
+        return ("not_applicable".into(), Some("HAR library archive".into()));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if filename.contains("unsigned") {
+        return ("unsigned".into(), Some("filename:unsigned".into()));
+    }
+    if let Ok(file) = std::fs::File::open(path) {
+        if let Ok(mut archive) = zip::ZipArchive::new(file) {
+            let mut manifests = Vec::new();
+            let mut signature_blocks = Vec::new();
+            for index in 0..archive.len() {
+                let Ok(entry) = archive.by_index(index) else {
+                    continue;
+                };
+                let name = entry.name().to_ascii_lowercase();
+                if !name.starts_with("meta-inf/") {
+                    continue;
+                }
+                match Path::new(&name).extension().and_then(|ext| ext.to_str()) {
+                    Some("sf") => manifests.push(name),
+                    Some("rsa" | "dsa" | "ec" | "p7b" | "cer" | "cert") => {
+                        signature_blocks.push(name)
+                    }
+                    _ => {}
+                }
+            }
+            if !manifests.is_empty() && !signature_blocks.is_empty() {
+                manifests.sort();
+                signature_blocks.sort();
+                return (
+                    "verified_signed".into(),
+                    Some(format!(
+                        "archive:manifest={} block={}",
+                        manifests.join(","),
+                        signature_blocks.join(",")
+                    )),
+                );
+            }
+        }
+    }
+    if filename.contains("signed") {
+        return ("claimed_signed".into(), Some("filename:signed".into()));
+    }
+    ("unknown".into(), None)
 }
 
 fn package_dir(base: &Path, name: &str) -> PathBuf {
@@ -501,6 +749,10 @@ fn package_dir(base: &Path, name: &str) -> PathBuf {
 fn checkpoint_path(root: &Path) -> PathBuf {
     root.join(".deveco-agent")
         .join("harmony-build-workflow.json")
+}
+
+fn artifact_manifest_path(root: &Path) -> PathBuf {
+    root.join(".deveco-agent").join("harmony-artifacts.json")
 }
 
 fn load(root: &Path) -> Option<HarmonyBuildCheckpoint> {
@@ -531,6 +783,7 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn module(name: &str, path: &str, kind: &str) -> crate::services::harmony_model::HarmonyModule {
         crate::services::harmony_model::HarmonyModule {
@@ -722,5 +975,63 @@ mod tests {
         assert!(args.contains(&"product=paid".to_string()));
         assert!(args.contains(&"buildMode=release".to_string()));
         assert!(!args.iter().any(|arg| arg.contains("@default")));
+    }
+
+    #[test]
+    fn artifact_manifest_records_hash_signature_product_and_source_step() {
+        let root = root("manifest");
+        let output = root.join("entry/build/default/outputs/default");
+        std::fs::create_dir_all(&output).unwrap();
+        let hap = output.join("entry-default-release.hap");
+        let file = std::fs::File::create(&hap).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+        archive.start_file("module.json", options).unwrap();
+        archive.write_all(b"{}").unwrap();
+        archive.start_file("META-INF/APP.RSA", options).unwrap();
+        archive.write_all(b"signature").unwrap();
+        archive.start_file("META-INF/APP.SF", options).unwrap();
+        archive.write_all(b"manifest digest").unwrap();
+        archive.finish().unwrap();
+
+        let model = crate::services::harmony_model::HarmonySemanticModel {
+            products: vec![crate::services::harmony_model::HarmonyProduct {
+                name: "default".into(),
+                modules: vec!["entry".into()],
+                ..Default::default()
+            }],
+            modules: vec![module("entry", "entry", "hap")],
+            ..Default::default()
+        };
+        let plan = HarmonyBuildPlan {
+            scope: "default".into(),
+            targets: vec![HarmonyBuildTarget {
+                module: "entry".into(),
+                module_path: "entry".into(),
+                product: "default".into(),
+                mode: "release".into(),
+                task: "assembleHap".into(),
+                reason: "test".into(),
+            }],
+            ..Default::default()
+        };
+        let manifest =
+            record_artifact_manifest(&root, &model, &plan, "workflow", "fingerprint").unwrap();
+        assert_eq!(manifest.artifacts.len(), 1);
+        let artifact = &manifest.artifacts[0];
+        assert_eq!(artifact.signing_status, "verified_signed");
+        assert_eq!(artifact.product.as_deref(), Some("default"));
+        assert_eq!(artifact.module.as_deref(), Some("entry"));
+        assert_eq!(artifact.build_mode.as_deref(), Some("release"));
+        assert_eq!(
+            artifact.source_step,
+            "build:entry@default/release:assembleHap"
+        );
+        assert_eq!(artifact.sha256.len(), 64);
+        assert_eq!(
+            load_artifact_manifest(&root).unwrap().workflow_key,
+            "workflow"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 }

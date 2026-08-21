@@ -33,6 +33,17 @@
 
 目标集合进入 checkpoint workflow key，因此产品、模块、模式或影响计划变化后不会错误恢复旧构建。
 
+## 产物清单
+
+构建成功必须生成 `.deveco-agent/harmony-artifacts.json`；清单与 checkpoint 分离，包含 schema、生成时间、workflow key、工程指纹以及工作区内每个 HAP/HSP/HAR 的：
+
+- 工程相对路径、类型、字节数、文件修改时间和本次发现时间；
+- 对实际文件内容流式计算的 SHA-256；任一文件不可读时 artifacts 阶段失败，不写出残缺成功结论；
+- 从最长模块路径和产品输出路径推导的模块、产品，以及与本次构建目标匹配后的 mode 和来源 step；无法唯一归属时保留 `unknown` / `workspace_discovery`，不猜测；
+- `signing_status`：HAP/HSP 同时存在 `META-INF/*.SF` 与签名块时为 `verified_signed`，文件名明确含 unsigned 时为 `unsigned`，仅有 signed 文件名但缺少结构证据时为 `claimed_signed`，其余为 `unknown`；HAR 为 `not_applicable`。
+
+这里的 `verified_signed` 表示归档内签名材料结构可验证存在，并不声称已完成证书链信任验证；部署侧仍需设备安装结果作为最终验收证据。文件名本身不能升级为已验证状态。
+
 ## Checkpoint 与恢复
 
 工作流将脱敏后的状态写入 `.deveco-agent/harmony-build-workflow.json`，记录 schema、构建参数键、工程指纹、完成阶段、当前阶段、错误摘要和产物证据。
@@ -73,4 +84,4 @@ Hvigor 与 ArkTS 日志统一解析为 `BuildError`：
 
 ## 验收
 
-自动化测试覆盖参数策略校验、影响闭包到顶层产物的收敛、多产品目标、独立 HSP 任务、产品/模式拒绝、相同指纹失败恢复、源码变化拒绝恢复、外部依赖缺失/安装证据、HAP 产物发现、ArkTS 跨行错误、命名/数字错误码和 Hvigor 阶段继承。全仓 Rust、崩溃 E2E、前端测试、lint 和生产构建作为阶段门禁。
+自动化测试覆盖参数策略校验、影响闭包到顶层产物的收敛、多产品目标、独立 HSP 任务、产品/模式拒绝、产物哈希/签名/产品/来源清单、相同指纹失败恢复、源码变化拒绝恢复、外部依赖缺失/安装证据、HAP 产物发现、ArkTS 跨行错误、命名/数字错误码和 Hvigor 阶段继承。全仓 Rust、崩溃 E2E、前端测试、lint 和生产构建作为阶段门禁。

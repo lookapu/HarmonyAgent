@@ -374,7 +374,25 @@ pub(super) async fn build_project(
 
     if build_succeeded {
         crate::services::harmony_build::stage_completed(root, &mut checkpoint, "build");
-        let artifacts = crate::services::harmony_build::discover_artifacts(root);
+        let manifest = match crate::services::harmony_build::record_artifact_manifest(
+            root,
+            &semantic_model,
+            &plan,
+            &workflow_key,
+            &checkpoint.project_fingerprint,
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                crate::services::harmony_build::stage_failed(
+                    root,
+                    &mut checkpoint,
+                    "artifacts",
+                    &error,
+                );
+                return Err(with_advice("build_project", error));
+            }
+        };
+        let artifacts = manifest.artifacts;
         if artifacts.is_empty() {
             let error = "Hvigor 返回成功，但未发现 HAP/HSP/HAR 产物";
             crate::services::harmony_build::stage_failed(root, &mut checkpoint, "artifacts", error);
@@ -401,10 +419,16 @@ pub(super) async fn build_project(
         ));
         for artifact in artifacts.iter().take(8) {
             summary.push_str(&format!(
-                "- {} · {} bytes · {}\n",
-                artifact.path, artifact.size, artifact.kind
+                "- {} · {} bytes · {} · product={} · signing={} · sha256={}\n",
+                artifact.path,
+                artifact.size,
+                artifact.kind,
+                artifact.product.as_deref().unwrap_or("unknown"),
+                artifact.signing_status,
+                &artifact.sha256[..12]
             ));
         }
+        summary.push_str("产物清单: .deveco-agent/harmony-artifacts.json\n");
         // 未签名产物预警：构建日志出现 No signingConfig 说明产出 unsigned HAP，
         // 真机部署必然报 9568319——提前告知并给出自动修复路径，避免部署失败后再回查
         if combined.contains("No signingConfig") || combined.contains("no signingConfig found") {
