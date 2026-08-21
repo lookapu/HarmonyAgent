@@ -43,6 +43,8 @@
 - `get_project_info patterns=true` 新增 GitHub/Gitee 鸿蒙开源工程模式分析：绑定脱敏 origin、分支和 commit，只用语义模型与精确源码证据提取模块化、product、路由、Ability、依赖、状态、网络、存储、测试、Native 和多设备模式，并逐项给出适用边界、复用步骤与风险；扫描有确定性上限、不跟随符号链接且不执行第三方代码。
 - `search_knowledge` 建立统一鸿蒙生态知识记录：团队经验之外可按 API Level、设备类型和错误指纹检索三方包兼容规则、常见错误与设备差异，每条记录绑定适用条件、回归来源、验证状态和未知边界；`ohpm_search detail=true` 将实时 registry 审计转换为同一版本化记录。
 - `environment_check path=...` 新增 DevEco 公共配置互操作报告：对 AppScope、product/module、OHPM、Hvigor 和 manifest 生成确定性配置指纹，明确忽略 `.idea` 与 `local.properties` 私有内容，并只用字段路径提示机器绝对路径和敏感配置，不输出值或依赖 IDE 私有状态。
+- 发布安全域改为逐次显式审批：release 构建、签名参考、OTA、凭据读取及发布/签名命令不能被 allow-all、项目/会话白名单或历史授权绕过；审批参数先统一脱敏，敏感调用失败后采用人工恢复。
+- `copy_signing_from` 只允许授权根内的非敏感签名元数据和工程内材料引用，密码/令牌/私钥字段与目录外材料直接拒绝，未知字段按白名单丢弃；应用市场专用发布能力在满足同一治理契约前保持关闭。
 
 ### 长会话 Context V2（M1 基础）
 

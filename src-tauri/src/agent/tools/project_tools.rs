@@ -46,8 +46,8 @@ pub async fn create_harmony_project(args: &Value, roots: &[String]) -> Result<St
     {
         return Err(format!("bundle_name 非法：{bundle_name}（应形如 com.example.app，各段仅允许字母/数字/下划线）"));
     }
-    // copy_signing_from：复用参考工程的包名与签名配置（签名材料与 profile 绑定 bundleName，
-    // 因此包名以参考工程为准；显式 bundle_name 与之冲突时以参考工程为准并提示）
+    // copy_signing_from：只复用参考工程内的非敏感签名元数据与材料引用。密码、令牌、
+    // 私钥字段一律拒绝复制；参考工程和材料都必须位于本次授权根内。
     let (bundle_name, signing_json, signing_name, signing_warnings) = resolve_signing_reference(
         args["copy_signing_from"].as_str(),
         roots,
@@ -101,8 +101,7 @@ pub async fn create_harmony_project(args: &Value, roots: &[String]) -> Result<St
         Ok(())
     };
 
-    // 根配置文件；copy_signing_from 时向 build-profile.json5 注入参考工程签名配置，
-    // 并在 products[0] 挂上 signingConfig 引用，使新工程直接产出签名 HAP
+    // 根配置文件；copy_signing_from 时只注入已通过隔离校验的非敏感签名元数据。
     let root_bp_content = match &signing_json {
         Some(sig_json) => {
             let out = fill(&TEMPLATE_ROOT_BUILD_PROFILE, &app_name, &bundle_name, &module, &sdk_version);
@@ -269,7 +268,7 @@ pub async fn create_harmony_project(args: &Value, roots: &[String]) -> Result<St
     };
     let signing_note = if signing_json.is_some() {
         format!(
-            "- 签名：已复用参考工程签名配置（signingConfigs={signing_name}，包名 {bundle_name}），构建产物可直接安装真机\n{}",
+            "- 签名：已复用参考工程的非敏感签名元数据（signingConfigs={signing_name}，包名 {bundle_name}）\n- 凭据：密码、令牌和私钥不会复制；release 构建仍需由 DevEco/系统凭据存储在运行时提供\n{}",
             if signing_warnings.is_empty() {
                 String::new()
             } else {
@@ -277,7 +276,7 @@ pub async fn create_harmony_project(args: &Value, roots: &[String]) -> Result<St
             }
         )
     } else {
-        "- 签名：signingConfigs 为空，当前仅能产出 unsigned HAP；部署真机前需在 DevEco Studio（File → Project Structure → Signing Configs）配置自动签名，或创建时传 copy_signing_from 复用已有工程的签名\n".to_string()
+        "- 签名：signingConfigs 为空，当前仅能产出 unsigned HAP；部署真机前需在 DevEco Studio（File → Project Structure → Signing Configs）配置自动签名，凭据保留在 IDE/系统隔离存储中\n".to_string()
     };
     Ok(format!(
         "已创建完整 HarmonyOS 工程（Stage 模型）：{}\n\n生成 {} 个文件：\n{}\n\
@@ -323,7 +322,7 @@ fn inject_signing_into_root_build_profile(
     )
 }
 
-/// 解析 copy_signing_from 参考工程：复用其包名与 signingConfigs（含签名材料路径处理）。
+/// 解析 copy_signing_from 参考工程：复用包名与非敏感 signingConfigs 元数据。
 /// 签名材料与 provisioning profile 绑定 bundleName，因此返回的包名以参考工程为准。
 /// 返回 (包名, 签名配置 JSON 字符串, 签名名, 材料缺失警告列表)；未指定或参考工程无签名配置时
 /// 返回 (原包名, None, "", 空)。
@@ -335,11 +334,7 @@ fn resolve_signing_reference(
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok((fallback_bundle.to_string(), None, String::new(), Vec::new()));
     };
-    let ref_root = if Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
-    } else {
-        resolve_in_roots(roots, raw)?
-    };
+    let ref_root = resolve_in_roots(roots, raw)?;
     if !ref_root.is_dir() {
         return Err(format!("copy_signing_from 参考工程目录不存在：{}", ref_root.display()));
     }
@@ -372,11 +367,15 @@ fn resolve_signing_reference(
     else {
         return Ok((bundle, None, String::new(), Vec::new()));
     };
-    // 材料路径：相对路径转为绝对（相对参考工程根），缺失材料记入警告
+    // 材料路径：仅允许参考工程目录内文件。签名密码/令牌/私钥字段拒绝复制，
+    // 未知字段按最小权限丢弃，避免后续工具新增字段时意外带出凭据。
     let mut warnings = Vec::new();
     let mut out = Vec::new();
     for c in cfgs {
-        let mut c = c.clone();
+        if contains_signing_credential(c) {
+            return Err("参考工程 signingConfigs 含密码、令牌、凭据或私钥字段；为隔离凭据，copy_signing_from 拒绝复制。请在 DevEco/系统凭据存储中为新工程单独配置签名".to_string());
+        }
+        let mut c = sanitize_signing_config(c);
         if let Some(mat) = c.get_mut("material").and_then(|m| m.as_object_mut()) {
             for key in ["certpath", "profile", "storeFile"] {
                 if let Some(p) = mat
@@ -385,11 +384,37 @@ fn resolve_signing_reference(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    let abs = if Path::new(p).is_absolute() {
-                        PathBuf::from(p)
+                    let supplied = Path::new(p);
+                    if supplied.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+                        return Err(format!("签名材料 {key} 包含越界路径，隔离策略拒绝引用：{p}"));
+                    }
+                    let abs = if supplied.is_absolute() {
+                        PathBuf::from(supplied)
                     } else {
-                        ref_root.join(p)
+                        ref_root.join(supplied)
                     };
+                    let canonical = std::fs::canonicalize(&abs).ok();
+                    let ref_canonical = std::fs::canonicalize(&ref_root).ok();
+                    if canonical.as_ref().zip(ref_canonical.as_ref()).is_some_and(|(path, root)| {
+                        !crate::utils::path::path_within(path, root)
+                    }) {
+                        return Err(format!(
+                            "签名材料 {key} 位于参考工程之外，隔离策略拒绝引用：{}",
+                            abs.display()
+                        ));
+                    }
+                    if canonical.is_none()
+                        && abs
+                            .parent()
+                            .and_then(|parent| std::fs::canonicalize(parent).ok())
+                            .zip(ref_canonical.as_ref())
+                            .is_some_and(|(parent, root)| !crate::utils::path::path_within(&parent, root))
+                    {
+                        return Err(format!(
+                            "签名材料 {key} 位于参考工程之外，隔离策略拒绝引用：{}",
+                            abs.display()
+                        ));
+                    }
                     if !abs.is_file() {
                         warnings.push(format!("{key} 不存在：{}", abs.display()));
                     }
@@ -408,6 +433,41 @@ fn resolve_signing_reference(
     let json = serde_json::to_string_pretty(&serde_json::Value::Array(out))
         .map_err(|e| format!("序列化签名配置失败：{e}"))?;
     Ok((bundle, Some(json), sig_name, warnings))
+}
+
+fn contains_signing_credential(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+            ["password", "passwd", "pwd", "token", "secret", "credential", "privatekey"]
+                .iter()
+                .any(|marker| normalized.contains(marker))
+                || contains_signing_credential(value)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(contains_signing_credential),
+        _ => false,
+    }
+}
+
+fn sanitize_signing_config(value: &serde_json::Value) -> serde_json::Value {
+    let mut config = serde_json::Map::new();
+    for key in ["name", "type"] {
+        if let Some(value) = value.get(key).and_then(|value| value.as_str()) {
+            config.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        }
+    }
+    let mut material = serde_json::Map::new();
+    if let Some(source) = value.get("material").and_then(|value| value.as_object()) {
+        for key in ["certpath", "profile", "storeFile", "keyAlias", "signAlg"] {
+            if let Some(value) = source.get(key).and_then(|value| value.as_str()) {
+                material.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+            }
+        }
+    }
+    if !material.is_empty() {
+        config.insert("material".to_string(), serde_json::Value::Object(material));
+    }
+    serde_json::Value::Object(config)
 }
 
 /// 从 DevEco Studio 工具链或软件内置 toolkits 拷贝 hvigorw 启动脚本
@@ -1168,7 +1228,7 @@ mod tests {
             r#"{"app":{"bundleName":"com.sns.harmony"}}"#,
         )
         .unwrap();
-        let mat = tmp.join("m");
+        let mat = ref_root.join("signing");
         std::fs::create_dir_all(&mat).unwrap();
         for f in ["a.cer", "a.p7b", "a.p12"] {
             std::fs::write(mat.join(f), "x").unwrap();
@@ -1177,21 +1237,24 @@ mod tests {
         std::fs::write(
             ref_root.join("build-profile.json5"),
             format!(
-                r#"{{"app":{{"signingConfigs":[{{"name":"default","type":"HarmonyOS","material":{{"certpath":"{cer}","keyAlias":"debugKey","profile":"{p7b}","storeFile":"{p12}"}}}}]}}}}"#,
+                r#"{{"app":{{"signingConfigs":[{{"name":"default","type":"HarmonyOS","futureMetadata":"drop-me","material":{{"certpath":"{cer}","keyAlias":"debugKey","profile":"{p7b}","storeFile":"{p12}","futureField":"drop-me"}}}}]}}}}"#,
                 cer = esc(mat.join("a.cer")),
                 p7b = esc(mat.join("a.p7b")),
                 p12 = esc(mat.join("a.p12")),
             ),
         )
         .unwrap();
+        let roots = [tmp.to_string_lossy().to_string()];
         let (bundle, json, name, warns) =
-            resolve_signing_reference(Some(ref_root.to_str().unwrap()), &[], "com.example.fallback")
+            resolve_signing_reference(Some(ref_root.to_str().unwrap()), &roots, "com.example.fallback")
                 .expect("参考工程应解析成功");
         assert_eq!(bundle, "com.sns.harmony");
         assert_eq!(name, "default");
         assert!(warns.is_empty(), "材料存在不应警告: {:?}", warns);
         let v: serde_json::Value = serde_json::from_str(json.as_deref().unwrap()).unwrap();
         assert_eq!(v[0]["material"]["certpath"], mat.join("a.cer").to_string_lossy().to_string());
+        assert!(v[0].get("futureMetadata").is_none());
+        assert!(v[0]["material"].get("futureField").is_none());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1211,10 +1274,41 @@ mod tests {
             r#"{"app":{"signingConfigs":[{"name":"default","material":{"certpath":"C:\\nope.cer","keyAlias":"debugKey","profile":"C:\\nope.p7b","storeFile":"C:\\nope.p12"}}]}}"#,
         )
         .unwrap();
+        let roots = [tmp.to_string_lossy().to_string()];
         let (_, _, _, warns) =
-            resolve_signing_reference(Some(ref_root.to_str().unwrap()), &[], "com.example.x")
+            resolve_signing_reference(Some(ref_root.to_str().unwrap()), &roots, "com.example.x")
                 .expect("材料缺失不应报错，应记入警告");
         assert_eq!(warns.len(), 3);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_signing_reference_rejects_credentials_and_external_materials() {
+        let tmp = std::env::temp_dir().join(format!("sig-ref-isolation-{}", uuid::Uuid::new_v4()));
+        let ref_root = tmp.join("ref");
+        std::fs::create_dir_all(ref_root.join("AppScope")).unwrap();
+        std::fs::write(ref_root.join("AppScope/app.json5"), r#"{"app":{"bundleName":"com.x"}}"#).unwrap();
+        std::fs::write(
+            ref_root.join("build-profile.json5"),
+            r#"{"app":{"signingConfigs":[{"name":"default","material":{"storePassword":"do-not-copy","storeFile":"signing/a.p12"}}]}}"#,
+        )
+        .unwrap();
+        let roots = [tmp.to_string_lossy().to_string()];
+        let err = resolve_signing_reference(Some(ref_root.to_str().unwrap()), &roots, "com.example.x")
+            .expect_err("凭据字段必须阻断复制");
+        assert!(err.contains("隔离凭据"));
+
+        std::fs::write(
+            ref_root.join("build-profile.json5"),
+            format!(
+                r#"{{"app":{{"signingConfigs":[{{"name":"default","material":{{"storeFile":"{}"}}}}]}}}}"#,
+                tmp.join("outside.p12").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let err = resolve_signing_reference(Some(ref_root.to_str().unwrap()), &roots, "com.example.x")
+            .expect_err("工程外签名材料必须阻断引用");
+        assert!(err.contains("参考工程之外"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1233,20 +1327,26 @@ mod tests {
             return;
         }
         let target = std::env::temp_dir().join("deveco_e2e_new_harmony");
-        let roots = [std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default()];
+        let roots = [
+            std::env::temp_dir().to_string_lossy().to_string(),
+            ref_proj.to_string_lossy().to_string(),
+        ];
         let _ = std::fs::remove_dir_all(&target);
         let args = serde_json::json!({
             "path": target.to_string_lossy(),
             "copy_signing_from": ref_proj.to_string_lossy(),
             "with_tests": false,
         });
-        let out = create_harmony_project(&args, &roots)
-            .await
-            .expect("create_harmony_project 应成功");
+        let out = match create_harmony_project(&args, &roots).await {
+            Ok(out) => out,
+            Err(err) if err.contains("隔离凭据") || err.contains("参考工程之外") => {
+                eprintln!("skip: 真实参考工程使用隔离凭据，安全策略已正确拒绝复制：{err}");
+                return;
+            }
+            Err(err) => panic!("create_harmony_project 应成功：{err}"),
+        };
         assert!(out.contains("com.sns.harmony"), "应复用参考工程包名: {out}");
-        assert!(out.contains("已复用参考工程签名配置"), "应提示签名复用: {out}");
+        assert!(out.contains("非敏感签名元数据"), "应提示受限签名复用: {out}");
         for must in [
             "build-profile.json5",
             "AppScope/app.json5",

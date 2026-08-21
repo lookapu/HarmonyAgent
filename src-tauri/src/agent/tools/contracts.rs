@@ -124,6 +124,10 @@ const MANUAL_RECOVERY: &[&str] = &[
     "secret_store",
     "secret_delete",
     "create_emulator",
+    "ota_pack",
+    "sign_hap",
+    "certificate_import",
+    "app_market_publish",
 ];
 
 /// 只从注册表的结构化约定派生契约。未知/MCP 工具默认按写入处理，禁止自动重放。
@@ -251,6 +255,7 @@ mod tests {
         assert_eq!(contract("git_push").recovery, RecoveryPolicy::Manual);
         assert_eq!(contract("run_command").recovery, RecoveryPolicy::Manual);
         assert_eq!(contract("secret_delete").recovery, RecoveryPolicy::Manual);
+        assert_eq!(contract("ota_pack").recovery, RecoveryPolicy::Manual);
         assert_eq!(contract("mcp__unknown").effect, EffectKind::Write);
         assert_eq!(contract("mcp__unknown").approval, ApprovalPolicy::Always);
         assert_eq!(contract("mcp__unknown").idempotency, IdempotencyKind::Keyed);

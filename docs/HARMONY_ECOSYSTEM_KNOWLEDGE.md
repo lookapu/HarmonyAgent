@@ -28,6 +28,18 @@ HarmonyAgent 将团队经验、三方包兼容审计、常见工具链错误和�
 
 `@kit.*`、`@ohos.*` 或某个装饰器不能硬编码为特定 API 代际结论。具体引入、废弃和替代版本始终回到当前工程 API 与本机 SDK `.d.ts` 验证。
 
+推荐按以下证据矩阵计算路由置信度，而不是用“出现即命中”的布尔规则：
+
+| 证据面 | 典型信号 | 可推断内容 | 不能单独推断 |
+| --- | --- | --- | --- |
+| 工程 | `app.json5`、`module.json5`、`build-profile.json5`、Hvigor/OHPM 组合 | Harmony 工程、高概率模型与模块入口候选 | 实际 API 可用性、构建成功 |
+| 源码 | `.ets` 中 `@Entry/@Component`、ArkUI DSL、`@kit/@ohos` import 组合 | ArkTS/ArkUI 上下文与待查 Kit | `@ohos` 必然旧、`@kit` 必然 API 12+ |
+| 日志 | `ArkTS:ERROR`、Hvigor task、Ability/安装错误码 | 工具链阶段与错误分类候选 | 根因已经确定 |
+| 设备 | HDC 能力、系统版本、ABI、SystemCapability | 可执行验证范围 | manifest 声明等于设备支持 |
+| 对话 | “Stage”“Ability”“卡片”等术语 | 提升检索召回 | 当前仓库就是鸿蒙工程 |
+
+识别器输出应是 `framework/model/api_evidence/confidence/reasons/unknowns`，下游据此选择工具与验证门禁。比如 `.ets + module.json5 + @Entry` 可以高置信路由到 ArkUI，但 API 版本仍应标为未知，直到读取 product 配置和本机 SDK。`struct`、`build()`、`aboutToAppear()` 等单个语法或名称在其他语言/框架也可能出现，只能作为组合证据。
+
 ## 记录模型
 
 `EcosystemKnowledgeRecord` 包含：

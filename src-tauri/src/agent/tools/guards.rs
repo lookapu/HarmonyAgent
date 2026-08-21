@@ -75,7 +75,7 @@ async fn pre_blacklist(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
 }
 
 /// 权限分级审核：
-/// - allow_all 模式：直接执行（危险命令黑名单仍在工具内部硬拦截，安全底线）
+/// - allow_all 模式：常规操作直接执行；发布/签名/证书/凭据操作仍逐次确认
 /// - ask 模式：已信任项目的 L0/L1 自动放行；L2 或未信任项目弹窗确认
 /// - auto 模式：不依赖项目信任，L0/L1 一律免审，仅 L2 弹窗确认
 /// - first_write 模式：写文件类工具首次弹窗确认，本任务后续写操作免审；其他工具直接放行
@@ -91,8 +91,9 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     let conversation_id = inv.conversation_id;
     let recovery_forces_approval =
         crate::agent::recovery::requires_confirmation_global(&inv.ctx.run_id, tool);
+    let release_forces_approval = permissions::requires_explicit_release_approval(tool, inv.args);
     let is_write_tool = matches!(tool, "edit_file" | "write_file" | "delete_file");
-    let needs_approval = if recovery_forces_approval {
+    let needs_approval = if recovery_forces_approval || release_forces_approval {
         true
     } else if approval_mode_str == "first_write" && is_write_tool {
         let approved = app
@@ -176,6 +177,7 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
             &inv.ctx.run_id,
             tool,
             inv.args_raw,
+            recovery_forces_approval || release_forces_approval,
         )
         .await;
     if !inv.ctx.run_id.is_empty() {
@@ -341,9 +343,10 @@ pub(crate) async fn request_tool_approval(
     run_id: &str,
     tool: &str,
     args: &str,
+    force_fresh_approval: bool,
 ) -> Result<ApprovalOutcome, String> {
     // 会话级“始终允许此工具”记忆：本会话已勾选允许则直接放行，不再弹窗
-    {
+    if !force_fresh_approval {
         let session_allowed = app
             .state::<SessionToolAllowState>()
             .0
@@ -354,6 +357,10 @@ pub(crate) async fn request_tool_approval(
             return Ok(ApprovalOutcome::Approved);
         }
     }
+    let visible_args = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .map(|value| crate::utils::redact::redact_json_value(&value).to_string())
+        .unwrap_or_else(|| crate::utils::redact::redact_text(args));
     let request_id = Uuid::new_v4().to_string();
     crate::agent::interactions::begin(
         &request_id,
@@ -362,7 +369,7 @@ pub(crate) async fn request_tool_approval(
         "tool_approval",
         &serde_json::json!({
             "tool": tool,
-            "args": args,
+            "args": visible_args,
             "level": permissions::tool_level(tool).as_str(),
             "description": super::tool_short_desc(tool),
         }),
@@ -372,7 +379,7 @@ pub(crate) async fn request_tool_approval(
         let mut map = state.0.lock().map_err(|e| e.to_string())?;
         map.insert(
             request_id.clone(),
-            (tx, tool.to_string(), conversation_id.to_string(), args.to_string()),
+            (tx, tool.to_string(), conversation_id.to_string(), visible_args.clone()),
         );
     }
     let _ = app.emit(
@@ -381,7 +388,7 @@ pub(crate) async fn request_tool_approval(
             conversation_id: conversation_id.to_string(),
             request_id: request_id.clone(),
             tool: tool.to_string(),
-            args: args.to_string(),
+            args: visible_args,
             level: permissions::tool_level(tool).as_str().to_string(),
             desc: super::tool_short_desc(tool).to_string(),
         },

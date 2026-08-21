@@ -319,11 +319,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "create_harmony_project",
-        desc: "创建完整标准 HarmonyOS 工程骨架（Stage 模型），一次生成全部模板文件，避免逐文件手写遗漏。\n参数：{\"path\":\"<工程目录，相对项目根或绝对路径，缺省项目根；目标必须不存在或为空目录>\",\"name\":\"<可选应用显示名>\",\"bundle_name\":\"<可选包名，缺省 com.example.<目录名>；与 copy_signing_from 同传时以参考工程包名为准>\",\"module\":\"<可选入口模块名，缺省 entry>\",\"sdk_version\":\"<可选，形如 6.1.1(24)>\",\"copy_signing_from\":\"<可选参考工程绝对路径：复用其包名与 signingConfigs，新工程直接产出可安装真机的签名 HAP>\",\"with_tests\":<可选 bool，缺省 true 生成 hypium 单测骨架>}。\n自动生成：根配置（build-profile/oh-package/hvigorfile/hvigor-config/code-linter）、根 .gitignore/README、hvigorw 启动脚本（优先从 DevEco 工具链拷贝）、AppScope（app.json5+多语言+PNG 图标）、入口模块（EntryAbility+首页+资源）、单测骨架。\n创建完成后返回文件清单与签名状态提示，可继续 build_project 验证。\n副作用：在目标目录创建完整工程（目录非空时拒绝执行，防覆盖）。\n返回：生成文件清单、SDK 版本、签名复用状态/待办提示。",
+        desc: "创建完整标准 HarmonyOS 工程骨架（Stage 模型），一次生成全部模板文件，避免逐文件手写遗漏。\n参数：{\"path\":\"<工程目录，相对项目根或绝对路径，缺省项目根；目标必须不存在或为空目录>\",\"name\":\"<可选应用显示名>\",\"bundle_name\":\"<可选包名，缺省 com.example.<目录名>；与 copy_signing_from 同传时以参考工程包名为准>\",\"module\":\"<可选入口模块名，缺省 entry>\",\"sdk_version\":\"<可选，形如 6.1.1(24)>\",\"copy_signing_from\":\"<可选、须逐次审批的授权根内参考工程：仅复用包名与非敏感签名元数据；密码、令牌、私钥和工程外材料拒绝复制>\",\"with_tests\":<可选 bool，缺省 true 生成 hypium 单测骨架>}。\n自动生成：根配置（build-profile/oh-package/hvigorfile/hvigor-config/code-linter）、根 .gitignore/README、hvigorw 启动脚本（优先从 DevEco 工具链拷贝）、AppScope（app.json5+多语言+PNG 图标）、入口模块（EntryAbility+首页+资源）、单测骨架。\n创建完成后返回文件清单与签名状态提示，可继续 build_project 验证。\n副作用：在目标目录创建完整工程（目录非空时拒绝执行，防覆盖）；签名引用不代表 release 已取得凭据。\n返回：生成文件清单、SDK 版本、签名复用状态/待办提示。",
     },
     ToolSpec {
         name: "build_project",
-        desc: "运行可恢复的 HarmonyOS 构建工作流（环境预检 → OHPM 依赖核对/安装 → 影响范围规划 → Hvigor 构建 → HAP/HSP/HAR 产物清单）。\n参数：{\"mode\":\"debug\"|\"release\",\"clean\":bool,\"module\":\"<可选模块名，如 entry/feature>\",\"product\":\"<可选产品名>\",\"changed_files\":[\"<可选变更文件>\"],\"dependencies\":\"auto\"|\"force\"|\"skip\"}；提供 changed_files 且未显式指定模块/产品时，沿工程依赖与真实 import 选择各受影响产品的最小顶层产物，并按类型运行 assembleHap/assembleHsp/assembleHar；显式 module/product 始终优先。dependencies 缺省 auto，仅在声明依赖缺失时安装，force 强制同步，skip 明确跳过。clean=true 时先 hvigor clean 清缓存。相同计划与工程指纹的中断/失败任务会从安全 checkpoint 恢复，工程变化后自动重开。\n副作用：可能更新 OHPM 锁文件/oh_modules，在 build 目录生成产物，并写入 .deveco-agent/harmony-artifacts.json（SHA-256、时间、产品、来源 step、分级签名证据）；耗时可能数分钟。\n返回：可审计的 scope/目标计划、持久产物清单、构建日志尾部与结论。失败时返回结构化错误（含 category 根因分类：type/syntax/dependency/sdk/api_level/signing/ohpm/resource）与推荐下一步。",
+        desc: "运行可恢复的 HarmonyOS 构建工作流（环境预检 → OHPM 依赖核对/安装 → 影响范围规划 → Hvigor 构建 → HAP/HSP/HAR 产物清单）。\n参数：{\"mode\":\"debug\"|\"release\",\"clean\":bool,\"module\":\"<可选模块名，如 entry/feature>\",\"product\":\"<可选产品名>\",\"changed_files\":[\"<可选变更文件>\"],\"dependencies\":\"auto\"|\"force\"|\"skip\"}；提供 changed_files 且未显式指定模块/产品时，沿工程依赖与真实 import 选择各受影响产品的最小顶层产物，并按类型运行 assembleHap/assembleHsp/assembleHar；显式 module/product 始终优先。dependencies 缺省 auto，仅在声明依赖缺失时安装，force 强制同步，skip 明确跳过。clean=true 时先 hvigor clean 清缓存。相同计划与工程指纹的中断/失败任务会从安全 checkpoint 恢复，工程变化后自动重开。mode=release 涉及发布签名，始终要求本次显式审批。\n副作用：可能更新 OHPM 锁文件/oh_modules，在 build 目录生成产物，并写入 .deveco-agent/harmony-artifacts.json（SHA-256、时间、产品、来源 step、分级签名证据）；耗时可能数分钟。\n返回：可审计的 scope/目标计划、持久产物清单、构建日志尾部与结论。失败时返回结构化错误（含 category 根因分类：type/syntax/dependency/sdk/api_level/signing/ohpm/resource）与推荐下一步。",
     },
     ToolSpec {
         name: "deploy",
@@ -1067,7 +1067,7 @@ name: "ask_history",
     },
     ToolSpec {
         name: "ota_pack",
-        desc: "基于 HAP 包制作 HarmonyOS OTA 升级包（.pkg）。\n参数：{\"hap_path\":\"<HAP 文件路径>\"（必填）,\"out_path\":\"<输出 .pkg 路径>\"（必填）,\"profile_path\":\"<可选签名 profile.json>\"}。\n实现：调 java -jar packagingtool.jar --mode ota --hap <HAP> --out <pkg> --profile <profile> --force。\n前置：DevEco Studio 工具链或 Sdk Command-Line Tools（含 packagingtool.jar，PATH 或 HOS_PACKAGING_TOOL 环境变量）。\n副作用：写 .pkg 到 out_path。\n返回：出包路径 + 大小 + 耗时 + stdout 摘要；失败时 stderr。",
+        desc: "基于 HAP 包制作 HarmonyOS OTA 升级包（.pkg），每次调用都必须显式审批，不能用项目/会话白名单跳过。\n参数：{\"hap_path\":\"<HAP 文件路径>\"（必填）,\"out_path\":\"<输出 .pkg 路径>\"（必填）,\"profile_path\":\"<可选签名 profile.json；审批展示与持久审计会脱敏>\"}。\n实现：调 java -jar packagingtool.jar --mode ota --hap <HAP> --out <pkg> --profile <profile> --force。\n前置：DevEco Studio 工具链或 Sdk Command-Line Tools（含 packagingtool.jar，PATH 或 HOS_PACKAGING_TOOL 环境变量）。\n副作用：写 .pkg 到 out_path；失败或中断后不得自动重放，需人工复验。\n返回：出包路径 + 大小 + 耗时 + stdout 摘要；失败时 stderr。",
     },
 ];
 

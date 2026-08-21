@@ -2,8 +2,8 @@
 //!
 //! - L0（只读）：读取/搜索/列表/查看类，对已信任项目免审。
 //! - L1（写入，限定项目内）：写文件、编辑、构建、安装依赖、部署等，对已信任项目免审。
-//! - L2（危险/越界）：删除、执行任意命令、git push、网络写等，需用户确认（ask/auto 模式弹窗；
-//!   allow_all 模式用户已完全授权，直接放行）。
+//! - L2（危险/越界）：删除、执行任意命令、git push、网络写等，需用户确认。
+//! - 发布/签名/证书/凭据操作：无论常规审批模式和历史白名单如何，每次都显式确认。
 //!
 //! 命令白名单：作为 run_command 的审批分级依据——命中白名单的命令视为 L1（已信任项目免审），
 //! 未命中的视为 L2（ask/auto 模式弹窗确认，allow_all 模式直接放行）；危险命令黑名单在
@@ -99,9 +99,47 @@ pub fn tool_level(tool: &str) -> Level {
         "snippet_insert" | "obfuscate" | "api_test" | "api_health" => Level::L1,
         // L2 危险/越界
         "delete_file" | "run_command" | "git_commit" | "git_stash" | "git_restore"
-        | "git_pull" | "git_push" | "secret_get" | "sandbox_exec" => Level::L2,
+        | "git_pull" | "git_push" | "secret_get" | "sandbox_exec" | "ota_pack"
+        | "sign_hap" | "certificate_import" | "app_market_publish" => Level::L2,
         _ => Level::L2,
     }
+}
+
+/// 发布治理的参数级硬门禁。返回 true 时必须为本次调用单独取得用户确认，不能被
+/// allow_all、项目/会话白名单或历史授权绕过。未来新增市场/证书工具时沿用显式名称，
+/// 未登记工具仍保持 L2，但只有这里命中的操作具有“每次确认”语义。
+pub fn requires_explicit_release_approval(tool: &str, args: &serde_json::Value) -> bool {
+    match tool {
+        "ota_pack" | "sign_hap" | "certificate_import" | "app_market_publish" | "secret_get" => true,
+        "create_harmony_project" => args
+            .get("copy_signing_from")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()),
+        "build_project" => args
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("release")),
+        "run_command" => args
+            .get("command")
+            .and_then(|value| value.as_str())
+            .is_some_and(command_requires_release_approval),
+        _ => false,
+    }
+}
+
+fn command_requires_release_approval(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase();
+    let words: Vec<&str> = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().any(|word| matches!(*word, "signhapsigner" | "packagingtool" | "appgallery"))
+        || words.windows(2).any(|pair| {
+            matches!(pair, ["npm" | "ohpm", "publish"] | ["app", "market"] | ["certificate", "import"])
+        })
+        || words
+            .windows(3)
+            .any(|triple| matches!(triple, ["npm" | "ohpm", "exe" | "cmd", "publish"]))
 }
 
 /// 可安全短期缓存的纯查询工具。权限 L0 不等于可缓存：设备状态、文件内容、UI 事件、
@@ -350,5 +388,34 @@ mod tests {
         assert!(auto_approve("delete_file", false, None) == false);
         assert!(auto_approve("run_command", true, Some("git status")));
         assert!(!auto_approve("run_command", true, Some("git push")));
+    }
+
+    #[test]
+    fn release_operations_always_require_fresh_approval() {
+        assert!(requires_explicit_release_approval("ota_pack", &serde_json::json!({})));
+        assert!(requires_explicit_release_approval(
+            "build_project",
+            &serde_json::json!({"mode": "release"}),
+        ));
+        assert!(!requires_explicit_release_approval(
+            "build_project",
+            &serde_json::json!({"mode": "debug"}),
+        ));
+        assert!(requires_explicit_release_approval(
+            "create_harmony_project",
+            &serde_json::json!({"copy_signing_from": "/safe/reference"}),
+        ));
+        assert!(requires_explicit_release_approval(
+            "run_command",
+            &serde_json::json!({"command": "\"/opt/ohpm\"   publish --tag next"}),
+        ));
+        assert!(requires_explicit_release_approval(
+            "run_command",
+            &serde_json::json!({"command": "java -jar packagingtool.jar --mode ota"}),
+        ));
+        assert!(!requires_explicit_release_approval(
+            "run_command",
+            &serde_json::json!({"command": "hvigorw assembleHap --mode module -p product=default"}),
+        ));
     }
 }
