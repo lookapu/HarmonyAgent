@@ -674,9 +674,35 @@ export const createConversation = (projectId: string, title?: string, worktree?:
     worktreeBranch: worktree?.worktree_branch ?? null,
   })
 
-/** 会话 Fork：从既有会话派生新会话（复制截至 untilMessageId 含该条的消息与事件；缺省全部） */
-export const forkConversation = (fromId: string, untilMessageId?: string) =>
-  invokeWithError<Conversation>('fork_conversation', { fromId, untilMessageId: untilMessageId ?? null })
+export type ConversationBranchAnchorKind = 'latest' | 'message' | 'checkpoint' | 'build_failure' | 'git_commit'
+
+export interface ConversationBranchAnchor {
+  kind: ConversationBranchAnchorKind
+  ref?: string
+}
+
+/** 会话 Fork：可从消息、检查点、构建失败或 Git 提交锚点非破坏式派生。 */
+export const forkConversation = (fromId: string, untilMessageId?: string, anchor?: ConversationBranchAnchor) =>
+  invokeWithError<Conversation>('fork_conversation', {
+    fromId,
+    untilMessageId: untilMessageId ?? null,
+    anchorKind: anchor?.kind ?? null,
+    anchorRef: anchor?.ref ?? null,
+  })
+
+export interface BranchMergeResult {
+  merge_id: string
+  decisions_merged: number
+  artifacts_merged: number
+  evidence_merged: number
+}
+
+/** 仅合并结构化决策、产物与来源化验证证据，不复制消息或摘要。 */
+export const mergeConversationBranch = (sourceId: string, targetId: string) =>
+  invokeWithError<BranchMergeResult>('merge_conversation_branch', { sourceId, targetId })
+
+export const getConversationBranchParent = (branchId: string) =>
+  invokeWithError<string | null>('get_conversation_branch_parent', { branchId })
 
 export const listMessages = (conversationId: string) =>
   invokeWithError<ChatMessage[]>('list_messages', { conversationId })

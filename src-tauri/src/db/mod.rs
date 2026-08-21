@@ -145,6 +145,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (65, "065_context_reconciliation", include_str!("../../migrations/065_context_reconciliation.sql")),
     (66, "066_structured_project_memories", include_str!("../../migrations/066_structured_project_memories.sql")),
     (67, "067_context_pins", include_str!("../../migrations/067_context_pins.sql")),
+    (68, "068_conversation_branches", include_str!("../../migrations/068_conversation_branches.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {

@@ -941,6 +941,8 @@ pub fn create_conversation(
 pub fn fork_conversation(
     from_id: String,
     until_message_id: Option<String>,
+    anchor_kind: Option<String>,
+    anchor_ref: Option<String>,
     state: State<DbState>,
 ) -> Result<Conversation, String> {
     let new_id = Uuid::new_v4().to_string();
@@ -966,20 +968,12 @@ pub fn fork_conversation(
     .map_err(|e| e.to_string())?;
 
     // 2) 截止锚点：until 消息的 (created_at, rowid)，按序截断（同秒多条时不误带后续消息）
-    let until: Option<(i64, i64)> = match &until_message_id {
-        Some(mid) => {
-            let row: Option<(i64, i64)> = tx
-                .query_row(
-                    "SELECT created_at, rowid FROM messages WHERE id = ?1 AND conversation_id = ?2",
-                    params![mid, from_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            Some(row.ok_or_else(|| "截止消息不存在".to_string())?)
-        }
-        None => None,
-    };
+    let requested_anchor = anchor_kind.as_deref().unwrap_or(if until_message_id.is_some() { "message" } else { "latest" });
+    if !matches!(requested_anchor, "latest" | "message" | "checkpoint" | "build_failure" | "git_commit") {
+        return Err("anchor_kind 仅支持 latest|message|checkpoint|build_failure|git_commit".into());
+    }
+    let effective_ref = anchor_ref.as_ref().or(until_message_id.as_ref());
+    let until = resolve_conversation_branch_anchor(&tx, &from_id, requested_anchor, effective_ref.map(String::as_str))?;
 
     // 3) 复制 messages（新 UUID；按 (created_at, rowid) 升序保持原顺序）
     let copied: usize = {
@@ -1031,6 +1025,30 @@ pub fn fork_conversation(
     )
     .map_err(|e| e.to_string())?;
 
+    tx.execute(
+        "INSERT INTO conversation_branches
+         (id,source_conversation_id,branch_conversation_id,anchor_kind,anchor_ref,anchor_message_rowid,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![Uuid::new_v4().to_string(), from_id, new_id, requested_anchor,
+            effective_ref, until.map(|item| item.1), ts],
+    ).map_err(|e| e.to_string())?;
+    let _ = crate::agent::enterprise::audit(
+        &tx,
+        None,
+        Some(&new_id),
+        "user",
+        "conversation.fork",
+        "conversation",
+        "created",
+        &serde_json::json!({
+            "source_conversation_id": from_id,
+            "branch_conversation_id": new_id,
+            "anchor_kind": requested_anchor,
+            "anchor_ref": effective_ref,
+            "anchor_message_rowid": until.map(|item| item.1),
+        }),
+    );
+
     tx.commit().map_err(|e| e.to_string())?;
     drop(conn);
     // 空会话 fork 等价于新建，同样允许
@@ -1039,6 +1057,169 @@ pub fn fork_conversation(
         .into_iter()
         .find(|c| c.id == new_id)
         .ok_or_else(|| "会话派生失败".into())
+}
+
+fn resolve_conversation_branch_anchor(
+    conn: &rusqlite::Connection,
+    from_id: &str,
+    requested_anchor: &str,
+    effective_ref: Option<&str>,
+) -> Result<Option<(i64, i64)>, String> {
+    let resolved = match requested_anchor {
+        "message" => {
+            let mid = effective_ref.ok_or_else(|| "消息锚点缺少 anchor_ref".to_string())?;
+            let row: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT created_at, rowid FROM messages WHERE id = ?1 AND conversation_id = ?2",
+                    params![mid, from_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Some(row.ok_or_else(|| "截止消息不存在".to_string())?)
+        }
+        "checkpoint" => {
+            let snapshot_id = effective_ref.ok_or_else(|| "检查点锚点缺少 anchor_ref".to_string())?;
+            let rowid: i64 = conn.query_row(
+                "SELECT msg_rowid FROM conversation_snapshots WHERE id=?1 AND conversation_id=?2",
+                params![snapshot_id, from_id], |row| row.get(0),
+            ).map_err(|_| "检查点不存在或不属于该会话".to_string())?;
+            let created_at = conn.query_row(
+                "SELECT created_at FROM messages WHERE conversation_id=?1 AND rowid=?2",
+                params![from_id, rowid], |row| row.get(0),
+            ).unwrap_or(0);
+            Some((created_at, rowid))
+        }
+        "build_failure" | "git_commit" => {
+            let (tool_filter, status_filter) = if requested_anchor == "build_failure" {
+                ("tool_name IN ('build_project','build_generic','build_hap','hvigor_build','run_tests','test_project')", "status NOT IN ('ok','completed')")
+            } else {
+                ("tool_name='git_commit'", "status IN ('ok','completed')")
+            };
+            let ref_filter = if effective_ref.is_some() { " AND (id=?2 OR COALESCE(result_json,'') LIKE '%'||?2||'%')" } else { "" };
+            let sql = format!("SELECT created_at,id FROM tool_runs WHERE conversation_id=?1 AND {tool_filter} AND {status_filter}{ref_filter} ORDER BY created_at DESC LIMIT 1");
+            let tool_anchor: Option<(i64, String)> = if let Some(reference) = effective_ref {
+                conn.query_row(&sql, params![from_id, reference], |row| Ok((row.get(0)?, row.get(1)?))).optional()
+            } else {
+                conn.query_row(&sql, [from_id], |row| Ok((row.get(0)?, row.get(1)?))).optional()
+            }.map_err(|e| e.to_string())?;
+            let (created_at, _) = tool_anchor.ok_or_else(|| format!("未找到可用的{requested_anchor}锚点"))?;
+            let message: Option<(i64, i64)> = conn.query_row(
+                "SELECT created_at,rowid FROM messages WHERE conversation_id=?1 AND created_at<=?2 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![from_id, created_at], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|e| e.to_string())?;
+            Some(message.unwrap_or((0, 0)))
+        }
+        _ => None,
+    };
+    Ok(resolved)
+}
+
+#[derive(Clone, Serialize)]
+pub struct BranchMergeResult {
+    pub merge_id: String,
+    pub decisions_merged: i64,
+    pub artifacts_merged: i64,
+    pub evidence_merged: i64,
+}
+
+#[tauri::command]
+pub fn get_conversation_branch_parent(
+    branch_id: String,
+    state: State<DbState>,
+) -> Result<Option<String>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT source_conversation_id FROM conversation_branches WHERE branch_conversation_id=?1",
+        [branch_id], |row| row.get(0),
+    ).optional().map_err(|e| e.to_string())
+}
+
+/// Merge only structured, source-backed branch output. Messages, summaries and
+/// free-form assistant text are intentionally excluded.
+#[tauri::command]
+pub fn merge_conversation_branch(
+    source_id: String,
+    target_id: String,
+    state: State<DbState>,
+) -> Result<BranchMergeResult, String> {
+    let mut conn = state.0.lock().map_err(|e| e.to_string())?;
+    merge_conversation_branch_conn(&mut conn, &source_id, &target_id)
+}
+
+fn merge_conversation_branch_conn(
+    conn: &mut rusqlite::Connection,
+    source_id: &str,
+    target_id: &str,
+) -> Result<BranchMergeResult, String> {
+    if source_id == target_id { return Err("不能把会话分支合并到自身".into()); }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let (source_project, target_project): (String, String) = (
+        tx.query_row("SELECT project_id FROM conversations WHERE id=?1", [source_id], |row| row.get(0)).map_err(|_| "源分支不存在".to_string())?,
+        tx.query_row("SELECT project_id FROM conversations WHERE id=?1", [target_id], |row| row.get(0)).map_err(|_| "目标会话不存在".to_string())?,
+    );
+    if source_project != target_project { return Err("只能合并同一项目内的会话分支".into()); }
+    let lineage: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversation_branches WHERE branch_conversation_id=?1 AND source_conversation_id=?2)",
+        params![source_id, target_id], |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    if !lineage { return Err("源会话不是目标会话的直接分支".into()); }
+    let now = now();
+    let decisions = tx.execute(
+        "INSERT OR IGNORE INTO conversation_context_pins
+         (id,conversation_id,project_id,pin_kind,source_ref,label,content,created_at,updated_at)
+         SELECT lower(hex(randomblob(16))),?2,project_id,pin_kind,'branch:'||?1||':'||source_ref,
+                label,content,?3,?3 FROM conversation_context_pins
+         WHERE conversation_id=?1 AND pin_kind IN ('decision','acceptance')",
+        params![source_id, target_id, now],
+    ).map_err(|e| e.to_string())? as i64;
+    let artifacts = tx.execute(
+        "INSERT OR IGNORE INTO conversation_context_artifacts
+         (id,conversation_id,run_id,artifact_kind,uri,label,digest,metadata_json,source_ref,valid,created_at,updated_at)
+         SELECT lower(hex(randomblob(16))),?2,NULL,artifact_kind,uri,label,digest,metadata_json,
+                'branch:'||?1||':'||source_ref,valid,?3,?3
+         FROM conversation_context_artifacts WHERE conversation_id=?1 AND valid=1",
+        params![source_id, target_id, now],
+    ).map_err(|e| e.to_string())? as i64;
+    let evidence = tx.execute(
+        "INSERT OR IGNORE INTO conversation_context_facts
+         (id,conversation_id,project_id,run_id,fact_kind,fact_key,value_json,source_kind,source_ref,
+          scope,confidence,version,observed_at,created_at,updated_at)
+         SELECT lower(hex(randomblob(16))),?2,project_id,NULL,fact_kind,
+                'branch:'||?1||':'||fact_key,value_json,'branch_merge',source_ref,scope,confidence,1,?3,?3,?3
+         FROM conversation_context_facts
+         WHERE conversation_id=?1 AND invalidated_at IS NULL AND fact_kind IN ('verification','workspace','device')",
+        params![source_id, target_id, now],
+    ).map_err(|e| e.to_string())? as i64;
+    let merge_id = Uuid::new_v4().to_string();
+    let manifest = serde_json::json!({
+        "source": source_id, "target": target_id,
+        "included": ["decision_pins", "acceptance_pins", "artifacts", "verification_facts"],
+        "excluded": ["messages", "summaries", "free_form_output"]
+    });
+    tx.execute(
+        "INSERT INTO conversation_branch_merges
+         (id,source_conversation_id,target_conversation_id,decisions_merged,artifacts_merged,evidence_merged,manifest_json,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![merge_id, source_id, target_id, decisions, artifacts, evidence, manifest.to_string(), now],
+    ).map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE conversation_context_state SET invalidation_epoch=invalidation_epoch+1,updated_at=?1
+         WHERE conversation_id=?2",
+        params![now, target_id],
+    ).map_err(|e| e.to_string())?;
+    let _ = crate::agent::enterprise::audit(
+        &tx,
+        None,
+        Some(target_id),
+        "user",
+        "conversation.branch_merge",
+        "conversation_context",
+        "merged",
+        &manifest,
+    );
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(BranchMergeResult { merge_id, decisions_merged: decisions, artifacts_merged: artifacts, evidence_merged: evidence })
 }
 
 /// 按标签筛选会话（精确匹配某个标签；项目内；含/不含归档）
@@ -1694,5 +1875,79 @@ mod tests {
         assert_eq!(page.messages.len(), 1);
         let page = list_messages_page_impl(&conn, "c1", None, Some(9999)).unwrap();
         assert_eq!(page.messages.len(), 5);
+    }
+
+    #[test]
+    fn branch_merge_copies_only_structured_whitelist() {
+        let mut conn = test_conn();
+        conn.execute(
+            "INSERT INTO projects (id,name,path,kind,trusted,index_state,created_at) VALUES ('merge-p','p','p','harmony',1,'ready',1)",
+            [],
+        ).unwrap();
+        conn.execute_batch(
+            "INSERT INTO conversations(id,project_id,title,created_at,updated_at) VALUES ('parent','merge-p','parent',1,1);
+             INSERT INTO conversations(id,project_id,title,created_at,updated_at) VALUES ('branch','merge-p','branch',1,1);
+             INSERT INTO conversation_branches(id,source_conversation_id,branch_conversation_id,anchor_kind,created_at)
+               VALUES ('lineage','parent','branch','latest',1);
+             INSERT INTO conversation_context_pins(id,conversation_id,project_id,pin_kind,source_ref,label,content,created_at,updated_at)
+               VALUES ('decision','branch','merge-p','decision','d','decision','use api',1,1),
+                      ('message','branch','merge-p','message','m','message','free form',1,1);
+             INSERT INTO conversation_context_artifacts(id,conversation_id,artifact_kind,uri,label,metadata_json,source_ref,valid,created_at,updated_at)
+               VALUES ('artifact','branch','file','src/a.ets','a','{}','tool:a',1,1,1);
+             INSERT INTO conversation_context_facts(id,conversation_id,project_id,fact_kind,fact_key,value_json,source_kind,source_ref,scope,confidence,version,observed_at,created_at,updated_at)
+               VALUES ('verified','branch','merge-p','verification','tests','{\"passed\":true}','tool_run','tool:t','project',1,1,1,1,1),
+                      ('other','branch','merge-p','note','summary','\"text\"','summary','message:m','conversation',0.5,1,1,1,1);",
+        ).unwrap();
+        let result = merge_conversation_branch_conn(&mut conn, "branch", "parent").unwrap();
+        assert_eq!((result.decisions_merged, result.artifacts_merged, result.evidence_merged), (1, 1, 1));
+        let pin_kinds: Vec<String> = conn.prepare(
+            "SELECT pin_kind FROM conversation_context_pins WHERE conversation_id='parent' ORDER BY pin_kind",
+        ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(pin_kinds, vec!["decision"]);
+        let fact_kinds: Vec<String> = conn.prepare(
+            "SELECT fact_kind FROM conversation_context_facts WHERE conversation_id='parent' ORDER BY fact_kind",
+        ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(fact_kinds, vec!["verification"]);
+        let manifest: String = conn.query_row(
+            "SELECT manifest_json FROM conversation_branch_merges WHERE id=?1",
+            [&result.merge_id], |row| row.get(0),
+        ).unwrap();
+        assert!(manifest.contains("free_form_output"));
+    }
+
+    #[test]
+    fn branch_anchors_resolve_checkpoint_build_failure_and_git_commit() {
+        let conn = test_conn();
+        seed(&conn, "anchors", 20);
+        let checkpoint_rowid: i64 = conn.query_row(
+            "SELECT rowid FROM messages WHERE id='m-010'", [], |row| row.get(0),
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO conversation_snapshots(id,conversation_id,msg_rowid,label,tool_count,created_at)
+             VALUES ('snap','anchors',?1,'checkpoint',1,1)",
+            [checkpoint_rowid],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO tool_runs(id,conversation_id,tool_name,result_json,status,created_at)
+             VALUES ('build-fail','anchors','build_project','failed','error',1004)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO tool_runs(id,conversation_id,tool_name,result_json,status,created_at)
+             VALUES ('commit-tool','anchors','git_commit','commit abc123','ok',1005)",
+            [],
+        ).unwrap();
+
+        assert_eq!(
+            resolve_conversation_branch_anchor(&conn, "anchors", "checkpoint", Some("snap")).unwrap().unwrap().1,
+            checkpoint_rowid,
+        );
+        let build = resolve_conversation_branch_anchor(&conn, "anchors", "build_failure", Some("build-fail"))
+            .unwrap().unwrap();
+        let commit = resolve_conversation_branch_anchor(&conn, "anchors", "git_commit", Some("abc123"))
+            .unwrap().unwrap();
+        assert!(build.0 <= 1004);
+        assert!(commit.0 <= 1005);
+        assert!(commit.1 >= build.1);
     }
 }

@@ -20,6 +20,7 @@ import type {
   TaskLedger,
   SnapshotInfo,
   RestoreSnapshotResult,
+  ConversationBranchAnchor,
 } from '../api/project'
 import type { TaskRun } from '../api/cost'
 
@@ -275,7 +276,7 @@ export interface ChatSlice {
   newConversation: (worktree?: NewConversationWorktree) => Promise<void>
   openConversation: (id: string) => Promise<void>
   /** 会话 Fork：从当前会话派生新会话（复制截至 untilMessageId 含该条的消息与事件；缺省全部），完成后切换到新会话 */
-  forkCurrentConversation: (untilMessageId?: string) => Promise<void>
+  forkCurrentConversation: (untilMessageId?: string, anchor?: ConversationBranchAnchor) => Promise<void>
   /** 加载更早的历史消息（prepend 到 messages 头部），返回新增条数；无更多或已加载返回 0 */
   loadOlderMessages: (conversationId: string) => Promise<number>
   sendUserMessage: (content: string, options?: ChatOptions, references?: string[], images?: string[]) => Promise<void>

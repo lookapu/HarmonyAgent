@@ -60,6 +60,8 @@ import {
   listToolGroups,
   queueMessage,
   conversationRoot,
+  getConversationBranchParent,
+  mergeConversationBranch,
 } from '../api/project'
 import { toolsHealth } from '../api/health'
 import { sendNotification } from '../api/desktop'
@@ -618,6 +620,19 @@ export default function Home() {
   const [showMoreMenu, setShowMoreMenu] = useState(false)
   // 会话时间线弹窗（快照点列表 → 回到历史决策点重新引导）
   const [timelineOpen, setTimelineOpen] = useState(false)
+  const [branchParentId, setBranchParentId] = useState<string | null>(null)
+  useEffect(() => {
+    let active = true
+    const conversationId = currentConversation?.id
+    if (!conversationId) {
+      setBranchParentId(null)
+      return () => { active = false }
+    }
+    void getConversationBranchParent(conversationId)
+      .then((parent) => { if (active) setBranchParentId(parent) })
+      .catch(() => { if (active) setBranchParentId(null) })
+    return () => { active = false }
+  }, [currentConversation?.id])
   // 正在朗读的消息 id
   const [speakingId, setSpeakingId] = useState<string | null>(null)
   // 编辑消息弹窗目标（仅 user 消息可编辑）
@@ -6429,6 +6444,23 @@ export default function Home() {
               </button>
             </div>
             <div className="mt-2 text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.timelineDesc')}</div>
+            {branchParentId && (
+              <button
+                onClick={() => {
+                  if (!currentConversation) return
+                  void mergeConversationBranch(currentConversation.id, branchParentId)
+                    .then((result) => alert(t('home.branchMergeDone', {
+                      decisions: String(result.decisions_merged),
+                      artifacts: String(result.artifacts_merged),
+                      evidence: String(result.evidence_merged),
+                    })))
+                    .catch((error) => alert(String(error)))
+                }}
+                className="mt-2 w-full px-2.5 py-1.5 rounded-lg text-[11px] text-[var(--accent)] bg-[var(--accent-soft)] hover:opacity-80 transition-opacity"
+              >
+                {t('home.branchMergeStructured')}
+              </button>
+            )}
             <div className="mt-3 space-y-1 max-h-80 overflow-y-auto">
               {loadingSnapshots && snapshots.length === 0 ? (
                 <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('common.loading')}</div>
@@ -6452,6 +6484,15 @@ export default function Home() {
                           {isCurrent && <span className="ml-1.5 text-[var(--success)]">{t('home.timelineCurrent')}</span>}
                         </div>
                       </div>
+                      <button
+                        onClick={() => {
+                          setTimelineOpen(false)
+                          void forkCurrentConversation(undefined, { kind: 'checkpoint', ref: snap.id })
+                        }}
+                        className="shrink-0 px-2 py-1 rounded-lg text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+                      >
+                        {t('home.timelineFork')}
+                      </button>
                       <button
                         onClick={() => {
                           setTimelineOpen(false)

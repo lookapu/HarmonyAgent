@@ -395,6 +395,8 @@ pub fn run() {
             commands::project::get_conversation,
             commands::project::create_conversation,
             commands::project::fork_conversation,
+            commands::project::merge_conversation_branch,
+            commands::project::get_conversation_branch_parent,
             commands::project::update_conversation,
             commands::project::list_conversations_by_tag,
             commands::project::list_conversation_tags,

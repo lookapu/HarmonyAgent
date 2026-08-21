@@ -34,7 +34,7 @@ import {
   getAgentRunEvents as getAgentRunEventsApi,
   getAgentRunSteps as getAgentRunStepsApi,
 } from '../../api/project'
-import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger } from '../../api/project'
+import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger, ConversationBranchAnchor } from '../../api/project'
 import type { StateCreator } from 'zustand'
 import type { ChatSlice, DiagnoseCard, ProjectState, StreamingState } from '../projectStoreTypes'
 import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, upsertMessageById } from './chatUtils'
@@ -1307,11 +1307,11 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       t.end()
     },
 
-    forkCurrentConversation: async (untilMessageId) => {
+    forkCurrentConversation: async (untilMessageId, anchor?: ConversationBranchAnchor) => {
       const cur = get().currentConversation
       const project = get().currentProject
       if (!cur || !project) return
-      const conv = await forkConversation(cur.id, untilMessageId)
+      const conv = await forkConversation(cur.id, untilMessageId, anchor)
       // 先刷新列表（openConversation 从列表查找会话对象）
       const conversations = await listConversations(project.id)
       set({ conversations })
