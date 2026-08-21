@@ -2,7 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureSignal {
     StreamBeforeDelta, StreamAfterDelta, ModelTruncated, ReadTimeout, WriteTimeout,
@@ -10,7 +9,6 @@ pub enum FailureSignal {
     BudgetExhausted, SubagentMissingEvidence,
 }
 
-#[cfg(test)]
 pub fn reliability_disposition(signal: FailureSignal) -> &'static str {
     match signal {
         FailureSignal::StreamBeforeDelta => "replay_same_request",
@@ -52,6 +50,18 @@ impl ExecutionBudget {
             allow_model_fallback: complexity >= 4,
         }
     }
+}
+
+/// 只有近期持续产生成功工具证据、且未触发循环检测时才允许扩容；最多两次，
+/// 防止复杂任务被固定上限误杀，也不让打转任务无限消耗。
+pub fn extend_tool_budget(
+    current: usize,
+    recent_successes: usize,
+    loop_breaks: usize,
+    extensions: usize,
+) -> Option<usize> {
+    if recent_successes < 3 || loop_breaks > 0 || extensions >= 2 { return None; }
+    Some(current.saturating_add((current / 3).max(12)).min(512))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +110,14 @@ mod tests {
         assert!(complex.tool_rounds > simple.tool_rounds);
         assert!(complex.duration_ms > simple.duration_ms);
         assert!(complex.allow_model_fallback);
+    }
+
+    #[test]
+    fn budget_only_extends_for_real_progress() {
+        assert_eq!(extend_tool_budget(60, 5, 0, 0), Some(80));
+        assert_eq!(extend_tool_budget(60, 1, 0, 0), None);
+        assert_eq!(extend_tool_budget(60, 5, 1, 0), None);
+        assert_eq!(extend_tool_budget(60, 5, 0, 2), None);
     }
 
     #[test]

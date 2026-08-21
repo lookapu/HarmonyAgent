@@ -78,6 +78,7 @@ fn extract_artifact_hints(goal: &str) -> Vec<String> {
     hints.sort(); hints.dedup(); hints.truncate(32); hints
 }
 
+#[derive(Clone, Copy)]
 pub struct ToolEvidence<'a> {
     pub tool: &'a str,
     pub args: &'a str,
@@ -128,32 +129,10 @@ fn matches_kind(kind: &CriterionKind, e: &ToolEvidence<'_>) -> bool {
 fn evidence_label(index: usize, e: &ToolEvidence<'_>) -> String {
     let target: String = e.args.split(['\n', ',']).next().unwrap_or("").trim().chars().take(100).collect();
     let outcome: String = e.output.lines().find(|line| !line.trim().is_empty()).unwrap_or("").chars().take(100).collect();
-    format!("#{} {} {} {}", index + 1, e.tool, target, outcome).trim().to_string()
-}
-
-fn argument_targets(args: &str) -> Vec<String> {
-    fn walk(value: &serde_json::Value, field: &str, out: &mut Vec<String>) {
-        match value {
-            serde_json::Value::String(text) => {
-                let field = field.to_lowercase();
-                if (field.contains("path") || field.contains("file") || field.contains("target"))
-                    && (text.contains('/') || text.contains('\\') || text.rsplit_once('.').is_some())
-                {
-                    out.push(text.replace('\\', "/").to_lowercase());
-                }
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, field, out)),
-            serde_json::Value::Object(map) => map.iter().for_each(|(key, item)| walk(item, key, out)),
-            _ => {}
-        }
-    }
-    let mut targets = Vec::new();
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
-        walk(&value, "", &mut targets);
-    } else if args.contains('/') || args.contains('\\') || args.rsplit_once('.').is_some() {
-        targets.push(args.replace('\\', "/").to_lowercase());
-    }
-    targets.sort(); targets.dedup(); targets
+    let envelope = crate::agent::structured_result::ToolResultEnvelope::from_execution(
+        e.tool, e.args, e.output, if e.succeeded { "ok" } else { "error" },
+    );
+    format!("#{} {} {} {} [{}]", index + 1, e.tool, target, outcome, &envelope.digest()[..12]).trim().to_string()
 }
 
 fn is_global_verifier(e: &ToolEvidence<'_>) -> bool {
@@ -166,7 +145,10 @@ pub fn evaluate_contract(contract: &GoalContract, tool_runs: &[ToolEvidence<'_>]
         .filter(|(_, evidence)| evidence.succeeded && is_mutation(evidence.tool))
         .map(|(index, _)| index).next_back();
     let mutation_targets = tool_runs.iter().filter(|item| item.succeeded && is_mutation(item.tool))
-        .flat_map(|item| argument_targets(item.args)).collect::<Vec<_>>();
+        .flat_map(|item| {
+            crate::agent::structured_result::ToolResultEnvelope::from_execution(item.tool, item.args, item.output, "ok")
+                .artifacts.into_iter().map(|artifact| artifact.path.to_lowercase()).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
     let criteria = contract.criteria.iter().map(|spec| {
         let mut evidence = tool_runs.iter().enumerate()
             .filter(|(index, item)| item.succeeded && matches_kind(&spec.kind, item)
@@ -179,7 +161,10 @@ pub fn evaluate_contract(contract: &GoalContract, tool_runs: &[ToolEvidence<'_>]
                 evidence = vec![evidence_label(last_mutation.unwrap_or(0) + offset + 1, item)];
             } else if !mutation_targets.is_empty() {
                 let reads = after.iter().filter(|item| item.succeeded && item.tool == "read_file")
-                    .flat_map(|item| argument_targets(item.args)).collect::<Vec<_>>();
+                    .flat_map(|item| {
+                        crate::agent::structured_result::ToolResultEnvelope::from_execution(item.tool, item.args, item.output, "ok")
+                            .artifacts.into_iter().map(|artifact| artifact.path.to_lowercase()).collect::<Vec<_>>()
+                    }).collect::<Vec<_>>();
                 let covers_all = mutation_targets.iter().all(|target| reads.iter().any(|read| {
                     read == target || read.ends_with(target) || target.ends_with(read)
                 }));

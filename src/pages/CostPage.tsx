@@ -9,6 +9,7 @@ import { writeTextFile } from '@tauri-apps/plugin-fs'
 import Icon from '../icons/Icon'
 import { getJSON, setJSON } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
+import { getReliabilityDashboard, runReliabilityEvaluation, type ReliabilityDashboard } from '../api/reliability'
 
 /** CSV 字段转义：含逗号/引号/换行的字段用双引号包裹，内部双引号 → 双重转义 */
 const csvEscape = (s: string) => {
@@ -35,6 +36,8 @@ export default function CostPage() {
   // LLM 请求级 trace：每次 LLM 调用一行（比 task_runs 更细：能看到 latency_ms / first_token_ms / cache 命中）
   const [requestLogs, setRequestLogs] = useState<RequestLog[]>([])
   const [requestLogsLoading, setRequestLogsLoading] = useState(false)
+  const [reliability, setReliability] = useState<ReliabilityDashboard | null>(null)
+  const [reliabilityLoading, setReliabilityLoading] = useState(false)
   // 请求日志状态过滤：all / success / error
   const [logStatusFilter, setLogStatusFilter] = useState<'all' | 'success' | 'error'>('all')
   // 请求日志分页
@@ -122,6 +125,31 @@ export default function CostPage() {
     }
   }, [])
 
+  const loadReliability = useCallback(async () => {
+    try {
+      setReliability(await getReliabilityDashboard(30))
+    } catch (e) {
+      console.error(e)
+    }
+  }, [])
+
+  const runReliabilityGate = useCallback(async () => {
+    setReliabilityLoading(true)
+    try {
+      const result = await runReliabilityEvaluation(0.95)
+      await loadReliability()
+      useNotificationStore.getState().push({
+        tone: result.passed ? 'success' : 'error',
+        title: result.passed ? t('cost.reliabilityGatePassed') : t('cost.reliabilityGateFailed'),
+        body: `${result.passed_cases}/${result.total_cases} · ${(result.score * 100).toFixed(1)}%`,
+      })
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setReliabilityLoading(false)
+    }
+  }, [loadReliability, t])
+
   /** 加载请求级 trace（按 status 过滤、按分页偏移拉）
    *  - 一次性拉到 200 条（满足前端翻 4 页），按 client 端 status 过滤，避免每页都打后端
    *  - status_code 2xx → success；4xx/5xx 或有 error_message → error
@@ -143,6 +171,7 @@ export default function CostPage() {
   useEffect(() => { load() }, [])
   useEffect(() => { loadBalances() }, [loadBalances])
   useEffect(() => { loadBudget() }, [loadBudget])
+  useEffect(() => { loadReliability() }, [loadReliability])
   useEffect(() => { loadRequestLogs(logPage) }, [loadRequestLogs, logPage])
 
   /** 错误分类 → 可读标签（与后端 errors::ErrorKind::as_str 对应） */
@@ -305,6 +334,48 @@ export default function CostPage() {
         <StatCard label={t('cost.inputTokens')} value={formatTokens(summary?.total_input_tokens ?? 0)} />
         <StatCard label={t('cost.outputTokens')} value={formatTokens(summary?.total_output_tokens ?? 0)} />
         <StatCard label={t('cost.totalCost')} value={`¥${(summary?.total_cost_cny ?? 0).toFixed(2)}`} />
+      </div>
+
+      {/* Agent 可靠性控制面：验收证据、恢复、调度、DAG 与版本化评测统一观测 */}
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <h3 className="text-sm font-medium text-[var(--text-secondary)]">{t('cost.reliabilityTitle')}</h3>
+          <p className="text-[11px] text-[var(--text-muted)] mt-0.5">{t('cost.reliabilityDesc')}</p>
+        </div>
+        <button
+          onClick={runReliabilityGate}
+          disabled={reliabilityLoading}
+          className="flex items-center gap-1.5 h-8 px-3 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-hover)] disabled:opacity-50 text-[12px] transition-colors"
+        >
+          <Icon name="refresh" size={12} className={reliabilityLoading ? 'animate-spin' : ''} />
+          {t('cost.runReliabilityGate')}
+        </button>
+      </div>
+      <div className="modern-card rounded-lg p-4 mb-6 space-y-4">
+        <div className="grid grid-cols-4 gap-4">
+          <StatCard label={t('cost.acceptanceRate')} value={reliability?.total_runs ? `${(reliability.acceptance_rate * 100).toFixed(1)}%` : '—'} tone={reliability?.total_runs ? rateTone(reliability.acceptance_rate) : undefined} />
+          <StatCard label={t('cost.qualityScore')} value={reliability?.total_runs ? reliability.average_quality_score.toFixed(1) : '—'} tone={reliability?.total_runs ? scoreTone(reliability.average_quality_score) : undefined} />
+          <StatCard label={t('cost.evidenceCoverage')} value={`${((reliability?.structured_evidence_coverage ?? 0) * 100).toFixed(1)}%`} tone={rateTone(reliability?.structured_evidence_coverage)} />
+          <StatCard label={t('cost.falseCompletions')} value={reliability?.false_completion_count ?? 0} tone={(reliability?.false_completion_count ?? 0) === 0 ? 'ok' : 'bad'} />
+        </div>
+        <div className="grid grid-cols-4 gap-4 text-sm">
+          <ReliabilityValue label={t('cost.remediationSuccess')} value={`${((reliability?.remediation_success_rate ?? 0) * 100).toFixed(1)}%`} />
+          <ReliabilityValue label={t('cost.recoverySuccess')} value={`${((reliability?.recovery_success_rate ?? 0) * 100).toFixed(1)}%`} />
+          <ReliabilityValue label={t('cost.dagProgress')} value={`${reliability?.dag_completed_nodes ?? 0}/${reliability?.dag_total_nodes ?? 0}`} />
+          <ReliabilityValue label={t('cost.duplicateEffects')} value={String(reliability?.duplicate_side_effect_count ?? 0)} />
+        </div>
+        <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3 text-[11px]">
+          <span className="text-[var(--text-muted)]">{t('cost.schedulerStates')}</span>
+          {(reliability?.scheduler_states ?? []).map((item) => (
+            <span key={item.name} className="badge-tone badge-tone-info">{item.name} · {item.count}</span>
+          ))}
+          {(reliability?.scheduler_states.length ?? 0) === 0 && <span className="text-[var(--text-muted)]">—</span>}
+          <span className="ml-auto text-[var(--text-muted)]">
+            {t('cost.latestEval')}: {reliability?.latest_eval
+              ? `${reliability.latest_eval.platform} · ${(reliability.latest_eval.score * 100).toFixed(1)}%`
+              : t('cost.notRun')}
+          </span>
+        </div>
       </div>
 
       {/* 任务级指标：Agent 任务成功率 / 耗时分布 / 错误分类 */}
@@ -772,6 +843,18 @@ function StatCard({ label, value, tone }: { label: string; value: string | numbe
       <p className="text-lg font-semibold mt-1 tnum" style={color ? { color } : undefined}>{value}</p>
     </div>
   )
+}
+
+function ReliabilityValue({ label, value }: { label: string; value: string }) {
+  return <div><p className="text-xs text-[var(--text-secondary)] mb-1">{label}</p><p className="tnum">{value}</p></div>
+}
+
+function rateTone(value?: number): 'ok' | 'warn' | 'bad' {
+  return (value ?? 0) >= 0.95 ? 'ok' : (value ?? 0) >= 0.8 ? 'warn' : 'bad'
+}
+
+function scoreTone(value?: number): 'ok' | 'warn' | 'bad' {
+  return (value ?? 0) >= 90 ? 'ok' : (value ?? 0) >= 75 ? 'warn' : 'bad'
 }
 
 /** 预算进度卡：日/月预算已用 vs 上限；上限为 null 时显示"未设上限" */

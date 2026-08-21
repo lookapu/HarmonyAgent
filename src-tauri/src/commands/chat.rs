@@ -1834,6 +1834,13 @@ async fn stream_chat_body(
                     phase,
                     error,
                 );
+                let scheduler_state = match run_state {
+                    "completed" => "completed",
+                    "cancelled" => "cancelled",
+                    _ => "failed",
+                };
+                let _ = crate::agent::scheduler::finish(&conn, run_id, scheduler_state, error);
+                let _ = crate::agent::dag::finish_root(&conn, run_id, scheduler_state);
             }
         }
 
@@ -2055,8 +2062,9 @@ fn begin_tool_run(
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO tool_runs
          (id, conversation_id, tool_name, input_json, status, duration_ms, created_at, trace_id,
-          call_id, idempotency_key, effect_kind, recovery_policy, prepared_at)
-         VALUES (?1,?2,?3,?4,'prepared',0,?5,?6,?1,?1,?7,?8,?5)",
+          call_id, idempotency_key, effect_kind, recovery_policy, prepared_at,dag_node_id)
+         VALUES (?1,?2,?3,?4,'prepared',0,?5,?6,?1,?1,?7,?8,?5,
+                 (SELECT dag_node_id FROM agent_runs WHERE run_id=?6))",
         params![call_id, conversation_id, tool, input, now(), trace_id, effect_kind, recovery_policy],
     ).unwrap_or(0);
     if inserted > 0 {
@@ -2108,14 +2116,20 @@ fn finish_tool_run(
     duration_ms: i64,
 ) {
     let (input, output) = tool_audit_payload(tool, input, output, status);
+    let structured = crate::agent::structured_result::ToolResultEnvelope::from_execution(
+        tool, &input, &output, status,
+    );
+    let structured_json = serde_json::to_string(&structured).unwrap_or_default();
+    let evidence_digest = structured.digest();
     let Ok(conn) = state.0.lock() else { return };
     if let Some(id) = call_id {
         let updated = conn
             .execute(
                 "UPDATE tool_runs SET result_json=?1, status=?2, duration_ms=?3,
-                 trace_id=?4, call_id=?5, finished_at=?6 WHERE id=?5
+                 trace_id=?4, call_id=?5, finished_at=?6,structured_result_json=?7,
+                 evidence_digest=?8,dag_node_id=COALESCE(dag_node_id,(SELECT dag_node_id FROM agent_runs WHERE run_id=?4)) WHERE id=?5
                  AND status NOT IN ('ok','error','blocked','cancelled','interrupted')",
-                params![output, status, duration_ms, trace_id, id, now()],
+                params![output, status, duration_ms, trace_id, id, now(), structured_json, evidence_digest],
             )
             .unwrap_or(0);
         if updated > 0 {
@@ -2147,6 +2161,12 @@ fn finish_tool_run(
                     );
                 }
             }
+            let _ = crate::agent::scheduler::checkpoint(
+                &conn,
+                trace_id,
+                &serde_json::json!({ "last_call_id": id, "tool": tool, "status": status, "evidence_digest": evidence_digest }),
+                180_000,
+            );
             let _ = crate::agent::runtime::append_event(
                 &conn,
                 trace_id,
@@ -2157,6 +2177,8 @@ fn finish_tool_run(
                     "tool": tool,
                     "status": status,
                     "duration_ms": duration_ms,
+                    "evidence_digest": evidence_digest,
+                    "artifacts": structured.artifacts,
                 }),
             );
             return;
@@ -2181,8 +2203,10 @@ fn finish_tool_run(
     let inserted = conn.execute(
         "INSERT OR REPLACE INTO tool_runs
          (id, conversation_id, tool_name, input_json, result_json, status, duration_ms, created_at,
-          trace_id, call_id, idempotency_key, effect_kind, recovery_policy, prepared_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?1,?11,?12,?8,?13)",
+          trace_id, call_id, idempotency_key, effect_kind, recovery_policy, prepared_at, finished_at,
+          structured_result_json,evidence_digest,dag_node_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?1,?11,?12,?8,?13,?14,?15,
+                 (SELECT dag_node_id FROM agent_runs WHERE run_id=?9))",
         params![
             id,
             conversation_id,
@@ -2197,6 +2221,8 @@ fn finish_tool_run(
             effect_kind,
             recovery_policy,
             now(),
+            structured_json,
+            evidence_digest,
         ],
     ).unwrap_or(0);
     if inserted > 0 {
@@ -2247,6 +2273,12 @@ fn finish_tool_run(
                 );
             }
         }
+        let _ = crate::agent::scheduler::checkpoint(
+            &conn,
+            trace_id,
+            &serde_json::json!({ "last_call_id": id, "tool": tool, "status": status, "evidence_digest": evidence_digest }),
+            180_000,
+        );
         let _ = crate::agent::runtime::append_event(
             &conn,
             trace_id,
@@ -2257,6 +2289,8 @@ fn finish_tool_run(
                 "tool": tool,
                 "status": status,
                 "duration_ms": duration_ms,
+                "evidence_digest": evidence_digest,
+                "artifacts": structured.artifacts,
             }),
         );
     }
@@ -2360,6 +2394,16 @@ async fn stream_chat_inner(
             content.trim(),
             recovery_plan.as_ref(),
             Some(&goal_contract),
+            execution_budget.lease_ms,
+        )?;
+        crate::agent::dag::register_root(&conn, &trace_id, &goal_contract.original_goal, None)?;
+        crate::agent::scheduler::register_active(
+            &conn,
+            &trace_id,
+            &conversation_id,
+            &goal_contract.original_goal,
+            50 + i64::from(execution_budget.complexity) * 5,
+            &serde_json::to_value(&execution_budget).unwrap_or_default(),
             execution_budget.lease_ms,
         )?;
         if let Some(plan) = recovery_plan.as_ref() {
@@ -3606,10 +3650,11 @@ async fn stream_chat_inner(
     // 工具轮次上限（防死循环兜底）：一轮可含多个工具标记，80 轮足以覆盖上百次调用的深度任务；
     // 真正的打转由 tool_limits 的连续重复调用检测拦截；
     // 上限可在设置页动态调整（0/-1 表示不限制）
-    let max_tool_rounds = crate::services::agent_limits::current()
+    let mut max_tool_rounds = crate::services::agent_limits::current()
         .tool_rounds()
         .map(|configured| configured.min(execution_budget.tool_rounds))
         .unwrap_or(execution_budget.tool_rounds);
+    let mut budget_extensions = 0usize;
 
     let mut full = String::new();
     let mut reasoning_full = String::new();
@@ -4742,7 +4787,34 @@ async fn stream_chat_inner(
                     break;
                 }
                 // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
-                if tool_runs.len() + pending.len() >= max_tool_rounds {
+                let reached_tool_limit = tool_runs.len() + pending.len() >= max_tool_rounds;
+                let limit_must_stop = if reached_tool_limit {
+                    let recent_successes = tool_runs.iter().rev().take(8).filter(|item| item.succeeded).count();
+                    if let Some(extended) = crate::agent::governance::extend_tool_budget(
+                        max_tool_rounds, recent_successes, loop_breaks, budget_extensions,
+                    ) {
+                        let previous = max_tool_rounds;
+                        max_tool_rounds = extended;
+                        budget_extensions += 1;
+                        if let Ok(conn) = state.0.lock() {
+                            let _ = crate::agent::scheduler::update_budget(
+                                &conn,
+                                &trace_id,
+                                &serde_json::json!({
+                                    "base": execution_budget,
+                                    "effective_tool_rounds": extended,
+                                    "extension_count": budget_extensions,
+                                }),
+                            );
+                            let _ = crate::agent::runtime::append_event(
+                                &conn, &trace_id, &conversation_id, "budget.extended",
+                                serde_json::json!({ "previous": previous, "current": extended, "reason": "verified_progress" }),
+                            );
+                        }
+                        false
+                    } else { true }
+                } else { false };
+                if limit_must_stop {
                     let round = (tool_runs.len() + 1) as u32;
                     let _ = app.emit(
                         "chat-tool-start",
@@ -5567,7 +5639,9 @@ async fn stream_chat_inner(
                 output: &item.output,
                 succeeded: item.succeeded,
             }).collect::<Vec<_>>();
-            let report = crate::agent::acceptance::evaluate_contract(&goal_contract, &evidence);
+            let report = state.0.lock().ok()
+                .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &evidence).ok())
+                .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &evidence));
             if !report.passed {
                 remediation_rounds += 1;
                 correction_text = crate::agent::tools::strip_tool_calls(&text);
@@ -5650,7 +5724,9 @@ async fn stream_chat_inner(
             succeeded: item.succeeded,
         })
         .collect::<Vec<_>>();
-    let acceptance = crate::agent::acceptance::evaluate_contract(&goal_contract, &acceptance_evidence);
+    let acceptance = state.0.lock().ok()
+        .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &acceptance_evidence).ok())
+        .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &acceptance_evidence));
     if let Ok(conn) = state.0.lock() {
         let value = serde_json::to_value(&acceptance).unwrap_or_else(|_| serde_json::json!({}));
         let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
@@ -7958,6 +8034,25 @@ async fn run_one_subagent_emitted(
     }
     let t0 = std::time::Instant::now();
     let run_id = app.state::<TaskRegistry>().run_id(conversation_id);
+    let child_contract = crate::agent::acceptance::GoalContract::compile(prompt);
+    let child_budget = crate::agent::governance::ExecutionBudget::for_contract(&child_contract, 0);
+    let (node_id, child_run_id) = match state.0.lock() {
+        Ok(conn) => match crate::agent::dag::begin_child(
+            &conn,
+            &run_id,
+            &format!("root:{run_id}"),
+            conversation_id,
+            name,
+            prompt,
+            &mc.model,
+            &child_contract,
+            &child_budget,
+        ) {
+            Ok(ids) => ids,
+            Err(error) => return (name.to_string(), Err(format!("子 Agent 持久化启动失败：{error}"))),
+        },
+        Err(error) => return (name.to_string(), Err(format!("子 Agent 数据库锁失败：{error}"))),
+    };
     let _ = app.emit(
         "chat-agent-start",
         ChatAgentStartEvent {
@@ -7983,8 +8078,18 @@ async fn run_one_subagent_emitted(
         app,
         approval,
         approval_mode,
+        &child_run_id,
     )
     .await;
+    if let Ok(conn) = state.0.lock() {
+        let report = crate::agent::dag::evaluate_run(&conn, &child_run_id, &child_contract)
+            .unwrap_or_else(|_| crate::agent::acceptance::evaluate_contract(&child_contract, &[]));
+        let output = r.as_ref().map(String::as_str).unwrap_or_else(|error| error.as_str());
+        let error = r.as_ref().err().map(String::as_str);
+        let _ = crate::agent::dag::finish_child(
+            &conn, &run_id, conversation_id, &node_id, &child_run_id, &report, output, error,
+        );
+    }
     let _ = app.emit(
         "chat-agent-done",
         ChatAgentDoneEvent {
@@ -8148,6 +8253,7 @@ async fn run_subagent(
     app: &AppHandle,
     _approval: &tauri::State<'_, ToolApprovalState>,
     approval_mode: &str,
+    child_run_id: &str,
 ) -> Result<String, String> {
     let sub_contract = crate::agent::acceptance::GoalContract::compile(prompt);
     let sub_budget = crate::agent::governance::ExecutionBudget::for_contract(&sub_contract, 0);
@@ -8283,7 +8389,7 @@ async fn run_subagent(
             let tool_ctx = crate::agent::exec_ctx::ToolCtx {
                 app: Some(app.clone()),
                 conversation_id: conversation_id.to_string(),
-                run_id: app.state::<TaskRegistry>().run_id(conversation_id),
+                run_id: child_run_id.to_string(),
                 spawn_remaining: limits.max_depth.unwrap_or(0),
             };
             let args_val: serde_json::Value =
@@ -8417,6 +8523,14 @@ async fn run_tool_with_guard(
 ) -> Result<String, String> {
     if is_cancelled(cancel, conversation_id) {
         return Err("用户已停止生成".into());
+    }
+    let fault_point = if tool_retry_safe(tool) {
+        "readonly_tool_timeout"
+    } else {
+        "write_tool_timeout"
+    };
+    if crate::agent::evals::fault_enabled(fault_point) {
+        return Err(format!("可靠性评测故障注入：{fault_point}（工具 {tool} 未执行）"));
     }
     if !tool_ctx.run_id.is_empty() {
         if let Ok(conn) = state.0.lock() {

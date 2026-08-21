@@ -29,6 +29,8 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     crate::agent::coordinator::recover_interrupted_steps(&conn)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     recover_interrupted_tool_runs(&conn)?;
+    crate::agent::scheduler::recover_orphaned_on_startup(&conn)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     // 上次进程已经不存在，非终态 durable run 不得继续伪装为运行中。
     // 恢复失败不应静默启动；映射回 rusqlite 错误较笨重，因此使用 SQL 侧同等收敛，
     // 详细 run.recovered 事件由 runtime 恢复函数在正常路径补齐。
@@ -119,6 +121,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (55, "055_execution_steps", include_str!("../../migrations/055_execution_steps.sql")),
     (56, "056_recovery_orchestrator", include_str!("../../migrations/056_recovery_orchestrator.sql")),
     (57, "057_agent_governance", include_str!("../../migrations/057_agent_governance.sql")),
+    (58, "058_reliability_control_plane", include_str!("../../migrations/058_reliability_control_plane.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -208,7 +211,10 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        for c in ["trace_id", "call_id", "idempotency_key", "effect_kind", "recovery_policy"] {
+        for c in [
+            "trace_id", "call_id", "idempotency_key", "effect_kind", "recovery_policy",
+            "structured_result_json", "evidence_digest", "dag_node_id",
+        ] {
             assert!(tool_cols.iter().any(|x| x == c), "tool_runs 迁移后缺少列 {c}: {tool_cols:?}");
         }
         let run_tables: i64 = conn
@@ -227,6 +233,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(step_tables, 1);
+        let control_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                 ('agent_task_queue','agent_dag_nodes','agent_dag_edges','agent_eval_runs')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(control_tables, 4);
         let run_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(agent_runs)")
             .unwrap()
@@ -237,6 +252,7 @@ mod tests {
         for c in [
             "parent_run_id", "recovery_plan_json", "recovery_mode", "goal_contract_json",
             "remediation_count", "heartbeat_at", "lease_expires_at", "quality_json",
+            "scheduler_task_id", "root_run_id", "dag_node_id", "budget_json",
         ] {
             assert!(
                 run_cols.iter().any(|x| x == c),

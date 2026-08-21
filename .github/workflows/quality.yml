@@ -37,5 +37,7 @@ jobs:
         run: npm run build
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Agent reliability gate
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked agent::evals::tests::reliability_gate
       - name: Rust clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked

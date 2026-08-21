@@ -320,6 +320,11 @@ pub fn renew_lease(
          WHERE run_id=?4 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
         params![now, expires, phase, run_id],
     ).map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "UPDATE agent_task_queue SET lease_expires_at=?1,updated_at=?2
+         WHERE run_id=?3 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
+        params![expires, now, run_id],
+    );
     append_event(conn, run_id, conversation_id, "run.heartbeat", serde_json::json!({
         "phase": phase, "lease_expires_at": expires,
     }))
@@ -334,6 +339,11 @@ pub fn touch_lease_global(run_id: &str, phase: &str, lease_ms: i64) {
         "UPDATE agent_runs SET heartbeat_at=?1,lease_expires_at=?2,phase=?3,updated_at=?1
          WHERE run_id=?4 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
         params![now, now.saturating_add(lease_ms.max(10_000)), phase, run_id],
+    );
+    let _ = conn.execute(
+        "UPDATE agent_task_queue SET lease_expires_at=?1,updated_at=?2
+         WHERE run_id=?3 AND state IN ('queued','running','waiting_approval','waiting_user','verifying')",
+        params![now.saturating_add(lease_ms.max(10_000)), now, run_id],
     );
 }
 

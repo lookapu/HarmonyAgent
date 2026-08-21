@@ -24,6 +24,7 @@ pub mod provider;
 pub mod proxy;
 pub mod maintenance;
 pub mod preview;
+pub mod reliability;
 pub mod rules;
 pub mod skill;
 pub mod terminal;
