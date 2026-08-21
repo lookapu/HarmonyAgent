@@ -144,6 +144,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (64, "064_pending_interactions", include_str!("../../migrations/064_pending_interactions.sql")),
     (65, "065_context_reconciliation", include_str!("../../migrations/065_context_reconciliation.sql")),
     (66, "066_structured_project_memories", include_str!("../../migrations/066_structured_project_memories.sql")),
+    (67, "067_context_pins", include_str!("../../migrations/067_context_pins.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -375,6 +376,15 @@ mod tests {
         ] {
             assert!(memory_cols.iter().any(|item| item == column), "project_memories missing {column}");
         }
+        let pin_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+                 AND name='conversation_context_pins'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pin_tables, 1);
     }
 
     #[test]

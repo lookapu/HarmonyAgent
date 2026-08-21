@@ -9674,6 +9674,29 @@ pub fn get_conversation_context_v2(
     crate::agent::context::load_context_v2(&conn, &conversation_id, context_limit)
 }
 
+/// 固定或解除固定关键消息、决策、文件和验收条件。
+#[tauri::command]
+pub fn set_conversation_context_pin(
+    conversation_id: String,
+    pin_kind: String,
+    source_ref: String,
+    label: String,
+    content: String,
+    pinned: bool,
+    state: State<'_, DbState>,
+) -> Result<Option<crate::agent::context::ContextPinV2>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::context::set_context_pin(
+        &conn,
+        &conversation_id,
+        &pin_kind,
+        &source_ref,
+        &label,
+        &content,
+        pinned,
+    )
+}
+
 /// 读取会话持久化摘要（上次任务压缩生成，跨任务继承早期对话要点）
 fn load_persisted_summary(
     state: &tauri::State<'_, DbState>,

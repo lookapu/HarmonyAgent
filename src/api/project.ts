@@ -331,6 +331,14 @@ export interface ConversationContextV2 {
     valid: boolean
     updated_at: number
   }>
+  pins: Array<{
+    id: string
+    pin_kind: 'message' | 'decision' | 'file' | 'acceptance'
+    source_ref: string
+    label: string
+    content: string
+    updated_at: number
+  }>
   budget: NonNullable<ConversationContextInfo['context_v2']>['budget']
   facts_digest: string | null
   invalidation_epoch: number
@@ -345,6 +353,22 @@ export interface ConversationContextV2 {
 
 export const getConversationContextV2 = (conversationId: string) =>
   invokeWithError<ConversationContextV2>('get_conversation_context_v2', { conversationId })
+
+export const setConversationContextPin = (input: {
+  conversation_id: string
+  pin_kind: 'message' | 'decision' | 'file' | 'acceptance'
+  source_ref: string
+  label: string
+  content: string
+  pinned: boolean
+}) => invokeWithError<ConversationContextV2['pins'][number] | null>('set_conversation_context_pin', {
+  conversationId: input.conversation_id,
+  pinKind: input.pin_kind,
+  sourceRef: input.source_ref,
+  label: input.label,
+  content: input.content,
+  pinned: input.pinned,
+})
 
 /** 会话事件日志条目（回放视图） */
 export interface SessionEvent {

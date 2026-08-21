@@ -110,6 +110,16 @@ pub struct PendingInteractionV2 {
     pub source_ref: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextPinV2 {
+    pub id: String,
+    pub pin_kind: String,
+    pub source_ref: String,
+    pub label: String,
+    pub content: String,
+    pub updated_at: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HotContextV2 {
     pub recent_messages: Vec<HotMessageV2>,
@@ -178,6 +188,7 @@ pub struct ConversationContextV2 {
     pub hot: HotContextV2,
     pub facts: Vec<ContextFactV2>,
     pub artifacts: Vec<ContextArtifactRef>,
+    pub pins: Vec<ContextPinV2>,
     pub budget: ContextBudgetV2,
     pub facts_digest: Option<String>,
     pub invalidation_epoch: i64,
@@ -215,6 +226,108 @@ pub struct ContextCheckpoint<'a> {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+pub fn set_context_pin(
+    conn: &Connection,
+    conversation_id: &str,
+    pin_kind: &str,
+    source_ref: &str,
+    label: &str,
+    content: &str,
+    pinned: bool,
+) -> Result<Option<ContextPinV2>, String> {
+    if !matches!(pin_kind, "message" | "decision" | "file" | "acceptance") {
+        return Err("pin_kind 仅支持 message|decision|file|acceptance".into());
+    }
+    let source_ref = source_ref.trim();
+    if source_ref.is_empty() || source_ref.chars().count() > 500 {
+        return Err("固定项来源为空或过长".into());
+    }
+    let project_id = conn
+        .query_row(
+            "SELECT project_id FROM conversations WHERE id=?1",
+            [conversation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "会话不存在".to_string())?;
+    if !pinned {
+        conn.execute(
+            "DELETE FROM conversation_context_pins
+             WHERE conversation_id=?1 AND pin_kind=?2 AND source_ref=?3",
+            params![conversation_id, pin_kind, source_ref],
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(None);
+    }
+    let mut content = content.trim().chars().take(4_000).collect::<String>();
+    let mut label = label.trim().chars().take(200).collect::<String>();
+    if pin_kind == "message" {
+        let message_id = source_ref.strip_prefix("message:").unwrap_or(source_ref);
+        let message = conn
+            .query_row(
+                "SELECT role,content FROM messages WHERE id=?1 AND conversation_id=?2 AND hidden=0",
+                params![message_id, conversation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "消息不存在或不属于当前会话".to_string())?;
+        if label.is_empty() {
+            label = format!("{} message", message.0);
+        }
+        content = message.1.chars().take(4_000).collect();
+    }
+    if content.is_empty() {
+        return Err("固定项内容不能为空".into());
+    }
+    if label.is_empty() {
+        label = pin_kind.to_string();
+    }
+    let now = now_ms();
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO conversation_context_pins
+         (id,conversation_id,project_id,pin_kind,source_ref,label,content,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)
+         ON CONFLICT(conversation_id,pin_kind,source_ref) DO UPDATE SET
+           label=excluded.label,content=excluded.content,updated_at=excluded.updated_at",
+        params![id, conversation_id, project_id, pin_kind, source_ref, label, content, now],
+    )
+    .map_err(|e| e.to_string())?;
+    load_context_pins(conn, conversation_id, 500).map(|pins| {
+        pins.into_iter()
+            .find(|pin| pin.pin_kind == pin_kind && pin.source_ref == source_ref)
+    })
+}
+
+fn load_context_pins(
+    conn: &Connection,
+    conversation_id: &str,
+    limit: usize,
+) -> Result<Vec<ContextPinV2>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,pin_kind,source_ref,label,content,updated_at
+             FROM conversation_context_pins WHERE conversation_id=?1
+             ORDER BY updated_at DESC LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![conversation_id, limit.clamp(1, 500) as i64], |row| {
+            Ok(ContextPinV2 {
+                id: row.get(0)?,
+                pin_kind: row.get(1)?,
+                source_ref: row.get(2)?,
+                label: row.get(3)?,
+                content: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 fn json_or_default<T>(raw: &str) -> T
@@ -1038,6 +1151,32 @@ fn active_facts_digest(conn: &Connection, conversation_id: &str) -> Result<Optio
             count += 1;
         }
     }
+    let mut pins = conn
+        .prepare(
+            "SELECT pin_kind,source_ref,label,content,updated_at FROM conversation_context_pins
+             WHERE conversation_id=?1 ORDER BY pin_kind,source_ref",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = pins
+        .query_map([conversation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (kind, reference, label, content, updated_at) = row.map_err(|e| e.to_string())?;
+        for value in [kind, reference, label, content] {
+            hasher.update(value);
+            hasher.update([0]);
+        }
+        hasher.update(updated_at.to_le_bytes());
+        count += 1;
+    }
     Ok((count > 0).then(|| format!("{:x}", hasher.finalize())))
 }
 
@@ -1062,6 +1201,7 @@ pub fn reconcile_summary(
     let facts = load_active_facts(conn, conversation_id, 40)?;
     let artifacts = load_valid_artifacts(conn, conversation_id, 20)?;
     let pending = load_hot_context(conn, conversation_id)?.pending_interactions;
+    let pins = load_context_pins(conn, conversation_id, 30)?;
 
     let mut lines = Vec::new();
     if !task.goal.trim().is_empty() {
@@ -1076,6 +1216,15 @@ pub fn reconcile_summary(
             pending
                 .iter()
                 .map(|item| format!("{}:{}", item.kind, item.request_id))
+                .collect::<Vec<_>>()
+                .join("；")
+        ));
+    }
+    if !pins.is_empty() {
+        lines.push(format!(
+            "用户固定上下文：{}",
+            pins.iter()
+                .map(|pin| format!("{}:{}={}", pin.pin_kind, pin.label, pin.content))
                 .collect::<Vec<_>>()
                 .join("；")
         ));
@@ -1305,6 +1454,7 @@ pub fn load_context_v2(
         hot: load_hot_context(conn, conversation_id)?,
         facts: load_active_facts(conn, conversation_id, 100)?,
         artifacts: load_valid_artifacts(conn, conversation_id, 100)?,
+        pins: load_context_pins(conn, conversation_id, 100)?,
         budget,
         facts_digest,
         invalidation_epoch: epoch,
@@ -1353,19 +1503,19 @@ fn load_reconciliation_state(
 fn load_hot_context(conn: &Connection, conversation_id: &str) -> Result<HotContextV2, String> {
     let mut message_stmt = conn
         .prepare(
-            "SELECT rowid,role,content,created_at FROM messages
+            "SELECT id,role,content,created_at FROM messages
              WHERE conversation_id=?1 AND queued=0 AND hidden=0
              ORDER BY created_at DESC,rowid DESC LIMIT 12",
         )
         .map_err(|e| e.to_string())?;
     let mut recent_messages = message_stmt
         .query_map([conversation_id], |row| {
-            let rowid = row.get::<_, i64>(0)?;
+            let message_id = row.get::<_, String>(0)?;
             let content = row.get::<_, String>(2)?;
             Ok(HotMessageV2 {
                 role: row.get(1)?,
                 content: content.chars().take(1_200).collect(),
-                source_ref: format!("message:rowid:{rowid}"),
+                source_ref: format!("message:{message_id}"),
                 created_at: row.get(3)?,
             })
         })
@@ -1674,7 +1824,7 @@ fn load_valid_artifacts(
 
 pub fn render_context_hint(context: &ConversationContextV2) -> Option<String> {
     let has_task = !context.task.goal.trim().is_empty();
-    if !has_task && context.facts.is_empty() && context.artifacts.is_empty() {
+    if !has_task && context.facts.is_empty() && context.artifacts.is_empty() && context.pins.is_empty() {
         return None;
     }
     let mut out = String::from("## 长会话结构化上下文 v2（事实均可追溯）\n");
@@ -1714,6 +1864,15 @@ pub fn render_context_hint(context: &ConversationContextV2) -> Option<String> {
             out.push_str(&format!(
                 "  - {} {}（来源 {}）\n",
                 interaction.kind, interaction.payload, interaction.source_ref
+            ));
+        }
+    }
+    if !context.pins.is_empty() {
+        out.push_str("- 用户固定上下文（不得被压缩、摘要或推断覆盖）：\n");
+        for pin in context.pins.iter().take(30) {
+            out.push_str(&format!(
+                "  - [{}] {}={}（来源 {}）\n",
+                pin.pin_kind, pin.label, pin.content, pin.source_ref
             ));
         }
     }
@@ -1816,6 +1975,8 @@ mod tests {
             "../../migrations/066_structured_project_memories.sql"
         ))
         .unwrap();
+        conn.execute_batch(include_str!("../../migrations/067_context_pins.sql"))
+            .unwrap();
     }
 
     fn conn() -> Connection {
@@ -1991,6 +2152,58 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(epochs, vec![3, 3]);
+    }
+
+    #[test]
+    fn user_pins_are_durable_authoritative_and_message_content_is_db_sourced() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO messages(id,conversation_id,role,content,created_at)
+             VALUES ('m1','c','user','不要推送',1)",
+            [],
+        )
+        .unwrap();
+        let message = set_context_pin(
+            &conn,
+            "c",
+            "message",
+            "message:m1",
+            "关键约束",
+            "伪造内容",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(message.content, "不要推送");
+        for (kind, reference, label, content) in [
+            ("decision", "decision:local-only", "发布方式", "只创建本地提交"),
+            ("file", "file:docs/ROADMAP.md", "路线图", "docs/ROADMAP.md"),
+            ("acceptance", "acceptance:tests", "验收", "Rust 与前端测试通过"),
+        ] {
+            set_context_pin(&conn, "c", kind, reference, label, content, true)
+                .unwrap()
+                .unwrap();
+        }
+        let context = load_context_v2(&conn, "c", 20_000).unwrap();
+        assert_eq!(context.pins.len(), 4);
+        let hint = render_context_hint(&context).unwrap();
+        assert!(hint.contains("不得被压缩、摘要或推断覆盖"));
+        assert!(hint.contains("不要推送"));
+        let reconciled = reconcile_summary(&conn, "c", "继续工作").unwrap();
+        assert!(reconciled.authoritative_block.contains("用户固定上下文"));
+
+        assert!(set_context_pin(
+            &conn,
+            "c",
+            "message",
+            "message:m1",
+            "",
+            "",
+            false,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(load_context_pins(&conn, "c", 20).unwrap().len(), 3);
     }
 
     #[test]

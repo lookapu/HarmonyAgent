@@ -32,6 +32,7 @@ import {
   compactConversation,
   getConversationContext,
   getConversationContextV2,
+  setConversationContextPin,
   type ConversationContextInfo,
   type ConversationContextV2,
   searchMessages,
@@ -701,6 +702,7 @@ export default function Home() {
   const [ctxInfo, setCtxInfo] = useState<ConversationContextInfo | null>(null)
   const [ctxV2Detail, setCtxV2Detail] = useState<ConversationContextV2 | null>(null)
   const [ctxV2Open, setCtxV2Open] = useState(false)
+  const [ctxDecisionDraft, setCtxDecisionDraft] = useState('')
   // 当前会话 ID：上下文可视条刷新依赖（避免 effect 内直接引用会话对象）
   const convId = currentConversation?.id
   useEffect(() => {
@@ -722,6 +724,57 @@ export default function Home() {
       cancelled = true
     }
   }, [convId, messages.length, modelOptions.model_id])
+  const changeContextPin = useCallback(async (
+    pinKind: 'message' | 'decision' | 'file' | 'acceptance',
+    sourceRef: string,
+    label: string,
+    content: string,
+    pinned: boolean,
+  ) => {
+    if (!convId) return
+    await setConversationContextPin({
+      conversation_id: convId,
+      pin_kind: pinKind,
+      source_ref: sourceRef,
+      label,
+      content,
+      pinned,
+    })
+    if (pinKind === 'message') {
+      const messageId = sourceRef.replace(/^message:/, '')
+      if (pinned) usePinStore.getState().pin(convId, messageId)
+      else usePinStore.getState().unpin(convId, messageId)
+    }
+    const context = await getConversationContextV2(convId)
+    setCtxV2Detail(context)
+  }, [convId])
+  // One-time-compatible union: migrate legacy localStorage message pins into
+  // Context V2, and mirror durable pins back to the existing pinned-message bar.
+  useEffect(() => {
+    if (!convId || !ctxV2Detail) return
+    const durableIds = new Set(
+      ctxV2Detail.pins
+        .filter((pin) => pin.pin_kind === 'message' && pin.source_ref.startsWith('message:'))
+        .map((pin) => pin.source_ref.slice('message:'.length)),
+    )
+    for (const id of durableIds) usePinStore.getState().pin(convId, id)
+    const localIds = usePinStore.getState().pins[convId] ?? []
+    const missing = localIds.filter((id) => !durableIds.has(id))
+    if (missing.length === 0) return
+    const byId = new Map(messages.map((message) => [message.id, message]))
+    void Promise.all(missing.map((id) => {
+      const message = byId.get(id)
+      if (!message) return Promise.resolve(null)
+      return setConversationContextPin({
+        conversation_id: convId,
+        pin_kind: 'message',
+        source_ref: `message:${id}`,
+        label: message.role,
+        content: message.content,
+        pinned: true,
+      })
+    })).then(() => getConversationContextV2(convId)).then(setCtxV2Detail).catch(() => {})
+  }, [convId, ctxV2Detail, messages])
   // 会话跟随模型：切换会话时恢复该会话绑定的模型（未绑定的会话保持当前全局选择）
   useEffect(() => {
     if (currentConversation?.model_id) {
@@ -4754,7 +4807,7 @@ export default function Home() {
                       {t('home.ctxV2Badge', { count: ctxInfo.context_v2.fact_count })}
                     </button>
                     {ctxV2Open && ctxV2Detail && (
-                      <span className="absolute bottom-full left-0 z-50 mb-2 block w-80 max-h-80 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3 text-[11px] text-[var(--text-secondary)] shadow-xl">
+                      <span className="absolute bottom-full left-0 z-50 mb-2 block w-96 max-h-96 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3 text-[11px] text-[var(--text-secondary)] shadow-xl">
                         <span className="mb-2 block font-medium text-[var(--text-primary)]">
                           {t('home.ctxV2PanelTitle')}
                         </span>
@@ -4767,6 +4820,87 @@ export default function Home() {
                             })}
                           </span>
                         )}
+                        <span className="mb-2 block rounded-md border border-[var(--border)] p-2">
+                          <span className="mb-1 block font-medium text-[var(--text-primary)]">
+                            {t('home.ctxPinsTitle', { count: ctxV2Detail.pins.length })}
+                          </span>
+                          {ctxV2Detail.pins.map((pin) => (
+                            <span key={pin.id} className="mb-1 flex items-start gap-1 rounded bg-[var(--bg-hover)] px-1.5 py-1">
+                              <Icon name="pin" size={10} className="mt-0.5 shrink-0" />
+                              <span className="min-w-0 flex-1 break-all">[{pin.pin_kind}] {pin.label}: {pin.content}</span>
+                              <button
+                                type="button"
+                                className="shrink-0 text-[var(--danger)]"
+                                onClick={() => void changeContextPin(pin.pin_kind, pin.source_ref, pin.label, pin.content, false)}
+                              >
+                                {t('home.ctxPinRemove')}
+                              </button>
+                            </span>
+                          ))}
+                          {ctxV2Detail.task.required_conditions.slice(0, 5).map((condition, index) => {
+                            const sourceRef = `acceptance:${index}:${condition.slice(0, 40)}`
+                            const pinned = ctxV2Detail.pins.some((pin) => pin.pin_kind === 'acceptance' && pin.source_ref === sourceRef)
+                            return (
+                              <button
+                                key={sourceRef}
+                                type="button"
+                                className="mr-1 mt-1 rounded bg-[var(--accent)]/10 px-1.5 py-0.5 text-[var(--accent)]"
+                                onClick={() => void changeContextPin('acceptance', sourceRef, t('home.ctxPinAcceptance'), condition, !pinned)}
+                              >
+                                {pinned ? '✓ ' : '+ '}{condition}
+                              </button>
+                            )
+                          })}
+                          {ctxV2Detail.hot.active_files.slice(0, 5).map((file) => {
+                            const sourceRef = `file:${file}`
+                            const pinned = ctxV2Detail.pins.some((pin) => pin.pin_kind === 'file' && pin.source_ref === sourceRef)
+                            return (
+                              <button
+                                key={sourceRef}
+                                type="button"
+                                className="mr-1 mt-1 rounded bg-[var(--accent)]/10 px-1.5 py-0.5 text-[var(--accent)]"
+                                onClick={() => void changeContextPin('file', sourceRef, file, file, !pinned)}
+                              >
+                                {pinned ? '✓ ' : '+ '}{file}
+                              </button>
+                            )
+                          })}
+                          {ctxV2Detail.hot.recent_messages.slice(-4).map((message) => {
+                            const pinned = ctxV2Detail.pins.some((pin) => pin.pin_kind === 'message' && pin.source_ref === message.source_ref)
+                            return (
+                              <button
+                                key={message.source_ref}
+                                type="button"
+                                className="mt-1 block w-full truncate rounded bg-[var(--bg-hover)] px-1.5 py-1 text-left"
+                                title={message.content}
+                                onClick={() => void changeContextPin('message', message.source_ref, message.role, message.content, !pinned)}
+                              >
+                                {pinned ? '✓' : '+'} [{message.role}] {message.content}
+                              </button>
+                            )
+                          })}
+                          <span className="mt-2 flex gap-1">
+                            <input
+                              value={ctxDecisionDraft}
+                              onChange={(event) => setCtxDecisionDraft(event.target.value)}
+                              placeholder={t('home.ctxPinDecisionPlaceholder')}
+                              className="min-w-0 flex-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-1.5 py-1 outline-none"
+                            />
+                            <button
+                              type="button"
+                              disabled={!ctxDecisionDraft.trim()}
+                              className="rounded bg-[var(--accent)] px-2 py-1 text-white disabled:opacity-40"
+                              onClick={() => {
+                                const decision = ctxDecisionDraft.trim()
+                                if (!decision) return
+                                void changeContextPin('decision', `decision:${Date.now()}`, t('home.ctxPinDecision'), decision, true)
+                                  .then(() => setCtxDecisionDraft(''))
+                              }}
+                            >
+                              {t('home.ctxPinAdd')}
+                            </button>
+                          </span>
+                        </span>
                         <span className="mb-2 block">
                           {t('home.ctxV2Cursor', {
                             from: ctxV2Detail.summary_from_message_rowid,
@@ -7268,12 +7402,20 @@ const MessageItem = memo(function MessageItem({
               {t('home.forkFromHere')}
             </button>
           )}
-          {/* Pin 到会话顶部：纯前端 localStorage，会话维度持久化（最多 8 条） */}
+          {/* Pin 到会话顶部，同时持久化为 Context V2 权威上下文。 */}
           <button
             onClick={() => {
               const convId = message.conversation_id
               const isP = usePinStore.getState().isPinned(convId, message.id)
               usePinStore.getState().toggle(convId, message.id)
+              void setConversationContextPin({
+                conversation_id: convId,
+                pin_kind: 'message',
+                source_ref: `message:${message.id}`,
+                label: message.role,
+                content: message.content,
+                pinned: !isP,
+              }).catch(() => {})
               // toast 反馈
               useNotificationStore.getState().push({
                 tone: isP ? 'info' : 'success',
@@ -8139,7 +8281,17 @@ function PinnedBar({ convId, onJump }: { convId: string; onJump: (msgId: string)
                 </span>
               </button>
               <button
-                onClick={() => unpin(convId, m.id)}
+                onClick={() => {
+                  unpin(convId, m.id)
+                  void setConversationContextPin({
+                    conversation_id: convId,
+                    pin_kind: 'message',
+                    source_ref: `message:${m.id}`,
+                    label: m.role,
+                    content: m.content,
+                    pinned: false,
+                  }).catch(() => {})
+                }}
                 className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger)] transition-all shrink-0"
                 title={t('home.unpinFromTop')}
               >
