@@ -35,6 +35,7 @@
 - 本机声明、官方变更与官方参考检索统一绑定当前工程 product 的 compile/compatible/target API 和已装 SDK；结果逐项标记可用、需运行时守卫、高于编译 SDK、废弃或移除，仅在 `@useinstead`/官方证据明确时提供替代。
 - ArkTS 构建错误新增 API 证据映射：从错误提取类型/模块符号，关联当前产品 API Level、本机 `.d.ts` 官方定义和官方版本变更，并把可审计证据与恢复步骤写回源码定位和同一次 Run。
 - `check_sdk_alignment` 升级为工程一致性审计：扫描 SDK import 并核对 API Level、精确权限、SystemCapability 守卫、设备类型、入口 Ability、permission usedScene 与产品模块归属；确定性问题、风险和降级提示分级输出且不自动篡改配置。
+- `search_api` 新增 Android/Web/TypeScript 迁移模式：常见实现按架构语义映射到 HarmonyOS 候选，并用当前工程 API Level、本机 SDK 模块/符号和官方来源逐项标记 verified/conditional/unavailable/unverified，附风险边界与完整验证闭环。
 
 ### 长会话 Context V2（M1 基础）
 

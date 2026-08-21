@@ -659,7 +659,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_api",
-        desc: "搜索已抓取的官方 API 变更库。\n参数：{\"keyword\":\"<关键字>\",\"module\":\"<可选>\",\"kit\":\"<可选>\",\"product\":\"<可选工程产品>\",\"api_level\":<可选变更版本过滤>,\"change_type\":\"added|removed|deprecated|modified\",\"limit\":<可选>}。每条结果绑定工程 compile/compatible/target API 与本机 SDK，标注可用性、废弃或移除；官方未明确替代时不臆造。\n前提：需要先 refresh_api_db。\n副作用：无（只读本地知识库）。\n返回：API 上下文、变更证据、工程可用性和官方链接。",
+        desc: "搜索官方 API 变更库，或生成 Android/Web/TypeScript 到 HarmonyOS 的证据化迁移建议。\nAPI 搜索参数：{\"keyword\":\"<关键字>\",\"module\":\"<可选>\",\"kit\":\"<可选>\",\"product\":\"<可选工程产品>\",\"api_level\":<可选变更版本过滤>,\"change_type\":\"added|removed|deprecated|modified\",\"limit\":<可选>}。迁移模式参数：{\"source_platform\":\"android|web|typescript\",\"concept\":\"<如 SharedPreferences/fetch/Node fs>\",\"product\":\"<可选>\"}。迁移候选逐项验证当前工程 API Level、本机 SDK 模块/符号及本地官方来源，标为 verified/conditional/unavailable/unverified；未验证候选不可直接生成代码。\n副作用：无（只读本机 SDK 与本地知识库）。\n返回：API 变更证据，或迁移策略、风险边界、验证状态与 LSP/一致性审计/构建/真机闭环步骤。",
     },
     ToolSpec {
         name: "refresh_api_details",

@@ -13,6 +13,7 @@ pub mod harmony_api_diagnosis;
 pub mod harmony_consistency;
 pub mod harmony_diagnosis;
 pub mod harmony_model;
+pub mod harmony_migration;
 pub mod harmony_api_diff;
 pub mod harmony_api_ref;
 pub mod harmony_docs;

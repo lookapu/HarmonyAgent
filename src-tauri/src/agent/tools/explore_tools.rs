@@ -465,6 +465,23 @@ pub(super) async fn search_api(args: &Value, roots: &[String], db: &crate::db::D
         args["product"].as_str(),
         env.default_api.as_deref(),
     );
+    if let Some(platform) = args["source_platform"].as_str() {
+        let concept = args["concept"]
+            .as_str()
+            .or_else(|| args["keyword"].as_str())
+            .ok_or("迁移模式需要 concept（或兼容使用 keyword）")?;
+        let index = crate::services::harmony_env::default_api_dir(&env)
+            .map(|api_dir| crate::services::sdk_api::index_api_dir(&api_dir));
+        let conn = db.0.lock().map_err(|error| error.to_string())?;
+        let advice = crate::services::harmony_migration::advise(
+            platform,
+            concept,
+            &context,
+            index.as_ref(),
+            Some(&conn),
+        )?;
+        return Ok(crate::services::harmony_migration::render(&context, &advice));
+    }
     let db = db.0.clone();
     let keyword = args["keyword"].as_str().map(|s| s.to_string());
     let module = args["module"].as_str().map(|s| s.to_string());

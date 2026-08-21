@@ -166,7 +166,7 @@
 - [x] `HM-21` 检索结果始终绑定当前工程 SDK/API Level，标注引入、废弃和替代版本。
 - [x] `HM-22` 将 ArkTS 编译错误映射到 API 变更、类型约束和官方定义。
 - [x] `HM-23` 检查 API 使用、权限声明、设备能力和模块配置的一致性。
-- [ ] `HM-24` 为 Android/Web/TypeScript 常见实现提供经过验证的 HarmonyOS 迁移建议。
+- [x] `HM-24` 为 Android/Web/TypeScript 常见实现提供经过验证的 HarmonyOS 迁移建议。
 - [ ] `HM-25` 生成代码后用本机类型定义、LSP 诊断和构建结果完成闭环验证。
 
 ### 5.5 阶段验收
