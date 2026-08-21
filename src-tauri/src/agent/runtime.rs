@@ -318,8 +318,10 @@ pub fn recover_interrupted_runs(conn: &Connection) -> Result<usize, String> {
             "UPDATE agent_runs SET state='interrupted',phase='recovery_required',
              recovery_count=recovery_count+1,error='应用退出导致任务中断，可从已持久化进度继续',
              resume_policy=CASE
-               WHEN EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='manual') THEN 'manual'
-               WHEN EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='verify') THEN 'verify_effects'
+               WHEN EXISTS(SELECT 1 FROM execution_steps WHERE run_id=?2 AND state='interrupted' AND recovery_policy='manual')
+                 OR EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='manual') THEN 'manual'
+               WHEN EXISTS(SELECT 1 FROM execution_steps WHERE run_id=?2 AND state='interrupted' AND recovery_policy='verify')
+                 OR EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='verify') THEN 'verify_effects'
                ELSE 'continue'
              END,
              updated_at=?1,finished_at=?1 WHERE run_id=?2",
@@ -351,7 +353,8 @@ mod tests {
              INSERT INTO conversations(id) VALUES ('c');
              CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER);
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
-             CREATE TABLE tool_runs(trace_id TEXT,status TEXT,recovery_policy TEXT);",
+             CREATE TABLE tool_runs(trace_id TEXT,status TEXT,recovery_policy TEXT);
+             CREATE TABLE execution_steps(run_id TEXT,state TEXT,recovery_policy TEXT);",
         ).unwrap();
         c
     }

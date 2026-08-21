@@ -4764,14 +4764,18 @@ export default function Home() {
                   </span>
                 )}
                 <button
-                  onClick={() => void sendUserMessage(
-                    unfinishedConv.recoveryPolicy === 'manual'
+                  onClick={() => {
+                    const affected = unfinishedConv.recoverySteps
+                      ?.slice(-12)
+                      .map((step) => `- ${step.title} [${step.state}; ${step.verification_state}; ${step.recovery_policy}]`)
+                      .join('\n')
+                    const base = unfinishedConv.recoveryPolicy === 'manual'
                       ? t('home.recoveryManualPrompt')
                       : unfinishedConv.recoveryPolicy === 'verify_effects'
                         ? t('home.recoveryVerifyPrompt')
-                        : t('home.continuePrompt'),
-                    modelOptions,
-                  )}
+                        : t('home.continuePrompt')
+                    void sendUserMessage(affected ? `${base}\n\n${t('home.recoveryAffectedSteps')}:\n${affected}` : base, modelOptions)
+                  }}
                   className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-all"
                 >
                   <Icon name="arrow-down" size={11} />

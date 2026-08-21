@@ -2,6 +2,7 @@
 
 pub mod ask;
 pub mod acceptance;
+pub mod coordinator;
 pub mod diagnostics;
 pub mod crash;
 pub mod runtime_log;

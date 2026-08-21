@@ -308,11 +308,34 @@ export interface AgentRunEvent {
   created_at: number
 }
 
+export interface ExecutionStep {
+  step_id: string
+  run_id: string
+  conversation_id: string
+  source: 'plan' | 'tool' | string
+  external_id: string
+  ordinal: number
+  title: string
+  tool_name: string | null
+  input_hash: string | null
+  state: string
+  effect_kind: 'read' | 'write' | 'destructive' | string
+  recovery_policy: 'replay' | 'verify' | 'manual' | string
+  verification_state: string
+  result_summary: string | null
+  started_at: number | null
+  updated_at: number
+  finished_at: number | null
+}
+
 export const getLatestAgentRun = (conversationId: string) =>
   invokeWithError<AgentRun | null>('get_latest_agent_run', { conversationId })
 
 export const getAgentRunEvents = (runId: string, afterSeq = 0, limit = 200) =>
   invokeWithError<AgentRunEvent[]>('get_agent_run_events', { runId, afterSeq, limit })
+
+export const getAgentRunSteps = (runId: string) =>
+  invokeWithError<ExecutionStep[]>('get_agent_run_steps', { runId })
 
 export const getSessionEvents = (conversationId: string) =>
   invokeWithError<SessionEventsView>('get_session_events', { conversationId })

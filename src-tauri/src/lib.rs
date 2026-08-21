@@ -407,6 +407,7 @@ pub fn run() {
             commands::chat::get_session_events,
             commands::chat::get_latest_agent_run,
             commands::chat::get_agent_run_events,
+            commands::chat::get_agent_run_steps,
             commands::chat::delete_conversation,
             commands::chat::save_message_feedback,
             commands::chat::list_message_feedback,

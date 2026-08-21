@@ -26,6 +26,8 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     run_migrations(&conn)?;
+    crate::agent::coordinator::recover_interrupted_steps(&conn)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     recover_interrupted_tool_runs(&conn)?;
     // 上次进程已经不存在，非终态 durable run 不得继续伪装为运行中。
     // 恢复失败不应静默启动；映射回 rusqlite 错误较笨重，因此使用 SQL 侧同等收敛，
@@ -38,7 +40,13 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
 /// 应用异常退出时，执行前已落库但未写终态的工具会残留 running。启动恢复将其明确
 /// 标记为 interrupted，并按副作用策略说明后续动作；绝不把未知副作用调用自动当作失败重跑。
 fn recover_interrupted_tool_runs(conn: &Connection) -> Result<usize, rusqlite::Error> {
-    conn.execute(
+    let prepared = conn.execute(
+        "UPDATE tool_runs SET status='cancelled', finished_at=unixepoch(),
+         result_json=COALESCE(NULLIF(result_json, ''), '应用退出时工具尚未开始执行')
+         WHERE status='prepared'",
+        [],
+    )?;
+    let running = conn.execute(
         "UPDATE tool_runs SET status='interrupted', finished_at=unixepoch(),
          result_json=COALESCE(NULLIF(result_json, ''),
            CASE recovery_policy
@@ -48,7 +56,8 @@ fn recover_interrupted_tool_runs(conn: &Connection) -> Result<usize, rusqlite::E
            END)
          WHERE status='running'",
         [],
-    )
+    )?;
+    Ok(prepared + running)
 }
 
 /// 全部迁移清单（id, 名称, SQL）。启动迁移与 db_migrate 工具共用同一清单。
@@ -107,6 +116,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (52, "052_reminders_feedback_terms", include_str!("../../migrations/052_reminders_feedback_terms.sql")),
     (53, "053_tool_run_lifecycle", include_str!("../../migrations/053_tool_run_lifecycle.sql")),
     (54, "054_agent_runtime", include_str!("../../migrations/054_agent_runtime.sql")),
+    (55, "055_execution_steps", include_str!("../../migrations/055_execution_steps.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -207,6 +217,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(run_tables, 2);
+        let step_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='execution_steps'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_tables, 1);
     }
 
     #[test]

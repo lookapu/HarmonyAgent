@@ -11,6 +11,7 @@
 mod build_tools;
 mod cmd_tools;
 mod compose_tools;
+pub mod contracts;
 mod debug_tools;
 pub(crate) mod doc_tools;
 mod device_tools;
@@ -3600,6 +3601,20 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
     } else {
         crate::agent::todo::replace(&key, items)
     };
+    // 会话级 todo 同步为当前 Run 的持久化计划步骤。项目级 todo 可能跨多个 Run 共享，
+    // 不绑定到单次执行图，避免其他会话的更新污染本次恢复决策。
+    if project.is_none() && !ctx.run_id.is_empty() {
+        if let Some(db) = crate::db::global() {
+            if let Ok(conn) = db.lock() {
+                let _ = crate::agent::coordinator::sync_todos(
+                    &conn,
+                    &ctx.run_id,
+                    &ctx.conversation_id,
+                    &todos,
+                );
+            }
+        }
+    }
     if let Some(app) = &ctx.app {
         use tauri::Emitter;
         let _ = app.emit(

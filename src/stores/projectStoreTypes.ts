@@ -239,6 +239,7 @@ export interface ChatSlice {
     conversationId: string
     recoveryPolicy?: 'continue' | 'verify_effects' | 'manual' | string
     error?: string
+    recoverySteps?: import('../api/project').ExecutionStep[]
   } | null
   /** 会话排队中消息列表（流式运行中提交、任务结束后续跑） */
   queuedList: QueuedMessageInfo[]

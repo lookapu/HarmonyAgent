@@ -2022,29 +2022,8 @@ fn tool_audit_payload(tool: &str, input: &str, output: &str, status: &str) -> (S
     (bounded_tool_audit_text(input), bounded_tool_audit_text(output))
 }
 
-/// 工具副作用与崩溃恢复契约。未知工具一律按可能有副作用处理，禁止自动重放。
-fn tool_recovery_profile(tool: &str) -> (&'static str, &'static str) {
-    if is_concurrency_safe(tool)
-        || matches!(
-            tool,
-            "job_list" | "job_output" | "tool_list" | "tool_help" | "tool_history"
-                | "list_devices" | "device_info" | "environment_check" | "read_runtime_logs"
-        )
-    {
-        ("read", "replay")
-    } else if matches!(
-        tool,
-        "delete_file" | "git_push" | "git_commit" | "git_merge" | "git_rebase"
-            | "deploy" | "install_app" | "uninstall_app" | "secret_store"
-    ) {
-        ("destructive", "manual")
-    } else {
-        ("write", "verify")
-    }
-}
-
-/// 工具开始即落一条 running 记录。进程崩溃时该记录会保留下来，诊断层可明确识别
-/// 未收尾调用；call_id 同时作为主键与前端事件关联键，重复事件天然幂等。
+/// 工具进入执行流水线时先落一条 prepared 记录。只有审批/预算等 pre hooks 全部通过后
+/// 才推进到 running；call_id 同时作为主键与前端事件关联键，重复事件天然幂等。
 fn begin_tool_run(
     state: &tauri::State<'_, DbState>,
     conversation_id: &str,
@@ -2054,29 +2033,49 @@ fn begin_tool_run(
     input: &str,
 ) {
     let (input, _) = tool_audit_payload(tool, input, "", "running");
-    let (effect_kind, recovery_policy) = tool_recovery_profile(tool);
+    let contract = crate::agent::tools::contracts::contract(tool);
+    let effect_kind = contract.effect.as_str();
+    let recovery_policy = contract.recovery.as_str();
     let Ok(conn) = state.0.lock() else { return };
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO tool_runs
          (id, conversation_id, tool_name, input_json, status, duration_ms, created_at, trace_id,
           call_id, idempotency_key, effect_kind, recovery_policy, prepared_at)
-         VALUES (?1,?2,?3,?4,'running',0,?5,?6,?1,?1,?7,?8,?5)",
+         VALUES (?1,?2,?3,?4,'prepared',0,?5,?6,?1,?1,?7,?8,?5)",
         params![call_id, conversation_id, tool, input, now(), trace_id, effect_kind, recovery_policy],
     ).unwrap_or(0);
     if inserted > 0 {
-        let _ = crate::agent::runtime::append_event(
+        let _ = crate::agent::coordinator::prepare_tool_step(
             &conn,
             trace_id,
             conversation_id,
-            "tool.prepared",
-            serde_json::json!({
-                "call_id": call_id,
-                "tool": tool,
-                "effect_kind": effect_kind,
-                "recovery_policy": recovery_policy,
-            }),
+            call_id,
+            tool,
+            &input,
+            contract,
         );
     }
+}
+
+/// 审批/预算等 pre hooks 全部通过后才把 prepared 推进到 running。这样崩溃恢复能
+/// 明确区分“工具从未调用”和“可能已产生副作用”。
+fn mark_tool_run_started(
+    state: &tauri::State<'_, DbState>,
+    conversation_id: &str,
+    trace_id: &str,
+    call_id: &str,
+) {
+    let Ok(conn) = state.0.lock() else { return };
+    let _ = conn.execute(
+        "UPDATE tool_runs SET status='running' WHERE id=?1 AND status='prepared'",
+        [call_id],
+    );
+    let _ = crate::agent::coordinator::start_tool_step(
+        &conn,
+        trace_id,
+        conversation_id,
+        call_id,
+    );
 }
 
 /// 工具终态落库（Evaluation/审计统计来源）：有 begin 记录则原位更新；子 Agent 等
@@ -2095,15 +2094,23 @@ fn finish_tool_run(
     let (input, output) = tool_audit_payload(tool, input, output, status);
     let Ok(conn) = state.0.lock() else { return };
     if let Some(id) = call_id {
-        if conn
+        let updated = conn
             .execute(
                 "UPDATE tool_runs SET result_json=?1, status=?2, duration_ms=?3,
-                 trace_id=?4, call_id=?5, finished_at=?6 WHERE id=?5",
+                 trace_id=?4, call_id=?5, finished_at=?6 WHERE id=?5
+                 AND status NOT IN ('ok','error','blocked','cancelled','interrupted')",
                 params![output, status, duration_ms, trace_id, id, now()],
             )
-            .unwrap_or(0)
-            > 0
-        {
+            .unwrap_or(0);
+        if updated > 0 {
+            let _ = crate::agent::coordinator::finish_tool_step(
+                &conn,
+                trace_id,
+                conversation_id,
+                id,
+                status,
+                &output,
+            );
             let _ = crate::agent::runtime::append_event(
                 &conn,
                 trace_id,
@@ -2118,9 +2125,23 @@ fn finish_tool_run(
             );
             return;
         }
+        // 已存在的终态调用拒绝迟到/重复收尾。不能继续走 INSERT OR REPLACE，后者会
+        // 破坏终态不可变性，并让诊断与恢复策略取决于事件到达顺序。
+        let exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tool_runs WHERE id=?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if exists {
+            return;
+        }
     }
     let id = call_id.map(str::to_string).unwrap_or_else(|| Uuid::new_v4().to_string());
-    let (effect_kind, recovery_policy) = tool_recovery_profile(tool);
+    let contract = crate::agent::tools::contracts::contract(tool);
+    let effect_kind = contract.effect.as_str();
+    let recovery_policy = contract.recovery.as_str();
     let inserted = conn.execute(
         "INSERT OR REPLACE INTO tool_runs
          (id, conversation_id, tool_name, input_json, result_json, status, duration_ms, created_at,
@@ -2143,6 +2164,33 @@ fn finish_tool_run(
         ],
     ).unwrap_or(0);
     if inserted > 0 {
+        // 子 Agent 工具没有前端 call_id，使用审计行 id 作为执行步骤外部键；这样所有
+        // 真正发生过的工具调用都进入同一执行图，而不是只覆盖主 Agent 的可见卡片。
+        let _ = crate::agent::coordinator::prepare_tool_step(
+            &conn,
+            trace_id,
+            conversation_id,
+            &id,
+            tool,
+            &input,
+            contract,
+        );
+        if !matches!(status, "blocked" | "cancelled") {
+            let _ = crate::agent::coordinator::start_tool_step(
+                &conn,
+                trace_id,
+                conversation_id,
+                &id,
+            );
+        }
+        let _ = crate::agent::coordinator::finish_tool_step(
+            &conn,
+            trace_id,
+            conversation_id,
+            &id,
+            status,
+            &output,
+        );
         let _ = crate::agent::runtime::append_event(
             &conn,
             trace_id,
@@ -4866,6 +4914,7 @@ async fn stream_chat_inner(
                     exhausted = true;
                     break;
                 }
+            mark_tool_run_started(&state, &conversation_id, &trace_id, &call_id);
             // 子 Agent 委派：并发执行、可指定模型，结果汇总后继续主 Agent 循环
             let result = if tool == "spawn_agents" {
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
@@ -8094,16 +8143,7 @@ fn tool_exec_timeout(tool: &str, args_raw: &str) -> std::time::Duration {
 /// 只有明确幂等的查询工具允许框架自动重试。写文件、构建、部署、Git、命令和未知
 /// MCP 工具的超时结果不代表“没有发生”，重放可能造成重复副作用。
 fn tool_retry_safe(tool: &str) -> bool {
-    !tool.starts_with("mcp__")
-        && matches!(
-            tool,
-            "list_devices" | "list_dir" | "read_file" | "find_files" | "grep_files"
-                | "web_search" | "web_fetch" | "search_symbols" | "codebase_search"
-                | "get_symbol_details" | "git_status" | "git_diff" | "git_log"
-                | "read_runtime_logs" | "search_hilog" | "environment_check"
-                | "search_sdk_api" | "read_sdk_api_module" | "search_harmony_docs"
-                | "read_harmony_doc" | "get_api_detail" | "diff_api_versions"
-        )
+    crate::agent::tools::contracts::contract(tool).retry_safe
 }
 
 /// 执行单个工具（带硬超时 + 用户停止检查）。
@@ -8207,10 +8247,11 @@ mod tool_execution_policy_tests {
 
     #[test]
     fn recovery_contract_is_conservative_and_default_approval_is_safe() {
-        assert_eq!(tool_recovery_profile("read_file"), ("read", "replay"));
-        assert_eq!(tool_recovery_profile("edit_file"), ("write", "verify"));
-        assert_eq!(tool_recovery_profile("git_push"), ("destructive", "manual"));
-        assert_eq!(tool_recovery_profile("mcp__unknown"), ("write", "verify"));
+        use crate::agent::tools::contracts::{contract, EffectKind, RecoveryPolicy};
+        assert_eq!(contract("read_file").recovery, RecoveryPolicy::Replay);
+        assert_eq!(contract("edit_file").recovery, RecoveryPolicy::Verify);
+        assert_eq!(contract("git_push").recovery, RecoveryPolicy::Manual);
+        assert_eq!(contract("mcp__unknown").effect, EffectKind::Write);
         assert_eq!(approval_mode(&ChatOptions::default()), "auto");
     }
 
@@ -8345,6 +8386,7 @@ async fn execute_tool_batch_one(
             retries: 0,
         };
     }
+    mark_tool_run_started(state, conversation_id, &tool_ctx.run_id, &call_id);
     // 执行：超时/网络类错误按指数退避自动重试（与串行路径同策略）
     let tool_started = std::time::Instant::now();
     // 工具心跳：长工具执行期间保持心跳，防看门狗误杀
@@ -8810,6 +8852,17 @@ pub fn get_agent_run_events(
         after_seq.unwrap_or(0).max(0),
         limit.unwrap_or(200),
     )
+}
+
+/// 返回一次运行的持久化执行步骤。用于重启后展示精确恢复范围，避免前端只凭一条
+/// 泛化错误文案决定是否重放有副作用操作。
+#[tauri::command]
+pub fn get_agent_run_steps(
+    run_id: String,
+    state: State<'_, DbState>,
+) -> Result<Vec<crate::agent::coordinator::ExecutionStep>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::coordinator::list_steps(&conn, &run_id)
 }
 
 /// 查询会话事件日志（回放/统计），与写入侧的 append_event 构成完整的事件溯源闭环

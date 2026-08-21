@@ -32,6 +32,7 @@ import {
   restoreSnapshot as restoreSnapshotApi,
   getLatestAgentRun as getLatestAgentRunApi,
   getAgentRunEvents as getAgentRunEventsApi,
+  getAgentRunSteps as getAgentRunStepsApi,
 } from '../../api/project'
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger } from '../../api/project'
 import type { StateCreator } from 'zustand'
@@ -1369,6 +1370,34 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             if (events.length < 1000) break
           }
           if (get().currentConversation?.id !== id || get().streamings[id]) return
+          // 首轮补拉的最大序号才是已装载边界。latest_run 与事件查询之间仍可能产生新
+          // checkpoint，不能继续沿用查询开始时的 last_event_seq。
+          durableRunCursors.set(run.run_id, Math.max(run.last_event_seq, after))
+          const durableSteps = await getAgentRunStepsApi(run.run_id).catch(() => [])
+          if (get().currentConversation?.id !== id || get().streamings[id]) return
+          const restoredToolRuns = durableSteps
+            .filter((step) => step.source === 'tool')
+            .map((step) => ({
+              id: `tool-call-${step.external_id}`,
+              tool: step.tool_name || step.title,
+              args: '',
+              status: (['prepared', 'running'].includes(step.state)
+                ? 'running'
+                : step.state === 'completed'
+                  ? 'done'
+                  : 'error') as 'running' | 'done' | 'error',
+              output: step.result_summary || '',
+              startedAt: step.started_at ?? step.updated_at,
+              durationMs: step.started_at && step.finished_at
+                ? Math.max(0, step.finished_at - step.started_at)
+                : undefined,
+            }))
+          const activeCalls = new Set(
+            durableSteps
+              .filter((step) => step.source === 'tool' && ['prepared', 'running'].includes(step.state))
+              .map((step) => step.external_id),
+          )
+          if (activeCalls.size > 0) activeToolCallIds.set(id, activeCalls)
           if (interrupted) {
             set((state) => {
               const recoveredId = `recovered-${run.run_id}`
@@ -1395,15 +1424,18 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
                 messages: recoveredMessage && !hasRecovered
                   ? [...state.messages, recoveredMessage]
                   : state.messages,
+                toolRuns: restoredToolRuns,
                 unfinishedConv: {
                   conversationId: id,
                   recoveryPolicy: run.resume_policy,
                   error: run.error ?? undefined,
+                  recoverySteps: durableSteps,
                 },
               }
             })
             return
           }
+          set({ toolRuns: restoredToolRuns })
           setBucket(id, {
             ...emptyStreaming(),
             conversationId: id,
@@ -1412,7 +1444,69 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             reasoning,
             startedAt: run.started_at,
             lastDeltaAt: Date.now(),
+            toolRunning: activeCalls.size,
           })
+          // 建立流式桶之后再做一次增量补拉，闭合“最后一次 SQLite 查询 → 桶创建”之间
+          // 的竞态窗口。已由 IPC 收到的 checkpoint 会推进 cursor，因此不会重复追加。
+          let catchupAfter = after
+          for (;;) {
+            const events = await getAgentRunEventsApi(run.run_id, catchupAfter, 1000)
+            for (const item of events) {
+              catchupAfter = Math.max(catchupAfter, item.seq)
+              const cursor = durableRunCursors.get(run.run_id) ?? 0
+              if (item.seq <= cursor || item.event_type !== 'model.delta' || !item.payload || typeof item.payload !== 'object') continue
+              durableRunCursors.set(run.run_id, item.seq)
+              const payload = item.payload as { content?: unknown; reasoning?: unknown }
+              if (typeof payload.content === 'string' && payload.content) queueStreamDelta(id, 'content', payload.content)
+              if (typeof payload.reasoning === 'string' && payload.reasoning) queueStreamDelta(id, 'reasoning', payload.reasoning)
+            }
+            if (events.length < 1000) break
+          }
+          // 工具也做二次对账。终态优先，绝不让较旧快照把刚收到的 done/error 降级回 running。
+          const refreshedSteps = await getAgentRunStepsApi(run.run_id).catch(() => durableSteps)
+          const refreshedTools = refreshedSteps
+            .filter((step) => step.source === 'tool')
+            .map((step) => ({
+              id: `tool-call-${step.external_id}`,
+              tool: step.tool_name || step.title,
+              args: '',
+              status: (['prepared', 'running'].includes(step.state)
+                ? 'running'
+                : step.state === 'completed'
+                  ? 'done'
+                  : 'error') as 'running' | 'done' | 'error',
+              output: step.result_summary || '',
+              startedAt: step.started_at ?? step.updated_at,
+              durationMs: step.started_at && step.finished_at
+                ? Math.max(0, step.finished_at - step.started_at)
+                : undefined,
+            }))
+          const reconciledActive = activeToolCallIds.get(id) ?? new Set<string>()
+          for (const step of refreshedSteps.filter((item) => item.source === 'tool')) {
+            const current = get().toolRuns.find((toolRun) => toolRun.id === `tool-call-${step.external_id}`)
+            if (['prepared', 'running'].includes(step.state) && (!current || current.status === 'running')) {
+              reconciledActive.add(step.external_id)
+            } else {
+              reconciledActive.delete(step.external_id)
+            }
+          }
+          if (reconciledActive.size > 0) activeToolCallIds.set(id, reconciledActive)
+          else activeToolCallIds.delete(id)
+          if (get().currentConversation?.id !== id || get().streamings[id]?.runId !== run.run_id) return
+          set((state) => {
+            const previous = new Map(state.toolRuns.map((toolRun) => [toolRun.id, toolRun]))
+            const refreshedIds = new Set(refreshedTools.map((toolRun) => toolRun.id))
+            return {
+              toolRuns: [
+                ...refreshedTools.map((toolRun) => {
+                  const old = previous.get(toolRun.id)
+                  return old && old.status !== 'running' && toolRun.status === 'running' ? old : toolRun
+                }),
+                ...state.toolRuns.filter((toolRun) => !refreshedIds.has(toolRun.id)),
+              ],
+            }
+          })
+          setBucket(id, { toolRunning: reconciledActive.size })
         })
         .catch(() => {})
       trace.mark('messages-state-set')
