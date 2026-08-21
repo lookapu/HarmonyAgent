@@ -42,6 +42,8 @@ pub fn ensure_registered() {
 
 /// 超大输出落盘阈值（字符）：超过后写 .deveco-agent/spill 并只返回预览
 const SPILL_THRESHOLD: usize = 20_000;
+const SPILL_HEAD_CHARS: usize = 3_000;
+const SPILL_TAIL_CHARS: usize = 2_000;
 /// 免落盘工具：输出含结构化标记，必须原样保留给上层处理（截图视觉闭环）
 const NO_SPILL_TOOLS: &[&str] = &["take_screenshot", "verify_ui", "run_ui_flow"];
 
@@ -235,7 +237,9 @@ async fn post_guard(inv: &ToolInvocation<'_>, result: &mut Result<String, String
 /// 超大输出落盘：成功结果超过阈值时写入 {root}/.deveco-agent/spill/，
 /// 返回预览 + 定位符，模型需要完整内容时用 read_file 读取（防长输出撑爆上下文）
 async fn post_spill(inv: &ToolInvocation<'_>, result: &mut Result<String, String>) {
-    let Ok(out) = result else { return };
+    let out = match result {
+        Ok(out) | Err(out) => out,
+    };
     let cnt = out.chars().count();
     if cnt <= SPILL_THRESHOLD || NO_SPILL_TOOLS.contains(&inv.name) {
         return;
@@ -257,10 +261,15 @@ async fn post_spill(inv: &ToolInvocation<'_>, result: &mut Result<String, String
     if std::fs::write(spill_dir.join(&fname), out.as_str()).is_err() {
         return;
     }
+    super::cleanup_tool_outputs(&spill_dir);
     let rel = format!(".deveco-agent/spill/{fname}");
-    let head: String = out.chars().take(3000).collect();
+    let head: String = out.chars().take(SPILL_HEAD_CHARS).collect();
+    let tail: String = out
+        .chars()
+        .skip(cnt.saturating_sub(SPILL_TAIL_CHARS))
+        .collect();
     *out = format!(
-        "{head}\n\n…(输出过长共 {cnt} 字符，已完整保存到 {rel}；如需继续处理请用 read_file 读取该文件)…"
+        "{head}\n\n…(输出过长共 {cnt} 字符，已完整保存到 {rel}；如需继续处理请用 read_file 读取该文件)…\n\n{tail}"
     );
 }
 
@@ -463,6 +472,24 @@ mod tests {
         assert_eq!(files.len(), 1, "应生成一个落盘文件");
         let content = std::fs::read_to_string(files[0].path()).unwrap();
         assert_eq!(content.len(), SPILL_THRESHOLD + 100, "落盘内容应完整");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn post_spill_preserves_failed_output_as_bounded_artifact() {
+        let ctx = ToolCtx::empty();
+        let dir = std::env::temp_dir().join(format!("spill-error-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).ok();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let args = serde_json::json!({});
+        let mut result: Result<String, String> = Err(format!(
+            "{}FINAL_FAILURE", "diagnostic\n".repeat(SPILL_THRESHOLD / 10)
+        ));
+        post_spill(&inv("run_tests", &roots, &ctx, &args), &mut result).await;
+        let out = result.unwrap_err();
+        assert!(out.contains(".deveco-agent/spill/"));
+        assert!(out.contains("FINAL_FAILURE"), "失败结论必须保留在尾部预览");
+        assert!(out.chars().count() < SPILL_THRESHOLD);
         std::fs::remove_dir_all(&dir).ok();
     }
 

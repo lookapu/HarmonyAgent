@@ -109,6 +109,7 @@ impl ToolResultV2 {
         let committed = matches!(status, "ok" | "partial" | "partial_success");
         let mut artifacts = argument_artifacts(tool, args);
         merge_native_artifacts(output, &mut artifacts);
+        merge_spilled_artifacts(output, &mut artifacts);
         let mut verification = Vec::new();
         if is_verifier(tool, args) {
             verification.push(VerificationEvidence {
@@ -348,6 +349,33 @@ fn merge_native_artifacts(output: &str, artifacts: &mut Vec<ArtifactEvidence>) {
     artifacts.truncate(64);
 }
 
+fn merge_spilled_artifacts(output: &str, artifacts: &mut Vec<ArtifactEvidence>) {
+    for marker in ["已完整保存到 ", "完整内容已保存到 "] {
+        let mut rest = output;
+        while let Some(start) = rest.find(marker) {
+            let after = &rest[start + marker.len()..];
+            let end = after
+                .find(['；', '，', '\n', '\r'])
+                .unwrap_or(after.len());
+            let path = after[..end].trim();
+            if !path.is_empty()
+                && (path.contains(".deveco-agent/spill/")
+                    || path.contains(".deveco-agent/tool-output/"))
+            {
+                artifacts.push(ArtifactEvidence {
+                    path: path.replace('\\', "/"),
+                    kind: "tool_output".into(),
+                    operation: "produce".into(),
+                });
+            }
+            rest = &after[end..];
+        }
+    }
+    artifacts.sort_by(|a, b| a.path.cmp(&b.path).then(a.operation.cmp(&b.operation)));
+    artifacts.dedup_by(|a, b| a.path == b.path && a.operation == b.operation);
+    artifacts.truncate(64);
+}
+
 fn first_line(output: &str) -> String {
     output
         .lines()
@@ -506,6 +534,20 @@ mod tests {
             "ok",
         );
         assert_eq!(native.artifacts[0].path, "dist/app.exe");
+    }
+
+    #[test]
+    fn spilled_output_is_a_first_class_artifact() {
+        let value = ToolResultV2::from_execution(
+            "run_tests",
+            "{}",
+            "preview\n…(输出过长，已完整保存到 .deveco-agent/spill/tests.txt；可读取)…\nfailed",
+            "error",
+        );
+        assert!(value.artifacts.iter().any(|item| {
+            item.kind == "tool_output" && item.path == ".deveco-agent/spill/tests.txt"
+        }));
+        assert!(value.raw_excerpt.chars().count() <= 1000);
     }
 
     #[test]
