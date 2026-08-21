@@ -43,8 +43,16 @@ pub struct ExecutionLoopSnapshot {
 }
 
 pub fn snapshot(contract: &GoalContract, evidence: &[ToolEvidence<'_>]) -> ExecutionLoopSnapshot {
-    let acceptance = super::acceptance::evaluate_contract(contract, evidence);
+    let mut acceptance = super::acceptance::evaluate_contract(contract, evidence);
     let verification_plan = super::verification_planner::plan(evidence);
+    let pending_verification = verification_plan.pending_required();
+    if !pending_verification.is_empty() {
+        acceptance.passed = false;
+        acceptance.blockers.push(format!(
+            "文件变更验证未闭环：{}",
+            pending_verification.iter().map(|step| step.tool.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
     let pending_postconditions = super::postconditions::pending(evidence);
     let successful = evidence.iter().filter(|item| item.succeeded).count();
     let has_plan = evidence.iter().any(|item| {
@@ -78,7 +86,7 @@ pub fn snapshot(contract: &GoalContract, evidence: &[ToolEvidence<'_>]) -> Execu
         LoopStage::Plan
     } else if has_plan && !attempted_execution {
         LoopStage::Select
-    } else if needs_post_effect_verification {
+    } else if needs_post_effect_verification || !pending_verification.is_empty() {
         LoopStage::Verify
     } else {
         LoopStage::Execute
@@ -198,5 +206,19 @@ mod tests {
         assert_eq!(state.stage, LoopStage::Execute);
         assert_eq!(state.recommended_phase, "deliver");
         assert!(state.minimal_tools.iter().any(|tool| tool == "git_commit"));
+    }
+
+    #[test]
+    fn arkts_write_cannot_accept_until_sdk_lsp_and_build_are_clean() {
+        let contract = GoalContract::compile("修改 ArkTS 文件并验证");
+        let write = ToolEvidence {
+            tool: "edit_file",
+            args: r#"{"path":"entry/src/main/ets/Index.ets"}"#,
+            output: "ok",
+            succeeded: true,
+        };
+        let state = snapshot(&contract, &[write, evidence("build_project", true)]);
+        assert_eq!(state.stage, LoopStage::Verify);
+        assert!(state.blockers.iter().any(|blocker| blocker.contains("lsp_diagnostics")));
     }
 }

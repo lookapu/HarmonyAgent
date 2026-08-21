@@ -155,7 +155,8 @@ pub fn selected_tool_names_for_phase(
     let mut candidates = selected_tool_names(query, 64);
     if phase == TaskPhase::Verify {
         for tool in [
-            "lsp_format", "format_file", "run_lint", "check_code", "run_tests",
+            "lsp_format", "format_file", "check_sdk_alignment", "lsp_diagnostics",
+            "run_lint", "check_code", "run_tests",
             "build_project", "build_generic", "git_diff",
         ].into_iter().rev() {
             if let Some(index) = candidates.iter().position(|candidate| *candidate == tool) {
