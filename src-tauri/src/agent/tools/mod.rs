@@ -350,6 +350,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "查询当前项目的预置任务模板（build/test/lint 一键组合，按项目类型自动识别 HarmonyOS hvigor 工程 / npm 工程）。\n参数：无。\n适合：不确定该项目的构建/测试命令时先查模板，取其中命令作为 run_command / run_in_background 的 command 参数（可直接修改）；hvigor 工程额外提供 build-module（只构建 entry）与 clean（清缓存重建）模板。\n副作用：无（只读模板表）。\n返回：模板清单（模板名 + 命令 + 说明）。",
     },
     ToolSpec {
+        name: "workflow_template",
+        desc: "管理项目级、版本化工作流模板。\n参数：{\"action\":\"list|validate|import|enable|disable|upgrade\",\"id\":\"<enable/disable 必填>\",\"template\":{\"schema\":1,\"id\":\"build-check\",\"name\":\"Build check\",\"version\":\"1.0.0\",\"harmony_agent_compat\":\">=2.0.0,<3.0.0\",\"permissions\":[\"project.read\"],\"enabled\":true,\"steps\":[{\"id\":\"inspect\",\"tool\":\"read_file\",\"args\":{\"path\":\"README.md\"},\"acceptance\":\"文件可读\"}]},\"allow_permission_escalation\":false}。\n校验 schema/SemVer/Agent 兼容范围、权限、已注册工具、参数对象、步骤 id 和验收条件；import/upgrade 每次显式审批，升级只接受更高版本，新增权限需显式 allow_permission_escalation=true，旧版本归档供回滚。模板不能递归调用本工具，且不会自动执行步骤。\n副作用：validate/list 无写入；import/enable/disable/upgrade 写入项目 .deveco-agent/workflow-templates。\n返回：模板版本、启用状态、步骤和权限摘要。",
+    },
+    ToolSpec {
         name: "debug_probe",
         desc: "在 .ets 源文件的目标函数/方法入口插桩 hilog 日志（可附带变量值），形成“软件断点”——无需 DevEco 调试器协议即可在运行期观察函数是否被调用与参数值。\n参数：{\"path\":\"<文件路径>\",\"target\":\"<函数/方法名>\",\"vars\":[\"<可选变量名数组>\"],\"action\":\"insert|cleanup|list（缺省 insert）\"}。\n适合：定位“函数是否执行/参数是什么”类问题（如点击无反应、数据未更新）；比直接改代码更安全，插桩点自动记录可一键还原。\n副作用：修改源文件（插入 hilog 调用与 import，构建前必须 cleanup 或保留）；插桩点记录在会话内。\n返回：插桩位置与后续流程（build_project → deploy → query_hilog(tag=\"devecoProbe\") → cleanup）。",
     },
@@ -1300,6 +1304,7 @@ pub async fn run_tool(
         "agent_publish" => crate::agent::agent_board::agent_publish(&args, ctx).await,
         "agent_subscribe" => crate::agent::agent_board::agent_subscribe(&args, ctx).await,
         "job_template" => job_template(&args, &roots).await,
+        "workflow_template" => crate::services::workflow_templates::handle(&args, &roots),
         "lsp_definition" => crate::agent::lsp_client::lsp_definition(&args, &roots, &ctx.conversation_id).await,
         "lsp_references" => crate::agent::lsp_client::lsp_references(&args, &roots, &ctx.conversation_id).await,
         "lsp_symbols" => crate::agent::lsp_client::lsp_symbols(&args, &roots, &ctx.conversation_id).await,

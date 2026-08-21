@@ -50,7 +50,9 @@ pub fn parse_and_validate(content: &str) -> Result<SkillManifest, String> {
         ));
     }
     let version = version.ok_or("Skill v1 清单缺少 version")?;
-    parse_version(&version).ok_or_else(|| format!("Skill version 不是合法 SemVer：{version}"))?;
+    validate_version(&version)
+        .then_some(())
+        .ok_or_else(|| format!("Skill version 不是合法 SemVer：{version}"))?;
     let agent_compat = agent_compat.ok_or("Skill v1 清单缺少 harmony_agent_compat")?;
     let permissions = permissions.ok_or("Skill v1 清单缺少 permissions（无额外权限时写 []）")?;
     let mut normalized = Vec::new();
@@ -66,7 +68,7 @@ pub fn parse_and_validate(content: &str) -> Result<SkillManifest, String> {
         }
     }
     normalized.sort();
-    let compatible = requirement_matches(&agent_compat, env!("CARGO_PKG_VERSION"))?;
+    let compatible = agent_requirement_matches(&agent_compat, env!("CARGO_PKG_VERSION"))?;
     Ok(SkillManifest {
         schema,
         version,
@@ -161,7 +163,17 @@ fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some((major, minor, patch))
 }
 
-fn requirement_matches(requirement: &str, current: &str) -> Result<bool, String> {
+pub fn validate_version(value: &str) -> bool {
+    parse_version(value).is_some()
+}
+
+pub fn compare_versions(left: &str, right: &str) -> Result<std::cmp::Ordering, String> {
+    let left = parse_version(left).ok_or_else(|| format!("无效 SemVer：{left}"))?;
+    let right = parse_version(right).ok_or_else(|| format!("无效 SemVer：{right}"))?;
+    Ok(left.cmp(&right))
+}
+
+pub fn agent_requirement_matches(requirement: &str, current: &str) -> Result<bool, String> {
     let current =
         parse_version(current).ok_or_else(|| format!("应用版本不是合法 SemVer：{current}"))?;
     let mut saw_constraint = false;

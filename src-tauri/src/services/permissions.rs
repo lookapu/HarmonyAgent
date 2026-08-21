@@ -95,6 +95,7 @@ pub fn tool_level(tool: &str) -> Level {
         | "db_migrate" | "state_snapshot"
         | "secret_store" | "secret_delete"
         | "fact_extract" | "reflexion_pin" | "export_report" | "use_skill" => Level::L1,
+        "workflow_template" => Level::L1,
         // 质量/度量域写/外部请求工具（snippet 库、混淆开关、HTTP 探测）
         "snippet_insert" | "obfuscate" | "api_test" | "api_health" => Level::L1,
         // L2 危险/越界
@@ -105,12 +106,14 @@ pub fn tool_level(tool: &str) -> Level {
     }
 }
 
-/// 发布治理的参数级硬门禁。返回 true 时必须为本次调用单独取得用户确认，不能被
-/// allow_all、项目/会话白名单或历史授权绕过。未来新增市场/证书工具时沿用显式名称，
-/// 未登记工具仍保持 L2，但只有这里命中的操作具有“每次确认”语义。
-pub fn requires_explicit_release_approval(tool: &str, args: &serde_json::Value) -> bool {
+/// 参数级逐次审批硬门禁。返回 true 时必须为本次调用单独取得用户确认，不能被
+/// allow_all、项目/会话白名单或历史授权绕过。这里同时覆盖发布安全域，以及导入、
+/// 升级第三方工作流等会改变后续能力边界的操作。
+pub fn requires_fresh_explicit_approval(tool: &str, args: &serde_json::Value) -> bool {
     match tool {
-        "ota_pack" | "sign_hap" | "certificate_import" | "app_market_publish" | "secret_get" => true,
+        "ota_pack" | "sign_hap" | "certificate_import" | "app_market_publish" | "secret_get" => {
+            true
+        }
         "create_harmony_project" => args
             .get("copy_signing_from")
             .and_then(|value| value.as_str())
@@ -123,6 +126,10 @@ pub fn requires_explicit_release_approval(tool: &str, args: &serde_json::Value) 
             .get("command")
             .and_then(|value| value.as_str())
             .is_some_and(command_requires_release_approval),
+        "workflow_template" => args
+            .get("action")
+            .and_then(|value| value.as_str())
+            .is_some_and(|action| matches!(action, "import" | "upgrade")),
         _ => false,
     }
 }
@@ -391,29 +398,44 @@ mod tests {
     }
 
     #[test]
-    fn release_operations_always_require_fresh_approval() {
-        assert!(requires_explicit_release_approval("ota_pack", &serde_json::json!({})));
-        assert!(requires_explicit_release_approval(
+    fn sensitive_operations_always_require_fresh_approval() {
+        assert!(requires_fresh_explicit_approval(
+            "ota_pack",
+            &serde_json::json!({})
+        ));
+        assert!(requires_fresh_explicit_approval(
             "build_project",
             &serde_json::json!({"mode": "release"}),
         ));
-        assert!(!requires_explicit_release_approval(
+        assert!(!requires_fresh_explicit_approval(
             "build_project",
             &serde_json::json!({"mode": "debug"}),
         ));
-        assert!(requires_explicit_release_approval(
+        assert!(requires_fresh_explicit_approval(
+            "workflow_template",
+            &serde_json::json!({"action": "upgrade"}),
+        ));
+        assert!(requires_fresh_explicit_approval(
+            "workflow_template",
+            &serde_json::json!({"action": "import"}),
+        ));
+        assert!(!requires_fresh_explicit_approval(
+            "workflow_template",
+            &serde_json::json!({"action": "validate"}),
+        ));
+        assert!(requires_fresh_explicit_approval(
             "create_harmony_project",
             &serde_json::json!({"copy_signing_from": "/safe/reference"}),
         ));
-        assert!(requires_explicit_release_approval(
+        assert!(requires_fresh_explicit_approval(
             "run_command",
             &serde_json::json!({"command": "\"/opt/ohpm\"   publish --tag next"}),
         ));
-        assert!(requires_explicit_release_approval(
+        assert!(requires_fresh_explicit_approval(
             "run_command",
             &serde_json::json!({"command": "java -jar packagingtool.jar --mode ota"}),
         ));
-        assert!(!requires_explicit_release_approval(
+        assert!(!requires_fresh_explicit_approval(
             "run_command",
             &serde_json::json!({"command": "hvigorw assembleHap --mode module -p product=default"}),
         ));

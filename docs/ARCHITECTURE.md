@@ -180,7 +180,7 @@ Worker 每 5 秒写心跳并回收过期 Owner。认领任务会生成 lease tok
 
 ### 8.1 工具注册与协议
 
-`agent/tools/mod.rs` 的 `TOOL_SPECS` 是 198 个对外工具的权威清单，包含名称、说明和副作用标记。工具既支持文本标记协议，也支持 OpenAI 兼容的原生 function calling；MCP 与 Skill 工具在运行时动态注入。
+`agent/tools/mod.rs` 的 `TOOL_SPECS` 是 199 个对外工具的权威清单，包含名称、说明和副作用标记。工具既支持文本标记协议，也支持 OpenAI 兼容的原生 function calling；MCP 与 Skill 工具在运行时动态注入。
 
 工具按 build/fix/explore/deploy/refactor/test/debug/other 八个任务域进行限额和统计。
 

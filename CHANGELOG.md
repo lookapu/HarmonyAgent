@@ -7,7 +7,7 @@
 
 ## Unreleased — 证据驱动治理与双层执行内核（2026-08-21）
 
-定位：把“模型能调用很多工具”升级为“任务和工具都可持久调度、可验收、可恢复、可观测”。可靠性与治理批次新增迁移 `057`—`062`、`069`；当前继续推进长会话 Context V2，数据库迁移总数达到 **69**。本批不新增对外工具，`TOOL_SPECS` 仍为 **198**。
+定位：把“模型能调用很多工具”升级为“任务和工具都可持久调度、可验收、可恢复、可观测”。可靠性与治理批次新增迁移 `057`—`062`、`069`—`070`；当前继续推进长会话 Context V2，数据库迁移总数达到 **70**。工作流模板管理新增 1 个对外工具，`TOOL_SPECS` 达到 **199**。
 
 ### HarmonyOS 工程语义模型
 
@@ -47,6 +47,8 @@
 - `copy_signing_from` 只允许授权根内的非敏感签名元数据和工程内材料引用，密码/令牌/私钥字段与目录外材料直接拒绝，未知字段按白名单丢弃；应用市场专用发布能力在满足同一治理契约前保持关闭。
 - Skill manifest v1 新增独立 SemVer、HarmonyAgent 兼容范围、权限枚举、兼容状态和 `SKILL.md` 内容哈希：旧 Skill 明示为 `legacy_unverified`，不兼容项保持禁用，导入后内容漂移会阻止指令注入与调用；Skill 声明不能扩大现有工具权限。
 - 内置能力包新增 schema/version、最低 Agent 版本与 `read_only|project_write|device_write|delivery` 权限上限，选择策略可独立于工具协议演进。
+- 新增项目级工作流模板 v1：支持校验、导入、列出、启用、禁用和 SemVer 升级；逐步骤核对已注册工具、验收条件与权限清单，拒绝递归模板和不兼容 Agent 版本。
+- 工作流导入/升级必须逐次显式审批；升级只接受更高版本，新增权限还需单独确认权限差异，旧版本归档在项目 `.deveco-agent/workflow-templates/history/` 供人工恢复，模板不会因导入或启用而自动执行。
 
 ### 长会话 Context V2（M1 基础）
 
@@ -380,7 +382,7 @@
 
 ## 维护说明
 
-- 工具总数以 `src-tauri/src/agent/tools/mod.rs` 中 `TOOL_SPECS` 数组长度为准（当前 198）。
+- 工具总数以 `src-tauri/src/agent/tools/mod.rs` 中 `TOOL_SPECS` 数组长度为准（当前 199）。
 - 任务分组以 `TASK_GROUPS` 常量为准（当前 8 个：`build` / `fix` / `explore` / `deploy` / `refactor` / `test` / `debug` / `other`）。
 - `quality_tools::*` 通过 facade 暴露，**禁止**直接 import 4 个子文件（`quality_metrics` 等）—— 内部模块，外部耦合面随 facade 走。
 - 任何对工具的"按行数切分"禁止。**必须按方法完整切片**，签名 + 函数体在同一文件内。脚本辅助可见 `scripts/legacy/_split_quality.py`。

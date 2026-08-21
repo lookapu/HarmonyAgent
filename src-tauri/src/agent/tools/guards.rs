@@ -91,9 +91,10 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     let conversation_id = inv.conversation_id;
     let recovery_forces_approval =
         crate::agent::recovery::requires_confirmation_global(&inv.ctx.run_id, tool);
-    let release_forces_approval = permissions::requires_explicit_release_approval(tool, inv.args);
+    let sensitive_operation_forces_approval =
+        permissions::requires_fresh_explicit_approval(tool, inv.args);
     let is_write_tool = matches!(tool, "edit_file" | "write_file" | "delete_file");
-    let needs_approval = if recovery_forces_approval || release_forces_approval {
+    let needs_approval = if recovery_forces_approval || sensitive_operation_forces_approval {
         true
     } else if approval_mode_str == "first_write" && is_write_tool {
         let approved = app
@@ -168,18 +169,17 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
             None,
         );
     }
-    let approval_result =
-        request_tool_approval(
-            app,
-            &approval,
-            &cancel,
-            conversation_id,
-            &inv.ctx.run_id,
-            tool,
-            inv.args_raw,
-            recovery_forces_approval || release_forces_approval,
-        )
-        .await;
+    let approval_result = request_tool_approval(
+        app,
+        &approval,
+        &cancel,
+        conversation_id,
+        &inv.ctx.run_id,
+        tool,
+        inv.args_raw,
+        recovery_forces_approval || sensitive_operation_forces_approval,
+    )
+    .await;
     if !inv.ctx.run_id.is_empty() {
         crate::agent::runtime::transition_global(
             &inv.ctx.run_id,

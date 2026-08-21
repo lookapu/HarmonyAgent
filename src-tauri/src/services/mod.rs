@@ -46,3 +46,4 @@ pub mod task_guard;
 pub mod tool_cache;
 pub mod tool_limits;
 pub mod workspace;
+pub mod workflow_templates;
