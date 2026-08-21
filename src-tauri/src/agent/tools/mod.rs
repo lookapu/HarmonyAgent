@@ -327,7 +327,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "deploy",
-        desc: "把构建产物安装到已连接设备并拉起应用（hdc install + aa start）。\n参数：{\"hap\":\"<可选 hap 文件路径，相对项目根或绝对路径>\",\"product\":\"<可选产品>\",\"module\":\"<可选模块>\",\"device\":\"<可选设备序列号，缺省默认设备>\"}。hap 缺省时只从最近构建 manifest 选择工程指纹未过期、内容 SHA-256 复验一致、签名结构已验证且有 build 来源的最新 HAP；跨产品/模块或同时间多候选会拒绝并要求用户用 hap 或 product+module 确认，不再递归猜包。显式 hap 表示用户确认该文件，但明确 unsigned 仍拒绝。\n副作用：覆盖安装应用到设备，可能替换现有版本。\n返回：产物选择证据、设备信息、安装/启动结果。安装失败时返回结构化错误（category：device_offline/signing/version_downgrade/insufficient_storage/incompatible/install_failed）与推荐下一步：设备问题调用 list_devices；签名问题调用 diagnose_signing 或重新构建；版本降级提示卸载旧版。不要盲目重复部署。",
+        desc: "把构建产物安装到已授权在线设备并拉起应用，形成设备发现 → 安装 → Ability 启动 → 8 秒状态确认 → Hilog/崩溃取证 → 运行日志监听的闭环。\n参数：{\"hap\":\"<可选 hap 文件路径，相对项目根或绝对路径>\",\"product\":\"<可选产品>\",\"module\":\"<可选模块>\",\"device\":\"<可选设备序列号，缺省默认设备>\"}。hap 缺省时只从最近构建 manifest 选择工程指纹未过期、内容 SHA-256 复验一致、签名结构已验证且有 build 来源的最新 HAP；显式设备同样复验连接、授权与 install/ability/hilog 能力。\n副作用：覆盖安装应用到设备，可能替换现有版本。若本次是首次安装且启动失败，会留存日志后自动卸载并确认恢复；覆盖安装失败会保留应用，避免误删原有安装。\n返回：产物选择、设备、安装、启动、状态、日志与恢复证据。安装失败时返回结构化错误（category：device_offline/signing/version_downgrade/insufficient_storage/incompatible/install_failed）与推荐下一步。不要盲目重复部署。",
     },
     ToolSpec {
         name: "ohpm_install",
@@ -523,7 +523,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "deploy_all",
-        desc: "把同一 HAP 一次性并行部署到所有在线设备（多设备验证）。\n参数：{\"hap\":\"<可选 HAP 路径>\",\"product\":\"<可选产品>\",\"module\":\"<可选模块>\",\"devices\":<可选字符串数组，指定设备序列号；缺省全部在线设备>}。缺省 HAP 使用与 deploy 相同的 manifest 指纹、SHA-256、签名和歧义门禁；有多个产品/模块候选时必须显式确认。\n流程：安全选择 hap → 列出在线设备 → 并行安装、拉起、存活探测、崩溃归因，最后汇总每台设备结果。\n需要在多台真机上同时验证兼容性时使用；单台设备使用 deploy。\n副作用：在多台设备上安装/启动应用。\n返回：产物选择证据与各设备部署结果汇总。",
+        desc: "把同一 HAP 一次性部署到所有满足连接、授权与 install/ability/hilog 能力门禁的设备（多设备验证）。\n参数：{\"hap\":\"<可选 HAP 路径>\",\"product\":\"<可选产品>\",\"module\":\"<可选模块>\",\"devices\":<可选字符串数组，指定设备序列号；缺省全部就绪设备>}。显式设备不能绕过门禁；列表会去重。缺省 HAP 使用与 deploy 相同的 manifest 指纹、SHA-256、签名和歧义门禁。\n流程：安全选择 HAP → 统一发现与复验设备 → 受控并行安装、拉起、存活探测、日志/崩溃取证与安全恢复 → 汇总每台设备结果。\n副作用：在多台设备上安装/启动应用；仅首次安装且启动失败时自动卸载恢复。\n返回：产物选择证据与各设备独立结果汇总。",
     },
     ToolSpec {
         name: "verify_ui",
@@ -551,7 +551,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "start_ability",
-        desc: "启动指定 Ability 或通过 Deep Link 拉起应用特定页面。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"ability\":\"<可选 Ability 名，如 EntryAbility>\"，\"uri\":\"<可选 Deep Link URI，如 myapp://page/settings>\"}。\n显式启动：传 bundle + ability；隐式 Deep Link：传 uri（可省略 bundle）；同时传则以显式 Want 启动并附带 uri 参数。\n适合：部署完想直接跳到某个页面验证、复现特定路由下的 bug、对比不同页面性能等。\n副作用：会切换设备前台应用。\n返回：启动结果与应用是否成功进入前台（aa dump -l 检查）。",
+        desc: "启动指定 Ability 或通过 Deep Link 拉起应用特定页面。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"ability\":\"<可选 Ability 名，如 EntryAbility>\"，\"uri\":\"<可选 Deep Link URI，如 myapp://page/settings>\"}。显式设备会复验在线、授权与 ability 能力。\n显式启动：传 bundle + ability；隐式 Deep Link：传 uri（可省略 bundle）；同时传则以显式 Want 启动并附带 uri 参数。\n副作用：会切换设备前台应用。\n返回：启动命令结果，并在多次 aa dump 观测中确认 bundle 已进入 Ability 栈；未观察到时返回相关 Hilog 证据而不是假报成功。",
     },
     ToolSpec {
         name: "clear_app_data",
@@ -575,7 +575,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "uninstall_app",
-        desc: "卸载设备上的指定应用。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"keep_data\":<可选布尔，true 时保留数据>}。\n基于 bm uninstall -n [-k]。\n适合：清洁环境、重装前卸载旧版本、测试首次安装体验等。\n副作用：应用被卸载，默认数据也删除；确认再调用。\n返回：卸载结果。",
+        desc: "卸载设备上的指定应用并做卸载后状态确认。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"keep_data\":<可选布尔，true 时保留数据>}。显式设备会复验在线、授权与 install 能力；基于 bm uninstall -n [-k]，随后 bm dump 确认应用不再存在并停止该工程旧的运行日志监听。\n适合：清洁环境、重装前卸载旧版本、测试首次安装体验等。\n副作用：应用被卸载，默认数据也删除；确认再调用。\n返回：卸载命令与状态确认结果；仍存在时按失败返回。",
     },
     ToolSpec {
         name: "grant_permission",

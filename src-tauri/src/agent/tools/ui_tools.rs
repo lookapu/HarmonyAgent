@@ -3,6 +3,27 @@
 //! 本模块通过 `use super::*` 继承访问。
 
 use super::*;
+
+async fn resolve_authorized_device(requested: Option<&str>, capability: &str) -> Result<String, String> {
+    let devices = crate::commands::devices::list_devices().await.map_err(|error| format!("无法发现设备：{error}"))?;
+    let selected = if let Some(requested) = requested.map(str::trim).filter(|id| !id.is_empty()) {
+        devices.iter().find(|device| device.id == requested).ok_or_else(|| format!("未发现指定设备 {requested}；请调用 list_devices 刷新设备状态。"))?
+    } else {
+        devices
+            .iter()
+            .find(|device| device.is_default && device.connection == "online" && device.authorized)
+            .or_else(|| devices.iter().find(|device| device.connection == "online" && device.authorized))
+            .ok_or_else(|| "未检测到已授权在线设备，请连接设备并确认调试授权".to_string())?
+    };
+    if selected.connection != "online" || !selected.authorized {
+        return Err(format!("设备 {} 当前不可操作（raw={} connection={} authorized={}）", selected.id, selected.state, selected.connection, selected.authorized));
+    }
+    if !selected.capabilities.iter().any(|available| available == capability) {
+        return Err(format!("设备 {} 缺少 {capability} 能力", selected.id));
+    }
+    Ok(selected.id.clone())
+}
+
 /// 性能基准快照（同设备同应用对比用）。
 #[derive(Clone)]
 struct BenchSnapshot {
@@ -409,10 +430,7 @@ pub(super) fn unescape_json(s: &str) -> String {
 
 /// start_ability：显式或隐式拉起 Ability。
 pub(super) async fn start_ability(args: &Value, roots: &[String]) -> Result<String, String> {
-    let device = match args["device"].as_str() {
-        Some(d) => d.to_string(),
-        None => default_device_id().await?,
-    };
+    let device = resolve_authorized_device(args["device"].as_str(), "ability").await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -451,15 +469,27 @@ pub(super) async fn start_ability(args: &Value, roots: &[String]) -> Result<Stri
     let out = run_hdc_shell(&device, &cmd, 20).await
         .map_err(|e| format!("启动 Ability 失败：{e}"))?;
 
-    tokio::time::sleep(Duration::from_millis(800)).await;
-
-    // 验证是否进入前台
-    let foreground = match run_hdc_shell(&device, &["aa", "dump", "-l"], 10).await {
-        Ok(dump) => {
-            dump.lines().any(|l| l.contains(&bundle) && l.contains("foreground"))
+    // 状态确认：显式 bundle 必须在多次 Ability 栈观测中至少出现一次。
+    let mut observed = bundle.is_empty();
+    let mut foreground = false;
+    for wait in [800u64, 1200, 2000] {
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        if let Ok(dump) = run_hdc_shell(&device, &["aa", "dump", "-l"], 10).await {
+            if bundle.is_empty() || dump.contains(&bundle) { observed = true; }
+            if dump.lines().any(|line| line.contains(&bundle) && line.contains("foreground")) {
+                foreground = true;
+                break;
+            }
         }
-        Err(_) => false,
-    };
+    }
+    if !observed {
+        let hilog = run_hdc_shell(&device, &["hilog", "-x"], 25).await.unwrap_or_default();
+        let evidence = hilog.lines().filter(|line| line.contains(&bundle)).collect::<Vec<_>>().join("\n");
+        return Err(format!(
+            "Ability 启动命令已返回，但状态确认未观察到 {bundle}。\n日志证据：{}",
+            if evidence.is_empty() { "（未捕获到相关 hilog）".to_string() } else { tail(&evidence, 1200) }
+        ));
+    }
 
     let mut report = format!("启动 Ability（设备 {device}）\n");
     if !bundle.is_empty() { report.push_str(&format!("包名：{bundle}\n")); }
@@ -741,10 +771,7 @@ pub(super) fn extract_json_num(text: &str, field: &str) -> Option<String> {
 
 /// uninstall_app：卸载应用。
 pub(super) async fn uninstall_app(args: &Value, roots: &[String]) -> Result<String, String> {
-    let device = match args["device"].as_str() {
-        Some(d) => d.to_string(),
-        None => default_device_id().await?,
-    };
+    let device = resolve_authorized_device(args["device"].as_str(), "install").await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -768,7 +795,16 @@ pub(super) async fn uninstall_app(args: &Value, roots: &[String]) -> Result<Stri
     let out = run_hdc_shell(&device, &args, 30).await
         .map_err(|e| format!("卸载失败：{e}"))?;
 
-    Ok(format!("卸载完成（设备 {device}，包名 {bundle}，保留数据：{keep_data}）\n结果：{}", out.trim()))
+    let still_installed = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 20).await
+        .is_ok_and(|dump| dump.contains(&bundle) && !dump.contains("not found"));
+    if still_installed {
+        return Err(format!("卸载命令已返回，但状态确认仍显示 {bundle} 已安装。结果：{}", out.trim()));
+    }
+    if !project_path.is_empty() {
+        crate::agent::runtime_log::stop(project_path);
+    }
+
+    Ok(format!("卸载完成并已确认应用不存在（设备 {device}，包名 {bundle}，保留数据：{keep_data}）\n结果：{}", out.trim()))
 }
 
 /// grant_permission：授予权限。

@@ -675,6 +675,103 @@ fn resolve_hap_for_deploy(args: &Value, root: &Path) -> Result<(String, bool, St
     ))
 }
 
+fn ensure_deploy_device_ready(device: &crate::commands::devices::DeviceInfo) -> Result<(), String> {
+    if device.connection != "online" || !device.authorized {
+        return Err(format!(
+            "设备 {} 当前不可部署（raw={} connection={} authorized={}）。请先调用 list_devices 恢复连接与调试授权。",
+            device.id, device.state, device.connection, device.authorized
+        ));
+    }
+    let missing: Vec<&str> = ["install", "ability", "hilog"]
+        .into_iter()
+        .filter(|capability| {
+            !device
+                .capabilities
+                .iter()
+                .any(|available| available == capability)
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "设备 {} 缺少部署闭环能力：{}。请检查系统工具与调试权限。",
+            device.id,
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_deploy_device(requested: Option<&str>) -> Result<String, String> {
+    let devices = crate::commands::devices::list_devices()
+        .await
+        .map_err(|error| format!("无法发现设备：{error}"))?;
+    let selected = if let Some(requested) = requested.map(str::trim).filter(|id| !id.is_empty()) {
+        devices
+            .iter()
+            .find(|device| device.id == requested)
+            .ok_or_else(|| {
+                format!("未发现指定设备 {requested}；请调用 list_devices 刷新设备状态。")
+            })?
+    } else {
+        devices
+            .iter()
+            .find(|device| device.is_default && device.connection == "online" && device.authorized)
+            .or_else(|| {
+                devices
+                    .iter()
+                    .find(|device| device.connection == "online" && device.authorized)
+            })
+            .ok_or_else(|| "未检测到已授权在线设备，请连接设备并确认调试授权".to_string())?
+    };
+    ensure_deploy_device_ready(selected)?;
+    Ok(selected.id.clone())
+}
+
+async fn recover_fresh_install(device_id: &str, bundle: &str) -> String {
+    if bundle.is_empty() {
+        return "恢复：无法确定 bundleName，未执行自动卸载。".into();
+    }
+    match run_hdc_shell(device_id, &["bm", "uninstall", "-n", bundle], 30).await {
+        Ok(output) => {
+            let still_installed = run_hdc_shell(device_id, &["bm", "dump", "-n", bundle], 20)
+                .await
+                .is_ok_and(|dump| dump.contains(bundle) && !dump.contains("not found"));
+            if still_installed {
+                format!(
+                    "恢复失败：已请求卸载本次新装的 {bundle}，但状态确认仍显示已安装。输出：{}",
+                    tail(&output, 200)
+                )
+            } else {
+                format!("恢复完成：已卸载本次新装的 {bundle}，并确认设备不再报告该应用。")
+            }
+        }
+        Err(error) => format!("恢复失败：无法卸载本次新装的 {bundle}：{error}"),
+    }
+}
+
+fn should_recover_fresh_install(already_installed: bool) -> bool {
+    !already_installed
+}
+
+async fn start_failure_evidence(device_id: &str, bundle: &str) -> String {
+    let hilog = run_hdc_shell(device_id, &["hilog", "-x"], 25)
+        .await
+        .unwrap_or_default();
+    let relevant = hilog
+        .lines()
+        .filter(|line| bundle.is_empty() || line.contains(bundle))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tail(
+        if relevant.is_empty() {
+            &hilog
+        } else {
+            &relevant
+        },
+        1200,
+    )
+}
+
 pub(super) async fn deploy(
     args: &Value,
     roots: &[String],
@@ -695,11 +792,7 @@ pub(super) async fn deploy(
     let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
 
     // 1. 选择设备：优先参数指定，否则取默认设备记忆 / 第一个在线设备
-    let device_id = if let Some(d) = args["device"].as_str() {
-        d.to_string()
-    } else {
-        default_device_id().await?
-    };
+    let device_id = resolve_deploy_device(args["device"].as_str()).await?;
     // per-device 门控：与 deploy_all 中同设备的任务互斥，不同设备不阻塞
     let _dev_gate =
         crate::services::tool_limits::acquire_named_gate(&format!("deploy:{device_id}")).await;
@@ -817,13 +910,31 @@ pub(super) async fn deploy(
     };
     let ability = info.main_element.as_deref().unwrap_or("EntryAbility");
     ctx.emit_log("system", &format!("拉起应用: {bundle}/{ability}"));
-    let start = run_hdc_shell(
+    let start = match run_hdc_shell(
         &device_id,
         &["aa", "start", "-b", bundle, "-a", ability],
         30,
     )
     .await
-    .map_err(|e| format!("拉起失败: {e}"))?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let evidence = start_failure_evidence(&device_id, bundle).await;
+            let recovery = if should_recover_fresh_install(already_installed) {
+                recover_fresh_install(&device_id, bundle).await
+            } else {
+                "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
+            };
+            return Err(format!(
+                "拉起失败: {error}\n日志证据:\n{}\n{recovery}",
+                if evidence.is_empty() {
+                    "（未捕获到相关 hilog）"
+                } else {
+                    &evidence
+                }
+            ));
+        }
+    };
     out.push_str(&format!("\n拉起应用: aa start -b {bundle} -a {ability}\n"));
     out.push_str(&start);
 
@@ -957,6 +1068,13 @@ pub(super) async fn deploy(
             &matched,
         );
         out.push_str(&err);
+        out.push('\n');
+        if should_recover_fresh_install(already_installed) {
+            out.push_str(&recover_fresh_install(&device_id, bundle).await);
+            out.push('\n');
+        } else {
+            out.push_str("恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。\n");
+        }
         return Err(out);
     }
     // 记住本次使用的设备
@@ -986,19 +1104,36 @@ pub(super) async fn deploy_all(
         .clone()
         .unwrap_or_else(|| "EntryAbility".to_string());
 
-    // 解析目标设备列表
-    let devices: Vec<String> = if let Some(arr) = args["devices"].as_array() {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect()
-    } else if let Ok(devs) = crate::commands::devices::list_devices().await {
-        devs.iter()
-            .filter(|d| is_device_online(&d.state))
-            .map(|d| d.id.clone())
-            .collect()
+    // 解析并复验目标设备列表；显式设备也不能绕过连接、授权与能力门禁。
+    let snapshots = crate::commands::devices::list_devices()
+        .await
+        .map_err(|error| format!("无法发现设备：{error}"))?;
+    let mut devices: Vec<String> = if let Some(arr) = args["devices"].as_array() {
+        let mut selected = Vec::new();
+        for requested in arr.iter().filter_map(Value::as_str) {
+            let requested = requested.trim();
+            if requested.is_empty() {
+                continue;
+            }
+            let snapshot = snapshots
+                .iter()
+                .find(|device| device.id == requested)
+                .ok_or_else(|| {
+                    format!("未发现指定设备 {requested}；请调用 list_devices 刷新设备状态。")
+                })?;
+            ensure_deploy_device_ready(snapshot)?;
+            selected.push(snapshot.id.clone());
+        }
+        selected
     } else {
-        Vec::new()
+        snapshots
+            .iter()
+            .filter(|device| ensure_deploy_device_ready(device).is_ok())
+            .map(|device| device.id.clone())
+            .collect()
     };
+    devices.sort();
+    devices.dedup();
     if devices.is_empty() {
         return Err(
             "没有可用的在线设备。请连接设备并开启 USB 调试，或用 list_devices 查看。".into(),
@@ -1140,9 +1275,24 @@ pub(super) async fn deploy_one_device(
     }
 
     // 拉起
-    run_hdc_shell(device_id, &["aa", "start", "-b", bundle, "-a", ability], 30)
-        .await
-        .map_err(|e| format!("拉起失败: {e}"))?;
+    if let Err(error) =
+        run_hdc_shell(device_id, &["aa", "start", "-b", bundle, "-a", ability], 30).await
+    {
+        let evidence = start_failure_evidence(device_id, bundle).await;
+        let recovery = if should_recover_fresh_install(already_installed) {
+            recover_fresh_install(device_id, bundle).await
+        } else {
+            "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
+        };
+        return Err(format!(
+            "拉起失败: {error}；日志证据: {}；{recovery}",
+            if evidence.is_empty() {
+                "（未捕获到相关 hilog）"
+            } else {
+                &evidence
+            }
+        ));
+    }
 
     // 存活探测
     let mut alive = false;
@@ -1197,8 +1347,13 @@ pub(super) async fn deploy_one_device(
                     .unwrap_or(0),
             },
         );
+        let recovery = if should_recover_fresh_install(already_installed) {
+            recover_fresh_install(device_id, bundle).await
+        } else {
+            "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
+        };
         Err(format!(
-            "启动后崩溃 [{}]: {}",
+            "启动后崩溃 [{}]: {}；{recovery}",
             report.category,
             tail(&report.summary, 200)
         ))
@@ -1750,6 +1905,35 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
 mod build_workflow_tests {
     use super::*;
 
+    fn device(
+        connection: &str,
+        authorized: bool,
+        capabilities: &[&str],
+    ) -> crate::commands::devices::DeviceInfo {
+        crate::commands::devices::DeviceInfo {
+            id: "device-1".into(),
+            state: if authorized {
+                "Connected"
+            } else {
+                "Unauthorized"
+            }
+            .into(),
+            model: String::new(),
+            os_version: String::new(),
+            connection: connection.into(),
+            authorized,
+            api_level: Some(18),
+            architecture: "arm64-v8a".into(),
+            resolution: "1080x2400".into(),
+            capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            observed_at: 1,
+            is_default: false,
+        }
+    }
+
     #[test]
     fn build_request_validates_dependency_policy() {
         let root = std::env::temp_dir().join(format!("build-request-{}", std::process::id()));
@@ -1772,5 +1956,27 @@ mod build_workflow_tests {
                 .is_err()
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn deploy_requires_online_authorized_device_capabilities() {
+        let ready = device("online", true, &["shell", "install", "ability", "hilog"]);
+        assert!(ensure_deploy_device_ready(&ready).is_ok());
+
+        let offline = device("offline", false, &[]);
+        assert!(ensure_deploy_device_ready(&offline)
+            .unwrap_err()
+            .contains("不可部署"));
+
+        let incomplete = device("online", true, &["shell", "install"]);
+        let error = ensure_deploy_device_ready(&incomplete).unwrap_err();
+        assert!(error.contains("ability"));
+        assert!(error.contains("hilog"));
+    }
+
+    #[test]
+    fn recovery_only_removes_an_app_created_by_this_deploy() {
+        assert!(should_recover_fresh_install(false));
+        assert!(!should_recover_fresh_install(true));
     }
 }
