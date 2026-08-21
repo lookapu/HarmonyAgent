@@ -71,6 +71,7 @@
 - 副作用工具采用 prepared → running/verifying → committed 语义；同 Run 的重复副作用按幂等键阻止，迟到结果按 lease fencing 丢弃。
 - 实际工具 future 迁到命名专用 OS 线程执行；线程 panic 由 `catch_unwind` 隔离，不拖垮主进程。
 - 调用方超时/取消但线程仍运行时标记 stuck，后台同时扫描租约过期调用；控制面新增 `stuck_tools` 指标和 Worker 线程身份。
+- 增加卡死线程、不可取消迟到结果、输出洪泛和真实孤儿进程隔离测试；Unix 进程树清理先允许包装器回收已终止子进程，再兜底强杀，避免遗留僵尸 PID。
 - 新增工具线程 panic、进程崩溃、副作用恢复与重复执行防护 E2E。
 
 ### 可靠性控制面与质量门禁

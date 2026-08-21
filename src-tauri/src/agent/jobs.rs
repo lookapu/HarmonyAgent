@@ -670,6 +670,127 @@ mod tests {
     }
 
     #[test]
+    fn output_flood_stays_bounded_and_preserves_latest_evidence() {
+        let job = Arc::new(Mutex::new(Job {
+            conversation_id: "flood".into(),
+            command: "noisy-command".into(),
+            cwd: PathBuf::from("."),
+            pid: None,
+            output: String::new(),
+            status: JobStatus::Running,
+            ok: false,
+            summary: None,
+            created_at: now_ms(),
+            finished_at: None,
+        }));
+        append_output(&job, "first-evidence-must-be-evicted");
+        for i in 0..60_000 {
+            append_output(&job, &format!("flood-line-{i:05}-xxxxxxxxxxxxxxxx"));
+        }
+        append_output(&job, "latest-evidence-must-survive");
+
+        let output = &job.lock().unwrap().output;
+        assert!(
+            output.len() <= JOB_OUTPUT_CAP * 2,
+            "输出洪泛不得突破有界缓冲：len={}",
+            output.len()
+        );
+        assert!(!output.contains("first-evidence-must-be-evicted"));
+        assert!(output.ends_with("latest-evidence-must-survive\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conversation_cleanup_kills_parent_and_orphan_candidate() {
+        fn process_signalable(pid: u32) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+
+        fn process_present(pid: u32) -> bool {
+            std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+                .unwrap_or(false)
+        }
+
+        fn process_snapshot(parent_pid: u32, child_pid: u32) -> String {
+            std::process::Command::new("ps")
+                .args([
+                    "-o",
+                    "pid=,ppid=,stat=,command=",
+                    "-p",
+                    &format!("{parent_pid},{child_pid}"),
+                ])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default()
+        }
+
+        let conversation_id = format!("orphan-isolation-{}", uuid::Uuid::new_v4());
+        let ctx = ToolCtx {
+            app: None,
+            conversation_id: conversation_id.clone(),
+            run_id: "tc-17".into(),
+            spawn_remaining: 0,
+        };
+        let job_id = start_background(
+            "sh".into(),
+            vec!["-c".into(), "sleep 30 & child=$!; echo $child; wait".into()],
+            "spawn-child-and-wait".into(),
+            std::env::temp_dir(),
+            30,
+            &ctx,
+            None,
+        )
+        .unwrap();
+
+        let mut observed = None;
+        for _ in 0..100 {
+            let job = find_job(&conversation_id, &job_id).unwrap();
+            let snapshot = job.lock().unwrap();
+            let child_pid = snapshot
+                .output
+                .lines()
+                .find_map(|line| line.trim().parse::<u32>().ok());
+            if let (Some(parent_pid), Some(child_pid)) = (snapshot.pid, child_pid) {
+                observed = Some((parent_pid, child_pid));
+                break;
+            }
+            drop(snapshot);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let (parent_pid, child_pid) = observed.expect("应观察到包装器和直接子进程 PID");
+        assert!(process_signalable(parent_pid));
+        assert!(process_signalable(child_pid));
+
+        drop_conversation_jobs(&conversation_id);
+        let mut both_stopped = false;
+        for _ in 0..150 {
+            if !process_present(parent_pid) && !process_present(child_pid) {
+                both_stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            both_stopped,
+            "会话清理后父进程与子进程均不得残留：{}",
+            process_snapshot(parent_pid, child_pid)
+        );
+        assert!(list_jobs(&conversation_id).is_empty());
+    }
+
+    #[test]
     fn finish_is_idempotent_and_status_transitions() {
         let job = Arc::new(Mutex::new(Job {
             conversation_id: "c".into(),

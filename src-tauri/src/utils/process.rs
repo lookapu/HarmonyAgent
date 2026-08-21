@@ -564,10 +564,14 @@ pub fn kill_tree(pid: Option<u32>) {
     #[cfg(not(windows))]
     {
         // macOS/Linux 同样可能有 shell/node/hvigor 孙进程继续持有管道。先终止直接
-        // 子进程，再终止包装器本身；通过 sh 顺序执行，避免父进程先死后子进程被
-        // reparent 导致 `pkill -P` 再也找不到。pkill 不存在/无匹配时仍继续 kill 父进程。
+        // 子进程，并给包装器一个很短的 wait/reap 窗口；包装器未自行退出时再兜底终止。
+        // 若同时 SIGKILL 子进程和包装器，子进程可能在无人及时 wait 的环境里残留僵尸 PID。
+        // pkill 不存在/无匹配时仍继续 kill 父进程。
         let script = format!(
-            "pkill -KILL -P {pid} >/dev/null 2>&1 || true; kill -KILL {pid} >/dev/null 2>&1 || true"
+            "pkill -KILL -P {pid} >/dev/null 2>&1 || true; \
+             attempt=0; while kill -0 {pid} >/dev/null 2>&1 && [ $attempt -lt 20 ]; do \
+             sleep 0.01; attempt=$((attempt + 1)); done; \
+             kill -KILL {pid} >/dev/null 2>&1 || true"
         );
         let _ = std::process::Command::new("sh")
             .args(["-c", &script])

@@ -778,6 +778,116 @@ mod tests {
     }
 
     #[test]
+    fn hung_execution_lane_times_out_without_blocking_caller() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut lane = spawn_execution(
+                "hung",
+                "run_command",
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    Ok("eventually-finished".to_string())
+                },
+                None,
+            );
+            let started = std::time::Instant::now();
+            let err = lane
+                .await_result(std::time::Duration::from_millis(15))
+                .await
+                .unwrap_err();
+            assert!(err.contains("超时"), "{err}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "卡死执行线程不应阻塞调用方"
+            );
+            assert!(!lane.is_finished(), "超时时执行线程仍应被隔离在后台");
+            assert_eq!(
+                lane.await_result(std::time::Duration::from_secs(2))
+                    .await
+                    .unwrap(),
+                "eventually-finished"
+            );
+        });
+    }
+
+    #[test]
+    fn uncancellable_late_result_is_fenced_after_recovery() {
+        let db_arc = std::sync::Arc::new(std::sync::Mutex::new(db()));
+        register_current_worker(&db_arc.lock().unwrap()).unwrap();
+        db_arc
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO tool_runs(id,status,recovery_policy,trace_id,idempotency_key,effect_kind)
+                 VALUES('late','prepared','verify','r','late-key','write')",
+                [],
+            )
+            .unwrap();
+        start_attempt(&db_arc.lock().unwrap(), "late", 30_000)
+            .unwrap()
+            .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut lane = spawn_execution(
+                "late",
+                "edit_file",
+                async {
+                    // 模拟忽略协作式取消、最终仍返回结果的第三方/阻塞工具。
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    Ok("late-side-effect-result".to_string())
+                },
+                Some(db_arc.clone()),
+            );
+            assert!(lane
+                .await_result(std::time::Duration::from_millis(15))
+                .await
+                .unwrap_err()
+                .contains("超时"));
+            assert!(mark_stuck(&db_arc.lock().unwrap(), "late").unwrap());
+            db_arc
+                .lock()
+                .unwrap()
+                .execute("UPDATE tool_execution_workers SET last_heartbeat_at=0", [])
+                .unwrap();
+            db_arc
+                .lock()
+                .unwrap()
+                .execute("UPDATE tool_runs SET lease_expires_at=0", [])
+                .unwrap();
+            assert_eq!(recover_stale(&db_arc.lock().unwrap(), 30_000).unwrap(), 1);
+
+            assert_eq!(
+                lane.await_result(std::time::Duration::from_secs(2))
+                    .await
+                    .unwrap(),
+                "late-side-effect-result"
+            );
+            assert!(
+                !finish_owned(
+                    &db_arc.lock().unwrap(),
+                    "late",
+                    "ok",
+                    Some("late-digest"),
+                    None
+                )
+                .unwrap(),
+                "恢复完成后，失去租约的迟到结果不得提交"
+            );
+        });
+        let conn = db_arc.lock().unwrap();
+        let (status, verification): (String, String) = conn
+            .query_row(
+                "SELECT status,verification_state FROM tool_runs WHERE id='late'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "verification_required");
+        assert_eq!(verification, "required");
+    }
+
+    #[test]
     fn panicked_execution_thread_is_isolated_and_reported() {
         let db_arc = std::sync::Arc::new(std::sync::Mutex::new(db()));
         register_current_worker(&db_arc.lock().unwrap()).unwrap();
