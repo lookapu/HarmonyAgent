@@ -147,6 +147,14 @@ pub struct Skill {
     pub subdir: Option<String>,
     pub enabled: bool,
     pub content_hash: Option<String>,
+    /// 0=legacy/unversioned, 1=HarmonyAgent Skill manifest v1.
+    pub manifest_schema: i64,
+    pub skill_version: String,
+    pub agent_compat: Option<String>,
+    /// JSON string array of declared permission identifiers.
+    pub permissions_json: String,
+    /// compatible | incompatible | legacy_unverified.
+    pub compatibility_status: String,
     pub installed_at: i64,
     pub updated_at: Option<i64>,
     /// 作用域：NULL=用户级（全局，对所有项目生效）；非空=仅该项目生效

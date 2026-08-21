@@ -695,7 +695,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "use_skill",
-        desc: "声明正在使用某个 Skill 并记录一次调用，返回该技能的完整指令（SKILL.md）。\n参数：{\"name\":\"<技能名>\"}（与技能管理页展示的名称一致，同名时项目级技能优先）。\n用法：系统提示的技能库中出现、且当前任务适用该技能时，先调用本工具声明，再严格按返回的指令执行；调用后该技能计入调用统计。\n副作用：写入一条技能调用记录（skill_usage 表，供技能管理页/统计页展示）。\n返回：技能描述与完整指令；技能未安装或未启用时返回错误（可在技能管理页启用）。",
+        desc: "声明正在使用某个 Skill，复验清单版本、Agent 兼容范围、权限声明和 SKILL.md 内容哈希后记录调用并返回完整指令。\n参数：{\"name\":\"<技能名>\"}（与技能管理页展示的名称一致，同名时项目级技能优先）。\n用法：系统提示的技能库中出现、且当前任务适用该技能时，先调用本工具声明，再严格按返回的指令执行；Skill 声明不能扩大工具权限，实际调用仍受项目、阶段和审批护栏约束。旧格式 Skill 标记 legacy_unverified；不兼容或导入后内容漂移的 Skill 拒绝执行。\n副作用：校验通过后写入一条技能调用记录（skill_usage 表，供技能管理页/统计页展示）。\n返回：版本、兼容状态、声明权限和完整指令；技能未安装、未启用、不兼容或哈希漂移时返回错误。",
     },
     ToolSpec {
         name: "plan_task",
@@ -5227,6 +5227,11 @@ mod tests {
             subdir: None,
             enabled: true,
             content_hash: None,
+            manifest_schema: 0,
+            skill_version: "0.0.0".into(),
+            agent_compat: None,
+            permissions_json: "[]".into(),
+            compatibility_status: "legacy_unverified".into(),
             installed_at: 0,
             updated_at: None,
             project_id: project_id.map(|s| s.to_string()),

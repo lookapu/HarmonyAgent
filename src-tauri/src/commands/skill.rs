@@ -226,17 +226,13 @@ pub async fn import_skill_from_github(
             break;
         }
     }
-    let (meta_name, meta_desc) = if let Some(p) = skill_md_path {
-        match std::fs::read_to_string(&p) {
-            Ok(content) => {
-                let (n, d) = parse_skill_meta(&content);
-                (n, d)
-            }
-            Err(_) => (None, None),
-        }
-    } else {
-        (None, None)
-    };
+    let skill_md_path = skill_md_path.ok_or_else(|| {
+        format!("技能目录缺少 SKILL.md：{}", skill_root.display())
+    })?;
+    let skill_content = std::fs::read_to_string(&skill_md_path)
+        .map_err(|e| format!("读取 SKILL.md 失败 {}：{e}", skill_md_path.display()))?;
+    let (meta_name, meta_desc) = parse_skill_meta(&skill_content);
+    let manifest = crate::services::skill_manifest::parse_and_validate(&skill_content)?;
 
     let skill_name = meta_name.unwrap_or_else(|| name.clone());
     let description = meta_desc.or_else(|| Some(format!("{host}/{owner}/{name} 仓库中安装的 Skill")));
@@ -253,6 +249,13 @@ pub async fn import_skill_from_github(
         s.directory = Some(directory);
         s.repo_host = Some(host.clone());
         s.repo_branch = actual_branch.clone();
+        s.content_hash = Some(manifest.content_hash.clone());
+        s.manifest_schema = manifest.schema;
+        s.skill_version = manifest.version.clone();
+        s.agent_compat = manifest.agent_compat.clone();
+        s.permissions_json = serde_json::to_string(&manifest.permissions).map_err(|e| e.to_string())?;
+        s.compatibility_status = manifest.compatibility_status.clone();
+        s.enabled = manifest.compatibility_status != "incompatible";
         s.updated_at = Some(now);
         queries::update_skill(&conn, &s).map_err(|e| e.to_string())?;
         s
@@ -267,8 +270,13 @@ pub async fn import_skill_from_github(
             repo_host: Some(host.clone()),
             repo_branch: actual_branch.clone(),
             subdir: if subdir.is_empty() { None } else { Some(subdir.clone()) },
-            enabled: true,
-            content_hash: None,
+            enabled: manifest.compatibility_status != "incompatible",
+            content_hash: Some(manifest.content_hash.clone()),
+            manifest_schema: manifest.schema,
+            skill_version: manifest.version.clone(),
+            agent_compat: manifest.agent_compat.clone(),
+            permissions_json: serde_json::to_string(&manifest.permissions).map_err(|e| e.to_string())?,
+            compatibility_status: manifest.compatibility_status.clone(),
             installed_at: now,
             updated_at: None,
             project_id: input.project_id.clone(),
@@ -339,6 +347,16 @@ pub fn list_skills(db: State<DbState>, project_id: Option<String>) -> Result<Vec
 #[tauri::command]
 pub fn toggle_skill(db: State<DbState>, id: String, enabled: bool) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    if enabled {
+        let skill = queries::get_skill(&conn, &id).map_err(|e| e.to_string())?;
+        if skill.compatibility_status == "incompatible" {
+            return Err(format!(
+                "Skill「{}」与当前 HarmonyAgent {} 不兼容，不能启用",
+                skill.name,
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
+    }
     conn.execute(
         "UPDATE skills SET enabled = ?2 WHERE id = ?1",
         rusqlite::params![id, enabled],

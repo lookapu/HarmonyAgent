@@ -13,6 +13,13 @@ export interface Skill {
   subdir: string | null
   enabled: boolean
   content_hash: string | null
+  /** HarmonyAgent Skill manifest schema；0 表示旧格式、未验证。 */
+  manifest_schema: number
+  skill_version: string
+  agent_compat: string | null
+  /** JSON 数组字符串，例如 ["project.read","project.write"]。 */
+  permissions_json: string
+  compatibility_status: 'compatible' | 'incompatible' | 'legacy_unverified'
   installed_at: number
   updated_at: number | null
   /** 作用域：null=用户级(全局，对所有项目生效)；非空=仅该项目生效 */

@@ -128,8 +128,12 @@ export default function SkillsPage() {
   }
 
   const handleToggle = async (id: string, enabled: boolean) => {
-    await toggleSkill(id, !enabled)
-    load()
+    try {
+      await toggleSkill(id, !enabled)
+      load()
+    } catch (e) {
+      setError(String(e))
+    }
   }
 
   const handleRemove = async (id: string, name: string) => {
@@ -372,6 +376,9 @@ export default function SkillsPage() {
                 <span className={`text-xs px-2 py-0.5 rounded ${s.enabled ? 'bg-[var(--success)] text-white' : 'bg-[var(--bg-card)] text-[var(--text-secondary)]'}`}>
                   {s.enabled ? t('skill.enabled') : t('skill.disabled')}
                 </span>
+                <span className="text-[10px] px-2 py-0.5 rounded bg-[var(--bg-card)] text-[var(--text-secondary)] font-mono">
+                  v{s.skill_version} · {s.compatibility_status}
+                </span>
               </div>
               {s.description && <p className="text-xs text-[var(--text-secondary)] mt-1">{s.description}</p>}
               {s.repo_owner && (
@@ -389,6 +396,8 @@ export default function SkillsPage() {
             <div className="flex items-center gap-2 shrink-0">
               <button
                 onClick={() => handleToggle(s.id, s.enabled)}
+                disabled={!s.enabled && s.compatibility_status === 'incompatible'}
+                title={s.agent_compat ? `HarmonyAgent ${s.agent_compat} · ${s.permissions_json}` : s.compatibility_status}
                 className="px-3 py-1 text-xs border border-[var(--border)] rounded hover:bg-[var(--bg-card)] transition-colors"
               >
                 {s.enabled ? t('skill.disable') : t('skill.enable')}
@@ -582,7 +591,6 @@ function SkillUsageView({
     </div>
   )
 }
-
 
 
 

@@ -322,13 +322,24 @@ pub fn skill_hint(skills: &[crate::db::models::Skill]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for s in unique.iter().take(8) {
         let mut block = format!(
-            "【{}】{}",
+            "【{} v{} | {}】{}",
             s.name,
+            s.skill_version,
+            s.compatibility_status,
             s.description.as_deref().unwrap_or("")
         );
         if let Some(dir) = &s.directory {
             if let Some(content) = read_skill_md(dir) {
-                block.push_str(&format!("\n指令内容：\n{}", truncate_chars(&content, 3000)));
+                let validated = crate::services::skill_manifest::parse_and_validate(&content).ok();
+                let hash_matches = validated.as_ref().is_some_and(|manifest| {
+                    manifest.compatibility_status != "incompatible"
+                        && s.content_hash.as_deref().is_none_or(|hash| hash == manifest.content_hash)
+                });
+                if hash_matches {
+                    block.push_str(&format!("\n指令内容：\n{}", truncate_chars(&content, 3000)));
+                } else {
+                    block.push_str("\n指令内容未注入：清单不兼容、无效或导入后内容哈希漂移，请重新审核导入。");
+                }
             }
         }
         parts.push(block);

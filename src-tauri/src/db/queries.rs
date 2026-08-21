@@ -293,7 +293,8 @@ pub fn delete_mcp_server(conn: &Connection, id: &str) -> Result<(), rusqlite::Er
 pub fn list_skills(conn: &Connection, project_id: Option<&str>) -> Result<Vec<Skill>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id, name, description, directory, repo_owner, repo_name, repo_host, repo_branch,
-                subdir, enabled, content_hash, installed_at, updated_at, project_id
+                subdir, enabled, content_hash, manifest_schema, skill_version, agent_compat,
+                permissions_json, compatibility_status, installed_at, updated_at, project_id
          FROM skills
          WHERE project_id IS NULL OR (?1 IS NOT NULL AND project_id = ?1)
          ORDER BY project_id IS NOT NULL, name"
@@ -312,9 +313,14 @@ pub fn list_skills(conn: &Connection, project_id: Option<&str>) -> Result<Vec<Sk
             subdir: row.get(8)?,
             enabled: row.get(9)?,
             content_hash: row.get(10)?,
-            installed_at: row.get(11)?,
-            updated_at: row.get(12)?,
-            project_id: row.get(13)?,
+            manifest_schema: row.get(11)?,
+            skill_version: row.get(12)?,
+            agent_compat: row.get(13)?,
+            permissions_json: row.get(14)?,
+            compatibility_status: row.get(15)?,
+            installed_at: row.get(16)?,
+            updated_at: row.get(17)?,
+            project_id: row.get(18)?,
         })
     })?;
 
@@ -325,7 +331,8 @@ pub fn list_skills(conn: &Connection, project_id: Option<&str>) -> Result<Vec<Sk
 pub fn find_skill_by_repo(conn: &Connection, host: &str, owner: &str, name: &str, subdir: &str, project_id: Option<&str>) -> Result<Option<Skill>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id, name, description, directory, repo_owner, repo_name, repo_host, repo_branch,
-                subdir, enabled, content_hash, installed_at, updated_at, project_id
+                subdir, enabled, content_hash, manifest_schema, skill_version, agent_compat,
+                permissions_json, compatibility_status, installed_at, updated_at, project_id
          FROM skills WHERE IFNULL(repo_host, 'github') = ?1 AND repo_owner = ?2 AND repo_name = ?3 AND IFNULL(subdir, '') = ?4
            AND (?5 IS NULL AND project_id IS NULL OR project_id = ?5)",
     )?;
@@ -342,9 +349,14 @@ pub fn find_skill_by_repo(conn: &Connection, host: &str, owner: &str, name: &str
             subdir: row.get(8)?,
             enabled: row.get(9)?,
             content_hash: row.get(10)?,
-            installed_at: row.get(11)?,
-            updated_at: row.get(12)?,
-            project_id: row.get(13)?,
+            manifest_schema: row.get(11)?,
+            skill_version: row.get(12)?,
+            agent_compat: row.get(13)?,
+            permissions_json: row.get(14)?,
+            compatibility_status: row.get(15)?,
+            installed_at: row.get(16)?,
+            updated_at: row.get(17)?,
+            project_id: row.get(18)?,
         })
     })?;
     rows.next().transpose()
@@ -353,8 +365,9 @@ pub fn find_skill_by_repo(conn: &Connection, host: &str, owner: &str, name: &str
 pub fn insert_skill(conn: &Connection, s: &Skill) -> Result<(), rusqlite::Error> {
     conn.execute(
         "INSERT INTO skills (id, name, description, directory, repo_owner, repo_name, repo_host, repo_branch,
-                subdir, enabled, content_hash, installed_at, updated_at, project_id)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                subdir, enabled, content_hash, manifest_schema, skill_version, agent_compat,
+                permissions_json, compatibility_status, installed_at, updated_at, project_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
         params![
             s.id,
             s.name,
@@ -367,6 +380,11 @@ pub fn insert_skill(conn: &Connection, s: &Skill) -> Result<(), rusqlite::Error>
             s.subdir,
             s.enabled as i64,
             s.content_hash,
+            s.manifest_schema,
+            s.skill_version,
+            s.agent_compat,
+            s.permissions_json,
+            s.compatibility_status,
             s.installed_at,
             s.updated_at,
             s.project_id,
@@ -378,8 +396,12 @@ pub fn insert_skill(conn: &Connection, s: &Skill) -> Result<(), rusqlite::Error>
 pub fn update_skill(conn: &Connection, s: &Skill) -> Result<(), rusqlite::Error> {
     conn.execute(
         "UPDATE skills SET name = ?2, description = ?3, directory = ?4, repo_branch = ?5,
-                subdir = ?6, updated_at = ?7 WHERE id = ?1",
-        params![s.id, s.name, s.description, s.directory, s.repo_branch, s.subdir, s.updated_at],
+                subdir = ?6, updated_at = ?7, content_hash = ?8, manifest_schema = ?9,
+                skill_version = ?10, agent_compat = ?11, permissions_json = ?12,
+                compatibility_status = ?13, enabled = ?14 WHERE id = ?1",
+        params![s.id, s.name, s.description, s.directory, s.repo_branch, s.subdir, s.updated_at,
+            s.content_hash, s.manifest_schema, s.skill_version, s.agent_compat, s.permissions_json,
+            s.compatibility_status, s.enabled as i64],
     )?;
     Ok(())
 }
@@ -387,7 +409,8 @@ pub fn update_skill(conn: &Connection, s: &Skill) -> Result<(), rusqlite::Error>
 pub fn get_skill(conn: &Connection, id: &str) -> Result<Skill, rusqlite::Error> {
     conn.query_row(
         "SELECT id, name, description, directory, repo_owner, repo_name, repo_host, repo_branch,
-                subdir, enabled, content_hash, installed_at, updated_at, project_id
+                subdir, enabled, content_hash, manifest_schema, skill_version, agent_compat,
+                permissions_json, compatibility_status, installed_at, updated_at, project_id
          FROM skills WHERE id = ?1",
         [id],
         |row| {
@@ -403,9 +426,14 @@ pub fn get_skill(conn: &Connection, id: &str) -> Result<Skill, rusqlite::Error> 
                 subdir: row.get(8)?,
                 enabled: row.get(9)?,
                 content_hash: row.get(10)?,
-                installed_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                project_id: row.get(13)?,
+                manifest_schema: row.get(11)?,
+                skill_version: row.get(12)?,
+                agent_compat: row.get(13)?,
+                permissions_json: row.get(14)?,
+                compatibility_status: row.get(15)?,
+                installed_at: row.get(16)?,
+                updated_at: row.get(17)?,
+                project_id: row.get(18)?,
             })
         },
     )
@@ -434,7 +462,8 @@ pub fn find_enabled_skill_by_name(
 ) -> Result<Option<Skill>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id, name, description, directory, repo_owner, repo_name, repo_host, repo_branch,
-                subdir, enabled, content_hash, installed_at, updated_at, project_id
+                subdir, enabled, content_hash, manifest_schema, skill_version, agent_compat,
+                permissions_json, compatibility_status, installed_at, updated_at, project_id
          FROM skills
          WHERE name = ?1 AND enabled = 1
            AND (project_id IS NULL OR (?2 IS NOT NULL AND project_id = ?2))
@@ -455,9 +484,14 @@ pub fn find_enabled_skill_by_name(
             subdir: r.get(8)?,
             enabled: r.get(9)?,
             content_hash: r.get(10)?,
-            installed_at: r.get(11)?,
-            updated_at: r.get(12)?,
-            project_id: r.get(13)?,
+            manifest_schema: r.get(11)?,
+            skill_version: r.get(12)?,
+            agent_compat: r.get(13)?,
+            permissions_json: r.get(14)?,
+            compatibility_status: r.get(15)?,
+            installed_at: r.get(16)?,
+            updated_at: r.get(17)?,
+            project_id: r.get(18)?,
         }),
     )?;
     rows.next().transpose()

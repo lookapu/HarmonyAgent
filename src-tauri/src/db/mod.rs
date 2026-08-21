@@ -147,6 +147,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (67, "067_context_pins", include_str!("../../migrations/067_context_pins.sql")),
     (68, "068_conversation_branches", include_str!("../../migrations/068_conversation_branches.sql")),
     (69, "069_tool_quality_governance", include_str!("../../migrations/069_tool_quality_governance.sql")),
+    (70, "070_skill_manifest_v1", include_str!("../../migrations/070_skill_manifest_v1.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -228,6 +229,25 @@ mod tests {
             .unwrap();
         for c in ["likes", "popularity", "latest_publish_time"] {
             assert!(cols.iter().any(|x| x == c), "迁移后缺少列 {c}: {cols:?}");
+        }
+        let skill_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(skills)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for column in [
+            "manifest_schema",
+            "skill_version",
+            "agent_compat",
+            "permissions_json",
+            "compatibility_status",
+        ] {
+            assert!(
+                skill_cols.iter().any(|item| item == column),
+                "skills 迁移后缺少列 {column}: {skill_cols:?}"
+            );
         }
         let tool_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(tool_runs)")

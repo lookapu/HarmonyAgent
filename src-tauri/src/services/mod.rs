@@ -40,6 +40,7 @@ pub mod proxy_service;
 pub mod reminders;
 pub mod runtime_progress;
 pub mod seed;
+pub mod skill_manifest;
 pub mod symbol_index;
 pub mod task_guard;
 pub mod tool_cache;

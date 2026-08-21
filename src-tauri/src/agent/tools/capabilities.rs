@@ -3,6 +3,10 @@
 #[derive(Clone, Copy, Debug)]
 pub struct CapabilityPack {
     pub id: &'static str,
+    pub schema_version: u32,
+    pub version: &'static str,
+    pub min_agent_version: &'static str,
+    pub permission_ceiling: PermissionCeiling,
     pub triggers: &'static [&'static str],
     pub tools: &'static [&'static str],
     pub recommended_order: &'static [&'static str],
@@ -10,8 +14,22 @@ pub struct CapabilityPack {
     pub acceptance: &'static [&'static str],
 }
 
+pub const CAPABILITY_PACK_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionCeiling {
+    ReadOnly,
+    ProjectWrite,
+    DeviceWrite,
+    Delivery,
+}
+
 const PROJECT_UNDERSTANDING: CapabilityPack = CapabilityPack {
     id: "project_understanding",
+    schema_version: CAPABILITY_PACK_SCHEMA_VERSION,
+    version: "1.0.0",
+    min_agent_version: "2.0.0",
+    permission_ceiling: PermissionCeiling::ReadOnly,
     triggers: &["project", "understand", "inspect", "项目", "理解", "阅读", "分析", "架构"],
     tools: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "search_symbols", "read_file", "environment_check"],
     recommended_order: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "read_file"],
@@ -21,6 +39,10 @@ const PROJECT_UNDERSTANDING: CapabilityPack = CapabilityPack {
 
 const COMPILE_FIX: CapabilityPack = CapabilityPack {
     id: "compile_fix",
+    schema_version: CAPABILITY_PACK_SCHEMA_VERSION,
+    version: "1.0.0",
+    min_agent_version: "2.0.0",
+    permission_ceiling: PermissionCeiling::ProjectWrite,
     triggers: &["compile", "build error", "fix", "bug", "error", "编译", "构建失败", "修复", "报错"],
     tools: &["get_diagnostics", "get_build_log", "codebase_search", "read_file", "edit_file", "check_code", "build_project", "run_tests", "git_diff"],
     recommended_order: &["get_diagnostics", "get_build_log", "read_file", "edit_file", "check_code", "build_project", "run_tests"],
@@ -30,6 +52,10 @@ const COMPILE_FIX: CapabilityPack = CapabilityPack {
 
 const FEATURE_DEVELOPMENT: CapabilityPack = CapabilityPack {
     id: "feature_development",
+    schema_version: CAPABILITY_PACK_SCHEMA_VERSION,
+    version: "1.0.0",
+    min_agent_version: "2.0.0",
+    permission_ceiling: PermissionCeiling::ProjectWrite,
     triggers: &["feature", "implement", "add", "develop", "功能", "实现", "新增", "开发"],
     tools: &["codebase_search", "get_symbol_details", "read_file", "write_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
     recommended_order: &["codebase_search", "get_symbol_details", "read_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
@@ -39,6 +65,10 @@ const FEATURE_DEVELOPMENT: CapabilityPack = CapabilityPack {
 
 const REFACTOR: CapabilityPack = CapabilityPack {
     id: "refactor",
+    schema_version: CAPABILITY_PACK_SCHEMA_VERSION,
+    version: "1.0.0",
+    min_agent_version: "2.0.0",
+    permission_ceiling: PermissionCeiling::ProjectWrite,
     triggers: &["refactor", "rename", "cleanup", "重构", "重命名", "整理"],
     tools: &["deep_scan", "search_symbols", "lsp_references", "preview_edit", "multi_edit", "lsp_rename", "lsp_format", "run_tests", "build_project", "git_diff"],
     recommended_order: &["deep_scan", "search_symbols", "lsp_references", "preview_edit", "multi_edit", "lsp_format", "run_tests", "build_project"],
@@ -48,6 +78,10 @@ const REFACTOR: CapabilityPack = CapabilityPack {
 
 const BUILD_DEPLOY: CapabilityPack = CapabilityPack {
     id: "build_deploy",
+    schema_version: CAPABILITY_PACK_SCHEMA_VERSION,
+    version: "1.0.0",
+    min_agent_version: "2.0.0",
+    permission_ceiling: PermissionCeiling::DeviceWrite,
     triggers: &["deploy", "package", "hap", "install", "部署", "打包", "安装", "真机"],
     tools: &["environment_check", "check_sdk_alignment", "diagnose_signing", "ohpm_install", "build_project", "list_devices", "deploy", "start_ability", "take_screenshot", "read_logcat"],
     recommended_order: &["environment_check", "check_sdk_alignment", "diagnose_signing", "build_project", "list_devices", "deploy", "start_ability", "take_screenshot"],
@@ -57,6 +91,10 @@ const BUILD_DEPLOY: CapabilityPack = CapabilityPack {
 
 const DEVICE_DIAGNOSTICS: CapabilityPack = CapabilityPack {
     id: "device_diagnostics",
+    schema_version: CAPABILITY_PACK_SCHEMA_VERSION,
+    version: "1.0.0",
+    min_agent_version: "2.0.0",
+    permission_ceiling: PermissionCeiling::DeviceWrite,
     triggers: &["device", "crash", "freeze", "log", "设备", "崩溃", "卡死", "日志", "性能"],
     tools: &["list_devices", "get_app_info", "read_logcat", "search_hilog", "dump_ui_hierarchy", "take_screenshot", "dump_memory", "dump_battery", "device_perf", "analyze_crash"],
     recommended_order: &["list_devices", "get_app_info", "read_logcat", "take_screenshot", "dump_ui_hierarchy", "analyze_crash"],
@@ -66,6 +104,10 @@ const DEVICE_DIAGNOSTICS: CapabilityPack = CapabilityPack {
 
 const GIT_DELIVERY: CapabilityPack = CapabilityPack {
     id: "git_delivery",
+    schema_version: CAPABILITY_PACK_SCHEMA_VERSION,
+    version: "1.0.0",
+    min_agent_version: "2.0.0",
+    permission_ceiling: PermissionCeiling::Delivery,
     triggers: &["git", "commit", "push", "pull", "delivery", "提交", "推送", "拉取", "交付"],
     tools: &["git_status", "git_diff", "review_changes", "run_tests", "build_project", "secret_scan", "git_commit", "git_push", "git_log"],
     recommended_order: &["git_status", "git_diff", "review_changes", "secret_scan", "run_tests", "build_project", "git_commit", "git_push", "git_log"],
@@ -196,6 +238,11 @@ mod tests {
     #[test]
     fn packs_are_complete_and_reference_registered_tools() {
         for pack in CAPABILITY_PACKS {
+            assert_eq!(pack.schema_version, CAPABILITY_PACK_SCHEMA_VERSION);
+            assert!(crate::services::skill_manifest::parse_and_validate(&format!(
+                "---\nharmony_agent_schema: 1\nversion: {}\nharmony_agent_compat: >={}\npermissions: []\n---",
+                pack.version, pack.min_agent_version
+            )).is_ok(), "{} 的版本/兼容范围必须可解析", pack.id);
             assert!(!pack.tools.is_empty());
             assert!(!pack.recommended_order.is_empty());
             assert!(!pack.stop_conditions.is_empty());

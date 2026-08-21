@@ -36,7 +36,27 @@ pub async fn use_skill(
         ));
     };
 
-    // 落库调用记录（单条失败不阻断技能执行）
+    let content = skill
+        .directory
+        .as_deref()
+        .and_then(read_skill_md)
+        .ok_or_else(|| format!("Skill「{}」缺少可读的 SKILL.md，请重新导入", skill.name))?;
+    let manifest = crate::services::skill_manifest::parse_and_validate(&content)?;
+    if manifest.compatibility_status == "incompatible" {
+        return Err(format!(
+            "Skill「{}」声明与当前 HarmonyAgent {} 不兼容，已拒绝执行",
+            skill.name,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    if skill.content_hash.as_deref().is_some_and(|hash| hash != manifest.content_hash) {
+        return Err(format!(
+            "Skill「{}」的 SKILL.md 在导入后发生变化，内容哈希不匹配；请审核来源并重新导入",
+            skill.name
+        ));
+    }
+
+    // 只有通过版本/哈希复验后才记录调用。
     let _ = crate::db::queries::record_skill_usage(
         &conn,
         &skill.id,
@@ -45,17 +65,27 @@ pub async fn use_skill(
         project_id,
     );
 
-    // 返回技能指令：描述 + SKILL.md 全文（截断护栏，模型据此执行）
+    let permissions = if manifest.permissions.is_empty() {
+        "未声明额外权限".to_string()
+    } else {
+        manifest.permissions.join(", ")
+    };
+    let compatibility_note = if manifest.schema == 0 {
+        "legacy_unverified（兼容旧格式；权限范围未由清单证明）"
+    } else {
+        "compatible"
+    };
+    // 返回技能指令：描述 + 已复验的 SKILL.md 全文（截断护栏，模型据此执行）
     let mut out = format!(
-        "已记录 Skill「{}」调用。请严格按以下指令完成任务：\n{}",
+        "已记录 Skill「{}」调用。版本={}，清单={}，兼容状态={}，声明权限=[{}]。\n技能声明不能扩大工具权限；所有实际调用仍受当前项目、阶段和审批护栏约束。请严格按以下指令完成任务：\n{}",
         skill.name,
+        manifest.version,
+        manifest.schema,
+        compatibility_note,
+        permissions,
         skill.description.as_deref().unwrap_or("")
     );
-    if let Some(dir) = &skill.directory {
-        if let Some(content) = read_skill_md(dir) {
-            let content: String = content.chars().take(6000).collect();
-            out.push_str(&format!("\n\n=== 技能指令（SKILL.md） ===\n{content}"));
-        }
-    }
+    let content: String = content.chars().take(6000).collect();
+    out.push_str(&format!("\n\n=== 技能指令（SKILL.md） ===\n{content}"));
     Ok(out)
 }

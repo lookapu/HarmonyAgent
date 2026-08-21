@@ -45,6 +45,8 @@
 - `environment_check path=...` 新增 DevEco 公共配置互操作报告：对 AppScope、product/module、OHPM、Hvigor 和 manifest 生成确定性配置指纹，明确忽略 `.idea` 与 `local.properties` 私有内容，并只用字段路径提示机器绝对路径和敏感配置，不输出值或依赖 IDE 私有状态。
 - 发布安全域改为逐次显式审批：release 构建、签名参考、OTA、凭据读取及发布/签名命令不能被 allow-all、项目/会话白名单或历史授权绕过；审批参数先统一脱敏，敏感调用失败后采用人工恢复。
 - `copy_signing_from` 只允许授权根内的非敏感签名元数据和工程内材料引用，密码/令牌/私钥字段与目录外材料直接拒绝，未知字段按白名单丢弃；应用市场专用发布能力在满足同一治理契约前保持关闭。
+- Skill manifest v1 新增独立 SemVer、HarmonyAgent 兼容范围、权限枚举、兼容状态和 `SKILL.md` 内容哈希：旧 Skill 明示为 `legacy_unverified`，不兼容项保持禁用，导入后内容漂移会阻止指令注入与调用；Skill 声明不能扩大现有工具权限。
+- 内置能力包新增 schema/version、最低 Agent 版本与 `read_only|project_write|device_write|delivery` 权限上限，选择策略可独立于工具协议演进。
 
 ### 长会话 Context V2（M1 基础）
 
