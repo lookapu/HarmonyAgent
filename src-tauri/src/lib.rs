@@ -517,6 +517,8 @@ pub fn run() {
             commands::reliability::claim_next_scheduled_agent_task,
             commands::reliability::retry_scheduled_agent_task,
             commands::reliability::resume_scheduled_agent_task,
+            commands::reliability::pause_scheduled_agent_task,
+            commands::reliability::cancel_scheduled_agent_task,
             commands::reliability::add_agent_dag_dependency,
             commands::reliability::list_runnable_agent_dag_nodes,
             commands::reliability::retry_agent_dag_node,

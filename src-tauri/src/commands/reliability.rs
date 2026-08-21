@@ -342,6 +342,18 @@ pub fn resume_scheduled_agent_task(
 }
 
 #[tauri::command]
+pub fn pause_scheduled_agent_task(db: State<DbState>, run_id: String) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::scheduler::request_pause(&conn, &run_id)
+}
+
+#[tauri::command]
+pub fn cancel_scheduled_agent_task(db: State<DbState>, run_id: String) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::scheduler::request_cancel(&conn, &run_id)
+}
+
+#[tauri::command]
 pub fn add_agent_dag_dependency(
     db: State<DbState>,
     root_run_id: String,

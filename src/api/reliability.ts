@@ -168,3 +168,12 @@ export const listToolExecutionWorkers = (limit = 100) =>
   invokeWithError<ToolExecutionWorker[]>('list_tool_execution_workers', { limit })
 export const getAgentSloPolicy = () => invokeWithError<SloPolicy | null>('get_agent_slo_policy')
 export const updateAgentSloPolicy = (policy: SloPolicy) => invokeWithError<void>('update_agent_slo_policy', { policy })
+
+export const resumeScheduledAgentTask = (runId: string, resumeToken: string) =>
+  invokeWithError<boolean>('resume_scheduled_agent_task', { runId, resumeToken })
+
+export const pauseScheduledAgentTask = (runId: string) =>
+  invokeWithError<boolean>('pause_scheduled_agent_task', { runId })
+
+export const cancelScheduledAgentTask = (runId: string) =>
+  invokeWithError<boolean>('cancel_scheduled_agent_task', { runId })

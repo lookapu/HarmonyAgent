@@ -393,8 +393,7 @@ pub fn renew_owned(
             "UPDATE agent_task_queue SET lease_expires_at=?1,updated_at=?2
          WHERE run_id=?3 AND state='running' AND worker_id=?4",
             params![expires, now, run_id, worker_id],
-        )
-        .map_err(|e| e.to_string())?;
+        ).map_err(|e|e.to_string())?;
     if changed > 0 {
         conn.execute(
             "UPDATE agent_task_attempts SET last_heartbeat_at=?1 WHERE task_id=(SELECT task_id FROM agent_task_queue WHERE run_id=?2)
@@ -439,10 +438,80 @@ pub fn request_resume(conn: &Connection, run_id: &str, resume_token: &str) -> Re
         .execute(
             "UPDATE agent_task_queue SET state='queued',worker_id=NULL,lease_token=NULL,lease_expires_at=NULL,
          next_attempt_at=?1,error=NULL,updated_at=?1 WHERE run_id=?2 AND resume_token=?3
-         AND state='recovery_required' AND attempt<max_attempts",
+         AND state IN ('recovery_required','paused') AND attempt<max_attempts",
             params![now_ms(), run_id, resume_token],
+        ).map_err(|e|e.to_string())?;
+    if changed > 0 {
+        let _ = crate::agent::enterprise::audit(
+            conn,
+            Some(run_id),
+            None,
+            "user",
+            "resume",
+            "scheduled_agent_task",
+            "queued",
+            &serde_json::json!({"resume_token_verified": true}),
+        );
+    }
+    Ok(changed > 0)
+}
+
+/// Pause only when no worker owns the task. A running task must first reach its
+/// normal cancellation/checkpoint boundary; changing its row behind a live
+/// worker would violate fencing guarantees.
+pub fn request_pause(conn: &Connection, run_id: &str) -> Result<bool, String> {
+    let now = now_ms();
+    let changed = conn
+        .execute(
+            "UPDATE agent_task_queue SET state='paused',next_attempt_at=NULL,
+             error='用户在安全检查点暂停任务',updated_at=?1
+             WHERE run_id=?2 AND state IN ('queued','recovery_required') AND worker_id IS NULL",
+            params![now, run_id],
         )
         .map_err(|e| e.to_string())?;
+    if changed > 0 {
+        let _ = crate::agent::enterprise::audit(
+            conn,
+            Some(run_id),
+            None,
+            "user",
+            "pause",
+            "scheduled_agent_task",
+            "paused",
+            &serde_json::json!({"checkpoint": "unowned_queue_boundary"}),
+        );
+    }
+    Ok(changed > 0)
+}
+
+pub fn request_cancel(conn: &Connection, run_id: &str) -> Result<bool, String> {
+    let now = now_ms();
+    let changed = conn
+        .execute(
+            "UPDATE agent_task_queue SET state='cancelled',next_attempt_at=NULL,
+             error='用户取消任务',updated_at=?1,finished_at=?1
+             WHERE run_id=?2 AND state IN ('queued','recovery_required','paused') AND worker_id IS NULL",
+            params![now, run_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed > 0 {
+        conn.execute(
+            "UPDATE agent_runs SET state='cancelled',phase='cancelled',error='用户取消任务',
+             updated_at=?1,finished_at=?1 WHERE run_id=?2 AND state NOT IN ('completed','cancelled')",
+            params![now, run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = crate::agent::enterprise::audit(
+            conn,
+            Some(run_id),
+            None,
+            "user",
+            "cancel",
+            "scheduled_agent_task",
+            "cancelled",
+            &serde_json::json!({"checkpoint": "unowned_queue_boundary"}),
+        );
+    }
     Ok(changed > 0)
 }
 
@@ -464,7 +533,8 @@ pub fn mark_recovery_required(conn: &Connection, run_id: &str, error: &str) -> R
         conn.execute(
             "UPDATE agent_workers SET active_tasks=MAX(active_tasks-1,0) WHERE worker_id=?1",
             [current_worker_id()],
-        ).map_err(|e|e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -540,7 +610,8 @@ pub fn finish(
         conn.execute(
             "UPDATE agent_workers SET active_tasks=MAX(active_tasks-1,0) WHERE worker_id=?1",
             [current_worker_id()],
-        ).map_err(|e|e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -749,7 +820,7 @@ mod tests {
     use super::*;
     fn conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,scheduler_task_id TEXT,budget_json TEXT); CREATE TABLE conversations(id TEXT PRIMARY KEY); INSERT INTO conversations VALUES('c'); CREATE TABLE agent_task_queue(task_id TEXT PRIMARY KEY,run_id TEXT UNIQUE,conversation_id TEXT,goal TEXT,state TEXT,priority INTEGER,worker_id TEXT,attempt INTEGER,max_attempts INTEGER,lease_expires_at INTEGER,budget_json TEXT,checkpoint_json TEXT,error TEXT,created_at INTEGER,updated_at INTEGER,finished_at INTEGER,payload_json TEXT NOT NULL DEFAULT '{}',resume_token TEXT,claimed_at INTEGER,last_checkpoint_at INTEGER,next_attempt_at INTEGER,concurrency_key TEXT,tenant_id TEXT NOT NULL DEFAULT 'local',lease_token TEXT,claim_epoch INTEGER NOT NULL DEFAULT 0,last_worker_id TEXT,recovery_count INTEGER NOT NULL DEFAULT 0); CREATE TABLE agent_workers(worker_id TEXT PRIMARY KEY,worker_kind TEXT,pid INTEGER,hostname TEXT,version TEXT,state TEXT,capacity INTEGER,active_tasks INTEGER,started_at INTEGER,last_heartbeat_at INTEGER,draining_at INTEGER,stopped_at INTEGER,metadata_json TEXT); CREATE TABLE agent_task_attempts(task_id TEXT,attempt INTEGER,worker_id TEXT,lease_token TEXT,state TEXT,checkpoint_json TEXT,error TEXT,started_at INTEGER,last_heartbeat_at INTEGER,finished_at INTEGER,PRIMARY KEY(task_id,attempt));").unwrap();
+        conn.execute_batch("CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,scheduler_task_id TEXT,budget_json TEXT,state TEXT NOT NULL DEFAULT 'queued',phase TEXT NOT NULL DEFAULT 'queued',error TEXT,updated_at INTEGER,finished_at INTEGER); CREATE TABLE conversations(id TEXT PRIMARY KEY); INSERT INTO conversations VALUES('c'); CREATE TABLE agent_task_queue(task_id TEXT PRIMARY KEY,run_id TEXT UNIQUE,conversation_id TEXT,goal TEXT,state TEXT,priority INTEGER,worker_id TEXT,attempt INTEGER,max_attempts INTEGER,lease_expires_at INTEGER,budget_json TEXT,checkpoint_json TEXT,error TEXT,created_at INTEGER,updated_at INTEGER,finished_at INTEGER,payload_json TEXT NOT NULL DEFAULT '{}',resume_token TEXT,claimed_at INTEGER,last_checkpoint_at INTEGER,next_attempt_at INTEGER,concurrency_key TEXT,tenant_id TEXT NOT NULL DEFAULT 'local',lease_token TEXT,claim_epoch INTEGER NOT NULL DEFAULT 0,last_worker_id TEXT,recovery_count INTEGER NOT NULL DEFAULT 0); CREATE TABLE agent_workers(worker_id TEXT PRIMARY KEY,worker_kind TEXT,pid INTEGER,hostname TEXT,version TEXT,state TEXT,capacity INTEGER,active_tasks INTEGER,started_at INTEGER,last_heartbeat_at INTEGER,draining_at INTEGER,stopped_at INTEGER,metadata_json TEXT); CREATE TABLE agent_task_attempts(task_id TEXT,attempt INTEGER,worker_id TEXT,lease_token TEXT,state TEXT,checkpoint_json TEXT,error TEXT,started_at INTEGER,last_heartbeat_at INTEGER,finished_at INTEGER,PRIMARY KEY(task_id,attempt));").unwrap();
         conn
     }
     #[test]
@@ -813,6 +884,51 @@ mod tests {
         let task = get(&conn, "q").unwrap().unwrap();
         assert!(request_resume(&conn, "q", task.resume_token.as_deref().unwrap()).unwrap());
         assert_eq!(get(&conn, "q").unwrap().unwrap().state, "queued");
+    }
+
+    #[test]
+    fn pause_resume_and_cancel_respect_worker_ownership() {
+        let conn = conn();
+        conn.execute("INSERT INTO agent_runs(run_id) VALUES('control')", [])
+            .unwrap();
+        enqueue(
+            &conn,
+            &EnqueueSpec {
+                run_id: "control".into(),
+                conversation_id: "c".into(),
+                goal: "controlled task".into(),
+                priority: 50,
+                max_attempts: 3,
+                concurrency_key: None,
+                payload: serde_json::json!({}),
+                budget: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+
+        assert!(request_pause(&conn, "control").unwrap());
+        let paused = get(&conn, "control").unwrap().unwrap();
+        assert_eq!(paused.state, "paused");
+        assert!(claim_next(&conn, 60_000).unwrap().is_none());
+        assert!(!request_resume(&conn, "control", "wrong-token").unwrap());
+        assert!(request_resume(&conn, "control", paused.resume_token.as_deref().unwrap()).unwrap());
+
+        let claimed = claim_next(&conn, 60_000).unwrap().unwrap();
+        assert_eq!(claimed.state, "running");
+        assert!(!request_pause(&conn, "control").unwrap());
+        assert!(!request_cancel(&conn, "control").unwrap());
+
+        mark_recovery_required(&conn, "control", "worker interrupted").unwrap();
+        assert!(request_cancel(&conn, "control").unwrap());
+        assert_eq!(get(&conn, "control").unwrap().unwrap().state, "cancelled");
+        let run_state: String = conn
+            .query_row(
+                "SELECT state FROM agent_runs WHERE run_id='control'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_state, "cancelled");
     }
 
     #[test]
