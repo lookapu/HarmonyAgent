@@ -166,7 +166,16 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
         );
     }
     let approval_result =
-        request_tool_approval(app, &approval, &cancel, conversation_id, tool, inv.args_raw).await;
+        request_tool_approval(
+            app,
+            &approval,
+            &cancel,
+            conversation_id,
+            &inv.ctx.run_id,
+            tool,
+            inv.args_raw,
+        )
+        .await;
     if !inv.ctx.run_id.is_empty() {
         crate::agent::runtime::transition_global(
             &inv.ctx.run_id,
@@ -320,6 +329,7 @@ pub(crate) async fn request_tool_approval(
     state: &State<'_, ToolApprovalState>,
     cancel: &ChatCancel,
     conversation_id: &str,
+    run_id: &str,
     tool: &str,
     args: &str,
 ) -> Result<ApprovalOutcome, String> {
@@ -336,6 +346,18 @@ pub(crate) async fn request_tool_approval(
         }
     }
     let request_id = Uuid::new_v4().to_string();
+    crate::agent::interactions::begin(
+        &request_id,
+        conversation_id,
+        Some(run_id),
+        "tool_approval",
+        &serde_json::json!({
+            "tool": tool,
+            "args": args,
+            "level": permissions::tool_level(tool).as_str(),
+            "description": super::tool_short_desc(tool),
+        }),
+    )?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     {
         let mut map = state.0.lock().map_err(|e| e.to_string())?;
@@ -366,16 +388,33 @@ pub(crate) async fn request_tool_approval(
                 return match r {
                     Ok((true, _feedback)) => Ok(ApprovalOutcome::Approved),
                     Ok((false, feedback)) => Ok(ApprovalOutcome::Rejected(feedback)),
-                    Err(_) => Ok(ApprovalOutcome::Rejected(None)),
+                    Err(_) => {
+                        let _ = crate::agent::interactions::finish(
+                            &request_id,
+                            "interrupted",
+                            serde_json::json!({ "reason": "approval_channel_closed" }),
+                        );
+                        Ok(ApprovalOutcome::Rejected(None))
+                    },
                 };
             }
             _ = tokio::time::sleep_until(deadline) => {
                 let _ = state.0.lock().map(|mut m| m.remove(&request_id));
+                let _ = crate::agent::interactions::finish(
+                    &request_id,
+                    "timed_out",
+                    serde_json::json!({ "reason": "tool_approval_timeout" }),
+                );
                 return Ok(ApprovalOutcome::Rejected(None));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if is_cancelled(cancel, conversation_id) {
                     let _ = state.0.lock().map(|mut m| m.remove(&request_id));
+                    let _ = crate::agent::interactions::finish(
+                        &request_id,
+                        "cancelled",
+                        serde_json::json!({ "reason": "user_stopped" }),
+                    );
                     return Ok(ApprovalOutcome::Cancelled);
                 }
             }

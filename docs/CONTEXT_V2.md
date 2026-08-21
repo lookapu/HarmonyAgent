@@ -2,6 +2,8 @@
 
 本文定义路线图 M1 的数据边界、事实优先级和兼容策略。实现入口为 `src-tauri/src/agent/context.rs`，数据库结构由 `063_conversation_context_v2.sql` 创建。
 
+待审批、计划审查和 `ask_user` 的生命周期由 `064_pending_interactions.sql` 持久化。实时回复仍通过进程内通道完成；SQLite 保存经过递归脱敏的请求载荷与回答，以及 Run、Owner、超时和终态。启动恢复仅将已经进入 `interrupted/recovery_required` 的失联 Run 所属等待标为 `interrupted`，不会自动批准，也不会中断其他健康 Worker 的等待。
+
 ## 1. 设计目标
 
 Context V2 解决三个问题：

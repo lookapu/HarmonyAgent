@@ -385,6 +385,16 @@ pub fn resolve_tool_approval(
                 }
             }
         }
+        crate::agent::interactions::finish(
+            &request_id,
+            if approved { "approved" } else { "rejected" },
+            serde_json::json!({
+                "approved": approved,
+                "feedback": feedback,
+                "remember": remember,
+                "scope": scope,
+            }),
+        )?;
         let _ = tx.send((approved, feedback));
     }
     Ok(())
@@ -482,6 +492,13 @@ async fn request_plan_review(
         None,
     );
     let request_id = Uuid::new_v4().to_string();
+    crate::agent::interactions::begin(
+        &request_id,
+        conversation_id,
+        Some(run_id),
+        "plan_review",
+        &serde_json::json!({ "plan": plan }),
+    )?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     {
         let mut map = state.0.lock().map_err(|e| e.to_string())?;
@@ -519,15 +536,27 @@ async fn request_plan_review(
                         }
                         Ok(review)
                     }
-                    Err(_) => Ok(PlanReview {
-                        approved: false,
-                        feedback: "计划确认通道已关闭".to_string(),
-                        cancelled: false,
-                    }),
+                    Err(_) => {
+                        let _ = crate::agent::interactions::finish(
+                            &request_id,
+                            "interrupted",
+                            serde_json::json!({ "reason": "plan_review_channel_closed" }),
+                        );
+                        Ok(PlanReview {
+                            approved: false,
+                            feedback: "计划确认通道已关闭".to_string(),
+                            cancelled: false,
+                        })
+                    },
                 };
             }
             _ = tokio::time::sleep_until(deadline) => {
                 let _ = state.0.lock().map(|mut m| m.remove(&request_id));
+                let _ = crate::agent::interactions::finish(
+                    &request_id,
+                    "timed_out",
+                    serde_json::json!({ "reason": "plan_review_timeout" }),
+                );
                 return Ok(PlanReview {
                     approved: false,
                     feedback: "计划确认超时，已暂停执行".to_string(),
@@ -537,6 +566,11 @@ async fn request_plan_review(
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if is_cancelled(cancel, conversation_id) {
                     let _ = state.0.lock().map(|mut m| m.remove(&request_id));
+                    let _ = crate::agent::interactions::finish(
+                        &request_id,
+                        "cancelled",
+                        serde_json::json!({ "reason": "user_stopped" }),
+                    );
                     return Ok(PlanReview {
                         approved: false,
                         feedback: "用户已停止生成".to_string(),
@@ -559,6 +593,11 @@ pub fn resolve_plan_review(
 ) -> Result<(), String> {
     let mut map = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(req) = map.remove(&request_id) {
+        crate::agent::interactions::finish(
+            &request_id,
+            if approved { "approved" } else { "rejected" },
+            serde_json::json!({ "approved": approved, "feedback": feedback }),
+        )?;
         let _ = req.tx.send(PlanReview {
             approved,
             feedback: feedback.unwrap_or_default(),

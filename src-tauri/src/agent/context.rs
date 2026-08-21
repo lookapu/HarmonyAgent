@@ -62,12 +62,14 @@ pub struct ContextFactInput {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TaskSnapshotV2 {
     pub run_id: Option<String>,
     pub goal: String,
     pub state: String,
     pub phase: String,
     pub required_conditions: Vec<String>,
+    pub constraints: Vec<String>,
     pub completed_steps: Vec<String>,
     pub open_steps: Vec<String>,
     pub blocked_steps: Vec<String>,
@@ -89,6 +91,31 @@ pub struct ContextArtifactRef {
     pub source_ref: String,
     pub valid: bool,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HotMessageV2 {
+    pub role: String,
+    pub content: String,
+    pub source_ref: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingInteractionV2 {
+    pub request_id: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub expires_at: Option<i64>,
+    pub source_ref: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HotContextV2 {
+    pub recent_messages: Vec<HotMessageV2>,
+    pub current_errors: Vec<String>,
+    pub active_files: Vec<String>,
+    pub pending_interactions: Vec<PendingInteractionV2>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +175,7 @@ pub struct ConversationContextV2 {
     pub summary_to_message_rowid: i64,
     pub summary_event_seq: i64,
     pub task: TaskSnapshotV2,
+    pub hot: HotContextV2,
     pub facts: Vec<ContextFactV2>,
     pub artifacts: Vec<ContextArtifactRef>,
     pub budget: ContextBudgetV2,
@@ -207,18 +235,19 @@ pub fn capture_task_snapshot(
         return snapshot_from_legacy_ledger(conn, conversation_id);
     };
 
-    let required_conditions = contract_json
+    let contract = contract_json
         .as_deref()
-        .and_then(|raw| serde_json::from_str::<crate::agent::acceptance::GoalContract>(raw).ok())
+        .and_then(|raw| serde_json::from_str::<crate::agent::acceptance::GoalContract>(raw).ok());
+    let required_conditions = contract
+        .as_ref()
         .map(|contract| {
-            contract
-                .criteria
-                .into_iter()
+            contract.criteria.iter()
                 .filter(|criterion| criterion.required)
-                .map(|criterion| criterion.label)
+                .map(|criterion| criterion.label.clone())
                 .collect()
         })
         .unwrap_or_default();
+    let constraints = contract.map(|contract| contract.constraints).unwrap_or_default();
 
     let mut stmt = conn
         .prepare(
@@ -260,6 +289,7 @@ pub fn capture_task_snapshot(
         state,
         phase,
         required_conditions,
+        constraints,
         completed_steps,
         open_steps,
         blocked_steps,
@@ -303,6 +333,7 @@ fn snapshot_from_legacy_ledger(
         state: "legacy".into(),
         phase: "ledger".into(),
         required_conditions: Vec::new(),
+        constraints: Vec::new(),
         completed_steps: list("verified"),
         open_steps: list("open"),
         blocked_steps: Vec::new(),
@@ -916,12 +947,126 @@ pub fn load_context_v2(
         summary_to_message_rowid: to_rowid,
         summary_event_seq: event_seq,
         task,
+        hot: load_hot_context(conn, conversation_id)?,
         facts: load_active_facts(conn, conversation_id, 100)?,
         artifacts: load_valid_artifacts(conn, conversation_id, 100)?,
         budget,
         facts_digest,
         invalidation_epoch: epoch,
         updated_at,
+    })
+}
+
+fn load_hot_context(conn: &Connection, conversation_id: &str) -> Result<HotContextV2, String> {
+    let mut message_stmt = conn
+        .prepare(
+            "SELECT rowid,role,content,created_at FROM messages
+             WHERE conversation_id=?1 AND queued=0 AND hidden=0
+             ORDER BY created_at DESC,rowid DESC LIMIT 12",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut recent_messages = message_stmt
+        .query_map([conversation_id], |row| {
+            let rowid = row.get::<_, i64>(0)?;
+            let content = row.get::<_, String>(2)?;
+            Ok(HotMessageV2 {
+                role: row.get(1)?,
+                content: content.chars().take(1_200).collect(),
+                source_ref: format!("message:rowid:{rowid}"),
+                created_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    recent_messages.reverse();
+
+    let mut current_errors = Vec::new();
+    if let Some(error) = conn
+        .query_row(
+            "SELECT error FROM agent_runs WHERE conversation_id=?1 AND error IS NOT NULL
+             ORDER BY started_at DESC LIMIT 1",
+            [conversation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .filter(|value| !value.trim().is_empty())
+    {
+        current_errors.push(error.chars().take(1_000).collect());
+    }
+    let mut fact_stmt = conn
+        .prepare(
+            "SELECT value_json FROM conversation_context_facts
+             WHERE conversation_id=?1 AND invalidated_at IS NULL
+               AND json_extract(value_json,'$.passed')=0
+             ORDER BY updated_at DESC LIMIT 4",
+        )
+        .map_err(|e| e.to_string())?;
+    for raw in fact_stmt
+        .query_map([conversation_id], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+    {
+        let raw = raw.map_err(|e| e.to_string())?;
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if let Some(summary) = value["summary"].as_str().filter(|value| !value.trim().is_empty()) {
+            current_errors.push(summary.chars().take(1_000).collect());
+        }
+    }
+    current_errors.dedup();
+    let mut interrupted_stmt = conn
+        .prepare(
+            "SELECT kind FROM pending_interactions
+             WHERE conversation_id=?1 AND state='interrupted'
+             ORDER BY resolved_at DESC LIMIT 3",
+        )
+        .map_err(|e| e.to_string())?;
+    for kind in interrupted_stmt
+        .query_map([conversation_id], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+    {
+        current_errors.push(format!(
+            "{} 等待因运行中断而关闭；继续前必须从安全检查点重新确认",
+            kind.map_err(|e| e.to_string())?
+        ));
+    }
+
+    let mut active_files = load_valid_artifacts(conn, conversation_id, 40)?
+        .into_iter()
+        .filter(|item| matches!(item.artifact_kind.as_str(), "file" | "config" | "source"))
+        .map(|item| item.uri)
+        .collect::<Vec<_>>();
+    active_files.dedup();
+    active_files.truncate(12);
+
+    let mut interaction_stmt = conn
+        .prepare(
+            "SELECT request_id,kind,payload_json,expires_at FROM pending_interactions
+             WHERE conversation_id=?1 AND state='pending'
+             ORDER BY created_at DESC LIMIT 10",
+        )
+        .map_err(|e| e.to_string())?;
+    let pending_interactions = interaction_stmt
+        .query_map([conversation_id], |row| {
+            let request_id = row.get::<_, String>(0)?;
+            let raw = row.get::<_, String>(2)?;
+            Ok(PendingInteractionV2 {
+                source_ref: format!("interaction:{request_id}"),
+                request_id,
+                kind: row.get(1)?,
+                payload: serde_json::from_str(&raw).unwrap_or_default(),
+                expires_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(HotContextV2 {
+        recent_messages,
+        current_errors,
+        active_files,
+        pending_interactions,
     })
 }
 
@@ -1087,6 +1232,9 @@ pub fn render_context_hint(context: &ConversationContextV2) -> Option<String> {
                 context.task.required_conditions.join("；")
             ));
         }
+        if !context.task.constraints.is_empty() {
+            out.push_str(&format!("- 用户/执行约束：{}\n", context.task.constraints.join("；")));
+        }
         if !context.task.open_steps.is_empty() {
             out.push_str(&format!(
                 "- 待完成：{}\n",
@@ -1102,6 +1250,21 @@ pub fn render_context_hint(context: &ConversationContextV2) -> Option<String> {
         if let Some(next) = &context.task.next_action {
             out.push_str(&format!("- 下一步：{next}\n"));
         }
+    }
+    if !context.hot.pending_interactions.is_empty() {
+        out.push_str("- 待用户确认（不得被摘要覆盖或自动批准）：\n");
+        for interaction in &context.hot.pending_interactions {
+            out.push_str(&format!(
+                "  - {} {}（来源 {}）\n",
+                interaction.kind, interaction.payload, interaction.source_ref
+            ));
+        }
+    }
+    if !context.hot.current_errors.is_empty() {
+        out.push_str(&format!("- 当前错误：{}\n", context.hot.current_errors.join("；")));
+    }
+    if !context.hot.active_files.is_empty() {
+        out.push_str(&format!("- 活跃文件：{}\n", context.hot.active_files.join("；")));
     }
     if !context.facts.is_empty() {
         out.push_str("- 活跃事实：\n");
@@ -1174,6 +1337,10 @@ mod tests {
         .unwrap();
         conn.execute_batch(include_str!(
             "../../migrations/063_conversation_context_v2.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/064_pending_interactions.sql"
         ))
         .unwrap();
     }
@@ -1309,6 +1476,39 @@ mod tests {
         assert_eq!(loaded.summary_from_message_rowid, 1);
         assert_eq!(loaded.summary_to_message_rowid, 4);
         assert_eq!(loaded.summary_event_seq, 9);
+    }
+
+    #[test]
+    fn hot_context_keeps_recent_messages_files_errors_and_pending_waits() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO messages(id,conversation_id,role,content,created_at)
+             VALUES ('m-hot','c','user','保持审批约束',10)",
+            [],
+        )
+        .unwrap();
+        record_tool_evidence(
+            &conn,
+            "c",
+            "run-hot",
+            "write_file",
+            r#"{"path":"src/main.ets","content":"x"}"#,
+            "written",
+            true,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pending_interactions
+             (request_id,conversation_id,kind,state,payload_json,created_at,updated_at)
+             VALUES ('ask-hot','c','ask_user','pending','{\"question\":\"继续吗\"}',11,11)",
+            [],
+        )
+        .unwrap();
+        let loaded = load_context_v2(&conn, "c", 16_000).unwrap();
+        assert_eq!(loaded.hot.recent_messages.len(), 1);
+        assert!(loaded.hot.active_files.iter().any(|path| path == "src/main.ets"));
+        assert_eq!(loaded.hot.pending_interactions[0].request_id, "ask-hot");
+        assert!(render_context_hint(&loaded).unwrap().contains("不得被摘要覆盖"));
     }
 
     #[test]

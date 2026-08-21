@@ -290,12 +290,25 @@ export interface ConversationContextV2 {
     state: string
     phase: string
     required_conditions: string[]
+    constraints: string[]
     completed_steps: string[]
     open_steps: string[]
     blocked_steps: string[]
     next_action: string | null
     last_error: string | null
     updated_at: number
+  }
+  hot: {
+    recent_messages: Array<{ role: string; content: string; source_ref: string; created_at: number }>
+    current_errors: string[]
+    active_files: string[]
+    pending_interactions: Array<{
+      request_id: string
+      kind: string
+      payload: unknown
+      expires_at: number | null
+      source_ref: string
+    }>
   }
   facts: Array<{
     id: string

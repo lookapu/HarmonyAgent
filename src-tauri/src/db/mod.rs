@@ -44,6 +44,8 @@ pub fn init(path: &Path) -> Result<Mutex<Connection>, rusqlite::Error> {
     // 详细 run.recovered 事件由 runtime 恢复函数在正常路径补齐。
     crate::agent::runtime::recover_interrupted_runs(&conn)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
+    crate::agent::interactions::recover_orphaned(&conn)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     Ok(Mutex::new(conn))
 }
 
@@ -139,6 +141,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (61, "061_tool_execution_kernel_v2", include_str!("../../migrations/061_tool_execution_kernel_v2.sql")),
     (62, "062_tool_execution_threads", include_str!("../../migrations/062_tool_execution_threads.sql")),
     (63, "063_conversation_context_v2", include_str!("../../migrations/063_conversation_context_v2.sql")),
+    (64, "064_pending_interactions", include_str!("../../migrations/064_pending_interactions.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -325,6 +328,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(context_tables, 4);
+        let interaction_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(pending_interactions)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in ["request_id", "run_id", "kind", "state", "payload_json", "owner_worker_id"] {
+            assert!(interaction_cols.iter().any(|x| x == c), "pending_interactions 迁移后缺少列 {c}");
+        }
+        run_migrations(&conn).unwrap();
+        let applied_064: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _migrations WHERE id=64", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(applied_064, 1, "重复迁移不得重复登记或破坏新表");
     }
 
     #[test]

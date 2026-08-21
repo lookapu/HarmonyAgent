@@ -3736,10 +3736,11 @@ async fn ask_user(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result
     };
     let rx = crate::agent::ask::wait(
         &ctx.conversation_id,
+        &ctx.run_id,
         request_id.clone(),
         question.clone(),
         options.clone(),
-    );
+    )?;
     if !ctx.run_id.is_empty() {
         crate::agent::runtime::transition_global(
             &ctx.run_id,
@@ -3775,11 +3776,21 @@ async fn ask_user(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result
             }
             _ = tokio::time::sleep_until(deadline) => {
                 crate::agent::ask::remove(&request_id);
+                let _ = crate::agent::interactions::finish(
+                    &request_id,
+                    "timed_out",
+                    serde_json::json!({ "reason": "ask_user_timeout" }),
+                );
                 break Ok("用户未在 5 分钟内回复，跳过该问题（如需确认可再次 ask_user 或换用更具体的选项）。".into());
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if crate::agent::exec_ctx::current_tool_stop_requested() {
                     crate::agent::ask::remove(&request_id);
+                    let _ = crate::agent::interactions::finish(
+                        &request_id,
+                        "cancelled",
+                        serde_json::json!({ "reason": "tool_stopped" }),
+                    );
                     break Err("用户已停止当前工具".into());
                 }
             }

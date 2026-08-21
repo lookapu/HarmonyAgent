@@ -45,10 +45,18 @@ fn table() -> std::sync::MutexGuard<'static, crate::agent::session_ctx::SessionC
 /// 注册一次提问等待。返回回答通道。
 pub fn wait(
     conversation_id: &str,
+    run_id: &str,
     request_id: String,
     question: String,
     options: Vec<String>,
-) -> oneshot::Receiver<String> {
+) -> Result<oneshot::Receiver<String>, String> {
+    crate::agent::interactions::begin(
+        &request_id,
+        conversation_id,
+        Some(run_id),
+        "ask_user",
+        &serde_json::json!({ "question": question, "options": options }),
+    )?;
     let (tx, rx) = oneshot::channel();
     table()
         .ask_waiters
@@ -64,7 +72,7 @@ pub fn wait(
                 tx,
             ),
         );
-    rx
+    Ok(rx)
 }
 
 /// 查询会话内挂起的提问（前端切回会话时恢复提问卡；无挂起返回 None）。
@@ -86,6 +94,11 @@ pub fn resolve(request_id: &str, answer: String) -> bool {
     let removed = table().ask_waiters.remove(request_id);
     match removed {
         Some((ev, tx)) => {
+            let _ = crate::agent::interactions::finish(
+                request_id,
+                if answer.trim().is_empty() { "skipped" } else { "answered" },
+                serde_json::json!({ "answer": answer }),
+            );
             let _ = tx.send(answer.clone());
             record_history(&ev.conversation_id, &ev, &answer);
             true
@@ -121,6 +134,7 @@ pub fn history(conversation_id: &str, limit: usize) -> Vec<AskRecord> {
 
 /// 停止任务时关闭该会话所有未答复的提问（通道关闭 → 工具按"用户已停止"返回）。
 pub fn cancel_conversation(conversation_id: &str) {
+    crate::agent::interactions::cancel_conversation(conversation_id, "conversation_cancelled");
     let doomed: Vec<String> = table()
         .ask_waiters
         .iter()
@@ -141,7 +155,7 @@ mod tests {
         // 会话/请求 ID 用专属前缀：全局会话单例与其它模块测试并发共享，
         // 避免与 session_ctx 等测试的同名 key 互相误删
         let rid = "ask-r1".to_string();
-        let rx = wait("ask-c1", rid.clone(), "q".into(), vec![]);
+        let rx = wait("ask-c1", "", rid.clone(), "q".into(), vec![]).unwrap();
         assert_eq!(pending("ask-c1").map(|e| e.request_id).as_deref(), Some("ask-r1"));
         assert!(resolve(&rid, "是".into()));
         assert!(rx.blocking_recv().unwrap() == "是");
@@ -152,7 +166,7 @@ mod tests {
     #[test]
     fn history_records_answered() {
         let rid = "ask-r3".to_string();
-        let _rx = wait("ask-c3", rid.clone(), "选哪个？".into(), vec!["A".into(), "B".into()]);
+        let _rx = wait("ask-c3", "", rid.clone(), "选哪个？".into(), vec!["A".into(), "B".into()]).unwrap();
         assert!(resolve(&rid, "A".into()));
         let h = history("ask-c3", 10);
         assert_eq!(h.len(), 1);
@@ -164,7 +178,7 @@ mod tests {
     #[test]
     fn cancel_closes_channel() {
         let rid = "ask-r2".to_string();
-        let rx = wait("ask-c2", rid.clone(), "q".into(), vec!["a".into()]);
+        let rx = wait("ask-c2", "", rid.clone(), "q".into(), vec!["a".into()]).unwrap();
         assert_eq!(pending("ask-c2").map(|e| e.options.len()), Some(1));
         cancel_conversation("ask-c2");
         assert!(rx.blocking_recv().is_err());
