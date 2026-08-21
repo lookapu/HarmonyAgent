@@ -675,7 +675,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "get_project_info",
-        desc: "读取当前鸿蒙工程的结构化信息（bundleName、版本、启动 Ability、API 版本、entry 模块、签名状态、产物目录、页面路由）。\n参数：无。\n比逐个读 json5 配置更高效，部署/构建前可先调用以了解工程。\n副作用：无（只读，解析工程配置）。\n返回：JSON 格式的工程信息。",
+        desc: "读取鸿蒙工程的结构化信息（bundleName、版本、启动 Ability、API 版本、entry 模块、签名状态、产物目录、页面路由），并可分析已检出的 GitHub/Gitee 开源工程模式。\n参数：{\"path\":\"<可选工程目录，必须在绑定工作区内>\",\"patterns\":<可选 true，提取带来源提交、文件证据、适用边界和风险的可复用模式>}。\npatterns=true 适合分析已打开/克隆的鸿蒙开源仓库；只采信语义模型、源码和 Git checkout 证据，不把 README 宣传语当实现事实。\n副作用：无（只读工程、源码与 .git 元数据）。\n返回：JSON 工程信息；深度模式附 repository、扫描范围、模式证据、复用建议与限制。",
     },
     ToolSpec {
         name: "environment_check",
@@ -1254,7 +1254,7 @@ pub async fn run_tool(
         "refresh_api_details" => explore_tools::refresh_api_details(db, ctx).await,
         "get_api_detail" => explore_tools::get_api_detail(&args, &roots, db),
         "diff_api_versions" => explore_tools::diff_api_versions(&args, db),
-        "get_project_info" => get_project_info(&roots).await,
+        "get_project_info" => get_project_info(&args, &roots).await,
         "environment_check" => environment_check(&args, db, ctx).await,
         "search_knowledge" => memory_tools::search_knowledge(&args, project_id, db).await,
         "manage_memory" => memory_tools::manage_memory(&args, project_id, db).await,
@@ -2155,16 +2155,19 @@ async fn sample_proc(device: &str, pid: &str) -> Result<(f64, f64), String> {
 }
 
 /// get_project_info：返回当前鸿蒙工程结构化信息（JSON）
-async fn get_project_info(roots: &[String]) -> Result<String, String> {
-    let project_path = roots.first().map(String::as_str).unwrap_or("");
-    if project_path.is_empty() {
-        return Err("当前会话未绑定项目目录".into());
+async fn get_project_info(args: &Value, roots: &[String]) -> Result<String, String> {
+    let root = match args["path"].as_str().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(path) => resolve_in_roots(roots, path)?,
+        None => roots.first().map(PathBuf::from).ok_or_else(|| "当前会话未绑定项目目录".to_string())?,
+    };
+    if !root.is_dir() {
+        return Err(format!("鸿蒙工程目录不存在：{}", root.display()));
     }
-    let root = Path::new(project_path);
-    let model = crate::services::harmony_model::cached(root);
-    let mut info = crate::services::harmony::project_summary(root, &model);
+    let model = crate::services::harmony_model::cached(&root);
+    let mut info = crate::services::harmony::project_summary(&root, &model);
     let pages = crate::services::harmony::routes_from_model(&model, info.entry_module.as_deref());
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
+        "project_path": root.display().to_string(),
         "bundle_name": info.bundle_name,
         "version_code": info.version_code,
         "version_name": info.version_name,
@@ -2176,6 +2179,12 @@ async fn get_project_info(roots: &[String]) -> Result<String, String> {
         "hap_output_dir": info.hap_output_dir.take().map(|p| p.display().to_string()),
         "pages": pages,
     });
+    if args["patterns"].as_bool().unwrap_or(false) {
+        payload["ecosystem_analysis"] = serde_json::to_value(
+            crate::services::harmony_patterns::analyze(&root, &model),
+        )
+        .map_err(|error| format!("序列化开源工程模式失败：{error}"))?;
+    }
     Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
 }
 

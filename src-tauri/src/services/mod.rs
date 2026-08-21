@@ -14,6 +14,7 @@ pub mod harmony_consistency;
 pub mod harmony_diagnosis;
 pub mod harmony_model;
 pub mod harmony_migration;
+pub mod harmony_patterns;
 pub mod harmony_provenance;
 pub mod harmony_api_diff;
 pub mod harmony_api_ref;
