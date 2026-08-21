@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod governance;
 pub mod dag;
 pub mod evals;
+pub mod enterprise;
 pub mod scheduler;
 pub mod structured_result;
 pub mod crash;

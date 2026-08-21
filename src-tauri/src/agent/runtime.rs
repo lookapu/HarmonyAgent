@@ -461,7 +461,7 @@ pub fn recover_interrupted_runs(conn: &Connection) -> Result<usize, String> {
         let mut stmt = conn
             .prepare(
                 "SELECT run_id,conversation_id FROM agent_runs
-                 WHERE state IN ('queued','running','waiting_approval','waiting_user','verifying')",
+                 WHERE state IN ('queued','running','delegated_running','waiting_approval','waiting_user','verifying')",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt

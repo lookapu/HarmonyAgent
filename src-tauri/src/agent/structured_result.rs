@@ -18,6 +18,28 @@ pub struct VerificationEvidence {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolErrorEvidence {
+    pub code: String,
+    pub retryable: bool,
+    pub category: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompensationEvidence {
+    pub strategy: String,
+    pub requires_approval: bool,
+    pub instruction: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolMetrics {
+    pub duration_ms: i64,
+    pub output_chars: usize,
+    pub artifact_count: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolResultEnvelope {
     pub schema_version: u32,
@@ -31,13 +53,28 @@ pub struct ToolResultEnvelope {
     pub side_effects: Vec<String>,
     pub verification: Vec<VerificationEvidence>,
     pub raw_excerpt: String,
+    pub outcome: String,
+    pub error: Option<ToolErrorEvidence>,
+    pub compensation: Option<CompensationEvidence>,
+    pub metrics: ToolMetrics,
 }
 
 impl ToolResultEnvelope {
     pub fn from_execution(tool: &str, args: &str, output: &str, status: &str) -> Self {
+        Self::from_execution_with_metrics(tool, args, output, status, 0)
+    }
+
+    pub fn from_execution_with_metrics(
+        tool: &str,
+        args: &str,
+        output: &str,
+        status: &str,
+        duration_ms: i64,
+    ) -> Self {
         let contract = crate::agent::tools::contracts::contract(tool);
         let succeeded = status == "ok";
-        let artifacts = argument_artifacts(tool, args);
+        let mut artifacts = argument_artifacts(tool, args);
+        merge_native_artifacts(output, &mut artifacts);
         let mut verification = Vec::new();
         if is_verifier(tool, args) {
             verification.push(VerificationEvidence {
@@ -56,8 +93,15 @@ impl ToolResultEnvelope {
                 .map(|artifact| format!("{}:{}", artifact.operation, artifact.path))
                 .collect()
         };
+        let error = (!succeeded).then(|| classify_error(status, output, contract.retry_safe));
+        let compensation = compensation(tool, contract.recovery.as_str(), succeeded, &artifacts);
+        let metrics = ToolMetrics {
+            duration_ms: duration_ms.max(0),
+            output_chars: output.chars().count(),
+            artifact_count: artifacts.len(),
+        };
         Self {
-            schema_version: 1,
+            schema_version: 2,
             tool: tool.into(),
             status: status.into(),
             summary: first_line(output),
@@ -68,15 +112,120 @@ impl ToolResultEnvelope {
             side_effects,
             verification,
             raw_excerpt: output.chars().take(1000).collect(),
+            outcome: if succeeded {
+                "succeeded"
+            } else if status == "cancelled" {
+                "cancelled"
+            } else {
+                "failed"
+            }
+            .into(),
+            error,
+            compensation,
+            metrics,
         }
     }
 
     pub fn digest(&self) -> String {
-        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        let mut canonical = self.clone();
+        // 证据身份必须与机器快慢无关，否则相同副作用在不同耗时下无法去重。
+        canonical.metrics.duration_ms = 0;
+        let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
         let mut digest = Sha256::new();
         digest.update(bytes);
         format!("{:x}", digest.finalize())
     }
+}
+
+fn classify_error(status: &str, output: &str, retry_safe: bool) -> ToolErrorEvidence {
+    let lower = output.to_lowercase();
+    let (code, category, transient) = if status == "cancelled" {
+        ("TOOL_CANCELLED", "cancelled", false)
+    } else if lower.contains("timeout") || lower.contains("超时") {
+        ("TOOL_TIMEOUT", "timeout", true)
+    } else if lower.contains("permission") || lower.contains("权限") {
+        ("TOOL_PERMISSION_DENIED", "permission", false)
+    } else if lower.contains("not found") || lower.contains("不存在") {
+        ("TOOL_NOT_FOUND", "not_found", false)
+    } else if lower.contains("network") || lower.contains("connection") || lower.contains("网络")
+    {
+        ("TOOL_NETWORK", "network", true)
+    } else if status == "blocked" {
+        ("TOOL_POLICY_BLOCKED", "policy", false)
+    } else {
+        ("TOOL_EXECUTION_FAILED", "execution", false)
+    };
+    ToolErrorEvidence {
+        code: code.into(),
+        retryable: retry_safe && transient,
+        category: category.into(),
+        message: first_line(output),
+    }
+}
+
+fn compensation(
+    tool: &str,
+    recovery: &str,
+    succeeded: bool,
+    artifacts: &[ArtifactEvidence],
+) -> Option<CompensationEvidence> {
+    if !succeeded || recovery == "replay" {
+        return None;
+    }
+    let (strategy, approval, instruction) = match tool {
+        "write_file" | "edit_file" | "apply_patch" | "delete_file" => (
+            "restore_snapshot",
+            false,
+            "Restore the pre-tool file snapshot",
+        ),
+        "git_commit" => ("git_revert", true, "Create a compensating revert commit"),
+        "deploy" | "deploy_all" => (
+            "redeploy_previous",
+            true,
+            "Verify device state and redeploy the previous artifact",
+        ),
+        _ if !artifacts.is_empty() => (
+            "verify_then_compensate",
+            true,
+            "Verify external state before applying a compensating action",
+        ),
+        _ => return None,
+    };
+    Some(CompensationEvidence {
+        strategy: strategy.into(),
+        requires_approval: approval,
+        instruction: instruction.into(),
+    })
+}
+
+fn merge_native_artifacts(output: &str, artifacts: &mut Vec<ArtifactEvidence>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return;
+    };
+    let Some(items) = value.get("artifacts").and_then(|value| value.as_array()) else {
+        return;
+    };
+    for item in items {
+        let Some(path) = item.get("path").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        artifacts.push(ArtifactEvidence {
+            path: path.replace('\\', "/"),
+            kind: item
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| artifact_kind(path))
+                .into(),
+            operation: item
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("produce")
+                .into(),
+        });
+    }
+    artifacts.sort_by(|a, b| a.path.cmp(&b.path).then(a.operation.cmp(&b.operation)));
+    artifacts.dedup_by(|a, b| a.path == b.path && a.operation == b.operation);
+    artifacts.truncate(64);
 }
 
 fn first_line(output: &str) -> String {
@@ -197,7 +346,20 @@ mod tests {
         );
         assert_eq!(value.artifacts[0].path, "src/a.rs");
         assert_eq!(value.side_effects, vec!["write:src/a.rs"]);
+        assert_eq!(value.schema_version, 2);
+        assert_eq!(
+            value.compensation.as_ref().unwrap().strategy,
+            "restore_snapshot"
+        );
         assert_eq!(value.digest(), value.digest());
+        let slower = ToolResultEnvelope::from_execution_with_metrics(
+            "edit_file",
+            r#"{"path":"src/a.rs","new":"x"}"#,
+            "updated",
+            "ok",
+            9_999,
+        );
+        assert_eq!(value.digest(), slower.digest());
     }
 
     #[test]
@@ -205,5 +367,20 @@ mod tests {
         let value = ToolResultEnvelope::from_execution("run_tests", "{}", "2 failed", "error");
         assert!(!value.verification[0].passed);
         assert!(value.side_effects.is_empty());
+        assert_eq!(value.error.as_ref().unwrap().code, "TOOL_EXECUTION_FAILED");
+    }
+
+    #[test]
+    fn retryability_and_native_artifacts_are_machine_readable() {
+        let timeout =
+            ToolResultEnvelope::from_execution("read_file", "{}", "network timeout", "error");
+        assert!(timeout.error.unwrap().retryable);
+        let native = ToolResultEnvelope::from_execution(
+            "build_generic",
+            "{}",
+            r#"{"artifacts":[{"path":"dist/app.exe","kind":"binary"}]}"#,
+            "ok",
+        );
+        assert_eq!(native.artifacts[0].path, "dist/app.exe");
     }
 }

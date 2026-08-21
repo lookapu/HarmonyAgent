@@ -38,6 +38,9 @@ pub struct ReliabilityDashboard {
     pub dag_failed_nodes: i64,
     pub latest_eval: Option<crate::agent::evals::EvalRun>,
     pub recent_runs: Vec<QualityRunRow>,
+    pub open_alert_count: i64,
+    pub critical_alert_count: i64,
+    pub quota: crate::agent::enterprise::QuotaUsage,
 }
 
 #[tauri::command]
@@ -49,6 +52,7 @@ pub fn get_reliability_dashboard(
     let _ = crate::agent::scheduler::recover_expired(&conn);
     let since =
         chrono::Utc::now().timestamp_millis() - days.unwrap_or(30).clamp(1, 365) * 86_400_000;
+    let _ = crate::agent::enterprise::evaluate_window_slo(&conn, since);
     let mut stmt = conn.prepare(
         "SELECT run_id,conversation_id,goal,state,quality_json,acceptance_json,remediation_count,recovery_mode,updated_at
          FROM agent_runs WHERE parent_run_id IS NULL AND started_at>=?1 ORDER BY started_at DESC",
@@ -169,6 +173,10 @@ pub fn get_reliability_dashboard(
         "SELECT COUNT(*),SUM(CASE WHEN state='completed' THEN 1 ELSE 0 END),SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END)
          FROM agent_dag_nodes WHERE created_at>=?1", [since], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
     ).unwrap_or((0,0,0));
+    let (open_alert_count,critical_alert_count) = conn.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END),0) FROM agent_alerts WHERE state='open'",
+        [], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap_or((0,0));
     Ok(ReliabilityDashboard {
         total_runs,
         acceptance_rate: ratio(accepted, total_runs),
@@ -188,7 +196,56 @@ pub fn get_reliability_dashboard(
         dag_failed_nodes,
         latest_eval: latest_eval(&conn)?,
         recent_runs,
+        open_alert_count,
+        critical_alert_count,
+        quota: crate::agent::enterprise::quota(&conn)?,
     })
+}
+
+#[tauri::command]
+pub fn list_agent_alerts(
+    db: State<DbState>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::agent::enterprise::AgentAlert>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::enterprise::list_alerts(&conn, limit.unwrap_or(100))
+}
+
+#[tauri::command]
+pub fn list_agent_audit_events(
+    db: State<DbState>,
+    run_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::agent::enterprise::AuditEvent>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::enterprise::list_audit(&conn, run_id.as_deref(), limit.unwrap_or(200))
+}
+
+#[tauri::command]
+pub fn get_agent_slo_policy(
+    db: State<DbState>,
+) -> Result<Option<crate::agent::enterprise::SloPolicy>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::enterprise::get_policy(&conn)
+}
+
+#[tauri::command]
+pub fn update_agent_slo_policy(
+    db: State<DbState>,
+    policy: crate::agent::enterprise::SloPolicy,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::enterprise::update_policy(&conn, &policy)?;
+    crate::agent::enterprise::audit(
+        &conn,
+        None,
+        None,
+        "user",
+        "slo.update",
+        "agent_slo_policy",
+        "success",
+        &serde_json::json!({"policy_id":policy.policy_id}),
+    )
 }
 
 #[tauri::command]
@@ -219,6 +276,97 @@ pub fn list_agent_dag_nodes(
 ) -> Result<Vec<crate::agent::dag::DagNode>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     crate::agent::dag::list_nodes(&conn, &root_run_id)
+}
+
+#[tauri::command]
+pub fn get_scheduled_agent_task(
+    db: State<DbState>,
+    run_id: String,
+) -> Result<Option<crate::agent::scheduler::ScheduledTask>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::scheduler::get(&conn, &run_id)
+}
+
+#[tauri::command]
+pub fn claim_next_scheduled_agent_task(
+    db: State<DbState>,
+    lease_ms: Option<i64>,
+) -> Result<Option<crate::agent::scheduler::ScheduledTask>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::scheduler::claim_next(&conn, lease_ms.unwrap_or(180_000))
+}
+
+#[tauri::command]
+pub fn retry_scheduled_agent_task(
+    db: State<DbState>,
+    run_id: String,
+    error: String,
+    delay_ms: Option<i64>,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::scheduler::release_for_retry(&conn, &run_id, &error, delay_ms.unwrap_or(1_000))
+}
+
+#[tauri::command]
+pub fn resume_scheduled_agent_task(
+    db: State<DbState>,
+    run_id: String,
+    resume_token: String,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::scheduler::request_resume(&conn, &run_id, &resume_token)
+}
+
+#[tauri::command]
+pub fn add_agent_dag_dependency(
+    db: State<DbState>,
+    root_run_id: String,
+    from_node_id: String,
+    to_node_id: String,
+    required: Option<bool>,
+    condition: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::dag::add_dependency(
+        &conn,
+        &root_run_id,
+        &from_node_id,
+        &to_node_id,
+        required.unwrap_or(true),
+        &condition.unwrap_or_default(),
+    )
+}
+
+#[tauri::command]
+pub fn list_runnable_agent_dag_nodes(
+    db: State<DbState>,
+    root_run_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::agent::dag::DagNode>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::dag::runnable_nodes(&conn, &root_run_id, limit.unwrap_or(50))
+}
+
+#[tauri::command]
+pub fn retry_agent_dag_node(
+    db: State<DbState>,
+    node_id: String,
+    error: String,
+    delay_ms: Option<i64>,
+) -> Result<String, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::dag::fail_or_retry_node(&conn, &node_id, &error, delay_ms.unwrap_or(1_000))
+}
+
+#[tauri::command]
+pub fn cancel_agent_dag_descendants(
+    db: State<DbState>,
+    root_run_id: String,
+    node_id: String,
+    reason: String,
+) -> Result<usize, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::dag::cancel_descendants(&conn, &root_run_id, &node_id, &reason)
 }
 
 fn ratio(numerator: i64, denominator: i64) -> f64 {

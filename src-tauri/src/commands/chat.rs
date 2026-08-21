@@ -1834,13 +1834,17 @@ async fn stream_chat_body(
                     phase,
                     error,
                 );
-                let scheduler_state = match run_state {
-                    "completed" => "completed",
-                    "cancelled" => "cancelled",
-                    _ => "failed",
-                };
-                let _ = crate::agent::scheduler::finish(&conn, run_id, scheduler_state, error);
+                let scheduler_state = match run_state { "completed" => "completed", "cancelled" => "cancelled", "interrupted" => "recovery_required", _ => "failed" };
+                if scheduler_state == "recovery_required" {
+                    let _ = crate::agent::scheduler::mark_recovery_required(&conn, run_id, error.unwrap_or("任务需要恢复"));
+                } else {
+                    let _ = crate::agent::scheduler::finish(&conn, run_id, scheduler_state, error);
+                }
                 let _ = crate::agent::dag::finish_root(&conn, run_id, scheduler_state);
+                let _ = crate::agent::enterprise::record_run_finished(
+                    &conn, run_id, &conversation_id, run_state,
+                    chrono::Utc::now().timestamp_millis().saturating_sub(started_ms),
+                );
             }
         }
 
@@ -2007,6 +2011,7 @@ fn record_task_run(
         finished_at: finished_ms / 1000,
     };
     let _ = crate::db::queries::insert_task_run(&conn, &run);
+    let _ = crate::agent::enterprise::record_cost(&conn, stats.run_id.as_deref(), cost_cny);
 }
 
 const TOOL_AUDIT_TEXT_LIMIT: usize = 120_000;
@@ -2116,8 +2121,8 @@ fn finish_tool_run(
     duration_ms: i64,
 ) {
     let (input, output) = tool_audit_payload(tool, input, output, status);
-    let structured = crate::agent::structured_result::ToolResultEnvelope::from_execution(
-        tool, &input, &output, status,
+    let structured = crate::agent::structured_result::ToolResultEnvelope::from_execution_with_metrics(
+        tool, &input, &output, status, duration_ms,
     );
     let structured_json = serde_json::to_string(&structured).unwrap_or_default();
     let evidence_digest = structured.digest();
@@ -2127,9 +2132,11 @@ fn finish_tool_run(
             .execute(
                 "UPDATE tool_runs SET result_json=?1, status=?2, duration_ms=?3,
                  trace_id=?4, call_id=?5, finished_at=?6,structured_result_json=?7,
-                 evidence_digest=?8,dag_node_id=COALESCE(dag_node_id,(SELECT dag_node_id FROM agent_runs WHERE run_id=?4)) WHERE id=?5
+                 evidence_digest=?8,dag_node_id=COALESCE(dag_node_id,(SELECT dag_node_id FROM agent_runs WHERE run_id=?4)),
+                 protocol_version=2,error_code=?9,compensation_json=?10,metrics_json=?11 WHERE id=?5
                  AND status NOT IN ('ok','error','blocked','cancelled','interrupted')",
-                params![output, status, duration_ms, trace_id, id, now(), structured_json, evidence_digest],
+                params![output, status, duration_ms, trace_id, id, now(), structured_json, evidence_digest,
+                    structured.error.as_ref().map(|e|e.code.as_str()),serde_json::to_string(&structured.compensation).ok(),serde_json::to_string(&structured.metrics).ok()],
             )
             .unwrap_or(0);
         if updated > 0 {
@@ -2167,6 +2174,7 @@ fn finish_tool_run(
                 &serde_json::json!({ "last_call_id": id, "tool": tool, "status": status, "evidence_digest": evidence_digest }),
                 180_000,
             );
+            let _ = crate::agent::enterprise::record_tool(&conn, trace_id, conversation_id, tool, status, &evidence_digest);
             let _ = crate::agent::runtime::append_event(
                 &conn,
                 trace_id,
@@ -2204,9 +2212,9 @@ fn finish_tool_run(
         "INSERT OR REPLACE INTO tool_runs
          (id, conversation_id, tool_name, input_json, result_json, status, duration_ms, created_at,
           trace_id, call_id, idempotency_key, effect_kind, recovery_policy, prepared_at, finished_at,
-          structured_result_json,evidence_digest,dag_node_id)
+          structured_result_json,evidence_digest,dag_node_id,protocol_version,error_code,compensation_json,metrics_json)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?1,?11,?12,?8,?13,?14,?15,
-                 (SELECT dag_node_id FROM agent_runs WHERE run_id=?9))",
+                 (SELECT dag_node_id FROM agent_runs WHERE run_id=?9),2,?16,?17,?18)",
         params![
             id,
             conversation_id,
@@ -2223,6 +2231,9 @@ fn finish_tool_run(
             now(),
             structured_json,
             evidence_digest,
+            structured.error.as_ref().map(|e|e.code.as_str()),
+            serde_json::to_string(&structured.compensation).ok(),
+            serde_json::to_string(&structured.metrics).ok(),
         ],
     ).unwrap_or(0);
     if inserted > 0 {
@@ -2279,6 +2290,7 @@ fn finish_tool_run(
             &serde_json::json!({ "last_call_id": id, "tool": tool, "status": status, "evidence_digest": evidence_digest }),
             180_000,
         );
+        let _ = crate::agent::enterprise::record_tool(&conn, trace_id, conversation_id, tool, status, &evidence_digest);
         let _ = crate::agent::runtime::append_event(
             &conn,
             trace_id,
@@ -2406,7 +2418,15 @@ async fn stream_chat_inner(
             &serde_json::to_value(&execution_budget).unwrap_or_default(),
             execution_budget.lease_ms,
         )?;
+        crate::agent::scheduler::update_payload(&conn,&trace_id,&serde_json::json!({
+            "conversation_id":conversation_id,
+            "goal":goal_contract.original_goal,
+            "resume_run_id":recovery_plan.as_ref().map(|plan|plan.parent_run_id.as_str()),
+            "requires_provider_rebind":true,
+        }))?;
+        crate::agent::enterprise::record_run_started(&conn, &trace_id, &conversation_id)?;
         if let Some(plan) = recovery_plan.as_ref() {
+            let _ = crate::agent::scheduler::supersede_recovery(&conn, &plan.parent_run_id, &trace_id);
             crate::agent::coordinator::inherit_plan_steps(
                 &conn,
                 &plan.parent_run_id,
@@ -6669,6 +6689,9 @@ async fn stream_once(
     state: &tauri::State<'_, DbState>,
     placeholder: &mut Option<String>,
 ) -> Result<StreamOutcome, FriendlyError> {
+    if crate::agent::evals::take_fault("stream_disconnect_before_delta") {
+        return Err(FriendlyError::new(ErrorKind::Network,"可靠性评测故障注入：首个增量前断流"));
+    }
     // 能力接缝：按协议解析出提供方实现，协议特有的请求构造由 trait 承担
     let provider_impl = llm_provider_for(protocol);
     // 原生 function calling（工具协议标准化 Phase 1）：仅 openai 协议 + 显式开启时
@@ -7009,6 +7032,10 @@ async fn stream_once(
                         registry.touch_stream_progress(conversation_id);
                         delivered_content.push_str(&delta);
                         event_batcher.push_content(&delta);
+                        if crate::agent::evals::take_fault("stream_disconnect_after_delta") {
+                            event_batcher.flush();
+                            return Err(FriendlyError::new(ErrorKind::Network,"可靠性评测故障注入：增量检查点后断流"));
+                        }
                     }
                     StreamParserEvent::Reasoning(r) => {
                         registry.touch_stream_progress(conversation_id);
@@ -7171,6 +7198,9 @@ async fn stream_once(
             usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
             tool_calls: Vec::new(),
         });
+    }
+    if crate::agent::evals::take_fault("model_output_truncated") {
+        truncated = true;
     }
     // 截断：不报错退出，保留已输出内容并标记 truncated，由主循环决定追加“请继续”续写。
     // 注意：输出截断不等于上下文超限，裁剪历史对其无效，必须续写才能继续。
@@ -8529,7 +8559,7 @@ async fn run_tool_with_guard(
     } else {
         "write_tool_timeout"
     };
-    if crate::agent::evals::fault_enabled(fault_point) {
+    if crate::agent::evals::take_fault(fault_point) {
         return Err(format!("可靠性评测故障注入：{fault_point}（工具 {tool} 未执行）"));
     }
     if !tool_ctx.run_id.is_empty() {

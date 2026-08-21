@@ -19,6 +19,12 @@ pub struct DagNode {
     pub created_at: i64,
     pub updated_at: i64,
     pub finished_at: Option<i64>,
+    pub attempt: i64,
+    pub max_attempts: i64,
+    pub next_attempt_at: Option<i64>,
+    pub condition_json: String,
+    pub failure_policy: String,
+    pub concurrency_key: Option<String>,
 }
 
 fn now_ms() -> i64 {
@@ -129,7 +135,15 @@ pub fn finish_child(
 ) -> Result<(), String> {
     let now = now_ms();
     let passed = error.is_none() && report.passed;
-    let state = if passed { "completed" } else { "failed" };
+    let cancelled = error
+        .is_some_and(|value| value.contains("停止") || value.to_lowercase().contains("cancel"));
+    let state = if passed {
+        "completed"
+    } else if cancelled {
+        "cancelled"
+    } else {
+        "failed"
+    };
     let acceptance = serde_json::to_string(report).unwrap_or_default();
     conn.execute(
         "UPDATE agent_dag_nodes SET state=?1,acceptance_json=?2,output_summary=?3,updated_at=?4,finished_at=?4
@@ -151,6 +165,23 @@ pub fn finish_child(
             "node_id": node_id, "child_run_id": child_run_id, "state": state, "acceptance_passed": report.passed,
         }),
     );
+    if !passed {
+        let policy: String = conn
+            .query_row(
+                "SELECT failure_policy FROM agent_dag_nodes WHERE node_id=?1",
+                [node_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "fail_fast".into());
+        if policy == "fail_fast" {
+            let _ = cancel_descendants(
+                conn,
+                root_run_id,
+                node_id,
+                error.unwrap_or("upstream node failed"),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -164,10 +195,22 @@ pub fn finish_root(conn: &Connection, root_run_id: &str, state: &str) -> Result<
     Ok(())
 }
 
+pub fn recover_orphaned_nodes(conn: &Connection) -> Result<usize, String> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE agent_dag_nodes SET state=CASE WHEN attempt<max_attempts THEN 'retry_wait' ELSE 'failed' END,
+         next_attempt_at=CASE WHEN attempt<max_attempts THEN ?1 ELSE NULL END,
+         output_summary=COALESCE(output_summary,'应用重启，节点等待局部恢复'),updated_at=?1
+         WHERE state='running' AND parent_node_id IS NOT NULL",
+        [now],
+    ).map_err(|e|e.to_string())
+}
+
 pub fn list_nodes(conn: &Connection, root_run_id: &str) -> Result<Vec<DagNode>, String> {
     let mut stmt = conn.prepare(
         "SELECT node_id,root_run_id,run_id,parent_node_id,name,goal,model,state,acceptance_json,
-                output_summary,created_at,updated_at,finished_at
+                output_summary,created_at,updated_at,finished_at,attempt,max_attempts,next_attempt_at,
+                condition_json,failure_policy,concurrency_key
          FROM agent_dag_nodes WHERE root_run_id=?1 ORDER BY created_at,node_id",
     ).map_err(|e| e.to_string())?;
     let rows = stmt
@@ -186,11 +229,127 @@ pub fn list_nodes(conn: &Connection, root_run_id: &str) -> Result<Vec<DagNode>, 
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
                 finished_at: row.get(12)?,
+                attempt: row.get(13)?,
+                max_attempts: row.get(14)?,
+                next_attempt_at: row.get(15)?,
+                condition_json: row.get(16)?,
+                failure_policy: row.get(17)?,
+                concurrency_key: row.get(18)?,
             })
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+}
+
+pub fn add_dependency(
+    conn: &Connection,
+    root_run_id: &str,
+    from_node_id: &str,
+    to_node_id: &str,
+    required: bool,
+    condition: &serde_json::Value,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO agent_dag_edges(root_run_id,from_node_id,to_node_id,edge_kind,created_at,condition_json,required)
+         VALUES (?1,?2,?3,'depends_on',?4,?5,?6)
+         ON CONFLICT(root_run_id,from_node_id,to_node_id) DO UPDATE SET condition_json=excluded.condition_json,required=excluded.required",
+        params![root_run_id,from_node_id,to_node_id,now_ms(),condition.to_string(),required],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 返回依赖均已成功（或非必需依赖已终止）的 pending/retry_wait 节点。
+pub fn runnable_nodes(
+    conn: &Connection,
+    root_run_id: &str,
+    limit: usize,
+) -> Result<Vec<DagNode>, String> {
+    let now = now_ms();
+    let mut stmt = conn.prepare(
+        "SELECT n.node_id,n.root_run_id,n.run_id,n.parent_node_id,n.name,n.goal,n.model,n.state,
+         n.acceptance_json,n.output_summary,n.created_at,n.updated_at,n.finished_at,n.attempt,n.max_attempts,
+         n.next_attempt_at,n.condition_json,n.failure_policy,n.concurrency_key
+         FROM agent_dag_nodes n WHERE n.root_run_id=?1 AND n.state IN ('pending','retry_wait')
+         AND (n.next_attempt_at IS NULL OR n.next_attempt_at<=?2)
+         AND NOT EXISTS (SELECT 1 FROM agent_dag_edges e JOIN agent_dag_nodes upstream ON upstream.node_id=e.from_node_id
+           WHERE e.root_run_id=n.root_run_id AND e.to_node_id=n.node_id AND e.required=1 AND upstream.state!='completed')
+         AND (n.concurrency_key IS NULL OR NOT EXISTS (SELECT 1 FROM agent_dag_nodes active
+           WHERE active.root_run_id=n.root_run_id AND active.concurrency_key=n.concurrency_key AND active.state='running'))
+         ORDER BY n.created_at,n.node_id LIMIT ?3"
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            params![root_run_id, now, limit.clamp(1, 100) as i64],
+            row_to_node,
+        )
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn fail_or_retry_node(
+    conn: &Connection,
+    node_id: &str,
+    error: &str,
+    delay_ms: i64,
+) -> Result<String, String> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE agent_dag_nodes SET state=CASE WHEN attempt<max_attempts THEN 'retry_wait' ELSE 'failed' END,
+         attempt=CASE WHEN attempt<max_attempts THEN attempt+1 ELSE attempt END,
+         next_attempt_at=CASE WHEN attempt<max_attempts THEN ?1 ELSE NULL END,
+         output_summary=?2,updated_at=?3,finished_at=CASE WHEN attempt<max_attempts THEN NULL ELSE ?3 END
+         WHERE node_id=?4 AND state IN ('running','pending')",
+        params![now.saturating_add(delay_ms.max(0)),error.chars().take(1000).collect::<String>(),now,node_id],
+    ).map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT state FROM agent_dag_nodes WHERE node_id=?1",
+        [node_id],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// 递归取消所有尚未终止的下游节点；已完成节点保持不可变。
+pub fn cancel_descendants(
+    conn: &Connection,
+    root_run_id: &str,
+    node_id: &str,
+    reason: &str,
+) -> Result<usize, String> {
+    conn.execute(
+        "WITH RECURSIVE descendants(node_id) AS (
+           SELECT to_node_id FROM agent_dag_edges WHERE root_run_id=?1 AND from_node_id=?2
+           UNION SELECT e.to_node_id FROM agent_dag_edges e JOIN descendants d ON e.from_node_id=d.node_id WHERE e.root_run_id=?1)
+         UPDATE agent_dag_nodes SET state='cancelled',output_summary=?3,updated_at=?4,finished_at=?4
+         WHERE node_id IN descendants AND state NOT IN ('completed','failed','cancelled')",
+        params![root_run_id,node_id,reason,now_ms()],
+    ).map_err(|e| e.to_string())
+}
+
+fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<DagNode> {
+    Ok(DagNode {
+        node_id: row.get(0)?,
+        root_run_id: row.get(1)?,
+        run_id: row.get(2)?,
+        parent_node_id: row.get(3)?,
+        name: row.get(4)?,
+        goal: row.get(5)?,
+        model: row.get(6)?,
+        state: row.get(7)?,
+        acceptance_json: row.get(8)?,
+        output_summary: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        finished_at: row.get(12)?,
+        attempt: row.get(13)?,
+        max_attempts: row.get(14)?,
+        next_attempt_at: row.get(15)?,
+        condition_json: row.get(16)?,
+        failure_policy: row.get(17)?,
+        concurrency_key: row.get(18)?,
+    })
 }
 
 pub fn evaluate_run(
@@ -288,7 +447,41 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             finished_at: Some(2),
+            attempt: 1,
+            max_attempts: 2,
+            next_attempt_at: None,
+            condition_json: "{}".into(),
+            failure_policy: "fail_fast".into(),
+            concurrency_key: None,
         };
         assert!(serde_json::to_string(&node).unwrap().contains("review"));
+    }
+
+    #[test]
+    fn dependency_retry_and_cancel_flow() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE agent_dag_nodes(node_id TEXT PRIMARY KEY,root_run_id TEXT,run_id TEXT,parent_node_id TEXT,name TEXT,goal TEXT,model TEXT,state TEXT,acceptance_json TEXT,output_summary TEXT,created_at INTEGER,updated_at INTEGER,finished_at INTEGER,attempt INTEGER DEFAULT 1,max_attempts INTEGER DEFAULT 2,next_attempt_at INTEGER,condition_json TEXT DEFAULT '{}',failure_policy TEXT DEFAULT 'fail_fast',concurrency_key TEXT); CREATE TABLE agent_dag_edges(root_run_id TEXT,from_node_id TEXT,to_node_id TEXT,edge_kind TEXT,created_at INTEGER,condition_json TEXT DEFAULT '{}',required INTEGER DEFAULT 1,PRIMARY KEY(root_run_id,from_node_id,to_node_id)); INSERT INTO agent_dag_nodes(node_id,root_run_id,run_id,name,goal,state,created_at,updated_at) VALUES ('a','r','ra','a','a','running',1,1),('b','r','rb','b','b','pending',2,2),('c','r','rc','c','c','pending',3,3);").unwrap();
+        add_dependency(&conn, "r", "a", "b", true, &serde_json::json!({})).unwrap();
+        add_dependency(&conn, "r", "b", "c", true, &serde_json::json!({})).unwrap();
+        assert!(runnable_nodes(&conn, "r", 10).unwrap().is_empty());
+        conn.execute(
+            "UPDATE agent_dag_nodes SET state='completed' WHERE node_id='a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(runnable_nodes(&conn, "r", 10).unwrap()[0].node_id, "b");
+        conn.execute(
+            "UPDATE agent_dag_nodes SET state='running' WHERE node_id='b'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            fail_or_retry_node(&conn, "b", "temporary", 0).unwrap(),
+            "retry_wait"
+        );
+        assert_eq!(
+            cancel_descendants(&conn, "r", "b", "upstream cancelled").unwrap(),
+            1
+        );
     }
 }

@@ -9,7 +9,7 @@ import { writeTextFile } from '@tauri-apps/plugin-fs'
 import Icon from '../icons/Icon'
 import { getJSON, setJSON } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
-import { getReliabilityDashboard, runReliabilityEvaluation, type ReliabilityDashboard } from '../api/reliability'
+import { getAgentSloPolicy, getReliabilityDashboard, listAgentAlerts, runReliabilityEvaluation, type AgentAlert, type ReliabilityDashboard, type SloPolicy } from '../api/reliability'
 
 /** CSV 字段转义：含逗号/引号/换行的字段用双引号包裹，内部双引号 → 双重转义 */
 const csvEscape = (s: string) => {
@@ -38,6 +38,8 @@ export default function CostPage() {
   const [requestLogsLoading, setRequestLogsLoading] = useState(false)
   const [reliability, setReliability] = useState<ReliabilityDashboard | null>(null)
   const [reliabilityLoading, setReliabilityLoading] = useState(false)
+  const [agentAlerts, setAgentAlerts] = useState<AgentAlert[]>([])
+  const [sloPolicy, setSloPolicy] = useState<SloPolicy | null>(null)
   // 请求日志状态过滤：all / success / error
   const [logStatusFilter, setLogStatusFilter] = useState<'all' | 'success' | 'error'>('all')
   // 请求日志分页
@@ -127,7 +129,12 @@ export default function CostPage() {
 
   const loadReliability = useCallback(async () => {
     try {
-      setReliability(await getReliabilityDashboard(30))
+      const dashboard = await getReliabilityDashboard(30)
+      const alerts = await listAgentAlerts(20)
+      const policy = await getAgentSloPolicy()
+      setReliability(dashboard)
+      setAgentAlerts(alerts)
+      setSloPolicy(policy)
     } catch (e) {
       console.error(e)
     }
@@ -364,6 +371,12 @@ export default function CostPage() {
           <ReliabilityValue label={t('cost.dagProgress')} value={`${reliability?.dag_completed_nodes ?? 0}/${reliability?.dag_total_nodes ?? 0}`} />
           <ReliabilityValue label={t('cost.duplicateEffects')} value={String(reliability?.duplicate_side_effect_count ?? 0)} />
         </div>
+        <div className="grid grid-cols-4 gap-4 text-sm border-t border-[var(--border)] pt-3">
+          <ReliabilityValue label={t('cost.openAlerts')} value={String(reliability?.open_alert_count ?? 0)} />
+          <ReliabilityValue label={t('cost.criticalAlerts')} value={String(reliability?.critical_alert_count ?? 0)} />
+          <ReliabilityValue label={t('cost.monthlyRuns')} value={String(reliability?.quota.runs ?? 0)} />
+          <ReliabilityValue label={t('cost.monthlyToolCalls')} value={String(reliability?.quota.tool_calls ?? 0)} />
+        </div>
         <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3 text-[11px]">
           <span className="text-[var(--text-muted)]">{t('cost.schedulerStates')}</span>
           {(reliability?.scheduler_states ?? []).map((item) => (
@@ -376,6 +389,26 @@ export default function CostPage() {
               : t('cost.notRun')}
           </span>
         </div>
+        {sloPolicy?.enabled && (
+          <p className="text-[10.5px] text-[var(--text-muted)]">
+            {t('cost.sloTargets', { acceptance: (sloPolicy.acceptance_target * 100).toFixed(0), recovery: (sloPolicy.recovery_target * 100).toFixed(0), evidence: (sloPolicy.evidence_target * 100).toFixed(0) })}
+          </p>
+        )}
+        {agentAlerts.length > 0 && (
+          <div className="border-t border-[var(--border)] pt-3">
+            <p className="text-xs text-[var(--text-secondary)] mb-2">{t('cost.recentAlerts')}</p>
+            <div className="space-y-1.5 max-h-36 overflow-auto">
+              {agentAlerts.slice(0, 8).map((alert) => (
+                <div key={alert.alert_id} className="flex items-center gap-2 text-[11px]">
+                  <span className={`badge-tone ${alert.severity === 'critical' ? 'badge-tone-bad' : 'badge-tone-warn'}`}>{alert.severity}</span>
+                  <span className="font-mono text-[var(--text-secondary)]">{alert.code}</span>
+                  <span className="truncate" title={alert.message}>{alert.message}</span>
+                  <span className="ml-auto shrink-0 text-[var(--text-muted)]">{new Date(alert.created_at).toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 任务级指标：Agent 任务成功率 / 耗时分布 / 错误分类 */}

@@ -39,5 +39,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
       - name: Agent reliability gate
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked agent::evals::tests::reliability_gate
+      - name: Agent execution kernel V2 gate
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked agent::
       - name: Rust clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked

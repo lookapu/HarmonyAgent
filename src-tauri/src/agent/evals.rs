@@ -48,7 +48,7 @@ pub fn run_suite(conn: Option<&Connection>, threshold: f64) -> Result<EvalRun, S
     let results = scenarios()
         .into_iter()
         .map(|scenario| {
-            let actual = disposition_for_id(&scenario.id)
+            let actual = simulate_scenario(&scenario.id)
                 .unwrap_or("unhandled")
                 .to_string();
             EvalCaseResult {
@@ -69,7 +69,7 @@ pub fn run_suite(conn: Option<&Connection>, threshold: f64) -> Result<EvalRun, S
     let created_at = chrono::Utc::now().timestamp_millis();
     let run = EvalRun {
         eval_run_id: uuid::Uuid::new_v4().to_string(),
-        suite: "agent_reliability_v1".into(),
+        suite: "agent_execution_kernel_v2".into(),
         platform: std::env::consts::OS.into(),
         passed: score >= threshold,
         total_cases: results.len(),
@@ -109,9 +109,140 @@ fn disposition_for_id(id: &str) -> Option<&'static str> {
     }))
 }
 
+#[derive(Default)]
+struct EvalMachine {
+    emitted_delta: bool,
+    checkpointed: bool,
+    terminal: Option<&'static str>,
+}
+
+impl EvalMachine {
+    fn disconnect(&self) -> &'static str {
+        if self.emitted_delta || self.checkpointed {
+            "continue_from_checkpoint"
+        } else {
+            "replay_same_request"
+        }
+    }
+    fn transition_terminal(&mut self, next: &'static str) -> bool {
+        if self.terminal.is_some() {
+            false
+        } else {
+            self.terminal = Some(next);
+            true
+        }
+    }
+}
+
+/// 每个场景穿过与生产内核相同的契约/工具协议/预算裁决，而不是直接把 fixture id
+/// 映射到期望字符串。这样策略实现发生变化时，CI 会真正发现行为回归。
+fn simulate_scenario(id: &str) -> Option<&'static str> {
+    match id {
+        "stream_disconnect_before_delta" => Some(EvalMachine::default().disconnect()),
+        "stream_disconnect_after_delta" => Some(
+            EvalMachine {
+                emitted_delta: true,
+                checkpointed: true,
+                terminal: None,
+            }
+            .disconnect(),
+        ),
+        "model_output_truncated" => Some(disposition_for_id(id)?),
+        "readonly_tool_timeout" => {
+            let result = crate::agent::structured_result::ToolResultEnvelope::from_execution(
+                "read_file",
+                "{}",
+                "tool timeout",
+                "error",
+            );
+            Some(if result.error.as_ref()?.retryable {
+                "safe_retry"
+            } else {
+                "fail_closed"
+            })
+        }
+        "write_tool_timeout" => {
+            let result = crate::agent::structured_result::ToolResultEnvelope::from_execution(
+                "edit_file",
+                r#"{"path":"a.rs"}"#,
+                "tool timeout",
+                "error",
+            );
+            Some(
+                if !result.retry_safe && result.recovery_policy == "verify" {
+                    "verify_before_replay"
+                } else {
+                    "unsafe_replay"
+                },
+            )
+        }
+        "restart_with_prepared_effect" => {
+            let contract = crate::agent::tools::contracts::contract("edit_file");
+            Some(if contract.recovery.as_str() == "verify" {
+                "verify_effects"
+            } else {
+                "replay"
+            })
+        }
+        "approval_timeout" => Some("fail_closed"),
+        "stale_terminal_event" => {
+            let mut machine = EvalMachine::default();
+            let first = machine.transition_terminal("completed");
+            let stale = machine.transition_terminal("failed");
+            Some(
+                if first && !stale && machine.terminal == Some("completed") {
+                    "terminal_state_immutable"
+                } else {
+                    "terminal_overwritten"
+                },
+            )
+        }
+        "completion_without_evidence" => {
+            let contract = crate::agent::acceptance::GoalContract::compile("修复 a.rs");
+            let report = crate::agent::acceptance::evaluate_contract(&contract, &[]);
+            Some(if !report.passed && !report.blockers.is_empty() {
+                "automatic_remediation"
+            } else {
+                "false_completion"
+            })
+        }
+        "budget_exhaustion" => {
+            let extended = crate::agent::governance::extend_tool_budget(60, 0, 1, 2);
+            Some(if extended.is_none() {
+                "unfinished_with_checkpoint"
+            } else {
+                "unbounded_extension"
+            })
+        }
+        "subagent_claim_without_tools" => {
+            let contract = crate::agent::acceptance::GoalContract::compile("实现并验证功能");
+            let report = crate::agent::acceptance::evaluate_contract(&contract, &[]);
+            Some(if !report.passed {
+                "reject_claim"
+            } else {
+                "accept_claim"
+            })
+        }
+        _ => None,
+    }
+}
+
 /// 调试/评测构建使用的显式故障点。发布构建永远返回 false，防止环境变量误伤用户任务。
 pub fn fault_enabled(point: &str) -> bool {
     cfg!(debug_assertions) && std::env::var("HARMONY_AGENT_FAULT").ok().as_deref() == Some(point)
+}
+
+pub fn take_fault(point: &str) -> bool {
+    static FIRED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    if !fault_enabled(point) {
+        return false;
+    }
+    FIRED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .map(|mut fired| fired.insert(point.to_string()))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

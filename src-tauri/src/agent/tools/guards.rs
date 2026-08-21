@@ -148,6 +148,12 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     if !needs_approval {
         return Ok(());
     }
+    if crate::agent::evals::take_fault("approval_timeout") {
+        return Err(Intercept::new(
+            InterceptKind::Approval,
+            "可靠性评测故障注入：审批等待超时，已按默认拒绝处理",
+        ));
+    }
     let approval = app.state::<ToolApprovalState>();
     let cancel = app.state::<ChatCancel>();
     if !inv.ctx.run_id.is_empty() {

@@ -53,6 +53,56 @@ export interface ReliabilityDashboard {
   dag_failed_nodes: number
   latest_eval: EvalRun | null
   recent_runs: QualityRunRow[]
+  open_alert_count: number
+  critical_alert_count: number
+  quota: QuotaUsage
+}
+
+export interface QuotaUsage {
+  tenant_id: string
+  period: string
+  runs: number
+  tool_calls: number
+  failed_tools: number
+  duration_ms: number
+  cost_cny: number
+  updated_at: number
+}
+
+export interface AgentAlert {
+  alert_id: string
+  run_id: string | null
+  severity: string
+  code: string
+  message: string
+  state: string
+  details_json: string
+  created_at: number
+  resolved_at: number | null
+}
+
+export interface AuditEvent {
+  audit_id: string
+  run_id: string | null
+  conversation_id: string | null
+  actor: string
+  action: string
+  resource: string
+  outcome: string
+  details_json: string
+  created_at: number
+}
+
+export interface SloPolicy {
+  policy_id: string
+  name: string
+  enabled: boolean
+  acceptance_target: number
+  recovery_target: number
+  evidence_target: number
+  max_duration_ms: number
+  max_cost_cny: number | null
+  updated_at: number
 }
 
 export const getReliabilityDashboard = (days = 30) =>
@@ -60,3 +110,9 @@ export const getReliabilityDashboard = (days = 30) =>
 
 export const runReliabilityEvaluation = (threshold = 0.95) =>
   invokeWithError<EvalRun>('run_reliability_evaluation', { threshold })
+
+export const listAgentAlerts = (limit = 100) => invokeWithError<AgentAlert[]>('list_agent_alerts', { limit })
+export const listAgentAuditEvents = (runId?: string, limit = 200) =>
+  invokeWithError<AuditEvent[]>('list_agent_audit_events', { runId, limit })
+export const getAgentSloPolicy = () => invokeWithError<SloPolicy | null>('get_agent_slo_policy')
+export const updateAgentSloPolicy = (policy: SloPolicy) => invokeWithError<void>('update_agent_slo_policy', { policy })
