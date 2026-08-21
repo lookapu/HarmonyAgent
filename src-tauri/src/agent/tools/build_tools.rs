@@ -1640,10 +1640,21 @@ pub(super) fn classify_deploy_error(output: &str, is_signed: bool) -> (String, S
         || lower.contains("can not connect")
     {
         ("device_offline", "设备未连接或离线。请先调用 list_devices 确认设备在线；提示用户用 USB 连接设备、开启开发者模式与 USB 调试，或重新插拔。不要改代码。")
+    } else if lower.contains("unauthorized")
+        || lower.contains("not authorized")
+        || lower.contains("authorization denied")
+        || lower.contains("debug authorization")
+    {
+        ("device_authorization_denied", "设备拒绝或尚未确认调试授权。请解锁设备并确认 USB/无线调试授权，再调用 list_devices 验证 authorized=true；不要通过改签名或重复安装绕过授权门禁。")
+    } else if lower.contains("signature mismatch")
+        || lower.contains("inconsistent signature")
+        || lower.contains("conflicting package")
+        || lower.contains("install_failed_update_incompatible")
+    {
+        ("install_conflict", "设备上的同包名应用与当前 HAP 签名或更新身份冲突。先用 get_app_info 核对现有版本/签名；只有确认可丢弃旧应用和数据后才卸载重装，默认不得自动卸载。")
     } else if is_signed == false
         || lower.contains("signature")
         || lower.contains("sign verify")
-        || lower.contains("not authorized")
         || lower.contains("9568339")
         || lower.contains("code:95683")
     {
@@ -2231,6 +2242,14 @@ mod build_workflow_tests {
     fn recovery_only_removes_an_app_created_by_this_deploy() {
         assert!(should_recover_fresh_install(false));
         assert!(!should_recover_fresh_install(true));
+    }
+
+    #[test]
+    fn deployment_failures_distinguish_authorization_and_install_conflicts() {
+        assert_eq!(classify_deploy_error("device unauthorized", true).0, "device_authorization_denied");
+        assert_eq!(classify_deploy_error("INSTALL_FAILED_UPDATE_INCOMPATIBLE: signature mismatch", true).0, "install_conflict");
+        assert_eq!(classify_deploy_error("sign verify failed", true).0, "signing");
+        assert_eq!(classify_deploy_error("INSTALL_FAILED_VERSION_DOWNGRADE", true).0, "version_downgrade");
     }
 
     #[test]

@@ -572,7 +572,11 @@ pub(super) fn unescape_json(s: &str) -> String {
 }
 
 /// start_ability：显式或隐式拉起 Ability。
-pub(super) async fn start_ability(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn start_ability(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = resolve_authorized_device(args["device"].as_str(), "ability").await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -589,6 +593,17 @@ pub(super) async fn start_ability(args: &Value, roots: &[String]) -> Result<Stri
 
     if bundle.is_empty() && uri.is_empty() {
         return Err("start_ability 至少需要 bundle 或 uri 其一".into());
+    }
+
+    let resume_after_background = args["resume_after_background"].as_bool().unwrap_or(false);
+    if resume_after_background {
+        if bundle.is_empty() {
+            return Err("后台恢复验证需要显式 bundle 或可解析当前工程 bundleName".into());
+        }
+        run_hdc_shell(&device, &["uitest", "uiInput", "keyEvent", "home"], 20)
+            .await
+            .map_err(|error| format!("将应用切入后台失败：{error}"))?;
+        tokio::time::sleep(Duration::from_millis(800)).await;
     }
 
     let mut cmd: Vec<&str> = vec!["aa", "start"];
@@ -640,6 +655,21 @@ pub(super) async fn start_ability(args: &Value, roots: &[String]) -> Result<Stri
     if !uri.is_empty() { report.push_str(&format!("URI：{uri}\n")); }
     report.push_str(&format!("结果：{}\n", out.trim()));
     report.push_str(&format!("前台状态：{}\n", if foreground { "应用已进入前台 ✅" } else { "未检测到前台（可能还在启动或启动失败）" }));
+    if resume_after_background {
+        if !foreground {
+            return Err(format!("后台恢复后未确认 {bundle} 回到前台。\n{report}"));
+        }
+        report.push_str("后台恢复：Home 切后台后重新拉起并确认前台 ✅\n");
+        ctx.record_run_event(
+            "harmony.lifecycle.background_recovered",
+            serde_json::json!({
+                "device_id": device,
+                "bundle": bundle,
+                "ability": ability,
+                "foreground": true,
+            }),
+        );
+    }
     Ok(report)
 }
 
@@ -951,11 +981,12 @@ pub(super) async fn uninstall_app(args: &Value, roots: &[String]) -> Result<Stri
 }
 
 /// grant_permission：授予权限。
-pub(super) async fn grant_permission(args: &Value, roots: &[String]) -> Result<String, String> {
-    let device = match args["device"].as_str() {
-        Some(d) => d.to_string(),
-        None => default_device_id().await?,
-    };
+pub(super) async fn grant_permission(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let device = resolve_authorized_device(args["device"].as_str(), "shell").await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -970,21 +1001,36 @@ pub(super) async fn grant_permission(args: &Value, roots: &[String]) -> Result<S
     if bundle.is_empty() {
         return Err("无法确定应用包名".into());
     }
+    let action = args["action"].as_str().unwrap_or("grant");
+    if !matches!(action, "grant" | "revoke") {
+        return Err("action 必须是 grant 或 revoke".into());
+    }
 
-    // 尝试 bm grant（需要权限/root），失败则给备选方案
-    let result = run_hdc_shell(&device, &["bm", "grant-permission", "-n", &bundle, "-p", &perm], 20).await;
-    match result {
-        Ok(o) => Ok(format!("授予权限成功（设备 {device}，包名 {bundle}，权限 {perm}）\n结果：{}", o.trim())),
-        Err(e) => {
-            // 兼容某些版本使用 grant 命令
-            let result2 = run_hdc_shell(&device, &["bm", "grant", &bundle, &perm], 20).await;
-            match result2 {
-                Ok(o) => Ok(format!("授予权限成功（设备 {device}，包名 {bundle}，权限 {perm}）\n结果：{}", o.trim())),
-                Err(e2) => Err(format!(
-                    "授予权限失败：{e}\n备选方案同样失败：{e2}\n\n提示：user 版本可能不支持 bm grant，需要 root/userdebug；或手动在系统设置 → 应用 → 权限中开启。"
-                )),
-            }
+    let primary = if action == "grant" { "grant-permission" } else { "revoke-permission" };
+    let fallback = if action == "grant" { "grant" } else { "revoke" };
+    let result = run_hdc_shell(&device, &["bm", primary, "-n", &bundle, "-p", &perm], 20).await;
+    let primary_error = match result {
+        Ok(o) if !hdc_shell_failed(&o) => {
+            ctx.record_run_event("harmony.permission.changed", serde_json::json!({
+                "device_id": device, "bundle": bundle, "permission": perm, "action": action,
+                "evidence": tail(&o, 500),
+            }));
+            return Ok(format!("权限{}命令成功（设备 {device}，包名 {bundle}，权限 {perm}）\n结果：{}", if action == "grant" { "授予" } else { "拒绝/撤销" }, o.trim()));
         }
+        Ok(o) => o,
+        Err(e) => e,
+    };
+    let result2 = run_hdc_shell(&device, &["bm", fallback, &bundle, &perm], 20).await;
+    match result2 {
+        Ok(o) if !hdc_shell_failed(&o) => {
+            ctx.record_run_event("harmony.permission.changed", serde_json::json!({
+                "device_id": device, "bundle": bundle, "permission": perm, "action": action,
+                "evidence": tail(&o, 500),
+            }));
+            Ok(format!("权限{}命令成功（设备 {device}，包名 {bundle}，权限 {perm}）\n结果：{}", if action == "grant" { "授予" } else { "拒绝/撤销" }, o.trim()))
+        }
+        Ok(o) => Err(format!("权限{action}失败：{primary_error}\n备选命令返回失败：{o}\n\n提示：user 版本可能不支持 bm 权限命令，需要 root/userdebug；可在系统设置 → 应用 → 权限中手动调整。")),
+        Err(e2) => Err(format!("权限{action}失败：{primary_error}\n备选方案同样失败：{e2}\n\n提示：user 版本可能不支持 bm 权限命令，需要 root/userdebug；可在系统设置 → 应用 → 权限中手动调整。")),
     }
 }
 

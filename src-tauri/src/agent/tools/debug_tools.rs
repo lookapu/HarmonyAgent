@@ -391,11 +391,12 @@ pub(super) fn extract_rule_name(line: &str) -> String {
 }
 
 /// set_network_condition：设置网络条件（弱网/延迟/丢包）。
-pub(super) async fn set_network_condition(args: &Value, _roots: &[String]) -> Result<String, String> {
-    let device = match args["device"].as_str() {
-        Some(d) => d.to_string(),
-        None => default_device_id().await?,
-    };
+pub(super) async fn set_network_condition(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let device = super::ui_tools::resolve_authorized_device(args["device"].as_str(), "shell").await?;
     let mode = args["mode"].as_str().unwrap_or("normal");
 
     let (bandwidth_kbps, delay_ms, loss_pct) = match mode {
@@ -412,36 +413,25 @@ pub(super) async fn set_network_condition(args: &Value, _roots: &[String]) -> Re
     };
 
     if mode == "normal" {
-        // 重置：尝试几种方式。注意 tc qdisc del 在「本来就没有限速规则」时
-        // 输出 RTNETLINK answers: No such file or directory —— 这其实说明网络已正常，
-        // 不应判为失败；只有 tc 不存在 / 接口不存在才是真正的失败。
-        let attempts = vec![
-            ("删除 wlan0 限速规则", vec!["tc", "qdisc", "del", "dev", "wlan0", "root"]),
-            ("删除 eth0 限速规则", vec!["tc", "qdisc", "del", "dev", "eth0", "root"]),
-        ];
-        let mut errors: Vec<String> = Vec::new();
-        for (name, cmd) in &attempts {
-            match run_hdc_shell(&device, cmd, 10).await {
-                Ok(o) => {
-                    let lower = o.to_lowercase();
-                    if lower.contains("not found") || lower.contains("inaccessible") {
-                        // tc 工具不存在（非 root 设备）
-                        errors.push(format!("{name}: {}", o.trim()));
-                    } else if o.contains("Cannot find device") {
-                        // 接口不存在，尝试下一个
-                        errors.push(format!("{name}: {}", o.trim()));
-                    } else {
-                        // 删除成功，或 No such file（本来就没有限速规则）→ 网络已是正常状态
-                        return Ok(format!("网络已恢复正常（设备 {device}，方式：{name}）\n{o}"));
-                    }
-                }
-                Err(e) => errors.push(format!("{name}: {e}")),
-            }
+        let iface = detect_network_iface(&device).await.ok_or("未发现可恢复的在线网络接口")?;
+        let output = match run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", &iface, "root"], 10).await {
+            Ok(output) => output,
+            Err(error) if error.to_ascii_lowercase().contains("no such file") => error,
+            Err(error) => return Err(format!("重置网络失败（设备 {device}，接口 {iface}）：{error}")),
+        };
+        let lower = output.to_lowercase();
+        if lower.contains("not found") || lower.contains("inaccessible") {
+            return Err(format!("重置网络失败（设备 {device}，接口 {iface}）：{}", output.trim()));
         }
-        return Err(format!(
-            "重置网络失败（设备 {device}）：\n{}\n\n提示：需要 root 权限或 userdebug 版本。可手动重启 Wi-Fi 恢复。",
-            errors.join("\n")
-        ));
+        let state = run_hdc_shell(&device, &["tc", "qdisc", "show", "dev", &iface], 10).await?;
+        if qdisc_has_impairment(&state) {
+            return Err(format!("网络恢复命令已返回，但读回仍存在限速规则（设备 {device}，接口 {iface}）：{}", state.trim()));
+        }
+        ctx.record_run_event("harmony.network.condition", serde_json::json!({
+            "device_id": device, "mode": "normal", "interface": iface, "verified": true,
+            "evidence": tail(&state, 500),
+        }));
+        return Ok(format!("网络已恢复正常并完成读回确认（设备 {device}，接口 {iface}）\n{}", state.trim()));
     }
 
     // 设置弱网：用 tc netem（需要 root）
@@ -471,13 +461,24 @@ pub(super) async fn set_network_condition(args: &Value, _roots: &[String]) -> Re
 
     match run_hdc_shell(&device, &cmd, 10).await {
         Ok(o) if !o.to_lowercase().contains("not found") && !o.contains("No such file") => {
+            let state = run_hdc_shell(&device, &["tc", "qdisc", "show", "dev", iface_str], 10).await?;
+            if !qdisc_has_impairment(&state) {
+                let _ = run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", iface_str, "root"], 5).await;
+                return Err(format!("弱网命令已返回，但读回未发现 netem/tbf 规则，已尝试恢复：{}", state.trim()));
+            }
             let mut out = format!("网络条件已设置（设备 {device}，模式：{mode}）\n");
             if bandwidth_kbps > 0 { out.push_str(&format!("带宽：{bandwidth_kbps} Kbps\n")); }
             if delay_ms > 0 { out.push_str(&format!("延迟：{delay_ms} ms\n")); }
             if loss_pct > 0 { out.push_str(&format!("丢包率：{loss_pct}%\n")); }
             out.push_str(&format!("接口：{iface_str}\n"));
             out.push_str(&format!("输出：{}\n", o.trim()));
+            out.push_str(&format!("读回：{}\n", state.trim()));
             out.push_str("\n⚠️  测试完成后记得调用 set_network_condition mode=normal 恢复网络！");
+            ctx.record_run_event("harmony.network.condition", serde_json::json!({
+                "device_id": device, "mode": mode, "interface": iface_str, "verified": true,
+                "bandwidth_kbps": bandwidth_kbps, "delay_ms": delay_ms, "loss_pct": loss_pct,
+                "evidence": tail(&state, 500),
+            }));
             Ok(out)
         }
         Ok(o) => Err(format!("设置网络条件失败：{o}\n\n提示：需要 root 或 userdebug 权限的设备才能使用 tc 命令。")),
@@ -485,16 +486,49 @@ pub(super) async fn set_network_condition(args: &Value, _roots: &[String]) -> Re
     }
 }
 
+fn qdisc_has_impairment(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("netem") || lower.contains(" tbf ") || lower.starts_with("qdisc tbf")
+}
+
+#[cfg(test)]
+mod network_condition_tests {
+    use super::{network_iface_is_active, qdisc_has_impairment};
+
+    #[test]
+    fn qdisc_readback_distinguishes_normal_and_impaired_network() {
+        assert!(qdisc_has_impairment("qdisc netem 8001: root refcnt 2 limit 1000 delay 100ms loss 1%"));
+        assert!(qdisc_has_impairment("qdisc tbf 1: root rate 500Kbit"));
+        assert!(!qdisc_has_impairment("qdisc mq 0: root\nqdisc fq_codel 0: parent :1"));
+    }
+
+    #[test]
+    fn network_interface_requires_up_or_non_loopback_address() {
+        assert!(network_iface_is_active("wlan0: flags=4163<UP,BROADCAST,RUNNING>"));
+        assert!(network_iface_is_active("    inet 192.168.1.8 netmask 255.255.255.0"));
+        assert!(!network_iface_is_active("wlan0: flags=4098<BROADCAST,MULTICAST>"));
+        assert!(!network_iface_is_active("    inet 127.0.0.1 netmask 255.0.0.0"));
+    }
+}
+
 pub(super) async fn detect_network_iface(device: &str) -> Option<String> {
     // 优先尝试 wlan0，然后 eth0
     for iface in ["wlan0", "eth0", "wlan1"] {
         if let Ok(out) = run_hdc_shell(device, &["ifconfig", iface], 3).await {
-            if out.contains("UP") || out.contains(iface) {
+            if network_iface_is_active(&out) {
                 return Some(iface.to_string());
             }
         }
     }
     None
+}
+
+fn network_iface_is_active(output: &str) -> bool {
+    output.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("flags=") && lower.contains("up")
+            || lower.trim_start().starts_with("inet ") && !lower.contains("127.0.0.1")
+    })
 }
 
 /// check_signature：检查签名信息。

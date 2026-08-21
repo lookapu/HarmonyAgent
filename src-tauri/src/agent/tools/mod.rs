@@ -551,7 +551,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "start_ability",
-        desc: "启动指定 Ability 或通过 Deep Link 拉起应用特定页面。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"ability\":\"<可选 Ability 名，如 EntryAbility>\"，\"uri\":\"<可选 Deep Link URI，如 myapp://page/settings>\"}。显式设备会复验在线、授权与 ability 能力。\n显式启动：传 bundle + ability；隐式 Deep Link：传 uri（可省略 bundle）；同时传则以显式 Want 启动并附带 uri 参数。\n副作用：会切换设备前台应用。\n返回：启动命令结果，并在多次 aa dump 观测中确认 bundle 已进入 Ability 栈；未观察到时返回相关 Hilog 证据而不是假报成功。",
+        desc: "启动指定 Ability、通过 Deep Link 拉起页面，或验证后台恢复。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"ability\":\"<可选 Ability 名>\",\"uri\":\"<可选 Deep Link URI>\",\"resume_after_background\":<可选，缺省 false>}。显式设备会复验在线、授权与 ability 能力；后台恢复模式先发送 Home，再重新拉起并要求确认前台。\n副作用：会切换设备前台应用；后台恢复模式还会先把当前应用切到后台。\n返回：启动命令、Ability 栈状态；后台恢复成功时写入当前 Run。",
     },
     ToolSpec {
         name: "clear_app_data",
@@ -579,7 +579,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "grant_permission",
-        desc: "为指定应用动态授予运行时权限（相当于用户点击「允许」）。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"permission\":\"<权限名，如 ohos.permission.APPROXIMATELY_LOCATION>\"}。\n基于 bm grant / hdc shell 下权限授予能力；若系统支持则直接生效，不支持时给出可手动授权的提示。\n适合：应用需要权限但又不想手动点允许弹窗时自动授权。\n副作用：授予后应用立即拥有对应权限。\n返回：授权结果。",
+        desc: "授予或撤销指定应用的运行时权限，用于验证允许与权限拒绝路径。\n参数：{\"device\":\"<可选>\",\"bundle\":\"<可选包名，缺省取当前工程>\",\"permission\":\"<权限名>\",\"action\":\"grant|revoke\"（缺省 grant）}。设备必须在线、已授权并具备 shell 能力；兼容两组 bm 命令并将变更写入当前 Run。\n副作用：改变应用的运行时权限状态；拒绝场景验证完成后应按原状态恢复。\n返回：权限变更命令结果；设备或系统不支持时明确失败。",
     },
     ToolSpec {
         name: "set_wifi_state",
@@ -631,7 +631,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "set_network_condition",
-        desc: "设置网络条件，模拟弱网/高延迟/丢包等场景（需要 root 或 userdebug 设备）。\n参数：{\"device\":\"<可选>\",\"mode\":\"normal|weak|slow|lossy|custom\"，\"custom_bandwidth_kbps\":<自定义带宽 kbps>,\"custom_delay_ms\":<自定义延迟 ms>,\"custom_loss_pct\":<自定义丢包率 0-100>}。\nnormal 恢复正常网络；weak=中等弱网（500kbps/100ms 延迟/1% 丢包）；slow=极慢网（100kbps/500ms 延迟）；lossy=高丢包（1Mbps/50ms/10% 丢包）；custom 自定义参数。\n适合：测试弱网加载、断网重试、超时逻辑、缓存策略等场景。\n副作用：设备网络状态改变，所有应用都会受影响，测试完记得 normal 恢复。\n返回：设置结果。",
+        desc: "设置网络条件，模拟弱网/高延迟/丢包（需要 root 或 userdebug）。\n参数：{\"device\":\"<可选>\",\"mode\":\"normal|weak|slow|lossy|custom\",\"custom_bandwidth_kbps\":<kbps>,\"custom_delay_ms\":<ms>,\"custom_loss_pct\":<0-100>}。设备必须在线、已授权并具备 shell；只操作实际在线接口，设置和恢复后均用 tc qdisc 读回确认并记录当前 Run。\n副作用：改变设备所有应用的网络状态；测试必须以 mode=normal 收尾。\n返回：设置参数、接口和读回证据；命令未真实生效时失败并尝试清理。",
     },
     ToolSpec {
         name: "check_signature",
@@ -1223,14 +1223,14 @@ pub async fn run_tool(
         "run_perf_benchmark" => ui_tools::run_perf_benchmark(&args, &roots, ctx).await,
         "dump_ui_hierarchy" => ui_tools::dump_ui_hierarchy(&args, &roots).await,
         "ui_locator" => ui_tools::ui_locator(&args, &roots).await,
-        "start_ability" => ui_tools::start_ability(&args, &roots).await,
+        "start_ability" => ui_tools::start_ability(&args, &roots, ctx).await,
         "clear_app_data" => ui_tools::clear_app_data(&args, &roots).await,
         "dump_memory" => ui_tools::dump_memory(&args, &roots).await,
         "memory_snapshot" => quality_tools::memory_snapshot(&args, &roots).await,
         "get_installed_apps" => ui_tools::get_installed_apps(&args, &roots).await,
         "get_app_info" => ui_tools::get_app_info(&args, &roots).await,
         "uninstall_app" => ui_tools::uninstall_app(&args, &roots).await,
-        "grant_permission" => ui_tools::grant_permission(&args, &roots).await,
+        "grant_permission" => ui_tools::grant_permission(&args, &roots, ctx).await,
         "set_wifi_state" => ui_tools::set_wifi_state(&args, &roots).await,
         "set_airplane_mode" => ui_tools::set_airplane_mode(&args, &roots).await,
         "screen_record" => ui_tools::screen_record(&args, &roots).await,
@@ -1243,7 +1243,7 @@ pub async fn run_tool(
         "search_hilog" => debug_tools::search_hilog(&args, &roots).await,
         "log_query" => quality_tools::log_query(&args, &roots, ctx).await,
         "run_lint" => debug_tools::run_lint(&args, &roots).await,
-        "set_network_condition" => debug_tools::set_network_condition(&args, &roots).await,
+        "set_network_condition" => debug_tools::set_network_condition(&args, &roots, ctx).await,
         "check_signature" => debug_tools::check_signature(&args, &roots).await,
         "diagnose_signing" => build_tools::diagnose_signing(&args, &roots).await,
         "dump_battery" => debug_tools::dump_battery(&args, &roots).await,
