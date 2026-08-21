@@ -4,6 +4,7 @@ pub mod cost_guard;
 pub mod circuit_breaker;
 pub mod config_service;
 pub mod cost_calculator;
+pub mod deveco_interop;
 pub mod embedding;
 pub mod git_runtime;
 pub mod generic_project;

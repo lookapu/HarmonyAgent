@@ -3119,7 +3119,11 @@ async fn environment_check(
     out.push_str(&crate::services::harmony_provenance::render(&provenance));
 
     // 工程 SDK 对齐（可选 project_path，未指定则跳过）
-    let project_path = args["project_path"].as_str().unwrap_or("").trim();
+    let project_path = args["path"]
+        .as_str()
+        .or_else(|| args["project_path"].as_str())
+        .unwrap_or("")
+        .trim();
     if !project_path.is_empty() {
         out.push_str("\n[工程对齐]\n");
         match crate::services::harmony_env::project_sdk_alignment(project_path, db) {
@@ -3131,6 +3135,17 @@ async fn environment_check(
                 r.message
             )),
             Err(e) => out.push_str(&format!("- 对齐检查失败：{e}\n")),
+        }
+        let root = Path::new(project_path);
+        if root.is_dir() {
+            let model = crate::services::harmony_model::cached(root);
+            let interop = crate::services::deveco_interop::analyze(
+                root,
+                &model,
+                env.hvigorw_path.is_some(),
+            );
+            out.push('\n');
+            out.push_str(&crate::services::deveco_interop::render(&interop));
         }
     }
 
