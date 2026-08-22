@@ -284,9 +284,10 @@ export default function TimelinePanel({
         >
           {t('home.timelineTip')}
         </div>
-        <div className="mt-1.5 flex items-center gap-1">
+        {/* 按钮组：视图切换与展开/折叠分两行，避免一行挤 4 个按钮 */}
+        <div className="mt-1.5 flex flex-wrap items-center gap-1">
           {/* [76] 视图切换：事件流水 / 调用链 DAG */}
-          <div className="flex items-center rounded-lg bg-[var(--bg-hover)] p-0.5 mr-1">
+          <div className="flex items-center rounded-lg bg-[var(--bg-hover)] p-0.5">
             <button
               onClick={() => setView('list')}
               className={`px-2 py-0.5 rounded text-[11px] transition-colors ${view === 'list' ? 'tab-soft' : 'tab-inactive'}`}
@@ -300,18 +301,20 @@ export default function TimelinePanel({
               {t('home.timelineDagView')}
             </button>
           </div>
-          <button
-            onClick={() => setAllCollapsed(false)}
-            className="px-2 py-0.5 rounded text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            {t('home.timelineExpandAll')}
-          </button>
-          <button
-            onClick={() => setAllCollapsed(true)}
-            className="px-2 py-0.5 rounded text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            {t('home.timelineCollapseAll')}
-          </button>
+          <div className="flex items-center gap-1 flex-wrap w-full">
+            <button
+              onClick={() => setAllCollapsed(false)}
+              className="px-2 py-0.5 rounded text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              {t('home.timelineExpandAll')}
+            </button>
+            <button
+              onClick={() => setAllCollapsed(true)}
+              className="px-2 py-0.5 rounded text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              {t('home.timelineCollapseAll')}
+            </button>
+          </div>
         </div>
       </div>
 
