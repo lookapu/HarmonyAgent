@@ -5772,8 +5772,8 @@ export default function Home() {
             ]
             return (
               <div
-                className={`right-tabbar h-16 flex items-center gap-1 border-b border-[var(--border)] shrink-0 overflow-x-auto ${
-                  rightCompact ? 'px-2' : 'px-3'
+                className={`right-tabbar flex flex-wrap items-center gap-1 border-b border-[var(--border)] shrink-0 ${
+                  rightCompact ? 'px-2 py-1.5' : 'px-3 py-1.5'
                 }`}
               >
                 {tabs.map((tb) => {
@@ -5787,10 +5787,10 @@ export default function Home() {
                         active
                           ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                           : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                      } ${rightCompact ? 'w-9 justify-center px-0' : 'px-3.5'}`}
+                      } px-3.5`}
                     >
                       <Icon name={tb.icon} size={15} />
-                      {!rightCompact && <span className="whitespace-nowrap">{tb.label}</span>}
+                      <span className="whitespace-nowrap">{tb.label}</span>
                     </button>
                   )
                 })}
