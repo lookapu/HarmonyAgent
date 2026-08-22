@@ -11,6 +11,7 @@ import { getHarmonyEnv, detectHarmonyEnv, saveHarmonyEnv, checkProjectSdkAlignme
   type HarmonyEnv, type ProjectSdkAlignment, type HarmonyDocsStatus, type DocEntry } from '../api/harmonyEnv'
 import SdkApiBrowser from '../components/SdkApiBrowser'
 import { getNodeRuntime, upgradeNodeRuntime, resetNodeRuntime, type NodeRuntimeInfo } from '../api/nodeRuntime'
+import { detectDevecoCli, type DevecoCliInfo } from '../api/devecoCli'
 import { getGitRuntime, fetchGitLatestVersion, upgradeGitRuntime, resetGitRuntime, type GitRuntimeInfo } from '../api/gitRuntime'
 import { getJdkRuntime, fetchJdkReleases, installJdk, setDefaultJdk, uninstallJdk, checkJdkUpdates,
   type JdkRuntimeInfo, type JdkProgress, type JdkUpdateInfo } from '../api/jdkRuntime'
@@ -68,6 +69,7 @@ export default function HealthPage() {
   })
   // Node 运行时（内置便携版兑底 + 在线升级）
   const [nodeRt, setNodeRt] = useState<NodeRuntimeInfo | null>(null)
+  const [devecoCli, setDevecoCli] = useState<DevecoCliInfo | null>(null)
   const [rtBusy, setRtBusy] = useState(false)
   const [rtMsg, setRtMsg] = useState<string | null>(null)
   const [rtVersion, setRtVersion] = useState('')
@@ -196,6 +198,17 @@ export default function HealthPage() {
   // 挂载时加载一次：函数引用每次渲染变化属预期，不加入依赖避免重复请求
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { loadNodeRuntime() }, [])
+
+  /** DevEco CLI（devecocli）探测：健康页展示安装状态与版本 */
+  const loadDevecoCli = async () => {
+    try {
+      setDevecoCli(await detectDevecoCli())
+    } catch (e) {
+      setDevecoCli({ installed: false, version: '', path: null, install_hint: String(e) })
+    }
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { loadDevecoCli() }, [])
 
   const loadGitRuntime = async () => {
     try {
@@ -1192,6 +1205,36 @@ export default function HealthPage() {
             </div>
             {nodeProgress && <RuntimeProgressBar progress={nodeProgress} />}
             {rtMsg && <p className="text-xs mt-2 break-all">{rtMsg}</p>}
+          </>
+        ) : (
+          <p className="text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+        )}
+      </div>
+
+      {/* DevEco CLI：官方原子化能力调度枢纽（devecocli），已通过 MCP 模板接入 */}
+      <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.devecoCli')}</h3>
+      <div className="modern-card rounded-lg p-4 mb-3">
+        {devecoCli ? (
+          <>
+            <div className="flex items-center gap-3 flex-wrap">
+              <div
+                className="w-3 h-3 rounded-full shrink-0"
+                style={{ backgroundColor: devecoCli.installed ? 'var(--success)' : 'var(--danger)' }}
+              />
+              <span className="font-medium">devecocli</span>
+              <span className="text-xs text-[var(--text-secondary)]">
+                {devecoCli.installed
+                  ? `v${devecoCli.version} · ${t('health.devecoCliInstalled')}`
+                  : t('health.devecoCliMissing')}
+              </span>
+            </div>
+            {devecoCli.installed && devecoCli.path && (
+              <p className="text-xs text-[var(--text-muted)] mt-2 font-mono break-all">{devecoCli.path}</p>
+            )}
+            {!devecoCli.installed && devecoCli.install_hint && (
+              <p className="text-xs text-[var(--warning)] mt-2 break-all font-mono">{devecoCli.install_hint}</p>
+            )}
+            <p className="text-xs text-[var(--text-muted)] mt-2">{t('health.devecoCliDesc')}</p>
           </>
         ) : (
           <p className="text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>

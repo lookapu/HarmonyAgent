@@ -116,15 +116,18 @@ pub fn set_default_jdk_dir(dir: Option<PathBuf>) {
     *DEFAULT_JDK_DIR.lock().unwrap() = dir;
 }
 
-/// 计算 JDK 环境覆盖（系统已有 JDK 时返回空，尊重用户环境）：
-/// - 系统 JAVA_HOME 已存在 → 跳过
-/// - 系统 PATH 已有 java.exe → 跳过
-///   否则返回 (key, value) 对：JAVA_HOME + 前置 `<jdk>/bin` 的 PATH。
+/// 计算 JDK 环境覆盖（系统已有可用 JDK 时返回空，尊重用户环境）。
+/// 跳过条件：系统 JAVA_HOME 已存在，或系统 PATH 已有可用 java
+/// （macOS 的 /usr/bin/java stub 不算，见 system_path_has_java）。
+/// 否则返回 (key, value) 对：JAVA_HOME + 前置 `<jdk>/bin` 的 PATH。
+/// 需要注入时优先探测到的系统 JDK（macOS：DevEco JBR / sdkman，GUI 启动不可见），
+/// 其次内置默认 JDK。
 pub fn jdk_env_overrides() -> Vec<(String, String)> {
     if std::env::var_os("JAVA_HOME").is_some() || system_path_has_java() {
         return Vec::new();
     }
-    let Some(dir) = DEFAULT_JDK_DIR.lock().unwrap().clone() else {
+    let dir = probe_system_jdk_dir().or_else(|| DEFAULT_JDK_DIR.lock().unwrap().clone());
+    let Some(dir) = dir else {
         return Vec::new();
     };
     let mut overrides = vec![("JAVA_HOME".to_string(), dir.to_string_lossy().to_string())];
@@ -139,28 +142,74 @@ pub fn jdk_env_overrides() -> Vec<(String, String)> {
     overrides
 }
 
-/// 系统 PATH 中是否存在 java 命令（存在时视为系统已有 JDK，不注入内置）
+/// 系统 PATH 中是否存在可用的 java 命令（存在时视为系统已有 JDK，不注入兜底）。
+/// macOS 的 /usr/bin/java 是 Apple launcher stub：文件存在不代表有可用 JVM
+/// （无 JVM 时执行报 "Unable to locate a Java Runtime"），不能视为系统已装 JDK，
+/// 否则内置/探测到的 JDK 注入被跳过，hvigor 构建调 java 仍命中 stub 失败。
 fn system_path_has_java() -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
     let exe = if cfg!(windows) { "java.exe" } else { "java" };
-    if std::env::split_paths(&path_var).any(|d| d.join(exe).is_file()) {
+    #[cfg(target_os = "macos")]
+    let mut saw_macos_stub = false;
+    for dir in std::env::split_paths(&path_var) {
+        let p = dir.join(exe);
+        if !p.is_file() {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if p == *"/usr/bin/java" {
+                saw_macos_stub = true;
+                continue;
+            }
+        }
         return true;
     }
-    // macOS GUI 启动不继承 shell PATH（无 sdkman）；sdkman current 存在即视为系统已有 JDK
     #[cfg(target_os = "macos")]
+    if saw_macos_stub {
+        // 仅命中 stub：有 Java.framework 注册的 JVM 时 stub 能转发到真实 JVM，否则不可用
+        return std::process::Command::new("/usr/libexec/java_home")
+            .output()
+            .is_ok_and(|o| o.status.success());
+    }
+    false
+}
+
+/// 需注入时的系统 JDK 候选（macOS）：GUI 启动不继承 shell 配置（无 JAVA_HOME、
+/// PATH 不含 sdkman），但这些目录真实存在，注入后构建可复用用户自己的 JDK：
+/// 1. DevEco Studio 自带 JBR（与 hvigor 构建/签名工具链同源，版本匹配）
+/// 2. sdkman current（current 为符号链接，is_file 跟随）
+#[cfg(target_os = "macos")]
+fn probe_system_jdk_dir() -> Option<PathBuf> {
+    for app in ["DevEco-Studio.app", "DevEco Studio.app"] {
+        let jbr = PathBuf::from("/Applications")
+            .join(app)
+            .join("Contents")
+            .join("jbr")
+            .join("Contents")
+            .join("Home");
+        if jbr.join("bin").join("java").is_file() {
+            return Some(jbr);
+        }
+    }
     if let Some(home) = std::env::var_os("HOME") {
-        let cur = std::path::PathBuf::from(home)
+        let cur = PathBuf::from(home)
             .join(".sdkman")
             .join("candidates")
             .join("java")
             .join("current");
         if cur.join("bin").join("java").is_file() {
-            return true;
+            return Some(cur);
         }
     }
-    false
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_system_jdk_dir() -> Option<PathBuf> {
+    None
 }
 
 /// App 专属 npm 缓存根目录（None 表示未注册）。
@@ -194,7 +243,10 @@ fn is_npx_like(program: &str) -> bool {
 /// MCP 子进程公共环境（测试连接与常驻连接统一调用）：
 /// 1. 移除 NODE_TLS_REJECT_UNAUTHORIZED：用户系统级设置会被子进程继承，导致 node
 ///    每次启动输出警告（干扰诊断）且关闭 TLS 证书校验（安全风险），不应传染给 MCP 服务器。
-/// 2. npx/npm 命令注入按服务器隔离的 npm 缓存目录（App 数据目录下），
+/// 2. PATH 增强：GUI 启动（LaunchServices）PATH 极简，npm 全局 CLI 与 node 均不可见。
+///    前插内置 Node bin（npm 全局 CLI 的 JS shim 内部 spawn node 可命中），追加用户级
+///    npm 全局 bin（devecocli 等 `npm i -g` 安装的命令在子进程内可解析）。
+/// 3. npx/npm 命令注入按服务器隔离的 npm 缓存目录（App 数据目录下），
 ///    避免多进程并发写全局 npm 缓存时的 Windows 文件锁冲突（EPERM）。
 pub fn apply_mcp_child_env(
     cmd: &mut tokio::process::Command,
@@ -203,6 +255,19 @@ pub fn apply_mcp_child_env(
 ) -> Result<(), String> {
     cmd.env_remove("NODE_TLS_REJECT_UNAUTHORIZED");
     cmd.env_remove("node_tls_reject_unauthorized");
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = BUNDLED_NODE_DIR.lock().unwrap().clone() {
+        let bin = if cfg!(windows) { dir } else { dir.join("bin") };
+        paths.push(bin);
+    }
+    paths.extend(std::env::split_paths(&current));
+    if let Some(bin) = npm_global_bin_dir() {
+        paths.push(bin);
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
     if is_npx_like(program) {
         if let Some(root) = MCP_NPM_CACHE_ROOT.lock().unwrap().clone() {
             // 服务器 id 归一化后作子目录名（uuid 本身已安全，防御性清洗）
@@ -356,6 +421,12 @@ fn resolve_program(program: &str) -> Option<Resolved> {
         }
     }
 
+    // 系统 PATH 全部未命中：npm 全局 bin 中查找（GUI 启动 PATH 极简时 `npm i -g`
+    // 安装的 CLI 如 deveco/devecocli 不可见），JS shim 用内置 Node 直调
+    if let Some(r) = resolve_npm_global_bin(program) {
+        return Some(r);
+    }
+
     // 系统 PATH 全部未命中：macOS/Linux 兑底探测常见安装目录（nvm/brew/sdkman，
     // GUI 启动 PATH 极简时 npx/java 等仍可命中），再尝试 sh 脚本候选
     if let Some(p) = probe_common_program(program) {
@@ -446,7 +517,8 @@ fn resolve_bundled_jdk(program: &str) -> Option<Resolved> {
     if std::env::var_os("JAVA_HOME").is_some() || system_path_has_java() {
         return None;
     }
-    let dir = DEFAULT_JDK_DIR.lock().unwrap().clone()?;
+    // 优先探测到的系统 JDK（macOS：DevEco JBR / sdkman），再兑底内置默认 JDK
+    let dir = probe_system_jdk_dir().or_else(|| DEFAULT_JDK_DIR.lock().unwrap().clone())?;
     if !dir.is_dir() {
         return None;
     }
@@ -531,6 +603,77 @@ fn resolve_system_npx(program: &str) -> Option<Resolved> {
     }
     let node = find_system_program("node")?;
     Some(Resolved { program: node, needs_cmd_wrap: false, node_cli: Some(cli) })
+}
+
+/// 用户级 npm 全局 bin 目录（`npm i -g` 安装的 CLI shim 位置）：
+/// - Windows: `%APPDATA%\npm`（npm 用户级全局目录，装 Node 时默认在 PATH）
+/// - macOS/Linux: `~/.npm-global/bin`（内置 npm 默认前缀在应用资源目录下、不在
+///   PATH，安装/读取时显式使用该目录，与 commands/version.rs 的基座 CLI 安装一致）
+pub fn npm_global_bin_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|d| d.join("npm"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .map(|h| h.join(".npm-global").join("bin"))
+    }
+}
+
+/// 在用户级 npm 全局 bin 中解析命令：`npm i -g` 安装的 CLI（deveco/devecocli 等）
+/// bin 是 `#!/usr/bin/env node` 的 JS shim（macOS/Linux）或 .cmd 批处理（Windows），
+/// GUI 启动 PATH 极简时命令与 node 都不可见。命中后：
+/// - macOS/Linux：内置 Node 直调 shim（`node <shim> args`，绕开 shebang 对 PATH 的依赖），
+///   内置缺失时直接执行 shim（依赖调用方注入的 PATH）；
+/// - Windows：.cmd/.bat 走 cmd 包装（内部 `node` 由 MCP 子进程 PATH 注入兜底），.exe 直调。
+fn resolve_npm_global_bin(program: &str) -> Option<Resolved> {
+    let base = program
+        .strip_suffix(".exe")
+        .unwrap_or(program)
+        .strip_suffix(".cmd")
+        .unwrap_or(program)
+        .strip_suffix(".bat")
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let dir = npm_global_bin_dir()?;
+    #[cfg(target_os = "windows")]
+    {
+        for name in [format!("{base}.cmd"), format!("{base}.bat"), format!("{base}.exe")] {
+            let cand = dir.join(&name);
+            if cand.is_file() {
+                return Some(Resolved {
+                    program: cand,
+                    needs_cmd_wrap: !name.ends_with(".exe"),
+                    node_cli: None,
+                });
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let shim = dir.join(&base);
+        if !shim.is_file() {
+            return None;
+        }
+        // 优先内置 Node 直调 shim；内置未初始化时直接执行（shebang env node 由调用方 PATH 兜底）
+        if let Some(node_dir) = BUNDLED_NODE_DIR.lock().unwrap().clone() {
+            let node = node_exe_in(&node_dir);
+            if node.is_file() {
+                return Some(Resolved {
+                    program: node,
+                    needs_cmd_wrap: false,
+                    node_cli: Some(shim),
+                });
+            }
+        }
+        Some(Resolved { program: shim, needs_cmd_wrap: false, node_cli: None })
+    }
 }
 
 /// 在鸿蒙额外 PATH / 系统 PATH / 常见安装目录中定位程序（返回第一个命中）
@@ -645,6 +788,8 @@ fn not_found_error(program: &str) -> String {
         }
     } else if program.eq_ignore_ascii_case("docker") {
         "请确认已安装并启动 Docker Desktop"
+    } else if program.eq_ignore_ascii_case("devecocli") || program.eq_ignore_ascii_case("deveco") {
+        "请先安装官方 DevEco CLI：npm install -g @deveco/deveco-cli@stable（要求 Node 22+ 与 DevEco Studio 6.1+）；安装后无需重启，重新测试连接即可"
     } else {
         "请确认该程序已安装并加入 PATH，或在命令中填写完整路径"
     };
@@ -852,6 +997,83 @@ mod tests {
         assert!(err.contains("找不到程序"));
     }
 
+    /// system_path_has_java：PATH 中仅有真实 java 文件才视为系统已有 JDK；
+    /// macOS 的 /usr/bin/java stub 不算（文件存在但无 JVM 时执行仍报
+    /// "Unable to locate a Java Runtime"，会错误跳过内置 JDK 注入）。
+    #[test]
+    fn test_system_path_has_java() {
+        let _g = STATE_LOCK.lock().unwrap();
+        let orig_path = std::env::var_os("PATH");
+        let tmp = std::env::temp_dir().join(format!("deveco-java-probe-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("bin")).ok();
+        let java = if cfg!(windows) { "java.exe" } else { "java" };
+        // 无 java：false（应触发 JDK 兜底注入）
+        std::env::set_var("PATH", &tmp);
+        assert!(!system_path_has_java(), "PATH 无 java 时应返回 false");
+        // 有真实 java：true（尊重用户环境，不注入）
+        std::fs::write(tmp.join("bin").join(java), "fake").unwrap();
+        std::env::set_var("PATH", tmp.join("bin"));
+        assert!(system_path_has_java(), "PATH 含真实 java 文件时应返回 true");
+        match orig_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// jdk_env_overrides：系统无 JAVA_HOME/PATH 无 java 时，注入的 JAVA_HOME 非空
+    /// 且 PATH 前置其 bin（macOS 上优先 DevEco JBR/sdkman，其次内置默认 JDK）。
+    #[test]
+    fn test_jdk_env_overrides_injects_when_no_system_java() {
+        let _g = STATE_LOCK.lock().unwrap();
+        let orig_home = std::env::var_os("JAVA_HOME");
+        let orig_path = std::env::var_os("PATH");
+        let tmp = std::env::temp_dir().join(format!("deveco-jdk-env-{}", std::process::id()));
+        let bundled = tmp.join("jdk");
+        std::fs::create_dir_all(bundled.join("bin")).ok();
+        let java = if cfg!(windows) { "java.exe" } else { "java" };
+        std::fs::write(bundled.join("bin").join(java), "fake").unwrap();
+        set_default_jdk_dir(Some(bundled.clone()));
+        std::env::remove_var("JAVA_HOME");
+        std::env::set_var("PATH", &tmp); // 无 java
+        let overrides = jdk_env_overrides();
+        assert!(!overrides.is_empty(), "系统无 JDK 时应注入兜底 JDK");
+        let java_home = overrides
+            .iter()
+            .find(|(k, _)| k == "JAVA_HOME")
+            .map(|(_, v)| v.clone())
+            .expect("应注入 JAVA_HOME");
+        let path_override = overrides
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .expect("应注入 PATH");
+        // 注入的 JAVA_HOME 目录必须真实含 java（DevEco JBR/sdkman/内置皆可）
+        assert!(
+            Path::new(&java_home).join("bin").join(java).is_file(),
+            "注入的 JAVA_HOME 应含 java: {java_home}"
+        );
+        // PATH 应前置注入 JDK 的 bin（split_paths 兼容 Windows 的 ; 分隔）
+        let first = std::env::split_paths(&path_override)
+            .next()
+            .expect("PATH 覆盖非空");
+        assert_eq!(
+            first,
+            Path::new(&java_home).join("bin"),
+            "PATH 应前置注入 JDK 的 bin: {path_override}"
+        );
+        set_default_jdk_dir(None);
+        match orig_home {
+            Some(v) => std::env::set_var("JAVA_HOME", v),
+            None => std::env::remove_var("JAVA_HOME"),
+        }
+        match orig_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// 内置 Node 目录路径（开发机上存在 runtime/node；CI 无则跳过）
     fn bundled_dir() -> Option<std::path::PathBuf> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/node");
@@ -1011,5 +1233,120 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         set_harmony_path_dirs(Vec::new());
+    }
+
+    /// npm 全局 bin 解析：`npm i -g` 安装的 CLI（如 devecocli）shim 在用户级目录，
+    /// GUI 启动 PATH 极简时命令不可见。HOME/APPDATA 指向临时目录构造 shim 验证：
+    /// macOS/Linux 内置 Node 存在时走 `node <shim>` 直调（绕开 shebang 依赖 PATH），
+    /// 缺失时直接执行 shim；Windows .cmd/.bat 走 cmd 包装、.exe 直调。
+    #[test]
+    fn test_npm_global_bin_resolve() {
+        let _g = STATE_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("deveco-npmgbin-{}", std::process::id()));
+        #[cfg(windows)]
+        let bin = tmp.join("npm");
+        #[cfg(not(windows))]
+        let bin = tmp.join(".npm-global").join("bin");
+        std::fs::create_dir_all(&bin).ok();
+
+        #[cfg(windows)]
+        {
+            let orig = std::env::var_os("APPDATA");
+            std::env::set_var("APPDATA", &tmp);
+            std::fs::write(bin.join("devecocli.cmd"), "@echo off\r\n").unwrap();
+            let r = resolve_npm_global_bin("devecocli").expect("npm 全局 .cmd shim 应可解析");
+            assert!(r.needs_cmd_wrap, ".cmd 应走 cmd 包装");
+            assert_eq!(r.program, bin.join("devecocli.cmd"));
+            // 扩展名/大小写归一：传 Deveco.exe 应命中已存在的 deveco.exe
+            std::fs::write(bin.join("deveco.exe"), "MZ").unwrap();
+            let r2 = resolve_npm_global_bin("Deveco.exe").expect("exe shim 应可解析");
+            assert!(!r2.needs_cmd_wrap);
+            assert!(resolve_npm_global_bin("no-such-cli").is_none());
+            match orig {
+                Some(v) => std::env::set_var("APPDATA", v),
+                None => std::env::remove_var("APPDATA"),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let orig = std::env::var_os("HOME");
+            std::env::set_var("HOME", &tmp);
+            let shim = bin.join("devecocli");
+            std::fs::write(&shim, "#!/usr/bin/env node\n").unwrap();
+            // 内置 Node 未注册：直接执行 shim（shebang 的 env node 由调用方 PATH 兜底）
+            set_bundled_node_dir(None);
+            let r = resolve_npm_global_bin("devecocli").expect("npm 全局 shim 应可解析");
+            assert_eq!(r.program, shim);
+            assert!(r.node_cli.is_none());
+            assert!(!r.needs_cmd_wrap);
+            // 内置 Node 存在：node <shim> 直调（绕开 shebang 对 PATH 的依赖）
+            let node_dir = tmp.join("node");
+            std::fs::create_dir_all(node_dir.join("bin")).ok();
+            std::fs::write(node_dir.join("bin").join("node"), "fake").unwrap();
+            set_bundled_node_dir(Some(node_dir.clone()));
+            let r2 = resolve_npm_global_bin("devecocli").expect("内置 Node 存在时应直调");
+            assert_eq!(r2.program, node_dir.join("bin").join("node"));
+            assert_eq!(r2.node_cli, Some(shim));
+            assert!(!r2.needs_cmd_wrap);
+            assert!(resolve_npm_global_bin("no-such-cli").is_none());
+            set_bundled_node_dir(None);
+            match orig {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 端到端：resolve_program 在系统 PATH 全未命中后仍能从 npm 全局 bin 兜底找到
+    /// devecocli（GUI 启动 PATH 极简场景；解析顺序在系统 PATH 之后、常见安装目录之前）。
+    #[test]
+    fn test_resolve_program_finds_npm_global_bin() {
+        let _g = STATE_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("deveco-npmgbin-e2e-{}", std::process::id()));
+        #[cfg(windows)]
+        let bin = tmp.join("npm");
+        #[cfg(not(windows))]
+        let bin = tmp.join(".npm-global").join("bin");
+        std::fs::create_dir_all(&bin).ok();
+        let clean_path = tmp.join("empty-path");
+        std::fs::create_dir_all(&clean_path).ok();
+
+        let orig_home = std::env::var_os("HOME");
+        let orig_appdata = std::env::var_os("APPDATA");
+        let orig_path = std::env::var_os("PATH");
+        set_bundled_node_dir(None);
+        set_harmony_path_dirs(Vec::new());
+        std::env::set_var("PATH", &clean_path);
+        #[cfg(windows)]
+        {
+            std::env::set_var("APPDATA", &tmp);
+            std::fs::write(bin.join("devecocli.cmd"), "@echo off\r\n").unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::set_var("HOME", &tmp);
+            std::fs::write(bin.join("devecocli"), "#!/usr/bin/env node\n").unwrap();
+        }
+        let r = resolve_program("devecocli").expect("PATH 未命中时 npm 全局 bin 应兜底");
+        #[cfg(windows)]
+        assert_eq!(r.program, bin.join("devecocli.cmd"));
+        #[cfg(not(windows))]
+        assert_eq!(r.program, bin.join("devecocli"));
+
+        // 恢复全局环境（HOME/APPDATA/PATH）
+        match orig_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match orig_appdata {
+            Some(v) => std::env::set_var("APPDATA", v),
+            None => std::env::remove_var("APPDATA"),
+        }
+        match orig_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

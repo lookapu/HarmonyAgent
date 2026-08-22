@@ -857,6 +857,23 @@ fn match_error_line(line: &str) -> Option<BuildError> {
             suggestion: "检查 ohpm 工具链路径，或在 DevEco Studio 中重新安装 ohpm".into(),
         });
     }
+    // Java 运行时缺失：macOS 的 /usr/bin/java 仅为 Apple stub（无 JVM 时执行报
+    // "Unable to locate a Java Runtime"），GUI 启动又不继承终端 shell 的 JAVA_HOME/PATH。
+    if lower.contains("unable to locate a java runtime")
+        || lower.contains("00308018") && (lower.contains("java") || lower.contains("jdk"))
+    {
+        return Some(BuildError {
+            kind: "environment".into(),
+            category: "environment".into(),
+            error_code: extract_error_code(line),
+            stage: "environment".into(),
+            file: None,
+            line: None,
+            column: None,
+            message: line.trim().to_string(),
+            suggestion: "构建需要 Java 运行时但子进程环境不可见：macOS 上 /usr/bin/java 仅为 Apple stub，GUI 应用也不继承终端 shell 的 JAVA_HOME/PATH。应用已自动探测注入 DevEco JBR / sdkman / 内置 JDK；仍失败时可在 设置 → 环境 → JDK 运行时 安装或切换内置 JDK，或在终端执行 java -version 确认系统 JDK 可用".into(),
+        });
+    }
     let error_code = extract_error_code(line);
     if lower.contains("hvigor error")
         || lower.starts_with("error:")
@@ -1020,6 +1037,7 @@ fn suggestion_for(category: &str) -> String {
         "ohpm" => "检查 OHPM 工具链、registry 与缓存状态后重新同步依赖",
         "sdk" | "api_level" => "核对本机 SDK、产品 API Level 与使用 API 的兼容范围",
         "signing" => "核对 signingConfigs、证书、profile、keystore 与产品引用",
+        "environment" => "核对 JDK 运行时（设置 → 环境 → JDK 运行时）与 JAVA_HOME 配置",
         "type" | "syntax" => "读取对应源码位置，修复 ArkTS 类型或语法错误后重新构建",
         "resource" => "核对资源声明、限定词目录与源码中的资源引用",
         _ => "读取当前阶段前后的完整构建日志，定位首个根因后再重试",

@@ -41,11 +41,35 @@ fn user_npm_global_dir() -> Option<std::path::PathBuf> {
     }
 }
 
+/// 计算需要注入 npm 子进程的 PATH（None 表示无需注入）：
+/// npm 安装包时会执行 postinstall 等生命周期脚本（如 `sh -c node scripts/postinstall.mjs`），
+/// 脚本继承进程 PATH；GUI 启动（LaunchServices）PATH 极简，nvm/homebrew 等用户级 node
+/// 不在其中，脚本会报 `sh: node: command not found`（exit 127）导致安装失败。
+/// PATH 已含 node 时返回 None；否则探测系统 node 并把其 bin 前置，
+/// 仅影响子进程环境，不影响 npm 自身解析。
+fn node_path_injection() -> Option<String> {
+    let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+    let path_has_node = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(node_name).is_file()))
+        .unwrap_or(false);
+    if path_has_node {
+        return None;
+    }
+    let node = crate::utils::process::probe_common_program("node")?;
+    let bin = node.parent()?;
+    let mut dirs = vec![bin.to_path_buf()];
+    dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    std::env::join_paths(&dirs).ok().map(|p| p.to_string_lossy().to_string())
+}
+
 /// 构造 npm 子进程并按 use_proxy 注入系统代理：
 /// - `None` / `Some(true)`: 检测到系统代理则走（未检测到则直连，不报错）
 /// - `Some(false)`: 直连（移除从宿主环境继承的代理变量，避免意外走代理）
 fn npm_cmd(args: &[String], use_proxy: Option<bool>) -> Result<tokio::process::Command, String> {
     let mut cmd = crate::utils::process::command("npm", args)?;
+    if let Some(path) = node_path_injection() {
+        cmd.env("PATH", path);
+    }
     if use_proxy == Some(false) {
         for var in [
             "HTTP_PROXY",
@@ -226,6 +250,43 @@ pub async fn check_base_update(use_proxy: Option<bool>) -> Result<BaseUpdateInfo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 环境变量测试互斥（与 process.rs 的 STATE_LOCK 同理，避免并行测试互相干扰）
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// PATH 中无 node 时，node_path_injection 应返回前置了探测 node bin 的 PATH（GUI 极简 PATH 的 nvm 场景）
+    #[cfg(not(windows))]
+    #[test]
+    fn node_path_injection_prepends_nvm_node() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let orig_path = std::env::var_os("PATH");
+        let orig_home = std::env::var_os("HOME");
+        let tmp = std::env::temp_dir().join(format!("ver-node-inject-{}", std::process::id()));
+        let node_bin = tmp
+            .join(".nvm")
+            .join("versions")
+            .join("node")
+            .join("v99.1.2")
+            .join("bin");
+        std::fs::create_dir_all(&node_bin).unwrap();
+        std::fs::write(node_bin.join("node"), "").unwrap();
+        std::env::set_var("HOME", &tmp);
+        std::env::remove_var("PATH");
+
+        let injected = node_path_injection().expect("PATH 中无 node 时应注入");
+        let first = std::env::split_paths(&injected).next().expect("注入 PATH 非空");
+        assert_eq!(first, node_bin, "注入 PATH 首个目录应为探测到的 node bin");
+
+        match orig_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match orig_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn semver_compare() {

@@ -2085,3 +2085,4 @@
     "devecoCliInstalled": "已安装",
     "devecoCliMissing": "未安装",
     "devecoCliDesc": "华为官方原子化能力调度枢纽（@deveco/deveco-cli），已通过 MCP 模板接入：Check MCP 语法检查、官方知识检索等（见 docs/DEVECO_CLI_MCP_INTEGRATION.md）。",
+      "budget": "预算超限",

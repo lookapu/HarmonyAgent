@@ -2084,3 +2084,4 @@
     "devecoCliInstalled": "installed",
     "devecoCliMissing": "not installed",
     "devecoCliDesc": "Huawei's official atomic capability hub (@deveco/deveco-cli), integrated via the MCP template: Check MCP syntax checking, official knowledge retrieval, etc. (see docs/DEVECO_CLI_MCP_INTEGRATION.md).",
+      "budget": "Budget exceeded",

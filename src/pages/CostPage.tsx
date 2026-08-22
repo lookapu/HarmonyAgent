@@ -194,6 +194,7 @@ export default function CostPage() {
       timeout: t('cost.errKind.timeout'),
       client: t('cost.errKind.client'),
       local: t('cost.errKind.local'),
+      budget: t('cost.errKind.budget'),
       unknown: t('cost.errKind.unknown'),
     }
     return map[kind] ?? kind
