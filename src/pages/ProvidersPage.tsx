@@ -19,6 +19,7 @@ import {
   type CreateProviderInput,
   type ProviderModel,
   type EndpointDef,
+  type RemoteModelInfo,
   type SyncModelsResult,
 } from '../api/provider'
 import {
@@ -229,6 +230,33 @@ function sortModels(list: ProviderModel[]): ProviderModel[] {
   })
 }
 
+/** 上下文窗口格式化：200000 → 200K，1000000 → 1M；0/空 → '—' */
+function fmtCtx(n: number | null | undefined): string {
+  if (!n || n <= 0) return '—'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1000) return `${Math.round(n / 1000)}K`
+  return String(n)
+}
+
+/** 价格格式化（美元/百万 token）：0 → FREE；极小值保留有效位数 */
+function fmtPrice(n: number): string {
+  if (!n || n <= 0) return 'FREE'
+  if (n >= 100) return `$${n.toFixed(0)}`
+  if (n >= 1) return `$${n.toFixed(2)}`
+  return `$${n.toPrecision(2)}`
+}
+
+/** 远端模型排序：免费优先 / 价格升序 / 默认（后端返回顺序） */
+function sortRemote(list: RemoteModelInfo[], mode: 'free' | 'price' | 'default'): RemoteModelInfo[] {
+  if (mode === 'default') return list
+  return [...list].sort((a, b) => {
+    if (mode === 'free') {
+      if (a.free !== b.free) return a.free ? -1 : 1
+    }
+    return a.input_price + a.output_price - (b.input_price + b.output_price)
+  })
+}
+
 export default function ProvidersPage() {
   const { t } = useTranslation()
   const [providers, setProviders] = useState<Provider[]>([])
@@ -268,6 +296,18 @@ export default function ProvidersPage() {
   const [editTypeOut, setEditTypeOut] = useState<Modality[]>(['text'])
   const [editSaving, setEditSaving] = useState(false)
   const [editError, setEditError] = useState<string | null>(null)
+  // 同步面板排序/筛选：免费优先（默认） / 价格升序 / 后端顺序；可只看免费
+  const [syncSort, setSyncSort] = useState<'free' | 'price' | 'default'>('free')
+  const [syncFreeOnly, setSyncFreeOnly] = useState(false)
+  // 新添加模型的上下文窗口 / 输出上限（作用于「即将添加的新模型」，与模态选择器同模式）
+  const [editCtx, setEditCtx] = useState('')
+  const [editOut, setEditOut] = useState('')
+  // 已有模型编辑：上下文窗口 / 输出上限（✎ 面板内与模态一起保存）
+  const [editTypeCtx, setEditTypeCtx] = useState('')
+  const [editTypeOutLimit, setEditTypeOutLimit] = useState('')
+  // 创建表单：新建模型的默认上下文窗口 / 输出上限（应用到本次添加的全部模型）
+  const [formCtx, setFormCtx] = useState('')
+  const [formOut, setFormOut] = useState('')
 
   const load = async () => {
     try {
@@ -353,6 +393,8 @@ export default function ProvidersPage() {
           model_id: m,
           input_modalities: looksVisionModel(m) ? ['text', 'image'] : ['text'],
           output_modalities: looksGenerationModel(m) ?? ['text'],
+          context_limit: formCtx.trim() ? Math.max(1, Number(formCtx)) : undefined,
+          output_limit: formOut.trim() ? Math.max(1, Number(formOut)) : undefined,
         })),
       })
       setForm({ name: '', provider_type: 'openai-compatible', protocol: 'openai', base_url: '', api_key: '', endpoints: [] })
@@ -465,19 +507,20 @@ export default function ProvidersPage() {
     }
   }
 
-  // 同步面板：一键添加平台新增模型
-  const addSyncModel = async (p: Provider, modelId: string) => {
-    setSyncBusy((prev) => ({ ...prev, [modelId]: 'add' }))
+  // 同步面板：一键添加平台新增模型（携带远端元数据：上下文窗口自动填充，价格类字段不入库）
+  const addSyncModel = async (p: Provider, modelInfo: RemoteModelInfo) => {
+    setSyncBusy((prev) => ({ ...prev, [modelInfo.id]: 'add' }))
     try {
       await addModel(p.id, {
-        model_id: modelId,
-        input_modalities: looksVisionModel(modelId) ? ['text', 'image'] : ['text'],
-        output_modalities: looksGenerationModel(modelId) ?? ['text'],
+        model_id: modelInfo.id,
+        input_modalities: looksVisionModel(modelInfo.id) ? ['text', 'image'] : ['text'],
+        output_modalities: looksGenerationModel(modelInfo.id) ?? ['text'],
+        context_limit: modelInfo.context_length > 0 ? modelInfo.context_length : undefined,
       })
       setSyncResults((prev) => {
         const cur = prev[p.id]
         if (!cur) return prev
-        return { ...prev, [p.id]: { ...cur, new_models: cur.new_models.filter((x) => x !== modelId) } }
+        return { ...prev, [p.id]: { ...cur, new_models: cur.new_models.filter((x) => x.id !== modelInfo.id) } }
       })
       await load()
     } catch (e) {
@@ -494,7 +537,7 @@ export default function ProvidersPage() {
     } finally {
       setSyncBusy((prev) => {
         const next = { ...prev }
-        delete next[modelId]
+        delete next[modelInfo.id]
         return next
       })
     }
@@ -506,12 +549,13 @@ export default function ProvidersPage() {
     if (!cur || cur.new_models.length === 0) return
     setSyncBusy((prev) => ({ ...prev, ['__all_' + p.id]: 'add' }))
     try {
-      for (const modelId of cur.new_models) {
+      for (const modelInfo of cur.new_models) {
         try {
           await addModel(p.id, {
-            model_id: modelId,
-            input_modalities: looksVisionModel(modelId) ? ['text', 'image'] : ['text'],
-            output_modalities: looksGenerationModel(modelId) ?? ['text'],
+            model_id: modelInfo.id,
+            input_modalities: looksVisionModel(modelInfo.id) ? ['text', 'image'] : ['text'],
+            output_modalities: looksGenerationModel(modelInfo.id) ?? ['text'],
+            context_limit: modelInfo.context_length > 0 ? modelInfo.context_length : undefined,
           })
         } catch {
           // 单个添加失败继续加其余
@@ -557,6 +601,10 @@ export default function ProvidersPage() {
     setEditModPreset('text')
     setEditModIn(['text'])
     setEditModOut(['text'])
+    setEditCtx('')
+    setEditOut('')
+    setEditTypeCtx('')
+    setEditTypeOutLimit('')
     setEditError(null)
   }
 
@@ -584,7 +632,7 @@ export default function ProvidersPage() {
     }
   }
 
-  // 编辑面板内添加模型（携带所选类型模态）
+  // 编辑面板内添加模型（携带所选类型模态 + 上下文窗口/输出上限）
   const addEditModel = async () => {
     const m = editModelInput.trim()
     if (!m || !editingId) return
@@ -597,6 +645,8 @@ export default function ProvidersPage() {
         model_id: m,
         input_modalities: editModIn,
         output_modalities: editModOut,
+        context_limit: editCtx.trim() ? Math.max(1, Number(editCtx)) : undefined,
+        output_limit: editOut.trim() ? Math.max(1, Number(editOut)) : undefined,
       })
       setEditModels((prev) => sortModels([...prev, created]))
       setEditModelInput('')
@@ -634,11 +684,13 @@ export default function ProvidersPage() {
     setEditModOut(p.output)
   }
 
-  // 打开已有模型的类型编辑（预填当前模态）
+  // 打开已有模型的类型编辑（预填当前模态与上下文/输出上限）
   const startEditType = (m: ProviderModel) => {
     setEditTypeModel(m)
     setEditTypeIn(parseModalities(m.input_modalities))
     setEditTypeOut(parseModalities(m.output_modalities))
+    setEditTypeCtx(m.context_limit > 0 ? String(m.context_limit) : '')
+    setEditTypeOutLimit(m.output_limit > 0 ? String(m.output_limit) : '')
   }
   const toggleTypeMod = (side: 'in' | 'out', mo: Modality) => {
     if (side === 'in') {
@@ -660,13 +712,15 @@ export default function ProvidersPage() {
         [...p.input].sort().join() === [...editTypeIn].sort().join() &&
         [...p.output].sort().join() === [...editTypeOut].sort().join(),
     )?.key ?? 'custom'
-  // 保存已有模型的类型（模态）
+  // 保存已有模型的类型（模态 + 上下文窗口 + 输出上限）
   const saveEditType = async () => {
     if (!editTypeModel) return
     try {
       const updated = await updateModel(editTypeModel.id, {
         input_modalities: editTypeIn,
         output_modalities: editTypeOut,
+        context_limit: editTypeCtx.trim() ? Math.max(1, Number(editTypeCtx)) : undefined,
+        output_limit: editTypeOutLimit.trim() ? Math.max(1, Number(editTypeOutLimit)) : undefined,
       })
       setEditModels((prev) => sortModels(prev.map((x) => (x.id === updated.id ? updated : x))))
       setEditTypeModel(null)
@@ -878,6 +932,26 @@ export default function ProvidersPage() {
                 className="h-8 px-3 flex-1 min-w-40 modern-card border-dashed border-[var(--border)] rounded-lg text-[12px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
+            {/* 新建模型的默认上下文窗口 / 输出上限（应用到本次添加的全部模型；创建后可在编辑面板逐模型调整） */}
+            <div className="flex items-center gap-3 flex-wrap">
+              <label className="text-[10px] text-[var(--text-muted)]">{t('provider.modelDefaults')}</label>
+              <input
+                type="number"
+                min={1}
+                placeholder={t('provider.modelCtx')}
+                value={formCtx}
+                onChange={(e) => setFormCtx(e.target.value)}
+                className="w-32 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              />
+              <input
+                type="number"
+                min={1}
+                placeholder={t('provider.modelOut')}
+                value={formOut}
+                onChange={(e) => setFormOut(e.target.value)}
+                className="w-32 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              />
+            </div>
             <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelHint')}</p>
           </div>
 
@@ -969,6 +1043,14 @@ export default function ProvidersPage() {
                         </button>
                         <span className={!m.enabled ? 'line-through decoration-1' : ''}>{m.model_id}</span>
                         <span className="text-[9px] px-1 rounded bg-[var(--bg-primary)]/80">{modalityShort(m.input_modalities, t)}</span>
+                        {m.context_limit > 0 && (
+                          <span
+                            className="text-[9px] px-1 rounded bg-[var(--bg-primary)]/80 tnum"
+                            title={`${t('provider.modelCtx')}: ${m.context_limit}`}
+                          >
+                            {fmtCtx(m.context_limit)}
+                          </span>
+                        )}
                         <span className="flex flex-col gap-px opacity-0 group-hover/model:opacity-100 transition-opacity">
                           <button
                             onClick={() => moveMainModel(p, m, -1)}
@@ -1025,6 +1107,40 @@ export default function ProvidersPage() {
                             local: modelsMap[p.id]?.length ?? 0,
                           })}
                         </p>
+                        {/* 排序/筛选：免费优先（默认）/ 价格升序 / 平台顺序；可只看免费 */}
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-[10px] text-[var(--text-muted)]">{t('provider.syncSort')}</span>
+                          <div className="flex rounded-md border border-[var(--border)] overflow-hidden">
+                            {(
+                              [
+                                ['free', t('provider.syncSortFree')],
+                                ['price', t('provider.syncSortPrice')],
+                                ['default', t('provider.syncSortDefault')],
+                              ] as const
+                            ).map(([key, label]) => (
+                              <button
+                                key={key}
+                                onClick={() => setSyncSort(key)}
+                                className={`px-2 py-0.5 text-[10px] transition-colors ${
+                                  syncSort === key
+                                    ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
+                                    : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                                }`}
+                              >
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                          <label className="flex items-center gap-1 text-[10px] text-[var(--text-muted)] cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={syncFreeOnly}
+                              onChange={(e) => setSyncFreeOnly(e.target.checked)}
+                              className="w-3 h-3 accent-[var(--accent)]"
+                            />
+                            {t('provider.syncFreeOnly')}
+                          </label>
+                        </div>
                         {/* 失效模型：默认模型等旧配置，可移除 */}
                         <div className="space-y-1">
                           <div className="flex items-center justify-between gap-2">
@@ -1068,9 +1184,11 @@ export default function ProvidersPage() {
                         <div className="space-y-1">
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-[10.5px] text-[var(--success)]">
-                              {t('provider.syncNew')}（{syncResults[p.id].new_models.length}）
+                              {t('provider.syncNew')}（
+                              {sortRemote(syncResults[p.id].new_models, syncSort).filter((m) => !syncFreeOnly || m.free).length}
+                              ）
                             </span>
-                            {syncResults[p.id].new_models.length > 0 && (
+                            {sortRemote(syncResults[p.id].new_models, syncSort).filter((m) => !syncFreeOnly || m.free).length > 0 && (
                               <button
                                 onClick={() => addAllNew(p)}
                                 disabled={syncBusy['__all_' + p.id] === 'add'}
@@ -1080,26 +1198,35 @@ export default function ProvidersPage() {
                               </button>
                             )}
                           </div>
-                          {syncResults[p.id].new_models.length === 0 ? (
+                          {sortRemote(syncResults[p.id].new_models, syncSort).filter((m) => !syncFreeOnly || m.free).length === 0 ? (
                             <p className="text-[10.5px] text-[var(--text-muted)] italic">{t('provider.syncNewEmpty')}</p>
                           ) : (
                             <div className="flex gap-1.5 flex-wrap max-h-24 overflow-y-auto">
-                              {syncResults[p.id].new_models.map((modelId) => (
-                                <span
-                                  key={modelId}
-                                  className="group flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[var(--success)]/10 border border-[var(--success)]/20 text-[10.5px] font-mono text-[var(--success)]"
-                                >
-                                  {modelId}
-                                  <button
-                                    onClick={() => addSyncModel(p, modelId)}
-                                    disabled={syncBusy[modelId] === 'add'}
-                                    className="opacity-50 hover:opacity-100 transition-opacity disabled:opacity-30"
-                                    title={t('provider.syncAdd')}
+                              {sortRemote(syncResults[p.id].new_models, syncSort)
+                                .filter((m) => !syncFreeOnly || m.free)
+                                .map((m) => (
+                                  <span
+                                    key={m.id}
+                                    title={`${m.id} · ${t('provider.modelCtx')} ${fmtCtx(m.context_length)} · ${fmtPrice(m.input_price)}/in · ${fmtPrice(m.output_price)}/out`}
+                                    className="group flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[var(--success)]/10 border border-[var(--success)]/20 text-[10.5px] font-mono text-[var(--success)]"
                                   >
-                                    {syncBusy[modelId] === 'add' ? t('provider.syncBusy') : <Icon name="plus" size={10} />}
-                                  </button>
-                                </span>
-                              ))}
+                                    {m.id}
+                                    {m.free && (
+                                      <span className="text-[8px] px-1 py-px rounded bg-[var(--success)] text-white font-bold leading-none">
+                                        FREE
+                                      </span>
+                                    )}
+                                    <span className="text-[9px] text-[var(--text-muted)]/70">{fmtCtx(m.context_length)}</span>
+                                    <button
+                                      onClick={() => addSyncModel(p, m)}
+                                      disabled={syncBusy[m.id] === 'add'}
+                                      className="opacity-50 hover:opacity-100 transition-opacity disabled:opacity-30"
+                                      title={t('provider.syncAdd')}
+                                    >
+                                      {syncBusy[m.id] === 'add' ? t('provider.syncBusy') : <Icon name="plus" size={10} />}
+                                    </button>
+                                  </span>
+                                ))}
                             </div>
                           )}
                         </div>
@@ -1186,6 +1313,14 @@ export default function ProvidersPage() {
                             <span className="text-[9px] px-1 rounded bg-[var(--bg-primary)]/80">
                               {modalityShort(m.input_modalities, t)}
                             </span>
+                            {m.context_limit > 0 && (
+                              <span
+                                className="text-[9px] px-1 rounded bg-[var(--bg-primary)]/80 tnum"
+                                title={`${t('provider.modelCtx')}: ${m.context_limit}`}
+                              >
+                                {fmtCtx(m.context_limit)}
+                              </span>
+                            )}
                             <button
                               onClick={() => startEditType(m)}
                               title={t('provider.modelEditType')}
@@ -1242,6 +1377,26 @@ export default function ProvidersPage() {
                         onPreset={applyModPreset}
                         onToggle={toggleMod}
                       />
+                      {/* 新建模型的上下文窗口 / 输出上限（与模态选择器同样只作用于「即将添加的新模型」） */}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelDefaults')}</span>
+                        <input
+                          type="number"
+                          min={1}
+                          placeholder={t('provider.modelCtx')}
+                          value={editCtx}
+                          onChange={(e) => setEditCtx(e.target.value)}
+                          className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                        />
+                        <input
+                          type="number"
+                          min={1}
+                          placeholder={t('provider.modelOut')}
+                          value={editOut}
+                          onChange={(e) => setEditOut(e.target.value)}
+                          className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                        />
+                      </div>
                       {/* 已有模型的类型编辑：点击 chip 上的 ✎ 打开 */}
                       {editTypeModel && (
                         <div className="rounded-xl border border-[var(--accent)]/30 bg-[var(--bg-card)]/60 px-3 py-2.5 space-y-2 animate-fade-in-up">
@@ -1255,6 +1410,27 @@ export default function ProvidersPage() {
                             onPreset={applyTypePreset}
                             onToggle={toggleTypeMod}
                           />
+                          {/* 已有模型的上下文窗口 / 输出上限（随类型一起保存） */}
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelCtx')}</span>
+                            <input
+                              type="number"
+                              min={1}
+                              placeholder={t('provider.modelCtx')}
+                              value={editTypeCtx}
+                              onChange={(e) => setEditTypeCtx(e.target.value)}
+                              className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                            />
+                            <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelOut')}</span>
+                            <input
+                              type="number"
+                              min={1}
+                              placeholder={t('provider.modelOut')}
+                              value={editTypeOutLimit}
+                              onChange={(e) => setEditTypeOutLimit(e.target.value)}
+                              className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                            />
+                          </div>
                           <div className="flex items-center gap-2">
                             <button
                               onClick={saveEditType}

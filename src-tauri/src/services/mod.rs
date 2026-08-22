@@ -30,6 +30,7 @@ pub mod jdk_runtime;
 pub mod sdk_api;
 pub mod key_store;
 pub mod lan_server;
+pub mod language;
 pub mod llm_replay;
 pub mod maintenance;
 pub mod mcp_client;

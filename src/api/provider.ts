@@ -97,14 +97,27 @@ export interface UpdateProviderInput {
   limit_monthly_cny?: number | null // 月预算（元），0/null 表示不限制
 }
 
+/** 远端模型元数据（同步结果）：平台模型列表的展开信息 */
+export interface RemoteModelInfo {
+  id: string
+  /** 上下文窗口（token）；平台未提供时为 0 */
+  context_length: number
+  /** 输入价格（美元/百万 token） */
+  input_price: number
+  /** 输出价格（美元/百万 token） */
+  output_price: number
+  /** 免费模型（OpenRouter :free 后缀或输入/输出价格均为 0） */
+  free: boolean
+}
+
 export interface SyncModelsResult {
   provider_id: string
-  /** 平台当前返回的模型 ID 列表 */
-  remote_models: string[]
+  /** 平台当前返回的模型列表（含元数据，已按免费优先→价格升序→上下文降序排序） */
+  remote_models: RemoteModelInfo[]
   /** 本地已配置但平台当前不可用的模型 ID（默认模型等旧配置） */
   missing: string[]
-  /** 平台当前有、但本地未配置的模型 ID（新增候选） */
-  new_models: string[]
+  /** 平台当前有、但本地未配置的模型（新增候选，含元数据） */
+  new_models: RemoteModelInfo[]
   /** 拉取远端模型列表失败时的原因（null=成功） */
   error: string | null
 }

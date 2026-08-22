@@ -8,6 +8,25 @@ import Icon from '../../icons/Icon'
 import { ToolRunRow, AgentRunCard } from './toolRuns'
 import { getRequestLogs, type RequestLog } from '../../api/cost'
 
+/** 回复语言选项（与后端 services/language.rs 的 LANGUAGES 一致；auto=跟随用户输入） */
+const REPLY_LANGUAGES: [string, string][] = [
+  ['zh', '中文'],
+  ['en', 'English'],
+  ['ar', 'العربية'],
+  ['ja', '日本語'],
+  ['ko', '한국어'],
+  ['ru', 'Русский'],
+  ['fr', 'Français'],
+  ['de', 'Deutsch'],
+  ['es', 'Español'],
+  ['pt', 'Português'],
+  ['it', 'Italiano'],
+  ['th', 'ไทย'],
+  ['vi', 'Tiếng Việt'],
+  ['he', 'עברית'],
+  ['hi', 'हिन्दी'],
+]
+
 /* ============ 分支选择器（顶部栏） ============ */
 export function BranchSelector({
   current,
@@ -333,6 +352,24 @@ export function ModelSettingsPopover({
             <option value="high">{t('home.reasoningHigh')}</option>
           </select>
           <p className="text-[10px] text-[var(--text-muted)] mt-1 leading-snug">{t('home.reasoningHint')}</p>
+        </div>
+
+        {/* 回复语言：auto=跟随用户输入语言（默认）；固定语言=强制模型用该语言回复 */}
+        <div>
+          <div className="text-[10px] font-medium text-[var(--text-muted)] mb-1.5">{t('home.replyLanguage')}</div>
+          <select
+            value={options.reply_language ?? 'auto'}
+            onChange={(e) => onChange({ ...options, reply_language: e.target.value === 'auto' ? undefined : e.target.value })}
+            className="w-full h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-2 text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
+          >
+            <option value="auto">{t('home.replyLangAuto')}</option>
+            {REPLY_LANGUAGES.map(([code, label]) => (
+              <option key={code} value={code}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <p className="text-[10px] text-[var(--text-muted)] mt-1 leading-snug">{t('home.replyLangHint')}</p>
         </div>
 
         {/* 子 Agent 设置（Claude Code subagent / ArkClaw 多 Agent） */}

@@ -115,6 +115,8 @@ export interface ChatOptions {
   native_tools?: boolean
   /** 精确恢复的父 Run；只应由安全恢复入口临时设置，不写入持久化模型偏好。 */
   resume_run_id?: string
+  /** 回复语言：auto=跟随用户输入（缺省）；zh/en/ar/ja/ko/ru/fr/de/es/pt/th/vi 等=固定语言 */
+  reply_language?: string
 }
 
 /** 回复工具权限审核请求（自动审核模式下由确认弹窗调用）；remember=始终允许该工具，feedback=拒绝理由，scope=project 时持久化到项目白名单 */

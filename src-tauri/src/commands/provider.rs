@@ -526,16 +526,30 @@ pub fn switch_provider(db: State<DbState>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 远端模型元数据（同步结果）：平台模型列表的展开信息，供前端排序/展示/自动填充
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteModelInfo {
+    pub id: String,
+    /// 上下文窗口（token）；平台未提供时为 0
+    pub context_length: i64,
+    /// 输入价格（美元/百万 token）
+    pub input_price: f64,
+    /// 输出价格（美元/百万 token）
+    pub output_price: f64,
+    /// 免费模型（OpenRouter :free 后缀或输入/输出价格均为 0）
+    pub free: bool,
+}
+
 /// 模型同步结果：拉取平台当前模型列表后与本地配置对比
 #[derive(Debug, Serialize)]
 pub struct SyncModelsResult {
     pub provider_id: String,
-    /// 平台当前返回的模型 ID 列表
-    pub remote_models: Vec<String>,
+    /// 平台当前返回的模型列表（含元数据，已按免费优先→价格升序→上下文降序排序）
+    pub remote_models: Vec<RemoteModelInfo>,
     /// 本地已配置但平台当前不可用的模型 ID（默认模型等旧配置）
     pub missing: Vec<String>,
-    /// 平台当前有、但本地未配置的模型 ID（新增候选）
-    pub new_models: Vec<String>,
+    /// 平台当前有、但本地未配置的模型（新增候选，含元数据）
+    pub new_models: Vec<RemoteModelInfo>,
     /// 拉取远端模型列表失败时的原因（None=成功）
     pub error: Option<String>,
 }
@@ -641,14 +655,32 @@ pub async fn sync_provider_models(db: State<'_, DbState>, id: String) -> Result<
         }
     };
 
-    // 平台模型 ID 提取：openai/anthropic -> data[].id；gemini -> models[].name（去 models/ 前缀）
-    let remote_models: Vec<String> = match protocol.as_str() {
+    // 平台模型元数据提取：
+    // - openai 兼容（含 OpenRouter）：data[].id / context_length / pricing.prompt / pricing.completion
+    // - anthropic：data[].id（无上下文/价格字段）
+    // - gemini：models[].name（去 models/ 前缀）/ inputTokenLimit / outputTokenLimit
+    // 免费判断：id 以 :free 结尾（OpenRouter 惯例）或输入/输出价格均为 0
+    let parse_price = |v: &serde_json::Value| -> f64 {
+        v.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| v.as_f64())
+            .unwrap_or(0.0)
+    };
+    let mut remote_models: Vec<RemoteModelInfo> = match protocol.as_str() {
         "gemini" => resp_json["models"]
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| m["name"].as_str())
-                    .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
+                    .filter_map(|m| {
+                        let name = m["name"].as_str()?;
+                        Some(RemoteModelInfo {
+                            id: name.strip_prefix("models/").unwrap_or(name).to_string(),
+                            context_length: m["inputTokenLimit"].as_i64().unwrap_or(0),
+                            input_price: 0.0,
+                            output_price: 0.0,
+                            free: false,
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -656,25 +688,50 @@ pub async fn sync_provider_models(db: State<'_, DbState>, id: String) -> Result<
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| m["id"].as_str().map(String::from))
+                    .filter_map(|m| {
+                        let id = m["id"].as_str()?;
+                        let pricing = &m["pricing"];
+                        let in_p = parse_price(&pricing["prompt"]);
+                        let out_p = parse_price(&pricing["completion"]);
+                        Some(RemoteModelInfo {
+                            id: id.to_string(),
+                            context_length: m["context_length"].as_i64().unwrap_or(0),
+                            input_price: in_p * 1_000_000.0,
+                            output_price: out_p * 1_000_000.0,
+                            free: id.ends_with(":free") || (in_p == 0.0 && out_p == 0.0),
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default(),
     };
+    // 免费优先 → 合计价格升序 → 上下文窗口降序 → 名称升序（OpenRouter 等大列表更易找免费模型）
+    remote_models.sort_by(|a, b| {
+        b.free
+            .cmp(&a.free)
+            .then_with(|| {
+                (a.input_price + a.output_price)
+                    .partial_cmp(&(b.input_price + b.output_price))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.context_length.cmp(&a.context_length))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
-    let remote_set: std::collections::HashSet<String> = remote_models.iter().cloned().collect();
+    let remote_set: std::collections::HashSet<String> =
+        remote_models.iter().map(|m| m.id.clone()).collect();
     let local_set: std::collections::HashSet<String> =
         local_models.iter().map(|m| m.model_id.clone()).collect();
 
-    // missing：本地有、平台无（旧配置/已下线模型）；new_models：平台有、本地无（新增候选）
+    // missing：本地有、平台无（旧配置/已下线模型）；new_models：平台有、本地无（新增候选，携带元数据）
     let missing: Vec<String> = local_models
         .iter()
         .map(|m| m.model_id.clone())
         .filter(|m| !remote_set.contains(m))
         .collect();
-    let new_models: Vec<String> = remote_models
+    let new_models: Vec<RemoteModelInfo> = remote_models
         .iter()
-        .filter(|m| !local_set.contains(*m))
+        .filter(|m| !local_set.contains(&m.id))
         .cloned()
         .collect();
 
