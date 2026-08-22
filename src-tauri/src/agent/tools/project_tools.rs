@@ -1279,7 +1279,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             ref_root.join("build-profile.json5"),
-            r#"{"app":{"signingConfigs":[{"name":"default","material":{"certpath":"C:\\nope.cer","keyAlias":"debugKey","profile":"C:\\nope.p7b","storeFile":"C:\\nope.p12"}}]}}"#,
+            r#"{"app":{"signingConfigs":[{"name":"default","material":{"certpath":"nope.cer","keyAlias":"debugKey","profile":"nope.p7b","storeFile":"nope.p12"}}]}}"#,
         )
         .unwrap();
         let roots = [tmp.to_string_lossy().to_string()];
@@ -1310,7 +1310,7 @@ mod tests {
             ref_root.join("build-profile.json5"),
             format!(
                 r#"{{"app":{{"signingConfigs":[{{"name":"default","material":{{"storeFile":"{}"}}}}]}}}}"#,
-                tmp.join("outside.p12").to_string_lossy()
+                tmp.join("outside.p12").to_string_lossy().replace('\\', "\\\\")
             ),
         )
         .unwrap();

@@ -632,12 +632,12 @@ pub fn npm_global_bin_dir() -> Option<PathBuf> {
 ///   内置缺失时直接执行 shim（依赖调用方注入的 PATH）；
 /// - Windows：.cmd/.bat 走 cmd 包装（内部 `node` 由 MCP 子进程 PATH 注入兜底），.exe 直调。
 fn resolve_npm_global_bin(program: &str) -> Option<Resolved> {
+    // 注意：后续 strip_suffix 失败时不能再回退到原始 program（否则“Deveco.exe”
+    // 去掉 .exe 后又被 unwrap_or 恢复，最终 base 仍带扩展名），用 or_else 链保持剥离结果
     let base = program
         .strip_suffix(".exe")
-        .unwrap_or(program)
-        .strip_suffix(".cmd")
-        .unwrap_or(program)
-        .strip_suffix(".bat")
+        .or_else(|| program.strip_suffix(".cmd"))
+        .or_else(|| program.strip_suffix(".bat"))
         .unwrap_or(program)
         .to_ascii_lowercase();
     let dir = npm_global_bin_dir()?;

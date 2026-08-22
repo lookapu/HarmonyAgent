@@ -5099,7 +5099,9 @@ mod tests {
         let spec = req.resolve(&roots).unwrap();
          assert_eq!(spec.timeout, 300);
          let root_c = std::fs::canonicalize(&root).unwrap();
-         assert_eq!(spec.cwd, root_c.join("sub"));
+         // Windows canonicalize 返回 \\?\ verbatim 路径，被测实现输出干净路径，统一后比较
+         let expected = std::path::PathBuf::from(crate::utils::path::normalize_path(&root_c.join("sub").to_string_lossy()));
+         assert_eq!(spec.cwd, expected);
         // cwd 不是目录 → 报错
         let req = super::cmd_tools::CommandRequest::from_args(&serde_json::json!({"command":"git status","cwd":"not_a_dir"})).unwrap();
         assert!(req.resolve(&roots).is_err());
@@ -5117,7 +5119,9 @@ mod tests {
         // read：默认值（outline=false / start=1 / lines=0）+ 相对路径归一化
         let req = super::fs_tools::ReadFileRequest::from_args(&serde_json::json!({"path":"a.txt"})).unwrap();
         let spec = req.resolve(&roots).unwrap();
-        assert_eq!(spec.path, root_c.join("a.txt"));
+        // Windows canonicalize 返回 \\?\ verbatim 路径，被测实现输出干净路径，统一后比较
+        let expected = std::path::PathBuf::from(crate::utils::path::normalize_path(&root_c.join("a.txt").to_string_lossy()));
+        assert_eq!(spec.path, expected);
         assert!(!spec.outline);
         assert_eq!(spec.start, 1);
         assert_eq!(spec.lines, 0);
@@ -5128,7 +5132,8 @@ mod tests {
         assert!(super::fs_tools::WriteFileRequest::from_args(&serde_json::json!({"path":"b.txt"})).unwrap().resolve(&roots).is_err());
         let req = super::fs_tools::WriteFileRequest::from_args(&serde_json::json!({"path":"b.txt","content":"x"})).unwrap();
         let spec = req.resolve(&roots).unwrap();
-        assert_eq!(spec.path, root_c.join("b.txt"));
+        let expected = std::path::PathBuf::from(crate::utils::path::normalize_path(&root_c.join("b.txt").to_string_lossy()));
+        assert_eq!(spec.path, expected);
         assert_eq!(spec.content, "x");
         // edit：old 空 → 报错；缺省 replace_all=false
         assert!(super::fs_tools::EditFileRequest::from_args(&serde_json::json!({"path":"a.txt","old":""})).unwrap().resolve(&roots).is_err());
@@ -5380,8 +5385,8 @@ mod tests {
         // resolve_for_write 应返回根内规范化路径
         let p = resolve_for_write(&roots, sub).expect("resolve_for_write 应支持创建新文件");
         assert!(p.is_absolute());
-        // Windows 下分隔符可能混合（join 用 /，canonicalize 用 \），统一后再比较
-        let norm = |s: &str| s.replace('/', "\\").to_lowercase();
+        // Windows 下分隔符可能混合（join 用 /，canonicalize 用 \），且 canonicalize 返回 \\?\ 前缀，统一后比较
+        let norm = |s: &str| crate::utils::path::normalize_path(&s.replace('/', "\\")).to_lowercase();
         let expected = std::fs::canonicalize(&root).unwrap().join(sub);
         assert_eq!(norm(&p.to_string_lossy()), norm(&expected.to_string_lossy()));
         // 已存在文件：两者结果一致
