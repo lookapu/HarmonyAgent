@@ -15,6 +15,7 @@ import {
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
+import { emptyStreaming } from './chatSlice'
 
 /** localStorage key：持久化最近选中的项目/会话（统一见 src/constants.ts 的 STORAGE_KEYS） */
 
@@ -89,6 +90,10 @@ export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice
       buildLogs: [],
       terminalEntries: [],
       lastTaskSummary: null,
+      // 待发送队列与会话搜索词都是会话列表/对话区视角的状态，跨项目切换即丢弃，
+      // 避免旧项目的排队消息/搜索过滤串到新项目
+      queuedList: [],
+      conversationKeyword: '',
       // feedbackMap/versionMap/tokenStats 延迟到新消息 set 时一并清空，合并为一次渲染
     })
     trace.mark('project-set')
@@ -116,7 +121,29 @@ export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice
       persistLastProject(id, targetConv.id)
       trace.mark('conv-painted')
     } else {
-      trace.mark('no-conv')
+      // 新项目没有任何会话：立即清空对话区（会话与消息都不能沿用上一个项目），
+      // 否则切换后残留上一项目的会话标题、消息与流式状态，造成“串项目”错觉
+      set({
+        currentConversation: null,
+        messages: [],
+        olderHasMore: false,
+        loadingOlder: false,
+        streaming: emptyStreaming(),
+        feedbackMap: {},
+        versionMap: {},
+        tokenStats: null,
+        toolRuns: [],
+        agentRuns: [],
+        todos: [],
+        askCard: null,
+        toolApprovals: [],
+        pendingPlan: null,
+        plan: null,
+        lastTaskSummary: null,
+        approvedPlan: null,
+        unfinishedConv: null,
+      })
+      trace.mark('no-conv-cleared')
     }
 
     // 3. 侧边栏数据（Git/文件树/记忆/工具统计）全部并行加载，不阻塞聊天视图

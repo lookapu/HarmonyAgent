@@ -105,8 +105,8 @@ const markRunTerminal = (conversationId: string, runId?: string) => {
   }, 60 * 1000)
 }
 
-/** 空流式状态 */
-const emptyStreaming = (): StreamingState => ({
+/** 空流式状态（projectSlice 无会话清空时复用） */
+export const emptyStreaming = (): StreamingState => ({
   conversationId: null,
   runId: null,
   recoveryParentRunId: null,
