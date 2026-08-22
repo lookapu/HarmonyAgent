@@ -333,6 +333,7 @@
     "gitBranches": "Branches",
     "gitBranchCurrent": "Current branch",
     "gitChanged": "{{n}} changed",
+    "gitChangedLabel": "Changed",
     "gitUntracked": "{{n}} untracked",
     "gitStatusDetail": "Working tree details",
     "gitNoRepo": "This project is not a Git repository",

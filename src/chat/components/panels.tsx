@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { TerminalEntry, BuildLogLine } from '../../stores/projectStore'
 import type { ProjectMemory, ToolStat, ToolTokenStat } from '../../api/project'
-import { gitBranchInfo, type GitBranchInfo } from '../../api/git'
+import { gitBranchInfo, gitInitRepo, type GitBranchInfo } from '../../api/git'
 import { terminalExec, terminalKill, terminalStatus } from '../../api/terminal'
 import Icon from '../../icons/Icon'
 import { AnsiText, hasAnsi } from '../../components/AnsiText'
@@ -34,23 +34,37 @@ export function OverviewRow({
   )
 }
 
-/** 概览 Git 变更摘要：当前分支 + 已跟踪/未跟踪计数，点击进入 Git 面板 */
+/** 概览 Git 变更摘要：当前分支 + 已跟踪/未跟踪计数，点击进入 Git 面板；非仓库时可一键初始化 */
 export function OverviewGitSummary({ projectPath, onOpenGit }: { projectPath: string; onOpenGit: () => void }) {
   const { t } = useTranslation()
   const [info, setInfo] = useState<GitBranchInfo | null>(null)
+  const [initBusy, setInitBusy] = useState(false)
+  const [initErr, setInitErr] = useState<string | null>(null)
+
+  const refresh = () => {
+    gitBranchInfo(projectPath)
+      .then(setInfo)
+      .catch(() => {})
+  }
 
   useEffect(() => {
-    let alive = true
     setInfo(null)
-    gitBranchInfo(projectPath)
-      .then((v) => {
-        if (alive) setInfo(v)
-      })
-      .catch(() => {})
-    return () => {
-      alive = false
-    }
+    refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectPath])
+
+  const initRepo = async () => {
+    setInitBusy(true)
+    setInitErr(null)
+    try {
+      await gitInitRepo(projectPath)
+      refresh()
+    } catch (e) {
+      setInitErr(String(e))
+    } finally {
+      setInitBusy(false)
+    }
+  }
 
   return (
     <div className="rounded-xl modern-card p-3">
@@ -71,13 +85,25 @@ export function OverviewGitSummary({ projectPath, onOpenGit }: { projectPath: st
             <OverviewRow icon="folder" label={t('home.gitBranch')} value={info.current} mono />
             <OverviewRow
               icon="check"
-              label={t('home.gitChanged')}
+              label={t('home.gitChangedLabel')}
               value={`${t('home.gitTracked', { n: info.changed })} · ${t('home.gitUntracked', { n: info.untracked })}`}
               tone={info.changed > 0 || info.untracked > 0 ? 'warn' : 'ok'}
             />
           </div>
         ) : (
-          <div className="mt-2 text-[11px] text-[var(--text-muted)]">{t('home.gitNotRepo')}</div>
+          <div className="mt-2 space-y-1.5">
+            <div className="text-[11px] text-[var(--text-muted)]">{t('home.gitNotRepo')}</div>
+            {initErr && <div className="text-[10.5px] text-[var(--danger)] break-all">{initErr}</div>}
+            <button
+              type="button"
+              onClick={() => void initRepo()}
+              disabled={initBusy}
+              className="inline-flex items-center gap-1.5 h-6 px-2.5 rounded-md text-[10.5px] font-medium bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--accent)]/15 transition-colors disabled:opacity-50"
+            >
+              {initBusy && <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />}
+              {initBusy ? '…' : t('home.gitInitRepo')}
+            </button>
+          </div>
         )
       ) : (
         <div className="mt-2 text-[11px] text-[var(--text-muted)] animate-pulse">{t('home.loading')}</div>

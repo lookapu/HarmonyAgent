@@ -48,7 +48,6 @@ import {
   MODULE_KINDS,
   MODULE_KIND_LABELS,
   deriveProjectType,
-  projectTypeBadgeClass,
   type WorkspaceModule,
   type ModuleKind,
   listToolWhitelist,
@@ -4393,14 +4392,6 @@ export default function Home() {
                 {tokenStats.cost_cny > 0.001 && <span> · ¥{tokenStats.cost_cny.toFixed(2)}</span>}
               </span>
             )}
-            {currentProject && currentProject.kind !== 'global' && (() => {
-              const badge = deriveProjectType(currentProject)
-              return (
-                <span className={`shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-md ${projectTypeBadgeClass(badge.kind)}`}>
-                  {badge.label}
-                </span>
-              )
-            })()}
             {currentProject && currentProject.path && gitBranches?.has_git && (
               <BranchSelector current={gitBranches.current} branches={gitBranches.branches} onSwitch={switchBranch} />
             )}

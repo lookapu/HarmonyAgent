@@ -334,6 +334,7 @@
     "gitBranches": "分支",
     "gitBranchCurrent": "当前分支",
     "gitChanged": "改动 {{n}}",
+    "gitChangedLabel": "改动",
     "gitUntracked": "未跟踪 {{n}}",
     "gitStatusDetail": "工作区详情",
     "gitNoRepo": "该项目不是 Git 仓库",

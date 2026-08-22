@@ -755,7 +755,8 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
   ]
 
   return (
-    <div className="h-full flex flex-col items-center justify-center text-center">
+    <div className="h-full overflow-y-auto">
+      <div className="min-h-full flex flex-col items-center justify-center text-center px-6 py-6">
       <div className="relative mb-6">
         <div className="absolute inset-0 blur-3xl bg-[var(--accent)]/20 rounded-full scale-150" />
         <div className="relative w-14 h-14 rounded-2xl bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shadow-xl shadow-[var(--accent)]/25">
@@ -798,6 +799,7 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
         >
           {t('home.example2')}
         </button>
+      </div>
       </div>
     </div>
   )
