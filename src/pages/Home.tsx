@@ -5102,6 +5102,21 @@ export default function Home() {
                                 usage: Math.round(sessionHealth.budget_usage_ratio * 100),
                               })}
                             </span>
+                            {sessionHealth.recent_invalidations.length > 0 && (
+                              <span className="mt-1 block">
+                                <span className="block text-[10px] font-medium text-[var(--text-primary)]">
+                                  {t('home.ctxHealthInvalidations')}
+                                </span>
+                                {sessionHealth.recent_invalidations.map((item) => (
+                                  <span
+                                    key={`${item.fact_kind}/${item.fact_key}/${item.invalidated_at}`}
+                                    className="block break-all text-[10px] text-[var(--text-muted)]"
+                                  >
+                                    · {item.fact_kind}/{item.fact_key} — {item.reason}
+                                  </span>
+                                ))}
+                              </span>
+                            )}
                             {sessionHealth.advice.length > 0 && (
                               <span className="mt-1 block space-y-0.5">
                                 {sessionHealth.advice.map((item) => (

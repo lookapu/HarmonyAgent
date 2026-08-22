@@ -443,6 +443,7 @@
     "ctxHealthTitle": "Session health",
     "ctxHealthDegraded": "degraded",
     "ctxHealthMetrics": "compress {{compress}} · fact flips {{flip}}% · corrections {{corrected}} · usage {{usage}}%",
+    "ctxHealthInvalidations": "Why facts were invalidated",
     "ctxV2Empty": "No sourced facts or artifacts yet.",
     "ctxPinsTitle": "Pinned context ({{count}})",
     "ctxPinRemove": "Remove",

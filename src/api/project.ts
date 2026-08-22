@@ -279,6 +279,14 @@ export interface ConversationContextInfo {
 export const getConversationContext = (conversationId: string) =>
   invokeWithError<ConversationContextInfo>('conversation_context', { conversationId })
 
+/** 事实失效明细：原因（superseded/项目切换/设备变化等）与失效时间（LC-31） */
+export interface FactInvalidationDetail {
+  fact_key: string
+  fact_kind: string
+  reason: string
+  invalidated_at: number
+}
+
 /** 会话健康度与摘要退化预警（长会话可观测性，后端 compute_session_health 口径） */
 export interface SessionHealthV2 {
   conversation_id: string
@@ -292,6 +300,12 @@ export interface SessionHealthV2 {
   reconciliation_count: number
   corrected_count: number
   budget_usage_ratio: number
+  /** 摘要覆盖游标链推导：摘要覆盖消息占比（LC-34） */
+  summary_coverage: number
+  /** 真实摘要层级：0=无摘要 1=浅层 2=中层 3=深层（LC-34） */
+  summary_depth: number
+  /** 最近失效事实明细（最多 5 条，'为什么遗忘'入口） */
+  recent_invalidations: FactInvalidationDetail[]
   degraded: boolean
   advice: string[]
 }

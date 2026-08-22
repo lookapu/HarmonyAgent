@@ -444,6 +444,7 @@
     "ctxHealthTitle": "会话健康度",
     "ctxHealthDegraded": "已退化",
     "ctxHealthMetrics": "压缩 {{compress}} 次 · 事实翻转 {{flip}}% · 对账纠正 {{corrected}} 次 · 占用 {{usage}}%",
+    "ctxHealthInvalidations": "失效明细（为什么遗忘）",
     "ctxV2Empty": "当前没有来源化事实或产物。",
     "ctxPinsTitle": "固定上下文（{{count}}）",
     "ctxPinRemove": "解除",
