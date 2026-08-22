@@ -196,11 +196,118 @@ pub fn pick_model_for_task(
     }
 }
 
+/// 视觉兜底：同 Provider 内挑选支持 image 输入且已启用的模型（不要求已定价）。
+///
+/// 用于「附带图片但当前模型不支持 image」时的自动切换（如用户显式选了纯文本模型，
+/// 或自动路由因候选未定价而落空）。排序：默认模型优先 → 已定价者按单价合计升序
+/// （未定价模型排后）→ 上下文窗口降序。排除主模型本身；无候选返回 None。
+pub fn pick_vision_fallback(
+    conn: &Connection,
+    provider_id: &str,
+    exclude_model: &str,
+) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT model_id, input_price_per_mtok, output_price_per_mtok,
+                    context_limit, is_default, input_modalities
+             FROM models
+             WHERE provider_id = ?1 AND enabled = 1 AND model_id != ?2",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![provider_id, exclude_model], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, i64>(4)? != 0,
+                r.get::<_, String>(5)?,
+            ))
+        })
+        .ok()?;
+    let mut cands: Vec<(String, f64, f64, Option<i64>, bool)> = Vec::new();
+    for row in rows.flatten() {
+        if !modalities_include(&row.5, "image") {
+            continue;
+        }
+        cands.push((row.0, row.1, row.2, row.3, row.4));
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // 默认模型优先；已定价（单价合计 > 0）按价格升序，未定价模型排后按上下文窗口降序
+    cands.sort_by(|a, b| {
+        let ap = a.1 + a.2;
+        let bp = b.1 + b.2;
+        b.4.cmp(&a.4).then_with(|| match (ap > 0.0, bp > 0.0) {
+            (true, true) => ap.partial_cmp(&bp).unwrap_or(std::cmp::Ordering::Equal),
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => b.3.unwrap_or(0).cmp(&a.3.unwrap_or(0)),
+        })
+    });
+    cands.first().map(|c| c.0.clone())
+}
+
 /// 判断 input_modalities JSON 数组字符串是否包含某模态。
 fn modalities_include(json: &str, want: &str) -> bool {
     // 容错：直接子串匹配 "image" / "text"，足以应对 ["text","image"] 这类序列化结果；
     // 对历史纯文本值 "text" 也成立。
     json.contains(&format!("\"{want}\"")) || json == want
+}
+
+/// 按输出模态挑选生成模型（图片/视频/音频）：同 Provider 内 enabled=1 且
+/// output_modalities 含目标模态的候选。排序：默认模型优先 → 已定价（单价合计 > 0）
+/// 按单价升序 → 未定价模型排后按上下文窗口降序。无候选返回 None（不要求已定价，
+/// 同 pick_vision_fallback 容错风格）。
+pub fn pick_model_for_output(
+    conn: &Connection,
+    provider_id: &str,
+    modality: &str,
+) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT model_id, input_price_per_mtok, output_price_per_mtok,
+                    context_limit, is_default, output_modalities
+             FROM models
+             WHERE provider_id = ?1 AND enabled = 1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![provider_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, i64>(4)? != 0,
+                r.get::<_, String>(5)?,
+            ))
+        })
+        .ok()?;
+    let mut cands: Vec<(String, f64, f64, Option<i64>, bool)> = Vec::new();
+    for row in rows.flatten() {
+        if !modalities_include(&row.5, modality) {
+            continue;
+        }
+        cands.push((row.0, row.1, row.2, row.3, row.4));
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // 默认模型优先；已定价（单价合计 > 0）按价格升序，未定价模型排后按上下文窗口降序
+    cands.sort_by(|a, b| {
+        let ap = a.1 + a.2;
+        let bp = b.1 + b.2;
+        b.4.cmp(&a.4).then_with(|| match (ap > 0.0, bp > 0.0) {
+            (true, true) => ap.partial_cmp(&bp).unwrap_or(std::cmp::Ordering::Equal),
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => b.3.unwrap_or(0).cmp(&a.3.unwrap_or(0)),
+        })
+    });
+    cands.first().map(|c| c.0.clone())
 }
 
 /// 同 Provider 中比主模型更便宜的可用模型：返回最便宜的一个（按输入+输出单价合计）。
@@ -353,6 +460,56 @@ mod tests {
         insert(&conn, "1", "p1", "main", 1, 30.0, 60.0, 1);
         insert(&conn, "2", "p2", "cheap_elsewhere", 1, 0.1, 0.1, 1);
         assert_eq!(pick_economy_model(&conn, "p1", "main"), None);
+    }
+
+    #[test]
+    fn test_pick_vision_fallback_prefers_default_then_cheapest() {
+        let conn = setup();
+        // 默认模型：priced_default（默认 + 有价格）；候选有更便宜的 vision 模型
+        insert_full(&conn, "1", "p1", "main", 1, 8192, 30.0, 60.0, "[\"text\"]");
+        insert_full(&conn, "2", "p1", "vision_cheap", 0, 8192, 1.0, 2.0, "[\"text\",\"image\"]");
+        insert_full(&conn, "3", "p1", "vision_default", 1, 8192, 5.0, 10.0, "[\"text\",\"image\"]");
+        assert_eq!(
+            pick_vision_fallback(&conn, "p1", "main").as_deref(),
+            Some("vision_cheap")
+        );
+    }
+
+    #[test]
+    fn test_pick_vision_fallback_requires_image_modality() {
+        let conn = setup();
+        insert_full(&conn, "1", "p1", "main", 1, 8192, 30.0, 60.0, "[\"text\"]");
+        // 唯一候选不支持 image：返回 None
+        insert_full(&conn, "2", "p1", "text_only", 1, 8192, 1.0, 2.0, "[\"text\"]");
+        assert_eq!(pick_vision_fallback(&conn, "p1", "main"), None);
+    }
+
+    #[test]
+    fn test_pick_vision_fallback_unpriced_by_context() {
+        let conn = setup();
+        insert_full(&conn, "1", "p1", "main", 1, 8192, 30.0, 60.0, "[\"text\"]");
+        // 未定价（0+0）的 vision 模型：仍可被选中（模板添加的模型常无价格），大上下文优先
+        insert_full(&conn, "2", "p1", "vision_small", 1, 8192, 0.0, 0.0, "[\"text\",\"image\"]");
+        insert_full(&conn, "3", "p1", "vision_big", 1, 128_000, 0.0, 0.0, "[\"text\",\"image\"]");
+        assert_eq!(
+            pick_vision_fallback(&conn, "p1", "main").as_deref(),
+            Some("vision_big")
+        );
+    }
+
+    #[test]
+    fn test_pick_vision_fallback_ignores_disabled_and_other_provider() {
+        let conn = setup();
+        insert_full(&conn, "1", "p1", "main", 1, 8192, 30.0, 60.0, "[\"text\"]");
+        // 禁用 / 其他 Provider：不可选
+        insert_full(&conn, "2", "p1", "vision_disabled", 1, 8192, 1.0, 2.0, "[\"text\",\"image\"]");
+        conn.execute(
+            "UPDATE models SET enabled = 0 WHERE id = '2'",
+            [],
+        )
+        .unwrap();
+        insert_full(&conn, "3", "p2", "vision_elsewhere", 1, 8192, 1.0, 2.0, "[\"text\",\"image\"]");
+        assert_eq!(pick_vision_fallback(&conn, "p1", "main"), None);
     }
 
     #[test]

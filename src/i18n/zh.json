@@ -2050,3 +2050,16 @@
     "opening": "正在打开…"
   }
 }
+    "generate": "生成",
+    "genKind": {
+      "image": "图片",
+      "video": "视频",
+      "audio": "音频"
+    },
+    "genProgress": "正在生成{{kind}}…",
+    "genWaited": "（已等待 {{secs}} 秒）",
+    "genCancel": "取消生成",
+    "genCancelHint": "取消生成模式",
+    "genFailed": "生成失败",
+    "modelSwitchTitle": "模型自动切换",
+    "modelSwitchBody": "本条消息包含图片，已自动从 {{from}} 切换到支持图片输入的 {{to}}",

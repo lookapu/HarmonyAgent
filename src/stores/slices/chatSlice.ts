@@ -584,12 +584,15 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     deletedTrace?.end()
     const pendingConfirmations = { ...state.pendingConfirmations }
     delete pendingConfirmations[conversation_id]
+    const genStatus = { ...state.genStatus }
+    delete genStatus[conversation_id]
     if (state.currentConversation?.id === conversation_id) {
       // 删除的是当前会话：清空视图，打开同项目第一个会话
       const remaining = state.conversations.filter((c) => c.id !== conversation_id)
       set({
         streamings,
         pendingConfirmations,
+        genStatus,
         conversations: remaining,
         currentConversation: null,
         messages: [],
@@ -608,9 +611,58 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       set({
         streamings,
         pendingConfirmations,
+        genStatus,
         conversations: state.conversations.filter((c) => c.id !== conversation_id),
       })
     }
+  }).catch(() => {})
+
+  // ============ 生成媒体任务（gen-* 事件）：图片/视频/音频 ============
+  // genStatus 按会话记录生成中状态：输入区状态条 / 停止按钮 / 生成中防重入依赖它
+  listen<{ conversation_id: string; kind: 'image' | 'video' | 'audio' }>('gen-start', (event) => {
+    const { conversation_id, kind } = event.payload
+    set({
+      genStatus: {
+        ...get().genStatus,
+        [conversation_id]: { kind, stage: 'submitting', waitedSecs: 0 },
+      },
+    })
+  }).catch(() => {})
+
+  listen<{ conversation_id: string; kind: 'image' | 'video' | 'audio'; stage: string; waited_secs: number }>(
+    'gen-progress',
+    (event) => {
+      const { conversation_id, kind, stage, waited_secs } = event.payload
+      set({
+        genStatus: {
+          ...get().genStatus,
+          [conversation_id]: { kind, stage, waitedSecs: waited_secs },
+        },
+      })
+    },
+  ).catch(() => {})
+
+  // 生成完成：释放状态位 + 已入库的 assistant 消息（媒体标记 content）直接入列渲染
+  listen<{ conversation_id: string; message: ChatMessage }>('gen-done', (event) => {
+    const { conversation_id, message } = event.payload
+    const genStatus = { ...get().genStatus }
+    delete genStatus[conversation_id]
+    const state = get()
+    const isCurrent = state.currentConversation?.id === conversation_id
+    set({
+      genStatus,
+      messages: isCurrent ? upsertMessageById(state.messages, message) : state.messages,
+    })
+    // 刷新 token/成本累计（assistant 消息已入库）
+    get().loadTokenStats(conversation_id).catch(() => {})
+  }).catch(() => {})
+
+  // 生成失败/停止：释放状态位（错误文案由 invoke reject 携带，调用方 toast）
+  listen<{ conversation_id: string; error: string }>('gen-error', (event) => {
+    const { conversation_id } = event.payload
+    const genStatus = { ...get().genStatus }
+    delete genStatus[conversation_id]
+    set({ genStatus })
   }).catch(() => {})
 
   listen<{ conversation_id: string; run_id?: string; error: string; kind: string; title: string; reason: string; suggestion: string; retryable: boolean; status_code?: number | null }>(
@@ -1189,6 +1241,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     loadingOlder: false,
     streaming: emptyStreaming(),
     streamings: {},
+    genStatus: {},
     toolRuns: [],
     terminalEntries: [],
     buildLogs: [],

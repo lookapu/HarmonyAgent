@@ -2049,3 +2049,16 @@
     "opening": "Opening…"
   }
 }
+    "generate": "Generate",
+    "genKind": {
+      "image": "Image",
+      "video": "Video",
+      "audio": "Audio"
+    },
+    "genProgress": "Generating {{kind}}…",
+    "genWaited": "（waited {{secs}}s）",
+    "genCancel": "Cancel generation",
+    "genCancelHint": "Cancel generation mode",
+    "genFailed": "Generation failed",
+    "modelSwitchTitle": "Model auto-switched",
+    "modelSwitchBody": "This message contains images; auto-switched from {{from}} to {{to}} (vision-capable)",

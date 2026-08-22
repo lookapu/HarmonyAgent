@@ -727,3 +727,4 @@ pub fn run() {
             }
         });
 }
+            commands::generation::generate_media,

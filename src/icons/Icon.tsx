@@ -45,6 +45,9 @@ import history from './history.svg'
 import quote from './quote.svg'
 import tune from './tune.svg'
 import apps from './apps.svg'
+import image from './image.svg'
+import videocam from './videocam.svg'
+import mic from './mic.svg'
 
 export const icons = {
   bolt,
@@ -94,6 +97,9 @@ export const icons = {
   quote,
   tune,
   apps,
+  image,
+  videocam,
+  mic,
 } as const
 
 export type IconName = keyof typeof icons

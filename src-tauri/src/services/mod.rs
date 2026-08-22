@@ -7,6 +7,7 @@ pub mod cost_calculator;
 pub mod deveco_interop;
 pub mod embedding;
 pub mod extension_governance;
+pub mod generation;
 pub mod git_runtime;
 pub mod generic_project;
 pub mod harmony;

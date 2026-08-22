@@ -680,6 +680,12 @@ button:focus-visible {
   max-width: 100%;
   border-radius: 8px;
 }
+.md-body .md-media {
+  max-width: 100%;
+  border-radius: 8px;
+  margin: 0.7em 0;
+  display: block;
+}
 .md-table-wrap {
   overflow-x: auto;
   margin: 0.7em 0;

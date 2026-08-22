@@ -34,3 +34,4 @@ pub mod reproduction_bundle;
 pub mod tools;
 pub mod update;
 pub mod version;
+pub mod generation;

@@ -69,6 +69,7 @@ import {
 import { toolsHealth } from '../api/health'
 import { sendNotification } from '../api/desktop'
 import { listProviders, listProviderModels, type ProviderModel } from '../api/provider'
+import { generateMedia, type GenKind } from '../api/generation'
 import { listPaletteCommands, type PaletteEntry } from '../api/palette'
 import { openTerminal } from '../api/terminal'
 import { getHarmonyEnv } from '../api/harmonyEnv'
@@ -124,6 +125,13 @@ type RenderItem =
   | { kind: 'tools'; key: string; runs: ToolRun[] }
   | { kind: 'divider'; key: string; label: string }
   | { kind: 'tail'; key: string }
+
+/** 生成媒体菜单项：图片 / 视频 / 音频（对应各厂商生成模型） */
+const GEN_ITEMS: { kind: GenKind; icon: IconName }[] = [
+  { kind: 'image', icon: 'image' },
+  { kind: 'video', icon: 'videocam' },
+  { kind: 'audio', icon: 'mic' },
+]
 
 // 设备/工程分析/时间线仅在右侧对应 Tab 打开时加载，避免约 100KB 的低频组件源码进入首页首屏执行路径。
 const DevicesPanel = lazy(() => import('../chat/components/devicePanels').then((m) => ({ default: m.DevicesPanel })))
@@ -304,6 +312,7 @@ export default function Home() {
     loadingOlder,
     loadOlderMessages,
     forkCurrentConversation,
+    genStatus,
   } = useProjectStore(useShallow((s) => ({
     projects: s.projects,
     currentProject: s.currentProject,
@@ -390,6 +399,7 @@ export default function Home() {
     loadingOlder: s.loadingOlder,
     loadOlderMessages: s.loadOlderMessages,
     forkCurrentConversation: s.forkCurrentConversation,
+    genStatus: s.genStatus,
   })))
   // 只订阅运行会话 ID 集合。流式正文变化时选择器结果保持相同字符串，Home 不会重渲染。
   const runningConversationKey = useProjectStore((s) =>
@@ -464,6 +474,10 @@ export default function Home() {
   const [references, setReferences] = useState<string[]>([])
   // 多模态图片（粘贴/拖入，data URL；发送时随消息上传，后端按协议内联）
   const [pickedImages, setPickedImages] = useState<string[]>([])
+  // 生成媒体模式：选中图片/视频/音频后，发送按钮提交生成任务（而非普通对话）
+  const [genMode, setGenMode] = useState<GenKind | null>(null)
+  const [genMenuOpen, setGenMenuOpen] = useState(false)
+  const genMenuRef = useRef<HTMLDivElement>(null)
   // Rules 编辑弹窗（全局指令 + 项目级 rules，均注入 system_prompt）
   const [showRulesDialog, setShowRulesDialog] = useState(false)
   const [rulesTab, setRulesTab] = useState<'global' | 'project'>('global')
@@ -1274,6 +1288,29 @@ export default function Home() {
     }
   }, [t])
 
+  // 图片输入自动切换到视觉模型：后端已在任务内完成切换，这里 toast 告知用户实际使用的模型
+  useEffect(() => {
+    let cancelled = false
+    let dispose: (() => void) | undefined
+    listen<{ conversation_id: string; from: string; to: string; reason: string }>('chat-model-switch', (event) => {
+      const conv = useProjectStore.getState().currentConversation
+      if (cancelled || !conv || event.payload.conversation_id !== conv.id) return
+      useNotificationStore.getState().push({
+        tone: 'info',
+        title: t('home.modelSwitchTitle'),
+        body: t('home.modelSwitchBody', { from: event.payload.from, to: event.payload.to }),
+      })
+    })
+      .then((unlisten) => {
+        if (!cancelled) dispose = unlisten
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+      dispose?.()
+    }
+  }, [t])
+
   // 设置菜单外部点击关闭
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -1290,6 +1327,17 @@ export default function Home() {
     const handler = (e: MouseEvent) => {
       if (modelSettingsRef.current && !modelSettingsRef.current.contains(e.target as Node)) {
         setShowModelSettings(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  // 生成菜单外部点击关闭
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (genMenuRef.current && !genMenuRef.current.contains(e.target as Node)) {
+        setGenMenuOpen(false)
       }
     }
     document.addEventListener('mousedown', handler)
@@ -1839,6 +1887,8 @@ export default function Home() {
 
   /** 当前会话是否正在流式生成（派生值：供下方处理函数与 effect 使用，声明需在使用前） */
   const isStreaming = streamingConversationId === currentConversation?.id
+  /** 当前会话生成媒体任务状态（gen-* 事件驱动：生成中禁用发送、输入区展示状态条） */
+  const currentGen = currentConversation ? genStatus[currentConversation.id] : undefined
   useEffect(() => {
     if (!isStreaming) setStopRequested(false)
   }, [isStreaming])
@@ -2134,7 +2184,12 @@ export default function Home() {
 
   const handleSend = async () => {
     const text = draft.trim()
-    if (!text || stopRequested) return
+    if (!text || stopRequested || currentGen) return
+    // 生成媒体模式：发送提交生成任务（图片/视频/音频，走对应生成模型）
+    if (genMode) {
+      await handleGenerateSend(text)
+      return
+    }
     if (!currentProject) return
     if (!currentConversation) {
       await newConversation()
@@ -2176,6 +2231,38 @@ export default function Home() {
       })
     } else {
       void sendUserMessage(text, modelOptions, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
+    }
+  }
+
+  /** 生成媒体发送：genMode 激活时提交生成任务（异步，视频可达 15 分钟）。
+   * 完成后后端入库 assistant 消息（媒体标记 content）并推送 gen-done；
+   * 失败时恢复输入内容与生成模式，便于修改后重试。 */
+  const handleGenerateSend = async (text: string) => {
+    if (!genMode || stopRequested || currentGen) return
+    if (!currentProject) return
+    if (!currentConversation) {
+      await newConversation()
+    }
+    const targetConversation = useProjectStore.getState().currentConversation
+    if (!targetConversation) return
+    const mode = genMode
+    const imgs = pickedImages
+    // 先清空输入区：invoke 要等整个生成任务结束后才 resolve
+    setDraft('')
+    setPickedImages([])
+    setGenMode(null)
+    setGenMenuOpen(false)
+    try {
+      await generateMedia(targetConversation.id, mode, text, undefined, imgs.length ? imgs : undefined)
+    } catch (e) {
+      useNotificationStore.getState().push({
+        tone: 'error',
+        title: t('home.genFailed', '生成失败'),
+        body: String(e ?? ''),
+      })
+      setDraft((cur) => (cur.trim() ? `${text}\n\n${cur}` : text))
+      setPickedImages((cur) => [...imgs, ...cur].slice(0, 4))
+      setGenMode(mode)
     }
   }
 
@@ -5423,6 +5510,29 @@ export default function Home() {
               style={{ height: inputHeight }}
               className="w-full resize-none bg-transparent px-4 pt-3.5 pb-1 text-sm outline-none placeholder:text-[var(--text-muted)] disabled:opacity-40 overflow-y-auto"
             />
+            {/* 生成媒体状态条（图片/视频/音频任务进行中；含停止按钮，复用 stopGeneration） */}
+            {currentGen && (
+              <div className="flex items-center gap-2 mx-3 mt-1.5 px-2.5 py-1.5 rounded-lg bg-[var(--accent-soft)] text-[11px] text-[var(--accent)]">
+                <Icon name="spark" size={11} className="animate-pulse shrink-0" />
+                <span className="truncate">
+                  {t('home.genProgress', '正在生成{{kind}}', {
+                    kind: t(`home.genKind.${currentGen.kind}`),
+                  })}
+                  {currentGen.kind === 'video' && currentGen.waitedSecs > 0 &&
+                    t('home.genWaited', '（已等待 {{secs}} 秒）', { secs: Math.floor(currentGen.waitedSecs) })}
+                </span>
+                <button
+                  onClick={() => {
+                    setStopRequested(true)
+                    void stopGeneration()
+                  }}
+                  className="ml-auto shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] hover:bg-[var(--danger)]/20 transition-colors"
+                >
+                  <Icon name="close" size={9} />
+                  {t('home.stopGenerating')}
+                </button>
+              </div>
+            )}
             {/* 消息引用条（Quote 后展示；× 仅移除 msg: 标记，正文引用行可手动编辑） */}
             {pendingQuote && (
               <div className="flex items-center gap-1.5 mx-3 mt-1 px-2 py-1 rounded-md bg-[var(--accent-soft)] text-[10.5px] text-[var(--accent)]">
@@ -5489,6 +5599,65 @@ export default function Home() {
             {/* 工具栏：sm 以下允许换行（左侧状态+右侧按钮分两行），md+ 单行排布 */}
             <div className="flex flex-wrap items-center justify-between gap-y-1.5 px-3 pb-2.5 pt-1">
               <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+                {/* 生成媒体：图片/视频/音频（走对应服务商生成模型） */}
+                <div className="relative shrink-0" ref={genMenuRef}>
+                  <button
+                    onClick={() => setGenMenuOpen((v) => !v)}
+                    title={t('home.generate')}
+                    aria-label={t('home.generate')}
+                    aria-expanded={genMenuOpen}
+                    className={`flex items-center gap-1 pl-1.5 pr-2 py-1 rounded-lg text-[11px] transition-colors ${
+                      genMenuOpen || genMode
+                        ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+                    }`}
+                  >
+                    <Icon name="spark" size={13} />
+                    {genMode ? (
+                      <span>{t(`home.genKind.${genMode}`)}</span>
+                    ) : (
+                      <Icon name="chevron-right" size={10} className="rotate-90 opacity-60" />
+                    )}
+                  </button>
+                  {genMenuOpen && (
+                    <div className="absolute left-0 bottom-full mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 w-40 animate-modal-in">
+                      {GEN_ITEMS.map((item) => (
+                        <button
+                          key={item.kind}
+                          onClick={() => {
+                            setGenMode(item.kind)
+                            setGenMenuOpen(false)
+                            inputRef.current?.focus()
+                          }}
+                          className={`w-full flex items-center gap-2.5 px-3 py-2 text-[12px] transition-colors ${
+                            genMode === item.kind
+                              ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
+                              : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+                          }`}
+                        >
+                          <Icon name={item.icon} size={14} className="shrink-0" />
+                          {t(`home.genKind.${item.kind}`)}
+                          {genMode === item.kind && <Icon name="check" size={12} className="ml-auto shrink-0" />}
+                        </button>
+                      ))}
+                      {genMode && (
+                        <>
+                          <div className="h-px bg-[var(--border)] mx-2 my-0.5" />
+                          <button
+                            onClick={() => {
+                              setGenMode(null)
+                              setGenMenuOpen(false)
+                            }}
+                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors"
+                          >
+                            <Icon name="close" size={14} className="shrink-0" />
+                            {t('home.genCancel')}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
                 {/* Rules 编辑：全局指令 + 项目级 rules（注入 system_prompt） */}
                 <button
                   onClick={() => void openRulesDialog()}
@@ -5599,7 +5768,7 @@ export default function Home() {
                     {/* 发送：主操作，xl 以下也常驻 */}
                     <button
                       onClick={handleSend}
-                      disabled={!draft.trim() || stopRequested}
+                      disabled={!draft.trim() || stopRequested || !!currentGen}
                       aria-label={t('home.queueSend')}
                       className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
                       title={t('home.queueSend')}
@@ -5703,15 +5872,29 @@ export default function Home() {
                     </div>
                   </>
                 ) : (
-                  <button
-                    onClick={handleSend}
-                    disabled={!draft.trim() || !currentProject}
-                    aria-label={t('home.send')}
-                    className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
-                    title={t('home.send')}
-                  >
-                    <Icon name="send" size={14} white />
-                  </button>
+                  <>
+                    {/* 生成媒体模式 chip（可点击取消，回到普通对话发送） */}
+                    {genMode && !currentGen && (
+                      <button
+                        onClick={() => setGenMode(null)}
+                        title={t('home.genCancelHint', '取消生成模式')}
+                        className="h-8 px-2.5 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] flex items-center gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 transition-all text-[12px] font-medium"
+                      >
+                        <Icon name={GEN_ITEMS.find((g) => g.kind === genMode)?.icon ?? 'spark'} size={12} className="shrink-0" />
+                        <span className="hidden sm:inline">{t(`home.genKind.${genMode}`)}</span>
+                        <Icon name="close" size={10} />
+                      </button>
+                    )}
+                    <button
+                      onClick={handleSend}
+                      disabled={!draft.trim() || !currentProject || !!currentGen}
+                      aria-label={t('home.send')}
+                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
+                      title={t('home.send')}
+                    >
+                      <Icon name="send" size={14} white />
+                    </button>
+                  </>
                 )}
               </div>
             </div>
@@ -6165,7 +6348,10 @@ export default function Home() {
                 projectId={currentProject?.id}
                 projectName={currentProject?.name}
                 onChanged={() => {}}
-                onSendImage={(url) => setPickedImages((cur) => (cur.length >= 4 ? cur : [...cur, url]))}
+                onSendImage={(url) => {
+                  // 设备截图原图可能很大（PNG 未压缩），发送前走统一压缩，控制 token 与供应商请求体限制
+                  void compressImage(url).then((u) => setPickedImages((cur) => (cur.length >= 4 ? cur : [...cur, u])))
+                }}
               />
             ) : rightTab === 'shell' ? (
               <ShellPanel key={`${currentProject.id}:${convRoot ?? ''}`} projectId={currentProject.id} projectPath={convRoot ?? currentProject.path} />

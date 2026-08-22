@@ -3067,28 +3067,106 @@ async fn stream_chat_inner(
     // 记录本次任务使用的 Provider / 模型（供任务级 Trace 聚合）
     stats.provider_id = Some(provider.provider_id.clone());
     stats.model = Some(model_choice.model.clone());
-    // 多模态校验：附带图片时当前模型必须支持 image 输入（models.input_modalities）
-    if let Some(imgs) = &images {
-        if !imgs.is_empty() {
-            let conn = state.0.lock().map_err(|e| e.to_string())?;
-            if !model_supports_image(&conn, &model_choice.provider_id, &model_choice.model) {
-                return Err(format!(
-                    "当前模型 {} 不支持图片输入（多模态），请切换到支持图片的模型后重试",
-                    model_choice.model
-                )
-                .into());
-            }
-        }
-    }
     // 对话级代理控制（统一由对话框开关决定，默认不走代理）
     let use_proxy = opts.use_proxy.unwrap_or(false);
 
     // 多协议端点：按对话所选协议匹配（如 DeepSeek 的 OpenAI / Anthropic 端点不同）
-    let (mut provider, mut model_choice, context_budget) = (provider, model_choice, context_budget);
+    let (mut provider, mut model_choice, mut context_budget) = (provider, model_choice, context_budget);
     if let Some(proto) = opts.protocol.as_deref() {
         if let Some(ep) = provider.endpoints.iter().find(|e| e.protocol == proto) {
             provider.base_url = ep.base_url.clone();
             provider.protocol = proto.to_string();
+        }
+    }
+
+    // 多模态校验：附带图片时当前模型必须支持 image 输入（models.input_modalities）。
+    // 不支持时自动切换到同 Provider 支持图片的模型（先按任务路由选已定价的最便宜视觉模型，
+    // 再按兜底规则选默认/便宜/大上下文，未定价的模板模型也可被选中），切换成功发事件提示；
+    // 同 Provider 无可用视觉模型才报错，避免「粘贴图片直接发送失败」。
+    if let Some(imgs) = &images {
+        if !imgs.is_empty() {
+            // 请求体防御：单图/总图超限直接报错（前端已压缩，主要拦截 LAN UI 等未压缩入口）
+            let mut total_bytes: u64 = 0;
+            for img in imgs {
+                if let Some((_, data)) = parse_data_url(img) {
+                    let bytes = (data.len() as u64) * 3 / 4;
+                    if bytes > 30 * 1024 * 1024 {
+                        return Err("单张图片超过 30MiB（base64 后），请压缩后重试".into());
+                    }
+                    total_bytes += bytes;
+                }
+            }
+            if total_bytes > 44 * 1024 * 1024 {
+                return Err("图片总大小超过 44MiB（请求体上限），请减少图片或压缩后重试".into());
+            }
+            let (supports, fallback) = {
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                let ok = model_supports_image(&conn, &model_choice.provider_id, &model_choice.model);
+                let fb = if ok {
+                    None
+                } else {
+                    crate::services::model_router::pick_model_for_task(
+                        &conn,
+                        &model_choice.provider_id,
+                        &model_choice.model,
+                        crate::services::model_router::TaskKind::Vision,
+                    )
+                    .or_else(|| {
+                        crate::services::model_router::pick_vision_fallback(
+                            &conn,
+                            &model_choice.provider_id,
+                            &model_choice.model,
+                        )
+                    })
+                };
+                (ok, fb)
+            };
+            if !supports {
+                if let Some(fb) = fallback {
+                    // 查回新模型的代理开关/上下文/输出上限，并按新模型刷新上下文预算
+                    let (up, c, o) = {
+                        let conn = state.0.lock().map_err(|e| e.to_string())?;
+                        conn.query_row(
+                            "SELECT use_proxy, context_limit, output_limit FROM models
+                             WHERE provider_id = ?1 AND model_id = ?2 AND enabled = 1",
+                            params![&model_choice.provider_id, &fb],
+                            |r| {
+                                Ok((
+                                    r.get::<_, bool>(0)?,
+                                    r.get::<_, Option<i64>>(1)?,
+                                    r.get::<_, Option<i64>>(2)?,
+                                ))
+                            },
+                        )
+                        .ok()
+                        .unwrap_or((model_choice.use_proxy, None, None))
+                    };
+                    context_budget = c.unwrap_or(context_budget);
+                    // 事件提示：实际已切换模型，前端 toast 告知用户
+                    let _ = app.emit(
+                        "chat-model-switch",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "from": model_choice.model,
+                            "to": fb,
+                            "reason": "image_input",
+                        }),
+                    );
+                    model_choice = ModelChoice {
+                        provider_id: model_choice.provider_id.clone(),
+                        model: fb,
+                        use_proxy: up,
+                        output_limit: o.unwrap_or(8192) as u32,
+                    };
+                    stats.model = Some(model_choice.model.clone());
+                } else {
+                    return Err(format!(
+                        "当前模型 {} 不支持图片输入（多模态），且该 Provider 下没有已启用且支持图片的模型。请在 Provider 设置中添加/启用视觉模型（如 deepseek-v4-flash-vision-exp）后重试",
+                        model_choice.model
+                    )
+                    .into());
+                }
+            }
         }
     }
 

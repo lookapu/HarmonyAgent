@@ -223,6 +223,8 @@ export interface ChatSlice {
   streaming: StreamingState
   /** 多会话并行流式分桶（真源）：conversationId → 流式状态；streaming 为当前会话的派生视图 */
   streamings: Record<string, StreamingState>
+  /** 生成媒体任务状态（gen-* 事件）：conversationId → 生成中状态（图片/视频/音频） */
+  genStatus: Record<string, { kind: 'image' | 'video' | 'audio'; stage: string; waitedSecs: number }>
   toolRuns: ToolRun[]
   /** 终端面板：工具执行实时记录（新任务开始时清空，结束后保留供查看） */
   terminalEntries: TerminalEntry[]

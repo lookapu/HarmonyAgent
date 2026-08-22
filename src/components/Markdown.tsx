@@ -10,6 +10,7 @@ import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import hljs from 'highlight.js'
 import { open as shellOpen } from '@tauri-apps/plugin-shell'
 import { save as dialogSave } from '@tauri-apps/plugin-dialog'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { writeTextFile } from '@tauri-apps/plugin-fs'
 import { useTranslation } from 'react-i18next'
 import { useThemeStore } from '../stores/themeStore'
@@ -64,6 +65,11 @@ Object.entries(languages).forEach(([name, lang]) => {
  * 长日志/长输出中 `$` 符号会触发 remarkMath→Katex 渲染、raw HTML 解析与 hljs 高亮都是主线程卡点，
  * 超长内容降级渲染可避免窗口卡死（单条消息仍有折叠保护，此处兜底展开后的渲染成本）。
  * 阈值根据 GPU 能力动态调整：high tier 30000、medium 15000、low 6000 */
+
+/** 本地绝对路径判断：Unix 以 / 开头，Windows 盘符（C:\ 或 C:/）——生成媒体产物直接以绝对路径入库 */
+function isLocalPath(p: string): boolean {
+  return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)
+}
 
 /** HTML 转义：避免 XSS 并防止标签被浏览器解释 */
 function escapeHtml(s: string): string {
@@ -263,6 +269,17 @@ export default memo(function Markdown({
             return <input type="checkbox" checked={checked} readOnly {...props} />
           },
           img({ src, alt }) {
+            // 生成媒体产物：本地绝对路径入库，经 convertFileSrc 提供访问；alt 标记区分 图片/视频/音频
+            if (src && isLocalPath(src)) {
+              const fileSrc = convertFileSrc(src)
+              if (alt === 'VIDEO') {
+                return <video src={fileSrc} controls preload="metadata" className="md-media" />
+              }
+              if (alt === 'AUDIO') {
+                return <audio src={fileSrc} controls preload="metadata" className="md-media" />
+              }
+              return <SmartImage src={fileSrc} alt={alt} onZoom={() => setLightbox(fileSrc)} />
+            }
             return <SmartImage src={src ?? ''} alt={alt} onZoom={() => src && setLightbox(src)} />
           },
           kbd({ children }) {

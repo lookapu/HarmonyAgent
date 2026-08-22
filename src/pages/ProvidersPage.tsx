@@ -33,6 +33,26 @@ import Icon from '../icons/Icon'
 const MODALITY_OPTIONS = ['text', 'image', 'audio', 'video'] as const
 type Modality = (typeof MODALITY_OPTIONS)[number]
 
+/** 视觉模型判定：模板显式标记的 visionModels，或 ID 含 vision/-vl 关键词（自动推断）
+ *  命中时添加模型自动带上 image 输入模态，避免用户漏配导致图片发送失败 */
+function looksVisionModel(modelId: string): boolean {
+  if (providerTemplates.some((t) => t.visionModels?.includes(modelId))) return true
+  return /vision/i.test(modelId) || /-vl$/i.test(modelId)
+}
+
+/** 生成模型判定：模板 generationModels 命中 → 返回对应输出模态数组（image/video/audio），
+ *  未命中返回 undefined（保持默认 text 输出，生成模型不参与对话调度） */
+function looksGenerationModel(modelId: string): Modality[] | undefined {
+  const out: Modality[] = []
+  for (const t of providerTemplates) {
+    const g = t.generationModels
+    if (g?.image?.models.includes(modelId)) out.push('image')
+    if (g?.video?.models.includes(modelId)) out.push('video')
+    if (g?.audio?.models.includes(modelId)) out.push('audio')
+  }
+  return out.length ? [...new Set(out)] : undefined
+}
+
 /** 模型类型预设：一键设置输入/输出模态（单选） */
 const MODALITY_PRESETS: { key: string; input: Modality[]; output: Modality[] }[] = [
   { key: 'text', input: ['text'], output: ['text'] },
@@ -329,7 +349,11 @@ export default function ProvidersPage() {
         ...form,
         name: form.name.trim(),
         base_url: form.base_url.trim(),
-        models: models.map((m) => ({ model_id: m })),
+        models: models.map((m) => ({
+          model_id: m,
+          input_modalities: looksVisionModel(m) ? ['text', 'image'] : ['text'],
+          output_modalities: looksGenerationModel(m) ?? ['text'],
+        })),
       })
       setForm({ name: '', provider_type: 'openai-compatible', protocol: 'openai', base_url: '', api_key: '', endpoints: [] })
       setModels([])
@@ -445,7 +469,11 @@ export default function ProvidersPage() {
   const addSyncModel = async (p: Provider, modelId: string) => {
     setSyncBusy((prev) => ({ ...prev, [modelId]: 'add' }))
     try {
-      await addModel(p.id, { model_id: modelId })
+      await addModel(p.id, {
+        model_id: modelId,
+        input_modalities: looksVisionModel(modelId) ? ['text', 'image'] : ['text'],
+        output_modalities: looksGenerationModel(modelId) ?? ['text'],
+      })
       setSyncResults((prev) => {
         const cur = prev[p.id]
         if (!cur) return prev
@@ -480,7 +508,11 @@ export default function ProvidersPage() {
     try {
       for (const modelId of cur.new_models) {
         try {
-          await addModel(p.id, { model_id: modelId })
+          await addModel(p.id, {
+            model_id: modelId,
+            input_modalities: looksVisionModel(modelId) ? ['text', 'image'] : ['text'],
+            output_modalities: looksGenerationModel(modelId) ?? ['text'],
+          })
         } catch {
           // 单个添加失败继续加其余
         }
