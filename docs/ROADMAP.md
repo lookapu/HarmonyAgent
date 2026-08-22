@@ -173,11 +173,11 @@
 
 执行记录、证据和环境阻塞项见 [HarmonyOS 阶段三验收记录](HARMONY_STAGE5_ACCEPTANCE.md)。只有取得对应证据的条目才允许勾选。
 
-- [ ] 能解释一个真实多模块工程的入口、依赖、路由、权限和构建产物关系。
+- [x] 能解释一个真实多模块工程的入口、依赖、路由、权限和构建产物关系。证据见 [HarmonyOS 阶段三验收记录](HARMONY_STAGE5_ACCEPTANCE.md)（hongmeng-app 双模块 entry+application：入口 EntryAbility/ApplicationAbility、124 页面路由、INTERNET 权限、模块依赖与双模块签名产物关系完整解析）。
 - [x] 能从常见 ArkTS/Hvigor 错误定位根因、修复并通过构建。
 - [x] 能在真机完成安装、启动、日志采集、异常定位、修复和重新验证。证据见 [HarmonyOS 阶段三验收记录](HARMONY_STAGE5_ACCEPTANCE.md)（2026-08-22 在 CHZ-AL00 真机：签名 HAP 构建→安装→启动→hilog 基线→注入 JSON 解析故障→hilog 定位 SyntaxError/RuntimeError→修复→重建→复验 onCreate/loadContent 成功）。
 - [x] 能识别 SDK/API Level 不兼容并给出基于本机定义的替代方案。
-- [ ] 多设备任务中单台失败不会污染其他设备结果，恢复后不重复成功部署。
+- [x] 多设备任务中单台失败不会污染其他设备结果，恢复后不重复成功部署。证据见 [HarmonyOS 阶段三验收记录](HARMONY_STAGE5_ACCEPTANCE.md)（真机+模拟器双设备外部验收：模拟器卸载故障期间真机 PID 全程不变；恢复后模拟器单独重装；防重放内容哈希门禁自动化测试通过）。
 
 ## 6. 阶段四：生态集成与产品化
 

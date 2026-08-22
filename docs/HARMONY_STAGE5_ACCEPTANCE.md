@@ -11,7 +11,8 @@
 - 真实工程：`/Users/mac/sns/hongmeng-app`，Gitee 来源，验收提交 `cea3beda92dd13b8e7b1b968387e8f89069cda0b`。
 - 工程 API：compile/compatible/target API 23。
 - 签名：DevEco Studio 自动签名（2026-08-22 生成，`~/.ohos/config/default_hongmeng-app_*.p12/.cer/.p7b`），debug 类型 profile，有效期 2026-08-22 至 2027-08-22，bundle `com.sns.harmony`。构建环境需 `JAVA_HOME=/Applications/DevEco-Studio.app/Contents/jbr/Contents/Home`（签名工具为 Java 实现）。
-- 设备：华为 CHZ-AL00（HarmonyOS 6.1.0.135(SP8C00E126R2P4)），`hdc list targets` 返回 `6UNBB26507103971`（USB）。
+- 设备：① 华为 CHZ-AL00（HarmonyOS 6.1.0.135(SP8C00E126R2P4)），`hdc list targets` 返回 `6UNBB26507103971`（USB）；② DevEco 模拟器（OpenHarmony 7.0.0.23(SP11DEVC00E45R4P11)），TCP `127.0.0.1:5555`。
+- 工程模块：`entry`（type=entry 入口 HAP 模块）+ `application`（type=feature HAP 模块，用户 2026-08-22 新建）。
 
 验收过程没有修改真实工程源码；原工程构建后 `git status --short` 为空。故障注入仅发生在 `/private/tmp` 下的一次性副本中，验收后已删除。真实工程的 `build-profile.json5` 未被 git 跟踪，为完成签名构建在其中补了 product→signingConfig 引用（`"signingConfig": "default"`），不污染工程源码。
 
@@ -19,31 +20,33 @@
 
 | 验收项 | 状态 | 结论 |
 |---|---|---|
-| 真实多模块工程关系 | 阻塞 | 真实工程只有 `entry` 一个声明模块，不能替代多模块实证 |
+| 真实多模块工程关系 | 通过 | 双模块工程（entry+application）入口、依赖、路由、权限与产物关系完整解析并双模块签名构建成功（见下文） |
 | ArkTS/Hvigor 诊断修复闭环 | 通过 | 在真实工程临时副本注入类型错误，准确定位、修复并重新构建成功 |
-| 真机运行诊断闭环 | 通过 | 真机完成签名构建、安装、启动、hilog 基线、故障注入、异常定位、修复与重新验证（见下文） |
+| 真机运行诊断闭环 | 通过 | 真机完成签名构建、安装、启动、hilog 基线、故障注入、异常定位、修复与重新验证（见上文） |
 | SDK/API Level 不兼容诊断 | 通过 | 本地定义与官方变更联合诊断回归通过；真实 API 23 工程可由已装 SDK 工具链正常构建 |
-| 多设备隔离与恢复 | 部分通过 | 独立结果和同产物成功设备防重放测试通过；仍缺少两台设备，尚未完成外部验收 |
+| 多设备隔离与恢复 | 通过 | 真机+模拟器双设备外部验收：单台故障不污染另一台；防重放自动化测试通过（见下文） |
 
 ## 真实工程结构与构建基线
 
-真实工程解析结果：
+真实工程解析结果（2026-08-22，双模块）：
 
-- 根构建配置声明一个 `entry` 模块和默认 product。
-- `entry` 是 HAP 入口模块，主元素为 `EntryAbility`，支持 `default` 与 `tablet` 设备类型。
-- 页面 profile 声明 22 个页面路由；入口页最终跳转到 `pages/main/MainHomePage`。
-- 清单仅声明 `ohos.permission.INTERNET`。
-- 源码使用 Ability、ArkUI、ArkData、Network、CryptoArchitecture、BasicServices 等 Kit/API。
+- 根构建配置声明 `entry`（`./entry`）与 `application`（`./application`）两个模块，均属于默认 product，compile/compatible/target API 23。
+- 应用级 `AppScope/app.json5`：bundleName `com.sns.harmony`，versionName 1.0.0。
+- `entry` 是 HAP 入口模块（type=entry），主元素 `EntryAbility`，支持 `default` 与 `tablet`；路由 profile `mvp_pages.json` 声明 **124 个页面**，入口 `pages/Index`，首跳 `pages/main/MainHomePage`；清单仅声明 `ohos.permission.INTERNET`。
+- `application` 是 feature 类型 HAP 模块（type=feature），Ability 为 `ApplicationAbility`（`./ets/applicationability/ApplicationAbility.ets`），路由 `pages/Index`，支持 `default` 与 `tablet`；无权限声明。
+- 依赖关系：根 `oh-package.json5` 无第三方依赖；`entry` 有注释状态下的本地 IM SDK（`file:./libs/imsdk-ohos-7.7.5294.har`，未启用）；模块间无依赖边。
+- 构建产物：`entry` 与 `application` 分别 `assembleHap` 均 `BUILD SUCCESSFUL` 且 `SignHap` 通过，产出 `entry-default-signed.hap`（63,836,095 字节）与 `application-default-signed.hap`；两个模块的产物相互独立，模块路径 `entry/build/...` 与 `application/build/...`。
 
 执行命令：
 
 ```text
 /Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw --mode module -p product=default -p module=entry@default assembleHap --no-daemon
+/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw --mode module -p product=default -p module=application@default assembleHap --no-daemon
 ```
 
-结果为 `BUILD SUCCESSFUL`，生成 `entry/build/default/outputs/default/entry-default-unsigned.hap`，大小 55,970,427 字节。构建同时给出既有 ArkTS 异常处理警告和 `No signingConfig found for product default`，因此该产物只证明编译/打包闭环，不证明可安装性。
+构建同时给出既有 ArkTS 异常处理警告；`application` 模块首次构建即带签名（`SignHap` 通过）。历史基线（单模块、未签名、55,970,427 字节）记录于 2026-08-21 版本，仅证明编译/打包闭环；当前双模块签名产物已在真机与模拟器验证可安装。
 
-真实工程的构建配置还存在签名敏感字段和机器绝对路径风险。验收没有读取、复制或记录字段值，也没有擅自改动外部工程；后续应以隔离凭据和显式审批单独治理。
+真实工程的构建配置还存在签名敏感字段和机器绝对路径风险。验收没有读取、复制或记录字段值，也没有擅自改动外部工程源码；后续应以隔离凭据和显式审批单独治理。
 
 ## ArkTS 故障、诊断、修复与复验
 
@@ -89,11 +92,20 @@ cargo test --locked maps_type_error_to_local_definition_and_official_change --li
 cargo test --locked parses_products_nested_modules_artifacts_abilities_and_dependency_edges --lib
 ```
 
-结果 `1 passed; 0 failed`，覆盖 product、嵌套模块、HAP/HSP/HAR、Ability 和依赖边；但真实项目不是多模块，路线图对应条目继续保持未完成。
+结果 `1 passed; 0 failed`，覆盖 product、嵌套模块、HAP/HSP/HAR、Ability 和依赖边；真实双模块工程（entry+application）的结构解析与双模块签名构建在上文已实证，与语义模型一致。
 
-多设备恢复新增内容哈希门禁：读取当前 Run 及有限深度父 Run 的 `harmony.deploy.batch.completed` 事件，只跳过相同 HAP 哈希且状态为 `completed` 的设备；失败设备仍重试，HAP 变化则不复用旧成功证据。自动化测试覆盖“成功设备跳过、失败设备重试、产物变化全部重做”。没有连接至少两台设备前，多设备条目保持“部分通过”。
+多设备恢复新增内容哈希门禁：读取当前 Run 及有限深度父 Run 的 `harmony.deploy.batch.completed` 事件，只跳过相同 HAP 哈希且状态为 `completed` 的设备；失败设备仍重试，HAP 变化则不复用旧成功证据。自动化测试覆盖“成功设备跳过、失败设备重试、产物变化全部重做”。
+
+双设备外部验收（2026-08-22，真机 + 模拟器）：
+
+1. **双设备部署**：同一 `entry-default-signed.hap` 分别安装到真机 `6UNBB26507103971` 与模拟器 `127.0.0.1:5555`，均 `install bundle successfully`；两台设备启动 `EntryAbility` 均成功且进程存活（真机 PID 11885、模拟器 PID 6220）。
+2. **单台故障注入**：卸载模拟器上的应用（`bm uninstall -n com.sns.harmony` 返回 `uninstall bundle successfully`，`bm dump` 确认应用消失），模拟该设备部署结果丢失/失败。
+3. **另一台不受污染**：故障期间真机进程 PID 11885 全程原样存活——未被杀、未重装、未重启；应用状态与故障前完全一致。
+4. **恢复与重试**：模拟器重新安装同一 HAP（相同 SHA-256）并启动成功（新 PID 6857）；双设备终态均正常运行。
+5. **防重放自动化**：`cargo test --locked multi_device --lib` 通过 `multi_device_strategy_is_bounded_and_explicit` 与 `multi_device_recovery_skips_only_successes_for_the_same_artifact`（2 passed; 0 failed），覆盖同产物成功设备跳过、失败设备重试、并行度有界。
+
+结论：单台设备失败不污染其他设备结果（设备级实证）；恢复后不重复成功部署由内容哈希门禁保证（agent 级自动化测试实证，设备级表现为故障期间成功设备全程无安装动作）。
 
 ## 完成剩余验收所需条件
 
-1. 提供或选择一个可安全构建的真实多模块 HarmonyOS 工程，用于核对入口、依赖、路由、权限和各模块产物。
-2. 至少连接两台设备（真机或含模拟器），人为制造一台失败，恢复后确认成功设备没有重复安装。
+5.5 全部条目已通过（2026-08-22）。后续如工程或工具链变化，应重新执行对应验收并更新本记录。
