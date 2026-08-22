@@ -4248,12 +4248,11 @@ export default function Home() {
 
         {/* 底部：设置 + 语言 + 主题 + 折叠 */}
         <div className={`p-2 border-t border-[var(--border)] flex gap-1 ${sidebarCollapsed ? 'flex-col items-center' : 'items-center'}`}>
-          <div className="relative flex items-center gap-1 flex-1 min-w-0" ref={settingsRef}>
-            <LangToggle />
+          <div className="relative flex-1" ref={settingsRef}>
             <button
               onClick={() => setShowSettingsMenu((v) => !v)}
               title={t('home.settings')}
-              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 justify-center' : 'flex-1 min-w-0'} ${showSettingsMenu ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : ''}`}
+              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 justify-center' : 'w-full'} ${showSettingsMenu ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : ''}`}
             >
               <Icon name="settings" size={15} />
               {!sidebarCollapsed && t('home.settings')}
@@ -4303,6 +4302,7 @@ export default function Home() {
               </div>
             )}
           </div>
+          <LangToggle />
           <button
             onClick={toggleTheme}
             title={t('home.theme')}
