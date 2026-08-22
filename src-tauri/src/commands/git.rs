@@ -779,3 +779,253 @@ pub async fn git_diff_stat(project_path: String, files: Vec<String>) -> Result<D
         deletions,
     })
 }
+
+// ---------- 仓库初始化 / 文件级 Git 操作（文件树右键菜单） ----------
+
+/// 初始化 Git 仓库（git init）：当前目录已在仓库内时直接返回提示，不重复初始化。
+/// 无 .gitignore 时生成最小默认规则，避免 node_modules 等依赖/产物目录被误跟踪。
+#[tauri::command]
+pub async fn git_init_repo(project_path: String) -> Result<String, String> {
+    if project_path.trim().is_empty() {
+        return Err("未指定项目目录".into());
+    }
+    let cwd = Path::new(&project_path);
+    if crate::agent::tools::run_cmd(
+        "git",
+        &["rev-parse".into(), "--is-inside-work-tree".into()],
+        Some(cwd),
+        15,
+    )
+    .await
+    .is_ok()
+    {
+        return Ok("该项目已经是 Git 仓库".into());
+    }
+    let out = crate::agent::tools::run_cmd("git", &["init".into()], Some(cwd), 30)
+        .await
+        .map_err(|e| format!("初始化 Git 仓库失败：{e}"))?;
+    // 常见工程补充默认 .gitignore（仅当不存在时生成，不覆盖已有规则）
+    let gitignore = cwd.join(".gitignore");
+    if !gitignore.exists() {
+        let default = "# 依赖与构建产物\nnode_modules/\noh_modules/\ndist/\nbuild/\n*.log\n";
+        if std::fs::write(&gitignore, default).is_ok() {
+            return Ok(format!("{out}\n已生成默认 .gitignore"));
+        }
+    }
+    Ok(out)
+}
+
+/// 单文件/目录的 Git 状态（文件树右键菜单用；非仓库 is_repo=false，不报错）
+#[derive(Debug, Clone, Serialize)]
+pub struct GitFileStatus {
+    pub is_repo: bool,
+    /// 是否被 .gitignore 忽略（check-ignore 命中，含父目录规则）
+    pub ignored: bool,
+    /// 是否已被 git 跟踪（ls-files 命中；目录含任一已跟踪文件即 true）
+    pub tracked: bool,
+    /// 状态摘要：none | clean | ignored | untracked | modified | staged | deleted
+    pub status: String,
+}
+
+#[tauri::command]
+pub async fn git_file_status(project_path: String, path: String) -> Result<GitFileStatus, String> {
+    if project_path.trim().is_empty() {
+        return Err("未指定项目目录".into());
+    }
+    let cwd = Path::new(&project_path);
+    let rel = resolve_repo_path(cwd, &path)?;
+    // 非仓库：返回 none，不报错（前端据此隐藏 git 操作分组）
+    if crate::agent::tools::run_cmd(
+        "git",
+        &["rev-parse".into(), "--is-inside-work-tree".into()],
+        Some(cwd),
+        15,
+    )
+    .await
+    .is_err()
+    {
+        return Ok(GitFileStatus {
+            is_repo: false,
+            ignored: false,
+            tracked: false,
+            status: "none".into(),
+        });
+    }
+    // 忽略判断：check-ignore 命中即忽略（含父目录规则，文件/目录均可用）
+    let ignored = crate::agent::tools::run_cmd(
+        "git",
+        &["check-ignore".into(), "-q".into(), "--".into(), rel.clone()],
+        Some(cwd),
+        15,
+    )
+    .await
+    .is_ok();
+    // 跟踪判断：ls-files 列出匹配文件（目录会列出其下已跟踪文件），输出非空即已跟踪
+    let tracked = crate::agent::tools::run_cmd(
+        "git",
+        &["ls-files".into(), "--".into(), rel.clone()],
+        Some(cwd),
+        15,
+    )
+    .await
+    .map(|o| !o.trim().is_empty())
+    .unwrap_or(false);
+    // 状态判断：git status --short -- path（目录为聚合：全未跟踪→untracked，含暂存→staged，含删除→deleted，否则 modified）
+    let mut status = "clean".to_string();
+    if let Ok(s) = crate::agent::tools::run_cmd(
+        "git",
+        &["status".into(), "--short".into(), "--".into(), rel.clone()],
+        Some(cwd),
+        15,
+    )
+    .await
+    {
+        let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+        if !lines.is_empty() {
+            let all_untracked = lines.iter().all(|l| l.trim_start().starts_with("??"));
+            let any_staged = lines.iter().any(|l| {
+                let b = l.as_bytes();
+                b.len() > 1 && !matches!(b[0], b' ' | b'?' | b'!')
+            });
+            let any_deleted = lines.iter().any(|l| {
+                let b = l.as_bytes();
+                b.len() > 1 && (b[0] == b'D' || (b[0] == b' ' && b[1] == b'D'))
+            });
+            status = if all_untracked {
+                "untracked".into()
+            } else if any_staged {
+                "staged".into()
+            } else if any_deleted {
+                "deleted".into()
+            } else {
+                "modified".into()
+            };
+        }
+    }
+    if ignored && status == "clean" {
+        status = "ignored".into();
+    }
+    Ok(GitFileStatus {
+        is_repo: true,
+        ignored,
+        tracked,
+        status,
+    })
+}
+
+/// 把路径追加到项目根 .gitignore（目录自动补尾部 /；已存在相同规则时跳过）
+#[tauri::command]
+pub async fn git_ignore_add(project_path: String, path: String) -> Result<String, String> {
+    if project_path.trim().is_empty() {
+        return Err("未指定项目目录".into());
+    }
+    let cwd = Path::new(&project_path);
+    let rel = resolve_repo_path(cwd, &path)?;
+    if rel.is_empty() {
+        return Err("文件路径为空".into());
+    }
+    let is_dir = cwd.join(&rel).is_dir();
+    let rule = if is_dir { format!("{rel}/") } else { rel.clone() };
+    let gitignore = cwd.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == rule) {
+        return Ok(format!("{rule} 已在 .gitignore 中"));
+    }
+    // 追加：文件不存在/结尾无换行时先补换行，保证规则各自独立成行
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&rule);
+    content.push('\n');
+    std::fs::write(&gitignore, content).map_err(|e| format!("写入 .gitignore 失败：{e}"))?;
+    Ok(format!("已将 {rule} 加入 .gitignore"))
+}
+
+/// 从 Git 索引移除（git rm --cached）：工作区文件保留，配合 .gitignore 可彻底停止跟踪。
+/// 需已跟踪；仓库尚无提交时 git 会拒绝，给出友好提示。
+#[tauri::command]
+pub async fn git_untrack(project_path: String, path: String) -> Result<String, String> {
+    if project_path.trim().is_empty() {
+        return Err("未指定项目目录".into());
+    }
+    let cwd = Path::new(&project_path);
+    let rel = resolve_repo_path(cwd, &path)?;
+    let tracked = crate::agent::tools::run_cmd(
+        "git",
+        &["ls-files".into(), "--".into(), rel.clone()],
+        Some(cwd),
+        15,
+    )
+    .await
+    .map(|o| !o.trim().is_empty())
+    .unwrap_or(false);
+    if !tracked {
+        return Err("该路径未被 Git 跟踪，无需排除".into());
+    }
+    let mut args = vec!["rm".into(), "--cached".into()];
+    if cwd.join(&rel).is_dir() {
+        args.push("-r".into());
+    }
+    args.push("--".into());
+    args.push(rel.clone());
+    crate::agent::tools::run_cmd("git", &args, Some(cwd), 30).await.map_err(|e| {
+        format!("从 Git 历史排除失败：{e}\n提示：若仓库还没有任何提交，请先提交一次后再排除。")
+    })?;
+    Ok(format!("已从 Git 历史排除 {rel}（工作区文件保留；建议同时加入 .gitignore 防止再次跟踪）"))
+}
+
+/// 暂存改动（git add）：被 .gitignore 忽略的路径直接拒绝并提示，避免误暂存
+#[tauri::command]
+pub async fn git_stage(project_path: String, path: String) -> Result<String, String> {
+    if project_path.trim().is_empty() {
+        return Err("未指定项目目录".into());
+    }
+    let cwd = Path::new(&project_path);
+    let rel = resolve_repo_path(cwd, &path)?;
+    if !cwd.join(&rel).exists() {
+        return Err("路径不存在，无法暂存".into());
+    }
+    if crate::agent::tools::run_cmd(
+        "git",
+        &["check-ignore".into(), "-q".into(), "--".into(), rel.clone()],
+        Some(cwd),
+        15,
+    )
+    .await
+    .is_ok()
+    {
+        return Err("该路径已被 .gitignore 忽略，无法直接暂存（如需强制暂存可在终端执行 git add -f）".into());
+    }
+    crate::agent::tools::run_cmd(
+        "git",
+        &["add".into(), "--".into(), rel.clone()],
+        Some(cwd),
+        30,
+    )
+    .await
+    .map_err(|e| format!("暂存失败：{e}"))?;
+    Ok(format!("已暂存 {rel}"))
+}
+
+/// 单文件/目录的提交历史（最近 15 条，一行一条）
+#[tauri::command]
+pub async fn git_file_log(project_path: String, path: String) -> Result<String, String> {
+    if project_path.trim().is_empty() {
+        return Err("未指定项目目录".into());
+    }
+    let cwd = Path::new(&project_path);
+    let rel = resolve_repo_path(cwd, &path)?;
+    let out = crate::agent::tools::run_cmd(
+        "git",
+        &["log".into(), "--oneline".into(), "-n".into(), "15".into(), "--".into(), rel.clone()],
+        Some(cwd),
+        15,
+    )
+    .await
+    .map_err(|e| format!("读取历史失败：{e}"))?;
+    if out.trim().is_empty() {
+        return Err("该路径还没有提交历史".into());
+    }
+    Ok(out)
+}

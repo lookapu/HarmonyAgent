@@ -84,3 +84,37 @@ export interface DiffStat {
 
 export const gitDiffStat = (projectPath: string, files: string[]) =>
   invokeWithError<DiffStat>('git_diff_stat', { projectPath, files })
+
+/** 初始化 Git 仓库（git init）：当前目录非仓库时执行，已是仓库返回提示 */
+export const gitInitRepo = (projectPath: string) =>
+  invokeWithError<string>('git_init_repo', { projectPath })
+
+/** 单文件/目录的 Git 状态（文件树右键菜单；非仓库 is_repo=false 不报错） */
+export interface GitFileStatus {
+  is_repo: boolean
+  /** 是否被 .gitignore 忽略（含父目录规则） */
+  ignored: boolean
+  /** 是否已被 git 跟踪 */
+  tracked: boolean
+  /** none | clean | ignored | untracked | modified | staged | deleted */
+  status: string
+}
+
+export const gitFileStatus = (projectPath: string, path: string) =>
+  invokeWithError<GitFileStatus>('git_file_status', { projectPath, path })
+
+/** 把路径追加到项目根 .gitignore（目录自动补尾部 /；已存在规则时跳过） */
+export const gitIgnoreAdd = (projectPath: string, path: string) =>
+  invokeWithError<string>('git_ignore_add', { projectPath, path })
+
+/** 从 Git 历史排除（git rm --cached，工作区文件保留） */
+export const gitUntrack = (projectPath: string, path: string) =>
+  invokeWithError<string>('git_untrack', { projectPath, path })
+
+/** 暂存改动（git add；被忽略文件返回提示） */
+export const gitStage = (projectPath: string, path: string) =>
+  invokeWithError<string>('git_stage', { projectPath, path })
+
+/** 单文件/目录的提交历史（最近 15 条） */
+export const gitFileLog = (projectPath: string, path: string) =>
+  invokeWithError<string>('git_file_log', { projectPath, path })

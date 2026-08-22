@@ -4,6 +4,7 @@ import Icon from '../icons/Icon'
 import {
   gitBranchInfo,
   gitDiscoverRepos,
+  gitInitRepo,
   gitSwitchBranch,
   gitWorktreeList,
   gitWorktreeCreate,
@@ -230,7 +231,22 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
             <span className="w-4 h-4 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
           </div>
         ) : !isRepo ? (
-          <div className="py-3 text-[11.5px] text-[var(--text-muted)] text-center">{t('home.gitNoRepo')}</div>
+          <div className="py-3 text-center space-y-2">
+            <div className="text-[11.5px] text-[var(--text-muted)]">{t('home.gitNoRepo')}</div>
+            <div className="text-[10.5px] text-[var(--text-muted)]/80 leading-relaxed">{t('home.gitInitRepoTip')}</div>
+            <button
+              onClick={() => run('init', () => gitInitRepo(gitRoot))}
+              disabled={busy !== null}
+              className="inline-flex items-center gap-1.5 h-7 px-3 rounded-lg btn-primary text-[11px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
+            >
+              {busy === 'init' ? (
+                <span className="w-3 h-3 rounded-full border border-white/40 border-t-transparent animate-spin" />
+              ) : (
+                <Icon name="git-branch" size={12} />
+              )}
+              {busy === 'init' ? '…' : t('home.gitInitRepo')}
+            </button>
+          </div>
         ) : (
           <>
             {/* 当前分支 + 状态详情 */}

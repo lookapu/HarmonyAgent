@@ -2,6 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { onFileTreeIndexDone, onFileTreeIndexProgress, searchProjectFiles, type FileSearchHit, type FileTreeNode } from '../api/project'
 import { symbolCounts } from '../api/symbols'
+import {
+  gitFileLog,
+  gitFileStatus,
+  gitIgnoreAdd,
+  gitRevertFile,
+  gitStage,
+  gitUntrack,
+  type GitFileStatus,
+} from '../api/git'
 import Icon from '../icons/Icon'
 import FilePreviewDialog from './FilePreviewDialog'
 
@@ -41,6 +50,16 @@ export default function FileTreePanel({
   // 预览定位行号（来自代码块行号跳转的 deveco:open-file 事件）
   const [previewLine, setPreviewLine] = useState<number | undefined>(undefined)
   const [menu, setMenu] = useState<{ x: number; y: number; node: FileTreeNode } | null>(null)
+  // 右键菜单 Git 状态：目标路径状态（异步拉取）/ 进行中操作 / 错误 / 成功提示 / 历史视图 / 还原确认
+  const [menuStatus, setMenuStatus] = useState<GitFileStatus | null>(null)
+  const [statusLoading, setStatusLoading] = useState(false)
+  const [menuBusy, setMenuBusy] = useState<string | null>(null)
+  const [menuErr, setMenuErr] = useState<string | null>(null)
+  const [menuDone, setMenuDone] = useState<string | null>(null)
+  const [menuView, setMenuView] = useState<'ops' | 'log'>('ops')
+  const [logContent, setLogContent] = useState('')
+  const [confirmRevert, setConfirmRevert] = useState(false)
+  const confirmRevertTimer = useRef<number | null>(null)
   const [copied, setCopied] = useState(false)
   const [loadingAll, setLoadingAll] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -204,14 +223,28 @@ export default function FileTreePanel({
     })
   }
 
-  // 右键菜单外部点击/失焦关闭
+  // 右键菜单外部点击/失焦关闭（同时重置菜单内全部临时状态）
+  const closeMenu = () => {
+    setMenu(null)
+    setMenuView('ops')
+    setLogContent('')
+    setMenuErr(null)
+    setMenuDone(null)
+    setMenuBusy(null)
+    setConfirmRevert(false)
+    setMenuStatus(null)
+    if (confirmRevertTimer.current) {
+      window.clearTimeout(confirmRevertTimer.current)
+      confirmRevertTimer.current = null
+    }
+  }
+
   useEffect(() => {
-    const close = () => setMenu(null)
-    window.addEventListener('mousedown', close)
-    window.addEventListener('blur', close)
+    window.addEventListener('mousedown', closeMenu)
+    window.addEventListener('blur', closeMenu)
     return () => {
-      window.removeEventListener('mousedown', close)
-      window.removeEventListener('blur', close)
+      window.removeEventListener('mousedown', closeMenu)
+      window.removeEventListener('blur', closeMenu)
     }
   }, [])
 
@@ -239,7 +272,59 @@ export default function FileTreePanel({
     e.preventDefault()
     e.stopPropagation()
     setCopied(false)
+    closeMenu()
     setMenu({ x: e.clientX, y: e.clientY, node })
+    // 异步拉取该路径的 Git 状态（非仓库 is_repo=false，菜单隐藏 git 分组）
+    setStatusLoading(true)
+    gitFileStatus(projectPath, node.path)
+      .then(setMenuStatus)
+      .catch(() => setMenuStatus(null))
+      .finally(() => setStatusLoading(false))
+  }
+
+  /** 执行 Git 操作：统一 loading/错误反馈；log 结果保留在菜单内展示，其余操作成功后短暂提示再关闭 */
+  const runGitOp = async (key: string, fn: () => Promise<string>) => {
+    if (menuBusy || !menu) return
+    setMenuBusy(key)
+    setMenuErr(null)
+    setMenuDone(null)
+    try {
+      const out = await fn()
+      if (key === 'log') {
+        setLogContent(out)
+      } else {
+        setMenuDone(out)
+        window.setTimeout(closeMenu, 900)
+      }
+    } catch (e) {
+      setMenuErr(String(e))
+    } finally {
+      setMenuBusy(null)
+    }
+  }
+
+  /** 还原改动：破坏性操作，首次点击进入确认态（3s 自动复位），再次点击才执行 */
+  const handleRevert = () => {
+    if (!menu) return
+    if (!confirmRevert) {
+      setConfirmRevert(true)
+      if (confirmRevertTimer.current) window.clearTimeout(confirmRevertTimer.current)
+      confirmRevertTimer.current = window.setTimeout(() => setConfirmRevert(false), 3000)
+      return
+    }
+    void runGitOp('revert', () => gitRevertFile(projectPath, menu.node.path))
+  }
+
+  /** Git 状态 -> 文案 + 颜色 */
+  const gitStatusMeta = (s: string): { label: string; color: string } => {
+    switch (s) {
+      case 'untracked': return { label: t('home.gitStatusUntracked'), color: 'text-[var(--accent)]' }
+      case 'modified': return { label: t('home.gitStatusModified'), color: 'text-[var(--warning)]' }
+      case 'staged': return { label: t('home.gitStatusStaged'), color: 'text-[var(--success)]' }
+      case 'deleted': return { label: t('home.gitStatusDeleted'), color: 'text-[var(--danger)]' }
+      case 'ignored': return { label: t('home.gitStatusIgnored'), color: 'text-[var(--text-muted)]' }
+      default: return { label: t('home.gitStatusClean'), color: 'text-[var(--text-muted)]' }
+    }
   }
 
   const copyPath = async () => {
@@ -432,43 +517,176 @@ export default function FileTreePanel({
         </div>
       )}
 
-      {/* 右键菜单 */}
+      {/* 右键菜单：基础操作 + Git 操作（状态/忽略/排除/暂存/还原/历史） */}
       {menu && (
         <div
           ref={menuRef}
-          className="fixed z-[80] w-44 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
+          className="fixed z-[80] w-60 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
           style={{
-            left: Math.min(menu.x, window.innerWidth - 190),
-            top: Math.min(menu.y, window.innerHeight - 140),
+            left: Math.min(menu.x, window.innerWidth - 250),
+            top: Math.min(menu.y, window.innerHeight - 320),
           }}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          {menu.node.type === 'file' && (
-            <button
-              onClick={() => {
-                setPreview(menu.node)
-                setMenu(null)
-              }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-            >
-              <Icon name="devices" size={13} className="opacity-60" />
-              {t('home.preview')}
-            </button>
+          {menuView === 'log' ? (
+            /* ============ Git 历史视图 ============ */
+            <>
+              <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[var(--border)]">
+                <Icon name="history" size={12} className="text-[var(--accent)] shrink-0" />
+                <span
+                  className="text-[11px] font-medium text-[var(--text-secondary)] flex-1 min-w-0 truncate"
+                  title={menu.node.path}
+                >
+                  {menu.node.path}
+                </span>
+                <button
+                  onClick={() => {
+                    setMenuView('ops')
+                    setMenuErr(null)
+                  }}
+                  className="shrink-0 text-[10px] text-[var(--accent)] hover:underline"
+                >
+                  {t('home.gitLogBack')}
+                </button>
+              </div>
+              <div className="max-h-56 overflow-y-auto p-2">
+                {menuBusy === 'log' ? (
+                  <div className="flex items-center gap-1.5 py-2 text-[11px] text-[var(--text-muted)]">
+                    <span className="w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
+                    {t('home.loading')}
+                  </div>
+                ) : logContent ? (
+                  <pre className="font-mono text-[10.5px] text-[var(--text-secondary)] whitespace-pre-wrap leading-relaxed">
+                    {logContent}
+                  </pre>
+                ) : menuErr ? (
+                  <div className="text-[10.5px] text-[var(--danger)] break-all">{menuErr}</div>
+                ) : null}
+              </div>
+            </>
+          ) : (
+            /* ============ 操作视图 ============ */
+            <>
+              {/* Git 状态行（非仓库/加载中时按需展示） */}
+              {statusLoading ? (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[var(--border)]">
+                  <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
+                  <span className="text-[10px] text-[var(--text-muted)]">{t('home.loading')}</span>
+                </div>
+              ) : menuStatus?.is_repo ? (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[var(--border)]">
+                  <Icon name="git-branch" size={11} className="opacity-60 shrink-0" />
+                  <span className={`text-[10px] font-medium ${gitStatusMeta(menuStatus.status).color}`}>
+                    {gitStatusMeta(menuStatus.status).label}
+                  </span>
+                </div>
+              ) : null}
+
+              {menu.node.type === 'file' && (
+                <button
+                  onClick={() => {
+                    setPreview(menu.node)
+                    setMenu(null)
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                >
+                  <Icon name="devices" size={13} className="opacity-60" />
+                  {t('home.preview')}
+                </button>
+              )}
+              <button
+                onClick={copyPath}
+                className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <Icon name="copy" size={13} className="opacity-60" />
+                {copied ? t('home.copied') : t('home.copyPath')}
+              </button>
+              <button
+                onClick={sendToChat}
+                className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <Icon name="plus" size={13} className="opacity-60" />
+                {t('home.sendToChat')}
+              </button>
+
+              {/* Git 操作分组（非仓库隐藏） */}
+              {menuStatus?.is_repo && (
+                <>
+                  <div className="my-1 border-t border-[var(--border)]" />
+                  {!menuStatus.ignored && (
+                    <button
+                      onClick={() => void runGitOp('ignore', () => gitIgnoreAdd(projectPath, menu.node.path))}
+                      disabled={menuBusy !== null}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
+                    >
+                      <Icon name="archive" size={13} className="opacity-60" />
+                      {menuBusy === 'ignore' ? t('home.gitOpRunning') : t('home.gitIgnoreAdd')}
+                    </button>
+                  )}
+                  {menuStatus.tracked && (
+                    <button
+                      onClick={() => void runGitOp('untrack', () => gitUntrack(projectPath, menu.node.path))}
+                      disabled={menuBusy !== null}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
+                    >
+                      <Icon name="delete" size={13} className="opacity-60" />
+                      {menuBusy === 'untrack' ? t('home.gitOpRunning') : t('home.gitUntrack')}
+                    </button>
+                  )}
+                  {['untracked', 'modified', 'staged', 'deleted'].includes(menuStatus.status) && (
+                    <button
+                      onClick={() => void runGitOp('stage', () => gitStage(projectPath, menu.node.path))}
+                      disabled={menuBusy !== null}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
+                    >
+                      <Icon name="check" size={13} className="opacity-60" />
+                      {menuBusy === 'stage' ? t('home.gitOpRunning') : t('home.gitStage')}
+                    </button>
+                  )}
+                  {['modified', 'staged', 'deleted'].includes(menuStatus.status) && (
+                    <button
+                      onClick={handleRevert}
+                      disabled={menuBusy !== null}
+                      className={`w-full flex items-center gap-2.5 px-3 py-2 text-[12px] transition-colors disabled:opacity-40 disabled:cursor-default ${
+                        confirmRevert
+                          ? 'text-[var(--danger)] bg-[var(--danger)]/10 hover:bg-[var(--danger)]/15'
+                          : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+                      }`}
+                    >
+                      <Icon name="refresh" size={13} className="opacity-60" />
+                      {menuBusy === 'revert'
+                        ? t('home.gitOpRunning')
+                        : confirmRevert
+                          ? t('home.gitRevertConfirm')
+                          : t('home.gitRevertChanges')}
+                    </button>
+                  )}
+                  {menuStatus.tracked && (
+                    <button
+                      onClick={() => void runGitOp('log', () => gitFileLog(projectPath, menu.node.path))}
+                      disabled={menuBusy !== null}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
+                    >
+                      <Icon name="history" size={13} className="opacity-60" />
+                      {menuBusy === 'log' ? t('home.gitOpRunning') : t('home.gitFileLog')}
+                    </button>
+                  )}
+                </>
+              )}
+
+              {/* 操作结果反馈 */}
+              {menuErr && (
+                <div className="px-3 py-1.5 text-[10px] text-[var(--danger)] border-t border-[var(--border)] break-all">
+                  {menuErr}
+                </div>
+              )}
+              {menuDone && (
+                <div className="px-3 py-1.5 text-[10px] text-[var(--success)] border-t border-[var(--border)] break-all">
+                  {menuDone}
+                </div>
+              )}
+            </>
           )}
-          <button
-            onClick={copyPath}
-            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            <Icon name="copy" size={13} className="opacity-60" />
-            {copied ? t('home.copied') : t('home.copyPath')}
-          </button>
-          <button
-            onClick={sendToChat}
-            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            <Icon name="plus" size={13} className="opacity-60" />
-            {t('home.sendToChat')}
-          </button>
         </div>
       )}
 
