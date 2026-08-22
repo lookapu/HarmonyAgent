@@ -394,6 +394,7 @@ pub fn hvigor_command(project_path: &Path) -> Result<HvigorCommand, String> {
     // node 直调 hvigorw.js；node 优先 DevEco 自带（绝对路径，GUI 启动 PATH 极简也可用），
     // 并注入 NODE_HOME/PATH 供 hvigorw.js 内部 spawn node 子进程
     if let Some((dev_hvigorw, _)) = find_deveco_toolchain() {
+        #[cfg_attr(windows, allow(unused_mut))]
         let mut env = env;
         #[cfg(not(windows))]
         env.extend(deveco_node_env());
@@ -493,6 +494,23 @@ fn hvigor_env() -> Vec<(String, String)> {
 /// DevEco Studio 自带 node（tools/node/bin/node）：hvigorw.js 依赖 node 运行，
 /// GUI 启动（LaunchServices）PATH 极简时 PATH 中的 node 可能不存在，
 /// 优先用绝对路径；找不到时调用方回退 "node"（走 resolve_program）。
+#[cfg(windows)]
+fn find_deveco_node() -> Option<String> {
+    let base = Path::new(r"C:\Program Files\Huawei");
+    let mut candidates = vec![base.join("DevEco Studio").join("tools").join("node").join("node.exe")];
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("DevEco") {
+                candidates.push(e.path().join("tools").join("node").join("node.exe"));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
 #[cfg(not(windows))]
 fn find_deveco_node() -> Option<String> {
     for root in ["/Applications/DevEco-Studio.app", "/Applications/DevEco Studio.app"] {
