@@ -222,7 +222,7 @@
 - [x] `Q-01` 新增迁移必须有前滚、重复执行保护和兼容旧数据测试。证据：迁移注册表与 `db/mod.rs` 测试覆盖每个迁移可执行、旧数据兼容列存在（如 075 快照列断言）。
 - [x] `Q-02` 新增后台任务必须有取消、超时、资源上限和应用退出行为。证据：调度器租约/认领/取消与执行尝试账本，工具执行线程卡死归因，均有 E2E。
 - [x] `Q-03` 新增副作用必须有审批等级、幂等策略、验证器和审计事件。证据：工具契约声明 effect/recovery/retry_safe/idempotency，治理审计统一留痕。
-- [ ] `Q-04` 新增 UI 状态必须覆盖加载、空数据、部分成功、失败、恢复和无权限状态。
+- [x] `Q-04` 新增 UI 状态必须覆盖加载、空数据、部分成功、失败、恢复和无权限状态。证据：16 个页面全部头部声明 `@ui-states` 覆盖清单（LanPage 纯容器页声明 delegated），`scripts/check-ui-states.py` 校验声明存在性、状态名合法性与声明-代码证据一致性（自测覆盖非法状态/声明无证据/delegated 误用四类回归），接入 quality.yml Frontend 门禁，规范与现状审计矩阵见 [UI 状态覆盖规范](UI_STATE_COVERAGE.md)。
 - [x] `Q-05` 日志和产物默认脱敏，禁止持久化明文凭据与签名私钥。
 - [x] `Q-06` 每个里程碑运行前端测试、Lint、构建、Rust 测试、Clippy 和相关 E2E。证据：quality.yml 全量运行前端测试/Lint/构建、Rust 测试、固定评测门禁、执行内核门禁、崩溃恢复 E2E 与 Clippy。
 - [x] `Q-07` 逐步收敛现有格式、Clippy、ESLint 和依赖安全告警，并建立不新增基线。证据：ESLint 9→0（react-hooks 真修复与带原因豁免，quality.yml 以 `--max-warnings 0` 阻断回退）；Clippy 338→44（clippy --fix 两轮 + sort_by_key 批量转换 + 修复锁文件截断/进程终止等疑似真 bug，全部机械类告警清零，剩余 44 个全为结构类 too_many_arguments 31 + type_complexity 13 保留为基线）；`scripts/check-warnings.py` 按 (lint, 位置) 去重统计 clippy 唯一告警并接入 quality.yml 双平台门禁，超过基线即阻断；所有修复经 cargo test 667 项零回归验证。

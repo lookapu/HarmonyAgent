@@ -18,6 +18,7 @@
 - 告警收敛与不新增基线门禁（Q-07）：ESLint 9 项告警清零（react-hooks 真修复与带原因豁免，`--max-warnings 0` 阻断回退）；Clippy 338 → 44（clippy --fix 两轮收敛 221 项机械告警，批量 sort_by_key 转换，修复锁文件截断语义、Drop 中进程终止等疑似真 bug，文档格式批量规范化），剩余 44 项全为结构类（too_many_arguments 31 + type_complexity 13）保留为基线；`scripts/check-warnings.py` 按 (lint, 位置) 去重统计 clippy 唯一告警并接入 quality.yml，新增告警立即阻断。
 - 真机运行诊断闭环验收通过（5.5 阶段验收）：在华为 CHZ-AL00 真机（HarmonyOS 6.1.0.135）完成签名 HAP 构建、安装、启动、hilog 日志基线、运行时故障注入（JSON 解析异常）、hilog/hisysevent 异常定位、修复、重新安装与复验全链路；验收记录与证据见 [HarmonyOS 阶段三验收记录](docs/HARMONY_STAGE5_ACCEPTANCE.md)。
 - 5.5 阶段验收全部完成：多模块工程关系（真实工程 entry+application 双模块：入口、124 页面路由、权限、依赖与双模块签名产物关系）与多设备隔离恢复（真机+模拟器：模拟器卸载故障期间真机进程全程不受影响，恢复后单独重装；防重放内容哈希门禁自动化测试通过）补齐勾选。
+- UI 状态覆盖规范与门禁（Q-04）：16 个页面全部显式声明 `@ui-states` 六类状态覆盖（加载/空数据/部分成功/失败/恢复/无权限），`scripts/check-ui-states.py` 校验声明与代码证据一致性并接入 CI，新增/修改页面未声明即阻断；规范与现状审计矩阵见 [UI 状态覆盖规范](docs/UI_STATE_COVERAGE.md)。
 
 - 建立 `agent_harmony_fixed_v3` 固定评测集：16 个可靠性场景与 10 个鸿蒙场景统一运行，覆盖真实工程创建内核、编译 API 归因、跨模块影响、录制真机 faultlog、混合工程和长会话恢复。
 - 新增可解释的鸿蒙指纹报告，把工程清单、ArkTS/ArkUI、`@kit.*` / `@ohos.*` 和构建/崩溃日志证据接入 `get_project_info` 与能力包选择，同时保留普通 TypeScript 负例和“不得由导入风格猜测精确 API Level”的边界。
