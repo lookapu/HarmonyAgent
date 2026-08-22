@@ -549,7 +549,7 @@ export const StreamingMessage = memo(function StreamingMessage({
         }
       })
     }
-  }, [content, reasoning])
+  }, [content, reasoning, speed])
   // 卸载时清理 rAF 与尾随计时器
   useEffect(
     () => () => {

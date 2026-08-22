@@ -29,7 +29,6 @@ export class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: { componentStack?: string }) {
     // 简单 console 即可；后续可接 Sentry 等
-    // eslint-disable-next-line no-console
     console.error('[ErrorBoundary] Caught error:', error, info.componentStack)
   }
 

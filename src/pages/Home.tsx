@@ -198,6 +198,16 @@ const writeDraftMap = (pid: string, m: Record<string, string>) => {
 /** 稳定的短 ID 格式化函数：作为 MessageItem prop 时不因 Home 重渲染改变引用。 */
 const shortId = (id: string) => id.slice(0, 8)
 
+// 会话时间分组键（纯函数，模块级保证引用稳定，供 useMemo 直接使用）
+const convGroupKey = (ts: number): 'today' | 'yesterday' | 'week' | 'earlier' => {
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  const diffDays = Math.round((startOfDay(new Date()) - startOfDay(new Date(ts * 1000))) / 86400000)
+  if (diffDays <= 0) return 'today'
+  if (diffDays === 1) return 'yesterday'
+  if (diffDays < 7) return 'week'
+  return 'earlier'
+}
+
 export default function Home() {
   const { t } = useTranslation()
   const navigate = useNavigate()
@@ -927,7 +937,6 @@ export default function Home() {
     draftsRef.current[cur] = draft
     const h = setTimeout(() => writeDraftMap(pid, draftsRef.current), 600)
     return () => clearTimeout(h)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft, currentConversation?.id, currentProject?.id])
 
   // 输入框自动增高：内容超过当前高度时增高（上限与拖拽一致 360），不自动缩小（尊重手动拖拽调低）
@@ -1048,6 +1057,9 @@ export default function Home() {
         return 250
     }
   }, [virtualItems])
+  // TanStack Virtual 的 useVirtualizer 返回不可 memoize 的函数，编译器跳过该组件；
+  // 与其它告警不同，这是库 API 限制，无法通过依赖数组消除。
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: virtualItems.length,
     getScrollElement: () => scrollRef.current,
@@ -1163,6 +1175,9 @@ export default function Home() {
       cancelled = true
       unlisteners.forEach((u) => u())
     }
+    // 事件订阅只应随 newConversation 重建；回调内的 store 函数每次渲染重建引用，
+    // 加入 deps 会导致订阅反复拆除重建。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newConversation])
 
   // 运行时异常一键修复：把异常信息拼成指令，自动发送给 Agent 触发自主修复闭环
@@ -1685,7 +1700,6 @@ export default function Home() {
         streamScrollRafRef.current = null
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [streamingActive])
 
   // 组件卸载时清理 rAF 与滚动位置持久化
@@ -2169,9 +2183,7 @@ export default function Home() {
       conversationId: currentConversation?.id,
       projectId: currentProject?.id,
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [confirmDeleteMsgId, removeMessage, currentConversation?.id, currentProject?.id, t])
-
   /** 更新对话级模型设置（持久化到 localStorage，随消息发送；同时绑定到当前会话使上下文预算实时生效） */
   const updateModelOptions = (next: ChatOptions) => {
     setModelOptions(next)
@@ -3351,20 +3363,16 @@ export default function Home() {
   }
 
   // 会话列表时间分组：今天 / 昨天 / 本周 / 更早；用于左侧会话列表快速定位
-  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
-  const convGroupKey = (ts: number) => {
-    const diffDays = Math.round((startOfDay(new Date()) - startOfDay(new Date(ts * 1000))) / 86400000)
-    if (diffDays <= 0) return 'today'
-    if (diffDays === 1) return 'yesterday'
-    if (diffDays < 7) return 'week'
-    return 'earlier'
-  }
-  const convGroupLabel = (key: string) => {
-    if (key === 'today') return t('home.dayToday')
-    if (key === 'yesterday') return t('home.dayYesterday')
-    if (key === 'week') return t('home.dayThisWeek')
-    return t('home.dayEarlier')
-  }
+  // convGroupKey 为模块级纯函数（引用稳定），label 依赖 i18n 故用 useCallback 保持稳定
+  const convGroupLabel = useCallback(
+    (key: string) => {
+      if (key === 'today') return t('home.dayToday')
+      if (key === 'yesterday') return t('home.dayYesterday')
+      if (key === 'week') return t('home.dayThisWeek')
+      return t('home.dayEarlier')
+    },
+    [t],
+  )
   // 智能归档建议：7+ 天无活动且未置顶 → 建议归档；30+ 天 → 强烈建议（前端标记，后端不自动改）
   // 阈值用户可在 ConfigPage 调整（本期先用默认值 7/30）
   const ARCHIVE_SUGGEST_DAYS = 7
@@ -3406,7 +3414,7 @@ export default function Home() {
       out.push({ kind: 'item', conv: c, key: c.id })
     }
     return out
-  }, [conversations, t, activeTagFilter])
+  }, [conversations, activeTagFilter, convGroupLabel])
 
   // token 数缩写（1.2k / 3.4w），标题下累计展示用
   const fmtTokens = (n: number) =>
@@ -7964,6 +7972,7 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lines.length, onClose]) // submit 是稳定闭包，但依赖 lines 让 Enter 触发时拿到最新行数
 
   return (
