@@ -130,7 +130,7 @@ pub fn match_knowledge(error_text: &str, max: usize) -> Vec<&'static KnowledgeEn
     let mut scored: Vec<(f64, &'static KnowledgeEntry)> = ENTRIES
         .iter()
         .filter_map(|e| {
-            let score = score_kw_match(&lower, &e.keywords, &e.title);
+            let score = score_kw_match(&lower, e.keywords, e.title);
             if score > 0.0 { Some((score, e)) } else { None }
         })
         .collect();

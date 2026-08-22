@@ -547,10 +547,10 @@ pub fn select_deploy_artifact(
         .filter(|artifact| artifact.kind == "hap")
         .filter(|artifact| artifact.source_step.starts_with("build:"))
         .filter(|artifact| {
-            requested_product.map_or(true, |product| artifact.product.as_deref() == Some(product))
+            requested_product.is_none_or(|product| artifact.product.as_deref() == Some(product))
         })
         .filter(|artifact| {
-            requested_module.map_or(true, |module| artifact.module.as_deref() == Some(module))
+            requested_module.is_none_or(|module| artifact.module.as_deref() == Some(module))
         })
     {
         let relative = Path::new(&artifact.path);

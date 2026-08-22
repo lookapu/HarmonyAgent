@@ -209,7 +209,7 @@ pub fn provider_error_with_retry_after(
 /// - 延迟秒数：纯数字，如 "120"；
 /// - HTTP-date：IMF-fixdate 格式，如 "Wed, 21 Oct 2015 07:28:00 GMT"，
 ///   返回距该时刻的秒数（已过期返回 0，由退避层兜底）；
-/// 两种形态都无法解析时返回 None（调用方退回指数退避）。
+///   两种形态都无法解析时返回 None（调用方退回指数退避）。
 pub fn parse_retry_after_secs(v: &str) -> Option<u64> {
     let s = v.trim();
     if s.is_empty() {
@@ -382,7 +382,7 @@ mod tests {
         let future = chrono::Utc::now() + chrono::Duration::seconds(90);
         let header = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         let parsed = parse_retry_after_secs(&header).unwrap();
-        assert!(parsed >= 80 && parsed <= 100, "parsed={parsed}");
+        assert!((80..=100).contains(&parsed), "parsed={parsed}");
         // HTTP-date 过去时刻 → 0（退避层兜底）
         let past = chrono::Utc::now() - chrono::Duration::seconds(60);
         let past_header = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();

@@ -211,7 +211,7 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 fn find_in_dirs(name: &str, dirs: &[String]) -> Option<PathBuf> {
     for dir in dirs {
         let d = std::path::Path::new(dir);
-        if let Some(p) = find_tool_in_dir(name, &d) {
+        if let Some(p) = find_tool_in_dir(name, d) {
             return Some(p);
         }
     }
@@ -317,7 +317,7 @@ pub fn discover_deveco_dirs() -> Vec<PathBuf> {
 /// Windows 上 ohpm 独立安装位置（ohpm 官方安装器默认装到 %USERPROFILE%\ohpm\<version>，
 /// 该位置不在 DevEco 安装目录与 PATH 内，需单独探测）
 fn user_ohpm_dirs() -> Vec<String> {
-    let mut out = Vec::new();
+    let out = Vec::new();
     #[cfg(windows)]
     if let Ok(home) = std::env::var("USERPROFILE") {
         let ohpm_root = std::path::Path::new(&home).join("ohpm");

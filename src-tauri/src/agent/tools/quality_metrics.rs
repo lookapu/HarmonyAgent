@@ -72,7 +72,7 @@ pub async fn code_metrics(args: &Value, roots: &[String]) -> Result<String, Stri
                 Err(e) => errors.push(e),
             }
         }
-        per_file.sort_by(|a, b| b.1.cyclomatic_delta.cmp(&a.1.cyclomatic_delta));
+        per_file.sort_by_key(|a| std::cmp::Reverse(a.1.cyclomatic_delta));
         Ok((errors, total, per_file))
     })
     .await

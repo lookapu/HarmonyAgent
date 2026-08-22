@@ -56,7 +56,7 @@ struct PriceRow {
 /// - 含图片 → Vision
 /// - 含明确代码/工程/构建/调试意图 → Code
 /// - 纯短问答/问候/闲聊/简单翻译 → Chat
-/// `is_background_aux` 用于摘要/标题/记忆等后台辅助任务，直接判为 Fast。
+///   `is_background_aux` 用于摘要/标题/记忆等后台辅助任务，直接判为 Fast。
 pub fn classify_task(message: &str, has_images: bool, is_background_aux: bool) -> TaskKind {
     if is_background_aux {
         return TaskKind::Fast;

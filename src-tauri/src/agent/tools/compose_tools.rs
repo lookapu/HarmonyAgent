@@ -223,13 +223,10 @@ pub(super) async fn compose(
         let tool = &step.tool;
         let merged = merge_args(&route_chain_parameters(tool, &chain_args), &step.args);
         // fb 为链上声明的 fallback：先合并链级参数再借用（match 模式自动解引用，闭包参数不会）
-        let fb_owned: Option<(String, Value)> = match &step.fallback {
-            Some((f, fa)) => Some((
+        let fb_owned: Option<(String, Value)> = step.fallback.as_ref().map(|(f, fa)| (
                 f.clone(),
                 merge_args(&route_chain_parameters(f, &chain_args), fa),
-            )),
-            None => None,
-        };
+            ));
         let fb_merged = fb_owned.as_ref().map(|(f, fa)| (f.as_str(), fa));
         let r = run_tool_with_fallback(
             tool,

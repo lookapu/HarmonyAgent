@@ -23,8 +23,8 @@ pub struct BaseUpdateInfo {
 /// 用户级 npm 全局目录（基座 CLI 的安装前缀，需 PATH 可见）：
 /// - Windows: `%APPDATA%\npm`（npm 用户级全局目录，装 Node 时默认在 PATH）
 /// - macOS/Linux: `~/.npm-global`
-/// 内置 npm 的默认前缀在应用资源目录下（不在 PATH），直接 `-g` 安装会导致
-/// 安装成功后 `deveco` 命令仍无法解析，因此安装/读取时显式使用该目录。
+///   内置 npm 的默认前缀在应用资源目录下（不在 PATH），直接 `-g` 安装会导致
+///   安装成功后 `deveco` 命令仍无法解析，因此安装/读取时显式使用该目录。
 fn user_npm_global_dir() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {

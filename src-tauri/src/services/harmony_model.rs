@@ -927,7 +927,7 @@ fn assign_product_modules(products: &mut [HarmonyProduct], modules: &[HarmonyMod
                 .iter()
                 .flat_map(|target| &target.products)
                 .collect::<Vec<_>>();
-            if explicit.is_empty() || explicit.iter().any(|name| *name == &product.name) {
+            if explicit.is_empty() || explicit.contains(&&product.name) {
                 product.modules.push(module.rel_path.clone());
             }
         }

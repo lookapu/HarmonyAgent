@@ -265,13 +265,13 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     // 任务完成时结果注入会话队列（模型下一轮请求自动看到），并可 job_output/job_kill 管理
     if spec.run_in_background {
         // 注：后台任务暂不注入环境变量（jobs 模块无 env 支持），.bat 经 cmd /C 执行即可
-        let (program, args, _envs) = if needs_shell(&command) {
+        let (program, args, _envs) = if needs_shell(command) {
             #[cfg(windows)]
             { ("cmd".to_string(), vec!["/C".to_string(), command.to_string()], None) }
             #[cfg(not(windows))]
             { ("sh".to_string(), vec!["-c".to_string(), command.to_string()], None) }
         } else {
-            resolve_program(&command, &cwd)
+            resolve_program(command, cwd)
         };
         let job_id = crate::agent::jobs::start_background(
             program,
@@ -294,7 +294,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     // 引号内的 | 等不算（如 rg -n 'a|b' 的正则竖线），保持单程序直接执行
     // 流式执行：stdout/stderr 逐行推送 agent:log（工具卡片/终端面板实时可见），
     // 同时支持“停止当前工具”中断；结果解析保持 run_cmd 语义（退出码/截断/建议）
-    let result = if needs_shell(&command) {
+    let result = if needs_shell(command) {
         #[cfg(windows)]
         let shell_prog = "cmd";
         #[cfg(windows)]
@@ -305,16 +305,16 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         let shell_args = vec!["-c".to_string(), command.to_string()];
         let envs = deveco_node_env();
         crate::agent::exec_ctx::run_cmd_streaming_env(
-            ctx, shell_prog, &shell_args, Some(&cwd), timeout, None, envs.as_deref(),
+            ctx, shell_prog, &shell_args, Some(cwd), timeout, None, envs.as_deref(),
         )
         .await
         .and_then(|o| cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or("")))
         .map_err(|e| with_advice("run_command", e))
     } else {
         // 工程内脚本（如 hvigorw.bat）优先本地路径解析；.bat/.cmd 经 cmd /C 执行（见 resolve_program）
-        let (program, full_args, envs) = resolve_program(&command, &cwd);
+        let (program, full_args, envs) = resolve_program(command, cwd);
         crate::agent::exec_ctx::run_cmd_streaming_env(
-            ctx, &program, &full_args, Some(&cwd), timeout, None, envs.as_deref(),
+            ctx, &program, &full_args, Some(cwd), timeout, None, envs.as_deref(),
         )
         .await
         .and_then(|o| cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or("")))
@@ -599,7 +599,7 @@ pub(super) fn decode_response(bytes: &[u8], charset: &Option<String>) -> String 
 
 pub(super) fn utf16_lossy(bytes: &[u8], little: bool) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|c| {
             if little {
                 u16::from_le_bytes([c[0], c[1]])
@@ -615,7 +615,6 @@ pub(super) fn utf16_lossy(bytes: &[u8], little: bool) -> String {
 
 /// multi_edit：一次调用批量修改多个文件（逐项独立执行，失败不影响后续项，返回逐项汇总）
 // ---------- 真机性能采样 ----------
-
 /// device_perf：真机性能快照（CPU/内存/电量/温度），供卡顿/资源占用分析
 pub(super) async fn device_perf(args: &Value) -> Result<String, String> {
     let device = match args["device"].as_str() {

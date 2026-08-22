@@ -224,7 +224,7 @@ pub fn preview(
     for set in &package.eval_sets {
         items.push(preview_eval(conn, project_id, package, set)?);
     }
-    Ok(summarize(package, items)?)
+    summarize(package, items)
 }
 
 pub fn apply(

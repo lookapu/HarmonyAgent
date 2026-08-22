@@ -524,6 +524,12 @@ pub struct LanServer {
     _lock_file: Option<std::fs::File>,
 }
 
+impl Default for LanServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LanServer {
     pub fn new() -> Self {
         Self {
@@ -1121,7 +1127,7 @@ fn dispatch_api(
         }
         ("GET", ["api", "conversations", id, "todos"]) => {
             let v = serde_json::to_value(chat::get_todos(id.to_string()))
-                .unwrap_or_else(|_| serde_json::Value::Null);
+                .unwrap_or(serde_json::Value::Null);
             json_response(StatusCode::OK, &v)
         }
         ("GET", ["api", "conversations", id, "cost"]) => {
@@ -1257,7 +1263,7 @@ fn dispatch_api(
         }
         ("POST", ["api", "conversations", id, "delete"]) => {
             let st = app.state::<DbState>();
-            cmd_response(chat::delete_conversation_sync(id, &app, &st))
+            cmd_response(chat::delete_conversation_sync(id, app, &st))
         }
 
         _ => err_response(StatusCode::NOT_FOUND, "not found"),

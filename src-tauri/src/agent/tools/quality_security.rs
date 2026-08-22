@@ -116,7 +116,7 @@ pub async fn sandbox_exec(args: &Value, roots: &[String]) -> Result<String, Stri
     let first_word = command.split_whitespace().next().unwrap_or("");
     let program = first_word
         .split(['/', '\\'])
-        .last()
+        .next_back()
         .unwrap_or("")
         .to_lowercase();
     let allowed = crate::services::permissions::ALLOWED_COMMANDS.contains(&program.as_str());

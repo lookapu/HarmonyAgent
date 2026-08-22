@@ -557,7 +557,7 @@ fn parse_sdk_import(line: &str) -> Option<(String, Vec<String>)> {
             value
                 .split(',')
                 .filter_map(|binding| {
-                    let name = binding.trim().split_whitespace().next()?;
+                    let name = binding.split_whitespace().next()?;
                     (!name.is_empty()).then(|| name.to_string())
                 })
                 .collect()

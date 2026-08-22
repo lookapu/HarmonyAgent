@@ -16,11 +16,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// CREATE_NO_WINDOW：子进程不创建控制台窗口（Windows）
+#[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// App 是否持有（隐藏的）控制台。GUI 双击运行时无控制台，需 AllocConsole 创建一个隐藏控制台，
 /// 使 hvigor/ohpm 等命令行工具的子进程、孙进程（hvigor worker / node 编译进程等）
 /// 继承隐藏控制台而非新建窗口——这是消除“构建时弹出 cmd 窗口”的根本手段。
+#[cfg(windows)]
 static APP_HAS_CONSOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 初始化隐藏控制台（lib.rs setup 时调用一次）：
@@ -99,7 +101,7 @@ pub fn set_default_jdk_dir(dir: Option<PathBuf>) {
 /// 计算 JDK 环境覆盖（系统已有 JDK 时返回空，尊重用户环境）：
 /// - 系统 JAVA_HOME 已存在 → 跳过
 /// - 系统 PATH 已有 java.exe → 跳过
-/// 否则返回 (key, value) 对：JAVA_HOME + 前置 `<jdk>/bin` 的 PATH。
+///   否则返回 (key, value) 对：JAVA_HOME + 前置 `<jdk>/bin` 的 PATH。
 pub fn jdk_env_overrides() -> Vec<(String, String)> {
     if std::env::var_os("JAVA_HOME").is_some() || system_path_has_java() {
         return Vec::new();
@@ -186,7 +188,8 @@ pub fn apply_mcp_child_env(
 /// 程序解析结果：最终可执行程序 + 是否需要 cmd 包装 + node CLI 脚本
 struct Resolved {
     program: PathBuf,
-    /// true 时需以 `cmd.exe /C` 启动（.cmd/.bat 脚本）
+    /// true 时需以 `cmd.exe /C` 启动（.cmd/.bat 脚本）；仅 Windows 分支读取
+    #[cfg_attr(not(windows), allow(dead_code))]
     needs_cmd_wrap: bool,
     /// 非空时表示应执行 `node.exe <node_cli> args`（内置 npx/npm 直调，绕开 .cmd）
     node_cli: Option<PathBuf>,
@@ -201,7 +204,7 @@ fn is_pe_executable(p: &Path) -> bool {
         return false;
     };
     let mut buf = [0u8; 2];
-    f.read_exact(&mut buf).is_ok() && buf == [b'M', b'Z']
+    f.read_exact(&mut buf).is_ok() && buf == *b"MZ"
 }
 
 /// 显式查找可执行程序：
@@ -461,6 +464,7 @@ fn not_found_error(program: &str) -> String {
 /// .cmd/.bat 经 cmd.exe /C 执行时，把程序+参数拼成单条命令（引号包裹防空格破坏）。
 /// 注意：cmd /C 会剥离整条命令最外层的一对引号，因此这里再包一层，
 /// 否则 `"C:\path\x.cmd" args` 会被剥成 `C:\path\x.cmd" "args` 导致引号错位。
+#[cfg(windows)]
 fn build_cmd_line(program: &Path, args: &[String]) -> String {
     let mut inner = format!("\"{}\"", program.display());
     for a in args {
@@ -739,6 +743,7 @@ mod tests {
     }
 
     /// build_cmd_line 应在外层包一对引号，避免 cmd /C 剥引号导致错位
+    #[cfg(windows)]
     #[test]
     fn test_build_cmd_line_wrapping() {
         let s = build_cmd_line(Path::new(r"C:\a b\x.cmd"), &["install".to_string()]);

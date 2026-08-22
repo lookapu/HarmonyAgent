@@ -1,5 +1,5 @@
 /// 网络共享工具：系统代理读取、请求客户端构建、SSE 增量提取
-
+///
 /// 读取系统代理地址：环境变量优先，Windows 注册表兜底
 pub fn read_system_proxy() -> Option<String> {
     for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {

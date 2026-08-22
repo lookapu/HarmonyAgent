@@ -121,7 +121,7 @@ pub fn delete(conn: &Connection, id: &str) -> Result<(), String> {
 /// 到期投递：把全部已到期提醒作为对话消息交付，返回 (conversation_id, prompt) 列表。
 /// - after/at：投递后终结（active=0）
 /// - every：推进 scheduled_at 到判断时刻之后第一个锚点对齐目标（错过多次只投递一次，不枚举）
-/// 调用方负责把返回项注入会话队列 + 桌面通知（对齐 dsh：只经普通对话 transcript 出现）
+///   调用方负责把返回项注入会话队列 + 桌面通知（对齐 dsh：只经普通对话 transcript 出现）
 pub fn dispatch_due(conn: &Connection, now: i64) -> Result<Vec<(String, String)>, String> {
     let mut stmt = conn
         .prepare(

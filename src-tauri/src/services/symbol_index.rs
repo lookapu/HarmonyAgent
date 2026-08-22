@@ -127,7 +127,7 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
             // 避免把 "@StateXxx" 这类普通标识符误报为装饰器
             for dec in ETS_STATE_DECORATORS {
                 if let Some(rest) = line.strip_prefix(*dec) {
-                    if rest.chars().next().map_or(true, |c| !is_ident(c)) {
+                    if rest.chars().next().is_none_or(|c| !is_ident(c)) {
                         out.push(Symbol { kind: "decorator".into(), name: (*dec).into(), file: rel.into(), line: lineno, parent: None });
                     }
                     break;
@@ -262,7 +262,6 @@ pub fn index_project(root: &Path) -> Vec<Symbol> {
 /// 符号索引缓存：key = 规范化后的项目根路径，value = (文件指纹映射, 符号列表, 最近同步秒)。
 /// 每次检索 walk + stat 收集当前文件指纹，与缓存对比后只重扫变化文件；
 /// 另持久化到磁盘（<app_data>/symbol_cache/），重启后首次打开面板即可命中。
-
 struct CacheEntry {
     files: HashMap<String, FileStamp>,
     syms: Vec<Symbol>,
@@ -512,7 +511,7 @@ pub fn invalidate_files(root: &Path, rels: &[String]) {
                 .canonicalize()
                 .ok()
                 .zip(root.canonicalize().ok())
-                .map_or(false, |(a, r)| a.starts_with(&r));
+                .is_some_and(|(a, r)| a.starts_with(&r));
             if !in_root {
                 continue;
             }
@@ -579,7 +578,7 @@ fn ensure_inside(root: &Path, rel: &str) -> Result<std::path::PathBuf, String> {
 pub fn filter_symbols<'a>(syms: &'a [Symbol], query: &str, kind: Option<&str>) -> Vec<&'a Symbol> {
     let q = query.trim().to_lowercase();
     syms.iter()
-        .filter(|s| kind.map_or(true, |k| s.kind == k))
+        .filter(|s| kind.is_none_or(|k| s.kind == k))
         .filter(|s| q.is_empty() || s.name.to_lowercase().contains(&q) || s.file.to_lowercase().contains(&q))
         .take(200)
         .collect()

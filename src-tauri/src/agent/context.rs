@@ -797,8 +797,7 @@ fn invalidate_fact_kinds(
         return Ok(0);
     }
     let now = now_ms();
-    let placeholders = std::iter::repeat("?")
-        .take(kinds.len())
+    let placeholders = std::iter::repeat_n("?", kinds.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(

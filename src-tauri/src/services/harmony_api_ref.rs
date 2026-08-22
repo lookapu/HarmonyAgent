@@ -473,12 +473,11 @@ fn extract_members(body: &str, module: &str) -> Vec<ApiMember> {
                 if in_code {
                     decl.push_str(lt);
                     decl.push('\n');
-                } else if !lt.starts_with('#') {
-                    if desc.len() < 2000 {
+                } else if !lt.starts_with('#')
+                    && desc.len() < 2000 {
                         desc.push_str(lt);
                         desc.push('\n');
                     }
-                }
                 j += 1;
             }
             let deprecated = desc.contains("废弃") || desc.contains("deprecated");
@@ -623,7 +622,7 @@ fn strip_version_sup(h: &str) -> (String, Option<u32>) {
     // 匹配 (9+) 后缀
     if since.is_none() {
         if let Some(open) = name.rfind('(') {
-            if let Some(close) = name.find(')').map(|c| c) {
+            if let Some(close) = name.find(')') {
                 if close > open {
                     let inner = &name[open + 1..close];
                     let digits: String =
@@ -1129,10 +1128,8 @@ pub async fn refresh_all(
                     })
                     .collect();
                 let results = futures_util::future::join_all(slug_futs).await;
-                for r in results {
-                    if let Some(triple) = r {
-                        return (module, Some(triple), last_err);
-                    }
+                if let Some(triple) = results.into_iter().flatten().next() {
+                    return (module, Some(triple), last_err);
                 }
                 last_err = Some(format!("所有候选 slug 均 404: {}", slugs.join(", ")));
                 (module, None, last_err)

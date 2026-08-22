@@ -665,7 +665,7 @@ pub(super) async fn permission_audit(
         if bucket.is_empty() {
             continue;
         }
-        bucket.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+        bucket.sort_by_key(|a| std::cmp::Reverse(a.call_count));
         out.push_str(&format!("\n## {level}（{} 个）\n", bucket.len()));
         for s in bucket.iter().take(15) {
             let rate = if s.call_count > 0 {
@@ -1017,7 +1017,7 @@ pub(super) async fn state_snapshot(
                     Some((e.file_name().to_string_lossy().to_string(), meta.len()))
                 })
                 .collect();
-            files.sort_by(|a, b| b.0.cmp(&a.0));
+            files.sort_by_key(|a| std::cmp::Reverse(a.0.clone()));
             if files.is_empty() {
                 return Ok(format!("快照目录中没有 JSON 快照：{base_dir}"));
             }
@@ -1132,7 +1132,7 @@ fn md_to_html(md: &str) -> String {
                 .split('|')
                 .map(|c| c.trim())
                 .filter(|c| !c.is_empty())
-                .map(|c| inline(c))
+                .map(&inline)
                 .collect();
             let is_sep = cells.iter().all(|c| c.trim().matches(['-', ':']).count() == c.trim().chars().count() && !c.trim().is_empty());
             if is_sep {

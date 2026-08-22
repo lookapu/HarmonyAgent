@@ -54,7 +54,7 @@ pub fn tokenize_query(text: &str) -> Vec<String> {
     let mut ascii = String::new(); // 连续英文/数字段
     for ch in text.chars().take(2000) {
         let cp = ch as u32;
-        let is_cjk = cp >= 0x4e00 && cp <= 0x9fff;
+        let is_cjk = (0x4e00..=0x9fff).contains(&cp);
         let is_ascii_word = ch.is_ascii_alphanumeric();
         if is_cjk {
             flush_ascii(&mut ascii, &mut out);
@@ -196,7 +196,7 @@ pub fn rank_candidates(
     let docs: Vec<String> = candidates
         .iter()
         .map(|(t, c, _)| {
-            let title_part = std::iter::repeat(t.as_str()).take(title_repeat).collect::<Vec<_>>().join(" ");
+            let title_part = std::iter::repeat_n(t.as_str(), title_repeat).collect::<Vec<_>>().join(" ");
             format!("{title_part} {c}")
         })
         .collect();

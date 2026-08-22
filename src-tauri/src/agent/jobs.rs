@@ -120,7 +120,7 @@ fn prune_finished_jobs(map: &mut HashMap<String, Arc<Mutex<Job>>>) {
             })
         })
         .collect();
-    finished.sort_by(|a, b| b.2.cmp(&a.2));
+    finished.sort_by_key(|a| std::cmp::Reverse(a.2));
     let mut per_conversation: HashMap<String, usize> = HashMap::new();
     let mut keep = std::collections::HashSet::new();
     for (id, conversation_id, _) in finished {
@@ -409,7 +409,7 @@ pub fn list_jobs(conversation_id: &str) -> Vec<JobInfo> {
                 .map(|j| j.conversation_id == conversation_id)
                 .unwrap_or(false)
         })
-        .map(|(id, j)| {
+        .filter_map(|(id, j)| {
             let j = match j.lock() {
                 Ok(j) => j,
                 Err(_) => return None,
@@ -427,7 +427,6 @@ pub fn list_jobs(conversation_id: &str) -> Vec<JobInfo> {
                 finished_at: j.finished_at,
             })
         })
-        .flatten()
         .collect();
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.job_id.cmp(&a.job_id)));
     out
@@ -547,45 +546,45 @@ pub fn templates(project_path: &str) -> Vec<JobTemplate> {
     match project_kind(project_path) {
         "harmony" => vec![
             JobTemplate {
-                name: "build".into(),
-                command: "hvigorw assembleHap".into(),
+                name: "build",
+                command: "hvigorw assembleHap",
                 desc: "全量构建 HAP（等价 DevEco 的 Build）",
             },
             JobTemplate {
-                name: "build-module".into(),
-                command: "hvigorw --mode module -p module=entry@default -p product=default assembleHap".into(),
+                name: "build-module",
+                command: "hvigorw --mode module -p module=entry@default -p product=default assembleHap",
                 desc: "只构建 entry 模块（更快，适合快速验证）",
             },
             JobTemplate {
-                name: "test".into(),
-                command: "hvigorw test".into(),
+                name: "test",
+                command: "hvigorw test",
                 desc: "运行单元测试（ohosTest 工程测试）",
             },
             JobTemplate {
-                name: "lint".into(),
-                command: "hvigorw --mode module -p module=entry@default -p product=default assembleHap --info".into(),
+                name: "lint",
+                command: "hvigorw --mode module -p module=entry@default -p product=default assembleHap --info",
                 desc: "静态检查+构建（hvigor 无独立 lint 任务，用 --info 输出检查告警）",
             },
             JobTemplate {
-                name: "clean".into(),
-                command: "hvigorw clean".into(),
+                name: "clean",
+                command: "hvigorw clean",
                 desc: "清理构建产物后重建（解决缓存导致的假错误）",
             },
         ],
         "npm" => vec![
             JobTemplate {
-                name: "build".into(),
-                command: "npm run build".into(),
+                name: "build",
+                command: "npm run build",
                 desc: "构建（package.json scripts.build）",
             },
             JobTemplate {
-                name: "test".into(),
-                command: "npm test".into(),
+                name: "test",
+                command: "npm test",
                 desc: "运行测试（package.json scripts.test）",
             },
             JobTemplate {
-                name: "lint".into(),
-                command: "npm run lint".into(),
+                name: "lint",
+                command: "npm run lint",
                 desc: "静态检查（package.json scripts.lint）",
             },
         ],
@@ -701,6 +700,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    // 循环内先显式 drop(snapshot) 再 await，锁不会跨越 await 点；clippy 词法分析保守误报
+    #[allow(clippy::await_holding_lock)]
     async fn conversation_cleanup_kills_parent_and_orphan_candidate() {
         fn process_signalable(pid: u32) -> bool {
             std::process::Command::new("kill")

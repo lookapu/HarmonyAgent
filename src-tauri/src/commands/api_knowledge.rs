@@ -726,10 +726,8 @@ fn query_string_vec(conn: &Connection, sql: &str) -> Result<Vec<String>, String>
         .query_map([], |r| r.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for r in rows {
-        if let Ok(v) = r {
-            out.push(v);
-        }
+    for v in rows.flatten() {
+        out.push(v);
     }
     Ok(out)
 }
@@ -855,7 +853,7 @@ pub fn api_kb_embed_index(app: AppHandle, db: State<'_, DbState>) -> Result<(), 
     #[cfg(not(feature = "embedding"))]
     {
         let _ = (&app, &db);
-        return Err("当前构建未启用语义检索（embedding feature），无法建索引".into());
+        Err("当前构建未启用语义检索（embedding feature），无法建索引".into())
     }
 
     #[cfg(feature = "embedding")]

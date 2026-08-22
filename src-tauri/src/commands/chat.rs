@@ -1065,8 +1065,7 @@ fn save_conversation_snapshot(
         label = "（工具执行轮）".to_string();
     }
     let ledger_json = ledger
-        .map(|l| serde_json::to_string(l).ok())
-        .flatten();
+        .and_then(|l| serde_json::to_string(l).ok());
     conn.execute(
         "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, label, ledger_json, tool_count, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1353,7 +1352,7 @@ fn take_next_queued(
     conn.execute("UPDATE messages SET queued = 0 WHERE id = ?1", [&id])
         .map_err(|e| e.to_string())?;
     // 通知前端该消息已消费（前端刷新排队标记为已提交）
-    let _ = crate::utils::logger::log_event(
+    crate::utils::logger::log_event(
         "queued_consumed",
         serde_json::json!({ "conversation_id": conversation_id, "message_id": id, "agent_owned": agent_only }),
     );
@@ -1399,7 +1398,7 @@ fn take_all_queued(
             .collect::<Vec<_>>()
             .join("\n\n")
     };
-    let _ = crate::utils::logger::log_event(
+    crate::utils::logger::log_event(
         "queued_batch_consumed",
         serde_json::json!({ "conversation_id": conversation_id, "count": items.len() }),
     );
@@ -2622,11 +2621,11 @@ async fn stream_chat_inner(
                 }
             } else {
                 guard.insert(project_id.clone(), conversation_id.clone());
-                break Unlock(&lock, project_id.clone(), conversation_id.clone());
+                break Unlock(lock, project_id.clone(), conversation_id.clone());
             }
         }
         // 等待期间响应停止请求；超时释放（防僵尸任务永久阻塞队列）
-        if is_cancelled(&cancel, &conversation_id) {
+        if is_cancelled(cancel, &conversation_id) {
             // 尚未取得项目锁时普通 user 消息还未走到下方入库；停止前先持久化，
             // 避免前端乐观消息刷新后消失。重新生成/自动续跑的 user 消息已在库，不重复写。
             let user_message_id = if !regenerate.unwrap_or(false) && persist_user {
@@ -2835,7 +2834,7 @@ async fn stream_chat_inner(
                 .filter(|h| !h.reference)
                 .map(|h| h.path.clone())
                 .collect();
-            remember_path_hints(&state, &project_id, &project_path, &persist_hints);
+            remember_path_hints(state, &project_id, &project_path, &persist_hints);
         }
     }
 
@@ -3157,7 +3156,7 @@ async fn stream_chat_inner(
                     for m in &modules {
                         let mp = m.rel_path.replace('\\', "/");
                         let hit = rel_s == mp || rel_s.starts_with(&format!("{mp}/"));
-                        if hit && best.map_or(true, |b| mp.len() > b.rel_path.len()) {
+                        if hit && best.is_none_or(|b| mp.len() > b.rel_path.len()) {
                             best = Some(m);
                         }
                     }
@@ -3405,7 +3404,7 @@ async fn stream_chat_inner(
         }
         // 本地 OpenHarmony 文档库：无需登录的 API 文档镜像（search_harmony_docs / read_harmony_doc）
         {
-            let app = tauri::AppHandle::clone(&app);
+            let app = tauri::AppHandle::clone(app);
             let root = crate::services::harmony_docs::docs_root(&app);
             if let Some(r) = root {
                 if crate::services::harmony_docs::is_downloaded(&r) {
@@ -3683,8 +3682,8 @@ async fn stream_chat_inner(
     );
     let system_prompt_full = format!("{system_prompt_core}\n\n{low_freq_hints}");
     // MCP 服务器工具 + Skill 技能库：动态注入工具清单与技能指令（子 Agent 共用同一批逻辑）
-    let mcp_hint = load_mcp_hint(&state, &app, &project_id, &project_path).await?;
-    let skill_hint = load_skill_hint(&state, if project_id.is_empty() { None } else { Some(&project_id) })?;
+    let mcp_hint = load_mcp_hint(state, app, &project_id, &project_path).await?;
+    let skill_hint = load_skill_hint(state, if project_id.is_empty() { None } else { Some(&project_id) })?;
     // 打点：提示词构建完成（含 MCP 工具加载耗时），定位卡点用
     crate::utils::logger::log_event(
         "hint_built",
@@ -3789,7 +3788,7 @@ async fn stream_chat_inner(
         .and_then(|conn| {
             crate::agent::context::load_summary(&conn, &conversation_id, context_budget)
         })
-        .or_else(|| load_persisted_summary(&state, &conversation_id));
+        .or_else(|| load_persisted_summary(state, &conversation_id));
     // 连续工具失败 replan 提示：连续失败 ≥2 时注入一次“重新规划”指令（重试/改策略/终止 三档）
     let mut consecutive_failures: u32 = 0;
     let mut replan_given = false;
@@ -3856,7 +3855,7 @@ async fn stream_chat_inner(
         .chars()
         .take(200)
         .collect::<String>();
-    let mut prev_ledger = load_task_ledger(&state, &conversation_id);
+    let mut prev_ledger = load_task_ledger(state, &conversation_id);
     let ledger_base_n = prev_ledger
         .as_ref()
         .map(|l| l.verified.iter().chain(l.open.iter()).map(|e| e.n).max().unwrap_or(0))
@@ -3940,7 +3939,7 @@ async fn stream_chat_inner(
             );
             if !full.is_empty() {
                 persist_turn(
-                    &state,
+                    state,
                     &conversation_id,
                     &trace_id,
                     &tool_runs,
@@ -3949,7 +3948,7 @@ async fn stream_chat_inner(
                     &model_choice.model,
                     &context_summary,
                     &modified_files,
-                    &app,
+                    app,
                     stats.input_tokens,
                     stats.output_tokens,
                     task_started.elapsed().as_millis() as i64,
@@ -3962,7 +3961,7 @@ async fn stream_chat_inner(
             if !tool_runs.is_empty() || prev_ledger.is_some() {
                 let derived = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
                 let merged = TaskLedger::merge_continuation(prev_ledger.take(), derived);
-                save_task_ledger(&state, &conversation_id, Some(&merged))?;
+                save_task_ledger(state, &conversation_id, Some(&merged))?;
                 // 账本最终态推送：任务中断（超时）→ 保留账本，前端展示未完成任务状态
                 let _ = app.emit(
                     "chat-ledger",
@@ -3991,7 +3990,7 @@ async fn stream_chat_inner(
             });
         }
         // 检查停止请求（安全点：每轮请求前，工具执行完成后会回到这里）
-        if is_cancelled(&cancel, &conversation_id) {
+        if is_cancelled(cancel, &conversation_id) {
             crate::utils::logger::log_event(
                 "stop_effective",
                 serde_json::json!({
@@ -4002,7 +4001,7 @@ async fn stream_chat_inner(
             );
             stats.stopped = true;
             persist_turn(
-                &state,
+                state,
                 &conversation_id,
                 &trace_id,
                 &tool_runs,
@@ -4011,7 +4010,7 @@ async fn stream_chat_inner(
                 &model_choice.model,
                 &context_summary,
                 &modified_files,
-                &app,
+                app,
                 stats.input_tokens,
                 stats.output_tokens,
                 task_started.elapsed().as_millis() as i64,
@@ -4023,7 +4022,7 @@ async fn stream_chat_inner(
             if !tool_runs.is_empty() || prev_ledger.is_some() {
                 let derived = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
                 let merged = TaskLedger::merge_continuation(prev_ledger.take(), derived);
-                save_task_ledger(&state, &conversation_id, Some(&merged))?;
+                save_task_ledger(state, &conversation_id, Some(&merged))?;
                 // 账本最终态推送：任务中断（用户停止）→ 保留账本，前端展示未完成任务状态
                 let _ = app.emit(
                     "chat-ledger",
@@ -4037,7 +4036,7 @@ async fn stream_chat_inner(
             return Ok(());
         }
         // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
-        if let Some((_, pending_content)) = take_next_queued(&state, &conversation_id, true)? {
+        if let Some((_, pending_content)) = take_next_queued(state, &conversation_id, true)? {
             merged_instructions.push(pending_content);
             let _ = app.emit(
                 "chat-stream",
@@ -4051,7 +4050,7 @@ async fn stream_chat_inner(
         // 组装消息：系统提示 + 历史（最近 history_limit 条，含 tool）+ 已执行工具结果
         // 接缝审计 + 刷新频率分级：完整提示（含低频项目上下文/知识库）每 FULL_HINT_EVERY_ROUNDS
         // 轮刷新一次，中间轮只带核心规则；任务账本每轮注入（账本=当前状态，接缝处刷新保证连续性）
-        let prompt_now = if seam_count % FULL_HINT_EVERY_ROUNDS == 0 {
+        let prompt_now = if seam_count.is_multiple_of(FULL_HINT_EVERY_ROUNDS) {
             &system_prompt
         } else {
             &system_prompt_core
@@ -4407,7 +4406,7 @@ async fn stream_chat_inner(
                 }),
             );
             if let Some(s) = summarize_rolling_history(
-                &state,
+                state,
                 &client,
                 &provider,
                 &model_choice,
@@ -4416,7 +4415,7 @@ async fn stream_chat_inner(
                 old_limit,
                 history_limit,
                 context_summary.take(),
-                Some(&cancel),
+                Some(cancel),
             )
             .await
             {
@@ -4609,7 +4608,7 @@ async fn stream_chat_inner(
             );
         }
         let outcome = match stream_once(
-            &app,
+            app,
             &client,
             &protocol,
             &provider,
@@ -4617,10 +4616,10 @@ async fn stream_chat_inner(
             &opts,
             &messages,
             &conversation_id,
-            &cancel,
+            cancel,
             registry,
             stats,
-            &state,
+            state,
             &mut placeholder_msg_id,
         )
         .await
@@ -4651,7 +4650,7 @@ async fn stream_chat_inner(
                     }),
                 );
                 if let Some(s) = summarize_rolling_history(
-                    &state,
+                    state,
                     &client,
                     &provider,
                     &model_choice,
@@ -4660,7 +4659,7 @@ async fn stream_chat_inner(
                     old_limit,
                     history_limit,
                     context_summary.take(),
-                    Some(&cancel),
+                    Some(cancel),
                 )
                 .await
                 {
@@ -4702,7 +4701,7 @@ async fn stream_chat_inner(
                 // 可恢复性错误（限流/网络/5xx）→ 自动降级到同 Provider 备用模型重试一次
                 // （配置类错误 401/400 降级无意义；只降级一次防级联）
                 if e.retryable() && !used_fallback {
-                    if let Some(fb) = pick_fallback_model(&state, &model_choice) {
+                    if let Some(fb) = pick_fallback_model(state, &model_choice) {
                         used_fallback = true;
                         let fb_name = fb.model.clone();
                         model_choice = fb;
@@ -4724,7 +4723,7 @@ async fn stream_chat_inner(
                 // 避免半途失败丢失全部工作（前端保留已有内容 + 错误提示）
                 if !full.trim().is_empty() || !tool_runs.is_empty() {
                     let _ = persist_turn(
-                        &state,
+                        state,
                         &conversation_id,
                         &trace_id,
                         &tool_runs,
@@ -4733,7 +4732,7 @@ async fn stream_chat_inner(
                         &model_choice.model,
                         &context_summary,
                         &modified_files,
-                        &app,
+                        app,
                         stats.input_tokens,
                         stats.output_tokens,
                         task_started.elapsed().as_millis() as i64,
@@ -4767,7 +4766,7 @@ async fn stream_chat_inner(
         if outcome.stopped {
             stats.stopped = true;
             persist_turn(
-                &state,
+                state,
                 &conversation_id,
                 &trace_id,
                 &tool_runs,
@@ -4776,7 +4775,7 @@ async fn stream_chat_inner(
                 &model_choice.model,
                 &context_summary,
                 &modified_files,
-                &app,
+                app,
                 stats.input_tokens,
                 stats.output_tokens,
                 task_started.elapsed().as_millis() as i64,
@@ -4833,7 +4832,7 @@ async fn stream_chat_inner(
                 } else {
                     plan_text
                 };
-                let review = request_plan_review(&app, plan_review, cancel.inner(), &conversation_id, &trace_id, &plan_text)
+                let review = request_plan_review(app, plan_review, cancel.inner(), &conversation_id, &trace_id, &plan_text)
                     .await
                     .unwrap_or(PlanReview {
                         approved: false,
@@ -5013,7 +5012,7 @@ async fn stream_chat_inner(
                             desc: crate::agent::tools::tool_short_desc(&tool).to_string(),
                         },
                     );
-                    begin_tool_run(&state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
+                    begin_tool_run(state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
                     let limit_output = format!(
                         "工具调用已达轮次上限（{max_tool_rounds} 轮），本次调用未执行"
                     );
@@ -5031,7 +5030,7 @@ async fn stream_chat_inner(
                     );
                     finish_tool_run(
                         app,
-                        &state,
+                        state,
                         &conversation_id,
                         &trace_id,
                         Some(&call_id),
@@ -5042,7 +5041,7 @@ async fn stream_chat_inner(
                         tool_begin.elapsed().as_millis() as i64,
                     );
                     let summary = request_final_summary(
-                        &app,
+                        app,
                         &client,
                         &protocol,
                         &provider,
@@ -5050,10 +5049,10 @@ async fn stream_chat_inner(
                         &opts,
                         &messages,
                         &conversation_id,
-                        &cancel,
+                        cancel,
                         registry,
                         stats,
-                        &state,
+                        state,
                         &mut placeholder_msg_id,
                     )
                     .await;
@@ -5078,8 +5077,8 @@ async fn stream_chat_inner(
                     if pending.len() >= MAX_TOOL_CONCURRENCY {
                         let results = run_tool_batch(
                             &pending,
-                            &app,
-                            &state,
+                            app,
+                            state,
                             &opts,
                             &mcp,
                             &tool_ctx,
@@ -5087,7 +5086,7 @@ async fn stream_chat_inner(
                             &path_hints,
                             &project_id,
                             &conversation_id,
-                            &cancel,
+                            cancel,
                             registry,
                             max_tool_rounds as u32,
                         )
@@ -5101,8 +5100,8 @@ async fn stream_chat_inner(
                             stats,
                             &mut tools_since_progress,
                             &mut full,
-                            &app,
-                            &state,
+                            app,
+                            state,
                             &trace_id,
                             &client,
                             &protocol,
@@ -5111,7 +5110,7 @@ async fn stream_chat_inner(
                             &opts,
                             &messages,
                             &conversation_id,
-                            &cancel,
+                            cancel,
                             registry,
                         )
                         .await;
@@ -5126,8 +5125,8 @@ async fn stream_chat_inner(
                 if !pending.is_empty() {
                     let results = run_tool_batch(
                         &pending,
-                        &app,
-                        &state,
+                        app,
+                        state,
                         &opts,
                         &mcp,
                         &tool_ctx,
@@ -5135,7 +5134,7 @@ async fn stream_chat_inner(
                         &path_hints,
                         &project_id,
                         &conversation_id,
-                        &cancel,
+                        cancel,
                         registry,
                         max_tool_rounds as u32,
                     )
@@ -5149,8 +5148,8 @@ async fn stream_chat_inner(
                         stats,
                         &mut tools_since_progress,
                         &mut full,
-                        &app,
-                        &state,
+                        app,
+                        state,
                         &trace_id,
                         &client,
                         &protocol,
@@ -5159,7 +5158,7 @@ async fn stream_chat_inner(
                         &opts,
                         &messages,
                         &conversation_id,
-                        &cancel,
+                        cancel,
                         registry,
                     )
                     .await;
@@ -5184,7 +5183,7 @@ async fn stream_chat_inner(
                         desc: crate::agent::tools::tool_short_desc(&tool).to_string(),
                     },
                 );
-                begin_tool_run(&state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
+                begin_tool_run(state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
                 // 统一护栏预检：任务预算/失败黑名单/权限分级审批由 pipeline pre 钩子裁决
                 // （guards.rs 注册），拦截后按 InterceptKind 收尾：
                 // - Budget/Blacklist：发 done 事件 + 请求模型总结后终止（不静默收尾）
@@ -5218,7 +5217,7 @@ async fn stream_chat_inner(
                         },
                     );
                     persist_tool_run_immediate(
-                        &state,
+                        state,
                         &conversation_id,
                         &trace_id,
                         &tool,
@@ -5228,7 +5227,7 @@ async fn stream_chat_inner(
                     );
                     finish_tool_run(
                         app,
-                        &state,
+                        state,
                         &conversation_id,
                         &trace_id,
                         Some(&call_id),
@@ -5272,7 +5271,7 @@ async fn stream_chat_inner(
                     );
                     // 拦截结果同样即时入库（任务中断时用户可见拦截原因）
                     persist_tool_run_immediate(
-                        &state,
+                        state,
                         &conversation_id,
                         &trace_id,
                         &tool,
@@ -5282,7 +5281,7 @@ async fn stream_chat_inner(
                     );
                     finish_tool_run(
                         app,
-                        &state,
+                        state,
                         &conversation_id,
                         &trace_id,
                         Some(&call_id),
@@ -5317,7 +5316,7 @@ async fn stream_chat_inner(
                     ) {
                         // 给模型最后一次总结机会，避免输出戛然而止
                         let summary = request_final_summary(
-                            &app,
+                            app,
                             &client,
                             &protocol,
                             &provider,
@@ -5325,10 +5324,10 @@ async fn stream_chat_inner(
                             &opts,
                             &messages,
                             &conversation_id,
-                            &cancel,
+                            cancel,
                             registry,
                             stats,
-                            &state,
+                            state,
                             &mut placeholder_msg_id,
                         )
                         .await;
@@ -5347,9 +5346,9 @@ async fn stream_chat_inner(
                     exhausted = true;
                     break;
                 }
-            if let Err(output) = mark_tool_run_started(&state, &conversation_id, &trace_id, &call_id) {
+            if let Err(output) = mark_tool_run_started(state, &conversation_id, &trace_id, &call_id) {
                 finish_tool_run(
-                    app, &state, &conversation_id, &trace_id, Some(&call_id), &tool,
+                    app, state, &conversation_id, &trace_id, Some(&call_id), &tool,
                     &args_raw, &output, "error", tool_begin.elapsed().as_millis() as i64,
                 );
                 let _ = app.emit("chat-tool-done", ChatToolDoneEvent {
@@ -5368,8 +5367,8 @@ async fn stream_chat_inner(
             let (result, retry_count) = if tool == "spawn_agents" {
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
                 let r = run_spawn_agents(
-                    &app,
-                    &state,
+                    app,
+                    state,
                     &client,
                     &project_path,
                     &path_hints,
@@ -5380,7 +5379,7 @@ async fn stream_chat_inner(
                     approval,
                     &args_raw,
                     &conversation_id,
-                    &cancel,
+                    cancel,
                     tool_ctx.spawn_remaining,
                 )
                 .await;
@@ -5396,10 +5395,10 @@ async fn stream_chat_inner(
                             &project_path,
                             &path_hints,
                             &project_id,
-                            &state,
+                            state,
                             &mcp,
                             &tool_ctx,
-                            &cancel,
+                            cancel,
                             &conversation_id,
                             registry,
                             &call_id,
@@ -5432,7 +5431,7 @@ async fn stream_chat_inner(
             };
             let committed = finish_tool_run(
                 app,
-                &state,
+                state,
                 &conversation_id,
                 &trace_id,
                 Some(&call_id),
@@ -5559,7 +5558,7 @@ async fn stream_chat_inner(
                     );
                     // 执行完成即入库：任务中断（应用退出/崩溃）时执行轨迹不丢
                     persist_tool_run_immediate(
-                        &state,
+                        state,
                         &conversation_id,
                         &trace_id,
                         &tool,
@@ -5599,7 +5598,7 @@ async fn stream_chat_inner(
                     );
                     // 失败同样即时入库（任务中断时用户可见失败原因，恢复会话可继续）
                     persist_tool_run_immediate(
-                        &state,
+                        state,
                         &conversation_id,
                         &trace_id,
                         &tool,
@@ -5627,8 +5626,8 @@ async fn stream_chat_inner(
             if !pending.is_empty() {
                 let results = run_tool_batch(
                     &pending,
-                    &app,
-                    &state,
+                    app,
+                    state,
                     &opts,
                     &mcp,
                     &tool_ctx,
@@ -5636,7 +5635,7 @@ async fn stream_chat_inner(
                     &path_hints,
                     &project_id,
                     &conversation_id,
-                    &cancel,
+                    cancel,
                     registry,
                     max_tool_rounds as u32,
                 )
@@ -5650,8 +5649,8 @@ async fn stream_chat_inner(
                     stats,
                     &mut tools_since_progress,
                     &mut full,
-                    &app,
-                    &state,
+                    app,
+                    state,
                     &trace_id,
                     &client,
                     &protocol,
@@ -5660,7 +5659,7 @@ async fn stream_chat_inner(
                     &opts,
                     &messages,
                     &conversation_id,
-                    &cancel,
+                    cancel,
                     registry,
                 )
                 .await;
@@ -5684,7 +5683,7 @@ async fn stream_chat_inner(
             } else {
                 plan_text
             };
-            let review = request_plan_review(&app, plan_review, cancel.inner(), &conversation_id, &trace_id, &plan_text)
+            let review = request_plan_review(app, plan_review, cancel.inner(), &conversation_id, &trace_id, &plan_text)
                 .await
                 .unwrap_or(PlanReview {
                     approved: false,
@@ -5987,7 +5986,7 @@ async fn stream_chat_inner(
         && (is_completion_confirmation(&last_model_text) || tool_runs.is_empty());
     stats.unfinished = !task_done;
     persist_turn(
-        &state,
+        state,
         &conversation_id,
         &trace_id,
         &tool_runs,
@@ -5996,7 +5995,7 @@ async fn stream_chat_inner(
         &model_choice.model,
         &context_summary,
         &modified_files,
-        &app,
+        app,
         stats.input_tokens,
         stats.output_tokens,
         task_started.elapsed().as_millis() as i64,
@@ -6008,7 +6007,7 @@ async fn stream_chat_inner(
     // 账本持久化（Ledger 协议）：任务确认完成（模型明确确认或纯问答无工具）则清空账本；
     // 否则保存当前账本（含断点续跑合并），下次续跑继承——完成/未完成状态不静默丢失
     if task_done {
-        save_task_ledger(&state, &conversation_id, None)?;
+        save_task_ledger(state, &conversation_id, None)?;
         // 账本最终态推送：任务完成 → 清空账本（前端收起账本卡，任务摘要接管展示）
         let _ = app.emit(
             "chat-ledger",
@@ -6021,7 +6020,7 @@ async fn stream_chat_inner(
     } else if !tool_runs.is_empty() || prev_ledger.is_some() {
         let derived = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
         let merged = TaskLedger::merge_continuation(prev_ledger.take(), derived);
-        save_task_ledger(&state, &conversation_id, Some(&merged))?;
+        save_task_ledger(state, &conversation_id, Some(&merged))?;
         // 账本最终态推送：任务未完成（护栏收尾）→ 保留账本供断点续跑展示
         let _ = app.emit(
             "chat-ledger",
@@ -6433,9 +6432,9 @@ fn pick_fallback_model(state: &tauri::State<'_, DbState>, current: &ModelChoice)
     })
 }
 
-/// LLM 提供方能力接缝（Capability Seam）：协议特有的"流式请求构造"抽象为 trait。
-/// 主循环（stream_once）依赖抽象而非具体协议分支；新增协议 = 实现 LlmProvider 并注册到工厂。
-/// 增量解析（SSE 增量/思考/结束标记）由 utils::net 按协议字符串统一处理，此处不再重复。
+// LLM 提供方能力接缝（Capability Seam）：协议特有的"流式请求构造"抽象为 trait。
+// 主循环（stream_once）依赖抽象而非具体协议分支；新增协议 = 实现 LlmProvider 并注册到工厂。
+// 增量解析（SSE 增量/思考/结束标记）由 utils::net 按协议字符串统一处理，此处不再重复。
 // ---------- DeepSeek 推理模型 reasoning 合规（对齐 DeepSeek-TUI 最终净化器） ----------
 // 官方 thinking_mode 文档硬性要求：携带 tools 参数的请求在后续所有请求中必须完整回传
 // reasoning_content，缺失会 400。但历史/续写/纠正等路径构造的 assistant 消息并不保证
@@ -7414,7 +7413,7 @@ async fn stream_once(
                     );
                     break 'outer;
                 }
-                if tick_count % 50 == 0 {
+                if tick_count.is_multiple_of(50) {
                     // 诊断心跳：每 10s 自报存活 + 所在线程，区分主循环卡死/正常轮询
                     crate::utils::logger::log_event(
                         "stream_loop_alive",
@@ -7926,7 +7925,7 @@ fn stream_parse_thread(
                 );
             }
             // 进度日志：每 4096 行记录一次，异常巨大响应时留下可定位证据
-            if lines_parsed % (STREAM_YIELD_LINES * 8) == 0 {
+            if lines_parsed.is_multiple_of(STREAM_YIELD_LINES * 8) {
                 crate::utils::logger::log_event(
                     "stream_parse_progress",
                     serde_json::json!({
@@ -8282,9 +8281,9 @@ async fn run_spawn_agents(
                 _ => prompt,
             };
             let (name, r) = run_one_subagent_emitted(
-                &app,
-                &state,
-                &client,
+                app,
+                state,
+                client,
                 &ep,
                 &mc,
                 project_path,
@@ -8294,7 +8293,7 @@ async fn run_spawn_agents(
                 &prompt,
                 &limits,
                 cancel,
-                &conversation_id,
+                conversation_id,
                 approval,
                 approval_mode,
             )
@@ -8314,7 +8313,7 @@ async fn run_spawn_agents(
                 async move {
                     run_one_subagent_emitted(
                         &app,
-                        &state,
+                        state,
                         &client,
                         &ep,
                         &mc,
@@ -9512,7 +9511,7 @@ async fn apply_tool_batch(
                     cancel,
                     registry,
                     stats,
-                    &state,
+                    state,
                     &mut local_placeholder,
                 )
                 .await;
@@ -10485,7 +10484,7 @@ async fn non_stream_request(
             .unwrap_or_default();
         return Err(format!(
             "Provider 返回 {status}: {}",
-            &text.chars().take(300).collect::<String>()
+            text.chars().take(300).collect::<String>()
         ));
     }
     let json: serde_json::Value =
@@ -10533,7 +10532,7 @@ fn model_supports_image(conn: &rusqlite::Connection, provider_id: &str, model_id
 /// 把引用内容注入消息正文：
 /// - 文件引用（相对路径）：路径安全检查 + 截断护栏，以【引用文件 path】代码块追加
 /// - 会话引用（conv:<id>）：注入该会话标题 + 最近摘要/结论，以【引用会话 title】块追加
-/// 不存在的引用静默跳过，不阻塞发送。单条 ≤2000 字符，总注入 ≤8000 字符（防上下文膨胀）。
+///   不存在的引用静默跳过，不阻塞发送。单条 ≤2000 字符，总注入 ≤8000 字符（防上下文膨胀）。
 fn inject_references(
     conn: &rusqlite::Connection,
     project_path: &str,
@@ -11073,7 +11072,7 @@ fn delete_conversation_inner(
     if let Ok(mut set) = cancel.0.lock() {
         set.insert(id.to_string());
     }
-    let _ = crate::agent::ask::cancel_conversation(id);
+    crate::agent::ask::cancel_conversation(id);
     crate::agent::exec_ctx::request_stop_tool(id);
     // 2. 立即 abort 正在运行的 tokio 任务，并从注册表移除（看门狗不再追猎）
     registry.abort_conversation(id);
@@ -11195,7 +11194,7 @@ fn record_feedback_terms(
         *freq.entry(t).or_default() += 1;
     }
     let mut top: Vec<(String, usize)> = freq.into_iter().filter(|(_, n)| *n >= 2).collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|a| std::cmp::Reverse(a.1));
     top.truncate(5);
     if top.is_empty() {
         return;

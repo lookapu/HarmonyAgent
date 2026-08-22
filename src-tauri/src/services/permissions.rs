@@ -400,7 +400,7 @@ mod tests {
     fn test_auto_approve() {
         assert!(auto_approve("read_file", true, None));
         assert!(!auto_approve("read_file", false, None));
-        assert!(auto_approve("delete_file", false, None) == false);
+        assert!(!auto_approve("delete_file", false, None));
         assert!(auto_approve("run_command", true, Some("git status")));
         assert!(!auto_approve("run_command", true, Some("git push")));
     }

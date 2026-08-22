@@ -238,7 +238,7 @@ fn latest_hap_in_dir(dir: &Path) -> Option<PathBuf> {
             } else {
                 mtime
             };
-            if best.as_ref().map_or(true, |(_, t)| score > *t) {
+            if best.as_ref().is_none_or(|(_, t)| score > *t) {
                 best = Some((p, score));
             }
         }
@@ -275,7 +275,7 @@ fn find_latest_hap_fallback(root: &Path) -> Option<PathBuf> {
                 } else {
                     mtime
                 };
-                if best.as_ref().map_or(true, |(_, t)| score > *t) {
+                if best.as_ref().is_none_or(|(_, t)| score > *t) {
                     *best = Some((p, score));
                 }
             }
@@ -450,7 +450,7 @@ fn find_toolkit_hvigorw() -> Option<PathBuf> {
 /// PATH 中，且 Windows 下 cmd 报错可能被吞掉、看不到任何输出）。因此 bat 存在
 /// 但引用缺失的 wrapper 时应判定不可用，跳过它改走 DevEco 内置工具链。
 fn hvigorw_bat_usable(bat: &Path, wrapper: &Path) -> bool {
-    wrapper.is_file() || read_to_string_opt(bat).map_or(true, |t| !t.contains("hvigor-wrapper.js"))
+    wrapper.is_file() || read_to_string_opt(bat).is_none_or(|t| !t.contains("hvigor-wrapper.js"))
 }
 
 /// 构建 hvigor 所需环境变量：用户显式设置了 DEVECO_SDK_HOME 时不覆盖，
@@ -873,7 +873,6 @@ fn extract_error_code(line: &str) -> Option<String> {
             continue;
         };
         let candidate = line[index + marker.len()..]
-            .trim_start()
             .split_whitespace()
             .next()
             .unwrap_or("")

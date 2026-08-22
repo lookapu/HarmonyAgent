@@ -1706,7 +1706,7 @@ fn is_device_online(state: &str) -> bool {
 
 /// 列出鸿蒙工程的可构建模块名：优先读 build-profile.json5 的 modules 字段，
 /// 失败回退扫描根目录下含 oh-package.json5 且非 AppScope 的直接子目录。
-
+///
 /// 当构建/部署由失败转为成功时，向前端推送一条"修复经验候选"。
 /// 前端展示为可一键保存的提示：把刚才的错误症状 + 本次修复动作沉淀为知识条目。
 /// 这里只推送、不落库；用户确认后调用 save_knowledge_from_text 才真正保存。
@@ -1808,19 +1808,19 @@ fn tail(s: &str, max: usize) -> String {
 
 
 /// deploy_all：把同一个 HAP 并行部署到所有（或指定的）在线设备，汇总结果。
-
+///
 /// 在单台设备上完成：安装 → 拉起 → 存活探测/崩溃归因。供 deploy_all 并行调用。
-
+///
 /// 从设备拉取本应用最近的 faultlog（JsError/CppCrash/appfreeze）。
 /// 鸿蒙 faultlog 位于 /data/log/faultlog/temp/，文件名形如：
 ///   JsError-<bundle>-<pid>-<时间>.log
 ///   CppCrash-<bundle>-<pid>-<时间>.log
 /// 这里先 ls 找与 bundle 相关的最新文件，再 cat 其内容；权限受限或目录不存在时返回空。
-
+///
 /// 部署/安装失败根因分类：根据 hdc install 输出特征判定失败类别并给出推荐下一步。
 /// 类别：device_offline(设备未连接/离线)、signing(签名问题)、version_downgrade(版本降级)、
 /// insufficient_storage(空间不足)、incompatible(架构/设备不兼容)、install_failed(其他安装失败)
-
+///
 /// 持久化默认设备 id 到用户本地配置目录（下次部署免选择）
 fn save_default_device(device_id: &str) {
     if let Some(path) = default_device_file() {
@@ -2683,18 +2683,16 @@ fn extract_ports_from_text(text: &str) -> Vec<u16> {
             if (1024..=65535).contains(&num) {
                 let start = i.saturating_sub(40);
                 let ctx: String = chars[start..i].iter().collect::<String>().to_lowercase();
-                if ctx.contains("http")
+                if (ctx.contains("http")
                     || ctx.contains("localhost")
                     || ctx.contains("127.0.0.1")
                     || ctx.contains("0.0.0.0")
                     || ctx.contains("listening")
                     || ctx.contains("port")
-                    || ctx.contains("端口")
-                {
-                    if !out.contains(&(num as u16)) {
+                    || ctx.contains("端口"))
+                    && !out.contains(&(num as u16)) {
                         out.push(num as u16);
                     }
-                }
             }
             i = j;
         } else {
@@ -3029,23 +3027,23 @@ async fn run_app(args: &Value, roots: &[String]) -> Result<String, String> {
 // ---------- 设备管理增强工具族（无线连接/文件传输/进程停止/受限 shell/崩溃取证/ohpm 搜索） ----------
 
 /// connect_device：通过 hdc tconn 无线连接/断开真机（无需 USB 线）。
-
+///
 /// manage_hdc：管理 hdc 服务端（daemon）——start/stop/restart/status。
-
+///
 /// 定位 DevEco Studio 的 Emulator.exe（安装目录发现优先，回退常见路径）。
-
+///
 /// list_emulators：列出 DevEco Studio 已创建的模拟器实例。
-
+///
 /// start_emulator：启动/停止模拟器实例，启动后轮询 hdc 等待设备上线。
-
+///
 /// create_emulator：创建/删除模拟器实例，或查询镜像/机型（Emulator.exe -create/-delete/-imageList/-screenProfileList）。
-
+///
 /// device_file：电脑与设备之间传输文件（hdc file send/recv，即 push/pull）。
-
+///
 /// 解析本地路径：绝对路径直接使用，相对路径基于工程根。
-
+///
 /// stop_app：强制停止设备上运行的应用进程（aa force-stop）。
-
+///
 /// device_shell 白名单：仅允许只读/查询类命令；破坏性命令一律拒绝。
 const DEVICE_SHELL_ALLOWED: &[&str] = &[
     "ps", "ls", "cat", "df", "free", "uptime", "date", "top", "netstat", "ip",
@@ -3061,17 +3059,17 @@ const DEVICE_SHELL_FORBIDDEN_TOKENS: &[&str] = &[
 
 /// 校验设备 shell 命令是否安全（四重校验），通过后返回分词结果。
 /// ① 字符集白名单（拒绝 shell 元字符）② 首命令白名单 ③ 破坏性命令词拦截 ④ aa/bm 仅允许 dump 查询。
-
+///
 /// device_shell：在设备上执行受限白名单 shell 命令（只读/查询类）。
-
+///
 /// analyze_crash：拉取设备 faultlog 最近的崩溃记录并归因（JS/Native/Freeze）。
-
+///
 /// 提取崩溃文件名的排序键：文件内嵌的 14 位数字时间戳（YYYYMMDDHHMMSS），无则取 0。
-
+///
 /// 提取崩溃文件的关键信息（类型/Reason/堆栈关键行）。
-
+///
 /// ohpm_search：在 ohpm 官方仓库搜索三方库（可选 ohpm info 详情）。
-
+///
 /// environment_check：一次性体检 HarmonyOS 开发环境（工具链/设备/代理/工程对齐）。
 async fn environment_check(
     args: &Value,
@@ -3751,7 +3749,7 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let key = project
-        .map(|p| crate::agent::todo::project_key(p))
+        .map(crate::agent::todo::project_key)
         .unwrap_or_else(|| ctx.conversation_id.clone());
     let todos = if merge {
         crate::agent::todo::merge(&key, items)
@@ -3853,9 +3851,7 @@ async fn job_template(args: &Value, roots: &[String]) -> Result<String, String> 
     let kind = crate::agent::jobs::project_kind(project_path);
     let tpls = crate::agent::jobs::templates(project_path);
     if tpls.is_empty() {
-        return Ok(format!(
-            "未识别到项目类型（未发现 hvigorfile.*/build-profile.json5 或 package.json），暂无预置模板。可先确认项目结构或手动指定构建命令。"
-        ));
+        return Ok("未识别到项目类型（未发现 hvigorfile.*/build-profile.json5 或 package.json），暂无预置模板。可先确认项目结构或手动指定构建命令。".to_string());
     }
     let mut out = format!("项目类型：{kind}（{} 条预置模板，可直接作为 run_command / run_in_background 的 command 参数）：\n", tpls.len());
     for t in &tpls {
@@ -3965,29 +3961,28 @@ async fn ask_user(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result
     result
 }
 
-/// git_stash：push/pop/list
-
+// git_stash：push/pop/list（工具清单，见下方对应实现）
 
 // ---------- 联网搜索 ----------
 
-/// 联网搜索：自动代理策略（有系统代理走代理，无则直连）。
-/// 优先 DuckDuckGo HTML，失败回退 Bing RSS。
-
-/// 简单 URL 编码（仅编码非 ASCII 与保留字符）
-
-/// GET 文本（自动代理客户端 + 状态检查 + 长度保护）
-
-/// HTML 实体反转义（&amp; &lt; &gt; &quot; &#39; &nbsp; 等）
-
-
-/// 解析 DuckDuckGo HTML：<a class="result__a" href="...">标题</a> + <a class="result__snippet">摘要</a>
-
-/// 解析 Bing RSS：<item><title>..</title><link>..</link><description>..</description></item>
-
-/// DuckDuckGo 跳转链接 /%3A 等解码为真实 URL
+// 联网搜索：自动代理策略（有系统代理走代理，无则直连）。
+// 优先 DuckDuckGo HTML，失败回退 Bing RSS。
+//
+// 简单 URL 编码（仅编码非 ASCII 与保留字符）
+//
+// GET 文本（自动代理客户端 + 状态检查 + 长度保护）
+//
+// HTML 实体反转义（&amp; &lt; &gt; &quot; &#39; &nbsp; 等）
 
 
-/// 格式化搜索结果（标题 / 链接 / 摘要）
+// 解析 DuckDuckGo HTML：<a class="result__a" href="...">标题</a> + <a class="result__snippet">摘要</a>
+//
+// 解析 Bing RSS：<item><title>..</title><link>..</link><description>..</description></item>
+//
+// DuckDuckGo 跳转链接 /%3A 等解码为真实 URL
+
+
+// 格式化搜索结果（标题 / 链接 / 摘要）
 
 // ---------- 文件系统工具（只读：目录浏览 / 文件读取 / 搜索） ----------
 
@@ -4256,7 +4251,6 @@ fn cleanup_tool_outputs(dir: &std::path::Path) {
 }
 
 /// list_dir：列出目录内容（深度 1-3，目录优先排序，跳过忽略目录）
-
 // ---------- 文件指纹乐观锁 ----------
 /// 记录 Agent 最后读/写某文件时的状态；写前对比检测外部修改
 /// （IDE 重构/用户手动编辑/其他会话），避免基于过期认知静默覆盖他人改动。
@@ -4393,8 +4387,7 @@ fn scan_recent_changes(roots: &[String], since: std::time::SystemTime, max: usiz
     out
 }
 
-/// read_file：读取文本文件（UTF-8 容错 + 二进制检测 + 行号切片）
-
+// read_file：读取文本文件（UTF-8 容错 + 二进制检测 + 行号切片）
 // ---------- Git 工具 ----------
 
 
@@ -4402,25 +4395,25 @@ fn scan_recent_changes(roots: &[String], since: std::time::SystemTime, max: usiz
 
 // ---------- Git 工具扩展 ----------
 
-/// git_log：提交历史（可选文件/目录过滤、提交信息关键词过滤）
-
-/// git_restore：丢弃工作区/暂存区改动（不可逆，L2 权限由对话审核层拦截）
-
-/// git_branch：分支查看/创建/切换
-
-/// git_blame：行级提交归属（可选行范围，输出截断保护）
-
-/// git_fetch：拉取远端最新引用（不合并、不改动工作区）
-
-/// git_pull：拉取远端并快速前进合并（ff-only），冲突/分叉时给出明确诊断。
-
-/// git_push：推送本地提交到远端（推送前检查未提交改动与落后状态）。
-
-/// review_changes：审查工作区未提交/已暂存改动——文件清单、增删统计与 diff 全文。
-
-/// 解析 git diff 文本，统计 (文件数, 新增行数, 删除行数)。
-
-/// git_tag：标签查看/创建（轻量标签）
+// git_log：提交历史（可选文件/目录过滤、提交信息关键词过滤）
+//
+// git_restore：丢弃工作区/暂存区改动（不可逆，L2 权限由对话审核层拦截）
+//
+// git_branch：分支查看/创建/切换
+//
+// git_blame：行级提交归属（可选行范围，输出截断保护）
+//
+// git_fetch：拉取远端最新引用（不合并、不改动工作区）
+//
+// git_pull：拉取远端并快速前进合并（ff-only），冲突/分叉时给出明确诊断。
+//
+// git_push：推送本地提交到远端（推送前检查未提交改动与落后状态）。
+//
+// review_changes：审查工作区未提交/已暂存改动——文件清单、增删统计与 diff 全文。
+//
+// 解析 git diff 文本，统计 (文件数, 新增行数, 删除行数)。
+//
+// git_tag：标签查看/创建（轻量标签）
 
 // ---------- 分级扫描 / 代码库检索 ----------
 
@@ -4493,7 +4486,7 @@ mod tests {
             "  }",
             "}",
         ];
-        let lines: Vec<&str> = src.iter().copied().collect();
+        let lines: Vec<&str> = src.to_vec();
         let out = super::fs_tools::render_outline(Path::new("Index.ets"), &lines, 500, 1, None);
         assert!(out.contains("装饰器"), "应识别 @Entry/@Component：{out}");
         assert!(out.contains("组件"), "应识别 struct Index：{out}");
@@ -4517,7 +4510,7 @@ mod tests {
             "",
             "fn helper() -> bool { true }",
         ];
-        let lines: Vec<&str> = src.iter().copied().collect();
+        let lines: Vec<&str> = src.to_vec();
         let out = super::fs_tools::render_outline(Path::new("a.rs"), &lines, 200, 1, None);
         assert!(out.contains("pub struct Foo"));
         assert!(out.contains("pub async fn run"));

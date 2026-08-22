@@ -86,12 +86,7 @@ pub fn estimate_messages_tokens(messages: &[serde_json::Value]) -> usize {
             Some(serde_json::Value::Array(parts)) => parts
                 .iter()
                 .filter_map(|p| {
-                    if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                        Some(estimate_text_tokens(t))
-                    } else {
-                        // 图片等非文本块：按 1200 token 估算（图片块大致开销）
-                        None
-                    }
+                    p.get("text").and_then(|t| t.as_str()).map(estimate_text_tokens)
                 })
                 .sum::<usize>()
                 // 非文本块计入固定开销
@@ -131,7 +126,7 @@ mod tests {
         let t = estimate_text_tokens("hello world this is a test message for token estimation");
         // 46 字母 + 10 词段开销 + 4 固定 ≈ 21 token；真实 tokenizer 约 12~14，
         // 我们"宁可高估"，量级接近且 ≥ 真实值即可。
-        assert!(t >= 15 && t <= 25, "英文量级应在 15~25，实际 {t}");
+        assert!((15..=25).contains(&t), "英文量级应在 15~25，实际 {t}");
     }
 
     #[test]
@@ -139,7 +134,7 @@ mod tests {
         let text = "调用 ohos.file.fs 的 openSync 打开文件，然后 readSync 读取内容，最后 closeSync 关闭。";
         let t = estimate_text_tokens(text);
         // 中文 30 字 + 英文标识符若干，量级 40 左右
-        assert!(t >= 30 && t <= 60, "混合文本量级应在 30~60，实际 {t}");
+        assert!((30..=60).contains(&t), "混合文本量级应在 30~60，实际 {t}");
     }
 
     #[test]

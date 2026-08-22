@@ -151,7 +151,7 @@ fn map_error(
 
     if let Some(conn) = official_db {
         let mut seen = BTreeSet::new();
-        for term in terms.iter().filter(|term| searchable_term(term)).take(5) {
+        for term in terms.iter().filter(searchable_term).take(5) {
             let query = crate::services::harmony_api_diff::SearchQuery {
                 keyword: Some(term.clone()),
                 limit: Some(4),

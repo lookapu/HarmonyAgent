@@ -103,7 +103,7 @@ fn adler32(data: &[u8]) -> u32 {
 /// 从 PNG 字节解码出下采样后的 RGB 位图。
 /// `max_dim` 控制返回图的最大边长（等比缩小），用于降低质检计算量。
 pub fn decode_png(data: &[u8], max_dim: u32) -> Result<Image, String> {
-    if data.len() < 8 || &data[0..8] != [137, 80, 78, 71, 13, 10, 26, 10] {
+    if data.len() < 8 || data[0..8] != [137, 80, 78, 71, 13, 10, 26, 10] {
         return Err("not a png".into());
     }
     let mut pos = 8;
@@ -163,7 +163,7 @@ pub fn decode_png(data: &[u8], max_dim: u32) -> Result<Image, String> {
     let step = ((width.max(height)) / max_dim).max(1) as usize;
     let out_w = (width as usize / step).max(1);
     let out_h = (height as usize / step).max(1);
-    let mut rgb = vec![0u8; (out_w * out_h * 3) as usize];
+    let mut rgb = vec![0u8; out_w * out_h * 3];
     let mut prev: Vec<u8> = vec![0; stride];
     for (y, row) in rows.iter().enumerate() {
         let filter = row[0];
@@ -222,7 +222,7 @@ pub fn analyze(img: &Image) -> ScreenCheck {
     let n = img.rgb.len() as f64 / 3.0;
     let mut sum = 0u64;
     for rgb in img.rgb.chunks(3) {
-        sum += ((rgb[0] as u64 + rgb[1] as u64 + rgb[2] as u64) / 3) as u64;
+        sum += (rgb[0] as u64 + rgb[1] as u64 + rgb[2] as u64) / 3;
     }
     let avg = sum as f64 / n;
     let mut var = 0u64;
@@ -248,7 +248,7 @@ fn inflate(input: &[u8]) -> Result<Vec<u8>, String> {
     }
     let cmf = input[0] as u16;
     let flg = input[1] as u16;
-    if (cmf * 256 + flg) % 31 != 0 {
+    if !(cmf * 256 + flg).is_multiple_of(31) {
         return Err("bad zlib header".into());
     }
     let mut out = Vec::new();
@@ -350,17 +350,11 @@ impl<'a> BitStream<'a> {
                         code_lens.push(last);
                     }
                 }
-                17 => {
-                    let rep = self.read_bits(3)? as usize + 3;
-                    for _ in 0..rep {
-                        code_lens.push(0);
-                    }
-                }
-                18 => {
-                    let rep = self.read_bits(7)? as usize + 11;
-                    for _ in 0..rep {
-                        code_lens.push(0);
-                    }
+                // 17/18：重复 0（长度码），仅重复位宽/基数不同
+                17 | 18 => {
+                    let (bits, base) = if sym == 17 { (3, 3) } else { (7, 11) };
+                    let rep = self.read_bits(bits)? as usize + base;
+                    code_lens.resize(code_lens.len() + rep, 0);
                 }
                 _ => code_lens.push(sym as u8),
             }

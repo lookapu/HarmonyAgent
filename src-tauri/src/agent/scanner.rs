@@ -2,9 +2,9 @@
 //!
 //! 对标主流 Agent 的扫描分层能力：
 //! - `check_code`      静态检查（规则式 lint）：调试残留 / TODO / 硬编码密钥 / 空 catch /
-//!                     类型逃逸 / 明文 http 等，返回 file:line + 规则 + 建议
+//!   类型逃逸 / 明文 http 等，返回 file:line + 规则 + 建议
 //! - `deep_scan`       深度扫描：全库结构 + 质量报告（扩展名分布 / 大文件 / 符号密度 /
-//!                     import 依赖拓扑 / 疑似死代码候选）
+//!   import 依赖拓扑 / 疑似死代码候选）
 //! - `codebase_search` 全库混合检索：符号名 + 路径 + 内容行三路匹配打分排序（无需向量库）
 //! - `get_symbol_details` 符号详情：定义信息 + 前置注释 + 全库引用位置反查
 //!
@@ -20,7 +20,7 @@ pub const SKIP_DIRS: [&str; 15] = [
 ];
 
 fn should_skip_dir(name: &str) -> bool {
-    SKIP_DIRS.iter().any(|s| *s == name)
+    SKIP_DIRS.contains(&name)
 }
 
 /// 源码文件扩展名（扫描对象；json5 参与结构统计但不参与规则检查）
@@ -55,11 +55,10 @@ fn walk(dir: &Path, root: &Path, max_size: u64, out: &mut Vec<std::path::PathBuf
             if !should_skip_dir(&name) {
                 walk(&p, root, max_size, out);
             }
-        } else if is_src_file(&name) {
-            if e.metadata().map(|m| m.len() <= max_size).unwrap_or(false) {
+        } else if is_src_file(&name)
+            && e.metadata().map(|m| m.len() <= max_size).unwrap_or(false) {
                 out.push(p.clone());
             }
-        }
     }
     let _ = root;
 }
@@ -318,7 +317,7 @@ pub fn deep_scan(root: &Path, path: Option<&str>) -> Result<String, String> {
         en.1 += lines;
         sized.push((rel(root, f), lines));
     }
-    sized.sort_by(|a, b| b.1.cmp(&a.1));
+    sized.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -328,7 +327,7 @@ pub fn deep_scan(root: &Path, path: Option<&str>) -> Result<String, String> {
         total_lines
     ));
     let mut exts: Vec<_> = ext_lines.into_iter().collect();
-    exts.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    exts.sort_by_key(|a| std::cmp::Reverse(a.1 .1));
     out.push_str("\n按扩展名分布：\n");
     for (ext, (n, l)) in &exts {
         out.push_str(&format!("  .{ext}: {n} 个文件 / {l} 行\n"));
@@ -347,13 +346,13 @@ pub fn deep_scan(root: &Path, path: Option<&str>) -> Result<String, String> {
         *by_file.entry(s.file.clone()).or_default() += 1;
     }
     let mut kinds: Vec<_> = by_kind.into_iter().collect();
-    kinds.sort_by(|a, b| b.1.cmp(&a.1));
+    kinds.sort_by_key(|a| std::cmp::Reverse(a.1));
     out.push_str(&format!("\n符号索引：共 {} 个符号。\n", syms.len()));
     for (k, n) in kinds.iter().take(10) {
         out.push_str(&format!("  {k}: {n}\n"));
     }
     let mut dense: Vec<_> = by_file.into_iter().collect();
-    dense.sort_by(|a, b| b.1.cmp(&a.1));
+    dense.sort_by_key(|a| std::cmp::Reverse(a.1));
     out.push_str("\n符号最密集的文件（Top 10）：\n");
     for (f, n) in dense.iter().take(10) {
         out.push_str(&format!("  {n} 个符号  {f}\n"));
@@ -379,7 +378,7 @@ pub fn deep_scan(root: &Path, path: Option<&str>) -> Result<String, String> {
         imports_of.insert(relf.clone(), deps);
     }
     // 本地文件 → 其他文件通过相对路径引用它的次数（目标归一化后按后缀包含匹配）
-    for (_from, deps) in &imports_of {
+    for deps in imports_of.values() {
         for d in deps {
             for to in imports_of.keys() {
                 let base = to.trim_end_matches(".ets").trim_end_matches(".ts");
@@ -390,13 +389,13 @@ pub fn deep_scan(root: &Path, path: Option<&str>) -> Result<String, String> {
         }
     }
     let mut hot: Vec<_> = imported_by.iter().collect();
-    hot.sort_by(|a, b| b.1.cmp(&a.1));
+    hot.sort_by_key(|a| std::cmp::Reverse(a.1));
     out.push_str("\n被引用最多的模块（Top 10）：\n");
     for (f, n) in hot.iter().take(10) {
         out.push_str(&format!("  {n} 次引用  {f}\n"));
     }
     let mut outdegree: Vec<_> = imports_of.iter().map(|(f, d)| (f, d.len())).collect();
-    outdegree.sort_by(|a, b| b.1.cmp(&a.1));
+    outdegree.sort_by_key(|a| std::cmp::Reverse(a.1));
     out.push_str("\n依赖最多的模块（Top 10）：\n");
     for (f, n) in outdegree.iter().take(10) {
         out.push_str(&format!("  {n} 个依赖  {f}\n"));
@@ -527,7 +526,7 @@ pub fn codebase_search(root: &Path, query: &str, limit: usize) -> Result<String,
     }
 
     let mut ranked: Vec<_> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    ranked.sort_by_key(|a| std::cmp::Reverse(a.1 .0));
     if ranked.is_empty() {
         return Ok(format!("未找到与 \"{query}\" 匹配的内容（已检索符号索引与源码内容）"));
     }
@@ -793,11 +792,10 @@ pub fn secret_scan(
                     if !should_skip_dir(&name) {
                         walk_conf(&p, root, out);
                     }
-                } else if is_secret_config_file(&name) {
-                    if e.metadata().map(|m| m.len() <= 512 * 1024).unwrap_or(false) {
+                } else if is_secret_config_file(&name)
+                    && e.metadata().map(|m| m.len() <= 512 * 1024).unwrap_or(false) {
                         out.push(p);
                     }
-                }
             }
             let _ = root;
         }

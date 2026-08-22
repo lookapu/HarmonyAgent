@@ -176,9 +176,8 @@ pub fn search(project_path: &str, max: usize, filter: Option<&str>, regex: Optio
         // 附带上下文行（不重复输出已输出的行）
         let lo = i.saturating_sub(ctx_n);
         let hi = (i + ctx_n + 1).min(window.len());
-        for j in lo..hi {
-            let line = window[j].as_str();
-            if out.last().map(|x: &String| x.as_str()) == Some(line) {
+        for (j, line) in window.iter().enumerate().take(hi).skip(lo) {
+            if out.last().map(String::as_str) == Some(line.as_str()) {
                 continue;
             }
             let marker = if j == i { "> " } else { "  " };

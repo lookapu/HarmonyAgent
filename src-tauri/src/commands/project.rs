@@ -513,8 +513,8 @@ pub struct HarmonyRootInfo {
 /// 2) 项目根本身是鸿蒙工程根 → 用项目根（常见单工程场景，优先于子模块候选）；
 /// 3) 未配置 → 若工作区恰好一个工程根级鸿蒙子工程，自动兜底使用它；
 /// 4) 否则回退到项目根本身。
-/// 工程根级判定见 harmony::is_project_root：AppScope/app.json5 存在，或 build-profile.json5 顶层含 "app" 键，
-/// 避免 entry 等纯模块目录（模块级 build-profile.json5 无 "app" 键）被误设为主工程导致 Bundle 名/SDK 识别失败。
+///    工程根级判定见 harmony::is_project_root：AppScope/app.json5 存在，或 build-profile.json5 顶层含 "app" 键，
+///    避免 entry 等纯模块目录（模块级 build-profile.json5 无 "app" 键）被误设为主工程导致 Bundle 名/SDK 识别失败。
 pub fn resolve_harmony_root(
     conn: &rusqlite::Connection,
     project_id: &str,

@@ -554,10 +554,8 @@ fn trunc_line(s: &str) -> String {
     }
 }
 
-/// get_diagnostics：返回近期构建/部署失败的结构化归因清单（进程内缓存，1 小时 TTL）
-
 pub(super) fn should_skip_dir(name: &str) -> bool {
-    SKIP_DIRS.iter().any(|s| *s == name)
+    SKIP_DIRS.contains(&name)
 }
 
 /// 人类可读文件大小
@@ -1731,7 +1729,7 @@ pub(super) fn starts_with_word(s: &str, word: &str) -> bool {
     if !s.starts_with(word) {
         return false;
     }
-    s.as_bytes().get(word.len()).map_or(true, |b| !b.is_ascii_alphanumeric() && *b != b'_')
+    s.as_bytes().get(word.len()).is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
 }
 
 pub(super) fn starts_with_any(s: &str, prefixes: &[&str]) -> bool {
@@ -1752,7 +1750,7 @@ pub(super) fn looks_like_method(line: &str) -> bool {
     if matches!(name, "if" | "for" | "while" | "switch" | "catch" | "when" | "return" | "else") {
         return false;
     }
-    name.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
 }
 
 pub(super) fn looks_like_arrow(line: &str) -> bool {
@@ -1765,7 +1763,7 @@ pub(super) fn looks_like_arrow(line: &str) -> bool {
         && name
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
 }
 
 // ---------- 语言感知的成对代码块 ----------
@@ -1914,7 +1912,7 @@ impl LineScanner {
             if regex_lang && c == '/' {
                 let next_is_comment = chars.peek().map(|(_, n)| *n) == Some('/') || chars.peek().map(|(_, n)| *n) == Some('*');
                 if !next_is_comment
-                    && self.prev_char.map_or(true, |p| matches!(p, '=' | '(' | ',' | ':' | '[' | '!' | '&' | '|' | '?' | ';' | '{' | '}' | '\n' | '+' | '-' | '*' | '%' | '<' | '>' | '~' | '^'))
+                    && self.prev_char.is_none_or(|p| matches!(p, '=' | '(' | ',' | ':' | '[' | '!' | '&' | '|' | '?' | ';' | '{' | '}' | '\n' | '+' | '-' | '*' | '%' | '<' | '>' | '~' | '^'))
                 {
                     self.in_regex = true;
                     self.in_regex_class = false;
@@ -2034,9 +2032,7 @@ pub(super) fn find_matching_close(lines: &[&str], open_idx: usize, ext: &str) ->
         if target.is_none() {
             // 开行处理完毕：目标 = 该行最后未闭合的开括号（若无 → 该行未真正开块）
             target = stack.last().copied();
-            if target.is_none() {
-                return None;
-            }
+            target?;
         } else if closed_target {
             return Some(i);
         }
@@ -4434,9 +4430,7 @@ mod tests {
     #[test]
     fn read_file_folds_long_comment_blocks() {
         // 10 行头注释 + 3 行代码：注释占比 77% → 长注释块折叠，代码可见
-        let content = format!(
-            "{}",
-            [
+        let content = [
                 "// 文件头说明",
                 "// 文件头说明",
                 "// 文件头说明",
@@ -4451,8 +4445,7 @@ mod tests {
                 "  let x = 1;",
                 "}",
             ]
-            .join("\n")
-        );
+            .join("\n").to_string();
         let (f, roots) = tmp_file("read_fold", &content, "rs");
         let rel = f.to_string_lossy().to_string();
         let args = serde_json::json!({"path": rel});

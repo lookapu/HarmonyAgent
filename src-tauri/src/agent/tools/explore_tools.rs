@@ -14,7 +14,7 @@ pub(super) fn extract_import_modules(line: &str) -> Vec<String> {
             let start = i + 1;
             if let Some(end_rel) = line[start..].find(quote as char) {
                 let m = &line[start..start + end_rel];
-                if m.starts_with('@') || m.starts_with('.') == false {
+                if m.starts_with('@') || !m.starts_with('.') {
                     out.push(m.to_string());
                 }
                 i = start + end_rel + 1;
@@ -112,7 +112,7 @@ pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<Strin
                 // 找到从当前页到 page_id 的点击
                 if let Some(&(_, cidx, _)) = actions_taken.iter().find(|(f, _, t)| *f == current_page_id.unwrap_or(0) && *t == *page_id) {
                     // 执行点击
-                    if let Err(_) = click_nth_clickable(&device, cidx).await {
+                    if click_nth_clickable(&device, cidx).await.is_err() {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -237,7 +237,7 @@ pub(super) async fn back_to_root(device: &str, root_signature: &str, max_back: u
         let _ = super::test_tools::execute_ui_step(device, &serde_json::json!({"action": "key", "name": "back"})).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         if let Some(sig) = page_signature_now(device).await {
-            if &sig == root_signature {
+            if sig == root_signature {
                 break;
             }
         }
@@ -461,7 +461,7 @@ pub(super) async fn refresh_api_db(
 pub(super) async fn search_api(args: &Value, roots: &[String], db: &crate::db::DbState) -> Result<String, String> {
     let env = crate::services::harmony_env::detect(db);
     let context = crate::services::sdk_api::project_api_context(
-        roots.first().map(|root| std::path::Path::new(root)),
+        roots.first().map(std::path::Path::new),
         args["product"].as_str(),
         env.default_api.as_deref(),
     );
@@ -717,7 +717,7 @@ pub(super) fn get_api_detail(args: &Value, roots: &[String], db: &crate::db::DbS
     }
     let env = crate::services::harmony_env::detect(db);
     let context = crate::services::sdk_api::project_api_context(
-        roots.first().map(|root| std::path::Path::new(root)),
+        roots.first().map(std::path::Path::new),
         args["product"].as_str(),
         env.default_api.as_deref(),
     );
@@ -1050,9 +1050,7 @@ pub(super) fn diff_api_versions(args: &Value, db: &crate::db::DbState) -> Result
     out.push_str("2. 删除的 API（removed）必须替换：用 search_api 查同名 API 的替代声明，或参考新版本的 release note。\n");
     out.push_str("3. 废弃的 API（deprecated）仍可用但将来会删除，建议逐步迁移到新接口。\n");
     out.push_str("4. 修改的 API（modified）注意签名/行为变化，重点回归相关功能。\n");
-    out.push_str(&format!(
-        "5. 用 get_api_detail 查具体 API 的用法、权限与示例；用 scan_api_compat 扫描本工程是否用到了高版本 API。\n"
-    ));
+    out.push_str("5. 用 get_api_detail 查具体 API 的用法、权限与示例；用 scan_api_compat 扫描本工程是否用到了高版本 API。\n");
 
     Ok(out)
 }

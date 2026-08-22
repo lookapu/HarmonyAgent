@@ -72,6 +72,7 @@ pub(super) async fn image_inspect(args: &Value, roots: &[String]) -> Result<Stri
 /// exe 并缓存到 %TEMP%\deveco-agent\ocr_v1.exe。输入：图片绝对路径；输出：单行 JSON
 /// （{text, line_count} 或 {error, detail}）。非 ASCII 字符全部转义为 \uXXXX，stdout 恒为
 /// ASCII，规避控制台代码页乱码。
+#[cfg(windows)]
 const OCR_CS: &str = r#"// Windows OCR (WinRT via .NET Framework interop).
 using System;
 using System.Linq;
@@ -226,7 +227,7 @@ pub(super) async fn ocr_image(args: &Value, roots: &[String]) -> Result<String, 
     #[cfg(not(windows))]
     {
         let _ = (path, ext);
-        return Err("ocr_image 仅支持 Windows（Windows.Media.Ocr）".into());
+        Err("ocr_image 仅支持 Windows（Windows.Media.Ocr）".into())
     }
     #[cfg(windows)]
     {

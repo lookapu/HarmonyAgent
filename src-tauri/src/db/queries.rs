@@ -74,7 +74,7 @@ pub fn get_provider(conn: &Connection, id: &str) -> Result<Option<Provider>, rus
         })
     })?;
 
-    Ok(rows.next().transpose()?)
+    rows.next().transpose()
 }
 
 pub fn insert_provider(conn: &Connection, p: &Provider) -> Result<(), rusqlite::Error> {
@@ -1063,7 +1063,7 @@ pub fn get_task_stats(conn: &Connection, project_id: &str, days: i64) -> Result<
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    by_error_kind.sort_by(|a, b| b.count.cmp(&a.count));
+    by_error_kind.sort_by_key(|a| std::cmp::Reverse(a.count));
 
     let effective = (total - cancelled).max(1);
     Ok(TaskStats {
@@ -1131,7 +1131,7 @@ pub fn project_id_by_path(conn: &Connection, path: &str) -> Result<Option<String
             && normalized[root.len()..].starts_with('/')
         {
             let len = root.len();
-            if best.as_ref().map_or(true, |(_, bl)| len > *bl) {
+            if best.as_ref().is_none_or(|(_, bl)| len > *bl) {
                 best = Some((row.0, len));
             }
         }

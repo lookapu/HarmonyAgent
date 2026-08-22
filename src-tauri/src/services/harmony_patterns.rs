@@ -794,25 +794,27 @@ mod tests {
             "describe('app', () => { it('works', () => {}) })",
         )
         .unwrap();
-        let mut model = HarmonySemanticModel::default();
-        model.modules = vec![
-            HarmonyModule {
-                name: "entry".into(),
-                rel_path: "entry".into(),
-                artifact_kind: "hap".into(),
+        let mut model = HarmonySemanticModel {
+            modules: vec![
+                HarmonyModule {
+                    name: "entry".into(),
+                    rel_path: "entry".into(),
+                    artifact_kind: "hap".into(),
+                    ..Default::default()
+                },
+                HarmonyModule {
+                    name: "shared".into(),
+                    rel_path: "shared".into(),
+                    artifact_kind: "har".into(),
+                    ..Default::default()
+                },
+            ],
+            products: vec![HarmonyProduct {
+                name: "default".into(),
                 ..Default::default()
-            },
-            HarmonyModule {
-                name: "shared".into(),
-                rel_path: "shared".into(),
-                artifact_kind: "har".into(),
-                ..Default::default()
-            },
-        ];
-        model.products = vec![HarmonyProduct {
-            name: "default".into(),
+            }],
             ..Default::default()
-        }];
+        };
         model.dependencies.push(HarmonyDependency {
             from_module: "entry".into(),
             name: "shared".into(),

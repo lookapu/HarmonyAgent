@@ -259,7 +259,7 @@ fn strip_md_link(s: &str) -> String {
     let s = {
         let trimmed = s.trim_start();
         let hash_count = trimmed.chars().take_while(|&c| c == '#').count();
-        if hash_count >= 1 && hash_count <= 6 {
+        if (1..=6).contains(&hash_count) {
             let rest = &trimmed[hash_count..];
             rest.strip_prefix(' ').unwrap_or(rest)
         } else {
@@ -313,7 +313,7 @@ fn plain_preview(text: &str, max: usize) -> String {
 pub fn index_docs(root: &Path) -> DocIndex {
     if let Ok(g) = CACHE.lock() {
         if let Some(idx) = g.as_ref() {
-            if idx.root.as_deref() == Some(&root.to_string_lossy().to_string()) {
+            if idx.root.as_deref() == Some(root.to_string_lossy().as_ref()) {
                 return idx.clone();
             }
         }

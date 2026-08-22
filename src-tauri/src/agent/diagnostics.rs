@@ -69,7 +69,7 @@ pub fn recent(project_key: &str, ttl_sec: i64) -> Vec<Diagnosis> {
     map.get(project_key)
         .map(|list| {
             let mut v = list.clone();
-            v.sort_by(|a, b| b.at.cmp(&a.at));
+            v.sort_by_key(|a| std::cmp::Reverse(a.at));
             v
         })
         .unwrap_or_default()

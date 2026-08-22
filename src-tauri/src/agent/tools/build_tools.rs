@@ -1341,7 +1341,7 @@ pub(super) async fn deploy(
         return Err(out);
     }
     // 记住本次使用的设备
-    let _ = std::env::set_var("DEVECO_DEFAULT_DEVICE", &device_id);
+    std::env::set_var("DEVECO_DEFAULT_DEVICE", &device_id);
     save_default_device(&device_id);
     Ok(out)
 }
@@ -1786,7 +1786,7 @@ pub(super) fn classify_deploy_error(output: &str, is_signed: bool) -> (String, S
         || lower.contains("install_failed_update_incompatible")
     {
         ("install_conflict", "设备上的同包名应用与当前 HAP 签名或更新身份冲突。先用 get_app_info 核对现有版本/签名；只有确认可丢弃旧应用和数据后才卸载重装，默认不得自动卸载。")
-    } else if is_signed == false
+    } else if !is_signed
         || lower.contains("signature")
         || lower.contains("sign verify")
         || lower.contains("9568339")
@@ -1880,7 +1880,7 @@ pub(super) async fn ohpm_search(
                     ecosystem_record,
                 ]));
             }
-            return Ok(out);
+            Ok(out)
         }
         Err(registry_error) => {
             // registry 结构变化或网络异常时保留旧 CLI 只读降级，不能丢掉可用性查询能力。
@@ -1890,7 +1890,7 @@ pub(super) async fn ohpm_search(
                 .map_err(|error| with_advice("ohpm_search", format!("{registry_error}；CLI 降级也失败：{error}")))?;
             fallback.push_str(view.trim_end());
             fallback.push_str("\n结论：仅确认 CLI 可查询，禁止据此宣称许可证、兼容性或安全性已通过。");
-            return Ok(fallback);
+            Ok(fallback)
         }
     }
 }
@@ -2035,11 +2035,11 @@ fn parse_profile_meta(bytes: &[u8]) -> serde_json::Value {
             continue;
         };
         let v = after[colon + 1..].trim_start();
-        if v.starts_with('"') {
-            if let Some(end) = v[1..].find('"') {
+        if let Some(rest) = v.strip_prefix('"') {
+            if let Some(end) = rest.find('"') {
                 meta.insert(
                     key.to_string(),
-                    serde_json::Value::String(v[1..1 + end].to_string()),
+                    serde_json::Value::String(rest[..end].to_string()),
                 );
             }
         } else if v.starts_with('[') {

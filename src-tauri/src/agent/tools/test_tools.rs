@@ -503,7 +503,7 @@ pub(super) async fn search_sdk_api(args: &Value, roots: &[String], db: &crate::d
         let idx = sdk_api::index_api_dir(&dir);
         let hits = sdk_api::search(&idx, &query, limit);
         let context = sdk_api::project_api_context(
-            roots_owned.first().map(|root| std::path::Path::new(root)),
+            roots_owned.first().map(std::path::Path::new),
             args_owned.get("product").and_then(|value| value.as_str()),
             env.default_api.as_deref(),
         );
@@ -576,7 +576,7 @@ pub(super) async fn read_sdk_api_module(args: &Value, roots: &[String], db: &cra
         }
         let env = crate::services::harmony_env::detect(&db2);
         let context = sdk_api::project_api_context(
-            roots_owned.first().map(|root| std::path::Path::new(root)),
+            roots_owned.first().map(std::path::Path::new),
             args_owned.get("product").and_then(|value| value.as_str()),
             env.default_api.as_deref(),
         );
@@ -830,14 +830,13 @@ pub(super) fn extract_python_symbols(text: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for line in text.lines() {
         let t = line.trim();
-        let (prefix, rest) = if t.starts_with("def ") {
-            (4, &t[4..])
-        } else if t.starts_with("class ") {
-            (6, &t[6..])
+        let rest = if let Some(rest) = t.strip_prefix("def ") {
+            rest
+        } else if let Some(rest) = t.strip_prefix("class ") {
+            rest
         } else {
             continue;
         };
-        let _ = prefix;
         if let Some(name) = rest.split(|c: char| !(c.is_alphanumeric() || c == '_')).next() {
             if !name.is_empty() && !name.starts_with('_') && !names.contains(&name.to_string()) {
                 names.push(name.to_string());

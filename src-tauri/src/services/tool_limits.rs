@@ -164,7 +164,7 @@ pub fn record_tool_call(conversation_id: &str, tool: &str, args: &str) {
 /// 获取重操作并发许可：无护栏的工具立即返回 None；有护栏的工具等待队列
 pub async fn acquire_gate(tool: &str) -> Option<OwnedSemaphorePermit> {
     let gate = gates().get(tool)?.clone();
-    Some(gate.acquire_owned().await.ok()?)
+    gate.acquire_owned().await.ok()
 }
 
 /// 获取动态命名信号量许可（如 per-device 部署门控）。同名共享容量为 1 的信号量，

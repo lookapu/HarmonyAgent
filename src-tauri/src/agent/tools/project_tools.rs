@@ -112,17 +112,17 @@ pub(crate) fn create_harmony_project_sync(
     // 根配置文件；copy_signing_from 时只注入已通过隔离校验的非敏感签名元数据。
     let root_bp_content = match &signing_json {
         Some(sig_json) => {
-            let out = fill(&TEMPLATE_ROOT_BUILD_PROFILE, &app_name, &bundle_name, &module, &sdk_version);
+            let out = fill(TEMPLATE_ROOT_BUILD_PROFILE, &app_name, &bundle_name, &module, &sdk_version);
             inject_signing_into_root_build_profile(&out, &sdk_version, sig_json, &signing_name)
         }
-        None => fill(&TEMPLATE_ROOT_BUILD_PROFILE, &app_name, &bundle_name, &module, &sdk_version),
+        None => fill(TEMPLATE_ROOT_BUILD_PROFILE, &app_name, &bundle_name, &module, &sdk_version),
     };
     push("build-profile.json5", &root_bp_content)?;
-    push("oh-package.json5", &fill(&TEMPLATE_ROOT_OH_PACKAGE, &app_name, &bundle_name, &module, &sdk_version))?;
-    push("hvigorfile.ts", &fill(&TEMPLATE_ROOT_HVIGORFILE, &app_name, &bundle_name, &module, &sdk_version))?;
+    push("oh-package.json5", &fill(TEMPLATE_ROOT_OH_PACKAGE, &app_name, &bundle_name, &module, &sdk_version))?;
+    push("hvigorfile.ts", &fill(TEMPLATE_ROOT_HVIGORFILE, &app_name, &bundle_name, &module, &sdk_version))?;
     // hvigor-config.json5 必须位于 hvigor/ 子目录（hvigor 按此路径查找，根目录同名字文件不生效）
-    push("hvigor/hvigor-config.json5", &fill(&TEMPLATE_HVIGOR_CONFIG, &app_name, &bundle_name, &module, &sdk_version))?;
-    push("code-linter.json5", &fill(&TEMPLATE_CODE_LINTER, &app_name, &bundle_name, &module, &sdk_version))?;
+    push("hvigor/hvigor-config.json5", &fill(TEMPLATE_HVIGOR_CONFIG, &app_name, &bundle_name, &module, &sdk_version))?;
+    push("code-linter.json5", &fill(TEMPLATE_CODE_LINTER, &app_name, &bundle_name, &module, &sdk_version))?;
     push(".gitignore", TEMPLATE_GITIGNORE)?;
     push(".hvigorignore", TEMPLATE_HVIGORIGNORE)?;
     push("README.md", &fill(TEMPLATE_README, &app_name, &bundle_name, &module, &sdk_version))?;

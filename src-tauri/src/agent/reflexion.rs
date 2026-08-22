@@ -174,7 +174,7 @@ pub fn analyze_conversation(conn: &Connection, conversation_id: &str) {
             by_tool.push((t.clone(), 1, out.clone()));
         }
     }
-    by_tool.sort_by(|a, b| b.1.cmp(&a.1));
+    by_tool.sort_by_key(|a| std::cmp::Reverse(a.1));
     let (tool, count, evidence) = by_tool[0].clone();
     let evidence_clean: String = evidence.split_whitespace().collect::<Vec<_>>().join(" ");
     let evidence_short: String = evidence_clean.chars().take(160).collect();
@@ -202,7 +202,7 @@ pub fn analyze_conversation(conn: &Connection, conversation_id: &str) {
         list.push(card);
         // 只留最近 6 张
         if list.len() > 6 {
-            list.sort_by(|a, b| b.at.cmp(&a.at));
+            list.sort_by_key(|a| std::cmp::Reverse(a.at));
             list.truncate(6);
         }
     }
@@ -237,7 +237,7 @@ pub fn query_cards() -> Vec<ReflexionCard> {
     let mut guard = cards();
     let list = guard.as_mut().unwrap();
     let mut sorted = list.clone();
-    sorted.sort_by(|a, b| b.at.cmp(&a.at));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.at));
     sorted
 }
 

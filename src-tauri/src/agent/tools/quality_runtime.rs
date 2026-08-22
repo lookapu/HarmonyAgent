@@ -331,7 +331,7 @@ pub async fn attach_debugger(
     let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).await.map_err(|e| format!("hdc pidof 失败: {e}"))?;
     let pid = pid_out.trim();
     if pid.is_empty() {
-        return Err(format!("应用未运行或 pidof 返回空（先 deploy 启动应用）"));
+        return Err("应用未运行或 pidof 返回空（先 deploy 启动应用）".to_string());
     }
 
     // 2) attach 调试器（hdc shell debuggerd attach <pid>，系统服务）
@@ -533,7 +533,7 @@ fn sample_from_schema(schema: &serde_json::Value, depth: usize) -> serde_json::V
         "array" => {
             let items = &schema["items"];
             if items.is_object() && !items.is_null() {
-                serde_json::json!([sample_from_schema(&items, depth + 1)])
+                serde_json::json!([sample_from_schema(items, depth + 1)])
             } else {
                 serde_json::json!([])
             }
@@ -609,7 +609,7 @@ fn path_template_to_regex(path: &str) -> String {
             }
         }
     }
-    re.push_str("$");
+    re.push('$');
     re
 }
 

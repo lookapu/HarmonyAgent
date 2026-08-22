@@ -108,15 +108,12 @@ fn lsp_entry() -> Option<PathBuf> {
 
 fn global_npm_root() -> Option<PathBuf> {
     // 尝试 `npm root -g`；失败时按常见布局猜测
-    for cand in [
+    [
         dirs_user_profile()?.join("AppData").join("Roaming").join("npm").join("node_modules"),
         PathBuf::from(r"C:\Program Files\nodejs\node_modules"),
-    ] {
-        if cand.join("@arkts").exists() {
-            return Some(cand);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|cand| cand.join("@arkts").exists())
 }
 
 fn dirs_user_profile() -> Option<PathBuf> {
@@ -308,7 +305,9 @@ impl LspConnection {
 impl Drop for LspConnection {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
+            // Drop 中无法 await；tokio 的 kill() 内部先同步 start_kill 发出信号，
+            // 丢弃 future 只表示不等待进程退出，信号已送达。
+            drop(child.kill());
         }
     }
 }

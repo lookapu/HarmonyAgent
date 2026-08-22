@@ -138,7 +138,7 @@ pub fn get_jdk_runtime_info(app: &tauri::AppHandle) -> JdkRuntimeInfo {
         });
     }
     // feature 号降序展示（21 在前，17 在后）
-    versions.sort_by(|a, b| b.feature.cmp(&a.feature));
+    versions.sort_by_key(|a| std::cmp::Reverse(a.feature.clone()));
     // 同一 feature 升级版与捆绑版并存时，升级版在前
     versions.sort_by_key(|v| if v.source == "upgraded" { 0 } else { 1 });
 

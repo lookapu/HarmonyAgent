@@ -921,7 +921,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("panic"), "{err}");
         // panic 被隔离：调用仍处 running，由恢复协议接管
-        assert_eq!(mark_stuck(&db_arc.lock().unwrap(), "p").unwrap(), true);
+        assert!(mark_stuck(&db_arc.lock().unwrap(), "p").unwrap());
         let state: String = db_arc
             .lock()
             .unwrap()

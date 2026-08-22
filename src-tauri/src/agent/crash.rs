@@ -67,7 +67,7 @@ fn parse_js_fault(text: &str, bundle: &str) -> Option<CrashReport> {
 
     let locations = extract_source_locations(&relevant);
 
-    let category = classify_js_exception(&lower, &exception);
+    let category = classify_js_exception(lower, &exception);
     let advice = advice_for(category).to_string();
 
     let summary = if message.is_empty() {

@@ -137,8 +137,7 @@ pub fn clone_knowledge(
         .into_iter()
         .chain(
             queries::list_knowledge(&conn, target_project_id.as_deref())
-                .map_err(|e| e.to_string())?
-                .into_iter(),
+                .map_err(|e| e.to_string())?,
         )
         .find(|e| e.id == id)
         .ok_or_else(|| "知识条目不存在".to_string())?;

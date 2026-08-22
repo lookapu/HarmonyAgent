@@ -114,9 +114,9 @@ pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<Stri
         } else if last_end >= 0 {
             out.push_str("...\n");
         }
-        for j in start..=end {
+        for (j, line) in lines.iter().enumerate().take(end + 1).skip(start) {
             let marker = if j == *idx { "▶" } else { " " };
-            out.push_str(&format!("{marker} {}\n", lines[j]));
+            out.push_str(&format!("{marker} {line}\n"));
         }
         last_end = end as isize;
     }
@@ -549,7 +549,7 @@ pub(super) async fn check_signature(args: &Value, roots: &[String]) -> Result<St
         None => None,
     };
 
-    let mut out = format!("签名诊断报告\n");
+    let mut out = "签名诊断报告\n".to_string();
 
     // 如果指定了本地 hap
     if let Some(hap) = &hap_path {
@@ -683,8 +683,7 @@ pub(super) async fn dump_battery(args: &Value, _roots: &[String]) -> Result<Stri
 pub(super) fn grep_number(text: &str, key: &str) -> Option<f64> {
     for line in text.lines() {
         let t = line.trim();
-        if t.starts_with(key) {
-            let rest = &t[key.len()..];
+        if let Some(rest) = t.strip_prefix(key) {
             return super::ui_tools::first_number(rest.trim_start_matches(':').trim());
         }
     }
@@ -694,8 +693,8 @@ pub(super) fn grep_number(text: &str, key: &str) -> Option<f64> {
 pub(super) fn grep_text<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     for line in text.lines() {
         let t = line.trim();
-        if t.starts_with(key) {
-            return Some(t[key.len()..].trim_start_matches(':').trim());
+        if let Some(rest) = t.strip_prefix(key) {
+            return Some(rest.trim_start_matches(':').trim());
         }
     }
     None
@@ -783,7 +782,7 @@ pub(super) async fn scan_api_compat(args: &Value, roots: &[String], db: &crate::
         }
     }
 
-    let mut out = format!("API 版本兼容性扫描\n");
+    let mut out = "API 版本兼容性扫描\n".to_string();
     out.push_str(&format!("扫描路径：{scan_path}\n"));
     out.push_str(&format!("目标 API 版本：{target_api}\n"));
     out.push_str(&format!("扫描文件数：{}\n", files.len()));
@@ -946,12 +945,12 @@ fn find_function_body(lines: &[String], target: &str) -> Option<usize> {
             return Some(i);
         }
         // 签名跨行：后续 3 行内找 {（排除注释行）
-        for j in (i + 1)..(i + 4).min(lines.len()) {
-            let tj = lines[j].trim_start();
+        for (j, tj) in lines.iter().enumerate().skip(i + 1).take(3) {
+            let tj = tj.trim_start();
             if tj.starts_with("//") {
                 continue;
             }
-            if lines[j].contains('{') {
+            if tj.contains('{') {
                 return Some(j);
             }
         }

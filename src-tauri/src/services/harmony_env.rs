@@ -337,7 +337,7 @@ fn parse_variant(variant_dir: &Path, name: &str, is_default: bool) -> Option<Sdk
                 continue;
             }
             if let Ok(num) = n.parse::<i64>() {
-                if latest.as_ref().map_or(true, |(m, _)| num > *m) {
+                if latest.as_ref().is_none_or(|(m, _)| num > *m) {
                     latest = Some((num, e.path()));
                 }
             }
@@ -983,8 +983,7 @@ fn extract_compatible(text: &str) -> Option<(String, Option<i64>)> {
     let colon = rest.find(':')?;
     let after = rest[colon + 1..].trim_start();
     // 字符串形式
-    if after.starts_with('"') {
-        let inner = &after[1..];
+    if let Some(inner) = after.strip_prefix('"') {
         let end = inner.find('"')?;
         let raw = inner[..end].trim().to_string();
         let num = parse_compatible_version(&raw);

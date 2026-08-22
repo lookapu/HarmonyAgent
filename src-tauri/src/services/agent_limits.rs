@@ -260,8 +260,7 @@ mod tests {
 
     #[test]
     fn invalid_values_rejected() {
-        let mut l = AgentLimits::default();
-        l.tool_call_limit = -2;
+        let mut l = AgentLimits { tool_call_limit: -2, ..AgentLimits::default() };
         assert!(l.normalize().is_err());
         l.tool_call_limit = MAX_LIMIT_VALUE + 1;
         assert!(l.normalize().is_err());
@@ -271,8 +270,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let mut l = AgentLimits::default();
-        l.tool_rounds = -1;
+        let mut l = AgentLimits { tool_rounds: -1, ..AgentLimits::default() };
         l.normalize().unwrap();
         let raw = serde_json::to_string(&l).unwrap();
         let back: AgentLimits = serde_json::from_str(&raw).unwrap();

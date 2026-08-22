@@ -35,6 +35,8 @@ pub fn acquire_lan_lock(data_dir: &std::path::Path) -> Option<std::fs::File> {
         .create(true)
         .read(true)
         .write(true)
+        // 锁文件不截断：内容无关紧要，只依赖文件存在与独占锁
+        .truncate(false)
         .open(&path)
         .ok()?;
     match file.try_lock_exclusive() {

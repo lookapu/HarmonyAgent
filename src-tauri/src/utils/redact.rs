@@ -133,7 +133,7 @@ pub fn redact_text(input: &str) -> String {
     // 邮箱（闭包替换，保留结构）
     let email_re = Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap();
     out = email_re
-        .replace_all(&out, |caps: &regex::Captures| mask_email(&caps[0], &caps))
+        .replace_all(&out, |caps: &regex::Captures| mask_email(&caps[0], caps))
         .into_owned();
     // 手机号：独立 token（前后非数字），避免遮蔽年份/编号
     let phone_re = Regex::new(r"(^|[^\d])(1[3-9]\d{9})([^\d]|$)").unwrap();

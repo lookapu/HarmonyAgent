@@ -788,7 +788,7 @@ pub async fn list_device_screenshots(
             });
         }
     }
-    items.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    items.sort_by_key(|a| std::cmp::Reverse(a.mtime));
     items.truncate(50);
     Ok(items)
 }

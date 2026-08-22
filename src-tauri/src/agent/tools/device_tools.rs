@@ -229,19 +229,16 @@ pub(super) async fn start_emulator(args: &Value) -> Result<String, String> {
     let mut seen = String::new();
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match run_cmd("hdc", &["list".into(), "targets".into()], None, 15).await {
-            Ok(t) => {
-                let now_set: std::collections::HashSet<String> = t
-                    .lines()
-                    .filter_map(|l| l.split_whitespace().next().map(String::from))
-                    .collect();
-                let new: Vec<&String> = now_set.difference(&before).collect();
-                if !new.is_empty() {
-                    seen = new.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
-                    break;
-                }
+        if let Ok(t) = run_cmd("hdc", &["list".into(), "targets".into()], None, 15).await {
+            let now_set: std::collections::HashSet<String> = t
+                .lines()
+                .filter_map(|l| l.split_whitespace().next().map(String::from))
+                .collect();
+            let new: Vec<&String> = now_set.difference(&before).collect();
+            if !new.is_empty() {
+                seen = new.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+                break;
             }
-            Err(_) => {}
         }
     }
     if seen.is_empty() {
@@ -558,7 +555,7 @@ pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<Stri
         }
     }
     // 3) 按文件名内嵌时间戳排序取最近 N 条
-    remote_files.sort_by(|a, b| crash_time_key(b).cmp(&crash_time_key(a)));
+    remote_files.sort_by_key(|a| std::cmp::Reverse(crash_time_key(a)));
     remote_files.truncate(limit);
     // 4) 拉取到本地并解析
     let base = if project_path.is_empty() {

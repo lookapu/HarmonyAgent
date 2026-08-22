@@ -194,8 +194,8 @@ async fn discover_kit_pages(
         }
 
         // 3) 仍无，数字子版本直接入口兜底（如 6.0.0 只有 apidiff-6001/6002/6003/6004，无 apidiff-600）
-        if apidiff_urls.is_empty() {
-            if digit.chars().all(|c| c.is_ascii_digit()) {
+        if apidiff_urls.is_empty()
+            && digit.chars().all(|c| c.is_ascii_digit()) {
                 for n in 1..=6 {
                     let u = format!("{BASE_URL}/apidiff-{digit}{n}");
                     if let Ok(b) = fetch_markdown(&format!("{u}.md")).await {
@@ -205,7 +205,6 @@ async fn discover_kit_pages(
                     }
                 }
             }
-        }
     }
 
     let mut out: Vec<(String, String, Option<u32>)> = Vec::new();

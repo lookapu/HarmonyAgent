@@ -132,9 +132,7 @@ pub async fn run_pre_hooks(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
         (*guard).clone()
     };
     for hook in hooks.iter() {
-        if let Err(intercept) = hook(inv).await {
-            return Err(intercept);
-        }
+        hook(inv).await?;
     }
     Ok(())
 }

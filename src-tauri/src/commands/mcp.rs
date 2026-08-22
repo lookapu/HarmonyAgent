@@ -76,7 +76,7 @@ pub async fn fetch_mcp_from_url(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("URL 返回 {status}: {}", &text.chars().take(200).collect::<String>()));
+        return Err(format!("URL 返回 {status}: {}", text.chars().take(200).collect::<String>()));
     }
     let text = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
     let json: serde_json::Value =
@@ -815,12 +815,12 @@ pub fn list_mcp_usage_stats(
         .into_values()
         .map(|(mut s, tools)| {
             let mut ts: Vec<McpToolUsage> = tools.into_values().collect();
-            ts.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+            ts.sort_by_key(|a| std::cmp::Reverse(a.call_count));
             s.tools = ts;
             s
         })
         .collect();
-    out.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+    out.sort_by_key(|a| std::cmp::Reverse(a.call_count));
     Ok(out)
 }
 

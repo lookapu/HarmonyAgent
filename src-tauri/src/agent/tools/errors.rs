@@ -533,6 +533,64 @@ pub(crate) fn with_advice_v2(tool: &str, err: String) -> String {
     ToolError::enrich(tool, err).to_envelope()
 }
 
+/// 一个可定位的错误条目（文件:行 + 信息）
+pub struct ErrorLocation {
+    pub file: Option<String>,
+    pub line: Option<i64>,
+    pub message: String,
+}
+
+/// 构建/部署等工具失败时的统一结构化信封。
+/// 模型在自动修复循环中可稳定解析 category 决定下一步工具、按 locations 逐个修文件，
+/// 比自由文本更不易"看完就忘"或盲目重复构建。
+pub fn structured_tool_error(
+    tool: &str,
+    category: &str,
+    summary: &str,
+    locations: &[ErrorLocation],
+    next_steps: &[&str],
+    log_path: Option<&str>,
+    raw_tail: &str,
+    knowledge: &[crate::services::harmony_knowledge::MatchedEntry],
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("【工具失败】{tool}\n"));
+    s.push_str(&format!("category: {category}\n"));
+    s.push_str(&format!("摘要: {summary}\n"));
+    if !locations.is_empty() {
+        s.push_str("定位（按此逐一 read_file + edit_file 修复，修完再重新构建）:\n");
+        for loc in locations {
+            let pos = match (&loc.file, loc.line) {
+                (Some(f), Some(l)) => format!("{f}:{l}"),
+                (Some(f), None) => f.clone(),
+                _ => "未知位置".to_string(),
+            };
+            s.push_str(&format!("- {pos}: {loc_message}\n", loc_message = loc.message));
+        }
+    }
+    if !knowledge.is_empty() {
+        s.push_str("知识库（团队经验，优先参考）:\n");
+        for k in knowledge {
+            s.push_str(&format!("- {}：{}\n", k.title, k.fix));
+        }
+    }
+    if !next_steps.is_empty() {
+        s.push_str("推荐下一步（按顺序）:\n");
+        for (i, step) in next_steps.iter().enumerate() {
+            s.push_str(&format!("{}. {step}\n", i + 1));
+        }
+    }
+    if let Some(p) = log_path {
+        s.push_str(&format!("完整日志: {p}\n"));
+    }
+    if !raw_tail.trim().is_empty() {
+        s.push_str("原始日志尾部:\n");
+        s.push_str(raw_tail.trim());
+        s.push('\n');
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests_v2 {
     use super::*;
@@ -593,62 +651,4 @@ mod tests_v2 {
         assert!(env.contains("可重试: 否"));
         assert!(env.contains("详情:"));
     }
-}
-
-/// 一个可定位的错误条目（文件:行 + 信息）
-pub struct ErrorLocation {
-    pub file: Option<String>,
-    pub line: Option<i64>,
-    pub message: String,
-}
-
-/// 构建/部署等工具失败时的统一结构化信封。
-/// 模型在自动修复循环中可稳定解析 category 决定下一步工具、按 locations 逐个修文件，
-/// 比自由文本更不易"看完就忘"或盲目重复构建。
-pub fn structured_tool_error(
-    tool: &str,
-    category: &str,
-    summary: &str,
-    locations: &[ErrorLocation],
-    next_steps: &[&str],
-    log_path: Option<&str>,
-    raw_tail: &str,
-    knowledge: &[crate::services::harmony_knowledge::MatchedEntry],
-) -> String {
-    let mut s = String::new();
-    s.push_str(&format!("【工具失败】{tool}\n"));
-    s.push_str(&format!("category: {category}\n"));
-    s.push_str(&format!("摘要: {summary}\n"));
-    if !locations.is_empty() {
-        s.push_str("定位（按此逐一 read_file + edit_file 修复，修完再重新构建）:\n");
-        for loc in locations {
-            let pos = match (&loc.file, loc.line) {
-                (Some(f), Some(l)) => format!("{f}:{l}"),
-                (Some(f), None) => f.clone(),
-                _ => "未知位置".to_string(),
-            };
-            s.push_str(&format!("- {pos}: {loc_message}\n", loc_message = loc.message));
-        }
-    }
-    if !knowledge.is_empty() {
-        s.push_str("知识库（团队经验，优先参考）:\n");
-        for k in knowledge {
-            s.push_str(&format!("- {}：{}\n", k.title, k.fix));
-        }
-    }
-    if !next_steps.is_empty() {
-        s.push_str("推荐下一步（按顺序）:\n");
-        for (i, step) in next_steps.iter().enumerate() {
-            s.push_str(&format!("{}. {step}\n", i + 1));
-        }
-    }
-    if let Some(p) = log_path {
-        s.push_str(&format!("完整日志: {p}\n"));
-    }
-    if !raw_tail.trim().is_empty() {
-        s.push_str("原始日志尾部:\n");
-        s.push_str(raw_tail.trim());
-        s.push('\n');
-    }
-    s
 }

@@ -62,6 +62,12 @@ pub struct ProxyServer {
     status: Arc<TokioMutex<ProxyStatus>>,
 }
 
+impl Default for ProxyServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyServer {
     pub fn new() -> Self {
         Self {

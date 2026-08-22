@@ -397,7 +397,7 @@ pub(super) async fn capture_ui_hierarchy(project_path: &str, device: &str) -> Re
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let dev_file = format!("/data/local/tmp/ui_dump_{}.json", ts);
-    run_hdc_shell(&device, &["uitest", "dumpLayout", "-p", &dev_file], 30).await
+    run_hdc_shell(device, &["uitest", "dumpLayout", "-p", &dev_file], 30).await
         .map_err(|e| format!("控件树导出失败：{e}"))?;
 
     let local_dir = if project_path.is_empty() {
@@ -840,11 +840,10 @@ pub(super) async fn get_installed_apps(args: &Value, _roots: &[String]) -> Resul
         if t.is_empty() || t.starts_with("ID:") || t.starts_with('[') || t.contains(':') && !t.contains('.') {
             continue;
         }
-        if t.contains('.') && !t.contains(' ') && !t.contains('{') {
-            if filter.is_empty() || t.to_lowercase().contains(&filter) {
+        if t.contains('.') && !t.contains(' ') && !t.contains('{')
+            && (filter.is_empty() || t.to_lowercase().contains(&filter)) {
                 pkgs.push(t.to_string());
             }
-        }
     }
 
     let mut out = format!("已安装应用（设备 {device}，共 {} 个", pkgs.len());
@@ -1083,7 +1082,7 @@ pub(super) async fn set_airplane_mode(args: &Value, _roots: &[String]) -> Result
     ];
     let mut errors: Vec<String> = Vec::new();
     for (name, cmd) in &attempts {
-        match run_hdc_shell(&device, &cmd, 10).await {
+        match run_hdc_shell(&device, cmd, 10).await {
             Ok(o) => {
                 let low = o.to_lowercase();
                 if !low.contains("not found") && !low.contains("unknown") && !low.contains("failed") && !low.contains("无此命令") {
@@ -1625,16 +1624,16 @@ pub(super) async fn analyze_hap_size(args: &Value, roots: &[String]) -> Result<S
         *category_sizes.entry(cat).or_insert(0) += size;
     }
 
-    file_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+    file_sizes.sort_by_key(|a| std::cmp::Reverse(a.1));
 
-    let mut out = format!("HAP 包大小分析报告\n");
+    let mut out = "HAP 包大小分析报告\n".to_string();
     out.push_str(&format!("文件：{hap_path}\n"));
     out.push_str(&format!("总大小：{}（{:.2} MB）\n", format_bytes(total_size), total_size as f64 / (1024.0 * 1024.0)));
     out.push_str(&format!("文件数：{}\n\n", file_sizes.len()));
 
     out.push_str("分类占比：\n");
     let mut sorted_cats: Vec<(&String, &u64)> = category_sizes.iter().collect();
-    sorted_cats.sort_by(|a, b| b.1.cmp(a.1));
+    sorted_cats.sort_by_key(|a| std::cmp::Reverse(a.1));
     for (cat, sz) in &sorted_cats {
         let pct = if total_size > 0 { (**sz as f64 / total_size as f64) * 100.0 } else { 0.0 };
         let bar_len = (pct / 5.0).round() as usize;
@@ -1712,10 +1711,10 @@ pub(super) fn size_diff(args: &Value, roots: &[String]) -> Result<String, String
         .filter_map(|(n, sa)| map_b.get(n).map(|sb| (*n, *sb as i64 - *sa as i64)))
         .filter(|(_, d)| *d < 0)
         .collect();
-    added.sort_by(|a, b| b.1.cmp(&a.1));
-    removed.sort_by(|a, b| b.1.cmp(&a.1));
-    grew.sort_by(|a, b| b.1.cmp(&a.1));
-    shrank.sort_by(|a, b| a.1.cmp(&b.1));
+    added.sort_by_key(|a| std::cmp::Reverse(a.1));
+    removed.sort_by_key(|a| std::cmp::Reverse(a.1));
+    grew.sort_by_key(|a| std::cmp::Reverse(a.1));
+    shrank.sort_by_key(|a| a.1);
 
     out.push_str(&format!("\n新增文件（{} 个）：\n", added.len()));
     for (n, s) in added.iter().take(top_n) {
