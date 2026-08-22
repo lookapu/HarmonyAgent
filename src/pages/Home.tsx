@@ -1370,19 +1370,52 @@ export default function Home() {
   )
   const persistUnreadMap = useRef<number | null>(null)
   useEffect(() => {
-    if (persistUnreadMap.current) cancelIdleCallback(persistUnreadMap.current)
-    persistUnreadMap.current = requestIdleCallback(() => {
-      setJSON(STORAGE_KEYS.UNREAD_MAP, unreadMap)
-    }, { timeout: 2000 })
+    // WKWebView 无 requestIdleCallback：守卫降级为 setTimeout（与符号预热同款策略）
+    const w = window as unknown as {
+      requestIdleCallback: (cb: () => void, o?: { timeout: number }) => number
+      cancelIdleCallback: (id: number) => void
+      setTimeout: (cb: () => void, ms?: number) => number
+      clearTimeout: (id: number) => void
+    }
+    const hasRic = 'requestIdleCallback' in window
+    if (persistUnreadMap.current) {
+      if (hasRic) w.cancelIdleCallback(persistUnreadMap.current)
+      else w.clearTimeout(persistUnreadMap.current)
+    }
+    if (hasRic) {
+      persistUnreadMap.current = w.requestIdleCallback(() => {
+        setJSON(STORAGE_KEYS.UNREAD_MAP, unreadMap)
+      }, { timeout: 2000 })
+    } else {
+      persistUnreadMap.current = w.setTimeout(() => {
+        setJSON(STORAGE_KEYS.UNREAD_MAP, unreadMap)
+      }, 500)
+    }
   }, [unreadMap])
   const unreadCount = currentConvId ? unreadMap[currentConvId] ?? 0 : 0
 
   /** idle 节流持久化滚动位置（scroll 高频事件下避免频繁写 localStorage） */
   const persistScrollPos = () => {
-    if (persistScrollPosRef.current) cancelIdleCallback(persistScrollPosRef.current)
-    persistScrollPosRef.current = requestIdleCallback(() => {
-      setJSON(STORAGE_KEYS.SCROLL_POS, scrollPosMapRef.current)
-    }, { timeout: 2000 })
+    const w = window as unknown as {
+      requestIdleCallback: (cb: () => void, o?: { timeout: number }) => number
+      cancelIdleCallback: (id: number) => void
+      setTimeout: (cb: () => void, ms?: number) => number
+      clearTimeout: (id: number) => void
+    }
+    const hasRic = 'requestIdleCallback' in window
+    if (persistScrollPosRef.current) {
+      if (hasRic) w.cancelIdleCallback(persistScrollPosRef.current)
+      else w.clearTimeout(persistScrollPosRef.current)
+    }
+    if (hasRic) {
+      persistScrollPosRef.current = w.requestIdleCallback(() => {
+        setJSON(STORAGE_KEYS.SCROLL_POS, scrollPosMapRef.current)
+      }, { timeout: 2000 })
+    } else {
+      persistScrollPosRef.current = w.setTimeout(() => {
+        setJSON(STORAGE_KEYS.SCROLL_POS, scrollPosMapRef.current)
+      }, 500)
+    }
   }
 
   const isNearBottom = () => {
