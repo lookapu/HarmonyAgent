@@ -24,6 +24,9 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install dependencies
         run: npm ci
       - name: Prepare clean-checkout Tauri config
@@ -31,6 +34,10 @@ jobs:
         run: node -e 'const fs=require("fs");const p="src-tauri/tauri.conf.json";const d=JSON.parse(fs.readFileSync(p,"utf8"));d.bundle.resources={};d.build.features=[];fs.writeFileSync(p,JSON.stringify(d,null,2))'
       - name: Frontend tests
         run: npm test
+      # Q-08：文档漂移门禁。数量、路径、接口必须与代码真源一致，
+      # 避免 README/ARCHITECTURE 等文档中的数字、链接与实现脱节。
+      - name: Documentation drift check (Q-08)
+        run: python scripts/check-docs.py
       - name: Frontend lint
         run: npm run lint
       - name: Frontend production build

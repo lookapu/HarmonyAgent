@@ -133,7 +133,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 286 个 Tauri IPC 入口 · 54 个 service 模块        │
-│  - agent/ 37 个顶层模块 · tools/ 29 文件 · 201 工具  │
+│  - agent/ 36 个顶层模块 · tools/ 29 文件 · 201 工具  │
 │  - SQLite + 75 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
@@ -143,7 +143,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 
 ```
 src-tauri/src/
-├── agent/                  # AI Agent 内核（37 个顶层模块）
+├── agent/                  # AI Agent 内核（36 个顶层模块）
 │   ├── runtime.rs           #   - Durable Run 状态机与事件游标
 │   ├── scheduler.rs         #   - 持久队列、Worker 租约与 fencing
 │   ├── coordinator.rs       #   - 执行步骤与恢复检查点

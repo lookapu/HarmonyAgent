@@ -49,7 +49,7 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 | 项目 | 实际值 |
 |---|---:|
 | Agent 对外工具 | 201 |
-| `agent/` 顶层模块（不含 `mod.rs`） | 37 |
+| `agent/` 顶层模块（不含 `mod.rs`） | 36 |
 | `agent/tools/` Rust 文件（含 `mod.rs`） | 30 |
 | `commands/` 命令模块（不含 `mod.rs`） | 36 |
 | `services/` 服务模块（不含 `mod.rs`） | 54 |
