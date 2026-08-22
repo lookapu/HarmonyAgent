@@ -96,7 +96,7 @@ import {
   EmptyState,
   ChatEmptyState,
 } from '../chat/components/messageBlocks'
-import { BranchSelector, ModelSettingsPopover, PlanCard, TaskOpsBadge } from '../chat/components/plan'
+import { ModelSettingsPopover, PlanCard, TaskOpsBadge } from '../chat/components/plan'
 import {
   ConversationRunStatus,
   RunningTaskOpsBadge,
@@ -4392,32 +4392,9 @@ export default function Home() {
                 {tokenStats.cost_cny > 0.001 && <span> · ¥{tokenStats.cost_cny.toFixed(2)}</span>}
               </span>
             )}
-            {currentProject && currentProject.path && gitBranches?.has_git && (
-              <BranchSelector current={gitBranches.current} branches={gitBranches.branches} onSwitch={switchBranch} />
-            )}
           </div>
-          {/* 顶栏右侧：模型切换（常驻）+ 更多操作折叠菜单 + 面板开关 */}
+          {/* 顶栏右侧：更多操作折叠菜单 + 面板开关 */}
           <div className="flex items-center gap-1.5">
-            {modelCatalog.length > 0 && (
-              <select
-                value={modelOptions.model_id ?? ''}
-                onChange={(e) => updateModelOptions({ ...modelOptions, model_id: e.target.value || undefined })}
-                title={t('home.switchModel')}
-                className="h-7 max-w-[8.5rem] rounded-lg modern-card border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)] transition-colors cursor-pointer"
-              >
-                <option value="">{t('provider.modelDefault')}</option>
-                {modelCatalog.map((g) => (
-                  <optgroup key={g.providerName} label={g.providerName}>
-                    {g.models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.display_name ?? m.model_id}
-                      </option>
-                    ))}
-                  </optgroup>
-                ))}
-              </select>
-            )}
-
             {currentConversation && (
               <div className="relative" ref={moreMenuRef}>
                 <button
@@ -5843,7 +5820,12 @@ export default function Home() {
                 </div>
 
                 {/* Git 变更摘要：当前工作区状态入口（点击跳转 Git 面板） */}
-                <OverviewGitSummary projectPath={convRoot ?? currentProject.path} onOpenGit={() => setRightTab('git')} />
+                <OverviewGitSummary
+                  projectPath={convRoot ?? currentProject.path}
+                  branches={gitBranches?.branches ?? null}
+                  onSwitchBranch={switchBranch}
+                  onOpenGit={() => setRightTab('git')}
+                />
 
                 {/* 工作区模块：混合工作区中识别到的各类型子工程（Vue/Java/Go/HarmonyOS 等），支持手动绑定 */}
                 {(() => {

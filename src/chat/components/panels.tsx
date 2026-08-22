@@ -7,6 +7,7 @@ import { terminalExec, terminalKill, terminalStatus } from '../../api/terminal'
 import Icon from '../../icons/Icon'
 import { AnsiText, hasAnsi } from '../../components/AnsiText'
 import { fmtElapsed } from '../chatUtils'
+import { BranchSelector } from './plan'
 
 /* ============ 概览信息行 ============ */
 export function OverviewRow({
@@ -34,8 +35,18 @@ export function OverviewRow({
   )
 }
 
-/** 概览 Git 变更摘要：当前分支 + 已跟踪/未跟踪计数，点击进入 Git 面板；非仓库时可一键初始化 */
-export function OverviewGitSummary({ projectPath, onOpenGit }: { projectPath: string; onOpenGit: () => void }) {
+/** 概览 Git 变更摘要：当前分支（可切换）+ 已跟踪/未跟踪计数，点击进入 Git 面板；非仓库时可一键初始化 */
+export function OverviewGitSummary({
+  projectPath,
+  branches,
+  onSwitchBranch,
+  onOpenGit,
+}: {
+  projectPath: string
+  branches: string[] | null
+  onSwitchBranch: (branch: string) => Promise<string | null>
+  onOpenGit: () => void
+}) {
   const { t } = useTranslation()
   const [info, setInfo] = useState<GitBranchInfo | null>(null)
   const [initBusy, setInitBusy] = useState(false)
@@ -82,7 +93,10 @@ export function OverviewGitSummary({ projectPath, onOpenGit }: { projectPath: st
       {info ? (
         info.is_repo ? (
           <div className="mt-2 space-y-1.5">
-            <OverviewRow icon="folder" label={t('home.gitBranch')} value={info.current} mono />
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-[var(--text-secondary)]">{t('home.gitBranch')}</span>
+              <BranchSelector current={info.current} branches={branches ?? []} onSwitch={onSwitchBranch} />
+            </div>
             <OverviewRow
               icon="check"
               label={t('home.gitChangedLabel')}
