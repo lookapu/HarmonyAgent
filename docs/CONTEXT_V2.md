@@ -132,10 +132,10 @@ Context V2 是投影层，不取代消息、事件、Run、工具结果或工作
 |---|---|---:|---:|---:|---:|
 | `balanced` | 默认/无法识别 | 15% | 12% | 13% | 15% |
 | `explore` | exploring/scan/research/analyze/探索/调研 | 15% | 12% | 13% | 20% |
-| `execute` | build/deploy/execute/implement/fix/执行/构建 | 15% | 16% | 13% | 13% |
-| `verify` | verify/test/accept/validate/验收/验证 | 15% | 12% | 16% | 14% |
+| `execute` | build/deploy/execute/implement/fix/recover/modify/edit/update/refactor/rewrite/执行/构建/修改/编辑/重构 | 15% | 16% | 13% | 13% |
+| `verify` | verify/test/accept/validate/deliver/summarize/report/验收/验证/交付/汇报 | 15% | 12% | 16% | 14% |
 
-实现为 `ContextBudgetV2::allocate_with_profile` + `BudgetProfile::from_phase`；持久化的 `budget_json` 仅作审计，读取时以当前阶段为准（`load_context_v2` / `persist_runtime_checkpoint` 共用同一推导）。
+实现为 `ContextBudgetV2::allocate_with_profile` + `BudgetProfile::from_goal_or_phase`（LC-30 统一分类器）：`agent_runs.phase` 实存运行状态（initializing/recovering/orchestrating），结构化阶段关键词优先、任务 goal 文本兜底推导，动态预算不再永远落在 Balanced；持久化的 `budget_json` 仅作审计，读取时以当前阶段为准（`load_context_v2` / `persist_runtime_checkpoint` 共用同一推导）。
 
 ## 7. 失效规则
 
@@ -207,8 +207,13 @@ Context V2 是投影层，不取代消息、事件、Run、工具结果或工作
 | `fact_flip_rate` | 事实翻转率 = 失效事实数 / 历史版本总数（同一事实反复变化） |
 | `corrected_count` | 摘要与结构化事实对账被纠正次数 |
 | `budget_usage_ratio` | 估算 token 占用 / 模型窗口（与发送口径一致） |
+| `summary_coverage` | 摘要覆盖消息占比（`summary_from/to_message_rowid` 游标链，LC-11） |
+| `summary_depth` | 真实摘要层级：0=无摘要 1=浅层(<50%) 2=中层(<85%) 3=深层(≥85%) |
+| `recent_invalidations` | 最近 5 条失效事实明细（`invalidation_reason`：superseded/项目切换/设备变化等），补全“为什么遗忘”入口 |
 
-退化判定（任一命中即 `degraded`，返回可执行建议）：压缩 ≥2 次（摘要层级加深）、对账纠正 ≥1 次、事实翻转率 >30%；占用 ≥85% 时提示接近窗口上限。前端在上下文面板展示健康度与建议，压缩事件（`chat-compact`）后自动刷新。
+退化判定（任一命中即 `degraded`，返回可执行建议）：摘要层级 ≥2（LC-34 起由覆盖游标链推导，压缩次数仅作辅助信号——次数多但游标未推进不判定退化）、对账纠正 ≥1 次、事实翻转率 >30%；占用 ≥85% 时提示接近窗口上限。前端在上下文面板展示健康度、失效明细与建议，压缩事件（`chat-compact`）后自动刷新。
+
+压缩预警与执行统一写入会话事件流（`context_compress` 事件，trigger=active/overflow/manual，LC-33）：Timeline 可回放压缩历史，度量“无预兆压缩”是否被预警改善。
 
 ## 13. 知识检索增强
 

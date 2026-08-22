@@ -94,17 +94,17 @@
 - [x] `LC-26` Workspace 上下文面板展示分层预算条（5 段色块）、画像标签、失效次数与会话健康度面板，压缩事件后自动刷新。
 - [x] `LC-27` 100+ 轮长会话压力回归：消息/事实翻转/压缩检查点/失效/对账交错 100 轮后，事实版本完整、预算不越界、游标单调（`long_session_100_round_stress_keeps_facts_and_budget_bounded`）。
 - [x] `LC-28` 知识检索多 token 模糊召回：拆 token 独立 LIKE 取并集，按 token 命中数 → 字符重叠度 → 历史命中数排序，单 token 退化为原精确 LIKE（`search_knowledge_fuzzy`）。
-- [x] `LC-29` 会话健康度与摘要退化检测：压缩次数/事实翻转率/对账纠正次数/预算占用四指标，退化判定（压缩 ≥2、纠正 ≥1、翻转 >30%）给出固定关键结论与开新会话建议（`get_session_health` + `076_session_health.sql`）。
+- [x] `LC-29` 会话健康度与摘要退化检测：压缩次数/事实翻转率/对账纠正次数/预算占 用四指标，退化判定（摘要层级 ≥2、纠正 ≥1、翻转 >30%，LC-34 起压缩次数仅作辅助 信号）给出固定关键结论与开新会话建议（`get_session_health` + `076_session_health.sql`）。
 
-### 3.7 长会话关联加强（审计发现，未实施）
+### 3.7 长会话关联加强（审计发现，已实施）
 
-全盘关联审计（2026-08-22）发现的可加强项，跨项依赖已标注；实施时须满足第 10 节完成定义：
+全盘关联审计（2026-08-22）发现的可加强项，全部落地（2026-08-22 关联加强批次，详见 [CONTEXT_V2.md](CONTEXT_V2.md) §12/§13 与 [EVALUATION_RUN_SNAPSHOTS.md](EVALUATION_RUN_SNAPSHOTS.md)）：
 
-- [ ] `LC-30` 统一任务阶段分类器：执行循环 `recommended_phase` 输出的结构化阶段（`capabilities.rs` `TaskPhase`：Explore/Modify/Verify/Deliver）直接映射预算画像与工具裁剪，`BudgetProfile::from_phase` 关键词猜测仅作无运行态读取兜底，避免两套阶段规则漂移。依赖 `LC-24`/`TC-09`。
-- [ ] `LC-31` 上下文面板展示事实失效原因明细（`invalidation_reason`：superseded/项目切换/设备变化等），补全“为什么遗忘”解释入口。依赖 `LC-26`/`LC-21`。
-- [ ] `LC-32` 核心指标表补充长会话退化指标（事实翻转率、退化预警次数），评测快照（`EVALUATION_RUN_SNAPSHOTS.md`）记录压缩与翻转计数，退化可度量。依赖 `LC-29`/`EC-14`。
-- [ ] `LC-33` 压缩预警事件写入会话事件流，度量预警后用户固定行为与“无预兆压缩”体验改善。依赖 `LC-25`/`LC-29`。
-- [ ] `LC-34` 健康度退化判定改用摘要覆盖游标链推导真实摘要层级（`LC-11` 游标链），压缩次数仅作辅助信号，替代“压缩 ≥2 次”启发式。依赖 `LC-29`/`LC-11`。
+- [x] `LC-30` 统一任务阶段分类器：核查发现执行循环 `recommended_phase` 仅在进程内、`agent_runs.phase` 实存运行状态（initializing/recovering/orchestrating），实施为 `BudgetProfile::from_goal_or_phase` 联合推导——结构化阶段优先、goal 关键词兜底，关键词与 `capabilities.rs` `TaskPhase` 语义对齐（Modify→Execute、Deliver→Verify、Recover→Execute），动态预算不再永远落在 Balanced。依赖 `LC-24`/`TC-09`。
+- [x] `LC-31` 上下文面板展示事实失效原因明细（`recent_invalidations`：superseded/项目切换/设备变化等，取自 `invalidation_reason`），补全“为什么遗忘”解释入口。依赖 `LC-26`/`LC-21`。
+- [x] `LC-32` 核心指标表补充长会话退化指标（事实翻转率、退化预警次数），评测快照（`EVALUATION_RUN_SNAPSHOTS.md`）记录压缩与翻转计数（`EvalLongSessionMetrics`，来自 EC-19 场景真实执行），退化可度量。依赖 `LC-29`/`EC-14`。
+- [x] `LC-33` 压缩预警事件写入会话事件流（`context_compress` 事件：主动/超限/手动三处统一留痕，Timeline 可回放），度量预警后用户固定行为与“无预兆压缩”体验改善。依赖 `LC-25`/`LC-29`。
+- [x] `LC-34` 健康度退化判定改用摘要覆盖游标链推导真实摘要层级（`summary_coverage`/`summary_depth`，LC-11 游标链），压缩次数仅作辅助信号，替代“压缩 ≥2 次”启发式。依赖 `LC-29`/`LC-11`。
 
 ## 4. 阶段二：Agent 工具链质量工程
 
@@ -228,7 +228,7 @@
 - [x] `EC-16` 建立真实失败样本回流流程，脱敏后转化为回归场景。校验、提炼、注册与门禁流程见 [失败样本回流](FAILURE_REFLOW.md)。
 - [x] `EC-17` 发布说明自动汇总迁移、工具协议、风险、兼容性和回滚方式。生成脚本为 `scripts/gen-release-notes.py`，已接入 release.yml 的 Create Release 步骤。
 - [x] `EC-18` 为数据库、工作流、Skill、工具协议和知识索引定义版本兼容策略。资产版本清单与验证入口为 `src-tauri/src/agent/versioning.rs`，策略见 [版本兼容策略](VERSION_COMPATIBILITY.md)。
-- [ ] `EC-19` 固定评测集增加 100 轮长会话压缩恢复用例（多次压缩 + 事实冲突后验收），纳入 EC-15 基线门禁，压力场景防回退。依赖 `LC-27`/`EC-13`/`EC-15`。
+- [x] `EC-19` 固定评测集增加 100 轮长会话压缩恢复用例（多次压缩 + 事实冲突后验收），纳入 EC-15 基线门禁，压力场景防回退。依赖 `LC-27`/`EC-13`/`EC-15`。
 
 ### 6.4 阶段验收
 
@@ -255,7 +255,7 @@
 | 维度 | 指标 | 目标方向 |
 |---|---|---|
 | 任务 | 最终任务完成率、一次完成率、人工介入次数 | 完成率上升、介入下降 |
-| 长会话 | 事实保持率、恢复成功率、错误继续率 | 保持与恢复上升，错误继续下降 |
+| 长会话 | 事实保持率、恢复成功率、错误继续率、事实翻转率、退化预警次数 | 保持与恢复上升，错误继续下降；翻转与预警下降 |
 | 工具 | 参数错误率、无效调用率、超时率、重复副作用率 | 持续下降，重复副作用接近零 |
 | 鸿蒙 | 构建修复率、真机部署成功率、诊断命中率 | 持续上升 |
 | 效率 | 完成耗时、Token、成本、工具调用次数 | 在完成质量不下降时降低 |
