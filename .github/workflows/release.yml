@@ -32,6 +32,10 @@ jobs:
       - name: Frontend production build
         run: npm run build
       - name: Rust tests
+        env:
+          # Windows 测试线程默认 2MB 栈：compose→run_tool 链在 debug 模式栈帧需求 2~3MB，
+          # 默认栈下 STATUS_STACK_OVERFLOW（macOS/Linux 默认 8MB 无此问题）
+          RUST_MIN_STACK: 8388608
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
       - name: Rust clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked
