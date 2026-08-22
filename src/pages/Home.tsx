@@ -1750,7 +1750,11 @@ export default function Home() {
   // 组件卸载时清理 rAF 与滚动位置持久化
   useEffect(() => {
     return () => {
-      if (persistScrollPosRef.current != null) cancelIdleCallback(persistScrollPosRef.current)
+      if (persistScrollPosRef.current != null) {
+        // WKWebView 无 cancelIdleCallback：与 persistScrollPos 分支一致地降级（#185 同批真机修复）
+        if ('cancelIdleCallback' in window) cancelIdleCallback(persistScrollPosRef.current)
+        else clearTimeout(persistScrollPosRef.current)
+      }
       streamScrollActiveRef.current = false
       if (streamScrollRafRef.current != null) cancelAnimationFrame(streamScrollRafRef.current)
     }
@@ -4913,7 +4917,7 @@ export default function Home() {
                       {t('home.ctxV2Badge', { count: ctxInfo.context_v2.fact_count })}
                     </button>
                     {ctxV2Open && ctxV2Detail && (
-                      <span className="absolute bottom-full left-0 z-50 mb-2 block w-96 max-h-96 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3 text-[11px] text-[var(--text-secondary)] shadow-xl">
+                      <span className="absolute bottom-full left-0 z-50 mb-2 block w-96 max-h-96 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] p-3 text-[11px] text-[var(--text-secondary)] shadow-xl">
                         <span className="mb-2 block font-medium text-[var(--text-primary)]">
                           {t('home.ctxV2PanelTitle')}
                         </span>
@@ -5779,7 +5783,7 @@ export default function Home() {
                       key={tb.key}
                       onClick={() => setRightTab(tb.key)}
                       title={tb.label}
-                      className={`relative flex items-center gap-2 h-9 shrink-0 rounded-lg text-[12.5px] font-medium transition-colors ${
+                      className={`flex items-center gap-2 h-9 shrink-0 rounded-lg text-[12.5px] font-medium transition-colors ${
                         active
                           ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                           : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
@@ -5787,12 +5791,6 @@ export default function Home() {
                     >
                       <Icon name={tb.icon} size={15} />
                       {!rightCompact && <span className="whitespace-nowrap">{tb.label}</span>}
-                      {active && (
-                        <span
-                          className="absolute left-1/2 -translate-x-1/2 bottom-0.5 w-4 h-[2px] rounded-full bg-[var(--accent)]"
-                          style={{ boxShadow: '0 0 6px var(--accent-glow)' }}
-                        />
-                      )}
                     </button>
                   )
                 })}
