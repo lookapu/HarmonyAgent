@@ -15,6 +15,7 @@
 - 新增统一资产版本清单：数据库、工具协议、Skill/工作流规范、知识索引与评测 schema 的当前版本、兼容承诺和迁移说明集中可查，发布说明与验证共用同一数据源。
 - 发布说明自动汇总：从 git 对比与 CHANGELOG 生成迁移清单、工具协议变更、资产版本、风险与回滚方式，release.yml 发布流程自动使用。
 - 新增文档漂移门禁 `scripts/check-docs.py`：从代码真源提取工具/迁移/IPC/模块数量并与 README、架构文档逐模式比对，校验路线图与 docs 内链接、代码路径引用及 CI 工作流引用的测试和脚本；接入 quality.yml 双平台门禁，文档与实现脱节时合并被阻断。
+- 告警收敛与不新增基线门禁（Q-07）：ESLint 9 项告警清零（react-hooks 真修复与带原因豁免，`--max-warnings 0` 阻断回退）；Clippy 338 → 44（clippy --fix 两轮收敛 221 项机械告警，批量 sort_by_key 转换，修复锁文件截断语义、Drop 中进程终止等疑似真 bug，文档格式批量规范化），剩余 44 项全为结构类（too_many_arguments 31 + type_complexity 13）保留为基线；`scripts/check-warnings.py` 按 (lint, 位置) 去重统计 clippy 唯一告警并接入 quality.yml，新增告警立即阻断。
 
 - 建立 `agent_harmony_fixed_v3` 固定评测集：16 个可靠性场景与 10 个鸿蒙场景统一运行，覆盖真实工程创建内核、编译 API 归因、跨模块影响、录制真机 faultlog、混合工程和长会话恢复。
 - 新增可解释的鸿蒙指纹报告，把工程清单、ArkTS/ArkUI、`@kit.*` / `@ohos.*` 和构建/崩溃日志证据接入 `get_project_info` 与能力包选择，同时保留普通 TypeScript 负例和“不得由导入风格猜测精确 API Level”的边界。

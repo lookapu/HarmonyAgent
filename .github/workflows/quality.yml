@@ -39,7 +39,7 @@ jobs:
       - name: Documentation drift check (Q-08)
         run: python scripts/check-docs.py
       - name: Frontend lint
-        run: npm run lint
+        run: npm run lint -- --max-warnings 0
       - name: Frontend production build
         run: npm run build
       - name: Rust tests
@@ -76,3 +76,8 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --test tool_worker_crash_e2e -- --test-threads=1
       - name: Rust clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked
+      # Q-07：告警基线门禁。clippy 唯一告警数（按 lint+位置去重）超过基线即阻断；
+      # 基线 44 = Q-07 收敛后剩余的结构类告警（too_many_arguments 31 +
+      # type_complexity 13），新增任何告警必须修复或显式更新基线。
+      - name: Clippy warning baseline gate (Q-07)
+        run: python scripts/check-warnings.py --baseline 44
