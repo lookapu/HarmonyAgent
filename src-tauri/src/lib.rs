@@ -429,6 +429,7 @@ pub fn run() {
             commands::chat::compact_conversation,
             commands::chat::conversation_context,
             commands::chat::get_conversation_context_v2,
+            commands::chat::get_session_health,
             commands::chat::set_conversation_context_pin,
             commands::chat::get_session_events,
             commands::chat::get_latest_agent_run,

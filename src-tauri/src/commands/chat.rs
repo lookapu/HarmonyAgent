@@ -4438,6 +4438,8 @@ async fn stream_chat_inner(
                     "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
                     params![history_limit as i64, conversation_id],
                 );
+                // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
+                crate::agent::context::bump_compress_count(&conn, &conversation_id);
             }
             let _ = app.emit(
                 "chat-compact",
@@ -4687,6 +4689,8 @@ async fn stream_chat_inner(
                         "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
                         params![history_limit as i64, conversation_id],
                     );
+                    // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
+                    crate::agent::context::bump_compress_count(&conn, &conversation_id);
                 }
                 let _ = app.emit(
                     "chat-compact",
@@ -9913,6 +9917,73 @@ pub fn get_conversation_context_v2(
     crate::agent::context::load_context_v2(&conn, &conversation_id, context_limit)
 }
 
+/// 查询会话健康度与摘要退化预警（长会话可观测性，口径见 compute_session_health）。
+#[tauri::command]
+pub fn get_session_health(
+    conversation_id: String,
+    state: State<'_, DbState>,
+) -> Result<crate::agent::context::SessionHealthV2, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let context_limit: i64 = conn
+        .query_row(
+            "SELECT COALESCE((SELECT context_limit FROM models WHERE id=conversations.model_id),200000)
+             FROM conversations WHERE id=?1",
+            [&conversation_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(200_000);
+    // 与 conversation_context 命令同口径的估算：压缩过的会话按"摘要 + 最近 compact_keep 条"
+    let summary: Option<String> = conn
+        .query_row(
+            "SELECT summary FROM conversations WHERE id = ?1",
+            [&conversation_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    let compact_keep: Option<i64> = conn
+        .query_row(
+            "SELECT compact_keep FROM conversations WHERE id = ?1",
+            [&conversation_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let total_chars: i64 = match compact_keep {
+        Some(k) if k > 0 => {
+            let summary_chars = summary
+                .as_deref()
+                .map(|s| s.chars().count() as i64)
+                .unwrap_or(0);
+            let recent_chars: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM (
+                         SELECT content FROM messages
+                         WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0
+                         ORDER BY created_at DESC, rowid DESC LIMIT ?2
+                     )",
+                    params![conversation_id, k],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            summary_chars + recent_chars
+        }
+        _ => conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages
+                 WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0",
+                [&conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?,
+    };
+    crate::agent::context::compute_session_health(
+        &conn,
+        &conversation_id,
+        context_limit,
+        total_chars / 2,
+    )
+}
+
 /// 固定或解除固定关键消息、决策、文件和验收条件。
 #[tauri::command]
 pub fn set_conversation_context_pin(
@@ -11012,6 +11083,8 @@ pub async fn compact_conversation(
             params![summary, keep as i64, now(), conversation_id],
         )
         .map_err(|e| e.to_string())?;
+        // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
+        crate::agent::context::bump_compress_count(&conn, &conversation_id);
         crate::agent::context::persist_runtime_checkpoint(
             &conn,
             &conversation_id,

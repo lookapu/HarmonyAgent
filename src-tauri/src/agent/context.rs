@@ -137,17 +137,97 @@ pub struct ContextBudgetV2 {
     pub project_tokens: i64,
     pub archive_tokens: i64,
     pub hot_tokens: i64,
+    #[serde(default = "default_budget_profile")]
+    pub profile: String,
+}
+
+fn default_budget_profile() -> String {
+    BudgetProfile::Balanced.name().into()
+}
+
+/// 预算画像：长会话不同阶段对历史归档、任务状态与项目事实的侧重不同。
+/// 静态比例（CONTEXT_V2.md §6）在探索期浪费预算在任务状态上、在执行期浪费在历史检索上，
+/// 动态画像按当前任务阶段调整各区域占比，热窗口始终吸收剩余预算。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BudgetProfile {
+    Balanced,
+    /// 探索/调研/分析：历史归档检索更重要（archive 20%）
+    Explore,
+    /// 执行/构建/修复：任务状态与下一步更重要（task 16%）
+    Execute,
+    /// 验收/验证/测试：事实与产物更重要（project 16%）
+    Verify,
+}
+
+impl BudgetProfile {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BudgetProfile::Balanced => "balanced",
+            BudgetProfile::Explore => "explore",
+            BudgetProfile::Execute => "execute",
+            BudgetProfile::Verify => "verify",
+        }
+    }
+
+    /// (system, task, project, archive) 占输入预算的百分比；hot 吸收剩余。
+    fn ratios(&self) -> (i64, i64, i64, i64) {
+        match self {
+            BudgetProfile::Balanced => (15, 12, 13, 15),
+            BudgetProfile::Explore => (15, 12, 13, 20),
+            BudgetProfile::Execute => (15, 16, 13, 13),
+            BudgetProfile::Verify => (15, 12, 16, 14),
+        }
+    }
+
+    /// 从任务阶段推导画像：无法识别时回退 Balanced。
+    pub fn from_phase(phase: &str) -> BudgetProfile {
+        let p = phase.to_ascii_lowercase();
+        if p.contains("explor")
+            || p.contains("scan")
+            || p.contains("research")
+            || p.contains("analyz")
+            || p.contains("探索")
+            || p.contains("调研")
+        {
+            BudgetProfile::Explore
+        } else if p.contains("build")
+            || p.contains("deploy")
+            || p.contains("execut")
+            || p.contains("implement")
+            || p.contains("fix")
+            || p.contains("执行")
+            || p.contains("构建")
+        {
+            BudgetProfile::Execute
+        } else if p.contains("verif")
+            || p.contains("test")
+            || p.contains("accept")
+            || p.contains("valid")
+            || p.contains("验收")
+            || p.contains("验证")
+        {
+            BudgetProfile::Verify
+        } else {
+            BudgetProfile::Balanced
+        }
+    }
 }
 
 impl ContextBudgetV2 {
     pub fn allocate(total_tokens: i64) -> Self {
+        Self::allocate_with_profile(total_tokens, BudgetProfile::Balanced)
+    }
+
+    /// 按预算画像分配：输出预留八分之一，输入按画像比例切分，hot 吸收剩余。
+    pub fn allocate_with_profile(total_tokens: i64, profile: BudgetProfile) -> Self {
         let total_tokens = total_tokens.max(4_096);
         let reserved_output_tokens = (total_tokens / 8).clamp(1_024, 16_384);
         let input = total_tokens.saturating_sub(reserved_output_tokens);
-        let system_tokens = input * 15 / 100;
-        let task_tokens = input * 12 / 100;
-        let project_tokens = input * 13 / 100;
-        let archive_tokens = input * 15 / 100;
+        let (system_ratio, task_ratio, project_ratio, archive_ratio) = profile.ratios();
+        let system_tokens = input * system_ratio / 100;
+        let task_tokens = input * task_ratio / 100;
+        let project_tokens = input * project_ratio / 100;
+        let archive_tokens = input * archive_ratio / 100;
         let hot_tokens = input
             .saturating_sub(system_tokens)
             .saturating_sub(task_tokens)
@@ -161,6 +241,7 @@ impl ContextBudgetV2 {
             project_tokens,
             archive_tokens,
             hot_tokens,
+            profile: profile.name().into(),
         }
     }
 
@@ -1386,7 +1467,7 @@ pub fn load_context_v2(
         from_rowid,
         to_rowid,
         event_seq,
-        budget,
+        _budget,
         facts_digest,
         epoch,
         updated_at,
@@ -1442,6 +1523,9 @@ pub fn load_context_v2(
         )
     };
 
+    // 预算按当前任务阶段动态分配（持久化 budget_json 仅作审计，读取时以当前阶段为准）
+    let budget =
+        ContextBudgetV2::allocate_with_profile(context_limit, BudgetProfile::from_phase(&task.phase));
     Ok(ConversationContextV2 {
         schema_version,
         conversation_id: conversation_id.to_string(),
@@ -1637,7 +1721,10 @@ pub fn persist_runtime_checkpoint(
     context_limit: i64,
 ) -> Result<(), String> {
     let task = capture_task_snapshot(conn, conversation_id)?;
-    let budget = ContextBudgetV2::allocate(context_limit);
+    let budget = ContextBudgetV2::allocate_with_profile(
+        context_limit,
+        BudgetProfile::from_phase(&task.phase),
+    );
     let (summary_from_message_rowid, summary_to_message_rowid) =
         if summary.is_some_and(|value| !value.trim().is_empty()) {
             conn.query_row(
@@ -1675,6 +1762,152 @@ pub fn persist_runtime_checkpoint(
             budget: &budget,
         },
     )
+}
+
+/// 会话健康度指标（长会话可观测性）：压缩次数、事实翻转率、对账纠正次数与预算占用。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionHealthV2 {
+    pub conversation_id: String,
+    pub message_count: i64,
+    pub compress_count: i64,
+    pub last_compress_at: Option<i64>,
+    pub active_facts: i64,
+    pub invalidated_facts: i64,
+    pub fact_versions: i64,
+    pub fact_flip_rate: f64,
+    pub reconciliation_count: i64,
+    pub corrected_count: i64,
+    pub budget_usage_ratio: f64,
+    pub degraded: bool,
+    pub advice: Vec<String>,
+}
+
+/// 递增会话压缩计数（主动压缩/超限压缩/手动压缩共用，074 迁移新增列）。
+/// 写入失败静默忽略（健康度不能影响压缩主流程）。
+pub fn bump_compress_count(conn: &Connection, conversation_id: &str) {
+    // state 行可能尚未创建（未 checkpoint 过），用 UPSERT 保证计数生效
+    let _ = conn.execute(
+        "INSERT INTO conversation_context_state
+         (conversation_id,schema_version,compress_count,last_compress_at,created_at,updated_at)
+         VALUES (?1,?2,1,?3,?3,?3)
+         ON CONFLICT(conversation_id) DO UPDATE SET
+           compress_count=compress_count+1,last_compress_at=excluded.last_compress_at,
+           updated_at=excluded.updated_at",
+        params![conversation_id, CONTEXT_SCHEMA_VERSION, now_ms()],
+    );
+}
+
+/// 计算会话健康度并做摘要退化检测。
+///
+/// 指标口径：
+/// - `compress_count`：上下文压缩次数（state 表计数，三处压缩统一递增）；
+/// - `fact_flip_rate`：事实翻转率 = 失效事实数 / 历史版本总数（同一事实反复变化）；
+/// - `corrected_count`：摘要与结构化事实对账被纠正次数；
+/// - `budget_usage_ratio`：估算 token 占用 / 模型窗口（调用方按发送口径传入）。
+///
+/// 退化判定（任一命中即 `degraded`）：压缩 ≥2 次（摘要层级加深）、对账纠正 ≥1 次、
+/// 事实翻转率 >30%。命中时给出可执行建议（固定关键结论 / 开新会话）。
+pub fn compute_session_health(
+    conn: &Connection,
+    conversation_id: &str,
+    context_limit: i64,
+    estimated_tokens: i64,
+) -> Result<SessionHealthV2, String> {
+    let message_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1 AND queued=0",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let (compress_count, last_compress_at): (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT COALESCE(compress_count,0),last_compress_at
+             FROM conversation_context_state WHERE conversation_id=?1",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or((0, None));
+    let fact_versions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_context_facts WHERE conversation_id=?1",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let active_facts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_context_facts
+             WHERE conversation_id=?1 AND invalidated_at IS NULL",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let invalidated_facts = fact_versions.saturating_sub(active_facts);
+    let fact_flip_rate = if fact_versions > 0 {
+        invalidated_facts as f64 / fact_versions as f64
+    } else {
+        0.0
+    };
+    let (reconciliation_count, corrected_count): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN status='corrected' THEN 1 ELSE 0 END),0)
+             FROM conversation_context_reconciliations WHERE conversation_id=?1",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or((0, 0));
+    let budget_usage_ratio = if context_limit > 0 {
+        (estimated_tokens as f64 / context_limit as f64).clamp(0.0, 1.5)
+    } else {
+        0.0
+    };
+
+    let mut degraded = false;
+    let mut advice = Vec::new();
+    if compress_count >= 2 {
+        degraded = true;
+        advice.push("会话已压缩多次，早期细节可能只保留在摘要中".into());
+    }
+    if corrected_count >= 1 {
+        degraded = true;
+        advice.push("摘要与结构化事实发生过冲突纠正，请核对摘要是否忠实".into());
+    }
+    if fact_flip_rate > 0.3 {
+        degraded = true;
+        advice.push(format!(
+            "事实翻转率 {:.0}%，同一事实多次变化，建议确认当前状态",
+            fact_flip_rate * 100.0
+        ));
+    }
+    if budget_usage_ratio >= 0.85 {
+        advice.push(format!(
+            "上下文占用约 {:.0}%，接近窗口上限",
+            budget_usage_ratio * 100.0
+        ));
+    }
+    if degraded {
+        advice.push("建议对关键结论使用固定（pin）防止被压缩覆盖，必要时开新会话".into());
+    }
+    Ok(SessionHealthV2 {
+        conversation_id: conversation_id.to_string(),
+        message_count,
+        compress_count,
+        last_compress_at,
+        active_facts,
+        invalidated_facts,
+        fact_versions,
+        fact_flip_rate,
+        reconciliation_count,
+        corrected_count,
+        budget_usage_ratio,
+        degraded,
+        advice,
+    })
 }
 
 fn load_active_facts(
@@ -1975,6 +2208,8 @@ mod tests {
         ))
         .unwrap();
         conn.execute_batch(include_str!("../../migrations/067_context_pins.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/076_session_health.sql"))
             .unwrap();
     }
 
@@ -2518,5 +2753,186 @@ mod tests {
             assert!(reconciled.facts.iter().any(|item| item.fact_key == "git_head" && item.value == serde_json::json!("head-b")));
         }
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn budget_profiles_follow_phase_and_never_exceed_window() {
+        let total = 200_000;
+        for profile in [
+            BudgetProfile::Balanced,
+            BudgetProfile::Explore,
+            BudgetProfile::Execute,
+            BudgetProfile::Verify,
+        ] {
+            let b = ContextBudgetV2::allocate_with_profile(total, profile);
+            let sum = b.system_tokens
+                + b.task_tokens
+                + b.project_tokens
+                + b.archive_tokens
+                + b.hot_tokens;
+            assert!(sum <= b.input_tokens(), "{:?} 超出输入窗口", profile);
+            assert_eq!(b.profile, profile.name());
+        }
+        // 阶段 → 画像推导
+        assert_eq!(
+            BudgetProfile::from_phase("exploring_harmony_sdk"),
+            BudgetProfile::Explore
+        );
+        assert_eq!(BudgetProfile::from_phase("build_sign_hap"), BudgetProfile::Execute);
+        assert_eq!(
+            BudgetProfile::from_phase("verify_acceptance"),
+            BudgetProfile::Verify
+        );
+        assert_eq!(BudgetProfile::from_phase("waiting_user"), BudgetProfile::Balanced);
+        // 侧重方向：Explore 归档 > Balanced；Execute 任务 > Balanced；Verify 项目 > Balanced
+        let balanced = ContextBudgetV2::allocate_with_profile(total, BudgetProfile::Balanced);
+        let explore = ContextBudgetV2::allocate_with_profile(total, BudgetProfile::Explore);
+        let execute = ContextBudgetV2::allocate_with_profile(total, BudgetProfile::Execute);
+        let verify = ContextBudgetV2::allocate_with_profile(total, BudgetProfile::Verify);
+        assert!(explore.archive_tokens > balanced.archive_tokens);
+        assert!(execute.task_tokens > balanced.task_tokens);
+        assert!(verify.project_tokens > balanced.project_tokens);
+        // load_context_v2 按当前任务阶段动态分配
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO agent_runs(run_id,conversation_id,goal,state,phase,started_at,updated_at)
+             VALUES ('run-b','c','构建','running','build_hap',1,2)",
+            [],
+        )
+        .unwrap();
+        let ctx = load_context_v2(&conn, "c", 64_000).unwrap();
+        assert_eq!(ctx.budget.profile, "execute");
+        conn.execute("UPDATE agent_runs SET phase='verify_acceptance' WHERE run_id='run-b'", [])
+            .unwrap();
+        let ctx = load_context_v2(&conn, "c", 64_000).unwrap();
+        assert_eq!(ctx.budget.profile, "verify");
+    }
+
+    #[test]
+    fn session_health_tracks_compression_flips_and_corrections() {
+        let conn = conn();
+        for index in 1..=20 {
+            conn.execute(
+                "INSERT INTO messages(id,conversation_id,role,content,created_at)
+                 VALUES (?1,'c','user',?2,?3)",
+                params![format!("m{index}"), format!("msg-{index}"), index],
+            )
+            .unwrap();
+        }
+        // 同一事实翻转 3 次（历史版本 3，活跃 1）
+        upsert_fact(&conn, &fact(serde_json::json!("head-1"))).unwrap();
+        upsert_fact(&conn, &fact(serde_json::json!("head-2"))).unwrap();
+        upsert_fact(&conn, &fact(serde_json::json!("head-3"))).unwrap();
+        // 压缩 2 次
+        bump_compress_count(&conn, "c");
+        bump_compress_count(&conn, "c");
+        // 对账纠正 1 次
+        conn.execute(
+            "INSERT INTO conversation_context_reconciliations
+             (id,conversation_id,summary_digest,facts_digest,status,conflicts_json,authoritative_block,created_at)
+             VALUES ('r1','c','d','f','corrected','[\"c1\"]','',1)",
+            [],
+        )
+        .unwrap();
+        let health = compute_session_health(&conn, "c", 64_000, 60_000).unwrap();
+        assert_eq!(health.message_count, 20);
+        assert_eq!(health.compress_count, 2);
+        assert_eq!(health.fact_versions, 3);
+        assert_eq!(health.active_facts, 1);
+        assert!(health.fact_flip_rate > 0.6);
+        assert_eq!(health.reconciliation_count, 1);
+        assert_eq!(health.corrected_count, 1);
+        assert!(health.degraded);
+        assert!(!health.advice.is_empty());
+        assert!((health.budget_usage_ratio - 60_000.0 / 64_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn session_health_clean_session_is_not_degraded() {
+        let db = conn();
+        let clean = compute_session_health(&db, "c", 64_000, 1_000).unwrap();
+        assert_eq!(clean.compress_count, 0);
+        assert_eq!(clean.message_count, 0);
+        assert!(!clean.degraded);
+        assert!(clean.advice.is_empty());
+    }
+
+    #[test]
+    fn long_session_100_round_stress_keeps_facts_and_budget_bounded() {
+        let conn = conn();
+        let mut version = 0;
+        for round in 1..=100 {
+            conn.execute(
+                "INSERT INTO messages(id,conversation_id,role,content,created_at)
+                 VALUES (?1,'c','user',?2,?3)",
+                params![format!("m{round}"), format!("round-{round}"), round],
+            )
+            .unwrap();
+            // 每 5 轮翻转一次事实
+            if round % 5 == 0 {
+                version += 1;
+                let mut f = fact(serde_json::json!(format!("head-v{version}")));
+                f.source_ref = format!("git:HEAD-{round}");
+                upsert_fact(&conn, &f).unwrap();
+            }
+            // 每 10 轮做一次压缩检查点
+            if round % 10 == 0 {
+                let summary = format!("增量摘要 1..={round}");
+                persist_runtime_checkpoint(
+                    &conn,
+                    "c",
+                    None,
+                    Some(summary.as_str()),
+                    8,
+                    64_000,
+                )
+                .unwrap();
+            }
+            // 每 20 轮使事实失效（模拟状态切换）
+            if round % 20 == 0 {
+                let reason = format!("rotate-{round}");
+                invalidate_facts(&conn, "c", Some("project"), reason.as_str()).unwrap();
+            }
+            // 每 30 轮做一次摘要对账
+            if round % 30 == 0 {
+                reconcile_summary(&conn, "c", &format!("第 {round} 轮摘要：状态正常")).unwrap();
+            }
+        }
+        let ctx = load_context_v2(&conn, "c", 64_000).unwrap();
+        // 预算不越界
+        let b = &ctx.budget;
+        assert!(
+            b.system_tokens + b.task_tokens + b.project_tokens + b.archive_tokens + b.hot_tokens
+                <= b.input_tokens()
+        );
+        // 事实版本历史完整：20 次 upsert 全部保留（最后一条在 round 100 被失效覆盖）
+        let versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_context_facts
+                 WHERE fact_kind='workspace' AND fact_key='git_head'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 20);
+        // 活跃事实为 0（round 100 upsert 后紧跟失效）
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_context_facts WHERE invalidated_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        // 摘要游标单调：最后检查点在 round 100，keep_recent=8 → 覆盖 1..=92
+        assert_eq!(ctx.summary_to_message_rowid, 92);
+        // 失效 epoch：5 次失效
+        assert_eq!(ctx.invalidation_epoch, 5);
+        // 健康度：100 条消息、3 次对账、翻转率 1.0 → 退化预警
+        let health = compute_session_health(&conn, "c", 64_000, 32_000).unwrap();
+        assert_eq!(health.message_count, 100);
+        assert_eq!(health.reconciliation_count, 3);
+        assert!(health.fact_flip_rate > 0.9);
+        assert!(health.degraded);
     }
 }
