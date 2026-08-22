@@ -4311,12 +4311,6 @@ export default function Home() {
             <Icon name={themeResolved === 'dark' ? 'sun' : 'moon'} size={15} />
           </button>
           <NotificationBell fixed />
-          {currentProject && !sidebarCollapsed && (
-            <span
-              className={`w-2 h-2 rounded-full shrink-0 ${currentProject.trusted ? 'bg-[var(--success)]' : 'bg-[var(--warning)]'}`}
-              title={currentProject.trusted ? t('home.trusted') : t('home.untrusted')}
-            />
-          )}
           <button
             onClick={() =>
               setSidebarCollapsed((v) => {
