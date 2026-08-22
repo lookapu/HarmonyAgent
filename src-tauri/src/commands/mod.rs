@@ -35,3 +35,4 @@ pub mod tools;
 pub mod update;
 pub mod version;
 pub mod generation;
+pub mod deveco_cli;

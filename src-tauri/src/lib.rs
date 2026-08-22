@@ -728,3 +728,4 @@ pub fn run() {
         });
 }
             commands::generation::generate_media,
+            commands::deveco_cli::detect_devecocli,

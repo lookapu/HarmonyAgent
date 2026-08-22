@@ -1,8 +1,10 @@
 // @ui-states: loading, empty, failed, retry
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
+import { open as shellOpen } from '@tauri-apps/plugin-shell'
 import { listMcpServers, addMcpServer, updateMcpServer, testMcpServer, toggleMcpServer, authorizeMcpServer, removeMcpServer, cloneMcpServer, exportMcpConfig, importMcpConfig, fetchMcpFromUrl, listMcpUsageStats, type McpServer, type CreateMcpInput, type McpDraft, type McpUsageStat } from '../api/mcp'
-import { mcpTemplates, matchMcpTemplate, templateEnvDefaults, type McpTemplate } from '../data/mcpTemplates'
+import { mcpTemplates, mcpTemplateCategories, matchMcpTemplate, templateEnvDefaults, type McpTemplate, type McpTemplateCategory } from '../data/mcpTemplates'
+import { detectDevecoCli } from '../api/devecoCli'
 import { useProjectStore } from '../stores/projectStore'
 import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
 
@@ -58,6 +60,109 @@ function formatTime(ts: number): string {
   return d.toLocaleString()
 }
 
+/** 模板分类筛选 chip */
+function CatChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-2 h-5 rounded-md text-[10px] transition-colors ${
+        active
+          ? 'bg-[var(--accent)]/15 text-[var(--accent)]'
+          : 'bg-[var(--bg-card)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+interface TemplateCardProps {
+  tpl: McpTemplate
+  /** 当前作用域已添加 */
+  installed: boolean
+  /** 仅全局已添加（项目视图下弱化提示） */
+  globalOnly: boolean
+  /** 刚通过本卡片添加（短暂闪烁标记） */
+  justAdded: boolean
+  /** 编辑模式：点击填充表单而非添加 */
+  editing: boolean
+  onActivate: (tpl: McpTemplate) => void
+}
+
+/** 内置模板卡片：名称/徽章/描述/流行度/env 提示/项目主页链接，点击添加（编辑模式填充表单） */
+function TemplateCard({ tpl, installed, globalOnly, justAdded, editing, onActivate }: TemplateCardProps) {
+  const { t } = useTranslation()
+  const rec = tpl.recommended
+  const highlighted = installed || justAdded
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => onActivate(tpl)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onActivate(tpl)
+        }
+      }}
+      title={`${tpl.description}\n${tpl.popularity ? t('mcp.popularity', { data: tpl.popularity }) : ''}\n${tpl.envHint ? t('mcp.envSummary', { env: tpl.envHint }) : ''}\n${editing ? t('mcp.clickToFill') : t('mcp.clickToAdd')}`}
+      className={`px-2.5 py-2 rounded-xl border text-left transition-all cursor-pointer focus:outline-none focus-visible:border-[var(--accent)] ${
+        highlighted
+          ? 'border-[var(--success)]/50 bg-[var(--success)]/10'
+          : 'border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--accent)]/40 hover:bg-[var(--bg-hover)]'
+      }`}
+    >
+      {/* 第一行：名称 + 徽章 + 状态标记 */}
+      <span className="flex items-center gap-1.5 min-w-0">
+        <span className={`text-[12px] font-medium truncate ${highlighted ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'}`}>
+          {justAdded ? t('mcp.added') : tpl.name}
+        </span>
+        {tpl.official && !justAdded && (
+          <span className="shrink-0 px-1 py-px rounded bg-[#6366f1]/15 text-[#6366f1] text-[9px] font-bold">🏛 {t('mcp.official')}</span>
+        )}
+        {rec === 'hot' && !justAdded && (
+          <span className="shrink-0 px-1 py-px rounded bg-[#f59e0b]/15 text-[#f59e0b] text-[9px] font-bold">🔥 {t('mcp.hot')}</span>
+        )}
+        {rec === 'popular' && !justAdded && (
+          <span className="shrink-0 px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[9px] font-bold">⭐ {t('mcp.popular')}</span>
+        )}
+        {installed && !justAdded && <span className="shrink-0 text-[var(--success)] text-[11px]">✓</span>}
+        {globalOnly && !installed && (
+          <span className="shrink-0 px-1 py-px rounded bg-[var(--bg-hover)] text-[var(--text-muted)] text-[9px]">{t('mcp.globalOnly')}</span>
+        )}
+      </span>
+      {/* 第二行：功能描述 */}
+      <span className="block text-[11px] text-[var(--text-muted)] truncate mt-0.5">{tpl.description}</span>
+      {/* 第三行：流行度 + 环境变量提示 */}
+      <span className="block text-[10px] text-[var(--text-secondary)] truncate mt-0.5">
+        {tpl.popularity && <span>{t('mcp.popularity', { data: tpl.popularity })}</span>}
+        {tpl.envHint && (
+          <span className="font-mono">
+            {tpl.popularity ? ' · ' : ''}{t('mcp.envSummary', { env: tpl.envHint })}
+          </span>
+        )}
+      </span>
+      {/* 第四行：项目主页链接（阻止冒泡，不触发添加） */}
+      {tpl.homepage && (
+        <span className="block mt-1">
+          <a
+            href={tpl.homepage}
+            title={t('mcp.homepageLabel')}
+            onClick={(e) => {
+              e.stopPropagation()
+              e.preventDefault()
+              shellOpen(tpl.homepage!).catch(() => window.open(tpl.homepage!, '_blank', 'noopener'))
+            }}
+            className="text-[10px] text-[var(--accent)] hover:underline"
+          >
+            ↗ {t('mcp.homepageLabel')}
+          </a>
+        </span>
+      )}
+    </div>
+  )
+}
+
 export default function McpPage() {
   const { t } = useTranslation()
   const currentProject = useProjectStore((s) => s.currentProject)
@@ -71,6 +176,9 @@ export default function McpPage() {
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({ name: '', command: '', description: '', env: '' })
   const [addedKeys, setAddedKeys] = useState<Set<string>>(new Set())
+  /** 内置模板筛选：分类 + 关键字 */
+  const [templateCat, setTemplateCat] = useState<'all' | McpTemplateCategory>('all')
+  const [templateQuery, setTemplateQuery] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<Record<string, string>>({})
   const [authEditingId, setAuthEditingId] = useState<string | null>(null)
@@ -78,6 +186,8 @@ export default function McpPage() {
   const [fetchUrl, setFetchUrl] = useState('')
   const [fetchProxy, setFetchProxy] = useState(false)
   const [fetching, setFetching] = useState(false)
+  /** deveco-cli 未安装时的安装引导（DC-09：模板创建时检测并提示） */
+  const [cliHint, setCliHint] = useState<string>('')
   const [drafts, setDrafts] = useState<McpDraft[] | null>(null)
   const [fetchError, setFetchError] = useState<string | null>(null)
   /** 视图切换：服务器列表 / 使用统计 */
@@ -147,6 +257,11 @@ export default function McpPage() {
 
   /** 一键添加内置模板（自动带出本机可用默认环境变量；已添加的显示标记） */
   const handleAddTemplate = async (tpl: McpTemplate) => {
+    // 官方 deveco-cli 模板：创建时探测命令可用性，未安装则给出安装命令引导
+    if (tpl.key === 'deveco-cli') {
+      const info = await detectDevecoCli().catch(() => null)
+      setCliHint(info && !info.installed ? info.install_hint : '')
+    }
     const defaults = templateEnvDefaults(tpl)
     await addMcpServer({
       name: tpl.name,
@@ -161,10 +276,59 @@ export default function McpPage() {
     load()
   }
 
+  // 内置模板：官方置顶，其余保持数据定义顺序
+  const sortedTemplates = useMemo(() => [...mcpTemplates].sort((a, b) => (b.official ? 1 : 0) - (a.official ? 1 : 0)), [])
+  // 按分类 + 关键字过滤
+  const filteredTemplates = useMemo(() => {
+    const q = templateQuery.trim().toLowerCase()
+    return sortedTemplates.filter(
+      (t) =>
+        (templateCat === 'all' || t.category === templateCat) &&
+        (!q || t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q)),
+    )
+  }, [sortedTemplates, templateCat, templateQuery])
+  // 空状态推荐：有推荐标记的模板（官方优先）
+  const recommendedTemplates = useMemo(() => sortedTemplates.filter((t) => t.recommended).slice(0, 6), [sortedTemplates])
+
+  /** 当前作用域是否已添加该模板名 */
+  const templateInstalled = (tpl: McpTemplate) =>
+    visibleServers.some((s) => s.name.toLowerCase() === tpl.name.toLowerCase())
+  /** 项目视图下：模板仅存在于全局作用域（弱化提示，避免误以为可重复添加） */
+  const templateGlobalOnly = (tpl: McpTemplate) =>
+    effectiveScope === 'project' &&
+    !templateInstalled(tpl) &&
+    servers.some((s) => !s.project_id && s.name.toLowerCase() === tpl.name.toLowerCase())
+
+  /** 模板卡片激活：编辑模式填充表单（不添加），新增模式一键添加 */
+  const handleTemplateActivate = (tpl: McpTemplate) => {
+    if (editingId) {
+      // 编辑/手填官方模板命令时同样探测可用性
+      if (tpl.key === 'deveco-cli') {
+        detectDevecoCli()
+          .then((info) => setCliHint(info && !info.installed ? info.install_hint : ''))
+          .catch(() => {})
+      }
+      setForm({
+        name: tpl.name,
+        command: tpl.command.join(' '),
+        description: tpl.description,
+        env: templateEnvDefaults(tpl),
+      })
+      return
+    }
+    void handleAddTemplate(tpl)
+  }
+
   /** 命令输入失焦：智能识别模板补全（含本机默认环境变量） */
   const handleCommandBlur = () => {
     const tpl = matchMcpTemplate(form.command)
     if (tpl) {
+      // 编辑/手填官方模板命令时同样探测可用性
+      if (tpl.key === 'deveco-cli') {
+        detectDevecoCli()
+          .then((info) => setCliHint(info && !info.installed ? info.install_hint : ''))
+          .catch(() => {})
+      }
       setForm((f) => ({
         ...f,
         name: f.name || tpl.name,
@@ -450,44 +614,51 @@ export default function McpPage() {
           <div className="text-[13px] font-semibold text-[var(--text-primary)]">
             {editingId ? t('mcp.editTitle') : t('mcp.addTitle')}
           </div>
-          {/* 内置模板选择 */}
+          {/* 内置模板选择：长方形信息卡片，可搜索/分类，区域固定高度，模板多时滚动 */}
           <div>
-            <div className="text-[11px] font-medium text-[var(--text-muted)] mb-2">{t('mcp.templates')}</div>
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
-              {mcpTemplates.map((tpl) => {
-                const installed = servers.some((s) => s.name.toLowerCase() === tpl.name.toLowerCase())
-                const justAdded = addedKeys.has(tpl.key)
-                const rec = tpl.recommended
-                return (
-                  <button
-                    key={tpl.key}
-                    onClick={() => handleAddTemplate(tpl)}
-                    title={`${tpl.description}\n${tpl.popularity ? t('mcp.popularity', { data: tpl.popularity }) : ''}\n${tpl.envHint ? t('mcp.envSummary', { env: tpl.envHint }) : ''}\n${t('mcp.clickToAdd')}`}
-                    className={`px-2.5 py-1.5 rounded-lg border text-left transition-all ${
-                      installed || justAdded
-                        ? 'border-[var(--success)]/50 bg-[var(--success)]/10'
-                        : 'border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--accent)]/40 hover:bg-[var(--bg-hover)]'
-                    }`}
-                  >
-                    <span
-                      className={`block text-[12px] truncate ${
-                        installed || justAdded ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'
-                      }`}
-                    >
-                      {justAdded ? t('mcp.added') : tpl.name}
-                      {rec === 'hot' && !justAdded && (
-                        <span className="ml-1 px-1 py-px rounded bg-[#f59e0b]/15 text-[#f59e0b] text-[9px] font-bold align-middle">🔥 {t('mcp.hot')}</span>
-                      )}
-                      {rec === 'popular' && !justAdded && (
-                        <span className="ml-1 px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[9px] font-bold align-middle">⭐ {t('mcp.popular')}</span>
-                      )}
-                      {installed && !justAdded && ' ✓'}
-                    </span>
-                  </button>
-                )
-              })}
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <span className="text-[11px] font-medium text-[var(--text-muted)]">{t('mcp.templates')}</span>
+              <input
+                value={templateQuery}
+                onChange={(e) => setTemplateQuery(e.target.value)}
+                placeholder={t('mcp.templateSearch')}
+                className="w-44 h-6 px-2 rounded-md modern-card text-[11px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              />
             </div>
+            {/* 分类筛选 */}
+            <div className="flex flex-wrap gap-1 mb-2">
+              <CatChip active={templateCat === 'all'} onClick={() => setTemplateCat('all')}>{t('mcp.catAll')}</CatChip>
+              {mcpTemplateCategories.map((c) => (
+                <CatChip key={c} active={templateCat === c} onClick={() => setTemplateCat(c)}>
+                  {t(`mcp.cat.${c}`)}
+                </CatChip>
+              ))}
+            </div>
+            {filteredTemplates.length === 0 ? (
+              <p className="text-[11px] text-[var(--text-muted)] py-5 text-center">{t('mcp.emptyTemplateResult')}</p>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-72 overflow-y-auto scroll-thin pr-1">
+                {filteredTemplates.map((tpl) => (
+                  <TemplateCard
+                    key={tpl.key}
+                    tpl={tpl}
+                    installed={templateInstalled(tpl)}
+                    globalOnly={templateGlobalOnly(tpl)}
+                    justAdded={addedKeys.has(tpl.key)}
+                    editing={!!editingId}
+                    onActivate={handleTemplateActivate}
+                  />
+                ))}
+              </div>
+            )}
+            {/* deveco-cli 未安装引导（模板一键添加/命令失焦时触发探测） */}
+            {cliHint && (
+              <div className="mt-2 px-3 py-2 rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 text-[11px] text-[var(--warning)] break-all font-mono">
+                {cliHint}
+              </div>
+            )}
             <p className="text-[10px] text-[var(--text-muted)]">{t('mcp.oneClickHint')}</p>
+            {editingId && <p className="text-[10px] text-[var(--warning)] mt-0.5">{t('mcp.templateEditHint')}</p>}
             <p className="text-[10px] text-[var(--text-muted)] mt-0.5">{t('mcp.recommendedTip')}</p>
           </div>
 
@@ -632,7 +803,24 @@ export default function McpPage() {
 
       <div className="space-y-3">
         {visibleServers.length === 0 && (
-          <p className="text-[var(--text-secondary)] text-sm">{t('mcp.empty')}</p>
+          <div className="modern-card rounded-lg p-4">
+            <p className="text-[var(--text-secondary)] text-sm">{t('mcp.empty')}</p>
+            <p className="text-[11px] font-medium text-[var(--text-muted)] mt-3 mb-2">{t('mcp.emptyGuideTitle')}</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+              {recommendedTemplates.map((tpl) => (
+                <TemplateCard
+                  key={tpl.key}
+                  tpl={tpl}
+                  installed={templateInstalled(tpl)}
+                  globalOnly={templateGlobalOnly(tpl)}
+                  justAdded={addedKeys.has(tpl.key)}
+                  editing={false}
+                  onActivate={handleTemplateActivate}
+                />
+              ))}
+            </div>
+            <p className="text-[10px] text-[var(--text-muted)] mt-2">{t('mcp.emptyGuideHint')}</p>
+          </div>
         )}
         <p className="text-[10px] text-[var(--text-muted)]">{t('mcp.multiInstanceHint')}</p>
         {visibleServers.map((s) => (

@@ -10,6 +10,12 @@ export interface McpEnvDef {
   defaultValue?: string
 }
 
+/** 模板分类（内置模板区域筛选分组） */
+export type McpTemplateCategory = 'database' | 'browser' | 'search' | 'dev' | 'harmony' | 'other'
+
+/** 内置模板分类（筛选 chips 展示顺序） */
+export const mcpTemplateCategories: McpTemplateCategory[] = ['database', 'browser', 'search', 'dev', 'harmony', 'other']
+
 export interface McpTemplate {
   key: string
   name: string
@@ -25,6 +31,10 @@ export interface McpTemplate {
   recommended?: 'hot' | 'popular'
   /** 流行度数据展示（如 "25.9M 次/月"） */
   popularity?: string
+  /** 分类：模板区域筛选分组 */
+  category: McpTemplateCategory
+  /** 官方出品标记：排序置顶 + 卡片徽章 */
+  official?: boolean
 }
 
 /**
@@ -39,6 +49,7 @@ export function templateEnvDefaults(tpl: McpTemplate): string {
 export const mcpTemplates: McpTemplate[] = [
   {
     key: 'redis',
+    category: 'database',
     name: 'Redis',
     command: ['npx', '-y', 'redis-mcp'],
     description: 'Redis 数据库操作（查询/写入/键管理）',
@@ -51,10 +62,11 @@ export const mcpTemplates: McpTemplate[] = [
         defaultValue: 'redis://localhost:6379',
       },
     ],
-    homepage: 'https://github.com/gongrzhe/server-mcp-redis',
+    homepage: 'https://github.com/farhankaz/redis-mcp',
   },
   {
     key: 'mysql',
+    category: 'database',
     name: 'MySQL',
     command: ['npx', '-y', '@benborla29/mcp-server-mysql'],
     description: 'MySQL 数据库查询与操作',
@@ -68,10 +80,11 @@ export const mcpTemplates: McpTemplate[] = [
       { key: 'MYSQL_PASS', placeholder: '密码', hint: '登录密码（本地无密码可留空）' },
       { key: 'MYSQL_DB', placeholder: 'test', hint: '默认连接的数据库名', defaultValue: 'test' },
     ],
-    homepage: 'https://github.com/benborla29/mcp-server-mysql',
+    homepage: 'https://github.com/benborla/mcp-server-mysql',
   },
   {
     key: 'postgres',
+    category: 'database',
     name: 'PostgreSQL',
     command: ['npx', '-y', '@henkey/postgres-mcp-server'],
     description: 'PostgreSQL 数据库查询与操作',
@@ -86,10 +99,11 @@ export const mcpTemplates: McpTemplate[] = [
         defaultValue: 'postgresql://postgres:postgres@localhost:5432/postgres',
       },
     ],
-    homepage: 'https://github.com/henkey/postgres-mcp-server',
+    homepage: 'https://github.com/HenkDz/postgresql-mcp-server',
   },
   {
     key: 'mongodb',
+    category: 'database',
     name: 'MongoDB',
     command: ['npx', '-y', 'mongodb-mcp-server'],
     description: 'MongoDB 官方 MCP：查询/聚合/索引管理',
@@ -104,10 +118,11 @@ export const mcpTemplates: McpTemplate[] = [
         defaultValue: 'mongodb://localhost:27017',
       },
     ],
-    homepage: 'https://github.com/mongodb/mongodb-mcp-server',
+    homepage: 'https://github.com/mongodb-js/mongodb-mcp-server',
   },
   {
     key: 'elasticsearch',
+    category: 'database',
     name: 'Elasticsearch',
     command: ['npx', '-y', '@elastic/mcp-server-elasticsearch'],
     description: 'Elasticsearch 索引与搜索操作（Elastic 官方）',
@@ -122,6 +137,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'sqlite',
+    category: 'database',
     name: 'SQLite',
     command: ['npx', '-y', 'mcp-server-sqlite', '--db', './sqlite.db'],
     description: 'SQLite 数据库（本地文件，--db 参数指定数据库文件路径）',
@@ -131,6 +147,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'mssql',
+    category: 'database',
     name: 'MSSQL Server',
     command: ['npx', '-y', 'mssql-mcp'],
     description: 'Microsoft SQL Server 查询与操作',
@@ -144,10 +161,11 @@ export const mcpTemplates: McpTemplate[] = [
       { key: 'MSSQL_PASSWORD', placeholder: '密码', hint: '登录密码（必填）' },
       { key: 'MSSQL_DATABASE', placeholder: 'master', hint: '默认连接的数据库名', defaultValue: 'master' },
     ],
-    homepage: 'https://github.com/sujaygarlanka/mssql-mcp',
+    homepage: 'https://github.com/BYMCS/mssql-mcp',
   },
   {
     key: 'clickhouse',
+    category: 'database',
     name: 'ClickHouse',
     command: ['npx', '-y', 'clickhouse-mcp'],
     description: 'ClickHouse 查询与分析',
@@ -161,6 +179,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'duckdb',
+    category: 'database',
     name: 'DuckDB',
     command: ['npx', '-y', '@seed-ship/duckdb-mcp-native'],
     description: 'DuckDB 本地分析数据库（列式存储，无需服务，免配置）',
@@ -170,6 +189,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'kafka',
+    category: 'database',
     name: 'Kafka',
     command: ['npx', '-y', 'kafka-mcp-server'],
     description: 'Apache Kafka 消息队列：topic/生产/消费',
@@ -182,10 +202,11 @@ export const mcpTemplates: McpTemplate[] = [
         defaultValue: 'localhost:9092',
       },
     ],
-    homepage: 'https://github.com/hasura/kafka-mcp-server',
+    homepage: 'https://www.npmjs.com/package/kafka-mcp-server',
   },
   {
     key: 'sentry',
+    category: 'dev',
     name: 'Sentry',
     command: ['npx', '-y', '@sentry/mcp-server'],
     description: 'Sentry 官方 MCP：错误监控、Issue 排查',
@@ -201,6 +222,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'playwright',
+    category: 'browser',
     name: 'Playwright',
     command: ['npx', '-y', '@playwright/mcp@latest'],
     description: '浏览器自动化：打开网页、点击、截图、抓取内容',
@@ -209,16 +231,8 @@ export const mcpTemplates: McpTemplate[] = [
     homepage: 'https://github.com/microsoft/playwright-mcp',
   },
   {
-    key: 'puppeteer',
-    name: 'Puppeteer',
-    command: ['npx', '-y', '@modelcontextprotocol/server-puppeteer'],
-    description: '无头浏览器控制（旧版，推荐 Playwright）',
-    recommended: 'hot',
-    popularity: '119K 次/月',
-    homepage: 'https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer',
-  },
-  {
     key: 'filesystem',
+    category: 'dev',
     name: 'Filesystem',
     command: ['npx', '-y', '@modelcontextprotocol/server-filesystem', '~/'],
     description: '本地文件系统读写（默认工作目录 ~/，可自行修改路径）',
@@ -228,11 +242,12 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'github',
-    name: 'GitHub',
-    command: ['npx', '-y', '@modelcontextprotocol/server-github'],
-    description: 'GitHub 仓库/Issue/PR 操作',
+    category: 'dev',
+    name: 'GitHub（官方新版）',
+    command: ['docker', 'run', '-i', '--rm', '-e', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'ghcr.io/github/github-mcp-server:latest'],
+    description: 'GitHub 官方新版 MCP（Go 实现，替代已停更的 @modelcontextprotocol/server-github）：仓库/Issue/PR 操作（需 Docker）',
     recommended: 'hot',
-    popularity: '536K 次/月',
+    popularity: 'GitHub ⭐32K',
     envHint: 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx',
     envDefs: [
       {
@@ -241,10 +256,11 @@ export const mcpTemplates: McpTemplate[] = [
         hint: 'GitHub Personal Access Token（github.com → Settings → Developer settings → Tokens，勾选 repo 权限）',
       },
     ],
-    homepage: 'https://github.com/modelcontextprotocol/servers/tree/main/src/github',
+    homepage: 'https://github.com/github/github-mcp-server',
   },
   {
     key: 'git',
+    category: 'dev',
     name: 'Git',
     command: ['npx', '-y', 'mcp-server-git'],
     description: 'Git 仓库操作：提交/分支/日志/差异',
@@ -260,6 +276,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'docker',
+    category: 'dev',
     name: 'Docker',
     command: ['npx', '-y', 'mcp-server-docker'],
     description: 'Docker 容器与镜像管理',
@@ -269,6 +286,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'memory',
+    category: 'dev',
     name: 'Memory',
     command: ['npx', '-y', '@modelcontextprotocol/server-memory'],
     description: '长期知识图谱记忆（跨会话知识存储）',
@@ -278,13 +296,15 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'fetch',
+    category: 'dev',
     name: 'HTTP Request',
     command: ['npx', '-y', '@vrosario/http-request-mcp'],
     description: 'HTTP 请求工具：GET/POST/PUT/DELETE 调试接口',
-    homepage: 'https://github.com/vitolrosario/http-request-mcp',
+    homepage: 'https://www.npmjs.com/package/@vrosario/http-request-mcp',
   },
   {
     key: 'sequential-thinking',
+    category: 'dev',
     name: 'Sequential Thinking',
     command: ['npx', '-y', '@modelcontextprotocol/server-sequential-thinking'],
     description: '结构化逐步推理（复杂问题分解）',
@@ -294,6 +314,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'time',
+    category: 'dev',
     name: 'Time',
     command: ['npx', '-y', 'time-mcp'],
     description: '时间与时区查询',
@@ -303,6 +324,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'everything',
+    category: 'dev',
     name: 'Everything (测试)',
     command: ['npx', '-y', '@modelcontextprotocol/server-everything'],
     description: 'MCP 协议全能力测试服务器（调试用）',
@@ -312,6 +334,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'browser-use',
+    category: 'browser',
     name: 'Browser Use',
     command: ['docker', 'run', '-i', '--rm', '-e', 'BROWSER_USE_LOGGING_LEVEL=info', 'ghcr.io/browser-use/browser-use:latest'],
     description: 'AI 浏览器自动化（Google 开源）：打开网页、点击、填表、截图（需 Docker）',
@@ -321,6 +344,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'firecrawl',
+    category: 'browser',
     name: 'Firecrawl',
     command: ['npx', '-y', 'firecrawl-mcp'],
     description: '网页爬取与结构化提取：反爬站/JS 渲染页面抓取、批量爬取、深度研究',
@@ -334,10 +358,11 @@ export const mcpTemplates: McpTemplate[] = [
         hint: 'Firecrawl API Key（firecrawl.dev 控制台创建，免费额度 500 次/月）',
       },
     ],
-    homepage: 'https://github.com/mendableai/firecrawl-mcp-server',
+    homepage: 'https://github.com/firecrawl/firecrawl-mcp-server',
   },
   {
     key: 'exa',
+    category: 'search',
     name: 'Exa Search',
     command: ['npx', '-y', 'exa-mcp-server'],
     description: '语义搜索引擎：全网/代码/学术检索，返回带内容的搜索结果',
@@ -355,6 +380,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'serper',
+    category: 'search',
     name: 'Serper (Google)',
     command: ['npx', '-y', 'serper-search-scrape-mcp-server'],
     description: 'Google 搜索 API（低价）：网页/图片/新闻/地点搜索 + 网页抓取',
@@ -372,11 +398,10 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'brave-search',
+    category: 'search',
     name: 'Brave Search',
-    command: ['npx', '-y', '@modelcontextprotocol/server-brave-search'],
-    description: 'Brave 隐私搜索引擎（官方参考服务器）',
-    recommended: 'hot',
-    popularity: '113K 次/月',
+    command: ['npx', '-y', 'brave-search-mcp'],
+    description: 'Brave 隐私搜索引擎（社区维护版，官方参考服务器已停更；另可选 Exa/Serper）',
     envHint: 'BRAVE_API_KEY=xxx',
     envDefs: [
       {
@@ -385,10 +410,11 @@ export const mcpTemplates: McpTemplate[] = [
         hint: 'Brave Search API Key（brave.com/search/api 注册）',
       },
     ],
-    homepage: 'https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search',
+    homepage: 'https://github.com/mikechao/brave-search-mcp',
   },
   {
     key: 'chrome-devtools',
+    category: 'browser',
     name: 'Chrome DevTools',
     command: ['npx', '-y', 'chrome-devtools-mcp'],
     description: 'Chrome 调试协议：浏览器控制、DOM 操作、性能分析（ChromeDevTools 官方）',
@@ -398,6 +424,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'notion',
+    category: 'other',
     name: 'Notion',
     command: ['npx', '-y', 'notion-mcp-server'],
     description: 'Notion 页面/数据库/搜索操作（开源社区版）',
@@ -415,6 +442,7 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'desktop-commander',
+    category: 'dev',
     name: 'Desktop Commander',
     command: ['npx', '-y', '@wonderwhy-er/desktop-commander@latest'],
     description: '本地命令执行与文件操作：终端命令、文本文件读写（无需 API Key）',
@@ -424,13 +452,35 @@ export const mcpTemplates: McpTemplate[] = [
   },
   {
     key: 'npm-search',
+    category: 'dev',
     name: 'NPM Search',
     command: ['npx', '-y', 'npm-search-mcp-server'],
     description: 'npm 包搜索：查询包信息、版本、描述（无需 API Key）',
     homepage: 'https://modelcontextprotocol.io/',
   },
   {
+    key: 'deveco-cli',
+    category: 'harmony',
+    official: true,
+    name: 'DevEco CLI',
+    command: ['devecocli', 'serve', 'mcp'],
+    description:
+      '华为官方 DevEco CLI 内置 MCP 服务：基于 LSP 的 ArkTS/C++ 实时语法检查（Check MCP，编译前错误拦截）、官方知识检索等。前置：npm install -g @deveco/deveco-cli@stable（Node 22+、DevEco Studio 6.1+）',
+    recommended: 'hot',
+    envHint: 'DEVECO_HOME=<DevEco Studio 安装路径>（可留空自动探测）',
+    envDefs: [
+      {
+        key: 'DEVECO_HOME',
+        placeholder: '/Applications/DevEco-Studio.app',
+        defaultValue: '/Applications/DevEco-Studio.app',
+        hint: 'DevEco Studio 安装目录（deveco-cli 依赖其工具链；macOS 默认 /Applications/DevEco-Studio.app，Windows 默认 C:\\Program Files\\Huawei\\DevEco Studio，非默认位置请改为实际路径）。只有默认安装位置时可留空，deveco-cli 会自动探测。注意：项目授权时需把 DEVECO_HOME 加入 credential_keys，否则不会传给子进程',
+      },
+    ],
+    homepage: 'https://gitcode.com/openharmony-sig/deveco-cli',
+  },
+  {
     key: 'deveco-mcp',
+    category: 'harmony',
     name: 'DevEco Toolbox',
     command: ['npx', '-y', 'deveco-mcp-server'],
     description: '鸿蒙开发工具集（open-deveco 社区）：ArkTS 语法检查 check_ets_files（基于官方 LSP）、构建、启动应用、UI 树、hilog/faultlog 日志，依赖 DevEco Studio',

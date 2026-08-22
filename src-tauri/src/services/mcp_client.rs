@@ -189,32 +189,17 @@ impl McpClient {
                 self.frame_mode.store(mode.code(), Ordering::SeqCst);
                 result
             }
-            Err(_) if mode == FrameMode::Ndjson => {
-                // NDJSON 探测超时：回退 Content-Length 帧重试
-                // （服务器可能是 2025-03-26 时期旧包，仅支持帧协议）
-                let mut stdin = self.stdin.lock().await;
-                let mut stdout = self.stdout.lock().await;
-                let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-                let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-                let body_str = body.to_string();
-                stdin
-                    .write_all(&encode_frame(&body_str, FrameMode::ContentLength))
-                    .await
-                    .map_err(|e| format!("写入请求失败: {e}"))?;
-                stdin
-                    .flush()
-                    .await
-                    .map_err(|e| format!("刷新请求失败: {e}"))?;
-                let r = tokio::time::timeout(
-                    self.request_timeout,
-                    read_response_frame(&mut stdout, &id, &self.stderr_tail),
-                )
-                .await
-                .map_err(|_| format!("MCP 请求超时（>{s}s）", s = self.request_timeout.as_secs()))?;
-                self.frame_mode.store(FrameMode::ContentLength.code(), Ordering::SeqCst);
-                r
+            Err(_) => {
+                // 不再在同一管道回退 Content-Length 重发：超时通常是服务器未就绪
+                // （npx 冷下载/初始化慢），并非帧格式不兼容；同一管道混发两种帧格式
+                // 会打崩 SDK 1.x 的按行 JSON 解析器（Content-Length 残留 → JSON.parse
+                // 崩溃 → 服务器进程存活但后续请求永久无响应）。request 为 &self 无法
+                // 检测子进程状态，直接报超时，由上层决定重连（重连会重新探测帧模式）。
+                Err(format!(
+                    "MCP 请求超时（>{s}s）：服务器未就绪或无响应，首次 npx 拉取依赖可能较慢，请稍后重试",
+                    s = self.request_timeout.as_secs()
+                ))
             }
-            Err(_) => Err(format!("MCP 请求超时（>{s}s）", s = self.request_timeout.as_secs())),
         }
     }
 }
@@ -276,14 +261,14 @@ impl Drop for McpClient {
     }
 }
 
-/// 进程退出诊断后缀（stderr 尾部非空时附带）
+/// 进程退出诊断后缀（stderr 尾部非空时附带；2000 字符避免截断 Node 堆栈关键帧）
 fn stderr_suffix(tail: &Arc<StdMutex<String>>) -> String {
     let s = tail.lock().map(|g| g.clone()).unwrap_or_default();
     let s = s.trim();
     if s.is_empty() {
         String::new()
     } else {
-        let tail: String = s.chars().rev().take(400).collect::<String>().chars().rev().collect();
+        let tail: String = s.chars().rev().take(2000).collect::<String>().chars().rev().collect();
         format!("\n服务器输出: {tail}")
     }
 }

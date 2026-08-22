@@ -246,10 +246,68 @@ async fn test_mcp_server_inner(
         Err::<String, String>(format!("{e}{}", stderr_tail(err_buf)))
     }
 
+    // 按指定帧模式完成 initialize 握手：发送请求后分段等待响应（每段超时先检查
+    // 子进程是否退出——npx 冷下载失败/命令错误会快速退出，立即报错；进程存活则
+    // 继续等待）。预算耗尽时终止进程并以干净管道重启（child/stdin/stdout/stderr
+    // 全部替换），返回超时错误由调用方决定切换帧模式重探。
+    // 关键：探测超时 ≠ 格式不兼容（npx 首次拉包可能远超 6s），进程存活期间绝不
+    // 在同一管道混发第二种帧格式（SDK 1.x 按行解析，Content-Length 残留会导致
+    // JSON.parse 崩溃，服务器进程存活但所有后续请求永久无响应）。
+    async fn handshake_with_mode(
+        cmd: &mut tokio::process::Command,
+        child: &mut tokio::process::Child,
+        stdin: &mut tokio::process::ChildStdin,
+        stdout: &mut tokio::process::ChildStdout,
+        stderr: &mut Option<tokio::process::ChildStderr>,
+        err_buf: &mut Vec<u8>,
+        req: &serde_json::Value,
+        mode: crate::utils::mcp_frames::FrameMode,
+        deadline: tokio::time::Instant,
+    ) -> Result<serde_json::Value, String> {
+        send_mcp_request(stdin, req, mode).await?;
+        loop {
+            match read_mcp_frame(stdout, stderr, err_buf, deadline).await {
+                Ok(v) => return Ok(v),
+                Err(e) if e == "等待响应超时" => {
+                    match child.try_wait().map_err(|e| e.to_string())? {
+                        Some(status) => {
+                            // 进程已退出：启动失败（命令错误/依赖缺失等），立即报错
+                            return Err(format!("服务器进程已退出（exit {status}）"));
+                        }
+                        None => {
+                            // 进程仍存活（可能正在 npx 冷下载）：等待间隔后重试，
+                            // 预算是否耗尽由 read_mcp_frame 的绝对 deadline 控制
+                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                            if tokio::time::Instant::now() >= deadline {
+                                // 预算耗尽：终止进程并重启干净子进程（调用方切换帧模式重探）
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                                crate::utils::process::kill_tree(child.id());
+                                let mut new_child = cmd.spawn().map_err(|e| {
+                                    format!("重启 MCP 服务器失败: {e}")
+                                })?;
+                                *stdin = new_child.stdin.take().ok_or("无法获取服务器 stdin")?;
+                                *stdout = new_child.stdout.take().ok_or("无法获取服务器 stdout")?;
+                                *stderr = new_child.stderr.take();
+                                *child = new_child;
+                                return Err("等待响应超时".into());
+                            }
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     // 1. initialize 握手（60s 总预算：首次 npx 拉取依赖可能较慢；绝对 deadline，
     //    stderr 持续输出（npm 下载进度等）不会重置计时）。
-    //    stdio 帧格式先按 newline-delimited JSON（2025-06-18 起官方规范）探测，
-    //    无响应则回退 Content-Length 帧（2025-03-26 时期规范）重发。
+    //    stdio 帧格式先按 newline-delimited JSON（2025-06-18 起官方规范）探测：
+    //    超时不代表格式不兼容（可能是 npx 冷下载中），进程存活期间保持 NDJSON 等待；
+    //    只有 60s 预算耗尽才终止进程、以干净管道重启并改用 Content-Length 帧
+    //    （2025-03-26 时期规范）重探——绝不在同一管道混发两种帧格式
+    //    （SDK 1.x 按行解析，Content-Length 残留会打崩其 JSON 解析器，
+    //    导致握手"成功"但后续 tools/list 永久无响应）。
     let req = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -263,20 +321,39 @@ async fn test_mcp_server_inner(
     let handshake_deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
     use crate::utils::mcp_frames::FrameMode;
-    let probe_deadline =
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(6);
     let mut frame_mode = FrameMode::Ndjson;
-    let init = match send_mcp_request(&mut stdin, &req, frame_mode).await {
-        Ok(()) => read_mcp_frame(&mut stdout, &mut stderr, &mut err_buf, probe_deadline).await,
-        Err(e) => Err(e),
-    };
+    let init = handshake_with_mode(
+        &mut cmd,
+        &mut child,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+        &mut err_buf,
+        &req,
+        frame_mode,
+        handshake_deadline,
+    )
+    .await;
     let init = match init {
         Ok(v) => Ok(v),
-        // NDJSON 探测超时：回退 Content-Length 帧重发（服务器可能是 2025-03-26 时期旧包）
+        // NDJSON 探测预算耗尽（旧进程已终止、已以干净管道重启）：服务器可能是
+        // 2025-03-26 时期旧包，改用 Content-Length 帧重探（独立 30s 预算）
         Err(e) if e == "等待响应超时" => {
             frame_mode = FrameMode::ContentLength;
-            send_mcp_request(&mut stdin, &req, frame_mode).await?;
-            read_mcp_frame(&mut stdout, &mut stderr, &mut err_buf, handshake_deadline).await
+            let retry_deadline =
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            handshake_with_mode(
+                &mut cmd,
+                &mut child,
+                &mut stdin,
+                &mut stdout,
+                &mut stderr,
+                &mut err_buf,
+                &req,
+                frame_mode,
+                retry_deadline,
+            )
+            .await
         }
         Err(e) => Err(e),
     };
@@ -431,7 +508,8 @@ async fn read_mcp_frame(
     }
 }
 
-/// stderr 尾部 400 字符（失败时附在错误后帮助定位，如 npm 报错、缺依赖等）
+/// stderr 尾部 2000 字符（失败时附在错误后帮助定位，如 npm 报错、缺依赖等；
+/// 400 字符会截断 Node 堆栈，看不到关键帧）
 fn stderr_tail(err_buf: &[u8]) -> String {
     let s = String::from_utf8_lossy(err_buf);
     let s = s.trim();
@@ -441,7 +519,7 @@ fn stderr_tail(err_buf: &[u8]) -> String {
         let tail: String = s
             .chars()
             .rev()
-            .take(400)
+            .take(2000)
             .collect::<String>()
             .chars()
             .rev()
