@@ -114,12 +114,16 @@ pub fn list_projects(state: State<DbState>) -> Result<Vec<Project>, String> {
 /// 置顶/取消置顶项目（列表排序优先），返回更新后的项目
 #[tauri::command]
 pub fn set_project_pinned(id: String, pinned: bool, state: State<DbState>) -> Result<Project, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE projects SET pinned = ?1 WHERE id = ?2",
-        params![pinned as i64, id],
-    )
-    .map_err(|e| e.to_string())?;
+    // 先更新再查询：更新用的 conn 必须在 get_project_by_id 之前释放（同一 Mutex 非重入，
+    // 持锁期间再次 lock 会死锁，导致置顶操作永久挂起）
+    {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE projects SET pinned = ?1 WHERE id = ?2",
+            params![pinned as i64, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     get_project_by_id(&state, &id)
 }
 
