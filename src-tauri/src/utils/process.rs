@@ -110,7 +110,7 @@ pub fn jdk_env_overrides() -> Vec<(String, String)> {
         return Vec::new();
     };
     let mut overrides = vec![("JAVA_HOME".to_string(), dir.to_string_lossy().to_string())];
-    // PATH 前插 <jdk>/bin，使子进程可直接解析 java.exe
+    // PATH 前插 <jdk>/bin，使子进程可直接解析 java 命令
     let bin = dir.join("bin");
     let cur = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<std::ffi::OsString> = vec![bin.into_os_string()];
@@ -121,12 +121,28 @@ pub fn jdk_env_overrides() -> Vec<(String, String)> {
     overrides
 }
 
-/// 系统 PATH 中是否存在 java.exe（存在时视为系统已有 JDK，不注入内置）
+/// 系统 PATH 中是否存在 java 命令（存在时视为系统已有 JDK，不注入内置）
 fn system_path_has_java() -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path_var).any(|d| d.join("java.exe").is_file())
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    if std::env::split_paths(&path_var).any(|d| d.join(exe).is_file()) {
+        return true;
+    }
+    // macOS GUI 启动不继承 shell PATH（无 sdkman）；sdkman current 存在即视为系统已有 JDK
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        let cur = std::path::PathBuf::from(home)
+            .join(".sdkman")
+            .join("candidates")
+            .join("java")
+            .join("current");
+        if cur.join("bin").join("java").is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 /// App 专属 npm 缓存根目录（None 表示未注册）。
@@ -222,9 +238,9 @@ fn resolve_program(program: &str) -> Option<Resolved> {
         let p = Path::new(program);
         if p.is_file() {
             let wrap = is_script_ext(p);
-            // 脚本（.cmd/.bat）可 cmd 包装；PE 可执行直接运行；
-            // 其他（无扩展名 sh 脚本等）非有效 Win32 程序，交给补扩展名分支再试
-            if wrap || is_pe_executable(p) {
+            // Windows：.cmd/.bat 需 cmd 包装，无扩展名文件需通过 PE 校验（sh 脚本直接
+            // CreateProcess 会报 os error 193）；macOS/Linux 无 MZ 头限制，文件存在即可执行
+            if !cfg!(windows) || wrap || is_pe_executable(p) {
                 return Some(Resolved { program: p.to_path_buf(), needs_cmd_wrap: wrap, node_cli: None });
             }
         }
@@ -267,6 +283,10 @@ fn resolve_program(program: &str) -> Option<Resolved> {
     for dir in HARMONY_EXTRA_PATH.lock().unwrap().iter() {
         let exact = dir.join(program);
         if exact.is_file() {
+            // 非 Windows：文件存在即可直接执行（Mach-O 二进制与 sh 脚本均无 MZ 头）
+            if !cfg!(windows) {
+                return Some(Resolved { program: exact, needs_cmd_wrap: false, node_cli: None });
+            }
             if is_script_ext(&exact) {
                 return Some(Resolved { program: exact, needs_cmd_wrap: true, node_cli: None });
             }
@@ -289,6 +309,10 @@ fn resolve_program(program: &str) -> Option<Resolved> {
         // 先尝试原样（可能是 .exe 名），再按 PATHEXT 补扩展名
         let exact = dir.join(program);
         if exact.is_file() {
+            // 非 Windows：文件存在即可直接执行（Mach-O 二进制与 sh 脚本均无 MZ 头）
+            if !cfg!(windows) {
+                return Some(Resolved { program: exact, needs_cmd_wrap: false, node_cli: None });
+            }
             if is_script_ext(&exact) {
                 return Some(Resolved { program: exact, needs_cmd_wrap: true, node_cli: None });
             }

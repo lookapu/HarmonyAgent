@@ -26,8 +26,26 @@ const DEFAULT_FILE: &str = "default.txt";
 const PROGRESS_EVENT: &str = "jdk-install-progress";
 /// Adoptium API：列 LTS feature 版本
 const AVAILABLE_API: &str = "https://api.adoptium.net/v3/info/available_releases";
-/// Adoptium API：指定 feature 的 latest 资产（取 windows x64 jdk zip 下载链接）
-const ASSETS_API: &str = "https://api.adoptium.net/v3/assets/latest/{feature}/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse";
+/// Adoptium 资产 API：按当前平台动态拼 os/架构（mac 上 GUI 与 shell 环境一致，需 arm64/x64 区分）
+fn assets_api(feature: &str) -> String {
+    let (os, arch) = if cfg!(windows) {
+        ("windows", "x64")
+    } else if cfg!(target_os = "macos") {
+        if std::env::consts::ARCH == "aarch64" {
+            ("macos", "aarch64")
+        } else {
+            ("macos", "x64")
+        }
+    } else {
+        ("linux", if std::env::consts::ARCH == "aarch64" { "aarch64" } else { "x64" })
+    };
+    format!("https://api.adoptium.net/v3/assets/latest/{feature}/hotspot?architecture={arch}&image_type=jdk&os={os}&vendor=eclipse")
+}
+
+/// 当前平台 JDK 压缩包扩展名（Adoptium：Windows zip，macOS/Linux tar.gz）
+fn archive_suffix() -> &'static str {
+    if cfg!(windows) { ".zip" } else { ".tar.gz" }
+}
 /// 更新检查缓存 TTL（10 分钟；安装/卸载后立即失效）
 const UPDATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// 更新检查缓存：feature → 最新版本号（静态内存缓存，避免每次进健康页都请求 Adoptium API）
@@ -79,13 +97,27 @@ pub fn init_jdk_runtime(app: &tauri::AppHandle) {
     crate::utils::process::set_default_jdk_dir(default_jdk_dir(app));
 }
 
-/// 默认 JDK 目录：default.txt 指定的 feature（升级版优先，其次捆绑版同 feature）
+/// JDK 可执行文件路径（跨平台：Windows 为 java.exe，macOS/Linux 为 java）
+fn java_bin(dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        dir.join("bin").join("java.exe")
+    } else {
+        dir.join("bin").join("java")
+    }
+}
+
+/// 目录下是否存在 JDK 可执行文件（作为「已安装 JDK」的判定）
+fn has_java_bin(dir: &Path) -> bool {
+    java_bin(dir).is_file()
+}
+
+/// 默认 JDK 目录：default.txt 指定的 feature（升级版优先，其次捆绑版同 feature ）
 /// → 最高 feature 升级版 → 捆绑版 → None
 pub fn default_jdk_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     // default.txt 指定 feature：升级版优先，捆绑版 feature 匹配时兑底
     if let Some(feat) = default_feature(app) {
         let upgraded = upgraded_root(app).map(|r| r.join(format!("jdk-{feat}")));
-        if upgraded.as_ref().is_some_and(|d| d.join("bin").join("java.exe").is_file()) {
+        if upgraded.as_ref().is_some_and(|d| has_java_bin(d)) {
             return upgraded;
         }
         if let Some(b) = bundled_dir(app) {
@@ -100,17 +132,53 @@ pub fn default_jdk_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     }
     // 兑底捆绑版
     let b = bundled_dir(app)?;
-    b.join("bin").join("java.exe").is_file().then_some(b)
+    has_java_bin(&b).then_some(b)
+}
+
+/// 探测系统 JAVA_HOME（跨平台）：优先环境变量；macOS GUI 启动不继承 shell 环境，
+/// 追加 /usr/libexec/java_home 与 sdkman 常见路径兜底
+fn system_java_home() -> Option<String> {
+    if let Some(v) = std::env::var_os("JAVA_HOME") {
+        let s = v.to_string_lossy().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // /usr/libexec/java_home：macOS 官方 JDK 定位工具（安装 Java.framework 时生效）
+        if let Ok(out) = std::process::Command::new("/usr/libexec/java_home").output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() && Path::new(&s).join("bin").join("java").is_file() {
+                    return Some(s);
+                }
+            }
+        }
+        // sdkman：GUI 启动时 JAVA_HOME 不可见，但目录真实存在（current 为符号链接，is_file 跟随）
+        if let Some(home) = std::env::var_os("HOME") {
+            let cur = PathBuf::from(home)
+                .join(".sdkman")
+                .join("candidates")
+                .join("java")
+                .join("current");
+            if cur.join("bin").join("java").is_file() {
+                return Some(cur.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// 查询 JDK 运行时状态（版本列表、默认版本、系统 JAVA_HOME）
 pub fn get_jdk_runtime_info(app: &tauri::AppHandle) -> JdkRuntimeInfo {
     let active = default_jdk_dir(app);
+    let sys = system_java_home();
     let mut versions: Vec<JdkVersionInfo> = Vec::new();
 
     // 捆绑版
     if let Some(b) = bundled_dir(app) {
-        if b.join("bin").join("java.exe").is_file() {
+        if has_java_bin(&b) {
             let feat = feature_of(&b).unwrap_or_default();
             let full = read_release_full(&b).unwrap_or_default();
             versions.push(JdkVersionInfo {
@@ -142,14 +210,34 @@ pub fn get_jdk_runtime_info(app: &tauri::AppHandle) -> JdkRuntimeInfo {
     // 同一 feature 升级版与捆绑版并存时，升级版在前
     versions.sort_by_key(|v| if v.source == "upgraded" { 0 } else { 1 });
 
+    // 无内置 JDK 时，系统 JDK（JAVA_HOME / macOS sdkman 探测）作为可用项兑底，
+    // 避免 mac 上明明装了 JDK 却显示「未检测到任何 JDK」
+    if versions.is_empty() {
+        if let Some(sys_path) = &sys {
+            let p = PathBuf::from(sys_path);
+            let full = read_release_full(&p).unwrap_or_default();
+            let feature = read_release_java_version(&p)
+                .and_then(|v| v.split('.').next().map(|s| s.to_string()))
+                .unwrap_or_default();
+            versions.push(JdkVersionInfo {
+                is_default: true,
+                feature,
+                full_version: full,
+                path: crate::utils::path::normalize_path(sys_path),
+                source: "system".into(),
+            });
+        }
+    }
+    // 生效目录：内置默认优先，其次系统 JDK
+    let active_dir = active.clone().or_else(|| sys.clone().map(PathBuf::from));
+
     JdkRuntimeInfo {
-        active_dir: active
+        active_dir: active_dir
             .as_ref()
             .map(|d| crate::utils::path::normalize_path(&d.to_string_lossy())),
-        active_version: active.as_ref().and_then(|d| read_release_java_version(d)),
+        active_version: active_dir.as_ref().and_then(|d| read_release_java_version(d)),
         versions,
-        system_java_home: std::env::var_os("JAVA_HOME")
-            .map(|v| v.to_string_lossy().to_string()),
+        system_java_home: sys,
     }
 }
 
@@ -199,14 +287,14 @@ pub async fn install_jdk(
         return Err("版本号格式不正确（应为 feature 号，如 17）".into());
     }
 
-    // 1. 网络检查 + 查询最新资产，定位 windows x64 jdk zip 下载链接与 SHA256
+    // 1. 网络检查 + 查询最新资产，定位当前平台 JDK 压缩包下载链接与 SHA256
     runtime_progress::emit(
         app,
         PROGRESS_EVENT,
         &RuntimeProgress::phase("check", format!("检查网络与 JDK {feature} 最新版本…")),
     );
     let client = build_download_client(use_proxy, 15)?;
-    let url = ASSETS_API.replace("{feature}", &feature);
+    let url = assets_api(&feature);
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -225,13 +313,13 @@ pub async fn install_jdk(
         .json()
         .await
         .map_err(|e| format!("解析资产列表失败: {e}"))?;
-    let (link, checksum, latest_ver) = pick_jdk_zip(&assets, &feature)?;
+    let (link, checksum, latest_ver) = pick_jdk_pkg(&assets, &feature)?;
 
-    // 2. 流式下载到临时 zip（逐块写盘 + 边下边算 SHA256，不占内存，进度事件推送）
+    // 2. 流式下载到临时压缩包（逐块写盘 + 边下边算 SHA256，不占内存，进度事件推送）
     let dl_client = build_download_client(use_proxy, 3600)?;
     let data_dir = app.path().app_data_dir().map_err(|e| format!("无法解析应用数据目录: {e}"))?;
     let root = data_dir.join(UPGRADED_ROOT);
-    let zip_path = root.join(format!("jdk-{feature}.zip"));
+    let archive_path = root.join(format!("jdk-{feature}{}", archive_suffix()));
     std::fs::create_dir_all(&root).map_err(|e| format!("创建 JDK 目录失败: {e}"))?;
     let ver = latest_ver.clone();
     let feat = feature.clone();
@@ -240,7 +328,7 @@ pub async fn install_jdk(
         PROGRESS_EVENT,
         &dl_client,
         &link,
-        &zip_path,
+        &archive_path,
         move |pct| {
             if pct.is_empty() {
                 format!("下载 JDK {feat}（{ver}）…")
@@ -260,7 +348,7 @@ pub async fn install_jdk(
     );
     if let Some(expect) = checksum {
         if !expect.eq_ignore_ascii_case(&actual_sha) {
-            let _ = std::fs::remove_file(&zip_path);
+            let _ = std::fs::remove_file(&archive_path);
             return Err(format!(
                 "SHA256 校验失败：下载内容与官方校验值不一致（可能被损坏或劫持）\n本地：{actual_sha}\n期望：{expect}"
             ));
@@ -269,7 +357,7 @@ pub async fn install_jdk(
 
     // 4. 解压到 jdk_runtime/jdk-<feature>（替换同 feature 旧版），随后瘦身删无用大文件
     let target = root.join(format!("jdk-{feature}"));
-    let zip_for_task = zip_path.clone();
+    let archive_for_task = archive_path.clone();
     let app_for_task = app.clone();
     let slim_target = target.clone();
     tokio::task::spawn_blocking(move || {
@@ -278,7 +366,12 @@ pub async fn install_jdk(
             PROGRESS_EVENT,
             &RuntimeProgress::phase("extract", "解压安装中…"),
         );
-        let r = extract_zip(&zip_for_task, &target).map(|_| {
+        let r = if cfg!(windows) {
+            extract_zip(&archive_for_task, &target)
+        } else {
+            extract_targz(&archive_for_task, &target)
+        }
+        .map(|_| {
             slim_jdk(&slim_target);
         });
         runtime_progress::emit(
@@ -290,7 +383,7 @@ pub async fn install_jdk(
     })
     .await
     .map_err(|e| format!("解压任务失败: {e}"))??;
-    let _ = std::fs::remove_file(&zip_path);
+    let _ = std::fs::remove_file(&archive_path);
 
     // 5. 更新检查缓存失效 + 未设置默认版本时，新装版本自动成为默认（首个可用版本即可用）
     invalidate_update_cache();
@@ -427,10 +520,12 @@ fn feature_num(dir: &Path) -> u32 {
 }
 
 /// 从 Adoptium assets JSON 中挑选 windows x64 jdk zip 的下载链接、SHA256 与版本号
-fn pick_jdk_zip(
+/// 选择当前平台 JDK 压缩包资产（Windows zip / macOS·Linux tar.gz）
+fn pick_jdk_pkg(
     assets: &serde_json::Value,
     feature: &str,
 ) -> Result<(String, Option<String>, String), String> {
+    let suffix = archive_suffix();
     let arr = assets
         .as_array()
         .ok_or_else(|| "资产响应格式异常".to_string())?;
@@ -439,7 +534,7 @@ fn pick_jdk_zip(
         let Some(name) = pkg.and_then(|p| p.get("name")).and_then(|n| n.as_str()) else {
             continue;
         };
-        if !name.ends_with(".zip") {
+        if !name.ends_with(suffix) {
             continue;
         }
         let link = pkg
@@ -459,7 +554,7 @@ fn pick_jdk_zip(
             .to_string();
         return Ok((link.to_string(), checksum, ver));
     }
-    Err(format!("未找到 JDK {feature} 的 windows x64 zip 下载项"))
+    Err(format!("未找到 JDK {feature} 的 {suffix} 下载项"))
 }
 
 /// 检查已装 JDK 是否有可用的补丁更新（Adoptium latest assets 与本地 release 版本比较）。
@@ -537,7 +632,7 @@ fn invalidate_update_cache() {
 /// 查询指定 feature 的最新完整版本号（Adoptium assets 的 version.semver）
 async fn fetch_latest_full_version(feature: &str) -> Result<String, String> {
     let client = build_download_client(None, 15)?;
-    let url = ASSETS_API.replace("{feature}", feature);
+    let url = assets_api(feature);
     let resp = client
         .get(&url)
         .send()
@@ -668,6 +763,53 @@ fn extract_zip(zip_path: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// macOS/Linux：系统 tar 解压 Adoptium tar.gz（解到临时目录后与 extract_zip
+/// 相同的落盘模式：顶层 jdk-xxx 内容提升到 target）
+fn extract_targz(archive: &Path, target: &Path) -> Result<(), String> {
+    let parent = target.parent().unwrap_or(Path::new("."));
+    let tmp = parent.join(format!(
+        "{}.{}.tmp",
+        target.file_name().and_then(|n| n.to_str()).unwrap_or("jdk"),
+        std::process::id()
+    ));
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp).map_err(|e| format!("清理临时目录失败: {e}"))?;
+    }
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("创建临时目录失败: {e}"))?;
+
+    let st = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .current_dir(&tmp)
+        .status()
+        .map_err(|e| format!("调用系统 tar 失败: {e}"))?;
+    if !st.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err("tar 解压失败（压缩包可能损坏或已被占用）".to_string());
+    }
+
+    let root = std::fs::read_dir(&tmp)
+        .map_err(|e| format!("读取临时目录失败: {e}"))?
+        .next()
+        .and_then(|r| r.ok())
+        .map(|r| r.path())
+        .filter(|p| p.is_dir())
+        .ok_or_else(|| "压缩包结构异常：未找到顶层目录".to_string())?;
+
+    if target.exists() {
+        std::fs::remove_dir_all(target)
+            .map_err(|e| format!("替换旧版本失败（请先停止正在运行的 java 进程）: {e}"))?;
+    }
+    std::fs::create_dir_all(target).map_err(|e| format!("创建目标目录失败: {e}"))?;
+    for entry in std::fs::read_dir(&root).map_err(|e| format!("读取解压结果失败: {e}"))? {
+        let e = entry.map_err(|e| format!("读取解压结果失败: {e}"))?;
+        let dst = target.join(e.file_name());
+        std::fs::rename(e.path(), &dst).map_err(|e| format!("移动文件失败: {e}"))?;
+    }
+    std::fs::remove_dir_all(&tmp).map_err(|e| format!("清理临时目录失败: {e}"))?;
+    Ok(())
+}
+
 /// 构建下载客户端（与 node_runtime 升级一致的代理三态策略；下载大文件用长超时）。
 fn build_download_client(
     use_proxy: Option<bool>,
@@ -727,24 +869,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Adoptium assets 中跳过非 zip（msi），只取 windows x64 jdk zip 的链接、校验值与版本号
+    /// Adoptium assets 中跳过非本平台后缀（msi 等），只取当前平台（Windows zip / macOS·Linux tar.gz）的包
     #[test]
-    fn test_pick_jdk_zip_skips_msi() {
+    fn test_pick_jdk_pkg_skips_other_ext() {
+        let suffix = archive_suffix();
+        let bad_name = if cfg!(windows) {
+            "OpenJDK17U-jdk_x64_windows_hotspot_17.0.20_8.msi"
+        } else {
+            "OpenJDK17U-jdk_x64_mac_hotspot_17.0.20_8.dmg"
+        };
+        let good_name = if cfg!(windows) {
+            "OpenJDK17U-jdk_x64_windows_hotspot_17.0.20_8.zip"
+        } else {
+            "OpenJDK17U-jdk_x64_mac_hotspot_17.0.20_8.tar.gz"
+        };
         let assets = serde_json::json!([
-            { "binary": { "package": { "name": "OpenJDK17U-jdk_x64_windows_hotspot_17.0.20_8.msi", "link": "https://x/msi", "checksum": "aaa" } }, "version": { "semver": "17.0.20+8" } },
-            { "binary": { "package": { "name": "OpenJDK17U-jdk_x64_windows_hotspot_17.0.20_8.zip", "link": "https://x/zip", "checksum": "bbb" } }, "version": { "semver": "17.0.20+8" } }
+            { "binary": { "package": { "name": bad_name, "link": "https://x/bad", "checksum": "aaa" } }, "version": { "semver": "17.0.20+8" } },
+            { "binary": { "package": { "name": good_name, "link": "https://x/good", "checksum": "bbb" } }, "version": { "semver": "17.0.20+8" } }
         ]);
-        let (link, checksum, ver) = pick_jdk_zip(&assets, "17").unwrap();
-        assert_eq!(link, "https://x/zip");
+        let (link, checksum, ver) = pick_jdk_pkg(&assets, "17").unwrap();
+        assert_eq!(link, "https://x/good");
         assert_eq!(checksum.as_deref(), Some("bbb"));
         assert_eq!(ver, "17.0.20+8");
+        assert!(good_name.ends_with(suffix));
     }
 
-    /// 无任何 zip 项时报错
+    /// 无任何本平台包时报错
     #[test]
-    fn test_pick_jdk_zip_none() {
+    fn test_pick_jdk_pkg_none() {
         let assets = serde_json::json!([]);
-        assert!(pick_jdk_zip(&assets, "17").is_err());
+        assert!(pick_jdk_pkg(&assets, "17").is_err());
     }
 
     /// 完整版本号解析：17.0.20+8 → (17, 0, 20, 8)；非法格式返回 None

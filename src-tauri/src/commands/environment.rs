@@ -282,6 +282,26 @@ fn version_arg(tool: &str) -> &'static str {
     }
 }
 
+/// 定位 DevEco Studio 自带 Node 运行时（tools/node），供 hvigorw/ohpm 版本读取兑底
+fn deveco_node_home() -> Option<std::path::PathBuf> {
+    // macOS：/Applications/DevEco-Studio.app（连字符）与 DevEco Studio.app（空格）两种命名
+    for base in [
+        "/Applications/DevEco-Studio.app/Contents",
+        "/Applications/DevEco Studio.app/Contents",
+    ] {
+        let node = std::path::PathBuf::from(base).join("tools").join("node");
+        let probe = if cfg!(windows) {
+            node.join("node.exe")
+        } else {
+            node.join("bin").join("node")
+        };
+        if probe.is_file() {
+            return Some(node);
+        }
+    }
+    None
+}
+
 /// 读取工具版本（默认执行 --version，15 秒超时防卡死）。
 /// 返回首行非空输出；执行失败返回友好错误（部分工具如 hvigorw 首次运行较慢）。
 #[tauri::command]
@@ -291,17 +311,54 @@ pub async fn get_tool_version(path: String) -> Result<String, String> {
         .and_then(|n| n.to_str())
         .unwrap_or("");
     let mut cmd = crate::utils::process::command(&path, &[version_arg(tool).to_string()])?;
+    // hvigorw / ohpm 依赖 node：注入 DevEco Studio 自带 Node（tools/node）兑底，
+    // 避免 GUI 启动环境未继承 shell PATH 时报 "NODE_HOME is not set"（macOS 常见）
+    let lower = tool.to_ascii_lowercase();
+    if lower.starts_with("hvigorw") || lower.starts_with("ohpm") {
+        if let Some(home) = deveco_node_home() {
+            cmd.env("NODE_HOME", &home);
+            let bin = if cfg!(windows) { home.clone() } else { home.join("bin") };
+            if bin.is_dir() {
+                // GUI 启动（LaunchServices）时 PATH 可能为空/极简，脚本 shebang
+                // （#!/usr/bin/env bash）依赖基础目录，必须补齐再前置 node
+                let mut dirs = vec![bin];
+                for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+                    dirs.push(std::path::PathBuf::from(d));
+                }
+                dirs.extend(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                ));
+                if let Ok(p) = std::env::join_paths(&dirs) {
+                    cmd.env("PATH", p);
+                }
+            }
+        }
+    }
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let output = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output())
         .await
-        .map_err(|_| "执行超时（15 秒）".to_string())?
-        .map_err(|e| format!("执行失败: {e}"))?;
+        .map_err(|_| {
+            eprintln!("[tool_version] {path} 执行超时（15 秒）");
+            "执行超时（15 秒）".to_string()
+        })?
+        .map_err(|e| {
+            eprintln!("[tool_version] {path} 执行失败: {e}");
+            format!("执行失败: {e}")
+        })?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!(
+            "[tool_version] {path} 退出码 {}: stdout={} stderr={}",
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            stderr.trim()
+        );
         return Err(format!(
             "退出码 {}: {}",
             output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -334,6 +391,26 @@ mod tests {
         assert_eq!(version_arg("ohpm.bat"), "--version");
         assert_eq!(version_arg("node.exe"), "--version");
         assert_eq!(version_arg(""), "--version");
+    }
+
+    /// macOS 实测：DevEco Studio 自带 hvigorw/ohpm 版本读取（含 NODE_HOME 注入链路）
+    /// 仅本机 DevEco-Studio.app 存在时运行，验证 get_tool_version 完整路径
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn get_tool_version_hvigorw_macos_manual() {
+        for (tool, sub) in [("hvigorw", "hvigor"), ("ohpm", "ohpm")] {
+            let path = format!(
+                "/Applications/DevEco-Studio.app/Contents/tools/{}/bin/{}",
+                sub, tool
+            );
+            if !std::path::Path::new(&path).is_file() {
+                continue;
+            }
+            match get_tool_version(path.clone()).await {
+                Ok(v) => eprintln!("[manual] {tool} 版本读取成功: {v}"),
+                Err(e) => eprintln!("[manual] {tool} 版本读取失败: {e}"),
+            }
+        }
     }
 
     /// 官方包嵌套布局：target/command-line-tools/{bin,version.txt} → 拉平为 target/{bin,version.txt}

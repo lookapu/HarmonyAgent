@@ -474,8 +474,9 @@ fn common_sdk_candidates(studio: &Option<PathBuf>) -> Vec<PathBuf> {
             v.push(home.join("AppData").join("Local").join("Huawei").join("Sdk"));
             v.push(home.join("AppData").join("Local").join("OpenHarmony").join("Sdk"));
         } else if cfg!(target_os = "macos") {
-            // macOS：DevEco Studio 自带 SDK 与用户级 SDK 目录
+            // macOS：DevEco Studio 自带 SDK 与用户级 SDK 目录（安装包名可能为 DevEco-Studio 连字符）
             v.push(PathBuf::from("/Applications/DevEco Studio.app/Contents/sdk"));
+            v.push(PathBuf::from("/Applications/DevEco-Studio.app/Contents/sdk"));
             v.push(home.join("Library").join("Huawei").join("Sdk"));
             v.push(home.join("Library").join("OpenHarmony").join("Sdk"));
         } else {
@@ -511,6 +512,7 @@ fn common_cli_candidates(studio: &Option<PathBuf>) -> Vec<PathBuf> {
             v.push(home.join("command-line-tools"));
             v.push(home.join("Library").join("Huawei").join("command-line-tools"));
             v.push(PathBuf::from("/Applications/DevEco Studio.app/Contents/command-line-tools"));
+            v.push(PathBuf::from("/Applications/DevEco-Studio.app/Contents/command-line-tools"));
             v.push(PathBuf::from("/opt/command-line-tools"));
         } else {
             v.push(home.join("command-line-tools"));

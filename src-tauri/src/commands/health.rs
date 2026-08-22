@@ -304,9 +304,12 @@ pub fn discover_deveco_dirs() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        let app = PathBuf::from("/Applications/DevEco Studio.app/Contents");
-        if app.is_dir() {
-            dirs.push(app);
+        // 安装包名可能为 DevEco-Studio.app（连字符）或 DevEco Studio.app（空格），两种都探测
+        for app_name in ["DevEco-Studio.app", "DevEco Studio.app"] {
+            let app = PathBuf::from("/Applications").join(app_name).join("Contents");
+            if app.is_dir() {
+                dirs.push(app);
+            }
         }
     }
     dirs.sort();
