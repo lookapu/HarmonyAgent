@@ -30,7 +30,12 @@ export class ErrorBoundary extends Component<Props, State> {
   componentDidCatch(error: Error, info: { componentStack?: string }) {
     // 简单 console 即可；后续可接 Sentry 等
     console.error('[ErrorBoundary] Caught error:', error, info.componentStack)
+    this.componentStack = info.componentStack
   }
+
+  componentStack: string | undefined
+
+  getDetail = () => `${this.componentStack ?? ''}\n${this.state.error?.stack ?? ''}`
 
   reset = () => this.setState({ error: null })
 
@@ -63,7 +68,7 @@ export class ErrorBoundary extends Component<Props, State> {
                 onClick={() => {
                   // 复制到剪贴板
                   try {
-                    void navigator.clipboard.writeText(`${error.name}: ${error.message}\n${error.stack ?? ''}`)
+                    void navigator.clipboard.writeText(`${error.name}: ${error.message}\n${this.getDetail()}`)
                   } catch {
                     // 剪贴板不可用 → 静默
                   }

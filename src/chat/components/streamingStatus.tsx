@@ -104,6 +104,9 @@ export const RunningTaskOpsBadge = memo(function RunningTaskOpsBadge({
   )
 })
 
+/** 模块级常量：selector 内若写 `?? []` 每次渲染创建新数组引用，useShallow 浅比较判变 → 无限重渲染（#185）。 */
+const EMPTY_BLOCKERS: string[] = []
+
 /** 静默检测只订阅当前流式桶的时间戳，不让 token/秒表变化波及主页面。 */
 export const SilentStreamHint = memo(function SilentStreamHint({
   conversationId,
@@ -120,7 +123,7 @@ export const SilentStreamHint = memo(function SilentStreamHint({
         startedAt: bucket?.startedAt ?? null,
         lastDeltaAt: bucket?.lastDeltaAt ?? null,
         remediationCount: bucket?.remediationCount ?? 0,
-        remediationBlockers: bucket?.remediationBlockers ?? [],
+        remediationBlockers: bucket?.remediationBlockers ?? EMPTY_BLOCKERS,
       }
     }),
   )
