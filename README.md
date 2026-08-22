@@ -132,9 +132,9 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 287 个 Tauri IPC 入口 · 54 个 service 模块        │
+│  - 296 个 Tauri IPC 入口 · 54 个 service 模块        │
 │  - agent/ 36 个顶层模块 · tools/ 29 文件 · 201 工具  │
-│  - SQLite + 76 个迁移 · Run/步骤/工具全链路事件溯源  │
+│  - SQLite + 77 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -280,6 +280,7 @@ npx tauri build
 ## 文档
 
 - [持续演进任务路线图](docs/ROADMAP.md) — 长会话、Agent 工具链、HarmonyOS 闭环与生态集成的阶段任务和验收标准
+- [官方 DevEco CLI 的 MCP 接入](docs/DEVECO_CLI_MCP_INTEGRATION.md) — 内置 MCP 模板、命令解析增强与自研工具分工策略
 - [长会话上下文 V2](docs/CONTEXT_V2.md) — 数据映射、事实优先级、预算和兼容策略
 - [架构文档 v2](docs/ARCHITECTURE.md) — 产品定位、模块边界、设计取舍
 - [LAN 访问说明](docs/LAN_ACCESS.md) — 局域网服务的启用、token 管理与安全边界
