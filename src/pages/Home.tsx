@@ -33,9 +33,11 @@ import {
   compactConversation,
   getConversationContext,
   getConversationContextV2,
+  getSessionHealth,
   setConversationContextPin,
   type ConversationContextInfo,
   type ConversationContextV2,
+  type SessionHealthV2,
   searchMessages,
   searchMessagesAllProjects,
   type MessageSearchHit,
@@ -727,6 +729,7 @@ export default function Home() {
   // 上下文可视条：消息数 + 摘要状态 + token 预算占用（切换会话/收到新消息后刷新）
   const [ctxInfo, setCtxInfo] = useState<ConversationContextInfo | null>(null)
   const [ctxV2Detail, setCtxV2Detail] = useState<ConversationContextV2 | null>(null)
+  const [sessionHealth, setSessionHealth] = useState<SessionHealthV2 | null>(null)
   const [ctxV2Open, setCtxV2Open] = useState(false)
   const [ctxDecisionDraft, setCtxDecisionDraft] = useState('')
   const reconciliationNoticeRef = useRef('')
@@ -736,6 +739,7 @@ export default function Home() {
     if (!convId) {
       setCtxInfo(null)
       setCtxV2Detail(null)
+      setSessionHealth(null)
       setCtxV2Open(false)
       return
     }
@@ -747,6 +751,9 @@ export default function Home() {
     getConversationContextV2(convId)
       .then((context) => !cancelled && setCtxV2Detail(context))
       .catch(() => !cancelled && setCtxV2Detail(null))
+    getSessionHealth(convId)
+      .then((health) => !cancelled && setSessionHealth(health))
+      .catch(() => !cancelled && setSessionHealth(null))
     return () => {
       cancelled = true
     }
@@ -1225,6 +1232,10 @@ export default function Home() {
       if (cancelled || !conv || e.payload.conversation_id !== conv.id) return
       getConversationContext(conv.id)
         .then((info) => !cancelled && setCtxInfo(info))
+        .catch(() => {})
+      // 压缩会递增健康度 compress_count，同步刷新健康度面板
+      getSessionHealth(conv.id)
+        .then((health) => !cancelled && setSessionHealth(health))
         .catch(() => {})
     })
       .then((u) => {
@@ -4992,12 +5003,66 @@ export default function Home() {
                           </span>
                         )}
                         <span className="mb-2 block">
-                          {t('home.ctxV2Budget', {
-                            hot: ctxV2Detail.budget.hot_tokens.toLocaleString(),
-                            task: ctxV2Detail.budget.task_tokens.toLocaleString(),
-                            project: ctxV2Detail.budget.project_tokens.toLocaleString(),
-                            archive: ctxV2Detail.budget.archive_tokens.toLocaleString(),
-                          })}
+                          <span className="mb-1 flex items-center gap-1">
+                            <span className="font-medium text-[var(--text-primary)]">
+                              {t('home.ctxBudgetBarTitle')}
+                            </span>
+                            {ctxV2Detail.budget.profile && (
+                              <span className="rounded bg-[var(--accent)]/10 px-1 py-px text-[10px] text-[var(--accent)]">
+                                {ctxV2Detail.budget.profile}
+                              </span>
+                            )}
+                            <span className="text-[var(--text-muted)]">
+                              {t('home.ctxV2Invalidations', {
+                                count: ctxV2Detail.invalidation_epoch,
+                              })}
+                            </span>
+                          </span>
+                          <span className="flex h-2 w-full overflow-hidden rounded-sm bg-[var(--bg-hover)]">
+                            <span
+                              className="bg-[var(--accent)]"
+                              title={`system ${ctxV2Detail.budget.system_tokens.toLocaleString()}`}
+                              style={{
+                                width: `${(ctxV2Detail.budget.system_tokens / Math.max(ctxV2Detail.budget.total_tokens, 1)) * 100}%`,
+                              }}
+                            />
+                            <span
+                              className="bg-[var(--success)]"
+                              title={`task ${ctxV2Detail.budget.task_tokens.toLocaleString()}`}
+                              style={{
+                                width: `${(ctxV2Detail.budget.task_tokens / Math.max(ctxV2Detail.budget.total_tokens, 1)) * 100}%`,
+                              }}
+                            />
+                            <span
+                              className="bg-[var(--warning)]"
+                              title={`project ${ctxV2Detail.budget.project_tokens.toLocaleString()}`}
+                              style={{
+                                width: `${(ctxV2Detail.budget.project_tokens / Math.max(ctxV2Detail.budget.total_tokens, 1)) * 100}%`,
+                              }}
+                            />
+                            <span
+                              className="bg-[var(--info)]"
+                              title={`archive ${ctxV2Detail.budget.archive_tokens.toLocaleString()}`}
+                              style={{
+                                width: `${(ctxV2Detail.budget.archive_tokens / Math.max(ctxV2Detail.budget.total_tokens, 1)) * 100}%`,
+                              }}
+                            />
+                            <span
+                              className="bg-[var(--text-muted)]/40"
+                              title={`hot ${ctxV2Detail.budget.hot_tokens.toLocaleString()}`}
+                              style={{
+                                width: `${(ctxV2Detail.budget.hot_tokens / Math.max(ctxV2Detail.budget.total_tokens, 1)) * 100}%`,
+                              }}
+                            />
+                          </span>
+                          <span className="mt-1 block text-[10px] text-[var(--text-muted)]">
+                            {t('home.ctxV2Budget', {
+                              hot: ctxV2Detail.budget.hot_tokens.toLocaleString(),
+                              task: ctxV2Detail.budget.task_tokens.toLocaleString(),
+                              project: ctxV2Detail.budget.project_tokens.toLocaleString(),
+                              archive: ctxV2Detail.budget.archive_tokens.toLocaleString(),
+                            })}
+                          </span>
                         </span>
                         {ctxV2Detail.facts.slice(0, 8).map((fact) => (
                           <span key={fact.id} className="mb-1 block break-all">
@@ -5012,6 +5077,41 @@ export default function Home() {
                         ))}
                         {ctxV2Detail.facts.length === 0 && ctxV2Detail.artifacts.length === 0 && (
                           <span className="block text-[var(--text-muted)]">{t('home.ctxV2Empty')}</span>
+                        )}
+                        {sessionHealth && (
+                          <span
+                            className={`mt-1 block rounded-md border p-2 ${
+                              sessionHealth.degraded
+                                ? 'border-[var(--warning)]/30 bg-[var(--warning)]/5'
+                                : 'border-[var(--border)]'
+                            }`}
+                          >
+                            <span className="mb-1 flex items-center gap-1 font-medium text-[var(--text-primary)]">
+                              {t('home.ctxHealthTitle')}
+                              {sessionHealth.degraded && (
+                                <span className="rounded bg-[var(--warning)]/15 px-1 py-px text-[10px] text-[var(--warning)]">
+                                  {t('home.ctxHealthDegraded')}
+                                </span>
+                              )}
+                            </span>
+                            <span className="block text-[10px] text-[var(--text-muted)]">
+                              {t('home.ctxHealthMetrics', {
+                                compress: sessionHealth.compress_count,
+                                flip: Math.round(sessionHealth.fact_flip_rate * 100),
+                                corrected: sessionHealth.corrected_count,
+                                usage: Math.round(sessionHealth.budget_usage_ratio * 100),
+                              })}
+                            </span>
+                            {sessionHealth.advice.length > 0 && (
+                              <span className="mt-1 block space-y-0.5">
+                                {sessionHealth.advice.map((item) => (
+                                  <span key={item} className="block break-all text-[10px] text-[var(--warning)]">
+                                    · {item}
+                                  </span>
+                                ))}
+                              </span>
+                            )}
+                          </span>
                         )}
                       </span>
                     )}

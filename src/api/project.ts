@@ -270,12 +270,34 @@ export interface ConversationContextInfo {
       project_tokens: number
       archive_tokens: number
       hot_tokens: number
+      /** 预算画像：balanced / explore / execute / verify（按任务阶段动态分配） */
+      profile: string
     }
   } | null
 }
 
 export const getConversationContext = (conversationId: string) =>
   invokeWithError<ConversationContextInfo>('conversation_context', { conversationId })
+
+/** 会话健康度与摘要退化预警（长会话可观测性，后端 compute_session_health 口径） */
+export interface SessionHealthV2 {
+  conversation_id: string
+  message_count: number
+  compress_count: number
+  last_compress_at: number | null
+  active_facts: number
+  invalidated_facts: number
+  fact_versions: number
+  fact_flip_rate: number
+  reconciliation_count: number
+  corrected_count: number
+  budget_usage_ratio: number
+  degraded: boolean
+  advice: string[]
+}
+
+export const getSessionHealth = (conversationId: string) =>
+  invokeWithError<SessionHealthV2>('get_session_health', { conversationId })
 
 export interface ConversationContextV2 {
   schema_version: number
