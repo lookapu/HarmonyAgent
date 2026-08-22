@@ -1852,6 +1852,7 @@
     "jdkRuntime": "JDK 运行时",
     "jdkSystemJavaHome": "系统 JAVA_HOME：{{path}}",
     "jdkSrcBundled": "出厂捆绑",
+    "jdkSrcSystem": "系统",
     "jdkSrcUpgraded": "在线安装",
     "jdkDefault": "默认",
     "jdkSetDefault": "设为默认",

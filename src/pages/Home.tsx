@@ -3658,12 +3658,6 @@ export default function Home() {
                       sidebarCollapsed ? 'w-9 h-9 justify-center' : 'w-full pl-3 pr-2 py-[7px]'
                     } ${active ? 'bg-[var(--accent-soft)]' : 'hover:bg-[var(--bg-hover)]'}`}
                   >
-                    {active && !sidebarCollapsed && (
-                      <span className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-4 rounded-full bg-[var(--accent)]" />
-                    )}
-                    {active && sidebarCollapsed && (
-                      <span className="absolute left-1 top-1/2 -translate-y-1/2 w-[3px] h-4 rounded-full bg-[var(--accent)]" />
-                    )}
                     <Icon name="folder" size={15} className={`shrink-0 ${active ? '' : 'opacity-60'}`} />
                     {!sidebarCollapsed && (
                       <>

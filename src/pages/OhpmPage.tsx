@@ -527,7 +527,7 @@ export default function OhpmPage() {
                           className="w-full text-left px-3 py-2 hover:bg-[var(--bg-hover)] transition-colors"
                         >
                           <div className="flex items-center gap-2">
-                            <span className="text-xs font-medium text-[var(--text-primary)] break-all min-w-0">
+                            <span className="flex-1 min-w-0 text-xs font-medium text-[var(--text-primary)] truncate" title={p.package_name}>
                               {highlight(p.package_name, qTrim)}
                             </span>
                             <span className="shrink-0 text-[10px] text-[var(--text-muted)] font-mono">v{p.version}</span>
@@ -538,11 +538,11 @@ export default function OhpmPage() {
                               <span className="shrink-0 text-[10px] text-[var(--text-muted)]">❤ {p.likes}</span>
                             )}
                             {p.author_name && (
-                              <span className="shrink-0 text-[10px] text-[var(--text-muted)] truncate">· {p.author_name}</span>
+                              <span className="shrink-0 max-w-[90px] text-[10px] text-[var(--text-muted)] truncate">· {p.author_name}</span>
                             )}
                             {p.license && (
                               <span
-                                className="shrink-0 rounded px-1 py-0.5 text-[9px] font-mono bg-[var(--bg-hover)] text-[var(--text-secondary)]"
+                                className="shrink-0 max-w-[140px] truncate rounded px-1 py-0.5 text-[9px] font-mono bg-[var(--bg-hover)] text-[var(--text-secondary)]"
                                 title={`License: ${p.license}`}
                               >
                                 {p.license}

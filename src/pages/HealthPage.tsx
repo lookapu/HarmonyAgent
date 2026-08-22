@@ -370,8 +370,9 @@ export default function HealthPage() {
         .map(async (c) => {
           try {
             return [c.detail, await getToolVersion(c.detail)] as const
-          } catch {
-            return [c.detail, t('health.versionReadFailed')] as const
+          } catch (e) {
+            // 失败时带具体原因（超时/退出码），便于定位工具链问题
+            return [c.detail, `${t('health.versionReadFailed')}（${String(e).slice(0, 120)}）`] as const
           }
         }),
     )
@@ -1302,11 +1303,17 @@ export default function HealthPage() {
                       )}
                       <span className="font-mono text-xs">JDK {v.full_version || v.feature}</span>
                       <span className="text-[10px] text-[var(--text-muted)] shrink-0">
-                        {v.source === 'bundled' ? t('health.jdkSrcBundled') : t('health.jdkSrcUpgraded')}
+                        {v.source === 'bundled'
+                          ? t('health.jdkSrcBundled')
+                          : v.source === 'system'
+                            ? t('health.jdkSrcSystem')
+                            : t('health.jdkSrcUpgraded')}
                       </span>
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
-                      {jdkUpdates[v.feature]?.updatable && (
+                      {v.source !== 'system' && (
+                        <>
+                          {jdkUpdates[v.feature]?.updatable && (
                         <button
                           onClick={() => handleJdkInstall(v.feature, true)}
                           disabled={jdkBusy !== null}
@@ -1334,6 +1341,8 @@ export default function HealthPage() {
                         >
                           {t('health.jdkUninstall')}
                         </button>
+                      )}
+                        </>
                       )}
                     </div>
                   </div>

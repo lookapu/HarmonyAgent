@@ -163,6 +163,7 @@ function AdminLayout() {
               key={item.path}
               to={item.path}
               end={item.path === '/' || item.path === '/skills'}
+              draggable={false}
               className={({ isActive }) =>
                 `flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
                   isActive

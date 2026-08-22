@@ -1851,6 +1851,7 @@
     "jdkRuntime": "JDK Runtime",
     "jdkSystemJavaHome": "System JAVA_HOME: {{path}}",
     "jdkSrcBundled": "Bundled",
+    "jdkSrcSystem": "System",
     "jdkSrcUpgraded": "Installed",
     "jdkDefault": "Default",
     "jdkSetDefault": "Set default",
