@@ -257,6 +257,17 @@ function sortRemote(list: RemoteModelInfo[], mode: 'free' | 'price' | 'default')
   })
 }
 
+/** 解析 token 输入：支持纯数字与 K/M 缩写（200K=200000，1M=1000000）；空/非法返回 undefined（走默认值） */
+function parseTokenInput(s: string): number | undefined {
+  const v = s.trim()
+  if (!v) return undefined
+  const m = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(v)
+  if (!m) return undefined
+  const mult = m[2] ? (m[2].toLowerCase() === 'k' ? 1000 : 1_000_000) : 1
+  const n = Math.round(parseFloat(m[1]) * mult)
+  return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
 export default function ProvidersPage() {
   const { t } = useTranslation()
   const [providers, setProviders] = useState<Provider[]>([])
@@ -393,8 +404,8 @@ export default function ProvidersPage() {
           model_id: m,
           input_modalities: looksVisionModel(m) ? ['text', 'image'] : ['text'],
           output_modalities: looksGenerationModel(m) ?? ['text'],
-          context_limit: formCtx.trim() ? Math.max(1, Number(formCtx)) : undefined,
-          output_limit: formOut.trim() ? Math.max(1, Number(formOut)) : undefined,
+          context_limit: parseTokenInput(formCtx),
+          output_limit: parseTokenInput(formOut),
         })),
       })
       setForm({ name: '', provider_type: 'openai-compatible', protocol: 'openai', base_url: '', api_key: '', endpoints: [] })
@@ -645,8 +656,8 @@ export default function ProvidersPage() {
         model_id: m,
         input_modalities: editModIn,
         output_modalities: editModOut,
-        context_limit: editCtx.trim() ? Math.max(1, Number(editCtx)) : undefined,
-        output_limit: editOut.trim() ? Math.max(1, Number(editOut)) : undefined,
+        context_limit: parseTokenInput(editCtx),
+        output_limit: parseTokenInput(editOut),
       })
       setEditModels((prev) => sortModels([...prev, created]))
       setEditModelInput('')
@@ -689,8 +700,9 @@ export default function ProvidersPage() {
     setEditTypeModel(m)
     setEditTypeIn(parseModalities(m.input_modalities))
     setEditTypeOut(parseModalities(m.output_modalities))
-    setEditTypeCtx(m.context_limit > 0 ? String(m.context_limit) : '')
-    setEditTypeOutLimit(m.output_limit > 0 ? String(m.output_limit) : '')
+    // 预填紧凑格式（200K/8K），与输入解析兼容，保存时原样转换回完整 token 数
+    setEditTypeCtx(m.context_limit > 0 ? fmtCtx(m.context_limit) : '')
+    setEditTypeOutLimit(m.output_limit > 0 ? fmtCtx(m.output_limit) : '')
   }
   const toggleTypeMod = (side: 'in' | 'out', mo: Modality) => {
     if (side === 'in') {
@@ -719,8 +731,8 @@ export default function ProvidersPage() {
       const updated = await updateModel(editTypeModel.id, {
         input_modalities: editTypeIn,
         output_modalities: editTypeOut,
-        context_limit: editTypeCtx.trim() ? Math.max(1, Number(editTypeCtx)) : undefined,
-        output_limit: editTypeOutLimit.trim() ? Math.max(1, Number(editTypeOutLimit)) : undefined,
+        context_limit: parseTokenInput(editTypeCtx),
+        output_limit: parseTokenInput(editTypeOutLimit),
       })
       setEditModels((prev) => sortModels(prev.map((x) => (x.id === updated.id ? updated : x))))
       setEditTypeModel(null)
@@ -936,17 +948,17 @@ export default function ProvidersPage() {
             <div className="flex items-center gap-3 flex-wrap">
               <label className="text-[10px] text-[var(--text-muted)]">{t('provider.modelDefaults')}</label>
               <input
-                type="number"
-                min={1}
-                placeholder={t('provider.modelCtx')}
+                type="text"
+                inputMode="numeric"
+                placeholder={t('provider.modelCtxPh')}
                 value={formCtx}
                 onChange={(e) => setFormCtx(e.target.value)}
                 className="w-32 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
               <input
-                type="number"
-                min={1}
-                placeholder={t('provider.modelOut')}
+                type="text"
+                inputMode="numeric"
+                placeholder={t('provider.modelOutPh')}
                 value={formOut}
                 onChange={(e) => setFormOut(e.target.value)}
                 className="w-32 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
@@ -1381,17 +1393,17 @@ export default function ProvidersPage() {
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelDefaults')}</span>
                         <input
-                          type="number"
-                          min={1}
-                          placeholder={t('provider.modelCtx')}
+                          type="text"
+                          inputMode="numeric"
+                          placeholder={t('provider.modelCtxPh')}
                           value={editCtx}
                           onChange={(e) => setEditCtx(e.target.value)}
                           className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                         />
                         <input
-                          type="number"
-                          min={1}
-                          placeholder={t('provider.modelOut')}
+                          type="text"
+                          inputMode="numeric"
+                          placeholder={t('provider.modelOutPh')}
                           value={editOut}
                           onChange={(e) => setEditOut(e.target.value)}
                           className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
@@ -1414,18 +1426,18 @@ export default function ProvidersPage() {
                           <div className="flex items-center gap-2 flex-wrap">
                             <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelCtx')}</span>
                             <input
-                              type="number"
-                              min={1}
-                              placeholder={t('provider.modelCtx')}
+                              type="text"
+                              inputMode="numeric"
+                              placeholder={t('provider.modelCtxPh')}
                               value={editTypeCtx}
                               onChange={(e) => setEditTypeCtx(e.target.value)}
                               className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                             />
                             <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelOut')}</span>
                             <input
-                              type="number"
-                              min={1}
-                              placeholder={t('provider.modelOut')}
+                              type="text"
+                              inputMode="numeric"
+                              placeholder={t('provider.modelOutPh')}
                               value={editTypeOutLimit}
                               onChange={(e) => setEditTypeOutLimit(e.target.value)}
                               className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
