@@ -71,12 +71,24 @@ pub struct EvalDeviceInventorySnapshot {
     pub devices: Vec<EvalDeviceSnapshot>,
 }
 
+/// 长会话退化指标（LC-32）：评测快照记录压缩次数、事实翻转率与退化预警计数，
+/// 退化可度量。数据来自固定评测的 100 轮长会话压力场景真实执行（EC-19）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalLongSessionMetrics {
+    pub compress_count: i64,
+    pub fact_flip_rate: f64,
+    pub degraded_warnings: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EvalMetricsSnapshot {
     pub duration_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_cny: f64,
+    /// 长会话退化指标（旧快照无此字段，读取时回退默认值）
+    #[serde(default)]
+    pub long_session: EvalLongSessionMetrics,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -441,6 +453,25 @@ pub fn scenarios() -> Vec<ReliabilityScenario> {
     scenarios
 }
 
+/// EC-19 压力评测用的内存库：跑全部迁移并准备最小会话数据，
+/// 供 100 轮长会话压缩恢复场景真实执行（不触碰磁盘与外部服务）。
+fn stress_conn() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    crate::db::run_migrations(&conn).unwrap();
+    // 004_agent 的 projects/conversations 有 NOT NULL 约束，完整插入最小行
+    let _ = conn.execute(
+        "INSERT INTO projects(id,name,path,kind,trusted,index_state,created_at)
+         VALUES ('p','eval','/tmp/eval','harmony',1,'ready',1)",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT INTO conversations(id,project_id,title,created_at,updated_at)
+         VALUES ('c','p','eval',1,1)",
+        [],
+    );
+    conn
+}
+
 pub fn run_suite(conn: Option<&Connection>, threshold: f64) -> Result<EvalRun, String> {
     run_suite_with_snapshot(conn, threshold, default_execution_snapshot(), 0)
 }
@@ -472,6 +503,18 @@ pub fn run_suite_with_snapshot(
     } else {
         passed_cases as f64 / results.len() as f64
     };
+    // LC-32：固定评测记录长会话退化指标（100 轮压力场景真实执行，内存库幂等；
+    // 调用方已显式提供时不再覆盖），退化可度量、防压力场景回退
+    if snapshot.metrics.long_session.compress_count == 0
+        && snapshot.metrics.long_session.fact_flip_rate == 0.0
+    {
+        let (_, health) = crate::agent::context::run_long_session_stress(&stress_conn());
+        snapshot.metrics.long_session = EvalLongSessionMetrics {
+            compress_count: health.compress_count,
+            fact_flip_rate: health.fact_flip_rate,
+            degraded_warnings: if health.degraded { 1 } else { 0 },
+        };
+    }
     let created_at = chrono::Utc::now().timestamp_millis();
     snapshot.metrics.duration_ms =
         preparation_duration_ms.saturating_add(started.elapsed().as_millis() as u64);
@@ -898,6 +941,17 @@ fn simulate_harmony_scenario(id: &str) -> Option<String> {
                 .into(),
             )
         }
+        // EC-19：100 轮长会话压缩恢复（多次压缩 + 事实冲突后验收）——
+        // 在内存库真实执行完整压力周期，防压力场景回退（LC-27 进固定评测）
+        "harmony_long_session_100_round" => {
+            let (passed, health) =
+                crate::agent::context::run_long_session_stress(&stress_conn());
+            Some(if passed {
+                "degraded_detected_after_100_rounds".into()
+            } else {
+                format!("long_session_stress_regression:{health:?}")
+            })
+        }
         _ => None,
     }
 }
@@ -1053,13 +1107,17 @@ mod tests {
                 .len()
                 >= 8
         );
-        assert!(run.total_cases >= 26);
+        assert!(run.total_cases >= 27);
         assert_eq!(run.snapshot.schema_version, EVAL_SNAPSHOT_SCHEMA_VERSION);
         assert!(!run.snapshot.model.used);
         assert!(!run.snapshot.prompt.used);
         assert_eq!(run.snapshot.metrics.input_tokens, 0);
         assert_eq!(run.snapshot.metrics.output_tokens, 0);
         assert_eq!(run.snapshot.metrics.cost_cny, 0.0);
+        // LC-32：长会话退化指标已由 100 轮压力场景填充
+        assert_eq!(run.snapshot.metrics.long_session.compress_count, 5);
+        assert!(run.snapshot.metrics.long_session.fact_flip_rate > 0.9);
+        assert_eq!(run.snapshot.metrics.long_session.degraded_warnings, 1);
         assert_eq!(run.snapshot.tools.external_calls, 0);
         assert_eq!(
             run.snapshot.evidence.passed_case_digests.len(),
