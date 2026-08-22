@@ -4298,10 +4298,22 @@ export default function Home() {
                   >
                     <Icon name={item.icon} size={14} />
                     <span className="flex-1 text-left">{t(item.labelKey)}</span>
-                    {item.path === '/health' && envHealth && envHealth !== 'ok' && (
+                    {item.path === '/health' && envHealth && (
                       <span
-                        className={`w-2 h-2 rounded-full shrink-0 ${envHealth === 'bad' ? 'bg-[var(--danger)]' : 'bg-[var(--warning)]'}`}
-                        title={envHealth === 'bad' ? t('home.envHealthBad') : t('home.envHealthWarn')}
+                        className={`w-2 h-2 rounded-full shrink-0 ${
+                          envHealth === 'ok'
+                            ? 'bg-[var(--success)]'
+                            : envHealth === 'bad'
+                              ? 'bg-[var(--danger)]'
+                              : 'bg-[var(--warning)]'
+                        }`}
+                        title={
+                          envHealth === 'ok'
+                            ? t('home.envHealthOk')
+                            : envHealth === 'bad'
+                              ? t('home.envHealthBad')
+                              : t('home.envHealthWarn')
+                        }
                       />
                     )}
                   </button>

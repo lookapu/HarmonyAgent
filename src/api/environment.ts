@@ -31,6 +31,9 @@ export const getEnvironmentInfo = (customPaths?: string[]) =>
 /** 查询 Node 最新 LTS 版本号 */
 export const fetchNodeLatestLts = () => invokeWithError<string>('fetch_node_latest_lts')
 
+/** 查询最近 N 个 Node LTS 版本（降序），供环境页“选择版本”下拉 */
+export const fetchNodeLtsList = () => invokeWithError<string[]>('fetch_node_lts_list')
+
 /** 手动升级工具包：下载 zip 解压到 toolkits/<name>，返回解压目录；useProxy: true=走系统代理 / false=直连 */
 export const installToolkit = (name: string, url: string, useProxy?: boolean) =>
   invokeWithError<string>('install_toolkit', { name, url, useProxy: useProxy ?? null })

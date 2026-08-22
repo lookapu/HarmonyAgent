@@ -17,7 +17,7 @@ import { getJdkRuntime, fetchJdkReleases, installJdk, setDefaultJdk, uninstallJd
 import { listen } from '@tauri-apps/api/event'
 import type { RuntimeProgress } from '../api/runtimeProgress'
 import RuntimeProgressBar from '../components/RuntimeProgressBar'
-import { getAppInfo, fetchNodeLatestLts, installToolkitFromZip, getToolchainCandidates, getToolVersion, type AppInfo, type ToolCandidate } from '../api/environment'
+import { getAppInfo, fetchNodeLatestLts, fetchNodeLtsList, installToolkitFromZip, getToolchainCandidates, getToolVersion, type AppInfo, type ToolCandidate } from '../api/environment'
 import { checkWithProxy, withProxy } from '../api/updateProxy'
 import { useProjectStore } from '../stores/projectStore'
 import { getJSON, setItem } from '../utils/storage'
@@ -74,6 +74,8 @@ export default function HealthPage() {
   // 最新 Node LTS（自动检查）
   const [nodeLatestLts, setNodeLatestLts] = useState<string | null>(null)
   const [ltsMsg, setLtsMsg] = useState<string | null>(null)
+  // Node LTS 版本列表（供“选择版本”下拉；空 = 最新 LTS）
+  const [nodeLtsList, setNodeLtsList] = useState<string[]>([])
   // Git 运行时（内置便携版兑底 + 在线升级）
   const [gitRt, setGitRt] = useState<GitRuntimeInfo | null>(null)
   const [gitBusy, setGitBusy] = useState(false)
@@ -181,9 +183,11 @@ export default function HealthPage() {
     } catch (e) {
       setRtMsg(t('health.nodeQueryFailed', { err: String(e) }))
     }
-    // 自动检查最新 LTS（失败仅提示，不影响其他功能）
+    // 自动检查最新 LTS + 候选版本列表（失败仅提示，不影响其他功能）
     try {
-      setNodeLatestLts(await fetchNodeLatestLts())
+      const [latest, list] = await Promise.all([fetchNodeLatestLts(), fetchNodeLtsList()])
+      setNodeLatestLts(latest)
+      setNodeLtsList(list)
       setLtsMsg(null)
     } catch (e) {
       setLtsMsg(t('health.ltsQueryFailed', { err: String(e) }))
@@ -687,6 +691,8 @@ export default function HealthPage() {
   const nodeUpgradable =
     nodeRt?.node_version && nodeLatestLts && compareVersions(nodeRt.node_version, nodeLatestLts) < 0
 
+  // 当前平台是否为 Windows（后端仅 Windows 支持内置 Git 下载）
+  const isWindows = navigator.userAgent.includes('Windows')
   // Git 当前生效版本号（去掉 "git version " 前缀）与可升级判断
   const gitVersionNum = gitRt?.git_version?.replace(/^git version\s*/i, '').trim() || ''
   const gitUpgradable =
@@ -1156,19 +1162,23 @@ export default function HealthPage() {
             )}
             {ltsMsg && <p className="text-xs text-[var(--text-muted)] mt-2 break-all">{ltsMsg}</p>}
             <div className="flex gap-2 mt-3">
-              <input
+              <select
                 value={rtVersion}
                 onChange={(e) => setRtVersion(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleUpgrade() }}
-                placeholder={t('health.versionPlaceholder', { example: nodeLatestLts || '22.14.0' })}
-                className="flex-1 px-3 h-8 rounded-lg modern-card border-[var(--border)] text-[12px] font-mono outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] transition-colors"
-              />
+                title={t('health.nodeSelectTitle')}
+                className="flex-1 min-w-0 px-3 h-8 rounded-lg modern-card border-[var(--border)] text-[12px] font-mono outline-none focus:border-[var(--accent)] transition-colors"
+              >
+                <option value="">{t('health.nodeSelectLatest')}</option>
+                {nodeLtsList.map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
               <button
                 onClick={handleUpgrade}
                 disabled={rtBusy}
                 className="px-4 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors shrink-0"
               >
-                {rtBusy ? t('health.upgrading') : t('health.upgrade')}
+                {rtBusy ? t('health.upgrading') : nodeRt.source === 'none' ? t('health.installNode') : t('health.upgrade')}
               </button>
               <label className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] cursor-pointer select-none shrink-0" title={t('health.autoProxyHint')}>
                 <input
@@ -1206,7 +1216,7 @@ export default function HealthPage() {
                   <span className="text-xs text-[var(--text-secondary)] ml-2">
                     {gitRt.git_version || t('health.unavailable')}
                   </span>
-                  {gitLatest && (
+                  {isWindows && gitLatest && (
                     <span className="text-xs text-[var(--text-muted)] ml-2">{t('health.gitLatest', { version: gitLatest })}</span>
                   )}
                 </div>
@@ -1227,22 +1237,28 @@ export default function HealthPage() {
               <p className="text-xs text-[var(--warning)] mt-2">{t('health.noGitWarning')}</p>
             )}
             <div className="flex items-center gap-2 mt-3">
-              <button
-                onClick={handleGitUpgrade}
-                disabled={gitBusy}
-                className="px-4 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors shrink-0"
-              >
-                {gitBusy ? t('health.upgrading') : t('health.upgrade')}
-              </button>
-              <label className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] cursor-pointer select-none shrink-0" title={t('health.autoProxyHint')}>
-                <input
-                  type="checkbox"
-                  checked={gitUseProxy}
-                  onChange={(e) => setGitUseProxy(e.target.checked)}
-                  className="accent-[var(--accent)]"
-                />
-                {t('health.forceProxy')}
-              </label>
+              {isWindows ? (
+                <>
+                  <button
+                    onClick={handleGitUpgrade}
+                    disabled={gitBusy}
+                    className="px-4 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors shrink-0"
+                  >
+                    {gitBusy ? t('health.upgrading') : t('health.upgrade')}
+                  </button>
+                  <label className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] cursor-pointer select-none shrink-0" title={t('health.autoProxyHint')}>
+                    <input
+                      type="checkbox"
+                      checked={gitUseProxy}
+                      onChange={(e) => setGitUseProxy(e.target.checked)}
+                      className="accent-[var(--accent)]"
+                    />
+                    {t('health.forceProxy')}
+                  </label>
+                </>
+              ) : (
+                <p className="text-xs text-[var(--text-muted)]">{t('health.gitPlatformHint')}</p>
+              )}
               {gitRt.upgraded_dir && (
                 <button
                   onClick={handleGitReset}
