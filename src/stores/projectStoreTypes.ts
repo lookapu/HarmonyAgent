@@ -196,6 +196,8 @@ export interface ProjectSlice {
   dirCache: Record<string, FileTreeNode[]>
   loading: boolean
   refreshProjects: () => Promise<void>
+  /** 置顶/取消置顶项目（列表排序优先，本地重排 + 后端持久化） */
+  toggleProjectPin: (id: string) => Promise<void>
   openProject: (id: string) => Promise<void>
   addProjectByPath: (path: string) => Promise<Project>
   confirmTrust: (id: string) => Promise<void>

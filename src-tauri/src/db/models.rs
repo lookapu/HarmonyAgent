@@ -221,6 +221,8 @@ pub struct Project {
     pub harmony_project_path: Option<String>,
     /// 该项目的会话数量（含归档；list_projects 子查询填充，其余场景为 0）
     pub conversation_count: i64,
+    /// 置顶（列表排序优先）
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

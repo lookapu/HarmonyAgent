@@ -247,6 +247,7 @@ export default function Home() {
     askCard,
     resolveAskUser,
     refreshProjects,
+    toggleProjectPin,
     openProject,
     addProjectByPath,
     confirmTrust,
@@ -332,6 +333,7 @@ export default function Home() {
     askCard: s.askCard,
     resolveAskUser: s.resolveAskUser,
     refreshProjects: s.refreshProjects,
+    toggleProjectPin: s.toggleProjectPin,
     openProject: s.openProject,
     addProjectByPath: s.addProjectByPath,
     confirmTrust: s.confirmTrust,
@@ -3665,12 +3667,26 @@ export default function Home() {
                     <Icon name="folder" size={15} className={`shrink-0 ${active ? '' : 'opacity-60'}`} />
                     {!sidebarCollapsed && (
                       <>
-                        <span
-                          className={`flex-1 text-[13px] truncate ${
-                            active ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)] group-hover:text-[var(--text-primary)]'
-                          }`}
-                        >
-                          {p.name}
+                        <span className="min-w-0 flex-1">
+                          <span
+                            className={`block text-[13px] truncate leading-4 ${
+                              active ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)] group-hover:text-[var(--text-primary)]'
+                            }`}
+                          >
+                            {p.name}
+                          </span>
+                          {/* 项目 ID：点击复制完整 ID，排查问题用（标题下小字） */}
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              void copyId(p.id)
+                            }}
+                            className="block max-w-full truncate text-left font-mono text-[9.5px] leading-3.5 text-[var(--text-muted)]/70 hover:text-[var(--accent)] transition-colors"
+                            title={`${t('home.projId')}: ${p.id}\n${t('home.clickToCopy')}`}
+                          >
+                            {copiedId === p.id ? <Icon name="check" size={8} className="inline text-[var(--success)]" /> : 'P:'}
+                            {shortId(p.id)}
+                          </button>
                         </span>
                         {total > 0 && (
                           <span
@@ -3691,6 +3707,20 @@ export default function Home() {
                         )}
                         {/* 分隔线：危险操作与常规操作拉开视觉距离，降低误触 */}
                         <span className="mx-0.5 w-px h-3.5 bg-[var(--border)] shrink-0" aria-hidden="true" />
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void toggleProjectPin(p.id)
+                          }}
+                          className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
+                            p.pinned
+                              ? 'text-[var(--accent)] opacity-100'
+                              : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
+                          }`}
+                          title={p.pinned ? t('home.unpinProject') : t('home.pinProject')}
+                        >
+                          <Icon name="pin" size={13} />
+                        </button>
                         <button
                           onClick={(e) => {
                             e.stopPropagation()
@@ -4369,17 +4399,6 @@ export default function Home() {
               >
                 {copiedId === currentConversation.id ? <Icon name="check" size={9} className="text-[var(--success)]" /> : '#'}
                 {shortId(currentConversation.id)}
-              </button>
-            )}
-            {/* 项目 ID：点击复制，排查问题用 */}
-            {currentProject && (
-              <button
-                onClick={() => copyId(currentProject.id)}
-                className="debug-id-badge shrink-0 hidden sm:inline-flex font-mono text-[9.5px] px-1.5 py-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]/40 transition-colors"
-                title={`${t('home.projId')}: ${currentProject.id}\n${t('home.clickToCopy')}`}
-              >
-                {copiedId === currentProject.id ? <Icon name="check" size={9} className="text-[var(--success)]" /> : 'P:'}
-                {shortId(currentProject.id)}
               </button>
             )}
             {/* 会话内 token/成本累计（会话打开时加载，任务结束后刷新） */}

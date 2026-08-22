@@ -23,6 +23,8 @@ export interface Project {
   harmony_project_path: string | null
   /** 该项目的会话数量（列表接口填充） */
   conversation_count: number
+  /** 置顶（列表排序优先） */
+  pinned: boolean
 }
 
 export interface Conversation {
@@ -510,6 +512,10 @@ export interface FileTreeNode {
 }
 
 export const listProjects = () => invokeWithError<Project[]>('list_projects')
+
+/** 置顶/取消置顶项目（列表排序优先），返回更新后的项目 */
+export const setProjectPinned = (id: string, pinned: boolean) =>
+  invokeWithError<Project>('set_project_pinned', { id, pinned })
 
 export const inspectProject = (path: string) => invokeWithError<ProjectInspect>('inspect_project', { path })
 

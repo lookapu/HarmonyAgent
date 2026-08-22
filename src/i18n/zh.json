@@ -100,6 +100,8 @@
     "deleteConversation": "删除会话（再次点击确认）",
     "confirmDeleteConversation": "再次点击确认删除该会话全部消息",
     "deleteProject": "删除项目（再次点击确认，磁盘文件将移入系统回收站）",
+    "pinProject": "置顶项目（排序优先）",
+    "unpinProject": "取消置顶",
     "confirmDeleteProject": "再次点击确认删除（删除该项目全部会话，磁盘文件将移入系统回收站，可恢复）",
     "pin": "置顶会话",
     "unpin": "取消置顶",

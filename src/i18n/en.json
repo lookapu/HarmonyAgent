@@ -100,6 +100,8 @@
     "deleteConversation": "Delete chat (click again to confirm)",
     "confirmDeleteConversation": "Click again to confirm deleting all messages in this chat",
     "deleteProject": "Delete project (click again to confirm; files move to system Recycle Bin/Trash)",
+    "pinProject": "Pin project (sorted first)",
+    "unpinProject": "Unpin",
     "confirmDeleteProject": "Click again to confirm (deletes all chats of this project; disk files move to system Recycle Bin/Trash, recoverable)",
     "pin": "Pin chat",
     "unpin": "Unpin",

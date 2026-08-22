@@ -31,6 +31,7 @@ fn row_to_project(row: &Row) -> rusqlite::Result<Project> {
         workspace_modules: row.get::<_, Option<String>>(13)?,
         harmony_project_path: row.get::<_, Option<String>>(14)?,
         conversation_count: row.get(15)?,
+        pinned: row.get::<_, i64>(16)? != 0,
     })
 }
 
@@ -78,7 +79,8 @@ pub(crate) fn get_project_by_id(state: &State<DbState>, id: &str) -> Result<Proj
         "SELECT p.id, p.name, p.path, p.kind, p.trusted, p.default_provider_id, p.default_model_id,
                 p.index_state, p.rules, p.last_opened_at, p.created_at, p.worktree_path, p.harmony_subprojects, p.workspace_modules,
                 p.harmony_project_path,
-                (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS conversation_count
+                (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS conversation_count,
+                p.pinned
          FROM projects p WHERE p.id = ?1",
         [id],
         row_to_project,
@@ -95,9 +97,11 @@ pub fn list_projects(state: State<DbState>) -> Result<Vec<Project>, String> {
             "SELECT p.id, p.name, p.path, p.kind, p.trusted, p.default_provider_id, p.default_model_id,
                     p.index_state, p.rules, p.last_opened_at, p.created_at, p.worktree_path, p.harmony_subprojects, p.workspace_modules,
                     p.harmony_project_path,
-                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS conversation_count
+                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS conversation_count,
+                    p.pinned
              FROM projects p
-                 ORDER BY CASE WHEN p.kind = 'global' THEN 1 ELSE 0 END,
+                 ORDER BY p.pinned DESC,
+                          CASE WHEN p.kind = 'global' THEN 1 ELSE 0 END,
                           COALESCE(p.last_opened_at, p.created_at) DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -105,6 +109,18 @@ pub fn list_projects(state: State<DbState>) -> Result<Vec<Project>, String> {
         .query_map([], row_to_project)
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// 置顶/取消置顶项目（列表排序优先），返回更新后的项目
+#[tauri::command]
+pub fn set_project_pinned(id: String, pinned: bool, state: State<DbState>) -> Result<Project, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE projects SET pinned = ?1 WHERE id = ?2",
+        params![pinned as i64, id],
+    )
+    .map_err(|e| e.to_string())?;
+    get_project_by_id(&state, &id)
 }
 
 /// 添加项目前的目录探测（信任对话框展示用，不落库）

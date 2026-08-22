@@ -11,6 +11,7 @@ import {
   listConversations,
   buildProjectIndex,
   conversationRoot,
+  setProjectPinned,
 } from '../../api/project'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { getItem, setItem } from '../../utils/storage'
@@ -54,6 +55,20 @@ export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice
       const fresh = projects.find((p) => p.id === cur.id)
       if (fresh) set({ currentProject: fresh })
     }
+  },
+
+  toggleProjectPin: async (id: string) => {
+    const { projects } = get()
+    const p = projects.find((x) => x.id === id)
+    if (!p) return
+    const updated = await setProjectPinned(id, !p.pinned)
+    // 置顶优先重排（与后端 list_projects 排序一致：pinned → global → 最近打开）
+    const reordered = projects
+      .map((x) => (x.id === id ? updated : x))
+      .sort((a, b) => Number(b.pinned) - Number(a.pinned))
+    set({ projects: reordered })
+    const cur = get().currentProject
+    if (cur && cur.id === id) set({ currentProject: updated })
   },
 
   openProject: async (id) => {
