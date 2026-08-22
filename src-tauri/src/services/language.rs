@@ -81,7 +81,9 @@ pub fn detect_language(text: &str) -> Option<&'static str> {
     }
 }
 
-/// 生成系统提示中的语言指令（形如“回答使用阿拉伯语（العربية），”）。
+/// 生成系统提示中的语言指令（形如“回答与思考过程使用阿拉伯语（العربية），”）。
+/// 同时约束正文与思考过程（reasoning_content）：推理模型的思考链同样跟随语言，
+/// 避免正文英文、思考链却用中文的割裂体验。
 /// - reply_language: 显式指定（auto 或缺省 = 跟随输入）
 /// - text: 用于自动检测的用户消息原文
 pub fn language_directive(reply_language: Option<&str>, text: &str) -> String {
@@ -92,14 +94,14 @@ pub fn language_directive(reply_language: Option<&str>, text: &str) -> String {
     if let Some(code) = explicit {
         let name = language_display(code);
         return if name.is_empty() {
-            format!("回答使用与用户消息相同的语言（代码 {code}），")
+            format!("回答与思考过程使用与用户消息相同的语言（代码 {code}），")
         } else {
-            format!("回答使用{name}，")
+            format!("回答与思考过程使用{name}，")
         };
     }
     match detect_language(text) {
-        Some(code) => format!("回答使用与用户消息相同的语言（{}），", language_display(code)),
-        None => "回答使用与用户最近一条消息相同的语言（用户消息是什么语言就用什么语言回复，禁止默认使用中文），".to_string(),
+        Some(code) => format!("回答与思考过程使用与用户消息相同的语言（{}），", language_display(code)),
+        None => "回答与思考过程使用与用户最近一条消息相同的语言（用户消息是什么语言就用什么语言回复，禁止默认使用中文），".to_string(),
     }
 }
 
@@ -138,15 +140,15 @@ mod tests {
     fn explicit_language_overrides_detection() {
         assert_eq!(
             language_directive(Some("ar"), "fix this"),
-            "回答使用阿拉伯语（العربية），"
+            "回答与思考过程使用阿拉伯语（العربية），"
         );
         assert_eq!(
             language_directive(Some("auto"), "أهلاً بك"),
-            "回答使用与用户消息相同的语言（阿拉伯语（العربية）），"
+            "回答与思考过程使用与用户消息相同的语言（阿拉伯语（العربية）），"
         );
         assert_eq!(
             language_directive(None, "fix this build error"),
-            "回答使用与用户最近一条消息相同的语言（用户消息是什么语言就用什么语言回复，禁止默认使用中文），"
+            "回答与思考过程使用与用户最近一条消息相同的语言（用户消息是什么语言就用什么语言回复，禁止默认使用中文），"
         );
     }
 }
