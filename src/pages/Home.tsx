@@ -6,7 +6,8 @@ import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useShallow } from 'zustand/react/shallow'
 import { listen } from '@tauri-apps/api/event'
-import { watch, writeTextFile, readTextFile } from '@tauri-apps/plugin-fs'
+import { watch, writeTextFile, readTextFile, readFile, stat } from '@tauri-apps/plugin-fs'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { save as dialogSave, open as dialogOpen } from '@tauri-apps/plugin-dialog'
 import { open as shellOpen } from '@tauri-apps/plugin-shell'
 import { useProjectStore, type ToolRun } from '../stores/projectStore'
@@ -474,6 +475,8 @@ export default function Home() {
   const [references, setReferences] = useState<string[]>([])
   // 多模态图片（粘贴/拖入，data URL；发送时随消息上传，后端按协议内联）
   const [pickedImages, setPickedImages] = useState<string[]>([])
+  // 外部文件拖拽悬停中（显示"松手添加"覆盖层；Tauri onDragDropEvent 驱动）
+  const [dragActive, setDragActive] = useState(false)
   // 生成媒体模式：选中图片/视频/音频后，发送按钮提交生成任务（而非普通对话）
   const [genMode, setGenMode] = useState<GenKind | null>(null)
   const [genMenuOpen, setGenMenuOpen] = useState(false)
@@ -2075,6 +2078,110 @@ export default function Home() {
   const removePickedImage = (idx: number) => {
     setPickedImages((cur) => cur.filter((_, i) => i !== idx))
   }
+
+  /* ============ 外部文件拖拽（Tauri 环境拿真实路径；浏览器环境回退 DOM File） ============ */
+  const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif']
+  const isImagePath = (p: string) => IMAGE_EXTS.some((e) => p.toLowerCase().endsWith(e))
+  /** 路径规范化：\ → /、去尾部斜杠（Windows 与混合分隔符统一比较） */
+  const normPath = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+  /** 绝对路径是否在项目根内（大小写不敏感，Windows） */
+  const pathInProject = (p: string, root: string) => {
+    const a = normPath(p).toLowerCase()
+    const b = normPath(root).toLowerCase()
+    return a === b || a.startsWith(b + '/')
+  }
+  /** 本地图片文件 → data URL 预览（拖拽场景；大小已由调用方校验，发送前统一压缩） */
+  const readImageFile = async (path: string) => {
+    try {
+      const bytes = await readFile(path)
+      if (bytes.byteLength === 0) return
+      const ext = path.split('.').pop()?.toLowerCase() ?? 'png'
+      const mime = ext === 'jpg' ? 'jpeg' : ext
+      let binary = ''
+      const chunk = 0x8000
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
+      }
+      void compressImage(`data:image/${mime};base64,${btoa(binary)}`).then((url) => {
+        setPickedImages((cur) => (cur.length >= 4 ? cur : [...cur, url]))
+      })
+    } catch {
+      useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
+    }
+  }
+  /** 项目外文本文件：读入输入框作为引用块（≤200KB；二进制/乱码跳过并提示） */
+  const readExternalText = async (path: string) => {
+    try {
+      const bytes = await readFile(path)
+      const text = new TextDecoder('utf-8').decode(bytes)
+      if (!text.trim() || text.includes('\uFFFD')) {
+        useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropBinary') })
+        return
+      }
+      const name = path.split(/[\\/]/).pop() || path
+      const block = `【引用文件 ${name}】\n\`\`\`\n${text}\n\`\`\``
+      setDraft((d) => (d ? `${d}\n\n${block}` : block))
+      inputRef.current?.focus()
+    } catch {
+      useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
+    }
+  }
+  /** 拖拽路径分发：图片 → 预览；项目内文件 → @引用（后端注入内容）；项目外文本 → 插入输入框 */
+  const handleDroppedPaths = useCallback((paths: string[]) => {
+    const root = useProjectStore.getState().currentProject?.path
+    for (const p of paths) {
+      void (async () => {
+        try {
+          const info = await stat(p)
+          if (info.isDirectory) {
+            useNotificationStore.getState().push({ tone: 'info', title: t('home.dropDir') })
+            return
+          }
+          if (isImagePath(p)) {
+            if (info.size > 8 * 1024 * 1024) return
+            void readImageFile(p)
+          } else if (root && pathInProject(p, root)) {
+            handleReference(p)
+          } else {
+            if (info.size > 200 * 1024) {
+              useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropTooBig') })
+              return
+            }
+            void readExternalText(p)
+          }
+        } catch {
+          useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
+        }
+      })()
+    }
+  }, [handleReference, t])
+  // Tauri 拖拽事件：真实路径 + 悬停高亮（DOM dataTransfer 拿不到路径，须走 webview 原生事件）
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    let cancelled = false
+    if ('__TAURI_INTERNALS__' in window) {
+      getCurrentWebview()
+        .onDragDropEvent((e) => {
+          if (e.payload.type === 'drop') {
+            setDragActive(false)
+            handleDroppedPaths(e.payload.paths)
+          } else if (e.payload.type === 'enter' || e.payload.type === 'over') {
+            setDragActive(true)
+          } else {
+            setDragActive(false)
+          }
+        })
+        .then((u) => {
+          if (cancelled) u()
+          else unlisten = u
+        })
+        .catch(() => {})
+    }
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [handleDroppedPaths])
 
   /** @ 引用候选：@ 后输入路径片段（无空格/换行）时弹候选面板 */
   const handleDraftChange = (v: string) => {
@@ -5376,13 +5483,29 @@ export default function Home() {
           <div
             className="relative max-w-3xl mx-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] transition-all focus-within:border-[var(--accent)] focus-within:shadow-[0_0_0_3px_var(--accent-soft)]"
             onDragOver={(e) => {
-              if (Array.from(e.dataTransfer.types).includes('Files')) e.preventDefault()
+              if (Array.from(e.dataTransfer.types).includes('Files')) {
+                e.preventDefault()
+                setDragActive(true)
+              }
+            }}
+            onDragLeave={(e) => {
+              // 子元素间移动也会触发 leave：仅当真正离开容器时取消高亮
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragActive(false)
             }}
             onDrop={(e) => {
               e.preventDefault()
+              setDragActive(false)
+              // Tauri 环境 DOM 拿不到文件（须走 onDragDropEvent）；此处仅作浏览器开发模式回退
               if (e.dataTransfer.files.length > 0) addImageFiles(e.dataTransfer.files)
             }}
           >
+            {/* 拖拽悬停覆盖层：提示松手添加（文件/图片；项目外文本自动插入输入框） */}
+            {dragActive && (
+              <div className="absolute -inset-px rounded-2xl border-2 border-dashed border-[var(--accent)] bg-[var(--bg-secondary)]/85 backdrop-blur-sm flex items-center justify-center gap-2 z-40 pointer-events-none">
+                <Icon name="file" size={15} className="text-[var(--accent)]" />
+                <span className="text-[12px] font-medium text-[var(--accent)]">{t('home.dropHint')}</span>
+              </div>
+            )}
             {/* 斜杠快捷指令面板（行首 / 后弹出） */}
             {slashCandidates && (
               <div className="absolute bottom-full left-3 right-3 mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 max-h-72 overflow-y-auto animate-modal-in">
@@ -5566,7 +5689,14 @@ export default function Home() {
                       className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[10.5px] text-[var(--accent)] max-w-56"
                     >
                       <Icon name={convTitle ? 'chat' : 'file'} size={10} className="shrink-0" />
-                      <span className="truncate">{convTitle ? `会话：${convTitle}` : p}</span>
+                      <span className="truncate" title={p}>
+                        {convTitle
+                          ? `会话：${convTitle}`
+                          : // 绝对路径（拖拽加入）只显示文件名，完整路径放 title 悬浮
+                            /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('/')
+                            ? (p.split(/[\\/]/).pop() ?? p)
+                            : p}
+                      </span>
                       <button
                         onClick={() => setReferences((r) => r.filter((x) => x !== p))}
                         className="shrink-0 hover:text-[var(--danger)] transition-colors"
