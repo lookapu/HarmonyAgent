@@ -4440,6 +4440,18 @@ async fn stream_chat_inner(
                 );
                 // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
                 crate::agent::context::bump_compress_count(&conn, &conversation_id);
+                // LC-33：压缩事件写入会话事件流（预警→执行闭环可回放、可度量）
+                let _ = crate::agent::session_events::append_event(
+                    &conn,
+                    &conversation_id,
+                    crate::agent::session_events::SessionEventType::ContextCompress,
+                    serde_json::json!({
+                        "trigger": "active",
+                        "old_limit": old_limit,
+                        "new_limit": history_limit,
+                    }),
+                    Some(&trace_id),
+                );
             }
             let _ = app.emit(
                 "chat-compact",
@@ -4691,6 +4703,18 @@ async fn stream_chat_inner(
                     );
                     // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
                     crate::agent::context::bump_compress_count(&conn, &conversation_id);
+                    // LC-33：压缩事件写入会话事件流（超限恢复同样留痕）
+                    let _ = crate::agent::session_events::append_event(
+                        &conn,
+                        &conversation_id,
+                        crate::agent::session_events::SessionEventType::ContextCompress,
+                        serde_json::json!({
+                            "trigger": "overflow",
+                            "old_limit": old_limit,
+                            "new_limit": history_limit,
+                        }),
+                        Some(&trace_id),
+                    );
                 }
                 let _ = app.emit(
                     "chat-compact",
@@ -11085,6 +11109,14 @@ pub async fn compact_conversation(
         .map_err(|e| e.to_string())?;
         // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
         crate::agent::context::bump_compress_count(&conn, &conversation_id);
+        // LC-33：手动压缩同样写入会话事件流（trigger=manual，无任务 trace）
+        let _ = crate::agent::session_events::append_event(
+            &conn,
+            &conversation_id,
+            crate::agent::session_events::SessionEventType::ContextCompress,
+            serde_json::json!({ "trigger": "manual", "keep": keep }),
+            None,
+        );
         crate::agent::context::persist_runtime_checkpoint(
             &conn,
             &conversation_id,

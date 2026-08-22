@@ -26,6 +26,9 @@ pub enum SessionEventType {
     ToolResult,
     /// 系统说明（payload: { text }）
     SystemNote,
+    /// 上下文压缩（payload: { trigger, old_limit?, new_limit?, keep? }）——LC-33：
+    /// 压缩预警与执行写入事件流，度量预警后用户固定行为与“无预兆压缩”体验
+    ContextCompress,
 }
 
 impl SessionEventType {
@@ -36,6 +39,7 @@ impl SessionEventType {
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
             Self::SystemNote => "system_note",
+            Self::ContextCompress => "context_compress",
         }
     }
 
@@ -45,6 +49,7 @@ impl SessionEventType {
             "assistant_message" => Self::AssistantMessage,
             "tool_call" => Self::ToolCall,
             "tool_result" => Self::ToolResult,
+            "context_compress" => Self::ContextCompress,
             _ => Self::SystemNote,
         }
     }
@@ -166,6 +171,8 @@ pub fn derive_messages(conn: &Connection, conversation_id: &str) -> Result<Vec<D
                 let text = ev.payload.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 out.push(DerivedMessage { role: "assistant".into(), content: text, tool_name: None, created_at: ev.created_at });
             }
+            // 压缩事件不进消息历史投影（摘要/裁剪由 conversations 表水位承载）
+            SessionEventType::ContextCompress => {}
         }
     }
     Ok(out)

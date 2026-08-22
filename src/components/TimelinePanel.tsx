@@ -20,6 +20,7 @@ function badgeOf(type: string): string {
     case 'assistant_message': return 'bg-[#e6f4fe] text-[#149eca] dark:bg-[#149eca]/15 dark:text-[#61dafb]'
     case 'tool_call': return 'bg-[#fff3e0] text-[#e76f00] dark:bg-[#e76f00]/15 dark:text-[#fbbf24]'
     case 'tool_result': return 'bg-[#e9f9e3] text-[#5fa04e] dark:bg-[#5fa04e]/15 dark:text-[#86efac]'
+    case 'context_compress': return 'bg-[var(--warning)]/15 text-[var(--warning)]'
     default: return 'bg-[var(--bg-hover)] text-[var(--text-secondary)]'
   }
 }
@@ -32,6 +33,7 @@ function typeLabel(type: string): string {
     case 'tool_call': return '工具调用'
     case 'tool_result': return '工具结果'
     case 'system_note': return '系统'
+    case 'context_compress': return '压缩'
     default: return type
   }
 }
@@ -77,6 +79,21 @@ function eventSummary(e: SessionEvent): ReactNode {
     case 'system_note': {
       const c = cut(String(p.text ?? ''))
       return <span className="italic text-[var(--text-muted)]">{c}</span>
+    }
+    case 'context_compress': {
+      const trigger = String(p.trigger ?? '')
+      const detail =
+        p.old_limit != null && p.new_limit != null
+          ? `：${String(p.old_limit)} → ${String(p.new_limit)} 条`
+          : p.keep != null
+            ? `：保留最近 ${String(p.keep)} 条`
+            : ''
+      return (
+        <span className="text-[var(--warning)]">
+          {trigger === 'active' ? '超 85% 主动压缩' : trigger === 'overflow' ? '超限恢复压缩' : '手动压缩'}
+          {detail}
+        </span>
+      )
     }
     default:
       return <span className="font-mono">{cut(JSON.stringify(p), 120)}</span>

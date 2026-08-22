@@ -830,6 +830,10 @@ fn render_trace_chain(out: &mut String, events: &[&crate::agent::session_events:
                 let note = ev.payload.to_string();
                 out.push_str(&format!("{}. [{when}] 📋 系统: {}\n", i + 1, truncate_chars(&note, 80)));
             }
+            T::ContextCompress => {
+                let trigger = ev.payload.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
+                out.push_str(&format!("{}. [{when}] 🗜️ 上下文压缩（{}）\n", i + 1, trigger));
+            }
         }
     }
 }
