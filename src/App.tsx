@@ -7,13 +7,14 @@ import UpdateChecker from './components/UpdateChecker'
 import DesktopNotifyToast from './components/DesktopNotifyToast'
 import PerfMonitor from './components/PerfMonitor'
 import NotificationBell from './components/NotificationBell'
+import LangToggle from './components/LangToggle'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { recordBootstrapStage } from './utils/perfTrace'
 import { useThemeStore } from './stores/themeStore'
 import { detectSystemLocale } from './api/desktop'
 import { LANG_STORAGE_KEY } from './i18n'
 import { detectGpu, getTierClass } from './utils/gpuDetect'
-import { getItem, setItem } from './utils/storage'
+import { getItem } from './utils/storage'
 
 // 页面级拆包：避免 Recharts、Markdown/KaTeX、设备诊断等全部阻塞首个可交互帧。
 // Tauri 资源来自本地，懒加载没有网络不确定性，只把 JS 解析/执行摊到实际进入页面时。
@@ -207,47 +208,6 @@ function AdminLayout() {
         </Suspense>
       </main>
     </div>
-  )
-}
-
-function LangToggle() {
-  const { i18n, t } = useTranslation()
-  const saved = getItem(LANG_STORAGE_KEY)
-  const mode: 'auto' | 'zh' | 'en' = saved === 'auto' ? 'auto' : i18n.language === 'en' ? 'en' : 'zh'
-
-  const cycle = async () => {
-    // 中 → EN → 自动 → 中
-    const nextMode = mode === 'zh' ? 'en' : mode === 'en' ? 'auto' : 'zh'
-    if (nextMode === 'auto') {
-      setItem(LANG_STORAGE_KEY, 'auto')
-      try {
-        const info = await detectSystemLocale()
-        i18n.changeLanguage(info.is_zh ? 'zh' : 'en')
-      } catch {
-        i18n.changeLanguage('zh')
-      }
-    } else {
-      setItem(LANG_STORAGE_KEY, nextMode)
-      i18n.changeLanguage(nextMode)
-    }
-  }
-
-  const label = mode === 'auto' ? 'AUTO' : mode === 'zh' ? 'EN' : '中'
-  const title =
-    mode === 'auto'
-      ? t('common.langSystem')
-      : mode === 'zh'
-        ? 'Switch to English'
-        : '切换到中文'
-
-  return (
-    <button
-      onClick={cycle}
-      className="px-1.5 py-0.5 rounded text-xs font-mono hover:bg-[var(--bg-card)] transition-colors text-[var(--text-secondary)]"
-      title={title}
-    >
-      {label}
-    </button>
   )
 }
 

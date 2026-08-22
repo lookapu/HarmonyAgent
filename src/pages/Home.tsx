@@ -13,6 +13,7 @@ import { useProjectStore, type ToolRun } from '../stores/projectStore'
 import { useThemeStore } from '../stores/themeStore'
 import { useNotificationStore } from '../stores/notificationStore'
 import NotificationBell from '../components/NotificationBell'
+import LangToggle from '../components/LangToggle'
 import { useAuditStore, type AuditCategory } from '../stores/auditStore'
 import { usePinStore, PIN_MAX_PER_CONV } from '../stores/pinStore'
 import { useRatingStore } from '../stores/ratingStore'
@@ -4245,13 +4246,14 @@ export default function Home() {
           </div>
         </div>
 
-        {/* 底部：设置 + 主题 + 折叠 */}
+        {/* 底部：设置 + 语言 + 主题 + 折叠 */}
         <div className={`p-2 border-t border-[var(--border)] flex gap-1 ${sidebarCollapsed ? 'flex-col items-center' : 'items-center'}`}>
-          <div className="relative flex-1" ref={settingsRef}>
+          <div className="relative flex items-center gap-1 flex-1 min-w-0" ref={settingsRef}>
+            <LangToggle />
             <button
               onClick={() => setShowSettingsMenu((v) => !v)}
               title={t('home.settings')}
-              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 justify-center' : 'w-full'} ${showSettingsMenu ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : ''}`}
+              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 justify-center' : 'flex-1 min-w-0'} ${showSettingsMenu ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : ''}`}
             >
               <Icon name="settings" size={15} />
               {!sidebarCollapsed && t('home.settings')}
