@@ -276,17 +276,15 @@ export default function TimelinePanel({
 
   return (
     <div className="flex flex-col h-full">
-      {/* 工具栏：视图切换 + 展开/折叠全部 + 刷新
-          窄栏下 tip 保持完整不省略（不 truncate），外层 overflow-x-auto 兜底横向滚动；
-          title 提供完整文本给 hover tooltip。 */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] shrink-0 overflow-x-auto whitespace-nowrap">
-        <span
-          className="shrink-0 text-[11px] text-[var(--text-muted)]"
+      {/* 工具栏：说明文字与操作按钮分两行（窄栏下一行过长，按钮被挤出可视区） */}
+      <div className="px-3 py-2 border-b border-[var(--border)] shrink-0">
+        <div
+          className="text-[11px] leading-4 text-[var(--text-muted)]"
           title={t('home.timelineTip')}
         >
           {t('home.timelineTip')}
-        </span>
-        <div className="flex items-center gap-1 shrink-0">
+        </div>
+        <div className="mt-1.5 flex items-center gap-1">
           {/* [76] 视图切换：事件流水 / 调用链 DAG */}
           <div className="flex items-center rounded-lg bg-[var(--bg-hover)] p-0.5 mr-1">
             <button
