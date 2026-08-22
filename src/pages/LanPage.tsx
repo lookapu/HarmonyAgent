@@ -1,3 +1,4 @@
+// @ui-states: delegated
 import { useTranslation } from 'react-i18next'
 import LanPanel from '../components/LanPanel'
 import LanTokenPanel from '../components/LanTokenPanel'

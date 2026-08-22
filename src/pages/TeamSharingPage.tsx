@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, failed, retry
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useProjectStore } from '../stores/projectStore'

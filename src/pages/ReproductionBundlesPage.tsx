@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, failed, retry
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { generateReproductionBundle, listReproductionBundles, previewReproductionBundle, validateReproductionBundle, type ReproductionBundleRecord, type ReproductionPreview, type ReproductionRequest } from '../api/reproductionBundle'

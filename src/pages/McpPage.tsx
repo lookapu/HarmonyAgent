@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, failed, retry
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listMcpServers, addMcpServer, updateMcpServer, testMcpServer, toggleMcpServer, authorizeMcpServer, removeMcpServer, cloneMcpServer, exportMcpConfig, importMcpConfig, fetchMcpFromUrl, listMcpUsageStats, type McpServer, type CreateMcpInput, type McpDraft, type McpUsageStat } from '../api/mcp'

@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, failed
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { getCurrentVersion, listAvailableVersions, installVersion, type VersionInfo } from '../api/version'

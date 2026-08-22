@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, failed
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import Icon from '../icons/Icon'

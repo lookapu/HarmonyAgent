@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, partial, failed, retry
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { getCostSummary, getDailyUsage, getTaskStats, getTaskRuns, getAllBudgetStatus, getRequestLogs, type CostSummary, type DailyUsage, type TaskStats, type TaskRun, type AllBudgetStatus, type RequestLog } from '../api/cost'

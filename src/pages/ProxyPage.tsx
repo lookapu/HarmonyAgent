@@ -1,3 +1,4 @@
+// @ui-states: loading, failed
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { startProxy, stopProxy, getProxyStatus, getProxyConfig, updateProxyConfig, type ProxyStatus, type ProxyConfigInput } from '../api/proxy'

@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, partial, failed, retry
 import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { JSX } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'

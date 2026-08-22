@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, retry
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { open as shellOpen } from '@tauri-apps/plugin-shell'

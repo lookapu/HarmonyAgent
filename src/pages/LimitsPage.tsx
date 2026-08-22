@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, failed
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { getAgentLimits, setAgentLimits, resetAgentLimits, type AgentLimits } from '../api/limits'

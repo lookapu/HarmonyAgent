@@ -1,3 +1,4 @@
+// @ui-states: loading, empty, partial, failed, retry, permission
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
