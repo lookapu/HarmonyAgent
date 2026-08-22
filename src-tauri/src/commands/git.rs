@@ -962,6 +962,46 @@ fn add_root_prefix(path: &str, root_rel: &Option<String>) -> String {
     }
 }
 
+/// 执行 git 并返回原始 stdout（保留 -z 的 NUL 分隔，不做 trim/合并 stderr）。
+/// run_cmd_capped 的 trim 会删掉 porcelain 输出首条目标前的状态空格
+/// （` M src-...` → `M src-...`），导致第一个条目状态与路径错位，必须绕开。
+/// stdin_data 为 Some 时写入 stdin（check-ignore --stdin）后关闭，否则直接关闭。
+async fn git_raw_output(
+    cwd: &Path,
+    args: &[String],
+    stdin_data: Option<Vec<u8>>,
+) -> Result<String, String> {
+    let mut cmd = crate::utils::process::command("git", args)?;
+    cmd.current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("无法启动 git: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Some(data) = stdin_data {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(&data).await;
+        }
+        drop(stdin); // 关闭 stdin，git 读到 EOF 才开始处理
+    }
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| "git 命令超时".to_string())?
+    .map_err(|e| format!("等待 git 失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} 退出码 {}: {}",
+            args.first().map(String::as_str).unwrap_or(""),
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 #[tauri::command]
 pub async fn get_file_tree_git_status(
     project_path: String,
@@ -1018,15 +1058,7 @@ pub async fn get_file_tree_git_status(
         status_args.push("--".into());
         status_args.push(rel.clone());
     }
-    let status_out = crate::agent::tools::run_cmd_capped(
-        "git",
-        &status_args,
-        Some(cwd),
-        15,
-        8_000_000,
-    )
-    .await
-    .unwrap_or_default();
+    let status_out = git_raw_output(cwd, &status_args, None).await.unwrap_or_default();
 
     // 文件级条目 + 目录前缀聚合（同一目录多个子项取最高严重度）
     let mut entries: Vec<GitTreeEntry> = Vec::new();
@@ -1110,35 +1142,25 @@ pub async fn get_file_tree_git_status(
             ls_args.push("--".into());
             ls_args.push(rel.clone());
         }
-        let tracked: std::collections::HashSet<String> = crate::agent::tools::run_cmd_capped(
-            "git",
-            &ls_args,
-            Some(cwd),
-            15,
-            8_000_000,
-        )
-        .await
-        .unwrap_or_default()
-        .split('\0')
-        .filter(|s| !s.is_empty())
-        .map(|s| strip_root_prefix(s, &root_rel))
-        .collect();
+        let tracked: std::collections::HashSet<String> = git_raw_output(cwd, &ls_args, None)
+            .await
+            .unwrap_or_default()
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(|s| strip_root_prefix(s, &root_rel))
+            .collect();
         let probe: Vec<String> = candidates
             .iter()
             .filter(|p| !tracked.contains(p.as_str()))
             .map(|p| add_root_prefix(p, &root_rel))
             .collect();
         if !probe.is_empty() {
-            let mut ci_args = vec!["check-ignore".into(), "-z".into(), "--".into()];
-            ci_args.extend(probe.iter().cloned());
-            if let Ok(out) = crate::agent::tools::run_cmd_capped(
-                "git",
-                &ci_args,
-                Some(cwd),
-                15,
-                8_000_000,
-            )
-            .await
+            // check-ignore -z 必须配合 --stdin（直接传参时 -z 报 "fatal: -z only
+            // makes sense with --stdin"，退出码 128 导致 ignored 恒为空），
+            // 路径经 stdin 以 NUL 分隔传入
+            let ci_args = vec!["check-ignore".into(), "-z".into(), "--stdin".into()];
+            if let Ok(out) =
+                git_raw_output(cwd, &ci_args, Some(probe.join("\0").into_bytes())).await
             {
                 ignored = out
                     .split('\0')

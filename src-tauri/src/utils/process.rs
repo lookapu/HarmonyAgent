@@ -60,6 +60,15 @@ pub fn init_hidden_console() {}
 /// 内置 Node 运行时目录（升级版优先于出厂捆绑版）；None 表示未初始化/无内置
 static BUNDLED_NODE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// 内置 Node 可执行文件（Windows: node.exe；macOS/Linux: bin/node）
+pub fn node_exe_in(dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        dir.join("node.exe")
+    } else {
+        dir.join("bin").join("node")
+    }
+}
+
 /// 注册内置 Node 运行时目录（lib.rs setup 时调用）
 pub fn set_bundled_node_dir(dir: Option<PathBuf>) {
     *BUNDLED_NODE_DIR.lock().unwrap() = dir;
@@ -67,6 +76,15 @@ pub fn set_bundled_node_dir(dir: Option<PathBuf>) {
 
 /// 内置 Git 运行时目录（升级版优先于出厂捆绑版）；None 表示未初始化/无内置
 static BUNDLED_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// 内置 Git 可执行文件（Windows: cmd/git.exe 便携版布局；macOS/Linux: bin/git）
+pub fn git_exe_in(dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        dir.join("cmd").join("git.exe")
+    } else {
+        dir.join("bin").join("git")
+    }
+}
 
 /// 注册内置 Git 运行时目录（lib.rs setup 时调用）
 pub fn set_bundled_git_dir(dir: Option<PathBuf>) {
@@ -279,6 +297,14 @@ fn resolve_program(program: &str) -> Option<Resolved> {
         return Some(r);
     }
 
+    // 系统 npx/npm 直调：nvm/brew 等安装的 npx/npm 是 `#!/usr/bin/env node` 的
+    // JS 脚本/软链，GUI 启动（LaunchServices）PATH 极简时 env 找不到 node 直接失败；
+    // 找到脚本与配套 node 后经 `node <cli.js>` 启动，绕开 shebang 依赖（与内置
+    // npx 解析一致）。
+    if let Some(r) = resolve_system_npx(program) {
+        return Some(r);
+    }
+
     // 鸿蒙工具链额外 PATH（command-line-tools/bin 等）：hdc/ohpm 未进系统 PATH 时也能命中
     for dir in HARMONY_EXTRA_PATH.lock().unwrap().iter() {
         let exact = dir.join(program);
@@ -330,7 +356,13 @@ fn resolve_program(program: &str) -> Option<Resolved> {
         }
     }
 
-    // 系统 PATH 全部未命中：最后尝试 sh 脚本候选（cmd 包装，错误提示比 not found 更准确）
+    // 系统 PATH 全部未命中：macOS/Linux 兑底探测常见安装目录（nvm/brew/sdkman，
+    // GUI 启动 PATH 极简时 npx/java 等仍可命中），再尝试 sh 脚本候选
+    if let Some(p) = probe_common_program(program) {
+        return Some(Resolved { program: p, needs_cmd_wrap: false, node_cli: None });
+    }
+
+    // 最后尝试 sh 脚本候选（cmd 包装，错误提示比 not found 更准确）
     if let Some(p) = script_fallback {
         return Some(Resolved { program: p, needs_cmd_wrap: true, node_cli: None });
     }
@@ -354,7 +386,7 @@ fn resolve_bundled_node(program: &str) -> Option<Resolved> {
 
     match base.as_str() {
         "node" => {
-            let exe = dir.join("node.exe");
+            let exe = node_exe_in(&dir);
             if exe.is_file() {
                 Some(Resolved { program: exe, needs_cmd_wrap: false, node_cli: None })
             } else {
@@ -362,7 +394,7 @@ fn resolve_bundled_node(program: &str) -> Option<Resolved> {
             }
         }
         "npx" | "npm" => {
-            let exe = dir.join("node.exe");
+            let exe = node_exe_in(&dir);
             let cli = dir.join("node_modules/npm/bin")
                 .join(if base == "npx" { "npx-cli.js" } else { "npm-cli.js" });
             if exe.is_file() && cli.is_file() {
@@ -399,7 +431,7 @@ fn resolve_bundled_git(program: &str) -> Option<Resolved> {
     if base != "git" {
         return None;
     }
-    let exe = dir.join("cmd").join("git.exe");
+    let exe = git_exe_in(&dir);
     if exe.is_file() {
         Some(Resolved { program: exe, needs_cmd_wrap: false, node_cli: None })
     } else {
@@ -422,7 +454,11 @@ fn resolve_bundled_jdk(program: &str) -> Option<Resolved> {
     if base != "java" && base != "javac" {
         return None;
     }
-    let exe = dir.join("bin").join(format!("{base}.exe"));
+    let exe = if cfg!(windows) {
+        dir.join("bin").join(format!("{base}.exe"))
+    } else {
+        dir.join("bin").join(&base)
+    };
     if exe.is_file() {
         Some(Resolved { program: exe, needs_cmd_wrap: false, node_cli: None })
     } else {
@@ -464,19 +500,149 @@ fn resolve_ohpm_direct(program: &str) -> Option<Resolved> {
     .into_iter()
     .find(|p| p.is_file())?;
     // 用内置 Node 直调（绕开 DevEco 自带 node 与系统 node 的版本差异）
-    let node = BUNDLED_NODE_DIR.lock().unwrap().clone()?.join("node.exe");
+    let dir = BUNDLED_NODE_DIR.lock().unwrap().clone()?;
+    let node = node_exe_in(&dir);
     if !node.is_file() {
         return None;
     }
     Some(Resolved { program: node, needs_cmd_wrap: false, node_cli: Some(cli) })
 }
 
+/// 系统 npx/npm 直调：找到 npx/npm 脚本（nvm/brew 等安装，多为 `#!/usr/bin/env node`
+/// 的 JS 脚本/软链）与配套 node，经 `node <cli.js>` 启动，绕开 shebang 对 PATH 的
+/// 依赖——GUI 启动（LaunchServices）PATH 极简时 `env node` 会直接失败。
+fn resolve_system_npx(program: &str) -> Option<Resolved> {
+    let base = program
+        .strip_suffix(".exe")
+        .unwrap_or(program)
+        .strip_suffix(".cmd")
+        .unwrap_or(program)
+        .strip_suffix(".bat")
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if base != "npx" && base != "npm" {
+        return None;
+    }
+    let script = find_system_program(program)?;
+    // 软链解析（nvm 的 npx → ../lib/node_modules/npm/bin/npx-cli.js）得到真实 JS 入口
+    let cli = std::fs::canonicalize(&script).ok()?;
+    if !cli.is_file() {
+        return None;
+    }
+    let node = find_system_program("node")?;
+    Some(Resolved { program: node, needs_cmd_wrap: false, node_cli: Some(cli) })
+}
+
+/// 在鸿蒙额外 PATH / 系统 PATH / 常见安装目录中定位程序（返回第一个命中）
+fn find_system_program(program: &str) -> Option<PathBuf> {
+    for dir in HARMONY_EXTRA_PATH.lock().unwrap().iter() {
+        let exact = dir.join(program);
+        if exact.is_file() {
+            return Some(exact);
+        }
+        for ext in ["exe", "cmd", "bat"] {
+            let cand = dir.join(format!("{program}.{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let exact = dir.join(program);
+            if exact.is_file() {
+                return Some(exact);
+            }
+            for ext in ["exe", "cmd", "bat"] {
+                let cand = dir.join(format!("{program}.{ext}"));
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    probe_common_program(program)
+}
+
+/// macOS/Linux：GUI 启动（LaunchServices）PATH 极简（仅 /usr/bin:/bin:/usr/sbin:/sbin），
+/// nvm/brew/sdkman 等用户级安装不在 PATH 中。这里探测常见安装目录，供
+/// node/npm/npx/git/java 在 PATH 未命中时兑底（与 shell 环境行为一致）。
+/// 返回可执行文件完整路径；Windows 直接返回 None（PATH 语义完整）。
+pub fn probe_common_program(program: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let _ = program;
+        return None;
+    }
+    #[cfg(not(windows))]
+    {
+        let base = Path::new(program).file_name()?.to_str()?.to_string();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            // nvm：版本目录取版本号最高（v9 < v10 需数值比较，不能按字典序）
+            if let Ok(entries) = std::fs::read_dir(home.join(".nvm").join("versions").join("node")) {
+                let mut vers: Vec<(u32, u32, u32, PathBuf)> = entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        let bin = e.path().join("bin");
+                        if !bin.join(&base).is_file() {
+                            return None;
+                        }
+                        let v = n.trim_start_matches('v');
+                        let mut parts = v.split('.');
+                        let (major, minor, patch) = (
+                            parts.next().and_then(|s| s.parse().ok())?,
+                            parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                            parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                        );
+                        Some((major, minor, patch, bin))
+                    })
+                    .collect();
+                vers.sort_by(|a, b| b.cmp(a));
+                if let Some((_, _, _, bin)) = vers.into_iter().next() {
+                    dirs.push(bin);
+                }
+            }
+            // sdkman（java/gradle 等）current 软链
+            if let Ok(cands) = std::fs::read_dir(home.join(".sdkman").join("candidates")) {
+                for c in cands.flatten() {
+                    let cur = c.path().join("current").join("bin");
+                    if cur.join(&base).is_file() {
+                        dirs.push(cur);
+                    }
+                }
+            }
+        }
+        dirs.extend(
+            ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"]
+                .map(PathBuf::from),
+        );
+        for d in dirs {
+            let p = d.join(&base);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
+
 /// 找不到程序时的友好错误（含安装/路径建议）
 fn not_found_error(program: &str) -> String {
     let hint = if program.eq_ignore_ascii_case("npx") {
-        "请确认已安装 Node.js（npm 自带 npx），或将 Node 目录加入 PATH；也可以在命令中填写完整路径，如 C:\\Program Files\\nodejs\\npx.cmd"
+        if cfg!(windows) {
+            "请确认已安装 Node.js（npm 自带 npx），或将 Node 目录加入 PATH；也可以在命令中填写完整路径，如 C:\\Program Files\\nodejs\\npx.cmd"
+        } else {
+            "请确认已安装 Node.js（npm 自带 npx），或将 Node 目录加入 PATH（如 ~/.nvm/versions/node/v22.x/bin、/usr/local/bin）"
+        }
     } else if program.eq_ignore_ascii_case("git") {
-        "请确认已安装 Git（https://git-scm.com/download/win），或将 git 加入 PATH"
+        if cfg!(windows) {
+            "请确认已安装 Git（https://git-scm.com/download/win），或将 git 加入 PATH"
+        } else {
+            "macOS 可在终端执行 xcode-select --install 安装命令行工具；Linux 请使用系统包管理器安装 git"
+        }
     } else if program.eq_ignore_ascii_case("docker") {
         "请确认已安装并启动 Docker Desktop"
     } else {

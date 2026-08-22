@@ -48,8 +48,8 @@ fn effective_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     let upgraded = app.path().app_data_dir().ok().map(|d| d.join(UPGRADED_DIR));
     let bundled = app.path().resource_dir().ok().map(|d| d.join(BUNDLED_REL));
     match (&upgraded, &bundled) {
-        (Some(u), _) if u.join("node.exe").is_file() => Some(u.clone()),
-        (_, Some(b)) if b.join("node.exe").is_file() => Some(b.clone()),
+        (Some(u), _) if crate::utils::process::node_exe_in(u).is_file() => Some(u.clone()),
+        (_, Some(b)) if crate::utils::process::node_exe_in(b).is_file() => Some(b.clone()),
         _ => None,
     }
 }
@@ -58,8 +58,8 @@ fn effective_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
 pub fn get_node_runtime_info(app: &tauri::AppHandle) -> NodeRuntimeInfo {
     let upgraded = app.path().app_data_dir().ok().map(|d| d.join(UPGRADED_DIR));
     let bundled = app.path().resource_dir().ok().map(|d| d.join(BUNDLED_REL));
-    let has_upgraded = upgraded.as_ref().is_some_and(|d| d.join("node.exe").is_file());
-    let has_bundled = bundled.as_ref().is_some_and(|d| d.join("node.exe").is_file());
+    let has_upgraded = upgraded.as_ref().is_some_and(|d| crate::utils::process::node_exe_in(d).is_file());
+    let has_bundled = bundled.as_ref().is_some_and(|d| crate::utils::process::node_exe_in(d).is_file());
 
     // 生效来源与 utils::process 解析一致：内置（升级版优先）→ 系统 PATH → none
     // 展示字段统一 normalize_path：去掉 canonicalize 产生的 `\\?\` verbatim 前缀
@@ -96,8 +96,10 @@ pub fn get_node_runtime_info(app: &tauri::AppHandle) -> NodeRuntimeInfo {
         source: source.to_string(),
         dir,
         upgraded_dir: upgraded
+            .filter(|d| d.is_dir())
             .map(|d| crate::utils::path::normalize_path(&d.to_string_lossy())),
         bundled_dir: bundled
+            .filter(|d| d.is_dir())
             .map(|d| crate::utils::path::normalize_path(&d.to_string_lossy())),
         node_error,
         npx_error,
@@ -127,6 +129,23 @@ pub async fn upgrade_node_runtime(
     };
     let version = version.trim_start_matches('v').to_string();
 
+    // 平台对应的压缩包后缀与扩展名（npmmirror 官方命名：darwin-arm64/darwin-x64/linux-x64/win-x64）
+    let (suffix, is_targz): (&str, bool) = if cfg!(windows) {
+        ("win-x64", false)
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            ("darwin-arm64", true)
+        } else {
+            ("darwin-x64", true)
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        ("linux-arm64", true)
+    } else {
+        ("linux-x64", true)
+    };
+    let ext = if is_targz { "tar.gz" } else { "zip" };
+    let url = format!("{BINARY_BASE}/v{version}/node-v{version}-{suffix}.{ext}");
+
     // 代理策略：None=自动；Some(true)=强制走系统代理；Some(false)=直连
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(600));
     match use_proxy {
@@ -147,11 +166,10 @@ pub async fn upgrade_node_runtime(
         }
     }
     let client = builder.build().map_err(|e| format!("创建下载客户端失败: {e}"))?;
-    let url = format!("{BINARY_BASE}/v{version}/node-v{version}-win-x64.zip");
 
-    // 2. 流式下载到临时 zip（逐块写盘 + 进度事件推送）
+    // 2. 流式下载到临时压缩包（逐块写盘 + 进度事件推送）
     let data_dir = app.path().app_data_dir().map_err(|e| format!("无法解析应用数据目录: {e}"))?;
-    let zip_path = data_dir.join(format!("node-v{version}-win-x64.zip"));
+    let zip_path = data_dir.join(format!("node-v{version}-{suffix}.{ext}"));
     let v = version.clone();
     runtime_progress::download_to_file(
         app,
@@ -180,7 +198,11 @@ pub async fn upgrade_node_runtime(
             EVENT,
             &RuntimeProgress::phase("extract", "解压安装中…"),
         );
-        let r = extract_zip(&zip_for_task, &target);
+        let r = if is_targz {
+            crate::services::jdk_runtime::extract_targz(&zip_for_task, &target)
+        } else {
+            extract_zip(&zip_for_task, &target)
+        };
         runtime_progress::emit(
             &app_for_task,
             EVENT,
@@ -222,12 +244,17 @@ fn system_node_found() -> bool {
 
 /// 系统 PATH 中 Node 可执行文件所在目录（找到的第一个）
 fn system_node_dir() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["node.exe", "node.cmd", "node.bat"]
+    } else {
+        &["node"]
+    };
     let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var).find(|dir| {
-        ["node.exe", "node.cmd", "node.bat"]
-            .iter()
-            .any(|n| dir.join(n).is_file())
-    })
+    if let Some(d) = std::env::split_paths(&path_var).find(|dir| names.iter().any(|n| dir.join(n).is_file())) {
+        return Some(d);
+    }
+    // macOS/Linux GUI 启动 PATH 极简（不继承 shell 配置）：兑底探测常见安装目录（nvm/brew/usr/local）
+    crate::utils::process::probe_common_program("node").and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
 /// 执行程序并捕获 stdout，返回（版本串, 失败原因）。
@@ -252,10 +279,8 @@ fn run_capture(program: &str, flag: &str) -> (String, Option<String>) {
     }
 }
 
-/// 查询 npmmirror index.json，返回最新 LTS 版本号（如 22.14.0）。
-/// 注意：列表按版本降序排列（v26 在前、v0.1 在后），不能依赖顺序——
-/// 统一遍历取 lts 标识非空且版本号最大的条目。
-pub(crate) async fn fetch_latest_lts(use_proxy: Option<bool>) -> Result<String, String> {
+/// 查询 npmmirror index.json 原始列表（按版本降序：v26 在前、v0.1 在后）
+async fn fetch_index(use_proxy: Option<bool>) -> Result<Vec<serde_json::Value>, String> {
     // 代理策略：None=自动；Some(true)=强制系统代理；Some(false)=直连
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
     match use_proxy {
@@ -284,9 +309,37 @@ pub(crate) async fn fetch_latest_lts(use_proxy: Option<bool>) -> Result<String, 
     if !resp.status().is_success() {
         return Err(format!("查询最新版本失败: HTTP {}", resp.status()));
     }
-    let list: Vec<serde_json::Value> =
-        resp.json().await.map_err(|e| format!("解析版本列表失败: {e}"))?;
+    resp.json().await.map_err(|e| format!("解析版本列表失败: {e}"))
+}
+
+/// 查询 npmmirror index.json，返回最新 LTS 版本号（如 22.14.0）。
+/// 注意：列表按版本降序排列（v26 在前、v0.1 在后），不能依赖顺序——
+/// 统一遍历取 lts 标识非空且版本号最大的条目。
+pub(crate) async fn fetch_latest_lts(use_proxy: Option<bool>) -> Result<String, String> {
+    let list = fetch_index(use_proxy).await?;
     pick_latest_lts(&list).ok_or_else(|| "未找到可用的 LTS 版本".to_string())
+}
+
+/// 查询最近的 N 个 LTS 版本（按版本降序），供环境页“选择版本”下拉候选
+pub(crate) async fn fetch_lts_list(
+    use_proxy: Option<bool>,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    let list = fetch_index(use_proxy).await?;
+    let mut lts: Vec<(String, (u32, u32, u32))> = list
+        .iter()
+        .filter_map(|item| {
+            let lts = item.get("lts").and_then(|l| l.as_str()).unwrap_or("");
+            if lts.is_empty() {
+                return None;
+            }
+            let v = item.get("version").and_then(|v| v.as_str())?.trim_start_matches('v');
+            let ver = parse_semver(v)?;
+            Some((v.to_string(), ver))
+        })
+        .collect();
+    lts.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(lts.into_iter().take(limit).map(|(v, _)| v).collect())
 }
 
 /// 从 index.json 条目中挑选最新 LTS：lts 标识非空（字符串）且版本号最大

@@ -47,8 +47,8 @@ fn effective_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     let upgraded = app.path().app_data_dir().ok().map(|d| d.join(UPGRADED_DIR));
     let bundled = app.path().resource_dir().ok().map(|d| d.join(BUNDLED_REL));
     match (&upgraded, &bundled) {
-        (Some(u), _) if u.join("cmd").join("git.exe").is_file() => Some(u.clone()),
-        (_, Some(b)) if b.join("cmd").join("git.exe").is_file() => Some(b.clone()),
+        (Some(u), _) if crate::utils::process::git_exe_in(u).is_file() => Some(u.clone()),
+        (_, Some(b)) if crate::utils::process::git_exe_in(b).is_file() => Some(b.clone()),
         _ => None,
     }
 }
@@ -57,8 +57,8 @@ fn effective_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
 pub fn get_git_runtime_info(app: &tauri::AppHandle) -> GitRuntimeInfo {
     let upgraded = app.path().app_data_dir().ok().map(|d| d.join(UPGRADED_DIR));
     let bundled = app.path().resource_dir().ok().map(|d| d.join(BUNDLED_REL));
-    let has_upgraded = upgraded.as_ref().is_some_and(|d| d.join("cmd").join("git.exe").is_file());
-    let has_bundled = bundled.as_ref().is_some_and(|d| d.join("cmd").join("git.exe").is_file());
+    let has_upgraded = upgraded.as_ref().is_some_and(|d| crate::utils::process::git_exe_in(d).is_file());
+    let has_bundled = bundled.as_ref().is_some_and(|d| crate::utils::process::git_exe_in(d).is_file());
 
     // 生效来源与 utils::process 解析一致：内置（升级版优先）→ 系统 PATH → none
     let (source, dir) = if has_upgraded {
@@ -103,6 +103,10 @@ pub async fn upgrade_git_runtime(
     app: &tauri::AppHandle,
     use_proxy: Option<bool>,
 ) -> Result<GitRuntimeInfo, String> {
+    // 内置 Git 仅支持 Windows（PortableGit 自解压包）；macOS/Linux 使用系统 Git
+    if !cfg!(windows) {
+        return Err("当前平台不支持内置 Git 下载：macOS 可在终端执行 xcode-select --install 安装命令行工具；Linux 请使用系统包管理器安装 git".into());
+    }
     use crate::services::runtime_progress::{self, RuntimeProgress};
     const EVENT: &str = "git-runtime-progress";
 
@@ -259,13 +263,16 @@ fn build_client(use_proxy: Option<bool>) -> Result<reqwest::Client, String> {
     builder.build().map_err(|e| format!("创建下载客户端失败: {e}"))
 }
 
-/// 系统 PATH 中是否存在 Git（git.exe）
+/// 系统 PATH 中是否存在 Git（Windows: git.exe；macOS/Linux: git）
 fn system_git_found() -> bool {
-    let path_var = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return false,
-    };
-    std::env::split_paths(&path_var).any(|dir| dir.join("git.exe").is_file())
+    let names: &[&str] = if cfg!(windows) { &["git.exe"] } else { &["git"] };
+    if let Some(path_var) = std::env::var_os("PATH") {
+        if std::env::split_paths(&path_var).any(|dir| names.iter().any(|n| dir.join(n).is_file())) {
+            return true;
+        }
+    }
+    // macOS/Linux GUI 启动 PATH 极简：兑底探测常见安装目录
+    crate::utils::process::probe_common_program("git").is_some()
 }
 
 /// 执行 git --version 并捕获输出（走 process 解析，与命令执行逻辑一致）
@@ -289,9 +296,9 @@ fn run_git_version() -> (String, Option<String>) {
     }
 }
 
-/// 便携版 git 可执行文件路径（cmd\git.exe）
+/// 便携版 git 可执行文件路径（Windows: cmd/git.exe；macOS/Linux: bin/git）
 pub fn git_exe_in(dir: &Path) -> PathBuf {
-    dir.join("cmd").join("git.exe")
+    crate::utils::process::git_exe_in(dir)
 }
 
 #[cfg(test)]
@@ -301,10 +308,12 @@ mod tests {
     /// 开发机 runtime/git 存在时，effective 解析应命中捆绑版
     #[test]
     fn test_git_exe_in_layout() {
-        assert_eq!(
-            git_exe_in(Path::new("D:/x/git")),
-            Path::new("D:/x/git").join("cmd").join("git.exe")
-        );
+        let p = git_exe_in(Path::new("D:/x/git"));
+        if cfg!(windows) {
+            assert_eq!(p, Path::new("D:/x/git").join("cmd").join("git.exe"));
+        } else {
+            assert_eq!(p, Path::new("D:/x/git").join("bin").join("git"));
+        }
     }
 
     /// tag 转 PortableGit 版本号：v2.50.1.windows.1 → 2.50.1.windows.1

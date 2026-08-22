@@ -682,6 +682,21 @@ pub fn detect_with(manual: &HarmonyEnvConfig) -> HarmonyEnv {
     if ohpm_path.is_none() {
         ohpm_path = find_in_path("ohpm");
     }
+    // 兜底：DevEco Studio 新版安装自带 ohpm（tools/ohpm/bin），不再随
+    // command-line-tools 分发。hdc 已有 SDK toolchains / 安装目录两处兜底，
+    // ohpm 若漏掉会导致环境状态误判为"部分缺失"（黄点）
+    if ohpm_path.is_none() {
+        if let Some(s) = &studio {
+            let bin = s.join("tools").join("ohpm").join("bin");
+            ohpm_path = [
+                bin.join(exe_name("ohpm")),
+                bin.join("ohpm"),
+                bin.join("ohpm.bat"),
+            ]
+            .into_iter()
+            .find(|p| p.is_file());
+        }
+    }
 
     let mut suggestions = Vec::new();
     if sdk_root.is_none() {
@@ -699,6 +714,19 @@ pub fn detect_with(manual: &HarmonyEnvConfig) -> HarmonyEnv {
         "auto".to_string()
     };
 
+    // hvigorw：DevEco Studio 内置 tools/hvigor/bin（与 hvigor_command 兜底同源，
+    // 让 environment_check 的“hvigorw 未在工具链目录发现”与构建实际可用性一致）
+    let hvigorw_path = studio.as_ref().and_then(|s| {
+        let bin = s.join("tools").join("hvigor").join("bin");
+        [
+            bin.join(exe_name("hvigorw")),
+            bin.join("hvigorw"),
+            bin.join("hvigorw.bat"),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
+    });
+
     HarmonyEnv {
         sdk_root: sdk_root.map(|p| p.to_string_lossy().to_string()),
         default_api,
@@ -708,7 +736,7 @@ pub fn detect_with(manual: &HarmonyEnvConfig) -> HarmonyEnv {
         hdc_path: hdc_path.map(|p| p.to_string_lossy().to_string()),
         hdc_source: hdc_source.map(String::from),
         ohpm_path: ohpm_path.map(|p| p.to_string_lossy().to_string()),
-        hvigorw_path: None,
+        hvigorw_path: hvigorw_path.map(|p| p.to_string_lossy().to_string()),
         studio_dir: studio.map(|p| p.to_string_lossy().to_string()),
         source,
         suggestions,

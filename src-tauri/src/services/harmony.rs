@@ -338,10 +338,7 @@ pub struct HvigorCommand {
 /// （HarmonyOS 模式下 Property 不读 local.properties 的 hwsdk.dir），未设置且探测到
 /// DevEco Studio 内置 SDK 时自动注入，否则构建会以 00303217/00303312 失败。
 pub fn hvigor_command(project_path: &Path) -> Result<HvigorCommand, String> {
-    #[cfg(windows)]
     let env = hvigor_env();
-    #[cfg(not(windows))]
-    let env: Vec<(String, String)> = Vec::new();
     let wrapper = project_path.join("hvigor").join("hvigor-wrapper.js");
     if cfg!(windows) && wrapper.is_file() {
         return Ok(HvigorCommand {
@@ -390,6 +387,20 @@ pub fn hvigor_command(project_path: &Path) -> Result<HvigorCommand, String> {
         return Ok(HvigorCommand {
             program: script.to_string_lossy().to_string(),
             args: Vec::new(),
+            env,
+        });
+    }
+    // DevEco Studio 内置 hvigor 引擎（工程因 .gitignore/拷贝丢失 hvigorw 脚本时兜底）：
+    // node 直调 hvigorw.js；node 优先 DevEco 自带（绝对路径，GUI 启动 PATH 极简也可用），
+    // 并注入 NODE_HOME/PATH 供 hvigorw.js 内部 spawn node 子进程
+    if let Some((dev_hvigorw, _)) = find_deveco_toolchain() {
+        let mut env = env;
+        #[cfg(not(windows))]
+        env.extend(deveco_node_env());
+        let node = find_deveco_node().unwrap_or_else(|| "node".to_string());
+        return Ok(HvigorCommand {
+            program: node,
+            args: vec![dev_hvigorw.to_string_lossy().to_string()],
             env,
         });
     }
@@ -456,7 +467,6 @@ fn hvigorw_bat_usable(bat: &Path, wrapper: &Path) -> bool {
 /// 构建 hvigor 所需环境变量：用户显式设置了 DEVECO_SDK_HOME 时不覆盖，
 /// 否则探测 DevEco Studio 内置 SDK 根目录（sdk/default/sdk-pkg.json 布局），
 /// 未发现时回退复用环境探测的 command-line-tools 内置 SDK。
-#[cfg(windows)]
 fn hvigor_env() -> Vec<(String, String)> {
     if std::env::var("DEVECO_SDK_HOME").is_ok() {
         return Vec::new();
@@ -480,9 +490,87 @@ fn hvigor_env() -> Vec<(String, String)> {
     Vec::new()
 }
 
-/// 非 Windows 平台无 DevEco Studio 桌面端（hvigor 依赖 HarmonyOS CLI 工具链），返回 None。
+/// DevEco Studio 自带 node（tools/node/bin/node）：hvigorw.js 依赖 node 运行，
+/// GUI 启动（LaunchServices）PATH 极简时 PATH 中的 node 可能不存在，
+/// 优先用绝对路径；找不到时调用方回退 "node"（走 resolve_program）。
+#[cfg(not(windows))]
+fn find_deveco_node() -> Option<String> {
+    for root in ["/Applications/DevEco-Studio.app", "/Applications/DevEco Studio.app"] {
+        let cand = Path::new(root)
+            .join("Contents")
+            .join("tools")
+            .join("node")
+            .join("bin")
+            .join("node");
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// DevEco 自带 node 的环境注入（NODE_HOME + PATH 前置基础目录与 node bin）：
+/// hvigorw.js 内部可能 spawn `node` 子进程，PATH 极简时找不到会静默失败。
+#[cfg(not(windows))]
+fn deveco_node_env() -> Vec<(String, String)> {
+    let node_bin = match find_deveco_node() {
+        Some(n) => PathBuf::from(n),
+        None => return Vec::new(),
+    };
+    let home = match node_bin.parent().and_then(|p| p.parent()) {
+        Some(h) => h.to_path_buf(),
+        None => return Vec::new(),
+    };
+    let mut v = vec![("NODE_HOME".to_string(), home.to_string_lossy().to_string())];
+    let mut dirs = vec![node_bin.parent().unwrap_or(&home).to_path_buf()];
+    for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        dirs.push(PathBuf::from(d));
+    }
+    dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    if let Ok(p) = std::env::join_paths(&dirs) {
+        v.push(("PATH".to_string(), p.to_string_lossy().to_string()));
+    }
+    v
+}
+
+/// 非 Windows 平台探测 DevEco Studio 内置工具链：hvigor 启动器 + HarmonyOS SDK 根目录。
+/// macOS 候选：/Applications/DevEco-Studio.app（连字符）与 /Applications/DevEco Studio.app（空格）；
+/// Linux 候选：/opt 常见安装位置；均支持 DEVECO_HOME/DEVECO_STUDIO_HOME 环境变量覆盖。
+/// SDK 根要求存在 `sdk/default/sdk-pkg.json`（DevEco 6.x 内置 SDK 布局：
+/// hvigor 的 SDK 扫描器只找 {SDK_ROOT}/<子目录>/sdk-pkg.json，因此 DEVECO_SDK_HOME
+/// 必须指向 sdk-pkg.json 所在目录（default）的父目录，指向 sdk/default 或
+/// sdk/default/openharmony 都会报 00303312）。
 #[cfg(not(windows))]
 pub(crate) fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
+    fn probe(root: &Path) -> Option<(PathBuf, PathBuf)> {
+        let hvigorw = root
+            .join("tools")
+            .join("hvigor")
+            .join("bin")
+            .join("hvigorw.js");
+        let sdk = root.join("sdk");
+        (hvigorw.is_file() && sdk.join("default").join("sdk-pkg.json").is_file())
+            .then(|| (hvigorw, sdk))
+    }
+    for var in ["DEVECO_HOME", "DEVECO_STUDIO_HOME"] {
+        if let Ok(v) = std::env::var(var) {
+            if let Some(p) = probe(Path::new(&v)) {
+                return Some(p);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for app in ["DevEco-Studio.app", "DevEco Studio.app"] {
+        if let Some(p) = probe(&Path::new("/Applications").join(app).join("Contents")) {
+            return Some(p);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for root in ["/opt/DevEco Studio", "/opt/DevEco-Studio", "/opt/deveco-studio"] {
+        if let Some(p) = probe(Path::new(root)) {
+            return Some(p);
+        }
+    }
     None
 }
 

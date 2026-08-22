@@ -668,6 +668,7 @@ pub fn run() {
             commands::environment::get_app_info,
             commands::environment::get_environment_info,
             commands::environment::fetch_node_latest_lts,
+            commands::environment::fetch_node_lts_list,
             commands::environment::fetch_git_latest_version,
             commands::environment::get_git_runtime,
             commands::environment::upgrade_git_runtime,

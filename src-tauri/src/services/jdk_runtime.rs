@@ -763,9 +763,10 @@ fn extract_zip(zip_path: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// macOS/Linux：系统 tar 解压 Adoptium tar.gz（解到临时目录后与 extract_zip
-/// 相同的落盘模式：顶层 jdk-xxx 内容提升到 target）
-fn extract_targz(archive: &Path, target: &Path) -> Result<(), String> {
+/// macOS/Linux：系统 tar 解压 tar.gz（解到临时目录后与 extract_zip
+/// 相同的落盘模式：顶层 jdk-xxx 内容提升到 target）。
+/// 供 node_runtime 等共享使用（node 官方包同为 tar.gz + 顶层目录布局）。
+pub(crate) fn extract_targz(archive: &Path, target: &Path) -> Result<(), String> {
     let parent = target.parent().unwrap_or(Path::new("."));
     let tmp = parent.join(format!(
         "{}.{}.tmp",

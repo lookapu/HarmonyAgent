@@ -46,14 +46,14 @@ pub fn get_app_info(app: tauri::AppHandle) -> AppInfo {
             .resource_dir()
             .ok()
             .map(|d| d.join("node"))
-            .filter(|d| d.join("node.exe").is_file())
+            .filter(|d| crate::utils::process::node_exe_in(d).is_file())
             .map(norm),
         upgraded_node_dir: app
             .path()
             .app_data_dir()
             .ok()
             .map(|d| d.join("node_runtime"))
-            .filter(|d| d.join("node.exe").is_file())
+            .filter(|d| crate::utils::process::node_exe_in(d).is_file())
             .map(norm),
     }
 }
@@ -106,6 +106,12 @@ pub async fn get_environment_info(
 #[tauri::command]
 pub async fn fetch_node_latest_lts() -> Result<String, String> {
     crate::services::node_runtime::fetch_latest_lts(None).await
+}
+
+/// 查询最近 N 个 Node LTS 版本（降序），供环境页“选择版本”下拉候选
+#[tauri::command]
+pub async fn fetch_node_lts_list() -> Result<Vec<String>, String> {
+    crate::services::node_runtime::fetch_lts_list(None, 10).await
 }
 
 /// 查询内置 Git 运行时状态（版本、来源、目录），与 Node/JDK 运行时卡片对齐
@@ -311,26 +317,47 @@ pub async fn get_tool_version(path: String) -> Result<String, String> {
         .and_then(|n| n.to_str())
         .unwrap_or("");
     let mut cmd = crate::utils::process::command(&path, &[version_arg(tool).to_string()])?;
-    // hvigorw / ohpm 依赖 node：注入 DevEco Studio 自带 Node（tools/node）兑底，
-    // 避免 GUI 启动环境未继承 shell PATH 时报 "NODE_HOME is not set"（macOS 常见）
+    // GUI 启动（LaunchServices）时应用工作目录为 /（无写权限）：hvigorw/ohpm
+    // 会在工作目录创建 .hvigor 等缓存，脚本递归建目录直接 RangeError 崩溃，
+    // 必须切到可写目录（临时目录优先，/tmp 兑底）
+    let workdir = std::env::temp_dir();
+    let workdir = if workdir.is_dir() {
+        workdir
+    } else {
+        std::path::PathBuf::from("/tmp")
+    };
+    if workdir.is_dir() {
+        cmd.current_dir(workdir);
+    }
+    // hvigorw / ohpm 依赖 node：注入 Node 环境兑底，避免 GUI 启动环境未继承
+    // shell PATH 时报 "NODE_HOME is not set"（macOS 常见）。优先 DevEco Studio
+    // 自带 Node（tools/node），探测失败时用常见安装目录兜底（nvm/brew/sdkman）
     let lower = tool.to_ascii_lowercase();
     if lower.starts_with("hvigorw") || lower.starts_with("ohpm") {
-        if let Some(home) = deveco_node_home() {
+        let mut node_home = deveco_node_home();
+        if node_home.is_none() {
+            if let Some(node_bin) = crate::utils::process::probe_common_program("node") {
+                // probe 返回 <node_home>/bin/node → NODE_HOME 取上级的上级
+                node_home = node_bin
+                    .parent()
+                    .and_then(|bin_dir| bin_dir.parent())
+                    .map(|h| h.to_path_buf());
+            }
+        }
+        if let Some(home) = node_home {
             cmd.env("NODE_HOME", &home);
             let bin = if cfg!(windows) { home.clone() } else { home.join("bin") };
-            if bin.is_dir() {
-                // GUI 启动（LaunchServices）时 PATH 可能为空/极简，脚本 shebang
-                // （#!/usr/bin/env bash）依赖基础目录，必须补齐再前置 node
-                let mut dirs = vec![bin];
-                for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-                    dirs.push(std::path::PathBuf::from(d));
-                }
-                dirs.extend(std::env::split_paths(
-                    &std::env::var_os("PATH").unwrap_or_default(),
-                ));
-                if let Ok(p) = std::env::join_paths(&dirs) {
-                    cmd.env("PATH", p);
-                }
+            // GUI 启动（LaunchServices）时 PATH 可能为空/极简，脚本 shebang
+            // （#!/usr/bin/env bash）依赖基础目录，必须补齐再前置 node
+            let mut dirs = vec![bin];
+            for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+                dirs.push(std::path::PathBuf::from(d));
+            }
+            dirs.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(p) = std::env::join_paths(&dirs) {
+                cmd.env("PATH", p);
             }
         }
     }
@@ -355,11 +382,14 @@ pub async fn get_tool_version(path: String) -> Result<String, String> {
             stdout.trim(),
             stderr.trim()
         );
-        return Err(format!(
-            "退出码 {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        ));
+        // 脚本类工具（hvigorw/ohpm 等）错误常输出到 stdout（echo 默认），
+        // stderr 为空时回退 stdout，避免错误信息丢失
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else {
+            stdout.trim().to_string()
+        };
+        return Err(format!("退出码 {}: {}", output.status.code().unwrap_or(-1), detail));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
