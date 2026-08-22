@@ -79,7 +79,8 @@ jobs:
           path: src-tauri/target/eval-baseline.json
           key: eval-baseline-${{ matrix.os }}-${{ github.sha }}
       - name: Agent execution kernel V2 gate
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked agent::
+        # 行尾 :: 需引号包裹，否则 YAML 解析报 mapping values not allowed
+        run: "cargo test --manifest-path src-tauri/Cargo.toml --locked agent::"
       - name: Multi-process worker crash recovery gate
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --test worker_crash_e2e -- --test-threads=1
       - name: Tool worker crash and side-effect recovery gate
