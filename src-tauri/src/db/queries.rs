@@ -1236,3 +1236,115 @@ fn row_to_knowledge(row: &rusqlite::Row) -> rusqlite::Result<KnowledgeEntry> {
         updated_at: row.get(10)?,
     })
 }
+
+/// 多关键词模糊检索（长会话检索增强）：把 keyword 拆分为多个 token（空白/逗号/分号），
+/// 每个 token 独立 LIKE 检索取并集，Rust 层按 token 命中数与字符重叠度排序取 top limit；
+/// 单 token 时退化为原精确 LIKE（search_knowledge）行为。
+///
+/// 背景：长会话跨轮次检索时用词会漂移（同一事实两种说法），整串 LIKE 会漏召回；
+/// 拆 token 后任一说法命中即可入围，重叠度排序保证最相关的条目排前面。
+pub fn search_knowledge_fuzzy(
+    conn: &Connection,
+    project_id: Option<&str>,
+    keyword: &str,
+    limit: usize,
+) -> Result<Vec<KnowledgeEntry>, rusqlite::Error> {
+    let tokens: Vec<String> = keyword
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '；'))
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && t.chars().count() >= 2)
+        .map(str::to_string)
+        .collect();
+    if tokens.len() <= 1 {
+        return search_knowledge(conn, project_id, keyword, limit);
+    }
+    // 各 token 并集粗筛（保留 hit_count 供排序 tie-break）
+    let mut seen: Vec<KnowledgeEntry> = Vec::new();
+    for token in &tokens {
+        for entry in search_knowledge(conn, project_id, token, limit.saturating_mul(4))? {
+            if !seen.iter().any(|e| e.id == entry.id) {
+                seen.push(entry);
+            }
+        }
+    }
+    // 排序：token 命中数降序 → 字符重叠度降序 → hit_count 降序
+    let query_lower = keyword.to_lowercase();
+    seen.sort_by(|a, b| score(b, &tokens, &query_lower).cmp(&score(a, &tokens, &query_lower)));
+    seen.truncate(limit);
+    Ok(seen)
+}
+
+fn score(entry: &KnowledgeEntry, tokens: &[String], query_lower: &str) -> (usize, i64, i64) {
+    let haystack = format!("{} {} {} {}", entry.title, entry.keywords, entry.cause, entry.fix)
+        .to_lowercase();
+    let hits = tokens.iter().filter(|t| haystack.contains(t.as_str())).count();
+    let overlap = (char_overlap_ratio(query_lower, &haystack) * 1000.0) as i64;
+    (hits, overlap, entry.hit_count)
+}
+
+/// Jaccard 字符重叠度（去重字符交集 / 并集），0.0-1.0。
+fn char_overlap_ratio(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    let set_a: HashSet<char> = a.chars().collect();
+    let set_b: HashSet<char> = b.chars().collect();
+    if set_a.is_empty() || set_b.is_empty() {
+        return 0.0;
+    }
+    let inter = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+    inter as f64 / union.max(1) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn init_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../migrations/026_knowledge_entries.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/027_knowledge_hit_count.sql"))
+            .unwrap();
+        conn
+    }
+
+    fn insert(conn: &Connection, id: &str, title: &str, keywords: &str, cause: &str, fix: &str) {
+        conn.execute(
+            "INSERT INTO knowledge_entries(id,keywords,title,cause,fix,enabled,builtin,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,1,0,1,1)",
+            params![id, keywords, title, cause, fix],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fuzzy_search_recalls_by_any_token_and_ranks_by_overlap() {
+        let conn = init_conn();
+        insert(
+            &conn,
+            "k1",
+            "hvigor 构建报 00308018",
+            "hvigor java",
+            "缺 Java 运行时",
+            "设置 JAVA_HOME",
+        );
+        insert(&conn, "k2", "真机安装失败", "hdc install", "签名问题", "重新签名");
+        insert(&conn, "k3", "鸿蒙设备调试", "hdc 设备", "连接问题", "重启 hdc");
+        // 多 token 查询：任一命中即召回
+        let rows = search_knowledge_fuzzy(&conn, None, "hvigor 00308018", 5).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "k1");
+        // 中文逗号分隔 token：hdc 命中 k2/k3，安装失败命中 k2 → k2 排前
+        let rows = search_knowledge_fuzzy(&conn, None, "hdc, 安装失败", 5).unwrap();
+        assert_eq!(rows[0].id, "k2");
+        assert!(rows.iter().any(|e| e.id == "k3"));
+        // 单 token 退化为原逻辑
+        let rows = search_knowledge_fuzzy(&conn, None, "hvigor", 5).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "k1");
+        // 无命中
+        let rows = search_knowledge_fuzzy(&conn, None, "不存在的关键词 xyz", 5).unwrap();
+        assert!(rows.is_empty());
+    }
+}

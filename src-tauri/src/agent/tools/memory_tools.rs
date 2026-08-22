@@ -177,7 +177,7 @@ pub(super) async fn search_knowledge(args: &Value, project_id: &str, db: &crate:
     let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 20) as usize;
     let rows = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        crate::db::queries::search_knowledge(
+        crate::db::queries::search_knowledge_fuzzy(
             &conn,
             if project_id.is_empty() { None } else { Some(project_id) },
             keyword,
