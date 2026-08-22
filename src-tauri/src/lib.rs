@@ -506,6 +506,7 @@ pub fn run() {
             commands::version::list_available_versions,
             commands::version::install_version,
             commands::version::check_base_update,
+            commands::deveco_cli::detect_devecocli,
             commands::config::read_config,
             commands::config::write_config,
             commands::config::get_config_path,
@@ -689,6 +690,7 @@ pub fn run() {
             services::harmony_env::read_harmony_doc,
             commands::desktop::detect_system_locale,
             commands::desktop::send_notification,
+            commands::generation::generate_media,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -727,5 +729,3 @@ pub fn run() {
             }
         });
 }
-            commands::generation::generate_media,
-            commands::deveco_cli::detect_devecocli,
