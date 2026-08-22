@@ -180,6 +180,8 @@ impl BudgetProfile {
     }
 
     /// 从任务阶段推导画像：无法识别时回退 Balanced。
+    /// 关键词与 capabilities.rs TaskPhase（Explore/Modify/Verify/Deliver）语义对齐：
+    /// Modify→Execute、Deliver→Verify、Recover→Execute（LC-30 统一分类器）。
     pub fn from_phase(phase: &str) -> BudgetProfile {
         let p = phase.to_ascii_lowercase();
         if p.contains("explor")
@@ -195,21 +197,47 @@ impl BudgetProfile {
             || p.contains("execut")
             || p.contains("implement")
             || p.contains("fix")
+            || p.contains("recover")
+            || p.contains("modify")
+            || p.contains("edit")
+            || p.contains("update")
+            || p.contains("refactor")
+            || p.contains("rewrite")
             || p.contains("执行")
             || p.contains("构建")
+            || p.contains("修改")
+            || p.contains("编辑")
+            || p.contains("重构")
         {
             BudgetProfile::Execute
         } else if p.contains("verif")
             || p.contains("test")
             || p.contains("accept")
             || p.contains("valid")
+            || p.contains("deliver")
+            || p.contains("summarize")
+            || p.contains("report")
             || p.contains("验收")
             || p.contains("验证")
+            || p.contains("交付")
+            || p.contains("汇报")
         {
             BudgetProfile::Verify
         } else {
             BudgetProfile::Balanced
         }
+    }
+
+    /// 从运行态 phase 与任务 goal 联合推导画像（LC-30 统一任务阶段分类器）：
+    /// phase 是结构化任务阶段时优先；agent_runs.phase 实际存运行状态
+    /// （initializing/recovering/orchestrating 等，见 runtime.rs/dag.rs），
+    /// 无法识别时用 goal 文本关键词兜底，避免动态预算永远落在 Balanced。
+    pub fn from_goal_or_phase(phase: &str, goal: &str) -> BudgetProfile {
+        let from_phase = BudgetProfile::from_phase(phase);
+        if from_phase != BudgetProfile::Balanced {
+            return from_phase;
+        }
+        BudgetProfile::from_phase(goal)
     }
 }
 
@@ -1525,7 +1553,10 @@ pub fn load_context_v2(
 
     // 预算按当前任务阶段动态分配（持久化 budget_json 仅作审计，读取时以当前阶段为准）
     let budget =
-        ContextBudgetV2::allocate_with_profile(context_limit, BudgetProfile::from_phase(&task.phase));
+        ContextBudgetV2::allocate_with_profile(
+            context_limit,
+            BudgetProfile::from_goal_or_phase(&task.phase, &task.goal),
+        );
     Ok(ConversationContextV2 {
         schema_version,
         conversation_id: conversation_id.to_string(),
@@ -1721,9 +1752,10 @@ pub fn persist_runtime_checkpoint(
     context_limit: i64,
 ) -> Result<(), String> {
     let task = capture_task_snapshot(conn, conversation_id)?;
+    // LC-30：agent_runs.phase 存运行状态（initializing/recovering），用 goal 兜底推导画像
     let budget = ContextBudgetV2::allocate_with_profile(
         context_limit,
-        BudgetProfile::from_phase(&task.phase),
+        BudgetProfile::from_goal_or_phase(&task.phase, &task.goal),
     );
     let (summary_from_message_rowid, summary_to_message_rowid) =
         if summary.is_some_and(|value| !value.trim().is_empty()) {
@@ -1764,6 +1796,16 @@ pub fn persist_runtime_checkpoint(
     )
 }
 
+/// 事实失效明细：原因（superseded/项目切换/设备变化等）与失效时间，
+/// 补全“为什么遗忘”解释入口（LC-31）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FactInvalidationDetail {
+    pub fact_key: String,
+    pub fact_kind: String,
+    pub reason: String,
+    pub invalidated_at: i64,
+}
+
 /// 会话健康度指标（长会话可观测性）：压缩次数、事实翻转率、对账纠正次数与预算占用。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionHealthV2 {
@@ -1778,6 +1820,12 @@ pub struct SessionHealthV2 {
     pub reconciliation_count: i64,
     pub corrected_count: i64,
     pub budget_usage_ratio: f64,
+    /// 摘要覆盖游标链推导：摘要覆盖消息占比（0..=1，LC-11 游标）
+    pub summary_coverage: f64,
+    /// 真实摘要层级：0=无摘要 1=浅层(<50%) 2=中层(<85%) 3=深层(≥85%)（LC-34）
+    pub summary_depth: i64,
+    /// 最近失效事实明细（最多 5 条）
+    pub recent_invalidations: Vec<FactInvalidationDetail>,
     pub degraded: bool,
     pub advice: Vec<String>,
 }
@@ -1867,11 +1915,65 @@ pub fn compute_session_health(
         0.0
     };
 
+    // 摘要覆盖游标链（LC-11 游标）：从 checkpoint 游标推导真实摘要层级（LC-34），
+    // 替代“压缩 ≥2 次”次数启发式——压缩次数仅作辅助信号。
+    let (summary_from, summary_to): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(summary_from_message_rowid,0),COALESCE(summary_to_message_rowid,0)
+             FROM conversation_context_state WHERE conversation_id=?1",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or((0, 0));
+    let summary_coverage = if summary_to > 0 && summary_to >= summary_from && message_count > 0 {
+        ((summary_to - summary_from + 1) as f64 / message_count as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let summary_depth = if summary_to <= 0 {
+        0
+    } else if summary_coverage < 0.5 {
+        1
+    } else if summary_coverage < 0.85 {
+        2
+    } else {
+        3
+    };
+    // 最近失效事实明细（“为什么遗忘”入口，LC-31）：最多 5 条
+    let mut stmt = conn
+        .prepare(
+            "SELECT fact_kind,fact_key,COALESCE(invalidation_reason,'unknown'),invalidated_at
+             FROM conversation_context_facts
+             WHERE conversation_id=?1 AND invalidated_at IS NOT NULL
+             ORDER BY invalidated_at DESC LIMIT 5",
+        )
+        .map_err(|e| e.to_string())?;
+    let recent_invalidations = stmt
+        .query_map([conversation_id], |row| {
+            Ok(FactInvalidationDetail {
+                fact_kind: row.get(0)?,
+                fact_key: row.get(1)?,
+                reason: row.get(2)?,
+                invalidated_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
     let mut degraded = false;
     let mut advice = Vec::new();
-    if compress_count >= 2 {
+    if summary_depth >= 2 {
         degraded = true;
-        advice.push("会话已压缩多次，早期细节可能只保留在摘要中".into());
+        advice.push(format!(
+            "摘要已覆盖 {:.0}% 历史（层级 {summary_depth}），早期细节可能只保留在摘要中",
+            summary_coverage * 100.0
+        ));
+    } else if compress_count >= 2 {
+        // 压缩次数仅作辅助信号：次数多但游标未推进（如压缩后未生成摘要）不判定退化
+        advice.push("会话已多次触发压缩，但摘要覆盖尚浅，请留意关键细节是否完整".into());
     }
     if corrected_count >= 1 {
         degraded = true;
@@ -1905,9 +2007,77 @@ pub fn compute_session_health(
         reconciliation_count,
         corrected_count,
         budget_usage_ratio,
+        summary_coverage,
+        summary_depth,
+        recent_invalidations,
         degraded,
         advice,
     })
+}
+
+/// EC-19 长会话压力评测核心：100 轮消息 + 事实翻转 + 压缩检查点 + 失效 + 对账，
+/// 在传入的已初始化内存库上真实执行，返回（是否通过, 健康度指标）。
+/// 固定评测场景（evals.rs）与本地压力测试共用，防压力场景回退。
+/// 通过条件：预算不越界、摘要游标覆盖正确、多次压缩后健康度检出退化。
+pub fn run_long_session_stress(conn: &Connection) -> (bool, SessionHealthV2) {
+    let mut version = 0;
+    for round in 1..=100 {
+        conn.execute(
+            "INSERT INTO messages(id,conversation_id,role,content,created_at)
+             VALUES (?1,'c','user',?2,?3)",
+            params![format!("m{round}"), format!("round-{round}"), round],
+        )
+        .unwrap();
+        // 每 5 轮翻转一次事实
+        if round % 5 == 0 {
+            version += 1;
+            upsert_fact(
+                &conn,
+                &ContextFactInput {
+                    conversation_id: "c".into(),
+                    project_id: Some("p".into()),
+                    run_id: None,
+                    fact_kind: "workspace".into(),
+                    fact_key: "git_head".into(),
+                    value: serde_json::json!(format!("head-v{version}")),
+                    source_kind: "git".into(),
+                    source_ref: format!("git:HEAD-{round}"),
+                    scope: "project".into(),
+                    confidence: 1.0,
+                    observed_at: Some(round as i64),
+                },
+            )
+            .unwrap();
+        }
+        // 每 10 轮做一次压缩检查点
+        if round % 10 == 0 {
+            let summary = format!("增量摘要 1..={round}");
+            persist_runtime_checkpoint(conn, "c", None, Some(summary.as_str()), 8, 64_000).unwrap();
+        }
+        // 每 20 轮使事实失效（模拟状态切换）并压缩一次（EC-19：多次压缩）
+        if round % 20 == 0 {
+            invalidate_facts(conn, "c", Some("project"), format!("rotate-{round}").as_str())
+                .unwrap();
+            bump_compress_count(conn, "c");
+        }
+        // 每 30 轮做一次摘要对账
+        if round % 30 == 0 {
+            reconcile_summary(conn, "c", &format!("第 {round} 轮摘要：状态正常")).unwrap();
+        }
+    }
+    let ctx = load_context_v2(conn, "c", 64_000).unwrap();
+    let b = &ctx.budget;
+    let budget_ok = b.system_tokens + b.task_tokens + b.project_tokens + b.archive_tokens + b.hot_tokens
+        <= b.input_tokens();
+    let health = compute_session_health(conn, "c", 64_000, 32_000).unwrap();
+    let passed = budget_ok
+        && ctx.summary_to_message_rowid == 92
+        && health.message_count == 100
+        && health.compress_count == 5
+        && health.summary_depth >= 2
+        && health.fact_flip_rate > 0.9
+        && health.degraded;
+    (passed, health)
 }
 
 fn load_active_facts(
@@ -2784,6 +2954,28 @@ mod tests {
             BudgetProfile::Verify
         );
         assert_eq!(BudgetProfile::from_phase("waiting_user"), BudgetProfile::Balanced);
+        // LC-30 联合推导：运行态 phase（initializing/recovering）用 goal 兜底，
+        // 结构化 phase 优先于 goal；Modify/Deliver 对齐 TaskPhase 语义
+        assert_eq!(
+            BudgetProfile::from_goal_or_phase("initializing", "探索 Harmony SDK 能力"),
+            BudgetProfile::Explore
+        );
+        assert_eq!(
+            BudgetProfile::from_goal_or_phase("recovering", "修复构建失败"),
+            BudgetProfile::Execute
+        );
+        assert_eq!(
+            BudgetProfile::from_goal_or_phase("verify_acceptance", "随便什么目标"),
+            BudgetProfile::Verify
+        );
+        assert_eq!(
+            BudgetProfile::from_phase("modify_implementation"),
+            BudgetProfile::Execute
+        );
+        assert_eq!(
+            BudgetProfile::from_phase("deliver_report"),
+            BudgetProfile::Verify
+        );
         // 侧重方向：Explore 归档 > Balanced；Execute 任务 > Balanced；Verify 项目 > Balanced
         let balanced = ContextBudgetV2::allocate_with_profile(total, BudgetProfile::Balanced);
         let explore = ContextBudgetV2::allocate_with_profile(total, BudgetProfile::Explore);
@@ -2806,6 +2998,14 @@ mod tests {
             .unwrap();
         let ctx = load_context_v2(&conn, "c", 64_000).unwrap();
         assert_eq!(ctx.budget.profile, "verify");
+        // 运行态 phase（initializing）不再永远落在 Balanced：goal 兜底推导生效
+        conn.execute(
+            "UPDATE agent_runs SET phase='initializing' WHERE run_id='run-b'",
+            [],
+        )
+        .unwrap();
+        let ctx = load_context_v2(&conn, "c", 64_000).unwrap();
+        assert_eq!(ctx.budget.profile, "execute");
     }
 
     #[test]
@@ -2845,6 +3045,20 @@ mod tests {
         assert!(health.degraded);
         assert!(!health.advice.is_empty());
         assert!((health.budget_usage_ratio - 60_000.0 / 64_000.0).abs() < 0.01);
+        // LC-34 游标推导：尚未 checkpoint（游标 0）→ 无摘要层级，退化由纠正/翻转触发
+        assert_eq!(health.summary_depth, 0);
+        assert_eq!(health.summary_coverage, 0.0);
+        // LC-31 失效明细：被失效覆盖的事实带原因
+        assert!(health
+            .recent_invalidations
+            .iter()
+            .any(|item| item.fact_key == "git_head" && !item.reason.is_empty()));
+        // checkpoint 推进游标（覆盖 1..=15/20 = 75% → 中层摘要）后，深度退化独立触发
+        persist_runtime_checkpoint(&conn, "c", None, Some("前 15 条摘要"), 5, 64_000).unwrap();
+        let deep = compute_session_health(&conn, "c", 64_000, 60_000).unwrap();
+        assert_eq!(deep.summary_depth, 2);
+        assert!(deep.summary_coverage > 0.7);
+        assert!(deep.degraded);
     }
 
     #[test]
@@ -2860,51 +3074,16 @@ mod tests {
     #[test]
     fn long_session_100_round_stress_keeps_facts_and_budget_bounded() {
         let conn = conn();
-        let mut version = 0;
-        for round in 1..=100 {
-            conn.execute(
-                "INSERT INTO messages(id,conversation_id,role,content,created_at)
-                 VALUES (?1,'c','user',?2,?3)",
-                params![format!("m{round}"), format!("round-{round}"), round],
-            )
-            .unwrap();
-            // 每 5 轮翻转一次事实
-            if round % 5 == 0 {
-                version += 1;
-                let mut f = fact(serde_json::json!(format!("head-v{version}")));
-                f.source_ref = format!("git:HEAD-{round}");
-                upsert_fact(&conn, &f).unwrap();
-            }
-            // 每 10 轮做一次压缩检查点
-            if round % 10 == 0 {
-                let summary = format!("增量摘要 1..={round}");
-                persist_runtime_checkpoint(
-                    &conn,
-                    "c",
-                    None,
-                    Some(summary.as_str()),
-                    8,
-                    64_000,
-                )
-                .unwrap();
-            }
-            // 每 20 轮使事实失效（模拟状态切换）
-            if round % 20 == 0 {
-                let reason = format!("rotate-{round}");
-                invalidate_facts(&conn, "c", Some("project"), reason.as_str()).unwrap();
-            }
-            // 每 30 轮做一次摘要对账
-            if round % 30 == 0 {
-                reconcile_summary(&conn, "c", &format!("第 {round} 轮摘要：状态正常")).unwrap();
-            }
-        }
-        let ctx = load_context_v2(&conn, "c", 64_000).unwrap();
-        // 预算不越界
-        let b = &ctx.budget;
-        assert!(
-            b.system_tokens + b.task_tokens + b.project_tokens + b.archive_tokens + b.hot_tokens
-                <= b.input_tokens()
-        );
+        // EC-19 公共压力核心：100 轮消息 + 事实翻转 + 压缩检查点 + 失效 + 对账
+        let (passed, health) = run_long_session_stress(&conn);
+        assert!(passed, "长会话压力场景回退：{:?}", health);
+        // 预算不越界（公共函数内已校验，此处复核健康度指标）
+        assert_eq!(health.message_count, 100);
+        assert_eq!(health.reconciliation_count, 3);
+        assert_eq!(health.compress_count, 5);
+        assert!(health.fact_flip_rate > 0.9);
+        assert_eq!(health.summary_depth, 3);
+        assert!(health.degraded);
         // 事实版本历史完整：20 次 upsert 全部保留（最后一条在 round 100 被失效覆盖）
         let versions: i64 = conn
             .query_row(
@@ -2925,14 +3104,14 @@ mod tests {
             .unwrap();
         assert_eq!(active, 0);
         // 摘要游标单调：最后检查点在 round 100，keep_recent=8 → 覆盖 1..=92
+        let ctx = load_context_v2(&conn, "c", 64_000).unwrap();
         assert_eq!(ctx.summary_to_message_rowid, 92);
         // 失效 epoch：5 次失效
         assert_eq!(ctx.invalidation_epoch, 5);
-        // 健康度：100 条消息、3 次对账、翻转率 1.0 → 退化预警
-        let health = compute_session_health(&conn, "c", 64_000, 32_000).unwrap();
-        assert_eq!(health.message_count, 100);
-        assert_eq!(health.reconciliation_count, 3);
-        assert!(health.fact_flip_rate > 0.9);
-        assert!(health.degraded);
+        // LC-31：失效明细含原因（rotate-N）
+        assert!(health
+            .recent_invalidations
+            .iter()
+            .any(|item| item.reason.starts_with("rotate-")));
     }
 }
