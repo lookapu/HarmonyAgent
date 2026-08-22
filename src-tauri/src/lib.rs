@@ -458,6 +458,7 @@ pub fn run() {
             commands::git::git_revert_file,
             commands::git::git_init_repo,
             commands::git::git_file_status,
+            commands::git::get_file_tree_git_status,
             commands::git::git_ignore_add,
             commands::git::git_untrack,
             commands::git::git_stage,

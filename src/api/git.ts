@@ -103,6 +103,27 @@ export interface GitFileStatus {
 export const gitFileStatus = (projectPath: string, path: string) =>
   invokeWithError<GitFileStatus>('git_file_status', { projectPath, path })
 
+/** 文件树 Git 状态批量查询（懒加载树着色）：变更集（含目录聚合）+ 已加载节点忽略判定 */
+export interface GitTreeEntry {
+  path: string
+  /** untracked | modified | staged | deleted */
+  status: string
+}
+
+export interface GitTreeStatusBundle {
+  is_repo: boolean
+  entries: GitTreeEntry[]
+  /** paths 参数中命中 .gitignore 的路径 */
+  ignored: string[]
+}
+
+export const getFileTreeGitStatus = (projectPath: string, root: string | null, paths: string[]) =>
+  invokeWithError<GitTreeStatusBundle>('get_file_tree_git_status', {
+    projectPath,
+    root: root ?? null,
+    paths,
+  })
+
 /** 把路径追加到项目根 .gitignore（目录自动补尾部 /；已存在规则时跳过） */
 export const gitIgnoreAdd = (projectPath: string, path: string) =>
   invokeWithError<string>('git_ignore_add', { projectPath, path })

@@ -913,6 +913,249 @@ pub async fn git_file_status(project_path: String, path: String) -> Result<GitFi
     })
 }
 
+/// 文件树 Git 状态批量查询（懒加载树着色用，一次调用返回全量变更集）：
+/// - entries：git status --porcelain 全量变更（文件级），外加按目录前缀聚合的目录条目；
+/// - ignored：paths 参数（已加载节点）中命中 .gitignore 的路径，供灰色标识；
+/// - 路径统一相对 root（worktree 根，未传时相对项目根），与文件树节点路径对齐。
+#[derive(Debug, Clone, Serialize)]
+pub struct GitTreeEntry {
+    pub path: String,
+    /// untracked | modified | staged | deleted
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitTreeStatusBundle {
+    pub is_repo: bool,
+    pub entries: Vec<GitTreeEntry>,
+    pub ignored: Vec<String>,
+}
+
+/// 目录聚合严重度：未跟踪最醒目，其次已删除，再次已修改，最后已暂存
+fn status_severity(s: &str) -> u32 {
+    match s {
+        "untracked" => 4,
+        "deleted" => 3,
+        "modified" => 2,
+        _ => 1, // staged
+    }
+}
+
+/// 把 git 输出路径（相对 cwd=项目根）转成相对 root 的路径（root 为项目根时不转换）
+fn strip_root_prefix(path: &str, root_rel: &Option<String>) -> String {
+    if let Some(rel) = root_rel {
+        if let Some(rest) = path.strip_prefix(&format!("{rel}/")) {
+            return rest.to_string();
+        }
+        if path == rel {
+            return String::new();
+        }
+    }
+    path.to_string()
+}
+
+/// 给 check-ignore 传参用的路径：相对 root → 相对项目根（root 为项目根时不转换）
+fn add_root_prefix(path: &str, root_rel: &Option<String>) -> String {
+    match root_rel {
+        Some(rel) if !rel.is_empty() => format!("{rel}/{path}"),
+        _ => path.to_string(),
+    }
+}
+
+#[tauri::command]
+pub async fn get_file_tree_git_status(
+    project_path: String,
+    root: Option<String>,
+    paths: Vec<String>,
+) -> Result<GitTreeStatusBundle, String> {
+    if project_path.trim().is_empty() {
+        return Err("未指定项目目录".into());
+    }
+    let cwd = Path::new(&project_path);
+    // 非仓库：返回空 bundle，不报错（前端据此关闭着色）
+    if crate::agent::tools::run_cmd(
+        "git",
+        &["rev-parse".into(), "--is-inside-work-tree".into()],
+        Some(cwd),
+        15,
+    )
+    .await
+    .is_err()
+    {
+        return Ok(GitTreeStatusBundle {
+            is_repo: false,
+            entries: vec![],
+            ignored: vec![],
+        });
+    }
+
+    // root（worktree 根）相对项目根的路径；root 必须位于项目内（防御越界）
+    let root_rel: Option<String> = root.filter(|r| !r.is_empty()).and_then(|r| {
+        let abs = if Path::new(&r).is_absolute() {
+            r.clone()
+        } else {
+            format!("{}/{}", project_path.trim_end_matches(['/', '\\']), r.trim_start_matches(['/', '\\']))
+        };
+        let canon_root = cwd.canonicalize().ok()?;
+        let canon_target = Path::new(&abs).canonicalize().ok()?;
+        if canon_target == canon_root {
+            return None;
+        }
+        canon_target
+            .strip_prefix(&canon_root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+    });
+
+    // 全量变更集（-z 分隔防路径含空格/特殊字符；输出上限 8MB 覆盖大仓库）
+    let mut status_args = vec![
+        "status".into(),
+        "--porcelain".into(),
+        "-z".into(),
+        "--untracked-files=all".into(),
+    ];
+    if let Some(rel) = &root_rel {
+        status_args.push("--".into());
+        status_args.push(rel.clone());
+    }
+    let status_out = crate::agent::tools::run_cmd_capped(
+        "git",
+        &status_args,
+        Some(cwd),
+        15,
+        8_000_000,
+    )
+    .await
+    .unwrap_or_default();
+
+    // 文件级条目 + 目录前缀聚合（同一目录多个子项取最高严重度）
+    let mut entries: Vec<GitTreeEntry> = Vec::new();
+    let mut dir_agg: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let fields: Vec<&str> = status_out.split('\0').collect();
+    let mut i = 0usize;
+    while i < fields.len() {
+        let field = fields[i];
+        i += 1;
+        if field.is_empty() || field.len() < 4 {
+            continue;
+        }
+        let b = field.as_bytes();
+        let x = b[0] as char;
+        let y = b[1] as char;
+        let mut path = field[3..].to_string();
+        // 重命名/复制：-z 格式下旧名与新名分属两个 \0 字段，取新名
+        if (x == 'R' || x == 'C') && path.is_empty() && i < fields.len() {
+            path = fields[i].to_string();
+            i += 1;
+        }
+        let status = if x == '?' && y == '?' {
+            "untracked"
+        } else if x != ' ' && x != '?' && x != '!' {
+            "staged" // 暂存区有改动（A/M/R/C/D）
+        } else if y == 'M' || y == 'T' || y == 'U' {
+            "modified"
+        } else if y == 'D' {
+            "deleted"
+        } else {
+            "modified"
+        };
+        let rel_path = strip_root_prefix(&path, &root_rel);
+        if rel_path.is_empty() {
+            continue;
+        }
+        if !seen_files.contains(&rel_path) {
+            seen_files.insert(rel_path.clone());
+            entries.push(GitTreeEntry {
+                path: rel_path.clone(),
+                status: status.to_string(),
+            });
+        }
+        // 目录前缀聚合（文件自身最后一段不参与）
+        let sev = status_severity(status);
+        let mut prefix = String::new();
+        for part in rel_path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if prefix == rel_path {
+                break;
+            }
+            let e = dir_agg.entry(prefix.clone()).or_insert(0);
+            *e = (*e).max(sev);
+        }
+    }
+    let sev_name = ["", "staged", "modified", "deleted", "untracked"];
+    for (dir, sev) in dir_agg {
+        if sev > 0 && !seen_files.contains(&dir) {
+            entries.push(GitTreeEntry {
+                path: dir,
+                status: sev_name[sev as usize].to_string(),
+            });
+        }
+    }
+
+    // 忽略判定：对已加载节点中「不在变更集」的路径，先排除已跟踪（ls-files），
+    // 剩余用 check-ignore 批量判定（已跟踪文件不受 gitignore 影响，不能标灰）
+    let mut ignored: Vec<String> = Vec::new();
+    let candidates: Vec<String> = paths
+        .iter()
+        .filter(|p| !p.is_empty() && !seen_files.contains(p.as_str()))
+        .cloned()
+        .collect();
+    if !candidates.is_empty() {
+        let mut ls_args = vec!["ls-files".into(), "-z".into()];
+        if let Some(rel) = &root_rel {
+            ls_args.push("--".into());
+            ls_args.push(rel.clone());
+        }
+        let tracked: std::collections::HashSet<String> = crate::agent::tools::run_cmd_capped(
+            "git",
+            &ls_args,
+            Some(cwd),
+            15,
+            8_000_000,
+        )
+        .await
+        .unwrap_or_default()
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| strip_root_prefix(s, &root_rel))
+        .collect();
+        let probe: Vec<String> = candidates
+            .iter()
+            .filter(|p| !tracked.contains(p.as_str()))
+            .map(|p| add_root_prefix(p, &root_rel))
+            .collect();
+        if !probe.is_empty() {
+            let mut ci_args = vec!["check-ignore".into(), "-z".into(), "--".into()];
+            ci_args.extend(probe.iter().cloned());
+            if let Ok(out) = crate::agent::tools::run_cmd_capped(
+                "git",
+                &ci_args,
+                Some(cwd),
+                15,
+                8_000_000,
+            )
+            .await
+            {
+                ignored = out
+                    .split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| strip_root_prefix(s, &root_rel))
+                    .collect();
+            }
+        }
+    }
+
+    Ok(GitTreeStatusBundle {
+        is_repo: true,
+        entries,
+        ignored,
+    })
+}
+
 /// 把路径追加到项目根 .gitignore（目录自动补尾部 /；已存在相同规则时跳过）
 #[tauri::command]
 pub async fn git_ignore_add(project_path: String, path: String) -> Result<String, String> {
