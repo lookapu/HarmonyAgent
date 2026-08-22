@@ -9,6 +9,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
 import { getSessionEvents, type SessionEvent } from '../api/project'
 
 const OTHER = '__other__'
@@ -25,22 +26,22 @@ function badgeOf(type: string): string {
   }
 }
 
-/** 事件类型中文短名 */
-function typeLabel(type: string): string {
+/** 事件类型徽章短名（i18n） */
+function typeLabel(type: string, t: TFunction): string {
   switch (type) {
-    case 'user_message': return '用户'
-    case 'assistant_message': return '助手'
-    case 'tool_call': return '工具调用'
-    case 'tool_result': return '工具结果'
-    case 'system_note': return '系统'
-    case 'context_compress': return '压缩'
+    case 'user_message': return t('home.timelineEventUser')
+    case 'assistant_message': return t('home.timelineEventAssistant')
+    case 'tool_call': return t('home.timelineEventToolCall')
+    case 'tool_result': return t('home.timelineEventToolResult')
+    case 'system_note': return t('home.timelineEventSystem')
+    case 'context_compress': return t('home.timelineEventCompress')
     default: return type
   }
 }
 
 /** 事件摘要（单行）：tool_call=工具名+参数；tool_result=成败+输出；消息类=内容截断
  *  返回 ReactNode 便于内嵌 span 上色（工具名加色、user 加粗、result 用绿/红点缀） */
-function eventSummary(e: SessionEvent): ReactNode {
+function eventSummary(e: SessionEvent, t: TFunction): ReactNode {
   const p = e.payload
   const cut = (s: string, n = 120) => (s.length > n ? `${s.slice(0, n)}…` : s)
   switch (e.event_type) {
@@ -84,13 +85,17 @@ function eventSummary(e: SessionEvent): ReactNode {
       const trigger = String(p.trigger ?? '')
       const detail =
         p.old_limit != null && p.new_limit != null
-          ? `：${String(p.old_limit)} → ${String(p.new_limit)} 条`
+          ? t('home.timelineCompressLimit', { old: String(p.old_limit), new: String(p.new_limit) })
           : p.keep != null
-            ? `：保留最近 ${String(p.keep)} 条`
+            ? t('home.timelineCompressKeep', { keep: String(p.keep) })
             : ''
       return (
         <span className="text-[var(--warning)]">
-          {trigger === 'active' ? '超 85% 主动压缩' : trigger === 'overflow' ? '超限恢复压缩' : '手动压缩'}
+          {trigger === 'active'
+            ? t('home.timelineCompressActive')
+            : trigger === 'overflow'
+              ? t('home.timelineCompressOverflow')
+              : t('home.timelineCompressManual')}
           {detail}
         </span>
       )
@@ -399,11 +404,11 @@ export default function TimelinePanel({
                               </span>
                               {/* 类型徽章：固定 2 字宽度（用户/助手/工具等），避免被内容撑长 */}
                               <span className={`shrink-0 inline-flex items-center justify-center text-[10px] px-1.5 py-0.5 rounded font-medium leading-4 min-w-[28px] ${badgeOf(e.event_type)}`}>
-                                {typeLabel(e.event_type)}
+                                {typeLabel(e.event_type, t)}
                               </span>
                               {/* 摘要：唯一可压缩元素，长内容省略号 */}
                               <span className="min-w-0 flex-1 text-[11.5px] text-[var(--text-secondary)] truncate leading-5">
-                                {eventSummary(e)}
+                                {eventSummary(e, t)}
                               </span>
                             </button>
                             {expanded && (
