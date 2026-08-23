@@ -700,9 +700,9 @@ export default function ProvidersPage() {
     setEditTypeModel(m)
     setEditTypeIn(parseModalities(m.input_modalities))
     setEditTypeOut(parseModalities(m.output_modalities))
-    // 预填紧凑格式（200K/8K），与输入解析兼容，保存时原样转换回完整 token 数
-    setEditTypeCtx(m.context_limit > 0 ? fmtCtx(m.context_limit) : '')
-    setEditTypeOutLimit(m.output_limit > 0 ? fmtCtx(m.output_limit) : '')
+    // 预填完整 token 数（如 200000），单位说明在 label/placeholder；仍兼容 K/M 缩写输入
+    setEditTypeCtx(m.context_limit > 0 ? String(m.context_limit) : '')
+    setEditTypeOutLimit(m.output_limit > 0 ? String(m.output_limit) : '')
   }
   const toggleTypeMod = (side: 'in' | 'out', mo: Modality) => {
     if (side === 'in') {
@@ -965,6 +965,7 @@ export default function ProvidersPage() {
               />
             </div>
             <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelHint')}</p>
+            <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
           </div>
 
           <div className="flex items-center gap-3">
@@ -1409,6 +1410,7 @@ export default function ProvidersPage() {
                           className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                         />
                       </div>
+                      <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
                       {/* 已有模型的类型编辑：点击 chip 上的 ✎ 打开 */}
                       {editTypeModel && (
                         <div className="rounded-xl border border-[var(--accent)]/30 bg-[var(--bg-card)]/60 px-3 py-2.5 space-y-2 animate-fade-in-up">
@@ -1443,6 +1445,7 @@ export default function ProvidersPage() {
                               className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                             />
                           </div>
+                          <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
                           <div className="flex items-center gap-2">
                             <button
                               onClick={saveEditType}
