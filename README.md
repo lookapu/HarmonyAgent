@@ -6,6 +6,8 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 
+简体中文 | [English](README.en.md)
+
 面向 HarmonyOS / OpenHarmony 开发者的桌面 AI 编程 IDE。把多 Provider 路由、Agent 工具链、鸿蒙工程理解、设备调试、API 知识库、本地代理熔断塞进一个原生应用，让模型真正"懂"鸿蒙项目、能干活。
 
 ## 它是什么
