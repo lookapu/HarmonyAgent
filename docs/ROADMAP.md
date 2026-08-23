@@ -4,6 +4,8 @@
 > 适用范围：长会话、Agent 工具链、HarmonyOS 开发闭环、生态集成与质量体系  
 > 更新规则：任务完成时同步勾选本文件，并在 `CHANGELOG.md` 记录用户可感知变化；数据库结构只能通过递增迁移演进。
 
+简体中文 | [English](ROADMAP.en.md)
+
 长会话数据映射与事实优先级见 [CONTEXT_V2.md](CONTEXT_V2.md)。
 
 ## 1. 目标与推进原则

@@ -2,6 +2,8 @@
 
 > 当前状态：2026-08-21，`main` 分支。历史需求来源见 `tool-enhancement-backlog.txt`；本文件只描述已经落地的能力、事实源和仍明确暂缓的边界。
 
+简体中文 | [English](TOOL_ENHANCEMENTS.en.md)
+
 ## 1. 权威口径
 
 | 项目 | 当前值 | 权威来源 |

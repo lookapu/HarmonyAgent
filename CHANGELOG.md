@@ -3,6 +3,8 @@
 > 面向 HarmonyOS / OpenHarmony 开发者的桌面 AI 编程 IDE。
 > 本文件按版本倒序记录用户可见的变更、迁移要点与回滚指引。
 
+简体中文 | [English](CHANGELOG.en.md)
+
 ---
 
 ## v2.1.0 — 证据驱动治理与双层执行内核（2026-08-22）

@@ -2,6 +2,8 @@
 
 > 本文描述 2026-08-21 `main` 分支的实际实现。历史规划与能力盘点分别见 `CHANGELOG.md`、`TOOL_ENHANCEMENTS.md` 和 `HARNESS_ENHANCEMENTS.md`。
 
+简体中文 | [English](ARCHITECTURE.en.md)
+
 ## 1. 产品定位
 
 DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工作台。用户选中工程并用自然语言下达目标，Agent 负责读取和修改代码、构建、测试、部署、读取设备日志并验证结果。
