@@ -59,9 +59,9 @@ Current codebase scale:
 | Agent-facing tools | 201 |
 | `agent/` top-level modules (excluding `mod.rs`) | 36 |
 | `agent/tools/` Rust files (incl. `mod.rs`) | 30 |
-| `commands/` command modules (excluding `mod.rs`) | 36 |
-| `services/` service modules (excluding `mod.rs`) | 54 |
-| Tauri IPC registration entry points | 296 |
+| `commands/` command modules (excluding `mod.rs`) | 38 |
+| `services/` service modules (excluding `mod.rs`) | 56 |
+| Tauri IPC registration entry points | 298 |
 | Database migrations | 77 |
 | React pages | 16 |
 

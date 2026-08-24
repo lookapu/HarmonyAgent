@@ -119,6 +119,7 @@ import {
 } from '../chat/chatUtils'
 import { detectGpu, getRecommendedOverscan, shouldUseSmoothScroll } from '../utils/gpuDetect'
 import { getLastProjectId } from '../stores/slices/projectSlice'
+import { isImagePath, pathInProject } from './homeDropUtils'
 
 /** 消息区渲染条目：消息 / 工具组 / 日期分隔线 / 尾部动态区（流式消息、计划卡、工具徽章等，高度动态测量） */
 type RenderItem =
@@ -2080,18 +2081,8 @@ export default function Home() {
   }
 
   /* ============ 外部文件拖拽（Tauri 环境拿真实路径；浏览器环境回退 DOM File） ============ */
-  const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif']
-  const isImagePath = (p: string) => IMAGE_EXTS.some((e) => p.toLowerCase().endsWith(e))
-  /** 路径规范化：\ → /、去尾部斜杠（Windows 与混合分隔符统一比较） */
-  const normPath = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
-  /** 绝对路径是否在项目根内（大小写不敏感，Windows） */
-  const pathInProject = (p: string, root: string) => {
-    const a = normPath(p).toLowerCase()
-    const b = normPath(root).toLowerCase()
-    return a === b || a.startsWith(b + '/')
-  }
   /** 本地图片文件 → data URL 预览（拖拽场景；大小已由调用方校验，发送前统一压缩） */
-  const readImageFile = async (path: string) => {
+  const readImageFile = useCallback(async (path: string) => {
     try {
       const bytes = await readFile(path)
       if (bytes.byteLength === 0) return
@@ -2108,9 +2099,9 @@ export default function Home() {
     } catch {
       useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
     }
-  }
+  }, [t])
   /** 项目外文本文件：读入输入框作为引用块（≤200KB；二进制/乱码跳过并提示） */
-  const readExternalText = async (path: string) => {
+  const readExternalText = useCallback(async (path: string) => {
     try {
       const bytes = await readFile(path)
       const text = new TextDecoder('utf-8').decode(bytes)
@@ -2125,7 +2116,7 @@ export default function Home() {
     } catch {
       useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
     }
-  }
+  }, [t])
   /** 拖拽路径分发：图片 → 预览；项目内文件 → @引用（后端注入内容）；项目外文本 → 插入输入框 */
   const handleDroppedPaths = useCallback((paths: string[]) => {
     const root = useProjectStore.getState().currentProject?.path
@@ -2154,7 +2145,7 @@ export default function Home() {
         }
       })()
     }
-  }, [handleReference, t])
+  }, [handleReference, readExternalText, readImageFile, t])
   // Tauri 拖拽事件：真实路径 + 悬停高亮（DOM dataTransfer 拿不到路径，须走 webview 原生事件）
   useEffect(() => {
     let unlisten: (() => void) | undefined

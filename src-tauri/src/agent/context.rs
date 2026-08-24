@@ -688,6 +688,7 @@ pub fn upsert_fact(conn: &Connection, input: &ContextFactInput) -> Result<Contex
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_fact(
     conn: &Connection,
     id: &str,
@@ -2032,7 +2033,7 @@ pub fn run_long_session_stress(conn: &Connection) -> (bool, SessionHealthV2) {
         if round % 5 == 0 {
             version += 1;
             upsert_fact(
-                &conn,
+                conn,
                 &ContextFactInput {
                     conversation_id: "c".into(),
                     project_id: Some("p".into()),

@@ -568,7 +568,7 @@ pub(crate) fn find_deveco_toolchain() -> Option<(PathBuf, PathBuf)> {
             .join("hvigorw.js");
         let sdk = root.join("sdk");
         (hvigorw.is_file() && sdk.join("default").join("sdk-pkg.json").is_file())
-            .then(|| (hvigorw, sdk))
+            .then_some((hvigorw, sdk))
     }
     for var in ["DEVECO_HOME", "DEVECO_STUDIO_HOME"] {
         if let Ok(v) = std::env::var(var) {

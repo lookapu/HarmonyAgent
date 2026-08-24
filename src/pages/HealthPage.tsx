@@ -207,7 +207,6 @@ export default function HealthPage() {
       setDevecoCli({ installed: false, version: '', path: null, install_hint: String(e) })
     }
   }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { loadDevecoCli() }, [])
 
   const loadGitRuntime = async () => {
@@ -1597,7 +1596,6 @@ export default function HealthPage() {
     </div>
   )
 }
-
 
 
 

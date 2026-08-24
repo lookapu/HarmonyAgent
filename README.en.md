@@ -134,7 +134,7 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 296 Tauri IPC entry points · 54 service modules  │
+│  - 298 Tauri IPC entry points · 56 service modules  │
 │  - agent/ 36 top-level modules · tools/ 29 files    │
 │  - SQLite + 77 migrations · full event sourcing for │
 │    runs/steps/tools                                 │
@@ -204,8 +204,8 @@ src-tauri/src/
 │       ├── quality_runtime.rs   #   Runtime quality (6 tools)
 │       ├── quality_media.rs     #   Media quality (2 tools)
 │       └── schedule_tools.rs    # Scheduled reminders (schedule_create/list/delete)
-├── commands/               # 36 command modules (287 IPC registration entry points total)
-├── services/               # Business services (54)
+├── commands/               # 38 command modules (298 IPC registration entry points total)
+├── services/               # Business services (56)
 │   ├── proxy_service.rs    #   - Local proxy
 │   ├── circuit_breaker.rs  #   - Circuit breaker
 │   ├── model_router.rs     #   - Model routing

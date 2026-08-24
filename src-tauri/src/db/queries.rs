@@ -1269,7 +1269,7 @@ pub fn search_knowledge_fuzzy(
     }
     // 排序：token 命中数降序 → 字符重叠度降序 → hit_count 降序
     let query_lower = keyword.to_lowercase();
-    seen.sort_by(|a, b| score(b, &tokens, &query_lower).cmp(&score(a, &tokens, &query_lower)));
+    seen.sort_by_key(|entry| std::cmp::Reverse(score(entry, &tokens, &query_lower)));
     seen.truncate(limit);
     Ok(seen)
 }

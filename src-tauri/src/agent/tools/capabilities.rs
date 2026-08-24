@@ -331,7 +331,8 @@ mod tests {
 
     #[test]
     fn bounded_phase_selection_keeps_representative_tasks_acceptable() {
-        let cases: &[(&str, &[(&str, &str, &str)])] = &[
+        type AcceptanceCase<'a> = (&'a str, &'a [(&'a str, &'a str, &'a str)]);
+        let cases: &[AcceptanceCase<'_>] = &[
             (
                 "修复代码，运行测试并构建",
                 &[

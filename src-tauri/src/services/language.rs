@@ -51,7 +51,7 @@ pub fn detect_language(text: &str) -> Option<&'static str> {
         // 泰语
         ("th", |c| matches!(c as u32, 0x0E00..=0x0E7F)),
         // 日文假名（平假名 + 片假名；纯汉字归中文）
-        ("ja", |c| matches!(c as u32, 0x3040..=0x309F | 0x30A0..=0x30FF)),
+        ("ja", |c| matches!(c as u32, 0x3040..=0x30FF)),
         // 韩文（谚文音节 + 字母 + 兼容谚文）
         ("ko", |c| matches!(c as u32, 0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F)),
         // 中文（CJK 统一表意 + 扩展 A）
