@@ -7,6 +7,13 @@
 
 ---
 
+## v2.1.1 — Interaction and Quality-Gate Hardening (2026-08-25)
+
+- Provider Token fields now preserve and prefill full values with K/M suffix guidance; reply-language and reasoning-language configuration is also refined.
+- File drag-and-drop now supports external files, batch imports, and browser fallback paths, while in-project references remain portable and relative; SVG MIME detection, duplicate/failure feedback, and regression coverage are included.
+- Improved bilingual README, development, and release documentation; repaired documentation-drift validation and added Node.js version preflight plus frontend bundle-size enforcement.
+- Fixed Windows/macOS toolchain and packaging-path compatibility, with stricter ESLint, Rust test, Clippy, and cross-platform prerelease checks.
+
 ## v2.1.0 — Evidence-Driven Governance & Dual Execution Kernel (2026-08-22)
 
 Positioning: upgrading "the model can call many tools" to "tasks and tools are durably scheduled, acceptable, recoverable, and observable". The reliability & governance batch adds migrations `057`—`062`, `069`—`075`; work continues on long-session Context V2, and the total migration count reaches **77**. The governance batch adds 3 new external tools (`workflow_template`, `team_share`, `reproduction_bundle`), bringing `TOOL_SPECS` to **201**.

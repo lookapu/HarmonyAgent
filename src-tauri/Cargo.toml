@@ -1,6 +1,6 @@
 [package]
 name = "deveco-switch"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2021"
 description = "DevEco Code Provider Manager"
 # 多二进制（deveco-switch 主程序 / full_fetch 数据脚本）时让 cargo run/tauri dev 默认选中主程序；

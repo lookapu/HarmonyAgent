@@ -80,8 +80,16 @@ def protocol_changes(repo: Path, prev: str) -> list[str]:
     return [line for line in proc.stdout.splitlines() if line.strip()]
 
 
-def changelog_unreleased(repo: Path) -> str:
+def changelog_changes(repo: Path, release_tag: str | None) -> str:
     text = (repo / "CHANGELOG.md").read_text(errors="replace")
+    if release_tag:
+        match = re.search(
+            rf"^##\s+{re.escape(release_tag)}(?:\s+[^\n]*)?\n(.*?)(?=^##\s+|\Z)",
+            text,
+            re.M | re.S,
+        )
+        if match:
+            return match.group(1).strip()
     match = re.search(r"## Unreleased[^\n]*\n(.*?)(?=\n## v|\Z)", text, re.S)
     return match.group(1).strip() if match else ""
 
@@ -98,7 +106,20 @@ def asset_version_table(repo: Path) -> str:
 
 def generate(repo: Path, prev_tag: str | None) -> str:
     head = git(repo, "rev-parse", "HEAD").stdout.strip()
-    prev = prev_tag or git(repo, "describe", "--tags", "--abbrev=0").stdout.strip()
+    release_tags = [
+        tag
+        for tag in git(repo, "tag", "--points-at", "HEAD", "--sort=-version:refname").stdout.splitlines()
+        if tag.startswith("v")
+    ]
+    release_tag = release_tags[0] if release_tags else None
+    if prev_tag:
+        prev = prev_tag
+    elif release_tag:
+        # 发布工作流运行在当前 tag 上；基线必须取父提交可达的上一 tag，
+        # 否则 git describe 会返回当前 tag，导致差异被错误汇总为 0。
+        prev = git(repo, "describe", "--tags", "--abbrev=0", "HEAD^").stdout.strip()
+    else:
+        prev = git(repo, "describe", "--tags", "--abbrev=0").stdout.strip()
     if not prev:
         prev = git(repo, "rev-list", "--max-parents=0", "HEAD").stdout.strip() or "HEAD~1"
         prev_label = "首次提交"
@@ -109,7 +130,7 @@ def generate(repo: Path, prev_tag: str | None) -> str:
     protocol = protocol_changes(repo, prev)
     tools_before = count_tools(repo, prev)
     tools_now = count_tools(repo, None)
-    unreleased = changelog_unreleased(repo)
+    changes = changelog_changes(repo, release_tag)
     assets = asset_version_table(repo)
 
     lines = [
@@ -122,7 +143,7 @@ def generate(repo: Path, prev_tag: str | None) -> str:
         "",
         "## 用户可见变化",
         "",
-        unreleased or "（CHANGELOG 无 Unreleased 段）",
+        changes or "（CHANGELOG 无当前版本或 Unreleased 段）",
         "",
         "## 数据库迁移清单",
         "",
@@ -191,6 +212,18 @@ def self_test() -> None:
         assert "回滚方式" in notes
         assert "schema 2" in notes
         assert "工具协议无变更" in notes
+
+        # 发布工作流在当前 tag 上运行：应对比上一 tag，并读取当前版本段落。
+        (repo / "CHANGELOG.md").write_text(
+            "## v0.0.2 — 测试版本\n\n- 当前版本可见变化。\n\n## v0.0.1 — 旧版本\n"
+        )
+        git(repo, "add", "CHANGELOG.md")
+        git(repo, "commit", "-qm", "release")
+        git(repo, "tag", "v0.0.2")
+        tagged_notes = generate(repo, None)
+        assert "v0.0.1.." in tagged_notes
+        assert "当前版本可见变化" in tagged_notes
+        assert "（0 个提交）" not in tagged_notes
     print("self-test: 全部通过")
 
 
