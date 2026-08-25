@@ -7,11 +7,17 @@
     "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
+    "preflight": "node scripts/check-node-version.mjs",
+    "predev": "npm run preflight",
     "dev": "vite",
+    "prebuild": "npm run preflight",
     "build": "tsc -b && vite build",
+    "postbuild": "node scripts/check-bundle-size.mjs",
+    "check:bundle": "node scripts/check-bundle-size.mjs",
     "tauri": "tauri",
     "lint": "eslint .",
     "preview": "vite preview",
+    "pretest": "npm run preflight",
     "test": "vitest run",
     "test:watch": "vitest"
   },

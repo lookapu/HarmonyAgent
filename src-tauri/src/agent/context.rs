@@ -640,13 +640,15 @@ pub fn upsert_fact(conn: &Connection, input: &ContextFactInput) -> Result<Contex
             let id = uuid::Uuid::new_v4().to_string();
             insert_fact(
                 &tx,
-                &id,
-                input,
-                &value_json,
-                confidence,
-                version + 1,
-                observed_at,
-                now,
+                FactInsert {
+                    id: &id,
+                    input,
+                    value_json: &value_json,
+                    confidence,
+                    version: version + 1,
+                    observed_at,
+                    now,
+                },
             )?;
             (id, version + 1, now)
         }
@@ -654,13 +656,15 @@ pub fn upsert_fact(conn: &Connection, input: &ContextFactInput) -> Result<Contex
             let id = uuid::Uuid::new_v4().to_string();
             insert_fact(
                 &tx,
-                &id,
-                input,
-                &value_json,
-                confidence,
-                1,
-                observed_at,
-                now,
+                FactInsert {
+                    id: &id,
+                    input,
+                    value_json: &value_json,
+                    confidence,
+                    version: 1,
+                    observed_at,
+                    now,
+                },
             )?;
             (id, 1, now)
         }
@@ -688,17 +692,26 @@ pub fn upsert_fact(conn: &Connection, input: &ContextFactInput) -> Result<Contex
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn insert_fact(
-    conn: &Connection,
-    id: &str,
-    input: &ContextFactInput,
-    value_json: &str,
+struct FactInsert<'a> {
+    id: &'a str,
+    input: &'a ContextFactInput,
+    value_json: &'a str,
     confidence: f64,
     version: i64,
     observed_at: i64,
     now: i64,
-) -> Result<(), String> {
+}
+
+fn insert_fact(conn: &Connection, fact: FactInsert<'_>) -> Result<(), String> {
+    let FactInsert {
+        id,
+        input,
+        value_json,
+        confidence,
+        version,
+        observed_at,
+        now,
+    } = fact;
     conn.execute(
         "INSERT INTO conversation_context_facts
          (id,conversation_id,project_id,run_id,fact_kind,fact_key,value_json,source_kind,

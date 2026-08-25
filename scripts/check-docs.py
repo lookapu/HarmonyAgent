@@ -2,7 +2,7 @@
 """Q-08 文档漂移校验：数量、路径、接口与状态必须与代码真源一致。
 
 从代码真源提取工具数、迁移数、IPC 入口、模块数等数量，再逐模式校验
-README / ARCHITECTURE / TOOL_ENHANCEMENTS / TOOLCHAIN_ACCEPTANCE /
+中英文 README / ARCHITECTURE / TOOL_ENHANCEMENTS / TOOLCHAIN_ACCEPTANCE /
 TOOL_RESULT_V2 / CHANGELOG / VERSION_COMPATIBILITY 中的对应数字；
 校验 ROADMAP 与 docs 内相对链接目标存在、ROADMAP 反引号路径存在；
 校验 quality.yml / release.yml 引用的 Rust 测试、集成测试与脚本存在。
@@ -110,10 +110,40 @@ def check_counts(repo: Path) -> list[str]:
         ("CHANGELOG.md", r"`TOOL_SPECS` 达到 \*\*(\d+)\*\*", tools, "工具数"),
         ("CHANGELOG.md", r"数据库迁移总数达到 \*\*(\d+)\*\*", migrations, "迁移数"),
         ("VERSION_COMPATIBILITY.md", r"迁移数（当前 (\d+)）", migrations, "迁移数"),
+        ("README.en.md", r"\*\*(\d+) Agent tools\*\*", tools, "Tool count"),
+        ("README.en.md", r"(\d+) Tauri IPC entry points", ipc, "IPC entry count"),
+        ("README.en.md", r"agent/ (\d+) top-level modules", agent_modules, "Agent module count"),
+        ("README.en.md", r"tools/ (\d+) files", tools_files - 1, "Tool file count"),
+        ("README.en.md", r"(\d+) command modules", commands, "Command module count"),
+        ("README.en.md", r"Business services \((\d+)\)", services, "Service module count"),
+        ("README.en.md", r"(\d+) service modules", services, "Service module count (summary)"),
+        ("README.en.md", r"SQLite \+ (\d+) migrations", migrations, "Migration count"),
+        ("README.en.md", r"## The (\d+) Agent Tools Grouped", tools, "Tool count (heading)"),
+        ("ARCHITECTURE.en.md", r"\| Agent-facing tools \| (\d+) \|", tools, "Tool count"),
+        ("ARCHITECTURE.en.md", r"\| `agent/` top-level modules \(excluding `mod.rs`\) \| (\d+) \|", agent_modules, "Agent module count"),
+        ("ARCHITECTURE.en.md", r"\| `agent/tools/` Rust files \(incl\. `mod.rs`\) \| (\d+) \|", tools_files, "Tool file count"),
+        ("ARCHITECTURE.en.md", r"\| `commands/` command modules \(excluding `mod.rs`\) \| (\d+) \|", commands, "Command module count"),
+        ("ARCHITECTURE.en.md", r"\| `services/` service modules \(excluding `mod.rs`\) \| (\d+) \|", services, "Service module count"),
+        ("ARCHITECTURE.en.md", r"\| Tauri IPC registration entry points \| (\d+) \|", ipc, "IPC entry count"),
+        ("ARCHITECTURE.en.md", r"\| Database migrations \| (\d+) \|", migrations, "Migration count"),
+        ("ARCHITECTURE.en.md", r"\| React pages \| (\d+) \|", pages, "Page count"),
+        ("ARCHITECTURE.en.md", r"SQLite \((\d+) migrations\)", migrations, "Migration count (diagram)"),
+        ("ARCHITECTURE.en.md", r"current (\d+) migrations", migrations, "Migration count (body)"),
+        ("ARCHITECTURE.en.md", r"(\d+) tools / approval pipeline", tools, "Tool count (diagram)"),
+        ("TOOL_ENHANCEMENTS.en.md", r"\| External Agent tools \| (\d+) \|", tools, "Tool count"),
+        ("TOOL_ENHANCEMENTS.en.md", r"current (\d+) tools", tools, "Tool count (deferred)"),
+        ("TOOL_ENHANCEMENTS.en.md", r"\| Tool implementation files \| (\d+) \|", tools_files - 1, "Tool implementation file count"),
+        ("CHANGELOG.en.md", r"`TOOL_SPECS` to \*\*(\d+)\*\*", tools, "Tool count"),
+        ("CHANGELOG.en.md", r"migration count reaches \*\*(\d+)\*\*", migrations, "Migration count"),
     ]
     for doc, pattern, expected, label in checks:
-        base = repo if doc in ("README.md", "CHANGELOG.md") else repo / "docs"
-        text = (base / doc).read_text(errors="replace")
+        path = repo / doc
+        if not path.exists():
+            path = repo / "docs" / doc
+        if not path.exists():
+            problems.append(f"文档不存在：{doc}")
+            continue
+        text = path.read_text(errors="replace")
         match = re.search(pattern, text)
         if not match:
             problems.append(f"{label}：{doc} 未找到模式 {pattern!r}")
@@ -127,7 +157,7 @@ def check_counts(repo: Path) -> list[str]:
 
 
 def check_links(repo: Path) -> list[str]:
-    """ROADMAP 与 docs/*.md 中的相对链接目标必须存在。"""
+    """中英文 README/CHANGELOG 与 docs/*.md 中的相对链接目标必须存在。"""
     problems = []
     docs_dir = repo / "docs"
 
@@ -141,11 +171,15 @@ def check_links(repo: Path) -> list[str]:
             return None
         return (base_dir / target).resolve()
 
-    for doc in sorted(docs_dir.glob("*.md")):
+    root_docs = [
+        path for pattern in ("README*.md", "CHANGELOG*.md")
+        for path in repo.glob(pattern)
+    ]
+    for doc in sorted([*docs_dir.glob("*.md"), *root_docs]):
         text = doc.read_text(errors="replace")
         for match in re.finditer(r"\]\(([^)]+)\)", text):
             target = match.group(1).strip()
-            resolved = resolve(docs_dir, target)
+            resolved = resolve(doc.parent, target)
             if resolved is None:
                 continue
             if not resolved.exists():
@@ -154,16 +188,19 @@ def check_links(repo: Path) -> list[str]:
 
 
 def check_path_refs(repo: Path) -> list[str]:
-    """ROADMAP 中反引号内的代码/脚本/迁移路径必须存在。"""
+    """中英文 ROADMAP 中反引号内的代码/脚本/迁移路径必须存在。"""
     problems = []
-    text = (repo / "docs/ROADMAP.md").read_text(errors="replace")
-    for match in re.finditer(r"`((?:src-tauri|scripts|src|docs)/[^`]+)`", text):
-        ref = match.group(1).strip().rstrip("/")
-        if not ref:
+    for roadmap in (repo / "docs/ROADMAP.md", repo / "docs/ROADMAP.en.md"):
+        if not roadmap.exists():
             continue
-        if ref.endswith((".rs", ".py", ".sql", ".json", ".tsx", ".ts", ".md")):
-            if not (repo / ref).exists():
-                problems.append(f"ROADMAP 引用路径不存在：{ref}")
+        text = roadmap.read_text(errors="replace")
+        for match in re.finditer(r"`((?:src-tauri|scripts|src|docs)/[^`]+)`", text):
+            ref = match.group(1).strip().rstrip("/")
+            if not ref:
+                continue
+            if ref.endswith((".rs", ".py", ".sql", ".json", ".tsx", ".ts", ".md")):
+                if not (repo / ref).exists():
+                    problems.append(f"{roadmap.name} 引用路径不存在：{ref}")
     return problems
 
 
@@ -251,6 +288,15 @@ def self_test() -> None:
             "| `agent/tools/` Rust 文件（含 `mod.rs`） | 1 |\n"
             "SQLite（1 个迁移）\n当前 1 个迁移\n2 工具 / 审批流水线\n"
         )
+        (repo / "docs/ARCHITECTURE.en.md").write_text(
+            "| Agent-facing tools | 2 |\n| Database migrations | 1 |\n"
+            "| Tauri IPC registration entry points | 2 |\n| React pages | 1 |\n"
+            "| `commands/` command modules (excluding `mod.rs`) | 2 |\n"
+            "| `services/` service modules (excluding `mod.rs`) | 1 |\n"
+            "| `agent/` top-level modules (excluding `mod.rs`) | 1 |\n"
+            "| `agent/tools/` Rust files (incl. `mod.rs`) | 1 |\n"
+            "SQLite (1 migrations)\nthe current 1 migrations\n2 tools / approval pipeline\n"
+        )
         (repo / "README.md").write_text(
             "**2 个 Agent 工具**\n## 2 个 Agent 工具按域分组\n"
             "2 个 Tauri IPC 入口 · 1 个 service 模块\n"
@@ -258,9 +304,22 @@ def self_test() -> None:
             "2 个 Agent 工具（0 文件）\n2 个命令模块\n业务服务（1 个）\n"
             "SQLite + 1 个迁移\n"
         )
+        (repo / "README.en.md").write_text(
+            "**2 Agent tools**\n## The 2 Agent Tools Grouped\n"
+            "2 Tauri IPC entry points · 1 service modules\n"
+            "agent/ 1 top-level modules · tools/ 0 files\n"
+            "2 command modules\nBusiness services (1)\nSQLite + 1 migrations\n"
+        )
         (repo / "CHANGELOG.md").write_text("`TOOL_SPECS` 达到 **2**\n数据库迁移总数达到 **1**\n")
+        (repo / "CHANGELOG.en.md").write_text(
+            "migration count reaches **1**; `TOOL_SPECS` to **2**.\n"
+        )
         (repo / "docs/TOOL_ENHANCEMENTS.md").write_text(
             "| 对外 Agent 工具 | 2 |\n| 工具实现文件 | 0 |\n不属于当前 2 工具\n"
+        )
+        (repo / "docs/TOOL_ENHANCEMENTS.en.md").write_text(
+            "| External Agent tools | 2 |\n| Tool implementation files | 0 |\n"
+            "not part of the current 2 tools\n"
         )
         (repo / "docs/TOOLCHAIN_ACCEPTANCE.md").write_text("2 个注册工具共享契约真源\n")
         (repo / "docs/TOOL_RESULT_V2.md").write_text("2 个注册工具均产生完整稳定字段\n")
@@ -275,6 +334,15 @@ def self_test() -> None:
         assert any("工具数" in p for p in check_repo(repo)), "篡改工具数未被检出"
         (repo / "README.md").write_text(
             (repo / "README.md").read_text().replace("**3 个 Agent 工具**", "**2 个 Agent 工具**")
+        )
+
+        # 英文文档篡改同样必须被检出
+        (repo / "README.en.md").write_text(
+            (repo / "README.en.md").read_text().replace("**2 Agent tools**", "**3 Agent tools**")
+        )
+        assert any("Tool count" in p for p in check_repo(repo)), "英文工具数漂移未被检出"
+        (repo / "README.en.md").write_text(
+            (repo / "README.en.md").read_text().replace("**3 Agent tools**", "**2 Agent tools**")
         )
 
         # 删除链接目标 → 必须检出

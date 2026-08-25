@@ -250,7 +250,7 @@
 - [x] `Q-05` 日志和产物默认脱敏，禁止持久化明文凭据与签名私钥。
 - [x] `Q-06` 每个里程碑运行前端测试、Lint、构建、Rust 测试、Clippy 和相关 E2E。证据：quality.yml 全量运行前端测试/Lint/构建、Rust 测试、固定评测门禁、执行内核门禁、崩溃恢复 E2E 与 Clippy。
 - [x] `Q-07` 逐步收敛现有格式、Clippy、ESLint 和依赖安全告警，并建立不新增基线。证据：ESLint 9→0（react-hooks 真修复与带原因豁免，quality.yml 以 `--max-warnings 0` 阻断回退）；Clippy 338→44（clippy --fix 两轮 + sort_by_key 批量转换 + 修复锁文件截断/进程终止等疑似真 bug，全部机械类告警清零，剩余 44 个全为结构类 too_many_arguments 31 + type_complexity 13 保留为基线）；`scripts/check-warnings.py` 按 (lint, 位置) 去重统计 clippy 唯一告警并接入 quality.yml 双平台门禁，超过基线即阻断；所有修复经 cargo test 667 项零回归验证。
-- [x] `Q-08` 文档中的数量、路径、接口和状态通过脚本或测试校验，避免再次漂移。证据：`scripts/check-docs.py` 从代码真源提取 8 类数量（工具 201/迁移 75/IPC 286/命令 36/服务 54/页面 16/agent 36/tools 29-30）并校验 7 个文档 29 处模式，校验 ROADMAP 与 docs 相对链接、反引号代码路径及 quality/release.yml 引用的测试与脚本；接入 quality.yml 双平台门禁；自测覆盖篡改数字、删除链接目标、改坏 CI 测试名、引用不存在路径四类回归（见 [文档漂移校验](DOCUMENTATION_CHECKS.md)）。
+- [x] `Q-08` 文档中的数量、路径、接口和状态通过脚本或测试校验，避免再次漂移。证据：`scripts/check-docs.py` 从代码真源提取 8 类数量（工具 201/迁移 77/IPC 298/命令 38/服务 56/页面 16/agent 36/tools 29-30）并校验 11 个中英文文档的 54 处模式，校验 ROADMAP 与 docs 相对链接、反引号代码路径及 quality/release.yml 引用的测试与脚本；接入 quality.yml 双平台门禁；自测覆盖篡改中英文数字、删除链接目标、改坏 CI 测试名、引用不存在路径五类回归（见 [文档漂移校验](DOCUMENTATION_CHECKS.md)）。
 
 ## 8. 核心指标
 

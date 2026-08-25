@@ -1,7 +1,7 @@
 # 文档漂移校验（Q-08）
 
 > 状态：已生效
-> 适用范围：README、架构文档、路线图、CI 工作流与代码真源的一致性
+> 适用范围：中英文 README、架构文档、路线图、CI 工作流与代码真源的一致性
 > 入口：`scripts/check-docs.py`，已接入 `.github/workflows/quality.yml` 的 Documentation drift check 步骤（macOS/Windows 双平台）
 
 ## 1. 目标
@@ -20,14 +20,14 @@
 
 | 真源 | 提取方式 | 校验的文档模式 |
 |---|---|---|
-| 工具数 | `src-tauri/src/agent/tools/mod.rs` 中 `ToolSpec {` 计数 | README（4 处）、ARCHITECTURE（2 处）、TOOL_ENHANCEMENTS（2 处）、TOOLCHAIN_ACCEPTANCE、TOOL_RESULT_V2、CHANGELOG |
-| 迁移数 | `migrations/*.sql` 文件数与 `db/mod.rs` 注册数（两者必须相等） | README、ARCHITECTURE（3 处）、CHANGELOG、VERSION_COMPATIBILITY |
-| IPC 入口 | `lib.rs` 的 `generate_handler![...]` 块内 `commands::` 行数 | README、ARCHITECTURE |
-| 页面数 | `src/pages/*.tsx` 文件数 | ARCHITECTURE |
-| commands 模块数 | `src-tauri/src/commands/*.rs`（不含 `mod.rs`） | README、ARCHITECTURE |
-| services 模块数 | `src-tauri/src/services/*.rs`（不含 `mod.rs`） | README（2 处）、ARCHITECTURE |
-| agent 模块数 | `src-tauri/src/agent/*.rs`（不含 `mod.rs`） | README（2 处）、ARCHITECTURE |
-| tools 文件数 | `src-tauri/src/agent/tools/*.rs` 总数（含注册表）与减一（不含）两个口径 | README（2 处）、ARCHITECTURE（含 `mod.rs` 口径）、TOOL_ENHANCEMENTS |
+| 工具数 | `src-tauri/src/agent/tools/mod.rs` 中 `ToolSpec {` 计数 | 中英文 README、ARCHITECTURE、TOOL_ENHANCEMENTS，以及中文 TOOLCHAIN_ACCEPTANCE、TOOL_RESULT_V2、CHANGELOG |
+| 迁移数 | `migrations/*.sql` 文件数与 `db/mod.rs` 注册数（两者必须相等） | 中英文 README、ARCHITECTURE、CHANGELOG，以及 VERSION_COMPATIBILITY |
+| IPC 入口 | `lib.rs` 的 `generate_handler![...]` 块内 `commands::` 行数 | 中英文 README、ARCHITECTURE |
+| 页面数 | `src/pages/*.tsx` 文件数 | 中英文 ARCHITECTURE |
+| commands 模块数 | `src-tauri/src/commands/*.rs`（不含 `mod.rs`） | 中英文 README、ARCHITECTURE |
+| services 模块数 | `src-tauri/src/services/*.rs`（不含 `mod.rs`） | 中英文 README、ARCHITECTURE |
+| agent 模块数 | `src-tauri/src/agent/*.rs`（不含 `mod.rs`） | 中英文 README、ARCHITECTURE |
+| tools 文件数 | `src-tauri/src/agent/tools/*.rs` 总数（含注册表）与减一（不含）两个口径 | 中英文 README、ARCHITECTURE、TOOL_ENHANCEMENTS |
 
 校验脚本只识别显式数字模式（如 `**201 个 Agent 工具**`、`\| 数据库迁移 \| 75 \|`）；历史时间线记录（如 TOOL_ENHANCEMENTS 中"增至 201"）属于当时快照，不在校验范围。
 
@@ -42,7 +42,7 @@
 
 ```bash
 python3 scripts/check-docs.py        # 校验当前仓库，退出码 0/1
-python3 scripts/check-docs.py --self-test   # 合成仓库回归：篡改数字、删除链接目标、
+python3 scripts/check-docs.py --self-test   # 合成仓库回归：篡改中/英文数字、删除链接目标、
                                             # 改坏 CI 测试名、引用不存在路径均必须被检出
 python3 scripts/check-docs.py --repo <路径> # 校验其它仓库副本
 ```

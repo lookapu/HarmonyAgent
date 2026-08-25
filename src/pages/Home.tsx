@@ -119,7 +119,12 @@ import {
 } from '../chat/chatUtils'
 import { detectGpu, getRecommendedOverscan, shouldUseSmoothScroll } from '../utils/gpuDetect'
 import { getLastProjectId } from '../stores/slices/projectSlice'
-import { isImagePath, pathInProject } from './homeDropUtils'
+import {
+  externalTextReference,
+  imageMimeFromPath,
+  isImagePath,
+  projectRelativePath,
+} from './homeDropUtils'
 
 /** 消息区渲染条目：消息 / 工具组 / 日期分隔线 / 尾部动态区（流式消息、计划卡、工具徽章等，高度动态测量） */
 type RenderItem =
@@ -2062,19 +2067,41 @@ export default function Home() {
     return Array.from(new Set([...references, ...fromText]))
   }
 
-  /** 图片文件 → data URL（粘贴/拖入共用；单图超 8MB 跳过，最多 4 张；发送前压缩控制 token 与供应商限制） */
-  const addImageFiles = (files: FileList | File[]) => {
+  const appendExternalText = useCallback((name: string, text: string) => {
+    const block = externalTextReference(
+      name,
+      text,
+      t('home.externalFileLabel'),
+      t('home.externalDataOnly'),
+    )
+    setDraft((d) => (d ? `${d}\n\n${block}` : block))
+    inputRef.current?.focus()
+  }, [t])
+
+  /** 图片文件 → data URL（粘贴/浏览器拖入共用；单图超 8MB，最多 4 张） */
+  const addImageFiles = useCallback((files: FileList | File[]) => {
+    let oversized = 0
     for (const f of Array.from(files)) {
-      if (!f.type.startsWith('image/') || f.size > 8 * 1024 * 1024) continue
+      if (!f.type.startsWith('image/')) continue
+      if (f.size > 8 * 1024 * 1024) {
+        oversized += 1
+        continue
+      }
       const reader = new FileReader()
       reader.onload = () => {
         void compressImage(String(reader.result)).then((url) => {
           setPickedImages((cur) => (cur.length >= 4 ? cur : [...cur, url]))
         })
       }
+      reader.onerror = () => {
+        useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
+      }
       reader.readAsDataURL(f)
     }
-  }
+    if (oversized > 0) {
+      useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropImageTooBig', { count: oversized }) })
+    }
+  }, [t])
 
   const removePickedImage = (idx: number) => {
     setPickedImages((cur) => cur.filter((_, i) => i !== idx))
@@ -2082,70 +2109,110 @@ export default function Home() {
 
   /* ============ 外部文件拖拽（Tauri 环境拿真实路径；浏览器环境回退 DOM File） ============ */
   /** 本地图片文件 → data URL 预览（拖拽场景；大小已由调用方校验，发送前统一压缩） */
-  const readImageFile = useCallback(async (path: string) => {
+  const readImageFile = useCallback(async (path: string): Promise<boolean> => {
     try {
       const bytes = await readFile(path)
-      if (bytes.byteLength === 0) return
-      const ext = path.split('.').pop()?.toLowerCase() ?? 'png'
-      const mime = ext === 'jpg' ? 'jpeg' : ext
+      if (bytes.byteLength === 0) return false
+      const mime = imageMimeFromPath(path)
+      if (!mime) return false
       let binary = ''
       const chunk = 0x8000
       for (let i = 0; i < bytes.length; i += chunk) {
         binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
       }
-      void compressImage(`data:image/${mime};base64,${btoa(binary)}`).then((url) => {
-        setPickedImages((cur) => (cur.length >= 4 ? cur : [...cur, url]))
-      })
+      const url = await compressImage(`data:${mime};base64,${btoa(binary)}`)
+      setPickedImages((cur) => (cur.length >= 4 ? cur : [...cur, url]))
+      return true
     } catch {
-      useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
+      return false
     }
-  }, [t])
+  }, [])
   /** 项目外文本文件：读入输入框作为引用块（≤200KB；二进制/乱码跳过并提示） */
-  const readExternalText = useCallback(async (path: string) => {
+  const readExternalText = useCallback(async (path: string): Promise<'added' | 'binary' | 'failed'> => {
     try {
       const bytes = await readFile(path)
       const text = new TextDecoder('utf-8').decode(bytes)
       if (!text.trim() || text.includes('\uFFFD')) {
-        useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropBinary') })
-        return
+        return 'binary'
       }
       const name = path.split(/[\\/]/).pop() || path
-      const block = `【引用文件 ${name}】\n\`\`\`\n${text}\n\`\`\``
-      setDraft((d) => (d ? `${d}\n\n${block}` : block))
-      inputRef.current?.focus()
+      appendExternalText(name, text)
+      return 'added'
     } catch {
-      useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
+      return 'failed'
     }
-  }, [t])
+  }, [appendExternalText])
   /** 拖拽路径分发：图片 → 预览；项目内文件 → @引用（后端注入内容）；项目外文本 → 插入输入框 */
-  const handleDroppedPaths = useCallback((paths: string[]) => {
+  const handleDroppedPaths = useCallback(async (paths: string[]) => {
     const root = useProjectStore.getState().currentProject?.path
+    const skipped = { directories: 0, imagesTooBig: 0, textTooBig: 0, binary: 0, failed: 0 }
     for (const p of paths) {
-      void (async () => {
-        try {
-          const info = await stat(p)
-          if (info.isDirectory) {
-            useNotificationStore.getState().push({ tone: 'info', title: t('home.dropDir') })
-            return
-          }
-          if (isImagePath(p)) {
-            if (info.size > 8 * 1024 * 1024) return
-            void readImageFile(p)
-          } else if (root && pathInProject(p, root)) {
-            handleReference(p)
-          } else {
-            if (info.size > 200 * 1024) {
-              useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropTooBig') })
-              return
-            }
-            void readExternalText(p)
-          }
-        } catch {
-          useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFail') })
+      try {
+        const info = await stat(p)
+        if (info.isDirectory) {
+          skipped.directories += 1
+          continue
         }
-      })()
+        if (isImagePath(p)) {
+          if (info.size > 8 * 1024 * 1024) {
+            skipped.imagesTooBig += 1
+            continue
+          }
+          if (!(await readImageFile(p))) skipped.failed += 1
+          continue
+        }
+        const relative = root ? projectRelativePath(p, root) : null
+        if (relative) {
+          handleReference(relative)
+          continue
+        }
+        if (info.size > 200 * 1024) {
+          skipped.textTooBig += 1
+          continue
+        }
+        const result = await readExternalText(p)
+        if (result === 'binary') skipped.binary += 1
+        else if (result === 'failed') skipped.failed += 1
+      } catch {
+        skipped.failed += 1
+      }
     }
+    if (skipped.directories) useNotificationStore.getState().push({ tone: 'info', title: t('home.dropDirCount', { count: skipped.directories }) })
+    if (skipped.imagesTooBig) useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropImageTooBig', { count: skipped.imagesTooBig }) })
+    if (skipped.textTooBig) useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropTooBigCount', { count: skipped.textTooBig }) })
+    if (skipped.binary) useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropBinaryCount', { count: skipped.binary }) })
+    if (skipped.failed) useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFailCount', { count: skipped.failed }) })
   }, [handleReference, readExternalText, readImageFile, t])
+
+  /** 浏览器开发模式拿不到真实路径：图片仍可预览，文本按外部引用直接读取。 */
+  const handleDroppedBrowserFiles = useCallback(async (files: FileList) => {
+    const textFiles: File[] = []
+    const imageFiles: File[] = []
+    let tooBig = 0
+    let binary = 0
+    let failed = 0
+    for (const file of Array.from(files)) {
+      if (file.type.startsWith('image/')) imageFiles.push(file)
+      else textFiles.push(file)
+    }
+    addImageFiles(imageFiles)
+    for (const file of textFiles) {
+      if (file.size > 200 * 1024) {
+        tooBig += 1
+        continue
+      }
+      try {
+        const text = await file.text()
+        if (!text.trim() || text.includes('\uFFFD')) binary += 1
+        else appendExternalText(file.name, text)
+      } catch {
+        failed += 1
+      }
+    }
+    if (tooBig) useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropTooBigCount', { count: tooBig }) })
+    if (binary) useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropBinaryCount', { count: binary }) })
+    if (failed) useNotificationStore.getState().push({ tone: 'warn', title: t('home.dropReadFailCount', { count: failed }) })
+  }, [addImageFiles, appendExternalText, t])
   // Tauri 拖拽事件：真实路径 + 悬停高亮（DOM dataTransfer 拿不到路径，须走 webview 原生事件）
   useEffect(() => {
     let unlisten: (() => void) | undefined
@@ -2155,7 +2222,7 @@ export default function Home() {
         .onDragDropEvent((e) => {
           if (e.payload.type === 'drop') {
             setDragActive(false)
-            handleDroppedPaths(e.payload.paths)
+            void handleDroppedPaths(e.payload.paths)
           } else if (e.payload.type === 'enter' || e.payload.type === 'over') {
             setDragActive(true)
           } else {
@@ -5487,7 +5554,7 @@ export default function Home() {
               e.preventDefault()
               setDragActive(false)
               // Tauri 环境 DOM 拿不到文件（须走 onDragDropEvent）；此处仅作浏览器开发模式回退
-              if (e.dataTransfer.files.length > 0) addImageFiles(e.dataTransfer.files)
+              if (e.dataTransfer.files.length > 0) void handleDroppedBrowserFiles(e.dataTransfer.files)
             }}
           >
             {/* 拖拽悬停覆盖层：提示松手添加（文件/图片；项目外文本自动插入输入框） */}
