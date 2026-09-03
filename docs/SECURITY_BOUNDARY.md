@@ -67,6 +67,8 @@ HarmonyAgent 当前**不具备默认 OS 级命令沙箱**：
 
 任何平台如果不能建立所声明的边界，必须返回 `sandbox_unavailable` 并失败关闭，不能静默切换到 `host-direct`。
 
+当前实现进度：`src-tauri/src/agent/sandbox.rs` 已提供 `SandboxBackend`/`OciBackend`、Docker/Podman 运行时探测、固定 digest 的安全 argv、wall-time/取消处理、命名容器清理、输出预算和运行事件。它尚未成为 `run_command` 的默认执行路径，也尚未实现 artifact 导出，因此当前产品能力仍按第 2 节的宿主执行边界对外说明。
+
 ## 6. Sandbox Backend 最低契约
 
 ### 6.1 文件系统

@@ -76,4 +76,6 @@ HARMONY_INDEX_BENCH_FILES=1000000 cargo test --manifest-path src-tauri/Cargo.tom
 - file/line Recall@5/20；
 - 峰值内存、CPU time 和索引磁盘占用。
 
+百万级目标采用“全库可达、按需读取”：目录和索引覆盖全部合规文件，但每次读取仍按行、字节或符号块分页，并返回游标与文件版本。单次限制用于保护上下文和内存，不能表现为文件永久不可访问。机械式跨文件修改应在隔离工作树中批量执行，再以 diff 和测试验证，而不是把所有文件全文送入模型。
+
 相关路线见 [Agent 能力演进路线](AGENT_EVOLUTION_ROADMAP_2026.md)。

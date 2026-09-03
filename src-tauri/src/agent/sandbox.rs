@@ -1,11 +1,12 @@
-//! Agent 命令执行沙箱的稳定策略模型与 OCI 启动参数构造。
+//! Agent 命令执行沙箱的稳定策略模型、OCI 能力探测与进程生命周期。
 //!
-//! 本模块目前只建立能力契约和可测试的 OCI argv，不会自行切换现有
-//! `run_command` 执行路径。接入前必须完成进程生命周期、日志、取消、
-//! artifact 导出和对抗测试，禁止在能力不足时静默回退宿主执行。
+//! 本模块不会自行切换现有 `run_command` 执行路径。调用方必须显式选择
+//! [`OciBackend`]；探测或能力校验失败时一律失败关闭，禁止静默回退宿主执行。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 pub const SANDBOX_SPEC_VERSION: u32 = 1;
 pub const SANDBOX_WORKSPACE_PATH: &str = "/workspace";
@@ -91,13 +92,19 @@ impl SandboxSpec {
             return Err("OCI --mount 暂不支持路径中含逗号的 workspace".into());
         }
         if self.limits.cpu_count == 0
+            || self.limits.cpu_count > 64
             || self.limits.memory_mb < 128
+            || self.limits.memory_mb > 65_536
             || self.limits.pids == 0
+            || self.limits.pids > 4_096
             || self.limits.writable_tmp_mb < 16
+            || self.limits.writable_tmp_mb > 16_384
             || self.limits.wall_time_seconds == 0
+            || self.limits.wall_time_seconds > 3_600
             || self.limits.output_bytes == 0
+            || self.limits.output_bytes > 64 * 1024 * 1024
         {
-            return Err("sandbox 资源限制必须为有效的非零安全值".into());
+            return Err("sandbox 资源限制超出安全范围".into());
         }
         for key in &self.environment_keys {
             if !valid_environment_key(key) {
@@ -136,6 +143,19 @@ pub struct SandboxCapabilities {
     pub reason: Option<String>,
 }
 
+/// 所有沙箱后端必须提供的同步、可审计契约。运行时探测和执行由具体后端的
+/// async 方法承担，避免为了 async trait 引入额外运行时依赖。
+pub trait SandboxBackend {
+    fn declared_capabilities(&self) -> SandboxCapabilities;
+    fn build_run_command(
+        &self,
+        spec: &SandboxSpec,
+        execution_id: &str,
+        image: &str,
+        command: &[String],
+    ) -> Result<OciRunCommand, String>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OciEngine {
@@ -168,10 +188,275 @@ impl OciEngine {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OciBackend {
+    pub engine: OciEngine,
+}
+
+impl OciBackend {
+    pub fn new(engine: OciEngine) -> Self {
+        Self { engine }
+    }
+
+    /// 探测 CLI 与后端服务是否都可用。`docker version` 会同时验证 daemon，
+    /// Podman 的无 daemon 模式也能通过相同探测确认运行时完整可用。
+    pub async fn probe(&self) -> SandboxCapabilities {
+        probe_oci_engine(self.engine).await
+    }
+
+    /// 启动一个前台 OCI 执行域。所有参数以 argv 传递，不经过 shell。
+    /// 超时或用户取消时会同时终止 CLI 进程树并强制删除命名容器。
+    pub async fn run(
+        &self,
+        spec: &SandboxSpec,
+        execution_id: &str,
+        image: &str,
+        command: &[String],
+        ctx: &crate::agent::exec_ctx::ToolCtx,
+    ) -> Result<SandboxRunResult, String> {
+        let built = self.build_run_command(spec, execution_id, image, command)?;
+        let capabilities = self.probe().await;
+        if !capabilities.available {
+            return Err(format!(
+                "sandbox_unavailable: {}",
+                capabilities
+                    .reason
+                    .unwrap_or_else(|| format!("{} 不可用", self.engine.program()))
+            ));
+        }
+
+        ctx.record_run_event(
+            "sandbox_started",
+            serde_json::json!({
+                "backend": self.engine.program(),
+                "execution_id": execution_id,
+                "spec_version": spec.version,
+                "filesystem": spec.filesystem,
+                "network": spec.network,
+                "limits": spec.limits,
+            }),
+        );
+
+        let started = Instant::now();
+        let output = crate::agent::exec_ctx::run_cmd_streaming(
+            ctx,
+            &built.program,
+            &built.args,
+            None,
+            spec.limits.wall_time_seconds,
+            None,
+        )
+        .await;
+
+        let (status, exit_code, stdout, stderr, forced_cleanup) = match output {
+            Ok(output) => {
+                let status = if output.status.success() {
+                    SandboxRunStatus::Succeeded
+                } else {
+                    SandboxRunStatus::Failed
+                };
+                (
+                    status,
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                    false,
+                )
+            }
+            Err(error) => {
+                let status = if error.contains("用户已停止") {
+                    SandboxRunStatus::Cancelled
+                } else if error.contains("命令超时") {
+                    SandboxRunStatus::TimedOut
+                } else {
+                    SandboxRunStatus::Failed
+                };
+                cleanup_container(self.engine, execution_id).await;
+                (status, None, String::new(), error, true)
+            }
+        };
+        let (stdout, stderr, output_truncated) =
+            bound_output(stdout, stderr, spec.limits.output_bytes as usize);
+        let result = SandboxRunResult {
+            backend: self.engine.program().into(),
+            execution_id: execution_id.into(),
+            status,
+            exit_code,
+            stdout,
+            stderr,
+            duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            output_truncated,
+            forced_cleanup,
+        };
+        ctx.record_run_event(
+            "sandbox_finished",
+            serde_json::json!({
+                "backend": result.backend,
+                "execution_id": result.execution_id,
+                "status": result.status,
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "output_truncated": result.output_truncated,
+                "forced_cleanup": result.forced_cleanup,
+            }),
+        );
+        Ok(result)
+    }
+}
+
+impl SandboxBackend for OciBackend {
+    fn declared_capabilities(&self) -> SandboxCapabilities {
+        self.engine.declared_capabilities()
+    }
+
+    fn build_run_command(
+        &self,
+        spec: &SandboxSpec,
+        execution_id: &str,
+        image: &str,
+        command: &[String],
+    ) -> Result<OciRunCommand, String> {
+        build_oci_run_command(self.engine, spec, execution_id, image, command)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxRunStatus {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxRunResult {
+    pub backend: String,
+    pub execution_id: String,
+    pub status: SandboxRunStatus,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub output_truncated: bool,
+    /// 是否因超时、取消或启动后异常而额外执行了 `rm --force`。
+    /// 正常结束仍由 OCI `--rm` 自动回收，不计入此字段。
+    pub forced_cleanup: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OciRunCommand {
     pub program: String,
     pub args: Vec<String>,
+}
+
+/// 并行探测所有内置 OCI 后端。返回顺序稳定，便于 UI 和诊断报告展示。
+pub async fn probe_oci_backends() -> Vec<SandboxCapabilities> {
+    let (docker, podman) = tokio::join!(
+        probe_oci_engine(OciEngine::Docker),
+        probe_oci_engine(OciEngine::Podman)
+    );
+    vec![docker, podman]
+}
+
+async fn probe_oci_engine(engine: OciEngine) -> SandboxCapabilities {
+    let mut capabilities = engine.declared_capabilities();
+    let args = vec!["version".to_string()];
+    let mut command = match crate::utils::process::command(engine.program(), &args) {
+        Ok(command) => command,
+        Err(error) => {
+            capabilities.reason = Some(error);
+            return capabilities;
+        }
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = match tokio::time::timeout(Duration::from_secs(5), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            capabilities.reason = Some(format!("无法启动 {}：{error}", engine.program()));
+            return capabilities;
+        }
+        Err(_) => {
+            capabilities.reason = Some(format!("{} 运行时探测超时（5s）", engine.program()));
+            return capabilities;
+        }
+    };
+    if output.status.success() {
+        capabilities.available = true;
+        capabilities.reason = first_summary_line(&output.stdout)
+            .map(|line| format!("运行时探测通过：{line}"))
+            .or_else(|| Some("运行时探测通过".into()));
+    } else {
+        let detail = first_summary_line(&output.stderr)
+            .or_else(|| first_summary_line(&output.stdout))
+            .unwrap_or_else(|| format!("退出码 {}", output.status.code().unwrap_or(-1)));
+        capabilities.reason = Some(format!("{} 后端不可用：{detail}", engine.program()));
+    }
+    capabilities
+}
+
+fn first_summary_line(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(160).collect())
+}
+
+async fn cleanup_container(engine: OciEngine, execution_id: &str) {
+    let Ok(name) = normalize_container_name(execution_id) else {
+        return;
+    };
+    let args = vec!["rm".into(), "--force".into(), name];
+    let Ok(mut command) = crate::utils::process::command(engine.program(), &args) else {
+        return;
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = tokio::time::timeout(Duration::from_secs(5), command.status()).await;
+}
+
+fn bound_output(stdout: String, stderr: String, limit: usize) -> (String, String, bool) {
+    if stdout.len().saturating_add(stderr.len()) <= limit {
+        return (stdout, stderr, false);
+    }
+    // stderr 通常包含失败结论，先为它保留一半预算，剩余预算在两个流间动态让渡。
+    let stderr_budget = stderr.len().min(limit / 2);
+    let stdout_budget = stdout.len().min(limit.saturating_sub(stderr_budget));
+    let stderr_budget = stderr.len().min(limit.saturating_sub(stdout_budget));
+    (
+        tail_with_marker(&stdout, stdout_budget),
+        tail_with_marker(&stderr, stderr_budget),
+        true,
+    )
+}
+
+fn tail_with_marker(value: &str, budget: usize) -> String {
+    if value.len() <= budget {
+        return value.into();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    const MARKER: &str = "[前部输出已截断]\n";
+    if budget <= MARKER.len() {
+        let mut end = budget;
+        while end > 0 && !MARKER.is_char_boundary(end) {
+            end -= 1;
+        }
+        return MARKER[..end].into();
+    }
+    let keep = budget - MARKER.len();
+    let mut start = value.len().saturating_sub(keep);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{MARKER}{}", &value[start..])
 }
 
 /// 构造无 shell 插值的 OCI argv。调用方必须把 program/args 直接交给 Command，
@@ -206,6 +491,7 @@ pub fn build_oci_run_command(
         "--name".into(),
         name,
         "--read-only".into(),
+        "--user=65532:65532".into(),
         "--cap-drop=ALL".into(),
         "--security-opt=no-new-privileges".into(),
         format!("--cpus={}", spec.limits.cpu_count),
@@ -337,6 +623,7 @@ mod tests {
         .unwrap();
         assert_eq!(built.program, "docker");
         assert!(built.args.contains(&"--read-only".to_string()));
+        assert!(built.args.contains(&"--user=65532:65532".to_string()));
         assert!(built.args.contains(&"--cap-drop=ALL".to_string()));
         assert!(built
             .args
@@ -386,5 +673,36 @@ mod tests {
         let error = spec.validate().unwrap_err();
         assert!(error.contains("Host Capability Broker"));
         std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn backend_contract_builds_the_same_fail_closed_argv() {
+        let workspace = temp_workspace();
+        let spec = SandboxSpec::workspace_write(workspace.clone());
+        let backend = OciBackend::new(OciEngine::Podman);
+        assert!(!backend.declared_capabilities().available);
+        let built = backend
+            .build_run_command(
+                &spec,
+                "contract-1",
+                digest_image(),
+                &["cargo".into(), "check".into()],
+            )
+            .unwrap();
+        assert_eq!(built.program, "podman");
+        assert!(built.args.contains(&"--network=none".into()));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn bounded_output_keeps_valid_utf8_within_byte_budget() {
+        let stdout = "前缀".repeat(100);
+        let stderr = "错误".repeat(100);
+        let (stdout, stderr, truncated) = bound_output(stdout, stderr, 101);
+        assert!(truncated);
+        assert!(stdout.len() + stderr.len() <= 101);
+        assert!(stdout.is_char_boundary(stdout.len()));
+        assert!(stderr.is_char_boundary(stderr.len()));
+        assert!(stdout.contains("截断") || stderr.contains("截断"));
     }
 }

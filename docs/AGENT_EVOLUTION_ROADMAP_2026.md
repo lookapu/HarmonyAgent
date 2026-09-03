@@ -231,7 +231,25 @@ Agent 不应直接猜选搜索工具。新增一个统一 `repo_query`：
 - 修改影响面：反向依赖图 + 测试映射 + Git 历史；
 - 每个结果返回 `source_layer`、`index_revision`、`coverage`、`stale` 和可引用行范围。
 
-### 6.5 大仓验收指标
+### 6.5 “全库可达”与单次读写预算
+
+百万级支持不等于把全仓文件内容同时读取进模型上下文。系统应区分两个概念：
+
+- **全库可达**：每个未被 ignore/权限策略排除的文件都有目录记录，可以按稳定路径或 `file_id` 定位；索引必须报告覆盖率，不能静默漏掉第 4,001 个文件；
+- **单次预算**：一次工具调用仍限制行数、字节数、输出 token 和耗时，防止一个超大文件耗尽上下文或内存。
+
+建议统一文件访问协议：
+
+1. `repo_query` 返回 `file_id`、路径、大小、hash/index revision、命中行和下一页游标；
+2. `read_file` 支持 `start_line + lines`、`byte_offset + byte_length`、`symbol_id` 三种窗口，响应返回 `next_cursor` 和文件版本；
+3. 文本大文件按窗口读取，语法块可以在预算内自动补齐；超预算时返回摘要和继续读取位置，而不是声称已读完整文件；
+4. 修改优先使用带 `expected_hash` 的锚点 patch；落盘前重新校验版本，冲突时拒绝覆盖并要求重读；
+5. 大范围机械变更由受限脚本在沙箱工作树内完成，随后用 Git diff、编译和测试验证，不让模型逐文件复制全文；
+6. 二进制、生成物、压缩包和超大数据文件只记录元数据，由专用解析器按需抽取，不进入通用源码全文索引。
+
+因此，当前 `read_file` 的单次 2,000 行/字符预算和写入大小限制可以保留，但错误信息与结果协议必须明确这是“单次窗口限制”，不是“文件不可访问”。最终验收应包含随机抽取首部、中部、尾部文件，证明百万文件目录中任意合规文件均可寻址、分页读取和版本安全修改。
+
+### 6.6 大仓验收指标
 
 构造或选择 10k、100k、1M 文件三个档位，发布以下结果：
 
@@ -390,7 +408,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 交付：
 
-- [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、能力声明和 fail-closed OCI argv 构造器；运行时探测/生命周期/接线待完成）；
+- [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、后端契约、Docker/Podman 运行时探测、fail-closed OCI argv、超时/取消清理、输出限制和审计事件；实际命令接线与 artifact 导出待完成）；
 - [ ] approval 与 sandbox escalation 进入统一事件和审计链；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断；
