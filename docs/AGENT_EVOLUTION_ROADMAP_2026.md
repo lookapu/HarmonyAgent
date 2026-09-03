@@ -247,7 +247,7 @@ Agent 不应直接猜选搜索工具。新增一个统一 `repo_query`：
 5. 大范围机械变更由受限脚本在沙箱工作树内完成，随后用 Git diff、编译和测试验证，不让模型逐文件复制全文；
 6. 二进制、生成物、压缩包和超大数据文件只记录元数据，由专用解析器按需抽取，不进入通用源码全文索引。
 
-因此，当前 `read_file` 的单次 2,000 行/字符预算和写入大小限制可以保留，但错误信息与结果协议必须明确这是“单次窗口限制”，不是“文件不可访问”。最终验收应包含随机抽取首部、中部、尾部文件，证明百万文件目录中任意合规文件均可寻址、分页读取和版本安全修改。
+因此，当前 `read_file` 的单次 2,000 行/字符预算和写入大小限制可以保留，但错误信息与结果协议必须明确这是“单次窗口限制”，不是“文件不可访问”。本轮已让普通读取返回 SHA-256 `file_version`、实际窗口和 `next_start`；超过 1 MiB 的文本在显式提供 `start/lines` 后使用固定内存的流式窗口，不再加载或拒绝整个文件。深页目前仍需从文件头扫描，后续通过持久化行偏移 sidecar 支持直接 seek；大文件版本目前使用 metadata revision，版本安全修改仍需强 hash/分块 patch。最终验收应包含随机抽取首部、中部、尾部文件，证明百万文件目录中任意合规文件均可寻址、分页读取和版本安全修改。
 
 ### 6.6 大仓验收指标
 
@@ -509,6 +509,9 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [SWE-bench Pro](https://scale.com/blog/swe-bench-pro)
 - [SWE-bench Live](https://swe-bench-live.github.io/)
 - [SWE-Explore：单独评测仓库探索与代码定位](https://github.com/Qiushao-E/SWE-Explore-Bench)
+- [GitHub Blackbird：代码搜索的 n-gram、分片、惰性迭代与增量摄取](https://github.blog/engineering/architecture-optimization/the-technology-behind-githubs-new-code-search/)
+- [Sourcegraph：大规模 monorepo 的后台索引、分片与分页](https://sourcegraph.com/docs/admin/monorepo)
+- [Sourcegraph：Zoekt 索引、大文件边界与未索引搜索策略](https://sourcegraph.com/docs/admin/search)
 - [Tree-sitter：增量解析](https://tree-sitter.github.io/tree-sitter/)
 - [Sourcegraph：SCIP 精确代码导航](https://sourcegraph.com/docs/code-navigation/precise-code-navigation)
 - [Trae Agent 官方仓库与技术报告入口](https://github.com/bytedance/trae-agent)

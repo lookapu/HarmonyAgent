@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// 面向工具协议的稳定内容版本。与进程内冲突检测使用的 FNV 指纹分离：
+/// 该值会暴露给 Agent，后续可直接作为 expected_hash 乐观锁使用。
+fn file_content_version(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// 读文件请求（宽松）：字段均可选；路径归一化/基础文件校验集中在 `resolve()` 显式落地。
 #[derive(serde::Deserialize, Default)]
 pub(super) struct ReadFileRequest {
@@ -37,9 +45,14 @@ impl ReadFileRequest {
             return Err(format!("路径不是文件: {}", p.display()));
         }
         let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
-        if meta.len() > 1024 * 1024 {
+        let stream_large = meta.len() > 1024 * 1024;
+        if stream_large
+            && (self.outline.unwrap_or(false)
+                || self.lines.unwrap_or(0) == 0
+                || self.lines.unwrap_or(0) > 2_000)
+        {
             return Err(format!(
-                "文件过大（{}，>1MB），无法直接读取：先用 grep_files 定位关键词所在行号，再 read_file 传 start/lines 分段读取，或用命令行工具处理",
+                "文件较大（{}，>1MB），请显式传 start/lines 进行流式窗口读取（单次最多 2000 行，不会把整文件加载进内存）；大文件 outline 将在行偏移索引上线后支持",
                 human_size(meta.len())
             ));
         }
@@ -50,6 +63,7 @@ impl ReadFileRequest {
             outline_filter: self.outline_filter.filter(|f| !f.trim().is_empty()),
             start: self.start.unwrap_or(1).max(1),
             lines: self.lines.unwrap_or(0),
+            stream_large,
         })
     }
 }
@@ -68,6 +82,8 @@ pub(super) struct ReadFileSpec {
     pub start: u64,
     /// 读取行数（0 表示读到文件尾）
     pub lines: u64,
+    /// 超过 1 MiB 时走固定内存的流式行窗口，不加载整文件。
+    pub stream_large: bool,
 }
 
 /// 写文件请求（宽松）：默认值/校验在 `resolve()` 显式落地。
@@ -1118,6 +1134,132 @@ pub(super) async fn list_dir(args: &Value, roots: &[String]) -> Result<String, S
     Ok(truncate_out_head_tail(&out, 3000))
 }
 
+fn append_large_line_preview(
+    out: &mut String,
+    output_chars: &mut usize,
+    line_no: u64,
+    preview: &[u8],
+    line_truncated: bool,
+) -> bool {
+    const OUTPUT_CHARS: usize = 14_000;
+    let decoded = String::from_utf8_lossy(preview);
+    let snippet: String = decoded.trim_end_matches('\r').chars().take(240).collect();
+    let suffix = if line_truncated || decoded.chars().count() > 240 {
+        " …(本行已截断)"
+    } else {
+        ""
+    };
+    let rendered = format!("{line_no:>5} │ {snippet}{suffix}\n");
+    let chars = rendered.chars().count();
+    if output_chars.saturating_add(chars) > OUTPUT_CHARS {
+        return false;
+    }
+    out.push_str(&rendered);
+    *output_chars += chars;
+    true
+}
+
+/// 大文本文件的固定内存窗口读取。扫描到目标行只需要 O(1) 额外内存；单行预览也有
+/// 独立上限，避免无换行的病理文件把进程内存撑满。行偏移 sidecar 上线后可把深页扫描
+/// 从 O(n) 降为 seek + O(window)。
+fn read_large_file_window(path: &Path, start: u64, limit: u64) -> Result<String, String> {
+    use std::io::Read;
+
+    const READ_BUFFER: usize = 64 * 1024;
+    const LINE_PREVIEW_BYTES: usize = 4 * 1024;
+    let file = std::fs::File::open(path).map_err(|e| format!("读取文件失败: {e}"))?;
+    let meta = file.metadata().map_err(|e| format!("读取文件元数据失败: {e}"))?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mut reader = std::io::BufReader::with_capacity(READ_BUFFER, file);
+    let mut chunk = [0u8; READ_BUFFER];
+    let mut line_no = 1u64;
+    let mut selected = 0u64;
+    let mut preview = Vec::with_capacity(LINE_PREVIEW_BYTES);
+    let mut line_truncated = false;
+    let mut scanned = 0usize;
+    let mut out = String::new();
+    let mut output_chars = 0usize;
+    let mut next_start: Option<u64> = None;
+
+    'scan: loop {
+        let read = reader.read(&mut chunk).map_err(|e| format!("读取文件失败: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        for byte in &chunk[..read] {
+            if scanned < 8192 && *byte == 0 {
+                return Err(format!("文件是二进制（{}），无法以文本方式读取", human_size(meta.len())));
+            }
+            scanned = scanned.saturating_add(1);
+            let selected_line = line_no >= start;
+            if *byte == b'\n' {
+                if selected_line {
+                    if selected >= limit {
+                        next_start = Some(line_no);
+                        break 'scan;
+                    }
+                    if !append_large_line_preview(
+                        &mut out,
+                        &mut output_chars,
+                        line_no,
+                        &preview,
+                        line_truncated,
+                    ) {
+                        next_start = Some(line_no);
+                        break 'scan;
+                    }
+                    selected += 1;
+                }
+                line_no = line_no.saturating_add(1);
+                preview.clear();
+                line_truncated = false;
+            } else if selected_line {
+                if preview.len() < LINE_PREVIEW_BYTES {
+                    preview.push(*byte);
+                } else {
+                    line_truncated = true;
+                }
+            }
+        }
+    }
+
+    if next_start.is_none() && !preview.is_empty() && line_no >= start {
+        if selected >= limit
+            || !append_large_line_preview(
+                &mut out,
+                &mut output_chars,
+                line_no,
+                &preview,
+                line_truncated,
+            )
+        {
+            next_start = Some(line_no);
+        } else {
+            selected += 1;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("（目标窗口为空；start 可能已超过文件末尾）\n");
+    }
+    let window_end = if selected == 0 {
+        0
+    } else {
+        start.saturating_add(selected).saturating_sub(1)
+    };
+    let cursor = next_start.map_or_else(|| "end".into(), |line| line.to_string());
+    Ok(format!(
+        "文件 {}（{}；file_version=stat:{mtime_ns}:{}；流式窗口=L{start}-L{window_end}；next_start={cursor}；总行数=未预计算）：\n{out}",
+        path.display(),
+        human_size(meta.len()),
+        meta.len(),
+    ))
+}
+
 pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, String> {
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法读取文件".into());
@@ -1125,6 +1267,14 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     // Request/Spec 分离：宽松参数 ReadFileRequest → 显式 resolve() 产出严格规范 ReadFileSpec
     let spec = ReadFileRequest::from_args(args)?.resolve(roots)?;
     let p = &spec.path;
+    if spec.stream_large {
+        let path = p.clone();
+        let start = spec.start;
+        let lines = spec.lines;
+        return tokio::task::spawn_blocking(move || read_large_file_window(&path, start, lines))
+            .await
+            .map_err(|e| format!("流式读取文件任务异常: {e}"))?;
+    }
     // 整文件读取 + metadata 为 IO 操作（大文件/日志可达数 MB~数十 MB），
     // 放 spawn_blocking 避免钉死 tokio worker
     let p_buf = p.clone();
@@ -1143,6 +1293,7 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     }
     // 记录文件指纹（外部修改检测基线）
     stamp_put(p, &meta, &bytes);
+    let file_version = file_content_version(&bytes);
     // 编码：UTF-8 严格校验；非 UTF-8 用 GBK 解码展示（Windows 老项目常见），并标注编码避免误导
     let (text, enc_note) = match std::str::from_utf8(&bytes) {
         Ok(s) => {
@@ -1386,11 +1537,20 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     } else {
         String::new()
     };
+    let processed_end = (win_begin + shown_lines).min(win_end);
+    let window_start = if total == 0 { 0 } else { win_begin + 1 };
+    let next_start = if processed_end < total {
+        (processed_end + 1).to_string()
+    } else {
+        "end".to_string()
+    };
     Ok(truncate_out_max(
         &format!(
-            "文件 {}{enc_note}（{}，共 {total} 行）：\n{block_note}{comment_note}{out}",
+            "文件 {}{enc_note}（{}，共 {total} 行；file_version=sha256:{file_version}；窗口=L{}-L{}；next_start={next_start}）：\n{block_note}{comment_note}{out}",
             p.display(),
-            human_size(meta.len())
+            human_size(meta.len()),
+            window_start,
+            processed_end,
         ),
         if block_expanded { BLOCK_CHARS + 2000 } else { 15000 },
     ))
@@ -4338,6 +4498,50 @@ mod tests {
         assert!(!out.contains("代码块"), "非代码文件不应做块对齐: {out}");
         assert!(out.contains("line2") && out.contains("line3"), "{out}");
         assert!(!out.contains("line1"), "应严格按 lines=2: {out}");
+        assert!(out.contains("file_version=sha256:"), "应返回稳定文件版本: {out}");
+        assert!(out.contains("窗口=L2-L3") && out.contains("next_start=4"), "应返回续读游标: {out}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_last_window_reports_terminal_cursor() {
+        let (f, roots) = tmp_file("read_cursor_end", "line1\nline2\n", "txt");
+        let args = serde_json::json!({
+            "path": f.to_string_lossy(),
+            "start": 2,
+            "lines": 20
+        });
+        let out = block_on_rt(read_file(&args, &roots)).unwrap();
+        assert!(out.contains("窗口=L2-L2"), "{out}");
+        assert!(out.contains("next_start=end"), "{out}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn large_text_requires_and_supports_bounded_stream_window() {
+        let mut content = String::with_capacity(1_200_000);
+        for line in 1..=12_000 {
+            content.push_str(&format!("line-{line:05}-{}\n", "x".repeat(90)));
+        }
+        let (f, roots) = tmp_file("read_large_stream", &content, "txt");
+        assert!(std::fs::metadata(&f).unwrap().len() > 1024 * 1024);
+
+        let without_window = block_on_rt(read_file(
+            &serde_json::json!({"path": f.to_string_lossy()}),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(without_window.contains("显式传 start/lines"), "{without_window}");
+
+        let out = block_on_rt(read_file(
+            &serde_json::json!({"path": f.to_string_lossy(), "start": 10_000, "lines": 2}),
+            &roots,
+        ))
+        .unwrap();
+        assert!(out.contains("流式窗口=L10000-L10001"), "{out}");
+        assert!(out.contains("line-10000") && out.contains("line-10001"), "{out}");
+        assert!(!out.contains("line-09999"), "不应泄露窗口外内容: {out}");
+        assert!(out.contains("next_start=10002"), "{out}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
     }
 
