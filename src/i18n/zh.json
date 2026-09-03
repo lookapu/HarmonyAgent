@@ -665,7 +665,7 @@
     "toolToolHelp": "查工具帮助",
     "toolToolHistory": "查工具调用历史",
     "toolToolsHealth": "工具链体检",
-    "toolSandboxExec": "危险命令干跑",
+    "toolSandboxExec": "临时副本试运行",
     "toolDocxRead": "读 Word 文档",
     "toolAudioTranscribe": "语音转文字",
     "toolOcrImage": "截图 OCR",

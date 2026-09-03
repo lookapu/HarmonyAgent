@@ -57,7 +57,7 @@ Current codebase scale:
 | Item | Actual value |
 |---|---:|
 | Agent-facing tools | 201 |
-| `agent/` top-level modules (excluding `mod.rs`) | 36 |
+| `agent/` top-level modules (excluding `mod.rs`) | 37 |
 | `agent/tools/` Rust files (incl. `mod.rs`) | 30 |
 | `commands/` command modules (excluding `mod.rs`) | 38 |
 | `services/` service modules (excluding `mod.rs`) | 56 |

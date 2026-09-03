@@ -81,6 +81,8 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 - **工具限额**：tool_limits 按 8 个任务组（build / fix / explore / deploy / refactor / test / debug / other）限制调用次数，热门工具不再被全局压制
 - **权限管理**：permissions 模块按工具类型分级
 
+> 当前限制：`run_command` 虽有工作区路径校验、危险模式拒绝和审批，但命令进程仍以宿主用户权限运行；兼容工具名 `sandbox_exec` 只是“临时副本试运行”，不是 OS 级文件系统或网络沙箱。不要用它运行不可信仓库脚本。详见 [安全边界与威胁模型](docs/SECURITY_BOUNDARY.md)。
+
 ### 6. 证据驱动的可靠执行
 
 - **目标契约**：从用户目标提取修改、验证、构建、测试、部署、提交和推送等必需条件；模型只能申请完成，运行内核依据真实工具证据裁决
@@ -135,7 +137,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 298 个 Tauri IPC 入口 · 56 个 service 模块        │
-│  - agent/ 36 个顶层模块 · tools/ 29 文件 · 201 工具  │
+│  - agent/ 37 个顶层模块 · tools/ 29 文件 · 201 工具  │
 │  - SQLite + 77 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
@@ -145,7 +147,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 
 ```
 src-tauri/src/
-├── agent/                  # AI Agent 内核（36 个顶层模块）
+├── agent/                  # AI Agent 内核（37 个顶层模块）
 │   ├── runtime.rs           #   - Durable Run 状态机与事件游标
 │   ├── scheduler.rs         #   - 持久队列、Worker 租约与 fencing
 │   ├── coordinator.rs       #   - 执行步骤与恢复检查点
@@ -155,6 +157,7 @@ src-tauri/src/
 │   ├── governance.rs        #   - 动态预算、可靠性策略与质量快照
 │   ├── dag.rs               #   - 主/子 Agent DAG 与依赖调度
 │   ├── tool_runtime.rs      #   - 工具 Worker、专用线程、租约与幂等
+│   ├── sandbox.rs           #   - 沙箱策略、能力声明与 OCI 启动契约
 │   ├── structured_result.rs #   - 工具结果 V2、产物/验证/补偿证据
 │   ├── enterprise.rs        #   - SLO、告警、审计与配额
 │   ├── evals.rs             #   - 可靠性场景评测与故障注入
@@ -247,6 +250,8 @@ src-tauri/src/
 - **Windows**: `.exe`（NSIS 安装包）或 `.msi`
 - **macOS**: `.dmg` 或 `.app.tar.gz`
 
+最终用户运行上述安装包不需要本地 Python 环境。Python 仅用于部分开发、文档和发布辅助脚本。
+
 ### macOS 首次打开
 
 应用未签名，macOS 会阻止。终端一条命令搞定：
@@ -282,6 +287,8 @@ npx tauri build
 ## 文档
 
 - [持续演进任务路线图](docs/ROADMAP.md) — 长会话、Agent 工具链、HarmonyOS 闭环与生态集成的阶段任务和验收标准
+- [Agent 能力演进路线（2026）](docs/AGENT_EVOLUTION_ROADMAP_2026.md) — 安全沙箱、大仓理解、真实评测与 12 周执行顺序
+- [安全边界与威胁模型](docs/SECURITY_BOUNDARY.md) — 当前保证、明确限制和真实沙箱最低契约
 - [官方 DevEco CLI 的 MCP 接入](docs/DEVECO_CLI_MCP_INTEGRATION.md) — 内置 MCP 模板、命令解析增强与自研工具分工策略
 - [长会话上下文 V2](docs/CONTEXT_V2.md) — 数据映射、事实优先级、预算和兼容策略
 - [架构文档 v2](docs/ARCHITECTURE.md) — 产品定位、模块边界、设计取舍

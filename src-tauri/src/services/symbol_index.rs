@@ -859,4 +859,88 @@ struct Detail {
         std::fs::remove_dir_all(&data_dir).ok();
         std::fs::remove_dir_all(&proj).ok();
     }
+
+    /// Phase 0 大仓基线。默认忽略，避免在普通 CI 中创建大量文件。
+    ///
+    /// 运行示例：
+    /// HARMONY_INDEX_BENCH_FILES=10000 cargo test --lib \
+    ///   services::symbol_index::tests::large_repo_baseline -- --ignored --exact --nocapture
+    #[test]
+    #[ignore = "手动大仓索引基准；通过 HARMONY_INDEX_BENCH_FILES 选择规模"]
+    fn large_repo_baseline() {
+        let requested = std::env::var("HARMONY_INDEX_BENCH_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10_000)
+            .clamp(1, 1_000_000);
+        let files_per_shard = 1_000usize;
+        let root = std::env::temp_dir().join(format!(
+            "deveco-symbol-scale-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let generate_started = std::time::Instant::now();
+        for index in 0..requested {
+            let shard = root.join(format!("shard_{:04}", index / files_per_shard));
+            if index % files_per_shard == 0 {
+                std::fs::create_dir_all(&shard).unwrap();
+            }
+            std::fs::write(
+                shard.join(format!("file_{index:07}.rs")),
+                format!("pub fn symbol_{index:07}() -> usize {{ {index} }}\n"),
+            )
+            .unwrap();
+        }
+        let generation_ms = generate_started.elapsed().as_millis() as u64;
+
+        invalidate_cache(&root);
+        let cold_started = std::time::Instant::now();
+        let cold_symbols = index_project_cached(&root);
+        let cold_ms = cold_started.elapsed().as_millis() as u64;
+
+        let warm_started = std::time::Instant::now();
+        let warm_symbols = index_project_cached(&root);
+        let warm_ms = warm_started.elapsed().as_millis() as u64;
+
+        let changed_file = cold_symbols
+            .first()
+            .map(|symbol| symbol.file.clone())
+            .expect("基准至少应索引一个符号");
+        std::fs::write(
+            root.join(&changed_file),
+            "pub fn symbol_after_incremental_update() -> usize { 42 }\n",
+        )
+        .unwrap();
+        let incremental_started = std::time::Instant::now();
+        invalidate_files(&root, std::slice::from_ref(&changed_file));
+        let incremental_symbols = index_project_cached(&root);
+        let incremental_ms = incremental_started.elapsed().as_millis() as u64;
+
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "requested_files": requested,
+            "configured_max_files": MAX_FILES,
+            "indexed_files": cold_symbols.iter().map(|symbol| &symbol.file).collect::<std::collections::HashSet<_>>().len(),
+            "cold_symbols": cold_symbols.len(),
+            "warm_symbols": warm_symbols.len(),
+            "incremental_symbols": incremental_symbols.len(),
+            "generation_ms": generation_ms,
+            "cold_index_ms": cold_ms,
+            "warm_query_ms": warm_ms,
+            "single_file_incremental_ms": incremental_ms,
+            "truncated_by_current_limit": requested > MAX_FILES,
+            "platform": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+        });
+        println!("HARMONY_INDEX_BASELINE={report}");
+
+        assert!(!cold_symbols.is_empty());
+        assert_eq!(cold_symbols.len(), warm_symbols.len());
+        assert!(incremental_symbols
+            .iter()
+            .any(|symbol| symbol.name == "symbol_after_incremental_update"));
+        invalidate_cache(&root);
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

@@ -34,6 +34,7 @@ pub mod agent_board;
 pub mod lsp_client;
 pub mod recovery;
 pub mod reflexion;
+pub mod sandbox;
 pub mod todo;
 pub mod tools;
 pub mod undo;

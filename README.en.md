@@ -81,6 +81,8 @@ SDK path auto-detection: `DEVECO_SDK_HOME` → DevEco Studio install path → us
 - **Tool limits**: `tool_limits` caps invocations per 8 task groups (build / fix / explore / deploy / refactor / test / debug / other) — hot tools are no longer throttled globally
 - **Permission management**: `permissions` module tiers tools by type
 
+> Current limitation: `run_command` validates the workspace path, rejects known-dangerous patterns, and uses approvals, but the child process still runs with the host user's permissions. The compatibility tool named `sandbox_exec` is only a temporary-copy trial run, not an OS-level filesystem or network sandbox. Do not use it to execute untrusted repository scripts. See [Security Boundary and Threat Model](docs/SECURITY_BOUNDARY.md).
+
 ### 6. Evidence-Driven Reliable Execution
 
 - **Goal contract**: required conditions (modify, verify, build, test, deploy, commit, push, etc.) are extracted from the user's goal; the model can only *claim* completion while the runtime kernel adjudicates against real tool evidence
@@ -135,7 +137,7 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 298 Tauri IPC entry points · 56 service modules  │
-│  - agent/ 36 top-level modules · tools/ 29 files    │
+│  - agent/ 37 top-level modules · tools/ 29 files    │
 │  - SQLite + 77 migrations · full event sourcing for │
 │    runs/steps/tools                                 │
 │  - Bundled runtimes: Node + JDK + Git (runtime/)    │
@@ -146,7 +148,7 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
 
 ```
 src-tauri/src/
-├── agent/                  # AI Agent core (36 top-level modules)
+├── agent/                  # AI Agent core (37 top-level modules)
 │   ├── runtime.rs           #   - Durable Run state machine & event cursors
 │   ├── scheduler.rs         #   - Durable queue, worker leases & fencing
 │   ├── coordinator.rs       #   - Execution steps & recovery checkpoints
@@ -156,6 +158,7 @@ src-tauri/src/
 │   ├── governance.rs        #   - Dynamic budget, reliability policies & quality snapshots
 │   ├── dag.rs               #   - Main/sub-agent DAG & dependency scheduling
 │   ├── tool_runtime.rs      #   - Tool workers, dedicated threads, leases & idempotency
+│   ├── sandbox.rs           #   - Sandbox policy, capabilities & OCI launch contract
 │   ├── structured_result.rs #   - Tool result V2, artifact/verification/compensation evidence
 │   ├── enterprise.rs        #   - SLO, alerts, audit & quotas
 │   ├── evals.rs             #   - Reliability scenario evals & fault injection
@@ -248,6 +251,8 @@ Download the installer from [Releases](https://github.com/lookapu/HarmonyAgent/r
 - **Windows**: `.exe` (NSIS installer) or `.msi`
 - **macOS**: `.dmg` or `.app.tar.gz`
 
+End users do not need a local Python environment to run these installers. Python is used only by selected development, documentation, and release helper scripts.
+
 ### First Launch on macOS
 
 The app is unsigned, so macOS will block it. One terminal command fixes it:
@@ -283,6 +288,8 @@ npx tauri build
 ## Documentation
 
 - [Continuous evolution roadmap](docs/ROADMAP.md) — phased tasks and acceptance criteria for long sessions, the Agent toolchain, the HarmonyOS loop, and ecosystem integration
+- [Agent capability evolution roadmap (Chinese)](docs/AGENT_EVOLUTION_ROADMAP_2026.md) — sandboxing, large-repository intelligence, real-agent evaluation, and a 12-week delivery sequence
+- [Security boundary and threat model (Chinese)](docs/SECURITY_BOUNDARY.md) — current guarantees, explicit limitations, and the minimum real-sandbox contract
 - [Official DevEco CLI MCP integration](docs/DEVECO_CLI_MCP_INTEGRATION.md) — built-in MCP templates, command parsing enhancements, and the division of labor with custom tools
 - [Long-session context V2](docs/CONTEXT_V2.md) — data mapping, fact priority, budget, and compatibility strategy
 - [Architecture doc v2](docs/ARCHITECTURE.md) — product positioning, module boundaries, design trade-offs

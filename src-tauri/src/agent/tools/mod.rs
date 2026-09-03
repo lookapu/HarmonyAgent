@@ -1054,7 +1054,7 @@ name: "ask_history",
     },
     ToolSpec {
         name: "sandbox_exec",
-        desc: "危险命令干跑：在系统临时沙箱目录模拟执行（可先复制 source 目录进去），预览结果后再决定是否真执行。\n参数：{\"command\":\"<命令串>\",\"source\":\"<可选源目录，复制到沙箱后执行（限 50MB/200 文件）>\",\"mode\":\"simulate|preview（缺省 simulate）\",\"timeout_secs\":<可选，缺省 30>}。\nsimulate：有 source 时在沙箱内真执行（影响面仅沙箱），否则对命中危险模式的命令只做静态预览；preview：仅静态危险分析不执行。\n适合：rm -rf / git clean -f 等破坏性命令先看影响面、批量改名/重构前验证脚本行为。\n副作用：系统临时目录创建/删除文件（不影响项目）；preview 模式无任何副作用。\n返回：危险分析 + 沙箱执行输出与退出码。",
+        desc: "临时副本试运行（兼容工具名 sandbox_exec）：可把 source 复制到系统临时目录执行，预览结果后再决定是否在项目中执行。它不是 OS 级沙箱：子进程仍具有宿主用户权限，可能读取临时目录外文件或访问网络。\n参数：{\"command\":\"<命令串>\",\"source\":\"<simulate 必填的源目录，复制到临时目录后执行（限 50MB/200 文件）>\",\"mode\":\"simulate|preview（缺省 simulate）\",\"timeout_secs\":<可选，缺省 30>}。\nsimulate：有 source 时在临时副本中执行；未提供 source 时只返回预览且绝不执行。preview：仅静态危险分析不执行。\n适合：在副本中观察批量改名、重构脚本等对项目文件的影响；不得用于运行不可信代码或保护宿主凭据。\n副作用：simulate 命令在宿主机以当前用户权限运行，并可能创建/删除临时目录内文件；未提供 source 或 preview 模式无执行副作用。\n返回：危险分析、明确的隔离边界警告、执行输出与退出码。",
     },
     ToolSpec {
         name: "license_check",

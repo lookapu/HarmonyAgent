@@ -664,7 +664,7 @@
     "toolToolHelp": "Tool help",
     "toolToolHistory": "Tool call history",
     "toolToolsHealth": "Toolchain health",
-    "toolSandboxExec": "Sandbox exec",
+    "toolSandboxExec": "Temporary-copy trial run",
     "toolDocxRead": "Read Word document",
     "toolAudioTranscribe": "Audio transcribe",
     "toolOcrImage": "Screenshot OCR",
