@@ -766,7 +766,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_symbols",
-        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"page\":<可选页码，缺省 1>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、签名、归属、行区间，以及 indexed_files/coverage/staleness；coverage 非完整时必须结合 codebase_search 或精确路径补查。",
+        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、next_cursor、签名、归属、行区间，以及 indexed_files/coverage/staleness；coverage 非完整时必须结合 codebase_search 或精确路径补查。",
     },
     ToolSpec {
         name: "delete_file",
@@ -3627,11 +3627,12 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         return Err("role 仅支持 entity 或 logic".into());
     }
     let file = args["file"].as_str().map(|s| s.to_string());
+    let cursor = args["cursor"].as_str().map(|s| s.to_string());
     let page = args["page"].as_u64().unwrap_or(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
     // 复用增量持久索引；只把当前页结构元数据带入模型，不把全仓源码塞进上下文。
     let result = tokio::task::spawn_blocking(move || {
-        crate::services::symbol_index::query_structure(
+        crate::services::symbol_index::query_structure_with_cursor(
             &root,
             &query,
             role.as_deref(),
@@ -3639,10 +3640,11 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
             file.as_deref(),
             page,
             limit,
+            cursor.as_deref(),
         )
     })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())??;
     let mut out = String::new();
     out.push_str(&format!(
         "结构查询：匹配 {}，第 {} 页（每页 {}）；已解析 {} 个源码文件 / {} 个结构 / {} 条关系；全库目录发现 {} 个文件（源码 {}，延期 {}，超大 {}，不可读文件/目录 {}/{}，持久化 {}）；watcher={}；coverage={}；索引更新于 {} 秒前。\n",
@@ -3702,7 +3704,9 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
             ));
         }
     }
-    if let Some(next_page) = result.next_page {
+    if let Some(next_cursor) = result.next_cursor {
+        out.push_str(&format!("还有结果：优先原样传入 cursor={next_cursor} 读取下一页。\n"));
+    } else if let Some(next_page) = result.next_page {
         out.push_str(&format!("还有结果：使用 page={next_page} 读取下一页。\n"));
     }
     Ok(truncate_out_max(&out, 12000))

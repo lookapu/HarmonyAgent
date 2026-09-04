@@ -13,8 +13,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection};
 
 use crate::services::harmony;
 
@@ -833,6 +834,15 @@ fn replace_all_symbol_rows_at(
             return false;
         }
     }
+    if transaction
+        .execute(
+            "UPDATE structure_meta SET revision = revision + 1 WHERE id=1",
+            [],
+        )
+        .is_err()
+    {
+        return false;
+    }
     transaction.commit().is_ok()
 }
 
@@ -895,6 +905,15 @@ fn replace_changed_symbol_rows_at(
         if insert_edge_row(&transaction, &edge).is_err() {
             return false;
         }
+    }
+    if transaction
+        .execute(
+            "UPDATE structure_meta SET revision = revision + 1 WHERE id=1",
+            [],
+        )
+        .is_err()
+    {
+        return false;
     }
     transaction.commit().is_ok()
 }
@@ -1018,6 +1037,14 @@ where
             insert_edge_row(&transaction, &edge).map_err(|error| error.to_string())?;
         }
         promoted += 1;
+    }
+    if promoted > 0 {
+        transaction
+            .execute(
+                "UPDATE structure_meta SET revision = revision + 1 WHERE id=1",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
     }
     transaction.commit().map_err(|error| error.to_string())?;
     let catalog = catalog_stats(&conn).map_err(|error| error.to_string())?;
@@ -1315,6 +1342,11 @@ fn collect_files_at_with_budget(
                    AFTER DELETE ON symbol_edges BEGIN
                      UPDATE structure_stats SET relation_count = MAX(0, relation_count - 1) WHERE id = 1;
                    END;
+                 CREATE TABLE IF NOT EXISTS structure_meta (
+                   id INTEGER PRIMARY KEY CHECK(id = 1),
+                   revision INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO structure_meta(id, revision) VALUES(1, 0);
                  BEGIN IMMEDIATE;",
             )
             .ok()?;
@@ -1996,6 +2028,8 @@ pub struct StructureQueryResult {
     pub page: usize,
     pub page_size: usize,
     pub next_page: Option<usize>,
+    /// Opaque keyset cursor. Prefer this over deep numeric pages on large repositories.
+    pub next_cursor: Option<String>,
     pub indexed_files: usize,
     pub indexed_symbols: usize,
     pub indexed_relations: usize,
@@ -2004,6 +2038,57 @@ pub struct StructureQueryResult {
     pub progressive: ProgressiveIndexStatus,
     pub coverage: String,
     pub synced_ago_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StructureCursor {
+    version: u8,
+    filter_hash: u64,
+    index_revision: u64,
+    total_matches: usize,
+    exact_match: bool,
+    file: String,
+    line: i64,
+    name: String,
+    row_id: i64,
+}
+
+fn structure_filter_hash(
+    root: &Path,
+    query: &str,
+    role: Option<&str>,
+    kind: Option<&str>,
+    file: Option<&str>,
+) -> u64 {
+    let normalized = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        canonical_key(root),
+        query.trim().to_lowercase(),
+        role.unwrap_or("").trim(),
+        kind.unwrap_or("").trim(),
+        file.unwrap_or("").trim().to_lowercase(),
+    );
+    stable_hash(&normalized)
+}
+
+fn encode_structure_cursor(cursor: &StructureCursor) -> Result<String, String> {
+    let payload = serde_json::to_vec(cursor).map_err(|error| format!("编码结构游标失败：{error}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
+}
+
+fn decode_structure_cursor(value: &str, expected_filter_hash: u64) -> Result<StructureCursor, String> {
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .map_err(|_| "结构游标无效或已损坏".to_string())?;
+    let cursor: StructureCursor =
+        serde_json::from_slice(&payload).map_err(|_| "结构游标格式不受支持".to_string())?;
+    if cursor.version != 1 {
+        return Err("结构游标版本不受支持，请从第一页重新查询".into());
+    }
+    if cursor.filter_hash != expected_filter_hash {
+        return Err("结构游标与当前项目或过滤条件不匹配，请从第一页重新查询".into());
+    }
+    Ok(cursor)
 }
 
 fn query_persisted_symbols_at(
@@ -2165,6 +2250,201 @@ fn query_persisted_symbols_at(
     Some(Ok((items, total)))
 }
 
+/// Keyset query used by the Agent-facing cursor protocol. Predicates are emitted only when
+/// active so SQLite can select the targeted indexes instead of planning around optional ORs.
+fn query_persisted_symbols_keyset_at(
+    root: &Path,
+    data_dir: &Path,
+    query: &str,
+    role: Option<&str>,
+    kind: Option<&str>,
+    file: Option<&str>,
+    cursor: Option<&StructureCursor>,
+    page_size: usize,
+    filter_hash: u64,
+) -> Option<Result<(Vec<Symbol>, usize, Option<String>), String>> {
+    let conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("打开结构节点库失败：{error}"))),
+    };
+    let index_revision = match conn.query_row(
+        "SELECT revision FROM structure_meta WHERE id=1",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(value) => value.max(0) as u64,
+        Err(error) => return Some(Err(format!("读取结构索引版本失败：{error}"))),
+    };
+    if cursor.is_some_and(|value| value.index_revision != index_revision) {
+        return Some(Err(
+            "结构索引已在翻页期间更新，请从第一页重新查询以避免遗漏或重复".into(),
+        ));
+    }
+    let query = query.trim().to_lowercase();
+    let role = role.map(str::trim).filter(|value| !value.is_empty());
+    let kind = kind.map(str::trim).filter(|value| !value.is_empty());
+    let file = file
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    let mut filters = Vec::<String>::new();
+    let mut values = Vec::<Value>::new();
+    let push_text = |values: &mut Vec<Value>, value: String| {
+        values.push(Value::Text(value));
+        values.len()
+    };
+    if let Some(value) = role {
+        let parameter = push_text(&mut values, value.to_string());
+        filters.push(format!("role=?{parameter}"));
+    }
+    if let Some(value) = kind {
+        let parameter = push_text(&mut values, value.to_string());
+        filters.push(format!("kind=?{parameter}"));
+    }
+    if let Some(value) = file {
+        let parameter = push_text(&mut values, value);
+        filters.push(format!("instr(lower(file), ?{parameter}) > 0"));
+    }
+
+    let count = |clauses: &[String], parameters: &[Value]| -> Result<usize, String> {
+        let where_sql = if clauses.is_empty() {
+            "1".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM symbols WHERE {where_sql}"),
+            params_from_iter(parameters.iter()),
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value.max(0) as usize)
+        .map_err(|error| format!("查询结构节点数量失败：{error}"))
+    };
+
+    let (total, exact_match) = if let Some(cursor) = cursor {
+        if !query.is_empty() {
+            let query_parameter = push_text(&mut values, query.clone());
+            if cursor.exact_match {
+                filters.push(format!("name=?{query_parameter} COLLATE NOCASE"));
+            } else {
+                filters.push(format!(
+                    "(instr(lower(name), ?{query_parameter}) > 0
+                       OR instr(lower(file), ?{query_parameter}) > 0
+                       OR instr(lower(signature), ?{query_parameter}) > 0)"
+                ));
+            }
+        }
+        (cursor.total_matches, cursor.exact_match)
+    } else if query.is_empty() {
+        let total = match count(&filters, &values) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        (total, false)
+    } else {
+        let query_parameter = push_text(&mut values, query.clone());
+        let mut exact_filters = filters.clone();
+        exact_filters.push(format!("name=?{query_parameter} COLLATE NOCASE"));
+        let exact_total = match count(&exact_filters, &values) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        if exact_total > 0 {
+            filters = exact_filters;
+            (exact_total, true)
+        } else {
+            filters.push(format!(
+                "(instr(lower(name), ?{query_parameter}) > 0
+                   OR instr(lower(file), ?{query_parameter}) > 0
+                   OR instr(lower(signature), ?{query_parameter}) > 0)"
+            ));
+            let total = match count(&filters, &values) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            (total, false)
+        }
+    };
+
+    if let Some(cursor) = cursor {
+        let file_parameter = push_text(&mut values, cursor.file.clone());
+        values.push(Value::Integer(cursor.line));
+        let line_parameter = values.len();
+        let name_parameter = push_text(&mut values, cursor.name.clone());
+        values.push(Value::Integer(cursor.row_id));
+        let id_parameter = values.len();
+        filters.push(format!(
+            "(file, line, name, id) >
+             (?{file_parameter}, ?{line_parameter}, ?{name_parameter}, ?{id_parameter})"
+        ));
+    }
+    values.push(Value::Integer(page_size.saturating_add(1) as i64));
+    let limit_parameter = values.len();
+    let where_sql = if filters.is_empty() {
+        "1".to_string()
+    } else {
+        filters.join(" AND ")
+    };
+    let mut statement = match conn.prepare(&format!(
+        "SELECT kind, name, file, line, end_line, role, signature, parent, id
+         FROM symbols WHERE {where_sql}
+         ORDER BY file, line, name, id LIMIT ?{limit_parameter}"
+    )) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("准备游标结构查询失败：{error}"))),
+    };
+    let rows = match statement.query_map(params_from_iter(values.iter()), |row| {
+        Ok((
+            Symbol {
+                kind: row.get(0)?,
+                name: row.get(1)?,
+                file: row.get(2)?,
+                line: row.get::<_, i64>(3)?.max(0) as usize,
+                end_line: row.get::<_, i64>(4)?.max(0) as usize,
+                role: row.get(5)?,
+                signature: row.get(6)?,
+                parent: row.get(7)?,
+            },
+            row.get::<_, i64>(8)?,
+        ))
+    }) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("读取游标结构查询失败：{error}"))),
+    };
+    let mut rows = match rows.collect::<Result<Vec<_>, _>>() {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("解析游标结构查询失败：{error}"))),
+    };
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
+    let next_cursor = if has_more {
+        rows.last().map(|(symbol, row_id)| {
+            encode_structure_cursor(&StructureCursor {
+                version: 1,
+                filter_hash,
+                index_revision,
+                total_matches: total,
+                exact_match,
+                file: symbol.file.clone(),
+                line: symbol.line as i64,
+                name: symbol.name.clone(),
+                row_id: *row_id,
+            })
+        }).transpose()
+    } else {
+        Ok(None)
+    };
+    let next_cursor = match next_cursor {
+        Ok(value) => value,
+        Err(error) => return Some(Err(error)),
+    };
+    Some(Ok((
+        rows.into_iter().map(|(symbol, _)| symbol).collect(),
+        total,
+        next_cursor,
+    )))
+}
+
 fn query_persisted_symbols(
     root: &Path,
     query: &str,
@@ -2259,15 +2539,58 @@ pub fn query_structure(
     page: usize,
     page_size: usize,
 ) -> StructureQueryResult {
+    query_structure_with_cursor(root, query, role, kind, file, page, page_size, None)
+        .expect("without a cursor the structure query retains its in-memory fallback")
+}
+
+pub fn query_structure_with_cursor(
+    root: &Path,
+    query: &str,
+    role: Option<&str>,
+    kind: Option<&str>,
+    file: Option<&str>,
+    page: usize,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<StructureQueryResult, String> {
     let syms = index_project_cached(root);
     #[cfg(not(test))]
     ensure_progressive_indexing(root);
-    let page = page.max(1);
     let page_size = page_size.clamp(1, 200);
+    let cursor = cursor.map(str::trim).filter(|value| !value.is_empty());
+    let page = if cursor.is_some() { 1 } else { page.max(1) };
     let offset = page.saturating_sub(1).saturating_mul(page_size);
-    let persisted = query_persisted_symbols(root, query, role, kind, file, page, page_size)
-        .and_then(Result::ok);
-    let (items, total_matches) = persisted.unwrap_or_else(|| {
+    let filter_hash = structure_filter_hash(root, query, role, kind, file);
+    let decoded_cursor = cursor
+        .map(|value| decode_structure_cursor(value, filter_hash))
+        .transpose()?;
+    let persisted = if page == 1 || decoded_cursor.is_some() {
+        DATA_DIR.get().and_then(|data_dir| {
+            query_persisted_symbols_keyset_at(
+                root,
+                data_dir,
+                query,
+                role,
+                kind,
+                file,
+                decoded_cursor.as_ref(),
+                page_size,
+                filter_hash,
+            )
+        })
+    } else {
+        query_persisted_symbols(root, query, role, kind, file, page, page_size)
+            .map(|result| result.map(|(items, total)| (items, total, None)))
+    };
+    let persisted = match persisted {
+        Some(Ok(value)) => Some(value),
+        Some(Err(error)) => return Err(error),
+        None if decoded_cursor.is_some() => {
+            return Err("持久结构索引不可用，无法安全续读游标；请从第一页重新查询".into())
+        }
+        None => None,
+    };
+    let (items, total_matches, next_cursor) = persisted.unwrap_or_else(|| {
         let q = query.trim().to_lowercase();
         let role = role.map(str::trim).filter(|value| !value.is_empty());
         let kind = kind.map(str::trim).filter(|value| !value.is_empty());
@@ -2296,7 +2619,7 @@ pub fn query_structure(
         });
         let total = matched.len();
         let items = matched.into_iter().skip(offset).take(page_size).cloned().collect();
-        (items, total)
+        (items, total, None)
     });
     let fallback_edges = || {
         let mut edges = containment_edges(&syms)
@@ -2320,7 +2643,10 @@ pub fn query_structure(
     let (relations, indexed_relations) = query_persisted_edges(root, &items)
         .and_then(Result::ok)
         .unwrap_or_else(fallback_edges);
-    let next_page = (offset.saturating_add(page_size) < total_matches).then_some(page + 1);
+    let next_page = decoded_cursor
+        .is_none()
+        .then(|| (offset.saturating_add(page_size) < total_matches).then_some(page + 1))
+        .flatten();
 
     let key = canonical_key(root);
     let now = now_secs();
@@ -2341,13 +2667,14 @@ pub fn query_structure(
         .unwrap_or((0, CatalogStats::default(), 0));
     let coverage = catalog.coverage();
     let progressive = progressive_status(root, catalog.deferred_source_files);
-    StructureQueryResult {
+    Ok(StructureQueryResult {
         items,
         relations,
         total_matches,
         page,
         page_size,
         next_page,
+        next_cursor,
         indexed_files,
         indexed_symbols: persisted_symbol_count(root).unwrap_or(syms.len()),
         indexed_relations,
@@ -2356,7 +2683,7 @@ pub fn query_structure(
         progressive,
         coverage,
         synced_ago_secs,
-    }
+    })
 }
 
 /// 项目级摘要：组件数、页面数、函数数、路由清单（用于 Agent 快速了解工程结构）
@@ -2791,6 +3118,108 @@ struct Detail {
             kind_plan.contains("idx_symbols_kind_order"),
             "按类型浏览应命中覆盖排序的复合索引：{kind_plan}"
         );
+
+        let cursor_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT kind, name, file, line, end_line, role, signature, parent, id
+                 FROM symbols
+                 WHERE kind=?1 AND (file, line, name, id) > (?2, ?3, ?4, ?5)
+                 ORDER BY file, line, name, id LIMIT ?6",
+            )
+            .unwrap()
+            .query_map(
+                params!["component", "src/a.ets", 1, "Page", 1, 20],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            cursor_plan.contains("idx_symbols_kind_order"),
+            "游标续页应从复合索引定位而不是扫描前序页：{cursor_plan}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn keyset_cursor_paginates_without_duplicates_and_binds_filters() {
+        let root = std::env::temp_dir().join(format!(
+            "deveco-symbol-cursor-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-symbol-cursor-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("a.rs"), "struct Alpha {}\nfn alpha() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "struct Beta {}\n").unwrap();
+        let (_, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        scan_file(&root.join("a.rs"), "a.rs", &mut symbols);
+        scan_file(&root.join("b.rs"), "b.rs", &mut symbols);
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+
+        let filter_hash = structure_filter_hash(&root, "", None, None, None);
+        let (first, total, first_cursor) = query_persisted_symbols_keyset_at(
+            &root, &data_dir, "", None, None, None, None, 1, filter_hash,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(total, 3);
+        let first_cursor = first_cursor.expect("第一页之后应返回游标");
+        let decoded = decode_structure_cursor(&first_cursor, filter_hash).unwrap();
+        let (second, _, second_cursor) = query_persisted_symbols_keyset_at(
+            &root,
+            &data_dir,
+            "",
+            None,
+            None,
+            None,
+            Some(&decoded),
+            1,
+            filter_hash,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(first[0].name, second[0].name);
+        assert!(second_cursor.is_some());
+        assert!(decode_structure_cursor(
+            &first_cursor,
+            structure_filter_hash(&root, "different", None, None, None),
+        )
+        .is_err());
+        assert!(decode_structure_cursor("not-a-cursor", filter_hash).is_err());
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        conn.execute(
+            "UPDATE structure_meta SET revision = revision + 1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(query_persisted_symbols_keyset_at(
+            &root,
+            &data_dir,
+            "",
+            None,
+            None,
+            None,
+            Some(&decoded),
+            1,
+            filter_hash,
+        )
+        .unwrap()
+        .is_err());
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
@@ -3352,6 +3781,43 @@ struct Detail {
         .unwrap();
         let deep_page_ms = deep_started.elapsed().as_millis() as u64;
 
+        let cursor_index = requested.saturating_mul(9) / 10;
+        let cursor_index = cursor_index.saturating_sub(1);
+        let cursor_shard = format!("shard_{:04}", cursor_index / 1_000);
+        let cursor_filter_hash = structure_filter_hash(
+            &root,
+            "",
+            None,
+            Some("component"),
+            None,
+        );
+        let cursor = StructureCursor {
+            version: 1,
+            filter_hash: cursor_filter_hash,
+            index_revision: 0,
+            total_matches: requested,
+            exact_match: false,
+            file: format!("{cursor_shard}/file_{cursor_index:07}.ets"),
+            line: 1,
+            name: format!("Page_{cursor_index:07}"),
+            row_id: (cursor_index + cursor_index.div_ceil(4) + 1) as i64,
+        };
+        let cursor_started = std::time::Instant::now();
+        let (cursor_items, _, _) = query_persisted_symbols_keyset_at(
+            &root,
+            &data_dir,
+            "",
+            None,
+            Some("component"),
+            None,
+            Some(&cursor),
+            50,
+            cursor_filter_hash,
+        )
+        .unwrap()
+        .unwrap();
+        let cursor_page_ms = cursor_started.elapsed().as_millis() as u64;
+
         let edge_started = std::time::Instant::now();
         let (edges, edge_total) = query_persisted_edges_at(&root, &data_dir, &exact)
             .unwrap()
@@ -3370,6 +3836,7 @@ struct Detail {
             "exact_query_ms": exact_ms,
             "deep_page": deep_page,
             "deep_page_ms": deep_page_ms,
+            "cursor_page_ms": cursor_page_ms,
             "edge_query_ms": edge_query_ms,
             "database_bytes": database_bytes,
             "platform": std::env::consts::OS,
@@ -3380,6 +3847,7 @@ struct Detail {
         assert_eq!(exact_total, 1);
         assert_eq!(exact[0].name, target_name);
         assert!(!deep_items.is_empty());
+        assert!(!cursor_items.is_empty());
         assert_eq!(edge_total, requested.div_ceil(4));
         assert_eq!(edges.len(), 1);
         std::fs::remove_dir_all(&root).ok();
