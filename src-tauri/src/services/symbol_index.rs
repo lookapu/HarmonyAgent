@@ -97,6 +97,18 @@ pub struct Symbol {
     pub parent: Option<String>,
 }
 
+/// 全局结构图中的关系边。当前只产生语法上可靠的 contains；imports/calls 等待 AST/LSP。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StructureEdge {
+    pub kind: String,
+    pub source_file: String,
+    pub source_name: String,
+    pub source_line: usize,
+    pub target_file: String,
+    pub target_name: String,
+    pub target_line: usize,
+}
+
 fn structure_role(kind: &str) -> &'static str {
     if matches!(kind, "function" | "method") {
         "logic"
@@ -673,6 +685,65 @@ fn insert_symbol_row(transaction: &rusqlite::Transaction<'_>, symbol: &Symbol) -
     Ok(())
 }
 
+fn containment_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
+    let mut parents: HashMap<(&str, &str), Vec<&Symbol>> = HashMap::new();
+    for symbol in symbols.iter().filter(|symbol| symbol.role == "entity") {
+        parents
+            .entry((&symbol.file, &symbol.name))
+            .or_default()
+            .push(symbol);
+    }
+    for candidates in parents.values_mut() {
+        candidates.sort_by_key(|symbol| symbol.line);
+    }
+    let mut edges = Vec::new();
+    for child in symbols {
+        let Some(parent_name) = child.parent.as_deref() else { continue };
+        let Some(candidates) = parents.get(&(child.file.as_str(), parent_name)) else { continue };
+        let Some(parent) = candidates.iter().rev().find(|parent| parent.line <= child.line) else {
+            continue;
+        };
+        if parent.line == child.line && parent.name == child.name {
+            continue;
+        }
+        edges.push(StructureEdge {
+            kind: "contains".into(),
+            source_file: parent.file.clone(),
+            source_name: parent.name.clone(),
+            source_line: parent.line,
+            target_file: child.file.clone(),
+            target_name: child.name.clone(),
+            target_line: child.line,
+        });
+    }
+    edges.sort();
+    edges.dedup();
+    edges
+}
+
+fn insert_edge_row(
+    transaction: &rusqlite::Transaction<'_>,
+    edge: &StructureEdge,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO symbol_edges(
+           kind, source_file, source_name, source_line,
+           target_file, target_name, target_line, shard
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            edge.kind,
+            edge.source_file,
+            edge.source_name,
+            edge.source_line as i64,
+            edge.target_file,
+            edge.target_name,
+            edge.target_line as i64,
+            shard_for(&edge.source_file),
+        ],
+    )?;
+    Ok(())
+}
+
 /// 全量一致性扫描后重建结构节点表。当前轻量解析最多覆盖 MAX_FILES，写入量有明确上限。
 fn replace_all_symbol_rows_at(
     root: &Path,
@@ -699,8 +770,16 @@ fn replace_all_symbol_rows_at(
     if transaction.execute("DELETE FROM symbols", []).is_err() {
         return false;
     }
+    if transaction.execute("DELETE FROM symbol_edges", []).is_err() {
+        return false;
+    }
     for symbol in symbols {
         if insert_symbol_row(&transaction, symbol).is_err() {
+            return false;
+        }
+    }
+    for edge in containment_edges(symbols) {
+        if insert_edge_row(&transaction, &edge).is_err() {
             return false;
         }
     }
@@ -740,6 +819,18 @@ fn replace_changed_symbol_rows_at(
         {
             return false;
         }
+        if transaction
+            .execute(
+                "DELETE FROM symbol_edges
+                 WHERE source_file = ?1 OR target_file = ?1
+                    OR substr(source_file, 1, length(?1) + 1) = ?1 || '/'
+                    OR substr(target_file, 1, length(?1) + 1) = ?1 || '/'",
+                params![rel],
+            )
+            .is_err()
+        {
+            return false;
+        }
         normalized.push(rel);
     }
     for symbol in symbols {
@@ -747,6 +838,11 @@ fn replace_changed_symbol_rows_at(
             symbol.file == *rel || symbol.file.strip_prefix(rel).is_some_and(|tail| tail.starts_with('/'))
         }) && insert_symbol_row(&transaction, symbol).is_err()
         {
+            return false;
+        }
+    }
+    for edge in containment_edges(symbols) {
+        if insert_edge_row(&transaction, &edge).is_err() {
             return false;
         }
     }
@@ -876,6 +972,23 @@ fn collect_files_at(
                  CREATE INDEX IF NOT EXISTS idx_symbols_role_kind ON symbols(role, kind);
                  CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name COLLATE NOCASE);
                  CREATE INDEX IF NOT EXISTS idx_symbols_shard ON symbols(shard);
+                 CREATE TABLE IF NOT EXISTS symbol_edges (
+                   kind TEXT NOT NULL,
+                   source_file TEXT NOT NULL,
+                   source_name TEXT NOT NULL,
+                   source_line INTEGER NOT NULL,
+                   target_file TEXT NOT NULL,
+                   target_name TEXT NOT NULL,
+                   target_line INTEGER NOT NULL,
+                   shard TEXT NOT NULL,
+                   PRIMARY KEY(kind, source_file, source_name, source_line,
+                               target_file, target_name, target_line)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_edges_source
+                   ON symbol_edges(source_file, source_name, source_line);
+                 CREATE INDEX IF NOT EXISTS idx_edges_target
+                   ON symbol_edges(target_file, target_name, target_line);
+                 CREATE INDEX IF NOT EXISTS idx_edges_shard ON symbol_edges(shard);
                  BEGIN IMMEDIATE;",
             )
             .ok()?;
@@ -1497,12 +1610,15 @@ pub fn filter_symbols<'a>(syms: &'a [Symbol], query: &str, kind: Option<&str>) -
 #[derive(Debug, Serialize)]
 pub struct StructureQueryResult {
     pub items: Vec<Symbol>,
+    /// 与当前页节点相连的结构关系；端点可能位于当前页之外。
+    pub relations: Vec<StructureEdge>,
     pub total_matches: usize,
     pub page: usize,
     pub page_size: usize,
     pub next_page: Option<usize>,
     pub indexed_files: usize,
     pub indexed_symbols: usize,
+    pub indexed_relations: usize,
     pub catalog: CatalogStats,
     pub watcher_active: bool,
     pub coverage: String,
@@ -1588,6 +1704,70 @@ fn query_persisted_symbols(
     query_persisted_symbols_at(root, data_dir, query, role, kind, file, page, page_size)
 }
 
+fn query_persisted_edges_at(
+    root: &Path,
+    data_dir: &Path,
+    symbols: &[Symbol],
+) -> Option<Result<(Vec<StructureEdge>, usize), String>> {
+    let conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("打开结构关系库失败：{error}"))),
+    };
+    let total = match conn.query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(value) => value.max(0) as usize,
+        Err(error) => return Some(Err(format!("查询结构关系数量失败：{error}"))),
+    };
+    let mut statement = match conn.prepare(
+        "SELECT kind, source_file, source_name, source_line,
+                target_file, target_name, target_line
+         FROM symbol_edges
+         WHERE (source_file = ?1 AND source_name = ?2 AND source_line = ?3)
+            OR (target_file = ?1 AND target_name = ?2 AND target_line = ?3)",
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("准备结构关系查询失败：{error}"))),
+    };
+    let mut edges = Vec::new();
+    for symbol in symbols {
+        let rows = match statement.query_map(
+            params![symbol.file, symbol.name, symbol.line as i64],
+            |row| {
+                Ok(StructureEdge {
+                    kind: row.get(0)?,
+                    source_file: row.get(1)?,
+                    source_name: row.get(2)?,
+                    source_line: row.get::<_, i64>(3)?.max(0) as usize,
+                    target_file: row.get(4)?,
+                    target_name: row.get(5)?,
+                    target_line: row.get::<_, i64>(6)?.max(0) as usize,
+                })
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(format!("读取结构关系失败：{error}"))),
+        };
+        for row in rows {
+            match row {
+                Ok(edge) => edges.push(edge),
+                Err(error) => return Some(Err(format!("解析结构关系失败：{error}"))),
+            }
+        }
+    }
+    edges.sort();
+    edges.dedup();
+    Some(Ok((edges, total)))
+}
+
+fn query_persisted_edges(
+    root: &Path,
+    symbols: &[Symbol],
+) -> Option<Result<(Vec<StructureEdge>, usize), String>> {
+    let data_dir = DATA_DIR.get()?;
+    query_persisted_edges_at(root, data_dir, symbols)
+}
+
 pub fn query_structure(
     root: &Path,
     query: &str,
@@ -1634,6 +1814,28 @@ pub fn query_structure(
         let items = matched.into_iter().skip(offset).take(page_size).cloned().collect();
         (items, total)
     });
+    let fallback_edges = || {
+        let mut edges = containment_edges(&syms)
+            .into_iter()
+            .filter(|edge| {
+                items.iter().any(|symbol| {
+                    (symbol.file == edge.source_file
+                        && symbol.name == edge.source_name
+                        && symbol.line == edge.source_line)
+                        || (symbol.file == edge.target_file
+                            && symbol.name == edge.target_name
+                            && symbol.line == edge.target_line)
+                })
+            })
+            .collect::<Vec<_>>();
+        let total = containment_edges(&syms).len();
+        edges.sort();
+        edges.dedup();
+        (edges, total)
+    };
+    let (relations, indexed_relations) = query_persisted_edges(root, &items)
+        .and_then(Result::ok)
+        .unwrap_or_else(fallback_edges);
     let next_page = (offset.saturating_add(page_size) < total_matches).then_some(page + 1);
 
     let key = canonical_key(root);
@@ -1656,12 +1858,14 @@ pub fn query_structure(
     let coverage = catalog.coverage();
     StructureQueryResult {
         items,
+        relations,
         total_matches,
         page,
         page_size,
         next_page,
         indexed_files,
         indexed_symbols: syms.len(),
+        indexed_relations,
         catalog,
         watcher_active: crate::services::repo_watcher::is_watching(root),
         coverage,
@@ -2040,6 +2244,62 @@ struct Detail {
         .unwrap();
         assert_eq!(updated[0].name, "new_logic");
         assert!(!updated.iter().any(|symbol| symbol.name == "old_logic"));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn containment_edges_persist_query_and_incrementally_replace() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-edge-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-edge-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let file = root.join("Page.ets");
+        std::fs::write(
+            &file,
+            "@Component\nstruct Page {\n  load() {\n  }\n}\n",
+        )
+        .unwrap();
+        let (_, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        scan_file(&file, "Page.ets", &mut symbols);
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+        let (edges, total) = query_persisted_edges_at(&root, &data_dir, &symbols)
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, "contains");
+        assert_eq!(edges[0].source_name, "Page");
+        assert_eq!(edges[0].target_name, "load");
+
+        std::fs::write(
+            &file,
+            "@Component\nstruct Page {\n  refresh() {\n  }\n}\n",
+        )
+        .unwrap();
+        let mut fresh = Vec::new();
+        scan_file(&file, "Page.ets", &mut fresh);
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            &["Page.ets".into()],
+            &fresh,
+        ));
+        let (updated, updated_total) = query_persisted_edges_at(&root, &data_dir, &fresh)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_total, 1);
+        assert_eq!(updated[0].target_name, "refresh");
+        assert!(!updated.iter().any(|edge| edge.target_name == "load"));
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();

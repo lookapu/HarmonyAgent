@@ -3645,12 +3645,13 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         .map_err(|e| e.to_string())?;
     let mut out = String::new();
     out.push_str(&format!(
-        "结构查询：匹配 {}，第 {} 页（每页 {}）；已解析 {} 个源码文件 / {} 个结构；全库目录发现 {} 个文件（源码 {}，延期 {}，超大 {}，不可读文件/目录 {}/{}，持久化 {}）；watcher={}；coverage={}；索引更新于 {} 秒前。\n",
+        "结构查询：匹配 {}，第 {} 页（每页 {}）；已解析 {} 个源码文件 / {} 个结构 / {} 条关系；全库目录发现 {} 个文件（源码 {}，延期 {}，超大 {}，不可读文件/目录 {}/{}，持久化 {}）；watcher={}；coverage={}；索引更新于 {} 秒前。\n",
         result.total_matches,
         result.page,
         result.page_size,
         result.indexed_files,
         result.indexed_symbols,
+        result.indexed_relations,
         result.catalog.discovered_files,
         result.catalog.source_files,
         result.catalog.deferred_source_files,
@@ -3675,6 +3676,21 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
             "- [{}/{}] {}{}  ({}:{}-{})\n  {}\n",
             s.role, s.kind, s.name, parent, s.file, s.line, s.end_line, s.signature
         ));
+    }
+    if !result.relations.is_empty() {
+        out.push_str("当前页关系：\n");
+        for edge in result.relations {
+            out.push_str(&format!(
+                "- [{}] {} ({}:{}) -> {} ({}:{})\n",
+                edge.kind,
+                edge.source_name,
+                edge.source_file,
+                edge.source_line,
+                edge.target_name,
+                edge.target_file,
+                edge.target_line,
+            ));
+        }
     }
     if let Some(next_page) = result.next_page {
         out.push_str(&format!("还有结果：使用 page={next_page} 读取下一页。\n"));
