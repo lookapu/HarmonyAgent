@@ -1411,6 +1411,19 @@ fn replace_all_symbol_rows_with_files_at(
     {
         return false;
     }
+    if transaction
+        .execute(
+            "DELETE FROM semantic_call_edges
+             WHERE NOT EXISTS (
+               SELECT 1 FROM files f
+               WHERE f.path = semantic_call_edges.source_file AND f.state = 'indexed'
+             )",
+            [],
+        )
+        .is_err()
+    {
+        return false;
+    }
     let mut baseline_files = symbols
         .iter()
         .map(|symbol| symbol.file.as_str())
@@ -1435,6 +1448,33 @@ fn replace_all_symbol_rows_with_files_at(
         if insert_symbol_row(&transaction, symbol).is_err() {
             return false;
         }
+    }
+    if transaction
+        .execute(
+            "DELETE FROM semantic_call_edges
+             WHERE NOT EXISTS (
+               SELECT 1 FROM files f
+               WHERE f.path=semantic_call_edges.source_file AND f.state='indexed'
+                 AND f.size=semantic_call_edges.source_size
+                 AND f.mtime_ns=semantic_call_edges.source_mtime_ns
+             )
+             OR NOT EXISTS (
+               SELECT 1 FROM symbols source
+               WHERE source.file=semantic_call_edges.source_file
+                 AND source.name=semantic_call_edges.source_name
+                 AND source.line=semantic_call_edges.source_line AND source.role='logic'
+             )
+             OR NOT EXISTS (
+               SELECT 1 FROM symbols target
+               WHERE target.file=semantic_call_edges.target_file
+                 AND target.name=semantic_call_edges.target_name
+                 AND target.line=semantic_call_edges.target_line AND target.role='logic'
+             )",
+            [],
+        )
+        .is_err()
+    {
+        return false;
     }
     if replace_module_reexports_for_files(
         &transaction,
@@ -1534,6 +1574,19 @@ fn replace_changed_symbol_rows_at(
                 "DELETE FROM symbol_edges
                  WHERE source_file = ?1
                     OR substr(source_file, 1, length(?1) + 1) = ?1 || '/'",
+                params![rel],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if transaction
+            .execute(
+                "DELETE FROM semantic_call_edges
+                 WHERE source_file = ?1
+                    OR substr(source_file, 1, length(?1) + 1) = ?1 || '/'
+                    OR target_file = ?1
+                    OR substr(target_file, 1, length(?1) + 1) = ?1 || '/'",
                 params![rel],
             )
             .is_err()
@@ -1702,6 +1755,12 @@ where
         transaction
             .execute(
                 "DELETE FROM symbol_edges WHERE source_file=?1",
+                params![rel],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM semantic_call_edges WHERE source_file=?1",
                 params![rel],
             )
             .map_err(|error| error.to_string())?;
@@ -1958,7 +2017,25 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
            PRIMARY KEY(source_file, exported_name, target_module, imported_name)
          );
          CREATE INDEX IF NOT EXISTS idx_reexports_source_name
-           ON module_reexports(source_file, exported_name);",
+           ON module_reexports(source_file, exported_name);
+         CREATE TABLE IF NOT EXISTS semantic_call_edges (
+           source_file TEXT NOT NULL,
+           source_name TEXT NOT NULL,
+           source_line INTEGER NOT NULL,
+           call_line INTEGER NOT NULL,
+           call_column INTEGER NOT NULL,
+           source_size INTEGER NOT NULL,
+           source_mtime_ns INTEGER NOT NULL,
+           target_file TEXT NOT NULL,
+           target_name TEXT NOT NULL,
+           target_line INTEGER NOT NULL,
+           provider TEXT NOT NULL,
+           PRIMARY KEY(source_file, call_line, call_column, provider)
+         );
+         CREATE INDEX IF NOT EXISTS idx_semantic_calls_source
+           ON semantic_call_edges(source_file, source_name, source_line);
+         CREATE INDEX IF NOT EXISTS idx_semantic_calls_target
+           ON semantic_call_edges(target_file, target_name, target_line);",
     )?;
     let columns = conn
         .prepare("PRAGMA table_info(symbols)")?
@@ -2014,6 +2091,38 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    let stats_columns = conn
+        .prepare("PRAGMA table_info(structure_stats)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !stats_columns
+        .iter()
+        .any(|column| column == "semantic_relation_count")
+    {
+        conn.execute(
+            "ALTER TABLE structure_stats
+             ADD COLUMN semantic_relation_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE structure_stats SET semantic_relation_count=(
+               SELECT COUNT(*) FROM semantic_call_edges
+             ) WHERE id=1",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS trg_semantic_call_edges_insert
+           AFTER INSERT ON semantic_call_edges BEGIN
+             UPDATE structure_stats
+             SET semantic_relation_count=semantic_relation_count + 1 WHERE id=1;
+           END;
+         CREATE TRIGGER IF NOT EXISTS trg_semantic_call_edges_delete
+           AFTER DELETE ON semantic_call_edges BEGIN
+             UPDATE structure_stats
+             SET semantic_relation_count=MAX(0, semantic_relation_count - 1) WHERE id=1;
+           END;",
+    )?;
     let parser_version = conn.query_row(
         "SELECT parser_version FROM structure_meta WHERE id=1",
         [],
@@ -2024,6 +2133,7 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         transaction.execute("DELETE FROM symbol_edges", [])?;
         transaction.execute("DELETE FROM symbols", [])?;
         transaction.execute("DELETE FROM module_reexports", [])?;
+        transaction.execute("DELETE FROM semantic_call_edges", [])?;
         transaction.execute("UPDATE files SET state='deferred' WHERE state='indexed'", [])?;
         transaction.execute(
             "UPDATE structure_meta
@@ -2117,9 +2227,28 @@ fn collect_files_at_with_budget(
                  );
                  CREATE INDEX IF NOT EXISTS idx_reexports_source_name
                    ON module_reexports(source_file, exported_name);
+                 CREATE TABLE IF NOT EXISTS semantic_call_edges (
+                   source_file TEXT NOT NULL,
+                   source_name TEXT NOT NULL,
+                   source_line INTEGER NOT NULL,
+                   call_line INTEGER NOT NULL,
+                   call_column INTEGER NOT NULL,
+                   source_size INTEGER NOT NULL,
+                   source_mtime_ns INTEGER NOT NULL,
+                   target_file TEXT NOT NULL,
+                   target_name TEXT NOT NULL,
+                   target_line INTEGER NOT NULL,
+                   provider TEXT NOT NULL,
+                   PRIMARY KEY(source_file, call_line, call_column, provider)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_semantic_calls_source
+                   ON semantic_call_edges(source_file, source_name, source_line);
+                 CREATE INDEX IF NOT EXISTS idx_semantic_calls_target
+                   ON semantic_call_edges(target_file, target_name, target_line);
                  CREATE TABLE IF NOT EXISTS structure_stats (
                    id INTEGER PRIMARY KEY CHECK(id = 1),
-                   relation_count INTEGER NOT NULL DEFAULT 0
+                   relation_count INTEGER NOT NULL DEFAULT 0,
+                   semantic_relation_count INTEGER NOT NULL DEFAULT 0
                  );
                  INSERT OR IGNORE INTO structure_stats(id, relation_count)
                    SELECT 1, COUNT(*) FROM symbol_edges;
@@ -2130,6 +2259,16 @@ fn collect_files_at_with_budget(
                  CREATE TRIGGER IF NOT EXISTS trg_symbol_edges_delete
                    AFTER DELETE ON symbol_edges BEGIN
                      UPDATE structure_stats SET relation_count = MAX(0, relation_count - 1) WHERE id = 1;
+                   END;
+                 CREATE TRIGGER IF NOT EXISTS trg_semantic_call_edges_insert
+                   AFTER INSERT ON semantic_call_edges BEGIN
+                     UPDATE structure_stats
+                     SET semantic_relation_count=semantic_relation_count + 1 WHERE id=1;
+                   END;
+                 CREATE TRIGGER IF NOT EXISTS trg_semantic_call_edges_delete
+                   AFTER DELETE ON semantic_call_edges BEGIN
+                     UPDATE structure_stats
+                     SET semantic_relation_count=MAX(0, semantic_relation_count - 1) WHERE id=1;
                    END;
                  CREATE TABLE IF NOT EXISTS structure_meta (
                    id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -3775,7 +3914,8 @@ fn query_persisted_edges_at(
         Ok(value) => value,
         Err(error) => return Some(Err(format!("打开结构关系库失败：{error}"))),
     };
-    let total = match conn.query_row("SELECT relation_count FROM structure_stats WHERE id=1", [], |row| {
+    let total = match conn.query_row("SELECT relation_count + semantic_relation_count
+                                      FROM structure_stats WHERE id=1", [], |row| {
         row.get::<_, i64>(0)
     }) {
         Ok(value) => value.max(0) as usize,
@@ -3821,6 +3961,58 @@ fn query_persisted_edges_at(
             }
         }
     }
+    let mut semantic_statement = match conn.prepare(
+        "SELECT e.source_file, e.source_name, e.source_line,
+                e.target_file, e.target_name, e.target_line
+         FROM semantic_call_edges e
+         WHERE EXISTS (
+           SELECT 1 FROM files f
+           WHERE f.path=e.source_file AND f.state='indexed'
+             AND f.size=e.source_size AND f.mtime_ns=e.source_mtime_ns
+         )
+         AND EXISTS (
+           SELECT 1 FROM symbols source
+           WHERE source.file=e.source_file AND source.name=e.source_name
+             AND source.line=e.source_line AND source.role='logic'
+         )
+         AND EXISTS (
+           SELECT 1 FROM symbols target
+           WHERE target.file=e.target_file AND target.name=e.target_name
+             AND target.line=e.target_line AND target.role='logic'
+         )
+         AND ((e.source_file=?1 AND e.source_name=?2 AND e.source_line=?3)
+           OR (e.target_file=?1 AND e.target_name=?2 AND e.target_line=?3))",
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("准备语义调用关系查询失败：{error}"))),
+    };
+    for symbol in symbols {
+        let rows = match semantic_statement.query_map(
+            params![symbol.file, symbol.name, symbol.line as i64],
+            |row| {
+                Ok(StructureEdge {
+                    kind: "calls".into(),
+                    source_file: row.get(0)?,
+                    source_name: row.get(1)?,
+                    source_line: row.get::<_, i64>(2)?.max(0) as usize,
+                    target_file: row.get(3)?,
+                    target_name: row.get(4)?,
+                    target_line: row.get::<_, i64>(5)?.max(0) as usize,
+                    target_module: None,
+                    target_imported_name: None,
+                })
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(format!("读取语义调用关系失败：{error}"))),
+        };
+        for row in rows {
+            match row {
+                Ok(edge) => edges.push(edge),
+                Err(error) => return Some(Err(format!("解析语义调用关系失败：{error}"))),
+            }
+        }
+    }
     let aliases = load_module_aliases(root, edges.iter().map(|edge| edge.source_file.as_str()));
     for edge in &mut edges {
         resolve_import_target_from_catalog(root, &conn, Some(&aliases), edge);
@@ -3846,6 +4038,171 @@ fn query_persisted_edges(
 ) -> Option<Result<(Vec<StructureEdge>, usize), String>> {
     let data_dir = DATA_DIR.get()?;
     query_persisted_edges_at(root, data_dir, symbols)
+}
+
+fn utf16_column_to_byte(line: &str, utf16_column: usize) -> usize {
+    let mut units = 0usize;
+    for (byte, ch) in line.char_indices() {
+        if units >= utf16_column {
+            return byte;
+        }
+        units += ch.len_utf16();
+        if units > utf16_column {
+            return byte;
+        }
+    }
+    line.len()
+}
+
+fn is_call_callee_position(path: &Path, line: usize, utf16_column: usize) -> bool {
+    let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(language) = tree_sitter_language(ext) else {
+        return false;
+    };
+    let Some(content) = fs::metadata(path)
+        .ok()
+        .filter(|metadata| metadata.len() <= MAX_BYTES)
+        .and_then(|_| fs::read_to_string(path).ok())
+    else {
+        return false;
+    };
+    let Some(line_text) = content.lines().nth(line) else {
+        return false;
+    };
+    let point = tree_sitter::Point::new(line, utf16_column_to_byte(line_text, utf16_column));
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(&content, None) else {
+        return false;
+    };
+    let Some(mut node) = tree.root_node().descendant_for_point_range(point, point) else {
+        return false;
+    };
+    loop {
+        if node.kind() == "call_expression" {
+            return node
+                .child_by_field_name("function")
+                .filter(|function| function.kind() == "member_expression")
+                .and_then(|function| function.child_by_field_name("property"))
+                .is_some_and(|property| {
+                    matches!(
+                        property.kind(),
+                        "property_identifier" | "private_property_identifier"
+                    )
+                        && property.start_position() <= point
+                        && point <= property.end_position()
+                });
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn record_lsp_call_definition_at(
+    root: &Path,
+    data_dir: &Path,
+    source_path: &Path,
+    source_line: usize,
+    source_column: usize,
+    target_path: &Path,
+    target_line: usize,
+) -> bool {
+    if !is_call_callee_position(source_path, source_line, source_column) {
+        return false;
+    }
+    let (Ok(source_rel), Ok(target_rel)) = (
+        source_path.strip_prefix(root),
+        target_path.strip_prefix(root),
+    ) else {
+        return false;
+    };
+    let source_rel = source_rel.to_string_lossy().replace('\\', "/");
+    let target_rel = target_rel.to_string_lossy().replace('\\', "/");
+    let Some(stamp) = file_stamp(source_path) else {
+        return false;
+    };
+    let conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let source_position = source_line.saturating_add(1) as i64;
+    let caller = conn
+        .query_row(
+            "SELECT name, line FROM symbols
+             WHERE file=?1 AND role='logic' AND line<=?2 AND end_line>=?2
+             ORDER BY (end_line-line), line DESC LIMIT 1",
+            params![source_rel, source_position],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .ok();
+    let target_position = target_line.saturating_add(1) as i64;
+    let target = conn
+        .query_row(
+            "SELECT name, line FROM symbols
+             WHERE file=?1 AND role='logic' AND line<=?2 AND end_line>=?2
+             ORDER BY CASE WHEN line=?2 THEN 0 ELSE 1 END,
+                      (end_line-line), line DESC LIMIT 1",
+            params![target_rel, target_position],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .ok();
+    let (Some((source_name, source_symbol_line)), Some((target_name, target_symbol_line))) =
+        (caller, target)
+    else {
+        return false;
+    };
+    conn.execute(
+        "INSERT INTO semantic_call_edges(
+           source_file, source_name, source_line, call_line, call_column,
+           source_size, source_mtime_ns, target_file, target_name, target_line, provider
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'arkts_lsp')
+         ON CONFLICT(source_file, call_line, call_column, provider) DO UPDATE SET
+           source_name=excluded.source_name, source_line=excluded.source_line,
+           source_size=excluded.source_size, source_mtime_ns=excluded.source_mtime_ns,
+           target_file=excluded.target_file, target_name=excluded.target_name,
+           target_line=excluded.target_line",
+        params![
+            source_rel,
+            source_name,
+            source_symbol_line,
+            source_position,
+            source_column.saturating_add(1) as i64,
+            stamp.len as i64,
+            stamp.mtime as i64,
+            target_rel,
+            target_name,
+            target_symbol_line,
+        ],
+    )
+    .is_ok()
+}
+
+pub(crate) fn record_lsp_call_definition(
+    root: &Path,
+    source_path: &Path,
+    source_line: usize,
+    source_column: usize,
+    target_path: &Path,
+    target_line: usize,
+) -> bool {
+    let Some(data_dir) = DATA_DIR.get() else {
+        return false;
+    };
+    record_lsp_call_definition_at(
+        root,
+        data_dir,
+        source_path,
+        source_line,
+        source_column,
+        target_path,
+        target_line,
+    )
 }
 
 fn persisted_symbol_count(root: &Path) -> Option<usize> {
@@ -4550,7 +4907,12 @@ class Service extends BaseService implements Loadable, Disposable {}
                id INTEGER PRIMARY KEY AUTOINCREMENT, file TEXT NOT NULL, kind TEXT NOT NULL,
                name TEXT NOT NULL, line INTEGER NOT NULL, end_line INTEGER NOT NULL,
                role TEXT NOT NULL, signature TEXT NOT NULL, parent TEXT, shard TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE structure_stats (
+               id INTEGER PRIMARY KEY CHECK(id = 1),
+               relation_count INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO structure_stats(id, relation_count) VALUES(1, 0);",
         )
         .unwrap();
         drop(conn);
@@ -4567,6 +4929,16 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert!(columns.iter().any(|column| column == "language"));
         assert!(columns.iter().any(|column| column == "source_layer"));
         assert!(columns.iter().any(|column| column == "declared_relations"));
+        let stats_columns = conn
+            .prepare("PRAGMA table_info(structure_stats)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(stats_columns
+            .iter()
+            .any(|column| column == "semantic_relation_count"));
         let edge_columns = conn
             .prepare("PRAGMA table_info(symbol_edges)")
             .unwrap()
@@ -4587,6 +4959,15 @@ class Service extends BaseService implements Loadable, Disposable {}
             )
             .unwrap();
         assert_eq!(reexport_table, 1);
+        let semantic_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='semantic_call_edges'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_table, 1);
         let parser_version: i64 = conn
             .query_row(
                 "SELECT parser_version FROM structure_meta WHERE id=1",
@@ -5328,6 +5709,142 @@ class Service extends BaseService implements Loadable, Disposable {}
             .declared_relations
             .iter()
             .any(|relation| relation.kind == "calls" && relation.target_name == "helper"));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn lsp_definition_records_fresh_member_call_evidence() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-lsp-call-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-lsp-call-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let source_file = root.join("service.ts");
+        let target_file = root.join("client.ts");
+        let source = "export class Service {\n  run() { client.fetch(); }\n}\n";
+        std::fs::write(&source_file, source).unwrap();
+        std::fs::write(
+            &target_file,
+            "export class Client {\n  fetch() {}\n}\n",
+        )
+        .unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+        let call_column = source.lines().nth(1).unwrap().find("fetch").unwrap();
+        assert!(record_lsp_call_definition_at(
+            &root,
+            &data_dir,
+            &source_file,
+            1,
+            call_column,
+            &target_file,
+            1,
+        ));
+        assert!(!record_lsp_call_definition_at(
+            &root,
+            &data_dir,
+            &source_file,
+            0,
+            13,
+            &target_file,
+            1,
+        ));
+        let object_column = source.lines().nth(1).unwrap().find("client").unwrap();
+        assert!(!record_lsp_call_definition_at(
+            &root,
+            &data_dir,
+            &source_file,
+            1,
+            object_column,
+            &target_file,
+            1,
+        ));
+        let run = symbols
+            .iter()
+            .find(|symbol| symbol.name == "run")
+            .cloned()
+            .unwrap();
+        let (edges, total) = query_persisted_edges_at(&root, &data_dir, &[run.clone()])
+            .unwrap()
+            .unwrap();
+        assert!(edges.iter().any(|edge| {
+            edge.kind == "calls"
+                && edge.source_name == "run"
+                && edge.target_file == "client.ts"
+                && edge.target_name == "fetch"
+        }));
+        assert!(total >= 2, "contains 与语义 calls 都应计入关系总数");
+
+        std::fs::write(
+            &target_file,
+            "export class Client {\n  renamed() {}\n}\n",
+        )
+        .unwrap();
+        let mut changed_target_symbols = Vec::new();
+        scan_file(&target_file, "client.ts", &mut changed_target_symbols);
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            &["client.ts".into()],
+            &changed_target_symbols,
+        ));
+        let (invalid_target, _) = query_persisted_edges_at(&root, &data_dir, &[run.clone()])
+            .unwrap()
+            .unwrap();
+        assert!(invalid_target
+            .iter()
+            .all(|edge| !(edge.kind == "calls" && edge.target_name == "fetch")));
+
+        std::fs::write(
+            &target_file,
+            "export class Client {\n  fetch() {}\n}\n",
+        )
+        .unwrap();
+        let mut restored_target_symbols = Vec::new();
+        scan_file(&target_file, "client.ts", &mut restored_target_symbols);
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            &["client.ts".into()],
+            &restored_target_symbols,
+        ));
+        assert!(record_lsp_call_definition_at(
+            &root,
+            &data_dir,
+            &source_file,
+            1,
+            call_column,
+            &target_file,
+            1,
+        ));
+
+        std::fs::write(
+            &source_file,
+            "export class Service {\n  run() { client.otherLonger(); }\n}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_catalog_changes_at(&root, &data_dir, &["service.ts".into()]),
+            CatalogDelta::Updated(_)
+        ));
+        let (stale_safe, _) = query_persisted_edges_at(&root, &data_dir, &[run])
+            .unwrap()
+            .unwrap();
+        assert!(stale_safe
+            .iter()
+            .all(|edge| !(edge.kind == "calls" && edge.target_name == "fetch")));
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();

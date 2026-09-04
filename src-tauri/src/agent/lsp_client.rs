@@ -411,6 +411,32 @@ pub(super) async fn lsp_definition(args: &Value, roots: &[String], conversation_
         }), std::time::Duration::from_secs(20))
         .await?;
     let items = res.as_array().cloned().unwrap_or_else(|| vec![res]);
+    if items.len() == 1 {
+        let location = &items[0];
+        let uri = location["targetUri"]
+            .as_str()
+            .or_else(|| location["uri"].as_str());
+        let range = location["targetRange"]
+            .as_object()
+            .or_else(|| location["range"].as_object());
+        if let (Some(target), Some(range)) = (uri.and_then(uri_to_path), range) {
+            if let Some(root) = roots
+                .iter()
+                .map(PathBuf::from)
+                .find(|root| path.starts_with(root) && target.starts_with(root))
+            {
+                let target_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
+                let _ = crate::services::symbol_index::record_lsp_call_definition(
+                    &root,
+                    &path,
+                    line,
+                    column,
+                    &target,
+                    target_line,
+                );
+            }
+        }
+    }
     Ok(format!("符号定义（{} 处）：\n{}", items.len(), render_locations(&items)))
 }
 
