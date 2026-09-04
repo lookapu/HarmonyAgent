@@ -4323,13 +4323,13 @@ export default function Home() {
                       className="flex-1 min-w-0 bg-[var(--bg-primary)] border border-[var(--accent)] rounded-md px-2 py-1 text-[13px] outline-none"
                     />
                   ) : sidebarCollapsed ? (
-                    <button
+                    <IconButton
+                      icon="chat"
+                      label={c.title}
+                      iconSize={15}
+                      className="h-8 w-8"
                       onClick={() => openConversation(c.id)}
-                      title={c.title}
-                      className={`w-8 h-8 flex items-center justify-center rounded-lg ${active ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'}`}
-                    >
-                      <Icon name="chat" size={15} />
-                    </button>
+                    />
                   ) : (
                     <>
                       <button onClick={() => openConversation(c.id)} className="flex-1 min-w-0 text-left">
@@ -4583,15 +4583,21 @@ export default function Home() {
             )}
           </div>
           <LangToggle />
-          <button
+          <IconButton
+            icon={themeResolved === 'dark' ? 'sun' : 'moon'}
+            label={t('home.theme')}
+            pad="lg"
+            iconSize={15}
+            className={sidebarCollapsed ? 'h-9 w-9' : undefined}
             onClick={toggleTheme}
-            title={t('home.theme')}
-            className={`p-2 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 flex items-center justify-center' : ''}`}
-          >
-            <Icon name={themeResolved === 'dark' ? 'sun' : 'moon'} size={15} />
-          </button>
+          />
           <NotificationBell fixed />
-          <button
+          <IconButton
+            icon={sidebarCollapsed ? 'chevron-right' : 'chevron-left'}
+            label={sidebarCollapsed ? t('home.expandSidebar') : t('home.collapseSidebar')}
+            pad="lg"
+            iconSize={15}
+            className={sidebarCollapsed ? 'mt-1 h-9 w-9' : undefined}
             onClick={() =>
               setSidebarCollapsed((v) => {
                 const next = !v
@@ -4599,11 +4605,7 @@ export default function Home() {
                 return next
               })
             }
-            title={sidebarCollapsed ? t('home.expandSidebar') : t('home.collapseSidebar')}
-            className={`p-2 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 flex items-center justify-center mt-1' : ''}`}
-          >
-            <Icon name={sidebarCollapsed ? 'chevron-right' : 'chevron-left'} size={15} />
-          </button>
+          />
         </div>
         </div>
       </aside>
@@ -8473,7 +8475,7 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
             </div>
             <h2 className="text-[14px] font-semibold">{t('home.batch')}</h2>
           </div>
-          {/* h-6 w-6 锁死 24px 盒：默认 pad + 13px 图标 + 2px 透明边框只会给到 23px */}
+          {/* h-6 w-6 锁死 24px 盒：裸 IconButton 只有 13px 图标 + 8px padding = 21px */}
           <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
         </div>
 

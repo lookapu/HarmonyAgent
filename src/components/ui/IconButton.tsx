@@ -7,6 +7,11 @@
  * hoverTone 只提供**底色**反馈，不提供文字色：Icon 是 <img> + filter 实现，
  * 只有「原色 / 反白」两种状态，无法跟随 tone 任意着色（见计划里的 Icon 批次说明）。
  * 所以这里不写 hover:text-* —— 按钮内没有文字，写了是死类。
+ *
+ * 裸按钮（box=false）**不带 border**：Tailwind preflight 把所有元素重置成
+ * `border: 0 solid`，被替换掉的那些手写按钮本来就是无边框的；写 border-transparent
+ * 会让每一颗悄悄长大 2px（p-1 + 14px 图标：22px → 24px）。
+ * 代价是 box 与裸按钮现在相差 2px，**同一行里不要混用**。
  */
 
 import type { ButtonHTMLAttributes } from 'react'
@@ -24,6 +29,7 @@ const padCls = {
   xs: 'p-0.5',
   sm: 'p-1',
   md: 'p-1.5',
+  lg: 'p-2',
 } as const
 
 export interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -58,7 +64,7 @@ export function IconButton({
         'inline-flex shrink-0 items-center justify-center rounded-md text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-45',
         box
           ? 'border border-[var(--border)] bg-[var(--bg-card)]'
-          : 'border border-transparent bg-transparent',
+          : 'bg-transparent',
         padCls[pad],
         hoverCls[hoverTone],
         className,

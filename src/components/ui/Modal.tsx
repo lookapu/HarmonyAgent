@@ -134,8 +134,7 @@ export function Modal({
               <IconButton
                 icon="close"
                 label={t('common.close')}
-                pad="xs"
-                iconSize={12}
+                iconSize={13}
                 onClick={onClose}
                 className={cn(title == null && 'ml-auto')}
               />
