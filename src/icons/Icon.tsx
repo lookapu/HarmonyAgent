@@ -48,6 +48,8 @@ import apps from './apps.svg'
 import image from './image.svg'
 import videocam from './videocam.svg'
 import mic from './mic.svg'
+import login from './login.svg'
+import logout from './logout.svg'
 
 export const icons = {
   bolt,
@@ -100,6 +102,8 @@ export const icons = {
   image,
   videocam,
   mic,
+  login,
+  logout,
 } as const
 
 export type IconName = keyof typeof icons
