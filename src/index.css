@@ -106,7 +106,11 @@
   --app-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.45);
   --app-shadow-xl: 0 12px 32px rgba(0, 0, 0, 0.50);
   --app-shadow-2xl: 0 16px 40px rgba(0, 0, 0, 0.55);
-  --app-ring: 0 0 0 3px var(--accent-soft);
+
+  /* 键盘焦点环。表达式与主题无关（靠 --accent-500 取色），故只在 :root 声明一份。
+     不用 --accent-soft：那个 token 的透明度是为大面积底色调的（5%~14%），
+     做成 2px 细环在两套主题下都看不见。 */
+  --app-ring: 0 0 0 2px color-mix(in srgb, var(--accent-500) 28%, transparent);
 
   /* 动效常量：统一在 CSS 里管理，避免组件各自写魔法数 */
   --app-motion-fast: 0.12s;
@@ -208,9 +212,8 @@
   --app-shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.10);
   --app-shadow-xl: 0 12px 32px rgba(15, 23, 42, 0.12);
   --app-shadow-2xl: 0 16px 40px rgba(15, 23, 42, 0.14);
-  --app-ring: 0 0 0 3px var(--accent-soft);
 
-  /* 动效、圆角、字号阶梯、等宽字体都与主题无关，由 :root 统一提供，此处不再重复声明。
+  /* 动效、圆角、字号阶梯、焦点环、等宽字体都与主题无关，由 :root 统一提供，此处不再重复声明。
      此前这里重复了一份完全相同的值，改阶梯时极易只改一边。 */
 }
 
@@ -428,16 +431,28 @@ button:active:not(:disabled) {
   transform: scale(0.97);
 }
 
-/* 输入类控件不加全局 box-shadow 环：无圆角的 textarea（如聊天输入框）会画出方形边框，
-   与容器 rounded-2xl 圆角不匹配；它们的焦点反馈由各自的 focus:border / focus-within 提供 */
+/* 键盘焦点兜底。必须整段替换而不是追加：下面这些规则要保持「无层」，
+   才压得过 tsx 里约 100 处 outline-none（那些本来只是为了干掉浏览器默认的丑环）。
+   只用 :focus-visible 而非 :focus，鼠标点击不会触发，不干扰日常观感。
+
+   输入类走 border + ring 而不是 outline：聊天 textarea 是直角的，outline 会在
+   rounded 容器里画出一个方框；ring 的取值见 --app-ring。
+
+   [tabindex='-1'] 刻意排除：那是程序化聚焦的落点（模态容器、焦点陷阱），
+   给它画环会在打开弹窗时闪出一个无意义的框。 */
+button:focus-visible,
+a:focus-visible,
+[role='button']:focus-visible,
+summary:focus-visible,
+[tabindex]:not([tabindex='-1']):focus-visible {
+  outline: 2px solid var(--accent-500);
+  outline-offset: 1px;
+}
 input:focus-visible,
 textarea:focus-visible,
-select:focus-visible,
-button:focus-visible {
+select:focus-visible {
   outline: none;
-}
-/* 仅按钮保留键盘导航焦点环（按钮均带圆角，环会跟随圆角） */
-button:focus-visible {
+  border-color: var(--accent-500);
   box-shadow: var(--app-ring);
 }
 
