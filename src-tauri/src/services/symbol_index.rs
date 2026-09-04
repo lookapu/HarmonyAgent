@@ -28,7 +28,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 7;
+const STRUCTURE_PARSER_VERSION: i64 = 8;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -378,7 +378,6 @@ fn named_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> HashMap<String, 
         let Some(module_specifier) = import_node
             .child_by_field_name("source")
             .and_then(|source_node| string_literal_value(source_node, source))
-            .filter(|value| value.starts_with('.'))
         else {
             continue;
         };
@@ -1115,6 +1114,7 @@ fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
 fn insert_edge_row(
     transaction: &rusqlite::Transaction<'_>,
     edge: &StructureEdge,
+    aliases: Option<&TsconfigAliases>,
 ) -> rusqlite::Result<()> {
     let mut target_file = edge.target_file.clone();
     let mut target_name = edge.target_name.clone();
@@ -1123,7 +1123,7 @@ fn insert_edge_row(
         edge.target_module.as_deref(),
         edge.target_imported_name.as_deref(),
     ) {
-        if let Some(resolved_file) = resolve_relative_module_file(transaction, &edge.source_file, module) {
+        if let Some(resolved_file) = resolve_module_file(transaction, &edge.source_file, module, aliases) {
             target_file = resolved_file;
             target_name = imported.to_string();
             // Imported targets are rebound on every query so external edits cannot stale the line.
@@ -1225,8 +1225,9 @@ fn replace_all_symbol_rows_at(
             return false;
         }
     }
+    let aliases = load_tsconfig_aliases(root);
     for edge in structure_edges(symbols) {
-        if insert_edge_row(&transaction, &edge).is_err() {
+        if insert_edge_row(&transaction, &edge, aliases.as_ref()).is_err() {
             return false;
         }
     }
@@ -1296,8 +1297,9 @@ fn replace_changed_symbol_rows_at(
             return false;
         }
     }
+    let aliases = load_tsconfig_aliases(root);
     for edge in structure_edges(symbols) {
-        if insert_edge_row(&transaction, &edge).is_err() {
+        if insert_edge_row(&transaction, &edge, aliases.as_ref()).is_err() {
             return false;
         }
     }
@@ -1415,6 +1417,7 @@ where
         .map_err(|error| error.to_string())?;
     let lock_wait_ms = lock_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let mut promoted = 0usize;
+    let aliases = load_tsconfig_aliases(root);
     for (rel, expected, symbols) in parsed {
         let updated = transaction
             .execute(
@@ -1439,7 +1442,8 @@ where
             insert_symbol_row(&transaction, symbol).map_err(|error| error.to_string())?;
         }
         for edge in structure_edges(&symbols) {
-            insert_edge_row(&transaction, &edge).map_err(|error| error.to_string())?;
+            insert_edge_row(&transaction, &edge, aliases.as_ref())
+                .map_err(|error| error.to_string())?;
         }
         promoted += 1;
     }
@@ -2083,8 +2087,8 @@ struct PersistedIndex {
     catalog: CatalogStats,
 }
 
-// v9 persists import evidence on graph edges for fresh query-time target binding.
-const PERSIST_VERSION: u32 = 9;
+// v10 retains bare import evidence so strict tsconfig path aliases can be resolved.
+const PERSIST_VERSION: u32 = 10;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -2967,32 +2971,40 @@ fn query_persisted_symbols(
     query_persisted_symbols_at(root, data_dir, query, role, kind, file, page, page_size)
 }
 
-fn relative_module_candidates(source_file: &str, module_specifier: &str) -> Vec<String> {
-    if !module_specifier.starts_with('.') || module_specifier.contains('\\') {
-        return Vec::new();
+fn normalize_project_path(base: &str, value: &str) -> Option<String> {
+    if value.contains('\\') || value.starts_with('/') {
+        return None;
     }
-    let mut parts = source_file
+    let mut parts = base
         .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>();
-    parts.pop();
-    for part in module_specifier.split('/') {
+    for part in value.split('/') {
         match part {
             "" | "." => {}
             ".." => {
                 if parts.pop().is_none() {
-                    return Vec::new();
+                    return None;
                 }
             }
             value if value != "." && value != ".." => parts.push(value),
-            _ => return Vec::new(),
+            _ => return None,
         }
     }
-    let base = parts.join("/");
+    let normalized = parts.join("/");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn source_parent(source_file: &str) -> &str {
+    source_file.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
+}
+
+fn module_file_candidates(base: &str) -> Vec<String> {
     if base.is_empty() {
         return Vec::new();
     }
     if Path::new(&base).extension().is_some() {
-        return vec![base];
+        return vec![base.to_string()];
     }
     let mut candidates = Vec::new();
     for extension in ["ets", "ts", "tsx", "js", "jsx"] {
@@ -3002,12 +3014,125 @@ fn relative_module_candidates(source_file: &str, module_specifier: &str) -> Vec<
     candidates
 }
 
-fn resolve_relative_module_file(
+#[derive(Debug, Clone)]
+struct TsconfigPathRule {
+    pattern: String,
+    replacements: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TsconfigAliases {
+    base_dir: String,
+    rules: Vec<TsconfigPathRule>,
+}
+
+fn load_tsconfig_aliases(root: &Path) -> Option<TsconfigAliases> {
+    let path = root.join("tsconfig.json");
+    let content = fs::read_to_string(path).ok()?;
+    let value = crate::services::harmony::parse_json5(&content).ok()?;
+    let compiler = value.get("compilerOptions")?.as_object()?;
+    let base_url = compiler
+        .get("baseUrl")
+        .and_then(|value| value.as_str())
+        .unwrap_or(".");
+    let base_dir = normalize_project_path("", base_url).unwrap_or_default();
+    let paths = compiler.get("paths")?.as_object()?;
+    let mut rules = Vec::new();
+    for (pattern, replacements) in paths {
+        let replacements = replacements
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        if !replacements.is_empty() && pattern.matches('*').count() <= 1 {
+            rules.push(TsconfigPathRule { pattern: pattern.clone(), replacements });
+        }
+    }
+    (!rules.is_empty()).then_some(TsconfigAliases { base_dir, rules })
+}
+
+fn alias_replacements(aliases: &TsconfigAliases, module_specifier: &str) -> Vec<String> {
+    let exact = aliases
+        .rules
+        .iter()
+        .filter(|rule| !rule.pattern.contains('*') && rule.pattern == module_specifier)
+        .collect::<Vec<_>>();
+    let matched = if exact.len() == 1 {
+        exact
+    } else if exact.is_empty() {
+        let wildcard = aliases
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                let (prefix, suffix) = rule.pattern.split_once('*')?;
+                module_specifier
+                    .strip_prefix(prefix)?
+                    .strip_suffix(suffix)
+                    .map(|capture| (rule, capture, prefix.len() + suffix.len()))
+            })
+            .collect::<Vec<_>>();
+        let Some(best) = wildcard.iter().map(|(_, _, score)| *score).max() else {
+            return Vec::new();
+        };
+        let best = wildcard
+            .into_iter()
+            .filter(|(_, _, score)| *score == best)
+            .collect::<Vec<_>>();
+        if best.len() != 1 {
+            return Vec::new();
+        }
+        let (rule, capture, _) = best[0];
+        return rule
+            .replacements
+            .iter()
+            .filter_map(|replacement| {
+                normalize_project_path(
+                    &aliases.base_dir,
+                    &replacement.replacen('*', capture, 1),
+                )
+            })
+            .collect();
+    } else {
+        return Vec::new();
+    };
+    matched[0]
+        .replacements
+        .iter()
+        .filter_map(|replacement| normalize_project_path(&aliases.base_dir, replacement))
+        .collect()
+}
+
+fn module_candidates(
+    source_file: &str,
+    module_specifier: &str,
+    aliases: Option<&TsconfigAliases>,
+) -> Vec<String> {
+    let bases = if module_specifier.starts_with('.') {
+        normalize_project_path(source_parent(source_file), module_specifier)
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        aliases
+            .map(|config| alias_replacements(config, module_specifier))
+            .unwrap_or_default()
+    };
+    let mut candidates = bases
+        .iter()
+        .flat_map(|base| module_file_candidates(base))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn resolve_module_file(
     conn: &Connection,
     source_file: &str,
     module_specifier: &str,
+    aliases: Option<&TsconfigAliases>,
 ) -> Option<String> {
-    let candidates = relative_module_candidates(source_file, module_specifier);
+    let candidates = module_candidates(source_file, module_specifier, aliases);
     if candidates.is_empty() {
         return None;
     }
@@ -3034,14 +3159,19 @@ fn resolve_relative_module_file(
     existing.into_iter().next()
 }
 
-fn resolve_import_target_from_catalog(conn: &Connection, edge: &mut StructureEdge) {
+fn resolve_import_target_from_catalog(
+    conn: &Connection,
+    aliases: Option<&TsconfigAliases>,
+    edge: &mut StructureEdge,
+) {
     let (Some(module_specifier), Some(imported_name)) = (
         edge.target_module.as_deref(),
         edge.target_imported_name.as_deref(),
     ) else {
         return;
     };
-    let Some(target_file) = resolve_relative_module_file(conn, &edge.source_file, module_specifier)
+    let Some(target_file) =
+        resolve_module_file(conn, &edge.source_file, module_specifier, aliases)
     else {
         edge.target_file.clear();
         edge.target_line = 0;
@@ -3126,8 +3256,9 @@ fn query_persisted_edges_at(
             }
         }
     }
+    let aliases = load_tsconfig_aliases(root);
     for edge in &mut edges {
-        resolve_import_target_from_catalog(&conn, edge);
+        resolve_import_target_from_catalog(&conn, aliases.as_ref(), edge);
     }
     edges.retain(|edge| {
         symbols.iter().any(|symbol| {
@@ -4359,6 +4490,87 @@ class Service extends BaseService implements Loadable, Disposable {}
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn tsconfig_path_alias_resolves_one_existing_target() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-alias-edge-db-{}", uuid::Uuid::new_v4()));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-alias-edge-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("src/model")).unwrap();
+        std::fs::create_dir_all(root.join("src/service")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{
+              // JSON5 comments and trailing commas are accepted.
+              "compilerOptions": {
+                "baseUrl": ".",
+                "paths": { "@model/*": ["src/model/*"], },
+              },
+            }"#,
+        )
+        .unwrap();
+        let base_file = root.join("src/model/base.ts");
+        let service_file = root.join("src/service/service.ts");
+        std::fs::write(&base_file, "export interface BaseModel {}\n").unwrap();
+        std::fs::write(
+            &service_file,
+            "import { BaseModel as Parent } from '@model/base';\nexport interface ServiceModel extends Parent {}\n",
+        )
+        .unwrap();
+        let (_, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        scan_file(&base_file, "src/model/base.ts", &mut symbols);
+        scan_file(&service_file, "src/service/service.ts", &mut symbols);
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+        let service = symbols
+            .iter()
+            .find(|symbol| symbol.name == "ServiceModel")
+            .cloned()
+            .unwrap();
+        let (resolved, _) = query_persisted_edges_at(&root, &data_dir, &[service])
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].target_file, "src/model/base.ts");
+        assert_eq!(resolved[0].target_name, "BaseModel");
+        assert_eq!(resolved[0].target_line, 1);
+        let base = symbols
+            .iter()
+            .find(|symbol| symbol.name == "BaseModel")
+            .cloned()
+            .unwrap();
+        let (incoming, _) = query_persisted_edges_at(&root, &data_dir, &[base])
+            .unwrap()
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_name, "ServiceModel");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn tsconfig_alias_replacements_remain_conservative_when_ambiguous() {
+        let aliases = TsconfigAliases {
+            base_dir: String::new(),
+            rules: vec![TsconfigPathRule {
+                pattern: "@model/*".into(),
+                replacements: vec!["src/model/*".into(), "generated/model/*".into()],
+            }],
+        };
+        let candidates = module_candidates("src/service.ts", "@model/base", Some(&aliases));
+        assert!(candidates.contains(&"src/model/base.ts".to_string()));
+        assert!(candidates.contains(&"generated/model/base.ts".to_string()));
     }
 
     #[test]
