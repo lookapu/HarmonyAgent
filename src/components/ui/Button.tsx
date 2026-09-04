@@ -17,7 +17,7 @@
  */
 
 import { useEffect, useState } from 'react'
-import type { ButtonHTMLAttributes } from 'react'
+import type { ButtonHTMLAttributes, Ref } from 'react'
 import Icon from '../../icons/Icon'
 import type { IconName } from '../../icons/Icon'
 import { cn } from '../../utils/cn'
@@ -48,6 +48,8 @@ const armedCls =
 const iconSizeFor = { xs: 11, sm: 12, md: 13 } as const
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  /** React 19 把 ref 当普通 prop；随 rest 透传到原生 button 上即可生效 */
+  ref?: Ref<HTMLButtonElement>
   variant?: keyof typeof variantCls
   size?: keyof typeof sizeCls
   icon?: IconName
