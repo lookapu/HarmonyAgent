@@ -114,6 +114,7 @@ import { Button } from '../components/ui/Button'
 import { IconButton } from '../components/ui/IconButton'
 import { Field, TextArea } from '../components/ui/Field'
 import { Spinner } from '../components/ui/Spinner'
+import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { useEscapeKey } from '../hooks/useEscapeKey'
 import {
   fmtElapsed,
@@ -230,6 +231,13 @@ const convGroupKey = (ts: number): 'today' | 'yesterday' | 'week' | 'earlier' =>
   if (diffDays < 7) return 'week'
   return 'earlier'
 }
+
+// 发送圆钮的 className：流式 / 空闲两条工具栏里有一份逐字节相同的复制粘贴，
+// 抽成常量只写一次。刻意不迁 <Button>：这组控件要 rounded-full + 实心 accent
+// 底 + 发光 hover 阴影，Button 的 rounded-md 基类与软色/实心变体都表达不了，
+// 强行迁移要先给 Button 加 shape/tone 维度，等有像素取证的那批再做。
+const composerSendCls =
+  'w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[var(--accent-600)] hover:bg-[var(--accent-500)] hover:shadow-[0_4px_16px_var(--accent-glow)]'
 
 export default function Home() {
   const { t } = useTranslation()
@@ -5958,7 +5966,7 @@ export default function Home() {
                       onClick={handleSend}
                       disabled={!draft.trim() || stopRequested || !!currentGen}
                       aria-label={t('home.queueSend')}
-                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[var(--accent-600)] hover:bg-[var(--accent-500)] hover:shadow-[0_4px_16px_var(--accent-glow)]"
+                      className={composerSendCls}
                       title={t('home.queueSend')}
                     >
                       <Icon name="send" size={14} white />
@@ -6077,7 +6085,7 @@ export default function Home() {
                       onClick={handleSend}
                       disabled={!draft.trim() || !currentProject || !!currentGen}
                       aria-label={t('home.send')}
-                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[var(--accent-600)] hover:bg-[var(--accent-500)] hover:shadow-[0_4px_16px_var(--accent-glow)]"
+                      className={composerSendCls}
                       title={t('home.send')}
                     >
                       <Icon name="send" size={14} white />
@@ -8839,122 +8847,6 @@ function PinnedBar({ convId, onJump }: { convId: string; onJump: (msgId: string)
             </div>
           )
         })}
-      </div>
-    </div>
-  )
-}
-
-
-/* ============ 通用确认弹层：替代 window.confirm，支持危险级别 + 自定义文案 ============
- * - tone: danger（红）/ warn（黄）/ info（蓝）
- * - confirmLabel: 主按钮文案（默认"确定"）
- * - requireInput: 需要用户输入指定短语才解锁确认按钮（最严级）
- * - 用法：调用方用 state 持有回调函数 + 参数 → 渲染时挂 onConfirm/onCancel
- */
-function ConfirmDialog({ open, title, body, tone = 'danger', confirmLabel, cancelLabel, requireInput, onConfirm, onCancel }: {
-  open: boolean
-  title: string
-  body: string | React.ReactNode
-  tone?: 'danger' | 'warn' | 'info'
-  confirmLabel?: string
-  cancelLabel?: string
-  /** 若提供此短语，用户必须在输入框中键入完全匹配的字符串才解锁确认 */
-  requireInput?: string
-  onConfirm: () => void
-  onCancel: () => void
-}) {
-  const { t } = useTranslation()
-  const [typed, setTyped] = useState('')
-  const inputRef = useRef<HTMLInputElement>(null)
-  const confirmBtnRef = useRef<HTMLButtonElement>(null)
-
-  // 重置输入态
-  useEffect(() => {
-    if (open) {
-      setTyped('')
-      setTimeout(() => (requireInput ? inputRef.current?.focus() : confirmBtnRef.current?.focus()), 30)
-    }
-  }, [open, requireInput])
-
-  // Esc 取消 / Enter 确认
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onCancel()
-      } else if (e.key === 'Enter' && !requireInput) {
-        e.preventDefault()
-        onConfirm()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onConfirm, onCancel, requireInput])
-
-  if (!open) return null
-  const canConfirm = !requireInput || typed === requireInput
-  const accent = tone === 'danger' ? 'var(--danger)' : tone === 'warn' ? 'var(--warning)' : 'var(--accent)'
-  const confirmStyle = canConfirm
-    ? { background: accent, color: '#fff' }
-    : { background: 'var(--bg-hover)', color: 'var(--text-muted)' }
-
-  return (
-    <div className="cmdk-backdrop" onClick={onCancel}>
-      <div
-        className="w-[440px] max-w-[92vw] glass-card p-4 animate-modal-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* 图标 + 标题 */}
-        <div className="flex items-start gap-3 mb-3">
-          <div
-            className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
-            style={{ background: `${accent}20`, color: accent }}
-          >
-            <Icon name={tone === 'info' ? 'info' : 'archive'} size={18} />
-          </div>
-          <div className="flex-1 min-w-0">
-            <h3 className="text-[14px] font-semibold leading-snug">{title}</h3>
-            <div className="mt-1.5 text-[12.5px] text-[var(--text-secondary)] leading-relaxed">{body}</div>
-          </div>
-        </div>
-
-        {/* 危险操作需要用户输入确认短语（防误触） */}
-        {requireInput && (
-          <div className="mb-3">
-            <label className="block text-[11px] text-[var(--text-muted)] mb-1.5">
-              {t('home.confirmTypePhrase', { phrase: requireInput })}
-            </label>
-            <input
-              ref={inputRef}
-              value={typed}
-              onChange={(e) => setTyped(e.target.value)}
-              spellCheck={false}
-              autoComplete="off"
-              className="w-full rounded-lg modern-card px-2.5 py-1.5 text-[12.5px] font-mono outline-none focus:border-[var(--accent)]"
-              placeholder={requireInput}
-            />
-          </div>
-        )}
-
-        {/* 操作按钮 */}
-        <div className="flex items-center justify-end gap-2 mt-1">
-          <button
-            onClick={onCancel}
-            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12.5px] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            {cancelLabel ?? t('home.cancel')}
-          </button>
-          <button
-            ref={confirmBtnRef}
-            onClick={onConfirm}
-            disabled={!canConfirm}
-            style={confirmStyle}
-            className="h-8 px-3 rounded-lg text-[12.5px] font-medium disabled:cursor-not-allowed transition-colors"
-          >
-            {confirmLabel ?? t('home.confirm')}
-          </button>
-        </div>
       </div>
     </div>
   )
