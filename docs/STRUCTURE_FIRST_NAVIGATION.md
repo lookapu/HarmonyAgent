@@ -138,7 +138,7 @@ fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `im
 
 1. ~~为结构浏览增加稳定游标/keyset 分页，消除深页 `OFFSET` 的线性扫描，并保留现有页码接口作为兼容层。~~ 已完成。
 2. ~~在生成仓运行渐进解析 1M 验收，记录冷扫描吞吐、写放大、锁等待、峰值内存和取消延迟。~~ 已完成；仍需补充真实混合语言 monorepo 的 Recall@5/20 与任务轨迹验收，达到单库 SLO 边界时再启用物理分片。
-3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS、`extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import/别名/ArkTS `import lazy`、根 `tsconfig` path alias、`oh-package.json5 file:/link:` 本地包入口及有界 re-export/barrel 闭包均已完成；ArkTS `lsp_definition` 单点和 `lsp_references` 有界批量结果也可沉淀成员调用边，覆盖缺口已可量化并可按需/空闲断点推进，失败目标具备跨进程指数退避。SCIP importer 也已接入：逐 document 有界解析、独立 `references` 语义层、文件指纹失效、完整成功后原子切换代次，并保留损坏导入前的有效快照；下一步补自动发现 indexer 产物与超大索引性能基线。
+3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS、`extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import/别名/ArkTS `import lazy`、根 `tsconfig` path alias、`oh-package.json5 file:/link:` 本地包入口及有界 re-export/barrel 闭包均已完成；ArkTS `lsp_definition` 单点和 `lsp_references` 有界批量结果也可沉淀成员调用边，覆盖缺口已可量化并可按需/空闲断点推进，失败目标具备跨进程指数退避。SCIP importer 也已接入：逐 document 有界解析、独立 `references` 语义层、文件指纹失效、完整成功后原子切换代次，并保留损坏导入前的有效快照；`search_symbols` 会发现根目录或 `.scip/` 中的产物并报告 active/stale 状态。下一步补超大索引性能基线。
 4. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 5. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
 6. 用 10k/100k/1M 基准和真实任务轨迹持续验证 Recall@5/20、延迟与上下文节省量。

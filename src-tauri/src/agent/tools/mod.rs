@@ -3684,6 +3684,23 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         result.semantic.backoff_targets,
         result.semantic.coverage,
     ));
+    match result.scip.state.as_str() {
+        "active" => out.push_str(&format!(
+            "SCIP 精确引用：active，索引 {}，文档 {}，定义 {}，引用 {}，已解析 {}，导入于 {} 秒前。\n",
+            result.scip.index_path.as_deref().unwrap_or("index.scip"),
+            result.scip.documents, result.scip.definitions, result.scip.references,
+            result.scip.resolved_references, result.scip.imported_ago_secs.unwrap_or(0),
+        )),
+        "available_not_imported" | "stale_index" => out.push_str(&format!(
+            "SCIP 精确引用：{}，已发现 {}；可调用 import_scip_index 导入/刷新。\n",
+            result.scip.state,
+            result.scip.index_path.as_deref().unwrap_or("index.scip"),
+        )),
+        "imported_source_missing" => out.push_str(
+            "SCIP 精确引用：上次导入仍可供未变化文件查询，但原始索引已缺失；重新生成后调用 import_scip_index 刷新。\n",
+        ),
+        _ => {}
+    }
     if matches!(
         result.semantic.coverage.as_str(),
         "not_started_query_driven" | "partial_query_driven"

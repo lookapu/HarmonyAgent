@@ -17,6 +17,9 @@ const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 1024 * 1024;
 const DEFINITION_ROLE: u64 = 1;
+const DOCUMENTS_PER_TRANSACTION: usize = 256;
+const EDGE_BUILD_BATCH_ROWS: i64 = 50_000;
+const CLEANUP_BATCH_ROWS: i64 = 50_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScipImportStats {
@@ -27,6 +30,17 @@ pub struct ScipImportStats {
     pub references: usize,
     pub resolved_references: usize,
     pub ignored_documents: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScipIndexStatus {
+    pub state: String,
+    pub index_path: Option<String>,
+    pub documents: usize,
+    pub definitions: usize,
+    pub references: usize,
+    pub resolved_references: usize,
+    pub imported_ago_secs: Option<u64>,
 }
 
 #[derive(Default)]
@@ -60,6 +74,99 @@ fn stamp(path: &Path) -> Result<(u64, u64), String> {
         .map(|value| value.as_nanos().min(u64::MAX as u128) as u64)
         .unwrap_or(0);
     Ok((meta.len(), mtime))
+}
+
+fn discovered_index(root: &Path) -> Option<(String, std::path::PathBuf)> {
+    ["index.scip", ".scip/index.scip"]
+        .into_iter()
+        .map(|rel| (rel.to_string(), root.join(rel)))
+        .find(|(_, path)| {
+            fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+        })
+}
+
+pub fn status(root: &Path, database: &Path) -> ScipIndexStatus {
+    let discovered = discovered_index(root);
+    let Ok(conn) = Connection::open(database) else {
+        return ScipIndexStatus {
+            state: if discovered.is_some() {
+                "available_not_imported"
+            } else {
+                "not_found"
+            }
+            .into(),
+            index_path: discovered.map(|(rel, _)| rel),
+            ..Default::default()
+        };
+    };
+    let has_state = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scip_import_state')",
+        [], |row| row.get::<_, bool>(0),
+    ).unwrap_or(false);
+    if !has_state {
+        return ScipIndexStatus {
+            state: if discovered.is_some() {
+                "available_not_imported"
+            } else {
+                "not_found"
+            }
+            .into(),
+            index_path: discovered.map(|(rel, _)| rel),
+            ..Default::default()
+        };
+    }
+    let stored = conn.query_row(
+        "SELECT index_path, index_size, index_mtime_ns, imported_at, document_count,
+                definition_count, reference_count, edge_count FROM scip_import_state WHERE id=1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        },
+    );
+    let Ok((path, size, mtime, imported_at, documents, definitions, references, edges)) = stored
+    else {
+        return ScipIndexStatus {
+            state: if discovered.is_some() {
+                "available_not_imported"
+            } else {
+                "not_found"
+            }
+            .into(),
+            index_path: discovered.map(|(rel, _)| rel),
+            ..Default::default()
+        };
+    };
+    let current = stamp(&root.join(&path)).ok();
+    let state = if current == Some((size.max(0) as u64, mtime.max(0) as u64)) {
+        "active"
+    } else if current.is_some() || discovered.is_some() {
+        "stale_index"
+    } else {
+        "imported_source_missing"
+    };
+    ScipIndexStatus {
+        state: state.into(),
+        index_path: Some(path),
+        documents: documents.max(0) as usize,
+        definitions: definitions.max(0) as usize,
+        references: references.max(0) as usize,
+        resolved_references: edges.max(0) as usize,
+        imported_ago_secs: Some(
+            now_nanos()
+                .saturating_div(1_000_000_000)
+                .saturating_sub(imported_at.max(0) as u64),
+        ),
+    }
 }
 
 fn read_varint<R: Read>(reader: &mut R) -> io::Result<Option<u64>> {
@@ -435,6 +542,7 @@ pub fn import(root: &Path, database: &Path, index: &Path) -> Result<ScipImportSt
     let parse_result = (|| -> Result<(), String> {
         let file = File::open(&canonical_index).map_err(|e| format!("打开 SCIP 索引失败：{e}"))?;
         let mut reader = BufReader::with_capacity(256 * 1024, file);
+        let mut documents_in_transaction = 0usize;
         while let Some(key) =
             read_varint(&mut reader).map_err(|e| format!("解析 SCIP 顶层字段失败：{e}"))?
         {
@@ -453,21 +561,29 @@ pub fn import(root: &Path, database: &Path, index: &Path) -> Result<ScipImportSt
                 reader
                     .read_exact(&mut bytes)
                     .map_err(|e| format!("SCIP document 被截断：{e}"))?;
-                // One transaction per document bounds write-lock duration while avoiding
-                // an fsync/autocommit for every occurrence in large indexes.
-                let tx = conn
-                    .transaction()
-                    .map_err(|e| format!("开启 SCIP document 事务失败：{e}"))?;
-                parse_document(&bytes, &tx, import_id, &canonical_root, &mut stats)?;
-                tx.commit()
-                    .map_err(|e| format!("提交 SCIP document 失败：{e}"))?;
+                if documents_in_transaction == 0 {
+                    conn.execute_batch("BEGIN DEFERRED")
+                        .map_err(|e| format!("开启 SCIP 批事务失败：{e}"))?;
+                }
+                parse_document(&bytes, &conn, import_id, &canonical_root, &mut stats)?;
+                documents_in_transaction += 1;
+                if documents_in_transaction == DOCUMENTS_PER_TRANSACTION {
+                    conn.execute_batch("COMMIT")
+                        .map_err(|e| format!("提交 SCIP 批事务失败：{e}"))?;
+                    documents_in_transaction = 0;
+                }
             } else {
                 skip_field(&mut reader, wire).map_err(|e| format!("跳过 SCIP 字段失败：{e}"))?;
             }
         }
+        if documents_in_transaction > 0 {
+            conn.execute_batch("COMMIT")
+                .map_err(|e| format!("提交 SCIP 批事务失败：{e}"))?;
+        }
         Ok(())
     })();
     if let Err(error) = parse_result {
+        let _ = conn.execute_batch("ROLLBACK");
         let _ = conn.execute(
             "DELETE FROM scip_import_symbols WHERE import_id=?1",
             [import_id],
@@ -497,8 +613,19 @@ pub fn import(root: &Path, database: &Path, index: &Path) -> Result<ScipImportSt
         );
         return Err("SCIP 索引在导入期间被外部工具改写，已放弃未完成代次；请重试".into());
     }
-    conn.execute(
-        "INSERT INTO scip_reference_edges(import_id, source_file, source_name, source_line, occurrence_line, occurrence_column, source_size, source_mtime_ns, target_file, target_name, target_line, target_size, target_mtime_ns, symbol_key)
+    let (min_occurrence_rowid, max_occurrence_rowid) = conn
+        .query_row(
+            "SELECT COALESCE(MIN(rowid), 1), COALESCE(MAX(rowid), 0)
+         FROM scip_import_occurrences WHERE import_id=?1",
+            [import_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|e| format!("读取 SCIP 引用游标失败：{e}"))?;
+    let mut occurrence_rowid = min_occurrence_rowid.saturating_sub(1);
+    while occurrence_rowid < max_occurrence_rowid {
+        let batch_end = occurrence_rowid.saturating_add(EDGE_BUILD_BATCH_ROWS);
+        conn.execute(
+            "INSERT INTO scip_reference_edges(import_id, source_file, source_name, source_line, occurrence_line, occurrence_column, source_size, source_mtime_ns, target_file, target_name, target_line, target_size, target_mtime_ns, symbol_key)
          SELECT o.import_id, o.file,
            COALESCE((SELECT s.name FROM symbols s WHERE s.file=o.file AND s.line<=o.line AND s.end_line>=o.line ORDER BY CASE WHEN s.role='logic' THEN 0 ELSE 1 END, (s.end_line-s.line), s.line DESC LIMIT 1), '<file>'),
            COALESCE((SELECT s.line FROM symbols s WHERE s.file=o.file AND s.line<=o.line AND s.end_line>=o.line ORDER BY CASE WHEN s.role='logic' THEN 0 ELSE 1 END, (s.end_line-s.line), s.line DESC LIMIT 1), o.line),
@@ -508,9 +635,12 @@ pub fn import(root: &Path, database: &Path, index: &Path) -> Result<ScipImportSt
            d.file_size, d.file_mtime_ns, o.symbol_key
          FROM scip_import_occurrences o JOIN scip_import_definitions d ON d.import_id=o.import_id AND d.symbol_key=o.symbol_key
          LEFT JOIN scip_import_symbols i ON i.import_id=o.import_id AND i.symbol_key=o.symbol_key
-         WHERE o.import_id=?1 AND (o.file<>d.file OR o.line<>d.line OR o.column<>d.column)",
-        [import_id],
-    ).map_err(|e| format!("解析 SCIP 引用关系失败：{e}"))?;
+         WHERE o.import_id=?1 AND o.rowid>?2 AND o.rowid<=?3
+           AND (o.file<>d.file OR o.line<>d.line OR o.column<>d.column)",
+            params![import_id, occurrence_rowid, batch_end],
+        ).map_err(|e| format!("分块解析 SCIP 引用关系失败：{e}"))?;
+        occurrence_rowid = batch_end;
+    }
     stats.resolved_references = conn
         .query_row(
             "SELECT COUNT(*) FROM scip_reference_edges WHERE import_id=?1",
@@ -519,6 +649,25 @@ pub fn import(root: &Path, database: &Path, index: &Path) -> Result<ScipImportSt
         )
         .unwrap_or(0)
         .max(0) as usize;
+    if stamp(&canonical_index)? != (index_size, index_mtime) {
+        let _ = conn.execute(
+            "DELETE FROM scip_reference_edges WHERE import_id=?1",
+            [import_id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM scip_import_symbols WHERE import_id=?1",
+            [import_id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM scip_import_definitions WHERE import_id=?1",
+            [import_id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM scip_import_occurrences WHERE import_id=?1",
+            [import_id],
+        );
+        return Err("SCIP 索引在关系构建期间被外部工具改写，已保留上一有效代次；请重试".into());
+    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
@@ -528,27 +677,29 @@ pub fn import(root: &Path, database: &Path, index: &Path) -> Result<ScipImportSt
          ON CONFLICT(id) DO UPDATE SET active_import_id=excluded.active_import_id, index_path=excluded.index_path, index_size=excluded.index_size, index_mtime_ns=excluded.index_mtime_ns, imported_at=excluded.imported_at, document_count=excluded.document_count, definition_count=excluded.definition_count, reference_count=excluded.reference_count, edge_count=excluded.edge_count",
         params![import_id, display_path, index_size as i64, index_mtime as i64, (now_nanos()/1_000_000_000) as i64, stats.documents as i64, stats.definitions as i64, stats.references as i64, stats.resolved_references as i64],
     ).map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM scip_reference_edges WHERE import_id<>?1",
-        [import_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM scip_import_occurrences WHERE import_id<>?1",
-        [import_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM scip_import_definitions WHERE import_id<>?1",
-        [import_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM scip_import_symbols WHERE import_id<>?1",
-        [import_id],
-    )
-    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
+    // The state switch makes old generations invisible. Reclaim them in short batches
+    // so a multi-million-edge cleanup does not monopolize the catalog write lock.
+    for table in [
+        "scip_reference_edges",
+        "scip_import_occurrences",
+        "scip_import_definitions",
+        "scip_import_symbols",
+    ] {
+        loop {
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN (
+                   SELECT rowid FROM {table} WHERE import_id<>?1 LIMIT ?2
+                 )"
+            );
+            let deleted = conn
+                .execute(&sql, params![import_id, CLEANUP_BATCH_ROWS])
+                .unwrap_or(0);
+            if deleted < CLEANUP_BATCH_ROWS as usize {
+                break;
+            }
+        }
+    }
     Ok(stats)
 }
 
@@ -677,21 +828,29 @@ mod tests {
         drop(conn);
 
         let symbol = "scip-typescript npm demo 1.0 fetch().";
-        let index_bytes = [
-            len_field(
-                2,
-                &document("src/target.ts", &[occurrence(symbol, 0, 9, true)]),
-            ),
-            len_field(
+        let mut index_bytes = len_field(
+            2,
+            &document("src/target.ts", &[occurrence(symbol, 0, 9, true)]),
+        );
+        // Cross the 256-document transaction boundary while duplicate occurrences
+        // still collapse to one persisted reference edge.
+        for _ in 0..DOCUMENTS_PER_TRANSACTION {
+            index_bytes.extend(len_field(
                 2,
                 &document("src/source.ts", &[occurrence(symbol, 0, 20, false)]),
-            ),
-        ]
-        .concat();
+            ));
+        }
         let index = root.join("index.scip");
         fs::write(&index, index_bytes).unwrap();
+        let available = status(&root, &database);
+        assert_eq!(available.state, "available_not_imported");
+        assert_eq!(available.index_path.as_deref(), Some("index.scip"));
         let stats = import(&root, &database, &index).unwrap();
+        assert_eq!(stats.documents, DOCUMENTS_PER_TRANSACTION + 1);
         assert_eq!(stats.resolved_references, 1);
+        let active_status = status(&root, &database);
+        assert_eq!(active_status.state, "active");
+        assert_eq!(active_status.resolved_references, 1);
         let conn = Connection::open(&database).unwrap();
         assert_eq!(
             conn.query_row(
@@ -716,6 +875,7 @@ mod tests {
             [varint(2 << 3 | 2), varint(12), vec![1, 2]].concat(),
         )
         .unwrap();
+        assert_eq!(status(&root, &database).state, "stale_index");
         assert!(import(&root, &database, &index).is_err());
         let conn = Connection::open(&database).unwrap();
         assert_eq!(

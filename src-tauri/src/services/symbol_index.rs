@@ -854,7 +854,14 @@ pub(crate) fn import_scip_index(root: &Path, index_path: Option<&Path>) -> Resul
     // Ensure the file catalog and syntax symbols exist before validating SCIP document stamps.
     let _ = index_project_cached(root);
     let data_dir = DATA_DIR.get().ok_or("结构索引数据目录尚未初始化")?;
-    let index = index_path.map(Path::to_path_buf).unwrap_or_else(|| root.join("index.scip"));
+    let index = index_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        let conventional = root.join("index.scip");
+        if conventional.is_file() {
+            conventional
+        } else {
+            root.join(".scip").join("index.scip")
+        }
+    });
     crate::services::scip_index::import(root, &catalog_file_at(data_dir, root), &index)
 }
 
@@ -3416,6 +3423,7 @@ pub struct StructureQueryResult {
     pub indexed_symbols: usize,
     pub indexed_relations: usize,
     pub semantic: SemanticCoverageStats,
+    pub scip: crate::services::scip_index::ScipIndexStatus,
     pub catalog: CatalogStats,
     pub watcher_active: bool,
     pub progressive: ProgressiveIndexStatus,
@@ -5165,6 +5173,9 @@ pub fn query_structure_with_cursor(
             0,
         )
     });
+    let scip = DATA_DIR.get()
+        .map(|data_dir| crate::services::scip_index::status(root, &catalog_file_at(data_dir, root)))
+        .unwrap_or_default();
     Ok(StructureQueryResult {
         items,
         relations,
@@ -5177,6 +5188,7 @@ pub fn query_structure_with_cursor(
         indexed_symbols: persisted_symbol_count(root).unwrap_or(syms.len()),
         indexed_relations,
         semantic,
+        scip,
         catalog,
         watcher_active: crate::services::repo_watcher::is_watching(root),
         progressive,
