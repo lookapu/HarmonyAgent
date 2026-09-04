@@ -2491,7 +2491,12 @@ struct Detail {
             "deveco-symbol-scale-{}",
             uuid::Uuid::new_v4()
         ));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-symbol-scale-data-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
 
         let generate_started = std::time::Instant::now();
         for index in 0..requested {
@@ -2500,54 +2505,95 @@ struct Detail {
                 std::fs::create_dir_all(&shard).unwrap();
             }
             std::fs::write(
-                shard.join(format!("file_{index:07}.rs")),
-                format!("pub fn symbol_{index:07}() -> usize {{ {index} }}\n"),
+                shard.join(format!("file_{index:07}.ets")),
+                format!(
+                    "@Component\nstruct Page_{index:07} {{\n  symbol_{index:07}() {{\n    return {index}\n  }}\n}}\n"
+                ),
             )
             .unwrap();
         }
         let generation_ms = generate_started.elapsed().as_millis() as u64;
 
-        invalidate_cache(&root);
         let cold_started = std::time::Instant::now();
-        let cold_symbols = index_project_cached(&root);
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut cold_symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut cold_symbols);
+        }
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &cold_symbols,
+            catalog.revision,
+        ));
         let cold_ms = cold_started.elapsed().as_millis() as u64;
 
+        let query_name = cold_symbols
+            .iter()
+            .find(|symbol| symbol.role == "logic")
+            .map(|symbol| symbol.name.clone())
+            .expect("基准至少应索引一个逻辑节点");
         let warm_started = std::time::Instant::now();
-        let warm_symbols = index_project_cached(&root);
+        let (warm_symbols, total_matches) = query_persisted_symbols_at(
+            &root,
+            &data_dir,
+            &query_name,
+            Some("logic"),
+            None,
+            None,
+            1,
+            50,
+        )
+        .unwrap()
+        .unwrap();
         let warm_ms = warm_started.elapsed().as_millis() as u64;
 
-        let changed_file = cold_symbols
-            .first()
-            .map(|symbol| symbol.file.clone())
-            .expect("基准至少应索引一个符号");
+        let changed_file = files.keys().next().cloned().expect("基准至少应索引一个文件");
         std::fs::write(
             root.join(&changed_file),
-            "pub fn symbol_after_incremental_update() -> usize { 42 }\n",
+            "@Component\nstruct ChangedPage {\n  symbol_after_incremental_update() {\n    return 42\n  }\n}\n",
         )
         .unwrap();
         let incremental_started = std::time::Instant::now();
-        invalidate_files(&root, std::slice::from_ref(&changed_file));
-        let incremental_symbols = index_project_cached(&root);
+        assert!(matches!(
+            apply_catalog_changes_at(&root, &data_dir, std::slice::from_ref(&changed_file)),
+            CatalogDelta::Updated(_)
+        ));
+        let mut incremental_symbols = Vec::new();
+        scan_file(&root.join(&changed_file), &changed_file, &mut incremental_symbols);
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            std::slice::from_ref(&changed_file),
+            &incremental_symbols,
+        ));
         let incremental_ms = incremental_started.elapsed().as_millis() as u64;
-        let meta = index_meta(&root);
-        assert_eq!(meta.catalog.discovered_files, requested);
-        assert_eq!(meta.catalog.source_files, requested);
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        let relation_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .max(0) as usize;
+        drop(conn);
+        assert_eq!(catalog.discovered_files, requested);
+        assert_eq!(catalog.source_files, requested);
         assert_eq!(
-            meta.catalog.deferred_source_files,
+            catalog.deferred_source_files,
             requested.saturating_sub(MAX_FILES)
         );
 
         let report = serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "requested_files": requested,
             "configured_max_files": MAX_FILES,
             "indexed_files": cold_symbols.iter().map(|symbol| &symbol.file).collect::<std::collections::HashSet<_>>().len(),
-            "catalog_discovered_files": meta.catalog.discovered_files,
-            "catalog_source_files": meta.catalog.source_files,
-            "deferred_source_files": meta.catalog.deferred_source_files,
-            "coverage": meta.coverage,
+            "catalog_discovered_files": catalog.discovered_files,
+            "catalog_source_files": catalog.source_files,
+            "deferred_source_files": catalog.deferred_source_files,
+            "coverage": catalog.coverage(),
             "cold_symbols": cold_symbols.len(),
-            "warm_symbols": warm_symbols.len(),
+            "indexed_relations": relation_count,
+            "warm_query_matches": total_matches,
+            "warm_query_page_items": warm_symbols.len(),
             "incremental_symbols": incremental_symbols.len(),
             "generation_ms": generation_ms,
             "cold_index_ms": cold_ms,
@@ -2560,11 +2606,12 @@ struct Detail {
         println!("HARMONY_INDEX_BASELINE={report}");
 
         assert!(!cold_symbols.is_empty());
-        assert_eq!(cold_symbols.len(), warm_symbols.len());
+        assert_eq!(total_matches, 1);
+        assert_eq!(warm_symbols[0].name, query_name);
         assert!(incremental_symbols
             .iter()
             .any(|symbol| symbol.name == "symbol_after_incremental_update"));
-        invalidate_cache(&root);
         std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
     }
 }
