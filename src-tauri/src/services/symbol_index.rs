@@ -28,8 +28,10 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 9;
+const STRUCTURE_PARSER_VERSION: i64 = 10;
 const MAX_REEXPORT_DEPTH: usize = 8;
+const MAX_REEXPORT_BRANCHES: usize = 16;
+const MAX_REEXPORT_VISITS: usize = 128;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -448,7 +450,25 @@ fn parse_module_reexports(content: &str, ext: &str) -> Vec<ModuleReexport> {
         else {
             continue;
         };
+        let before = out.len();
         collect_export_specifiers(statement, source, &target_module, &mut out);
+        if out.len() == before {
+            let mut children = statement.walk();
+            let namespace_export = statement
+                .named_children(&mut children)
+                .any(|child| child.kind() == "namespace_export");
+            let mut raw_children = statement.walk();
+            let star_export = statement
+                .children(&mut raw_children)
+                .any(|child| child.kind() == "*");
+            if star_export && !namespace_export {
+                out.push(ModuleReexport {
+                    exported_name: "*".into(),
+                    target_module,
+                    imported_name: "*".into(),
+                });
+            }
+        }
     }
     out.sort_by(|a, b| {
         (&a.exported_name, &a.target_module, &a.imported_name).cmp(&(
@@ -3515,88 +3535,163 @@ fn resolve_module_file(
     existing.into_iter().next()
 }
 
+fn resolve_exported_target(
+    root: &Path,
+    conn: &Connection,
+    aliases: Option<&ModuleAliases>,
+    source_file: &str,
+    module_specifier: &str,
+    imported_name: &str,
+    depth: usize,
+    visited: &mut Vec<(String, String, String)>,
+    remaining_visits: &mut usize,
+) -> Option<(String, String, usize)> {
+    if depth >= MAX_REEXPORT_DEPTH || *remaining_visits == 0 {
+        return None;
+    }
+    *remaining_visits -= 1;
+    let key = (
+        source_file.to_string(),
+        module_specifier.to_string(),
+        imported_name.to_string(),
+    );
+    if visited.contains(&key) {
+        return None;
+    }
+    visited.push(key);
+    let owned_aliases = (depth > 0)
+        .then(|| load_module_aliases(root, std::iter::once(source_file)));
+    let effective_aliases = if depth == 0 {
+        aliases
+    } else {
+        owned_aliases.as_ref()
+    };
+    let target_file =
+        resolve_module_file(conn, source_file, module_specifier, effective_aliases)?;
+    let lines = conn
+        .prepare(
+            "SELECT line FROM symbols
+             WHERE file=?1 AND name=?2 AND role='entity'
+             ORDER BY line LIMIT 2",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![target_file, imported_name], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+    if lines.len() == 1 {
+        return Some((
+            target_file,
+            imported_name.to_string(),
+            lines[0].max(0) as usize,
+        ));
+    }
+    if !lines.is_empty() {
+        return None;
+    }
+    let named = conn
+        .prepare(
+            "SELECT target_module, imported_name FROM module_reexports
+             WHERE source_file=?1 AND exported_name=?2
+             ORDER BY target_module, imported_name LIMIT 2",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![target_file, imported_name], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+    if named.len() == 1 {
+        let (next_module, next_name) = &named[0];
+        return resolve_exported_target(
+            root,
+            conn,
+            aliases,
+            &target_file,
+            next_module,
+            next_name,
+            depth + 1,
+            visited,
+            remaining_visits,
+        );
+    }
+    if !named.is_empty() {
+        return None;
+    }
+    let stars = conn
+        .prepare(
+            "SELECT target_module FROM module_reexports
+             WHERE source_file=?1 AND exported_name='*' AND imported_name='*'
+             ORDER BY target_module LIMIT ?2",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![target_file, (MAX_REEXPORT_BRANCHES + 1) as i64],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+    if stars.is_empty() || stars.len() > MAX_REEXPORT_BRANCHES {
+        return None;
+    }
+    let mut resolved = Vec::new();
+    for next_module in stars {
+        let mut branch_visited = visited.clone();
+        if let Some(target) = resolve_exported_target(
+            root,
+            conn,
+            aliases,
+            &target_file,
+            &next_module,
+            imported_name,
+            depth + 1,
+            &mut branch_visited,
+            remaining_visits,
+        ) {
+            resolved.push(target);
+        }
+    }
+    resolved.sort();
+    resolved.dedup();
+    (resolved.len() == 1).then(|| resolved.remove(0))
+}
+
 fn resolve_import_target_from_catalog(
     root: &Path,
     conn: &Connection,
     aliases: Option<&ModuleAliases>,
     edge: &mut StructureEdge,
 ) {
-    let (Some(mut module_specifier), Some(mut imported_name)) = (
-        edge.target_module.clone(),
-        edge.target_imported_name.clone(),
+    let (Some(module_specifier), Some(imported_name)) = (
+        edge.target_module.as_deref(),
+        edge.target_imported_name.as_deref(),
     ) else {
         return;
     };
-    let mut source_file = edge.source_file.clone();
-    let mut visited = Vec::new();
-    for depth in 0..MAX_REEXPORT_DEPTH {
-        let hop_aliases;
-        let effective_aliases = if depth == 0 {
-            aliases
-        } else {
-            hop_aliases = load_module_aliases(root, std::iter::once(source_file.as_str()));
-            Some(&hop_aliases)
-        };
-        if visited.contains(&(
-            source_file.clone(),
-            module_specifier.clone(),
-            imported_name.clone(),
-        )) {
-            break;
-        }
-        visited.push((
-            source_file.clone(),
-            module_specifier.clone(),
-            imported_name.clone(),
-        ));
-        let Some(target_file) = resolve_module_file(
-            conn,
-            &source_file,
-            &module_specifier,
-            effective_aliases,
-        ) else {
-            break;
-        };
-        let lines = conn
-            .prepare(
-                "SELECT line FROM symbols
-                 WHERE file=?1 AND name=?2 AND role='entity'
-                 ORDER BY line LIMIT 2",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![target_file, imported_name], |row| row.get::<_, i64>(0))?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap_or_default();
-        if lines.len() == 1 {
-            edge.target_file = target_file;
-            edge.target_name = imported_name;
-            edge.target_line = lines[0].max(0) as usize;
-            return;
-        }
-        let reexports = conn
-            .prepare(
-                "SELECT target_module, imported_name FROM module_reexports
-                 WHERE source_file=?1 AND exported_name=?2
-                 ORDER BY target_module, imported_name LIMIT 2",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![target_file, imported_name], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap_or_default();
-        if reexports.len() != 1 {
-            break;
-        }
-        source_file = target_file;
-        (module_specifier, imported_name) = reexports.into_iter().next().unwrap();
+    let mut remaining_visits = MAX_REEXPORT_VISITS;
+    if let Some((target_file, target_name, target_line)) = resolve_exported_target(
+        root,
+        conn,
+        aliases,
+        &edge.source_file,
+        module_specifier,
+        imported_name,
+        0,
+        &mut Vec::new(),
+        &mut remaining_visits,
+    ) {
+        edge.target_file = target_file;
+        edge.target_name = target_name;
+        edge.target_line = target_line;
+    } else {
+        edge.target_file.clear();
+        edge.target_line = 0;
     }
-    edge.target_file.clear();
-    edge.target_line = 0;
 }
 
 fn query_persisted_edges_at(
@@ -4984,14 +5079,19 @@ class Service extends BaseService implements Loadable, Disposable {}
     }
 
     #[test]
-    fn named_reexports_parse_aliases_without_guessing_star_exports() {
+    fn reexports_parse_named_aliases_and_plain_stars() {
         let exports = parse_module_reexports(
-            "export { Core as PublicCore, Other } from './core';\nexport * from './wild';\n",
+            "export { Core as PublicCore, Other } from './core';\nexport * from './wild';\nexport * as Namespace from './namespace';\n",
             "ts",
         );
         assert_eq!(
             exports,
             vec![
+                ModuleReexport {
+                    exported_name: "*".into(),
+                    target_module: "./wild".into(),
+                    imported_name: "*".into(),
+                },
                 ModuleReexport {
                     exported_name: "Other".into(),
                     target_module: "./core".into(),
@@ -5004,6 +5104,71 @@ class Service extends BaseService implements Loadable, Disposable {}
                 },
             ]
         );
+    }
+
+    #[test]
+    fn star_reexport_closure_requires_one_final_definition() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-star-edge-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-star-edge-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("one.ts"), "export interface Shared {}\n").unwrap();
+        std::fs::write(root.join("two.ts"), "export interface Other {}\n").unwrap();
+        std::fs::write(
+            root.join("index.ts"),
+            "export * from './one';\nexport * from './two';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("service.ts"),
+            "import { Shared } from './index';\nexport class Service implements Shared {}\n",
+        )
+        .unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        let indexed_files = files.keys().cloned().collect::<Vec<_>>();
+        assert!(replace_all_symbol_rows_with_files_at(
+            &root,
+            &data_dir,
+            &symbols,
+            &indexed_files,
+            catalog.revision,
+        ));
+        let service = symbols
+            .iter()
+            .find(|symbol| symbol.name == "Service")
+            .cloned()
+            .unwrap();
+        let (unique, _) = query_persisted_edges_at(&root, &data_dir, &[service.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0].target_file, "one.ts");
+        assert_eq!(unique[0].target_name, "Shared");
+
+        std::fs::write(root.join("two.ts"), "export interface Shared {}\n").unwrap();
+        let mut changed = Vec::new();
+        scan_file(&root.join("two.ts"), "two.ts", &mut changed);
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            &["two.ts".into()],
+            &changed,
+        ));
+        let (ambiguous, _) = query_persisted_edges_at(&root, &data_dir, &[service])
+            .unwrap()
+            .unwrap();
+        assert_eq!(ambiguous.len(), 1);
+        assert!(ambiguous[0].target_file.is_empty());
+        assert_eq!(ambiguous[0].target_line, 0);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
     }
 
     #[test]
