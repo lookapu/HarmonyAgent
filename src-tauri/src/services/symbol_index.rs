@@ -28,7 +28,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 4;
+const STRUCTURE_PARSER_VERSION: i64 = 5;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -973,16 +973,32 @@ fn containment_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
 
 fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
     let mut edges = containment_edges(symbols);
+    let mut local_entities: HashMap<(&str, &str), Vec<&Symbol>> = HashMap::new();
+    for candidate in symbols.iter().filter(|symbol| symbol.role == "entity") {
+        local_entities
+            .entry((&candidate.file, &candidate.name))
+            .or_default()
+            .push(candidate);
+    }
     for symbol in symbols {
         for relation in &symbol.declared_relations {
+            let resolved = local_entities
+                .get(&(symbol.file.as_str(), relation.target_name.as_str()))
+                .filter(|candidates| candidates.len() == 1)
+                .and_then(|candidates| candidates.first())
+                .filter(|candidate| {
+                    candidate.line != symbol.line || candidate.name != symbol.name
+                });
             edges.push(StructureEdge {
                 kind: relation.kind.clone(),
                 source_file: symbol.file.clone(),
                 source_name: symbol.name.clone(),
                 source_line: symbol.line,
-                target_file: String::new(),
+                target_file: resolved
+                    .map(|candidate| candidate.file.clone())
+                    .unwrap_or_default(),
                 target_name: relation.target_name.clone(),
-                target_line: 0,
+                target_line: resolved.map(|candidate| candidate.line).unwrap_or(0),
             });
         }
     }
@@ -1931,8 +1947,8 @@ struct PersistedIndex {
     catalog: CatalogStats,
 }
 
-// v6 persists parser provenance plus syntactic declaration relationships.
-const PERSIST_VERSION: u32 = 6;
+// v7 rebuilds declaration edges with conservative same-file target binding.
+const PERSIST_VERSION: u32 = 7;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -3388,7 +3404,35 @@ class Service extends BaseService implements Loadable, Disposable {}
             .filter(|edge| edge.source_name == "Service" && edge.kind != "contains")
             .collect::<Vec<_>>();
         assert_eq!(declared.len(), 3);
-        assert!(declared.iter().all(|edge| edge.target_file.is_empty() && edge.target_line == 0));
+        assert_eq!(
+            declared
+                .iter()
+                .filter(|edge| !edge.target_file.is_empty() && edge.target_line > 0)
+                .count(),
+            2,
+            "同文件唯一声明应解析，缺失的 Disposable 必须保持未解析"
+        );
+        let disposable = declared
+            .iter()
+            .find(|edge| edge.target_name == "Disposable")
+            .unwrap();
+        assert!(disposable.target_file.is_empty());
+        assert_eq!(disposable.target_line, 0);
+
+        let mut cross_file = Vec::new();
+        assert!(scan_file_tree_sitter("class RemoteBase {}", "base.ts", "ts", &mut cross_file));
+        assert!(scan_file_tree_sitter(
+            "class RemoteChild extends RemoteBase {}",
+            "child.ts",
+            "ts",
+            &mut cross_file,
+        ));
+        let remote = structure_edges(&cross_file)
+            .into_iter()
+            .find(|edge| edge.source_name == "RemoteChild")
+            .unwrap();
+        assert!(remote.target_file.is_empty(), "没有 import 证据时不得跨文件猜测目标");
+        assert_eq!(remote.target_line, 0);
     }
 
     #[test]
@@ -3929,8 +3973,8 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().all(|edge| {
             matches!(edge.kind.as_str(), "extends" | "implements")
-                && edge.target_file.is_empty()
-                && edge.target_line == 0
+                && edge.target_file == "service.ts"
+                && edge.target_line > 0
         }));
 
         std::fs::remove_dir_all(&root).ok();
