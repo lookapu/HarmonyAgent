@@ -111,6 +111,7 @@ import { FeedbackDialog, VersionDiffDialog, MemoryDraftDialog, EditMessageDialog
 import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, PreviewPanel, TerminalPanel, ShellPanel } from '../chat/components/panels'
 import CommandPalette, { type PaletteCommand } from '../components/CommandPalette'
 import { Button } from '../components/ui/Button'
+import { IconButton } from '../components/ui/IconButton'
 import {
   fmtElapsed,
   interruptedTailMessage,
@@ -4065,21 +4066,9 @@ export default function Home() {
                 >
                   <Icon name="archive" size={14} />
                 </button>
-                <button
-                  onClick={() => newConversation()}
-                  className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-                  title={t('home.newConversation')}
-                >
-                  <Icon name="plus" size={14} />
-                </button>
+                <IconButton icon="plus" label={t('home.newConversation')} onClick={() => newConversation()} />
                 {/* 导入会话（只读预览：解析 md/json 文件，弹窗显示 + 复制全文） */}
-                <button
-                  onClick={handleImport}
-                  className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-                  title={t('home.import')}
-                >
-                  <Icon name="file" size={14} />
-                </button>
+                <IconButton icon="file" label={t('home.import')} onClick={handleImport} />
               </div>
             )}
           </div>
@@ -4473,27 +4462,27 @@ export default function Home() {
                       >
                         <Icon name="pin" size={13} />
                       </button>
-                      <button
+                      <IconButton
+                        icon="archive"
+                        label={c.archived ? t('home.unarchive') : t('home.archive')}
+                        iconSize={13}
+                        className="opacity-0 group-hover:opacity-100"
                         onClick={(e) => {
                           e.stopPropagation()
                           toggleArchive(c.id, c.archived)
                         }}
-                        className="p-1 rounded-md text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-all shrink-0"
-                        title={c.archived ? t('home.unarchive') : t('home.archive')}
-                      >
-                        <Icon name="archive" size={13} />
-                      </button>
-                      <button
+                      />
+                      <IconButton
+                        icon="edit"
+                        label={t('home.rename')}
+                        iconSize={13}
+                        className="opacity-0 group-hover:opacity-100"
                         onClick={(e) => {
                           e.stopPropagation()
                           setRenamingId(c.id)
                           setRenamingText(c.title)
                         }}
-                        className="p-1 rounded-md text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-all shrink-0"
-                        title={t('home.rename')}
-                      >
-                        <Icon name="edit" size={13} />
-                      </button>
+                      />
                       {/* 分隔线：危险操作与常规操作拉开视觉距离，降低误触 */}
                       <span className="mx-0.5 w-px h-3.5 bg-[var(--border)] shrink-0" aria-hidden="true" />
                       <button
@@ -5530,13 +5519,14 @@ export default function Home() {
                           {t('home.queuedAgentLabel')}
                         </span>
                       )}
-                      <button
+                      <IconButton
+                        icon="close"
+                        label={t('home.queuedRemove')}
+                        hoverTone="danger"
+                        pad="xs"
+                        iconSize={11}
                         onClick={() => removeQueued(q.id)}
-                        className="p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
-                        title={t('home.queuedRemove')}
-                      >
-                        <Icon name="close" size={11} />
-                      </button>
+                      />
                     </div>
                   ))}
                 </div>
@@ -5852,13 +5842,13 @@ export default function Home() {
                   )}
                 </div>
                 {/* Rules 编辑：全局指令 + 项目级 rules（注入 system_prompt） */}
-                <button
+                <IconButton
+                  icon="settings"
+                  label={t('home.rules')}
+                  pad="md"
+                  iconSize={13}
                   onClick={() => void openRulesDialog()}
-                  title={t('home.rules')}
-                  className="p-1.5 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                >
-                  <Icon name="settings" size={13} />
-                </button>
+                />
                 {/* 模型设置：切换模型 / 代理 / 采样参数 */}
                 <div className="relative shrink-0" ref={modelSettingsRef}>
                   <button
@@ -6961,12 +6951,13 @@ export default function Home() {
             <div className="flex items-center gap-2">
               <Icon name="history" size={15} />
               <span className="text-[13px] font-semibold">{t('home.timelineTitle')}</span>
-              <button
+              <IconButton
+                icon="close"
+                label={t('common.close')}
+                iconSize={13}
+                className="ml-auto"
                 onClick={() => setTimelineOpen(false)}
-                className="ml-auto p-1 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <Icon name="close" size={13} />
-              </button>
+              />
             </div>
             <div className="mt-2 text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.timelineDesc')}</div>
             {branchParentId && (
@@ -7054,12 +7045,13 @@ export default function Home() {
             <div className="flex items-center gap-2">
               <Icon name="check" size={15} />
               <span className="text-[13px] font-semibold">{t('home.whitelistTitle')}</span>
-              <button
+              <IconButton
+                icon="close"
+                label={t('common.close')}
+                iconSize={13}
+                className="ml-auto"
                 onClick={() => setWhitelistOpen(false)}
-                className="ml-auto p-1 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <Icon name="close" size={13} />
-              </button>
+              />
             </div>
             <div className="mt-3 space-y-1 max-h-72 overflow-y-auto">
               {whitelist.length === 0 && (
@@ -7072,17 +7064,18 @@ export default function Home() {
                 >
                   <span className="text-[11px] font-mono text-[var(--text-primary)] flex-1 truncate">{w.tool}</span>
                   <span className="text-[10px] text-[var(--text-muted)] shrink-0">{formatTime(w.created_at)}</span>
-                  <button
+                  <IconButton
+                    icon="delete"
+                    label={t('home.whitelistRemove')}
+                    hoverTone="danger"
+                    pad="xs"
+                    iconSize={12}
                     onClick={() => {
                       removeToolWhitelist(currentProject.id, w.tool)
                         .then(() => setWhitelist((l) => l.filter((x) => x.tool !== w.tool)))
                         .catch(() => {})
                     }}
-                    className="p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
-                    title={t('home.whitelistRemove')}
-                  >
-                    <Icon name="delete" size={12} />
-                  </button>
+                  />
                 </div>
               ))}
             </div>
@@ -7777,13 +7770,13 @@ const MessageItem = memo(function MessageItem({
                   {t('home.versionLabel', { n: new Date(v.created_at * 1000).toLocaleString() })}
                 </button>
               ))}
-              <button
+              <IconButton
+                icon="close"
+                label={t('home.close')}
+                iconSize={12}
+                className="ml-auto"
                 onClick={() => setBranchOpen(false)}
-                className="ml-auto p-1 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                title={t('home.close')}
-              >
-                <Icon name="close" size={12} />
-              </button>
+              />
               <button
                 onClick={() => onOpenVersions(message, userMessageId)}
                 className="px-2.5 py-1 rounded-lg text-[11px] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
@@ -7795,37 +7788,33 @@ const MessageItem = memo(function MessageItem({
         )}
         {/* 操作栏：复制 / 引用 / 重新生成 / 点赞 / 点踩 / 朗读 / 版本对比 */}
         <div className="flex items-center gap-0.5 mt-1.5 opacity-0 group-hover:opacity-100 max-md:opacity-100 transition-opacity">
-          <button
+          <IconButton
+            icon={copied ? 'check' : 'copy'}
+            label={t('home.copyMessage')}
+            iconSize={13}
             onClick={copyMessage}
-            className={`p-1 rounded-md transition-colors ${copied ? 'text-[var(--success)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'}`}
-            title={t('home.copyMessage')}
-          >
-            {copied ? <Icon name="check" size={13} /> : <Icon name="copy" size={13} />}
-          </button>
+          />
           {onQuoteMessage && (
-            <button
+            <IconButton
+              icon="quote"
+              label={t('home.quoteMessage')}
+              iconSize={13}
               onClick={() => onQuoteMessage(message)}
-              className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-              title={t('home.quoteMessage')}
-            >
-              <Icon name="quote" size={13} />
-            </button>
+            />
           )}
-          <button
+          <IconButton
+            icon="lightbulb"
+            label={t('knowledge.rememberThisFix')}
+            iconSize={13}
             onClick={openRemember}
-            className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-            title={t('knowledge.rememberThisFix')}
-          >
-            <Icon name="lightbulb" size={13} />
-          </button>
+          />
           {isLastAssistant && onRegenerate && (
-            <button
+            <IconButton
+              icon="refresh"
+              label={t('home.regenerate')}
+              iconSize={13}
               onClick={onRegenerate}
-              className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-              title={t('home.regenerate')}
-            >
-              <Icon name="refresh" size={13} />
-            </button>
+            />
           )}
           <button
             onClick={() => onRate(message.id, feedback?.feedback === 'like' ? 'neutral' : 'like')}
@@ -8235,12 +8224,7 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
             <Icon name="bolt" size={15} />
             <h2 className="text-[14px] font-semibold">{t('home.shortcuts')}</h2>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            <Icon name="close" size={14} />
-          </button>
+          <IconButton icon="close" label={t('common.close')} onClick={onClose} />
         </div>
 
         {/* 搜索框 */}
@@ -8498,13 +8482,8 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
             </div>
             <h2 className="text-[14px] font-semibold">{t('home.batch')}</h2>
           </div>
-          <button
-            onClick={onClose}
-            className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center"
-            title={t('home.cancel')}
-          >
-            <Icon name="close" size={13} />
-          </button>
+          {/* h-6 w-6 锁死 24px 盒：默认 pad + 13px 图标 + 2px 透明边框只会给到 23px */}
+          <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
         </div>
 
         <p className="text-[11.5px] text-[var(--text-muted)] mb-2.5 leading-relaxed">
@@ -8622,13 +8601,7 @@ function ImportDialog({ data, onClose }: {
               {t('home.importMsgCount', { count: data.messages.length })}
             </span>
           </div>
-          <button
-            onClick={onClose}
-            className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center shrink-0"
-            title={t('home.cancel')}
-          >
-            <Icon name="close" size={13} />
-          </button>
+          <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
         </div>
 
         {/* 角色分布小条 */}
@@ -9085,13 +9058,7 @@ function AuditDialog({ onClose }: { onClose: () => void }) {
             >
               {t('home.auditClear')}
             </button>
-            <button
-              onClick={onClose}
-              className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center"
-              title={t('home.cancel')}
-            >
-              <Icon name="close" size={13} />
-            </button>
+            <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
           </div>
         </div>
 
