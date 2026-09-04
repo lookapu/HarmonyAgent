@@ -2289,11 +2289,13 @@ button:active:not(:disabled),
   content-visibility: visible !important;
 }
 
-/* 禁用/简化阴影（软件渲染下多层 box-shadow 是逐像素计算，开销大） */
+/* 禁用/简化阴影（软件渲染下多层 box-shadow 是逐像素计算，开销大）
+   注意 .btn-primary 不在此列：它的基线是 --app-shadow-xs（0 1px 0，零模糊），
+   比这里的 sm（0 1px 2px，有模糊）更轻，套进来等于给低配机器凭空加一层模糊，
+   与本节意图相反。零模糊的 1px 硬偏移没有逐像素开销，不需要降级。 */
 .render-tier-low .shadow-md,
 .render-tier-low .shadow-lg,
 .render-tier-low .glass-card,
-.render-tier-low .btn-primary,
 .render-tier-low .scroll-to-bottom {
   box-shadow: var(--app-shadow-sm) !important;
 }
