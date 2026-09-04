@@ -1445,6 +1445,27 @@ fn replace_all_symbol_rows_with_files_at(
     {
         return false;
     }
+    if transaction
+        .execute(
+            "DELETE FROM semantic_scan_failures
+             WHERE NOT EXISTS (
+               SELECT 1 FROM files f
+               WHERE f.path=semantic_scan_failures.target_file AND f.state='indexed'
+                 AND f.size=semantic_scan_failures.target_size
+                 AND f.mtime_ns=semantic_scan_failures.target_mtime_ns
+             )
+             OR NOT EXISTS (
+               SELECT 1 FROM symbols target
+               WHERE target.file=semantic_scan_failures.target_file
+                 AND target.name=semantic_scan_failures.target_name
+                 AND target.line=semantic_scan_failures.target_line AND target.role='logic'
+             )",
+            [],
+        )
+        .is_err()
+    {
+        return false;
+    }
     let mut baseline_files = symbols
         .iter()
         .map(|symbol| symbol.file.as_str())
@@ -1617,6 +1638,17 @@ fn replace_changed_symbol_rows_at(
         if transaction
             .execute(
                 "DELETE FROM semantic_target_scans
+                 WHERE target_file = ?1
+                    OR substr(target_file, 1, length(?1) + 1) = ?1 || '/'",
+                params![rel],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if transaction
+            .execute(
+                "DELETE FROM semantic_scan_failures
                  WHERE target_file = ?1
                     OR substr(target_file, 1, length(?1) + 1) = ?1 || '/'",
                 params![rel],
@@ -2080,7 +2112,21 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
            recorded_call_count INTEGER NOT NULL,
            truncated INTEGER NOT NULL DEFAULT 0,
            PRIMARY KEY(target_file, target_name, target_line, provider)
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS semantic_scan_failures (
+           target_file TEXT NOT NULL,
+           target_name TEXT NOT NULL,
+           target_line INTEGER NOT NULL,
+           target_size INTEGER NOT NULL,
+           target_mtime_ns INTEGER NOT NULL,
+           provider TEXT NOT NULL,
+           failure_count INTEGER NOT NULL,
+           last_attempt_at INTEGER NOT NULL,
+           retry_after INTEGER NOT NULL,
+           PRIMARY KEY(target_file, target_name, target_line, provider)
+         );
+         CREATE INDEX IF NOT EXISTS idx_semantic_failures_retry
+           ON semantic_scan_failures(provider, retry_after, target_file, target_line);",
     )?;
     let columns = conn
         .prepare("PRAGMA table_info(symbols)")?
@@ -2209,6 +2255,22 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !stats_columns
+        .iter()
+        .any(|column| column == "semantic_failure_target_count")
+    {
+        conn.execute(
+            "ALTER TABLE structure_stats
+             ADD COLUMN semantic_failure_target_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE structure_stats SET semantic_failure_target_count=(
+               SELECT COUNT(*) FROM semantic_scan_failures
+             ) WHERE id=1",
+            [],
+        )?;
+    }
     conn.execute_batch(
         "CREATE TRIGGER IF NOT EXISTS trg_semantic_call_edges_insert
            AFTER INSERT ON semantic_call_edges BEGIN
@@ -2249,6 +2311,18 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
              SET semantic_truncated_target_count=MAX(
                0, semantic_truncated_target_count + NEW.truncated - OLD.truncated
              ) WHERE id=1;
+           END;
+         CREATE TRIGGER IF NOT EXISTS trg_semantic_scan_failures_insert
+           AFTER INSERT ON semantic_scan_failures BEGIN
+             UPDATE structure_stats
+             SET semantic_failure_target_count=semantic_failure_target_count + 1
+             WHERE id=1;
+           END;
+         CREATE TRIGGER IF NOT EXISTS trg_semantic_scan_failures_delete
+           AFTER DELETE ON semantic_scan_failures BEGIN
+             UPDATE structure_stats
+             SET semantic_failure_target_count=MAX(0, semantic_failure_target_count - 1)
+             WHERE id=1;
            END;",
     )?;
     let parser_version = conn.query_row(
@@ -2263,6 +2337,7 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         transaction.execute("DELETE FROM module_reexports", [])?;
         transaction.execute("DELETE FROM semantic_call_edges", [])?;
         transaction.execute("DELETE FROM semantic_target_scans", [])?;
+        transaction.execute("DELETE FROM semantic_scan_failures", [])?;
         transaction.execute("UPDATE files SET state='deferred' WHERE state='indexed'", [])?;
         transaction.execute(
             "UPDATE structure_meta
@@ -2387,13 +2462,28 @@ fn collect_files_at_with_budget(
                    truncated INTEGER NOT NULL DEFAULT 0,
                    PRIMARY KEY(target_file, target_name, target_line, provider)
                  );
+                 CREATE TABLE IF NOT EXISTS semantic_scan_failures (
+                   target_file TEXT NOT NULL,
+                   target_name TEXT NOT NULL,
+                   target_line INTEGER NOT NULL,
+                   target_size INTEGER NOT NULL,
+                   target_mtime_ns INTEGER NOT NULL,
+                   provider TEXT NOT NULL,
+                   failure_count INTEGER NOT NULL,
+                   last_attempt_at INTEGER NOT NULL,
+                   retry_after INTEGER NOT NULL,
+                   PRIMARY KEY(target_file, target_name, target_line, provider)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_semantic_failures_retry
+                   ON semantic_scan_failures(provider, retry_after, target_file, target_line);
                  CREATE TABLE IF NOT EXISTS structure_stats (
                    id INTEGER PRIMARY KEY CHECK(id = 1),
                    relation_count INTEGER NOT NULL DEFAULT 0,
                    semantic_relation_count INTEGER NOT NULL DEFAULT 0,
                    logic_symbol_count INTEGER NOT NULL DEFAULT 0,
                    semantic_target_count INTEGER NOT NULL DEFAULT 0,
-                   semantic_truncated_target_count INTEGER NOT NULL DEFAULT 0
+                   semantic_truncated_target_count INTEGER NOT NULL DEFAULT 0,
+                   semantic_failure_target_count INTEGER NOT NULL DEFAULT 0
                  );
                  INSERT OR IGNORE INTO structure_stats(id, relation_count)
                    SELECT 1, COUNT(*) FROM symbol_edges;
@@ -3104,6 +3194,7 @@ pub struct SemanticCoverageStats {
     pub scanned_logic_symbols: usize,
     pub semantic_call_relations: usize,
     pub truncated_targets: usize,
+    pub backoff_targets: usize,
     pub coverage_percent: f64,
     pub coverage: String,
 }
@@ -3122,6 +3213,7 @@ impl SemanticCoverageStats {
         scanned_logic_symbols: usize,
         semantic_call_relations: usize,
         truncated_targets: usize,
+        backoff_targets: usize,
     ) -> Self {
         let scanned_logic_symbols = scanned_logic_symbols.min(indexed_logic_symbols);
         let coverage_percent = if indexed_logic_symbols == 0 {
@@ -3146,6 +3238,7 @@ impl SemanticCoverageStats {
             scanned_logic_symbols,
             semantic_call_relations,
             truncated_targets,
+            backoff_targets,
             coverage_percent,
             coverage,
         }
@@ -3159,7 +3252,8 @@ fn persisted_semantic_coverage_at(
     let conn = Connection::open(catalog_file_at(data_dir, root)).ok()?;
     conn.query_row(
         "SELECT logic_symbol_count, semantic_target_count,
-                semantic_relation_count, semantic_truncated_target_count
+                semantic_relation_count, semantic_truncated_target_count,
+                semantic_failure_target_count
          FROM structure_stats WHERE id=1",
         [],
         |row| {
@@ -3168,6 +3262,7 @@ fn persisted_semantic_coverage_at(
                 row.get::<_, i64>(1)?.max(0) as usize,
                 row.get::<_, i64>(2)?.max(0) as usize,
                 row.get::<_, i64>(3)?.max(0) as usize,
+                row.get::<_, i64>(4)?.max(0) as usize,
             ))
         },
     )
@@ -3208,8 +3303,12 @@ fn next_lsp_semantic_targets_at(
          LEFT JOIN semantic_target_scans scan
            ON scan.target_file=s.file AND scan.target_name=s.name
           AND scan.target_line=s.line AND scan.provider='arkts_lsp'
+         LEFT JOIN semantic_scan_failures failure
+           ON failure.target_file=s.file AND failure.target_name=s.name
+          AND failure.target_line=s.line AND failure.provider='arkts_lsp'
          WHERE s.role='logic' AND s.language=?2 AND s.kind=?1
            AND scan.target_file IS NULL
+           AND (failure.target_file IS NULL OR failure.retry_after <= ?4)
          ORDER BY s.file, s.line, s.name
          LIMIT ?3",
     ) {
@@ -3217,6 +3316,7 @@ fn next_lsp_semantic_targets_at(
         Err(_) => return Vec::new(),
     };
     let limit = limit.clamp(1, 64);
+    let now = now_secs() as i64;
     let mut targets = Vec::new();
     for kind in ["method", "function"] {
         for language in ["ets", "ts"] {
@@ -3226,7 +3326,7 @@ fn next_lsp_semantic_targets_at(
             }
             let candidate_limit = remaining.saturating_mul(4).min(256) as i64;
             let rows = match statement.query_map(
-                params![kind, language, candidate_limit],
+                params![kind, language, candidate_limit, now],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -4508,6 +4608,90 @@ fn project_relative(root: &Path, path: &Path) -> Option<String> {
         .filter(|rel| !rel.is_empty())
 }
 
+const LSP_SCAN_BACKOFF_SECS: [u64; 8] = [30, 60, 120, 300, 600, 1_800, 3_600, 21_600];
+
+fn record_lsp_scan_failure_at(
+    root: &Path,
+    data_dir: &Path,
+    target_path: &Path,
+    target_line: usize,
+) -> u64 {
+    let Some(target_rel) = project_relative(root, target_path) else {
+        return 0;
+    };
+    let Some(target_stamp) = file_stamp(target_path) else {
+        return 0;
+    };
+    let mut conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    if !indexed_stamp_matches(&conn, &target_rel, target_stamp) {
+        return 0;
+    }
+    let transaction = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    if file_stamp(target_path) != Some(target_stamp)
+        || !indexed_stamp_matches(&transaction, &target_rel, target_stamp)
+    {
+        return 0;
+    }
+    let Some((target_name, target_symbol_line)) =
+        logic_symbol_at(&transaction, &target_rel, target_line)
+    else {
+        return 0;
+    };
+    let previous = transaction
+        .query_row(
+            "SELECT failure_count, target_size, target_mtime_ns
+             FROM semantic_scan_failures
+             WHERE target_file=?1 AND target_name=?2 AND target_line=?3
+               AND provider='arkts_lsp'",
+            params![target_rel, target_name, target_symbol_line],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+        )
+        .ok();
+    let failure_count = previous
+        .filter(|(_, size, mtime)| {
+            *size == target_stamp.len as i64 && *mtime == target_stamp.mtime as i64
+        })
+        .map(|(count, _, _)| count.max(0) as usize + 1)
+        .unwrap_or(1)
+        .min(LSP_SCAN_BACKOFF_SECS.len());
+    let delay = LSP_SCAN_BACKOFF_SECS[failure_count - 1];
+    let attempted_at = now_secs();
+    if transaction
+        .execute(
+            "INSERT INTO semantic_scan_failures(
+               target_file, target_name, target_line, target_size, target_mtime_ns,
+               provider, failure_count, last_attempt_at, retry_after
+             ) VALUES(?1, ?2, ?3, ?4, ?5, 'arkts_lsp', ?6, ?7, ?8)
+             ON CONFLICT(target_file, target_name, target_line, provider) DO UPDATE SET
+               target_size=excluded.target_size,
+               target_mtime_ns=excluded.target_mtime_ns,
+               failure_count=excluded.failure_count,
+               last_attempt_at=excluded.last_attempt_at,
+               retry_after=excluded.retry_after",
+            params![
+                target_rel,
+                target_name,
+                target_symbol_line,
+                target_stamp.len as i64,
+                target_stamp.mtime as i64,
+                failure_count as i64,
+                attempted_at as i64,
+                attempted_at.saturating_add(delay) as i64,
+            ],
+        )
+        .is_err()
+    {
+        return 0;
+    }
+    if transaction.commit().is_ok() { delay } else { 0 }
+}
+
 fn record_lsp_call_references_at(
     root: &Path,
     data_dir: &Path,
@@ -4571,6 +4755,17 @@ fn record_lsp_call_references_at(
     else {
         return 0;
     };
+    if transaction
+        .execute(
+            "DELETE FROM semantic_scan_failures
+             WHERE target_file=?1 AND target_name=?2 AND target_line=?3
+               AND provider='arkts_lsp'",
+            params![target_rel, target_name, target_symbol_line],
+        )
+        .is_err()
+    {
+        return 0;
+    }
     let mut recorded = 0usize;
     for (source_path, source_rel, source_stamp, positions) in valid_sources {
         if file_stamp(&source_path) != Some(source_stamp)
@@ -4727,6 +4922,17 @@ pub(crate) fn record_lsp_call_references(
     )
 }
 
+pub(crate) fn record_lsp_scan_failure(
+    root: &Path,
+    target_path: &Path,
+    target_line: usize,
+) -> u64 {
+    let Some(data_dir) = DATA_DIR.get() else {
+        return 0;
+    };
+    record_lsp_scan_failure_at(root, data_dir, target_path, target_line)
+}
+
 fn persisted_symbol_count(root: &Path) -> Option<usize> {
     let data_dir = DATA_DIR.get()?;
     let conn = Connection::open(catalog_file_at(data_dir, root)).ok()?;
@@ -4875,6 +5081,7 @@ pub fn query_structure_with_cursor(
     let semantic = persisted_semantic_coverage(root).unwrap_or_else(|| {
         SemanticCoverageStats::from_counts(
             syms.iter().filter(|symbol| symbol.role == "logic").count(),
+            0,
             0,
             0,
             0,
@@ -5474,6 +5681,7 @@ class Service extends BaseService implements Loadable, Disposable {}
             "logic_symbol_count",
             "semantic_target_count",
             "semantic_truncated_target_count",
+            "semantic_failure_target_count",
         ] {
             assert!(stats_columns.iter().any(|value| value == column), "{column}");
         }
@@ -5515,6 +5723,15 @@ class Service extends BaseService implements Loadable, Disposable {}
             )
             .unwrap();
         assert_eq!(semantic_scan_table, 1);
+        let semantic_failure_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='semantic_scan_failures'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_failure_table, 1);
         let parser_version: i64 = conn
             .query_row(
                 "SELECT parser_version FROM structure_meta WHERE id=1",
@@ -5738,12 +5955,18 @@ class Service extends BaseService implements Loadable, Disposable {}
                  LEFT JOIN semantic_target_scans scan
                    ON scan.target_file=s.file AND scan.target_name=s.name
                   AND scan.target_line=s.line AND scan.provider='arkts_lsp'
+                 LEFT JOIN semantic_scan_failures failure
+                   ON failure.target_file=s.file AND failure.target_name=s.name
+                  AND failure.target_line=s.line AND failure.provider='arkts_lsp'
                  WHERE s.role='logic' AND s.language=?2 AND s.kind=?1
                    AND scan.target_file IS NULL
+                   AND (failure.target_file IS NULL OR failure.retry_after <= ?4)
                  ORDER BY s.file, s.line, s.name LIMIT ?3",
             )
             .unwrap()
-            .query_map(params!["method", "ets", 16], |row| row.get::<_, String>(3))
+            .query_map(params!["method", "ets", 16, now_secs() as i64], |row| {
+                row.get::<_, String>(3)
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
@@ -6479,6 +6702,25 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert_eq!(pending[0].line, 1);
         assert_eq!(pending[0].column, 2);
         assert_eq!(
+            record_lsp_scan_failure_at(&root, &data_dir, &target_file, 1),
+            30
+        );
+        let coverage = persisted_semantic_coverage_at(&root, &data_dir).unwrap();
+        assert_eq!(coverage.backoff_targets, 1);
+        assert!(next_lsp_semantic_targets_at(&root, &data_dir, 4)
+            .iter()
+            .all(|target| !(target.path == target_file && target.name == "fetch")));
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        conn.execute("UPDATE semantic_scan_failures SET retry_after=0", [])
+            .unwrap();
+        assert!(next_lsp_semantic_targets_at(&root, &data_dir, 4)
+            .iter()
+            .any(|target| target.path == target_file && target.name == "fetch"));
+        assert_eq!(
+            record_lsp_scan_failure_at(&root, &data_dir, &target_file, 1),
+            60
+        );
+        assert_eq!(
             record_lsp_call_references_at(
                 &root,
                 &data_dir,
@@ -6507,6 +6749,7 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert_eq!(coverage.scanned_logic_symbols, 1);
         assert_eq!(coverage.semantic_call_relations, 3);
         assert_eq!(coverage.truncated_targets, 0);
+        assert_eq!(coverage.backoff_targets, 0, "成功扫描应清除失败退避");
         assert_eq!(coverage.coverage_percent, 25.0);
         assert_eq!(coverage.coverage, "partial_query_driven");
         assert!(next_lsp_semantic_targets_at(&root, &data_dir, 4)
@@ -6528,6 +6771,10 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert_eq!(coverage.scanned_logic_symbols, 1, "重复扫描不能重复计数");
         assert_eq!(coverage.truncated_targets, 1);
         assert_eq!(coverage.coverage, "partial_with_truncated_targets");
+        assert_eq!(
+            record_lsp_scan_failure_at(&root, &data_dir, &target_file, 1),
+            30
+        );
 
         std::fs::write(&target_file, "export class Client {\n  renamed() {}\n}\n").unwrap();
         assert!(matches!(
@@ -6547,6 +6794,7 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert_eq!(coverage.scanned_logic_symbols, 0);
         assert_eq!(coverage.semantic_call_relations, 0);
         assert_eq!(coverage.truncated_targets, 0);
+        assert_eq!(coverage.backoff_targets, 0, "目标变化应清除失败退避");
         assert_eq!(coverage.coverage, "not_started_query_driven");
 
         std::fs::remove_dir_all(&root).ok();

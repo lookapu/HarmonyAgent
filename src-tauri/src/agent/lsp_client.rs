@@ -540,6 +540,7 @@ async fn lsp_index_call_targets(
     let limit = limit.clamp(1, 16);
     let conn = conn_for(conversation_id).await?;
     let mut failed = 0usize;
+    let mut backed_off = 0usize;
     let mut recorded = 0usize;
     let mut selected = Vec::new();
     for root in roots {
@@ -574,22 +575,35 @@ async fn lsp_index_call_targets(
         let responses = join_all(chunk.iter().cloned().map(|(root, target)| {
             let conn = conn.clone();
             async move {
-                let uri = to_file_uri(&target.path)?;
-                let response = conn
-                    .request("textDocument/references", json!({
-                        "textDocument": {"uri": uri},
-                        "position": {"line": target.line, "character": target.column},
-                        "context": {"includeDeclaration": false}
-                    }), std::time::Duration::from_secs(10))
-                    .await;
-                Ok::<_, String>((root, target, response))
+                let response = match to_file_uri(&target.path) {
+                    Ok(uri) => conn
+                        .request("textDocument/references", json!({
+                            "textDocument": {"uri": uri},
+                            "position": {"line": target.line, "character": target.column},
+                            "context": {"includeDeclaration": false}
+                        }), std::time::Duration::from_secs(10))
+                        .await,
+                    Err(error) => Err(error),
+                };
+                (root, target, response)
             }
         }))
         .await;
-        for response in responses {
-            let Ok((root, target, Ok(response))) = response else {
-                failed += 1;
-                continue;
+        for (root, target, response) in responses {
+            let response = match response {
+                Ok(value) => value,
+                Err(_) => {
+                    failed += 1;
+                    if crate::services::symbol_index::record_lsp_scan_failure(
+                        &root,
+                        &target.path,
+                        target.line,
+                    ) > 0
+                    {
+                        backed_off += 1;
+                    }
+                    continue;
+                }
             };
             let items = response.as_array().cloned().unwrap_or_default();
             let project_references = items
@@ -611,9 +625,10 @@ async fn lsp_index_call_targets(
         }
     }
     Ok(format!(
-        "渐进语义扫描：尝试 {} 个高优先级未覆盖目标，失败 {} 个，沉淀 {} 条成员调用关系。\n{}",
+        "渐进语义扫描：尝试 {} 个高优先级未覆盖目标，失败 {} 个（已退避 {} 个），沉淀 {} 条成员调用关系。\n{}",
         attempted,
         failed,
+        backed_off,
         recorded,
         names.join("\n"),
     ))

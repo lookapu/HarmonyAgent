@@ -378,7 +378,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "lsp_references",
-        desc: "LSP 查找引用（真实 AST）：给出文件中某个符号的行列位置，返回该符号全部引用位置；唯一工程内定义对应的成员调用会机会式批量补入结构索引（单次最多 256 个工程内引用）。也可只传 {\"auto_batch_limit\":<1-16>}，按方法优先、公开符号优先、稳定路径顺序渐进扫描尚未覆盖的 ArkTS/TypeScript 逻辑符号；扫描账本提供断点续扫。\n普通参数：{\"path\":\"<文件路径>\",\"line\":<行号 1 起>,\"column\":<列号 1 起>,\"include_declaration\":<可选，缺省 true=含声明本身>}。\n适合：重构前评估影响面（改名字/改签名会波及哪些地方），或用小批次逐步提高调用图语义覆盖率。\n副作用：只读查询（会话内常驻 LSP 进程；内部结构索引缓存可能增量更新）。\n返回：普通模式返回引用位置和沉淀数量；渐进模式返回尝试目标、失败数和新增调用关系数。",
+        desc: "LSP 查找引用（真实 AST）：给出文件中某个符号的行列位置，返回该符号全部引用位置；唯一工程内定义对应的成员调用会机会式批量补入结构索引（单次最多 256 个工程内引用）。也可只传 {\"auto_batch_limit\":<1-16>}，按方法优先、公开符号优先、稳定路径顺序渐进扫描尚未覆盖的 ArkTS/TypeScript 逻辑符号；扫描账本提供断点续扫，失败目标持久指数退避。\n普通参数：{\"path\":\"<文件路径>\",\"line\":<行号 1 起>,\"column\":<列号 1 起>,\"include_declaration\":<可选，缺省 true=含声明本身>}。\n适合：重构前评估影响面（改名字/改签名会波及哪些地方），或用小批次逐步提高调用图语义覆盖率。\n副作用：只读查询（会话内常驻 LSP 进程；内部结构索引缓存可能增量更新）。\n返回：普通模式返回引用位置和沉淀数量；渐进模式返回尝试目标、失败/退避数和新增调用关系数。",
     },
     ToolSpec {
         name: "lsp_symbols",
@@ -3669,12 +3669,13 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         out.push_str("注意：当前结构索引不是全量语义保证；无结果或高风险修改时需用 codebase_search/LSP/精确路径补查。\n");
     }
     out.push_str(&format!(
-        "语义调用覆盖：已扫描 {}/{} 个逻辑符号（{:.2}%），沉淀 {} 条调用关系，截断目标 {}；semantic_coverage={}。\n",
+        "语义调用覆盖：已扫描 {}/{} 个逻辑符号（{:.2}%），沉淀 {} 条调用关系，截断目标 {}，退避目标 {}；semantic_coverage={}。\n",
         result.semantic.scanned_logic_symbols,
         result.semantic.indexed_logic_symbols,
         result.semantic.coverage_percent,
         result.semantic.semantic_call_relations,
         result.semantic.truncated_targets,
+        result.semantic.backoff_targets,
         result.semantic.coverage,
     ));
     if matches!(
