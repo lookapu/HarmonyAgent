@@ -110,6 +110,7 @@ import { ToolRunGroup } from '../chat/components/toolRuns'
 import { FeedbackDialog, VersionDiffDialog, MemoryDraftDialog, EditMessageDialog, RulesDialog } from '../chat/components/dialogs'
 import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, PreviewPanel, TerminalPanel, ShellPanel } from '../chat/components/panels'
 import CommandPalette, { type PaletteCommand } from '../components/CommandPalette'
+import { Button } from '../components/ui/Button'
 import {
   fmtElapsed,
   interruptedTailMessage,
@@ -3870,13 +3871,16 @@ export default function Home() {
 
         {/* 添加项目 */}
         <div className="px-3 pb-3 shrink-0">
-          <button
-            onClick={() => setShowAddDialog(true)}
+          <Button
+            variant="primary"
+            size="md"
+            icon="plus"
             title={t('home.addProject')}
-            className={`h-9 flex items-center justify-center gap-1.5 rounded-[10px] btn-primary text-[13px] font-medium transition-all ${sidebarCollapsed ? 'w-9 mx-auto' : 'w-full'}`}
+            onClick={() => setShowAddDialog(true)}
+            className={sidebarCollapsed ? 'w-9 mx-auto' : 'w-full'}
           >
-            <Icon name="plus" size={15} white /> {!sidebarCollapsed && t('home.addProject')}
-          </button>
+            {!sidebarCollapsed && t('home.addProject')}
+          </Button>
         </div>
 
         {/* 最近项目 */}
@@ -5055,13 +5059,14 @@ export default function Home() {
                                     : t('home.interruptedBannerDesc')}
                                 </div>
                               </div>
-                              <button
+                              <Button
+                                variant="primary"
+                                size="sm"
+                                icon="refresh"
                                 onClick={() => void regenerateLatest()}
-                                className="shrink-0 h-7 px-3 rounded-full btn-primary text-[11.5px] font-medium flex items-center gap-1"
                               >
-                                <Icon name="refresh" size={11} />
                                 {t('home.resumeGenerate')}
-                              </button>
+                              </Button>
                             </div>
                           )}
                           <div ref={bottomRef} />
@@ -5237,10 +5242,10 @@ export default function Home() {
                               placeholder={t('home.ctxPinDecisionPlaceholder')}
                               className="min-w-0 flex-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-1.5 py-1 outline-none"
                             />
-                            <button
-                              type="button"
+                            <Button
+                              variant="primary"
+                              size="xs"
                               disabled={!ctxDecisionDraft.trim()}
-                              className="rounded bg-[var(--accent)] px-2 py-1 text-white disabled:opacity-40"
                               onClick={() => {
                                 const decision = ctxDecisionDraft.trim()
                                 if (!decision) return
@@ -5249,7 +5254,7 @@ export default function Home() {
                               }}
                             >
                               {t('home.ctxPinAdd')}
-                            </button>
+                            </Button>
                           </span>
                         </span>
                         <span className="mb-2 block">
@@ -6659,7 +6664,10 @@ export default function Home() {
               >
                 {t('home.planReject')}
               </button>
-              <button
+              <Button
+                variant="primary"
+                size="md"
+                icon="check"
                 onClick={() => {
                   // 批准：若编辑过计划，把修订稿作为执行要求注入；否则纯批准
                   const edited = planDraft.trim()
@@ -6673,11 +6681,9 @@ export default function Home() {
                   void resolvePlanReview(pendingPlan.requestId, true, fb || undefined)
                   setPlanFeedback('')
                 }}
-                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium transition-all flex items-center gap-1.5"
               >
-                <Icon name="check" size={14} />
                 {t('home.planApprove')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -6727,9 +6733,9 @@ export default function Home() {
                 <button type="button" onClick={() => handleDiagnoseDismiss(card)} className="h-7 px-2.5 rounded-lg text-[10.5px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors">
                   {t('home.diagnoseLater')}
                 </button>
-                <button type="button" onClick={() => void handleDiagnoseAction(card)} className="h-7 px-3 rounded-lg text-[10.5px] font-medium btn-primary hover:opacity-90 transition-opacity">
+                <Button variant="primary" size="sm" onClick={() => void handleDiagnoseAction(card)}>
                   {actionLabel}
-                </button>
+                </Button>
               </div>
             )}
           </div>
@@ -6787,14 +6793,9 @@ export default function Home() {
               >
                 {t('home.askSkip')}
               </button>
-              <button
-                type="button"
-                onClick={handleAskSubmit}
-                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium transition-all flex items-center gap-1.5"
-              >
-                <Icon name="send" size={12} />
+              <Button variant="primary" size="md" icon="send" onClick={handleAskSubmit}>
                 {t('home.askSubmit')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -6872,12 +6873,13 @@ export default function Home() {
               >
                 {t('home.toolApprovalReject')}
               </button>
-              <button
+              <Button
+                variant="primary"
+                size="md"
                 onClick={() => resolveToolApproval(toolApprovals[0].requestId, true, approvalScope !== '', undefined, approvalScope || undefined)}
-                className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all"
               >
                 {t('home.toolApprovalAllow')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -7330,13 +7332,9 @@ export default function Home() {
             >
               {t('knowledge.candidateDismiss')}
             </button>
-            <button
-              onClick={saveKnowledgeCandidate}
-              disabled={candidateSaving}
-              className="h-8 px-4 rounded-lg btn-primary text-[12px]  disabled:opacity-50"
-            >
+            <Button variant="primary" size="md" loading={candidateSaving} onClick={saveKnowledgeCandidate}>
               {t('knowledge.candidateSave')}
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -7926,13 +7924,9 @@ const MessageItem = memo(function MessageItem({
               >
                 {t('mcp.cancel')}
               </button>
-              <button
-                onClick={saveRemember}
-                disabled={rememberSaving}
-                className="h-8 px-4 rounded-lg btn-primary text-[12px]  disabled:opacity-50"
-              >
+              <Button variant="primary" size="md" loading={rememberSaving} onClick={saveRemember}>
                 {t('knowledge.save')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -8550,13 +8544,9 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
             >
               {t('home.cancel')}
             </button>
-            <button
-              onClick={submit}
-              disabled={lines.length === 0}
-              className="h-7 px-3 rounded-lg btn-primary text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
-            >
+            <Button variant="primary" size="sm" disabled={lines.length === 0} onClick={submit}>
               {t('home.batchSend')}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -8698,14 +8688,15 @@ function ImportDialog({ data, onClose }: {
             >
               {t('home.cancel')}
             </button>
-            <button
+            <Button
+              variant="primary"
+              size="sm"
               ref={copyRef}
+              icon={copied ? 'check' : 'copy'}
               onClick={copyAll}
-              className="h-7 px-3 rounded-lg btn-primary text-[12px] flex items-center gap-1.5"
             >
-              <Icon name={copied ? 'check' : 'copy'} size={12} white />
               {copied ? t('home.importCopied') : t('home.importCopyAll')}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -8769,15 +8760,16 @@ function ConvNoteBar({ convId }: { convId: string }) {
             <span className={`text-[10px] tnum ${draft.length > NOTE_MAX_LEN * 0.9 ? 'text-[var(--warning)]' : 'text-[var(--text-muted)]'}`}>
               {draft.length}/{NOTE_MAX_LEN}
             </span>
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={() => {
                 setNote(convId, draft)
                 setEditing(false)
               }}
-              className="text-[10.5px] h-6 px-2 rounded-md btn-primary"
             >
               {t('home.noteDone')}
-            </button>
+            </Button>
           </div>
         </div>
         <textarea

@@ -8,6 +8,7 @@ import { sanitizeToolMarkers } from '../chatUtils'
 import { createPortal } from 'react-dom'
 import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
+import { Button } from '../../components/ui/Button'
 
 /** 流式补全未闭合的代码围栏：``` 未配对时补一个闭合，否则 react-markdown 把整块当纯文本，
  *  代码块刚开头时裸露 ``` 符号闪烁；只影响展示层，不改真实内容 */
@@ -683,12 +684,10 @@ export const EmptyState = memo(function EmptyState({
       </div>
       <h2 className="text-lg font-semibold">{t('home.welcome')}</h2>
       <p className="text-[13px] text-[var(--text-secondary)] mt-1.5 max-w-sm leading-relaxed">{t('home.welcomeDesc')}</p>
-      <button
-        onClick={onAdd}
-        className="mt-7 h-10 px-5 rounded-[10px] btn-primary text-[13px] font-medium flex items-center gap-1.5 transition-all"
-      >
-        <Icon name="plus" size={15} white /> {t('home.addProject')}
-      </button>
+      {/* Button 基类的 shrink-0 在这里是承重墙：外层容器矮视口下会溢出，删了它 CTA 会被压到 21.5px（比一行文字还矮） */}
+      <Button variant="primary" size="md" icon="plus" className="mt-7" onClick={onAdd}>
+        {t('home.addProject')}
+      </Button>
       {secondaryActions.length > 0 && (
         <div className="mt-8 grid grid-cols-3 gap-2.5 w-full max-w-md animate-fade-in-up">
           {secondaryActions.map((a, i) => (
