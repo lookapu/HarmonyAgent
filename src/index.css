@@ -17,6 +17,13 @@
   --radius-lg: var(--app-radius-lg);
   --radius-xl: var(--app-radius-xl);
 
+  --shadow-xs: var(--app-shadow-xs);
+  --shadow-sm: var(--app-shadow-sm);
+  --shadow-md: var(--app-shadow-md);
+  --shadow-lg: var(--app-shadow-lg);
+  --shadow-xl: var(--app-shadow-xl);
+  --shadow-2xl: var(--app-shadow-2xl);
+
   --ease-out: var(--app-ease-out);
   --ease-spring: var(--app-ease-spring);
 }
@@ -81,9 +88,12 @@
   --scrollbar: rgba(255, 255, 255, 0.12);
   --icon-filter: brightness(0) invert(1);
 
+  --app-shadow-xs: 0 1px 1px rgba(0, 0, 0, 0.20);
   --app-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
   --app-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
   --app-shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --app-shadow-xl: 0 16px 40px rgba(0, 0, 0, 0.50);
+  --app-shadow-2xl: 0 20px 48px rgba(0, 0, 0, 0.55);
   --app-ring: 0 0 0 3px var(--accent-soft);
 
   /* 动效常量：统一在 CSS 里管理，避免组件各自写魔法数 */
@@ -160,9 +170,12 @@
   --scrollbar: rgba(15, 23, 42, 0.18);
   --icon-filter: brightness(0);
 
+  --app-shadow-xs: 0 1px 1px rgba(15, 23, 42, 0.04);
   --app-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
   --app-shadow-md: 0 2px 8px rgba(15, 23, 42, 0.06), 0 6px 20px rgba(15, 23, 42, 0.08);
   --app-shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.10), 0 16px 48px rgba(15, 23, 42, 0.10);
+  --app-shadow-xl: 0 12px 32px rgba(15, 23, 42, 0.12), 0 20px 56px rgba(15, 23, 42, 0.10);
+  --app-shadow-2xl: 0 16px 40px rgba(15, 23, 42, 0.14), 0 28px 72px rgba(15, 23, 42, 0.12);
   --app-ring: 0 0 0 3px var(--accent-soft);
 
   /* 动效常量 + 圆角 + 等宽数字：与暗色主题一致 */
