@@ -27,6 +27,9 @@ const MAX_BYTES: u64 = 512 * 1024;
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct CatalogStats {
+    /// SQLite 目录代次，用于在并发全量/增量写入之间做 fencing。
+    #[serde(default)]
+    pub revision: u64,
     pub discovered_files: usize,
     pub source_files: usize,
     pub indexed_source_files: usize,
@@ -547,6 +550,12 @@ fn catalog_stats(conn: &Connection) -> rusqlite::Result<CatalogStats> {
             _ => stats.unsupported_files += count,
         }
     }
+    drop(statement);
+    stats.revision = conn
+        .query_row("SELECT COALESCE(MAX(generation), 0) FROM files", [], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .max(0) as u64;
     Ok(stats)
 }
 
@@ -643,6 +652,110 @@ fn apply_catalog_changes(root: &Path, rels: &[String]) -> CatalogDelta {
         return CatalogDelta::NeedsReconciliation;
     };
     apply_catalog_changes_at(root, data_dir, rels)
+}
+
+fn insert_symbol_row(transaction: &rusqlite::Transaction<'_>, symbol: &Symbol) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO symbols(file, kind, name, line, end_line, role, signature, parent, shard)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            symbol.file,
+            symbol.kind,
+            symbol.name,
+            symbol.line as i64,
+            symbol.end_line as i64,
+            symbol.role,
+            symbol.signature,
+            symbol.parent,
+            shard_for(&symbol.file),
+        ],
+    )?;
+    Ok(())
+}
+
+/// 全量一致性扫描后重建结构节点表。当前轻量解析最多覆盖 MAX_FILES，写入量有明确上限。
+fn replace_all_symbol_rows_at(
+    root: &Path,
+    data_dir: &Path,
+    symbols: &[Symbol],
+    expected_revision: u64,
+) -> bool {
+    let mut conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let transaction = match conn.transaction() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let revision = transaction
+        .query_row("SELECT COALESCE(MAX(generation), 0) FROM files", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(-1);
+    if revision < 0 || revision as u64 != expected_revision {
+        return false;
+    }
+    if transaction.execute("DELETE FROM symbols", []).is_err() {
+        return false;
+    }
+    for symbol in symbols {
+        if insert_symbol_row(&transaction, symbol).is_err() {
+            return false;
+        }
+    }
+    transaction.commit().is_ok()
+}
+
+fn replace_all_symbol_rows(root: &Path, symbols: &[Symbol], expected_revision: u64) -> bool {
+    let Some(data_dir) = DATA_DIR.get() else { return false };
+    replace_all_symbol_rows_at(root, data_dir, symbols, expected_revision)
+}
+
+/// 文件级事件只替换对应结构节点；删除目录时同时清理路径前缀。
+fn replace_changed_symbol_rows_at(
+    root: &Path,
+    data_dir: &Path,
+    rels: &[String],
+    symbols: &[Symbol],
+) -> bool {
+    let mut conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let transaction = match conn.transaction() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let mut normalized = Vec::new();
+    for value in rels {
+        let Some((rel, _)) = normalize_changed_path(root, value) else { continue };
+        if transaction
+            .execute(
+                "DELETE FROM symbols
+                 WHERE file = ?1 OR substr(file, 1, length(?1) + 1) = ?1 || '/'",
+                params![rel],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        normalized.push(rel);
+    }
+    for symbol in symbols {
+        if normalized.iter().any(|rel| {
+            symbol.file == *rel || symbol.file.strip_prefix(rel).is_some_and(|tail| tail.starts_with('/'))
+        }) && insert_symbol_row(&transaction, symbol).is_err()
+        {
+            return false;
+        }
+    }
+    transaction.commit().is_ok()
+}
+
+fn replace_changed_symbol_rows(root: &Path, rels: &[String], symbols: &[Symbol]) -> bool {
+    let Some(data_dir) = DATA_DIR.get() else { return false };
+    replace_changed_symbol_rows_at(root, data_dir, rels, symbols)
 }
 
 /// 遍历所有未忽略文件。回调是流式的，百万文件时不需要把全目录保存在内存。
@@ -747,6 +860,22 @@ fn collect_files_at(
                  );
                  CREATE INDEX IF NOT EXISTS idx_files_state ON files(state);
                  CREATE INDEX IF NOT EXISTS idx_files_shard ON files(shard);
+                 CREATE TABLE IF NOT EXISTS symbols (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   file TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   line INTEGER NOT NULL,
+                   end_line INTEGER NOT NULL,
+                   role TEXT NOT NULL,
+                   signature TEXT NOT NULL,
+                   parent TEXT,
+                   shard TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
+                 CREATE INDEX IF NOT EXISTS idx_symbols_role_kind ON symbols(role, kind);
+                 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name COLLATE NOCASE);
+                 CREATE INDEX IF NOT EXISTS idx_symbols_shard ON symbols(shard);
                  BEGIN IMMEDIATE;",
             )
             .ok()?;
@@ -781,6 +910,7 @@ fn collect_files_at(
             && conn.execute_batch("COMMIT;").is_ok()
         {
             stats.persisted = true;
+            stats.revision = generation.max(0) as u64;
         } else {
             let _ = conn.execute_batch("ROLLBACK;");
         }
@@ -1171,6 +1301,9 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
     };
     // 阶段 2（无锁）：walk + 指纹对比 + 只重扫变化文件
     let (_rescanned, _removed, catalog) = sync_incremental(&mut files, &mut syms, root);
+    if catalog.persisted {
+        let _ = replace_all_symbol_rows(root, &syms, catalog.revision);
+    }
     // 阶段 3（锁内）：CAS 写回——期间有其他线程同步过（last_sync 变化）则丢弃本地结果。
     // invalidate_files 精确更新同样会推进 last_sync，不会被本阶段覆盖丢失。
     let mut guard = cache().lock().unwrap();
@@ -1301,7 +1434,31 @@ pub fn invalidate_files(root: &Path, rels: &[String]) -> bool {
         entry.last_sync = now_secs();
         save_persisted(root, &entry.files, &entry.syms, entry.catalog);
     }
-    catalog_precise
+    let normalized = rels
+        .iter()
+        .filter_map(|value| normalize_changed_path(root, value).map(|(rel, _)| rel))
+        .collect::<Vec<_>>();
+    let affected_symbols = entry
+        .syms
+        .iter()
+        .filter(|symbol| {
+            normalized.iter().any(|rel| {
+                symbol.file == *rel
+                    || symbol
+                        .file
+                        .strip_prefix(rel)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    drop(guard);
+    let symbols_precise = !changed || replace_changed_symbol_rows(root, rels, &affected_symbols);
+    let precise = catalog_precise && symbols_precise;
+    if !precise {
+        request_reconciliation(root);
+    }
+    precise
 }
 
 /// 路径安全校验：仅项目内相对路径，拒绝越界
@@ -1352,6 +1509,85 @@ pub struct StructureQueryResult {
     pub synced_ago_secs: u64,
 }
 
+fn query_persisted_symbols_at(
+    root: &Path,
+    data_dir: &Path,
+    query: &str,
+    role: Option<&str>,
+    kind: Option<&str>,
+    file: Option<&str>,
+    page: usize,
+    page_size: usize,
+) -> Option<Result<(Vec<Symbol>, usize), String>> {
+    let conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("打开结构节点库失败：{error}"))),
+    };
+    let query = query.trim().to_lowercase();
+    let role = role.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("");
+    let kind = kind.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("");
+    let file = file.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("").to_lowercase();
+    let where_sql = "(?1 = '' OR role = ?1)
+                     AND (?2 = '' OR kind = ?2)
+                     AND (?3 = '' OR instr(lower(file), ?3) > 0)
+                     AND (?4 = '' OR instr(lower(name), ?4) > 0
+                                      OR instr(lower(file), ?4) > 0
+                                      OR instr(lower(signature), ?4) > 0)";
+    let total = match conn.query_row(
+        &format!("SELECT COUNT(*) FROM symbols WHERE {where_sql}"),
+        params![role, kind, file, query],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(value) => value.max(0) as usize,
+        Err(error) => return Some(Err(format!("查询结构节点数量失败：{error}"))),
+    };
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    let mut statement = match conn.prepare(&format!(
+        "SELECT kind, name, file, line, end_line, role, signature, parent
+         FROM symbols WHERE {where_sql}
+         ORDER BY file, line, name LIMIT ?5 OFFSET ?6"
+    )) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("准备结构节点查询失败：{error}"))),
+    };
+    let rows = match statement.query_map(
+        params![role, kind, file, query, page_size as i64, offset as i64],
+        |row| {
+            Ok(Symbol {
+                kind: row.get(0)?,
+                name: row.get(1)?,
+                file: row.get(2)?,
+                line: row.get::<_, i64>(3)?.max(0) as usize,
+                end_line: row.get::<_, i64>(4)?.max(0) as usize,
+                role: row.get(5)?,
+                signature: row.get(6)?,
+                parent: row.get(7)?,
+            })
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("读取结构节点失败：{error}"))),
+    };
+    let items = match rows.collect::<Result<Vec<_>, _>>() {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("解析结构节点失败：{error}"))),
+    };
+    Some(Ok((items, total)))
+}
+
+fn query_persisted_symbols(
+    root: &Path,
+    query: &str,
+    role: Option<&str>,
+    kind: Option<&str>,
+    file: Option<&str>,
+    page: usize,
+    page_size: usize,
+) -> Option<Result<(Vec<Symbol>, usize), String>> {
+    let data_dir = DATA_DIR.get()?;
+    query_persisted_symbols_at(root, data_dir, query, role, kind, file, page, page_size)
+}
+
 pub fn query_structure(
     root: &Path,
     query: &str,
@@ -1362,43 +1598,42 @@ pub fn query_structure(
     page_size: usize,
 ) -> StructureQueryResult {
     let syms = index_project_cached(root);
-    let q = query.trim().to_lowercase();
-    let role = role.map(str::trim).filter(|value| !value.is_empty());
-    let kind = kind.map(str::trim).filter(|value| !value.is_empty());
-    let file_filter = file.map(str::trim).filter(|value| !value.is_empty()).map(str::to_lowercase);
-    // 查询阶段只排序引用，最后仅克隆当前页，避免空查询时复制百万级结构元数据。
-    let mut matched: Vec<&Symbol> = syms
-        .iter()
-        .filter(|symbol| role.is_none_or(|value| symbol.role == value))
-        .filter(|symbol| kind.is_none_or(|value| symbol.kind == value))
-        .filter(|symbol| {
-            file_filter
-                .as_ref()
-                .is_none_or(|value| symbol.file.to_lowercase().contains(value))
-        })
-        .filter(|symbol| {
-            q.is_empty()
-                || symbol.name.to_lowercase().contains(&q)
-                || symbol.file.to_lowercase().contains(&q)
-                || symbol.signature.to_lowercase().contains(&q)
-        })
-        .collect();
-    matched.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then(a.line.cmp(&b.line))
-            .then(a.name.cmp(&b.name))
-    });
-    let total_matches = matched.len();
     let page = page.max(1);
     let page_size = page_size.clamp(1, 200);
     let offset = page.saturating_sub(1).saturating_mul(page_size);
-    let items = matched
-        .into_iter()
-        .skip(offset)
-        .take(page_size)
-        .cloned()
-        .collect();
+    let persisted = query_persisted_symbols(root, query, role, kind, file, page, page_size)
+        .and_then(Result::ok);
+    let (items, total_matches) = persisted.unwrap_or_else(|| {
+        let q = query.trim().to_lowercase();
+        let role = role.map(str::trim).filter(|value| !value.is_empty());
+        let kind = kind.map(str::trim).filter(|value| !value.is_empty());
+        let file_filter = file.map(str::trim).filter(|value| !value.is_empty()).map(str::to_lowercase);
+        let mut matched: Vec<&Symbol> = syms
+            .iter()
+            .filter(|symbol| role.is_none_or(|value| symbol.role == value))
+            .filter(|symbol| kind.is_none_or(|value| symbol.kind == value))
+            .filter(|symbol| {
+                file_filter
+                    .as_ref()
+                    .is_none_or(|value| symbol.file.to_lowercase().contains(value))
+            })
+            .filter(|symbol| {
+                q.is_empty()
+                    || symbol.name.to_lowercase().contains(&q)
+                    || symbol.file.to_lowercase().contains(&q)
+                    || symbol.signature.to_lowercase().contains(&q)
+            })
+            .collect();
+        matched.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then(a.line.cmp(&b.line))
+                .then(a.name.cmp(&b.name))
+        });
+        let total = matched.len();
+        let items = matched.into_iter().skip(offset).take(page_size).cloned().collect();
+        (items, total)
+    });
     let next_page = (offset.saturating_add(page_size) < total_matches).then_some(page + 1);
 
     let key = canonical_key(root);
@@ -1749,6 +1984,63 @@ struct Detail {
             apply_catalog_changes_at(&root, &data_dir, &["new_dir".into()]),
             CatalogDelta::NeedsReconciliation
         ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn persisted_structure_nodes_paginate_and_replace_one_file() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-symbol-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-symbol-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("a.rs"), "struct Alpha {}\nfn old_logic() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "struct Beta {}\n").unwrap();
+        let (_, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        scan_file(&root.join("a.rs"), "a.rs", &mut symbols);
+        scan_file(&root.join("b.rs"), "b.rs", &mut symbols);
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+
+        let (first, total) = query_persisted_symbols_at(
+            &root, &data_dir, "", None, None, None, 1, 1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(first.len(), 1);
+        let (logic, logic_total) = query_persisted_symbols_at(
+            &root, &data_dir, "logic", Some("logic"), None, Some("a.rs"), 1, 20,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(logic_total, 1);
+        assert_eq!(logic[0].name, "old_logic");
+
+        std::fs::write(root.join("a.rs"), "struct Alpha {}\nfn new_logic() {}\n").unwrap();
+        let mut fresh = Vec::new();
+        scan_file(&root.join("a.rs"), "a.rs", &mut fresh);
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            &["a.rs".into()],
+            &fresh,
+        ));
+        let (updated, _) = query_persisted_symbols_at(
+            &root, &data_dir, "logic", Some("logic"), None, None, 1, 20,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated[0].name, "new_logic");
+        assert!(!updated.iter().any(|symbol| symbol.name == "old_logic"));
+
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
     }

@@ -1,6 +1,6 @@
 # Structure-first 代码导航设计
 
-> 状态：MVP 已接入 `search_symbols`；全库文件目录已使用独立 SQLite 持久化；Tree-sitter/LSP、目录分片和关系图仍在后续阶段。
+> 状态：MVP 已接入 `search_symbols`；全库文件目录和结构节点已使用独立 SQLite 持久化、索引和分页；Tree-sitter/LSP、物理分片和关系边仍在后续阶段。
 
 ## 1. 结论
 
@@ -63,9 +63,9 @@ MVP 的范围估算仍是轻量规则扫描。大括号出现在字符串/注释
 
 超大源码也必须在目录中可达；可以暂不建立全文倒排，但不能从目录和 coverage 中消失。
 
-目录层第一版已经完成：所有未忽略文件流式写入独立 SQLite，不把全量路径堆进内存；记录 `indexed/deferred/oversized/unsupported/symlink/unreadable` 状态和一级目录 shard。`find_files` 优先查询该目录，支持状态过滤和分页；结构查询同时报告发现、解析、延期、超大和不可读数量。
+目录层第一版已经完成：所有未忽略文件流式写入独立 SQLite，不把全量路径堆进内存；记录 `indexed/deferred/oversized/unsupported/symlink/unreadable` 状态和一级目录 shard。`find_files` 优先查询该目录，支持状态过滤和分页；结构查询同时报告发现、解析、延期、超大和不可读数量。结构节点也已进入同一仓库数据库，按 file、role/kind、name 和 shard 建索引，`search_symbols` 优先执行数据库过滤、排序、计数与分页，内存列表只作为兼容 fallback。
 
-原生跨平台 watcher 也已接入：第一次建立索引时懒启动，忽略纯访问事件，将编辑器常见的 create/modify/remove/rename 事件按 200 ms 合并。普通文件变化现在会在缓存锁外用一个 SQLite 事务直接 upsert/delete 全库目录记录，并精准替换对应符号，不再安排全仓 walk；目录级变化、数据库失败、系统 `Rescan` 标志、空路径事件或监听错误才把一致性校验延迟到下一次真实查询。稳定仓库不再每 30 秒反复 walk；watcher 启动失败时保留 30 秒周期扫描，active 时仍每 5 分钟低频校验，防止监听器“创建成功但不投递”或静默失效。最多保留 16 个项目 watcher，按最近使用淘汰，避免系统句柄泄漏。
+原生跨平台 watcher 也已接入：第一次建立索引时懒启动，忽略纯访问事件，将编辑器常见的 create/modify/remove/rename 事件按 200 ms 合并。普通文件变化现在会在缓存锁外用 SQLite 事务直接 upsert/delete 全库目录记录，并只替换对应文件的结构节点，不再安排全仓 walk；目录级变化、数据库失败、系统 `Rescan` 标志、空路径事件或监听错误才把一致性校验延迟到下一次真实查询。目录代次还会对全量节点重建做 revision fencing，避免并发外部编辑被较旧的扫描结果覆盖。稳定仓库不再每 30 秒反复 walk；watcher 启动失败时保留 30 秒周期扫描，active 时仍每 5 分钟低频校验，防止监听器“创建成功但不投递”或静默失效。最多保留 16 个项目 watcher，按最近使用淘汰，避免系统句柄泄漏。
 
 watcher 不是唯一真相：网络文件系统可能没有事件，Linux 可能达到 inotify watch 限额，大目录也可能发生事件队列溢出。索引查询现在还会比较 Git HEAD/index 指纹；HEAD 变化时通过 `git diff --name-only -z --no-renames` 精确枚举 checkout/rebase 涉及的旧、新路径，直接复用文件级增量更新；Git 不可用、输出异常、单次超过 20,000 路径或 8 MiB、以及无法确定旧 tree 的 index-only 变化才回退一致性扫描。[notify 官方文档](https://docs.rs/notify/latest/notify/)也明确要求在 `need_rescan` 时重建内存状态，并提示大型目录可能漏事件。
 
@@ -108,7 +108,7 @@ watcher 不是唯一真相：网络文件系统可能没有事件，Linux 可能
 
 ## 7. 下一实现顺序
 
-1. 把单库 SQLite 按 module/shard 拆分，结构节点/关系边转为数据库分页查询。
+1. 在现有 shard 字段与索引之上验证 100k/1M 数据量，再按测量结果决定何时拆成物理数据库；补充结构关系边表。
 2. 引入 Tree-sitter 增量语法树，并把当前轻量规则保留为解析失败时的 fallback。
 3. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 4. 接入 Tree-sitter/ArkTS 容错解析，替换 MVP 的范围估算。
