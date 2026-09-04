@@ -31,8 +31,8 @@ const PROJECT_UNDERSTANDING: CapabilityPack = CapabilityPack {
     min_agent_version: "2.0.0",
     permission_ceiling: PermissionCeiling::ReadOnly,
     triggers: &["project", "understand", "inspect", "项目", "理解", "阅读", "分析", "架构"],
-    tools: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "search_symbols", "read_file", "environment_check"],
-    recommended_order: &["list_dir", "get_project_info", "list_modules", "search_symbols", "deep_scan", "codebase_search", "read_file"],
+    tools: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "search_symbols", "import_scip_index", "read_file", "environment_check"],
+    recommended_order: &["list_dir", "get_project_info", "list_modules", "search_symbols", "import_scip_index", "deep_scan", "codebase_search", "read_file"],
     stop_conditions: &["核心入口、模块边界和构建方式已有来源证据", "继续读取不会改变当前任务计划"],
     acceptance: &["给出工程类型、入口、模块、依赖和风险摘要", "所有关键判断可追溯到文件或工具结果"],
 };

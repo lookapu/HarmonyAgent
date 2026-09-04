@@ -842,10 +842,20 @@ fn stamp_from_meta(meta: &fs::Metadata) -> FileStamp {
     FileStamp { mtime, len: meta.len() }
 }
 
-fn catalog_file_at(dir: &Path, root: &Path) -> PathBuf {
+pub(crate) fn catalog_file_at(dir: &Path, root: &Path) -> PathBuf {
     let key = canonical_key(root);
     dir.join("repo_catalog")
         .join(format!("{:016x}.sqlite3", stable_hash(&key)))
+}
+
+/// Import a compiler-produced SCIP index into an independent precise-reference layer.
+/// The existing active generation remains queryable until the new generation is complete.
+pub(crate) fn import_scip_index(root: &Path, index_path: Option<&Path>) -> Result<crate::services::scip_index::ScipImportStats, String> {
+    // Ensure the file catalog and syntax symbols exist before validating SCIP document stamps.
+    let _ = index_project_cached(root);
+    let data_dir = DATA_DIR.get().ok_or("结构索引数据目录尚未初始化")?;
+    let index = index_path.map(Path::to_path_buf).unwrap_or_else(|| root.join("index.scip"));
+    crate::services::scip_index::import(root, &catalog_file_at(data_dir, root), &index)
 }
 
 #[derive(Debug, Serialize)]
@@ -4353,7 +4363,7 @@ fn query_persisted_edges_at(
         Ok(value) => value,
         Err(error) => return Some(Err(format!("打开结构关系库失败：{error}"))),
     };
-    let total = match conn.query_row("SELECT relation_count + semantic_relation_count
+    let mut total = match conn.query_row("SELECT relation_count + semantic_relation_count
                                       FROM structure_stats WHERE id=1", [], |row| {
         row.get::<_, i64>(0)
     }) {
@@ -4449,6 +4459,53 @@ fn query_persisted_edges_at(
             match row {
                 Ok(edge) => edges.push(edge),
                 Err(error) => return Some(Err(format!("解析语义调用关系失败：{error}"))),
+            }
+        }
+    }
+    let has_scip = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scip_reference_edges')",
+        [], |row| row.get::<_, bool>(0),
+    ).unwrap_or(false);
+    if has_scip {
+        total = total.saturating_add(conn.query_row(
+            "SELECT COALESCE(edge_count, 0) FROM scip_import_state WHERE id=1",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap_or(0).max(0) as usize);
+        let mut scip_statement = match conn.prepare(
+            "SELECT e.source_file, e.source_name, e.source_line,
+                    e.target_file, e.target_name, e.target_line
+             FROM scip_reference_edges e JOIN scip_import_state state
+               ON state.id=1 AND state.active_import_id=e.import_id
+             WHERE EXISTS (SELECT 1 FROM files f WHERE f.path=e.source_file AND f.state='indexed'
+               AND f.size=e.source_size AND f.mtime_ns=e.source_mtime_ns)
+               AND EXISTS (SELECT 1 FROM files f WHERE f.path=e.target_file AND f.state='indexed'
+               AND f.size=e.target_size AND f.mtime_ns=e.target_mtime_ns)
+               AND ((e.source_file=?1 AND e.source_name=?2 AND e.source_line=?3)
+                 OR (e.target_file=?1 AND e.target_name=?2 AND e.target_line=?3))"
+        ) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(format!("准备 SCIP 引用查询失败：{error}"))),
+        };
+        for symbol in symbols {
+            let rows = match scip_statement.query_map(
+                params![symbol.file, symbol.name, symbol.line as i64],
+                |row| Ok(StructureEdge {
+                    kind: "references".into(),
+                    source_file: row.get(0)?, source_name: row.get(1)?,
+                    source_line: row.get::<_, i64>(2)?.max(0) as usize,
+                    target_file: row.get(3)?, target_name: row.get(4)?,
+                    target_line: row.get::<_, i64>(5)?.max(0) as usize,
+                    target_module: None, target_imported_name: None,
+                }),
+            ) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(format!("读取 SCIP 引用失败：{error}"))),
+            };
+            for row in rows {
+                match row {
+                    Ok(edge) => edges.push(edge),
+                    Err(error) => return Some(Err(format!("解析 SCIP 引用失败：{error}"))),
+                }
             }
         }
     }

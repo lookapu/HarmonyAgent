@@ -182,6 +182,7 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("conversation_search", "explore"),
     ("search_sdk_api", "explore"),
     ("search_symbols", "explore"),
+    ("import_scip_index", "explore"),
     ("stack_dump", "explore"),
     ("tool_help", "explore"),
     ("tool_history", "explore"),
@@ -769,6 +770,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
     },
     ToolSpec {
+        name: "import_scip_index",
+        desc: "导入编译器生成的 SCIP 精确代码导航索引，把跨语言定义/引用接入全局结构图；适合百万级仓库避免逐文件全文读取。\n参数：{\"path\":\"<可选 SCIP 文件路径，缺省项目根 index.scip；必须位于项目目录内>\"}。\n导入按 document 流式读取且内存有界；新代次完整成功后才原子切换，文件变化时陈旧引用自动失效，重复导入未变化索引会直接复用。\n副作用：只更新 .deveco-agent 外部缓存目录中的结构索引，不修改项目源码。\n返回：文档、定义、引用、已解析引用及忽略文档数量。",
+    },
+    ToolSpec {
         name: "delete_file",
         desc: "删除文件或空目录（删除后移入回收站/工程内 .deveco-agent/trash，可恢复，不直接永久删除）。\n参数：{\"path\":\"<要删除的文件路径，相对项目根>\",\"dry_run\":<可选 true 只预览不执行>}。\n禁止删除 .git、oh_modules、build 等受保护目录及工程根；删除前建议先 dry_run 确认路径。\n副作用：把文件移动到回收目录（可恢复；dry_run=true 时无副作用）。\n返回：删除结果。",
     },
@@ -1311,6 +1316,7 @@ pub async fn run_tool(
         "read_module_config" => read_module_config(&args, &roots).await,
         "get_build_log" => get_build_log(&args, &roots).await,
         "search_symbols" => search_symbols_tool(&args, &roots).await,
+        "import_scip_index" => import_scip_index_tool(&args, &roots).await,
         "delete_file" => fs_tools::delete_file(&args, &roots).await,
         "git_stash" => git_tools::git_stash(&args, &roots).await,
         "move_file" => fs_tools::move_file(&args, &roots).await,
@@ -3746,6 +3752,41 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         out.push_str(&format!("还有结果：使用 page={next_page} 读取下一页。\n"));
     }
     Ok(truncate_out_max(&out, 12000))
+}
+
+async fn import_scip_index_tool(args: &Value, roots: &[String]) -> Result<String, String> {
+    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录".into());
+    }
+    let root = Path::new(project_path).to_path_buf();
+    let index = args["path"].as_str().map(|value| {
+        let value = Path::new(value);
+        if value.is_absolute() {
+            value.to_path_buf()
+        } else {
+            root.join(value)
+        }
+    });
+    let stats = tokio::task::spawn_blocking(move || {
+        crate::services::symbol_index::import_scip_index(&root, index.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(format!(
+        "SCIP 索引{}：{}；文档 {}，定义 {}，引用 {}，已解析引用 {}，忽略/陈旧文档 {}。",
+        if stats.skipped_unchanged {
+            "未变化，复用现有代次"
+        } else {
+            "导入完成"
+        },
+        stats.index_path,
+        stats.documents,
+        stats.definitions,
+        stats.references,
+        stats.resolved_references,
+        stats.ignored_documents,
+    ))
 }
 
 /// get_build_log：读取落盘的构建日志

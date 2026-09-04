@@ -48,6 +48,7 @@ pub mod runtime_progress;
 pub mod seed;
 pub mod skill_manifest;
 pub mod symbol_index;
+pub(crate) mod scip_index;
 pub mod task_guard;
 pub mod team_sharing;
 pub mod reproduction_bundle;

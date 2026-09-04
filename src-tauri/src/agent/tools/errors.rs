@@ -207,7 +207,7 @@ pub(crate) fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str>
                 None
             }
         }
-        "search_symbols" => {
+        "search_symbols" | "import_scip_index" => {
             if has_any(&["未绑定", "项目目录"]) {
                 Some("当前会话未绑定项目：在项目内开启会话后使用")
             } else {
