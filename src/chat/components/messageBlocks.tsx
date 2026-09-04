@@ -375,7 +375,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
       {reviewOpen && canReview &&
         createPortal(
           <div
-            className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-6"
+            className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-6"
             onMouseDown={(e) => {
               if (e.target === e.currentTarget) setReviewOpen(false)
             }}

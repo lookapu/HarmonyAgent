@@ -4004,7 +4004,7 @@ export default function Home() {
         {projectMenu && (
           <div
             ref={projectMenuRef}
-            className="fixed z-[80] w-52 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
+            className="fixed z-[var(--app-z-popover)] w-52 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
             style={{
               left: Math.min(projectMenu.x, window.innerWidth - 220),
               top: Math.min(projectMenu.y, window.innerHeight - 140),
@@ -6605,7 +6605,7 @@ export default function Home() {
 
       {/* ============ 计划/审查模式：任务计划确认卡片 ============ */}
       {pendingPlan && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[55] w-[640px] max-w-[calc(100vw-2rem)]">
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[var(--app-z-overlay)] w-[640px] max-w-[calc(100vw-2rem)]">
           <div className="rounded-2xl border border-[var(--accent)]/40 bg-[var(--bg-elevated)]/95 backdrop-blur shadow-2xl shadow-black/20 animate-modal-in overflow-hidden">
             <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[var(--border)] bg-[var(--accent-soft)]">
               <span className="w-2 h-2 rounded-full bg-[var(--accent)] animate-pulse" />
@@ -6685,7 +6685,7 @@ export default function Home() {
 
       {/* ============ 已批准任务计划（执行中锚点，可收起） ============ */}
       {approvedPlan && approvedPlan.conversationId === currentConversation?.id && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[54] w-[640px] max-w-[calc(100vw-2rem)]">
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[var(--app-z-overlay)] w-[640px] max-w-[calc(100vw-2rem)]">
           <details className="rounded-xl border border-[var(--success)]/40 bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 animate-modal-in overflow-hidden" open={false}>
             <summary className="flex items-center gap-2 px-4 py-2 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
               <Icon name="check" size={13} className="text-[var(--success)] shrink-0" />
@@ -6711,7 +6711,7 @@ export default function Home() {
           : card.action === 'open_signing_config' ? t('home.diagnoseOpenSigning')
           : ''
         return (
-          <div key={card.id} className={`fixed bottom-24 right-4 z-[53] w-[320px] rounded-xl border bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 animate-modal-in overflow-hidden ${color}`}>
+          <div key={card.id} className={`fixed bottom-24 right-4 z-[var(--app-z-overlay)] w-[320px] rounded-xl border bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 animate-modal-in overflow-hidden ${color}`}>
             <div className="flex items-start gap-2 p-3">
               <Icon name={icon as React.ComponentProps<typeof Icon>['name']} size={14} className="shrink-0 mt-0.5" />
               <div className="flex-1 min-w-0">
@@ -6740,7 +6740,7 @@ export default function Home() {
 
       {/* ============ Agent 提问卡（ask_user 工具，自由文本回答闭环） ============ */}
       {askCard && askCard.conversationId === currentConversation?.id && (
-        <div className="fixed inset-0 z-[62] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+        <div className="fixed inset-0 z-[var(--app-z-modal-blocking)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[480px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="headphones" size={14} className="text-[var(--accent)] shrink-0" />
@@ -6804,7 +6804,7 @@ export default function Home() {
       {toolApprovals.length > 0 && (() => {
         const risk = approvalRisk(toolApprovals[0].tool, toolApprovals[0].level)
         return (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+        <div className="fixed inset-0 z-[var(--app-z-modal-blocking)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[460px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-[var(--warning)] animate-pulse" />
@@ -6887,7 +6887,7 @@ export default function Home() {
       {/* ============ 划词菜单（选中文本弹出） ============ */}
       {selectionMenu && (
         <div
-          className="fixed z-[70] animate-modal-in"
+          className="fixed z-[var(--app-z-popover)] animate-modal-in"
           style={{ left: selectionMenu.x, top: selectionMenu.y, transform: 'translateX(-50%)' }}
           onMouseDown={(e) => {
             // 阻止默认行为：防止按钮聚焦/点击清除选区高亮；并拦截冒泡避免全局 mouseup 重定位菜单
@@ -6954,7 +6954,7 @@ export default function Home() {
 
       {/* ============ 会话时间线弹窗（快照点列表 → 回到历史决策点） ============ */}
       {timelineOpen && currentConversation && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+        <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[520px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="history" size={15} />
@@ -7047,7 +7047,7 @@ export default function Home() {
       {/* ============ 编辑消息弹窗（user 消息编辑 = 重新执行任务） ============ */}
       {/* ============ 项目审批白名单管理弹窗 ============ */}
       {whitelistOpen && currentProject && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+        <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[460px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="check" size={15} />
@@ -7943,7 +7943,7 @@ const MessageItem = memo(function MessageItem({
         <div
           role="menu"
           onClick={(e) => e.stopPropagation()}
-          className="fixed z-[200] min-w-[180px] glass-card rounded-lg py-1 animate-modal-in text-[12.5px]"
+          className="fixed z-[var(--app-z-popover)] min-w-[180px] glass-card rounded-lg py-1 animate-modal-in text-[12.5px]"
           style={{ left: ctxMenu.x, top: ctxMenu.y }}
         >
           <button

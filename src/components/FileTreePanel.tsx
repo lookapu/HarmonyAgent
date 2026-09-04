@@ -593,7 +593,7 @@ export default function FileTreePanel({
         <div
           ref={menuRef}
           data-testid="ctx-menu"
-          className="fixed z-[9999] w-60 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
+          className="fixed z-[var(--app-z-popover)] w-60 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
           style={{
             left: Math.min(menu.x, window.innerWidth - 250),
             top: Math.min(menu.y, window.innerHeight - 320),

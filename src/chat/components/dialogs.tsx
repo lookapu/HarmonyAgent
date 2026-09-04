@@ -12,7 +12,7 @@ export function FeedbackDialog({ onSubmit, onCancel }: { onSubmit: (reason?: str
   const [reason, setReason] = useState('')
   const reasons = ['内容不准确', '代码有错误', '没有帮助', '语气不合适', '其他']
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
       <div className="w-[420px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
         <div className="flex items-center gap-2">
           <ThumbDownIcon filled />
@@ -71,7 +71,7 @@ export function VersionDiffDialog({
   const [selected, setSelected] = useState<MessageVersion | null>(versions[0] ?? null)
   if (!selected) {
     return (
-      <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+      <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
         <div className="w-[560px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
           <p className="text-[12px] text-[var(--text-muted)]">{t('home.noVersions')}</p>
           <button onClick={onClose} className="mt-3 h-8 px-4 rounded-lg btn-primary text-[12px]">
@@ -84,7 +84,7 @@ export function VersionDiffDialog({
   // diff：当前回复 vs 旧版本（旧 → 新 方向，添加为绿、删除为红）
   const changes: Change[] = diffWords(selected.content, current)
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]" onClick={onClose}>
+    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]" onClick={onClose}>
       <div
         className="w-[720px] max-w-[94vw] max-h-[80vh] flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in"
         onClick={(e) => e.stopPropagation()}
@@ -158,7 +158,7 @@ export function MemoryDraftDialog({
     ['path', t('home.memoryCat.path')],
   ] as const
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
       <div className="w-[520px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
         <div className="flex items-center gap-2">
           <Icon name="lightbulb" size={15} />
@@ -217,7 +217,7 @@ export function EditMessageDialog({
     inputRef.current?.setSelectionRange(message.content.length, message.content.length)
   }, [message.content.length])
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
       <div className="w-[560px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
         <div className="flex items-center gap-2">
           <Icon name="edit" size={15} />
@@ -312,7 +312,7 @@ export function RulesDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
       <div className="w-[620px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
         <div className="flex items-center gap-2">
           <Icon name="settings" size={15} />

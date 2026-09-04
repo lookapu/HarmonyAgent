@@ -144,6 +144,26 @@
   --app-text-lg: 16px;
   --app-lh-lg: 24px;
 
+  /* z-index 层级表。z-index 不是 Tailwind 命名空间，放进 @theme 会被 tree-shake，
+     故留在 :root；组件消费方式：z-[var(--app-z-modal)]。
+     排序不变量（改动前先确认不违反）：
+       modal-blocking(75) > modal(70)      —— 阻塞式审批必须压住普通模态
+       modal-blocking(75) < toast(90)      —— 审批进行中仍要能看到桌面通知
+       devtools(900) 高于全部业务层        —— 性能浮窗是诊断工具，不参与业务层叠
+     不在此表的：容器内部的局部层叠（如 .scroll-to-bottom 在聊天滚动容器里的
+     z-index:20）走各自 stacking context，不需要全局编号。 */
+  --app-z-sticky: 10;
+  --app-z-panel: 20;
+  --app-z-dropdown: 40;
+  --app-z-drawer: 50;
+  --app-z-overlay: 60;
+  --app-z-modal: 70;
+  --app-z-modal-blocking: 75;
+  --app-z-popover: 80;
+  --app-z-toast: 90;
+  --app-z-tooltip: 95;
+  --app-z-devtools: 900;
+
   /* 等宽数字：用于 token/时长/计数 */
   --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
   --tabular-nums: font-variant-numeric: tabular-nums;
@@ -1125,7 +1145,7 @@ select:focus-visible {
 .md-codeblock-fullscreen {
   position: fixed;
   inset: 0;
-  z-index: 999;
+  z-index: var(--app-z-modal);
   margin: 0;
   border-radius: 0;
   display: flex;
@@ -1230,7 +1250,7 @@ select:focus-visible {
 .md-lightbox {
   position: fixed;
   inset: 0;
-  z-index: 1000;
+  z-index: var(--app-z-modal);
   background: rgba(0, 0, 0, 0.82);
   display: flex;
   align-items: center;
@@ -1346,7 +1366,7 @@ select:focus-visible {
 .md-mermaid-fullscreen {
   position: fixed;
   inset: 0;
-  z-index: 1000;
+  z-index: var(--app-z-modal);
   background: rgba(0, 0, 0, 0.72);
   backdrop-filter: blur(4px);
   display: flex;
@@ -1655,11 +1675,14 @@ select:focus-visible {
   box-shadow: 0 0 0 1px var(--accent-soft), 0 6px 18px -6px var(--accent-glow);
 }
 
-/* 会话/列表项：精致 hover + 选中态 */
+/* 会话/列表项：精致 hover + 选中态。
+   计划里本该删掉（新代码统一用 .list-row），但它唯一的调用点在 devicePanels.tsx，
+   而那个文件本批因并行改动整体排除，无法迁移 → 保留，只把字面量接到 token。 */
 .list-item {
   position: relative;
-  border-radius: 10px;
-  transition: background-color 0.15s ease, transform 0.12s ease;
+  border-radius: var(--app-radius-md);
+  transition: background-color var(--app-motion-fast) var(--app-ease-out),
+    transform var(--app-motion-fast) var(--app-ease-out);
 }
 .list-item:hover {
   background: var(--bg-hover);
@@ -1679,30 +1702,11 @@ select:focus-visible {
   background: var(--accent);
 }
 
-/* 可交互卡片：悬停轻微抬升 */
-.lift-card {
-  transition: transform 0.16s cubic-bezier(0.16, 1, 0.3, 1),
-    box-shadow 0.16s ease, border-color 0.16s ease;
-}
-.lift-card:hover {
-  transform: translateY(-1px);
-  border-color: var(--border-strong);
-  box-shadow: var(--app-shadow-md);
-}
-
-/* 状态点呼吸光 */
+/* 危险态呼吸光：由 .context-meter-fill[data-level='danger'] 消费，
+   通过 --pulse-color 取色。 */
 @keyframes status-pulse {
   0%, 100% { box-shadow: 0 0 0 0 var(--pulse-color, var(--accent-glow)); }
   50% { box-shadow: 0 0 0 4px transparent; }
-}
-.status-dot {
-  animation: status-pulse 2s ease-out infinite;
-}
-
-/* 输入框：聚焦时柔和强调描边（非 ring 场景） */
-.soft-focus:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border)) !important;
-  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 /* 骨架/流光（加载占位） */
@@ -1912,25 +1916,6 @@ button:active:not(:disabled),
   box-shadow: var(--app-shadow-lg);
 }
 
-/* 渐变光晕装饰（输入框聚焦时四角微光） */
-.glow-accent {
-  position: relative;
-}
-.glow-accent::after {
-  content: '';
-  position: absolute;
-  inset: -1px;
-  border-radius: inherit;
-  background: linear-gradient(135deg, var(--accent-glow), transparent 60%);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--app-motion-base) var(--app-ease-out);
-  z-index: -1;
-}
-.glow-accent:focus-within::after {
-  opacity: 1;
-}
-
 /* 列表项 hover：左侧 accent 滑入（用于会话/工作区/文件列表） */
 .list-row {
   position: relative;
@@ -2034,7 +2019,7 @@ button:active:not(:disabled),
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
-  z-index: 100;
+  z-index: var(--app-z-modal);
   animation: fade-in 0.15s var(--app-ease-out) both;
 }
 /* 命令面板 backdrop（居中、顶部 12vh 偏移——⌘K 视觉上更靠近顶部触发点） */
@@ -2042,7 +2027,7 @@ button:active:not(:disabled),
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
-  z-index: 100;
+  z-index: var(--app-z-modal);
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -2134,11 +2119,6 @@ button:active:not(:disabled),
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
 
-/* 亮色主题下：lift-card 悬停阴影更轻 */
-[data-theme='light'] .lift-card:hover {
-  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
-}
-
 /* 亮色主题下：键盘键帽（kbd）更立体 */
 [data-theme='light'] kbd {
   background: #ffffff;
@@ -2185,11 +2165,6 @@ button:active:not(:disabled),
 [data-theme='light'] .msg-role-tool {
   background: rgba(22, 163, 74, 0.05);
   border-color: rgba(22, 163, 74, 0.22);
-}
-
-/* 亮色主题下：flow-status-pulse 颜色调淡 */
-[data-theme='light'] .status-dot {
-  --pulse-color: rgba(59, 111, 245, 0.20);
 }
 
 /* 亮色主题下：代码块头部颜色用更柔和的过渡 */
@@ -2322,16 +2297,13 @@ button:active:not(:disabled),
 .render-tier-low .scroll-to-bottom {
   box-shadow: var(--app-shadow-sm) !important;
 }
-.render-tier-low .glow-accent::after {
-  display: none !important;
-}
 
 /* 禁用复杂动画/脉冲效果（减少主线程定时器和重绘） */
 .render-tier-low .thinking-block-icon {
   animation: none !important;
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent) !important;
 }
-.render-tier-low .status-dot {
+.render-tier-low .context-meter-fill[data-level='danger'] {
   animation: none !important;
 }
 .render-tier-low .codeblock-streaming::before {
@@ -2350,13 +2322,13 @@ button:active:not(:disabled),
   scroll-behavior: auto !important;
 }
 
-/* 降低按钮 active 动效复杂度（取消 scale，只用内阴影反馈） */
+/* 降低按钮 active 动效复杂度。注意 Tailwind v4 的 active:scale-* 编译成独立的
+   scale 属性（不是 transform），且独立属性先于 transform 应用——只写
+   transform:none 压不住它，两条都要给。 */
 .render-tier-low button:active:not(:disabled),
 .render-tier-low [role='button']:active:not(:disabled) {
   transform: none !important;
-}
-.render-tier-low .lift-card:hover {
-  transform: none !important;
+  scale: none !important;
 }
 
 /* ---- Mac 平台专属优化：Core Animation 合成器效率高，可更激进使用合成层 ---- */
