@@ -2126,6 +2126,11 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
          WHERE target_module IS NOT NULL",
         [],
     )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_symbols_semantic_schedule
+         ON symbols(role, language, kind, file, line, name)",
+        [],
+    )?;
     let meta_columns = conn
         .prepare("PRAGMA table_info(structure_meta)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -3103,6 +3108,14 @@ pub struct SemanticCoverageStats {
     pub coverage: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LspSemanticTarget {
+    pub path: PathBuf,
+    pub name: String,
+    pub line: usize,
+    pub column: usize,
+}
+
 impl SemanticCoverageStats {
     fn from_counts(
         indexed_logic_symbols: usize,
@@ -3163,6 +3176,98 @@ fn persisted_semantic_coverage_at(
 
 fn persisted_semantic_coverage(root: &Path) -> Option<SemanticCoverageStats> {
     persisted_semantic_coverage_at(root, DATA_DIR.get()?)
+}
+
+fn symbol_name_utf16_column(path: &Path, line0: usize, name: &str) -> Option<usize> {
+    let content = fs::read_to_string(path).ok()?;
+    let line = content.lines().nth(line0)?;
+    line.match_indices(name)
+        .find(|(byte, _)| {
+            let before = line[..*byte].chars().next_back();
+            let after = line[byte + name.len()..].chars().next();
+            let is_identifier = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '$');
+            before.is_none_or(|ch| !is_identifier(ch))
+                && after.is_none_or(|ch| !is_identifier(ch))
+        })
+        .map(|(byte, _)| line[..byte].encode_utf16().count())
+}
+
+fn next_lsp_semantic_targets_at(
+    root: &Path,
+    data_dir: &Path,
+    limit: usize,
+) -> Vec<LspSemanticTarget> {
+    let conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let mut statement = match conn.prepare(
+        "SELECT s.file, s.name, s.line
+         FROM symbols s
+         JOIN files f ON f.path=s.file AND f.state='indexed'
+         LEFT JOIN semantic_target_scans scan
+           ON scan.target_file=s.file AND scan.target_name=s.name
+          AND scan.target_line=s.line AND scan.provider='arkts_lsp'
+         WHERE s.role='logic' AND s.language=?2 AND s.kind=?1
+           AND scan.target_file IS NULL
+         ORDER BY s.file, s.line, s.name
+         LIMIT ?3",
+    ) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let limit = limit.clamp(1, 64);
+    let mut targets = Vec::new();
+    for kind in ["method", "function"] {
+        for language in ["ets", "ts"] {
+            let remaining = limit.saturating_sub(targets.len());
+            if remaining == 0 {
+                break;
+            }
+            let candidate_limit = remaining.saturating_mul(4).min(256) as i64;
+            let rows = match statement.query_map(
+                params![kind, language, candidate_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?.max(1) as usize,
+                    ))
+                },
+            ) {
+                Ok(value) => value,
+                Err(_) => return targets,
+            };
+            for row in rows.filter_map(Result::ok) {
+                let (file, name, line1) = row;
+                let path = root.join(file);
+                let line = line1.saturating_sub(1);
+                let Some(column) = symbol_name_utf16_column(&path, line, &name) else {
+                    continue;
+                };
+                targets.push(LspSemanticTarget {
+                    path,
+                    name,
+                    line,
+                    column,
+                });
+                if targets.len() == limit {
+                    break;
+                }
+            }
+        }
+    }
+    targets
+}
+
+pub(crate) fn next_lsp_semantic_targets(
+    root: &Path,
+    limit: usize,
+) -> Vec<LspSemanticTarget> {
+    let Some(data_dir) = DATA_DIR.get() else {
+        return Vec::new();
+    };
+    next_lsp_semantic_targets_at(root, data_dir, limit)
 }
 
 #[derive(Debug, Serialize)]
@@ -5624,6 +5729,30 @@ class Service extends BaseService implements Loadable, Disposable {}
             "渐进批次领取应使用覆盖顺序索引：{deferred_plan}"
         );
 
+        let semantic_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT s.file, s.name, s.line
+                 FROM symbols s
+                 JOIN files f ON f.path=s.file AND f.state='indexed'
+                 LEFT JOIN semantic_target_scans scan
+                   ON scan.target_file=s.file AND scan.target_name=s.name
+                  AND scan.target_line=s.line AND scan.provider='arkts_lsp'
+                 WHERE s.role='logic' AND s.language=?2 AND s.kind=?1
+                   AND scan.target_file IS NULL
+                 ORDER BY s.file, s.line, s.name LIMIT ?3",
+            )
+            .unwrap()
+            .query_map(params!["method", "ets", 16], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            semantic_plan.contains("idx_symbols_semantic_schedule"),
+            "语义调度应从复合索引领取未覆盖目标：{semantic_plan}"
+        );
+
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
     }
@@ -6344,6 +6473,11 @@ class Service extends BaseService implements Loadable, Disposable {}
             (second_file.clone(), 0, object),
             (second_file.clone(), 0, member_fetch),
         ];
+        let pending = next_lsp_semantic_targets_at(&root, &data_dir, 4);
+        assert_eq!(pending.len(), 4);
+        assert_eq!(pending[0].name, "fetch", "成员方法应优先于顶层函数");
+        assert_eq!(pending[0].line, 1);
+        assert_eq!(pending[0].column, 2);
         assert_eq!(
             record_lsp_call_references_at(
                 &root,
@@ -6375,6 +6509,9 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert_eq!(coverage.truncated_targets, 0);
         assert_eq!(coverage.coverage_percent, 25.0);
         assert_eq!(coverage.coverage, "partial_query_driven");
+        assert!(next_lsp_semantic_targets_at(&root, &data_dir, 4)
+            .iter()
+            .all(|target| !(target.path == target_file && target.name == "fetch")));
 
         assert_eq!(
             record_lsp_call_references_at(

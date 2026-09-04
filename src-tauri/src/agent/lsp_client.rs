@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
+use futures_util::future::join_all;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -458,6 +459,9 @@ pub(super) async fn lsp_definition(args: &Value, roots: &[String], conversation_
 
 /// lsp_references：查找引用（含声明本身与否由 include_declaration 控制）
 pub(super) async fn lsp_references(args: &Value, roots: &[String], conversation_id: &str) -> Result<String, String> {
+    if let Some(limit) = args["auto_batch_limit"].as_u64() {
+        return lsp_index_call_targets(roots, conversation_id, limit as usize).await;
+    }
     let (path, line, column) = resolve_lsp_pos(args, roots)?;
     let include_decl = args["include_declaration"].as_bool().unwrap_or(true);
     let conn = conn_for(conversation_id).await?;
@@ -525,6 +529,93 @@ pub(super) async fn lsp_references(args: &Value, roots: &[String], conversation_
         items.len(),
         render_locations(&items),
         semantic_summary,
+    ))
+}
+
+async fn lsp_index_call_targets(
+    roots: &[String],
+    conversation_id: &str,
+    limit: usize,
+) -> Result<String, String> {
+    let limit = limit.clamp(1, 16);
+    let conn = conn_for(conversation_id).await?;
+    let mut failed = 0usize;
+    let mut recorded = 0usize;
+    let mut selected = Vec::new();
+    for root in roots {
+        let root = PathBuf::from(root);
+        let remaining = limit.saturating_sub(selected.len());
+        if remaining == 0 {
+            break;
+        }
+        selected.extend(
+            crate::services::symbol_index::next_lsp_semantic_targets(&root, remaining)
+                .into_iter()
+                .map(|target| (root.clone(), target)),
+        );
+    }
+    if selected.is_empty() {
+        return Ok(
+            "没有可调度的 ArkTS/TypeScript 逻辑符号；可能已覆盖，或需先运行 search_symbols 建立结构索引。"
+                .into(),
+        );
+    }
+    let mut names = Vec::new();
+    let attempted = selected.len();
+    for (_, target) in &selected {
+        names.push(format!(
+            "{}:{}:{}",
+            target.path.display(),
+            target.line + 1,
+            target.name,
+        ));
+    }
+    for chunk in selected.chunks(4) {
+        let responses = join_all(chunk.iter().cloned().map(|(root, target)| {
+            let conn = conn.clone();
+            async move {
+                let uri = to_file_uri(&target.path)?;
+                let response = conn
+                    .request("textDocument/references", json!({
+                        "textDocument": {"uri": uri},
+                        "position": {"line": target.line, "character": target.column},
+                        "context": {"includeDeclaration": false}
+                    }), std::time::Duration::from_secs(10))
+                    .await;
+                Ok::<_, String>((root, target, response))
+            }
+        }))
+        .await;
+        for response in responses {
+            let Ok((root, target, Ok(response))) = response else {
+                failed += 1;
+                continue;
+            };
+            let items = response.as_array().cloned().unwrap_or_default();
+            let project_references = items
+                .iter()
+                .filter_map(location_path_position)
+                .filter(|(path, _, _)| path.starts_with(&root))
+                .take(MAX_REFERENCE_EVIDENCE_PER_REQUEST + 1)
+                .collect::<Vec<_>>();
+            let truncated = project_references.len() > MAX_REFERENCE_EVIDENCE_PER_REQUEST;
+            let evidence = &project_references
+                [..project_references.len().min(MAX_REFERENCE_EVIDENCE_PER_REQUEST)];
+            recorded += crate::services::symbol_index::record_lsp_call_references(
+                &root,
+                &target.path,
+                target.line,
+                evidence,
+                truncated,
+            );
+        }
+    }
+    Ok(format!(
+        "渐进语义扫描：尝试 {} 个高优先级未覆盖目标，失败 {} 个，沉淀 {} 条成员调用关系。\n{}",
+        attempted,
+        failed,
+        recorded,
+        names.join("\n"),
     ))
 }
 
