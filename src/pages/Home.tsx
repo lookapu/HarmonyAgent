@@ -6776,13 +6776,9 @@ export default function Home() {
             />
             <div className="mt-3 flex items-center justify-end gap-2">
               <span className="text-[10.5px] text-[var(--text-muted)] mr-auto">Ctrl+Enter ↵</span>
-              <button
-                type="button"
-                onClick={handleAskSkip}
-                className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
+              <Button variant="secondary" size="md" onClick={handleAskSkip}>
                 {t('home.askSkip')}
-              </button>
+              </Button>
               <Button variant="primary" size="md" icon="send" onClick={handleAskSubmit}>
                 {t('home.askSubmit')}
               </Button>
@@ -7234,12 +7230,9 @@ export default function Home() {
             </pre>
           </div>
           <div className="flex justify-end gap-2">
-            <button
-              onClick={() => setRuntimeAnomaly(null)}
-              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)]"
-            >
+            <Button variant="secondary" size="md" onClick={() => setRuntimeAnomaly(null)}>
               {t('runtime.dismiss')}
-            </button>
+            </Button>
             <button
               onClick={() => void fixRuntimeAnomaly()}
               className="h-8 px-4 rounded-lg bg-red-500 text-white text-[12px] hover:bg-red-600"
@@ -7319,12 +7312,9 @@ export default function Home() {
             />
           </div>
           <div className="flex justify-end gap-2">
-            <button
-              onClick={() => setKnowledgeCandidate(null)}
-              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)]"
-            >
+            <Button variant="secondary" size="md" onClick={() => setKnowledgeCandidate(null)}>
               {t('knowledge.candidateDismiss')}
-            </button>
+            </Button>
             <Button variant="primary" size="md" loading={candidateSaving} onClick={saveKnowledgeCandidate}>
               {t('knowledge.candidateSave')}
             </Button>
@@ -7907,12 +7897,9 @@ const MessageItem = memo(function MessageItem({
               />
             </div>
             <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setRememberOpen(false)}
-                className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)]"
-              >
+              <Button variant="secondary" size="md" onClick={() => setRememberOpen(false)}>
                 {t('mcp.cancel')}
-              </button>
+              </Button>
               <Button variant="primary" size="md" loading={rememberSaving} onClick={saveRemember}>
                 {t('knowledge.save')}
               </Button>
@@ -8517,12 +8504,9 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
             <kbd className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] tnum">
               Ctrl+Enter
             </kbd>
-            <button
-              onClick={onClose}
-              className="h-7 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
-            >
+            <Button variant="secondary" size="sm" onClick={onClose}>
               {t('home.cancel')}
-            </button>
+            </Button>
             <Button variant="primary" size="sm" disabled={lines.length === 0} onClick={submit}>
               {t('home.batchSend')}
             </Button>
@@ -8655,12 +8639,9 @@ function ImportDialog({ data, onClose }: {
         <div className="flex items-center justify-between px-4 h-12 border-t border-[var(--border)] shrink-0">
           <span className="text-[11px] text-[var(--text-muted)]">{t('home.importReadOnly')}</span>
           <div className="flex items-center gap-2">
-            <button
-              onClick={onClose}
-              className="h-7 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
-            >
+            <Button variant="secondary" size="sm" onClick={onClose}>
               {t('home.cancel')}
-            </button>
+            </Button>
             <Button
               variant="primary"
               size="sm"
