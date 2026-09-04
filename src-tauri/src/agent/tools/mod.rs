@@ -766,7 +766,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_symbols",
-        desc: "按名称检索项目中的代码符号（组件/类/接口/函数/方法/路由/装饰器），返回所在文件与行号。\n参数：{\"query\":\"<关键字，匹配符号名或文件路径，可空>\",\"kind\":\"<可选类型过滤：component|class|interface|function|method|route|decorator|struct|enum>\"}。\n适合在修改前快速定位某组件/函数定义在哪个文件，避免盲目 list_dir/read_file。\n副作用：无（只读，基于源码轻量扫描）。\n返回：符号清单（名称、类型、文件、行号、归属类），最多 200 条。",
+        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"page\":<可选页码，缺省 1>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、签名、归属、行区间，以及 indexed_files/coverage/staleness；coverage 非完整时必须结合 codebase_search 或精确路径补查。",
     },
     ToolSpec {
         name: "delete_file",
@@ -3622,22 +3622,54 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     let root = Path::new(project_path).to_path_buf();
     let query = args["query"].as_str().unwrap_or("").to_string();
     let kind = args["kind"].as_str().map(|s| s.to_string());
-    // 复用带 60 秒 TTL 的缓存索引（连续检索/多文件定位时避免重复全量扫描）
-    let syms = tokio::task::spawn_blocking(move || crate::services::symbol_index::index_project_cached(&root))
+    let role = args["role"].as_str().map(|s| s.to_string());
+    if role.as_deref().is_some_and(|value| !matches!(value, "entity" | "logic")) {
+        return Err("role 仅支持 entity 或 logic".into());
+    }
+    let file = args["file"].as_str().map(|s| s.to_string());
+    let page = args["page"].as_u64().unwrap_or(1) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    // 复用增量持久索引；只把当前页结构元数据带入模型，不把全仓源码塞进上下文。
+    let result = tokio::task::spawn_blocking(move || {
+        crate::services::symbol_index::query_structure(
+            &root,
+            &query,
+            role.as_deref(),
+            kind.as_deref(),
+            file.as_deref(),
+            page,
+            limit,
+        )
+    })
         .await
         .map_err(|e| e.to_string())?;
-    let found = crate::services::symbol_index::filter_symbols(&syms, &query, kind.as_deref());
-    if found.is_empty() {
-        return Ok(format!("未找到匹配 \"{query}\" 的符号"));
-    }
     let mut out = String::new();
-    out.push_str(&format!("找到 {} 个符号：\n", found.len()));
-    for s in found {
+    out.push_str(&format!(
+        "结构查询：匹配 {}，第 {} 页（每页 {}）；已索引 {} 个文件 / {} 个结构；coverage={}；索引更新于 {} 秒前。\n",
+        result.total_matches,
+        result.page,
+        result.page_size,
+        result.indexed_files,
+        result.indexed_symbols,
+        result.coverage,
+        result.synced_ago_secs,
+    ));
+    if result.coverage.starts_with("partial_") || result.coverage.starts_with("best_effort_") {
+        out.push_str("注意：当前结构索引不是全量语义保证；无结果或高风险修改时需用 codebase_search/LSP/精确路径补查。\n");
+    }
+    if result.items.is_empty() {
+        out.push_str("本页无匹配结构。\n");
+        return Ok(out);
+    }
+    for s in result.items {
         let parent = s.parent.as_deref().map(|p| format!(" in {p}")).unwrap_or_default();
         out.push_str(&format!(
-            "- [{}] {}{}  ({}:{})\n",
-            s.kind, s.name, parent, s.file, s.line
+            "- [{}/{}] {}{}  ({}:{}-{})\n  {}\n",
+            s.role, s.kind, s.name, parent, s.file, s.line, s.end_line, s.signature
         ));
+    }
+    if let Some(next_page) = result.next_page {
+        out.push_str(&format!("还有结果：使用 page={next_page} 读取下一页。\n"));
     }
     Ok(truncate_out_max(&out, 12000))
 }

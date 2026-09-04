@@ -231,6 +231,8 @@ Agent 不应直接猜选搜索工具。新增一个统一 `repo_query`：
 - 修改影响面：反向依赖图 + 测试映射 + Git 历史；
 - 每个结果返回 `source_layer`、`index_revision`、`coverage`、`stale` 和可引用行范围。
 
+Agent 的默认入口采用 [Structure-first 代码导航](./STRUCTURE_FIRST_NAVIGATION.md)：先把符号按 `entity`（类/组件/类型/状态等）和 `logic`（函数/方法）组织并分页检索，再按返回的结构行区间读取正文。二分类只用于规划，索引仍保留语言原生 kind；索引无结果或 coverage 不完整时必须走 lexical/LSP fallback。本轮已将现有 `search_symbols` 升级为该 MVP，加入签名、父级、起止行、角色、分页、coverage 和 staleness，并调整 Agent 能力包为结构优先。
+
 ### 6.5 “全库可达”与单次读写预算
 
 百万级支持不等于把全仓文件内容同时读取进模型上下文。系统应区分两个概念：
@@ -412,7 +414,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [ ] approval 与 sandbox escalation 进入统一事件和审计链；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断；
-- [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据；
+- [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成，统一 planner 待完成）；
 - [ ] 每周真实模型回归，保存 patch/trajectory/cost/report。
 
 退出门槛：恶意仓库脚本不能读取工作区外文件或联网；100k 文件仓库满足校准后的 P95 指标；真实模型评测可重复。

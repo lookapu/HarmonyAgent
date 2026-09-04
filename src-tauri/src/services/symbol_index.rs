@@ -41,9 +41,98 @@ pub struct Symbol {
     pub file: String,
     /// 1-based 行号
     pub line: usize,
+    /// 结构块结束行（1-based，含）；无法识别块时等于定义行。
+    #[serde(default)]
+    pub end_line: usize,
+    /// 结构角色：entity（类/组件/类型/状态）或 logic（函数/方法）。
+    #[serde(default)]
+    pub role: String,
+    /// 定义签名的单行摘要，不包含方法正文。
+    #[serde(default)]
+    pub signature: String,
     /// 所在类/组件（方法的归属，顶层为空）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+}
+
+fn structure_role(kind: &str) -> &'static str {
+    if matches!(kind, "function" | "method") {
+        "logic"
+    } else {
+        "entity"
+    }
+}
+
+fn leading_indent(line: &str) -> usize {
+    line.chars().take_while(|ch| ch.is_whitespace()).count()
+}
+
+/// 轻量结构块范围。这里保持容错和零额外依赖；Tree-sitter/LSP 接入后将作为 fallback。
+fn structure_end_line(lines: &[&str], start: usize, ext: &str, kind: &str) -> usize {
+    if matches!(kind, "decorator" | "route") {
+        return start + 1;
+    }
+    if ext == "py" {
+        let base = leading_indent(lines.get(start).copied().unwrap_or(""));
+        let mut end = start;
+        for (idx, line) in lines.iter().enumerate().skip(start + 1) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if leading_indent(line) <= base {
+                break;
+            }
+            end = idx;
+        }
+        return end + 1;
+    }
+    let mut found_open = false;
+    let mut depth = 0i64;
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    found_open = true;
+                    depth += 1;
+                }
+                '}' if found_open => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return idx + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 声明没有块体时不要吞掉后续定义。
+        if !found_open && line.trim_end().ends_with(';') {
+            return start + 1;
+        }
+    }
+    start + 1
+}
+
+fn make_symbol(
+    kind: &str,
+    name: String,
+    rel: &str,
+    line: usize,
+    parent: Option<String>,
+    raw: &str,
+    lines: &[&str],
+    ext: &str,
+) -> Symbol {
+    Symbol {
+        kind: kind.into(),
+        name,
+        file: rel.into(),
+        line,
+        end_line: structure_end_line(lines, line.saturating_sub(1), ext, kind),
+        role: structure_role(kind).into(),
+        signature: raw.trim().chars().take(300).collect(),
+        parent,
+    }
 }
 
 fn safe_rel(root: &Path, path: &Path) -> String {
@@ -100,11 +189,12 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
         Err(_) => return,
     };
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let lines: Vec<&str> = content.lines().collect();
     let mut current_parent: Option<String> = None;
     let mut brace_depth = 0i32;
     let class_like = ["class ", "interface ", "struct ", "enum ", "object ", "trait ", "impl "];
 
-    for (idx, raw) in content.lines().enumerate() {
+    for (idx, raw) in lines.iter().copied().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with('*') || line.starts_with("/*") {
             // 仍需统计大括号（注释里的括号近似忽略，足够符号提取使用）
@@ -115,20 +205,20 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
         // ArkTS/HarmonyOS 装饰器：入口/组件/路由 + 状态管理装饰器
         if ext == "ets" && line.starts_with('@') {
             if line.starts_with("@Entry") {
-                out.push(Symbol { kind: "decorator".into(), name: "@Entry".into(), file: rel.into(), line: lineno, parent: None });
+                out.push(make_symbol("decorator", "@Entry".into(), rel, lineno, None, raw, &lines, ext));
             }
             if line.starts_with("@Component") {
-                out.push(Symbol { kind: "decorator".into(), name: "@Component".into(), file: rel.into(), line: lineno, parent: None });
+                out.push(make_symbol("decorator", "@Component".into(), rel, lineno, None, raw, &lines, ext));
             }
             if line.starts_with("@Router") {
-                out.push(Symbol { kind: "route".into(), name: "@Router".into(), file: rel.into(), line: lineno, parent: None });
+                out.push(make_symbol("route", "@Router".into(), rel, lineno, None, raw, &lines, ext));
             }
             // 状态管理装饰器：仅当装饰器名后是空白/(/) 等边界符时计入，
             // 避免把 "@StateXxx" 这类普通标识符误报为装饰器
             for dec in ETS_STATE_DECORATORS {
                 if let Some(rest) = line.strip_prefix(*dec) {
                     if rest.chars().next().is_none_or(|c| !is_ident(c)) {
-                        out.push(Symbol { kind: "decorator".into(), name: (*dec).into(), file: rel.into(), line: lineno, parent: None });
+                        out.push(make_symbol("decorator", (*dec).into(), rel, lineno, None, raw, &lines, ext));
                     }
                     break;
                 }
@@ -139,7 +229,7 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
         for kw in &class_like {
             if let Some(name) = ident_after(line, kw) {
                 let kind = kw.trim();
-                out.push(Symbol { kind: kind.into(), name: name.clone(), file: rel.into(), line: lineno, parent: None });
+                out.push(make_symbol(kind, name.clone(), rel, lineno, None, raw, &lines, ext));
                 current_parent = Some(name);
                 break;
             }
@@ -148,15 +238,15 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
         // 函数/方法
         let fn_kw = if ext == "py" { "def " } else { "fn " };
         if let Some(name) = ident_after(line, fn_kw) {
-            out.push(Symbol { kind: "function".into(), name, file: rel.into(), line: lineno, parent: current_parent.clone() });
+            out.push(make_symbol("function", name, rel, lineno, current_parent.clone(), raw, &lines, ext));
         }
         if let Some(name) = ident_after(line, "function ") {
-            out.push(Symbol { kind: "function".into(), name, file: rel.into(), line: lineno, parent: current_parent.clone() });
+            out.push(make_symbol("function", name, rel, lineno, current_parent.clone(), raw, &lines, ext));
         }
         // ArkTS 组件 struct
         if ext == "ets" {
             if let Some(name) = ident_after(line, "struct ") {
-                out.push(Symbol { kind: "component".into(), name, file: rel.into(), line: lineno, parent: None });
+                out.push(make_symbol("component", name, rel, lineno, None, raw, &lines, ext));
             }
             // 方法形似 name(...) {
             if line.contains('(') && line.ends_with('{') {
@@ -166,7 +256,7 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
                     && is_ident_start(name.chars().next().unwrap_or(' '))
                     && !["if", "for", "while", "switch", "catch", "when", "return", "else"].contains(&name)
                 {
-                    out.push(Symbol { kind: "method".into(), name: name.to_string(), file: rel.into(), line: lineno, parent: current_parent.clone() });
+                    out.push(make_symbol("method", name.to_string(), rel, lineno, current_parent.clone(), raw, &lines, ext));
                 }
             }
         }
@@ -312,7 +402,8 @@ struct PersistedIndex {
     syms: Vec<Symbol>,
 }
 
-const PERSIST_VERSION: u32 = 1;
+// v2 增加 role/end_line/signature，旧缓存必须重建，避免结构查询返回空范围。
+const PERSIST_VERSION: u32 = 2;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -584,6 +675,99 @@ pub fn filter_symbols<'a>(syms: &'a [Symbol], query: &str, kind: Option<&str>) -
         .collect()
 }
 
+/// 面向 Agent 的结构优先查询结果。保留 Symbol 作为前端兼容模型，同时补齐分页、
+/// 覆盖状态和新鲜度，调用方据此决定是否读取具体代码块。
+#[derive(Debug, Serialize)]
+pub struct StructureQueryResult {
+    pub items: Vec<Symbol>,
+    pub total_matches: usize,
+    pub page: usize,
+    pub page_size: usize,
+    pub next_page: Option<usize>,
+    pub indexed_files: usize,
+    pub indexed_symbols: usize,
+    pub coverage: String,
+    pub synced_ago_secs: u64,
+}
+
+pub fn query_structure(
+    root: &Path,
+    query: &str,
+    role: Option<&str>,
+    kind: Option<&str>,
+    file: Option<&str>,
+    page: usize,
+    page_size: usize,
+) -> StructureQueryResult {
+    let syms = index_project_cached(root);
+    let q = query.trim().to_lowercase();
+    let role = role.map(str::trim).filter(|value| !value.is_empty());
+    let kind = kind.map(str::trim).filter(|value| !value.is_empty());
+    let file_filter = file.map(str::trim).filter(|value| !value.is_empty()).map(str::to_lowercase);
+    // 查询阶段只排序引用，最后仅克隆当前页，避免空查询时复制百万级结构元数据。
+    let mut matched: Vec<&Symbol> = syms
+        .iter()
+        .filter(|symbol| role.is_none_or(|value| symbol.role == value))
+        .filter(|symbol| kind.is_none_or(|value| symbol.kind == value))
+        .filter(|symbol| {
+            file_filter
+                .as_ref()
+                .is_none_or(|value| symbol.file.to_lowercase().contains(value))
+        })
+        .filter(|symbol| {
+            q.is_empty()
+                || symbol.name.to_lowercase().contains(&q)
+                || symbol.file.to_lowercase().contains(&q)
+                || symbol.signature.to_lowercase().contains(&q)
+        })
+        .collect();
+    matched.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line.cmp(&b.line))
+            .then(a.name.cmp(&b.name))
+    });
+    let total_matches = matched.len();
+    let page = page.max(1);
+    let page_size = page_size.clamp(1, 200);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    let items = matched
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .cloned()
+        .collect();
+    let next_page = (offset.saturating_add(page_size) < total_matches).then_some(page + 1);
+
+    let key = canonical_key(root);
+    let now = now_secs();
+    let (indexed_files, synced_ago_secs) = cache()
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .get(&key)
+                .map(|entry| (entry.files.len(), now.saturating_sub(entry.last_sync)))
+        })
+        .unwrap_or((0, 0));
+    let coverage = if indexed_files >= MAX_FILES {
+        format!("partial_at_least_{MAX_FILES}_file_limit")
+    } else {
+        format!("best_effort_source_files_under_{MAX_BYTES}_bytes")
+    };
+    StructureQueryResult {
+        items,
+        total_matches,
+        page,
+        page_size,
+        next_page,
+        indexed_files,
+        indexed_symbols: syms.len(),
+        coverage,
+        synced_ago_secs,
+    }
+}
+
 /// 项目级摘要：组件数、页面数、函数数、路由清单（用于 Agent 快速了解工程结构）
 #[derive(Debug, Serialize, Default)]
 pub struct ProjectOutline {
@@ -707,6 +891,13 @@ struct Index {
         assert!(out.iter().any(|s| s.kind == "component" && s.name == "Index"), "应识别 struct Index: {out:?}");
         assert!(out.iter().any(|s| s.kind == "method" && s.name == "aboutToAppear"));
         assert!(out.iter().any(|s| s.kind == "method" && s.name == "build"));
+        let component = out.iter().find(|s| s.kind == "component" && s.name == "Index").unwrap();
+        assert_eq!(component.role, "entity");
+        assert!(component.end_line > component.line);
+        let method = out.iter().find(|s| s.kind == "method" && s.name == "aboutToAppear").unwrap();
+        assert_eq!(method.role, "logic");
+        assert!(method.signature.contains("aboutToAppear"));
+        assert!(method.end_line >= method.line);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -757,12 +948,29 @@ struct Detail {
     #[test]
     fn filter_works() {
         let syms = vec![
-            Symbol { kind: "function".into(), name: "loadData".into(), file: "a.ts".into(), line: 1, parent: None },
-            Symbol { kind: "component".into(), name: "BookCard".into(), file: "b.ets".into(), line: 2, parent: None },
+            Symbol { kind: "function".into(), name: "loadData".into(), file: "a.ts".into(), line: 1, end_line: 1, role: "logic".into(), signature: "function loadData()".into(), parent: None },
+            Symbol { kind: "component".into(), name: "BookCard".into(), file: "b.ets".into(), line: 2, end_line: 5, role: "entity".into(), signature: "struct BookCard".into(), parent: None },
         ];
         assert_eq!(filter_symbols(&syms, "book", None).len(), 1);
         assert_eq!(filter_symbols(&syms, "", Some("component")).len(), 1);
         assert_eq!(filter_symbols(&syms, "", None).len(), 2);
+    }
+
+    #[test]
+    fn structure_query_filters_roles_and_paginates_with_coverage() {
+        let dir = make_project("structure-query");
+        let first = query_structure(&dir, "", Some("entity"), None, None, 1, 1);
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].role, "entity");
+        assert_eq!(first.page_size, 1);
+        assert!(first.next_page.is_some());
+        assert_eq!(first.coverage, "best_effort_source_files_under_524288_bytes");
+
+        let logic = query_structure(&dir, "oldA", Some("logic"), None, Some("a.ets"), 1, 20);
+        assert_eq!(logic.total_matches, 1);
+        assert_eq!(logic.items[0].name, "oldA");
+        assert_eq!(logic.items[0].role, "logic");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 辅助：建一个含两个 ets 文件的临时项目目录
@@ -846,7 +1054,7 @@ struct Detail {
         let proj = make_project("persist");
         let mut files = HashMap::new();
         files.insert("a.ets".to_string(), FileStamp { mtime: 123, len: 45 });
-        let syms = vec![Symbol { kind: "struct".into(), name: "Aaa".into(), file: "a.ets".into(), line: 1, parent: None }];
+        let syms = vec![Symbol { kind: "struct".into(), name: "Aaa".into(), file: "a.ets".into(), line: 1, end_line: 1, role: "entity".into(), signature: "struct Aaa {}".into(), parent: None }];
         save_to(&data_dir, &proj, &files, &syms);
         let loaded = load_from(&data_dir, &proj).expect("应能从磁盘恢复");
         assert_eq!(loaded.files.len(), 1);

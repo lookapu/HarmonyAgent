@@ -32,7 +32,7 @@ const PROJECT_UNDERSTANDING: CapabilityPack = CapabilityPack {
     permission_ceiling: PermissionCeiling::ReadOnly,
     triggers: &["project", "understand", "inspect", "项目", "理解", "阅读", "分析", "架构"],
     tools: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "search_symbols", "read_file", "environment_check"],
-    recommended_order: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "read_file"],
+    recommended_order: &["list_dir", "get_project_info", "list_modules", "search_symbols", "deep_scan", "codebase_search", "read_file"],
     stop_conditions: &["核心入口、模块边界和构建方式已有来源证据", "继续读取不会改变当前任务计划"],
     acceptance: &["给出工程类型、入口、模块、依赖和风险摘要", "所有关键判断可追溯到文件或工具结果"],
 };
@@ -44,8 +44,8 @@ const COMPILE_FIX: CapabilityPack = CapabilityPack {
     min_agent_version: "2.0.0",
     permission_ceiling: PermissionCeiling::ProjectWrite,
     triggers: &["compile", "build error", "fix", "bug", "error", "编译", "构建失败", "修复", "报错"],
-    tools: &["get_diagnostics", "get_build_log", "codebase_search", "read_file", "edit_file", "check_code", "build_project", "run_tests", "git_diff"],
-    recommended_order: &["get_diagnostics", "get_build_log", "read_file", "edit_file", "check_code", "build_project", "run_tests"],
+    tools: &["get_diagnostics", "get_build_log", "search_symbols", "codebase_search", "read_file", "edit_file", "check_code", "build_project", "run_tests", "git_diff"],
+    recommended_order: &["get_diagnostics", "get_build_log", "search_symbols", "codebase_search", "read_file", "edit_file", "check_code", "build_project", "run_tests"],
     stop_conditions: &["同一失败签名重复且没有新证据", "修复需要用户选择或外部环境变更"],
     acceptance: &["原始失败不再出现", "相关静态检查、构建或测试通过", "diff 仅包含目标修复"],
 };
@@ -57,8 +57,8 @@ const FEATURE_DEVELOPMENT: CapabilityPack = CapabilityPack {
     min_agent_version: "2.0.0",
     permission_ceiling: PermissionCeiling::ProjectWrite,
     triggers: &["feature", "implement", "add", "develop", "功能", "实现", "新增", "开发"],
-    tools: &["codebase_search", "get_symbol_details", "read_file", "write_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
-    recommended_order: &["codebase_search", "get_symbol_details", "read_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
+    tools: &["search_symbols", "codebase_search", "get_symbol_details", "read_file", "write_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
+    recommended_order: &["search_symbols", "get_symbol_details", "codebase_search", "read_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
     stop_conditions: &["需求或交互存在会改变实现的歧义", "验收失败且缺少新的安全修复路径"],
     acceptance: &["功能行为满足目标契约", "新增或相关测试通过", "构建通过且变更经过审查"],
 };

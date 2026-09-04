@@ -284,7 +284,7 @@ fn system_hint_from_specs<'a>(specs: impl Iterator<Item = &'a super::ToolSpec>) 
          - 需要读取多个文件/执行多步操作时，可在一条回复中连续输出多个工具标记，系统会依次执行；\n\
          - 复杂多步骤任务开始前先 todo_write 拆分清单，完成一项标记一项，界面会实时展示进度；\n\
          - 改完 UI 并部署后，用 take_screenshot 截图验证：截图会自动以图片形式进入你的视野，直接观察真机界面，判断布局/样式/文字是否达标，再决定是否继续修；\n\
-         - 修改代码前先定位再动手：优先 codebase_search / get_symbol_details / search_symbols 找到目标，read_file 精读后 edit_file 小步修改；\n\
+         - 修改代码前先定位再动手：默认先用 search_symbols 按 entity/logic 结构定位并取得签名与完整行区间，再用 read_file 读取目标区块；需要文本召回或索引覆盖不足时用 codebase_search/LSP 补查，跨结构上下文确有必要时才读全文；\n\
          - 接手陌生工程或大范围重构前先 deep_scan 了解全库结构与依赖；改完代码后用 check_code 自查调试残留/硬编码密钥等常见问题；\n\
          - 大任务可 spawn_agents 并行委派互不依赖的子任务，执行后用 list_agents 回看各子任务结果；\n\
          - 工具执行失败时，根据错误信息分析原因，给出修复建议或改用其他工具；不要编造工具结果；\n\
