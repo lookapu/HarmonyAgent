@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection};
 
 use crate::services::harmony;
 
@@ -22,6 +23,44 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
+
+/// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CatalogStats {
+    pub discovered_files: usize,
+    pub source_files: usize,
+    pub indexed_source_files: usize,
+    pub deferred_source_files: usize,
+    pub oversized_source_files: usize,
+    pub unsupported_files: usize,
+    pub symlink_files: usize,
+    pub unreadable_files: usize,
+    pub unreadable_directories: usize,
+    pub persisted: bool,
+}
+
+impl CatalogStats {
+    fn coverage(&self) -> String {
+        if self.deferred_source_files > 0 {
+            format!(
+                "partial_{}_source_files_deferred_by_parse_budget",
+                self.deferred_source_files
+            )
+        } else if self.oversized_source_files > 0
+            || self.unreadable_files > 0
+            || self.unreadable_directories > 0
+        {
+            format!(
+                "partial_{}_oversized_{}_unreadable_files_{}_unreadable_directories",
+                self.oversized_source_files,
+                self.unreadable_files,
+                self.unreadable_directories,
+            )
+        } else {
+            "best_effort_lightweight_syntax_index".into()
+        }
+    }
+}
 
 /// ArkTS 状态管理装饰器（属性声明/状态流转标记，鸿蒙工程定位数据流的关键符号）
 const ETS_STATE_DECORATORS: &[&str] = &[
@@ -289,58 +328,288 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
     if !meta.is_file() || meta.len() > MAX_BYTES {
         return None;
     }
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    Some(FileStamp { mtime, len: meta.len() })
+    Some(stamp_from_meta(&meta))
 }
 
-/// 收集项目内全部候选源文件及其指纹（mtime 秒 + 字节数）。
-/// 只做 read_dir + stat，不做内容解析——增量同步用它定位变化文件。
-fn collect_files(dir: &Path, root: &Path, count: &mut usize, files: &mut HashMap<String, FileStamp>) {
-    if *count >= MAX_FILES {
-        return;
+fn stamp_from_meta(meta: &fs::Metadata) -> FileStamp {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    FileStamp { mtime, len: meta.len() }
+}
+
+fn catalog_file_at(dir: &Path, root: &Path) -> PathBuf {
+    let key = canonical_key(root);
+    dir.join("repo_catalog")
+        .join(format!("{:016x}.sqlite3", stable_hash(&key)))
+}
+
+#[derive(Debug, Serialize)]
+pub struct CatalogFile {
+    pub path: String,
+    pub extension: String,
+    pub size: u64,
+    pub state: String,
+    pub shard: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CatalogQueryResult {
+    pub items: Vec<CatalogFile>,
+    pub total_matches: usize,
+    pub page: usize,
+    pub page_size: usize,
+    pub next_page: Option<usize>,
+}
+
+fn glob_to_sql_like(pattern: &str) -> String {
+    let mut out = String::new();
+    for ch in pattern.replace('\\', "/").chars() {
+        match ch {
+            '*' => out.push('%'),
+            '?' => out.push('_'),
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
     }
+    out
+}
+
+/// 查询持久化全库目录。None 表示应用数据目录尚未初始化，调用方可回退即时扫描。
+pub fn query_catalog_files(
+    root: &Path,
+    pattern: &str,
+    prefix: Option<&str>,
+    state: Option<&str>,
+    page: usize,
+    page_size: usize,
+) -> Option<Result<CatalogQueryResult, String>> {
+    let data_dir = DATA_DIR.get()?;
+    let _ = index_project_cached(root);
+    let conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("打开全库目录失败：{error}"))),
+    };
+    let page = page.max(1);
+    let page_size = page_size.clamp(1, 200);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    let like = glob_to_sql_like(pattern);
+    let basename_like = format!("%/{like}");
+    let prefix_like = prefix
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != ".")
+        .map(|value| format!("{}/%", value.trim_matches('/')))
+        .unwrap_or_else(|| "%".into());
+    let state = state.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("%");
+    let where_sql = "(path LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+                      OR path LIKE ?2 ESCAPE '\\' COLLATE NOCASE)
+                     AND path LIKE ?3 ESCAPE '\\' COLLATE NOCASE
+                     AND state LIKE ?4 COLLATE NOCASE";
+    let total_matches = match conn.query_row(
+        &format!("SELECT COUNT(*) FROM files WHERE {where_sql}"),
+        params![like, basename_like, prefix_like, state],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(value) => value.max(0) as usize,
+        Err(error) => return Some(Err(format!("查询全库目录失败：{error}"))),
+    };
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT path, extension, size, state, shard FROM files
+         WHERE {where_sql} ORDER BY path LIMIT ?5 OFFSET ?6"
+    )) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("准备全库目录查询失败：{error}"))),
+    };
+    let rows = match stmt.query_map(
+        params![like, basename_like, prefix_like, state, page_size as i64, offset as i64],
+        |row| {
+            Ok(CatalogFile {
+                path: row.get(0)?,
+                extension: row.get(1)?,
+                size: row.get::<_, i64>(2)?.max(0) as u64,
+                state: row.get(3)?,
+                shard: row.get(4)?,
+            })
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("读取全库目录失败：{error}"))),
+    };
+    let items = match rows.collect::<Result<Vec<_>, _>>() {
+        Ok(value) => value,
+        Err(error) => return Some(Err(format!("解析全库目录结果失败：{error}"))),
+    };
+    Some(Ok(CatalogQueryResult {
+        items,
+        total_matches,
+        page,
+        page_size,
+        next_page: (offset.saturating_add(page_size) < total_matches).then_some(page + 1),
+    }))
+}
+
+fn shard_for(rel: &str) -> &str {
+    rel.split('/').next().filter(|value| !value.is_empty()).unwrap_or(".")
+}
+
+/// 遍历所有未忽略文件。回调是流式的，百万文件时不需要把全目录保存在内存。
+fn walk_catalog<F>(dir: &Path, root: &Path, stats: &mut CatalogStats, visit: &mut F)
+where
+    F: FnMut(&str, &str, u64, u64, &str, &str),
+{
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        if *count >= MAX_FILES {
+        Err(_) => {
+            stats.unreadable_directories += 1;
             return;
         }
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(value) => value,
+            Err(_) => {
+                stats.unreadable_files += 1;
+                continue;
+            }
+        };
+        if file_type.is_dir() {
             if SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') {
                 continue;
             }
-            collect_files(&path, root, count, files);
-        } else {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !SYMBOL_EXTS.contains(&ext) {
+            walk_catalog(&path, root, stats, visit);
+            continue;
+        }
+
+        let rel = safe_rel(root, &path);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        stats.discovered_files += 1;
+        if file_type.is_symlink() {
+            stats.symlink_files += 1;
+            visit(&rel, ext, 0, 0, "symlink", shard_for(&rel));
+            continue;
+        }
+        if !file_type.is_file() {
+            stats.unsupported_files += 1;
+            visit(&rel, ext, 0, 0, "unsupported", shard_for(&rel));
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(value) => value,
+            Err(_) => {
+                stats.unreadable_files += 1;
+                visit(&rel, ext, 0, 0, "unreadable", shard_for(&rel));
                 continue;
             }
-            *count += 1;
-            let rel = safe_rel(root, &path);
-            if let Some(stamp) = file_stamp(&path) {
-                files.insert(rel, stamp);
-            }
+        };
+        let stamp = stamp_from_meta(&meta);
+        if !SYMBOL_EXTS.contains(&ext) {
+            stats.unsupported_files += 1;
+            visit(&rel, ext, stamp.len, stamp.mtime, "unsupported", shard_for(&rel));
+        } else if stamp.len > MAX_BYTES {
+            stats.source_files += 1;
+            stats.oversized_source_files += 1;
+            visit(&rel, ext, stamp.len, stamp.mtime, "oversized", shard_for(&rel));
+        } else if stats.indexed_source_files < MAX_FILES {
+            stats.source_files += 1;
+            stats.indexed_source_files += 1;
+            visit(&rel, ext, stamp.len, stamp.mtime, "indexed", shard_for(&rel));
+        } else {
+            stats.source_files += 1;
+            stats.deferred_source_files += 1;
+            visit(&rel, ext, stamp.len, stamp.mtime, "deferred", shard_for(&rel));
         }
     }
+}
+
+/// 刷新全库目录，并返回本轮允许进入轻量结构解析预算的源码文件。
+fn collect_files_at(
+    root: &Path,
+    data_dir: Option<&Path>,
+) -> (HashMap<String, FileStamp>, CatalogStats) {
+    let mut files = HashMap::new();
+    let mut stats = CatalogStats::default();
+    let generation = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+
+    let mut catalog = data_dir
+        .and_then(|dir| {
+            let path = catalog_file_at(dir, root);
+            fs::create_dir_all(path.parent()?).ok()?;
+            let conn = Connection::open(path).ok()?;
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 CREATE TABLE IF NOT EXISTS files (
+                   path TEXT PRIMARY KEY,
+                   extension TEXT NOT NULL,
+                   size INTEGER NOT NULL,
+                   mtime_ns INTEGER NOT NULL,
+                   state TEXT NOT NULL,
+                   shard TEXT NOT NULL,
+                   generation INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_files_state ON files(state);
+                 CREATE INDEX IF NOT EXISTS idx_files_shard ON files(shard);
+                 BEGIN IMMEDIATE;",
+            )
+            .ok()?;
+            Some(conn)
+        });
+    let mut write_failed = false;
+    walk_catalog(root, root, &mut stats, &mut |rel, ext, size, mtime, state, shard| {
+        if state == "indexed" {
+            files.insert(rel.to_string(), FileStamp { mtime, len: size });
+        }
+        if let Some(conn) = catalog.as_mut() {
+            if conn.execute(
+                "INSERT INTO files(path, extension, size, mtime_ns, state, shard, generation)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(path) DO UPDATE SET
+                   extension=excluded.extension, size=excluded.size, mtime_ns=excluded.mtime_ns,
+                   state=excluded.state, shard=excluded.shard, generation=excluded.generation",
+                params![rel, ext, size as i64, mtime as i64, state, shard, generation],
+            ).is_err() {
+                write_failed = true;
+            }
+        }
+    });
+    if let Some(conn) = catalog.as_mut() {
+        // 某个目录暂时不可读时保留其上一代记录，避免一次权限抖动被误判成整目录删除。
+        let cleanup_ok = stats.unreadable_directories > 0
+            || conn
+                .execute("DELETE FROM files WHERE generation <> ?1", [generation])
+                .is_ok();
+        if !write_failed
+            && cleanup_ok
+            && conn.execute_batch("COMMIT;").is_ok()
+        {
+            stats.persisted = true;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+    }
+    (files, stats)
+}
+
+fn collect_files(root: &Path) -> (HashMap<String, FileStamp>, CatalogStats) {
+    collect_files_at(root, DATA_DIR.get().map(PathBuf::as_path))
 }
 
 /// 扫描整个项目，返回全部符号（全量构建：无缓存的底层实现）。
 /// 强制刷新入口 refresh_project_symbols 已改为 invalidate_cache + cached 组合，此函数暂无调用者。
 #[allow(dead_code)]
 pub fn index_project(root: &Path) -> Vec<Symbol> {
-    let mut files = HashMap::new();
-    let mut count = 0usize;
-    collect_files(root, root, &mut count, &mut files);
+    let (files, _) = collect_files(root);
     let mut out = Vec::new();
     for rel in files.keys() {
         let p = root.join(rel);
@@ -355,6 +624,7 @@ pub fn index_project(root: &Path) -> Vec<Symbol> {
 struct CacheEntry {
     files: HashMap<String, FileStamp>,
     syms: Vec<Symbol>,
+    catalog: CatalogStats,
     /// 最近一次增量同步的秒：冷却期内直接复用内存结果（Agent 修改文件会主动精确失效）
     last_sync: u64,
     /// 数据来源：disk（磁盘恢复）/ scan（本次会话扫描建立），供面板展示缓存状态
@@ -373,7 +643,9 @@ pub fn init_cache_dir(dir: PathBuf) {
 
 /// 增量同步冷却（秒）：冷却期内直接返回内存结果，避免高频检索反复 walk；
 /// 修改类工具会主动 invalidate_files 立即更新，冷却不会掩盖 Agent 的改动。
-const SYNC_COOLDOWN_SECS: u64 = 2;
+// 全库目录会覆盖所有未忽略文件，避免高频查询反复遍历百万文件；工具内修改仍会精确失效。
+// watcher/Git diff 补偿接入后可进一步延长或移除周期性 walk。
+const SYNC_COOLDOWN_SECS: u64 = 30;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -400,10 +672,11 @@ struct PersistedIndex {
     version: u32,
     files: HashMap<String, FileStamp>,
     syms: Vec<Symbol>,
+    catalog: CatalogStats,
 }
 
-// v2 增加 role/end_line/signature，旧缓存必须重建，避免结构查询返回空范围。
-const PERSIST_VERSION: u32 = 2;
+// v3 持久化全库目录覆盖统计；旧缓存重建以避免把解析子集误报为全库。
+const PERSIST_VERSION: u32 = 3;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -435,13 +708,24 @@ fn load_from(dir: &Path, root: &Path) -> Option<PersistedIndex> {
 }
 
 /// 原子写盘（tmp + rename），失败静默——缓存只是加速手段，不影响正确性
-fn save_to(dir: &Path, root: &Path, files: &HashMap<String, FileStamp>, syms: &[Symbol]) {
+fn save_to(
+    dir: &Path,
+    root: &Path,
+    files: &HashMap<String, FileStamp>,
+    syms: &[Symbol],
+    catalog: CatalogStats,
+) {
     let path = cache_file_at(dir, root);
     let Some(parent) = path.parent() else { return };
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let idx = PersistedIndex { version: PERSIST_VERSION, files: files.clone(), syms: syms.to_vec() };
+    let idx = PersistedIndex {
+        version: PERSIST_VERSION,
+        files: files.clone(),
+        syms: syms.to_vec(),
+        catalog,
+    };
     let Ok(json) = serde_json::to_string(&idx) else { return };
     let tmp = path.with_extension("json.tmp");
     if fs::write(&tmp, json).is_err() {
@@ -455,9 +739,14 @@ fn load_persisted(root: &Path) -> Option<PersistedIndex> {
     load_from(dir, root)
 }
 
-fn save_persisted(root: &Path, files: &HashMap<String, FileStamp>, syms: &[Symbol]) {
+fn save_persisted(
+    root: &Path,
+    files: &HashMap<String, FileStamp>,
+    syms: &[Symbol],
+    catalog: CatalogStats,
+) {
     if let Some(dir) = DATA_DIR.get() {
-        save_to(dir, root, files, syms);
+        save_to(dir, root, files, syms, catalog);
     }
 }
 
@@ -471,10 +760,8 @@ fn sync_incremental(
     files: &mut HashMap<String, FileStamp>,
     syms: &mut Vec<Symbol>,
     root: &Path,
-) -> (usize, usize) {
-    let mut current: HashMap<String, FileStamp> = HashMap::new();
-    let mut count = 0usize;
-    collect_files(root, root, &mut count, &mut current);
+) -> (usize, usize, CatalogStats) {
+    let (current, catalog) = collect_files(root);
 
     let mut rescanned = 0usize;
     let mut removed = 0usize;
@@ -508,7 +795,7 @@ fn sync_incremental(
         syms.extend(fresh);
         rescanned += 1;
     }
-    (rescanned, removed)
+    (rescanned, removed, catalog)
 }
 
 /// 带缓存的符号索引：内存 → 磁盘 → 增量同步。
@@ -526,6 +813,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
         let entry = guard.entry(key.clone()).or_insert_with(|| CacheEntry {
             files: HashMap::new(),
             syms: Vec::new(),
+            catalog: CatalogStats::default(),
             last_sync: 0,
             source: "scan",
         });
@@ -534,6 +822,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
             if let Some(persisted) = load_persisted(root) {
                 entry.files = persisted.files;
                 entry.syms = persisted.syms;
+                entry.catalog = persisted.catalog;
                 entry.source = "disk";
             }
         }
@@ -544,7 +833,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
         (entry.files.clone(), entry.syms.clone(), entry.last_sync)
     };
     // 阶段 2（无锁）：walk + 指纹对比 + 只重扫变化文件
-    let (rescanned, removed) = sync_incremental(&mut files, &mut syms, root);
+    let (_rescanned, _removed, catalog) = sync_incremental(&mut files, &mut syms, root);
     // 阶段 3（锁内）：CAS 写回——期间有其他线程同步过（last_sync 变化）则丢弃本地结果。
     // invalidate_files 精确更新同样会推进 last_sync，不会被本阶段覆盖丢失。
     let mut guard = cache().lock().unwrap();
@@ -552,10 +841,9 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
         if entry.last_sync == snap_sync {
             entry.files = files;
             entry.syms = syms;
+            entry.catalog = catalog;
             entry.last_sync = now;
-            if rescanned > 0 || removed > 0 {
-                save_persisted(root, &entry.files, &entry.syms);
-            }
+            save_persisted(root, &entry.files, &entry.syms, entry.catalog);
         }
         entry.syms.clone()
     } else {
@@ -577,6 +865,16 @@ pub fn invalidate_cache(root: &Path) {
     }
     if let Some(path) = cache_file_for(root) {
         let _ = fs::remove_file(path);
+    }
+    if let Some(dir) = DATA_DIR.get() {
+        let path = catalog_file_at(dir, root);
+        for candidate in [
+            path.clone(),
+            path.with_extension("sqlite3-wal"),
+            path.with_extension("sqlite3-shm"),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
     }
 }
 
@@ -640,7 +938,7 @@ pub fn invalidate_files(root: &Path, rels: &[String]) {
         // 推进 last_sync：与 index_project_cached 阶段 3 的 CAS 协调，
         // 防止并发中的锁外扫描写回时覆盖本次精确更新
         entry.last_sync = now_secs();
-        save_persisted(root, &entry.files, &entry.syms);
+        save_persisted(root, &entry.files, &entry.syms, entry.catalog);
     }
 }
 
@@ -686,6 +984,7 @@ pub struct StructureQueryResult {
     pub next_page: Option<usize>,
     pub indexed_files: usize,
     pub indexed_symbols: usize,
+    pub catalog: CatalogStats,
     pub coverage: String,
     pub synced_ago_secs: u64,
 }
@@ -741,20 +1040,22 @@ pub fn query_structure(
 
     let key = canonical_key(root);
     let now = now_secs();
-    let (indexed_files, synced_ago_secs) = cache()
+    let (indexed_files, catalog, synced_ago_secs) = cache()
         .lock()
         .ok()
         .and_then(|guard| {
             guard
                 .get(&key)
-                .map(|entry| (entry.files.len(), now.saturating_sub(entry.last_sync)))
+                .map(|entry| {
+                    (
+                        entry.files.len(),
+                        entry.catalog,
+                        now.saturating_sub(entry.last_sync),
+                    )
+                })
         })
-        .unwrap_or((0, 0));
-    let coverage = if indexed_files >= MAX_FILES {
-        format!("partial_at_least_{MAX_FILES}_file_limit")
-    } else {
-        format!("best_effort_source_files_under_{MAX_BYTES}_bytes")
-    };
+        .unwrap_or((0, CatalogStats::default(), 0));
+    let coverage = catalog.coverage();
     StructureQueryResult {
         items,
         total_matches,
@@ -763,6 +1064,7 @@ pub fn query_structure(
         next_page,
         indexed_files,
         indexed_symbols: syms.len(),
+        catalog,
         coverage,
         synced_ago_secs,
     }
@@ -801,6 +1103,8 @@ pub struct SymbolIndexMeta {
     pub source: &'static str,
     /// 最近同步距今秒数（磁盘恢复后未同步时为较大值）
     pub synced_ago_secs: u64,
+    pub catalog: CatalogStats,
+    pub coverage: String,
 }
 
 /// 查询索引元信息：内部先确保索引已构建且新鲜（有冷却/增量，不会重复全量扫描）
@@ -815,6 +1119,8 @@ pub fn index_meta(root: &Path) -> SymbolIndexMeta {
             files: e.files.len(),
             source: e.source,
             synced_ago_secs: now.saturating_sub(e.last_sync),
+            catalog: e.catalog,
+            coverage: e.catalog.coverage(),
         },
         // 条目被容量上限清空：仅能给出符号数（来源视为本次扫描）
         None => SymbolIndexMeta {
@@ -822,6 +1128,8 @@ pub fn index_meta(root: &Path) -> SymbolIndexMeta {
             files: 0,
             source: "scan",
             synced_ago_secs: 0,
+            catalog: CatalogStats::default(),
+            coverage: "unavailable".into(),
         },
     }
 }
@@ -957,6 +1265,80 @@ struct Detail {
     }
 
     #[test]
+    fn catalog_coverage_distinguishes_deferred_and_best_effort() {
+        let complete = CatalogStats {
+            discovered_files: 3,
+            source_files: 2,
+            indexed_source_files: 2,
+            unsupported_files: 1,
+            ..CatalogStats::default()
+        };
+        assert_eq!(complete.coverage(), "best_effort_lightweight_syntax_index");
+        let deferred = CatalogStats {
+            deferred_source_files: 17,
+            ..complete
+        };
+        assert_eq!(
+            deferred.coverage(),
+            "partial_17_source_files_deferred_by_parse_budget"
+        );
+        assert_eq!(glob_to_sql_like("src/**/*.ets"), "src/%%/%.ets");
+        assert_eq!(glob_to_sql_like("100%_ok?.ts"), "100\\%\\_ok_.ts");
+    }
+
+    #[test]
+    fn catalog_persists_all_files_and_removes_stale_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "deveco-catalog-project-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-catalog-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("small.rs"), "fn small() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "# hello\n").unwrap();
+        std::fs::write(root.join("large.ts"), vec![b'x'; MAX_BYTES as usize + 1]).unwrap();
+
+        let (files, stats) = collect_files_at(&root, Some(&data_dir));
+        assert_eq!(files.len(), 1);
+        assert_eq!(stats.discovered_files, 3);
+        assert_eq!(stats.source_files, 2);
+        assert_eq!(stats.oversized_source_files, 1);
+        assert_eq!(stats.unsupported_files, 1);
+        assert!(stats.persisted);
+
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 3);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM files WHERE path='large.ts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "oversized");
+        drop(conn);
+
+        std::fs::remove_file(root.join("README.md")).unwrap();
+        let (_, refreshed) = collect_files_at(&root, Some(&data_dir));
+        assert!(refreshed.persisted);
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
     fn structure_query_filters_roles_and_paginates_with_coverage() {
         let dir = make_project("structure-query");
         let first = query_structure(&dir, "", Some("entity"), None, None, 1, 1);
@@ -964,7 +1346,9 @@ struct Detail {
         assert_eq!(first.items[0].role, "entity");
         assert_eq!(first.page_size, 1);
         assert!(first.next_page.is_some());
-        assert_eq!(first.coverage, "best_effort_source_files_under_524288_bytes");
+        assert_eq!(first.coverage, "best_effort_lightweight_syntax_index");
+        assert_eq!(first.catalog.discovered_files, 2);
+        assert_eq!(first.catalog.indexed_source_files, 2);
 
         let logic = query_structure(&dir, "oldA", Some("logic"), None, Some("a.ets"), 1, 20);
         assert_eq!(logic.total_matches, 1);
@@ -986,23 +1370,32 @@ struct Detail {
     #[test]
     fn sync_incremental_rescans_only_changed() {
         let dir = make_project("incr");
-        let mut entry = CacheEntry { files: HashMap::new(), syms: Vec::new(), last_sync: 0, source: "scan" };
+        let mut entry = CacheEntry {
+            files: HashMap::new(),
+            syms: Vec::new(),
+            catalog: CatalogStats::default(),
+            last_sync: 0,
+            source: "scan",
+        };
         // 首次同步：两个文件都是新增
-        let (r1, _) = sync_incremental(&mut entry.files, &mut entry.syms, &dir);
+        let (r1, _, catalog) = sync_incremental(&mut entry.files, &mut entry.syms, &dir);
+        entry.catalog = catalog;
         assert_eq!(r1, 2);
         assert!(entry.syms.iter().any(|s| s.name == "Aaa"));
         assert!(entry.syms.iter().any(|s| s.name == "oldA"));
         assert!(entry.syms.iter().any(|s| s.name == "Bbb"));
         // 只改 a.ets（长度变化 → 指纹变化）
         std::fs::write(dir.join("a.ets"), "struct Aaa {}\nfn oldA() {}\nfn newA() {}").unwrap();
-        let (r2, _) = sync_incremental(&mut entry.files, &mut entry.syms, &dir);
+        let (r2, _, catalog) = sync_incremental(&mut entry.files, &mut entry.syms, &dir);
+        entry.catalog = catalog;
         assert_eq!(r2, 1, "只有 a.ets 应被重扫");
         assert!(entry.syms.iter().any(|s| s.name == "newA"), "变化文件的新符号应出现");
         assert!(entry.syms.iter().any(|s| s.name == "Bbb"), "未变文件符号应保留");
         assert_eq!(entry.syms.iter().filter(|s| s.name == "oldA").count(), 1, "旧符号不应重复");
         // 删除 b.ets
         std::fs::remove_file(dir.join("b.ets")).unwrap();
-        let (_, removed) = sync_incremental(&mut entry.files, &mut entry.syms, &dir);
+        let (_, removed, catalog) = sync_incremental(&mut entry.files, &mut entry.syms, &dir);
+        entry.catalog = catalog;
         assert!(removed > 0);
         assert!(!entry.syms.iter().any(|s| s.name == "Bbb"), "被删文件符号应移除");
         std::fs::remove_dir_all(&dir).ok();
@@ -1055,12 +1448,20 @@ struct Detail {
         let mut files = HashMap::new();
         files.insert("a.ets".to_string(), FileStamp { mtime: 123, len: 45 });
         let syms = vec![Symbol { kind: "struct".into(), name: "Aaa".into(), file: "a.ets".into(), line: 1, end_line: 1, role: "entity".into(), signature: "struct Aaa {}".into(), parent: None }];
-        save_to(&data_dir, &proj, &files, &syms);
+        let catalog = CatalogStats {
+            discovered_files: 1,
+            source_files: 1,
+            indexed_source_files: 1,
+            persisted: true,
+            ..CatalogStats::default()
+        };
+        save_to(&data_dir, &proj, &files, &syms, catalog);
         let loaded = load_from(&data_dir, &proj).expect("应能从磁盘恢复");
         assert_eq!(loaded.files.len(), 1);
         assert_eq!(loaded.files["a.ets"], FileStamp { mtime: 123, len: 45 });
         assert_eq!(loaded.syms.len(), 1);
         assert_eq!(loaded.syms[0].name, "Aaa");
+        assert_eq!(loaded.catalog.discovered_files, 1);
         // 损坏内容应返回 None（触发全量重建，不 panic）
         std::fs::write(cache_file_at(&data_dir, &proj), "not-json").unwrap();
         assert!(load_from(&data_dir, &proj).is_none());
@@ -1124,12 +1525,23 @@ struct Detail {
         invalidate_files(&root, std::slice::from_ref(&changed_file));
         let incremental_symbols = index_project_cached(&root);
         let incremental_ms = incremental_started.elapsed().as_millis() as u64;
+        let meta = index_meta(&root);
+        assert_eq!(meta.catalog.discovered_files, requested);
+        assert_eq!(meta.catalog.source_files, requested);
+        assert_eq!(
+            meta.catalog.deferred_source_files,
+            requested.saturating_sub(MAX_FILES)
+        );
 
         let report = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "requested_files": requested,
             "configured_max_files": MAX_FILES,
             "indexed_files": cold_symbols.iter().map(|symbol| &symbol.file).collect::<std::collections::HashSet<_>>().len(),
+            "catalog_discovered_files": meta.catalog.discovered_files,
+            "catalog_source_files": meta.catalog.source_files,
+            "deferred_source_files": meta.catalog.deferred_source_files,
+            "coverage": meta.coverage,
             "cold_symbols": cold_symbols.len(),
             "warm_symbols": warm_symbols.len(),
             "incremental_symbols": incremental_symbols.len(),
@@ -1137,7 +1549,7 @@ struct Detail {
             "cold_index_ms": cold_ms,
             "warm_query_ms": warm_ms,
             "single_file_incremental_ms": incremental_ms,
-            "truncated_by_current_limit": requested > MAX_FILES,
+            "structure_parse_is_partial": requested > MAX_FILES,
             "platform": std::env::consts::OS,
             "architecture": std::env::consts::ARCH,
         });

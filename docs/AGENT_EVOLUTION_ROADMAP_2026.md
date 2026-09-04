@@ -413,7 +413,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、后端契约、Docker/Podman 运行时探测、fail-closed OCI argv、超时/取消清理、输出限制和审计事件；实际命令接线与 artifact 导出待完成）；
 - [ ] approval 与 sandbox escalation 进入统一事件和审计链；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy；
-- [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断；
+- [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 文件目录、状态/coverage 与分页查询已完成；watcher、Git diff、物理分片和结构解析扩容待完成）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成，统一 planner 待完成）；
 - [ ] 每周真实模型回归，保存 patch/trajectory/cost/report。
 

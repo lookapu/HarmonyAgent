@@ -454,7 +454,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "find_files",
-        desc: "按文件名搜索文件（glob 模式：* 匹配单层、** 匹配任意层级、? 匹配单字符，不区分大小写；模式可匹配文件名或相对路径，如 *.ets 或 src/**/*.ets）。\n参数：{\"pattern\":\"<如 *.ets 或 **/*.json>\",\"path\":<可选搜索起点，缺省项目根或用户指明目录>}。\n自动跳过 .git、node_modules、build 等忽略目录并遵循项目 .gitignore 规则（含子目录），结果按路径排序，最多返回 100 条。\n适合定位文件位置。\n副作用：无（只读）。\n返回：匹配文件路径列表。",
+        desc: "通过持久化全库目录按文件名搜索（glob 模式：*、**、?，不区分大小写；如 *.ets 或 src/**/*.ets）。\n参数：{\"pattern\":\"<glob>\",\"path\":<可选搜索起点>,\"state\":\"<可选 indexed|deferred|oversized|unsupported|symlink|unreadable>\",\"page\":<可选页码>,\"limit\":<可选每页 1-200，缺省 100>}。\n目录记录所有未忽略文件，不因符号解析预算或文件过大而消失；目录不可用时回退即时遍历。自动跳过 .git、node_modules、build 等忽略目录。\n适合定位文件位置、核查未进入结构索引的文件。\n副作用：无（只读）。\n返回：分页文件路径、大小、索引状态和 shard。",
     },
     ToolSpec {
         name: "grep_files",
@@ -3645,12 +3645,19 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         .map_err(|e| e.to_string())?;
     let mut out = String::new();
     out.push_str(&format!(
-        "结构查询：匹配 {}，第 {} 页（每页 {}）；已索引 {} 个文件 / {} 个结构；coverage={}；索引更新于 {} 秒前。\n",
+        "结构查询：匹配 {}，第 {} 页（每页 {}）；已解析 {} 个源码文件 / {} 个结构；全库目录发现 {} 个文件（源码 {}，延期 {}，超大 {}，不可读文件/目录 {}/{}，持久化 {}）；coverage={}；索引更新于 {} 秒前。\n",
         result.total_matches,
         result.page,
         result.page_size,
         result.indexed_files,
         result.indexed_symbols,
+        result.catalog.discovered_files,
+        result.catalog.source_files,
+        result.catalog.deferred_source_files,
+        result.catalog.oversized_source_files,
+        result.catalog.unreadable_files,
+        result.catalog.unreadable_directories,
+        if result.catalog.persisted { "是" } else { "否" },
         result.coverage,
         result.synced_ago_secs,
     ));

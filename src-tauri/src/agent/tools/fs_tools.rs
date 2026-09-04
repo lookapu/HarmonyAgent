@@ -2474,6 +2474,59 @@ pub(super) async fn find_files(args: &Value, roots: &[String]) -> Result<String,
     if !root.is_dir() {
         return Err(format!("路径不是目录: {}", root.display()));
     }
+    let state = args["state"].as_str().map(str::trim).filter(|value| !value.is_empty());
+    if state.is_some_and(|value| {
+        !matches!(
+            value,
+            "indexed" | "deferred" | "oversized" | "unsupported" | "symlink" | "unreadable"
+        )
+    }) {
+        return Err("state 仅支持 indexed|deferred|oversized|unsupported|symlink|unreadable".into());
+    }
+    let page = args["page"].as_u64().unwrap_or(1) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+    let project_root = PathBuf::from(&roots[0]);
+    let prefix = root
+        .strip_prefix(&project_root)
+        .ok()
+        .map(|value| value.to_string_lossy().replace('\\', "/"));
+    if let Some(prefix) = prefix {
+        let project_root_for_query = project_root.clone();
+        let pattern_for_query = pattern.to_string();
+        let state_for_query = state.map(str::to_string);
+        let catalog = tokio::task::spawn_blocking(move || {
+            crate::services::symbol_index::query_catalog_files(
+                &project_root_for_query,
+                &pattern_for_query,
+                Some(&prefix),
+                state_for_query.as_deref(),
+                page,
+                limit,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Some(result) = catalog {
+            let result = result?;
+            let mut out = format!(
+                "全库目录匹配 {} 个文件，第 {} 页（每页 {}）：\n",
+                result.total_matches, result.page, result.page_size
+            );
+            for file in result.items {
+                out.push_str(&format!(
+                    "{}  [{}; {} bytes; shard={}]\n",
+                    project_root.join(&file.path).display(),
+                    file.state,
+                    file.size,
+                    file.shard,
+                ));
+            }
+            if let Some(next_page) = result.next_page {
+                out.push_str(&format!("还有结果：使用 page={next_page} 读取下一页。\n"));
+            }
+            return Ok(truncate_out(&out));
+        }
+    }
     // 全树递归遍历为 IO 密集操作，放 spawn_blocking 避免钉死 tokio worker
     let root_buf = root.clone();
     let roots_owned: Vec<String> = roots.to_vec();

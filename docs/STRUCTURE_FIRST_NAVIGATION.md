@@ -1,6 +1,6 @@
 # Structure-first 代码导航设计
 
-> 状态：MVP 已接入 `search_symbols`；Tree-sitter/LSP、全库目录分片和关系图仍在后续阶段。
+> 状态：MVP 已接入 `search_symbols`；全库文件目录已使用独立 SQLite 持久化；Tree-sitter/LSP、目录分片和关系图仍在后续阶段。
 
 ## 1. 结论
 
@@ -63,6 +63,10 @@ MVP 的范围估算仍是轻量规则扫描。大括号出现在字符串/注释
 
 超大源码也必须在目录中可达；可以暂不建立全文倒排，但不能从目录和 coverage 中消失。
 
+本轮已经完成目录层的第一版：所有未忽略文件流式写入独立 SQLite，不把全量路径堆进内存；记录 `indexed/deferred/oversized/unsupported/symlink/unreadable` 状态和一级目录 shard。`find_files` 优先查询该目录，支持状态过滤和分页；结构查询同时报告发现、解析、延期、超大和不可读数量。当前仍通过周期性 walk 校正，下一步用 watcher + Git diff 替代高频全树遍历并把单库数据库进一步拆成物理 shard。
+
+当前机器的 10k 合成源码复测中，全目录发现 10,000 个文件，冷扫描约 266 ms、热查询约 0 ms；结构层解析 4,000 个并明确报告 6,000 个 deferred。该结果证明目录不再静默截断，但不等于已经通过 100k/1M 验收；后两档必须在物理分片和 watcher 完成后正式发布数据。
+
 ### 5.2 语法结构层
 
 使用 Tree-sitter/编译器解析器增量提取实体和逻辑，轻量扫描只做容错 fallback。按文件或模块 shard 保存，单文件变化只替换对应文档和关系边。
@@ -100,7 +104,7 @@ MVP 的范围估算仍是轻量规则扫描。大括号出现在字符串/注释
 
 ## 7. 下一实现顺序
 
-1. 建立无硬截断的持久文件目录，记录跳过原因和分 shard coverage。
+1. 用 watcher + Git diff 增量维护目录，并把单库 SQLite 按 module/shard 拆分。
 2. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 3. 接入 Tree-sitter/ArkTS 容错解析，替换 MVP 的范围估算。
 4. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
