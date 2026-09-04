@@ -4,6 +4,8 @@
 //! 结果可持久化到 project_index_cache 表（kind='symbols'），也可即时返回。
 
 use std::collections::HashMap;
+#[cfg(not(test))]
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -634,7 +636,11 @@ fn apply_catalog_changes_at(root: &Path, data_dir: &Path, rels: &[String]) -> Ca
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(path) DO UPDATE SET
                    extension=excluded.extension, size=excluded.size, mtime_ns=excluded.mtime_ns,
-                   state=excluded.state, shard=excluded.shard, generation=excluded.generation",
+                   state=CASE
+                     WHEN files.state='indexed' AND excluded.state='deferred'
+                          AND files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns
+                     THEN files.state ELSE excluded.state END,
+                   shard=excluded.shard, generation=excluded.generation",
                 params![
                     rel,
                     ext,
@@ -744,7 +750,7 @@ fn insert_edge_row(
     Ok(())
 }
 
-/// 全量一致性扫描后重建结构节点表。当前轻量解析最多覆盖 MAX_FILES，写入量有明确上限。
+/// 一致性扫描后重建本轮基础批次，同时保留指纹未变、已由后台补齐的节点。
 fn replace_all_symbol_rows_at(
     root: &Path,
     data_dir: &Path,
@@ -767,11 +773,53 @@ fn replace_all_symbol_rows_at(
     if revision < 0 || revision as u64 != expected_revision {
         return false;
     }
-    if transaction.execute("DELETE FROM symbols", []).is_err() {
+    if transaction
+        .execute(
+            "DELETE FROM symbol_edges
+             WHERE NOT EXISTS (
+               SELECT 1 FROM files f
+               WHERE f.path = symbol_edges.source_file AND f.state = 'indexed'
+             ) OR NOT EXISTS (
+               SELECT 1 FROM files f
+               WHERE f.path = symbol_edges.target_file AND f.state = 'indexed'
+             )",
+            [],
+        )
+        .is_err()
+    {
         return false;
     }
-    if transaction.execute("DELETE FROM symbol_edges", []).is_err() {
+    if transaction
+        .execute(
+            "DELETE FROM symbols
+             WHERE NOT EXISTS (
+               SELECT 1 FROM files f WHERE f.path = symbols.file AND f.state = 'indexed'
+             )",
+            [],
+        )
+        .is_err()
+    {
         return false;
+    }
+    let mut baseline_files = symbols
+        .iter()
+        .map(|symbol| symbol.file.as_str())
+        .collect::<Vec<_>>();
+    baseline_files.sort_unstable();
+    baseline_files.dedup();
+    for file in baseline_files {
+        if transaction
+            .execute(
+                "DELETE FROM symbol_edges WHERE source_file = ?1 OR target_file = ?1",
+                params![file],
+            )
+            .is_err()
+            || transaction
+                .execute("DELETE FROM symbols WHERE file = ?1", params![file])
+                .is_err()
+        {
+            return false;
+        }
     }
     for symbol in symbols {
         if insert_symbol_row(&transaction, symbol).is_err() {
@@ -854,8 +902,171 @@ fn replace_changed_symbol_rows(root: &Path, rels: &[String], symbols: &[Symbol])
     replace_changed_symbol_rows_at(root, data_dir, rels, symbols)
 }
 
+#[derive(Debug)]
+struct DeferredBatchResult {
+    promoted: usize,
+    catalog: CatalogStats,
+    needs_reconciliation: bool,
+}
+
+/// 从 SQLite 领取一小批 deferred 文件，锁外解析，再以指纹条件更新提交。
+fn promote_deferred_batch_at(
+    root: &Path,
+    data_dir: &Path,
+    batch_size: usize,
+) -> Result<DeferredBatchResult, String> {
+    let db_path = catalog_file_at(data_dir, root);
+    let mut conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    let deferred = {
+        let mut statement = conn
+            .prepare(
+                "SELECT path, size, mtime_ns FROM files
+                 WHERE state='deferred' ORDER BY shard, path LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([batch_size.clamp(1, 1000) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    FileStamp {
+                        len: row.get::<_, i64>(1)?.max(0) as u64,
+                        mtime: row.get::<_, i64>(2)?.max(0) as u64,
+                    },
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    if deferred.is_empty() {
+        return Ok(DeferredBatchResult {
+            promoted: 0,
+            catalog: catalog_stats(&conn).map_err(|error| error.to_string())?,
+            needs_reconciliation: false,
+        });
+    }
+
+    let mut parsed = Vec::new();
+    let mut needs_reconciliation = false;
+    for (rel, expected) in deferred {
+        let path = root.join(&rel);
+        if file_stamp(&path) != Some(expected) {
+            needs_reconciliation = true;
+            continue;
+        }
+        let mut symbols = Vec::new();
+        scan_file(&path, &rel, &mut symbols);
+        parsed.push((rel, expected, symbols));
+    }
+
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let mut promoted = 0usize;
+    for (rel, expected, symbols) in parsed {
+        let updated = transaction
+            .execute(
+                "UPDATE files SET state='indexed'
+                 WHERE path=?1 AND state='deferred' AND size=?2 AND mtime_ns=?3",
+                params![rel, expected.len as i64, expected.mtime as i64],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated == 0 {
+            continue;
+        }
+        transaction
+            .execute("DELETE FROM symbols WHERE file=?1", params![rel])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM symbol_edges WHERE source_file=?1 OR target_file=?1",
+                params![rel],
+            )
+            .map_err(|error| error.to_string())?;
+        for symbol in &symbols {
+            insert_symbol_row(&transaction, symbol).map_err(|error| error.to_string())?;
+        }
+        for edge in containment_edges(&symbols) {
+            insert_edge_row(&transaction, &edge).map_err(|error| error.to_string())?;
+        }
+        promoted += 1;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    let catalog = catalog_stats(&conn).map_err(|error| error.to_string())?;
+    Ok(DeferredBatchResult {
+        promoted,
+        catalog,
+        needs_reconciliation,
+    })
+}
+
+#[cfg(not(test))]
+static PROGRESSIVE_WORKERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+#[cfg(not(test))]
+const PROGRESSIVE_BATCH_FILES: usize = 128;
+
+#[cfg(not(test))]
+fn ensure_progressive_indexing(root: &Path) {
+    let Some(data_dir) = DATA_DIR.get().cloned() else { return };
+    let root = root.to_path_buf();
+    let key = canonical_key(&root);
+    let workers = PROGRESSIVE_WORKERS.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut guard) = workers.lock() else { return };
+    if !guard.insert(key.clone()) {
+        return;
+    }
+    drop(guard);
+    let spawn_key = key.clone();
+    if std::thread::Builder::new()
+        .name("repo-progressive-index".into())
+        .spawn(move || {
+            loop {
+                match promote_deferred_batch_at(&root, &data_dir, PROGRESSIVE_BATCH_FILES) {
+                    Ok(result) => {
+                        if let Ok(mut cache) = cache().lock() {
+                            if let Some(entry) = cache.get_mut(&key) {
+                                entry.catalog = CatalogStats {
+                                    unreadable_directories: entry.catalog.unreadable_directories,
+                                    ..result.catalog
+                                };
+                            }
+                        }
+                        if result.needs_reconciliation {
+                            request_reconciliation(&root);
+                            break;
+                        }
+                        if result.promoted == 0 {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        request_reconciliation(&root);
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if let Some(workers) = PROGRESSIVE_WORKERS.get() {
+                if let Ok(mut guard) = workers.lock() {
+                    guard.remove(&key);
+                }
+            }
+        })
+        .is_err()
+    {
+        if let Ok(mut guard) = workers.lock() {
+            guard.remove(&spawn_key);
+        }
+    }
+}
+
 /// 遍历所有未忽略文件。回调是流式的，百万文件时不需要把全目录保存在内存。
-fn walk_catalog<F>(dir: &Path, root: &Path, stats: &mut CatalogStats, visit: &mut F)
+fn walk_catalog<F>(
+    dir: &Path,
+    root: &Path,
+    parse_budget: usize,
+    stats: &mut CatalogStats,
+    visit: &mut F,
+)
 where
     F: FnMut(&str, &str, u64, u64, &str, &str),
 {
@@ -880,7 +1091,7 @@ where
             if SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') {
                 continue;
             }
-            walk_catalog(&path, root, stats, visit);
+            walk_catalog(&path, root, parse_budget, stats, visit);
             continue;
         }
 
@@ -913,7 +1124,7 @@ where
             stats.source_files += 1;
             stats.oversized_source_files += 1;
             visit(&rel, ext, stamp.len, stamp.mtime, "oversized", shard_for(&rel));
-        } else if stats.indexed_source_files < MAX_FILES {
+        } else if stats.indexed_source_files < parse_budget {
             stats.source_files += 1;
             stats.indexed_source_files += 1;
             visit(&rel, ext, stamp.len, stamp.mtime, "indexed", shard_for(&rel));
@@ -926,9 +1137,10 @@ where
 }
 
 /// 刷新全库目录，并返回本轮允许进入轻量结构解析预算的源码文件。
-fn collect_files_at(
+fn collect_files_at_with_budget(
     root: &Path,
     data_dir: Option<&Path>,
+    parse_budget: usize,
 ) -> (HashMap<String, FileStamp>, CatalogStats) {
     let mut files = HashMap::new();
     let mut stats = CatalogStats::default();
@@ -995,7 +1207,7 @@ fn collect_files_at(
             Some(conn)
         });
     let mut write_failed = false;
-    walk_catalog(root, root, &mut stats, &mut |rel, ext, size, mtime, state, shard| {
+    walk_catalog(root, root, parse_budget, &mut stats, &mut |rel, ext, size, mtime, state, shard| {
         if state == "indexed" {
             files.insert(rel.to_string(), FileStamp { mtime, len: size });
         }
@@ -1005,7 +1217,11 @@ fn collect_files_at(
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(path) DO UPDATE SET
                    extension=excluded.extension, size=excluded.size, mtime_ns=excluded.mtime_ns,
-                   state=excluded.state, shard=excluded.shard, generation=excluded.generation",
+                   state=CASE
+                     WHEN files.state='indexed' AND excluded.state='deferred'
+                          AND files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns
+                     THEN files.state ELSE excluded.state END,
+                   shard=excluded.shard, generation=excluded.generation",
                 params![rel, ext, size as i64, mtime as i64, state, shard, generation],
             ).is_err() {
                 write_failed = true;
@@ -1022,6 +1238,7 @@ fn collect_files_at(
             && cleanup_ok
             && conn.execute_batch("COMMIT;").is_ok()
         {
+            stats = catalog_stats(conn).unwrap_or(stats);
             stats.persisted = true;
             stats.revision = generation.max(0) as u64;
         } else {
@@ -1029,6 +1246,13 @@ fn collect_files_at(
         }
     }
     (files, stats)
+}
+
+fn collect_files_at(
+    root: &Path,
+    data_dir: Option<&Path>,
+) -> (HashMap<String, FileStamp>, CatalogStats) {
+    collect_files_at_with_budget(root, data_dir, MAX_FILES)
 }
 
 fn collect_files(root: &Path) -> (HashMap<String, FileStamp>, CatalogStats) {
@@ -1768,6 +1992,14 @@ fn query_persisted_edges(
     query_persisted_edges_at(root, data_dir, symbols)
 }
 
+fn persisted_symbol_count(root: &Path) -> Option<usize> {
+    let data_dir = DATA_DIR.get()?;
+    let conn = Connection::open(catalog_file_at(data_dir, root)).ok()?;
+    conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get::<_, i64>(0))
+        .ok()
+        .map(|value| value.max(0) as usize)
+}
+
 pub fn query_structure(
     root: &Path,
     query: &str,
@@ -1778,6 +2010,8 @@ pub fn query_structure(
     page_size: usize,
 ) -> StructureQueryResult {
     let syms = index_project_cached(root);
+    #[cfg(not(test))]
+    ensure_progressive_indexing(root);
     let page = page.max(1);
     let page_size = page_size.clamp(1, 200);
     let offset = page.saturating_sub(1).saturating_mul(page_size);
@@ -1848,7 +2082,7 @@ pub fn query_structure(
                 .get(&key)
                 .map(|entry| {
                     (
-                        entry.files.len(),
+                        entry.catalog.indexed_source_files,
                         entry.catalog,
                         now.saturating_sub(entry.last_sync),
                     )
@@ -1864,7 +2098,7 @@ pub fn query_structure(
         page_size,
         next_page,
         indexed_files,
-        indexed_symbols: syms.len(),
+        indexed_symbols: persisted_symbol_count(root).unwrap_or(syms.len()),
         indexed_relations,
         catalog,
         watcher_active: crate::services::repo_watcher::is_watching(root),
@@ -2300,6 +2534,61 @@ struct Detail {
         assert_eq!(updated_total, 1);
         assert_eq!(updated[0].target_name, "refresh");
         assert!(!updated.iter().any(|edge| edge.target_name == "load"));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn deferred_files_promote_in_bounded_batches_and_detect_stale_input() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-deferred-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-deferred-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(
+                root.join(format!("{name}.ets")),
+                format!("@Component\nstruct {name} {{\n  run() {{\n  }}\n}}\n"),
+            )
+            .unwrap();
+        }
+        let (_, catalog) = collect_files_at_with_budget(&root, Some(&data_dir), 1);
+        assert_eq!(catalog.indexed_source_files, 1);
+        assert_eq!(catalog.deferred_source_files, 2);
+
+        let first = promote_deferred_batch_at(&root, &data_dir, 1).unwrap();
+        assert_eq!(first.promoted, 1);
+        assert_eq!(first.catalog.indexed_source_files, 2);
+        assert_eq!(first.catalog.deferred_source_files, 1);
+        assert!(!first.needs_reconciliation);
+        let (_, reconciled) = collect_files_at_with_budget(&root, Some(&data_dir), 1);
+        assert_eq!(reconciled.indexed_source_files, 2, "已提升文件不应被基础预算降级");
+        assert_eq!(reconciled.deferred_source_files, 1);
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        let nodes: usize = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .max(0) as usize;
+        let edges: usize = conn
+            .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .max(0) as usize;
+        assert!(nodes > 0);
+        assert_eq!(edges, 1);
+        drop(conn);
+
+        std::fs::write(
+            root.join("c.ets"),
+            "@Component\nstruct ChangedExternally {\n  refresh() {\n  }\n}\n",
+        )
+        .unwrap();
+        let stale = promote_deferred_batch_at(&root, &data_dir, 1).unwrap();
+        assert_eq!(stale.promoted, 0);
+        assert!(stale.needs_reconciliation);
+        assert_eq!(stale.catalog.deferred_source_files, 1);
+        assert!(catalog.revision > 0);
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
