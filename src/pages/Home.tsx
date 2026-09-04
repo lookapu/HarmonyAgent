@@ -3873,7 +3873,7 @@ export default function Home() {
           <button
             onClick={() => setShowAddDialog(true)}
             title={t('home.addProject')}
-            className={`h-9 flex items-center justify-center gap-1.5 rounded-[10px] btn-primary text-[13px] font-medium active:scale-[0.98] transition-all ${sidebarCollapsed ? 'w-9 mx-auto' : 'w-full'}`}
+            className={`h-9 flex items-center justify-center gap-1.5 rounded-[10px] btn-primary text-[13px] font-medium transition-all ${sidebarCollapsed ? 'w-9 mx-auto' : 'w-full'}`}
           >
             <Icon name="plus" size={15} white /> {!sidebarCollapsed && t('home.addProject')}
           </button>
@@ -6673,7 +6673,7 @@ export default function Home() {
                   void resolvePlanReview(pendingPlan.requestId, true, fb || undefined)
                   setPlanFeedback('')
                 }}
-                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all flex items-center gap-1.5"
+                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium transition-all flex items-center gap-1.5"
               >
                 <Icon name="check" size={14} />
                 {t('home.planApprove')}
@@ -6790,7 +6790,7 @@ export default function Home() {
               <button
                 type="button"
                 onClick={handleAskSubmit}
-                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all flex items-center gap-1.5"
+                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium transition-all flex items-center gap-1.5"
               >
                 <Icon name="send" size={12} />
                 {t('home.askSubmit')}
@@ -6874,7 +6874,7 @@ export default function Home() {
               </button>
               <button
                 onClick={() => resolveToolApproval(toolApprovals[0].requestId, true, approvalScope !== '', undefined, approvalScope || undefined)}
-                className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all"
+                className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all"
               >
                 {t('home.toolApprovalAllow')}
               </button>
@@ -8553,7 +8553,7 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
             <button
               onClick={submit}
               disabled={lines.length === 0}
-              className="h-7 px-3 rounded-lg btn-primary text-[12px] active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed"
+              className="h-7 px-3 rounded-lg btn-primary text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {t('home.batchSend')}
             </button>
@@ -8701,7 +8701,7 @@ function ImportDialog({ data, onClose }: {
             <button
               ref={copyRef}
               onClick={copyAll}
-              className="h-7 px-3 rounded-lg btn-primary text-[12px] active:scale-[0.98] flex items-center gap-1.5"
+              className="h-7 px-3 rounded-lg btn-primary text-[12px] flex items-center gap-1.5"
             >
               <Icon name={copied ? 'check' : 'copy'} size={12} white />
               {copied ? t('home.importCopied') : t('home.importCopyAll')}
@@ -8774,7 +8774,7 @@ function ConvNoteBar({ convId }: { convId: string }) {
                 setNote(convId, draft)
                 setEditing(false)
               }}
-              className="text-[10.5px] h-6 px-2 rounded-md btn-primary active:scale-[0.98]"
+              className="text-[10.5px] h-6 px-2 rounded-md btn-primary"
             >
               {t('home.noteDone')}
             </button>
@@ -9014,7 +9014,7 @@ function ConfirmDialog({ open, title, body, tone = 'danger', confirmLabel, cance
             onClick={onConfirm}
             disabled={!canConfirm}
             style={confirmStyle}
-            className="h-8 px-3 rounded-lg text-[12.5px] font-medium active:scale-[0.98] disabled:cursor-not-allowed transition-colors"
+            className="h-8 px-3 rounded-lg text-[12.5px] font-medium disabled:cursor-not-allowed transition-colors"
           >
             {confirmLabel ?? t('home.confirm')}
           </button>

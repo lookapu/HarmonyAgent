@@ -685,7 +685,7 @@ export const EmptyState = memo(function EmptyState({
       <p className="text-[13px] text-[var(--text-secondary)] mt-1.5 max-w-sm leading-relaxed">{t('home.welcomeDesc')}</p>
       <button
         onClick={onAdd}
-        className="mt-7 h-10 px-5 rounded-[10px] btn-primary text-[13px] font-medium flex items-center gap-1.5 active:scale-[0.98] transition-all"
+        className="mt-7 h-10 px-5 rounded-[10px] btn-primary text-[13px] font-medium flex items-center gap-1.5 transition-all"
       >
         <Icon name="plus" size={15} white /> {t('home.addProject')}
       </button>

@@ -45,7 +45,7 @@ export function FeedbackDialog({ onSubmit, onCancel }: { onSubmit: (reason?: str
           </button>
           <button
             onClick={() => onSubmit(reason || undefined)}
-            className="h-8 px-4 rounded-lg bg-[var(--danger)] text-white text-[12px] font-medium hover:opacity-90 active:scale-[0.98] transition-all"
+            className="h-8 px-4 rounded-lg bg-[var(--danger)] text-white text-[12px] font-medium hover:opacity-90 transition-all"
           >
             {t('home.feedbackSubmit')}
           </button>
@@ -188,7 +188,7 @@ export function MemoryDraftDialog({
           </button>
           <button
             onClick={onConfirm}
-            className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all"
+            className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all"
           >
             {t('home.memoryDraftSave')}
           </button>
@@ -244,7 +244,7 @@ export function EditMessageDialog({
           <button
             onClick={() => onSubmit(value.trim())}
             disabled={!value.trim()}
-            className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all disabled:opacity-50"
+            className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all disabled:opacity-50"
           >
             {t('home.editMessageSave')}
           </button>
@@ -386,7 +386,7 @@ export function RulesDialog({
             <button
               onClick={onSave}
               disabled={saving}
-              className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all disabled:opacity-50"
+              className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all disabled:opacity-50"
             >
               {saving ? t('home.rulesSaving') : t('home.rulesSave')}
             </button>

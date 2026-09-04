@@ -228,7 +228,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
           <button
             onClick={confirm}
             disabled={!inspect || inspect.already_added || busy || scanning}
-            className="px-4 h-9 rounded-[10px] text-[13px] font-medium btn-primary  disabled:opacity-35 disabled:cursor-not-allowed transition-all active:scale-[0.98]"
+            className="px-4 h-9 rounded-[10px] text-[13px] font-medium btn-primary  disabled:opacity-35 disabled:cursor-not-allowed transition-all"
           >
             {busy ? '…' : t('dialog.confirmAdd')}
           </button>

@@ -814,7 +814,7 @@ export default function ProvidersPage() {
         </div>
         <button
           onClick={() => setShowForm(!showForm)}
-          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium active:scale-[0.98] transition-all"
+          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-all"
         >
           <span className="flex items-center gap-1.5">
             <Icon name={showForm ? 'close' : 'plus'} size={14} white />
@@ -972,7 +972,7 @@ export default function ProvidersPage() {
             {error && <span className="text-xs text-[var(--danger)]">{error}</span>}
             <button
               onClick={handleCreate}
-              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 active:scale-[0.98] transition-all"
+              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 transition-all"
             >
               {t('provider.save')}
             </button>
@@ -1449,7 +1449,7 @@ export default function ProvidersPage() {
                           <div className="flex items-center gap-2">
                             <button
                               onClick={saveEditType}
-                              className="h-7 px-3 text-[11px] bg-[var(--accent)] text-white rounded-lg hover:opacity-90 active:scale-[0.98] transition-all"
+                              className="h-7 px-3 text-[11px] bg-[var(--accent)] text-white rounded-lg hover:opacity-90 transition-all"
                             >
                               {t('provider.typeSave')}
                             </button>
@@ -1468,7 +1468,7 @@ export default function ProvidersPage() {
                       <button
                         onClick={() => saveEdit(p.id)}
                         disabled={editSaving}
-                        className="h-8 px-4 text-[12px] bg-[var(--success)] text-white rounded-lg hover:opacity-90 active:scale-[0.98] transition-all disabled:opacity-50"
+                        className="h-8 px-4 text-[12px] bg-[var(--success)] text-white rounded-lg hover:opacity-90 transition-all disabled:opacity-50"
                       >
                         {editSaving ? t('provider.saving') : t('provider.saveEdit')}
                       </button>

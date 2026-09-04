@@ -224,7 +224,7 @@ export function ModelSettingsPopover({
                           const m = found.models.find((m) => m.model_id === top.model || m.id === top.model)
                           if (m) onChange({ ...options, model_id: m.id })
                         }}
-                        className="h-6 px-2 rounded-md btn-primary text-[10.5px] font-medium active:scale-[0.98] shrink-0"
+                        className="h-6 px-2 rounded-md btn-primary text-[10.5px] font-medium shrink-0"
                       >
                         {t('home.modelRecApply')}
                       </button>

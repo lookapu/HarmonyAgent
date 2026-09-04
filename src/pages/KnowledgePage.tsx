@@ -103,7 +103,7 @@ export default function KnowledgePage() {
         </div>
         <button
           onClick={() => { resetForm(); setShowForm(!showForm) }}
-          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium  active:scale-[0.98] transition-all"
+          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-all"
         >
           <span className="flex items-center gap-1.5">
             <Icon name={showForm ? 'close' : 'plus'} size={14} white />

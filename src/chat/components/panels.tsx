@@ -548,7 +548,7 @@ export function PreviewPanel({
           onClick={onOpen}
           disabled={!url.trim()}
           title={t('home.open')}
-          className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all disabled:opacity-40 shrink-0"
+          className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium transition-all disabled:opacity-40 shrink-0"
         >
           {t('home.open')}
         </button>

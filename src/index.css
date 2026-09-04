@@ -408,13 +408,20 @@ button:not(:disabled) {
 }
 
 /* ============ 现代化 UI 质感：统一过渡、圆角、焦点环 ============ */
+/* 这条规则刻意保持「无层 + 显式五属性」：
+   - 无层 → 优先级高于 @layer utilities，因此 tsx 里的 transition-all 在这五类元素上无效。
+     这是想要的：transition-all 会把 width/height/padding 也补间，侧栏拖拽手柄与
+     hidden xl:flex 的响应式胶囊会因此抖动。
+   - 代价是 opacity / filter 也不在补间列表里（hover:opacity-90 是瞬变的），已知项。
+   时长与缓动改吃 token，避免这里与 --app-motion-* 阶梯各写一套魔法数。 */
 button,
 select,
 input,
 textarea,
 [role="button"] {
-  transition: background-color 0.15s ease, border-color 0.15s ease,
-    color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+  transition-property: background-color, border-color, color, box-shadow, transform;
+  transition-duration: var(--app-motion-fast);
+  transition-timing-function: var(--app-ease-out);
 }
 
 button:active:not(:disabled) {
