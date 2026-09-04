@@ -69,6 +69,8 @@ sha2 = "0.10"
 ring = "0.17"
 regex = "1"
 notify = "8.2"
+tree-sitter = "0.24.7"
+tree-sitter-typescript = "0.23.2"
 local-ip-address = "0.6"
 candle-core = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }

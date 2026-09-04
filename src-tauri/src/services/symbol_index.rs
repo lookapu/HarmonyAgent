@@ -28,6 +28,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
+const STRUCTURE_PARSER_VERSION: i64 = 2;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -100,6 +101,12 @@ pub struct Symbol {
     /// 所在类/组件（方法的归属，顶层为空）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Source language inferred from the file extension.
+    #[serde(default)]
+    pub language: String,
+    /// Parser layer that produced this node: tree_sitter or lightweight.
+    #[serde(default)]
+    pub source_layer: String,
 }
 
 /// 全局结构图中的关系边。当前只产生语法上可靠的 contains；imports/calls 等待 AST/LSP。
@@ -191,6 +198,8 @@ fn make_symbol(
         role: structure_role(kind).into(),
         signature: raw.trim().chars().take(300).collect(),
         parent,
+        language: ext.to_string(),
+        source_layer: "lightweight".into(),
     }
 }
 
@@ -236,6 +245,133 @@ fn ident_after(line: &str, kw: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+fn tree_sitter_language(ext: &str) -> Option<tree_sitter::Language> {
+    match ext {
+        "ts" | "js" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "tsx" | "jsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        _ => None,
+    }
+}
+
+fn node_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    node.utf8_text(source).ok().map(str::to_string)
+}
+
+fn tree_sitter_signature(node: tree_sitter::Node<'_>, source: &str) -> String {
+    source
+        .lines()
+        .nth(node.start_position().row)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(300)
+        .collect()
+}
+
+fn push_tree_sitter_symbol(
+    out: &mut Vec<Symbol>,
+    node: tree_sitter::Node<'_>,
+    name_node: tree_sitter::Node<'_>,
+    kind: &str,
+    parent: Option<String>,
+    rel: &str,
+    ext: &str,
+    source: &str,
+) -> Option<String> {
+    let name = node_text(name_node, source.as_bytes())?;
+    let line = node.start_position().row + 1;
+    out.push(Symbol {
+        kind: kind.into(),
+        name: name.clone(),
+        file: rel.into(),
+        line,
+        end_line: (node.end_position().row + 1).max(line),
+        role: structure_role(kind).into(),
+        signature: tree_sitter_signature(node, source),
+        parent,
+        language: ext.into(),
+        source_layer: "tree_sitter".into(),
+    });
+    Some(name)
+}
+
+fn walk_typescript_tree(
+    node: tree_sitter::Node<'_>,
+    parent: Option<&str>,
+    rel: &str,
+    ext: &str,
+    source: &str,
+    out: &mut Vec<Symbol>,
+) {
+    let node_kind = node.kind();
+    let declaration_kind = match node_kind {
+        "class_declaration" | "abstract_class_declaration" => Some("class"),
+        "interface_declaration" => Some("interface"),
+        "type_alias_declaration" => Some("type"),
+        "enum_declaration" => Some("enum"),
+        "function_declaration" | "generator_function_declaration" => Some("function"),
+        "method_definition" | "method_signature" | "abstract_method_signature" => Some("method"),
+        _ => None,
+    };
+    let mut child_parent = parent.map(str::to_string);
+    if let (Some(kind), Some(name_node)) = (declaration_kind, node.child_by_field_name("name")) {
+        let symbol_parent = matches!(kind, "function" | "method")
+            .then(|| parent.map(str::to_string))
+            .flatten();
+        if let Some(name) = push_tree_sitter_symbol(
+            out,
+            node,
+            name_node,
+            kind,
+            symbol_parent,
+            rel,
+            ext,
+            source,
+        ) {
+            if matches!(kind, "class" | "interface" | "type" | "enum") {
+                child_parent = Some(name);
+            }
+        }
+    } else if node_kind == "variable_declarator"
+        && node
+            .child_by_field_name("value")
+            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+    {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let _ = push_tree_sitter_symbol(
+                out,
+                node,
+                name_node,
+                "function",
+                parent.map(str::to_string),
+                rel,
+                ext,
+                source,
+            );
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_typescript_tree(child, child_parent.as_deref(), rel, ext, source, out);
+    }
+}
+
+/// Returns true only when a supported grammar produced an error-free syntax tree.
+fn scan_file_tree_sitter(content: &str, rel: &str, ext: &str, out: &mut Vec<Symbol>) -> bool {
+    let Some(language) = tree_sitter_language(ext) else { return false };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(content, None) else { return false };
+    if tree.root_node().has_error() {
+        return false;
+    }
+    walk_typescript_tree(tree.root_node(), None, rel, ext, content, out);
+    true
+}
+
 /// 解析单个源文件中的符号
 fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
     let meta = match fs::metadata(path) {
@@ -248,6 +384,9 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
         Err(_) => return,
     };
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if scan_file_tree_sitter(&content, rel, ext, out) {
+        return;
+    }
     let lines: Vec<&str> = content.lines().collect();
     let mut current_parent: Option<String> = None;
     let mut brace_depth = 0i32;
@@ -677,8 +816,8 @@ fn apply_catalog_changes(root: &Path, rels: &[String]) -> CatalogDelta {
 
 fn insert_symbol_row(transaction: &rusqlite::Transaction<'_>, symbol: &Symbol) -> rusqlite::Result<()> {
     transaction.execute(
-        "INSERT INTO symbols(file, kind, name, line, end_line, role, signature, parent, shard)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO symbols(file, kind, name, line, end_line, role, signature, parent, shard, language, source_layer)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             symbol.file,
             symbol.kind,
@@ -689,6 +828,8 @@ fn insert_symbol_row(transaction: &rusqlite::Transaction<'_>, symbol: &Symbol) -
             symbol.signature,
             symbol.parent,
             shard_for(&symbol.file),
+            symbol.language,
+            symbol.source_layer,
         ],
     )?;
     Ok(())
@@ -1280,6 +1421,53 @@ where
 }
 
 /// 刷新全库目录，并返回本轮允许进入轻量结构解析预算的源码文件。
+fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(symbols)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "language") {
+        conn.execute(
+            "ALTER TABLE symbols ADD COLUMN language TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|column| column == "source_layer") {
+        conn.execute(
+            "ALTER TABLE symbols ADD COLUMN source_layer TEXT NOT NULL DEFAULT 'lightweight'",
+            [],
+        )?;
+    }
+    let meta_columns = conn
+        .prepare("PRAGMA table_info(structure_meta)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !meta_columns.iter().any(|column| column == "parser_version") {
+        conn.execute(
+            "ALTER TABLE structure_meta ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    let parser_version = conn.query_row(
+        "SELECT parser_version FROM structure_meta WHERE id=1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if parser_version < STRUCTURE_PARSER_VERSION {
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM symbol_edges", [])?;
+        transaction.execute("DELETE FROM symbols", [])?;
+        transaction.execute("UPDATE files SET state='deferred' WHERE state='indexed'", [])?;
+        transaction.execute(
+            "UPDATE structure_meta
+             SET parser_version=?1, revision=revision + 1 WHERE id=1",
+            [STRUCTURE_PARSER_VERSION],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
 fn collect_files_at_with_budget(
     root: &Path,
     data_dir: Option<&Path>,
@@ -1296,7 +1484,7 @@ fn collect_files_at_with_budget(
         .and_then(|dir| {
             let path = catalog_file_at(dir, root);
             fs::create_dir_all(path.parent()?).ok()?;
-            let conn = Connection::open(path).ok()?;
+            let mut conn = Connection::open(path).ok()?;
             conn.execute_batch(
                 "PRAGMA journal_mode=WAL;
                  PRAGMA synchronous=NORMAL;
@@ -1323,7 +1511,9 @@ fn collect_files_at_with_budget(
                    role TEXT NOT NULL,
                    signature TEXT NOT NULL,
                    parent TEXT,
-                   shard TEXT NOT NULL
+                   shard TEXT NOT NULL,
+                   language TEXT NOT NULL DEFAULT '',
+                   source_layer TEXT NOT NULL DEFAULT 'lightweight'
                  );
                  CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
                  CREATE INDEX IF NOT EXISTS idx_symbols_role_kind ON symbols(role, kind);
@@ -1364,12 +1554,14 @@ fn collect_files_at_with_budget(
                    END;
                  CREATE TABLE IF NOT EXISTS structure_meta (
                    id INTEGER PRIMARY KEY CHECK(id = 1),
-                   revision INTEGER NOT NULL DEFAULT 0
+                   revision INTEGER NOT NULL DEFAULT 0,
+                   parser_version INTEGER NOT NULL DEFAULT 0
                  );
-                 INSERT OR IGNORE INTO structure_meta(id, revision) VALUES(1, 0);
-                 BEGIN IMMEDIATE;",
+                 INSERT OR IGNORE INTO structure_meta(id, revision) VALUES(1, 0);",
             )
             .ok()?;
+            ensure_structure_schema(&mut conn).ok()?;
+            conn.execute_batch("BEGIN IMMEDIATE;").ok()?;
             Some(conn)
         });
     let mut write_failed = false;
@@ -1612,8 +1804,8 @@ struct PersistedIndex {
     catalog: CatalogStats,
 }
 
-// v3 持久化全库目录覆盖统计；旧缓存重建以避免把解析子集误报为全库。
-const PERSIST_VERSION: u32 = 3;
+// v4 adds parser provenance and invalidates lightweight-only symbol snapshots.
+const PERSIST_VERSION: u32 = 4;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -2143,7 +2335,7 @@ fn query_persisted_symbols_at(
             .max(0) as usize;
         let offset = page.saturating_sub(1).saturating_mul(page_size);
         let mut statement = match conn.prepare(
-            "SELECT kind, name, file, line, end_line, role, signature, parent
+            "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer
              FROM symbols WHERE kind=?1
              ORDER BY file, line, name LIMIT ?2 OFFSET ?3",
         ) {
@@ -2162,6 +2354,8 @@ fn query_persisted_symbols_at(
                     role: row.get(5)?,
                     signature: row.get(6)?,
                     parent: row.get(7)?,
+                    language: row.get(8)?,
+                    source_layer: row.get(9)?,
                 })
             },
         ) {
@@ -2192,7 +2386,7 @@ fn query_persisted_symbols_at(
         if exact_total > 0 {
             let offset = page.saturating_sub(1).saturating_mul(page_size);
             let mut statement = match conn.prepare(&format!(
-                "SELECT kind, name, file, line, end_line, role, signature, parent
+                "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer
                  FROM symbols WHERE {exact_where}
                  ORDER BY file, line, name LIMIT ?5 OFFSET ?6"
             )) {
@@ -2211,6 +2405,8 @@ fn query_persisted_symbols_at(
                         role: row.get(5)?,
                         signature: row.get(6)?,
                         parent: row.get(7)?,
+                        language: row.get(8)?,
+                        source_layer: row.get(9)?,
                     })
                 },
             ) {
@@ -2240,7 +2436,7 @@ fn query_persisted_symbols_at(
     };
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let mut statement = match conn.prepare(&format!(
-        "SELECT kind, name, file, line, end_line, role, signature, parent
+        "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer
          FROM symbols WHERE {where_sql}
          ORDER BY file, line, name LIMIT ?5 OFFSET ?6"
     )) {
@@ -2259,6 +2455,8 @@ fn query_persisted_symbols_at(
                 role: row.get(5)?,
                 signature: row.get(6)?,
                 parent: row.get(7)?,
+                language: row.get(8)?,
+                source_layer: row.get(9)?,
             })
         },
     ) {
@@ -2408,7 +2606,7 @@ fn query_persisted_symbols_keyset_at(
         filters.join(" AND ")
     };
     let mut statement = match conn.prepare(&format!(
-        "SELECT kind, name, file, line, end_line, role, signature, parent, id
+        "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer, id
          FROM symbols WHERE {where_sql}
          ORDER BY file, line, name, id LIMIT ?{limit_parameter}"
     )) {
@@ -2426,8 +2624,10 @@ fn query_persisted_symbols_keyset_at(
                 role: row.get(5)?,
                 signature: row.get(6)?,
                 parent: row.get(7)?,
+                language: row.get(8)?,
+                source_layer: row.get(9)?,
             },
-            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(10)?,
         ))
     }) {
         Ok(value) => value,
@@ -2895,10 +3095,95 @@ struct Detail {
     }
 
     #[test]
+    fn tree_sitter_extracts_typescript_ranges_parents_and_arrow_functions() {
+        let src = r#"export interface Loader {
+  load(value: string): Promise<string>;
+}
+
+export class Service {
+  async fetch(value: string): Promise<string> {
+    const braces = "{not a block}";
+    return value + braces;
+  }
+}
+
+export const normalize = (value: string) => {
+  return value.trim();
+};
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "deveco-symbol-ts-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("service.ts");
+        std::fs::write(&file, src).unwrap();
+        let mut out = Vec::new();
+        scan_file(&file, "service.ts", &mut out);
+
+        let interface = out.iter().find(|symbol| symbol.name == "Loader").unwrap();
+        assert_eq!(interface.kind, "interface");
+        assert_eq!(interface.end_line, 3);
+        assert_eq!(interface.source_layer, "tree_sitter");
+        assert_eq!(interface.language, "ts");
+        let signature = out.iter().find(|symbol| symbol.name == "load").unwrap();
+        assert_eq!(signature.kind, "method");
+        assert_eq!(signature.parent.as_deref(), Some("Loader"));
+        let method = out.iter().find(|symbol| symbol.name == "fetch").unwrap();
+        assert_eq!(method.parent.as_deref(), Some("Service"));
+        assert_eq!(method.end_line, 9, "字符串中的大括号不应破坏精确范围");
+        let arrow = out.iter().find(|symbol| symbol.name == "normalize").unwrap();
+        assert_eq!(arrow.kind, "function");
+        assert_eq!(arrow.line, 12);
+        assert_eq!(arrow.end_line, 14);
+        assert!(out.iter().all(|symbol| symbol.source_layer == "tree_sitter"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn malformed_typescript_falls_back_to_lightweight_scanner() {
+        let dir = std::env::temp_dir().join(format!(
+            "deveco-symbol-ts-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("broken.ts");
+        std::fs::write(&file, "function recover() {\n  return 1;\n").unwrap();
+        let mut out = Vec::new();
+        scan_file(&file, "broken.ts", &mut out);
+        let recovered = out.iter().find(|symbol| symbol.name == "recover").unwrap();
+        assert_eq!(recovered.source_layer, "lightweight");
+        assert_eq!(recovered.language, "ts");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tree_sitter_supports_javascript_tsx_and_jsx_entrypoints() {
+        let cases = [
+            ("js", "class JsService { run() { return 1; } }"),
+            ("jsx", "const JsCard = () => <section>ok</section>;"),
+            ("tsx", "const TsCard = (): JSX.Element => <section>ok</section>;"),
+        ];
+        for (ext, source) in cases {
+            let mut out = Vec::new();
+            assert!(scan_file_tree_sitter(
+                source,
+                &format!("entry.{ext}"),
+                ext,
+                &mut out,
+            ));
+            assert!(!out.is_empty(), "{ext} 应产生至少一个结构节点");
+            assert!(out.iter().all(|symbol| {
+                symbol.language == ext && symbol.source_layer == "tree_sitter"
+            }));
+        }
+    }
+
+    #[test]
     fn filter_works() {
         let syms = vec![
-            Symbol { kind: "function".into(), name: "loadData".into(), file: "a.ts".into(), line: 1, end_line: 1, role: "logic".into(), signature: "function loadData()".into(), parent: None },
-            Symbol { kind: "component".into(), name: "BookCard".into(), file: "b.ets".into(), line: 2, end_line: 5, role: "entity".into(), signature: "struct BookCard".into(), parent: None },
+            Symbol { kind: "function".into(), name: "loadData".into(), file: "a.ts".into(), line: 1, end_line: 1, role: "logic".into(), signature: "function loadData()".into(), parent: None, language: "ts".into(), source_layer: "tree_sitter".into() },
+            Symbol { kind: "component".into(), name: "BookCard".into(), file: "b.ets".into(), line: 2, end_line: 5, role: "entity".into(), signature: "struct BookCard".into(), parent: None, language: "ets".into(), source_layer: "lightweight".into() },
         ];
         assert_eq!(filter_symbols(&syms, "book", None).len(), 1);
         assert_eq!(filter_symbols(&syms, "", Some("component")).len(), 1);
@@ -2974,6 +3259,55 @@ struct Detail {
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 2);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn existing_symbol_database_adds_parser_provenance_columns() {
+        let root = std::env::temp_dir().join(format!(
+            "deveco-symbol-migrate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-symbol-migrate-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let database = catalog_file_at(&data_dir, &root);
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE symbols (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, file TEXT NOT NULL, kind TEXT NOT NULL,
+               name TEXT NOT NULL, line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+               role TEXT NOT NULL, signature TEXT NOT NULL, parent TEXT, shard TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let _ = collect_files_at(&root, Some(&data_dir));
+        let conn = Connection::open(database).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(symbols)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "language"));
+        assert!(columns.iter().any(|column| column == "source_layer"));
+        let parser_version: i64 = conn
+            .query_row(
+                "SELECT parser_version FROM structure_meta WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parser_version, STRUCTURE_PARSER_VERSION);
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
@@ -3558,7 +3892,7 @@ struct Detail {
         let proj = make_project("persist");
         let mut files = HashMap::new();
         files.insert("a.ets".to_string(), FileStamp { mtime: 123, len: 45 });
-        let syms = vec![Symbol { kind: "struct".into(), name: "Aaa".into(), file: "a.ets".into(), line: 1, end_line: 1, role: "entity".into(), signature: "struct Aaa {}".into(), parent: None }];
+        let syms = vec![Symbol { kind: "struct".into(), name: "Aaa".into(), file: "a.ets".into(), line: 1, end_line: 1, role: "entity".into(), signature: "struct Aaa {}".into(), parent: None, language: "ets".into(), source_layer: "lightweight".into() }];
         let catalog = CatalogStats {
             discovered_files: 1,
             source_files: 1,
@@ -3593,6 +3927,10 @@ struct Detail {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(10_000)
             .clamp(1, 1_000_000);
+        let benchmark_ext = std::env::var("HARMONY_INDEX_BENCH_EXT")
+            .ok()
+            .filter(|value| matches!(value.as_str(), "ets" | "ts" | "tsx" | "js" | "jsx"))
+            .unwrap_or_else(|| "ets".into());
         let files_per_shard = 1_000usize;
         let root = std::env::temp_dir().join(format!(
             "deveco-symbol-scale-{}",
@@ -3613,10 +3951,16 @@ struct Detail {
                 std::fs::create_dir_all(&shard).unwrap();
             }
             std::fs::write(
-                shard.join(format!("file_{index:07}.ets")),
-                format!(
-                    "@Component\nstruct Page_{index:07} {{\n  symbol_{index:07}() {{\n    return {index}\n  }}\n}}\n"
-                ),
+                shard.join(format!("file_{index:07}.{benchmark_ext}")),
+                if benchmark_ext == "ets" {
+                    format!(
+                        "@Component\nstruct Page_{index:07} {{\n  symbol_{index:07}() {{\n    return {index}\n  }}\n}}\n"
+                    )
+                } else {
+                    format!(
+                        "export class Page_{index:07} {{\n  symbol_{index:07}(): number {{\n    return {index};\n  }}\n}}\n"
+                    )
+                },
             )
             .unwrap();
         }
@@ -3691,7 +4035,11 @@ struct Detail {
         let changed_file = files.keys().next().cloned().expect("基准至少应索引一个文件");
         std::fs::write(
             root.join(&changed_file),
-            "@Component\nstruct ChangedPage {\n  symbol_after_incremental_update() {\n    return 42\n  }\n}\n",
+            if benchmark_ext == "ets" {
+                "@Component\nstruct ChangedPage {\n  symbol_after_incremental_update() {\n    return 42\n  }\n}\n"
+            } else {
+                "export class ChangedPage {\n  symbol_after_incremental_update(): number {\n    return 42;\n  }\n}\n"
+            },
         )
         .unwrap();
         let incremental_started = std::time::Instant::now();
@@ -3742,6 +4090,7 @@ struct Detail {
         let report = serde_json::json!({
             "schema_version": 4,
             "requested_files": requested,
+            "benchmark_extension": benchmark_ext,
             "configured_max_files": MAX_FILES,
             "indexed_files": cold_symbols.iter().map(|symbol| &symbol.file).collect::<std::collections::HashSet<_>>().len(),
             "catalog_discovered_files": catalog.discovered_files,
@@ -3749,6 +4098,8 @@ struct Detail {
             "deferred_source_files": catalog.deferred_source_files,
             "coverage": catalog.coverage(),
             "cold_symbols": cold_symbols.len(),
+            "tree_sitter_symbols": cold_symbols.iter().filter(|symbol| symbol.source_layer == "tree_sitter").count(),
+            "lightweight_symbols": cold_symbols.iter().filter(|symbol| symbol.source_layer == "lightweight").count(),
             "indexed_relations": relation_count,
             "warm_query_matches": total_matches,
             "warm_query_page_items": warm_symbols.len(),

@@ -3686,8 +3686,17 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     for s in result.items {
         let parent = s.parent.as_deref().map(|p| format!(" in {p}")).unwrap_or_default();
         out.push_str(&format!(
-            "- [{}/{}] {}{}  ({}:{}-{})\n  {}\n",
-            s.role, s.kind, s.name, parent, s.file, s.line, s.end_line, s.signature
+            "- [{}/{}; {}/{}] {}{}  ({}:{}-{})\n  {}\n",
+            s.role,
+            s.kind,
+            s.language,
+            s.source_layer,
+            s.name,
+            parent,
+            s.file,
+            s.line,
+            s.end_line,
+            s.signature
         ));
     }
     if !result.relations.is_empty() {

@@ -1,6 +1,6 @@
 # Structure-first 代码导航设计
 
-> 状态：MVP 已接入 `search_symbols`；全库文件目录、结构节点和可靠的实体包含关系已使用独立 SQLite 持久化、索引和游标分页；Tree-sitter/LSP、物理分片及调用/导入关系仍在后续阶段。
+> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和可靠的实体包含关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 已接入 Tree-sitter，ArkTS 精确语法、物理分片及调用/导入关系仍在后续阶段。
 
 ## 1. 结论
 
@@ -89,6 +89,14 @@ deferred 渐进解析现已接入：首次结构查询快速返回基础 4,000 �
 
 使用 Tree-sitter/编译器解析器增量提取实体和逻辑，轻量扫描只做容错 fallback。按文件或模块 shard 保存，单文件变化只替换对应文档和关系边。
 
+第一批 Tree-sitter 语法层已经落地：固定兼容的 `tree-sitter 0.24.7` 与官方 `tree-sitter-typescript 0.23.2` grammar，覆盖 `.ts/.tsx/.js/.jsx` 中的 class、interface、type alias、enum、function、generator、method、interface method signature 和绑定到变量的 arrow/function expression。节点范围直接使用语法树起止位置，因此字符串或注释中的大括号不会再破坏方法范围；类/接口成员会记录可靠 parent，并继续生成 `contains` 边。
+
+每个节点新增 `language` 和 `source_layer=tree_sitter|lightweight`，Agent 输出会展示来源，不能把 fallback 结果冒充 AST 事实。支持语言只有在语法树无错误时采用 Tree-sitter；解析失败时整文件回退原轻量扫描，ArkTS/Rust/Python 等未接 grammar 的语言也继续使用 fallback。SQLite 启动时兼容增加 provenance 列；parser schema version 从旧版本升级时清空旧节点、把已解析文件恢复为 deferred，并配合磁盘缓存版本升级重新建立首批结构，避免悄悄复用旧轻量结果。
+
+fixture 回归覆盖多行接口/类方法、字符串内大括号、箭头函数、parent 归属、JS/JSX/TSX 入口、语法错误 fallback 和旧 SQLite 自动迁移。当前尚不能称为完整语义索引：ArkTS 扩展装饰器/组件语法仍需专用 grammar 或 LSP，跨文件引用也还没有编译器级绑定。
+
+10,000 个实体 `.ts` 文件的同机基准中，冷目录与首批 4,000 文件 AST 解析/写入约 0.95 s，产生 8,000 个 Tree-sitter 节点且没有 fallback；峰值 RSS 约 23.7 MiB，单文件增量约 12 ms。该结果只证明首批 grammar 的吞吐未突破既有资源边界，不替代真实代码的召回率评测。
+
 ### 5.3 关系层
 
 在结构节点之间逐步加入：
@@ -124,7 +132,7 @@ deferred 渐进解析现已接入：首次结构查询快速返回基础 4,000 �
 
 1. ~~为结构浏览增加稳定游标/keyset 分页，消除深页 `OFFSET` 的线性扫描，并保留现有页码接口作为兼容层。~~ 已完成。
 2. ~~在生成仓运行渐进解析 1M 验收，记录冷扫描吞吐、写放大、锁等待、峰值内存和取消延迟。~~ 已完成；仍需补充真实混合语言 monorepo 的 Recall@5/20 与任务轨迹验收，达到单库 SLO 边界时再启用物理分片。
-3. 引入 Tree-sitter 增量语法树，并把当前轻量规则保留为解析失败时的 fallback；随后补充 calls/imports/implements 等语义边。
+3. ~~引入首批 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 已完成；下一步接 ArkTS 专用解析来源，并补充 imports/extends/implements 等可靠声明关系。
 4. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 5. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
 6. 用 10k/100k/1M 基准和真实任务轨迹持续验证 Recall@5/20、延迟与上下文节省量。

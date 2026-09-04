@@ -28,6 +28,8 @@ HARMONY_INDEX_BENCH_FILES=100000 cargo test --manifest-path src-tauri/Cargo.toml
 HARMONY_INDEX_BENCH_FILES=1000000 cargo test --manifest-path src-tauri/Cargo.toml --lib services::symbol_index::tests::large_repo_baseline -- --ignored --exact --nocapture
 ```
 
+可用 `HARMONY_INDEX_BENCH_EXT=ts`（也支持 `tsx/js/jsx`）切换为 Tree-sitter 语法层，并通过输出中的 `tree_sitter_symbols/lightweight_symbols` 验证来源；缺省仍为 `ets`。
+
 百万文件会消耗较多时间、inode 和临时磁盘，只应在专用基准机运行。首次开发验证建议使用 10,000 文件。
 
 ## 3. 输出
@@ -65,6 +67,8 @@ HARMONY_INDEX_BENCH_FILES=1000000 cargo test --manifest-path src-tauri/Cargo.tom
 | 10,000 | 10,000 / 4,000 | 0.84 s | 0.84 s | 136 ms（96 ms） | 7 ms | 12 ms | 7.4 MiB | 25.5 MiB |
 | 100,000 | 100,000 / 4,000 | 8.22 s | 4.57 s | 142 ms（66 ms） | 6 ms | 30 ms | 27.6 MiB | 27.6 MiB |
 | 1,000,000 | 1,000,000 / 4,000 | 82.44 s | 48.99 s | 343 ms（88 ms） | 4 ms | 227 ms | 223.4 MiB | 24.5 MiB |
+
+Tree-sitter 接入后的 10,000 个 `.ts` 实体文件复测：生成约 0.86 s，冷目录+首批 4,000 文件 AST 解析及写入约 0.95 s，得到 8,000 个节点且 `tree_sitter_symbols=8000/lightweight_symbols=0`；128 文件渐进批次在约 90 ms 人为锁等待下总计 120 ms，取消约 3 ms，单文件增量约 12 ms，峰值 RSS 约 23.7 MiB。这说明首批 TS AST 精确范围没有改变当前渐进索引的数量级；真实混合语法和 Recall@5/20 仍需独立验证。
 
 原始输出：
 

@@ -231,7 +231,7 @@ Agent 不应直接猜选搜索工具。新增一个统一 `repo_query`：
 - 修改影响面：反向依赖图 + 测试映射 + Git 历史；
 - 每个结果返回 `source_layer`、`index_revision`、`coverage`、`stale` 和可引用行范围。
 
-Agent 的默认入口采用 [Structure-first 代码导航](./STRUCTURE_FIRST_NAVIGATION.md)：先把符号按 `entity`（类/组件/类型/状态等）和 `logic`（函数/方法）组织并分页检索，再按返回的结构行区间读取正文。二分类只用于规划，索引仍保留语言原生 kind；索引无结果或 coverage 不完整时必须走 lexical/LSP fallback。本轮已将现有 `search_symbols` 升级为该 MVP，加入签名、父级、起止行、角色、分页、coverage 和 staleness，并调整 Agent 能力包为结构优先。
+Agent 的默认入口采用 [Structure-first 代码导航](./STRUCTURE_FIRST_NAVIGATION.md)：先把符号按 `entity`（类/组件/类型/状态等）和 `logic`（函数/方法）组织并分页检索，再按返回的结构行区间读取正文。二分类只用于规划，索引仍保留语言原生 kind；索引无结果或 coverage 不完整时必须走 lexical/LSP fallback。现有 `search_symbols` 已加入签名、父级、起止行、角色、稳定游标、coverage 和 staleness；TS/TSX/JS/JSX 节点进一步标注 `tree_sitter` 来源并使用 AST 精确范围，其余语言或语法错误文件明确标注 `lightweight` fallback。
 
 ### 6.5 “全库可达”与单次读写预算
 
@@ -413,7 +413,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、后端契约、Docker/Podman 运行时探测、fail-closed OCI argv、超时/取消清理、输出限制和审计事件；实际命令接线与 artifact 导出待完成）；
 - [ ] approval 与 sandbox escalation 进入统一事件和审计链；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy；
-- [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、分页查询及原生 watcher 已完成；Git diff、事件直写目录、物理分片和结构解析扩容待完成）；
+- [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系 Tree-sitter 已接入，ArkTS 精确解析与必要时的物理分片待完成）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成，统一 planner 待完成）；
 - [ ] 每周真实模型回归，保存 patch/trajectory/cost/report。
 
