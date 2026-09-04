@@ -1,5 +1,26 @@
 @import "tailwindcss";
 
+/* ============ Tailwind 主题桥接 ============
+   项目自有 token 一律用 --app- 前缀，再通过 @theme inline 映射回 Tailwind 命名空间，
+   这样 rounded-lg / ease-out 等 utility 才会引用项目值而非 Tailwind 默认值。
+
+   为什么必须改名：@theme inline 会把声明的值原样替换进 utility。若项目 token 与
+   Tailwind 主题变量同名（例如两边都叫 --radius-lg），映射就变成自己引用自己，
+   在 computed-value time 失效，圆角会整体塌成 0。
+
+   为什么颜色 token 永远不进这里：--text-* 是 Tailwind 的**字号**命名空间，
+   把 --text-primary / --text-secondary / --text-muted 声明进 @theme 会误注册字号 utility。
+   颜色如需接入 Tailwind，只能走 --color-* 命名空间。 */
+@theme inline {
+  --radius-sm: var(--app-radius-sm);
+  --radius-md: var(--app-radius-md);
+  --radius-lg: var(--app-radius-lg);
+  --radius-xl: var(--app-radius-xl);
+
+  --ease-out: var(--app-ease-out);
+  --ease-spring: var(--app-ease-spring);
+}
+
 /* ============ 主题变量：现代中性色系（精致分层 + 品牌强调） ============ */
 :root,
 [data-theme="dark"] {
@@ -60,23 +81,23 @@
   --scrollbar: rgba(255, 255, 255, 0.12);
   --icon-filter: brightness(0) invert(1);
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
-  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
-  --ring: 0 0 0 3px var(--accent-soft);
+  --app-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --app-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
+  --app-shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --app-ring: 0 0 0 3px var(--accent-soft);
 
   /* 动效常量：统一在 CSS 里管理，避免组件各自写魔法数 */
-  --motion-fast: 0.12s;
-  --motion-base: 0.18s;
-  --motion-slow: 0.25s;
-  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --app-motion-fast: 0.12s;
+  --app-motion-base: 0.18s;
+  --app-motion-slow: 0.25s;
+  --app-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --app-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 
   /* 圆角层级 */
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --radius-xl: 18px;
+  --app-radius-sm: 6px;
+  --app-radius-md: 10px;
+  --app-radius-lg: 14px;
+  --app-radius-xl: 18px;
 
   /* 等宽数字：用于 token/时长/计数 */
   --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
@@ -139,21 +160,21 @@
   --scrollbar: rgba(15, 23, 42, 0.18);
   --icon-filter: brightness(0);
 
-  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
-  --shadow-md: 0 2px 8px rgba(15, 23, 42, 0.06), 0 6px 20px rgba(15, 23, 42, 0.08);
-  --shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.10), 0 16px 48px rgba(15, 23, 42, 0.10);
-  --ring: 0 0 0 3px var(--accent-soft);
+  --app-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
+  --app-shadow-md: 0 2px 8px rgba(15, 23, 42, 0.06), 0 6px 20px rgba(15, 23, 42, 0.08);
+  --app-shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.10), 0 16px 48px rgba(15, 23, 42, 0.10);
+  --app-ring: 0 0 0 3px var(--accent-soft);
 
   /* 动效常量 + 圆角 + 等宽数字：与暗色主题一致 */
-  --motion-fast: 0.12s;
-  --motion-base: 0.18s;
-  --motion-slow: 0.25s;
-  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --radius-xl: 18px;
+  --app-motion-fast: 0.12s;
+  --app-motion-base: 0.18s;
+  --app-motion-slow: 0.25s;
+  --app-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --app-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --app-radius-sm: 6px;
+  --app-radius-md: 10px;
+  --app-radius-lg: 14px;
+  --app-radius-xl: 18px;
   --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
 }
 
@@ -374,7 +395,7 @@ button:focus-visible {
 }
 /* 仅按钮保留键盘导航焦点环（按钮均带圆角，环会跟随圆角） */
 button:focus-visible {
-  box-shadow: var(--ring);
+  box-shadow: var(--app-ring);
 }
 
 /* 卡片：细腻描边 + 轻阴影 */
@@ -382,7 +403,7 @@ button:focus-visible {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 14px;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--app-shadow-sm);
 }
 
 /* 主操作按钮（渐变强调） */
@@ -1603,7 +1624,7 @@ button:focus-visible {
 .lift-card:hover {
   transform: translateY(-1px);
   border-color: var(--border-strong);
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--app-shadow-md);
 }
 
 /* 状态点呼吸光 */
@@ -1673,7 +1694,7 @@ button:focus-visible {
 .msg-role {
   position: relative;
   padding: 0.65rem 0.9rem 0.65rem 1.05rem;
-  border-radius: var(--radius-lg);
+  border-radius: var(--app-radius-lg);
   border: 1px solid var(--border);
   background: var(--bg-card);
 }
@@ -1773,7 +1794,7 @@ button:focus-visible {
   inset: 0 auto 0 0;
   background: var(--accent);
   border-radius: 1px;
-  transition: width 0.3s var(--ease-out), background-color 0.3s;
+  transition: width 0.3s var(--app-ease-out), background-color 0.3s;
 }
 .context-meter-fill[data-level='warn'] {
   background: var(--warning);
@@ -1838,7 +1859,7 @@ button:active:not(:disabled),
   -webkit-backdrop-filter: blur(16px) saturate(150%);
   backdrop-filter: blur(16px) saturate(150%);
   border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--app-shadow-lg);
 }
 
 /* 渐变光晕装饰（输入框聚焦时四角微光） */
@@ -1853,7 +1874,7 @@ button:active:not(:disabled),
   background: linear-gradient(135deg, var(--accent-glow), transparent 60%);
   opacity: 0;
   pointer-events: none;
-  transition: opacity var(--motion-base) var(--ease-out);
+  transition: opacity var(--app-motion-base) var(--app-ease-out);
   z-index: -1;
 }
 .glow-accent:focus-within::after {
@@ -1863,7 +1884,7 @@ button:active:not(:disabled),
 /* 列表项 hover：左侧 accent 滑入（用于会话/工作区/文件列表） */
 .list-row {
   position: relative;
-  transition: background-color var(--motion-fast) var(--ease-out);
+  transition: background-color var(--app-motion-fast) var(--app-ease-out);
 }
 .list-row::before {
   content: '';
@@ -1876,7 +1897,7 @@ button:active:not(:disabled),
   background: var(--accent);
   transform: scaleY(0);
   transform-origin: center;
-  transition: transform var(--motion-base) var(--ease-spring);
+  transition: transform var(--app-motion-base) var(--app-ease-spring);
 }
 .list-row:hover::before,
 .list-row.is-active::before {
@@ -1938,10 +1959,10 @@ button:active:not(:disabled),
   color: var(--text-secondary);
   font-size: 11.5px;
   font-weight: 500;
-  box-shadow: var(--shadow-md);
-  transition: opacity var(--motion-base) var(--ease-out),
-    transform var(--motion-base) var(--ease-out),
-    color var(--motion-fast) var(--ease-out);
+  box-shadow: var(--app-shadow-md);
+  transition: opacity var(--app-motion-base) var(--app-ease-out),
+    transform var(--app-motion-base) var(--app-ease-out),
+    color var(--app-motion-fast) var(--app-ease-out);
   opacity: 0;
   transform: translateY(8px);
   pointer-events: none;
@@ -1964,7 +1985,7 @@ button:active:not(:disabled),
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
   z-index: 100;
-  animation: fade-in 0.15s var(--ease-out) both;
+  animation: fade-in 0.15s var(--app-ease-out) both;
 }
 /* 命令面板 backdrop（居中、顶部 12vh 偏移——⌘K 视觉上更靠近顶部触发点） */
 .cmdk-backdrop {
@@ -1978,7 +1999,7 @@ button:active:not(:disabled),
   align-items: flex-start;
   justify-content: center;
   padding-top: 12vh;
-  animation: fade-in 0.15s var(--ease-out) both;
+  animation: fade-in 0.15s var(--app-ease-out) both;
 }
 @keyframes fade-in {
   from { opacity: 0; }
@@ -1990,7 +2011,7 @@ button:active:not(:disabled),
   font-size: 10.5px;
   color: var(--text-muted);
   opacity: 0;
-  transition: opacity var(--motion-fast) var(--ease-out);
+  transition: opacity var(--app-motion-fast) var(--app-ease-out);
   font-variant-numeric: tabular-nums;
 }
 .msg-row:hover .msg-timestamp {
@@ -2003,19 +2024,19 @@ button:active:not(:disabled),
   align-items: center;
   gap: 0.6rem;
   padding: 0.5rem 0.75rem;
-  border-radius: var(--radius-md);
+  border-radius: var(--app-radius-md);
   border: 1px solid var(--border);
   background: var(--bg-card);
   cursor: pointer;
-  transition: background-color var(--motion-fast) var(--ease-out),
-    border-color var(--motion-fast) var(--ease-out);
+  transition: background-color var(--app-motion-fast) var(--app-ease-out),
+    border-color var(--app-motion-fast) var(--app-ease-out);
 }
 .tool-card-summary:hover {
   background: var(--bg-hover);
   border-color: var(--border-strong);
 }
 .tool-card-summary .chevron {
-  transition: transform var(--motion-base) var(--ease-out);
+  transition: transform var(--app-motion-base) var(--app-ease-out);
   color: var(--text-muted);
 }
 .tool-card-summary[aria-expanded='true'] .chevron {
@@ -2024,7 +2045,7 @@ button:active:not(:disabled),
 .tool-card-body {
   display: grid;
   grid-template-rows: 0fr;
-  transition: grid-template-rows var(--motion-base) var(--ease-out);
+  transition: grid-template-rows var(--app-motion-base) var(--app-ease-out);
 }
 .tool-card-body > div {
   overflow: hidden;
@@ -2161,11 +2182,11 @@ button:active:not(:disabled),
 .tab-active {
   background: var(--accent);
   color: #ffffff;
-  transition: background-color var(--motion-fast) var(--ease-out);
+  transition: background-color var(--app-motion-fast) var(--app-ease-out);
 }
 .tab-inactive {
   color: var(--text-secondary);
-  transition: color var(--motion-fast) var(--ease-out), background-color var(--motion-fast) var(--ease-out);
+  transition: color var(--app-motion-fast) var(--app-ease-out), background-color var(--app-motion-fast) var(--app-ease-out);
 }
 .tab-inactive:hover {
   color: var(--text-primary);
@@ -2176,7 +2197,7 @@ button:active:not(:disabled),
 .tab-soft {
   background: var(--bg-card);
   color: var(--accent);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--app-shadow-sm);
 }
 .tab-soft:hover {
   background: var(--bg-card);
@@ -2302,7 +2323,7 @@ button:active:not(:disabled),
 .render-tier-low .glass-card,
 .render-tier-low .btn-primary,
 .render-tier-low .scroll-to-bottom {
-  box-shadow: var(--shadow-sm) !important;
+  box-shadow: var(--app-shadow-sm) !important;
 }
 .render-tier-low .glow-accent::after {
   display: none !important;
