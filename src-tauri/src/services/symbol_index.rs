@@ -28,7 +28,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 2;
+const STRUCTURE_PARSER_VERSION: i64 = 4;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -107,9 +107,18 @@ pub struct Symbol {
     /// Parser layer that produced this node: tree_sitter or lightweight.
     #[serde(default)]
     pub source_layer: String,
+    /// Syntactically declared outgoing relationships; targets are resolved in a later layer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_relations: Vec<DeclaredRelation>,
 }
 
-/// 全局结构图中的关系边。当前只产生语法上可靠的 contains；imports/calls 等待 AST/LSP。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DeclaredRelation {
+    pub kind: String,
+    pub target_name: String,
+}
+
+/// 全局结构图中的关系边。空 target_file/0 target_line 表示语法目标尚未完成名称解析。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StructureEdge {
     pub kind: String,
@@ -200,6 +209,7 @@ fn make_symbol(
         parent,
         language: ext.to_string(),
         source_layer: "lightweight".into(),
+        declared_relations: Vec::new(),
     }
 }
 
@@ -247,6 +257,7 @@ fn ident_after(line: &str, kw: &str) -> Option<String> {
 
 fn tree_sitter_language(ext: &str) -> Option<tree_sitter::Language> {
     match ext {
+        "ets" => Some(tree_sitter_arkts::LANGUAGE.into()),
         "ts" | "js" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" | "jsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         _ => None,
@@ -268,6 +279,52 @@ fn tree_sitter_signature(node: tree_sitter::Node<'_>, source: &str) -> String {
         .collect()
 }
 
+fn collect_declared_relations(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    out: &mut Vec<DeclaredRelation>,
+) {
+    let relation_kind = match node.kind() {
+        "extends_clause" | "extends_type_clause" => Some("extends"),
+        "implements_clause" => Some("implements"),
+        _ => None,
+    };
+    if let Some(kind) = relation_kind {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "type_arguments" {
+                continue;
+            }
+            if let Some(target_name) = node_text(child, source)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                out.push(DeclaredRelation { kind: kind.into(), target_name });
+            }
+        }
+        return;
+    }
+    if matches!(node.kind(), "class_heritage") {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_declared_relations(child, source, out);
+        }
+    }
+}
+
+fn declared_relations(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<DeclaredRelation> {
+    let mut relations = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(child.kind(), "class_heritage" | "extends_type_clause") {
+            collect_declared_relations(child, source, &mut relations);
+        }
+    }
+    relations.sort();
+    relations.dedup();
+    relations
+}
+
 fn push_tree_sitter_symbol(
     out: &mut Vec<Symbol>,
     node: tree_sitter::Node<'_>,
@@ -277,9 +334,12 @@ fn push_tree_sitter_symbol(
     rel: &str,
     ext: &str,
     source: &str,
+    declared_relations: Vec<DeclaredRelation>,
 ) -> Option<String> {
     let name = node_text(name_node, source.as_bytes())?;
-    let line = node.start_position().row + 1;
+    // Decorators are part of a declaration node in TypeScript/ArkTS, so the
+    // declaration itself starts at the name/keyword line rather than @Entry.
+    let line = name_node.start_position().row + 1;
     out.push(Symbol {
         kind: kind.into(),
         name: name.clone(),
@@ -287,15 +347,23 @@ fn push_tree_sitter_symbol(
         line,
         end_line: (node.end_position().row + 1).max(line),
         role: structure_role(kind).into(),
-        signature: tree_sitter_signature(node, source),
+        signature: source
+            .lines()
+            .nth(name_node.start_position().row)
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(300)
+            .collect(),
         parent,
         language: ext.into(),
         source_layer: "tree_sitter".into(),
+        declared_relations,
     });
     Some(name)
 }
 
-fn walk_typescript_tree(
+fn walk_syntax_tree(
     node: tree_sitter::Node<'_>,
     parent: Option<&str>,
     rel: &str,
@@ -306,6 +374,7 @@ fn walk_typescript_tree(
     let node_kind = node.kind();
     let declaration_kind = match node_kind {
         "class_declaration" | "abstract_class_declaration" => Some("class"),
+        "struct_declaration" => Some("component"),
         "interface_declaration" => Some("interface"),
         "type_alias_declaration" => Some("type"),
         "enum_declaration" => Some("enum"),
@@ -314,7 +383,35 @@ fn walk_typescript_tree(
         _ => None,
     };
     let mut child_parent = parent.map(str::to_string);
-    if let (Some(kind), Some(name_node)) = (declaration_kind, node.child_by_field_name("name")) {
+    if node_kind == "decorator" && ext == "ets" {
+        if let Some(raw) = node_text(node, source.as_bytes()) {
+            let name = raw
+                .trim_start()
+                .strip_prefix('@')
+                .and_then(|value| value.split(|ch: char| !is_ident(ch)).next())
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("@{value}"));
+            if let Some(name) = name.filter(|value| {
+                matches!(value.as_str(), "@Entry" | "@Component" | "@Router")
+                    || ETS_STATE_DECORATORS.contains(&value.as_str())
+            }) {
+                let line = node.start_position().row + 1;
+                out.push(Symbol {
+                    kind: if name == "@Router" { "route" } else { "decorator" }.into(),
+                    name,
+                    file: rel.into(),
+                    line,
+                    end_line: (node.end_position().row + 1).max(line),
+                    role: "entity".into(),
+                    signature: tree_sitter_signature(node, source),
+                    parent: parent.map(str::to_string),
+                    language: ext.into(),
+                    source_layer: "tree_sitter".into(),
+                    declared_relations: Vec::new(),
+                });
+            }
+        }
+    } else if let (Some(kind), Some(name_node)) = (declaration_kind, node.child_by_field_name("name")) {
         let symbol_parent = matches!(kind, "function" | "method")
             .then(|| parent.map(str::to_string))
             .flatten();
@@ -327,8 +424,9 @@ fn walk_typescript_tree(
             rel,
             ext,
             source,
+            declared_relations(node, source.as_bytes()),
         ) {
-            if matches!(kind, "class" | "interface" | "type" | "enum") {
+            if matches!(kind, "class" | "component" | "interface" | "type" | "enum") {
                 child_parent = Some(name);
             }
         }
@@ -347,13 +445,14 @@ fn walk_typescript_tree(
                 rel,
                 ext,
                 source,
+                Vec::new(),
             );
         }
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_typescript_tree(child, child_parent.as_deref(), rel, ext, source, out);
+        walk_syntax_tree(child, child_parent.as_deref(), rel, ext, source, out);
     }
 }
 
@@ -368,7 +467,7 @@ fn scan_file_tree_sitter(content: &str, rel: &str, ext: &str, out: &mut Vec<Symb
     if tree.root_node().has_error() {
         return false;
     }
-    walk_typescript_tree(tree.root_node(), None, rel, ext, content, out);
+    walk_syntax_tree(tree.root_node(), None, rel, ext, content, out);
     true
 }
 
@@ -816,8 +915,8 @@ fn apply_catalog_changes(root: &Path, rels: &[String]) -> CatalogDelta {
 
 fn insert_symbol_row(transaction: &rusqlite::Transaction<'_>, symbol: &Symbol) -> rusqlite::Result<()> {
     transaction.execute(
-        "INSERT INTO symbols(file, kind, name, line, end_line, role, signature, parent, shard, language, source_layer)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO symbols(file, kind, name, line, end_line, role, signature, parent, shard, language, source_layer, declared_relations)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             symbol.file,
             symbol.kind,
@@ -830,6 +929,7 @@ fn insert_symbol_row(transaction: &rusqlite::Transaction<'_>, symbol: &Symbol) -
             shard_for(&symbol.file),
             symbol.language,
             symbol.source_layer,
+            serde_json::to_string(&symbol.declared_relations).unwrap_or_else(|_| "[]".into()),
         ],
     )?;
     Ok(())
@@ -865,6 +965,26 @@ fn containment_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
             target_name: child.name.clone(),
             target_line: child.line,
         });
+    }
+    edges.sort();
+    edges.dedup();
+    edges
+}
+
+fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
+    let mut edges = containment_edges(symbols);
+    for symbol in symbols {
+        for relation in &symbol.declared_relations {
+            edges.push(StructureEdge {
+                kind: relation.kind.clone(),
+                source_file: symbol.file.clone(),
+                source_name: symbol.name.clone(),
+                source_line: symbol.line,
+                target_file: String::new(),
+                target_name: relation.target_name.clone(),
+                target_line: 0,
+            });
+        }
     }
     edges.sort();
     edges.dedup();
@@ -923,10 +1043,10 @@ fn replace_all_symbol_rows_at(
              WHERE NOT EXISTS (
                SELECT 1 FROM files f
                WHERE f.path = symbol_edges.source_file AND f.state = 'indexed'
-             ) OR NOT EXISTS (
+             ) OR (symbol_edges.target_file <> '' AND NOT EXISTS (
                SELECT 1 FROM files f
                WHERE f.path = symbol_edges.target_file AND f.state = 'indexed'
-             )",
+             ))",
             [],
         )
         .is_err()
@@ -970,7 +1090,7 @@ fn replace_all_symbol_rows_at(
             return false;
         }
     }
-    for edge in containment_edges(symbols) {
+    for edge in structure_edges(symbols) {
         if insert_edge_row(&transaction, &edge).is_err() {
             return false;
         }
@@ -1042,7 +1162,7 @@ fn replace_changed_symbol_rows_at(
             return false;
         }
     }
-    for edge in containment_edges(symbols) {
+    for edge in structure_edges(symbols) {
         if insert_edge_row(&transaction, &edge).is_err() {
             return false;
         }
@@ -1184,7 +1304,7 @@ where
         for symbol in &symbols {
             insert_symbol_row(&transaction, symbol).map_err(|error| error.to_string())?;
         }
-        for edge in containment_edges(&symbols) {
+        for edge in structure_edges(&symbols) {
             insert_edge_row(&transaction, &edge).map_err(|error| error.to_string())?;
         }
         promoted += 1;
@@ -1438,6 +1558,12 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !columns.iter().any(|column| column == "declared_relations") {
+        conn.execute(
+            "ALTER TABLE symbols ADD COLUMN declared_relations TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
     let meta_columns = conn
         .prepare("PRAGMA table_info(structure_meta)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -1513,7 +1639,8 @@ fn collect_files_at_with_budget(
                    parent TEXT,
                    shard TEXT NOT NULL,
                    language TEXT NOT NULL DEFAULT '',
-                   source_layer TEXT NOT NULL DEFAULT 'lightweight'
+                   source_layer TEXT NOT NULL DEFAULT 'lightweight',
+                   declared_relations TEXT NOT NULL DEFAULT '[]'
                  );
                  CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
                  CREATE INDEX IF NOT EXISTS idx_symbols_role_kind ON symbols(role, kind);
@@ -1804,8 +1931,8 @@ struct PersistedIndex {
     catalog: CatalogStats,
 }
 
-// v4 adds parser provenance and invalidates lightweight-only symbol snapshots.
-const PERSIST_VERSION: u32 = 4;
+// v6 persists parser provenance plus syntactic declaration relationships.
+const PERSIST_VERSION: u32 = 6;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -2305,6 +2432,10 @@ fn decode_structure_cursor(value: &str, expected_filter_hash: u64) -> Result<Str
     Ok(cursor)
 }
 
+fn declared_relations_from_json(value: String) -> Vec<DeclaredRelation> {
+    serde_json::from_str(&value).unwrap_or_default()
+}
+
 fn query_persisted_symbols_at(
     root: &Path,
     data_dir: &Path,
@@ -2335,7 +2466,7 @@ fn query_persisted_symbols_at(
             .max(0) as usize;
         let offset = page.saturating_sub(1).saturating_mul(page_size);
         let mut statement = match conn.prepare(
-            "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer
+            "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer, declared_relations
              FROM symbols WHERE kind=?1
              ORDER BY file, line, name LIMIT ?2 OFFSET ?3",
         ) {
@@ -2356,6 +2487,7 @@ fn query_persisted_symbols_at(
                     parent: row.get(7)?,
                     language: row.get(8)?,
                     source_layer: row.get(9)?,
+                    declared_relations: declared_relations_from_json(row.get(10)?),
                 })
             },
         ) {
@@ -2386,7 +2518,7 @@ fn query_persisted_symbols_at(
         if exact_total > 0 {
             let offset = page.saturating_sub(1).saturating_mul(page_size);
             let mut statement = match conn.prepare(&format!(
-                "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer
+                "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer, declared_relations
                  FROM symbols WHERE {exact_where}
                  ORDER BY file, line, name LIMIT ?5 OFFSET ?6"
             )) {
@@ -2407,6 +2539,7 @@ fn query_persisted_symbols_at(
                         parent: row.get(7)?,
                         language: row.get(8)?,
                         source_layer: row.get(9)?,
+                        declared_relations: declared_relations_from_json(row.get(10)?),
                     })
                 },
             ) {
@@ -2436,7 +2569,7 @@ fn query_persisted_symbols_at(
     };
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let mut statement = match conn.prepare(&format!(
-        "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer
+        "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer, declared_relations
          FROM symbols WHERE {where_sql}
          ORDER BY file, line, name LIMIT ?5 OFFSET ?6"
     )) {
@@ -2457,6 +2590,7 @@ fn query_persisted_symbols_at(
                 parent: row.get(7)?,
                 language: row.get(8)?,
                 source_layer: row.get(9)?,
+                declared_relations: declared_relations_from_json(row.get(10)?),
             })
         },
     ) {
@@ -2606,7 +2740,7 @@ fn query_persisted_symbols_keyset_at(
         filters.join(" AND ")
     };
     let mut statement = match conn.prepare(&format!(
-        "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer, id
+        "SELECT kind, name, file, line, end_line, role, signature, parent, language, source_layer, declared_relations, id
          FROM symbols WHERE {where_sql}
          ORDER BY file, line, name, id LIMIT ?{limit_parameter}"
     )) {
@@ -2626,8 +2760,9 @@ fn query_persisted_symbols_keyset_at(
                 parent: row.get(7)?,
                 language: row.get(8)?,
                 source_layer: row.get(9)?,
+                declared_relations: declared_relations_from_json(row.get(10)?),
             },
-            row.get::<_, i64>(10)?,
+            row.get::<_, i64>(11)?,
         ))
     }) {
         Ok(value) => value,
@@ -2844,7 +2979,7 @@ pub fn query_structure_with_cursor(
         (items, total, None)
     });
     let fallback_edges = || {
-        let mut edges = containment_edges(&syms)
+        let mut edges = structure_edges(&syms)
             .into_iter()
             .filter(|edge| {
                 items.iter().any(|symbol| {
@@ -2857,7 +2992,7 @@ pub fn query_structure_with_cursor(
                 })
             })
             .collect::<Vec<_>>();
-        let total = containment_edges(&syms).len();
+        let total = structure_edges(&syms).len();
         edges.sort();
         edges.dedup();
         (edges, total)
@@ -3180,10 +3315,104 @@ export const normalize = (value: string) => {
     }
 
     #[test]
+    fn tree_sitter_extracts_arkts_components_methods_and_state_decorators() {
+        let source = r#"@Entry
+@Component
+struct CounterCard {
+  @State count: number = 0;
+
+  build() {
+    Column() {
+      Text(`${this.count}`)
+    }
+  }
+
+  increment(): void {
+    this.count++;
+  }
+}
+"#;
+        let mut out = Vec::new();
+        assert!(scan_file_tree_sitter(
+            source,
+            "entry/src/main/ets/pages/CounterCard.ets",
+            "ets",
+            &mut out,
+        ));
+
+        let component = out.iter().find(|symbol| symbol.name == "CounterCard").unwrap();
+        assert_eq!(component.kind, "component");
+        assert_eq!(component.line, 3);
+        assert_eq!(component.end_line, 15);
+        assert_eq!(component.source_layer, "tree_sitter");
+        let build = out.iter().find(|symbol| symbol.name == "build").unwrap();
+        assert_eq!(build.kind, "method");
+        assert_eq!(build.parent.as_deref(), Some("CounterCard"), "{out:?}");
+        assert_eq!(build.end_line, 10);
+        let state = out.iter().find(|symbol| symbol.name == "@State").unwrap();
+        assert_eq!(state.parent.as_deref(), Some("CounterCard"));
+        assert!(out.iter().any(|symbol| symbol.name == "@Entry"));
+        assert!(out.iter().any(|symbol| symbol.name == "@Component"));
+        assert!(out.iter().all(|symbol| {
+            symbol.language == "ets" && symbol.source_layer == "tree_sitter"
+        }));
+    }
+
+    #[test]
+    fn tree_sitter_records_declared_type_relations_without_guessing_targets() {
+        let source = r#"interface Identified {}
+interface Loadable extends Identified {}
+class BaseService {}
+class Service extends BaseService implements Loadable, Disposable {}
+"#;
+        let mut symbols = Vec::new();
+        assert!(scan_file_tree_sitter(source, "service.ts", "ts", &mut symbols));
+
+        let loadable = symbols.iter().find(|symbol| symbol.name == "Loadable").unwrap();
+        assert_eq!(
+            loadable.declared_relations,
+            vec![DeclaredRelation { kind: "extends".into(), target_name: "Identified".into() }]
+        );
+        let service = symbols.iter().find(|symbol| symbol.name == "Service").unwrap();
+        assert_eq!(
+            service.declared_relations,
+            vec![
+                DeclaredRelation { kind: "extends".into(), target_name: "BaseService".into() },
+                DeclaredRelation { kind: "implements".into(), target_name: "Disposable".into() },
+                DeclaredRelation { kind: "implements".into(), target_name: "Loadable".into() },
+            ]
+        );
+        let edges = structure_edges(&symbols);
+        let declared = edges
+            .iter()
+            .filter(|edge| edge.source_name == "Service" && edge.kind != "contains")
+            .collect::<Vec<_>>();
+        assert_eq!(declared.len(), 3);
+        assert!(declared.iter().all(|edge| edge.target_file.is_empty() && edge.target_line == 0));
+    }
+
+    #[test]
+    fn malformed_arkts_falls_back_to_lightweight_scanner() {
+        let dir = std::env::temp_dir().join(format!(
+            "deveco-symbol-ets-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Broken.ets");
+        std::fs::write(&file, "@Component\nstruct Broken {\n  build() {\n").unwrap();
+        let mut out = Vec::new();
+        scan_file(&file, "Broken.ets", &mut out);
+        let recovered = out.iter().find(|symbol| symbol.name == "Broken").unwrap();
+        assert_eq!(recovered.source_layer, "lightweight");
+        assert_eq!(recovered.language, "ets");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn filter_works() {
         let syms = vec![
-            Symbol { kind: "function".into(), name: "loadData".into(), file: "a.ts".into(), line: 1, end_line: 1, role: "logic".into(), signature: "function loadData()".into(), parent: None, language: "ts".into(), source_layer: "tree_sitter".into() },
-            Symbol { kind: "component".into(), name: "BookCard".into(), file: "b.ets".into(), line: 2, end_line: 5, role: "entity".into(), signature: "struct BookCard".into(), parent: None, language: "ets".into(), source_layer: "lightweight".into() },
+            Symbol { kind: "function".into(), name: "loadData".into(), file: "a.ts".into(), line: 1, end_line: 1, role: "logic".into(), signature: "function loadData()".into(), parent: None, language: "ts".into(), source_layer: "tree_sitter".into(), declared_relations: Vec::new() },
+            Symbol { kind: "component".into(), name: "BookCard".into(), file: "b.ets".into(), line: 2, end_line: 5, role: "entity".into(), signature: "struct BookCard".into(), parent: None, language: "ets".into(), source_layer: "lightweight".into(), declared_relations: Vec::new() },
         ];
         assert_eq!(filter_symbols(&syms, "book", None).len(), 1);
         assert_eq!(filter_symbols(&syms, "", Some("component")).len(), 1);
@@ -3265,7 +3494,7 @@ export const normalize = (value: string) => {
     }
 
     #[test]
-    fn existing_symbol_database_adds_parser_provenance_columns() {
+    fn existing_symbol_database_adds_parser_and_relation_columns() {
         let root = std::env::temp_dir().join(format!(
             "deveco-symbol-migrate-{}",
             uuid::Uuid::new_v4()
@@ -3300,6 +3529,7 @@ export const normalize = (value: string) => {
             .unwrap();
         assert!(columns.iter().any(|column| column == "language"));
         assert!(columns.iter().any(|column| column == "source_layer"));
+        assert!(columns.iter().any(|column| column == "declared_relations"));
         let parser_version: i64 = conn
             .query_row(
                 "SELECT parser_version FROM structure_meta WHERE id=1",
@@ -3655,6 +3885,59 @@ export const normalize = (value: string) => {
     }
 
     #[test]
+    fn declared_type_relations_roundtrip_through_sqlite() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-type-edge-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-type-edge-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let file = root.join("service.ts");
+        std::fs::write(
+            &file,
+            "interface Loadable {}\nclass BaseService {}\nclass Service extends BaseService implements Loadable {}\n",
+        )
+        .unwrap();
+        let (_, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        scan_file(&file, "service.ts", &mut symbols);
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+
+        let (persisted, total) = query_persisted_symbols_at(
+            &root,
+            &data_dir,
+            "Service",
+            None,
+            Some("class"),
+            None,
+            1,
+            20,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(persisted[0].declared_relations.len(), 2);
+        let (edges, edge_total) = query_persisted_edges_at(&root, &data_dir, &persisted)
+            .unwrap()
+            .unwrap();
+        assert_eq!(edge_total, 2);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|edge| {
+            matches!(edge.kind.as_str(), "extends" | "implements")
+                && edge.target_file.is_empty()
+                && edge.target_line == 0
+        }));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
     fn deferred_files_promote_in_bounded_batches_and_detect_stale_input() {
         let root =
             std::env::temp_dir().join(format!("deveco-deferred-db-{}", uuid::Uuid::new_v4()));
@@ -3892,7 +4175,7 @@ export const normalize = (value: string) => {
         let proj = make_project("persist");
         let mut files = HashMap::new();
         files.insert("a.ets".to_string(), FileStamp { mtime: 123, len: 45 });
-        let syms = vec![Symbol { kind: "struct".into(), name: "Aaa".into(), file: "a.ets".into(), line: 1, end_line: 1, role: "entity".into(), signature: "struct Aaa {}".into(), parent: None, language: "ets".into(), source_layer: "lightweight".into() }];
+        let syms = vec![Symbol { kind: "struct".into(), name: "Aaa".into(), file: "a.ets".into(), line: 1, end_line: 1, role: "entity".into(), signature: "struct Aaa {}".into(), parent: None, language: "ets".into(), source_layer: "lightweight".into(), declared_relations: Vec::new() }];
         let catalog = CatalogStats {
             discovered_files: 1,
             source_files: 1,

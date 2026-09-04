@@ -3702,15 +3702,14 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     if !result.relations.is_empty() {
         out.push_str("当前页关系：\n");
         for edge in result.relations {
+            let target = if edge.target_file.is_empty() || edge.target_line == 0 {
+                format!("{}（语法声明，目标待解析）", edge.target_name)
+            } else {
+                format!("{} ({}:{})", edge.target_name, edge.target_file, edge.target_line)
+            };
             out.push_str(&format!(
-                "- [{}] {} ({}:{}) -> {} ({}:{})\n",
-                edge.kind,
-                edge.source_name,
-                edge.source_file,
-                edge.source_line,
-                edge.target_name,
-                edge.target_file,
-                edge.target_line,
+                "- [{}] {} ({}:{}) -> {}\n",
+                edge.kind, edge.source_name, edge.source_file, edge.source_line, target,
             ));
         }
     }

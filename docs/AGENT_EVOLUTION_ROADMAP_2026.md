@@ -196,7 +196,7 @@ trait SandboxBackend {
 - 单文件上限 512 KiB；
 - `codebase_search` 和引用反查最多读取前 400 个源码文件；
 - 冷却期之外仍需从根目录递归 walk/stat；
-- 符号提取主要依赖行级规则，缺少稳定 AST、调用关系和跨仓依赖图；
+- TS 系与 ArkTS 已具备容错 AST 和声明继承关系，但仍缺少跨文件名称绑定、调用关系和跨仓依赖图；
 - 查询结果无法给出索引覆盖率和“因上限漏检”的明确告警。
 
 ### 6.2 建议的四层索引
@@ -413,7 +413,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、后端契约、Docker/Podman 运行时探测、fail-closed OCI argv、超时/取消清理、输出限制和审计事件；实际命令接线与 artifact 导出待完成）；
 - [ ] approval 与 sandbox escalation 进入统一事件和审计链；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy；
-- [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系 Tree-sitter 已接入，ArkTS 精确解析与必要时的物理分片待完成）；
+- [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成，统一 planner 待完成）；
 - [ ] 每周真实模型回归，保存 patch/trajectory/cost/report。
 
@@ -423,7 +423,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 交付：
 
-- [ ] Tree-sitter/ArkTS 容错 AST 层与依赖/影响图；
+- [ ] Tree-sitter/ArkTS 容错 AST 层与依赖/影响图（AST、`contains`、语法级 `extends/implements` 已完成；imports、跨文件目标解析与 calls 待完成）；
 - [ ] LSP/SCIP 语义层和 fallback 策略；
 - [ ] 延迟加载工具与程序化工具编排 A/B；
 - [ ] HarmonyBench v0（至少 50 题，其中一部分 holdout）；

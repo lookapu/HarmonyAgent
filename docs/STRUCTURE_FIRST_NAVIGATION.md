@@ -1,6 +1,6 @@
 # Structure-first 代码导航设计
 
-> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和可靠的实体包含关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 已接入 Tree-sitter，ArkTS 精确语法、物理分片及调用/导入关系仍在后续阶段。
+> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和结构关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 与 ArkTS 已接入 Tree-sitter，语法层 `extends/implements` 已落图，跨文件名称绑定、物理分片及调用/导入关系仍在后续阶段。
 
 ## 1. 结论
 
@@ -26,7 +26,7 @@
 - `name`、`role`、`kind`、`parent`；
 - `file`、`line`、`end_line`；
 - 单行 `signature`；
-- 后续补充稳定 `symbol_id`、`language`、`index_revision`、`source_layer` 和置信度。
+- 已包含 `language`、`source_layer` 和声明关系；后续补充稳定 `symbol_id`、`index_revision` 和解析置信度。
 
 ## 3. 默认访问协议
 
@@ -53,7 +53,7 @@
 - 返回匹配总数、下一页、已索引文件/结构数、新鲜度与 coverage；
 - Agent 能力包和全局工具协议已调整为结构优先。
 
-MVP 的范围估算仍是轻量规则扫描。大括号出现在字符串/注释、多行签名、宏、复杂 ArkTS/TypeScript/Python 语法时，`end_line` 可能退化或近似。当前 coverage 因此明确标记为 best-effort；达到 4,000 文件硬上限时标记 partial，而不静默声称全库完整。
+TS/TSX/JS/JSX/ArkTS 的范围来自 Tree-sitter AST；语法错误文件和 Rust/Python 等未接 grammar 的语言仍使用轻量规则扫描，其 `end_line` 在多行签名、宏或复杂语法下可能退化或近似。当前 coverage 因此明确标记为 best-effort；达到 4,000 文件首批解析预算时标记 partial，而不静默声称全库完整。
 
 ## 5. 百万仓演进
 
@@ -65,7 +65,7 @@ MVP 的范围估算仍是轻量规则扫描。大括号出现在字符串/注释
 
 目录层第一版已经完成：所有未忽略文件流式写入独立 SQLite，不把全量路径堆进内存；记录 `indexed/deferred/oversized/unsupported/symlink/unreadable` 状态和一级目录 shard。`find_files` 优先查询该目录，支持状态过滤和分页；结构查询同时报告发现、解析、延期、超大和不可读数量。结构节点也已进入同一仓库数据库，按 file、role/kind、name 和 shard 建索引，`search_symbols` 优先执行数据库过滤、排序、计数与分页，内存列表只作为兼容 fallback。
 
-结构图第一类边也已落地：根据解析器明确给出的 `parent` 生成 `contains`（实体 → 方法/逻辑）关系，按起点、终点和 shard 建索引；结构查询会返回与当前页节点相连的边，即使另一端不在当前页也保留完整定位。单文件外部变化会在同一增量流程中删除旧边并重建该文件的边。当前不使用正则猜测跨文件 `calls/imports/implements`，这些关系要等 Tree-sitter/LSP 提供可靠语义后再写入。
+结构图关系层也已落地：根据解析器明确给出的 `parent` 生成 `contains`（实体 → 方法/逻辑）关系，并从 AST heritage clause 生成 `extends/implements` 声明边，按起点、终点和 shard 建索引；结构查询会返回与当前页节点相连的边。尚未经过名称解析的类型目标使用空文件和 0 行号显式标记为“语法声明，目标待解析”，不会把同名类型猜成跨文件定义。单文件外部变化会在同一增量流程中删除旧边并重建该文件的边。当前仍不使用正则猜测 `calls/imports`，这些关系要等模块解析器或 LSP 提供可靠语义后再写入。
 
 原生跨平台 watcher 也已接入：第一次建立索引时懒启动，忽略纯访问事件，将编辑器常见的 create/modify/remove/rename 事件按 200 ms 合并。普通文件变化现在会在缓存锁外用 SQLite 事务直接 upsert/delete 全库目录记录，并只替换对应文件的结构节点，不再安排全仓 walk；目录级变化、数据库失败、系统 `Rescan` 标志、空路径事件或监听错误才把一致性校验延迟到下一次真实查询。目录代次还会对全量节点重建做 revision fencing，避免并发外部编辑被较旧的扫描结果覆盖。稳定仓库不再每 30 秒反复 walk；watcher 启动失败时保留 30 秒周期扫描，active 时仍每 5 分钟低频校验，防止监听器“创建成功但不投递”或静默失效。最多保留 16 个项目 watcher，按最近使用淘汰，避免系统句柄泄漏。
 
@@ -81,7 +81,7 @@ watcher 不是唯一真相：网络文件系统可能没有事件，Linux 可能
 
 这组数据验证的是单库结构图的容量和查询路径，不等同于 100 万真实源码文件的完整冷扫描，也没有给出符号召回率。当前决策是暂不引入物理多库分片：Agent 常用的“精确结构 → 邻接关系 → 窗口读取”已保持毫秒级，而深页 `OFFSET` 已接近 1 秒，应先改成稳定游标/keyset 分页；只有在真实 1M 仓库的写放大、数据库锁竞争或单库体积越过目标 SLO 后，再按 module/shard 拆物理库。
 
-deferred 渐进解析现已接入：首次结构查询快速返回基础 4,000 文件后，每个仓库最多启动一个后台 worker，以 128 文件为一批从 SQLite 领取任务；源码读取和解析发生在事务外，提交时再次核对 path、size、mtime 和 `state='deferred'`，避免覆盖 watcher 已处理的外部变化。每批只提交对应节点与 `contains` 边；指纹漂移或数据库异常会停止任务并请求一致性扫描。后续全目录校验会保留指纹未变的后台成果，不会重新降级。进程退出时无需排空任务，SQLite 中的状态可在下次查询后继续推进。
+deferred 渐进解析现已接入：首次结构查询快速返回基础 4,000 文件后，每个仓库最多启动一个后台 worker，以 128 文件为一批从 SQLite 领取任务；源码读取和解析发生在事务外，提交时再次核对 path、size、mtime 和 `state='deferred'`，避免覆盖 watcher 已处理的外部变化。每批只提交对应节点与结构边；指纹漂移或数据库异常会停止任务并请求一致性扫描。后续全目录校验会保留指纹未变的后台成果，不会重新降级。进程退出时无需排空任务，SQLite 中的状态可在下次查询后继续推进。
 
 后台治理也已补齐：批次耗时低于 75 ms 时让出 20 ms，随后按 50/100/200 ms 分级增加背压，避免慢盘或复杂源码持续争抢前台 CPU/IO；`search_symbols` 会报告 active 状态、本轮提升文件数、批次数、剩余文件、最近批次耗时和当前背压。清除索引会设置取消令牌并解除 worker 注册，worker 在批次开始、每个文件解析前和写事务前检查取消，防止旧任务回写已作废结果。
 
@@ -89,13 +89,15 @@ deferred 渐进解析现已接入：首次结构查询快速返回基础 4,000 �
 
 使用 Tree-sitter/编译器解析器增量提取实体和逻辑，轻量扫描只做容错 fallback。按文件或模块 shard 保存，单文件变化只替换对应文档和关系边。
 
-第一批 Tree-sitter 语法层已经落地：固定兼容的 `tree-sitter 0.24.7` 与官方 `tree-sitter-typescript 0.23.2` grammar，覆盖 `.ts/.tsx/.js/.jsx` 中的 class、interface、type alias、enum、function、generator、method、interface method signature 和绑定到变量的 arrow/function expression。节点范围直接使用语法树起止位置，因此字符串或注释中的大括号不会再破坏方法范围；类/接口成员会记录可靠 parent，并继续生成 `contains` 边。
+Tree-sitter 语法层已经扩展为固定兼容的 `tree-sitter 0.24.7`、`tree-sitter-typescript 0.23.2` 和 [`tree-sitter-arkts 0.2.0`](https://github.com/harmony-contrib/tree-sitter-arkts)。前者覆盖 `.ts/.tsx/.js/.jsx` 中的 class、interface、type alias、enum、function、generator、method、interface method signature 和绑定到变量的 arrow/function expression；ArkTS grammar 覆盖 `.ets` 的组件 `struct`、方法、状态装饰器和 ArkUI 扩展语法。节点范围直接使用语法树起止位置，因此字符串、注释或装饰器不会再破坏方法范围和声明定位；类、接口和组件成员会记录可靠 parent，并继续生成 `contains` 边。
 
-每个节点新增 `language` 和 `source_layer=tree_sitter|lightweight`，Agent 输出会展示来源，不能把 fallback 结果冒充 AST 事实。支持语言只有在语法树无错误时采用 Tree-sitter；解析失败时整文件回退原轻量扫描，ArkTS/Rust/Python 等未接 grammar 的语言也继续使用 fallback。SQLite 启动时兼容增加 provenance 列；parser schema version 从旧版本升级时清空旧节点、把已解析文件恢复为 deferred，并配合磁盘缓存版本升级重新建立首批结构，避免悄悄复用旧轻量结果。
+每个节点新增 `language` 和 `source_layer=tree_sitter|lightweight`，Agent 输出会展示来源，不能把 fallback 结果冒充 AST 事实。支持语言只有在语法树无错误时采用 Tree-sitter；解析失败时整文件回退原轻量扫描，Rust/Python 等未接 grammar 的语言也继续使用 fallback。SQLite 启动时兼容增加 provenance 和声明关系列；parser schema version 从旧版本升级时清空旧节点、把已解析文件恢复为 deferred，并配合磁盘缓存版本升级重新建立首批结构，避免悄悄复用旧轻量结果。
 
-fixture 回归覆盖多行接口/类方法、字符串内大括号、箭头函数、parent 归属、JS/JSX/TSX 入口、语法错误 fallback 和旧 SQLite 自动迁移。当前尚不能称为完整语义索引：ArkTS 扩展装饰器/组件语法仍需专用 grammar 或 LSP，跨文件引用也还没有编译器级绑定。
+fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器、字符串内大括号、箭头函数、parent 归属、JS/JSX/TSX 入口、语法错误 fallback、`extends/implements` 声明边持久化和旧 SQLite 自动迁移。当前仍不能称为完整语义索引：声明关系只代表语法事实，跨文件引用还没有编译器级绑定。
 
 10,000 个实体 `.ts` 文件的同机基准中，冷目录与首批 4,000 文件 AST 解析/写入约 0.95 s，产生 8,000 个 Tree-sitter 节点且没有 fallback；峰值 RSS 约 23.7 MiB，单文件增量约 12 ms。该结果只证明首批 grammar 的吞吐未突破既有资源边界，不替代真实代码的召回率评测。
+
+10,000 个生成型 `.ets` 文件复测中，冷目录与首批 4,000 文件 ArkTS AST 解析/写入约 0.99 s，产生 12,000 个 Tree-sitter 节点、4,128 条结构关系且没有 fallback；峰值 RSS 约 27.1 MiB，128 文件渐进批次约 135 ms（含约 95 ms 人为锁等待），单文件增量约 11 ms。
 
 ### 5.3 关系层
 
@@ -132,7 +134,7 @@ fixture 回归覆盖多行接口/类方法、字符串内大括号、箭头函�
 
 1. ~~为结构浏览增加稳定游标/keyset 分页，消除深页 `OFFSET` 的线性扫描，并保留现有页码接口作为兼容层。~~ 已完成。
 2. ~~在生成仓运行渐进解析 1M 验收，记录冷扫描吞吐、写放大、锁等待、峰值内存和取消延迟。~~ 已完成；仍需补充真实混合语言 monorepo 的 Recall@5/20 与任务轨迹验收，达到单库 SLO 边界时再启用物理分片。
-3. ~~引入首批 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 已完成；下一步接 ArkTS 专用解析来源，并补充 imports/extends/implements 等可靠声明关系。
+3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS 已完成，`extends/implements` 语法声明关系已落图；下一步补模块 import 解析与跨文件目标绑定。
 4. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 5. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
 6. 用 10k/100k/1M 基准和真实任务轨迹持续验证 Recall@5/20、延迟与上下文节省量。
