@@ -25,6 +25,8 @@ export interface Provider {
   settings_json: string
   notes: string | null
   icon: string | null
+  /** auto 池三态：0=不参与，1=仅主对话，2=主对话+杂活 */
+  auto_pool_mode: number
   created_at: number
   updated_at: number
 }
@@ -95,6 +97,8 @@ export interface UpdateProviderInput {
   endpoints?: EndpointDef[]
   limit_daily_cny?: number | null // 日预算（元），0/null 表示不限制
   limit_monthly_cny?: number | null // 月预算（元），0/null 表示不限制
+  /** auto 池三态：0=不参与，1=仅主对话，2=主对话+杂活 */
+  auto_pool_mode?: number
 }
 
 /** 远端模型元数据（同步结果）：平台模型列表的展开信息 */

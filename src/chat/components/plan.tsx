@@ -255,23 +255,29 @@ export function ModelSettingsPopover({
               </button>
             </div>
           ) : (
-            <select
-              value={options.model_id ?? ''}
-              onChange={(e) => onChange({ ...options, model_id: e.target.value || undefined })}
-              className="w-full h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-2 text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
-            >
-              <option value="">{t('provider.modelDefault')}</option>
-              {catalog.map((g) => (
-                <optgroup key={g.providerName} label={g.providerName}>
-                  {g.models.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.display_name ?? m.model_id}
-                      {m.is_default ? ' ★' : ''}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
+            <>
+              <select
+                value={options.model_id ?? ''}
+                onChange={(e) => onChange({ ...options, model_id: e.target.value || undefined })}
+                className="w-full h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-2 text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
+              >
+                <option value="">{t('provider.modelDefault')}</option>
+                <option value="auto">{t('home.autoMode')}</option>
+                {catalog.map((g) => (
+                  <optgroup key={g.providerName} label={g.providerName}>
+                    {g.models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.display_name ?? m.model_id}
+                        {m.is_default ? ' ★' : ''}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              {options.model_id === 'auto' && (
+                <p className="text-[10px] text-[var(--text-muted)] mt-1 leading-snug">{t('home.autoModeHint')}</p>
+              )}
+            </>
           )}
         </div>
 

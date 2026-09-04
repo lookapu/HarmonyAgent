@@ -61,6 +61,8 @@ pub struct UpdateProviderInput {
     pub limit_daily_cny: Option<f64>,
     /// 月预算上限（元）：发送前门控，突破则拦截
     pub limit_monthly_cny: Option<f64>,
+    /// auto 池三态：0=不参与，1=仅主对话，2=主对话+杂活
+    pub auto_pool_mode: Option<i64>,
 }
 
 #[tauri::command]
@@ -99,6 +101,7 @@ pub fn create_provider(db: State<DbState>, input: CreateProviderInput) -> Result
         settings_json: "{}".to_string(),
         notes: input.notes,
         icon: None,
+        auto_pool_mode: 0,
         created_at: now,
         updated_at: now,
     };
@@ -299,6 +302,12 @@ pub fn update_provider(db: State<DbState>, id: String, input: UpdateProviderInpu
             return Err("月预算不能为负数".into());
         }
         provider.limit_monthly_cny = if m > 0.0 { Some(m) } else { None };
+    }
+    if let Some(mode) = input.auto_pool_mode {
+        if !(0..=2).contains(&mode) {
+            return Err("auto_pool_mode 仅支持 0/1/2".into());
+        }
+        provider.auto_pool_mode = mode;
     }
     provider.updated_at = chrono::Utc::now().timestamp();
 

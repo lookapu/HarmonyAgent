@@ -364,6 +364,197 @@ pub fn pick_economy_model(
     }
 }
 
+/// 跨 provider 池的路由结果：命中模型的 provider + model_id。
+#[derive(Debug, Clone)]
+pub struct RoutedModel {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// auto 池候选模型（跨多个 provider）。
+struct PoolCand {
+    provider_id: String,
+    model_id: String,
+    input_price: f64,
+    output_price: f64,
+    context_limit: i64,
+    tool_call: bool,
+    input_modalities: String,
+}
+
+/// 读取 auto 池内的候选模型（enabled=1，排除指定主模型）。
+fn load_pool_candidates(
+    conn: &Connection,
+    pool: &[String],
+    main_provider_id: &str,
+    main_model: &str,
+) -> Option<Vec<PoolCand>> {
+    if pool.is_empty() {
+        return None;
+    }
+    let mut sql = String::from(
+        "SELECT provider_id, model_id, input_price_per_mtok, output_price_per_mtok,
+                context_limit, tool_call, input_modalities
+         FROM models
+         WHERE enabled = 1 AND provider_id IN (",
+    );
+    sql.push_str(&pool.iter().map(|_| "?").collect::<Vec<_>>().join(","));
+    sql.push_str(") AND NOT (provider_id = ? AND model_id = ?)");
+
+    let mut params: Vec<rusqlite::types::Value> = pool
+        .iter()
+        .map(|p| rusqlite::types::Value::Text(p.clone()))
+        .collect();
+    params.push(rusqlite::types::Value::Text(main_provider_id.to_string()));
+    params.push(rusqlite::types::Value::Text(main_model.to_string()));
+
+    let mut stmt = conn.prepare(&sql).ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok(PoolCand {
+                provider_id: r.get(0)?,
+                model_id: r.get(1)?,
+                input_price: r.get(2)?,
+                output_price: r.get(3)?,
+                context_limit: r.get(4)?,
+                tool_call: r.get::<_, i64>(5)? != 0,
+                input_modalities: r.get(6)?,
+            })
+        })
+        .ok()?;
+
+    let mut cands = Vec::new();
+    for row in rows.flatten() {
+        cands.push(row);
+    }
+    Some(cands)
+}
+
+/// 跨 provider 池版任务路由：候选 = pool 内全部 enabled 模型（排除主模型）。
+/// 规则与 `pick_model_for_task` 一致；参照上下文/价格来自 (main_provider_id, main_model)。
+pub fn pick_model_for_task_in_pool(
+    conn: &Connection,
+    pool: &[String],
+    main_provider_id: &str,
+    main_model: &str,
+    kind: TaskKind,
+) -> Option<RoutedModel> {
+    let main_ctx: i64 = conn
+        .query_row(
+            "SELECT context_limit FROM models WHERE provider_id = ?1 AND model_id = ?2",
+            rusqlite::params![main_provider_id, main_model],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let main_total: f64 = conn
+        .query_row(
+            "SELECT input_price_per_mtok + output_price_per_mtok FROM models
+             WHERE provider_id = ?1 AND model_id = ?2",
+            rusqlite::params![main_provider_id, main_model],
+            |r| r.get::<_, f64>(0),
+        )
+        .unwrap_or(0.0);
+
+    let mut cands = load_pool_candidates(conn, pool, main_provider_id, main_model)?;
+    cands.retain(|c| {
+        if kind.needs_tool_call() && !c.tool_call {
+            return false;
+        }
+        if kind.required_input() == "image" && !modalities_include(&c.input_modalities, "image") {
+            return false;
+        }
+        // 未定价模型不参与自动路由（避免选到未知昂贵模型）
+        c.input_price + c.output_price > 0.0
+    });
+    if cands.is_empty() {
+        return None;
+    }
+
+    match kind {
+        TaskKind::Fast | TaskKind::Vision => {
+            cands.sort_by(|a, b| {
+                (a.input_price + a.output_price)
+                    .partial_cmp(&(b.input_price + b.output_price))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            cands.first().map(|c| RoutedModel {
+                provider_id: c.provider_id.clone(),
+                model_id: c.model_id.clone(),
+            })
+        }
+        TaskKind::Code => {
+            cands.sort_by(|a, b| {
+                b.context_limit.cmp(&a.context_limit).then_with(|| {
+                    (a.input_price + a.output_price)
+                        .partial_cmp(&(b.input_price + b.output_price))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
+            cands
+                .into_iter()
+                .find(|r| r.context_limit >= main_ctx)
+                .map(|r| RoutedModel {
+                    provider_id: r.provider_id,
+                    model_id: r.model_id,
+                })
+        }
+        TaskKind::Chat => {
+            if main_total <= 0.0 {
+                return None;
+            }
+            cands.retain(|r| r.input_price + r.output_price <= main_total);
+            if cands.is_empty() {
+                return None;
+            }
+            cands.sort_by(|a, b| {
+                (a.input_price + a.output_price)
+                    .partial_cmp(&(b.input_price + b.output_price))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            cands.first().map(|c| RoutedModel {
+                provider_id: c.provider_id.clone(),
+                model_id: c.model_id.clone(),
+            })
+        }
+    }
+}
+
+/// 跨 provider 池版经济路由：比主模型更便宜的最便宜 tool 款（标题/摘要/子 Agent 杂活）。
+/// 约束：enabled=1、支持工具调用、排除主模型；只有严格更便宜才切换。
+pub fn pick_economy_in_pool(
+    conn: &Connection,
+    pool: &[String],
+    main_provider_id: &str,
+    main_model: &str,
+) -> Option<RoutedModel> {
+    let main_total: f64 = conn
+        .query_row(
+            "SELECT input_price_per_mtok + output_price_per_mtok FROM models
+             WHERE provider_id = ?1 AND model_id = ?2",
+            rusqlite::params![main_provider_id, main_model],
+            |r| r.get::<_, f64>(0),
+        )
+        .ok()?;
+    if main_total <= 0.0 {
+        return None;
+    }
+    let mut cands = load_pool_candidates(conn, pool, main_provider_id, main_model)?;
+    cands.retain(|c| {
+        c.tool_call
+            && c.input_price + c.output_price > 0.0
+            && c.input_price + c.output_price < main_total
+    });
+    cands.sort_by(|a, b| {
+        (a.input_price + a.output_price)
+            .partial_cmp(&(b.input_price + b.output_price))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    cands.first().map(|c| RoutedModel {
+        provider_id: c.provider_id.clone(),
+        model_id: c.model_id.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +759,48 @@ mod tests {
             pick_model_for_task(&conn, "p1", "main", TaskKind::Fast).as_deref(),
             Some("no_tool_cheap")
         );
+    }
+
+    #[test]
+    fn test_pick_economy_in_pool_cross_provider() {
+        let conn = setup();
+        insert(&conn, "1", "p1", "main", 1, 30.0, 60.0, 1);
+        insert(&conn, "2", "p2", "cheap_elsewhere", 1, 0.1, 0.2, 1);
+        let pool = vec!["p1".to_string(), "p2".to_string()];
+        let r = pick_economy_in_pool(&conn, &pool, "p1", "main").unwrap();
+        assert_eq!(r.provider_id, "p2");
+        assert_eq!(r.model_id, "cheap_elsewhere");
+    }
+
+    #[test]
+    fn test_pick_economy_in_pool_same_provider() {
+        let conn = setup();
+        insert(&conn, "1", "p1", "main", 1, 30.0, 60.0, 1);
+        insert(&conn, "2", "p1", "cheap", 1, 2.0, 8.0, 1);
+        let pool = vec!["p1".to_string()];
+        let r = pick_economy_in_pool(&conn, &pool, "p1", "main").unwrap();
+        assert_eq!(r.provider_id, "p1");
+        assert_eq!(r.model_id, "cheap");
+    }
+
+    #[test]
+    fn test_pick_economy_in_pool_excludes_main_and_disabled() {
+        let conn = setup();
+        insert(&conn, "1", "p1", "main", 1, 30.0, 60.0, 1);
+        // 更便宜但禁用，且无其他便宜候选 → 不切换
+        insert(&conn, "2", "p2", "disabled_cheap", 1, 0.1, 0.2, 0);
+        let pool = vec!["p1".to_string(), "p2".to_string()];
+        assert!(pick_economy_in_pool(&conn, &pool, "p1", "main").is_none());
+    }
+
+    #[test]
+    fn test_pick_model_for_task_in_pool_chat_picks_cheaper() {
+        let conn = setup();
+        insert_full(&conn, "1", "p1", "main", 1, 8192, 30.0, 60.0, "[\"text\"]");
+        insert_full(&conn, "2", "p2", "cheap", 1, 8192, 2.0, 8.0, "[\"text\"]");
+        let pool = vec!["p1".to_string(), "p2".to_string()];
+        let r = pick_model_for_task_in_pool(&conn, &pool, "p1", "main", TaskKind::Chat).unwrap();
+        assert_eq!(r.provider_id, "p2");
+        assert_eq!(r.model_id, "cheap");
     }
 }

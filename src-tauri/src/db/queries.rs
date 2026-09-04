@@ -6,7 +6,7 @@ pub fn list_providers(conn: &Connection) -> Result<Vec<Provider>, rusqlite::Erro
         "SELECT id, name, provider_type, protocol, base_url, api_key, npm_package,
                 is_active, in_failover_queue, priority, cost_multiplier,
                 limit_daily_cny, limit_monthly_cny, settings_json, notes, icon,
-                created_at, updated_at, endpoints_json
+                created_at, updated_at, endpoints_json, auto_pool_mode
          FROM providers ORDER BY is_active DESC, priority ASC, name ASC"
     )?;
 
@@ -31,6 +31,7 @@ pub fn list_providers(conn: &Connection) -> Result<Vec<Provider>, rusqlite::Erro
             settings_json: row.get(13)?,
             notes: row.get(14)?,
             icon: row.get(15)?,
+            auto_pool_mode: row.get(19)?,
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
         })
@@ -44,7 +45,7 @@ pub fn get_provider(conn: &Connection, id: &str) -> Result<Option<Provider>, rus
         "SELECT id, name, provider_type, protocol, base_url, api_key, npm_package,
                 is_active, in_failover_queue, priority, cost_multiplier,
                 limit_daily_cny, limit_monthly_cny, settings_json, notes, icon,
-                created_at, updated_at, endpoints_json
+                created_at, updated_at, endpoints_json, auto_pool_mode
          FROM providers WHERE id = ?1"
     )?;
 
@@ -69,6 +70,7 @@ pub fn get_provider(conn: &Connection, id: &str) -> Result<Option<Provider>, rus
             settings_json: row.get(13)?,
             notes: row.get(14)?,
             icon: row.get(15)?,
+            auto_pool_mode: row.get(19)?,
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
         })
@@ -82,14 +84,15 @@ pub fn insert_provider(conn: &Connection, p: &Provider) -> Result<(), rusqlite::
         "INSERT INTO providers (id, name, provider_type, protocol, base_url, api_key, npm_package,
             is_active, in_failover_queue, priority, cost_multiplier,
             limit_daily_cny, limit_monthly_cny, settings_json, notes, icon,
-            created_at, updated_at, endpoints_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            created_at, updated_at, endpoints_json, auto_pool_mode)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             p.id, p.name, p.provider_type, p.protocol, p.base_url, p.api_key, p.npm_package,
             p.is_active, p.in_failover_queue, p.priority, p.cost_multiplier,
             p.limit_daily_cny, p.limit_monthly_cny, p.settings_json, p.notes, p.icon,
             p.created_at, p.updated_at,
             serde_json::to_string(&p.endpoints).unwrap_or_else(|_| "[]".into()),
+            p.auto_pool_mode,
         ],
     )?;
     Ok(())
@@ -100,7 +103,8 @@ pub fn update_provider(conn: &Connection, p: &Provider) -> Result<(), rusqlite::
         "UPDATE providers SET name=?2, provider_type=?3, base_url=?4, api_key=?5,
             npm_package=?6, is_active=?7, in_failover_queue=?8, priority=?9,
             cost_multiplier=?10, limit_daily_cny=?11, limit_monthly_cny=?12,
-            settings_json=?13, notes=?14, icon=?15, updated_at=?16, endpoints_json=?17
+            settings_json=?13, notes=?14, icon=?15, updated_at=?16, endpoints_json=?17,
+            auto_pool_mode=?18
          WHERE id=?1",
         params![
             p.id, p.name, p.provider_type, p.base_url, p.api_key, p.npm_package,
@@ -108,6 +112,7 @@ pub fn update_provider(conn: &Connection, p: &Provider) -> Result<(), rusqlite::
             p.limit_daily_cny, p.limit_monthly_cny, p.settings_json, p.notes, p.icon,
             p.updated_at,
             serde_json::to_string(&p.endpoints).unwrap_or_else(|_| "[]".into()),
+            p.auto_pool_mode,
         ],
     )?;
     Ok(())

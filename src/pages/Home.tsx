@@ -2493,7 +2493,7 @@ export default function Home() {
   const updateModelOptions = (next: ChatOptions) => {
     setModelOptions(next)
     setJSON(STORAGE_KEYS.CHAT_OPTIONS, next)
-    if (currentConversation) {
+    if (currentConversation && next.model_id !== 'auto') {
       // 后端写入完成后再刷新可视条（避免竞态读到旧 model_id 的 context_limit）
       void setConversationModel(currentConversation.id, next.model_id ?? '')
         .then(() =>

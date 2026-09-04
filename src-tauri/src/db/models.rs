@@ -27,6 +27,8 @@ pub struct Provider {
     pub settings_json: String,
     pub notes: Option<String>,
     pub icon: Option<String>,
+    /// auto 池三态：0=不参与，1=仅主对话，2=主对话+杂活
+    pub auto_pool_mode: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }

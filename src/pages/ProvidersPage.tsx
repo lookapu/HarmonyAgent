@@ -1022,6 +1022,31 @@ export default function ProvidersPage() {
                   )}
                 </div>
                 <p className="text-xs font-mono text-[var(--text-secondary)] mt-1 break-all">{p.base_url}</p>
+                {/* Auto 池三态：不参与 / 仅主对话 / 主对话+杂活 */}
+                <div className="flex items-center gap-1.5 mt-1.5">
+                  <span className="text-[10px] text-[var(--text-muted)]">{t('provider.autoPool')}</span>
+                  <div className="flex rounded-md border border-[var(--border)] overflow-hidden">
+                    {(
+                      [
+                        [0, t('provider.autoPoolOff')],
+                        [1, t('provider.autoPoolMain')],
+                        [2, t('provider.autoPoolMainAux')],
+                      ] as const
+                    ).map(([mode, label]) => (
+                      <button
+                        key={mode}
+                        onClick={() => void updateProvider(p.id, { auto_pool_mode: mode }).then(load).catch((e) => console.error(e))}
+                        className={`px-2 py-0.5 text-[10px] transition-colors ${
+                          p.auto_pool_mode === mode
+                            ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
+                            : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 {(p.endpoints?.length ?? 0) > 0 && (
                   <div className="flex gap-1.5 flex-wrap mt-1.5">
                     {p.endpoints.map((ep) => (

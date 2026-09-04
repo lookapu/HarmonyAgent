@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::db::models::{ChatMessage, McpServer, TaskRun};
 use crate::db::DbState;
-use crate::services::{model_router, tool_limits};
+use crate::services::tool_limits;
 use crate::utils::errors::{
     classify_text, parse_retry_after_secs, provider_error_with_retry_after, transport_error, ErrorKind,
     FriendlyError,
@@ -1605,6 +1605,115 @@ struct ModelChoice {
     output_limit: u32,
 }
 
+/// 按 provider id 加载 ProviderEndpoint（含 keyring key 与多协议端点）。
+fn load_provider_endpoint(
+    conn: &rusqlite::Connection,
+    provider_id: &str,
+) -> Option<ProviderEndpoint> {
+    let row = conn
+        .query_row(
+            "SELECT base_url, api_key, protocol, endpoints_json FROM providers WHERE id = ?1",
+            [provider_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .ok()?;
+    let endpoints: Vec<crate::db::models::EndpointDef> =
+        serde_json::from_str(&row.3).unwrap_or_default();
+    let mut ep = ProviderEndpoint {
+        provider_id: provider_id.to_string(),
+        base_url: row.0,
+        api_key: row.1,
+        protocol: row.2,
+        endpoints,
+    };
+    if let Ok(k) = crate::services::key_store::load_provider_key(conn, &ep.provider_id) {
+        ep.api_key = k;
+    }
+    Some(ep)
+}
+
+/// 按 (provider_id, model_id) 加载 ModelChoice（含代理开关与输出上限）。
+fn load_model_choice(
+    conn: &rusqlite::Connection,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<ModelChoice> {
+    let row = conn
+        .query_row(
+            "SELECT use_proxy, output_limit FROM models
+             WHERE provider_id = ?1 AND model_id = ?2 AND enabled = 1",
+            rusqlite::params![provider_id, model_id],
+            |r| Ok((r.get::<_, bool>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .ok()?;
+    Some(ModelChoice {
+        provider_id: provider_id.to_string(),
+        model: model_id.to_string(),
+        use_proxy: row.0,
+        output_limit: row.1.unwrap_or(8192) as u32,
+    })
+}
+
+/// 读取 auto 池的 provider id 列表。active provider 恒在池内（视为满足任意 min_mode）；
+/// 其余 provider 按 auto_pool_mode >= min_mode 过滤。
+/// - 主对话路由用 min_mode=1（仅主对话 / 主对话+杂活）
+/// - 辅助调用路由用 min_mode=2（仅主对话+杂活）
+fn auto_pool_ids(conn: &rusqlite::Connection, min_mode: i64) -> Vec<String> {
+    let mut ids: Vec<String> = conn
+        .prepare("SELECT id FROM providers WHERE is_active = 1")
+        .and_then(|mut s| {
+            let rows = s.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.flatten().collect::<Vec<String>>())
+        })
+        .unwrap_or_default();
+    let extra: Vec<String> = conn
+        .prepare("SELECT id FROM providers WHERE auto_pool_mode >= ?1 AND is_active = 0")
+        .and_then(|mut s| {
+            let rows = s.query_map([min_mode], |r| r.get::<_, String>(0))?;
+            Ok(rows.flatten().collect::<Vec<String>>())
+        })
+        .unwrap_or_default();
+    for id in extra {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// 为辅助调用（摘要/标题/子 Agent 杂活）在 auto 辅助池内解析经济模型。
+/// 命中且更便宜时返回 (端点, 模型)；否则 None（调用方沿用主模型）。
+fn resolve_aux_economy(
+    state: &tauri::State<'_, DbState>,
+    main_provider: &ProviderEndpoint,
+    main_choice: &ModelChoice,
+) -> Option<(ProviderEndpoint, ModelChoice)> {
+    let conn = state.0.lock().ok()?;
+    let pool = auto_pool_ids(&conn, 2);
+    let routed = crate::services::model_router::pick_economy_in_pool(
+        &conn,
+        &pool,
+        &main_provider.provider_id,
+        &main_choice.model,
+    )?;
+    if routed.provider_id == main_provider.provider_id {
+        let mut mc = main_choice.clone();
+        mc.model = routed.model_id;
+        Some((main_provider.clone(), mc))
+    } else {
+        let ep = load_provider_endpoint(&conn, &routed.provider_id)?;
+        let mc = load_model_choice(&conn, &routed.provider_id, &routed.model_id)?;
+        Some((ep, mc))
+    }
+}
+
 /// 对话级设置（来自对话框，随每次请求覆盖 Provider/模型默认值）
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct ChatOptions {
@@ -2910,7 +3019,94 @@ async fn stream_chat_inner(
 
     // 3. 选择 Provider 与模型（支持对话级指定模型）
     let opts = options.unwrap_or_default();
-    let (provider, model_choice, context_budget) = if let Some(model_id) = opts.model_id.clone() {
+    let (provider, model_choice, context_budget) = if opts.model_id.as_deref() == Some("auto") {
+        // auto 模式：锚点 = active provider 默认模型，候选 = auto 池（active + auto_pool_mode>=1）
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let anchor_id: String = conn
+            .query_row(
+                "SELECT id FROM providers WHERE is_active = 1 LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let anchor_ep = load_provider_endpoint(&conn, &anchor_id)
+            .ok_or_else(|| "激活 Provider 配置缺失".to_string())?;
+        let (default_model, default_use_proxy, default_ctx_opt, default_out_opt) = conn
+            .query_row(
+                "SELECT model_id, use_proxy, context_limit, output_limit FROM models
+                 WHERE provider_id = ?1 AND enabled = 1
+                 ORDER BY is_default DESC, created_at ASC LIMIT 1",
+                [&anchor_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, bool>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let default_ctx = default_ctx_opt.unwrap_or(200000);
+        let default_out = default_out_opt.unwrap_or(8192) as u32;
+
+        let pool = auto_pool_ids(&conn, 1);
+        let has_images = images.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let kind = crate::services::model_router::classify_task(&content, has_images, false);
+        let routed = crate::services::model_router::pick_model_for_task_in_pool(
+            &conn,
+            &pool,
+            &anchor_id,
+            &default_model,
+            kind,
+        );
+
+        let fallback = (
+            anchor_ep.clone(),
+            ModelChoice {
+                provider_id: anchor_id.clone(),
+                model: default_model.clone(),
+                use_proxy: default_use_proxy,
+                output_limit: default_out,
+            },
+            default_ctx,
+        );
+
+        match routed {
+            Some(r) => {
+                let ep_opt = if r.provider_id == anchor_id {
+                    Some(anchor_ep.clone())
+                } else {
+                    load_provider_endpoint(&conn, &r.provider_id)
+                };
+                match ep_opt {
+                    Some(ep) => {
+                        let mc = load_model_choice(&conn, &r.provider_id, &r.model_id)
+                            .unwrap_or(ModelChoice {
+                                provider_id: r.provider_id.clone(),
+                                model: r.model_id.clone(),
+                                use_proxy: default_use_proxy,
+                                output_limit: default_out,
+                            });
+                        let ctx: i64 = conn
+                            .query_row(
+                                "SELECT context_limit FROM models
+                                 WHERE provider_id = ?1 AND model_id = ?2",
+                                rusqlite::params![&r.provider_id, &r.model_id],
+                                |row| {
+                                    row.get::<_, Option<i64>>(0)
+                                        .map(|v| v.unwrap_or(default_ctx))
+                                },
+                            )
+                            .unwrap_or(default_ctx);
+                        (ep, mc, ctx)
+                    }
+                    None => fallback,
+                }
+            }
+            None => fallback,
+        }
+    } else if let Some(model_id) = opts.model_id.clone() {
         // 对话指定模型：跨 Provider 查询
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(
@@ -3060,11 +3256,13 @@ async fn stream_chat_inner(
     // 记住会话绑定的模型（models.id）：上下文可视条按会话模型查 context_limit，
     // 后续任务缺省沿用上次使用的模型（自动路由分支不写，保持默认路由）
     if let Some(ref mid) = opts.model_id {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
-        let _ = conn.execute(
-            "UPDATE conversations SET model_id = ?1 WHERE id = ?2",
-            params![mid, conversation_id],
-        );
+        if mid.as_str() != "auto" {
+            let conn = state.0.lock().map_err(|e| e.to_string())?;
+            let _ = conn.execute(
+                "UPDATE conversations SET model_id = ?1 WHERE id = ?2",
+                params![mid, conversation_id],
+            );
+        }
     }
     // 记录本次任务使用的 Provider / 模型（供任务级 Trace 聚合）
     stats.provider_id = Some(provider.provider_id.clone());
@@ -8700,20 +8898,10 @@ fn resolve_agent_model(
             ));
         }
     }
-    // 3) 未指定任何模型：自动路由到同 Provider 更便宜的模型（简单任务成本优化）
-    if let Some(econ) =
-        model_router::pick_economy_model(&conn, &main_provider.provider_id, &main_choice.model)
-    {
-        return Ok((
-            main_provider.clone(),
-            ModelChoice {
-                provider_id: main_provider.provider_id.clone(),
-                model: econ,
-                use_proxy: main_choice.use_proxy,
-                // 经济模型未单独查询 output_limit：沿用主模型值（同 Provider 配置通常一致）
-                output_limit: main_choice.output_limit,
-            },
-        ));
+    // 3) 未指定任何模型：自动路由到 auto 辅助池更便宜的模型（简单任务成本优化）
+    drop(conn);
+    if let Some((ep, mc)) = resolve_aux_economy(state, main_provider, main_choice) {
+        return Ok((ep, mc));
     }
     // 4) 跟随主模型
     Ok((main_provider.clone(), main_choice.clone()))
@@ -10332,13 +10520,10 @@ async fn summarize_rolling_history(
     };
 
     // 4. 经济模型（非核心推理：有更便宜模型时用它省主模型预算；无则回退主模型）
-    let summary_model = {
-        let conn = state.0.lock().ok()?;
-        model_router::pick_economy_model(&conn, &provider.provider_id, &model_choice.model)
-            .unwrap_or_else(|| model_choice.model.clone())
+    let (summary_provider, summary_choice) = match resolve_aux_economy(state, provider, model_choice) {
+        Some((ep, mc)) => (ep, mc),
+        None => (provider.clone(), model_choice.clone()),
     };
-    let mut summary_choice = model_choice.clone();
-    summary_choice.model = summary_model;
 
     // 5. 结构化摘要（4 段式模板；已有旧摘要时增量更新）
     let prev_note = match prev_summary {
@@ -10377,7 +10562,7 @@ async fn summarize_rolling_history(
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1000 << (attempt - 1))).await;
         }
-        match non_stream_request(client, provider, &summary_choice, &messages, cancel, conversation_id, Some(summary_max_tokens))
+        match non_stream_request(client, &summary_provider, &summary_choice, &messages, cancel, conversation_id, Some(summary_max_tokens))
             .await
         {
             Ok(s) => {
@@ -10937,7 +11122,7 @@ async fn generate_conversation_title(
     endpoints_json: String,
 ) -> Result<(), String> {
     let state = app.state::<DbState>();
-    // 1. Provider 默认模型 + 经济模型路由（无更便宜模型时跟随默认）
+    // 1. Provider 默认模型（锚点）+ 经济模型路由：辅助池内更便宜则跨 provider 切换
     let main_model: String = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(
@@ -10957,16 +11142,9 @@ async fn generate_conversation_title(
         )
         .unwrap_or(false)
     };
-    let model = {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
-        crate::services::model_router::pick_economy_model(&conn, &provider_id, &main_model)
-            .unwrap_or(main_model.clone())
-    };
-    // 2. 非流式请求：提炼标题（内容截断护栏：超长任务指令只取开头）
-    let client = crate::utils::net::build_client(use_proxy)?;
     let endpoints: Vec<crate::db::models::EndpointDef> =
         serde_json::from_str(&endpoints_json).unwrap_or_default();
-    let mut ep = ProviderEndpoint {
+    let mut main_ep = ProviderEndpoint {
         provider_id: provider_id.clone(),
         base_url,
         api_key,
@@ -10977,8 +11155,20 @@ async fn generate_conversation_title(
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         crate::services::key_store::load_provider_key(&conn, &provider_id)
     } {
-        ep.api_key = k;
+        main_ep.api_key = k;
     }
+    let main_mc = ModelChoice {
+        provider_id: provider_id.clone(),
+        model: main_model.clone(),
+        use_proxy,
+        output_limit: 8192,
+    };
+    let (ep, mc) = match resolve_aux_economy(&state, &main_ep, &main_mc) {
+        Some((e, m)) => (e, m),
+        None => (main_ep, main_mc),
+    };
+    // 2. 非流式请求：提炼标题（内容截断护栏：超长任务指令只取开头）
+    let client = crate::utils::net::build_client(mc.use_proxy)?;
     let snippet: String = first_content.chars().take(400).collect();
     // 标题语言跟随首条消息：检测到具体语言则点名（如“中文/英文”），否则不限定语言
     let lang_hint = crate::services::language::detect_language(&snippet)
@@ -10994,7 +11184,7 @@ async fn generate_conversation_title(
         )
     };
     let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
-    let text = non_stream_request(&client, &ep, &ModelChoice { provider_id, model: model.clone(), use_proxy, output_limit: 8192 }, &messages, None, "", None).await?;
+    let text = non_stream_request(&client, &ep, &mc, &messages, None, "", None).await?;
     let title: String = text
         .trim()
         .trim_matches(|c| matches!(c, '"' | '“' | '”' | '「' | '」' | '\''))
@@ -11130,8 +11320,8 @@ pub async fn compact_conversation(
     if total <= keep + 2 {
         return Err("会话历史较短，无需压缩".into());
     }
-    // 激活 provider + 模型
-    let (provider, model_choice) = {
+    // 激活 provider（锚点）
+    let (main_ep, main_mc) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         let row = conn
             .query_row(
@@ -11165,17 +11355,17 @@ pub async fn compact_conversation(
         if let Ok(k) = crate::services::key_store::load_provider_key(&conn, &ep.provider_id) {
             ep.api_key = k;
         }
-        (
-            ep.clone(),
-            ModelChoice {
-                provider_id: ep.provider_id.clone(),
-                model: model_router::pick_economy_model(&conn, &ep.provider_id, &row.5)
-                    .unwrap_or_else(|| row.5.clone()),
-                use_proxy: row.6,
-                output_limit: 8192,
-            },
-        )
+        let mc = ModelChoice {
+            provider_id: ep.provider_id.clone(),
+            model: row.5.clone(),
+            use_proxy: row.6,
+            output_limit: 8192,
+        };
+        (ep, mc)
     };
+    // 经济模型路由：辅助池内更便宜则跨 provider 切换（无更便宜时跟随锚点）
+    let (provider, model_choice) =
+        resolve_aux_economy(&state, &main_ep, &main_mc).unwrap_or((main_ep, main_mc));
     let client = crate::utils::net::build_client(model_choice.use_proxy)?;
     let ctx_limit: Option<i64> = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
@@ -11524,8 +11714,8 @@ pub async fn summarize_memory(
         return Err("会话还没有可总结的内容".into());
     }
 
-    // 2. 当前激活 Provider + 默认模型（非流式一次请求）
-    let (provider, model_choice) = {
+    // 2. 当前激活 Provider（锚点）
+    let (main_ep, main_mc) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         let row = conn
             .query_row(
@@ -11559,18 +11749,17 @@ pub async fn summarize_memory(
         if let Ok(k) = crate::services::key_store::load_provider_key(&conn, &ep.provider_id) {
             ep.api_key = k;
         }
-        (
-            ep.clone(),
-            ModelChoice {
-                provider_id: ep.provider_id.clone(),
-                // 记忆提取属非核心推理：有更便宜模型时用经济模型（省主模型预算）
-                model: model_router::pick_economy_model(&conn, &ep.provider_id, &row.5)
-                    .unwrap_or_else(|| row.5.clone()),
-                use_proxy: row.6,
-                output_limit: 8192,
-            },
-        )
+        let mc = ModelChoice {
+            provider_id: ep.provider_id.clone(),
+            model: row.5.clone(),
+            use_proxy: row.6,
+            output_limit: 8192,
+        };
+        (ep, mc)
     };
+    // 记忆提取属非核心推理：辅助池内更便宜则跨 provider 切换（无更便宜时跟随锚点）
+    let (provider, model_choice) =
+        resolve_aux_economy(&state, &main_ep, &main_mc).unwrap_or((main_ep, main_mc));
 
     // 3. 请求 LLM 提取（JSON 输出；解析失败时给出可读错误）
     let client = crate::utils::net::build_client(model_choice.use_proxy)?;
