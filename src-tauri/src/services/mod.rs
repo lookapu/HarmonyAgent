@@ -42,6 +42,7 @@ pub mod ohpm_landscape;
 pub mod ohpm_audit;
 pub mod permissions;
 pub mod proxy_service;
+pub mod repo_watcher;
 pub mod reminders;
 pub mod runtime_progress;
 pub mod seed;

@@ -3645,7 +3645,7 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         .map_err(|e| e.to_string())?;
     let mut out = String::new();
     out.push_str(&format!(
-        "结构查询：匹配 {}，第 {} 页（每页 {}）；已解析 {} 个源码文件 / {} 个结构；全库目录发现 {} 个文件（源码 {}，延期 {}，超大 {}，不可读文件/目录 {}/{}，持久化 {}）；coverage={}；索引更新于 {} 秒前。\n",
+        "结构查询：匹配 {}，第 {} 页（每页 {}）；已解析 {} 个源码文件 / {} 个结构；全库目录发现 {} 个文件（源码 {}，延期 {}，超大 {}，不可读文件/目录 {}/{}，持久化 {}）；watcher={}；coverage={}；索引更新于 {} 秒前。\n",
         result.total_matches,
         result.page,
         result.page_size,
@@ -3658,6 +3658,7 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         result.catalog.unreadable_files,
         result.catalog.unreadable_directories,
         if result.catalog.persisted { "是" } else { "否" },
+        if result.watcher_active { "active" } else { "poll-fallback" },
         result.coverage,
         result.synced_ago_secs,
     ));

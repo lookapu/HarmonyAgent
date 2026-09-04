@@ -63,7 +63,11 @@ MVP 的范围估算仍是轻量规则扫描。大括号出现在字符串/注释
 
 超大源码也必须在目录中可达；可以暂不建立全文倒排，但不能从目录和 coverage 中消失。
 
-本轮已经完成目录层的第一版：所有未忽略文件流式写入独立 SQLite，不把全量路径堆进内存；记录 `indexed/deferred/oversized/unsupported/symlink/unreadable` 状态和一级目录 shard。`find_files` 优先查询该目录，支持状态过滤和分页；结构查询同时报告发现、解析、延期、超大和不可读数量。当前仍通过周期性 walk 校正，下一步用 watcher + Git diff 替代高频全树遍历并把单库数据库进一步拆成物理 shard。
+目录层第一版已经完成：所有未忽略文件流式写入独立 SQLite，不把全量路径堆进内存；记录 `indexed/deferred/oversized/unsupported/symlink/unreadable` 状态和一级目录 shard。`find_files` 优先查询该目录，支持状态过滤和分页；结构查询同时报告发现、解析、延期、超大和不可读数量。
+
+原生跨平台 watcher 也已接入：第一次建立索引时懒启动，忽略纯访问事件，将编辑器常见的 create/modify/remove/rename 事件按 200 ms 合并，先精准失效相关符号，再把全库一致性校验延迟到下一次真实查询。稳定仓库不再每 30 秒反复 walk；watcher 启动失败时保留 30 秒周期扫描，active 时仍每 5 分钟低频校验，防止监听器“创建成功但不投递”或静默失效。收到系统 `Rescan` 标志、空路径事件或监听错误时立即要求校验。最多保留 16 个项目 watcher，按最近使用淘汰，避免系统句柄泄漏。
+
+watcher 不是唯一真相：网络文件系统可能没有事件，Linux 可能达到 inotify watch 限额，大目录也可能发生事件队列溢出。后续仍需 Git diff/name-status 作为低成本校验来源，并把单库数据库进一步拆成物理 shard。[notify 官方文档](https://docs.rs/notify/latest/notify/)也明确要求在 `need_rescan` 时重建内存状态，并提示大型目录可能漏事件。
 
 当前机器的 10k 合成源码复测中，全目录发现 10,000 个文件，冷扫描约 266 ms、热查询约 0 ms；结构层解析 4,000 个并明确报告 6,000 个 deferred。该结果证明目录不再静默截断，但不等于已经通过 100k/1M 验收；后两档必须在物理分片和 watcher 完成后正式发布数据。
 
@@ -104,8 +108,9 @@ MVP 的范围估算仍是轻量规则扫描。大括号出现在字符串/注释
 
 ## 7. 下一实现顺序
 
-1. 用 watcher + Git diff 增量维护目录，并把单库 SQLite 按 module/shard 拆分。
-2. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
-3. 接入 Tree-sitter/ArkTS 容错解析，替换 MVP 的范围估算。
-4. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
-5. 用 10k/100k/1M 基准和真实任务轨迹持续验证召回率、延迟与上下文节省量。
+1. 增加 Git diff/name-status 校验，并把 watcher 事件直接增量写入目录数据库。
+2. 把单库 SQLite 按 module/shard 拆分，结构节点/关系边转为数据库分页查询。
+3. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
+4. 接入 Tree-sitter/ArkTS 容错解析，替换 MVP 的范围估算。
+5. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
+6. 用 10k/100k/1M 基准和真实任务轨迹持续验证召回率、延迟与上下文节省量。

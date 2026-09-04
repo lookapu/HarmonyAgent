@@ -625,6 +625,8 @@ struct CacheEntry {
     files: HashMap<String, FileStamp>,
     syms: Vec<Symbol>,
     catalog: CatalogStats,
+    /// watcher 检测到外部变化或丢事件后，下一次查询执行全库一致性校验。
+    needs_reconciliation: bool,
     /// 最近一次增量同步的秒：冷却期内直接复用内存结果（Agent 修改文件会主动精确失效）
     last_sync: u64,
     /// 数据来源：disk（磁盘恢复）/ scan（本次会话扫描建立），供面板展示缓存状态
@@ -646,6 +648,8 @@ pub fn init_cache_dir(dir: PathBuf) {
 // 全库目录会覆盖所有未忽略文件，避免高频查询反复遍历百万文件；工具内修改仍会精确失效。
 // watcher/Git diff 补偿接入后可进一步延长或移除周期性 walk。
 const SYNC_COOLDOWN_SECS: u64 = 30;
+/// 即使 watcher 自称 active，也要低频校验，防止网络盘、队列溢出或静默失效永久污染索引。
+const WATCHER_RECONCILE_SECS: u64 = 5 * 60;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -807,6 +811,11 @@ fn sync_incremental(
 pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
     let key = canonical_key(root);
     let now = now_secs();
+    // watcher 初始化可能触发底层线程；必须在符号缓存锁之外执行，避免回调反向失效死锁。
+    #[cfg(not(test))]
+    let watcher_active = crate::services::repo_watcher::ensure_watching(root);
+    #[cfg(test)]
+    let watcher_active = false;
     // 阶段 1：锁内取快照（克隆 files/syms + 记录 last_sync），冷却期内直接复用。
     let (mut files, mut syms, snap_sync) = {
         let mut guard = cache().lock().unwrap();
@@ -814,6 +823,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
             files: HashMap::new(),
             syms: Vec::new(),
             catalog: CatalogStats::default(),
+            needs_reconciliation: false,
             last_sync: 0,
             source: "scan",
         });
@@ -826,8 +836,17 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
                 entry.source = "disk";
             }
         }
-        // 冷却期内直接复用（空项目除外：可能刚建了新文件）
-        if now.saturating_sub(entry.last_sync) < SYNC_COOLDOWN_SECS && !entry.syms.is_empty() {
+        // 已完成过同步即可复用；空项目/无可识别符号的项目由 watcher 捕获新文件，
+        // watcher 不可用时仍按冷却周期扫描。
+        if !entry.needs_reconciliation
+            && entry.last_sync > 0
+            && now.saturating_sub(entry.last_sync)
+                < if watcher_active {
+                    WATCHER_RECONCILE_SECS
+                } else {
+                    SYNC_COOLDOWN_SECS
+                }
+        {
             return entry.syms.clone();
         }
         (entry.files.clone(), entry.syms.clone(), entry.last_sync)
@@ -842,6 +861,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
             entry.files = files;
             entry.syms = syms;
             entry.catalog = catalog;
+            entry.needs_reconciliation = false;
             entry.last_sync = now;
             save_persisted(root, &entry.files, &entry.syms, entry.catalog);
         }
@@ -876,6 +896,26 @@ pub fn invalidate_cache(root: &Path) {
             let _ = fs::remove_file(candidate);
         }
     }
+}
+
+/// watcher 的最终一致性闩锁：不在事件线程里做全库扫描，推迟到下一次真实查询。
+pub fn request_reconciliation(root: &Path) {
+    let key = canonical_key(root);
+    if let Ok(mut guard) = cache().lock() {
+        if let Some(entry) = guard.get_mut(&key) {
+            entry.needs_reconciliation = true;
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn reconciliation_pending(root: &Path) -> bool {
+    let key = canonical_key(root);
+    cache()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&key).map(|entry| entry.needs_reconciliation))
+        .unwrap_or(false)
 }
 
 /// 增量失效：仅更新指定文件（写/改/删）的符号，其余文件复用缓存。
@@ -985,6 +1025,7 @@ pub struct StructureQueryResult {
     pub indexed_files: usize,
     pub indexed_symbols: usize,
     pub catalog: CatalogStats,
+    pub watcher_active: bool,
     pub coverage: String,
     pub synced_ago_secs: u64,
 }
@@ -1065,6 +1106,7 @@ pub fn query_structure(
         indexed_files,
         indexed_symbols: syms.len(),
         catalog,
+        watcher_active: crate::services::repo_watcher::is_watching(root),
         coverage,
         synced_ago_secs,
     }
@@ -1105,6 +1147,7 @@ pub struct SymbolIndexMeta {
     pub synced_ago_secs: u64,
     pub catalog: CatalogStats,
     pub coverage: String,
+    pub watcher_active: bool,
 }
 
 /// 查询索引元信息：内部先确保索引已构建且新鲜（有冷却/增量，不会重复全量扫描）
@@ -1121,6 +1164,7 @@ pub fn index_meta(root: &Path) -> SymbolIndexMeta {
             synced_ago_secs: now.saturating_sub(e.last_sync),
             catalog: e.catalog,
             coverage: e.catalog.coverage(),
+            watcher_active: crate::services::repo_watcher::is_watching(root),
         },
         // 条目被容量上限清空：仅能给出符号数（来源视为本次扫描）
         None => SymbolIndexMeta {
@@ -1130,6 +1174,7 @@ pub fn index_meta(root: &Path) -> SymbolIndexMeta {
             synced_ago_secs: 0,
             catalog: CatalogStats::default(),
             coverage: "unavailable".into(),
+            watcher_active: false,
         },
     }
 }
@@ -1374,6 +1419,7 @@ struct Detail {
             files: HashMap::new(),
             syms: Vec::new(),
             catalog: CatalogStats::default(),
+            needs_reconciliation: false,
             last_sync: 0,
             source: "scan",
         };

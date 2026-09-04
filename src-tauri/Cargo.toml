@@ -67,6 +67,7 @@ encoding_rs = "0.8"
 sha2 = "0.10"
 ring = "0.17"
 regex = "1"
+notify = "8.2"
 local-ip-address = "0.6"
 candle-core = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
