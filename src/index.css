@@ -12,10 +12,12 @@
    把 --text-primary / --text-secondary / --text-muted 声明进 @theme 会误注册字号 utility。
    颜色如需接入 Tailwind，只能走 --color-* 命名空间。 */
 @theme inline {
+  --radius-xs: var(--app-radius-xs);
   --radius-sm: var(--app-radius-sm);
   --radius-md: var(--app-radius-md);
   --radius-lg: var(--app-radius-lg);
   --radius-xl: var(--app-radius-xl);
+  --radius-2xl: var(--app-radius-2xl);
 
   --shadow-xs: var(--app-shadow-xs);
   --shadow-sm: var(--app-shadow-sm);
@@ -26,6 +28,14 @@
 
   --ease-out: var(--app-ease-out);
   --ease-spring: var(--app-ease-spring);
+}
+
+/* transition-colors 等不带时长的 utility 走这两个默认值。
+   Tailwind 默认 150ms + ease-in-out，hover 反馈读起来偏软；IDE 要「即时」，故收到 120ms。
+   注意：button/input/select/textarea 另有下方一条无层规则单独接管，不吃这里的默认值。 */
+@theme {
+  --default-transition-duration: 120ms;
+  --default-transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 /* ============ 主题变量：现代中性色系（精致分层 + 品牌强调） ============ */
@@ -88,12 +98,14 @@
   --scrollbar: rgba(255, 255, 255, 0.12);
   --icon-filter: brightness(0) invert(1);
 
-  --app-shadow-xs: 0 1px 1px rgba(0, 0, 0, 0.20);
-  --app-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
-  --app-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
-  --app-shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
-  --app-shadow-xl: 0 16px 40px rgba(0, 0, 0, 0.50);
-  --app-shadow-2xl: 0 20px 48px rgba(0, 0, 0, 0.55);
+  /* 阴影：IDE 靠 1px 描边分层，阴影只做「离开表面」的暗示，几何一律收紧。
+     xs 是发丝级（0 1px 0），用于贴在面板上的控件；2xl 才是浮层菜单级别。 */
+  --app-shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.20);
+  --app-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.30);
+  --app-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.35);
+  --app-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --app-shadow-xl: 0 12px 32px rgba(0, 0, 0, 0.50);
+  --app-shadow-2xl: 0 16px 40px rgba(0, 0, 0, 0.55);
   --app-ring: 0 0 0 3px var(--accent-soft);
 
   /* 动效常量：统一在 CSS 里管理，避免组件各自写魔法数 */
@@ -103,11 +115,30 @@
   --app-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --app-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 
-  /* 圆角层级 */
-  --app-radius-sm: 6px;
-  --app-radius-md: 10px;
-  --app-radius-lg: 14px;
-  --app-radius-xl: 18px;
+  /* 圆角层级：IDE 向收敛（原 6/10/14/18）。圆角越大越像 SaaS 营销卡片，
+     DevEco Studio / JetBrains 的控件普遍在 2-8px。 */
+  --app-radius-xs: 2px;
+  --app-radius-sm: 3px;
+  --app-radius-md: 5px;
+  --app-radius-lg: 8px;
+  --app-radius-xl: 10px;
+  --app-radius-2xl: 12px;
+
+  /* 字号阶梯：用于收敛全库 9 / 10 / 10.5 / 11 / 11.5 / 12 / 12.5 / 13 / 13.5 / 14px
+     这些任意值。仅供 src/components/ui/ 消费，**不要**映射进 @theme 的 --text-*——
+     那会改掉全库 245 处裸 text-xs 与 111 处 text-sm 的含义。 */
+  --app-text-2xs: 10px;
+  --app-lh-2xs: 14px;
+  --app-text-xs: 11px;
+  --app-lh-xs: 16px;
+  --app-text-sm: 12px;
+  --app-lh-sm: 18px;
+  --app-text-md: 13px;
+  --app-lh-md: 20px;
+  --app-text-base: 14px;
+  --app-lh-base: 22px;
+  --app-text-lg: 16px;
+  --app-lh-lg: 24px;
 
   /* 等宽数字：用于 token/时长/计数 */
   --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
@@ -170,25 +201,17 @@
   --scrollbar: rgba(15, 23, 42, 0.18);
   --icon-filter: brightness(0);
 
-  --app-shadow-xs: 0 1px 1px rgba(15, 23, 42, 0.04);
-  --app-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
-  --app-shadow-md: 0 2px 8px rgba(15, 23, 42, 0.06), 0 6px 20px rgba(15, 23, 42, 0.08);
-  --app-shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.10), 0 16px 48px rgba(15, 23, 42, 0.10);
-  --app-shadow-xl: 0 12px 32px rgba(15, 23, 42, 0.12), 0 20px 56px rgba(15, 23, 42, 0.10);
-  --app-shadow-2xl: 0 16px 40px rgba(15, 23, 42, 0.14), 0 28px 72px rgba(15, 23, 42, 0.12);
+  /* 阴影（亮色）：几何与暗色阶梯一致，基色用 slate 而非纯黑，避免在浅底上发脏 */
+  --app-shadow-xs: 0 1px 0 rgba(15, 23, 42, 0.06);
+  --app-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06), 0 1px 3px rgba(15, 23, 42, 0.08);
+  --app-shadow-md: 0 2px 8px rgba(15, 23, 42, 0.08);
+  --app-shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.10);
+  --app-shadow-xl: 0 12px 32px rgba(15, 23, 42, 0.12);
+  --app-shadow-2xl: 0 16px 40px rgba(15, 23, 42, 0.14);
   --app-ring: 0 0 0 3px var(--accent-soft);
 
-  /* 动效常量 + 圆角 + 等宽数字：与暗色主题一致 */
-  --app-motion-fast: 0.12s;
-  --app-motion-base: 0.18s;
-  --app-motion-slow: 0.25s;
-  --app-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --app-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-  --app-radius-sm: 6px;
-  --app-radius-md: 10px;
-  --app-radius-lg: 14px;
-  --app-radius-xl: 18px;
-  --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  /* 动效、圆角、字号阶梯、等宽字体都与主题无关，由 :root 统一提供，此处不再重复声明。
+     此前这里重复了一份完全相同的值，改阶梯时极易只改一边。 */
 }
 
 /* 基础重置（放入 base 层，避免覆盖 Tailwind utilities） */
@@ -415,7 +438,7 @@ button:focus-visible {
 .modern-card {
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--app-radius-lg);
   box-shadow: var(--app-shadow-sm);
 }
 
@@ -424,7 +447,7 @@ button:focus-visible {
   background: linear-gradient(135deg, var(--accent), var(--accent-hover));
   color: #fff;
   border: none;
-  border-radius: 10px;
+  border-radius: var(--app-radius-md);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.06) inset;
 }
 .btn-primary:hover:not(:disabled) {
@@ -440,7 +463,7 @@ button:focus-visible {
 .btn-ghost {
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--app-radius-md);
   color: var(--text-secondary);
 }
 .btn-ghost:hover:not(:disabled) {
