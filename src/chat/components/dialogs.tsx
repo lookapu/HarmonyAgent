@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useProjectStore } from '../../stores/projectStore'
 import type { MessageVersion, ChatMessage, MemoryDraft } from '../../api/project'
-import Icon from '../../icons/Icon'
 import { diffWords, type Change } from 'diff'
 import { ThumbDownIcon } from './messageBlocks'
+import { Modal } from '../../components/ui/Modal'
+import { Button } from '../../components/ui/Button'
 
 /* ============ 点踩反馈弹窗（可选原因） ============ */
 export function FeedbackDialog({ onSubmit, onCancel }: { onSubmit: (reason?: string) => void; onCancel: () => void }) {
@@ -12,46 +13,49 @@ export function FeedbackDialog({ onSubmit, onCancel }: { onSubmit: (reason?: str
   const [reason, setReason] = useState('')
   const reasons = ['内容不准确', '代码有错误', '没有帮助', '语气不合适', '其他']
   return (
-    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
-      <div className="w-[420px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
-        <div className="flex items-center gap-2">
-          <ThumbDownIcon filled />
-          <span className="text-[13px] font-semibold">{t('home.feedbackTitle')}</span>
-        </div>
-        <div className="mt-3 flex flex-wrap gap-1.5">
-          {reasons.map((r) => (
-            <button
-              key={r}
-              onClick={() => setReason(r)}
-              className={`px-2.5 py-1 rounded-lg text-[11px] border transition-colors ${reason === r ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger)]/10' : 'border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--text-muted)]'}`}
-            >
-              {r}
-            </button>
-          ))}
-        </div>
-        <textarea
-          value={reason}
-          onChange={(e) => setReason(e.target.value)}
-          placeholder={t('home.feedbackPlaceholder')}
-          rows={3}
-          className="mt-3 w-full resize-none rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[12px] outline-none focus:border-[var(--accent)] placeholder:text-[var(--text-muted)]"
-        />
-        <div className="flex items-center justify-end gap-2 mt-4">
-          <button
-            onClick={onCancel}
-            className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
+    <Modal
+      open
+      onClose={onCancel}
+      backdropClose={false}
+      size="sm"
+      title={
+        <span className="inline-flex min-w-0 items-center gap-2">
+          <span aria-hidden="true" className="inline-flex shrink-0">
+            <ThumbDownIcon filled />
+          </span>
+          {t('home.feedbackTitle')}
+        </span>
+      }
+      footer={
+        <>
+          <Button variant="secondary" size="md" onClick={onCancel}>
             {t('home.cancel')}
-          </button>
-          <button
-            onClick={() => onSubmit(reason || undefined)}
-            className="h-8 px-4 rounded-lg bg-[var(--danger)] text-white text-[12px] font-medium hover:opacity-90 transition-all"
-          >
+          </Button>
+          <Button variant="primary" size="md" onClick={() => onSubmit(reason || undefined)}>
             {t('home.feedbackSubmit')}
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-wrap gap-1.5">
+        {reasons.map((r) => (
+          <button
+            key={r}
+            onClick={() => setReason(r)}
+            className={`px-2.5 py-1 rounded-lg text-[11px] border transition-colors ${reason === r ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger)]/10' : 'border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--text-muted)]'}`}
+          >
+            {r}
           </button>
-        </div>
+        ))}
       </div>
-    </div>
+      <textarea
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        placeholder={t('home.feedbackPlaceholder')}
+        rows={3}
+        className="mt-3 w-full resize-none rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[12px] outline-none focus:border-[var(--accent)] placeholder:text-[var(--text-muted)]"
+      />
+    </Modal>
   )
 }
 
@@ -71,35 +75,30 @@ export function VersionDiffDialog({
   const [selected, setSelected] = useState<MessageVersion | null>(versions[0] ?? null)
   if (!selected) {
     return (
-      <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
-        <div className="w-[560px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
-          <p className="text-[12px] text-[var(--text-muted)]">{t('home.noVersions')}</p>
-          <button onClick={onClose} className="mt-3 h-8 px-4 rounded-lg btn-primary text-[12px]">
-            {t('home.close')}
-          </button>
-        </div>
-      </div>
+      <Modal open onClose={onClose} size="lg">
+        <p className="text-[12px] text-[var(--text-muted)]">{t('home.noVersions')}</p>
+        <Button variant="primary" size="md" className="mt-3" onClick={onClose}>
+          {t('home.close')}
+        </Button>
+      </Modal>
     )
   }
   // diff：当前回复 vs 旧版本（旧 → 新 方向，添加为绿、删除为红）
   const changes: Change[] = diffWords(selected.content, current)
   return (
-    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]" onClick={onClose}>
-      <div
-        className="w-[720px] max-w-[94vw] max-h-[80vh] flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-2">
-            <Icon name="git-branch" size={14} />
-            <span className="text-[13px] font-semibold">{t('home.versionCompare')}</span>
-          </div>
-          <button onClick={onClose} className="p-1.5 rounded-lg text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors">
-            <Icon name="close" size={15} />
-          </button>
-        </div>
+    <Modal
+      open
+      onClose={onClose}
+      size="2xl"
+      maxHeight="80vh"
+      icon="git-branch"
+      title={t('home.versionCompare')}
+    >
+      {/* h-full + 内层自己滚：Modal 的 body 是 overflow-y-auto，若不约束高度，
+          版本选择器与图例会跟着 diff 一起滚走，长回复对比时就找不到切换入口了。 */}
+      <div className="flex h-full flex-col">
         {/* 版本选择器（按时间倒序：最新旧版在前） */}
-        <div className="flex items-center gap-1.5 mt-3 shrink-0 flex-wrap">
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
           {[...versions].reverse().map((v) => (
             <button
               key={v.id}
@@ -113,7 +112,7 @@ export function VersionDiffDialog({
             {t('home.versionCurrent')}
           </span>
         </div>
-        <div className="mt-3 flex-1 min-h-0 overflow-y-auto rounded-xl modern-card border-[var(--border)] p-3 text-[12px] leading-relaxed whitespace-pre-wrap break-words">
+        <div className="mt-3 min-h-0 flex-1 overflow-y-auto rounded-xl modern-card border-[var(--border)] p-3 text-[12px] leading-relaxed whitespace-pre-wrap break-words">
           {changes.map((ch, i) => {
             const cls = ch.added
               ? 'bg-[var(--success)]/15 text-[var(--success)]'
@@ -127,13 +126,13 @@ export function VersionDiffDialog({
             )
           })}
         </div>
-        <div className="mt-3 flex items-center gap-3 text-[10px] text-[var(--text-muted)] shrink-0">
+        <div className="mt-3 flex shrink-0 items-center gap-3 text-[10px] text-[var(--text-muted)]">
           <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[var(--success)]/50" />{t('home.diffAdded')}</span>
           <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[var(--danger)]/50" />{t('home.diffRemoved')}</span>
           <span className="ml-auto">{t('home.diffHint')}</span>
         </div>
       </div>
-    </div>
+    </Modal>
   )
 }
 
@@ -158,43 +157,39 @@ export function MemoryDraftDialog({
     ['path', t('home.memoryCat.path')],
   ] as const
   return (
-    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
-      <div className="w-[520px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
-        <div className="flex items-center gap-2">
-          <Icon name="lightbulb" size={15} />
-          <span className="text-[13px] font-semibold">{t('home.memoryDraftTitle')}</span>
-        </div>
-        <div className="mt-3 space-y-2.5">
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-[var(--text-muted)] shrink-0 w-14">{t('home.memoryTitle')}</span>
-            <span className="flex-1 text-[13px] font-medium">{draft.title}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-[var(--text-muted)] shrink-0 w-14">{t('home.memoryCategory')}</span>
-            <span className="px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] text-[11px]">
-              {categories.find(([v]) => v === draft.category)?.[1] ?? draft.category}
-            </span>
-          </div>
-          <div className="rounded-xl modern-card border-[var(--border)] p-3 max-h-52 overflow-y-auto">
-            <p className="text-[12px] leading-relaxed text-[var(--text-primary)] whitespace-pre-wrap">{draft.content}</p>
-          </div>
-        </div>
-        <div className="flex items-center justify-end gap-2 mt-4">
-          <button
-            onClick={onCancel}
-            className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
+    <Modal
+      open
+      onClose={onCancel}
+      size="lg"
+      icon="lightbulb"
+      title={t('home.memoryDraftTitle')}
+      footer={
+        <>
+          <Button variant="secondary" size="md" onClick={onCancel}>
             {t('home.cancel')}
-          </button>
-          <button
-            onClick={onConfirm}
-            className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all"
-          >
+          </Button>
+          <Button variant="primary" size="md" onClick={onConfirm}>
             {t('home.memoryDraftSave')}
-          </button>
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-2.5">
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-[var(--text-muted)] shrink-0 w-14">{t('home.memoryTitle')}</span>
+          <span className="flex-1 text-[13px] font-medium">{draft.title}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-[var(--text-muted)] shrink-0 w-14">{t('home.memoryCategory')}</span>
+          <span className="px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] text-[11px]">
+            {categories.find(([v]) => v === draft.category)?.[1] ?? draft.category}
+          </span>
+        </div>
+        <div className="rounded-xl modern-card border-[var(--border)] p-3 max-h-52 overflow-y-auto">
+          <p className="text-[12px] leading-relaxed text-[var(--text-primary)] whitespace-pre-wrap">{draft.content}</p>
         </div>
       </div>
-    </div>
+    </Modal>
   )
 }
 
@@ -217,40 +212,47 @@ export function EditMessageDialog({
     inputRef.current?.setSelectionRange(message.content.length, message.content.length)
   }, [message.content.length])
   return (
-    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
-      <div className="w-[560px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
-        <div className="flex items-center gap-2">
-          <Icon name="edit" size={15} />
-          <span className="text-[13px] font-semibold">{t('home.editMessage')}</span>
+    <Modal
+      open
+      onClose={onCancel}
+      backdropClose={false}
+      size="lg"
+      icon="edit"
+      title={
+        <>
+          {t('home.editMessage')}
           {message.role === 'user' && (
-            <span className="text-[11px] text-[var(--text-muted)]">{t('home.editRerunHint')}</span>
+            <span className="ml-2 font-normal text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
+              {t('home.editRerunHint')}
+            </span>
           )}
-        </div>
-        <textarea
-          ref={inputRef}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          rows={6}
-          className="mt-3 w-full resize-y rounded-xl modern-card border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[13px] leading-relaxed"
-          placeholder={t('home.editMessagePlaceholder')}
-        />
-        <div className="flex items-center justify-end gap-2 mt-4">
-          <button
-            onClick={onCancel}
-            className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
+        </>
+      }
+      footer={
+        <>
+          <Button variant="secondary" size="md" onClick={onCancel}>
             {t('home.cancel')}
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="primary"
+            size="md"
             onClick={() => onSubmit(value.trim())}
             disabled={!value.trim()}
-            className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all disabled:opacity-50"
           >
             {t('home.editMessageSave')}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </>
+      }
+    >
+      <textarea
+        ref={inputRef}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        rows={6}
+        className="w-full resize-y rounded-xl modern-card border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[13px] leading-relaxed"
+        placeholder={t('home.editMessagePlaceholder')}
+      />
+    </Modal>
   )
 }
 
@@ -312,15 +314,24 @@ export function RulesDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
-      <div className="w-[620px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
-        <div className="flex items-center gap-2">
-          <Icon name="settings" size={15} />
-          <span className="text-[13px] font-semibold">{t('home.rules')}</span>
-          <span className="text-[11px] text-[var(--text-muted)]">{t('home.rulesHint')}</span>
-        </div>
+    <>
+      <Modal
+        open
+        onClose={onClose}
+        backdropClose={false}
+        size="xl"
+        icon="settings"
+        title={
+          <>
+            {t('home.rules')}
+            <span className="ml-2 font-normal text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
+              {t('home.rulesHint')}
+            </span>
+          </>
+        }
+      >
         {/* Tab：全局指令 / 项目级 */}
-        <div className="flex items-center gap-1 mt-3 bg-[var(--bg-card)] rounded-lg p-1 w-fit">
+        <div className="flex items-center gap-1 bg-[var(--bg-card)] rounded-lg p-1 w-fit">
           <button
             onClick={() => setTab('global')}
             className={`h-7 px-3 rounded-md text-[12px] font-medium transition-colors ${
@@ -353,10 +364,12 @@ export function RulesDialog({
                   <button
                     key={tp.id}
                     onClick={() => setPendingTemplate(tp)}
-                    title={t(`${tp.i18nKey}.desc`)}
+                    // tp.i18nKey 本身不带 home. 前缀，但译文是平铺在 home 对象里的
+                    // 带点键（home."ruleTemplate.xxx"），漏前缀会直接把 key 渲染给用户
+                    title={t(`home.${tp.i18nKey}.desc`)}
                     className="px-2 py-0.5 rounded-md text-[11px] bg-[var(--bg-card)] text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] border border-[var(--border)] transition-colors"
                   >
-                    {t(tp.i18nKey)}
+                    {t(`home.${tp.i18nKey}`)}
                   </button>
                 ))}
               </div>
@@ -374,64 +387,58 @@ export function RulesDialog({
               : t('home.rulesProjectPlaceholder', { name: '项目' })
           }
         />
-        <div className="flex items-center justify-between mt-4">
+        {/* 底部行是「左提示 + 右按钮」，不是 Modal footer 的纯右对齐，故留在正文里 */}
+        <div className="mt-3 flex items-center justify-between gap-3">
           <span className="text-[11px] text-[var(--text-muted)]">{t('home.rulesInjectHint')}</span>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={onClose}
-              className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
-            >
+          <div className="flex shrink-0 items-center gap-2">
+            <Button variant="secondary" size="md" onClick={onClose}>
               {t('home.cancel')}
-            </button>
-            <button
-              onClick={onSave}
-              disabled={saving}
-              className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all disabled:opacity-50"
-            >
+            </Button>
+            <Button variant="primary" size="md" loading={saving} onClick={onSave}>
               {saving ? t('home.rulesSaving') : t('home.rulesSave')}
-            </button>
+            </Button>
           </div>
         </div>
-      </div>
+      </Modal>
 
-      {/* 模板套用确认浮层：避免点一下就覆盖用户的现有内容 */}
+      {/* 模板套用确认浮层：避免点一下就覆盖用户的现有内容。
+          与 RulesDialog 是嵌套模态——两者都注册 Esc，useEscapeKey 的模块级栈
+          保证 Esc 只关最上层这一个，不会把外层 Rules 一起关掉。 */}
       {pendingTemplate && (
-        <div className="cmdk-backdrop" onClick={() => setPendingTemplate(null)}>
-          <div
-            className="w-[420px] max-w-[90vw] rounded-2xl glass-card p-4 animate-modal-in"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <p className="text-[13px] font-semibold mb-1">{t('home.ruleTemplateConfirmTitle')}</p>
-            <p className="text-[12px] text-[var(--text-secondary)] mb-3">
-              {t(pendingTemplate.i18nKey)} — {t('home.ruleTemplateConfirmBody')}
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setPendingTemplate(null)}
-                className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
-              >
+        <Modal
+          open
+          onClose={() => setPendingTemplate(null)}
+          size="sm"
+          align="top"
+          maxHeight="none"
+          title={t('home.ruleTemplateConfirmTitle')}
+          footer={
+            <>
+              <Button variant="secondary" size="md" onClick={() => setPendingTemplate(null)}>
                 {t('home.cancel')}
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="secondary"
+                size="md"
                 onClick={() => applyTemplate(pendingTemplate, 'append')}
-                className="h-8 px-3 rounded-lg btn-ghost text-[12px] transition-colors"
               >
                 {t('home.ruleTemplateConfirmAppend')}
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="primary"
+                size="md"
                 onClick={() => applyTemplate(pendingTemplate, 'replace')}
-                className="h-8 px-3 rounded-lg btn-primary text-[12px] transition-all"
               >
                 {t('home.ruleTemplateConfirmReplace')}
-              </button>
-            </div>
-          </div>
-        </div>
+              </Button>
+            </>
+          }
+        >
+          <p className="text-[12px] text-[var(--text-secondary)]">
+            {t(`home.${pendingTemplate.i18nKey}`)} — {t('home.ruleTemplateConfirmBody')}
+          </p>
+        </Modal>
       )}
-    </div>
+    </>
   )
 }
-
-
-
-

@@ -66,6 +66,22 @@ describe('Modal', () => {
     expect(onClose).not.toHaveBeenCalled()
   })
 
+  it('backdropClose=false：遮罩点击不关闭，但 Esc 与关闭按钮仍然可关', () => {
+    render(
+      <Modal open onClose={onClose} backdropClose={false} title="编辑消息">
+        <p>unsaved input</p>
+      </Modal>,
+    )
+    fireEvent.mouseDown(backdrop())
+    expect(onClose).not.toHaveBeenCalled()
+
+    // 这个开关只挡误触遮罩，不能把键盘用户困在弹窗里
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByLabelText('common.close'))
+    expect(onClose).toHaveBeenCalledTimes(2)
+  })
+
   it('阻塞式模态（不传 onClose）：无 Esc、遮罩不可点、不渲染关闭按钮', () => {
     render(
       <Modal open title="工具权限审核">

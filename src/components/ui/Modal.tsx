@@ -2,7 +2,7 @@
  * 模态：全库 18 处手写模态的统一外壳
  *
  * 阻塞语义由 onClose 是否传入决定，这是刻意的单一开关：
- *   传 onClose  → 可关闭：注册 Esc、遮罩可点、渲染右上角 X
+ *   传 onClose  → 可关闭：注册 Esc、渲染右上角 X（遮罩点击另由 backdropClose 决定）
  *   不传 onClose → 阻塞式：三者全部没有（工具权限审核 / ask_user 就是这种，
  *                  用户必须做出选择，不能被 Esc 或点空白绕过）
  *
@@ -56,6 +56,10 @@ export interface ModalProps {
   align?: 'center' | 'top'
   footer?: ReactNode
   maxHeight?: keyof typeof maxHeightCls
+  /** 点击遮罩是否关闭，默认 true。持有未保存输入的表单类弹窗应传 false：
+   *  在弹窗内按下鼠标、拖到遮罩上松手是常见误操作，会直接丢掉用户已键入的内容。
+   *  这个开关**不**影响 Esc——按 Esc 是明确意图，且它是键盘用户唯一的退出路径。 */
+  backdropClose?: boolean
   className?: string
   children?: ReactNode
 }
@@ -70,6 +74,7 @@ export function Modal({
   align = 'center',
   footer,
   maxHeight = '86vh',
+  backdropClose = true,
   className,
   children,
 }: ModalProps) {
@@ -88,7 +93,7 @@ export function Modal({
         align === 'top' ? 'items-start pt-[12vh]' : 'items-center',
       )}
       onMouseDown={(e) => {
-        if (onClose && e.target === e.currentTarget) onClose()
+        if (onClose && backdropClose && e.target === e.currentTarget) onClose()
       }}
     >
       <div
