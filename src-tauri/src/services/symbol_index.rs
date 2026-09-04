@@ -28,7 +28,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 10;
+const STRUCTURE_PARSER_VERSION: i64 = 11;
 const MAX_REEXPORT_DEPTH: usize = 8;
 const MAX_REEXPORT_BRANCHES: usize = 16;
 const MAX_REEXPORT_VISITS: usize = 128;
@@ -328,6 +328,44 @@ fn collect_declared_relations(
     }
 }
 
+fn collect_direct_calls(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    root: bool,
+    out: &mut Vec<DeclaredRelation>,
+) {
+    if !root
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "generator_function_declaration"
+                | "method_definition"
+                | "arrow_function"
+                | "function_expression"
+        )
+    {
+        return;
+    }
+    if node.kind() == "call_expression" {
+        if let Some(target_name) = node
+            .child_by_field_name("function")
+            .filter(|function| function.kind() == "identifier")
+            .and_then(|function| node_text(function, source))
+        {
+            out.push(DeclaredRelation {
+                kind: "calls".into(),
+                target_name,
+                module_specifier: None,
+                imported_name: None,
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_direct_calls(child, source, false, out);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NamedImport {
     module_specifier: String,
@@ -494,6 +532,7 @@ fn declared_relations(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     imports: &HashMap<String, Vec<NamedImport>>,
+    include_calls: bool,
 ) -> Vec<DeclaredRelation> {
     let mut relations = Vec::new();
     let mut cursor = node.walk();
@@ -501,6 +540,9 @@ fn declared_relations(
         if matches!(child.kind(), "class_heritage" | "extends_type_clause") {
             collect_declared_relations(child, source, &mut relations);
         }
+    }
+    if include_calls {
+        collect_direct_calls(node, source, true, &mut relations);
     }
     for relation in &mut relations {
         let Some(local_name) = relation_local_identifier(&relation.target_name) else { continue };
@@ -615,7 +657,12 @@ fn walk_syntax_tree(
             rel,
             ext,
             source,
-            declared_relations(node, source.as_bytes(), imports),
+            declared_relations(
+                node,
+                source.as_bytes(),
+                imports,
+                matches!(kind, "function" | "method"),
+            ),
         ) {
             if matches!(kind, "class" | "component" | "interface" | "type" | "enum") {
                 child_parent = Some(name);
@@ -627,6 +674,10 @@ fn walk_syntax_tree(
             .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
     {
         if let Some(name_node) = node.child_by_field_name("name") {
+            let relations = node
+                .child_by_field_name("value")
+                .map(|value| declared_relations(value, source.as_bytes(), imports, true))
+                .unwrap_or_default();
             let _ = push_tree_sitter_symbol(
                 out,
                 node,
@@ -636,7 +687,7 @@ fn walk_syntax_tree(
                 rel,
                 ext,
                 source,
-                Vec::new(),
+                relations,
             );
         }
     }
@@ -1167,9 +1218,9 @@ fn containment_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
 
 fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
     let mut edges = containment_edges(symbols);
-    let mut local_entities: HashMap<(&str, &str), Vec<&Symbol>> = HashMap::new();
-    for candidate in symbols.iter().filter(|symbol| symbol.role == "entity") {
-        local_entities
+    let mut local_targets: HashMap<(&str, &str), Vec<&Symbol>> = HashMap::new();
+    for candidate in symbols {
+        local_targets
             .entry((&candidate.file, &candidate.name))
             .or_default()
             .push(candidate);
@@ -1179,12 +1230,25 @@ fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
             let resolved = relation
                 .module_specifier
                 .is_none()
-                .then(|| local_entities.get(&(symbol.file.as_str(), relation.target_name.as_str())))
+                .then(|| local_targets.get(&(symbol.file.as_str(), relation.target_name.as_str())))
                 .flatten()
-                .filter(|candidates| candidates.len() == 1)
-                .and_then(|candidates| candidates.first())
+                .and_then(|candidates| {
+                    let matching = candidates
+                        .iter()
+                        .filter(|candidate| {
+                            if relation.kind == "calls" {
+                                candidate.kind == "function"
+                            } else {
+                                candidate.role == "entity"
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    (matching.len() == 1).then(|| *matching[0])
+                })
                 .filter(|candidate| {
-                    candidate.line != symbol.line || candidate.name != symbol.name
+                    relation.kind == "calls"
+                        || candidate.line != symbol.line
+                        || candidate.name != symbol.name
                 });
             edges.push(StructureEdge {
                 kind: relation.kind.clone(),
@@ -2319,8 +2383,8 @@ struct PersistedIndex {
     catalog: CatalogStats,
 }
 
-// v11 resolves strict tsconfig and local ohpm package aliases without treating remote packages as files.
-const PERSIST_VERSION: u32 = 11;
+// v12 persists AST-declared direct call evidence in addition to type relationships.
+const PERSIST_VERSION: u32 = 12;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -3542,6 +3606,7 @@ fn resolve_exported_target(
     source_file: &str,
     module_specifier: &str,
     imported_name: &str,
+    relation_kind: &str,
     depth: usize,
     visited: &mut Vec<(String, String, String)>,
     remaining_visits: &mut usize,
@@ -3571,12 +3636,16 @@ fn resolve_exported_target(
     let lines = conn
         .prepare(
             "SELECT line FROM symbols
-             WHERE file=?1 AND name=?2 AND role='entity'
+             WHERE file=?1 AND name=?2
+               AND ((?3='calls' AND kind='function')
+                    OR (?3<>'calls' AND role='entity'))
              ORDER BY line LIMIT 2",
         )
         .and_then(|mut statement| {
             statement
-                .query_map(params![target_file, imported_name], |row| row.get::<_, i64>(0))?
+                .query_map(params![target_file, imported_name, relation_kind], |row| {
+                    row.get::<_, i64>(0)
+                })?
                 .collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
@@ -3613,6 +3682,7 @@ fn resolve_exported_target(
             &target_file,
             next_module,
             next_name,
+            relation_kind,
             depth + 1,
             visited,
             remaining_visits,
@@ -3649,6 +3719,7 @@ fn resolve_exported_target(
             &target_file,
             &next_module,
             imported_name,
+            relation_kind,
             depth + 1,
             &mut branch_visited,
             remaining_visits,
@@ -3681,6 +3752,7 @@ fn resolve_import_target_from_catalog(
         &edge.source_file,
         module_specifier,
         imported_name,
+        &edge.kind,
         0,
         &mut Vec::new(),
         &mut remaining_visits,
@@ -5166,6 +5238,96 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert_eq!(ambiguous.len(), 1);
         assert!(ambiguous[0].target_file.is_empty());
         assert_eq!(ambiguous[0].target_line, 0);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn direct_calls_resolve_local_imported_barrel_and_recursive_targets() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-call-edge-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-call-edge-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("util.ts"), "export function loadData() {}\n").unwrap();
+        std::fs::write(
+            root.join("barrel.ts"),
+            "export { loadData as fetchData } from './util';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("service.ts"),
+            "import { fetchData as fetch } from './barrel';\n\
+             function helper() {}\n\
+             export function run() { helper(); fetch(); client.fetch(); }\n\
+             export function recursive() { recursive(); }\n\
+             export function outer() { const inner = () => { helper(); }; }\n",
+        )
+        .unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        let indexed_files = files.keys().cloned().collect::<Vec<_>>();
+        assert!(replace_all_symbol_rows_with_files_at(
+            &root,
+            &data_dir,
+            &symbols,
+            &indexed_files,
+            catalog.revision,
+        ));
+        let find = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .cloned()
+                .unwrap()
+        };
+        let run = find("run");
+        assert_eq!(
+            run.declared_relations
+                .iter()
+                .filter(|relation| relation.kind == "calls")
+                .count(),
+            2,
+            "成员调用不能作为无类型信息的直接调用绑定",
+        );
+        let (calls, _) = query_persisted_edges_at(&root, &data_dir, &[run])
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().any(|edge| {
+            edge.kind == "calls"
+                && edge.target_file == "service.ts"
+                && edge.target_name == "helper"
+        }));
+        assert!(calls.iter().any(|edge| {
+            edge.kind == "calls"
+                && edge.target_file == "util.ts"
+                && edge.target_name == "loadData"
+        }));
+
+        let recursive = find("recursive");
+        let (recursive_calls, _) = query_persisted_edges_at(&root, &data_dir, &[recursive])
+            .unwrap()
+            .unwrap();
+        assert_eq!(recursive_calls.len(), 1);
+        assert_eq!(recursive_calls[0].source_name, "recursive");
+        assert_eq!(recursive_calls[0].target_name, "recursive");
+
+        let outer = find("outer");
+        assert!(outer
+            .declared_relations
+            .iter()
+            .all(|relation| relation.kind != "calls"));
+        let inner = find("inner");
+        assert!(inner
+            .declared_relations
+            .iter()
+            .any(|relation| relation.kind == "calls" && relation.target_name == "helper"));
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
