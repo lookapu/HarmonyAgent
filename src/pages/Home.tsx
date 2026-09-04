@@ -113,6 +113,7 @@ import CommandPalette, { type PaletteCommand } from '../components/CommandPalett
 import { Button } from '../components/ui/Button'
 import { IconButton } from '../components/ui/IconButton'
 import { Field, TextArea } from '../components/ui/Field'
+import { Spinner } from '../components/ui/Spinner'
 import {
   fmtElapsed,
   interruptedTailMessage,
@@ -4833,7 +4834,7 @@ export default function Home() {
             switchingConv ? (
               // 会话切换中：messages 已清空、新会话消息尚未加载完成，轻量占位避免空状态闪烁
               <div className="h-full flex flex-col items-center justify-center text-center">
-                <div className="w-8 h-8 rounded-full border-2 border-[var(--border)] border-t-[var(--accent)] animate-spin" />
+                <Spinner size={32} />
                 <p className="text-[12px] text-[var(--text-muted)] mt-3">{t('home.loadingConv')}</p>
               </div>
             ) : (
@@ -4962,7 +4963,7 @@ export default function Home() {
                                         {td.status === 'done' ? (
                                           <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
                                         ) : td.status === 'in_progress' ? (
-                                          <span className="w-2.5 h-2.5 mt-0.5 rounded-full border-2 border-[var(--accent)] border-t-transparent animate-spin shrink-0" />
+                                          <Spinner variant="inline" size={10} className="mt-0.5" />
                                         ) : (
                                           <span className="w-2.5 h-2.5 mt-1 rounded-full border border-[var(--border)] shrink-0" />
                                         )}

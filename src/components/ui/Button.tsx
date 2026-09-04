@@ -93,8 +93,9 @@ export function Button({
   }, [armedLocal])
 
   const isDisabled = disabled || loading
-  // 实心底色（primary / armed）上图标必须反白：Icon 是 <img> + filter 实现，
-  // 默认 filter 跟随主题，在 accent 底上会发灰
+  // 实心底色（primary / armed）上图标与 spinner 都必须反白：Icon 是 <img> + filter
+  // 实现，默认 filter 跟随主题，在 accent 底上会发灰；Spinner 的 accent 顶边落在
+  // accent-600 底上则直接隐形，只剩一个看着不动的灰圈
   const whiteIcon = variant === 'primary' || isArmed
 
   return (
@@ -112,15 +113,17 @@ export function Button({
         onClick?.(e)
       }}
       className={cn(
+        // loading 不再单独调透明度：它必然 isDisabled，disabled:opacity-45（特异度
+        // 0,2,0）在同层里稳赢 opacity-70（0,1,0），primary 还另有无层的
+        // .btn-primary:disabled 兜着——写了也是死类
         'inline-flex shrink-0 select-none items-center justify-center whitespace-nowrap rounded-md font-medium disabled:cursor-not-allowed disabled:opacity-45',
         isArmed ? armedCls : variantCls[variant],
         sizeCls[size],
-        loading && 'opacity-70',
         className,
       )}
     >
       {loading ? (
-        <Spinner size={iconSizeFor[size]} />
+        <Spinner size={iconSizeFor[size]} invert={whiteIcon} />
       ) : (
         icon && (
           <span aria-hidden="true" className="shrink-0">

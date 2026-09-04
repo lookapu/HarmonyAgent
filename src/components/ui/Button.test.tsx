@@ -40,8 +40,31 @@ describe('Button', () => {
     const btn = screen.getByRole('button')
     expect(btn).toBeDisabled()
     expect(btn).toHaveAttribute('aria-busy', 'true')
+    // loading 必然 isDisabled，disabled:opacity-45（0,2,0）稳赢 opacity-70（0,1,0），
+    // primary 还另有无层的 .btn-primary:disabled —— 那条是死类，已删
+    expect(btn).not.toHaveClass('opacity-70')
     fireEvent.click(btn)
     expect(onClick).not.toHaveBeenCalled()
+  })
+
+  // primary 走 .btn-primary = accent-600 实心底。spinner 不反白的话，accent 顶边
+  // 落在同色底上直接隐形，忙时只剩一个看着不动的灰圈
+  it('loading 的 spinner 在实心底色上反白，在浅底上保持 accent 顶边', () => {
+    const { rerender } = render(
+      <Button variant="primary" loading>
+        save
+      </Button>,
+    )
+    expect(screen.getByRole('status')).toHaveClass('border-t-white')
+    expect(screen.getByRole('status')).not.toHaveClass('border-t-[var(--accent)]')
+
+    rerender(
+      <Button variant="secondary" loading>
+        save
+      </Button>,
+    )
+    expect(screen.getByRole('status')).toHaveClass('border-t-[var(--accent)]')
+    expect(screen.getByRole('status')).not.toHaveClass('border-t-white')
   })
 
   it('confirm：首次点击进入 armed 态而不执行，再次点击才执行', () => {
