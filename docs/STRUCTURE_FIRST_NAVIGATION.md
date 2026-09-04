@@ -65,7 +65,7 @@ MVP 的范围估算仍是轻量规则扫描。大括号出现在字符串/注释
 
 目录层第一版已经完成：所有未忽略文件流式写入独立 SQLite，不把全量路径堆进内存；记录 `indexed/deferred/oversized/unsupported/symlink/unreadable` 状态和一级目录 shard。`find_files` 优先查询该目录，支持状态过滤和分页；结构查询同时报告发现、解析、延期、超大和不可读数量。
 
-原生跨平台 watcher 也已接入：第一次建立索引时懒启动，忽略纯访问事件，将编辑器常见的 create/modify/remove/rename 事件按 200 ms 合并，先精准失效相关符号，再把全库一致性校验延迟到下一次真实查询。稳定仓库不再每 30 秒反复 walk；watcher 启动失败时保留 30 秒周期扫描，active 时仍每 5 分钟低频校验，防止监听器“创建成功但不投递”或静默失效。收到系统 `Rescan` 标志、空路径事件或监听错误时立即要求校验。最多保留 16 个项目 watcher，按最近使用淘汰，避免系统句柄泄漏。
+原生跨平台 watcher 也已接入：第一次建立索引时懒启动，忽略纯访问事件，将编辑器常见的 create/modify/remove/rename 事件按 200 ms 合并。普通文件变化现在会在缓存锁外用一个 SQLite 事务直接 upsert/delete 全库目录记录，并精准替换对应符号，不再安排全仓 walk；目录级变化、数据库失败、系统 `Rescan` 标志、空路径事件或监听错误才把一致性校验延迟到下一次真实查询。稳定仓库不再每 30 秒反复 walk；watcher 启动失败时保留 30 秒周期扫描，active 时仍每 5 分钟低频校验，防止监听器“创建成功但不投递”或静默失效。最多保留 16 个项目 watcher，按最近使用淘汰，避免系统句柄泄漏。
 
 watcher 不是唯一真相：网络文件系统可能没有事件，Linux 可能达到 inotify watch 限额，大目录也可能发生事件队列溢出。后续仍需 Git diff/name-status 作为低成本校验来源，并把单库数据库进一步拆成物理 shard。[notify 官方文档](https://docs.rs/notify/latest/notify/)也明确要求在 `need_rescan` 时重建内存状态，并提示大型目录可能漏事件。
 
@@ -108,7 +108,7 @@ watcher 不是唯一真相：网络文件系统可能没有事件，Linux 可能
 
 ## 7. 下一实现顺序
 
-1. 增加 Git diff/name-status 校验，并把 watcher 事件直接增量写入目录数据库。
+1. 增加 Git diff/name-status 校验，捕获 checkout/rebase 和 watcher 漏报的批量变化。
 2. 把单库 SQLite 按 module/shard 拆分，结构节点/关系边转为数据库分页查询。
 3. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 4. 接入 Tree-sitter/ArkTS 容错解析，替换 MVP 的范围估算。

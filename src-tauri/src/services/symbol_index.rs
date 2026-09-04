@@ -458,6 +458,193 @@ fn shard_for(rel: &str) -> &str {
     rel.split('/').next().filter(|value| !value.is_empty()).unwrap_or(".")
 }
 
+fn ignored_catalog_path(rel: &str) -> bool {
+    let parts = rel
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.iter().enumerate().any(|(index, part)| {
+        SKIP_DIRS.contains(part) || (index + 1 < parts.len() && part.starts_with('.'))
+    })
+}
+
+/// 把 watcher/文件工具传入的路径规范为项目内相对路径。允许已删除路径，拒绝 `..` 越界。
+fn normalize_changed_path(root: &Path, value: &str) -> Option<(String, PathBuf)> {
+    let input = Path::new(value);
+    let rel_path = if input.is_absolute() {
+        input
+            .strip_prefix(root)
+            .ok()
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                let canonical_root = root.canonicalize().ok()?;
+                input
+                    .strip_prefix(canonical_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })?
+    } else {
+        input.to_path_buf()
+    };
+    if rel_path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    let rel = rel_path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if rel.is_empty() || ignored_catalog_path(&rel) {
+        return None;
+    }
+    Some((rel.clone(), root.join(rel)))
+}
+
+#[derive(Debug)]
+enum CatalogDelta {
+    Updated(CatalogStats),
+    NeedsReconciliation,
+}
+
+fn catalog_stats(conn: &Connection) -> rusqlite::Result<CatalogStats> {
+    let mut stats = CatalogStats {
+        persisted: true,
+        ..CatalogStats::default()
+    };
+    let mut statement = conn.prepare("SELECT state, COUNT(*) FROM files GROUP BY state")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.max(0) as usize,
+        ))
+    })?;
+    for row in rows {
+        let (state, count) = row?;
+        stats.discovered_files += count;
+        match state.as_str() {
+            "indexed" => {
+                stats.source_files += count;
+                stats.indexed_source_files += count;
+            }
+            "deferred" => {
+                stats.source_files += count;
+                stats.deferred_source_files += count;
+            }
+            "oversized" => {
+                stats.source_files += count;
+                stats.oversized_source_files += count;
+            }
+            "symlink" => stats.symlink_files += count,
+            "unreadable" => stats.unreadable_files += count,
+            _ => stats.unsupported_files += count,
+        }
+    }
+    Ok(stats)
+}
+
+/// 直接把文件级变化合并进持久化目录。目录创建/修改无法仅靠单条事件获知其子树，要求回退扫描。
+fn apply_catalog_changes_at(root: &Path, data_dir: &Path, rels: &[String]) -> CatalogDelta {
+    let path = catalog_file_at(data_dir, root);
+    if !path.is_file() {
+        return CatalogDelta::NeedsReconciliation;
+    }
+    let mut conn = match Connection::open(path) {
+        Ok(value) => value,
+        Err(_) => return CatalogDelta::NeedsReconciliation,
+    };
+    let transaction = match conn.transaction() {
+        Ok(value) => value,
+        Err(_) => return CatalogDelta::NeedsReconciliation,
+    };
+    let generation = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+
+    for value in rels {
+        let Some((rel, abs)) = normalize_changed_path(root, value) else {
+            continue;
+        };
+        let metadata = match fs::symlink_metadata(&abs) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if transaction
+                    .execute(
+                        "DELETE FROM files
+                         WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+                        params![rel],
+                    )
+                    .is_err()
+                {
+                    return CatalogDelta::NeedsReconciliation;
+                }
+                continue;
+            }
+            Err(_) => return CatalogDelta::NeedsReconciliation,
+        };
+        if metadata.is_dir() {
+            return CatalogDelta::NeedsReconciliation;
+        }
+        let ext = abs
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let stamp = stamp_from_meta(&metadata);
+        let state = if metadata.file_type().is_symlink() {
+            "symlink"
+        } else if !metadata.is_file() || !SYMBOL_EXTS.contains(&ext) {
+            "unsupported"
+        } else if metadata.len() > MAX_BYTES {
+            "oversized"
+        } else {
+            "indexed"
+        };
+        if transaction
+            .execute(
+                "INSERT INTO files(path, extension, size, mtime_ns, state, shard, generation)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(path) DO UPDATE SET
+                   extension=excluded.extension, size=excluded.size, mtime_ns=excluded.mtime_ns,
+                   state=excluded.state, shard=excluded.shard, generation=excluded.generation",
+                params![
+                    rel,
+                    ext,
+                    stamp.len as i64,
+                    stamp.mtime as i64,
+                    state,
+                    shard_for(&rel),
+                    generation
+                ],
+            )
+            .is_err()
+        {
+            return CatalogDelta::NeedsReconciliation;
+        }
+    }
+    let stats = match catalog_stats(&transaction) {
+        Ok(value) => value,
+        Err(_) => return CatalogDelta::NeedsReconciliation,
+    };
+    if transaction.commit().is_err() {
+        return CatalogDelta::NeedsReconciliation;
+    }
+    CatalogDelta::Updated(stats)
+}
+fn apply_catalog_changes(root: &Path, rels: &[String]) -> CatalogDelta {
+    let Some(data_dir) = DATA_DIR.get() else {
+        return CatalogDelta::NeedsReconciliation;
+    };
+    apply_catalog_changes_at(root, data_dir, rels)
+}
+
 /// 遍历所有未忽略文件。回调是流式的，百万文件时不需要把全目录保存在内存。
 fn walk_catalog<F>(dir: &Path, root: &Path, stats: &mut CatalogStats, visit: &mut F)
 where
@@ -921,45 +1108,47 @@ pub fn reconciliation_pending(root: &Path) -> bool {
 /// 增量失效：仅更新指定文件（写/改/删）的符号，其余文件复用缓存。
 /// rel 为工具参数中的路径（相对项目根或绝对路径）；目录路径会剔除其下全部文件符号。
 /// 内存中无该条目时不做任何事：下次检索会基于最新指纹构建。
-pub fn invalidate_files(root: &Path, rels: &[String]) {
+pub fn invalidate_files(root: &Path, rels: &[String]) -> bool {
+    // SQLite I/O 必须发生在全局内存缓存锁之外，避免慢盘阻塞其他项目查询。
+    let catalog_delta = apply_catalog_changes(root, rels);
+    let catalog_precise = matches!(catalog_delta, CatalogDelta::Updated(_));
     let key = canonical_key(root);
     let mut guard = cache().lock().unwrap();
-    let Some(entry) = guard.get_mut(&key) else { return };
-    let mut changed = false;
-    for rel in rels {
-        let abs = if Path::new(rel).is_absolute() {
-            PathBuf::from(rel)
-        } else {
-            root.join(rel)
+    let Some(entry) = guard.get_mut(&key) else {
+        return catalog_precise;
+    };
+    if let CatalogDelta::Updated(stats) = catalog_delta {
+        entry.catalog = CatalogStats {
+            unreadable_directories: entry.catalog.unreadable_directories,
+            ..stats
         };
-        // 跨根防护：绝对路径（write_file/edit_file 允许）不属于当前根时跳过，
-        // 避免 safe_rel 退化把绝对路径 key 写进缓存条目（多路径提示目录场景）。
-        // canonicalize 失败（文件已删）视为不属于本根，删除场景由下次同步兜底。
-        if Path::new(rel).is_absolute() {
-            let in_root = abs
-                .canonicalize()
-                .ok()
-                .zip(root.canonicalize().ok())
-                .is_some_and(|(a, r)| a.starts_with(&r));
-            if !in_root {
-                continue;
-            }
-        }
-        let rel_norm = safe_rel(root, &abs);
-        if rel_norm.is_empty() {
+    } else {
+        entry.needs_reconciliation = true;
+    }
+    let mut changed = false;
+    for value in rels {
+        let Some((rel_norm, abs)) = normalize_changed_path(root, value) else {
             continue;
-        }
+        };
         // 目录（含已删除目录，按缓存指纹前缀判断）：剔除其下全部文件
         let prefix = format!("{rel_norm}/");
         let dir_like = abs.is_dir() || entry.files.keys().any(|f| f.starts_with(&prefix));
         if dir_like {
-            entry.syms.retain(|s| s.file != rel_norm && !s.file.starts_with(&prefix));
-            entry.files.retain(|f, _| f != &rel_norm && !f.starts_with(&prefix));
+            entry
+                .syms
+                .retain(|s| s.file != rel_norm && !s.file.starts_with(&prefix));
+            entry
+                .files
+                .retain(|f, _| f != &rel_norm && !f.starts_with(&prefix));
             changed = true;
             continue;
         }
         // 单文件：存在则重扫，不存在则剔除
-        match file_stamp(&abs) {
+        let supported = abs
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|ext| SYMBOL_EXTS.contains(&ext));
+        match supported.then(|| file_stamp(&abs)).flatten() {
             Some(stamp) => {
                 entry.files.insert(rel_norm.clone(), stamp);
                 entry.syms.retain(|s| s.file != rel_norm);
@@ -980,6 +1169,7 @@ pub fn invalidate_files(root: &Path, rels: &[String]) {
         entry.last_sync = now_secs();
         save_persisted(root, &entry.files, &entry.syms, entry.catalog);
     }
+    catalog_precise
 }
 
 /// 路径安全校验：仅项目内相对路径，拒绝越界
@@ -1379,6 +1569,54 @@ struct Detail {
             .unwrap();
         assert_eq!(rows, 2);
 
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn catalog_applies_file_deltas_without_full_walk() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-catalog-delta-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-catalog-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("small.rs"), "fn before() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "# hello\n").unwrap();
+        let (_, initial) = collect_files_at(&root, Some(&data_dir));
+        assert!(initial.persisted);
+
+        std::fs::write(root.join("small.rs"), "fn after_change() {}\n").unwrap();
+        std::fs::write(root.join("added.py"), "def added():\n    pass\n").unwrap();
+        std::fs::remove_file(root.join("README.md")).unwrap();
+        let delta = apply_catalog_changes_at(
+            &root,
+            &data_dir,
+            &["small.rs".into(), "added.py".into(), "README.md".into()],
+        );
+        let CatalogDelta::Updated(stats) = delta else {
+            panic!("普通文件变化应能精确更新目录")
+        };
+        assert_eq!(stats.discovered_files, 2);
+        assert_eq!(stats.source_files, 2);
+        assert_eq!(stats.indexed_source_files, 2);
+
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        let paths = conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(paths, vec!["added.py", "small.rs"]);
+        drop(conn);
+
+        std::fs::create_dir_all(root.join("new_dir")).unwrap();
+        assert!(matches!(
+            apply_catalog_changes_at(&root, &data_dir, &["new_dir".into()]),
+            CatalogDelta::NeedsReconciliation
+        ));
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
     }

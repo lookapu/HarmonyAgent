@@ -11,7 +11,6 @@ struct WatchHandle {
     _watcher: RecommendedWatcher,
     last_used: std::time::Instant,
 }
-
 static WATCHERS: OnceLock<Mutex<HashMap<String, WatchHandle>>> = OnceLock::new();
 const SKIP_DIRS: &[&str] = &[
     ".git", ".idea", ".hvigor", ".ohpm", ".venv", "node_modules", "oh_modules",
@@ -65,12 +64,14 @@ fn process_batch(root: &Path, events: Vec<Result<Event, notify::Error>>) {
         }
     }
     let had_paths = !paths.is_empty();
-    if had_paths {
+    let precise = if had_paths {
         let paths = paths.into_iter().collect::<Vec<_>>();
-        crate::services::symbol_index::invalidate_files(root, &paths);
-    }
-    // 文件目录还需校验新增/删除/rename 及 watcher 可能丢失的事件；延迟到下一次查询执行。
-    if uncertain || had_paths {
+        crate::services::symbol_index::invalidate_files(root, &paths)
+    } else {
+        true
+    };
+    // 精确文件事件已直接提交 SQLite；仅目录/丢事件/数据库失败需要延迟全库校验。
+    if uncertain || !precise {
         crate::services::symbol_index::request_reconciliation(root);
     }
 }
