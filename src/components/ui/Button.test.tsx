@@ -18,6 +18,18 @@ describe('Button', () => {
     expect(screen.getByRole('button')).toHaveClass('btn-primary')
   })
 
+  // index.css 只给 .btn-primary:disabled 配了 opacity，其余 variant 得靠基类自己兜
+  it('disabled 时每个 variant 都有可见的禁用态，不只靠 cursor', () => {
+    render(
+      <Button variant="danger" disabled>
+        clear
+      </Button>,
+    )
+    const btn = screen.getByRole('button')
+    expect(btn).toBeDisabled()
+    expect(btn).toHaveClass('disabled:opacity-45')
+  })
+
   it('loading 时禁用、标记 aria-busy，且不触发 onClick', () => {
     const onClick = vi.fn()
     render(

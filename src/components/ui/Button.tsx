@@ -112,7 +112,7 @@ export function Button({
         onClick?.(e)
       }}
       className={cn(
-        'inline-flex shrink-0 select-none items-center justify-center whitespace-nowrap rounded-md font-medium disabled:cursor-not-allowed',
+        'inline-flex shrink-0 select-none items-center justify-center whitespace-nowrap rounded-md font-medium disabled:cursor-not-allowed disabled:opacity-45',
         isArmed ? armedCls : variantCls[variant],
         sizeCls[size],
         loading && 'opacity-70',

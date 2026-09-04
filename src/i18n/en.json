@@ -2042,6 +2042,7 @@
     "save": "Save",
     "cancel": "Cancel",
     "confirm": "Confirm",
+    "confirmAgain": "Confirm?",
     "delete": "Delete",
     "loading": "Loading...",
     "close": "Close",

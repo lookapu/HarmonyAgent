@@ -6853,12 +6853,13 @@ export default function Home() {
               </button>
             </div>
             <div className="flex items-center justify-end gap-2 mt-4">
-              <button
+              <Button
+                variant="danger"
+                size="md"
                 onClick={() => resolveToolApproval(toolApprovals[0].requestId, false, false, approvalFeedback || undefined)}
-                className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--danger)] hover:border-[var(--danger)]/50 transition-colors"
               >
                 {t('home.toolApprovalReject')}
-              </button>
+              </Button>
               <Button
                 variant="primary"
                 size="md"
@@ -7233,12 +7234,15 @@ export default function Home() {
             <Button variant="secondary" size="md" onClick={() => setRuntimeAnomaly(null)}>
               {t('runtime.dismiss')}
             </Button>
-            <button
+            <Button
+              variant="danger"
+              size="md"
+              confirm
+              confirmLabel={t('common.confirmAgain')}
               onClick={() => void fixRuntimeAnomaly()}
-              className="h-8 px-4 rounded-lg bg-red-500 text-white text-[12px] hover:bg-red-600"
             >
               {t('runtime.fixNow')}
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -9029,16 +9033,20 @@ function AuditDialog({ onClose }: { onClose: () => void }) {
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <button
+            <Button
+              variant="danger"
+              size="sm"
+              confirm
+              confirmLabel={t('common.confirmAgain')}
+              title={t('home.auditClearConfirm')}
+              disabled={entries.length === 0}
               onClick={() => {
                 if (entries.length === 0) return
-                if (window.confirm(t('home.auditClearConfirm'))) clear()
+                clear()
               }}
-              disabled={entries.length === 0}
-              className="h-7 px-2.5 rounded-md border border-[var(--border)] text-[11.5px] text-[var(--danger)] hover:bg-[var(--danger)]/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
               {t('home.auditClear')}
-            </button>
+            </Button>
             <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
           </div>
         </div>
