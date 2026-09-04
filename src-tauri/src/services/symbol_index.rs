@@ -28,7 +28,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 6;
+const STRUCTURE_PARSER_VERSION: i64 = 7;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -132,6 +132,10 @@ pub struct StructureEdge {
     pub target_file: String,
     pub target_name: String,
     pub target_line: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_module: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_imported_name: Option<String>,
 }
 
 fn structure_role(kind: &str) -> &'static str {
@@ -1058,6 +1062,8 @@ fn containment_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
             target_file: child.file.clone(),
             target_name: child.name.clone(),
             target_line: child.line,
+            target_module: None,
+            target_imported_name: None,
         });
     }
     edges.sort();
@@ -1096,6 +1102,8 @@ fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
                     .unwrap_or_default(),
                 target_name: relation.target_name.clone(),
                 target_line: resolved.map(|candidate| candidate.line).unwrap_or(0),
+                target_module: relation.module_specifier.clone(),
+                target_imported_name: relation.imported_name.clone(),
             });
         }
     }
@@ -1108,20 +1116,37 @@ fn insert_edge_row(
     transaction: &rusqlite::Transaction<'_>,
     edge: &StructureEdge,
 ) -> rusqlite::Result<()> {
+    let mut target_file = edge.target_file.clone();
+    let mut target_name = edge.target_name.clone();
+    let mut target_line = edge.target_line;
+    if let (Some(module), Some(imported)) = (
+        edge.target_module.as_deref(),
+        edge.target_imported_name.as_deref(),
+    ) {
+        if let Some(resolved_file) = resolve_relative_module_file(transaction, &edge.source_file, module) {
+            target_file = resolved_file;
+            target_name = imported.to_string();
+            // Imported targets are rebound on every query so external edits cannot stale the line.
+            target_line = 0;
+        }
+    }
     transaction.execute(
         "INSERT OR IGNORE INTO symbol_edges(
            kind, source_file, source_name, source_line,
-           target_file, target_name, target_line, shard
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+           target_file, target_name, target_line, shard,
+           target_module, target_imported_name
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             edge.kind,
             edge.source_file,
             edge.source_name,
             edge.source_line as i64,
-            edge.target_file,
-            edge.target_name,
-            edge.target_line as i64,
+            target_file,
+            target_name,
+            target_line as i64,
             shard_for(&edge.source_file),
+            edge.target_module,
+            edge.target_imported_name,
         ],
     )?;
     Ok(())
@@ -1156,10 +1181,7 @@ fn replace_all_symbol_rows_at(
              WHERE NOT EXISTS (
                SELECT 1 FROM files f
                WHERE f.path = symbol_edges.source_file AND f.state = 'indexed'
-             ) OR (symbol_edges.target_file <> '' AND NOT EXISTS (
-               SELECT 1 FROM files f
-               WHERE f.path = symbol_edges.target_file AND f.state = 'indexed'
-             ))",
+             )",
             [],
         )
         .is_err()
@@ -1187,7 +1209,7 @@ fn replace_all_symbol_rows_at(
     for file in baseline_files {
         if transaction
             .execute(
-                "DELETE FROM symbol_edges WHERE source_file = ?1 OR target_file = ?1",
+                "DELETE FROM symbol_edges WHERE source_file = ?1",
                 params![file],
             )
             .is_err()
@@ -1256,9 +1278,8 @@ fn replace_changed_symbol_rows_at(
         if transaction
             .execute(
                 "DELETE FROM symbol_edges
-                 WHERE source_file = ?1 OR target_file = ?1
-                    OR substr(source_file, 1, length(?1) + 1) = ?1 || '/'
-                    OR substr(target_file, 1, length(?1) + 1) = ?1 || '/'",
+                 WHERE source_file = ?1
+                    OR substr(source_file, 1, length(?1) + 1) = ?1 || '/'",
                 params![rel],
             )
             .is_err()
@@ -1410,7 +1431,7 @@ where
             .map_err(|error| error.to_string())?;
         transaction
             .execute(
-                "DELETE FROM symbol_edges WHERE source_file=?1 OR target_file=?1",
+                "DELETE FROM symbol_edges WHERE source_file=?1",
                 params![rel],
             )
             .map_err(|error| error.to_string())?;
@@ -1677,6 +1698,22 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    let edge_columns = conn
+        .prepare("PRAGMA table_info(symbol_edges)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !edge_columns.iter().any(|column| column == "target_module") {
+        conn.execute("ALTER TABLE symbol_edges ADD COLUMN target_module TEXT", [])?;
+    }
+    if !edge_columns
+        .iter()
+        .any(|column| column == "target_imported_name")
+    {
+        conn.execute(
+            "ALTER TABLE symbol_edges ADD COLUMN target_imported_name TEXT",
+            [],
+        )?;
+    }
     let meta_columns = conn
         .prepare("PRAGMA table_info(structure_meta)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -1770,6 +1807,8 @@ fn collect_files_at_with_budget(
                    target_name TEXT NOT NULL,
                    target_line INTEGER NOT NULL,
                    shard TEXT NOT NULL,
+                   target_module TEXT,
+                   target_imported_name TEXT,
                    PRIMARY KEY(kind, source_file, source_name, source_line,
                                target_file, target_name, target_line)
                  );
@@ -2044,8 +2083,8 @@ struct PersistedIndex {
     catalog: CatalogStats,
 }
 
-// v8 persists relative named-import evidence for cross-file target binding.
-const PERSIST_VERSION: u32 = 8;
+// v9 persists import evidence on graph edges for fresh query-time target binding.
+const PERSIST_VERSION: u32 = 9;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -2928,6 +2967,111 @@ fn query_persisted_symbols(
     query_persisted_symbols_at(root, data_dir, query, role, kind, file, page, page_size)
 }
 
+fn relative_module_candidates(source_file: &str, module_specifier: &str) -> Vec<String> {
+    if !module_specifier.starts_with('.') || module_specifier.contains('\\') {
+        return Vec::new();
+    }
+    let mut parts = source_file
+        .split('/')
+        .collect::<Vec<_>>();
+    parts.pop();
+    for part in module_specifier.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Vec::new();
+                }
+            }
+            value if value != "." && value != ".." => parts.push(value),
+            _ => return Vec::new(),
+        }
+    }
+    let base = parts.join("/");
+    if base.is_empty() {
+        return Vec::new();
+    }
+    if Path::new(&base).extension().is_some() {
+        return vec![base];
+    }
+    let mut candidates = Vec::new();
+    for extension in ["ets", "ts", "tsx", "js", "jsx"] {
+        candidates.push(format!("{base}.{extension}"));
+        candidates.push(format!("{base}/index.{extension}"));
+    }
+    candidates
+}
+
+fn resolve_relative_module_file(
+    conn: &Connection,
+    source_file: &str,
+    module_specifier: &str,
+) -> Option<String> {
+    let candidates = relative_module_candidates(source_file, module_specifier);
+    if candidates.is_empty() {
+        return None;
+    }
+    let placeholders = (1..=candidates.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut file_statement = match conn.prepare(&format!(
+        "SELECT path FROM files WHERE path IN ({placeholders}) ORDER BY path LIMIT 2"
+    )) {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+    let existing = match file_statement
+        .query_map(params_from_iter(candidates.iter()), |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+    if existing.len() != 1 {
+        return None;
+    }
+    existing.into_iter().next()
+}
+
+fn resolve_import_target_from_catalog(conn: &Connection, edge: &mut StructureEdge) {
+    let (Some(module_specifier), Some(imported_name)) = (
+        edge.target_module.as_deref(),
+        edge.target_imported_name.as_deref(),
+    ) else {
+        return;
+    };
+    let Some(target_file) = resolve_relative_module_file(conn, &edge.source_file, module_specifier)
+    else {
+        edge.target_file.clear();
+        edge.target_line = 0;
+        return;
+    };
+    let mut statement = match conn.prepare(
+        "SELECT line FROM symbols
+         WHERE file=?1 AND name=?2 AND role='entity'
+         ORDER BY line LIMIT 2",
+    ) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let lines = match statement
+        .query_map(params![target_file, imported_name], |row| row.get::<_, i64>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    if lines.len() == 1 {
+        edge.target_file = target_file;
+        edge.target_name = imported_name.to_string();
+        edge.target_line = lines[0].max(0) as usize;
+    } else {
+        edge.target_file.clear();
+        edge.target_line = 0;
+    }
+}
+
 fn query_persisted_edges_at(
     root: &Path,
     data_dir: &Path,
@@ -2945,10 +3089,11 @@ fn query_persisted_edges_at(
     };
     let mut statement = match conn.prepare(
         "SELECT kind, source_file, source_name, source_line,
-                target_file, target_name, target_line
+                target_file, target_name, target_line,
+                target_module, target_imported_name
          FROM symbol_edges
          WHERE (source_file = ?1 AND source_name = ?2 AND source_line = ?3)
-            OR (target_file = ?1 AND target_name = ?2 AND target_line = ?3)",
+            OR (target_file = ?1 AND target_name = ?2)",
     ) {
         Ok(value) => value,
         Err(error) => return Some(Err(format!("准备结构关系查询失败：{error}"))),
@@ -2966,6 +3111,8 @@ fn query_persisted_edges_at(
                     target_file: row.get(4)?,
                     target_name: row.get(5)?,
                     target_line: row.get::<_, i64>(6)?.max(0) as usize,
+                    target_module: row.get(7)?,
+                    target_imported_name: row.get(8)?,
                 })
             },
         ) {
@@ -2979,6 +3126,19 @@ fn query_persisted_edges_at(
             }
         }
     }
+    for edge in &mut edges {
+        resolve_import_target_from_catalog(&conn, edge);
+    }
+    edges.retain(|edge| {
+        symbols.iter().any(|symbol| {
+            (symbol.file == edge.source_file
+                && symbol.name == edge.source_name
+                && symbol.line == edge.source_line)
+                || (symbol.file == edge.target_file
+                    && symbol.name == edge.target_name
+                    && symbol.line == edge.target_line)
+        })
+    });
     edges.sort();
     edges.dedup();
     Some(Ok((edges, total)))
@@ -3711,6 +3871,17 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert!(columns.iter().any(|column| column == "language"));
         assert!(columns.iter().any(|column| column == "source_layer"));
         assert!(columns.iter().any(|column| column == "declared_relations"));
+        let edge_columns = conn
+            .prepare("PRAGMA table_info(symbol_edges)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(edge_columns.iter().any(|column| column == "target_module"));
+        assert!(edge_columns
+            .iter()
+            .any(|column| column == "target_imported_name"));
         let parser_version: i64 = conn
             .query_row(
                 "SELECT parser_version FROM structure_meta WHERE id=1",
@@ -4113,6 +4284,78 @@ class Service extends BaseService implements Loadable, Disposable {}
                 && edge.target_file == "service.ts"
                 && edge.target_line > 0
         }));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn relative_import_relations_resolve_fresh_cross_file_targets() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-import-edge-db-{}", uuid::Uuid::new_v4()));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-import-edge-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("model")).unwrap();
+        std::fs::create_dir_all(root.join("service")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let base_file = root.join("model/base.ts");
+        let service_file = root.join("service/service.ts");
+        std::fs::write(&base_file, "export class BaseService {}\n").unwrap();
+        std::fs::write(
+            &service_file,
+            "import { BaseService as Parent } from '../model/base';\nexport class Service extends Parent {}\n",
+        )
+        .unwrap();
+        let (_, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        scan_file(&base_file, "model/base.ts", &mut symbols);
+        scan_file(&service_file, "service/service.ts", &mut symbols);
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+        let service = symbols
+            .iter()
+            .find(|symbol| symbol.name == "Service")
+            .cloned()
+            .unwrap();
+        let (resolved, _) = query_persisted_edges_at(&root, &data_dir, &[service.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].target_file, "model/base.ts");
+        assert_eq!(resolved[0].target_name, "BaseService");
+        assert_eq!(resolved[0].target_line, 1);
+        let base = symbols
+            .iter()
+            .find(|symbol| symbol.name == "BaseService")
+            .cloned()
+            .unwrap();
+        let (incoming, _) = query_persisted_edges_at(&root, &data_dir, &[base])
+            .unwrap()
+            .unwrap();
+        assert_eq!(incoming.len(), 1, "目标节点应能反查跨文件入边");
+        assert_eq!(incoming[0].source_name, "Service");
+
+        std::fs::write(&base_file, "export class RenamedBaseService {}\n").unwrap();
+        let mut changed = Vec::new();
+        scan_file(&base_file, "model/base.ts", &mut changed);
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            &["model/base.ts".into()],
+            &changed,
+        ));
+        let (stale_safe, _) = query_persisted_edges_at(&root, &data_dir, &[service])
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_safe.len(), 1);
+        assert!(stale_safe[0].target_file.is_empty());
+        assert_eq!(stale_safe[0].target_line, 0);
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();

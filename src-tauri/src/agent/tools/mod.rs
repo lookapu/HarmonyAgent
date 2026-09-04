@@ -3703,7 +3703,16 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         out.push_str("当前页关系：\n");
         for edge in result.relations {
             let target = if edge.target_file.is_empty() || edge.target_line == 0 {
-                format!("{}（语法声明，目标待解析）", edge.target_name)
+                match (
+                    edge.target_module.as_deref(),
+                    edge.target_imported_name.as_deref(),
+                ) {
+                    (Some(module), Some(imported)) => format!(
+                        "{}（来自 {} 的 {}，目标待解析）",
+                        edge.target_name, module, imported
+                    ),
+                    _ => format!("{}（语法声明，目标待解析）", edge.target_name),
+                }
             } else {
                 format!("{} ({}:{})", edge.target_name, edge.target_file, edge.target_line)
             };
