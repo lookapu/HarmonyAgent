@@ -1,6 +1,6 @@
 # 大仓索引基线
 
-> 状态：百万实体文件基准已执行
+> 状态：百万实体文件与百万 SCIP 引用基准已执行
 > 更新日期：2026-09-04
 
 ## 1. 目的
@@ -78,7 +78,31 @@ ArkTS 专用 grammar 接入后的 10,000 个 `.ets` 实体文件复测：生成�
 {"architecture":"aarch64","cancellation_checks":33,"cancellation_latency_ms":4,"cancelled_batch_promoted":0,"catalog_discovered_files":1000000,"catalog_source_files":1000000,"cold_index_ms":48987,"cold_symbols":16000,"configured_max_files":4000,"coverage":"partial_996000_source_files_deferred_by_parse_budget","database_bytes":234254336,"deferred_after_progressive_batch":995872,"deferred_source_files":996000,"generation_ms":82444,"incremental_symbols":4,"indexed_files":4000,"indexed_relations":4128,"peak_rss_kib":25040,"platform":"macos","progressive_batch_files":128,"progressive_batch_ms":343,"progressive_lock_wait_ms":88,"requested_files":1000000,"schema_version":4,"single_file_incremental_ms":227,"structure_parse_is_partial":true,"warm_query_matches":1,"warm_query_ms":1,"warm_query_page_items":1}
 ```
 
-## 6. 后续升级
+## 6. SCIP 精确引用导入
+
+SCIP importer 基准使用一个定义文件和一个引用文件生成独立 protobuf `Document`，引用行号保持唯一，用于隔离测量流式解码、SQLite 暂存、定义连接和精确引用边构建。它不代表真实混合语言索引的符号分布，但可以稳定回归 O(文档+引用) 的导入路径、256 文档批事务和 50,000 行关系构建批次。
+
+```bash
+HARMONY_SCIP_BENCH_DOCS=100000 cargo test --manifest-path src-tauri/Cargo.toml --lib services::scip_index::tests::large_scip_import_baseline -- --ignored --exact --nocapture
+```
+
+同一台 Apple Silicon 开发机的 2026-09-04 结果：
+
+| 引用 | SCIP 文档 | 导入 | 吞吐 | SCIP 文件 | SQLite |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 10,001 | 368 ms | 27,173 文档/s | 0.64 MiB | 5.14 MiB |
+| 100,000 | 100,001 | 3.70 s | 27,041 文档/s | 6.47 MiB | 51.96 MiB |
+| 1,000,000 | 1,000,001 | 38.92 s | 25,694 文档/s | 64.83 MiB | 524.24 MiB |
+
+三个档位的引用解析率均为 100%。百万档吞吐相对 10k 档下降约 5.4%，没有出现随深页或全量内存累积导致的数量级退化。热点符号关系查询已设 500 条单次安全上限并返回截断标志，完整关系仍保留在索引中。当前主要成本转为 SQLite 暂存与精确边的磁盘写放大；下一轮应针对真实 indexer 产物测量符号重复率、未解析外部依赖比例、P95 查询和导入期间前台查询延迟。
+
+原始百万档输出：
+
+```json
+{"architecture":"aarch64","database_bytes":549703680,"documents":1000001,"documents_per_second":25694,"edge_batch_rows":50000,"import_ms":38919,"index_bytes":67983554,"platform":"macos","references":1000000,"resolved_references":1000000,"schema_version":1,"transaction_documents":256}
+```
+
+## 7. 后续升级
 
 下一阶段应在不改变 schema 既有字段含义的前提下增加：
 

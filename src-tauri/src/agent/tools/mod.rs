@@ -3762,6 +3762,11 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
                 edge.kind, edge.source_name, edge.source_file, edge.source_line, target,
             ));
         }
+        if result.relations_truncated {
+            out.push_str(
+                "关系结果已达到单次 500 条安全上限；请缩小 query/file，或按具体符号继续查询。\n",
+            );
+        }
     }
     if let Some(next_cursor) = result.next_cursor {
         out.push_str(&format!("还有结果：优先原样传入 cursor={next_cursor} 读取下一页。\n"));

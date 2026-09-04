@@ -32,6 +32,7 @@ const STRUCTURE_PARSER_VERSION: i64 = 11;
 const MAX_REEXPORT_DEPTH: usize = 8;
 const MAX_REEXPORT_BRANCHES: usize = 16;
 const MAX_REEXPORT_VISITS: usize = 128;
+const MAX_QUERY_RELATIONS: usize = 500;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -3413,6 +3414,8 @@ pub struct StructureQueryResult {
     pub items: Vec<Symbol>,
     /// 与当前页节点相连的结构关系；端点可能位于当前页之外。
     pub relations: Vec<StructureEdge>,
+    /// 单次关系预算已用尽；调用方应缩小符号或文件过滤条件。
+    pub relations_truncated: bool,
     pub total_matches: usize,
     pub page: usize,
     pub page_size: usize,
@@ -4362,11 +4365,11 @@ fn resolve_import_target_from_catalog(
     }
 }
 
-fn query_persisted_edges_at(
+fn query_persisted_edges_bounded_at(
     root: &Path,
     data_dir: &Path,
     symbols: &[Symbol],
-) -> Option<Result<(Vec<StructureEdge>, usize), String>> {
+) -> Option<Result<(Vec<StructureEdge>, usize, bool), String>> {
     let conn = match Connection::open(catalog_file_at(data_dir, root)) {
         Ok(value) => value,
         Err(error) => return Some(Err(format!("打开结构关系库失败：{error}"))),
@@ -4391,7 +4394,12 @@ fn query_persisted_edges_at(
         Err(error) => return Some(Err(format!("准备结构关系查询失败：{error}"))),
     };
     let mut edges = Vec::new();
+    let mut truncated = false;
     for symbol in symbols {
+        if edges.len() >= MAX_QUERY_RELATIONS {
+            truncated = true;
+            break;
+        }
         let rows = match statement.query_map(
             params![symbol.file, symbol.name, symbol.line as i64],
             |row| {
@@ -4412,6 +4420,10 @@ fn query_persisted_edges_at(
             Err(error) => return Some(Err(format!("读取结构关系失败：{error}"))),
         };
         for row in rows {
+            if edges.len() >= MAX_QUERY_RELATIONS {
+                truncated = true;
+                break;
+            }
             match row {
                 Ok(edge) => edges.push(edge),
                 Err(error) => return Some(Err(format!("解析结构关系失败：{error}"))),
@@ -4444,6 +4456,10 @@ fn query_persisted_edges_at(
         Err(error) => return Some(Err(format!("准备语义调用关系查询失败：{error}"))),
     };
     for symbol in symbols {
+        if edges.len() >= MAX_QUERY_RELATIONS {
+            truncated = true;
+            break;
+        }
         let rows = match semantic_statement.query_map(
             params![symbol.file, symbol.name, symbol.line as i64],
             |row| {
@@ -4464,6 +4480,10 @@ fn query_persisted_edges_at(
             Err(error) => return Some(Err(format!("读取语义调用关系失败：{error}"))),
         };
         for row in rows {
+            if edges.len() >= MAX_QUERY_RELATIONS {
+                truncated = true;
+                break;
+            }
             match row {
                 Ok(edge) => edges.push(edge),
                 Err(error) => return Some(Err(format!("解析语义调用关系失败：{error}"))),
@@ -4495,6 +4515,10 @@ fn query_persisted_edges_at(
             Err(error) => return Some(Err(format!("准备 SCIP 引用查询失败：{error}"))),
         };
         for symbol in symbols {
+            if edges.len() >= MAX_QUERY_RELATIONS {
+                truncated = true;
+                break;
+            }
             let rows = match scip_statement.query_map(
                 params![symbol.file, symbol.name, symbol.line as i64],
                 |row| Ok(StructureEdge {
@@ -4510,6 +4534,10 @@ fn query_persisted_edges_at(
                 Err(error) => return Some(Err(format!("读取 SCIP 引用失败：{error}"))),
             };
             for row in rows {
+                if edges.len() >= MAX_QUERY_RELATIONS {
+                    truncated = true;
+                    break;
+                }
                 match row {
                     Ok(edge) => edges.push(edge),
                     Err(error) => return Some(Err(format!("解析 SCIP 引用失败：{error}"))),
@@ -4533,15 +4561,25 @@ fn query_persisted_edges_at(
     });
     edges.sort();
     edges.dedup();
-    Some(Ok((edges, total)))
+    Some(Ok((edges, total, truncated)))
+}
+
+#[cfg(test)]
+fn query_persisted_edges_at(
+    root: &Path,
+    data_dir: &Path,
+    symbols: &[Symbol],
+) -> Option<Result<(Vec<StructureEdge>, usize), String>> {
+    query_persisted_edges_bounded_at(root, data_dir, symbols)
+        .map(|result| result.map(|(edges, total, _)| (edges, total)))
 }
 
 fn query_persisted_edges(
     root: &Path,
     symbols: &[Symbol],
-) -> Option<Result<(Vec<StructureEdge>, usize), String>> {
+) -> Option<Result<(Vec<StructureEdge>, usize, bool), String>> {
     let data_dir = DATA_DIR.get()?;
-    query_persisted_edges_at(root, data_dir, symbols)
+    query_persisted_edges_bounded_at(root, data_dir, symbols)
 }
 
 fn utf16_column_to_byte(line: &str, utf16_column: usize) -> usize {
@@ -5135,9 +5173,11 @@ pub fn query_structure_with_cursor(
         let total = structure_edges(&syms).len();
         edges.sort();
         edges.dedup();
-        (edges, total)
+        let truncated = edges.len() > MAX_QUERY_RELATIONS;
+        edges.truncate(MAX_QUERY_RELATIONS);
+        (edges, total, truncated)
     };
-    let (relations, indexed_relations) = query_persisted_edges(root, &items)
+    let (relations, indexed_relations, relations_truncated) = query_persisted_edges(root, &items)
         .and_then(Result::ok)
         .unwrap_or_else(fallback_edges);
     let next_page = decoded_cursor
@@ -5179,6 +5219,7 @@ pub fn query_structure_with_cursor(
     Ok(StructureQueryResult {
         items,
         relations,
+        relations_truncated,
         total_matches,
         page,
         page_size,
@@ -6204,6 +6245,64 @@ class Service extends BaseService implements Loadable, Disposable {}
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn popular_symbol_relations_are_bounded_per_query() {
+        let root = std::env::temp_dir()
+            .join(format!("deveco-relation-cap-db-{}", uuid::Uuid::new_v4()));
+        let data_dir = std::env::temp_dir()
+            .join(format!("deveco-relation-cap-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("source.ts"), "function caller() {}\n").unwrap();
+        std::fs::write(root.join("target.ts"), "function fetch() {}\n").unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        let indexed_files = files.keys().cloned().collect::<Vec<_>>();
+        assert!(replace_all_symbol_rows_with_files_at(
+            &root,
+            &data_dir,
+            &symbols,
+            &indexed_files,
+            catalog.revision,
+        ));
+        let database = catalog_file_at(&data_dir, &root);
+        let conn = Connection::open(database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scip_import_state(id INTEGER PRIMARY KEY, active_import_id INTEGER, edge_count INTEGER);
+             INSERT INTO scip_import_state VALUES(1, 7, 600);
+             CREATE TABLE scip_reference_edges(
+               import_id INTEGER, source_file TEXT, source_name TEXT, source_line INTEGER,
+               occurrence_line INTEGER, occurrence_column INTEGER, source_size INTEGER,
+               source_mtime_ns INTEGER, target_file TEXT, target_name TEXT, target_line INTEGER,
+               target_size INTEGER, target_mtime_ns INTEGER, symbol_key TEXT
+             );
+             CREATE INDEX idx_test_scip_source ON scip_reference_edges(import_id, source_file, source_name, source_line);
+             CREATE INDEX idx_test_scip_target ON scip_reference_edges(import_id, target_file, target_name, target_line);",
+        ).unwrap();
+        let source_stamp = files["source.ts"];
+        let target_stamp = files["target.ts"];
+        for column in 0..600i64 {
+            let source_name = format!("caller_{column}");
+            conn.execute(
+                "INSERT INTO scip_reference_edges VALUES(7,'source.ts',?1,1,1,?2,?3,?4,'target.ts','fetch',1,?5,?6,'symbol')",
+                params![source_name, column, source_stamp.len as i64, source_stamp.mtime as i64, target_stamp.len as i64, target_stamp.mtime as i64],
+            ).unwrap();
+        }
+        drop(conn);
+        let target = symbols.iter().find(|symbol| symbol.name == "fetch").cloned().unwrap();
+        let (edges, total, truncated) = query_persisted_edges_bounded_at(&root, &data_dir, &[target])
+            .unwrap().unwrap();
+        assert_eq!(total, 600);
+        assert_eq!(edges.len(), MAX_QUERY_RELATIONS);
+        assert!(truncated);
+        assert!(edges.iter().all(|edge| edge.kind == "references"));
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[test]

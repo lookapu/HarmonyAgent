@@ -706,6 +706,7 @@ pub fn import(root: &Path, database: &Path, index: &Path) -> Result<ScipImportSt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufWriter, Write};
 
     fn varint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
@@ -888,6 +889,109 @@ mod tests {
             active
         );
         drop(conn);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "手动 SCIP 流式导入基准；通过 HARMONY_SCIP_BENCH_DOCS 选择规模"]
+    fn large_scip_import_baseline() {
+        let documents = std::env::var("HARMONY_SCIP_BENCH_DOCS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10_000)
+            .clamp(1, 1_000_000);
+        let root =
+            std::env::temp_dir().join(format!("harmony-scip-bench-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let source = root.join("src/source.ts");
+        let target = root.join("src/target.ts");
+        fs::write(&source, "function caller() { fetch(); }\n").unwrap();
+        fs::write(&target, "function fetch() {}\n").unwrap();
+        let database = root.join("catalog.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+             CREATE TABLE files(path TEXT PRIMARY KEY, state TEXT, size INTEGER, mtime_ns INTEGER);
+             CREATE TABLE symbols(file TEXT, name TEXT, line INTEGER, end_line INTEGER, role TEXT);",
+        ).unwrap();
+        for (path, rel) in [(&source, "src/source.ts"), (&target, "src/target.ts")] {
+            let meta = fs::metadata(path).unwrap();
+            let mtime = meta
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+            conn.execute(
+                "INSERT INTO files VALUES(?1,'indexed',?2,?3)",
+                params![rel, meta.len() as i64, mtime],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO symbols VALUES('src/source.ts','caller',1,1,'logic')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES('src/target.ts','fetch',1,1,'logic')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let symbol = "scip-typescript npm bench 1.0 fetch().";
+        let index = root.join("index.scip");
+        let mut writer = BufWriter::new(File::create(&index).unwrap());
+        writer
+            .write_all(&len_field(
+                2,
+                &document("src/target.ts", &[occurrence(symbol, 0, 9, true)]),
+            ))
+            .unwrap();
+        for line in 0..documents {
+            writer
+                .write_all(&len_field(
+                    2,
+                    &document(
+                        "src/source.ts",
+                        &[occurrence(symbol, line as u64, 20, false)],
+                    ),
+                ))
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        let started = std::time::Instant::now();
+        let stats = import(&root, &database, &index).unwrap();
+        let import_ms = started.elapsed().as_millis() as u64;
+        assert_eq!(stats.resolved_references, documents);
+        let database_bytes = [
+            database.clone(),
+            database.with_extension("sqlite3-wal"),
+            database.with_extension("sqlite3-shm"),
+        ]
+        .into_iter()
+        .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+        .sum::<u64>();
+        println!(
+            "HARMONY_SCIP_BASELINE={}",
+            serde_json::json!({
+                "schema_version": 1,
+                "documents": documents + 1,
+                "references": documents,
+                "resolved_references": stats.resolved_references,
+                "index_bytes": fs::metadata(&index).unwrap().len(),
+                "database_bytes": database_bytes,
+                "import_ms": import_ms,
+                "documents_per_second": (documents as u64).saturating_mul(1000) / import_ms.max(1),
+                "transaction_documents": DOCUMENTS_PER_TRANSACTION,
+                "edge_batch_rows": EDGE_BUILD_BATCH_ROWS,
+                "platform": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+            })
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
