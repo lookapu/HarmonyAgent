@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use rusqlite::{params, params_from_iter, types::Value, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection, TransactionBehavior};
 
 use crate::services::harmony;
 
@@ -926,8 +926,9 @@ fn replace_changed_symbol_rows(root: &Path, rels: &[String], symbols: &[Symbol])
 #[derive(Debug)]
 struct DeferredBatchResult {
     promoted: usize,
-    catalog: CatalogStats,
+    catalog: Option<CatalogStats>,
     needs_reconciliation: bool,
+    lock_wait_ms: u64,
 }
 
 /// 从 SQLite 领取一小批 deferred 文件，锁外解析，再以指纹条件更新提交。
@@ -950,6 +951,8 @@ where
 {
     let db_path = catalog_file_at(data_dir, root);
     let mut conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
     let deferred = {
         let mut statement = conn
             .prepare(
@@ -975,8 +978,9 @@ where
     if deferred.is_empty() {
         return Ok(DeferredBatchResult {
             promoted: 0,
-            catalog: catalog_stats(&conn).map_err(|error| error.to_string())?,
+            catalog: Some(catalog_stats(&conn).map_err(|error| error.to_string())?),
             needs_reconciliation: false,
+            lock_wait_ms: 0,
         });
     }
 
@@ -986,8 +990,9 @@ where
         if is_cancelled() {
             return Ok(DeferredBatchResult {
                 promoted: 0,
-                catalog: catalog_stats(&conn).map_err(|error| error.to_string())?,
+                catalog: None,
                 needs_reconciliation: false,
+                lock_wait_ms: 0,
             });
         }
         let path = root.join(&rel);
@@ -1003,12 +1008,17 @@ where
     if is_cancelled() {
         return Ok(DeferredBatchResult {
             promoted: 0,
-            catalog: catalog_stats(&conn).map_err(|error| error.to_string())?,
+            catalog: None,
             needs_reconciliation: false,
+            lock_wait_ms: 0,
         });
     }
 
-    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let lock_started = std::time::Instant::now();
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let lock_wait_ms = lock_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let mut promoted = 0usize;
     for (rel, expected, symbols) in parsed {
         let updated = transaction
@@ -1050,8 +1060,9 @@ where
     let catalog = catalog_stats(&conn).map_err(|error| error.to_string())?;
     Ok(DeferredBatchResult {
         promoted,
-        catalog,
+        catalog: Some(catalog),
         needs_reconciliation,
+        lock_wait_ms,
     })
 }
 
@@ -1061,6 +1072,7 @@ struct ProgressiveWorker {
     promoted: AtomicUsize,
     batches: AtomicUsize,
     last_batch_ms: AtomicU64,
+    last_lock_wait_ms: AtomicU64,
     throttle_ms: AtomicU64,
 }
 
@@ -1096,6 +1108,7 @@ fn ensure_progressive_indexing(root: &Path) {
         promoted: AtomicUsize::new(0),
         batches: AtomicUsize::new(0),
         last_batch_ms: AtomicU64::new(0),
+        last_lock_wait_ms: AtomicU64::new(0),
         throttle_ms: AtomicU64::new(20),
     });
     guard.insert(key.clone(), state.clone());
@@ -1119,14 +1132,19 @@ fn ensure_progressive_indexing(root: &Path) {
                     Ok(result) => {
                         let elapsed_ms = batch_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                         state.last_batch_ms.store(elapsed_ms, Ordering::Relaxed);
+                        state
+                            .last_lock_wait_ms
+                            .store(result.lock_wait_ms, Ordering::Relaxed);
                         state.promoted.fetch_add(result.promoted, Ordering::Relaxed);
                         state.batches.fetch_add(1, Ordering::Relaxed);
-                        if let Ok(mut cache) = cache().lock() {
-                            if let Some(entry) = cache.get_mut(&key) {
-                                entry.catalog = CatalogStats {
-                                    unreadable_directories: entry.catalog.unreadable_directories,
-                                    ..result.catalog
-                                };
+                        if let Some(catalog) = result.catalog {
+                            if let Ok(mut cache) = cache().lock() {
+                                if let Some(entry) = cache.get_mut(&key) {
+                                    entry.catalog = CatalogStats {
+                                        unreadable_directories: entry.catalog.unreadable_directories,
+                                        ..catalog
+                                    };
+                                }
                             }
                         }
                         if result.needs_reconciliation {
@@ -1293,6 +1311,8 @@ fn collect_files_at_with_budget(
                  );
                  CREATE INDEX IF NOT EXISTS idx_files_state ON files(state);
                  CREATE INDEX IF NOT EXISTS idx_files_shard ON files(shard);
+                 CREATE INDEX IF NOT EXISTS idx_files_state_order
+                   ON files(state, shard, path);
                  CREATE TABLE IF NOT EXISTS symbols (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                    file TEXT NOT NULL,
@@ -1984,6 +2004,7 @@ pub struct ProgressiveIndexStatus {
     pub promoted_this_run: usize,
     pub batches: usize,
     pub last_batch_ms: u64,
+    pub last_lock_wait_ms: u64,
     pub throttle_ms: u64,
     pub remaining_files: usize,
 }
@@ -2001,6 +2022,7 @@ fn progressive_status(root: &Path, remaining_files: usize) -> ProgressiveIndexSt
             promoted_this_run: state.promoted.load(Ordering::Relaxed),
             batches: state.batches.load(Ordering::Relaxed),
             last_batch_ms: state.last_batch_ms.load(Ordering::Relaxed),
+            last_lock_wait_ms: state.last_lock_wait_ms.load(Ordering::Relaxed),
             throttle_ms: state.throttle_ms.load(Ordering::Relaxed),
             remaining_files,
         },
@@ -3141,6 +3163,23 @@ struct Detail {
             "游标续页应从复合索引定位而不是扫描前序页：{cursor_plan}"
         );
 
+        let deferred_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT path, size, mtime_ns FROM files
+                 WHERE state='deferred' ORDER BY shard, path LIMIT 128",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            deferred_plan.contains("idx_files_state_order"),
+            "渐进批次领取应使用覆盖顺序索引：{deferred_plan}"
+        );
+
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
     }
@@ -3302,12 +3341,13 @@ struct Detail {
 
         let cancelled = promote_deferred_batch_at_if(&root, &data_dir, 1, || true).unwrap();
         assert_eq!(cancelled.promoted, 0);
-        assert_eq!(cancelled.catalog.deferred_source_files, 2);
+        assert!(cancelled.catalog.is_none());
 
         let first = promote_deferred_batch_at(&root, &data_dir, 1).unwrap();
+        let first_catalog = first.catalog.expect("成功批次应刷新目录统计");
         assert_eq!(first.promoted, 1);
-        assert_eq!(first.catalog.indexed_source_files, 2);
-        assert_eq!(first.catalog.deferred_source_files, 1);
+        assert_eq!(first_catalog.indexed_source_files, 2);
+        assert_eq!(first_catalog.deferred_source_files, 1);
         assert!(!first.needs_reconciliation);
         let (_, reconciled) = collect_files_at_with_budget(&root, Some(&data_dir), 1);
         assert_eq!(reconciled.indexed_source_files, 2, "已提升文件不应被基础预算降级");
@@ -3331,9 +3371,10 @@ struct Detail {
         )
         .unwrap();
         let stale = promote_deferred_batch_at(&root, &data_dir, 1).unwrap();
+        let stale_catalog = stale.catalog.expect("非取消批次应刷新目录统计");
         assert_eq!(stale.promoted, 0);
         assert!(stale.needs_reconciliation);
-        assert_eq!(stale.catalog.deferred_source_files, 1);
+        assert_eq!(stale_catalog.deferred_source_files, 1);
         assert!(catalog.revision > 0);
 
         std::fs::remove_dir_all(&root).ok();
@@ -3412,6 +3453,27 @@ struct Detail {
         std::fs::write(dir.join("a.ets"), "struct Aaa {}\nfn oldA() {}").unwrap();
         std::fs::write(dir.join("b.ets"), "struct Bbb {}").unwrap();
         dir
+    }
+
+    fn peak_rss_kib() -> Option<u64> {
+        #[cfg(unix)]
+        {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+            // SAFETY: getrusage initializes the provided rusage buffer for the current process.
+            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            // SAFETY: a successful getrusage call initialized the whole rusage value.
+            let bytes_or_kib = unsafe { usage.assume_init() }.ru_maxrss.max(0) as u64;
+            #[cfg(target_os = "macos")]
+            return Some(bytes_or_kib / 1024);
+            #[cfg(not(target_os = "macos"))]
+            return Some(bytes_or_kib);
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     #[test]
@@ -3542,6 +3604,7 @@ struct Detail {
         ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
+        let rss_before_kib = peak_rss_kib();
 
         let generate_started = std::time::Instant::now();
         for index in 0..requested {
@@ -3558,6 +3621,7 @@ struct Detail {
             .unwrap();
         }
         let generation_ms = generate_started.elapsed().as_millis() as u64;
+        let rss_after_generation_kib = peak_rss_kib();
 
         let cold_started = std::time::Instant::now();
         let (files, catalog) = collect_files_at(&root, Some(&data_dir));
@@ -3572,6 +3636,7 @@ struct Detail {
             catalog.revision,
         ));
         let cold_ms = cold_started.elapsed().as_millis() as u64;
+        let rss_after_cold_index_kib = peak_rss_kib();
 
         let query_name = cold_symbols
             .iter()
@@ -3592,6 +3657,36 @@ struct Detail {
         .unwrap()
         .unwrap();
         let warm_ms = warm_started.elapsed().as_millis() as u64;
+
+        // Hold a real SQLite write lock briefly so the batch reports observable contention.
+        let db_path = catalog_file_at(&data_dir, &root);
+        let blocker_path = db_path.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let blocker = std::thread::spawn(move || {
+            let mut conn = Connection::open(blocker_path).unwrap();
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            transaction.commit().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let progressive_started = std::time::Instant::now();
+        let progressive = promote_deferred_batch_at(&root, &data_dir, 128).unwrap();
+        let progressive_batch_ms = progressive_started.elapsed().as_millis() as u64;
+        blocker.join().unwrap();
+
+        let cancel_checks = std::cell::Cell::new(0usize);
+        let cancel_started = std::time::Instant::now();
+        let cancelled = promote_deferred_batch_at_if(&root, &data_dir, 128, || {
+            let next = cancel_checks.get().saturating_add(1);
+            cancel_checks.set(next);
+            next > 32
+        })
+        .unwrap();
+        let cancellation_latency_ms = cancel_started.elapsed().as_millis() as u64;
+        let rss_after_progressive_kib = peak_rss_kib();
 
         let changed_file = files.keys().next().cloned().expect("基准至少应索引一个文件");
         std::fs::write(
@@ -3614,11 +3709,29 @@ struct Detail {
         ));
         let incremental_ms = incremental_started.elapsed().as_millis() as u64;
         let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").unwrap();
         let relation_count: usize = conn
             .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get::<_, i64>(0))
             .unwrap()
             .max(0) as usize;
         drop(conn);
+        let database_bytes = [
+            db_path.clone(),
+            db_path.with_extension("sqlite3-wal"),
+            db_path.with_extension("sqlite3-shm"),
+        ]
+        .into_iter()
+        .filter_map(|path| std::fs::metadata(path).ok().map(|metadata| metadata.len()))
+        .sum::<u64>();
+        let peak_rss_kib = [
+            rss_before_kib,
+            rss_after_generation_kib,
+            rss_after_cold_index_kib,
+            rss_after_progressive_kib,
+        ]
+        .into_iter()
+        .flatten()
+        .max();
         assert_eq!(catalog.discovered_files, requested);
         assert_eq!(catalog.source_files, requested);
         assert_eq!(
@@ -3627,7 +3740,7 @@ struct Detail {
         );
 
         let report = serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "requested_files": requested,
             "configured_max_files": MAX_FILES,
             "indexed_files": cold_symbols.iter().map(|symbol| &symbol.file).collect::<std::collections::HashSet<_>>().len(),
@@ -3644,6 +3757,19 @@ struct Detail {
             "cold_index_ms": cold_ms,
             "warm_query_ms": warm_ms,
             "single_file_incremental_ms": incremental_ms,
+            "progressive_batch_files": progressive.promoted,
+            "progressive_batch_ms": progressive_batch_ms,
+            "progressive_lock_wait_ms": progressive.lock_wait_ms,
+            "deferred_after_progressive_batch": progressive.catalog.expect("成功批次应刷新目录统计").deferred_source_files,
+            "cancellation_latency_ms": cancellation_latency_ms,
+            "cancellation_checks": cancel_checks.get(),
+            "cancelled_batch_promoted": cancelled.promoted,
+            "database_bytes": database_bytes,
+            "peak_rss_before_kib": rss_before_kib,
+            "peak_rss_after_generation_kib": rss_after_generation_kib,
+            "peak_rss_after_cold_index_kib": rss_after_cold_index_kib,
+            "peak_rss_after_progressive_kib": rss_after_progressive_kib,
+            "peak_rss_kib": peak_rss_kib,
             "structure_parse_is_partial": requested > MAX_FILES,
             "platform": std::env::consts::OS,
             "architecture": std::env::consts::ARCH,
@@ -3656,6 +3782,9 @@ struct Detail {
         assert!(incremental_symbols
             .iter()
             .any(|symbol| symbol.name == "symbol_after_incremental_update"));
+        assert_eq!(progressive.promoted, requested.saturating_sub(MAX_FILES).min(128));
+        assert_eq!(cancelled.promoted, 0);
+        assert!(cancel_checks.get() <= 33);
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
     }

@@ -1146,6 +1146,7 @@ dependencies = [
  "hyper-util",
  "image",
  "keyring",
+ "libc",
  "local-ip-address",
  "notify",
  "pdf-extract",
