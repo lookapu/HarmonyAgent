@@ -1424,6 +1424,27 @@ fn replace_all_symbol_rows_with_files_at(
     {
         return false;
     }
+    if transaction
+        .execute(
+            "DELETE FROM semantic_target_scans
+             WHERE NOT EXISTS (
+               SELECT 1 FROM files f
+               WHERE f.path=semantic_target_scans.target_file AND f.state='indexed'
+                 AND f.size=semantic_target_scans.target_size
+                 AND f.mtime_ns=semantic_target_scans.target_mtime_ns
+             )
+             OR NOT EXISTS (
+               SELECT 1 FROM symbols target
+               WHERE target.file=semantic_target_scans.target_file
+                 AND target.name=semantic_target_scans.target_name
+                 AND target.line=semantic_target_scans.target_line AND target.role='logic'
+             )",
+            [],
+        )
+        .is_err()
+    {
+        return false;
+    }
     let mut baseline_files = symbols
         .iter()
         .map(|symbol| symbol.file.as_str())
@@ -1586,6 +1607,17 @@ fn replace_changed_symbol_rows_at(
                  WHERE source_file = ?1
                     OR substr(source_file, 1, length(?1) + 1) = ?1 || '/'
                     OR target_file = ?1
+                    OR substr(target_file, 1, length(?1) + 1) = ?1 || '/'",
+                params![rel],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if transaction
+            .execute(
+                "DELETE FROM semantic_target_scans
+                 WHERE target_file = ?1
                     OR substr(target_file, 1, length(?1) + 1) = ?1 || '/'",
                 params![rel],
             )
@@ -2035,7 +2067,20 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_semantic_calls_source
            ON semantic_call_edges(source_file, source_name, source_line);
          CREATE INDEX IF NOT EXISTS idx_semantic_calls_target
-           ON semantic_call_edges(target_file, target_name, target_line);",
+           ON semantic_call_edges(target_file, target_name, target_line);
+         CREATE TABLE IF NOT EXISTS semantic_target_scans (
+           target_file TEXT NOT NULL,
+           target_name TEXT NOT NULL,
+           target_line INTEGER NOT NULL,
+           target_size INTEGER NOT NULL,
+           target_mtime_ns INTEGER NOT NULL,
+           provider TEXT NOT NULL,
+           scanned_at INTEGER NOT NULL,
+           reference_count INTEGER NOT NULL,
+           recorded_call_count INTEGER NOT NULL,
+           truncated INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY(target_file, target_name, target_line, provider)
+         );",
     )?;
     let columns = conn
         .prepare("PRAGMA table_info(symbols)")?
@@ -2111,6 +2156,54 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !stats_columns
+        .iter()
+        .any(|column| column == "logic_symbol_count")
+    {
+        conn.execute(
+            "ALTER TABLE structure_stats
+             ADD COLUMN logic_symbol_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE structure_stats SET logic_symbol_count=(
+               SELECT COUNT(*) FROM symbols WHERE role='logic'
+             ) WHERE id=1",
+            [],
+        )?;
+    }
+    if !stats_columns
+        .iter()
+        .any(|column| column == "semantic_target_count")
+    {
+        conn.execute(
+            "ALTER TABLE structure_stats
+             ADD COLUMN semantic_target_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE structure_stats SET semantic_target_count=(
+               SELECT COUNT(*) FROM semantic_target_scans
+             ) WHERE id=1",
+            [],
+        )?;
+    }
+    if !stats_columns
+        .iter()
+        .any(|column| column == "semantic_truncated_target_count")
+    {
+        conn.execute(
+            "ALTER TABLE structure_stats
+             ADD COLUMN semantic_truncated_target_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE structure_stats SET semantic_truncated_target_count=(
+               SELECT COUNT(*) FROM semantic_target_scans WHERE truncated=1
+             ) WHERE id=1",
+            [],
+        )?;
+    }
     conn.execute_batch(
         "CREATE TRIGGER IF NOT EXISTS trg_semantic_call_edges_insert
            AFTER INSERT ON semantic_call_edges BEGIN
@@ -2121,6 +2214,36 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
            AFTER DELETE ON semantic_call_edges BEGIN
              UPDATE structure_stats
              SET semantic_relation_count=MAX(0, semantic_relation_count - 1) WHERE id=1;
+           END;
+         CREATE TRIGGER IF NOT EXISTS trg_logic_symbols_insert
+           AFTER INSERT ON symbols WHEN NEW.role='logic' BEGIN
+             UPDATE structure_stats SET logic_symbol_count=logic_symbol_count + 1 WHERE id=1;
+           END;
+         CREATE TRIGGER IF NOT EXISTS trg_logic_symbols_delete
+           AFTER DELETE ON symbols WHEN OLD.role='logic' BEGIN
+             UPDATE structure_stats SET logic_symbol_count=MAX(0, logic_symbol_count - 1) WHERE id=1;
+           END;
+         CREATE TRIGGER IF NOT EXISTS trg_semantic_target_scans_insert
+           AFTER INSERT ON semantic_target_scans BEGIN
+             UPDATE structure_stats
+             SET semantic_target_count=semantic_target_count + 1,
+                 semantic_truncated_target_count=semantic_truncated_target_count + NEW.truncated
+             WHERE id=1;
+           END;
+         CREATE TRIGGER IF NOT EXISTS trg_semantic_target_scans_delete
+           AFTER DELETE ON semantic_target_scans BEGIN
+             UPDATE structure_stats
+             SET semantic_target_count=MAX(0, semantic_target_count - 1),
+                 semantic_truncated_target_count=MAX(
+                   0, semantic_truncated_target_count - OLD.truncated
+                 ) WHERE id=1;
+           END;
+         CREATE TRIGGER IF NOT EXISTS trg_semantic_target_scans_update
+           AFTER UPDATE OF truncated ON semantic_target_scans BEGIN
+             UPDATE structure_stats
+             SET semantic_truncated_target_count=MAX(
+               0, semantic_truncated_target_count + NEW.truncated - OLD.truncated
+             ) WHERE id=1;
            END;",
     )?;
     let parser_version = conn.query_row(
@@ -2134,6 +2257,7 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         transaction.execute("DELETE FROM symbols", [])?;
         transaction.execute("DELETE FROM module_reexports", [])?;
         transaction.execute("DELETE FROM semantic_call_edges", [])?;
+        transaction.execute("DELETE FROM semantic_target_scans", [])?;
         transaction.execute("UPDATE files SET state='deferred' WHERE state='indexed'", [])?;
         transaction.execute(
             "UPDATE structure_meta
@@ -2245,10 +2369,26 @@ fn collect_files_at_with_budget(
                    ON semantic_call_edges(source_file, source_name, source_line);
                  CREATE INDEX IF NOT EXISTS idx_semantic_calls_target
                    ON semantic_call_edges(target_file, target_name, target_line);
+                 CREATE TABLE IF NOT EXISTS semantic_target_scans (
+                   target_file TEXT NOT NULL,
+                   target_name TEXT NOT NULL,
+                   target_line INTEGER NOT NULL,
+                   target_size INTEGER NOT NULL,
+                   target_mtime_ns INTEGER NOT NULL,
+                   provider TEXT NOT NULL,
+                   scanned_at INTEGER NOT NULL,
+                   reference_count INTEGER NOT NULL,
+                   recorded_call_count INTEGER NOT NULL,
+                   truncated INTEGER NOT NULL DEFAULT 0,
+                   PRIMARY KEY(target_file, target_name, target_line, provider)
+                 );
                  CREATE TABLE IF NOT EXISTS structure_stats (
                    id INTEGER PRIMARY KEY CHECK(id = 1),
                    relation_count INTEGER NOT NULL DEFAULT 0,
-                   semantic_relation_count INTEGER NOT NULL DEFAULT 0
+                   semantic_relation_count INTEGER NOT NULL DEFAULT 0,
+                   logic_symbol_count INTEGER NOT NULL DEFAULT 0,
+                   semantic_target_count INTEGER NOT NULL DEFAULT 0,
+                   semantic_truncated_target_count INTEGER NOT NULL DEFAULT 0
                  );
                  INSERT OR IGNORE INTO structure_stats(id, relation_count)
                    SELECT 1, COUNT(*) FROM symbol_edges;
@@ -2954,6 +3094,78 @@ fn progressive_status(_root: &Path, remaining_files: usize) -> ProgressiveIndexS
 }
 
 #[derive(Debug, Serialize)]
+pub struct SemanticCoverageStats {
+    pub indexed_logic_symbols: usize,
+    pub scanned_logic_symbols: usize,
+    pub semantic_call_relations: usize,
+    pub truncated_targets: usize,
+    pub coverage_percent: f64,
+    pub coverage: String,
+}
+
+impl SemanticCoverageStats {
+    fn from_counts(
+        indexed_logic_symbols: usize,
+        scanned_logic_symbols: usize,
+        semantic_call_relations: usize,
+        truncated_targets: usize,
+    ) -> Self {
+        let scanned_logic_symbols = scanned_logic_symbols.min(indexed_logic_symbols);
+        let coverage_percent = if indexed_logic_symbols == 0 {
+            0.0
+        } else {
+            ((scanned_logic_symbols as f64 * 10_000.0 / indexed_logic_symbols as f64).round())
+                / 100.0
+        };
+        let coverage = if indexed_logic_symbols == 0 {
+            "not_applicable".into()
+        } else if scanned_logic_symbols == 0 {
+            "not_started_query_driven".into()
+        } else if scanned_logic_symbols == indexed_logic_symbols && truncated_targets == 0 {
+            "complete_for_current_index".into()
+        } else if truncated_targets > 0 {
+            "partial_with_truncated_targets".into()
+        } else {
+            "partial_query_driven".into()
+        };
+        Self {
+            indexed_logic_symbols,
+            scanned_logic_symbols,
+            semantic_call_relations,
+            truncated_targets,
+            coverage_percent,
+            coverage,
+        }
+    }
+}
+
+fn persisted_semantic_coverage_at(
+    root: &Path,
+    data_dir: &Path,
+) -> Option<SemanticCoverageStats> {
+    let conn = Connection::open(catalog_file_at(data_dir, root)).ok()?;
+    conn.query_row(
+        "SELECT logic_symbol_count, semantic_target_count,
+                semantic_relation_count, semantic_truncated_target_count
+         FROM structure_stats WHERE id=1",
+        [],
+        |row| {
+            Ok(SemanticCoverageStats::from_counts(
+                row.get::<_, i64>(0)?.max(0) as usize,
+                row.get::<_, i64>(1)?.max(0) as usize,
+                row.get::<_, i64>(2)?.max(0) as usize,
+                row.get::<_, i64>(3)?.max(0) as usize,
+            ))
+        },
+    )
+    .ok()
+}
+
+fn persisted_semantic_coverage(root: &Path) -> Option<SemanticCoverageStats> {
+    persisted_semantic_coverage_at(root, DATA_DIR.get()?)
+}
+
+#[derive(Debug, Serialize)]
 pub struct StructureQueryResult {
     pub items: Vec<Symbol>,
     /// 与当前页节点相连的结构关系；端点可能位于当前页之外。
@@ -2967,6 +3179,7 @@ pub struct StructureQueryResult {
     pub indexed_files: usize,
     pub indexed_symbols: usize,
     pub indexed_relations: usize,
+    pub semantic: SemanticCoverageStats,
     pub catalog: CatalogStats,
     pub watcher_active: bool,
     pub progressive: ProgressiveIndexStatus,
@@ -4196,6 +4409,7 @@ fn record_lsp_call_references_at(
     target_path: &Path,
     target_line: usize,
     references: &[(PathBuf, usize, usize)],
+    truncated: bool,
 ) -> usize {
     let Some(target_rel) = project_relative(root, target_path) else {
         return 0;
@@ -4281,6 +4495,35 @@ fn record_lsp_call_references_at(
             }
         }
     }
+    if transaction
+        .execute(
+            "INSERT INTO semantic_target_scans(
+               target_file, target_name, target_line, target_size, target_mtime_ns,
+               provider, scanned_at, reference_count, recorded_call_count, truncated
+             ) VALUES(?1, ?2, ?3, ?4, ?5, 'arkts_lsp', ?6, ?7, ?8, ?9)
+             ON CONFLICT(target_file, target_name, target_line, provider) DO UPDATE SET
+               target_size=excluded.target_size,
+               target_mtime_ns=excluded.target_mtime_ns,
+               scanned_at=excluded.scanned_at,
+               reference_count=excluded.reference_count,
+               recorded_call_count=excluded.recorded_call_count,
+               truncated=excluded.truncated",
+            params![
+                target_rel,
+                target_name,
+                target_symbol_line,
+                target_stamp.len as i64,
+                target_stamp.mtime as i64,
+                now_secs() as i64,
+                references.len() as i64,
+                recorded as i64,
+                i64::from(truncated),
+            ],
+        )
+        .is_err()
+    {
+        return 0;
+    }
     if transaction.commit().is_ok() { recorded } else { 0 }
 }
 
@@ -4364,11 +4607,19 @@ pub(crate) fn record_lsp_call_references(
     target_path: &Path,
     target_line: usize,
     references: &[(PathBuf, usize, usize)],
+    truncated: bool,
 ) -> usize {
     let Some(data_dir) = DATA_DIR.get() else {
         return 0;
     };
-    record_lsp_call_references_at(root, data_dir, target_path, target_line, references)
+    record_lsp_call_references_at(
+        root,
+        data_dir,
+        target_path,
+        target_line,
+        references,
+        truncated,
+    )
 }
 
 fn persisted_symbol_count(root: &Path) -> Option<usize> {
@@ -4516,6 +4767,14 @@ pub fn query_structure_with_cursor(
         .unwrap_or((0, CatalogStats::default(), 0));
     let coverage = catalog.coverage();
     let progressive = progressive_status(root, catalog.deferred_source_files);
+    let semantic = persisted_semantic_coverage(root).unwrap_or_else(|| {
+        SemanticCoverageStats::from_counts(
+            syms.iter().filter(|symbol| symbol.role == "logic").count(),
+            0,
+            0,
+            0,
+        )
+    });
     Ok(StructureQueryResult {
         items,
         relations,
@@ -4527,6 +4786,7 @@ pub fn query_structure_with_cursor(
         indexed_files,
         indexed_symbols: persisted_symbol_count(root).unwrap_or(syms.len()),
         indexed_relations,
+        semantic,
         catalog,
         watcher_active: crate::services::repo_watcher::is_watching(root),
         progressive,
@@ -5105,6 +5365,13 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert!(stats_columns
             .iter()
             .any(|column| column == "semantic_relation_count"));
+        for column in [
+            "logic_symbol_count",
+            "semantic_target_count",
+            "semantic_truncated_target_count",
+        ] {
+            assert!(stats_columns.iter().any(|value| value == column), "{column}");
+        }
         let edge_columns = conn
             .prepare("PRAGMA table_info(symbol_edges)")
             .unwrap()
@@ -5134,6 +5401,15 @@ class Service extends BaseService implements Loadable, Disposable {}
             )
             .unwrap();
         assert_eq!(semantic_table, 1);
+        let semantic_scan_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='semantic_target_scans'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_scan_table, 1);
         let parser_version: i64 = conn
             .query_row(
                 "SELECT parser_version FROM structure_meta WHERE id=1",
@@ -6075,6 +6351,7 @@ class Service extends BaseService implements Loadable, Disposable {}
                 &target_file,
                 1,
                 &references,
+                false,
             ),
             3
         );
@@ -6091,6 +6368,49 @@ class Service extends BaseService implements Loadable, Disposable {}
         );
         assert_eq!(rows, 3);
         assert_eq!(stats, 3);
+        let coverage = persisted_semantic_coverage_at(&root, &data_dir).unwrap();
+        assert_eq!(coverage.indexed_logic_symbols, 4);
+        assert_eq!(coverage.scanned_logic_symbols, 1);
+        assert_eq!(coverage.semantic_call_relations, 3);
+        assert_eq!(coverage.truncated_targets, 0);
+        assert_eq!(coverage.coverage_percent, 25.0);
+        assert_eq!(coverage.coverage, "partial_query_driven");
+
+        assert_eq!(
+            record_lsp_call_references_at(
+                &root,
+                &data_dir,
+                &target_file,
+                1,
+                &references,
+                true,
+            ),
+            3
+        );
+        let coverage = persisted_semantic_coverage_at(&root, &data_dir).unwrap();
+        assert_eq!(coverage.scanned_logic_symbols, 1, "重复扫描不能重复计数");
+        assert_eq!(coverage.truncated_targets, 1);
+        assert_eq!(coverage.coverage, "partial_with_truncated_targets");
+
+        std::fs::write(&target_file, "export class Client {\n  renamed() {}\n}\n").unwrap();
+        assert!(matches!(
+            apply_catalog_changes_at(&root, &data_dir, &["client.ts".into()]),
+            CatalogDelta::Updated(_)
+        ));
+        let mut changed_target_symbols = Vec::new();
+        scan_file(&target_file, "client.ts", &mut changed_target_symbols);
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            &["client.ts".into()],
+            &changed_target_symbols,
+        ));
+        let coverage = persisted_semantic_coverage_at(&root, &data_dir).unwrap();
+        assert_eq!(coverage.indexed_logic_symbols, 4);
+        assert_eq!(coverage.scanned_logic_symbols, 0);
+        assert_eq!(coverage.semantic_call_relations, 0);
+        assert_eq!(coverage.truncated_targets, 0);
+        assert_eq!(coverage.coverage, "not_started_query_driven");
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();

@@ -507,6 +507,7 @@ pub(super) async fn lsp_references(args: &Value, roots: &[String], conversation_
                             &target_path,
                             target_line,
                             evidence,
+                            truncated,
                         );
                         semantic_summary = format!(
                             "\n结构索引：已检查 {} 个工程内引用，沉淀 {} 条成员调用关系{}。",

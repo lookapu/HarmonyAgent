@@ -766,7 +766,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_symbols",
-        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、next_cursor、签名、归属、行区间，以及 indexed_files/coverage/staleness；coverage 非完整时必须结合 codebase_search 或精确路径补查。",
+        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
     },
     ToolSpec {
         name: "delete_file",
@@ -3668,6 +3668,15 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     if result.coverage.starts_with("partial_") || result.coverage.starts_with("best_effort_") {
         out.push_str("注意：当前结构索引不是全量语义保证；无结果或高风险修改时需用 codebase_search/LSP/精确路径补查。\n");
     }
+    out.push_str(&format!(
+        "语义调用覆盖：已扫描 {}/{} 个逻辑符号（{:.2}%），沉淀 {} 条调用关系，截断目标 {}；semantic_coverage={}。\n",
+        result.semantic.scanned_logic_symbols,
+        result.semantic.indexed_logic_symbols,
+        result.semantic.coverage_percent,
+        result.semantic.semantic_call_relations,
+        result.semantic.truncated_targets,
+        result.semantic.coverage,
+    ));
     if result.progressive.active {
         out.push_str(&format!(
             "后台渐进索引：active，本轮已提升 {} 个文件 / {} 批，剩余 {}；最近一批 {} ms（SQLite 写锁等待 {} ms），背压间隔 {} ms。\n",
