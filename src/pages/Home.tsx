@@ -114,6 +114,7 @@ import { Button } from '../components/ui/Button'
 import { IconButton } from '../components/ui/IconButton'
 import { Field, TextArea } from '../components/ui/Field'
 import { Spinner } from '../components/ui/Spinner'
+import { useEscapeKey } from '../hooks/useEscapeKey'
 import {
   fmtElapsed,
   interruptedTailMessage,
@@ -560,7 +561,7 @@ export default function Home() {
   // 最近项目右键菜单（打开文件夹 / 刷新项目信息）
   const [projectMenu, setProjectMenu] = useState<{ x: number; y: number; project: Project } | null>(null)
   const projectMenuRef = useRef<HTMLDivElement>(null)
-  // 右键菜单关闭：点击菜单外 / Escape / 任意滚动
+  // 右键菜单关闭：点击菜单外 / 任意滚动
   useEffect(() => {
     if (!projectMenu) return
     const onDown = (e: MouseEvent) => {
@@ -568,19 +569,16 @@ export default function Home() {
         setProjectMenu(null)
       }
     }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setProjectMenu(null)
-    }
     const onScroll = () => setProjectMenu(null)
     document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onKey)
     window.addEventListener('scroll', onScroll, true)
     return () => {
       document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey)
       window.removeEventListener('scroll', onScroll, true)
     }
   }, [projectMenu])
+  // Escape 走全局栈：菜单开在模态之上时，一次 Esc 只关菜单，不把底下那层一起带走
+  useEscapeKey(projectMenu ? () => setProjectMenu(null) : null)
   useEffect(() => {
     if (!projectMetaToast) return
     const timer = setTimeout(() => setProjectMetaToast(null), 4000)
@@ -8193,13 +8191,11 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
     }
   }
 
-  // 自动聚焦搜索框 + Esc 关闭
+  // 自动聚焦搜索框
   useEffect(() => {
     inputRef.current?.focus()
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [])
+  useEscapeKey(onClose)
 
   return (
     <div className="cmdk-backdrop" onClick={onClose}>
@@ -8320,13 +8316,10 @@ function ProjectSwitcher({ onClose, onSelect }: { onClose: () => void; onSelect:
     return () => clearTimeout(h)
   }, [])
 
-  // 键盘：↑↓ 移动 / Enter 选择 / Esc 关闭
+  // 键盘：↑↓ 移动 / Enter 选择（Esc 走全局栈，见下）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onClose()
-      } else if (e.key === 'ArrowDown') {
+      if (e.key === 'ArrowDown') {
         e.preventDefault()
         setSel((s) => Math.min(filtered.length - 1, s + 1))
       } else if (e.key === 'ArrowUp') {
@@ -8340,7 +8333,8 @@ function ProjectSwitcher({ onClose, onSelect }: { onClose: () => void; onSelect:
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [filtered, sel, onSelect, onClose])
+  }, [filtered, sel, onSelect])
+  useEscapeKey(onClose)
 
   return (
     <div
@@ -8441,13 +8435,10 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
     }
   }
 
-  // 快捷键：Esc 关闭 / Ctrl+Enter 提交
+  // 快捷键：Ctrl+Enter 提交（Esc 走全局栈，见下）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onClose()
-      } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault()
         void submit()
       }
@@ -8455,7 +8446,8 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lines.length, onClose]) // submit 是稳定闭包，但依赖 lines 让 Enter 触发时拿到最新行数
+  }, [lines.length]) // submit 是稳定闭包，但依赖 lines 让 Enter 触发时拿到最新行数
+  useEscapeKey(onClose)
 
   return (
     <div className="cmdk-backdrop" onClick={onClose}>
@@ -8561,14 +8553,7 @@ function ImportDialog({ data, onClose }: {
     return { user, assistant, other }
   }, [data.messages])
 
-  // Esc 关闭
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useEscapeKey(onClose)
 
   return (
     <div className="cmdk-backdrop" onClick={onClose}>
@@ -8984,12 +8969,7 @@ function AuditDialog({ onClose }: { onClose: () => void }) {
   const clear = useAuditStore((s) => s.clear)
   const [filter, setFilter] = useState<'all' | AuditCategory>('all')
 
-  // Esc 关闭
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useEscapeKey(onClose)
 
   const filtered = useMemo(
     () => (filter === 'all' ? entries : entries.filter((e) => e.category === filter)).slice().sort((a, b) => b.ts - a.ts),
