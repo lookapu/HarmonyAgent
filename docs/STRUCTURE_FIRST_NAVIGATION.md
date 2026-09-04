@@ -1,6 +1,6 @@
 # Structure-first 代码导航设计
 
-> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和结构关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 与 ArkTS 已接入 Tree-sitter，语法层 `extends/implements` 与保守的直接 `calls` 已落图，相对命名 import、根 `tsconfig` path alias、HarmonyOS `file:/link:` 本地包和有界 re-export/barrel 闭包可精确绑定；ArkTS LSP 的唯一工程内定义可增量沉淀为成员调用边，批量语义索引、SCIP importer 与物理分片仍在后续阶段。
+> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和结构关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 与 ArkTS 已接入 Tree-sitter，语法层 `extends/implements` 与保守的直接 `calls` 已落图，相对命名 import、根 `tsconfig` path alias、HarmonyOS `file:/link:` 本地包和有界 re-export/barrel 闭包可精确绑定；ArkTS LSP 的唯一工程内定义与有界引用批次可增量沉淀为成员调用边，后台全库语义调度、SCIP importer 与物理分片仍在后续阶段。
 
 ## 1. 结论
 
@@ -65,7 +65,7 @@ TS/TSX/JS/JSX/ArkTS 的范围来自 Tree-sitter AST；语法错误文件和 Rust
 
 目录层第一版已经完成：所有未忽略文件流式写入独立 SQLite，不把全量路径堆进内存；记录 `indexed/deferred/oversized/unsupported/symlink/unreadable` 状态和一级目录 shard。`find_files` 优先查询该目录，支持状态过滤和分页；结构查询同时报告发现、解析、延期、超大和不可读数量。结构节点也已进入同一仓库数据库，按 file、role/kind、name 和 shard 建索引，`search_symbols` 优先执行数据库过滤、排序、计数与分页，内存列表只作为兼容 fallback。
 
-结构图关系层也已落地：根据解析器明确给出的 `parent` 生成 `contains`（实体 → 方法/逻辑）关系，从 AST heritage clause 生成 `extends/implements`，并把最内层函数/方法中的直接标识符调用生成 `calls` 声明边，按起点、终点和 shard 建索引；结构查询会返回与当前页节点相连的边。语法调用层只接受 `identifier(...)`，可绑定同文件唯一顶层函数、递归函数和命名 import，并复用 ohpm 与 barrel 链解析。`obj.method()` 不按方法名猜测；用户或 Agent 对成员调用执行 `lsp_definition` 时，只有 LSP 返回唯一的工程内函数/方法定义才以调用点行列为键写入独立语义边表。同一调用点的新证据原位替换；源文件目录指纹变化，或目标函数/方法已移动、改名、删除后，旧边都不会参与查询。SDK 外定义、多定义、动态属性和反射调用不沉淀为项目边。同文件中名称唯一的实体会立即绑定到精确行号；相对命名 import（含别名和 ArkTS `import lazy`）、根 `tsconfig.json` 的 `baseUrl + paths` 精确/单星号映射，以及离源文件最近的 `oh-package.json5` 中 `file:/link:` 本地依赖加目标包明确 `main` 入口，都会在查询时根据当前目录与符号表确认唯一目标。re-export 证据单独写入 SQLite，支持别名桶文件和保守的 `export *` 闭包；查询最多穿透 8 层、每层 16 个星号分支、全程 128 个访问节点并检测循环，只有所有可达分支最终收敛为唯一实体才绑定。目标新增、删除、桶文件或清单改指向、以及 deferred 解析完成后均不要求重写全库入边。多个同等 alias 规则、多个映射文件或多个最终同名实体一律保持未解析；`export * as Namespace` 暂不展开。远程 ohpm 包、没有明确 `main` 的本地包和越出仓库的路径不会猜测绑定。其他尚未经过名称解析的目标使用空文件和 0 行号显式标记为“语法声明，目标待解析”。单文件外部变化会在同一增量流程中重建源文件节点、声明边与再导出证据；按导入目标名建立的部分索引支持映射变化后的反向关系重新确认。
+结构图关系层也已落地：根据解析器明确给出的 `parent` 生成 `contains`（实体 → 方法/逻辑）关系，从 AST heritage clause 生成 `extends/implements`，并把最内层函数/方法中的直接标识符调用生成 `calls` 声明边，按起点、终点和 shard 建索引；结构查询会返回与当前页节点相连的边。语法调用层只接受 `identifier(...)`，可绑定同文件唯一顶层函数、递归函数和命名 import，并复用 ohpm 与 barrel 链解析。`obj.method()` 不按方法名猜测；用户或 Agent 对成员调用执行 `lsp_definition` 时，只有 LSP 返回唯一的工程内函数/方法定义才以调用点行列为键写入独立语义边表。执行 `lsp_references` 时还会用一次机会式定义查询锁定唯一目标，并在单次最多 256 个工程内引用的边界内，按文件只解析一次语法树、过滤真正的成员调用点，最后用一个短事务批量沉淀；附加定义查询失败不会影响引用工具原结果。同一调用点的新证据原位替换；源文件目录指纹变化，或目标函数/方法已移动、改名、删除后，旧边都不会参与查询。SDK 外定义、多定义、动态属性和反射调用不沉淀为项目边。同文件中名称唯一的实体会立即绑定到精确行号；相对命名 import（含别名和 ArkTS `import lazy`）、根 `tsconfig.json` 的 `baseUrl + paths` 精确/单星号映射，以及离源文件最近的 `oh-package.json5` 中 `file:/link:` 本地依赖加目标包明确 `main` 入口，都会在查询时根据当前目录与符号表确认唯一目标。re-export 证据单独写入 SQLite，支持别名桶文件和保守的 `export *` 闭包；查询最多穿透 8 层、每层 16 个星号分支、全程 128 个访问节点并检测循环，只有所有可达分支最终收敛为唯一实体才绑定。目标新增、删除、桶文件或清单改指向、以及 deferred 解析完成后均不要求重写全库入边。多个同等 alias 规则、多个映射文件或多个最终同名实体一律保持未解析；`export * as Namespace` 暂不展开。远程 ohpm 包、没有明确 `main` 的本地包和越出仓库的路径不会猜测绑定。其他尚未经过名称解析的目标使用空文件和 0 行号显式标记为“语法声明，目标待解析”。单文件外部变化会在同一增量流程中重建源文件节点、声明边与再导出证据；按导入目标名建立的部分索引支持映射变化后的反向关系重新确认。
 
 原生跨平台 watcher 也已接入：第一次建立索引时懒启动，忽略纯访问事件，将编辑器常见的 create/modify/remove/rename 事件按 200 ms 合并。普通文件变化现在会在缓存锁外用 SQLite 事务直接 upsert/delete 全库目录记录，并只替换对应文件的结构节点，不再安排全仓 walk；目录级变化、数据库失败、系统 `Rescan` 标志、空路径事件或监听错误才把一致性校验延迟到下一次真实查询。目录代次还会对全量节点重建做 revision fencing，避免并发外部编辑被较旧的扫描结果覆盖。稳定仓库不再每 30 秒反复 walk；watcher 启动失败时保留 30 秒周期扫描，active 时仍每 5 分钟低频校验，防止监听器“创建成功但不投递”或静默失效。最多保留 16 个项目 watcher，按最近使用淘汰，避免系统句柄泄漏。
 
@@ -93,7 +93,7 @@ Tree-sitter 语法层已经扩展为固定兼容的 `tree-sitter 0.24.7`、`tree
 
 每个节点新增 `language` 和 `source_layer=tree_sitter|lightweight`，Agent 输出会展示来源，不能把 fallback 结果冒充 AST 事实。支持语言只有在语法树无错误时采用 Tree-sitter；解析失败时整文件回退原轻量扫描，Rust/Python 等未接 grammar 的语言也继续使用 fallback。SQLite 启动时兼容增加 provenance 和声明关系列；parser schema version 从旧版本升级时清空旧节点、把已解析文件恢复为 deferred，并配合磁盘缓存版本升级重新建立首批结构，避免悄悄复用旧轻量结果。
 
-fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `import lazy`、字符串内大括号、箭头函数、parent 归属、JS/JSX/TSX 入口、语法错误 fallback、`extends/implements` 声明边、相对命名 import/别名证据持久化和旧 SQLite 自动迁移。当前仍不能称为完整语义索引：声明关系只代表语法事实，跨文件引用还没有编译器级绑定。
+fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `import lazy`、字符串内大括号、箭头函数、parent 归属、JS/JSX/TSX 入口、语法错误 fallback、`extends/implements` 声明边、相对命名 import/别名证据持久化、LSP 单点/批量调用证据和旧 SQLite 自动迁移。当前仍不能称为完整语义索引：只有被 LSP 查询命中的调用具有编译器级绑定，尚无后台全库覆盖保证。
 
 10,000 个实体 `.ts` 文件的同机基准中，冷目录与首批 4,000 文件 AST 解析/写入约 0.95 s，产生 8,000 个 Tree-sitter 节点且没有 fallback；峰值 RSS 约 23.7 MiB，单文件增量约 12 ms。该结果只证明首批 grammar 的吞吐未突破既有资源边界，不替代真实代码的召回率评测。
 
@@ -134,7 +134,7 @@ fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `im
 
 1. ~~为结构浏览增加稳定游标/keyset 分页，消除深页 `OFFSET` 的线性扫描，并保留现有页码接口作为兼容层。~~ 已完成。
 2. ~~在生成仓运行渐进解析 1M 验收，记录冷扫描吞吐、写放大、锁等待、峰值内存和取消延迟。~~ 已完成；仍需补充真实混合语言 monorepo 的 Recall@5/20 与任务轨迹验收，达到单库 SLO 边界时再启用物理分片。
-3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS、`extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import/别名/ArkTS `import lazy`、根 `tsconfig` path alias、`oh-package.json5 file:/link:` 本地包入口及有界 re-export/barrel 闭包均已完成；ArkTS `lsp_definition` 唯一工程内结果也可沉淀成员调用边，下一步补批量调度与 SCIP importer。
+3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS、`extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import/别名/ArkTS `import lazy`、根 `tsconfig` path alias、`oh-package.json5 file:/link:` 本地包入口及有界 re-export/barrel 闭包均已完成；ArkTS `lsp_definition` 单点和 `lsp_references` 有界批量结果也可沉淀成员调用边，下一步补后台覆盖调度与 SCIP importer。
 4. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 5. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
 6. 用 10k/100k/1M 基准和真实任务轨迹持续验证 Recall@5/20、延迟与上下文节省量。

@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, oneshot};
 
 /// 会话级连接池：conversation_id → LSP 连接（懒启动，进程常驻至会话结束）
 static POOL: OnceLock<StdMutex<HashMap<String, Arc<LspConnection>>>> = OnceLock::new();
+const MAX_REFERENCE_EVIDENCE_PER_REQUEST: usize = 256;
 
 fn pool() -> &'static StdMutex<HashMap<String, Arc<LspConnection>>> {
     POOL.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -344,6 +345,21 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     url::Url::parse(uri).ok().and_then(|u| u.to_file_path().ok())
 }
 
+fn location_path_position(location: &Value) -> Option<(PathBuf, usize, usize)> {
+    let uri = location["targetUri"]
+        .as_str()
+        .or_else(|| location["uri"].as_str())?;
+    let range = location["targetSelectionRange"]
+        .as_object()
+        .or_else(|| location["targetRange"].as_object())
+        .or_else(|| location["range"].as_object())?;
+    Some((
+        uri_to_path(uri)?,
+        range["start"]["line"].as_u64().unwrap_or(0) as usize,
+        range["start"]["character"].as_u64().unwrap_or(0) as usize,
+    ))
+}
+
 /// 取某文件某行（1-based）的文本，供结果附上下文
 fn read_line_at(path: &Path, line1: usize) -> String {
     let Ok(text) = std::fs::read_to_string(path) else { return String::new() };
@@ -453,7 +469,62 @@ pub(super) async fn lsp_references(args: &Value, roots: &[String], conversation_
         }), std::time::Duration::from_secs(20))
         .await?;
     let items = res.as_array().cloned().unwrap_or_default();
-    Ok(format!("引用位置（{} 处）：\n{}", items.len(), render_locations(&items)))
+    let mut semantic_summary = String::new();
+    if !items.is_empty() {
+        let definition = conn
+            .request("textDocument/definition", json!({
+                "textDocument": {"uri": to_file_uri(&path)?},
+                "position": {"line": line, "character": column}
+            }), std::time::Duration::from_secs(20))
+            .await;
+        if let Ok(definition) = definition {
+            let definitions = match definition {
+                Value::Array(values) => values,
+                Value::Null => Vec::new(),
+                value => vec![value],
+            };
+            if definitions.len() == 1 {
+                if let Some((target_path, target_line, _)) =
+                    location_path_position(&definitions[0])
+                {
+                    if let Some(root) = roots
+                        .iter()
+                        .map(PathBuf::from)
+                        .find(|root| path.starts_with(root) && target_path.starts_with(root))
+                    {
+                        let project_references = items
+                            .iter()
+                            .filter_map(location_path_position)
+                            .filter(|(reference_path, _, _)| reference_path.starts_with(&root))
+                            .take(MAX_REFERENCE_EVIDENCE_PER_REQUEST + 1)
+                            .collect::<Vec<_>>();
+                        let truncated =
+                            project_references.len() > MAX_REFERENCE_EVIDENCE_PER_REQUEST;
+                        let evidence = &project_references
+                            [..project_references.len().min(MAX_REFERENCE_EVIDENCE_PER_REQUEST)];
+                        let recorded = crate::services::symbol_index::record_lsp_call_references(
+                            &root,
+                            &target_path,
+                            target_line,
+                            evidence,
+                        );
+                        semantic_summary = format!(
+                            "\n结构索引：已检查 {} 个工程内引用，沉淀 {} 条成员调用关系{}。",
+                            evidence.len(),
+                            recorded,
+                            if truncated { "（达到单次 256 条上限）" } else { "" },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(format!(
+        "引用位置（{} 处）：\n{}{}",
+        items.len(),
+        render_locations(&items),
+        semantic_summary,
+    ))
 }
 
 /// lsp_symbols：文档符号树（struct/方法/成员，带行号）

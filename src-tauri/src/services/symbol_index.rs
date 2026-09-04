@@ -4055,108 +4055,108 @@ fn utf16_column_to_byte(line: &str, utf16_column: usize) -> usize {
 }
 
 fn is_call_callee_position(path: &Path, line: usize, utf16_column: usize) -> bool {
+    !member_call_callee_positions(path, &[(line, utf16_column)]).is_empty()
+}
+
+fn member_call_callee_positions(
+    path: &Path,
+    positions: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
     let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
-        return false;
+        return Vec::new();
     };
     let Some(language) = tree_sitter_language(ext) else {
-        return false;
+        return Vec::new();
     };
     let Some(content) = fs::metadata(path)
         .ok()
         .filter(|metadata| metadata.len() <= MAX_BYTES)
         .and_then(|_| fs::read_to_string(path).ok())
     else {
-        return false;
+        return Vec::new();
     };
-    let Some(line_text) = content.lines().nth(line) else {
-        return false;
-    };
-    let point = tree_sitter::Point::new(line, utf16_column_to_byte(line_text, utf16_column));
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&language).is_err() {
-        return false;
+        return Vec::new();
     }
     let Some(tree) = parser.parse(&content, None) else {
-        return false;
+        return Vec::new();
     };
-    let Some(mut node) = tree.root_node().descendant_for_point_range(point, point) else {
-        return false;
-    };
-    loop {
-        if node.kind() == "call_expression" {
-            return node
-                .child_by_field_name("function")
-                .filter(|function| function.kind() == "member_expression")
-                .and_then(|function| function.child_by_field_name("property"))
-                .is_some_and(|property| {
-                    matches!(
-                        property.kind(),
-                        "property_identifier" | "private_property_identifier"
-                    )
-                        && property.start_position() <= point
-                        && point <= property.end_position()
-                });
-        }
-        let Some(parent) = node.parent() else {
-            return false;
-        };
-        node = parent;
-    }
+    let lines = content.lines().collect::<Vec<_>>();
+    positions
+        .iter()
+        .copied()
+        .filter(|(line, utf16_column)| {
+            let Some(line_text) = lines.get(*line) else {
+                return false;
+            };
+            let point = tree_sitter::Point::new(
+                *line,
+                utf16_column_to_byte(line_text, *utf16_column),
+            );
+            let Some(mut node) = tree.root_node().descendant_for_point_range(point, point) else {
+                return false;
+            };
+            loop {
+                if node.kind() == "call_expression" {
+                    return node
+                        .child_by_field_name("function")
+                        .filter(|function| function.kind() == "member_expression")
+                        .and_then(|function| function.child_by_field_name("property"))
+                        .is_some_and(|property| {
+                            matches!(
+                                property.kind(),
+                                "property_identifier" | "private_property_identifier"
+                            ) && property.start_position() <= point
+                                && point <= property.end_position()
+                        });
+                }
+                let Some(parent) = node.parent() else {
+                    return false;
+                };
+                node = parent;
+            }
+        })
+        .collect()
 }
 
-fn record_lsp_call_definition_at(
-    root: &Path,
-    data_dir: &Path,
-    source_path: &Path,
+fn indexed_stamp_matches(conn: &Connection, rel: &str, stamp: FileStamp) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM files
+           WHERE path=?1 AND state='indexed' AND size=?2 AND mtime_ns=?3
+         )",
+        params![rel, stamp.len as i64, stamp.mtime as i64],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+fn logic_symbol_at(conn: &Connection, rel: &str, line0: usize) -> Option<(String, i64)> {
+    let position = line0.saturating_add(1) as i64;
+    conn.query_row(
+        "SELECT name, line FROM symbols
+         WHERE file=?1 AND role='logic' AND line<=?2 AND end_line>=?2
+         ORDER BY CASE WHEN line=?2 THEN 0 ELSE 1 END,
+                  (end_line-line), line DESC LIMIT 1",
+        params![rel, position],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .ok()
+}
+
+fn insert_semantic_call(
+    conn: &Connection,
+    source_rel: &str,
+    source_name: &str,
+    source_symbol_line: i64,
     source_line: usize,
     source_column: usize,
-    target_path: &Path,
-    target_line: usize,
+    source_stamp: FileStamp,
+    target_rel: &str,
+    target_name: &str,
+    target_symbol_line: i64,
 ) -> bool {
-    if !is_call_callee_position(source_path, source_line, source_column) {
-        return false;
-    }
-    let (Ok(source_rel), Ok(target_rel)) = (
-        source_path.strip_prefix(root),
-        target_path.strip_prefix(root),
-    ) else {
-        return false;
-    };
-    let source_rel = source_rel.to_string_lossy().replace('\\', "/");
-    let target_rel = target_rel.to_string_lossy().replace('\\', "/");
-    let Some(stamp) = file_stamp(source_path) else {
-        return false;
-    };
-    let conn = match Connection::open(catalog_file_at(data_dir, root)) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    let source_position = source_line.saturating_add(1) as i64;
-    let caller = conn
-        .query_row(
-            "SELECT name, line FROM symbols
-             WHERE file=?1 AND role='logic' AND line<=?2 AND end_line>=?2
-             ORDER BY (end_line-line), line DESC LIMIT 1",
-            params![source_rel, source_position],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .ok();
-    let target_position = target_line.saturating_add(1) as i64;
-    let target = conn
-        .query_row(
-            "SELECT name, line FROM symbols
-             WHERE file=?1 AND role='logic' AND line<=?2 AND end_line>=?2
-             ORDER BY CASE WHEN line=?2 THEN 0 ELSE 1 END,
-                      (end_line-line), line DESC LIMIT 1",
-            params![target_rel, target_position],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .ok();
-    let (Some((source_name, source_symbol_line)), Some((target_name, target_symbol_line))) =
-        (caller, target)
-    else {
-        return false;
-    };
     conn.execute(
         "INSERT INTO semantic_call_edges(
            source_file, source_name, source_line, call_line, call_column,
@@ -4171,16 +4171,170 @@ fn record_lsp_call_definition_at(
             source_rel,
             source_name,
             source_symbol_line,
-            source_position,
+            source_line.saturating_add(1) as i64,
             source_column.saturating_add(1) as i64,
-            stamp.len as i64,
-            stamp.mtime as i64,
+            source_stamp.len as i64,
+            source_stamp.mtime as i64,
             target_rel,
             target_name,
             target_symbol_line,
         ],
     )
     .is_ok()
+}
+
+fn project_relative(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .filter(|rel| !rel.is_empty())
+}
+
+fn record_lsp_call_references_at(
+    root: &Path,
+    data_dir: &Path,
+    target_path: &Path,
+    target_line: usize,
+    references: &[(PathBuf, usize, usize)],
+) -> usize {
+    let Some(target_rel) = project_relative(root, target_path) else {
+        return 0;
+    };
+    let Some(target_stamp) = file_stamp(target_path) else {
+        return 0;
+    };
+    let mut conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    if !indexed_stamp_matches(&conn, &target_rel, target_stamp) {
+        return 0;
+    }
+    let mut by_file = HashMap::<PathBuf, Vec<(usize, usize)>>::new();
+    for (path, line, column) in references {
+        if project_relative(root, path).is_some() {
+            by_file.entry(path.clone()).or_default().push((*line, *column));
+        }
+    }
+    for positions in by_file.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
+
+    let mut valid_sources = Vec::new();
+    for (source_path, positions) in by_file {
+        let Some(source_rel) = project_relative(root, &source_path) else {
+            continue;
+        };
+        let Some(source_stamp) = file_stamp(&source_path) else {
+            continue;
+        };
+        if !indexed_stamp_matches(&conn, &source_rel, source_stamp) {
+            continue;
+        }
+        let valid_positions = member_call_callee_positions(&source_path, &positions);
+        if !valid_positions.is_empty() {
+            valid_sources.push((source_path, source_rel, source_stamp, valid_positions));
+        }
+    }
+
+    let transaction = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    if file_stamp(target_path) != Some(target_stamp)
+        || !indexed_stamp_matches(&transaction, &target_rel, target_stamp)
+    {
+        return 0;
+    }
+    let Some((target_name, target_symbol_line)) =
+        logic_symbol_at(&transaction, &target_rel, target_line)
+    else {
+        return 0;
+    };
+    let mut recorded = 0usize;
+    for (source_path, source_rel, source_stamp, positions) in valid_sources {
+        if file_stamp(&source_path) != Some(source_stamp)
+            || !indexed_stamp_matches(&transaction, &source_rel, source_stamp)
+        {
+            continue;
+        }
+        for (source_line, source_column) in positions {
+            let Some((source_name, source_symbol_line)) =
+                logic_symbol_at(&transaction, &source_rel, source_line)
+            else {
+                continue;
+            };
+            if insert_semantic_call(
+                &transaction,
+                &source_rel,
+                &source_name,
+                source_symbol_line,
+                source_line,
+                source_column,
+                source_stamp,
+                &target_rel,
+                &target_name,
+                target_symbol_line,
+            ) {
+                recorded += 1;
+            }
+        }
+    }
+    if transaction.commit().is_ok() { recorded } else { 0 }
+}
+
+fn record_lsp_call_definition_at(
+    root: &Path,
+    data_dir: &Path,
+    source_path: &Path,
+    source_line: usize,
+    source_column: usize,
+    target_path: &Path,
+    target_line: usize,
+) -> bool {
+    if !is_call_callee_position(source_path, source_line, source_column) {
+        return false;
+    }
+    let (Some(source_rel), Some(target_rel)) = (
+        project_relative(root, source_path),
+        project_relative(root, target_path),
+    ) else {
+        return false;
+    };
+    let (Some(source_stamp), Some(target_stamp)) =
+        (file_stamp(source_path), file_stamp(target_path))
+    else {
+        return false;
+    };
+    let conn = match Connection::open(catalog_file_at(data_dir, root)) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if !indexed_stamp_matches(&conn, &source_rel, source_stamp)
+        || !indexed_stamp_matches(&conn, &target_rel, target_stamp)
+    {
+        return false;
+    }
+    let caller = logic_symbol_at(&conn, &source_rel, source_line);
+    let target = logic_symbol_at(&conn, &target_rel, target_line);
+    let (Some((source_name, source_symbol_line)), Some((target_name, target_symbol_line))) =
+        (caller, target)
+    else {
+        return false;
+    };
+    insert_semantic_call(
+        &conn,
+        &source_rel,
+        &source_name,
+        source_symbol_line,
+        source_line,
+        source_column,
+        source_stamp,
+        &target_rel,
+        &target_name,
+        target_symbol_line,
+    )
 }
 
 pub(crate) fn record_lsp_call_definition(
@@ -4203,6 +4357,18 @@ pub(crate) fn record_lsp_call_definition(
         target_path,
         target_line,
     )
+}
+
+pub(crate) fn record_lsp_call_references(
+    root: &Path,
+    target_path: &Path,
+    target_line: usize,
+    references: &[(PathBuf, usize, usize)],
+) -> usize {
+    let Some(data_dir) = DATA_DIR.get() else {
+        return 0;
+    };
+    record_lsp_call_references_at(root, data_dir, target_path, target_line, references)
 }
 
 fn persisted_symbol_count(root: &Path) -> Option<usize> {
@@ -5792,6 +5958,10 @@ class Service extends BaseService implements Loadable, Disposable {}
             "export class Client {\n  renamed() {}\n}\n",
         )
         .unwrap();
+        assert!(matches!(
+            apply_catalog_changes_at(&root, &data_dir, &["client.ts".into()]),
+            CatalogDelta::Updated(_)
+        ));
         let mut changed_target_symbols = Vec::new();
         scan_file(&target_file, "client.ts", &mut changed_target_symbols);
         assert!(replace_changed_symbol_rows_at(
@@ -5812,6 +5982,10 @@ class Service extends BaseService implements Loadable, Disposable {}
             "export class Client {\n  fetch() {}\n}\n",
         )
         .unwrap();
+        assert!(matches!(
+            apply_catalog_changes_at(&root, &data_dir, &["client.ts".into()]),
+            CatalogDelta::Updated(_)
+        ));
         let mut restored_target_symbols = Vec::new();
         scan_file(&target_file, "client.ts", &mut restored_target_symbols);
         assert!(replace_changed_symbol_rows_at(
@@ -5845,6 +6019,78 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert!(stale_safe
             .iter()
             .all(|edge| !(edge.kind == "calls" && edge.target_name == "fetch")));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn lsp_reference_batch_deduplicates_and_records_only_member_calls() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-lsp-batch-db-{}", uuid::Uuid::new_v4()));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-lsp-batch-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let first_file = root.join("first.ts");
+        let second_file = root.join("second.ts");
+        let target_file = root.join("client.ts");
+        let first_source = "export function first() { client.fetch(); }\nexport function second() { client.fetch(); }\n";
+        let second_source = "export function third() { fetch(); client.fetch(); }\n";
+        std::fs::write(&first_file, first_source).unwrap();
+        std::fs::write(&second_file, second_source).unwrap();
+        std::fs::write(&target_file, "export class Client {\n  fetch() {}\n}\n").unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+
+        let first_fetch = first_source.lines().next().unwrap().find("fetch").unwrap();
+        let second_fetch = first_source.lines().nth(1).unwrap().find("fetch").unwrap();
+        let third_line = second_source.lines().next().unwrap();
+        let direct_fetch = third_line.find("fetch").unwrap();
+        let member_fetch = third_line.rfind("fetch").unwrap();
+        let object = third_line.find("client").unwrap();
+        let references = vec![
+            (first_file.clone(), 0, first_fetch),
+            (first_file.clone(), 0, first_fetch),
+            (first_file.clone(), 1, second_fetch),
+            (second_file.clone(), 0, direct_fetch),
+            (second_file.clone(), 0, object),
+            (second_file.clone(), 0, member_fetch),
+        ];
+        assert_eq!(
+            record_lsp_call_references_at(
+                &root,
+                &data_dir,
+                &target_file,
+                1,
+                &references,
+            ),
+            3
+        );
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+        let (rows, stats): (i64, i64) = (
+            conn.query_row("SELECT COUNT(*) FROM semantic_call_edges", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row(
+                "SELECT semantic_relation_count FROM structure_stats WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, 3);
+        assert_eq!(stats, 3);
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
