@@ -3416,6 +3416,8 @@ pub struct StructureQueryResult {
     pub relations: Vec<StructureEdge>,
     /// 单次关系预算已用尽；调用方应缩小符号或文件过滤条件。
     pub relations_truncated: bool,
+    /// 关系翻页游标。仅在单符号查询且关系超过单次预算时返回，原样传入可读取下一页。
+    pub relations_next_cursor: Option<String>,
     pub total_matches: usize,
     pub page: usize,
     pub page_size: usize,
@@ -3481,6 +3483,69 @@ fn decode_structure_cursor(value: &str, expected_filter_hash: u64) -> Result<Str
     }
     if cursor.filter_hash != expected_filter_hash {
         return Err("结构游标与当前项目或过滤条件不匹配，请从第一页重新查询".into());
+    }
+    Ok(cursor)
+}
+
+/// 关系边在 SQLite 内的稳定排序键，三张边表统一使用同一列序，`rowid` 作为最终 tiebreaker。
+#[derive(Debug, Clone)]
+struct RelationKey {
+    source_file: String,
+    source_name: String,
+    source_line: i64,
+    target_file: String,
+    target_name: String,
+    target_line: i64,
+    row_id: i64,
+}
+
+/// 关系边翻页游标。仅单符号查询启用，避免把热点符号的百万级关系一次性塞进内存。
+#[derive(Debug, Serialize, Deserialize)]
+struct RelationCursor {
+    version: u8,
+    filter_hash: u64,
+    index_revision: u64,
+    scip_import_id: i64,
+    /// 0 = symbol_edges，1 = semantic_call_edges，2 = scip_reference_edges。
+    source: u8,
+    source_file: String,
+    source_name: String,
+    source_line: i64,
+    target_file: String,
+    target_name: String,
+    target_line: i64,
+    row_id: i64,
+}
+
+fn relation_filter_hash(root: &Path, symbols: &[Symbol]) -> u64 {
+    let mut normalized = canonical_key(root);
+    for symbol in symbols {
+        normalized.push('\0');
+        normalized.push_str(&symbol.file);
+        normalized.push('\0');
+        normalized.push_str(&symbol.name);
+        normalized.push('\0');
+        normalized.push_str(&symbol.line.to_string());
+    }
+    stable_hash(&normalized)
+}
+
+fn encode_relation_cursor(cursor: &RelationCursor) -> Result<String, String> {
+    let payload = serde_json::to_vec(cursor).map_err(|error| format!("编码关系游标失败：{error}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
+}
+
+fn decode_relation_cursor(value: &str, expected_filter_hash: u64) -> Result<RelationCursor, String> {
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .map_err(|_| "关系游标无效或已损坏".to_string())?;
+    let cursor: RelationCursor =
+        serde_json::from_slice(&payload).map_err(|_| "关系游标格式不受支持".to_string())?;
+    if cursor.version != 1 {
+        return Err("关系游标版本不受支持，请从第一页重新查询".into());
+    }
+    if cursor.filter_hash != expected_filter_hash {
+        return Err("关系游标与当前项目或符号不匹配，请从第一页重新查询".into());
     }
     Ok(cursor)
 }
@@ -4365,11 +4430,151 @@ fn resolve_import_target_from_catalog(
     }
 }
 
+/// 按统一列序读取单一关系来源，可选 keyset 续读与 LIMIT。
+/// 返回 (边, 稳定排序键)。三张边表投影为一致的 10 列：
+/// kind/source_file/source_name/source_line/target_file/target_name/target_line/
+/// target_module/target_imported_name/rowid。排序统一为
+/// (source_file, source_name, source_line, target_file, target_name, target_line, rowid)，
+/// 与 keyset 比较完全一致；`kind` 不进排序键是因为三张表该列语义不一致，`rowid` 充当最终 tiebreaker。
+fn relation_source_rows(
+    conn: &Connection,
+    source: u8,
+    symbol: &Symbol,
+    keyset: Option<&RelationCursor>,
+    limit: usize,
+) -> Result<Vec<(StructureEdge, RelationKey)>, String> {
+    let (select_sql, from_sql, qual) = match source {
+        0 => (
+            "SELECT kind, source_file, source_name, source_line,
+                    target_file, target_name, target_line,
+                    target_module, target_imported_name, rowid
+             FROM symbol_edges",
+            "WHERE (source_file = ?1 AND source_name = ?2 AND source_line = ?3)
+                OR (target_file = ?1 AND target_name = ?2)
+                OR (target_module IS NOT NULL AND target_name = ?2)",
+            "",
+        ),
+        1 => (
+            "SELECT 'calls' AS kind, e.source_file, e.source_name, e.source_line,
+                    e.target_file, e.target_name, e.target_line,
+                    NULL AS target_module, NULL AS target_imported_name, e.rowid
+             FROM semantic_call_edges e",
+            "WHERE EXISTS (
+                SELECT 1 FROM files f
+                WHERE f.path=e.source_file AND f.state='indexed'
+                  AND f.size=e.source_size AND f.mtime_ns=e.source_mtime_ns
+              )
+              AND EXISTS (
+                SELECT 1 FROM symbols source
+                WHERE source.file=e.source_file AND source.name=e.source_name
+                  AND source.line=e.source_line AND source.role='logic'
+              )
+              AND EXISTS (
+                SELECT 1 FROM symbols target
+                WHERE target.file=e.target_file AND target.name=e.target_name
+                  AND target.line=e.target_line AND target.role='logic'
+              )
+              AND ((e.source_file=?1 AND e.source_name=?2 AND e.source_line=?3)
+                OR (e.target_file=?1 AND e.target_name=?2 AND e.target_line=?3))",
+            "e.",
+        ),
+        _ => (
+            "SELECT 'references' AS kind, e.source_file, e.source_name, e.source_line,
+                    e.target_file, e.target_name, e.target_line,
+                    NULL AS target_module, NULL AS target_imported_name, e.rowid
+             FROM scip_reference_edges e JOIN scip_import_state state
+               ON state.id=1 AND state.active_import_id=e.import_id",
+            "WHERE EXISTS (SELECT 1 FROM files f WHERE f.path=e.source_file AND f.state='indexed'
+                AND f.size=e.source_size AND f.mtime_ns=e.source_mtime_ns)
+              AND EXISTS (SELECT 1 FROM files f WHERE f.path=e.target_file AND f.state='indexed'
+                AND f.size=e.target_size AND f.mtime_ns=e.target_mtime_ns)
+              AND ((e.source_file=?1 AND e.source_name=?2 AND e.source_line=?3)
+                OR (e.target_file=?1 AND e.target_name=?2 AND e.target_line=?3))",
+            "e.",
+        ),
+    };
+    let keyset_sql = if keyset.is_some() {
+        format!(
+            " AND ({qual}source_file, {qual}source_name, {qual}source_line, {qual}target_file, {qual}target_name, {qual}target_line, {qual}rowid) \
+               > (?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+        )
+    } else {
+        String::new()
+    };
+    let order_sql = format!(
+        "ORDER BY {qual}source_file, {qual}source_name, {qual}source_line, {qual}target_file, {qual}target_name, {qual}target_line, {qual}rowid"
+    );
+    let sql = format!("{select_sql} {from_sql}{keyset_sql} {order_sql} LIMIT ?11");
+    let mut values: Vec<Value> = vec![
+        Value::Text(symbol.file.clone()),
+        Value::Text(symbol.name.clone()),
+        Value::Integer(symbol.line as i64),
+    ];
+    match keyset {
+        Some(cursor) => {
+            values.push(Value::Text(cursor.source_file.clone()));
+            values.push(Value::Text(cursor.source_name.clone()));
+            values.push(Value::Integer(cursor.source_line));
+            values.push(Value::Text(cursor.target_file.clone()));
+            values.push(Value::Text(cursor.target_name.clone()));
+            values.push(Value::Integer(cursor.target_line));
+            values.push(Value::Integer(cursor.row_id));
+        }
+        None => {
+            // 无 keyset 时仍占位 7 个参数，保证 LIMIT 恒为 ?11。
+            values.extend([
+                Value::Text(String::new()),
+                Value::Text(String::new()),
+                Value::Integer(0),
+                Value::Text(String::new()),
+                Value::Text(String::new()),
+                Value::Integer(0),
+                Value::Integer(0),
+            ]);
+        }
+    }
+    values.push(Value::Integer(limit as i64));
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| format!("准备关系查询（来源 {source}）失败：{error}"))?;
+    let rows = statement
+        .query_map(params_from_iter(values.iter()), |row| {
+            let key = RelationKey {
+                source_file: row.get(1)?,
+                source_name: row.get(2)?,
+                source_line: row.get::<_, i64>(3)?.max(0),
+                target_file: row.get(4)?,
+                target_name: row.get(5)?,
+                target_line: row.get::<_, i64>(6)?.max(0),
+                row_id: row.get(9)?,
+            };
+            let edge = StructureEdge {
+                kind: row.get(0)?,
+                source_file: key.source_file.clone(),
+                source_name: key.source_name.clone(),
+                source_line: key.source_line as usize,
+                target_file: key.target_file.clone(),
+                target_name: key.target_name.clone(),
+                target_line: key.target_line as usize,
+                target_module: row.get(7)?,
+                target_imported_name: row.get(8)?,
+            };
+            Ok((edge, key))
+        })
+        .map_err(|error| format!("读取关系（来源 {source}）失败：{error}"))?;
+    let mut out = Vec::with_capacity(limit);
+    for row in rows {
+        out.push(row.map_err(|error| format!("解析关系（来源 {source}）失败：{error}"))?);
+    }
+    Ok(out)
+}
+
 fn query_persisted_edges_bounded_at(
     root: &Path,
     data_dir: &Path,
     symbols: &[Symbol],
-) -> Option<Result<(Vec<StructureEdge>, usize, bool), String>> {
+    cursor: Option<&RelationCursor>,
+) -> Option<Result<(Vec<StructureEdge>, usize, bool, Option<String>), String>> {
     let conn = match Connection::open(catalog_file_at(data_dir, root)) {
         Ok(value) => value,
         Err(error) => return Some(Err(format!("打开结构关系库失败：{error}"))),
@@ -4381,170 +4586,109 @@ fn query_persisted_edges_bounded_at(
         Ok(value) => value.max(0) as usize,
         Err(error) => return Some(Err(format!("查询结构关系数量失败：{error}"))),
     };
-    let mut statement = match conn.prepare(
-        "SELECT kind, source_file, source_name, source_line,
-                target_file, target_name, target_line,
-                target_module, target_imported_name
-         FROM symbol_edges
-         WHERE (source_file = ?1 AND source_name = ?2 AND source_line = ?3)
-            OR (target_file = ?1 AND target_name = ?2)
-            OR (target_module IS NOT NULL AND target_name = ?2)",
-    ) {
-        Ok(value) => value,
-        Err(error) => return Some(Err(format!("准备结构关系查询失败：{error}"))),
-    };
-    let mut edges = Vec::new();
-    let mut truncated = false;
-    for symbol in symbols {
-        if edges.len() >= MAX_QUERY_RELATIONS {
-            truncated = true;
-            break;
-        }
-        let rows = match statement.query_map(
-            params![symbol.file, symbol.name, symbol.line as i64],
-            |row| {
-                Ok(StructureEdge {
-                    kind: row.get(0)?,
-                    source_file: row.get(1)?,
-                    source_name: row.get(2)?,
-                    source_line: row.get::<_, i64>(3)?.max(0) as usize,
-                    target_file: row.get(4)?,
-                    target_name: row.get(5)?,
-                    target_line: row.get::<_, i64>(6)?.max(0) as usize,
-                    target_module: row.get(7)?,
-                    target_imported_name: row.get(8)?,
-                })
-            },
-        ) {
-            Ok(value) => value,
-            Err(error) => return Some(Err(format!("读取结构关系失败：{error}"))),
-        };
-        for row in rows {
-            if edges.len() >= MAX_QUERY_RELATIONS {
-                truncated = true;
-                break;
-            }
-            match row {
-                Ok(edge) => edges.push(edge),
-                Err(error) => return Some(Err(format!("解析结构关系失败：{error}"))),
-            }
-        }
-    }
-    let mut semantic_statement = match conn.prepare(
-        "SELECT e.source_file, e.source_name, e.source_line,
-                e.target_file, e.target_name, e.target_line
-         FROM semantic_call_edges e
-         WHERE EXISTS (
-           SELECT 1 FROM files f
-           WHERE f.path=e.source_file AND f.state='indexed'
-             AND f.size=e.source_size AND f.mtime_ns=e.source_mtime_ns
-         )
-         AND EXISTS (
-           SELECT 1 FROM symbols source
-           WHERE source.file=e.source_file AND source.name=e.source_name
-             AND source.line=e.source_line AND source.role='logic'
-         )
-         AND EXISTS (
-           SELECT 1 FROM symbols target
-           WHERE target.file=e.target_file AND target.name=e.target_name
-             AND target.line=e.target_line AND target.role='logic'
-         )
-         AND ((e.source_file=?1 AND e.source_name=?2 AND e.source_line=?3)
-           OR (e.target_file=?1 AND e.target_name=?2 AND e.target_line=?3))",
-    ) {
-        Ok(value) => value,
-        Err(error) => return Some(Err(format!("准备语义调用关系查询失败：{error}"))),
-    };
-    for symbol in symbols {
-        if edges.len() >= MAX_QUERY_RELATIONS {
-            truncated = true;
-            break;
-        }
-        let rows = match semantic_statement.query_map(
-            params![symbol.file, symbol.name, symbol.line as i64],
-            |row| {
-                Ok(StructureEdge {
-                    kind: "calls".into(),
-                    source_file: row.get(0)?,
-                    source_name: row.get(1)?,
-                    source_line: row.get::<_, i64>(2)?.max(0) as usize,
-                    target_file: row.get(3)?,
-                    target_name: row.get(4)?,
-                    target_line: row.get::<_, i64>(5)?.max(0) as usize,
-                    target_module: None,
-                    target_imported_name: None,
-                })
-            },
-        ) {
-            Ok(value) => value,
-            Err(error) => return Some(Err(format!("读取语义调用关系失败：{error}"))),
-        };
-        for row in rows {
-            if edges.len() >= MAX_QUERY_RELATIONS {
-                truncated = true;
-                break;
-            }
-            match row {
-                Ok(edge) => edges.push(edge),
-                Err(error) => return Some(Err(format!("解析语义调用关系失败：{error}"))),
-            }
-        }
-    }
-    let has_scip = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scip_reference_edges')",
-        [], |row| row.get::<_, bool>(0),
-    ).unwrap_or(false);
-    if has_scip {
+    let index_revision = conn
+        .query_row("SELECT revision FROM structure_meta WHERE id=1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|value| value.max(0) as u64)
+        .unwrap_or(0);
+    let has_scip = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scip_reference_edges')",
+            [], |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    let scip_import_id = if has_scip {
         total = total.saturating_add(conn.query_row(
             "SELECT COALESCE(edge_count, 0) FROM scip_import_state WHERE id=1",
             [], |row| row.get::<_, i64>(0),
         ).unwrap_or(0).max(0) as usize);
-        let mut scip_statement = match conn.prepare(
-            "SELECT e.source_file, e.source_name, e.source_line,
-                    e.target_file, e.target_name, e.target_line
-             FROM scip_reference_edges e JOIN scip_import_state state
-               ON state.id=1 AND state.active_import_id=e.import_id
-             WHERE EXISTS (SELECT 1 FROM files f WHERE f.path=e.source_file AND f.state='indexed'
-               AND f.size=e.source_size AND f.mtime_ns=e.source_mtime_ns)
-               AND EXISTS (SELECT 1 FROM files f WHERE f.path=e.target_file AND f.state='indexed'
-               AND f.size=e.target_size AND f.mtime_ns=e.target_mtime_ns)
-               AND ((e.source_file=?1 AND e.source_name=?2 AND e.source_line=?3)
-                 OR (e.target_file=?1 AND e.target_name=?2 AND e.target_line=?3))"
-        ) {
-            Ok(value) => value,
-            Err(error) => return Some(Err(format!("准备 SCIP 引用查询失败：{error}"))),
-        };
+        conn.query_row(
+            "SELECT COALESCE(active_import_id, 0) FROM scip_import_state WHERE id=1",
+            [], |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    if let Some(cursor) = cursor {
+        if cursor.index_revision != index_revision || cursor.scip_import_id != scip_import_id {
+            return Some(Err(
+                "结构索引或 SCIP 索引已在翻页期间更新，请从第一页重新查询".into(),
+            ));
+        }
+    }
+    // 关系翻页仅在单符号查询下启用；多符号查询保持既有“截断到 500 条”行为，不产生游标。
+    let single_symbol = symbols.len() == 1;
+    let cursor = if single_symbol { cursor } else { None };
+
+    let mut edges: Vec<StructureEdge> = Vec::new();
+    let mut truncated = false;
+    let mut next_key: Option<(u8, RelationKey)> = None;
+    for source in 0u8..=2 {
+        if source == 2 && !has_scip {
+            continue;
+        }
+        if cursor.is_some_and(|value| source < value.source) {
+            continue;
+        }
+        let keyset_for_source = cursor.filter(|value| value.source == source);
         for symbol in symbols {
-            if edges.len() >= MAX_QUERY_RELATIONS {
+            let remaining = MAX_QUERY_RELATIONS.saturating_sub(edges.len());
+            if remaining == 0 {
                 truncated = true;
                 break;
             }
-            let rows = match scip_statement.query_map(
-                params![symbol.file, symbol.name, symbol.line as i64],
-                |row| Ok(StructureEdge {
-                    kind: "references".into(),
-                    source_file: row.get(0)?, source_name: row.get(1)?,
-                    source_line: row.get::<_, i64>(2)?.max(0) as usize,
-                    target_file: row.get(3)?, target_name: row.get(4)?,
-                    target_line: row.get::<_, i64>(5)?.max(0) as usize,
-                    target_module: None, target_imported_name: None,
-                }),
+            let rows = match relation_source_rows(
+                &conn,
+                source,
+                symbol,
+                keyset_for_source,
+                remaining + 1,
             ) {
                 Ok(value) => value,
-                Err(error) => return Some(Err(format!("读取 SCIP 引用失败：{error}"))),
+                Err(error) => return Some(Err(error)),
             };
-            for row in rows {
-                if edges.len() >= MAX_QUERY_RELATIONS {
-                    truncated = true;
-                    break;
-                }
-                match row {
-                    Ok(edge) => edges.push(edge),
-                    Err(error) => return Some(Err(format!("解析 SCIP 引用失败：{error}"))),
-                }
+            let has_more = rows.len() > remaining;
+            let mut last_key = None;
+            for (edge, key) in rows.into_iter().take(remaining) {
+                edges.push(edge);
+                last_key = Some(key);
+            }
+            if has_more {
+                truncated = true;
+                next_key = last_key.map(|key| (source, key));
+                break;
             }
         }
+        if truncated {
+            break;
+        }
     }
+    let next_cursor = if single_symbol {
+        match next_key.map(|(source, key)| {
+            encode_relation_cursor(&RelationCursor {
+                version: 1,
+                filter_hash: relation_filter_hash(root, symbols),
+                index_revision,
+                scip_import_id,
+                source,
+                source_file: key.source_file,
+                source_name: key.source_name,
+                source_line: key.source_line,
+                target_file: key.target_file,
+                target_name: key.target_name,
+                target_line: key.target_line,
+                row_id: key.row_id,
+            })
+        }) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) => return Some(Err(error)),
+            None => None,
+        }
+    } else {
+        None
+    };
     let aliases = load_module_aliases(root, edges.iter().map(|edge| edge.source_file.as_str()));
     for edge in &mut edges {
         resolve_import_target_from_catalog(root, &conn, Some(&aliases), edge);
@@ -4561,7 +4705,7 @@ fn query_persisted_edges_bounded_at(
     });
     edges.sort();
     edges.dedup();
-    Some(Ok((edges, total, truncated)))
+    Some(Ok((edges, total, truncated, next_cursor)))
 }
 
 #[cfg(test)]
@@ -4570,16 +4714,17 @@ fn query_persisted_edges_at(
     data_dir: &Path,
     symbols: &[Symbol],
 ) -> Option<Result<(Vec<StructureEdge>, usize), String>> {
-    query_persisted_edges_bounded_at(root, data_dir, symbols)
-        .map(|result| result.map(|(edges, total, _)| (edges, total)))
+    query_persisted_edges_bounded_at(root, data_dir, symbols, None)
+        .map(|result| result.map(|(edges, total, _, _)| (edges, total)))
 }
 
-fn query_persisted_edges(
+fn query_persisted_edges_with_cursor(
     root: &Path,
+    data_dir: &Path,
     symbols: &[Symbol],
-) -> Option<Result<(Vec<StructureEdge>, usize, bool), String>> {
-    let data_dir = DATA_DIR.get()?;
-    query_persisted_edges_bounded_at(root, data_dir, symbols)
+    cursor: Option<&RelationCursor>,
+) -> Option<Result<(Vec<StructureEdge>, usize, bool, Option<String>), String>> {
+    query_persisted_edges_bounded_at(root, data_dir, symbols, cursor)
 }
 
 fn utf16_column_to_byte(line: &str, utf16_column: usize) -> usize {
@@ -5074,7 +5219,7 @@ pub fn query_structure(
     page: usize,
     page_size: usize,
 ) -> StructureQueryResult {
-    query_structure_with_cursor(root, query, role, kind, file, page, page_size, None)
+    query_structure_with_cursor(root, query, role, kind, file, page, page_size, None, None)
         .expect("without a cursor the structure query retains its in-memory fallback")
 }
 
@@ -5087,6 +5232,7 @@ pub fn query_structure_with_cursor(
     page: usize,
     page_size: usize,
     cursor: Option<&str>,
+    relations_cursor: Option<&str>,
 ) -> Result<StructureQueryResult, String> {
     let syms = index_project_cached(root);
     #[cfg(not(test))]
@@ -5177,9 +5323,25 @@ pub fn query_structure_with_cursor(
         edges.truncate(MAX_QUERY_RELATIONS);
         (edges, total, truncated)
     };
-    let (relations, indexed_relations, relations_truncated) = query_persisted_edges(root, &items)
-        .and_then(Result::ok)
-        .unwrap_or_else(fallback_edges);
+    let decoded_relation_cursor = relations_cursor
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| decode_relation_cursor(value, relation_filter_hash(root, &items)))
+        .transpose()?;
+    let persisted_edges = DATA_DIR.get().and_then(|data_dir| {
+        query_persisted_edges_with_cursor(root, data_dir, &items, decoded_relation_cursor.as_ref())
+    });
+    let (relations, indexed_relations, relations_truncated, relations_next_cursor) = match persisted_edges {
+        Some(Ok(value)) => value,
+        Some(Err(error)) => return Err(error),
+        None if decoded_relation_cursor.is_some() => {
+            return Err("持久结构索引不可用，无法安全续读关系游标；请从第一页重新查询".into())
+        }
+        None => {
+            let (edges, total, truncated) = fallback_edges();
+            (edges, total, truncated, None)
+        }
+    };
     let next_page = decoded_cursor
         .is_none()
         .then(|| (offset.saturating_add(page_size) < total_matches).then_some(page + 1))
@@ -5220,6 +5382,7 @@ pub fn query_structure_with_cursor(
         items,
         relations,
         relations_truncated,
+        relations_next_cursor,
         total_matches,
         page,
         page_size,
@@ -6295,12 +6458,91 @@ class Service extends BaseService implements Loadable, Disposable {}
         }
         drop(conn);
         let target = symbols.iter().find(|symbol| symbol.name == "fetch").cloned().unwrap();
-        let (edges, total, truncated) = query_persisted_edges_bounded_at(&root, &data_dir, &[target])
+        let (edges, total, truncated, _) = query_persisted_edges_bounded_at(&root, &data_dir, &[target], None)
             .unwrap().unwrap();
         assert_eq!(total, 600);
         assert_eq!(edges.len(), MAX_QUERY_RELATIONS);
         assert!(truncated);
         assert!(edges.iter().all(|edge| edge.kind == "references"));
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn popular_symbol_relations_can_be_paged_via_cursor() {
+        let root = std::env::temp_dir()
+            .join(format!("deveco-relation-page-db-{}", uuid::Uuid::new_v4()));
+        let data_dir = std::env::temp_dir()
+            .join(format!("deveco-relation-page-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("source.ts"), "function caller() {}\n").unwrap();
+        std::fs::write(root.join("target.ts"), "function fetch() {}\n").unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        let indexed_files = files.keys().cloned().collect::<Vec<_>>();
+        assert!(replace_all_symbol_rows_with_files_at(
+            &root,
+            &data_dir,
+            &symbols,
+            &indexed_files,
+            catalog.revision,
+        ));
+        let database = catalog_file_at(&data_dir, &root);
+        let conn = Connection::open(database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scip_import_state(id INTEGER PRIMARY KEY, active_import_id INTEGER, edge_count INTEGER);
+             INSERT INTO scip_import_state VALUES(1, 7, 600);
+             CREATE TABLE scip_reference_edges(
+               import_id INTEGER, source_file TEXT, source_name TEXT, source_line INTEGER,
+               occurrence_line INTEGER, occurrence_column INTEGER, source_size INTEGER,
+               source_mtime_ns INTEGER, target_file TEXT, target_name TEXT, target_line INTEGER,
+               target_size INTEGER, target_mtime_ns INTEGER, symbol_key TEXT
+             );
+             CREATE INDEX idx_test_scip_source ON scip_reference_edges(import_id, source_file, source_name, source_line);
+             CREATE INDEX idx_test_scip_target ON scip_reference_edges(import_id, target_file, target_name, target_line);",
+        ).unwrap();
+        let source_stamp = files["source.ts"];
+        let target_stamp = files["target.ts"];
+        for column in 0..600i64 {
+            let source_name = format!("caller_{column}");
+            conn.execute(
+                "INSERT INTO scip_reference_edges VALUES(7,'source.ts',?1,1,1,?2,?3,?4,'target.ts','fetch',1,?5,?6,'symbol')",
+                params![source_name, column, source_stamp.len as i64, source_stamp.mtime as i64, target_stamp.len as i64, target_stamp.mtime as i64],
+            ).unwrap();
+        }
+        drop(conn);
+        let target = symbols.iter().find(|symbol| symbol.name == "fetch").cloned().unwrap();
+        let query_symbols = [target];
+        let filter_hash = relation_filter_hash(&root, &query_symbols);
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        for page in 0..4 {
+            let (edges, total, truncated, next) = query_persisted_edges_bounded_at(
+                &root,
+                &data_dir,
+                &query_symbols,
+                cursor.as_ref(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(total, 600);
+            seen.extend(edges);
+            if !truncated {
+                assert!(next.is_none());
+                break;
+            }
+            assert!(page < 3, "600 条引用应在两页内翻完");
+            let encoded = next.expect("截断页必须携带关系游标");
+            cursor = Some(decode_relation_cursor(&encoded, filter_hash).unwrap());
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 600);
+        assert!(seen.iter().all(|edge| edge.kind == "references"));
         std::fs::remove_dir_all(root).ok();
         std::fs::remove_dir_all(data_dir).ok();
     }

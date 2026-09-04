@@ -767,7 +767,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_symbols",
-        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
+        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"relations_cursor\":\"<可选，原样传回关系结果的 relations_next_cursor 读取下一页关系>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；热点符号关系超过单次上限时返回 relations_next_cursor 供翻页；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
     },
     ToolSpec {
         name: "import_scip_index",
@@ -3634,6 +3634,7 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     }
     let file = args["file"].as_str().map(|s| s.to_string());
     let cursor = args["cursor"].as_str().map(|s| s.to_string());
+    let relations_cursor = args["relations_cursor"].as_str().map(|s| s.to_string());
     let page = args["page"].as_u64().unwrap_or(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
     // 复用增量持久索引；只把当前页结构元数据带入模型，不把全仓源码塞进上下文。
@@ -3647,6 +3648,7 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
             page,
             limit,
             cursor.as_deref(),
+            relations_cursor.as_deref(),
         )
     })
         .await
@@ -3763,9 +3765,15 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
             ));
         }
         if result.relations_truncated {
-            out.push_str(
-                "关系结果已达到单次 500 条安全上限；请缩小 query/file，或按具体符号继续查询。\n",
-            );
+            if let Some(cursor) = result.relations_next_cursor.as_deref() {
+                out.push_str(&format!(
+                    "关系结果已达单次 500 条安全上限；原样传入 relations_cursor={cursor} 读取下一页关系。\n",
+                ));
+            } else {
+                out.push_str(
+                    "关系结果已达到单次 500 条安全上限；请缩小 query/file，或按具体符号继续查询。\n",
+                );
+            }
         }
     }
     if let Some(next_cursor) = result.next_cursor {
