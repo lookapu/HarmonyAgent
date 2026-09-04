@@ -112,6 +112,7 @@ import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, Preview
 import CommandPalette, { type PaletteCommand } from '../components/CommandPalette'
 import { Button } from '../components/ui/Button'
 import { IconButton } from '../components/ui/IconButton'
+import { Field, TextArea } from '../components/ui/Field'
 import {
   fmtElapsed,
   interruptedTailMessage,
@@ -7296,25 +7297,25 @@ export default function Home() {
             </button>
           </div>
           <div className="space-y-2">
-            <input
+            <Field
+              fieldSize="md"
               value={knowledgeCandidate.title}
               onChange={(e) => setKnowledgeCandidate({ ...knowledgeCandidate, title: e.target.value })}
               placeholder={t('knowledge.entryTitle')}
-              className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)]"
             />
-            <textarea
+            <TextArea
+              fieldSize="md"
               value={knowledgeCandidate.error_text}
               onChange={(e) => setKnowledgeCandidate({ ...knowledgeCandidate, error_text: e.target.value })}
               rows={3}
               placeholder={t('knowledge.candidateErrorPh')}
-              className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] resize-y"
             />
-            <textarea
+            <TextArea
+              fieldSize="md"
               value={knowledgeCandidate.fix}
               onChange={(e) => setKnowledgeCandidate({ ...knowledgeCandidate, fix: e.target.value })}
               rows={4}
               placeholder={t('knowledge.candidateFixPh')}
-              className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] resize-y"
             />
           </div>
           <div className="flex justify-end gap-2">
@@ -7874,34 +7875,28 @@ const MessageItem = memo(function MessageItem({
           >
             <h3 className="text-[14px] font-semibold">{t('knowledge.rememberTitle')}</h3>
             <p className="text-[11px] text-[var(--text-muted)]">{t('knowledge.rememberHint')}</p>
-            <div>
-              <label className="block text-[11px] text-[var(--text-secondary)] mb-1">{t('knowledge.entryTitle')}</label>
-              <input
-                value={rememberForm.title}
-                onChange={(e) => setRememberForm({ ...rememberForm, title: e.target.value })}
-                placeholder={t('knowledge.rememberTitlePh')}
-                className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)]"
-              />
-            </div>
-            <div>
-              <label className="block text-[11px] text-[var(--text-secondary)] mb-1">{t('knowledge.rememberError')}</label>
-              <textarea
-                value={rememberForm.error_text}
-                onChange={(e) => setRememberForm({ ...rememberForm, error_text: e.target.value })}
-                rows={4}
-                placeholder={t('knowledge.rememberErrorPh')}
-                className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] resize-y"
-              />
-            </div>
-            <div>
-              <label className="block text-[11px] text-[var(--text-secondary)] mb-1">{t('knowledge.fix')}</label>
-              <textarea
-                value={rememberForm.fix}
-                onChange={(e) => setRememberForm({ ...rememberForm, fix: e.target.value })}
-                rows={5}
-                className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] resize-y"
-              />
-            </div>
+            <Field
+              fieldSize="md"
+              label={t('knowledge.entryTitle')}
+              value={rememberForm.title}
+              onChange={(e) => setRememberForm({ ...rememberForm, title: e.target.value })}
+              placeholder={t('knowledge.rememberTitlePh')}
+            />
+            <TextArea
+              fieldSize="md"
+              label={t('knowledge.rememberError')}
+              value={rememberForm.error_text}
+              onChange={(e) => setRememberForm({ ...rememberForm, error_text: e.target.value })}
+              rows={4}
+              placeholder={t('knowledge.rememberErrorPh')}
+            />
+            <TextArea
+              fieldSize="md"
+              label={t('knowledge.fix')}
+              value={rememberForm.fix}
+              onChange={(e) => setRememberForm({ ...rememberForm, fix: e.target.value })}
+              rows={5}
+            />
             <div className="flex justify-end gap-2 pt-1">
               <Button variant="secondary" size="md" onClick={() => setRememberOpen(false)}>
                 {t('mcp.cancel')}

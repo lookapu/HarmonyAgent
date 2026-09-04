@@ -162,7 +162,14 @@ export function TextArea({
         id={inputId}
         aria-invalid={error != null || undefined}
         aria-describedby={cn(ids.hint, ids.err) || undefined}
-        className={controlClass(fieldSize, mono, error != null, areaSizeCls, 'resize-y leading-relaxed min-h-[80px]')}
+        className={controlClass(
+          fieldSize,
+          mono,
+          error != null,
+          areaSizeCls,
+          // rows 已显式给定时不再兜 min-h，否则 rows={3} 会被强行撑到 80px
+          cn('resize-y leading-relaxed', rest.rows == null && 'min-h-[80px]'),
+        )}
       />
     </Wrap>
   )
