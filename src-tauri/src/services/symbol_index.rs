@@ -28,7 +28,8 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 8;
+const STRUCTURE_PARSER_VERSION: i64 = 9;
+const MAX_REEXPORT_DEPTH: usize = 8;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -331,6 +332,13 @@ struct NamedImport {
     imported_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModuleReexport {
+    exported_name: String,
+    target_module: String,
+    imported_name: String,
+}
+
 fn string_literal_value(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let value = node_text(node, source)?;
     let quote = value.chars().next()?;
@@ -384,6 +392,73 @@ fn named_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> HashMap<String, 
         collect_named_import_specifiers(import_node, source, &module_specifier, &mut imports);
     }
     imports
+}
+
+fn collect_export_specifiers(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    target_module: &str,
+    out: &mut Vec<ModuleReexport>,
+) {
+    if node.kind() == "export_specifier" {
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|value| node_text(value, source))
+        else {
+            return;
+        };
+        let exported_name = node
+            .child_by_field_name("alias")
+            .and_then(|value| node_text(value, source))
+            .unwrap_or_else(|| name.clone());
+        out.push(ModuleReexport {
+            exported_name,
+            target_module: target_module.to_string(),
+            imported_name: name,
+        });
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_export_specifiers(child, source, target_module, out);
+    }
+}
+
+fn parse_module_reexports(content: &str, ext: &str) -> Vec<ModuleReexport> {
+    let Some(language) = tree_sitter_language(ext) else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let source = content.as_bytes();
+    let mut out = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    for statement in tree.root_node().named_children(&mut cursor) {
+        if statement.kind() != "export_statement" {
+            continue;
+        }
+        let Some(target_module) = statement
+            .child_by_field_name("source")
+            .and_then(|value| string_literal_value(value, source))
+        else {
+            continue;
+        };
+        collect_export_specifiers(statement, source, &target_module, &mut out);
+    }
+    out.sort_by(|a, b| {
+        (&a.exported_name, &a.target_module, &a.imported_name).cmp(&(
+            &b.exported_name,
+            &b.target_module,
+            &b.imported_name,
+        ))
+    });
+    out.dedup();
+    out
 }
 
 fn relation_local_identifier(value: &str) -> Option<&str> {
@@ -1113,23 +1188,18 @@ fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
 
 fn insert_edge_row(
     transaction: &rusqlite::Transaction<'_>,
+    root: &Path,
     edge: &StructureEdge,
     aliases: Option<&ModuleAliases>,
 ) -> rusqlite::Result<()> {
-    let mut target_file = edge.target_file.clone();
-    let mut target_name = edge.target_name.clone();
-    let mut target_line = edge.target_line;
-    if let (Some(module), Some(imported)) = (
-        edge.target_module.as_deref(),
-        edge.target_imported_name.as_deref(),
-    ) {
-        if let Some(resolved_file) = resolve_module_file(transaction, &edge.source_file, module, aliases) {
-            target_file = resolved_file;
-            target_name = imported.to_string();
-            // Imported targets are rebound on every query so external edits cannot stale the line.
-            target_line = 0;
-        }
-    }
+    let mut resolved = edge.clone();
+    resolve_import_target_from_catalog(root, transaction, aliases, &mut resolved);
+    let target_line = if edge.target_module.is_some() && !resolved.target_file.is_empty() {
+        // Imported targets are rebound on every query so external edits cannot stale the line.
+        0
+    } else {
+        resolved.target_line
+    };
     transaction.execute(
         "INSERT OR IGNORE INTO symbol_edges(
            kind, source_file, source_name, source_line,
@@ -1141,8 +1211,8 @@ fn insert_edge_row(
             edge.source_file,
             edge.source_name,
             edge.source_line as i64,
-            target_file,
-            target_name,
+            resolved.target_file,
+            resolved.target_name,
             target_line as i64,
             shard_for(&edge.source_file),
             edge.target_module,
@@ -1152,11 +1222,55 @@ fn insert_edge_row(
     Ok(())
 }
 
+fn replace_module_reexports_for_files<'a>(
+    transaction: &rusqlite::Transaction<'_>,
+    root: &Path,
+    files: impl Iterator<Item = &'a str>,
+) -> rusqlite::Result<()> {
+    for file in files {
+        transaction.execute(
+            "DELETE FROM module_reexports
+             WHERE source_file = ?1
+                OR substr(source_file, 1, length(?1) + 1) = ?1 || '/'",
+            params![file],
+        )?;
+        let Some(ext) = Path::new(file).extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !matches!(ext, "ets" | "ts" | "tsx" | "js" | "jsx") {
+            continue;
+        }
+        let path = root.join(file);
+        let Some(content) = fs::metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.len() <= MAX_BYTES)
+            .and_then(|_| fs::read_to_string(path).ok())
+        else {
+            continue;
+        };
+        for reexport in parse_module_reexports(&content, ext) {
+            transaction.execute(
+                "INSERT OR IGNORE INTO module_reexports(
+                   source_file, exported_name, target_module, imported_name
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    file,
+                    reexport.exported_name,
+                    reexport.target_module,
+                    reexport.imported_name,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// 一致性扫描后重建本轮基础批次，同时保留指纹未变、已由后台补齐的节点。
-fn replace_all_symbol_rows_at(
+fn replace_all_symbol_rows_with_files_at(
     root: &Path,
     data_dir: &Path,
     symbols: &[Symbol],
+    indexed_files: &[String],
     expected_revision: u64,
 ) -> bool {
     let mut conn = match Connection::open(catalog_file_at(data_dir, root)) {
@@ -1200,6 +1314,19 @@ fn replace_all_symbol_rows_at(
     {
         return false;
     }
+    if transaction
+        .execute(
+            "DELETE FROM module_reexports
+             WHERE NOT EXISTS (
+               SELECT 1 FROM files f
+               WHERE f.path = module_reexports.source_file AND f.state = 'indexed'
+             )",
+            [],
+        )
+        .is_err()
+    {
+        return false;
+    }
     let mut baseline_files = symbols
         .iter()
         .map(|symbol| symbol.file.as_str())
@@ -1225,9 +1352,18 @@ fn replace_all_symbol_rows_at(
             return false;
         }
     }
+    if replace_module_reexports_for_files(
+        &transaction,
+        root,
+        indexed_files.iter().map(String::as_str),
+    )
+    .is_err()
+    {
+        return false;
+    }
     let aliases = load_module_aliases(root, symbols.iter().map(|symbol| symbol.file.as_str()));
     for edge in structure_edges(symbols) {
-        if insert_edge_row(&transaction, &edge, Some(&aliases)).is_err() {
+        if insert_edge_row(&transaction, root, &edge, Some(&aliases)).is_err() {
             return false;
         }
     }
@@ -1243,9 +1379,42 @@ fn replace_all_symbol_rows_at(
     transaction.commit().is_ok()
 }
 
-fn replace_all_symbol_rows(root: &Path, symbols: &[Symbol], expected_revision: u64) -> bool {
+#[cfg(test)]
+fn replace_all_symbol_rows_at(
+    root: &Path,
+    data_dir: &Path,
+    symbols: &[Symbol],
+    expected_revision: u64,
+) -> bool {
+    let mut indexed_files = symbols
+        .iter()
+        .map(|symbol| symbol.file.clone())
+        .collect::<Vec<_>>();
+    indexed_files.sort();
+    indexed_files.dedup();
+    replace_all_symbol_rows_with_files_at(
+        root,
+        data_dir,
+        symbols,
+        &indexed_files,
+        expected_revision,
+    )
+}
+
+fn replace_all_symbol_rows(
+    root: &Path,
+    symbols: &[Symbol],
+    indexed_files: &[String],
+    expected_revision: u64,
+) -> bool {
     let Some(data_dir) = DATA_DIR.get() else { return false };
-    replace_all_symbol_rows_at(root, data_dir, symbols, expected_revision)
+    replace_all_symbol_rows_with_files_at(
+        root,
+        data_dir,
+        symbols,
+        indexed_files,
+        expected_revision,
+    )
 }
 
 /// 文件级事件只替换对应结构节点；删除目录时同时清理路径前缀。
@@ -1297,9 +1466,18 @@ fn replace_changed_symbol_rows_at(
             return false;
         }
     }
+    if replace_module_reexports_for_files(
+        &transaction,
+        root,
+        normalized.iter().map(String::as_str),
+    )
+    .is_err()
+    {
+        return false;
+    }
     let aliases = load_module_aliases(root, symbols.iter().map(|symbol| symbol.file.as_str()));
     for edge in structure_edges(symbols) {
-        if insert_edge_row(&transaction, &edge, Some(&aliases)).is_err() {
+        if insert_edge_row(&transaction, root, &edge, Some(&aliases)).is_err() {
             return false;
         }
     }
@@ -1443,11 +1621,13 @@ where
                 params![rel],
             )
             .map_err(|error| error.to_string())?;
+        replace_module_reexports_for_files(&transaction, root, std::iter::once(rel.as_str()))
+            .map_err(|error| error.to_string())?;
         for symbol in &symbols {
             insert_symbol_row(&transaction, symbol).map_err(|error| error.to_string())?;
         }
         for edge in structure_edges(&symbols) {
-            insert_edge_row(&transaction, &edge, Some(&aliases))
+            insert_edge_row(&transaction, root, &edge, Some(&aliases))
                 .map_err(|error| error.to_string())?;
         }
         promoted += 1;
@@ -1685,6 +1865,17 @@ where
 
 /// 刷新全库目录，并返回本轮允许进入轻量结构解析预算的源码文件。
 fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS module_reexports (
+           source_file TEXT NOT NULL,
+           exported_name TEXT NOT NULL,
+           target_module TEXT NOT NULL,
+           imported_name TEXT NOT NULL,
+           PRIMARY KEY(source_file, exported_name, target_module, imported_name)
+         );
+         CREATE INDEX IF NOT EXISTS idx_reexports_source_name
+           ON module_reexports(source_file, exported_name);",
+    )?;
     let columns = conn
         .prepare("PRAGMA table_info(symbols)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -1748,6 +1939,7 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM symbol_edges", [])?;
         transaction.execute("DELETE FROM symbols", [])?;
+        transaction.execute("DELETE FROM module_reexports", [])?;
         transaction.execute("UPDATE files SET state='deferred' WHERE state='indexed'", [])?;
         transaction.execute(
             "UPDATE structure_meta
@@ -1832,6 +2024,15 @@ fn collect_files_at_with_budget(
                  CREATE INDEX IF NOT EXISTS idx_edges_target
                    ON symbol_edges(target_file, target_name, target_line);
                  CREATE INDEX IF NOT EXISTS idx_edges_shard ON symbol_edges(shard);
+                 CREATE TABLE IF NOT EXISTS module_reexports (
+                   source_file TEXT NOT NULL,
+                   exported_name TEXT NOT NULL,
+                   target_module TEXT NOT NULL,
+                   imported_name TEXT NOT NULL,
+                   PRIMARY KEY(source_file, exported_name, target_module, imported_name)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_reexports_source_name
+                   ON module_reexports(source_file, exported_name);
                  CREATE TABLE IF NOT EXISTS structure_stats (
                    id INTEGER PRIMARY KEY CHECK(id = 1),
                    relation_count INTEGER NOT NULL DEFAULT 0
@@ -2291,7 +2492,9 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
     // 阶段 2（无锁）：walk + 指纹对比 + 只重扫变化文件
     let (_rescanned, _removed, catalog) = sync_incremental(&mut files, &mut syms, root);
     if catalog.persisted {
-        let _ = replace_all_symbol_rows(root, &syms, catalog.revision);
+        let mut indexed_files = files.keys().cloned().collect::<Vec<_>>();
+        indexed_files.sort();
+        let _ = replace_all_symbol_rows(root, &syms, &indexed_files, catalog.revision);
     }
     // 阶段 3（锁内）：CAS 写回——期间有其他线程同步过（last_sync 变化）则丢弃本地结果。
     // invalidate_files 精确更新同样会推进 last_sync，不会被本阶段覆盖丢失。
@@ -3313,46 +3516,87 @@ fn resolve_module_file(
 }
 
 fn resolve_import_target_from_catalog(
+    root: &Path,
     conn: &Connection,
     aliases: Option<&ModuleAliases>,
     edge: &mut StructureEdge,
 ) {
-    let (Some(module_specifier), Some(imported_name)) = (
-        edge.target_module.as_deref(),
-        edge.target_imported_name.as_deref(),
+    let (Some(mut module_specifier), Some(mut imported_name)) = (
+        edge.target_module.clone(),
+        edge.target_imported_name.clone(),
     ) else {
         return;
     };
-    let Some(target_file) =
-        resolve_module_file(conn, &edge.source_file, module_specifier, aliases)
-    else {
-        edge.target_file.clear();
-        edge.target_line = 0;
-        return;
-    };
-    let mut statement = match conn.prepare(
-        "SELECT line FROM symbols
-         WHERE file=?1 AND name=?2 AND role='entity'
-         ORDER BY line LIMIT 2",
-    ) {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    let lines = match statement
-        .query_map(params![target_file, imported_name], |row| row.get::<_, i64>(0))
-        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-    {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    if lines.len() == 1 {
-        edge.target_file = target_file;
-        edge.target_name = imported_name.to_string();
-        edge.target_line = lines[0].max(0) as usize;
-    } else {
-        edge.target_file.clear();
-        edge.target_line = 0;
+    let mut source_file = edge.source_file.clone();
+    let mut visited = Vec::new();
+    for depth in 0..MAX_REEXPORT_DEPTH {
+        let hop_aliases;
+        let effective_aliases = if depth == 0 {
+            aliases
+        } else {
+            hop_aliases = load_module_aliases(root, std::iter::once(source_file.as_str()));
+            Some(&hop_aliases)
+        };
+        if visited.contains(&(
+            source_file.clone(),
+            module_specifier.clone(),
+            imported_name.clone(),
+        )) {
+            break;
+        }
+        visited.push((
+            source_file.clone(),
+            module_specifier.clone(),
+            imported_name.clone(),
+        ));
+        let Some(target_file) = resolve_module_file(
+            conn,
+            &source_file,
+            &module_specifier,
+            effective_aliases,
+        ) else {
+            break;
+        };
+        let lines = conn
+            .prepare(
+                "SELECT line FROM symbols
+                 WHERE file=?1 AND name=?2 AND role='entity'
+                 ORDER BY line LIMIT 2",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![target_file, imported_name], |row| row.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        if lines.len() == 1 {
+            edge.target_file = target_file;
+            edge.target_name = imported_name;
+            edge.target_line = lines[0].max(0) as usize;
+            return;
+        }
+        let reexports = conn
+            .prepare(
+                "SELECT target_module, imported_name FROM module_reexports
+                 WHERE source_file=?1 AND exported_name=?2
+                 ORDER BY target_module, imported_name LIMIT 2",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![target_file, imported_name], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        if reexports.len() != 1 {
+            break;
+        }
+        source_file = target_file;
+        (module_specifier, imported_name) = reexports.into_iter().next().unwrap();
     }
+    edge.target_file.clear();
+    edge.target_line = 0;
 }
 
 fn query_persisted_edges_at(
@@ -3412,7 +3656,7 @@ fn query_persisted_edges_at(
     }
     let aliases = load_module_aliases(root, edges.iter().map(|edge| edge.source_file.as_str()));
     for edge in &mut edges {
-        resolve_import_target_from_catalog(&conn, Some(&aliases), edge);
+        resolve_import_target_from_catalog(root, &conn, Some(&aliases), edge);
     }
     edges.retain(|edge| {
         symbols.iter().any(|symbol| {
@@ -4167,6 +4411,15 @@ class Service extends BaseService implements Loadable, Disposable {}
         assert!(edge_columns
             .iter()
             .any(|column| column == "target_imported_name"));
+        let reexport_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='module_reexports'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reexport_table, 1);
         let parser_version: i64 = conn
             .query_row(
                 "SELECT parser_version FROM structure_meta WHERE id=1",
@@ -4728,6 +4981,183 @@ class Service extends BaseService implements Loadable, Disposable {}
         let candidates = module_candidates("src/service.ts", "@model/base", Some(&aliases));
         assert!(candidates.contains(&"src/model/base.ts".to_string()));
         assert!(candidates.contains(&"generated/model/base.ts".to_string()));
+    }
+
+    #[test]
+    fn named_reexports_parse_aliases_without_guessing_star_exports() {
+        let exports = parse_module_reexports(
+            "export { Core as PublicCore, Other } from './core';\nexport * from './wild';\n",
+            "ts",
+        );
+        assert_eq!(
+            exports,
+            vec![
+                ModuleReexport {
+                    exported_name: "Other".into(),
+                    target_module: "./core".into(),
+                    imported_name: "Other".into(),
+                },
+                ModuleReexport {
+                    exported_name: "PublicCore".into(),
+                    target_module: "./core".into(),
+                    imported_name: "Core".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn named_reexport_chain_resolves_forward_and_reverse_edges() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-reexport-edge-db-{}", uuid::Uuid::new_v4()));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-reexport-edge-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("barrel/inner")).unwrap();
+        std::fs::create_dir_all(root.join("model-next")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let contract_file = root.join("contract.ts");
+        let next_contract_file = root.join("model-next/contract.ts");
+        let inner_file = root.join("barrel/inner/index.ts");
+        let barrel_file = root.join("barrel/index.ts");
+        let service_file = root.join("service.ts");
+        std::fs::write(&contract_file, "export interface CoreContract {}\n").unwrap();
+        std::fs::write(&next_contract_file, "export interface CoreContract {}\n").unwrap();
+        std::fs::write(
+            &inner_file,
+            "export { CoreContract as InternalContract } from '../../contract';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &barrel_file,
+            "export { InternalContract as PublicContract } from './inner';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &service_file,
+            "import { PublicContract as Contract } from './barrel';\nexport class Service implements Contract {}\n",
+        )
+        .unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        let mut indexed_files = files.keys().cloned().collect::<Vec<_>>();
+        indexed_files.sort();
+        assert!(replace_all_symbol_rows_with_files_at(
+            &root,
+            &data_dir,
+            &symbols,
+            &indexed_files,
+            catalog.revision,
+        ));
+        let service = symbols
+            .iter()
+            .find(|symbol| symbol.name == "Service")
+            .cloned()
+            .unwrap();
+        let contract = symbols
+            .iter()
+            .find(|symbol| symbol.name == "CoreContract" && symbol.file == "contract.ts")
+            .cloned()
+            .unwrap();
+        let (forward, _) = query_persisted_edges_at(&root, &data_dir, &[service.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].target_file, "contract.ts");
+        assert_eq!(forward[0].target_name, "CoreContract");
+        assert_eq!(forward[0].target_line, 1);
+        let (reverse, _) = query_persisted_edges_at(&root, &data_dir, &[contract])
+            .unwrap()
+            .unwrap();
+        assert_eq!(reverse.len(), 1);
+        assert_eq!(reverse[0].source_name, "Service");
+
+        std::fs::write(
+            &inner_file,
+            "export { CoreContract as InternalContract } from '../../model-next/contract';\n",
+        )
+        .unwrap();
+        assert!(replace_changed_symbol_rows_at(
+            &root,
+            &data_dir,
+            &["barrel/inner/index.ts".into()],
+            &[],
+        ));
+        let next_contract = symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name == "CoreContract" && symbol.file == "model-next/contract.ts"
+            })
+            .cloned()
+            .unwrap();
+        let (repointed, _) = query_persisted_edges_at(&root, &data_dir, &[service])
+            .unwrap()
+            .unwrap();
+        assert_eq!(repointed.len(), 1);
+        assert_eq!(repointed[0].target_file, "model-next/contract.ts");
+        let (new_reverse, _) = query_persisted_edges_at(&root, &data_dir, &[next_contract])
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_reverse.len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn ambiguous_or_cyclic_reexports_stay_unresolved() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-reexport-safe-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-reexport-safe-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("a.ts"), "export { Loop } from './b';\n").unwrap();
+        std::fs::write(root.join("b.ts"), "export { Loop } from './a';\n").unwrap();
+        std::fs::write(root.join("one.ts"), "export interface Value {}\n").unwrap();
+        std::fs::write(root.join("two.ts"), "export interface Value {}\n").unwrap();
+        std::fs::write(
+            root.join("ambiguous.ts"),
+            "export { Value } from './one';\nexport { Value } from './two';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("service.ts"),
+            "import { Loop } from './a';\nimport { Value } from './ambiguous';\nexport class LoopService implements Loop {}\nexport class ValueService implements Value {}\n",
+        )
+        .unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        let indexed_files = files.keys().cloned().collect::<Vec<_>>();
+        assert!(replace_all_symbol_rows_with_files_at(
+            &root,
+            &data_dir,
+            &symbols,
+            &indexed_files,
+            catalog.revision,
+        ));
+        for name in ["LoopService", "ValueService"] {
+            let source = symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .cloned()
+                .unwrap();
+            let (edges, _) = query_persisted_edges_at(&root, &data_dir, &[source])
+                .unwrap()
+                .unwrap();
+            assert_eq!(edges.len(), 1);
+            assert!(edges[0].target_file.is_empty());
+            assert_eq!(edges[0].target_line, 0);
+        }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
     }
 
     #[test]
