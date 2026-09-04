@@ -115,6 +115,7 @@ import { IconButton } from '../components/ui/IconButton'
 import { Field, TextArea } from '../components/ui/Field'
 import { Spinner } from '../components/ui/Spinner'
 import { ConfirmDialog } from '../components/ui/ConfirmDialog'
+import { EmptyState as UiEmptyState } from '../components/ui/EmptyState'
 import { useEscapeKey } from '../hooks/useEscapeKey'
 import {
   fmtElapsed,
@@ -4211,7 +4212,7 @@ export default function Home() {
                     <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.searching')}</div>
                   )}
                   {!msgSearching && msgHits.length === 0 && (
-                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.noMessageHits')}</div>
+                    <UiEmptyState compact title={t('home.noMessageHits')} />
                   )}
                   {msgHits.slice(0, 30).map((hit) => (
                     <button
@@ -4244,7 +4245,7 @@ export default function Home() {
                     <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.searching')}</div>
                   )}
                   {!allProjectSearching && allProjectHits.length === 0 && (
-                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.noMessageHits')}</div>
+                    <UiEmptyState compact title={t('home.noMessageHits')} />
                   )}
                   {(() => {
                     // 按项目分组
@@ -4298,9 +4299,7 @@ export default function Home() {
           )}
           <div className={`flex-1 overflow-y-auto pb-2 space-y-0.5 ${sidebarCollapsed ? 'px-2' : 'px-2'}`}>
             {conversations.length === 0 && !sidebarCollapsed && (
-              <p className="text-[11px] text-[var(--text-muted)] px-2 py-4 text-center leading-relaxed">
-                {currentProject ? t('home.noConversation') : t('home.selectProjectFirst')}
-              </p>
+              <UiEmptyState compact title={currentProject ? t('home.noConversation') : t('home.selectProjectFirst')} />
             )}
             {groupedConversations.map((row) => {
               if (row.kind === 'header') {
@@ -5579,7 +5578,7 @@ export default function Home() {
                   {t('home.slashHint')}
                 </div>
                 {slashCandidates.length === 0 && (
-                  <div className="px-3 py-2.5 text-[11px] text-[var(--text-muted)]">{t('home.slashNoMatch')}</div>
+                  <UiEmptyState compact title={t('home.slashNoMatch')} />
                 )}
                 {slashCandidates.map((c, i) => (
                   <button
@@ -5608,7 +5607,7 @@ export default function Home() {
                   {t('home.refHint')}「@{refQuery}」
                 </div>
                 {refCandidates.length === 0 && (
-                  <div className="px-3 py-2.5 text-[11px] text-[var(--text-muted)]">{t('home.refNoMatch')}</div>
+                  <UiEmptyState compact title={t('home.refNoMatch')} />
                 )}
                 {refCandidates.map((c, i) => {
                   const isConv = c.path.startsWith('conv:')
@@ -8247,7 +8246,7 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
         {/* 分组列表 */}
         <div className="space-y-3 text-[12.5px] overflow-y-auto min-h-0 flex-1">
           {filtered.length === 0 ? (
-            <p className="text-center text-[12px] text-[var(--text-muted)] py-6">{t('home.shortcutNoResults')}</p>
+            <UiEmptyState compact title={t('home.shortcutNoResults')} />
           ) : (
             filtered.map((g) => (
               <div key={g.titleKey}>
