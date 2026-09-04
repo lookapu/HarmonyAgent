@@ -120,13 +120,21 @@ export function ModelSettingsPopover({
   options,
   onChange,
 }: {
-  catalog: { providerName: string; models: ProviderModel[] }[]
+  catalog: { providerName: string; providerId: string; autoPoolMode: number; isActive: boolean; models: ProviderModel[] }[]
   options: ChatOptions
   onChange: (next: ChatOptions) => void
 }) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const totalModels = catalog.reduce((n, g) => n + g.models.length, 0)
+  // auto 池概况：active provider 恒在池内；其余按 auto_pool_mode 加入（主池 >=1，杂活池 >=2）
+  const poolOverview = useMemo(() => {
+    const main = catalog.filter((g) => g.isActive || g.autoPoolMode >= 1)
+    const aux = catalog.filter((g) => g.isActive || g.autoPoolMode >= 2)
+    const count = (gs: typeof catalog) =>
+      gs.reduce((n, g) => n + g.models.filter((m) => m.enabled).length, 0)
+    return { mainProviders: main.length, mainModels: count(main), auxProviders: aux.length, auxModels: count(aux) }
+  }, [catalog])
   // 模型推荐：打开弹层时拉最近 200 条 request_logs，按 model 分组打分（成功率 + 平均成本 + 平均延迟）
   // 打分公式：success_rate * 0.6 + cost_efficiency * 0.3 + speed_score * 0.1
   // - cost_efficiency = min(1, 0.001 / avg_cost_cny)（¥0.001 = 满分基准，贵的递减）
@@ -275,7 +283,13 @@ export function ModelSettingsPopover({
                 ))}
               </select>
               {options.model_id === 'auto' && (
-                <p className="text-[10px] text-[var(--text-muted)] mt-1 leading-snug">{t('home.autoModeHint')}</p>
+                <p className="text-[10px] text-[var(--text-muted)] mt-1 leading-snug">
+                  {t('home.autoModeHint')}
+                  <span className="text-[var(--accent)]">
+                    {' '}
+                    {poolOverview.mainProviders} {t('home.autoPoolProviders')} · {poolOverview.mainModels} {t('home.autoPoolModels')}
+                  </span>
+                </p>
               )}
             </>
           )}

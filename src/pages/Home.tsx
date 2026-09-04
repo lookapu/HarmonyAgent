@@ -681,7 +681,7 @@ export default function Home() {
   const [confirmDeleteMsgId, setConfirmDeleteMsgId] = useState<string | null>(null)
   // 拖拽调宽中的侧栏（拖拽时禁用宽度过渡动画，避免拖尾）
   const [resizing, setResizing] = useState<'sidebar' | 'right' | null>(null)
-  const [modelCatalog, setModelCatalog] = useState<{ providerName: string; models: ProviderModel[] }[]>([])
+  const [modelCatalog, setModelCatalog] = useState<{ providerName: string; providerId: string; autoPoolMode: number; isActive: boolean; models: ProviderModel[] }[]>([])
   // 命令面板（Cmd+K）：后端静态命令 + 前端动态命令（会话/模型/斜杠）合并后 fuzzy 搜索
   const [paletteOpen, setPaletteOpen] = useState(false)
   // 快捷键速查浮层（? 触发 / Esc 关闭）
@@ -1379,6 +1379,9 @@ export default function Home() {
         const entries = await Promise.all(
           ps.map(async (p) => ({
             providerName: p.name,
+            providerId: p.id,
+            autoPoolMode: p.auto_pool_mode,
+            isActive: p.is_active,
             models: await listProviderModels(p.id).catch(() => [] as ProviderModel[]),
           })),
         )

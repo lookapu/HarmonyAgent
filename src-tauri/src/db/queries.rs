@@ -922,6 +922,65 @@ pub fn get_cost_by_model(conn: &Connection, start: i64, end: i64) -> Result<Vec<
     rows.collect()
 }
 
+/* ============ Auto 池统计 ============ */
+
+/// 读取 auto 池内的 provider 概况（min_mode：主池 1 / 杂活池 2；active 恒在池内）
+fn auto_pool_providers(conn: &Connection, min_mode: i64) -> Result<Vec<AutoPoolProvider>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.name, p.auto_pool_mode, p.is_active, COUNT(m.id)
+         FROM providers p
+         LEFT JOIN models m ON m.provider_id = p.id AND m.enabled = 1
+         WHERE p.is_active = 1 OR p.auto_pool_mode >= ?1
+         GROUP BY p.id
+         ORDER BY p.is_active DESC, p.auto_pool_mode DESC, p.name ASC",
+    )?;
+    let rows = stmt.query_map([min_mode], |row| {
+        Ok(AutoPoolProvider {
+            provider_id: row.get(0)?,
+            name: row.get(1)?,
+            auto_pool_mode: row.get(2)?,
+            is_active: row.get(3)?,
+            model_count: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// auto 池统计：主池/杂活池构成 + 池内模型在主任务中的使用分布
+pub fn get_auto_pool_stats(conn: &Connection) -> Result<AutoPoolStats, rusqlite::Error> {
+    let main_pool = auto_pool_providers(conn, 1)?;
+    let aux_pool = auto_pool_providers(conn, 2)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT tr.model, tr.provider_id, p.name, COUNT(*),
+                SUM(tr.cost_cny), SUM(tr.input_tokens), SUM(tr.output_tokens)
+         FROM task_runs tr
+         JOIN providers p ON p.id = tr.provider_id
+         WHERE tr.model IS NOT NULL
+           AND (p.is_active = 1 OR p.auto_pool_mode >= 1)
+         GROUP BY tr.model, tr.provider_id
+         ORDER BY SUM(tr.cost_cny) DESC, COUNT(*) DESC",
+    )?;
+    let usage = stmt.query_map([], |row| {
+        Ok(AutoPoolModelUsage {
+            model: row.get(0)?,
+            provider_id: row.get(1)?,
+            provider_name: row.get(2)?,
+            request_count: row.get(3)?,
+            cost_cny: row.get(4)?,
+            input_tokens: row.get(5)?,
+            output_tokens: row.get(6)?,
+        })
+    })?;
+    let usage_by_model = usage.collect::<Result<Vec<_>, _>>()?;
+
+    Ok(AutoPoolStats {
+        main_pool,
+        aux_pool,
+        usage_by_model,
+    })
+}
+
 /* ============ 任务级 Trace（010） ============ */
 
 pub fn insert_task_run(conn: &Connection, t: &TaskRun) -> Result<(), rusqlite::Error> {

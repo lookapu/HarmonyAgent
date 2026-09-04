@@ -513,6 +513,7 @@ pub fn run() {
             commands::cost::get_cost_summary,
             commands::cost::get_request_logs,
             commands::cost::get_daily_usage,
+            commands::cost::get_auto_pool_stats,
             commands::cost::get_task_stats,
             commands::cost::get_task_runs,
             commands::cost::get_budget_status,

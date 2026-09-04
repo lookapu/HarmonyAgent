@@ -89,6 +89,36 @@ export interface TaskRun {
 export const getCostSummary = (range: DateRange) => invokeWithError<CostSummary>('get_cost_summary', { range })
 export const getRequestLogs = (filter: LogFilter) => invokeWithError<RequestLog[]>('get_request_logs', { filter })
 export const getDailyUsage = (range: DateRange) => invokeWithError<DailyUsage[]>('get_daily_usage', { range })
+
+/** auto 池内的 provider 概况 */
+export interface AutoPoolProvider {
+  provider_id: string
+  name: string
+  auto_pool_mode: number
+  is_active: boolean
+  model_count: number
+}
+
+/** auto 池内某模型的实际使用（task_runs 主任务口径） */
+export interface AutoPoolModelUsage {
+  model: string
+  provider_id: string
+  provider_name: string
+  request_count: number
+  cost_cny: number
+  input_tokens: number
+  output_tokens: number
+}
+
+/** auto 池统计：主池/杂活池构成 + 池内模型使用分布 */
+export interface AutoPoolStats {
+  main_pool: AutoPoolProvider[]
+  aux_pool: AutoPoolProvider[]
+  usage_by_model: AutoPoolModelUsage[]
+}
+
+export const getAutoPoolStats = () => invokeWithError<AutoPoolStats>('get_auto_pool_stats')
+
 /** 任务级指标聚合；project_id 为空 = 全局，days 缺省 30 */
 export const getTaskStats = (projectId?: string, days = 30) =>
   invokeWithError<TaskStats>('get_task_stats', { projectId: projectId ?? '', days })

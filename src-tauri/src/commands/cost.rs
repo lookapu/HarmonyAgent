@@ -1,6 +1,6 @@
 use tauri::State;
 use crate::db::{
-    models::{CostSummary, DailyUsage, RequestLog, TaskStats},
+    models::{AutoPoolStats, CostSummary, DailyUsage, RequestLog, TaskStats},
     queries, DbState,
 };
 use crate::services::budget::{self, BudgetStatus};
@@ -85,6 +85,13 @@ pub fn get_request_logs(db: State<DbState>, filter: LogFilter) -> Result<Vec<Req
 pub fn get_daily_usage(db: State<DbState>, range: DateRange) -> Result<Vec<DailyUsage>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::get_daily_usage(&conn, &range.start, &range.end).map_err(|e| e.to_string())
+}
+
+/// auto 池统计：主池/杂活池构成 + 池内模型在主任务中的使用分布
+#[tauri::command]
+pub fn get_auto_pool_stats(db: State<DbState>) -> Result<AutoPoolStats, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::get_auto_pool_stats(&conn).map_err(|e| e.to_string())
 }
 
 /// 任务级指标聚合（成功率 / P50 / P95 / 成本 / 错误分布）；project_id 为空 = 全局
