@@ -95,6 +95,25 @@ describe('Modal', () => {
     expect(screen.getByText('must decide')).toBeInTheDocument()
   })
 
+  // aria-modal="true" 必须由焦点陷阱兑现：否则它向读屏声明背后内容不可达，
+  // 焦点却能 Tab 出去，比干脆不写这个属性更糟
+  it('打开即把焦点移入 dialog，Tab 循环锁在里面', () => {
+    render(
+      <Modal open onClose={onClose} title="t">
+        <button>body action</button>
+      </Modal>,
+    )
+    expect(screen.getByRole('dialog')).toHaveAttribute('tabindex', '-1')
+
+    const closeBtn = screen.getByLabelText('common.close')
+    const bodyBtn = screen.getByRole('button', { name: 'body action' })
+    expect(document.activeElement).toBe(closeBtn)
+
+    bodyBtn.focus()
+    fireEvent.keyDown(document, { key: 'Tab' })
+    expect(document.activeElement).toBe(closeBtn)
+  })
+
   it('嵌套时 Esc 只关最上层', () => {
     const onOuter = vi.fn()
     const onInner = vi.fn()

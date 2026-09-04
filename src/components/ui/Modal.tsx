@@ -14,15 +14,21 @@
  * 遮罩点击用 onMouseDown 而非 onClick，且比对 e.target === e.currentTarget：
  * 在模态内按下鼠标、拖到遮罩上松开不应关闭（onClick 会误触发）。
  *
+ * `aria-modal="true"` 由 useFocusTrap 兑现：Tab 循环锁在容器内、打开时把焦点移进去、
+ * 关闭时还给触发元素。少了它这个属性是**反向伤害**——它向读屏声明背后内容不可达，
+ * 焦点却还能 Tab 出去（详见 hooks/useFocusTrap.ts）。dialog 因此带 tabindex="-1"，
+ * 好在没有任何可聚焦子元素时兜住焦点。
+ *
  * 遮罩本体复用 index.css 的 .modal-backdrop（已含平涂压暗 + fade-in +
  * z-index: var(--app-z-modal)），本文件只补 flex 居中与内边距。
  */
 
-import { useId } from 'react'
+import { useId, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { useEscapeKey } from '../../hooks/useEscapeKey'
+import { useFocusTrap } from '../../hooks/useFocusTrap'
 import { cn } from '../../utils/cn'
 import { IconButton } from './IconButton'
 import Icon from '../../icons/Icon'
@@ -79,8 +85,10 @@ export function Modal({
   children,
 }: ModalProps) {
   const titleId = useId()
+  const dialogRef = useRef<HTMLDivElement>(null)
   const { t } = useTranslation()
   useEscapeKey(onClose ?? null, { enabled: open })
+  useFocusTrap(dialogRef, { enabled: open })
 
   if (!open) return null
 
@@ -97,6 +105,8 @@ export function Modal({
       }}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby={title != null ? titleId : undefined}
