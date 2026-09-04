@@ -1282,6 +1282,8 @@ fn collect_files_at_with_budget(
                  CREATE INDEX IF NOT EXISTS idx_symbols_role_kind ON symbols(role, kind);
                  CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name COLLATE NOCASE);
                  CREATE INDEX IF NOT EXISTS idx_symbols_shard ON symbols(shard);
+                 CREATE INDEX IF NOT EXISTS idx_symbols_kind_order
+                   ON symbols(kind, file, line, name);
                  CREATE TABLE IF NOT EXISTS symbol_edges (
                    kind TEXT NOT NULL,
                    source_file TEXT NOT NULL,
@@ -1299,6 +1301,20 @@ fn collect_files_at_with_budget(
                  CREATE INDEX IF NOT EXISTS idx_edges_target
                    ON symbol_edges(target_file, target_name, target_line);
                  CREATE INDEX IF NOT EXISTS idx_edges_shard ON symbol_edges(shard);
+                 CREATE TABLE IF NOT EXISTS structure_stats (
+                   id INTEGER PRIMARY KEY CHECK(id = 1),
+                   relation_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO structure_stats(id, relation_count)
+                   SELECT 1, COUNT(*) FROM symbol_edges;
+                 CREATE TRIGGER IF NOT EXISTS trg_symbol_edges_insert
+                   AFTER INSERT ON symbol_edges BEGIN
+                     UPDATE structure_stats SET relation_count = relation_count + 1 WHERE id = 1;
+                   END;
+                 CREATE TRIGGER IF NOT EXISTS trg_symbol_edges_delete
+                   AFTER DELETE ON symbol_edges BEGIN
+                     UPDATE structure_stats SET relation_count = MAX(0, relation_count - 1) WHERE id = 1;
+                   END;
                  BEGIN IMMEDIATE;",
             )
             .ok()?;
@@ -2008,6 +2024,99 @@ fn query_persisted_symbols_at(
     let role = role.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("");
     let kind = kind.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("");
     let file = file.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("").to_lowercase();
+    // 按类型浏览结构图时使用固定谓词，让 kind+file+line 复合索引同时承担过滤和排序。
+    if query.is_empty() && role.is_empty() && !kind.is_empty() && file.is_empty() {
+        let total = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE kind=?1",
+                params![kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as usize;
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let mut statement = match conn.prepare(
+            "SELECT kind, name, file, line, end_line, role, signature, parent
+             FROM symbols WHERE kind=?1
+             ORDER BY file, line, name LIMIT ?2 OFFSET ?3",
+        ) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(format!("准备类型结构查询失败：{error}"))),
+        };
+        let rows = match statement.query_map(
+            params![kind, page_size as i64, offset as i64],
+            |row| {
+                Ok(Symbol {
+                    kind: row.get(0)?,
+                    name: row.get(1)?,
+                    file: row.get(2)?,
+                    line: row.get::<_, i64>(3)?.max(0) as usize,
+                    end_line: row.get::<_, i64>(4)?.max(0) as usize,
+                    role: row.get(5)?,
+                    signature: row.get(6)?,
+                    parent: row.get(7)?,
+                })
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(format!("读取类型结构查询失败：{error}"))),
+        };
+        let items = match rows.collect::<Result<Vec<_>, _>>() {
+            Ok(value) => value,
+            Err(error) => return Some(Err(format!("解析类型结构查询失败：{error}"))),
+        };
+        return Some(Ok((items, total)));
+    }
+    // Agent 多数情况下会带着结构名继续定位。先走可命中 name 索引的精确路径；
+    // 没有精确命中时再保留原有 substring 召回语义。
+    if !query.is_empty() {
+        let exact_where = "(?1 = '' OR role = ?1)
+                           AND (?2 = '' OR kind = ?2)
+                           AND (?3 = '' OR instr(lower(file), ?3) > 0)
+                           AND name = ?4 COLLATE NOCASE";
+        let exact_total = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM symbols WHERE {exact_where}"),
+                params![role, kind, file, query],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as usize;
+        if exact_total > 0 {
+            let offset = page.saturating_sub(1).saturating_mul(page_size);
+            let mut statement = match conn.prepare(&format!(
+                "SELECT kind, name, file, line, end_line, role, signature, parent
+                 FROM symbols WHERE {exact_where}
+                 ORDER BY file, line, name LIMIT ?5 OFFSET ?6"
+            )) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(format!("准备精确结构查询失败：{error}"))),
+            };
+            let rows = match statement.query_map(
+                params![role, kind, file, query, page_size as i64, offset as i64],
+                |row| {
+                    Ok(Symbol {
+                        kind: row.get(0)?,
+                        name: row.get(1)?,
+                        file: row.get(2)?,
+                        line: row.get::<_, i64>(3)?.max(0) as usize,
+                        end_line: row.get::<_, i64>(4)?.max(0) as usize,
+                        role: row.get(5)?,
+                        signature: row.get(6)?,
+                        parent: row.get(7)?,
+                    })
+                },
+            ) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(format!("读取精确结构查询失败：{error}"))),
+            };
+            let items = match rows.collect::<Result<Vec<_>, _>>() {
+                Ok(value) => value,
+                Err(error) => return Some(Err(format!("解析精确结构查询失败：{error}"))),
+            };
+            return Some(Ok((items, exact_total)));
+        }
+    }
     let where_sql = "(?1 = '' OR role = ?1)
                      AND (?2 = '' OR kind = ?2)
                      AND (?3 = '' OR instr(lower(file), ?3) > 0)
@@ -2078,7 +2187,7 @@ fn query_persisted_edges_at(
         Ok(value) => value,
         Err(error) => return Some(Err(format!("打开结构关系库失败：{error}"))),
     };
-    let total = match conn.query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| {
+    let total = match conn.query_row("SELECT relation_count FROM structure_stats WHERE id=1", [], |row| {
         row.get::<_, i64>(0)
     }) {
         Ok(value) => value.max(0) as usize,
@@ -2627,6 +2736,67 @@ struct Detail {
     }
 
     #[test]
+    fn sqlite_structure_query_plans_use_targeted_indexes() {
+        let root = std::env::temp_dir().join(format!(
+            "deveco-symbol-plan-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-symbol-plan-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _ = collect_files_at(&root, Some(&data_dir));
+        let conn = Connection::open(catalog_file_at(&data_dir, &root)).unwrap();
+
+        let exact_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT kind, name, file, line, end_line, role, signature, parent
+                 FROM symbols
+                 WHERE (?1 = '' OR role = ?1)
+                   AND (?2 = '' OR kind = ?2)
+                   AND (?3 = '' OR instr(lower(file), ?3) > 0)
+                   AND name = ?4 COLLATE NOCASE
+                 ORDER BY file, line, name LIMIT ?5 OFFSET ?6",
+            )
+            .unwrap()
+            .query_map(params!["", "", "", "Alpha", 20, 0], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            exact_plan.contains("idx_symbols_name"),
+            "精确名称查询应命中名称索引：{exact_plan}"
+        );
+
+        let kind_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT kind, name, file, line, end_line, role, signature, parent
+                 FROM symbols WHERE kind=?1
+                 ORDER BY file, line, name LIMIT ?2 OFFSET ?3",
+            )
+            .unwrap()
+            .query_map(params!["component", 20, 0], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            kind_plan.contains("idx_symbols_kind_order"),
+            "按类型浏览应命中覆盖排序的复合索引：{kind_plan}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
     fn containment_edges_persist_query_and_incrementally_replace() {
         let root =
             std::env::temp_dir().join(format!("deveco-edge-db-{}", uuid::Uuid::new_v4()));
@@ -3057,6 +3227,161 @@ struct Detail {
         assert!(incremental_symbols
             .iter()
             .any(|symbol| symbol.name == "symbol_after_incremental_update"));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// SQLite 节点/边规模基线：不创建海量实体文件，专门测持久图存储与查询。
+    #[test]
+    #[ignore = "手动 1M SQLite 结构图基准；通过 HARMONY_SQLITE_BENCH_FILES 选择规模"]
+    fn million_scale_sqlite_graph_baseline() {
+        let requested = std::env::var("HARMONY_SQLITE_BENCH_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100_000)
+            .clamp(1, 1_000_000);
+        let root = std::env::temp_dir().join(format!(
+            "deveco-sqlite-scale-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = std::env::temp_dir().join(format!(
+            "deveco-sqlite-scale-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _ = collect_files_at(&root, Some(&data_dir));
+        let db_path = catalog_file_at(&data_dir, &root);
+        let mut conn = Connection::open(&db_path).unwrap();
+
+        let insert_started = std::time::Instant::now();
+        let transaction = conn.transaction().unwrap();
+        {
+            let mut file_statement = transaction
+                .prepare(
+                    "INSERT INTO files(path, extension, size, mtime_ns, state, shard, generation)
+                     VALUES(?1, 'ets', 128, 1, 'indexed', ?2, 1)",
+                )
+                .unwrap();
+            let mut symbol_statement = transaction
+                .prepare(
+                    "INSERT INTO symbols(file, kind, name, line, end_line, role, signature, parent, shard)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .unwrap();
+            let mut edge_statement = transaction
+                .prepare(
+                    "INSERT INTO symbol_edges(
+                       kind, source_file, source_name, source_line,
+                       target_file, target_name, target_line, shard
+                     ) VALUES('contains', ?1, ?2, 1, ?1, ?3, 2, ?4)",
+                )
+                .unwrap();
+            for index in 0..requested {
+                let shard = format!("shard_{:04}", index / 1_000);
+                let path = format!("{shard}/file_{index:07}.ets");
+                let entity = format!("Page_{index:07}");
+                file_statement.execute(params![path, shard]).unwrap();
+                symbol_statement
+                    .execute(params![
+                        path,
+                        "component",
+                        entity,
+                        1,
+                        4,
+                        "entity",
+                        format!("struct {entity}"),
+                        Option::<String>::None,
+                        shard,
+                    ])
+                    .unwrap();
+                if index % 4 == 0 {
+                    let method = format!("method_{index:07}");
+                    symbol_statement
+                        .execute(params![
+                            path,
+                            "method",
+                            method,
+                            2,
+                            3,
+                            "logic",
+                            format!("{method}()"),
+                            entity,
+                            shard,
+                        ])
+                        .unwrap();
+                    edge_statement
+                        .execute(params![path, entity, method, shard])
+                        .unwrap();
+                }
+            }
+        }
+        transaction.commit().unwrap();
+        let insert_ms = insert_started.elapsed().as_millis() as u64;
+
+        let target_index = (requested.saturating_sub(1) / 4) * 4;
+        let target_name = format!("method_{target_index:07}");
+        let exact_started = std::time::Instant::now();
+        let (exact, exact_total) = query_persisted_symbols_at(
+            &root,
+            &data_dir,
+            &target_name,
+            Some("logic"),
+            None,
+            None,
+            1,
+            20,
+        )
+        .unwrap()
+        .unwrap();
+        let exact_ms = exact_started.elapsed().as_millis() as u64;
+
+        let deep_page = ((requested.saturating_mul(9) / 10) / 50).max(1);
+        let deep_started = std::time::Instant::now();
+        let (deep_items, _) = query_persisted_symbols_at(
+            &root,
+            &data_dir,
+            "",
+            None,
+            Some("component"),
+            None,
+            deep_page,
+            50,
+        )
+        .unwrap()
+        .unwrap();
+        let deep_page_ms = deep_started.elapsed().as_millis() as u64;
+
+        let edge_started = std::time::Instant::now();
+        let (edges, edge_total) = query_persisted_edges_at(&root, &data_dir, &exact)
+            .unwrap()
+            .unwrap();
+        let edge_query_ms = edge_started.elapsed().as_millis() as u64;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(conn);
+        let database_bytes = std::fs::metadata(&db_path).unwrap().len();
+
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "files": requested,
+            "symbols": requested + requested.div_ceil(4),
+            "relations": requested.div_ceil(4),
+            "insert_ms": insert_ms,
+            "exact_query_ms": exact_ms,
+            "deep_page": deep_page,
+            "deep_page_ms": deep_page_ms,
+            "edge_query_ms": edge_query_ms,
+            "database_bytes": database_bytes,
+            "platform": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+        });
+        println!("HARMONY_SQLITE_GRAPH_BASELINE={report}");
+
+        assert_eq!(exact_total, 1);
+        assert_eq!(exact[0].name, target_name);
+        assert!(!deep_items.is_empty());
+        assert_eq!(edge_total, requested.div_ceil(4));
+        assert_eq!(edges.len(), 1);
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
     }
