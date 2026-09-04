@@ -5958,7 +5958,7 @@ export default function Home() {
                       onClick={handleSend}
                       disabled={!draft.trim() || stopRequested || !!currentGen}
                       aria-label={t('home.queueSend')}
-                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
+                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[var(--accent-600)] hover:bg-[var(--accent-500)] hover:shadow-[0_4px_16px_var(--accent-glow)]"
                       title={t('home.queueSend')}
                     >
                       <Icon name="send" size={14} white />
@@ -6077,7 +6077,7 @@ export default function Home() {
                       onClick={handleSend}
                       disabled={!draft.trim() || !currentProject || !!currentGen}
                       aria-label={t('home.send')}
-                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
+                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[var(--accent-600)] hover:bg-[var(--accent-500)] hover:shadow-[0_4px_16px_var(--accent-glow)]"
                       title={t('home.send')}
                     >
                       <Icon name="send" size={14} white />

@@ -442,20 +442,25 @@ button:focus-visible {
   box-shadow: var(--app-shadow-sm);
 }
 
-/* 主操作按钮（渐变强调） */
+/* 主操作按钮：实心 accent + 三段式状态色阶。
+   不用渐变——「渐变 + brightness 滤镜」的观感偏营销页，实心色阶更可推理也更好主题化。
+   :active 必须写成 .btn-primary:active:not(:disabled)（特异度 0,3,0），
+   否则会被后面那条无层的 button:active:not(:disabled)（0,2,1）压掉。 */
 .btn-primary {
-  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+  background: var(--accent-600);
   color: #fff;
-  border: none;
+  border: 1px solid transparent;
   border-radius: var(--app-radius-md);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+  box-shadow: var(--app-shadow-xs);
 }
 .btn-primary:hover:not(:disabled) {
-  filter: brightness(1.08);
-  box-shadow: 0 2px 10px var(--accent-glow);
+  background: var(--accent-500);
+}
+.btn-primary:active:not(:disabled) {
+  background: var(--accent-700);
 }
 .btn-primary:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
@@ -1616,11 +1621,11 @@ button:focus-visible {
 
 /* ============ 全局美化：玻璃质感 / 渐变光晕 / 统一描边 ============ */
 
-/* 顶栏与侧栏：半透明 + 背景模糊，形成层次 */
+/* 顶栏与侧栏：不透明底色。
+   原先是半透明 + blur(10px)，但它们下方本来就是滚动内容，模糊只会让文字边缘发糊，
+   还要常驻一个 GPU 合成层；分层交给下方的 1px 描边就够了。 */
 .glass-bar {
-  background: color-mix(in srgb, var(--bg-secondary) 82%, transparent);
-  backdrop-filter: saturate(140%) blur(10px);
-  -webkit-backdrop-filter: saturate(140%) blur(10px);
+  background: var(--bg-secondary);
 }
 
 /* 品牌标识光晕 */
@@ -1875,25 +1880,12 @@ button:active:not(:disabled),
   box-shadow: inset 0 0 0 2px var(--accent-100);
 }
 
-/* 主操作按钮在原有渐变基础上加更精致的内阴影 */
-.btn-primary {
-  background: linear-gradient(135deg, var(--accent-500), var(--accent-700));
-  box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.2),
-    inset 0 1px 0 rgba(255, 255, 255, 0.15);
-}
-.btn-primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, var(--accent-hover), var(--accent-600));
-  box-shadow:
-    0 4px 14px var(--accent-glow),
-    inset 0 1px 0 rgba(255, 255, 255, 0.2);
-}
-
-/* 浮窗卡片：现代玻璃感（背景 + backdrop-filter + 强调描边） */
+/* 浮窗卡片：不透明 elevated 底 + 强调描边 + 大阴影。
+   原先是 color-mix 半透明 + blur(16px) 毛玻璃。IDE 语境里模糊是纯装饰，
+   却让每个浮层都要一个 GPU 合成层；改实色后分层由 1px 描边与阴影承担。
+   刻意不写 border-radius——圆角由调用方的 rounded-* utility 提供，写在这里会压过它们。 */
 .glass-card {
-  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
-  -webkit-backdrop-filter: blur(16px) saturate(150%);
-  backdrop-filter: blur(16px) saturate(150%);
+  background: var(--bg-elevated);
   border: 1px solid var(--border-strong);
   box-shadow: var(--app-shadow-lg);
 }
@@ -2013,13 +2005,13 @@ button:active:not(:disabled),
   border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
 }
 
-/* 通用 modal backdrop（黑半透明 + 模糊） */
+/* 通用 modal backdrop：平涂压暗，不模糊。
+   VS Code / JetBrains 的做法是让底层「退后」而不是「糊掉」——blur(8px) 每开一次模态
+   就要一个全视口合成层，且让底层信息彻底不可读，对需要参照上下文的确认框尤其糟。 */
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: color-mix(in srgb, #000 50%, transparent);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
+  background: rgba(0, 0, 0, 0.55);
   z-index: 100;
   animation: fade-in 0.15s var(--app-ease-out) both;
 }
@@ -2027,9 +2019,7 @@ button:active:not(:disabled),
 .cmdk-backdrop {
   position: fixed;
   inset: 0;
-  background: color-mix(in srgb, #000 50%, transparent);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
+  background: rgba(0, 0, 0, 0.55);
   z-index: 100;
   display: flex;
   align-items: flex-start;
@@ -2093,18 +2083,15 @@ button:active:not(:disabled),
 
 /* ============ 亮色主题深度优化：让所有页面在白底下更精致 ============ */
 
-/* 亮色主题下：按钮渐变调整（避免深色专属的深色渐变在白底变脏） */
-[data-theme='light'] .btn-primary {
-  background: linear-gradient(135deg, var(--accent-500), var(--accent-600));
-  box-shadow:
-    0 1px 2px rgba(15, 23, 42, 0.06),
-    inset 0 1px 0 rgba(255, 255, 255, 0.3);
-}
+/* 亮色主题下：主按钮的 hover / active 要往深走。
+   静止态无需覆盖——基础块用的 --accent-600 在亮色下已是 #2f5fe6，白底上够沉。
+   但基础 hover 用 --accent-500（#3b6ff5）比静止态更浅，方向是反的；
+   active 若沿用基础的 accent-700 又会与亮色 hover 撞色，故再压一档到 accent-900。 */
 [data-theme='light'] .btn-primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, var(--accent-600), var(--accent-700));
-  box-shadow:
-    0 4px 14px var(--accent-glow),
-    inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  background: var(--accent-700);
+}
+[data-theme='light'] .btn-primary:active:not(:disabled) {
+  background: var(--accent-900);
 }
 
 /* 亮色主题下：次级按钮在白底上需要更明确的边界 */
@@ -2136,15 +2123,6 @@ button:active:not(:disabled),
   border-color: rgba(15, 23, 42, 0.12);
   box-shadow: 0 1px 0 rgba(15, 23, 42, 0.08);
   color: var(--text-secondary);
-}
-
-/* 亮色主题下：玻璃卡片用白底+阴影，不用 backdrop-filter（白底背景模糊效果弱） */
-[data-theme='light'] .glass-card {
-  background: rgba(255, 255, 255, 0.85);
-  -webkit-backdrop-filter: blur(12px) saturate(150%);
-  backdrop-filter: blur(12px) saturate(150%);
-  border-color: rgba(15, 23, 42, 0.10);
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
 }
 
 /* 亮色主题下：上下文进度条轨道颜色用更柔和的灰 */
@@ -2264,10 +2242,11 @@ button:active:not(:disabled),
 
 /*
  * 核心思路：
- * - high/medium tier（硬件加速可用）：将滚动容器、虚拟列表项、弹窗等提升到 GPU 合成层，
+ * - high/medium tier（硬件加速可用）：将滚动容器与虚拟列表项提升到 GPU 合成层，
  *   使用 will-change + transform: translateZ(0) 触发独立合成层，滚动/动画走 GPU 不阻塞主线程；
  *   contain: layout paint size 限制重排/重绘范围；content-visibility 跳过离屏元素渲染。
- * - low tier（软件渲染/无 GPU）：禁用 will-change、backdrop-filter、阴影、复杂动画等效果，
+ *   弹窗/浮层不在此列——它们已改为实色底，没有 backdrop-filter 需要靠合成层兜住。
+ * - low tier（软件渲染/无 GPU）：禁用 will-change、阴影、复杂动画等效果，
  *   避免在 CPU 软件光栅化路径上产生额外合成开销（软件渲染下合成层越多越慢）。
  * - Mac 平台额外优化：Core Animation 合成器对 transform 动画效率极高，可放心使用更多合成层。
  */
@@ -2301,56 +2280,16 @@ button:active:not(:disabled),
   will-change: transform;
 }
 
-/* 弹窗/浮层：独立合成层避免 backdrop-filter 时底层重绘 */
-.render-tier-high .glass-card,
-.render-tier-medium .glass-card,
-.render-tier-high .modal-backdrop,
-.render-tier-medium .modal-backdrop,
-.render-tier-high .cmdk-backdrop,
-.render-tier-medium .cmdk-backdrop,
-.render-tier-high .glass-bar,
-.render-tier-medium .glass-bar {
-  will-change: transform, opacity;
-  -webkit-transform: translateZ(0);
-  transform: translateZ(0);
-}
-
 /* ---- low tier（软件渲染/无 GPU 加速）：降级策略 ---- */
 
 /* 禁用 will-change（软件渲染下合成层无意义，反而增加内存占用和 CPU 合成开销） */
 .render-tier-low .chat-scroll,
 .render-tier-low .chat-scroll > *,
-.render-tier-low .msg-role,
-.render-tier-low .glass-card,
-.render-tier-low .modal-backdrop,
-.render-tier-low .cmdk-backdrop,
-.render-tier-low .glass-bar {
+.render-tier-low .msg-role {
   will-change: auto !important;
   transform: none !important;
   contain: none !important;
   content-visibility: visible !important;
-}
-
-/* 禁用 backdrop-filter（软件渲染下高斯模糊是灾难性性能杀手） */
-.render-tier-low .glass-card,
-.render-tier-low .glass-bar,
-.render-tier-low .modal-backdrop,
-.render-tier-low .cmdk-backdrop,
-.render-tier-low .animate-modal-in {
-  -webkit-backdrop-filter: none !important;
-  backdrop-filter: none !important;
-}
-
-/* 简化玻璃卡片为实色背景（无模糊无透明叠加） */
-.render-tier-low .glass-card {
-  background: var(--bg-elevated) !important;
-}
-.render-tier-low .glass-bar {
-  background: var(--bg-secondary) !important;
-}
-.render-tier-low .modal-backdrop,
-.render-tier-low .cmdk-backdrop {
-  background: rgba(0, 0, 0, 0.6) !important;
 }
 
 /* 禁用/简化阴影（软件渲染下多层 box-shadow 是逐像素计算，开销大） */
