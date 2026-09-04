@@ -1114,7 +1114,7 @@ fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
 fn insert_edge_row(
     transaction: &rusqlite::Transaction<'_>,
     edge: &StructureEdge,
-    aliases: Option<&TsconfigAliases>,
+    aliases: Option<&ModuleAliases>,
 ) -> rusqlite::Result<()> {
     let mut target_file = edge.target_file.clone();
     let mut target_name = edge.target_name.clone();
@@ -1225,9 +1225,9 @@ fn replace_all_symbol_rows_at(
             return false;
         }
     }
-    let aliases = load_tsconfig_aliases(root);
+    let aliases = load_module_aliases(root, symbols.iter().map(|symbol| symbol.file.as_str()));
     for edge in structure_edges(symbols) {
-        if insert_edge_row(&transaction, &edge, aliases.as_ref()).is_err() {
+        if insert_edge_row(&transaction, &edge, Some(&aliases)).is_err() {
             return false;
         }
     }
@@ -1297,9 +1297,9 @@ fn replace_changed_symbol_rows_at(
             return false;
         }
     }
-    let aliases = load_tsconfig_aliases(root);
+    let aliases = load_module_aliases(root, symbols.iter().map(|symbol| symbol.file.as_str()));
     for edge in structure_edges(symbols) {
-        if insert_edge_row(&transaction, &edge, aliases.as_ref()).is_err() {
+        if insert_edge_row(&transaction, &edge, Some(&aliases)).is_err() {
             return false;
         }
     }
@@ -1417,7 +1417,12 @@ where
         .map_err(|error| error.to_string())?;
     let lock_wait_ms = lock_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let mut promoted = 0usize;
-    let aliases = load_tsconfig_aliases(root);
+    let aliases = load_module_aliases(
+        root,
+        parsed
+            .iter()
+            .flat_map(|(_, _, symbols)| symbols.iter().map(|symbol| symbol.file.as_str())),
+    );
     for (rel, expected, symbols) in parsed {
         let updated = transaction
             .execute(
@@ -1442,7 +1447,7 @@ where
             insert_symbol_row(&transaction, symbol).map_err(|error| error.to_string())?;
         }
         for edge in structure_edges(&symbols) {
-            insert_edge_row(&transaction, &edge, aliases.as_ref())
+            insert_edge_row(&transaction, &edge, Some(&aliases))
                 .map_err(|error| error.to_string())?;
         }
         promoted += 1;
@@ -1718,6 +1723,12 @@ fn ensure_structure_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_edges_import_target
+         ON symbol_edges(target_name, target_module)
+         WHERE target_module IS NOT NULL",
+        [],
+    )?;
     let meta_columns = conn
         .prepare("PRAGMA table_info(structure_meta)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -2087,8 +2098,8 @@ struct PersistedIndex {
     catalog: CatalogStats,
 }
 
-// v10 retains bare import evidence so strict tsconfig path aliases can be resolved.
-const PERSIST_VERSION: u32 = 10;
+// v11 resolves strict tsconfig and local ohpm package aliases without treating remote packages as files.
+const PERSIST_VERSION: u32 = 11;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -3026,6 +3037,19 @@ struct TsconfigAliases {
     rules: Vec<TsconfigPathRule>,
 }
 
+#[derive(Debug, Clone)]
+struct OhpmLocalAlias {
+    owner_dir: String,
+    package_name: String,
+    entry_base: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModuleAliases {
+    tsconfig: Option<TsconfigAliases>,
+    ohpm: Vec<OhpmLocalAlias>,
+}
+
 fn load_tsconfig_aliases(root: &Path) -> Option<TsconfigAliases> {
     let path = root.join("tsconfig.json");
     let content = fs::read_to_string(path).ok()?;
@@ -3050,6 +3074,97 @@ fn load_tsconfig_aliases(root: &Path) -> Option<TsconfigAliases> {
         }
     }
     (!rules.is_empty()).then_some(TsconfigAliases { base_dir, rules })
+}
+
+fn load_module_aliases<'a>(
+    root: &Path,
+    source_files: impl Iterator<Item = &'a str>,
+) -> ModuleAliases {
+    let mut manifest_dirs = source_files
+        .flat_map(|source_file| {
+            let mut dirs = Vec::new();
+            let mut current = source_parent(source_file);
+            loop {
+                dirs.push(current.to_string());
+                let Some((parent, _)) = current.rsplit_once('/') else {
+                    break;
+                };
+                current = parent;
+            }
+            dirs
+        })
+        .collect::<Vec<_>>();
+    manifest_dirs.push(String::new());
+    manifest_dirs.sort();
+    manifest_dirs.dedup();
+
+    let mut ohpm = Vec::new();
+    for owner_dir in manifest_dirs {
+        let manifest = if owner_dir.is_empty() {
+            root.join("oh-package.json5")
+        } else {
+            root.join(&owner_dir).join("oh-package.json5")
+        };
+        let Some(value) = fs::read_to_string(manifest)
+            .ok()
+            .and_then(|content| crate::services::harmony::parse_json5(&content).ok())
+        else {
+            continue;
+        };
+        for scope in ["dependencies", "devDependencies", "dynamicDependencies"] {
+            let Some(dependencies) = value.get(scope).and_then(|value| value.as_object()) else {
+                continue;
+            };
+            for (package_name, requirement) in dependencies {
+                let Some(requirement) = requirement.as_str() else {
+                    continue;
+                };
+                let Some(raw_target) = requirement
+                    .strip_prefix("file:")
+                    .or_else(|| requirement.strip_prefix("link:"))
+                else {
+                    continue;
+                };
+                let Some(target_dir) = normalize_project_path(&owner_dir, raw_target) else {
+                    continue;
+                };
+                let target_manifest = root.join(&target_dir).join("oh-package.json5");
+                let Some(target) = fs::read_to_string(target_manifest)
+                    .ok()
+                    .and_then(|content| crate::services::harmony::parse_json5(&content).ok())
+                else {
+                    continue;
+                };
+                let Some(main) = target.get("main").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let Some(entry_base) = normalize_project_path(&target_dir, main) else {
+                    continue;
+                };
+                ohpm.push(OhpmLocalAlias {
+                    owner_dir: owner_dir.clone(),
+                    package_name: package_name.clone(),
+                    entry_base,
+                });
+            }
+        }
+    }
+    ohpm.sort_by(|a, b| {
+        (&a.owner_dir, &a.package_name, &a.entry_base).cmp(&(
+            &b.owner_dir,
+            &b.package_name,
+            &b.entry_base,
+        ))
+    });
+    ohpm.dedup_by(|a, b| {
+        a.owner_dir == b.owner_dir
+            && a.package_name == b.package_name
+            && a.entry_base == b.entry_base
+    });
+    ModuleAliases {
+        tsconfig: load_tsconfig_aliases(root),
+        ohpm,
+    }
 }
 
 fn alias_replacements(aliases: &TsconfigAliases, module_specifier: &str) -> Vec<String> {
@@ -3106,7 +3221,7 @@ fn alias_replacements(aliases: &TsconfigAliases, module_specifier: &str) -> Vec<
 fn module_candidates(
     source_file: &str,
     module_specifier: &str,
-    aliases: Option<&TsconfigAliases>,
+    aliases: Option<&ModuleAliases>,
 ) -> Vec<String> {
     let bases = if module_specifier.starts_with('.') {
         normalize_project_path(source_parent(source_file), module_specifier)
@@ -3114,7 +3229,45 @@ fn module_candidates(
             .collect::<Vec<_>>()
     } else {
         aliases
-            .map(|config| alias_replacements(config, module_specifier))
+            .map(|config| {
+                let tsconfig = config
+                    .tsconfig
+                    .as_ref()
+                    .map(|tsconfig| alias_replacements(tsconfig, module_specifier))
+                    .unwrap_or_default();
+                if !tsconfig.is_empty() {
+                    return tsconfig;
+                }
+                let source_dir = source_parent(source_file);
+                let best_scope = config
+                    .ohpm
+                    .iter()
+                    .filter(|alias| {
+                        alias.package_name == module_specifier
+                            && (alias.owner_dir.is_empty()
+                                || source_dir == alias.owner_dir
+                                || source_dir
+                                    .strip_prefix(&alias.owner_dir)
+                                    .is_some_and(|tail| tail.starts_with('/')))
+                    })
+                    .map(|alias| alias.owner_dir.len())
+                    .max();
+                best_scope
+                    .into_iter()
+                    .flat_map(|scope_len| {
+                        config.ohpm.iter().filter(move |alias| {
+                            alias.package_name == module_specifier
+                                && alias.owner_dir.len() == scope_len
+                                && (alias.owner_dir.is_empty()
+                                    || source_dir == alias.owner_dir
+                                    || source_dir
+                                        .strip_prefix(&alias.owner_dir)
+                                        .is_some_and(|tail| tail.starts_with('/')))
+                        })
+                    })
+                    .map(|alias| alias.entry_base.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let mut candidates = bases
@@ -3130,7 +3283,7 @@ fn resolve_module_file(
     conn: &Connection,
     source_file: &str,
     module_specifier: &str,
-    aliases: Option<&TsconfigAliases>,
+    aliases: Option<&ModuleAliases>,
 ) -> Option<String> {
     let candidates = module_candidates(source_file, module_specifier, aliases);
     if candidates.is_empty() {
@@ -3161,7 +3314,7 @@ fn resolve_module_file(
 
 fn resolve_import_target_from_catalog(
     conn: &Connection,
-    aliases: Option<&TsconfigAliases>,
+    aliases: Option<&ModuleAliases>,
     edge: &mut StructureEdge,
 ) {
     let (Some(module_specifier), Some(imported_name)) = (
@@ -3223,7 +3376,8 @@ fn query_persisted_edges_at(
                 target_module, target_imported_name
          FROM symbol_edges
          WHERE (source_file = ?1 AND source_name = ?2 AND source_line = ?3)
-            OR (target_file = ?1 AND target_name = ?2)",
+            OR (target_file = ?1 AND target_name = ?2)
+            OR (target_module IS NOT NULL AND target_name = ?2)",
     ) {
         Ok(value) => value,
         Err(error) => return Some(Err(format!("准备结构关系查询失败：{error}"))),
@@ -3256,9 +3410,9 @@ fn query_persisted_edges_at(
             }
         }
     }
-    let aliases = load_tsconfig_aliases(root);
+    let aliases = load_module_aliases(root, edges.iter().map(|edge| edge.source_file.as_str()));
     for edge in &mut edges {
-        resolve_import_target_from_catalog(&conn, aliases.as_ref(), edge);
+        resolve_import_target_from_catalog(&conn, Some(&aliases), edge);
     }
     edges.retain(|edge| {
         symbols.iter().any(|symbol| {
@@ -4561,16 +4715,170 @@ class Service extends BaseService implements Loadable, Disposable {}
 
     #[test]
     fn tsconfig_alias_replacements_remain_conservative_when_ambiguous() {
-        let aliases = TsconfigAliases {
-            base_dir: String::new(),
-            rules: vec![TsconfigPathRule {
-                pattern: "@model/*".into(),
-                replacements: vec!["src/model/*".into(), "generated/model/*".into()],
-            }],
+        let aliases = ModuleAliases {
+            tsconfig: Some(TsconfigAliases {
+                base_dir: String::new(),
+                rules: vec![TsconfigPathRule {
+                    pattern: "@model/*".into(),
+                    replacements: vec!["src/model/*".into(), "generated/model/*".into()],
+                }],
+            }),
+            ohpm: Vec::new(),
         };
         let candidates = module_candidates("src/service.ts", "@model/base", Some(&aliases));
         assert!(candidates.contains(&"src/model/base.ts".to_string()));
         assert!(candidates.contains(&"generated/model/base.ts".to_string()));
+    }
+
+    #[test]
+    fn ohpm_file_dependency_resolves_explicit_package_entry() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-ohpm-edge-db-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("deveco-ohpm-edge-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("entry/src/main/ets")).unwrap();
+        std::fs::create_dir_all(root.join("shared/core/src/main/ets")).unwrap();
+        std::fs::create_dir_all(root.join("shared/core-next/src/main/ets")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            root.join("oh-package.json5"),
+            r#"{"dependencies":{"@app/core":"file:./shared/core-next"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("entry/oh-package.json5"),
+            r#"{"dependencies":{"@app/core":"file:../shared/core"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared/core/oh-package.json5"),
+            r#"{"name":"@app/core","main":"src/main/ets/Index.ets"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared/core-next/oh-package.json5"),
+            r#"{"name":"@app/core","main":"src/main/ets/Index.ets"}"#,
+        )
+        .unwrap();
+        let base_file = root.join("shared/core/src/main/ets/Index.ets");
+        let next_base_file = root.join("shared/core-next/src/main/ets/Index.ets");
+        let service_file = root.join("entry/src/main/ets/Service.ets");
+        std::fs::write(&base_file, "export interface CoreContract {}\n").unwrap();
+        std::fs::write(&next_base_file, "export interface CoreContract {}\n").unwrap();
+        std::fs::write(
+            &service_file,
+            "import { CoreContract as Contract } from '@app/core';\nexport class Service implements Contract {}\n",
+        )
+        .unwrap();
+        let (_, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        scan_file(
+            &base_file,
+            "shared/core/src/main/ets/Index.ets",
+            &mut symbols,
+        );
+        scan_file(
+            &next_base_file,
+            "shared/core-next/src/main/ets/Index.ets",
+            &mut symbols,
+        );
+        scan_file(
+            &service_file,
+            "entry/src/main/ets/Service.ets",
+            &mut symbols,
+        );
+        assert!(replace_all_symbol_rows_at(
+            &root,
+            &data_dir,
+            &symbols,
+            catalog.revision,
+        ));
+        let service = symbols
+            .iter()
+            .find(|symbol| symbol.name == "Service")
+            .cloned()
+            .unwrap();
+        let (resolved, _) = query_persisted_edges_at(&root, &data_dir, &[service])
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].target_file,
+            "shared/core/src/main/ets/Index.ets"
+        );
+        assert_eq!(resolved[0].target_name, "CoreContract");
+        assert_eq!(resolved[0].target_line, 1);
+
+        let contract = symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name == "CoreContract"
+                    && symbol.file == "shared/core/src/main/ets/Index.ets"
+            })
+            .cloned()
+            .unwrap();
+        let (incoming, _) = query_persisted_edges_at(&root, &data_dir, &[contract])
+            .unwrap()
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_name, "Service");
+
+        std::fs::write(
+            root.join("entry/oh-package.json5"),
+            r#"{"dependencies":{"@app/core":"file:../shared/core-next"}}"#,
+        )
+        .unwrap();
+        let next_contract = symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name == "CoreContract"
+                    && symbol.file == "shared/core-next/src/main/ets/Index.ets"
+            })
+            .cloned()
+            .unwrap();
+        let (repointed, _) = query_persisted_edges_at(&root, &data_dir, &[next_contract])
+            .unwrap()
+            .unwrap();
+        assert_eq!(repointed.len(), 1, "清单改指向后不应要求重建全库入边");
+        assert_eq!(
+            repointed[0].target_file,
+            "shared/core-next/src/main/ets/Index.ets"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn ohpm_remote_or_entryless_dependency_stays_unresolved() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-ohpm-safe-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("entry/src/main/ets")).unwrap();
+        std::fs::create_dir_all(root.join("shared/core")).unwrap();
+        std::fs::write(
+            root.join("entry/oh-package.json5"),
+            r#"{"dependencies":{"remote":"^1.0.0","entryless":"file:../shared/core"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared/core/oh-package.json5"),
+            r#"{"name":"entryless"}"#,
+        )
+        .unwrap();
+        let aliases = load_module_aliases(&root, ["entry/src/main/ets/Service.ets"].into_iter());
+        assert!(module_candidates(
+            "entry/src/main/ets/Service.ets",
+            "remote",
+            Some(&aliases),
+        )
+        .is_empty());
+        assert!(module_candidates(
+            "entry/src/main/ets/Service.ets",
+            "entryless",
+            Some(&aliases),
+        )
+        .is_empty());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
