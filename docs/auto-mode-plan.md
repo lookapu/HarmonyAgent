@@ -80,23 +80,28 @@
 - 辅助池 = `auto_pool_ids(min_mode=2)`。
 - 经济路由只考虑**已定价**模型（`input + output > 0`），因此未定价的包月/本地模型天然不会参与杂活压价——避免把杂活错误地丢到 coding plan 上再烧一份额度。
 
-### 4.4 可观测性（未实现，后续）
+### 4.4 可观测性（已实现，收敛到主流做法）
 
-- 每条 assistant 消息记录实际模型（SSE `model-selected` 事件：`{ call_site: main|aux, model_id, provider_id }`），气泡上显示小标签——auto 模式下尤其必要，用户要能看见系统选了谁。
-- 统计页：池内各模型被选次数、辅助调用节省估算（API provider 用单价×token 估算；coding plan 按请求次数口径，提示"约 N 次杂活未占用高级请求"）。
+- 每条 assistant 消息气泡在 hover 时显示本次实际使用的模型（`messages.model` 落库值，auto 模式下即路由后的实际模型）。
+- 模型选择器「自动」选项旁显示池概况（N 个 provider · M 个模型）。
+- 统计页新增「Auto 池」面板：主池/杂活池构成 + 池内模型在主任务中的实际使用分布（`task_runs` 口径，请求数 / token / 费用）。
+
+> 明确不做：精确的"节省反事实估算"。主流工具也不做逐调用的节省归因（需要给流式请求链路透传 call_site，成本高、收益低）；这里只展示**真实的主任务模型分布**，让用户看见 auto 池实际用了谁、花了多少。
 
 ## 5. 实现改动点（已落地）
 
 | 文件 | 改动 |
 |---|---|
 | `migrations/078_provider_auto_pool.sql` | `providers.auto_pool_mode` 三态字段 |
-| `db/models.rs` / `db/queries.rs` | `Provider` 结构体 + 读写 SQL 同步新字段 |
+| `db/models.rs` / `db/queries.rs` | `Provider` 结构体 + 读写 SQL 同步新字段；`AutoPoolStats` + `get_auto_pool_stats` |
 | `commands/provider.rs` | `UpdateProviderInput.auto_pool_mode` + 校验（0/1/2） |
+| `commands/cost.rs` | `get_auto_pool_stats` 命令 |
 | `model_router.rs` | 新增 `RoutedModel`、`pick_model_for_task_in_pool`、`pick_economy_in_pool` |
 | `commands/chat.rs` | `"auto"` 主对话分支；`auto_pool_ids` / `resolve_aux_economy` 辅助；会话写回跳过 `"auto"` |
-| `api/provider.ts` | `Provider.auto_pool_mode` + `UpdateProviderInput.auto_pool_mode` 类型 |
+| `api/provider.ts` / `api/cost.ts` | `Provider.auto_pool_mode` 类型；`AutoPoolStats` 类型 + `getAutoPoolStats` |
 | `ProvidersPage.tsx` | provider 卡片 Auto 池三态切换 |
-| `plan.tsx` / `Home.tsx` | 模型选择器「自动」入口 + 说明；auto 模式跳过会话绑定 |
+| `plan.tsx` / `Home.tsx` | 模型选择器「自动」入口 + 池概况；auto 模式跳过会话绑定 |
+| `CostPage.tsx` | 「Auto 池」面板（池构成 + 主任务模型使用分布） |
 
 ## 6. 实施阶段
 
@@ -105,9 +110,9 @@
 | P0 | B 类：auto 池字段 + 前端三态 + `pick_economy_in_pool` + 替换辅助调用点 | ✅ 已实现 |
 | P0 | A 类：`"auto"` 主对话分支 + 跨池按任务路由 | ✅ 已实现 |
 | P0 | 前端「自动」入口 + provider 池三态 | ✅ 已实现 |
-| P1 | 消息模型标签（model-selected 事件） | ⬜ 未实现 |
-| P1 | 统计页（请求次数口径，兼容 coding plan 无金额） | ⬜ 未实现 |
-| P2 | 池概况提示（auto 选项旁） | ⬜ 未实现 |
+| P1 | 消息模型标签（hover 显示实际模型） | ✅ 已实现（复用既有落库字段） |
+| P1 | 统计页 Auto 池面板（池构成 + 主任务模型使用分布） | ✅ 已实现 |
+| P2 | 池概况提示（auto 选项旁） | ✅ 已实现 |
 | P2 | 回归验证（model_router 池用例已补 4 个） | ✅ 已完成 |
 
 ## 7. 明确不做（防止范围蔓延）
@@ -115,6 +120,7 @@
 - **能力排名 / 跨 provider 主模型质量比较**：主流不解决、我们不引入。A 类只在授权池内按任务/价格路由，不跨 provider 判断"谁更强"。
 - **包月额度余量探测**：平台不提供 API，只做请求次数统计提示，不做硬门禁。
 - **会话锚点写回 / 按难度重路由**：首版按任务每轮路由；等有真实使用反馈后再评估是否需要锁定锚点。
+- **精确的节省反事实估算**：主流不做逐调用节省归因，我们不标新立异；只展示真实使用分布。
 
 ## 8. 风险与边界
 
