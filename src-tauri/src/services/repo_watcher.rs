@@ -53,7 +53,9 @@ fn process_batch(root: &Path, events: Vec<Result<Event, notify::Error>>) {
                 for path in event.paths {
                     if let Ok(rel) = path.strip_prefix(root) {
                         let rel = rel.to_string_lossy().replace('\\', "/");
-                        if !rel.is_empty() && !ignored_path(&rel) {
+                        if rel.is_empty() {
+                            uncertain = true;
+                        } else if !ignored_path(&rel) {
                             paths.insert(rel);
                         }
                     }
@@ -99,7 +101,7 @@ pub fn ensure_watching(root: &Path) -> bool {
     }
 
     let worker_root = watch_root;
-    std::thread::Builder::new()
+    if std::thread::Builder::new()
         .name("repo-index-watcher".into())
         .spawn(move || {
             while let Ok(first) = rx.recv() {
@@ -117,7 +119,10 @@ pub fn ensure_watching(root: &Path) -> bool {
                 process_batch(&worker_root, batch);
             }
         })
-        .ok();
+        .is_err()
+    {
+        return false;
+    }
 
     if let Ok(mut guard) = watchers().lock() {
         // 每个原生 watcher 都占用系统句柄；按最近使用淘汰，防止多项目会话无限累积。
