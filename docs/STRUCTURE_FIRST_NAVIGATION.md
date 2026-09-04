@@ -1,6 +1,6 @@
 # Structure-first 代码导航设计
 
-> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和结构关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 与 ArkTS 已接入 Tree-sitter，语法层 `extends/implements` 与保守的直接 `calls` 已落图，相对命名 import、根 `tsconfig` path alias、HarmonyOS `file:/link:` 本地包和有界 re-export/barrel 闭包可精确绑定；ArkTS LSP 的唯一工程内定义与有界引用批次可增量沉淀为成员调用边，并报告独立语义覆盖指标；按需渐进调度和失败持久退避已完成，自动空闲调度、SCIP importer 与物理分片仍在后续阶段。
+> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和结构关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 与 ArkTS 已接入 Tree-sitter，语法层 `extends/implements` 与保守的直接 `calls` 已落图，相对命名 import、根 `tsconfig` path alias、HarmonyOS `file:/link:` 本地包和有界 re-export/barrel 闭包可精确绑定；ArkTS LSP 的唯一工程内定义与有界引用批次可增量沉淀为成员调用边，并报告独立语义覆盖指标；按需/空闲渐进调度和失败持久退避已完成，SCIP importer 与物理分片仍在后续阶段。
 
 ## 1. 结论
 
@@ -95,7 +95,9 @@ Tree-sitter 语法层已经扩展为固定兼容的 `tree-sitter 0.24.7`、`tree
 
 fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `import lazy`、字符串内大括号、箭头函数、parent 归属、JS/JSX/TSX 入口、语法错误 fallback、`extends/implements` 声明边、相对命名 import/别名证据持久化、LSP 单点/批量调用证据、失败退避/成功恢复和旧 SQLite 自动迁移。当前仍不能称为完整语义索引：只有被 LSP 查询命中的调用具有编译器级绑定，尚无后台全库覆盖保证。
 
-渐进语义调度复用 `lsp_references`：传入 `{"auto_batch_limit": 1..16}` 后，从 SQLite 领取尚无成功扫描账本的目标，固定按 `method → function`、`ets → ts`、路径/行号顺序推进。领取查询使用 `(role, language, kind, file, line, name)` 复合索引，不用 `OFFSET` 或全量随机排序；方法优先是因为成员派发正是语法层最缺的证据。每轮最多 16 个目标，LSP 请求按 4 路并发、单请求 10 秒超时，成功结果立即形成断点。失败目标按 `30s → 60s → 120s → 5m → 10m → 30m → 1h → 6h` 持久退避，跨进程仍有效，不再反复占住稳定队首；到期自动重试，成功或目标文件变化会清除失败状态。覆盖输出同时报告当前退避目标数。该入口适合 Agent 在结构查询提示覆盖不足时以 4 个左右的小批次推进；自动检测空闲和资源预算联动仍属于下一阶段。
+渐进语义调度复用 `lsp_references`：传入 `{"auto_batch_limit": 1..16}` 后，从 SQLite 领取尚无成功扫描账本的目标，固定按 `method → function`、`ets → ts`、路径/行号顺序推进。领取查询使用 `(role, language, kind, file, line, name)` 复合索引，不用 `OFFSET` 或全量随机排序；方法优先是因为成员派发正是语法层最缺的证据。每轮最多 16 个目标，LSP 请求按 4 路并发、单请求 10 秒超时，成功结果立即形成断点。失败目标按 `30s → 60s → 120s → 5m → 10m → 30m → 1h → 6h` 持久退避，跨进程仍有效，不再反复占住稳定队首；到期自动重试，成功或目标文件变化会清除失败状态。覆盖输出同时报告当前退避目标数。
+
+前台任务成功结束后还会建立一次静默空闲窗口：等待 5 秒，确认全局没有运行中的 Agent、文件目录没有待对账状态、渐进语法 worker 已退出后，才自动扫描每批 2 个目标。全局只保留最新一个语义 worker；任一新消息会更新活动代次，使旧 worker 在当前有界批次结束后退出。每个空闲窗口最多 32 批，单批内存仍受引用 256 条上限约束；批间冷却为上一批耗时的 4 倍，并限制在 5—60 秒，使持续占用占比约不超过 20%。取消、失败和未完成任务不会启动后台扫描，另一个前台任务暂未结束时最多等待 60 秒。该机制只消费已经存在且一致的结构索引，不在后台隐式触发百万文件冷建库。
 
 10,000 个实体 `.ts` 文件的同机基准中，冷目录与首批 4,000 文件 AST 解析/写入约 0.95 s，产生 8,000 个 Tree-sitter 节点且没有 fallback；峰值 RSS 约 23.7 MiB，单文件增量约 12 ms。该结果只证明首批 grammar 的吞吐未突破既有资源边界，不替代真实代码的召回率评测。
 
@@ -136,7 +138,7 @@ fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `im
 
 1. ~~为结构浏览增加稳定游标/keyset 分页，消除深页 `OFFSET` 的线性扫描，并保留现有页码接口作为兼容层。~~ 已完成。
 2. ~~在生成仓运行渐进解析 1M 验收，记录冷扫描吞吐、写放大、锁等待、峰值内存和取消延迟。~~ 已完成；仍需补充真实混合语言 monorepo 的 Recall@5/20 与任务轨迹验收，达到单库 SLO 边界时再启用物理分片。
-3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS、`extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import/别名/ArkTS `import lazy`、根 `tsconfig` path alias、`oh-package.json5 file:/link:` 本地包入口及有界 re-export/barrel 闭包均已完成；ArkTS `lsp_definition` 单点和 `lsp_references` 有界批量结果也可沉淀成员调用边，覆盖缺口已可量化并可按需断点推进，失败目标具备跨进程指数退避，下一步补自动空闲调度与 SCIP importer。
+3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS、`extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import/别名/ArkTS `import lazy`、根 `tsconfig` path alias、`oh-package.json5 file:/link:` 本地包入口及有界 re-export/barrel 闭包均已完成；ArkTS `lsp_definition` 单点和 `lsp_references` 有界批量结果也可沉淀成员调用边，覆盖缺口已可量化并可按需/空闲断点推进，失败目标具备跨进程指数退避，下一步补 SCIP importer。
 4. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 5. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
 6. 用 10k/100k/1M 基准和真实任务轨迹持续验证 Recall@5/20、延迟与上下文节省量。

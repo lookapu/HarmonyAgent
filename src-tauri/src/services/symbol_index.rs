@@ -3188,6 +3188,27 @@ fn progressive_status(_root: &Path, remaining_files: usize) -> ProgressiveIndexS
     }
 }
 
+pub(crate) fn semantic_background_ready(root: &Path) -> bool {
+    let key = canonical_key(root);
+    let catalog_ready = cache()
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(&key).map(|entry| !entry.needs_reconciliation))
+        .unwrap_or(false);
+    if !catalog_ready {
+        return false;
+    }
+    #[cfg(not(test))]
+    {
+        !PROGRESSIVE_WORKERS
+            .get()
+            .and_then(|workers| workers.lock().ok())
+            .is_some_and(|workers| workers.contains_key(&key))
+    }
+    #[cfg(test)]
+    true
+}
+
 #[derive(Debug, Serialize)]
 pub struct SemanticCoverageStats {
     pub indexed_logic_symbols: usize,

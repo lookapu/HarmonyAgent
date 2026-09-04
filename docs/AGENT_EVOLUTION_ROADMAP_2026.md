@@ -424,7 +424,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 交付：
 
 - [ ] Tree-sitter/ArkTS 容错 AST 层与依赖/影响图（AST、`contains`、语法级 `extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import、根 `tsconfig` path alias、HarmonyOS `file:/link:` 本地包入口及有界命名/星号 re-export 闭包已完成；ArkTS LSP 唯一工程内定义和有界引用批次可增量沉淀成员调用边）；
-- [ ] LSP/SCIP 语义层和 fallback 策略（单点定义、单次最多 256 个引用的成员调用证据、目标扫描账本、覆盖率/截断/退避指标，以及方法优先/复合索引领取/4 路并发的按需渐进调度和跨进程指数退避已接入；自动空闲调度和 SCIP importer 待完成）；
+- [ ] LSP/SCIP 语义层和 fallback 策略（单点定义、单次最多 256 个引用的成员调用证据、目标扫描账本、覆盖率/截断/退避指标，以及方法优先的按需调度、空闲小批次调度、自适应占用预算和跨进程指数退避已接入；SCIP importer 待完成）；
 - [ ] 延迟加载工具与程序化工具编排 A/B；
 - [ ] HarmonyBench v0（至少 50 题，其中一部分 holdout）；
 - [ ] SWE-bench Verified 100 题与 SWE-Explore 报告；

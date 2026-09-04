@@ -17,18 +17,25 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use futures_util::future::join_all;
 use serde_json::{Value, json};
+use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 
 /// 会话级连接池：conversation_id → LSP 连接（懒启动，进程常驻至会话结束）
 static POOL: OnceLock<StdMutex<HashMap<String, Arc<LspConnection>>>> = OnceLock::new();
+static IDLE_SEMANTIC_GENERATION: AtomicU64 = AtomicU64::new(0);
+static IDLE_SEMANTIC_BATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 const MAX_REFERENCE_EVIDENCE_PER_REQUEST: usize = 256;
+const IDLE_SEMANTIC_DELAY_SECS: u64 = 5;
+const IDLE_SEMANTIC_BATCH_TARGETS: usize = 2;
+const IDLE_SEMANTIC_MAX_BATCHES: usize = 32;
+const IDLE_SEMANTIC_MAX_BUSY_POLLS: usize = 12;
 
 fn pool() -> &'static StdMutex<HashMap<String, Arc<LspConnection>>> {
     POOL.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -532,13 +539,179 @@ pub(super) async fn lsp_references(args: &Value, roots: &[String], conversation_
     ))
 }
 
+#[derive(Debug)]
+struct LspBatchOutcome {
+    attempted: usize,
+    failed: usize,
+    backed_off: usize,
+    recorded: usize,
+    names: Vec<String>,
+}
+
+impl LspBatchOutcome {
+    fn render(&self) -> String {
+        if self.attempted == 0 {
+            return "没有可调度的 ArkTS/TypeScript 逻辑符号；可能已覆盖，或需先运行 search_symbols 建立结构索引。"
+                .into();
+        }
+        format!(
+            "渐进语义扫描：尝试 {} 个高优先级未覆盖目标，失败 {} 个（已退避 {} 个），沉淀 {} 条成员调用关系。\n{}",
+            self.attempted,
+            self.failed,
+            self.backed_off,
+            self.recorded,
+            self.names.join("\n"),
+        )
+    }
+}
+
+fn idle_semantic_throttle_ms(elapsed_ms: u64) -> u64 {
+    elapsed_ms.saturating_mul(4).clamp(5_000, 60_000)
+}
+
+struct IdleSemanticBatchLease;
+
+impl IdleSemanticBatchLease {
+    fn acquire() -> Option<Self> {
+        IDLE_SEMANTIC_BATCH_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for IdleSemanticBatchLease {
+    fn drop(&mut self) {
+        IDLE_SEMANTIC_BATCH_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) fn note_foreground_activity() -> u64 {
+    IDLE_SEMANTIC_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+}
+
+pub(crate) fn schedule_idle_semantic_indexing(
+    app: AppHandle,
+    roots: Vec<String>,
+    conversation_id: String,
+    foreground_generation: u64,
+) {
+    if roots.is_empty() {
+        return;
+    }
+    let generation = foreground_generation.wrapping_add(1);
+    if IDLE_SEMANTIC_GENERATION
+        .compare_exchange(
+            foreground_generation,
+            generation,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(IDLE_SEMANTIC_DELAY_SECS)).await;
+        let mut batch = 0usize;
+        let mut busy_polls = 0usize;
+        while batch < IDLE_SEMANTIC_MAX_BATCHES {
+            if IDLE_SEMANTIC_GENERATION.load(Ordering::Acquire) != generation {
+                break;
+            }
+            let foreground_idle = app
+                .state::<crate::utils::task_registry::TaskRegistry>()
+                .is_idle();
+            let structure_ready = roots.iter().all(|root| {
+                crate::services::symbol_index::semantic_background_ready(Path::new(root))
+            });
+            if !foreground_idle || !structure_ready {
+                busy_polls += 1;
+                if busy_polls >= IDLE_SEMANTIC_MAX_BUSY_POLLS {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    IDLE_SEMANTIC_DELAY_SECS,
+                ))
+                .await;
+                continue;
+            }
+            let Some(batch_lease) = IdleSemanticBatchLease::acquire() else {
+                busy_polls += 1;
+                if busy_polls >= IDLE_SEMANTIC_MAX_BUSY_POLLS {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    IDLE_SEMANTIC_DELAY_SECS,
+                ))
+                .await;
+                continue;
+            };
+            busy_polls = 0;
+            batch += 1;
+            let started = std::time::Instant::now();
+            let outcome = lsp_index_call_targets_batch(
+                &roots,
+                &conversation_id,
+                IDLE_SEMANTIC_BATCH_TARGETS,
+            )
+            .await;
+            drop(batch_lease);
+            let outcome = match outcome {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::utils::logger::log_event(
+                        "idle_semantic_index_stopped",
+                        serde_json::json!({
+                            "conversation_id": &conversation_id,
+                            "reason": error,
+                        }),
+                    );
+                    break;
+                }
+            };
+            crate::utils::logger::log_event(
+                "idle_semantic_index_batch",
+                serde_json::json!({
+                    "conversation_id": &conversation_id,
+                    "batch": batch,
+                    "attempted": outcome.attempted,
+                    "failed": outcome.failed,
+                    "backed_off": outcome.backed_off,
+                    "recorded": outcome.recorded,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                }),
+            );
+            if outcome.attempted == 0 {
+                break;
+            }
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                idle_semantic_throttle_ms(elapsed_ms),
+            ))
+            .await;
+        }
+    });
+}
+
 async fn lsp_index_call_targets(
     roots: &[String],
     conversation_id: &str,
     limit: usize,
 ) -> Result<String, String> {
+    lsp_index_call_targets_batch(roots, conversation_id, limit)
+        .await
+        .map(|outcome| outcome.render())
+}
+
+async fn lsp_index_call_targets_batch(
+    roots: &[String],
+    conversation_id: &str,
+    limit: usize,
+) -> Result<LspBatchOutcome, String> {
     let limit = limit.clamp(1, 16);
-    let conn = conn_for(conversation_id).await?;
     let mut failed = 0usize;
     let mut backed_off = 0usize;
     let mut recorded = 0usize;
@@ -556,11 +729,15 @@ async fn lsp_index_call_targets(
         );
     }
     if selected.is_empty() {
-        return Ok(
-            "没有可调度的 ArkTS/TypeScript 逻辑符号；可能已覆盖，或需先运行 search_symbols 建立结构索引。"
-                .into(),
-        );
+        return Ok(LspBatchOutcome {
+            attempted: 0,
+            failed: 0,
+            backed_off: 0,
+            recorded: 0,
+            names: Vec::new(),
+        });
     }
+    let conn = conn_for(conversation_id).await?;
     let mut names = Vec::new();
     let attempted = selected.len();
     for (_, target) in &selected {
@@ -624,14 +801,13 @@ async fn lsp_index_call_targets(
             );
         }
     }
-    Ok(format!(
-        "渐进语义扫描：尝试 {} 个高优先级未覆盖目标，失败 {} 个（已退避 {} 个），沉淀 {} 条成员调用关系。\n{}",
+    Ok(LspBatchOutcome {
         attempted,
         failed,
         backed_off,
         recorded,
-        names.join("\n"),
-    ))
+        names,
+    })
 }
 
 /// lsp_symbols：文档符号树（struct/方法/成员，带行号）
@@ -1069,4 +1245,47 @@ pub(super) async fn lsp_signature(args: &Value, roots: &[String], conversation_i
     }
     out.push_str(&format!("（当前参数下标：{param}）"));
     Ok(out)
+}
+
+#[cfg(test)]
+mod idle_semantic_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_throttle_caps_background_duty_cycle() {
+        assert_eq!(idle_semantic_throttle_ms(0), 5_000);
+        assert_eq!(idle_semantic_throttle_ms(500), 5_000);
+        assert_eq!(idle_semantic_throttle_ms(2_000), 8_000);
+        assert_eq!(idle_semantic_throttle_ms(20_000), 60_000);
+    }
+
+    #[test]
+    fn empty_and_nonempty_batch_results_render_stably() {
+        let empty = LspBatchOutcome {
+            attempted: 0,
+            failed: 0,
+            backed_off: 0,
+            recorded: 0,
+            names: Vec::new(),
+        };
+        assert!(empty.render().contains("没有可调度"));
+        let batch = LspBatchOutcome {
+            attempted: 2,
+            failed: 1,
+            backed_off: 1,
+            recorded: 3,
+            names: vec!["a.ts:2:run".into()],
+        };
+        let rendered = batch.render();
+        assert!(rendered.contains("失败 1 个（已退避 1 个）"));
+        assert!(rendered.contains("a.ts:2:run"));
+    }
+
+    #[test]
+    fn idle_batch_lease_allows_only_one_background_batch() {
+        let lease = IdleSemanticBatchLease::acquire().expect("first lease");
+        assert!(IdleSemanticBatchLease::acquire().is_none());
+        drop(lease);
+        assert!(IdleSemanticBatchLease::acquire().is_some());
+    }
 }

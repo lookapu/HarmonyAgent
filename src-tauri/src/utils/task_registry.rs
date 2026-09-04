@@ -88,6 +88,11 @@ pub struct TaskHandle {
 pub struct TaskRegistry(pub StdMutex<HashMap<String, TaskHandle>>);
 
 impl TaskRegistry {
+    /// 后台维护任务只在没有任何前台 Agent 运行时领取工作；锁异常时保守视为繁忙。
+    pub fn is_idle(&self) -> bool {
+        self.0.lock().map(|tasks| tasks.is_empty()).unwrap_or(false)
+    }
+
     /// 尝试登记运行中任务。已存在时拒绝，避免并发 stream_chat 覆盖原任务的 AbortHandle。
     /// 返回本次代次，正常收尾时必须带回该值做条件注销。
     pub fn register(&self, conversation_id: &str, abort: tokio::task::AbortHandle) -> Option<u64> {
@@ -435,6 +440,18 @@ mod tests {
         registry.unregister("conv", generation);
         first.abort();
         second.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_state_tracks_registered_tasks() {
+        let registry = TaskRegistry::default();
+        assert!(registry.is_idle());
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        let generation = registry.register("c", task.abort_handle()).unwrap();
+        assert!(!registry.is_idle());
+        registry.unregister("c", generation);
+        assert!(registry.is_idle());
+        task.abort();
     }
 
     #[tokio::test]

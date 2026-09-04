@@ -1801,6 +1801,82 @@ impl Drop for RegisteredChatTask {
     }
 }
 
+fn eligible_idle_semantic_root(
+    base_path: String,
+    worktree_path: Option<String>,
+    status: Option<String>,
+) -> Option<String> {
+    if status.as_deref() != Some("success") {
+        return None;
+    }
+    let root = worktree_path
+        .filter(|path| !path.trim().is_empty() && std::path::Path::new(path).is_dir())
+        .unwrap_or(base_path);
+    (!root.trim().is_empty() && std::path::Path::new(&root).is_dir()).then_some(root)
+}
+
+fn completed_conversation_root(app: &AppHandle, conversation_id: &str) -> Option<String> {
+    let state = app.state::<DbState>();
+    let conn = state.0.lock().ok()?;
+    let values = conn
+        .query_row(
+            "SELECT p.path, c.worktree_path,
+                    (SELECT status FROM task_runs
+                     WHERE conversation_id=c.id
+                     ORDER BY finished_at DESC, rowid DESC LIMIT 1)
+             FROM conversations c JOIN projects p ON p.id=c.project_id
+             WHERE c.id=?1",
+            [conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok()?;
+    eligible_idle_semantic_root(values.0, values.1, values.2)
+}
+
+#[cfg(test)]
+mod idle_semantic_schedule_tests {
+    use super::eligible_idle_semantic_root;
+
+    #[test]
+    fn only_successful_tasks_schedule_existing_worktree_or_base_root() {
+        let base = std::env::temp_dir().join(format!("deveco-idle-base-{}", uuid::Uuid::new_v4()));
+        let worktree =
+            std::env::temp_dir().join(format!("deveco-idle-worktree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        assert_eq!(
+            eligible_idle_semantic_root(
+                base.to_string_lossy().into_owned(),
+                Some(worktree.to_string_lossy().into_owned()),
+                Some("success".into()),
+            ),
+            Some(worktree.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            eligible_idle_semantic_root(
+                base.to_string_lossy().into_owned(),
+                Some(worktree.join("missing").to_string_lossy().into_owned()),
+                Some("success".into()),
+            ),
+            Some(base.to_string_lossy().into_owned())
+        );
+        assert!(eligible_idle_semantic_root(
+            base.to_string_lossy().into_owned(),
+            None,
+            Some("cancelled".into()),
+        )
+        .is_none());
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(worktree).ok();
+    }
+}
+
 #[tauri::command]
 pub async fn stream_chat(
     app: AppHandle,
@@ -1820,6 +1896,8 @@ pub async fn stream_chat(
     // 多模态图片（data URL，仅首次请求发送；落库时正文追加附图标记）
     images: Option<Vec<String>>,
 ) -> Result<(), String> {
+    // 任一前台消息到达都使旧后台语义批次在当前批结束后退出；新的空闲窗口由本任务收尾重建。
+    let foreground_generation = crate::agent::lsp_client::note_foreground_activity();
     // 任务监管壳：把任务主体 spawn 到 tokio（获得 AbortHandle 供看门狗强杀），
     // 注册心跳后等待收尾。State 在闭包内经 app.state() 重取（底层 'static 数据，
     // 跨线程可用），绕开命令参数借用生命周期；任务卡死/停止失效时看门狗 abort，
@@ -1889,7 +1967,18 @@ pub async fn stream_chat(
             );
         }
     }
+    let idle_root = matches!(&result, Ok(Ok(())))
+        .then(|| completed_conversation_root(&app, &conversation_id))
+        .flatten();
     registered.finish();
+    if let Some(root) = idle_root {
+        crate::agent::lsp_client::schedule_idle_semantic_indexing(
+            app.clone(),
+            vec![root],
+            conversation_id.clone(),
+            foreground_generation,
+        );
+    }
     match result {
         Ok(r) => r,
         Err(e) if e.is_cancelled() => {
