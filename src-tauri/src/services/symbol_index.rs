@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 #[cfg(not(test))]
-use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(not(test))]
+use std::sync::Arc;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -915,6 +917,18 @@ fn promote_deferred_batch_at(
     data_dir: &Path,
     batch_size: usize,
 ) -> Result<DeferredBatchResult, String> {
+    promote_deferred_batch_at_if(root, data_dir, batch_size, || false)
+}
+
+fn promote_deferred_batch_at_if<F>(
+    root: &Path,
+    data_dir: &Path,
+    batch_size: usize,
+    is_cancelled: F,
+) -> Result<DeferredBatchResult, String>
+where
+    F: Fn() -> bool,
+{
     let db_path = catalog_file_at(data_dir, root);
     let mut conn = Connection::open(db_path).map_err(|error| error.to_string())?;
     let deferred = {
@@ -950,6 +964,13 @@ fn promote_deferred_batch_at(
     let mut parsed = Vec::new();
     let mut needs_reconciliation = false;
     for (rel, expected) in deferred {
+        if is_cancelled() {
+            return Ok(DeferredBatchResult {
+                promoted: 0,
+                catalog: catalog_stats(&conn).map_err(|error| error.to_string())?,
+                needs_reconciliation: false,
+            });
+        }
         let path = root.join(&rel);
         if file_stamp(&path) != Some(expected) {
             needs_reconciliation = true;
@@ -958,6 +979,14 @@ fn promote_deferred_batch_at(
         let mut symbols = Vec::new();
         scan_file(&path, &rel, &mut symbols);
         parsed.push((rel, expected, symbols));
+    }
+
+    if is_cancelled() {
+        return Ok(DeferredBatchResult {
+            promoted: 0,
+            catalog: catalog_stats(&conn).map_err(|error| error.to_string())?,
+            needs_reconciliation: false,
+        });
     }
 
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
@@ -1000,28 +1029,71 @@ fn promote_deferred_batch_at(
 }
 
 #[cfg(not(test))]
-static PROGRESSIVE_WORKERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+struct ProgressiveWorker {
+    cancel: AtomicBool,
+    promoted: AtomicUsize,
+    batches: AtomicUsize,
+    last_batch_ms: AtomicU64,
+    throttle_ms: AtomicU64,
+}
+
+#[cfg(not(test))]
+static PROGRESSIVE_WORKERS: OnceLock<Mutex<HashMap<String, Arc<ProgressiveWorker>>>> = OnceLock::new();
 #[cfg(not(test))]
 const PROGRESSIVE_BATCH_FILES: usize = 128;
+
+fn progressive_throttle_ms(elapsed_ms: u64) -> u64 {
+    if elapsed_ms >= 500 {
+        200
+    } else if elapsed_ms >= 200 {
+        100
+    } else if elapsed_ms >= 75 {
+        50
+    } else {
+        20
+    }
+}
 
 #[cfg(not(test))]
 fn ensure_progressive_indexing(root: &Path) {
     let Some(data_dir) = DATA_DIR.get().cloned() else { return };
     let root = root.to_path_buf();
     let key = canonical_key(&root);
-    let workers = PROGRESSIVE_WORKERS.get_or_init(|| Mutex::new(HashSet::new()));
+    let workers = PROGRESSIVE_WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(mut guard) = workers.lock() else { return };
-    if !guard.insert(key.clone()) {
+    if guard.contains_key(&key) {
         return;
     }
+    let state = Arc::new(ProgressiveWorker {
+        cancel: AtomicBool::new(false),
+        promoted: AtomicUsize::new(0),
+        batches: AtomicUsize::new(0),
+        last_batch_ms: AtomicU64::new(0),
+        throttle_ms: AtomicU64::new(20),
+    });
+    guard.insert(key.clone(), state.clone());
     drop(guard);
     let spawn_key = key.clone();
+    let spawn_state = state.clone();
     if std::thread::Builder::new()
         .name("repo-progressive-index".into())
         .spawn(move || {
             loop {
-                match promote_deferred_batch_at(&root, &data_dir, PROGRESSIVE_BATCH_FILES) {
+                if state.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let batch_started = std::time::Instant::now();
+                match promote_deferred_batch_at_if(
+                    &root,
+                    &data_dir,
+                    PROGRESSIVE_BATCH_FILES,
+                    || state.cancel.load(Ordering::Relaxed),
+                ) {
                     Ok(result) => {
+                        let elapsed_ms = batch_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        state.last_batch_ms.store(elapsed_ms, Ordering::Relaxed);
+                        state.promoted.fetch_add(result.promoted, Ordering::Relaxed);
+                        state.batches.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut cache) = cache().lock() {
                             if let Some(entry) = cache.get_mut(&key) {
                                 entry.catalog = CatalogStats {
@@ -1043,21 +1115,47 @@ fn ensure_progressive_indexing(root: &Path) {
                         break;
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                // 慢盘/复杂源码批次主动加大间隔，避免后台索引持续争抢前台 IO/CPU。
+                let elapsed_ms = state.last_batch_ms.load(Ordering::Relaxed);
+                let throttle_ms = progressive_throttle_ms(elapsed_ms);
+                state.throttle_ms.store(throttle_ms, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(throttle_ms));
             }
             if let Some(workers) = PROGRESSIVE_WORKERS.get() {
                 if let Ok(mut guard) = workers.lock() {
-                    guard.remove(&key);
+                    if guard.get(&key).is_some_and(|current| Arc::ptr_eq(current, &state)) {
+                        guard.remove(&key);
+                    }
                 }
             }
         })
         .is_err()
     {
         if let Ok(mut guard) = workers.lock() {
-            guard.remove(&spawn_key);
+            if guard
+                .get(&spawn_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &spawn_state))
+            {
+                guard.remove(&spawn_key);
+            }
         }
     }
 }
+
+#[cfg(not(test))]
+fn cancel_progressive_indexing(root: &Path) {
+    let key = canonical_key(root);
+    if let Some(workers) = PROGRESSIVE_WORKERS.get() {
+        if let Ok(mut guard) = workers.lock() {
+            if let Some(state) = guard.remove(&key) {
+                state.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn cancel_progressive_indexing(_root: &Path) {}
 
 /// 遍历所有未忽略文件。回调是流式的，百万文件时不需要把全目录保存在内存。
 fn walk_catalog<F>(
@@ -1668,6 +1766,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
 
 /// 全盘失效：清内存条目并删除磁盘缓存（手动刷新/强制重建时调用）。
 pub fn invalidate_cache(root: &Path) {
+    cancel_progressive_indexing(root);
     let key = canonical_key(root);
     if let Ok(mut guard) = cache().lock() {
         guard.remove(&key);
@@ -1831,6 +1930,47 @@ pub fn filter_symbols<'a>(syms: &'a [Symbol], query: &str, kind: Option<&str>) -
 
 /// 面向 Agent 的结构优先查询结果。保留 Symbol 作为前端兼容模型，同时补齐分页、
 /// 覆盖状态和新鲜度，调用方据此决定是否读取具体代码块。
+#[derive(Debug, Default, Serialize)]
+pub struct ProgressiveIndexStatus {
+    pub active: bool,
+    pub promoted_this_run: usize,
+    pub batches: usize,
+    pub last_batch_ms: u64,
+    pub throttle_ms: u64,
+    pub remaining_files: usize,
+}
+
+#[cfg(not(test))]
+fn progressive_status(root: &Path, remaining_files: usize) -> ProgressiveIndexStatus {
+    let key = canonical_key(root);
+    let state = PROGRESSIVE_WORKERS
+        .get()
+        .and_then(|workers| workers.lock().ok())
+        .and_then(|workers| workers.get(&key).cloned());
+    match state {
+        Some(state) => ProgressiveIndexStatus {
+            active: true,
+            promoted_this_run: state.promoted.load(Ordering::Relaxed),
+            batches: state.batches.load(Ordering::Relaxed),
+            last_batch_ms: state.last_batch_ms.load(Ordering::Relaxed),
+            throttle_ms: state.throttle_ms.load(Ordering::Relaxed),
+            remaining_files,
+        },
+        None => ProgressiveIndexStatus {
+            remaining_files,
+            ..ProgressiveIndexStatus::default()
+        },
+    }
+}
+
+#[cfg(test)]
+fn progressive_status(_root: &Path, remaining_files: usize) -> ProgressiveIndexStatus {
+    ProgressiveIndexStatus {
+        remaining_files,
+        ..ProgressiveIndexStatus::default()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct StructureQueryResult {
     pub items: Vec<Symbol>,
@@ -1845,6 +1985,7 @@ pub struct StructureQueryResult {
     pub indexed_relations: usize,
     pub catalog: CatalogStats,
     pub watcher_active: bool,
+    pub progressive: ProgressiveIndexStatus,
     pub coverage: String,
     pub synced_ago_secs: u64,
 }
@@ -2090,6 +2231,7 @@ pub fn query_structure(
         })
         .unwrap_or((0, CatalogStats::default(), 0));
     let coverage = catalog.coverage();
+    let progressive = progressive_status(root, catalog.deferred_source_files);
     StructureQueryResult {
         items,
         relations,
@@ -2102,6 +2244,7 @@ pub fn query_structure(
         indexed_relations,
         catalog,
         watcher_active: crate::services::repo_watcher::is_watching(root),
+        progressive,
         coverage,
         synced_ago_secs,
     }
@@ -2558,6 +2701,10 @@ struct Detail {
         assert_eq!(catalog.indexed_source_files, 1);
         assert_eq!(catalog.deferred_source_files, 2);
 
+        let cancelled = promote_deferred_batch_at_if(&root, &data_dir, 1, || true).unwrap();
+        assert_eq!(cancelled.promoted, 0);
+        assert_eq!(cancelled.catalog.deferred_source_files, 2);
+
         let first = promote_deferred_batch_at(&root, &data_dir, 1).unwrap();
         assert_eq!(first.promoted, 1);
         assert_eq!(first.catalog.indexed_source_files, 2);
@@ -2592,6 +2739,16 @@ struct Detail {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn progressive_backpressure_increases_for_slow_batches() {
+        assert_eq!(progressive_throttle_ms(0), 20);
+        assert_eq!(progressive_throttle_ms(74), 20);
+        assert_eq!(progressive_throttle_ms(75), 50);
+        assert_eq!(progressive_throttle_ms(200), 100);
+        assert_eq!(progressive_throttle_ms(500), 200);
+        assert_eq!(progressive_throttle_ms(10_000), 200);
     }
 
     #[test]

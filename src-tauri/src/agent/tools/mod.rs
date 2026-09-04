@@ -3666,6 +3666,16 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     if result.coverage.starts_with("partial_") || result.coverage.starts_with("best_effort_") {
         out.push_str("注意：当前结构索引不是全量语义保证；无结果或高风险修改时需用 codebase_search/LSP/精确路径补查。\n");
     }
+    if result.progressive.active {
+        out.push_str(&format!(
+            "后台渐进索引：active，本轮已提升 {} 个文件 / {} 批，剩余 {}；最近一批 {} ms，背压间隔 {} ms。\n",
+            result.progressive.promoted_this_run,
+            result.progressive.batches,
+            result.progressive.remaining_files,
+            result.progressive.last_batch_ms,
+            result.progressive.throttle_ms,
+        ));
+    }
     if result.items.is_empty() {
         out.push_str("本页无匹配结构。\n");
         return Ok(out);
