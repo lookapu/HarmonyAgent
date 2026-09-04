@@ -812,6 +812,8 @@ struct CacheEntry {
     files: HashMap<String, FileStamp>,
     syms: Vec<Symbol>,
     catalog: CatalogStats,
+    /// Git HEAD/index 的廉价指纹，用于补偿 checkout/reset 等 watcher 可能漏报的批量变化。
+    git_checkpoint: Option<GitCheckpoint>,
     /// watcher 检测到外部变化或丢事件后，下一次查询执行全库一致性校验。
     needs_reconciliation: bool,
     /// 最近一次增量同步的秒：冷却期内直接复用内存结果（Agent 修改文件会主动精确失效）
@@ -853,6 +855,117 @@ fn canonical_key(root: &Path) -> String {
     root.canonicalize()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| root.to_string_lossy().to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitCheckpoint {
+    head: String,
+    index: Option<FileStamp>,
+}
+
+fn git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let value = fs::read_to_string(dot_git).ok()?;
+    let path = value.trim().strip_prefix("gitdir:")?.trim();
+    let path = Path::new(path);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    })
+}
+
+fn git_common_dir(git_dir: &Path) -> PathBuf {
+    let Some(value) = fs::read_to_string(git_dir.join("commondir")).ok() else {
+        return git_dir.to_path_buf();
+    };
+    let path = Path::new(value.trim());
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        git_dir.join(path)
+    }
+}
+
+fn packed_ref_oid(common_dir: &Path, reference: &str) -> Option<String> {
+    fs::read_to_string(common_dir.join("packed-refs"))
+        .ok()?
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
+        .find_map(|line| {
+            let (oid, name) = line.split_once(' ')?;
+            (name == reference).then(|| oid.to_string())
+        })
+}
+
+fn git_checkpoint(root: &Path) -> Option<GitCheckpoint> {
+    let git_dir = git_dir(root)?;
+    let common_dir = git_common_dir(&git_dir);
+    let head_value = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head_value = head_value.trim();
+    let head = if let Some(reference) = head_value.strip_prefix("ref: ") {
+        fs::read_to_string(git_dir.join(reference))
+            .or_else(|_| fs::read_to_string(common_dir.join(reference)))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .or_else(|| packed_ref_oid(&common_dir, reference))?
+    } else {
+        head_value.to_string()
+    };
+    if head.is_empty() {
+        return None;
+    }
+    let index = fs::metadata(git_dir.join("index"))
+        .ok()
+        .map(|metadata| stamp_from_meta(&metadata));
+    Some(GitCheckpoint { head, index })
+}
+
+const MAX_GIT_DELTA_PATHS: usize = 20_000;
+const MAX_GIT_DELTA_BYTES: usize = 8 * 1024 * 1024;
+
+/// HEAD 变化时让 Git 枚举变化文件；禁用 rename 检测后 rename 会自然展开为 delete + add。
+/// index-only 变化（如 reset --hard）没有旧 tree 可比较，返回 None 触发一致性扫描。
+fn git_changed_paths(
+    root: &Path,
+    previous: &GitCheckpoint,
+    current: &GitCheckpoint,
+) -> Option<Vec<String>> {
+    if previous.head == current.head {
+        return (previous.index == current.index).then(Vec::new);
+    }
+    let args = vec![
+        "-C".to_string(),
+        root.to_string_lossy().to_string(),
+        "diff".to_string(),
+        "--name-only".to_string(),
+        "-z".to_string(),
+        "--no-renames".to_string(),
+        previous.head.clone(),
+        current.head.clone(),
+        "--".to_string(),
+    ];
+    let output = crate::utils::process::output_blocking("git", &args).ok()?;
+    if !output.status.success() || output.stdout.len() > MAX_GIT_DELTA_BYTES {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for value in output.stdout.split(|byte| *byte == 0).filter(|value| !value.is_empty()) {
+        let rel = std::str::from_utf8(value).ok()?.replace('\\', "/");
+        if normalize_changed_path(root, &rel).is_none() {
+            return None;
+        }
+        paths.push(rel);
+        if paths.len() > MAX_GIT_DELTA_PATHS {
+            return None;
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Some(paths)
 }
 
 // ---------- 磁盘持久化 ----------
@@ -1003,6 +1116,22 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
     let watcher_active = crate::services::repo_watcher::ensure_watching(root);
     #[cfg(test)]
     let watcher_active = false;
+    let current_git = git_checkpoint(root);
+    let previous_git = cache()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&key).and_then(|entry| entry.git_checkpoint.clone()));
+    if let (Some(previous), Some(current)) = (&previous_git, &current_git) {
+        match git_changed_paths(root, previous, current) {
+            Some(paths) if !paths.is_empty() => {
+                if !invalidate_files(root, &paths) {
+                    request_reconciliation(root);
+                }
+            }
+            Some(_) => {}
+            None => request_reconciliation(root),
+        }
+    }
     // 阶段 1：锁内取快照（克隆 files/syms + 记录 last_sync），冷却期内直接复用。
     let (mut files, mut syms, snap_sync) = {
         let mut guard = cache().lock().unwrap();
@@ -1010,6 +1139,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
             files: HashMap::new(),
             syms: Vec::new(),
             catalog: CatalogStats::default(),
+            git_checkpoint: None,
             needs_reconciliation: false,
             last_sync: 0,
             source: "scan",
@@ -1023,6 +1153,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
                 entry.source = "disk";
             }
         }
+        entry.git_checkpoint = current_git.clone();
         // 已完成过同步即可复用；空项目/无可识别符号的项目由 watcher 捕获新文件，
         // watcher 不可用时仍按冷却周期扫描。
         if !entry.needs_reconciliation
@@ -1048,6 +1179,7 @@ pub fn index_project_cached(root: &Path) -> Vec<Symbol> {
             entry.files = files;
             entry.syms = syms;
             entry.catalog = catalog;
+            entry.git_checkpoint = current_git;
             entry.needs_reconciliation = false;
             entry.last_sync = now;
             save_persisted(root, &entry.files, &entry.syms, entry.catalog);
@@ -1622,6 +1754,41 @@ struct Detail {
     }
 
     #[test]
+    fn git_checkpoint_lists_paths_across_head_changes() {
+        let root =
+            std::env::temp_dir().join(format!("deveco-git-checkpoint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        };
+        if run(&["init", "-q"]).is_none() {
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        run(&["config", "user.name", "HarmonyAgent Test"]).unwrap();
+        run(&["config", "user.email", "harmony-agent@example.invalid"]).unwrap();
+        std::fs::write(root.join("old.rs"), "fn old() {}\n").unwrap();
+        run(&["add", "old.rs"]).unwrap();
+        run(&["commit", "-q", "-m", "first"]).unwrap();
+        let previous = git_checkpoint(&root).expect("首次提交应有 Git 指纹");
+
+        std::fs::remove_file(root.join("old.rs")).unwrap();
+        std::fs::write(root.join("new.rs"), "fn new() {}\n").unwrap();
+        run(&["add", "-A"]).unwrap();
+        run(&["commit", "-q", "-m", "second"]).unwrap();
+        let current = git_checkpoint(&root).expect("第二次提交应有 Git 指纹");
+        let paths = git_changed_paths(&root, &previous, &current).expect("HEAD diff 应可精确枚举");
+        assert_eq!(paths, vec!["new.rs", "old.rs"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn structure_query_filters_roles_and_paginates_with_coverage() {
         let dir = make_project("structure-query");
         let first = query_structure(&dir, "", Some("entity"), None, None, 1, 1);
@@ -1657,6 +1824,7 @@ struct Detail {
             files: HashMap::new(),
             syms: Vec::new(),
             catalog: CatalogStats::default(),
+            git_checkpoint: None,
             needs_reconciliation: false,
             last_sync: 0,
             source: "scan",
