@@ -28,7 +28,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 5;
+const STRUCTURE_PARSER_VERSION: i64 = 6;
 
 /// 全库文件目录统计。目录覆盖所有未被忽略的普通文件；结构解析可以渐进完成。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -116,6 +116,10 @@ pub struct Symbol {
 pub struct DeclaredRelation {
     pub kind: String,
     pub target_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_specifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_name: Option<String>,
 }
 
 /// 全局结构图中的关系边。空 target_file/0 target_line 表示语法目标尚未完成名称解析。
@@ -299,7 +303,12 @@ fn collect_declared_relations(
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
             {
-                out.push(DeclaredRelation { kind: kind.into(), target_name });
+                out.push(DeclaredRelation {
+                    kind: kind.into(),
+                    target_name,
+                    module_specifier: None,
+                    imported_name: None,
+                });
             }
         }
         return;
@@ -312,13 +321,96 @@ fn collect_declared_relations(
     }
 }
 
-fn declared_relations(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<DeclaredRelation> {
+#[derive(Debug, Clone)]
+struct NamedImport {
+    module_specifier: String,
+    imported_name: String,
+}
+
+fn string_literal_value(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let value = node_text(node, source)?;
+    let quote = value.chars().next()?;
+    matches!(quote, '\'' | '"')
+        .then(|| value.strip_prefix(quote)?.strip_suffix(quote).map(str::to_string))
+        .flatten()
+}
+
+fn collect_named_import_specifiers(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    module_specifier: &str,
+    imports: &mut HashMap<String, Vec<NamedImport>>,
+) {
+    if node.kind() == "import_specifier" {
+        let Some(name_node) = node.child_by_field_name("name") else { return };
+        let Some(imported_name) = node_text(name_node, source) else { return };
+        let local_name = node
+            .child_by_field_name("alias")
+            .and_then(|alias| node_text(alias, source))
+            .unwrap_or_else(|| imported_name.clone());
+        imports.entry(local_name).or_default().push(NamedImport {
+            module_specifier: module_specifier.to_string(),
+            imported_name,
+        });
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_named_import_specifiers(child, source, module_specifier, imports);
+    }
+}
+
+fn named_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> HashMap<String, Vec<NamedImport>> {
+    let mut imports = HashMap::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "import_statement" {
+            continue;
+        }
+        let import_node = statement
+            .named_child(0)
+            .filter(|child| child.kind() == "lazy_import_statement")
+            .unwrap_or(statement);
+        let Some(module_specifier) = import_node
+            .child_by_field_name("source")
+            .and_then(|source_node| string_literal_value(source_node, source))
+            .filter(|value| value.starts_with('.'))
+        else {
+            continue;
+        };
+        collect_named_import_specifiers(import_node, source, &module_specifier, &mut imports);
+    }
+    imports
+}
+
+fn relation_local_identifier(value: &str) -> Option<&str> {
+    let identifier = value.split('<').next()?.trim();
+    let mut chars = identifier.chars();
+    is_ident_start(chars.next()?)
+        .then(|| chars.all(is_ident))
+        .filter(|valid| *valid)
+        .map(|_| identifier)
+}
+
+fn declared_relations(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    imports: &HashMap<String, Vec<NamedImport>>,
+) -> Vec<DeclaredRelation> {
     let mut relations = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if matches!(child.kind(), "class_heritage" | "extends_type_clause") {
             collect_declared_relations(child, source, &mut relations);
         }
+    }
+    for relation in &mut relations {
+        let Some(local_name) = relation_local_identifier(&relation.target_name) else { continue };
+        let Some(bindings) = imports.get(local_name).filter(|bindings| bindings.len() == 1) else {
+            continue;
+        };
+        relation.module_specifier = Some(bindings[0].module_specifier.clone());
+        relation.imported_name = Some(bindings[0].imported_name.clone());
     }
     relations.sort();
     relations.dedup();
@@ -369,6 +461,7 @@ fn walk_syntax_tree(
     rel: &str,
     ext: &str,
     source: &str,
+    imports: &HashMap<String, Vec<NamedImport>>,
     out: &mut Vec<Symbol>,
 ) {
     let node_kind = node.kind();
@@ -424,7 +517,7 @@ fn walk_syntax_tree(
             rel,
             ext,
             source,
-            declared_relations(node, source.as_bytes()),
+            declared_relations(node, source.as_bytes(), imports),
         ) {
             if matches!(kind, "class" | "component" | "interface" | "type" | "enum") {
                 child_parent = Some(name);
@@ -452,7 +545,7 @@ fn walk_syntax_tree(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_syntax_tree(child, child_parent.as_deref(), rel, ext, source, out);
+        walk_syntax_tree(child, child_parent.as_deref(), rel, ext, source, imports, out);
     }
 }
 
@@ -467,7 +560,8 @@ fn scan_file_tree_sitter(content: &str, rel: &str, ext: &str, out: &mut Vec<Symb
     if tree.root_node().has_error() {
         return false;
     }
-    walk_syntax_tree(tree.root_node(), None, rel, ext, content, out);
+    let imports = named_imports(tree.root_node(), content.as_bytes());
+    walk_syntax_tree(tree.root_node(), None, rel, ext, content, &imports, out);
     true
 }
 
@@ -982,8 +1076,11 @@ fn structure_edges(symbols: &[Symbol]) -> Vec<StructureEdge> {
     }
     for symbol in symbols {
         for relation in &symbol.declared_relations {
-            let resolved = local_entities
-                .get(&(symbol.file.as_str(), relation.target_name.as_str()))
+            let resolved = relation
+                .module_specifier
+                .is_none()
+                .then(|| local_entities.get(&(symbol.file.as_str(), relation.target_name.as_str())))
+                .flatten()
                 .filter(|candidates| candidates.len() == 1)
                 .and_then(|candidates| candidates.first())
                 .filter(|candidate| {
@@ -1947,8 +2044,8 @@ struct PersistedIndex {
     catalog: CatalogStats,
 }
 
-// v7 rebuilds declaration edges with conservative same-file target binding.
-const PERSIST_VERSION: u32 = 7;
+// v8 persists relative named-import evidence for cross-file target binding.
+const PERSIST_VERSION: u32 = 8;
 
 /// FNV-1a 64 位：把项目根路径稳定散列为缓存文件名
 fn stable_hash(s: &str) -> u64 {
@@ -3387,15 +3484,15 @@ class Service extends BaseService implements Loadable, Disposable {}
         let loadable = symbols.iter().find(|symbol| symbol.name == "Loadable").unwrap();
         assert_eq!(
             loadable.declared_relations,
-            vec![DeclaredRelation { kind: "extends".into(), target_name: "Identified".into() }]
+            vec![DeclaredRelation { kind: "extends".into(), target_name: "Identified".into(), module_specifier: None, imported_name: None }]
         );
         let service = symbols.iter().find(|symbol| symbol.name == "Service").unwrap();
         assert_eq!(
             service.declared_relations,
             vec![
-                DeclaredRelation { kind: "extends".into(), target_name: "BaseService".into() },
-                DeclaredRelation { kind: "implements".into(), target_name: "Disposable".into() },
-                DeclaredRelation { kind: "implements".into(), target_name: "Loadable".into() },
+                DeclaredRelation { kind: "extends".into(), target_name: "BaseService".into(), module_specifier: None, imported_name: None },
+                DeclaredRelation { kind: "implements".into(), target_name: "Disposable".into(), module_specifier: None, imported_name: None },
+                DeclaredRelation { kind: "implements".into(), target_name: "Loadable".into(), module_specifier: None, imported_name: None },
             ]
         );
         let edges = structure_edges(&symbols);
@@ -3433,6 +3530,46 @@ class Service extends BaseService implements Loadable, Disposable {}
             .unwrap();
         assert!(remote.target_file.is_empty(), "没有 import 证据时不得跨文件猜测目标");
         assert_eq!(remote.target_line, 0);
+    }
+
+    #[test]
+    fn tree_sitter_attaches_relative_named_import_evidence_to_type_relations() {
+        let cases = [
+            (
+                "ts",
+                "import { BaseService as Parent, Loadable } from './base';\nclass Service extends Parent implements Loadable {}\n",
+            ),
+            (
+                "ets",
+                "import lazy { BaseService as Parent } from './base';\nclass Service extends Parent {}\n",
+            ),
+        ];
+        for (ext, source) in cases {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_language(ext).unwrap()).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let imports = named_imports(tree.root_node(), source.as_bytes());
+            assert!(imports.contains_key("Parent"), "{ext}: {} / {imports:?}", tree.root_node().to_sexp());
+            let mut symbols = Vec::new();
+            assert!(scan_file_tree_sitter(source, &format!("service.{ext}"), ext, &mut symbols));
+            let service = symbols.iter().find(|symbol| symbol.name == "Service").unwrap();
+            let parent = service
+                .declared_relations
+                .iter()
+                .find(|relation| relation.target_name == "Parent")
+                .unwrap();
+            assert_eq!(parent.module_specifier.as_deref(), Some("./base"));
+            assert_eq!(parent.imported_name.as_deref(), Some("BaseService"));
+            if ext == "ts" {
+                let loadable = service
+                    .declared_relations
+                    .iter()
+                    .find(|relation| relation.target_name == "Loadable")
+                    .unwrap();
+                assert_eq!(loadable.module_specifier.as_deref(), Some("./base"));
+                assert_eq!(loadable.imported_name.as_deref(), Some("Loadable"));
+            }
+        }
     }
 
     #[test]

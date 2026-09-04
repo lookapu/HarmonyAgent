@@ -1,6 +1,6 @@
 # Structure-first 代码导航设计
 
-> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和结构关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 与 ArkTS 已接入 Tree-sitter，语法层 `extends/implements` 已落图，跨文件名称绑定、物理分片及调用/导入关系仍在后续阶段。
+> 状态：MVP 已接入 `search_symbols`；全库目录、结构节点和结构关系已使用独立 SQLite 持久化、索引和游标分页；TS/TSX/JS/JSX 与 ArkTS 已接入 Tree-sitter，语法层 `extends/implements` 已落图，相对命名 import 证据已持久化，跨文件目标绑定、物理分片及调用关系仍在后续阶段。
 
 ## 1. 结论
 
@@ -93,7 +93,7 @@ Tree-sitter 语法层已经扩展为固定兼容的 `tree-sitter 0.24.7`、`tree
 
 每个节点新增 `language` 和 `source_layer=tree_sitter|lightweight`，Agent 输出会展示来源，不能把 fallback 结果冒充 AST 事实。支持语言只有在语法树无错误时采用 Tree-sitter；解析失败时整文件回退原轻量扫描，Rust/Python 等未接 grammar 的语言也继续使用 fallback。SQLite 启动时兼容增加 provenance 和声明关系列；parser schema version 从旧版本升级时清空旧节点、把已解析文件恢复为 deferred，并配合磁盘缓存版本升级重新建立首批结构，避免悄悄复用旧轻量结果。
 
-fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器、字符串内大括号、箭头函数、parent 归属、JS/JSX/TSX 入口、语法错误 fallback、`extends/implements` 声明边持久化和旧 SQLite 自动迁移。当前仍不能称为完整语义索引：声明关系只代表语法事实，跨文件引用还没有编译器级绑定。
+fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `import lazy`、字符串内大括号、箭头函数、parent 归属、JS/JSX/TSX 入口、语法错误 fallback、`extends/implements` 声明边、相对命名 import/别名证据持久化和旧 SQLite 自动迁移。当前仍不能称为完整语义索引：声明关系只代表语法事实，跨文件引用还没有编译器级绑定。
 
 10,000 个实体 `.ts` 文件的同机基准中，冷目录与首批 4,000 文件 AST 解析/写入约 0.95 s，产生 8,000 个 Tree-sitter 节点且没有 fallback；峰值 RSS 约 23.7 MiB，单文件增量约 12 ms。该结果只证明首批 grammar 的吞吐未突破既有资源边界，不替代真实代码的召回率评测。
 
@@ -134,7 +134,7 @@ fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器、字�
 
 1. ~~为结构浏览增加稳定游标/keyset 分页，消除深页 `OFFSET` 的线性扫描，并保留现有页码接口作为兼容层。~~ 已完成。
 2. ~~在生成仓运行渐进解析 1M 验收，记录冷扫描吞吐、写放大、锁等待、峰值内存和取消延迟。~~ 已完成；仍需补充真实混合语言 monorepo 的 Recall@5/20 与任务轨迹验收，达到单库 SLO 边界时再启用物理分片。
-3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS 已完成，`extends/implements` 语法声明关系已落图，同文件唯一目标已精确绑定；下一步补模块 import 解析与跨文件目标绑定。
+3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS 已完成，`extends/implements` 语法声明关系已落图，同文件唯一目标已精确绑定，相对命名 import/别名/ArkTS `import lazy` 证据已持久化；下一步将模块路径绑定到跨文件目标。
 4. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
 5. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
 6. 用 10k/100k/1M 基准和真实任务轨迹持续验证 Recall@5/20、延迟与上下文节省量。
