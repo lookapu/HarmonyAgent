@@ -136,13 +136,13 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 
 ## 10. 首个实现切片
 
-- [ ] 抽取 `AgentEventSink`，让 Tauri 和 JSONL writer 共用事件源；
+- [x] 抽取 `AgentEventSink`，让 Tauri 和 JSONL writer 共用事件源（改用拉取式桥接：`eval_trajectory::session_events_to_trajectory` 直接回放 `session_events` 到 trajectory.jsonl，复用真实事件源，无需再引入 push sink trait）；
 - [ ] 增加只接受本地已准备 workspace 的 `eval run`；
 - [ ] 只支持一个 Provider、`network=none` 和 command grader；
-- [ ] 输出完整 manifest/trajectory/patch/report；
+- [ ] 输出完整 manifest/trajectory/patch/report（manifest/report/trajectory 数据契约已落地；patch 采集与落盘待 runner）；
 - [ ] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact；
 - [x] 未交付真实沙箱前，runner 必须拒绝不可信 task，而不是回退宿主执行（已落地为 `agent::eval_task`：task schema v1 解析 + 安全校验，拒绝宿主命令/绝对路径/`..`/命令替换/联网/不安全 artifact，并附单元测试）。
 
-已完成部分见 `src-tauri/src/agent/eval_task.rs`；其余切片（事件 sink、`eval run`、grader、CI artifact）待实现。
+已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`；其余切片（`eval run` runner、grader、patch 采集、CI artifact）待实现。
 
 相关文档：[固定评测集](FIXED_EVALUATION_SUITE.md)、[评测运行快照](EVALUATION_RUN_SNAPSHOTS.md)、[安全边界](SECURITY_BOUNDARY.md)、[演进路线](AGENT_EVOLUTION_ROADMAP_2026.md)。

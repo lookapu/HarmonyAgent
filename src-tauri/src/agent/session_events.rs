@@ -32,7 +32,7 @@ pub enum SessionEventType {
 }
 
 impl SessionEventType {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::UserMessage => "user_message",
             Self::AssistantMessage => "assistant_message",

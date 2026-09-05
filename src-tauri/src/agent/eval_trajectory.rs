@@ -71,6 +71,26 @@ pub fn append_existing(path: &Path) -> Result<TrajectoryWriter, String> {
     })
 }
 
+/// 把已有会话事件日志（`agent::session_events`）回放进 trajectory 写入器，
+/// 复用真实事件源而不是另造一套。返回写入的事件条数。
+pub fn session_events_to_trajectory(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    writer: &mut TrajectoryWriter,
+) -> Result<usize, String> {
+    let events = crate::agent::session_events::replay(conn, conversation_id)?;
+    let mut written = 0usize;
+    for event in events {
+        writer.append(&TrajectoryEvent {
+            ts: event.created_at.to_string(),
+            kind: event.event_type.as_str().to_string(),
+            fields: event.payload,
+        })?;
+        written += 1;
+    }
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +167,61 @@ mod tests {
             .read_to_string(&mut contents)
             .unwrap();
         assert_eq!(contents.lines().count(), 2);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn replays_session_events_into_trajectory() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                trace_id TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX idx_session_events_conv_seq ON session_events(conversation_id, seq);",
+        )
+        .unwrap();
+        crate::agent::session_events::append_event(
+            &conn,
+            "eval-1",
+            crate::agent::session_events::SessionEventType::UserMessage,
+            serde_json::json!({ "content": "fix it" }),
+            None,
+        )
+        .unwrap();
+        crate::agent::session_events::append_event(
+            &conn,
+            "eval-1",
+            crate::agent::session_events::SessionEventType::ToolCall,
+            serde_json::json!({ "name": "read_file", "args": {} }),
+            Some("tr-1"),
+        )
+        .unwrap();
+
+        let path = temp_path();
+        let mut writer = TrajectoryWriter::create(&path).unwrap();
+        let written = session_events_to_trajectory(&conn, "eval-1", &mut writer).unwrap();
+        assert_eq!(written, 2);
+        drop(writer.finish().unwrap());
+
+        let mut contents = String::new();
+        File::open(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        let events: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["kind"], "user_message");
+        assert_eq!(events[1]["kind"], "tool_call");
+        assert_eq!(events[1]["name"], "read_file");
         std::fs::remove_file(path).ok();
     }
 }
