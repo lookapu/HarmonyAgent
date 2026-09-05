@@ -427,10 +427,10 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 - [x] 把当前 `sandbox_exec` 在 UI/文档中改称“临时副本试运行”，消除错误安全承诺；
 - [x] 写 `SECURITY_BOUNDARY.md`：明确宿主、工作区、网络、凭据和 MCP 边界；
-- [ ] 完成 headless eval adapter 设计与一个真实模型 end-to-end 样例（接口设计已完成；task schema v1 与安全校验器已完成——`agent::eval_task` 拒绝携带宿主命令/绝对路径/凭据/联网的可信任务，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)；真实 runner、事件 sink 抽取与 end-to-end 样例待实现）；
+- [ ] 完成 headless eval adapter 设计与一个真实模型 end-to-end 样例（接口设计与 harness 数据契约/编排已落地——`eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`/`eval_patch`/`eval_workspace`/`eval_runner` 七个模块 + 事件源回放桥接，`run_trial` 以可注入 `AgentDriver` trait 串成闭环并经桩端到端验证；真实 headless `AgentDriver`（从 `commands/chat.rs` 抽取）、`eval run` CLI 入口与真实模型 end-to-end 样例待实现，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）；
 - [ ] 固定 SWE-bench Verified 25 题 smoke 子集；
 - [x] 建立 10k/100k/1M 文件索引基准生成器，并记录 10k 当前基线；
-- [x] 更新 README：二进制下载、支持平台和当前限制。
+- [x] 更新 README：二进制下载、支持平台和当前限制（badge 改为仅 Windows/macOS，并明确 Linux 暂不提供官方安装包，避免“跨平台”措辞超出实际产物）。
 
 退出门槛：可以用一条命令重现当前的安全边界、检索性能和 25 题 Agent 基线。
 

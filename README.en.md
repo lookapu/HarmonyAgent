@@ -2,7 +2,7 @@
 
 > **Agent Workspace for HarmonyOS Developers** — an all-in-one desktop AI coding workbench
 
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)]()
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)]()
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 
@@ -250,6 +250,8 @@ Download the installer from [Releases](https://github.com/lookapu/HarmonyAgent/r
 
 - **Windows**: `.exe` (NSIS installer) or `.msi`
 - **macOS**: `.dmg` or `.app.tar.gz`
+
+> **Linux**: no official installer is provided yet (the release pipeline currently produces Windows/macOS artifacts only); build from source if needed, or watch for future `.deb`/AppImage support.
 
 End users do not need a local Python environment to run these installers. Python is used only by selected development, documentation, and release helper scripts.
 

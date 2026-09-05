@@ -2,7 +2,7 @@
 
 > **Agent Workspace for HarmonyOS Developers** — 一站式桌面 AI 编程工作台
 
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)]()
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)]()
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 
@@ -249,6 +249,8 @@ src-tauri/src/
 
 - **Windows**: `.exe`（NSIS 安装包）或 `.msi`
 - **macOS**: `.dmg` 或 `.app.tar.gz`
+
+> **Linux**：暂不提供官方安装包（发布流水线当前只产出 Windows/macOS 产物）；如需在 Linux 使用请自行从源码构建，或关注后续 `.deb`/AppImage 支持。
 
 最终用户运行上述安装包不需要本地 Python 环境。Python 仅用于部分开发、文档和发布辅助脚本。
 
