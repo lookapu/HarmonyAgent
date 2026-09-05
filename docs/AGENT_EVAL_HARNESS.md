@@ -137,12 +137,12 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 ## 10. 首个实现切片
 
 - [x] 抽取 `AgentEventSink`，让 Tauri 和 JSONL writer 共用事件源（改用拉取式桥接：`eval_trajectory::session_events_to_trajectory` 直接回放 `session_events` 到 trajectory.jsonl，复用真实事件源，无需再引入 push sink trait）；
-- [ ] 增加只接受本地已准备 workspace 的 `eval run`；
+- [ ] 增加只接受本地已准备 workspace 的 `eval run`（workspace 准备已落地为 `agent::eval_workspace`（`git worktree add --detach` 检出干净隔离 base 工作树）；runner 组装与 CLI 入口待做）；
 - [ ] 只支持一个 Provider、`network=none` 和 command grader（command grader 已落地为 `agent::eval_grader`：argv 直接执行、退出码判定、超时兜底、拒绝 shell 解释器与绝对路径；Provider 接线与 `network=none` 随 runner）；
 - [ ] 输出完整 manifest/trajectory/patch/report（manifest/report/trajectory 数据契约与 patch 采集/应用 `agent::eval_patch`（`git diff base` / `git apply`）已落地；由 `eval run` runner 组装成四件套待做）；
 - [ ] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact；
 - [x] 未交付真实沙箱前，runner 必须拒绝不可信 task，而不是回退宿主执行（已落地为 `agent::eval_task`：task schema v1 解析 + 安全校验，拒绝宿主命令/绝对路径/`..`/命令替换/联网/不安全 artifact，并附单元测试）。
 
-已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`；其余切片（`eval run` runner、Provider 接线、CI artifact）待实现。
+已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`；唯一剩余切片是 `eval run` runner（Provider 接线、headless 驱动核心、四件套组装、CI artifact）。
 
 相关文档：[固定评测集](FIXED_EVALUATION_SUITE.md)、[评测运行快照](EVALUATION_RUN_SNAPSHOTS.md)、[安全边界](SECURITY_BOUNDARY.md)、[演进路线](AGENT_EVOLUTION_ROADMAP_2026.md)。

@@ -24,7 +24,7 @@
 - `SandboxBackend`/`SandboxSpec`、Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线决策均已就绪——`run_command` 默认路由与 artifact 导出待 Docker 运行环境验证后接线。
 - Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
 - ArkTS LSP 语义层与 `repo_query` 路由 MVP——影响面反查、依赖图重排的统一 planner 待完成。
-- headless eval harness——数据契约/grader 已落地，`eval run` runner（需从 12k 行 UI 耦合的 `commands/chat.rs` 抽取 headless 驱动核心）与真实模型 end-to-end 样例待实现。
+- headless eval harness——数据契约/grader/补丁采集/工作树准备已落地，`eval run` runner（需从 12k 行 UI 耦合的 `commands/chat.rs` 抽取 headless 驱动核心）与真实模型 end-to-end 样例待实现。
 
 **需外部基础设施（本仓库环境无法完成，需 Docker/真实模型/官方 harness/签名证书）**
 
