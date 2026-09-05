@@ -424,7 +424,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 交付：
 
 - [ ] Tree-sitter/ArkTS 容错 AST 层与依赖/影响图（AST、`contains`、语法级 `extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import、根 `tsconfig` path alias、HarmonyOS `file:/link:` 本地包入口及有界命名/星号 re-export 闭包已完成；ArkTS LSP 唯一工程内定义和有界引用批次可增量沉淀成员调用边）；
-- [x] LSP/SCIP 语义层和 fallback 策略（单点定义、单次最多 256 个引用的成员调用证据、目标扫描账本、覆盖率/截断/退避指标，以及方法优先的按需调度、空闲小批次调度、自适应占用预算和跨进程指数退避均已接入；SCIP importer 支持逐 document 有界解析、独立精确引用层、文件指纹失效与原子代次切换；热点符号关系超过单次 500 条上限时以 `relations_cursor` 按统一 keyset 逐页读取，并已记录关系查询 P50/P95 基准——5k 到 1M 条引用第一页 P50 稳定在约 3.6 ms，见 [INDEX_SCALE_BASELINE.md §7](./INDEX_SCALE_BASELINE.md)）；
+- [x] LSP/SCIP 语义层和 fallback 策略（单点定义、单次最多 256 个引用的成员调用证据、目标扫描账本、覆盖率/截断/退避指标，以及方法优先的按需调度、空闲小批次调度、自适应占用预算和跨进程指数退避均已接入；SCIP importer 支持逐 document 有界解析、独立精确引用层、文件指纹失效与原子代次切换，并按 SCIP 语义把 `ForwardDefinition` 前向声明当作定义位置而非引用；热点符号关系超过单次 500 条上限时以 `relations_cursor` 按统一 keyset 逐页读取，并已记录关系查询 P50/P95 基准——5k 到 1M 条引用第一页 P50 稳定在约 3.6 ms，见 [INDEX_SCALE_BASELINE.md §7](./INDEX_SCALE_BASELINE.md)）；
 - [ ] 延迟加载工具与程序化工具编排 A/B；
 - [ ] HarmonyBench v0（至少 50 题，其中一部分 holdout）；
 - [ ] SWE-bench Verified 100 题与 SWE-Explore 报告；

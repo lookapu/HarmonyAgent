@@ -17,6 +17,9 @@ const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 1024 * 1024;
 const DEFINITION_ROLE: u64 = 1;
+// SCIP SymbolRole.ForwardDefinition：前向声明也是符号的合法定义位置，不应被当作引用。
+const FORWARD_DEFINITION_ROLE: u64 = 64;
+const DEFINITION_OR_FORWARD_ROLE: u64 = DEFINITION_ROLE | FORWARD_DEFINITION_ROLE;
 const DOCUMENTS_PER_TRANSACTION: usize = 256;
 const EDGE_BUILD_BATCH_ROWS: i64 = 50_000;
 const CLEANUP_BATCH_ROWS: i64 = 50_000;
@@ -435,7 +438,7 @@ fn parse_document(
             continue;
         }
         let key = symbol_key(&path, &occurrence.symbol);
-        if occurrence.roles & DEFINITION_ROLE != 0 {
+        if occurrence.roles & DEFINITION_OR_FORWARD_ROLE != 0 {
             conn.execute(
                 "INSERT OR IGNORE INTO scip_import_definitions(import_id, symbol_key, file, line, column, file_size, file_mtime_ns, fallback_name) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![import_id, key, path, occurrence.line.saturating_add(1) as i64, occurrence.column.saturating_add(1) as i64, meta.len() as i64, file_mtime as i64, fallback_name(&occurrence.symbol)],
@@ -750,6 +753,76 @@ mod tests {
             out.extend(len_field(2, occurrence));
         }
         out
+    }
+
+    fn occurrence_with_roles(symbol: &str, line: u64, column: u64, roles: u64) -> Vec<u8> {
+        let range = [varint(line), varint(column), varint(column + 1)].concat();
+        [
+            len_field(1, &range),
+            len_field(2, symbol.as_bytes()),
+            [varint(3 << 3), varint(roles)].concat(),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn forward_definition_counts_as_definition_not_reference() {
+        let root = std::env::temp_dir().join(format!("harmony-scip-fwd-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let source = root.join("src/source.ts");
+        let target = root.join("src/target.ts");
+        fs::write(&source, "function caller() { fetch(); }\n").unwrap();
+        fs::write(&target, "declare function fetch(): void;\n").unwrap();
+        let source_meta = fs::metadata(&source).unwrap();
+        let target_meta = fs::metadata(&target).unwrap();
+        let source_mtime = source_meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let target_mtime = target_meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let database = root.join("catalog.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files(path TEXT PRIMARY KEY, state TEXT, size INTEGER, mtime_ns INTEGER);
+             CREATE TABLE symbols(file TEXT, name TEXT, line INTEGER, end_line INTEGER, role TEXT);",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO files VALUES('src/source.ts','indexed',?1,?2)",
+            params![source_meta.len() as i64, source_mtime],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO files VALUES('src/target.ts','indexed',?1,?2)",
+            params![target_meta.len() as i64, target_mtime],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES('src/source.ts','caller',1,1,'logic')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES('src/target.ts','fetch',1,1,'logic')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let symbol = "scip-typescript npm demo 1.0 fetch().";
+        let mut bytes = len_field(
+            2,
+            &document(
+                "src/target.ts",
+                &[occurrence_with_roles(symbol, 0, 9, FORWARD_DEFINITION_ROLE)],
+            ),
+        );
+        for column in 0..3u64 {
+            bytes.extend(len_field(
+                2,
+                &document("src/source.ts", &[occurrence_with_roles(symbol, 0, 20 + column, 0)]),
+            ));
+        }
+        let index = root.join("index.scip");
+        fs::write(&index, bytes).unwrap();
+        let stats = import(&root, &database, &index).unwrap();
+        // 前向声明被记为定义位置；三个引用都解析到它，而不是把前向声明误算成第 4 个引用。
+        assert_eq!(stats.definitions, 1);
+        assert_eq!(stats.references, 3);
+        assert_eq!(stats.resolved_references, 3);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
