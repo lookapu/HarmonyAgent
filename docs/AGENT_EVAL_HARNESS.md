@@ -139,7 +139,7 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 - [x] 抽取 `AgentEventSink`，让 Tauri 和 JSONL writer 共用事件源（改用拉取式桥接：`eval_trajectory::session_events_to_trajectory` 直接回放 `session_events` 到 trajectory.jsonl，复用真实事件源，无需再引入 push sink trait）；
 - [ ] 增加只接受本地已准备 workspace 的 `eval run`（编排器 `agent::eval_runner::run_trial` 已落地——validate→prepare worktree→drive agent→collect patch→grade→组装，Agent 驱动做成可注入 `AgentDriver` trait、用桩端到端验证；真实 headless `AgentDriver` 实现与 CLI 入口待做）；
 - [ ] 只支持一个 Provider、`network=none` 和 command grader（command grader 已落地为 `agent::eval_grader`：argv 直接执行、退出码判定、超时兜底、拒绝 shell 解释器与绝对路径；Provider 接线与 `network=none` 随 runner）；
-- [ ] 输出完整 manifest/trajectory/patch/report（manifest/report/trajectory 数据契约与 patch 采集/应用 `agent::eval_patch`（`git diff base` / `git apply`）已落地；由 `eval run` runner 组装成四件套待做）；
+- [ ] 输出完整 manifest/trajectory/patch/report（manifest/report/trajectory 数据契约、patch 采集/应用 `agent::eval_patch`、产物收集 `agent::eval_workspace::collect_artifacts`（按任务声明 glob 复制到 `artifacts/`）已落地；由 `eval run` runner 组装成四件套待做）；
 - [ ] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact；
 - [x] 未交付真实沙箱前，runner 必须拒绝不可信 task，而不是回退宿主执行（已落地为 `agent::eval_task`：task schema v1 解析 + 安全校验，拒绝宿主命令/绝对路径/`..`/命令替换/联网/不安全 artifact，并附单元测试）。
 

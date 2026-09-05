@@ -26,6 +26,97 @@ pub fn prepare_worktree(source_repo: &Path, target: &Path, base_commit: &str) ->
     Ok(())
 }
 
+/// 最小 glob 匹配：`*` 匹配段内任意字符，`**` 匹配零个或多个路径段。
+/// 覆盖 eval task `artifacts` 字段的常见形态（`dir/**`、`dir/*.log`、`file.txt`）。
+fn glob_matches(pattern: &str, rel: &str) -> bool {
+    fn seg(pat: &str, name: &str) -> bool {
+        if !pat.contains('*') {
+            return pat == name;
+        }
+        let parts: Vec<&str> = pat.split('*').collect();
+        let mut pos = 0usize;
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() {
+                continue;
+            }
+            if i == 0 {
+                if !name.starts_with(part) {
+                    return false;
+                }
+                pos = part.len();
+            } else if i == parts.len() - 1 {
+                if !name[pos..].ends_with(part) {
+                    return false;
+                }
+            } else {
+                match name[pos..].find(part) {
+                    Some(idx) => pos += idx + part.len(),
+                    None => return false,
+                }
+            }
+        }
+        true
+    }
+    let pat: Vec<&str> = pattern.split('/').collect();
+    let segs: Vec<&str> = rel.split('/').collect();
+    fn walk(pat: &[&str], segs: &[&str]) -> bool {
+        match (pat.first(), segs.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => {
+                walk(&pat[1..], segs) || (!segs.is_empty() && walk(pat, &segs[1..]))
+            }
+            (Some(p), Some(s)) => seg(p, s) && walk(&pat[1..], &segs[1..]),
+            _ => false,
+        }
+    }
+    walk(&pat, &segs)
+}
+
+/// 采集任务声明的 artifacts（glob 匹配）到输出目录的 `artifacts/` 子目录，保留相对结构。
+/// 返回收集到的相对路径列表。工作树内无匹配文件不视为错误。
+pub fn collect_artifacts(
+    worktree: &Path,
+    artifacts: &[String],
+    output_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let dest = output_dir.join("artifacts");
+    std::fs::create_dir_all(&dest).map_err(|error| format!("创建 artifacts 目录失败：{error}"))?;
+    let mut collected = Vec::new();
+    walk_and_collect(worktree, worktree, &dest, artifacts, &mut collected)?;
+    Ok(collected)
+}
+
+fn walk_and_collect(
+    dir: &Path,
+    base: &Path,
+    dest: &Path,
+    patterns: &[String],
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if path.is_dir() {
+            if entry.file_name() != ".git" {
+                walk_and_collect(&path, base, dest, patterns, out)?;
+            }
+        } else if patterns.iter().any(|pattern| glob_matches(pattern, &rel)) {
+            let target = dest.join(&rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +174,51 @@ mod tests {
 
         fs::remove_dir_all(source).ok();
         fs::remove_dir_all(target).ok();
+    }
+
+    #[test]
+    fn glob_matches_supports_star_and_double_star() {
+        assert!(glob_matches("test-results/**", "test-results/a.log"));
+        assert!(glob_matches("test-results/**", "test-results/sub/b.log"));
+        assert!(glob_matches("test-results/*.log", "test-results/a.log"));
+        assert!(!glob_matches("test-results/*.log", "test-results/sub/a.log"));
+        assert!(glob_matches("out/report.json", "out/report.json"));
+        assert!(!glob_matches("out/report.json", "out/other.json"));
+        assert!(glob_matches("**/*.hap", "entry/build/x.hap"));
+    }
+
+    #[test]
+    fn collect_artifacts_copies_matches_preserving_structure() {
+        let worktree = temp_dir("art-ws");
+        fs::create_dir_all(worktree.join("test-results/sub")).unwrap();
+        fs::create_dir_all(worktree.join("entry/build")).unwrap();
+        fs::write(worktree.join("test-results/a.log"), "a").unwrap();
+        fs::write(worktree.join("test-results/sub/b.log"), "b").unwrap();
+        fs::write(worktree.join("entry/build/app.hap"), "hap").unwrap();
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        fs::write(worktree.join("src/main.ets"), "code").unwrap();
+
+        let output = temp_dir("art-out");
+        let mut collected = collect_artifacts(
+            &worktree,
+            &["test-results/**".to_string(), "**/*.hap".to_string()],
+            &output,
+        )
+        .unwrap();
+        collected.sort();
+        assert_eq!(
+            collected,
+            vec![
+                "entry/build/app.hap".to_string(),
+                "test-results/a.log".to_string(),
+                "test-results/sub/b.log".to_string(),
+            ]
+        );
+        assert!(output.join("artifacts/test-results/sub/b.log").exists());
+        assert!(output.join("artifacts/entry/build/app.hap").exists());
+        assert!(!output.join("artifacts/src/main.ets").exists());
+
+        fs::remove_dir_all(worktree).ok();
+        fs::remove_dir_all(output).ok();
     }
 }
