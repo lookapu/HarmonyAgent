@@ -14,23 +14,23 @@
 - 路线 B 核心检索：全库 SQLite 目录、keyset 游标查询、原生 watcher 与 Git diff 修复；`MAX_FILES=4000` 降级为首批解析预算，其余以 `deferred` 状态入目录。
 - SCIP 精确引用：流式导入官方 protobuf、独立精确引用层、文件指纹失效、跨进程导入锁、外部覆盖检测、原子代次切换；`ForwardDefinition` 前向声明按定义位置处理。
 - 热点符号关系：单次 500 条预算 + `relations_cursor` 统一 keyset 分页；关系查询 P50/P95 基准显示 5k→1M 引用第一页 P50 稳定约 3.6 ms。
-- 统一检索入口：`repo_query` 按 `path/symbol/concept` 自动分流并标注 `source_layer`；`search_tools` 按 query 发现工具（`detail=name|summary`）。
-- 沙箱命令接线决策：`select_sandbox_target` 按后端偏好 + 运行时探测 fail-closed 选择 OCI/宿主直跑，宿主直跑显式标注风险（`agent::sandbox`）。
-- 审批审计：`resolve_tool_approval` 决议写入 `session_events`（`ToolApproval` 事件），与沙箱升级/工具调用同源可回放并进入 eval trajectory。
+- 统一检索入口：`repo_query` 按 `path/symbol/concept` 自动分流并标注 `source_layer`，`impact` 模式返回精确图反向依赖 + 主流约定的候选测试文件；`search_tools` 按 query 发现工具（`detail=name|summary`）。
+- 沙箱命令接线：`select_sandbox_target`/`resolve_sandbox_target` 按 `HARMONY_SANDBOX_BACKEND`/`HARMONY_SANDBOX_IMAGE` 环境配置 fail-closed 选择执行目标，`run_command` 已接入 `OciBackend::run`（显式配置时容器内执行），宿主直跑持续显示风险标注（`agent::sandbox`）。
+- 审批审计：`resolve_tool_approval` 决议写入 `session_events`（`ToolApproval` 事件），`audit_timeline` 把 `session_events` 与 `run_events`（沙箱升级）合并为一条按时间排序的统一审计时间线。
 - Host Capability Broker 原型：`HostCapability` 类型化窄能力（hdc 连接/断开/列表、install、deploy）+ `validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`（`agent::capability_broker`）。
 - headless eval harness：task schema v1 + 安全校验、`manifest`/`report`/`trajectory` 数据契约、`command grader`、补丁采集/应用、工作树准备、`run_trial` 编排（`AgentDriver` 可注入 trait，桩端到端验证），trajectory 复用 `session_events` 事件源（`agent::eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`/`eval_patch`/`eval_workspace`/`eval_runner`，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）。
 - 文案与事实基线：`sandbox_exec` 改称“临时副本试运行”、`SECURITY_BOUNDARY.md`、README 下载/平台限制（已修正 Linux 过度承诺）、10k/100k/1M 基准生成器。
 
 **部分落地（契约/探测/语法层就绪，接线或验收待完成）**
 
-- `SandboxBackend`/`SandboxSpec`、Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线决策均已就绪——`run_command` 默认路由与 artifact 导出待 Docker 运行环境验证后接线。
+- `SandboxBackend`/`SandboxSpec`、Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线均已就绪——Docker 运行环境下的端到端验证、artifact 导出与把沙箱设为默认值待做。
 - Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
-- ArkTS LSP 语义层与 `repo_query` 路由 MVP——影响面反查、依赖图重排的统一 planner 待完成。
-- headless eval harness——数据契约/grader/补丁采集/工作树准备已落地，`eval run` runner（需从 12k 行 UI 耦合的 `commands/chat.rs` 抽取 headless 驱动核心）与真实模型 end-to-end 样例待实现。
+- ArkTS LSP 语义层与 `repo_query` 路由/影响面——依赖图重排的统一 planner 待完成。
+- headless eval harness——数据契约/grader/补丁/工作树/编排已落地，真实 `AgentDriver`（需从 12k 行 UI 耦合的 `commands/chat.rs` 抽取 headless 驱动核心，51 个 emit 点）与真实模型 end-to-end 样例待实现。
 
 **需外部基础设施（本仓库环境无法完成，需 Docker/真机/真实模型/官方 harness/签名证书）**
 
-- 真实 OCI 沙箱接线 + 恶意脚本逃逸套件（需可运行容器运行时）。
+- 沙箱端到端验证 + 恶意脚本逃逸套件（需可运行容器运行时）。
 - Host Capability Broker 真实执行接入 `device_tools`/`build_tools`（需真机/模拟器验证）。
 - 审批与沙箱升级的单一审计链合并（`session_events` 与 `runtime` 事件日志统一，需跨模块治理改造）。
 - 真实 headless `AgentDriver`（`stream_chat` 12k 行 headless 抽取）+ `eval run` CLI + CI artifact（需真实模型端到端验证）。
