@@ -188,6 +188,7 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("tool_help", "explore"),
     ("tool_history", "explore"),
     ("tool_list", "explore"),
+    ("search_tools", "explore"),
     ("view_image", "explore"),
     // refactor：Git / 重构 / 计划
     ("git_blame", "refactor"),
@@ -908,6 +909,10 @@ name: "ask_history",
         desc: "查某个工具的详细说明：完整描述 + 权限级别 + 执行预期（超时/重试/成本）+ 参数示例。\n参数：{\"name\":\"<工具名>\"}。\n适合：对某工具的参数、副作用、返回结构不确定时调用；不确定用法先 tool_help 而不是猜参数。\n副作用：无（只读）。\n返回：该工具完整说明。",
     },
     ToolSpec {
+        name: "search_tools",
+        desc: "按关键词/用途发现相关工具，而不是全量列出。\n参数：{\"query\":\"<用途/关键词/工具名>\",\"detail\":\"<可选 name|summary，缺省 summary>\",\"limit\":<可选返回条数，缺省 10>}。\n适合：知道想做什么但不确定工具名时；命中名称权重高于描述。\n副作用：无（只读注册表）。\n返回：按相关度排序的工具清单；某工具细节用 tool_help 查。",
+    },
+    ToolSpec {
         name: "tool_history",
         desc: "查看最近工具调用历史（默认当前会话，新→旧）：时间、工具名、状态（成功/失败）、耗时、参数摘要、失败原因。\n参数：{\"limit\":<可选 1-100，缺省 10>,\"tool\":\"<可选按工具名过滤>\",\"status\":\"<可选 ok|error|running|cancelled|ask>\",\"all\":<可选 true 时跨会话查询>}。\n适合：复盘「刚才那个工具为什么失败」「我调用了哪些工具」；与 session_events 同源。\n副作用：无（只读）。\n返回：调用历史清单。",
     },
@@ -1373,6 +1378,7 @@ pub async fn run_tool(
         // ---- 工具自我管理域（meta_tools）----
         "tool_list" => meta_tools::tool_list(&args, &roots).await,
         "tool_help" => meta_tools::tool_help(&args, &roots).await,
+        "search_tools" => meta_tools::search_tools(&args, &roots).await,
         "tool_history" => meta_tools::tool_history(&args, &roots, &ctx.conversation_id, db).await,
         "db_query" => meta_tools::db_query(&args, &roots, db).await,
         "share_session" => meta_tools::share_session(&args, &roots, &ctx.conversation_id, db).await,

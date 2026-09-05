@@ -137,6 +137,71 @@ pub(super) async fn tool_help(args: &Value, _roots: &[String]) -> Result<String,
     Ok(out)
 }
 
+/// 按查询词对工具注册表打分排序（纯函数，供 `search_tools` 与单测共用）。
+/// 命中名称权重高于描述；空查询返回空。
+fn rank_tools(query: &str, limit: usize) -> Vec<(&'static super::ToolSpec, u32)> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let tokens: Vec<String> = q.split_whitespace().map(str::to_string).collect();
+    let mut scored: Vec<(&super::ToolSpec, u32)> = super::TOOL_SPECS
+        .iter()
+        .filter_map(|tool| {
+            let name = tool.name.to_lowercase();
+            let desc = tool.desc.to_lowercase();
+            let mut score = 0u32;
+            for token in &tokens {
+                if name == *token {
+                    score += 8;
+                } else if name.contains(token.as_str()) {
+                    score += 4;
+                }
+                if desc.contains(token.as_str()) {
+                    score += 2;
+                }
+            }
+            if name.contains(&q) {
+                score += 2;
+            }
+            (score > 0).then_some((tool, score))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.name.cmp(b.0.name)));
+    scored.truncate(limit);
+    scored
+}
+
+/// search_tools：按关键词/用途发现相关工具，而不是全量列出（路线 D 8.1 延迟加载工具协议）。
+pub(super) async fn search_tools(args: &Value, _roots: &[String]) -> Result<String, String> {
+    let query = args["query"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("search_tools 需要参数 {\"query\":\"<按用途/关键词/工具名检索>\"}")?;
+    let limit = (args["limit"].as_u64().unwrap_or(10) as usize).clamp(1, 30);
+    let detail = args["detail"].as_str().unwrap_or("summary");
+    if !matches!(detail, "name" | "summary") {
+        return Err("detail 仅支持 name|summary（完整 schema 用 tool_help）".into());
+    }
+    let ranked = rank_tools(query, limit);
+    if ranked.is_empty() {
+        return Ok(format!(
+            "没有匹配 \"{query}\" 的工具。可 tool_list 看全部清单，或换更宽泛的关键词。"
+        ));
+    }
+    let mut out = format!("匹配 \"{query}\" 的 {} 个工具：\n", ranked.len());
+    for (tool, _score) in ranked {
+        if detail == "name" {
+            out.push_str(&format!("- {}\n", tool.name));
+        } else {
+            out.push_str(&format!("- {}：{}{}\n", tool.name, tool.desc, fmt_meta(tool.name)));
+        }
+    }
+    out.push_str("\n想了解某工具的参数/副作用，调用 tool_help name=<工具名>。");
+    Ok(out)
+}
+
 // ---------------- tool_history ----------------
 
 /// tool_history：最近工具调用历史（tool_runs 表，默认当前会话，可跨会话/按工具/按状态过滤）。
@@ -1494,4 +1559,32 @@ pub(super) async fn export_tools_meta(args: &Value, roots: &[String]) -> Result<
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     std::fs::write(&out_path, text).map_err(|e| format!("写入失败：{e}"))?;
     Ok(format!("已导出 {} 个工具元数据 → {}", tools.len(), out_path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rank_tools_prefers_name_hits_and_orders_by_score() {
+        let hits = rank_tools("git commit", 10);
+        assert!(!hits.is_empty());
+        // 名称含 "git" 且含 "commit" 的工具排在最前。
+        assert!(hits[0].0.name.contains("git"), "top hit 应含 git：{:?}", hits[0].0.name);
+
+        let exact = rank_tools("search_symbols", 10);
+        assert_eq!(exact[0].0.name, "search_symbols");
+    }
+
+    #[test]
+    fn rank_tools_returns_empty_for_no_match() {
+        assert!(rank_tools("zzz_no_such_tool_zzz", 10).is_empty());
+        assert!(rank_tools("   ", 10).is_empty());
+    }
+
+    #[test]
+    fn rank_tools_respects_limit() {
+        let hits = rank_tools("file", 3);
+        assert!(hits.len() <= 3);
+    }
 }
