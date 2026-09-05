@@ -322,6 +322,8 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     };
     match result {
         Ok(out) => {
+            // 宿主直跑持续显示风险（路线 5.2.3）：命令未受沙箱隔离。
+            let out = format!("⚠️ {}\n{out}", crate::agent::sandbox::host_direct_risk_note());
             // 扫描命令间接修改/创建的文件（写文件类命令也受文件列表追踪，与 edit_file/write_file 一致）。
             // 全项目递归遍历在 spawn_blocking 中执行，避免钉死 tokio worker。
             let roots_owned = roots.to_vec();

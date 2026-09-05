@@ -342,12 +342,15 @@ impl SandboxExecutionTarget {
 
     pub fn host_direct_risk_note(&self) -> Option<&'static str> {
         match self {
-            Self::HostDirect => {
-                Some("未受沙箱隔离：命令在宿主用户权限下执行，可读取工作区外文件并联网")
-            }
+            Self::HostDirect => Some(host_direct_risk_note()),
             Self::Oci(_) => None,
         }
     }
+}
+
+/// 宿主直跑（未隔离）时的风险标注，供 `run_command` 等直接宿主执行路径持续显示（路线 5.2.3）。
+pub fn host_direct_risk_note() -> &'static str {
+    "未受沙箱隔离：命令在宿主用户权限下执行，可读取工作区外文件并联网"
 }
 
 /// 后端偏好：显式声明要哪种隔离。缺省为宿主直跑（显式兼容模式，非安全默认）。
