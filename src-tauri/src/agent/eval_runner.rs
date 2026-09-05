@@ -8,7 +8,7 @@
 use crate::agent::eval_task::{validate_eval_task, EvalTask};
 use crate::agent::eval_grader::{run_command_grader, GraderOutcome};
 use crate::agent::eval_patch::{apply_patch, collect_patch};
-use crate::agent::eval_workspace::prepare_worktree;
+use crate::agent::eval_workspace::{collect_artifacts, prepare_worktree};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -27,6 +27,7 @@ pub struct EvalTrialOutcome {
     pub status: String,
     pub patch: String,
     pub grader: GraderOutcome,
+    pub collected_artifacts: Vec<String>,
     pub duration_ms: u64,
 }
 
@@ -54,6 +55,8 @@ pub fn run_trial(
     prepare_worktree(source_repo, &grader_ws, &task.repo.base_commit)?;
     apply_patch(&grader_ws, &patch)?;
     let grader = run_command_grader(&task.grader, &grader_ws)?;
+    // 采集任务声明的产物（如 test-results/**），从 grader 干净工作树收集，保留相对结构。
+    let collected_artifacts = collect_artifacts(&grader_ws, &task.artifacts, output_dir)?;
 
     let status = if grader.passed {
         OUTCOME_RESOLVED
@@ -64,6 +67,7 @@ pub fn run_trial(
         status: status.to_string(),
         patch,
         grader,
+        collected_artifacts,
         duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
     })
 }
@@ -157,6 +161,25 @@ mod tests {
         let outcome = run_trial(&task, &source, &output_dir, &StubAgentDriver).unwrap();
         assert_eq!(outcome.status, OUTCOME_UNRESOLVED);
         assert!(!outcome.grader.passed);
+
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(output_dir).ok();
+    }
+
+    #[test]
+    fn run_trial_collects_declared_artifacts() {
+        let (source, base) = source_repo_with_base();
+        // 声明 a.txt 为产物：stub 把 a.txt 改为 fixed，patch 应用后 grader 工作树含 a.txt=fixed。
+        let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
+        task.repo.base_commit = base.clone();
+        task.artifacts = vec!["a.txt".to_string()];
+        let output_dir = std::env::temp_dir().join(format!("deveco-eval-run-out3-{}", uuid::Uuid::new_v4()));
+
+        let outcome = run_trial(&task, &source, &output_dir, &StubAgentDriver).unwrap();
+        assert_eq!(outcome.status, OUTCOME_RESOLVED);
+        assert_eq!(outcome.collected_artifacts, vec!["a.txt".to_string()]);
+        assert!(output_dir.join("artifacts/a.txt").exists());
+        assert_eq!(fs::read_to_string(output_dir.join("artifacts/a.txt")).unwrap(), "fixed\n");
 
         fs::remove_dir_all(source).ok();
         fs::remove_dir_all(output_dir).ok();
