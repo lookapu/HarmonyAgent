@@ -320,6 +320,65 @@ impl SandboxBackend for OciBackend {
     }
 }
 
+/// 运行命令时的执行目标：要么走 OCI 隔离，要么显式退回宿主直跑。
+/// 宿主直跑不是安全边界，调用方必须通过 [`SandboxExecutionTarget::host_direct_risk_note`] 显式标注。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxExecutionTarget {
+    Oci(OciBackend),
+    HostDirect,
+}
+
+impl SandboxExecutionTarget {
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Oci(backend) => backend.engine.program(),
+            Self::HostDirect => "host-direct",
+        }
+    }
+
+    pub fn is_isolated(&self) -> bool {
+        matches!(self, Self::Oci(_))
+    }
+
+    pub fn host_direct_risk_note(&self) -> Option<&'static str> {
+        match self {
+            Self::HostDirect => {
+                Some("未受沙箱隔离：命令在宿主用户权限下执行，可读取工作区外文件并联网")
+            }
+            Self::Oci(_) => None,
+        }
+    }
+}
+
+/// 后端偏好：显式声明要哪种隔离。缺省为宿主直跑（显式兼容模式，非安全默认）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxBackendPreference {
+    HostDirect,
+    Oci(OciEngine),
+}
+
+/// 依据后端偏好与运行时探测结果选择执行目标，并 fail-closed：
+/// 请求 OCI 但运行时不可用时返回错误，绝不静默回退宿主执行。
+pub fn select_sandbox_target(
+    preference: SandboxBackendPreference,
+    probe: &SandboxCapabilities,
+) -> Result<SandboxExecutionTarget, String> {
+    match preference {
+        SandboxBackendPreference::HostDirect => Ok(SandboxExecutionTarget::HostDirect),
+        SandboxBackendPreference::Oci(engine) => {
+            if probe.available && probe.backend == engine.program() {
+                Ok(SandboxExecutionTarget::Oci(OciBackend::new(engine)))
+            } else {
+                Err(format!(
+                    "sandbox_unavailable: 请求了 {} 沙箱但运行时不可用（{}）；已失败关闭，未回退宿主执行",
+                    engine.program(),
+                    probe.reason.as_deref().unwrap_or("未知原因"),
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxRunStatus {
@@ -596,6 +655,67 @@ mod tests {
 
     fn digest_image() -> &'static str {
         "example.invalid/harmony-agent-eval@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+
+    fn available_probe(engine: OciEngine) -> SandboxCapabilities {
+        SandboxCapabilities {
+            backend: engine.program().into(),
+            available: true,
+            os_level_isolation: true,
+            filesystem_read_only: true,
+            workspace_write: true,
+            network_none: true,
+            network_allowlist: false,
+            resource_limits: true,
+            reason: Some("运行时探测通过".into()),
+        }
+    }
+
+    #[test]
+    fn select_target_prefers_host_direct_when_requested_and_flags_risk() {
+        let target = select_sandbox_target(
+            SandboxBackendPreference::HostDirect,
+            &available_probe(OciEngine::Docker),
+        )
+        .unwrap();
+        assert_eq!(target, SandboxExecutionTarget::HostDirect);
+        assert!(!target.is_isolated());
+        assert!(target.host_direct_risk_note().is_some());
+    }
+
+    #[test]
+    fn select_target_uses_oci_when_available() {
+        let target = select_sandbox_target(
+            SandboxBackendPreference::Oci(OciEngine::Docker),
+            &available_probe(OciEngine::Docker),
+        )
+        .unwrap();
+        assert!(target.is_isolated());
+        assert_eq!(target.backend_name(), "docker");
+        assert!(target.host_direct_risk_note().is_none());
+    }
+
+    #[test]
+    fn select_target_fails_closed_when_oci_unavailable_or_mismatched() {
+        let unavailable = SandboxCapabilities {
+            available: false,
+            ..OciEngine::Docker.declared_capabilities()
+        };
+        let err = select_sandbox_target(
+            SandboxBackendPreference::Oci(OciEngine::Docker),
+            &unavailable,
+        )
+        .unwrap_err();
+        assert!(err.contains("sandbox_unavailable"), "{err}");
+        assert!(err.contains("未回退宿主执行"), "{err}");
+
+        // 探测到 Podman 但请求 Docker：引擎不匹配也必须失败关闭。
+        let mismatched = select_sandbox_target(
+            SandboxBackendPreference::Oci(OciEngine::Docker),
+            &available_probe(OciEngine::Podman),
+        )
+        .unwrap_err();
+        assert!(mismatched.contains("sandbox_unavailable"), "{mismatched}");
     }
 
     #[test]
