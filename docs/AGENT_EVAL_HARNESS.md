@@ -88,6 +88,8 @@ eval-runs/<run-id>/
 - FAIL_TO_PASS/PASS_TO_PASS 或 Harmony outcome assertions；
 - failure taxonomy 和安全策略违反计数。
 
+以上必填字段已落地为 `agent::eval_report`（`EvalReport` 类型 + JSON 序列化 + 字段完整性单测）；runner 完成后直接采集各字段即可，无需再定义 schema。
+
 ## 6. 执行状态机
 
 ```text
