@@ -6548,6 +6548,127 @@ class Service extends BaseService implements Loadable, Disposable {}
     }
 
     #[test]
+    #[ignore = "手动热点符号关系查询 P50/P95 基准；通过 HARMONY_QUERY_BENCH_REFS 选择引用规模"]
+    fn hot_symbol_relation_query_latency_baseline() {
+        let references = std::env::var("HARMONY_QUERY_BENCH_REFS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100_000)
+            .clamp(500, 1_000_000);
+        let trials = 30usize;
+        let root = std::env::temp_dir()
+            .join(format!("deveco-query-bench-db-{}", uuid::Uuid::new_v4()));
+        let data_dir = std::env::temp_dir()
+            .join(format!("deveco-query-bench-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(root.join("source.ts"), "function caller() {}\n").unwrap();
+        std::fs::write(root.join("target.ts"), "function fetch() {}\n").unwrap();
+        let (files, catalog) = collect_files_at(&root, Some(&data_dir));
+        let mut symbols = Vec::new();
+        for rel in files.keys() {
+            scan_file(&root.join(rel), rel, &mut symbols);
+        }
+        let indexed_files = files.keys().cloned().collect::<Vec<_>>();
+        assert!(replace_all_symbol_rows_with_files_at(
+            &root,
+            &data_dir,
+            &symbols,
+            &indexed_files,
+            catalog.revision,
+        ));
+        let database = catalog_file_at(&data_dir, &root);
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scip_import_state(id INTEGER PRIMARY KEY, active_import_id INTEGER, edge_count INTEGER);
+             INSERT INTO scip_import_state VALUES(1, 7, 0);
+             CREATE TABLE scip_reference_edges(
+               import_id INTEGER, source_file TEXT, source_name TEXT, source_line INTEGER,
+               occurrence_line INTEGER, occurrence_column INTEGER, source_size INTEGER,
+               source_mtime_ns INTEGER, target_file TEXT, target_name TEXT, target_line INTEGER,
+               target_size INTEGER, target_mtime_ns INTEGER, symbol_key TEXT
+             );
+             CREATE INDEX idx_test_scip_source ON scip_reference_edges(import_id, source_file, source_name, source_line);
+             CREATE INDEX idx_test_scip_target ON scip_reference_edges(import_id, target_file, target_name, target_line);",
+        ).unwrap();
+        let source_stamp = files["source.ts"];
+        let target_stamp = files["target.ts"];
+        conn.execute_batch("BEGIN").unwrap();
+        for column in 0..references as i64 {
+            let source_name = format!("caller_{column}");
+            conn.execute(
+                "INSERT INTO scip_reference_edges VALUES(7,'source.ts',?1,1,1,?2,?3,?4,'target.ts','fetch',1,?5,?6,'symbol')",
+                params![source_name, column, source_stamp.len as i64, source_stamp.mtime as i64, target_stamp.len as i64, target_stamp.mtime as i64],
+            ).unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        conn.execute(
+            "UPDATE scip_import_state SET edge_count=?1 WHERE id=1",
+            params![references as i64],
+        )
+        .unwrap();
+        drop(conn);
+        let target = symbols.iter().find(|symbol| symbol.name == "fetch").cloned().unwrap();
+        let query_symbols = [target];
+        let (first_edges, total, truncated, next) =
+            query_persisted_edges_bounded_at(&root, &data_dir, &query_symbols, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(total, references);
+        assert!(truncated);
+        assert_eq!(first_edges.len(), MAX_QUERY_RELATIONS);
+        let encoded = next.expect("截断页必须携带关系游标");
+        let cursor = decode_relation_cursor(&encoded, relation_filter_hash(&root, &query_symbols)).unwrap();
+
+        let mut first_page_us = Vec::with_capacity(trials);
+        let mut cursor_page_us = Vec::with_capacity(trials);
+        for _ in 0..trials {
+            let started = std::time::Instant::now();
+            let _ = query_persisted_edges_bounded_at(&root, &data_dir, &query_symbols, None)
+                .unwrap()
+                .unwrap();
+            first_page_us.push(started.elapsed().as_micros() as u64);
+
+            let started = std::time::Instant::now();
+            let _ = query_persisted_edges_bounded_at(&root, &data_dir, &query_symbols, Some(&cursor))
+                .unwrap()
+                .unwrap();
+            cursor_page_us.push(started.elapsed().as_micros() as u64);
+        }
+        let percentile = |samples: &mut Vec<u64>, q: f64| -> u64 {
+            samples.sort_unstable();
+            let index = ((samples.len() as f64 - 1.0) * q).round() as usize;
+            samples[index.min(samples.len().saturating_sub(1))]
+        };
+        let database_bytes = [
+            database.clone(),
+            database.with_extension("sqlite3-wal"),
+            database.with_extension("sqlite3-shm"),
+        ]
+        .into_iter()
+        .filter_map(|path| std::fs::metadata(path).ok().map(|meta| meta.len()))
+        .sum::<u64>();
+        println!(
+            "HARMONY_QUERY_BASELINE={}",
+            serde_json::json!({
+                "schema_version": 1,
+                "references": references,
+                "max_query_relations": MAX_QUERY_RELATIONS,
+                "trials": trials,
+                "first_page_p50_us": percentile(&mut first_page_us, 0.5),
+                "first_page_p95_us": percentile(&mut first_page_us, 0.95),
+                "cursor_page_p50_us": percentile(&mut cursor_page_us, 0.5),
+                "cursor_page_p95_us": percentile(&mut cursor_page_us, 0.95),
+                "database_bytes": database_bytes,
+                "platform": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+            })
+        );
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn declared_type_relations_roundtrip_through_sqlite() {
         let root =
             std::env::temp_dir().join(format!("deveco-type-edge-db-{}", uuid::Uuid::new_v4()));

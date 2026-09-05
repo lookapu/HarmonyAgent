@@ -94,7 +94,7 @@ HARMONY_SCIP_BENCH_DOCS=100000 cargo test --manifest-path src-tauri/Cargo.toml -
 | 100,000 | 100,001 | 3.70 s | 27,041 文档/s | 6.47 MiB | 51.96 MiB |
 | 1,000,000 | 1,000,001 | 38.92 s | 25,694 文档/s | 64.83 MiB | 524.24 MiB |
 
-三个档位的引用解析率均为 100%。百万档吞吐相对 10k 档下降约 5.4%，没有出现随深页或全量内存累积导致的数量级退化。热点符号关系查询已设 500 条单次安全上限，超过上限时通过 `relations_cursor` 按统一 `(source_file, source_name, source_line, target_file, target_name, target_line, rowid)` keyset 逐页读取，完整关系仍保留在索引中。当前主要成本转为 SQLite 暂存与精确边的磁盘写放大；下一轮应针对真实 indexer 产物测量符号重复率、未解析外部依赖比例、P95 查询和导入期间前台查询延迟。
+三个档位的引用解析率均为 100%。百万档吞吐相对 10k 档下降约 5.4%，没有出现随深页或全量内存累积导致的数量级退化。热点符号关系查询已设 500 条单次安全上限，超过上限时通过 `relations_cursor` 按统一 `(source_file, source_name, source_line, target_file, target_name, target_line, rowid)` keyset 逐页读取，完整关系仍保留在索引中。当前主要成本转为 SQLite 暂存与精确边的磁盘写放大；下一轮应针对真实 indexer 产物测量符号重复率、未解析外部依赖比例和导入期间前台查询延迟。
 
 原始百万档输出：
 
@@ -102,14 +102,40 @@ HARMONY_SCIP_BENCH_DOCS=100000 cargo test --manifest-path src-tauri/Cargo.toml -
 {"architecture":"aarch64","database_bytes":549703680,"documents":1000001,"documents_per_second":25694,"edge_batch_rows":50000,"import_ms":38919,"index_bytes":67983554,"platform":"macos","references":1000000,"resolved_references":1000000,"schema_version":1,"transaction_documents":256}
 ```
 
-## 7. 后续升级
+## 7. 热点关系查询 P50/P95
+
+该基准构造一个被 N 处引用的目标符号，反复查询第一页（返回 500 条 + 截断）与 keyset 游标续读页，测量单页 P50/P95 时延，验证“单次 500 条预算 + 游标分页”让查询时延不随引用规模膨胀。
+
+```bash
+HARMONY_QUERY_BENCH_REFS=1000000 cargo test --manifest-path src-tauri/Cargo.toml --lib \
+  services::symbol_index::tests::hot_symbol_relation_query_latency_baseline \
+  -- --ignored --exact --nocapture
+```
+
+同一台 Apple Silicon 开发机的 2026-09-05 结果（30 次采样）：
+
+| 引用 | 第一页 P50 | 第一页 P95 | 游标页 P50 | 游标页 P95 | SQLite |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 5,000 | 3.57 ms | 4.11 ms | 3.45 ms | 4.11 ms | 0.9 MiB |
+| 100,000 | 3.81 ms | 4.42 ms | 3.72 ms | 4.25 ms | 15.4 MiB |
+| 1,000,000 | 3.57 ms | 3.93 ms | 3.42 ms | 3.73 ms | 154.8 MiB |
+
+从 5,000 到 1,000,000 条引用，第一页 P50 稳定在约 3.6 ms，说明 SQLite 对 `ORDER BY ... LIMIT 501` 采用 top-N 排序，查询时延按 O(n·log 500) 而非 O(n·log n) 增长，也没有把百万边塞进进程内存；游标续读页与第一页同数量级。该样本为单符号引用分布，不代表真实混合语言的符号/关系分布。
+
+原始百万档输出：
+
+```json
+{"architecture":"aarch64","cursor_page_p50_us":3424,"cursor_page_p95_us":3729,"database_bytes":154779648,"first_page_p50_us":3570,"first_page_p95_us":3930,"max_query_relations":500,"platform":"macos","references":1000000,"schema_version":1,"trials":30}
+```
+
+## 8. 后续升级
 
 下一阶段应在不改变 schema 既有字段含义的前提下增加：
 
 - manifest/Git 文件发现时间；
 - watcher 与 Git checkout 修复延迟；
 - 真实混合语言 monorepo 的分片索引进度和渐进覆盖率；
-- lexical/AST/LSP/SCIP 各层查询 P50/P95；
+- lexical/AST/LSP 各层查询 P50/P95（SCIP 热点关系查询 P50/P95 已在上节记录，其余各层待测）；
 - file/line Recall@5/20；
 - 峰值内存、CPU time 和索引磁盘占用。
 

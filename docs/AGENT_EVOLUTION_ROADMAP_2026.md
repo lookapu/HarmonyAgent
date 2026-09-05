@@ -231,7 +231,7 @@ Agent 不应直接猜选搜索工具。新增一个统一 `repo_query`：
 - 修改影响面：反向依赖图 + 测试映射 + Git 历史；
 - 每个结果返回 `source_layer`、`index_revision`、`coverage`、`stale` 和可引用行范围。
 
-Agent 的默认入口采用 [Structure-first 代码导航](./STRUCTURE_FIRST_NAVIGATION.md)：先把符号按 `entity`（类/组件/类型/状态等）和 `logic`（函数/方法）组织并分页检索，再按返回的结构行区间读取正文。二分类只用于规划，索引仍保留语言原生 kind；索引无结果或 coverage 不完整时必须走 lexical/LSP fallback。现有 `search_symbols` 已加入签名、父级、起止行、角色、稳定游标、coverage 和 staleness；TS/TSX/JS/JSX 节点进一步标注 `tree_sitter` 来源并使用 AST 精确范围，其余语言或语法错误文件明确标注 `lightweight` fallback。
+Agent 的默认入口采用 [Structure-first 代码导航](./STRUCTURE_FIRST_NAVIGATION.md)：先把符号按 `entity`（类/组件/类型/状态等）和 `logic`（函数/方法）组织并分页检索，再按返回的结构行区间读取正文。二分类只用于规划，索引仍保留语言原生 kind；索引无结果或 coverage 不完整时必须走 lexical/LSP fallback。现有 `search_symbols` 已加入签名、父级、起止行、角色、稳定游标、coverage 和 staleness，以及热点符号关系的 keyset 游标分页（`relations_cursor`）；TS/TSX/JS/JSX 节点进一步标注 `tree_sitter` 来源并使用 AST 精确范围，其余语言或语法错误文件明确标注 `lightweight` fallback。
 
 ### 6.5 “全库可达”与单次读写预算
 
@@ -257,7 +257,7 @@ Agent 的默认入口采用 [Structure-first 代码导航](./STRUCTURE_FIRST_NAV
 
 - 冷启动可查询时间、完整索引时间；
 - 单文件修改后的 P50/P95 可见延迟；
-- 路径/符号/自然语言查询 P50/P95；
+- 路径/符号/自然语言查询 P50/P95（SCIP 热点关系查询 P50/P95 已测，见 [INDEX_SCALE_BASELINE.md §7](./INDEX_SCALE_BASELINE.md)；其余各层待测）；
 - 文件级 Recall@5、Recall@20，行级 Recall@20；
 - 峰值内存、索引磁盘占用、CPU 时间；
 - 索引重启恢复时间、Git checkout 后一致性；
@@ -424,7 +424,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 交付：
 
 - [ ] Tree-sitter/ArkTS 容错 AST 层与依赖/影响图（AST、`contains`、语法级 `extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import、根 `tsconfig` path alias、HarmonyOS `file:/link:` 本地包入口及有界命名/星号 re-export 闭包已完成；ArkTS LSP 唯一工程内定义和有界引用批次可增量沉淀成员调用边）；
-- [x] LSP/SCIP 语义层和 fallback 策略（单点定义、单次最多 256 个引用的成员调用证据、目标扫描账本、覆盖率/截断/退避指标，以及方法优先的按需调度、空闲小批次调度、自适应占用预算和跨进程指数退避均已接入；SCIP importer 支持逐 document 有界解析、独立精确引用层、文件指纹失效与原子代次切换）；
+- [x] LSP/SCIP 语义层和 fallback 策略（单点定义、单次最多 256 个引用的成员调用证据、目标扫描账本、覆盖率/截断/退避指标，以及方法优先的按需调度、空闲小批次调度、自适应占用预算和跨进程指数退避均已接入；SCIP importer 支持逐 document 有界解析、独立精确引用层、文件指纹失效与原子代次切换；热点符号关系超过单次 500 条上限时以 `relations_cursor` 按统一 keyset 逐页读取，并已记录关系查询 P50/P95 基准——5k 到 1M 条引用第一页 P50 稳定在约 3.6 ms，见 [INDEX_SCALE_BASELINE.md §7](./INDEX_SCALE_BASELINE.md)）；
 - [ ] 延迟加载工具与程序化工具编排 A/B；
 - [ ] HarmonyBench v0（至少 50 题，其中一部分 holdout）；
 - [ ] SWE-bench Verified 100 题与 SWE-Explore 报告；
