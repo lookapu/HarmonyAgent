@@ -15,13 +15,16 @@
 - SCIP 精确引用：流式导入官方 protobuf、独立精确引用层、文件指纹失效、跨进程导入锁、外部覆盖检测、原子代次切换；`ForwardDefinition` 前向声明按定义位置处理。
 - 热点符号关系：单次 500 条预算 + `relations_cursor` 统一 keyset 分页；关系查询 P50/P95 基准显示 5k→1M 引用第一页 P50 稳定约 3.6 ms。
 - 统一检索入口：`repo_query` 按 `path/symbol/concept` 自动分流并标注 `source_layer`。
+- 沙箱命令接线决策：`select_sandbox_target` 按后端偏好 + 运行时探测 fail-closed 选择 OCI/宿主直跑，宿主直跑显式标注风险（`agent::sandbox`）。
+- headless eval harness 数据契约：task schema v1 + 安全校验、`manifest`/`report`/`trajectory` 类型与 JSON 落盘、`command grader`（退出码判定 + 超时 + 拒绝 shell 解释器），trajectory 复用 `session_events` 事件源（`agent::eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）。
 - 文案与事实基线：`sandbox_exec` 改称“临时副本试运行”、`SECURITY_BOUNDARY.md`、README 下载/平台限制、10k/100k/1M 基准生成器。
 
 **部分落地（契约/探测/语法层就绪，接线或验收待完成）**
 
-- `SandboxBackend`/`SandboxSpec`、Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件——真实命令接线与 artifact 导出待完成。
+- `SandboxBackend`/`SandboxSpec`、Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线决策均已就绪——`run_command` 默认路由与 artifact 导出待 Docker 运行环境验证后接线。
 - Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
 - ArkTS LSP 语义层与 `repo_query` 路由 MVP——影响面反查、依赖图重排的统一 planner 待完成。
+- headless eval harness——数据契约/grader 已落地，`eval run` runner（需从 12k 行 UI 耦合的 `commands/chat.rs` 抽取 headless 驱动核心）与真实模型 end-to-end 样例待实现。
 
 **需外部基础设施（本仓库环境无法完成，需 Docker/真实模型/官方 harness/签名证书）**
 
