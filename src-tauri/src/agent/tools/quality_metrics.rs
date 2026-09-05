@@ -830,6 +830,12 @@ fn render_trace_chain(out: &mut String, events: &[&crate::agent::session_events:
                 let note = ev.payload.to_string();
                 out.push_str(&format!("{}. [{when}] 📋 系统: {}\n", i + 1, truncate_chars(&note, 80)));
             }
+            T::ToolApproval => {
+                let tool = ev.payload.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+                let approved = ev.payload.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+                let mark = if approved { "✅ 已批准" } else { "⛔ 已拒绝" };
+                out.push_str(&format!("{}. [{when}] 🛡️ 审批 {tool}：{mark}\n", i + 1));
+            }
             T::ContextCompress => {
                 let trigger = ev.payload.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
                 out.push_str(&format!("{}. [{when}] 🗜️ 上下文压缩（{}）\n", i + 1, trigger));

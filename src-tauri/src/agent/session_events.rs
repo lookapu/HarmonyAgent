@@ -24,6 +24,9 @@ pub enum SessionEventType {
     ToolCall,
     /// 工具结果（payload: { ok, output }）
     ToolResult,
+    /// 工具审批决议（payload: { tool, approved, remember?, scope? }）——与沙箱升级、
+    /// 工具调用同源进入统一审计链，可回放/进入 eval trajectory。
+    ToolApproval,
     /// 系统说明（payload: { text }）
     SystemNote,
     /// 上下文压缩（payload: { trigger, old_limit?, new_limit?, keep? }）——LC-33：
@@ -38,6 +41,7 @@ impl SessionEventType {
             Self::AssistantMessage => "assistant_message",
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
+            Self::ToolApproval => "tool_approval",
             Self::SystemNote => "system_note",
             Self::ContextCompress => "context_compress",
         }
@@ -49,6 +53,7 @@ impl SessionEventType {
             "assistant_message" => Self::AssistantMessage,
             "tool_call" => Self::ToolCall,
             "tool_result" => Self::ToolResult,
+            "tool_approval" => Self::ToolApproval,
             "context_compress" => Self::ContextCompress,
             _ => Self::SystemNote,
         }
@@ -173,6 +178,8 @@ pub fn derive_messages(conn: &Connection, conversation_id: &str) -> Result<Vec<D
             }
             // 压缩事件不进消息历史投影（摘要/裁剪由 conversations 表水位承载）
             SessionEventType::ContextCompress => {}
+            // 审批决议只进审计链，不进消息历史投影
+            SessionEventType::ToolApproval => {}
         }
     }
     Ok(out)

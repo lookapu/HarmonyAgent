@@ -395,6 +395,17 @@ pub fn resolve_tool_approval(
                 "scope": scope,
             }),
         )?;
+        // 审批决议写入统一审计链（session_events），与沙箱升级/工具调用同源可回放，
+        // 后续可进入 eval trajectory 作为审批证据。
+        if let Ok(conn) = db.0.lock() {
+            let _ = crate::agent::session_events::append_event(
+                &conn,
+                &conv,
+                crate::agent::session_events::SessionEventType::ToolApproval,
+                serde_json::json!({ "tool": tool, "approved": approved, "remember": remember, "scope": scope }),
+                None,
+            );
+        }
         let _ = tx.send((approved, feedback));
     }
     Ok(())
