@@ -136,6 +136,47 @@ pub fn replay(conn: &Connection, conversation_id: &str) -> Result<Vec<SessionEve
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+/// 统一审计时间线的一条事件：把会话事件与运行事件合并到同一可查询链。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AuditEvent {
+    /// "session"（消息生命周期/审批）| "run"（沙箱升级等运行级事件）
+    pub source: String,
+    pub event_type: String,
+    pub payload: Value,
+    pub created_at: i64,
+    pub run_id: Option<String>,
+    pub trace_id: Option<String>,
+}
+
+/// 统一审计链：把 `session_events`（含审批决议）与 `run_events`（含沙箱升级）合并为
+/// 一条按时间排序的审计时间线。只读，不改动任何写入路径。
+pub fn audit_timeline(conn: &Connection, conversation_id: &str) -> Result<Vec<AuditEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT 'session' AS source, event_type, payload, created_at, NULL AS run_id, trace_id
+             FROM session_events WHERE conversation_id = ?1
+             UNION ALL
+             SELECT 'run' AS source, event_type, payload, created_at, run_id, NULL AS trace_id
+             FROM run_events WHERE conversation_id = ?1
+             ORDER BY created_at ASC, source ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([conversation_id], |row| {
+            let payload: String = row.get(2)?;
+            Ok(AuditEvent {
+                source: row.get(0)?,
+                event_type: row.get(1)?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                created_at: row.get(3)?,
+                run_id: row.get(4)?,
+                trace_id: row.get(5)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 /// 事件 → 消息历史投影（核心派生：消息历史从事件日志重建）。
 /// 工具调用/结果配对为 assistant 视角的 tool 条目，保持与消息表的语义对齐。
 pub fn derive_messages(conn: &Connection, conversation_id: &str) -> Result<Vec<DerivedMessage>, String> {
@@ -243,6 +284,57 @@ mod tests {
         assert_eq!(events[3].trace_id.as_deref(), Some("tr-1"));
         // 会话隔离
         assert_eq!(count_events(&conn, "c2"), 0);
+    }
+
+    #[test]
+    fn audit_timeline_merges_session_and_run_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                event_type TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+                trace_id TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                goal TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, phase TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1, last_event_seq INTEGER NOT NULL DEFAULT 0,
+                recovery_count INTEGER NOT NULL DEFAULT 0, resume_policy TEXT NOT NULL DEFAULT 'continue',
+                acceptance_json TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', error TEXT,
+                started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, finished_at INTEGER,
+                parent_run_id TEXT, recovery_plan_json TEXT, recovery_mode TEXT NOT NULL DEFAULT 'fresh',
+                goal_contract_json TEXT, remediation_count INTEGER NOT NULL DEFAULT 0,
+                heartbeat_at INTEGER, lease_expires_at INTEGER, quality_json TEXT);
+            CREATE TABLE run_events(event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL, seq INTEGER NOT NULL, event_type TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE(run_id,seq));",
+        )
+        .unwrap();
+        append_event(&conn, "c1", SessionEventType::ToolApproval, serde_json::json!({"tool": "git_push", "approved": true}), None).unwrap();
+        conn.execute(
+            "INSERT INTO agent_runs(run_id, conversation_id, goal, state, phase, started_at, updated_at)
+             VALUES('r1','c1','','running','execute',100,101)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO run_events VALUES('e1','r1','c1',1,'sandbox_started','{}',200)",
+            [],
+        ).unwrap();
+
+        let timeline = audit_timeline(&conn, "c1").unwrap();
+        assert_eq!(timeline.len(), 2);
+        // 两条来源的事件都进入统一时间线，且按 created_at 升序
+        let sources: Vec<&str> = timeline.iter().map(|e| e.source.as_str()).collect();
+        assert!(sources.contains(&"session") && sources.contains(&"run"));
+        let created: Vec<i64> = timeline.iter().map(|e| e.created_at).collect();
+        assert!(created.windows(2).all(|w| w[0] <= w[1]));
+        let session_ev = timeline.iter().find(|e| e.source == "session").unwrap();
+        assert_eq!(session_ev.event_type, "tool_approval");
+        let run_ev = timeline.iter().find(|e| e.source == "run").unwrap();
+        assert_eq!(run_ev.event_type, "sandbox_started");
+        assert_eq!(run_ev.run_id.as_deref(), Some("r1"));
+        // 会话隔离
+        assert!(audit_timeline(&conn, "c2").unwrap().is_empty());
     }
 
     #[test]

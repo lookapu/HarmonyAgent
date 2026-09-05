@@ -444,7 +444,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 交付：
 
 - [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、后端契约、Docker/Podman 运行时探测、fail-closed OCI argv、超时/取消清理、输出限制和审计事件，以及命令接线决策——`select_sandbox_target` 按偏好+探测 fail-closed 选择执行目标、宿主直跑显式标注风险；`run_command` 默认路由与 artifact 导出待 Docker 运行环境验证后接线）；
-- [ ] approval 与 sandbox escalation 进入统一事件和审计链（审批决议已写入 `session_events` 审计链——`ToolApproval` 事件可回放并进入 eval trajectory，与沙箱升级的 `runtime` 事件日志同属可审计事件流；二者进一步合并为单一审计链待做）；
+- [ ] approval 与 sandbox escalation 进入统一事件和审计链（审批决议已写入 `session_events`（`ToolApproval` 事件），沙箱升级在 `run_events`；`audit_timeline` 已把两者合并为一条按时间排序的统一审计时间线查询，审批/沙箱/工具调用同链可回放并进入 eval trajectory；写入侧进一步合并为单一事件日志待做）；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy（类型化窄能力 + 安全校验已落地为 `agent::capability_broker`——`HostCapability` 枚举覆盖 hdc 连接/断开/列表、install、deploy，`validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`；真实执行按 capability_id 接入 device_tools/build_tools 待真机）；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成；`repo_query` 路由 MVP 已完成——`auto` 按查询形态分流 `path/symbol/concept` 到 lexical/结构索引并标注 `source_layer`，避免在多个检索工具间猜测；影响面反查与依赖图重排的统一 planner 待完成）；
