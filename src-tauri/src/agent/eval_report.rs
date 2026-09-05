@@ -98,6 +98,28 @@ impl EvalReport {
     }
 }
 
+/// 一次 trial 的固定运行条件（docs/AGENT_EVAL_HARNESS.md §4 `manifest.json`）。
+/// 与 `EvalReport` 共享 harness/model/prompt/tool/task/sandbox 指纹，但不含 run/outcome，
+/// 是“跑之前”的不可变输入记录，供第三方复现同一运行条件。
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalManifest {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub created_at: String,
+    pub task: TaskInfo,
+    pub harness: HarnessInfo,
+    pub model: ModelInfo,
+    pub prompt: PromptInfo,
+    pub tool_registry: ToolRegistryInfo,
+    pub sandbox: SandboxInfo,
+}
+
+impl EvalManifest {
+    pub fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self).map_err(|error| format!("序列化 manifest 失败：{error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +217,26 @@ mod tests {
             matches!(status, "resolved" | "unresolved" | "harness_error" | "cancelled"),
             "未知 outcome 状态：{status}"
         );
+    }
+
+    #[test]
+    fn manifest_serializes_fixed_run_conditions_without_outcome() {
+        let manifest = EvalManifest {
+            schema_version: EVAL_REPORT_SCHEMA_VERSION,
+            run_id: "run-1".into(),
+            created_at: "2026-09-05T00:00:00Z".into(),
+            task: sample_report().task,
+            harness: sample_report().harness,
+            model: sample_report().model,
+            prompt: sample_report().prompt,
+            tool_registry: sample_report().tool_registry,
+            sandbox: sample_report().sandbox,
+        };
+        let json = manifest.to_json().unwrap();
+        for required in ["run_id", "task", "harness", "model", "prompt", "tool_registry", "sandbox"] {
+            assert!(json.contains(required), "缺少字段 {required}：{json}");
+        }
+        assert!(!json.contains("\"outcome\""), "manifest 不应包含 outcome：{json}");
+        assert!(!json.contains("\"run\""), "manifest 不应包含 run：{json}");
     }
 }

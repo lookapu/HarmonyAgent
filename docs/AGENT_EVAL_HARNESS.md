@@ -75,6 +75,8 @@ eval-runs/<run-id>/
 
 `manifest.json` 固定运行条件；`trajectory.jsonl` 保存事件流；`report.json` 只保存 grader 结论和派生指标。三者不得相互替代。
 
+`manifest.json` 与 `report.json` 已落地为 `agent::eval_report` 的 `EvalManifest` / `EvalReport` 类型；`trajectory.jsonl` 的事件 schema 待事件 sink 抽取后定义。
+
 ## 5. Report schema v1 必填字段
 
 - harness commit、应用版本、平台；
