@@ -773,7 +773,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "repo_query",
-        desc: "统一代码检索入口：按查询形态自动路由到结构索引或全库混合检索，并标注命中的 source_layer。\n参数：{\"query\":\"<查询词、符号名或文件路径>\",\"mode\":\"<可选 auto|symbol|path|concept，缺省 auto 自动判断>\",\"limit\":<可选返回条数，缺省 10>}。\n路由规则：含路径分隔符或文件扩展名 → lexical；单个标识符（函数/类名）→ 结构索引（LSP/SCIP/AST，返回 coverage/staleness）；其余自然语言 → 全库混合检索。\n适合不熟悉项目结构时的第一步定位，避免在 search_symbols/codebase_search/grep 之间猜测；需要更细控制（按 role/kind 过滤、分页、关系翻页）时再直接用对应工具。\n副作用：无（只读）。\n返回：路由说明 + 对应工具的检索结果。",
+        desc: "统一代码检索入口：按查询形态自动路由到结构索引或全库混合检索，并标注命中的 source_layer。\n参数：{\"query\":\"<查询词、符号名或文件路径>\",\"mode\":\"<可选 auto|symbol|path|concept|impact，缺省 auto 自动判断>\",\"limit\":<可选返回条数，缺省 10>}。\n路由规则：含路径分隔符或文件扩展名 → lexical；单个标识符（函数/类名）→ 结构索引（LSP/SCIP/AST，返回 coverage/staleness）；impact → 修改影响面（精确图反向依赖：谁引用了/调用了该符号）；其余自然语言 → 全库混合检索。\n适合不熟悉项目结构时的第一步定位，避免在 search_symbols/codebase_search/grep 之间猜测；需要更细控制（按 role/kind 过滤、分页、关系翻页）时再直接用对应工具。\n副作用：无（只读）。\n返回：路由说明 + 对应工具的检索结果。",
     },
     ToolSpec {
         name: "import_scip_index",
@@ -3662,6 +3662,23 @@ fn classify_repo_query(query: &str) -> &'static str {
     }
 }
 
+/// 反向依赖边：target 命中给定符号的边（即“谁引用了/调用了这些符号”），供影响面分析。
+fn incoming_relation_edges<'a>(
+    relations: &'a [crate::services::symbol_index::StructureEdge],
+    symbols: &[crate::services::symbol_index::Symbol],
+) -> Vec<&'a crate::services::symbol_index::StructureEdge> {
+    relations
+        .iter()
+        .filter(|edge| {
+            symbols.iter().any(|sym| {
+                sym.file == edge.target_file
+                    && sym.name == edge.target_name
+                    && sym.line == edge.target_line
+            })
+        })
+        .collect()
+}
+
 async fn repo_query_tool(args: &Value, roots: &[String]) -> Result<String, String> {
     let query = args["query"]
         .as_str()
@@ -3672,11 +3689,38 @@ async fn repo_query_tool(args: &Value, roots: &[String]) -> Result<String, Strin
     let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 50);
     let routed = match mode {
         "auto" => classify_repo_query(query),
-        "symbol" | "path" | "concept" => mode,
-        other => return Err(format!("repo_query mode 仅支持 auto|symbol|path|concept，收到 {other}")),
+        "symbol" | "path" | "concept" | "impact" => mode,
+        other => return Err(format!("repo_query mode 仅支持 auto|symbol|path|concept|impact，收到 {other}")),
     };
     let delegate = serde_json::json!({ "query": query, "limit": limit });
     match routed {
+        "impact" => {
+            let project_path = roots.first().map(String::as_str).unwrap_or("");
+            if project_path.is_empty() {
+                return Err("当前会话未绑定项目目录".into());
+            }
+            let root = Path::new(project_path).to_path_buf();
+            let result = crate::services::symbol_index::query_structure(
+                &root, query, None, None, None, 1, 50,
+            );
+            let incoming = incoming_relation_edges(&result.relations, &result.items);
+            if incoming.is_empty() {
+                return Ok(format!(
+                    "修改影响面：精确语义图（SCIP/LSP/AST）中没有引用/调用 \"{query}\" 的反向依赖。"
+                ));
+            }
+            let mut out = format!("修改影响面：{} 处引用/调用 \"{query}\"（改动会波及，source_layer 精确图）：\n", incoming.len());
+            for edge in incoming.iter().take(limit as usize) {
+                out.push_str(&format!(
+                    "- {} ({}:{}) → {}\n",
+                    edge.source_name, edge.source_file, edge.source_line, edge.kind
+                ));
+            }
+            if result.relations_truncated {
+                out.push_str("（关系超过单次上限，结果可能不完整）\n");
+            }
+            Ok(out)
+        }
         "symbol" => {
             let inner = search_symbols_tool(&delegate, roots).await?;
             Ok(format!(
@@ -4724,6 +4768,51 @@ mod tests {
         assert_eq!(classify_repo_query("支付流程在哪里实现"), "concept");
         assert_eq!(classify_repo_query("how is auth implemented"), "concept");
         assert_eq!(classify_repo_query("error E1001"), "concept");
+    }
+
+    #[test]
+    fn incoming_relation_edges_filters_to_target_matches() {
+        use crate::services::symbol_index::{StructureEdge, Symbol};
+        let sym = |name: &str, file: &str| Symbol {
+            kind: "function".into(),
+            name: name.into(),
+            file: file.into(),
+            line: 1,
+            end_line: 1,
+            role: "logic".into(),
+            signature: String::new(),
+            parent: None,
+            language: "ts".into(),
+            source_layer: "tree_sitter".into(),
+            declared_relations: vec![],
+        };
+        let target = sym("fetch", "target.ts");
+        let edge_incoming = StructureEdge {
+            kind: "calls".into(),
+            source_file: "source.ts".into(),
+            source_name: "caller".into(),
+            source_line: 1,
+            target_file: "target.ts".into(),
+            target_name: "fetch".into(),
+            target_line: 1,
+            target_module: None,
+            target_imported_name: None,
+        };
+        let edge_outgoing = StructureEdge {
+            kind: "calls".into(),
+            source_file: "target.ts".into(),
+            source_name: "fetch".into(),
+            source_line: 1,
+            target_file: "other.ts".into(),
+            target_name: "x".into(),
+            target_line: 1,
+            target_module: None,
+            target_imported_name: None,
+        };
+        let relations = vec![edge_incoming, edge_outgoing];
+        let incoming = incoming_relation_edges(&relations, &[target]);
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_name, "caller");
     }
 
     #[test]
