@@ -443,7 +443,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 交付：
 
-- [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、后端契约、Docker/Podman 运行时探测、fail-closed OCI argv、超时/取消清理、输出限制和审计事件，以及命令接线决策——`select_sandbox_target` 按偏好+探测 fail-closed 选择执行目标、宿主直跑显式标注风险；`run_command` 默认路由与 artifact 导出待 Docker 运行环境验证后接线）；
+- [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、后端契约、Docker/Podman 运行时探测、fail-closed OCI argv、超时/取消清理、输出限制和审计事件，以及命令接线——`select_sandbox_target`/`resolve_sandbox_target` 按 `HARMONY_SANDBOX_BACKEND`/`HARMONY_SANDBOX_IMAGE` 环境配置 fail-closed 选择执行目标，`run_command` 已接入 `OciBackend::run`（显式配置时容器内执行、缺镜像/运行时不可用即失败关闭），宿主直跑持续显示风险标注；Docker 运行环境下的端到端验证、artifact 导出与把沙箱设为默认值待做）；
 - [ ] approval 与 sandbox escalation 进入统一事件和审计链（审批决议已写入 `session_events`（`ToolApproval` 事件），沙箱升级在 `run_events`；`audit_timeline` 已把两者合并为一条按时间排序的统一审计时间线查询，审批/沙箱/工具调用同链可回放并进入 eval trajectory；写入侧进一步合并为单一事件日志待做）；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy（类型化窄能力 + 安全校验已落地为 `agent::capability_broker`——`HostCapability` 枚举覆盖 hdc 连接/断开/列表、install、deploy，`validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`；真实执行按 capability_id 接入 device_tools/build_tools 待真机）；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；

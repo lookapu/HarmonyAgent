@@ -382,6 +382,48 @@ pub fn select_sandbox_target(
     }
 }
 
+/// 沙箱运行配置：从环境变量读取。缺省宿主直跑（显式兼容模式，非安全默认）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SandboxConfig {
+    /// None = 宿主直跑（缺省）；Some = 显式请求的 OCI 引擎。
+    pub backend: Option<OciEngine>,
+    /// OCI 后端所需镜像（固定 digest 形式）；未配置时 OCI 请求失败关闭。
+    pub image: Option<String>,
+}
+
+/// 从 `HARMONY_SANDBOX_BACKEND`（oci-docker|oci-podman）与 `HARMONY_SANDBOX_IMAGE` 读取配置。
+pub fn sandbox_config_from_env() -> SandboxConfig {
+    let backend = match std::env::var("HARMONY_SANDBOX_BACKEND").as_deref() {
+        Ok("oci-docker") => Some(OciEngine::Docker),
+        Ok("oci-podman") => Some(OciEngine::Podman),
+        _ => None,
+    };
+    let image = std::env::var("HARMONY_SANDBOX_IMAGE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    SandboxConfig { backend, image }
+}
+
+/// 把 sandbox 配置解析为执行目标：缺省宿主直跑；请求 OCI 但缺镜像或运行时不可用时失败关闭。
+pub fn resolve_sandbox_target(
+    config: &SandboxConfig,
+    probe: &SandboxCapabilities,
+) -> Result<SandboxExecutionTarget, String> {
+    match config.backend {
+        None => Ok(SandboxExecutionTarget::HostDirect),
+        Some(engine) => {
+            if config.image.is_none() {
+                return Err(format!(
+                    "sandbox 镜像未配置：请求了 {} 沙箱但未设置 HARMONY_SANDBOX_IMAGE；已失败关闭，未回退宿主执行",
+                    engine.program()
+                ));
+            }
+            select_sandbox_target(SandboxBackendPreference::Oci(engine), probe)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxRunStatus {
@@ -719,6 +761,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(mismatched.contains("sandbox_unavailable"), "{mismatched}");
+    }
+
+    #[test]
+    fn resolve_sandbox_target_defaults_to_host_direct_and_fails_closed_on_oci() {
+        // 缺省：无后端 → 宿主直跑
+        let target = resolve_sandbox_target(&SandboxConfig::default(), &available_probe(OciEngine::Docker)).unwrap();
+        assert_eq!(target, SandboxExecutionTarget::HostDirect);
+
+        // 请求 OCI 但缺镜像 → 失败关闭
+        let err = resolve_sandbox_target(
+            &SandboxConfig { backend: Some(OciEngine::Docker), image: None },
+            &available_probe(OciEngine::Docker),
+        )
+        .unwrap_err();
+        assert!(err.contains("镜像未配置"), "{err}");
+
+        // 请求 OCI + 镜像 + 运行时可用 → Oci
+        let target = resolve_sandbox_target(
+            &SandboxConfig { backend: Some(OciEngine::Docker), image: Some("img@sha256:".into()) },
+            &available_probe(OciEngine::Docker),
+        )
+        .unwrap();
+        assert!(target.is_isolated());
     }
 
     #[test]

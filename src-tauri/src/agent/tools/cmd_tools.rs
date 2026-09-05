@@ -287,6 +287,41 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
             cwd.display()
         ));
     }
+    // 沙箱命令接线（路线 5.3）：显式配置 OCI 后端时在容器内执行；缺省仍宿主直跑（下方持续显示风险）。
+    let sandbox_config = crate::agent::sandbox::sandbox_config_from_env();
+    if let Some(engine) = sandbox_config.backend {
+        let image = sandbox_config.image.as_deref().ok_or_else(|| {
+            "sandbox 镜像未配置：设置了 HARMONY_SANDBOX_BACKEND 但未设置 HARMONY_SANDBOX_IMAGE".to_string()
+        })?;
+        let probe = crate::agent::sandbox::OciBackend::new(engine).probe().await;
+        let target = crate::agent::sandbox::resolve_sandbox_target(&sandbox_config, &probe)?;
+        let crate::agent::sandbox::SandboxExecutionTarget::Oci(backend) = target else {
+            return Err("sandbox 路由内部错误：OCI 请求未解析为 OCI 目标".into());
+        };
+        let command_vec = if cfg!(windows) {
+            vec!["cmd".to_string(), "/C".to_string(), command.to_string()]
+        } else {
+            vec!["sh".to_string(), "-c".to_string(), command.to_string()]
+        };
+        let spec = crate::agent::sandbox::SandboxSpec::workspace_write(cwd.to_path_buf());
+        let execution_id = format!("run-{}", uuid::Uuid::new_v4());
+        let result = backend.run(&spec, &execution_id, image, &command_vec, ctx).await?;
+        return match result.status {
+            crate::agent::sandbox::SandboxRunStatus::Succeeded => Ok(format!(
+                "[sandbox:{}] {}{}",
+                result.backend,
+                result.stdout,
+                if result.stderr.is_empty() { String::new() } else { format!("\n{}", result.stderr) }
+            )),
+            _ => Err(format!(
+                "[sandbox:{}] 命令失败（{:?}，exit={:?}）：{}",
+                result.backend,
+                result.status,
+                result.exit_code,
+                if result.stderr.is_empty() { &result.stdout } else { &result.stderr }
+            )),
+        };
+    }
     // 间接修改追踪：记录命令开始时间，执行后扫描工作区内变更文件（排除构建产物目录）
     let cmd_start = std::time::SystemTime::now();
     // shell 语法（&&、||、引号外的 | > < &）经系统 shell 执行（Windows: cmd /C；
