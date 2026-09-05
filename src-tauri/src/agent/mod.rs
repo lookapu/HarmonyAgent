@@ -28,6 +28,7 @@ pub mod tool_ranking;
 pub mod versioning;
 pub mod verification_planner;
 pub mod crash;
+pub mod capability_broker;
 pub mod runtime_log;
 pub mod runtime;
 pub mod exec_ctx;
