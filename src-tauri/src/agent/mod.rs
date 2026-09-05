@@ -16,6 +16,7 @@ pub mod eval_trajectory;
 pub mod eval_grader;
 pub mod eval_patch;
 pub mod eval_workspace;
+pub mod eval_runner;
 pub mod enterprise;
 pub mod execution_loop;
 pub mod scheduler;
