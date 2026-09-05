@@ -3679,6 +3679,34 @@ fn incoming_relation_edges<'a>(
         .collect()
 }
 
+/// 测试映射：按主流约定（`*.test.*`、`*.spec.*`、`__tests__/`、`test/`）给出源文件的候选测试文件。
+fn candidate_test_files(file: &str) -> Vec<String> {
+    let path = Path::new(file);
+    let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let base = |name: &str| {
+        if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        }
+    };
+    let mut out = vec![
+        base(&format!("{stem}.test.{ext}")),
+        base(&format!("{stem}.spec.{ext}")),
+        if parent.is_empty() {
+            format!("__tests__/{stem}.{ext}")
+        } else {
+            format!("{parent}/__tests__/{stem}.{ext}")
+        },
+        format!("test/{stem}.{ext}"),
+    ];
+    out.sort();
+    out.dedup();
+    out
+}
+
 async fn repo_query_tool(args: &Value, roots: &[String]) -> Result<String, String> {
     let query = args["query"]
         .as_str()
@@ -3718,6 +3746,19 @@ async fn repo_query_tool(args: &Value, roots: &[String]) -> Result<String, Strin
             }
             if result.relations_truncated {
                 out.push_str("（关系超过单次上限，结果可能不完整）\n");
+            }
+            // 测试映射：给出源文件对应的候选测试文件（主流命名约定）。
+            let mut test_files = Vec::new();
+            for sym in &result.items {
+                test_files.extend(candidate_test_files(&sym.file));
+            }
+            test_files.sort();
+            test_files.dedup();
+            if !test_files.is_empty() {
+                out.push_str(&format!("\n相关测试文件（候选 {} 个，命中与否以实际存在为准）：\n", test_files.len()));
+                for file in test_files.iter().take(limit as usize) {
+                    out.push_str(&format!("- {file}\n"));
+                }
             }
             Ok(out)
         }
@@ -4813,6 +4854,19 @@ mod tests {
         let incoming = incoming_relation_edges(&relations, &[target]);
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].source_name, "caller");
+    }
+
+    #[test]
+    fn candidate_test_files_follows_mainstream_conventions() {
+        let files = candidate_test_files("src/pages/Index.ets");
+        assert!(files.contains(&"src/pages/Index.test.ets".to_string()));
+        assert!(files.contains(&"src/pages/Index.spec.ets".to_string()));
+        assert!(files.contains(&"src/pages/__tests__/Index.ets".to_string()));
+        assert!(files.contains(&"test/Index.ets".to_string()));
+        // 顶层文件不产生带前导斜杠的路径
+        let top = candidate_test_files("App.ets");
+        assert!(top.iter().all(|f| !f.starts_with('/')));
+        assert!(top.contains(&"__tests__/App.ets".to_string()));
     }
 
     #[test]
