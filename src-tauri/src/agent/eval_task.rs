@@ -143,6 +143,14 @@ fn validate_grader(grader: &EvalGrader) -> Result<(), String> {
     if grader.command.is_empty() || grader.command.len() > 64 {
         return Err("grader.command 必须是非空且不超过 64 个令牌的列表".into());
     }
+    // 拒绝把 shell 解释器当作 grader 程序：`sh -c <脚本>` 会让任务文件里的任意字符串
+    // 以宿主命令身份执行。grader 只接受直接程序 + 固定 argv（如 npm test）。
+    if is_shell_interpreter(&grader.command[0]) {
+        return Err(format!(
+            "grader.command 不得以 shell 解释器开头（收到 {}）；请使用直接程序 + 固定参数",
+            grader.command[0]
+        ));
+    }
     for token in &grader.command {
         // 拒绝 shell 元字符、绝对路径、上级路径与命令替换，防止把不可信任务里的字符串直接交给宿主 shell。
         let unsafe_char = |c: char| {
@@ -165,6 +173,14 @@ fn validate_grader(grader: &EvalGrader) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn is_shell_interpreter(program: &str) -> bool {
+    let base = program.rsplit('/').next().unwrap_or(program).to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "cmd" | "cmd.exe" | "powershell" | "pwsh"
+    )
 }
 
 fn is_safe_id(value: &str) -> bool {
