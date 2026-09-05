@@ -414,7 +414,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [ ] approval 与 sandbox escalation 进入统一事件和审计链；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；
-- [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成，统一 planner 待完成）；
+- [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成；`repo_query` 路由 MVP 已完成——`auto` 按查询形态分流 `path/symbol/concept` 到 lexical/结构索引并标注 `source_layer`，避免在多个检索工具间猜测；影响面反查与依赖图重排的统一 planner 待完成）；
 - [ ] 每周真实模型回归，保存 patch/trajectory/cost/report。
 
 退出门槛：恶意仓库脚本不能读取工作区外文件或联网；100k 文件仓库满足校准后的 P95 指标；真实模型评测可重复。

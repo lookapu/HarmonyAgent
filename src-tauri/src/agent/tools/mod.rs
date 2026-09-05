@@ -182,6 +182,7 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("conversation_search", "explore"),
     ("search_sdk_api", "explore"),
     ("search_symbols", "explore"),
+    ("repo_query", "explore"),
     ("import_scip_index", "explore"),
     ("stack_dump", "explore"),
     ("tool_help", "explore"),
@@ -770,6 +771,10 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"relations_cursor\":\"<可选，原样传回关系结果的 relations_next_cursor 读取下一页关系>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；热点符号关系超过单次上限时返回 relations_next_cursor 供翻页；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
     },
     ToolSpec {
+        name: "repo_query",
+        desc: "统一代码检索入口：按查询形态自动路由到结构索引或全库混合检索，并标注命中的 source_layer。\n参数：{\"query\":\"<查询词、符号名或文件路径>\",\"mode\":\"<可选 auto|symbol|path|concept，缺省 auto 自动判断>\",\"limit\":<可选返回条数，缺省 10>}。\n路由规则：含路径分隔符或文件扩展名 → lexical；单个标识符（函数/类名）→ 结构索引（LSP/SCIP/AST，返回 coverage/staleness）；其余自然语言 → 全库混合检索。\n适合不熟悉项目结构时的第一步定位，避免在 search_symbols/codebase_search/grep 之间猜测；需要更细控制（按 role/kind 过滤、分页、关系翻页）时再直接用对应工具。\n副作用：无（只读）。\n返回：路由说明 + 对应工具的检索结果。",
+    },
+    ToolSpec {
         name: "import_scip_index",
         desc: "导入编译器生成的 SCIP 精确代码导航索引，把跨语言定义/引用接入全局结构图；适合百万级仓库避免逐文件全文读取。\n参数：{\"path\":\"<可选 SCIP 文件路径，缺省项目根 index.scip；必须位于项目目录内>\"}。\n导入按 document 流式读取且内存有界；新代次完整成功后才原子切换，文件变化时陈旧引用自动失效，重复导入未变化索引会直接复用。\n副作用：只更新 .deveco-agent 外部缓存目录中的结构索引，不修改项目源码。\n返回：文档、定义、引用、已解析引用及忽略文档数量。",
     },
@@ -1316,6 +1321,7 @@ pub async fn run_tool(
         "read_module_config" => read_module_config(&args, &roots).await,
         "get_build_log" => get_build_log(&args, &roots).await,
         "search_symbols" => search_symbols_tool(&args, &roots).await,
+        "repo_query" => repo_query_tool(&args, &roots).await,
         "import_scip_index" => import_scip_index_tool(&args, &roots).await,
         "delete_file" => fs_tools::delete_file(&args, &roots).await,
         "git_stash" => git_tools::git_stash(&args, &roots).await,
@@ -3619,6 +3625,66 @@ async fn read_module_config(args: &Value, roots: &[String]) -> Result<String, St
     Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
 }
 
+/// `repo_query` 的 auto 路由分类：把查询词归到 path/symbol/concept 三类之一，
+/// 让模型不必在 grep_files/codebase_search/search_symbols 之间手工猜测。
+fn classify_repo_query(query: &str) -> &'static str {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return "concept";
+    }
+    let looks_like_path = trimmed.contains('/')
+        || trimmed.contains('\\')
+        || [
+            ".ts", ".tsx", ".ets", ".js", ".jsx", ".json5", ".json", ".rs", ".py", ".kt", ".java",
+            ".cpp", ".c", ".h", ".hpp",
+        ]
+        .iter()
+        .any(|ext| trimmed.ends_with(ext));
+    if looks_like_path {
+        return "path";
+    }
+    let is_identifier = !trimmed.contains(char::is_whitespace)
+        && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$');
+    if is_identifier {
+        "symbol"
+    } else {
+        "concept"
+    }
+}
+
+async fn repo_query_tool(args: &Value, roots: &[String]) -> Result<String, String> {
+    let query = args["query"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("repo_query 需要参数 {\"query\":\"<查询词、符号名或文件路径>\"}")?;
+    let mode = args["mode"].as_str().unwrap_or("auto");
+    let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 50);
+    let routed = match mode {
+        "auto" => classify_repo_query(query),
+        "symbol" | "path" | "concept" => mode,
+        other => return Err(format!("repo_query mode 仅支持 auto|symbol|path|concept，收到 {other}")),
+    };
+    let delegate = serde_json::json!({ "query": query, "limit": limit });
+    match routed {
+        "symbol" => {
+            let inner = search_symbols_tool(&delegate, roots).await?;
+            Ok(format!(
+                "repo_query 路由 → 结构索引（source_layer=ast/lsp/scip，附 coverage/staleness）：\n{inner}"
+            ))
+        }
+        _ => {
+            let inner = cmd_tools::codebase_search_tool(&delegate, roots).await?;
+            Ok(format!(
+                "repo_query 路由 → 全库混合检索（source_layer=lexical，路径/内容/符号名匹配）：\n{inner}"
+            ))
+        }
+    }
+}
 
 async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
@@ -4638,6 +4704,21 @@ pub(crate) fn smart_decode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_query_classifies_path_symbol_concept() {
+        assert_eq!(classify_repo_query(""), "concept");
+        assert_eq!(classify_repo_query("src/components/Button.ets"), "path");
+        assert_eq!(classify_repo_query("model\\Book.ts"), "path");
+        assert_eq!(classify_repo_query("app.json5"), "path");
+        assert_eq!(classify_repo_query("fetchData"), "symbol");
+        assert_eq!(classify_repo_query("_private_method"), "symbol");
+        assert_eq!(classify_repo_query("$store"), "symbol");
+        assert_eq!(classify_repo_query("load"), "symbol");
+        assert_eq!(classify_repo_query("支付流程在哪里实现"), "concept");
+        assert_eq!(classify_repo_query("how is auth implemented"), "concept");
+        assert_eq!(classify_repo_query("error E1001"), "concept");
+    }
 
     #[test]
     fn outline_detects_arkts_structures() {
