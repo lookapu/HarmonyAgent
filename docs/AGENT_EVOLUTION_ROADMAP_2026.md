@@ -5,6 +5,31 @@
 > 基线版本：`main` / `v2.1.1` / `8d7443e`  
 > 目标：把外部评价转化为可验证的产品与工程路线，而不是继续堆叠功能清单。
 
+## 0. 当前进度快照（2026-09-05）
+
+下面按“已落地并验证 / 部分落地 / 需外部基础设施”三类标注当前状态；每类的具体证据见对应章节与 [INDEX_SCALE_BASELINE.md](./INDEX_SCALE_BASELINE.md)。这里不把“单测通过”冒充“产品能力完成”。
+
+**已落地并通过测试/基准验证**
+
+- 路线 B 核心检索：全库 SQLite 目录、keyset 游标查询、原生 watcher 与 Git diff 修复；`MAX_FILES=4000` 降级为首批解析预算，其余以 `deferred` 状态入目录。
+- SCIP 精确引用：流式导入官方 protobuf、独立精确引用层、文件指纹失效、跨进程导入锁、外部覆盖检测、原子代次切换；`ForwardDefinition` 前向声明按定义位置处理。
+- 热点符号关系：单次 500 条预算 + `relations_cursor` 统一 keyset 分页；关系查询 P50/P95 基准显示 5k→1M 引用第一页 P50 稳定约 3.6 ms。
+- 统一检索入口：`repo_query` 按 `path/symbol/concept` 自动分流并标注 `source_layer`。
+- 文案与事实基线：`sandbox_exec` 改称“临时副本试运行”、`SECURITY_BOUNDARY.md`、README 下载/平台限制、10k/100k/1M 基准生成器。
+
+**部分落地（契约/探测/语法层就绪，接线或验收待完成）**
+
+- `SandboxBackend`/`SandboxSpec`、Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件——真实命令接线与 artifact 导出待完成。
+- Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
+- ArkTS LSP 语义层与 `repo_query` 路由 MVP——影响面反查、依赖图重排的统一 planner 待完成。
+
+**需外部基础设施（本仓库环境无法完成，需 Docker/真实模型/官方 harness/签名证书）**
+
+- 真实 OCI 沙箱接线 + 恶意脚本逃逸套件（需可运行容器运行时）。
+- SWE-bench Verified 25/100、SWE-Explore、HarmonyBench v0、真实模型回归（需真实模型与官方数据集/harness）。
+- file/line Recall@5/20（需真实语料与相关性标注，合成语料无意义）。
+- Release 签名、SBOM、provenance、新 VM smoke test（需签名证书与 CI 环境）。
+
 ## 1. 先给结论
 
 外部评价有价值，但四条里只有两条半成立：
