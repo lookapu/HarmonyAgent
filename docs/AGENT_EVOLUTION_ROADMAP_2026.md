@@ -14,10 +14,12 @@
 - 路线 B 核心检索：全库 SQLite 目录、keyset 游标查询、原生 watcher 与 Git diff 修复；`MAX_FILES=4000` 降级为首批解析预算，其余以 `deferred` 状态入目录。
 - SCIP 精确引用：流式导入官方 protobuf、独立精确引用层、文件指纹失效、跨进程导入锁、外部覆盖检测、原子代次切换；`ForwardDefinition` 前向声明按定义位置处理。
 - 热点符号关系：单次 500 条预算 + `relations_cursor` 统一 keyset 分页；关系查询 P50/P95 基准显示 5k→1M 引用第一页 P50 稳定约 3.6 ms。
-- 统一检索入口：`repo_query` 按 `path/symbol/concept` 自动分流并标注 `source_layer`。
+- 统一检索入口：`repo_query` 按 `path/symbol/concept` 自动分流并标注 `source_layer`；`search_tools` 按 query 发现工具（`detail=name|summary`）。
 - 沙箱命令接线决策：`select_sandbox_target` 按后端偏好 + 运行时探测 fail-closed 选择 OCI/宿主直跑，宿主直跑显式标注风险（`agent::sandbox`）。
-- headless eval harness 数据契约：task schema v1 + 安全校验、`manifest`/`report`/`trajectory` 类型与 JSON 落盘、`command grader`（退出码判定 + 超时 + 拒绝 shell 解释器），trajectory 复用 `session_events` 事件源（`agent::eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）。
-- 文案与事实基线：`sandbox_exec` 改称“临时副本试运行”、`SECURITY_BOUNDARY.md`、README 下载/平台限制、10k/100k/1M 基准生成器。
+- 审批审计：`resolve_tool_approval` 决议写入 `session_events`（`ToolApproval` 事件），与沙箱升级/工具调用同源可回放并进入 eval trajectory。
+- Host Capability Broker 原型：`HostCapability` 类型化窄能力（hdc 连接/断开/列表、install、deploy）+ `validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`（`agent::capability_broker`）。
+- headless eval harness：task schema v1 + 安全校验、`manifest`/`report`/`trajectory` 数据契约、`command grader`、补丁采集/应用、工作树准备、`run_trial` 编排（`AgentDriver` 可注入 trait，桩端到端验证），trajectory 复用 `session_events` 事件源（`agent::eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`/`eval_patch`/`eval_workspace`/`eval_runner`，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）。
+- 文案与事实基线：`sandbox_exec` 改称“临时副本试运行”、`SECURITY_BOUNDARY.md`、README 下载/平台限制（已修正 Linux 过度承诺）、10k/100k/1M 基准生成器。
 
 **部分落地（契约/探测/语法层就绪，接线或验收待完成）**
 
@@ -26,9 +28,12 @@
 - ArkTS LSP 语义层与 `repo_query` 路由 MVP——影响面反查、依赖图重排的统一 planner 待完成。
 - headless eval harness——数据契约/grader/补丁采集/工作树准备已落地，`eval run` runner（需从 12k 行 UI 耦合的 `commands/chat.rs` 抽取 headless 驱动核心）与真实模型 end-to-end 样例待实现。
 
-**需外部基础设施（本仓库环境无法完成，需 Docker/真实模型/官方 harness/签名证书）**
+**需外部基础设施（本仓库环境无法完成，需 Docker/真机/真实模型/官方 harness/签名证书）**
 
 - 真实 OCI 沙箱接线 + 恶意脚本逃逸套件（需可运行容器运行时）。
+- Host Capability Broker 真实执行接入 `device_tools`/`build_tools`（需真机/模拟器验证）。
+- 审批与沙箱升级的单一审计链合并（`session_events` 与 `runtime` 事件日志统一，需跨模块治理改造）。
+- 真实 headless `AgentDriver`（`stream_chat` 12k 行 headless 抽取）+ `eval run` CLI + CI artifact（需真实模型端到端验证）。
 - SWE-bench Verified 25/100、SWE-Explore、HarmonyBench v0、真实模型回归（需真实模型与官方数据集/harness）。
 - file/line Recall@5/20（需真实语料与相关性标注，合成语料无意义）。
 - Release 签名、SBOM、provenance、新 VM smoke test（需签名证书与 CI 环境）。
