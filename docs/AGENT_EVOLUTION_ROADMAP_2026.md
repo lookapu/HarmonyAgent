@@ -424,7 +424,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 - [x] 把当前 `sandbox_exec` 在 UI/文档中改称“临时副本试运行”，消除错误安全承诺；
 - [x] 写 `SECURITY_BOUNDARY.md`：明确宿主、工作区、网络、凭据和 MCP 边界；
-- [ ] 完成 headless eval adapter 设计与一个真实模型 end-to-end 样例（接口设计已完成，真实 runner/样例待实现）；
+- [ ] 完成 headless eval adapter 设计与一个真实模型 end-to-end 样例（接口设计已完成；task schema v1 与安全校验器已完成——`agent::eval_task` 拒绝携带宿主命令/绝对路径/凭据/联网的可信任务，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)；真实 runner、事件 sink 抽取与 end-to-end 样例待实现）；
 - [ ] 固定 SWE-bench Verified 25 题 smoke 子集；
 - [x] 建立 10k/100k/1M 文件索引基准生成器，并记录 10k 当前基线；
 - [x] 更新 README：二进制下载、支持平台和当前限制。
