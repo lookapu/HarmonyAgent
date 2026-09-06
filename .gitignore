@@ -81,3 +81,6 @@ docs/PITFALLS.private.md
 .workbuddy/
 /=ro
 
+# 本地生成的 Tauri 签名密码记录（仅本机保留，勿提交）
+signer_pass.tmp
+
