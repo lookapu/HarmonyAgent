@@ -15,7 +15,10 @@ use crate::agent::eval_report::{
 use crate::agent::eval_trajectory::{TrajectoryEvent, TrajectoryWriter};
 use crate::agent::eval_workspace::{collect_artifacts, prepare_worktree};
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 use std::time::Instant;
 
 pub const OUTCOME_RESOLVED: &str = "resolved";
@@ -49,7 +52,8 @@ pub trait AgentDriver: Send + Sync {
 }
 
 /// 真实驱动必须返回可审计的资源计量与事件，不允许 runner 从最终文本猜测。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AgentDriverOutcome {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -61,6 +65,58 @@ pub struct AgentDriverOutcome {
     pub trajectory: Vec<TrajectoryEvent>,
     pub failure_taxonomy: Vec<String>,
     pub policy_violations: u64,
+}
+
+/// 通过受信任的本地 adapter 接入真实 Agent。任务 JSON 只经 stdin 传递，工作树通过
+/// current_dir 约束；adapter stdout 必须只包含 `AgentDriverOutcome` JSON。
+pub struct ProcessAgentDriver {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub timeout: Duration,
+}
+
+impl AgentDriver for ProcessAgentDriver {
+    fn run(&self, task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError> {
+        if !self.program.is_absolute() || !self.program.is_file() {
+            return Err(AgentDriverError::Failed("driver program 必须是存在的绝对文件路径".into()));
+        }
+        let mut child = Command::new(&self.program)
+            .args(&self.args)
+            .current_dir(workspace)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().map_err(|e| AgentDriverError::Failed(format!("启动 driver 失败：{e}")))?;
+        let request = serde_json::to_vec(task)
+            .map_err(|e| AgentDriverError::Failed(format!("序列化 driver 请求失败：{e}")))?;
+        child.stdin.take().ok_or_else(|| AgentDriverError::Failed("driver stdin 不可用".into()))?
+            .write_all(&request).map_err(|e| AgentDriverError::Failed(format!("写入 driver stdin 失败：{e}")))?;
+        let mut stdout = child.stdout.take().ok_or_else(|| AgentDriverError::Failed("driver stdout 不可用".into()))?;
+        let mut stderr = child.stderr.take().ok_or_else(|| AgentDriverError::Failed("driver stderr 不可用".into()))?;
+        let stdout_reader = std::thread::spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
+        let stderr_reader = std::thread::spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < self.timeout => std::thread::sleep(Duration::from_millis(25)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(AgentDriverError::Cancelled("driver 超过 wall time，已终止".into()));
+                }
+                Err(e) => return Err(AgentDriverError::Failed(format!("等待 driver 失败：{e}"))),
+            }
+        };
+        let stdout = stdout_reader.join().map_err(|_| AgentDriverError::Failed("driver stdout reader panic".into()))?
+            .map_err(|e| AgentDriverError::Failed(format!("读取 driver stdout 失败：{e}")))?;
+        let stderr = stderr_reader.join().map_err(|_| AgentDriverError::Failed("driver stderr reader panic".into()))?
+            .map_err(|e| AgentDriverError::Failed(format!("读取 driver stderr 失败：{e}")))?;
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
+            return Err(AgentDriverError::Failed(format!("driver 退出码 {:?}：{}", status.code(), stderr.trim())));
+        }
+        serde_json::from_slice(&stdout)
+            .map_err(|e| AgentDriverError::Failed(format!("driver stdout 不是 AgentDriverOutcome JSON：{e}")))
+    }
 }
 
 /// 一次 eval 的不可变运行条件。调用方必须显式提供真实指纹，runner 不填伪造默认值。
@@ -538,6 +594,27 @@ mod tests {
             fs::remove_dir_all(source).ok();
             fs::remove_dir_all(output_dir).ok();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_driver_uses_stdin_cwd_and_structured_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = std::env::temp_dir().join(format!("deveco-process-driver-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace).unwrap();
+        let program = workspace.join("driver.sh");
+        fs::write(&program, "#!/bin/sh\nread request\nprintf '%s' \"$request\" > received-task.json\nprintf '{\"steps\":2,\"tool_calls\":1}'\n").unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&program, permissions).unwrap();
+        let task = task_with_grader(vec!["true"]);
+        let outcome = ProcessAgentDriver { program, args: vec![], timeout: Duration::from_secs(2) }
+            .run(&task, &workspace).unwrap();
+        assert_eq!(outcome.steps, 2);
+        assert_eq!(outcome.tool_calls, 1);
+        let received: serde_json::Value = serde_json::from_str(&fs::read_to_string(workspace.join("received-task.json")).unwrap()).unwrap();
+        assert_eq!(received["task_id"], task.task_id);
+        fs::remove_dir_all(workspace).ok();
     }
 
     #[test]

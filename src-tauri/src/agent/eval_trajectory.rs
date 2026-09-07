@@ -4,13 +4,13 @@
 //! 供 `report.json` 的 `trajectory_digest` 引用。事件源（AgentEventSink）待抽取后接入，
 //! 但信封与落盘契约先固定，避免 sink 落地时再改 schema。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrajectoryEvent {
     /// RFC 3339 或 unix 秒；由调用方写入，保证跨进程可排序。
     pub ts: String,

@@ -134,6 +134,8 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 
 可以替换：UI event sink、Provider 配置来源、workspace provisioner、sandbox backend、grader adapter 和 artifact sink。
 
+真实驱动接入已定义 `ProcessAgentDriver` 适配协议：受信任的本地 adapter 以 Agent 工作树为当前目录，从 stdin 接收完整 `EvalTask` JSON，并在 stdout 返回 `AgentDriverOutcome` JSON；诊断写 stderr。runner 负责 wall-time 终止、退出码判定和失败/取消评测包收敛。该协议允许先接外部 Provider adapter，之后再把同一接口替换为内置 headless loop。
+
 不能把 `simulate_scenario` 扩展成假的真实模型评测；确定性 fixture 与真实 trial 必须使用不同 suite 类型和报告字段。
 
 ## 10. 首个实现切片
