@@ -95,6 +95,9 @@ eval-runs/<run-id>/
 
 `manifest.json`、`trajectory.jsonl`、`report.json` 已分别落地为 `agent::eval_report` 的 `EvalManifest`/`EvalReport` 与 `agent::eval_trajectory` 的 `TrajectoryWriter`（统一事件信封 + JSONL 落盘 + 边写边算 SHA-256）。`run_trial` 已是原生异步主路径，并把驱动返回的真实计量与事件写入评测包；builtin headless 驱动通过 `SessionTrajectorySink` 同步生成 session event 与 trajectory，不从最终文本反推轨迹。外部进程 adapter 被放入 blocking worker，不阻塞异步 runtime。
 
+builtin trial 使用完整迁移后的私有 SQLite，并为 project/conversation/trace 建立独立作用域；
+实际工具调用写入 `tool_runs`，结尾通过统一 `tool_metrics` 口径把成功率、错误率、超时率和耗时摘要追加到 trajectory。策略拒绝不会伪装成实际工具执行，而是单独计入 `policy_violations` 和 `tool_rejected` 事件。
+
 runner 要求调用方显式提供 harness/model/prompt/tool/sandbox 指纹，拒绝用空值生成看似可复现的报告；manifest 还记录规范化 task JSON 的 SHA-256，防止相同 task id 下题目内容被静默替换。`repo.subdir` 会同时约束 Agent 工作目录、grader 工作目录与声明产物根，而补丁仍从完整仓库根采集。
 
 ## 5. Report schema v1 必填字段

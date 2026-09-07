@@ -278,6 +278,11 @@ builtin 当前已通过 `HeadlessToolPolicy` 对 allowlist 外工具追加 `Tool
 `tool_rejected` trajectory 事件；工具自身失败追加 `tool_error`，Provider 截断追加
 `provider_truncated`，轮次耗尽追加 `max_steps_exceeded`。
 
+策略检查不再只判断工具名：它会复用 `permissions::requires_fresh_explicit_approval()`、
+`permissions::tool_level()` 与 `tools::contracts::contract()`。非法 JSON、非 object 参数、
+L2、逐次审批工具和 allowlist 外工具全部 fail-closed；允许调用的副作用类型、恢复策略与
+契约超时会进入审批事件。工具硬超时取契约 timeout 与任务剩余 wall time 的较小值。
+
 ### 9.2 网络分层
 
 `network=none` 只适用于任务执行面：
@@ -317,6 +322,12 @@ Git worktree 只提供代码目录隔离，不是安全沙箱。平台原生轻�
 `HeadlessToolRuntime` 会在每个 trial 的内存 SQLite 中执行完整应用 migrations；
 `SessionTrajectorySink::from_db` 与工具 runtime 共享该连接，因此审批、工具相关状态和
 session events 不再写入彼此隔离的临时数据库。trajectory 仍作为同一次事件追加的派生输出返回 runner。
+每个 trial 同时拥有独立 project/conversation/trace scope，实际执行的工具调用会写入
+`tool_runs` 终态，再由现有 `tool_metrics::summary()` 生成 `tool_metrics` trajectory 事件，
+统一统计成功率、参数错误率、超时率、取消数和平均耗时。
+ToolCall/ToolResult 审计不保存无界原文：JSON 会先按敏感字段递归脱敏，自由文本再走统一
+文本遮罩，事件仅保留 4,000 字符预览、原文 SHA-256 和独立截断标记；模型上下文的
+32,000 字符上限与审计预览上限分别记录，避免混淆。
 
 `session_events_to_trajectory` 的当前实现写入 `TrajectoryWriter`。因此采用以下过渡策略：
 

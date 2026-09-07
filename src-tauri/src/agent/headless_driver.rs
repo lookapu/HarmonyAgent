@@ -11,6 +11,7 @@ use crate::agent::event_sink::{AgentEventSink, SessionTrajectorySink};
 use crate::agent::headless_runtime::HeadlessToolRuntime;
 use crate::agent::session_events::SessionEventType;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -19,6 +20,18 @@ use std::time::{Duration, Instant};
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOOL_RESULT_CHARS: usize = 32_000;
+const MAX_AUDIT_TEXT_CHARS: usize = 4_000;
+
+fn bounded_audit_text(value: &str) -> (String, bool, String) {
+    let redacted = serde_json::from_str::<Value>(value)
+        .map(|json| crate::utils::redact::redact_json_value(&json).to_string())
+        .unwrap_or_else(|_| crate::utils::redact::redact_text(value));
+    let mut chars = redacted.chars();
+    let preview: String = chars.by_ref().take(MAX_AUDIT_TEXT_CHARS).collect();
+    let truncated = chars.next().is_some();
+    let digest = format!("sha256:{:x}", Sha256::digest(value.as_bytes()));
+    (preview, truncated, digest)
+}
 
 fn bounded_tool_output(value: String) -> (String, bool) {
     let mut chars = value.chars();
@@ -368,33 +381,65 @@ impl HeadlessAgentDriver {
                     .get("arguments")
                     .and_then(Value::as_str)
                     .unwrap_or("{}");
-                if !runtime.policy.allows(name) {
-                    outcome.policy_violations += 1;
-                    sink.append(
-                        SessionEventType::ToolApproval,
-                        json!({"tool":name,"approved":false,"reason":"headless_allowlist"}),
-                        "tool_rejected",
-                        json!({"name":name,"reason":"headless_allowlist"}),
-                    )
-                    .map_err(AgentDriverError::Failed)?;
-                    messages.push(json!({"role":"tool","tool_call_id":id,"content":"headless policy rejected tool"}));
-                    continue;
-                }
+                let contract = match runtime.policy.check(name, args) {
+                    Ok(contract) => contract,
+                    Err(reason) => {
+                        outcome.policy_violations += 1;
+                        sink.append(
+                            SessionEventType::ToolApproval,
+                            json!({"tool":name,"approved":false,"reason":reason}),
+                            "tool_rejected",
+                            json!({"name":name,"reason":reason}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                        messages.push(json!({"role":"tool","tool_call_id":id,"content":reason}));
+                        continue;
+                    }
+                };
                 sink.append(
                     SessionEventType::ToolApproval,
-                    json!({"tool":name,"approved":true,"reason":"headless_allowlist"}),
+                    json!({
+                        "tool":name,
+                        "approved":true,
+                        "reason":"headless_policy_and_contract",
+                        "effect":contract.effect.as_str(),
+                        "recovery":contract.recovery.as_str(),
+                        "timeout_ms":contract.timeout_ms,
+                    }),
                     "tool_approval",
-                    json!({"name":name,"approved":true}),
+                    json!({
+                        "name":name,
+                        "approved":true,
+                        "effect":contract.effect.as_str(),
+                        "recovery":contract.recovery.as_str(),
+                        "timeout_ms":contract.timeout_ms,
+                    }),
                 )
                 .map_err(AgentDriverError::Failed)?;
                 sink.append(
                     SessionEventType::ToolCall,
-                    json!({"name":name,"args":args}),
+                    {
+                        let (args_preview, args_truncated, args_digest) =
+                            bounded_audit_text(args);
+                        json!({
+                            "name":name,
+                            "args_preview":args_preview,
+                            "args_truncated":args_truncated,
+                            "args_digest":args_digest,
+                        })
+                    },
                     "tool_call",
-                    json!({"name":name}),
+                    {
+                        let (_, args_truncated, args_digest) = bounded_audit_text(args);
+                        json!({"name":name,"args_truncated":args_truncated,"args_digest":args_digest})
+                    },
                 )
                 .map_err(AgentDriverError::Failed)?;
-                let result = runtime.execute(name, args).await;
+                let remaining_wall_time = Duration::from_secs(task.limits.wall_time_seconds)
+                    .saturating_sub(started.elapsed());
+                let result = runtime
+                    .execute_observed(name, args, id, remaining_wall_time)
+                    .await;
                 outcome.tool_calls += 1;
                 let (ok, raw_text) = match result {
                     Ok(v) => (true, v),
@@ -403,19 +448,54 @@ impl HeadlessAgentDriver {
                 let (text, truncated) = bounded_tool_output(raw_text);
                 if !ok {
                     outcome.failure_taxonomy.push("tool_error".into());
+                    if text.contains("超时") || text.contains("剩余 wall time") {
+                        outcome.failure_taxonomy.push("tool_timeout".into());
+                    }
                 }
                 if truncated {
                     outcome
                         .failure_taxonomy
                         .push("tool_output_truncated".into());
                 }
-                sink.append(SessionEventType::ToolResult, json!({"name":name,"ok":ok,"output":text.chars().take(4000).collect::<String>(),"truncated":truncated}), "tool_result", json!({"name":name,"ok":ok,"truncated":truncated})).map_err(AgentDriverError::Failed)?;
+                let (output_preview, audit_truncated, output_digest) = bounded_audit_text(&text);
+                sink.append(
+                    SessionEventType::ToolResult,
+                    json!({
+                        "name":name,
+                        "ok":ok,
+                        "output_preview":output_preview,
+                        "output_digest":output_digest,
+                        "model_context_truncated":truncated,
+                        "audit_truncated":audit_truncated,
+                    }),
+                    "tool_result",
+                    json!({
+                        "name":name,
+                        "ok":ok,
+                        "output_digest":output_digest,
+                        "model_context_truncated":truncated,
+                        "audit_truncated":audit_truncated,
+                    }),
+                )
+                .map_err(AgentDriverError::Failed)?;
                 messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
             }
         }
         if !stopped_by_model && outcome.steps >= round_limit as u64 {
             outcome.failure_taxonomy.push("max_steps_exceeded".into());
         }
+        let tool_quality = runtime
+            .quality_summary()
+            .map_err(AgentDriverError::Failed)?;
+        sink.append(
+            SessionEventType::SystemNote,
+            serde_json::to_value(&tool_quality)
+                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
+            "tool_metrics",
+            serde_json::to_value(&tool_quality)
+                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
+        )
+        .map_err(AgentDriverError::Failed)?;
         sink.append(SessionEventType::SystemNote, json!({"text":"builtin driver finished","steps":outcome.steps,"tool_calls":outcome.tool_calls}), "driver_finished", json!({"steps":outcome.steps,"tool_calls":outcome.tool_calls})).map_err(AgentDriverError::Failed)?;
         outcome.trajectory = sink.into_trajectory();
         if self.provider.input_price_cny_per_1k.is_none()
@@ -490,6 +570,49 @@ mod tests {
         }
     }
 
+    fn offline_task() -> EvalTask {
+        EvalTask {
+            schema_version: crate::agent::eval_task::EVAL_TASK_SCHEMA_VERSION,
+            task_id: "offline__headless-loop".into(),
+            suite: "offline".into(),
+            problem_statement: "write fixed to a.txt".into(),
+            repo: EvalRepo {
+                url: "file:///offline".into(),
+                base_commit: "0000000".into(),
+                subdir: None,
+            },
+            limits: EvalLimits {
+                wall_time_seconds: 10,
+                max_steps: 4,
+                max_cost_cny: 0.0,
+                network: "none".into(),
+            },
+            grader: EvalGrader {
+                kind: "command".into(),
+                command: vec!["true".into()],
+                timeout_seconds: 1,
+            },
+            artifacts: vec![],
+        }
+    }
+
+    fn scripted_driver(
+        responses: impl IntoIterator<Item = serde_json::Value>,
+    ) -> HeadlessAgentDriver {
+        HeadlessAgentDriver::with_client(
+            HeadlessProviderConfig {
+                provider_id: "stub".into(),
+                base_url: "http://127.0.0.1/offline".into(),
+                api_key: "test-secret".into(),
+                model_id: "offline-model".into(),
+                max_rounds: 4,
+                input_price_cny_per_1k: Some(0.0),
+                output_price_cny_per_1k: Some(0.0),
+            },
+            Arc::new(ScriptedClient(Mutex::new(responses.into_iter().collect()))),
+        )
+    }
+
     #[test]
     fn policy_is_fail_closed_for_unknown_tools() {
         let policy = HeadlessToolPolicy;
@@ -534,6 +657,18 @@ mod tests {
         assert!(bounded.chars().count() < super::MAX_TOOL_RESULT_CHARS + 100);
     }
 
+    #[test]
+    fn audit_preview_redacts_json_secrets_and_keeps_raw_digest() {
+        let secret = "sk-abcdefghijklmnop123456";
+        let raw = format!(r#"{{"api_key":"{secret}","path":"a.txt"}}"#);
+        let (preview, truncated, digest) = super::bounded_audit_text(&raw);
+        assert!(!truncated);
+        assert!(!preview.contains(secret));
+        assert!(preview.contains("***"));
+        assert!(digest.starts_with("sha256:"));
+        assert!(!digest.contains(secret));
+    }
+
     #[tokio::test]
     async fn builtin_driver_completes_offline_tool_loop() {
         let responses = [
@@ -567,41 +702,8 @@ mod tests {
             std::env::temp_dir().join(format!("harmony-headless-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("a.txt"), "base\n").unwrap();
-        let task = EvalTask {
-            schema_version: crate::agent::eval_task::EVAL_TASK_SCHEMA_VERSION,
-            task_id: "offline__headless-loop".into(),
-            suite: "offline".into(),
-            problem_statement: "write fixed to a.txt".into(),
-            repo: EvalRepo {
-                url: "file:///offline".into(),
-                base_commit: "0000000".into(),
-                subdir: None,
-            },
-            limits: EvalLimits {
-                wall_time_seconds: 10,
-                max_steps: 4,
-                max_cost_cny: 0.0,
-                network: "none".into(),
-            },
-            grader: EvalGrader {
-                kind: "command".into(),
-                command: vec!["true".into()],
-                timeout_seconds: 1,
-            },
-            artifacts: vec![],
-        };
-        let driver = HeadlessAgentDriver::with_client(
-            HeadlessProviderConfig {
-                provider_id: "stub".into(),
-                base_url: "http://127.0.0.1/offline".into(),
-                api_key: "test-secret".into(),
-                model_id: "offline-model".into(),
-                max_rounds: 4,
-                input_price_cny_per_1k: Some(0.0),
-                output_price_cny_per_1k: Some(0.0),
-            },
-            Arc::new(ScriptedClient(Mutex::new(responses.into_iter().collect()))),
-        );
+        let task = offline_task();
+        let driver = scripted_driver(responses);
 
         let outcome = driver.run_async(&task, &workspace).await.unwrap();
         assert_eq!(
@@ -617,9 +719,63 @@ mod tests {
             .trajectory
             .iter()
             .any(|event| event.kind == "tool_result"));
+        let quality = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "tool_metrics")
+            .expect("工具质量摘要必须进入 trajectory");
+        assert_eq!(quality.fields["total_calls"], 1);
+        assert_eq!(quality.fields["successful_calls"], 1);
         assert!(!serde_json::to_string(&outcome.trajectory)
             .unwrap()
             .contains("test-secret"));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn builtin_driver_rejects_unapproved_tools_and_records_policy_event() {
+        let responses = [
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-dangerous",
+                            "type": "function",
+                            "function": {"name": "run_command", "arguments": "{\"command\":\"true\"}"}
+                        }]
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "cannot run it"}
+                }]
+            }),
+        ];
+        let workspace =
+            std::env::temp_dir().join(format!("harmony-headless-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outcome = scripted_driver(responses)
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.policy_violations, 1);
+        assert_eq!(outcome.tool_calls, 0);
+        let rejected = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "tool_rejected")
+            .expect("拒绝必须进入 trajectory");
+        assert_eq!(rejected.fields["name"], "run_command");
+        assert!(rejected.fields["reason"]
+            .as_str()
+            .unwrap()
+            .contains("未授权"));
         std::fs::remove_dir_all(workspace).ok();
     }
 }
