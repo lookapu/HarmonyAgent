@@ -2,21 +2,23 @@
 //!
 //! `run_trial` 把已落地的各阶段串成一条可跑闭环：validate → prepare worktree →
 //! drive agent → collect patch → grade in clean worktree → 组装结果。Agent 驱动是
-//! 可注入的 [`AgentDriver`]（真实实现待从 `commands/chat.rs` 抽取 headless 驱动核心，
-//! 见 §9「可以替换 Provider 配置来源」），编排逻辑本身不依赖 UI、可用桩驱动端到端验证。
+//! 可注入的 [`AsyncAgentDriver`]（builtin 最小驱动已落地，最终仍需与
+//! `commands/chat.rs` 共享统一 AgentKernel），编排逻辑本身不依赖 UI、可用桩驱动端到端验证。
 
-use crate::agent::eval_task::{validate_eval_task, EvalTask};
 use crate::agent::eval_grader::{run_command_grader, GraderOutcome};
 use crate::agent::eval_patch::{apply_patch, collect_patch};
 use crate::agent::eval_report::{
     EvalManifest, EvalReport, HarnessInfo, ModelInfo, OutcomeInfo, PromptInfo, RunInfo,
     SandboxInfo, TaskInfo, ToolRegistryInfo, EVAL_REPORT_SCHEMA_VERSION,
 };
+use crate::agent::eval_task::{validate_eval_task, EvalTask};
 use crate::agent::eval_trajectory::{TrajectoryEvent, TrajectoryWriter};
 use crate::agent::eval_workspace::{collect_artifacts, prepare_worktree};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::time::Instant;
@@ -34,21 +36,41 @@ pub enum AgentDriverError {
 
 impl AgentDriverError {
     fn status(&self) -> &'static str {
-        match self { Self::Failed(_) => OUTCOME_HARNESS_ERROR, Self::Cancelled(_) => OUTCOME_CANCELLED }
+        match self {
+            Self::Failed(_) => OUTCOME_HARNESS_ERROR,
+            Self::Cancelled(_) => OUTCOME_CANCELLED,
+        }
     }
     fn message(&self) -> &str {
-        match self { Self::Failed(message) | Self::Cancelled(message) => message }
+        match self {
+            Self::Failed(message) | Self::Cancelled(message) => message,
+        }
     }
 }
 
 impl From<String> for AgentDriverError {
-    fn from(value: String) -> Self { Self::Failed(value) }
+    fn from(value: String) -> Self {
+        Self::Failed(value)
+    }
 }
 
-/// 在给定工作树中完成任务的执行核心。真实实现待从 UI 耦合的 `commands/chat.rs`
-/// 抽取 headless 驱动；测试桩只需在工作树里做出改动即可驱动整条闭环。
+/// 旧同步 driver 边界，仅供外部进程 adapter 内部兼容。runner 主路径使用
+/// [`AsyncAgentDriver`]，避免 Provider/工具异步执行被嵌套 runtime 包装。
 pub trait AgentDriver: Send + Sync {
-    fn run(&self, task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError>;
+    fn run(
+        &self,
+        task: &EvalTask,
+        workspace: &Path,
+    ) -> Result<AgentDriverOutcome, AgentDriverError>;
+}
+
+/// 异步 driver 边界。保留旧同步 trait 以兼容外部 adapter；builtin 和未来 kernel 优先实现此接口。
+pub trait AsyncAgentDriver: Send + Sync {
+    fn run_async<'a>(
+        &'a self,
+        task: &'a EvalTask,
+        workspace: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentDriverOutcome, AgentDriverError>> + Send + 'a>>;
 }
 
 /// 真实驱动必须返回可审计的资源计量与事件，不允许 runner 从最终文本猜测。
@@ -69,6 +91,7 @@ pub struct AgentDriverOutcome {
 
 /// 通过受信任的本地 adapter 接入真实 Agent。任务 JSON 只经 stdin 传递，工作树通过
 /// current_dir 约束；adapter stdout 必须只包含 `AgentDriverOutcome` JSON。
+#[derive(Clone)]
 pub struct ProcessAgentDriver {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -76,46 +99,109 @@ pub struct ProcessAgentDriver {
 }
 
 impl AgentDriver for ProcessAgentDriver {
-    fn run(&self, task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError> {
+    fn run(
+        &self,
+        task: &EvalTask,
+        workspace: &Path,
+    ) -> Result<AgentDriverOutcome, AgentDriverError> {
         if !self.program.is_absolute() || !self.program.is_file() {
-            return Err(AgentDriverError::Failed("driver program 必须是存在的绝对文件路径".into()));
+            return Err(AgentDriverError::Failed(
+                "driver program 必须是存在的绝对文件路径".into(),
+            ));
         }
         let mut child = Command::new(&self.program)
             .args(&self.args)
             .current_dir(workspace)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-            .spawn().map_err(|e| AgentDriverError::Failed(format!("启动 driver 失败：{e}")))?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| AgentDriverError::Failed(format!("启动 driver 失败：{e}")))?;
         let request = serde_json::to_vec(task)
             .map_err(|e| AgentDriverError::Failed(format!("序列化 driver 请求失败：{e}")))?;
-        child.stdin.take().ok_or_else(|| AgentDriverError::Failed("driver stdin 不可用".into()))?
-            .write_all(&request).map_err(|e| AgentDriverError::Failed(format!("写入 driver stdin 失败：{e}")))?;
-        let mut stdout = child.stdout.take().ok_or_else(|| AgentDriverError::Failed("driver stdout 不可用".into()))?;
-        let mut stderr = child.stderr.take().ok_or_else(|| AgentDriverError::Failed("driver stderr 不可用".into()))?;
-        let stdout_reader = std::thread::spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
-        let stderr_reader = std::thread::spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AgentDriverError::Failed("driver stdin 不可用".into()))?;
+        stdin
+            .write_all(&request)
+            .map_err(|e| AgentDriverError::Failed(format!("写入 driver stdin 失败：{e}")))?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| AgentDriverError::Failed(format!("结束 driver stdin 请求失败：{e}")))?;
+        drop(stdin);
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AgentDriverError::Failed("driver stdout 不可用".into()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AgentDriverError::Failed("driver stderr 不可用".into()))?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
         let started = Instant::now();
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() < self.timeout => std::thread::sleep(Duration::from_millis(25)),
+                Ok(None) if started.elapsed() < self.timeout => {
+                    std::thread::sleep(Duration::from_millis(25))
+                }
                 Ok(None) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(AgentDriverError::Cancelled("driver 超过 wall time，已终止".into()));
+                    return Err(AgentDriverError::Cancelled(
+                        "driver 超过 wall time，已终止".into(),
+                    ));
                 }
                 Err(e) => return Err(AgentDriverError::Failed(format!("等待 driver 失败：{e}"))),
             }
         };
-        let stdout = stdout_reader.join().map_err(|_| AgentDriverError::Failed("driver stdout reader panic".into()))?
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| AgentDriverError::Failed("driver stdout reader panic".into()))?
             .map_err(|e| AgentDriverError::Failed(format!("读取 driver stdout 失败：{e}")))?;
-        let stderr = stderr_reader.join().map_err(|_| AgentDriverError::Failed("driver stderr reader panic".into()))?
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| AgentDriverError::Failed("driver stderr reader panic".into()))?
             .map_err(|e| AgentDriverError::Failed(format!("读取 driver stderr 失败：{e}")))?;
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr);
-            return Err(AgentDriverError::Failed(format!("driver 退出码 {:?}：{}", status.code(), stderr.trim())));
+            return Err(AgentDriverError::Failed(format!(
+                "driver 退出码 {:?}：{}",
+                status.code(),
+                stderr.trim()
+            )));
         }
-        serde_json::from_slice(&stdout)
-            .map_err(|e| AgentDriverError::Failed(format!("driver stdout 不是 AgentDriverOutcome JSON：{e}")))
+        serde_json::from_slice(&stdout).map_err(|e| {
+            AgentDriverError::Failed(format!("driver stdout 不是 AgentDriverOutcome JSON：{e}"))
+        })
+    }
+}
+
+impl AsyncAgentDriver for ProcessAgentDriver {
+    fn run_async<'a>(
+        &'a self,
+        task: &'a EvalTask,
+        workspace: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentDriverOutcome, AgentDriverError>> + Send + 'a>>
+    {
+        let driver = self.clone();
+        let task = task.clone();
+        let workspace = workspace.to_path_buf();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || driver.run(&task, &workspace))
+                .await
+                .map_err(|error| {
+                    AgentDriverError::Failed(format!("driver blocking worker 失败：{error}"))
+                })?
+        })
     }
 }
 
@@ -140,16 +226,31 @@ fn validate_run_config(config: &EvalRunConfig) -> Result<(), String> {
         ("harness.commit", config.harness.commit.as_str()),
         ("model.provider", config.model.provider.as_str()),
         ("model.model_id", config.model.model_id.as_str()),
-        ("prompt.profile_version", config.prompt.profile_version.as_str()),
+        (
+            "prompt.profile_version",
+            config.prompt.profile_version.as_str(),
+        ),
         ("prompt.digest", config.prompt.digest.as_str()),
-        ("tool_registry.version", config.tool_registry.version.as_str()),
+        (
+            "tool_registry.version",
+            config.tool_registry.version.as_str(),
+        ),
         ("tool_registry.digest", config.tool_registry.digest.as_str()),
         ("sandbox.backend", config.sandbox.backend.as_str()),
     ];
-    if let Some((field, _)) = required.into_iter().find(|(_, value)| value.trim().is_empty()) {
-        return Err(format!("eval run 配置缺少真实 {field}，拒绝生成不可复现报告"));
+    if let Some((field, _)) = required
+        .into_iter()
+        .find(|(_, value)| value.trim().is_empty())
+    {
+        return Err(format!(
+            "eval run 配置缺少真实 {field}，拒绝生成不可复现报告"
+        ));
     }
-    if !config.run_id.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')) {
+    if !config
+        .run_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    {
         return Err("eval run_id 只能包含字母、数字、点、短横线和下划线".into());
     }
     for (field, digest) in [
@@ -173,11 +274,10 @@ fn write_json(path: &Path, value: &str, label: &str) -> Result<(), String> {
 }
 
 fn task_workspace(repo_workspace: &Path, task: &EvalTask) -> Result<PathBuf, String> {
-    let workspace = task
-        .repo
-        .subdir
-        .as_deref()
-        .map_or_else(|| repo_workspace.to_path_buf(), |subdir| repo_workspace.join(subdir));
+    let workspace = task.repo.subdir.as_deref().map_or_else(
+        || repo_workspace.to_path_buf(),
+        |subdir| repo_workspace.join(subdir),
+    );
     if !workspace.is_dir() {
         return Err(format!(
             "任务子目录不存在或不是目录：{}",
@@ -201,11 +301,11 @@ pub struct EvalTrialOutcome {
 
 /// 一次 trial 的完整编排。`source_repo` 是本地已准备仓库；`output_dir` 为 run 专用目录，
 /// 内部产出 `agent/`、`grader/` 两棵隔离工作树与 `model.patch`。
-pub fn run_trial(
+pub async fn run_trial(
     task: &EvalTask,
     source_repo: &Path,
     output_dir: &Path,
-    driver: &dyn AgentDriver,
+    driver: &dyn AsyncAgentDriver,
     config: &EvalRunConfig,
 ) -> Result<EvalTrialOutcome, String> {
     validate_eval_task(task)?;
@@ -216,8 +316,7 @@ pub fn run_trial(
             config.sandbox.network_policy, task.limits.network
         ));
     }
-    std::fs::create_dir_all(output_dir)
-        .map_err(|error| format!("创建输出目录失败：{error}"))?;
+    std::fs::create_dir_all(output_dir).map_err(|error| format!("创建输出目录失败：{error}"))?;
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
     let task_info = TaskInfo {
@@ -225,8 +324,7 @@ pub fn run_trial(
         suite_version: config.suite_version.clone(),
         task_id: task.task_id.clone(),
         task_digest: sha256_hex(
-            &serde_json::to_vec(task)
-                .map_err(|error| format!("序列化任务指纹失败：{error}"))?,
+            &serde_json::to_vec(task).map_err(|error| format!("序列化任务指纹失败：{error}"))?,
         ),
         repo_base_commit: task.repo.base_commit.clone(),
     };
@@ -261,7 +359,7 @@ pub fn run_trial(
         kind: "trial_started".into(),
         fields: serde_json::json!({ "run_id": config.run_id, "task_id": task.task_id }),
     })?;
-    let driver_outcome = match driver.run(task, &agent_task_ws) {
+    let driver_outcome = match driver.run_async(task, &agent_task_ws).await {
         Ok(outcome) => outcome,
         Err(failure) => {
             let status = failure.status();
@@ -269,7 +367,12 @@ pub fn run_trial(
             let cancelled = matches!(&failure, AgentDriverError::Cancelled(_));
             trajectory.append(&TrajectoryEvent {
                 ts: chrono::Utc::now().to_rfc3339(),
-                kind: if cancelled { "agent_cancelled" } else { "agent_failed" }.into(),
+                kind: if cancelled {
+                    "agent_cancelled"
+                } else {
+                    "agent_failed"
+                }
+                .into(),
                 fields: serde_json::json!({ "message": failure_message }),
             })?;
             let (_, raw_digest) = trajectory.finish()?;
@@ -278,28 +381,57 @@ pub fn run_trial(
             write_json(&output_dir.join("model.patch"), &patch, "model.patch")?;
             let patch_digest = sha256_hex(patch.as_bytes());
             let grader_dir = output_dir.join("grader");
-            std::fs::create_dir_all(&grader_dir).map_err(|e| format!("创建 grader 日志目录失败：{e}"))?;
+            std::fs::create_dir_all(&grader_dir)
+                .map_err(|e| format!("创建 grader 日志目录失败：{e}"))?;
             write_json(&grader_dir.join("stdout.log"), "", "grader/stdout.log")?;
-            write_json(&grader_dir.join("stderr.log"), "grader 未运行：Agent 未正常结束\n", "grader/stderr.log")?;
+            write_json(
+                &grader_dir.join("stderr.log"),
+                "grader 未运行：Agent 未正常结束\n",
+                "grader/stderr.log",
+            )?;
             let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let report = EvalReport {
                 schema_version: EVAL_REPORT_SCHEMA_VERSION,
-                harness: config.harness.clone(), model: config.model.clone(), prompt: config.prompt.clone(),
-                tool_registry: config.tool_registry.clone(), task: task_info, sandbox: config.sandbox.clone(),
+                harness: config.harness.clone(),
+                model: config.model.clone(),
+                prompt: config.prompt.clone(),
+                tool_registry: config.tool_registry.clone(),
+                task: task_info,
+                sandbox: config.sandbox.clone(),
                 run: RunInfo {
-                    started: started_at, finished: chrono::Utc::now().to_rfc3339(),
+                    started: started_at,
+                    finished: chrono::Utc::now().to_rfc3339(),
                     duration_seconds: duration_ms as f64 / 1000.0,
-                    input_tokens: 0, output_tokens: 0, cached_tokens: 0, cost_cny: 0.0,
-                    steps: 0, tool_calls: 0, retries: 0, patch_digest,
-                    trajectory_digest, grader_kind: task.grader.kind.clone(), grader_version: config.grader_version.clone(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_tokens: 0,
+                    cost_cny: 0.0,
+                    steps: 0,
+                    tool_calls: 0,
+                    retries: 0,
+                    patch_digest,
+                    trajectory_digest,
+                    grader_kind: task.grader.kind.clone(),
+                    grader_version: config.grader_version.clone(),
                 },
                 outcome: OutcomeInfo {
-                    status: status.into(), fail_to_pass: 0, pass_to_pass: 0,
-                    failure_taxonomy: vec![if cancelled { "cancelled" } else { "agent_driver_error" }.into()],
+                    status: status.into(),
+                    fail_to_pass: 0,
+                    pass_to_pass: 0,
+                    failure_taxonomy: vec![if cancelled {
+                        "cancelled"
+                    } else {
+                        "agent_driver_error"
+                    }
+                    .into()],
                     policy_violations: 0,
                 },
             };
-            write_json(&output_dir.join("report.json"), &report.to_json()?, "report.json")?;
+            write_json(
+                &output_dir.join("report.json"),
+                &report.to_json()?,
+                "report.json",
+            )?;
             return Err(format!("{status}: {failure_message}"));
         }
     };
@@ -340,8 +472,16 @@ pub fn run_trial(
     let grader_dir = output_dir.join("grader");
     std::fs::create_dir_all(&grader_dir)
         .map_err(|error| format!("创建 grader 日志目录失败：{error}"))?;
-    write_json(&grader_dir.join("stdout.log"), &grader.stdout, "grader/stdout.log")?;
-    write_json(&grader_dir.join("stderr.log"), &grader.stderr, "grader/stderr.log")?;
+    write_json(
+        &grader_dir.join("stdout.log"),
+        &grader.stdout,
+        "grader/stdout.log",
+    )?;
+    write_json(
+        &grader_dir.join("stderr.log"),
+        &grader.stderr,
+        "grader/stderr.log",
+    )?;
     trajectory.append(&TrajectoryEvent {
         ts: chrono::Utc::now().to_rfc3339(),
         kind: "grader_finished".into(),
@@ -418,19 +558,26 @@ pub fn run_trial(
 pub struct StubAgentDriver;
 
 #[cfg(test)]
-impl AgentDriver for StubAgentDriver {
-    fn run(&self, _task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError> {
-        std::fs::write(workspace.join("a.txt"), "fixed\n")
-            .map_err(|error| format!("stub agent 写入失败：{error}"))?;
-        Ok(AgentDriverOutcome {
-            steps: 1,
-            tool_calls: 1,
-            trajectory: vec![TrajectoryEvent {
-                ts: "2026-09-05T00:00:00Z".into(),
-                kind: "tool_result".into(),
-                fields: serde_json::json!({"tool": "write_file", "ok": true}),
-            }],
-            ..Default::default()
+impl AsyncAgentDriver for StubAgentDriver {
+    fn run_async<'a>(
+        &'a self,
+        _task: &'a EvalTask,
+        workspace: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentDriverOutcome, AgentDriverError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            std::fs::write(workspace.join("a.txt"), "fixed\n")
+                .map_err(|error| format!("stub agent 写入失败：{error}"))?;
+            Ok(AgentDriverOutcome {
+                steps: 1,
+                tool_calls: 1,
+                trajectory: vec![TrajectoryEvent {
+                    ts: "2026-09-05T00:00:00Z".into(),
+                    kind: "tool_result".into(),
+                    fields: serde_json::json!({"tool": "write_file", "ok": true}),
+                }],
+                ..Default::default()
+            })
         })
     }
 }
@@ -443,8 +590,16 @@ mod tests {
     use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git").args(args).current_dir(dir).output().unwrap();
-        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
@@ -475,12 +630,25 @@ mod tests {
     }
 
     fn source_repo_with_base() -> (PathBuf, String) {
-        let dir = std::env::temp_dir().join(format!("deveco-eval-run-src-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("deveco-eval-run-src-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a.txt"), "base\n").unwrap();
         git(&dir, &["init", "-q"]);
         git(&dir, &["add", "a.txt"]);
-        git(&dir, &["-c", "user.email=e@x", "-c", "user.name=t", "commit", "-q", "-m", "base"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.email=e@x",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        );
         let base = git(&dir, &["rev-parse", "HEAD"]);
         (dir, base)
     }
@@ -518,18 +686,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn run_trial_resolves_when_stub_fix_passes_grader() {
+    #[tokio::test]
+    async fn run_trial_resolves_when_stub_fix_passes_grader() {
         let (source, base) = source_repo_with_base();
         let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
         task.repo.base_commit = base.clone();
-        let output_dir = std::env::temp_dir().join(format!("deveco-eval-run-out-{}", uuid::Uuid::new_v4()));
+        let output_dir =
+            std::env::temp_dir().join(format!("deveco-eval-run-out-{}", uuid::Uuid::new_v4()));
 
-        let outcome = run_trial(&task, &source, &output_dir, &StubAgentDriver, &run_config()).unwrap();
+        let outcome = run_trial(&task, &source, &output_dir, &StubAgentDriver, &run_config())
+            .await
+            .unwrap();
         assert_eq!(outcome.status, OUTCOME_RESOLVED);
-        assert!(outcome.patch.contains("+fixed"), "patch 应含 fixed：{}", outcome.patch);
+        assert!(
+            outcome.patch.contains("+fixed"),
+            "patch 应含 fixed：{}",
+            outcome.patch
+        );
         assert!(output_dir.join("model.patch").exists());
-        for path in ["manifest.json", "trajectory.jsonl", "report.json", "grader/stdout.log", "grader/stderr.log"] {
+        for path in [
+            "manifest.json",
+            "trajectory.jsonl",
+            "report.json",
+            "grader/stdout.log",
+            "grader/stderr.log",
+        ] {
             assert!(output_dir.join(path).exists(), "缺少评测产物 {path}");
         }
         assert_eq!(outcome.trajectory_events, 4);
@@ -544,23 +725,30 @@ mod tests {
             sha256_hex(&fs::read(output_dir.join("trajectory.jsonl")).unwrap())
         );
         let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(output_dir.join("report.json")).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(output_dir.join("report.json")).unwrap())
+                .unwrap();
         assert_eq!(report["run"]["patch_digest"], outcome.patch_digest);
-        assert_eq!(report["run"]["trajectory_digest"], outcome.trajectory_digest);
+        assert_eq!(
+            report["run"]["trajectory_digest"],
+            outcome.trajectory_digest
+        );
 
         fs::remove_dir_all(source).ok();
         fs::remove_dir_all(output_dir).ok();
     }
 
-    #[test]
-    fn run_trial_unresolved_when_grader_fails() {
+    #[tokio::test]
+    async fn run_trial_unresolved_when_grader_fails() {
         let (source, base) = source_repo_with_base();
         // grader 要求 a.txt 含 "other"，但 stub 写的是 "fixed"
         let mut task = task_with_grader(vec!["grep", "-q", "other", "a.txt"]);
         task.repo.base_commit = base.clone();
-        let output_dir = std::env::temp_dir().join(format!("deveco-eval-run-out2-{}", uuid::Uuid::new_v4()));
+        let output_dir =
+            std::env::temp_dir().join(format!("deveco-eval-run-out2-{}", uuid::Uuid::new_v4()));
 
-        let outcome = run_trial(&task, &source, &output_dir, &StubAgentDriver, &run_config()).unwrap();
+        let outcome = run_trial(&task, &source, &output_dir, &StubAgentDriver, &run_config())
+            .await
+            .unwrap();
         assert_eq!(outcome.status, OUTCOME_UNRESOLVED);
         assert!(!outcome.grader.passed);
 
@@ -570,26 +758,54 @@ mod tests {
 
     struct TerminalDriver(bool);
 
-    impl AgentDriver for TerminalDriver {
-        fn run(&self, _task: &EvalTask, _workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError> {
-            if self.0 { Err(AgentDriverError::Cancelled("user stopped".into())) }
-            else { Err(AgentDriverError::Failed("provider unavailable".into())) }
+    impl AsyncAgentDriver for TerminalDriver {
+        fn run_async<'a>(
+            &'a self,
+            _task: &'a EvalTask,
+            _workspace: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Result<AgentDriverOutcome, AgentDriverError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if self.0 {
+                    Err(AgentDriverError::Cancelled("user stopped".into()))
+                } else {
+                    Err(AgentDriverError::Failed("provider unavailable".into()))
+                }
+            })
         }
     }
 
-    #[test]
-    fn driver_failure_and_cancel_still_emit_complete_trial_bundle() {
+    #[tokio::test]
+    async fn driver_failure_and_cancel_still_emit_complete_trial_bundle() {
         for (cancelled, expected) in [(false, OUTCOME_HARNESS_ERROR), (true, OUTCOME_CANCELLED)] {
             let (source, base) = source_repo_with_base();
             let mut task = task_with_grader(vec!["true"]);
             task.repo.base_commit = base;
-            let output_dir = std::env::temp_dir().join(format!("deveco-eval-terminal-{}", uuid::Uuid::new_v4()));
-            let error = run_trial(&task, &source, &output_dir, &TerminalDriver(cancelled), &run_config()).unwrap_err();
+            let output_dir =
+                std::env::temp_dir().join(format!("deveco-eval-terminal-{}", uuid::Uuid::new_v4()));
+            let error = run_trial(
+                &task,
+                &source,
+                &output_dir,
+                &TerminalDriver(cancelled),
+                &run_config(),
+            )
+            .await
+            .unwrap_err();
             assert!(error.starts_with(expected), "{error}");
-            for path in ["manifest.json", "trajectory.jsonl", "model.patch", "report.json", "grader/stdout.log", "grader/stderr.log"] {
+            for path in [
+                "manifest.json",
+                "trajectory.jsonl",
+                "model.patch",
+                "report.json",
+                "grader/stdout.log",
+                "grader/stderr.log",
+            ] {
                 assert!(output_dir.join(path).exists(), "{expected} 缺少 {path}");
             }
-            let report: serde_json::Value = serde_json::from_str(&fs::read_to_string(output_dir.join("report.json")).unwrap()).unwrap();
+            let report: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(output_dir.join("report.json")).unwrap())
+                    .unwrap();
             assert_eq!(report["outcome"]["status"], expected);
             fs::remove_dir_all(source).ok();
             fs::remove_dir_all(output_dir).ok();
@@ -600,7 +816,8 @@ mod tests {
     #[test]
     fn process_driver_uses_stdin_cwd_and_structured_stdout() {
         use std::os::unix::fs::PermissionsExt;
-        let workspace = std::env::temp_dir().join(format!("deveco-process-driver-{}", uuid::Uuid::new_v4()));
+        let workspace =
+            std::env::temp_dir().join(format!("deveco-process-driver-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&workspace).unwrap();
         let program = workspace.join("driver.sh");
         fs::write(&program, "#!/bin/sh\nread request\nprintf '%s' \"$request\" > received-task.json\nprintf '{\"steps\":2,\"tool_calls\":1}'\n").unwrap();
@@ -608,43 +825,60 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&program, permissions).unwrap();
         let task = task_with_grader(vec!["true"]);
-        let outcome = ProcessAgentDriver { program, args: vec![], timeout: Duration::from_secs(2) }
-            .run(&task, &workspace).unwrap();
+        let outcome = ProcessAgentDriver {
+            program,
+            args: vec![],
+            timeout: Duration::from_secs(2),
+        }
+        .run(&task, &workspace)
+        .unwrap();
         assert_eq!(outcome.steps, 2);
         assert_eq!(outcome.tool_calls, 1);
-        let received: serde_json::Value = serde_json::from_str(&fs::read_to_string(workspace.join("received-task.json")).unwrap()).unwrap();
+        let received: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(workspace.join("received-task.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(received["task_id"], task.task_id);
         fs::remove_dir_all(workspace).ok();
     }
 
-    #[test]
-    fn run_trial_collects_declared_artifacts() {
+    #[tokio::test]
+    async fn run_trial_collects_declared_artifacts() {
         let (source, base) = source_repo_with_base();
         // 声明 a.txt 为产物：stub 把 a.txt 改为 fixed，patch 应用后 grader 工作树含 a.txt=fixed。
         let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
         task.repo.base_commit = base.clone();
         task.artifacts = vec!["a.txt".to_string()];
-        let output_dir = std::env::temp_dir().join(format!("deveco-eval-run-out3-{}", uuid::Uuid::new_v4()));
+        let output_dir =
+            std::env::temp_dir().join(format!("deveco-eval-run-out3-{}", uuid::Uuid::new_v4()));
 
-        let outcome = run_trial(&task, &source, &output_dir, &StubAgentDriver, &run_config()).unwrap();
+        let outcome = run_trial(&task, &source, &output_dir, &StubAgentDriver, &run_config())
+            .await
+            .unwrap();
         assert_eq!(outcome.status, OUTCOME_RESOLVED);
         assert_eq!(outcome.collected_artifacts, vec!["a.txt".to_string()]);
         assert!(output_dir.join("artifacts/a.txt").exists());
-        assert_eq!(fs::read_to_string(output_dir.join("artifacts/a.txt")).unwrap(), "fixed\n");
+        assert_eq!(
+            fs::read_to_string(output_dir.join("artifacts/a.txt")).unwrap(),
+            "fixed\n"
+        );
 
         fs::remove_dir_all(source).ok();
         fs::remove_dir_all(output_dir).ok();
     }
 
-    #[test]
-    fn run_trial_rejects_missing_reproducibility_fingerprints_before_workspace_changes() {
+    #[tokio::test]
+    async fn run_trial_rejects_missing_reproducibility_fingerprints_before_workspace_changes() {
         let (source, base) = source_repo_with_base();
         let mut task = task_with_grader(vec!["true"]);
         task.repo.base_commit = base;
-        let output_dir = std::env::temp_dir().join(format!("deveco-eval-run-invalid-{}", uuid::Uuid::new_v4()));
+        let output_dir =
+            std::env::temp_dir().join(format!("deveco-eval-run-invalid-{}", uuid::Uuid::new_v4()));
         let mut config = run_config();
         config.model.model_id.clear();
-        let error = run_trial(&task, &source, &output_dir, &StubAgentDriver, &config).unwrap_err();
+        let error = run_trial(&task, &source, &output_dir, &StubAgentDriver, &config)
+            .await
+            .unwrap_err();
         assert!(error.contains("model.model_id"), "{error}");
         assert!(!output_dir.exists(), "配置失败不应创建输出目录");
         fs::remove_dir_all(source).ok();
@@ -652,36 +886,62 @@ mod tests {
 
     struct SubdirDriver;
 
-    impl AgentDriver for SubdirDriver {
-        fn run(&self, _task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError> {
-            if workspace.file_name().and_then(|value| value.to_str()) != Some("package") {
-                return Err(format!("driver 未进入任务 subdir：{}", workspace.display()).into());
-            }
-            fs::write(workspace.join("a.txt"), "fixed\n").map_err(|error| error.to_string())?;
-            Ok(AgentDriverOutcome::default())
+    impl AsyncAgentDriver for SubdirDriver {
+        fn run_async<'a>(
+            &'a self,
+            _task: &'a EvalTask,
+            workspace: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Result<AgentDriverOutcome, AgentDriverError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if workspace.file_name().and_then(|value| value.to_str()) != Some("package") {
+                    return Err(format!("driver 未进入任务 subdir：{}", workspace.display()).into());
+                }
+                fs::write(workspace.join("a.txt"), "fixed\n").map_err(|error| error.to_string())?;
+                Ok(AgentDriverOutcome::default())
+            })
         }
     }
 
-    #[test]
-    fn run_trial_scopes_driver_grader_and_artifacts_to_repo_subdir() {
-        let source = std::env::temp_dir().join(format!("deveco-eval-subdir-src-{}", uuid::Uuid::new_v4()));
+    #[tokio::test]
+    async fn run_trial_scopes_driver_grader_and_artifacts_to_repo_subdir() {
+        let source =
+            std::env::temp_dir().join(format!("deveco-eval-subdir-src-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(source.join("package")).unwrap();
         fs::write(source.join("package/a.txt"), "base\n").unwrap();
         fs::write(source.join("root.txt"), "untouched\n").unwrap();
         git(&source, &["init", "-q"]);
         git(&source, &["add", "."]);
-        git(&source, &["-c", "user.email=e@x", "-c", "user.name=t", "commit", "-q", "-m", "base"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.email=e@x",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        );
         let base = git(&source, &["rev-parse", "HEAD"]);
         let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
         task.repo.base_commit = base;
         task.repo.subdir = Some("package".into());
         task.artifacts = vec!["a.txt".into()];
-        let output_dir = std::env::temp_dir().join(format!("deveco-eval-subdir-out-{}", uuid::Uuid::new_v4()));
+        let output_dir =
+            std::env::temp_dir().join(format!("deveco-eval-subdir-out-{}", uuid::Uuid::new_v4()));
 
-        let outcome = run_trial(&task, &source, &output_dir, &SubdirDriver, &run_config()).unwrap();
+        let outcome = run_trial(&task, &source, &output_dir, &SubdirDriver, &run_config())
+            .await
+            .unwrap();
         assert_eq!(outcome.status, OUTCOME_RESOLVED);
         assert_eq!(outcome.collected_artifacts, vec!["a.txt"]);
-        assert_eq!(fs::read_to_string(output_dir.join("artifacts/a.txt")).unwrap(), "fixed\n");
+        assert_eq!(
+            fs::read_to_string(output_dir.join("artifacts/a.txt")).unwrap(),
+            "fixed\n"
+        );
         assert!(outcome.patch.contains("package/a.txt"));
         assert!(!outcome.patch.contains("root.txt"));
 

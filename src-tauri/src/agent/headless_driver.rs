@@ -1,0 +1,625 @@
+//! Builtin headless Agent driver (Phase 1).
+//!
+//! This deliberately starts with a small, auditable OpenAI-compatible loop.  It is
+//! not a replacement for the UI loop yet; the driver is marked `minimal` in the
+//! event stream and is intended for eval smoke tests while AgentKernel is extracted.
+
+use crate::agent::eval_report::ModelInfo;
+use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
+use crate::agent::eval_task::EvalTask;
+use crate::agent::event_sink::{AgentEventSink, SessionTrajectorySink};
+use crate::agent::headless_runtime::HeadlessToolRuntime;
+use crate::agent::session_events::SessionEventType;
+use serde_json::{json, Value};
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOOL_RESULT_CHARS: usize = 32_000;
+
+fn bounded_tool_output(value: String) -> (String, bool) {
+    let mut chars = value.chars();
+    let bounded: String = chars.by_ref().take(MAX_TOOL_RESULT_CHARS).collect();
+    let truncated = chars.next().is_some();
+    if truncated {
+        (
+            format!("{bounded}\n…[tool output truncated at {MAX_TOOL_RESULT_CHARS} chars]"),
+            true,
+        )
+    } else {
+        (bounded, false)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HeadlessProviderConfig {
+    pub provider_id: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_id: String,
+    pub max_rounds: u32,
+    pub input_price_cny_per_1k: Option<f64>,
+    pub output_price_cny_per_1k: Option<f64>,
+}
+
+impl HeadlessProviderConfig {
+    pub fn from_env() -> Result<Self, AgentDriverError> {
+        let get = |name: &str| {
+            std::env::var(name).map_err(|_| {
+                AgentDriverError::Failed(format!("builtin driver 缺少环境变量 {name}"))
+            })
+        };
+        let base_url = get("HARMONY_EVAL_BASE_URL")?;
+        let api_key = get("HARMONY_EVAL_API_KEY")?;
+        let model_id = get("HARMONY_EVAL_MODEL_ID")?;
+        let provider_id =
+            std::env::var("HARMONY_EVAL_PROVIDER_ID").unwrap_or_else(|_| "openai".into());
+        let protocol = std::env::var("HARMONY_EVAL_PROTOCOL").unwrap_or_else(|_| "openai".into());
+        if protocol != "openai" {
+            return Err(AgentDriverError::Failed(
+                "builtin driver 当前仅支持 HARMONY_EVAL_PROTOCOL=openai".into(),
+            ));
+        }
+        if !(base_url.starts_with("https://")
+            || base_url.starts_with("http://localhost")
+            || base_url.starts_with("http://127.0.0.1"))
+        {
+            return Err(AgentDriverError::Failed(
+                "builtin driver 仅允许 HTTPS 或本地测试 endpoint".into(),
+            ));
+        }
+        if model_id.trim().is_empty() || api_key.trim().is_empty() {
+            return Err(AgentDriverError::Failed(
+                "builtin driver 的 model_id/api_key 不能为空".into(),
+            ));
+        }
+        let parse_price = |name: &str| -> Result<Option<f64>, AgentDriverError> {
+            match std::env::var(name) {
+                Ok(value) => {
+                    let price = value.parse::<f64>().map_err(|_| {
+                        AgentDriverError::Failed(format!("{name} 必须是有限非负数字"))
+                    })?;
+                    if !price.is_finite() || price < 0.0 {
+                        return Err(AgentDriverError::Failed(format!(
+                            "{name} 必须是有限非负数字"
+                        )));
+                    }
+                    Ok(Some(price))
+                }
+                Err(_) => Ok(None),
+            }
+        };
+        Ok(Self {
+            provider_id,
+            base_url: base_url.trim_end_matches('/').into(),
+            api_key,
+            model_id,
+            max_rounds: 32,
+            input_price_cny_per_1k: parse_price("HARMONY_EVAL_INPUT_PRICE_CNY_PER_1K")?,
+            output_price_cny_per_1k: parse_price("HARMONY_EVAL_OUTPUT_PRICE_CNY_PER_1K")?,
+        })
+    }
+
+    pub fn validate_against(&self, model: &ModelInfo) -> Result<(), AgentDriverError> {
+        if self.provider_id != model.provider {
+            return Err(AgentDriverError::Failed(format!(
+                "builtin provider 不匹配 run-config：{} != {}",
+                self.provider_id, model.provider
+            )));
+        }
+        if self.model_id != model.model_id {
+            return Err(AgentDriverError::Failed(format!(
+                "builtin model_id 不匹配 run-config：{} != {}",
+                self.model_id, model.model_id
+            )));
+        }
+        let protocol = std::env::var("HARMONY_EVAL_PROTOCOL").unwrap_or_else(|_| "openai".into());
+        if protocol != model.protocol {
+            return Err(AgentDriverError::Failed(format!(
+                "builtin protocol 不匹配 run-config：{} != {}",
+                protocol, model.protocol
+            )));
+        }
+        Ok(())
+    }
+}
+
+trait HeadlessModelClient: Send + Sync {
+    fn request<'a>(
+        &'a self,
+        provider: &'a HeadlessProviderConfig,
+        messages: Vec<Value>,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(Value, u64), AgentDriverError>> + Send + 'a>>;
+}
+
+#[derive(Default)]
+struct OpenAiCompatibleClient;
+
+pub struct HeadlessAgentDriver {
+    pub provider: HeadlessProviderConfig,
+    client: Arc<dyn HeadlessModelClient>,
+}
+
+impl HeadlessAgentDriver {
+    pub fn new(provider: HeadlessProviderConfig) -> Self {
+        Self {
+            provider,
+            client: Arc::new(OpenAiCompatibleClient),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_client(provider: HeadlessProviderConfig, client: Arc<dyn HeadlessModelClient>) -> Self {
+        Self { provider, client }
+    }
+
+    fn tool_specs() -> Value {
+        json!([
+            {"type":"function","function":{"name":"list_dir","description":"列出工作区目录结构","parameters":{"type":"object","properties":{"path":{"type":"string"},"depth":{"type":"integer","minimum":1,"maximum":3}}}}},
+            {"type":"function","function":{"name":"read_file","description":"读取工作区内的文本文件","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+            {"type":"function","function":{"name":"write_file","description":"写入工作区内的文本文件","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+            {"type":"function","function":{"name":"preview_edit","description":"预览精确文本替换，不写入文件","parameters":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}}},
+            {"type":"function","function":{"name":"edit_file","description":"对工作区文件执行精确文本替换","parameters":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old","new"]}}},
+            {"type":"function","function":{"name":"find_files","description":"按 glob 查找工作区内文件","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200}},"required":["pattern"]}}},
+            {"type":"function","function":{"name":"grep_files","description":"在工作区内容中搜索文本或正则","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"case_sensitive":{"type":"boolean"},"regex":{"type":"boolean"},"block":{"type":"boolean"}},"required":["pattern"]}}},
+            {"type":"function","function":{"name":"search_symbols","description":"结构优先搜索类、函数和方法","parameters":{"type":"object","properties":{"query":{"type":"string"},"role":{"type":"string","enum":["entity","logic"]},"kind":{"type":"string"},"file":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200}}}}},
+            {"type":"function","function":{"name":"repo_query","description":"统一代码检索入口，支持符号、路径、概念和影响面","parameters":{"type":"object","properties":{"query":{"type":"string"},"mode":{"type":"string","enum":["auto","symbol","path","concept","impact"]},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"]}}},
+            {"type":"function","function":{"name":"git_status","description":"读取当前工作树 Git 状态","parameters":{"type":"object","properties":{}}}},
+            {"type":"function","function":{"name":"git_diff","description":"读取当前工作树 diff","parameters":{"type":"object","properties":{"path":{"type":"string"},"staged":{"type":"boolean"}}}}}
+        ])
+    }
+
+    async fn request_openai(
+        provider: &HeadlessProviderConfig,
+        messages: &[Value],
+        timeout: Duration,
+    ) -> Result<(Value, u64), AgentDriverError> {
+        let url = format!("{}/chat/completions", provider.base_url);
+        let client = reqwest::Client::new();
+        let mut retries = 0;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let request = client
+                .post(&url)
+                .bearer_auth(&provider.api_key)
+                .json(&json!({"model": provider.model_id, "messages": messages, "tools": Self::tool_specs(), "temperature": 0}))
+                .send();
+            let response = tokio::time::timeout_at(deadline, request)
+                .await
+                .map_err(|_| {
+                    AgentDriverError::Cancelled("Provider 请求超过剩余 wall time，已取消".into())
+                })?
+                .map_err(|e| AgentDriverError::Failed(format!("Provider 请求失败：{e}")))?;
+            let status = response.status();
+            let bytes = tokio::time::timeout_at(deadline, response.bytes())
+                .await
+                .map_err(|_| {
+                    AgentDriverError::Cancelled(
+                        "读取 Provider 响应超过剩余 wall time，已取消".into(),
+                    )
+                })?
+                .map_err(|e| AgentDriverError::Failed(format!("读取 Provider 响应失败：{e}")))?;
+            if bytes.len() > MAX_RESPONSE_BYTES {
+                return Err(AgentDriverError::Failed("Provider 响应超过 8 MiB".into()));
+            }
+            if status.is_success() {
+                let value = serde_json::from_slice(&bytes).map_err(|e| {
+                    AgentDriverError::Failed(format!("Provider JSON 无法解析：{e}"))
+                })?;
+                return Ok((value, retries));
+            }
+            if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+                && retries == 0
+            {
+                retries = 1;
+                tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(250)))
+                    .await
+                    .map_err(|_| {
+                        AgentDriverError::Cancelled(
+                            "Provider 重试超过剩余 wall time，已取消".into(),
+                        )
+                    })?;
+                continue;
+            }
+            let detail = crate::utils::redact::redact_text(
+                &String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .take(500)
+                    .collect::<String>(),
+            );
+            return Err(AgentDriverError::Failed(format!(
+                "Provider 返回 HTTP {status}：{detail}"
+            )));
+        }
+    }
+}
+
+impl HeadlessModelClient for OpenAiCompatibleClient {
+    fn request<'a>(
+        &'a self,
+        provider: &'a HeadlessProviderConfig,
+        messages: Vec<Value>,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(Value, u64), AgentDriverError>> + Send + 'a>> {
+        Box::pin(
+            async move { HeadlessAgentDriver::request_openai(provider, &messages, timeout).await },
+        )
+    }
+}
+
+impl HeadlessAgentDriver {
+    async fn run_async_impl(
+        &self,
+        task: &EvalTask,
+        workspace: &Path,
+    ) -> Result<AgentDriverOutcome, AgentDriverError> {
+        let started = Instant::now();
+        let conversation_id = format!("headless-{}", uuid::Uuid::new_v4());
+        let trace_id = task.task_id.as_str();
+        let runtime = HeadlessToolRuntime::new(workspace).map_err(AgentDriverError::Failed)?;
+        let mut sink =
+            SessionTrajectorySink::from_db(&runtime.db, conversation_id, trace_id.to_string())
+                .map_err(AgentDriverError::Failed)?;
+        let system = "你是 HarmonyAgent 的 headless eval agent。只使用提供的工具修改当前工作区；完成修改后必须验证。不要执行工作区外操作。";
+        let mut messages = vec![
+            json!({"role":"system","content":system}),
+            json!({"role":"user","content":task.problem_statement}),
+        ];
+        sink.append(
+            SessionEventType::UserMessage,
+            json!({"content":task.problem_statement}),
+            "user_message",
+            json!({"chars":task.problem_statement.len()}),
+        )
+        .map_err(AgentDriverError::Failed)?;
+        let mut outcome = AgentDriverOutcome::default();
+        sink.append(SessionEventType::SystemNote, json!({"text":"builtin driver started","mode":"minimal","provider":self.provider.provider_id}), "driver_started", json!({"mode":"minimal","provider":self.provider.provider_id})).map_err(AgentDriverError::Failed)?;
+        if task.limits.max_cost_cny > 0.0
+            && (self.provider.input_price_cny_per_1k.is_none()
+                || self.provider.output_price_cny_per_1k.is_none())
+        {
+            return Err(AgentDriverError::Failed(
+                "任务设置了 max_cost_cny，但 builtin driver 缺少价格快照；请设置 HARMONY_EVAL_INPUT_PRICE_CNY_PER_1K 和 HARMONY_EVAL_OUTPUT_PRICE_CNY_PER_1K".into(),
+            ));
+        }
+        let round_limit = self.provider.max_rounds.min(task.limits.max_steps as u32);
+        let mut stopped_by_model = false;
+        for round in 0..round_limit {
+            let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
+            if started.elapsed() >= wall_time {
+                return Err(AgentDriverError::Cancelled(
+                    "builtin driver 超过 wall time".into(),
+                ));
+            }
+            outcome.steps = round as u64 + 1;
+            let request_timeout =
+                Duration::from_secs(60).min(wall_time.saturating_sub(started.elapsed()));
+            let (response, retries) = self
+                .client
+                .request(&self.provider, messages.clone(), request_timeout)
+                .await?;
+            outcome.retries = outcome.retries.saturating_add(retries);
+            if let Some(usage) = response.get("usage") {
+                let input = usage
+                    .get("prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let output = usage
+                    .get("completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                outcome.input_tokens = outcome.input_tokens.saturating_add(input);
+                outcome.output_tokens = outcome.output_tokens.saturating_add(output);
+                if let (Some(input_price), Some(output_price)) = (
+                    self.provider.input_price_cny_per_1k,
+                    self.provider.output_price_cny_per_1k,
+                ) {
+                    outcome.cost_cny +=
+                        input as f64 / 1000.0 * input_price + output as f64 / 1000.0 * output_price;
+                    if outcome.cost_cny > task.limits.max_cost_cny && task.limits.max_cost_cny > 0.0
+                    {
+                        outcome.failure_taxonomy.push("max_cost_exceeded".into());
+                        return Ok(outcome);
+                    }
+                }
+            }
+            let choice = response
+                .get("choices")
+                .and_then(|v| v.get(0))
+                .ok_or_else(|| AgentDriverError::Failed("Provider 响应缺少 choices".into()))?;
+            let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+            if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+                outcome.failure_taxonomy.push("provider_truncated".into());
+            }
+            let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+            let calls = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            sink.append(
+                SessionEventType::AssistantMessage,
+                json!({"content":content,"tool_calls":calls.len()}),
+                "assistant_message",
+                json!({"chars":content.len(),"tool_calls":calls.len()}),
+            )
+            .map_err(AgentDriverError::Failed)?;
+            messages.push(message);
+            if calls.is_empty() {
+                stopped_by_model = true;
+                sink.append(
+                    SessionEventType::SystemNote,
+                    json!({"text":"model returned text"}),
+                    "agent_stop_candidate",
+                    json!({"reason":"model_text"}),
+                )
+                .map_err(AgentDriverError::Failed)?;
+                break;
+            }
+            for call in calls {
+                let id = call.get("id").and_then(Value::as_str).unwrap_or("call");
+                let function = call.get("function").cloned().unwrap_or_else(|| json!({}));
+                let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = function
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                if !runtime.policy.allows(name) {
+                    outcome.policy_violations += 1;
+                    sink.append(
+                        SessionEventType::ToolApproval,
+                        json!({"tool":name,"approved":false,"reason":"headless_allowlist"}),
+                        "tool_rejected",
+                        json!({"name":name,"reason":"headless_allowlist"}),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                    messages.push(json!({"role":"tool","tool_call_id":id,"content":"headless policy rejected tool"}));
+                    continue;
+                }
+                sink.append(
+                    SessionEventType::ToolApproval,
+                    json!({"tool":name,"approved":true,"reason":"headless_allowlist"}),
+                    "tool_approval",
+                    json!({"name":name,"approved":true}),
+                )
+                .map_err(AgentDriverError::Failed)?;
+                sink.append(
+                    SessionEventType::ToolCall,
+                    json!({"name":name,"args":args}),
+                    "tool_call",
+                    json!({"name":name}),
+                )
+                .map_err(AgentDriverError::Failed)?;
+                let result = runtime.execute(name, args).await;
+                outcome.tool_calls += 1;
+                let (ok, raw_text) = match result {
+                    Ok(v) => (true, v),
+                    Err(e) => (false, e),
+                };
+                let (text, truncated) = bounded_tool_output(raw_text);
+                if !ok {
+                    outcome.failure_taxonomy.push("tool_error".into());
+                }
+                if truncated {
+                    outcome
+                        .failure_taxonomy
+                        .push("tool_output_truncated".into());
+                }
+                sink.append(SessionEventType::ToolResult, json!({"name":name,"ok":ok,"output":text.chars().take(4000).collect::<String>(),"truncated":truncated}), "tool_result", json!({"name":name,"ok":ok,"truncated":truncated})).map_err(AgentDriverError::Failed)?;
+                messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
+            }
+        }
+        if !stopped_by_model && outcome.steps >= round_limit as u64 {
+            outcome.failure_taxonomy.push("max_steps_exceeded".into());
+        }
+        sink.append(SessionEventType::SystemNote, json!({"text":"builtin driver finished","steps":outcome.steps,"tool_calls":outcome.tool_calls}), "driver_finished", json!({"steps":outcome.steps,"tool_calls":outcome.tool_calls})).map_err(AgentDriverError::Failed)?;
+        outcome.trajectory = sink.into_trajectory();
+        if self.provider.input_price_cny_per_1k.is_none()
+            || self.provider.output_price_cny_per_1k.is_none()
+        {
+            outcome.failure_taxonomy.push("cost_unavailable".into());
+        }
+        Ok(outcome)
+    }
+}
+
+impl AsyncAgentDriver for HeadlessAgentDriver {
+    fn run_async<'a>(
+        &'a self,
+        task: &'a EvalTask,
+        workspace: &'a Path,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<AgentDriverOutcome, AgentDriverError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.run_async_impl(task, workspace))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HeadlessAgentDriver, HeadlessProviderConfig};
+    use crate::agent::eval_report::ModelInfo;
+    use crate::agent::eval_runner::AsyncAgentDriver;
+    use crate::agent::eval_task::{EvalGrader, EvalLimits, EvalRepo, EvalTask};
+    use crate::agent::headless_runtime::HeadlessToolPolicy;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct ScriptedClient(Mutex<VecDeque<serde_json::Value>>);
+
+    impl super::HeadlessModelClient for ScriptedClient {
+        fn request<'a>(
+            &'a self,
+            _provider: &'a HeadlessProviderConfig,
+            _messages: Vec<serde_json::Value>,
+            _timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (serde_json::Value, u64),
+                            crate::agent::eval_runner::AgentDriverError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .map_err(|error| {
+                        crate::agent::eval_runner::AgentDriverError::Failed(error.to_string())
+                    })?
+                    .pop_front()
+                    .map(|response| (response, 0))
+                    .ok_or_else(|| {
+                        crate::agent::eval_runner::AgentDriverError::Failed(
+                            "scripted provider exhausted".into(),
+                        )
+                    })
+            })
+        }
+    }
+
+    #[test]
+    fn policy_is_fail_closed_for_unknown_tools() {
+        let policy = HeadlessToolPolicy;
+        assert!(policy.allows("read_file"));
+        assert!(policy.allows("write_file"));
+        assert!(policy.allows("preview_edit"));
+        assert!(policy.allows("edit_file"));
+        assert!(policy.allows("find_files"));
+        assert!(policy.allows("search_symbols"));
+        assert!(policy.allows("repo_query"));
+        assert!(policy.allows("git_diff"));
+        assert!(!policy.allows("run_command"));
+        assert!(!policy.allows("mcp__server__read_file"));
+    }
+
+    #[test]
+    fn provider_config_must_match_run_manifest() {
+        let config = HeadlessProviderConfig {
+            provider_id: "openai".into(),
+            base_url: "https://example.invalid".into(),
+            api_key: "secret".into(),
+            model_id: "gpt-test".into(),
+            max_rounds: 1,
+            input_price_cny_per_1k: Some(1.0),
+            output_price_cny_per_1k: Some(2.0),
+        };
+        let model = ModelInfo {
+            provider: "other".into(),
+            model_id: "gpt-test".into(),
+            protocol: "openai".into(),
+            reasoning_effort: "none".into(),
+        };
+        assert!(config.validate_against(&model).is_err());
+    }
+
+    #[test]
+    fn tool_output_is_utf8_safe_and_bounded() {
+        let source = "界".repeat(super::MAX_TOOL_RESULT_CHARS + 1);
+        let (bounded, truncated) = super::bounded_tool_output(source);
+        assert!(truncated);
+        assert!(bounded.contains("tool output truncated"));
+        assert!(bounded.chars().count() < super::MAX_TOOL_RESULT_CHARS + 100);
+    }
+
+    #[tokio::test]
+    async fn builtin_driver_completes_offline_tool_loop() {
+        let responses = [
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"a.txt\",\"content\":\"fixed\\n\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }),
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "done"}
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 2}
+            }),
+        ];
+        let workspace =
+            std::env::temp_dir().join(format!("harmony-headless-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "base\n").unwrap();
+        let task = EvalTask {
+            schema_version: crate::agent::eval_task::EVAL_TASK_SCHEMA_VERSION,
+            task_id: "offline__headless-loop".into(),
+            suite: "offline".into(),
+            problem_statement: "write fixed to a.txt".into(),
+            repo: EvalRepo {
+                url: "file:///offline".into(),
+                base_commit: "0000000".into(),
+                subdir: None,
+            },
+            limits: EvalLimits {
+                wall_time_seconds: 10,
+                max_steps: 4,
+                max_cost_cny: 0.0,
+                network: "none".into(),
+            },
+            grader: EvalGrader {
+                kind: "command".into(),
+                command: vec!["true".into()],
+                timeout_seconds: 1,
+            },
+            artifacts: vec![],
+        };
+        let driver = HeadlessAgentDriver::with_client(
+            HeadlessProviderConfig {
+                provider_id: "stub".into(),
+                base_url: "http://127.0.0.1/offline".into(),
+                api_key: "test-secret".into(),
+                model_id: "offline-model".into(),
+                max_rounds: 4,
+                input_price_cny_per_1k: Some(0.0),
+                output_price_cny_per_1k: Some(0.0),
+            },
+            Arc::new(ScriptedClient(Mutex::new(responses.into_iter().collect()))),
+        );
+
+        let outcome = driver.run_async(&task, &workspace).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+            "fixed\n"
+        );
+        assert_eq!(outcome.steps, 2);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(outcome.input_tokens, 22);
+        assert_eq!(outcome.output_tokens, 7);
+        assert!(outcome.failure_taxonomy.is_empty());
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "tool_result"));
+        assert!(!serde_json::to_string(&outcome.trajectory)
+            .unwrap()
+            .contains("test-secret"));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+}

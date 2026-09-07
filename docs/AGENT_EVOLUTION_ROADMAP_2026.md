@@ -24,12 +24,12 @@
 
 **部分落地（契约/探测/语法层就绪，接线或验收待完成）**
 
-- `SandboxBackend`/`SandboxSpec`、Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线均已就绪——Docker 运行环境下的端到端验证、artifact 导出与把沙箱设为默认值待做。
+- `SandboxBackend`/`SandboxSpec`、可选 Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线均已就绪；产品默认路线已改为无 Docker 依赖的平台原生轻量后端，OCI 只保留为外部 CI 适配器。
 - Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
 - ArkTS LSP 语义层与 `repo_query` 路由/影响面——依赖图重排的统一 planner 待完成。
-- headless eval harness——数据契约/grader/补丁/工作树/编排已落地，真实 `AgentDriver`（需从 12k 行 UI 耦合的 `commands/chat.rs` 抽取 headless 驱动核心，51 个 emit 点）与真实模型 end-to-end 样例待实现。
+- headless eval harness——数据契约/grader/补丁/工作树/编排与最小 builtin driver 已落地；当前 builtin 支持 OpenAI-compatible Provider、受限文件工具和 `--driver builtin`，事件流记录 `mode=minimal`。异步 AgentDriver、统一事件 sink、完整治理与从 `commands/chat.rs` 抽取 Agent Kernel 仍待实现，详见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)。
 
-**需外部基础设施（本仓库环境无法完成，需 Docker/真机/真实模型/官方 harness/签名证书）**
+**需外部基础设施（本仓库环境无法完成，按任务分别需真机/真实模型/官方 harness/签名证书；官方 SWE-bench 复现可在独立 CI 使用容器）**
 
 - 沙箱端到端验证 + 恶意脚本逃逸套件（需可运行容器运行时）。
 - Host Capability Broker 真实执行接入 `device_tools`/`build_tools`（需真机/模拟器验证）。
@@ -159,7 +159,7 @@ Repository Intelligence Service
 - **检索先于生成**：代码定位、影响分析和验证计划是独立可评测阶段；
 - **最终状态裁决**：完成与否由测试、构建、diff 和设备状态判定，不由模型口头声明判定。
 
-## 5. 路线 A：真正的默认沙箱（P0）
+## 5. 路线 A：无 Docker 依赖的默认隔离（P0）
 
 ### 5.1 先定义统一策略，而不是先绑定某个容器产品
 
@@ -186,10 +186,10 @@ trait SandboxBackend {
 
 ### 5.2 推荐落地顺序
 
-1. **先实现 OCI 后端**：Docker/Podman 均可，最容易建立可验证的文件系统、网络和资源边界，也能复用 SWE-bench 官方容器。
-2. **再实现本机轻量后端**：按平台封装原生限制；如果某平台达不到声明能力，UI 必须显示“不受保护”，不能仍叫 sandbox。
-3. **保留 `HostDirectBackend`**：只作为显式兼容模式，启动任务时持续显示风险，不作为默认值。
-4. **拆分宿主特权工具**：`hdc`、模拟器、签名、发布走 Host Capability Broker，每次只获得完成该动作所需的句柄和范围。
+1. **先实现本机轻量后端**：核心安装和日常工具不要求 Docker/Podman；按 macOS/Windows/Linux 封装原生目录、进程、环境和网络限制。如果某平台达不到声明能力，必须失败关闭或明确显示“不受保护”。
+2. **保留 `HostDirectBackend`**：只作为显式兼容模式，启动任务时持续显示风险，不作为默认值。
+3. **拆分宿主特权工具**：`hdc`、模拟器、签名、发布走 Host Capability Broker，每次只获得完成该动作所需的句柄和范围。
+4. **OCI 仅作为可选适配器**：用于官方 SWE-bench 镜像复现或已有容器基础设施的 CI，不进入桌面工具的安装依赖和默认执行路径。
 
 ### 5.3 需要修正的现有能力
 
@@ -339,7 +339,7 @@ harmony-agent eval run \
 
 ### 7.3 公开基准顺序
 
-1. **SWE-bench Verified smoke（25 题）**：打通官方 Docker grader；目标是可复现，不追榜。
+1. **SWE-bench Verified smoke（25 题）**：固定题目与官方 revision；官方容器 grader 只在独立 CI 适配器中复现，不成为 HarmonyAgent 本体依赖，目标是可复现，不追榜。
 2. **SWE-bench Verified 100 题固定子集**：用于每周 harness A/B；同模型、同预算，至少 3 个 trial 或报告置信区间。
 3. **SWE-Explore**：直接测文件/行定位，专门驱动大仓检索路线。
 4. **SWE-bench Pro public 或 SWE-bench Live**：降低旧数据污染和 Verified 天花板问题。
@@ -433,8 +433,8 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 - [x] 把当前 `sandbox_exec` 在 UI/文档中改称“临时副本试运行”，消除错误安全承诺；
 - [x] 写 `SECURITY_BOUNDARY.md`：明确宿主、工作区、网络、凭据和 MCP 边界；
-- [ ] 完成 headless eval adapter 设计与一个真实模型 end-to-end 样例（接口设计与 harness 数据契约/编排已落地——`eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`/`eval_patch`/`eval_workspace`/`eval_runner` 七个模块 + 事件源回放桥接；`run_trial` 已用可注入 `AgentDriver` 生成 manifest/trajectory/patch/report、grader 日志与声明产物，并校验内容摘要；真实 headless `AgentDriver`、`eval run` CLI、失败/取消终态报告与真实模型样例待实现，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）；
-- [ ] 固定 SWE-bench Verified 25 题 smoke 子集；
+- [ ] 完成 headless eval adapter 的生产级 Agent Kernel 与一个真实模型 end-to-end 样例（最小 builtin driver、`eval run --driver builtin`、11 个结构/文件/Git 工具、`SessionTrajectorySink`、`HeadlessToolRuntime`、原生异步 runner 主路径、可注入 `ModelClient`、完全离线的脚本 Provider tool-loop 测试、成本计量、超时/重试与失败/取消终态已实现；完整治理和真实模型手动 workflow 仍待完成，见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)）；
+- [x] 固定 SWE-bench Verified 25 题 smoke 子集（v1 清单覆盖 12 个仓库和三档难度，固定官方 dataset revision；数量/唯一性/ID/revision 校验器与仓库清单测试已落地。官方 gold 25/25 容器自检只作为可选 CI 适配器验收，不是核心工具依赖，见 [SWE_BENCH_VERIFIED_25.md](./SWE_BENCH_VERIFIED_25.md)）；
 - [x] 建立 10k/100k/1M 文件索引基准生成器，并记录 10k 当前基线；
 - [x] 更新 README：二进制下载、支持平台和当前限制（badge 改为仅 Windows/macOS，并明确 Linux 暂不提供官方安装包，避免“跨平台”措辞超出实际产物）。
 
@@ -444,8 +444,8 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 交付：
 
-- [ ] `SandboxBackend` + OCI 实现；Shell/build/test 默认断网运行（已完成 `SandboxSpec`、后端契约、Docker/Podman 运行时探测、fail-closed OCI argv、超时/取消清理、输出限制和审计事件，以及命令接线——`select_sandbox_target`/`resolve_sandbox_target` 按 `HARMONY_SANDBOX_BACKEND`/`HARMONY_SANDBOX_IMAGE` 环境配置 fail-closed 选择执行目标，`run_command` 已接入 `OciBackend::run`（显式配置时容器内执行、缺镜像/运行时不可用即失败关闭），宿主直跑持续显示风险标注；Docker 运行环境下的端到端验证、artifact 导出与把沙箱设为默认值待做）；
-- [ ] approval 与 sandbox escalation 进入统一事件和审计链（审批决议已写入 `session_events`（`ToolApproval` 事件），沙箱升级在 `run_events`；`audit_timeline` 已把两者合并为一条按时间排序的统一审计时间线查询，审批/沙箱/工具调用同链可回放并进入 eval trajectory；写入侧进一步合并为单一事件日志待做）；
+- [ ] 平台原生轻量 `SandboxBackend`；Shell/build/test 默认断网运行且不依赖 Docker（统一 `SandboxSpec`、后端契约、超时/取消、输出限制和审计事件已完成；现有 Docker/Podman `OciBackend` 保留为显式可选适配器，缺镜像/运行时会失败关闭，但不再计划设为桌面默认值；下一步实现 macOS/Linux/Windows 原生后端与 capability 探测）；
+- [ ] approval 与 sandbox escalation 进入统一事件和审计链（审批决议已写入 `session_events`（`ToolApproval` 事件），沙箱升级在 `run_events`；`audit_timeline` 已把两者合并为一条按时间排序的统一审计时间线查询，审批/沙箱/工具调用同链可回放并进入 eval trajectory；headless 的 `SessionTrajectorySink` 已与完整迁移后的 trial 工具数据库共享同一连接，桌面运行时的写入侧进一步合并仍待做）；
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy（类型化窄能力 + 安全校验已落地为 `agent::capability_broker`——`HostCapability` 枚举覆盖 hdc 连接/断开/列表、install、deploy，`validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`；真实执行按 capability_id 接入 device_tools/build_tools 待真机）；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成；`repo_query` 路由 MVP 已完成——`auto` 按查询形态分流 `path/symbol/concept` 到 lexical/结构索引并标注 `source_layer`，`impact` 模式已完成——精确图反向依赖返回“谁引用/调用了该符号”并按主流约定给出候选测试文件；依赖图重排的统一 planner 待完成）；
@@ -484,7 +484,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 | P0 | `EVAL-01 Headless Agent Eval` | 单 task JSON -> patch/trajectory/report | CI artifact 可下载并复跑 |
 | P0 | `INDEX-01 Large Repo Baseline` | 基准生成器 + 现实现报告 | 10k/100k/1M 数据 |
 | P0 | `DOC-01 Truthful Capability Matrix` | 修正 sandbox/二进制/评测表述 | 文档漂移测试 |
-| P1 | `SEC-02 OCI Sandbox` | `network=none` + workspace mount + resource limits | 恶意脚本套件 0 escape |
+| P1 | `SEC-02 Native Sandbox` | 平台原生 `network=none` + workspace scope + resource limits；OCI 可选 | 恶意脚本套件 0 escape，桌面安装不要求 Docker |
 | P1 | `INDEX-02 Persistent File Catalog` | watcher + shard + Git checkout repair | 100k 增量 P95 |
 | P1 | `CTX-01 Repo Query Planner` | lexical/symbol/LSP 路由和 coverage | SWE-Explore Recall@k |
 | P1 | `TOOL-01 Deferred Tool Loading` | core tools + `search_tools` | 同模型 A/B |
@@ -509,11 +509,11 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 我们第一次一起评审时，建议只决定四件事：
 
 1. 是否认同“安全执行、仓库理解、真实评测”是未来 12 周前三优先级；
-2. 默认沙箱先走 OCI，还是优先做 Windows/macOS 本机后端；
+2. Windows/macOS/Linux 原生后端分别能声明哪些能力，能力不足时如何失败关闭；
 3. 通用评测先做 Verified 25/100，还是先做 HarmonyBench 20；
 4. 是否把现有 `sandbox_exec` 立即改名并公开说明其真实边界。
 
-建议默认选择：**OCI 沙箱先行；Verified 25 与 HarmonyBench 20 并行建基线；立即修正文案。** 这条路径最快产生可信、可复现、能对外回应评价的结果。
+建议默认选择：**平台原生轻量隔离先行，OCI 仅作外部 CI 适配器；Verified 25 与 HarmonyBench 20 并行建基线；立即修正文案。** 这条路径既保持桌面工具零 Docker 前置条件，也能产出可信、可复现、能对外回应评价的结果。
 
 ## 14. 资料来源
 

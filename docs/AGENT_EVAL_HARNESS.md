@@ -1,6 +1,6 @@
 # Headless Agent Eval Harness 设计
 
-> 状态：Phase 0 runner 已形成可复现评测包，真实 headless 驱动与 CLI 待接入
+> 状态：Phase 0 runner、builtin headless 驱动与 CLI 已接入；生产级统一 Agent Kernel 待推进
 > 更新日期：2026-09-07
 
 ## 1. 目的
@@ -93,7 +93,7 @@ eval-runs/<run-id>/
 
 `manifest.json` 固定运行条件；`trajectory.jsonl` 保存事件流；`report.json` 只保存 grader 结论和派生指标。三者不得相互替代。
 
-`manifest.json`、`trajectory.jsonl`、`report.json` 已分别落地为 `agent::eval_report` 的 `EvalManifest`/`EvalReport` 与 `agent::eval_trajectory` 的 `TrajectoryWriter`（统一事件信封 + JSONL 落盘 + 边写边算 SHA-256）。`run_trial` 已把驱动返回的真实计量与事件写入评测包；后续 headless 驱动必须复用 `session_events` 事件源，不能从最终文本反推轨迹。
+`manifest.json`、`trajectory.jsonl`、`report.json` 已分别落地为 `agent::eval_report` 的 `EvalManifest`/`EvalReport` 与 `agent::eval_trajectory` 的 `TrajectoryWriter`（统一事件信封 + JSONL 落盘 + 边写边算 SHA-256）。`run_trial` 已是原生异步主路径，并把驱动返回的真实计量与事件写入评测包；builtin headless 驱动通过 `SessionTrajectorySink` 同步生成 session event 与 trajectory，不从最终文本反推轨迹。外部进程 adapter 被放入 blocking worker，不阻塞异步 runtime。
 
 runner 要求调用方显式提供 harness/model/prompt/tool/sandbox 指纹，拒绝用空值生成看似可复现的报告；manifest 还记录规范化 task JSON 的 SHA-256，防止相同 task id 下题目内容被静默替换。`repo.subdir` 会同时约束 Agent 工作目录、grader 工作目录与声明产物根，而补丁仍从完整仓库根采集。
 
@@ -140,7 +140,7 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 ## 8. Adapter 顺序
 
 1. 本地单任务 adapter，打通真实 Agent loop；
-2. SWE-bench Verified 25 题 smoke + 官方 Docker grader；
+2. SWE-bench Verified 25 题 smoke；官方容器 grader 放在可选的独立 CI 适配器中；
 3. HarmonyBench 20 题 smoke；
 4. SWE-Explore 文件/行定位 adapter；
 5. Verified 100 与 HarmonyBench 50 周回归；
@@ -152,7 +152,7 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 
 可以替换：UI event sink、Provider 配置来源、workspace provisioner、sandbox backend、grader adapter 和 artifact sink。
 
-真实驱动接入已定义 `ProcessAgentDriver` 适配协议：受信任的本地 adapter 以 Agent 工作树为当前目录，从 stdin 接收完整 `EvalTask` JSON，并在 stdout 返回 `AgentDriverOutcome` JSON；诊断写 stderr。runner 负责 wall-time 终止、退出码判定和失败/取消评测包收敛。该协议允许先接外部 Provider adapter，之后再把同一接口替换为内置 headless loop。
+真实驱动接入同时支持两条路径：`ProcessAgentDriver` 作为受信任的本地 adapter，以 Agent 工作树为当前目录，从 stdin 接收完整 `EvalTask` JSON，并在 stdout 返回 `AgentDriverOutcome` JSON；`--driver builtin` 使用内置 OpenAI-compatible headless loop，读取 `HARMONY_EVAL_*` Provider 配置并执行受限工具。runner 负责 wall-time 终止、退出码判定和失败/取消评测包收敛。builtin 当前在事件流中记录 `mode=minimal`，完整 Agent Kernel 仍按 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md) 分阶段演进。
 
 不能把 `simulate_scenario` 扩展成假的真实模型评测；确定性 fixture 与真实 trial 必须使用不同 suite 类型和报告字段。
 
@@ -160,11 +160,11 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 
 - [x] 抽取 `AgentEventSink`，让 Tauri 和 JSONL writer 共用事件源（改用拉取式桥接：`eval_trajectory::session_events_to_trajectory` 直接回放 `session_events` 到 trajectory.jsonl，复用真实事件源，无需再引入 push sink trait）；
 - [x] 增加只接受本地已准备 workspace 的 `eval run`（`harmony-agent eval run` CLI 与 `ProcessAgentDriver` 已接通；内置 Provider headless loop 仍待从 `commands/chat.rs` 抽取）；
-- [ ] 只支持一个 Provider、`network=none` 和 command grader（command grader 已落地为 `agent::eval_grader`：argv 直接执行、退出码判定、超时兜底、拒绝 shell 解释器与绝对路径；Provider 接线与 `network=none` 随 runner）；
+- [x] 接入一个 OpenAI-compatible Provider、受限工具 allowlist、`network=none` 任务执行面和 command grader（Provider 通过 `--driver builtin` 与 `HARMONY_EVAL_*` 接线；模型网络与任务网络的严格分层、无 Docker 依赖的平台原生默认隔离仍待后续阶段）；
 - [x] 输出完整 manifest/trajectory/patch/report（`run_trial` 对 resolved/unresolved/harness_error/cancelled 均生成四件套和 grader stdout/stderr；patch/trajectory 摘要与磁盘内容交叉验证）；
 - [ ] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact；
 - [x] 未交付真实沙箱前，runner 必须拒绝不可信 task，而不是回退宿主执行（已落地为 `agent::eval_task`：task schema v1 解析 + 安全校验，拒绝宿主命令/绝对路径/`..`/命令替换/联网/不安全 artifact，并附单元测试）。
 
-已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`、`eval_runner.rs`；主路径剩余工作是真实 headless `AgentDriver` 实现（从 `commands/chat.rs` 抽取）、CLI 入口与 CI artifact。
+已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`、`eval_runner.rs`、`headless_driver.rs`；主路径剩余工作是异步 AgentDriver/事件 sink、完整工具治理与从 `commands/chat.rs` 抽取统一 Agent Kernel。
 
 相关文档：[固定评测集](FIXED_EVALUATION_SUITE.md)、[评测运行快照](EVALUATION_RUN_SNAPSHOTS.md)、[安全边界](SECURITY_BOUNDARY.md)、[演进路线](AGENT_EVOLUTION_ROADMAP_2026.md)。
