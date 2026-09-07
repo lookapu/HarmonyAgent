@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use rusqlite::{params, params_from_iter, types::Value, Connection, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
 use crate::services::harmony;
 
@@ -114,6 +115,196 @@ pub struct Symbol {
     /// Syntactically declared outgoing relationships; targets are resolved in a later layer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_relations: Vec<DeclaredRelation>,
+}
+
+/// `search_symbols` 返回给文件读取工具的不可猜测定位信息。
+///
+/// 句柄不授予额外文件权限：消费端仍必须执行项目根约束。它绑定项目、相对路径、
+/// 精确行区间和完整文件 SHA-256，因此外部编辑器即使做同尺寸改写并保留 mtime，
+/// 旧句柄也会明确失效，而不会静默读取漂移后的代码。
+struct SymbolReadHandle {
+    r: String,
+    p: String,
+    s: usize,
+    e: usize,
+    h: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolReadLocator {
+    pub path: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+const SYMBOL_READ_HANDLE_PREFIX: &str = "sr1.";
+
+fn sha256_base64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
+}
+
+fn file_sha256_base64(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize()))
+}
+
+fn root_read_fingerprint(root: &Path) -> String {
+    sha256_base64(canonical_key(root).as_bytes())
+}
+
+fn encode_symbol_read_handle(handle: &SymbolReadHandle) -> Result<String, String> {
+    let path = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(handle.p.as_bytes());
+    Ok(format!(
+        "{SYMBOL_READ_HANDLE_PREFIX}{}.{}.{:x}.{:x}.{path}",
+        handle.r, handle.h, handle.s, handle.e
+    ))
+}
+
+fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
+    let encoded = value
+        .trim()
+        .strip_prefix(SYMBOL_READ_HANDLE_PREFIX)
+        .ok_or_else(|| "符号读取句柄无效或版本不受支持，请重新查询结构".to_string())?;
+    let mut fields = encoded.split('.');
+    let r = fields.next().unwrap_or_default().to_string();
+    let h = fields.next().unwrap_or_default().to_string();
+    let s = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
+        .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
+    let e = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
+        .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
+    let path = fields.next().unwrap_or_default();
+    if fields.next().is_some() || r.len() != 43 || h.len() != 43 {
+        return Err("符号读取句柄无效或已损坏，请重新查询结构".into());
+    }
+    let p = String::from_utf8(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(path)
+            .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?,
+    )
+    .map_err(|_| "符号读取句柄路径编码无效，请重新查询结构".to_string())?;
+    let handle = SymbolReadHandle { r, p, s, e, h };
+    if handle.p.is_empty() || handle.s == 0 || handle.e < handle.s {
+        return Err("符号读取句柄包含无效定位信息，请重新查询结构".into());
+    }
+    Ok(handle)
+}
+
+/// 为一页结构结果批量生成读取句柄。同一文件只读取和哈希一次，避免类中多个方法
+/// 造成重复 I/O；单文件摘要绑定完整内容而非仅依赖 mtime/size。
+pub fn symbol_read_handles(root: &Path, symbols: &[Symbol]) -> Vec<Result<String, String>> {
+    let canonical_root = match root.canonicalize() {
+        Ok(value) => value,
+        Err(error) => {
+            let message = format!("无法解析项目根目录 {}：{error}", root.display());
+            return symbols.iter().map(|_| Err(message.clone())).collect();
+        }
+    };
+    let root_fingerprint = root_read_fingerprint(&canonical_root);
+    let mut files: HashMap<String, Result<(String, Vec<Symbol>), String>> = HashMap::new();
+    symbols
+        .iter()
+        .map(|symbol| {
+            let cached = files
+                .entry(symbol.file.clone())
+                .or_insert_with(|| {
+                    let path = canonical_root.join(&symbol.file);
+                    let canonical = path.canonicalize().map_err(|error| {
+                        format!("无法定位结构文件 {}：{error}", symbol.file)
+                    })?;
+                    canonical.strip_prefix(&canonical_root).map_err(|_| {
+                        format!("结构文件越出项目根目录：{}", symbol.file)
+                    })?;
+                    let digest = file_sha256_base64(&canonical)
+                        .map_err(|error| format!("读取结构文件 {} 失败：{error}", symbol.file))?;
+                    let mut current_symbols = Vec::new();
+                    scan_file(&canonical, &symbol.file, &mut current_symbols);
+                    Ok((digest, current_symbols))
+                });
+            let (digest, current_symbols) = cached.as_ref().map_err(Clone::clone)?;
+            if !current_symbols.iter().any(|current| {
+                current.kind == symbol.kind
+                    && current.name == symbol.name
+                    && current.line == symbol.line
+                    && current.end_line == symbol.end_line
+                    && current.signature == symbol.signature
+            }) {
+                return Err(format!(
+                    "结构索引中的 {} ({}:{}-{}) 已与文件内容不一致，请等待增量索引刷新后重新查询",
+                    symbol.name, symbol.file, symbol.line, symbol.end_line
+                ));
+            }
+            encode_symbol_read_handle(&SymbolReadHandle {
+                r: root_fingerprint.clone(),
+                p: symbol.file.clone(),
+                s: symbol.line.max(1),
+                e: symbol.end_line.max(symbol.line).max(1),
+                h: digest.clone(),
+            })
+        })
+        .collect()
+}
+
+/// 验证并解析结构读取句柄。根目录、路径和内容摘要全部通过后才返回绝对路径。
+pub fn resolve_symbol_read_handle(
+    roots: &[PathBuf],
+    value: &str,
+) -> Result<SymbolReadLocator, String> {
+    let handle = decode_symbol_read_handle(value)?;
+    let relative = Path::new(&handle.p);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        })
+    {
+        return Err("符号读取句柄路径不安全，请重新查询结构".into());
+    }
+    let mut matched_root = None;
+    for root in roots {
+        let Ok(canonical) = root.canonicalize() else {
+            continue;
+        };
+        if root_read_fingerprint(&canonical) == handle.r {
+            matched_root = Some(canonical);
+            break;
+        }
+    }
+    let root = matched_root.ok_or_else(|| {
+        "符号读取句柄不属于当前项目，请在当前项目重新查询结构".to_string()
+    })?;
+    let path = root
+        .join(relative)
+        .canonicalize()
+        .map_err(|_| "符号读取句柄对应文件已移动或删除，请重新查询结构".to_string())?;
+    path.strip_prefix(&root)
+        .map_err(|_| "符号读取句柄路径越出项目根目录，请重新查询结构".to_string())?;
+    if !path.is_file() {
+        return Err("符号读取句柄对应路径不再是文件，请重新查询结构".into());
+    }
+    let digest = file_sha256_base64(&path)
+        .map_err(|error| format!("验证符号读取句柄失败：{error}"))?;
+    if digest != handle.h {
+        return Err(
+            "结构定位已过期：目标文件已被外部工具或其他会话修改，请重新调用 search_symbols/repo_query 后再读取"
+                .into(),
+        );
+    }
+    Ok(SymbolReadLocator {
+        path,
+        start_line: handle.s,
+        end_line: handle.e,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

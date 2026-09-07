@@ -16,6 +16,8 @@ fn file_content_version(bytes: &[u8]) -> String {
 pub(super) struct ReadFileRequest {
     /// 文件路径（相对工程根或绝对路径，resolve 校验非空）
     pub path: Option<String>,
+    /// `search_symbols` / `repo_query` 返回的、绑定文件 SHA-256 的精确结构定位句柄。
+    pub symbol_handle: Option<String>,
     /// 骨架模式：只输出结构定义行（import/类/函数等），快速了解大文件
     pub outline: Option<bool>,
     /// 骨架分页（1 起，缺省第 1 页；每页 200 条，大文件结构项多时翻页查看）
@@ -1264,8 +1266,35 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法读取文件".into());
     }
-    // Request/Spec 分离：宽松参数 ReadFileRequest → 显式 resolve() 产出严格规范 ReadFileSpec
-    let spec = ReadFileRequest::from_args(args)?.resolve(roots)?;
+    // Request/Spec 分离：宽松参数 ReadFileRequest → 显式 resolve() 产出严格规范 ReadFileSpec。
+    // 结构句柄先在阻塞线程验证完整文件 SHA-256，再转换为普通安全读取区间。
+    let mut request = ReadFileRequest::from_args(args)?;
+    if let Some(handle) = request.symbol_handle.take() {
+        if request.path.is_some()
+            || request.start.is_some()
+            || request.lines.is_some()
+            || request.outline.unwrap_or(false)
+            || request.outline_page.is_some()
+            || request.outline_filter.is_some()
+        {
+            return Err("symbol_handle 与 path/start/lines/outline 参数互斥，请只传结构读取句柄".into());
+        }
+        let root_paths = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let locator = tokio::task::spawn_blocking(move || {
+            crate::services::symbol_index::resolve_symbol_read_handle(&root_paths, &handle)
+        })
+        .await
+        .map_err(|error| format!("验证符号读取句柄任务异常：{error}"))??;
+        request.path = Some(locator.path.to_string_lossy().to_string());
+        request.start = Some(locator.start_line as u64);
+        request.lines = Some(
+            locator
+                .end_line
+                .saturating_sub(locator.start_line)
+                .saturating_add(1) as u64,
+        );
+    }
+    let spec = request.resolve(roots)?;
     let p = &spec.path;
     if spec.stream_large {
         let path = p.clone();
@@ -4567,6 +4596,84 @@ mod tests {
         let out = block_on_rt(read_file(&args, &roots)).unwrap();
         assert!(out.contains("窗口=L2-L2"), "{out}");
         assert!(out.contains("next_start=end"), "{out}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_accepts_symbol_handle_and_rejects_same_size_external_rewrite() {
+        let content = "fn first() {\n  one();\n}\nfn target() {\n  old();\n}\n";
+        let (f, roots) = tmp_file("read_symbol_handle", content, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .expect("应索引目标函数");
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let out = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": handle.clone()}),
+            &roots,
+        ))
+        .expect("句柄读取应成功");
+        assert!(out.contains("fn target()") && out.contains("old();"), "{out}");
+        assert!(!out.contains("fn first()"), "应只返回目标结构区间: {out}");
+
+        // 保持总字节数不变，证明校验不依赖 size；mtime 在部分文件系统上也可能碰撞。
+        std::fs::write(&f, content.replace("old();", "new();")).unwrap();
+        let error = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": handle}),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(error.contains("结构定位已过期"), "{error}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_rejects_symbol_handle_from_another_project() {
+        let (source, _source_roots) = tmp_file("read_symbol_source", "fn source() {}\n", "rs");
+        let source_root = source.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&source_root)
+            .into_iter()
+            .find(|symbol| symbol.name == "source")
+            .expect("应索引源函数");
+        let handle = crate::services::symbol_index::symbol_read_handles(&source_root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let (other, other_roots) = tmp_file("read_symbol_other", "fn other() {}\n", "rs");
+        let error = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": handle}),
+            &other_roots,
+        ))
+        .unwrap_err();
+        assert!(error.contains("不属于当前项目"), "{error}");
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+        std::fs::remove_dir_all(other.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_rejects_malformed_or_ambiguous_symbol_handle() {
+        let (f, roots) = tmp_file("read_symbol_invalid", "fn sample() {}\n", "rs");
+        let malformed = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": "sr1.not-base64"}),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(malformed.contains("无效或已损坏"), "{malformed}");
+        let ambiguous = block_on_rt(read_file(
+            &serde_json::json!({
+                "symbol_handle": "sr1.not-base64",
+                "path": f.to_string_lossy()
+            }),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(ambiguous.contains("互斥"), "{ambiguous}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
     }
 

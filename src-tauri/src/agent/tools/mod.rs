@@ -453,7 +453,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "read_file",
-        desc: "读取文本文件（UTF-8；二进制拒绝通用文本读取）。\n参数：{\"path\":\"<路径，相对项目根或绝对路径>\",\"start\":<可选起始行号，1 起>,\"lines\":<可选行数，缺省全部>,\"outline\":<可选 true 只返回骨架（类/函数/组件等签名，嵌套定义按层级缩进），先快速了解大文件结构再精读>,\"outline_page\":<可选骨架分页（1 起，每页 200 条），结构项多时翻页查看，输出标注总页数与翻页提示>,\"outline_filter\":<可选类型过滤，如 \"函数\"/\"类型\"/\"组件\"：只显示该类条目，分页在过滤后集合上进行>}。\n读取窗口按语言代码块自动对齐：起点落在方法内部会从方法首行开始，末尾仍在块内会补齐到块结束符——绝不把方法截断在中间；块补齐场景输出上限放宽到 40000 字符。\n超过 1MB 的文本必须显式传 start/lines（1-2000），使用固定内存流式窗口，不会把整文件加载进内存；该模式暂不做 outline/代码块自动补齐。\n注释清洗：连续长注释块（≥8 行，如 license 头）自动折叠为一行摘要（标注行号区间，可 start/lines 精读原文），文件头标注折叠统计。\noutline 行号列为「定义行-块尾行」区间（块对齐联动）：read_file {\"start\":区间起点,\"lines\":区间长度} 整读该方法；edit_file {\"start\":区间起点} 整块替换/删除。\n普通模式单次最多 2000 行 / 15000 字符，超出自动截断；返回 file_version、实际窗口和 next_start，可稳定分页并为乐观锁编辑提供版本。大文件建议先定位关键词再按区间精读。\n副作用：无（只读）。\n返回：文件版本、实际窗口、下一页位置及带行号内容；outline 模式返回结构大纲（含块区间）。",
+        desc: "读取文本文件（UTF-8；拒绝二进制）。\n参数：{\"path\":\"<项目内路径>\",\"start\":<可选起始行，1 起>,\"lines\":<可选行数>,\"symbol_handle\":\"<可选，search_symbols/repo_query 返回的 read_handle；与其他参数互斥>\",\"outline\":<可选 true，只返回类/函数/组件等骨架>,\"outline_page\":<可选骨架页码，每页 200 条>,\"outline_filter\":\"<可选类型过滤，如函数/类型/组件>\"}。\nsymbol_handle 绑定项目、文件、行区间和完整 SHA-256；目标文件被外部修改后旧句柄会拒绝读取，需重新查询结构。\n普通代码窗口会自动扩展到完整方法/块，避免截断结束符；长注释块（≥8 行）自动折叠。\n超过 1MB 的文本必须显式传 start/lines（1-2000），使用固定内存流式读取，不支持 outline/块补齐。普通模式最多 2000 行/15000 字符，块补齐最多 40000 字符，超出返回 next_start。\n副作用：无（只读）。\n返回：file_version、实际窗口、next_start 及带行号内容；outline 返回含定义起止行的结构大纲。",
     },
     ToolSpec {
         name: "find_files",
@@ -769,7 +769,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_symbols",
-        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"relations_cursor\":\"<可选，原样传回关系结果的 relations_next_cursor 读取下一页关系>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再用 read_file 按返回的 start-end 行精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构清单、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；热点符号关系超过单次上限时返回 relations_next_cursor 供翻页；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
+        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"relations_cursor\":\"<可选，原样传回关系结果的 relations_next_cursor 读取下一页关系>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再把结果的 read_handle 原样传给 read_file 的 symbol_handle 精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引；生成句柄时每个命中文件只哈希一次）。\n返回：分页结构清单、每项的防漂移 read_handle、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；热点符号关系超过单次上限时返回 relations_next_cursor 供翻页；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
     },
     ToolSpec {
         name: "repo_query",
@@ -3795,8 +3795,8 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     let page = args["page"].as_u64().unwrap_or(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
     // 复用增量持久索引；只把当前页结构元数据带入模型，不把全仓源码塞进上下文。
-    let result = tokio::task::spawn_blocking(move || {
-        crate::services::symbol_index::query_structure_with_cursor(
+    let (result, read_handles) = tokio::task::spawn_blocking(move || {
+        let result = crate::services::symbol_index::query_structure_with_cursor(
             &root,
             &query,
             role.as_deref(),
@@ -3806,7 +3806,9 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
             limit,
             cursor.as_deref(),
             relations_cursor.as_deref(),
-        )
+        )?;
+        let read_handles = crate::services::symbol_index::symbol_read_handles(&root, &result.items);
+        Ok::<_, String>((result, read_handles))
     })
         .await
         .map_err(|e| e.to_string())??;
@@ -3883,7 +3885,7 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
         out.push_str("本页无匹配结构。\n");
         return Ok(out);
     }
-    for s in result.items {
+    for (s, read_handle) in result.items.into_iter().zip(read_handles) {
         let parent = s.parent.as_deref().map(|p| format!(" in {p}")).unwrap_or_default();
         out.push_str(&format!(
             "- [{}/{}; {}/{}] {}{}  ({}:{}-{})\n  {}\n",
@@ -3898,6 +3900,10 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
             s.end_line,
             s.signature
         ));
+        match read_handle {
+            Ok(handle) => out.push_str(&format!("  read_handle={handle}\n")),
+            Err(error) => out.push_str(&format!("  read_handle=unavailable（{error}）\n")),
+        }
     }
     if !result.relations.is_empty() {
         out.push_str("当前页关系：\n");

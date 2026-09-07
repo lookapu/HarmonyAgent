@@ -119,7 +119,7 @@ fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `im
 
 ### 5.5 读写闭环
 
-- 读取：支持 `symbol_id` 或行区间窗口，并返回文件版本和游标；
+- 读取：结构查询为每个结果返回 `read_handle`，`read_file` 校验项目根、当前结构与完整文件 SHA-256 后按精确行区间读取；句柄过期时 fail closed；
 - 修改：优先对结构块做带 `expected_hash` 的锚点 patch；
 - 校验：重新解析受影响文件，检查结构是否仍存在，再运行静态检查、测试和构建；
 - 大范围机械修改：在隔离工作树中用受限脚本执行，通过 diff 审查，不让模型逐文件复制全文。
@@ -138,9 +138,9 @@ fixture 回归覆盖多行接口/类方法、ArkTS 组件/状态装饰器与 `im
 
 1. ~~为结构浏览增加稳定游标/keyset 分页，消除深页 `OFFSET` 的线性扫描，并保留现有页码接口作为兼容层。~~ 已完成。
 2. ~~在生成仓运行渐进解析 1M 验收，记录冷扫描吞吐、写放大、锁等待、峰值内存和取消延迟。~~ 已完成；仍需补充真实混合语言 monorepo 的 Recall@5/20 与任务轨迹验收，达到单库 SLO 边界时再启用物理分片。
-3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS、`extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import/别名/ArkTS `import lazy`、根 `tsconfig` path alias、`oh-package.json5 file:/link:` 本地包入口及有界 re-export/barrel 闭包均已完成；ArkTS `lsp_definition` 单点和 `lsp_references` 有界批量结果也可沉淀成员调用边，覆盖缺口已可量化并可按需/空闲断点推进，失败目标具备跨进程指数退避。SCIP importer 也已接入：逐 document 有界解析、独立 `references` 语义层、文件指纹失效、完整成功后原子切换代次，并保留损坏导入前的有效快照；`search_symbols` 会发现根目录或 `.scip/` 中的产物并报告 active/stale 状态。下一步补超大索引性能基线。
-4. 让 `read_file` 接受结构查询返回的区间/后续 `symbol_id`，补强 hash 冲突保护。
-5. 建调用、状态和测试关系边，再实现统一 `repo_query` planner。
+3. ~~引入 Tree-sitter 语法树，并把当前轻量规则保留为解析失败时的 fallback。~~ TS/TSX/JS/JSX 与 ArkTS、`extends/implements`、保守直接 `calls`、同文件唯一目标、相对命名 import/别名/ArkTS `import lazy`、根 `tsconfig` path alias、`oh-package.json5 file:/link:` 本地包入口及有界 re-export/barrel 闭包均已完成；ArkTS `lsp_definition` 单点和 `lsp_references` 有界批量结果也可沉淀成员调用边，覆盖缺口已可量化并可按需/空闲断点推进，失败目标具备跨进程指数退避。SCIP importer 也已接入：逐 document 有界解析、独立 `references` 语义层、文件指纹失效、完整成功后原子切换代次，并保留损坏导入前的有效快照；`search_symbols` 会发现根目录或 `.scip/` 中的产物并报告 active/stale 状态，超大导入与热点查询基线已纳入手动基准。
+4. ✅ `read_file` 已接受结构查询返回的 `read_handle`：句柄绑定项目根、相对路径、完整行区间与文件 SHA-256；外部工具即使同尺寸改写并保留 mtime，也会拒绝陈旧定位并要求重新查询。
+5. ~~建调用、状态和测试关系边，再实现统一 `repo_query` planner。~~ 已提供统一 symbol/path/concept/impact 路由、反向影响面、候选测试映射，以及热点关系 keyset 游标；状态读写边继续按语言语义能力渐进补充。
 6. 用 10k/100k/1M 基准和真实任务轨迹持续验证 Recall@5/20、延迟与上下文节省量。
 
 关系查询同样遵循“全库可达、单次有界”：热点符号的一次结构查询最多返回 500 条相邻边，并显式给出 `relations_truncated`/缩小过滤条件提示，避免百万引用节点把 SQLite 结果和模型上下文同时撑爆。全图关系总量仍保留在统计中，截断不等于索引丢失。
