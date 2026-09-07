@@ -141,12 +141,14 @@ export const resolvePlanReview = (
   requestId: string,
   approved: boolean,
   feedback?: string,
+  revisedPlan?: string,
 ) =>
   invokeWithError<void>('resolve_plan_review', {
     conversationId,
     requestId,
     approved,
     feedback,
+    revisedPlan,
   })
 
 /** 任务清单条目（todo_write 工具维护，agent:todo 事件推送） */
@@ -456,6 +458,8 @@ export interface AgentRun {
   heartbeat_at: number | null
   lease_expires_at: number | null
   quality_json: string | null
+  /** 用户最终批准的计划；中断恢复后仍作为执行锚点。 */
+  approved_plan: string | null
   error: string | null
   started_at: number
   updated_at: number

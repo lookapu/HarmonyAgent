@@ -6671,16 +6671,12 @@ export default function Home() {
                 size="md"
                 icon="check"
                 onClick={() => {
-                  // 批准：若编辑过计划，把修订稿作为执行要求注入；否则纯批准
+                  // 批准：编辑稿作为结构化最终计划提交，后端持久化并在恢复时复用。
                   const edited = planDraft.trim()
                   const original = pendingPlan.plan.trim()
-                  let fb = planFeedback.trim()
-                  if (edited && edited !== original) {
-                    fb = [fb, `用户修订后的最终计划（请严格据此执行）：\n${edited}`]
-                      .filter(Boolean)
-                      .join('\n\n')
-                  }
-                  void resolvePlanReview(pendingPlan.requestId, true, fb || undefined)
+                  const fb = planFeedback.trim()
+                  const revised = edited && edited !== original ? edited : undefined
+                  void resolvePlanReview(pendingPlan.requestId, true, fb || undefined, revised)
                   setPlanFeedback('')
                 }}
               >

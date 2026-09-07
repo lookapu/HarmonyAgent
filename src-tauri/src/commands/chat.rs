@@ -461,6 +461,8 @@ pub struct PlanReview {
     pub approved: bool,
     /// 用户的修改意见/补充要求（驳回时可能附带）
     pub feedback: String,
+    /// 用户编辑后的最终计划；None 表示沿用模型草案。
+    pub revised_plan: Option<String>,
     /// 用户在审查等待期间主动停止生成（任务应终止，而非带反馈重新规划）
     pub cancelled: bool,
 }
@@ -556,6 +558,7 @@ async fn request_plan_review(
                         Ok(PlanReview {
                             approved: false,
                             feedback: "计划确认通道已关闭".to_string(),
+                            revised_plan: None,
                             cancelled: false,
                         })
                     },
@@ -571,6 +574,7 @@ async fn request_plan_review(
                 return Ok(PlanReview {
                     approved: false,
                     feedback: "计划确认超时，已暂停执行".to_string(),
+                    revised_plan: None,
                     cancelled: false,
                 });
             }
@@ -585,6 +589,7 @@ async fn request_plan_review(
                     return Ok(PlanReview {
                         approved: false,
                         feedback: "用户已停止生成".to_string(),
+                        revised_plan: None,
                         cancelled: true,
                     });
                 }
@@ -600,22 +605,52 @@ pub fn resolve_plan_review(
     request_id: String,
     approved: bool,
     feedback: Option<String>,
+    revised_plan: Option<String>,
     state: State<'_, PlanApprovalState>,
 ) -> Result<(), String> {
     let mut map = state.0.lock().map_err(|e| e.to_string())?;
+    if !map.get(&request_id).is_some_and(|req| req.conversation_id == conversation_id) {
+        return Err("计划审批请求不存在或不属于该会话".into());
+    }
     if let Some(req) = map.remove(&request_id) {
+        let revised_plan = revised_plan
+            .map(|plan| plan.trim().chars().take(40_000).collect::<String>())
+            .filter(|plan| !plan.is_empty());
         crate::agent::interactions::finish(
             &request_id,
             if approved { "approved" } else { "rejected" },
-            serde_json::json!({ "approved": approved, "feedback": feedback }),
+            serde_json::json!({ "approved": approved, "feedback": feedback, "revised_plan": revised_plan }),
         )?;
         let _ = req.tx.send(PlanReview {
             approved,
             feedback: feedback.unwrap_or_default(),
+            revised_plan,
             cancelled: false,
         });
     }
-    let _ = conversation_id;
+    Ok(())
+}
+
+/// 将最终批准计划绑定到 Durable Run，并投影成可继承的执行步骤。
+fn activate_approved_plan(
+    app: &AppHandle,
+    state: &tauri::State<'_, DbState>,
+    conversation_id: &str,
+    run_id: &str,
+    plan: &str,
+) -> Result<(), String> {
+    let todos = crate::agent::todo::from_markdown_plan(plan);
+    if !todos.is_empty() {
+        crate::agent::todo::replace(conversation_id, todos.clone());
+        let _ = app.emit("agent:todo", crate::agent::todo::TodoEvent {
+            conversation_id: conversation_id.to_string(), todos: todos.clone(),
+        });
+    }
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::runtime::set_approved_plan(&conn, run_id, conversation_id, plan)?;
+    if !todos.is_empty() {
+        crate::agent::coordinator::sync_todos(&conn, run_id, conversation_id, &todos)?;
+    }
     Ok(())
 }
 
@@ -2673,6 +2708,10 @@ async fn stream_chat_inner(
             .map(|parent| crate::agent::recovery::build_plan(&conn, &conversation_id, parent))
             .transpose()?
     };
+    let inherited_approved_plan = recovery_plan.as_ref().and_then(|plan| {
+        let conn = state.0.lock().ok()?;
+        crate::agent::runtime::get_run(&conn, &plan.parent_run_id).ok().flatten()?.approved_plan
+    });
     let (goal_contract, goal_diff) = if let Some(plan) = recovery_plan.as_ref() {
         let previous = plan.original_contract.clone()
             .unwrap_or_else(|| crate::agent::acceptance::GoalContract::compile(&plan.original_goal));
@@ -4215,9 +4254,9 @@ async fn stream_chat_inner(
     let mut merged_instructions: Vec<String> = Vec::new();
     // 计划/审查模式：本次任务是否已经过用户批准计划（批准前只允许输出计划，不执行工具）
     let plan_mode = plan_mode_enabled(&opts);
-    let mut plan_confirmed = !plan_mode;
+    let mut plan_confirmed = !plan_mode || inherited_approved_plan.is_some();
     // 已批准计划全文：批准后每轮注入（长任务防中途遗忘/偏离目标，锚定执行方向）
-    let mut confirmed_plan: Option<String> = None;
+    let mut confirmed_plan = inherited_approved_plan;
     // 自上次进度对照以来的工具执行数（每 3 个工具注入一次“对照计划汇报进度”）
     let mut tools_since_progress: u32 = 0;
     // 任务收尾复核计数：模型主动收尾但本任务执行过工具时注入“任务是否真完成”确认，
@@ -5249,6 +5288,7 @@ async fn stream_chat_inner(
                     .unwrap_or(PlanReview {
                         approved: false,
                         feedback: "计划审查通道异常，已暂停".to_string(),
+                        revised_plan: None,
                         cancelled: false,
                     });
                 crate::agent::runtime::transition_global(
@@ -5282,11 +5322,14 @@ async fn stream_chat_inner(
                     }));
                     continue;
                 }
+                let final_plan = review.revised_plan.as_deref().unwrap_or(&plan_text).to_string();
+                activate_approved_plan(app, state, &conversation_id, &trace_id, &final_plan)?;
                 plan_confirmed = true;
-                confirmed_plan = Some(plan_text);
+                confirmed_plan = Some(final_plan.clone());
                 let _ = app.emit("chat-plan-resolved", serde_json::json!({
                     "conversation_id": conversation_id,
                     "approved": true,
+                    "plan": final_plan,
                 }));
                 // 用户在审查时可能直接修订了计划或补充了执行要求；批准但附带意见时，
                 // 作为下一条 user 指令注入，要求 Agent 严格按修订后的方案执行。
@@ -6100,6 +6143,7 @@ async fn stream_chat_inner(
                 .unwrap_or(PlanReview {
                     approved: false,
                     feedback: "计划审查通道异常，已暂停".to_string(),
+                    revised_plan: None,
                     cancelled: false,
                 });
             crate::agent::runtime::transition_global(
@@ -6132,11 +6176,14 @@ async fn stream_chat_inner(
                 }));
                 continue;
             }
+            let final_plan = review.revised_plan.as_deref().unwrap_or(&plan_text).to_string();
+            activate_approved_plan(app, state, &conversation_id, &trace_id, &final_plan)?;
             plan_confirmed = true;
-            confirmed_plan = Some(plan_text);
+            confirmed_plan = Some(final_plan.clone());
             let _ = app.emit("chat-plan-resolved", serde_json::json!({
                 "conversation_id": conversation_id,
                 "approved": true,
+                "plan": final_plan,
             }));
             let note = review.feedback.trim().to_string();
             messages.push(serde_json::json!({

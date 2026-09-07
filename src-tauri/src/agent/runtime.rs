@@ -26,6 +26,8 @@ pub struct AgentRun {
     pub heartbeat_at: Option<i64>,
     pub lease_expires_at: Option<i64>,
     pub quality_json: Option<String>,
+    /// 用户最终批准的执行计划；恢复 Run 继承该版本并持续作为执行锚点。
+    pub approved_plan: Option<String>,
     pub error: Option<String>,
     pub started_at: i64,
     pub updated_at: i64,
@@ -96,10 +98,11 @@ pub fn begin_managed_run(
         "INSERT INTO agent_runs
          (run_id,conversation_id,goal,state,phase,attempt,last_event_seq,recovery_count,
           resume_policy,metadata_json,started_at,updated_at,parent_run_id,recovery_plan_json,recovery_mode,
-          goal_contract_json,heartbeat_at,lease_expires_at)
+          goal_contract_json,heartbeat_at,lease_expires_at,approved_plan)
          VALUES (?1,?2,?3,'running',?4,
                  COALESCE((SELECT attempt+1 FROM agent_runs WHERE run_id=?7),1),
-                 0,0,?5,'{}',?6,?6,?7,?8,?9,?10,?6,?11)",
+                 0,0,?5,'{}',?6,?6,?7,?8,?9,?10,?6,?11,
+                 CASE WHEN ?7 IS NULL THEN NULL ELSE (SELECT approved_plan FROM agent_runs WHERE run_id=?7) END)",
         params![
             run_id,
             conversation_id,
@@ -428,7 +431,7 @@ pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<AgentRun>, Stri
         "SELECT run_id,conversation_id,goal,state,phase,attempt,last_event_seq,recovery_count,
                 resume_policy,acceptance_json,error,started_at,updated_at,finished_at,
                 parent_run_id,recovery_plan_json,recovery_mode,goal_contract_json,
-                remediation_count,heartbeat_at,lease_expires_at,quality_json
+                remediation_count,heartbeat_at,lease_expires_at,quality_json,approved_plan
          FROM agent_runs WHERE run_id=?1",
         [run_id],
         |r| {
@@ -455,11 +458,32 @@ pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<AgentRun>, Stri
                 heartbeat_at: r.get(19)?,
                 lease_expires_at: r.get(20)?,
                 quality_json: r.get(21)?,
+                approved_plan: r.get(22)?,
             })
         },
     )
     .optional()
     .map_err(|e| e.to_string())
+}
+
+/// 保存用户最终批准的计划，并写入 Run 事件流。
+pub fn set_approved_plan(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    plan: &str,
+) -> Result<(), String> {
+    let plan = plan.trim();
+    if plan.is_empty() { return Err("批准计划不能为空".into()); }
+    fence_run_write(conn, run_id)?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let changed = tx.execute(
+        "UPDATE agent_runs SET approved_plan=?1,updated_at=?2 WHERE run_id=?3 AND conversation_id=?4",
+        params![plan, now_ms(), run_id, conversation_id],
+    ).map_err(|e| e.to_string())?;
+    if changed == 0 { return Err("未找到所属会话中的 Agent Run".into()); }
+    append_event_tx(&tx, run_id, conversation_id, "plan.approved", &serde_json::json!({ "plan": plan }), now_ms())?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 pub fn latest_run(conn: &Connection, conversation_id: &str) -> Result<Option<AgentRun>, String> {
@@ -575,7 +599,7 @@ mod tests {
             "PRAGMA foreign_keys=ON;
              CREATE TABLE conversations(id TEXT PRIMARY KEY);
              INSERT INTO conversations(id) VALUES ('c');
-             CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT);
+             CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT,approved_plan TEXT);
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
              CREATE TABLE tool_runs(trace_id TEXT,status TEXT,recovery_policy TEXT);
              CREATE TABLE execution_steps(run_id TEXT,state TEXT,recovery_policy TEXT);",
@@ -662,6 +686,23 @@ mod tests {
         assert_eq!(get_run(&c, "r").unwrap().unwrap().remediation_count, 1);
         transition(&c, "r", "c", "completed", "done", None).unwrap();
         assert!(get_run(&c, "r").unwrap().unwrap().lease_expires_at.is_none());
+    }
+
+    #[test]
+    fn approved_plan_is_persisted_and_inherited_by_recovery_run() {
+        let c = conn();
+        begin_run(&c, "parent", "c", "实现目标").unwrap();
+        set_approved_plan(&c, "parent", "c", "1. 实现\n2. 验证").unwrap();
+        transition(&c, "parent", "c", "interrupted", "recovery_required", None).unwrap();
+        let plan = crate::agent::recovery::RecoveryPlan {
+            parent_run_id: "parent".into(), original_goal: "实现目标".into(),
+            original_contract: None, policy: "continue".into(), decisions: Vec::new(),
+            completed_count: 0, pending_count: 0, verification_count: 0,
+            confirmation_count: 0, created_at: 0,
+        };
+        begin_run_with_recovery(&c, "child", "c", "继续", Some(&plan)).unwrap();
+        assert_eq!(get_run(&c, "child").unwrap().unwrap().approved_plan.as_deref(), Some("1. 实现\n2. 验证"));
+        assert!(events_after(&c, "parent", 0, 20).unwrap().iter().any(|e| e.event_type == "plan.approved"));
     }
 
     #[test]

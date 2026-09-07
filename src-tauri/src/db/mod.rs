@@ -156,6 +156,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (76, "076_session_health", include_str!("../../migrations/076_session_health.sql")),
     (77, "077_project_pin", include_str!("../../migrations/077_project_pin.sql")),
     (78, "078_provider_auto_pool", include_str!("../../migrations/078_provider_auto_pool.sql")),
+    (79, "079_agent_run_approved_plan", include_str!("../../migrations/079_agent_run_approved_plan.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -370,6 +371,7 @@ mod tests {
             "parent_run_id", "recovery_plan_json", "recovery_mode", "goal_contract_json",
             "remediation_count", "heartbeat_at", "lease_expires_at", "quality_json",
             "scheduler_task_id", "root_run_id", "dag_node_id", "budget_json",
+            "approved_plan",
         ] {
             assert!(
                 run_cols.iter().any(|x| x == c),

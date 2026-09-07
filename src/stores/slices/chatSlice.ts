@@ -1031,8 +1031,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
 
   // 计划已被处理（批准/驳回）：清空待确认状态；批准时把计划保留为"已批准计划"执行中展示。
   // 后台会话的计划被处理时（如超时自动驳回）也要从待确认表移除，避免角标残留。
-  listen<{ conversation_id: string; approved: boolean }>('chat-plan-resolved', (event) => {
-    const { conversation_id, approved } = event.payload
+  listen<{ conversation_id: string; approved: boolean; plan?: string }>('chat-plan-resolved', (event) => {
+    const { conversation_id, approved, plan } = event.payload
     set((s) => {
       const arr = s.pendingConfirmations[conversation_id]
       let pendingConfirmations = s.pendingConfirmations
@@ -1050,7 +1050,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         pendingPlan: isCurrentPlan ? null : s.pendingPlan,
         approvedPlan:
           isCurrentPlan && approved
-            ? { conversationId: conversation_id, plan: s.pendingPlan?.plan ?? '' }
+            ? { conversationId: conversation_id, plan: plan ?? s.pendingPlan?.plan ?? '' }
             : s.approvedPlan,
       }
     })
@@ -1567,6 +1567,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
                   ? [...state.messages, recoveredMessage]
                   : state.messages,
                 toolRuns: restoredToolRuns,
+                approvedPlan: run.approved_plan
+                  ? { conversationId: id, plan: run.approved_plan }
+                  : state.approvedPlan,
                 unfinishedConv: {
                   conversationId: id,
                   runId: run.run_id,
@@ -1578,7 +1581,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             })
             return
           }
-          set({ toolRuns: restoredToolRuns })
+          set({
+            toolRuns: restoredToolRuns,
+            approvedPlan: run.approved_plan ? { conversationId: id, plan: run.approved_plan } : null,
+          })
           let goalCriteriaTotal = 0
           let remediationBlockers: string[] = []
           try {
@@ -1964,12 +1970,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     },
 
     /** 回复计划审查：批准执行或驳回（可附带修改意见） */
-    resolvePlanReview: async (requestId, approved, feedback) => {
+    resolvePlanReview: async (requestId, approved, feedback, revisedPlan) => {
       const conv = get().currentConversation
       const pending = get().pendingPlan
       try {
         if (conv) {
-          await resolvePlanReviewApi(conv.id, requestId, approved, feedback)
+          await resolvePlanReviewApi(conv.id, requestId, approved, feedback, revisedPlan)
         }
       } catch {
         // 超时/失效：后端按驳回处理

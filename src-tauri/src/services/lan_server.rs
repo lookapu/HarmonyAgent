@@ -1333,12 +1333,14 @@ fn dispatch_approval(
                 .unwrap_or("")
                 .to_string();
             let feedback = body.get("feedback").and_then(|v| v.as_str()).map(String::from);
+            let revised_plan = body.get("revised_plan").and_then(|v| v.as_str()).map(String::from);
             let state = app.state::<PlanApprovalState>();
             cmd_response(chat::resolve_plan_review(
                 conversation_id,
                 request_id.to_string(),
                 approved,
                 feedback,
+                revised_plan,
                 state,
             ))
         }

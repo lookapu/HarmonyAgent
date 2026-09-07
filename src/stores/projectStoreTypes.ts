@@ -266,7 +266,7 @@ export interface ChatSlice {
   /** 回复 Agent 提问：answer 为空串表示跳过 */
   resolveAskUser: (requestId: string, answer: string) => Promise<void>
   /** 回复计划审查：approved=true 批准执行；false 驳回并可附带修改意见 */
-  resolvePlanReview: (requestId: string, approved: boolean, feedback?: string) => Promise<void>
+  resolvePlanReview: (requestId: string, approved: boolean, feedback?: string, revisedPlan?: string) => Promise<void>
   /** 回复审核结果：true=允许执行 / false=拒绝（可附理由反馈模型）；remember=本会话始终允许该工具 */
   resolveToolApproval: (requestId: string, approved: boolean, remember?: boolean, feedback?: string, scope?: 'session' | 'project') => Promise<void>
   /** 拉取项目内所有会话的待确认项（审批/计划/提问），刷新会话列表角标与恢复数据 */

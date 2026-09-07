@@ -21,6 +21,31 @@ pub struct TodoEvent {
     pub todos: Vec<TodoItem>,
 }
 
+/// 将 Markdown 计划投影为可恢复步骤。标题/说明段不冒充步骤；复杂语义由 Agent 后续细化。
+pub fn from_markdown_plan(plan: &str) -> Vec<TodoItem> {
+    plan.lines().filter_map(plan_line_content).take(30).enumerate().map(|(index, content)| TodoItem {
+        id: format!("approved-plan-{}", index + 1),
+        content: content.chars().take(200).collect(),
+        status: "pending".into(),
+    }).collect()
+}
+
+fn plan_line_content(line: &str) -> Option<String> {
+    let mut value = line.trim();
+    if let Some(rest) = value.strip_prefix("- [ ] ").or_else(|| value.strip_prefix("* [ ] "))
+        .or_else(|| value.strip_prefix("- [x] ")).or_else(|| value.strip_prefix("- [X] ")) {
+        value = rest.trim();
+    } else if let Some(rest) = value.strip_prefix("- ").or_else(|| value.strip_prefix("* ")) {
+        value = rest.trim();
+    } else {
+        let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 { return None; }
+        let rest = &value[digits..];
+        value = rest.strip_prefix('.').or_else(|| rest.strip_prefix('、')).or_else(|| rest.strip_prefix(')'))?.trim();
+    }
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// 访问会话级任务清单（统一收敛到 SessionContext，锁由进程级单例持有）
 fn table() -> std::sync::MutexGuard<'static, crate::agent::session_ctx::SessionContext> {
     crate::agent::session_ctx::sessions()
@@ -155,5 +180,14 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].id, "z");
         assert_eq!(get("t2").len(), 1);
+    }
+
+    #[test]
+    fn markdown_plan_becomes_stable_pending_steps() {
+        let items = from_markdown_plan("# 目标\n1. 建立索引\n2、验证增量更新\n- [ ] 跑百万文件基准\n说明文字");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, "approved-plan-1");
+        assert_eq!(items[1].content, "验证增量更新");
+        assert!(items.iter().all(|item| item.status == "pending"));
     }
 }

@@ -19,6 +19,7 @@
 - 审批审计：`resolve_tool_approval` 决议写入 `session_events`（`ToolApproval` 事件），`audit_timeline` 把 `session_events` 与 `run_events`（沙箱升级）合并为一条按时间排序的统一审计时间线。
 - Host Capability Broker 原型：`HostCapability` 类型化窄能力（hdc 连接/断开/列表、install、deploy）+ `validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`（`agent::capability_broker`）。
 - headless eval harness：task schema v1 + 安全校验、`manifest`/`report`/`trajectory` 数据契约、`command grader`、补丁采集/应用、工作树准备、产物收集/导出（按声明 glob 复制到 `artifacts/`）、`run_trial` 编排（`AgentDriver` 可注入 trait，桩端到端验证），trajectory 复用 `session_events` 事件源（`agent::eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`/`eval_patch`/`eval_workspace`/`eval_runner`，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）。
+- 目标驱动执行闭环：自定义输入编译为 `GoalContract`；计划模式支持生成、编辑和批准，最终计划持久化到 Durable Run、投影为可恢复步骤，并在中断恢复后继续作为每轮执行锚点。
 - 文案与事实基线：`sandbox_exec` 改称“临时副本试运行”、`SECURITY_BOUNDARY.md`、README 下载/平台限制（已修正 Linux 过度承诺）、10k/100k/1M 基准生成器。
 
 **部分落地（契约/探测/语法层就绪，接线或验收待完成）**
