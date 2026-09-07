@@ -4657,6 +4657,31 @@ mod tests {
     }
 
     #[test]
+    fn read_file_rejects_handle_built_from_stale_symbol_coordinates() {
+        let original = "fn first() {\n}\nfn target() {\n  work();\n}\n";
+        let (f, roots) = tmp_file("read_symbol_stale_index", original, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let stale_symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .expect("应索引目标函数");
+        // 模拟 watcher 尚未刷新：查询拿到旧坐标，但磁盘文件已插入一行。
+        std::fs::write(&f, original.replacen("}\nfn target", "}\n\nfn target", 1)).unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[stale_symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .expect("句柄可绑定当前文件摘要，结构复核延迟到实际读取");
+        let error = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": handle}),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(error.contains("符号范围与当前文件不一致"), "{error}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn read_file_rejects_malformed_or_ambiguous_symbol_handle() {
         let (f, roots) = tmp_file("read_symbol_invalid", "fn sample() {}\n", "rs");
         let malformed = block_on_rt(read_file(

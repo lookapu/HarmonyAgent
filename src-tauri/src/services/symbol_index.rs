@@ -128,6 +128,7 @@ struct SymbolReadHandle {
     s: usize,
     e: usize,
     h: String,
+    i: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,11 +165,21 @@ fn root_read_fingerprint(root: &Path) -> String {
     sha256_base64(canonical_key(root).as_bytes())
 }
 
+fn symbol_read_fingerprint(symbol: &Symbol) -> String {
+    sha256_base64(
+        format!(
+            "{}\0{}\0{}\0{}\0{}",
+            symbol.kind, symbol.name, symbol.line, symbol.end_line, symbol.signature
+        )
+        .as_bytes(),
+    )
+}
+
 fn encode_symbol_read_handle(handle: &SymbolReadHandle) -> Result<String, String> {
     let path = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(handle.p.as_bytes());
     Ok(format!(
-        "{SYMBOL_READ_HANDLE_PREFIX}{}.{}.{:x}.{:x}.{path}",
-        handle.r, handle.h, handle.s, handle.e
+        "{SYMBOL_READ_HANDLE_PREFIX}{}.{}.{}.{:x}.{:x}.{path}",
+        handle.r, handle.h, handle.i, handle.s, handle.e
     ))
 }
 
@@ -180,12 +191,13 @@ fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
     let mut fields = encoded.split('.');
     let r = fields.next().unwrap_or_default().to_string();
     let h = fields.next().unwrap_or_default().to_string();
+    let i = fields.next().unwrap_or_default().to_string();
     let s = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
         .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
     let e = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
         .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
     let path = fields.next().unwrap_or_default();
-    if fields.next().is_some() || r.len() != 43 || h.len() != 43 {
+    if fields.next().is_some() || r.len() != 43 || h.len() != 43 || i.len() != 43 {
         return Err("符号读取句柄无效或已损坏，请重新查询结构".into());
     }
     let p = String::from_utf8(
@@ -194,7 +206,7 @@ fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
             .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?,
     )
     .map_err(|_| "符号读取句柄路径编码无效，请重新查询结构".to_string())?;
-    let handle = SymbolReadHandle { r, p, s, e, h };
+    let handle = SymbolReadHandle { r, p, s, e, h, i };
     if handle.p.is_empty() || handle.s == 0 || handle.e < handle.s {
         return Err("符号读取句柄包含无效定位信息，请重新查询结构".into());
     }
@@ -212,11 +224,11 @@ pub fn symbol_read_handles(root: &Path, symbols: &[Symbol]) -> Vec<Result<String
         }
     };
     let root_fingerprint = root_read_fingerprint(&canonical_root);
-    let mut files: HashMap<String, Result<(String, Vec<Symbol>), String>> = HashMap::new();
+    let mut hashes: HashMap<String, Result<String, String>> = HashMap::new();
     symbols
         .iter()
         .map(|symbol| {
-            let cached = files
+            let digest = hashes
                 .entry(symbol.file.clone())
                 .or_insert_with(|| {
                     let path = canonical_root.join(&symbol.file);
@@ -226,31 +238,17 @@ pub fn symbol_read_handles(root: &Path, symbols: &[Symbol]) -> Vec<Result<String
                     canonical.strip_prefix(&canonical_root).map_err(|_| {
                         format!("结构文件越出项目根目录：{}", symbol.file)
                     })?;
-                    let digest = file_sha256_base64(&canonical)
-                        .map_err(|error| format!("读取结构文件 {} 失败：{error}", symbol.file))?;
-                    let mut current_symbols = Vec::new();
-                    scan_file(&canonical, &symbol.file, &mut current_symbols);
-                    Ok((digest, current_symbols))
+                    file_sha256_base64(&canonical)
+                        .map_err(|error| format!("读取结构文件 {} 失败：{error}", symbol.file))
                 });
-            let (digest, current_symbols) = cached.as_ref().map_err(Clone::clone)?;
-            if !current_symbols.iter().any(|current| {
-                current.kind == symbol.kind
-                    && current.name == symbol.name
-                    && current.line == symbol.line
-                    && current.end_line == symbol.end_line
-                    && current.signature == symbol.signature
-            }) {
-                return Err(format!(
-                    "结构索引中的 {} ({}:{}-{}) 已与文件内容不一致，请等待增量索引刷新后重新查询",
-                    symbol.name, symbol.file, symbol.line, symbol.end_line
-                ));
-            }
+            let digest = digest.as_ref().map_err(Clone::clone)?;
             encode_symbol_read_handle(&SymbolReadHandle {
                 r: root_fingerprint.clone(),
                 p: symbol.file.clone(),
                 s: symbol.line.max(1),
                 e: symbol.end_line.max(symbol.line).max(1),
                 h: digest.clone(),
+                i: symbol_read_fingerprint(symbol),
             })
         })
         .collect()
@@ -297,6 +295,17 @@ pub fn resolve_symbol_read_handle(
     if digest != handle.h {
         return Err(
             "结构定位已过期：目标文件已被外部工具或其他会话修改，请重新调用 search_symbols/repo_query 后再读取"
+                .into(),
+        );
+    }
+    let mut current_symbols = Vec::new();
+    scan_file(&path, &handle.p, &mut current_symbols);
+    if !current_symbols
+        .iter()
+        .any(|symbol| symbol_read_fingerprint(symbol) == handle.i)
+    {
+        return Err(
+            "结构定位已过期：索引中的符号范围与当前文件不一致，请等待增量索引刷新并重新查询"
                 .into(),
         );
     }
