@@ -26,6 +26,8 @@ embedding = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep
 cuda = ["embedding", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 # 数据抓取工具 full_fetch 的独立开关（见 [[bin]] required-features）
 full-fetch = []
+# Headless Agent 评测 CLI；显式启用，避免 Tauri 日常构建额外打包命令行二进制。
+eval-cli = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -84,6 +86,11 @@ candle-nn = { version = "0.11", optional = true }
 name = "full_fetch"
 path = "src/bin/full_fetch.rs"
 required-features = ["full-fetch"]
+
+[[bin]]
+name = "harmony-agent"
+path = "src/bin/harmony_agent.rs"
+required-features = ["eval-cli"]
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 # 隐藏控制台（AllocConsole + SW_HIDE）：构建类子进程（hvigor worker 等孙进程）

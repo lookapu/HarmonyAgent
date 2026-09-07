@@ -4,7 +4,7 @@
 //! 模型/工具/prompt 指纹、沙箱边界、资源消耗与 grader 结论。报告字段由 runner 采集，
 //! 与 manifest/trajectory 相互独立，不得相互替代。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const EVAL_REPORT_SCHEMA_VERSION: u32 = 1;
 
@@ -21,14 +21,14 @@ pub struct EvalReport {
     pub outcome: OutcomeInfo,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessInfo {
     pub commit: String,
     pub app_version: String,
     pub platform: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub provider: String,
     pub model_id: String,
@@ -36,13 +36,13 @@ pub struct ModelInfo {
     pub reasoning_effort: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptInfo {
     pub profile_version: String,
     pub digest: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRegistryInfo {
     pub version: String,
     pub digest: String,
@@ -57,7 +57,7 @@ pub struct TaskInfo {
     pub repo_base_commit: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxInfo {
     pub backend: String,
     pub capabilities: String,

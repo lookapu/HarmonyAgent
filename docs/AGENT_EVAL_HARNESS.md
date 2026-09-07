@@ -11,15 +11,33 @@
 
 ## 2. 命令行契约
 
-计划入口：
+当前入口（CLI 通过显式 feature 构建，不进入 Tauri 桌面包）：
 
 ```bash
-harmony-agent eval run \
+cargo run --manifest-path src-tauri/Cargo.toml --features eval-cli --bin harmony-agent -- eval run \
   --task eval/tasks/example.json \
   --workspace /absolute/repo \
-  --model-config eval/model.json \
-  --sandbox oci \
+  --run-config eval/run-config.json \
+  --driver /absolute/path/to/trusted-agent-adapter \
+  --driver-arg adapter-specific-value \
   --output eval-runs/example
+```
+
+`--output` 必须是尚不存在的新目录，防止覆盖旧 trial。task 与 run config 限制为 1 MiB 普通 UTF-8 文件；workspace、driver 在执行前规范化为真实路径，driver 必须是绝对可执行文件。`--driver-arg` 可重复。
+
+`run-config.json` 不保存 API key，只保存可复现指纹：
+
+```json
+{
+  "run_id": "example-001",
+  "suite_version": "1",
+  "grader_version": "command-v1",
+  "harness": { "commit": "full-git-sha", "app_version": "2.1.1", "platform": "macos-arm64" },
+  "model": { "provider": "provider-name", "model_id": "exact-model-id", "protocol": "openai", "reasoning_effort": "high" },
+  "prompt": { "profile_version": "v1", "digest": "sha256:<64-hex>" },
+  "tool_registry": { "version": "v1", "digest": "sha256:<64-hex>" },
+  "sandbox": { "backend": "process-adapter", "capabilities": "workspace-write", "image_digest": null, "network_policy": "none" }
+}
 ```
 
 退出码：
@@ -141,7 +159,7 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 ## 10. 首个实现切片
 
 - [x] 抽取 `AgentEventSink`，让 Tauri 和 JSONL writer 共用事件源（改用拉取式桥接：`eval_trajectory::session_events_to_trajectory` 直接回放 `session_events` 到 trajectory.jsonl，复用真实事件源，无需再引入 push sink trait）；
-- [ ] 增加只接受本地已准备 workspace 的 `eval run`（编排器 `agent::eval_runner::run_trial` 已落地——validate→prepare worktree→drive agent→collect patch→grade→组装，Agent 驱动做成可注入 `AgentDriver` trait、用桩端到端验证；真实 headless `AgentDriver` 实现与 CLI 入口待做）；
+- [x] 增加只接受本地已准备 workspace 的 `eval run`（`harmony-agent eval run` CLI 与 `ProcessAgentDriver` 已接通；内置 Provider headless loop 仍待从 `commands/chat.rs` 抽取）；
 - [ ] 只支持一个 Provider、`network=none` 和 command grader（command grader 已落地为 `agent::eval_grader`：argv 直接执行、退出码判定、超时兜底、拒绝 shell 解释器与绝对路径；Provider 接线与 `network=none` 随 runner）；
 - [x] 输出完整 manifest/trajectory/patch/report（`run_trial` 对 resolved/unresolved/harness_error/cancelled 均生成四件套和 grader stdout/stderr；patch/trajectory 摘要与磁盘内容交叉验证）；
 - [ ] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact；

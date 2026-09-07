@@ -120,7 +120,7 @@ impl AgentDriver for ProcessAgentDriver {
 }
 
 /// 一次 eval 的不可变运行条件。调用方必须显式提供真实指纹，runner 不填伪造默认值。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EvalRunConfig {
     pub run_id: String,
     pub suite_version: String,
