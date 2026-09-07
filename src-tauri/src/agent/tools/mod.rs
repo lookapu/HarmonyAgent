@@ -469,11 +469,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "edit_file",
-        desc: "修改文件，三种模式：old 精确文本替换、start 按「完整代码块」整体替换（推荐编辑/删除整个方法，不固定行数、不漏块结束符）、starts 批量块替换（一次改多个方法）。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文片段（模式一），须与文件内容完全一致>\",\"new\":\"<替换后内容；模式二 new 为空=整块删除>\",\"replace_all\":<可选，true 替换全部出现处，缺省仅第一处>,\"start\":<可选行号（模式二）：语言感知成对 {}() 定位该行所在完整代码块整体替换，块多长操作多长>,\"anchor\":<可选块锚签名（模式二）：块定义行内容片段（如 \"fn parse\"），行号漂移时 ±100 行内自动重定位，找不到则拒绝，防改错块>,\"starts\":<可选行号数组（模式三）：一次定位多个完整块批量替换/删除，与 news 一一对应>,\"news\":<模式三各块新内容数组（空串=整块删除）>,\"anchors\":<可选模式三各块锚签名数组，与 starts 等长（不用锚的项传 null）>,\"dry_run\":<可选 true 只返回 diff 不落盘>}。\nold/start/starts 互斥；块模式内置配平守卫（新内容漏 } 拒绝落盘）；批量块重叠拒绝、只写一个 undo 快照（一次全恢复）；建议先 dry_run 或 preview_edit 预览。\n转义提示：换行写 \\n；字面量「反斜杠+n」（如 [^\\n]*）须写 \\\\n 双重转义。\n文件 ≤1MB；old 不匹配报错并提示附近内容；文件被外部修改后编辑被拒，需重新 read_file。\n副作用：修改项目内文件（dry_run 无副作用）。\n返回：替换处数与位置（块模式返回各块行区间明细）。",
+        desc: "修改文件，支持 old 精确替换、start 完整代码块替换、starts 批量块替换，以及 symbol_handle 防漂移结构编辑。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文片段>\",\"new\":\"<新内容；块模式为空即删除>\",\"replace_all\":<可选>,\"start\":<可选块内行号>,\"anchor\":\"<可选块签名>\",\"starts\":[<批量行号>],\"news\":[\"<批量新内容>\"],\"anchors\":[\"<可选批量签名>\"],\"symbol_handle\":\"<可选 read_handle；仅与 new/dry_run 同用>\",\"dry_run\":<可选>}。\nold/start/starts/symbol_handle 互斥；句柄绑定完整 SHA-256，外部改动后拒绝。块编辑自动定位完整方法并做配平守卫；批量块重叠拒绝且只写一个 undo 快照。文件 ≤1MB，修改前建议 read_file 或 preview_edit。\n副作用：修改项目内文件（dry_run 无副作用）。\n返回：替换位置或块区间。",
     },
     ToolSpec {
         name: "preview_edit",
-        desc: "预览文件编辑的 diff（不落盘，只读）：与 edit_file 相同的参数（path/old/new/replace_all/start/anchor/starts/news/anchors），只计算并返回 unified diff（含 @@ 行号、上下文、增删行统计），文件不会被修改。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文本，需唯一>\",\"new\":\"<新文本>\",\"replace_all\":<可选，全部替换>,\"start\":<可选行号：语言感知定位该行所在完整代码块，diff 即整块替换效果>,\"anchor\":<可选块锚签名：块定义行内容片段，行号漂移时自动重定位>,\"starts\":<可选批量模式：行号数组一次预览多个块的替换/删除，与 news 一一对应>}。\n与 edit_file 完全同口径：超界显式报错、anchor 重定位、块重叠校验——预览即拦截错误定位，不用等落盘才发现改错块。\n适合：编辑前先展示改动（信任感），确认后同参数调用 edit_file 应用；批量重构前先整体过目 diff。\n副作用：无（只读）。\n返回：unified diff 文本 + 统计；确认后必须用 edit_file 应用同一修改。",
+        desc: "预览 edit_file 的 unified diff，不落盘。\n参数：与 edit_file 相同，包括 path/old/new、start/anchor、starts/news/anchors 或 symbol_handle/new。\nsymbol_handle 会先校验项目、符号范围和完整文件 SHA-256；过期即拒绝。预览与落盘共用超界、块定位、重叠与配平校验，确认后可把同一参数交给 edit_file。\n副作用：无（只读）。\n返回：diff、增删统计和块区间。",
     },
     ToolSpec {
         name: "run_command",

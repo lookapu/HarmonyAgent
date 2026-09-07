@@ -136,6 +136,8 @@ pub(super) struct WriteFileSpec {
 pub(super) struct EditFileRequest {
     /// 目标路径
     pub path: Option<String>,
+    /// `search_symbols` / `repo_query` 返回的结构读取句柄；作为单块编辑的强校验定位。
+    pub symbol_handle: Option<String>,
     /// 被替换的原文（resolve 校验非空；与 start 互斥）
     pub old: Option<String>,
     /// 替换成的新文（缺省空串）
@@ -156,6 +158,9 @@ pub(super) struct EditFileRequest {
     pub news: Option<Vec<String>>,
     /// 批量模式各块的锚签名（可选，与 starts 等长；元素可为 null）
     pub anchors: Option<Vec<Option<String>>>,
+    /// 由已验证结构句柄注入，不接受工具 JSON 传入。
+    #[serde(skip)]
+    expected_symbol_sha256: Option<String>,
 }
 
 impl EditFileRequest {
@@ -235,6 +240,7 @@ impl EditFileRequest {
             } else {
                 Vec::new()
             },
+            expected_symbol_sha256: self.expected_symbol_sha256,
         })
     }
 }
@@ -259,6 +265,38 @@ pub(super) struct EditFileSpec {
     pub news: Vec<String>,
     /// 批量模式各块锚签名（与 starts 等长；None = 该块不用锚）
     pub anchors: Vec<Option<String>>,
+    /// 使用 symbol_handle 时绑定的完整文件 SHA-256；普通 path/start 编辑为空。
+    pub expected_symbol_sha256: Option<String>,
+}
+
+async fn resolve_edit_file_spec(args: &Value, roots: &[String]) -> Result<EditFileSpec, String> {
+    let mut request = EditFileRequest::from_args(args)?;
+    if let Some(handle) = request.symbol_handle.take() {
+        if request.path.is_some()
+            || request.old.is_some()
+            || request.start.is_some()
+            || request.starts.is_some()
+            || request.news.is_some()
+            || request.anchor.is_some()
+            || request.anchors.is_some()
+            || request.replace_all.is_some()
+        {
+            return Err(
+                "symbol_handle 与 path/old/start/starts/anchor/replace_all 参数互斥；只需传 symbol_handle 和 new"
+                    .into(),
+            );
+        }
+        let root_paths = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let locator = tokio::task::spawn_blocking(move || {
+            crate::services::symbol_index::resolve_symbol_read_handle(&root_paths, &handle)
+        })
+        .await
+        .map_err(|error| format!("验证符号编辑句柄任务异常：{error}"))??;
+        request.path = Some(locator.path.to_string_lossy().to_string());
+        request.start = Some(locator.start_line as u64);
+        request.expected_symbol_sha256 = Some(locator.file_sha256);
+    }
+    request.resolve(roots)
 }
 
 pub(super) async fn delete_file(args: &Value, roots: &[String]) -> Result<String, String> {
@@ -3182,7 +3220,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         return Err("当前会话未绑定项目目录，无法编辑文件".into());
     }
     // Request/Spec 分离：宽松参数 EditFileRequest → 显式 resolve() 产出严格规范 EditFileSpec
-    let spec = EditFileRequest::from_args(args)?.resolve(roots)?;
+    let spec = resolve_edit_file_spec(args, roots).await?;
     check_nested_module_path(&spec.path, roots)?;
     let p = &spec.path;
     let old = spec.old.as_str();
@@ -3197,8 +3235,17 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return Err("文件是二进制，无法以文本方式编辑".into());
     }
-    // 冲突保护：文件自上次读取后被外部修改 → 提前拦截（比 old 匹配失败的报错更明确）
-    if has_external_change(p, &bytes) {
+    // 结构句柄是完整 SHA-256 基线，强于进程内 FNV stamp；普通编辑仍沿用最后读取基线。
+    if spec
+        .expected_symbol_sha256
+        .as_ref()
+        .is_some_and(|expected| crate::services::symbol_index::sha256_base64(&bytes) != *expected)
+    {
+        return Err(
+            "结构编辑句柄已过期：文件在定位后再次发生变化，请重新查询结构后重试".into(),
+        );
+    }
+    if spec.expected_symbol_sha256.is_none() && has_external_change(p, &bytes) {
         return Err(format!(
             "编辑冲突：文件 {} 自上次读取后被修改（可能被外部编辑器/IDE、其他会话或命令间接改动）。\n请先 read_file 查看最新内容后重新编辑（重新读取会解除冲突保护）。",
             p.display()
@@ -3578,7 +3625,7 @@ pub(super) async fn preview_edit(args: &Value, roots: &[String], _conversation_i
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法预览编辑".into());
     }
-    let spec = EditFileRequest::from_args(args)?.resolve(roots)?;
+    let spec = resolve_edit_file_spec(args, roots).await?;
     let p = &spec.path;
     if !p.is_file() {
         return Err(format!(
@@ -3589,6 +3636,15 @@ pub(super) async fn preview_edit(args: &Value, roots: &[String], _conversation_i
     let bytes = std::fs::read(p).map_err(|e| format!("读取文件失败: {e}"))?;
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return Err("文件是二进制，无法以文本方式编辑".into());
+    }
+    if spec
+        .expected_symbol_sha256
+        .as_ref()
+        .is_some_and(|expected| crate::services::symbol_index::sha256_base64(&bytes) != *expected)
+    {
+        return Err(
+            "结构编辑句柄已过期：文件在定位后再次发生变化，请重新查询结构后重试".into(),
+        );
     }
     // 严格 UTF-8 校验（与 edit_file 同口径，防 GBK 文件预览后写坏）
     let text = std::str::from_utf8(&bytes)
@@ -4747,6 +4803,89 @@ mod tests {
         let text = std::fs::read_to_string(&f).unwrap();
         assert!(text.contains("fn b2()"), "应整块替换: {text}");
         assert!(!text.contains("let z = 3"), "旧方法体应消失: {text}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_replaces_symbol_handle_block_without_separate_read() {
+        let content = "fn keep() {\n  keep_work();\n}\nfn target() {\n  old_work();\n}\n";
+        let (f, roots) = tmp_file("edit_symbol_handle", content, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .expect("应索引目标函数");
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let out = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() {\n  new_work();\n}\n"
+            }),
+            &roots,
+            "t_edit_symbol_handle",
+        ))
+        .expect("结构句柄编辑应成功");
+        assert!(out.contains("完整代码块"), "{out}");
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.contains("keep_work();") && text.contains("new_work();"), "{text}");
+        assert!(!text.contains("old_work();"), "{text}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn preview_edit_supports_symbol_handle_without_writing() {
+        let content = "fn target() {\n  old_work();\n}\n";
+        let (f, roots) = tmp_file("preview_symbol_handle", content, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let out = block_on_rt(preview_edit(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() {\n  preview_work();\n}\n"
+            }),
+            &roots,
+            "t_preview_symbol_handle",
+        ))
+        .expect("结构句柄预览应成功");
+        assert!(out.contains("-  old_work();") && out.contains("+  preview_work();"), "{out}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), content);
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_rejects_stale_symbol_handle() {
+        let content = "fn target() {\n  old_work();\n}\n";
+        let (f, roots) = tmp_file("edit_stale_symbol_handle", content, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::write(&f, content.replace("old_work", "new_work")).unwrap();
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({"symbol_handle": handle, "new": "fn target() {}\n"}),
+            &roots,
+            "t_edit_stale_symbol_handle",
+        ))
+        .unwrap_err();
+        assert!(error.contains("结构定位已过期"), "{error}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
     }
 

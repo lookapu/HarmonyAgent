@@ -136,11 +136,12 @@ pub struct SymbolReadLocator {
     pub path: PathBuf,
     pub start_line: usize,
     pub end_line: usize,
+    pub file_sha256: String,
 }
 
 const SYMBOL_READ_HANDLE_PREFIX: &str = "sr1.";
 
-fn sha256_base64(bytes: &[u8]) -> String {
+pub(crate) fn sha256_base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
 }
 
@@ -313,6 +314,7 @@ pub fn resolve_symbol_read_handle(
         path,
         start_line: handle.s,
         end_line: handle.e,
+        file_sha256: handle.h,
     })
 }
 
