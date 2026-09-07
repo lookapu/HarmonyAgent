@@ -21,11 +21,31 @@ use std::time::Instant;
 pub const OUTCOME_RESOLVED: &str = "resolved";
 pub const OUTCOME_UNRESOLVED: &str = "unresolved";
 pub const OUTCOME_HARNESS_ERROR: &str = "harness_error";
+pub const OUTCOME_CANCELLED: &str = "cancelled";
+
+#[derive(Debug, Clone)]
+pub enum AgentDriverError {
+    Failed(String),
+    Cancelled(String),
+}
+
+impl AgentDriverError {
+    fn status(&self) -> &'static str {
+        match self { Self::Failed(_) => OUTCOME_HARNESS_ERROR, Self::Cancelled(_) => OUTCOME_CANCELLED }
+    }
+    fn message(&self) -> &str {
+        match self { Self::Failed(message) | Self::Cancelled(message) => message }
+    }
+}
+
+impl From<String> for AgentDriverError {
+    fn from(value: String) -> Self { Self::Failed(value) }
+}
 
 /// 在给定工作树中完成任务的执行核心。真实实现待从 UI 耦合的 `commands/chat.rs`
 /// 抽取 headless 驱动；测试桩只需在工作树里做出改动即可驱动整条闭环。
 pub trait AgentDriver: Send + Sync {
-    fn run(&self, task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, String>;
+    fn run(&self, task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError>;
 }
 
 /// 真实驱动必须返回可审计的资源计量与事件，不允许 runner 从最终文本猜测。
@@ -178,7 +198,55 @@ pub fn run_trial(
 
     prepare_worktree(source_repo, &agent_ws, &task.repo.base_commit)?;
     let agent_task_ws = task_workspace(&agent_ws, task)?;
-    let driver_outcome = driver.run(task, &agent_task_ws)?;
+    let trajectory_path = output_dir.join("trajectory.jsonl");
+    let mut trajectory = TrajectoryWriter::create(&trajectory_path)?;
+    trajectory.append(&TrajectoryEvent {
+        ts: started_at.clone(),
+        kind: "trial_started".into(),
+        fields: serde_json::json!({ "run_id": config.run_id, "task_id": task.task_id }),
+    })?;
+    let driver_outcome = match driver.run(task, &agent_task_ws) {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            let status = failure.status();
+            let failure_message = failure.message().to_string();
+            let cancelled = matches!(&failure, AgentDriverError::Cancelled(_));
+            trajectory.append(&TrajectoryEvent {
+                ts: chrono::Utc::now().to_rfc3339(),
+                kind: if cancelled { "agent_cancelled" } else { "agent_failed" }.into(),
+                fields: serde_json::json!({ "message": failure_message }),
+            })?;
+            let (_, raw_digest) = trajectory.finish()?;
+            let trajectory_digest = format!("sha256:{raw_digest}");
+            let patch = String::new();
+            write_json(&output_dir.join("model.patch"), &patch, "model.patch")?;
+            let patch_digest = sha256_hex(patch.as_bytes());
+            let grader_dir = output_dir.join("grader");
+            std::fs::create_dir_all(&grader_dir).map_err(|e| format!("创建 grader 日志目录失败：{e}"))?;
+            write_json(&grader_dir.join("stdout.log"), "", "grader/stdout.log")?;
+            write_json(&grader_dir.join("stderr.log"), "grader 未运行：Agent 未正常结束\n", "grader/stderr.log")?;
+            let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let report = EvalReport {
+                schema_version: EVAL_REPORT_SCHEMA_VERSION,
+                harness: config.harness.clone(), model: config.model.clone(), prompt: config.prompt.clone(),
+                tool_registry: config.tool_registry.clone(), task: task_info, sandbox: config.sandbox.clone(),
+                run: RunInfo {
+                    started: started_at, finished: chrono::Utc::now().to_rfc3339(),
+                    duration_seconds: duration_ms as f64 / 1000.0,
+                    input_tokens: 0, output_tokens: 0, cached_tokens: 0, cost_cny: 0.0,
+                    steps: 0, tool_calls: 0, retries: 0, patch_digest,
+                    trajectory_digest, grader_kind: task.grader.kind.clone(), grader_version: config.grader_version.clone(),
+                },
+                outcome: OutcomeInfo {
+                    status: status.into(), fail_to_pass: 0, pass_to_pass: 0,
+                    failure_taxonomy: vec![if cancelled { "cancelled" } else { "agent_driver_error" }.into()],
+                    policy_violations: 0,
+                },
+            };
+            write_json(&output_dir.join("report.json"), &report.to_json()?, "report.json")?;
+            return Err(format!("{status}: {failure_message}"));
+        }
+    };
     if !driver_outcome.cost_cny.is_finite() || driver_outcome.cost_cny < 0.0 {
         return Err("AgentDriver 返回了无效 cost_cny".into());
     }
@@ -194,13 +262,6 @@ pub fn run_trial(
             driver_outcome.cost_cny, task.limits.max_cost_cny
         ));
     }
-    let trajectory_path = output_dir.join("trajectory.jsonl");
-    let mut trajectory = TrajectoryWriter::create(&trajectory_path)?;
-    trajectory.append(&TrajectoryEvent {
-        ts: started_at.clone(),
-        kind: "trial_started".into(),
-        fields: serde_json::json!({ "run_id": config.run_id, "task_id": task.task_id }),
-    })?;
     for event in &driver_outcome.trajectory {
         trajectory.append(event)?;
     }
@@ -302,7 +363,7 @@ pub struct StubAgentDriver;
 
 #[cfg(test)]
 impl AgentDriver for StubAgentDriver {
-    fn run(&self, _task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, String> {
+    fn run(&self, _task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError> {
         std::fs::write(workspace.join("a.txt"), "fixed\n")
             .map_err(|error| format!("stub agent 写入失败：{error}"))?;
         Ok(AgentDriverOutcome {
@@ -451,6 +512,34 @@ mod tests {
         fs::remove_dir_all(output_dir).ok();
     }
 
+    struct TerminalDriver(bool);
+
+    impl AgentDriver for TerminalDriver {
+        fn run(&self, _task: &EvalTask, _workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError> {
+            if self.0 { Err(AgentDriverError::Cancelled("user stopped".into())) }
+            else { Err(AgentDriverError::Failed("provider unavailable".into())) }
+        }
+    }
+
+    #[test]
+    fn driver_failure_and_cancel_still_emit_complete_trial_bundle() {
+        for (cancelled, expected) in [(false, OUTCOME_HARNESS_ERROR), (true, OUTCOME_CANCELLED)] {
+            let (source, base) = source_repo_with_base();
+            let mut task = task_with_grader(vec!["true"]);
+            task.repo.base_commit = base;
+            let output_dir = std::env::temp_dir().join(format!("deveco-eval-terminal-{}", uuid::Uuid::new_v4()));
+            let error = run_trial(&task, &source, &output_dir, &TerminalDriver(cancelled), &run_config()).unwrap_err();
+            assert!(error.starts_with(expected), "{error}");
+            for path in ["manifest.json", "trajectory.jsonl", "model.patch", "report.json", "grader/stdout.log", "grader/stderr.log"] {
+                assert!(output_dir.join(path).exists(), "{expected} 缺少 {path}");
+            }
+            let report: serde_json::Value = serde_json::from_str(&fs::read_to_string(output_dir.join("report.json")).unwrap()).unwrap();
+            assert_eq!(report["outcome"]["status"], expected);
+            fs::remove_dir_all(source).ok();
+            fs::remove_dir_all(output_dir).ok();
+        }
+    }
+
     #[test]
     fn run_trial_collects_declared_artifacts() {
         let (source, base) = source_repo_with_base();
@@ -487,9 +576,9 @@ mod tests {
     struct SubdirDriver;
 
     impl AgentDriver for SubdirDriver {
-        fn run(&self, _task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, String> {
+        fn run(&self, _task: &EvalTask, workspace: &Path) -> Result<AgentDriverOutcome, AgentDriverError> {
             if workspace.file_name().and_then(|value| value.to_str()) != Some("package") {
-                return Err(format!("driver 未进入任务 subdir：{}", workspace.display()));
+                return Err(format!("driver 未进入任务 subdir：{}", workspace.display()).into());
             }
             fs::write(workspace.join("a.txt"), "fixed\n").map_err(|error| error.to_string())?;
             Ok(AgentDriverOutcome::default())
