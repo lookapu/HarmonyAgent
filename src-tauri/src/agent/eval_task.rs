@@ -4,7 +4,7 @@
 //! 是 headless eval harness 执行状态机的 `validate input` 阶段；实际 runner 在此之后才接工作树与沙箱。
 //! 契约见 docs/AGENT_EVAL_HARNESS.md。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const EVAL_TASK_SCHEMA_VERSION: u32 = 1;
 const MAX_PROBLEM_STATEMENT_BYTES: usize = 64 * 1024;
@@ -13,7 +13,7 @@ const MAX_STEPS: u64 = 10_000;
 const MAX_GRADER_TIMEOUT_SECONDS: u64 = 24 * 3600;
 const MAX_ARTIFACTS: usize = 64;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalTask {
     pub schema_version: u32,
     pub task_id: String,
@@ -26,7 +26,7 @@ pub struct EvalTask {
     pub artifacts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalRepo {
     pub url: String,
     pub base_commit: String,
@@ -34,7 +34,7 @@ pub struct EvalRepo {
     pub subdir: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalLimits {
     pub wall_time_seconds: u64,
     pub max_steps: u64,
@@ -42,7 +42,7 @@ pub struct EvalLimits {
     pub network: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalGrader {
     pub kind: String,
     pub command: Vec<String>,

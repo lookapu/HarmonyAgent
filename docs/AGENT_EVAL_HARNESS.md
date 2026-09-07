@@ -1,7 +1,7 @@
 # Headless Agent Eval Harness 设计
 
-> 状态：Phase 0 接口草案  
-> 更新日期：2026-09-03
+> 状态：Phase 0 runner 已形成可复现评测包，真实 headless 驱动与 CLI 待接入
+> 更新日期：2026-09-07
 
 ## 1. 目的
 
@@ -75,7 +75,9 @@ eval-runs/<run-id>/
 
 `manifest.json` 固定运行条件；`trajectory.jsonl` 保存事件流；`report.json` 只保存 grader 结论和派生指标。三者不得相互替代。
 
-`manifest.json`、`trajectory.jsonl`、`report.json` 已分别落地为 `agent::eval_report` 的 `EvalManifest`/`EvalReport` 与 `agent::eval_trajectory` 的 `TrajectoryWriter`（统一事件信封 + JSONL 落盘 + 边写边算 SHA-256）；事件源（AgentEventSink）待抽取后接入 `TrajectoryWriter`。
+`manifest.json`、`trajectory.jsonl`、`report.json` 已分别落地为 `agent::eval_report` 的 `EvalManifest`/`EvalReport` 与 `agent::eval_trajectory` 的 `TrajectoryWriter`（统一事件信封 + JSONL 落盘 + 边写边算 SHA-256）。`run_trial` 已把驱动返回的真实计量与事件写入评测包；后续 headless 驱动必须复用 `session_events` 事件源，不能从最终文本反推轨迹。
+
+runner 要求调用方显式提供 harness/model/prompt/tool/sandbox 指纹，拒绝用空值生成看似可复现的报告；manifest 还记录规范化 task JSON 的 SHA-256，防止相同 task id 下题目内容被静默替换。`repo.subdir` 会同时约束 Agent 工作目录、grader 工作目录与声明产物根，而补丁仍从完整仓库根采集。
 
 ## 5. Report schema v1 必填字段
 
@@ -139,10 +141,10 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 - [x] 抽取 `AgentEventSink`，让 Tauri 和 JSONL writer 共用事件源（改用拉取式桥接：`eval_trajectory::session_events_to_trajectory` 直接回放 `session_events` 到 trajectory.jsonl，复用真实事件源，无需再引入 push sink trait）；
 - [ ] 增加只接受本地已准备 workspace 的 `eval run`（编排器 `agent::eval_runner::run_trial` 已落地——validate→prepare worktree→drive agent→collect patch→grade→组装，Agent 驱动做成可注入 `AgentDriver` trait、用桩端到端验证；真实 headless `AgentDriver` 实现与 CLI 入口待做）；
 - [ ] 只支持一个 Provider、`network=none` 和 command grader（command grader 已落地为 `agent::eval_grader`：argv 直接执行、退出码判定、超时兜底、拒绝 shell 解释器与绝对路径；Provider 接线与 `network=none` 随 runner）；
-- [ ] 输出完整 manifest/trajectory/patch/report（manifest/report/trajectory 数据契约、patch 采集/应用 `agent::eval_patch`、产物收集 `agent::eval_workspace::collect_artifacts`（按任务声明 glob 复制到 `artifacts/`）已落地；由 `eval run` runner 组装成四件套待做）；
+- [x] 输出完整 manifest/trajectory/patch/report（`run_trial` 对 resolved/unresolved trial 已生成四件套、grader stdout/stderr 与声明产物；patch/trajectory 摘要与磁盘内容交叉验证；harness_error/cancelled 的失败中途收敛报告随真实驱动接入补齐）；
 - [ ] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact；
 - [x] 未交付真实沙箱前，runner 必须拒绝不可信 task，而不是回退宿主执行（已落地为 `agent::eval_task`：task schema v1 解析 + 安全校验，拒绝宿主命令/绝对路径/`..`/命令替换/联网/不安全 artifact，并附单元测试）。
 
-已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`、`eval_runner.rs`；唯一剩余是真实 headless `AgentDriver` 实现（从 `commands/chat.rs` 抽取）+ CLI 入口 + CI artifact。
+已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`、`eval_runner.rs`；主路径剩余工作是真实 headless `AgentDriver` 实现（从 `commands/chat.rs` 抽取）、CLI 入口、失败/取消终态报告与 CI artifact。
 
 相关文档：[固定评测集](FIXED_EVALUATION_SUITE.md)、[评测运行快照](EVALUATION_RUN_SNAPSHOTS.md)、[安全边界](SECURITY_BOUNDARY.md)、[演进路线](AGENT_EVOLUTION_ROADMAP_2026.md)。

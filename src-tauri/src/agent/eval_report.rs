@@ -53,6 +53,7 @@ pub struct TaskInfo {
     pub suite: String,
     pub suite_version: String,
     pub task_id: String,
+    pub task_digest: String,
     pub repo_base_commit: String,
 }
 
@@ -150,6 +151,7 @@ mod tests {
                 suite: "harmonybench-smoke-v0".into(),
                 suite_version: "1".into(),
                 task_id: "smoke__example-1".into(),
+                task_digest: "sha256:task".into(),
                 repo_base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
             },
             sandbox: SandboxInfo {
@@ -194,6 +196,7 @@ mod tests {
             "prompt",
             "tool_registry",
             "task",
+            "task_digest",
             "sandbox",
             "run",
             "outcome",
