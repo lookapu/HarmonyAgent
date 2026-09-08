@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { ChatErrorDetail, TaskSummary } from '../../stores/projectStore'
 import Icon from '../../icons/Icon'
@@ -654,53 +654,142 @@ export const StreamingMessage = memo(function StreamingMessage({
   )
 })
 
-/* ============ 结构化错误卡片（chat-error 事件友好展示） ============ */
+/* ============ 错误分类标签映射 ============ */
+const ERROR_KIND_LABELS: Record<string, string> = {
+  rate_limited: 'Rate Limited',
+  timeout: 'Timeout',
+  network: 'Network',
+  server: 'Server',
+  context_overflow: 'Context Overflow',
+  auth: 'Auth',
+  model: 'Model',
+}
+
+/* ============ 结构化错误卡片（chat-error 事件友好展示）：分类徽章 + 可折叠详情 + 操作栏 ============ */
 export const ErrorCard = memo(function ErrorCard({
   error,
   detail,
   onRetry,
   retryLabel,
+  onViewLogs,
 }: {
   error: string
   detail: ChatErrorDetail | null
   onRetry: () => void
   retryLabel: string
+  onViewLogs?: () => void
 }) {
   const { t } = useTranslation()
-  // 按错误分类着色：认证/请求被拒=红；限流/超时/网络/服务端=橙；上下文超长=黄；其余=红
+  const [expanded, setExpanded] = useState(false)
+  const [copied, setCopied] = useState(false)
+
   const color =
     detail?.kind === 'rate_limited' || detail?.kind === 'timeout' || detail?.kind === 'network' || detail?.kind === 'server'
       ? 'var(--warning)'
       : detail?.kind === 'context_overflow'
         ? 'var(--warning)'
         : 'var(--danger)'
+
   const showRetry = !detail || detail.retryable
+  const kindLabel = detail ? (ERROR_KIND_LABELS[detail.kind] ?? detail.kind) : null
+  const hasDetail = !!detail && (!!detail.reason || !!detail.suggestion)
+
+  const errorText = detail
+    ? `[${detail.kind}] ${detail.title}\n${detail.reason}${detail.suggestion ? `\n建议：${detail.suggestion}` : ''}${detail.statusCode ? `\nHTTP ${detail.statusCode}` : ''}`
+    : error
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(errorText)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch { /* ignore */ }
+  }, [errorText])
+
   return (
     <div
-      className="px-3 py-2.5 text-[12px] animate-fade-in-up rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60"
-      style={{ color }}
+      className="animate-fade-in-up rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60 overflow-hidden"
+      style={{ borderColor: `${color}30` }}
     >
-      <div className="flex items-start gap-2">
-        <Icon name="info" size={13} className="shrink-0 mt-0.5" />
-        <div className="flex-1 min-w-0 space-y-1">
-          {detail ? (
-            <>
-              <p className="font-semibold leading-snug">{detail.title}</p>
-              <p className="break-all leading-snug opacity-90">{detail.reason}</p>
-              {detail.suggestion && (
-                <p className="leading-snug opacity-75">{t('home.suggestion', { text: detail.suggestion })}</p>
-              )}
-            </>
-          ) : (
-            <p className="break-all leading-snug">{error}</p>
+      {/* 头部：图标 + 标题/摘要 + 分类徽章 */}
+      <div className="flex items-start gap-2 px-3 py-2.5">
+        <Icon name="info" size={13} className="shrink-0 mt-0.5" style={{ color }} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            {kindLabel && (
+              <span
+                className="text-[10px] font-medium px-1.5 py-0.5 rounded-md leading-none"
+                style={{ color, backgroundColor: `${color}18` }}
+              >
+                {kindLabel}
+              </span>
+            )}
+            {detail?.statusCode && (
+              <span className="text-[10px] text-[var(--text-muted)] font-mono">
+                HTTP {detail.statusCode}
+              </span>
+            )}
+          </div>
+          <p className="text-[12px] font-semibold leading-snug mt-1" style={{ color }}>
+            {detail ? detail.title : error.slice(0, 120)}
+          </p>
+          {hasDetail && !expanded && (
+            <p className="text-[11.5px] leading-snug text-[var(--text-muted)] mt-0.5 truncate">
+              {detail!.reason}
+            </p>
           )}
         </div>
+      </div>
+
+      {/* 可折叠详情区 */}
+      {hasDetail && expanded && (
+        <div className="px-3 pb-2 space-y-1 border-t border-[var(--border)]/40 pt-2">
+          <p className="text-[11.5px] break-all leading-relaxed text-[var(--text-secondary)]">{detail!.reason}</p>
+          {detail!.suggestion && (
+            <p className="text-[11.5px] leading-relaxed text-[var(--text-muted)]">
+              {t('home.suggestion', { text: detail!.suggestion })}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* 操作栏 */}
+      <div className="flex items-center gap-1 px-2 py-1.5 border-t border-[var(--border)]/40">
+        {hasDetail && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            <Icon name="chevron-right" size={10} className={`transition-transform ${expanded ? 'rotate-90' : ''}`} />
+            {expanded ? t('home.errorCollapse') : t('home.errorExpand')}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+        >
+          <Icon name={copied ? 'check' : 'copy'} size={11} />
+          {copied ? t('home.errorCopied') : t('home.errorCopy')}
+        </button>
+        {onViewLogs && (
+          <button
+            type="button"
+            onClick={onViewLogs}
+            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            <Icon name="health" size={11} />
+            {t('home.errorViewLogs')}
+          </button>
+        )}
         {showRetry && (
           <button
             onClick={onRetry}
-            className="shrink-0 h-7 px-3 rounded-lg text-white text-[11px] font-medium hover:opacity-90 active:scale-95 transition-[opacity,transform]"
+            className="ml-auto flex items-center gap-1 h-7 px-3 rounded-lg text-white text-[11px] font-medium hover:opacity-90 active:scale-95 transition-[opacity,transform]"
             style={{ backgroundColor: color }}
           >
+            <Icon name="refresh" size={11} />
             {retryLabel}
           </button>
         )}

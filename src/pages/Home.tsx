@@ -5043,6 +5043,7 @@ export default function Home() {
                               detail={streamingErrorDetail}
                               onRetry={() => regenerateLast(modelOptions)}
                               retryLabel={t('home.retry')}
+                              onViewLogs={() => navigate('/health')}
                             />
                           )}
                           {/* 中断回复恢复横幅：最后一条 user 消息已提交但回复从未入库，或

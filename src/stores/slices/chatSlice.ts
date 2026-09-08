@@ -300,9 +300,22 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       if (pending && pending.length > 0) continue
       // 当前会话视图级挂起（兜底，历史数据无 pendingConfirmations 时）
       if (isCurrent && s.toolApprovals.length > 0) continue
+      const elapsedSec = Math.round((now - (bucket.startedAt ?? ref)) / 1000)
+      const elapsedMin = Math.floor(elapsedSec / 60)
+      const contextInfo = bucket.content || bucket.reasoning
+        ? `已接收部分内容，但后端已 ${elapsedMin} 分钟无新事件`
+        : `等待首字节响应已 ${elapsedMin} 分钟`
       setBucket(convId, {
         ...emptyStreaming(),
         error: '后端长时间无响应，已自动停止等待。请检查模型配置与网络后重试',
+        errorDetail: {
+          kind: 'timeout',
+          title: '后端长时间无响应',
+          reason: `${contextInfo}，已自动停止等待。`,
+          suggestion: '请检查模型配置与网络连接，或尝试切换其他模型后重试。',
+          retryable: true,
+          statusCode: null,
+        },
       })
       // UI 释放必须与后端任务收敛同步；否则用户重试时旧任务仍持有项目锁，
       // 只会得到“已有任务进行中”，形成假恢复。停止命令失败仍由后端看门狗兜底。
@@ -1868,6 +1881,14 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           setBucket(cid, {
             ...emptyStreaming(),
             error: '停止未生效：后端任务已无响应。请查看应用日志定位卡点，或重启应用后重试',
+            errorDetail: {
+              kind: 'timeout',
+              title: '停止未生效',
+              reason: '后端任务在停止命令后 60 秒内仍未响应，可能已卡死。',
+              suggestion: '请查看应用日志定位卡点，或重启应用后重试。',
+              retryable: false,
+              statusCode: null,
+            },
           })
         }
       }, 10 * 1000)
