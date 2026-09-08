@@ -392,6 +392,39 @@ mod tests {
     }
 
     #[test]
+    fn headless_allowlist_is_exactly_pinned_and_global_db_free() {
+        // 穷举钉住 allowlist：任何新增/删除都要经过显式评审。工具若在分派路径上
+        // 触碰 db::global()（如 todo_write 同步执行图步骤），会破坏 headless 无全局
+        // 库边界，不得进入 allowlist。
+        const EXPECTED: &[&str] = &[
+            "list_dir",
+            "read_file",
+            "write_file",
+            "preview_edit",
+            "edit_file",
+            "find_files",
+            "grep_files",
+            "search_symbols",
+            "repo_query",
+            "git_status",
+            "git_diff",
+        ];
+        let policy = HeadlessToolPolicy;
+        for spec in crate::agent::tools::TOOL_SPECS {
+            assert_eq!(
+                policy.allows(spec.name),
+                EXPECTED.contains(&spec.name),
+                "{} 的 allowlist 归属与钉住清单不一致",
+                spec.name
+            );
+        }
+        for tool in EXPECTED {
+            assert!(policy.allows(tool), "{tool} 应保留在 headless allowlist");
+        }
+        assert!(!policy.allows("todo_write"));
+    }
+
+    #[test]
     fn runtime_database_has_full_application_schema() {
         let runtime = HeadlessToolRuntime::new(Path::new(".")).unwrap();
         let conn = runtime.db.0.lock().unwrap();

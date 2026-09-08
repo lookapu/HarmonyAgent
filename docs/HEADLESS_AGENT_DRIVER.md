@@ -532,5 +532,9 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
    白名单，见 `agent/tools/errors.rs`），重试次数写入 trial 私有 `tool_runs.retry_count`，
    每次尝试前重新检查取消与剩余 wall time；血缘式 Recovery Orchestrator（父运行恢复
    计划/核验门）是桌面会话特性，headless 单次 trial 无父运行血缘，按设计不接入；
-4. 清理 headless 工具路径上的全局数据库依赖；
+4. 清理 headless 工具路径上的全局数据库依赖（已核查完成：headless 运行时使用独立
+   in-memory 库 + 全量迁移，allowlist 工具全部经 `DbState` 注入，不触 `db::global()`；
+   工具分派路径上唯一的全局库调用在 `todo_write`，不在 allowlist。回归测试
+   `headless_allowlist_is_exactly_pinned_and_global_db_free` 穷举钉住 allowlist，
+   任何新增工具都需显式评审其全局库边界）；
 5. 最终抽取 UI/headless 共用的 Agent Kernel。
