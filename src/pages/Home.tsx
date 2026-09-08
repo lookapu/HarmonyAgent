@@ -97,6 +97,7 @@ import {
   ErrorCard,
   EmptyState,
   ChatEmptyState,
+  TaskSummaryCard,
 } from '../chat/components/messageBlocks'
 import { ModelSettingsPopover, PlanCard, TaskOpsBadge } from '../chat/components/plan'
 import {
@@ -5023,26 +5024,7 @@ export default function Home() {
                           )}
                           {/* 任务收尾摘要：明确区分正常完成与达到上限/被停止后的未完成状态。 */}
                           {lastTaskSummary && !isStreaming && (
-                            <div
-                              className={`md-task-summary animate-fade-in-up ${lastTaskSummary.status === 'incomplete' ? 'is-incomplete' : ''}`}
-                            >
-                              <div className="md-task-summary-icon">
-                                <Icon name={lastTaskSummary.status === 'incomplete' ? 'info' : 'check'} size={13} white />
-                              </div>
-                              <div className="min-w-0">
-                                <span className="md-task-summary-title">
-                                  {t(lastTaskSummary.status === 'incomplete' ? 'home.taskIncompleteTitle' : 'home.taskDoneTitle')}
-                                </span>
-                                <span className="md-task-summary-meta tabular-nums">
-                                  {t('home.taskSummary', {
-                                    time: fmtElapsed(lastTaskSummary.durationMs / 1000),
-                                    tools: lastTaskSummary.toolCount,
-                                    files: lastTaskSummary.fileCount,
-                                    tokens: (lastTaskSummary.tokensIn + lastTaskSummary.tokensOut).toLocaleString(),
-                                  })}
-                                </span>
-                              </div>
-                            </div>
+                            <TaskSummaryCard summary={lastTaskSummary} t={t} />
                           )}
                           {/* 工具过程已收进顶部“已处理 N 个操作”徽章（展开查看），对话流不再平铺工具卡 */}
                           <StreamingOutput conversationId={currentConversation?.id ?? null} speed={streamSpeed} />

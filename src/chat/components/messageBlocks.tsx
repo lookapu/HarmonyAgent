@@ -1,10 +1,11 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { ChatErrorDetail } from '../../stores/projectStore'
+import type { ChatErrorDetail, TaskSummary } from '../../stores/projectStore'
 import Icon from '../../icons/Icon'
 import Markdown from '../../components/Markdown'
 import { gitDiffStat, gitFileDiff, gitAcceptChanges, gitRevertFile } from '../../api/git'
 import { sanitizeToolMarkers } from '../chatUtils'
+import { fmtElapsed } from '../chatUtils'
 import { createPortal } from 'react-dom'
 import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
@@ -54,12 +55,36 @@ export function DiffText({ text }: { text: string }) {
 }
 
 /* ============ 思考过程（推理模型 reasoning 折叠展示） ============ */
-export const ThinkingBlock = memo(function ThinkingBlock({ content }: { content: string }) {
+export const ThinkingBlock = memo(function ThinkingBlock({ content, active }: { content: string; active?: boolean }) {
   const { t } = useTranslation()
   // 展开偏好记忆：用户手动开合后跨会话记住（localStorage）
-  const [open, setOpen] = useState(() => getItem(STORAGE_KEYS.THINKING_OPEN) === '1')
+  const [prefOpen, setPrefOpen] = useState(() => getItem(STORAGE_KEYS.THINKING_OPEN) === '1')
+  // 流式期间自动展开（覆盖偏好）；流结束后恢复用户偏好
+  const [streamingAutoOpen, setStreamingAutoOpen] = useState(false)
+  const open = active && streamingAutoOpen ? true : prefOpen
+  // 思考计时：从内容首次非空开始计时
+  const [thinkStart] = useState(() => (content.trim() ? Date.now() : 0))
+  const [thinkElapsed, setThinkElapsed] = useState(0)
+  useEffect(() => {
+    if (!active || !thinkStart) {
+      setThinkElapsed(0)
+      return
+    }
+    setThinkElapsed(Math.floor((Date.now() - thinkStart) / 1000))
+    const timer = setInterval(() => setThinkElapsed(Math.floor((Date.now() - thinkStart) / 1000)), 1000)
+    return () => clearInterval(timer)
+  }, [active, thinkStart])
+  // 流式开始时自动展开；流结束时恢复用户偏好
+  useEffect(() => {
+    if (active && content.trim() && !streamingAutoOpen) {
+      setStreamingAutoOpen(true)
+    }
+    if (!active && streamingAutoOpen) {
+      setStreamingAutoOpen(false)
+    }
+  }, [active, content, streamingAutoOpen])
   const toggle = () => {
-    setOpen((v) => {
+    setPrefOpen((v) => {
       const next = !v
       setItem(STORAGE_KEYS.THINKING_OPEN, next ? '1' : '0')
       return next
@@ -79,6 +104,9 @@ export const ThinkingBlock = memo(function ThinkingBlock({ content }: { content:
           <Icon name="spark" size={11} />
         </span>
         <span className="text-[11px] font-medium">{t('home.thinking')}</span>
+        {active && thinkElapsed > 0 && (
+          <span className="text-[10px] text-[var(--text-muted)] tabular-nums ml-1">{fmtElapsed(thinkElapsed)}</span>
+        )}
         {!open && preview && <span className="thinking-block-preview">{preview}…</span>}
         <Icon name="chevron-right" size={12} className={`thinking-block-caret ${open ? 'rotate-90' : ''}`} />
       </button>
@@ -591,7 +619,7 @@ export const StreamingMessage = memo(function StreamingMessage({
           )}
           <span className="msg-timestamp ml-auto tnum">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
         </div>
-        {shown.reasoning && <ThinkingBlock content={shown.reasoning} />}
+        {shown.reasoning && <ThinkingBlock content={shown.reasoning} active={active} />}
         {shown.content.trim() ? (
           <div className="text-sm break-words leading-relaxed text-[var(--text-primary)]">
             <Markdown streaming={active}>{processedContent}</Markdown>
@@ -806,6 +834,68 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
         </button>
       </div>
       </div>
+    </div>
+  )
+})
+
+/* ============ 任务收尾摘要卡片（可展开查看 token 明细） ============ */
+export const TaskSummaryCard = memo(function TaskSummaryCard({
+  summary,
+  t,
+}: {
+  summary: TaskSummary
+  t: (key: string, opts?: Record<string, unknown>) => string
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const incomplete = summary.status === 'incomplete'
+  const totalTokens = summary.tokensIn + summary.tokensOut
+  return (
+    <div
+      className={`md-task-summary animate-fade-in-up ${incomplete ? 'is-incomplete' : ''}`}
+      style={{ cursor: 'pointer' }}
+      onClick={() => setExpanded((v) => !v)}
+    >
+      <div className="md-task-summary-icon">
+        <Icon name={incomplete ? 'info' : 'check'} size={13} white />
+      </div>
+      <div className="min-w-0 flex-1">
+        <span className="md-task-summary-title">
+          {t(incomplete ? 'home.taskIncompleteTitle' : 'home.taskDoneTitle')}
+        </span>
+        <span className="md-task-summary-meta tabular-nums">
+          {t('home.taskSummary', {
+            time: fmtElapsed(summary.durationMs / 1000),
+            tools: summary.toolCount,
+            files: summary.fileCount,
+            tokens: totalTokens.toLocaleString(),
+          })}
+        </span>
+        {expanded && (
+          <div className="mt-2 pt-2 border-t border-[var(--border)]/50 grid grid-cols-2 gap-x-4 gap-y-1 text-[10.5px]">
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">{t('home.tokensIn')}</span>
+              <span className="text-[var(--text-secondary)] tabular-nums">{summary.tokensIn.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">{t('home.tokensOut')}</span>
+              <span className="text-[var(--text-secondary)] tabular-nums">{summary.tokensOut.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">{t('home.toolCallsShort')}</span>
+              <span className="text-[var(--text-secondary)] tabular-nums">{summary.toolCount}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">{t('home.filesModified')}</span>
+              <span className="text-[var(--text-secondary)] tabular-nums">{summary.fileCount}</span>
+            </div>
+          </div>
+        )}
+      </div>
+      <Icon
+        name="chevron-right"
+        size={11}
+        className={`shrink-0 text-[var(--text-muted)] transition-transform ${expanded ? 'rotate-90' : ''}`}
+      />
     </div>
   )
 })

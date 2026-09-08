@@ -1089,6 +1089,11 @@
     "taskSummary": "用时 {{time}} · 工具调用 {{tools}} 次 · 修改 {{files}} 个文件 · {{tokens}} tokens",
     "taskDoneTitle": "任务完成",
     "taskIncompleteTitle": "任务未完成",
+    "tokensIn": "输入 tokens",
+    "tokensOut": "输出 tokens",
+    "toolCallsShort": "工具调用",
+    "filesModified": "修改文件",
+    "tokenRate": "{{rate}} 字/秒",
     "replyDurationHint": "本条回复用时（任务从开始到完成）"
   },
   "dialog": {

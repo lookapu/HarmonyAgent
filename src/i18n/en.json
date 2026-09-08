@@ -1088,6 +1088,11 @@
     "taskSummary": "{{time}} · {{tools}} tool calls · {{files}} files changed · {{tokens}} tokens",
     "taskDoneTitle": "Task complete",
     "taskIncompleteTitle": "Task incomplete",
+    "tokensIn": "Input tokens",
+    "tokensOut": "Output tokens",
+    "toolCallsShort": "Tool calls",
+    "filesModified": "Files changed",
+    "tokenRate": "{{rate}} chars/s",
     "replyDurationHint": "Time taken for this reply (task start to finish)"
   },
   "dialog": {
