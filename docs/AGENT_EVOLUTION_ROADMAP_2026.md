@@ -27,7 +27,7 @@
 - `SandboxBackend`/`SandboxSpec`、可选 Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线均已就绪；产品默认路线已改为无 Docker 依赖的平台原生轻量后端，OCI 只保留为外部 CI 适配器。
 - Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
 - ArkTS LSP 语义层与 `repo_query` 路由/影响面——依赖图重排的统一 planner 待完成。
-- 结构化代码修改——`edit_file` 已支持完整块/批量块、`symbol_handle` 全文件 SHA-256 防漂移、括号配平、undo 和写后验证计划；统一候选门禁已覆盖 TS/JS/ArkTS Tree-sitter 错误增量与 Java `@Override`/`@Resource` 游离注解增量检查，但块边界仍以括号/缩进扫描为主，尚未形成全语言 AST 事务，Java import/override 类型语义与 JDT/Javac 诊断仍待完成。
+- 结构化代码修改——`symbol_handle` v2 已绑定 file hash、node ID、expected kind、精确节点范围和 parent range；单节点及同文件多节点编辑直接按句柄范围原子修改，连续注解随声明进入同一节点，旧 v1 句柄兼容。统一候选门禁已覆盖 TS/JS/ArkTS Tree-sitter 错误增量与 Java `@Override`/`@Resource` 游离注解增量检查；普通 `start/starts` 模式仍以括号/缩进扫描为 fallback，Java import/override 类型语义与 JDT/Javac 诊断仍待完成。
 - headless eval harness——数据契约/grader/补丁/工作树/编排与 builtin driver 已落地；当前 builtin 支持 OpenAI-compatible Provider、受限文件工具和 `--driver builtin`，非流式回合、多协议流式帧累加器、无 secret 请求规划、成本账本、acceptance stop gate 与 Provider 重试/取消/截止时间控制已进入 UI/headless 共用 Agent Kernel。流响应读取、消息历史/tool loop 与 recovery 的进一步统一仍待实现，详见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)。
 
 **需外部基础设施（本仓库环境无法完成，按任务分别需真机/真实模型/官方 harness/签名证书；官方 SWE-bench 复现可在独立 CI 使用容器）**
@@ -410,7 +410,7 @@ Explore -> Hypothesis -> Minimal Edit -> Targeted Verify
 现有能力作为兼容底座保留：
 
 - `start/starts` 按完整括号块或 Python 缩进块定位，批量块统一使用原文坐标并拒绝重叠；
-- `symbol_handle` 绑定项目、符号范围和完整文件 SHA-256，外部工具改写后失败关闭；
+- `symbol_handle` v2 绑定项目、完整文件 SHA-256、节点 ID/类型/精确范围和父节点范围，连续注解纳入声明节点；外部工具改写或结构漂移后失败关闭，旧 v1 句柄保持兼容；
 - `balance_guard` 在落盘前检查字符串/注释感知的 `{}()[]` 配平；
 - undo、`preview_edit`、增量重索引和 [文件变更验证计划](./CHANGE_VERIFICATION.md) 负责预览、恢复与写后证据。
 
@@ -445,7 +445,7 @@ Flutter/Dart、Rust、TypeScript/ArkTS 等语言采用相同协议，由语言 a
 分阶段实现与出口：
 
 - **P0 写前门禁**：先在内存副本应用、配平、解析、diff 范围核对，失败不落盘；把现有写工具统一接入事务外壳；
-- **P1 节点事务**：编辑参数改为 `symbol_handle/node_id + expected_hash + expected_kind + replacement`，支持同文件多节点原子修改和结构重定位；
+- **P1 节点事务**：核心已落地——`symbol_handle` v2 封装 `node_id + expected_hash + expected_kind + parent range`，支持单节点与同文件多节点原子修改；下一步补同文件非目标区域变化后的受控结构重定位，不以模糊匹配静默越过冲突；
 - **P1 Java 语义闭环**：JDT LS/Javac adapter、annotation/import/override 联动、Maven/Gradle 验证；
 - **P2 跨文件事务**：承接 LSP WorkspaceEdit、原子暂存/提交、失败回滚和外部编辑冲突重规划；
 - **评测出口**：固定加入漏 `) ] }`、Widget 子树错位、Java 游离 `@Override`/`@Resource`、误删仍在使用的 import、并发外部改写、部分多文件写入六类故障；要求新语法错误落盘率为 0、部分事务残留率为 0，并分别报告预防率、回滚率和误拒绝率。
@@ -497,7 +497,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy（类型化窄能力 + 安全校验已落地为 `agent::capability_broker`——`HostCapability` 枚举覆盖 hdc 连接/断开/列表、install、deploy，`validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`；真实执行按 capability_id 接入 device_tools/build_tools 待真机）；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成；`repo_query` 路由 MVP 已完成——`auto` 按查询形态分流 `path/symbol/concept` 到 lexical/结构索引并标注 `source_layer`，`impact` 模式已完成——精确图反向依赖返回“谁引用/调用了该符号”并按主流约定给出候选测试文件；依赖图重排的统一 planner 待完成）；
-- [ ] 结构化代码修改事务 P0/P1：P0 已将 `write_file`、`edit_file`、`multi_edit` 与 LSP WorkspaceEdit 接入候选文本门禁；TS/JS/ArkTS 使用 Tree-sitter 错误增量检查，Java 在 JDT/Javac 接入前先以增量声明门禁阻止新增游离 `@Override`/`@Resource`，其他语言明确回退配平层；`multi_edit` 已先验证全部文件后原子提交并在写入失败时回滚，门禁/回滚/结构过期状态已接入工具卡。剩余工作是节点句柄携带 file hash、node kind 与父节点范围，补齐 Dart/Rust adapter，并接入 Java JDT LS/Javac 的 import/override 类型语义联动；失败时不落盘或整体回滚，且不依赖 Docker；
+- [ ] 结构化代码修改事务 P0/P1：P0 已将 `write_file`、`edit_file`、`multi_edit` 与 LSP WorkspaceEdit 接入候选文本门禁；TS/JS/ArkTS 使用 Tree-sitter 错误增量检查，Java 在 JDT/Javac 接入前先以增量声明门禁阻止新增游离 `@Override`/`@Resource`，其他语言明确回退配平层；`multi_edit` 已先验证全部文件后原子提交并在写入失败时回滚，门禁/回滚/结构过期状态已接入工具卡。P1 节点句柄 v2 已携带 file hash、node ID/kind、精确范围与 parent range，单节点和同文件多节点事务已落地，Java/Kotlin 方法与字段进入轻量结构索引且连续注解随声明修改。剩余工作是受控结构重定位、Dart/Rust adapter，以及 Java JDT LS/Javac 的 import/override 类型语义联动；失败时不落盘或整体回滚，且不依赖 Docker；
 - [ ] 每周真实模型回归，保存 patch/trajectory/cost/report。
 
 退出门槛：恶意仓库脚本不能读取工作区外文件或联网；100k 文件仓库满足校准后的 P95 指标；结构化修改故障集中新增语法错误落盘率和部分事务残留率均为 0；真实模型评测可重复。

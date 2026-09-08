@@ -29,7 +29,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 11;
+const STRUCTURE_PARSER_VERSION: i64 = 12;
 const MAX_REEXPORT_DEPTH: usize = 8;
 const MAX_REEXPORT_BRANCHES: usize = 16;
 const MAX_REEXPORT_VISITS: usize = 128;
@@ -129,6 +129,10 @@ struct SymbolReadHandle {
     e: usize,
     h: String,
     i: String,
+    k: String,
+    ps: usize,
+    pe: usize,
+    version: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,9 +141,13 @@ pub struct SymbolReadLocator {
     pub start_line: usize,
     pub end_line: usize,
     pub file_sha256: String,
+    pub node_id: String,
+    pub expected_kind: Option<String>,
+    pub parent_range: Option<(usize, usize)>,
 }
 
-const SYMBOL_READ_HANDLE_PREFIX: &str = "sr1.";
+const SYMBOL_READ_HANDLE_V1_PREFIX: &str = "sr1.";
+const SYMBOL_READ_HANDLE_V2_PREFIX: &str = "sr2.";
 
 pub(crate) fn sha256_base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
@@ -176,19 +184,65 @@ fn symbol_read_fingerprint(symbol: &Symbol) -> String {
     )
 }
 
+fn symbol_parent_range(symbol: &Symbol, symbols: &[Symbol]) -> Option<(usize, usize)> {
+    let contains = |candidate: &&Symbol| {
+        candidate.file == symbol.file
+            && candidate.line <= symbol.line
+            && candidate.end_line >= symbol.end_line
+            && (candidate.line != symbol.line
+                || candidate.end_line != symbol.end_line
+                || candidate.name != symbol.name
+                || candidate.kind != symbol.kind)
+    };
+    let named_parent = symbol.parent.as_deref().and_then(|parent| {
+        symbols
+            .iter()
+            .filter(contains)
+            .filter(|candidate| candidate.name == parent)
+            .min_by_key(|candidate| candidate.end_line.saturating_sub(candidate.line))
+    });
+    named_parent
+        .or_else(|| {
+            symbols
+                .iter()
+                .filter(contains)
+                .min_by_key(|candidate| candidate.end_line.saturating_sub(candidate.line))
+        })
+        .map(|parent| (parent.line.max(1), parent.end_line.max(parent.line).max(1)))
+}
+
+fn attached_annotation_start(content: &str, declaration_line: usize) -> usize {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut start = declaration_line.max(1).min(lines.len().max(1));
+    while start > 1 {
+        let previous = lines[start - 2].trim();
+        if previous.starts_with('@') {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    start
+}
+
 fn encode_symbol_read_handle(handle: &SymbolReadHandle) -> Result<String, String> {
     let path = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(handle.p.as_bytes());
+    let kind = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(handle.k.as_bytes());
     Ok(format!(
-        "{SYMBOL_READ_HANDLE_PREFIX}{}.{}.{}.{:x}.{:x}.{path}",
-        handle.r, handle.h, handle.i, handle.s, handle.e
+        "{SYMBOL_READ_HANDLE_V2_PREFIX}{}.{}.{}.{:x}.{:x}.{:x}.{:x}.{kind}.{path}",
+        handle.r, handle.h, handle.i, handle.s, handle.e, handle.ps, handle.pe
     ))
 }
 
 fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
-    let encoded = value
-        .trim()
-        .strip_prefix(SYMBOL_READ_HANDLE_PREFIX)
-        .ok_or_else(|| "符号读取句柄无效或版本不受支持，请重新查询结构".to_string())?;
+    let trimmed = value.trim();
+    let (version, encoded) = if let Some(encoded) = trimmed.strip_prefix(SYMBOL_READ_HANDLE_V2_PREFIX) {
+        (2, encoded)
+    } else if let Some(encoded) = trimmed.strip_prefix(SYMBOL_READ_HANDLE_V1_PREFIX) {
+        (1, encoded)
+    } else {
+        return Err("符号读取句柄无效或版本不受支持，请重新查询结构".into());
+    };
     let mut fields = encoded.split('.');
     let r = fields.next().unwrap_or_default().to_string();
     let h = fields.next().unwrap_or_default().to_string();
@@ -197,7 +251,21 @@ fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
         .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
     let e = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
         .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
-    let path = fields.next().unwrap_or_default();
+    let (ps, pe, kind, path) = if version == 2 {
+        let ps = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
+            .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
+        let pe = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
+            .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
+        let kind = String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(fields.next().unwrap_or_default())
+                .map_err(|_| "符号读取句柄节点类型编码无效，请重新查询结构".to_string())?,
+        )
+        .map_err(|_| "符号读取句柄节点类型编码无效，请重新查询结构".to_string())?;
+        (ps, pe, kind, fields.next().unwrap_or_default())
+    } else {
+        (0, 0, String::new(), fields.next().unwrap_or_default())
+    };
     if fields.next().is_some() || r.len() != 43 || h.len() != 43 || i.len() != 43 {
         return Err("符号读取句柄无效或已损坏，请重新查询结构".into());
     }
@@ -207,8 +275,15 @@ fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
             .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?,
     )
     .map_err(|_| "符号读取句柄路径编码无效，请重新查询结构".to_string())?;
-    let handle = SymbolReadHandle { r, p, s, e, h, i };
-    if handle.p.is_empty() || handle.s == 0 || handle.e < handle.s {
+    let handle = SymbolReadHandle { r, p, s, e, h, i, k: kind, ps, pe, version };
+    if handle.p.is_empty()
+        || handle.s == 0
+        || handle.e < handle.s
+        || (version == 2
+            && (handle.k.is_empty()
+                || (handle.ps == 0) != (handle.pe == 0)
+                || (handle.ps > 0 && handle.pe < handle.ps)))
+    {
         return Err("符号读取句柄包含无效定位信息，请重新查询结构".into());
     }
     Ok(handle)
@@ -226,6 +301,8 @@ pub fn symbol_read_handles(root: &Path, symbols: &[Symbol]) -> Vec<Result<String
     };
     let root_fingerprint = root_read_fingerprint(&canonical_root);
     let mut hashes: HashMap<String, Result<String, String>> = HashMap::new();
+    let mut file_symbols: HashMap<String, Vec<Symbol>> = HashMap::new();
+    let mut file_contents: HashMap<String, String> = HashMap::new();
     symbols
         .iter()
         .map(|symbol| {
@@ -243,13 +320,28 @@ pub fn symbol_read_handles(root: &Path, symbols: &[Symbol]) -> Vec<Result<String
                         .map_err(|error| format!("读取结构文件 {} 失败：{error}", symbol.file))
                 });
             let digest = digest.as_ref().map_err(Clone::clone)?;
+            let indexed = file_symbols.entry(symbol.file.clone()).or_insert_with(|| {
+                let mut values = Vec::new();
+                scan_file(&canonical_root.join(&symbol.file), &symbol.file, &mut values);
+                values
+            });
+            let path = canonical_root.join(&symbol.file);
+            let content = file_contents
+                .entry(symbol.file.clone())
+                .or_insert_with(|| fs::read_to_string(&path).unwrap_or_default());
+            let start = attached_annotation_start(content, symbol.line);
+            let (ps, pe) = symbol_parent_range(symbol, indexed).unwrap_or((0, 0));
             encode_symbol_read_handle(&SymbolReadHandle {
                 r: root_fingerprint.clone(),
                 p: symbol.file.clone(),
-                s: symbol.line.max(1),
+                s: start,
                 e: symbol.end_line.max(symbol.line).max(1),
                 h: digest.clone(),
                 i: symbol_read_fingerprint(symbol),
+                k: symbol.kind.clone(),
+                ps,
+                pe,
+                version: 2,
             })
         })
         .collect()
@@ -260,8 +352,33 @@ pub fn resolve_symbol_read_handle(
     roots: &[PathBuf],
     value: &str,
 ) -> Result<SymbolReadLocator, String> {
-    let handle = decode_symbol_read_handle(value)?;
-    let relative = Path::new(&handle.p);
+    resolve_symbol_read_handles(roots, &[value.to_string()])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "符号读取句柄不能为空".to_string())
+}
+
+/// 批量验证同文件结构句柄。项目根解析、文件 SHA-256 与结构扫描均只执行一次，供
+/// `symbol_handles/news` 节点事务使用，避免节点数线性放大文件 I/O。
+pub fn resolve_symbol_read_handles(
+    roots: &[PathBuf],
+    values: &[String],
+) -> Result<Vec<SymbolReadLocator>, String> {
+    if values.is_empty() {
+        return Err("符号读取句柄不能为空".into());
+    }
+    let handles = values
+        .iter()
+        .map(|value| decode_symbol_read_handle(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let first = handles.first().expect("非空已校验");
+    if handles
+        .iter()
+        .any(|handle| handle.r != first.r || handle.p != first.p || handle.h != first.h)
+    {
+        return Err("批量结构句柄必须属于同一项目、文件和文件版本".into());
+    }
+    let relative = Path::new(&first.p);
     if relative.is_absolute()
         || relative.components().any(|component| {
             matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
@@ -274,7 +391,7 @@ pub fn resolve_symbol_read_handle(
         let Ok(canonical) = root.canonicalize() else {
             continue;
         };
-        if root_read_fingerprint(&canonical) == handle.r {
+        if root_read_fingerprint(&canonical) == first.r {
             matched_root = Some(canonical);
             break;
         }
@@ -293,29 +410,60 @@ pub fn resolve_symbol_read_handle(
     }
     let digest = file_sha256_base64(&path)
         .map_err(|error| format!("验证符号读取句柄失败：{error}"))?;
-    if digest != handle.h {
+    if digest != first.h {
         return Err(
             "结构定位已过期：目标文件已被外部工具或其他会话修改，请重新调用 search_symbols/repo_query 后再读取"
                 .into(),
         );
     }
     let mut current_symbols = Vec::new();
-    scan_file(&path, &handle.p, &mut current_symbols);
-    if !current_symbols
-        .iter()
-        .any(|symbol| symbol_read_fingerprint(symbol) == handle.i)
-    {
-        return Err(
-            "结构定位已过期：索引中的符号范围与当前文件不一致，请等待增量索引刷新并重新查询"
-                .into(),
-        );
-    }
-    Ok(SymbolReadLocator {
-        path,
-        start_line: handle.s,
-        end_line: handle.e,
-        file_sha256: handle.h,
-    })
+    scan_file(&path, &first.p, &mut current_symbols);
+    let current_content = fs::read_to_string(&path)
+        .map_err(|error| format!("验证结构节点注解边界失败：{error}"))?;
+    handles
+        .into_iter()
+        .map(|handle| {
+            let current_symbol = current_symbols
+                .iter()
+                .find(|symbol| symbol_read_fingerprint(symbol) == handle.i)
+                .ok_or_else(|| {
+                    "结构定位已过期：索引中的符号范围与当前文件不一致，请等待增量索引刷新并重新查询"
+                        .to_string()
+                })?;
+            if handle.version >= 2 && current_symbol.kind != handle.k {
+                return Err(
+                    "结构定位已过期：目标节点类型已经变化，请重新查询结构后再编辑".into(),
+                );
+            }
+            if handle.version >= 2
+                && attached_annotation_start(&current_content, current_symbol.line) != handle.s
+            {
+                return Err(
+                    "结构定位已过期：目标节点的注解边界已经变化，请重新查询结构后再编辑"
+                        .into(),
+                );
+            }
+            let parent_range = symbol_parent_range(current_symbol, &current_symbols);
+            if handle.version >= 2 {
+                let expected_parent = (handle.ps > 0).then_some((handle.ps, handle.pe));
+                if parent_range != expected_parent {
+                    return Err(
+                        "结构定位已过期：目标节点的父节点范围已经变化，请重新查询结构后再编辑"
+                            .into(),
+                    );
+                }
+            }
+            Ok(SymbolReadLocator {
+                path: path.clone(),
+                start_line: handle.s,
+                end_line: handle.e,
+                file_sha256: handle.h,
+                node_id: handle.i,
+                expected_kind: (handle.version >= 2).then_some(handle.k),
+                parent_range,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -985,6 +1133,76 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
         }
         if let Some(name) = ident_after(line, "function ") {
             out.push(make_symbol("function", name, rel, lineno, current_parent.clone(), raw, &lines, ext));
+        }
+        // Java/Kotlin fallback：只在类体第一层识别声明，避免把方法体中的调用误报为方法。
+        // 注解由 v2 结构句柄向上吸收，与声明共同构成最小完整修改节点。
+        if matches!(ext, "java" | "kt") && current_parent.is_some() && brace_depth == 1 {
+            let has_fun_keyword = line.starts_with("fun ") || line.contains(" fun ");
+            let declaration = line
+                .strip_prefix("fun ")
+                .or_else(|| line.split_once(" fun ").map(|(_, rest)| rest))
+                .unwrap_or(line);
+            if let Some(open) = declaration.find('(') {
+                let prefix = declaration[..open].trim();
+                let name = prefix.split_whitespace().last().unwrap_or("");
+                let control = ["if", "for", "while", "switch", "catch", "when", "return", "new"];
+                let enough_declaration_evidence = prefix.split_whitespace().count() >= 2
+                    || current_parent.as_deref() == Some(name)
+                    || has_fun_keyword;
+                if enough_declaration_evidence
+                    && !name.is_empty()
+                    && !name.contains('.')
+                    && is_ident_start(name.chars().next().unwrap_or(' '))
+                    && !control.contains(&name)
+                    && (line.contains('{') || line.ends_with(';') || line.contains('='))
+                {
+                    out.push(make_symbol(
+                        "method",
+                        name.to_string(),
+                        rel,
+                        lineno,
+                        current_parent.clone(),
+                        raw,
+                        &lines,
+                        ext,
+                    ));
+                }
+            }
+            if !line.starts_with('@') && !line.contains('(') {
+                let declaration = line
+                    .split(['=', ';'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
+                let kotlin_name = declaration
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .find_map(|pair| matches!(pair[0], "val" | "var").then_some(pair[1]));
+                let raw_name = kotlin_name
+                    .unwrap_or_else(|| declaration.split_whitespace().last().unwrap_or(""));
+                let name = raw_name
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches("[]");
+                if !name.is_empty()
+                    && is_ident_start(name.chars().next().unwrap_or(' '))
+                    && name.chars().all(is_ident)
+                    && (line.ends_with(';') || line.contains('=') || kotlin_name.is_some())
+                {
+                    out.push(make_symbol(
+                        "field",
+                        name.to_string(),
+                        rel,
+                        lineno,
+                        current_parent.clone(),
+                        raw,
+                        &lines,
+                        ext,
+                    ));
+                }
+            }
         }
         // ArkTS 组件 struct
         if ext == "ets" {
@@ -5707,6 +5925,63 @@ pub fn symbols_of_file(root: &Path, rel: &str) -> Result<Vec<Symbol>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_symbol_handle_binds_kind_node_and_parent_range() {
+        let root = std::env::temp_dir().join(format!(
+            "deveco-symbol-handle-v2-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = "class Service {\n  @Override\n  public void run() {\n    work();\n  }\n}\n";
+        std::fs::write(root.join("Service.java"), source).unwrap();
+        let symbols = index_project(&root);
+        let method = symbols
+            .iter()
+            .find(|symbol| symbol.kind == "method" && symbol.name == "run")
+            .expect("应识别 Java 方法")
+            .clone();
+        let handle = symbol_read_handles(&root, &[method])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(handle.starts_with(SYMBOL_READ_HANDLE_V2_PREFIX), "{handle}");
+        let locator = resolve_symbol_read_handle(&[root.clone()], &handle).unwrap();
+        assert_eq!(locator.expected_kind.as_deref(), Some("method"));
+        assert_eq!(locator.node_id.len(), 43);
+        assert_eq!((locator.start_line, locator.end_line), (2, 5));
+        assert_eq!(locator.parent_range, Some((1, 6)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn legacy_v1_symbol_handle_remains_readable() {
+        let root = std::env::temp_dir().join(format!(
+            "deveco-symbol-handle-v1-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("sample.rs"), "fn sample() {}\n").unwrap();
+        let symbol = index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "sample")
+            .unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let path = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(symbol.file.as_bytes());
+        let handle = format!(
+            "{SYMBOL_READ_HANDLE_V1_PREFIX}{}.{}.{}.{:x}.{:x}.{path}",
+            root_read_fingerprint(&canonical_root),
+            file_sha256_base64(&root.join(&symbol.file)).unwrap(),
+            symbol_read_fingerprint(&symbol),
+            symbol.line,
+            symbol.end_line,
+        );
+        let locator = resolve_symbol_read_handle(&[root.clone()], &handle).unwrap();
+        assert_eq!(locator.expected_kind, None);
+        assert_eq!(locator.start_line, symbol.line);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn extracts_arkts_component_and_methods() {

@@ -462,7 +462,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "read_file",
-        desc: "读取文本文件（UTF-8；拒绝二进制）。\n参数：{\"path\":\"<项目内路径>\",\"start\":<可选起始行，1 起>,\"lines\":<可选行数>,\"symbol_handle\":\"<可选，search_symbols/repo_query 返回的 read_handle；与其他参数互斥>\",\"outline\":<可选 true，只返回类/函数/组件等骨架>,\"outline_page\":<可选骨架页码，每页 200 条>,\"outline_filter\":\"<可选类型过滤，如函数/类型/组件>\"}。\nsymbol_handle 绑定项目、文件、行区间和完整 SHA-256；目标文件被外部修改后旧句柄会拒绝读取，需重新查询结构。\n普通代码窗口会自动扩展到完整方法/块，避免截断结束符；长注释块（≥8 行）自动折叠。\n超过 1MB 的文本必须显式传 start/lines（1-2000），使用固定内存流式读取，不支持 outline/块补齐。普通模式最多 2000 行/15000 字符，块补齐最多 40000 字符，超出返回 next_start。\n副作用：无（只读）。\n返回：file_version、实际窗口、next_start 及带行号内容；outline 返回含定义起止行的结构大纲。",
+        desc: "读取文本文件（UTF-8；拒绝二进制）。\n参数：{\"path\":\"<项目内路径>\",\"start\":<可选起始行，1 起>,\"lines\":<可选行数>,\"symbol_handle\":\"<可选，search_symbols/repo_query 返回的 read_handle；与其他参数互斥>\",\"outline\":<可选 true，只返回类/函数/组件等骨架>,\"outline_page\":<可选骨架页码，每页 200 条>,\"outline_filter\":\"<可选类型过滤，如函数/类型/组件>\"}。\nsymbol_handle v2 绑定项目、文件、完整 SHA-256、节点 ID/类型、精确行区间与父节点范围；文件或结构漂移后旧句柄会拒绝读取，需重新查询结构（旧 v1 句柄保持兼容）。\n普通代码窗口会自动扩展到完整方法/块，避免截断结束符；长注释块（≥8 行）自动折叠。\n超过 1MB 的文本必须显式传 start/lines（1-2000），使用固定内存流式读取，不支持 outline/块补齐。普通模式最多 2000 行/15000 字符，块补齐最多 40000 字符，超出返回 next_start。\n副作用：无（只读）。\n返回：file_version、实际窗口、next_start 及带行号内容；outline 返回含定义起止行的结构大纲。",
     },
     ToolSpec {
         name: "find_files",
@@ -478,11 +478,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "edit_file",
-        desc: "修改文件，支持 old 精确替换、start 完整代码块替换、starts 批量块替换，以及 symbol_handle 防漂移结构编辑。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文片段>\",\"new\":\"<新内容；块模式为空即删除>\",\"replace_all\":<可选>,\"start\":<可选块内行号>,\"anchor\":\"<可选块签名>\",\"starts\":[<批量行号>],\"news\":[\"<批量新内容>\"],\"anchors\":[\"<可选批量签名>\"],\"symbol_handle\":\"<可选 read_handle；仅与 new/dry_run 同用>\",\"dry_run\":<可选>}。\nold/start/starts/symbol_handle 互斥；句柄绑定完整 SHA-256，外部改动后拒绝。块编辑自动定位完整方法并做配平守卫；批量块重叠拒绝且只写一个 undo 快照。文件 ≤1MB，修改前建议 read_file 或 preview_edit。\n副作用：修改项目内文件（dry_run 无副作用）。\n返回：替换位置或块区间。",
+        desc: "修改文件，支持 old 精确替换、start 完整代码块替换、starts 批量块替换，以及结构句柄节点事务。\n参数：单节点用 {\"symbol_handle\":\"<read_handle>\",\"new\":\"<完整替换节点>\"}；同文件多节点原子修改用 {\"symbol_handles\":[\"<handle>\"],\"news\":[\"<逐节点新内容>\"]}；也兼容 path/old/new、path/start/new、path/starts/news/anchors；各模式可带 dry_run。\nold/start/starts/symbol_handle/symbol_handles 互斥；v2 句柄绑定完整 SHA-256、node ID、expected kind、精确节点区间与 parent range，编辑直接替换节点而不重新猜块，连续注解属于声明节点，任一前置条件漂移即拒绝。多句柄必须来自同一文件和版本，范围重叠会整体拒绝。普通块编辑自动定位完整方法；所有代码候选均走语法/配平门禁。文件 ≤1MB，修改前建议 read_file 或 preview_edit。\n副作用：修改项目内文件（dry_run 无副作用）。\n返回：替换位置或节点事务信息。",
     },
     ToolSpec {
         name: "preview_edit",
-        desc: "预览 edit_file 的 unified diff，不落盘。\n参数：与 edit_file 相同，包括 path/old/new、start/anchor、starts/news/anchors 或 symbol_handle/new。\nsymbol_handle 会先校验项目、符号范围和完整文件 SHA-256；过期即拒绝。预览与落盘共用超界、块定位、重叠与配平校验，确认后可把同一参数交给 edit_file。\n副作用：无（只读）。\n返回：diff、增删统计和块区间。",
+        desc: "预览 edit_file 的 unified diff，不落盘。\n参数：与 edit_file 相同，包括 path/old/new、start/anchor、starts/news/anchors、symbol_handle/new 或 symbol_handles/news。\n结构句柄会先校验项目、完整文件 SHA-256、节点 ID/类型/范围与父节点范围；过期即拒绝。预览与落盘共用精确节点范围、重叠与语法门禁，确认后可把同一参数交给 edit_file。\n副作用：无（只读）。\n返回：diff、增删统计和节点区间。",
     },
     ToolSpec {
         name: "run_command",
@@ -778,7 +778,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_symbols",
-        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"relations_cursor\":\"<可选，原样传回关系结果的 relations_next_cursor 读取下一页关系>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再把结果的 read_handle 原样传给 read_file 的 symbol_handle 精读；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引；生成句柄时每个命中文件只哈希一次）。\n返回：分页结构清单、每项的防漂移 read_handle、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；热点符号关系超过单次上限时返回 relations_next_cursor 供翻页；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
+        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/字段/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|field|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"relations_cursor\":\"<可选，原样传回关系结果的 relations_next_cursor 读取下一页关系>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再把结果的 read_handle 原样传给 read_file 精读或 edit_file 做节点事务；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引；生成句柄时每个命中文件只哈希和扫描一次）。\n返回：分页结构清单、每项绑定 file hash/node ID/expected kind/parent range 的 v2 read_handle、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；热点符号关系超过单次上限时返回 relations_next_cursor 供翻页；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
     },
     ToolSpec {
         name: "repo_query",
