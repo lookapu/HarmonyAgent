@@ -530,10 +530,9 @@ export default function FileTreePanel({
                 return (
                   <div
                     key={hit.path}
-                    className={`group flex items-center gap-1 rounded-md py-[3px] pr-1 text-[12px] cursor-pointer select-none transition-colors text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] ${
+                    className={`group flex items-center gap-1 rounded-md py-[3px] pl-2 pr-1 text-[12px] cursor-pointer select-none transition-colors text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] ${
                       ctxSelected === hit.path ? 'bg-[var(--accent-soft)] text-[var(--text-primary)]' : ''
                     }`}
-                    style={{ paddingLeft: 8 }}
                     onClick={() => openSearchHit(hit)}
                     onContextMenu={(e) => openContextMenu(e, { name: hit.name, path: hit.path, type: 'file' })}
                     title={hit.path}

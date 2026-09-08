@@ -772,10 +772,7 @@ export default function HealthPage() {
         <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
           <div className="flex items-center gap-3 min-w-0">
             <div
-              className="w-3 h-3 rounded-full shrink-0"
-              style={{
-                background: harmonyEnv?.sdk_root || harmonyEnv?.cli ? 'var(--success)' : 'var(--warning)',
-              }}
+              className={`w-3 h-3 rounded-full shrink-0 ${harmonyEnv?.sdk_root || harmonyEnv?.cli ? 'bg-[var(--success)]' : 'bg-[var(--warning)]'}`}
             />
             <div className="min-w-0">
               <div className="text-[13px] font-medium text-[var(--text-primary)]">
@@ -936,14 +933,11 @@ export default function HealthPage() {
             }}
           >
             <div
-              className="w-3 h-3 rounded-full shrink-0"
-              style={{
-                background:
-                  alignment.status === 'ok' ? 'var(--success)'
-                  : alignment.status === 'behind' ? 'var(--danger)'
-                  : alignment.status === 'ahead' ? 'var(--success)'
-                  : 'var(--warning)',
-              }}
+              className={`w-3 h-3 rounded-full shrink-0 ${
+                alignment.status === 'behind' ? 'bg-[var(--danger)]'
+                : alignment.status === 'ok' || alignment.status === 'ahead' ? 'bg-[var(--success)]'
+                : 'bg-[var(--warning)]'
+              }`}
             />
             <div className="min-w-0">
               <div className="text-[13px] font-medium text-[var(--text-primary)]">{alignment.message}</div>
@@ -1130,8 +1124,7 @@ export default function HealthPage() {
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-3 min-w-0">
                 <div
-                  className="w-3 h-3 rounded-full shrink-0"
-                  style={{ backgroundColor: nodeRt.node_version ? 'var(--success)' : 'var(--danger)' }}
+                  className={`w-3 h-3 rounded-full shrink-0 ${nodeRt.node_version ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
                 />
                 <div className="min-w-0">
                   <span className="font-medium">{rtSourceLabel(nodeRt.source)}</span>
@@ -1218,8 +1211,7 @@ export default function HealthPage() {
           <>
             <div className="flex items-center gap-3 flex-wrap">
               <div
-                className="w-3 h-3 rounded-full shrink-0"
-                style={{ backgroundColor: devecoCli.installed ? 'var(--success)' : 'var(--danger)' }}
+                className={`w-3 h-3 rounded-full shrink-0 ${devecoCli.installed ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
               />
               <span className="font-medium">devecocli</span>
               <span className="text-xs text-[var(--text-secondary)]">
@@ -1249,8 +1241,7 @@ export default function HealthPage() {
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-3 min-w-0">
                 <div
-                  className="w-3 h-3 rounded-full shrink-0"
-                  style={{ backgroundColor: gitRt.git_version ? 'var(--success)' : 'var(--danger)' }}
+                  className={`w-3 h-3 rounded-full shrink-0 ${gitRt.git_version ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
                 />
                 <div className="min-w-0">
                   <span className="font-medium">
@@ -1328,8 +1319,7 @@ export default function HealthPage() {
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-3 min-w-0">
                 <div
-                  className="w-3 h-3 rounded-full shrink-0"
-                  style={{ backgroundColor: jdkRt.active_version ? 'var(--success)' : 'var(--danger)' }}
+                  className={`w-3 h-3 rounded-full shrink-0 ${jdkRt.active_version ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
                 />
                 <div className="min-w-0">
                   <span className="font-medium">JDK {jdkRt.active_version || t('health.unavailable')}</span>
@@ -1502,8 +1492,7 @@ export default function HealthPage() {
             >
               <div className="flex items-start gap-3 min-w-0">
                 <div
-                  className="w-3 h-3 rounded-full mt-1 shrink-0"
-                  style={{ backgroundColor: c.found ? 'var(--success)' : 'var(--danger)' }}
+                  className={`w-3 h-3 rounded-full mt-1 shrink-0 ${c.found ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
                 />
                 <div className="min-w-0">
                   <span className="font-medium text-sm">

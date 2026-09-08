@@ -4268,7 +4268,7 @@ export default function Home() {
                     for (const [pid, hits] of groups) {
                       const first = hits[0]
                       out.push(
-                        <div key={`gh-${pid}`} className="group-label" style={{ paddingLeft: 10, paddingRight: 10, paddingTop: 6, paddingBottom: 2 }}>
+                        <div key={`gh-${pid}`} className="group-label px-2.5 pt-1.5 pb-0.5">
                           <span className="truncate">{first.project_name ?? pid} · {hits.length}</span>
                         </div>
                       )
@@ -4312,7 +4312,7 @@ export default function Home() {
             {groupedConversations.map((row) => {
               if (row.kind === 'header') {
                 return (
-                  <div key={row.key} className="group-label" style={{ paddingLeft: 10, paddingRight: 10, paddingTop: 10, paddingBottom: 4 }}>
+                  <div key={row.key} className="group-label px-2.5 pt-2.5 pb-1">
                     <span>{row.label}</span>
                   </div>
                 )
@@ -5450,7 +5450,7 @@ export default function Home() {
                         pct,
                       })}
                     >
-                      <span className="context-meter w-16 shrink-0" style={{ height: 2 }}>
+                      <span className="context-meter w-16 shrink-0 h-0.5">
                         <span
                           className="context-meter-fill"
                           data-level={level}

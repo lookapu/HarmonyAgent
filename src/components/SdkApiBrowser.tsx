@@ -122,7 +122,7 @@ export default function SdkApiBrowser() {
         </button>
       </div>
 
-      <div className="flex" style={{ minHeight: 320, maxHeight: 520 }}>
+      <div className="flex min-h-[320px] max-h-[520px]">
         <div className="w-64 shrink-0 border-r border-[var(--border)] flex flex-col">
           {kits.length > 0 && !query.trim() && (
             <div className="flex flex-wrap gap-1 p-2 border-b border-[var(--border)] max-h-24 overflow-auto">

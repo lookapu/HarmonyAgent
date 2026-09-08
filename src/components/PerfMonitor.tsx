@@ -176,8 +176,7 @@ export default function PerfMonitor() {
 
       {open && (
         <div
-          className="absolute bottom-10 right-0 w-[400px] max-h-[520px] rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl flex flex-col overflow-hidden"
-          style={{ backdropFilter: 'blur(12px)' }}
+          className="absolute bottom-10 right-0 w-[400px] max-h-[520px] rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl flex flex-col overflow-hidden backdrop-blur-md"
         >
           {/* 头部 */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)]">

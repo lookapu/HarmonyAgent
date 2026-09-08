@@ -1109,7 +1109,7 @@ function BudgetMeter({ label, used, limit }: { label: string; used: number; limi
         ¥{used.toFixed(2)}
         {hasLimit && <span className="text-xs text-[var(--text-muted)] font-normal ml-2">/ ¥{(limit as number).toFixed(2)}</span>}
       </p>
-      <div className="context-meter mt-2.5" style={{ height: 3 }}>
+      <div className="context-meter mt-2.5 h-[3px]">
         <div
           className="context-meter-fill"
           data-level={level}

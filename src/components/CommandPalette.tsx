@@ -170,8 +170,7 @@ export default function CommandPalette({
             e.kind === 'header' ? (
               <div
                 key={`h-${e.group}`}
-                className="group-label"
-                style={{ paddingLeft: 16, paddingRight: 16 }}
+                className="group-label px-4"
               >
                 <span>{e.group}</span>
               </div>
