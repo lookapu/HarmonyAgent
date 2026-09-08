@@ -5,8 +5,11 @@
 //! event stream and is intended for eval smoke tests while AgentKernel is extracted.
 
 use crate::agent::agent_kernel::{
-    parse_openai_turn, run_provider_transport, KernelAcceptanceGate, KernelStopDecision,
-    KernelToolEvidence, KernelTransportStop, KernelUsageLedger,
+    build_model_request_plan, run_provider_transport, sse_payload, KernelAcceptanceGate,
+    KernelSseBuffer, KernelStopDecision, KernelStreamAccumulator, KernelStreamFinish,
+    KernelStreamGovernor, KernelStreamSignal, KernelToolEvidence, KernelTransportStop, KernelTurn,
+    KernelUsageLedger, KERNEL_STREAM_MAX_BYTES, KERNEL_STREAM_REASONING_GRACE,
+    KERNEL_STREAM_SILENT_TIMEOUT,
 };
 use crate::agent::eval_report::ModelInfo;
 use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
@@ -19,6 +22,8 @@ use crate::utils::errors::{
     FriendlyError,
 };
 use crate::utils::retry::STREAM_REQUEST_POLICY;
+use bytes::Bytes;
+use futures_util::Stream;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::future::Future;
@@ -156,7 +161,7 @@ trait HeadlessModelClient: Send + Sync {
         provider: &'a HeadlessProviderConfig,
         messages: Vec<Value>,
         timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<(Value, u64), AgentDriverError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(KernelTurn, u64), AgentDriverError>> + Send + 'a>>;
 }
 
 #[derive(Default)]
@@ -212,25 +217,27 @@ impl HeadlessAgentDriver {
         ])
     }
 
-    async fn request_openai(
+    async fn request_openai_stream(
         provider: &HeadlessProviderConfig,
         messages: &[Value],
         timeout: Duration,
-    ) -> Result<(Value, u64), AgentDriverError> {
+    ) -> Result<(KernelTurn, u64), AgentDriverError> {
         let tool_specs = Self::tool_specs();
-        let request_plan = crate::agent::agent_kernel::build_model_request_plan(
+        let mut request_plan = build_model_request_plan(
             "openai",
             &provider.base_url,
             &provider.model_id,
             messages,
             tool_specs.as_array().map(Vec::as_slice),
-            false,
+            true,
             None,
             Some(0.0),
             None,
             None,
         )
         .map_err(AgentDriverError::Failed)?;
+        // 流式回合需要 usage 尾帧才能执行成本账本；支持的兼容 Provider 会附带该帧。
+        request_plan.body["stream_options"] = json!({"include_usage": true});
         let client = reqwest::Client::new();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut attempt = || {
@@ -247,32 +254,21 @@ impl HeadlessAgentDriver {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(parse_retry_after_secs);
-                let bytes = response.bytes().await.map_err(|error| transport_error(&error))?;
-                if bytes.len() > MAX_RESPONSE_BYTES {
-                    return Err(FriendlyError::new(
-                        ErrorKind::Client,
-                        "Provider 响应超过 8 MiB",
+                if !status.is_success() {
+                    let bytes = response.bytes().await.map_err(|error| transport_error(&error))?;
+                    let detail = crate::utils::redact::redact_text(
+                        &String::from_utf8_lossy(&bytes)
+                            .chars()
+                            .take(500)
+                            .collect::<String>(),
+                    );
+                    return Err(provider_error_with_retry_after(
+                        status.as_u16(),
+                        &detail,
+                        retry_after,
                     ));
                 }
-                if status.is_success() {
-                    return serde_json::from_slice(&bytes).map_err(|error| {
-                        FriendlyError::new(
-                            ErrorKind::Client,
-                            format!("Provider JSON 无法解析：{error}"),
-                        )
-                    });
-                }
-                let detail = crate::utils::redact::redact_text(
-                    &String::from_utf8_lossy(&bytes)
-                        .chars()
-                        .take(500)
-                        .collect::<String>(),
-                );
-                Err(provider_error_with_retry_after(
-                    status.as_u16(),
-                    &detail,
-                    retry_after,
-                ))
+                read_openai_sse_stream(response.bytes_stream()).await
             }
         };
         let result = run_provider_transport(
@@ -302,16 +298,196 @@ impl HeadlessAgentDriver {
     }
 }
 
+/// 消费一个 OpenAI-compatible SSE 字节流：字节级行缓冲、`KernelStreamGovernor` 停滞治理、
+/// `KernelStreamAccumulator` 帧归一化，组装为严格 `KernelTurn`。
+///
+/// 结束条件：`data: [DONE]` 或 finish_reason 帧。停滞（静默超时/思考宽限封顶）、
+/// 无结束标记提前关闭、无产出空流、JSON 帧损坏与响应体积超限全部失败关闭，
+/// 不把不完整流伪装成正常回合。流式与桌面 UI 共用同一停滞策略常量。
+async fn read_openai_sse_stream<S, E>(stream: S) -> Result<KernelTurn, FriendlyError>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display + 'static,
+{
+    read_openai_sse_stream_with(
+        stream,
+        KernelStreamGovernor::new(
+            KERNEL_STREAM_SILENT_TIMEOUT,
+            KERNEL_STREAM_REASONING_GRACE,
+            KERNEL_STREAM_MAX_BYTES,
+            tokio::time::Instant::now(),
+        ),
+    )
+    .await
+}
+
+async fn read_openai_sse_stream_with<S, E>(
+    mut stream: S,
+    mut governor: KernelStreamGovernor,
+) -> Result<KernelTurn, FriendlyError>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display + 'static,
+{
+    let mut sse = KernelSseBuffer::default();
+    let mut accumulator = KernelStreamAccumulator::default();
+    let mut content = String::new();
+    let mut finish = KernelStreamFinish::None;
+    let mut warnings = Vec::new();
+    let mut done_marker = false;
+
+    loop {
+        tokio::select! {
+            chunk = futures_util::StreamExt::next(&mut stream) => match chunk {
+                Some(Ok(bytes)) => {
+                    governor
+                        .observe(KernelStreamSignal::Data(bytes.len()), tokio::time::Instant::now())
+                        .map_err(|error| FriendlyError::new(ErrorKind::Network, error))?;
+                    sse.push(&bytes);
+                    while let Some(line) = sse.next_line() {
+                        if ingest_openai_sse_line(
+                            &mut accumulator,
+                            &mut governor,
+                            &mut content,
+                            &mut finish,
+                            &mut warnings,
+                            &line,
+                        )? {
+                            done_marker = true;
+                            break;
+                        }
+                    }
+                }
+                Some(Err(error)) => {
+                    return Err(FriendlyError::new(
+                        ErrorKind::Network,
+                        format!("读取 Provider 流失败: {error}"),
+                    ))
+                }
+                None => break,
+            },
+            _ = tokio::time::sleep_until(governor.deadline()) => {
+                return Err(FriendlyError::new(
+                    ErrorKind::Network,
+                    format!("Provider 流停滞（{}s 无有效产出）", KERNEL_STREAM_SILENT_TIMEOUT.as_secs()),
+                ));
+            }
+        }
+        if done_marker || finish != KernelStreamFinish::None {
+            break;
+        }
+    }
+    if !done_marker {
+        while let Some(line) = sse.flush() {
+            if ingest_openai_sse_line(
+                &mut accumulator,
+                &mut governor,
+                &mut content,
+                &mut finish,
+                &mut warnings,
+                &line,
+            )? {
+                break;
+            }
+        }
+    }
+    if finish == KernelStreamFinish::None && !done_marker {
+        return Err(FriendlyError::new(
+            ErrorKind::Network,
+            "Provider 流在结束标记前关闭，未产生完整回合",
+        ));
+    }
+    if !warnings.is_empty() {
+        return Err(FriendlyError::new(
+            ErrorKind::Network,
+            format!("Provider 流含协议警告：{}", warnings.join("；")),
+        ));
+    }
+    let tool_calls = accumulator.finalized_tool_calls();
+    let mut provider_message = json!({
+        "role": "assistant",
+        "content": if content.is_empty() { Value::Null } else { Value::String(content.clone()) },
+    });
+    if !tool_calls.is_empty() {
+        provider_message["tool_calls"] = Value::Array(
+            tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })
+                })
+                .collect(),
+        );
+    }
+    Ok(KernelTurn {
+        provider_message,
+        content,
+        tool_calls,
+        usage: accumulator.usage(),
+        finish_reason: match finish {
+            KernelStreamFinish::Done => Some("stop".into()),
+            KernelStreamFinish::Truncated => Some("length".into()),
+            KernelStreamFinish::None => None,
+        },
+    })
+}
+
+fn ingest_openai_sse_line(
+    accumulator: &mut KernelStreamAccumulator,
+    governor: &mut KernelStreamGovernor,
+    content: &mut String,
+    finish: &mut KernelStreamFinish,
+    warnings: &mut Vec<String>,
+    line: &str,
+) -> Result<bool, FriendlyError> {
+    let Some(payload) = sse_payload(line) else { return Ok(false) };
+    if payload == "[DONE]" {
+        return Ok(true);
+    }
+    let frame_json: Value = serde_json::from_str(payload).map_err(|error| {
+        FriendlyError::new(ErrorKind::Network, format!("Provider SSE 帧无法解析：{error}"))
+    })?;
+    let frame = accumulator.ingest("openai", &frame_json);
+    let now = tokio::time::Instant::now();
+    if frame.content.is_some() {
+        let _ = governor.observe(KernelStreamSignal::Content, now);
+    }
+    if frame.reasoning.is_some() {
+        let _ = governor.observe(KernelStreamSignal::Reasoning, now);
+    }
+    if frame.tool_call_deltas > 0 {
+        let _ = governor.observe(KernelStreamSignal::ToolCall, now);
+    }
+    if frame.finish != KernelStreamFinish::None {
+        *finish = frame.finish;
+        let _ = governor.observe(KernelStreamSignal::Finish, now);
+    }
+    if let Some(delta) = frame.content {
+        content.push_str(&delta);
+        if content.len() > MAX_RESPONSE_BYTES {
+            return Err(FriendlyError::new(
+                ErrorKind::Network,
+                "Provider 流式正文超过 8 Mi 字符上限",
+            ));
+        }
+    }
+    warnings.extend(frame.warnings);
+    Ok(false)
+}
+
 impl HeadlessModelClient for OpenAiCompatibleClient {
     fn request<'a>(
         &'a self,
         provider: &'a HeadlessProviderConfig,
         messages: Vec<Value>,
         timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<(Value, u64), AgentDriverError>> + Send + 'a>> {
-        Box::pin(
-            async move { HeadlessAgentDriver::request_openai(provider, &messages, timeout).await },
-        )
+    ) -> Pin<Box<dyn Future<Output = Result<(KernelTurn, u64), AgentDriverError>> + Send + 'a>> {
+        Box::pin(async move {
+            HeadlessAgentDriver::request_openai_stream(provider, &messages, timeout).await
+        })
     }
 }
 
@@ -369,12 +545,11 @@ impl HeadlessAgentDriver {
                 .request_timeout
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
                 .min(wall_time.saturating_sub(started.elapsed()));
-            let (response, retries) = self
+            let (turn, retries) = self
                 .client
                 .request(&self.provider, messages.clone(), request_timeout)
                 .await?;
             outcome.retries = outcome.retries.saturating_add(retries);
-            let turn = parse_openai_turn(&response).map_err(AgentDriverError::Failed)?;
             let cost_exceeded = usage
                 .record(turn.usage.as_ref())
                 .map_err(AgentDriverError::Failed)?;
@@ -635,6 +810,7 @@ mod tests {
     use crate::agent::eval_runner::AsyncAgentDriver;
     use crate::agent::eval_task::{EvalGrader, EvalLimits, EvalRepo, EvalTask};
     use crate::agent::headless_runtime::HeadlessToolPolicy;
+    use bytes::Bytes;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -651,7 +827,7 @@ mod tests {
             Box<
                 dyn std::future::Future<
                         Output = Result<
-                            (serde_json::Value, u64),
+                            (crate::agent::agent_kernel::KernelTurn, u64),
                             crate::agent::eval_runner::AgentDriverError,
                         >,
                     > + Send
@@ -659,18 +835,22 @@ mod tests {
             >,
         > {
             Box::pin(async move {
-                self.0
+                let response = self
+                    .0
                     .lock()
                     .map_err(|error| {
                         crate::agent::eval_runner::AgentDriverError::Failed(error.to_string())
                     })?
                     .pop_front()
-                    .map(|response| (response, 0))
                     .ok_or_else(|| {
                         crate::agent::eval_runner::AgentDriverError::Failed(
                             "scripted provider exhausted".into(),
                         )
-                    })
+                    })?;
+                let turn = crate::agent::agent_kernel::parse_openai_turn(&response).map_err(
+                    crate::agent::eval_runner::AgentDriverError::Failed,
+                )?;
+                Ok((turn, 0))
             })
         }
     }
@@ -1002,5 +1182,107 @@ mod tests {
             matches!(error, crate::agent::eval_runner::AgentDriverError::Failed(message) if message.contains("未返回 usage"))
         );
         std::fs::remove_dir_all(workspace).ok();
+    }
+
+    fn sse_chunks(parts: &[&str]) -> Vec<Result<Bytes, std::io::Error>> {
+        parts
+            .iter()
+            .map(|part| Ok(Bytes::from(part.to_string())))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_reader_assembles_split_utf8_tool_calls_and_usage() {
+        // 前两个 chunk 故意把多字节 UTF-8 字符 "固" 截断在字节中间，
+        // 字节级行缓冲必须跨 chunk 重组而不是用 lossy 解码损坏 JSON。
+        let ch = "固".as_bytes();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            {
+                let mut head = b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
+                head.extend_from_slice(&ch[..2]);
+                Ok(Bytes::from(head))
+            },
+            {
+                let mut tail = ch[2..].to_vec();
+                tail.extend_from_slice(b"\"}}]}\n\n");
+                Ok(Bytes::from(tail))
+            },
+            Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n",
+            )),
+        ];
+        let turn = super::read_openai_sse_stream(futures_util::stream::iter(chunks))
+            .await
+            .unwrap();
+        assert_eq!(turn.content, "固");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "read_file");
+        assert_eq!(turn.tool_calls[0].arguments, "{\"path\":\"a.txt\"}");
+        assert_eq!(turn.finish_reason.as_deref(), Some("stop"));
+        let usage = turn.usage.expect("usage 尾帧必须进入回合");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(
+            turn.provider_message["tool_calls"][0]["function"]["name"],
+            "read_file",
+            "provider_message 必须能回放给 Provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_reader_marks_length_finish_as_truncated() {
+        let chunks = sse_chunks(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        ]);
+        let turn = super::read_openai_sse_stream(futures_util::stream::iter(chunks))
+            .await
+            .unwrap();
+        assert!(turn.was_truncated());
+        assert_eq!(turn.finish_reason.as_deref(), Some("length"));
+    }
+
+    #[tokio::test]
+    async fn stream_reader_fails_closed_on_early_close_without_end_marker() {
+        let chunks = sse_chunks(&["data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n"]);
+        let error = super::read_openai_sse_stream(futures_util::stream::iter(chunks))
+            .await
+            .unwrap_err();
+        assert!(error.to_user_string().contains("结束标记"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_reader_fails_closed_on_stall() {
+        let governor = crate::agent::agent_kernel::KernelStreamGovernor::new(
+            Duration::from_millis(50),
+            Duration::from_secs(180),
+            1024,
+            tokio::time::Instant::now(),
+        );
+        let stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let error = super::read_openai_sse_stream_with(stream, governor)
+            .await
+            .unwrap_err();
+        assert!(error.to_user_string().contains("停滞"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_reader_fails_closed_on_broken_frame_and_oversized_content() {
+        let chunks = sse_chunks(&["data: {not json\n\n"]);
+        let error = super::read_openai_sse_stream(futures_util::stream::iter(chunks))
+            .await
+            .unwrap_err();
+        assert!(error.to_user_string().contains("SSE 帧无法解析"), "{error:?}");
+
+        let big = "x".repeat(super::MAX_RESPONSE_BYTES + 1);
+        let chunks = sse_chunks(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"",
+            &big,
+            "\"}}]}\n\n",
+        ]);
+        let error = super::read_openai_sse_stream(futures_util::stream::iter(chunks))
+            .await
+            .unwrap_err();
+        assert!(error.to_user_string().contains("上限"), "{error:?}");
     }
 }

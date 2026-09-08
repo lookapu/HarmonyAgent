@@ -5,8 +5,14 @@
 > 适用范围：`harmony-agent eval run --driver builtin`
 
 当前代码已经提供 `HeadlessAgentDriver` 和 CLI 的 `--driver builtin` 分支：支持
-OpenAI-compatible 非流式 chat completions、11 个受限工具（结构/文本检索、文件读写/精确编辑、Git 只读）、事件记录、轮次/墙钟限制和基础策略拒绝；`SessionTrajectorySink` 会把
-session event 与 trajectory 同步写入，事件流会记录 `mode=minimal`。runner 主路径已经原生异步化，外部进程 adapter 在 blocking worker 中运行；模型调用通过可注入的 `HeadlessModelClient` 边界，离线脚本 Provider 测试可以完整执行 `write_file` tool loop，不需要网络或 Docker。
+OpenAI-compatible 流式 chat completions（SSE 字节级行缓冲 + `KernelStreamGovernor` 停滞治理 +
+`KernelStreamAccumulator` 帧归一化，`stream_options.include_usage` 请求 usage 尾帧）、
+11 个受限工具（结构/文本检索、文件读写/精确编辑、Git 只读）、事件记录、轮次/墙钟限制和
+基础策略拒绝；`SessionTrajectorySink` 会把 session event 与 trajectory 同步写入，事件流会记录
+`mode=minimal`。runner 主路径已经原生异步化，外部进程 adapter 在 blocking worker 中运行；
+模型调用通过可注入的 `HeadlessModelClient` 边界，离线脚本 Provider 测试可以完整执行
+`write_file` tool loop，不需要网络或 Docker。流式读取对停滞、无结束标记提前关闭、空流、
+坏帧和超限正文全部失败关闭；停滞错误归类为 Network，自动进入与 UI 共用的指数退避重试。
 它仍然不等价于 Tauri UI 的完整 Agent loop；下文的 Phase 2/3/4 是后续演进要求。
 
 ## 1. 结论先行
@@ -138,7 +144,9 @@ OpenAI 原生工具调用分片。Anthropic 分散在 `message_start` 与 `messa
 第五个切片 `KernelStreamGovernor` 已把流停滞治理提取为共用状态机：静默超时、reasoning-only
 宽限封顶与响应字节预算只有一套策略，时间由调用方注入（可离线单测与故障注入），语义对齐
 桌面 UI 的流循环（有效产出刷新停滞线、纯思考流封顶在首次思考 + 宽限期、首字节初始化）。
-桌面 UI 的流循环尚未切换到该组件；下一步由 headless 流式回合作为首个真实消费者。
+headless 流式回合是它的首个真实消费者：SSE 字节级行缓冲（`KernelSseBuffer`，多字节字符
+跨 chunk 不损坏）+ governor + `KernelStreamAccumulator` 组装严格 `KernelTurn`，停滞/提前
+关闭/坏帧/超限全部失败关闭。桌面 UI 的流循环尚未切换到该组件，是剩余收敛项。
 
 ### 5.1 事件输出接口
 
@@ -515,8 +523,11 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 下一步推进 Phase 2/3，但保持核心工具不依赖 Docker：
 
-1. 增加真实 Provider 手动 smoke workflow 和脱敏产物检查；
-2. 把已统一的 Provider transport 接入 run-config 单请求上限，并继续抽取流响应读取/停滞治理；
-3. 将参数级审批、tool metrics 和 recovery 接入 headless runtime；
+1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
+   （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
+2. 流响应读取/停滞治理已在 headless 落地（SSE 行缓冲 + `KernelStreamGovernor` + 失败关闭）；
+   下一步把桌面 UI 流循环切换到同一组件，并继续抽取消息历史/tool loop；
+3. 将参数级审批、tool metrics 和 recovery 接入 headless runtime（参数级审批与
+   tool metrics 已接入；recovery 仍待接入）；
 4. 清理 headless 工具路径上的全局数据库依赖；
 5. 最终抽取 UI/headless 共用的 Agent Kernel。

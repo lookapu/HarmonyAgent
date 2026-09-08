@@ -763,6 +763,53 @@ impl KernelStreamGovernor {
     }
 }
 
+/// 停滞治理的共用策略默认值（与桌面 UI 流循环的 STREAM_SILENT_TIMEOUT /
+/// REASONING_ONLY_GRACE_SECS / STREAM_MAX_BYTES 语义一致；UI 切换到本组件后收敛于此）。
+pub const KERNEL_STREAM_SILENT_TIMEOUT: Duration = Duration::from_secs(60);
+pub const KERNEL_STREAM_REASONING_GRACE: Duration = Duration::from_secs(180);
+pub const KERNEL_STREAM_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// OpenAI-compatible SSE 字节流行缓冲：跨 chunk 累积，按完整行提取 `data:` payload。
+/// 字节级缓冲避免多字节 UTF-8 字符被网络分块截断后损坏 JSON。
+#[derive(Default)]
+pub struct KernelSseBuffer {
+    pending: Vec<u8>,
+}
+
+impl KernelSseBuffer {
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+    }
+
+    /// 取出下一个完整行（不含换行符）。缓冲为空时返回 None；
+    /// 行不是合法 UTF-8 时返回空字符串（协议损坏，由调用方跳过）。
+    pub fn next_line(&mut self) -> Option<String> {
+        let pos = self.pending.iter().position(|byte| *byte == b'\n')?;
+        let line: Vec<u8> = self.pending.drain(..=pos).collect();
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        Some(String::from_utf8_lossy(line).into_owned())
+    }
+
+    /// 流结束后冲刷剩余未以换行结尾的尾部。
+    pub fn flush(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let tail: Vec<u8> = std::mem::take(&mut self.pending);
+        Some(String::from_utf8_lossy(&tail).into_owned())
+    }
+}
+
+/// 提取一行 SSE 的 `data:` payload（去前导空格后 trim）。注释行、keepalive 空行
+/// 与无 `data:` 前缀的行返回 None。
+pub fn sse_payload(line: &str) -> Option<&str> {
+    let payload = line.strip_prefix("data:")?;
+    let payload = payload.strip_prefix(' ').unwrap_or(payload);
+    let payload = payload.trim();
+    (!payload.is_empty()).then_some(payload)
+}
+
 fn merge_stream_usage(
     label: &str,
     value: Option<&Value>,
