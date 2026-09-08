@@ -526,7 +526,11 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
 2. 流响应读取/停滞治理已在 headless 落地（SSE 行缓冲 + `KernelStreamGovernor` + 失败关闭）；
-   下一步把桌面 UI 流循环切换到同一组件，并继续抽取消息历史/tool loop；
+   桌面 UI 流循环已切换到同一组件：chat.rs 删除本地 `STREAM_SILENT_TIMEOUT`/
+   `STREAM_MAX_BYTES`/`REASONING_ONLY_GRACE_SECS` 常量与自维护的 stall deadline/
+   reasoning 宽限状态，改用 `KernelStreamGovernor` + `KERNEL_STREAM_*` 常量（含字节
+   预算、`sleep_until(deadline)` 硬截止与 200ms tick 兜底判死）；剩余收敛件是消息
+   历史/tool loop 的抽取；
 3. 参数级审批、tool metrics 与工具重试语义均已接入 headless runtime：工具执行使用与
    UI 相同的 `TOOL_POLICY` 退避 + `retryable_for` 谓词（契约 retry_safe + 可恢复错误
    白名单，见 `agent/tools/errors.rs`），重试次数写入 trial 私有 `tool_runs.retry_count`，

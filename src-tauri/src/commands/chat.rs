@@ -16,6 +16,10 @@ use crate::utils::errors::{
 };
 use crate::utils::retry::{retry_with_backoff, STREAM_REQUEST_POLICY, TOOL_POLICY};
 use crate::utils::task_registry::{TaskRegistry, PHASE_MAIN_LOOP, PHASE_ROUND_REQUEST, PHASE_SEND, PHASE_START, PHASE_STREAMING, PHASE_TOOL};
+use crate::agent::agent_kernel::{
+    KernelStreamGovernor, KernelStreamSignal, KERNEL_STREAM_MAX_BYTES,
+    KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
+};
 use crate::agent::tools::guards::is_cancelled;
 
 /// 流式增量事件（每收到一个 delta 推送一次）
@@ -1255,12 +1259,8 @@ const MAX_CONTINUATION_ROUNDS: usize = 8;
 /// 空响应重试上限：模型连续多轮输出为空（服务端静默失败/异常截断）时最多重试
 /// 两次即收尾提示，防止进入无限空轮循环导致界面长时间无输出看起来卡死
 const MAX_EMPTY_ROUNDS: usize = 2;
-/// 流式无产出静默超时：连接保持但长时间解析不到有效内容（服务端只发心跳/空数据行、
-/// 模型卡住不吐字）时视为中断，保留已收内容触发自动续写（与截断续写机制同链路）；
-/// 续写轮模型无需重新思考，60 秒足够判定；过长会让“不吐字”的感知持续更久。
-/// 注意：仅“无有效产出”触发——大输出/长响应解析期间产出持续刷新不会触发，
-/// 数据仍到达但无产出由独立看门狗以数据停滞判据兜底。
-const STREAM_SILENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+// 流式无产出静默超时、reasoning-only 宽限与累计响应字节上限已迁入共用
+// `agent_kernel::KERNEL_STREAM_*` 常量与 `KernelStreamGovernor`（与 headless 同一状态机）。
 /// 连接中断自动续写次数上限：网络问题重试 3 次无意义（多为本地代理/网络故障），
 /// 超过后收尾并明确提示，避免无限续写空转
 const MAX_INTERRUPT_RETRY_ROUNDS: usize = 3;
@@ -1268,8 +1268,6 @@ const MAX_INTERRUPT_RETRY_ROUNDS: usize = 3;
 /// 用冻结请求原样重发（对齐 DeepSeek-Reasonix 冻结请求重放机制：模型无需重新思考、
 /// prompt 缓存不失效）；连续 5 次 0 产出中断多为本地网络故障，超过后走下方续写收尾
 const MAX_STREAM_REPLAYS: usize = 5;
-/// 累计响应字节上限（仅异常无限流兜底；正常任务百倍裕量）
-const STREAM_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// 单行字节上限（覆盖超大 JSON 工具参数；超限行跳过解析防烧 CPU）
 const STREAM_MAX_LINE: usize = 4 * 1024 * 1024;
 /// 每批最大处理行数（批间让出执行权/检查预算）
@@ -1290,10 +1288,6 @@ const STREAM_DELIVER_MAX_WAITS: u32 = 25;
 /// 推送会导致前端思考区每行重渲染 + 后端 IPC 堆积（实测 4096 条事件 renderer 烧满核），
 /// 合并后事件量降两个数量级；块边界强制 flush 保证正常流显示延迟 <100ms
 const STREAM_REASONING_MERGE_BYTES: usize = 2048;
-/// reasoning-only 护栏：纯思考流（无正文产出）最长允许时长。正常深度思考 <3 分钟；
-/// 超过视为病态（模型只吐思考不吐正文，停滞线被 Reasoning 持续刷新而永不触发），
-/// 中断后由自动续写接管。正文 Delta 出现后按正常停滞线继续
-const REASONING_ONLY_GRACE_SECS: u64 = 180;
 /// 工具循环检测阈值（对齐 qwen-code LoopDetectionService 轻量版）：
 /// - 连续相同调用（同工具名+同参数）达到该次数即判定打转——重复调用必得相同结果，
 ///   低于 DashScope 服务端 "Repetitive tool calls detected" 阈值，客户端先断循环防服务端 400；
@@ -7698,15 +7692,17 @@ async fn stream_once(
     let mut last_chunk_at = tokio::time::Instant::now();
     // 首字节打点：报告从 stream_send_begin 到收到首个网络块的耗时（连接建立/TLS/代理慢）
     let mut first_byte_logged = false;
-    let mut total_bytes: usize = 0;
-    // 停滞 wall-clock deadline：独立于流读取 future 计时。即便 stream.next()
+    // 停滞治理与字节预算共用 KernelStreamGovernor（与 headless 同一状态机）：
+    // wall-clock 停滞 deadline 独立于流读取 future 计时。即便 stream.next()
     // 在某些挂起连接上不响应取消/不被唤醒（实测会导致内部 200ms 轮询与 reqwest
     // 120s 总超时双双失效、8 分钟后才被看门狗杀），select! 也会在此 deadline
-    // 到达时强制跳出。每收到有效产出就重置。
-    let mut stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
-    // reasoning-only 护栏基线：首个 Reasoning 事件时间。纯思考流停滞线最多顺延到
-    // 该基线 + REASONING_ONLY_GRACE_SECS，防止模型只吐思考不吐正文时无限转圈
-    let mut first_reasoning_at: Option<tokio::time::Instant> = None;
+    // 到达时强制跳出。每收到有效产出就重置；纯思考流最多顺延到首次思考 + 宽限期。
+    let mut governor = KernelStreamGovernor::new(
+        KERNEL_STREAM_SILENT_TIMEOUT,
+        KERNEL_STREAM_REASONING_GRACE,
+        KERNEL_STREAM_MAX_BYTES,
+        tokio::time::Instant::now(),
+    );
     'outer: loop {
         // ── 停止检查：任何等待前先看是否已点停止 ────────────────────────
         registry.touch(conversation_id, PHASE_STREAMING);
@@ -7726,7 +7722,6 @@ async fn stream_once(
                 Some(Ok(bytes)) => {
                     if !first_byte_logged {
                         first_byte_logged = true;
-                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
                         // 首字节即视为一次数据到达+有效产出：初始化看门狗的流式
                         // 判据基线（数据到达），并保留产出基线供排障日志。
                         registry.touch_stream_data(conversation_id);
@@ -7744,24 +7739,20 @@ async fn stream_once(
                     // 看门狗以它为停滞判据：大输出/长响应传输中数据持续到达，
                     // 即使长时间无解析产出也不会被强杀；数据停滞才触发兜底。
                     registry.touch_stream_data(conversation_id);
-                    total_bytes += bytes.len();
-                    // 响应体积超限：立即中断报错（可重试），防止异常巨大流持续烧资源
-                    if total_bytes > STREAM_MAX_BYTES {
+                    if let Err(reason) = governor.observe(
+                        KernelStreamSignal::Data(bytes.len()),
+                        tokio::time::Instant::now(),
+                    ) {
+                        // 响应体积超限：立即中断报错（可重试），防止异常巨大流持续烧资源
                         crate::utils::logger::log_event(
                             "stream_too_large",
                             serde_json::json!({
                                 "conversation_id": conversation_id,
-                                "total_bytes": total_bytes,
-                                "max_bytes": STREAM_MAX_BYTES,
+                                "total_bytes": governor.total_bytes(),
+                                "max_bytes": KERNEL_STREAM_MAX_BYTES,
                             }),
                         );
-                        return Err(FriendlyError::new(
-                            ErrorKind::Network,
-                            format!(
-                                "流式响应体积超限(>{:.1}MB)，已中断防止持续卡死",
-                                STREAM_MAX_BYTES as f64 / 1024.0 / 1024.0
-                            ),
-                        ));
+                        return Err(FriendlyError::new(ErrorKind::Network, reason));
                     }
                     // 投递解析线程：有界通道背压下等待，期间每 200ms 检查停止（不丢字节）
                     if !deliver_chunk(&chunk_tx, bytes, cancel, conversation_id).await {
@@ -7784,7 +7775,7 @@ async fn stream_once(
                         serde_json::json!({
                             "conversation_id": conversation_id,
                             "error": error_chain,
-                            "bytes_received": total_bytes,
+                            "bytes_received": governor.total_bytes(),
                             "ms_since_last_chunk": last_chunk_at.elapsed().as_millis() as i64,
                             "headers": stream_headers,
                         }),
@@ -7801,9 +7792,8 @@ async fn stream_once(
                 let Some(ev) = ev else { break 'outer }; // 解析线程已退出且未发 Done（极端）
                 match ev {
                     StreamParserEvent::Delta(delta) => {
-                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
                         // 正文到达后退出 pure-reasoning 模式，恢复普通静默超时语义。
-                        first_reasoning_at = None;
+                        let _ = governor.observe(KernelStreamSignal::Content, tokio::time::Instant::now());
                         registry.touch_stream_progress(conversation_id);
                         delivered_content.push_str(&delta);
                         event_batcher.push_content(&delta);
@@ -7816,26 +7806,18 @@ async fn stream_once(
                         registry.touch_stream_progress(conversation_id);
                         // reasoning-only 护栏：停滞线最多顺延到首次思考 + 宽限期，
                         // 之后即使 reasoning 持续到达也强制判死（正文 Delta 恢复常规刷新）
-                        if first_reasoning_at.is_none() {
-                            first_reasoning_at = Some(tokio::time::Instant::now());
-                        }
-                        let now = tokio::time::Instant::now();
-                        let grace_end = first_reasoning_at.unwrap()
-                            + tokio::time::Duration::from_secs(REASONING_ONLY_GRACE_SECS);
-                        // 持续 reasoning 可推进静默线，但绝不能越过首次思考后的硬上限。
-                        stall_deadline = std::cmp::min(now + STREAM_SILENT_TIMEOUT, grace_end);
+                        let _ = governor.observe(KernelStreamSignal::Reasoning, tokio::time::Instant::now());
                         delivered_reasoning.push_str(&r);
                         event_batcher.push_reasoning(&r);
                     }
                     StreamParserEvent::ToolCall => {
-                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
-                        first_reasoning_at = None;
+                        let _ = governor.observe(KernelStreamSignal::ToolCall, tokio::time::Instant::now());
                         registry.touch_stream_progress(conversation_id);
                     }
                     StreamParserEvent::Finish { truncated: t } => {
                         finished = true;
                         truncated = t;
-                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+                        let _ = governor.observe(KernelStreamSignal::Finish, tokio::time::Instant::now());
                         registry.touch_stream_progress(conversation_id);
                     }
                     StreamParserEvent::PersistWatermark { placeholder: p } => {
@@ -7853,14 +7835,14 @@ async fn stream_once(
                 tick_count += 1;
                 // 停滞兜底双保险：事件洪峰长期压制 sleep_until 分支调度时，tick 仍按
                 // 200ms 粒度 wall-clock 判死（不依赖 select! 分支公平性）
-                if tokio::time::Instant::now() >= stall_deadline {
+                if governor.stalled(tokio::time::Instant::now()) {
                     stalled = true;
                     crate::utils::logger::log_event(
                         "stream_silent_dead",
                         serde_json::json!({
                             "conversation_id": conversation_id,
                             "after_first_byte": first_byte_logged,
-                            "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
+                            "timeout_ms": KERNEL_STREAM_SILENT_TIMEOUT.as_millis() as i64,
                             "via": "tick_backstop",
                         }),
                     );
@@ -7895,14 +7877,14 @@ async fn stream_once(
             //    即便 stream.next() 在挂起连接上不被唤醒，tokio::time::sleep 也会
             //    触发，彻底避免无限转圈。与旧实现直接返回不同：统一 break 走收尾，
             //    取回解析线程 flush 后的产物（半截正文保留给续写，不丢内容）。
-            _ = tokio::time::sleep_until(stall_deadline) => {
+            _ = tokio::time::sleep_until(governor.deadline()) => {
                 stalled = true;
                 crate::utils::logger::log_event(
                     "stream_silent_dead",
                     serde_json::json!({
                         "conversation_id": conversation_id,
                         "after_first_byte": first_byte_logged,
-                        "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
+                        "timeout_ms": KERNEL_STREAM_SILENT_TIMEOUT.as_millis() as i64,
                         "via": "wall_clock_deadline",
                     }),
                 );
@@ -7919,7 +7901,7 @@ async fn stream_once(
             "finished": finished,
             "truncated": truncated,
             "stalled": stalled,
-            "total_bytes": total_bytes,
+            "total_bytes": governor.total_bytes(),
         }),
     );
     drop(chunk_tx);
