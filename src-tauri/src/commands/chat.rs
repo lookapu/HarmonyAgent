@@ -4590,60 +4590,14 @@ async fn stream_chat_inner(
             images_attached,
             protocol: &protocol,
             supports_image,
+            context_budget,
+            history_limit,
         });
         let mut messages = assembled.messages;
         images_attached = assembled.images_attached;
         
-        // 重置续写/纠正状态（assembler 已消费）
-        continuation_pending = false;
-        continuation_reasoning_only = false;
-        correction_text = String::new();
-        correction_hint = String::new();
-        
-        seam_count += 1;
-        // 账本实时推送（前端"任务账本"卡）：每轮刷新当前执行轨迹派生账本
-        if let Some(ref ledger_now) = ledger_now {
-            // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
-            // 应用崩溃、系统重启或看门狗强杀时，下一次任务仍能从最近一次
-            // 已执行工具及下一步继续，避免复杂任务回到起点。
-            save_task_ledger(state, &conversation_id, Some(ledger_now))?;
-            let _ = app.emit(
-                "chat-ledger",
-                ChatLedgerEvent {
-                    conversation_id: conversation_id.clone(),
-                    ledger: Some(ledger_now.clone()),
-                    finished: false,
-                },
-            );
-        }
-        // 会话快照（时间旅行）：每轮执行后保存状态锚点（消息 rowid + 账本 + 摘要），
-        // 用户可"回到此处"从历史决策点重新引导；无执行痕迹的首轮不保存。
-        // 失败不阻塞主循环（快照是增值能力，丢一轮无碍）
-        {
-            let Ok(conn) = state.0.lock() else { return Err("数据库锁不可用".into()) };
-            let _ = save_conversation_snapshot(
-                &conn,
-                &conversation_id,
-                ledger_now.as_ref(),
-                &last_model_text,
-                tool_runs.len(),
-            );
-            // Context V2 检查点是可重建投影：保存任务状态、摘要覆盖游标和预算。
-            // 失败不阻断聊天主循环，旧消息/Run/事件仍是恢复真源。
-            let _ = crate::agent::context::persist_runtime_checkpoint(
-                &conn,
-                &conversation_id,
-                Some(&trace_id),
-                context_summary.as_deref(),
-                history_limit,
-                context_budget,
-            );
-        }
-        // 主动预算压缩：估算请求 token，超过模型窗口 85% 时不等待 400 报错，
-        // 主动把最旧历史压缩为滚动摘要后重试（保住早期关键决策，避免大窗口模型下静默丢失）
-        if history_limit > MIN_HISTORY_KEEP
-            && estimate_tokens(&messages) > context_budget as usize * 85 / 100
-        {
+        // E3：压缩决策——assembler 已判断是否需要压缩，adapter 执行实际压缩
+        if assembled.compress {
             let old_limit = history_limit;
             history_limit = (history_limit / 2).max(MIN_HISTORY_KEEP);
             let _ = app.emit(
@@ -4698,28 +4652,65 @@ async fn stream_chat_inner(
                     params![history_limit as i64, conversation_id],
                 );
                 // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
-                crate::agent::context::bump_compress_count(&conn, &conversation_id);
-                // LC-33：压缩事件写入会话事件流（预警→执行闭环可回放、可度量）
-                let _ = crate::agent::session_events::append_event(
-                    &conn,
-                    &conversation_id,
-                    crate::agent::session_events::SessionEventType::ContextCompress,
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO conversation_health(conversation_id, compress_count) VALUES(?1, 1)
+                     ON CONFLICT(conversation_id) DO UPDATE SET compress_count = COALESCE(compress_count, 0) + 1",
+                    params![conversation_id],
+                );
+                let _ = app.emit(
+                    "chat-context-compact",
                     serde_json::json!({
-                        "trigger": "active",
-                        "old_limit": old_limit,
-                        "new_limit": history_limit,
+                        "conversation_id": conversation_id,
+                        "keep": history_limit,
                     }),
-                    Some(&trace_id),
                 );
             }
+        }
+        
+        // 重置续写/纠正状态（assembler 已消费）
+        continuation_pending = false;
+        continuation_reasoning_only = false;
+        correction_text = String::new();
+        correction_hint = String::new();
+        
+        seam_count += 1;
+        // 账本实时推送（前端"任务账本"卡）：每轮刷新当前执行轨迹派生账本
+        if let Some(ref ledger_now) = ledger_now {
+            // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
+            // 应用崩溃、系统重启或看门狗强杀时，下一次任务仍能从最近一次
+            // 已执行工具及下一步继续，避免复杂任务回到起点。
+            save_task_ledger(state, &conversation_id, Some(ledger_now))?;
             let _ = app.emit(
-                "chat-compact",
-                serde_json::json!({
-                    "conversation_id": conversation_id.clone(),
-                    "keep": history_limit,
-                }),
+                "chat-ledger",
+                ChatLedgerEvent {
+                    conversation_id: conversation_id.clone(),
+                    ledger: Some(ledger_now.clone()),
+                    finished: false,
+                },
             );
-            continue;
+        }
+        // 会话快照（时间旅行）：每轮执行后保存状态锚点（消息 rowid + 账本 + 摘要），
+        // 用户可"回到此处"从历史决策点重新引导；无执行痕迹的首轮不保存。
+        // 失败不阻塞主循环（快照是增值能力，丢一轮无碍）
+        {
+            let Ok(conn) = state.0.lock() else { return Err("数据库锁不可用".into()) };
+            let _ = save_conversation_snapshot(
+                &conn,
+                &conversation_id,
+                ledger_now.as_ref(),
+                &last_model_text,
+                tool_runs.len(),
+            );
+            // Context V2 检查点是可重建投影：保存任务状态、摘要覆盖游标和预算。
+            // 失败不阻断聊天主循环，旧消息/Run/事件仍是恢复真源。
+            let _ = crate::agent::context::persist_runtime_checkpoint(
+                &conn,
+                &conversation_id,
+                Some(&trace_id),
+                context_summary.as_deref(),
+                history_limit,
+                context_budget,
+            );
         }
 
         // 预算门控：发送前用本地 token 预估估算本次成本，若已用+本次预估突破

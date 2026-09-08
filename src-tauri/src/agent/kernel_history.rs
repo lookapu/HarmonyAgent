@@ -7,6 +7,9 @@
 use serde_json;
 use crate::agent::tools::parse_data_url;
 
+/// 最小历史保留条数：压缩时至少保留这么多条最近消息，避免把关键上下文全压掉。
+const MIN_HISTORY_KEEP: usize = 10;
+
 /// 历史行数上限按模型上下文预算动态计算：预算越大保留越多历史，但有上下限防止
 /// 小窗口模型撑爆上下文或大窗口模型历史过短丢失决策语境。
 ///
@@ -82,13 +85,18 @@ pub struct KernelHistoryInput<'a> {
     pub images_attached: usize,
     pub protocol: &'a str,
     pub supports_image: bool,
+
+    // 压缩决策参数（E3：adapter 传入上下文预算和当前历史限制，assembler 判断是否需要压缩）
+    pub context_budget: i64,
+    pub history_limit: usize,
 }
 
-/// Assembler 输出：消息序列 + 更新后的图片计数（adapter 直接发给 Provider）
+/// Assembler 输出：消息序列 + 更新后的图片计数 + 压缩决策（adapter 执行实际压缩）
 #[derive(Clone, Debug)]
 pub struct KernelAssembled {
     pub messages: Vec<serde_json::Value>,
     pub images_attached: usize,
+    pub compress: bool, // true 时 adapter 应执行 summarize_rolling_history + 落库 + 事件
 }
 
 /// KernelHistoryAssembler：纯策略消息组装器（无 IO，所有数据由 adapter 预读）。
@@ -319,7 +327,12 @@ impl KernelHistoryAssembler {
             }
         }
 
-        KernelAssembled { messages, images_attached }
+        // E3：压缩决策——估算请求 token，超过模型窗口 85% 时标记需要压缩
+        // 注意：实际压缩执行（summarize_rolling_history + 落库 + 事件）留在 adapter
+        let compress = input.history_limit > MIN_HISTORY_KEEP
+            && estimate_tokens(&messages) > input.context_budget as usize * 85 / 100;
+
+        KernelAssembled { messages, images_attached, compress }
     }
 }
 
@@ -399,10 +412,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 2); // system + workflow directive
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false); // no history, should not compress
         assert_eq!(assembled.messages[0]["role"], "system");
         assert_eq!(assembled.messages[0]["content"], "You are a helpful assistant.");
         assert_eq!(assembled.messages[1]["role"], "system");
@@ -431,10 +447,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + memo + context + workflow
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "Core rules.");
         assert_eq!(assembled.messages[1]["content"], "Memory: user prefers Rust.");
         assert_eq!(assembled.messages[2]["content"], "Context: working on auth module.");
@@ -463,10 +482,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + ledger + plan
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "System.");
         assert_eq!(assembled.messages[1]["content"], "Workflow.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("Ledger:"));
@@ -502,11 +524,14 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // system + workflow + assistant (with reasoning)
         assert_eq!(assembled.messages.len(), 3);
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "System.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -542,10 +567,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + tool result as user
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -581,11 +609,14 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // Short pending action phrase (< 300 chars) should be replaced with placeholder
         assert_eq!(assembled.messages.len(), 3);
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -619,10 +650,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + tool result
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("[工具执行结果 - write_file]"));
@@ -655,10 +689,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + user injection
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -687,11 +724,14 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // system + workflow + plan + progress check
         assert_eq!(assembled.messages.len(), 4);
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("已批准任务计划"));
@@ -720,10 +760,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + assistant + user (continuation)
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -753,11 +796,14 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // Empty continuation_text means no continuation injected
         assert_eq!(assembled.messages.len(), 2); // system + workflow only
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
     }
@@ -784,10 +830,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + assistant + user (correction)
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -818,10 +867,13 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + compression summary
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("历史摘要"));
@@ -865,6 +917,8 @@ mod tests {
             images_attached: 0,
             protocol: "",
             supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // Expected order:
@@ -885,6 +939,7 @@ mod tests {
         // 14: correction user
         assert_eq!(assembled.messages.len(), 15);
         assert_eq!(assembled.images_attached, 0);
+        assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "System prompt.");
         assert_eq!(assembled.messages[1]["content"], "Memo.");
         assert_eq!(assembled.messages[2]["content"], "Context.");
