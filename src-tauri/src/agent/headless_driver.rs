@@ -196,15 +196,28 @@ impl HeadlessAgentDriver {
         messages: &[Value],
         timeout: Duration,
     ) -> Result<(Value, u64), AgentDriverError> {
-        let url = format!("{}/chat/completions", provider.base_url);
+        let tool_specs = Self::tool_specs();
+        let request_plan = crate::agent::agent_kernel::build_model_request_plan(
+            "openai",
+            &provider.base_url,
+            &provider.model_id,
+            messages,
+            tool_specs.as_array().map(Vec::as_slice),
+            false,
+            None,
+            Some(0.0),
+            None,
+            None,
+        )
+        .map_err(AgentDriverError::Failed)?;
         let client = reqwest::Client::new();
         let mut retries = 0;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let request = client
-                .post(&url)
+                .post(&request_plan.url)
                 .bearer_auth(&provider.api_key)
-                .json(&json!({"model": provider.model_id, "messages": messages, "tools": Self::tool_specs(), "temperature": 0}))
+                .json(&request_plan.body)
                 .send();
             let response = tokio::time::timeout_at(deadline, request)
                 .await

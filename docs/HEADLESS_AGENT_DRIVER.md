@@ -128,6 +128,11 @@ OpenAI/Anthropic/Gemini 的正常结束与 token 截断，以常量空间累计 
 OpenAI 原生工具调用分片。Anthropic 分散在 `message_start` 与 `message_delta` 的输入/输出/
 缓存 token 会合并为同一份 usage；一个 OpenAI 帧内的多个并行 tool call 不再只保留首个。
 
+第四个切片 `KernelRequestPlan` 已统一桌面流式、桌面非流式和 headless 的请求规划：协议端点、
+请求体、鉴权类型、采样参数、原生工具 schema 与 DeepSeek reasoning 历史净化只有一套实现。
+计划对象刻意不携带 API key，transport 只在发送前注入凭据；非法 temperature/top-p/max_tokens
+在内核失败关闭。代理选择、HTTP 重试、取消轮询和超时仍由调用方运行时负责，下一阶段再统一。
+
 ### 5.1 事件输出接口
 
 推荐新增事件 sink，而不是让 driver 组装完整 trajectory Vec：
@@ -441,7 +446,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ### Phase 4：统一 Agent Kernel
 
-- 从 `chat.rs` 抽取 ModelClient/stream parser（`KernelTurn`、usage ledger 与多协议 `KernelStreamAccumulator` 已落地；请求传输层仍待抽取）；
+- 从 `chat.rs` 抽取 ModelClient/stream parser（`KernelTurn`、usage ledger、多协议 `KernelStreamAccumulator` 与无 secret 的 `KernelRequestPlan` 已落地；HTTP 重试/取消 transport 仍待抽取）；
 - 抽取消息历史、tool loop、reflexion、governance、recovery（acceptance stop gate 已共用）；
 - Tauri UI 和 eval 共用 AgentKernel；
 - 再扩展 Anthropic/Gemini 适配器。

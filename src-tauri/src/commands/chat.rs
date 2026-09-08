@@ -6910,75 +6910,6 @@ fn pick_fallback_model(state: &tauri::State<'_, DbState>, current: &ModelChoice)
 // - 推理模型且 effort 未显式关闭：缺失/为空的 assistant 消息填 "(reasoning omitted)" 占位符
 //   （占位符在无工具调用时被服务端忽略，双向安全）。
 
-/// 模型名判定是否为 DeepSeek 推理模型（v3.2/v4/reasoner/-reasoning/-thinking/deepseek-r 数字系列）
-fn requires_reasoning_content(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.contains("deepseek-v3.2")
-        || lower.contains("deepseek-v4")
-        || lower.contains("reasoner")
-        || lower.contains("-reasoning")
-        || lower.contains("-thinking")
-        || {
-            // deepseek-r 后接数字（deepseek-r1 / deepseek-r2 等）
-            const PREFIX: &str = "deepseek-r";
-            lower
-                .match_indices(PREFIX)
-                .any(|(idx, _)| lower[idx + PREFIX.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
-        }
-}
-
-/// 是否应回传/占位 reasoning_content：推理模型且 effort 未显式关闭（off/disabled/none/false）
-fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
-    let disabled = effort.is_some_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "off" | "disabled" | "none" | "false"
-        )
-    });
-    !disabled && requires_reasoning_content(model)
-}
-
-/// 最终净化器：返回净化后的消息副本（不修改入参）。
-/// 返回 (净化后消息, 占位符替换数, 回传 reasoning 总字符数)。
-fn sanitize_thinking_messages(
-    messages: &[serde_json::Value],
-    model: &str,
-    effort: Option<&str>,
-) -> (Vec<serde_json::Value>, u32, u64) {
-    let mut out: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
-    let mut substitutions: u32 = 0;
-    let mut replay_chars: u64 = 0;
-    let replay = should_replay_reasoning_content(model, effort);
-    for m in messages {
-        let mut mm = m.clone();
-        if !replay {
-            // 非推理模型：剥离字段，防兼容端点不认识而报错
-            if let serde_json::Value::Object(map) = &mut mm {
-                map.remove("reasoning_content");
-            }
-        } else if let serde_json::Value::Object(map) = &mut mm {
-            let missing = map
-                .get("reasoning_content")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|s| s.trim().is_empty());
-            if map.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-                && missing
-            {
-                map.insert(
-                    "reasoning_content".to_string(),
-                    serde_json::json!("(reasoning omitted)"),
-                );
-                substitutions = substitutions.saturating_add(1);
-            }
-            if let Some(r) = map.get("reasoning_content").and_then(serde_json::Value::as_str) {
-                replay_chars = replay_chars.saturating_add(r.len() as u64);
-            }
-        }
-        out.push(mm);
-    }
-    (out, substitutions, replay_chars)
-}
-
 /// 400 诊断：遍历消息，输出仍缺 reasoning_content 的 assistant 消息（标注是否带 tool_calls），
 /// 用于定位绕过净化器的代码路径（对齐 DeepSeek-TUI log_thinking_mode_violations）。
 fn log_thinking_mode_violations(messages: &[serde_json::Value]) {
@@ -7029,6 +6960,29 @@ fn format_stream_headers(headers: &reqwest::header::HeaderMap) -> String {
         .join(", ")
 }
 
+fn request_builder_from_plan(
+    client: &reqwest::Client,
+    provider: &ProviderEndpoint,
+    plan: &crate::agent::agent_kernel::KernelRequestPlan,
+) -> reqwest::RequestBuilder {
+    let mut request = client.post(&plan.url).json(&plan.body);
+    if let Some(key) = provider.api_key.as_deref() {
+        request = match plan.auth_scheme {
+            crate::agent::agent_kernel::KernelAuthScheme::Bearer => {
+                request.header("Authorization", format!("Bearer {key}"))
+            }
+            crate::agent::agent_kernel::KernelAuthScheme::Anthropic => request
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01"),
+            crate::agent::agent_kernel::KernelAuthScheme::Gemini => {
+                request.header("x-goog-api-key", key)
+            }
+        };
+    }
+    request
+}
+
+#[cfg(test)]
 trait LlmProvider: Send + Sync {
     /// 构造流式请求（URL/headers/body 由协议决定），返回可发送的 RequestBuilder。
     /// native_tools：原生 function calling 工具 schema（OpenAI 兼容协议注入 tools；
@@ -7045,6 +6999,7 @@ trait LlmProvider: Send + Sync {
 }
 
 /// 采样参数注入：仅当显式设置时加入请求体（键名因协议而异）
+#[cfg(test)]
 fn apply_sampling(body: &mut serde_json::Value, key_temp: &str, key_top: &str, key_max: &str, opts: &ChatOptions) {
     if let Some(v) = opts.temperature {
         body[key_temp] = serde_json::json!(v);
@@ -7058,12 +7013,16 @@ fn apply_sampling(body: &mut serde_json::Value, key_temp: &str, key_top: &str, k
 }
 
 /// OpenAI 兼容协议（/chat/completions，Bearer 鉴权，reasoning_effort 可选）
+#[cfg(test)]
 struct OpenAiProvider;
 /// Anthropic 原生协议（/v1/messages，x-api-key 鉴权，system 单独字段）
+#[cfg(test)]
 struct AnthropicProvider;
 /// Gemini 原生协议（x-goog-api-key，contents + systemInstruction，SSE）
+#[cfg(test)]
 struct GeminiProvider;
 
+#[cfg(test)]
 impl LlmProvider for OpenAiProvider {
     fn build_stream_request(
         &self,
@@ -7080,7 +7039,11 @@ impl LlmProvider for OpenAiProvider {
         // 消息填 "(reasoning omitted)" 占位符（携带 tools 的请求缺失会 400）。历史构造、续写、
         // 纠正等任意来源的 assistant 消息都经此兜底，历史构造处的回传只是第一层。
         let (messages_san, substitutions, replay_chars) =
-            sanitize_thinking_messages(messages, &model_choice.model, opts.reasoning_effort.as_deref());
+            crate::agent::agent_kernel::sanitize_thinking_messages(
+                messages,
+                &model_choice.model,
+                opts.reasoning_effort.as_deref(),
+            );
         if substitutions > 0 || replay_chars > 0 {
             crate::utils::logger::log_event(
                 "reasoning_replay",
@@ -7121,6 +7084,7 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+#[cfg(test)]
 impl LlmProvider for AnthropicProvider {
     fn build_stream_request(
         &self,
@@ -7162,6 +7126,7 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+#[cfg(test)]
 impl LlmProvider for GeminiProvider {
     fn build_stream_request(
         &self,
@@ -7217,6 +7182,7 @@ impl LlmProvider for GeminiProvider {
 }
 
 /// 按协议名创建提供方实现（未知协议回退 OpenAI 兼容，与历史行为一致）
+#[cfg(test)]
 fn llm_provider_for(protocol: &str) -> Box<dyn LlmProvider> {
     match protocol {
         "anthropic" => Box::new(AnthropicProvider),
@@ -7228,6 +7194,10 @@ fn llm_provider_for(protocol: &str) -> Box<dyn LlmProvider> {
 #[cfg(test)]
 mod llm_provider_tests {
     use super::*;
+    use crate::agent::agent_kernel::{
+        requires_reasoning_content, sanitize_thinking_messages,
+        should_replay_reasoning_content,
+    };
 
     fn sample_provider(protocol: &str) -> ProviderEndpoint {
         ProviderEndpoint {
@@ -7437,8 +7407,6 @@ async fn stream_once(
     if crate::agent::evals::take_fault("stream_disconnect_before_delta") {
         return Err(FriendlyError::new(ErrorKind::Network,"可靠性评测故障注入：首个增量前断流"));
     }
-    // 能力接缝：按协议解析出提供方实现，协议特有的请求构造由 trait 承担
-    let provider_impl = llm_provider_for(protocol);
     // 原生 function calling（工具协议标准化 Phase 1）：仅 openai 协议 + 显式开启时
     // 注入当前任务相关 schema；MCP/Skill 动态工具仍可用文本标记调用。
     let tool_query = messages
@@ -7488,21 +7456,34 @@ async fn stream_once(
         "role": "system",
         "content": crate::agent::tools::phase_hint_for_names(tool_phase, &ranked_tools),
     }));
-    let build_req = || {
-        let tools_opt = if tool_schemas.is_empty() {
-            None
-        } else {
-            Some(tool_schemas.as_slice())
-        };
-        provider_impl.build_stream_request(
-            client,
-            provider,
-            model_choice,
-            opts,
-            &request_messages,
-            tools_opt,
-        )
-    };
+    let tools_opt = (!tool_schemas.is_empty()).then_some(tool_schemas.as_slice());
+    let request_plan = crate::agent::agent_kernel::build_model_request_plan(
+        protocol,
+        &provider.base_url,
+        &model_choice.model,
+        &request_messages,
+        tools_opt,
+        true,
+        Some(opts.max_tokens.unwrap_or(model_choice.output_limit)),
+        opts.temperature,
+        opts.top_p,
+        opts.reasoning_effort.as_deref(),
+    )
+    .map_err(|error| FriendlyError::new(ErrorKind::Client, error))?;
+    if request_plan.reasoning_replay.substitutions > 0
+        || request_plan.reasoning_replay.replay_chars > 0
+    {
+        crate::utils::logger::log_event(
+            "reasoning_replay",
+            serde_json::json!({
+                "model": model_choice.model,
+                "substitutions": request_plan.reasoning_replay.substitutions,
+                "replay_chars": request_plan.reasoning_replay.replay_chars,
+                "approx_tokens": request_plan.reasoning_replay.replay_chars / 4,
+            }),
+        );
+    }
+    let build_req = || request_builder_from_plan(client, provider, &request_plan);
 
     // LLM 录制/重放接缝（无 key 回归测试；DEVS_LLM_REPLAY=record:dir|replay:dir）：
     // 重放命中直接返回录制响应不发起真实请求；录制把原始 SSE 流落盘
@@ -10855,65 +10836,19 @@ async fn non_stream_request(
             )),
         };
     }
-    let base = provider.base_url.trim_end_matches('/');
-    let system = messages[0]["content"].as_str().unwrap_or("").to_string();
-    // Anthropic 协议不认识 OpenAI 的 reasoning_content 字段，剥离（reasoning 合规回传仅 OpenAI 协议）
-    let history: Vec<serde_json::Value> = messages[1..]
-        .iter()
-        .map(|m| {
-            let mut mm = m.clone();
-            if let serde_json::Value::Object(map) = &mut mm {
-                map.remove("reasoning_content");
-            }
-            mm
-        })
-        .collect();
-    let (url, body) = match provider.protocol.as_str() {
-        "anthropic" => (
-            format!("{base}/v1/messages"),
-            serde_json::json!({
-                "model": model_choice.model,
-                "max_tokens": max_tokens.unwrap_or(4096),
-                "system": system,
-                "messages": history,
-            }),
-        ),
-        "gemini" => (
-            format!("{base}/v1beta/models/{}:generateContent", model_choice.model),
-            serde_json::json!({
-                "contents": history
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "role": if m["role"] == "assistant" { "model" } else { "user" },
-                            "parts": [{"text": m["content"]}],
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                "systemInstruction": {"parts": [{"text": system}]},
-                "maxOutputTokens": max_tokens.unwrap_or(4096),
-            }),
-        ),
-        _ => {
-            // DeepSeek 推理模型合规净化（与流式同口径）：非推理模型剥离 reasoning_content、
-            // 推理模型对缺失/为空的 assistant 消息填占位符（子 Agent/压缩等调用方消息
-            // 可能来自任意来源，发送前统一兜底防 400）
-            let (messages_san, _, _) =
-                sanitize_thinking_messages(messages, &model_choice.model, None);
-            (
-                format!("{base}/chat/completions"),
-                serde_json::json!({ "model": model_choice.model, "messages": messages_san, "max_tokens": max_tokens.unwrap_or(4096) }),
-            )
-        }
-    };
-    let mut req = client.post(&url).json(&body);
-    if let Some(ref key) = provider.api_key {
-        match provider.protocol.as_str() {
-            "anthropic" => req = req.header("x-api-key", key).header("anthropic-version", "2023-06-01"),
-            "gemini" => req = req.header("x-goog-api-key", key),
-            _ => req = req.header("Authorization", format!("Bearer {key}")),
-        }
-    }
+    let request_plan = crate::agent::agent_kernel::build_model_request_plan(
+        &provider.protocol,
+        &provider.base_url,
+        &model_choice.model,
+        messages,
+        None,
+        false,
+        Some(max_tokens.unwrap_or(4096).min(u32::MAX as usize) as u32),
+        None,
+        None,
+        None,
+    )?;
+    let req = request_builder_from_plan(client, provider, &request_plan);
     crate::utils::logger::log_event(
         "non_stream_start",
         serde_json::json!({

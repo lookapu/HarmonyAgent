@@ -140,6 +140,269 @@ pub fn parse_openai_turn(response: &Value) -> Result<KernelTurn, String> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelAuthScheme {
+    Bearer,
+    Anthropic,
+    Gemini,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KernelReasoningReplay {
+    pub substitutions: u32,
+    pub replay_chars: u64,
+}
+
+/// 不携带 secret 的 Provider 请求计划。API key 只在 transport 最后一刻按 auth_scheme
+/// 注入 reqwest，避免请求规划、日志或 eval manifest 意外持有凭据。
+#[derive(Clone, Debug)]
+pub struct KernelRequestPlan {
+    pub url: String,
+    pub body: Value,
+    pub auth_scheme: KernelAuthScheme,
+    pub reasoning_replay: KernelReasoningReplay,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_model_request_plan(
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    messages: &[Value],
+    native_tools: Option<&[Value]>,
+    stream: bool,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    reasoning_effort: Option<&str>,
+) -> Result<KernelRequestPlan, String> {
+    if base_url.trim().is_empty() || model.trim().is_empty() {
+        return Err("Provider base_url/model 不能为空".into());
+    }
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
+        return Err("temperature 必须是 0..=2 的有限数字".into());
+    }
+    if top_p.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err("top_p 必须是 0..=1 的有限数字".into());
+    }
+    if max_tokens == Some(0) {
+        return Err("max_tokens 必须大于 0".into());
+    }
+    let base = base_url.trim_end_matches('/');
+    match protocol {
+        "anthropic" => {
+            let (system, history) = split_system_history(messages);
+            let history = strip_reasoning_fields(history);
+            let mut body = serde_json::json!({
+                "model": model,
+                "system": system,
+                "messages": history,
+            });
+            if stream {
+                body["stream"] = Value::Bool(true);
+            }
+            apply_kernel_sampling(
+                &mut body,
+                "temperature",
+                "top_p",
+                "max_tokens",
+                temperature,
+                top_p,
+                max_tokens,
+            );
+            Ok(KernelRequestPlan {
+                url: format!("{base}/v1/messages"),
+                body,
+                auth_scheme: KernelAuthScheme::Anthropic,
+                reasoning_replay: KernelReasoningReplay::default(),
+            })
+        }
+        "gemini" => {
+            let (system, history) = split_system_history(messages);
+            let history = strip_reasoning_fields(history);
+            let contents = history
+                .iter()
+                .map(|message| {
+                    serde_json::json!({
+                        "role": if message.get("role").and_then(Value::as_str) == Some("assistant") { "model" } else { "user" },
+                        "parts": message.get("parts").cloned().unwrap_or_else(|| serde_json::json!([{"text":message.get("content").cloned().unwrap_or(Value::Null)}])),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut body = serde_json::json!({
+                "contents": contents,
+                "systemInstruction": {"parts":[{"text":system}]},
+            });
+            apply_kernel_sampling(
+                &mut body,
+                "temperature",
+                "topP",
+                "maxOutputTokens",
+                temperature,
+                top_p,
+                max_tokens,
+            );
+            let method = if stream {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
+            Ok(KernelRequestPlan {
+                url: format!("{base}/v1beta/models/{model}:{method}"),
+                body,
+                auth_scheme: KernelAuthScheme::Gemini,
+                reasoning_replay: KernelReasoningReplay::default(),
+            })
+        }
+        _ => {
+            let (messages, substitutions, replay_chars) =
+                sanitize_thinking_messages(messages, model, reasoning_effort);
+            let mut body = serde_json::json!({"model":model,"messages":messages});
+            if stream {
+                body["stream"] = Value::Bool(true);
+            }
+            apply_kernel_sampling(
+                &mut body,
+                "temperature",
+                "top_p",
+                "max_tokens",
+                temperature,
+                top_p,
+                max_tokens,
+            );
+            if let Some(tools) = native_tools.filter(|tools| !tools.is_empty()) {
+                body["tools"] = Value::Array(tools.to_vec());
+                body["tool_choice"] = Value::String("auto".into());
+            }
+            if reasoning_effort.is_some_and(|value| matches!(value, "low" | "medium" | "high")) {
+                body["reasoning_effort"] = Value::String(reasoning_effort.unwrap().into());
+            }
+            Ok(KernelRequestPlan {
+                url: format!("{base}/chat/completions"),
+                body,
+                auth_scheme: KernelAuthScheme::Bearer,
+                reasoning_replay: KernelReasoningReplay {
+                    substitutions,
+                    replay_chars,
+                },
+            })
+        }
+    }
+}
+
+fn apply_kernel_sampling(
+    body: &mut Value,
+    temperature_key: &str,
+    top_p_key: &str,
+    max_tokens_key: &str,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
+) {
+    if let Some(value) = temperature {
+        body[temperature_key] = serde_json::json!(value);
+    }
+    if let Some(value) = top_p {
+        body[top_p_key] = serde_json::json!(value);
+    }
+    if let Some(value) = max_tokens {
+        body[max_tokens_key] = serde_json::json!(value);
+    }
+}
+
+fn split_system_history(messages: &[Value]) -> (String, &[Value]) {
+    match messages.split_first() {
+        Some((first, rest)) if first.get("role").and_then(Value::as_str) == Some("system") => (
+            first
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            rest,
+        ),
+        _ => (String::new(), messages),
+    }
+}
+
+fn strip_reasoning_fields(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if let Value::Object(map) = &mut message {
+                map.remove("reasoning_content");
+            }
+            message
+        })
+        .collect()
+}
+
+pub fn requires_reasoning_content(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("deepseek-v3.2")
+        || lower.contains("deepseek-v4")
+        || lower.contains("reasoner")
+        || lower.contains("-reasoning")
+        || lower.contains("-thinking")
+        || {
+            const PREFIX: &str = "deepseek-r";
+            lower.match_indices(PREFIX).any(|(index, _)| {
+                lower[index + PREFIX.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_digit())
+            })
+        }
+}
+
+pub fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
+    let disabled = effort.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "disabled" | "none" | "false"
+        )
+    });
+    !disabled && requires_reasoning_content(model)
+}
+
+pub fn sanitize_thinking_messages(
+    messages: &[Value],
+    model: &str,
+    effort: Option<&str>,
+) -> (Vec<Value>, u32, u64) {
+    let replay = should_replay_reasoning_content(model, effort);
+    let mut substitutions = 0u32;
+    let mut replay_chars = 0u64;
+    let messages = messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if !replay {
+                if let Value::Object(map) = &mut message {
+                    map.remove("reasoning_content");
+                }
+            } else if let Value::Object(map) = &mut message {
+                let missing = map
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty());
+                if map.get("role").and_then(Value::as_str) == Some("assistant") && missing {
+                    map.insert(
+                        "reasoning_content".into(),
+                        Value::String("(reasoning omitted)".into()),
+                    );
+                    substitutions = substitutions.saturating_add(1);
+                }
+                if let Some(reasoning) = map.get("reasoning_content").and_then(Value::as_str) {
+                    replay_chars = replay_chars.saturating_add(reasoning.len() as u64);
+                }
+            }
+            message
+        })
+        .collect();
+    (messages, substitutions, replay_chars)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KernelStreamFinish {
     #[default]
@@ -686,6 +949,138 @@ mod tests {
         );
         assert_eq!(frame.finish, KernelStreamFinish::Done);
         assert_eq!(stream.usage().unwrap().cached_tokens, 2);
+    }
+
+    #[test]
+    fn request_plans_cover_protocol_endpoints_auth_and_tools() {
+        let messages = vec![
+            serde_json::json!({"role":"system","content":"system"}),
+            serde_json::json!({"role":"user","content":"hello"}),
+        ];
+        let tools = vec![serde_json::json!({"type":"function","function":{"name":"read_file"}})];
+        let openai = build_model_request_plan(
+            "openai",
+            "https://api.example/",
+            "model-a",
+            &messages,
+            Some(&tools),
+            true,
+            Some(2048),
+            Some(0.2),
+            Some(0.9),
+            Some("high"),
+        )
+        .unwrap();
+        assert_eq!(openai.url, "https://api.example/chat/completions");
+        assert_eq!(openai.auth_scheme, KernelAuthScheme::Bearer);
+        assert_eq!(openai.body["stream"], true);
+        assert_eq!(openai.body["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(openai.body["reasoning_effort"], "high");
+
+        let anthropic = build_model_request_plan(
+            "anthropic",
+            "https://api.example",
+            "model-b",
+            &messages,
+            None,
+            true,
+            Some(1024),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(anthropic.url, "https://api.example/v1/messages");
+        assert_eq!(anthropic.auth_scheme, KernelAuthScheme::Anthropic);
+        assert_eq!(anthropic.body["system"], "system");
+        assert_eq!(anthropic.body["messages"].as_array().unwrap().len(), 1);
+
+        let gemini = build_model_request_plan(
+            "gemini",
+            "https://api.example",
+            "model-c",
+            &messages,
+            None,
+            false,
+            Some(512),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            gemini.url,
+            "https://api.example/v1beta/models/model-c:generateContent"
+        );
+        assert_eq!(gemini.auth_scheme, KernelAuthScheme::Gemini);
+        assert!(gemini.body.get("stream").is_none());
+    }
+
+    #[test]
+    fn request_plan_sanitizes_reasoning_without_mutating_history() {
+        let messages = vec![
+            serde_json::json!({"role":"user","content":"hello"}),
+            serde_json::json!({"role":"assistant","content":"answer"}),
+            serde_json::json!({"role":"assistant","content":"answer 2","reasoning_content":"trace"}),
+        ];
+        let plan = build_model_request_plan(
+            "openai",
+            "https://api.example",
+            "deepseek-v4",
+            &messages,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.reasoning_replay.substitutions, 1);
+        assert_eq!(
+            plan.body["messages"][1]["reasoning_content"],
+            "(reasoning omitted)"
+        );
+        assert!(messages[1].get("reasoning_content").is_none());
+
+        let ordinary = build_model_request_plan(
+            "openai",
+            "https://api.example",
+            "gpt-test",
+            &messages,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(ordinary.body["messages"][2]
+            .get("reasoning_content")
+            .is_none());
+    }
+
+    #[test]
+    fn request_plan_rejects_invalid_sampling_values() {
+        let build = |temperature, top_p, max_tokens| {
+            build_model_request_plan(
+                "openai",
+                "https://api.example",
+                "model",
+                &[],
+                None,
+                false,
+                max_tokens,
+                temperature,
+                top_p,
+                None,
+            )
+        };
+        assert!(build(Some(f32::NAN), None, None).is_err());
+        assert!(build(Some(2.1), None, None).is_err());
+        assert!(build(None, Some(-0.1), None).is_err());
+        assert!(build(None, None, Some(0)).is_err());
     }
 
     #[test]
