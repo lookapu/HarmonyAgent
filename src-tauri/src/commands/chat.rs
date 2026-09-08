@@ -1259,20 +1259,8 @@ pub fn restore_snapshot(
 /// 主动压缩/上下文超限时自动减半，直到 MIN_HISTORY_KEEP 下限。
 /// 上下文超限自动裁剪时的历史保留下限（少于该条数不再裁剪，直接报错）
 const MIN_HISTORY_KEEP: usize = 10;
-/// 输出截断续写次数上限：模型被 max_tokens 截断后自动追加“请继续”续写，防无限啰嗦
-const MAX_CONTINUATION_ROUNDS: usize = 8;
-/// 空响应重试上限：模型连续多轮输出为空（服务端静默失败/异常截断）时最多重试
-/// 两次即收尾提示，防止进入无限空轮循环导致界面长时间无输出看起来卡死
-const MAX_EMPTY_ROUNDS: usize = 2;
 // 流式无产出静默超时、reasoning-only 宽限与累计响应字节上限已迁入共用
 // `agent_kernel::KERNEL_STREAM_*` 常量与 `KernelStreamGovernor`（与 headless 同一状态机）。
-/// 连接中断自动续写次数上限：网络问题重试 3 次无意义（多为本地代理/网络故障），
-/// 超过后收尾并明确提示，避免无限续写空转
-const MAX_INTERRUPT_RETRY_ROUNDS: usize = 3;
-/// 产出前中断重放次数上限：流在输出任何内容前即中断（服务端断流/代理重置）时，
-/// 用冻结请求原样重发（对齐 DeepSeek-Reasonix 冻结请求重放机制：模型无需重新思考、
-/// prompt 缓存不失效）；连续 5 次 0 产出中断多为本地网络故障，超过后走下方续写收尾
-const MAX_STREAM_REPLAYS: usize = 5;
 /// 单行字节上限（覆盖超大 JSON 工具参数；超限行跳过解析防烧 CPU）
 const STREAM_MAX_LINE: usize = 4 * 1024 * 1024;
 /// 每批最大处理行数（批间让出执行权/检查预算）
@@ -1293,21 +1281,6 @@ const STREAM_DELIVER_MAX_WAITS: u32 = 25;
 /// 推送会导致前端思考区每行重渲染 + 后端 IPC 堆积（实测 4096 条事件 renderer 烧满核），
 /// 合并后事件量降两个数量级；块边界强制 flush 保证正常流显示延迟 <100ms
 const STREAM_REASONING_MERGE_BYTES: usize = 2048;
-/// 工具循环检测阈值（对齐 qwen-code LoopDetectionService 轻量版）：
-/// - 连续相同调用（同工具名+同参数）达到该次数即判定打转——重复调用必得相同结果，
-///   低于 DashScope 服务端 "Repetitive tool calls detected" 阈值，客户端先断循环防服务端 400；
-/// - 连续同名调用（不管参数）达到该次数判定参数抖动循环（模型反复调同一工具换参数试探）；
-/// - 每轮工具调用总数：软上限（仅停滞信号时生效）/ 硬上限（无条件中止，防参数变化逃逸检测）
-const TOOL_CALL_LOOP_THRESHOLD: usize = 5;
-const TOOL_NAME_STAGNATION_THRESHOLD: usize = 8;
-const MAX_TOOL_CALLS_PER_TURN: usize = 100;
-const MAX_TOOL_CALLS_HARD: usize = 1000;
-/// 循环检测命中后注入纠正提示的轮数上限：模型收到提示仍循环时最多打断两次，
-/// 之后直接收尾（防“纠正-循环-再纠正”空转）
-const MAX_LOOP_BREAKS: usize = 2;
-/// “叙述式假调用”纠正次数上限：模型在正文里写“已调用工具”却不输出标记时，
-/// 自动注入纠正提示继续（历史格式污染导致模型模仿，纠正后重走标记协议）
-const MAX_FAKE_CALL_CORRECTIONS: usize = 3;
 /// “未完话术”纠正次数上限：模型承诺“还需读取/继续查看”等下一步动作但未输出工具标记时，
 /// 自动注入纠正提示继续（任务实际未完成却正常收尾，纠正后要求立即输出标记或总结）
 const MAX_PENDING_ACTION_CORRECTIONS: usize = 5;
@@ -4216,7 +4189,6 @@ async fn stream_chat_inner(
     let mut replan_given = false;
     let mut replan_instruction: Option<String> = None;
     // 输出截断续写状态：上轮输出被 max_tokens 截断时，下轮请求追加“请继续”指令（防无限续写有上限）
-    let mut continuation_pending = false;
     // 截断续写时上轮“正文为空但思考非空”（推理模型 reasoning 耗尽预算被截断）：
     // 续写指令改为要求直接输出结论/工具调用，避免再次思考耗尽预算空转
     let mut continuation_reasoning_only = false;
@@ -4494,7 +4466,7 @@ async fn stream_chat_inner(
         };
         
         // 历史行：从 DB 读取并转换为 HistoryRow
-        let history_rows = {
+        let raw_history = {
             let conn = state.0.lock().map_err(|e| e.to_string())?;
             let mut stmt = conn
                 .prepare(
@@ -4514,15 +4486,24 @@ async fn stream_chat_inner(
             drop(stmt);
             drop(conn);
             
-            raw_history.into_iter().rev().map(|(role, text, refs_json, reasoning)| {
-                HistoryRow {
-                    role,
-                    content: text,
-                    references_json: refs_json,
-                    reasoning,
-                }
-            }).collect()
+            raw_history
         };
+        let mut history_rows = Vec::with_capacity(raw_history.len());
+        for (role, text, refs_json, reasoning) in raw_history.into_iter().rev() {
+            // @ 引用需要文件/DB IO，因此在纯策略 assembler 外预先展开。
+            let content = if role == "user" && refs_json.is_some() {
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                inject_references(&conn, &project_path, &text, refs_json.as_deref())?
+            } else {
+                text
+            };
+            history_rows.push(HistoryRow {
+                role,
+                content,
+                references_json: refs_json,
+                reasoning,
+            });
+        }
         
         // 本轮已执行的工具结果
         let tool_results: Vec<ToolResult> = tool_runs.iter().enumerate().map(|(i, item)| {
@@ -4548,22 +4529,24 @@ async fn stream_chat_inner(
         }).collect();
         
         // 用户注入集合
-        let mut user_injections: Vec<UserInjection> = Vec::new();
-        for inst in &merged_instructions {
-            user_injections.push(UserInjection { content: inst.clone() });
-        }
+        // 一次性注入先并入持久到“请求成功”为止的队列；主动压缩重组消息时不能丢失。
         for msg in crate::agent::session_ctx::drain_injected(&conversation_id) {
-            user_injections.push(UserInjection { content: msg });
+            merged_instructions.push(msg);
         }
         if confirmed_plan.is_some() && tools_since_progress >= 3 {
             tools_since_progress = 0;
-            user_injections.push(UserInjection { 
-                content: "（执行对照：请对照上方\"已批准任务计划\"，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）".to_string() 
-            });
+            merged_instructions.push(
+                "（执行对照：请对照上方\"已批准任务计划\"，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）".to_string(),
+            );
         }
         if let Some(p) = replan_instruction.take() {
-            user_injections.push(UserInjection { content: p });
+            merged_instructions.push(p);
         }
+        let user_injections = merged_instructions
+            .iter()
+            .cloned()
+            .map(|content| UserInjection { content })
+            .collect();
         
         // 调用 assembler 组装消息序列（纯策略，无 IO）
         let supports_image = {
@@ -4594,7 +4577,7 @@ async fn stream_chat_inner(
             history_limit,
         });
         let mut messages = assembled.messages;
-        images_attached = assembled.images_attached;
+        let next_images_attached = assembled.images_attached;
         
         // E3：压缩决策——assembler 已判断是否需要压缩，adapter 执行实际压缩
         if assembled.compress {
@@ -4651,24 +4634,33 @@ async fn stream_chat_inner(
                     "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
                     params![history_limit as i64, conversation_id],
                 );
-                // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
-                let _ = conn.execute(
-                    "INSERT OR IGNORE INTO conversation_health(conversation_id, compress_count) VALUES(?1, 1)
-                     ON CONFLICT(conversation_id) DO UPDATE SET compress_count = COALESCE(compress_count, 0) + 1",
-                    params![conversation_id],
-                );
-                let _ = app.emit(
-                    "chat-context-compact",
+                crate::agent::context::bump_compress_count(&conn, &conversation_id);
+                let _ = crate::agent::session_events::append_event(
+                    &conn,
+                    &conversation_id,
+                    crate::agent::session_events::SessionEventType::ContextCompress,
                     serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "keep": history_limit,
+                        "trigger": "active",
+                        "old_limit": old_limit,
+                        "new_limit": history_limit,
                     }),
+                    Some(&trace_id),
                 );
             }
+            let _ = app.emit(
+                "chat-compact",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "keep": history_limit,
+                }),
+            );
+            // 使用缩小后的 history_limit 和新摘要重新组装；一次性注入、图片和续写状态
+            // 尚未发给 Provider，因此都保留到下一次实际请求成功。
+            continue 'outer;
         }
-        
+
+        images_attached = next_images_attached;
         // 重置续写/纠正状态（assembler 已消费）
-        continuation_pending = false;
         continuation_reasoning_only = false;
         correction_text = String::new();
         correction_hint = String::new();
@@ -6010,18 +6002,15 @@ async fn stream_chat_inner(
             has_native_tool_calls: !outcome.tool_calls.is_empty(),
         };
         let actions = round_router.route(&router_input);
-        let mut router_handled = false;
         for action in actions {
             match action {
                 crate::agent::kernel_loop::KernelRoundAction::RetryEmpty { hint } => {
                     correction_text = String::new();
                     correction_hint = hint;
-                    router_handled = true;
                     continue 'outer;
                 }
                 crate::agent::kernel_loop::KernelRoundAction::StopEmpty { note } => {
                     full.push_str(&note);
-                    router_handled = true;
                     break 'outer;
                 }
                 crate::agent::kernel_loop::KernelRoundAction::ReplayFrozen => {
@@ -6033,40 +6022,31 @@ async fn stream_chat_inner(
                             "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
                         }),
                     );
-                    router_handled = true;
                     continue 'outer;
                 }
                 crate::agent::kernel_loop::KernelRoundAction::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
-                    continuation_pending = true;
                     continuation_text = ct;
                     continuation_reasoning_only = reasoning_only;
-                    router_handled = true;
                     continue 'outer;
                 }
                 crate::agent::kernel_loop::KernelRoundAction::InterruptedNote { note } => {
                     full.push_str(&note);
-                    // 落穿：不设置 router_handled，继续评估后续 UI 专属门
+                    // 落穿：继续评估后续 UI 专属门
                 }
                 crate::agent::kernel_loop::KernelRoundAction::ContinueTruncated { continuation_text: ct, reasoning_only } => {
-                    continuation_pending = true;
                     continuation_text = ct;
                     continuation_reasoning_only = reasoning_only;
-                    router_handled = true;
                     continue 'outer;
                 }
                 crate::agent::kernel_loop::KernelRoundAction::CorrectFakeCall { correction_text: ct, hint } => {
                     correction_text = ct;
                     correction_hint = hint;
-                    router_handled = true;
                     continue 'outer;
                 }
                 crate::agent::kernel_loop::KernelRoundAction::Proceed => {
                     // 无特殊动作：继续后续 UI 专属门
                 }
             }
-        }
-        if router_handled {
-            continue;
         }
         // 防“未完话术”静默结束：模型承诺“还需读取/继续查看”等下一步动作但未输出【TOOL】
         // 标记（任务实际未完成却正常收尾），注入纠正提示要求立即输出标记或明确总结

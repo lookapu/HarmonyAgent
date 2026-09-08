@@ -12,7 +12,7 @@ A desktop AI coding IDE for HarmonyOS / OpenHarmony developers. It packs multi-p
 
 ## What It Is
 
-Not just a simple provider switcher. **201 Agent tools** cover the full HarmonyOS development loop — from scaffolding a project to crash attribution, from code scanning to on-device deployment:
+Not just a simple provider switcher. **204 Agent tools** cover the full HarmonyOS development loop — from scaffolding a project to crash attribution, from code scanning to on-device deployment:
 
 | Dimension | Capability |
 |------|------|
@@ -136,9 +136,9 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 298 Tauri IPC entry points · 56 service modules  │
-│  - agent/ 37 top-level modules · tools/ 29 files    │
-│  - SQLite + 77 migrations · full event sourcing for │
+│  - 299 Tauri IPC entry points · 58 service modules  │
+│  - agent/ 52 top-level modules · tools/ 30 files    │
+│  - SQLite + 79 migrations · full event sourcing for │
 │    runs/steps/tools                                 │
 │  - Bundled runtimes: Node + JDK + Git (runtime/)    │
 └─────────────────────────────────────────────────────┘
@@ -178,7 +178,7 @@ src-tauri/src/
 │   ├── session_ctx.rs       #   - Session-level runtime state (converged)
 │   ├── invariants.rs        #   - Write invariants (.env / certs / migration SQL)
 │   ├── session_events.rs    #   - Session event sourcing
-│   └── tools/               #   - 201 Agent tools (29 files)
+│   └── tools/               #   - 204 Agent tools (30 files)
 │       ├── mod.rs               # Tool registry (TOOL_SPECS) + protocol dispatch
 │       ├── protocol.rs          # Tool-call marker parsing
 │       ├── errors.rs            # Structured error envelope (7 ToolError classes)
@@ -207,8 +207,8 @@ src-tauri/src/
 │       ├── quality_runtime.rs   #   Runtime quality (6 tools)
 │       ├── quality_media.rs     #   Media quality (2 tools)
 │       └── schedule_tools.rs    # Scheduled reminders (schedule_create/list/delete)
-├── commands/               # 38 command modules (298 IPC registration entry points total)
-├── services/               # Business services (56)
+├── commands/               # 38 command modules (299 IPC registration entry points total)
+├── services/               # Business services (58)
 │   ├── proxy_service.rs    #   - Local proxy
 │   ├── circuit_breaker.rs  #   - Circuit breaker
 │   ├── model_router.rs     #   - Model routing
@@ -229,7 +229,7 @@ src-tauri/src/
 
 > **About large files**: `src-tauri/runtime/` (portable runtimes), `src-tauri/resources/` (seed knowledge base + embedding models, ~340MB) and `portable-build/` (portable build artifacts) total ~1GB. They are build artifacts / downloaded resources and are **not distributed with the Git repository** (see `.gitignore`). Keep these directories for local builds; users cloning the repo can obtain the full runtime from the Release installer, or prepare it themselves following the download logic in [release.yml](.github/workflows/release.yml).
 
-## The 201 Agent Tools Grouped by Domain
+## The 204 Agent Tools Grouped by Domain
 
 | Domain (TOOL_GROUP) | Representative tools |
 |------|------|
@@ -276,6 +276,10 @@ npx tauri dev
 
 # Production build (requires local src-tauri/runtime & src-tauri/resources — see below)
 npx tauri build
+
+# Preview/remove reproducible Rust and frontend caches (keeps node_modules)
+npm run clean:generated:dry-run
+npm run clean:generated
 ```
 
 > **Bundled runtimes note**: portable Node / JDK / Git (~700MB), plus the knowledge-base seed and embedding models (~340MB), are not distributed with the repository.
@@ -290,6 +294,7 @@ npx tauri build
 ## Documentation
 
 - [Continuous evolution roadmap](docs/ROADMAP.md) — phased tasks and acceptance criteria for long sessions, the Agent toolchain, the HarmonyOS loop, and ecosystem integration
+- [Generated-file cleanup (Chinese)](docs/GENERATED_FILES_CLEANUP.md) — safely removes `target`, `dist`, coverage, and Vite caches
 - [Agent capability evolution roadmap (Chinese)](docs/AGENT_EVOLUTION_ROADMAP_2026.md) — sandboxing, large-repository intelligence, real-agent evaluation, and a 12-week delivery sequence
 - [Security boundary and threat model (Chinese)](docs/SECURITY_BOUNDARY.md) — current guarantees, explicit limitations, and the minimum real-sandbox contract
 - [Official DevEco CLI MCP integration](docs/DEVECO_CLI_MCP_INTEGRATION.md) — built-in MCP templates, command parsing enhancements, and the division of labor with custom tools

@@ -887,6 +887,8 @@ function CodeBlock({
   }, [shownLines, highlightedLines, focusLine, selectedLines, onLineClick, onOpenFile, filePath, isDiff, isShell])
 
   const parentRef = useRef<HTMLPreElement>(null)
+  // TanStack Virtual 返回带内部可变状态的函数；跳过 React Compiler memoization 是其预期用法。
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: useVirtual ? shownLines.length : 0,
     getScrollElement: () => parentRef.current,

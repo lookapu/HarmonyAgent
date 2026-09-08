@@ -534,12 +534,13 @@ impl HeadlessAgentDriver {
         let mut stopped_by_model = false;
         let mut stopped_by_budget = false;
         let mut stopped_by_acceptance = false;
+        let mut stopped_by_loop = false;
         
         // Phase F：headless 接入循环治理与轮级路由（纯策略，UI 共用）
         let mut loop_governor = KernelLoopGovernor::new();
         let mut round_router = KernelRoundRouter::new();
         
-        for round in 0..round_limit {
+        'rounds: for round in 0..round_limit {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
             if started.elapsed() >= wall_time {
                 return Err(AgentDriverError::Cancelled(
@@ -749,6 +750,7 @@ impl HeadlessAgentDriver {
                     crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, .. } => {
                         if final_halt {
                             // loop_breaks 已超上限，直接收尾
+                            stopped_by_loop = true;
                             outcome.failure_taxonomy.push("tool_loop_exhausted".into());
                             sink.append(
                                 SessionEventType::SystemNote,
@@ -756,8 +758,7 @@ impl HeadlessAgentDriver {
                                 "tool_loop_halt",
                                 json!({"reason":"tool_loop_exhausted","tool":name}),
                             ).map_err(AgentDriverError::Failed)?;
-                            messages.push(json!({"role":"tool","tool_call_id":id,"content":"（系统检测到工具调用循环已达上限，任务已中止。）"}));
-                            continue;
+                            break 'rounds;
                         }
                         // 注入纠正提示，让模型换方案
                         if let Some(hint) = corrective_hint {
@@ -867,6 +868,7 @@ impl HeadlessAgentDriver {
         if !stopped_by_model
             && !stopped_by_budget
             && !stopped_by_acceptance
+            && !stopped_by_loop
             && outcome.steps >= round_limit as u64
         {
             outcome.failure_taxonomy.push("max_steps_exceeded".into());
@@ -958,9 +960,6 @@ mod tests {
             }
         }
         
-        fn get_recorded_messages(&self) -> Vec<Vec<serde_json::Value>> {
-            self.recorded_messages.lock().unwrap().clone()
-        }
     }
 
     impl super::HeadlessModelClient for ScriptedClient {
@@ -1402,6 +1401,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loop_governor_final_halt_stops_the_driver_round_loop() {
+        let response = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": (0..7).map(|i| {
+                        serde_json::json!({
+                            "id": format!("call-{i}"),
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"a.txt\"}"
+                            }
+                        })
+                    }).collect::<Vec<_>>()
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 30}
+        });
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-loop-final-halt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "base\n").unwrap();
+
+        let outcome = scripted_driver([response])
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps, 1, "最终循环熔断必须终止外层 round loop");
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "tool_loop_halt"));
+        assert!(outcome
+            .failure_taxonomy
+            .contains(&"tool_loop_exhausted".to_string()));
+        assert!(!outcome
+            .failure_taxonomy
+            .contains(&"max_steps_exceeded".to_string()));
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
     async fn round_router_stops_on_consecutive_empty_rounds() {
         // 连续 2 轮空响应 → empty_rounds_exhausted
         let responses = [
@@ -1516,12 +1564,12 @@ mod tests {
     #[tokio::test]
     async fn differential_test_loop_governor_trajectory() {
         // 同一语料：先跑 router 得黄金动作，再跑 driver 断言事件序列匹配
-        use crate::agent::kernel_loop::{KernelLoopGovernor, KernelRoundRouter};
+        use crate::agent::kernel_loop::KernelLoopGovernor;
         
         // 黄金轨迹：6 次相同调用 → 前 4 次 Proceed，第 5、6 次 Halt（纠正）
         let mut governor = KernelLoopGovernor::new();
         let expected_actions: Vec<&str> = (0..6)
-            .map(|i| {
+            .map(|_| {
                 let verdict = governor.observe("read_file", "{\"path\":\"a.txt\"}");
                 match verdict {
                     crate::agent::kernel_loop::KernelLoopVerdict::Proceed => "proceed",
@@ -1595,7 +1643,7 @@ mod tests {
     #[tokio::test]
     async fn differential_test_round_router_empty_trajectory() {
         // 黄金轨迹：连续 2 轮空 → RetryEmpty(第1轮) → StopEmpty(第2轮)
-        use crate::agent::kernel_loop::{KernelRoundRouter, KernelRoundAction};
+        use crate::agent::kernel_loop::KernelRoundRouter;
         let mut router = KernelRoundRouter::new();
         let input = crate::agent::kernel_loop::KernelRoundInput {
             text: "",

@@ -14,6 +14,8 @@
     "build": "tsc -b && vite build",
     "postbuild": "node scripts/check-bundle-size.mjs",
     "check:bundle": "node scripts/check-bundle-size.mjs",
+    "clean:generated": "node scripts/clean-generated.mjs",
+    "clean:generated:dry-run": "node scripts/clean-generated.mjs --dry-run",
     "tauri": "tauri",
     "lint": "eslint .",
     "preview": "vite preview",

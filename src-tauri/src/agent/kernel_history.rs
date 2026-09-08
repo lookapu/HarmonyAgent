@@ -4,8 +4,8 @@
 //! Phase A 先搬入两个纯函数（`dynamic_history_limit`、`estimate_tokens`）；
 //! Phase E 实现 `KernelHistoryAssembler` 接管 system/history/tool/注入/续写/纠正中段组装。
 
+use crate::agent::tools::{has_pending_action_phrase, parse_data_url};
 use serde_json;
-use crate::agent::tools::parse_data_url;
 
 /// 最小历史保留条数：压缩时至少保留这么多条最近消息，避免把关键上下文全压掉。
 const MIN_HISTORY_KEEP: usize = 10;
@@ -110,7 +110,7 @@ pub struct KernelHistoryAssembler;
 impl KernelHistoryAssembler {
     /// 组装消息序列：返回 Vec<serde_json::Value> 供 adapter 直接发送给 Provider。
     ///
-    /// 注意：图片附加（E2）和压缩决策（E3）暂留 adapter，本阶段只处理 Ready 路径中段。
+    /// 图片格式适配和压缩判断也在此完成；adapter 只负责 IO、落库和发送事件。
     pub fn assemble(input: &KernelHistoryInput) -> KernelAssembled {
         let mut messages: Vec<serde_json::Value> = Vec::new();
 
@@ -177,12 +177,22 @@ impl KernelHistoryAssembler {
                 }
                 "tool" => {
                     // tool 消息入库格式："工具名\n输出"，转 user 消息反馈给模型
-                    // 历史工具结果已在 adapter 截断到 1200 字符
                     let (name, out) = row.content.split_once('\n').unwrap_or(("tool", &row.content));
                     let out_guard = crate::agent::tools::sanitize_tool_output(out);
+                    const HISTORY_TOOL_RESULT_LIMIT: usize = 1200;
+                    let output_chars = out_guard.chars().count();
+                    let output: String = out_guard
+                        .chars()
+                        .take(HISTORY_TOOL_RESULT_LIMIT)
+                        .collect();
+                    let suffix = if output_chars > HISTORY_TOOL_RESULT_LIMIT {
+                        format!("\n...[历史工具输出已截断，共 {output_chars} 字符]")
+                    } else {
+                        String::new()
+                    };
                     messages.push(serde_json::json!({
                         "role": "user",
-                        "content": format!("[工具执行结果 - {name}]\n{out_guard}"),
+                        "content": format!("[工具执行结果 - {name}]\n{output}{suffix}"),
                     }));
                 }
                 _ => {
@@ -334,18 +344,6 @@ impl KernelHistoryAssembler {
 
         KernelAssembled { messages, images_attached, compress }
     }
-}
-
-/// 未完话术检测：判断 assistant 消息是否仅为"我将继续/我将读取"等过渡性叙述，
-/// 未实际执行任何工具（格式污染源）。
-fn has_pending_action_phrase(text: &str) -> bool {
-    text.contains("我将继续")
-        || text.contains("我将读取")
-        || text.contains("我来读取")
-        || text.contains("我先读取")
-        || text.contains("让我来查看")
-        || text.contains("我需要先")
-        || text.contains("接下来我会")
 }
 
 #[cfg(test)]
@@ -581,6 +579,45 @@ mod tests {
     }
 
     #[test]
+    fn assembler_bounds_historical_tool_output() {
+        let long_output = format!("{}TAIL_MUST_NOT_LEAK", "x".repeat(1400));
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![HistoryRow {
+                role: "tool".to_string(),
+                content: format!("read_file\n{long_output}"),
+                references_json: None,
+                reasoning: None,
+            }],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
+            context_budget: 128_000,
+            history_limit: 40,
+        };
+
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        let content = assembled.messages[2]["content"].as_str().unwrap();
+        assert!(content.contains("历史工具输出已截断"));
+        assert!(!content.contains("TAIL_MUST_NOT_LEAK"));
+        assert!(content.chars().count() < long_output.chars().count());
+    }
+
+    #[test]
     fn assembler_pending_action_phrase_filtered() {
         let input = KernelHistoryInput {
             system_prompt: "S.",
@@ -593,7 +630,7 @@ mod tests {
             history_rows: vec![
                 HistoryRow {
                     role: "assistant".to_string(),
-                    content: "我将继续读取文件内容".to_string(),
+                    content: "接下来验证构建".to_string(),
                     references_json: None,
                     reasoning: None,
                 },

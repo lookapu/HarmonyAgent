@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：v2 设计 + Phase 0/1 已落地，Phase 4 的协议、预算、验收与 Provider transport 控制已开始共用
+> 状态：Phase 0—3 与 Phase 4 A—G 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略与循环治理组件，单一 run-loop executor 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -13,7 +13,7 @@ OpenAI-compatible 流式 chat completions（SSE 字节级行缓冲 + `KernelStre
 模型调用通过可注入的 `HeadlessModelClient` 边界，离线脚本 Provider 测试可以完整执行
 `write_file` tool loop，不需要网络或 Docker。流式读取对停滞、无结束标记提前关闭、空流、
 坏帧和超限正文全部失败关闭；停滞错误归类为 Network，自动进入与 UI 共用的指数退避重试。
-它仍然不等价于 Tauri UI 的完整 Agent loop；下文的 Phase 2/3/4 是后续演进要求。
+它仍然不等价于 Tauri UI 的完整 Agent loop：两个 adapter 已共享关键策略组件，但尚未由同一个 run-loop executor 驱动。
 
 ## 1. 结论先行
 
@@ -146,7 +146,8 @@ OpenAI 原生工具调用分片。Anthropic 分散在 `message_start` 与 `messa
 桌面 UI 的流循环（有效产出刷新停滞线、纯思考流封顶在首次思考 + 宽限期、首字节初始化）。
 headless 流式回合是它的首个真实消费者：SSE 字节级行缓冲（`KernelSseBuffer`，多字节字符
 跨 chunk 不损坏）+ governor + `KernelStreamAccumulator` 组装严格 `KernelTurn`，停滞/提前
-关闭/坏帧/超限全部失败关闭。桌面 UI 的流循环尚未切换到该组件，是剩余收敛项。
+关闭/坏帧/超限全部失败关闭。桌面 UI 的流循环也已切换到同一 governor；adapter 仍分别负责
+协议 IO 与 UI/CLI 生命周期。
 
 ### 5.1 事件输出接口
 
@@ -481,15 +482,18 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | C | UI 接入 KernelLoopGovernor + KernelToolBudgetGate | ✅ COMPLETED |
 | D | UI 接入 KernelRoundRouter | ✅ COMPLETED |
 | E | 消息组装入核（E1 中段 → E2 图片 → E3 压缩决策） | ✅ COMPLETED |
-| F | headless 闭合防护缺口（governor/router 集成 + ScriptedClient 记录 messages + 4 个新测试） | ✅ COMPLETED |
+| F | headless 闭合防护缺口（governor/router 集成 + ScriptedClient 请求记录 + 5 个集成测试） | ✅ COMPLETED |
 | G | 差分测试 + 文档收口（2 个差分测试验证 router 黄金轨迹与 driver 事件序列一致） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
 - KernelLoopGovernor 在每次工具调用前 observe，命中循环时注入纠正提示或直接收尾
+- final halt 终止整个 headless round loop，并独立归因为 `tool_loop_exhausted`，不会误报 `max_steps_exceeded`
 - KernelRoundRouter 在 stop-candidate 前 route，处理空轮/冻结重放/中断续写/截断续写/假调用纠正
 - ScriptedClient 记录每请求 messages，为后续差分测试提供基础
-- 所有 905 个测试全绿（基线 899 + 6 个 Phase F/G 新增测试）
+- 历史 `@文件/@会话` 引用在进入纯策略 assembler 前展开；主动压缩后立即重组本轮请求，并保留尚未发送的一次性注入、图片与续写状态
+- 历史工具输出在内核侧执行 1,200 字符上限，避免 adapter 迁移再次取消上下文护栏
+- Rust lib 共 915 项：907 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -560,4 +564,5 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
    工具分派路径上唯一的全局库调用在 `todo_write`，不在 allowlist。回归测试
    `headless_allowlist_is_exactly_pinned_and_global_db_free` 穷举钉住 allowlist，
    任何新增工具都需显式评审其全局库边界）；
-5. 最终抽取 UI/headless 共用的 Agent Kernel。
+5. 将两个 adapter 的外层 round 编排继续收敛为单一 executor；UI 生命周期、DB IO 与
+   headless grader 编排仍作为端口实现保留，不再重复停止、压缩和循环决策。

@@ -34,14 +34,14 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 │   Run 状态机 / 执行步骤 / 调度队列 / DAG / 恢复 / 治理       │
 │                                                              │
 │ Tool Execution Kernel                                       │
-│   201 工具 / 审批流水线 / 专用线程 / 租约 / fencing / 幂等   │
+│   204 工具 / 审批流水线 / 专用线程 / 租约 / fencing / 幂等   │
 │                                                              │
 │ Services                                                     │
 │   Provider/代理/熔断/成本、鸿蒙环境、知识库、MCP、LAN         │
 └────────────────────────────┬─────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────┐
-│ SQLite（77 个迁移） + 本地文件/钥匙串 + 外部工具链           │
+│ SQLite（79 个迁移） + 本地文件/钥匙串 + 外部工具链           │
 │ HarmonyOS SDK / hvigor / ohpm / hdc / ArkTS LSP              │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -50,13 +50,13 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 
 | 项目 | 实际值 |
 |---|---:|
-| Agent 对外工具 | 201 |
-| `agent/` 顶层模块（不含 `mod.rs`） | 37 |
-| `agent/tools/` Rust 文件（含 `mod.rs`） | 30 |
+| Agent 对外工具 | 204 |
+| `agent/` 顶层模块（不含 `mod.rs`） | 52 |
+| `agent/tools/` Rust 文件（含 `mod.rs`） | 31 |
 | `commands/` 命令模块（不含 `mod.rs`） | 38 |
-| `services/` 服务模块（不含 `mod.rs`） | 56 |
-| Tauri IPC 注册入口 | 298 |
-| 数据库迁移 | 77 |
+| `services/` 服务模块（不含 `mod.rs`） | 58 |
+| Tauri IPC 注册入口 | 299 |
+| 数据库迁移 | 79 |
 | React 页面 | 16 |
 
 以上计数会随代码演进变化；工具数以 `TOOL_SPECS`、IPC 入口以 `lib.rs` 的 `generate_handler!`、迁移数以 `src-tauri/migrations/` 为准。
@@ -182,7 +182,7 @@ Worker 每 5 秒写心跳并回收过期 Owner。认领任务会生成 lease tok
 
 ### 8.1 工具注册与协议
 
-`agent/tools/mod.rs` 的 `TOOL_SPECS` 是 201 个对外工具的权威清单，包含名称、说明和副作用标记。工具既支持文本标记协议，也支持 OpenAI 兼容的原生 function calling；MCP 与 Skill 工具在运行时动态注入。
+`agent/tools/mod.rs` 的 `TOOL_SPECS` 是 204 个对外工具的权威清单，包含名称、说明和副作用标记。工具既支持文本标记协议，也支持 OpenAI 兼容的原生 function calling；MCP 与 Skill 工具在运行时动态注入。
 
 工具按 build/fix/explore/deploy/refactor/test/debug/other 八个任务域进行限额和统计。
 
@@ -246,7 +246,7 @@ Provider 和 model 保存于 SQLite，API key 通过系统钥匙串管理。会�
 
 ## 12. 数据与存储
 
-SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 77 个迁移覆盖：
+SQLite 使用 WAL 和外键约束，迁移在启动时顺序执行。当前 79 个迁移覆盖：
 
 - Provider、模型、代理、成本和请求日志；
 - 项目、会话、消息、引用、标签、反馈和版本；
@@ -305,7 +305,7 @@ Tauri setup 依次完成：
 
 1. `commands/chat.rs` 同时承担协议、上下文、工具循环、恢复和持久化，文件过大，后续应按不破坏状态机边界的方式拆分；
 2. `pages/Home.tsx` 仍然庞大，虽已拆出多组 chat components，但布局和交互状态仍高度集中；
-3. `agent/tools/mod.rs` 同时承担 201 个 schema 与总分发，新增工具时必须同步验证注册、权限、分组和结构化结果；
+3. `agent/tools/mod.rs` 同时承担 204 个 schema 与总分发，新增工具时必须同步验证注册、权限、分组和结构化结果；
 4. README/CHANGELOG 中的能力批次版本与应用 manifest `2.0.0` 不是同一口径，发布前应统一正式版本策略；
 5. 内置 runtime/resources 不随 Git 分发，干净克隆只能运行不依赖这些资源的测试和精简构建。
 

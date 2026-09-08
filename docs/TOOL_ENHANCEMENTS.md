@@ -8,13 +8,13 @@
 
 | 项目 | 当前值 | 权威来源 |
 |---|---:|---|
-| 对外 Agent 工具 | 201 | `agent/tools/mod.rs::TOOL_SPECS` |
-| 工具实现文件 | 29 | `src-tauri/src/agent/tools/*.rs` |
+| 对外 Agent 工具 | 204 | `agent/tools/mod.rs::TOOL_SPECS` |
+| 工具实现文件 | 30 | `src-tauri/src/agent/tools/*.rs` |
 | 任务分组 | 8 | `TOOL_GROUP` / `TASK_GROUPS` |
 | 权限等级 | L0/L1/L2 | `services/permissions.rs` 与工具 hooks |
 | 工具协议 | 文本标记 + 原生 function calling | `protocol.rs` / `commands/chat.rs` |
 
-`TOOL_SPECS` 是工具名称、描述和副作用标记的唯一事实源；本文不复制 201 项完整数组，避免新增工具后出现双份清单漂移。
+`TOOL_SPECS` 是工具名称、描述和副作用标记的唯一事实源；本文不复制 204 项完整数组，避免新增工具后出现双份清单漂移。
 
 ## 2. 八个任务域
 
@@ -146,7 +146,7 @@
 
 ## 7. 明确暂缓项
 
-以下外部服务集成不属于当前 201 工具，保持暂缓：
+以下外部服务集成不属于当前 204 工具，保持暂缓：
 
 - Figma 导入；
 - 飞书任务同步；

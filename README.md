@@ -12,7 +12,7 @@
 
 ## 它是什么
 
-不是简单的 Provider 切换器。**201 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
+不是简单的 Provider 切换器。**204 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
 
 | 维度 | 能力 |
 |------|------|
@@ -136,9 +136,9 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 298 个 Tauri IPC 入口 · 56 个 service 模块        │
-│  - agent/ 37 个顶层模块 · tools/ 29 文件 · 201 工具  │
-│  - SQLite + 77 个迁移 · Run/步骤/工具全链路事件溯源  │
+│  - 299 个 Tauri IPC 入口 · 58 个 service 模块        │
+│  - agent/ 52 个顶层模块 · tools/ 30 文件 · 204 工具  │
+│  - SQLite + 79 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -177,7 +177,7 @@ src-tauri/src/
 │   ├── session_ctx.rs       #   - 会话级运行态（统一收敛）
 │   ├── invariants.rs         #   - 写操作不变式（.env/证书/迁移 SQL）
 │   ├── session_events.rs    #   - 会话事件溯源
-│   └── tools/               #   - 201 个 Agent 工具（29 文件）
+│   └── tools/               #   - 204 个 Agent 工具（30 文件）
 │       ├── mod.rs               # 工具注册表（TOOL_SPECS）+ 协议分发
 │       ├── protocol.rs          # 工具调用标记解析
 │       ├── errors.rs            # 结构化错误信封（ToolError 7 类）
@@ -206,8 +206,8 @@ src-tauri/src/
 │       ├── quality_runtime.rs   #   运行时质量（6 工具）
 │       ├── quality_media.rs     #   媒体质量（2 工具）
 │       └── schedule_tools.rs    # 定时提醒（schedule_create/list/delete）
-├── commands/               # 38 个命令模块（合计 298 个 IPC 注册入口）
-├── services/               # 业务服务（56 个）
+├── commands/               # 38 个命令模块（合计 299 个 IPC 注册入口）
+├── services/               # 业务服务（58 个）
 │   ├── proxy_service.rs    #   - 本地代理
 │   ├── circuit_breaker.rs  #   - 熔断器
 │   ├── model_router.rs     #   - 模型路由
@@ -228,7 +228,7 @@ src-tauri/src/
 
 > **关于大文件**：`src-tauri/runtime/`（便携运行时）、`src-tauri/resources/`（种子知识库 + embedding 模型，约 340MB）与 `portable-build/`（绿色版产物）共约 1GB，属构建产物/下载资源，**不随 Git 仓库分发**（见 `.gitignore`）。本机构建请保留这些目录；克隆用户可从 Release 安装包获取完整运行时，或参照 [release.yml](.github/workflows/release.yml) 的下载逻辑自行准备。
 
-## 201 个 Agent 工具按域分组
+## 204 个 Agent 工具按域分组
 
 | 域（TOOL_GROUP） | 代表工具 |
 |------|------|
@@ -275,6 +275,10 @@ npx tauri dev
 
 # 生产构建（需本机已准备 src-tauri/runtime 与 src-tauri/resources，见下方说明）
 npx tauri build
+
+# 预览/清理可重新生成的 Rust 与前端缓存（保留 node_modules）
+npm run clean:generated:dry-run
+npm run clean:generated
 ```
 
 > **内置运行时说明**：便携版 Node / JDK / Git（约 700MB）与知识库种子、embedding 模型（约 340MB）不随仓库分发。
@@ -289,6 +293,7 @@ npx tauri build
 ## 文档
 
 - [持续演进任务路线图](docs/ROADMAP.md) — 长会话、Agent 工具链、HarmonyOS 闭环与生态集成的阶段任务和验收标准
+- [项目生成物清理](docs/GENERATED_FILES_CLEANUP.md) — 安全清理 `target`、`dist`、覆盖率和 Vite 缓存
 - [Agent 能力演进路线（2026）](docs/AGENT_EVOLUTION_ROADMAP_2026.md) — 安全沙箱、大仓理解、真实评测与 12 周执行顺序
 - [安全边界与威胁模型](docs/SECURITY_BOUNDARY.md) — 当前保证、明确限制和真实沙箱最低契约
 - [官方 DevEco CLI 的 MCP 接入](docs/DEVECO_CLI_MCP_INTEGRATION.md) — 内置 MCP 模板、命令解析增强与自研工具分工策略
