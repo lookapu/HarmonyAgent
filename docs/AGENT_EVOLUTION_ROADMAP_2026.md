@@ -27,7 +27,7 @@
 - `SandboxBackend`/`SandboxSpec`、可选 Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线均已就绪；产品默认路线已改为无 Docker 依赖的平台原生轻量后端，OCI 只保留为外部 CI 适配器。
 - Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
 - ArkTS LSP 语义层与 `repo_query` 路由/影响面——依赖图重排的统一 planner 待完成。
-- headless eval harness——数据契约/grader/补丁/工作树/编排与 builtin driver 已落地；当前 builtin 支持 OpenAI-compatible Provider、受限文件工具和 `--driver builtin`，协议回合、成本账本与 acceptance stop gate 已进入 UI/headless 共用 Agent Kernel。流式协议、消息历史、tool loop 与 recovery 的进一步统一仍待实现，详见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)。
+- headless eval harness——数据契约/grader/补丁/工作树/编排与 builtin driver 已落地；当前 builtin 支持 OpenAI-compatible Provider、受限文件工具和 `--driver builtin`，非流式回合、多协议流式帧累加器、成本账本与 acceptance stop gate 已进入 UI/headless 共用 Agent Kernel。Provider 请求传输层、消息历史、tool loop 与 recovery 的进一步统一仍待实现，详见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)。
 
 **需外部基础设施（本仓库环境无法完成，按任务分别需真机/真实模型/官方 harness/签名证书；官方 SWE-bench 复现可在独立 CI 使用容器）**
 
@@ -433,7 +433,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 - [x] 把当前 `sandbox_exec` 在 UI/文档中改称“临时副本试运行”，消除错误安全承诺；
 - [x] 写 `SECURITY_BOUNDARY.md`：明确宿主、工作区、网络、凭据和 MCP 边界；
-- [ ] 完成 headless eval adapter 的生产级 Agent Kernel 与一个真实模型 end-to-end 样例（builtin driver、`eval run --driver builtin`、11 个结构/文件/Git 工具、`SessionTrajectorySink`、`HeadlessToolRuntime`、原生异步 runner 主路径、可注入 `ModelClient`、完全离线的脚本 Provider tool-loop 测试、成本计量、超时/重试与失败/取消终态已实现；参数级审批/L2 fail-closed、共享工具契约、trial 私有 `tool_runs` 与 `tool_metrics` 汇总也已接入；统一 Kernel 的严格 `KernelTurn`、usage/cost ledger 和 UI/headless 共用 acceptance stop gate、无 Docker 的真实 Provider 手动 workflow 已落地，流式协议/消息历史/tool loop/recovery 共用仍待完成，见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)）；
+- [ ] 完成 headless eval adapter 的生产级 Agent Kernel 与一个真实模型 end-to-end 样例（builtin driver、`eval run --driver builtin`、11 个结构/文件/Git 工具、`SessionTrajectorySink`、`HeadlessToolRuntime`、原生异步 runner 主路径、可注入 `ModelClient`、完全离线的脚本 Provider tool-loop 测试、成本计量、超时/重试与失败/取消终态已实现；参数级审批/L2 fail-closed、共享工具契约、trial 私有 `tool_runs` 与 `tool_metrics` 汇总也已接入；统一 Kernel 的严格 `KernelTurn`、多协议 `KernelStreamAccumulator`、usage/cost ledger 和 UI/headless 共用 acceptance stop gate、无 Docker 的真实 Provider 手动 workflow 已落地，请求传输层/消息历史/tool loop/recovery 共用仍待完成，见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)）；
 - [x] 固定 SWE-bench Verified 25 题 smoke 子集（v1 清单覆盖 12 个仓库和三档难度，固定官方 dataset revision；数量/唯一性/ID/revision 校验器与仓库清单测试已落地。官方 gold 25/25 容器自检只作为可选 CI 适配器验收，不是核心工具依赖，见 [SWE_BENCH_VERIFIED_25.md](./SWE_BENCH_VERIFIED_25.md)）；
 - [x] 建立 10k/100k/1M 文件索引基准生成器，并记录 10k 当前基线；
 - [x] 更新 README：二进制下载、支持平台和当前限制（badge 改为仅 Windows/macOS，并明确 Linux 暂不提供官方安装包，避免“跨平台”措辞超出实际产物）。

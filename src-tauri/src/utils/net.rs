@@ -208,25 +208,6 @@ pub fn extract_non_stream_text(protocol: &str, json: &serde_json::Value) -> Opti
     }
 }
 
-/// 从 OpenAI 兼容 SSE JSON 中提取原生工具调用增量（function calling）。
-/// 返回 (工具序号 index, 名称增量, 参数字符串增量)；无增量时返回 None。
-/// 模型流式返回 tool_calls：每个 chunk 携带 index + id/name/arguments 片段，
-/// 调用方按 index 累积：name 拼接（罕见跨 chunk）、arguments 按 JSON 片段拼接。
-pub fn extract_tool_call_delta(
-    json: &serde_json::Value,
-) -> Option<(usize, Option<String>, Option<String>)> {
-    let call = json["choices"][0]["delta"]["tool_calls"]
-        .as_array()?
-        .first()?;
-    let index = call["index"].as_u64().unwrap_or(0) as usize;
-    let name = call["function"]["name"].as_str().map(String::from);
-    let args = call["function"]["arguments"].as_str().map(String::from);
-    if name.is_none() && args.is_none() {
-        return None;
-    }
-    Some((index, name, args))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,49 +240,4 @@ mod tests {
         assert_eq!(extract_reasoning_delta("openai", &field).as_deref(), Some("另一种思考字段"));
     }
 
-    #[test]
-    fn extract_tool_call_delta_first_chunk_with_name_and_args() {
-        let json = serde_json::json!({
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": "call_1",
-                        "function": { "name": "read_file", "arguments": "{\"path\":\"a" }
-                    }]
-                }
-            }]
-        });
-        let (idx, name, args) = extract_tool_call_delta(&json).unwrap();
-        assert_eq!(idx, 0);
-        assert_eq!(name.as_deref(), Some("read_file"));
-        assert_eq!(args.as_deref(), Some("{\"path\":\"a"));
-    }
-
-    #[test]
-    fn extract_tool_call_delta_args_continuation() {
-        let json = serde_json::json!({
-            "choices": [{ "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": ".txt\"}" } }] } }]
-        });
-        let (idx, name, args) = extract_tool_call_delta(&json).unwrap();
-        assert_eq!(idx, 0);
-        assert_eq!(name, None); // 纯参数增量无名称
-        assert_eq!(args.as_deref(), Some(".txt\"}"));
-    }
-
-    #[test]
-    fn extract_tool_call_delta_ignores_plain_text_chunk() {
-        let json = serde_json::json!({
-            "choices": [{ "delta": { "content": "普通文本" } }]
-        });
-        assert!(extract_tool_call_delta(&json).is_none());
-    }
-
-    #[test]
-    fn extract_tool_call_delta_ignores_role_chunk() {
-        let json = serde_json::json!({
-            "choices": [{ "delta": { "role": "assistant" } }]
-        });
-        assert!(extract_tool_call_delta(&json).is_none());
-    }
 }

@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：v2 设计 + Phase 0/1 已落地，Phase 4 的协议、预算与验收内核已开始共用
+> 状态：v2 设计 + Phase 0/1 已落地，Phase 4 的非流式/流式协议、预算与验收内核已开始共用
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -122,6 +122,11 @@ pub trait AgentDriver: Send + Sync {
 共同使用 `Accepted / Remediate / Exhausted` 裁决。headless 会编译 `GoalContract`、累计
 真实工具证据，并在缺少写入后验证等证据时向模型注入有界补救提示；最终报告写入
 `agent_acceptance_final`，失败则标记 `acceptance_failed`，grader 仍是 trial 成败的最终裁判。
+
+第三个切片 `KernelStreamAccumulator` 已接管桌面 UI 的 Provider 流式帧归一化：统一检测
+OpenAI/Anthropic/Gemini 的正常结束与 token 截断，以常量空间累计 usage，并按 index 合并
+OpenAI 原生工具调用分片。Anthropic 分散在 `message_start` 与 `message_delta` 的输入/输出/
+缓存 token 会合并为同一份 usage；一个 OpenAI 帧内的多个并行 tool call 不再只保留首个。
 
 ### 5.1 事件输出接口
 
@@ -436,7 +441,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ### Phase 4：统一 Agent Kernel
 
-- 从 `chat.rs` 抽取 ModelClient/stream parser（非流式 `KernelTurn` 与 usage ledger 基础已落地）；
+- 从 `chat.rs` 抽取 ModelClient/stream parser（`KernelTurn`、usage ledger 与多协议 `KernelStreamAccumulator` 已落地；请求传输层仍待抽取）；
 - 抽取消息历史、tool loop、reflexion、governance、recovery（acceptance stop gate 已共用）；
 - Tauri UI 和 eval 共用 AgentKernel；
 - 再扩展 Anthropic/Gemini 适配器。

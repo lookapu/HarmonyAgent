@@ -6859,15 +6859,16 @@ struct StreamOutcome {
     tool_calls: Vec<(String, String)>,
 }
 
-/// Usage 提取只需要流首/流尾事件；有界保存可防超长响应重复缓存全部 JSON。
-fn retain_usage_chunk(chunks: &mut Vec<String>, data: &str) {
-    const MAX: usize = 64;
-    const KEEP_HEAD: usize = 8;
-    if chunks.len() < MAX {
-        chunks.push(data.to_string());
-    } else {
-        chunks.remove(KEEP_HEAD);
-        chunks.push(data.to_string());
+fn kernel_usage_info(
+    usage: Option<crate::agent::agent_kernel::KernelUsage>,
+) -> crate::services::cost_calculator::UsageInfo {
+    let usage = usage.unwrap_or_default();
+    let bounded = |value: u64| value.min(i64::MAX as u64) as i64;
+    crate::services::cost_calculator::UsageInfo {
+        input_tokens: bounded(usage.input_tokens),
+        output_tokens: bounded(usage.output_tokens),
+        cache_read_tokens: bounded(usage.cached_tokens),
+        cache_creation_tokens: bounded(usage.cache_creation_tokens),
     }
 }
 
@@ -7604,7 +7605,7 @@ async fn stream_once(
                             stopped: true,
                             truncated: false,
                             interrupted: false,
-                            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&[]),
+                            usage: kernel_usage_info(None),
                             tool_calls: Vec::new(),
                         });
                     }
@@ -7625,7 +7626,7 @@ async fn stream_once(
             stopped: true,
             truncated: false,
             interrupted: false,
-            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&[]),
+            usage: kernel_usage_info(None),
             tool_calls: Vec::new(),
         });
     }
@@ -7948,11 +7949,11 @@ async fn stream_once(
             .await
         }
     };
-    let (full, reasoning_full, usage_chunks, native_tool_calls, rec_buf) = match final_ev {
+    let (full, reasoning_full, usage, native_tool_calls, rec_buf) = match final_ev {
         Some(StreamParserEvent::Done {
             text,
             reasoning,
-            usage_chunks,
+            usage,
             tool_calls,
             rec_buf,
             finished: f,
@@ -7960,10 +7961,10 @@ async fn stream_once(
         }) => {
             finished = f;
             truncated = t;
-            (text, reasoning, usage_chunks, tool_calls, rec_buf)
+            (text, reasoning, usage, tool_calls, rec_buf)
         }
         // Done 丢失（等待超时/通道异常）：用主循环快照兜底，不无限等待
-        _ => (String::new(), String::new(), Vec::new(), Vec::new(), None),
+        _ => (String::new(), String::new(), None, Vec::new(), None),
     };
     // 流读取结束/退出后，优先检查用户是否在此期间点了停止。
     // 否则连接恰在停止前关闭会落到下方 interrupted 分支，主循环自动续写“请继续”，
@@ -7983,7 +7984,7 @@ async fn stream_once(
             stopped: true,
             truncated: false,
             interrupted: false,
-            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
+            usage: kernel_usage_info(usage),
             tool_calls: Vec::new(),
         });
     }
@@ -7999,8 +8000,8 @@ async fn stream_once(
             stopped: false,
             truncated: true,
             interrupted: false,
-            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-            tool_calls: finalize_tool_calls(&native_tool_calls),
+            usage: kernel_usage_info(usage),
+            tool_calls: native_tool_calls,
         });
     }
     // 无结束标记但已有部分正文 / 停滞命中：连接被提前关闭（网络/代理抖动、服务商静默
@@ -8014,8 +8015,8 @@ async fn stream_once(
             stopped: false,
             truncated: false,
             interrupted: true,
-            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-            tool_calls: finalize_tool_calls(&native_tool_calls),
+            usage: kernel_usage_info(usage),
+            tool_calls: native_tool_calls,
         });
     }
     // 录制模式：仅正常结束路径落盘（截断/中止/报错不录，保证重放数据完整可重放）
@@ -8033,8 +8034,8 @@ async fn stream_once(
         stopped: false,
         truncated: false,
         interrupted: false,
-        usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-        tool_calls: finalize_tool_calls(&native_tool_calls),
+        usage: kernel_usage_info(usage),
+        tool_calls: native_tool_calls,
     })
 }
 
@@ -8107,7 +8108,7 @@ async fn await_parse_done(
                     return Some(StreamParserEvent::Done {
                         text: snapshot.0.clone(),
                         reasoning: snapshot.1.clone(),
-                        usage_chunks: Vec::new(),
+                        usage: None,
                         tool_calls: Vec::new(),
                         rec_buf: None,
                         finished: false,
@@ -8131,7 +8132,7 @@ async fn await_parse_done(
             Some(StreamParserEvent::Done {
                 text: snapshot.0,
                 reasoning: snapshot.1,
-                usage_chunks: Vec::new(),
+                usage: None,
                 tool_calls: Vec::new(),
                 rec_buf: None,
                 finished: false,
@@ -8157,8 +8158,8 @@ enum StreamParserEvent {
     Done {
         text: String,
         reasoning: String,
-        usage_chunks: Vec<String>,
-        tool_calls: Vec<(usize, String, String)>,
+        usage: Option<crate::agent::agent_kernel::KernelUsage>,
+        tool_calls: Vec<(String, String)>,
         rec_buf: Option<Vec<u8>>,
         finished: bool,
         truncated: bool,
@@ -8189,8 +8190,7 @@ fn stream_parse_thread(
     // reasoning 增量合并缓冲：满 STREAM_REASONING_MERGE_BYTES 发一条事件，
     // 块边界强制 flush（防病态流逐条 IPC 推送堆积烧前端渲染）
     let mut reasoning_pending = String::new();
-    let mut usage_chunks: Vec<String> = Vec::new(); // 收集含 usage 的块（成本统计）
-    let mut native_tool_calls: Vec<(usize, String, String)> = Vec::new();
+    let mut kernel_stream = crate::agent::agent_kernel::KernelStreamAccumulator::default();
     let mut rec_buf: Option<Vec<u8>> = rec_enabled.then(Vec::new);
     let mut finished = false;
     let mut truncated = false;
@@ -8281,12 +8281,9 @@ fn stream_parse_thread(
                         consumed += pos + 1;
                         continue;
                     }
-                    // Usage 只需首尾少量帧；有界保留避免长任务复制全部 token JSON。
-                    retain_usage_chunk(&mut usage_chunks, data);
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(delta) =
-                            crate::utils::net::extract_stream_delta(&protocol, &json)
-                        {
+                        let frame = kernel_stream.ingest(&protocol, &json);
+                        if let Some(delta) = frame.content {
                             if !delta.is_empty() {
                                 full.push_str(&delta);
                                 let _ = event_tx.send(StreamParserEvent::Delta(delta));
@@ -8294,7 +8291,7 @@ fn stream_parse_thread(
                         }
                         // 思考过程增量（推理模型）：合并缓冲，满阈值发一条事件（前端逐条
                         // 重渲染思考区是 renderer 烧核根因，合并后事件量降两个数量级）
-                        if let Some(r) = crate::utils::net::extract_reasoning_delta(&protocol, &json) {
+                        if let Some(r) = frame.reasoning {
                             if !r.is_empty() {
                                 reasoning_pending.push_str(&r);
                                 if reasoning_pending.len() >= STREAM_REASONING_MERGE_BYTES {
@@ -8307,37 +8304,30 @@ fn stream_parse_thread(
                         }
                         // 原生 function calling 增量：先透传事件（async 侧刷新产出打点），
                         // 再按 index 合并累积（name 覆盖 + arguments 拼接）
-                        if let Some((idx, name, args)) =
-                            crate::utils::net::extract_tool_call_delta(&json)
-                        {
+                        if frame.tool_call_deltas > 0 {
                             let _ = event_tx.send(StreamParserEvent::ToolCall);
-                            match native_tool_calls.iter_mut().find(|(i, _, _)| *i == idx) {
-                                Some((_, n, a)) => {
-                                    if let Some(nm) = name {
-                                        n.push_str(&nm);
-                                    }
-                                    if let Some(ar) = args {
-                                        a.push_str(&ar);
-                                    }
-                                }
-                                None => native_tool_calls.push((
-                                    idx,
-                                    name.unwrap_or_default(),
-                                    args.unwrap_or_default(),
-                                )),
-                            }
                         }
-                        match detect_finish(&protocol, &json) {
-                            FinishKind::Done => {
+                        for warning in frame.warnings {
+                            crate::utils::logger::log_event(
+                                "stream_protocol_warning",
+                                serde_json::json!({
+                                    "conversation_id": conversation_id,
+                                    "protocol": protocol,
+                                    "warning": warning,
+                                }),
+                            );
+                        }
+                        match frame.finish {
+                            crate::agent::agent_kernel::KernelStreamFinish::Done => {
                                 finished = true;
                                 let _ = event_tx.send(StreamParserEvent::Finish { truncated: false });
                             }
-                            FinishKind::Truncated => {
+                            crate::agent::agent_kernel::KernelStreamFinish::Truncated => {
                                 truncated = true;
                                 finished = true;
                                 let _ = event_tx.send(StreamParserEvent::Finish { truncated: true });
                             }
-                            FinishKind::None => {}
+                            crate::agent::agent_kernel::KernelStreamFinish::None => {}
                         }
                     }
                 }
@@ -8399,9 +8389,7 @@ fn stream_parse_thread(
                         "lines_parsed": lines_parsed,
                         "buffer_pending": buffer.len(),
                         "produced_chars": full.len(),
-                        "head_chunk": usage_chunks
-                            .first()
-                            .map(|s| s.chars().take(200).collect::<String>()),
+                        "usage_observed": kernel_stream.usage().is_some(),
                         "tail_produced": full.chars().rev().take(200).collect::<String>(),
                     }),
                 );
@@ -8436,8 +8424,12 @@ fn stream_parse_thread(
     let _ = event_tx.send(StreamParserEvent::Done {
         text: full,
         reasoning: reasoning_full,
-        usage_chunks,
-        tool_calls: native_tool_calls,
+        usage: kernel_stream.usage(),
+        tool_calls: kernel_stream
+            .finalized_tool_calls()
+            .into_iter()
+            .map(|call| (call.name, call.arguments))
+            .collect(),
         rec_buf,
         finished,
         truncated,
@@ -8453,46 +8445,6 @@ fn replay_sse_response(text: &str) -> reqwest::Response {
         .body(reqwest::Body::from(text.to_string()))
         .expect("构造重放响应失败")
         .into()
-}
-
-/// 原生 tool_calls 累积 → (工具名, 参数 JSON) 列表（按 index 排序）
-fn finalize_tool_calls(calls: &[(usize, String, String)]) -> Vec<(String, String)> {
-    let mut sorted: Vec<&(usize, String, String)> = calls.iter().collect();
-    sorted.sort_by_key(|(i, _, _)| *i);
-    sorted
-        .into_iter()
-        .map(|(_, name, args)| (name.clone(), args.clone()))
-        .collect()
-}
-
-/// 流式结束标记检测（协议差异：openai 的 finish_reason / anthropic 的 message_stop / gemini 的 finishReason）
-enum FinishKind {
-    None,
-    Done,
-    Truncated,
-}
-
-fn detect_finish(protocol: &str, json: &serde_json::Value) -> FinishKind {
-    match protocol {
-        "anthropic" => match json["type"].as_str() {
-            Some("message_stop") => FinishKind::Done,
-            Some("message_delta") => match json["delta"]["stop_reason"].as_str() {
-                Some("max_tokens") => FinishKind::Truncated,
-                _ => FinishKind::None,
-            },
-            _ => FinishKind::None,
-        },
-        "gemini" => match json["candidates"][0]["finishReason"].as_str() {
-            Some("STOP") => FinishKind::Done,
-            Some("MAX_TOKENS") => FinishKind::Truncated,
-            _ => FinishKind::None,
-        },
-        _ => match json["choices"][0]["finish_reason"].as_str() {
-            Some("stop") | Some("tool_calls") => FinishKind::Done,
-            Some("length") => FinishKind::Truncated,
-            _ => FinishKind::None,
-        },
-    }
 }
 
 /// ship 注册表审计：收尾总结中“已验证/测试通过/已修复”等完成声明（CLAIM）未在声明后的
@@ -12074,18 +12026,6 @@ mod completion_confirmation_tests {
         assert!(!is_completion_confirmation("（工具结果）构建失败，正在排查"));
         assert!(!is_completion_confirmation("好的，我继续读取文件"));
         assert!(!is_completion_confirmation(""));
-    }
-
-    #[test]
-    fn usage_chunk_retention_is_bounded_and_keeps_edges() {
-        let mut chunks = Vec::new();
-        for i in 0..200 {
-            retain_usage_chunk(&mut chunks, &format!("chunk-{i}"));
-        }
-        assert_eq!(chunks.len(), 64);
-        assert_eq!(chunks.first().map(String::as_str), Some("chunk-0"));
-        assert!(chunks.iter().any(|s| s == "chunk-7"));
-        assert_eq!(chunks.last().map(String::as_str), Some("chunk-199"));
     }
 }
 

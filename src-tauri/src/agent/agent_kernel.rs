@@ -3,17 +3,20 @@
 //! 本模块不依赖 Tauri、Provider 凭据或具体工具 runtime。协议 adapter 先把响应转换为
 //! `KernelTurn`，预算账本再统一累计 usage/cost；消息循环与 UI 流式 adapter 后续逐步接入。
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
 use crate::agent::acceptance::{
     evaluate_contract, remediation_prompt, AcceptanceReport, GoalContract, ToolEvidence,
 };
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KernelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_creation_tokens: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,6 +120,10 @@ pub fn parse_openai_turn(response: &Value) -> Result<KernelTurn, String> {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                cache_creation_tokens: usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
             })
         }
         Some(_) => return Err("Provider usage 必须是 object 或 null".into()),
@@ -133,11 +140,258 @@ pub fn parse_openai_turn(response: &Value) -> Result<KernelTurn, String> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KernelStreamFinish {
+    #[default]
+    None,
+    Done,
+    Truncated,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KernelStreamFrame {
+    pub content: Option<String>,
+    pub reasoning: Option<String>,
+    pub tool_call_deltas: usize,
+    pub finish: KernelStreamFinish,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct KernelToolCallFragment {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// UI 流式 adapter 的协议归一化状态。网络分块、SSE 行缓冲和前端事件仍由调用方负责；
+/// 本类型只处理一帧 JSON 的正文/思考/结束状态、跨帧工具参数和跨首尾帧 usage。
+#[derive(Clone, Debug, Default)]
+pub struct KernelStreamAccumulator {
+    tool_calls: BTreeMap<usize, KernelToolCallFragment>,
+    usage: KernelUsage,
+    usage_observed: bool,
+}
+
+impl KernelStreamAccumulator {
+    pub fn ingest(&mut self, protocol: &str, json: &Value) -> KernelStreamFrame {
+        let mut frame = KernelStreamFrame {
+            content: crate::utils::net::extract_stream_delta(protocol, json),
+            reasoning: crate::utils::net::extract_reasoning_delta(protocol, json),
+            finish: detect_stream_finish(protocol, json),
+            ..KernelStreamFrame::default()
+        };
+        if protocol != "anthropic" && protocol != "gemini" {
+            self.ingest_openai_tool_calls(json, &mut frame);
+        }
+        self.ingest_usage(protocol, json, &mut frame.warnings);
+        frame
+    }
+
+    pub fn usage(&self) -> Option<KernelUsage> {
+        self.usage_observed.then_some(self.usage)
+    }
+
+    pub fn finalized_tool_calls(&self) -> Vec<KernelToolCall> {
+        self.tool_calls
+            .iter()
+            .filter(|(_, call)| !call.name.trim().is_empty())
+            .map(|(index, call)| KernelToolCall {
+                id: if call.id.is_empty() {
+                    format!("stream-call-{index}")
+                } else {
+                    call.id.clone()
+                },
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .collect()
+    }
+
+    fn ingest_openai_tool_calls(&mut self, json: &Value, frame: &mut KernelStreamFrame) {
+        let Some(calls) = json
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for call in calls {
+            let Some(index) = call.get("index").and_then(Value::as_u64) else {
+                frame
+                    .warnings
+                    .push("stream tool_call 缺少非负整数 index".into());
+                continue;
+            };
+            let Ok(index) = usize::try_from(index) else {
+                frame
+                    .warnings
+                    .push("stream tool_call index 超出范围".into());
+                continue;
+            };
+            let fragment = self.tool_calls.entry(index).or_default();
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                if fragment.id.is_empty() {
+                    fragment.id.push_str(id);
+                }
+            }
+            if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                fragment.name.push_str(name);
+            }
+            if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                fragment.arguments.push_str(arguments);
+            }
+            frame.tool_call_deltas += 1;
+        }
+    }
+
+    fn ingest_usage(&mut self, protocol: &str, json: &Value, warnings: &mut Vec<String>) {
+        match protocol {
+            "anthropic" => {
+                for usage in [json.get("usage"), json.pointer("/message/usage")]
+                    .into_iter()
+                    .flatten()
+                {
+                    merge_stream_usage(
+                        "input_tokens",
+                        usage.get("input_tokens"),
+                        &mut self.usage.input_tokens,
+                        &mut self.usage_observed,
+                        warnings,
+                    );
+                    merge_stream_usage(
+                        "output_tokens",
+                        usage.get("output_tokens"),
+                        &mut self.usage.output_tokens,
+                        &mut self.usage_observed,
+                        warnings,
+                    );
+                    merge_stream_usage(
+                        "cache_read_input_tokens",
+                        usage.get("cache_read_input_tokens"),
+                        &mut self.usage.cached_tokens,
+                        &mut self.usage_observed,
+                        warnings,
+                    );
+                    merge_stream_usage(
+                        "cache_creation_input_tokens",
+                        usage.get("cache_creation_input_tokens"),
+                        &mut self.usage.cache_creation_tokens,
+                        &mut self.usage_observed,
+                        warnings,
+                    );
+                }
+            }
+            "gemini" => {
+                let Some(usage) = json.get("usageMetadata") else {
+                    return;
+                };
+                merge_stream_usage(
+                    "promptTokenCount",
+                    usage.get("promptTokenCount"),
+                    &mut self.usage.input_tokens,
+                    &mut self.usage_observed,
+                    warnings,
+                );
+                merge_stream_usage(
+                    "candidatesTokenCount",
+                    usage.get("candidatesTokenCount"),
+                    &mut self.usage.output_tokens,
+                    &mut self.usage_observed,
+                    warnings,
+                );
+                merge_stream_usage(
+                    "cachedContentTokenCount",
+                    usage.get("cachedContentTokenCount"),
+                    &mut self.usage.cached_tokens,
+                    &mut self.usage_observed,
+                    warnings,
+                );
+            }
+            _ => {
+                let Some(usage) = json.get("usage") else {
+                    return;
+                };
+                merge_stream_usage(
+                    "prompt_tokens",
+                    usage.get("prompt_tokens"),
+                    &mut self.usage.input_tokens,
+                    &mut self.usage_observed,
+                    warnings,
+                );
+                merge_stream_usage(
+                    "completion_tokens",
+                    usage.get("completion_tokens"),
+                    &mut self.usage.output_tokens,
+                    &mut self.usage_observed,
+                    warnings,
+                );
+                merge_stream_usage(
+                    "cached_tokens",
+                    usage.pointer("/prompt_tokens_details/cached_tokens"),
+                    &mut self.usage.cached_tokens,
+                    &mut self.usage_observed,
+                    warnings,
+                );
+            }
+        }
+    }
+}
+
+fn merge_stream_usage(
+    label: &str,
+    value: Option<&Value>,
+    target: &mut u64,
+    observed: &mut bool,
+    warnings: &mut Vec<String>,
+) {
+    let Some(value) = value else { return };
+    match value.as_u64() {
+        Some(value) => {
+            *target = (*target).max(value);
+            *observed = true;
+        }
+        None if !value.is_null() => warnings.push(format!("stream usage {label} 必须是非负整数")),
+        None => {}
+    }
+}
+
+pub fn detect_stream_finish(protocol: &str, json: &Value) -> KernelStreamFinish {
+    match protocol {
+        "anthropic" => match json.get("type").and_then(Value::as_str) {
+            Some("message_stop") => KernelStreamFinish::Done,
+            Some("message_delta")
+                if json.pointer("/delta/stop_reason").and_then(Value::as_str)
+                    == Some("max_tokens") =>
+            {
+                KernelStreamFinish::Truncated
+            }
+            _ => KernelStreamFinish::None,
+        },
+        "gemini" => match json
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+        {
+            Some("STOP") => KernelStreamFinish::Done,
+            Some("MAX_TOKENS") => KernelStreamFinish::Truncated,
+            _ => KernelStreamFinish::None,
+        },
+        _ => match json
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            Some("stop") | Some("tool_calls") => KernelStreamFinish::Done,
+            Some("length") => KernelStreamFinish::Truncated,
+            _ => KernelStreamFinish::None,
+        },
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct KernelUsageLedger {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub cost_cny: f64,
     max_cost_cny: f64,
     input_price_cny_per_1k: Option<f64>,
@@ -170,6 +424,7 @@ impl KernelUsageLedger {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_creation_tokens: 0,
             cost_cny: 0.0,
             max_cost_cny,
             input_price_cny_per_1k,
@@ -188,6 +443,9 @@ impl KernelUsageLedger {
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.cached_tokens = self.cached_tokens.saturating_add(usage.cached_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(usage.cache_creation_tokens);
         if let (Some(input_price), Some(output_price)) =
             (self.input_price_cny_per_1k, self.output_price_cny_per_1k)
         {
@@ -351,8 +609,83 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 1,
                 cached_tokens: 0,
+                cache_creation_tokens: 0,
             }))
             .unwrap());
+    }
+
+    #[test]
+    fn stream_accumulator_merges_multiple_parallel_tool_calls() {
+        let mut stream = KernelStreamAccumulator::default();
+        let first = stream.ingest(
+            "openai",
+            &serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":1,"id":"c2","function":{"name":"read_","arguments":r#"{"path":"#}},
+                {"index":0,"id":"c1","function":{"name":"write_file","arguments":r#"{"path":"a","content":"#}}
+            ]}}]}),
+        );
+        assert_eq!(first.tool_call_deltas, 2);
+        let second = stream.ingest(
+            "openai",
+            &serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":r#""x"}"#}},
+                {"index":1,"function":{"name":"file","arguments":r#""a"}"#}}
+            ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":4}}),
+        );
+        assert_eq!(second.finish, KernelStreamFinish::Done);
+        let calls = stream.finalized_tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments, r#"{"path":"a","content":"x"}"#);
+        assert_eq!(calls[1].id, "c2");
+        assert_eq!(calls[1].name, "read_file");
+        assert_eq!(calls[1].arguments, r#"{"path":"a"}"#);
+        assert_eq!(stream.usage().unwrap().input_tokens, 20);
+    }
+
+    #[test]
+    fn stream_accumulator_merges_anthropic_usage_across_start_and_end() {
+        let mut stream = KernelStreamAccumulator::default();
+        stream.ingest(
+            "anthropic",
+            &serde_json::json!({
+                "type":"message_start",
+                "message":{"usage":{"input_tokens":120,"cache_read_input_tokens":30,"cache_creation_input_tokens":7}}
+            }),
+        );
+        let end = stream.ingest(
+            "anthropic",
+            &serde_json::json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"max_tokens"},
+                "usage":{"output_tokens":18}
+            }),
+        );
+        assert_eq!(end.finish, KernelStreamFinish::Truncated);
+        assert_eq!(
+            stream.usage(),
+            Some(KernelUsage {
+                input_tokens: 120,
+                output_tokens: 18,
+                cached_tokens: 30,
+                cache_creation_tokens: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn stream_accumulator_reads_gemini_finish_and_usage() {
+        let mut stream = KernelStreamAccumulator::default();
+        let frame = stream.ingest(
+            "gemini",
+            &serde_json::json!({
+                "candidates":[{"finishReason":"STOP"}],
+                "usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":3,"cachedContentTokenCount":2}
+            }),
+        );
+        assert_eq!(frame.finish, KernelStreamFinish::Done);
+        assert_eq!(stream.usage().unwrap().cached_tokens, 2);
     }
 
     #[test]

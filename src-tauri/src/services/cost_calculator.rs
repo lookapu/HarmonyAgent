@@ -68,23 +68,3 @@ pub fn extract_usage_from_response(body: &serde_json::Value) -> UsageInfo {
             .unwrap_or(0),
     }
 }
-
-pub fn extract_usage_from_sse_chunks(chunks: &[String]) -> UsageInfo {
-    for chunk in chunks.iter().rev() {
-        let data = chunk.strip_prefix("data: ").unwrap_or(chunk);
-        if data == "[DONE]" {
-            continue;
-        }
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-            if parsed.get("usage").is_some() {
-                return extract_usage_from_response(&parsed);
-            }
-        }
-    }
-    UsageInfo {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_tokens: 0,
-    }
-}
