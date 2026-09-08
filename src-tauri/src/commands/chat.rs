@@ -20,7 +20,9 @@ use crate::agent::agent_kernel::{
     KernelStreamGovernor, KernelStreamSignal, KERNEL_STREAM_MAX_BYTES,
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
+use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
 use crate::agent::tools::guards::is_cancelled;
+use crate::agent::tools::{has_pending_action_phrase, parse_data_url};
 
 /// 流式增量事件（每收到一个 delta 推送一次）
 #[derive(Clone, Serialize)]
@@ -8470,35 +8472,7 @@ fn has_unverified_claim(text: &str) -> bool {
     false
 }
 
-/// 未完话术检测：模型承诺继续动作（先读取/继续查看/补全…）但未输出工具标记
-/// （任务实际未完成却正常收尾），命中后由主循环注入纠正提示继续。
-/// 用“计划词+动作词”组合替代枚举短语，覆盖模型的各种表达；含总结/交付信号的不算。
-fn has_pending_action_phrase(text: &str) -> bool {
-    // 总结/交付信号：命中即视为收尾（最终代码、报告、结论等），不再纠正。
-    // 注意：代码块 ``` 不是收尾信号——模型常先输出代码再描述“接下来执行”，
-    // 若视为收尾会让未完任务静默结束；真正的完成由“已完成/结论”等词判定
-    const DONE_SIGNALS: &[&str] = &[
-        "总结", "结论", "已完成", "以上就是", "最终版", "效果如下",
-        "全部完成", "修改完成", "实施完成", "核查完成", "检查完成", "报告如下", "综上所述",
-    ];
-    if DONE_SIGNALS.iter().any(|s| text.contains(s)) {
-        return false;
-    }
-    // 计划词：表示“接下来要做”的意图
-    const PLAN_WORDS: &[&str] = &[
-        "还需", "还需要", "还要", "仍需", "先", "继续", "接着", "接下来", "下一步",
-        "然后", "再", "补全", "待会", "稍后", "准备", "开始", "需要先",
-    ];
-    // 动作词：工具型动作
-    const ACTION_WORDS: &[&str] = &[
-        "读取", "查看", "检查", "阅读", "执行", "修改", "分析", "确认", "验证",
-        "测试", "构建", "部署", "美化", "设计", "优化", "完善", "调整", "编写",
-        "创建", "删除", "更新", "看看", "处理", "读一下", "看下",
-    ];
-    PLAN_WORDS.iter().any(|p| text.contains(p)) && ACTION_WORDS.iter().any(|a| text.contains(a))
-}
-
-/// 行动承诺检测：模型宣布“开始开发/创建/新建/实现”等当前行动或仅输出方案计划（如
+/// 行动承诺检测：模型宣布”开始开发/创建/新建/实现”等当前行动或仅输出方案计划（如
 /// “方案如下：新建 pages/Login.ets …”）但未输出任何【TOOL】标记时命中（任务实际未执行
 /// 却正常收尾），由主循环注入纠正提示继续。与 has_pending_action_phrase（承诺“还需/继续”
 /// 做某事）互补：本函数针对“现在就开始做”的承诺式表达与“只给计划不给执行”的假完成，
@@ -9914,12 +9888,6 @@ async fn apply_tool_batch(
     intercepted
 }
 
-/// 动态历史窗口：按模型上下文预算估算初始条数（预算大窗口大；配合主动压缩与
-/// 持久摘要，保证早期对话要点不丢的同时尽量保留近期细节）
-fn dynamic_history_limit(context_budget: i64) -> usize {
-    ((context_budget / 3000) as usize).clamp(20, 60)
-}
-
 /// 从文本提取到的目录路径及其语境分类。
 struct PathHint {
     /// canonicalize 后的规范化目录路径
@@ -10401,12 +10369,6 @@ fn load_persisted_summary(
     .ok()
     .flatten()
     .filter(|s| !s.trim().is_empty())
-}
-
-/// 估算请求 token：统一走 utils::tokenizer 的混合文本预估
-/// （中文 1 字符≈1 token、英文 4 字符≈1 token，比旧的"字符数/2"更贴近真实量级）
-fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
-    crate::utils::tokenizer::estimate_messages_tokens(messages)
 }
 
 /// 上下文超限时的滚动摘要：取将被裁剪的最旧历史，用经济模型压成结构化摘要。
@@ -11111,21 +11073,6 @@ fn build_auto_rag_hint(api_dir: &str, query: &str, api_ver: Option<&str>) -> Str
     out
 }
 
-
-fn parse_data_url(url: &str) -> Option<(String, String)> {
-    let rest = url.strip_prefix("data:")?;
-    let (meta, data) = rest.split_once(',')?;
-    if !meta.contains("base64") || data.is_empty() {
-        return None;
-    }
-    let mime = meta
-        .split(';')
-        .next()
-        .filter(|m| m.starts_with("image/"))
-        .unwrap_or("image/png")
-        .to_string();
-    Some((mime, data.to_string()))
-}
 
 /// 从 take_screenshot 工具输出中提取 [VISION_IMAGE: <路径>] 标记的路径（无标记返回 None）
 fn extract_vision_image_path(out: &str) -> Option<String> {

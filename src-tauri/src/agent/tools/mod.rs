@@ -57,6 +57,7 @@ pub use protocol::{
     phase_hint_for, system_hint_for, tool_short_desc, tool_schemas_for, tool_schemas_for_phase,
     tool_argument_error, validate_tool_arguments, ToolArgumentIssue,
     phase_hint_for_names, tool_schemas_for_names,
+    has_pending_action_phrase, parse_data_url,
 };
 use errors::with_advice;
 pub(crate) use errors::diagnose_tool_error;

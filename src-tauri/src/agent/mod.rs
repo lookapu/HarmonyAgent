@@ -51,3 +51,5 @@ pub mod tools;
 pub mod headless_driver;
 pub mod headless_runtime;
 pub mod undo;
+pub mod kernel_loop;
+pub mod kernel_history;

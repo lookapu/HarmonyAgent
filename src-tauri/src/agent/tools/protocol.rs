@@ -890,6 +890,48 @@ fn find_ci_ascii(haystack: &str, needle: &str) -> Option<usize> {
     })
 }
 
+/// 未完话术检测：模型回复含"还需/继续"+ 动作词（读取/查看/修改…）但未含总结/交付信号时，
+/// 视为"承诺接下来要做某事"的过渡回复；历史回放时省略此类消息，防止模型模仿话术风格。
+///
+/// 代码块 ``` 不是收尾信号——模型常先输出代码再描述"接下来执行"，若视为收尾会让未完任务
+/// 静默结束；真正的完成由"已完成/结论"等词判定。
+pub fn has_pending_action_phrase(text: &str) -> bool {
+    const DONE_SIGNALS: &[&str] = &[
+        "总结", "结论", "已完成", "以上就是", "最终版", "效果如下",
+        "全部完成", "修改完成", "实施完成", "核查完成", "检查完成", "报告如下", "综上所述",
+    ];
+    if DONE_SIGNALS.iter().any(|s| text.contains(s)) {
+        return false;
+    }
+    const PLAN_WORDS: &[&str] = &[
+        "还需", "还需要", "还要", "仍需", "先", "继续", "接着", "接下来", "下一步",
+        "然后", "再", "补全", "待会", "稍后", "准备", "开始", "需要先",
+    ];
+    const ACTION_WORDS: &[&str] = &[
+        "读取", "查看", "检查", "阅读", "执行", "修改", "分析", "确认", "验证",
+        "测试", "构建", "部署", "美化", "设计", "优化", "完善", "调整", "编写",
+        "创建", "删除", "更新", "看看", "处理", "读一下", "看下",
+    ];
+    PLAN_WORDS.iter().any(|p| text.contains(p)) && ACTION_WORDS.iter().any(|a| text.contains(a))
+}
+
+/// 解析 data URL（`data:image/...;base64,...`）为 (mime, base64_data)。
+/// 非 image mime 或非 base64 编码返回 None。
+pub fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if !meta.contains("base64") || data.is_empty() {
+        return None;
+    }
+    let mime = meta
+        .split(';')
+        .next()
+        .filter(|m| m.starts_with("image/"))
+        .unwrap_or("image/png")
+        .to_string();
+    Some((mime, data.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
