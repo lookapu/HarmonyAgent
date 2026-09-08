@@ -1,4 +1,4 @@
-import { createElement, memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createElement, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import type { PluggableList } from 'unified'
 import remarkGfm from 'remark-gfm'
@@ -16,6 +16,7 @@ import { useTranslation } from 'react-i18next'
 import { useThemeStore } from '../stores/themeStore'
 import Icon from '../icons/Icon'
 import { detectGpu, getCodeHighlightLimit, getMarkdownLightThreshold } from '../utils/gpuDetect'
+import { useVirtualizer } from '@tanstack/react-virtual'
 import 'katex/dist/katex.min.css'
 
 // 常用语言注册（按需加载，避免全量包体积）
@@ -552,14 +553,83 @@ function SmartImage({ src, alt, onZoom }: { src: string; alt?: string; onZoom: (
 }
 
 function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  const { t } = useTranslation()
+  const [scale, setScale] = useState(1)
+  const [translate, setTranslate] = useState({ x: 0, y: 0 })
+  const [dragging, setDragging] = useState(false)
+  const dragStart = useRef({ x: 0, y: 0, tx: 0, ty: 0 })
+
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+      if (e.key === '+' || e.key === '=') setScale((s) => Math.min(5, s + 0.25))
+      if (e.key === '-') setScale((s) => Math.max(0.25, s - 0.25))
+      if (e.key === '0') { setScale(1); setTranslate({ x: 0, y: 0 }) }
+    }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [onClose])
+
+  const onWheel = (e: React.WheelEvent) => {
+    e.stopPropagation()
+    const delta = e.deltaY > 0 ? -0.15 : 0.15
+    setScale((s) => Math.min(5, Math.max(0.25, s + delta)))
+  }
+
+  const onMouseDown = (e: React.MouseEvent) => {
+    if (scale <= 1) return
+    setDragging(true)
+    dragStart.current = { x: e.clientX, y: e.clientY, tx: translate.x, ty: translate.y }
+  }
+  const onMouseMove = (e: React.MouseEvent) => {
+    if (!dragging) return
+    setTranslate({ x: dragStart.current.tx + (e.clientX - dragStart.current.x), y: dragStart.current.ty + (e.clientY - dragStart.current.y) })
+  }
+  const onMouseUp = () => setDragging(false)
+
+  const doDownload = async () => {
+    try {
+      if ('__TAURI_INTERNALS__' in window) {
+        const dest = await dialogSave({ title: t('md.downloadImage'), defaultPath: 'image.png' })
+        if (!dest) return
+      }
+      const a = document.createElement('a')
+      a.href = src
+      a.download = 'image.png'
+      a.click()
+    } catch { /* silent */ }
+  }
+
+  const resetZoom = () => { setScale(1); setTranslate({ x: 0, y: 0 }) }
+
   return (
-    <div className="md-lightbox" onClick={onClose}>
-      <img src={src} alt="" onClick={(e) => e.stopPropagation()} />
+    <div className="md-lightbox" onClick={onClose} onWheel={onWheel}>
+      <img
+        src={src}
+        alt=""
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={onMouseUp}
+        style={{
+          transform: `translate(${translate.x}px, ${translate.y}px) scale(${scale})`,
+          cursor: scale > 1 ? (dragging ? 'grabbing' : 'grab') : 'zoom-in',
+          transition: dragging ? 'none' : 'transform 0.2s ease',
+        }}
+      />
+      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1.5 bg-black/60 backdrop-blur-sm rounded-full px-3 py-1.5 text-white text-xs" onClick={(e) => e.stopPropagation()}>
+        <button type="button" onClick={() => setScale((s) => Math.max(0.25, s - 0.25))} className="hover:opacity-70 px-1" title="缩小 (-)">−</button>
+        <span className="tabular-nums min-w-[3ch] text-center" onDoubleClick={resetZoom}>{Math.round(scale * 100)}%</span>
+        <button type="button" onClick={() => setScale((s) => Math.min(5, s + 0.25))} className="hover:opacity-70 px-1" title="放大 (+)">+</button>
+        {scale !== 1 && (
+          <button type="button" onClick={resetZoom} className="hover:opacity-70 px-1 ml-1 text-[10px] opacity-70" title="重置 (0)">1:1</button>
+        )}
+        <span className="w-px h-3 bg-white/20 mx-0.5" />
+        <button type="button" onClick={doDownload} className="hover:opacity-70 px-1" title={t('md.downloadImage')}>
+          <Icon name="download" size={12} />
+        </button>
+      </div>
       <button type="button" className="md-lightbox-close" onClick={onClose} title="关闭 (Esc)" aria-label="关闭 (Esc)">
         <Icon name="close" size={18} />
       </button>
@@ -770,49 +840,74 @@ function CodeBlock({
     </div>
   )
 
-  const body = (
-    <pre className="md-codeblock-pre">
-      {shownLines.map((line, i) => {
-        const lineNo = i + 1
-        const k = lineKind(line)
-        const tone = k ? null : lineTone(line)
-        const isFocus = focusLine === lineNo
-        const inSel =
-          selectedLines && lineNo >= selectedLines[0] && lineNo <= selectedLines[1]
-        const cls = `md-code-line${k ? ` md-diff-line md-diff-${k}` : ''}${tone ? ` md-line-${tone}` : ''}${isFocus ? ' md-code-line-focus' : ''}${inSel ? ' md-code-line-selected' : ''}`
-        const lineNoEl = onLineClick ? (
-          <button
-            type="button"
-            className="md-code-line-no md-code-line-no-btn"
-            onClick={(e) => onLineClick(lineNo, e)}
-            title="点击选择该行，Shift+点击选择范围"
-          >
-            {lineNo}
-          </button>
-        ) : onOpenFile && filePath ? (
-          <button
-            type="button"
-            className="md-code-line-no md-code-line-no-btn"
-            title={`定位到 ${filePath}:${lineNo}`}
-            onClick={() => onOpenFile(`${filePath}:${lineNo}`)}
-          >
-            {lineNo}
-          </button>
-        ) : (
-          <span className="md-code-line-no">{lineNo}</span>
-        )
-        return (
-          <div className={cls} key={i} data-line={lineNo}>
-            {lineNoEl}
-            <span
-              className="md-code-line-content"
-              dangerouslySetInnerHTML={{
-                __html: i === shownLines.length - 1 && line === '' ? '<br/>' : line === '' ? ' ' : highlightedLines[i] ?? '',
-              }}
-            />
+  const VIRTUAL_THRESHOLD = 200
+  const useVirtual = shownLines.length > VIRTUAL_THRESHOLD
+
+  const renderLine = useCallback((i: number) => {
+    const line = shownLines[i]
+    const lineNo = i + 1
+    const k = lineKind(line)
+    const tone = k ? null : lineTone(line)
+    const isFocus = focusLine === lineNo
+    const inSel =
+      selectedLines && lineNo >= selectedLines[0] && lineNo <= selectedLines[1]
+    const cls = `md-code-line${k ? ` md-diff-line md-diff-${k}` : ''}${tone ? ` md-line-${tone}` : ''}${isFocus ? ' md-code-line-focus' : ''}${inSel ? ' md-code-line-selected' : ''}`
+    const lineNoEl = onLineClick ? (
+      <button
+        type="button"
+        className="md-code-line-no md-code-line-no-btn"
+        onClick={(e) => onLineClick(lineNo, e)}
+        title="点击选择该行，Shift+点击选择范围"
+      >
+        {lineNo}
+      </button>
+    ) : onOpenFile && filePath ? (
+      <button
+        type="button"
+        className="md-code-line-no md-code-line-no-btn"
+        title={`定位到 ${filePath}:${lineNo}`}
+        onClick={() => onOpenFile(`${filePath}:${lineNo}`)}
+      >
+        {lineNo}
+      </button>
+    ) : (
+      <span className="md-code-line-no">{lineNo}</span>
+    )
+    return (
+      <div className={cls} data-line={lineNo}>
+        {lineNoEl}
+        <span
+          className="md-code-line-content"
+          dangerouslySetInnerHTML={{
+            __html: i === shownLines.length - 1 && line === '' ? '<br/>' : line === '' ? ' ' : highlightedLines[i] ?? '',
+          }}
+        />
+      </div>
+    )
+  }, [shownLines, highlightedLines, focusLine, selectedLines, onLineClick, onOpenFile, filePath, lineKind, lineTone])
+
+  const parentRef = useRef<HTMLPreElement>(null)
+  const virtualizer = useVirtualizer({
+    count: useVirtual ? shownLines.length : 0,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 20,
+    overscan: 15,
+    enabled: useVirtual,
+  })
+
+  const body = useVirtual ? (
+    <pre ref={parentRef} className="md-codeblock-pre" style={{ maxHeight: 600, overflow: 'auto' }}>
+      <div style={{ height: virtualizer.getTotalSize(), width: '100%', position: 'relative' }}>
+        {virtualizer.getVirtualItems().map((item) => (
+          <div key={item.index} style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${item.start}px)` }}>
+            {renderLine(item.index)}
           </div>
-        )
-      })}
+        ))}
+      </div>
+    </pre>
+  ) : (
+    <pre className="md-codeblock-pre">
+      {shownLines.map((_, i) => <div key={i}>{renderLine(i)}</div>)}
     </pre>
   )
 

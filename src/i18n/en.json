@@ -81,6 +81,7 @@
     "expandLines": "Expand ({{count}} lines)",
     "copy": "Copy",
     "downloadCode": "Download code",
+    "downloadImage": "Save image",
     "copyCode": "Copy code",
     "fullscreen": "Fullscreen",
     "exitFullscreen": "Exit fullscreen"
@@ -387,6 +388,8 @@
     "gitMain": "main",
     "gitWorktreeEmpty": "No worktrees yet. Create one below",
     "modifiedFiles": "{{n}} files modified",
+    "filterFiles": "Filter files…",
+    "noMatchFiles": "No matching files",
 "reviewChanges": "Review Changes",
 "reviewDesc": "Review diffs per file, accept or revert changes",
 "conversationCount": "{{n}} conversations",

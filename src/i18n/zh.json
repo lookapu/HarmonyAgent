@@ -81,6 +81,7 @@
     "expandLines": "展开 ({{count}} 行)",
     "copy": "复制",
     "downloadCode": "下载代码",
+    "downloadImage": "保存图片",
     "copyCode": "复制代码",
     "fullscreen": "全屏",
     "exitFullscreen": "退出全屏"
@@ -388,6 +389,8 @@
     "gitMain": "主仓库",
     "gitWorktreeEmpty": "还没有 worktree，可在下方创建",
     "modifiedFiles": "修改了 {{n}} 个文件",
+    "filterFiles": "筛选文件…",
+    "noMatchFiles": "无匹配文件",
     "reviewChanges": "审核变更",
     "reviewDesc": "逐文件查看 diff，接受或还原变更",
     "conversationCount": "{{n}} 个会话",

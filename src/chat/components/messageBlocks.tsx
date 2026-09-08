@@ -142,8 +142,9 @@ export function ThumbDownIcon({ filled }: { filled?: boolean }) {
 /** 变更审查卡片：修改文件列表 + 逐文件 diff/接受/还原（Qoder 式变更审核） */
 export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projectPath }: { files: string[]; projectPath?: string }) {
   const { t } = useTranslation()
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(files.length <= 3)
   const [copied, setCopied] = useState<string | null>(null)
+  const [filter, setFilter] = useState('')
   // 变更统计（+N/-M）：挂载时对文件列表拉取增删行数（ChatGPT 式“N 个文件已更改 +N -M”）
   const [stat, setStat] = useState<{ files: number; insertions: number; deletions: number } | null>(null)
   useEffect(() => {
@@ -184,6 +185,12 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
   const [reverted, setReverted] = useState<Set<string>>(new Set())
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const canReview = !!projectPath
+
+  const filteredFiles = useMemo(() => {
+    if (!filter.trim()) return files
+    const q = filter.trim().toLowerCase()
+    return files.filter((f) => f.toLowerCase().includes(q))
+  }, [files, filter])
 
   const copyPath = async (p: string) => {
     try {
@@ -312,7 +319,21 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
       </button>
       {open && (
         <div className="max-h-64 overflow-y-auto border-t border-[var(--border)] py-1">
-          {files.map((p) => {
+          {files.length > 5 && (
+            <div className="px-3 py-1">
+              <input
+                type="text"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder={t('home.filterFiles')}
+                className="w-full h-6 px-2 rounded-md border border-[var(--border)] bg-[var(--bg-primary)] text-[10.5px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)]/50 transition-colors"
+              />
+            </div>
+          )}
+          {filteredFiles.length === 0 && filter && (
+            <div className="px-3 py-2 text-[10.5px] text-[var(--text-muted)] text-center">{t('home.noMatchFiles')}</div>
+          )}
+          {filteredFiles.map((p) => {
             const isAccepted = accepted.has(p)
             const isReverted = reverted.has(p)
             const diff = diffMap[p]
