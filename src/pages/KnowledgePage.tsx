@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import Icon from '../icons/Icon'
 import { useProjectStore } from '../stores/projectStore'
+import { Skeleton } from '../components/ui/Spinner'
 import {
   listKnowledge,
   addKnowledge,
@@ -27,6 +28,7 @@ export default function KnowledgePage() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [form, setForm] = useState(emptyForm)
   const [saving, setSaving] = useState(false)
+  const [loaded, setLoaded] = useState(false)
 
   const scopeProjectId = effectiveScope === 'project' ? projectId : null
 
@@ -36,6 +38,8 @@ export default function KnowledgePage() {
       setEntries(await listKnowledge(scopeProjectId))
     } catch (e) {
       console.error(e)
+    } finally {
+      setLoaded(true)
     }
   }, [scopeProjectId])
   useEffect(() => { load() }, [load])
@@ -195,7 +199,9 @@ export default function KnowledgePage() {
       )}
 
       <div className="space-y-2">
-        {entries.length === 0 && (
+        {!loaded ? (
+          <Skeleton lines={4} label={t('common.loading')} />
+        ) : entries.length === 0 && (
           <div className="modern-card rounded-lg p-8 text-center text-sm text-[var(--text-secondary)]">
             {t('knowledge.empty')}
           </div>

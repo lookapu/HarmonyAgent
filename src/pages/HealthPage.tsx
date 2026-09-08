@@ -23,6 +23,7 @@ import { checkWithProxy, withProxy } from '../api/updateProxy'
 import { useProjectStore } from '../stores/projectStore'
 import { getJSON, setItem } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
+import { Skeleton } from '../components/ui/Spinner'
 
 /** 版本号比较：v22.14.0 vs 22.13.0；返回 a-b 差值（>0 表示 a 新）。
  *  非数字段（如 git 的 windows 段）退化为字符串比较，兼容 Git for Windows 版本号。 */
@@ -1206,7 +1207,7 @@ export default function HealthPage() {
             {rtMsg && <p className="text-xs mt-2 break-all">{rtMsg}</p>}
           </>
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+          <Skeleton lines={2} label={t('common.loading')} />
         )}
       </div>
 
@@ -1236,7 +1237,7 @@ export default function HealthPage() {
             <p className="text-xs text-[var(--text-muted)] mt-2">{t('health.devecoCliDesc')}</p>
           </>
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+          <Skeleton lines={2} label={t('common.loading')} />
         )}
       </div>
 
@@ -1315,7 +1316,7 @@ export default function HealthPage() {
             {gitMsg && <p className="text-xs mt-2 break-all">{gitMsg}</p>}
           </>
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">{gitMsg ?? t('common.loading')}</p>
+          gitMsg ? <p className="text-sm text-[var(--text-secondary)]">{gitMsg}</p> : <Skeleton lines={2} label={t('common.loading')} />
         )}
       </div>
 
@@ -1442,7 +1443,7 @@ export default function HealthPage() {
             {jdkMsg && <p className="text-xs mt-2 break-all">{jdkMsg}</p>}
           </>
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+          <Skeleton lines={2} label={t('common.loading')} />
         )}
       </div>
 
@@ -1558,7 +1559,7 @@ export default function HealthPage() {
                       </div>
                       <div className="max-h-56 overflow-y-auto">
                         {candLoading ? (
-                          <p className="px-3 py-2 text-xs text-[var(--text-muted)]">{t('common.loading')}</p>
+                          <Skeleton lines={2} label={t('common.loading')} className="px-3 py-2" />
                         ) : candidates.length === 0 ? (
                           <p className="px-3 py-2 text-xs text-[var(--text-muted)]">{t('health.toolchainNoCandidate')}</p>
                         ) : (

@@ -73,15 +73,22 @@ export function Spinner({
 interface SkeletonProps {
   /** 占位行数，默认 3 */
   lines?: number
+  /** 无障碍标签；传入时容器暴露 role="status"，占位条各自 aria-hidden */
+  label?: string
   className?: string
 }
 
-export function Skeleton({ lines = 3, className }: SkeletonProps) {
+export function Skeleton({ lines = 3, label, className }: SkeletonProps) {
   return (
-    <div aria-hidden="true" className={cn('space-y-2', className)}>
+    <div
+      role={label ? 'status' : undefined}
+      aria-label={label}
+      className={cn('space-y-2', className)}
+    >
       {Array.from({ length: lines }, (_, i) => (
         <div
           key={i}
+          aria-hidden="true"
           className="shimmer h-3 rounded-sm bg-[var(--bg-hover)]"
           style={{ width: i === lines - 1 ? '62%' : '100%' }}
         />

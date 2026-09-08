@@ -7,6 +7,7 @@ import { mcpTemplates, mcpTemplateCategories, matchMcpTemplate, templateEnvDefau
 import { detectDevecoCli } from '../api/devecoCli'
 import { useProjectStore } from '../stores/projectStore'
 import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
+import { Skeleton } from '../components/ui/Spinner'
 
 /**
  * 解析环境变量文本为对象（每行一个 KEY=value，兼容旧的逗号分隔）。
@@ -1010,7 +1011,7 @@ function McpUsageView({
   }
 
   if (loading) {
-    return <p className="text-sm text-[var(--text-secondary)]">{t('mcp.loadingStats')}</p>
+    return <Skeleton lines={4} label={t('mcp.loadingStats')} className="py-2" />
   }
 
   return (

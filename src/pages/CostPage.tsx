@@ -10,6 +10,7 @@ import { writeTextFile } from '@tauri-apps/plugin-fs'
 import Icon from '../icons/Icon'
 import { getJSON, setJSON } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
+import { Skeleton } from '../components/ui/Spinner'
 import { getAgentSloPolicy, getReliabilityDashboard, listAgentAlerts, runReliabilityEvaluation, type AgentAlert, type ReliabilityDashboard, type SloPolicy } from '../api/reliability'
 
 /** CSV 字段转义：含逗号/引号/换行的字段用双引号包裹，内部双引号 → 双重转义 */
@@ -869,7 +870,7 @@ export default function CostPage() {
             return logStatusFilter === 'success' ? !isError : isError
           })
           if (requestLogsLoading && requestLogs.length === 0) {
-            return <p className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+            return <Skeleton lines={8} label={t('common.loading')} className="px-4 py-3" />
           }
           if (filtered.length === 0) {
             return <p className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]">{t('cost.requestLogsEmpty')}</p>

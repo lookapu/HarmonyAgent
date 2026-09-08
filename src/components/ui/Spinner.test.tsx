@@ -48,14 +48,23 @@ describe('Spinner', () => {
 })
 
 describe('Skeleton', () => {
-  it('按 lines 出行数，末行收窄，整体对读屏隐藏', () => {
+  it('按 lines 出行数，末行收窄，占位条对读屏隐藏', () => {
     const { container } = render(<Skeleton lines={4} />)
     const wrap = container.firstElementChild as HTMLElement
-    expect(wrap).toHaveAttribute('aria-hidden', 'true')
+    expect(wrap).not.toHaveAttribute('role')
     const rows = Array.from(wrap.children)
     expect(rows).toHaveLength(4)
+    expect(rows.every((r) => r.getAttribute('aria-hidden') === 'true')).toBe(true)
     expect(rows.every((r) => r.className.includes('shimmer'))).toBe(true)
     expect(rows[0].getAttribute('style')).toContain('width: 100%')
     expect(rows[3].getAttribute('style')).toContain('width: 62%')
+  })
+
+  it('传入 label 时容器暴露 role=status，占位条仍 aria-hidden', () => {
+    render(<Skeleton lines={2} label="加载中" />)
+    const wrap = screen.getByRole('status', { name: '加载中' })
+    expect(wrap).not.toHaveAttribute('aria-hidden')
+    const rows = Array.from(wrap.children)
+    expect(rows.every((r) => r.getAttribute('aria-hidden') === 'true')).toBe(true)
   })
 })

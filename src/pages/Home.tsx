@@ -113,7 +113,7 @@ import CommandPalette, { type PaletteCommand } from '../components/CommandPalett
 import { Button } from '../components/ui/Button'
 import { IconButton } from '../components/ui/IconButton'
 import { Field, TextArea } from '../components/ui/Field'
-import { Spinner } from '../components/ui/Spinner'
+import { Skeleton, Spinner } from '../components/ui/Spinner'
 import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { EmptyState as UiEmptyState } from '../components/ui/EmptyState'
 import { useEscapeKey } from '../hooks/useEscapeKey'
@@ -6984,7 +6984,7 @@ export default function Home() {
             )}
             <div className="mt-3 space-y-1 max-h-80 overflow-y-auto">
               {loadingSnapshots && snapshots.length === 0 ? (
-                <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('common.loading')}</div>
+                <Skeleton lines={4} label={t('common.loading')} className="py-2" />
               ) : snapshots.length === 0 ? (
                 <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('home.timelineEmpty')}</div>
               ) : (

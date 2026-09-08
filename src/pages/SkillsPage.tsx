@@ -17,6 +17,7 @@ import { skillTemplates, type SkillTemplate } from '../data/skillTemplates'
 import { useProjectStore } from '../stores/projectStore'
 import Icon from '../icons/Icon'
 import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
+import { Skeleton } from '../components/ui/Spinner'
 
 /** 从 Git 仓库地址（GitHub/Gitee 的 URL / git@ / owner/name）提取 owner 和 name */
 function parseGithubUrl(input: string): { owner: string; name: string } | null {
@@ -496,7 +497,7 @@ function SkillUsageView({
         </button>
       </div>
 
-      {loading && <p className="text-xs text-[var(--text-muted)]">{t('common.loading')}</p>}
+      {loading && <Skeleton lines={2} label={t('common.loading')} />}
 
       {/* 汇总卡片 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
