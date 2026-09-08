@@ -108,6 +108,7 @@ import {
 } from '../chat/components/streamingStatus'
 import { LedgerCard } from '../chat/components/ledger'
 import { ToolRunGroup } from '../chat/components/toolRuns'
+import { ConversationNav } from '../chat/components/conversationNav'
 import { FeedbackDialog, VersionDiffDialog, MemoryDraftDialog, EditMessageDialog, RulesDialog } from '../chat/components/dialogs'
 import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, PreviewPanel, TerminalPanel, ShellPanel } from '../chat/components/panels'
 import CommandPalette, { type PaletteCommand } from '../components/CommandPalette'
@@ -4812,6 +4813,10 @@ export default function Home() {
                   </div>
                 )}
               </div>
+            )}
+
+            {currentProject && messages.length > 2 && (
+              <ConversationNav messages={messages} />
             )}
 
             <button

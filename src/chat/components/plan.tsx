@@ -590,6 +590,7 @@ export const PlanCard = memo(function PlanCard({ plan }: { plan: TaskPlan }) {
   const errCount = plan.steps.filter((s) => s.status === 'error').length
   const running = plan.phase === 'running'
   const total = plan.steps.length
+  const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0
   const statusLabel = plan.phase === 'error' ? t('home.planFailed') : running ? t('home.planRunning') : t('home.planDone')
   const statusColor = plan.phase === 'error' ? 'text-[var(--danger)]' : running ? 'text-[var(--accent)]' : 'text-[var(--success)]'
 
@@ -622,40 +623,53 @@ export const PlanCard = memo(function PlanCard({ plan }: { plan: TaskPlan }) {
         <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />
       </button>
       {open && (
-        <ol className="border-t border-[var(--border)]/60 py-1.5 space-y-0.5">
-          {plan.steps.map((s, i) => (
-            <li key={i} className="flex items-start gap-2 py-0.5">
-              <span
-                className={`w-4 h-4 rounded-full flex items-center justify-center shrink-0 mt-px text-[9px] font-semibold ${
-                  s.status === 'done'
-                    ? 'text-[var(--success)]'
-                    : s.status === 'error'
-                      ? 'text-[var(--danger)]'
-                      : s.status === 'running'
-                        ? 'text-[var(--accent)]'
-                        : 'text-[var(--text-muted)]'
+        <div className="border-t border-[var(--border)]/60">
+          <div className="flex items-center gap-2 px-1 pt-1.5 pb-1">
+            <div className="flex-1 h-1 rounded-full bg-[var(--border)]/60 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ease-out ${
+                  plan.phase === 'error' ? 'bg-[var(--danger)]' : 'bg-[var(--accent)]'
                 }`}
-              >
-                {s.status === 'done' ? (
-                  <Icon name="check" size={10} />
-                ) : s.status === 'error' ? (
-                  <Icon name="close" size={10} />
-                ) : s.status === 'running' ? (
-                  <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
-                ) : (
-                  i + 1
-                )}
-              </span>
-              <span
-                className={`flex-1 min-w-0 text-[12px] leading-relaxed ${
-                  s.status === 'pending' ? 'text-[var(--text-muted)]' : 'text-[var(--text-secondary)]'
-                }`}
-              >
-                {s.text}
-              </span>
-            </li>
-          ))}
-        </ol>
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            <span className="text-[10px] text-[var(--text-muted)] tabular-nums shrink-0">{pct}%</span>
+          </div>
+          <ol className="py-1 space-y-0.5">
+            {plan.steps.map((s, i) => (
+              <li key={i} className="flex items-start gap-2 py-0.5">
+                <span
+                  className={`w-4 h-4 rounded-full flex items-center justify-center shrink-0 mt-px text-[9px] font-semibold ${
+                    s.status === 'done'
+                      ? 'text-[var(--success)]'
+                      : s.status === 'error'
+                        ? 'text-[var(--danger)]'
+                        : s.status === 'running'
+                          ? 'text-[var(--accent)]'
+                          : 'text-[var(--text-muted)]'
+                  }`}
+                >
+                  {s.status === 'done' ? (
+                    <Icon name="check" size={10} />
+                  ) : s.status === 'error' ? (
+                    <Icon name="close" size={10} />
+                  ) : s.status === 'running' ? (
+                    <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
+                  ) : (
+                    i + 1
+                  )}
+                </span>
+                <span
+                  className={`flex-1 min-w-0 text-[12px] leading-relaxed ${
+                    s.status === 'pending' ? 'text-[var(--text-muted)]' : 'text-[var(--text-secondary)]'
+                  }`}
+                >
+                  {s.text}
+                </span>
+              </li>
+            ))}
+          </ol>
+        </div>
       )}
     </div>
   )
