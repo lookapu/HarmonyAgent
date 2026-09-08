@@ -140,6 +140,8 @@ pub(super) struct EditFileRequest {
     pub symbol_handle: Option<String>,
     /// 同文件多节点事务：与 news 一一对应，全部句柄必须绑定同一文件版本。
     pub symbol_handles: Option<Vec<String>>,
+    /// 显式允许 v3 句柄在非目标文件改动后做唯一、内容不变的受控重定位。
+    pub allow_relocate: Option<bool>,
     /// 被替换的原文（resolve 校验非空；与 start 互斥）
     pub old: Option<String>,
     /// 替换成的新文（缺省空串）
@@ -173,6 +175,8 @@ pub(super) struct EditFileRequest {
     #[serde(skip)]
     expected_parent_range: Option<(usize, usize)>,
     #[serde(skip)]
+    expected_relocated: bool,
+    #[serde(skip)]
     expected_nodes: Vec<ExpectedNode>,
 }
 
@@ -182,6 +186,7 @@ struct ExpectedNode {
     kind: Option<String>,
     range: (usize, usize),
     parent_range: Option<(usize, usize)>,
+    relocated: bool,
 }
 
 impl EditFileRequest {
@@ -266,6 +271,7 @@ impl EditFileRequest {
             expected_symbol_kind: self.expected_symbol_kind,
             expected_symbol_range: self.expected_symbol_range,
             expected_parent_range: self.expected_parent_range,
+            expected_relocated: self.expected_relocated,
             expected_nodes: self.expected_nodes,
         })
     }
@@ -298,12 +304,14 @@ pub(super) struct EditFileSpec {
     pub expected_symbol_kind: Option<String>,
     pub expected_symbol_range: Option<(usize, usize)>,
     pub expected_parent_range: Option<(usize, usize)>,
+    pub expected_relocated: bool,
     /// `symbol_handles` 多节点事务的逐节点前置条件。
     expected_nodes: Vec<ExpectedNode>,
 }
 
 async fn resolve_edit_file_spec(args: &Value, roots: &[String]) -> Result<EditFileSpec, String> {
     let mut request = EditFileRequest::from_args(args)?;
+    let allow_relocate = request.allow_relocate.unwrap_or(false);
     if request.symbol_handle.is_some() && request.symbol_handles.is_some() {
         return Err("symbol_handle 与 symbol_handles 互斥，请选择单节点或多节点事务".into());
     }
@@ -327,7 +335,11 @@ async fn resolve_edit_file_spec(args: &Value, roots: &[String]) -> Result<EditFi
         }
         let root_paths = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
         let locators = tokio::task::spawn_blocking(move || {
-            crate::services::symbol_index::resolve_symbol_read_handles(&root_paths, &handles)
+            crate::services::symbol_index::resolve_symbol_edit_handles(
+                &root_paths,
+                &handles,
+                allow_relocate,
+            )
         })
         .await
         .map_err(|error| format!("验证多节点编辑句柄任务异常：{error}"))??;
@@ -355,6 +367,7 @@ async fn resolve_edit_file_spec(args: &Value, roots: &[String]) -> Result<EditFi
                 kind: locator.expected_kind,
                 range: (locator.start_line, locator.end_line),
                 parent_range: locator.parent_range,
+                relocated: locator.relocated,
             })
             .collect();
     }
@@ -375,7 +388,14 @@ async fn resolve_edit_file_spec(args: &Value, roots: &[String]) -> Result<EditFi
         }
         let root_paths = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
         let locator = tokio::task::spawn_blocking(move || {
-            crate::services::symbol_index::resolve_symbol_read_handle(&root_paths, &handle)
+            crate::services::symbol_index::resolve_symbol_edit_handles(
+                &root_paths,
+                &[handle],
+                allow_relocate,
+            )
+            .and_then(|mut locators| {
+                locators.pop().ok_or_else(|| "符号编辑句柄不能为空".to_string())
+            })
         })
         .await
         .map_err(|error| format!("验证符号编辑句柄任务异常：{error}"))??;
@@ -386,6 +406,10 @@ async fn resolve_edit_file_spec(args: &Value, roots: &[String]) -> Result<EditFi
         request.expected_symbol_kind = locator.expected_kind;
         request.expected_symbol_range = Some((locator.start_line, locator.end_line));
         request.expected_parent_range = locator.parent_range;
+        request.expected_relocated = locator.relocated;
+    }
+    if allow_relocate && request.expected_symbol_sha256.is_none() {
+        return Err("allow_relocate 仅能与 symbol_handle 或 symbol_handles 一起使用".into());
     }
     request.resolve(roots)
 }
@@ -3479,6 +3503,9 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
                     "    节点事务：kind={}，node_id={short_id}…，parent={parent}\n",
                     node.kind.as_deref().unwrap_or("legacy")
                 ));
+                if node.relocated {
+                    report.push_str("    受控重定位：原文件版本已变化，目标节点内容与稳定身份唯一匹配\n");
+                }
             }
         }
         return Ok(format!("已批量编辑 {} 个块：\n{report}文件：{}", ranges.len(), p.display()));
@@ -3573,6 +3600,11 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             report.push_str(&format!(
                 "节点事务：kind={kind}，node_id={short_id}…，parent={parent}\n"
             ));
+            if spec.expected_relocated {
+                report.push_str(
+                    "受控重定位：原文件版本已变化，目标节点内容与稳定身份唯一匹配\n",
+                );
+            }
         }
         report.push_str(&format!("块首行：{}\n", show(body_lines[o].trim())));
         if !spec.new.is_empty() {
@@ -5256,6 +5288,101 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.contains("结构定位已过期"), "{error}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_relocates_unchanged_v3_node_only_when_explicitly_allowed() {
+        let original = "fn keep() { keep_work(); }\nfn target() { old_work(); }\n";
+        let (f, roots) = tmp_file("edit_relocate_symbol_handle", original, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let externally_changed = format!("// external note\n{original}");
+        std::fs::write(&f, &externally_changed).unwrap();
+        let out = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() { new_work(); }\n",
+                "allow_relocate": true
+            }),
+            &roots,
+            "t_edit_relocate_symbol_handle",
+        ))
+        .expect("非目标改动后应可显式受控重定位");
+        assert!(out.contains("受控重定位"), "{out}");
+        let updated = std::fs::read_to_string(&f).unwrap();
+        assert!(updated.starts_with("// external note\n"), "{updated}");
+        assert!(updated.contains("new_work()") && !updated.contains("old_work()"), "{updated}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_relocation_rejects_changed_target_node() {
+        let original = "fn target() { old_work(); }\n";
+        let (f, roots) = tmp_file("edit_relocate_changed_target", original, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let external = "fn target() { external_work(); }\n";
+        std::fs::write(&f, external).unwrap();
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() { agent_work(); }\n",
+                "allow_relocate": true
+            }),
+            &roots,
+            "t_edit_relocate_changed_target",
+        ))
+        .unwrap_err();
+        assert!(error.contains("结构重定位被拒绝"), "{error}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), external);
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_relocation_rejects_ambiguous_identical_nodes() {
+        let original = "fn target() { old_work(); }\n";
+        let (f, roots) = tmp_file("edit_relocate_ambiguous", original, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let ambiguous = format!("// external duplication\n{original}{original}");
+        std::fs::write(&f, &ambiguous).unwrap();
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() { agent_work(); }\n",
+                "allow_relocate": true
+            }),
+            &roots,
+            "t_edit_relocate_ambiguous",
+        ))
+        .unwrap_err();
+        assert!(error.contains("多个完全相同"), "{error}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), ambiguous);
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
     }
 

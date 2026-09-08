@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mutationGuardKind } from './toolRuns'
+import { mutationGuardKind, mutationRelocationApplied } from './toolRuns'
 
 const failedRun = (tool: string, output: string) => ({
   tool,
@@ -17,10 +17,17 @@ describe('mutationGuardKind', () => {
   it('classifies atomic rollback and stale structure failures', () => {
     expect(mutationGuardKind(failedRun('multi_edit', 'multi_edit 原子提交失败，已回滚此前 2 个文件'))).toBe('rollback')
     expect(mutationGuardKind(failedRun('write_file', '结构定位已过期：文件在定位后再次发生变化'))).toBe('stale')
+    expect(mutationGuardKind(failedRun('edit_file', '结构重定位被拒绝：目标节点内容已经变化'))).toBe('stale')
   })
 
   it('does not relabel unrelated tool failures', () => {
     expect(mutationGuardKind(failedRun('run_command', 'syntax gate failed'))).toBeNull()
     expect(mutationGuardKind({ tool: 'edit_file', output: 'ok', status: 'done' })).toBeNull()
+  })
+
+  it('surfaces successful controlled relocation only for mutation tools', () => {
+    expect(mutationRelocationApplied({ tool: 'edit_file', output: '受控重定位：目标节点唯一匹配', status: 'done' })).toBe(true)
+    expect(mutationRelocationApplied({ tool: 'run_command', output: 'controlled relocation', status: 'done' })).toBe(false)
+    expect(mutationRelocationApplied(failedRun('edit_file', '受控重定位失败'))).toBe(false)
   })
 })

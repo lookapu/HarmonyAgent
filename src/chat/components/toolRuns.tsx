@@ -25,8 +25,12 @@ export function mutationGuardKind(run: Pick<ToolRun, 'tool' | 'status' | 'output
   const output = run.output.toLowerCase()
   if (/语法门禁拒绝|java 声明门禁拒绝|syntax (?:mutation )?gate|syntax error nodes?/.test(output)) return 'syntax'
   if (/原子提交失败|已回滚|atomic commit failed|rolled back/.test(output)) return 'rollback'
-  if (/结构(?:编辑句柄|定位)已过期|文件在定位后再次发生变化|stale (?:symbol|structure)|changed since/.test(output)) return 'stale'
+  if (/结构(?:编辑句柄|定位)已过期|结构重定位被拒绝|文件在定位后再次发生变化|stale (?:symbol|structure)|changed since|controlled relocation rejected/.test(output)) return 'stale'
   return null
+}
+
+export function mutationRelocationApplied(run: Pick<ToolRun, 'tool' | 'status' | 'output'>): boolean {
+  return run.status === 'done' && MUTATION_TOOLS.has(run.tool) && /受控重定位|controlled relocation/.test(run.output.toLowerCase())
 }
 
 /* ============ 工具调用折叠组：一行展示（最后一次调用），点击展开全部 ============ */
@@ -123,6 +127,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
   // 展开内容：完成=最终输出（无输出时回退流式记录）；运行中=实时流式输出
   const displayOutput = done ? run.output || run.liveOutput || '' : run.liveOutput ?? ''
   const guardKind = mutationGuardKind(run)
+  const relocated = mutationRelocationApplied(run)
   // 运行中实时输出自动跟随（每次新行滚到底部）
   const liveRef = useRef<HTMLPreElement>(null)
   useEffect(() => {
@@ -251,6 +256,15 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
                 {t(`home.mutationGuard.${guardKind}.title`)}
               </div>
               <div className="mt-0.5 text-[#aeb8c4]">{t(`home.mutationGuard.${guardKind}.detail`)}</div>
+            </div>
+          )}
+          {relocated && (
+            <div className="mx-3 mt-2 rounded-md border border-[var(--success)]/35 bg-[var(--success)]/10 px-2.5 py-2 text-[11px] leading-relaxed">
+              <div className="flex items-center gap-1.5 font-semibold text-[var(--success)]">
+                <Icon name="info" size={11} />
+                {t('home.mutationGuard.relocated.title')}
+              </div>
+              <div className="mt-0.5 text-[#aeb8c4]">{t('home.mutationGuard.relocated.detail')}</div>
             </div>
           )}
           <pre

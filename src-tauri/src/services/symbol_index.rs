@@ -129,6 +129,8 @@ struct SymbolReadHandle {
     e: usize,
     h: String,
     i: String,
+    j: String,
+    c: String,
     k: String,
     ps: usize,
     pe: usize,
@@ -144,10 +146,12 @@ pub struct SymbolReadLocator {
     pub node_id: String,
     pub expected_kind: Option<String>,
     pub parent_range: Option<(usize, usize)>,
+    pub relocated: bool,
 }
 
 const SYMBOL_READ_HANDLE_V1_PREFIX: &str = "sr1.";
 const SYMBOL_READ_HANDLE_V2_PREFIX: &str = "sr2.";
+const SYMBOL_READ_HANDLE_V3_PREFIX: &str = "sr3.";
 
 pub(crate) fn sha256_base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
@@ -182,6 +186,29 @@ fn symbol_read_fingerprint(symbol: &Symbol) -> String {
         )
         .as_bytes(),
     )
+}
+
+fn symbol_relocation_fingerprint(symbol: &Symbol) -> String {
+    sha256_base64(
+        format!(
+            "{}\0{}\0{}\0{}",
+            symbol.kind,
+            symbol.name,
+            symbol.parent.as_deref().unwrap_or(""),
+            symbol.signature
+        )
+        .as_bytes(),
+    )
+}
+
+fn line_range_fingerprint(content: &str, start_line: usize, end_line: usize) -> String {
+    let normalized = content
+        .lines()
+        .skip(start_line.saturating_sub(1))
+        .take(end_line.saturating_sub(start_line).saturating_add(1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    sha256_base64(normalized.as_bytes())
 }
 
 fn symbol_parent_range(symbol: &Symbol, symbols: &[Symbol]) -> Option<(usize, usize)> {
@@ -229,14 +256,16 @@ fn encode_symbol_read_handle(handle: &SymbolReadHandle) -> Result<String, String
     let path = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(handle.p.as_bytes());
     let kind = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(handle.k.as_bytes());
     Ok(format!(
-        "{SYMBOL_READ_HANDLE_V2_PREFIX}{}.{}.{}.{:x}.{:x}.{:x}.{:x}.{kind}.{path}",
-        handle.r, handle.h, handle.i, handle.s, handle.e, handle.ps, handle.pe
+        "{SYMBOL_READ_HANDLE_V3_PREFIX}{}.{}.{}.{}.{}.{:x}.{:x}.{:x}.{:x}.{kind}.{path}",
+        handle.r, handle.h, handle.i, handle.j, handle.c, handle.s, handle.e, handle.ps, handle.pe
     ))
 }
 
 fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
     let trimmed = value.trim();
-    let (version, encoded) = if let Some(encoded) = trimmed.strip_prefix(SYMBOL_READ_HANDLE_V2_PREFIX) {
+    let (version, encoded) = if let Some(encoded) = trimmed.strip_prefix(SYMBOL_READ_HANDLE_V3_PREFIX) {
+        (3, encoded)
+    } else if let Some(encoded) = trimmed.strip_prefix(SYMBOL_READ_HANDLE_V2_PREFIX) {
         (2, encoded)
     } else if let Some(encoded) = trimmed.strip_prefix(SYMBOL_READ_HANDLE_V1_PREFIX) {
         (1, encoded)
@@ -247,11 +276,19 @@ fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
     let r = fields.next().unwrap_or_default().to_string();
     let h = fields.next().unwrap_or_default().to_string();
     let i = fields.next().unwrap_or_default().to_string();
+    let (j, c) = if version >= 3 {
+        (
+            fields.next().unwrap_or_default().to_string(),
+            fields.next().unwrap_or_default().to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     let s = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
         .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
     let e = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
         .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
-    let (ps, pe, kind, path) = if version == 2 {
+    let (ps, pe, kind, path) = if version >= 2 {
         let ps = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
             .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?;
         let pe = usize::from_str_radix(fields.next().unwrap_or_default(), 16)
@@ -266,7 +303,12 @@ fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
     } else {
         (0, 0, String::new(), fields.next().unwrap_or_default())
     };
-    if fields.next().is_some() || r.len() != 43 || h.len() != 43 || i.len() != 43 {
+    if fields.next().is_some()
+        || r.len() != 43
+        || h.len() != 43
+        || i.len() != 43
+        || (version >= 3 && (j.len() != 43 || c.len() != 43))
+    {
         return Err("符号读取句柄无效或已损坏，请重新查询结构".into());
     }
     let p = String::from_utf8(
@@ -275,11 +317,11 @@ fn decode_symbol_read_handle(value: &str) -> Result<SymbolReadHandle, String> {
             .map_err(|_| "符号读取句柄无效或已损坏，请重新查询结构".to_string())?,
     )
     .map_err(|_| "符号读取句柄路径编码无效，请重新查询结构".to_string())?;
-    let handle = SymbolReadHandle { r, p, s, e, h, i, k: kind, ps, pe, version };
+    let handle = SymbolReadHandle { r, p, s, e, h, i, j, c, k: kind, ps, pe, version };
     if handle.p.is_empty()
         || handle.s == 0
         || handle.e < handle.s
-        || (version == 2
+        || (version >= 2
             && (handle.k.is_empty()
                 || (handle.ps == 0) != (handle.pe == 0)
                 || (handle.ps > 0 && handle.pe < handle.ps)))
@@ -330,18 +372,21 @@ pub fn symbol_read_handles(root: &Path, symbols: &[Symbol]) -> Vec<Result<String
                 .entry(symbol.file.clone())
                 .or_insert_with(|| fs::read_to_string(&path).unwrap_or_default());
             let start = attached_annotation_start(content, symbol.line);
+            let end = symbol.end_line.max(symbol.line).max(1);
             let (ps, pe) = symbol_parent_range(symbol, indexed).unwrap_or((0, 0));
             encode_symbol_read_handle(&SymbolReadHandle {
                 r: root_fingerprint.clone(),
                 p: symbol.file.clone(),
                 s: start,
-                e: symbol.end_line.max(symbol.line).max(1),
+                e: end,
                 h: digest.clone(),
                 i: symbol_read_fingerprint(symbol),
+                j: symbol_relocation_fingerprint(symbol),
+                c: line_range_fingerprint(content, start, end),
                 k: symbol.kind.clone(),
                 ps,
                 pe,
-                version: 2,
+                version: 3,
             })
         })
         .collect()
@@ -363,6 +408,24 @@ pub fn resolve_symbol_read_handle(
 pub fn resolve_symbol_read_handles(
     roots: &[PathBuf],
     values: &[String],
+) -> Result<Vec<SymbolReadLocator>, String> {
+    resolve_symbol_handles_with_policy(roots, values, false)
+}
+
+/// 编辑专用解析。默认与读取一样严格；显式允许重定位时，仅 v3 句柄可在完整文件摘要
+/// 变化后，按稳定身份与原节点内容摘要做唯一重定位。
+pub fn resolve_symbol_edit_handles(
+    roots: &[PathBuf],
+    values: &[String],
+    allow_relocate: bool,
+) -> Result<Vec<SymbolReadLocator>, String> {
+    resolve_symbol_handles_with_policy(roots, values, allow_relocate)
+}
+
+fn resolve_symbol_handles_with_policy(
+    roots: &[PathBuf],
+    values: &[String],
+    allow_relocate: bool,
 ) -> Result<Vec<SymbolReadLocator>, String> {
     if values.is_empty() {
         return Err("符号读取句柄不能为空".into());
@@ -410,9 +473,16 @@ pub fn resolve_symbol_read_handles(
     }
     let digest = file_sha256_base64(&path)
         .map_err(|error| format!("验证符号读取句柄失败：{error}"))?;
-    if digest != first.h {
+    let file_changed = digest != first.h;
+    if file_changed && !allow_relocate {
         return Err(
             "结构定位已过期：目标文件已被外部工具或其他会话修改，请重新调用 search_symbols/repo_query 后再读取"
+                .into(),
+        );
+    }
+    if file_changed && handles.iter().any(|handle| handle.version < 3) {
+        return Err(
+            "结构定位已过期：旧版句柄不支持受控重定位，请重新调用 search_symbols/repo_query"
                 .into(),
         );
     }
@@ -423,20 +493,48 @@ pub fn resolve_symbol_read_handles(
     handles
         .into_iter()
         .map(|handle| {
-            let current_symbol = current_symbols
-                .iter()
-                .find(|symbol| symbol_read_fingerprint(symbol) == handle.i)
-                .ok_or_else(|| {
-                    "结构定位已过期：索引中的符号范围与当前文件不一致，请等待增量索引刷新并重新查询"
-                        .to_string()
-                })?;
+            let current_symbol = if file_changed {
+                let candidates = current_symbols
+                    .iter()
+                    .filter(|symbol| symbol_relocation_fingerprint(symbol) == handle.j)
+                    .filter(|symbol| {
+                        let start = attached_annotation_start(&current_content, symbol.line);
+                        let end = symbol.end_line.max(symbol.line).max(1);
+                        line_range_fingerprint(&current_content, start, end) == handle.c
+                    })
+                    .collect::<Vec<_>>();
+                match candidates.as_slice() {
+                    [symbol] => *symbol,
+                    [] => {
+                        return Err(
+                            "结构重定位被拒绝：目标节点内容、类型、签名或归属已经变化，请重新查询结构并重新规划"
+                                .into(),
+                        )
+                    }
+                    _ => {
+                        return Err(
+                            "结构重定位被拒绝：当前文件存在多个完全相同的候选节点，无法唯一定位"
+                                .into(),
+                        )
+                    }
+                }
+            } else {
+                current_symbols
+                    .iter()
+                    .find(|symbol| symbol_read_fingerprint(symbol) == handle.i)
+                    .ok_or_else(|| {
+                        "结构定位已过期：索引中的符号范围与当前文件不一致，请等待增量索引刷新并重新查询"
+                            .to_string()
+                    })?
+            };
             if handle.version >= 2 && current_symbol.kind != handle.k {
                 return Err(
                     "结构定位已过期：目标节点类型已经变化，请重新查询结构后再编辑".into(),
                 );
             }
-            if handle.version >= 2
-                && attached_annotation_start(&current_content, current_symbol.line) != handle.s
+            let current_start = attached_annotation_start(&current_content, current_symbol.line);
+            let current_end = current_symbol.end_line.max(current_symbol.line).max(1);
+            if !file_changed && handle.version >= 2 && current_start != handle.s
             {
                 return Err(
                     "结构定位已过期：目标节点的注解边界已经变化，请重新查询结构后再编辑"
@@ -444,7 +542,7 @@ pub fn resolve_symbol_read_handles(
                 );
             }
             let parent_range = symbol_parent_range(current_symbol, &current_symbols);
-            if handle.version >= 2 {
+            if !file_changed && handle.version >= 2 {
                 let expected_parent = (handle.ps > 0).then_some((handle.ps, handle.pe));
                 if parent_range != expected_parent {
                     return Err(
@@ -455,12 +553,13 @@ pub fn resolve_symbol_read_handles(
             }
             Ok(SymbolReadLocator {
                 path: path.clone(),
-                start_line: handle.s,
-                end_line: handle.e,
-                file_sha256: handle.h,
-                node_id: handle.i,
+                start_line: current_start,
+                end_line: current_end,
+                file_sha256: digest.clone(),
+                node_id: if handle.version >= 3 { handle.j } else { handle.i },
                 expected_kind: (handle.version >= 2).then_some(handle.k),
                 parent_range,
+                relocated: file_changed,
             })
         })
         .collect()
@@ -5927,7 +6026,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn v2_symbol_handle_binds_kind_node_and_parent_range() {
+    fn v3_symbol_handle_binds_kind_node_and_parent_range() {
         let root = std::env::temp_dir().join(format!(
             "deveco-symbol-handle-v2-{}",
             uuid::Uuid::new_v4()
@@ -5946,7 +6045,7 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        assert!(handle.starts_with(SYMBOL_READ_HANDLE_V2_PREFIX), "{handle}");
+        assert!(handle.starts_with(SYMBOL_READ_HANDLE_V3_PREFIX), "{handle}");
         let locator = resolve_symbol_read_handle(&[root.clone()], &handle).unwrap();
         assert_eq!(locator.expected_kind.as_deref(), Some("method"));
         assert_eq!(locator.node_id.len(), 43);
@@ -5980,6 +6079,35 @@ mod tests {
         let locator = resolve_symbol_read_handle(&[root.clone()], &handle).unwrap();
         assert_eq!(locator.expected_kind, None);
         assert_eq!(locator.start_line, symbol.line);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn legacy_v2_symbol_handle_remains_readable() {
+        let root = std::env::temp_dir().join(format!(
+            "deveco-symbol-handle-v2-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("sample.rs"), "fn sample() {}\n").unwrap();
+        let symbol = index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "sample")
+            .unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let path = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(symbol.file.as_bytes());
+        let kind = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(symbol.kind.as_bytes());
+        let handle = format!(
+            "{SYMBOL_READ_HANDLE_V2_PREFIX}{}.{}.{}.{:x}.{:x}.0.0.{kind}.{path}",
+            root_read_fingerprint(&canonical_root),
+            file_sha256_base64(&root.join(&symbol.file)).unwrap(),
+            symbol_read_fingerprint(&symbol),
+            symbol.line,
+            symbol.end_line,
+        );
+        let locator = resolve_symbol_read_handle(&[root.clone()], &handle).unwrap();
+        assert_eq!(locator.expected_kind.as_deref(), Some("function"));
+        assert!(!locator.relocated);
         std::fs::remove_dir_all(&root).ok();
     }
 

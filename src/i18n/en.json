@@ -566,6 +566,10 @@
       "stale": {
         "title": "Structure location is stale",
         "detail": "An external tool changed the file after it was located, so the write was rejected. Reloading the structure provides a fresh baseline."
+      },
+      "relocated": {
+        "title": "Structure node relocated safely",
+        "detail": "The file had unrelated changes, while the target node's content, kind, and stable identity remained unchanged and unique. The edit was applied to the revalidated exact range."
       }
     },
     "switchModel": "Switch Model",
