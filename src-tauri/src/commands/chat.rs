@@ -4566,6 +4566,10 @@ async fn stream_chat_inner(
         }
         
         // 调用 assembler 组装消息序列（纯策略，无 IO）
+        let supports_image = {
+            let conn = state.0.lock().map_err(|e| e.to_string())?;
+            model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
+        };
         let assembled = KernelHistoryAssembler::assemble(&KernelHistoryInput {
             system_prompt: prompt_now,
             memo_replay: memo_replay.as_deref(),
@@ -4582,8 +4586,13 @@ async fn stream_chat_inner(
             correction_text: &correction_text,
             correction_hint: &correction_hint,
             inject_progress_check: false, // progress check already collected in user_injections
+            images: images.as_ref(),
+            images_attached,
+            protocol: &protocol,
+            supports_image,
         });
         let mut messages = assembled.messages;
+        images_attached = assembled.images_attached;
         
         // 重置续写/纠正状态（assembler 已消费）
         continuation_pending = false;
@@ -4629,96 +4638,6 @@ async fn stream_chat_inner(
                 history_limit,
                 context_budget,
             );
-        }
-        // 多模态：把尚未附加的图片（用户首轮上传 + 工具轮次 take_screenshot 产生的截图）
-        // 附加到本轮最后一条 user 消息（通常为刚注入的工具结果），按协议转换结构；
-        // 该消息已被转换过（content 为数组）时只追加新的 image part，不重复转换文本。
-        if let Some(imgs) = &images {
-            if imgs.len() > images_attached {
-                let new_imgs: Vec<&String> = imgs[images_attached..].iter().collect();
-                if !new_imgs.is_empty() {
-                    let last_user = messages.iter().rposition(|m| m["role"] == "user");
-                    let idx = match last_user {
-                        Some(i) => i,
-                        None => {
-                            messages.push(serde_json::json!({ "role": "user", "content": "" }));
-                            messages.len() - 1
-                        }
-                    };
-                    // 防御：模型不支持 image（含主模型失败后降级到纯文本备用模型）时跳过图片附加，
-                    // 仅在消息正文注明，避免向纯文本模型发送 image_url 被 Provider 拒绝
-                    let supports_image = {
-                        let conn = state.0.lock().map_err(|e| e.to_string())?;
-                        model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
-                    };
-                    if supports_image {
-                        let last = &mut messages[idx];
-                        match protocol.as_str() {
-                            "gemini" => {
-                                if !last["parts"].is_array() {
-                                    let text = last["content"].as_str().unwrap_or("").to_string();
-                                    last["parts"] =
-                                        serde_json::Value::Array(vec![serde_json::json!({ "text": text })]);
-                                }
-                                if let Some(parts) = last["parts"].as_array_mut() {
-                                    for img in &new_imgs {
-                                        if let Some((mime, data)) = parse_data_url(img) {
-                                            parts.push(serde_json::json!({
-                                                "inline_data": { "mime_type": mime, "data": data },
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                            "anthropic" => {
-                                if !last["content"].is_array() {
-                                    let text = last["content"].as_str().unwrap_or("").to_string();
-                                    last["content"] = serde_json::Value::Array(vec![serde_json::json!({ "type": "text", "text": text })]);
-                                }
-                                if let Some(parts) = last["content"].as_array_mut() {
-                                    for img in &new_imgs {
-                                        if let Some((mime, data)) = parse_data_url(img) {
-                                            parts.push(serde_json::json!({
-                                                "type": "image",
-                                                "source": { "type": "base64", "media_type": mime, "data": data },
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                if !last["content"].is_array() {
-                                    let text = last["content"].as_str().unwrap_or("").to_string();
-                                    last["content"] = serde_json::Value::Array(vec![serde_json::json!({ "type": "text", "text": text })]);
-                                }
-                                if let Some(parts) = last["content"].as_array_mut() {
-                                    for img in &new_imgs {
-                                        if let Some((mime, data)) = parse_data_url(img) {
-                                            parts.push(serde_json::json!({
-                                                "type": "image_url",
-                                                "image_url": { "url": format!("data:{mime};base64,{data}") },
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let note = format!(
-                            "（本轮 {} 张截图/图片因当前模型不支持图片输入未附带，模型无法查看图片内容）",
-                            new_imgs.len()
-                        );
-                        let last = &mut messages[idx];
-                        if last["content"].is_string() {
-                            let text = last["content"].as_str().unwrap_or("").to_string();
-                            last["content"] = serde_json::json!(format!("{text}\n{note}"));
-                        } else if let Some(parts) = last["content"].as_array_mut() {
-                            parts.push(serde_json::json!({ "type": "text", "text": note }));
-                        }
-                    }
-                    images_attached = imgs.len();
-                }
-            }
         }
         // 主动预算压缩：估算请求 token，超过模型窗口 85% 时不等待 400 报错，
         // 主动把最旧历史压缩为滚动摘要后重试（保住早期关键决策，避免大窗口模型下静默丢失）

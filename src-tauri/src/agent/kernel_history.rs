@@ -5,6 +5,7 @@
 //! Phase E 实现 `KernelHistoryAssembler` 接管 system/history/tool/注入/续写/纠正中段组装。
 
 use serde_json;
+use crate::agent::tools::parse_data_url;
 
 /// 历史行数上限按模型上下文预算动态计算：预算越大保留越多历史，但有上下限防止
 /// 小窗口模型撑爆上下文或大窗口模型历史过短丢失决策语境。
@@ -75,12 +76,19 @@ pub struct KernelHistoryInput<'a> {
 
     // 进度对照标记（adapter 根据 tools_since_progress 决定）
     pub inject_progress_check: bool,
+
+    // 多模态图片（E2：adapter 预读 supports_image，assembler 负责附加到消息）
+    pub images: Option<&'a Vec<String>>,
+    pub images_attached: usize,
+    pub protocol: &'a str,
+    pub supports_image: bool,
 }
 
-/// Assembler 输出：消息序列（adapter 直接发给 Provider）
+/// Assembler 输出：消息序列 + 更新后的图片计数（adapter 直接发给 Provider）
 #[derive(Clone, Debug)]
 pub struct KernelAssembled {
     pub messages: Vec<serde_json::Value>,
+    pub images_attached: usize,
 }
 
 /// KernelHistoryAssembler：纯策略消息组装器（无 IO，所有数据由 adapter 预读）。
@@ -221,7 +229,97 @@ impl KernelHistoryAssembler {
             messages.push(serde_json::json!({ "role": "user", "content": input.correction_hint }));
         }
 
-        KernelAssembled { messages }
+        // 14. Images attachment（E2：多模态图片附加到最后一轮 user 消息）
+        let mut images_attached = input.images_attached;
+        if let Some(imgs) = input.images {
+            if imgs.len() > images_attached {
+                let new_imgs: Vec<&String> = imgs[images_attached..].iter().collect();
+                if !new_imgs.is_empty() && input.supports_image {
+                    // 找到最后一条 user 消息
+                    let last_user = messages.iter().rposition(|m| m["role"] == "user");
+                    let idx = match last_user {
+                        Some(i) => i,
+                        None => {
+                            messages.push(serde_json::json!({ "role": "user", "content": "" }));
+                            messages.len() - 1
+                        }
+                    };
+                    
+                    let last = &mut messages[idx];
+                    match input.protocol {
+                        "gemini" => {
+                            if !last["parts"].is_array() {
+                                let text = last["content"].as_str().unwrap_or("").to_string();
+                                last["parts"] =
+                                    serde_json::Value::Array(vec![serde_json::json!({ "text": text })]);
+                            }
+                            if let Some(parts) = last["parts"].as_array_mut() {
+                                for img in &new_imgs {
+                                    if let Some((mime, data)) = parse_data_url(img) {
+                                        parts.push(serde_json::json!({
+                                            "inline_data": { "mime_type": mime, "data": data },
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        "anthropic" => {
+                            if !last["content"].is_array() {
+                                let text = last["content"].as_str().unwrap_or("").to_string();
+                                last["content"] = serde_json::Value::Array(vec![serde_json::json!({ "type": "text", "text": text })]);
+                            }
+                            if let Some(parts) = last["content"].as_array_mut() {
+                                for img in &new_imgs {
+                                    if let Some((mime, data)) = parse_data_url(img) {
+                                        parts.push(serde_json::json!({
+                                            "type": "image",
+                                            "source": { "type": "base64", "media_type": mime, "data": data },
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // OpenAI 及其他协议
+                            if !last["content"].is_array() {
+                                let text = last["content"].as_str().unwrap_or("").to_string();
+                                last["content"] = serde_json::Value::Array(vec![serde_json::json!({ "type": "text", "text": text })]);
+                            }
+                            if let Some(parts) = last["content"].as_array_mut() {
+                                for img in &new_imgs {
+                                    if let Some((mime, data)) = parse_data_url(img) {
+                                        parts.push(serde_json::json!({
+                                            "type": "image_url",
+                                            "image_url": { "url": format!("data:{mime};base64,{data}") },
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    images_attached = imgs.len();
+                } else if !new_imgs.is_empty() && !input.supports_image {
+                    // 模型不支持图片：在最后一条 user 消息添加说明文本
+                    let note = format!(
+                        "（本轮 {} 张截图/图片因当前模型不支持图片输入未附带，模型无法查看图片内容）",
+                        new_imgs.len()
+                    );
+                    let last_user = messages.iter().rposition(|m| m["role"] == "user");
+                    if let Some(idx) = last_user {
+                        let last = &mut messages[idx];
+                        if last["content"].is_string() {
+                            let text = last["content"].as_str().unwrap_or("").to_string();
+                            last["content"] = serde_json::json!(format!("{text}\n{note}"));
+                        } else if let Some(parts) = last["content"].as_array_mut() {
+                            parts.push(serde_json::json!({ "type": "text", "text": note }));
+                        }
+                    }
+                    images_attached = imgs.len();
+                }
+            }
+        }
+
+        KernelAssembled { messages, images_attached }
     }
 }
 
@@ -297,9 +395,14 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 2); // system + workflow directive
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["role"], "system");
         assert_eq!(assembled.messages[0]["content"], "You are a helpful assistant.");
         assert_eq!(assembled.messages[1]["role"], "system");
@@ -324,9 +427,14 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + memo + context + workflow
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "Core rules.");
         assert_eq!(assembled.messages[1]["content"], "Memory: user prefers Rust.");
         assert_eq!(assembled.messages[2]["content"], "Context: working on auth module.");
@@ -351,9 +459,14 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + ledger + plan
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "System.");
         assert_eq!(assembled.messages[1]["content"], "Workflow.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("Ledger:"));
@@ -385,10 +498,15 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // system + workflow + assistant (with reasoning)
         assert_eq!(assembled.messages.len(), 3);
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "System.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -420,9 +538,14 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + tool result as user
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -454,10 +577,15 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // Short pending action phrase (< 300 chars) should be replaced with placeholder
         assert_eq!(assembled.messages.len(), 3);
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -487,9 +615,14 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + tool result
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("[工具执行结果 - write_file]"));
@@ -518,9 +651,14 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + user injection
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -545,10 +683,15 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: true,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // system + workflow + plan + progress check
         assert_eq!(assembled.messages.len(), 4);
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("已批准任务计划"));
@@ -573,9 +716,14 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + assistant + user (continuation)
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -601,10 +749,15 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // Empty continuation_text means no continuation injected
         assert_eq!(assembled.messages.len(), 2); // system + workflow only
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
     }
@@ -627,9 +780,14 @@ mod tests {
             correction_text: "Assistant said '已调用工具' without actual call.",
             correction_hint: "（检测到你的回复中出现了...",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + assistant + user (correction)
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -656,9 +814,14 @@ mod tests {
             correction_text: "",
             correction_hint: "",
             inject_progress_check: false,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + compression summary
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("历史摘要"));
@@ -698,6 +861,10 @@ mod tests {
             correction_text: "Correction text.",
             correction_hint: "Correction hint.",
             inject_progress_check: true,
+            images: None,
+            images_attached: 0,
+            protocol: "",
+            supports_image: false,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
         // Expected order:
@@ -717,6 +884,7 @@ mod tests {
         // 13: correction assistant
         // 14: correction user
         assert_eq!(assembled.messages.len(), 15);
+        assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.messages[0]["content"], "System prompt.");
         assert_eq!(assembled.messages[1]["content"], "Memo.");
         assert_eq!(assembled.messages[2]["content"], "Context.");
