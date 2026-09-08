@@ -22,6 +22,7 @@ use crate::agent::agent_kernel::{
     run_tool_with_retry, retry_notice,
 };
 use crate::agent::kernel_loop::{KernelLoopGovernor, KernelToolBudgetGate, KernelRoundRouter, KernelRoundInput};
+use crate::agent::kernel_history::{KernelHistoryAssembler, KernelHistoryInput, HistoryRow, ToolResult, UserInjection};
 use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
 use crate::agent::tools::guards::is_cancelled;
 use crate::agent::tools::{has_pending_action_phrase, parse_data_url};
@@ -4463,51 +4464,135 @@ async fn stream_chat_inner(
         } else {
             &system_prompt_core
         };
-        let mut messages: Vec<serde_json::Value> =
-            vec![serde_json::json!({ "role": "system", "content": prompt_now.clone() })];
-        // 关键记忆回放注入（对齐 Qwen-Agent MemoAssistant）：从历史消息重放 memorize
-        // 工具调用重建键值状态，每轮作为 system 注入（量小成本低），模型无需专门
-        // 读取——状态与消息历史天然一致，滚动摘要/时间旅行后自动正确
-        if let Some(memo) = {
+        
+        // IO 层：预读所有数据供 assembler 拼装
+        let memo_replay = {
             let conn = state.0.lock().ok();
             conn.as_ref().and_then(|c| replay_memories(c, &conversation_id))
-        } {
-            messages.push(serde_json::json!({ "role": "system", "content": memo }));
-        }
-        // Context V2 每轮从 Durable Run、执行步骤、来源化事实和产物引用重建，
-        // 不依赖可能过期的自然语言摘要；读取失败时保持旧路径继续执行。
-        if let Some(hint) = state.0.lock().ok().and_then(|conn| {
+        };
+        
+        let context_hint = state.0.lock().ok().and_then(|conn| {
             crate::agent::context::load_context_v2(&conn, &conversation_id, context_budget)
                 .ok()
                 .and_then(|context| crate::agent::context::render_context_hint(&context))
-        }) {
-            messages.push(serde_json::json!({ "role": "system", "content": hint }));
-        }
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": workflow.directive(),
-        }));
-        // 任务账本（Ledger 协议）：从工具执行轨迹派生，每轮作为 system 消息注入（状态外部化，
-        // 防长任务“忘记已做过什么/卡在哪一步”）；首轮无执行轨迹时若有上次未完成任务账本
-        // （断点续跑）先注入旧账本，续跑期间按新执行轨迹更新；同时构造 ledger_now 供事件推送
-        let ledger_now = if !tool_runs.is_empty() || !last_model_text.is_empty() {
+        });
+        
+        // 任务账本（同时构造 ledger_now 供事件推送和快照保存）
+        let (ledger_hint, ledger_now) = if !tool_runs.is_empty() || !last_model_text.is_empty() {
             let ledger = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
-            messages.push(serde_json::json!({ "role": "system", "content": ledger.to_hint() }));
-            Some(ledger)
+            (Some(ledger.to_hint()), Some(ledger))
         } else if let Some(prev) = &prev_ledger {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!(
+            (
+                Some(format!(
                     "## 上一任务账本（任务未完成，本次继续推进；续跑期间按新执行轨迹更新）\n{}",
                     prev.to_hint()
-                ),
-            }));
-            Some(prev.clone())
+                )),
+                Some(prev.clone())
+            )
         } else {
-            None
+            (None, None)
         };
+        
+        // 历史行：从 DB 读取并转换为 HistoryRow
+        let history_rows = {
+            let conn = state.0.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT role, content, references_json, reasoning FROM messages
+                     WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0 AND hidden = 0
+                     ORDER BY created_at DESC LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![&conversation_id, history_limit as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?)),
+                )
+                .map_err(|e| e.to_string())?;
+            let raw_history: Vec<(String, String, Option<String>, Option<String>)> =
+                rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+            drop(stmt);
+            drop(conn);
+            
+            raw_history.into_iter().rev().map(|(role, text, refs_json, reasoning)| {
+                HistoryRow {
+                    role,
+                    content: text,
+                    references_json: refs_json,
+                    reasoning,
+                }
+            }).collect()
+        };
+        
+        // 本轮已执行的工具结果
+        let tool_results: Vec<ToolResult> = tool_runs.iter().enumerate().map(|(i, item)| {
+            let out_guard = crate::agent::tools::sanitize_tool_output(&item.output);
+            let limit = if i + 2 >= tool_runs.len() {
+                TOOL_RESULT_RECENT_LIMIT
+            } else {
+                TOOL_RESULT_OLD_LIMIT
+            };
+            let cnt = out_guard.chars().count();
+            let out_final: String = if cnt > limit {
+                let head: String = out_guard.chars().take(limit / 2).collect();
+                let tail_len = limit - limit / 2;
+                let tail: String = out_guard.chars().skip(cnt - tail_len).collect();
+                format!("{head}\n\u{2026}(输出过长，中段已省略，共 {cnt} 字符)\u{2026}\n{tail}")
+            } else {
+                out_guard
+            };
+            ToolResult {
+                tool: item.tool.clone(),
+                output: out_final,
+            }
+        }).collect();
+        
+        // 用户注入集合
+        let mut user_injections: Vec<UserInjection> = Vec::new();
+        for inst in &merged_instructions {
+            user_injections.push(UserInjection { content: inst.clone() });
+        }
+        for msg in crate::agent::session_ctx::drain_injected(&conversation_id) {
+            user_injections.push(UserInjection { content: msg });
+        }
+        if confirmed_plan.is_some() && tools_since_progress >= 3 {
+            tools_since_progress = 0;
+            user_injections.push(UserInjection { 
+                content: "（执行对照：请对照上方\"已批准任务计划\"，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）".to_string() 
+            });
+        }
+        if let Some(p) = replan_instruction.take() {
+            user_injections.push(UserInjection { content: p });
+        }
+        
+        // 调用 assembler 组装消息序列（纯策略，无 IO）
+        let assembled = KernelHistoryAssembler::assemble(&KernelHistoryInput {
+            system_prompt: prompt_now,
+            memo_replay: memo_replay.as_deref(),
+            context_hint: context_hint.as_deref(),
+            workflow_directive: &workflow.directive(),
+            ledger_hint: ledger_hint.as_deref(),
+            compression_summary: context_summary.as_deref(),
+            confirmed_plan: confirmed_plan.as_deref(),
+            history_rows,
+            tool_results,
+            user_injections,
+            continuation_text: &continuation_text,
+            continuation_reasoning_only,
+            correction_text: &correction_text,
+            correction_hint: &correction_hint,
+            inject_progress_check: false, // progress check already collected in user_injections
+        });
+        let mut messages = assembled.messages;
+        
+        // 重置续写/纠正状态（assembler 已消费）
+        continuation_pending = false;
+        continuation_reasoning_only = false;
+        correction_text = String::new();
+        correction_hint = String::new();
+        
         seam_count += 1;
-        // 账本实时推送（前端“任务账本”卡）：每轮刷新当前执行轨迹派生账本
+        // 账本实时推送（前端"任务账本"卡）：每轮刷新当前执行轨迹派生账本
         if let Some(ref ledger_now) = ledger_now {
             // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
             // 应用崩溃、系统重启或看门狗强杀时，下一次任务仍能从最近一次
@@ -4523,7 +4608,7 @@ async fn stream_chat_inner(
             );
         }
         // 会话快照（时间旅行）：每轮执行后保存状态锚点（消息 rowid + 账本 + 摘要），
-        // 用户可“回到此处”从历史决策点重新引导；无执行痕迹的首轮不保存。
+        // 用户可"回到此处"从历史决策点重新引导；无执行痕迹的首轮不保存。
         // 失败不阻塞主循环（快照是增值能力，丢一轮无碍）
         {
             let Ok(conn) = state.0.lock() else { return Err("数据库锁不可用".into()) };
@@ -4544,159 +4629,6 @@ async fn stream_chat_inner(
                 history_limit,
                 context_budget,
             );
-        }
-        // 早期对话滚动摘要（上下文超限时生成）：作为 system 消息注入，保住被裁剪历史的决策信息
-        if let Some(ref summary) = context_summary {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!("## 历史摘要（早期对话，已被压缩）\n{summary}"),
-            }));
-        }
-        // 已批准计划锚定：长任务每轮携带计划全文（防中途遗忘/偏离），除非用户明确要求调整
-        if let Some(ref plan) = confirmed_plan {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!(
-                    "## 已批准任务计划（必须严格遵守，不得擅自偏离或扩大范围）\n{plan}"),
-            }));
-        }
-        {
-            let conn = state.0.lock().map_err(|e| e.to_string())?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT role, content, references_json, reasoning FROM messages
-                     WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0 AND hidden = 0
-                     ORDER BY created_at DESC LIMIT ?2",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![&conversation_id, history_limit as i64],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?)),
-                )
-                .map_err(|e| e.to_string())?;
-            let mut history: Vec<(String, String, Option<String>, Option<String>)> =
-                rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-            history.reverse();
-            // 释放锁后注入引用（读文件 IO 不放锁内）；先释放 stmt 借用再解锁
-            drop(stmt);
-            drop(conn);
-            for (role, text, refs_json, reasoning) in history {
-                match role.as_str() {
-                    "assistant" => {
-                        let cleaned = crate::agent::tools::sanitize_markers(&text);
-                        // 未完话术污染：历史上只描述计划未执行工具的短消息不重复喂给模型，
-                        // 防止模型模仿“好的，我继续读取…”的话术风格（格式污染）
-                        if cleaned.chars().count() < 300 && has_pending_action_phrase(&cleaned) {
-                            messages.push(serde_json::json!({ "role": "user", "content": "（此前有一轮未执行的过渡回复，已省略）" }));
-                        } else {
-                            // DeepSeek 推理模型多轮合规（官方 thinking_mode 文档硬性要求）：
-                            // 携带 tools 参数的请求在后续所有请求中必须完整回传 reasoning_content，
-                            // 缺失会导致 400 报错或思考链断裂（Reasonix missing_reasoning_watch 同源）；
-                            // 未携带 tools 时服务端忽略该字段，回传双向安全。
-                            let mut m = serde_json::json!({ "role": "assistant", "content": cleaned });
-                            if let Some(r) = reasoning.as_deref() {
-                                if !r.trim().is_empty() {
-                                    m["reasoning_content"] = serde_json::json!(r);
-                                }
-                            }
-                            messages.push(m);
-                        }
-                    }
-                    "tool" => {
-                        // tool 消息入库格式：“工具名\n输出”，转 user 消息反馈给模型
-                        // 历史工具结果截断到 1200 字符：防长文件读取结果反复撑大上下文
-                        let (name, out) = text.split_once('\n').unwrap_or(("tool", &text));
-                        // 注入防护：外部内容中的指令性文字仅作参考（不影响入库原文）
-                        let out_guard = crate::agent::tools::sanitize_tool_output(out);
-                        let out_trimmed: String = out_guard.chars().take(1200).collect();
-                        let suffix = if out_guard.chars().count() > 1200 { "\n…(历史工具结果已截断)" } else { "" };
-                        messages.push(serde_json::json!({ "role": "user", "content": format!("[工具执行结果 - {name}]\n{out_trimmed}{suffix}") }));
-                    }
-                    _ => {
-                        // @ 引用重放：历史 user 消息带 references_json 时注入对应内容
-                        // （文件内容 / conv: 会话摘要），不阻塞发送；本循环已在锁外运行，
-                        // conv: 会话摘要的 DB 查询现场取锁（点查开销极小）
-                        let injected = {
-                            let conn = state.0.lock().map_err(|e| e.to_string())?;
-                            inject_references(&conn, &project_path, &text, refs_json.as_deref())?
-                        };
-                        messages.push(serde_json::json!({ "role": "user", "content": injected }));
-                    }
-                }
-            }
-        }
-        // 本轮已执行的工具结果（注入防护：外部内容中的指令性文字仅作参考；
-        // 超长输出头尾截断，仅最近两个保留较多细节，更早的与历史同口径截断，
-        // 防长工具输出在多轮循环中反复重新注入、把上下文越撑越大）
-        let runs_len = tool_runs.len();
-        for (i, item) in tool_runs.iter().enumerate() {
-            let out_guard = crate::agent::tools::sanitize_tool_output(&item.output);
-            let limit = if i + 2 >= runs_len {
-                TOOL_RESULT_RECENT_LIMIT
-            } else {
-                TOOL_RESULT_OLD_LIMIT
-            };
-            let cnt = out_guard.chars().count();
-            let out_final: String = if cnt > limit {
-                let head: String = out_guard.chars().take(limit / 2).collect();
-                let tail_len = limit - limit / 2;
-                let tail: String = out_guard.chars().skip(cnt - tail_len).collect();
-                format!("{head}\n…(输出过长，中段已省略，共 {cnt} 字符)…\n{tail}")
-            } else {
-                out_guard
-            };
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "[工具执行结果 - {}]\n{out_final}\n\n请根据以上结果继续，若失败请分析原因并给出修复建议。",
-                    item.tool
-                ),
-            }));
-        }
-        // 本轮并入的用户挂起指令（“发送到 Agent”）：追加为 user 消息，与当前任务一并处理
-        for inst in &merged_instructions {
-            messages.push(serde_json::json!({ "role": "user", "content": inst }));
-        }
-        // 异步事件注入（后台任务完成等）：drain 后作为 user 消息反馈给模型（取出即清空）
-        for msg in crate::agent::session_ctx::drain_injected(&conversation_id) {
-            messages.push(serde_json::json!({ "role": "user", "content": msg }));
-        }
-        // 计划执行进度对照：每执行 3 个工具注入一次“对照计划汇报进度”，保持执行不偏离
-        if confirmed_plan.is_some() && tools_since_progress >= 3 {
-            tools_since_progress = 0;
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": "（执行对照：请对照上方“已批准任务计划”，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）",
-            }));
-        }
-        // 连续失败 replan 提示：给模型一次重新规划的机会（只注入一次，仍失败走终止逻辑）
-        if let Some(p) = replan_instruction.take() {
-            messages.push(serde_json::json!({ "role": "user", "content": p }));
-        }
-        // 输出截断续写：把上轮被截断的内容与“请继续”指令加入本轮请求；
-        // 正文为空仅思考非空时，提示直接输出结论/工具调用（不再思考），防推理模型反复耗尽预算空转
-        if continuation_pending {
-            messages.push(serde_json::json!({ "role": "assistant", "content": continuation_text }));
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": if continuation_reasoning_only {
-                    "（系统提示：你的上一条回复未完成（思考过长或网络中断），本轮请不要再输出思考过程，直接给出最终结论；若任务未完成，直接输出下一步要执行的工具调用标记。）"
-                } else {
-                    "（你的上一条回复未完整送达（被截断或网络中断），请直接从断点继续完成剩余内容，不要重复已输出的部分。）"
-                },
-            }));
-            continuation_pending = false;
-            continuation_reasoning_only = false;
-        }
-        // 纠正注入（假调用/未完话术/空响应重试）：把上轮被纠正的回复与纠正提示加入本轮请求
-        if !correction_text.is_empty() || !correction_hint.is_empty() {
-            if !correction_text.is_empty() {
-                messages.push(serde_json::json!({ "role": "assistant", "content": correction_text }));
-            }
-            messages.push(serde_json::json!({ "role": "user", "content": correction_hint }));
-            correction_text = String::new();
-            correction_hint = String::new();
         }
         // 多模态：把尚未附加的图片（用户首轮上传 + 工具轮次 take_screenshot 产生的截图）
         // 附加到本轮最后一条 user 消息（通常为刚注入的工具结果），按协议转换结构；
