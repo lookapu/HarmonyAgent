@@ -642,14 +642,14 @@ export function TerminalPanel({
     tab,
   ])
   const statusColor: Record<TerminalEntry['status'], string> = {
-    running: 'text-[#58a6ff]',
-    done: 'text-[#3fb950]',
-    error: 'text-[#f85149]',
+    running: 'text-[var(--accent)]',
+    done: 'text-[var(--success)]',
+    error: 'text-[var(--danger)]',
   }
   const statusDot: Record<TerminalEntry['status'], string> = {
-    running: 'bg-[#58a6ff] animate-pulse',
-    done: 'bg-[#3fb950]',
-    error: 'bg-[#f85149]',
+    running: 'bg-[var(--accent)] animate-pulse',
+    done: 'bg-[var(--success)]',
+    error: 'bg-[var(--danger)]',
   }
   const runningNow = entries.filter((e) => e.status === 'running').length
   return (

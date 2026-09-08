@@ -40,9 +40,9 @@ export function DiffText({ text }: { text: string }) {
     <>
       {text.split('\n').map((line, i) => {
         let cls = ''
-        if (line.startsWith('+') && !line.startsWith('+++')) cls = 'text-[#3fb950]'
-        else if (line.startsWith('-') && !line.startsWith('---')) cls = 'text-[#f85149]'
-        else if (line.startsWith('@@')) cls = 'text-[#58a6ff]'
+        if (line.startsWith('+') && !line.startsWith('+++')) cls = 'text-[var(--success)]'
+        else if (line.startsWith('-') && !line.startsWith('---')) cls = 'text-[var(--danger)]'
+        else if (line.startsWith('@@')) cls = 'text-[var(--accent)]'
         return (
           <div key={i} className={cls}>
             {line || '\u00A0'}
