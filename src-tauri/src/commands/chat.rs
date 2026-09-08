@@ -21,7 +21,7 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
     run_tool_with_retry, retry_notice,
 };
-use crate::agent::kernel_loop::{KernelLoopGovernor, KernelToolBudgetGate};
+use crate::agent::kernel_loop::{KernelLoopGovernor, KernelToolBudgetGate, KernelRoundRouter, KernelRoundInput};
 use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
 use crate::agent::tools::guards::is_cancelled;
 use crate::agent::tools::{has_pending_action_phrase, parse_data_url};
@@ -4215,25 +4215,18 @@ async fn stream_chat_inner(
     let mut replan_given = false;
     let mut replan_instruction: Option<String> = None;
     // 输出截断续写状态：上轮输出被 max_tokens 截断时，下轮请求追加“请继续”指令（防无限续写有上限）
-    let mut continuation_rounds = 0;
     let mut continuation_pending = false;
     // 截断续写时上轮“正文为空但思考非空”（推理模型 reasoning 耗尽预算被截断）：
     // 续写指令改为要求直接输出结论/工具调用，避免再次思考耗尽预算空转
     let mut continuation_reasoning_only = false;
-    // 空响应重试计数：模型输出为空（无正文无工具标记）时的重试次数
-    let mut empty_rounds = 0;
-    // 连接中断自动续写计数：流式中途无数据超时后的“请继续”重试次数（上限 MAX_INTERRUPT_RETRY_ROUNDS）
-    let mut interrupted_rounds = 0;
-    // 产出前中断重放计数：0 产出中断时冻结请求原样重发（上限 MAX_STREAM_REPLAYS）
-    let mut stream_replays = 0;
+    // 轮级路由：使用共享 KernelRoundRouter（空轮/冻结重放/中断续写/截断续写/假调用纠正）
+    let mut round_router = KernelRoundRouter::new();
     // 工具循环检测：使用共享 KernelLoopGovernor（对齐 qwen-code LoopDetectionService 轻量版）
     let mut loop_governor = KernelLoopGovernor::new();
     let mut continuation_text = String::new();
     // 多模态图片附加计数：已附加到请求的图片数（用户首轮上传 + 工具轮次 take_screenshot 产生的截图），
     // 每轮只附加新增部分到最新 user 消息（通常是刚注入的工具结果），避免重复注入历史图
     let mut images_attached: usize = 0;
-    // 叙述式假调用纠正次数（防死循环）：模型只写“已调用工具”叙述不输出标记时注入纠正提示
-    let mut fake_corrections = 0;
     // 未完话术纠正次数（防死循环）：模型承诺“还需读取/继续查看”但未输出标记时注入纠正提示
     let mut pending_action_corrections = 0;
     // 行动承诺假完成纠正次数（防死循环）：模型宣布开始开发/创建/实现或仅输出方案计划但未输出标记时注入纠正提示
@@ -4286,7 +4279,7 @@ async fn stream_chat_inner(
     // 工具循环是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾；
     // 声明在循环外：主流程据此判定任务是否被护栏强制收尾（强制收尾时账本需保留））
     let mut exhausted = false;
-    loop {
+    'outer: loop {
         if let Ok(conn) = state.0.lock() {
             let _ = crate::agent::runtime::transition(
                 &conn,
@@ -6166,80 +6159,71 @@ async fn stream_chat_inner(
         if completion_reviews > 0 && is_completion_confirmation(&text) {
             break;
         }
-        // 空响应兜底：模型输出为空（无正文无工具标记，服务端静默失败/异常截断）时不进入
-        // 续写循环（空文本续写只会反复拿到空响应，白等数十秒），重试上限后收尾并明确提示。
-        // 注意：截断（truncated）与连接中断（interrupted）导致的空正文不在此列——
-        // 前者是预算问题、后者是网络问题，均走下方续写分支处理
-        if text.trim().is_empty() && !outcome.truncated && !outcome.interrupted {
-            empty_rounds += 1;
-            if empty_rounds >= MAX_EMPTY_ROUNDS {
-                full.push_str(
-                    "\n\n> ⚠️ 模型连续多次未输出内容（可能服务端异常），任务已中止；可重新发送指令重试。",
-                );
-                break;
+        // 轮级路由：使用共享 KernelRoundRouter（空轮/冻结重放/中断续写/截断续写/假调用纠正）
+        let router_input = KernelRoundInput {
+            text: &text,
+            has_reasoning: !outcome.reasoning.trim().is_empty(),
+            truncated: outcome.truncated,
+            interrupted: outcome.interrupted,
+            has_native_tool_calls: !outcome.tool_calls.is_empty(),
+        };
+        let actions = round_router.route(&router_input);
+        let mut router_handled = false;
+        for action in actions {
+            match action {
+                crate::agent::kernel_loop::KernelRoundAction::RetryEmpty { hint } => {
+                    correction_text = String::new();
+                    correction_hint = hint;
+                    router_handled = true;
+                    continue 'outer;
+                }
+                crate::agent::kernel_loop::KernelRoundAction::StopEmpty { note } => {
+                    full.push_str(&note);
+                    router_handled = true;
+                    break 'outer;
+                }
+                crate::agent::kernel_loop::KernelRoundAction::ReplayFrozen => {
+                    crate::utils::logger::log_event(
+                        "stream_replay",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "attempt": round_router.counters().1,
+                            "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
+                        }),
+                    );
+                    router_handled = true;
+                    continue 'outer;
+                }
+                crate::agent::kernel_loop::KernelRoundAction::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
+                    continuation_pending = true;
+                    continuation_text = ct;
+                    continuation_reasoning_only = reasoning_only;
+                    router_handled = true;
+                    continue 'outer;
+                }
+                crate::agent::kernel_loop::KernelRoundAction::InterruptedNote { note } => {
+                    full.push_str(&note);
+                    // 落穿：不设置 router_handled，继续评估后续 UI 专属门
+                }
+                crate::agent::kernel_loop::KernelRoundAction::ContinueTruncated { continuation_text: ct, reasoning_only } => {
+                    continuation_pending = true;
+                    continuation_text = ct;
+                    continuation_reasoning_only = reasoning_only;
+                    router_handled = true;
+                    continue 'outer;
+                }
+                crate::agent::kernel_loop::KernelRoundAction::CorrectFakeCall { correction_text: ct, hint } => {
+                    correction_text = ct;
+                    correction_hint = hint;
+                    router_handled = true;
+                    continue 'outer;
+                }
+                crate::agent::kernel_loop::KernelRoundAction::Proceed => {
+                    // 无特殊动作：继续后续 UI 专属门
+                }
             }
-            correction_text = String::new();
-            correction_hint =
-                "（系统提示：你上一轮未输出任何内容，请重新生成完整回复；若任务已完成请直接给出结论，若需继续请输出工具调用标记。）"
-                    .to_string();
-            continue;
         }
-        // 产出前中断重放（冻结请求）：流在输出任何可见内容（正文/工具调用）之前就中断
-        // （服务端断流/代理重置）时，直接以完全相同的 payload 重发原始请求——
-        // 模型无需重新思考、prompt 缓存不失效（对齐 DeepSeek-Reasonix 冻结请求重放）。
-        // 思考链（reasoning）产出不阻塞重放（对齐 qwen-code #7832）：reasoning 是瞬态内容、
-        // 不进入对话历史，重放不会重复任何可见输出；且思考模型在思考阶段往往耗时数分钟，
-        // 正是网关关闭长 SSE 连接的高发期——此时冻结重放比“请继续”续写更可靠
-        // （续写依赖服务端保留会话状态，断流后可能失效）。已产出正文/工具调用的中断
-        // 走下方续写分支（保留已收内容从断点继续）。重放时 messages 自上次请求以来
-        // 未被修改，payload 与首次请求一致。
-        if outcome.interrupted
-            && text.trim().is_empty()
-            && outcome.tool_calls.is_empty()
-            && stream_replays < MAX_STREAM_REPLAYS
-        {
-            stream_replays += 1;
-            crate::utils::logger::log_event(
-                "stream_replay",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "attempt": stream_replays,
-                    "total": MAX_STREAM_REPLAYS,
-                }),
-            );
-            continue;
-        }
-        // 连接中断自动续写：流式无数据超时（代理悬挂/服务端异常）时保留已收内容，
-        // 自动重发“请继续”让模型从断点续写；连续多次仍中断则收尾并明确提示（不静默）
-        if outcome.interrupted && interrupted_rounds < MAX_INTERRUPT_RETRY_ROUNDS {
-            interrupted_rounds += 1;
-            continuation_pending = true;
-            continuation_text = crate::agent::tools::strip_tool_calls(&text);
-            continuation_reasoning_only = text.trim().is_empty() && !outcome.reasoning.trim().is_empty();
-            continue;
-        }
-        if outcome.interrupted {
-            full.push_str("\n\n> ⚠️ 网络连续中断（自动续写多次仍未恢复），已保留以上内容；可重新发送指令重试。");
-        }
-        // 输出被截断且本轮无工具调用：自动续写（保留已有内容，从截断处继续），
-        // 避免“输出到一半就停止”；超过续写上限或截断时无内容（异常）则按正常结束收尾。
-        // 正文为空但思考非空（推理模型 reasoning 耗尽预算）：标记为 thinking-only 续写，
-        // 下一轮请求改为要求直接输出结论/工具调用，不再思考（见续写消息构造处）
-        if outcome.truncated && continuation_rounds < MAX_CONTINUATION_ROUNDS {
-            continuation_rounds += 1;
-            continuation_pending = true;
-            continuation_text = crate::agent::tools::strip_tool_calls(&text);
-            continuation_reasoning_only = text.trim().is_empty() && !outcome.reasoning.trim().is_empty();
-            continue;
-        }
-        // 防“叙述式假调用”静默结束：模型正文出现“已调用工具/工具调用记录”等叙述但未输出
-        // 【TOOL】标记（历史格式污染导致模型模仿），不结束任务，注入纠正提示继续循环
-        if (text.contains("已调用工具") || text.contains("工具调用记录"))
-            && fake_corrections < MAX_FAKE_CALL_CORRECTIONS
-        {
-            fake_corrections += 1;
-            correction_text = crate::agent::tools::strip_tool_calls(&text);
-            correction_hint = "（检测到你的回复中出现了“已调用工具/工具调用记录”等叙述，但未输出工具调用标记，系统未执行任何工具。如需调用工具，请输出【TOOL|工具名|JSON参数】标记行，一行一个；若任务已完成，请直接给出结论总结，不要写“已调用工具”之类的叙述。）".to_string();
+        if router_handled {
             continue;
         }
         // 防“未完话术”静默结束：模型承诺“还需读取/继续查看”等下一步动作但未输出【TOOL】
