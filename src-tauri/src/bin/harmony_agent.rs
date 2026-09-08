@@ -227,7 +227,7 @@ mod tests {
         std::fs::write(&task_path, serde_json::json!({
             "schema_version": 1, "task_id": "cli__smoke", "suite": "cli-smoke",
             "problem_statement": "fix a.txt", "repo": { "url": "file:///repo", "base_commit": base },
-            "limits": { "wall_time_seconds": 10, "max_steps": 5, "max_cost_cny": 0.0, "network": "none" },
+            "limits": { "wall_time_seconds": 10, "max_steps": 5, "max_tool_calls": 20, "max_cost_cny": 0.0, "network": "none" },
             "grader": { "kind": "command", "command": ["grep", "-q", "fixed", "a.txt"], "timeout_seconds": 5 },
             "artifacts": []
         }).to_string()).unwrap();

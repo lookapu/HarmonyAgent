@@ -469,6 +469,12 @@ pub async fn run_trial(
             driver_outcome.steps, task.limits.max_steps
         ));
     }
+    if driver_outcome.tool_calls > task.limits.max_tool_calls {
+        return Err(format!(
+            "AgentDriver 超过 max_tool_calls：{} > {}",
+            driver_outcome.tool_calls, task.limits.max_tool_calls
+        ));
+    }
     if driver_outcome.cost_cny > task.limits.max_cost_cny {
         return Err(format!(
             "AgentDriver 超过 max_cost_cny：{:.4} > {:.4}",
@@ -614,6 +620,25 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    struct OverBudgetDriver;
+
+    impl AsyncAgentDriver for OverBudgetDriver {
+        fn run_async<'a>(
+            &'a self,
+            _task: &'a EvalTask,
+            _workspace: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Result<AgentDriverOutcome, AgentDriverError>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Ok(AgentDriverOutcome {
+                    steps: 1,
+                    tool_calls: 2,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
     fn git(dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .args(args)
@@ -642,6 +667,7 @@ mod tests {
             limits: EvalLimits {
                 wall_time_seconds: 60,
                 max_steps: 10,
+                max_tool_calls: 100,
                 max_cost_cny: 0.0,
                 network: "none".into(),
             },
@@ -742,6 +768,26 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("request_timeout_seconds"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn run_trial_rejects_driver_outcome_over_tool_call_budget() {
+        let (source, base) = source_repo_with_base();
+        let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
+        task.repo.base_commit = base;
+        task.limits.max_tool_calls = 1;
+        let output_dir = std::env::temp_dir().join(format!(
+            "deveco-eval-tool-budget-out-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let error = run_trial(&task, &source, &output_dir, &OverBudgetDriver, &run_config())
+            .await
+            .unwrap_err();
+        assert!(error.contains("超过 max_tool_calls"), "{error}");
+
+        std::fs::remove_dir_all(output_dir).ok();
+        std::fs::remove_dir_all(source).ok();
     }
 
     #[tokio::test]

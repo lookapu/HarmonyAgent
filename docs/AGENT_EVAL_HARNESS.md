@@ -63,6 +63,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --features eval-cli --bin harmony
   "limits": {
     "wall_time_seconds": 1800,
     "max_steps": 200,
+    "max_tool_calls": 400,
     "max_cost_cny": 20.0,
     "network": "none"
   },
@@ -75,7 +76,9 @@ cargo run --manifest-path src-tauri/Cargo.toml --features eval-cli --bin harmony
 }
 ```
 
-Task 文件不能携带宿主命令或凭据。外部数据集 adapter 必须把 grader 映射到受信任的本地注册表或固定镜像，而不是直接执行下载数据中的任意字符串。
+`max_tool_calls` 是单个 trial 中模型请求的工具调用总量硬上限，包含策略拒绝和循环治理拦截；
+旧的 schema v1 文件省略该字段时使用 400。Task 文件不能携带宿主命令或凭据。外部数据集
+adapter 必须把 grader 映射到受信任的本地注册表或固定镜像，而不是直接执行下载数据中的任意字符串。
 
 ## 4. 输出目录
 

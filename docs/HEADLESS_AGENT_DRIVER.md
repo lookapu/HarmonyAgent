@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—G 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略与循环治理组件，单一 run-loop executor 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—H 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略与循环治理组件，单一 run-loop executor 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -417,6 +417,11 @@ pricing_version
 CLI 传给 builtin driver，实际生效值取它与剩余 wall time 的较小值并写入
 `trial_started`/`driver_started` 事件；缺省时使用内置 60 秒默认值。
 
+Task schema v1 还支持可选 `limits.max_tool_calls`（缺省 400，合法范围 1—10,000）。该预算
+统计模型提出的全部工具调用，包括被权限策略拒绝、被循环治理拦截和实际执行的调用；下一次
+调用越界时写入 `agent_tool_budget_stop`，以 `max_tool_calls_exceeded` 收尾，不再等待 round
+或重复调用硬上限触发。
+
 Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不能只依赖外层
 `run_trial`，因为同步阻塞会绕过 wall-time 保护。
 
@@ -484,6 +489,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | E | 消息组装入核（E1 中段 → E2 图片 → E3 压缩决策） | ✅ COMPLETED |
 | F | headless 闭合防护缺口（governor/router 集成 + ScriptedClient 请求记录 + 5 个集成测试） | ✅ COMPLETED |
 | G | 差分测试 + 文档收口（2 个差分测试验证 router 黄金轨迹与 driver 事件序列一致） | ✅ COMPLETED |
+| H | 独立工具调用预算 + reasoning 流回放 + UI/headless 共用续写指令 | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -493,7 +499,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - ScriptedClient 记录每请求 messages，为后续差分测试提供基础
 - 历史 `@文件/@会话` 引用在进入纯策略 assembler 前展开；主动压缩后立即重组本轮请求，并保留尚未发送的一次性注入、图片与续写状态
 - 历史工具输出在内核侧执行 1,200 字符上限，避免 adapter 迁移再次取消上下文护栏
-- Rust lib 共 915 项：907 通过、8 项按环境条件忽略；前端 113 项通过
+- headless 保留流式 `reasoning_content`；UI/headless 的 reasoning-only 截断都会直接要求输出结论，不再漏掉续写指令、重复半截正文或继续消耗推理预算
+- Rust lib 共 921 项：913 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 

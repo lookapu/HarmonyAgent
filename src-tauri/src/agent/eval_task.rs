@@ -10,6 +10,8 @@ pub const EVAL_TASK_SCHEMA_VERSION: u32 = 1;
 const MAX_PROBLEM_STATEMENT_BYTES: usize = 64 * 1024;
 const MAX_WALL_TIME_SECONDS: u64 = 24 * 3600;
 const MAX_STEPS: u64 = 10_000;
+const MAX_TOOL_CALLS: u64 = 10_000;
+const DEFAULT_MAX_TOOL_CALLS: u64 = 400;
 const MAX_GRADER_TIMEOUT_SECONDS: u64 = 24 * 3600;
 const MAX_ARTIFACTS: usize = 64;
 
@@ -38,8 +40,15 @@ pub struct EvalRepo {
 pub struct EvalLimits {
     pub wall_time_seconds: u64,
     pub max_steps: u64,
+    /// 模型请求的工具调用总量硬上限；包含被策略拒绝及被循环治理拦截的调用。
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls: u64,
     pub max_cost_cny: f64,
     pub network: String,
+}
+
+fn default_max_tool_calls() -> u64 {
+    DEFAULT_MAX_TOOL_CALLS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +128,11 @@ fn validate_limits(limits: &EvalLimits) -> Result<(), String> {
     }
     if limits.max_steps == 0 || limits.max_steps > MAX_STEPS {
         return Err(format!("limits.max_steps 必须在 1..={MAX_STEPS} 之间"));
+    }
+    if limits.max_tool_calls == 0 || limits.max_tool_calls > MAX_TOOL_CALLS {
+        return Err(format!(
+            "limits.max_tool_calls 必须在 1..={MAX_TOOL_CALLS} 之间"
+        ));
     }
     if !limits.max_cost_cny.is_finite() || limits.max_cost_cny < 0.0 {
         return Err("limits.max_cost_cny 必须是非负有限数".into());
@@ -223,6 +237,7 @@ mod tests {
         assert_eq!(task.task_id, "smoke__example-1");
         assert_eq!(task.grader.command, vec!["npm", "test"]);
         assert_eq!(task.limits.network, "none");
+        assert_eq!(task.limits.max_tool_calls, DEFAULT_MAX_TOOL_CALLS);
     }
 
     #[test]
@@ -255,6 +270,24 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(&valid_task()).unwrap();
         value["artifacts"] = serde_json::json!(["../../etc/passwd"]);
         assert!(parse_eval_task(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn validates_explicit_tool_call_budget() {
+        let mut value: serde_json::Value = serde_json::from_str(&valid_task()).unwrap();
+        value["limits"]["max_tool_calls"] = serde_json::json!(25);
+        assert_eq!(
+            parse_eval_task(&value.to_string())
+                .unwrap()
+                .limits
+                .max_tool_calls,
+            25
+        );
+
+        for invalid in [0, MAX_TOOL_CALLS + 1] {
+            value["limits"]["max_tool_calls"] = serde_json::json!(invalid);
+            assert!(parse_eval_task(&value.to_string()).is_err());
+        }
     }
 
     #[test]

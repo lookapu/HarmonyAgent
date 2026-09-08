@@ -34,6 +34,7 @@ pub fn run_command_grader(grader: &EvalGrader, workspace: &Path) -> Result<Grade
         limits: crate::agent::eval_task::EvalLimits {
             wall_time_seconds: 60,
             max_steps: 1,
+            max_tool_calls: 10,
             max_cost_cny: 0.0,
             network: "none".into(),
         },

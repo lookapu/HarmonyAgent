@@ -23,6 +23,16 @@ pub fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
     crate::utils::tokenizer::estimate_messages_tokens(messages)
 }
 
+/// 输出中断/截断后的统一续写指令。UI 与 headless 必须使用同一文案，避免推理模型在
+/// reasoning-only 截断后继续消耗预算输出思考，也避免 adapter 把半截正文重复塞进 user 消息。
+pub fn continuation_instruction(reasoning_only: bool) -> &'static str {
+    if reasoning_only {
+        "（系统提示：你的上一条回复未完成（思考过长或网络中断），本轮请不要再输出思考过程，直接给出最终结论；若任务未完成，直接输出下一步要执行的工具调用标记。）"
+    } else {
+        "（你的上一条回复未完整送达（被截断或网络中断），请直接从断点继续完成剩余内容，不要重复已输出的部分。）"
+    }
+}
+
 // ── 历史行输入结构（adapter 从 DB 读出后传入，IO 留在 adapter） ───────────────────────
 
 /// 历史行：adapter 从 messages 表读出后构造（role/content/references_json/reasoning）
@@ -227,15 +237,13 @@ impl KernelHistoryAssembler {
         }
 
         // 12. Continuation（输出截断续写：把上轮被截断的内容与"请继续"指令加入本轮）
-        if !input.continuation_text.is_empty() {
-            messages.push(serde_json::json!({ "role": "assistant", "content": input.continuation_text }));
+        if !input.continuation_text.is_empty() || input.continuation_reasoning_only {
+            if !input.continuation_text.is_empty() {
+                messages.push(serde_json::json!({ "role": "assistant", "content": input.continuation_text }));
+            }
             messages.push(serde_json::json!({
                 "role": "user",
-                "content": if input.continuation_reasoning_only {
-                    "（系统提示：你的上一条回复未完成（思考过长或网络中断），本轮请不要再输出思考过程，直接给出最终结论；若任务未完成，直接输出下一步要执行的工具调用标记。）"
-                } else {
-                    "（你的上一条回复未完整送达（被截断或网络中断），请直接从断点继续完成剩余内容，不要重复已输出的部分。）"
-                },
+                "content": continuation_instruction(input.continuation_reasoning_only),
             }));
         }
 
@@ -386,6 +394,14 @@ mod tests {
         })];
         let est = estimate_tokens(&msgs);
         assert!(est > 0, "expected nonzero token estimate for Chinese content");
+    }
+
+    #[test]
+    fn continuation_instruction_prevents_repeated_reasoning() {
+        assert!(continuation_instruction(true).contains("不要再输出思考过程"));
+        assert!(continuation_instruction(true).contains("直接给出最终结论"));
+        assert!(continuation_instruction(false).contains("从断点继续"));
+        assert!(continuation_instruction(false).contains("不要重复"));
     }
 
     #[test]
@@ -837,12 +853,17 @@ mod tests {
             history_limit: 40,
         };
         let assembled = KernelHistoryAssembler::assemble(&input);
-        // Empty continuation_text means no continuation injected
-        assert_eq!(assembled.messages.len(), 2); // system + workflow only
+        // reasoning-only 截断没有正文断点，但仍必须注入“直接给结论”指令。
+        assert_eq!(assembled.messages.len(), 3); // system + workflow + continuation instruction
         assert_eq!(assembled.images_attached, 0);
         assert_eq!(assembled.compress, false);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
+        assert_eq!(assembled.messages[2]["role"], "user");
+        assert_eq!(
+            assembled.messages[2]["content"],
+            continuation_instruction(true)
+        );
     }
 
     #[test]

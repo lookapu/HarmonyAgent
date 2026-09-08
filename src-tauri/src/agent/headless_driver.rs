@@ -12,6 +12,7 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_SILENT_TIMEOUT,
 };
 use crate::agent::kernel_loop::{KernelLoopGovernor, KernelRoundAction, KernelRoundInput, KernelRoundRouter};
+use crate::agent::kernel_history::continuation_instruction;
 use crate::agent::eval_report::ModelInfo;
 use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
 use crate::agent::eval_task::EvalTask;
@@ -333,6 +334,7 @@ where
     let mut sse = KernelSseBuffer::default();
     let mut accumulator = KernelStreamAccumulator::default();
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut finish = KernelStreamFinish::None;
     let mut warnings = Vec::new();
     let mut done_marker = false;
@@ -350,6 +352,7 @@ where
                             &mut accumulator,
                             &mut governor,
                             &mut content,
+                            &mut reasoning,
                             &mut finish,
                             &mut warnings,
                             &line,
@@ -384,6 +387,7 @@ where
                 &mut accumulator,
                 &mut governor,
                 &mut content,
+                &mut reasoning,
                 &mut finish,
                 &mut warnings,
                 &line,
@@ -409,6 +413,9 @@ where
         "role": "assistant",
         "content": if content.is_empty() { Value::Null } else { Value::String(content.clone()) },
     });
+    if !reasoning.is_empty() {
+        provider_message["reasoning_content"] = Value::String(reasoning);
+    }
     if !tool_calls.is_empty() {
         provider_message["tool_calls"] = Value::Array(
             tool_calls
@@ -440,6 +447,7 @@ fn ingest_openai_sse_line(
     accumulator: &mut KernelStreamAccumulator,
     governor: &mut KernelStreamGovernor,
     content: &mut String,
+    reasoning: &mut String,
     finish: &mut KernelStreamFinish,
     warnings: &mut Vec<String>,
     line: &str,
@@ -472,6 +480,15 @@ fn ingest_openai_sse_line(
             return Err(FriendlyError::new(
                 ErrorKind::Network,
                 "Provider 流式正文超过 8 Mi 字符上限",
+            ));
+        }
+    }
+    if let Some(delta) = frame.reasoning {
+        reasoning.push_str(&delta);
+        if reasoning.len() > MAX_RESPONSE_BYTES {
+            return Err(FriendlyError::new(
+                ErrorKind::Network,
+                "Provider 流式思考内容超过 8 Mi 字符上限",
             ));
         }
     }
@@ -535,6 +552,8 @@ impl HeadlessAgentDriver {
         let mut stopped_by_budget = false;
         let mut stopped_by_acceptance = false;
         let mut stopped_by_loop = false;
+        let mut stopped_by_tool_budget = false;
+        let mut attempted_tool_calls = 0u64;
         
         // Phase F：headless 接入循环治理与轮级路由（纯策略，UI 共用）
         let mut loop_governor = KernelLoopGovernor::new();
@@ -589,7 +608,12 @@ impl HeadlessAgentDriver {
             }
             
             // Phase F：轮级路由——在 stop-candidate 前判定空轮/冻结重放/中断续写/截断续写/假调用纠正
-            let has_reasoning = turn.provider_message.get("reasoning").is_some();
+            let has_reasoning = turn
+                .provider_message
+                .get("reasoning_content")
+                .or_else(|| turn.provider_message.get("reasoning"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
             let round_input = KernelRoundInput {
                 text: &turn.content,
                 has_reasoning,
@@ -639,12 +663,8 @@ impl HeadlessAgentDriver {
                         // 中断耗尽注记：headless 不支持，落穿
                     }
                     KernelRoundAction::ContinueTruncated { continuation_text, reasoning_only } => {
-                        // 截断续写：保留已有内容，从截断处继续
-                        let prompt = if reasoning_only {
-                            format!("{}\n\n（系统提示：上文已被截断，请仅输出推理部分的剩余内容。）", continuation_text)
-                        } else {
-                            format!("{}\n\n（系统提示：上文已被截断，请继续输出剩余内容。）", continuation_text)
-                        };
+                        // assistant 半截正文已经写入 messages；这里只追加共用续写指令，禁止重复正文。
+                        let prompt = continuation_instruction(reasoning_only);
                         sink.append(
                             SessionEventType::SystemNote,
                             json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
@@ -722,6 +742,27 @@ impl HeadlessAgentDriver {
                 }
             }
             for call in turn.tool_calls {
+                attempted_tool_calls = attempted_tool_calls.saturating_add(1);
+                if attempted_tool_calls > task.limits.max_tool_calls {
+                    stopped_by_tool_budget = true;
+                    outcome.failure_taxonomy.push("max_tool_calls_exceeded".into());
+                    sink.append(
+                        SessionEventType::SystemNote,
+                        json!({
+                            "reason":"max_tool_calls_exceeded",
+                            "attempted":attempted_tool_calls,
+                            "limit":task.limits.max_tool_calls,
+                        }),
+                        "agent_tool_budget_stop",
+                        json!({
+                            "reason":"max_tool_calls_exceeded",
+                            "attempted":attempted_tool_calls,
+                            "limit":task.limits.max_tool_calls,
+                        }),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                    break 'rounds;
+                }
                 let id = call.id.as_str();
                 let name = call.name.as_str();
                 let args = call.arguments.as_str();
@@ -869,6 +910,7 @@ impl HeadlessAgentDriver {
             && !stopped_by_budget
             && !stopped_by_acceptance
             && !stopped_by_loop
+            && !stopped_by_tool_budget
             && outcome.steps >= round_limit as u64
         {
             outcome.failure_taxonomy.push("max_steps_exceeded".into());
@@ -954,9 +996,16 @@ mod tests {
 
     impl ScriptedClient {
         fn new(responses: VecDeque<serde_json::Value>) -> Self {
+            Self::with_recorder(responses, Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn with_recorder(
+            responses: VecDeque<serde_json::Value>,
+            recorded_messages: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+        ) -> Self {
             Self {
                 responses: Mutex::new(responses),
-                recorded_messages: Arc::new(Mutex::new(Vec::new())),
+                recorded_messages,
             }
         }
         
@@ -1021,6 +1070,7 @@ mod tests {
             limits: EvalLimits {
                 wall_time_seconds: 10,
                 max_steps: 4,
+                max_tool_calls: 100,
                 max_cost_cny: 0.0,
                 network: "none".into(),
             },
@@ -1057,6 +1107,32 @@ mod tests {
             },
             Arc::new(client),
         )
+    }
+
+    fn scripted_driver_with_recording(
+        responses: impl IntoIterator<Item = serde_json::Value>,
+    ) -> (
+        HeadlessAgentDriver,
+        Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+    ) {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let client = ScriptedClient::with_recorder(
+            responses.into_iter().collect(),
+            Arc::clone(&recorded),
+        );
+        let driver = HeadlessAgentDriver::with_client(
+            HeadlessProviderConfig {
+                provider_id: "stub".into(),
+                base_url: "http://127.0.0.1/offline".into(),
+                api_key: "test-secret".into(),
+                model_id: "offline-model".into(),
+                max_rounds: 4,
+                input_price_cny_per_1k: Some(0.0),
+                output_price_cny_per_1k: Some(0.0),
+            },
+            Arc::new(client),
+        );
+        (driver, recorded)
     }
 
     #[test]
@@ -1450,6 +1526,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_call_budget_stops_varying_calls_inside_one_round() {
+        let response = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": (0..4).map(|i| {
+                        serde_json::json!({
+                            "id": format!("call-{i}"),
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": format!("{{\"path\":\"{i}.txt\"}}")
+                            }
+                        })
+                    }).collect::<Vec<_>>()
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 30}
+        });
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-tool-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        for i in 0..4 {
+            std::fs::write(workspace.join(format!("{i}.txt")), "base\n").unwrap();
+        }
+        let mut task = offline_task();
+        task.limits.max_tool_calls = 3;
+
+        let outcome = scripted_driver([response])
+            .run_async(&task, &workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps, 1);
+        assert_eq!(outcome.tool_calls, 3);
+        assert!(outcome
+            .failure_taxonomy
+            .contains(&"max_tool_calls_exceeded".to_string()));
+        let budget_stop = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "agent_tool_budget_stop")
+            .expect("工具预算熔断事件必须写入 trajectory");
+        assert_eq!(budget_stop.fields["attempted"], 4);
+        assert_eq!(budget_stop.fields["limit"], 3);
+        assert!(!outcome
+            .failure_taxonomy
+            .contains(&"max_steps_exceeded".to_string()));
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
     async fn round_router_stops_on_consecutive_empty_rounds() {
         // 连续 2 轮空响应 → empty_rounds_exhausted
         let responses = [
@@ -1555,6 +1688,48 @@ mod tests {
             .any(|event| event.kind == "round_continuation_truncated"));
         // 验证续写后完成（steps=2）
         assert_eq!(outcome.steps, 2);
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn truncation_reuses_shared_instruction_without_duplicating_partial_text() {
+        let responses = [
+            serde_json::json!({
+                "choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "unique partial output"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }),
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "continued and done"}}],
+                "usage": {"prompt_tokens": 15, "completion_tokens": 3}
+            }),
+        ];
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-shared-continuation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (driver, recorded) = scripted_driver_with_recording(responses);
+
+        driver
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let second = &requests[1];
+        let partial_occurrences = second
+            .iter()
+            .filter(|message| message["content"].as_str() == Some("unique partial output"))
+            .count();
+        assert_eq!(partial_occurrences, 1, "半截正文只能以 assistant 消息出现一次");
+        let last = second.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(
+            last["content"].as_str(),
+            Some(crate::agent::kernel_history::continuation_instruction(false))
+        );
 
         std::fs::remove_dir_all(workspace).ok();
     }
@@ -1757,6 +1932,24 @@ mod tests {
             .unwrap();
         assert!(turn.was_truncated());
         assert_eq!(turn.finish_reason.as_deref(), Some("length"));
+    }
+
+    #[tokio::test]
+    async fn stream_reader_preserves_reasoning_for_reasoning_only_truncation() {
+        let chunks = sse_chunks(&[
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"internal trace\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        ]);
+        let turn = super::read_openai_sse_stream(futures_util::stream::iter(chunks))
+            .await
+            .unwrap();
+
+        assert!(turn.content.is_empty());
+        assert!(turn.was_truncated());
+        assert_eq!(
+            turn.provider_message["reasoning_content"],
+            "internal trace"
+        );
     }
 
     #[tokio::test]
