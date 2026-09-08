@@ -216,7 +216,13 @@ pub struct EvalRunConfig {
     pub prompt: PromptInfo,
     pub tool_registry: ToolRegistryInfo,
     pub sandbox: SandboxInfo,
+    /// 单次 Provider 请求的硬上限（秒）。缺省时 builtin driver 使用内置默认值；
+    /// 实际生效值始终取它与剩余 wall time 的较小值。
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
 }
+
+const MAX_REQUEST_TIMEOUT_SECONDS: u64 = 3600;
 
 fn validate_run_config(config: &EvalRunConfig) -> Result<(), String> {
     let required = [
@@ -260,6 +266,13 @@ fn validate_run_config(config: &EvalRunConfig) -> Result<(), String> {
         let value = digest.strip_prefix("sha256:").unwrap_or_default();
         if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
             return Err(format!("{field} 必须是完整 sha256:<64 hex> 指纹"));
+        }
+    }
+    if let Some(timeout) = config.request_timeout_seconds {
+        if timeout == 0 || timeout > MAX_REQUEST_TIMEOUT_SECONDS {
+            return Err(format!(
+                "request_timeout_seconds 必须在 1..={MAX_REQUEST_TIMEOUT_SECONDS} 之间"
+            ));
         }
     }
     Ok(())
@@ -316,6 +329,14 @@ pub async fn run_trial(
             config.sandbox.network_policy, task.limits.network
         ));
     }
+    if let Some(timeout) = config.request_timeout_seconds {
+        if timeout > task.limits.wall_time_seconds {
+            return Err(format!(
+                "request_timeout_seconds={timeout} 超过任务 wall_time_seconds={}",
+                task.limits.wall_time_seconds
+            ));
+        }
+    }
     std::fs::create_dir_all(output_dir).map_err(|error| format!("创建输出目录失败：{error}"))?;
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
@@ -357,7 +378,11 @@ pub async fn run_trial(
     trajectory.append(&TrajectoryEvent {
         ts: started_at.clone(),
         kind: "trial_started".into(),
-        fields: serde_json::json!({ "run_id": config.run_id, "task_id": task.task_id }),
+        fields: serde_json::json!({
+            "run_id": config.run_id,
+            "task_id": task.task_id,
+            "request_timeout_seconds": config.request_timeout_seconds,
+        }),
     })?;
     let driver_outcome = match driver.run_async(task, &agent_task_ws).await {
         Ok(outcome) => outcome,
@@ -683,7 +708,40 @@ mod tests {
                 image_digest: None,
                 network_policy: "none".into(),
             },
+            request_timeout_seconds: None,
         }
+    }
+
+    #[test]
+    fn request_timeout_seconds_is_validated_and_bounded() {
+        let mut config = run_config();
+        config.request_timeout_seconds = Some(120);
+        assert!(validate_run_config(&config).is_ok());
+
+        config.request_timeout_seconds = Some(0);
+        assert!(validate_run_config(&config).is_err());
+        config.request_timeout_seconds = Some(3601);
+        assert!(validate_run_config(&config).is_err());
+        config.request_timeout_seconds = Some(60);
+        assert!(validate_run_config(&config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_timeout_exceeding_wall_time_is_rejected_before_worktree() {
+        let mut config = run_config();
+        config.request_timeout_seconds = Some(120);
+        let task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
+        assert!(task.limits.wall_time_seconds < 120);
+        let error = run_trial(
+            &task,
+            Path::new("/nonexistent-eval-source"),
+            Path::new("/nonexistent-eval-out"),
+            &StubAgentDriver,
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("request_timeout_seconds"), "{error}");
     }
 
     #[tokio::test]

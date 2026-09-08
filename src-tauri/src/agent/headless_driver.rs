@@ -162,9 +162,13 @@ trait HeadlessModelClient: Send + Sync {
 #[derive(Default)]
 struct OpenAiCompatibleClient;
 
+/// run-config 未显式设置 `request_timeout_seconds` 时的内置单请求上限。
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct HeadlessAgentDriver {
     pub provider: HeadlessProviderConfig,
     client: Arc<dyn HeadlessModelClient>,
+    request_timeout: Option<Duration>,
 }
 
 impl HeadlessAgentDriver {
@@ -172,12 +176,24 @@ impl HeadlessAgentDriver {
         Self {
             provider,
             client: Arc::new(OpenAiCompatibleClient),
+            request_timeout: None,
         }
+    }
+
+    /// 单次 Provider 请求的硬上限；缺省时使用 [`DEFAULT_REQUEST_TIMEOUT`]。
+    /// 实际生效值始终取它与剩余 wall time 的较小值。
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     #[cfg(test)]
     fn with_client(provider: HeadlessProviderConfig, client: Arc<dyn HeadlessModelClient>) -> Self {
-        Self { provider, client }
+        Self {
+            provider,
+            client,
+            request_timeout: None,
+        }
     }
 
     fn tool_specs() -> Value {
@@ -330,7 +346,7 @@ impl HeadlessAgentDriver {
         )
         .map_err(AgentDriverError::Failed)?;
         let mut outcome = AgentDriverOutcome::default();
-        sink.append(SessionEventType::SystemNote, json!({"text":"builtin driver started","mode":"minimal","provider":self.provider.provider_id}), "driver_started", json!({"mode":"minimal","provider":self.provider.provider_id})).map_err(AgentDriverError::Failed)?;
+        sink.append(SessionEventType::SystemNote, json!({"text":"builtin driver started","mode":"minimal","provider":self.provider.provider_id,"request_timeout_ms":self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT).as_millis() as u64}), "driver_started", json!({"mode":"minimal","provider":self.provider.provider_id,"request_timeout_ms":self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT).as_millis() as u64})).map_err(AgentDriverError::Failed)?;
         let mut usage = KernelUsageLedger::new(
             task.limits.max_cost_cny,
             self.provider.input_price_cny_per_1k,
@@ -349,8 +365,10 @@ impl HeadlessAgentDriver {
                 ));
             }
             outcome.steps = round as u64 + 1;
-            let request_timeout =
-                Duration::from_secs(60).min(wall_time.saturating_sub(started.elapsed()));
+            let request_timeout = self
+                .request_timeout
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+                .min(wall_time.saturating_sub(started.elapsed()));
             let (response, retries) = self
                 .client
                 .request(&self.provider, messages.clone(), request_timeout)

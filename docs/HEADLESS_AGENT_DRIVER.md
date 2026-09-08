@@ -403,7 +403,10 @@ pricing_version
 并对错误响应做文本脱敏。HTTP 429、5xx、连接失败和传输超时与 UI 共用
 `STREAM_REQUEST_POLICY` 指数退避策略，尊重 Retry-After，实际尝试次数写入
 `AgentDriverOutcome.retries`；工具 allowlist 内外分别记录
-`ToolApproval(approved=true/false)`。后续再把单请求上限作为独立 run-config 字段。
+`ToolApproval(approved=true/false)`。单请求上限已作为独立 run-config 字段落地：
+`EvalRunConfig.request_timeout_seconds`（可选，1..=3600，不得超过任务 wall time），
+CLI 传给 builtin driver，实际生效值取它与剩余 wall time 的较小值并写入
+`trial_started`/`driver_started` 事件；缺省时使用内置 60 秒默认值。
 
 Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不能只依赖外层
 `run_trial`，因为同步阻塞会绕过 wall-time 保护。

@@ -91,7 +91,8 @@ async fn execute(args: EvalRunArgs) -> Result<i32, String> {
         provider
             .validate_against(&config.model)
             .map_err(|e| format!("builtin driver 配置与 run-config 不一致：{e:?}"))?;
-        let adapter = HeadlessAgentDriver::new(provider);
+        let adapter = HeadlessAgentDriver::new(provider)
+            .with_request_timeout(config.request_timeout_seconds.map(Duration::from_secs));
         run_trial(&task, &workspace, &args.output, &adapter, &config).await
     } else {
         let driver = PathBuf::from(&args.driver)
