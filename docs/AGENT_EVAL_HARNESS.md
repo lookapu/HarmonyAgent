@@ -162,12 +162,12 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 ## 10. 首个实现切片
 
 - [x] 抽取 `AgentEventSink`，让 Tauri 和 JSONL writer 共用事件源（改用拉取式桥接：`eval_trajectory::session_events_to_trajectory` 直接回放 `session_events` 到 trajectory.jsonl，复用真实事件源，无需再引入 push sink trait）；
-- [x] 增加只接受本地已准备 workspace 的 `eval run`（`harmony-agent eval run` CLI 与 `ProcessAgentDriver` 已接通；内置 Provider headless loop 仍待从 `commands/chat.rs` 抽取）；
+- [x] 增加只接受本地已准备 workspace 的 `eval run`（`harmony-agent eval run` CLI、`ProcessAgentDriver` 与 builtin driver 已接通）；
 - [x] 接入一个 OpenAI-compatible Provider、受限工具 allowlist、`network=none` 任务执行面和 command grader（Provider 通过 `--driver builtin` 与 `HARMONY_EVAL_*` 接线；模型网络与任务网络的严格分层、无 Docker 依赖的平台原生默认隔离仍待后续阶段）；
 - [x] 输出完整 manifest/trajectory/patch/report（`run_trial` 对 resolved/unresolved/harness_error/cancelled 均生成四件套和 grader stdout/stderr；patch/trajectory 摘要与磁盘内容交叉验证）；
-- [ ] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact；
+- [x] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact（`.github/workflows/headless-eval-smoke.yml`：macOS 临时 Git 仓、3 分钟任务预算、10 分钟 job 上限、真实 Provider secret、四件套上传和 API key 泄漏门禁；不依赖 Docker）；
 - [x] 未交付真实沙箱前，runner 必须拒绝不可信 task，而不是回退宿主执行（已落地为 `agent::eval_task`：task schema v1 解析 + 安全校验，拒绝宿主命令/绝对路径/`..`/命令替换/联网/不安全 artifact，并附单元测试）。
 
-已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`、`eval_runner.rs`、`headless_driver.rs`；主路径剩余工作是异步 AgentDriver/事件 sink、完整工具治理与从 `commands/chat.rs` 抽取统一 Agent Kernel。
+已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`、`eval_runner.rs`、`headless_driver.rs` 与 `agent_kernel.rs`；主路径剩余工作是把 UI 流式协议、消息循环、recovery 和 acceptance 继续迁入统一 Agent Kernel。
 
 相关文档：[固定评测集](FIXED_EVALUATION_SUITE.md)、[评测运行快照](EVALUATION_RUN_SNAPSHOTS.md)、[安全边界](SECURITY_BOUNDARY.md)、[演进路线](AGENT_EVOLUTION_ROADMAP_2026.md)。

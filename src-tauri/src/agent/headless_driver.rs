@@ -4,6 +4,7 @@
 //! not a replacement for the UI loop yet; the driver is marked `minimal` in the
 //! event stream and is intended for eval smoke tests while AgentKernel is extracted.
 
+use crate::agent::agent_kernel::{parse_openai_turn, KernelUsageLedger};
 use crate::agent::eval_report::ModelInfo;
 use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
 use crate::agent::eval_task::EvalTask;
@@ -291,16 +292,15 @@ impl HeadlessAgentDriver {
         .map_err(AgentDriverError::Failed)?;
         let mut outcome = AgentDriverOutcome::default();
         sink.append(SessionEventType::SystemNote, json!({"text":"builtin driver started","mode":"minimal","provider":self.provider.provider_id}), "driver_started", json!({"mode":"minimal","provider":self.provider.provider_id})).map_err(AgentDriverError::Failed)?;
-        if task.limits.max_cost_cny > 0.0
-            && (self.provider.input_price_cny_per_1k.is_none()
-                || self.provider.output_price_cny_per_1k.is_none())
-        {
-            return Err(AgentDriverError::Failed(
-                "任务设置了 max_cost_cny，但 builtin driver 缺少价格快照；请设置 HARMONY_EVAL_INPUT_PRICE_CNY_PER_1K 和 HARMONY_EVAL_OUTPUT_PRICE_CNY_PER_1K".into(),
-            ));
-        }
+        let mut usage = KernelUsageLedger::new(
+            task.limits.max_cost_cny,
+            self.provider.input_price_cny_per_1k,
+            self.provider.output_price_cny_per_1k,
+        )
+        .map_err(AgentDriverError::Failed)?;
         let round_limit = self.provider.max_rounds.min(task.limits.max_steps as u32);
         let mut stopped_by_model = false;
+        let mut stopped_by_budget = false;
         for round in 0..round_limit {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
             if started.elapsed() >= wall_time {
@@ -316,53 +316,38 @@ impl HeadlessAgentDriver {
                 .request(&self.provider, messages.clone(), request_timeout)
                 .await?;
             outcome.retries = outcome.retries.saturating_add(retries);
-            if let Some(usage) = response.get("usage") {
-                let input = usage
-                    .get("prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let output = usage
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                outcome.input_tokens = outcome.input_tokens.saturating_add(input);
-                outcome.output_tokens = outcome.output_tokens.saturating_add(output);
-                if let (Some(input_price), Some(output_price)) = (
-                    self.provider.input_price_cny_per_1k,
-                    self.provider.output_price_cny_per_1k,
-                ) {
-                    outcome.cost_cny +=
-                        input as f64 / 1000.0 * input_price + output as f64 / 1000.0 * output_price;
-                    if outcome.cost_cny > task.limits.max_cost_cny && task.limits.max_cost_cny > 0.0
-                    {
-                        outcome.failure_taxonomy.push("max_cost_exceeded".into());
-                        return Ok(outcome);
-                    }
-                }
-            }
-            let choice = response
-                .get("choices")
-                .and_then(|v| v.get(0))
-                .ok_or_else(|| AgentDriverError::Failed("Provider 响应缺少 choices".into()))?;
-            let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
-            if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+            let turn = parse_openai_turn(&response).map_err(AgentDriverError::Failed)?;
+            let cost_exceeded = usage
+                .record(turn.usage.as_ref())
+                .map_err(AgentDriverError::Failed)?;
+            outcome.input_tokens = usage.input_tokens;
+            outcome.output_tokens = usage.output_tokens;
+            outcome.cached_tokens = usage.cached_tokens;
+            outcome.cost_cny = usage.cost_cny;
+            if turn.was_truncated() {
                 outcome.failure_taxonomy.push("provider_truncated".into());
             }
-            let content = message.get("content").and_then(Value::as_str).unwrap_or("");
-            let calls = message
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
             sink.append(
                 SessionEventType::AssistantMessage,
-                json!({"content":content,"tool_calls":calls.len()}),
+                json!({"content":turn.content,"tool_calls":turn.tool_calls.len()}),
                 "assistant_message",
-                json!({"chars":content.len(),"tool_calls":calls.len()}),
+                json!({"chars":turn.content.len(),"tool_calls":turn.tool_calls.len()}),
             )
             .map_err(AgentDriverError::Failed)?;
-            messages.push(message);
-            if calls.is_empty() {
+            messages.push(turn.provider_message.clone());
+            if cost_exceeded {
+                stopped_by_budget = true;
+                outcome.failure_taxonomy.push("max_cost_exceeded".into());
+                sink.append(
+                    SessionEventType::SystemNote,
+                    json!({"reason":"max_cost_exceeded","cost_cny":outcome.cost_cny}),
+                    "agent_budget_stop",
+                    json!({"reason":"max_cost_exceeded","cost_cny":outcome.cost_cny}),
+                )
+                .map_err(AgentDriverError::Failed)?;
+                break;
+            }
+            if turn.is_stop_candidate() {
                 stopped_by_model = true;
                 sink.append(
                     SessionEventType::SystemNote,
@@ -373,14 +358,10 @@ impl HeadlessAgentDriver {
                 .map_err(AgentDriverError::Failed)?;
                 break;
             }
-            for call in calls {
-                let id = call.get("id").and_then(Value::as_str).unwrap_or("call");
-                let function = call.get("function").cloned().unwrap_or_else(|| json!({}));
-                let name = function.get("name").and_then(Value::as_str).unwrap_or("");
-                let args = function
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("{}");
+            for call in turn.tool_calls {
+                let id = call.id.as_str();
+                let name = call.name.as_str();
+                let args = call.arguments.as_str();
                 let contract = match runtime.policy.check(name, args) {
                     Ok(contract) => contract,
                     Err(reason) => {
@@ -481,7 +462,7 @@ impl HeadlessAgentDriver {
                 messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
             }
         }
-        if !stopped_by_model && outcome.steps >= round_limit as u64 {
+        if !stopped_by_model && !stopped_by_budget && outcome.steps >= round_limit as u64 {
             outcome.failure_taxonomy.push("max_steps_exceeded".into());
         }
         let tool_quality = runtime
@@ -599,6 +580,14 @@ mod tests {
     fn scripted_driver(
         responses: impl IntoIterator<Item = serde_json::Value>,
     ) -> HeadlessAgentDriver {
+        scripted_driver_with_prices(responses, 0.0, 0.0)
+    }
+
+    fn scripted_driver_with_prices(
+        responses: impl IntoIterator<Item = serde_json::Value>,
+        input_price: f64,
+        output_price: f64,
+    ) -> HeadlessAgentDriver {
         HeadlessAgentDriver::with_client(
             HeadlessProviderConfig {
                 provider_id: "stub".into(),
@@ -606,8 +595,8 @@ mod tests {
                 api_key: "test-secret".into(),
                 model_id: "offline-model".into(),
                 max_rounds: 4,
-                input_price_cny_per_1k: Some(0.0),
-                output_price_cny_per_1k: Some(0.0),
+                input_price_cny_per_1k: Some(input_price),
+                output_price_cny_per_1k: Some(output_price),
             },
             Arc::new(ScriptedClient(Mutex::new(responses.into_iter().collect()))),
         )
@@ -776,6 +765,53 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("未授权"));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn cost_limit_stop_preserves_trajectory_and_missing_usage_fails_closed() {
+        let response_with_usage = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "expensive response"}
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 10}
+        });
+        let workspace =
+            std::env::temp_dir().join(format!("harmony-headless-cost-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut task = offline_task();
+        task.limits.max_cost_cny = 0.1;
+        let outcome = scripted_driver_with_prices([response_with_usage], 10.0, 10.0)
+            .run_async(&task, &workspace)
+            .await
+            .unwrap();
+        assert!(outcome.cost_cny > task.limits.max_cost_cny);
+        assert!(outcome
+            .failure_taxonomy
+            .contains(&"max_cost_exceeded".to_string()));
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "agent_budget_stop"));
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "driver_finished"));
+
+        let response_without_usage = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "no usage"}
+            }]
+        });
+        let error = scripted_driver_with_prices([response_without_usage], 10.0, 10.0)
+            .run_async(&task, &workspace)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::agent::eval_runner::AgentDriverError::Failed(message) if message.contains("未返回 usage"))
+        );
         std::fs::remove_dir_all(workspace).ok();
     }
 }

@@ -433,7 +433,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 - [x] 把当前 `sandbox_exec` 在 UI/文档中改称“临时副本试运行”，消除错误安全承诺；
 - [x] 写 `SECURITY_BOUNDARY.md`：明确宿主、工作区、网络、凭据和 MCP 边界；
-- [ ] 完成 headless eval adapter 的生产级 Agent Kernel 与一个真实模型 end-to-end 样例（最小 builtin driver、`eval run --driver builtin`、11 个结构/文件/Git 工具、`SessionTrajectorySink`、`HeadlessToolRuntime`、原生异步 runner 主路径、可注入 `ModelClient`、完全离线的脚本 Provider tool-loop 测试、成本计量、超时/重试与失败/取消终态已实现；参数级审批/L2 fail-closed、共享工具契约、trial 私有 `tool_runs` 与 `tool_metrics` 汇总也已接入；UI/headless 统一 Kernel 和真实模型手动 workflow 仍待完成，见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)）；
+- [ ] 完成 headless eval adapter 的生产级 Agent Kernel 与一个真实模型 end-to-end 样例（最小 builtin driver、`eval run --driver builtin`、11 个结构/文件/Git 工具、`SessionTrajectorySink`、`HeadlessToolRuntime`、原生异步 runner 主路径、可注入 `ModelClient`、完全离线的脚本 Provider tool-loop 测试、成本计量、超时/重试与失败/取消终态已实现；参数级审批/L2 fail-closed、共享工具契约、trial 私有 `tool_runs` 与 `tool_metrics` 汇总也已接入；统一 Kernel 的严格 `KernelTurn` 解析与 usage/cost ledger、无 Docker 的真实 Provider 手动 workflow 已落地，UI 流式 loop/recovery/acceptance 共用仍待完成，见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)）；
 - [x] 固定 SWE-bench Verified 25 题 smoke 子集（v1 清单覆盖 12 个仓库和三档难度，固定官方 dataset revision；数量/唯一性/ID/revision 校验器与仓库清单测试已落地。官方 gold 25/25 容器自检只作为可选 CI 适配器验收，不是核心工具依赖，见 [SWE_BENCH_VERIFIED_25.md](./SWE_BENCH_VERIFIED_25.md)）；
 - [x] 建立 10k/100k/1M 文件索引基准生成器，并记录 10k 当前基线；
 - [x] 更新 README：二进制下载、支持平台和当前限制（badge 改为仅 Windows/macOS，并明确 Linux 暂不提供官方安装包，避免“跨平台”措辞超出实际产物）。

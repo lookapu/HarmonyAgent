@@ -1,0 +1,143 @@
+name: Headless Eval Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider_id:
+        description: Provider id recorded in the manifest
+        required: true
+        default: openai
+      base_url:
+        description: OpenAI-compatible HTTPS base URL
+        required: true
+      model_id:
+        description: Exact model id
+        required: true
+      input_price_cny_per_1k:
+        description: Input price snapshot in CNY per 1K tokens
+        required: true
+        default: "0"
+      output_price_cny_per_1k:
+        description: Output price snapshot in CNY per 1K tokens
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: headless-eval-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build headless eval CLI
+        run: cargo build --manifest-path src-tauri/Cargo.toml --locked --features eval-cli --bin harmony-agent
+
+      - name: Prepare deterministic smoke repository
+        id: fixture
+        shell: bash
+        env:
+          EVAL_PROVIDER_ID: ${{ inputs.provider_id }}
+          EVAL_MODEL_ID: ${{ inputs.model_id }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/harmony-headless-smoke"
+          repo="$root/repo"
+          mkdir -p "$repo"
+          printf 'base\n' > "$repo/a.txt"
+          git -C "$repo" init -q
+          git -C "$repo" add a.txt
+          git -C "$repo" -c user.email=eval@harmony.invalid -c user.name=HarmonyEval commit -q -m base
+          base_commit="$(git -C "$repo" rev-parse HEAD)"
+          prompt_digest="$(printf 'headless-smoke-prompt-v1' | shasum -a 256 | awk '{print $1}')"
+          tools_digest="$(printf 'headless-smoke-tools-v1' | shasum -a 256 | awk '{print $1}')"
+          mkdir -p "$root/input"
+          cat > "$root/input/task.json" <<EOF
+          {
+            "schema_version": 1,
+            "task_id": "manual__headless-smoke-v1",
+            "suite": "headless-smoke",
+            "problem_statement": "将工作区根目录 a.txt 的内容精确修改为 fixed，并用 read_file 或 git_diff 验证。不要修改其他文件。",
+            "repo": {"url": "local://headless-smoke", "base_commit": "$base_commit", "subdir": null},
+            "limits": {"wall_time_seconds": 180, "max_steps": 12, "max_cost_cny": 2.0, "network": "none"},
+            "grader": {"kind": "command", "command": ["grep", "-q", "^fixed$", "a.txt"], "timeout_seconds": 10},
+            "artifacts": ["a.txt"]
+          }
+          EOF
+          jq -n \
+            --arg run_id "manual-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --arg commit "$GITHUB_SHA" \
+            --arg provider "$EVAL_PROVIDER_ID" \
+            --arg model "$EVAL_MODEL_ID" \
+            --arg prompt_digest "sha256:$prompt_digest" \
+            --arg tools_digest "sha256:$tools_digest" \
+            '{
+              run_id: $run_id,
+              suite_version: "headless-smoke-v1",
+              grader_version: "command-v1",
+              harness: {commit: $commit, app_version: "ci", platform: "macos"},
+              model: {provider: $provider, model_id: $model, protocol: "openai", reasoning_effort: "default"},
+              prompt: {profile_version: "headless-smoke-v1", digest: $prompt_digest},
+              tool_registry: {version: "headless-smoke-v1", digest: $tools_digest},
+              sandbox: {backend: "git-worktree", capabilities: "trusted-repo-workspace-write", image_digest: null, network_policy: "none"}
+            }' > "$root/input/run.json"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Run builtin headless trial
+        id: eval
+        continue-on-error: true
+        shell: bash
+        env:
+          HARMONY_EVAL_PROVIDER_ID: ${{ inputs.provider_id }}
+          HARMONY_EVAL_BASE_URL: ${{ inputs.base_url }}
+          HARMONY_EVAL_MODEL_ID: ${{ inputs.model_id }}
+          HARMONY_EVAL_PROTOCOL: openai
+          HARMONY_EVAL_API_KEY: ${{ secrets.HARMONY_EVAL_API_KEY }}
+          HARMONY_EVAL_INPUT_PRICE_CNY_PER_1K: ${{ inputs.input_price_cny_per_1k }}
+          HARMONY_EVAL_OUTPUT_PRICE_CNY_PER_1K: ${{ inputs.output_price_cny_per_1k }}
+        run: |
+          set +e
+          src-tauri/target/debug/harmony-agent eval run \
+            --task "${{ steps.fixture.outputs.root }}/input/task.json" \
+            --workspace "${{ steps.fixture.outputs.repo }}" \
+            --run-config "${{ steps.fixture.outputs.root }}/input/run.json" \
+            --driver builtin \
+            --output "${{ steps.fixture.outputs.root }}/output"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Verify API key is absent from artifacts
+        if: always()
+        shell: bash
+        env:
+          HARMONY_EVAL_API_KEY: ${{ secrets.HARMONY_EVAL_API_KEY }}
+        run: |
+          set -euo pipefail
+          output="${{ steps.fixture.outputs.root }}/output"
+          if [ -n "$HARMONY_EVAL_API_KEY" ] && [ -d "$output" ] && grep -R -F -q "$HARMONY_EVAL_API_KEY" "$output"; then
+            echo "API key leaked into eval artifacts" >&2
+            exit 1
+          fi
+
+      - name: Upload reproducible trial bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-eval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.fixture.outputs.root }}/output
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce trial result
+        if: always()
+        shell: bash
+        run: exit "${{ steps.eval.outputs.exit_code || '2' }}"

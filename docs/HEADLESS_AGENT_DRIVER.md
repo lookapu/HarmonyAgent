@@ -1,7 +1,7 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
 > 状态：v2 设计 + Phase 0/1 最小实现已落地（统一 Agent Kernel / 完整治理仍待推进）
-> 更新日期：2026-09-07
+> 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
 当前代码已经提供 `HeadlessAgentDriver` 和 CLI 的 `--driver builtin` 分支：支持
@@ -112,6 +112,11 @@ pub trait AgentDriver: Send + Sync {
 当前代码以 `AsyncAgentDriver` 作为 `run_trial` 的主接口，并由 builtin driver 与
 `ProcessAgentDriver` 实现；旧的同步 `AgentDriver` 只保留为外部进程 adapter 的内部兼容实现，
 进程等待通过 `spawn_blocking` 与异步 runtime 隔离。
+
+`agent::agent_kernel` 已成为 UI/headless 共用内核的第一个代码切片：
+`parse_openai_turn` 把 Provider 响应严格转换为 `KernelTurn`/`KernelToolCall`，
+`KernelUsageLedger` 统一累计 input/output/cached token 与成本。设有成本上限但 Provider
+缺少 usage 时会失败关闭；成本超限通过 `agent_budget_stop` 正常收敛，不会提前返回而丢失 trajectory。
 
 ### 5.1 事件输出接口
 
@@ -426,7 +431,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ### Phase 4：统一 Agent Kernel
 
-- 从 `chat.rs` 抽取 ModelClient/stream parser；
+- 从 `chat.rs` 抽取 ModelClient/stream parser（非流式 `KernelTurn` 与 usage ledger 基础已落地）；
 - 抽取消息历史、tool loop、reflexion、governance、recovery；
 - Tauri UI 和 eval 共用 AgentKernel；
 - 再扩展 Anthropic/Gemini 适配器。

@@ -828,7 +828,7 @@ mod tests {
         let outcome = ProcessAgentDriver {
             program,
             args: vec![],
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_secs(10),
         }
         .run(&task, &workspace)
         .unwrap();

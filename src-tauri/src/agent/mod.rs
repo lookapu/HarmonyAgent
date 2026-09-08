@@ -2,6 +2,7 @@
 
 pub mod ask;
 pub mod acceptance;
+pub mod agent_kernel;
 pub mod coordinator;
 pub mod context;
 pub mod interactions;
