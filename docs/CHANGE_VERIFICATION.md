@@ -1,6 +1,6 @@
 # 文件变更验证策略
 
-统一执行循环从成功的 `write_file`、`edit_file`、`delete_file`、`apply_patch`、`multi_edit` 和 `lsp_rename` 参数中提取真实变更文件，并按文件类型生成验证计划。
+统一执行循环从成功的 `write_file`、`edit_file`、`delete_file`、`apply_patch`、`multi_edit` 和 `lsp_rename` 参数中提取真实变更文件，并按文件类型生成验证计划。代码写工具在验证计划之前还必须通过候选文本门禁：TS/JS/ArkTS 进行 Tree-sitter 错误增量检查，Java 阻止新增游离 `@Override`/`@Resource`，其他语言先做配平 fallback；`multi_edit` 先验证全部文件再原子提交，写入失败回滚已完成文件。门禁拒绝、事务回滚和结构句柄过期会在前端工具卡中明确展示。
 
 | 变更类型 | 自动选择的验证 |
 | --- | --- |

@@ -734,21 +734,8 @@ function CodeBlock({
   const shownLines = collapsed ? lines.slice(0, 10) : lines
   // diff 语言：按行首 + / - 标记增改行，高亮整行（绿/红底）
   const isDiff = lang === 'diff' || lang === 'patch'
-  const lineKind = (line: string): 'add' | 'del' | 'ctx' | null => {
-    if (!isDiff) return null
-    if (line.startsWith('+') && !line.startsWith('+++')) return 'add'
-    if (line.startsWith('-') && !line.startsWith('---')) return 'del'
-    return 'ctx'
-  }
   // shell/bash 输出中识别 error/warning 行（命令执行结果高亮）
   const isShell = ['bash', 'shell', 'sh'].includes(lang)
-  const lineTone = (line: string): 'err' | 'warn' | null => {
-    if (!isShell) return null
-    const l = line.toLowerCase()
-    if (/\b(error|failed|failure|exception|fatal)\b/.test(l)) return 'err'
-    if (/\b(warning|warn|deprecated)\b/.test(l)) return 'warn'
-    return null
-  }
 
   const copy = async () => {
     try {
@@ -846,8 +833,21 @@ function CodeBlock({
   const renderLine = useCallback((i: number) => {
     const line = shownLines[i]
     const lineNo = i + 1
-    const k = lineKind(line)
-    const tone = k ? null : lineTone(line)
+    const k: 'add' | 'del' | 'ctx' | null = !isDiff
+      ? null
+      : line.startsWith('+') && !line.startsWith('+++')
+        ? 'add'
+        : line.startsWith('-') && !line.startsWith('---')
+          ? 'del'
+          : 'ctx'
+    const normalized = line.toLowerCase()
+    const tone: 'err' | 'warn' | null = k || !isShell
+      ? null
+      : /\b(error|failed|failure|exception|fatal)\b/.test(normalized)
+        ? 'err'
+        : /\b(warning|warn|deprecated)\b/.test(normalized)
+          ? 'warn'
+          : null
     const isFocus = focusLine === lineNo
     const inSel =
       selectedLines && lineNo >= selectedLines[0] && lineNo <= selectedLines[1]
@@ -884,7 +884,7 @@ function CodeBlock({
         />
       </div>
     )
-  }, [shownLines, highlightedLines, focusLine, selectedLines, onLineClick, onOpenFile, filePath, lineKind, lineTone])
+  }, [shownLines, highlightedLines, focusLine, selectedLines, onLineClick, onOpenFile, filePath, isDiff, isShell])
 
   const parentRef = useRef<HTMLPreElement>(null)
   const virtualizer = useVirtualizer({

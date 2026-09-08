@@ -33,7 +33,8 @@ export const ConversationNav = memo(function ConversationNav({
   if (userMessages.length <= 2) return null
 
   const scrollToMsg = (msgId: string) => {
-    const el = document.querySelector(`[data-msg-id="${msgId}"]`)
+    const escapedId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(msgId) : msgId.replace(/["\\]/g, '\\$&')
+    const el = document.querySelector(`[data-msg-id="${escapedId}"]`)
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'center' })
       setOpen(false)
@@ -48,6 +49,8 @@ export const ConversationNav = memo(function ConversationNav({
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
+        aria-label={t('home.conversationNav')}
+        aria-expanded={open}
         title={t('home.conversationNav')}
         className="flex items-center justify-center w-7 h-7 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
       >

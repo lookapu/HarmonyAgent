@@ -10,7 +10,16 @@
 
 mod build_tools;
 mod cmd_tools;
+mod code_mutation;
 mod compose_tools;
+
+pub(crate) fn validate_code_mutation(
+    path: &std::path::Path,
+    before: &str,
+    after: &str,
+) -> Result<(), String> {
+    code_mutation::validate_candidate(path, before, after).map(|_| ())
+}
 pub mod contracts;
 pub mod capabilities;
 mod debug_tools;
@@ -893,7 +902,7 @@ name: "ask_history",
     },
     ToolSpec {
         name: "multi_edit",
-        desc: "一次调用批量修改多个文件（单文件替换逻辑与 edit_file 一致：old→new、可选 replace_all、冲突保护、可撤销）。\n参数：{\"edits\":[{\"path\":\"<文件路径，相对项目根或绝对路径>\",\"old\":\"<原文>\",\"new\":\"<新文>\",\"replace_all\":<可选布尔>}]}。\n转义提示：old/new 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行，old 会匹配失败。\n单次最多 10 个文件；某项失败不影响其他项继续，返回逐项 ✅/❌ 汇总。\n适合跨多文件的重命名/统一修复/接口迁移等联动修改，减少工具调用轮次。\n副作用：修改项目内文件。\n返回：逐项替换结果汇总。",
+        desc: "一次调用批量修改多个文件（单文件替换逻辑与 edit_file 一致：old→new、可选 replace_all、冲突保护、可撤销）。\n参数：{\"edits\":[{\"path\":\"<文件路径，相对项目根或绝对路径>\",\"old\":\"<原文>\",\"new\":\"<新文>\",\"replace_all\":<可选布尔>}]}。\n转义提示：old/new 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行，old 会匹配失败。\n单次最多 10 个文件；先对全部文件做冲突、语法/配平和范围验证，任一项失败则整体拒绝且不写入；全部通过后原子提交，提交中途失败会回滚已写文件。\n适合跨多文件的重命名/统一修复/接口迁移等联动修改，减少工具调用轮次。\n副作用：修改项目内文件。\n返回：原子提交的逐文件替换结果汇总。",
     },
     ToolSpec {
         name: "device_perf",

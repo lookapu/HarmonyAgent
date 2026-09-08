@@ -9,22 +9,10 @@ import Icon from '../../icons/Icon'
 export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedgerState }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(true)
-  const [checked, setChecked] = useState<Set<string>>(new Set())
   const { ledger, finished } = state
   if (!ledger) return null
   const running = !finished
-
-  const toggleCheck = (key: string) => {
-    setChecked((prev) => {
-      const next = new Set(prev)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
-    })
-  }
-
   const totalGoals = ledger.verified.length + ledger.open.length
-  const checkedCount = checked.size
 
   return (
     <div className="overflow-hidden animate-fade-in-up">
@@ -44,9 +32,9 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
             <span className="text-[11px] text-[var(--text-muted)] ml-2 truncate">{ledger.goal}</span>
           )}
         </div>
-        {totalGoals > 0 && !running && (
+        {totalGoals > 0 && (
           <span className="text-[10px] text-[var(--text-muted)] tabular-nums shrink-0">
-            {checkedCount}/{totalGoals}
+            {ledger.verified.length}/{totalGoals}
           </span>
         )}
         <span
@@ -71,48 +59,32 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
           </div>
           {ledger.verified.length > 0 && (
             <div className="space-y-0.5">
-              {ledger.verified.map((e) => {
-                const key = `v-${e.n}`
-                const isChecked = checked.has(key)
-                return (
-                  <div
-                    key={e.n}
-                    className="flex items-start gap-2 text-[11.5px] leading-relaxed cursor-pointer hover:opacity-80 transition-opacity"
-                    onClick={() => toggleCheck(key)}
-                  >
-                    <Icon name="check" size={11} className={`shrink-0 mt-0.5 ${isChecked ? 'text-[var(--text-muted)]' : 'text-[var(--success)]'}`} />
-                    <span className={`min-w-0 flex-1 ${isChecked ? 'line-through opacity-50' : ''}`}>
+              {ledger.verified.map((e) => (
+                  <div key={e.n} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+                    <Icon name="check" size={11} className="shrink-0 mt-0.5 text-[var(--success)]" />
+                    <span className="min-w-0 flex-1">
                       <span className="text-[var(--text-muted)]">
                         #{e.n} [{e.tool}]{' '}
                       </span>
                       <span className="text-[var(--text-secondary)]">{e.text}</span>
                     </span>
                   </div>
-                )
-              })}
+              ))}
             </div>
           )}
           {ledger.open.length > 0 && (
             <div className="space-y-0.5">
-              {ledger.open.map((e) => {
-                const key = `o-${e.n}`
-                const isChecked = checked.has(key)
-                return (
-                  <div
-                    key={e.n}
-                    className="flex items-start gap-2 text-[11.5px] leading-relaxed cursor-pointer hover:opacity-80 transition-opacity"
-                    onClick={() => toggleCheck(key)}
-                  >
-                    <Icon name="close" size={11} className={`shrink-0 mt-0.5 ${isChecked ? 'text-[var(--text-muted)]' : 'text-[var(--danger)]'}`} />
-                    <span className={`min-w-0 flex-1 ${isChecked ? 'line-through opacity-50' : ''}`}>
+              {ledger.open.map((e) => (
+                  <div key={e.n} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+                    <Icon name="close" size={11} className="shrink-0 mt-0.5 text-[var(--danger)]" />
+                    <span className="min-w-0 flex-1">
                       <span className="text-[var(--text-muted)]">
                         #{e.n} [{e.tool}]{' '}
                       </span>
                       <span className="text-[var(--text-secondary)]">{e.text}</span>
                     </span>
                   </div>
-                )
-              })}
+              ))}
             </div>
           )}
           {ledger.next && (

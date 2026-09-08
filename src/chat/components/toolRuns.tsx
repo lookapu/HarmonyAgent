@@ -7,6 +7,28 @@ import { fmtElapsed } from '../chatUtils'
 import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
 
+type MutationGuardKind = 'syntax' | 'rollback' | 'stale'
+
+const MUTATION_TOOLS = new Set([
+  'write_file',
+  'edit_file',
+  'multi_edit',
+  'apply_text_edits',
+  'lsp_rename',
+  'lsp_format',
+  'lsp_code_action',
+])
+
+/** 将内核写入门禁的稳定错误语义提升为 UI 状态；原始输出仍完整保留在终端区。 */
+export function mutationGuardKind(run: Pick<ToolRun, 'tool' | 'status' | 'output'>): MutationGuardKind | null {
+  if (run.status !== 'error' || !MUTATION_TOOLS.has(run.tool)) return null
+  const output = run.output.toLowerCase()
+  if (/语法门禁拒绝|java 声明门禁拒绝|syntax (?:mutation )?gate|syntax error nodes?/.test(output)) return 'syntax'
+  if (/原子提交失败|已回滚|atomic commit failed|rolled back/.test(output)) return 'rollback'
+  if (/结构(?:编辑句柄|定位)已过期|文件在定位后再次发生变化|stale (?:symbol|structure)|changed since/.test(output)) return 'stale'
+  return null
+}
+
 /* ============ 工具调用折叠组：一行展示（最后一次调用），点击展开全部 ============ */
 export const ToolRunGroup = memo(function ToolRunGroup({ runs, onRetry, onCancel }: { runs: ToolRun[]; onRetry?: (run: ToolRun) => void; onCancel?: (run: ToolRun) => void }) {
   const { t } = useTranslation()
@@ -100,6 +122,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
   const done = run.status === 'done' || run.status === 'error'
   // 展开内容：完成=最终输出（无输出时回退流式记录）；运行中=实时流式输出
   const displayOutput = done ? run.output || run.liveOutput || '' : run.liveOutput ?? ''
+  const guardKind = mutationGuardKind(run)
   // 运行中实时输出自动跟随（每次新行滚到底部）
   const liveRef = useRef<HTMLPreElement>(null)
   useEffect(() => {
@@ -221,6 +244,15 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
               </button>
             )}
           </div>
+          {guardKind && (
+            <div className="mx-3 mt-2 rounded-md border border-[var(--warning)]/35 bg-[var(--warning)]/10 px-2.5 py-2 text-[11px] leading-relaxed">
+              <div className="flex items-center gap-1.5 font-semibold text-[var(--warning)]">
+                <Icon name="info" size={11} />
+                {t(`home.mutationGuard.${guardKind}.title`)}
+              </div>
+              <div className="mt-0.5 text-[#aeb8c4]">{t(`home.mutationGuard.${guardKind}.detail`)}</div>
+            </div>
+          )}
           <pre
             ref={liveRef}
             className="px-3.5 py-2 text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed text-[#c9d1d9] max-h-64 overflow-y-auto"

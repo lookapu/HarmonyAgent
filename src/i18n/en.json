@@ -554,6 +554,20 @@
     "toolLevelL1": "Write (in project)",
     "toolLevelL2": "Dangerous (needs approval)",
     "toolWaitingOutput": "Running, waiting for output…",
+    "mutationGuard": {
+      "syntax": {
+        "title": "Syntax gate prevented the write",
+        "detail": "The candidate introduced new syntax errors, so the file was left unchanged. The agent can reload the target structure and regenerate a complete syntax node."
+      },
+      "rollback": {
+        "title": "Multi-file write rolled back safely",
+        "detail": "A file failed during the atomic commit. Earlier writes were restored so the workspace is not left partially updated."
+      },
+      "stale": {
+        "title": "Structure location is stale",
+        "detail": "An external tool changed the file after it was located, so the write was rejected. Reloading the structure provides a fresh baseline."
+      }
+    },
     "switchModel": "Switch Model",
     "subAgentModel": "Sub-agent Default Model",
     "subAgentFollowMain": "Follow main model",

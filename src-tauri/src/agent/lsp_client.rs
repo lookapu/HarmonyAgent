@@ -985,10 +985,11 @@ fn apply_edits_to_text(text: &str, edits: &[Value]) -> (String, usize, usize) {
 /// 写盘前记录 undo 快照（可 undo_edit 回退）。返回 (新增字符数, 删除字符数)。
 fn apply_text_edits(path: &Path, edits: &[Value], conversation_id: &str) -> Result<(usize, usize), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
-    // 落盘前记录快照：rename/format/code_action 的写盘可被 undo_edit 回退
-    crate::agent::undo::snapshot(conversation_id, path, &bytes);
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let (out, add, del) = apply_edits_to_text(&text, edits);
+    crate::agent::tools::validate_code_mutation(path, &text, &out)?;
+    // 候选文本通过写前门禁后才记录快照，避免失败修改污染 undo 栈。
+    crate::agent::undo::snapshot(conversation_id, path, &bytes);
     std::fs::write(path, out).map_err(|e| format!("写回 {} 失败: {e}", path.display()))?;
     Ok((add, del))
 }

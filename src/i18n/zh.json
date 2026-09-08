@@ -534,6 +534,20 @@
     "toolLevelL1": "写入操作（项目内）",
     "toolLevelL2": "危险操作（需确认）",
     "toolWaitingOutput": "正在执行，等待输出…",
+    "mutationGuard": {
+      "syntax": {
+        "title": "语法门禁已阻止写入",
+        "detail": "候选代码增加了语法错误，文件未被修改。Agent 可重新读取目标结构后生成完整语法节点。"
+      },
+      "rollback": {
+        "title": "多文件写入已安全回滚",
+        "detail": "原子提交中有文件写入失败，先前已写入的文件已恢复，避免工作区停留在半完成状态。"
+      },
+      "stale": {
+        "title": "结构定位已失效",
+        "detail": "文件在定位后被外部工具修改，本次写入已拒绝。重新查询结构即可基于最新内容继续。"
+      }
+    },
     "planTitle": "任务进度",
     "ledgerTitle": "任务账本",
     "ledgerRunning": "推进中",

@@ -2928,6 +2928,7 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
     let content = spec.content.as_str();
     let existed = p.exists();
     let mut content_out = content.to_string();
+    let mut old_bytes_for_undo: Option<Vec<u8>> = None;
     if existed {
         // 冲突保护：文件自上次读取后被外部修改（IDE/用户/其他会话）→ 拒绝覆盖，要求重读确认。
         // 整文件读取在 spawn_blocking 中执行，避免大文件读钉死 tokio worker。
@@ -2937,6 +2938,7 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
             .ok()
             .and_then(|r| r.ok());
         if let Some(bytes) = old_bytes {
+            old_bytes_for_undo = Some(bytes.clone());
             if has_external_change(p, &bytes) {
                 return Err(format!(
                     "写入冲突：文件 {} 自上次读取后被修改（可能被外部编辑器/IDE、其他会话或命令间接改动）。\n请先 read_file 查看最新内容、确认意图后再写入（重新读取会解除冲突保护）。",
@@ -2953,25 +2955,12 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
             if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) && !content_out.starts_with('\u{feff}') {
                 content_out.insert(0, '\u{feff}');
             }
-            // 撤销快照：覆盖前记录旧内容（必须记旧字节，记新内容会导致 undo 失效）
-            crate::agent::undo::snapshot(conversation_id, p, &bytes);
         }
-    }
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建目录失败 {}: {e}", parent.display()))?;
     }
     // 配平守卫（与 edit_file 同口径）：代码文件写入后必须配平——
     // 新文件不存在（旧内容为空串，视为配平基准），内容缺结束符（漏 } 等）→ 拒绝落盘
-    {
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let old_text = std::fs::read_to_string(p).unwrap_or_default(); // 不存在/读取失败 → 空串
-        balance_guard(&old_text, &content_out, &ext)?;
-    }
+    let old_text = std::fs::read_to_string(p).unwrap_or_default(); // 不存在/读取失败 → 空串
+    super::code_mutation::validate_candidate(p, &old_text, &content_out)?;
     // [58] dry-run：预览将写入的内容，不落盘、不写 undo
     if args["dry_run"].as_bool().unwrap_or(false) {
         let preview: String = {
@@ -2990,6 +2979,10 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
             preview
         ));
     }
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目录失败 {}: {e}", parent.display()))?;
+    }
     // 落盘 + 指纹登记：文件写入为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
     let p_buf = p.clone();
     let content_buf = content_out.clone();
@@ -3002,6 +2995,10 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
     .map_err(|e| format!("写入文件任务异常: {e}"))??;
     if let Some(meta) = wmeta {
         stamp_put(p, &meta, content_out.as_bytes());
+    }
+    if let Some(bytes) = old_bytes_for_undo.as_deref() {
+        // 仅成功落盘后记录旧内容，拒绝、预览或写入失败均不会污染 undo 栈。
+        crate::agent::undo::snapshot(conversation_id, p, bytes);
     }
     Ok(format!(
         "已{}文件 {}（{} 字节）",
@@ -3139,7 +3136,7 @@ fn plan_batch_blocks(
 
 /// 编辑落盘守卫：原文件配平而新内容失衡 → 拒绝（返回 Err 带定位提示）。
 /// 原文件本就失衡（病态/片段文件）时放行（允许修复），仅代码类扩展名适用。
-fn balance_guard(old_text: &str, new_text: &str, ext: &str) -> Result<(), String> {
+pub(super) fn balance_guard(old_text: &str, new_text: &str, ext: &str) -> Result<(), String> {
     if !is_code_ext(ext) {
         return Ok(());
     }
@@ -3277,7 +3274,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             .unwrap_or("")
             .to_lowercase();
         let (final_body, ranges) = plan_batch_blocks(body, starts, &spec.news, &spec.anchors, &ext)?;
-        balance_guard(body, &final_body, &ext)?;
+        super::code_mutation::validate_candidate(p, body, &final_body)?;
         let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body.clone() };
         if args["dry_run"].as_bool().unwrap_or(false) {
             let old_lines: Vec<&str> = body.split('\n').collect();
@@ -3363,7 +3360,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             ));
         }
         // 配平守卫：原文件配平而替换后失衡 → 拒绝落盘（新内容残缺，如漏结束符）
-        balance_guard(body, &final_body, &ext)?;
+        super::code_mutation::validate_candidate(p, body, &final_body)?;
         // 撤销快照：落盘前记录旧内容（会话级，undo_edit 工具按栈序恢复）
         crate::agent::undo::snapshot(conversation_id, p, &bytes);
         // 落盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
@@ -3407,14 +3404,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
     let (replaced, count) = apply_edit(body, old, new, replace_all)
         .map_err(|e| with_advice("edit_file", e))?;
     // 配平守卫：原文件配平而替换后失衡 → 拒绝落盘（新内容残缺，如漏结束符）
-    {
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        balance_guard(body, &replaced, &ext)?;
-    }
+    super::code_mutation::validate_candidate(p, body, &replaced)?;
     // 先构造 final_text 时不再 move replaced（dry_run 分支仍需借用）
     let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced.clone() };
     // [58] dry-run：内存 diff 预览，不落盘、不写 undo
@@ -3728,43 +3718,50 @@ pub(super) async fn multi_edit(
     if edits.len() > 10 {
         return Err("单次最多批量编辑 10 个文件，请拆分为多次调用".into());
     }
-    let mut report: Vec<String> = Vec::new();
-    let mut ok_count = 0usize;
+    let mut prepared = Vec::with_capacity(edits.len());
+    let mut paths = std::collections::HashSet::new();
     for (i, e) in edits.iter().enumerate() {
-        let raw = match e.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => {
-                report.push(format!("{}. ❌ 缺少 path 参数，跳过", i + 1));
-                continue;
-            }
-        };
+        let raw = e.get("path").and_then(|v| v.as_str()).ok_or_else(||
+            format!("第 {} 项缺少 path 参数；multi_edit 已整体拒绝，未写入任何文件", i + 1)
+        )?;
         let old = e.get("old").and_then(|v| v.as_str()).unwrap_or("");
         let new = e.get("new").and_then(|v| v.as_str()).unwrap_or("");
         let replace_all = e.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-        match apply_single_edit(raw, old, new, replace_all, roots, conversation_id) {
-            Ok(msg) => {
-                ok_count += 1;
-                report.push(format!("{}. ✅ {msg}", i + 1));
-            }
-            Err(err) => report.push(format!("{}. ❌ {err}", i + 1)),
+        let item = prepare_single_edit(raw, old, new, replace_all, roots)?;
+        if !paths.insert(item.path.clone()) {
+            return Err(format!(
+                "multi_edit 包含重复文件 {}；为避免顺序语义不确定已整体拒绝，未写入任何文件",
+                item.path.display()
+            ));
         }
+        prepared.push(item);
     }
+    commit_prepared_edits(&prepared, conversation_id)?;
     Ok(format!(
-        "批量编辑完成：{ok_count}/{} 项成功\n\n{}",
-        edits.len(),
-        report.join("\n")
+        "批量编辑原子提交完成：{} 个文件\n{}",
+        prepared.len(),
+        prepared.iter()
+            .map(|item| format!("✅ {}（替换 {} 处）", item.path.display(), item.count))
+            .collect::<Vec<_>>()
+            .join("\n")
     ))
 }
 
-/// 单文件替换核心（multi_edit 复用；校验/冲突保护/撤销快照/落盘与 edit_file 同口径）
-pub(super) fn apply_single_edit(
+struct PreparedEdit {
+    path: PathBuf,
+    old_bytes: Vec<u8>,
+    final_text: String,
+    count: usize,
+}
+
+/// 只读取、定位和验证候选文本，不产生写入或 undo 副作用。
+fn prepare_single_edit(
     raw: &str,
     old: &str,
     new: &str,
     replace_all: bool,
     roots: &[String],
-    conversation_id: &str,
-) -> Result<String, String> {
+) -> Result<PreparedEdit, String> {
     if old.is_empty() {
         return Err(format!("{raw}: old 参数不能为空"));
     }
@@ -3799,13 +3796,42 @@ pub(super) fn apply_single_edit(
         None => (false, text.as_str()),
     };
     let (replaced, count) = apply_edit(body, old, new, replace_all)?;
+    super::code_mutation::validate_candidate(&p, body, &replaced)?;
     let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced };
-    crate::agent::undo::snapshot(conversation_id, &p, &bytes);
-    std::fs::write(&p, final_text.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
-    if let Ok(meta) = std::fs::metadata(&p) {
-        stamp_put(&p, &meta, final_text.as_bytes());
+    Ok(PreparedEdit { path: p, old_bytes: bytes, final_text, count })
+}
+
+fn commit_prepared_edits(edits: &[PreparedEdit], conversation_id: &str) -> Result<(), String> {
+    let mut committed: Vec<&PreparedEdit> = Vec::with_capacity(edits.len());
+    for item in edits {
+        if let Err(error) = std::fs::write(&item.path, item.final_text.as_bytes()) {
+            // write 失败也可能已经截断或部分写入当前文件，当前项与此前项都要恢复。
+            let _ = std::fs::write(&item.path, &item.old_bytes);
+            if let Ok(meta) = std::fs::metadata(&item.path) {
+                stamp_put(&item.path, &meta, &item.old_bytes);
+            }
+            for previous in committed.iter().rev() {
+                let _ = std::fs::write(&previous.path, &previous.old_bytes);
+                if let Ok(meta) = std::fs::metadata(&previous.path) {
+                    stamp_put(&previous.path, &meta, &previous.old_bytes);
+                }
+            }
+            return Err(format!(
+                "multi_edit 原子提交失败，已恢复当前文件并回滚此前 {} 个文件：{}：{error}",
+                committed.len(),
+                item.path.display()
+            ));
+        }
+        if let Ok(meta) = std::fs::metadata(&item.path) {
+            stamp_put(&item.path, &meta, item.final_text.as_bytes());
+        }
+        committed.push(item);
     }
-    Ok(format!("{}（替换 {count} 处）", p.display()))
+    // 整批成功后才登记 undo，事务失败不会留下不可用的撤销记录。
+    for item in edits {
+        crate::agent::undo::snapshot(conversation_id, &item.path, &item.old_bytes);
+    }
+    Ok(())
 }
 
 /// copy_file：复制项目内文件/目录（不覆盖目标，禁止受保护路径）
@@ -4404,6 +4430,35 @@ mod tests {
         assert!(out2.is_err(), "覆盖为残缺应拒绝: {out2:?}");
         let after = std::fs::read_to_string(&f).unwrap();
         assert!(after.contains('}'), "原文件不应被改坏: {after}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn multi_edit_validates_all_files_before_any_write() {
+        let dir = std::env::temp_dir().join(format!("multi_atomic_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let first = dir.join("first.rs");
+        let second = dir.join("second.ts");
+        std::fs::write(&first, "fn first() { old(); }\n").unwrap();
+        std::fs::write(&second, "function second() { return 1; }\n").unwrap();
+        for path in [&first, &second] {
+            block_on_rt(read_file(&serde_json::json!({"path": path.to_string_lossy()}), &roots))
+                .expect("read establishes edit baseline");
+        }
+        let result = block_on_rt(multi_edit(
+            &serde_json::json!({
+                "edits": [
+                    {"path": first.to_string_lossy(), "old": "old", "new": "new"},
+                    {"path": second.to_string_lossy(), "old": "return 1", "new": "const value = ;"}
+                ]
+            }),
+            &roots,
+            "multi_atomic_test",
+        ));
+        assert!(result.is_err(), "第二个候选语法错误时应整体拒绝: {result:?}");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "fn first() { old(); }\n");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "function second() { return 1; }\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

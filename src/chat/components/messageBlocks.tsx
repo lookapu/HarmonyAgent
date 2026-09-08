@@ -59,31 +59,31 @@ export const ThinkingBlock = memo(function ThinkingBlock({ content, active }: { 
   const { t } = useTranslation()
   // 展开偏好记忆：用户手动开合后跨会话记住（localStorage）
   const [prefOpen, setPrefOpen] = useState(() => getItem(STORAGE_KEYS.THINKING_OPEN) === '1')
-  // 流式期间自动展开（覆盖偏好）；流结束后恢复用户偏好
-  const [streamingAutoOpen, setStreamingAutoOpen] = useState(false)
-  const open = active && streamingAutoOpen ? true : prefOpen
-  // 思考计时：从内容首次非空开始计时
-  const [thinkStart] = useState(() => (content.trim() ? Date.now() : 0))
+  // 流式期间默认展开，但允许用户在本轮手动收起；流结束后恢复持久偏好。
+  const [streamOverride, setStreamOverride] = useState<boolean | null>(null)
+  const open = active ? (streamOverride ?? true) : prefOpen
+  const thinkStartRef = useRef(0)
   const [thinkElapsed, setThinkElapsed] = useState(0)
   useEffect(() => {
-    if (!active || !thinkStart) {
+    if (!active || !content.trim()) {
+      thinkStartRef.current = 0
       setThinkElapsed(0)
       return
     }
-    setThinkElapsed(Math.floor((Date.now() - thinkStart) / 1000))
-    const timer = setInterval(() => setThinkElapsed(Math.floor((Date.now() - thinkStart) / 1000)), 1000)
+    if (!thinkStartRef.current) thinkStartRef.current = Date.now()
+    const update = () => setThinkElapsed(Math.floor((Date.now() - thinkStartRef.current) / 1000))
+    update()
+    const timer = setInterval(update, 1000)
     return () => clearInterval(timer)
-  }, [active, thinkStart])
-  // 流式开始时自动展开；流结束时恢复用户偏好
+  }, [active, content])
   useEffect(() => {
-    if (active && content.trim() && !streamingAutoOpen) {
-      setStreamingAutoOpen(true)
-    }
-    if (!active && streamingAutoOpen) {
-      setStreamingAutoOpen(false)
-    }
-  }, [active, content, streamingAutoOpen])
+    if (!active) setStreamOverride(null)
+  }, [active])
   const toggle = () => {
+    if (active) {
+      setStreamOverride(!open)
+      return
+    }
     setPrefOpen((v) => {
       const next = !v
       setItem(STORAGE_KEYS.THINKING_OPEN, next ? '1' : '0')
@@ -693,6 +693,14 @@ export const ErrorCard = memo(function ErrorCard({
   const showRetry = !detail || detail.retryable
   const kindLabel = detail ? (ERROR_KIND_LABELS[detail.kind] ?? detail.kind) : null
   const hasDetail = !!detail && (!!detail.reason || !!detail.suggestion)
+  const toneClass =
+    color === 'var(--warning)'
+      ? 'border-[var(--warning)]/30'
+      : 'border-[var(--danger)]/30'
+  const badgeClass =
+    color === 'var(--warning)'
+      ? 'text-[var(--warning)] bg-[var(--warning)]/10'
+      : 'text-[var(--danger)] bg-[var(--danger)]/10'
 
   const errorText = detail
     ? `[${detail.kind}] ${detail.title}\n${detail.reason}${detail.suggestion ? `\n建议：${detail.suggestion}` : ''}${detail.statusCode ? `\nHTTP ${detail.statusCode}` : ''}`
@@ -708,8 +716,7 @@ export const ErrorCard = memo(function ErrorCard({
 
   return (
     <div
-      className="animate-fade-in-up rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60 overflow-hidden"
-      style={{ borderColor: `${color}30` }}
+      className={`animate-fade-in-up rounded-lg border bg-[var(--bg-secondary)]/60 overflow-hidden ${toneClass}`}
     >
       {/* 头部：图标 + 标题/摘要 + 分类徽章 */}
       <div className="flex items-start gap-2 px-3 py-2.5">
@@ -718,8 +725,7 @@ export const ErrorCard = memo(function ErrorCard({
           <div className="flex items-center gap-2 flex-wrap">
             {kindLabel && (
               <span
-                className="text-[10px] font-medium px-1.5 py-0.5 rounded-md leading-none"
-                style={{ color, backgroundColor: `${color}18` }}
+                className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md leading-none ${badgeClass}`}
               >
                 {kindLabel}
               </span>
@@ -1009,4 +1015,3 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
     </div>
   )
 })
-
