@@ -165,7 +165,7 @@ export default function PerfMonitor() {
     <div className="fixed bottom-3 right-3 z-[var(--app-z-devtools)]" ref={panelRef}>
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-8 h-8 rounded-full flex items-center justify-center shadow-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] transition-all"
+        className="w-8 h-8 rounded-full flex items-center justify-center shadow-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] transition-colors"
         title="性能监控 (Ctrl+Shift+P)"
       >
         <span
@@ -307,7 +307,7 @@ function RecordItem({ record }: { record: PerfRecord }) {
 
       <div className="h-0.5 mx-2 mb-1 bg-[var(--bg-hover)] rounded-full overflow-hidden">
         <div
-          className="h-full rounded-full transition-all"
+          className="h-full rounded-full transition-[width,background-color]"
           style={{ width: `${barWidthPct}%`, backgroundColor: color }}
         />
       </div>

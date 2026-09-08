@@ -388,7 +388,7 @@ export default function ApiKnowledgePage() {
               </div>
               <div className="h-1.5 bg-[var(--bg-card)] rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-[var(--accent)] transition-all duration-300"
+                  className="h-full bg-[var(--accent)] transition-[width] duration-300"
                   style={{
                     width: embedProgress.total > 0
                       ? `${Math.min(100, (embedProgress.current / embedProgress.total) * 100)}%`
@@ -434,7 +434,7 @@ export default function ApiKnowledgePage() {
           </div>
           <div className="h-2 bg-[var(--bg-card)] rounded-full overflow-hidden">
             <div
-              className="h-full bg-[var(--accent)] transition-all duration-300"
+              className="h-full bg-[var(--accent)] transition-[width] duration-300"
               style={{ width: progress.total > 0 ? `${(progress.current / progress.total) * 100}%` : '0%' }}
             />
           </div>

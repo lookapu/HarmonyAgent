@@ -79,7 +79,7 @@ export class ErrorBoundary extends Component<Props, State> {
               </button>
               <button
                 onClick={this.reset}
-                className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-all"
+                className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-[color,background-color,border-color,opacity]"
               >
                 重试
               </button>

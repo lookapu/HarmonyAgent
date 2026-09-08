@@ -497,7 +497,7 @@ export function DevicesPanel({
           return (
             <div
               key={d.id}
-              className={`rounded-xl modern-card p-3 transition-all ${
+              className={`rounded-xl modern-card p-3 transition-[color,background-color,border-color,box-shadow] ${
                 d.is_default
                   ? 'border-[var(--accent)]/50 shadow-md shadow-[var(--accent)]/10'
                   : 'border-[var(--border)] hover:border-[var(--border-strong)]'
@@ -1313,7 +1313,7 @@ export function AnalyzePanel({
             type="button"
             onClick={() => setSub(tb.key)}
             title={tb.badge ? `${tb.label} (${tb.badge})` : tb.label}
-            className={`flex items-center justify-center gap-1 flex-1 h-6 rounded-[6px] text-[10.5px] transition-all border ${
+            className={`flex items-center justify-center gap-1 flex-1 h-6 rounded-[6px] text-[10.5px] transition-[color,background-color,border-color,box-shadow] border ${
               sub === tb.key
                 ? 'tab-soft font-medium border-[var(--border)]'
                 : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] border-transparent'
@@ -1582,7 +1582,7 @@ export function AnalyzePanel({
                             </div>
                             <div className="h-[3px] mt-0.5 rounded-full bg-[var(--bg-hover)] overflow-hidden">
                               <div
-                                className="h-full rounded-full bg-gradient-to-r from-[var(--accent)]/70 to-[var(--accent)]/30 transition-all"
+                                className="h-full rounded-full bg-gradient-to-r from-[var(--accent)]/70 to-[var(--accent)]/30 transition-[width]"
                                 style={{ width: `${Math.max(6, (k.count / maxCount) * 100)}%` }}
                               />
                             </div>

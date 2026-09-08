@@ -649,7 +649,7 @@ export const ErrorCard = memo(function ErrorCard({
         {showRetry && (
           <button
             onClick={onRetry}
-            className="shrink-0 h-7 px-3 rounded-lg text-white text-[11px] font-medium hover:opacity-90 active:scale-95 transition-all"
+            className="shrink-0 h-7 px-3 rounded-lg text-white text-[11px] font-medium hover:opacity-90 active:scale-95 transition-[opacity,transform]"
             style={{ backgroundColor: color }}
           >
             {retryLabel}
@@ -701,9 +701,9 @@ export const EmptyState = memo(function EmptyState({
               key={a.title}
               onClick={a.onClick}
               style={{ animationDelay: `${i * 60}ms` }}
-              className="group p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-md transition-all duration-200"
+              className="group p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-md transition-[color,background-color,border-color,box-shadow,transform] duration-200"
             >
-              <div className="w-7 h-7 rounded-md bg-[var(--accent-soft)] flex items-center justify-center mb-1.5 group-hover:bg-[var(--accent)] transition-all">
+              <div className="w-7 h-7 rounded-md bg-[var(--accent-soft)] flex items-center justify-center mb-1.5 group-hover:bg-[var(--accent)] transition-colors">
                 <Icon name={a.icon} size={13} className="group-hover:[filter:brightness(0)_invert(1)]!" />
               </div>
               <div className="text-[12px] font-medium text-[var(--text-primary)]">{a.title}</div>
@@ -778,10 +778,10 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
             key={a.title}
             onClick={() => onQuick(a.prompt)}
             style={{ animationDelay: `${i * 60}ms` }}
-            className="group p-3.5 rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-lg hover:shadow-[var(--accent)]/5 active:translate-y-0 transition-all duration-200"
+            className="group p-3.5 rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-lg hover:shadow-[var(--accent)]/5 active:translate-y-0 transition-[color,background-color,border-color,box-shadow,transform] duration-200"
           >
-            <div className="w-9 h-9 rounded-[10px] bg-[var(--accent-soft)] flex items-center justify-center mb-2.5 group-hover:bg-[var(--accent)] group-hover:shadow-md group-hover:shadow-[var(--accent)]/25 transition-all">
-              <Icon name={a.icon} size={17} className="transition-all group-hover:[filter:brightness(0)_invert(1)]!" />
+            <div className="w-9 h-9 rounded-[10px] bg-[var(--accent-soft)] flex items-center justify-center mb-2.5 group-hover:bg-[var(--accent)] group-hover:shadow-md group-hover:shadow-[var(--accent)]/25 transition-[color,background-color,border-color,box-shadow]">
+              <Icon name={a.icon} size={17} className="transition-[filter] group-hover:[filter:brightness(0)_invert(1)]!" />
             </div>
             <div className="text-[13px] font-medium text-[var(--text-primary)]">{a.title}</div>
             <div className="text-[11px] text-[var(--text-muted)] mt-0.5 leading-relaxed">{a.desc}</div>

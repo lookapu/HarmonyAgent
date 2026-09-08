@@ -553,7 +553,7 @@ export default function FileTreePanel({
                       }}
                       title={t('home.sendToChat')}
                       aria-label={t('home.sendToChat')}
-                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-all shrink-0"
+                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-[color,background-color,border-color,opacity] shrink-0"
                     >
                       <Icon name="plus" size={12} />
                     </button>
@@ -935,7 +935,7 @@ function TreeNodeItem({
             }}
             title={t('home.sendToChat')}
             aria-label={t('home.sendToChat')}
-            className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-all shrink-0"
+            className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-[color,background-color,border-color,opacity] shrink-0"
           >
             <Icon name="plus" size={12} />
           </button>

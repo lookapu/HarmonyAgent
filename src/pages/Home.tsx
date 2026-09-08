@@ -238,7 +238,7 @@ const convGroupKey = (ts: number): 'today' | 'yesterday' | 'week' | 'earlier' =>
 // 底 + 发光 hover 阴影，Button 的 rounded-md 基类与软色/实心变体都表达不了，
 // 强行迁移要先给 Button 加 shape/tone 维度，等有像素取证的那批再做。
 const composerSendCls =
-  'w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[var(--accent-600)] hover:bg-[var(--accent-500)] hover:shadow-[0_4px_16px_var(--accent-glow)]'
+  'w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,box-shadow,opacity,transform] shadow-lg shadow-[var(--accent)]/30 bg-[var(--accent-600)] hover:bg-[var(--accent-500)] hover:shadow-[0_4px_16px_var(--accent-glow)]'
 
 export default function Home() {
   const { t } = useTranslation()
@@ -3975,7 +3975,7 @@ export default function Home() {
                             e.stopPropagation()
                             void toggleProjectPin(p.id)
                           }}
-                          className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
+                          className={`p-1 ml-0.5 rounded-md transition-[color,background-color,border-color,opacity] shrink-0 ${
                             p.pinned
                               ? 'text-[var(--accent)] opacity-100'
                               : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
@@ -3990,7 +3990,7 @@ export default function Home() {
                             e.stopPropagation()
                             void handleDeleteProject(p.id)
                           }}
-                          className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
+                          className={`p-1 ml-0.5 rounded-md transition-[color,background-color,border-color,box-shadow,opacity] shrink-0 ${
                             confirmDeleteProjectId === p.id
                               ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)] opacity-100'
                               : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
@@ -4427,7 +4427,7 @@ export default function Home() {
                             {/* 会话短 ID：hover 可见，点击复制 */}
                             <button
                               onClick={(e) => { e.stopPropagation(); copyId(c.id) }}
-                              className="debug-id-badge font-mono text-[8.5px] px-1 py-px rounded border border-transparent text-[var(--text-muted)]/70 hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-all opacity-0 group-hover:opacity-100"
+                              className="debug-id-badge font-mono text-[8.5px] px-1 py-px rounded border border-transparent text-[var(--text-muted)]/70 hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-[color,background-color,border-color,opacity,transform] opacity-0 group-hover:opacity-100"
                               title={`${t('home.convId')}: ${c.id}\n${t('home.clickToCopy')}`}
                             >
                               {copiedId === c.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
@@ -4471,7 +4471,7 @@ export default function Home() {
                           e.stopPropagation()
                           togglePin(c.id, c.is_pinned)
                         }}
-                        className={`p-1 rounded-md transition-all shrink-0 ${
+                        className={`p-1 rounded-md transition-[color,background-color,border-color,opacity] shrink-0 ${
                           c.is_pinned
                             ? 'text-[var(--accent)] opacity-100'
                             : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
@@ -4509,7 +4509,7 @@ export default function Home() {
                           e.stopPropagation()
                           handleDeleteConversation(c.id)
                         }}
-                        className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
+                        className={`p-1 ml-0.5 rounded-md transition-[color,background-color,border-color,box-shadow,opacity] shrink-0 ${
                           confirmDeleteId === c.id
                             ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)] opacity-100'
                             : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
@@ -4976,7 +4976,7 @@ export default function Home() {
                                   <span className="text-[12px] text-[var(--text-secondary)]">{t('home.todoTitle')}</span>
                                   <span className="text-[11px] text-[var(--text-muted)] tabular-nums">{done}/{todos.length}</span>
                                   <div className="ml-auto h-1 w-12 rounded-full bg-[var(--bg-hover)] overflow-hidden">
-                                    <div className="h-full rounded-full bg-[var(--accent)] transition-all" style={{ width: `${pct}%` }} />
+                                    <div className="h-full rounded-full bg-[var(--accent)] transition-[width]" style={{ width: `${pct}%` }} />
                                   </div>
                                   <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform shrink-0 ${todoOpen ? 'rotate-90' : ''}`} />
                                 </button>
@@ -5099,7 +5099,7 @@ export default function Home() {
           {showScrollBottom && (
             <button
               onClick={() => scrollToBottom(true)}
-              className="sticky bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 pl-3 pr-2 h-8 rounded-full glass-card text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[color-mix(in_srgb,var(--accent)_50%,var(--border))] transition-all z-10 animate-fade-in-up tnum"
+              className="sticky bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 pl-3 pr-2 h-8 rounded-full glass-card text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[color-mix(in_srgb,var(--accent)_50%,var(--border))] transition-colors z-10 animate-fade-in-up tnum"
             >
               <Icon name="chevron-right" size={13} className="rotate-90" />
               {isStreaming ? t('home.scrollToLatest') : t('home.scrollBottom')}
@@ -5506,7 +5506,7 @@ export default function Home() {
                         : modelOptions,
                     )
                   }}
-                  className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-all"
+                  className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-[filter]"
                 >
                   <Icon name="arrow-down" size={11} />
                   {unfinishedConv.recoveryPolicy === 'manual' || unfinishedConv.recoveryPolicy === 'verify_effects'
@@ -5562,7 +5562,7 @@ export default function Home() {
             </div>
           )}
           <div
-            className="relative max-w-3xl mx-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] transition-all focus-within:border-[var(--accent)] focus-within:shadow-[0_0_0_3px_var(--accent-soft)]"
+            className="relative max-w-3xl mx-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] transition-[color,background-color,border-color,box-shadow] focus-within:border-[var(--accent)] focus-within:shadow-[0_0_0_3px_var(--accent-soft)]"
             onDragOver={(e) => {
               if (Array.from(e.dataTransfer.types).includes('Files')) {
                 e.preventDefault()
@@ -5929,7 +5929,7 @@ export default function Home() {
                     {toolRuns.some((r) => r.status === 'running') && (
                       <button
                         onClick={() => stopCurrentTool()}
-                        className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] items-center justify-start gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-all text-[12px] font-medium"
+                        className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] items-center justify-start gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-medium"
                         title={t('home.stopTool')}
                       >
                         <Icon name="bolt" size={12} className="shrink-0" />
@@ -5943,7 +5943,7 @@ export default function Home() {
                         const next = cycle[(cycle.indexOf(streamSpeed) + 1) % cycle.length]
                         setStreamSpeed(next)
                       }}
-                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center gap-1 hover:bg-[var(--bg-hover)] active:scale-95 transition-all text-[12px] font-mono font-medium tnum"
+                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center gap-1 hover:bg-[var(--bg-hover)] active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-mono font-medium tnum"
                       title={t('home.streamSpeedHint')}
                     >
                       {streamSpeed}x
@@ -5963,7 +5963,7 @@ export default function Home() {
                       }}
                       disabled={stopRequested}
                       aria-label={t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}
-                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 disabled:opacity-60 disabled:cursor-wait transition-all text-[12px] font-medium"
+                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 disabled:opacity-60 disabled:cursor-wait transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
                       title={t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}
                     >
                       <span className={`w-2.5 h-2.5 rounded-[3px] bg-[var(--danger)] shrink-0 ${stopRequested ? 'animate-pulse' : ''}`} />
@@ -5973,7 +5973,7 @@ export default function Home() {
                     <button
                       onClick={handleSendToAgent}
                       disabled={!draft.trim() || stopRequested}
-                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] items-center justify-start gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
+                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] items-center justify-start gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
                       title={t('home.sendToAgent')}
                     >
                       <Icon name="bolt" size={12} className="shrink-0" />
@@ -5993,7 +5993,7 @@ export default function Home() {
                     <button
                       onClick={() => setBatchOpen(true)}
                       disabled={!draft.trim() || stopRequested}
-                      className="hidden xl:flex h-8 xl:px-2.5 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center justify-start gap-1 hover:bg-[var(--bg-hover)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
+                      className="hidden xl:flex h-8 xl:px-2.5 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center justify-start gap-1 hover:bg-[var(--bg-hover)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
                       title={t('home.batchSend')}
                     >
                       <Icon name="package" size={12} />
@@ -6092,7 +6092,7 @@ export default function Home() {
                       <button
                         onClick={() => setGenMode(null)}
                         title={t('home.genCancelHint', '取消生成模式')}
-                        className="h-8 px-2.5 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] flex items-center gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 transition-all text-[12px] font-medium"
+                        className="h-8 px-2.5 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] flex items-center gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-medium"
                       >
                         <Icon name={GEN_ITEMS.find((g) => g.kind === genMode)?.icon ?? 'spark'} size={12} className="shrink-0" />
                         <span className="hidden sm:inline">{t(`home.genKind.${genMode}`)}</span>
@@ -7640,7 +7640,7 @@ const MessageItem = memo(function MessageItem({
               {onDeleteMessage && (
                 <button
                   onClick={() => onDeleteMessage(message)}
-                  className={`text-[10px] px-1.5 py-0.5 rounded-md transition-all ${
+                  className={`text-[10px] px-1.5 py-0.5 rounded-md transition-[color,background-color,border-color,box-shadow] ${
                     confirmDeleteMsgId === message.id
                       ? 'text-white bg-[var(--danger)] shadow-[0_0_0_3px_var(--danger-50)]'
                       : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
@@ -7885,7 +7885,7 @@ const MessageItem = memo(function MessageItem({
           {onDeleteMessage && (
             <button
               onClick={() => onDeleteMessage(message)}
-              className={`p-1 rounded-md transition-all ${confirmDeleteMsgId === message.id ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
+              className={`p-1 rounded-md transition-[color,background-color,border-color,box-shadow] ${confirmDeleteMsgId === message.id ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
               aria-label={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
               title={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
             >
@@ -8106,7 +8106,7 @@ const MessageItem = memo(function MessageItem({
                         })
                         setCtxMenu(null)
                       }}
-                      className={`w-7 h-7 rounded-md flex items-center justify-center text-[14px] font-semibold transition-all active:scale-90 ${
+                      className={`w-7 h-7 rounded-md flex items-center justify-center text-[14px] font-semibold transition-[color,background-color,border-color,box-shadow,transform] active:scale-90 ${
                         active
                           ? 'bg-[var(--warning)] text-white shadow-sm'
                           : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--warning)]'
@@ -8299,7 +8299,7 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
                         <Icon
                           name={isCopied ? 'check' : 'copy'}
                           size={10}
-                          className={`ml-1.5 transition-all ${isCopied ? 'text-[var(--success)] opacity-100' : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100'}`}
+                          className={`ml-1.5 transition-[color,background-color,border-color,opacity] ${isCopied ? 'text-[var(--success)] opacity-100' : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100'}`}
                         />
                       </span>
                     </div>
@@ -8863,7 +8863,7 @@ function PinnedBar({ convId, onJump }: { convId: string; onJump: (msgId: string)
                     pinned: false,
                   }).catch(() => {})
                 }}
-                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger)] transition-all shrink-0"
+                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger)] transition-[color,background-color,border-color,opacity] shrink-0"
                 aria-label={t('home.unpinFromTop')}
                 title={t('home.unpinFromTop')}
               >

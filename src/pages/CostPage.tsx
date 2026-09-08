@@ -1043,7 +1043,7 @@ function BalanceCard({ b }: { b: ProviderBalance }) {
           </p>
           {pct != null && (
             <div className="mt-2 h-1.5 rounded-full bg-[var(--bg-hover)] overflow-hidden">
-              <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: tone }} />
+              <div className="h-full rounded-full transition-[width,background-color]" style={{ width: `${pct}%`, background: tone }} />
             </div>
           )}
           <div className="mt-1.5 flex items-center justify-between text-[10px] text-[var(--text-muted)]">
@@ -1063,7 +1063,7 @@ function BalanceCard({ b }: { b: ProviderBalance }) {
 function StatCard({ label, value, tone }: { label: string; value: string | number; tone?: 'ok' | 'warn' | 'bad' }) {
   const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : tone === 'bad' ? 'var(--danger)' : undefined
   return (
-    <div className="modern-card p-4 transition-all hover:border-[var(--border-strong)]">
+    <div className="modern-card p-4 transition-colors hover:border-[var(--border-strong)]">
       <p className="text-xs text-[var(--text-secondary)]">{label}</p>
       <p className="text-lg font-semibold mt-1 tnum" style={color ? { color } : undefined}>{value}</p>
     </div>

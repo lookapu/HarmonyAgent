@@ -107,7 +107,7 @@ export default function KnowledgePage() {
         </div>
         <button
           onClick={() => { resetForm(); setShowForm(!showForm) }}
-          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-all"
+          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-[color,background-color,border-color,opacity]"
         >
           <span className="flex items-center gap-1.5">
             <Icon name={showForm ? 'close' : 'plus'} size={14} white />
@@ -120,7 +120,7 @@ export default function KnowledgePage() {
         <div className="inline-flex p-0.5 rounded-lg bg-[var(--bg-secondary)]">
           <button
             onClick={() => setScope('global')}
-            className={`h-7 px-3 rounded-md text-[12px] transition-all ${
+            className={`h-7 px-3 rounded-md text-[12px] transition-[color,background-color,border-color,box-shadow] ${
               effectiveScope === 'global'
                 ? 'bg-[var(--bg-card)] text-[var(--text-primary)] shadow-sm'
                 : 'tab-inactive'
@@ -130,7 +130,7 @@ export default function KnowledgePage() {
           </button>
           <button
             onClick={() => setScope('project')}
-            className={`h-7 px-3 rounded-md text-[12px] transition-all ${
+            className={`h-7 px-3 rounded-md text-[12px] transition-[color,background-color,border-color,box-shadow] ${
               effectiveScope === 'project'
                 ? 'bg-[var(--bg-card)] text-[var(--text-primary)] shadow-sm'
                 : 'tab-inactive'

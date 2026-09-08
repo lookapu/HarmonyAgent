@@ -197,7 +197,7 @@ export default function SkillsPage() {
         {view === 'skills' && (
           <button
             onClick={() => setShowForm(!showForm)}
-            className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-all shadow-lg shadow-[var(--accent)]/15"
+            className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-[color,background-color,border-color,opacity] shadow-lg shadow-[var(--accent)]/15"
           >
             <span className="flex items-center gap-1.5">
               <Icon name={showForm ? 'close' : 'download'} size={14} white />
@@ -299,7 +299,7 @@ export default function SkillsPage() {
             <button
               onClick={handleImport}
               disabled={!parsed || importing}
-              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {importing ? t('skill.importing') : t('skill.import')}
             </button>
@@ -335,7 +335,7 @@ export default function SkillsPage() {
                 key={tpl.key}
                 onClick={() => handleImportTemplate(tpl)}
                 disabled={installingKey !== null}
-                className={`text-left p-2.5 rounded-lg border transition-all ${
+                className={`text-left p-2.5 rounded-lg border transition-[color,background-color,border-color,opacity] ${
                   installed
                     ? 'border-[var(--success)]/50 bg-[var(--success)]/10'
                     : 'border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--accent)]/40 hover:bg-[var(--bg-hover)]'

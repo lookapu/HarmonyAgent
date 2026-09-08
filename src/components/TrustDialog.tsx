@@ -71,7 +71,7 @@ export default function TrustDialog({ inspect, onTrust, onReject, busy }: Props)
           <button
             onClick={onTrust}
             disabled={busy}
-            className="px-4 h-9 rounded-[10px] text-[13px] font-medium btn-primary disabled:opacity-40 transition-all"
+            className="px-4 h-9 rounded-[10px] text-[13px] font-medium btn-primary disabled:opacity-40 transition-[color,background-color,border-color,opacity]"
           >
             {busy ? '…' : t('trust.confirm')}
           </button>

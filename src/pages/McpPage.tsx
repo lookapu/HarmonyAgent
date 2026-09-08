@@ -107,7 +107,7 @@ function TemplateCard({ tpl, installed, globalOnly, justAdded, editing, onActiva
         }
       }}
       title={`${tpl.description}\n${tpl.popularity ? t('mcp.popularity', { data: tpl.popularity }) : ''}\n${tpl.envHint ? t('mcp.envSummary', { env: tpl.envHint }) : ''}\n${editing ? t('mcp.clickToFill') : t('mcp.clickToAdd')}`}
-      className={`px-2.5 py-2 rounded-xl border text-left transition-all cursor-pointer focus:outline-none focus-visible:border-[var(--accent)] ${
+      className={`px-2.5 py-2 rounded-xl border text-left transition-colors cursor-pointer focus:outline-none focus-visible:border-[var(--accent)] ${
         highlighted
           ? 'border-[var(--success)]/50 bg-[var(--success)]/10'
           : 'border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--accent)]/40 hover:bg-[var(--bg-hover)]'

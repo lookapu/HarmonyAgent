@@ -202,7 +202,7 @@ export function MemoriesPanel({
         <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.memoriesTip')}</p>
         <button
           onClick={startAdd}
-          className="shrink-0 h-7 px-2.5 rounded-lg bg-[var(--accent)]/10 text-[var(--accent)] text-[11px] font-medium flex items-center gap-1 hover:bg-[var(--accent)]/20 active:scale-95 transition-all"
+          className="shrink-0 h-7 px-2.5 rounded-lg bg-[var(--accent)]/10 text-[var(--accent)] text-[11px] font-medium flex items-center gap-1 hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,border-color,transform]"
         >
           <Icon name="plus" size={12} />
           {t('home.memoryAdd')}
@@ -256,7 +256,7 @@ export function MemoriesPanel({
             <button
               onClick={submit}
               disabled={busy || !title.trim() || !content.trim()}
-              className="h-7 px-3 rounded-lg btn-primary text-[11px] font-medium active:scale-95 disabled:opacity-40 transition-all"
+              className="h-7 px-3 rounded-lg btn-primary text-[11px] font-medium active:scale-95 disabled:opacity-40 transition-[color,background-color,border-color,opacity,transform]"
             >
               {t('common.save')}
             </button>
@@ -297,7 +297,7 @@ export function MemoriesPanel({
                 title={m.enabled ? t('home.memoryDisable') : t('home.memoryEnable')}
               >
                 <span
-                  className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${m.enabled ? 'left-3.5' : 'left-0.5'}`}
+                  className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-[left] ${m.enabled ? 'left-3.5' : 'left-0.5'}`}
                 />
               </button>
               <button
@@ -310,7 +310,7 @@ export function MemoriesPanel({
               </button>
               <button
                 onClick={() => handleDelete(m.id)}
-                className={`shrink-0 p-1 rounded-md transition-all ${
+                className={`shrink-0 p-1 rounded-md transition-[color,background-color,border-color,box-shadow] ${
                   confirmDeleteId === m.id
                     ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]'
                     : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
@@ -496,7 +496,7 @@ export function ToolStatsPanel({
                           </div>
                           <div className="mt-2 h-1.5 rounded-full bg-[var(--bg-hover)] overflow-hidden">
                             <div
-                              className={`h-full rounded-full transition-all ${rate >= 80 ? 'bg-[var(--success)]' : rate >= 50 ? 'bg-[var(--warning)]' : 'bg-[var(--danger)]'}`}
+                              className={`h-full rounded-full transition-[width,background-color] ${rate >= 80 ? 'bg-[var(--success)]' : rate >= 50 ? 'bg-[var(--warning)]' : 'bg-[var(--danger)]'}`}
                               style={{ width: `${rate}%` }}
                             />
                           </div>
@@ -551,7 +551,7 @@ export function PreviewPanel({
           onClick={onOpen}
           disabled={!url.trim()}
           title={t('home.open')}
-          className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium transition-all disabled:opacity-40 shrink-0"
+          className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium transition-[color,background-color,border-color,opacity] disabled:opacity-40 shrink-0"
         >
           {t('home.open')}
         </button>

@@ -757,7 +757,7 @@ export default function HealthPage() {
             <p className="text-[var(--text-secondary)] text-sm">{t('health.noProvider')}</p>
             <button
               onClick={() => navigate('/providers')}
-              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-all"
+              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-colors"
             >
               {t('health.goAdd')}
             </button>
