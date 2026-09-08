@@ -6309,7 +6309,7 @@ async fn stream_chat_inner(
         }
         // 强验收前移到“申请完成”时刻。缺少写入、后置验证、构建/测试/提交/推送等
         // 契约证据时自动回到工具循环；达到动态上限才保留为未完成，避免无限补救。
-        if !outcome.interrupted && remediation_rounds < execution_budget.remediation_rounds {
+        if !outcome.interrupted {
             let evidence = tool_runs.iter().map(|item| crate::agent::acceptance::ToolEvidence {
                 tool: &item.tool,
                 args: &item.args,
@@ -6319,10 +6319,17 @@ async fn stream_chat_inner(
             let report = state.0.lock().ok()
                 .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &evidence).ok())
                 .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &evidence));
-            if !report.passed {
-                remediation_rounds += 1;
+            if let crate::agent::agent_kernel::KernelStopDecision::Remediate {
+                report,
+                prompt,
+                round,
+            } = crate::agent::agent_kernel::decide_stop_candidate(
+                report,
+                &mut remediation_rounds,
+                execution_budget.remediation_rounds,
+            ) {
                 correction_text = crate::agent::tools::strip_tool_calls(&text);
-                correction_hint = crate::agent::acceptance::remediation_prompt(&report);
+                correction_hint = prompt;
                 if let Ok(conn) = state.0.lock() {
                     let value = serde_json::to_value(&report).unwrap_or_default();
                     let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
@@ -6333,7 +6340,7 @@ async fn stream_chat_inner(
                 let _ = app.emit("chat-governance", ChatGovernanceEvent {
                     conversation_id: conversation_id.clone(),
                     run_id: trace_id.clone(),
-                    remediation_count: remediation_rounds,
+                    remediation_count: round,
                     blockers: report.blockers,
                 });
                 continue;

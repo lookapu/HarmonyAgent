@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：v2 设计 + Phase 0/1 最小实现已落地（统一 Agent Kernel / 完整治理仍待推进）
+> 状态：v2 设计 + Phase 0/1 已落地，Phase 4 的协议、预算与验收内核已开始共用
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -117,6 +117,11 @@ pub trait AgentDriver: Send + Sync {
 `parse_openai_turn` 把 Provider 响应严格转换为 `KernelTurn`/`KernelToolCall`，
 `KernelUsageLedger` 统一累计 input/output/cached token 与成本。设有成本上限但 Provider
 缺少 usage 时会失败关闭；成本超限通过 `agent_budget_stop` 正常收敛，不会提前返回而丢失 trajectory。
+
+第二个切片已把“模型申请停止”统一为 `KernelStopDecision`：桌面 UI 与 builtin headless
+共同使用 `Accepted / Remediate / Exhausted` 裁决。headless 会编译 `GoalContract`、累计
+真实工具证据，并在缺少写入后验证等证据时向模型注入有界补救提示；最终报告写入
+`agent_acceptance_final`，失败则标记 `acceptance_failed`，grader 仍是 trial 成败的最终裁判。
 
 ### 5.1 事件输出接口
 
@@ -432,7 +437,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 ### Phase 4：统一 Agent Kernel
 
 - 从 `chat.rs` 抽取 ModelClient/stream parser（非流式 `KernelTurn` 与 usage ledger 基础已落地）；
-- 抽取消息历史、tool loop、reflexion、governance、recovery；
+- 抽取消息历史、tool loop、reflexion、governance、recovery（acceptance stop gate 已共用）；
 - Tauri UI 和 eval 共用 AgentKernel；
 - 再扩展 Anthropic/Gemini 适配器。
 

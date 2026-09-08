@@ -1,7 +1,7 @@
 # Headless Agent Eval Harness 设计
 
-> 状态：Phase 0 runner、builtin headless 驱动与 CLI 已接入；生产级统一 Agent Kernel 待推进
-> 更新日期：2026-09-07
+> 状态：Phase 0 runner、builtin headless 驱动与 CLI 已接入；协议、预算和验收 stop gate 已进入统一 Agent Kernel
+> 更新日期：2026-09-08
 
 ## 1. 目的
 
@@ -129,7 +129,9 @@ validate input
   -> write/digest report
 ```
 
-Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试、gold patch 或 grader 输出；grader 从原始 base commit 应用 `model.patch` 后执行。
+Agent 执行环境与 grader 环境必须分离。产品默认使用平台原生的独立工作树与受控子进程，
+不要求 Docker；外部 CI 可选容器适配器。Agent 不得看到隐藏测试、gold patch 或 grader
+输出；grader 从原始 base commit 应用 `model.patch` 后执行。
 
 ## 7. 可比性规则
 
@@ -168,6 +170,6 @@ Agent 运行容器与 grader 容器必须分离。Agent 不得看到隐藏测试
 - [x] 用一个 5 分钟内可完成的小仓任务作为 CI 手动 workflow artifact（`.github/workflows/headless-eval-smoke.yml`：macOS 临时 Git 仓、3 分钟任务预算、10 分钟 job 上限、真实 Provider secret、四件套上传和 API key 泄漏门禁；不依赖 Docker）；
 - [x] 未交付真实沙箱前，runner 必须拒绝不可信 task，而不是回退宿主执行（已落地为 `agent::eval_task`：task schema v1 解析 + 安全校验，拒绝宿主命令/绝对路径/`..`/命令替换/联网/不安全 artifact，并附单元测试）。
 
-已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`、`eval_runner.rs`、`headless_driver.rs` 与 `agent_kernel.rs`；主路径剩余工作是把 UI 流式协议、消息循环、recovery 和 acceptance 继续迁入统一 Agent Kernel。
+已完成部分见 `src-tauri/src/agent/eval_task.rs`、`eval_report.rs`、`eval_trajectory.rs`、`eval_grader.rs`、`eval_patch.rs`、`eval_workspace.rs`、`eval_runner.rs`、`headless_driver.rs` 与 `agent_kernel.rs`；桌面 UI 与 headless 已共用有界 acceptance stop gate，主路径剩余工作是把 UI 流式协议、消息历史、tool loop 和 recovery 继续迁入统一 Agent Kernel。
 
 相关文档：[固定评测集](FIXED_EVALUATION_SUITE.md)、[评测运行快照](EVALUATION_RUN_SNAPSHOTS.md)、[安全边界](SECURITY_BOUNDARY.md)、[演进路线](AGENT_EVOLUTION_ROADMAP_2026.md)。

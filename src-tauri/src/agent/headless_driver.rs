@@ -4,7 +4,10 @@
 //! not a replacement for the UI loop yet; the driver is marked `minimal` in the
 //! event stream and is intended for eval smoke tests while AgentKernel is extracted.
 
-use crate::agent::agent_kernel::{parse_openai_turn, KernelUsageLedger};
+use crate::agent::agent_kernel::{
+    parse_openai_turn, KernelAcceptanceGate, KernelStopDecision, KernelToolEvidence,
+    KernelUsageLedger,
+};
 use crate::agent::eval_report::ModelInfo;
 use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
 use crate::agent::eval_task::EvalTask;
@@ -22,6 +25,7 @@ use std::time::{Duration, Instant};
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOOL_RESULT_CHARS: usize = 32_000;
 const MAX_AUDIT_TEXT_CHARS: usize = 4_000;
+const MAX_REMEDIATION_ROUNDS: usize = 2;
 
 fn bounded_audit_text(value: &str) -> (String, bool, String) {
     let redacted = serde_json::from_str::<Value>(value)
@@ -278,7 +282,12 @@ impl HeadlessAgentDriver {
         let mut sink =
             SessionTrajectorySink::from_db(&runtime.db, conversation_id, trace_id.to_string())
                 .map_err(AgentDriverError::Failed)?;
-        let system = "你是 HarmonyAgent 的 headless eval agent。只使用提供的工具修改当前工作区；完成修改后必须验证。不要执行工作区外操作。";
+        let mut acceptance =
+            KernelAcceptanceGate::new(&task.problem_statement, MAX_REMEDIATION_ROUNDS);
+        let system = format!(
+            "你是 HarmonyAgent 的 headless eval agent。只使用提供的工具修改当前工作区；完成修改后必须验证。不要执行工作区外操作。\n\n{}",
+            acceptance.directive()
+        );
         let mut messages = vec![
             json!({"role":"system","content":system}),
             json!({"role":"user","content":task.problem_statement}),
@@ -301,6 +310,7 @@ impl HeadlessAgentDriver {
         let round_limit = self.provider.max_rounds.min(task.limits.max_steps as u32);
         let mut stopped_by_model = false;
         let mut stopped_by_budget = false;
+        let mut stopped_by_acceptance = false;
         for round in 0..round_limit {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
             if started.elapsed() >= wall_time {
@@ -348,15 +358,49 @@ impl HeadlessAgentDriver {
                 break;
             }
             if turn.is_stop_candidate() {
-                stopped_by_model = true;
-                sink.append(
-                    SessionEventType::SystemNote,
-                    json!({"text":"model returned text"}),
-                    "agent_stop_candidate",
-                    json!({"reason":"model_text"}),
-                )
-                .map_err(AgentDriverError::Failed)?;
-                break;
+                match acceptance.request_stop() {
+                    KernelStopDecision::Accepted(report) => {
+                        stopped_by_model = true;
+                        sink.append(
+                            SessionEventType::SystemNote,
+                            serde_json::to_value(&report)
+                                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
+                            "agent_stop_candidate",
+                            json!({"reason":"acceptance_passed","evidence_count":report.evidence_count}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                        break;
+                    }
+                    KernelStopDecision::Remediate {
+                        report,
+                        prompt,
+                        round,
+                    } => {
+                        sink.append(
+                            SessionEventType::SystemNote,
+                            serde_json::to_value(&report)
+                                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
+                            "agent_acceptance_remediation",
+                            json!({"round":round,"blockers":report.blockers}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                        messages.push(json!({"role":"user","content":prompt}));
+                        continue;
+                    }
+                    KernelStopDecision::Exhausted(report) => {
+                        stopped_by_acceptance = true;
+                        outcome.failure_taxonomy.push("acceptance_failed".into());
+                        sink.append(
+                            SessionEventType::SystemNote,
+                            serde_json::to_value(&report)
+                                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
+                            "agent_acceptance_exhausted",
+                            json!({"blockers":report.blockers,"remediation_rounds":acceptance.remediation_rounds()}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                        break;
+                    }
+                }
             }
             for call in turn.tool_calls {
                 let id = call.id.as_str();
@@ -459,12 +503,44 @@ impl HeadlessAgentDriver {
                     }),
                 )
                 .map_err(AgentDriverError::Failed)?;
+                acceptance.record(KernelToolEvidence {
+                    tool: name.to_string(),
+                    arguments: args.to_string(),
+                    output: text.clone(),
+                    succeeded: ok,
+                });
                 messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
             }
         }
-        if !stopped_by_model && !stopped_by_budget && outcome.steps >= round_limit as u64 {
+        if !stopped_by_model
+            && !stopped_by_budget
+            && !stopped_by_acceptance
+            && outcome.steps >= round_limit as u64
+        {
             outcome.failure_taxonomy.push("max_steps_exceeded".into());
         }
+        let acceptance_report = acceptance.report();
+        if !acceptance_report.passed
+            && !outcome
+                .failure_taxonomy
+                .iter()
+                .any(|item| item == "acceptance_failed")
+        {
+            outcome.failure_taxonomy.push("acceptance_failed".into());
+        }
+        sink.append(
+            SessionEventType::SystemNote,
+            serde_json::to_value(&acceptance_report)
+                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
+            "agent_acceptance_final",
+            json!({
+                "passed":acceptance_report.passed,
+                "blockers":acceptance_report.blockers,
+                "evidence_count":acceptance_report.evidence_count,
+                "remediation_rounds":acceptance.remediation_rounds(),
+            }),
+        )
+        .map_err(AgentDriverError::Failed)?;
         let tool_quality = runtime
             .quality_summary()
             .map_err(AgentDriverError::Failed)?;
@@ -556,7 +632,7 @@ mod tests {
             schema_version: crate::agent::eval_task::EVAL_TASK_SCHEMA_VERSION,
             task_id: "offline__headless-loop".into(),
             suite: "offline".into(),
-            problem_statement: "write fixed to a.txt".into(),
+            problem_statement: "set a.txt content to the target value".into(),
             repo: EvalRepo {
                 url: "file:///offline".into(),
                 base_commit: "0000000".into(),
@@ -718,6 +794,71 @@ mod tests {
         assert!(!serde_json::to_string(&outcome.trajectory)
             .unwrap()
             .contains("test-secret"));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn builtin_driver_remediates_early_stop_until_evidence_passes() {
+        let responses = [
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call-write", "type": "function",
+                        "function": {"name": "write_file", "arguments": "{\"path\":\"a.txt\",\"content\":\"fixed\\n\"}"}
+                    }]}
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }),
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            }),
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call-read", "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}
+                    }]}
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3}
+            }),
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "verified"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            }),
+        ];
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-acceptance-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "base\n").unwrap();
+        let mut task = offline_task();
+        task.problem_statement = "修改 a.txt 的内容并验证".into();
+
+        let outcome = scripted_driver(responses)
+            .run_async(&task, &workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps, 4);
+        assert_eq!(outcome.tool_calls, 2);
+        assert!(!outcome
+            .failure_taxonomy
+            .contains(&"acceptance_failed".to_string()));
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "agent_acceptance_remediation"));
+        let final_acceptance = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "agent_acceptance_final")
+            .expect("最终验收必须进入 trajectory");
+        assert_eq!(final_acceptance.fields["passed"], true);
+        assert_eq!(final_acceptance.fields["remediation_rounds"], 1);
         std::fs::remove_dir_all(workspace).ok();
     }
 

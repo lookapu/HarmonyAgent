@@ -5,6 +5,10 @@
 
 use serde_json::Value;
 
+use crate::agent::acceptance::{
+    evaluate_contract, remediation_prompt, AcceptanceReport, GoalContract, ToolEvidence,
+};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelUsage {
     pub input_tokens: u64,
@@ -194,6 +198,106 @@ impl KernelUsageLedger {
     }
 }
 
+/// 统一内核持有的工具证据。使用 owned 字段，既能跨异步回合保存，也不会把 UI/headless
+/// 的具体 ToolRun 类型泄漏到验收模块。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelToolEvidence {
+    pub tool: String,
+    pub arguments: String,
+    pub output: String,
+    pub succeeded: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum KernelStopDecision {
+    Accepted(AcceptanceReport),
+    Remediate {
+        report: AcceptanceReport,
+        prompt: String,
+        round: usize,
+    },
+    Exhausted(AcceptanceReport),
+}
+
+/// 对一次模型停止申请作统一裁决。调用方可以传入普通目标验收报告，也可以传入 UI
+/// 聚合子任务 DAG 后的报告；内核只负责一致的有界补救语义。
+pub fn decide_stop_candidate(
+    report: AcceptanceReport,
+    remediation_rounds: &mut usize,
+    max_remediation_rounds: usize,
+) -> KernelStopDecision {
+    if report.passed {
+        return KernelStopDecision::Accepted(report);
+    }
+    if *remediation_rounds >= max_remediation_rounds {
+        return KernelStopDecision::Exhausted(report);
+    }
+    *remediation_rounds = remediation_rounds.saturating_add(1);
+    KernelStopDecision::Remediate {
+        prompt: remediation_prompt(&report),
+        report,
+        round: *remediation_rounds,
+    }
+}
+
+/// 模型只能申请停止；是否真正停止由目标契约和真实工具证据裁决。
+///
+/// UI 与 headless 使用同一状态机后，benchmark 不会把“模型说完成了”误当成已完成，
+/// 同时通过有界 remediation 次数避免弱模型无限自循环。
+#[derive(Clone, Debug)]
+pub struct KernelAcceptanceGate {
+    contract: GoalContract,
+    evidence: Vec<KernelToolEvidence>,
+    remediation_rounds: usize,
+    max_remediation_rounds: usize,
+}
+
+impl KernelAcceptanceGate {
+    pub fn new(goal: &str, max_remediation_rounds: usize) -> Self {
+        Self {
+            contract: GoalContract::compile(goal),
+            evidence: Vec::new(),
+            remediation_rounds: 0,
+            max_remediation_rounds,
+        }
+    }
+
+    pub fn directive(&self) -> String {
+        self.contract.directive()
+    }
+
+    pub fn record(&mut self, evidence: KernelToolEvidence) {
+        self.evidence.push(evidence);
+    }
+
+    pub fn report(&self) -> AcceptanceReport {
+        let evidence = self
+            .evidence
+            .iter()
+            .map(|item| ToolEvidence {
+                tool: &item.tool,
+                args: &item.arguments,
+                output: &item.output,
+                succeeded: item.succeeded,
+            })
+            .collect::<Vec<_>>();
+        evaluate_contract(&self.contract, &evidence)
+    }
+
+    pub fn request_stop(&mut self) -> KernelStopDecision {
+        let report = self.report();
+        decide_stop_candidate(
+            report,
+            &mut self.remediation_rounds,
+            self.max_remediation_rounds,
+        )
+    }
+
+    pub fn remediation_rounds(&self) -> usize {
+        self.remediation_rounds
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +353,44 @@ mod tests {
                 cached_tokens: 0,
             }))
             .unwrap());
+    }
+
+    #[test]
+    fn acceptance_gate_requires_post_mutation_verification() {
+        let mut gate = KernelAcceptanceGate::new("修改 src/a.rs 并验证", 2);
+        gate.record(KernelToolEvidence {
+            tool: "write_file".into(),
+            arguments: r#"{"path":"src/a.rs","content":"fixed"}"#.into(),
+            output: "written".into(),
+            succeeded: true,
+        });
+        assert!(matches!(
+            gate.request_stop(),
+            KernelStopDecision::Remediate { round: 1, .. }
+        ));
+        gate.record(KernelToolEvidence {
+            tool: "read_file".into(),
+            arguments: r#"{"path":"src/a.rs"}"#.into(),
+            output: "fixed".into(),
+            succeeded: true,
+        });
+        assert!(matches!(
+            gate.request_stop(),
+            KernelStopDecision::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn acceptance_gate_exhaustion_is_bounded() {
+        let mut gate = KernelAcceptanceGate::new("修改 a.rs", 1);
+        assert!(matches!(
+            gate.request_stop(),
+            KernelStopDecision::Remediate { round: 1, .. }
+        ));
+        assert!(matches!(
+            gate.request_stop(),
+            KernelStopDecision::Exhausted(_)
+        ));
+        assert_eq!(gate.remediation_rounds(), 1);
     }
 }
