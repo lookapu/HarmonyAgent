@@ -8,6 +8,13 @@ use crate::agent::kernel_loop::{
     KernelLoopGovernor, KernelLoopVerdict, KernelRoundDecision, KernelRoundInput,
     KernelRoundRouter,
 };
+use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelRunPermit {
+    Proceed { remaining: Duration },
+    Halt(KernelRunTermination),
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct KernelExecutorState {
@@ -23,6 +30,26 @@ impl KernelExecutorState {
 
     pub fn decide_round(&mut self, input: &KernelRoundInput<'_>) -> KernelRoundDecision {
         self.rounds.decide(input)
+    }
+
+    /// 每次 Provider 请求前的共用安全点。deadline 优先于取消，与桌面历史顺序一致。
+    pub fn permit_run(
+        &mut self,
+        cancelled: bool,
+        elapsed: Duration,
+        deadline: Duration,
+    ) -> KernelRunPermit {
+        if elapsed >= deadline {
+            self.terminate(KernelRunTermination::DeadlineExceeded);
+            return KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded);
+        }
+        if cancelled {
+            self.terminate(KernelRunTermination::UserCancelled);
+            return KernelRunPermit::Halt(KernelRunTermination::UserCancelled);
+        }
+        KernelRunPermit::Proceed {
+            remaining: deadline.saturating_sub(elapsed),
+        }
     }
 
     pub fn observe_tool(&mut self, tool: &str, args: &str) -> KernelLoopVerdict {
@@ -102,6 +129,38 @@ mod tests {
         assert_eq!(
             executor.termination(),
             Some(KernelRunTermination::ToolCallBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn executor_run_permit_prioritizes_deadline_and_reports_remaining_time() {
+        let mut executor = KernelExecutorState::new();
+        assert_eq!(
+            executor.permit_run(false, Duration::from_secs(4), Duration::from_secs(10)),
+            KernelRunPermit::Proceed {
+                remaining: Duration::from_secs(6)
+            }
+        );
+        assert_eq!(
+            executor.permit_run(true, Duration::from_secs(10), Duration::from_secs(10)),
+            KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded)
+        );
+        assert_eq!(
+            executor.termination(),
+            Some(KernelRunTermination::DeadlineExceeded)
+        );
+    }
+
+    #[test]
+    fn executor_run_permit_records_user_cancellation() {
+        let mut executor = KernelExecutorState::new();
+        assert_eq!(
+            executor.permit_run(true, Duration::from_secs(1), Duration::from_secs(10)),
+            KernelRunPermit::Halt(KernelRunTermination::UserCancelled)
+        );
+        assert_eq!(
+            executor.termination(),
+            Some(KernelRunTermination::UserCancelled)
         );
     }
 }

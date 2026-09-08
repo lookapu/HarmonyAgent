@@ -946,6 +946,8 @@ pub struct KernelToolEvidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelRunTermination {
     ModelAccepted,
+    UserCancelled,
+    DeadlineExceeded,
     CostBudgetExceeded,
     AcceptanceExhausted,
     EmptyRoundsExhausted,
@@ -958,6 +960,8 @@ impl KernelRunTermination {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ModelAccepted => "model_accepted",
+            Self::UserCancelled => "user_cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::CostBudgetExceeded => "max_cost_exceeded",
             Self::AcceptanceExhausted => "acceptance_exhausted",
             Self::EmptyRoundsExhausted => "empty_rounds_exhausted",
@@ -970,7 +974,8 @@ impl KernelRunTermination {
     /// 需要进入失败分类的终止原因；模型通过验收后正常停止不产生失败 taxonomy。
     pub fn failure_taxonomy(self) -> Option<&'static str> {
         match self {
-            Self::ModelAccepted => None,
+            Self::ModelAccepted | Self::UserCancelled => None,
+            Self::DeadlineExceeded => Some("max_wall_time_exceeded"),
             Self::CostBudgetExceeded => Some("max_cost_exceeded"),
             Self::AcceptanceExhausted => Some("acceptance_failed"),
             Self::EmptyRoundsExhausted => Some("empty_rounds_exhausted"),

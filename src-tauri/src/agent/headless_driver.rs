@@ -11,7 +11,7 @@ use crate::agent::agent_kernel::{
     KernelToolEvidence, KernelTransportStop, KernelTurn, KernelUsageLedger, KERNEL_STREAM_MAX_BYTES,
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
-use crate::agent::kernel_executor::KernelExecutorState;
+use crate::agent::kernel_executor::{KernelExecutorState, KernelRunPermit};
 use crate::agent::kernel_loop::{KernelRoundControl, KernelRoundInput};
 use crate::agent::kernel_history::continuation_instruction;
 use crate::agent::eval_report::ModelInfo;
@@ -556,16 +556,25 @@ impl HeadlessAgentDriver {
         
         'rounds: for round in 0..round_limit {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
-            if started.elapsed() >= wall_time {
-                return Err(AgentDriverError::Cancelled(
-                    "builtin driver 超过 wall time".into(),
-                ));
-            }
+            let remaining = match kernel_executor.permit_run(false, started.elapsed(), wall_time) {
+                KernelRunPermit::Proceed { remaining } => remaining,
+                KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded) => {
+                    return Err(AgentDriverError::Cancelled(
+                        "builtin driver 超过 wall time".into(),
+                    ));
+                }
+                KernelRunPermit::Halt(reason) => {
+                    return Err(AgentDriverError::Cancelled(format!(
+                        "builtin driver 已停止：{}",
+                        reason.as_str()
+                    )));
+                }
+            };
             outcome.steps = round as u64 + 1;
             let request_timeout = self
                 .request_timeout
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
-                .min(wall_time.saturating_sub(started.elapsed()));
+                .min(remaining);
             let (turn, retries) = self
                 .client
                 .request(&self.provider, messages.clone(), request_timeout)
@@ -1410,6 +1419,29 @@ mod tests {
         assert!(
             matches!(error, crate::agent::eval_runner::AgentDriverError::Failed(message) if message.contains("未返回 usage"))
         );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn run_permit_stops_before_provider_when_wall_time_is_exhausted() {
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-wall-time-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut task = offline_task();
+        task.limits.wall_time_seconds = 0;
+
+        let error = scripted_driver([])
+            .run_async(&task, &workspace)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::agent::eval_runner::AgentDriverError::Cancelled(message)
+                if message.contains("wall time")
+        ));
+
         std::fs::remove_dir_all(workspace).ok();
     }
 

@@ -21,7 +21,7 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
     run_tool_with_retry, retry_notice,
 };
-use crate::agent::kernel_executor::KernelExecutorState;
+use crate::agent::kernel_executor::{KernelExecutorState, KernelRunPermit};
 use crate::agent::kernel_loop::{KernelToolBudgetGate, KernelRoundInput};
 use crate::agent::kernel_history::{KernelHistoryAssembler, KernelHistoryInput, HistoryRow, ToolResult, UserInjection};
 use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
@@ -4306,8 +4306,19 @@ async fn stream_chat_inner(
             }
             workflow_stage = Some(workflow.stage);
         }
+        // Provider 请求前共用安全点：统一 deadline/cancel 优先级与剩余时间语义。
+        let run_permit = kernel_executor.permit_run(
+            is_cancelled(cancel, &conversation_id),
+            task_started.elapsed(),
+            std::time::Duration::from_millis(task_deadline_ms.max(0) as u64),
+        );
         // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
-        if task_started.elapsed().as_millis() as i64 > task_deadline_ms {
+        if matches!(
+            run_permit,
+            KernelRunPermit::Halt(
+                crate::agent::agent_kernel::KernelRunTermination::DeadlineExceeded
+            )
+        ) {
             crate::utils::logger::log_event(
                 "task_deadline_hit",
                 serde_json::json!({
@@ -4370,7 +4381,12 @@ async fn stream_chat_inner(
             });
         }
         // 检查停止请求（安全点：每轮请求前，工具执行完成后会回到这里）
-        if is_cancelled(cancel, &conversation_id) {
+        if matches!(
+            run_permit,
+            KernelRunPermit::Halt(
+                crate::agent::agent_kernel::KernelRunTermination::UserCancelled
+            )
+        ) {
             crate::utils::logger::log_event(
                 "stop_effective",
                 serde_json::json!({
