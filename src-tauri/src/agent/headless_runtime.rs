@@ -2,13 +2,12 @@
 
 use crate::agent::exec_ctx::ToolCtx;
 use crate::agent::tools::contracts::{ApprovalPolicy, ToolContract};
-use crate::agent::tools::{is_retryable_err, run_tool_boxed};
+use crate::agent::tools::run_tool_boxed;
 use crate::db::DbState;
 use crate::services::mcp_manager::McpManager;
 use crate::services::permissions::{self, Level};
-use crate::utils::retry::{retry_with_backoff, RetryResult, TOOL_POLICY};
+use crate::utils::retry::TOOL_POLICY;
 use rusqlite::Connection;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -16,35 +15,8 @@ use std::sync::{
 };
 use std::time::Duration;
 
-/// 与桌面 UI tool loop 相同的自动重试语义：契约 retry_safe + 可恢复错误白名单 +
-/// 指数退避。生产路径传 `TOOL_POLICY`；`attempt` 负责一次执行（含取消与剩余
-/// wall time 检查）。
-pub(crate) async fn run_tool_with_retry<F, Fut>(
-    contract: &ToolContract,
-    policy: &crate::utils::retry::RetryPolicy,
-    mut attempt: F,
-) -> RetryResult<String, String>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<String, String>>,
-{
-    retry_with_backoff(
-        policy,
-        &mut attempt,
-        |error: &String| contract.retry_safe && is_retryable_err(error),
-        |_| None,
-    )
-    .await
-}
-
-/// 重试成功后的模型可见提示，与 UI 的措辞保持一致。
-pub(crate) fn retry_notice(output: String, attempts: usize) -> String {
-    if attempts > 1 {
-        format!("（首次执行超时/网络错误，已自动重试 {} 次）\n{output}", attempts - 1)
-    } else {
-        output
-    }
-}
+// 重试语义已统一到 agent_kernel，headless 直接复用。
+pub(crate) use crate::agent::agent_kernel::{retry_notice, run_tool_with_retry};
 
 fn audit_preview(value: &str) -> String {
     serde_json::from_str::<serde_json::Value>(value)

@@ -14,11 +14,12 @@ use crate::utils::errors::{
     classify_text, parse_retry_after_secs, provider_error_with_retry_after, transport_error, ErrorKind,
     FriendlyError,
 };
-use crate::utils::retry::{retry_with_backoff, STREAM_REQUEST_POLICY, TOOL_POLICY};
+use crate::utils::retry::{STREAM_REQUEST_POLICY, TOOL_POLICY};
 use crate::utils::task_registry::{TaskRegistry, PHASE_MAIN_LOOP, PHASE_ROUND_REQUEST, PHASE_SEND, PHASE_START, PHASE_STREAMING, PHASE_TOOL};
 use crate::agent::agent_kernel::{
     KernelStreamGovernor, KernelStreamSignal, KERNEL_STREAM_MAX_BYTES,
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
+    run_tool_with_retry, retry_notice,
 };
 use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
 use crate::agent::tools::guards::is_cancelled;
@@ -5837,9 +5838,11 @@ async fn stream_chat_inner(
                 (r, 0)
             } else {
                 // 执行工具：超时/网络类错误按指数退避自动重试（可恢复错误白名单）
-                let retried = retry_with_backoff(
+                let contract = crate::agent::tools::contracts::contract(&tool);
+                let retried = run_tool_with_retry(
+                    &contract,
                     &TOOL_POLICY,
-                    &mut || {
+                    || {
                         run_tool_with_guard(
                             &tool,
                             &args_raw,
@@ -5855,20 +5858,12 @@ async fn stream_chat_inner(
                             &call_id,
                         )
                     },
-                    |e: &String| tool_retry_safe(&tool) && crate::agent::tools::is_retryable_err(e),
-                    |_| None,
                 )
                 .await;
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
                 stats.retry_count += (retried.attempts - 1) as i64;
                 let retry_count = (retried.attempts - 1) as i64;
-                let result = match retried.value {
-                    Ok(out) if retried.attempts > 1 => Ok(format!(
-                        "（首次执行超时/网络错误，已自动重试 {} 次）\n{out}",
-                        retried.attempts - 1
-                    )),
-                    other => other,
-                };
+                let result = retried.value.map(|out| retry_notice(out, retried.attempts));
                 (result, retry_count)
             };
             // 统一护栏后处理：任务护栏记录（进展/失败黑名单/失速）+ 大输出落盘由 pipeline
@@ -9614,9 +9609,11 @@ async fn execute_tool_batch_one(
             "args": args_raw.chars().take(200).collect::<String>(),
         }),
     );
-    let retried = retry_with_backoff(
+    let contract = crate::agent::tools::contracts::contract(tool);
+    let retried = run_tool_with_retry(
+        &contract,
         &TOOL_POLICY,
-        &mut || {
+        || {
             run_tool_with_guard(
                 tool,
                 args_raw,
@@ -9632,19 +9629,11 @@ async fn execute_tool_batch_one(
                 &call_id,
             )
         },
-        |e: &String| tool_retry_safe(tool) && crate::agent::tools::is_retryable_err(e),
-        |_| None,
     )
     .await;
     tool_limits::record_tool_call(conversation_id, tool, args_raw);
     let duration_ms = tool_started.elapsed().as_millis() as i64;
-    let mut result = match retried.value {
-        Ok(out) if retried.attempts > 1 => Ok(format!(
-            "（首次执行超时/网络错误，已自动重试 {} 次）\n{out}",
-            retried.attempts - 1
-        )),
-        other => other,
-    };
+    let mut result = retried.value.map(|out| retry_notice(out, retried.attempts));
     // 统一护栏后处理：护栏记录/大输出落盘由 pipeline post 钩子改写结果
     crate::agent::tools::run_post_hooks(&inv, &mut result).await;
     let (ok, output) = match &result {

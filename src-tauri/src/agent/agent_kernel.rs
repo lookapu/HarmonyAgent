@@ -1029,6 +1029,36 @@ impl KernelAcceptanceGate {
     }
 }
 
+/// 与桌面 UI tool loop 相同的自动重试语义：契约 retry_safe + 可恢复错误白名单 +
+/// 指数退避。生产路径传 `TOOL_POLICY`；`attempt` 负责一次执行（含取消与剩余
+/// wall time 检查）。
+pub async fn run_tool_with_retry<F, Fut>(
+    contract: &crate::agent::tools::contracts::ToolContract,
+    policy: &RetryPolicy,
+    mut attempt: F,
+) -> RetryResult<String, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
+    retry_with_backoff(
+        policy,
+        &mut attempt,
+        |error: &String| contract.retry_safe && crate::agent::tools::is_retryable_err(error),
+        |_| None,
+    )
+    .await
+}
+
+/// 重试成功后的模型可见提示，与 UI 的措辞保持一致。
+pub fn retry_notice(output: String, attempts: usize) -> String {
+    if attempts > 1 {
+        format!("（首次执行超时/网络错误，已自动重试 {} 次）\n{output}", attempts - 1)
+    } else {
+        output
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
