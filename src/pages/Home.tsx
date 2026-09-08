@@ -572,6 +572,11 @@ export default function Home() {
   // 最近项目右键菜单（打开文件夹 / 刷新项目信息）
   const [projectMenu, setProjectMenu] = useState<{ x: number; y: number; project: Project } | null>(null)
   const projectMenuRef = useRef<HTMLDivElement>(null)
+  // 会话列表右键菜单
+  const [convMenu, setConvMenu] = useState<{ x: number; y: number; conv: Conversation } | null>(null)
+  const convMenuRef = useRef<HTMLDivElement>(null)
+  // 会话列表键盘焦点（-1 = 无焦点）
+  const [convFocusIdx, setConvFocusIdx] = useState(-1)
   // 右键菜单关闭：点击菜单外 / 任意滚动
   useEffect(() => {
     if (!projectMenu) return
@@ -590,6 +595,23 @@ export default function Home() {
   }, [projectMenu])
   // Escape 走全局栈：菜单开在模态之上时，一次 Esc 只关菜单，不把底下那层一起带走
   useEscapeKey(projectMenu ? () => setProjectMenu(null) : null)
+  // 会话右键菜单关闭
+  useEffect(() => {
+    if (!convMenu) return
+    const onDown = (e: MouseEvent) => {
+      if (convMenuRef.current && !convMenuRef.current.contains(e.target as Node)) {
+        setConvMenu(null)
+      }
+    }
+    const onScroll = () => setConvMenu(null)
+    document.addEventListener('mousedown', onDown)
+    window.addEventListener('scroll', onScroll, true)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      window.removeEventListener('scroll', onScroll, true)
+    }
+  }, [convMenu])
+  useEscapeKey(convMenu ? () => setConvMenu(null) : null)
   useEffect(() => {
     if (!projectMetaToast) return
     const timer = setTimeout(() => setProjectMetaToast(null), 4000)
@@ -4065,6 +4087,61 @@ export default function Home() {
           </div>
         )}
 
+        {/* 会话列表右键菜单：置顶/归档/重命名/删除/复制ID */}
+        {convMenu && (
+          <div
+            ref={convMenuRef}
+            className="fixed z-[var(--app-z-popover)] w-48 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
+            style={{
+              left: Math.min(convMenu.x, window.innerWidth - 200),
+              top: Math.min(convMenu.y, window.innerHeight - 260),
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="px-3 py-1.5 text-[11px] font-medium text-[var(--text-muted)] truncate">
+              {convMenu.conv.title}
+            </div>
+            <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+            <button
+              onClick={() => { togglePin(convMenu.conv.id, convMenu.conv.is_pinned); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="pin" size={13} />
+              {convMenu.conv.is_pinned ? t('home.unpin') : t('home.pin')}
+            </button>
+            <button
+              onClick={() => { toggleArchive(convMenu.conv.id, convMenu.conv.archived); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="archive" size={13} />
+              {convMenu.conv.archived ? t('home.unarchive') : t('home.archive')}
+            </button>
+            <button
+              onClick={() => { setRenamingId(convMenu.conv.id); setRenamingText(convMenu.conv.title); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="edit" size={13} />
+              {t('home.rename')}
+            </button>
+            <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+            <button
+              onClick={() => { navigator.clipboard.writeText(convMenu.conv.id); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="copy" size={13} />
+              {t('home.copyConvId')}
+            </button>
+            <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+            <button
+              onClick={() => { handleDeleteConversation(convMenu.conv.id); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
+            >
+              <Icon name="delete" size={13} />
+              {t('home.deleteConversation')}
+            </button>
+          </div>
+        )}
+
         {/* 会话列表 */}
         <div className="flex-1 flex flex-col min-h-0 mt-1">
           <div className={`flex items-center justify-between pb-1.5 ${sidebarCollapsed ? 'px-3 justify-center' : 'px-4'}`}>
@@ -4307,11 +4384,33 @@ export default function Home() {
               )}
             </div>
           )}
-          <div className={`flex-1 overflow-y-auto pb-2 space-y-0.5 ${sidebarCollapsed ? 'px-2' : 'px-2'}`}>
+          <div
+            className={`flex-1 overflow-y-auto pb-2 space-y-0.5 ${sidebarCollapsed ? 'px-2' : 'px-2'}`}
+            tabIndex={0}
+            onKeyDown={(e) => {
+              const items = groupedConversations.filter((r) => r.kind === 'item')
+              if (items.length === 0) return
+              if (e.key === 'ArrowDown') {
+                e.preventDefault()
+                setConvFocusIdx((v) => Math.min(v + 1, items.length - 1))
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault()
+                setConvFocusIdx((v) => Math.max(v - 1, 0))
+              } else if (e.key === 'Enter' && convFocusIdx >= 0 && convFocusIdx < items.length) {
+                e.preventDefault()
+                const target = items[convFocusIdx]
+                if (target.kind === 'item') openConversation(target.conv.id)
+              } else if (e.key === 'Escape') {
+                setConvFocusIdx(-1)
+              }
+            }}
+          >
             {conversations.length === 0 && !sidebarCollapsed && (
               <UiEmptyState compact title={currentProject ? t('home.noConversation') : t('home.selectProjectFirst')} />
             )}
-            {groupedConversations.map((row) => {
+            {(() => {
+              let idx = -1
+              return groupedConversations.map((row) => {
               if (row.kind === 'header') {
                 return (
                   <div key={row.key} className="group-label px-2.5 pt-2.5 pb-1">
@@ -4319,16 +4418,23 @@ export default function Home() {
                   </div>
                 )
               }
+              idx++
               const c = row.conv
               const active = c.id === currentConversation?.id
               const renaming = renamingId === c.id
               const pendingItems = pendingConfirmations[c.id] ?? []
+              const focused = convFocusIdx >= 0 && idx === convFocusIdx
               return (
                 <div
                   key={c.id}
                   className={`list-row group w-full flex items-center rounded-lg transition-colors ${
-                    active ? 'bg-[var(--bg-card)] is-active' : 'hover:bg-[var(--bg-hover)]'
+                    active ? 'bg-[var(--bg-card)] is-active' : focused ? 'bg-[var(--bg-hover)] ring-1 ring-[var(--accent)]/30' : 'hover:bg-[var(--bg-hover)]'
                   } ${sidebarCollapsed ? 'justify-center py-1' : 'pl-2.5 pr-1.5 py-1.5'}`}
+                  onContextMenu={(e) => {
+                    if (sidebarCollapsed) return
+                    e.preventDefault()
+                    setConvMenu({ x: e.clientX, y: e.clientY, conv: c })
+                  }}
                 >
                   {renaming ? (
                     <input
@@ -4536,7 +4642,8 @@ export default function Home() {
                   )}
                 </div>
               )
-            })}
+            })
+            })()}
           </div>
         </div>
 
@@ -4808,6 +4915,30 @@ export default function Home() {
                       >
                         <Icon name="terminal" size={14} />
                         {t('home.openShell')}
+                      </button>
+                    )}
+                    <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+                    <button
+                      onClick={() => {
+                        setShowMoreMenu(false)
+                        setSidebarCollapsed((v) => !v)
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                    >
+                      <Icon name="panel" size={14} />
+                      {t('home.toggleSidebar')}
+                    </button>
+                    {currentProject && messages.length > 0 && (
+                      <button
+                        onClick={() => {
+                          setShowMoreMenu(false)
+                          setSearchMode('conv')
+                          setTimeout(() => searchInputRef.current?.focus(), 50)
+                        }}
+                        className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                      >
+                        <Icon name="search" size={14} />
+                        {t('home.searchInConv')}
                       </button>
                     )}
                   </div>
