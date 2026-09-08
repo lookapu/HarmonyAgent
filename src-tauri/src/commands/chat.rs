@@ -21,6 +21,7 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
     run_tool_with_retry, retry_notice,
 };
+use crate::agent::kernel_loop::{KernelLoopGovernor, KernelToolBudgetGate};
 use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
 use crate::agent::tools::guards::is_cancelled;
 use crate::agent::tools::{has_pending_action_phrase, parse_data_url};
@@ -4225,14 +4226,8 @@ async fn stream_chat_inner(
     let mut interrupted_rounds = 0;
     // 产出前中断重放计数：0 产出中断时冻结请求原样重发（上限 MAX_STREAM_REPLAYS）
     let mut stream_replays = 0;
-    // 工具循环检测状态（对齐 qwen-code LoopDetectionService 轻量版）：
-    // 连续相同调用（name+args）/ 连续同名调用（不管参数）/ 每轮工具调用总数
-    let mut turn_tool_calls: usize = 0;
-    let mut last_tool_call_key: Option<String> = None;
-    let mut tool_call_repeat: usize = 0;
-    let mut last_tool_name: Option<String> = None;
-    let mut same_name_streak: usize = 0;
-    let mut loop_breaks: usize = 0;
+    // 工具循环检测：使用共享 KernelLoopGovernor（对齐 qwen-code LoopDetectionService 轻量版）
+    let mut loop_governor = KernelLoopGovernor::new();
     let mut continuation_text = String::new();
     // 多模态图片附加计数：已附加到请求的图片数（用户首轮上传 + 工具轮次 take_screenshot 产生的截图），
     // 每轮只附加新增部分到最新 user 消息（通常是刚注入的工具结果），避免重复注入历史图
@@ -5368,85 +5363,61 @@ async fn stream_chat_inner(
                         "elapsed_ms": task_started.elapsed().as_millis() as i64,
                     }),
                 );
-                // 工具循环检测（对齐 qwen-code LoopDetectionService 轻量版）：
-                // 连续相同调用（name+args）≥5 次或连续同名（不管参数）≥8 次判定打转，
-                // 命中后清空已排队批次并注入纠正提示让模型换方案（不重复执行）；
-                // 每轮总调用超硬上限（1000）无条件中止，防参数变化逃逸重复检测；
-                // 纠正提示后模型仍循环时最多打断 MAX_LOOP_BREAKS 次，之后直接收尾
-                turn_tool_calls += 1;
-                let call_key = format!("{tool}|{args_raw}");
-                if last_tool_call_key.as_deref() == Some(call_key.as_str()) {
-                    tool_call_repeat += 1;
-                } else {
-                    last_tool_call_key = Some(call_key);
-                    tool_call_repeat = 1;
-                }
-                if last_tool_name.as_deref() == Some(tool.as_str()) {
-                    same_name_streak += 1;
-                } else {
-                    last_tool_name = Some(tool.to_string());
-                    same_name_streak = 1;
-                }
-                let stuck = tool_call_repeat >= TOOL_CALL_LOOP_THRESHOLD
-                    || same_name_streak >= TOOL_NAME_STAGNATION_THRESHOLD;
-                // 软上限（100）：超过后只要存在弱重复信号（连续 3 次相同调用）即中止——
-                // 长任务后期模型容易在收尾阶段重复同一验证命令，不必等满 5 次；
-                // 硬上限（1000）：无条件中止，防参数变化逃逸重复检测
-                let halt = stuck
-                    || (turn_tool_calls > MAX_TOOL_CALLS_PER_TURN && tool_call_repeat >= 3)
-                    || turn_tool_calls > MAX_TOOL_CALLS_HARD;
-                if halt {
-                    loop_breaks += 1;
-                    crate::utils::logger::log_event(
-                        "tool_loop_detected",
-                        serde_json::json!({
-                            "conversation_id": conversation_id,
-                            "tool": tool,
-                            "repeat": tool_call_repeat,
-                            "same_name": same_name_streak,
-                            "turn_calls": turn_tool_calls,
-                            "breaks": loop_breaks,
-                        }),
-                    );
-                    pending.clear();
-                    if loop_breaks > MAX_LOOP_BREAKS {
-                        exhausted = true;
-                    } else {
-                        correction_text = String::new();
-                        correction_hint = format!(
-                            "（系统检测到工具调用循环：工具 {tool} 已连续重复调用 {} 次（连续同名 {} 次，本轮共 {} 次调用）。重复执行只会得到相同结果。请立即停止当前路径，改用其他工具/思路推进；若确实无法推进，请直接给出结论总结与所需条件。）",
-                            tool_call_repeat, same_name_streak, turn_tool_calls
+                // 工具循环检测：使用共享 KernelLoopGovernor（对齐 qwen-code LoopDetectionService 轻量版）
+                let verdict = loop_governor.observe(&tool, &args_raw);
+                match verdict {
+                    crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, repeat, same_name, turn_calls } => {
+                        crate::utils::logger::log_event(
+                            "tool_loop_detected",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "tool": tool,
+                                "repeat": repeat,
+                                "same_name": same_name,
+                                "turn_calls": turn_calls,
+                                "breaks": loop_governor.loop_breaks(),
+                            }),
                         );
+                        pending.clear();
+                        if final_halt {
+                            exhausted = true;
+                        } else {
+                            correction_text = String::new();
+                            correction_hint = corrective_hint.unwrap_or_default();
+                        }
+                        break;
                     }
-                    break;
+                    _ => {}
                 }
                 // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
                 let reached_tool_limit = tool_runs.len() + pending.len() >= max_tool_rounds;
                 let limit_must_stop = if reached_tool_limit {
                     let recent_successes = tool_runs.iter().rev().take(8).filter(|item| item.succeeded).count();
-                    if let Some(extended) = crate::agent::governance::extend_tool_budget(
-                        max_tool_rounds, recent_successes, loop_breaks, budget_extensions,
-                    ) {
-                        let previous = max_tool_rounds;
-                        max_tool_rounds = extended;
-                        budget_extensions += 1;
-                        if let Ok(conn) = state.0.lock() {
-                            let _ = crate::agent::scheduler::update_budget(
-                                &conn,
-                                &trace_id,
-                                &serde_json::json!({
-                                    "base": execution_budget,
-                                    "effective_tool_rounds": extended,
-                                    "extension_count": budget_extensions,
-                                }),
-                            );
-                            let _ = crate::agent::runtime::append_event(
-                                &conn, &trace_id, &conversation_id, "budget.extended",
-                                serde_json::json!({ "previous": previous, "current": extended, "reason": "verified_progress" }),
-                            );
+                    match KernelToolBudgetGate::check(max_tool_rounds, tool_runs.len() + pending.len(), recent_successes, loop_governor.loop_breaks(), budget_extensions) {
+                        crate::agent::kernel_loop::KernelBudgetVerdict::Extend { new_limit } => {
+                            let previous = max_tool_rounds;
+                            max_tool_rounds = new_limit;
+                            budget_extensions += 1;
+                            if let Ok(conn) = state.0.lock() {
+                                let _ = crate::agent::scheduler::update_budget(
+                                    &conn,
+                                    &trace_id,
+                                    &serde_json::json!({
+                                        "base": execution_budget,
+                                        "effective_tool_rounds": new_limit,
+                                        "extension_count": budget_extensions,
+                                    }),
+                                );
+                                let _ = crate::agent::runtime::append_event(
+                                    &conn, &trace_id, &conversation_id, "budget.extended",
+                                    serde_json::json!({ "previous": previous, "current": new_limit, "reason": "verified_progress" }),
+                                );
+                            }
+                            false
                         }
-                        false
-                    } else { true }
+                        crate::agent::kernel_loop::KernelBudgetVerdict::Halt => true,
+                        crate::agent::kernel_loop::KernelBudgetVerdict::Proceed => false,
+                    }
                 } else { false };
                 if limit_must_stop {
                     let round = (tool_runs.len() + 1) as u32;
