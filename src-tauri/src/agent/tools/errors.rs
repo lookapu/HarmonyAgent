@@ -16,6 +16,27 @@ pub fn is_retryable_err(e: &str) -> bool {
     KEYS.iter().any(|k| e.to_lowercase().contains(k))
 }
 
+/// 工具自动重试谓词：契约 retry_safe + 可恢复错误白名单。
+/// UI（chat.rs tool loop）与 headless runtime 共用同一语义。
+pub fn retryable_for(tool: &str, error: &str) -> bool {
+    crate::agent::tools::contracts::contract(tool).retry_safe && is_retryable_err(error)
+}
+
+#[cfg(test)]
+mod tests_retryable {
+    use super::*;
+
+    #[test]
+    fn retryable_for_combines_contract_and_error_whitelist() {
+        assert!(retryable_for("read_file", "连接超时，请稍后重试"));
+        assert!(retryable_for("git_status", "failed to spawn git"));
+        assert!(!retryable_for("write_file", "连接超时"));
+        assert!(!retryable_for("repo_query", "连接超时"));
+        assert!(!retryable_for("read_file", "文件不存在"));
+        assert!(retryable_for("read_file", "headless 工具 read_file 超过 100 ms 超时"));
+    }
+}
+
 // ---------- 错误模式诊断（常见错误 → 修复建议，帮助 Agent 快速定位，减少打转） ----------
 
 /// 按工具 + 错误文本匹配高频失败模式，返回针对性修复建议

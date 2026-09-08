@@ -2,17 +2,49 @@
 
 use crate::agent::exec_ctx::ToolCtx;
 use crate::agent::tools::contracts::{ApprovalPolicy, ToolContract};
-use crate::agent::tools::run_tool_boxed;
+use crate::agent::tools::{is_retryable_err, run_tool_boxed};
 use crate::db::DbState;
 use crate::services::mcp_manager::McpManager;
 use crate::services::permissions::{self, Level};
+use crate::utils::retry::{retry_with_backoff, RetryResult, TOOL_POLICY};
 use rusqlite::Connection;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
+
+/// 与桌面 UI tool loop 相同的自动重试语义：契约 retry_safe + 可恢复错误白名单 +
+/// 指数退避。生产路径传 `TOOL_POLICY`；`attempt` 负责一次执行（含取消与剩余
+/// wall time 检查）。
+pub(crate) async fn run_tool_with_retry<F, Fut>(
+    contract: &ToolContract,
+    policy: &crate::utils::retry::RetryPolicy,
+    mut attempt: F,
+) -> RetryResult<String, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
+    retry_with_backoff(
+        policy,
+        &mut attempt,
+        |error: &String| contract.retry_safe && is_retryable_err(error),
+        |_| None,
+    )
+    .await
+}
+
+/// 重试成功后的模型可见提示，与 UI 的措辞保持一致。
+pub(crate) fn retry_notice(output: String, attempts: usize) -> String {
+    if attempts > 1 {
+        format!("（首次执行超时/网络错误，已自动重试 {} 次）\n{output}", attempts - 1)
+    } else {
+        output
+    }
+}
 
 fn audit_preview(value: &str) -> String {
     serde_json::from_str::<serde_json::Value>(value)
@@ -170,10 +202,6 @@ impl HeadlessToolRuntime {
             return Err("headless 工具执行已取消".into());
         }
         let contract = self.policy.check(name, args)?;
-        let timeout = remaining_wall_time.min(Duration::from_millis(contract.timeout_ms));
-        if timeout.is_zero() {
-            return Err("headless 工具执行没有剩余 wall time".into());
-        }
         let created_at = chrono::Utc::now().timestamp();
         let input = audit_preview(args);
         let idempotency_key =
@@ -202,26 +230,40 @@ impl HeadlessToolRuntime {
             .map_err(|error| format!("记录 headless 工具开始失败：{error}"))?;
         }
         let started = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            timeout,
-            run_tool_boxed(
-                name,
-                args,
-                &self.project_root.to_string_lossy(),
-                &[],
-                "headless",
-                &self.db,
-                &self.mcp,
-                &ToolCtx::empty(),
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(format!(
-                "headless 工具 {name} 超过 {} ms 超时",
-                timeout.as_millis()
-            ))
-        });
+        let retried = run_tool_with_retry(&contract, &TOOL_POLICY, || async move {
+            if self.is_cancelled() {
+                return Err("headless 工具执行已取消".to_string());
+            }
+            let remaining = remaining_wall_time.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err("headless 工具执行没有剩余 wall time".to_string());
+            }
+            let timeout = remaining.min(Duration::from_millis(contract.timeout_ms));
+            tokio::time::timeout(
+                timeout,
+                run_tool_boxed(
+                    name,
+                    args,
+                    &self.project_root.to_string_lossy(),
+                    &[],
+                    "headless",
+                    &self.db,
+                    &self.mcp,
+                    &ToolCtx::empty(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "headless 工具 {name} 超过 {} ms 超时",
+                    timeout.as_millis()
+                ))
+            })
+        })
+        .await;
+        let attempts = retried.attempts;
+        let retry_count = attempts.saturating_sub(1) as i64;
+        let result = retried.value.map(|output| retry_notice(output, attempts));
         let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
         let status = if result.is_ok() { "ok" } else { "error" };
         let raw_output = match &result {
@@ -244,8 +286,8 @@ impl HeadlessToolRuntime {
             conn.execute(
                 "UPDATE tool_runs SET result_json=?1,status=?2,duration_ms=?3,finished_at=?4,
                  structured_result_json=?5,evidence_digest=?6,protocol_version=2,error_code=?7,
-                 compensation_json=?8,metrics_json=?9,outcome_committed_at=?10
-                 WHERE id=?11 AND status='running'",
+                 compensation_json=?8,metrics_json=?9,outcome_committed_at=?10,retry_count=?11
+                 WHERE id=?12 AND status='running'",
                 rusqlite::params![
                     output,
                     status,
@@ -257,6 +299,7 @@ impl HeadlessToolRuntime {
                     serde_json::to_string(&structured.compensation).ok(),
                     serde_json::to_string(&structured.metrics).ok(),
                     chrono::Utc::now().timestamp_millis(),
+                    retry_count,
                     call_id,
                 ],
             )
@@ -373,5 +416,99 @@ mod tests {
             .unwrap();
         assert_eq!(scope.0, runtime.project_id);
         assert_eq!(scope.1, runtime.conversation_id);
+    }
+
+    fn zero_delay_policy() -> crate::utils::retry::RetryPolicy {
+        crate::utils::retry::RetryPolicy {
+            max_attempts: 3,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_retry_retries_only_retryable_errors_on_retry_safe_tools() {
+        let contract = crate::agent::tools::contracts::contract("read_file");
+        assert!(contract.retry_safe);
+        let mut calls = 0usize;
+        let retried = run_tool_with_retry(&contract, &zero_delay_policy(), || {
+            calls += 1;
+            async move {
+                if calls < 3 {
+                    Err("连接被拒绝，请稍后重试".to_string())
+                } else {
+                    Ok("ok".to_string())
+                }
+            }
+        })
+        .await;
+        assert_eq!(retried.attempts, 3);
+        assert_eq!(retried.value.unwrap(), "ok");
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn tool_retry_stops_after_first_non_retryable_error() {
+        let contract = crate::agent::tools::contracts::contract("read_file");
+        let mut calls = 0usize;
+        let retried = run_tool_with_retry(&contract, &zero_delay_policy(), || {
+            calls += 1;
+            async move { Err::<String, String>("文件不存在：missing.txt".to_string()) }
+        })
+        .await;
+        assert_eq!(retried.attempts, 1);
+        assert!(retried.value.unwrap_err().contains("不存在"));
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn tool_retry_skips_non_retry_safe_contracts() {
+        let contract = crate::agent::tools::contracts::contract("write_file");
+        assert!(!contract.retry_safe);
+        let mut calls = 0usize;
+        let retried = run_tool_with_retry(&contract, &zero_delay_policy(), || {
+            calls += 1;
+            async move { Err::<String, String>("连接超时".to_string()) }
+        })
+        .await;
+        assert_eq!(retried.attempts, 1);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retry_notice_only_wraps_after_retries() {
+        assert_eq!(retry_notice("out".into(), 1), "out");
+        let noticed = retry_notice("out".into(), 3);
+        assert!(noticed.starts_with("（首次执行超时/网络错误，已自动重试 2 次）"));
+        assert!(noticed.ends_with("\nout"));
+    }
+
+    #[tokio::test]
+    async fn failed_tool_records_zero_retry_count_in_scoped_db() {
+        let workspace =
+            std::env::temp_dir().join(format!("harmony-headless-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let runtime = HeadlessToolRuntime::new(&workspace).unwrap();
+        let error = runtime
+            .execute_observed(
+                "read_file",
+                r#"{"path":"missing.txt"}"#,
+                "no-retry-call",
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.is_empty());
+        let conn = runtime.db.0.lock().unwrap();
+        let retry_count: i64 = conn
+            .query_row(
+                "SELECT retry_count FROM tool_runs WHERE id='no-retry-call'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_count, 0);
+        drop(conn);
+        std::fs::remove_dir_all(workspace).ok();
     }
 }

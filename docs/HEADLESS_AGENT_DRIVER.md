@@ -527,7 +527,10 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
 2. 流响应读取/停滞治理已在 headless 落地（SSE 行缓冲 + `KernelStreamGovernor` + 失败关闭）；
    下一步把桌面 UI 流循环切换到同一组件，并继续抽取消息历史/tool loop；
-3. 将参数级审批、tool metrics 和 recovery 接入 headless runtime（参数级审批与
-   tool metrics 已接入；recovery 仍待接入）；
+3. 参数级审批、tool metrics 与工具重试语义均已接入 headless runtime：工具执行使用与
+   UI 相同的 `TOOL_POLICY` 退避 + `retryable_for` 谓词（契约 retry_safe + 可恢复错误
+   白名单，见 `agent/tools/errors.rs`），重试次数写入 trial 私有 `tool_runs.retry_count`，
+   每次尝试前重新检查取消与剩余 wall time；血缘式 Recovery Orchestrator（父运行恢复
+   计划/核验门）是桌面会话特性，headless 单次 trial 无父运行血缘，按设计不接入；
 4. 清理 headless 工具路径上的全局数据库依赖；
 5. 最终抽取 UI/headless 共用的 Agent Kernel。

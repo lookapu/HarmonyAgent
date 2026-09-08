@@ -43,7 +43,7 @@ mod test_tools;
 mod ui_tools;
 mod web_tools;
 
-pub use errors::{ErrorLocation, is_retryable_err, structured_tool_error};
+pub use errors::{ErrorLocation, is_retryable_err, retryable_for, structured_tool_error};
 pub(crate) use project_tools::create_harmony_project_sync;
 // 流水线钩子类型与执行入口：chat.rs 主循环/子任务循环在工具调用点构造
 // ToolInvocation 并运行 pre/post 钩子（拦截需要控制流配合：预算/黑名单 →
