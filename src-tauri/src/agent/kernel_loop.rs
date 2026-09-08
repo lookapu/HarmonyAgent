@@ -236,8 +236,8 @@ impl KernelRoundRouter {
     pub fn route(&mut self, input: &KernelRoundInput) -> Vec<KernelRoundAction> {
         let mut actions = Vec::new();
         let text_empty = input.text.trim().is_empty();
-        // 空轮：text 空且非截断非中断
-        if text_empty && !input.truncated && !input.interrupted {
+        // 空轮：text 空且非截断非中断且无工具调用（工具调用响应可能无正文，属正常）
+        if text_empty && !input.truncated && !input.interrupted && !input.has_native_tool_calls {
             self.empty_rounds += 1;
             if self.empty_rounds >= KERNEL_MAX_EMPTY_ROUNDS {
                 actions.push(KernelRoundAction::StopEmpty {
@@ -472,6 +472,22 @@ mod tests {
         let actions = router.route(&input);
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], KernelRoundAction::StopEmpty { .. }));
+    }
+
+    #[test]
+    fn round_router_proceeds_on_tool_only_response() {
+        // 工具调用响应可能无正文（text 空但 has_native_tool_calls=true），应正常 Proceed
+        let mut router = KernelRoundRouter::new();
+        let input = KernelRoundInput {
+            text: "",
+            has_reasoning: false,
+            truncated: false,
+            interrupted: false,
+            has_native_tool_calls: true,
+        };
+        let actions = router.route(&input);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], KernelRoundAction::Proceed));
     }
 
     #[test]

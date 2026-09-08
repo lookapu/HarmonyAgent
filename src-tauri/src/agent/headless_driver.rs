@@ -11,6 +11,7 @@ use crate::agent::agent_kernel::{
     KernelUsageLedger, KERNEL_STREAM_MAX_BYTES, KERNEL_STREAM_REASONING_GRACE,
     KERNEL_STREAM_SILENT_TIMEOUT,
 };
+use crate::agent::kernel_loop::{KernelLoopGovernor, KernelRoundAction, KernelRoundInput, KernelRoundRouter};
 use crate::agent::eval_report::ModelInfo;
 use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
 use crate::agent::eval_task::EvalTask;
@@ -533,6 +534,11 @@ impl HeadlessAgentDriver {
         let mut stopped_by_model = false;
         let mut stopped_by_budget = false;
         let mut stopped_by_acceptance = false;
+        
+        // Phase F：headless 接入循环治理与轮级路由（纯策略，UI 共用）
+        let mut loop_governor = KernelLoopGovernor::new();
+        let mut round_router = KernelRoundRouter::new();
+        
         for round in 0..round_limit {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
             if started.elapsed() >= wall_time {
@@ -580,6 +586,95 @@ impl HeadlessAgentDriver {
                 .map_err(AgentDriverError::Failed)?;
                 break;
             }
+            
+            // Phase F：轮级路由——在 stop-candidate 前判定空轮/冻结重放/中断续写/截断续写/假调用纠正
+            let has_reasoning = turn.provider_message.get("reasoning").is_some();
+            let round_input = KernelRoundInput {
+                text: &turn.content,
+                has_reasoning,
+                truncated: turn.was_truncated(),
+                interrupted: false, // headless 流错误 fail-closed，不进入中断续写（文档画线）
+                has_native_tool_calls: !turn.tool_calls.is_empty(),
+            };
+            let actions = round_router.route(&round_input);
+            let mut should_continue = false;
+            let mut should_break = false;
+            for action in actions {
+                match action {
+                    KernelRoundAction::Proceed => {
+                        // 继续后续门控（stop-candidate 等）
+                    }
+                    KernelRoundAction::RetryEmpty { hint } => {
+                        // 空轮重试：注入纠正提示，下一轮继续
+                        sink.append(
+                            SessionEventType::SystemNote,
+                            json!({"hint": hint}),
+                            "round_retry_empty",
+                            json!({"hint": hint}),
+                        ).map_err(AgentDriverError::Failed)?;
+                        messages.push(json!({"role":"user","content":hint}));
+                        should_continue = true;
+                        break;
+                    }
+                    KernelRoundAction::StopEmpty { note } => {
+                        // 空轮耗尽：追加注记后收尾
+                        outcome.failure_taxonomy.push("empty_rounds_exhausted".into());
+                        sink.append(
+                            SessionEventType::SystemNote,
+                            json!({"note": note}),
+                            "round_stop_empty",
+                            json!({"note": note}),
+                        ).map_err(AgentDriverError::Failed)?;
+                        should_break = true;
+                        break;
+                    }
+                    KernelRoundAction::ReplayFrozen => {
+                        // 冻结重放：headless 不支持（流错误 fail-closed），落穿
+                    }
+                    KernelRoundAction::ContinueInterrupted { .. } => {
+                        // 中断续写：headless 不支持（流错误 fail-closed），落穿
+                    }
+                    KernelRoundAction::InterruptedNote { .. } => {
+                        // 中断耗尽注记：headless 不支持，落穿
+                    }
+                    KernelRoundAction::ContinueTruncated { continuation_text, reasoning_only } => {
+                        // 截断续写：保留已有内容，从截断处继续
+                        let prompt = if reasoning_only {
+                            format!("{}\n\n（系统提示：上文已被截断，请仅输出推理部分的剩余内容。）", continuation_text)
+                        } else {
+                            format!("{}\n\n（系统提示：上文已被截断，请继续输出剩余内容。）", continuation_text)
+                        };
+                        sink.append(
+                            SessionEventType::SystemNote,
+                            json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
+                            "round_continuation_truncated",
+                            json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
+                        ).map_err(AgentDriverError::Failed)?;
+                        messages.push(json!({"role":"user","content":prompt}));
+                        should_continue = true;
+                        break;
+                    }
+                    KernelRoundAction::CorrectFakeCall { correction_text, hint } => {
+                        // 假调用纠正：注入纠正提示继续
+                        sink.append(
+                            SessionEventType::SystemNote,
+                            json!({"correction_text": correction_text, "hint": hint}),
+                            "round_correct_fake_call",
+                            json!({"correction_text": correction_text, "hint": hint}),
+                        ).map_err(AgentDriverError::Failed)?;
+                        messages.push(json!({"role":"user","content":hint}));
+                        should_continue = true;
+                        break;
+                    }
+                }
+            }
+            if should_continue {
+                continue;
+            }
+            if should_break {
+                break;
+            }
+            
             if turn.is_stop_candidate() {
                 match acceptance.request_stop() {
                     KernelStopDecision::Accepted(report) => {
@@ -644,6 +739,40 @@ impl HeadlessAgentDriver {
                         continue;
                     }
                 };
+                
+                // Phase F：工具循环检测——在每次工具调用前观察，命中循环时注入纠正提示或直接收尾
+                let verdict = loop_governor.observe(name, args);
+                match verdict {
+                    crate::agent::kernel_loop::KernelLoopVerdict::Proceed => {
+                        // 继续执行工具
+                    }
+                    crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, .. } => {
+                        if final_halt {
+                            // loop_breaks 已超上限，直接收尾
+                            outcome.failure_taxonomy.push("tool_loop_exhausted".into());
+                            sink.append(
+                                SessionEventType::SystemNote,
+                                json!({"reason":"tool_loop_exhausted","tool":name}),
+                                "tool_loop_halt",
+                                json!({"reason":"tool_loop_exhausted","tool":name}),
+                            ).map_err(AgentDriverError::Failed)?;
+                            messages.push(json!({"role":"tool","tool_call_id":id,"content":"（系统检测到工具调用循环已达上限，任务已中止。）"}));
+                            continue;
+                        }
+                        // 注入纠正提示，让模型换方案
+                        if let Some(hint) = corrective_hint {
+                            sink.append(
+                                SessionEventType::SystemNote,
+                                json!({"hint": hint, "tool": name}),
+                                "tool_loop_correction",
+                                json!({"hint": hint, "tool": name}),
+                            ).map_err(AgentDriverError::Failed)?;
+                            messages.push(json!({"role":"tool","tool_call_id":id,"content":hint}));
+                            continue;
+                        }
+                    }
+                }
+                
                 sink.append(
                     SessionEventType::ToolApproval,
                     json!({
@@ -815,13 +944,30 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    struct ScriptedClient(Mutex<VecDeque<serde_json::Value>>);
+    struct ScriptedClient {
+        responses: Mutex<VecDeque<serde_json::Value>>,
+        /// Phase F：记录每请求 messages，用于测试循环检测场景
+        recorded_messages: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+    }
+
+    impl ScriptedClient {
+        fn new(responses: VecDeque<serde_json::Value>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                recorded_messages: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        
+        fn get_recorded_messages(&self) -> Vec<Vec<serde_json::Value>> {
+            self.recorded_messages.lock().unwrap().clone()
+        }
+    }
 
     impl super::HeadlessModelClient for ScriptedClient {
         fn request<'a>(
             &'a self,
             _provider: &'a HeadlessProviderConfig,
-            _messages: Vec<serde_json::Value>,
+            messages: Vec<serde_json::Value>,
             _timeout: Duration,
         ) -> std::pin::Pin<
             Box<
@@ -835,8 +981,15 @@ mod tests {
             >,
         > {
             Box::pin(async move {
+                // Phase F：记录每请求 messages
+                self.recorded_messages.lock()
+                    .map_err(|error| {
+                        crate::agent::eval_runner::AgentDriverError::Failed(error.to_string())
+                    })?
+                    .push(messages);
+                
                 let response = self
-                    .0
+                    .responses
                     .lock()
                     .map_err(|error| {
                         crate::agent::eval_runner::AgentDriverError::Failed(error.to_string())
@@ -892,6 +1045,7 @@ mod tests {
         input_price: f64,
         output_price: f64,
     ) -> HeadlessAgentDriver {
+        let client = ScriptedClient::new(responses.into_iter().collect());
         HeadlessAgentDriver::with_client(
             HeadlessProviderConfig {
                 provider_id: "stub".into(),
@@ -902,7 +1056,7 @@ mod tests {
                 input_price_cny_per_1k: Some(input_price),
                 output_price_cny_per_1k: Some(output_price),
             },
-            Arc::new(ScriptedClient(Mutex::new(responses.into_iter().collect()))),
+            Arc::new(client),
         )
     }
 
@@ -1181,6 +1335,179 @@ mod tests {
         assert!(
             matches!(error, crate::agent::eval_runner::AgentDriverError::Failed(message) if message.contains("未返回 usage"))
         );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    // ── Phase F：循环治理与轮级路由集成测试 ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn loop_governor_detects_identical_calls_and_injects_correction() {
+        // 构造单轮含 6 个相同工具调用：第 5 个应被 governor 拦截并注入纠正提示
+        let responses = [
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": (0..6).map(|i| {
+                            serde_json::json!({
+                                "id": format!("call-{}", i),
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"a.txt\"}"
+                                }
+                            })
+                        }).collect::<Vec<_>>()
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 30}
+            }),
+            // 模型收到纠正后应给出结论
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 2}
+            }),
+        ];
+
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-loop-correction-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "base\n").unwrap();
+
+        let outcome = scripted_driver(responses)
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+
+        // 验证 trajectory 中包含循环纠正事件（第 5 个相同调用被拦截）
+        let has_correction = outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "tool_loop_correction");
+        assert!(has_correction, "应在第 5 次相同调用时注入纠正提示");
+        
+        // 验证 tool_result 数量：前 4 个执行，第 5、6 个被拦截
+        let tool_results: Vec<_> = outcome
+            .trajectory
+            .iter()
+            .filter(|e| e.kind == "tool_result")
+            .collect();
+        assert_eq!(tool_results.len(), 4, "前 4 个应执行，第 5、6 个被循环检测拦截");
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn round_router_stops_on_consecutive_empty_rounds() {
+        // 连续 2 轮空响应 → empty_rounds_exhausted
+        let responses = [
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 0}
+            }),
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 0}
+            }),
+        ];
+
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-empty-rounds-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let outcome = scripted_driver(responses)
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+
+        // 验证 failure_taxonomy 包含 empty_rounds_exhausted
+        assert!(outcome
+            .failure_taxonomy
+            .contains(&"empty_rounds_exhausted".to_string()));
+        // 验证 trajectory 包含 StopEmpty 注记
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "round_stop_empty"));
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn round_router_corrects_fake_tool_call_narrative() {
+        // 模型在正文中叙述"已调用工具"但未输出标记 → 纠正提示进下一请求
+        let responses = [
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "已调用工具 read_file 读取了文件"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 8}
+            }),
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done after correction"}}],
+                "usage": {"prompt_tokens": 15, "completion_tokens": 3}
+            }),
+        ];
+
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-fake-call-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let outcome = scripted_driver(responses)
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+
+        // 验证 trajectory 包含假调用纠正事件
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "round_correct_fake_call"));
+        // 验证纠正后继续执行（steps=2）
+        assert_eq!(outcome.steps, 2);
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn round_router_continues_on_length_truncation() {
+        // length 截断 → 续写注入
+        let responses = [
+            serde_json::json!({
+                "choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "partial output"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }),
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "continued and done"}}],
+                "usage": {"prompt_tokens": 15, "completion_tokens": 3}
+            }),
+        ];
+
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-truncation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let outcome = scripted_driver(responses)
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+
+        // 验证 trajectory 包含截断续写事件
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "round_continuation_truncated"));
+        // 验证续写后完成（steps=2）
+        assert_eq!(outcome.steps, 2);
+
         std::fs::remove_dir_all(workspace).ok();
     }
 
