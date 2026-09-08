@@ -713,7 +713,7 @@ export const ErrorCard = memo(function ErrorCard({
     >
       {/* 头部：图标 + 标题/摘要 + 分类徽章 */}
       <div className="flex items-start gap-2 px-3 py-2.5">
-        <Icon name="info" size={13} className="shrink-0 mt-0.5" style={{ color }} />
+        <Icon name="info" size={13} className="shrink-0 mt-0.5" />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             {kindLabel && (

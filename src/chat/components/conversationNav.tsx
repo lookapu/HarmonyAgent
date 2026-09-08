@@ -51,7 +51,7 @@ export const ConversationNav = memo(function ConversationNav({
         title={t('home.conversationNav')}
         className="flex items-center justify-center w-7 h-7 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
       >
-        <Icon name="list" size={14} />
+        <Icon name="chat" size={14} />
       </button>
       {open && (
         <div className="absolute right-0 bottom-full mb-1.5 w-72 max-h-80 overflow-y-auto rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 animate-modal-in">
