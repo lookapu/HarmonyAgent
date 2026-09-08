@@ -11,7 +11,9 @@ use crate::agent::agent_kernel::{
     KernelToolEvidence, KernelTransportStop, KernelTurn, KernelUsageLedger, KERNEL_STREAM_MAX_BYTES,
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
-use crate::agent::kernel_executor::{KernelExecutorState, KernelRunPermit};
+use crate::agent::kernel_executor::{
+    KernelExecutorState, KernelRunPermit, KernelToolAttemptPermit,
+};
 use crate::agent::kernel_loop::{KernelRoundControl, KernelRoundInput};
 use crate::agent::kernel_history::continuation_instruction;
 use crate::agent::eval_report::ModelInfo;
@@ -549,12 +551,11 @@ impl HeadlessAgentDriver {
         )
         .map_err(AgentDriverError::Failed)?;
         let round_limit = self.provider.max_rounds.min(task.limits.max_steps as u32);
-        let mut attempted_tool_calls = 0u64;
         
         // UI/headless 共用 executor 状态：轮级路由、循环治理、唯一终止原因。
         let mut kernel_executor = KernelExecutorState::new();
         
-        'rounds: for round in 0..round_limit {
+        'rounds: for _ in 0..round_limit {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
             let remaining = match kernel_executor.permit_run(false, started.elapsed(), wall_time) {
                 KernelRunPermit::Proceed { remaining } => remaining,
@@ -570,7 +571,7 @@ impl HeadlessAgentDriver {
                     )));
                 }
             };
-            outcome.steps = round as u64 + 1;
+            outcome.steps = kernel_executor.start_round();
             let request_timeout = self
                 .request_timeout
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
@@ -746,21 +747,21 @@ impl HeadlessAgentDriver {
                 }
             }
             for call in turn.tool_calls {
-                attempted_tool_calls = attempted_tool_calls.saturating_add(1);
-                if attempted_tool_calls > task.limits.max_tool_calls {
-                    kernel_executor.terminate(KernelRunTermination::ToolCallBudgetExceeded);
+                if let KernelToolAttemptPermit::Halt { attempted, limit } =
+                    kernel_executor.permit_tool_attempt(task.limits.max_tool_calls)
+                {
                     sink.append(
                         SessionEventType::SystemNote,
                         json!({
                             "reason":"max_tool_calls_exceeded",
-                            "attempted":attempted_tool_calls,
-                            "limit":task.limits.max_tool_calls,
+                            "attempted":attempted,
+                            "limit":limit,
                         }),
                         "agent_tool_budget_stop",
                         json!({
                             "reason":"max_tool_calls_exceeded",
-                            "attempted":attempted_tool_calls,
-                            "limit":task.limits.max_tool_calls,
+                            "attempted":attempted,
+                            "limit":limit,
                         }),
                     )
                     .map_err(AgentDriverError::Failed)?;
@@ -909,7 +910,7 @@ impl HeadlessAgentDriver {
             }
         }
         if let Some(taxonomy) = kernel_executor
-            .finish(outcome.steps, round_limit as u64)
+            .finish(round_limit as u64)
             .and_then(KernelRunTermination::failure_taxonomy)
         {
             outcome.failure_taxonomy.push(taxonomy.into());

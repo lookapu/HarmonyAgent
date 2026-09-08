@@ -4431,6 +4431,7 @@ async fn stream_chat_inner(
             }
             return Ok(());
         }
+        kernel_executor.start_round();
         // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
         if let Some((_, pending_content)) = take_next_queued(state, &conversation_id, true)? {
             merged_instructions.push(pending_content);
@@ -5190,6 +5191,7 @@ async fn stream_chat_inner(
                 trace_id.clone(),
             );
             for (tool, args_raw) in calls {
+                kernel_executor.record_tool_attempt();
                 // 每个工具独立计时：覆盖审批等待与重试，作为 done 事件的精确耗时
                 let tool_begin = std::time::Instant::now();
                 let call_id = Uuid::new_v4().to_string();
