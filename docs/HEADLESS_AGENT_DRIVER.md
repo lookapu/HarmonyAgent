@@ -472,6 +472,25 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 验收：同一 stub provider 脚本在 UI adapter 和 headless adapter 上产生等价决策轨迹。
 
+**Phase 4 实施状态（2026-09-08 更新）**：
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| A | 纯策略组件落盘（kernel_loop/kernel_history + 黄金单测） | ✅ COMPLETED |
+| B | 工具重试共用（run_tool_with_retry 平移进 agent_kernel） | ✅ COMPLETED |
+| C | UI 接入 KernelLoopGovernor + KernelToolBudgetGate | ✅ COMPLETED |
+| D | UI 接入 KernelRoundRouter | ✅ COMPLETED |
+| E | 消息组装入核（E1 中段 → E2 图片 → E3 压缩决策） | ✅ COMPLETED |
+| F | headless 闭合防护缺口（governor/router 集成 + ScriptedClient 记录 messages + 4 个新测试） | ✅ COMPLETED |
+| G | 差分测试 + 文档收口（2 个差分测试验证 router 黄金轨迹与 driver 事件序列一致） | ✅ COMPLETED |
+
+**关键实现细节**：
+- headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
+- KernelLoopGovernor 在每次工具调用前 observe，命中循环时注入纠正提示或直接收尾
+- KernelRoundRouter 在 stop-candidate 前 route，处理空轮/冻结重放/中断续写/截断续写/假调用纠正
+- ScriptedClient 记录每请求 messages，为后续差分测试提供基础
+- 所有 905 个测试全绿（基线 899 + 6 个 Phase F/G 新增测试）
+
 ## 13. 测试策略
 
 ### 单元测试

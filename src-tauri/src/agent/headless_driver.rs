@@ -1511,6 +1511,148 @@ mod tests {
         std::fs::remove_dir_all(workspace).ok();
     }
 
+    // ── Phase G：差分测试——验证 router 黄金轨迹与 driver 事件序列一致 ────────────────
+
+    #[tokio::test]
+    async fn differential_test_loop_governor_trajectory() {
+        // 同一语料：先跑 router 得黄金动作，再跑 driver 断言事件序列匹配
+        use crate::agent::kernel_loop::{KernelLoopGovernor, KernelRoundRouter};
+        
+        // 黄金轨迹：6 次相同调用 → 前 4 次 Proceed，第 5、6 次 Halt（纠正）
+        let mut governor = KernelLoopGovernor::new();
+        let expected_actions: Vec<&str> = (0..6)
+            .map(|i| {
+                let verdict = governor.observe("read_file", "{\"path\":\"a.txt\"}");
+                match verdict {
+                    crate::agent::kernel_loop::KernelLoopVerdict::Proceed => "proceed",
+                    crate::agent::kernel_loop::KernelLoopVerdict::Halt { .. } => "halt",
+                }
+            })
+            .collect();
+        
+        assert_eq!(expected_actions.len(), 6);
+        assert_eq!(&expected_actions[..4], &["proceed"; 4]);
+        assert_eq!(&expected_actions[4..], &["halt"; 2]);
+        
+        // Driver 实际事件：前 4 个 tool_result，第 5、6 个被拦截无 tool_result
+        let responses = [
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": (0..6).map(|i| {
+                            serde_json::json!({
+                                "id": format!("call-{}", i),
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"a.txt\"}"
+                                }
+                            })
+                        }).collect::<Vec<_>>()
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 30}
+            }),
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 2}
+            }),
+        ];
+        
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-diff-loop-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "base\n").unwrap();
+        
+        let outcome = scripted_driver(responses)
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+        
+        // 验证：4 个 proceed → 4 个 tool_result；2 个 halt → 1 个 correction + 1 个静默跳过
+        let tool_results: Vec<_> = outcome
+            .trajectory
+            .iter()
+            .filter(|e| e.kind == "tool_result")
+            .collect();
+        assert_eq!(tool_results.len(), 4, "前 4 次 proceed 应产生 4 个 tool_result");
+        
+        let corrections: Vec<_> = outcome
+            .trajectory
+            .iter()
+            .filter(|e| e.kind == "tool_loop_correction")
+            .collect();
+        assert_eq!(corrections.len(), 2, "第 5、6 次 halt 应各注入 1 个纠正提示（共 2 个）");
+        
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn differential_test_round_router_empty_trajectory() {
+        // 黄金轨迹：连续 2 轮空 → RetryEmpty(第1轮) → StopEmpty(第2轮)
+        use crate::agent::kernel_loop::{KernelRoundRouter, KernelRoundAction};
+        let mut router = KernelRoundRouter::new();
+        let input = crate::agent::kernel_loop::KernelRoundInput {
+            text: "",
+            has_reasoning: false,
+            truncated: false,
+            interrupted: false,
+            has_native_tool_calls: false,
+        };
+        
+        let actions_r1 = router.route(&input);
+        assert_eq!(actions_r1.len(), 1);
+        assert!(matches!(actions_r1[0], crate::agent::kernel_loop::KernelRoundAction::RetryEmpty { .. }));
+        
+        let actions_r2 = router.route(&input);
+        assert_eq!(actions_r2.len(), 1);
+        assert!(matches!(actions_r2[0], crate::agent::kernel_loop::KernelRoundAction::StopEmpty { .. }));
+        
+        // Driver 实际事件：1 个 round_retry_empty + 1 个 round_stop_empty
+        let responses = [
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 0}
+            }),
+            serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 0}
+            }),
+        ];
+        
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-diff-empty-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        
+        let outcome = scripted_driver(responses)
+            .run_async(&offline_task(), &workspace)
+            .await
+            .unwrap();
+        
+        let retry_events: Vec<_> = outcome
+            .trajectory
+            .iter()
+            .filter(|e| e.kind == "round_retry_empty")
+            .collect();
+        assert_eq!(retry_events.len(), 1, "第 1 轮空应产生 round_retry_empty");
+        
+        let stop_events: Vec<_> = outcome
+            .trajectory
+            .iter()
+            .filter(|e| e.kind == "round_stop_empty")
+            .collect();
+        assert_eq!(stop_events.len(), 1, "第 2 轮空应产生 round_stop_empty");
+        
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
     fn sse_chunks(parts: &[&str]) -> Vec<Result<Bytes, std::io::Error>> {
         parts
             .iter()
