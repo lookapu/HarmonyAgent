@@ -6001,51 +6001,48 @@ async fn stream_chat_inner(
             interrupted: outcome.interrupted,
             has_native_tool_calls: !outcome.tool_calls.is_empty(),
         };
-        let actions = round_router.route(&router_input);
-        for action in actions {
-            match action {
-                crate::agent::kernel_loop::KernelRoundAction::RetryEmpty { hint } => {
-                    correction_text = String::new();
-                    correction_hint = hint;
-                    continue 'outer;
-                }
-                crate::agent::kernel_loop::KernelRoundAction::StopEmpty { note } => {
-                    full.push_str(&note);
-                    break 'outer;
-                }
-                crate::agent::kernel_loop::KernelRoundAction::ReplayFrozen => {
-                    crate::utils::logger::log_event(
-                        "stream_replay",
-                        serde_json::json!({
-                            "conversation_id": conversation_id,
-                            "attempt": round_router.counters().1,
-                            "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
-                        }),
-                    );
-                    continue 'outer;
-                }
-                crate::agent::kernel_loop::KernelRoundAction::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
-                    continuation_text = ct;
-                    continuation_reasoning_only = reasoning_only;
-                    continue 'outer;
-                }
-                crate::agent::kernel_loop::KernelRoundAction::InterruptedNote { note } => {
-                    full.push_str(&note);
-                    // 落穿：继续评估后续 UI 专属门
-                }
-                crate::agent::kernel_loop::KernelRoundAction::ContinueTruncated { continuation_text: ct, reasoning_only } => {
-                    continuation_text = ct;
-                    continuation_reasoning_only = reasoning_only;
-                    continue 'outer;
-                }
-                crate::agent::kernel_loop::KernelRoundAction::CorrectFakeCall { correction_text: ct, hint } => {
-                    correction_text = ct;
-                    correction_hint = hint;
-                    continue 'outer;
-                }
-                crate::agent::kernel_loop::KernelRoundAction::Proceed => {
-                    // 无特殊动作：继续后续 UI 专属门
-                }
+        let decision = round_router.decide(&router_input);
+        for notice in decision.notices {
+            full.push_str(&notice);
+        }
+        match decision.control {
+            crate::agent::kernel_loop::KernelRoundControl::RetryEmpty { hint } => {
+                correction_text = String::new();
+                correction_hint = hint;
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::StopEmpty { note } => {
+                full.push_str(&note);
+                break 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::ReplayFrozen => {
+                crate::utils::logger::log_event(
+                    "stream_replay",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "attempt": round_router.counters().1,
+                        "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
+                    }),
+                );
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
+                continuation_text = ct;
+                continuation_reasoning_only = reasoning_only;
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::ContinueTruncated { continuation_text: ct, reasoning_only } => {
+                continuation_text = ct;
+                continuation_reasoning_only = reasoning_only;
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::CorrectFakeCall { correction_text: ct, hint } => {
+                correction_text = ct;
+                correction_hint = hint;
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::Proceed => {
+                // 无特殊动作：继续后续 UI 专属门
             }
         }
         // 防“未完话术”静默结束：模型承诺“还需读取/继续查看”等下一步动作但未输出【TOOL】

@@ -11,7 +11,9 @@ use crate::agent::agent_kernel::{
     KernelUsageLedger, KERNEL_STREAM_MAX_BYTES, KERNEL_STREAM_REASONING_GRACE,
     KERNEL_STREAM_SILENT_TIMEOUT,
 };
-use crate::agent::kernel_loop::{KernelLoopGovernor, KernelRoundAction, KernelRoundInput, KernelRoundRouter};
+use crate::agent::kernel_loop::{
+    KernelLoopGovernor, KernelRoundControl, KernelRoundInput, KernelRoundRouter,
+};
 use crate::agent::kernel_history::continuation_instruction;
 use crate::agent::eval_report::ModelInfo;
 use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
@@ -621,81 +623,83 @@ impl HeadlessAgentDriver {
                 interrupted: false, // headless 流错误 fail-closed，不进入中断续写（文档画线）
                 has_native_tool_calls: !turn.tool_calls.is_empty(),
             };
-            let actions = round_router.route(&round_input);
-            let mut should_continue = false;
-            let mut should_break = false;
-            for action in actions {
-                match action {
-                    KernelRoundAction::Proceed => {
-                        // 继续后续门控（stop-candidate 等）
-                    }
-                    KernelRoundAction::RetryEmpty { hint } => {
-                        // 空轮重试：注入纠正提示，下一轮继续
-                        sink.append(
-                            SessionEventType::SystemNote,
-                            json!({"hint": hint}),
-                            "round_retry_empty",
-                            json!({"hint": hint}),
-                        ).map_err(AgentDriverError::Failed)?;
-                        messages.push(json!({"role":"user","content":hint}));
-                        should_continue = true;
-                        break;
-                    }
-                    KernelRoundAction::StopEmpty { note } => {
-                        // 空轮耗尽：追加注记后收尾
-                        outcome.failure_taxonomy.push("empty_rounds_exhausted".into());
-                        sink.append(
-                            SessionEventType::SystemNote,
-                            json!({"note": note}),
-                            "round_stop_empty",
-                            json!({"note": note}),
-                        ).map_err(AgentDriverError::Failed)?;
-                        should_break = true;
-                        break;
-                    }
-                    KernelRoundAction::ReplayFrozen => {
-                        // 冻结重放：headless 不支持（流错误 fail-closed），落穿
-                    }
-                    KernelRoundAction::ContinueInterrupted { .. } => {
-                        // 中断续写：headless 不支持（流错误 fail-closed），落穿
-                    }
-                    KernelRoundAction::InterruptedNote { .. } => {
-                        // 中断耗尽注记：headless 不支持，落穿
-                    }
-                    KernelRoundAction::ContinueTruncated { continuation_text, reasoning_only } => {
-                        // assistant 半截正文已经写入 messages；这里只追加共用续写指令，禁止重复正文。
-                        let prompt = continuation_instruction(reasoning_only);
-                        sink.append(
-                            SessionEventType::SystemNote,
-                            json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
-                            "round_continuation_truncated",
-                            json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
-                        ).map_err(AgentDriverError::Failed)?;
-                        messages.push(json!({"role":"user","content":prompt}));
-                        should_continue = true;
-                        break;
-                    }
-                    KernelRoundAction::CorrectFakeCall { correction_text, hint } => {
-                        // 假调用纠正：注入纠正提示继续
-                        sink.append(
-                            SessionEventType::SystemNote,
-                            json!({"correction_text": correction_text, "hint": hint}),
-                            "round_correct_fake_call",
-                            json!({"correction_text": correction_text, "hint": hint}),
-                        ).map_err(AgentDriverError::Failed)?;
-                        messages.push(json!({"role":"user","content":hint}));
-                        should_continue = true;
-                        break;
-                    }
+            let decision = round_router.decide(&round_input);
+            for notice in decision.notices {
+                sink.append(
+                    SessionEventType::SystemNote,
+                    json!({"notice": notice}),
+                    "round_notice",
+                    json!({"notice": notice}),
+                )
+                .map_err(AgentDriverError::Failed)?;
+            }
+            match decision.control {
+                KernelRoundControl::Proceed => {
+                    // 继续后续门控（stop-candidate 等）
+                }
+                KernelRoundControl::RetryEmpty { hint } => {
+                    // 空轮重试：注入纠正提示，下一轮继续
+                    sink.append(
+                        SessionEventType::SystemNote,
+                        json!({"hint": hint}),
+                        "round_retry_empty",
+                        json!({"hint": hint}),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                    messages.push(json!({"role":"user","content":hint}));
+                    continue 'rounds;
+                }
+                KernelRoundControl::StopEmpty { note } => {
+                    // 空轮耗尽：追加注记后收尾
+                    outcome.failure_taxonomy.push("empty_rounds_exhausted".into());
+                    sink.append(
+                        SessionEventType::SystemNote,
+                        json!({"note": note}),
+                        "round_stop_empty",
+                        json!({"note": note}),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                    break 'rounds;
+                }
+                KernelRoundControl::ReplayFrozen => {
+                    // 冻结重放：headless 不支持（流错误 fail-closed），落穿
+                }
+                KernelRoundControl::ContinueInterrupted { .. } => {
+                    // 中断续写：headless 不支持（流错误 fail-closed），落穿
+                }
+                KernelRoundControl::ContinueTruncated {
+                    continuation_text,
+                    reasoning_only,
+                } => {
+                    // assistant 半截正文已经写入 messages；这里只追加共用续写指令，禁止重复正文。
+                    let prompt = continuation_instruction(reasoning_only);
+                    sink.append(
+                        SessionEventType::SystemNote,
+                        json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
+                        "round_continuation_truncated",
+                        json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                    messages.push(json!({"role":"user","content":prompt}));
+                    continue 'rounds;
+                }
+                KernelRoundControl::CorrectFakeCall {
+                    correction_text,
+                    hint,
+                } => {
+                    // 假调用纠正：注入纠正提示继续
+                    sink.append(
+                        SessionEventType::SystemNote,
+                        json!({"correction_text": correction_text, "hint": hint}),
+                        "round_correct_fake_call",
+                        json!({"correction_text": correction_text, "hint": hint}),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                    messages.push(json!({"role":"user","content":hint}));
+                    continue 'rounds;
                 }
             }
-            if should_continue {
-                continue;
-            }
-            if should_break {
-                break;
-            }
-            
+
             if turn.is_stop_candidate() {
                 match acceptance.request_stop() {
                     KernelStopDecision::Accepted(report) => {
@@ -1828,13 +1832,19 @@ mod tests {
             has_native_tool_calls: false,
         };
         
-        let actions_r1 = router.route(&input);
-        assert_eq!(actions_r1.len(), 1);
-        assert!(matches!(actions_r1[0], crate::agent::kernel_loop::KernelRoundAction::RetryEmpty { .. }));
+        let decision_r1 = router.decide(&input);
+        assert!(decision_r1.notices.is_empty());
+        assert!(matches!(
+            decision_r1.control,
+            crate::agent::kernel_loop::KernelRoundControl::RetryEmpty { .. }
+        ));
         
-        let actions_r2 = router.route(&input);
-        assert_eq!(actions_r2.len(), 1);
-        assert!(matches!(actions_r2[0], crate::agent::kernel_loop::KernelRoundAction::StopEmpty { .. }));
+        let decision_r2 = router.decide(&input);
+        assert!(decision_r2.notices.is_empty());
+        assert!(matches!(
+            decision_r2.control,
+            crate::agent::kernel_loop::KernelRoundControl::StopEmpty { .. }
+        ));
         
         // Driver 实际事件：1 个 round_retry_empty + 1 个 round_stop_empty
         let responses = [

@@ -178,12 +178,9 @@ pub struct KernelRoundInput<'a> {
     pub has_native_tool_calls: bool,
 }
 
-/// 轮级路由动作：adapter 按动作执行效果（continue/break/落穿后续 UI 专属门）。
-///
-/// 注意：InterruptedNote 是非终态动作，adapter 追加注记后继续执行后续门控（对齐 chat.rs
-/// 6253 不 continue 的设计）。其他动作均为终态，adapter 执行后 continue/break。
+/// 轮级主控制：每轮恰好产生一个，adapter 不再自行推断动作序列的终态。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KernelRoundAction {
+pub enum KernelRoundControl {
     /// 继续后续 UI 专属门（pending-action/action-commitment/acceptance 等）
     Proceed,
     /// 空轮重试：注入纠正提示，下一轮继续
@@ -197,8 +194,6 @@ pub enum KernelRoundAction {
         continuation_text: String,
         reasoning_only: bool,
     },
-    /// 中断耗尽注记：追加后落穿后续门（对齐 chat.rs 6253 不 continue）
-    InterruptedNote { note: String },
     /// 截断续写：保留已有内容，从截断处继续
     ContinueTruncated {
         continuation_text: String,
@@ -211,7 +206,18 @@ pub enum KernelRoundAction {
     },
 }
 
-/// 轮级路由状态机：跨轮保持计数，route() 每轮调用一次。
+/// 单轮路由决策：零到多个非终态注记，加一个且仅一个主控制。
+///
+/// `notices` 必须先应用，再执行 `control`。该结构把历史上
+/// `InterruptedNote + ContinueTruncated/CorrectFakeCall` 的合法组合显式编码，避免 adapter
+/// 对 `Vec<KernelRoundAction>` 的顺序、continue/break 语义产生不同解释。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelRoundDecision {
+    pub notices: Vec<String>,
+    pub control: KernelRoundControl,
+}
+
+/// 轮级路由状态机：跨轮保持计数，decide() 每轮调用一次。
 ///
 /// 优先级逐字对齐 chat.rs 6205-6276：空轮 → 冻结重放 → 中断续写 → 中断耗尽注记（落穿）
 /// → 截断续写 → fake-call。
@@ -229,26 +235,27 @@ impl KernelRoundRouter {
         Self::default()
     }
 
-    /// 每轮 turn 解析后调用：返回动作序列，adapter 按序执行。
-    ///
-    /// 非终态动作（InterruptedNote）允许后续动作继续评估（对齐 chat.rs 6253 不 continue
-    /// 的设计：中断耗尽注记后仍检查截断/fake-call）。终态动作后不再评估。
-    pub fn route(&mut self, input: &KernelRoundInput) -> Vec<KernelRoundAction> {
-        let mut actions = Vec::new();
+    /// 每轮 turn 解析后调用：返回一个完整决策，adapter 先应用注记再执行主控制。
+    pub fn decide(&mut self, input: &KernelRoundInput) -> KernelRoundDecision {
+        let mut notices = Vec::new();
         let text_empty = input.text.trim().is_empty();
         // 空轮：text 空且非截断非中断且无工具调用（工具调用响应可能无正文，属正常）
         if text_empty && !input.truncated && !input.interrupted && !input.has_native_tool_calls {
             self.empty_rounds += 1;
             if self.empty_rounds >= KERNEL_MAX_EMPTY_ROUNDS {
-                actions.push(KernelRoundAction::StopEmpty {
-                    note: "\n\n> ⚠️ 模型连续多次未输出内容（可能服务端异常），任务已中止；可重新发送指令重试。".to_string(),
-                });
-                return actions;
+                return KernelRoundDecision {
+                    notices,
+                    control: KernelRoundControl::StopEmpty {
+                        note: "\n\n> ⚠️ 模型连续多次未输出内容（可能服务端异常），任务已中止；可重新发送指令重试。".to_string(),
+                    },
+                };
             }
-            actions.push(KernelRoundAction::RetryEmpty {
-                hint: "（系统提示：你上一轮未输出任何内容，请重新生成完整回复；若任务已完成请直接给出结论，若需继续请输出工具调用标记。）".to_string(),
-            });
-            return actions;
+            return KernelRoundDecision {
+                notices,
+                control: KernelRoundControl::RetryEmpty {
+                    hint: "（系统提示：你上一轮未输出任何内容，请重新生成完整回复；若任务已完成请直接给出结论，若需继续请输出工具调用标记。）".to_string(),
+                },
+            };
         }
         // 冻结重放：中断且 text 空且无工具调用且重放次数未耗尽
         if input.interrupted
@@ -257,49 +264,58 @@ impl KernelRoundRouter {
             && self.stream_replays < KERNEL_MAX_STREAM_REPLAYS
         {
             self.stream_replays += 1;
-            actions.push(KernelRoundAction::ReplayFrozen);
-            return actions;
+            return KernelRoundDecision {
+                notices,
+                control: KernelRoundControl::ReplayFrozen,
+            };
         }
         // 中断续写：中断且续写次数未耗尽
         if input.interrupted && self.interrupted_rounds < KERNEL_MAX_INTERRUPT_RETRY_ROUNDS {
             self.interrupted_rounds += 1;
-            actions.push(KernelRoundAction::ContinueInterrupted {
-                continuation_text: strip_tool_calls(input.text),
-                reasoning_only: text_empty && input.has_reasoning,
-            });
-            return actions;
+            return KernelRoundDecision {
+                notices,
+                control: KernelRoundControl::ContinueInterrupted {
+                    continuation_text: strip_tool_calls(input.text),
+                    reasoning_only: text_empty && input.has_reasoning,
+                },
+            };
         }
         // 中断耗尽注记：落穿（不 return，继续评估截断/fake-call）
         if input.interrupted {
-            actions.push(KernelRoundAction::InterruptedNote {
-                note: "\n\n> ⚠️ 网络连续中断（自动续写多次仍未恢复），已保留以上内容；可重新发送指令重试。".to_string(),
-            });
+            notices.push(
+                "\n\n> ⚠️ 网络连续中断（自动续写多次仍未恢复），已保留以上内容；可重新发送指令重试。"
+                    .to_string(),
+            );
         }
         // 截断续写：截断且续写次数未耗尽
         if input.truncated && self.continuation_rounds < KERNEL_MAX_CONTINUATION_ROUNDS {
             self.continuation_rounds += 1;
-            actions.push(KernelRoundAction::ContinueTruncated {
-                continuation_text: strip_tool_calls(input.text),
-                reasoning_only: text_empty && input.has_reasoning,
-            });
-            return actions;
+            return KernelRoundDecision {
+                notices,
+                control: KernelRoundControl::ContinueTruncated {
+                    continuation_text: strip_tool_calls(input.text),
+                    reasoning_only: text_empty && input.has_reasoning,
+                },
+            };
         }
         // 假调用纠正：正文含"已调用工具/工具调用记录"且纠正次数未耗尽
         if (input.text.contains("已调用工具") || input.text.contains("工具调用记录"))
             && self.fake_corrections < KERNEL_MAX_FAKE_CALL_CORRECTIONS
         {
             self.fake_corrections += 1;
-            actions.push(KernelRoundAction::CorrectFakeCall {
-                correction_text: strip_tool_calls(input.text),
-                hint: "（检测到你的回复中出现了\u{201c}已调用工具/工具调用记录\u{201d}等叙述，但未输出工具调用标记，系统未执行任何工具。如需调用工具，请输出【TOOL|工具名|JSON参数】标记行，一行一个；若任务已完成，请直接给出结论总结，不要写\u{201c}已调用工具\u{201d}之类的叙述。）".to_string(),
-            });
-            return actions;
+            return KernelRoundDecision {
+                notices,
+                control: KernelRoundControl::CorrectFakeCall {
+                    correction_text: strip_tool_calls(input.text),
+                    hint: "（检测到你的回复中出现了\u{201c}已调用工具/工具调用记录\u{201d}等叙述，但未输出工具调用标记，系统未执行任何工具。如需调用工具，请输出【TOOL|工具名|JSON参数】标记行，一行一个；若任务已完成，请直接给出结论总结，不要写\u{201c}已调用工具\u{201d}之类的叙述。）".to_string(),
+                },
+            };
         }
         // 无特殊动作：继续后续 UI 专属门
-        if actions.is_empty() {
-            actions.push(KernelRoundAction::Proceed);
+        KernelRoundDecision {
+            notices,
+            control: KernelRoundControl::Proceed,
         }
-        actions
     }
 
     /// 当前各计数器状态：供测试与诊断使用。
@@ -465,13 +481,13 @@ mod tests {
             has_native_tool_calls: false,
         };
         // 第 1 次空轮：RetryEmpty
-        let actions = router.route(&input);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], KernelRoundAction::RetryEmpty { .. }));
+        let decision = router.decide(&input);
+        assert!(decision.notices.is_empty());
+        assert!(matches!(decision.control, KernelRoundControl::RetryEmpty { .. }));
         // 第 2 次空轮：StopEmpty
-        let actions = router.route(&input);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], KernelRoundAction::StopEmpty { .. }));
+        let decision = router.decide(&input);
+        assert!(decision.notices.is_empty());
+        assert!(matches!(decision.control, KernelRoundControl::StopEmpty { .. }));
     }
 
     #[test]
@@ -485,9 +501,9 @@ mod tests {
             interrupted: false,
             has_native_tool_calls: true,
         };
-        let actions = router.route(&input);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], KernelRoundAction::Proceed));
+        let decision = router.decide(&input);
+        assert!(decision.notices.is_empty());
+        assert!(matches!(decision.control, KernelRoundControl::Proceed));
     }
 
     #[test]
@@ -502,14 +518,14 @@ mod tests {
         };
         // 前 5 次中断：ReplayFrozen
         for _ in 0..5 {
-            let actions = router.route(&input);
-            assert_eq!(actions.len(), 1);
-            assert!(matches!(actions[0], KernelRoundAction::ReplayFrozen));
+            let decision = router.decide(&input);
+            assert!(decision.notices.is_empty());
+            assert!(matches!(decision.control, KernelRoundControl::ReplayFrozen));
         }
         // 第 6 次中断：ContinueInterrupted
-        let actions = router.route(&input);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], KernelRoundAction::ContinueInterrupted { .. }));
+        let decision = router.decide(&input);
+        assert!(decision.notices.is_empty());
+        assert!(matches!(decision.control, KernelRoundControl::ContinueInterrupted { .. }));
     }
 
     #[test]
@@ -524,13 +540,13 @@ mod tests {
             has_native_tool_calls: false,
         };
         for _ in 0..3 {
-            let actions = router.route(&input);
-            assert!(matches!(actions[0], KernelRoundAction::ContinueInterrupted { .. }));
+            let decision = router.decide(&input);
+            assert!(matches!(decision.control, KernelRoundControl::ContinueInterrupted { .. }));
         }
-        // 第 4 次中断：InterruptedNote（落穿，无后续动作）
-        let actions = router.route(&input);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], KernelRoundAction::InterruptedNote { .. }));
+        // 第 4 次中断：注记 + Proceed（落穿后续门）
+        let decision = router.decide(&input);
+        assert_eq!(decision.notices.len(), 1);
+        assert!(matches!(decision.control, KernelRoundControl::Proceed));
     }
 
     #[test]
@@ -545,13 +561,13 @@ mod tests {
         };
         // 前 8 次截断：ContinueTruncated
         for _ in 0..8 {
-            let actions = router.route(&input);
-            assert!(matches!(actions[0], KernelRoundAction::ContinueTruncated { .. }));
+            let decision = router.decide(&input);
+            assert!(matches!(decision.control, KernelRoundControl::ContinueTruncated { .. }));
         }
         // 第 9 次截断：Proceed（续写次数耗尽，落穿后续 UI 门）
-        let actions = router.route(&input);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], KernelRoundAction::Proceed));
+        let decision = router.decide(&input);
+        assert!(decision.notices.is_empty());
+        assert!(matches!(decision.control, KernelRoundControl::Proceed));
     }
 
     #[test]
@@ -566,13 +582,13 @@ mod tests {
         };
         // 前 3 次假调用：CorrectFakeCall
         for _ in 0..3 {
-            let actions = router.route(&input);
-            assert!(matches!(actions[0], KernelRoundAction::CorrectFakeCall { .. }));
+            let decision = router.decide(&input);
+            assert!(matches!(decision.control, KernelRoundControl::CorrectFakeCall { .. }));
         }
         // 第 4 次假调用：Proceed（纠正次数耗尽）
-        let actions = router.route(&input);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], KernelRoundAction::Proceed));
+        let decision = router.decide(&input);
+        assert!(decision.notices.is_empty());
+        assert!(matches!(decision.control, KernelRoundControl::Proceed));
     }
 
     #[test]
@@ -585,12 +601,37 @@ mod tests {
             interrupted: false,
             has_native_tool_calls: false,
         };
-        let actions = router.route(&input);
-        match &actions[0] {
-            KernelRoundAction::ContinueTruncated { reasoning_only, .. } => {
+        let decision = router.decide(&input);
+        match decision.control {
+            KernelRoundControl::ContinueTruncated { reasoning_only, .. } => {
                 assert!(reasoning_only);
             }
             _ => panic!("expected ContinueTruncated with reasoning_only=true"),
         }
+    }
+
+    #[test]
+    fn round_router_preserves_interrupted_notice_with_truncated_control() {
+        let mut router = KernelRoundRouter::new();
+        let interrupted = KernelRoundInput {
+            text: "partial",
+            has_reasoning: false,
+            truncated: false,
+            interrupted: true,
+            has_native_tool_calls: false,
+        };
+        for _ in 0..KERNEL_MAX_INTERRUPT_RETRY_ROUNDS {
+            router.decide(&interrupted);
+        }
+
+        let decision = router.decide(&KernelRoundInput {
+            truncated: true,
+            ..interrupted
+        });
+        assert_eq!(decision.notices.len(), 1);
+        assert!(matches!(
+            decision.control,
+            KernelRoundControl::ContinueTruncated { .. }
+        ));
     }
 }

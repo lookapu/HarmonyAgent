@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—H 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略与循环治理组件，单一 run-loop executor 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—I 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略与循环治理组件，单一 run-loop executor 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -490,17 +490,18 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | F | headless 闭合防护缺口（governor/router 集成 + ScriptedClient 请求记录 + 5 个集成测试） | ✅ COMPLETED |
 | G | 差分测试 + 文档收口（2 个差分测试验证 router 黄金轨迹与 driver 事件序列一致） | ✅ COMPLETED |
 | H | 独立工具调用预算 + reasoning 流回放 + UI/headless 共用续写指令 | ✅ COMPLETED |
+| I | 单轮决策收敛（`KernelRoundDecision = notices + 唯一 control`，移除 adapter 动作序列推断） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
 - KernelLoopGovernor 在每次工具调用前 observe，命中循环时注入纠正提示或直接收尾
 - final halt 终止整个 headless round loop，并独立归因为 `tool_loop_exhausted`，不会误报 `max_steps_exceeded`
-- KernelRoundRouter 在 stop-candidate 前 route，处理空轮/冻结重放/中断续写/截断续写/假调用纠正
+- KernelRoundRouter 在 stop-candidate 前返回单一 `KernelRoundDecision`，处理空轮/冻结重放/中断续写/截断续写/假调用纠正；中断耗尽注记与后续主控制被显式拆为 `notices + control`，UI/headless 不再各自遍历动作数组推断 continue/break
 - ScriptedClient 记录每请求 messages，为后续差分测试提供基础
 - 历史 `@文件/@会话` 引用在进入纯策略 assembler 前展开；主动压缩后立即重组本轮请求，并保留尚未发送的一次性注入、图片与续写状态
 - 历史工具输出在内核侧执行 1,200 字符上限，避免 adapter 迁移再次取消上下文护栏
 - headless 保留流式 `reasoning_content`；UI/headless 的 reasoning-only 截断都会直接要求输出结论，不再漏掉续写指令、重复半截正文或继续消耗推理预算
-- Rust lib 共 921 项：913 通过、8 项按环境条件忽略；前端 113 项通过
+- Rust lib 共 922 项：914 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -551,7 +552,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-下一步推进 Phase 2/3，但保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—I 已完成；后续继续收敛单一 executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
@@ -559,8 +560,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
    桌面 UI 流循环已切换到同一组件：chat.rs 删除本地 `STREAM_SILENT_TIMEOUT`/
    `STREAM_MAX_BYTES`/`REASONING_ONLY_GRACE_SECS` 常量与自维护的 stall deadline/
    reasoning 宽限状态，改用 `KernelStreamGovernor` + `KERNEL_STREAM_*` 常量（含字节
-   预算、`sleep_until(deadline)` 硬截止与 200ms tick 兜底判死）；剩余收敛件是消息
-   历史/tool loop 的抽取；
+   预算、`sleep_until(deadline)` 硬截止与 200ms tick 兜底判死）；消息历史、tool loop、
+   单轮决策也已进入共用内核；
 3. 参数级审批、tool metrics 与工具重试语义均已接入 headless runtime：工具执行使用与
    UI 相同的 `TOOL_POLICY` 退避 + `retryable_for` 谓词（契约 retry_safe + 可恢复错误
    白名单，见 `agent/tools/errors.rs`），重试次数写入 trial 私有 `tool_runs.retry_count`，
