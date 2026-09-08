@@ -778,7 +778,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_symbols",
-        desc: "结构优先检索项目代码，不读取正文即可查看实体（类/组件/接口/字段/类型等）和逻辑（函数/方法）的签名与完整行区间。\n参数：{\"query\":\"<可选关键字，匹配名称/签名/文件>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 component|class|interface|field|function|method|route|decorator|struct|enum>\",\"file\":\"<可选文件路径过滤>\",\"cursor\":\"<可选，原样传回上页 next_cursor；提供时优先于 page>\",\"relations_cursor\":\"<可选，原样传回关系结果的 relations_next_cursor 读取下一页关系>\",\"page\":<兼容页码，缺省 1；大仓深翻页优先 cursor>,\"limit\":<可选每页条数 1-200，缺省 50>}。\n适合陌生仓库和修改前定位：先查结构，再把结果的 read_handle 原样传给 read_file 精读或 edit_file 做节点事务；只有跨结构上下文、配置或生成代码等场景才读全文。\n副作用：无（只读，使用增量持久索引；生成句柄时每个命中文件只哈希和扫描一次）。\n返回：分页结构清单、每项绑定 file hash/稳定节点身份/节点内容摘要/expected kind/parent range 的 v3 read_handle、next_cursor、签名、归属、行区间，以及文件/语法/语义覆盖率与 staleness；热点符号关系超过单次上限时返回 relations_next_cursor 供翻页；coverage 非完整时必须结合 codebase_search、LSP 或精确路径补查。",
+        desc: "结构优先检索代码实体与逻辑，不读取正文即可查看签名和完整行区间。\n参数：{\"query\":\"<可选名称/签名/文件关键字>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 kind>\",\"file\":\"<可选路径过滤>\",\"cursor\":\"<可选 next_cursor>\",\"relations_cursor\":\"<可选关系游标>\",\"page\":<兼容页码>,\"limit\":<1-200，缺省 50>}。游标优先于页码。\n陌生仓库和修改前应先查结构，再把 read_handle 传给 read_file 精读或 edit_file 做节点事务；Rust 支持受限可见性函数和 impl/trait 方法，Dart 支持常见 Flutter 类型、构造器、getter 与函数。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构、v3 read_handle、游标、归属、行区间、coverage/staleness；关系过多时返回 relations_next_cursor。coverage 非完整时需结合 codebase_search、LSP 或精确路径补查。",
     },
     ToolSpec {
         name: "repo_query",
@@ -3650,7 +3650,7 @@ fn classify_repo_query(query: &str) -> &'static str {
     let looks_like_path = trimmed.contains('/')
         || trimmed.contains('\\')
         || [
-            ".ts", ".tsx", ".ets", ".js", ".jsx", ".json5", ".json", ".rs", ".py", ".kt", ".java",
+            ".ts", ".tsx", ".ets", ".js", ".jsx", ".json5", ".json", ".rs", ".dart", ".py", ".kt", ".java",
             ".cpp", ".c", ".h", ".hpp",
         ]
         .iter()

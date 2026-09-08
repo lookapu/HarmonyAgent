@@ -2139,7 +2139,7 @@ pub(super) fn block_style(ext: &str) -> BlockStyle {
 
 /// 跨行扫描状态：块注释（/* */）与多行字符串（` 模板串、三引号等）跨行持续
 #[derive(Default)]
-pub(super) struct LineScanner {
+pub(crate) struct LineScanner {
     in_block_comment: bool,
     in_str: Option<char>,
     /// Rust 原始字符串（r"…" / r#"…"# / r##"…"##，含 br/cr 前缀）：
@@ -2160,13 +2160,13 @@ impl LineScanner {
     /// 逐字符扫描一行，把「有意义的括号字符」按出现顺序交给 cb；
     /// 字符串（" ' `）、三引号字符串、Rust 原始字符串、正则字面量、转义、
     /// 行注释（//，Python/Shell 的 #）、块注释（/* */）内的字符全部跳过。
-    pub(super) fn scan(&mut self, line: &str, ext: &str, mut cb: impl FnMut(char)) {
+    pub(crate) fn scan(&mut self, line: &str, ext: &str, mut cb: impl FnMut(char)) {
         let hash_comment = matches!(ext, "py" | "pyw" | "sh" | "bash" | "zsh" | "fish");
         let raw_str = ext == "rs";
-        // 三引号字符串语言：Python 双/三单引号，JVM/Dart 系仅三双引号
+        // 三引号字符串语言：Python/Dart 支持双、三单引号，JVM 系仅三双引号
         let triple: &[u8] = match ext {
-            "py" | "pyw" => b"\"'",
-            "kt" | "kts" | "dart" | "scala" | "groovy" => b"\"",
+            "py" | "pyw" | "dart" => b"\"'",
+            "kt" | "kts" | "scala" | "groovy" => b"\"",
             _ => b"",
         };
         // 正则字面量语言（JS 系）：`/` 可为除法或正则开头，用前驱字符消歧

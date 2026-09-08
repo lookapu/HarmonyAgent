@@ -27,7 +27,7 @@
 - `SandboxBackend`/`SandboxSpec`、可选 Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线均已就绪；产品默认路线已改为无 Docker 依赖的平台原生轻量后端，OCI 只保留为外部 CI 适配器。
 - Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
 - ArkTS LSP 语义层与 `repo_query` 路由/影响面——依赖图重排的统一 planner 待完成。
-- 结构化代码修改——`symbol_handle` v3 已绑定 file hash、稳定/位置 node ID、原节点内容摘要、expected kind、精确节点范围和 parent range；单节点及同文件多节点编辑直接按句柄范围原子修改，连续注解随声明进入同一节点，旧 v1/v2 句柄兼容。默认文件漂移失败关闭；显式 `allow_relocate=true` 时仅允许目标内容与身份不变、候选唯一的受控重定位。统一候选门禁已覆盖 TS/JS/ArkTS Tree-sitter 错误增量与 Java `@Override`/`@Resource` 游离注解增量检查；普通 `start/starts` 模式仍以括号/缩进扫描为 fallback，Java import/override 类型语义与 JDT/Javac 诊断仍待完成。
+- 结构化代码修改——`symbol_handle` v3 已绑定 file hash、稳定/位置 node ID、原节点内容摘要、expected kind、精确节点范围和 parent range；单节点及同文件多节点编辑直接按句柄范围原子修改，连续注解随声明进入同一节点，旧 v1/v2 句柄兼容。默认文件漂移失败关闭；显式 `allow_relocate=true` 时仅允许目标内容与身份不变、候选唯一的受控重定位。Rust/Dart 轻量 adapter 已覆盖受限可见性函数、impl/trait 方法及 Flutter 常见 class/mixin/extension、构造器/getter/函数，并进入持久增量索引。统一候选门禁已覆盖 TS/JS/ArkTS Tree-sitter 错误增量与 Java `@Override`/`@Resource` 游离注解增量检查；普通 `start/starts` 模式仍以括号/缩进扫描为 fallback，Java import/override 类型语义与 JDT/Javac 诊断仍待完成。
 - headless eval harness——数据契约/grader/补丁/工作树/编排与 builtin driver 已落地；当前 builtin 支持 OpenAI-compatible Provider、受限文件工具和 `--driver builtin`，非流式回合、多协议流式帧累加器、无 secret 请求规划、成本账本、acceptance stop gate 与 Provider 重试/取消/截止时间控制已进入 UI/headless 共用 Agent Kernel。流响应读取、消息历史/tool loop 与 recovery 的进一步统一仍待实现，详见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)。
 
 **需外部基础设施（本仓库环境无法完成，按任务分别需真机/真实模型/官方 harness/签名证书；官方 SWE-bench 复现可在独立 CI 使用容器）**
@@ -497,7 +497,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy（类型化窄能力 + 安全校验已落地为 `agent::capability_broker`——`HostCapability` 枚举覆盖 hdc 连接/断开/列表、install、deploy，`validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`；真实执行按 capability_id 接入 device_tools/build_tools 待真机）；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成；`repo_query` 路由 MVP 已完成——`auto` 按查询形态分流 `path/symbol/concept` 到 lexical/结构索引并标注 `source_layer`，`impact` 模式已完成——精确图反向依赖返回“谁引用/调用了该符号”并按主流约定给出候选测试文件；依赖图重排的统一 planner 待完成）；
-- [ ] 结构化代码修改事务 P0/P1：P0 已将 `write_file`、`edit_file`、`multi_edit` 与 LSP WorkspaceEdit 接入候选文本门禁；TS/JS/ArkTS 使用 Tree-sitter 错误增量检查，Java 在 JDT/Javac 接入前先以增量声明门禁阻止新增游离 `@Override`/`@Resource`，其他语言明确回退配平层；`multi_edit` 已先验证全部文件后原子提交并在写入失败时回滚，门禁/回滚/结构过期状态已接入工具卡。P1 节点句柄 v3 已携带 file hash、稳定/位置 node ID、节点内容摘要、kind、精确范围与 parent range，单节点和同文件多节点事务及显式受控重定位均已落地，Java/Kotlin 方法与字段进入轻量结构索引且连续注解随声明修改。剩余工作是 Dart/Rust adapter，以及 Java JDT LS/Javac 的 import/override 类型语义联动；失败时不落盘或整体回滚，且不依赖 Docker；
+- [ ] 结构化代码修改事务 P0/P1：P0 已将 `write_file`、`edit_file`、`multi_edit` 与 LSP WorkspaceEdit 接入候选文本门禁；TS/JS/ArkTS 使用 Tree-sitter 错误增量检查，Java 在 JDT/Javac 接入前先以增量声明门禁阻止新增游离 `@Override`/`@Resource`，其他语言明确回退配平层；`multi_edit` 已先验证全部文件后原子提交并在写入失败时回滚，门禁/回滚/结构过期状态已接入工具卡。P1 节点句柄 v3 已携带 file hash、稳定/位置 node ID、节点内容摘要、kind、精确范围与 parent range，单节点和同文件多节点事务及显式受控重定位均已落地；Java/Kotlin 方法与字段及 Rust/Dart 专用轻量 adapter 已进入持久结构索引，Rust 属性/文档注释与 Dart 注解连续随声明修改。剩余工作是 Java JDT LS/Javac 的 import/override 类型语义联动；失败时不落盘或整体回滚，且不依赖 Docker；
 - [ ] 每周真实模型回归，保存 patch/trajectory/cost/report。
 
 退出门槛：恶意仓库脚本不能读取工作区外文件或联网；100k 文件仓库满足校准后的 P95 指标；结构化修改故障集中新增语法错误落盘率和部分事务残留率均为 0；真实模型评测可重复。

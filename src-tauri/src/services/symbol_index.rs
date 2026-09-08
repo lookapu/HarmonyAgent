@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::services::harmony;
 
-const SYMBOL_EXTS: &[&str] = &["ets", "ts", "tsx", "js", "jsx", "rs", "py", "kt", "java", "swift", "go", "cpp", "c", "h", "hpp"];
+const SYMBOL_EXTS: &[&str] = &["ets", "ts", "tsx", "js", "jsx", "rs", "dart", "py", "kt", "java", "swift", "go", "cpp", "c", "h", "hpp"];
 
 const SKIP_DIRS: &[&str] = &[
     "node_modules", ".git", "build", ".hvigor", "oh_modules", ".idea", "dist",
@@ -29,7 +29,7 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 512 * 1024;
-const STRUCTURE_PARSER_VERSION: i64 = 12;
+const STRUCTURE_PARSER_VERSION: i64 = 13;
 const MAX_REEXPORT_DEPTH: usize = 8;
 const MAX_REEXPORT_BRANCHES: usize = 16;
 const MAX_REEXPORT_VISITS: usize = 128;
@@ -86,7 +86,7 @@ const ETS_STATE_DECORATORS: &[&str] = &[
 /// 单个符号定义
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
-    /// 符号类型：component / class / interface / function / method / route / struct / enum / decorator
+    /// 符号类型：component / class / interface / function / method / route / struct / enum / trait / mixin / extension / decorator
     pub kind: String,
     /// 符号名
     pub name: String,
@@ -243,7 +243,10 @@ fn attached_annotation_start(content: &str, declaration_line: usize) -> usize {
     let mut start = declaration_line.max(1).min(lines.len().max(1));
     while start > 1 {
         let previous = lines[start - 2].trim();
-        if previous.starts_with('@') {
+        if previous.starts_with('@')
+            || previous.starts_with("#[")
+            || previous.starts_with("///")
+        {
             start -= 1;
         } else {
             break;
@@ -625,8 +628,10 @@ fn structure_end_line(lines: &[&str], start: usize, ext: &str, kind: &str) -> us
     }
     let mut found_open = false;
     let mut depth = 0i64;
+    let mut scanner = crate::agent::tools::fs_tools::LineScanner::default();
     for (idx, line) in lines.iter().enumerate().skip(start) {
-        for ch in line.chars() {
+        let mut closed = false;
+        scanner.scan(line, ext, |ch| {
             match ch {
                 '{' => {
                     found_open = true;
@@ -635,11 +640,14 @@ fn structure_end_line(lines: &[&str], start: usize, ext: &str, kind: &str) -> us
                 '}' if found_open => {
                     depth -= 1;
                     if depth == 0 {
-                        return idx + 1;
+                        closed = true;
                     }
                 }
                 _ => {}
             }
+        });
+        if closed {
+            return idx + 1;
         }
         // 声明没有块体时不要吞掉后续定义。
         if !found_open && line.trim_end().ends_with(';') {
@@ -1164,6 +1172,257 @@ fn scan_file_tree_sitter(content: &str, rel: &str, ext: &str, out: &mut Vec<Symb
     true
 }
 
+fn identifier_after_word(line: &str, word: &str) -> Option<String> {
+    line.match_indices(word).find_map(|(offset, _)| {
+        let before = line[..offset].chars().next_back();
+        let after_offset = offset + word.len();
+        let after = line[after_offset..].chars().next();
+        if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+            return None;
+        }
+        let rest = line[after_offset..].trim_start();
+        let first = rest.chars().next()?;
+        if !is_ident_start(first) {
+            return None;
+        }
+        Some(rest.chars().take_while(|ch| is_ident(*ch)).collect())
+    })
+}
+
+fn rust_impl_name(line: &str) -> Option<String> {
+    let mut body = line.trim_start();
+    for prefix in ["pub ", "unsafe ", "default "] {
+        body = body.strip_prefix(prefix).unwrap_or(body);
+    }
+    body = body.strip_prefix("impl")?.trim_start();
+    if body.starts_with('<') {
+        let mut depth = 0i32;
+        let mut end = None;
+        for (index, ch) in body.char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index + ch.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        body = body.get(end?..).unwrap_or("").trim_start();
+    }
+    if let Some((_, target)) = body.rsplit_once(" for ") {
+        body = target.trim_start();
+    }
+    let body = body.trim_start_matches('&').trim_start();
+    let first = body.chars().next()?;
+    if !is_ident_start(first) {
+        return None;
+    }
+    Some(body.chars().take_while(|ch| is_ident(*ch)).collect())
+}
+
+#[derive(Clone)]
+struct LightweightContainer {
+    name: String,
+    kind: String,
+    end_line: usize,
+    body_depth: i32,
+}
+
+fn brace_delta(
+    scanner: &mut crate::agent::tools::fs_tools::LineScanner,
+    line: &str,
+    ext: &str,
+) -> i32 {
+    let mut depth = 0;
+    scanner.scan(line, ext, |ch| match ch {
+        '{' => depth += 1,
+        '}' => depth -= 1,
+        _ => {}
+    });
+    depth
+}
+
+/// Rust adapter for declarations that the generic fallback cannot classify reliably,
+/// notably restricted visibility functions and methods inside impl/trait blocks.
+fn scan_rust_lightweight(content: &str, rel: &str, out: &mut Vec<Symbol>) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut containers: Vec<LightweightContainer> = Vec::new();
+    let mut depth = 0i32;
+    let mut scanner = crate::agent::tools::fs_tools::LineScanner::default();
+    for (idx, raw) in lines.iter().copied().enumerate() {
+        let lineno = idx + 1;
+        containers.retain(|container| lineno <= container.end_line);
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') || line.starts_with("#[") {
+            depth += brace_delta(&mut scanner, line, "rs");
+            continue;
+        }
+
+        let mut entity = None;
+        for kind in ["struct", "enum", "trait", "union", "type", "mod"] {
+            if let Some(name) = identifier_after_word(line, kind) {
+                entity = Some((kind, name));
+                break;
+            }
+        }
+        if entity.is_none() {
+            entity = rust_impl_name(line).map(|name| ("impl", name));
+        }
+        if let Some((kind, name)) = entity {
+            let symbol = make_symbol(kind, name.clone(), rel, lineno, None, raw, &lines, "rs");
+            let end_line = symbol.end_line;
+            out.push(symbol);
+            if line.contains('{') && end_line > lineno {
+                containers.push(LightweightContainer {
+                    name,
+                    kind: kind.into(),
+                    end_line,
+                    body_depth: depth + 1,
+                });
+            }
+        }
+
+        if let Some(name) = identifier_after_word(line, "fn") {
+            let parent = containers
+                .iter()
+                .rev()
+                .find(|container| depth == container.body_depth);
+            let kind = if parent.is_some_and(|container| matches!(container.kind.as_str(), "impl" | "trait")) {
+                "method"
+            } else {
+                "function"
+            };
+            out.push(make_symbol(
+                kind,
+                name,
+                rel,
+                lineno,
+                parent.map(|container| container.name.clone()),
+                raw,
+                &lines,
+                "rs",
+            ));
+        }
+        depth += brace_delta(&mut scanner, line, "rs");
+    }
+}
+
+fn dart_member_name(line: &str) -> Option<String> {
+    let open = line.find('(')?;
+    let prefix = line[..open].trim_end();
+    let name = prefix
+        .chars()
+        .rev()
+        .take_while(|ch| is_ident(*ch))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    (!name.is_empty()
+        && !["if", "for", "while", "switch", "catch", "return", "assert"]
+            .contains(&name.as_str()))
+    .then_some(name)
+}
+
+fn dart_getter_name(line: &str) -> Option<String> {
+    let marker = line.find(" get ").map(|offset| offset + 5).or_else(|| {
+        line.strip_prefix("get ").map(|_| 4)
+    })?;
+    let rest = line.get(marker..)?.trim_start();
+    let first = rest.chars().next()?;
+    is_ident_start(first).then(|| rest.chars().take_while(|ch| is_ident(*ch)).collect())
+}
+
+/// Dart adapter covering Flutter's class/mixin/extension entities and top-level or
+/// type-owned functions. It deliberately requires declaration-shaped line endings to
+/// avoid indexing method invocations as declarations.
+fn scan_dart_lightweight(content: &str, rel: &str, out: &mut Vec<Symbol>) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut containers: Vec<LightweightContainer> = Vec::new();
+    let mut depth = 0i32;
+    let mut scanner = crate::agent::tools::fs_tools::LineScanner::default();
+    for (idx, raw) in lines.iter().copied().enumerate() {
+        let lineno = idx + 1;
+        containers.retain(|container| lineno <= container.end_line);
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') || line.starts_with('@') {
+            depth += brace_delta(&mut scanner, line, "dart");
+            continue;
+        }
+
+        let mut entity = None;
+        for kind in ["class", "mixin", "enum", "extension", "typedef"] {
+            let name = if kind == "extension" && line.contains("extension type ") {
+                identifier_after_word(line, "type")
+            } else {
+                identifier_after_word(line, kind)
+            };
+            if let Some(name) = name.filter(|name| !(kind == "extension" && name == "on")) {
+                entity = Some((kind, name));
+                break;
+            }
+        }
+        if let Some((kind, name)) = entity {
+            let symbol = make_symbol(kind, name.clone(), rel, lineno, None, raw, &lines, "dart");
+            let end_line = symbol.end_line;
+            out.push(symbol);
+            if line.contains('{') && end_line > lineno {
+                containers.push(LightweightContainer {
+                    name,
+                    kind: kind.into(),
+                    end_line,
+                    body_depth: depth + 1,
+                });
+            }
+        } else {
+            let parent = containers
+                .iter()
+                .rev()
+                .find(|container| depth == container.body_depth);
+            let declaration_end = line.contains('{') || line.contains("=>") || line.ends_with(';');
+            if declaration_end && (parent.is_some() || depth == 0) {
+                if let Some(name) = dart_getter_name(line) {
+                    out.push(make_symbol(
+                        if parent.is_some() { "method" } else { "function" },
+                        name,
+                        rel,
+                        lineno,
+                        parent.map(|container| container.name.clone()),
+                        raw,
+                        &lines,
+                        "dart",
+                    ));
+                    depth += brace_delta(&mut scanner, line, "dart");
+                    continue;
+                }
+                if let Some(name) = dart_member_name(line) {
+                    let prefix = line.split('(').next().unwrap_or("").trim();
+                    let declaration_evidence = prefix.split_whitespace().count() >= 2
+                        || parent.is_some_and(|container| container.name == name)
+                        || prefix.starts_with("operator ");
+                    if declaration_evidence {
+                        out.push(make_symbol(
+                            if parent.is_some() { "method" } else { "function" },
+                            name,
+                            rel,
+                            lineno,
+                            parent.map(|container| container.name.clone()),
+                            raw,
+                            &lines,
+                            "dart",
+                        ));
+                    }
+                }
+            }
+        }
+        depth += brace_delta(&mut scanner, line, "dart");
+    }
+}
+
 /// 解析单个源文件中的符号
 fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
     let meta = match fs::metadata(path) {
@@ -1177,6 +1436,14 @@ fn scan_file(path: &Path, rel: &str, out: &mut Vec<Symbol>) {
     };
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if scan_file_tree_sitter(&content, rel, ext, out) {
+        return;
+    }
+    if ext == "rs" {
+        scan_rust_lightweight(&content, rel, out);
+        return;
+    }
+    if ext == "dart" {
+        scan_dart_lightweight(&content, rel, out);
         return;
     }
     let lines: Vec<&str> = content.lines().collect();
@@ -6189,6 +6456,105 @@ struct Detail {
         assert!(out.iter().any(|s| s.kind == "struct" && s.name == "Foo"));
         assert!(out.iter().any(|s| s.kind == "function" && s.name == "bar"));
         assert!(out.iter().any(|s| s.kind == "function" && s.name == "baz"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rust_adapter_extracts_restricted_functions_and_impl_methods() {
+        let src = r##"/// Runs one job.
+#[cfg(feature = "jobs")]
+pub(crate) async fn run_job() {}
+
+pub struct Worker;
+
+impl Worker {
+    pub(super) fn execute(&self) {
+        let marker = r#"}"#;
+        helper();
+    }
+}
+"##;
+        let dir = std::env::temp_dir().join(format!("deveco-symbol-rust-adapter-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("worker.rs");
+        std::fs::write(&file, src).unwrap();
+        let mut out = Vec::new();
+        scan_file(&file, "worker.rs", &mut out);
+
+        let function = out.iter().find(|symbol| symbol.name == "run_job").unwrap();
+        assert_eq!(function.kind, "function");
+        assert_eq!(function.line, 3);
+        let method = out.iter().find(|symbol| symbol.name == "execute").unwrap();
+        assert_eq!(method.kind, "method");
+        assert_eq!(method.parent.as_deref(), Some("Worker"));
+        assert_eq!(method.end_line, 11, "Rust 原始字符串中的大括号不能截断节点");
+        assert!(!out.iter().any(|symbol| symbol.name == "helper"), "调用不应被识别成声明: {out:?}");
+
+        let handle = symbol_read_handles(&dir, &[function.clone()]).remove(0).unwrap();
+        let locator = resolve_symbol_read_handle(&[dir.clone()], &handle).unwrap();
+        assert_eq!(locator.start_line, 1, "文档注释和属性必须随声明进入节点事务");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dart_adapter_extracts_flutter_entities_and_logic_without_calls() {
+        assert!(SYMBOL_EXTS.contains(&"dart"), "Dart 必须进入持久文件目录与增量索引");
+        let src = r#"Future<void> bootstrap() async {
+  await runApp();
+}
+
+class CounterController {
+  CounterController();
+
+  @override
+  Future<int> increment(int value) async {
+    final marker = '''
+}
+''';
+    notifyListeners();
+    return value + 1;
+  }
+}
+
+mixin Logging {
+  String get label => 'log';
+  void logMessage(String value) => print(value);
+}
+
+extension type UserId(int value) {
+  String format() => value.toString();
+}
+"#;
+        let dir = std::env::temp_dir().join(format!("deveco-symbol-dart-adapter-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("controller.dart");
+        std::fs::write(&file, src).unwrap();
+        let mut out = Vec::new();
+        scan_file(&file, "controller.dart", &mut out);
+
+        let bootstrap = out.iter().find(|symbol| symbol.name == "bootstrap").unwrap();
+        assert_eq!(bootstrap.kind, "function");
+        let controller = out.iter().find(|symbol| symbol.name == "CounterController" && symbol.kind == "class").unwrap();
+        assert_eq!(controller.end_line, 16);
+        let constructor = out.iter().find(|symbol| symbol.name == "CounterController" && symbol.kind == "method").unwrap();
+        assert_eq!(constructor.parent.as_deref(), Some("CounterController"));
+        let increment = out.iter().find(|symbol| symbol.name == "increment").unwrap();
+        assert_eq!(increment.kind, "method");
+        assert_eq!(increment.parent.as_deref(), Some("CounterController"));
+        assert_eq!(increment.end_line, 15, "Dart 多行字符串中的大括号不能截断节点");
+        let logging = out.iter().find(|symbol| symbol.name == "Logging").unwrap();
+        assert_eq!(logging.kind, "mixin");
+        assert!(out.iter().any(|symbol| symbol.name == "label" && symbol.parent.as_deref() == Some("Logging")));
+        assert!(out.iter().any(|symbol| symbol.name == "logMessage" && symbol.parent.as_deref() == Some("Logging")));
+        let extension = out.iter().find(|symbol| symbol.name == "UserId").unwrap();
+        assert_eq!(extension.kind, "extension");
+        assert!(out.iter().any(|symbol| symbol.name == "format" && symbol.parent.as_deref() == Some("UserId")));
+        assert!(!out.iter().any(|symbol| matches!(symbol.name.as_str(), "runApp" | "notifyListeners" | "print")), "调用不应被识别成声明: {out:?}");
+        assert!(out.iter().all(|symbol| symbol.language == "dart" && symbol.source_layer == "lightweight"));
+
+        let handle = symbol_read_handles(&dir, &[increment.clone()]).remove(0).unwrap();
+        let locator = resolve_symbol_read_handle(&[dir.clone()], &handle).unwrap();
+        assert_eq!(locator.start_line, 8, "@override 必须随 Dart 方法进入节点事务");
         std::fs::remove_dir_all(&dir).ok();
     }
 
