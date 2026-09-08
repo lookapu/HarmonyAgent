@@ -939,6 +939,74 @@ pub struct KernelToolEvidence {
     pub succeeded: bool,
 }
 
+/// 一次 Agent run 的唯一主终止原因。
+///
+/// adapter 可以继续记录工具错误、验收阻塞等附加 taxonomy，但外层 round loop 只能由一个
+/// 主原因终止。集中记录可避免多个 `stopped_by_*` 布尔值遗漏或同时成立。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelRunTermination {
+    ModelAccepted,
+    CostBudgetExceeded,
+    AcceptanceExhausted,
+    EmptyRoundsExhausted,
+    ToolCallBudgetExceeded,
+    ToolLoopExhausted,
+    MaxStepsExceeded,
+}
+
+impl KernelRunTermination {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelAccepted => "model_accepted",
+            Self::CostBudgetExceeded => "max_cost_exceeded",
+            Self::AcceptanceExhausted => "acceptance_exhausted",
+            Self::EmptyRoundsExhausted => "empty_rounds_exhausted",
+            Self::ToolCallBudgetExceeded => "max_tool_calls_exceeded",
+            Self::ToolLoopExhausted => "tool_loop_exhausted",
+            Self::MaxStepsExceeded => "max_steps_exceeded",
+        }
+    }
+
+    /// 需要进入失败分类的终止原因；模型通过验收后正常停止不产生失败 taxonomy。
+    pub fn failure_taxonomy(self) -> Option<&'static str> {
+        match self {
+            Self::ModelAccepted => None,
+            Self::CostBudgetExceeded => Some("max_cost_exceeded"),
+            Self::AcceptanceExhausted => Some("acceptance_failed"),
+            Self::EmptyRoundsExhausted => Some("empty_rounds_exhausted"),
+            Self::ToolCallBudgetExceeded => Some("max_tool_calls_exceeded"),
+            Self::ToolLoopExhausted => Some("tool_loop_exhausted"),
+            Self::MaxStepsExceeded => Some("max_steps_exceeded"),
+        }
+    }
+}
+
+/// 外层 run-loop 的最小共享状态：锁定首个终止原因，并在自然跑满时归因为步数耗尽。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KernelRunState {
+    termination: Option<KernelRunTermination>,
+}
+
+impl KernelRunState {
+    pub fn terminate(&mut self, reason: KernelRunTermination) {
+        if self.termination.is_none() {
+            self.termination = Some(reason);
+        }
+    }
+
+    pub fn termination(&self) -> Option<KernelRunTermination> {
+        self.termination
+    }
+
+    /// 仅在尚无更具体原因且确实跑满时标记步数耗尽；返回最终终止原因。
+    pub fn finish(&mut self, completed_steps: u64, round_limit: u64) -> Option<KernelRunTermination> {
+        if self.termination.is_none() && completed_steps >= round_limit {
+            self.termination = Some(KernelRunTermination::MaxStepsExceeded);
+        }
+        self.termination
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum KernelStopDecision {
     Accepted(AcceptanceReport),
@@ -1438,6 +1506,41 @@ mod tests {
             KernelStopDecision::Exhausted(_)
         ));
         assert_eq!(gate.remediation_rounds(), 1);
+    }
+
+    #[test]
+    fn run_state_preserves_specific_termination_at_step_limit() {
+        let mut state = KernelRunState::default();
+        state.terminate(KernelRunTermination::EmptyRoundsExhausted);
+        assert_eq!(
+            state.finish(2, 2),
+            Some(KernelRunTermination::EmptyRoundsExhausted)
+        );
+        state.terminate(KernelRunTermination::ToolLoopExhausted);
+        assert_eq!(
+            state.termination(),
+            Some(KernelRunTermination::EmptyRoundsExhausted),
+            "首个终止原因必须保持稳定"
+        );
+        assert_eq!(
+            state.termination().map(KernelRunTermination::as_str),
+            Some("empty_rounds_exhausted")
+        );
+    }
+
+    #[test]
+    fn run_state_classifies_natural_step_exhaustion() {
+        let mut state = KernelRunState::default();
+        assert_eq!(
+            state.finish(3, 3),
+            Some(KernelRunTermination::MaxStepsExceeded)
+        );
+        assert_eq!(
+            state
+                .termination()
+                .and_then(KernelRunTermination::failure_taxonomy),
+            Some("max_steps_exceeded")
+        );
     }
 
     fn stream_governor() -> KernelStreamGovernor {

@@ -6,10 +6,10 @@
 
 use crate::agent::agent_kernel::{
     build_model_request_plan, run_provider_transport, sse_payload, KernelAcceptanceGate,
-    KernelSseBuffer, KernelStopDecision, KernelStreamAccumulator, KernelStreamFinish,
-    KernelStreamGovernor, KernelStreamSignal, KernelToolEvidence, KernelTransportStop, KernelTurn,
-    KernelUsageLedger, KERNEL_STREAM_MAX_BYTES, KERNEL_STREAM_REASONING_GRACE,
-    KERNEL_STREAM_SILENT_TIMEOUT,
+    KernelRunState, KernelRunTermination, KernelSseBuffer, KernelStopDecision,
+    KernelStreamAccumulator, KernelStreamFinish, KernelStreamGovernor, KernelStreamSignal,
+    KernelToolEvidence, KernelTransportStop, KernelTurn, KernelUsageLedger, KERNEL_STREAM_MAX_BYTES,
+    KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
 use crate::agent::kernel_loop::{
     KernelLoopGovernor, KernelRoundControl, KernelRoundInput, KernelRoundRouter,
@@ -550,11 +550,7 @@ impl HeadlessAgentDriver {
         )
         .map_err(AgentDriverError::Failed)?;
         let round_limit = self.provider.max_rounds.min(task.limits.max_steps as u32);
-        let mut stopped_by_model = false;
-        let mut stopped_by_budget = false;
-        let mut stopped_by_acceptance = false;
-        let mut stopped_by_loop = false;
-        let mut stopped_by_tool_budget = false;
+        let mut run_state = KernelRunState::default();
         let mut attempted_tool_calls = 0u64;
         
         // Phase F：headless 接入循环治理与轮级路由（纯策略，UI 共用）
@@ -597,8 +593,7 @@ impl HeadlessAgentDriver {
             .map_err(AgentDriverError::Failed)?;
             messages.push(turn.provider_message.clone());
             if cost_exceeded {
-                stopped_by_budget = true;
-                outcome.failure_taxonomy.push("max_cost_exceeded".into());
+                run_state.terminate(KernelRunTermination::CostBudgetExceeded);
                 sink.append(
                     SessionEventType::SystemNote,
                     json!({"reason":"max_cost_exceeded","cost_cny":outcome.cost_cny}),
@@ -651,7 +646,7 @@ impl HeadlessAgentDriver {
                 }
                 KernelRoundControl::StopEmpty { note } => {
                     // 空轮耗尽：追加注记后收尾
-                    outcome.failure_taxonomy.push("empty_rounds_exhausted".into());
+                    run_state.terminate(KernelRunTermination::EmptyRoundsExhausted);
                     sink.append(
                         SessionEventType::SystemNote,
                         json!({"note": note}),
@@ -703,7 +698,7 @@ impl HeadlessAgentDriver {
             if turn.is_stop_candidate() {
                 match acceptance.request_stop() {
                     KernelStopDecision::Accepted(report) => {
-                        stopped_by_model = true;
+                        run_state.terminate(KernelRunTermination::ModelAccepted);
                         sink.append(
                             SessionEventType::SystemNote,
                             serde_json::to_value(&report)
@@ -731,8 +726,7 @@ impl HeadlessAgentDriver {
                         continue;
                     }
                     KernelStopDecision::Exhausted(report) => {
-                        stopped_by_acceptance = true;
-                        outcome.failure_taxonomy.push("acceptance_failed".into());
+                        run_state.terminate(KernelRunTermination::AcceptanceExhausted);
                         sink.append(
                             SessionEventType::SystemNote,
                             serde_json::to_value(&report)
@@ -748,8 +742,7 @@ impl HeadlessAgentDriver {
             for call in turn.tool_calls {
                 attempted_tool_calls = attempted_tool_calls.saturating_add(1);
                 if attempted_tool_calls > task.limits.max_tool_calls {
-                    stopped_by_tool_budget = true;
-                    outcome.failure_taxonomy.push("max_tool_calls_exceeded".into());
+                    run_state.terminate(KernelRunTermination::ToolCallBudgetExceeded);
                     sink.append(
                         SessionEventType::SystemNote,
                         json!({
@@ -795,8 +788,7 @@ impl HeadlessAgentDriver {
                     crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, .. } => {
                         if final_halt {
                             // loop_breaks 已超上限，直接收尾
-                            stopped_by_loop = true;
-                            outcome.failure_taxonomy.push("tool_loop_exhausted".into());
+                            run_state.terminate(KernelRunTermination::ToolLoopExhausted);
                             sink.append(
                                 SessionEventType::SystemNote,
                                 json!({"reason":"tool_loop_exhausted","tool":name}),
@@ -910,14 +902,11 @@ impl HeadlessAgentDriver {
                 messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
             }
         }
-        if !stopped_by_model
-            && !stopped_by_budget
-            && !stopped_by_acceptance
-            && !stopped_by_loop
-            && !stopped_by_tool_budget
-            && outcome.steps >= round_limit as u64
+        if let Some(taxonomy) = run_state
+            .finish(outcome.steps, round_limit as u64)
+            .and_then(KernelRunTermination::failure_taxonomy)
         {
-            outcome.failure_taxonomy.push("max_steps_exceeded".into());
+            outcome.failure_taxonomy.push(taxonomy.into());
         }
         let acceptance_report = acceptance.report();
         if !acceptance_report.passed
@@ -953,7 +942,17 @@ impl HeadlessAgentDriver {
                 .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
         )
         .map_err(AgentDriverError::Failed)?;
-        sink.append(SessionEventType::SystemNote, json!({"text":"builtin driver finished","steps":outcome.steps,"tool_calls":outcome.tool_calls}), "driver_finished", json!({"steps":outcome.steps,"tool_calls":outcome.tool_calls})).map_err(AgentDriverError::Failed)?;
+        let termination_reason = run_state
+            .termination()
+            .map(KernelRunTermination::as_str)
+            .unwrap_or("unknown");
+        sink.append(
+            SessionEventType::SystemNote,
+            json!({"text":"builtin driver finished","steps":outcome.steps,"tool_calls":outcome.tool_calls,"termination_reason":termination_reason}),
+            "driver_finished",
+            json!({"steps":outcome.steps,"tool_calls":outcome.tool_calls,"termination_reason":termination_reason}),
+        )
+        .map_err(AgentDriverError::Failed)?;
         outcome.trajectory = sink.into_trajectory();
         if self.provider.input_price_cny_per_1k.is_none()
             || self.provider.output_price_cny_per_1k.is_none()
@@ -1525,6 +1524,15 @@ mod tests {
         assert!(!outcome
             .failure_taxonomy
             .contains(&"max_steps_exceeded".to_string()));
+        let finished = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "driver_finished")
+            .expect("终止原因必须进入最终事件");
+        assert_eq!(
+            finished.fields["termination_reason"],
+            "tool_loop_exhausted"
+        );
 
         std::fs::remove_dir_all(workspace).ok();
     }
@@ -1582,6 +1590,15 @@ mod tests {
         assert!(!outcome
             .failure_taxonomy
             .contains(&"max_steps_exceeded".to_string()));
+        let finished = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "driver_finished")
+            .expect("终止原因必须进入最终事件");
+        assert_eq!(
+            finished.fields["termination_reason"],
+            "max_tool_calls_exceeded"
+        );
 
         std::fs::remove_dir_all(workspace).ok();
     }
@@ -1606,8 +1623,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
+        let mut task = offline_task();
+        task.limits.max_steps = 2;
         let outcome = scripted_driver(responses)
-            .run_async(&offline_task(), &workspace)
+            .run_async(&task, &workspace)
             .await
             .unwrap();
 
@@ -1620,6 +1639,18 @@ mod tests {
             .trajectory
             .iter()
             .any(|event| event.kind == "round_stop_empty"));
+        assert!(!outcome
+            .failure_taxonomy
+            .contains(&"max_steps_exceeded".to_string()));
+        let finished = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "driver_finished")
+            .expect("终止原因必须进入最终事件");
+        assert_eq!(
+            finished.fields["termination_reason"],
+            "empty_rounds_exhausted"
+        );
 
         std::fs::remove_dir_all(workspace).ok();
     }
