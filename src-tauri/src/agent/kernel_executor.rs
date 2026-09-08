@@ -29,7 +29,7 @@ pub struct KernelExecutorSnapshot {
     pub tool_attempts: u64,
     pub loop_breaks: usize,
     pub round_counters: KernelRoundCounters,
-    pub termination_reason: Option<String>,
+    pub termination_reason: String,
     pub failure_taxonomy: Option<String>,
 }
 
@@ -129,18 +129,37 @@ impl KernelExecutorState {
         self.run.termination()
     }
 
-    pub fn snapshot(&self) -> KernelExecutorSnapshot {
-        KernelExecutorSnapshot {
+    fn final_snapshot(&self) -> Result<KernelExecutorSnapshot, String> {
+        let termination = self
+            .termination()
+            .ok_or_else(|| "executor 尚未终止，禁止生成最终快照".to_string())?;
+        Ok(KernelExecutorSnapshot {
             steps: self.completed_rounds,
             tool_attempts: self.tool_attempts,
             loop_breaks: self.loop_breaks(),
             round_counters: self.round_counters(),
-            termination_reason: self.termination().map(|reason| reason.as_str().to_string()),
-            failure_taxonomy: self
-                .termination()
-                .and_then(KernelRunTermination::failure_taxonomy)
-                .map(str::to_string),
-        }
+            termination_reason: termination.as_str().to_string(),
+            failure_taxonomy: termination.failure_taxonomy().map(str::to_string),
+        })
+    }
+
+    /// 有固定 round limit 的 executor：先完成自然耗尽归因，再生成非空终止快照。
+    pub fn finish_and_snapshot(
+        &mut self,
+        round_limit: u64,
+    ) -> Result<KernelExecutorSnapshot, String> {
+        self.finish(round_limit);
+        self.final_snapshot()
+    }
+
+    /// 由 adapter 提供无固定 round limit 时的最终回退原因；已存在的首个原因不会被覆盖。
+    pub fn terminate_and_snapshot(
+        &mut self,
+        fallback: KernelRunTermination,
+    ) -> KernelExecutorSnapshot {
+        self.terminate(fallback);
+        self.final_snapshot()
+            .expect("terminate 后必须能够生成 executor 最终快照")
     }
 }
 
@@ -253,11 +272,13 @@ mod tests {
             executor.termination(),
             Some(KernelRunTermination::ToolCallBudgetExceeded)
         );
-        let snapshot = executor.snapshot();
+        let snapshot = executor
+            .finish_and_snapshot(10)
+            .expect("已终止 executor 应生成最终快照");
         assert_eq!(snapshot.tool_attempts, 3);
         assert_eq!(
-            snapshot.termination_reason.as_deref(),
-            Some("max_tool_calls_exceeded")
+            snapshot.termination_reason,
+            "max_tool_calls_exceeded"
         );
         assert_eq!(
             snapshot.failure_taxonomy.as_deref(),
@@ -266,5 +287,15 @@ mod tests {
         let json = serde_json::to_value(snapshot).unwrap();
         assert_eq!(json["round_counters"]["empty_rounds"], 0);
         assert_eq!(json["loop_breaks"], 0);
+    }
+
+    #[test]
+    fn executor_rejects_final_snapshot_without_termination() {
+        let mut executor = KernelExecutorState::new();
+        executor.start_round();
+        let error = executor
+            .finish_and_snapshot(2)
+            .expect_err("未终止且未跑满时必须失败关闭");
+        assert!(error.contains("尚未终止"));
     }
 }

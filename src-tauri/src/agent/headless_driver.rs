@@ -909,11 +909,11 @@ impl HeadlessAgentDriver {
                 messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
             }
         }
-        if let Some(taxonomy) = kernel_executor
-            .finish(round_limit as u64)
-            .and_then(KernelRunTermination::failure_taxonomy)
-        {
-            outcome.failure_taxonomy.push(taxonomy.into());
+        let executor_snapshot = kernel_executor
+            .finish_and_snapshot(round_limit as u64)
+            .map_err(AgentDriverError::Failed)?;
+        if let Some(taxonomy) = &executor_snapshot.failure_taxonomy {
+            outcome.failure_taxonomy.push(taxonomy.clone());
         }
         let acceptance_report = acceptance.report();
         if !acceptance_report.passed
@@ -949,7 +949,7 @@ impl HeadlessAgentDriver {
                 .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
         )
         .map_err(AgentDriverError::Failed)?;
-        let mut finished_fields = serde_json::to_value(kernel_executor.snapshot())
+        let mut finished_fields = serde_json::to_value(executor_snapshot)
             .map_err(|error| AgentDriverError::Failed(error.to_string()))?;
         if let Some(fields) = finished_fields.as_object_mut() {
             fields.insert("tool_calls".into(), json!(outcome.tool_calls));
