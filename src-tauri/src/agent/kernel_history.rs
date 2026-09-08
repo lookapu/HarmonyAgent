@@ -1,8 +1,10 @@
-//! AgentKernel 共享消息历史组装策略（Phase A：仅搬入纯函数，assembler 在 Phase E 接入）。
+//! AgentKernel 共享消息历史组装策略（Phase A/E：纯函数 + Assembler）。
 //!
 //! 纯策略、无 IO、无 Tauri 依赖：UI（chat.rs）与 headless（headless_driver.rs）共用。
-//! Phase A 先搬入两个纯函数（`dynamic_history_limit`、`estimate_tokens`），chat.rs 改 import；
-//! 完整 `KernelHistoryAssembler` 在 Phase E 落盘并接入 chat.rs 主循环。
+//! Phase A 先搬入两个纯函数（`dynamic_history_limit`、`estimate_tokens`）；
+//! Phase E 实现 `KernelHistoryAssembler` 接管 system/history/tool/注入/续写/纠正中段组装。
+
+use serde_json;
 
 /// 历史行数上限按模型上下文预算动态计算：预算越大保留越多历史，但有上下限防止
 /// 小窗口模型撑爆上下文或大窗口模型历史过短丢失决策语境。
@@ -15,6 +17,224 @@ pub fn dynamic_history_limit(context_budget: i64) -> usize {
 /// 消息列表 token 估算：委托给 tokenizer 工具函数，与 chat.rs 原口径一致。
 pub fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
     crate::utils::tokenizer::estimate_messages_tokens(messages)
+}
+
+// ── 历史行输入结构（adapter 从 DB 读出后传入，IO 留在 adapter） ───────────────────────
+
+/// 历史行：adapter 从 messages 表读出后构造（role/content/references_json/reasoning）
+#[derive(Clone, Debug)]
+pub struct HistoryRow {
+    pub role: String,
+    pub content: String,
+    pub references_json: Option<String>,
+    pub reasoning: Option<String>,
+}
+
+/// 本轮已执行工具结果：adapter 从 tool_runs 派生后传入
+#[derive(Clone, Debug)]
+pub struct ToolResult {
+    pub tool: String,
+    pub output: String,
+}
+
+/// 用户注入指令：adapter 从 merged_instructions / session_ctx / replan 等收集后传入
+#[derive(Clone, Debug)]
+pub struct UserInjection {
+    pub content: String,
+}
+
+// ── Assembler 输入（所有数据由 adapter 预读好，assembler 只做拼装） ───────────────────
+
+/// KernelHistoryAssembler 输入：adapter 负责所有 IO（DB 查询、文件读取、context 加载），
+/// assembler 只负责按固定顺序拼装消息序列。
+#[derive(Clone, Debug)]
+pub struct KernelHistoryInput<'a> {
+    // System 层（adapter 预拼接好每段文本）
+    pub system_prompt: &'a str,
+    pub memo_replay: Option<&'a str>,
+    pub context_hint: Option<&'a str>,
+    pub workflow_directive: &'a str,
+    pub ledger_hint: Option<&'a str>,
+    pub compression_summary: Option<&'a str>,
+    pub confirmed_plan: Option<&'a str>,
+
+    // 历史行（adapter 已从 DB 读出并反转顺序）
+    pub history_rows: Vec<HistoryRow>,
+
+    // 本轮工具结果（adapter 已从 tool_runs 派生并截断）
+    pub tool_results: Vec<ToolResult>,
+
+    // 用户注入（adapter 已收集好所有 user 消息）
+    pub user_injections: Vec<UserInjection>,
+
+    // 续写/纠正状态（adapter 从 round_router 得到）
+    pub continuation_text: &'a str,
+    pub continuation_reasoning_only: bool,
+    pub correction_text: &'a str,
+    pub correction_hint: &'a str,
+
+    // 进度对照标记（adapter 根据 tools_since_progress 决定）
+    pub inject_progress_check: bool,
+}
+
+/// Assembler 输出：消息序列（adapter 直接发给 Provider）
+#[derive(Clone, Debug)]
+pub struct KernelAssembled {
+    pub messages: Vec<serde_json::Value>,
+}
+
+/// KernelHistoryAssembler：纯策略消息组装器（无 IO，所有数据由 adapter 预读）。
+///
+/// 组装顺序逐条对齐 chat.rs 4475-4700：
+/// system full/core → memo replay → context hint → workflow directive → ledger hint
+/// → compression summary → approved plan → 历史行（assistant/tool/user+references）
+/// → 本轮工具结果 → 用户注入 → 进度对照 → replan → 续写 → 纠正
+pub struct KernelHistoryAssembler;
+
+impl KernelHistoryAssembler {
+    /// 组装消息序列：返回 Vec<serde_json::Value> 供 adapter 直接发送给 Provider。
+    ///
+    /// 注意：图片附加（E2）和压缩决策（E3）暂留 adapter，本阶段只处理 Ready 路径中段。
+    pub fn assemble(input: &KernelHistoryInput) -> KernelAssembled {
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+
+        // 1. System prompt（adapter 已根据 seam_count 选择 full 或 core）
+        messages.push(serde_json::json!({ "role": "system", "content": input.system_prompt }));
+
+        // 2. Memo replay（关键记忆回放，对齐 Qwen-Agent MemoAssistant）
+        if let Some(memo) = input.memo_replay {
+            messages.push(serde_json::json!({ "role": "system", "content": memo }));
+        }
+
+        // 3. Context V2 hint（每轮从 Durable Run 重建）
+        if let Some(hint) = input.context_hint {
+            messages.push(serde_json::json!({ "role": "system", "content": hint }));
+        }
+
+        // 4. Workflow directive
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": input.workflow_directive,
+        }));
+
+        // 5. Task Ledger（任务账本，防长任务"忘记已做过什么/卡在哪一步"）
+        if let Some(ledger) = input.ledger_hint {
+            messages.push(serde_json::json!({ "role": "system", "content": ledger }));
+        }
+
+        // 6. Compression summary（早期对话滚动摘要）
+        if let Some(summary) = input.compression_summary {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": format!("## 历史摘要（早期对话，已被压缩）\n{summary}"),
+            }));
+        }
+
+        // 7. Confirmed plan（已批准计划锚定，防中途遗忘/偏离）
+        if let Some(plan) = input.confirmed_plan {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": format!(
+                    "## 已批准任务计划（必须严格遵守，不得擅自偏离或扩大范围）\n{plan}"
+                ),
+            }));
+        }
+
+        // 8. History rows（最近 history_limit 条，含 tool）
+        for row in &input.history_rows {
+            match row.role.as_str() {
+                "assistant" => {
+                    let cleaned = crate::agent::tools::sanitize_markers(&row.content);
+                    // 未完话术污染过滤：历史上只描述计划未执行工具的短消息不重复喂给模型
+                    if cleaned.chars().count() < 300 && has_pending_action_phrase(&cleaned) {
+                        messages.push(serde_json::json!({ "role": "user", "content": "（此前有一轮未执行的过渡回复，已省略）" }));
+                    } else {
+                        // DeepSeek 推理模型多轮合规：携带 tools 参数时必须回传 reasoning_content
+                        let mut m = serde_json::json!({ "role": "assistant", "content": cleaned });
+                        if let Some(r) = row.reasoning.as_deref() {
+                            if !r.trim().is_empty() {
+                                m["reasoning_content"] = serde_json::json!(r);
+                            }
+                        }
+                        messages.push(m);
+                    }
+                }
+                "tool" => {
+                    // tool 消息入库格式："工具名\n输出"，转 user 消息反馈给模型
+                    // 历史工具结果已在 adapter 截断到 1200 字符
+                    let (name, out) = row.content.split_once('\n').unwrap_or(("tool", &row.content));
+                    let out_guard = crate::agent::tools::sanitize_tool_output(out);
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("[工具执行结果 - {name}]\n{out_guard}"),
+                    }));
+                }
+                _ => {
+                    // user 消息：references_json 已在 adapter 注入为完整文本
+                    messages.push(serde_json::json!({ "role": "user", "content": &row.content }));
+                }
+            }
+        }
+
+        // 9. Tool results（本轮已执行的工具结果，adapter 已截断并防护）
+        for item in &input.tool_results {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "[工具执行结果 - {}]\n{}\n\n请根据以上结果继续，若失败请分析原因并给出修复建议。",
+                    item.tool, item.output
+                ),
+            }));
+        }
+
+        // 10. User injections（本轮并入的用户挂起指令 / 异步事件 / session_ctx）
+        for inj in &input.user_injections {
+            messages.push(serde_json::json!({ "role": "user", "content": &inj.content }));
+        }
+
+        // 11. Progress check（计划执行进度对照，每执行 3 个工具注入一次）
+        if input.inject_progress_check {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": "（执行对照：请对照上方\"已批准任务计划\"，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）",
+            }));
+        }
+
+        // 12. Continuation（输出截断续写：把上轮被截断的内容与"请继续"指令加入本轮）
+        if !input.continuation_text.is_empty() {
+            messages.push(serde_json::json!({ "role": "assistant", "content": input.continuation_text }));
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": if input.continuation_reasoning_only {
+                    "（系统提示：你的上一条回复未完成（思考过长或网络中断），本轮请不要再输出思考过程，直接给出最终结论；若任务未完成，直接输出下一步要执行的工具调用标记。）"
+                } else {
+                    "（你的上一条回复未完整送达（被截断或网络中断），请直接从断点继续完成剩余内容，不要重复已输出的部分。）"
+                },
+            }));
+        }
+
+        // 13. Correction（纠正注入：假调用/未完话术/空响应重试）
+        if !input.correction_text.is_empty() || !input.correction_hint.is_empty() {
+            if !input.correction_text.is_empty() {
+                messages.push(serde_json::json!({ "role": "assistant", "content": input.correction_text }));
+            }
+            messages.push(serde_json::json!({ "role": "user", "content": input.correction_hint }));
+        }
+
+        KernelAssembled { messages }
+    }
+}
+
+/// 未完话术检测：判断 assistant 消息是否仅为"我将继续/我将读取"等过渡性叙述，
+/// 未实际执行任何工具（格式污染源）。
+fn has_pending_action_phrase(text: &str) -> bool {
+    text.contains("我将继续")
+        || text.contains("我将读取")
+        || text.contains("我来读取")
+        || text.contains("我先读取")
+        || text.contains("让我来查看")
+        || text.contains("我需要先")
+        || text.contains("接下来我会")
 }
 
 #[cfg(test)]
@@ -57,5 +277,460 @@ mod tests {
         })];
         let est = estimate_tokens(&msgs);
         assert!(est > 0, "expected nonzero token estimate for Chinese content");
+    }
+
+    #[test]
+    fn assembler_system_prompt_only() {
+        let input = KernelHistoryInput {
+            system_prompt: "You are a helpful assistant.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "Follow the plan.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 2); // system + workflow directive
+        assert_eq!(assembled.messages[0]["role"], "system");
+        assert_eq!(assembled.messages[0]["content"], "You are a helpful assistant.");
+        assert_eq!(assembled.messages[1]["role"], "system");
+        assert_eq!(assembled.messages[1]["content"], "Follow the plan.");
+    }
+
+    #[test]
+    fn assembler_with_memo_and_context() {
+        let input = KernelHistoryInput {
+            system_prompt: "Core rules.",
+            memo_replay: Some("Memory: user prefers Rust."),
+            context_hint: Some("Context: working on auth module."),
+            workflow_directive: "Use tools.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 4); // system + memo + context + workflow
+        assert_eq!(assembled.messages[0]["content"], "Core rules.");
+        assert_eq!(assembled.messages[1]["content"], "Memory: user prefers Rust.");
+        assert_eq!(assembled.messages[2]["content"], "Context: working on auth module.");
+        assert_eq!(assembled.messages[3]["content"], "Use tools.");
+    }
+
+    #[test]
+    fn assembler_with_ledger_and_plan() {
+        let input = KernelHistoryInput {
+            system_prompt: "System.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "Workflow.",
+            ledger_hint: Some("Ledger: step 1 done."),
+            compression_summary: None,
+            confirmed_plan: Some("Plan: 1. Read 2. Write"),
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 4); // system + workflow + ledger + plan
+        assert_eq!(assembled.messages[0]["content"], "System.");
+        assert_eq!(assembled.messages[1]["content"], "Workflow.");
+        assert!(assembled.messages[2]["content"].as_str().unwrap().contains("Ledger:"));
+        assert!(assembled.messages[3]["content"].as_str().unwrap().contains("已批准任务计划"));
+    }
+
+    #[test]
+    fn assembler_history_assistant_with_reasoning() {
+        let input = KernelHistoryInput {
+            system_prompt: "System.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![
+                HistoryRow {
+                    role: "assistant".to_string(),
+                    content: "Let me analyze this.".to_string(),
+                    references_json: None,
+                    reasoning: Some("Thinking about the problem...".to_string()),
+                },
+            ],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        // system + workflow + assistant (with reasoning)
+        assert_eq!(assembled.messages.len(), 3);
+        assert_eq!(assembled.messages[0]["content"], "System.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert_eq!(assembled.messages[2]["role"], "assistant");
+        assert_eq!(assembled.messages[2]["reasoning_content"], "Thinking about the problem...");
+    }
+
+    #[test]
+    fn assembler_history_tool_row() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![
+                HistoryRow {
+                    role: "tool".to_string(),
+                    content: "read_file\nFile contents here.".to_string(),
+                    references_json: None,
+                    reasoning: None,
+                },
+            ],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 3); // system + workflow + tool result as user
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert_eq!(assembled.messages[2]["role"], "user");
+        assert!(assembled.messages[2]["content"].as_str().unwrap().contains("[工具执行结果 - read_file]"));
+    }
+
+    #[test]
+    fn assembler_pending_action_phrase_filtered() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![
+                HistoryRow {
+                    role: "assistant".to_string(),
+                    content: "我将继续读取文件内容".to_string(),
+                    references_json: None,
+                    reasoning: None,
+                },
+            ],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        // Short pending action phrase (< 300 chars) should be replaced with placeholder
+        assert_eq!(assembled.messages.len(), 3);
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert_eq!(assembled.messages[2]["role"], "user");
+        assert!(assembled.messages[2]["content"].as_str().unwrap().contains("未执行的过渡回复"));
+    }
+
+    #[test]
+    fn assembler_tool_results() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![],
+            tool_results: vec![
+                ToolResult {
+                    tool: "write_file".to_string(),
+                    output: "File written successfully.".to_string(),
+                },
+            ],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 3); // system + workflow + tool result
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert!(assembled.messages[2]["content"].as_str().unwrap().contains("[工具执行结果 - write_file]"));
+        assert!(assembled.messages[2]["content"].as_str().unwrap().contains("请根据以上结果继续"));
+    }
+
+    #[test]
+    fn assembler_user_injections() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![
+                UserInjection {
+                    content: "User instruction from session.".to_string(),
+                },
+            ],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 3); // system + workflow + user injection
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert_eq!(assembled.messages[2]["role"], "user");
+        assert_eq!(assembled.messages[2]["content"], "User instruction from session.");
+    }
+
+    #[test]
+    fn assembler_progress_check_injected() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: Some("Plan steps."),
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: true,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        // system + workflow + plan + progress check
+        assert_eq!(assembled.messages.len(), 4);
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert!(assembled.messages[2]["content"].as_str().unwrap().contains("已批准任务计划"));
+        assert!(assembled.messages[3]["content"].as_str().unwrap().contains("执行对照"));
+    }
+
+    #[test]
+    fn assembler_continuation_normal() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "Partial output from previous turn.",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 4); // system + workflow + assistant + user (continuation)
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert_eq!(assembled.messages[2]["role"], "assistant");
+        assert_eq!(assembled.messages[2]["content"], "Partial output from previous turn.");
+        assert!(assembled.messages[3]["content"].as_str().unwrap().contains("未完整送达"));
+    }
+
+    #[test]
+    fn assembler_continuation_reasoning_only() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: true,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        // Empty continuation_text means no continuation injected
+        assert_eq!(assembled.messages.len(), 2); // system + workflow only
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+    }
+
+    #[test]
+    fn assembler_correction_injection() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: None,
+            confirmed_plan: None,
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "Assistant said '已调用工具' without actual call.",
+            correction_hint: "（检测到你的回复中出现了...",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 4); // system + workflow + assistant + user (correction)
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert_eq!(assembled.messages[2]["role"], "assistant");
+        assert_eq!(assembled.messages[2]["content"], "Assistant said '已调用工具' without actual call.");
+        assert_eq!(assembled.messages[3]["role"], "user");
+        assert!(assembled.messages[3]["content"].as_str().unwrap().contains("检测到"));
+    }
+
+    #[test]
+    fn assembler_compression_summary() {
+        let input = KernelHistoryInput {
+            system_prompt: "S.",
+            memo_replay: None,
+            context_hint: None,
+            workflow_directive: "W.",
+            ledger_hint: None,
+            compression_summary: Some("Early conversation was about X and Y."),
+            confirmed_plan: None,
+            history_rows: vec![],
+            tool_results: vec![],
+            user_injections: vec![],
+            continuation_text: "",
+            continuation_reasoning_only: false,
+            correction_text: "",
+            correction_hint: "",
+            inject_progress_check: false,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        assert_eq!(assembled.messages.len(), 3); // system + workflow + compression summary
+        assert_eq!(assembled.messages[0]["content"], "S.");
+        assert_eq!(assembled.messages[1]["content"], "W.");
+        assert!(assembled.messages[2]["content"].as_str().unwrap().contains("历史摘要"));
+    }
+
+    #[test]
+    fn assembler_full_sequence_order() {
+        let input = KernelHistoryInput {
+            system_prompt: "System prompt.",
+            memo_replay: Some("Memo."),
+            context_hint: Some("Context."),
+            workflow_directive: "Workflow.",
+            ledger_hint: Some("Ledger."),
+            compression_summary: Some("Summary."),
+            confirmed_plan: Some("Plan."),
+            history_rows: vec![
+                HistoryRow {
+                    role: "user".to_string(),
+                    content: "User message.".to_string(),
+                    references_json: None,
+                    reasoning: None,
+                },
+            ],
+            tool_results: vec![
+                ToolResult {
+                    tool: "tool1".to_string(),
+                    output: "Output.".to_string(),
+                },
+            ],
+            user_injections: vec![
+                UserInjection {
+                    content: "Injection.".to_string(),
+                },
+            ],
+            continuation_text: "Continuation.",
+            continuation_reasoning_only: false,
+            correction_text: "Correction text.",
+            correction_hint: "Correction hint.",
+            inject_progress_check: true,
+        };
+        let assembled = KernelHistoryAssembler::assemble(&input);
+        // Expected order:
+        // 0: system
+        // 1: memo
+        // 2: context
+        // 3: workflow
+        // 4: ledger
+        // 5: compression summary
+        // 6: confirmed plan
+        // 7: history row (user)
+        // 8: tool result
+        // 9: user injection
+        // 10: progress check
+        // 11: continuation assistant
+        // 12: continuation user
+        // 13: correction assistant
+        // 14: correction user
+        assert_eq!(assembled.messages.len(), 15);
+        assert_eq!(assembled.messages[0]["content"], "System prompt.");
+        assert_eq!(assembled.messages[1]["content"], "Memo.");
+        assert_eq!(assembled.messages[2]["content"], "Context.");
+        assert_eq!(assembled.messages[3]["content"], "Workflow.");
+        assert!(assembled.messages[4]["content"].as_str().unwrap().contains("Ledger."));
+        assert!(assembled.messages[5]["content"].as_str().unwrap().contains("历史摘要"));
+        assert!(assembled.messages[6]["content"].as_str().unwrap().contains("已批准任务计划"));
+        assert_eq!(assembled.messages[7]["content"], "User message.");
+        assert!(assembled.messages[8]["content"].as_str().unwrap().contains("[工具执行结果 - tool1]"));
+        assert_eq!(assembled.messages[9]["content"], "Injection.");
+        assert!(assembled.messages[10]["content"].as_str().unwrap().contains("执行对照"));
+        assert_eq!(assembled.messages[11]["content"], "Continuation.");
+        assert!(assembled.messages[12]["content"].as_str().unwrap().contains("未完整送达"));
+        assert_eq!(assembled.messages[13]["content"], "Correction text.");
+        assert_eq!(assembled.messages[14]["content"], "Correction hint.");
     }
 }
