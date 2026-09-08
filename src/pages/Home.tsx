@@ -3980,6 +3980,7 @@ export default function Home() {
                               ? 'text-[var(--accent)] opacity-100'
                               : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
                           }`}
+                          aria-label={p.pinned ? t('home.unpinProject') : t('home.pinProject')}
                           title={p.pinned ? t('home.unpinProject') : t('home.pinProject')}
                         >
                           <Icon name="pin" size={13} />
@@ -3994,6 +3995,11 @@ export default function Home() {
                               ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)] opacity-100'
                               : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
                           }`}
+                          aria-label={
+                            confirmDeleteProjectId === p.id
+                              ? t('home.confirmDeleteProject')
+                              : t('home.deleteProject')
+                          }
                           title={
                             confirmDeleteProjectId === p.id
                               ? t('home.confirmDeleteProject')
@@ -4074,6 +4080,7 @@ export default function Home() {
                       ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                       : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
                   }`}
+                  aria-label={showArchived ? t('home.backToConversations') : t('home.viewArchived')}
                   title={showArchived ? t('home.backToConversations') : t('home.viewArchived')}
                 >
                   <Icon name="archive" size={14} />
@@ -4112,6 +4119,7 @@ export default function Home() {
                       if (searchMode === 'conv') void setConversationKeyword('')
                     }}
                     className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                    aria-label={t('home.clearSearch')}
                     title={t('home.clearSearch')}
                   >
                     <Icon name="close" size={12} />
@@ -4468,6 +4476,7 @@ export default function Home() {
                             ? 'text-[var(--accent)] opacity-100'
                             : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
                         }`}
+                        aria-label={c.is_pinned ? t('home.unpin') : t('home.pin')}
                         title={c.is_pinned ? t('home.unpin') : t('home.pin')}
                       >
                         <Icon name="pin" size={13} />
@@ -4505,6 +4514,11 @@ export default function Home() {
                             ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)] opacity-100'
                             : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
                         }`}
+                        aria-label={
+                          confirmDeleteId === c.id
+                            ? t('home.confirmDeleteConversation')
+                            : t('home.deleteConversation')
+                        }
                         title={
                           confirmDeleteId === c.id
                             ? t('home.confirmDeleteConversation')
@@ -4681,6 +4695,7 @@ export default function Home() {
               <div className="relative" ref={moreMenuRef}>
                 <button
                   onClick={() => setShowMoreMenu((v) => !v)}
+                  aria-label={t('home.moreActions')}
                   title={t('home.moreActions')}
                   className={`p-2 rounded-lg transition-colors ${
                     showMoreMenu
@@ -4811,6 +4826,7 @@ export default function Home() {
                   ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                   : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
               }`}
+              aria-label={t('home.togglePanel')}
               title={t('home.togglePanel')}
             >
               <Icon name="panel" size={16} />
@@ -5735,6 +5751,7 @@ export default function Home() {
                 <button
                   onClick={() => setPendingQuote(null)}
                   className="ml-auto shrink-0 hover:text-[var(--danger)] transition-colors"
+                  aria-label={t('home.removeQuote')}
                   title={t('home.removeQuote')}
                 >
                   <Icon name="close" size={10} />
@@ -5765,6 +5782,7 @@ export default function Home() {
                       <button
                         onClick={() => setReferences((r) => r.filter((x) => x !== p))}
                         className="shrink-0 hover:text-[var(--danger)] transition-colors"
+                        aria-label={t('home.removeReference')}
                         title={t('home.removeReference')}
                       >
                         <Icon name="close" size={10} />
@@ -5783,6 +5801,7 @@ export default function Home() {
                     <button
                       onClick={() => removePickedImage(i)}
                       className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full modern-card border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--danger)] flex items-center justify-center opacity-0 group-hover/img:opacity-100 transition-opacity"
+                      aria-label={t('home.removeImage')}
                       title={t('home.removeImage')}
                     >
                       <Icon name="close" size={9} />
@@ -6289,6 +6308,7 @@ export default function Home() {
                               type="button"
                               onClick={() => void handleRescanModules()}
                               disabled={rescanning}
+                              aria-label={t('home.rescanModules')}
                               title={t('home.rescanModules')}
                               className="ml-auto p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-50"
                             >
@@ -6297,6 +6317,7 @@ export default function Home() {
                             <button
                               type="button"
                               onClick={startEditModules}
+                              aria-label={t('home.editModules')}
                               title={t('home.editModules')}
                               className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                             >
@@ -6402,6 +6423,7 @@ export default function Home() {
                                   type="button"
                                   onClick={() => removeModuleRow(idx)}
                                   className="p-1 rounded text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
+                                  aria-label={t('dialog.remove')}
                                   title={t('dialog.remove')}
                                 >
                                   <Icon name="delete" size={13} />
@@ -6447,6 +6469,7 @@ export default function Home() {
                     <button
                       type="button"
                       onClick={() => void loadRecentRuns()}
+                      aria-label={t('home.refresh')}
                       title={t('home.refresh')}
                       className="ml-auto p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
@@ -6722,7 +6745,7 @@ export default function Home() {
                 <div className="text-[12px] font-semibold">{card.title}</div>
                 <div className="text-[10.5px] text-[var(--text-secondary)] mt-1 leading-relaxed whitespace-pre-wrap break-words">{card.message}</div>
               </div>
-              <button type="button" onClick={() => handleDiagnoseDismiss(card)} className="text-[var(--text-muted)] hover:text-[var(--text-secondary)] shrink-0">
+              <button type="button" aria-label={t('common.close')} title={t('common.close')} onClick={() => handleDiagnoseDismiss(card)} className="text-[var(--text-muted)] hover:text-[var(--text-secondary)] shrink-0">
                 <Icon name="close" size={12} />
               </button>
             </div>
@@ -7839,6 +7862,7 @@ const MessageItem = memo(function MessageItem({
           <button
             onClick={() => onSpeak(message.id, displayContent)}
             className={`p-1 rounded-md transition-colors ${speaking ? 'text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'}`}
+            aria-label={speaking ? t('home.stopSpeak') : t('home.speak')}
             title={speaking ? t('home.stopSpeak') : t('home.speak')}
           >
             <Icon name="headphones" size={13} />
@@ -7851,6 +7875,7 @@ const MessageItem = memo(function MessageItem({
                   ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
               }`}
+              aria-label={t('home.viewVersions')}
               title={t('home.viewVersions')}
             >
               <Icon name="git-branch" size={12} />
@@ -7861,6 +7886,7 @@ const MessageItem = memo(function MessageItem({
             <button
               onClick={() => onDeleteMessage(message)}
               className={`p-1 rounded-md transition-all ${confirmDeleteMsgId === message.id ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
+              aria-label={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
               title={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
             >
               <Icon name="delete" size={13} white={confirmDeleteMsgId === message.id} />
@@ -8231,6 +8257,8 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
           />
           {query && (
             <button
+              aria-label={t('home.clearSearch')}
+              title={t('home.clearSearch')}
               onClick={() => setQuery('')}
               className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
             >
@@ -8765,6 +8793,7 @@ function ConvNoteBar({ convId }: { convId: string }) {
               }
             }}
             className="p-1 text-[var(--text-muted)] hover:text-[var(--danger)] opacity-0 group-hover:opacity-100"
+            aria-label={t('home.noteClear')}
             title={t('home.noteClear')}
           >
             <Icon name="close" size={11} />
@@ -8835,6 +8864,7 @@ function PinnedBar({ convId, onJump }: { convId: string; onJump: (msgId: string)
                   }).catch(() => {})
                 }}
                 className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger)] transition-all shrink-0"
+                aria-label={t('home.unpinFromTop')}
                 title={t('home.unpinFromTop')}
               >
                 <Icon name="close" size={10} />

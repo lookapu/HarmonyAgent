@@ -425,6 +425,7 @@ export default function SkillsPage() {
               <button
                 onClick={() => handleRemove(s.id, s.name)}
                 title={t('skill.deleteTitle')}
+                aria-label={t('skill.deleteTitle')}
                 className="px-3 py-1 text-xs border border-[var(--danger)]/40 text-[var(--danger)] rounded hover:bg-[var(--danger)]/10 transition-colors"
               >
                 <Icon name="delete" size={12} />

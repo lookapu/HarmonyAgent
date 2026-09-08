@@ -453,6 +453,7 @@ export function DevicesPanel({
             disabled={svcBusy || hdcOk === true}
             className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] disabled:opacity-40 transition-colors"
             title={t('home.hdcStart')}
+            aria-label={t('home.hdcStart')}
           >
             <Icon name="bolt" size={12} />
           </button>
@@ -461,6 +462,7 @@ export function DevicesPanel({
             disabled={svcBusy || hdcOk === false}
             className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] disabled:opacity-40 transition-colors"
             title={t('home.hdcStop')}
+            aria-label={t('home.hdcStop')}
           >
             <Icon name="close" size={12} />
           </button>
@@ -469,6 +471,7 @@ export function DevicesPanel({
             disabled={loading}
             className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 transition-colors"
             title={t('common.refresh')}
+            aria-label={t('common.refresh')}
           >
             <Icon name="refresh" size={13} className={loading ? 'animate-spin' : ''} />
           </button>
@@ -938,6 +941,8 @@ export function DevicesPanel({
               {shotError && <span className="text-[10.5px] text-[var(--danger)] ml-1">{shotError}</span>}
               <button
                 onClick={() => setShotPreview(null)}
+                aria-label={t('common.close')}
+                title={t('common.close')}
                 className="ml-auto p-1 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
               >
                 <Icon name="close" size={14} />
@@ -1253,6 +1258,7 @@ export function AnalyzePanel({
           type="button"
           onClick={() => void load()}
           title={t('home.analyzeRefresh')}
+          aria-label={t('home.analyzeRefresh')}
           className="p-1.5 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
         >
           <Icon name="refresh" size={13} className={loading ? 'animate-spin' : ''} />
@@ -2091,6 +2097,8 @@ export function SymbolsPanel({
           {query && (
             <button
               onClick={() => setQuery('')}
+              aria-label={t('common.clear')}
+              title={t('common.clear')}
               className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
             >
               <Icon name="close" size={12} />
@@ -2154,12 +2162,15 @@ export function SymbolsPanel({
             <button
               onClick={() => onReference(viewer.file)}
               title={t('home.symbolReference')}
+              aria-label={t('home.symbolReference')}
               className="p-1 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]"
             >
               <Icon name="chat" size={12} />
             </button>
             <button
               onClick={() => setViewer(null)}
+              aria-label={t('common.close')}
+              title={t('common.close')}
               className="p-1 rounded text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
             >
               <Icon name="close" size={12} />

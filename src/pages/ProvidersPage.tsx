@@ -179,6 +179,7 @@ function EndpointEditor({
               onClick={() => onChange(endpoints.filter((_, j) => j !== i))}
               className="h-8 px-2 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors shrink-0"
               title={t('provider.endpointDelete')}
+              aria-label={t('provider.endpointDelete')}
             >
               <Icon name="close" size={12} />
             </button>
@@ -925,6 +926,7 @@ export default function ProvidersPage() {
                     onClick={() => removeFormModel(m)}
                     className="text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors"
                     title={t('provider.removeModel')}
+                    aria-label={t('provider.removeModel')}
                   >
                     <Icon name="close" size={11} />
                   </button>
@@ -1210,6 +1212,7 @@ export default function ProvidersPage() {
                                     disabled={syncBusy[modelId] === 'remove'}
                                     className="opacity-50 hover:opacity-100 transition-opacity disabled:opacity-30"
                                     title={t('provider.syncRemove')}
+                                    aria-label={t('provider.syncRemove')}
                                   >
                                     {syncBusy[modelId] === 'remove' ? t('provider.syncBusy') : <Icon name="close" size={10} />}
                                   </button>
@@ -1260,6 +1263,7 @@ export default function ProvidersPage() {
                                       disabled={syncBusy[m.id] === 'add'}
                                       className="opacity-50 hover:opacity-100 transition-opacity disabled:opacity-30"
                                       title={t('provider.syncAdd')}
+                                      aria-label={t('provider.syncAdd')}
                                     >
                                       {syncBusy[m.id] === 'add' ? t('provider.syncBusy') : <Icon name="plus" size={10} />}
                                     </button>
@@ -1389,6 +1393,7 @@ export default function ProvidersPage() {
                               onClick={() => removeEditModel(m)}
                               className="text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors"
                               title={t('provider.removeModel')}
+                              aria-label={t('provider.removeModel')}
                             >
                               <Icon name="close" size={11} />
                             </button>

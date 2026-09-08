@@ -191,6 +191,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
               type="button"
               onClick={copyOutput}
               title={t('home.copyOutput')}
+              aria-label={t('home.copyOutput')}
               className="p-1 rounded text-[#8b949e] hover:text-[#e6edf3] hover:bg-white/10 transition-colors"
             >
               <Icon name="copy" size={11} className={copied ? 'text-[#3fb950]' : ''} />

@@ -2061,6 +2061,7 @@
     "delete": "Delete",
     "loading": "Loading...",
     "close": "Close",
+    "clear": "Clear",
     "refresh": "Refresh",
     "langSystem": "Follow system language",
     "themeLight": "Light mode",

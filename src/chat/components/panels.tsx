@@ -304,6 +304,7 @@ export function MemoriesPanel({
                 onClick={() => startEdit(m)}
                 className="shrink-0 p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                 title={t('home.memoryEdit')}
+                aria-label={t('home.memoryEdit')}
               >
                 <Icon name="edit" size={12} />
               </button>
@@ -315,6 +316,7 @@ export function MemoriesPanel({
                     : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
                 }`}
                 title={confirmDeleteId === m.id ? t('home.memoryDeleteConfirm') : t('home.memoryDelete')}
+                aria-label={confirmDeleteId === m.id ? t('home.memoryDeleteConfirm') : t('home.memoryDelete')}
               >
                 <Icon name="delete" size={12} white={confirmDeleteId === m.id} />
               </button>
@@ -403,6 +405,7 @@ export function ToolStatsPanel({
           onClick={onRefresh}
           className="shrink-0 p-1.5 rounded-lg text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
           title={t('home.refresh')}
+          aria-label={t('home.refresh')}
         >
           <Icon name="refresh" size={13} />
         </button>
@@ -556,6 +559,7 @@ export function PreviewPanel({
           <button
             onClick={() => setReloadKey((k) => k + 1)}
             title={t('home.previewReload')}
+            aria-label={t('home.previewReload')}
             className="w-8 h-8 flex items-center justify-center rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
           >
             <Icon name="refresh" size={13} />
@@ -689,6 +693,8 @@ export function TerminalPanel({
             {filter && (
               <button
                 onClick={() => setFilter('')}
+                aria-label={t('common.clear')}
+                title={t('common.clear')}
                 className="absolute right-1 top-1/2 -translate-y-1/2 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)]"
               >
                 <Icon name="close" size={9} />

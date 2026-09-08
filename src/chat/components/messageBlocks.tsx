@@ -312,6 +312,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                         onClick={() => toggleDiff(p)}
                         disabled={diffLoading === p}
                         title={t('home.viewDiff')}
+                        aria-label={t('home.viewDiff')}
                         className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                       >
                         {diffLoading === p ? (
@@ -325,6 +326,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                         onClick={() => acceptFile(p)}
                         disabled={busy === p || isAccepted}
                         title={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
+                        aria-label={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
                         className={`p-1 rounded-md transition-colors ${
                           isAccepted
                             ? 'text-[var(--success)]'
@@ -340,6 +342,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                         onClick={() => revertFile(p)}
                         disabled={busy === p || isAccepted}
                         title={t('home.revertChange')}
+                        aria-label={t('home.revertChange')}
                         className="p-1 ml-0.5 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
                       >
                         <Icon name="close" size={11} />
@@ -398,6 +401,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                   onClick={() => setReviewOpen(false)}
                   className="shrink-0 w-7 h-7 rounded-lg flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   title={t('common.close')}
+                  aria-label={t('common.close')}
                 >
                   <Icon name="close" size={14} />
                 </button>
@@ -443,6 +447,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                               onClick={() => acceptFile(p)}
                               disabled={busy === p || isAccepted}
                               title={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
+                              aria-label={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
                               className={`p-1 rounded-md transition-colors ${
                                 isAccepted
                                   ? 'text-[var(--success)]'
@@ -457,6 +462,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                               onClick={() => revertFile(p)}
                               disabled={busy === p || isAccepted}
                               title={t('home.revertChange')}
+                              aria-label={t('home.revertChange')}
                               className="p-1 ml-0.5 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
                             >
                               <Icon name="close" size={11} />

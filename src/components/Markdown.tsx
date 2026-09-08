@@ -487,7 +487,7 @@ function TreeBlock({ code }: { code: string }) {
               {collapsed ? t('md.expandLines', { count: lines.length }) : t('md.collapse')}
             </button>
           )}
-          <button type="button" className="md-codeblock-btn" onClick={copy} title={t('md.copy')}>
+          <button type="button" className="md-codeblock-btn" onClick={copy} title={t('md.copy')} aria-label={t('md.copy')}>
             {copied ? (
               <span className="md-copied-ok">
                 <Icon name="check" size={13} />{t('md.copied')}
@@ -560,7 +560,7 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
   return (
     <div className="md-lightbox" onClick={onClose}>
       <img src={src} alt="" onClick={(e) => e.stopPropagation()} />
-      <button type="button" className="md-lightbox-close" onClick={onClose} title="关闭 (Esc)">
+      <button type="button" className="md-lightbox-close" onClick={onClose} title="关闭 (Esc)" aria-label="关闭 (Esc)">
         <Icon name="close" size={18} />
       </button>
     </div>
@@ -750,13 +750,13 @@ function CodeBlock({
             {collapsed ? t('md.expandLines', { count: lines.length }) : t('md.collapse')}
           </button>
         )}
-        <button type="button" className="md-codeblock-btn" onClick={download} title={t('md.downloadCode')}>
+        <button type="button" className="md-codeblock-btn" onClick={download} title={t('md.downloadCode')} aria-label={t('md.downloadCode')}>
           <Icon name="download" size={13} />
         </button>
-        <button type="button" className="md-codeblock-btn" onClick={() => setFullscreen((v) => !v)} title={fullscreen ? t('md.exitFullscreen') : t('md.fullscreen')}>
+        <button type="button" className="md-codeblock-btn" onClick={() => setFullscreen((v) => !v)} title={fullscreen ? t('md.exitFullscreen') : t('md.fullscreen')} aria-label={fullscreen ? t('md.exitFullscreen') : t('md.fullscreen')}>
           <Icon name="chevron-right" size={13} className="rotate-[-45deg]" />
         </button>
-        <button type="button" className="md-codeblock-btn" onClick={copy} title={t('md.copyCode')}>
+        <button type="button" className="md-codeblock-btn" onClick={copy} title={t('md.copyCode')} aria-label={t('md.copyCode')}>
           {copied ? (
             <span className="md-copied-ok">
               <Icon name="check" size={13} />{t('md.copied')}
@@ -1171,7 +1171,7 @@ function MermaidBlock({ code }: { code: string }) {
 
   const toolbar = (
     <div className="md-mermaid-toolbar">
-      <button onClick={() => setZoom((z) => Math.min(4, +(z + 0.2).toFixed(2)))} title="放大">
+      <button onClick={() => setZoom((z) => Math.min(4, +(z + 0.2).toFixed(2)))} title="放大" aria-label="放大">
         <Icon name="plus" size={12} />
       </button>
       <button onClick={() => setZoom((z) => Math.max(0.3, +(z - 0.2).toFixed(2)))} title="缩小" className="md-mermaid-zoom-btn">
@@ -1180,7 +1180,7 @@ function MermaidBlock({ code }: { code: string }) {
       <button onClick={resetView} title="重置缩放" className="md-mermaid-zoom-pct">
         {Math.round(zoom * 100)}%
       </button>
-      <button onClick={() => setFullscreen((v) => !v)} title={fullscreen ? '退出全屏' : '全屏'}>
+      <button onClick={() => setFullscreen((v) => !v)} title={fullscreen ? '退出全屏' : '全屏'} aria-label={fullscreen ? '退出全屏' : '全屏'}>
         <Icon name={fullscreen ? 'close' : 'panel'} size={12} />
       </button>
       <span className="md-mermaid-toolbar-sep" />

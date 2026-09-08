@@ -147,6 +147,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
           <button
             onClick={() => setErr(null)}
             title={t('home.gitDismiss')}
+            aria-label={t('home.gitDismiss')}
             className="shrink-0 p-0.5 rounded-md text-[var(--danger)]/70 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors"
           >
             <Icon name="close" size={11} />
@@ -159,6 +160,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
           <button
             onClick={() => setMsg(null)}
             title={t('home.gitDismiss')}
+            aria-label={t('home.gitDismiss')}
             className="shrink-0 p-0.5 rounded-md text-[var(--success)]/70 hover:text-[var(--success)] hover:bg-[var(--bg-hover)] transition-colors"
           >
             <Icon name="close" size={11} />
@@ -259,6 +261,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
               <button
                 onClick={() => setStatusOpen((v) => !v)}
                 title={t('home.gitStatusDetail')}
+                aria-label={t('home.gitStatusDetail')}
                 className={`p-1.5 rounded-lg transition-colors ${statusOpen ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'}`}
               >
                 <Icon name="info" size={13} />
@@ -365,6 +368,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
                         onClick={() => removeWt(wt)}
                         disabled={busy !== null}
                         title={t('home.gitRemove')}
+                        aria-label={t('home.gitRemove')}
                         className="shrink-0 p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
                       >
                         <Icon name="delete" size={11} />

@@ -95,6 +95,7 @@ export default function PerfMonitor() {
           setItem(STORAGE_KEYS.PERF_MONITOR, '1')
         }}
         title="性能监控 (Ctrl+Shift+P)"
+        aria-label="性能监控 (Ctrl+Shift+P)"
         className="fixed bottom-2 right-2 z-[var(--app-z-devtools)] w-5 h-5 rounded-full flex items-center justify-center text-[var(--text-muted)]/40 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
       >
         <Icon name="spark" size={12} />
@@ -190,6 +191,7 @@ export default function PerfMonitor() {
                 onClick={handleCopy}
                 className="p-1 rounded hover:bg-[var(--bg-hover)] transition-colors relative"
                 title="复制性能报告"
+                aria-label="复制性能报告"
                 style={{ color: copied ? '#22c55e' : undefined }}
               >
                 <Icon name={copied ? "check" : "copy"} size={11} className={copied ? "text-[#22c55e]" : "text-[var(--text-muted)] hover:text-[var(--text-primary)]"} />
@@ -198,6 +200,7 @@ export default function PerfMonitor() {
                 onClick={() => clearPerfHistory()}
                 className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                 title="清空记录"
+                aria-label="清空记录"
               >
                 <Icon name="delete" size={11} />
               </button>
@@ -209,6 +212,7 @@ export default function PerfMonitor() {
                 }}
                 className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                 title="关闭面板"
+                aria-label="关闭面板"
               >
                 <Icon name="close" size={11} />
               </button>
