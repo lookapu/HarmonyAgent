@@ -8,6 +8,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::agent::acceptance::{
     evaluate_contract, remediation_prompt, AcceptanceReport, GoalContract, ToolEvidence,
@@ -666,6 +667,102 @@ impl KernelStreamAccumulator {
     }
 }
 
+/// 流读取侧观察到的信号，决定停滞线如何刷新。
+///
+/// 语义对齐桌面 UI 的流循环：数据到达只刷新外部看门狗基线，不推进循环内的
+/// wall-clock 停滞线（首字节除外）；有效解析产出（正文/工具调用/结束标记）才
+/// 重置静默超时；纯 Reasoning 流最多把停滞线顺延到「首次思考 + 宽限期」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelStreamSignal {
+    /// 网络 chunk 到达（携带字节数）
+    Data(usize),
+    /// 正文 Delta 解析产出
+    Content,
+    /// 思考增量（Reasoning-only 流受宽限期封顶）
+    Reasoning,
+    /// 工具调用增量
+    ToolCall,
+    /// 正常结束/截断标记
+    Finish,
+}
+
+/// Provider 流响应停滞治理的共用状态机：字节预算、静默超时与
+/// reasoning-only 宽限封顶。时间全部由调用方注入（`tokio::time::Instant`），
+/// 纯策略、无 IO，可离线单测与故障注入。
+#[derive(Debug)]
+pub struct KernelStreamGovernor {
+    silent_timeout: Duration,
+    reasoning_grace: Duration,
+    max_bytes: usize,
+    /// wall-clock 停滞 deadline：命中即无有效产出，独立于流读取 future 计时。
+    stall_deadline: Instant,
+    /// 首个 Reasoning 事件时间：纯思考流停滞线的顺延基线。
+    first_reasoning_at: Option<Instant>,
+    total_bytes: usize,
+}
+
+impl KernelStreamGovernor {
+    pub fn new(silent_timeout: Duration, reasoning_grace: Duration, max_bytes: usize, now: Instant) -> Self {
+        Self {
+            silent_timeout,
+            reasoning_grace,
+            max_bytes,
+            stall_deadline: now + silent_timeout,
+            first_reasoning_at: None,
+            total_bytes: 0,
+        }
+    }
+
+    /// 记录一次信号并推进停滞线。响应体积超限立即报错，防止异常巨大流持续烧资源。
+    pub fn observe(&mut self, signal: KernelStreamSignal, now: Instant) -> Result<(), String> {
+        match signal {
+            KernelStreamSignal::Data(bytes) => {
+                self.total_bytes = self.total_bytes.saturating_add(bytes);
+                if self.total_bytes > self.max_bytes {
+                    return Err(format!(
+                        "流式响应体积超限(>{:.1}MiB)，已中断防止持续卡死",
+                        self.max_bytes as f64 / 1024.0 / 1024.0
+                    ));
+                }
+                // 首字节视为一次数据到达 + 有效产出，初始化停滞线；后续数据到达
+                // 不推进 wall-clock 停滞线（大输出传输由数据看门狗另行兜底）。
+                if self.total_bytes == bytes {
+                    self.stall_deadline = now + self.silent_timeout;
+                }
+            }
+            KernelStreamSignal::Content | KernelStreamSignal::ToolCall | KernelStreamSignal::Finish => {
+                self.stall_deadline = now + self.silent_timeout;
+                // 正文/工具调用到达后退出 pure-reasoning 模式，恢复常规静默语义。
+                self.first_reasoning_at = None;
+            }
+            KernelStreamSignal::Reasoning => {
+                // reasoning-only 护栏：停滞线最多顺延到首次思考 + 宽限期，
+                // 之后即使思考持续到达也强制判死。
+                if self.first_reasoning_at.is_none() {
+                    self.first_reasoning_at = Some(now);
+                }
+                let grace_end = self.first_reasoning_at.expect("刚写入") + self.reasoning_grace;
+                self.stall_deadline = std::cmp::min(now + self.silent_timeout, grace_end);
+            }
+        }
+        Ok(())
+    }
+
+    /// 当前停滞 deadline；调用方用它做 `select!` 的 `sleep_until` 分支或轮询判据。
+    pub fn deadline(&self) -> Instant {
+        self.stall_deadline
+    }
+
+    /// 现在是否已停滞（无有效产出超过静默超时或 reasoning 宽限封顶）。
+    pub fn stalled(&self, now: Instant) -> bool {
+        now >= self.stall_deadline
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+}
+
 fn merge_stream_usage(
     label: &str,
     value: Option<&Value>,
@@ -1264,5 +1361,108 @@ mod tests {
             KernelStopDecision::Exhausted(_)
         ));
         assert_eq!(gate.remediation_rounds(), 1);
+    }
+
+    fn stream_governor() -> KernelStreamGovernor {
+        KernelStreamGovernor::new(
+            Duration::from_secs(60),
+            Duration::from_secs(180),
+            1024,
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn stream_governor_stalls_without_progress_after_silent_timeout() {
+        let start = Instant::now();
+        let governor = stream_governor();
+        assert!(!governor.stalled(start + Duration::from_secs(59)));
+        assert!(governor.stalled(start + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn stream_governor_content_refreshes_deadline() {
+        let start = Instant::now();
+        let mut governor = stream_governor();
+        let mut now = start;
+        for _ in 0..5 {
+            now += Duration::from_secs(59);
+            assert!(!governor.stalled(now), "进度刷新前不应停滞");
+            governor.observe(KernelStreamSignal::Content, now).unwrap();
+        }
+        assert!(!governor.stalled(now + Duration::from_secs(59)));
+        assert!(governor.stalled(now + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn stream_governor_caps_reasoning_only_streams_at_grace_end() {
+        let start = Instant::now();
+        let mut governor = stream_governor();
+        let first_reasoning = start + Duration::from_secs(30);
+        governor
+            .observe(KernelStreamSignal::Reasoning, first_reasoning)
+            .unwrap();
+        // 持续思考可推进静默线，但绝不能越过首次思考后的硬上限。
+        let mut now = first_reasoning;
+        for _ in 0..200 {
+            now += Duration::from_secs(10);
+            governor.observe(KernelStreamSignal::Reasoning, now).unwrap();
+        }
+        assert!(!governor.stalled(first_reasoning + Duration::from_secs(179)));
+        assert!(governor.stalled(first_reasoning + Duration::from_secs(181)));
+        assert_eq!(
+            governor.deadline(),
+            first_reasoning + Duration::from_secs(180),
+            "停滞线必须封顶在首次思考 + 宽限期"
+        );
+    }
+
+    #[test]
+    fn stream_governor_content_exits_pure_reasoning_mode() {
+        let start = Instant::now();
+        let mut governor = stream_governor();
+        governor
+            .observe(KernelStreamSignal::Reasoning, start + Duration::from_secs(10))
+            .unwrap();
+        // 宽限期内持续思考：停滞线被宽限封顶在 t+190，而非 t+210。
+        governor
+            .observe(KernelStreamSignal::Reasoning, start + Duration::from_secs(150))
+            .unwrap();
+        assert_eq!(governor.deadline(), start + Duration::from_secs(190));
+        // 正文在封顶前到达 → 退出 pure-reasoning 模式，恢复常规静默刷新。
+        governor
+            .observe(KernelStreamSignal::Content, start + Duration::from_secs(185))
+            .unwrap();
+        assert_eq!(governor.deadline(), start + Duration::from_secs(245));
+        assert!(
+            !governor.stalled(start + Duration::from_secs(191)),
+            "正文后宽限封顶不应再生效"
+        );
+        assert!(governor.stalled(start + Duration::from_secs(246)));
+    }
+
+    #[test]
+    fn stream_governor_data_arrival_does_not_extend_progress_deadline() {
+        let start = Instant::now();
+        let mut governor = stream_governor();
+        governor.observe(KernelStreamSignal::Data(4), start).unwrap();
+        // 后续纯数据到达不推进 wall-clock 停滞线（由数据看门狗另行兜底）。
+        let mut now = start;
+        for _ in 0..10 {
+            now += Duration::from_secs(10);
+            governor.observe(KernelStreamSignal::Data(4), now).unwrap();
+        }
+        assert!(governor.stalled(start + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn stream_governor_rejects_oversized_responses() {
+        let mut governor = stream_governor();
+        assert!(governor.observe(KernelStreamSignal::Data(1024), Instant::now()).is_ok());
+        let error = governor
+            .observe(KernelStreamSignal::Data(1), Instant::now())
+            .unwrap_err();
+        assert!(error.contains("体积超限"), "{error}");
+        assert_eq!(governor.total_bytes(), 1025);
     }
 }

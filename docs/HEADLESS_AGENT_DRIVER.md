@@ -135,6 +135,11 @@ OpenAI 原生工具调用分片。Anthropic 分散在 `message_start` 与 `messa
 取消轮询与绝对截止时间；调用方只注入协议 HTTP attempt、取消来源和 watchdog touch。代理选择与
 流响应读取/停滞治理仍由各 adapter 负责，下一阶段继续收敛。
 
+第五个切片 `KernelStreamGovernor` 已把流停滞治理提取为共用状态机：静默超时、reasoning-only
+宽限封顶与响应字节预算只有一套策略，时间由调用方注入（可离线单测与故障注入），语义对齐
+桌面 UI 的流循环（有效产出刷新停滞线、纯思考流封顶在首次思考 + 宽限期、首字节初始化）。
+桌面 UI 的流循环尚未切换到该组件；下一步由 headless 流式回合作为首个真实消费者。
+
 ### 5.1 事件输出接口
 
 推荐新增事件 sink，而不是让 driver 组装完整 trajectory Vec：
