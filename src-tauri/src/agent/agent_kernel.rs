@@ -948,6 +948,7 @@ pub enum KernelRunTermination {
     ModelAccepted,
     UserCancelled,
     DeadlineExceeded,
+    GovernanceExhausted,
     CostBudgetExceeded,
     AcceptanceExhausted,
     EmptyRoundsExhausted,
@@ -962,6 +963,7 @@ impl KernelRunTermination {
             Self::ModelAccepted => "model_accepted",
             Self::UserCancelled => "user_cancelled",
             Self::DeadlineExceeded => "deadline_exceeded",
+            Self::GovernanceExhausted => "governance_exhausted",
             Self::CostBudgetExceeded => "max_cost_exceeded",
             Self::AcceptanceExhausted => "acceptance_exhausted",
             Self::EmptyRoundsExhausted => "empty_rounds_exhausted",
@@ -976,6 +978,7 @@ impl KernelRunTermination {
         match self {
             Self::ModelAccepted | Self::UserCancelled => None,
             Self::DeadlineExceeded => Some("max_wall_time_exceeded"),
+            Self::GovernanceExhausted => Some("governance_exhausted"),
             Self::CostBudgetExceeded => Some("max_cost_exceeded"),
             Self::AcceptanceExhausted => Some("acceptance_failed"),
             Self::EmptyRoundsExhausted => Some("empty_rounds_exhausted"),
@@ -1546,6 +1549,26 @@ mod tests {
                 .and_then(KernelRunTermination::failure_taxonomy),
             Some("max_steps_exceeded")
         );
+    }
+
+    #[test]
+    fn run_termination_reason_names_are_unique_and_stable() {
+        let reasons = [
+            KernelRunTermination::ModelAccepted,
+            KernelRunTermination::UserCancelled,
+            KernelRunTermination::DeadlineExceeded,
+            KernelRunTermination::GovernanceExhausted,
+            KernelRunTermination::CostBudgetExceeded,
+            KernelRunTermination::AcceptanceExhausted,
+            KernelRunTermination::EmptyRoundsExhausted,
+            KernelRunTermination::ToolCallBudgetExceeded,
+            KernelRunTermination::ToolLoopExhausted,
+            KernelRunTermination::MaxStepsExceeded,
+        ];
+        let names = reasons.map(KernelRunTermination::as_str);
+        let unique = names.into_iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), reasons.len());
+        assert!(unique.contains("governance_exhausted"));
     }
 
     fn stream_governor() -> KernelStreamGovernor {

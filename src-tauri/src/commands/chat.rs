@@ -6037,7 +6037,7 @@ async fn stream_chat_inner(
                     "stream_replay",
                     serde_json::json!({
                         "conversation_id": conversation_id,
-                        "attempt": kernel_executor.round_counters().1,
+                        "attempt": kernel_executor.round_counters().stream_replays,
                         "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
                     }),
                 );
@@ -6193,9 +6193,26 @@ async fn stream_chat_inner(
     let acceptance = state.0.lock().ok()
         .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &acceptance_evidence).ok())
         .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &acceptance_evidence));
+    if kernel_executor.termination().is_none() {
+        kernel_executor.terminate(if exhausted {
+            crate::agent::agent_kernel::KernelRunTermination::GovernanceExhausted
+        } else if acceptance.passed {
+            crate::agent::agent_kernel::KernelRunTermination::ModelAccepted
+        } else {
+            crate::agent::agent_kernel::KernelRunTermination::AcceptanceExhausted
+        });
+    }
+    let executor_snapshot = serde_json::to_value(kernel_executor.snapshot()).unwrap_or_default();
     if let Ok(conn) = state.0.lock() {
         let value = serde_json::to_value(&acceptance).unwrap_or_else(|_| serde_json::json!({}));
         let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
+        let _ = crate::agent::runtime::append_event(
+            &conn,
+            &trace_id,
+            &conversation_id,
+            "run.executor_snapshot",
+            executor_snapshot,
+        );
         let _ = crate::agent::tool_metrics::annotate_run_outcomes(
             &conn,
             &trace_id,

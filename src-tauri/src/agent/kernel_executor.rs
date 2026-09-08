@@ -6,7 +6,7 @@
 use crate::agent::agent_kernel::{KernelRunState, KernelRunTermination};
 use crate::agent::kernel_loop::{
     KernelLoopGovernor, KernelLoopVerdict, KernelRoundDecision, KernelRoundInput,
-    KernelRoundRouter,
+    KernelRoundCounters, KernelRoundRouter,
 };
 use std::time::Duration;
 
@@ -20,6 +20,17 @@ pub enum KernelRunPermit {
 pub enum KernelToolAttemptPermit {
     Proceed { attempt: u64 },
     Halt { attempted: u64, limit: u64 },
+}
+
+/// 跨 adapter 稳定的 executor 最终快照，可直接写入桌面 run event 或 headless trajectory。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct KernelExecutorSnapshot {
+    pub steps: u64,
+    pub tool_attempts: u64,
+    pub loop_breaks: usize,
+    pub round_counters: KernelRoundCounters,
+    pub termination_reason: Option<String>,
+    pub failure_taxonomy: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,7 +113,7 @@ impl KernelExecutorState {
         self.tools.loop_breaks()
     }
 
-    pub fn round_counters(&self) -> (usize, usize, usize, usize, usize) {
+    pub fn round_counters(&self) -> KernelRoundCounters {
         self.rounds.counters()
     }
 
@@ -116,6 +127,20 @@ impl KernelExecutorState {
 
     pub fn termination(&self) -> Option<KernelRunTermination> {
         self.run.termination()
+    }
+
+    pub fn snapshot(&self) -> KernelExecutorSnapshot {
+        KernelExecutorSnapshot {
+            steps: self.completed_rounds,
+            tool_attempts: self.tool_attempts,
+            loop_breaks: self.loop_breaks(),
+            round_counters: self.round_counters(),
+            termination_reason: self.termination().map(|reason| reason.as_str().to_string()),
+            failure_taxonomy: self
+                .termination()
+                .and_then(KernelRunTermination::failure_taxonomy)
+                .map(str::to_string),
+        }
     }
 }
 
@@ -228,5 +253,18 @@ mod tests {
             executor.termination(),
             Some(KernelRunTermination::ToolCallBudgetExceeded)
         );
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.tool_attempts, 3);
+        assert_eq!(
+            snapshot.termination_reason.as_deref(),
+            Some("max_tool_calls_exceeded")
+        );
+        assert_eq!(
+            snapshot.failure_taxonomy.as_deref(),
+            Some("max_tool_calls_exceeded")
+        );
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["round_counters"]["empty_rounds"], 0);
+        assert_eq!(json["loop_breaks"], 0);
     }
 }

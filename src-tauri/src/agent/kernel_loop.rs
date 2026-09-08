@@ -230,6 +230,15 @@ pub struct KernelRoundRouter {
     fake_corrections: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct KernelRoundCounters {
+    pub empty_rounds: usize,
+    pub stream_replays: usize,
+    pub interrupted_rounds: usize,
+    pub continuation_rounds: usize,
+    pub fake_corrections: usize,
+}
+
 impl KernelRoundRouter {
     pub fn new() -> Self {
         Self::default()
@@ -319,14 +328,14 @@ impl KernelRoundRouter {
     }
 
     /// 当前各计数器状态：供测试与诊断使用。
-    pub fn counters(&self) -> (usize, usize, usize, usize, usize) {
-        (
-            self.empty_rounds,
-            self.stream_replays,
-            self.interrupted_rounds,
-            self.continuation_rounds,
-            self.fake_corrections,
-        )
+    pub fn counters(&self) -> KernelRoundCounters {
+        KernelRoundCounters {
+            empty_rounds: self.empty_rounds,
+            stream_replays: self.stream_replays,
+            interrupted_rounds: self.interrupted_rounds,
+            continuation_rounds: self.continuation_rounds,
+            fake_corrections: self.fake_corrections,
+        }
     }
 }
 

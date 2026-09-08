@@ -949,15 +949,20 @@ impl HeadlessAgentDriver {
                 .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
         )
         .map_err(AgentDriverError::Failed)?;
-        let termination_reason = kernel_executor
-            .termination()
-            .map(KernelRunTermination::as_str)
-            .unwrap_or("unknown");
+        let mut finished_fields = serde_json::to_value(kernel_executor.snapshot())
+            .map_err(|error| AgentDriverError::Failed(error.to_string()))?;
+        if let Some(fields) = finished_fields.as_object_mut() {
+            fields.insert("tool_calls".into(), json!(outcome.tool_calls));
+        }
+        let mut finished_payload = finished_fields.clone();
+        if let Some(payload) = finished_payload.as_object_mut() {
+            payload.insert("text".into(), json!("builtin driver finished"));
+        }
         sink.append(
             SessionEventType::SystemNote,
-            json!({"text":"builtin driver finished","steps":outcome.steps,"tool_calls":outcome.tool_calls,"termination_reason":termination_reason}),
+            finished_payload,
             "driver_finished",
-            json!({"steps":outcome.steps,"tool_calls":outcome.tool_calls,"termination_reason":termination_reason}),
+            finished_fields,
         )
         .map_err(AgentDriverError::Failed)?;
         outcome.trajectory = sink.into_trajectory();
@@ -1629,6 +1634,8 @@ mod tests {
             finished.fields["termination_reason"],
             "max_tool_calls_exceeded"
         );
+        assert_eq!(finished.fields["tool_attempts"], 4);
+        assert_eq!(finished.fields["steps"], 1);
 
         std::fs::remove_dir_all(workspace).ok();
     }
