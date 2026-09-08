@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：v2 设计 + Phase 0/1 已落地，Phase 4 的非流式/流式协议、预算与验收内核已开始共用
+> 状态：v2 设计 + Phase 0/1 已落地，Phase 4 的协议、预算、验收与 Provider transport 控制已开始共用
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -131,7 +131,9 @@ OpenAI 原生工具调用分片。Anthropic 分散在 `message_start` 与 `messa
 第四个切片 `KernelRequestPlan` 已统一桌面流式、桌面非流式和 headless 的请求规划：协议端点、
 请求体、鉴权类型、采样参数、原生工具 schema 与 DeepSeek reasoning 历史净化只有一套实现。
 计划对象刻意不携带 API key，transport 只在发送前注入凭据；非法 temperature/top-p/max_tokens
-在内核失败关闭。代理选择、HTTP 重试、取消轮询和超时仍由调用方运行时负责，下一阶段再统一。
+在内核失败关闭。`run_provider_transport` 已统一 UI/headless 的指数退避、Retry-After、尝试次数、
+取消轮询与绝对截止时间；调用方只注入协议 HTTP attempt、取消来源和 watchdog touch。代理选择与
+流响应读取/停滞治理仍由各 adapter 负责，下一阶段继续收敛。
 
 ### 5.1 事件输出接口
 
@@ -392,10 +394,11 @@ pricing_version
 - cost；
 - 单次 Provider 请求和单次工具执行时间。
 
-当前 builtin 实现对 Provider 请求发送和响应读取分别设置 60 秒硬超时，并对错误响应做文本脱敏；后续统一 Agent Kernel 会把该值纳入 task/run-config 的可配置预算。
-
-对 HTTP 429 和 5xx 响应执行一次 250ms 有界重试，次数写入 `AgentDriverOutcome.retries`；
-工具 allowlist 内外分别记录 `ToolApproval(approved=true/false)`。
+当前 builtin 把任务剩余 wall time 作为 Provider 请求、响应读取和退避共享的绝对截止时间，
+并对错误响应做文本脱敏。HTTP 429、5xx、连接失败和传输超时与 UI 共用
+`STREAM_REQUEST_POLICY` 指数退避策略，尊重 Retry-After，实际尝试次数写入
+`AgentDriverOutcome.retries`；工具 allowlist 内外分别记录
+`ToolApproval(approved=true/false)`。后续再把单请求上限作为独立 run-config 字段。
 
 Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不能只依赖外层
 `run_trial`，因为同步阻塞会绕过 wall-time 保护。
@@ -446,7 +449,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ### Phase 4：统一 Agent Kernel
 
-- 从 `chat.rs` 抽取 ModelClient/stream parser（`KernelTurn`、usage ledger、多协议 `KernelStreamAccumulator` 与无 secret 的 `KernelRequestPlan` 已落地；HTTP 重试/取消 transport 仍待抽取）；
+- 从 `chat.rs` 抽取 ModelClient/stream parser（`KernelTurn`、usage ledger、多协议 `KernelStreamAccumulator`、无 secret 的 `KernelRequestPlan` 与共用 `run_provider_transport` 已落地；流响应读取/停滞治理仍待抽取）；
 - 抽取消息历史、tool loop、reflexion、governance、recovery（acceptance stop gate 已共用）；
 - Tauri UI 和 eval 共用 AgentKernel；
 - 再扩展 Anthropic/Gemini 适配器。
@@ -505,7 +508,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 下一步推进 Phase 2/3，但保持核心工具不依赖 Docker：
 
 1. 增加真实 Provider 手动 smoke workflow 和脱敏产物检查；
-2. 把 Provider 请求超时、定价快照与取消令牌纳入 run-config；
+2. 把已统一的 Provider transport 接入 run-config 单请求上限，并继续抽取流响应读取/停滞治理；
 3. 将参数级审批、tool metrics 和 recovery 接入 headless runtime；
 4. 清理 headless 工具路径上的全局数据库依赖；
 5. 最终抽取 UI/headless 共用的 Agent Kernel。

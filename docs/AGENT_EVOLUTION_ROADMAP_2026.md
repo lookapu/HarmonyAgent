@@ -27,7 +27,8 @@
 - `SandboxBackend`/`SandboxSpec`、可选 Docker/Podman 运行时探测、fail-closed OCI argv、超时取消与审计事件、命令接线均已就绪；产品默认路线已改为无 Docker 依赖的平台原生轻量后端，OCI 只保留为外部 CI 适配器。
 - Tree-sitter/ArkTS 容错 AST 层与依赖/影响图——物理分片待真实仓 SLO 触发。
 - ArkTS LSP 语义层与 `repo_query` 路由/影响面——依赖图重排的统一 planner 待完成。
-- headless eval harness——数据契约/grader/补丁/工作树/编排与 builtin driver 已落地；当前 builtin 支持 OpenAI-compatible Provider、受限文件工具和 `--driver builtin`，非流式回合、多协议流式帧累加器、无 secret 请求规划、成本账本与 acceptance stop gate 已进入 UI/headless 共用 Agent Kernel。HTTP 重试/取消 transport、消息历史、tool loop 与 recovery 的进一步统一仍待实现，详见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)。
+- 结构化代码修改——`edit_file` 已支持完整块/批量块、`symbol_handle` 全文件 SHA-256 防漂移、括号配平、undo 和写后验证计划；但块边界仍以括号/缩进扫描为主，尚未形成全语言 AST 事务，Java annotation/import/override 等语义联动与落盘前诊断门禁待完成。
+- headless eval harness——数据契约/grader/补丁/工作树/编排与 builtin driver 已落地；当前 builtin 支持 OpenAI-compatible Provider、受限文件工具和 `--driver builtin`，非流式回合、多协议流式帧累加器、无 secret 请求规划、成本账本、acceptance stop gate 与 Provider 重试/取消/截止时间控制已进入 UI/headless 共用 Agent Kernel。流响应读取、消息历史/tool loop 与 recovery 的进一步统一仍待实现，详见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)。
 
 **需外部基础设施（本仓库环境无法完成，按任务分别需真机/真实模型/官方 harness/签名证书；官方 SWE-bench 复现可在独立 CI 使用容器）**
 
@@ -402,7 +403,54 @@ Explore -> Hypothesis -> Minimal Edit -> Targeted Verify
 
 要求 Agent 在编辑前形成可证伪假设；失败后优先获取新证据，不允许无证据重复相同工具调用。完成前必须通过与改动范围匹配的验证计划。
 
-### 8.4 有条件的多 Agent，而不是默认多 Agent
+### 8.4 结构化代码修改事务
+
+代码修改的默认单位不应是模型任意截取的文本或“尽量大的代码块”，而应是**最小完整语法节点**。例如单个参数修改表达式节点，Flutter/Dart Widget 调整修改对应 Widget 子树，方法重写替换完整方法节点；Java 字段删除则把注解、修饰符、类型和字段声明作为同一节点。机械替换、生成文件和暂不支持语法树的语言可以回退文本 patch，但必须提高验证等级，不能静默降级。
+
+现有能力作为兼容底座保留：
+
+- `start/starts` 按完整括号块或 Python 缩进块定位，批量块统一使用原文坐标并拒绝重叠；
+- `symbol_handle` 绑定项目、符号范围和完整文件 SHA-256，外部工具改写后失败关闭；
+- `balance_guard` 在落盘前检查字符串/注释感知的 `{}()[]` 配平；
+- undo、`preview_edit`、增量重索引和 [文件变更验证计划](./CHANGE_VERIFICATION.md) 负责预览、恢复与写后证据。
+
+这些机制可以拦截常见的漏闭合符号和位置漂移，但括号配平不等于语法正确，构建后发现错误也不等于提前避免错误。下一阶段增加统一 `StructuredEditTransaction`（或 `CodeMutationGuard`），让 `write_file`、`edit_file`、`multi_edit`、`apply_patch`、LSP WorkspaceEdit 和 Agent Kernel 的代码写入走同一事务：
+
+```text
+结构索引定位 -> 生成节点级修改计划 -> 校验 file hash / node kind / parent range
+             -> 在内存副本原子应用全部修改 -> 重解析完整变更文件
+             -> 运行语言诊断与伴随节点清理 -> 格式化后再次解析
+             -> 核对 diff 声明范围 -> 全部通过后落盘，否则不写入/整体回滚
+```
+
+事务必须满足以下不变量：
+
+1. 修改不得引入新的语法诊断；原文件已有错误时，错误集合只能减少，或新增位置必须属于明确声明的修复范围；
+2. 修改后的目标节点仍可解析，父节点边界不得意外漂移；有意替换父节点时必须在计划中显式声明；
+3. 多节点、多文件重构必须全有或全无，任一步失败不得留下部分写入；
+4. formatter 只负责规范化，不得作为修复残缺语法的手段；格式化后必须再次解析且结果幂等；
+5. 最终 diff 只能覆盖事务声明的文件与节点；超范围变化、换行风格污染和无关格式化必须拒绝；
+6. 语法门禁通过后仍需执行与风险匹配的静态检查、测试和构建，写入成功不能自证任务完成。
+
+Java 需要独立的语义 adapter，优先接入 JDT Language Server，并以 `javac`、Maven 或 Gradle 构建作最终证据：
+
+- 删除字段或方法时，绑定在声明上的 `@Resource`、`@Override` 等 annotation 随节点一起处理，禁止留下游离注解；
+- annotation 删除后，仅在确认没有其他使用者时清理 `javax.annotation` / `jakarta.annotation` 等 import；
+- 方法签名变化后重新解析类型层次：仍覆盖父类/接口时保留 `@Override`，不再覆盖时由语义诊断阻止提交或执行明确 quick fix；
+- 字段注入删除后继续检查引用、构造器和框架约束，不能把“import 已清理”当作重构完成；
+- 语言服务不可用时失败关闭到“内存预览 + 完整 Java 构建”，不得把轻量正则结果冒充语义事实。
+
+Flutter/Dart、Rust、TypeScript/ArkTS 等语言采用相同协议，由语言 adapter 提供 parser、formatter、diagnostics 和 workspace edit；不要求 Docker。对百万级仓库，事务只加载目标节点、父节点和必要语义依赖，验证时解析受影响文件/模块，不把全仓正文送入模型。
+
+分阶段实现与出口：
+
+- **P0 写前门禁**：先在内存副本应用、配平、解析、diff 范围核对，失败不落盘；把现有写工具统一接入事务外壳；
+- **P1 节点事务**：编辑参数改为 `symbol_handle/node_id + expected_hash + expected_kind + replacement`，支持同文件多节点原子修改和结构重定位；
+- **P1 Java 语义闭环**：JDT LS/Javac adapter、annotation/import/override 联动、Maven/Gradle 验证；
+- **P2 跨文件事务**：承接 LSP WorkspaceEdit、原子暂存/提交、失败回滚和外部编辑冲突重规划；
+- **评测出口**：固定加入漏 `) ] }`、Widget 子树错位、Java 游离 `@Override`/`@Resource`、误删仍在使用的 import、并发外部改写、部分多文件写入六类故障；要求新语法错误落盘率为 0、部分事务残留率为 0，并分别报告预防率、回滚率和误拒绝率。
+
+### 8.5 有条件的多 Agent，而不是默认多 Agent
 
 Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和选择多个候选提高 SWE-bench 成绩。HarmonyAgent 已有子 Agent/DAG，可借鉴但不应无条件并行：
 
@@ -433,7 +481,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 - [x] 把当前 `sandbox_exec` 在 UI/文档中改称“临时副本试运行”，消除错误安全承诺；
 - [x] 写 `SECURITY_BOUNDARY.md`：明确宿主、工作区、网络、凭据和 MCP 边界；
-- [ ] 完成 headless eval adapter 的生产级 Agent Kernel 与一个真实模型 end-to-end 样例（builtin driver、`eval run --driver builtin`、11 个结构/文件/Git 工具、`SessionTrajectorySink`、`HeadlessToolRuntime`、原生异步 runner 主路径、可注入 `ModelClient`、完全离线的脚本 Provider tool-loop 测试、成本计量、超时/重试与失败/取消终态已实现；参数级审批/L2 fail-closed、共享工具契约、trial 私有 `tool_runs` 与 `tool_metrics` 汇总也已接入；统一 Kernel 的严格 `KernelTurn`、多协议 `KernelStreamAccumulator`、无 secret `KernelRequestPlan`、usage/cost ledger 和 UI/headless 共用 acceptance stop gate、无 Docker 的真实 Provider 手动 workflow 已落地，HTTP 重试/取消 transport、消息历史/tool loop/recovery 共用仍待完成，见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)）；
+- [ ] 完成 headless eval adapter 的生产级 Agent Kernel 与一个真实模型 end-to-end 样例（builtin driver、`eval run --driver builtin`、11 个结构/文件/Git 工具、`SessionTrajectorySink`、`HeadlessToolRuntime`、原生异步 runner 主路径、可注入 `ModelClient`、完全离线的脚本 Provider tool-loop 测试、成本计量、超时/重试与失败/取消终态已实现；参数级审批/L2 fail-closed、共享工具契约、trial 私有 `tool_runs` 与 `tool_metrics` 汇总也已接入；统一 Kernel 的严格 `KernelTurn`、多协议 `KernelStreamAccumulator`、无 secret `KernelRequestPlan`、usage/cost ledger、acceptance stop gate 和 Provider transport 控制已在 UI/headless 共用，无 Docker 的真实 Provider 手动 workflow 已落地，流响应读取、消息历史/tool loop/recovery 共用仍待完成，见 [HEADLESS_AGENT_DRIVER.md](./HEADLESS_AGENT_DRIVER.md)）；
 - [x] 固定 SWE-bench Verified 25 题 smoke 子集（v1 清单覆盖 12 个仓库和三档难度，固定官方 dataset revision；数量/唯一性/ID/revision 校验器与仓库清单测试已落地。官方 gold 25/25 容器自检只作为可选 CI 适配器验收，不是核心工具依赖，见 [SWE_BENCH_VERIFIED_25.md](./SWE_BENCH_VERIFIED_25.md)）；
 - [x] 建立 10k/100k/1M 文件索引基准生成器，并记录 10k 当前基线；
 - [x] 更新 README：二进制下载、支持平台和当前限制（badge 改为仅 Windows/macOS，并明确 Linux 暂不提供官方安装包，避免“跨平台”措辞超出实际产物）。
@@ -449,9 +497,10 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy（类型化窄能力 + 安全校验已落地为 `agent::capability_broker`——`HostCapability` 枚举覆盖 hdc 连接/断开/列表、install、deploy，`validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`；真实执行按 capability_id 接入 device_tools/build_tools 待真机）；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成；`repo_query` 路由 MVP 已完成——`auto` 按查询形态分流 `path/symbol/concept` 到 lexical/结构索引并标注 `source_layer`，`impact` 模式已完成——精确图反向依赖返回“谁引用/调用了该符号”并按主流约定给出候选测试文件；依赖图重排的统一 planner 待完成）；
+- [ ] 结构化代码修改事务 P0/P1：所有代码写工具先在内存副本原子应用并执行解析/diff 范围门禁；节点句柄携带文件 hash、node kind 与父节点范围；优先完成 ArkTS/TypeScript/Dart/Rust adapter，并接入 Java JDT LS/Javac 的 annotation/import/override 语义联动；失败时不落盘或整体回滚，且不依赖 Docker；
 - [ ] 每周真实模型回归，保存 patch/trajectory/cost/report。
 
-退出门槛：恶意仓库脚本不能读取工作区外文件或联网；100k 文件仓库满足校准后的 P95 指标；真实模型评测可重复。
+退出门槛：恶意仓库脚本不能读取工作区外文件或联网；100k 文件仓库满足校准后的 P95 指标；结构化修改故障集中新增语法错误落盘率和部分事务残留率均为 0；真实模型评测可重复。
 
 ### Phase 2：第 7—12 周，提升成功率并公开证据
 
@@ -501,6 +550,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 4. **效率**：每个成功任务的成本、token、工具调用和 wall time 是否改善？
 5. **领域价值**：HarmonyOS 任务是否显著优于通用 Agent + 通用工具？
 6. **可复现**：第三方能否从 commit、镜像、配置、trajectory 和 grader 重现结论？
+7. **修改完整性**：代码写入是否保持语法节点、语义依赖和事务边界完整，还是只能依赖后续构建发现残缺修改？
 
 如果某项新架构不能改善至少一个指标，或改善幅度小于它带来的维护成本，就不应仅因为“主流项目也有”而合入。
 

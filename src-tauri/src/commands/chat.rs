@@ -7559,38 +7559,43 @@ async fn stream_once(
             }
             Ok(resp)
         };
-        let retry_fut = retry_with_backoff(
+        let transport = crate::agent::agent_kernel::run_provider_transport(
             &STREAM_REQUEST_POLICY,
+            None,
+            std::time::Duration::from_millis(300),
             &mut attempt,
             |e: &FriendlyError| e.retryable(),
             |e: &FriendlyError| e.retry_after_ms(),
-        );
-        tokio::pin!(retry_fut);
-        loop {
-            registry.touch(conversation_id, PHASE_SEND);
-            tokio::select! {
-                r = &mut retry_fut => break r,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                    if is_cancelled(cancel, conversation_id) {
-                        // 放弃当前请求（send future drop 即取消连接），返回已停止
-                        crate::utils::logger::log_event(
-                            "stop_effective",
-                            serde_json::json!({
-                                "phase": "stream_send_poll",
-                                "conversation_id": conversation_id,
-                            }),
-                        );
-                        return Ok(StreamOutcome {
-                            text: String::new(),
-                            reasoning: String::new(),
-                            stopped: true,
-                            truncated: false,
-                            interrupted: false,
-                            usage: kernel_usage_info(None),
-                            tool_calls: Vec::new(),
-                        });
-                    }
-                }
+            || is_cancelled(cancel, conversation_id),
+            || registry.touch(conversation_id, PHASE_SEND),
+        )
+        .await;
+        match transport {
+            Ok(result) => result,
+            Err(crate::agent::agent_kernel::KernelTransportStop::Cancelled) => {
+                // 放弃当前请求（send future drop 即取消连接），返回已停止。
+                crate::utils::logger::log_event(
+                    "stop_effective",
+                    serde_json::json!({
+                        "phase": "stream_send_poll",
+                        "conversation_id": conversation_id,
+                    }),
+                );
+                return Ok(StreamOutcome {
+                    text: String::new(),
+                    reasoning: String::new(),
+                    stopped: true,
+                    truncated: false,
+                    interrupted: false,
+                    usage: kernel_usage_info(None),
+                    tool_calls: Vec::new(),
+                });
+            }
+            Err(crate::agent::agent_kernel::KernelTransportStop::DeadlineExceeded) => {
+                return Err(FriendlyError::new(
+                    ErrorKind::Timeout,
+                    "Provider 请求超过 Agent Kernel 截止时间",
+                ));
             }
         }
     };

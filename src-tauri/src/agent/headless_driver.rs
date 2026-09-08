@@ -5,8 +5,8 @@
 //! event stream and is intended for eval smoke tests while AgentKernel is extracted.
 
 use crate::agent::agent_kernel::{
-    parse_openai_turn, KernelAcceptanceGate, KernelStopDecision, KernelToolEvidence,
-    KernelUsageLedger,
+    parse_openai_turn, run_provider_transport, KernelAcceptanceGate, KernelStopDecision,
+    KernelToolEvidence, KernelTransportStop, KernelUsageLedger,
 };
 use crate::agent::eval_report::ModelInfo;
 use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
@@ -14,6 +14,11 @@ use crate::agent::eval_task::EvalTask;
 use crate::agent::event_sink::{AgentEventSink, SessionTrajectorySink};
 use crate::agent::headless_runtime::HeadlessToolRuntime;
 use crate::agent::session_events::SessionEventType;
+use crate::utils::errors::{
+    parse_retry_after_secs, provider_error_with_retry_after, transport_error, ErrorKind,
+    FriendlyError,
+};
+use crate::utils::retry::STREAM_REQUEST_POLICY;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::future::Future;
@@ -211,61 +216,73 @@ impl HeadlessAgentDriver {
         )
         .map_err(AgentDriverError::Failed)?;
         let client = reqwest::Client::new();
-        let mut retries = 0;
         let deadline = tokio::time::Instant::now() + timeout;
-        loop {
+        let mut attempt = || {
             let request = client
                 .post(&request_plan.url)
                 .bearer_auth(&provider.api_key)
                 .json(&request_plan.body)
                 .send();
-            let response = tokio::time::timeout_at(deadline, request)
-                .await
-                .map_err(|_| {
-                    AgentDriverError::Cancelled("Provider 请求超过剩余 wall time，已取消".into())
-                })?
-                .map_err(|e| AgentDriverError::Failed(format!("Provider 请求失败：{e}")))?;
-            let status = response.status();
-            let bytes = tokio::time::timeout_at(deadline, response.bytes())
-                .await
-                .map_err(|_| {
-                    AgentDriverError::Cancelled(
-                        "读取 Provider 响应超过剩余 wall time，已取消".into(),
-                    )
-                })?
-                .map_err(|e| AgentDriverError::Failed(format!("读取 Provider 响应失败：{e}")))?;
-            if bytes.len() > MAX_RESPONSE_BYTES {
-                return Err(AgentDriverError::Failed("Provider 响应超过 8 MiB".into()));
-            }
-            if status.is_success() {
-                let value = serde_json::from_slice(&bytes).map_err(|e| {
-                    AgentDriverError::Failed(format!("Provider JSON 无法解析：{e}"))
-                })?;
-                return Ok((value, retries));
-            }
-            if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-                && retries == 0
-            {
-                retries = 1;
-                tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(250)))
-                    .await
-                    .map_err(|_| {
-                        AgentDriverError::Cancelled(
-                            "Provider 重试超过剩余 wall time，已取消".into(),
+            async {
+                let response = request.await.map_err(|error| transport_error(&error))?;
+                let status = response.status();
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_retry_after_secs);
+                let bytes = response.bytes().await.map_err(|error| transport_error(&error))?;
+                if bytes.len() > MAX_RESPONSE_BYTES {
+                    return Err(FriendlyError::new(
+                        ErrorKind::Client,
+                        "Provider 响应超过 8 MiB",
+                    ));
+                }
+                if status.is_success() {
+                    return serde_json::from_slice(&bytes).map_err(|error| {
+                        FriendlyError::new(
+                            ErrorKind::Client,
+                            format!("Provider JSON 无法解析：{error}"),
                         )
-                    })?;
-                continue;
+                    });
+                }
+                let detail = crate::utils::redact::redact_text(
+                    &String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(500)
+                        .collect::<String>(),
+                );
+                Err(provider_error_with_retry_after(
+                    status.as_u16(),
+                    &detail,
+                    retry_after,
+                ))
             }
-            let detail = crate::utils::redact::redact_text(
-                &String::from_utf8_lossy(&bytes)
-                    .chars()
-                    .take(500)
-                    .collect::<String>(),
-            );
-            return Err(AgentDriverError::Failed(format!(
-                "Provider 返回 HTTP {status}：{detail}"
-            )));
-        }
+        };
+        let result = run_provider_transport(
+            &STREAM_REQUEST_POLICY,
+            Some(deadline),
+            Duration::from_millis(100),
+            &mut attempt,
+            FriendlyError::retryable,
+            FriendlyError::retry_after_ms,
+            || false,
+            || {},
+        )
+        .await
+        .map_err(|stop| match stop {
+            KernelTransportStop::Cancelled => {
+                AgentDriverError::Cancelled("Provider 请求已取消".into())
+            }
+            KernelTransportStop::DeadlineExceeded => AgentDriverError::Cancelled(
+                "Provider 请求或重试超过剩余 wall time，已取消".into(),
+            ),
+        })?;
+        let retries = result.attempts.saturating_sub(1) as u64;
+        result
+            .value
+            .map(|value| (value, retries))
+            .map_err(|error| AgentDriverError::Failed(error.to_user_string()))
     }
 }
 

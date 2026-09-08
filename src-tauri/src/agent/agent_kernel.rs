@@ -4,12 +4,78 @@
 //! `KernelTurn`，预算账本再统一累计 usage/cost；消息循环与 UI 流式 adapter 后续逐步接入。
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::agent::acceptance::{
     evaluate_contract, remediation_prompt, AcceptanceReport, GoalContract, ToolEvidence,
 };
+use crate::utils::retry::{retry_with_backoff, RetryPolicy, RetryResult};
+
+/// Provider 请求在真正返回响应前可能停留在 DNS/TCP/TLS、首字节等待或重试退避。
+/// UI 与 headless 通过同一控制层轮询取消和绝对截止时间，避免各自维护一套略有差异的
+/// `select!`。具体 HTTP client、鉴权和错误类型仍由 adapter 注入。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelTransportStop {
+    Cancelled,
+    DeadlineExceeded,
+}
+
+/// 在统一的重试策略外包裹取消/截止时间控制。
+///
+/// `attempt` 只负责一次 Provider 交互；可恢复性和 Retry-After 由调用方的结构化错误提供。
+/// 丢弃该 future 会同时丢弃当前 HTTP send/read 或退避 sleep，因此取消不需要等待一次
+/// 请求自然返回。`on_poll` 用于 UI watchdog touch；headless 可传空闭包。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_provider_transport<T, E, F, Fut, Retryable, RetryAfter, Cancelled, Poll>(
+    policy: &RetryPolicy,
+    deadline: Option<tokio::time::Instant>,
+    poll_interval: Duration,
+    attempt: &mut F,
+    should_retry: Retryable,
+    retry_after_of: RetryAfter,
+    mut is_cancelled: Cancelled,
+    mut on_poll: Poll,
+) -> Result<RetryResult<T, E>, KernelTransportStop>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    Retryable: Fn(&E) -> bool,
+    RetryAfter: Fn(&E) -> Option<u64>,
+    Cancelled: FnMut() -> bool,
+    Poll: FnMut(),
+{
+    if is_cancelled() {
+        return Err(KernelTransportStop::Cancelled);
+    }
+    if deadline.is_some_and(|value| tokio::time::Instant::now() >= value) {
+        return Err(KernelTransportStop::DeadlineExceeded);
+    }
+
+    let future = retry_with_backoff(policy, attempt, should_retry, retry_after_of);
+    tokio::pin!(future);
+    let poll_interval = poll_interval.max(Duration::from_millis(1));
+    loop {
+        on_poll();
+        let wait = deadline
+            .map(|value| value.saturating_duration_since(tokio::time::Instant::now()))
+            .map(|remaining| remaining.min(poll_interval))
+            .unwrap_or(poll_interval);
+        tokio::select! {
+            result = &mut future => return Ok(result),
+            _ = tokio::time::sleep(wait) => {
+                if is_cancelled() {
+                    return Err(KernelTransportStop::Cancelled);
+                }
+                if deadline.is_some_and(|value| tokio::time::Instant::now() >= value) {
+                    return Err(KernelTransportStop::DeadlineExceeded);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KernelUsage {
@@ -822,6 +888,84 @@ impl KernelAcceptanceGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn provider_transport_shares_retry_attempt_accounting() {
+        let calls = std::cell::Cell::new(0usize);
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+        };
+        let mut attempt = || async {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err("temporary")
+            } else {
+                Ok(42)
+            }
+        };
+        let result = run_provider_transport(
+            &policy,
+            None,
+            Duration::from_millis(1),
+            &mut attempt,
+            |_| true,
+            |_| None,
+            || false,
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.attempts, 2);
+        assert_eq!(result.value.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn provider_transport_cancellation_drops_pending_attempt() {
+        let polls = std::cell::Cell::new(0usize);
+        let mut attempt = || std::future::pending::<Result<(), &'static str>>();
+        let result = run_provider_transport(
+            &RetryPolicy {
+                max_attempts: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            },
+            None,
+            Duration::from_millis(1),
+            &mut attempt,
+            |_| false,
+            |_| None,
+            || polls.get() >= 2,
+            || polls.set(polls.get() + 1),
+        )
+        .await;
+        assert!(matches!(result, Err(KernelTransportStop::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn provider_transport_enforces_absolute_deadline_during_attempt() {
+        let mut attempt = || std::future::pending::<Result<(), &'static str>>();
+        let result = run_provider_transport(
+            &RetryPolicy {
+                max_attempts: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            },
+            Some(tokio::time::Instant::now() + Duration::from_millis(5)),
+            Duration::from_secs(1),
+            &mut attempt,
+            |_| false,
+            |_| None,
+            || false,
+            || {},
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(KernelTransportStop::DeadlineExceeded)
+        ));
+    }
 
     #[test]
     fn parses_tool_turn_and_cached_usage() {
