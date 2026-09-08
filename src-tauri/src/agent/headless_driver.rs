@@ -6,14 +6,13 @@
 
 use crate::agent::agent_kernel::{
     build_model_request_plan, run_provider_transport, sse_payload, KernelAcceptanceGate,
-    KernelRunState, KernelRunTermination, KernelSseBuffer, KernelStopDecision,
+    KernelRunTermination, KernelSseBuffer, KernelStopDecision,
     KernelStreamAccumulator, KernelStreamFinish, KernelStreamGovernor, KernelStreamSignal,
     KernelToolEvidence, KernelTransportStop, KernelTurn, KernelUsageLedger, KERNEL_STREAM_MAX_BYTES,
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
-use crate::agent::kernel_loop::{
-    KernelLoopGovernor, KernelRoundControl, KernelRoundInput, KernelRoundRouter,
-};
+use crate::agent::kernel_executor::KernelExecutorState;
+use crate::agent::kernel_loop::{KernelRoundControl, KernelRoundInput};
 use crate::agent::kernel_history::continuation_instruction;
 use crate::agent::eval_report::ModelInfo;
 use crate::agent::eval_runner::{AgentDriverError, AgentDriverOutcome, AsyncAgentDriver};
@@ -550,12 +549,10 @@ impl HeadlessAgentDriver {
         )
         .map_err(AgentDriverError::Failed)?;
         let round_limit = self.provider.max_rounds.min(task.limits.max_steps as u32);
-        let mut run_state = KernelRunState::default();
         let mut attempted_tool_calls = 0u64;
         
-        // Phase F：headless 接入循环治理与轮级路由（纯策略，UI 共用）
-        let mut loop_governor = KernelLoopGovernor::new();
-        let mut round_router = KernelRoundRouter::new();
+        // UI/headless 共用 executor 状态：轮级路由、循环治理、唯一终止原因。
+        let mut kernel_executor = KernelExecutorState::new();
         
         'rounds: for round in 0..round_limit {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
@@ -593,7 +590,7 @@ impl HeadlessAgentDriver {
             .map_err(AgentDriverError::Failed)?;
             messages.push(turn.provider_message.clone());
             if cost_exceeded {
-                run_state.terminate(KernelRunTermination::CostBudgetExceeded);
+                kernel_executor.terminate(KernelRunTermination::CostBudgetExceeded);
                 sink.append(
                     SessionEventType::SystemNote,
                     json!({"reason":"max_cost_exceeded","cost_cny":outcome.cost_cny}),
@@ -618,7 +615,7 @@ impl HeadlessAgentDriver {
                 interrupted: false, // headless 流错误 fail-closed，不进入中断续写（文档画线）
                 has_native_tool_calls: !turn.tool_calls.is_empty(),
             };
-            let decision = round_router.decide(&round_input);
+            let decision = kernel_executor.decide_round(&round_input);
             for notice in decision.notices {
                 sink.append(
                     SessionEventType::SystemNote,
@@ -646,7 +643,7 @@ impl HeadlessAgentDriver {
                 }
                 KernelRoundControl::StopEmpty { note } => {
                     // 空轮耗尽：追加注记后收尾
-                    run_state.terminate(KernelRunTermination::EmptyRoundsExhausted);
+                    kernel_executor.terminate(KernelRunTermination::EmptyRoundsExhausted);
                     sink.append(
                         SessionEventType::SystemNote,
                         json!({"note": note}),
@@ -698,7 +695,7 @@ impl HeadlessAgentDriver {
             if turn.is_stop_candidate() {
                 match acceptance.request_stop() {
                     KernelStopDecision::Accepted(report) => {
-                        run_state.terminate(KernelRunTermination::ModelAccepted);
+                        kernel_executor.terminate(KernelRunTermination::ModelAccepted);
                         sink.append(
                             SessionEventType::SystemNote,
                             serde_json::to_value(&report)
@@ -726,7 +723,7 @@ impl HeadlessAgentDriver {
                         continue;
                     }
                     KernelStopDecision::Exhausted(report) => {
-                        run_state.terminate(KernelRunTermination::AcceptanceExhausted);
+                        kernel_executor.terminate(KernelRunTermination::AcceptanceExhausted);
                         sink.append(
                             SessionEventType::SystemNote,
                             serde_json::to_value(&report)
@@ -742,7 +739,7 @@ impl HeadlessAgentDriver {
             for call in turn.tool_calls {
                 attempted_tool_calls = attempted_tool_calls.saturating_add(1);
                 if attempted_tool_calls > task.limits.max_tool_calls {
-                    run_state.terminate(KernelRunTermination::ToolCallBudgetExceeded);
+                    kernel_executor.terminate(KernelRunTermination::ToolCallBudgetExceeded);
                     sink.append(
                         SessionEventType::SystemNote,
                         json!({
@@ -780,7 +777,7 @@ impl HeadlessAgentDriver {
                 };
                 
                 // Phase F：工具循环检测——在每次工具调用前观察，命中循环时注入纠正提示或直接收尾
-                let verdict = loop_governor.observe(name, args);
+                let verdict = kernel_executor.observe_tool(name, args);
                 match verdict {
                     crate::agent::kernel_loop::KernelLoopVerdict::Proceed => {
                         // 继续执行工具
@@ -788,7 +785,7 @@ impl HeadlessAgentDriver {
                     crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, .. } => {
                         if final_halt {
                             // loop_breaks 已超上限，直接收尾
-                            run_state.terminate(KernelRunTermination::ToolLoopExhausted);
+                            kernel_executor.terminate(KernelRunTermination::ToolLoopExhausted);
                             sink.append(
                                 SessionEventType::SystemNote,
                                 json!({"reason":"tool_loop_exhausted","tool":name}),
@@ -902,7 +899,7 @@ impl HeadlessAgentDriver {
                 messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
             }
         }
-        if let Some(taxonomy) = run_state
+        if let Some(taxonomy) = kernel_executor
             .finish(outcome.steps, round_limit as u64)
             .and_then(KernelRunTermination::failure_taxonomy)
         {
@@ -942,7 +939,7 @@ impl HeadlessAgentDriver {
                 .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
         )
         .map_err(AgentDriverError::Failed)?;
-        let termination_reason = run_state
+        let termination_reason = kernel_executor
             .termination()
             .map(KernelRunTermination::as_str)
             .unwrap_or("unknown");

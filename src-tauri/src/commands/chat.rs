@@ -21,7 +21,8 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
     run_tool_with_retry, retry_notice,
 };
-use crate::agent::kernel_loop::{KernelLoopGovernor, KernelToolBudgetGate, KernelRoundRouter, KernelRoundInput};
+use crate::agent::kernel_executor::KernelExecutorState;
+use crate::agent::kernel_loop::{KernelToolBudgetGate, KernelRoundInput};
 use crate::agent::kernel_history::{KernelHistoryAssembler, KernelHistoryInput, HistoryRow, ToolResult, UserInjection};
 use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
 use crate::agent::tools::guards::is_cancelled;
@@ -4192,10 +4193,8 @@ async fn stream_chat_inner(
     // 截断续写时上轮“正文为空但思考非空”（推理模型 reasoning 耗尽预算被截断）：
     // 续写指令改为要求直接输出结论/工具调用，避免再次思考耗尽预算空转
     let mut continuation_reasoning_only = false;
-    // 轮级路由：使用共享 KernelRoundRouter（空轮/冻结重放/中断续写/截断续写/假调用纠正）
-    let mut round_router = KernelRoundRouter::new();
-    // 工具循环检测：使用共享 KernelLoopGovernor（对齐 qwen-code LoopDetectionService 轻量版）
-    let mut loop_governor = KernelLoopGovernor::new();
+    // 共用 executor 状态：统一持有轮级路由、工具循环检测与终止状态。
+    let mut kernel_executor = KernelExecutorState::new();
     let mut continuation_text = String::new();
     // 多模态图片附加计数：已附加到请求的图片数（用户首轮上传 + 工具轮次 take_screenshot 产生的截图），
     // 每轮只附加新增部分到最新 user 消息（通常是刚注入的工具结果），避免重复注入历史图
@@ -5190,8 +5189,8 @@ async fn stream_chat_inner(
                         "elapsed_ms": task_started.elapsed().as_millis() as i64,
                     }),
                 );
-                // 工具循环检测：使用共享 KernelLoopGovernor（对齐 qwen-code LoopDetectionService 轻量版）
-                let verdict = loop_governor.observe(&tool, &args_raw);
+                // 工具循环检测：由共享 KernelExecutorState 持有 governor 状态。
+                let verdict = kernel_executor.observe_tool(&tool, &args_raw);
                 match verdict {
                     crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, repeat, same_name, turn_calls } => {
                         crate::utils::logger::log_event(
@@ -5202,7 +5201,7 @@ async fn stream_chat_inner(
                                 "repeat": repeat,
                                 "same_name": same_name,
                                 "turn_calls": turn_calls,
-                                "breaks": loop_governor.loop_breaks(),
+                                "breaks": kernel_executor.loop_breaks(),
                             }),
                         );
                         pending.clear();
@@ -5220,7 +5219,7 @@ async fn stream_chat_inner(
                 let reached_tool_limit = tool_runs.len() + pending.len() >= max_tool_rounds;
                 let limit_must_stop = if reached_tool_limit {
                     let recent_successes = tool_runs.iter().rev().take(8).filter(|item| item.succeeded).count();
-                    match KernelToolBudgetGate::check(max_tool_rounds, tool_runs.len() + pending.len(), recent_successes, loop_governor.loop_breaks(), budget_extensions) {
+                    match KernelToolBudgetGate::check(max_tool_rounds, tool_runs.len() + pending.len(), recent_successes, kernel_executor.loop_breaks(), budget_extensions) {
                         crate::agent::kernel_loop::KernelBudgetVerdict::Extend { new_limit } => {
                             let previous = max_tool_rounds;
                             max_tool_rounds = new_limit;
@@ -5993,7 +5992,7 @@ async fn stream_chat_inner(
         if completion_reviews > 0 && is_completion_confirmation(&text) {
             break;
         }
-        // 轮级路由：使用共享 KernelRoundRouter（空轮/冻结重放/中断续写/截断续写/假调用纠正）
+        // 轮级路由：由共享 KernelExecutorState 决定空轮/重放/续写/假调用纠正。
         let router_input = KernelRoundInput {
             text: &text,
             has_reasoning: !outcome.reasoning.trim().is_empty(),
@@ -6001,7 +6000,7 @@ async fn stream_chat_inner(
             interrupted: outcome.interrupted,
             has_native_tool_calls: !outcome.tool_calls.is_empty(),
         };
-        let decision = round_router.decide(&router_input);
+        let decision = kernel_executor.decide_round(&router_input);
         for notice in decision.notices {
             full.push_str(&notice);
         }
@@ -6020,7 +6019,7 @@ async fn stream_chat_inner(
                     "stream_replay",
                     serde_json::json!({
                         "conversation_id": conversation_id,
-                        "attempt": round_router.counters().1,
+                        "attempt": kernel_executor.round_counters().1,
                         "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
                     }),
                 );

@@ -53,3 +53,4 @@ pub mod headless_runtime;
 pub mod undo;
 pub mod kernel_loop;
 pub mod kernel_history;
+pub mod kernel_executor;

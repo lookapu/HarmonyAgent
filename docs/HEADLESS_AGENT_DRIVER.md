@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—J 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略与循环治理组件，单一 run-loop executor 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—K 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -492,6 +492,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | H | 独立工具调用预算 + reasoning 流回放 + UI/headless 共用续写指令 | ✅ COMPLETED |
 | I | 单轮决策收敛（`KernelRoundDecision = notices + 唯一 control`，移除 adapter 动作序列推断） | ✅ COMPLETED |
 | J | 唯一终止状态（`KernelRunState` 锁定首个主原因，终止原因进入最终事件） | ✅ COMPLETED |
+| K | executor 状态所有权收敛（UI/headless 共用 `KernelExecutorState` 持有 router/governor/termination） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -503,7 +504,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - 历史工具输出在内核侧执行 1,200 字符上限，避免 adapter 迁移再次取消上下文护栏
 - headless 保留流式 `reasoning_content`；UI/headless 的 reasoning-only 截断都会直接要求输出结论，不再漏掉续写指令、重复半截正文或继续消耗推理预算
 - headless 外层循环不再维护多个 `stopped_by_*` 布尔值；成本、验收、空轮、工具预算、工具循环和步数耗尽由 `KernelRunState` 锁定唯一主终止原因，`driver_finished.termination_reason` 可直接审计。空轮恰好在最后一步耗尽时不会再误标 `max_steps_exceeded`
-- Rust lib 共 924 项：916 通过、8 项按环境条件忽略；前端 113 项通过
+- `KernelExecutorState` 成为两个 adapter 共同的跨轮状态所有者，集中装配 `KernelRoundRouter`、`KernelLoopGovernor` 与 `KernelRunState`；Provider/DB/事件/工具执行仍是端口，下一步迁移 IO 外循环
+- Rust lib 共 926 项：918 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -554,7 +556,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—J 已完成；后续继续收敛单一 executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—K 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
