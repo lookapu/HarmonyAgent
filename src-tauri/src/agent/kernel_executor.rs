@@ -22,7 +22,11 @@ pub enum KernelRunPermit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelToolAttemptPermit {
     Proceed { attempt: u64 },
-    Halt { attempted: u64, limit: u64 },
+    Halt {
+        reason: KernelRunTermination,
+        attempted: u64,
+        limit: Option<u64>,
+    },
 }
 
 /// 跨 adapter 稳定的 executor 最终快照，可直接写入桌面 run event 或 headless trajectory。
@@ -107,21 +111,28 @@ impl KernelExecutorState {
         verdict
     }
 
-    /// 对模型产生的每一个工具调用尝试计数（包括随后被策略拒绝的调用）。
-    pub fn permit_tool_attempt(&mut self, limit: u64) -> KernelToolAttemptPermit {
-        let attempted = self.record_tool_attempt();
-        if attempted > limit {
+    /// 工具执行前的原子入口。`Some(limit)` 用于固定硬上限，`None` 用于 adapter 的
+    /// 动态预算门；两者都在终态时拒绝继续计数或执行。
+    pub fn begin_tool_attempt(&mut self, limit: Option<u64>) -> KernelToolAttemptPermit {
+        if let Some(reason) = self.termination() {
+            return KernelToolAttemptPermit::Halt {
+                reason,
+                attempted: self.tool_attempts,
+                limit,
+            };
+        }
+        self.tool_attempts = self.tool_attempts.saturating_add(1);
+        let attempted = self.tool_attempts;
+        if limit.is_some_and(|value| attempted > value) {
             self.terminate(KernelRunTermination::ToolCallBudgetExceeded);
-            KernelToolAttemptPermit::Halt { attempted, limit }
+            KernelToolAttemptPermit::Halt {
+                reason: KernelRunTermination::ToolCallBudgetExceeded,
+                attempted,
+                limit,
+            }
         } else {
             KernelToolAttemptPermit::Proceed { attempt: attempted }
         }
-    }
-
-    /// 仅记账，不施加固定上限；用于拥有动态/可扩展工具预算的 adapter。
-    pub fn record_tool_attempt(&mut self) -> u64 {
-        self.tool_attempts = self.tool_attempts.saturating_add(1);
-        self.tool_attempts
     }
 
     pub fn tool_attempts(&self) -> u64 {
@@ -314,18 +325,19 @@ mod tests {
     fn executor_tool_attempt_budget_counts_rejected_attempt() {
         let mut executor = KernelExecutorState::new();
         assert_eq!(
-            executor.permit_tool_attempt(2),
+            executor.begin_tool_attempt(Some(2)),
             KernelToolAttemptPermit::Proceed { attempt: 1 }
         );
         assert_eq!(
-            executor.permit_tool_attempt(2),
+            executor.begin_tool_attempt(Some(2)),
             KernelToolAttemptPermit::Proceed { attempt: 2 }
         );
         assert_eq!(
-            executor.permit_tool_attempt(2),
+            executor.begin_tool_attempt(Some(2)),
             KernelToolAttemptPermit::Halt {
+                reason: KernelRunTermination::ToolCallBudgetExceeded,
                 attempted: 3,
-                limit: 2
+                limit: Some(2)
             }
         );
         assert_eq!(executor.tool_attempts(), 3);
@@ -456,5 +468,24 @@ mod tests {
             executor.termination(),
             Some(KernelRunTermination::ToolLoopExhausted)
         );
+    }
+
+    #[test]
+    fn executor_terminal_state_is_absorbing_at_tool_boundary() {
+        let mut executor = KernelExecutorState::new();
+        assert_eq!(
+            executor.begin_tool_attempt(None),
+            KernelToolAttemptPermit::Proceed { attempt: 1 }
+        );
+        executor.terminate(KernelRunTermination::UserCancelled);
+        assert_eq!(
+            executor.begin_tool_attempt(None),
+            KernelToolAttemptPermit::Halt {
+                reason: KernelRunTermination::UserCancelled,
+                attempted: 1,
+                limit: None,
+            }
+        );
+        assert_eq!(executor.tool_attempts(), 1);
     }
 }

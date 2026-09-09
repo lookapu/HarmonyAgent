@@ -5193,7 +5193,13 @@ async fn stream_chat_inner(
                 trace_id.clone(),
             );
             for (tool, args_raw) in calls {
-                kernel_executor.record_tool_attempt();
+                if matches!(
+                    kernel_executor.begin_tool_attempt(None),
+                    crate::agent::kernel_executor::KernelToolAttemptPermit::Halt { .. }
+                ) {
+                    exhausted = true;
+                    break;
+                }
                 // 每个工具独立计时：覆盖审批等待与重试，作为 done 事件的精确耗时
                 let tool_begin = std::time::Instant::now();
                 let call_id = Uuid::new_v4().to_string();

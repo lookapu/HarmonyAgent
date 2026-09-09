@@ -745,19 +745,22 @@ impl HeadlessAgentDriver {
                 }
             }
             for call in turn.tool_calls {
-                if let KernelToolAttemptPermit::Halt { attempted, limit } =
-                    kernel_executor.permit_tool_attempt(task.limits.max_tool_calls)
+                if let KernelToolAttemptPermit::Halt {
+                    reason,
+                    attempted,
+                    limit,
+                } = kernel_executor.begin_tool_attempt(Some(task.limits.max_tool_calls))
                 {
                     sink.append(
                         SessionEventType::SystemNote,
                         json!({
-                            "reason":"max_tool_calls_exceeded",
+                            "reason":reason.as_str(),
                             "attempted":attempted,
                             "limit":limit,
                         }),
                         "agent_tool_budget_stop",
                         json!({
-                            "reason":"max_tool_calls_exceeded",
+                            "reason":reason.as_str(),
                             "attempted":attempted,
                             "limit":limit,
                         }),
