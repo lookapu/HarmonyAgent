@@ -1047,25 +1047,18 @@ pub fn decide_stop_candidate(
     }
 }
 
-/// 模型只能申请停止；是否真正停止由目标契约和真实工具证据裁决。
-///
-/// UI 与 headless 使用同一状态机后，benchmark 不会把“模型说完成了”误当成已完成，
-/// 同时通过有界 remediation 次数避免弱模型无限自循环。
+/// 目标契约与真实工具证据的纯验收门；有界 remediation 状态由 `KernelExecutorState` 持有。
 #[derive(Clone, Debug)]
 pub struct KernelAcceptanceGate {
     contract: GoalContract,
     evidence: Vec<KernelToolEvidence>,
-    remediation_rounds: usize,
-    max_remediation_rounds: usize,
 }
 
 impl KernelAcceptanceGate {
-    pub fn new(goal: &str, max_remediation_rounds: usize) -> Self {
+    pub fn new(goal: &str) -> Self {
         Self {
             contract: GoalContract::compile(goal),
             evidence: Vec::new(),
-            remediation_rounds: 0,
-            max_remediation_rounds,
         }
     }
 
@@ -1091,18 +1084,6 @@ impl KernelAcceptanceGate {
         evaluate_contract(&self.contract, &evidence)
     }
 
-    pub fn request_stop(&mut self) -> KernelStopDecision {
-        let report = self.report();
-        decide_stop_candidate(
-            report,
-            &mut self.remediation_rounds,
-            self.max_remediation_rounds,
-        )
-    }
-
-    pub fn remediation_rounds(&self) -> usize {
-        self.remediation_rounds
-    }
 }
 
 /// 与桌面 UI tool loop 相同的自动重试语义：契约 retry_safe + 可恢复错误白名单 +
@@ -1479,41 +1460,36 @@ mod tests {
 
     #[test]
     fn acceptance_gate_requires_post_mutation_verification() {
-        let mut gate = KernelAcceptanceGate::new("修改 src/a.rs 并验证", 2);
+        let mut gate = KernelAcceptanceGate::new("修改 src/a.rs 并验证");
         gate.record(KernelToolEvidence {
             tool: "write_file".into(),
             arguments: r#"{"path":"src/a.rs","content":"fixed"}"#.into(),
             output: "written".into(),
             succeeded: true,
         });
-        assert!(matches!(
-            gate.request_stop(),
-            KernelStopDecision::Remediate { round: 1, .. }
-        ));
+        assert!(!gate.report().passed);
         gate.record(KernelToolEvidence {
             tool: "read_file".into(),
             arguments: r#"{"path":"src/a.rs"}"#.into(),
             output: "fixed".into(),
             succeeded: true,
         });
-        assert!(matches!(
-            gate.request_stop(),
-            KernelStopDecision::Accepted(_)
-        ));
+        assert!(gate.report().passed);
     }
 
     #[test]
-    fn acceptance_gate_exhaustion_is_bounded() {
-        let mut gate = KernelAcceptanceGate::new("修改 a.rs", 1);
+    fn stop_candidate_exhaustion_is_bounded() {
+        let gate = KernelAcceptanceGate::new("修改 a.rs");
+        let mut remediation_rounds = 0;
         assert!(matches!(
-            gate.request_stop(),
+            decide_stop_candidate(gate.report(), &mut remediation_rounds, 1),
             KernelStopDecision::Remediate { round: 1, .. }
         ));
         assert!(matches!(
-            gate.request_stop(),
+            decide_stop_candidate(gate.report(), &mut remediation_rounds, 1),
             KernelStopDecision::Exhausted(_)
         ));
-        assert_eq!(gate.remediation_rounds(), 1);
+        assert_eq!(remediation_rounds, 1);
     }
 
     #[test]

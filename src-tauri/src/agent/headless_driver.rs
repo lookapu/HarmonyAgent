@@ -525,8 +525,7 @@ impl HeadlessAgentDriver {
         let mut sink =
             SessionTrajectorySink::from_db(&runtime.db, conversation_id, trace_id.to_string())
                 .map_err(AgentDriverError::Failed)?;
-        let mut acceptance =
-            KernelAcceptanceGate::new(&task.problem_statement, MAX_REMEDIATION_ROUNDS);
+        let mut acceptance = KernelAcceptanceGate::new(&task.problem_statement);
         let system = format!(
             "你是 HarmonyAgent 的 headless eval agent。只使用提供的工具修改当前工作区；完成修改后必须验证。不要执行工作区外操作。\n\n{}",
             acceptance.directive()
