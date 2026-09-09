@@ -4219,8 +4219,6 @@ async fn stream_chat_inner(
     // 任务收尾复核计数：模型主动收尾但本任务执行过工具时注入“任务是否真完成”确认，
     // 未确认则继续执行（长任务防提前收尾）；达上限仍未确认则收尾并提示用户
     let mut completion_reviews: usize = 0;
-    // 自动补救轮：强验收失败不立刻退出，而是把缺失证据作为下一轮硬约束重新交给模型。
-    let mut remediation_rounds: usize = 0;
     // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）；
     // 时长可在设置页动态调整（0/-1 表示不限制）
     let task_deadline_ms = crate::services::agent_limits::current()
@@ -6105,9 +6103,8 @@ async fn stream_chat_inner(
                 report,
                 prompt,
                 round,
-            } = crate::agent::agent_kernel::decide_stop_candidate(
+            } = kernel_executor.decide_stop(
                 report,
-                &mut remediation_rounds,
                 execution_budget.remediation_rounds,
             ) {
                 correction_text = crate::agent::tools::strip_tool_calls(&text);
@@ -6231,7 +6228,7 @@ async fn stream_chat_inner(
         );
         let quality = crate::agent::governance::RunQualitySnapshot::calculate(
             &acceptance,
-            remediation_rounds,
+            kernel_executor.remediation_rounds(),
             recovery_plan.is_some(),
             exhausted,
         );

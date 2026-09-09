@@ -3,7 +3,10 @@
 //! 本层仍保持纯状态、无 IO：adapter 负责 Provider、数据库、事件和工具执行；这里统一持有
 //! 单轮路由、工具循环治理与唯一终止原因，避免三套跨轮状态在不同 adapter 中独立装配。
 
-use crate::agent::agent_kernel::{KernelRunState, KernelRunTermination};
+use crate::agent::acceptance::AcceptanceReport;
+use crate::agent::agent_kernel::{
+    decide_stop_candidate, KernelRunState, KernelRunTermination, KernelStopDecision,
+};
 use crate::agent::kernel_loop::{
     KernelLoopGovernor, KernelLoopVerdict, KernelRoundDecision, KernelRoundInput,
     KernelRoundCounters, KernelRoundRouter,
@@ -27,6 +30,7 @@ pub enum KernelToolAttemptPermit {
 pub struct KernelExecutorSnapshot {
     pub steps: u64,
     pub tool_attempts: u64,
+    pub remediation_rounds: usize,
     pub loop_breaks: usize,
     pub round_counters: KernelRoundCounters,
     pub termination_reason: String,
@@ -40,6 +44,7 @@ pub struct KernelExecutorState {
     run: KernelRunState,
     completed_rounds: u64,
     tool_attempts: u64,
+    remediation_rounds: usize,
 }
 
 impl KernelExecutorState {
@@ -109,6 +114,22 @@ impl KernelExecutorState {
         self.tool_attempts
     }
 
+    pub fn decide_stop(
+        &mut self,
+        report: AcceptanceReport,
+        max_remediation_rounds: usize,
+    ) -> KernelStopDecision {
+        decide_stop_candidate(
+            report,
+            &mut self.remediation_rounds,
+            max_remediation_rounds,
+        )
+    }
+
+    pub fn remediation_rounds(&self) -> usize {
+        self.remediation_rounds
+    }
+
     pub fn loop_breaks(&self) -> usize {
         self.tools.loop_breaks()
     }
@@ -136,6 +157,7 @@ impl KernelExecutorState {
         Ok(KernelExecutorSnapshot {
             steps: self.completed_rounds,
             tool_attempts: self.tool_attempts,
+            remediation_rounds: self.remediation_rounds,
             loop_breaks: self.loop_breaks(),
             round_counters: self.round_counters(),
             termination_reason: termination.as_str().to_string(),
@@ -297,5 +319,23 @@ mod tests {
             .finish_and_snapshot(2)
             .expect_err("未终止且未跑满时必须失败关闭");
         assert!(error.contains("尚未终止"));
+    }
+
+    #[test]
+    fn executor_owns_bounded_stop_remediation_count() {
+        let mut executor = KernelExecutorState::new();
+        let report = crate::agent::acceptance::evaluate_contract(
+            &crate::agent::acceptance::GoalContract::compile("修改 a.rs"),
+            &[],
+        );
+        assert!(matches!(
+            executor.decide_stop(report.clone(), 1),
+            KernelStopDecision::Remediate { round: 1, .. }
+        ));
+        assert!(matches!(
+            executor.decide_stop(report, 1),
+            KernelStopDecision::Exhausted(_)
+        ));
+        assert_eq!(executor.remediation_rounds(), 1);
     }
 }

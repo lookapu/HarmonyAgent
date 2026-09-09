@@ -703,7 +703,7 @@ impl HeadlessAgentDriver {
             }
 
             if turn.is_stop_candidate() {
-                match acceptance.request_stop() {
+                match kernel_executor.decide_stop(acceptance.report(), MAX_REMEDIATION_ROUNDS) {
                     KernelStopDecision::Accepted(report) => {
                         kernel_executor.terminate(KernelRunTermination::ModelAccepted);
                         sink.append(
@@ -739,7 +739,7 @@ impl HeadlessAgentDriver {
                             serde_json::to_value(&report)
                                 .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
                             "agent_acceptance_exhausted",
-                            json!({"blockers":report.blockers,"remediation_rounds":acceptance.remediation_rounds()}),
+                            json!({"blockers":report.blockers,"remediation_rounds":kernel_executor.remediation_rounds()}),
                         )
                         .map_err(AgentDriverError::Failed)?;
                         break;
@@ -933,7 +933,7 @@ impl HeadlessAgentDriver {
                 "passed":acceptance_report.passed,
                 "blockers":acceptance_report.blockers,
                 "evidence_count":acceptance_report.evidence_count,
-                "remediation_rounds":acceptance.remediation_rounds(),
+                "remediation_rounds":kernel_executor.remediation_rounds(),
             }),
         )
         .map_err(AgentDriverError::Failed)?;
@@ -1331,6 +1331,12 @@ mod tests {
             .expect("最终验收必须进入 trajectory");
         assert_eq!(final_acceptance.fields["passed"], true);
         assert_eq!(final_acceptance.fields["remediation_rounds"], 1);
+        let finished = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "driver_finished")
+            .expect("executor 快照必须进入最终事件");
+        assert_eq!(finished.fields["remediation_rounds"], 1);
         std::fs::remove_dir_all(workspace).ok();
     }
 

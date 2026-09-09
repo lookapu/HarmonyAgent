@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—O 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—P 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -497,6 +497,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | M | executor 回合/工具尝试记账（固定工具硬上限裁决入核，UI 保留动态预算） | ✅ COMPLETED |
 | N | 统一 executor 最终快照（具名 round counters + 桌面/headless 同结构审计） | ✅ COMPLETED |
 | O | 最终快照失败关闭（终止原因必填，未终止/未跑满禁止伪造 final snapshot） | ✅ COMPLETED |
+| P | 停止验收补救状态入核（UI/headless 共用 `decide_stop` 与 remediation 计数） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -513,7 +514,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - Provider 回合数与全部模型工具调用尝试（包括策略拒绝前的尝试）由 `KernelExecutorState` 饱和计数；headless 固定 `max_tool_calls` 通过 `permit_tool_attempt` 原子完成“计数 + 裁决 + 终止归因”，UI 复用计数并保留动态扩容策略
 - `KernelExecutorSnapshot` 统一输出 steps/tool attempts/loop breaks/具名 round counters/termination/taxonomy；headless 写入 `driver_finished`，桌面写入 Durable Run 的 `run.executor_snapshot`，不再依赖匿名计数元组或 adapter 私有审计字段
 - 最终快照不再允许空终止原因：固定轮数路径用 `finish_and_snapshot` 完成自然耗尽归因，无固定轮数路径用 `terminate_and_snapshot` 提供回退原因；尚未终止且未跑满时失败关闭，避免 trajectory/Durable Run 出现伪 final
-- Rust lib 共 932 项：924 通过、8 项按环境条件忽略；前端 113 项通过
+- 停止申请的有界补救状态进入 `KernelExecutorState`：UI/headless 都通过 `decide_stop` 推进，同一快照记录 `remediation_rounds`，不再由 UI 局部变量与 headless acceptance gate 各自计数
+- Rust lib 共 933 项：925 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -564,7 +566,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—O 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—P 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
