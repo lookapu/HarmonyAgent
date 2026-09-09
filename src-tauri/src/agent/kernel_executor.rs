@@ -70,7 +70,7 @@ impl KernelExecutorState {
         decision
     }
 
-    pub fn completed_rounds(&self) -> u64 {
+    fn completed_rounds(&self) -> u64 {
         self.completed_rounds
     }
 
@@ -145,7 +145,7 @@ impl KernelExecutorState {
         }
     }
 
-    pub fn tool_attempts(&self) -> u64 {
+    fn tool_attempts(&self) -> u64 {
         self.tool_attempts
     }
 
@@ -230,15 +230,15 @@ impl KernelExecutorState {
         self.rounds.counters()
     }
 
-    pub fn terminate(&mut self, reason: KernelRunTermination) {
+    fn terminate(&mut self, reason: KernelRunTermination) {
         self.run.terminate(reason);
     }
 
-    pub fn finish(&mut self, round_limit: u64) -> Option<KernelRunTermination> {
+    fn finish(&mut self, round_limit: u64) -> Option<KernelRunTermination> {
         self.run.finish(self.completed_rounds, round_limit)
     }
 
-    pub fn termination(&self) -> Option<KernelRunTermination> {
+    fn termination(&self) -> Option<KernelRunTermination> {
         self.run.termination()
     }
 
@@ -267,7 +267,7 @@ impl KernelExecutorState {
     }
 
     /// 由 adapter 提供无固定 round limit 时的最终回退原因；已存在的首个原因不会被覆盖。
-    pub fn terminate_and_snapshot(
+    fn terminate_and_snapshot(
         &mut self,
         fallback: KernelRunTermination,
     ) -> KernelExecutorSnapshot {

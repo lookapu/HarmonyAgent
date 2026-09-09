@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AA 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—AB 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -509,6 +509,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | Y | 桌面完成复核精确归因（验收通过但未确认完成不再误记为 model accepted） | ✅ COMPLETED |
 | Z | 回合上限入核（headless 删除外层 `for` 隐式上限，由 `begin_round` 原子裁决） | ✅ COMPLETED |
 | AA | 成本预算终态入核（成本超限与首因保持由 executor 原子裁决） | ✅ COMPLETED |
+| AB | executor 写入口封闭（终态、自然结束和内部计数不再向 adapter 暴露） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -534,6 +535,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - 桌面最终状态由 `finalize_acceptance_snapshot` 统一组合治理耗尽、证据验收与完成确认；证据通过但多轮完成复核仍未确认时归为 `completion_review_exhausted`，任务 UI 与 executor 审计不再互相矛盾
 - headless 不再用外层 `for 0..round_limit` 隐式控制步数，改由 `begin_round(Some(limit))` 在下一次 Provider 调用前原子锁定 `max_steps_exceeded`；deadline/cancel 与回合上限的优先级及最终快照均由 executor 单点负责
 - headless 成本账本结果统一经过 `observe_cost_budget`：超限时由 executor 锁定 `max_cost_exceeded`，已有更早终态时保持首因；两个生产 adapter 不再直接调用 `kernel_executor.terminate(...)`
+- executor 的 `terminate`、`finish`、`termination`、fallback snapshot 与内部计数查询已收为私有；生产 adapter 只能经过回合、工具、预算、验收和最终快照等受控入口推进状态，防止后续重新引入手工终止双写
 - Rust lib 共 942 项：934 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
@@ -585,7 +587,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AA 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AB 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
