@@ -556,8 +556,8 @@ impl HeadlessAgentDriver {
         
         'rounds: for _ in 0..round_limit {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
-            let remaining = match kernel_executor.permit_run(false, started.elapsed(), wall_time) {
-                KernelRunPermit::Proceed { remaining } => remaining,
+            let (round, remaining) = match kernel_executor.begin_round(false, started.elapsed(), wall_time) {
+                KernelRunPermit::Proceed { round, remaining } => (round, remaining),
                 KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded) => {
                     return Err(AgentDriverError::Cancelled(
                         "builtin driver 超过 wall time".into(),
@@ -570,9 +570,7 @@ impl HeadlessAgentDriver {
                     )));
                 }
             };
-            outcome.steps = kernel_executor.start_round().map_err(|reason| {
-                AgentDriverError::Cancelled(format!("builtin driver 已停止：{}", reason.as_str()))
-            })?;
+            outcome.steps = round;
             let request_timeout = self
                 .request_timeout
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT)

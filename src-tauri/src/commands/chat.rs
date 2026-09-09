@@ -4305,7 +4305,7 @@ async fn stream_chat_inner(
             workflow_stage = Some(workflow.stage);
         }
         // Provider 请求前共用安全点：统一 deadline/cancel 优先级与剩余时间语义。
-        let run_permit = kernel_executor.permit_run(
+        let run_permit = kernel_executor.begin_round(
             is_cancelled(cancel, &conversation_id),
             task_started.elapsed(),
             std::time::Duration::from_millis(task_deadline_ms.max(0) as u64),
@@ -4432,9 +4432,6 @@ async fn stream_chat_inner(
         // 任意已锁定终态都不得穿过 Provider 边界；正常分支会在产生终态的当轮退出，
         // 此处是防御性吸收态兜底，保留 executor 中的首个精确原因供最终快照审计。
         if matches!(run_permit, KernelRunPermit::Halt(_)) {
-            break;
-        }
-        if kernel_executor.start_round().is_err() {
             break;
         }
         // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
