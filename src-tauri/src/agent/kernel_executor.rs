@@ -32,6 +32,18 @@ pub enum KernelToolAttemptDecision {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelExecutorFinalization {
+    FixedRounds {
+        round_limit: u64,
+    },
+    Acceptance {
+        governance_exhausted: bool,
+        acceptance_passed: bool,
+        completion_confirmed: bool,
+    },
+}
+
 /// 跨 adapter 稳定的 executor 最终快照，可直接写入桌面 run event 或 headless trajectory。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct KernelExecutorSnapshot {
@@ -257,43 +269,34 @@ impl KernelExecutorState {
         })
     }
 
-    /// 有固定 round limit 的 executor：先完成自然耗尽归因，再生成非空终止快照。
-    pub fn finish_and_snapshot(
+    /// executor 的唯一公共最终化入口。固定回合模式完成自然耗尽归因；桌面验收模式
+    /// 组合治理、证据与完成确认。两种模式都要求非空终止原因并保持首因。
+    pub fn finalize(
         &mut self,
-        round_limit: u64,
+        mode: KernelExecutorFinalization,
     ) -> Result<KernelExecutorSnapshot, String> {
-        self.finish(round_limit);
+        match mode {
+            KernelExecutorFinalization::FixedRounds { round_limit } => {
+                self.finish(round_limit);
+            }
+            KernelExecutorFinalization::Acceptance {
+                governance_exhausted,
+                acceptance_passed,
+                completion_confirmed,
+            } => {
+                let fallback = if governance_exhausted {
+                    KernelRunTermination::GovernanceExhausted
+                } else if !acceptance_passed {
+                    KernelRunTermination::AcceptanceExhausted
+                } else if completion_confirmed {
+                    KernelRunTermination::ModelAccepted
+                } else {
+                    KernelRunTermination::CompletionReviewExhausted
+                };
+                self.terminate(fallback);
+            }
+        }
         self.final_snapshot()
-    }
-
-    /// 由 adapter 提供无固定 round limit 时的最终回退原因；已存在的首个原因不会被覆盖。
-    fn terminate_and_snapshot(
-        &mut self,
-        fallback: KernelRunTermination,
-    ) -> KernelExecutorSnapshot {
-        self.terminate(fallback);
-        self.final_snapshot()
-            .expect("terminate 后必须能够生成 executor 最终快照")
-    }
-
-    /// 桌面二阶段验收的最终归因：证据通过但完成复核未确认，不能记为 model accepted。
-    /// 已存在的更具体终止原因仍由 `KernelRunState` 首因规则保留。
-    pub fn finalize_acceptance_snapshot(
-        &mut self,
-        governance_exhausted: bool,
-        acceptance_passed: bool,
-        completion_confirmed: bool,
-    ) -> KernelExecutorSnapshot {
-        let fallback = if governance_exhausted {
-            KernelRunTermination::GovernanceExhausted
-        } else if !acceptance_passed {
-            KernelRunTermination::AcceptanceExhausted
-        } else if completion_confirmed {
-            KernelRunTermination::ModelAccepted
-        } else {
-            KernelRunTermination::CompletionReviewExhausted
-        };
-        self.terminate_and_snapshot(fallback)
     }
 }
 
@@ -448,7 +451,7 @@ mod tests {
             Some(KernelRunTermination::ToolCallBudgetExceeded)
         );
         let snapshot = executor
-            .finish_and_snapshot(10)
+            .finalize(KernelExecutorFinalization::FixedRounds { round_limit: 10 })
             .expect("已终止 executor 应生成最终快照");
         assert_eq!(snapshot.tool_attempts, 3);
         assert_eq!(snapshot.termination_reason, "max_tool_calls_exceeded");
@@ -469,7 +472,7 @@ mod tests {
             KernelRunPermit::Proceed { .. }
         ));
         let error = executor
-            .finish_and_snapshot(2)
+            .finalize(KernelExecutorFinalization::FixedRounds { round_limit: 2 })
             .expect_err("未终止且未跑满时必须失败关闭");
         assert!(error.contains("尚未终止"));
     }
@@ -623,7 +626,13 @@ mod tests {
     #[test]
     fn executor_does_not_mark_unconfirmed_completion_as_accepted() {
         let mut unconfirmed = KernelExecutorState::new();
-        let snapshot = unconfirmed.finalize_acceptance_snapshot(false, true, false);
+        let snapshot = unconfirmed
+            .finalize(KernelExecutorFinalization::Acceptance {
+                governance_exhausted: false,
+                acceptance_passed: true,
+                completion_confirmed: false,
+            })
+            .unwrap();
         assert_eq!(snapshot.termination_reason, "completion_review_exhausted");
         assert_eq!(
             snapshot.failure_taxonomy.as_deref(),
@@ -633,7 +642,12 @@ mod tests {
         let mut accepted = KernelExecutorState::new();
         assert_eq!(
             accepted
-                .finalize_acceptance_snapshot(false, true, true)
+                .finalize(KernelExecutorFinalization::Acceptance {
+                    governance_exhausted: false,
+                    acceptance_passed: true,
+                    completion_confirmed: true,
+                })
+                .unwrap()
                 .termination_reason,
             "model_accepted"
         );

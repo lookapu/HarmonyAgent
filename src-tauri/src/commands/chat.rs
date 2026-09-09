@@ -21,7 +21,9 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
     run_tool_with_retry, retry_notice,
 };
-use crate::agent::kernel_executor::{KernelExecutorState, KernelRunPermit};
+use crate::agent::kernel_executor::{
+    KernelExecutorFinalization, KernelExecutorState, KernelRunPermit,
+};
 use crate::agent::kernel_loop::KernelRoundInput;
 use crate::agent::kernel_history::{KernelHistoryAssembler, KernelHistoryInput, HistoryRow, ToolResult, UserInjection};
 use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
@@ -6211,11 +6213,11 @@ async fn stream_chat_inner(
     let completion_confirmed =
         is_completion_confirmation(&last_model_text) || tool_runs.is_empty();
     let executor_snapshot = serde_json::to_value(
-        kernel_executor.finalize_acceptance_snapshot(
-            exhausted,
-            acceptance.passed,
+        kernel_executor.finalize(KernelExecutorFinalization::Acceptance {
+            governance_exhausted: exhausted,
+            acceptance_passed: acceptance.passed,
             completion_confirmed,
-        ),
+        })?,
     )
     .unwrap_or_default();
     if let Ok(conn) = state.0.lock() {

@@ -12,7 +12,7 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
 use crate::agent::kernel_executor::{
-    KernelExecutorState, KernelRunPermit, KernelToolAttemptDecision,
+    KernelExecutorFinalization, KernelExecutorState, KernelRunPermit, KernelToolAttemptDecision,
 };
 use crate::agent::kernel_loop::{KernelRoundControl, KernelRoundInput};
 use crate::agent::kernel_history::continuation_instruction;
@@ -918,7 +918,9 @@ impl HeadlessAgentDriver {
             }
         }
         let executor_snapshot = kernel_executor
-            .finish_and_snapshot(round_limit as u64)
+            .finalize(KernelExecutorFinalization::FixedRounds {
+                round_limit: round_limit as u64,
+            })
             .map_err(AgentDriverError::Failed)?;
         if let Some(taxonomy) = &executor_snapshot.failure_taxonomy {
             outcome.failure_taxonomy.push(taxonomy.clone());
