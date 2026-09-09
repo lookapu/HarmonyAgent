@@ -6207,15 +6207,14 @@ async fn stream_chat_inner(
     let acceptance = state.0.lock().ok()
         .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &acceptance_evidence).ok())
         .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &acceptance_evidence));
-    let fallback_termination = if exhausted {
-        crate::agent::agent_kernel::KernelRunTermination::GovernanceExhausted
-    } else if acceptance.passed {
-        crate::agent::agent_kernel::KernelRunTermination::ModelAccepted
-    } else {
-        crate::agent::agent_kernel::KernelRunTermination::AcceptanceExhausted
-    };
+    let completion_confirmed =
+        is_completion_confirmation(&last_model_text) || tool_runs.is_empty();
     let executor_snapshot = serde_json::to_value(
-        kernel_executor.terminate_and_snapshot(fallback_termination),
+        kernel_executor.finalize_acceptance_snapshot(
+            exhausted,
+            acceptance.passed,
+            completion_confirmed,
+        ),
     )
     .unwrap_or_default();
     if let Ok(conn) = state.0.lock() {
@@ -6261,9 +6260,7 @@ async fn stream_chat_inner(
             acceptance.blockers.join("、")
         ));
     }
-    let task_done = !exhausted
-        && acceptance.passed
-        && (is_completion_confirmation(&last_model_text) || tool_runs.is_empty());
+    let task_done = !exhausted && acceptance.passed && completion_confirmed;
     stats.unfinished = !task_done;
     persist_turn(
         state,

@@ -951,6 +951,7 @@ pub enum KernelRunTermination {
     GovernanceExhausted,
     CostBudgetExceeded,
     AcceptanceExhausted,
+    CompletionReviewExhausted,
     EmptyRoundsExhausted,
     ToolCallBudgetExceeded,
     ToolLoopExhausted,
@@ -966,6 +967,7 @@ impl KernelRunTermination {
             Self::GovernanceExhausted => "governance_exhausted",
             Self::CostBudgetExceeded => "max_cost_exceeded",
             Self::AcceptanceExhausted => "acceptance_exhausted",
+            Self::CompletionReviewExhausted => "completion_review_exhausted",
             Self::EmptyRoundsExhausted => "empty_rounds_exhausted",
             Self::ToolCallBudgetExceeded => "max_tool_calls_exceeded",
             Self::ToolLoopExhausted => "tool_loop_exhausted",
@@ -981,6 +983,7 @@ impl KernelRunTermination {
             Self::GovernanceExhausted => Some("governance_exhausted"),
             Self::CostBudgetExceeded => Some("max_cost_exceeded"),
             Self::AcceptanceExhausted => Some("acceptance_failed"),
+            Self::CompletionReviewExhausted => Some("completion_review_exhausted"),
             Self::EmptyRoundsExhausted => Some("empty_rounds_exhausted"),
             Self::ToolCallBudgetExceeded => Some("max_tool_calls_exceeded"),
             Self::ToolLoopExhausted => Some("tool_loop_exhausted"),
@@ -1536,6 +1539,7 @@ mod tests {
             KernelRunTermination::GovernanceExhausted,
             KernelRunTermination::CostBudgetExceeded,
             KernelRunTermination::AcceptanceExhausted,
+            KernelRunTermination::CompletionReviewExhausted,
             KernelRunTermination::EmptyRoundsExhausted,
             KernelRunTermination::ToolCallBudgetExceeded,
             KernelRunTermination::ToolLoopExhausted,
@@ -1545,6 +1549,7 @@ mod tests {
         let unique = names.into_iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), reasons.len());
         assert!(unique.contains("governance_exhausted"));
+        assert!(unique.contains("completion_review_exhausted"));
     }
 
     fn stream_governor() -> KernelStreamGovernor {

@@ -254,6 +254,26 @@ impl KernelExecutorState {
         self.final_snapshot()
             .expect("terminate 后必须能够生成 executor 最终快照")
     }
+
+    /// 桌面二阶段验收的最终归因：证据通过但完成复核未确认，不能记为 model accepted。
+    /// 已存在的更具体终止原因仍由 `KernelRunState` 首因规则保留。
+    pub fn finalize_acceptance_snapshot(
+        &mut self,
+        governance_exhausted: bool,
+        acceptance_passed: bool,
+        completion_confirmed: bool,
+    ) -> KernelExecutorSnapshot {
+        let fallback = if governance_exhausted {
+            KernelRunTermination::GovernanceExhausted
+        } else if !acceptance_passed {
+            KernelRunTermination::AcceptanceExhausted
+        } else if completion_confirmed {
+            KernelRunTermination::ModelAccepted
+        } else {
+            KernelRunTermination::CompletionReviewExhausted
+        };
+        self.terminate_and_snapshot(fallback)
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +576,25 @@ mod tests {
         assert_eq!(
             executor.termination(),
             Some(KernelRunTermination::ToolCallBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn executor_does_not_mark_unconfirmed_completion_as_accepted() {
+        let mut unconfirmed = KernelExecutorState::new();
+        let snapshot = unconfirmed.finalize_acceptance_snapshot(false, true, false);
+        assert_eq!(snapshot.termination_reason, "completion_review_exhausted");
+        assert_eq!(
+            snapshot.failure_taxonomy.as_deref(),
+            Some("completion_review_exhausted")
+        );
+
+        let mut accepted = KernelExecutorState::new();
+        assert_eq!(
+            accepted
+                .finalize_acceptance_snapshot(false, true, true)
+                .termination_reason,
+            "model_accepted"
         );
     }
 }

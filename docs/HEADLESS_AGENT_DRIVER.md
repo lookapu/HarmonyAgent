@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—X 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—Y 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -506,6 +506,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | V | 原子工具尝试入口（固定/动态预算共用计数入口，终态后不再增加尝试） | ✅ COMPLETED |
 | W | 工具尝试统一裁决（计数、固定预算与循环观察合并，策略拒绝也不能绕过循环治理） | ✅ COMPLETED |
 | X | 动态工具预算归因入核（扩容保留，最终 Halt 精确归因为工具预算耗尽） | ✅ COMPLETED |
+| Y | 桌面完成复核精确归因（验收通过但未确认完成不再误记为 model accepted） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -528,7 +529,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - executor 终态成为 Provider 边界的吸收态：`begin_round` 优先返回已经锁定的首因；安全裁决、回合计数与剩余墙钟预算已合并为一次原子操作，UI 对任意终态执行防御性退出，不会意外发起下一轮请求
 - 无后置复核门的 headless 使用 `decide_terminal_stop`，Accepted/Exhausted 的决策与精确终止归因不可分离；桌面 UI 继续使用预验收 `decide_stop`，保留 ship 声明审计与完成复核语义
 - 桌面动态工具预算通过 executor 的 `decide_dynamic_tool_budget` 裁决，直接复用内部 loop-break 真源；有验证进展时仍可扩容，最终 Halt 原子锁定 `max_tool_calls_exceeded`，不再降级为笼统 governance 归因
-- Rust lib 共 939 项：931 通过、8 项按环境条件忽略；前端 113 项通过
+- 桌面最终状态由 `finalize_acceptance_snapshot` 统一组合治理耗尽、证据验收与完成确认；证据通过但多轮完成复核仍未确认时归为 `completion_review_exhausted`，任务 UI 与 executor 审计不再互相矛盾
+- Rust lib 共 940 项：932 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -579,7 +581,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—X 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—Y 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
