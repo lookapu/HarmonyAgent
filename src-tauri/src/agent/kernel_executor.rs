@@ -13,6 +13,8 @@ use crate::agent::kernel_loop::{
 };
 use std::time::Duration;
 
+pub const KERNEL_EXECUTOR_SNAPSHOT_VERSION: u32 = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelRunPermit {
     Proceed { round: u64, remaining: Duration },
@@ -64,6 +66,7 @@ impl Default for KernelExecutorLimits {
 /// 跨 adapter 稳定的 executor 最终快照，可直接写入桌面 run event 或 headless trajectory。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct KernelExecutorSnapshot {
+    pub schema_version: u32,
     pub limits: KernelExecutorLimits,
     pub steps: u64,
     pub tool_attempts: u64,
@@ -290,6 +293,7 @@ impl KernelExecutorState {
             .termination()
             .ok_or_else(|| "executor 尚未终止，禁止生成最终快照".to_string())?;
         Ok(KernelExecutorSnapshot {
+            schema_version: KERNEL_EXECUTOR_SNAPSHOT_VERSION,
             limits: self.limits,
             steps: self.completed_rounds,
             tool_attempts: self.tool_attempts,
@@ -489,6 +493,7 @@ mod tests {
             Some("max_tool_calls_exceeded")
         );
         let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["schema_version"], KERNEL_EXECUTOR_SNAPSHOT_VERSION);
         assert_eq!(json["limits"]["wall_time_ms"], u64::MAX);
         assert_eq!(json["limits"]["round_limit"], 10);
         assert_eq!(json["limits"]["tool_attempt_limit"], 2);
