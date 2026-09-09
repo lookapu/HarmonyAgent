@@ -19,9 +19,12 @@ pub enum KernelRunPermit {
     Halt(KernelRunTermination),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KernelToolAttemptPermit {
-    Proceed { attempt: u64 },
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KernelToolAttemptDecision {
+    Observed {
+        attempt: u64,
+        verdict: KernelLoopVerdict,
+    },
     Halt {
         reason: KernelRunTermination,
         attempted: u64,
@@ -97,25 +100,17 @@ impl KernelExecutorState {
         }
     }
 
-    pub fn observe_tool(&mut self, tool: &str, args: &str) -> KernelLoopVerdict {
-        let verdict = self.tools.observe(tool, args);
-        if matches!(
-            verdict,
-            KernelLoopVerdict::Halt {
-                final_halt: true,
-                ..
-            }
-        ) {
-            self.terminate(KernelRunTermination::ToolLoopExhausted);
-        }
-        verdict
-    }
-
-    /// 工具执行前的原子入口。`Some(limit)` 用于固定硬上限，`None` 用于 adapter 的
-    /// 动态预算门；两者都在终态时拒绝继续计数或执行。
-    pub fn begin_tool_attempt(&mut self, limit: Option<u64>) -> KernelToolAttemptPermit {
+    /// 工具执行前的原子入口。先计入模型产生的尝试，再执行固定预算裁决与循环观察；
+    /// `Some(limit)` 用于固定硬上限，`None` 用于 adapter 的动态预算门。
+    /// 权限拒绝前也必须调用，使重复的非法尝试无法绕过循环治理。
+    pub fn begin_tool_attempt(
+        &mut self,
+        tool: &str,
+        args: &str,
+        limit: Option<u64>,
+    ) -> KernelToolAttemptDecision {
         if let Some(reason) = self.termination() {
-            return KernelToolAttemptPermit::Halt {
+            return KernelToolAttemptDecision::Halt {
                 reason,
                 attempted: self.tool_attempts,
                 limit,
@@ -125,13 +120,23 @@ impl KernelExecutorState {
         let attempted = self.tool_attempts;
         if limit.is_some_and(|value| attempted > value) {
             self.terminate(KernelRunTermination::ToolCallBudgetExceeded);
-            KernelToolAttemptPermit::Halt {
+            KernelToolAttemptDecision::Halt {
                 reason: KernelRunTermination::ToolCallBudgetExceeded,
                 attempted,
                 limit,
             }
         } else {
-            KernelToolAttemptPermit::Proceed { attempt: attempted }
+            let verdict = self.tools.observe(tool, args);
+            if matches!(
+                verdict,
+                KernelLoopVerdict::Halt {
+                    final_halt: true,
+                    ..
+                }
+            ) {
+                self.terminate(KernelRunTermination::ToolLoopExhausted);
+            }
+            KernelToolAttemptDecision::Observed { attempt: attempted, verdict }
         }
     }
 
@@ -231,6 +236,15 @@ mod tests {
     use super::*;
     use crate::agent::kernel_loop::{KernelRoundControl, KERNEL_TOOL_CALL_LOOP_THRESHOLD};
 
+    fn observe(executor: &mut KernelExecutorState, tool: &str, args: &str) -> KernelLoopVerdict {
+        match executor.begin_tool_attempt(tool, args, None) {
+            KernelToolAttemptDecision::Observed { verdict, .. } => verdict,
+            KernelToolAttemptDecision::Halt { reason, .. } => {
+                panic!("工具观察被意外终止：{}", reason.as_str())
+            }
+        }
+    }
+
     #[test]
     fn executor_owns_round_and_tool_state_across_calls() {
         let mut executor = KernelExecutorState::new();
@@ -250,17 +264,18 @@ mod tests {
             KernelRoundControl::StopEmpty { .. }
         ));
 
+        let mut tools = KernelExecutorState::new();
         for _ in 0..KERNEL_TOOL_CALL_LOOP_THRESHOLD - 1 {
             assert_eq!(
-                executor.observe_tool("read_file", r#"{"path":"a.rs"}"#),
+                observe(&mut tools, "read_file", r#"{"path":"a.rs"}"#),
                 KernelLoopVerdict::Proceed
             );
         }
         assert!(matches!(
-            executor.observe_tool("read_file", r#"{"path":"a.rs"}"#),
+            observe(&mut tools, "read_file", r#"{"path":"a.rs"}"#),
             KernelLoopVerdict::Halt { .. }
         ));
-        assert_eq!(executor.loop_breaks(), 1);
+        assert_eq!(tools.loop_breaks(), 1);
     }
 
     #[test]
@@ -325,16 +340,22 @@ mod tests {
     fn executor_tool_attempt_budget_counts_rejected_attempt() {
         let mut executor = KernelExecutorState::new();
         assert_eq!(
-            executor.begin_tool_attempt(Some(2)),
-            KernelToolAttemptPermit::Proceed { attempt: 1 }
+            executor.begin_tool_attempt("read_file", r#"{"path":"1.rs"}"#, Some(2)),
+            KernelToolAttemptDecision::Observed {
+                attempt: 1,
+                verdict: KernelLoopVerdict::Proceed,
+            }
         );
         assert_eq!(
-            executor.begin_tool_attempt(Some(2)),
-            KernelToolAttemptPermit::Proceed { attempt: 2 }
+            executor.begin_tool_attempt("read_file", r#"{"path":"2.rs"}"#, Some(2)),
+            KernelToolAttemptDecision::Observed {
+                attempt: 2,
+                verdict: KernelLoopVerdict::Proceed,
+            }
         );
         assert_eq!(
-            executor.begin_tool_attempt(Some(2)),
-            KernelToolAttemptPermit::Halt {
+            executor.begin_tool_attempt("read_file", r#"{"path":"3.rs"}"#, Some(2)),
+            KernelToolAttemptDecision::Halt {
                 reason: KernelRunTermination::ToolCallBudgetExceeded,
                 attempted: 3,
                 limit: Some(2)
@@ -442,10 +463,10 @@ mod tests {
         for cycle in 0..=crate::agent::kernel_loop::KERNEL_MAX_LOOP_BREAKS {
             let path = format!(r#"{{"path":"{cycle}.rs"}}"#);
             for _ in 0..KERNEL_TOOL_CALL_LOOP_THRESHOLD {
-                tools.observe_tool("read_file", &path);
+                observe(&mut tools, "read_file", &path);
             }
             if cycle < crate::agent::kernel_loop::KERNEL_MAX_LOOP_BREAKS {
-                tools.observe_tool("write_file", r#"{"path":"reset.rs"}"#);
+                observe(&mut tools, "write_file", r#"{"path":"reset.rs"}"#);
             }
         }
         assert_eq!(
@@ -474,13 +495,16 @@ mod tests {
     fn executor_terminal_state_is_absorbing_at_tool_boundary() {
         let mut executor = KernelExecutorState::new();
         assert_eq!(
-            executor.begin_tool_attempt(None),
-            KernelToolAttemptPermit::Proceed { attempt: 1 }
+            executor.begin_tool_attempt("read_file", r#"{"path":"a.rs"}"#, None),
+            KernelToolAttemptDecision::Observed {
+                attempt: 1,
+                verdict: KernelLoopVerdict::Proceed,
+            }
         );
         executor.terminate(KernelRunTermination::UserCancelled);
         assert_eq!(
-            executor.begin_tool_attempt(None),
-            KernelToolAttemptPermit::Halt {
+            executor.begin_tool_attempt("read_file", r#"{"path":"b.rs"}"#, None),
+            KernelToolAttemptDecision::Halt {
                 reason: KernelRunTermination::UserCancelled,
                 attempted: 1,
                 limit: None,

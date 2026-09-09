@@ -12,7 +12,7 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
 use crate::agent::kernel_executor::{
-    KernelExecutorState, KernelRunPermit, KernelToolAttemptPermit,
+    KernelExecutorState, KernelRunPermit, KernelToolAttemptDecision,
 };
 use crate::agent::kernel_loop::{KernelRoundControl, KernelRoundInput};
 use crate::agent::kernel_history::continuation_instruction;
@@ -745,50 +745,38 @@ impl HeadlessAgentDriver {
                 }
             }
             for call in turn.tool_calls {
-                if let KernelToolAttemptPermit::Halt {
-                    reason,
-                    attempted,
-                    limit,
-                } = kernel_executor.begin_tool_attempt(Some(task.limits.max_tool_calls))
-                {
-                    sink.append(
-                        SessionEventType::SystemNote,
-                        json!({
-                            "reason":reason.as_str(),
-                            "attempted":attempted,
-                            "limit":limit,
-                        }),
-                        "agent_tool_budget_stop",
-                        json!({
-                            "reason":reason.as_str(),
-                            "attempted":attempted,
-                            "limit":limit,
-                        }),
-                    )
-                    .map_err(AgentDriverError::Failed)?;
-                    break 'rounds;
-                }
                 let id = call.id.as_str();
                 let name = call.name.as_str();
                 let args = call.arguments.as_str();
-                let contract = match runtime.policy.check(name, args) {
-                    Ok(contract) => contract,
-                    Err(reason) => {
-                        outcome.policy_violations += 1;
+                let verdict = match kernel_executor.begin_tool_attempt(
+                    name,
+                    args,
+                    Some(task.limits.max_tool_calls),
+                ) {
+                    KernelToolAttemptDecision::Observed { verdict, .. } => verdict,
+                    KernelToolAttemptDecision::Halt {
+                        reason,
+                        attempted,
+                        limit,
+                    } => {
                         sink.append(
-                            SessionEventType::ToolApproval,
-                            json!({"tool":name,"approved":false,"reason":reason}),
-                            "tool_rejected",
-                            json!({"name":name,"reason":reason}),
+                            SessionEventType::SystemNote,
+                            json!({
+                                "reason":reason.as_str(),
+                                "attempted":attempted,
+                                "limit":limit,
+                            }),
+                            "agent_tool_budget_stop",
+                            json!({
+                                "reason":reason.as_str(),
+                                "attempted":attempted,
+                                "limit":limit,
+                            }),
                         )
                         .map_err(AgentDriverError::Failed)?;
-                        messages.push(json!({"role":"tool","tool_call_id":id,"content":reason}));
-                        continue;
+                        break 'rounds;
                     }
                 };
-                
-                // Phase F：工具循环检测——在每次工具调用前观察，命中循环时注入纠正提示或直接收尾
-                let verdict = kernel_executor.observe_tool(name, args);
                 match verdict {
                     crate::agent::kernel_loop::KernelLoopVerdict::Proceed => {
                         // 继续执行工具
@@ -817,6 +805,21 @@ impl HeadlessAgentDriver {
                         }
                     }
                 }
+                let contract = match runtime.policy.check(name, args) {
+                    Ok(contract) => contract,
+                    Err(reason) => {
+                        outcome.policy_violations += 1;
+                        sink.append(
+                            SessionEventType::ToolApproval,
+                            json!({"tool":name,"approved":false,"reason":reason}),
+                            "tool_rejected",
+                            json!({"name":name,"reason":reason}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                        messages.push(json!({"role":"tool","tool_call_id":id,"content":reason}));
+                        continue;
+                    }
+                };
                 
                 sink.append(
                     SessionEventType::ToolApproval,
@@ -1384,6 +1387,47 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("未授权"));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn rejected_tool_attempts_still_trigger_loop_governance() {
+        let response = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": (0..5).map(|i| serde_json::json!({
+                        "id": format!("call-dangerous-{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": "{\"command\":\"true\"}"
+                        }
+                    })).collect::<Vec<_>>()
+                }
+            }]
+        });
+        let workspace = std::env::temp_dir().join(format!(
+            "harmony-headless-rejected-loop-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut task = offline_task();
+        task.limits.max_steps = 1;
+
+        let outcome = scripted_driver([response])
+            .run_async(&task, &workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.policy_violations, 4);
+        assert_eq!(outcome.tool_calls, 0);
+        assert!(outcome
+            .trajectory
+            .iter()
+            .any(|event| event.kind == "tool_loop_correction"));
         std::fs::remove_dir_all(workspace).ok();
     }
 

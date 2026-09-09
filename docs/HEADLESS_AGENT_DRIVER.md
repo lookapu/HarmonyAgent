@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—V 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—W 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -504,6 +504,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | T | 原子 Provider 回合入口（安全裁决、计数与剩余墙钟预算合并为 `begin_round`） | ✅ COMPLETED |
 | U | 终态验收原子归因（headless 的 Accepted/Exhausted 在停止裁决处直接锁定原因） | ✅ COMPLETED |
 | V | 原子工具尝试入口（固定/动态预算共用计数入口，终态后不再增加尝试） | ✅ COMPLETED |
+| W | 工具尝试统一裁决（计数、固定预算与循环观察合并，策略拒绝也不能绕过循环治理） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -517,7 +518,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - headless 外层循环不再维护多个 `stopped_by_*` 布尔值；成本、验收、空轮、工具预算、工具循环和步数耗尽由 `KernelRunState` 锁定唯一主终止原因，`driver_finished.termination_reason` 可直接审计。空轮恰好在最后一步耗尽时不会再误标 `max_steps_exceeded`
 - `KernelExecutorState` 成为两个 adapter 共同的跨轮状态所有者，集中装配 `KernelRoundRouter`、`KernelLoopGovernor` 与 `KernelRunState`；Provider/DB/事件/工具执行仍是端口，下一步迁移 IO 外循环
 - UI/headless 每次 Provider 请求前都经过 `begin_round`：deadline 优先于用户取消，终止原因进入同一 run state；通过时原子推进回合并返回轮号与剩余墙钟时间，headless 直接用剩余值裁剪单请求 timeout，避免两次读取 elapsed 造成预算漂移
-- Provider 回合数与全部模型工具调用尝试（包括策略拒绝前的尝试）由 `KernelExecutorState` 饱和计数；UI/headless 共用 `begin_tool_attempt`，headless 传固定 `max_tool_calls` 原子完成计数、裁决与终止归因，UI 传动态预算模式并保留扩容策略；已终止 executor 不再增加工具尝试
+- Provider 回合数与全部模型工具调用尝试（包括策略拒绝前的尝试）由 `KernelExecutorState` 饱和计数；UI/headless 共用 `begin_tool_attempt`，一次完成计数、固定预算裁决与循环观察，headless 传固定 `max_tool_calls`，UI 传动态预算模式并保留扩容策略；权限检查位于统一观察之后，重复的非法尝试同样会被熔断，已终止 executor 不再增加工具尝试
 - `KernelExecutorSnapshot` 统一输出 steps/tool attempts/loop breaks/具名 round counters/termination/taxonomy；headless 写入 `driver_finished`，桌面写入 Durable Run 的 `run.executor_snapshot`，不再依赖匿名计数元组或 adapter 私有审计字段
 - 最终快照不再允许空终止原因：固定轮数路径用 `finish_and_snapshot` 完成自然耗尽归因，无固定轮数路径用 `terminate_and_snapshot` 提供回退原因；尚未终止且未跑满时失败关闭，避免 trajectory/Durable Run 出现伪 final
 - 停止申请的有界补救状态进入 `KernelExecutorState`：UI/headless 都通过 `decide_stop` 推进，同一快照记录 `remediation_rounds`，不再由 UI 局部变量与 headless acceptance gate 各自计数
@@ -525,7 +526,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - executor 在产生 `StopEmpty` 或 final tool-loop halt 的同一处自动锁定精确终止原因；两个 adapter 不再补写，桌面快照也不会把这两类终态降级成笼统 governance 归因
 - executor 终态成为 Provider 边界的吸收态：`begin_round` 优先返回已经锁定的首因；安全裁决、回合计数与剩余墙钟预算已合并为一次原子操作，UI 对任意终态执行防御性退出，不会意外发起下一轮请求
 - 无后置复核门的 headless 使用 `decide_terminal_stop`，Accepted/Exhausted 的决策与精确终止归因不可分离；桌面 UI 继续使用预验收 `decide_stop`，保留 ship 声明审计与完成复核语义
-- Rust lib 共 937 项：929 通过、8 项按环境条件忽略；前端 113 项通过
+- Rust lib 共 938 项：930 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -576,7 +577,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—V 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—W 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
