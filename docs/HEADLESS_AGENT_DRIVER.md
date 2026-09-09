@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AN 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理、executor 状态与单调时钟所有者，单一 IO run-loop 的生产 adapter 迁移仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—AO 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理、executor 状态与单调时钟所有者，单一 IO run-loop 的生产 adapter 迁移仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -522,6 +522,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AL | headless 安全点持久化（下一 Provider 轮前与每个工具结果后写入 executor checkpoint 事件） | ✅ COMPLETED |
 | AM | checkpoint 恢复不变量（冻结预算与 router/governor 可达计数校验，篡改/损坏状态失败关闭） | ✅ COMPLETED |
 | AN | checkpoint 类型化读取（独立事件不污染消息投影，按 conversation/trace 精确选取最新安全点、复合索引加速并严格恢复） | ✅ COMPLETED |
+| AO | 端口可信 checkpoint clock（轮内工具安全点复用内核单调时钟，adapter 不能注入 elapsed） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -559,6 +560,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - loop governor 的重复调用键已改为长度定界的 SHA-256 指纹；循环语义不变，但 checkpoint 不再复制原始工具参数。headless 在下一 Provider 轮前及每个工具结果后把 checkpoint 同时写入 session event/trajectory，为后续自动恢复保留安全点
 - checkpoint 恢复会重新验证冻结的 round/tool/remediation 预算，以及 round router 与 loop governor 计数是否处于运行时可达范围；序列化结构即使能反序列化，也不能携带超限状态绕过治理
 - checkpoint 使用独立 `executor_checkpoint` 会话事件，不再作为 system note 派生为空助手消息；`SessionTrajectorySink::restore_latest_executor` 按 conversation + trace + 类型读取最新安全点，专用 `(conversation_id, trace_id, event_type, seq DESC)` 索引避免长会话扫描。最新 payload 损坏、版本未知、时钟倒退或状态不可达都会失败关闭，不会静默降级到旧 checkpoint。当前仍只恢复 executor，不能替代 adapter IO 状态恢复
+- `KernelIoClock` 把 run-loop 的单调起点与恢复前累计耗时封装为只读能力，并随 `KernelIoPort::run_round` 借给 adapter；端口可在每个工具结果后调用 `clock.checkpoint(executor)`，但不能改写时钟或向 Provider 治理入口注入自算 elapsed，避免生产迁移为了保留轮内安全点重新打开预算旁路
 - Rust lib 共 954 项：946 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
@@ -610,7 +612,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AN 已完成；后续继续把生产 adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AO 已完成；后续继续把生产 adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

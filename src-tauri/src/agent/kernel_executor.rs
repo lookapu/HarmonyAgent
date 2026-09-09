@@ -101,6 +101,13 @@ pub struct KernelExecutorState {
 #[derive(Debug)]
 pub struct KernelIoRunLoop {
     executor: KernelExecutorState,
+    clock: KernelIoClock,
+}
+
+/// IO adapter 的只读运行时钟视图。端口可在工具结果等轮内安全点生成 checkpoint，
+/// 但不能改变起点、累计耗时或把自算 elapsed 注入治理裁决。
+#[derive(Clone, Debug)]
+pub struct KernelIoClock {
     started: Instant,
     elapsed_before_start: Duration,
 }
@@ -139,9 +146,26 @@ pub trait KernelIoPort {
     fn run_round<'a>(
         &'a mut self,
         executor: &'a mut KernelExecutorState,
+        clock: &'a KernelIoClock,
         round: u64,
         remaining: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<KernelIoRoundControl, Self::Error>> + Send + 'a>>;
+}
+
+impl KernelIoClock {
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed_before_start
+            .saturating_add(self.started.elapsed())
+    }
+
+    pub fn checkpoint(&self, executor: &KernelExecutorState) -> KernelExecutorCheckpoint {
+        KernelExecutorCheckpoint {
+            schema_version: KERNEL_EXECUTOR_CHECKPOINT_VERSION,
+            checkpointed_at_ms: unix_time_ms(),
+            elapsed_ms: self.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            state: executor.clone(),
+        }
+    }
 }
 
 impl KernelIoRunLoop {
@@ -152,8 +176,10 @@ impl KernelIoRunLoop {
     pub fn with_started(limits: KernelExecutorLimits, started: Instant) -> Self {
         Self {
             executor: KernelExecutorState::with_limits(limits),
-            started,
-            elapsed_before_start: Duration::ZERO,
+            clock: KernelIoClock {
+                started,
+                elapsed_before_start: Duration::ZERO,
+            },
         }
     }
 
@@ -165,17 +191,11 @@ impl KernelIoRunLoop {
     }
 
     pub fn elapsed(&self) -> Duration {
-        self.elapsed_before_start
-            .saturating_add(self.started.elapsed())
+        self.clock.elapsed()
     }
 
     pub fn checkpoint(&self) -> KernelExecutorCheckpoint {
-        KernelExecutorCheckpoint {
-            schema_version: KERNEL_EXECUTOR_CHECKPOINT_VERSION,
-            checkpointed_at_ms: unix_time_ms(),
-            elapsed_ms: self.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            state: self.executor.clone(),
-        }
+        self.clock.checkpoint(&self.executor)
     }
 
     pub fn restore(checkpoint: KernelExecutorCheckpoint) -> Result<Self, String> {
@@ -195,8 +215,10 @@ impl KernelIoRunLoop {
             .saturating_add(now_ms - checkpoint.checkpointed_at_ms);
         Ok(Self {
             executor: checkpoint.state,
-            started: Instant::now(),
-            elapsed_before_start: Duration::from_millis(total_elapsed_ms),
+            clock: KernelIoClock {
+                started: Instant::now(),
+                elapsed_before_start: Duration::from_millis(total_elapsed_ms),
+            },
         })
     }
 
@@ -214,7 +236,7 @@ impl KernelIoRunLoop {
                 }
             };
             match port
-                .run_round(&mut self.executor, round, remaining)
+                .run_round(&mut self.executor, &self.clock, round, remaining)
                 .await?
             {
                 KernelIoRoundControl::Continue => {}
@@ -538,6 +560,7 @@ mod tests {
 
     struct ScriptedIoPort {
         rounds: Vec<u64>,
+        checkpoints: Vec<KernelExecutorCheckpoint>,
         stop_after: Option<u64>,
         cancelled: bool,
     }
@@ -551,13 +574,15 @@ mod tests {
 
         fn run_round<'a>(
             &'a mut self,
-            _executor: &'a mut KernelExecutorState,
+            executor: &'a mut KernelExecutorState,
+            clock: &'a KernelIoClock,
             round: u64,
             _remaining: Duration,
         ) -> Pin<Box<dyn Future<Output = Result<KernelIoRoundControl, Self::Error>> + Send + 'a>>
         {
             Box::pin(async move {
                 self.rounds.push(round);
+                self.checkpoints.push(clock.checkpoint(executor));
                 Ok(if self.stop_after == Some(round) {
                     KernelIoRoundControl::Stop
                 } else {
@@ -577,6 +602,7 @@ mod tests {
         });
         let mut port = ScriptedIoPort {
             rounds: Vec::new(),
+            checkpoints: Vec::new(),
             stop_after: Some(2),
             cancelled: false,
         };
@@ -586,6 +612,9 @@ mod tests {
             KernelIoRunExit::AdapterStopped
         );
         assert_eq!(port.rounds, vec![1, 2]);
+        assert_eq!(port.checkpoints.len(), 2);
+        assert_eq!(port.checkpoints[0].state.completed_rounds, 1);
+        assert_eq!(port.checkpoints[1].state.completed_rounds, 2);
     }
 
     #[tokio::test]
@@ -598,6 +627,7 @@ mod tests {
         });
         let mut port = ScriptedIoPort {
             rounds: Vec::new(),
+            checkpoints: Vec::new(),
             stop_after: None,
             cancelled: false,
         };
