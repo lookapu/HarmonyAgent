@@ -8,8 +8,8 @@ use crate::agent::agent_kernel::{
     decide_stop_candidate, KernelRunState, KernelRunTermination, KernelStopDecision,
 };
 use crate::agent::kernel_loop::{
-    KernelLoopGovernor, KernelLoopVerdict, KernelRoundCounters, KernelRoundDecision,
-    KernelRoundInput, KernelRoundRouter,
+    KernelBudgetVerdict, KernelLoopGovernor, KernelLoopVerdict, KernelRoundCounters,
+    KernelRoundDecision, KernelRoundInput, KernelRoundRouter, KernelToolBudgetGate,
 };
 use std::time::Duration;
 
@@ -142,6 +142,31 @@ impl KernelExecutorState {
 
     pub fn tool_attempts(&self) -> u64 {
         self.tool_attempts
+    }
+
+    /// 桌面端动态工具预算裁决。loop-break 状态直接取 executor 真源；最终 Halt 在
+    /// 裁决处锁定为精确工具预算终止原因，adapter 只负责展示和收尾 IO。
+    pub fn decide_dynamic_tool_budget(
+        &mut self,
+        limit: usize,
+        used: usize,
+        recent_successes: usize,
+        extensions: usize,
+    ) -> KernelBudgetVerdict {
+        if self.termination().is_some() {
+            return KernelBudgetVerdict::Halt;
+        }
+        let verdict = KernelToolBudgetGate::check(
+            limit,
+            used,
+            recent_successes,
+            self.loop_breaks(),
+            extensions,
+        );
+        if verdict == KernelBudgetVerdict::Halt {
+            self.terminate(KernelRunTermination::ToolCallBudgetExceeded);
+        }
+        verdict
     }
 
     pub fn decide_stop(
@@ -511,5 +536,26 @@ mod tests {
             }
         );
         assert_eq!(executor.tool_attempts(), 1);
+    }
+
+    #[test]
+    fn executor_owns_dynamic_tool_budget_termination() {
+        let mut executor = KernelExecutorState::new();
+        assert_eq!(
+            executor.decide_dynamic_tool_budget(100, 50, 0, 0),
+            KernelBudgetVerdict::Proceed
+        );
+        assert!(matches!(
+            executor.decide_dynamic_tool_budget(100, 100, 5, 0),
+            KernelBudgetVerdict::Extend { new_limit } if new_limit > 100
+        ));
+        assert_eq!(
+            executor.decide_dynamic_tool_budget(100, 100, 2, 0),
+            KernelBudgetVerdict::Halt
+        );
+        assert_eq!(
+            executor.termination(),
+            Some(KernelRunTermination::ToolCallBudgetExceeded)
+        );
     }
 }

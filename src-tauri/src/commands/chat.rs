@@ -22,7 +22,7 @@ use crate::agent::agent_kernel::{
     run_tool_with_retry, retry_notice,
 };
 use crate::agent::kernel_executor::{KernelExecutorState, KernelRunPermit};
-use crate::agent::kernel_loop::{KernelToolBudgetGate, KernelRoundInput};
+use crate::agent::kernel_loop::KernelRoundInput;
 use crate::agent::kernel_history::{KernelHistoryAssembler, KernelHistoryInput, HistoryRow, ToolResult, UserInjection};
 use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
 use crate::agent::tools::guards::is_cancelled;
@@ -5247,7 +5247,12 @@ async fn stream_chat_inner(
                 let reached_tool_limit = tool_runs.len() + pending.len() >= max_tool_rounds;
                 let limit_must_stop = if reached_tool_limit {
                     let recent_successes = tool_runs.iter().rev().take(8).filter(|item| item.succeeded).count();
-                    match KernelToolBudgetGate::check(max_tool_rounds, tool_runs.len() + pending.len(), recent_successes, kernel_executor.loop_breaks(), budget_extensions) {
+                    match kernel_executor.decide_dynamic_tool_budget(
+                        max_tool_rounds,
+                        tool_runs.len() + pending.len(),
+                        recent_successes,
+                        budget_extensions,
+                    ) {
                         crate::agent::kernel_loop::KernelBudgetVerdict::Extend { new_limit } => {
                             let previous = max_tool_rounds;
                             max_tool_rounds = new_limit;
