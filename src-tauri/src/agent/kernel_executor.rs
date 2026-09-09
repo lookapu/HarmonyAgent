@@ -12,6 +12,8 @@ use crate::agent::kernel_loop::{
     KernelBudgetVerdict, KernelLoopGovernor, KernelLoopVerdict, KernelRoundCounters,
     KernelRoundDecision, KernelRoundInput, KernelRoundRouter, KernelToolBudgetGate,
 };
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 pub const KERNEL_EXECUTOR_SNAPSHOT_VERSION: u32 = 1;
@@ -100,6 +102,33 @@ pub struct KernelIoRunLoop {
     started: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelIoRoundControl {
+    Continue,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelIoRunExit {
+    AdapterStopped,
+    Halted(KernelRunTermination),
+}
+
+/// 单一 IO run-loop 的 adapter 端口。实现方只负责一轮 Provider/工具/事件 IO；循环、
+/// 单调时钟、安全点和终态吸收由 [`KernelIoRunLoop::run`] 统一负责。
+pub trait KernelIoPort {
+    type Error;
+
+    fn cancelled(&mut self) -> bool;
+
+    fn run_round<'a>(
+        &'a mut self,
+        executor: &'a mut KernelExecutorState,
+        round: u64,
+        remaining: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<KernelIoRoundControl, Self::Error>> + Send + 'a>>;
+}
+
 impl KernelIoRunLoop {
     pub fn new(limits: KernelExecutorLimits) -> Self {
         Self::with_started(limits, Instant::now())
@@ -120,6 +149,29 @@ impl KernelIoRunLoop {
 
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    /// 驱动 adapter 直到其主动停止或 executor 锁定终态。任何下一轮 Provider IO 都必须先
+    /// 经过 `begin_next_round`，因此回合上限、deadline、取消和既有终态无法被端口绕过。
+    pub async fn run<P: KernelIoPort>(
+        &mut self,
+        port: &mut P,
+    ) -> Result<KernelIoRunExit, P::Error> {
+        loop {
+            let (round, remaining) = match self.begin_next_round(port.cancelled()) {
+                KernelRunPermit::Proceed { round, remaining } => (round, remaining),
+                KernelRunPermit::Halt(reason) => {
+                    return Ok(KernelIoRunExit::Halted(reason));
+                }
+            };
+            match port
+                .run_round(&mut self.executor, round, remaining)
+                .await?
+            {
+                KernelIoRoundControl::Continue => {}
+                KernelIoRoundControl::Stop => return Ok(KernelIoRunExit::AdapterStopped),
+            }
+        }
     }
 }
 
@@ -393,6 +445,79 @@ impl KernelExecutorState {
 mod tests {
     use super::*;
     use crate::agent::kernel_loop::{KernelRoundControl, KERNEL_TOOL_CALL_LOOP_THRESHOLD};
+
+    struct ScriptedIoPort {
+        rounds: Vec<u64>,
+        stop_after: Option<u64>,
+        cancelled: bool,
+    }
+
+    impl KernelIoPort for ScriptedIoPort {
+        type Error = String;
+
+        fn cancelled(&mut self) -> bool {
+            self.cancelled
+        }
+
+        fn run_round<'a>(
+            &'a mut self,
+            _executor: &'a mut KernelExecutorState,
+            round: u64,
+            _remaining: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<KernelIoRoundControl, Self::Error>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.rounds.push(round);
+                Ok(if self.stop_after == Some(round) {
+                    KernelIoRoundControl::Stop
+                } else {
+                    KernelIoRoundControl::Continue
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn io_run_loop_drives_one_port_until_adapter_stop() {
+        let mut run_loop = KernelIoRunLoop::new(KernelExecutorLimits {
+            wall_time_ms: 60_000,
+            round_limit: Some(5),
+            tool_attempt_limit: None,
+            remediation_limit: 0,
+        });
+        let mut port = ScriptedIoPort {
+            rounds: Vec::new(),
+            stop_after: Some(2),
+            cancelled: false,
+        };
+
+        assert_eq!(
+            run_loop.run(&mut port).await.unwrap(),
+            KernelIoRunExit::AdapterStopped
+        );
+        assert_eq!(port.rounds, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn io_run_loop_halts_before_port_io_at_frozen_limit() {
+        let mut run_loop = KernelIoRunLoop::new(KernelExecutorLimits {
+            wall_time_ms: 60_000,
+            round_limit: Some(2),
+            tool_attempt_limit: None,
+            remediation_limit: 0,
+        });
+        let mut port = ScriptedIoPort {
+            rounds: Vec::new(),
+            stop_after: None,
+            cancelled: false,
+        };
+
+        assert_eq!(
+            run_loop.run(&mut port).await.unwrap(),
+            KernelIoRunExit::Halted(KernelRunTermination::MaxStepsExceeded)
+        );
+        assert_eq!(port.rounds, vec![1, 2]);
+    }
 
     #[test]
     fn io_run_loop_owns_monotonic_wall_time_and_absorbs_halt() {
