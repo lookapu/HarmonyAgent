@@ -652,7 +652,6 @@ impl HeadlessAgentDriver {
                 }
                 KernelRoundControl::StopEmpty { note } => {
                     // 空轮耗尽：追加注记后收尾
-                    kernel_executor.terminate(KernelRunTermination::EmptyRoundsExhausted);
                     sink.append(
                         SessionEventType::SystemNote,
                         json!({"note": note}),
@@ -794,7 +793,6 @@ impl HeadlessAgentDriver {
                     crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, .. } => {
                         if final_halt {
                             // loop_breaks 已超上限，直接收尾
-                            kernel_executor.terminate(KernelRunTermination::ToolLoopExhausted);
                             sink.append(
                                 SessionEventType::SystemNote,
                                 json!({"reason":"tool_loop_exhausted","tool":name}),

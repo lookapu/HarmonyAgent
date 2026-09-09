@@ -53,7 +53,11 @@ impl KernelExecutorState {
     }
 
     pub fn decide_round(&mut self, input: &KernelRoundInput<'_>) -> KernelRoundDecision {
-        self.rounds.decide(input)
+        let decision = self.rounds.decide(input);
+        if matches!(decision.control, crate::agent::kernel_loop::KernelRoundControl::StopEmpty { .. }) {
+            self.terminate(KernelRunTermination::EmptyRoundsExhausted);
+        }
+        decision
     }
 
     /// Provider 请求真正开始前推进一次回合计数，并返回 1-based round number。
@@ -87,7 +91,17 @@ impl KernelExecutorState {
     }
 
     pub fn observe_tool(&mut self, tool: &str, args: &str) -> KernelLoopVerdict {
-        self.tools.observe(tool, args)
+        let verdict = self.tools.observe(tool, args);
+        if matches!(
+            verdict,
+            KernelLoopVerdict::Halt {
+                final_halt: true,
+                ..
+            }
+        ) {
+            self.terminate(KernelRunTermination::ToolLoopExhausted);
+        }
+        verdict
     }
 
     /// 对模型产生的每一个工具调用尝试计数（包括随后被策略拒绝的调用）。
@@ -337,5 +351,38 @@ mod tests {
             KernelStopDecision::Exhausted(_)
         ));
         assert_eq!(executor.remediation_rounds(), 1);
+    }
+
+    #[test]
+    fn executor_maps_terminal_policy_decisions_to_run_reason() {
+        let mut rounds = KernelExecutorState::new();
+        let empty = KernelRoundInput {
+            text: "",
+            has_reasoning: false,
+            truncated: false,
+            interrupted: false,
+            has_native_tool_calls: false,
+        };
+        rounds.decide_round(&empty);
+        rounds.decide_round(&empty);
+        assert_eq!(
+            rounds.termination(),
+            Some(KernelRunTermination::EmptyRoundsExhausted)
+        );
+
+        let mut tools = KernelExecutorState::new();
+        for cycle in 0..=crate::agent::kernel_loop::KERNEL_MAX_LOOP_BREAKS {
+            let path = format!(r#"{{"path":"{cycle}.rs"}}"#);
+            for _ in 0..KERNEL_TOOL_CALL_LOOP_THRESHOLD {
+                tools.observe_tool("read_file", &path);
+            }
+            if cycle < crate::agent::kernel_loop::KERNEL_MAX_LOOP_BREAKS {
+                tools.observe_tool("write_file", r#"{"path":"reset.rs"}"#);
+            }
+        }
+        assert_eq!(
+            tools.termination(),
+            Some(KernelRunTermination::ToolLoopExhausted)
+        );
     }
 }

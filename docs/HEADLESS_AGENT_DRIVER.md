@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—Q 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—R 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -499,6 +499,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | O | 最终快照失败关闭（终止原因必填，未终止/未跑满禁止伪造 final snapshot） | ✅ COMPLETED |
 | P | 停止验收补救状态入核（UI/headless 共用 `decide_stop` 与 remediation 计数） | ✅ COMPLETED |
 | Q | acceptance 单一职责（gate 只管契约/证据报告，补救状态仅由 executor 持有） | ✅ COMPLETED |
+| R | 终态策略自动归因（空轮耗尽/最终工具循环熔断在裁决处写入 run termination） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -517,7 +518,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - 最终快照不再允许空终止原因：固定轮数路径用 `finish_and_snapshot` 完成自然耗尽归因，无固定轮数路径用 `terminate_and_snapshot` 提供回退原因；尚未终止且未跑满时失败关闭，避免 trajectory/Durable Run 出现伪 final
 - 停止申请的有界补救状态进入 `KernelExecutorState`：UI/headless 都通过 `decide_stop` 推进，同一快照记录 `remediation_rounds`，不再由 UI 局部变量与 headless acceptance gate 各自计数
 - `KernelAcceptanceGate` 删除重复的 remediation/max 字段和有状态 `request_stop`，仅保留契约、证据累计与报告生成；停止状态机只有 executor 一个真源
-- Rust lib 共 933 项：925 通过、8 项按环境条件忽略；前端 113 项通过
+- executor 在产生 `StopEmpty` 或 final tool-loop halt 的同一处自动锁定精确终止原因；两个 adapter 不再补写，桌面快照也不会把这两类终态降级成笼统 governance 归因
+- Rust lib 共 934 项：926 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -568,7 +570,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—Q 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—R 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
