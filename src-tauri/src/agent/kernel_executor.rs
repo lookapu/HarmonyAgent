@@ -47,7 +47,7 @@ pub enum KernelExecutorFinalization {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KernelExecutorLimits {
     pub wall_time_ms: u64,
     pub round_limit: Option<u64>,
@@ -80,7 +80,7 @@ pub struct KernelExecutorSnapshot {
     pub failure_taxonomy: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct KernelExecutorState {
     limits: KernelExecutorLimits,
     rounds: KernelRoundRouter,
@@ -100,6 +100,19 @@ pub struct KernelExecutorState {
 pub struct KernelIoRunLoop {
     executor: KernelExecutorState,
     started: Instant,
+    elapsed_before_start: Duration,
+}
+
+pub const KERNEL_EXECUTOR_CHECKPOINT_VERSION: u32 = 1;
+
+/// 活跃 run-loop 的版本化恢复契约。与 final snapshot 不同，它保留 router/governor 的
+/// 完整内部状态；恢复时会把进程停止期间的墙钟时间计入预算，避免重启刷新 deadline。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct KernelExecutorCheckpoint {
+    pub schema_version: u32,
+    pub checkpointed_at_ms: u64,
+    pub elapsed_ms: u64,
+    state: KernelExecutorState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,17 +151,50 @@ impl KernelIoRunLoop {
         Self {
             executor: KernelExecutorState::with_limits(limits),
             started,
+            elapsed_before_start: Duration::ZERO,
         }
     }
 
     /// Provider 请求前的唯一循环入口。adapter 只能提供当前取消信号，不能注入自行计算的
     /// deadline/elapsed；单调耗时由循环壳在裁决瞬间采样。
     pub fn begin_next_round(&mut self, cancelled: bool) -> KernelRunPermit {
-        self.executor.begin_round(cancelled, self.started.elapsed())
+        let elapsed = self.elapsed();
+        self.executor.begin_round(cancelled, elapsed)
     }
 
     pub fn elapsed(&self) -> Duration {
-        self.started.elapsed()
+        self.elapsed_before_start
+            .saturating_add(self.started.elapsed())
+    }
+
+    pub fn checkpoint(&self) -> KernelExecutorCheckpoint {
+        KernelExecutorCheckpoint {
+            schema_version: KERNEL_EXECUTOR_CHECKPOINT_VERSION,
+            checkpointed_at_ms: unix_time_ms(),
+            elapsed_ms: self.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            state: self.executor.clone(),
+        }
+    }
+
+    pub fn restore(checkpoint: KernelExecutorCheckpoint) -> Result<Self, String> {
+        if checkpoint.schema_version != KERNEL_EXECUTOR_CHECKPOINT_VERSION {
+            return Err(format!(
+                "不支持 executor checkpoint schema_version={}（当前={}）",
+                checkpoint.schema_version, KERNEL_EXECUTOR_CHECKPOINT_VERSION
+            ));
+        }
+        let now_ms = unix_time_ms();
+        if now_ms < checkpoint.checkpointed_at_ms {
+            return Err("系统时钟早于 executor checkpoint，拒绝恢复墙钟预算".into());
+        }
+        let total_elapsed_ms = checkpoint
+            .elapsed_ms
+            .saturating_add(now_ms - checkpoint.checkpointed_at_ms);
+        Ok(Self {
+            executor: checkpoint.state,
+            started: Instant::now(),
+            elapsed_before_start: Duration::from_millis(total_elapsed_ms),
+        })
     }
 
     /// 驱动 adapter 直到其主动停止或 executor 锁定终态。任何下一轮 Provider IO 都必须先
@@ -173,6 +219,14 @@ impl KernelIoRunLoop {
             }
         }
     }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 impl std::ops::Deref for KernelIoRunLoop {
@@ -517,6 +571,82 @@ mod tests {
             KernelIoRunExit::Halted(KernelRunTermination::MaxStepsExceeded)
         );
         assert_eq!(port.rounds, vec![1, 2]);
+    }
+
+    #[test]
+    fn active_checkpoint_round_trips_router_governor_and_counters() {
+        let mut run_loop = KernelIoRunLoop::new(KernelExecutorLimits {
+            wall_time_ms: 60_000,
+            round_limit: Some(4),
+            tool_attempt_limit: Some(20),
+            remediation_limit: 2,
+        });
+        assert!(matches!(
+            run_loop.begin_next_round(false),
+            KernelRunPermit::Proceed { round: 1, .. }
+        ));
+        let empty = KernelRoundInput {
+            text: "",
+            has_reasoning: false,
+            truncated: false,
+            interrupted: false,
+            has_native_tool_calls: false,
+        };
+        assert!(matches!(
+            run_loop.decide_round(&empty).control,
+            KernelRoundControl::RetryEmpty { .. }
+        ));
+        for _ in 0..4 {
+            assert!(matches!(
+                run_loop.begin_tool_attempt("read_file", r#"{"path":"a.rs"}"#),
+                KernelToolAttemptDecision::Observed { .. }
+            ));
+        }
+
+        let encoded = serde_json::to_string(&run_loop.checkpoint()).unwrap();
+        let checkpoint: KernelExecutorCheckpoint = serde_json::from_str(&encoded).unwrap();
+        let mut restored = KernelIoRunLoop::restore(checkpoint).unwrap();
+
+        assert!(matches!(
+            restored.begin_next_round(false),
+            KernelRunPermit::Proceed { round: 2, .. }
+        ));
+        assert!(matches!(
+            restored.decide_round(&empty).control,
+            KernelRoundControl::StopEmpty { .. }
+        ));
+        assert!(matches!(
+            restored.begin_tool_attempt("read_file", r#"{"path":"a.rs"}"#),
+            KernelToolAttemptDecision::Halt {
+                reason: KernelRunTermination::EmptyRoundsExhausted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn active_checkpoint_rejects_unknown_schema() {
+        let run_loop = KernelIoRunLoop::new(KernelExecutorLimits::default());
+        let mut checkpoint = run_loop.checkpoint();
+        checkpoint.schema_version += 1;
+        assert!(KernelIoRunLoop::restore(checkpoint)
+            .unwrap_err()
+            .contains("schema_version"));
+    }
+
+    #[test]
+    fn restored_elapsed_cannot_refresh_wall_time_budget() {
+        let run_loop = KernelIoRunLoop::new(KernelExecutorLimits {
+            wall_time_ms: 60_000,
+            ..KernelExecutorLimits::default()
+        });
+        let mut checkpoint = run_loop.checkpoint();
+        checkpoint.elapsed_ms = 120_000;
+        let mut restored = KernelIoRunLoop::restore(checkpoint).unwrap();
+        assert_eq!(
+            restored.begin_next_round(false),
+            KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded)
+        );
     }
 
     #[test]

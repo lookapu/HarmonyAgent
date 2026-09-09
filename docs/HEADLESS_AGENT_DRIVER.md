@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AI 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理、executor 状态与单调时钟所有者，单一 IO run-loop 的生产 adapter 迁移仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—AJ 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理、executor 状态与单调时钟所有者，单一 IO run-loop 的生产 adapter 迁移仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -517,6 +517,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AG | 共用 IO 循环壳（`KernelIoRunLoop` 绑定 executor 与单调时钟，UI/headless 不再自行传入 elapsed） | ✅ COMPLETED |
 | AH | Provider 边界封口（原始 `with_limits`/`begin_round(elapsed)` 收为私有，生产 adapter 只能经过统一循环壳） | ✅ COMPLETED |
 | AI | 异步 IO 端口协议（`KernelIoPort` + `KernelIoRunLoop::run` 统一取消、安全点、轮次驱动与终态退出） | ✅ COMPLETED |
+| AJ | 活跃 executor checkpoint（版本化保存 router/governor/计数/首因，恢复时计入停机墙钟） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -550,7 +551,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - `KernelIoRunLoop` 现同时包裹桌面与 headless executor：Provider 请求前只接收 adapter 的取消信号，elapsed 在同一个单调时钟边界采样；headless 工具剩余 wall time 也复用该时钟。它是 IO executor 的统一循环壳，Provider/工具/事件/DB 的异步端口尚待迁入
 - 原始 `KernelExecutorState::with_limits` 与 `begin_round(elapsed)` 已收为模块私有；生产 adapter 无法绕开 `KernelIoRunLoop` 注入自算 elapsed 或另建状态所有者
 - `KernelIoPort` 把 adapter 限定为“执行一轮 IO 并返回 Continue/Stop”；`KernelIoRunLoop::run` 唯一负责循环、取消采样、Provider 安全点与吸收态退出，并以脚本端口验证 adapter 主动停止和固定回合耗尽两条路径。现有 UI/headless 生产循环尚待迁入该异步入口
-- Rust lib 共 947 项：939 通过、8 项按环境条件忽略；前端 113 项通过
+- `KernelExecutorCheckpoint` 以独立 schema v1 保存完整 executor 活跃状态；恢复时通过“恢复前累计耗时 + 本进程单调耗时”把停机时长计入 elapsed，不能靠重启或 `Instant` 回溯溢出刷新 wall-time。未知版本或系统时钟倒退会失败关闭；这仍不包含 adapter 的 messages/工具结果等 IO 状态，完整运行恢复需由生产端口组合持久化
+- Rust lib 共 950 项：942 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -601,7 +603,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AI 已完成；后续继续把生产 adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AJ 已完成；后续继续把生产 adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

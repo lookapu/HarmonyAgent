@@ -58,7 +58,7 @@ pub enum KernelLoopVerdict {
 ///
 /// 注意：`turn_tool_calls` 现状是从不重置的任务级累计（chat.rs 注释标"每轮"但实为累计）——
 /// 忠实复刻，不顺手修复，避免行为变化。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct KernelLoopGovernor {
     turn_tool_calls: usize,
     last_tool_call_key: Option<String>,
@@ -221,7 +221,7 @@ pub struct KernelRoundDecision {
 ///
 /// 优先级逐字对齐 chat.rs 6205-6276：空轮 → 冻结重放 → 中断续写 → 中断耗尽注记（落穿）
 /// → 截断续写 → fake-call。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct KernelRoundRouter {
     empty_rounds: usize,
     stream_replays: usize,

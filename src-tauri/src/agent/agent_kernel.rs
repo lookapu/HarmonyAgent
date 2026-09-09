@@ -943,7 +943,8 @@ pub struct KernelToolEvidence {
 ///
 /// adapter 可以继续记录工具错误、验收阻塞等附加 taxonomy，但外层 round loop 只能由一个
 /// 主原因终止。集中记录可避免多个 `stopped_by_*` 布尔值遗漏或同时成立。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KernelRunTermination {
     ModelAccepted,
     UserCancelled,
@@ -993,7 +994,7 @@ impl KernelRunTermination {
 }
 
 /// 外层 run-loop 的最小共享状态：锁定首个终止原因，并在自然跑满时归因为步数耗尽。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KernelRunState {
     termination: Option<KernelRunTermination>,
 }
