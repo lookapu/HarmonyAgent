@@ -570,7 +570,9 @@ impl HeadlessAgentDriver {
                     )));
                 }
             };
-            outcome.steps = kernel_executor.start_round();
+            outcome.steps = kernel_executor.start_round().map_err(|reason| {
+                AgentDriverError::Cancelled(format!("builtin driver 已停止：{}", reason.as_str()))
+            })?;
             let request_timeout = self
                 .request_timeout
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT)

@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—R 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—S 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -500,6 +500,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | P | 停止验收补救状态入核（UI/headless 共用 `decide_stop` 与 remediation 计数） | ✅ COMPLETED |
 | Q | acceptance 单一职责（gate 只管契约/证据报告，补救状态仅由 executor 持有） | ✅ COMPLETED |
 | R | 终态策略自动归因（空轮耗尽/最终工具循环熔断在裁决处写入 run termination） | ✅ COMPLETED |
+| S | executor 终态吸收（安全点保留首因，终止后拒绝新增 Provider 回合） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -519,7 +520,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - 停止申请的有界补救状态进入 `KernelExecutorState`：UI/headless 都通过 `decide_stop` 推进，同一快照记录 `remediation_rounds`，不再由 UI 局部变量与 headless acceptance gate 各自计数
 - `KernelAcceptanceGate` 删除重复的 remediation/max 字段和有状态 `request_stop`，仅保留契约、证据累计与报告生成；停止状态机只有 executor 一个真源
 - executor 在产生 `StopEmpty` 或 final tool-loop halt 的同一处自动锁定精确终止原因；两个 adapter 不再补写，桌面快照也不会把这两类终态降级成笼统 governance 归因
-- Rust lib 共 934 项：926 通过、8 项按环境条件忽略；前端 113 项通过
+- executor 终态成为 Provider 边界的吸收态：`permit_run` 优先返回已经锁定的首因，`start_round` 在终止后拒绝推进；UI 对任意终态执行防御性退出，不会意外发起下一轮请求
+- Rust lib 共 935 项：927 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -570,7 +572,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—R 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—S 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

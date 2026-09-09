@@ -8,8 +8,8 @@ use crate::agent::agent_kernel::{
     decide_stop_candidate, KernelRunState, KernelRunTermination, KernelStopDecision,
 };
 use crate::agent::kernel_loop::{
-    KernelLoopGovernor, KernelLoopVerdict, KernelRoundDecision, KernelRoundInput,
-    KernelRoundCounters, KernelRoundRouter,
+    KernelLoopGovernor, KernelLoopVerdict, KernelRoundCounters, KernelRoundDecision,
+    KernelRoundInput, KernelRoundRouter,
 };
 use std::time::Duration;
 
@@ -54,16 +54,24 @@ impl KernelExecutorState {
 
     pub fn decide_round(&mut self, input: &KernelRoundInput<'_>) -> KernelRoundDecision {
         let decision = self.rounds.decide(input);
-        if matches!(decision.control, crate::agent::kernel_loop::KernelRoundControl::StopEmpty { .. }) {
+        if matches!(
+            decision.control,
+            crate::agent::kernel_loop::KernelRoundControl::StopEmpty { .. }
+        ) {
             self.terminate(KernelRunTermination::EmptyRoundsExhausted);
         }
         decision
     }
 
     /// Provider 请求真正开始前推进一次回合计数，并返回 1-based round number。
-    pub fn start_round(&mut self) -> u64 {
+    ///
+    /// 终态是吸收态：即使 adapter 误调用，也不会在终止后增加回合或发起下一轮。
+    pub fn start_round(&mut self) -> Result<u64, KernelRunTermination> {
+        if let Some(reason) = self.termination() {
+            return Err(reason);
+        }
         self.completed_rounds = self.completed_rounds.saturating_add(1);
-        self.completed_rounds
+        Ok(self.completed_rounds)
     }
 
     pub fn completed_rounds(&self) -> u64 {
@@ -77,6 +85,9 @@ impl KernelExecutorState {
         elapsed: Duration,
         deadline: Duration,
     ) -> KernelRunPermit {
+        if let Some(reason) = self.termination() {
+            return KernelRunPermit::Halt(reason);
+        }
         if elapsed >= deadline {
             self.terminate(KernelRunTermination::DeadlineExceeded);
             return KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded);
@@ -109,10 +120,7 @@ impl KernelExecutorState {
         let attempted = self.record_tool_attempt();
         if attempted > limit {
             self.terminate(KernelRunTermination::ToolCallBudgetExceeded);
-            KernelToolAttemptPermit::Halt {
-                attempted,
-                limit,
-            }
+            KernelToolAttemptPermit::Halt { attempted, limit }
         } else {
             KernelToolAttemptPermit::Proceed { attempt: attempted }
         }
@@ -133,11 +141,7 @@ impl KernelExecutorState {
         report: AcceptanceReport,
         max_remediation_rounds: usize,
     ) -> KernelStopDecision {
-        decide_stop_candidate(
-            report,
-            &mut self.remediation_rounds,
-            max_remediation_rounds,
-        )
+        decide_stop_candidate(report, &mut self.remediation_rounds, max_remediation_rounds)
     }
 
     pub fn remediation_rounds(&self) -> usize {
@@ -239,8 +243,8 @@ mod tests {
     #[test]
     fn executor_preserves_specific_termination_when_finishing() {
         let mut executor = KernelExecutorState::new();
-        assert_eq!(executor.start_round(), 1);
-        assert_eq!(executor.start_round(), 2);
+        assert_eq!(executor.start_round(), Ok(1));
+        assert_eq!(executor.start_round(), Ok(2));
         assert_eq!(executor.completed_rounds(), 2);
         executor.terminate(KernelRunTermination::ToolCallBudgetExceeded);
         assert_eq!(
@@ -312,10 +316,7 @@ mod tests {
             .finish_and_snapshot(10)
             .expect("已终止 executor 应生成最终快照");
         assert_eq!(snapshot.tool_attempts, 3);
-        assert_eq!(
-            snapshot.termination_reason,
-            "max_tool_calls_exceeded"
-        );
+        assert_eq!(snapshot.termination_reason, "max_tool_calls_exceeded");
         assert_eq!(
             snapshot.failure_taxonomy.as_deref(),
             Some("max_tool_calls_exceeded")
@@ -328,7 +329,7 @@ mod tests {
     #[test]
     fn executor_rejects_final_snapshot_without_termination() {
         let mut executor = KernelExecutorState::new();
-        executor.start_round();
+        executor.start_round().unwrap();
         let error = executor
             .finish_and_snapshot(2)
             .expect_err("未终止且未跑满时必须失败关闭");
@@ -382,6 +383,26 @@ mod tests {
         }
         assert_eq!(
             tools.termination(),
+            Some(KernelRunTermination::ToolLoopExhausted)
+        );
+    }
+
+    #[test]
+    fn executor_terminal_state_is_absorbing_at_provider_boundary() {
+        let mut executor = KernelExecutorState::new();
+        executor.terminate(KernelRunTermination::ToolLoopExhausted);
+
+        assert_eq!(
+            executor.permit_run(true, Duration::from_secs(20), Duration::from_secs(10)),
+            KernelRunPermit::Halt(KernelRunTermination::ToolLoopExhausted)
+        );
+        assert_eq!(
+            executor.start_round(),
+            Err(KernelRunTermination::ToolLoopExhausted)
+        );
+        assert_eq!(executor.completed_rounds(), 0);
+        assert_eq!(
+            executor.termination(),
             Some(KernelRunTermination::ToolLoopExhausted)
         );
     }

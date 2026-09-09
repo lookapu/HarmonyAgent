@@ -4429,7 +4429,14 @@ async fn stream_chat_inner(
             }
             return Ok(());
         }
-        kernel_executor.start_round();
+        // 任意已锁定终态都不得穿过 Provider 边界；正常分支会在产生终态的当轮退出，
+        // 此处是防御性吸收态兜底，保留 executor 中的首个精确原因供最终快照审计。
+        if matches!(run_permit, KernelRunPermit::Halt(_)) {
+            break;
+        }
+        if kernel_executor.start_round().is_err() {
+            break;
+        }
         // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
         if let Some((_, pending_content)) = take_next_queued(state, &conversation_id, true)? {
             merged_instructions.push(pending_content);
