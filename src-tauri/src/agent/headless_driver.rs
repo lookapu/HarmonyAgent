@@ -12,7 +12,7 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
 use crate::agent::kernel_executor::{
-    KernelExecutorFinalization, KernelExecutorLimits, KernelExecutorState, KernelRunPermit,
+    KernelExecutorFinalization, KernelExecutorLimits, KernelIoRunLoop, KernelRunPermit,
     KernelToolAttemptDecision,
 };
 use crate::agent::kernel_loop::{KernelRoundControl, KernelRoundInput};
@@ -553,18 +553,18 @@ impl HeadlessAgentDriver {
         let round_limit = self.provider.max_rounds.min(task.limits.max_steps as u32);
         
         // UI/headless 共用 executor 状态：轮级路由、循环治理、唯一终止原因。
-        let mut kernel_executor = KernelExecutorState::with_limits(KernelExecutorLimits {
-            wall_time_ms: task.limits.wall_time_seconds.saturating_mul(1_000),
-            round_limit: Some(round_limit as u64),
-            tool_attempt_limit: Some(task.limits.max_tool_calls),
-            remediation_limit: MAX_REMEDIATION_ROUNDS,
-        });
+        let mut kernel_executor = KernelIoRunLoop::with_started(
+            KernelExecutorLimits {
+                wall_time_ms: task.limits.wall_time_seconds.saturating_mul(1_000),
+                round_limit: Some(round_limit as u64),
+                tool_attempt_limit: Some(task.limits.max_tool_calls),
+                remediation_limit: MAX_REMEDIATION_ROUNDS,
+            },
+            started,
+        );
         
         'rounds: loop {
-            let (round, remaining) = match kernel_executor.begin_round(
-                false,
-                started.elapsed(),
-            ) {
+            let (round, remaining) = match kernel_executor.begin_next_round(false) {
                 KernelRunPermit::Proceed { round, remaining } => (round, remaining),
                 KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded) => break,
                 KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded) => {
@@ -865,7 +865,7 @@ impl HeadlessAgentDriver {
                 )
                 .map_err(AgentDriverError::Failed)?;
                 let remaining_wall_time = Duration::from_secs(task.limits.wall_time_seconds)
-                    .saturating_sub(started.elapsed());
+                    .saturating_sub(kernel_executor.elapsed());
                 let result = runtime
                     .execute_observed(name, args, id, remaining_wall_time)
                     .await;

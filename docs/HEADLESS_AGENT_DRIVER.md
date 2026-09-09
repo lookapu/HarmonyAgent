@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AF 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—AH 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理、executor 状态与单调时钟所有者，单一 IO run-loop 的异步端口迁移仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -514,6 +514,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AD | 运行限制冻结（回合/工具/补救上限创建时注入并进入最终快照） | ✅ COMPLETED |
 | AE | 墙钟限制冻结（wall time 纳入运行配置，安全点只接收 elapsed/cancelled） | ✅ COMPLETED |
 | AF | 快照版本契约（Durable Run/headless executor snapshot 写入稳定 schema version） | ✅ COMPLETED |
+| AG | 共用 IO 循环壳（`KernelIoRunLoop` 绑定 executor 与单调时钟，UI/headless 不再自行传入 elapsed） | ✅ COMPLETED |
+| AH | Provider 边界封口（原始 `with_limits`/`begin_round(elapsed)` 收为私有，生产 adapter 只能经过统一循环壳） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -544,7 +546,9 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - `KernelExecutorLimits` 在生产 executor 创建时一次冻结 round/tool/remediation 上限，`begin_round`、`begin_tool_attempt`、`decide_stop` 与 `finalize` 不再接受可漂移的限制参数；配置随最终快照持久化，固定回合模式缺少创建期上限会失败关闭
 - wall time 同样以 `wall_time_ms` 冻结进 `KernelExecutorLimits` 并持久化；`begin_round` 不再接收 adapter 每轮传入的 deadline，只依据冻结契约、elapsed 与取消信号裁决剩余预算
 - `KernelExecutorSnapshot` 写入 `schema_version=1`，桌面 Durable Run 与 headless trajectory 共用同一版本化契约；当前快照只表达最终态，不宣称能恢复缺少 governor 完整状态的活跃运行
-- Rust lib 共 943 项：935 通过、8 项按环境条件忽略；前端 113 项通过
+- `KernelIoRunLoop` 现同时包裹桌面与 headless executor：Provider 请求前只接收 adapter 的取消信号，elapsed 在同一个单调时钟边界采样；headless 工具剩余 wall time 也复用该时钟。它是 IO executor 的统一循环壳，Provider/工具/事件/DB 的异步端口尚待迁入
+- 原始 `KernelExecutorState::with_limits` 与 `begin_round(elapsed)` 已收为模块私有；生产 adapter 无法绕开 `KernelIoRunLoop` 注入自算 elapsed 或另建状态所有者
+- Rust lib 共 945 项：937 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -595,7 +599,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AF 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AH 已完成；后续继续把异步端口迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

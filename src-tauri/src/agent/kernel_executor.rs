@@ -1,7 +1,8 @@
 //! UI/headless 共用的外层 Agent executor 状态所有者。
 //!
-//! 本层仍保持纯状态、无 IO：adapter 负责 Provider、数据库、事件和工具执行；这里统一持有
-//! 单轮路由、工具循环治理与唯一终止原因，避免三套跨轮状态在不同 adapter 中独立装配。
+//! 本层不直接执行外部 IO：adapter 负责 Provider、数据库、事件和工具执行；这里统一持有
+//! 单调运行时钟、单轮路由、工具循环治理与唯一终止原因，避免跨轮状态在不同 adapter
+//! 中独立装配。
 
 use crate::agent::acceptance::AcceptanceReport;
 use crate::agent::agent_kernel::{
@@ -11,7 +12,7 @@ use crate::agent::kernel_loop::{
     KernelBudgetVerdict, KernelLoopGovernor, KernelLoopVerdict, KernelRoundCounters,
     KernelRoundDecision, KernelRoundInput, KernelRoundRouter, KernelToolBudgetGate,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const KERNEL_EXECUTOR_SNAPSHOT_VERSION: u32 = 1;
 
@@ -88,12 +89,60 @@ pub struct KernelExecutorState {
     remediation_rounds: usize,
 }
 
+/// UI/headless 共用的 Provider 外层循环壳。
+///
+/// 它把单调时钟与 executor 状态绑定在一起，使 adapter 不再自行计算并传入 elapsed，
+/// 从而保证 wall-time、取消与回合上限始终在同一个 Provider 边界原子裁决。Provider、
+/// 工具、事件和数据库仍由 adapter 实现；后续 IO 端口迁移以此类型为唯一循环所有者。
+#[derive(Debug)]
+pub struct KernelIoRunLoop {
+    executor: KernelExecutorState,
+    started: Instant,
+}
+
+impl KernelIoRunLoop {
+    pub fn new(limits: KernelExecutorLimits) -> Self {
+        Self::with_started(limits, Instant::now())
+    }
+
+    pub fn with_started(limits: KernelExecutorLimits, started: Instant) -> Self {
+        Self {
+            executor: KernelExecutorState::with_limits(limits),
+            started,
+        }
+    }
+
+    /// Provider 请求前的唯一循环入口。adapter 只能提供当前取消信号，不能注入自行计算的
+    /// deadline/elapsed；单调耗时由循环壳在裁决瞬间采样。
+    pub fn begin_next_round(&mut self, cancelled: bool) -> KernelRunPermit {
+        self.executor.begin_round(cancelled, self.started.elapsed())
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+impl std::ops::Deref for KernelIoRunLoop {
+    type Target = KernelExecutorState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.executor
+    }
+}
+
+impl std::ops::DerefMut for KernelIoRunLoop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.executor
+    }
+}
+
 impl KernelExecutorState {
     fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_limits(limits: KernelExecutorLimits) -> Self {
+    fn with_limits(limits: KernelExecutorLimits) -> Self {
         Self {
             limits,
             ..Self::default()
@@ -117,7 +166,7 @@ impl KernelExecutorState {
 
     /// 每次 Provider 请求前的原子安全点。已有终态与回合上限先于新一轮 deadline/取消，
     /// deadline 优先于取消；仅在放行时推进计数并返回 1-based round 与剩余墙钟预算。
-    pub fn begin_round(
+    fn begin_round(
         &mut self,
         cancelled: bool,
         elapsed: Duration,
@@ -344,6 +393,49 @@ impl KernelExecutorState {
 mod tests {
     use super::*;
     use crate::agent::kernel_loop::{KernelRoundControl, KERNEL_TOOL_CALL_LOOP_THRESHOLD};
+
+    #[test]
+    fn io_run_loop_owns_monotonic_wall_time_and_absorbs_halt() {
+        let limits = KernelExecutorLimits {
+            wall_time_ms: 5,
+            round_limit: Some(3),
+            tool_attempt_limit: Some(2),
+            remediation_limit: 1,
+        };
+        let mut run_loop =
+            KernelIoRunLoop::with_started(limits, Instant::now() - Duration::from_millis(20));
+
+        assert_eq!(
+            run_loop.begin_next_round(false),
+            KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded)
+        );
+        assert_eq!(
+            run_loop.begin_next_round(true),
+            KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded)
+        );
+        assert_eq!(run_loop.completed_rounds(), 0);
+    }
+
+    #[test]
+    fn io_run_loop_delegates_round_counter_and_cancel_priority() {
+        let limits = KernelExecutorLimits {
+            wall_time_ms: 60_000,
+            round_limit: Some(2),
+            tool_attempt_limit: None,
+            remediation_limit: 0,
+        };
+        let mut run_loop = KernelIoRunLoop::new(limits);
+
+        assert!(matches!(
+            run_loop.begin_next_round(false),
+            KernelRunPermit::Proceed { round: 1, .. }
+        ));
+        assert_eq!(
+            run_loop.begin_next_round(true),
+            KernelRunPermit::Halt(KernelRunTermination::UserCancelled)
+        );
+        assert_eq!(run_loop.completed_rounds(), 1);
+    }
 
     fn observe(executor: &mut KernelExecutorState, tool: &str, args: &str) -> KernelLoopVerdict {
         match executor.begin_tool_attempt(tool, args) {

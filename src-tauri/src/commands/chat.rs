@@ -22,7 +22,7 @@ use crate::agent::agent_kernel::{
     run_tool_with_retry, retry_notice,
 };
 use crate::agent::kernel_executor::{
-    KernelExecutorFinalization, KernelExecutorLimits, KernelExecutorState, KernelRunPermit,
+    KernelExecutorFinalization, KernelExecutorLimits, KernelIoRunLoop, KernelRunPermit,
 };
 use crate::agent::kernel_loop::KernelRoundInput;
 use crate::agent::kernel_history::{KernelHistoryAssembler, KernelHistoryInput, HistoryRow, ToolResult, UserInjection};
@@ -4227,12 +4227,15 @@ async fn stream_chat_inner(
         .map(|configured| configured.min(execution_budget.duration_ms))
         .unwrap_or(execution_budget.duration_ms);
     // 共用 executor 状态：创建时冻结本次运行的墙钟与治理限制。
-    let mut kernel_executor = KernelExecutorState::with_limits(KernelExecutorLimits {
-        wall_time_ms: task_deadline_ms.max(0) as u64,
-        round_limit: None,
-        tool_attempt_limit: None,
-        remediation_limit: execution_budget.remediation_rounds,
-    });
+    let mut kernel_executor = KernelIoRunLoop::with_started(
+        KernelExecutorLimits {
+            wall_time_ms: task_deadline_ms.max(0) as u64,
+            round_limit: None,
+            tool_attempt_limit: None,
+            remediation_limit: execution_budget.remediation_rounds,
+        },
+        task_started,
+    );
     // 任务账本（Ledger 协议）状态：目标=首轮用户消息摘要；prev_ledger 为上次未完成任务
     // 落库的账本（断点续跑继承，编号从旧账本最大编号续接）；任务结束按完成/未完成保存或清空
     let task_goal = goal_contract.original_goal
@@ -4312,10 +4315,8 @@ async fn stream_chat_inner(
             workflow_stage = Some(workflow.stage);
         }
         // Provider 请求前共用安全点：统一 deadline/cancel 优先级与剩余时间语义。
-        let run_permit = kernel_executor.begin_round(
-            is_cancelled(cancel, &conversation_id),
-            task_started.elapsed(),
-        );
+        let run_permit =
+            kernel_executor.begin_next_round(is_cancelled(cancel, &conversation_id));
         // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
         if matches!(
             run_permit,
