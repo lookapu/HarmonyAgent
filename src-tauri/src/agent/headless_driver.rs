@@ -68,6 +68,21 @@ fn bounded_tool_output(value: String) -> (String, bool) {
     }
 }
 
+fn append_executor_checkpoint(
+    sink: &mut SessionTrajectorySink,
+    run_loop: &KernelIoRunLoop,
+) -> Result<(), AgentDriverError> {
+    let checkpoint = serde_json::to_value(run_loop.checkpoint())
+        .map_err(|error| AgentDriverError::Failed(error.to_string()))?;
+    sink.append(
+        SessionEventType::SystemNote,
+        checkpoint.clone(),
+        "executor_checkpoint",
+        checkpoint,
+    )
+    .map_err(AgentDriverError::Failed)
+}
+
 #[derive(Clone, Debug)]
 pub struct HeadlessProviderConfig {
     pub provider_id: String,
@@ -564,6 +579,9 @@ impl HeadlessAgentDriver {
         );
         
         'rounds: loop {
+            if outcome.steps > 0 {
+                append_executor_checkpoint(&mut sink, &kernel_executor)?;
+            }
             let (round, remaining) = match kernel_executor.begin_next_round(false) {
                 KernelRunPermit::Proceed { round, remaining } => (round, remaining),
                 KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded) => break,
@@ -907,6 +925,7 @@ impl HeadlessAgentDriver {
                     }),
                 )
                 .map_err(AgentDriverError::Failed)?;
+                append_executor_checkpoint(&mut sink, &kernel_executor)?;
                 acceptance.record(KernelToolEvidence {
                     tool: name.to_string(),
                     arguments: args.to_string(),
@@ -1270,6 +1289,15 @@ mod tests {
             .expect("工具质量摘要必须进入 trajectory");
         assert_eq!(quality.fields["total_calls"], 1);
         assert_eq!(quality.fields["successful_calls"], 1);
+        let checkpoint = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "executor_checkpoint")
+            .expect("真实 headless 工具循环必须持久化 executor checkpoint");
+        assert_eq!(checkpoint.fields["schema_version"], 1);
+        let checkpoint_json = serde_json::to_string(&checkpoint.fields).unwrap();
+        assert!(!checkpoint_json.contains("fixed\\n"));
+        assert!(checkpoint_json.contains("sha256:"));
         assert!(!serde_json::to_string(&outcome.trajectory)
             .unwrap()
             .contains("test-secret"));

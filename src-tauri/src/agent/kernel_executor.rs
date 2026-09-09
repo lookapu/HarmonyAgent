@@ -650,6 +650,23 @@ mod tests {
     }
 
     #[test]
+    fn active_checkpoint_never_serializes_raw_tool_arguments() {
+        let secret = "sk-secret-checkpoint-value";
+        let mut run_loop = KernelIoRunLoop::new(KernelExecutorLimits::default());
+        assert!(matches!(
+            run_loop.begin_tool_attempt(
+                "write_file",
+                &format!(r#"{{"path":"a.txt","content":"{secret}"}}"#),
+            ),
+            KernelToolAttemptDecision::Observed { .. }
+        ));
+
+        let encoded = serde_json::to_string(&run_loop.checkpoint()).unwrap();
+        assert!(!encoded.contains(secret), "checkpoint 泄露了原始工具参数");
+        assert!(encoded.contains("sha256:"), "checkpoint 缺少稳定调用指纹");
+    }
+
+    #[test]
     fn io_run_loop_owns_monotonic_wall_time_and_absorbs_halt() {
         let limits = KernelExecutorLimits {
             wall_time_ms: 5,

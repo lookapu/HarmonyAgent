@@ -5,6 +5,7 @@
 //! 阈值与文案从 chat.rs 主循环逐字搬入，保证 UI 行为零变化。
 
 use crate::agent::tools::strip_tool_calls;
+use sha2::{Digest, Sha256};
 
 // ── 工具循环检测阈值（对齐 chat.rs 原常量，UI 与 headless 共用） ─────────────────
 /// 连续相同调用（同工具名+同参数）达到该次数即判定打转——重复调用必得相同结果，
@@ -79,7 +80,14 @@ impl KernelLoopGovernor {
     /// stuck(≥5 相同 name+args 或 ≥8 同名) || (turn_calls>100 && repeat≥3) || turn_calls>1000
     pub fn observe(&mut self, tool: &str, args: &str) -> KernelLoopVerdict {
         self.turn_tool_calls += 1;
-        let call_key = format!("{tool}|{args}");
+        // 循环判断只需要稳定等价键，不能把原始参数（可能含 secret/源码正文）带入
+        // 活跃 executor checkpoint。长度前缀避免 tool/args 边界拼接歧义。
+        let mut hasher = Sha256::new();
+        hasher.update((tool.len() as u64).to_be_bytes());
+        hasher.update(tool.as_bytes());
+        hasher.update((args.len() as u64).to_be_bytes());
+        hasher.update(args.as_bytes());
+        let call_key = format!("sha256:{:x}", hasher.finalize());
         if self.last_tool_call_key.as_deref() == Some(call_key.as_str()) {
             self.tool_call_repeat += 1;
         } else {
