@@ -143,6 +143,15 @@ pub trait KernelIoPort {
 
     fn cancelled(&mut self) -> bool;
 
+    /// 每个后续 Provider 边界前的安全点。run-loop 负责生成可信 checkpoint 并调用，
+    /// adapter 只负责持久化，不能遗漏生成时机或自行拼装 elapsed。
+    fn persist_checkpoint(
+        &mut self,
+        _checkpoint: KernelExecutorCheckpoint,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn run_round<'a>(
         &'a mut self,
         executor: &'a mut KernelExecutorState,
@@ -229,6 +238,9 @@ impl KernelIoRunLoop {
         port: &mut P,
     ) -> Result<KernelIoRunExit, P::Error> {
         loop {
+            if self.executor.completed_rounds() > 0 {
+                port.persist_checkpoint(self.checkpoint())?;
+            }
             let (round, remaining) = match self.begin_next_round(port.cancelled()) {
                 KernelRunPermit::Proceed { round, remaining } => (round, remaining),
                 KernelRunPermit::Halt(reason) => {
@@ -561,6 +573,7 @@ mod tests {
     struct ScriptedIoPort {
         rounds: Vec<u64>,
         checkpoints: Vec<KernelExecutorCheckpoint>,
+        boundary_checkpoints: Vec<KernelExecutorCheckpoint>,
         stop_after: Option<u64>,
         cancelled: bool,
     }
@@ -570,6 +583,14 @@ mod tests {
 
         fn cancelled(&mut self) -> bool {
             self.cancelled
+        }
+
+        fn persist_checkpoint(
+            &mut self,
+            checkpoint: KernelExecutorCheckpoint,
+        ) -> Result<(), Self::Error> {
+            self.boundary_checkpoints.push(checkpoint);
+            Ok(())
         }
 
         fn run_round<'a>(
@@ -603,6 +624,7 @@ mod tests {
         let mut port = ScriptedIoPort {
             rounds: Vec::new(),
             checkpoints: Vec::new(),
+            boundary_checkpoints: Vec::new(),
             stop_after: Some(2),
             cancelled: false,
         };
@@ -615,6 +637,8 @@ mod tests {
         assert_eq!(port.checkpoints.len(), 2);
         assert_eq!(port.checkpoints[0].state.completed_rounds, 1);
         assert_eq!(port.checkpoints[1].state.completed_rounds, 2);
+        assert_eq!(port.boundary_checkpoints.len(), 1);
+        assert_eq!(port.boundary_checkpoints[0].state.completed_rounds, 1);
     }
 
     #[tokio::test]
@@ -628,6 +652,7 @@ mod tests {
         let mut port = ScriptedIoPort {
             rounds: Vec::new(),
             checkpoints: Vec::new(),
+            boundary_checkpoints: Vec::new(),
             stop_after: None,
             cancelled: false,
         };
@@ -637,6 +662,8 @@ mod tests {
             KernelIoRunExit::Halted(KernelRunTermination::MaxStepsExceeded)
         );
         assert_eq!(port.rounds, vec![1, 2]);
+        assert_eq!(port.boundary_checkpoints.len(), 2);
+        assert_eq!(port.boundary_checkpoints[1].state.completed_rounds, 2);
     }
 
     #[test]
