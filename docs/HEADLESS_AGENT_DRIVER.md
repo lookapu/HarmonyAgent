@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—T 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—U 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -478,7 +478,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 验收：同一 stub provider 脚本在 UI adapter 和 headless adapter 上产生等价决策轨迹。
 
-**Phase 4 实施状态（2026-09-08 更新）**：
+**Phase 4 实施状态（2026-09-09 更新）**：
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -502,6 +502,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | R | 终态策略自动归因（空轮耗尽/最终工具循环熔断在裁决处写入 run termination） | ✅ COMPLETED |
 | S | executor 终态吸收（安全点保留首因，终止后拒绝新增 Provider 回合） | ✅ COMPLETED |
 | T | 原子 Provider 回合入口（安全裁决、计数与剩余墙钟预算合并为 `begin_round`） | ✅ COMPLETED |
+| U | 终态验收原子归因（headless 的 Accepted/Exhausted 在停止裁决处直接锁定原因） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -522,7 +523,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - `KernelAcceptanceGate` 删除重复的 remediation/max 字段和有状态 `request_stop`，仅保留契约、证据累计与报告生成；停止状态机只有 executor 一个真源
 - executor 在产生 `StopEmpty` 或 final tool-loop halt 的同一处自动锁定精确终止原因；两个 adapter 不再补写，桌面快照也不会把这两类终态降级成笼统 governance 归因
 - executor 终态成为 Provider 边界的吸收态：`begin_round` 优先返回已经锁定的首因；安全裁决、回合计数与剩余墙钟预算已合并为一次原子操作，UI 对任意终态执行防御性退出，不会意外发起下一轮请求
-- Rust lib 共 935 项：927 通过、8 项按环境条件忽略；前端 113 项通过
+- 无后置复核门的 headless 使用 `decide_terminal_stop`，Accepted/Exhausted 的决策与精确终止归因不可分离；桌面 UI 继续使用预验收 `decide_stop`，保留 ship 声明审计与完成复核语义
+- Rust lib 共 936 项：928 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -573,7 +575,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—T 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—U 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

@@ -136,6 +136,26 @@ impl KernelExecutorState {
         decide_stop_candidate(report, &mut self.remediation_rounds, max_remediation_rounds)
     }
 
+    /// 对没有后置 ship/review 门的 adapter 执行终态停止裁决。
+    /// Accepted/Exhausted 在产生决策的同一处锁定精确终止原因，Remediate 保持运行态。
+    pub fn decide_terminal_stop(
+        &mut self,
+        report: AcceptanceReport,
+        max_remediation_rounds: usize,
+    ) -> KernelStopDecision {
+        let decision = self.decide_stop(report, max_remediation_rounds);
+        match &decision {
+            KernelStopDecision::Accepted(_) => {
+                self.terminate(KernelRunTermination::ModelAccepted);
+            }
+            KernelStopDecision::Exhausted(_) => {
+                self.terminate(KernelRunTermination::AcceptanceExhausted);
+            }
+            KernelStopDecision::Remediate { .. } => {}
+        }
+        decision
+    }
+
     pub fn remediation_rounds(&self) -> usize {
         self.remediation_rounds
     }
@@ -356,6 +376,37 @@ mod tests {
             KernelStopDecision::Exhausted(_)
         ));
         assert_eq!(executor.remediation_rounds(), 1);
+    }
+
+    #[test]
+    fn executor_terminal_stop_maps_acceptance_outcomes_atomically() {
+        let passed = crate::agent::acceptance::evaluate_contract(
+            &crate::agent::acceptance::GoalContract::compile("解释代码"),
+            &[],
+        );
+        let mut accepted = KernelExecutorState::new();
+        assert!(matches!(
+            accepted.decide_terminal_stop(passed, 1),
+            KernelStopDecision::Accepted(_)
+        ));
+        assert_eq!(
+            accepted.termination(),
+            Some(KernelRunTermination::ModelAccepted)
+        );
+
+        let missing = crate::agent::acceptance::evaluate_contract(
+            &crate::agent::acceptance::GoalContract::compile("修改 a.rs"),
+            &[],
+        );
+        let mut exhausted = KernelExecutorState::new();
+        assert!(matches!(
+            exhausted.decide_terminal_stop(missing, 0),
+            KernelStopDecision::Exhausted(_)
+        ));
+        assert_eq!(
+            exhausted.termination(),
+            Some(KernelRunTermination::AcceptanceExhausted)
+        );
     }
 
     #[test]

@@ -701,9 +701,10 @@ impl HeadlessAgentDriver {
             }
 
             if turn.is_stop_candidate() {
-                match kernel_executor.decide_stop(acceptance.report(), MAX_REMEDIATION_ROUNDS) {
+                match kernel_executor
+                    .decide_terminal_stop(acceptance.report(), MAX_REMEDIATION_ROUNDS)
+                {
                     KernelStopDecision::Accepted(report) => {
-                        kernel_executor.terminate(KernelRunTermination::ModelAccepted);
                         sink.append(
                             SessionEventType::SystemNote,
                             serde_json::to_value(&report)
@@ -731,7 +732,6 @@ impl HeadlessAgentDriver {
                         continue;
                     }
                     KernelStopDecision::Exhausted(report) => {
-                        kernel_executor.terminate(KernelRunTermination::AcceptanceExhausted);
                         sink.append(
                             SessionEventType::SystemNote,
                             serde_json::to_value(&report)
