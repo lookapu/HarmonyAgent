@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AD 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—AE 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理与 executor 状态所有者，单一 IO run-loop 仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -512,6 +512,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AB | executor 写入口封闭（终态、自然结束和内部计数不再向 adapter 暴露） | ✅ COMPLETED |
 | AC | 唯一最终化入口（固定回合与桌面验收使用类型化模式生成同一快照） | ✅ COMPLETED |
 | AD | 运行限制冻结（回合/工具/补救上限创建时注入并进入最终快照） | ✅ COMPLETED |
+| AE | 墙钟限制冻结（wall time 纳入运行配置，安全点只接收 elapsed/cancelled） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -540,6 +541,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - executor 的 `terminate`、`finish`、`termination`、fallback snapshot 与内部计数查询已收为私有；生产 adapter 只能经过回合、工具、预算、验收和最终快照等受控入口推进状态，防止后续重新引入手工终止双写
 - `KernelExecutorFinalization` 明确区分 `FixedRounds` 与 `Acceptance`，UI/headless 只通过唯一公共 `finalize(...)` 生成快照；旧的 `finish_and_snapshot`、`finalize_acceptance_snapshot` 与 fallback 快照入口已删除，所有模式保持首因与非空终态约束
 - `KernelExecutorLimits` 在生产 executor 创建时一次冻结 round/tool/remediation 上限，`begin_round`、`begin_tool_attempt`、`decide_stop` 与 `finalize` 不再接受可漂移的限制参数；配置随最终快照持久化，固定回合模式缺少创建期上限会失败关闭
+- wall time 同样以 `wall_time_ms` 冻结进 `KernelExecutorLimits` 并持久化；`begin_round` 不再接收 adapter 每轮传入的 deadline，只依据冻结契约、elapsed 与取消信号裁决剩余预算
 - Rust lib 共 943 项：935 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
@@ -591,7 +593,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AD 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AE 已完成；后续继续收敛单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

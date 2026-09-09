@@ -44,6 +44,7 @@ pub enum KernelExecutorFinalization {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct KernelExecutorLimits {
+    pub wall_time_ms: u64,
     pub round_limit: Option<u64>,
     pub tool_attempt_limit: Option<u64>,
     pub remediation_limit: usize,
@@ -52,6 +53,7 @@ pub struct KernelExecutorLimits {
 impl Default for KernelExecutorLimits {
     fn default() -> Self {
         Self {
+            wall_time_ms: u64::MAX,
             round_limit: None,
             tool_attempt_limit: None,
             remediation_limit: usize::MAX,
@@ -116,8 +118,8 @@ impl KernelExecutorState {
         &mut self,
         cancelled: bool,
         elapsed: Duration,
-        deadline: Duration,
     ) -> KernelRunPermit {
+        let deadline = Duration::from_millis(self.limits.wall_time_ms);
         if let Some(reason) = self.termination() {
             return KernelRunPermit::Halt(reason);
         }
@@ -385,11 +387,11 @@ mod tests {
     fn executor_preserves_specific_termination_when_finishing() {
         let mut executor = KernelExecutorState::new();
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
+            executor.begin_round(false, Duration::ZERO),
             KernelRunPermit::Proceed { round: 1, .. }
         ));
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
+            executor.begin_round(false, Duration::ZERO),
             KernelRunPermit::Proceed { round: 2, .. }
         ));
         assert_eq!(executor.completed_rounds(), 2);
@@ -406,24 +408,19 @@ mod tests {
 
     #[test]
     fn executor_run_permit_prioritizes_deadline_and_reports_remaining_time() {
-        let mut executor = KernelExecutorState::new();
+        let mut executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+            wall_time_ms: 10_000,
+            ..KernelExecutorLimits::default()
+        });
         assert_eq!(
-            executor.begin_round(
-                false,
-                Duration::from_secs(4),
-                Duration::from_secs(10),
-            ),
+            executor.begin_round(false, Duration::from_secs(4)),
             KernelRunPermit::Proceed {
                 round: 1,
                 remaining: Duration::from_secs(6)
             }
         );
         assert_eq!(
-            executor.begin_round(
-                true,
-                Duration::from_secs(10),
-                Duration::from_secs(10),
-            ),
+            executor.begin_round(true, Duration::from_secs(10)),
             KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded)
         );
         assert_eq!(executor.completed_rounds(), 1);
@@ -437,11 +434,7 @@ mod tests {
     fn executor_run_permit_records_user_cancellation() {
         let mut executor = KernelExecutorState::new();
         assert_eq!(
-            executor.begin_round(
-                true,
-                Duration::from_secs(1),
-                Duration::from_secs(10),
-            ),
+            executor.begin_round(true, Duration::from_secs(1)),
             KernelRunPermit::Halt(KernelRunTermination::UserCancelled)
         );
         assert_eq!(executor.completed_rounds(), 0);
@@ -454,6 +447,7 @@ mod tests {
     #[test]
     fn executor_tool_attempt_budget_counts_rejected_attempt() {
         let mut executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+            wall_time_ms: u64::MAX,
             round_limit: Some(10),
             tool_attempt_limit: Some(2),
             remediation_limit: usize::MAX,
@@ -495,6 +489,7 @@ mod tests {
             Some("max_tool_calls_exceeded")
         );
         let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["limits"]["wall_time_ms"], u64::MAX);
         assert_eq!(json["limits"]["round_limit"], 10);
         assert_eq!(json["limits"]["tool_attempt_limit"], 2);
         assert_eq!(json["round_counters"]["empty_rounds"], 0);
@@ -508,7 +503,7 @@ mod tests {
             ..KernelExecutorLimits::default()
         });
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
+            executor.begin_round(false, Duration::ZERO),
             KernelRunPermit::Proceed { .. }
         ));
         let error = executor
@@ -623,11 +618,7 @@ mod tests {
         executor.terminate(KernelRunTermination::ToolLoopExhausted);
 
         assert_eq!(
-            executor.begin_round(
-                true,
-                Duration::from_secs(20),
-                Duration::from_secs(10),
-            ),
+            executor.begin_round(true, Duration::from_secs(20)),
             KernelRunPermit::Halt(KernelRunTermination::ToolLoopExhausted)
         );
         assert_eq!(executor.completed_rounds(), 0);
@@ -717,11 +708,11 @@ mod tests {
             ..KernelExecutorLimits::default()
         });
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
+            executor.begin_round(false, Duration::ZERO),
             KernelRunPermit::Proceed { round: 1, .. }
         ));
         assert_eq!(
-            executor.begin_round(true, Duration::from_secs(20), Duration::from_secs(10)),
+            executor.begin_round(true, Duration::from_secs(20)),
             KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded)
         );
         assert_eq!(executor.completed_rounds(), 1);

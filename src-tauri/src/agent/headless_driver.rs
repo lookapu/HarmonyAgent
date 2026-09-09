@@ -554,17 +554,16 @@ impl HeadlessAgentDriver {
         
         // UI/headless 共用 executor 状态：轮级路由、循环治理、唯一终止原因。
         let mut kernel_executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+            wall_time_ms: task.limits.wall_time_seconds.saturating_mul(1_000),
             round_limit: Some(round_limit as u64),
             tool_attempt_limit: Some(task.limits.max_tool_calls),
             remediation_limit: MAX_REMEDIATION_ROUNDS,
         });
         
         'rounds: loop {
-            let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
             let (round, remaining) = match kernel_executor.begin_round(
                 false,
                 started.elapsed(),
-                wall_time,
             ) {
                 KernelRunPermit::Proceed { round, remaining } => (round, remaining),
                 KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded) => break,

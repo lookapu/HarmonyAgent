@@ -4195,12 +4195,6 @@ async fn stream_chat_inner(
     // 截断续写时上轮“正文为空但思考非空”（推理模型 reasoning 耗尽预算被截断）：
     // 续写指令改为要求直接输出结论/工具调用，避免再次思考耗尽预算空转
     let mut continuation_reasoning_only = false;
-    // 共用 executor 状态：统一持有轮级路由、工具循环检测与终止状态。
-    let mut kernel_executor = KernelExecutorState::with_limits(KernelExecutorLimits {
-        round_limit: None,
-        tool_attempt_limit: None,
-        remediation_limit: execution_budget.remediation_rounds,
-    });
     let mut continuation_text = String::new();
     // 多模态图片附加计数：已附加到请求的图片数（用户首轮上传 + 工具轮次 take_screenshot 产生的截图），
     // 每轮只附加新增部分到最新 user 消息（通常是刚注入的工具结果），避免重复注入历史图
@@ -4232,6 +4226,13 @@ async fn stream_chat_inner(
         .map(|s| (s.saturating_mul(1000)) as i64)
         .map(|configured| configured.min(execution_budget.duration_ms))
         .unwrap_or(execution_budget.duration_ms);
+    // 共用 executor 状态：创建时冻结本次运行的墙钟与治理限制。
+    let mut kernel_executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+        wall_time_ms: task_deadline_ms.max(0) as u64,
+        round_limit: None,
+        tool_attempt_limit: None,
+        remediation_limit: execution_budget.remediation_rounds,
+    });
     // 任务账本（Ledger 协议）状态：目标=首轮用户消息摘要；prev_ledger 为上次未完成任务
     // 落库的账本（断点续跑继承，编号从旧账本最大编号续接）；任务结束按完成/未完成保存或清空
     let task_goal = goal_contract.original_goal
@@ -4314,7 +4315,6 @@ async fn stream_chat_inner(
         let run_permit = kernel_executor.begin_round(
             is_cancelled(cancel, &conversation_id),
             task_started.elapsed(),
-            std::time::Duration::from_millis(task_deadline_ms.max(0) as u64),
         );
         // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
         if matches!(
