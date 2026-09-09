@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AL 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理、executor 状态与单调时钟所有者，单一 IO run-loop 的生产 adapter 迁移仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—AM 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理、executor 状态与单调时钟所有者，单一 IO run-loop 的生产 adapter 迁移仍是后续收敛项
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -520,6 +520,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AJ | 活跃 executor checkpoint（版本化保存 router/governor/计数/首因，恢复时计入停机墙钟） | ✅ COMPLETED |
 | AK | checkpoint 参数脱敏（loop 等价键改为稳定 SHA-256 指纹，禁止持久化原始工具参数） | ✅ COMPLETED |
 | AL | headless 安全点持久化（下一 Provider 轮前与每个工具结果后写入 executor checkpoint 事件） | ✅ COMPLETED |
+| AM | checkpoint 恢复不变量（冻结预算与 router/governor 可达计数校验，篡改/损坏状态失败关闭） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -555,7 +556,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - `KernelIoPort` 把 adapter 限定为“执行一轮 IO 并返回 Continue/Stop”；`KernelIoRunLoop::run` 唯一负责循环、取消采样、Provider 安全点与吸收态退出，并以脚本端口验证 adapter 主动停止和固定回合耗尽两条路径。现有 UI/headless 生产循环尚待迁入该异步入口
 - `KernelExecutorCheckpoint` 以独立 schema v1 保存完整 executor 活跃状态；恢复时通过“恢复前累计耗时 + 本进程单调耗时”把停机时长计入 elapsed，不能靠重启或 `Instant` 回溯溢出刷新 wall-time。未知版本或系统时钟倒退会失败关闭；这仍不包含 adapter 的 messages/工具结果等 IO 状态，完整运行恢复需由生产端口组合持久化
 - loop governor 的重复调用键已改为长度定界的 SHA-256 指纹；循环语义不变，但 checkpoint 不再复制原始工具参数。headless 在下一 Provider 轮前及每个工具结果后把 checkpoint 同时写入 session event/trajectory，为后续自动恢复保留安全点
-- Rust lib 共 951 项：943 通过、8 项按环境条件忽略；前端 113 项通过
+- checkpoint 恢复会重新验证冻结的 round/tool/remediation 预算，以及 round router 与 loop governor 计数是否处于运行时可达范围；序列化结构即使能反序列化，也不能携带超限状态绕过治理
+- Rust lib 共 952 项：944 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -606,7 +608,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AL 已完成；后续继续把生产 adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AM 已完成；后续继续把生产 adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

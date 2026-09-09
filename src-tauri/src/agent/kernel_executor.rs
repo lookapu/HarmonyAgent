@@ -11,6 +11,8 @@ use crate::agent::agent_kernel::{
 use crate::agent::kernel_loop::{
     KernelBudgetVerdict, KernelLoopGovernor, KernelLoopVerdict, KernelRoundCounters,
     KernelRoundDecision, KernelRoundInput, KernelRoundRouter, KernelToolBudgetGate,
+    KERNEL_MAX_CONTINUATION_ROUNDS, KERNEL_MAX_EMPTY_ROUNDS, KERNEL_MAX_FAKE_CALL_CORRECTIONS,
+    KERNEL_MAX_INTERRUPT_RETRY_ROUNDS, KERNEL_MAX_LOOP_BREAKS, KERNEL_MAX_STREAM_REPLAYS,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -187,6 +189,7 @@ impl KernelIoRunLoop {
         if now_ms < checkpoint.checkpointed_at_ms {
             return Err("系统时钟早于 executor checkpoint，拒绝恢复墙钟预算".into());
         }
+        checkpoint.state.validate_checkpoint_state()?;
         let total_elapsed_ms = checkpoint
             .elapsed_ms
             .saturating_add(now_ms - checkpoint.checkpointed_at_ms);
@@ -253,6 +256,39 @@ impl KernelExecutorState {
             limits,
             ..Self::default()
         }
+    }
+
+    fn validate_checkpoint_state(&self) -> Result<(), String> {
+        if self
+            .limits
+            .round_limit
+            .is_some_and(|limit| self.completed_rounds > limit)
+        {
+            return Err("executor checkpoint 的 completed_rounds 超过冻结上限".into());
+        }
+        if self
+            .limits
+            .tool_attempt_limit
+            .is_some_and(|limit| self.tool_attempts > limit.saturating_add(1))
+        {
+            return Err("executor checkpoint 的 tool_attempts 超过可达范围".into());
+        }
+        if self.remediation_rounds > self.limits.remediation_limit {
+            return Err("executor checkpoint 的 remediation_rounds 超过冻结上限".into());
+        }
+        if self.tools.loop_breaks() > KERNEL_MAX_LOOP_BREAKS.saturating_add(1) {
+            return Err("executor checkpoint 的 loop_breaks 超过可达范围".into());
+        }
+        let counters = self.rounds.counters();
+        if counters.empty_rounds > KERNEL_MAX_EMPTY_ROUNDS
+            || counters.stream_replays > KERNEL_MAX_STREAM_REPLAYS
+            || counters.interrupted_rounds > KERNEL_MAX_INTERRUPT_RETRY_ROUNDS
+            || counters.continuation_rounds > KERNEL_MAX_CONTINUATION_ROUNDS
+            || counters.fake_corrections > KERNEL_MAX_FAKE_CALL_CORRECTIONS
+        {
+            return Err("executor checkpoint 的 round counters 超过可达范围".into());
+        }
+        Ok(())
     }
 
     pub fn decide_round(&mut self, input: &KernelRoundInput<'_>) -> KernelRoundDecision {
@@ -632,6 +668,30 @@ mod tests {
         assert!(KernelIoRunLoop::restore(checkpoint)
             .unwrap_err()
             .contains("schema_version"));
+    }
+
+    #[test]
+    fn active_checkpoint_rejects_impossible_persisted_counters() {
+        let run_loop = KernelIoRunLoop::new(KernelExecutorLimits {
+            wall_time_ms: 60_000,
+            round_limit: Some(2),
+            tool_attempt_limit: Some(3),
+            remediation_limit: 1,
+        });
+        let base = serde_json::to_value(run_loop.checkpoint()).unwrap();
+        for (path, value, expected) in [
+            ("/state/completed_rounds", 3_u64, "completed_rounds"),
+            ("/state/tool_attempts", 5_u64, "tool_attempts"),
+            ("/state/remediation_rounds", 2_u64, "remediation_rounds"),
+            ("/state/rounds/empty_rounds", 3_u64, "round counters"),
+            ("/state/tools/loop_breaks", 4_u64, "loop_breaks"),
+        ] {
+            let mut tampered = base.clone();
+            *tampered.pointer_mut(path).expect("checkpoint field") = serde_json::json!(value);
+            let checkpoint: KernelExecutorCheckpoint = serde_json::from_value(tampered).unwrap();
+            let error = KernelIoRunLoop::restore(checkpoint).unwrap_err();
+            assert!(error.contains(expected), "{path}: {error}");
+        }
     }
 
     #[test]
