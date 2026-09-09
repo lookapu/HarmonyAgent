@@ -174,6 +174,22 @@ impl KernelExecutorState {
         verdict
     }
 
+    /// 成本账本更新后的原子安全点。超限时锁定成本终止原因；若此前已经终止，
+    /// 返回首因而不覆盖，供 adapter 立即停止后续路由和工具执行。
+    pub fn observe_cost_budget(
+        &mut self,
+        exceeded: bool,
+    ) -> Option<KernelRunTermination> {
+        if let Some(reason) = self.termination() {
+            return Some(reason);
+        }
+        if exceeded {
+            self.terminate(KernelRunTermination::CostBudgetExceeded);
+            return Some(KernelRunTermination::CostBudgetExceeded);
+        }
+        None
+    }
+
     pub fn decide_stop(
         &mut self,
         report: AcceptanceReport,
@@ -635,5 +651,22 @@ mod tests {
             KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded)
         );
         assert_eq!(executor.completed_rounds(), 1);
+    }
+
+    #[test]
+    fn executor_owns_cost_budget_termination_and_preserves_first_reason() {
+        let mut executor = KernelExecutorState::new();
+        assert_eq!(executor.observe_cost_budget(false), None);
+        assert_eq!(
+            executor.observe_cost_budget(true),
+            Some(KernelRunTermination::CostBudgetExceeded)
+        );
+
+        let mut already_stopped = KernelExecutorState::new();
+        already_stopped.terminate(KernelRunTermination::UserCancelled);
+        assert_eq!(
+            already_stopped.observe_cost_budget(true),
+            Some(KernelRunTermination::UserCancelled)
+        );
     }
 }

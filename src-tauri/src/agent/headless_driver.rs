@@ -604,13 +604,12 @@ impl HeadlessAgentDriver {
             )
             .map_err(AgentDriverError::Failed)?;
             messages.push(turn.provider_message.clone());
-            if cost_exceeded {
-                kernel_executor.terminate(KernelRunTermination::CostBudgetExceeded);
+            if let Some(reason) = kernel_executor.observe_cost_budget(cost_exceeded) {
                 sink.append(
                     SessionEventType::SystemNote,
-                    json!({"reason":"max_cost_exceeded","cost_cny":outcome.cost_cny}),
+                    json!({"reason":reason.as_str(),"cost_cny":outcome.cost_cny}),
                     "agent_budget_stop",
-                    json!({"reason":"max_cost_exceeded","cost_cny":outcome.cost_cny}),
+                    json!({"reason":reason.as_str(),"cost_cny":outcome.cost_cny}),
                 )
                 .map_err(AgentDriverError::Failed)?;
                 break;
