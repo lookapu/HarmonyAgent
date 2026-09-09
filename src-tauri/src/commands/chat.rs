@@ -22,7 +22,7 @@ use crate::agent::agent_kernel::{
     run_tool_with_retry, retry_notice,
 };
 use crate::agent::kernel_executor::{
-    KernelExecutorFinalization, KernelExecutorState, KernelRunPermit,
+    KernelExecutorFinalization, KernelExecutorLimits, KernelExecutorState, KernelRunPermit,
 };
 use crate::agent::kernel_loop::KernelRoundInput;
 use crate::agent::kernel_history::{KernelHistoryAssembler, KernelHistoryInput, HistoryRow, ToolResult, UserInjection};
@@ -4196,7 +4196,11 @@ async fn stream_chat_inner(
     // 续写指令改为要求直接输出结论/工具调用，避免再次思考耗尽预算空转
     let mut continuation_reasoning_only = false;
     // 共用 executor 状态：统一持有轮级路由、工具循环检测与终止状态。
-    let mut kernel_executor = KernelExecutorState::new();
+    let mut kernel_executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+        round_limit: None,
+        tool_attempt_limit: None,
+        remediation_limit: execution_budget.remediation_rounds,
+    });
     let mut continuation_text = String::new();
     // 多模态图片附加计数：已附加到请求的图片数（用户首轮上传 + 工具轮次 take_screenshot 产生的截图），
     // 每轮只附加新增部分到最新 user 消息（通常是刚注入的工具结果），避免重复注入历史图
@@ -4311,7 +4315,6 @@ async fn stream_chat_inner(
             is_cancelled(cancel, &conversation_id),
             task_started.elapsed(),
             std::time::Duration::from_millis(task_deadline_ms.max(0) as u64),
-            None,
         );
         // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
         if matches!(
@@ -5196,7 +5199,7 @@ async fn stream_chat_inner(
                 trace_id.clone(),
             );
             for (tool, args_raw) in calls {
-                let verdict = match kernel_executor.begin_tool_attempt(&tool, &args_raw, None) {
+                let verdict = match kernel_executor.begin_tool_attempt(&tool, &args_raw) {
                     crate::agent::kernel_executor::KernelToolAttemptDecision::Observed {
                         verdict,
                         ..
@@ -6123,10 +6126,7 @@ async fn stream_chat_inner(
                 report,
                 prompt,
                 round,
-            } = kernel_executor.decide_stop(
-                report,
-                execution_budget.remediation_rounds,
-            ) {
+            } = kernel_executor.decide_stop(report) {
                 correction_text = crate::agent::tools::strip_tool_calls(&text);
                 correction_hint = prompt;
                 if let Ok(conn) = state.0.lock() {

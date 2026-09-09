@@ -34,9 +34,7 @@ pub enum KernelToolAttemptDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelExecutorFinalization {
-    FixedRounds {
-        round_limit: u64,
-    },
+    FixedRounds,
     Acceptance {
         governance_exhausted: bool,
         acceptance_passed: bool,
@@ -44,9 +42,27 @@ pub enum KernelExecutorFinalization {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct KernelExecutorLimits {
+    pub round_limit: Option<u64>,
+    pub tool_attempt_limit: Option<u64>,
+    pub remediation_limit: usize,
+}
+
+impl Default for KernelExecutorLimits {
+    fn default() -> Self {
+        Self {
+            round_limit: None,
+            tool_attempt_limit: None,
+            remediation_limit: usize::MAX,
+        }
+    }
+}
+
 /// 跨 adapter 稳定的 executor 最终快照，可直接写入桌面 run event 或 headless trajectory。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct KernelExecutorSnapshot {
+    pub limits: KernelExecutorLimits,
     pub steps: u64,
     pub tool_attempts: u64,
     pub remediation_rounds: usize,
@@ -58,6 +74,7 @@ pub struct KernelExecutorSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub struct KernelExecutorState {
+    limits: KernelExecutorLimits,
     rounds: KernelRoundRouter,
     tools: KernelLoopGovernor,
     run: KernelRunState,
@@ -67,8 +84,15 @@ pub struct KernelExecutorState {
 }
 
 impl KernelExecutorState {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_limits(limits: KernelExecutorLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
     }
 
     pub fn decide_round(&mut self, input: &KernelRoundInput<'_>) -> KernelRoundDecision {
@@ -93,12 +117,15 @@ impl KernelExecutorState {
         cancelled: bool,
         elapsed: Duration,
         deadline: Duration,
-        round_limit: Option<u64>,
     ) -> KernelRunPermit {
         if let Some(reason) = self.termination() {
             return KernelRunPermit::Halt(reason);
         }
-        if round_limit.is_some_and(|limit| self.completed_rounds >= limit) {
+        if self
+            .limits
+            .round_limit
+            .is_some_and(|limit| self.completed_rounds >= limit)
+        {
             self.terminate(KernelRunTermination::MaxStepsExceeded);
             return KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded);
         }
@@ -124,8 +151,8 @@ impl KernelExecutorState {
         &mut self,
         tool: &str,
         args: &str,
-        limit: Option<u64>,
     ) -> KernelToolAttemptDecision {
+        let limit = self.limits.tool_attempt_limit;
         if let Some(reason) = self.termination() {
             return KernelToolAttemptDecision::Halt {
                 reason,
@@ -205,9 +232,12 @@ impl KernelExecutorState {
     pub fn decide_stop(
         &mut self,
         report: AcceptanceReport,
-        max_remediation_rounds: usize,
     ) -> KernelStopDecision {
-        decide_stop_candidate(report, &mut self.remediation_rounds, max_remediation_rounds)
+        decide_stop_candidate(
+            report,
+            &mut self.remediation_rounds,
+            self.limits.remediation_limit,
+        )
     }
 
     /// 对没有后置 ship/review 门的 adapter 执行终态停止裁决。
@@ -215,9 +245,8 @@ impl KernelExecutorState {
     pub fn decide_terminal_stop(
         &mut self,
         report: AcceptanceReport,
-        max_remediation_rounds: usize,
     ) -> KernelStopDecision {
-        let decision = self.decide_stop(report, max_remediation_rounds);
+        let decision = self.decide_stop(report);
         match &decision {
             KernelStopDecision::Accepted(_) => {
                 self.terminate(KernelRunTermination::ModelAccepted);
@@ -259,6 +288,7 @@ impl KernelExecutorState {
             .termination()
             .ok_or_else(|| "executor 尚未终止，禁止生成最终快照".to_string())?;
         Ok(KernelExecutorSnapshot {
+            limits: self.limits,
             steps: self.completed_rounds,
             tool_attempts: self.tool_attempts,
             remediation_rounds: self.remediation_rounds,
@@ -276,7 +306,11 @@ impl KernelExecutorState {
         mode: KernelExecutorFinalization,
     ) -> Result<KernelExecutorSnapshot, String> {
         match mode {
-            KernelExecutorFinalization::FixedRounds { round_limit } => {
+            KernelExecutorFinalization::FixedRounds => {
+                let round_limit = self
+                    .limits
+                    .round_limit
+                    .ok_or_else(|| "固定回合最终化缺少 round_limit 配置".to_string())?;
                 self.finish(round_limit);
             }
             KernelExecutorFinalization::Acceptance {
@@ -306,7 +340,7 @@ mod tests {
     use crate::agent::kernel_loop::{KernelRoundControl, KERNEL_TOOL_CALL_LOOP_THRESHOLD};
 
     fn observe(executor: &mut KernelExecutorState, tool: &str, args: &str) -> KernelLoopVerdict {
-        match executor.begin_tool_attempt(tool, args, None) {
+        match executor.begin_tool_attempt(tool, args) {
             KernelToolAttemptDecision::Observed { verdict, .. } => verdict,
             KernelToolAttemptDecision::Halt { reason, .. } => {
                 panic!("工具观察被意外终止：{}", reason.as_str())
@@ -351,11 +385,11 @@ mod tests {
     fn executor_preserves_specific_termination_when_finishing() {
         let mut executor = KernelExecutorState::new();
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10), None),
+            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
             KernelRunPermit::Proceed { round: 1, .. }
         ));
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10), None),
+            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
             KernelRunPermit::Proceed { round: 2, .. }
         ));
         assert_eq!(executor.completed_rounds(), 2);
@@ -378,7 +412,6 @@ mod tests {
                 false,
                 Duration::from_secs(4),
                 Duration::from_secs(10),
-                None,
             ),
             KernelRunPermit::Proceed {
                 round: 1,
@@ -390,7 +423,6 @@ mod tests {
                 true,
                 Duration::from_secs(10),
                 Duration::from_secs(10),
-                None,
             ),
             KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded)
         );
@@ -409,7 +441,6 @@ mod tests {
                 true,
                 Duration::from_secs(1),
                 Duration::from_secs(10),
-                None,
             ),
             KernelRunPermit::Halt(KernelRunTermination::UserCancelled)
         );
@@ -422,23 +453,27 @@ mod tests {
 
     #[test]
     fn executor_tool_attempt_budget_counts_rejected_attempt() {
-        let mut executor = KernelExecutorState::new();
+        let mut executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+            round_limit: Some(10),
+            tool_attempt_limit: Some(2),
+            remediation_limit: usize::MAX,
+        });
         assert_eq!(
-            executor.begin_tool_attempt("read_file", r#"{"path":"1.rs"}"#, Some(2)),
+            executor.begin_tool_attempt("read_file", r#"{"path":"1.rs"}"#),
             KernelToolAttemptDecision::Observed {
                 attempt: 1,
                 verdict: KernelLoopVerdict::Proceed,
             }
         );
         assert_eq!(
-            executor.begin_tool_attempt("read_file", r#"{"path":"2.rs"}"#, Some(2)),
+            executor.begin_tool_attempt("read_file", r#"{"path":"2.rs"}"#),
             KernelToolAttemptDecision::Observed {
                 attempt: 2,
                 verdict: KernelLoopVerdict::Proceed,
             }
         );
         assert_eq!(
-            executor.begin_tool_attempt("read_file", r#"{"path":"3.rs"}"#, Some(2)),
+            executor.begin_tool_attempt("read_file", r#"{"path":"3.rs"}"#),
             KernelToolAttemptDecision::Halt {
                 reason: KernelRunTermination::ToolCallBudgetExceeded,
                 attempted: 3,
@@ -451,7 +486,7 @@ mod tests {
             Some(KernelRunTermination::ToolCallBudgetExceeded)
         );
         let snapshot = executor
-            .finalize(KernelExecutorFinalization::FixedRounds { round_limit: 10 })
+            .finalize(KernelExecutorFinalization::FixedRounds)
             .expect("已终止 executor 应生成最终快照");
         assert_eq!(snapshot.tool_attempts, 3);
         assert_eq!(snapshot.termination_reason, "max_tool_calls_exceeded");
@@ -460,36 +495,53 @@ mod tests {
             Some("max_tool_calls_exceeded")
         );
         let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["limits"]["round_limit"], 10);
+        assert_eq!(json["limits"]["tool_attempt_limit"], 2);
         assert_eq!(json["round_counters"]["empty_rounds"], 0);
         assert_eq!(json["loop_breaks"], 0);
     }
 
     #[test]
     fn executor_rejects_final_snapshot_without_termination() {
-        let mut executor = KernelExecutorState::new();
+        let mut executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+            round_limit: Some(2),
+            ..KernelExecutorLimits::default()
+        });
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10), None),
+            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
             KernelRunPermit::Proceed { .. }
         ));
         let error = executor
-            .finalize(KernelExecutorFinalization::FixedRounds { round_limit: 2 })
+            .finalize(KernelExecutorFinalization::FixedRounds)
             .expect_err("未终止且未跑满时必须失败关闭");
         assert!(error.contains("尚未终止"));
     }
 
     #[test]
-    fn executor_owns_bounded_stop_remediation_count() {
+    fn fixed_round_finalization_requires_frozen_limit() {
         let mut executor = KernelExecutorState::new();
+        let error = executor
+            .finalize(KernelExecutorFinalization::FixedRounds)
+            .expect_err("固定回合模式缺少创建期限制时必须失败关闭");
+        assert!(error.contains("缺少 round_limit"));
+    }
+
+    #[test]
+    fn executor_owns_bounded_stop_remediation_count() {
+        let mut executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+            remediation_limit: 1,
+            ..KernelExecutorLimits::default()
+        });
         let report = crate::agent::acceptance::evaluate_contract(
             &crate::agent::acceptance::GoalContract::compile("修改 a.rs"),
             &[],
         );
         assert!(matches!(
-            executor.decide_stop(report.clone(), 1),
+            executor.decide_stop(report.clone()),
             KernelStopDecision::Remediate { round: 1, .. }
         ));
         assert!(matches!(
-            executor.decide_stop(report, 1),
+            executor.decide_stop(report),
             KernelStopDecision::Exhausted(_)
         ));
         assert_eq!(executor.remediation_rounds(), 1);
@@ -501,9 +553,12 @@ mod tests {
             &crate::agent::acceptance::GoalContract::compile("解释代码"),
             &[],
         );
-        let mut accepted = KernelExecutorState::new();
+        let mut accepted = KernelExecutorState::with_limits(KernelExecutorLimits {
+            remediation_limit: 1,
+            ..KernelExecutorLimits::default()
+        });
         assert!(matches!(
-            accepted.decide_terminal_stop(passed, 1),
+            accepted.decide_terminal_stop(passed),
             KernelStopDecision::Accepted(_)
         ));
         assert_eq!(
@@ -515,9 +570,12 @@ mod tests {
             &crate::agent::acceptance::GoalContract::compile("修改 a.rs"),
             &[],
         );
-        let mut exhausted = KernelExecutorState::new();
+        let mut exhausted = KernelExecutorState::with_limits(KernelExecutorLimits {
+            remediation_limit: 0,
+            ..KernelExecutorLimits::default()
+        });
         assert!(matches!(
-            exhausted.decide_terminal_stop(missing, 0),
+            exhausted.decide_terminal_stop(missing),
             KernelStopDecision::Exhausted(_)
         ));
         assert_eq!(
@@ -569,7 +627,6 @@ mod tests {
                 true,
                 Duration::from_secs(20),
                 Duration::from_secs(10),
-                None,
             ),
             KernelRunPermit::Halt(KernelRunTermination::ToolLoopExhausted)
         );
@@ -584,7 +641,7 @@ mod tests {
     fn executor_terminal_state_is_absorbing_at_tool_boundary() {
         let mut executor = KernelExecutorState::new();
         assert_eq!(
-            executor.begin_tool_attempt("read_file", r#"{"path":"a.rs"}"#, None),
+            executor.begin_tool_attempt("read_file", r#"{"path":"a.rs"}"#),
             KernelToolAttemptDecision::Observed {
                 attempt: 1,
                 verdict: KernelLoopVerdict::Proceed,
@@ -592,7 +649,7 @@ mod tests {
         );
         executor.terminate(KernelRunTermination::UserCancelled);
         assert_eq!(
-            executor.begin_tool_attempt("read_file", r#"{"path":"b.rs"}"#, None),
+            executor.begin_tool_attempt("read_file", r#"{"path":"b.rs"}"#),
             KernelToolAttemptDecision::Halt {
                 reason: KernelRunTermination::UserCancelled,
                 attempted: 1,
@@ -655,13 +712,16 @@ mod tests {
 
     #[test]
     fn executor_enforces_round_limit_before_starting_next_provider_call() {
-        let mut executor = KernelExecutorState::new();
+        let mut executor = KernelExecutorState::with_limits(KernelExecutorLimits {
+            round_limit: Some(1),
+            ..KernelExecutorLimits::default()
+        });
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10), Some(1)),
+            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
             KernelRunPermit::Proceed { round: 1, .. }
         ));
         assert_eq!(
-            executor.begin_round(true, Duration::from_secs(20), Duration::from_secs(10), Some(1)),
+            executor.begin_round(true, Duration::from_secs(20), Duration::from_secs(10)),
             KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded)
         );
         assert_eq!(executor.completed_rounds(), 1);
