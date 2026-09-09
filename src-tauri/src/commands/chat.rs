@@ -4309,6 +4309,7 @@ async fn stream_chat_inner(
             is_cancelled(cancel, &conversation_id),
             task_started.elapsed(),
             std::time::Duration::from_millis(task_deadline_ms.max(0) as u64),
+            None,
         );
         // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
         if matches!(

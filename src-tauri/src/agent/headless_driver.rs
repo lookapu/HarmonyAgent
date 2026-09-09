@@ -554,10 +554,16 @@ impl HeadlessAgentDriver {
         // UI/headless 共用 executor 状态：轮级路由、循环治理、唯一终止原因。
         let mut kernel_executor = KernelExecutorState::new();
         
-        'rounds: for _ in 0..round_limit {
+        'rounds: loop {
             let wall_time = Duration::from_secs(task.limits.wall_time_seconds);
-            let (round, remaining) = match kernel_executor.begin_round(false, started.elapsed(), wall_time) {
+            let (round, remaining) = match kernel_executor.begin_round(
+                false,
+                started.elapsed(),
+                wall_time,
+                Some(round_limit as u64),
+            ) {
                 KernelRunPermit::Proceed { round, remaining } => (round, remaining),
+                KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded) => break,
                 KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded) => {
                     return Err(AgentDriverError::Cancelled(
                         "builtin driver 超过 wall time".into(),
@@ -1428,6 +1434,14 @@ mod tests {
             .trajectory
             .iter()
             .any(|event| event.kind == "tool_loop_correction"));
+        let finished = outcome
+            .trajectory
+            .iter()
+            .find(|event| event.kind == "driver_finished")
+            .expect("回合上限必须由 executor 写入最终事件");
+        assert_eq!(finished.fields["termination_reason"], "max_steps_exceeded");
+        assert_eq!(finished.fields["steps"], 1);
+        assert_eq!(finished.fields["tool_attempts"], 5);
         std::fs::remove_dir_all(workspace).ok();
     }
 

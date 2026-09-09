@@ -74,16 +74,21 @@ impl KernelExecutorState {
         self.completed_rounds
     }
 
-    /// 每次 Provider 请求前的原子安全点。deadline 优先于取消，与桌面历史顺序一致；
-    /// 仅在放行时推进一次回合计数，同时返回 1-based round 与剩余墙钟预算。
+    /// 每次 Provider 请求前的原子安全点。已有终态与回合上限先于新一轮 deadline/取消，
+    /// deadline 优先于取消；仅在放行时推进计数并返回 1-based round 与剩余墙钟预算。
     pub fn begin_round(
         &mut self,
         cancelled: bool,
         elapsed: Duration,
         deadline: Duration,
+        round_limit: Option<u64>,
     ) -> KernelRunPermit {
         if let Some(reason) = self.termination() {
             return KernelRunPermit::Halt(reason);
+        }
+        if round_limit.is_some_and(|limit| self.completed_rounds >= limit) {
+            self.terminate(KernelRunTermination::MaxStepsExceeded);
+            return KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded);
         }
         if elapsed >= deadline {
             self.terminate(KernelRunTermination::DeadlineExceeded);
@@ -327,11 +332,11 @@ mod tests {
     fn executor_preserves_specific_termination_when_finishing() {
         let mut executor = KernelExecutorState::new();
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
+            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10), None),
             KernelRunPermit::Proceed { round: 1, .. }
         ));
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
+            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10), None),
             KernelRunPermit::Proceed { round: 2, .. }
         ));
         assert_eq!(executor.completed_rounds(), 2);
@@ -350,14 +355,24 @@ mod tests {
     fn executor_run_permit_prioritizes_deadline_and_reports_remaining_time() {
         let mut executor = KernelExecutorState::new();
         assert_eq!(
-            executor.begin_round(false, Duration::from_secs(4), Duration::from_secs(10)),
+            executor.begin_round(
+                false,
+                Duration::from_secs(4),
+                Duration::from_secs(10),
+                None,
+            ),
             KernelRunPermit::Proceed {
                 round: 1,
                 remaining: Duration::from_secs(6)
             }
         );
         assert_eq!(
-            executor.begin_round(true, Duration::from_secs(10), Duration::from_secs(10)),
+            executor.begin_round(
+                true,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                None,
+            ),
             KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded)
         );
         assert_eq!(executor.completed_rounds(), 1);
@@ -371,7 +386,12 @@ mod tests {
     fn executor_run_permit_records_user_cancellation() {
         let mut executor = KernelExecutorState::new();
         assert_eq!(
-            executor.begin_round(true, Duration::from_secs(1), Duration::from_secs(10)),
+            executor.begin_round(
+                true,
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+                None,
+            ),
             KernelRunPermit::Halt(KernelRunTermination::UserCancelled)
         );
         assert_eq!(executor.completed_rounds(), 0);
@@ -429,7 +449,7 @@ mod tests {
     fn executor_rejects_final_snapshot_without_termination() {
         let mut executor = KernelExecutorState::new();
         assert!(matches!(
-            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10)),
+            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10), None),
             KernelRunPermit::Proceed { .. }
         ));
         let error = executor
@@ -526,7 +546,12 @@ mod tests {
         executor.terminate(KernelRunTermination::ToolLoopExhausted);
 
         assert_eq!(
-            executor.begin_round(true, Duration::from_secs(20), Duration::from_secs(10)),
+            executor.begin_round(
+                true,
+                Duration::from_secs(20),
+                Duration::from_secs(10),
+                None,
+            ),
             KernelRunPermit::Halt(KernelRunTermination::ToolLoopExhausted)
         );
         assert_eq!(executor.completed_rounds(), 0);
@@ -596,5 +621,19 @@ mod tests {
                 .termination_reason,
             "model_accepted"
         );
+    }
+
+    #[test]
+    fn executor_enforces_round_limit_before_starting_next_provider_call() {
+        let mut executor = KernelExecutorState::new();
+        assert!(matches!(
+            executor.begin_round(false, Duration::ZERO, Duration::from_secs(10), Some(1)),
+            KernelRunPermit::Proceed { round: 1, .. }
+        ));
+        assert_eq!(
+            executor.begin_round(true, Duration::from_secs(20), Duration::from_secs(10), Some(1)),
+            KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded)
+        );
+        assert_eq!(executor.completed_rounds(), 1);
     }
 }
