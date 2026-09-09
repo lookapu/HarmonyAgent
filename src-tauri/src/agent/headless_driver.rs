@@ -75,7 +75,7 @@ fn append_executor_checkpoint(
     let checkpoint = serde_json::to_value(run_loop.checkpoint())
         .map_err(|error| AgentDriverError::Failed(error.to_string()))?;
     sink.append(
-        SessionEventType::SystemNote,
+        SessionEventType::ExecutorCheckpoint,
         checkpoint.clone(),
         "executor_checkpoint",
         checkpoint,

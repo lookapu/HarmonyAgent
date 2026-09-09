@@ -32,6 +32,8 @@ pub enum SessionEventType {
     /// 上下文压缩（payload: { trigger, old_limit?, new_limit?, keep? }）——LC-33：
     /// 压缩预警与执行写入事件流，度量预警后用户固定行为与“无预兆压缩”体验
     ContextCompress,
+    /// 活跃 executor 安全点。仅用于恢复，不进入消息历史投影。
+    ExecutorCheckpoint,
 }
 
 impl SessionEventType {
@@ -44,6 +46,7 @@ impl SessionEventType {
             Self::ToolApproval => "tool_approval",
             Self::SystemNote => "system_note",
             Self::ContextCompress => "context_compress",
+            Self::ExecutorCheckpoint => "executor_checkpoint",
         }
     }
 
@@ -55,6 +58,7 @@ impl SessionEventType {
             "tool_result" => Self::ToolResult,
             "tool_approval" => Self::ToolApproval,
             "context_compress" => Self::ContextCompress,
+            "executor_checkpoint" => Self::ExecutorCheckpoint,
             _ => Self::SystemNote,
         }
     }
@@ -134,6 +138,49 @@ pub fn replay(conn: &Connection, conversation_id: &str) -> Result<Vec<SessionEve
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// 读取指定任务 trace 的最新一条类型化事件。
+///
+/// 恢复入口不能扫描普通 system note 猜测 payload；最新记录损坏时也必须失败关闭，
+/// 不能静默回退到更旧的安全点掩盖持久化故障。
+pub fn latest_event_for_trace(
+    conn: &Connection,
+    conversation_id: &str,
+    trace_id: &str,
+    event_type: SessionEventType,
+) -> Result<Option<SessionEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, conversation_id, seq, event_type, payload, trace_id, created_at
+             FROM session_events
+             WHERE conversation_id = ?1 AND trace_id = ?2 AND event_type = ?3
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params![
+            conversation_id,
+            trace_id,
+            event_type.as_str()
+        ])
+        .map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let raw_type: String = row.get(3).map_err(|error| error.to_string())?;
+    let raw_payload: String = row.get(4).map_err(|error| error.to_string())?;
+    let payload = serde_json::from_str(&raw_payload)
+        .map_err(|error| format!("最新 {} 事件 payload 损坏：{error}", event_type.as_str()))?;
+    Ok(Some(SessionEvent {
+        id: row.get(0).map_err(|error| error.to_string())?,
+        conversation_id: row.get(1).map_err(|error| error.to_string())?,
+        seq: row.get(2).map_err(|error| error.to_string())?,
+        event_type: SessionEventType::from_str(&raw_type),
+        payload,
+        trace_id: row.get(5).map_err(|error| error.to_string())?,
+        created_at: row.get(6).map_err(|error| error.to_string())?,
+    }))
 }
 
 /// 统一审计时间线的一条事件：把会话事件与运行事件合并到同一可查询链。
@@ -221,6 +268,8 @@ pub fn derive_messages(conn: &Connection, conversation_id: &str) -> Result<Vec<D
             SessionEventType::ContextCompress => {}
             // 审批决议只进审计链，不进消息历史投影
             SessionEventType::ToolApproval => {}
+            // executor 安全点是控制状态，不得伪装成助手消息进入模型上下文
+            SessionEventType::ExecutorCheckpoint => {}
         }
     }
     Ok(out)
@@ -259,7 +308,9 @@ mod tests {
                 trace_id TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            CREATE INDEX idx_session_events_conv_seq ON session_events(conversation_id, seq);",
+            CREATE INDEX idx_session_events_conv_seq ON session_events(conversation_id, seq);
+            CREATE INDEX idx_session_events_checkpoint_lookup
+                ON session_events(conversation_id, trace_id, event_type, seq DESC);",
         )
         .unwrap();
         conn
@@ -284,6 +335,83 @@ mod tests {
         assert_eq!(events[3].trace_id.as_deref(), Some("tr-1"));
         // 会话隔离
         assert_eq!(count_events(&conn, "c2"), 0);
+    }
+
+    #[test]
+    fn latest_typed_event_is_trace_scoped_and_fails_closed_on_corruption() {
+        let conn = mem_conn();
+        append_event(
+            &conn,
+            "c1",
+            SessionEventType::ExecutorCheckpoint,
+            serde_json::json!({"generation": 1}),
+            Some("trace-a"),
+        )
+        .unwrap();
+        append_event(
+            &conn,
+            "c1",
+            SessionEventType::ExecutorCheckpoint,
+            serde_json::json!({"generation": 2}),
+            Some("trace-a"),
+        )
+        .unwrap();
+        append_event(
+            &conn,
+            "c1",
+            SessionEventType::ExecutorCheckpoint,
+            serde_json::json!({"generation": 9}),
+            Some("trace-b"),
+        )
+        .unwrap();
+
+        let latest = latest_event_for_trace(
+            &conn,
+            "c1",
+            "trace-a",
+            SessionEventType::ExecutorCheckpoint,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest.payload["generation"], 2);
+        assert_eq!(latest.trace_id.as_deref(), Some("trace-a"));
+        let query_plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, conversation_id, seq, event_type, payload, trace_id, created_at
+                 FROM session_events
+                 WHERE conversation_id = ?1 AND trace_id = ?2 AND event_type = ?3
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params!["c1", "trace-a", "executor_checkpoint"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            query_plan.contains("idx_session_events_checkpoint_lookup"),
+            "unexpected query plan: {query_plan}"
+        );
+        assert!(latest_event_for_trace(
+            &conn,
+            "missing",
+            "trace-a",
+            SessionEventType::ExecutorCheckpoint,
+        )
+        .unwrap()
+        .is_none());
+
+        conn.execute(
+            "UPDATE session_events SET payload = '{broken' WHERE id = ?1",
+            [latest.id],
+        )
+        .unwrap();
+        let error = latest_event_for_trace(
+            &conn,
+            "c1",
+            "trace-a",
+            SessionEventType::ExecutorCheckpoint,
+        )
+        .unwrap_err();
+        assert!(error.contains("payload 损坏"));
     }
 
     #[test]
@@ -344,6 +472,7 @@ mod tests {
         append_event(&conn, "c1", SessionEventType::ToolCall, serde_json::json!({"name": "read_file", "args": {"path": "a.txt"}}), Some("t1")).unwrap();
         append_event(&conn, "c1", SessionEventType::ToolResult, serde_json::json!({"ok": false, "output": "not found"}), Some("t1")).unwrap();
         append_event(&conn, "c1", SessionEventType::AssistantMessage, serde_json::json!({"content": "文件不存在"}), Some("t1")).unwrap();
+        append_event(&conn, "c1", SessionEventType::ExecutorCheckpoint, serde_json::json!({"schema_version": 1}), Some("t1")).unwrap();
         let msgs = derive_messages(&conn, "c1").unwrap();
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "user");

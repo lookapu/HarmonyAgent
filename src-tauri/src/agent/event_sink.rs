@@ -4,7 +4,8 @@
 //! 同时产生可审计的 trajectory 事件，避免两套日志手写后发生漂移。
 
 use crate::agent::eval_trajectory::TrajectoryEvent;
-use crate::agent::session_events::{append_event, SessionEventType};
+use crate::agent::kernel_executor::{KernelExecutorCheckpoint, KernelIoRunLoop};
+use crate::agent::session_events::{append_event, latest_event_for_trace, SessionEventType};
 use crate::db::DbState;
 use rusqlite::Connection;
 use serde_json::Value;
@@ -82,6 +83,26 @@ impl SessionTrajectorySink {
     pub fn into_trajectory(self) -> Vec<TrajectoryEvent> {
         self.trajectory
     }
+
+    /// 恢复当前 conversation/trace 的最新 executor 安全点。
+    ///
+    /// adapter 的 messages、工具结果和验收证据尚未纳入该 checkpoint，因此调用方只能
+    /// 把它作为内核状态恢复边界，不能据此宣称完整运行已经可续跑。
+    pub fn restore_latest_executor(&self) -> Result<Option<KernelIoRunLoop>, String> {
+        let conn = self.conn.lock().map_err(|error| error.to_string())?;
+        let Some(event) = latest_event_for_trace(
+            &conn,
+            &self.conversation_id,
+            &self.trace_id,
+            SessionEventType::ExecutorCheckpoint,
+        )? else {
+            return Ok(None);
+        };
+        drop(conn);
+        let checkpoint: KernelExecutorCheckpoint = serde_json::from_value(event.payload)
+            .map_err(|error| format!("executor checkpoint 反序列化失败：{error}"))?;
+        KernelIoRunLoop::restore(checkpoint).map(Some)
+    }
 }
 
 impl AgentEventSink for SessionTrajectorySink {
@@ -113,6 +134,8 @@ impl AgentEventSink for SessionTrajectorySink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::agent_kernel::KernelRunTermination;
+    use crate::agent::kernel_executor::{KernelExecutorLimits, KernelRunPermit};
     use crate::agent::session_events::replay;
 
     #[test]
@@ -128,5 +151,43 @@ mod tests {
         assert_eq!(sink.trajectory.len(), 1);
         let conn = sink.connection();
         assert_eq!(replay(&conn.lock().unwrap(), "conv").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn restores_latest_executor_checkpoint_for_exact_trace() {
+        let mut sink = SessionTrajectorySink::in_memory("conv".into(), "trace".into()).unwrap();
+        assert!(sink.restore_latest_executor().unwrap().is_none());
+        let mut run_loop = KernelIoRunLoop::new(KernelExecutorLimits {
+            wall_time_ms: 60_000,
+            round_limit: Some(3),
+            tool_attempt_limit: Some(3),
+            remediation_limit: 1,
+        });
+        assert!(matches!(
+            run_loop.begin_next_round(false),
+            KernelRunPermit::Proceed { round: 1, .. }
+        ));
+        let checkpoint = serde_json::to_value(run_loop.checkpoint()).unwrap();
+        sink.append(
+            SessionEventType::ExecutorCheckpoint,
+            checkpoint.clone(),
+            "executor_checkpoint",
+            checkpoint,
+        )
+        .unwrap();
+
+        let mut restored = sink.restore_latest_executor().unwrap().unwrap();
+        assert!(matches!(
+            restored.begin_next_round(false),
+            KernelRunPermit::Proceed { round: 2, .. }
+        ));
+        assert!(matches!(
+            restored.begin_next_round(false),
+            KernelRunPermit::Proceed { round: 3, .. }
+        ));
+        assert!(matches!(
+            restored.begin_next_round(false),
+            KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded)
+        ));
     }
 }

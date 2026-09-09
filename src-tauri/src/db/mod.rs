@@ -157,6 +157,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (77, "077_project_pin", include_str!("../../migrations/077_project_pin.sql")),
     (78, "078_provider_auto_pool", include_str!("../../migrations/078_provider_auto_pool.sql")),
     (79, "079_agent_run_approved_plan", include_str!("../../migrations/079_agent_run_approved_plan.sql")),
+    (80, "080_session_event_checkpoint_lookup", include_str!("../../migrations/080_session_event_checkpoint_lookup.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {

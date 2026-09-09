@@ -840,6 +840,10 @@ fn render_trace_chain(out: &mut String, events: &[&crate::agent::session_events:
                 let trigger = ev.payload.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
                 out.push_str(&format!("{}. [{when}] 🗜️ 上下文压缩（{}）\n", i + 1, trigger));
             }
+            T::ExecutorCheckpoint => {
+                let version = ev.payload.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                out.push_str(&format!("{}. [{when}] 💾 Executor 安全点（v{}）\n", i + 1, version));
+            }
         }
     }
 }
@@ -1005,4 +1009,3 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
         }
     }
 }
-
