@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AP 已落地；UI/headless 已共享请求、流治理、预算、验收、历史组装策略、循环治理、executor 状态与单调时钟所有者，单一 IO run-loop 的生产 adapter 迁移仍是后续收敛项
+> 状态：Phase 0—3 与 Phase 4 A—AQ 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI adapter 仍待迁移
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -478,7 +478,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 验收：同一 stub provider 脚本在 UI adapter 和 headless adapter 上产生等价决策轨迹。
 
-**Phase 4 实施状态（2026-09-09 更新）**：
+**Phase 4 实施状态（2026-09-10 更新）**：
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -524,6 +524,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AN | checkpoint 类型化读取（独立事件不污染消息投影，按 conversation/trace 精确选取最新安全点、复合索引加速并严格恢复） | ✅ COMPLETED |
 | AO | 端口可信 checkpoint clock（轮内工具安全点复用内核单调时钟，adapter 不能注入 elapsed） | ✅ COMPLETED |
 | AP | Provider 边界 checkpoint hook（统一 run-loop 生成并要求端口持久化，adapter 不再手写时机） | ✅ COMPLETED |
+| AQ | headless 生产端口迁移（Provider/路由/验收/工具/事件单轮 IO 进入 `KernelIoPort`，外循环唯一化） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -563,6 +564,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - checkpoint 使用独立 `executor_checkpoint` 会话事件，不再作为 system note 派生为空助手消息；`SessionTrajectorySink::restore_latest_executor` 按 conversation + trace + 类型读取最新安全点，专用 `(conversation_id, trace_id, event_type, seq DESC)` 索引避免长会话扫描。最新 payload 损坏、版本未知、时钟倒退或状态不可达都会失败关闭，不会静默降级到旧 checkpoint。当前仍只恢复 executor，不能替代 adapter IO 状态恢复
 - `KernelIoClock` 把 run-loop 的单调起点与恢复前累计耗时封装为只读能力，并随 `KernelIoPort::run_round` 借给 adapter；端口可在每个工具结果后调用 `clock.checkpoint(executor)`，但不能改写时钟或向 Provider 治理入口注入自算 elapsed，避免生产迁移为了保留轮内安全点重新打开预算旁路
 - `KernelIoRunLoop::run` 在首轮之后、每次尝试进入下一 Provider 边界前生成 checkpoint，并通过 `KernelIoPort::persist_checkpoint` 强制交给 adapter；即使下一步因固定回合上限或已有终态被吸收，也会先留下最后一个已完成回合的状态。端口只实现落库，边界时机和 elapsed 均由内核所有
+- headless 的生产 `HeadlessIoPort` 现只实现单轮 Provider、路由、验收、工具与事件 IO；回合循环、Provider 边界安全裁决、停止吸收和边界 checkpoint 全部由 `KernelIoRunLoop::run` 驱动。工具结果后使用端口收到的可信 clock 立即落安全点；集成测试同时断言两类 checkpoint，原有 25 条 headless 差分/治理测试保持通过
 - Rust lib 共 954 项：946 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
@@ -614,7 +616,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AP 已完成；后续继续把生产 adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AQ 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

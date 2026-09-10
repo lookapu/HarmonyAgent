@@ -12,8 +12,9 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
 use crate::agent::kernel_executor::{
-    KernelExecutorFinalization, KernelExecutorLimits, KernelIoRunLoop, KernelRunPermit,
-    KernelToolAttemptDecision,
+    KernelExecutorCheckpoint, KernelExecutorFinalization, KernelExecutorLimits,
+    KernelExecutorState, KernelIoClock, KernelIoPort, KernelIoRoundControl, KernelIoRunExit,
+    KernelIoRunLoop, KernelToolAttemptDecision,
 };
 use crate::agent::kernel_loop::{KernelRoundControl, KernelRoundInput};
 use crate::agent::kernel_history::continuation_instruction;
@@ -68,11 +69,11 @@ fn bounded_tool_output(value: String) -> (String, bool) {
     }
 }
 
-fn append_executor_checkpoint(
+fn append_executor_checkpoint_value(
     sink: &mut SessionTrajectorySink,
-    run_loop: &KernelIoRunLoop,
+    checkpoint: KernelExecutorCheckpoint,
 ) -> Result<(), AgentDriverError> {
-    let checkpoint = serde_json::to_value(run_loop.checkpoint())
+    let checkpoint = serde_json::to_value(checkpoint)
         .map_err(|error| AgentDriverError::Failed(error.to_string()))?;
     sink.append(
         SessionEventType::ExecutorCheckpoint,
@@ -528,6 +529,375 @@ impl HeadlessModelClient for OpenAiCompatibleClient {
     }
 }
 
+struct HeadlessIoPort<'a> {
+    client: &'a dyn HeadlessModelClient,
+    provider: &'a HeadlessProviderConfig,
+    request_timeout: Duration,
+    task: &'a EvalTask,
+    runtime: &'a HeadlessToolRuntime,
+    sink: &'a mut SessionTrajectorySink,
+    acceptance: &'a mut KernelAcceptanceGate,
+    usage: &'a mut KernelUsageLedger,
+    messages: &'a mut Vec<Value>,
+    outcome: &'a mut AgentDriverOutcome,
+}
+
+impl KernelIoPort for HeadlessIoPort<'_> {
+    type Error = AgentDriverError;
+
+    fn cancelled(&mut self) -> bool {
+        false
+    }
+
+    fn persist_checkpoint(
+        &mut self,
+        checkpoint: KernelExecutorCheckpoint,
+    ) -> Result<(), Self::Error> {
+        append_executor_checkpoint_value(self.sink, checkpoint)
+    }
+
+    fn run_round<'a>(
+        &'a mut self,
+        executor: &'a mut KernelExecutorState,
+        clock: &'a KernelIoClock,
+        round: u64,
+        remaining: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<KernelIoRoundControl, Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.outcome.steps = round;
+            let request_timeout = self.request_timeout.min(remaining);
+            let (turn, retries) = self
+                .client
+                .request(self.provider, self.messages.clone(), request_timeout)
+                .await?;
+            self.outcome.retries = self.outcome.retries.saturating_add(retries);
+            let cost_exceeded = self
+                .usage
+                .record(turn.usage.as_ref())
+                .map_err(AgentDriverError::Failed)?;
+            self.outcome.input_tokens = self.usage.input_tokens;
+            self.outcome.output_tokens = self.usage.output_tokens;
+            self.outcome.cached_tokens = self.usage.cached_tokens;
+            self.outcome.cost_cny = self.usage.cost_cny;
+            if turn.was_truncated() {
+                self.outcome
+                    .failure_taxonomy
+                    .push("provider_truncated".into());
+            }
+            self.sink
+                .append(
+                    SessionEventType::AssistantMessage,
+                    json!({"content":turn.content,"tool_calls":turn.tool_calls.len()}),
+                    "assistant_message",
+                    json!({"chars":turn.content.len(),"tool_calls":turn.tool_calls.len()}),
+                )
+                .map_err(AgentDriverError::Failed)?;
+            self.messages.push(turn.provider_message.clone());
+            if let Some(reason) = executor.observe_cost_budget(cost_exceeded) {
+                self.sink
+                    .append(
+                        SessionEventType::SystemNote,
+                        json!({"reason":reason.as_str(),"cost_cny":self.outcome.cost_cny}),
+                        "agent_budget_stop",
+                        json!({"reason":reason.as_str(),"cost_cny":self.outcome.cost_cny}),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                return Ok(KernelIoRoundControl::Stop);
+            }
+
+            let has_reasoning = turn
+                .provider_message
+                .get("reasoning_content")
+                .or_else(|| turn.provider_message.get("reasoning"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+            let decision = executor.decide_round(&KernelRoundInput {
+                text: &turn.content,
+                has_reasoning,
+                truncated: turn.was_truncated(),
+                interrupted: false,
+                has_native_tool_calls: !turn.tool_calls.is_empty(),
+            });
+            for notice in decision.notices {
+                self.sink
+                    .append(
+                        SessionEventType::SystemNote,
+                        json!({"notice": notice}),
+                        "round_notice",
+                        json!({"notice": notice}),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+            }
+            match decision.control {
+                KernelRoundControl::Proceed
+                | KernelRoundControl::ReplayFrozen
+                | KernelRoundControl::ContinueInterrupted { .. } => {}
+                KernelRoundControl::RetryEmpty { hint } => {
+                    self.sink
+                        .append(
+                            SessionEventType::SystemNote,
+                            json!({"hint": hint}),
+                            "round_retry_empty",
+                            json!({"hint": hint}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                    self.messages.push(json!({"role":"user","content":hint}));
+                    return Ok(KernelIoRoundControl::Continue);
+                }
+                KernelRoundControl::StopEmpty { note } => {
+                    self.sink
+                        .append(
+                            SessionEventType::SystemNote,
+                            json!({"note": note}),
+                            "round_stop_empty",
+                            json!({"note": note}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                    return Ok(KernelIoRoundControl::Stop);
+                }
+                KernelRoundControl::ContinueTruncated {
+                    continuation_text,
+                    reasoning_only,
+                } => {
+                    let prompt = continuation_instruction(reasoning_only);
+                    self.sink
+                        .append(
+                            SessionEventType::SystemNote,
+                            json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
+                            "round_continuation_truncated",
+                            json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                    self.messages.push(json!({"role":"user","content":prompt}));
+                    return Ok(KernelIoRoundControl::Continue);
+                }
+                KernelRoundControl::CorrectFakeCall {
+                    correction_text,
+                    hint,
+                } => {
+                    self.sink
+                        .append(
+                            SessionEventType::SystemNote,
+                            json!({"correction_text": correction_text, "hint": hint}),
+                            "round_correct_fake_call",
+                            json!({"correction_text": correction_text, "hint": hint}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                    self.messages.push(json!({"role":"user","content":hint}));
+                    return Ok(KernelIoRoundControl::Continue);
+                }
+            }
+
+            if turn.is_stop_candidate() {
+                match executor.decide_terminal_stop(self.acceptance.report()) {
+                    KernelStopDecision::Accepted(report) => {
+                        self.sink
+                            .append(
+                                SessionEventType::SystemNote,
+                                serde_json::to_value(&report).map_err(|error| {
+                                    AgentDriverError::Failed(error.to_string())
+                                })?,
+                                "agent_stop_candidate",
+                                json!({"reason":"acceptance_passed","evidence_count":report.evidence_count}),
+                            )
+                            .map_err(AgentDriverError::Failed)?;
+                        return Ok(KernelIoRoundControl::Stop);
+                    }
+                    KernelStopDecision::Remediate {
+                        report,
+                        prompt,
+                        round,
+                    } => {
+                        self.sink
+                            .append(
+                                SessionEventType::SystemNote,
+                                serde_json::to_value(&report).map_err(|error| {
+                                    AgentDriverError::Failed(error.to_string())
+                                })?,
+                                "agent_acceptance_remediation",
+                                json!({"round":round,"blockers":report.blockers}),
+                            )
+                            .map_err(AgentDriverError::Failed)?;
+                        self.messages.push(json!({"role":"user","content":prompt}));
+                        return Ok(KernelIoRoundControl::Continue);
+                    }
+                    KernelStopDecision::Exhausted(report) => {
+                        self.sink
+                            .append(
+                                SessionEventType::SystemNote,
+                                serde_json::to_value(&report).map_err(|error| {
+                                    AgentDriverError::Failed(error.to_string())
+                                })?,
+                                "agent_acceptance_exhausted",
+                                json!({"blockers":report.blockers,"remediation_rounds":executor.remediation_rounds()}),
+                            )
+                            .map_err(AgentDriverError::Failed)?;
+                        return Ok(KernelIoRoundControl::Stop);
+                    }
+                }
+            }
+
+            for call in turn.tool_calls {
+                let id = call.id.as_str();
+                let name = call.name.as_str();
+                let args = call.arguments.as_str();
+                let verdict = match executor.begin_tool_attempt(name, args) {
+                    KernelToolAttemptDecision::Observed { verdict, .. } => verdict,
+                    KernelToolAttemptDecision::Halt {
+                        reason,
+                        attempted,
+                        limit,
+                    } => {
+                        self.sink
+                            .append(
+                                SessionEventType::SystemNote,
+                                json!({"reason":reason.as_str(),"attempted":attempted,"limit":limit}),
+                                "agent_tool_budget_stop",
+                                json!({"reason":reason.as_str(),"attempted":attempted,"limit":limit}),
+                            )
+                            .map_err(AgentDriverError::Failed)?;
+                        return Ok(KernelIoRoundControl::Stop);
+                    }
+                };
+                match verdict {
+                    crate::agent::kernel_loop::KernelLoopVerdict::Proceed => {}
+                    crate::agent::kernel_loop::KernelLoopVerdict::Halt {
+                        corrective_hint,
+                        final_halt,
+                        ..
+                    } => {
+                        if final_halt {
+                            self.sink
+                                .append(
+                                    SessionEventType::SystemNote,
+                                    json!({"reason":"tool_loop_exhausted","tool":name}),
+                                    "tool_loop_halt",
+                                    json!({"reason":"tool_loop_exhausted","tool":name}),
+                                )
+                                .map_err(AgentDriverError::Failed)?;
+                            return Ok(KernelIoRoundControl::Stop);
+                        }
+                        if let Some(hint) = corrective_hint {
+                            self.sink
+                                .append(
+                                    SessionEventType::SystemNote,
+                                    json!({"hint": hint, "tool": name}),
+                                    "tool_loop_correction",
+                                    json!({"hint": hint, "tool": name}),
+                                )
+                                .map_err(AgentDriverError::Failed)?;
+                            self.messages
+                                .push(json!({"role":"tool","tool_call_id":id,"content":hint}));
+                            continue;
+                        }
+                    }
+                }
+
+                let contract = match self.runtime.policy.check(name, args) {
+                    Ok(contract) => contract,
+                    Err(reason) => {
+                        self.outcome.policy_violations += 1;
+                        self.sink
+                            .append(
+                                SessionEventType::ToolApproval,
+                                json!({"tool":name,"approved":false,"reason":reason}),
+                                "tool_rejected",
+                                json!({"name":name,"reason":reason}),
+                            )
+                            .map_err(AgentDriverError::Failed)?;
+                        self.messages.push(
+                            json!({"role":"tool","tool_call_id":id,"content":reason}),
+                        );
+                        continue;
+                    }
+                };
+                self.sink
+                    .append(
+                        SessionEventType::ToolApproval,
+                        json!({
+                            "tool":name,"approved":true,"reason":"headless_policy_and_contract",
+                            "effect":contract.effect.as_str(),"recovery":contract.recovery.as_str(),
+                            "timeout_ms":contract.timeout_ms,
+                        }),
+                        "tool_approval",
+                        json!({
+                            "name":name,"approved":true,"effect":contract.effect.as_str(),
+                            "recovery":contract.recovery.as_str(),"timeout_ms":contract.timeout_ms,
+                        }),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                self.sink
+                    .append(
+                        SessionEventType::ToolCall,
+                        {
+                            let (args_preview, args_truncated, args_digest) =
+                                bounded_audit_text(args);
+                            json!({
+                                "name":name,"args_preview":args_preview,
+                                "args_truncated":args_truncated,"args_digest":args_digest,
+                            })
+                        },
+                        "tool_call",
+                        {
+                            let (_, args_truncated, args_digest) = bounded_audit_text(args);
+                            json!({"name":name,"args_truncated":args_truncated,"args_digest":args_digest})
+                        },
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                let remaining_wall_time = Duration::from_secs(self.task.limits.wall_time_seconds)
+                    .saturating_sub(clock.elapsed());
+                let result = self
+                    .runtime
+                    .execute_observed(name, args, id, remaining_wall_time)
+                    .await;
+                self.outcome.tool_calls += 1;
+                let (ok, raw_text) = match result {
+                    Ok(value) => (true, value),
+                    Err(error) => (false, error),
+                };
+                let (text, truncated) = bounded_tool_output(raw_text);
+                if !ok {
+                    self.outcome.failure_taxonomy.push("tool_error".into());
+                    if text.contains("超时") || text.contains("剩余 wall time") {
+                        self.outcome.failure_taxonomy.push("tool_timeout".into());
+                    }
+                }
+                if truncated {
+                    self.outcome
+                        .failure_taxonomy
+                        .push("tool_output_truncated".into());
+                }
+                let (output_preview, audit_truncated, output_digest) = bounded_audit_text(&text);
+                self.sink
+                    .append(
+                        SessionEventType::ToolResult,
+                        json!({
+                            "name":name,"ok":ok,"output_preview":output_preview,
+                            "output_digest":output_digest,"model_context_truncated":truncated,
+                            "audit_truncated":audit_truncated,
+                        }),
+                        "tool_result",
+                        json!({
+                            "name":name,"ok":ok,"output_digest":output_digest,
+                            "model_context_truncated":truncated,"audit_truncated":audit_truncated,
+                        }),
+                    )
+                    .map_err(AgentDriverError::Failed)?;
+                append_executor_checkpoint_value(self.sink, clock.checkpoint(executor))?;
+                self.acceptance.record(KernelToolEvidence {
+                    tool: name.to_string(),
+                    arguments: args.to_string(),
+                    output: text.clone(),
+                    succeeded: ok,
+                });
+                self.messages
+                    .push(json!({"role":"tool","tool_call_id":id,"content":text}));
+            }
+            Ok(KernelIoRoundControl::Continue)
+        })
+    }
+}
+
 impl HeadlessAgentDriver {
     async fn run_async_impl(
         &self,
@@ -566,7 +936,7 @@ impl HeadlessAgentDriver {
         )
         .map_err(AgentDriverError::Failed)?;
         let round_limit = self.provider.max_rounds.min(task.limits.max_steps as u32);
-        
+
         // UI/headless 共用 executor 状态：轮级路由、循环治理、唯一终止原因。
         let mut kernel_executor = KernelIoRunLoop::with_started(
             KernelExecutorLimits {
@@ -577,362 +947,35 @@ impl HeadlessAgentDriver {
             },
             started,
         );
-        
-        'rounds: loop {
-            if outcome.steps > 0 {
-                append_executor_checkpoint(&mut sink, &kernel_executor)?;
-            }
-            let (round, remaining) = match kernel_executor.begin_next_round(false) {
-                KernelRunPermit::Proceed { round, remaining } => (round, remaining),
-                KernelRunPermit::Halt(KernelRunTermination::MaxStepsExceeded) => break,
-                KernelRunPermit::Halt(KernelRunTermination::DeadlineExceeded) => {
-                    return Err(AgentDriverError::Cancelled(
-                        "builtin driver 超过 wall time".into(),
-                    ));
-                }
-                KernelRunPermit::Halt(reason) => {
-                    return Err(AgentDriverError::Cancelled(format!(
-                        "builtin driver 已停止：{}",
-                        reason.as_str()
-                    )));
-                }
-            };
-            outcome.steps = round;
-            let request_timeout = self
-                .request_timeout
-                .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
-                .min(remaining);
-            let (turn, retries) = self
-                .client
-                .request(&self.provider, messages.clone(), request_timeout)
-                .await?;
-            outcome.retries = outcome.retries.saturating_add(retries);
-            let cost_exceeded = usage
-                .record(turn.usage.as_ref())
-                .map_err(AgentDriverError::Failed)?;
-            outcome.input_tokens = usage.input_tokens;
-            outcome.output_tokens = usage.output_tokens;
-            outcome.cached_tokens = usage.cached_tokens;
-            outcome.cost_cny = usage.cost_cny;
-            if turn.was_truncated() {
-                outcome.failure_taxonomy.push("provider_truncated".into());
-            }
-            sink.append(
-                SessionEventType::AssistantMessage,
-                json!({"content":turn.content,"tool_calls":turn.tool_calls.len()}),
-                "assistant_message",
-                json!({"chars":turn.content.len(),"tool_calls":turn.tool_calls.len()}),
-            )
-            .map_err(AgentDriverError::Failed)?;
-            messages.push(turn.provider_message.clone());
-            if let Some(reason) = kernel_executor.observe_cost_budget(cost_exceeded) {
-                sink.append(
-                    SessionEventType::SystemNote,
-                    json!({"reason":reason.as_str(),"cost_cny":outcome.cost_cny}),
-                    "agent_budget_stop",
-                    json!({"reason":reason.as_str(),"cost_cny":outcome.cost_cny}),
-                )
-                .map_err(AgentDriverError::Failed)?;
-                break;
-            }
-            
-            // Phase F：轮级路由——在 stop-candidate 前判定空轮/冻结重放/中断续写/截断续写/假调用纠正
-            let has_reasoning = turn
-                .provider_message
-                .get("reasoning_content")
-                .or_else(|| turn.provider_message.get("reasoning"))
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty());
-            let round_input = KernelRoundInput {
-                text: &turn.content,
-                has_reasoning,
-                truncated: turn.was_truncated(),
-                interrupted: false, // headless 流错误 fail-closed，不进入中断续写（文档画线）
-                has_native_tool_calls: !turn.tool_calls.is_empty(),
-            };
-            let decision = kernel_executor.decide_round(&round_input);
-            for notice in decision.notices {
-                sink.append(
-                    SessionEventType::SystemNote,
-                    json!({"notice": notice}),
-                    "round_notice",
-                    json!({"notice": notice}),
-                )
-                .map_err(AgentDriverError::Failed)?;
-            }
-            match decision.control {
-                KernelRoundControl::Proceed => {
-                    // 继续后续门控（stop-candidate 等）
-                }
-                KernelRoundControl::RetryEmpty { hint } => {
-                    // 空轮重试：注入纠正提示，下一轮继续
-                    sink.append(
-                        SessionEventType::SystemNote,
-                        json!({"hint": hint}),
-                        "round_retry_empty",
-                        json!({"hint": hint}),
-                    )
-                    .map_err(AgentDriverError::Failed)?;
-                    messages.push(json!({"role":"user","content":hint}));
-                    continue 'rounds;
-                }
-                KernelRoundControl::StopEmpty { note } => {
-                    // 空轮耗尽：追加注记后收尾
-                    sink.append(
-                        SessionEventType::SystemNote,
-                        json!({"note": note}),
-                        "round_stop_empty",
-                        json!({"note": note}),
-                    )
-                    .map_err(AgentDriverError::Failed)?;
-                    break 'rounds;
-                }
-                KernelRoundControl::ReplayFrozen => {
-                    // 冻结重放：headless 不支持（流错误 fail-closed），落穿
-                }
-                KernelRoundControl::ContinueInterrupted { .. } => {
-                    // 中断续写：headless 不支持（流错误 fail-closed），落穿
-                }
-                KernelRoundControl::ContinueTruncated {
-                    continuation_text,
-                    reasoning_only,
-                } => {
-                    // assistant 半截正文已经写入 messages；这里只追加共用续写指令，禁止重复正文。
-                    let prompt = continuation_instruction(reasoning_only);
-                    sink.append(
-                        SessionEventType::SystemNote,
-                        json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
-                        "round_continuation_truncated",
-                        json!({"continuation_text": continuation_text, "reasoning_only": reasoning_only}),
-                    )
-                    .map_err(AgentDriverError::Failed)?;
-                    messages.push(json!({"role":"user","content":prompt}));
-                    continue 'rounds;
-                }
-                KernelRoundControl::CorrectFakeCall {
-                    correction_text,
-                    hint,
-                } => {
-                    // 假调用纠正：注入纠正提示继续
-                    sink.append(
-                        SessionEventType::SystemNote,
-                        json!({"correction_text": correction_text, "hint": hint}),
-                        "round_correct_fake_call",
-                        json!({"correction_text": correction_text, "hint": hint}),
-                    )
-                    .map_err(AgentDriverError::Failed)?;
-                    messages.push(json!({"role":"user","content":hint}));
-                    continue 'rounds;
-                }
-            }
 
-            if turn.is_stop_candidate() {
-                match kernel_executor
-                    .decide_terminal_stop(acceptance.report())
-                {
-                    KernelStopDecision::Accepted(report) => {
-                        sink.append(
-                            SessionEventType::SystemNote,
-                            serde_json::to_value(&report)
-                                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
-                            "agent_stop_candidate",
-                            json!({"reason":"acceptance_passed","evidence_count":report.evidence_count}),
-                        )
-                        .map_err(AgentDriverError::Failed)?;
-                        break;
-                    }
-                    KernelStopDecision::Remediate {
-                        report,
-                        prompt,
-                        round,
-                    } => {
-                        sink.append(
-                            SessionEventType::SystemNote,
-                            serde_json::to_value(&report)
-                                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
-                            "agent_acceptance_remediation",
-                            json!({"round":round,"blockers":report.blockers}),
-                        )
-                        .map_err(AgentDriverError::Failed)?;
-                        messages.push(json!({"role":"user","content":prompt}));
-                        continue;
-                    }
-                    KernelStopDecision::Exhausted(report) => {
-                        sink.append(
-                            SessionEventType::SystemNote,
-                            serde_json::to_value(&report)
-                                .map_err(|error| AgentDriverError::Failed(error.to_string()))?,
-                            "agent_acceptance_exhausted",
-                            json!({"blockers":report.blockers,"remediation_rounds":kernel_executor.remediation_rounds()}),
-                        )
-                        .map_err(AgentDriverError::Failed)?;
-                        break;
-                    }
-                }
+        let exit = {
+            let mut port = HeadlessIoPort {
+                client: self.client.as_ref(),
+                provider: &self.provider,
+                request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+                task,
+                runtime: &runtime,
+                sink: &mut sink,
+                acceptance: &mut acceptance,
+                usage: &mut usage,
+                messages: &mut messages,
+                outcome: &mut outcome,
+            };
+            kernel_executor.run(&mut port).await?
+        };
+        match exit {
+            KernelIoRunExit::AdapterStopped
+            | KernelIoRunExit::Halted(KernelRunTermination::MaxStepsExceeded) => {}
+            KernelIoRunExit::Halted(KernelRunTermination::DeadlineExceeded) => {
+                return Err(AgentDriverError::Cancelled(
+                    "builtin driver 超过 wall time".into(),
+                ));
             }
-            for call in turn.tool_calls {
-                let id = call.id.as_str();
-                let name = call.name.as_str();
-                let args = call.arguments.as_str();
-                let verdict = match kernel_executor.begin_tool_attempt(name, args) {
-                    KernelToolAttemptDecision::Observed { verdict, .. } => verdict,
-                    KernelToolAttemptDecision::Halt {
-                        reason,
-                        attempted,
-                        limit,
-                    } => {
-                        sink.append(
-                            SessionEventType::SystemNote,
-                            json!({
-                                "reason":reason.as_str(),
-                                "attempted":attempted,
-                                "limit":limit,
-                            }),
-                            "agent_tool_budget_stop",
-                            json!({
-                                "reason":reason.as_str(),
-                                "attempted":attempted,
-                                "limit":limit,
-                            }),
-                        )
-                        .map_err(AgentDriverError::Failed)?;
-                        break 'rounds;
-                    }
-                };
-                match verdict {
-                    crate::agent::kernel_loop::KernelLoopVerdict::Proceed => {
-                        // 继续执行工具
-                    }
-                    crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, .. } => {
-                        if final_halt {
-                            // loop_breaks 已超上限，直接收尾
-                            sink.append(
-                                SessionEventType::SystemNote,
-                                json!({"reason":"tool_loop_exhausted","tool":name}),
-                                "tool_loop_halt",
-                                json!({"reason":"tool_loop_exhausted","tool":name}),
-                            ).map_err(AgentDriverError::Failed)?;
-                            break 'rounds;
-                        }
-                        // 注入纠正提示，让模型换方案
-                        if let Some(hint) = corrective_hint {
-                            sink.append(
-                                SessionEventType::SystemNote,
-                                json!({"hint": hint, "tool": name}),
-                                "tool_loop_correction",
-                                json!({"hint": hint, "tool": name}),
-                            ).map_err(AgentDriverError::Failed)?;
-                            messages.push(json!({"role":"tool","tool_call_id":id,"content":hint}));
-                            continue;
-                        }
-                    }
-                }
-                let contract = match runtime.policy.check(name, args) {
-                    Ok(contract) => contract,
-                    Err(reason) => {
-                        outcome.policy_violations += 1;
-                        sink.append(
-                            SessionEventType::ToolApproval,
-                            json!({"tool":name,"approved":false,"reason":reason}),
-                            "tool_rejected",
-                            json!({"name":name,"reason":reason}),
-                        )
-                        .map_err(AgentDriverError::Failed)?;
-                        messages.push(json!({"role":"tool","tool_call_id":id,"content":reason}));
-                        continue;
-                    }
-                };
-                
-                sink.append(
-                    SessionEventType::ToolApproval,
-                    json!({
-                        "tool":name,
-                        "approved":true,
-                        "reason":"headless_policy_and_contract",
-                        "effect":contract.effect.as_str(),
-                        "recovery":contract.recovery.as_str(),
-                        "timeout_ms":contract.timeout_ms,
-                    }),
-                    "tool_approval",
-                    json!({
-                        "name":name,
-                        "approved":true,
-                        "effect":contract.effect.as_str(),
-                        "recovery":contract.recovery.as_str(),
-                        "timeout_ms":contract.timeout_ms,
-                    }),
-                )
-                .map_err(AgentDriverError::Failed)?;
-                sink.append(
-                    SessionEventType::ToolCall,
-                    {
-                        let (args_preview, args_truncated, args_digest) =
-                            bounded_audit_text(args);
-                        json!({
-                            "name":name,
-                            "args_preview":args_preview,
-                            "args_truncated":args_truncated,
-                            "args_digest":args_digest,
-                        })
-                    },
-                    "tool_call",
-                    {
-                        let (_, args_truncated, args_digest) = bounded_audit_text(args);
-                        json!({"name":name,"args_truncated":args_truncated,"args_digest":args_digest})
-                    },
-                )
-                .map_err(AgentDriverError::Failed)?;
-                let remaining_wall_time = Duration::from_secs(task.limits.wall_time_seconds)
-                    .saturating_sub(kernel_executor.elapsed());
-                let result = runtime
-                    .execute_observed(name, args, id, remaining_wall_time)
-                    .await;
-                outcome.tool_calls += 1;
-                let (ok, raw_text) = match result {
-                    Ok(v) => (true, v),
-                    Err(e) => (false, e),
-                };
-                let (text, truncated) = bounded_tool_output(raw_text);
-                if !ok {
-                    outcome.failure_taxonomy.push("tool_error".into());
-                    if text.contains("超时") || text.contains("剩余 wall time") {
-                        outcome.failure_taxonomy.push("tool_timeout".into());
-                    }
-                }
-                if truncated {
-                    outcome
-                        .failure_taxonomy
-                        .push("tool_output_truncated".into());
-                }
-                let (output_preview, audit_truncated, output_digest) = bounded_audit_text(&text);
-                sink.append(
-                    SessionEventType::ToolResult,
-                    json!({
-                        "name":name,
-                        "ok":ok,
-                        "output_preview":output_preview,
-                        "output_digest":output_digest,
-                        "model_context_truncated":truncated,
-                        "audit_truncated":audit_truncated,
-                    }),
-                    "tool_result",
-                    json!({
-                        "name":name,
-                        "ok":ok,
-                        "output_digest":output_digest,
-                        "model_context_truncated":truncated,
-                        "audit_truncated":audit_truncated,
-                    }),
-                )
-                .map_err(AgentDriverError::Failed)?;
-                append_executor_checkpoint(&mut sink, &kernel_executor)?;
-                acceptance.record(KernelToolEvidence {
-                    tool: name.to_string(),
-                    arguments: args.to_string(),
-                    output: text.clone(),
-                    succeeded: ok,
-                });
-                messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
+            KernelIoRunExit::Halted(reason) => {
+                return Err(AgentDriverError::Cancelled(format!(
+                    "builtin driver 已停止：{}",
+                    reason.as_str()
+                )));
             }
         }
         let executor_snapshot = kernel_executor
@@ -1289,12 +1332,20 @@ mod tests {
             .expect("工具质量摘要必须进入 trajectory");
         assert_eq!(quality.fields["total_calls"], 1);
         assert_eq!(quality.fields["successful_calls"], 1);
-        let checkpoint = outcome
+        let checkpoints = outcome
             .trajectory
             .iter()
-            .find(|event| event.kind == "executor_checkpoint")
-            .expect("真实 headless 工具循环必须持久化 executor checkpoint");
+            .filter(|event| event.kind == "executor_checkpoint")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checkpoints.len(),
+            2,
+            "工具结果安全点与下一 Provider 边界都必须由生产端口持久化"
+        );
+        let checkpoint = checkpoints[0];
         assert_eq!(checkpoint.fields["schema_version"], 1);
+        assert_eq!(checkpoint.fields["state"]["completed_rounds"], 1);
+        assert_eq!(checkpoint.fields["state"]["tool_attempts"], 1);
         let checkpoint_json = serde_json::to_string(&checkpoint.fields).unwrap();
         assert!(!checkpoint_json.contains("fixed\\n"));
         assert!(checkpoint_json.contains("sha256:"));
