@@ -158,6 +158,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (78, "078_provider_auto_pool", include_str!("../../migrations/078_provider_auto_pool.sql")),
     (79, "079_agent_run_approved_plan", include_str!("../../migrations/079_agent_run_approved_plan.sql")),
     (80, "080_session_event_checkpoint_lookup", include_str!("../../migrations/080_session_event_checkpoint_lookup.sql")),
+    (81, "081_desktop_recovery_cursor_indexes", include_str!("../../migrations/081_desktop_recovery_cursor_indexes.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -417,6 +418,19 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _migrations WHERE id=64", [], |row| row.get(0))
             .unwrap();
         assert_eq!(applied_064, 1, "重复迁移不得重复登记或破坏新表");
+        for index in [
+            "idx_messages_recovery_cursor",
+            "idx_tool_runs_recovery_cursor",
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "恢复游标索引未创建：{index}");
+        }
         let reconciliation_tables: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table'

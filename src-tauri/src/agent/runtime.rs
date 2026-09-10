@@ -46,6 +46,8 @@ pub struct RunEvent {
 }
 
 pub const DESKTOP_ADAPTER_CURSOR_VERSION: u32 = 1;
+pub const DESKTOP_RECOVERY_MESSAGE_LIMIT: usize = 200;
+pub const DESKTOP_RECOVERY_TOOL_RUN_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopAdapterCheckpointCursor {
@@ -62,6 +64,69 @@ pub struct RestoredDesktopExecutorCheckpoint {
     pub run_loop: crate::agent::kernel_executor::KernelIoRunLoop,
     pub safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
     pub cursor: DesktopAdapterCheckpointCursor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopRecoveredMessage {
+    pub rowid: i64,
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopRecoveredToolRun {
+    pub rowid: i64,
+    pub id: String,
+    pub tool_name: String,
+    pub input_json: String,
+    pub result_json: String,
+    pub status: String,
+}
+
+#[derive(Debug)]
+pub struct DesktopAdapterRecoverySnapshot {
+    pub checkpoint: RestoredDesktopExecutorCheckpoint,
+    pub messages: Vec<DesktopRecoveredMessage>,
+    pub tool_runs: Vec<DesktopRecoveredToolRun>,
+    pub messages_truncated: bool,
+    pub tool_runs_truncated: bool,
+}
+
+impl DesktopAdapterRecoverySnapshot {
+    /// 只生成不含正文、reasoning、工具参数和工具输出的恢复提示。
+    pub fn prompt_hint(&self) -> String {
+        let cursor = &self.checkpoint.cursor;
+        let last_message = self
+            .messages
+            .last()
+            .map(|message| format!("{}:{}", message.role, message.id))
+            .unwrap_or_else(|| "none".into());
+        let last_tool = self
+            .tool_runs
+            .last()
+            .map(|tool| format!("{}:{}:{}", tool.tool_name, tool.status, tool.id))
+            .unwrap_or_else(|| "none".into());
+        format!(
+            "## 已验证的桌面恢复边界\n\
+             父运行 checkpoint 安全点：{}；可见消息 {} 条（高水位 rowid={}，本次有界读取 {} 条{}）；\n\
+             工具审计 {} 条（高水位 rowid={}，本次有界读取 {} 条{}）；最后消息={}；最后工具={}；正文占位={}。\n\
+             这些记录只用于确认恢复边界；工具是否重放必须服从恢复计划的逐项决策，不得仅因记录存在而盲目重放，也不得猜测未持久化的瞬态状态。",
+            self.checkpoint.safe_point.as_str(),
+            cursor.visible_message_count,
+            cursor.message_rowid,
+            self.messages.len(),
+            if self.messages_truncated { "，已截断" } else { "" },
+            cursor.tool_run_count,
+            cursor.tool_run_rowid,
+            self.tool_runs.len(),
+            if self.tool_runs_truncated { "，已截断" } else { "" },
+            last_message,
+            last_tool,
+            cursor.placeholder_message_id.as_deref().unwrap_or("none"),
+        )
+    }
 }
 
 fn now_ms() -> i64 {
@@ -460,6 +525,88 @@ pub fn restore_latest_desktop_executor(
     }))
 }
 
+/// 在严格校验 adapter cursor 后，仅物化高水位以内最近的有界消息和工具审计。
+/// 查询始终带 rowid 上界与 LIMIT，避免恢复长会话时无界加载。
+pub fn materialize_latest_desktop_checkpoint(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+) -> Result<Option<DesktopAdapterRecoverySnapshot>, String> {
+    let Some(checkpoint) = restore_latest_desktop_executor(conn, run_id, conversation_id)? else {
+        return Ok(None);
+    };
+    let cursor = &checkpoint.cursor;
+    let mut message_stmt = conn
+        .prepare(
+            "SELECT rowid,id,role,COALESCE(content,''),reasoning FROM messages
+             WHERE conversation_id=?1 AND queued=0 AND hidden=0 AND rowid<=?2
+             ORDER BY rowid DESC LIMIT ?3",
+        )
+        .map_err(|error| error.to_string())?;
+    let message_rows = message_stmt
+        .query_map(
+            params![
+                conversation_id,
+                cursor.message_rowid,
+                DESKTOP_RECOVERY_MESSAGE_LIMIT as i64
+            ],
+            |row| {
+                Ok(DesktopRecoveredMessage {
+                    rowid: row.get(0)?,
+                    id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    reasoning: row.get(4)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut messages = message_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    messages.reverse();
+
+    let mut tool_stmt = conn
+        .prepare(
+            "SELECT rowid,COALESCE(id,''),COALESCE(tool_name,''),COALESCE(input_json,''),
+                    COALESCE(result_json,''),COALESCE(status,'')
+             FROM tool_runs WHERE trace_id=?1 AND rowid<=?2
+             ORDER BY rowid DESC LIMIT ?3",
+        )
+        .map_err(|error| error.to_string())?;
+    let tool_rows = tool_stmt
+        .query_map(
+            params![
+                run_id,
+                cursor.tool_run_rowid,
+                DESKTOP_RECOVERY_TOOL_RUN_LIMIT as i64
+            ],
+            |row| {
+                Ok(DesktopRecoveredToolRun {
+                    rowid: row.get(0)?,
+                    id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    input_json: row.get(3)?,
+                    result_json: row.get(4)?,
+                    status: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut tool_runs = tool_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    tool_runs.reverse();
+
+    Ok(Some(DesktopAdapterRecoverySnapshot {
+        messages_truncated: cursor.visible_message_count > messages.len() as u64,
+        tool_runs_truncated: cursor.tool_run_count > tool_runs.len() as u64,
+        checkpoint,
+        messages,
+        tool_runs,
+    }))
+}
+
 pub fn transition(
     conn: &Connection,
     run_id: &str,
@@ -840,8 +987,8 @@ mod tests {
              INSERT INTO conversations(id) VALUES ('c');
              CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT,approved_plan TEXT);
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
-             CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,role TEXT NOT NULL,queued INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE tool_runs(id TEXT,conversation_id TEXT,trace_id TEXT,status TEXT,recovery_policy TEXT);
+             CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT '',reasoning TEXT,queued INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE tool_runs(id TEXT,conversation_id TEXT,trace_id TEXT,tool_name TEXT,input_json TEXT,result_json TEXT,status TEXT,recovery_policy TEXT);
              CREATE TABLE execution_steps(run_id TEXT,state TEXT,recovery_policy TEXT);",
         ).unwrap();
         c
@@ -915,18 +1062,18 @@ mod tests {
         let c = conn();
         begin_run(&c, "r", "c", "goal").unwrap();
         c.execute(
-            "INSERT INTO messages(id,conversation_id,role) VALUES('user','c','user')",
+            "INSERT INTO messages(id,conversation_id,role,content) VALUES('user','c','user','goal')",
             [],
         )
         .unwrap();
         c.execute(
-            "INSERT INTO messages(id,conversation_id,role) VALUES('placeholder','c','assistant')",
+            "INSERT INTO messages(id,conversation_id,role,content,reasoning) VALUES('placeholder','c','assistant','partial','thinking')",
             [],
         )
         .unwrap();
         c.execute(
-            "INSERT INTO tool_runs(id,conversation_id,trace_id,status,recovery_policy)
-             VALUES('tool-1','c','r','ok','replay')",
+            "INSERT INTO tool_runs(id,conversation_id,trace_id,tool_name,input_json,result_json,status,recovery_policy)
+             VALUES('tool-1','c','r','read_file','{\"path\":\"a.rs\"}','ok','ok','replay')",
             [],
         )
         .unwrap();
@@ -961,11 +1108,69 @@ mod tests {
             Some("placeholder")
         );
 
+        let snapshot = materialize_latest_desktop_checkpoint(&c, "r", "c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.messages[1].content, "partial");
+        assert_eq!(snapshot.messages[1].reasoning.as_deref(), Some("thinking"));
+        assert_eq!(snapshot.tool_runs.len(), 1);
+        assert_eq!(snapshot.tool_runs[0].tool_name, "read_file");
+        assert_eq!(snapshot.tool_runs[0].input_json, "{\"path\":\"a.rs\"}");
+        assert!(!snapshot.messages_truncated);
+        assert!(!snapshot.tool_runs_truncated);
+        assert!(snapshot.prompt_hint().contains("tool_result"));
+
         c.execute("DELETE FROM tool_runs WHERE id='tool-1'", [])
             .unwrap();
         assert!(restore_latest_desktop_executor(&c, "r", "c")
             .unwrap_err()
             .contains("工具审计集合已漂移"));
+    }
+
+    #[test]
+    fn desktop_checkpoint_materialization_is_bounded_and_chronological() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        for index in 0..205 {
+            c.execute(
+                "INSERT INTO messages(id,conversation_id,role,content) VALUES(?1,'c','user',?2)",
+                params![format!("m-{index:03}"), format!("content-{index:03}")],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO tool_runs(id,conversation_id,trace_id,tool_name,status,recovery_policy)
+                 VALUES(?1,'c','r','read_file','ok','replay')",
+                [format!("t-{index:03}")],
+            )
+            .unwrap();
+        }
+        let run_loop = crate::agent::kernel_executor::KernelIoRunLoop::new(
+            crate::agent::kernel_executor::KernelExecutorLimits::default(),
+        );
+        append_desktop_executor_checkpoint(
+            &c,
+            "r",
+            "c",
+            run_loop.checkpoint(),
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+            None,
+        )
+        .unwrap();
+
+        let snapshot = materialize_latest_desktop_checkpoint(&c, "r", "c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.checkpoint.cursor.visible_message_count, 205);
+        assert_eq!(snapshot.checkpoint.cursor.tool_run_count, 205);
+        assert_eq!(snapshot.messages.len(), DESKTOP_RECOVERY_MESSAGE_LIMIT);
+        assert_eq!(snapshot.tool_runs.len(), DESKTOP_RECOVERY_TOOL_RUN_LIMIT);
+        assert_eq!(snapshot.messages.first().unwrap().id, "m-005");
+        assert_eq!(snapshot.messages.last().unwrap().id, "m-204");
+        assert_eq!(snapshot.tool_runs.first().unwrap().id, "t-005");
+        assert_eq!(snapshot.tool_runs.last().unwrap().id, "t-204");
+        assert!(snapshot.messages_truncated);
+        assert!(snapshot.tool_runs_truncated);
     }
 
     #[test]

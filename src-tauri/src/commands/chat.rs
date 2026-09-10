@@ -2695,13 +2695,27 @@ async fn stream_chat_inner(
     let trace_id = Uuid::new_v4().to_string();
     stats.run_id = Some(trace_id.clone());
     registry.set_run_id(&conversation_id, &trace_id);
-    let recovery_plan = {
+    let (recovery_plan, recovery_adapter_snapshot) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
-        options
+        let plan = options
             .as_ref()
             .and_then(|opts| opts.resume_run_id.as_deref())
             .map(|parent| crate::agent::recovery::build_plan(&conn, &conversation_id, parent))
+            .transpose()?;
+        // 新子运行尚未落库前先严格验证父运行的组合 checkpoint。旧运行没有桌面
+        // checkpoint 时保持兼容；存在却损坏/漂移时失败关闭，避免半恢复。
+        let snapshot = plan
+            .as_ref()
+            .map(|plan| {
+                crate::agent::runtime::materialize_latest_desktop_checkpoint(
+                    &conn,
+                    &plan.parent_run_id,
+                    &conversation_id,
+                )
+            })
             .transpose()?
+            .flatten();
+        (plan, snapshot)
     };
     let inherited_approved_plan = recovery_plan.as_ref().and_then(|plan| {
         let conn = state.0.lock().ok()?;
@@ -2764,6 +2778,28 @@ async fn stream_chat_inner(
                     diff,
                 )?;
             }
+        }
+        if let Some(snapshot) = recovery_adapter_snapshot.as_ref() {
+            let cursor = &snapshot.checkpoint.cursor;
+            crate::agent::runtime::append_event(
+                &conn,
+                &trace_id,
+                &conversation_id,
+                "recovery.adapter_checkpoint_loaded",
+                serde_json::json!({
+                    "parent_run_id": recovery_plan.as_ref().map(|plan| plan.parent_run_id.as_str()),
+                    "safe_point": snapshot.checkpoint.safe_point.as_str(),
+                    "message_rowid": cursor.message_rowid,
+                    "visible_message_count": cursor.visible_message_count,
+                    "materialized_message_count": snapshot.messages.len(),
+                    "messages_truncated": snapshot.messages_truncated,
+                    "tool_run_rowid": cursor.tool_run_rowid,
+                    "tool_run_count": cursor.tool_run_count,
+                    "materialized_tool_run_count": snapshot.tool_runs.len(),
+                    "tool_runs_truncated": snapshot.tool_runs_truncated,
+                    "placeholder_message_id": cursor.placeholder_message_id,
+                }),
+            )?;
         }
     }
     let _ = app.emit(
@@ -4151,6 +4187,9 @@ async fn stream_chat_inner(
         }
         if let Some(plan) = recovery_plan.as_ref() {
             *p = format!("{p}\n\n{}", crate::agent::recovery::directive(plan));
+        }
+        if let Some(snapshot) = recovery_adapter_snapshot.as_ref() {
+            *p = format!("{p}\n\n{}", snapshot.prompt_hint());
         }
         *p = format!("{p}\n\n{}", goal_contract.directive());
         if plan_mode_enabled(&opts) {

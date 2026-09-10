@@ -121,6 +121,15 @@ pub enum KernelCheckpointSafePoint {
     ToolResult,
 }
 
+impl KernelCheckpointSafePoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderBoundary => "provider_boundary",
+            Self::ToolResult => "tool_result",
+        }
+    }
+}
+
 /// 活跃 run-loop 的版本化恢复契约。与 final snapshot 不同，它保留 router/governor 的
 /// 完整内部状态；恢复时会把进程停止期间的墙钟时间计入预算，避免重启刷新 deadline。
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
