@@ -1,7 +1,8 @@
-//! Agent 命令执行沙箱的稳定策略模型、OCI 能力探测与进程生命周期。
+//! Agent 命令执行沙箱的稳定策略模型、平台原生/OCI 能力探测与进程生命周期。
 //!
-//! 本模块不会自行切换现有 `run_command` 执行路径。调用方必须显式选择
-//! [`OciBackend`]；探测或能力校验失败时一律失败关闭，禁止静默回退宿主执行。
+//! 本模块不会自行切换现有 `run_command` 执行路径。OCI 仍需调用方显式选择；平台
+//! 原生后端当前只提供可信 capability 探测。探测或能力校验失败时一律失败关闭，禁止
+//! 静默回退宿主执行。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -141,6 +142,161 @@ pub struct SandboxCapabilities {
     pub network_allowlist: bool,
     pub resource_limits: bool,
     pub reason: Option<String>,
+}
+
+/// 平台原生轻量隔离候选。这里描述的是可被探测和审计的实现，不等同于已经可用；
+/// [`probe_native_backend`] 只有在当前平台与运行时探测都匹配时才会置 `available=true`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSandboxKind {
+    MacosSandboxExec,
+    LinuxBubblewrap,
+    WindowsAppContainer,
+}
+
+impl NativeSandboxKind {
+    pub fn backend_name(self) -> &'static str {
+        match self {
+            Self::MacosSandboxExec => "macos-sandbox-exec",
+            Self::LinuxBubblewrap => "linux-bubblewrap",
+            Self::WindowsAppContainer => "windows-app-container",
+        }
+    }
+
+    fn probe_program(self) -> Option<(&'static str, &'static [&'static str])> {
+        match self {
+            // 不只检查可执行文件是否存在，而是运行一个无副作用的最小隔离域；否则
+            // Linux user namespace 被系统策略禁用时会产生假阳性。
+            Self::MacosSandboxExec => Some((
+                "sandbox-exec",
+                &["-p", "(version 1) (allow default)", "/usr/bin/true"],
+            )),
+            Self::LinuxBubblewrap => Some((
+                "bwrap",
+                &[
+                    "--die-with-parent",
+                    "--unshare-all",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--",
+                    "/bin/true",
+                ],
+            )),
+            // AppContainer 需要 token/profile/ACL 生命周期实现，不能用“系统是 Windows”
+            // 冒充后端已经可用。
+            Self::WindowsAppContainer => None,
+        }
+    }
+
+    pub fn declared_capabilities(self) -> SandboxCapabilities {
+        let (os_level_isolation, filesystem_read_only, workspace_write, network_none) = match self {
+            Self::MacosSandboxExec | Self::LinuxBubblewrap => (true, true, true, true),
+            Self::WindowsAppContainer => (true, true, true, true),
+        };
+        SandboxCapabilities {
+            backend: self.backend_name().into(),
+            available: false,
+            os_level_isolation,
+            filesystem_read_only,
+            workspace_write,
+            network_none,
+            // 三个平台都不能仅凭基础原生机制可靠实现域名 allowlist。
+            network_allowlist: false,
+            // 当前统一 wall/output 上限由父进程治理；CPU/memory/pids 尚未在原生后端
+            // 全量强制，因此不能把 resource_limits 标为 true。
+            resource_limits: false,
+            reason: Some("尚未执行平台原生沙箱能力探测".into()),
+        }
+    }
+}
+
+/// 返回当前编译目标对应的平台原生后端候选。未知平台显式返回 `None`，调用方必须
+/// 保持未隔离状态或失败关闭，不能退化成一个名称看似安全的宿主进程。
+pub fn native_sandbox_for_current_platform() -> Option<NativeSandboxKind> {
+    #[cfg(target_os = "macos")]
+    {
+        return Some(NativeSandboxKind::MacosSandboxExec);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Some(NativeSandboxKind::LinuxBubblewrap);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Some(NativeSandboxKind::WindowsAppContainer);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// 探测当前平台的原生隔离能力。探测只回答“后续是否可以选择该后端”，不执行用户
+/// 命令，也不下载二进制或镜像。探测程序存在但返回非零时仍视为不可用。
+pub async fn probe_native_backend() -> SandboxCapabilities {
+    let Some(kind) = native_sandbox_for_current_platform() else {
+        return SandboxCapabilities {
+            backend: "native-unsupported".into(),
+            available: false,
+            os_level_isolation: false,
+            filesystem_read_only: false,
+            workspace_write: false,
+            network_none: false,
+            network_allowlist: false,
+            resource_limits: false,
+            reason: Some("当前平台没有已登记的平台原生沙箱后端".into()),
+        };
+    };
+    probe_native_kind(kind).await
+}
+
+async fn probe_native_kind(kind: NativeSandboxKind) -> SandboxCapabilities {
+    let mut capabilities = kind.declared_capabilities();
+    let Some((program, probe_args)) = kind.probe_program() else {
+        capabilities.reason = Some(
+            "Windows AppContainer backend 尚未实现 token/profile/ACL 生命周期，拒绝标记为可用"
+                .into(),
+        );
+        return capabilities;
+    };
+    let args = probe_args
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    let mut command = match crate::utils::process::command(program, &args) {
+        Ok(command) => command,
+        Err(error) => {
+            capabilities.reason = Some(format!("无法构造 {program} 探测命令：{error}"));
+            return capabilities;
+        }
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = match tokio::time::timeout(Duration::from_secs(3), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            capabilities.reason = Some(format!("无法启动 {program}：{error}"));
+            return capabilities;
+        }
+        Err(_) => {
+            capabilities.reason = Some(format!("{program} 能力探测超时（3s）"));
+            return capabilities;
+        }
+    };
+    if output.status.success() {
+        capabilities.available = true;
+        capabilities.reason = first_summary_line(&output.stdout)
+            .or_else(|| first_summary_line(&output.stderr))
+            .map(|line| format!("平台原生沙箱探测通过：{line}"))
+            .or_else(|| Some("平台原生沙箱探测通过".into()));
+    } else {
+        let detail = first_summary_line(&output.stderr)
+            .or_else(|| first_summary_line(&output.stdout))
+            .unwrap_or_else(|| format!("退出码 {}", output.status.code().unwrap_or(-1)));
+        capabilities.reason = Some(format!("{program} 不可用：{detail}"));
+    }
+    capabilities
 }
 
 /// 所有沙箱后端必须提供的同步、可审计契约。运行时探测和执行由具体后端的
@@ -463,6 +619,17 @@ pub async fn probe_oci_backends() -> Vec<SandboxCapabilities> {
     vec![docker, podman]
 }
 
+/// 并行生成完整沙箱能力清单。平台原生候选始终排在 OCI 之前，便于桌面设置页优先
+/// 展示零镜像路径；`available=false` 的条目仍保留原因，不能从诊断结果中静默消失。
+#[tauri::command]
+pub async fn probe_sandbox_backends() -> Vec<SandboxCapabilities> {
+    let (native, oci) = tokio::join!(probe_native_backend(), probe_oci_backends());
+    let mut capabilities = Vec::with_capacity(1 + oci.len());
+    capabilities.push(native);
+    capabilities.extend(oci);
+    capabilities
+}
+
 async fn probe_oci_engine(engine: OciEngine) -> SandboxCapabilities {
     let mut capabilities = engine.declared_capabilities();
     let args = vec!["version".to_string()];
@@ -717,6 +884,58 @@ mod tests {
     }
 
     #[test]
+    fn native_backend_declaration_never_claims_unprobed_availability() {
+        for kind in [
+            NativeSandboxKind::MacosSandboxExec,
+            NativeSandboxKind::LinuxBubblewrap,
+            NativeSandboxKind::WindowsAppContainer,
+        ] {
+            let capabilities = kind.declared_capabilities();
+            assert_eq!(capabilities.backend, kind.backend_name());
+            assert!(!capabilities.available);
+            assert!(capabilities.os_level_isolation);
+            assert!(capabilities.filesystem_read_only);
+            assert!(capabilities.workspace_write);
+            assert!(capabilities.network_none);
+            assert!(!capabilities.network_allowlist);
+            assert!(!capabilities.resource_limits);
+            assert!(capabilities.reason.is_some());
+        }
+    }
+
+    #[test]
+    fn current_platform_selects_only_its_native_backend() {
+        let selected = native_sandbox_for_current_platform();
+        #[cfg(target_os = "macos")]
+        assert_eq!(selected, Some(NativeSandboxKind::MacosSandboxExec));
+        #[cfg(target_os = "linux")]
+        assert_eq!(selected, Some(NativeSandboxKind::LinuxBubblewrap));
+        #[cfg(target_os = "windows")]
+        assert_eq!(selected, Some(NativeSandboxKind::WindowsAppContainer));
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        assert_eq!(selected, None);
+    }
+
+    #[tokio::test]
+    async fn native_probe_reports_the_current_backend_without_overclaiming_limits() {
+        let capabilities = probe_native_backend().await;
+        let expected = native_sandbox_for_current_platform()
+            .map(NativeSandboxKind::backend_name)
+            .unwrap_or("native-unsupported");
+        assert_eq!(capabilities.backend, expected);
+        assert!(!capabilities.network_allowlist);
+        assert!(!capabilities.resource_limits);
+        assert!(capabilities.reason.is_some());
+        if capabilities.available {
+            assert!(capabilities.os_level_isolation);
+            assert!(capabilities.network_none);
+            assert!(capabilities.workspace_write);
+        }
+        #[cfg(target_os = "windows")]
+        assert!(!capabilities.available);
+    }
+
+    #[test]
     fn select_target_prefers_host_direct_when_requested_and_flags_risk() {
         let target = select_sandbox_target(
             SandboxBackendPreference::HostDirect,
@@ -766,12 +985,19 @@ mod tests {
     #[test]
     fn resolve_sandbox_target_defaults_to_host_direct_and_fails_closed_on_oci() {
         // 缺省：无后端 → 宿主直跑
-        let target = resolve_sandbox_target(&SandboxConfig::default(), &available_probe(OciEngine::Docker)).unwrap();
+        let target = resolve_sandbox_target(
+            &SandboxConfig::default(),
+            &available_probe(OciEngine::Docker),
+        )
+        .unwrap();
         assert_eq!(target, SandboxExecutionTarget::HostDirect);
 
         // 请求 OCI 但缺镜像 → 失败关闭
         let err = resolve_sandbox_target(
-            &SandboxConfig { backend: Some(OciEngine::Docker), image: None },
+            &SandboxConfig {
+                backend: Some(OciEngine::Docker),
+                image: None,
+            },
             &available_probe(OciEngine::Docker),
         )
         .unwrap_err();
@@ -779,7 +1005,10 @@ mod tests {
 
         // 请求 OCI + 镜像 + 运行时可用 → Oci
         let target = resolve_sandbox_target(
-            &SandboxConfig { backend: Some(OciEngine::Docker), image: Some("img@sha256:".into()) },
+            &SandboxConfig {
+                backend: Some(OciEngine::Docker),
+                image: Some("img@sha256:".into()),
+            },
             &available_probe(OciEngine::Docker),
         )
         .unwrap();

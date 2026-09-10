@@ -67,7 +67,7 @@ HarmonyAgent 当前**不具备默认 OS 级命令沙箱**：
 
 任何平台如果不能建立所声明的边界，必须返回 `sandbox_unavailable` 并失败关闭，不能静默切换到 `host-direct`。
 
-当前实现进度：`src-tauri/src/agent/sandbox.rs` 已提供 `SandboxBackend`/`OciBackend`、Docker/Podman 运行时探测、固定 digest 的安全 argv、wall-time/取消处理、命名容器清理、输出预算和运行事件。它尚未成为 `run_command` 的默认执行路径，也尚未实现 artifact 导出，因此当前产品能力仍按第 2 节的宿主执行边界对外说明。
+当前实现进度：`src-tauri/src/agent/sandbox.rs` 已提供 `SandboxBackend`/`OciBackend`、固定 digest 的 OCI 安全 argv、wall-time/取消处理、命名容器清理、输出预算和运行事件；同时提供稳定的原生/OCI capability 清单与 Tauri 探测入口。macOS/Linux 探测会实际启动无副作用的最小隔离域，Windows AppContainer 在 token/profile/ACL 生命周期完成前保持 unavailable；探测不会下载镜像或执行用户命令。平台原生后端尚未接入 `run_command`，因此当前产品能力仍按第 2 节的宿主执行边界对外说明。
 
 ## 6. Sandbox Backend 最低契约
 
@@ -128,11 +128,11 @@ Broker 请求必须包含 `run_id`、`tool_call_id`、精确动作、目标、�
 
 ## 9. 下一步实现顺序
 
-1. 建立 `SandboxBackend`/`SandboxSpec`/`SandboxCapabilities`，不改变现有执行路径；**已完成策略模型、能力声明和 OCI argv 构造器，backend 生命周期接口待补。**
-2. 增加 OCI backend，并以能力探测方式接入；
-3. 将 `run_command` 的 build/test/shell 路径默认路由到 OCI backend；
+1. 建立 `SandboxBackend`/`SandboxSpec`/`SandboxCapabilities`，不改变现有执行路径；**已完成策略模型、能力声明、原生/OCI 真实探测入口和 OCI argv 构造器。**
+2. 增加 OCI backend，并以能力探测方式接入；**已完成，保持显式可选，不作为桌面默认。**
+3. 实现 macOS/Linux 原生执行 argv 与 Windows AppContainer 生命周期，逐平台验证工作区、断网和资源边界；
 4. 建立 Host Capability Broker，先迁移 `hdc`/deploy；
-5. 为各平台增加轻量本机 backend；
+5. 逃逸套件通过后，将 `run_command` 的 build/test/shell 默认路由到当前平台原生 backend；
 6. 当支持矩阵和逃逸门禁通过后，再把 UI 中的“临时副本试运行”升级为“沙箱执行”。
 
 相关文档：[工具故障隔离](TOOL_ISOLATION.md)、[MCP 项目授权](MCP_PROJECT_AUTHORIZATION.md)、[演进路线](AGENT_EVOLUTION_ROADMAP_2026.md)。
