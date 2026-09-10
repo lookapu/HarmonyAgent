@@ -104,7 +104,22 @@ export default function SandboxCapabilityPanel() {
                   capability.filesystem_read_only && t('health.sandboxReadOnly'),
                   capability.workspace_write && t('health.sandboxWorkspaceWrite'),
                   capability.network_none && t('health.sandboxNetworkNone'),
-                  capability.resource_limits && t('health.sandboxResourceLimits'),
+                  capability.wall_time_limit && t('health.sandboxWallTimeLimit'),
+                  capability.output_limit && t('health.sandboxOutputLimit'),
+                  capability.cpu_limit && t('health.sandboxCpuLimit'),
+                  capability.memory_limit && t('health.sandboxMemoryLimit'),
+                  capability.pids_limit && t('health.sandboxPidsLimit'),
+                  capability.writable_tmp_limit && t('health.sandboxWritableTmpLimit'),
+                ].filter(Boolean) as string[]
+              : []
+            const missingResourceLimits = capability.available
+              ? [
+                  !capability.wall_time_limit && t('health.sandboxWallTimeLimit'),
+                  !capability.output_limit && t('health.sandboxOutputLimit'),
+                  !capability.cpu_limit && t('health.sandboxCpuLimit'),
+                  !capability.memory_limit && t('health.sandboxMemoryLimit'),
+                  !capability.pids_limit && t('health.sandboxPidsLimit'),
+                  !capability.writable_tmp_limit && t('health.sandboxWritableTmpLimit'),
                 ].filter(Boolean) as string[]
               : []
             return (
@@ -140,6 +155,11 @@ export default function SandboxCapabilityPanel() {
                       </span>
                     ))}
                   </div>
+                )}
+                {missingResourceLimits.length > 0 && (
+                  <p className="mt-2 pl-[18px] text-[10px] text-[var(--warning)]">
+                    {t('health.sandboxLimitsMissing', { limits: missingResourceLimits.join(' / ') })}
+                  </p>
                 )}
               </div>
             )

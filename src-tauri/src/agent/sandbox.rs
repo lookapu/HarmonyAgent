@@ -140,7 +140,14 @@ pub struct SandboxCapabilities {
     pub workspace_write: bool,
     pub network_none: bool,
     pub network_allowlist: bool,
+    /// 兼容字段：仅当下列六类限制都被后端强制时为 true。
     pub resource_limits: bool,
+    pub wall_time_limit: bool,
+    pub output_limit: bool,
+    pub cpu_limit: bool,
+    pub memory_limit: bool,
+    pub pids_limit: bool,
+    pub writable_tmp_limit: bool,
     pub reason: Option<String>,
 }
 
@@ -206,6 +213,12 @@ impl NativeSandboxKind {
             // 当前统一 wall/output 上限由父进程治理；CPU/memory/pids 尚未在原生后端
             // 全量强制，因此不能把 resource_limits 标为 true。
             resource_limits: false,
+            wall_time_limit: true,
+            output_limit: true,
+            cpu_limit: false,
+            memory_limit: false,
+            pids_limit: false,
+            writable_tmp_limit: false,
             reason: Some("尚未执行平台原生沙箱能力探测".into()),
         }
     }
@@ -243,6 +256,12 @@ pub async fn probe_native_backend() -> SandboxCapabilities {
             network_none: false,
             network_allowlist: false,
             resource_limits: false,
+            wall_time_limit: false,
+            output_limit: false,
+            cpu_limit: false,
+            memory_limit: false,
+            pids_limit: false,
+            writable_tmp_limit: false,
             reason: Some("当前平台没有已登记的平台原生沙箱后端".into()),
         };
     };
@@ -461,6 +480,12 @@ impl OciEngine {
             // 单纯 `docker run`/`podman run` 不能可靠实现按域名 allowlist。
             network_allowlist: false,
             resource_limits: true,
+            wall_time_limit: true,
+            output_limit: true,
+            cpu_limit: true,
+            memory_limit: true,
+            pids_limit: true,
+            writable_tmp_limit: true,
             reason: Some("尚未执行运行时能力探测".into()),
         }
     }
@@ -1424,6 +1449,12 @@ mod tests {
             network_none: true,
             network_allowlist: false,
             resource_limits: true,
+            wall_time_limit: true,
+            output_limit: true,
+            cpu_limit: true,
+            memory_limit: true,
+            pids_limit: true,
+            writable_tmp_limit: true,
             reason: Some("运行时探测通过".into()),
         }
     }
@@ -1452,7 +1483,27 @@ mod tests {
             assert!(capabilities.network_none);
             assert!(!capabilities.network_allowlist);
             assert!(!capabilities.resource_limits);
+            assert!(capabilities.wall_time_limit);
+            assert!(capabilities.output_limit);
+            assert!(!capabilities.cpu_limit);
+            assert!(!capabilities.memory_limit);
+            assert!(!capabilities.pids_limit);
+            assert!(!capabilities.writable_tmp_limit);
             assert!(capabilities.reason.is_some());
+        }
+    }
+
+    #[test]
+    fn oci_resource_limit_summary_matches_granular_capabilities() {
+        for engine in [OciEngine::Docker, OciEngine::Podman] {
+            let capabilities = engine.declared_capabilities();
+            assert!(capabilities.resource_limits);
+            assert!(capabilities.wall_time_limit);
+            assert!(capabilities.output_limit);
+            assert!(capabilities.cpu_limit);
+            assert!(capabilities.memory_limit);
+            assert!(capabilities.pids_limit);
+            assert!(capabilities.writable_tmp_limit);
         }
     }
 

@@ -8,7 +8,14 @@ export interface SandboxCapabilities {
   workspace_write: boolean
   network_none: boolean
   network_allowlist: boolean
+  /** True only when every granular resource limit below is enforced. */
   resource_limits: boolean
+  wall_time_limit: boolean
+  output_limit: boolean
+  cpu_limit: boolean
+  memory_limit: boolean
+  pids_limit: boolean
+  writable_tmp_limit: boolean
   reason: string | null
 }
 

@@ -69,6 +69,8 @@ HarmonyAgent 当前**不具备默认 OS 级命令沙箱**：
 
 当前实现进度：`src-tauri/src/agent/sandbox.rs` 已提供 `SandboxBackend`/`OciBackend`、固定 digest 的 OCI 安全 argv、wall-time/取消处理、命名容器清理、输出预算和运行事件；同时提供稳定的原生/OCI capability 清单与 Tauri 探测入口，环境管理页以能力卡片展示真实状态和失败原因。macOS/Linux 探测会实际启动无副作用的最小隔离域，Windows AppContainer 在 token/profile/ACL 生命周期完成前保持 unavailable；探测不会下载镜像或执行用户命令。`run_command` 在显式设置 `HARMONY_SANDBOX_BACKEND=native` 时会进入 macOS `sandbox-exec` 或 Linux bubblewrap：使用干净环境、工作区定向挂载/规则、独立临时目录和默认断网；未知后端值、域名 allowlist、Windows 未实现路径及隔离模式下的后台任务均失败关闭。
 
+能力报告把资源治理拆成 `wall_time_limit`、`output_limit`、`cpu_limit`、`memory_limit`、`pids_limit` 和 `writable_tmp_limit`。兼容字段 `resource_limits` 只有在六项全部强制时才为 `true`。原生后端当前只声明父进程真实执行的墙钟和输出上限；不会用 POSIX `RLIMIT_NPROC` 冒充任务级进程树隔离，也不会把尚未实现的 CPU、内存和临时盘配额显示为可用。环境管理页会同时展示已强制项和缺失项。
+
 环境管理页还可手动调用 `verify_native_sandbox_boundary`。该命令只在应用内部创建 UUID 临时测试根目录，不读取或修改用户项目，并实际验证工作区写入、工作区外读取拒绝、只读工作区写入拒绝和符号链接逃逸拒绝。报告固定标记为 `filesystem_smoke_v1`；原生运行时不可用或任一检查失败时不会给出通过结论。该 smoke 不验证网络、凭据、进程树或资源限制，不能替代各平台的完整逃逸套件。
 
 真机或 CI 可用同一实现生成机器可读报告：
