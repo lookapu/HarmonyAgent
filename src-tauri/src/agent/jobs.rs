@@ -742,6 +742,7 @@ mod tests {
             app: None,
             conversation_id: conversation_id.clone(),
             run_id: "tc-17".into(),
+            tool_call_id: None,
             spawn_remaining: 0,
         };
         let job_id = start_background(

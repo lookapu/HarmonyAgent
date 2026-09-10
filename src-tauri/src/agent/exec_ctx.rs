@@ -94,18 +94,25 @@ pub struct ToolCtx {
     pub conversation_id: String,
     /// 当前任务代次 id。工具/日志事件必须携带它，避免已停止旧任务的延迟输出污染新任务。
     pub run_id: String,
+    /// 当前持久工具调用 id。Host Capability Broker 等特权边界必须要求该字段存在。
+    pub tool_call_id: Option<String>,
     /// 还可再委派子 Agent 的层数（防无限嵌套；主 Agent=1，子 Agent 由委派约束决定）
     pub spawn_remaining: usize,
 }
 
 impl ToolCtx {
     pub fn new(app: AppHandle, conversation_id: String, run_id: String) -> Self {
-        Self { app: Some(app), conversation_id, run_id, spawn_remaining: 1 }
+        Self { app: Some(app), conversation_id, run_id, tool_call_id: None, spawn_remaining: 1 }
     }
 
     #[allow(dead_code)]
     pub fn empty() -> Self {
-        Self { app: None, conversation_id: String::new(), run_id: String::new(), spawn_remaining: 0 }
+        Self { app: None, conversation_id: String::new(), run_id: String::new(), tool_call_id: None, spawn_remaining: 0 }
+    }
+
+    pub fn with_tool_call_id(mut self, tool_call_id: String) -> Self {
+        self.tool_call_id = Some(tool_call_id);
+        self
     }
 
     /// 推送一行流式日志到前端。失败静默（日志推送不应中断工具执行）。

@@ -9122,6 +9122,7 @@ async fn run_subagent(
                 app: Some(app.clone()),
                 conversation_id: conversation_id.to_string(),
                 run_id: child_run_id.to_string(),
+                tool_call_id: Some(call_id.clone()),
                 spawn_remaining: limits.max_depth.unwrap_or(0),
             };
             let args_val: serde_json::Value =
@@ -9333,7 +9334,7 @@ async fn run_tool_in_lane(
     let path_owned = project_path.to_string();
     let hints_owned = path_hints.to_vec();
     let pid_owned = project_id.to_string();
-    let ctx_owned = tool_ctx.clone();
+    let ctx_owned = tool_ctx.clone().with_tool_call_id(call_id.to_string());
     let fut = async move {
         if crate::agent::evals::take_fault("tool_worker_panic") {
             panic!("reliability fault injection: tool_worker_panic");

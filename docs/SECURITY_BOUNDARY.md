@@ -126,9 +126,9 @@ cargo run --manifest-path src-tauri/Cargo.toml --features eval-cli --bin harmony
 
 Broker 请求必须包含 `run_id`、`tool_call_id`、精确动作、目标、影响摘要、审批策略和幂等键。审批只能授权该次规范化请求，不能授权一段可变化的 Shell 字符串。
 
-当前接线进度：`connect_device` 的连接/断开，以及单设备 `deploy` 和 `deploy_all` 的 HAP 安装/ability 启动已经通过 `execute_host_capability` 执行。Broker 只生成固定 `hdc` argv；HAP 在执行前 canonicalize，并再次确认是工作区内普通文件，符号链接逃逸失败关闭；bundle/ability 使用受限标识符语法。`host_capability.started|finished|rejected` 进入 Durable Run 事件，设备目标只记录 SHA-256 短摘要，校验失败不记录恶意原参数。上层工具审批、按工作区/设备的并发门禁、批量部署恢复和启动后存活验证保持不变。
+当前接线进度：`connect_device` 的连接/断开，以及单设备 `deploy` 和 `deploy_all` 的 HAP 安装/ability 启动已经通过 `execute_host_capability` 执行。Broker 只生成固定 `hdc` argv；HAP 在执行前 canonicalize，并再次确认是工作区内普通文件，符号链接逃逸失败关闭；bundle/ability 使用受限标识符语法。特权执行缺少 `run_id` 或真实 `tool_call_id` 时失败关闭；幂等键稳定绑定 run、tool call、capability 和规范化目标，因此同一次批量部署中的不同设备不会碰撞。`host_capability.started|finished|rejected` 进入 Durable Run 事件，设备目标只记录 SHA-256 短摘要，校验失败不记录恶意原参数。上层工具审批、持久工具去重、按工作区/设备的并发门禁、批量部署恢复和启动后存活验证保持不变。
 
-这仍是部分实现：设备查询/日志、模拟器、签名与发布尚未迁移；Broker 事件目前从上层工具审计继承 tool call 身份，尚未把 `tool_call_id` 和独立幂等键固化进自身请求结构，因此不得宣称第 7 节契约已经全部完成。
+这仍是部分实现：设备查询/日志、模拟器、签名与发布尚未迁移；影响摘要和审批策略仍由上层工具事件承载，Broker 自身尚未实现跨进程的独立幂等登记表，因此不得宣称第 7 节契约已经全部完成。
 
 ## 8. 安全测试门禁
 

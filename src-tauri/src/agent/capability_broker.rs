@@ -67,6 +67,49 @@ struct HostInvocation {
     timeout_seconds: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostRequestIdentity {
+    tool_call_id: String,
+    idempotency_key: String,
+}
+
+fn request_identity(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    capability: &HostCapability,
+) -> Result<HostRequestIdentity, String> {
+    let run_id = ctx.run_id.trim();
+    let tool_call_id = ctx.tool_call_id.as_deref().map(str::trim).filter(|id| !id.is_empty())
+        .ok_or("Host Capability Broker 缺少 tool_call_id，拒绝执行")?;
+    if run_id.is_empty() {
+        return Err("Host Capability Broker 缺少 run_id，拒绝执行".into());
+    }
+    let capability_id = capability.capability_id();
+    let material = request_material(capability);
+    let digest = Sha256::digest(
+        format!("hcb-v1\0{run_id}\0{tool_call_id}\0{capability_id}\0{material}").as_bytes(),
+    );
+    Ok(HostRequestIdentity {
+        tool_call_id: tool_call_id.to_string(),
+        idempotency_key: format!("hcb-v1:{digest:x}"),
+    })
+}
+
+fn request_material(capability: &HostCapability) -> String {
+    match capability {
+        HostCapability::HdcConnect { target } | HostCapability::HdcDisconnect { target } =>
+            target.trim().to_string(),
+        HostCapability::HdcListTargets => String::new(),
+        HostCapability::InstallHap { device, hap_path, replace } => format!(
+            "{}\0{}\0{replace}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
+        ),
+        HostCapability::StartAbility { device, bundle, ability } =>
+            format!("{}\0{}\0{}", device.trim(), bundle.trim(), ability.trim()),
+        HostCapability::Deploy { device, hap_path } => format!(
+            "{}\0{}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
+        ),
+    }
+}
+
 fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> Result<HostInvocation, String> {
     capability.validate()?;
     let (args, timeout_seconds) = match capability {
@@ -109,18 +152,33 @@ pub async fn execute_host_capability(
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<Output, String> {
     let capability_id = capability.capability_id();
+    let identity = match request_identity(ctx, capability) {
+        Ok(identity) => identity,
+        Err(error) => {
+            ctx.record_run_event("host_capability.rejected", serde_json::json!({
+                "capability_id": capability_id,
+                "reason": "missing_request_identity",
+            }));
+            return Err(error);
+        }
+    };
     let invocation = match prepare_invocation(capability, workspace) {
         Ok(invocation) => invocation,
         Err(error) => {
             ctx.record_run_event("host_capability.rejected", serde_json::json!({
                 "capability_id": capability_id,
+                "tool_call_id": &identity.tool_call_id,
+                "idempotency_key": &identity.idempotency_key,
                 "reason": "validation_failed",
             }));
             return Err(error);
         }
     };
     ctx.record_run_event("host_capability.started", serde_json::json!({
-        "capability_id": capability_id, "subject": audit_subject(capability),
+        "capability_id": capability_id,
+        "tool_call_id": &identity.tool_call_id,
+        "idempotency_key": &identity.idempotency_key,
+        "subject": audit_subject(capability),
     }));
     let result = crate::agent::exec_ctx::run_cmd_streaming(
         ctx, invocation.program, &invocation.args, None, invocation.timeout_seconds, None,
@@ -129,6 +187,8 @@ pub async fn execute_host_capability(
         Ok(output) => {
             ctx.record_run_event("host_capability.finished", serde_json::json!({
                 "capability_id": capability_id,
+                "tool_call_id": &identity.tool_call_id,
+                "idempotency_key": &identity.idempotency_key,
                 "success": output.status.success(),
                 "exit_code": output.status.code(),
             }));
@@ -137,6 +197,8 @@ pub async fn execute_host_capability(
         Err(error) => {
             ctx.record_run_event("host_capability.finished", serde_json::json!({
                 "capability_id": capability_id,
+                "tool_call_id": &identity.tool_call_id,
+                "idempotency_key": &identity.idempotency_key,
                 "success": false,
                 "error_kind": capability_error_kind(&error),
             }));
@@ -315,5 +377,24 @@ mod tests {
             std::fs::remove_dir_all(root).ok();
             std::fs::remove_file(external).ok();
         }
+    }
+
+    #[test]
+    fn request_identity_is_bound_to_run_call_and_capability() {
+        let mut ctx = crate::agent::exec_ctx::ToolCtx::empty();
+        ctx.run_id = "run-1".into();
+        ctx.tool_call_id = Some("call-1".into());
+        let first_capability = HostCapability::InstallHap {
+            device: Some("device-a".into()), hap_path: "out/app.hap".into(), replace: false,
+        };
+        let first = request_identity(&ctx, &first_capability).unwrap();
+        let repeated = request_identity(&ctx, &first_capability).unwrap();
+        assert_eq!(first, repeated);
+        let other_device = HostCapability::InstallHap {
+            device: Some("device-b".into()), hap_path: "out/app.hap".into(), replace: false,
+        };
+        assert_ne!(first.idempotency_key, request_identity(&ctx, &other_device).unwrap().idempotency_key);
+        ctx.tool_call_id = None;
+        assert!(request_identity(&ctx, &first_capability).is_err());
     }
 }
