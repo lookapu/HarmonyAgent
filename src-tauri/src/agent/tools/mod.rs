@@ -1222,9 +1222,9 @@ pub async fn run_tool(
     // 记录本工具启动时的停止代次；同批并行工具各自观察后续代次变化。
     let result = crate::agent::exec_ctx::scope_tool_session(ctx.conversation_id.clone(), stop_generation, async {
       match name {
-        "list_devices" => list_devices().await,
+        "list_devices" => list_devices(ctx).await,
         "connect_device" => device_tools::connect_device(&args, ctx).await,
-        "manage_hdc" => device_tools::manage_hdc(&args, db).await,
+        "manage_hdc" => device_tools::manage_hdc(&args, db, ctx).await,
         "list_emulators" => device_tools::list_emulators().await,
         "start_emulator" => device_tools::start_emulator(&args).await,
         "create_emulator" => device_tools::create_emulator(&args).await,
@@ -1678,10 +1678,21 @@ async fn run_in_project(project_path: &str, prog: &str, args: &[String], timeout
 
 // ---------- 具体工具 ----------
 
-async fn list_devices() -> Result<String, String> {
+async fn list_devices(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
     // 复用前端设备面板的结构化查询（含型号/系统版本/在线状态/默认标记），
     // 比裸 hdc list targets 信息更丰富，便于 Agent 决定部署目标
-    match crate::commands::devices::list_devices().await {
+    let capability = crate::agent::capability_broker::HostCapability::HdcListTargets;
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await
+        .map_err(|error| with_advice("list_devices", error))?;
+    if !output.status.success() {
+        return Err(with_advice(
+            "list_devices",
+            (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim().to_string(),
+        ));
+    }
+    let targets = smart_decode(&output.stdout);
+    match crate::commands::devices::list_devices_from_targets(&targets).await {
         Ok(devs) if devs.is_empty() => Ok(
             "未检测到已连接设备。请用 USB 连接设备/启动模拟器并开启开发者模式；可调用 start_hdc_service 启动 hdc 服务后重试。".to_string(),
         ),

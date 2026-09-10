@@ -17,6 +17,10 @@ pub enum HostCapability {
     HdcDisconnect { target: String },
     /// 列出在线设备。
     HdcListTargets,
+    /// 启动 hdc daemon。
+    HdcStartServer,
+    /// 停止 hdc daemon。
+    HdcKillServer,
     /// 安装构建产物到设备（路径必须位于项目工作树内）。
     InstallHap { device: Option<String>, hap_path: String, replace: bool },
     /// 拉起一个已安装应用的明确 ability。
@@ -32,6 +36,8 @@ impl HostCapability {
             Self::HdcConnect { .. } => "hdc.connect",
             Self::HdcDisconnect { .. } => "hdc.disconnect",
             Self::HdcListTargets => "hdc.list",
+            Self::HdcStartServer => "hdc.start_server",
+            Self::HdcKillServer => "hdc.kill_server",
             Self::InstallHap { .. } => "deploy.install",
             Self::StartAbility { .. } => "deploy.start_ability",
             Self::Deploy { .. } => "deploy",
@@ -44,7 +50,7 @@ impl HostCapability {
             Self::HdcConnect { target } | Self::HdcDisconnect { target } => {
                 validate_device_target(target)
             }
-            Self::HdcListTargets => Ok(()),
+            Self::HdcListTargets | Self::HdcStartServer | Self::HdcKillServer => Ok(()),
             Self::InstallHap { device, hap_path, .. } | Self::Deploy { device, hap_path } => {
                 if let Some(device) = device {
                     validate_device_target(device)?;
@@ -57,6 +63,10 @@ impl HostCapability {
                 validate_app_identifier(ability, "ability")
             }
         }
+    }
+
+    fn replay_safe(&self) -> bool {
+        matches!(self, Self::HdcListTargets)
     }
 }
 
@@ -104,7 +114,9 @@ fn request_material(capability: &HostCapability) -> String {
     match capability {
         HostCapability::HdcConnect { target } | HostCapability::HdcDisconnect { target } =>
             target.trim().to_string(),
-        HostCapability::HdcListTargets => String::new(),
+        HostCapability::HdcListTargets
+        | HostCapability::HdcStartServer
+        | HostCapability::HdcKillServer => String::new(),
         HostCapability::InstallHap { device, hap_path, replace } => format!(
             "{}\0{}\0{replace}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
         ),
@@ -124,6 +136,8 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             vec!["tconn".into(), "-d".into(), target.trim().into()], 30,
         ),
         HostCapability::HdcListTargets => (vec!["list".into(), "targets".into()], 15),
+        HostCapability::HdcStartServer => (vec!["start".into()], 30),
+        HostCapability::HdcKillServer => (vec!["kill".into()], 30),
         HostCapability::InstallHap { device, hap_path, replace } => {
             let artifact = resolve_workspace_artifact(
                 workspace.ok_or("deploy.install 需要明确的项目工作区")?, hap_path,
@@ -181,19 +195,33 @@ pub async fn execute_host_capability(
         }
     };
     let subject = audit_subject(capability);
-    match claim_request(ctx, capability_id, &identity, &subject)? {
-        crate::agent::runtime::HostCapabilityClaim::Claimed => {}
-        crate::agent::runtime::HostCapabilityClaim::Duplicate { status } => {
-            ctx.record_run_event("host_capability.rejected", serde_json::json!({
+    if capability.replay_safe() {
+        record_request_event(
+            ctx,
+            "host_capability.started",
+            serde_json::json!({
                 "capability_id": capability_id,
                 "tool_call_id": &identity.tool_call_id,
                 "idempotency_key": &identity.idempotency_key,
-                "reason": "duplicate_dispatch",
-                "previous_status": status,
-            }));
-            return Err(format!(
-                "宿主能力请求已登记（状态：{status}），为避免重复副作用已拒绝自动重放；请先核验外部状态并发起新的工具调用"
-            ));
+                "replay_safe": true,
+                "subject": subject,
+            }),
+        )?;
+    } else {
+        match claim_request(ctx, capability_id, &identity, &subject)? {
+            crate::agent::runtime::HostCapabilityClaim::Claimed => {}
+            crate::agent::runtime::HostCapabilityClaim::Duplicate { status } => {
+                ctx.record_run_event("host_capability.rejected", serde_json::json!({
+                    "capability_id": capability_id,
+                    "tool_call_id": &identity.tool_call_id,
+                    "idempotency_key": &identity.idempotency_key,
+                    "reason": "duplicate_dispatch",
+                    "previous_status": status,
+                }));
+                return Err(format!(
+                    "宿主能力请求已登记（状态：{status}），为避免重复副作用已拒绝自动重放；请先核验外部状态并发起新的工具调用"
+                ));
+            }
         }
     }
     let result = crate::agent::exec_ctx::run_cmd_streaming(
@@ -202,23 +230,77 @@ pub async fn execute_host_capability(
     match result {
         Ok(output) => {
             let status = if output.status.success() { "succeeded" } else { "failed" };
-            finish_request(ctx, capability_id, &identity, status, output.status.code(), None)
-                .map_err(|error| format!(
-                    "宿主命令已经返回，但持久化终态失败，实际副作用状态不确定：{error}"
-                ))?;
+            if capability.replay_safe() {
+                record_replay_safe_finish(
+                    ctx, capability_id, &identity, status, output.status.code(), None,
+                )
+                .map_err(|error| format!("宿主查询已经返回，但写入审计终态失败：{error}"))?;
+            } else {
+                finish_request(ctx, capability_id, &identity, status, output.status.code(), None)
+                    .map_err(|error| format!(
+                        "宿主命令已经返回，但持久化终态失败，实际副作用状态不确定：{error}"
+                    ))?;
+            }
             Ok(output)
         }
         Err(error) => {
             let error_kind = capability_error_kind(&error);
-            finish_request(
-                ctx, capability_id, &identity, "indeterminate", None, Some(error_kind),
-            )
-            .map_err(|persist_error| format!(
-                "{error}；宿主能力的不确定终态持久化失败：{persist_error}"
-            ))?;
+            if capability.replay_safe() {
+                record_replay_safe_finish(
+                    ctx, capability_id, &identity, "failed", None, Some(error_kind),
+                )
+                .map_err(|persist_error| format!(
+                    "{error}；宿主查询失败事件写入审计链失败：{persist_error}"
+                ))?;
+            } else {
+                finish_request(
+                    ctx, capability_id, &identity, "indeterminate", None, Some(error_kind),
+                )
+                .map_err(|persist_error| format!(
+                    "{error}；宿主能力的不确定终态持久化失败：{persist_error}"
+                ))?;
+            }
             Err(error)
         }
     }
+}
+
+fn record_replay_safe_finish(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    capability_id: &str,
+    identity: &HostRequestIdentity,
+    status: &str,
+    exit_code: Option<i32>,
+    error_kind: Option<&str>,
+) -> Result<(), String> {
+    record_request_event(ctx, "host_capability.finished", serde_json::json!({
+        "capability_id": capability_id,
+        "tool_call_id": &identity.tool_call_id,
+        "idempotency_key": &identity.idempotency_key,
+        "replay_safe": true,
+        "success": status == "succeeded",
+        "status": status,
+        "exit_code": exit_code,
+        "error_kind": error_kind,
+    }))
+}
+
+fn record_request_event(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let app = ctx.app.as_ref().ok_or("Host Capability Broker 缺少应用数据库，拒绝执行")?;
+    let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
+    let conn = db.0.lock().map_err(|_| "Host Capability Broker 数据库锁已损坏")?;
+    crate::agent::runtime::append_event(
+        &conn,
+        &ctx.run_id,
+        &ctx.conversation_id,
+        event_type,
+        payload,
+    )
+    .map(|_| ())
 }
 
 fn claim_request(
@@ -290,7 +372,9 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
     match capability {
         HostCapability::HdcConnect { target } | HostCapability::HdcDisconnect { target } =>
             serde_json::json!({ "device_digest": short_digest(target.trim()) }),
-        HostCapability::HdcListTargets => serde_json::json!({}),
+        HostCapability::HdcListTargets
+        | HostCapability::HdcStartServer
+        | HostCapability::HdcKillServer => serde_json::json!({}),
         HostCapability::InstallHap { device, hap_path, replace } => serde_json::json!({
             "device_digest": device.as_deref().map(short_digest), "artifact": hap_path, "replace": replace,
         }),
@@ -400,7 +484,20 @@ mod tests {
     #[test]
     fn capability_ids_are_stable_for_audit() {
         assert_eq!(HostCapability::HdcConnect { target: "t".into() }.capability_id(), "hdc.connect");
+        assert_eq!(HostCapability::HdcStartServer.capability_id(), "hdc.start_server");
+        assert_eq!(HostCapability::HdcKillServer.capability_id(), "hdc.kill_server");
         assert_eq!(HostCapability::Deploy { device: None, hap_path: "a.hap".into() }.capability_id(), "deploy");
+    }
+
+    #[test]
+    fn daemon_lifecycle_uses_fixed_argv_and_only_queries_are_replay_safe() {
+        let start = prepare_invocation(&HostCapability::HdcStartServer, None).unwrap();
+        let kill = prepare_invocation(&HostCapability::HdcKillServer, None).unwrap();
+        assert_eq!(start.args, vec!["start"]);
+        assert_eq!(kill.args, vec!["kill"]);
+        assert!(HostCapability::HdcListTargets.replay_safe());
+        assert!(!HostCapability::HdcStartServer.replay_safe());
+        assert!(!HostCapability::HdcKillServer.replay_safe());
     }
 
     #[test]

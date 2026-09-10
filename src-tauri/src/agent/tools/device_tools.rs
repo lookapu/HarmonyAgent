@@ -45,12 +45,16 @@ pub(super) async fn connect_device(args: &Value, ctx: &crate::agent::exec_ctx::T
             }
             Ok(format!("已断开 {target}\n设备输出：{}", out.trim()))
         }
-        "list" => list_devices().await,
+        "list" => list_devices(ctx).await,
         _ => Err(format!("action 仅支持 connect|disconnect|list，收到 {action}")),
     }
 }
 
-pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+pub(super) async fn manage_hdc(
+    args: &Value,
+    db: &crate::db::DbState,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("status").trim();
     if !matches!(action, "start" | "stop" | "restart" | "status") {
         return Err("action 仅支持 start|stop|restart|status".into());
@@ -63,8 +67,10 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
     let hdc = env.hdc_path.clone().unwrap_or_else(|| "hdc".to_string());
     // 服务状态探测：能执行 list targets 即视为在线
     let probe = async || {
-        match run_cmd(&hdc, &["list".into(), "targets".into()], None, 15).await {
-            Ok(t) => {
+        let capability = crate::agent::capability_broker::HostCapability::HdcListTargets;
+        match crate::agent::capability_broker::execute_host_capability(&capability, None, ctx).await {
+            Ok(output) if output.status.success() => {
+                let t = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
                 let devs: Vec<&str> = t
                     .lines()
                     .map(|l| l.trim())
@@ -76,7 +82,7 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
                     devs.len()
                 ))
             }
-            Err(_) => None,
+            _ => None,
         }
     };
     match action {
@@ -87,9 +93,14 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
             )),
         },
         "start" => {
-            let out = run_cmd(&hdc, &["start".into()], None, 30)
+            let capability = crate::agent::capability_broker::HostCapability::HdcStartServer;
+            let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
                 .await
                 .map_err(|e| format!("hdc start 失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("hdc start 失败：{}", out.trim()));
+            }
             let mut s = format!("hdc start 执行完成。\n{}", out.trim_end());
             if let Some(ok) = probe().await {
                 s.push_str(&format!("\n✓ {ok}"));
@@ -99,9 +110,14 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
             Ok(s)
         }
         "stop" => {
-            let out = run_cmd(&hdc, &["kill".into()], None, 30)
+            let capability = crate::agent::capability_broker::HostCapability::HdcKillServer;
+            let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
                 .await
                 .map_err(|e| format!("hdc kill 失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("hdc kill 失败：{}", out.trim()));
+            }
             let mut s = format!("hdc 服务已停止。\n{}", out.trim_end());
             if probe().await.is_some() {
                 s.push_str("\n（探测到服务仍在响应，可能被自动拉起，可再次执行 stop）");
@@ -109,10 +125,22 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
             Ok(s)
         }
         "restart" => {
-            let _ = run_cmd(&hdc, &["kill".into()], None, 20).await;
-            let out = run_cmd(&hdc, &["start".into()], None, 30)
+            let kill = crate::agent::capability_broker::HostCapability::HdcKillServer;
+            let kill_output = crate::agent::capability_broker::execute_host_capability(&kill, None, ctx)
+                .await
+                .map_err(|e| format!("hdc restart 的停止阶段失败：{e}"))?;
+            if !kill_output.status.success() {
+                let detail = smart_decode(&kill_output.stdout) + &smart_decode(&kill_output.stderr);
+                return Err(format!("hdc restart 的停止阶段失败：{}", detail.trim()));
+            }
+            let start = crate::agent::capability_broker::HostCapability::HdcStartServer;
+            let output = crate::agent::capability_broker::execute_host_capability(&start, None, ctx)
                 .await
                 .map_err(|e| format!("hdc start 失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("hdc start 失败：{}", out.trim()));
+            }
             let mut s = format!("hdc 服务已重启。\n{}", out.trim_end());
             match probe().await {
                 Some(ok) => s.push_str(&format!("\n✓ {ok}")),

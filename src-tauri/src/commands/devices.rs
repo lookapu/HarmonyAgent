@@ -151,6 +151,12 @@ fn observed_at() -> i64 {
 #[tauri::command]
 pub async fn list_devices() -> Result<Vec<DeviceInfo>, String> {
     let out = run_hdc(&["list", "targets"], 30).await?;
+    list_devices_from_targets(&out).await
+}
+
+/// 使用已经过调用方安全边界获取的 `hdc list targets` 输出构建设备快照。
+/// Agent 入口借此通过 Host Capability Broker 获取清单，同时复用前端的富化逻辑。
+pub(crate) async fn list_devices_from_targets(out: &str) -> Result<Vec<DeviceInfo>, String> {
     let default = load_default_device();
     let mut devices: Vec<DeviceInfo> = Vec::new();
     for line in out.lines() {

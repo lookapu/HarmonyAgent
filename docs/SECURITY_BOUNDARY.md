@@ -126,11 +126,11 @@ cargo run --manifest-path src-tauri/Cargo.toml --features eval-cli --bin harmony
 
 Broker 请求必须包含 `run_id`、`tool_call_id`、精确动作、目标、影响摘要、审批策略和幂等键。审批只能授权该次规范化请求，不能授权一段可变化的 Shell 字符串。
 
-当前接线进度：`connect_device` 的连接/断开，以及单设备 `deploy` 和 `deploy_all` 的 HAP 安装/ability 启动已经通过 `execute_host_capability` 执行。Broker 只生成固定 `hdc` argv；HAP 在执行前 canonicalize，并再次确认是工作区内普通文件，符号链接逃逸失败关闭；bundle/ability 使用受限标识符语法。特权执行缺少 `run_id`、真实 `tool_call_id` 或应用数据库时失败关闭；幂等键稳定绑定 run、tool call、capability 和规范化目标，因此同一次批量部署中的不同设备不会碰撞。
+当前接线进度：`connect_device` 的连接/断开、`manage_hdc` 的 daemon 启动/停止/重启、Agent `list_devices` 的主清单查询，以及单设备 `deploy` 和 `deploy_all` 的 HAP 安装/ability 启动已经通过 `execute_host_capability` 执行。Broker 只生成固定 `hdc` argv；HAP 在执行前 canonicalize，并再次确认是工作区内普通文件，符号链接逃逸失败关闭；bundle/ability 使用受限标识符语法。特权执行缺少 `run_id`、真实 `tool_call_id` 或应用数据库时失败关闭；幂等键稳定绑定 run、tool call、capability 和规范化目标，因此同一次批量部署中的不同设备不会碰撞。只读 `hdc.list` 明确标记为 replay-safe，可在同一工具调用的状态探测中重复执行，但每次仍受 Run 租约约束并写入审计事件。
 
-迁移 `082_host_capability_claims` 提供跨进程原子 claim：获得 claim 与 `host_capability.started` 事件在同一事务提交，只有首个 Worker 可以派发命令；完成状态与 `host_capability.finished` 同样原子提交。重复的 `started/succeeded/failed/indeterminate` 请求全部失败关闭，必须先核验外部状态并发起新的工具调用。应用恢复会把遗留 `started` 标为 `indeterminate`，并把 Run 的恢复策略提升为 `verify_effects`。这是“最多一次派发 + 不确定结果人工/工具核验”，不是外部系统严格 exactly-once；命令可能已生效但进程来不及记录终态。设备目标只记录 SHA-256 短摘要，校验失败不记录恶意原参数。上层工具审批、持久工具去重、按工作区/设备的并发门禁、批量部署恢复和启动后存活验证保持不变。
+迁移 `082_host_capability_claims` 为非 replay-safe 能力提供跨进程原子 claim：获得 claim 与 `host_capability.started` 事件在同一事务提交，只有首个 Worker 可以派发命令；完成状态与 `host_capability.finished` 同样原子提交。重复的 `started/succeeded/failed/indeterminate` 请求全部失败关闭，必须先核验外部状态并发起新的工具调用。应用恢复会把遗留 `started` 标为 `indeterminate`，并把 Run 的恢复策略提升为 `verify_effects`。这是“最多一次派发 + 不确定结果人工/工具核验”，不是外部系统严格 exactly-once；命令可能已生效但进程来不及记录终态。设备目标只记录 SHA-256 短摘要，校验失败不记录恶意原参数。上层工具审批、持久工具去重、按工作区/设备的并发门禁、批量部署恢复和启动后存活验证保持不变。
 
-这仍是部分实现：设备查询/日志、模拟器、签名与发布尚未迁移；影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
+这仍是部分实现：设备属性富化查询、日志、模拟器、文件传输、受限 shell、签名与发布尚未完整迁移；影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
 
 ## 8. 安全测试门禁
 
