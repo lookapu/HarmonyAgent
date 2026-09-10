@@ -21,6 +21,12 @@ pub enum HostCapability {
     HdcStartServer,
     /// 停止 hdc daemon。
     HdcKillServer,
+    /// 查询指定 bundle 的进程 id。
+    DevicePidof { device: String, bundle: String },
+    /// 读取设备历史 hilog，可选最低级别和 tag。
+    ReadHilog { device: String, level: Option<String>, tag: Option<String> },
+    /// 兼容旧设备的有限行 logcat 查询。
+    ReadLogcat { device: String, lines: u64 },
     /// 安装构建产物到设备（路径必须位于项目工作树内）。
     InstallHap { device: Option<String>, hap_path: String, replace: bool },
     /// 拉起一个已安装应用的明确 ability。
@@ -38,6 +44,9 @@ impl HostCapability {
             Self::HdcListTargets => "hdc.list",
             Self::HdcStartServer => "hdc.start_server",
             Self::HdcKillServer => "hdc.kill_server",
+            Self::DevicePidof { .. } => "device.pidof",
+            Self::ReadHilog { .. } => "device.read_hilog",
+            Self::ReadLogcat { .. } => "device.read_logcat",
             Self::InstallHap { .. } => "deploy.install",
             Self::StartAbility { .. } => "deploy.start_ability",
             Self::Deploy { .. } => "deploy",
@@ -51,6 +60,29 @@ impl HostCapability {
                 validate_device_target(target)
             }
             Self::HdcListTargets | Self::HdcStartServer | Self::HdcKillServer => Ok(()),
+            Self::DevicePidof { device, bundle } => {
+                validate_device_target(device)?;
+                validate_app_identifier(bundle, "bundle")
+            }
+            Self::ReadHilog { device, level, tag } => {
+                validate_device_target(device)?;
+                if let Some(level) = level {
+                    if !matches!(level.as_str(), "D" | "I" | "W" | "E" | "F") {
+                        return Err("hilog level 仅支持 D|I|W|E|F".into());
+                    }
+                }
+                if let Some(tag) = tag {
+                    validate_log_tag(tag)?;
+                }
+                Ok(())
+            }
+            Self::ReadLogcat { device, lines } => {
+                validate_device_target(device)?;
+                if !(10..=1000).contains(lines) {
+                    return Err("logcat lines 必须在 10-1000 之间".into());
+                }
+                Ok(())
+            }
             Self::InstallHap { device, hap_path, .. } | Self::Deploy { device, hap_path } => {
                 if let Some(device) = device {
                     validate_device_target(device)?;
@@ -66,7 +98,13 @@ impl HostCapability {
     }
 
     fn replay_safe(&self) -> bool {
-        matches!(self, Self::HdcListTargets)
+        matches!(
+            self,
+            Self::HdcListTargets
+                | Self::DevicePidof { .. }
+                | Self::ReadHilog { .. }
+                | Self::ReadLogcat { .. }
+        )
     }
 }
 
@@ -117,6 +155,16 @@ fn request_material(capability: &HostCapability) -> String {
         HostCapability::HdcListTargets
         | HostCapability::HdcStartServer
         | HostCapability::HdcKillServer => String::new(),
+        HostCapability::DevicePidof { device, bundle } => {
+            format!("{}\0{}", device.trim(), bundle.trim())
+        }
+        HostCapability::ReadHilog { device, level, tag } => format!(
+            "{}\0{}\0{}",
+            device.trim(),
+            level.as_deref().unwrap_or(""),
+            tag.as_deref().unwrap_or("").trim(),
+        ),
+        HostCapability::ReadLogcat { device, lines } => format!("{}\0{lines}", device.trim()),
         HostCapability::InstallHap { device, hap_path, replace } => format!(
             "{}\0{}\0{replace}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
         ),
@@ -138,6 +186,31 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
         HostCapability::HdcListTargets => (vec!["list".into(), "targets".into()], 15),
         HostCapability::HdcStartServer => (vec!["start".into()], 30),
         HostCapability::HdcKillServer => (vec!["kill".into()], 30),
+        HostCapability::DevicePidof { device, bundle } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "pidof".into(),
+                bundle.trim().into(),
+            ],
+            15,
+        ),
+        HostCapability::ReadHilog { device, level, tag } => {
+            let mut args = vec![
+                "-t".into(), device.trim().into(), "shell".into(), "hilog".into(), "-x".into(),
+            ];
+            if let Some(level) = level {
+                args.extend(["-L".into(), level.clone()]);
+            }
+            if let Some(tag) = tag {
+                args.extend(["-T".into(), tag.trim().into()]);
+            }
+            (args, 25)
+        }
+        HostCapability::ReadLogcat { device, lines } => (
+            vec![
+                "-t".into(), device.trim().into(), "logcat".into(), "-T".into(), lines.to_string(),
+            ],
+            20,
+        ),
         HostCapability::InstallHap { device, hap_path, replace } => {
             let artifact = resolve_workspace_artifact(
                 workspace.ok_or("deploy.install 需要明确的项目工作区")?, hap_path,
@@ -375,6 +448,15 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         HostCapability::HdcListTargets
         | HostCapability::HdcStartServer
         | HostCapability::HdcKillServer => serde_json::json!({}),
+        HostCapability::DevicePidof { device, bundle } => serde_json::json!({
+            "device_digest": short_digest(device), "bundle": bundle,
+        }),
+        HostCapability::ReadHilog { device, level, tag } => serde_json::json!({
+            "device_digest": short_digest(device), "level": level, "tag": tag,
+        }),
+        HostCapability::ReadLogcat { device, lines } => serde_json::json!({
+            "device_digest": short_digest(device), "lines": lines,
+        }),
         HostCapability::InstallHap { device, hap_path, replace } => serde_json::json!({
             "device_digest": device.as_deref().map(short_digest), "artifact": hap_path, "replace": replace,
         }),
@@ -412,6 +494,14 @@ fn validate_device_target(target: &str) -> Result<(), String> {
     };
     if t.contains(unsafe_char) {
         return Err(format!("设备 target 含非法字符：{t}"));
+    }
+    Ok(())
+}
+
+fn validate_log_tag(tag: &str) -> Result<(), String> {
+    let tag = tag.trim();
+    if tag.is_empty() || tag.len() > 128 || tag.chars().any(char::is_control) {
+        return Err("hilog tag 不能为空、不得含控制字符且最多 128 字符".into());
     }
     Ok(())
 }
@@ -498,6 +588,38 @@ mod tests {
         assert!(HostCapability::HdcListTargets.replay_safe());
         assert!(!HostCapability::HdcStartServer.replay_safe());
         assert!(!HostCapability::HdcKillServer.replay_safe());
+    }
+
+    #[test]
+    fn log_queries_use_validated_fixed_argv() {
+        let hilog = HostCapability::ReadHilog {
+            device: "ABC123".into(),
+            level: Some("E".into()),
+            tag: Some("MyApp".into()),
+        };
+        let invocation = prepare_invocation(&hilog, None).unwrap();
+        assert_eq!(
+            invocation.args,
+            vec!["-t", "ABC123", "shell", "hilog", "-x", "-L", "E", "-T", "MyApp"]
+        );
+        assert!(hilog.replay_safe());
+        assert!(HostCapability::ReadHilog {
+            device: "ABC123".into(),
+            level: Some("verbose".into()),
+            tag: None,
+        }
+        .validate()
+        .is_err());
+        assert!(HostCapability::ReadHilog {
+            device: "ABC123".into(),
+            level: None,
+            tag: Some("bad\ntag".into()),
+        }
+        .validate()
+        .is_err());
+        assert!(HostCapability::ReadLogcat { device: "ABC123".into(), lines: 9 }
+            .validate()
+            .is_err());
     }
 
     #[test]

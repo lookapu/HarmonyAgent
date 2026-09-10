@@ -1273,7 +1273,7 @@ pub async fn run_tool(
         "flaky_test_detect" => test_tools::flaky_test_detect(&args, &roots).await,
         "smoke_test" => compose_tools::smoke_test(&args, project_path, path_hints, project_id, db, mcp, ctx).await,
         "compose" => compose_tools::compose(&args, project_path, path_hints, project_id, db, mcp, ctx).await,
-        "read_logcat" => test_tools::read_logcat(&args).await,
+        "read_logcat" => test_tools::read_logcat(&args, ctx).await,
         "read_runtime_logs" => test_tools::read_runtime_logs(&args, &roots, ctx).await,
         "web_fetch" => test_tools::web_fetch(&args).await,
         "take_screenshot" => take_screenshot(&args, &roots).await,

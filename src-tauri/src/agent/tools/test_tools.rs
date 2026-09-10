@@ -231,7 +231,10 @@ fn extract_test_summary(raw: &str) -> String {
 }
 
 /// read_logcat：读取设备最近 N 行日志（hdc logcat -T N，可选指定设备与关键词过滤）
-pub(super) async fn read_logcat(args: &Value) -> Result<String, String> {
+pub(super) async fn read_logcat(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let lines = args["lines"].as_u64().unwrap_or(200).clamp(10, 1000);
     let filter = args["filter"].as_str().unwrap_or("").trim();
     let package = args["package"].as_str().unwrap_or("").trim();
@@ -246,7 +249,17 @@ pub(super) async fn read_logcat(args: &Value) -> Result<String, String> {
     // 包名 → pid（hilog 按进程过滤更精准；多进程取全部 pid）
     let mut pids: Vec<String> = Vec::new();
     if !package.is_empty() {
-        if let Ok(out) = run_hdc_shell(&device, &["pidof", package], 15).await {
+        let capability = crate::agent::capability_broker::HostCapability::DevicePidof {
+            device: device.clone(),
+            bundle: package.to_string(),
+        };
+        let output = crate::agent::capability_broker::execute_host_capability(
+            &capability, None, ctx,
+        )
+        .await
+        .map_err(|error| with_advice("read_logcat", error))?;
+        if output.status.success() {
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
             for tok in out.split(|c: char| c.is_whitespace()) {
                 let t = tok.trim();
                 if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
@@ -267,43 +280,34 @@ pub(super) async fn read_logcat(args: &Value) -> Result<String, String> {
         None
     };
 
-    // 组装 hilog 命令：-x 转储历史后退出（不持续跟踪）；-T 不可靠，用 tail 控制行数
-    let mut hilog_args: Vec<String> = vec!["hilog".to_string(), "-x".to_string()];
-    if let Some(lv) = level_flag {
-        hilog_args.push("-L".to_string());
-        hilog_args.push(lv.to_string());
-    }
-    // tag 过滤：-T <tag> （hilog 按 tag 过滤；部分版本用 -D domain，这里用 -T）
-    if !tag.is_empty() {
-        hilog_args.push("-T".to_string());
-        hilog_args.push(tag.to_string());
-    }
-
-    let raw = match run_hdc_shell(
-        &device,
-        &hilog_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        25,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(_) => {
+    // hilog 参数由 Broker 从类型化字段构造，不接受任意 device shell。
+    let hilog = crate::agent::capability_broker::HostCapability::ReadHilog {
+        device: device.clone(),
+        level: level_flag.map(str::to_string),
+        tag: (!tag.is_empty()).then(|| tag.to_string()),
+    };
+    let raw = match crate::agent::capability_broker::execute_host_capability(&hilog, None, ctx).await {
+        Ok(output) if output.status.success() => {
+            smart_decode(&output.stdout) + &smart_decode(&output.stderr)
+        }
+        Ok(_) => {
             // 兜底：部分设备 hilog 参数受限，回退到无过滤的 logcat -T
-            run_cmd(
-                "hdc",
-                &[
-                    "-t".to_string(),
-                    device.clone(),
-                    "logcat".to_string(),
-                    "-T".to_string(),
-                    lines.to_string(),
-                ],
-                None,
-                20,
+            let fallback = crate::agent::capability_broker::HostCapability::ReadLogcat {
+                device: device.clone(),
+                lines,
+            };
+            let output = crate::agent::capability_broker::execute_host_capability(
+                &fallback, None, ctx,
             )
             .await
-            .map_err(|e| with_advice("read_logcat", e))?
+            .map_err(|e| with_advice("read_logcat", e))?;
+            let detail = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(with_advice("read_logcat", detail.trim().to_string()));
+            }
+            detail
         }
+        Err(error) => return Err(with_advice("read_logcat", error)),
     };
 
     // 本地逐行过滤：pid、关键词
