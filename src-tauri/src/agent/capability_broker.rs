@@ -70,6 +70,7 @@ struct HostInvocation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HostRequestIdentity {
     tool_call_id: String,
+    request_digest: String,
     idempotency_key: String,
 }
 
@@ -85,11 +86,16 @@ fn request_identity(
     }
     let capability_id = capability.capability_id();
     let material = request_material(capability);
+    let request_digest = format!(
+        "{:x}",
+        Sha256::digest(format!("hcb-request-v1\0{capability_id}\0{material}").as_bytes())
+    );
     let digest = Sha256::digest(
         format!("hcb-v1\0{run_id}\0{tool_call_id}\0{capability_id}\0{material}").as_bytes(),
     );
     Ok(HostRequestIdentity {
         tool_call_id: tool_call_id.to_string(),
+        request_digest,
         idempotency_key: format!("hcb-v1:{digest:x}"),
     })
 }
@@ -174,37 +180,90 @@ pub async fn execute_host_capability(
             return Err(error);
         }
     };
-    ctx.record_run_event("host_capability.started", serde_json::json!({
-        "capability_id": capability_id,
-        "tool_call_id": &identity.tool_call_id,
-        "idempotency_key": &identity.idempotency_key,
-        "subject": audit_subject(capability),
-    }));
+    let subject = audit_subject(capability);
+    match claim_request(ctx, capability_id, &identity, &subject)? {
+        crate::agent::runtime::HostCapabilityClaim::Claimed => {}
+        crate::agent::runtime::HostCapabilityClaim::Duplicate { status } => {
+            ctx.record_run_event("host_capability.rejected", serde_json::json!({
+                "capability_id": capability_id,
+                "tool_call_id": &identity.tool_call_id,
+                "idempotency_key": &identity.idempotency_key,
+                "reason": "duplicate_dispatch",
+                "previous_status": status,
+            }));
+            return Err(format!(
+                "宿主能力请求已登记（状态：{status}），为避免重复副作用已拒绝自动重放；请先核验外部状态并发起新的工具调用"
+            ));
+        }
+    }
     let result = crate::agent::exec_ctx::run_cmd_streaming(
         ctx, invocation.program, &invocation.args, None, invocation.timeout_seconds, None,
     ).await;
     match result {
         Ok(output) => {
-            ctx.record_run_event("host_capability.finished", serde_json::json!({
-                "capability_id": capability_id,
-                "tool_call_id": &identity.tool_call_id,
-                "idempotency_key": &identity.idempotency_key,
-                "success": output.status.success(),
-                "exit_code": output.status.code(),
-            }));
+            let status = if output.status.success() { "succeeded" } else { "failed" };
+            finish_request(ctx, capability_id, &identity, status, output.status.code(), None)
+                .map_err(|error| format!(
+                    "宿主命令已经返回，但持久化终态失败，实际副作用状态不确定：{error}"
+                ))?;
             Ok(output)
         }
         Err(error) => {
-            ctx.record_run_event("host_capability.finished", serde_json::json!({
-                "capability_id": capability_id,
-                "tool_call_id": &identity.tool_call_id,
-                "idempotency_key": &identity.idempotency_key,
-                "success": false,
-                "error_kind": capability_error_kind(&error),
-            }));
+            let error_kind = capability_error_kind(&error);
+            finish_request(
+                ctx, capability_id, &identity, "indeterminate", None, Some(error_kind),
+            )
+            .map_err(|persist_error| format!(
+                "{error}；宿主能力的不确定终态持久化失败：{persist_error}"
+            ))?;
             Err(error)
         }
     }
+}
+
+fn claim_request(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    capability_id: &str,
+    identity: &HostRequestIdentity,
+    subject: &serde_json::Value,
+) -> Result<crate::agent::runtime::HostCapabilityClaim, String> {
+    let app = ctx.app.as_ref().ok_or("Host Capability Broker 缺少应用数据库，拒绝执行")?;
+    let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
+    let conn = db.0.lock().map_err(|_| "Host Capability Broker 数据库锁已损坏")?;
+    crate::agent::runtime::claim_host_capability(
+        &conn,
+        &ctx.run_id,
+        &ctx.conversation_id,
+        &identity.tool_call_id,
+        capability_id,
+        &identity.request_digest,
+        &identity.idempotency_key,
+        subject,
+    )
+}
+
+fn finish_request(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    capability_id: &str,
+    identity: &HostRequestIdentity,
+    status: &str,
+    exit_code: Option<i32>,
+    error_kind: Option<&str>,
+) -> Result<(), String> {
+    let app = ctx.app.as_ref().ok_or("Host Capability Broker 缺少应用数据库")?;
+    let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
+    let conn = db.0.lock().map_err(|_| "Host Capability Broker 数据库锁已损坏")?;
+    crate::agent::runtime::finish_host_capability(
+        &conn,
+        &ctx.run_id,
+        &ctx.conversation_id,
+        &identity.idempotency_key,
+        capability_id,
+        &identity.tool_call_id,
+        status,
+        exit_code,
+        error_kind,
+    )
 }
 
 fn resolve_workspace_artifact(workspace: &Path, relative: &str) -> Result<std::path::PathBuf, String> {

@@ -45,6 +45,12 @@ pub struct RunEvent {
     pub created_at: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostCapabilityClaim {
+    Claimed,
+    Duplicate { status: String },
+}
+
 pub const DESKTOP_ADAPTER_CURSOR_VERSION: u32 = 1;
 pub const DESKTOP_ADAPTER_CONTROL_VERSION: u32 = 1;
 pub const DESKTOP_RECOVERY_MESSAGE_LIMIT: usize = 200;
@@ -345,6 +351,132 @@ pub fn append_event(
     let seq = append_event_tx(&tx, run_id, conversation_id, event_type, &payload, now)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(seq)
+}
+
+/// 原子登记一次宿主能力派发。唯一键同时受 SQLite 主键与规范化请求唯一约束保护，
+/// 因此多个进程/Worker 最多只有一个能获得执行权。
+pub fn claim_host_capability(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    tool_call_id: &str,
+    capability_id: &str,
+    request_digest: &str,
+    idempotency_key: &str,
+    subject: &serde_json::Value,
+) -> Result<HostCapabilityClaim, String> {
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    let active = tx
+        .query_row(
+            "SELECT conversation_id=?1 AND state IN ('running','verifying')
+             FROM agent_runs WHERE run_id=?2",
+            params![conversation_id, run_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    if !active {
+        return Err("Host Capability Broker 的 Run 不存在、归属不符或已非活跃状态".into());
+    }
+    let inserted = tx
+        .execute(
+            "INSERT INTO host_capability_claims(
+               idempotency_key,run_id,conversation_id,tool_call_id,capability_id,
+               request_digest,status,subject_json,claimed_at)
+             VALUES(?1,?2,?3,?4,?5,?6,'started',?7,?8)
+             ON CONFLICT DO NOTHING",
+            params![
+                idempotency_key,
+                run_id,
+                conversation_id,
+                tool_call_id,
+                capability_id,
+                request_digest,
+                subject.to_string(),
+                now,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if inserted == 0 {
+        let status = tx
+            .query_row(
+                "SELECT status FROM host_capability_claims WHERE idempotency_key=?1",
+                [idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "conflict".into());
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(HostCapabilityClaim::Duplicate { status });
+    }
+    append_event_tx(
+        &tx,
+        run_id,
+        conversation_id,
+        "host_capability.started",
+        &serde_json::json!({
+            "capability_id": capability_id,
+            "tool_call_id": tool_call_id,
+            "idempotency_key": idempotency_key,
+            "subject": subject,
+        }),
+        now,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(HostCapabilityClaim::Claimed)
+}
+
+/// 完成已 claim 的宿主能力，并与 finished 事件原子提交。若 Worker 已丢失租约，
+/// 状态会保留为 started，恢复端必须视为结果不确定且不得自动重放。
+pub fn finish_host_capability(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    idempotency_key: &str,
+    capability_id: &str,
+    tool_call_id: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    error_kind: Option<&str>,
+) -> Result<(), String> {
+    if !matches!(status, "succeeded" | "failed" | "indeterminate") {
+        return Err(format!("非法宿主能力终态：{status}"));
+    }
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    let changed = tx
+        .execute(
+            "UPDATE host_capability_claims
+             SET status=?1,finished_at=?2,exit_code=?3,error_kind=?4
+             WHERE idempotency_key=?5 AND run_id=?6 AND conversation_id=?7 AND status='started'",
+            params![status, now, exit_code, error_kind, idempotency_key, run_id, conversation_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed != 1 {
+        return Err("宿主能力 claim 不存在、归属不符或已经结束".into());
+    }
+    append_event_tx(
+        &tx,
+        run_id,
+        conversation_id,
+        "host_capability.finished",
+        &serde_json::json!({
+            "capability_id": capability_id,
+            "tool_call_id": tool_call_id,
+            "idempotency_key": idempotency_key,
+            "success": status == "succeeded",
+            "status": status,
+            "exit_code": exit_code,
+            "error_kind": error_kind,
+        }),
+        now,
+    )?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// 把桌面 Durable Run 的活跃 executor 状态写入受 Worker 租约保护的事件流。
@@ -1024,10 +1156,18 @@ pub fn recover_interrupted_runs(conn: &Connection) -> Result<usize, String> {
                WHEN EXISTS(SELECT 1 FROM execution_steps WHERE run_id=?2 AND state='interrupted' AND recovery_policy='manual')
                  OR EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='manual') THEN 'manual'
                WHEN EXISTS(SELECT 1 FROM execution_steps WHERE run_id=?2 AND state='interrupted' AND recovery_policy='verify')
-                 OR EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='verify') THEN 'verify_effects'
+                 OR EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='verify')
+                 OR EXISTS(SELECT 1 FROM host_capability_claims WHERE run_id=?2 AND status='started') THEN 'verify_effects'
                ELSE 'continue'
              END,
              updated_at=?1,finished_at=?1 WHERE run_id=?2",
+            params![now, run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE host_capability_claims
+             SET status='indeterminate',finished_at=?1,error_kind='process_interrupted'
+             WHERE run_id=?2 AND status='started'",
             params![now, run_id],
         )
         .map_err(|e| e.to_string())?;
@@ -1056,6 +1196,7 @@ mod tests {
              INSERT INTO conversations(id) VALUES ('c');
              CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT,approved_plan TEXT);
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
+             CREATE TABLE host_capability_claims(idempotency_key TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),tool_call_id TEXT NOT NULL,capability_id TEXT NOT NULL,request_digest TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'started',subject_json TEXT NOT NULL DEFAULT '{}',claimed_at INTEGER NOT NULL,finished_at INTEGER,exit_code INTEGER,error_kind TEXT,UNIQUE(run_id,tool_call_id,capability_id,request_digest));
              CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT '',reasoning TEXT,queued INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE tool_runs(id TEXT,conversation_id TEXT,trace_id TEXT,tool_name TEXT,input_json TEXT,result_json TEXT,status TEXT,recovery_policy TEXT);
              CREATE TABLE execution_steps(run_id TEXT,state TEXT,recovery_policy TEXT);",
@@ -1074,6 +1215,106 @@ mod tests {
         assert_eq!(run.last_event_seq, 3);
         let events = events_after(&c, "r", 1, 50).unwrap();
         assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn host_capability_claim_is_atomic_and_blocks_replay() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        let subject = serde_json::json!({"device_digest": "abc123"});
+        assert_eq!(
+            claim_host_capability(
+                &c, "r", "c", "call-1", "deploy.install", "request-a", "key-a", &subject,
+            )
+            .unwrap(),
+            HostCapabilityClaim::Claimed
+        );
+        assert_eq!(
+            claim_host_capability(
+                &c, "r", "c", "call-1", "deploy.install", "request-a", "key-a", &subject,
+            )
+            .unwrap(),
+            HostCapabilityClaim::Duplicate { status: "started".into() }
+        );
+        finish_host_capability(
+            &c, "r", "c", "key-a", "deploy.install", "call-1", "succeeded", Some(0), None,
+        )
+        .unwrap();
+        assert_eq!(
+            claim_host_capability(
+                &c, "r", "c", "call-1", "deploy.install", "request-a", "key-a", &subject,
+            )
+            .unwrap(),
+            HostCapabilityClaim::Duplicate { status: "succeeded".into() }
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM host_capability_claims WHERE run_id='r'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let events = events_after(&c, "r", 0, 10).unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
+            vec!["run.started", "host_capability.started", "host_capability.finished"]
+        );
+    }
+
+    #[test]
+    fn host_capability_claim_rejects_inactive_or_foreign_run() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        transition(&c, "r", "c", "completed", "done", None).unwrap();
+        let error = claim_host_capability(
+            &c,
+            "r",
+            "c",
+            "call-1",
+            "hdc.connect",
+            "request-a",
+            "key-a",
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(error.contains("非活跃"));
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM host_capability_claims", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recovery_marks_unfinished_host_capability_indeterminate() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        claim_host_capability(
+            &c,
+            "r",
+            "c",
+            "call-1",
+            "deploy.install",
+            "request-a",
+            "key-a",
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(recover_interrupted_runs(&c).unwrap(), 1);
+        let (status, error_kind): (String, String) = c
+            .query_row(
+                "SELECT status,error_kind FROM host_capability_claims WHERE idempotency_key='key-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "indeterminate");
+        assert_eq!(error_kind, "process_interrupted");
+        assert_eq!(get_run(&c, "r").unwrap().unwrap().resume_policy, "verify_effects");
     }
 
     #[test]

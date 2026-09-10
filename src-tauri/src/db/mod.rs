@@ -159,6 +159,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (79, "079_agent_run_approved_plan", include_str!("../../migrations/079_agent_run_approved_plan.sql")),
     (80, "080_session_event_checkpoint_lookup", include_str!("../../migrations/080_session_event_checkpoint_lookup.sql")),
     (81, "081_desktop_recovery_cursor_indexes", include_str!("../../migrations/081_desktop_recovery_cursor_indexes.sql")),
+    (82, "082_host_capability_claims", include_str!("../../migrations/082_host_capability_claims.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -329,6 +330,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reproduction_tables, 1);
+        let capability_claim_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='host_capability_claims'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(capability_claim_tables, 1);
         let eval_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(agent_eval_runs)")
             .unwrap()
