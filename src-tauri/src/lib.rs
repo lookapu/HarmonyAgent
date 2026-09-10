@@ -476,6 +476,7 @@ pub fn run() {
             commands::limits::set_agent_limits,
             commands::limits::reset_agent_limits,
             agent::sandbox::probe_sandbox_backends,
+            agent::sandbox::verify_native_sandbox_boundary,
             commands::index::build_project_index,
             commands::index::get_project_file_tree,
             commands::index::list_project_dir,

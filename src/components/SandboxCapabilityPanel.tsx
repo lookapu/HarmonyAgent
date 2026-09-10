@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { probeSandboxBackends, type SandboxCapabilities } from '../api/sandbox'
+import {
+  probeSandboxBackends,
+  verifyNativeSandboxBoundary,
+  type SandboxBoundaryReport,
+  type SandboxCapabilities,
+} from '../api/sandbox'
 
 const DISPLAY_NAMES: Record<string, string> = {
   'macos-sandbox-exec': 'macOS sandbox-exec',
@@ -10,11 +15,21 @@ const DISPLAY_NAMES: Record<string, string> = {
   podman: 'Podman (OCI)',
 }
 
+const CHECK_LABELS: Record<string, string> = {
+  runtime_available: 'health.sandboxCheckRuntime',
+  workspace_write: 'health.sandboxCheckWorkspaceWrite',
+  external_read_denied: 'health.sandboxCheckExternalRead',
+  read_only_write_denied: 'health.sandboxCheckReadOnly',
+  symlink_escape_denied: 'health.sandboxCheckSymlink',
+}
+
 export default function SandboxCapabilityPanel() {
   const { t } = useTranslation()
   const [capabilities, setCapabilities] = useState<SandboxCapabilities[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [verifying, setVerifying] = useState(false)
+  const [boundary, setBoundary] = useState<SandboxBoundaryReport | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -32,6 +47,18 @@ export default function SandboxCapabilityPanel() {
     void load()
   }, [load])
 
+  const verifyBoundary = useCallback(async () => {
+    setVerifying(true)
+    setError(null)
+    try {
+      setBoundary(await verifyNativeSandboxBoundary())
+    } catch (err) {
+      setError(String(err))
+    } finally {
+      setVerifying(false)
+    }
+  }, [])
+
   return (
     <section className="mt-8" aria-labelledby="sandbox-capability-title">
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -41,14 +68,24 @@ export default function SandboxCapabilityPanel() {
           </h3>
           <p className="mt-1 text-[11px] text-[var(--text-muted)]">{t('health.sandboxSubtitle')}</p>
         </div>
-        <button
-          type="button"
-          onClick={() => void load()}
-          disabled={loading}
-          className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50"
-        >
-          {loading ? t('health.sandboxProbing') : t('health.sandboxProbe')}
-        </button>
+        <div className="flex shrink-0 gap-2">
+          <button
+            type="button"
+            onClick={() => void verifyBoundary()}
+            disabled={verifying}
+            className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50"
+          >
+            {verifying ? t('health.sandboxVerifying') : t('health.sandboxVerify')}
+          </button>
+          <button
+            type="button"
+            onClick={() => void load()}
+            disabled={loading}
+            className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-50"
+          >
+            {loading ? t('health.sandboxProbing') : t('health.sandboxProbe')}
+          </button>
+        </div>
       </div>
 
       <div className="modern-card overflow-hidden rounded-lg">
@@ -109,6 +146,32 @@ export default function SandboxCapabilityPanel() {
           })
         )}
       </div>
+      {boundary && (
+        <div className={`mt-2 rounded-lg border px-4 py-3 ${boundary.passed ? 'border-[var(--success)]/25 bg-[var(--success)]/5' : 'border-[var(--warning)]/25 bg-[var(--warning)]/5'}`}>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-xs font-medium text-[var(--text-primary)]">
+              {t('health.sandboxVerifyResult')}
+            </span>
+            <span className={`text-[11px] font-medium ${boundary.passed ? 'text-[var(--success)]' : 'text-[var(--warning)]'}`}>
+              {boundary.passed ? t('health.sandboxVerifyPassed') : t('health.sandboxVerifyFailed')}
+            </span>
+          </div>
+          <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+            {boundary.checks.map((check) => (
+              <div key={check.name} className="flex items-start gap-2 text-[11px]">
+                <span className={check.passed ? 'text-[var(--success)]' : 'text-[var(--danger)]'}>
+                  {check.passed ? '✓' : '✕'}
+                </span>
+                <span className="text-[var(--text-secondary)]">
+                  {t(CHECK_LABELS[check.name] ?? check.name)}
+                  {!check.passed && check.detail ? ` · ${check.detail}` : ''}
+                </span>
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-[10px] text-[var(--text-muted)]">{t('health.sandboxVerifyScope')}</p>
+        </div>
+      )}
       <p className="mt-2 text-[11px] leading-5 text-[var(--warning)]">{t('health.sandboxBoundaryNote')}</p>
     </section>
   )

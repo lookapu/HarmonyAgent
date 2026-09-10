@@ -67,7 +67,11 @@ HarmonyAgent 当前**不具备默认 OS 级命令沙箱**：
 
 任何平台如果不能建立所声明的边界，必须返回 `sandbox_unavailable` 并失败关闭，不能静默切换到 `host-direct`。
 
-当前实现进度：`src-tauri/src/agent/sandbox.rs` 已提供 `SandboxBackend`/`OciBackend`、固定 digest 的 OCI 安全 argv、wall-time/取消处理、命名容器清理、输出预算和运行事件；同时提供稳定的原生/OCI capability 清单与 Tauri 探测入口，环境管理页以只读能力卡片展示真实状态和失败原因。macOS/Linux 探测会实际启动无副作用的最小隔离域，Windows AppContainer 在 token/profile/ACL 生命周期完成前保持 unavailable；探测不会下载镜像或执行用户命令。`run_command` 在显式设置 `HARMONY_SANDBOX_BACKEND=native` 时会进入 macOS `sandbox-exec` 或 Linux bubblewrap：使用干净环境、工作区定向挂载/规则、独立临时目录和默认断网；未知后端值、域名 allowlist、Windows 未实现路径及隔离模式下的后台任务均失败关闭。该路径尚未设为默认，且完整跨平台逃逸套件仍待宿主/CI 验证，因此缺省产品能力仍按第 2 节的宿主执行边界对外说明。
+当前实现进度：`src-tauri/src/agent/sandbox.rs` 已提供 `SandboxBackend`/`OciBackend`、固定 digest 的 OCI 安全 argv、wall-time/取消处理、命名容器清理、输出预算和运行事件；同时提供稳定的原生/OCI capability 清单与 Tauri 探测入口，环境管理页以能力卡片展示真实状态和失败原因。macOS/Linux 探测会实际启动无副作用的最小隔离域，Windows AppContainer 在 token/profile/ACL 生命周期完成前保持 unavailable；探测不会下载镜像或执行用户命令。`run_command` 在显式设置 `HARMONY_SANDBOX_BACKEND=native` 时会进入 macOS `sandbox-exec` 或 Linux bubblewrap：使用干净环境、工作区定向挂载/规则、独立临时目录和默认断网；未知后端值、域名 allowlist、Windows 未实现路径及隔离模式下的后台任务均失败关闭。
+
+环境管理页还可手动调用 `verify_native_sandbox_boundary`。该命令只在应用内部创建 UUID 临时测试根目录，不读取或修改用户项目，并实际验证工作区写入、工作区外读取拒绝、只读工作区写入拒绝和符号链接逃逸拒绝。报告固定标记为 `filesystem_smoke_v1`；原生运行时不可用或任一检查失败时不会给出通过结论。该 smoke 不验证网络、凭据、进程树或资源限制，不能替代各平台的完整逃逸套件。
+
+原生路径尚未设为默认，且完整跨平台逃逸套件仍待宿主/CI 验证，因此缺省产品能力仍按第 2 节的宿主执行边界对外说明。
 
 ## 6. Sandbox Backend 最低契约
 

@@ -950,6 +950,231 @@ pub async fn probe_sandbox_backends() -> Vec<SandboxCapabilities> {
     capabilities
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxBoundaryCheck {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxBoundaryReport {
+    pub scope: String,
+    pub backend: String,
+    pub available: bool,
+    pub passed: bool,
+    pub checks: Vec<SandboxBoundaryCheck>,
+}
+
+/// 在内部临时目录中运行原生文件边界 smoke。报告刻意命名为 filesystem_smoke_v1，
+/// 不把这四个用例冒充完整网络、凭据、进程与资源逃逸认证。
+#[tauri::command]
+pub async fn verify_native_sandbox_boundary() -> SandboxBoundaryReport {
+    let backend = match NativeBackend::current() {
+        Ok(backend) => backend,
+        Err(error) => {
+            return unavailable_boundary_report("native-unsupported", error);
+        }
+    };
+    let capabilities = backend.probe().await;
+    if !capabilities.available {
+        return unavailable_boundary_report(
+            backend.kind.backend_name(),
+            capabilities
+                .reason
+                .unwrap_or_else(|| "平台原生 sandbox 不可用".into()),
+        );
+    }
+
+    let root =
+        std::env::temp_dir().join(format!("harmony-agent-boundary-{}", uuid::Uuid::new_v4()));
+    let workspace = root.join("workspace");
+    let scratch = root.join("scratch");
+    let external = root.join("external");
+    let setup = [&workspace, &scratch, &external]
+        .iter()
+        .try_for_each(|path| std::fs::create_dir_all(path));
+    if let Err(error) = setup {
+        let _ = std::fs::remove_dir_all(&root);
+        return unavailable_boundary_report(
+            backend.kind.backend_name(),
+            format!("无法创建 boundary smoke 临时目录：{error}"),
+        );
+    }
+    let secret = external.join("secret.txt");
+    if let Err(error) = std::fs::write(&secret, "harmony-boundary-secret") {
+        let _ = std::fs::remove_dir_all(&root);
+        return unavailable_boundary_report(
+            backend.kind.backend_name(),
+            format!("无法准备 boundary smoke：{error}"),
+        );
+    }
+
+    let checks = run_native_filesystem_checks(backend.kind, &workspace, &scratch, &secret).await;
+    let _ = std::fs::remove_dir_all(&root);
+    match checks {
+        Ok(checks) => SandboxBoundaryReport {
+            scope: "filesystem_smoke_v1".into(),
+            backend: backend.kind.backend_name().into(),
+            available: true,
+            passed: checks.iter().all(|check| check.passed),
+            checks,
+        },
+        Err(error) => unavailable_boundary_report(backend.kind.backend_name(), error),
+    }
+}
+
+fn unavailable_boundary_report(backend: &str, detail: String) -> SandboxBoundaryReport {
+    SandboxBoundaryReport {
+        scope: "filesystem_smoke_v1".into(),
+        backend: backend.into(),
+        available: false,
+        passed: false,
+        checks: vec![SandboxBoundaryCheck {
+            name: "runtime_available".into(),
+            passed: false,
+            detail,
+        }],
+    }
+}
+
+async fn run_native_filesystem_checks(
+    kind: NativeSandboxKind,
+    workspace: &Path,
+    scratch: &Path,
+    external_secret: &Path,
+) -> Result<Vec<SandboxBoundaryCheck>, String> {
+    let writable = SandboxSpec::workspace_write(workspace.to_path_buf());
+    let write_output = run_native_check(build_native_run_command(
+        kind,
+        &writable,
+        scratch,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf boundary-ok > boundary-write.txt".into(),
+        ],
+    )?)
+    .await?;
+    let write_passed = write_output.status.success()
+        && std::fs::read_to_string(workspace.join("boundary-write.txt"))
+            .is_ok_and(|value| value == "boundary-ok");
+
+    let external_output = run_native_check(build_native_run_command(
+        kind,
+        &writable,
+        scratch,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat \"$1\"".into(),
+            "boundary-external-read".into(),
+            external_secret.to_string_lossy().into_owned(),
+        ],
+    )?)
+    .await?;
+    let external_stdout = String::from_utf8_lossy(&external_output.stdout);
+    let external_denied =
+        !external_output.status.success() && !external_stdout.contains("harmony-boundary-secret");
+
+    let mut read_only = writable.clone();
+    read_only.filesystem = FilesystemPolicy::ReadOnly;
+    let read_only_output = run_native_check(build_native_run_command(
+        kind,
+        &read_only,
+        scratch,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf denied > must-not-exist.txt".into(),
+        ],
+    )?)
+    .await?;
+    let read_only_denied =
+        !read_only_output.status.success() && !workspace.join("must-not-exist.txt").exists();
+
+    let symlink_denied = verify_symlink_escape(kind, &writable, scratch, external_secret).await?;
+    Ok(vec![
+        SandboxBoundaryCheck {
+            name: "workspace_write".into(),
+            passed: write_passed,
+            detail: boundary_detail(write_passed),
+        },
+        SandboxBoundaryCheck {
+            name: "external_read_denied".into(),
+            passed: external_denied,
+            detail: boundary_detail(external_denied),
+        },
+        SandboxBoundaryCheck {
+            name: "read_only_write_denied".into(),
+            passed: read_only_denied,
+            detail: boundary_detail(read_only_denied),
+        },
+        SandboxBoundaryCheck {
+            name: "symlink_escape_denied".into(),
+            passed: symlink_denied,
+            detail: boundary_detail(symlink_denied),
+        },
+    ])
+}
+
+#[cfg(unix)]
+async fn verify_symlink_escape(
+    kind: NativeSandboxKind,
+    spec: &SandboxSpec,
+    scratch: &Path,
+    external_secret: &Path,
+) -> Result<bool, String> {
+    use std::os::unix::fs::symlink;
+    let link = spec.workspace.join("external-link");
+    symlink(external_secret, &link).map_err(|error| format!("无法准备 symlink smoke：{error}"))?;
+    let output = run_native_check(build_native_run_command(
+        kind,
+        spec,
+        scratch,
+        &["/bin/sh".into(), "-c".into(), "cat external-link".into()],
+    )?)
+    .await?;
+    Ok(!output.status.success()
+        && !String::from_utf8_lossy(&output.stdout).contains("harmony-boundary-secret"))
+}
+
+#[cfg(not(unix))]
+async fn verify_symlink_escape(
+    _kind: NativeSandboxKind,
+    _spec: &SandboxSpec,
+    _scratch: &Path,
+    _external_secret: &Path,
+) -> Result<bool, String> {
+    Ok(false)
+}
+
+async fn run_native_check(built: NativeRunCommand) -> Result<std::process::Output, String> {
+    let mut command = tokio::process::Command::new(&built.program);
+    command
+        .args(&built.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(cwd) = &built.cwd {
+        command.current_dir(cwd);
+    }
+    match tokio::time::timeout(Duration::from_secs(5), command.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(format!("无法启动 boundary smoke：{error}")),
+        Err(_) => Err("boundary smoke 超时（5s）".into()),
+    }
+}
+
+fn boundary_detail(passed: bool) -> String {
+    if passed {
+        "通过".into()
+    } else {
+        "未建立所声明的文件边界".into()
+    }
+}
+
 async fn probe_oci_engine(engine: OciEngine) -> SandboxCapabilities {
     let mut capabilities = engine.declared_capabilities();
     let args = vec!["version".to_string()];
@@ -1263,6 +1488,20 @@ mod tests {
         assert!(!capabilities.available);
     }
 
+    #[tokio::test]
+    async fn boundary_report_is_scoped_and_never_passes_when_runtime_is_unavailable() {
+        let report = verify_native_sandbox_boundary().await;
+        assert_eq!(report.scope, "filesystem_smoke_v1");
+        assert!(!report.checks.is_empty());
+        if !report.available {
+            assert!(!report.passed);
+        }
+        if report.passed {
+            assert!(report.available);
+            assert!(report.checks.iter().all(|check| check.passed));
+        }
+    }
+
     #[test]
     fn macos_native_command_uses_deny_default_clean_env_and_scoped_writes() {
         let workspace = temp_workspace();
@@ -1408,62 +1647,24 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
+    #[tokio::test]
     #[ignore = "需要宿主允许创建嵌套 sandbox-exec 隔离域；受限 CI/Codex 环境会返回 Operation not permitted"]
-    fn macos_native_backend_writes_workspace_but_denies_external_file_read() {
+    async fn macos_native_backend_writes_workspace_but_denies_external_file_read() {
         let workspace = temp_workspace();
         let temp_root = temp_workspace();
         let external_root = temp_workspace();
         let external_secret = external_root.join("secret.txt");
-        std::fs::write(&external_secret, "must-not-be-readable").unwrap();
-        let spec = SandboxSpec::workspace_write(workspace.clone());
-
-        let write = build_native_run_command(
+        std::fs::write(&external_secret, "harmony-boundary-secret").unwrap();
+        let checks = run_native_filesystem_checks(
             NativeSandboxKind::MacosSandboxExec,
-            &spec,
+            &workspace,
             &temp_root,
-            &[
-                "/bin/sh".into(),
-                "-c".into(),
-                "printf sandbox-ok > allowed.txt".into(),
-            ],
+            &external_secret,
         )
+        .await
         .unwrap();
-        let write_output = std::process::Command::new(&write.program)
-            .args(&write.args)
-            .current_dir(write.cwd.as_ref().unwrap())
-            .output()
-            .unwrap();
-        assert!(
-            write_output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&write_output.stderr)
-        );
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("allowed.txt")).unwrap(),
-            "sandbox-ok"
-        );
-
-        let escape = build_native_run_command(
-            NativeSandboxKind::MacosSandboxExec,
-            &spec,
-            &temp_root,
-            &[
-                "/bin/sh".into(),
-                "-c".into(),
-                "cat \"$1\"".into(),
-                "sandbox-read-check".into(),
-                external_secret.to_string_lossy().into_owned(),
-            ],
-        )
-        .unwrap();
-        let escape_output = std::process::Command::new(&escape.program)
-            .args(&escape.args)
-            .current_dir(escape.cwd.as_ref().unwrap())
-            .output()
-            .unwrap();
-        assert!(!escape_output.status.success());
-        assert!(!String::from_utf8_lossy(&escape_output.stdout).contains("must-not-be-readable"));
+        assert_eq!(checks.len(), 4);
+        assert!(checks.iter().all(|check| check.passed), "{checks:#?}");
 
         std::fs::remove_dir_all(workspace).ok();
         std::fs::remove_dir_all(temp_root).ok();
