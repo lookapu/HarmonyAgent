@@ -250,6 +250,30 @@ fn read_tail(p: &Path, max_chars: usize) -> String {
     }
 }
 
+async fn append_command_changes(
+    out: String,
+    roots: &[String],
+    cmd_start: std::time::SystemTime,
+) -> String {
+    let roots_owned = roots.to_vec();
+    let changed = tokio::task::spawn_blocking(move || {
+        scan_recent_changes(&roots_owned, cmd_start, 200)
+    })
+    .await
+    .unwrap_or_default();
+    if changed.is_empty() {
+        return out;
+    }
+    let shown: Vec<&str> = changed.iter().take(15).map(String::as_str).collect();
+    let extra = if changed.len() > 15 { "…" } else { "" };
+    record_cmd_changes(&changed);
+    format!(
+        "{out}\n\n（命令间接修改/创建了 {} 个文件：{}{extra}）",
+        changed.len(),
+        shown.join(", ")
+    )
+}
+
 pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法执行命令".into());
@@ -259,11 +283,13 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     let command = spec.command.as_str();
     let timeout = spec.timeout;
     let cwd: &Path = &spec.cwd;
+    let sandbox_config = crate::agent::sandbox::sandbox_config_from_env()?;
     // 全局并发护栏：与构建/部署互斥，避免并发写 build 目录
     let _gate = crate::services::tool_limits::acquire_workspace_gate(cwd).await;
     // 后台模式：解析为 (program, args) 后交给 jobs 托管进程生命周期，立即返回 job_id；
     // 任务完成时结果注入会话队列（模型下一轮请求自动看到），并可 job_output/job_kill 管理
     if spec.run_in_background {
+        crate::agent::sandbox::validate_background_execution(&sandbox_config)?;
         // 注：后台任务暂不注入环境变量（jobs 模块无 env 支持），.bat 经 cmd /C 执行即可
         let (program, args, _envs) = if needs_shell(command) {
             #[cfg(windows)]
@@ -287,8 +313,39 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
             cwd.display()
         ));
     }
-    // 沙箱命令接线（路线 5.3）：显式配置 OCI 后端时在容器内执行；缺省仍宿主直跑（下方持续显示风险）。
-    let sandbox_config = crate::agent::sandbox::sandbox_config_from_env();
+    // 三种执行目标共用同一个变化窗口，避免隔离分支提前返回后丢失修改证据。
+    let cmd_start = std::time::SystemTime::now();
+    // 平台原生沙箱仅在显式 HARMONY_SANDBOX_BACKEND=native 时启用；不可用时失败关闭。
+    if sandbox_config.native {
+        let backend = crate::agent::sandbox::NativeBackend::current()?;
+        let command_vec = if cfg!(windows) {
+            vec!["cmd".to_string(), "/C".to_string(), command.to_string()]
+        } else {
+            vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()]
+        };
+        let native_spec = crate::agent::sandbox::SandboxSpec::workspace_write(cwd.to_path_buf());
+        let execution_id = format!("run-{}", uuid::Uuid::new_v4());
+        let result = backend.run(&native_spec, &execution_id, &command_vec, ctx).await?;
+        return match result.status {
+            crate::agent::sandbox::SandboxRunStatus::Succeeded => {
+                let out = format!(
+                    "[sandbox:{}] {}{}",
+                    result.backend,
+                    result.stdout,
+                    if result.stderr.is_empty() { String::new() } else { format!("\n{}", result.stderr) }
+                );
+                Ok(append_command_changes(out, roots, cmd_start).await)
+            }
+            _ => Err(format!(
+                "[sandbox:{}] 命令失败（{:?}，exit={:?}）：{}",
+                result.backend,
+                result.status,
+                result.exit_code,
+                if result.stderr.is_empty() { &result.stdout } else { &result.stderr }
+            )),
+        };
+    }
+    // OCI 只在显式配置时执行；缺省仍宿主直跑（下方持续显示风险）。
     if let Some(engine) = sandbox_config.backend {
         let image = sandbox_config.image.as_deref().ok_or_else(|| {
             "sandbox 镜像未配置：设置了 HARMONY_SANDBOX_BACKEND 但未设置 HARMONY_SANDBOX_IMAGE".to_string()
@@ -307,12 +364,15 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         let execution_id = format!("run-{}", uuid::Uuid::new_v4());
         let result = backend.run(&spec, &execution_id, image, &command_vec, ctx).await?;
         return match result.status {
-            crate::agent::sandbox::SandboxRunStatus::Succeeded => Ok(format!(
-                "[sandbox:{}] {}{}",
-                result.backend,
-                result.stdout,
-                if result.stderr.is_empty() { String::new() } else { format!("\n{}", result.stderr) }
-            )),
+            crate::agent::sandbox::SandboxRunStatus::Succeeded => {
+                let out = format!(
+                    "[sandbox:{}] {}{}",
+                    result.backend,
+                    result.stdout,
+                    if result.stderr.is_empty() { String::new() } else { format!("\n{}", result.stderr) }
+                );
+                Ok(append_command_changes(out, roots, cmd_start).await)
+            }
             _ => Err(format!(
                 "[sandbox:{}] 命令失败（{:?}，exit={:?}）：{}",
                 result.backend,
@@ -322,8 +382,6 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
             )),
         };
     }
-    // 间接修改追踪：记录命令开始时间，执行后扫描工作区内变更文件（排除构建产物目录）
-    let cmd_start = std::time::SystemTime::now();
     // shell 语法（&&、||、引号外的 | > < &）经系统 shell 执行（Windows: cmd /C；
     // macOS/Linux: sh -c），对齐 ChatGPT 式整条命令；
     // 引号内的 | 等不算（如 rg -n 'a|b' 的正则竖线），保持单程序直接执行
@@ -359,26 +417,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         Ok(out) => {
             // 宿主直跑持续显示风险（路线 5.2.3）：命令未受沙箱隔离。
             let out = format!("⚠️ {}\n{out}", crate::agent::sandbox::host_direct_risk_note());
-            // 扫描命令间接修改/创建的文件（写文件类命令也受文件列表追踪，与 edit_file/write_file 一致）。
-            // 全项目递归遍历在 spawn_blocking 中执行，避免钉死 tokio worker。
-            let roots_owned = roots.to_vec();
-            let changed = tokio::task::spawn_blocking(move || {
-                scan_recent_changes(&roots_owned, cmd_start, 200)
-            })
-            .await
-            .unwrap_or_default();
-            if changed.is_empty() {
-                Ok(out)
-            } else {
-                let shown: Vec<&str> = changed.iter().take(15).map(String::as_str).collect();
-                let extra = if changed.len() > 15 { "…" } else { "" };
-                record_cmd_changes(&changed);
-                Ok(format!(
-                    "{out}\n\n（命令间接修改/创建了 {} 个文件：{}{extra}）",
-                    changed.len(),
-                    shown.join(", ")
-                ))
-            }
+            Ok(append_command_changes(out, roots, cmd_start).await)
         }
         Err(e) => Err(enrich_run_error(e, command, cwd)),
     }

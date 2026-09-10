@@ -249,6 +249,128 @@ pub async fn probe_native_backend() -> SandboxCapabilities {
     probe_native_kind(kind).await
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeBackend {
+    pub kind: NativeSandboxKind,
+}
+
+impl NativeBackend {
+    pub fn current() -> Result<Self, String> {
+        native_sandbox_for_current_platform()
+            .map(|kind| Self { kind })
+            .ok_or_else(|| "sandbox_unavailable: 当前平台没有原生沙箱后端".into())
+    }
+
+    pub async fn probe(&self) -> SandboxCapabilities {
+        probe_native_kind(self.kind).await
+    }
+
+    pub async fn run(
+        &self,
+        spec: &SandboxSpec,
+        execution_id: &str,
+        command: &[String],
+        ctx: &crate::agent::exec_ctx::ToolCtx,
+    ) -> Result<SandboxRunResult, String> {
+        let capabilities = self.probe().await;
+        if !capabilities.available {
+            return Err(format!(
+                "sandbox_unavailable: {}",
+                capabilities
+                    .reason
+                    .unwrap_or_else(|| format!("{} 不可用", self.kind.backend_name()))
+            ));
+        }
+        // 临时目录名不能派生自调用方提供的 execution_id，避免 `../` 等路径成分
+        // 把清理或写入目标带出系统临时目录。
+        let temp_root =
+            std::env::temp_dir().join(format!("harmony-agent-sandbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temp_root)
+            .map_err(|error| format!("无法创建原生 sandbox 临时目录：{error}"))?;
+        let built = match build_native_run_command(self.kind, spec, &temp_root, command) {
+            Ok(built) => built,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&temp_root);
+                return Err(error);
+            }
+        };
+
+        ctx.record_run_event(
+            "sandbox_started",
+            serde_json::json!({
+                "backend": self.kind.backend_name(),
+                "execution_id": execution_id,
+                "spec_version": spec.version,
+                "filesystem": spec.filesystem,
+                "network": spec.network,
+                "limits": spec.limits,
+            }),
+        );
+        let started = Instant::now();
+        let output = crate::agent::exec_ctx::run_cmd_streaming(
+            ctx,
+            &built.program,
+            &built.args,
+            built.cwd.as_deref(),
+            spec.limits.wall_time_seconds,
+            None,
+        )
+        .await;
+        let cleanup_failed = std::fs::remove_dir_all(&temp_root).is_err();
+        let (status, exit_code, stdout, stderr) = match output {
+            Ok(output) => (
+                if output.status.success() {
+                    SandboxRunStatus::Succeeded
+                } else {
+                    SandboxRunStatus::Failed
+                },
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ),
+            Err(error) => (
+                if error.contains("用户已停止") {
+                    SandboxRunStatus::Cancelled
+                } else if error.contains("命令超时") {
+                    SandboxRunStatus::TimedOut
+                } else {
+                    SandboxRunStatus::Failed
+                },
+                None,
+                String::new(),
+                error,
+            ),
+        };
+        let (stdout, stderr, output_truncated) =
+            bound_output(stdout, stderr, spec.limits.output_bytes as usize);
+        let result = SandboxRunResult {
+            backend: self.kind.backend_name().into(),
+            execution_id: execution_id.into(),
+            status,
+            exit_code,
+            stdout,
+            stderr,
+            duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            output_truncated,
+            // 该字段专指 OCI 容器的额外强制删除；原生临时目录清理状态单独审计。
+            forced_cleanup: false,
+        };
+        ctx.record_run_event(
+            "sandbox_finished",
+            serde_json::json!({
+                "backend": result.backend,
+                "execution_id": result.execution_id,
+                "status": result.status,
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "output_truncated": result.output_truncated,
+                "cleanup_failed": cleanup_failed,
+            }),
+        );
+        Ok(result)
+    }
+}
+
 async fn probe_native_kind(kind: NativeSandboxKind) -> SandboxCapabilities {
     let mut capabilities = kind.declared_capabilities();
     let Some((program, probe_args)) = kind.probe_program() else {
@@ -480,6 +602,7 @@ impl SandboxBackend for OciBackend {
 /// 宿主直跑不是安全边界，调用方必须通过 [`SandboxExecutionTarget::host_direct_risk_note`] 显式标注。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxExecutionTarget {
+    Native(NativeBackend),
     Oci(OciBackend),
     HostDirect,
 }
@@ -487,19 +610,20 @@ pub enum SandboxExecutionTarget {
 impl SandboxExecutionTarget {
     pub fn backend_name(&self) -> &'static str {
         match self {
+            Self::Native(backend) => backend.kind.backend_name(),
             Self::Oci(backend) => backend.engine.program(),
             Self::HostDirect => "host-direct",
         }
     }
 
     pub fn is_isolated(&self) -> bool {
-        matches!(self, Self::Oci(_))
+        matches!(self, Self::Native(_) | Self::Oci(_))
     }
 
     pub fn host_direct_risk_note(&self) -> Option<&'static str> {
         match self {
             Self::HostDirect => Some(host_direct_risk_note()),
-            Self::Oci(_) => None,
+            Self::Native(_) | Self::Oci(_) => None,
         }
     }
 }
@@ -513,6 +637,7 @@ pub fn host_direct_risk_note() -> &'static str {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxBackendPreference {
     HostDirect,
+    Native(NativeSandboxKind),
     Oci(OciEngine),
 }
 
@@ -524,6 +649,17 @@ pub fn select_sandbox_target(
 ) -> Result<SandboxExecutionTarget, String> {
     match preference {
         SandboxBackendPreference::HostDirect => Ok(SandboxExecutionTarget::HostDirect),
+        SandboxBackendPreference::Native(kind) => {
+            if probe.available && probe.backend == kind.backend_name() {
+                Ok(SandboxExecutionTarget::Native(NativeBackend { kind }))
+            } else {
+                Err(format!(
+                    "sandbox_unavailable: 请求了 {} 沙箱但运行时不可用（{}）；已失败关闭，未回退宿主执行",
+                    kind.backend_name(),
+                    probe.reason.as_deref().unwrap_or("未知原因"),
+                ))
+            }
+        }
         SandboxBackendPreference::Oci(engine) => {
             if probe.available && probe.backend == engine.program() {
                 Ok(SandboxExecutionTarget::Oci(OciBackend::new(engine)))
@@ -541,31 +677,77 @@ pub fn select_sandbox_target(
 /// 沙箱运行配置：从环境变量读取。缺省宿主直跑（显式兼容模式，非安全默认）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SandboxConfig {
+    /// true = 显式请求当前平台原生后端。
+    pub native: bool,
     /// None = 宿主直跑（缺省）；Some = 显式请求的 OCI 引擎。
     pub backend: Option<OciEngine>,
     /// OCI 后端所需镜像（固定 digest 形式）；未配置时 OCI 请求失败关闭。
     pub image: Option<String>,
 }
 
-/// 从 `HARMONY_SANDBOX_BACKEND`（oci-docker|oci-podman）与 `HARMONY_SANDBOX_IMAGE` 读取配置。
-pub fn sandbox_config_from_env() -> SandboxConfig {
-    let backend = match std::env::var("HARMONY_SANDBOX_BACKEND").as_deref() {
-        Ok("oci-docker") => Some(OciEngine::Docker),
-        Ok("oci-podman") => Some(OciEngine::Podman),
-        _ => None,
-    };
-    let image = std::env::var("HARMONY_SANDBOX_IMAGE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    SandboxConfig { backend, image }
+impl SandboxConfig {
+    pub fn isolation_requested(&self) -> bool {
+        self.native || self.backend.is_some()
+    }
 }
 
-/// 把 sandbox 配置解析为执行目标：缺省宿主直跑；请求 OCI 但缺镜像或运行时不可用时失败关闭。
+/// 后台 job 有独立进程生命周期；在它接入原生/OCI backend 的清理与审计协议前，
+/// 任何显式隔离请求都必须失败关闭，不能绕过前台沙箱路由。
+pub fn validate_background_execution(config: &SandboxConfig) -> Result<(), String> {
+    if config.isolation_requested() {
+        Err("sandbox_unsupported: 后台命令尚未接入隔离生命周期；已失败关闭，未在宿主启动".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// 从 `HARMONY_SANDBOX_BACKEND`（native|oci-docker|oci-podman|host-direct）与
+/// `HARMONY_SANDBOX_IMAGE` 读取配置；未知值失败关闭。
+pub fn sandbox_config_from_env() -> Result<SandboxConfig, String> {
+    let configured = std::env::var("HARMONY_SANDBOX_BACKEND").ok();
+    let image = std::env::var("HARMONY_SANDBOX_IMAGE").ok();
+    sandbox_config_from_values(configured.as_deref(), image.as_deref())
+}
+
+fn sandbox_config_from_values(
+    configured: Option<&str>,
+    image: Option<&str>,
+) -> Result<SandboxConfig, String> {
+    let configured = configured.map(str::trim);
+    let native = configured == Some("native");
+    let backend = match configured {
+        Some("oci-docker") => Some(OciEngine::Docker),
+        Some("oci-podman") => Some(OciEngine::Podman),
+        None | Some("") | Some("host-direct") => None,
+        Some("native") => None,
+        Some(value) => {
+            return Err(format!(
+                "sandbox_config_invalid: 不支持 HARMONY_SANDBOX_BACKEND={value}；允许值为 native、oci-docker、oci-podman、host-direct"
+            ));
+        }
+    };
+    let image = image
+        .map(str::trim)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty());
+    Ok(SandboxConfig {
+        native,
+        backend,
+        image,
+    })
+}
+
+/// 把 sandbox 配置解析为执行目标：缺省宿主直跑；请求原生/OCI 但探测不匹配，或 OCI
+/// 缺镜像时失败关闭。
 pub fn resolve_sandbox_target(
     config: &SandboxConfig,
     probe: &SandboxCapabilities,
 ) -> Result<SandboxExecutionTarget, String> {
+    if config.native {
+        let kind = native_sandbox_for_current_platform()
+            .ok_or_else(|| "sandbox_unavailable: 当前平台没有原生沙箱后端".to_string())?;
+        return select_sandbox_target(SandboxBackendPreference::Native(kind), probe);
+    }
     match config.backend {
         None => Ok(SandboxExecutionTarget::HostDirect),
         Some(engine) => {
@@ -608,6 +790,144 @@ pub struct SandboxRunResult {
 pub struct OciRunCommand {
     pub program: String,
     pub args: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeRunCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+}
+
+pub fn build_native_run_command(
+    kind: NativeSandboxKind,
+    spec: &SandboxSpec,
+    temp_root: &Path,
+    command: &[String],
+) -> Result<NativeRunCommand, String> {
+    spec.validate()?;
+    if command.is_empty() || command[0].trim().is_empty() {
+        return Err("native sandbox command 不能为空".into());
+    }
+    if matches!(spec.network, NetworkPolicy::Allowlist(_)) {
+        return Err("当前原生 backend 尚不能强制域名 allowlist；拒绝降级为 full network".into());
+    }
+    let workspace = canonical_workspace(&spec.workspace)?;
+    let temp_root = canonical_workspace(temp_root)?;
+    match kind {
+        NativeSandboxKind::MacosSandboxExec => {
+            let profile = build_macos_profile(spec, &workspace, &temp_root)?;
+            let mut args = vec!["-p".into(), profile, "/usr/bin/env".into(), "-i".into()];
+            append_clean_environment(&mut args, spec, &temp_root);
+            args.extend(command.iter().cloned());
+            Ok(NativeRunCommand {
+                program: "sandbox-exec".into(),
+                args,
+                cwd: Some(workspace),
+            })
+        }
+        NativeSandboxKind::LinuxBubblewrap => {
+            let mut args = vec![
+                "--die-with-parent".into(),
+                "--new-session".into(),
+                "--unshare-all".into(),
+                "--clearenv".into(),
+                "--proc".into(),
+                "/proc".into(),
+                "--dev".into(),
+                "/dev".into(),
+                "--bind".into(),
+                temp_root.to_string_lossy().into_owned(),
+                "/tmp".into(),
+            ];
+            for root in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
+                if Path::new(root).exists() {
+                    args.extend(["--ro-bind".into(), root.into(), root.into()]);
+                }
+            }
+            args.extend([
+                match spec.filesystem {
+                    FilesystemPolicy::ReadOnly => "--ro-bind",
+                    FilesystemPolicy::WorkspaceWrite => "--bind",
+                }
+                .into(),
+                workspace.to_string_lossy().into_owned(),
+                SANDBOX_WORKSPACE_PATH.into(),
+                "--chdir".into(),
+                SANDBOX_WORKSPACE_PATH.into(),
+                "--setenv".into(),
+                "HOME".into(),
+                "/tmp".into(),
+                "--setenv".into(),
+                "TMPDIR".into(),
+                "/tmp".into(),
+                "--setenv".into(),
+                "PATH".into(),
+                "/usr/bin:/bin:/usr/sbin:/sbin".into(),
+            ]);
+            for key in &spec.environment_keys {
+                if let Ok(value) = std::env::var(key) {
+                    args.extend(["--setenv".into(), key.clone(), value]);
+                }
+            }
+            if !matches!(spec.network, NetworkPolicy::None) {
+                // `--unshare-all` includes a new network namespace. Full network cannot be
+                // reconstructed without weakening the rest of the isolation contract.
+                return Err("Linux 原生 backend 当前仅支持 network=none".into());
+            }
+            args.push("--".into());
+            args.extend(command.iter().cloned());
+            Ok(NativeRunCommand {
+                program: "bwrap".into(),
+                args,
+                cwd: None,
+            })
+        }
+        NativeSandboxKind::WindowsAppContainer => Err(
+            "sandbox_unavailable: Windows AppContainer token/profile/ACL 生命周期尚未实现".into(),
+        ),
+    }
+}
+
+fn append_clean_environment(args: &mut Vec<String>, spec: &SandboxSpec, temp_root: &Path) {
+    args.push(format!("HOME={}", temp_root.display()));
+    args.push(format!("TMPDIR={}", temp_root.display()));
+    args.push("PATH=/usr/bin:/bin:/usr/sbin:/sbin".into());
+    for key in &spec.environment_keys {
+        if let Ok(value) = std::env::var(key) {
+            args.push(format!("{key}={value}"));
+        }
+    }
+}
+
+fn build_macos_profile(
+    spec: &SandboxSpec,
+    workspace: &Path,
+    temp_root: &Path,
+) -> Result<String, String> {
+    let workspace = sandbox_profile_literal(workspace)?;
+    let temp_root = sandbox_profile_literal(temp_root)?;
+    let mut profile = format!(
+        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow file-ioctl)\n(allow file-read-metadata (subpath \"/System\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"{workspace}\") (subpath \"{temp_root}\"))\n(allow file-read* (subpath \"/System\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"{workspace}\") (subpath \"{temp_root}\"))\n(allow file-write* (subpath \"{temp_root}\"))"
+    );
+    if matches!(spec.filesystem, FilesystemPolicy::WorkspaceWrite) {
+        profile.push_str(&format!("\n(allow file-write* (subpath \"{workspace}\"))"));
+    }
+    if matches!(spec.network, NetworkPolicy::Full) {
+        profile.push_str("\n(allow network*)");
+    }
+    Ok(profile)
+}
+
+fn sandbox_profile_literal(path: &Path) -> Result<String, String> {
+    let value = path.to_string_lossy();
+    if value
+        .chars()
+        .any(|ch| ch == '\0' || ch == '\n' || ch == '\r')
+    {
+        return Err("sandbox profile 路径包含非法控制字符".into());
+    }
+    Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// 并行探测所有内置 OCI 后端。返回顺序稳定，便于 UI 和诊断报告展示。
@@ -883,6 +1203,14 @@ mod tests {
         }
     }
 
+    fn available_native_probe(kind: NativeSandboxKind) -> SandboxCapabilities {
+        SandboxCapabilities {
+            available: true,
+            reason: Some("运行时探测通过".into()),
+            ..kind.declared_capabilities()
+        }
+    }
+
     #[test]
     fn native_backend_declaration_never_claims_unprobed_availability() {
         for kind in [
@@ -936,6 +1264,213 @@ mod tests {
     }
 
     #[test]
+    fn macos_native_command_uses_deny_default_clean_env_and_scoped_writes() {
+        let workspace = temp_workspace();
+        let temp_root = temp_workspace();
+        let spec = SandboxSpec::workspace_write(workspace.clone());
+        let built = build_native_run_command(
+            NativeSandboxKind::MacosSandboxExec,
+            &spec,
+            &temp_root,
+            &["/bin/sh".into(), "-c".into(), "echo ok".into()],
+        )
+        .unwrap();
+        assert_eq!(built.program, "sandbox-exec");
+        assert_eq!(built.cwd, Some(workspace.canonicalize().unwrap()));
+        let profile = &built.args[1];
+        assert!(profile.contains("(deny default)"));
+        assert!(!profile.contains("(allow network"));
+        assert!(profile.contains("(allow file-write*"));
+        assert!(profile.contains(
+            &workspace
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ));
+        assert!(built
+            .args
+            .windows(2)
+            .any(|pair| pair == ["/usr/bin/env", "-i"]));
+        assert!(built.args.iter().any(|arg| arg.starts_with("HOME=")));
+        std::fs::remove_dir_all(workspace).ok();
+        std::fs::remove_dir_all(temp_root).ok();
+    }
+
+    #[test]
+    fn native_read_only_profile_does_not_grant_workspace_write() {
+        let workspace = temp_workspace();
+        let temp_root = temp_workspace();
+        let mut spec = SandboxSpec::workspace_write(workspace.clone());
+        spec.filesystem = FilesystemPolicy::ReadOnly;
+        let built = build_native_run_command(
+            NativeSandboxKind::MacosSandboxExec,
+            &spec,
+            &temp_root,
+            &["/usr/bin/true".into()],
+        )
+        .unwrap();
+        let profile = &built.args[1];
+        let workspace_literal = workspace
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(profile.contains(&format!("(subpath \"{workspace_literal}\")")));
+        assert!(!profile.contains(&format!("file-write* (subpath \"{workspace_literal}\")")));
+        std::fs::remove_dir_all(workspace).ok();
+        std::fs::remove_dir_all(temp_root).ok();
+    }
+
+    #[test]
+    fn linux_native_command_never_mounts_the_host_root() {
+        let workspace = temp_workspace();
+        let temp_root = temp_workspace();
+        let spec = SandboxSpec::workspace_write(workspace.clone());
+        let built = build_native_run_command(
+            NativeSandboxKind::LinuxBubblewrap,
+            &spec,
+            &temp_root,
+            &["/bin/sh".into(), "-c".into(), "echo ok".into()],
+        )
+        .unwrap();
+        assert_eq!(built.program, "bwrap");
+        assert!(built.args.contains(&"--unshare-all".into()));
+        assert!(built.args.contains(&"--clearenv".into()));
+        assert!(built.args.contains(&SANDBOX_WORKSPACE_PATH.into()));
+        assert!(!built
+            .args
+            .windows(3)
+            .any(|args| { args[0] == "--ro-bind" && args[1] == "/" && args[2] == "/" }));
+        std::fs::remove_dir_all(workspace).ok();
+        std::fs::remove_dir_all(temp_root).ok();
+    }
+
+    #[test]
+    fn native_backend_rejects_allowlist_and_unimplemented_windows() {
+        let workspace = temp_workspace();
+        let temp_root = temp_workspace();
+        let mut spec = SandboxSpec::workspace_write(workspace.clone());
+        spec.network = NetworkPolicy::Allowlist(vec!["example.com".into()]);
+        let allowlist = build_native_run_command(
+            NativeSandboxKind::MacosSandboxExec,
+            &spec,
+            &temp_root,
+            &["/usr/bin/true".into()],
+        )
+        .unwrap_err();
+        assert!(allowlist.contains("拒绝降级"));
+        spec.network = NetworkPolicy::None;
+        let windows = build_native_run_command(
+            NativeSandboxKind::WindowsAppContainer,
+            &spec,
+            &temp_root,
+            &["cmd".into()],
+        )
+        .unwrap_err();
+        assert!(windows.contains("sandbox_unavailable"));
+        std::fs::remove_dir_all(workspace).ok();
+        std::fs::remove_dir_all(temp_root).ok();
+    }
+
+    #[test]
+    fn sandbox_config_marks_native_and_oci_as_isolation_requests() {
+        assert!(!SandboxConfig::default().isolation_requested());
+        assert!(SandboxConfig {
+            native: true,
+            backend: None,
+            image: None,
+        }
+        .isolation_requested());
+        assert!(SandboxConfig {
+            native: false,
+            backend: Some(OciEngine::Podman),
+            image: Some("unused".into()),
+        }
+        .isolation_requested());
+        assert!(validate_background_execution(&SandboxConfig::default()).is_ok());
+        let error = validate_background_execution(&SandboxConfig {
+            native: true,
+            backend: None,
+            image: None,
+        })
+        .unwrap_err();
+        assert!(error.contains("未在宿主启动"));
+
+        let native = sandbox_config_from_values(Some(" native "), Some("unused")).unwrap();
+        assert!(native.native);
+        assert_eq!(native.backend, None);
+        let oci = sandbox_config_from_values(Some("oci-podman"), Some(" image ")).unwrap();
+        assert_eq!(oci.backend, Some(OciEngine::Podman));
+        assert_eq!(oci.image.as_deref(), Some("image"));
+        let invalid = sandbox_config_from_values(Some("natvie"), None).unwrap_err();
+        assert!(invalid.contains("sandbox_config_invalid"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "需要宿主允许创建嵌套 sandbox-exec 隔离域；受限 CI/Codex 环境会返回 Operation not permitted"]
+    fn macos_native_backend_writes_workspace_but_denies_external_file_read() {
+        let workspace = temp_workspace();
+        let temp_root = temp_workspace();
+        let external_root = temp_workspace();
+        let external_secret = external_root.join("secret.txt");
+        std::fs::write(&external_secret, "must-not-be-readable").unwrap();
+        let spec = SandboxSpec::workspace_write(workspace.clone());
+
+        let write = build_native_run_command(
+            NativeSandboxKind::MacosSandboxExec,
+            &spec,
+            &temp_root,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf sandbox-ok > allowed.txt".into(),
+            ],
+        )
+        .unwrap();
+        let write_output = std::process::Command::new(&write.program)
+            .args(&write.args)
+            .current_dir(write.cwd.as_ref().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            write_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&write_output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("allowed.txt")).unwrap(),
+            "sandbox-ok"
+        );
+
+        let escape = build_native_run_command(
+            NativeSandboxKind::MacosSandboxExec,
+            &spec,
+            &temp_root,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "cat \"$1\"".into(),
+                "sandbox-read-check".into(),
+                external_secret.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+        let escape_output = std::process::Command::new(&escape.program)
+            .args(&escape.args)
+            .current_dir(escape.cwd.as_ref().unwrap())
+            .output()
+            .unwrap();
+        assert!(!escape_output.status.success());
+        assert!(!String::from_utf8_lossy(&escape_output.stdout).contains("must-not-be-readable"));
+
+        std::fs::remove_dir_all(workspace).ok();
+        std::fs::remove_dir_all(temp_root).ok();
+        std::fs::remove_dir_all(external_root).ok();
+    }
+
+    #[test]
     fn select_target_prefers_host_direct_when_requested_and_flags_risk() {
         let target = select_sandbox_target(
             SandboxBackendPreference::HostDirect,
@@ -957,6 +1492,33 @@ mod tests {
         assert!(target.is_isolated());
         assert_eq!(target.backend_name(), "docker");
         assert!(target.host_direct_risk_note().is_none());
+    }
+
+    #[test]
+    fn select_and_resolve_native_never_fall_back_to_host_direct() {
+        let Some(kind) = native_sandbox_for_current_platform() else {
+            return;
+        };
+        let probe = available_native_probe(kind);
+        let target = select_sandbox_target(SandboxBackendPreference::Native(kind), &probe).unwrap();
+        assert!(matches!(target, SandboxExecutionTarget::Native(_)));
+        assert!(target.is_isolated());
+        assert_eq!(target.backend_name(), kind.backend_name());
+
+        let config = SandboxConfig {
+            native: true,
+            backend: None,
+            image: None,
+        };
+        let target = resolve_sandbox_target(&config, &probe).unwrap();
+        assert!(matches!(target, SandboxExecutionTarget::Native(_)));
+
+        let unavailable = SandboxCapabilities {
+            available: false,
+            ..kind.declared_capabilities()
+        };
+        let error = resolve_sandbox_target(&config, &unavailable).unwrap_err();
+        assert!(error.contains("未回退宿主执行"));
     }
 
     #[test]
@@ -995,6 +1557,7 @@ mod tests {
         // 请求 OCI 但缺镜像 → 失败关闭
         let err = resolve_sandbox_target(
             &SandboxConfig {
+                native: false,
                 backend: Some(OciEngine::Docker),
                 image: None,
             },
@@ -1006,6 +1569,7 @@ mod tests {
         // 请求 OCI + 镜像 + 运行时可用 → Oci
         let target = resolve_sandbox_target(
             &SandboxConfig {
+                native: false,
                 backend: Some(OciEngine::Docker),
                 image: Some("img@sha256:".into()),
             },
