@@ -1576,21 +1576,21 @@ pub(super) async fn deploy_one_device(
             "multi_device": true,
         }),
     );
-    let install_args: Vec<String> = if already_installed {
-        vec!["-t", device_id, "install", "-r", hap]
-            .into_iter()
-            .map(String::from)
-            .collect()
-    } else {
-        vec!["-t", device_id, "install", hap]
-            .into_iter()
-            .map(String::from)
-            .collect()
+    let root = Path::new(project_path).canonicalize()
+        .map_err(|e| format!("无法解析部署工作区：{e}"))?;
+    let artifact = Path::new(hap).canonicalize()
+        .map_err(|e| format!("无法解析部署 HAP：{e}"))?;
+    let relative_hap = artifact.strip_prefix(&root)
+        .map_err(|_| "部署 HAP 必须位于当前项目工作区内")?
+        .to_string_lossy().into_owned();
+    let install_capability = crate::agent::capability_broker::HostCapability::InstallHap {
+        device: Some(device_id.to_string()),
+        hap_path: relative_hap,
+        replace: already_installed,
     };
-    let install_out =
-        crate::agent::exec_ctx::run_cmd_streaming(ctx, "hdc", &install_args, None, 300, None)
-            .await
-            .map_err(|e| with_advice("deploy", e))?;
+    let install_out = crate::agent::capability_broker::execute_host_capability(
+        &install_capability, Some(&root), ctx,
+    ).await.map_err(|e| with_advice("deploy", e))?;
     let install_text = smart_decode(&install_out.stdout) + &smart_decode(&install_out.stderr);
     if !install_out.status.success() {
         let (cat, msg) = classify_deploy_error(&install_text, is_signed);
@@ -1630,9 +1630,7 @@ pub(super) async fn deploy_one_device(
     }
 
     // 拉起
-    if let Err(error) =
-        run_hdc_shell(device_id, &["aa", "start", "-b", bundle, "-a", ability], 30).await
-    {
+    if let Err(error) = start_ability_capability(ctx, device_id, bundle, ability).await {
         let evidence = start_failure_evidence(device_id, bundle).await;
         let recovery = if should_recover_fresh_install(already_installed) {
             recover_fresh_install(device_id, bundle).await

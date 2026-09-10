@@ -17,7 +17,7 @@
 - 统一检索入口：`repo_query` 按 `path/symbol/concept` 自动分流并标注 `source_layer`，`impact` 模式返回精确图反向依赖 + 主流约定的候选测试文件；`search_tools` 按 query 发现工具（`detail=name|summary`）。
 - 沙箱能力与命令接线：`probe_sandbox_backends` 以稳定顺序返回当前平台原生候选、Docker、Podman 的真实可用性与失败原因，环境管理页已提供能力卡片、手动刷新和原生文件边界 smoke；macOS/Linux 探测会实际启动最小隔离域而不只检查二进制，Windows AppContainer 生命周期未完成前保持 unavailable。`verify_native_sandbox_boundary` 仅使用内部 UUID 临时目录，实际检查工作区写入、外部读取拒绝、只读写入拒绝和符号链接逃逸拒绝，并明确限定为 `filesystem_smoke_v1`；`harmony-agent sandbox verify --json` 复用同一实现供真机/CI 门禁，失败或不可用返回非零退出码。`select_sandbox_target`/`resolve_sandbox_target` 按环境配置 fail-closed 选择 OCI 执行目标，`run_command` 已接入原生及可选 OCI 后端，宿主直跑持续显示风险标注（`agent::sandbox`）。
 - 审批审计：`resolve_tool_approval` 决议写入 `session_events`（`ToolApproval` 事件），`audit_timeline` 把 `session_events` 与 `run_events`（沙箱升级）合并为一条按时间排序的统一审计时间线。
-- Host Capability Broker：`HostCapability` 类型化窄能力覆盖 hdc 连接/断开/列表、HAP install、ability 启动与 deploy；`connect_device` 连接/断开及单设备 `deploy` 的安装/启动已通过固定 argv 执行入口。HAP canonicalize 后必须仍是工作区内普通文件，符号链接逃逸失败关闭；设备目标在 started/finished/rejected 审计中只保留摘要。`deploy_all`、查询/日志、模拟器、签名/发布及 broker 自带 tool-call/idempotency 身份仍待迁移（`agent::capability_broker`）。
+- Host Capability Broker：`HostCapability` 类型化窄能力覆盖 hdc 连接/断开/列表、HAP install、ability 启动与 deploy；`connect_device` 连接/断开、单设备 `deploy` 和 `deploy_all` 的安装/启动已通过固定 argv 执行入口。HAP canonicalize 后必须仍是工作区内普通文件，符号链接逃逸失败关闭；设备目标在 started/finished/rejected 审计中只保留摘要。查询/日志、模拟器、签名/发布及 broker 自带 tool-call/idempotency 身份仍待迁移（`agent::capability_broker`）。
 - headless eval harness：task schema v1 + 安全校验、`manifest`/`report`/`trajectory` 数据契约、`command grader`、补丁采集/应用、工作树准备、产物收集/导出（按声明 glob 复制到 `artifacts/`）、`run_trial` 编排（`AgentDriver` 可注入 trait，桩端到端验证），trajectory 复用 `session_events` 事件源（`agent::eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`/`eval_patch`/`eval_workspace`/`eval_runner`，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）。
 - 目标驱动执行闭环：自定义输入编译为 `GoalContract`；计划模式支持生成、编辑和批准，最终计划持久化到 Durable Run、投影为可恢复步骤，并在中断恢复后继续作为每轮执行锚点。
 - 文案与事实基线：`sandbox_exec` 改称“临时副本试运行”、`SECURITY_BOUNDARY.md`、README 下载/平台限制（已修正 Linux 过度承诺）、10k/100k/1M 基准生成器。
@@ -36,7 +36,7 @@
 **需外部基础设施（本仓库环境无法完成，按任务分别需真机/真实模型/官方 harness/签名证书；官方 SWE-bench 复现可在独立 CI 使用容器）**
 
 - 沙箱端到端验证 + 恶意脚本逃逸套件（需各目标平台的原生隔离运行环境；OCI 对照组仅在独立 CI 可选运行）。
-- Host Capability Broker 的 `deploy_all`、查询/日志、模拟器、签名/发布迁移及已接线路径的真机/模拟器端到端验证。
+- Host Capability Broker 的查询/日志、模拟器、签名/发布迁移及已接线路径的真机/模拟器端到端验证。
 - 审批与沙箱升级的单一审计链合并（`session_events` 与 `runtime` 事件日志统一，需跨模块治理改造）。
 - 真实 headless `AgentDriver`（`stream_chat` 12k 行 headless 抽取）+ `eval run` CLI + CI artifact（需真实模型端到端验证）。
 - SWE-bench Verified 25/100、SWE-Explore、HarmonyBench v0、真实模型回归（需真实模型与官方数据集/harness）。
@@ -497,7 +497,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 
 - [ ] 平台原生轻量 `SandboxBackend`；Shell/build/test 默认断网运行且不依赖 Docker（统一 `SandboxSpec`、后端契约、超时/取消、输出限制和审计事件已完成；macOS `sandbox-exec`、Linux bubblewrap、Windows AppContainer 的类型化 capability 与 Tauri 探测入口已落地，探测会运行最小隔离域且不下载镜像，未实现的 Windows 生命周期保持 unavailable；macOS/Linux 原生 argv 与显式 `run_command` 路由已落地，干净环境、工作区只读/可写、临时目录、默认断网和后台绕过门禁均有契约测试；环境管理页可在内部临时目录手动执行 `filesystem_smoke_v1`，验证工作区写入、外部读取拒绝、只读写入拒绝和符号链接逃逸拒绝，运行时不可用或任一检查失败均失败关闭；现有 Docker/Podman `OciBackend` 只作显式可选适配器。下一步完成资源限制和 Windows 生命周期，再在真实宿主跑网络、凭据、进程树等跨平台逃逸套件并决定默认启用）；
 - [ ] approval 与 sandbox escalation 进入统一事件和审计链（审批决议已写入 `session_events`（`ToolApproval` 事件），沙箱升级在 `run_events`；`audit_timeline` 已把两者合并为一条按时间排序的统一审计时间线查询，审批/沙箱/工具调用同链可回放并进入 eval trajectory；headless 的 `SessionTrajectorySink` 已与完整迁移后的 trial 工具数据库共享同一连接，桌面运行时的写入侧进一步合并仍待做）；
-- [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy（类型化窄能力、安全校验、固定 argv 执行与 Durable Run 事件已落地；`connect_device` 连接/断开、单设备 `deploy` 的 HAP install/ability start 已接入。HAP canonicalize 后必须位于工作区，符号链接逃逸失败关闭，设备目标仅以摘要审计；`deploy_all`、查询/日志、模拟器、签名/发布、自带 tool-call/idempotency 身份和真机验证待完成）；
+- [ ] Host Capability Broker 原型，先覆盖 `hdc` 与 deploy（类型化窄能力、安全校验、固定 argv 执行与 Durable Run 事件已落地；`connect_device` 连接/断开、单设备 `deploy` 和 `deploy_all` 的 HAP install/ability start 已接入。HAP canonicalize 后必须位于工作区，符号链接逃逸失败关闭，设备目标仅以摘要审计；查询/日志、模拟器、签名/发布、自带 tool-call/idempotency 身份和真机验证待完成）；
 - [ ] 文件目录持久索引、watcher、Git diff 修复和分片；移除 4,000/400 静默截断（全库 SQLite 目录、状态/coverage、游标查询、原生 watcher、Git diff、事件直写和百万生成仓验收已完成；TS 系与 ArkTS Tree-sitter 已接入，必要时的物理分片待真实仓 SLO 触发）；
 - [ ] `repo_query` 统一查询接口与 coverage/staleness 元数据（`search_symbols` 结构查询 MVP 已完成；`repo_query` 路由 MVP 已完成——`auto` 按查询形态分流 `path/symbol/concept` 到 lexical/结构索引并标注 `source_layer`，`impact` 模式已完成——精确图反向依赖返回“谁引用/调用了该符号”并按主流约定给出候选测试文件；依赖图重排的统一 planner 待完成）；
 - [ ] 结构化代码修改事务 P0/P1：P0 已将 `write_file`、`edit_file`、`multi_edit` 与 LSP WorkspaceEdit 接入候选文本门禁；TS/JS/ArkTS 使用 Tree-sitter 错误增量检查，Java 在 JDT/Javac 接入前先以增量声明门禁阻止新增游离 `@Override`/`@Resource`，其他语言明确回退配平层；`multi_edit` 已先验证全部文件后原子提交并在写入失败时回滚，门禁/回滚/结构过期状态已接入工具卡。P1 节点句柄 v3 已携带 file hash、稳定/位置 node ID、节点内容摘要、kind、精确范围与 parent range，单节点和同文件多节点事务及显式受控重定位均已落地；Java/Kotlin 方法与字段及 Rust/Dart 专用轻量 adapter 已进入持久结构索引，Rust 属性/文档注释与 Dart 注解连续随声明修改。剩余工作是 Java JDT LS/Javac 的 import/override 类型语义联动；失败时不落盘或整体回滚，且不依赖 Docker；
