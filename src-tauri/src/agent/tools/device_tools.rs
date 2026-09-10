@@ -4,7 +4,7 @@
 
 use super::*;
 
-pub(super) async fn connect_device(args: &Value) -> Result<String, String> {
+pub(super) async fn connect_device(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("connect").trim();
     let host = args["host"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("");
     let port = args["port"].as_u64().unwrap_or(5555);
@@ -22,8 +22,13 @@ pub(super) async fn connect_device(args: &Value) -> Result<String, String> {
     };
     match action {
         "connect" => {
-            let out = run_cmd("hdc", &["tconn".into(), target.clone()], None, 30).await
-                .map_err(|e| format!("无线连接失败：{e}"))?;
+            let capability = crate::agent::capability_broker::HostCapability::HdcConnect { target: target.clone() };
+            let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+                .await.map_err(|e| format!("无线连接失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("无线连接失败：{}", out.trim()));
+            }
             let out = out.trim();
             Ok(format!(
                 "无线连接请求已发送：{target}\n设备输出：{}\n下一步：调用 list_devices 确认设备在线；部署/截图/日志时 device 参数填 {target}。",
@@ -31,8 +36,13 @@ pub(super) async fn connect_device(args: &Value) -> Result<String, String> {
             ))
         }
         "disconnect" => {
-            let out = run_cmd("hdc", &["tconn".into(), "-d".into(), target.clone()], None, 30).await
-                .map_err(|e| format!("断开失败：{e}"))?;
+            let capability = crate::agent::capability_broker::HostCapability::HdcDisconnect { target: target.clone() };
+            let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+                .await.map_err(|e| format!("断开失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("断开失败：{}", out.trim()));
+            }
             Ok(format!("已断开 {target}\n设备输出：{}", out.trim()))
         }
         "list" => list_devices().await,

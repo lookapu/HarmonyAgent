@@ -1223,7 +1223,7 @@ pub async fn run_tool(
     let result = crate::agent::exec_ctx::scope_tool_session(ctx.conversation_id.clone(), stop_generation, async {
       match name {
         "list_devices" => list_devices().await,
-        "connect_device" => device_tools::connect_device(&args).await,
+        "connect_device" => device_tools::connect_device(&args, ctx).await,
         "manage_hdc" => device_tools::manage_hdc(&args, db).await,
         "list_emulators" => device_tools::list_emulators().await,
         "start_emulator" => device_tools::start_emulator(&args).await,

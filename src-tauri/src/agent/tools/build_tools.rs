@@ -966,6 +966,26 @@ async fn start_failure_evidence(device_id: &str, bundle: &str) -> String {
     )
 }
 
+async fn start_ability_capability(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    bundle: &str,
+    ability: &str,
+) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::StartAbility {
+        device: device.to_string(),
+        bundle: bundle.to_string(),
+        ability: ability.to_string(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx).await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(format!("命令退出码 {}：{text}", output.status.code().unwrap_or(-1)))
+    }
+}
+
 pub(super) async fn deploy(
     args: &Value,
     roots: &[String],
@@ -980,6 +1000,11 @@ pub(super) async fn deploy(
     let info = crate::services::harmony::parse_project(root);
 
     let (hap, is_signed, selection_note, _artifact_sha256) = resolve_hap_for_deploy(args, root)?;
+    let canonical_root = root.canonicalize().map_err(|e| format!("无法解析部署工作区：{e}"))?;
+    let canonical_hap = Path::new(&hap).canonicalize().map_err(|e| format!("无法解析部署 HAP：{e}"))?;
+    let relative_hap = canonical_hap.strip_prefix(&canonical_root)
+        .map_err(|_| "部署 HAP 必须位于当前项目工作区内")?
+        .to_string_lossy().into_owned();
     ctx.emit_log("system", &selection_note);
 
     // 全局并发护栏：同一时间只允许一个部署
@@ -1046,26 +1071,14 @@ pub(super) async fn deploy(
                 .unwrap_or(&hap)
         ),
     );
-    let install_args = if already_installed {
-        vec![
-            "-t".to_string(),
-            device_id.clone(),
-            "install".to_string(),
-            "-r".to_string(),
-            hap.clone(),
-        ]
-    } else {
-        vec![
-            "-t".to_string(),
-            device_id.clone(),
-            "install".to_string(),
-            hap.clone(),
-        ]
+    let install_capability = crate::agent::capability_broker::HostCapability::InstallHap {
+        device: Some(device_id.clone()),
+        hap_path: relative_hap,
+        replace: already_installed,
     };
-    let install_out =
-        crate::agent::exec_ctx::run_cmd_streaming(ctx, "hdc", &install_args, None, 300, None)
-            .await
-            .map_err(|e| with_advice("deploy", e))?;
+    let install_out = crate::agent::capability_broker::execute_host_capability(
+        &install_capability, Some(root), ctx,
+    ).await.map_err(|e| with_advice("deploy", e))?;
     let install_text = smart_decode(&install_out.stdout) + &smart_decode(&install_out.stderr);
     out.push_str(&install_text);
     if !install_out.status.success() {
@@ -1137,13 +1150,7 @@ pub(super) async fn deploy(
     };
     let ability = info.main_element.as_deref().unwrap_or("EntryAbility");
     ctx.emit_log("system", &format!("拉起应用: {bundle}/{ability}"));
-    let start = match run_hdc_shell(
-        &device_id,
-        &["aa", "start", "-b", bundle, "-a", ability],
-        30,
-    )
-    .await
-    {
+    let start = match start_ability_capability(ctx, &device_id, bundle, ability).await {
         Ok(output) => output,
         Err(error) => {
             let evidence = start_failure_evidence(&device_id, bundle).await;

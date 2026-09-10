@@ -1,10 +1,12 @@
 //! Host Capability Broker 原型（docs/AGENT_EVOLUTION_ROADMAP_2026.md §4 / §5.2）。
 //!
 //! 把宿主特权操作（hdc 设备管理、签名、部署）建模为**类型化、窄化的能力**，而不是暴露
-//! 等价的任意 shell。每个能力经 [`HostCapability::validate`] 拒绝越界/越权参数；真实执行
-//! 待接入现有 `device_tools`/`build_tools` 时按能力 id 路由到对应窄接口。
+//! 等价的任意 shell。每个能力经 [`HostCapability::validate`] 拒绝越界/越权参数，并由
+//! [`execute_host_capability`] 生成固定 argv、执行及写入运行审计。
 
+use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::process::Output;
 
 /// 宿主特权能力的窄化集合。v0 覆盖 hdc 与 deploy；签名与真机操作待接线。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,7 +18,9 @@ pub enum HostCapability {
     /// 列出在线设备。
     HdcListTargets,
     /// 安装构建产物到设备（路径必须位于项目工作树内）。
-    InstallHap { device: Option<String>, hap_path: String },
+    InstallHap { device: Option<String>, hap_path: String, replace: bool },
+    /// 拉起一个已安装应用的明确 ability。
+    StartAbility { device: String, bundle: String, ability: String },
     /// 部署 = 安装 + 可选启动（组合窄能力）。
     Deploy { device: Option<String>, hap_path: String },
 }
@@ -29,6 +33,7 @@ impl HostCapability {
             Self::HdcDisconnect { .. } => "hdc.disconnect",
             Self::HdcListTargets => "hdc.list",
             Self::InstallHap { .. } => "deploy.install",
+            Self::StartAbility { .. } => "deploy.start_ability",
             Self::Deploy { .. } => "deploy",
         }
     }
@@ -40,14 +45,152 @@ impl HostCapability {
                 validate_device_target(target)
             }
             Self::HdcListTargets => Ok(()),
-            Self::InstallHap { device, hap_path } | Self::Deploy { device, hap_path } => {
+            Self::InstallHap { device, hap_path, .. } | Self::Deploy { device, hap_path } => {
                 if let Some(device) = device {
                     validate_device_target(device)?;
                 }
                 validate_hap_path(hap_path)
             }
+            Self::StartAbility { device, bundle, ability } => {
+                validate_device_target(device)?;
+                validate_app_identifier(bundle, "bundle")?;
+                validate_app_identifier(ability, "ability")
+            }
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostInvocation {
+    program: &'static str,
+    args: Vec<String>,
+    timeout_seconds: u64,
+}
+
+fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> Result<HostInvocation, String> {
+    capability.validate()?;
+    let (args, timeout_seconds) = match capability {
+        HostCapability::HdcConnect { target } => (vec!["tconn".into(), target.trim().into()], 30),
+        HostCapability::HdcDisconnect { target } => (
+            vec!["tconn".into(), "-d".into(), target.trim().into()], 30,
+        ),
+        HostCapability::HdcListTargets => (vec!["list".into(), "targets".into()], 15),
+        HostCapability::InstallHap { device, hap_path, replace } => {
+            let artifact = resolve_workspace_artifact(
+                workspace.ok_or("deploy.install 需要明确的项目工作区")?, hap_path,
+            )?;
+            let mut args = Vec::new();
+            if let Some(device) = device {
+                args.extend(["-t".into(), device.trim().into()]);
+            }
+            args.push("install".into());
+            if *replace { args.push("-r".into()); }
+            args.push(artifact.to_string_lossy().into_owned());
+            (args, 300)
+        }
+        HostCapability::StartAbility { device, bundle, ability } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "aa".into(), "start".into(),
+                "-b".into(), bundle.trim().into(), "-a".into(), ability.trim().into(),
+            ], 30,
+        ),
+        HostCapability::Deploy { .. } => {
+            return Err("deploy 是组合能力，必须拆分为 install 与 start_ability 执行".into());
+        }
+    };
+    Ok(HostInvocation { program: "hdc", args, timeout_seconds })
+}
+
+/// 执行经过类型化校验的宿主能力。调用方负责解释领域输出和完成后验证；本入口
+/// 只允许固定程序/argv 模板，并保证成功、非零退出与启动失败都进入同一审计链。
+pub async fn execute_host_capability(
+    capability: &HostCapability,
+    workspace: Option<&Path>,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<Output, String> {
+    let capability_id = capability.capability_id();
+    let invocation = match prepare_invocation(capability, workspace) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            ctx.record_run_event("host_capability.rejected", serde_json::json!({
+                "capability_id": capability_id,
+                "reason": "validation_failed",
+            }));
+            return Err(error);
+        }
+    };
+    ctx.record_run_event("host_capability.started", serde_json::json!({
+        "capability_id": capability_id, "subject": audit_subject(capability),
+    }));
+    let result = crate::agent::exec_ctx::run_cmd_streaming(
+        ctx, invocation.program, &invocation.args, None, invocation.timeout_seconds, None,
+    ).await;
+    match result {
+        Ok(output) => {
+            ctx.record_run_event("host_capability.finished", serde_json::json!({
+                "capability_id": capability_id,
+                "success": output.status.success(),
+                "exit_code": output.status.code(),
+            }));
+            Ok(output)
+        }
+        Err(error) => {
+            ctx.record_run_event("host_capability.finished", serde_json::json!({
+                "capability_id": capability_id,
+                "success": false,
+                "error_kind": capability_error_kind(&error),
+            }));
+            Err(error)
+        }
+    }
+}
+
+fn resolve_workspace_artifact(workspace: &Path, relative: &str) -> Result<std::path::PathBuf, String> {
+    let root = workspace.canonicalize().map_err(|e| format!("无法解析项目工作区：{e}"))?;
+    let artifact = root.join(relative.trim()).canonicalize()
+        .map_err(|e| format!("无法解析 HAP 产物：{e}"))?;
+    if !artifact.starts_with(&root) || !artifact.is_file() {
+        return Err("HAP 产物必须是项目工作区内的普通文件".into());
+    }
+    Ok(artifact)
+}
+
+fn validate_app_identifier(value: &str, label: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 256
+        || !value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '$'))
+    {
+        return Err(format!("{label} 标识非法"));
+    }
+    Ok(())
+}
+
+fn audit_subject(capability: &HostCapability) -> serde_json::Value {
+    match capability {
+        HostCapability::HdcConnect { target } | HostCapability::HdcDisconnect { target } =>
+            serde_json::json!({ "device_digest": short_digest(target.trim()) }),
+        HostCapability::HdcListTargets => serde_json::json!({}),
+        HostCapability::InstallHap { device, hap_path, replace } => serde_json::json!({
+            "device_digest": device.as_deref().map(short_digest), "artifact": hap_path, "replace": replace,
+        }),
+        HostCapability::StartAbility { device, bundle, ability } => serde_json::json!({
+            "device_digest": short_digest(device), "bundle": bundle, "ability": ability,
+        }),
+        HostCapability::Deploy { device, hap_path } => serde_json::json!({
+            "device_digest": device.as_deref().map(short_digest), "artifact": hap_path,
+        }),
+    }
+}
+
+fn short_digest(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{:x}", digest)[..12].to_string()
+}
+
+fn capability_error_kind(error: &str) -> &'static str {
+    if error.contains("已停止") { "cancelled" }
+    else if error.contains("超时") { "timeout" }
+    else { "execution_failed" }
 }
 
 fn validate_device_target(target: &str) -> Result<(), String> {
@@ -69,7 +212,8 @@ fn validate_device_target(target: &str) -> Result<(), String> {
 }
 
 fn validate_hap_path(path: &str) -> Result<(), String> {
-    let p = Path::new(path.trim());
+    let path = path.trim();
+    let p = Path::new(path);
     if path.is_empty() {
         return Err("hap 路径不能为空".into());
     }
@@ -100,6 +244,7 @@ mod tests {
         assert!(HostCapability::InstallHap {
             device: Some("ABC123".into()),
             hap_path: "entry/build/outputs/entry-default-signed.hap".into(),
+            replace: false,
         }
         .validate()
         .is_ok());
@@ -117,6 +262,7 @@ mod tests {
         assert!(HostCapability::InstallHap {
             device: None,
             hap_path: "/etc/passwd.hap".into(),
+            replace: false,
         }
         .validate()
         .is_err());
@@ -127,12 +273,47 @@ mod tests {
         .validate()
         .is_err());
         // 非 .hap 产物拒绝
-        assert!(HostCapability::InstallHap { device: None, hap_path: "app.bin".into() }.validate().is_err());
+        assert!(HostCapability::InstallHap { device: None, hap_path: "app.bin".into(), replace: false }.validate().is_err());
     }
 
     #[test]
     fn capability_ids_are_stable_for_audit() {
         assert_eq!(HostCapability::HdcConnect { target: "t".into() }.capability_id(), "hdc.connect");
         assert_eq!(HostCapability::Deploy { device: None, hap_path: "a.hap".into() }.capability_id(), "deploy");
+    }
+
+    #[test]
+    fn prepares_fixed_hdc_argv_and_scopes_artifact_to_workspace() {
+        let root = std::env::temp_dir().join(format!("harmony-capability-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("out/app.hap"), b"hap").unwrap();
+        let invocation = prepare_invocation(&HostCapability::InstallHap {
+            device: Some("ABC123".into()), hap_path: "out/app.hap".into(), replace: true,
+        }, Some(&root)).unwrap();
+        assert_eq!(invocation.program, "hdc");
+        assert_eq!(&invocation.args[..4], ["-t", "ABC123", "install", "-r"]);
+        assert!(invocation.args[4].ends_with("out/app.hap"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_symlink_artifact_escape_and_unsafe_ability_identifiers() {
+        assert!(HostCapability::StartAbility {
+            device: "ABC123".into(), bundle: "com.example.app;bad".into(), ability: "EntryAbility".into(),
+        }.validate().is_err());
+        #[cfg(unix)] {
+            use std::os::unix::fs::symlink;
+            let root = std::env::temp_dir().join(format!("harmony-capability-{}", uuid::Uuid::new_v4()));
+            let external = std::env::temp_dir().join(format!("harmony-capability-external-{}.hap", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(&external, b"hap").unwrap();
+            symlink(&external, root.join("escape.hap")).unwrap();
+            let result = prepare_invocation(&HostCapability::InstallHap {
+                device: None, hap_path: "escape.hap".into(), replace: false,
+            }, Some(&root));
+            assert!(result.is_err());
+            std::fs::remove_dir_all(root).ok();
+            std::fs::remove_file(external).ok();
+        }
     }
 }
