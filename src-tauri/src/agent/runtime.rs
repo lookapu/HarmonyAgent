@@ -45,6 +45,25 @@ pub struct RunEvent {
     pub created_at: i64,
 }
 
+pub const DESKTOP_ADAPTER_CURSOR_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopAdapterCheckpointCursor {
+    pub schema_version: u32,
+    pub message_rowid: i64,
+    pub visible_message_count: u64,
+    pub tool_run_rowid: i64,
+    pub tool_run_count: u64,
+    pub placeholder_message_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RestoredDesktopExecutorCheckpoint {
+    pub run_loop: crate::agent::kernel_executor::KernelIoRunLoop,
+    pub safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
+    pub cursor: DesktopAdapterCheckpointCursor,
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -243,6 +262,87 @@ pub fn append_executor_checkpoint(
     )
 }
 
+/// 在同一 SQLite 事务中冻结桌面 adapter 的持久化高水位并追加 executor checkpoint。
+/// cursor 只保存数据库引用和计数，不复制消息正文、工具参数或工具输出。
+pub fn append_desktop_executor_checkpoint(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
+    safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
+    placeholder_message_id: Option<&str>,
+) -> Result<i64, String> {
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(|error| error.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    let owns_conversation = tx
+        .query_row(
+            "SELECT conversation_id=?1 FROM agent_runs WHERE run_id=?2",
+            params![conversation_id, run_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(false);
+    if !owns_conversation {
+        return Err("桌面 checkpoint 的运行与会话归属不一致".into());
+    }
+    let (message_rowid, visible_message_count): (i64, i64) = tx
+        .query_row(
+            "SELECT COALESCE(MAX(rowid),0),COUNT(*) FROM messages
+             WHERE conversation_id=?1 AND queued=0 AND hidden=0",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let (tool_run_rowid, tool_run_count): (i64, i64) = tx
+        .query_row(
+            "SELECT COALESCE(MAX(rowid),0),COUNT(*) FROM tool_runs WHERE trace_id=?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if let Some(message_id) = placeholder_message_id {
+        let valid = tx
+            .query_row(
+                "SELECT rowid<=?1 AND conversation_id=?2 AND role='assistant'
+                 FROM messages WHERE id=?3",
+                params![message_rowid, conversation_id, message_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+        if !valid {
+            return Err("桌面 checkpoint 的正文占位消息不存在、越过高水位或不属于当前会话".into());
+        }
+    }
+    let cursor = DesktopAdapterCheckpointCursor {
+        schema_version: DESKTOP_ADAPTER_CURSOR_VERSION,
+        message_rowid,
+        visible_message_count: visible_message_count.max(0) as u64,
+        tool_run_rowid,
+        tool_run_count: tool_run_count.max(0) as u64,
+        placeholder_message_id: placeholder_message_id.map(str::to_string),
+    };
+    let mut payload = crate::agent::kernel_executor::executor_checkpoint_payload(
+        checkpoint,
+        safe_point,
+    )?;
+    payload["desktop_adapter_cursor"] =
+        serde_json::to_value(&cursor).map_err(|error| error.to_string())?;
+    let seq = append_event_tx(
+        &tx,
+        run_id,
+        conversation_id,
+        "run.executor_checkpoint",
+        &payload,
+        now,
+    )?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(seq)
+}
+
 /// 严格恢复某个 Durable Run 的最新 executor checkpoint。
 /// 最新事件损坏时失败关闭，不回退到更旧状态掩盖持久化故障。
 pub fn restore_latest_executor(
@@ -273,6 +373,91 @@ pub fn restore_latest_executor(
     crate::agent::kernel_executor::restore_executor_checkpoint_payload(payload)
         .map(Some)
         .map_err(|error| format!("最新 Durable Run executor checkpoint 损坏：{error}"))
+}
+
+/// 严格恢复桌面 executor 及其 adapter 数据高水位。任何游标版本、归属或计数漂移都
+/// 失败关闭；调用方之后只能读取 rowid 不超过 cursor 的消息与工具审计记录。
+pub fn restore_latest_desktop_executor(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+) -> Result<Option<RestoredDesktopExecutorCheckpoint>, String> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM run_events
+             WHERE run_id=?1 AND conversation_id=?2 AND event_type='run.executor_checkpoint'
+             ORDER BY seq DESC LIMIT 1",
+            params![run_id, conversation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&payload)
+        .map_err(|error| format!("最新桌面 executor checkpoint 损坏：{error}"))?;
+    let cursor: DesktopAdapterCheckpointCursor = value
+        .get("desktop_adapter_cursor")
+        .cloned()
+        .ok_or_else(|| "最新桌面 executor checkpoint 缺少 adapter cursor".to_string())
+        .and_then(|cursor| {
+            serde_json::from_value(cursor)
+                .map_err(|error| format!("桌面 adapter cursor 反序列化失败：{error}"))
+        })?;
+    if cursor.schema_version != DESKTOP_ADAPTER_CURSOR_VERSION
+        || cursor.message_rowid < 0
+        || cursor.tool_run_rowid < 0
+    {
+        return Err(format!(
+            "桌面 adapter cursor 版本或高水位非法：schema_version={}",
+            cursor.schema_version
+        ));
+    }
+    let visible_message_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE conversation_id=?1 AND queued=0 AND hidden=0 AND rowid<=?2",
+            params![conversation_id, cursor.message_rowid],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if visible_message_count.max(0) as u64 != cursor.visible_message_count {
+        return Err("桌面 adapter cursor 指向的可见消息集合已漂移".into());
+    }
+    let tool_run_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tool_runs WHERE trace_id=?1 AND rowid<=?2",
+            params![run_id, cursor.tool_run_rowid],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if tool_run_count.max(0) as u64 != cursor.tool_run_count {
+        return Err("桌面 adapter cursor 指向的工具审计集合已漂移".into());
+    }
+    if let Some(message_id) = cursor.placeholder_message_id.as_deref() {
+        let valid = conn
+            .query_row(
+                "SELECT rowid<=?1 AND conversation_id=?2 AND role='assistant'
+                 FROM messages WHERE id=?3",
+                params![cursor.message_rowid, conversation_id, message_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+        if !valid {
+            return Err("桌面 adapter cursor 的正文占位引用已漂移".into());
+        }
+    }
+    let (run_loop, safe_point) =
+        crate::agent::kernel_executor::restore_executor_checkpoint_payload(value)
+            .map_err(|error| format!("最新桌面 executor checkpoint 损坏：{error}"))?;
+    Ok(Some(RestoredDesktopExecutorCheckpoint {
+        run_loop,
+        safe_point,
+        cursor,
+    }))
 }
 
 pub fn transition(
@@ -655,7 +840,8 @@ mod tests {
              INSERT INTO conversations(id) VALUES ('c');
              CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT,approved_plan TEXT);
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
-             CREATE TABLE tool_runs(trace_id TEXT,status TEXT,recovery_policy TEXT);
+             CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,role TEXT NOT NULL,queued INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE tool_runs(id TEXT,conversation_id TEXT,trace_id TEXT,status TEXT,recovery_policy TEXT);
              CREATE TABLE execution_steps(run_id TEXT,state TEXT,recovery_policy TEXT);",
         ).unwrap();
         c
@@ -722,6 +908,64 @@ mod tests {
         assert!(restore_latest_executor(&c, "r")
             .unwrap_err()
             .contains("checkpoint 损坏"));
+    }
+
+    #[test]
+    fn desktop_checkpoint_freezes_and_validates_adapter_cursors() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        c.execute(
+            "INSERT INTO messages(id,conversation_id,role) VALUES('user','c','user')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages(id,conversation_id,role) VALUES('placeholder','c','assistant')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tool_runs(id,conversation_id,trace_id,status,recovery_policy)
+             VALUES('tool-1','c','r','ok','replay')",
+            [],
+        )
+        .unwrap();
+        let mut run_loop = crate::agent::kernel_executor::KernelIoRunLoop::new(
+            crate::agent::kernel_executor::KernelExecutorLimits::default(),
+        );
+        assert!(matches!(
+            run_loop.begin_next_round(false),
+            crate::agent::kernel_executor::KernelRunPermit::Proceed { round: 1, .. }
+        ));
+        append_desktop_executor_checkpoint(
+            &c,
+            "r",
+            "c",
+            run_loop.checkpoint(),
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+            Some("placeholder"),
+        )
+        .unwrap();
+
+        let restored = restore_latest_desktop_executor(&c, "r", "c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.safe_point,
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult
+        );
+        assert_eq!(restored.cursor.visible_message_count, 2);
+        assert_eq!(restored.cursor.tool_run_count, 1);
+        assert_eq!(
+            restored.cursor.placeholder_message_id.as_deref(),
+            Some("placeholder")
+        );
+
+        c.execute("DELETE FROM tool_runs WHERE id='tool-1'", [])
+            .unwrap();
+        assert!(restore_latest_desktop_executor(&c, "r", "c")
+            .unwrap_err()
+            .contains("工具审计集合已漂移"));
     }
 
     #[test]

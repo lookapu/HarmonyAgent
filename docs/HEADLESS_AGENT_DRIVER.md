@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AW 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接入 Provider/工具活跃 checkpoint、完整端口迁移仍待完成
+> 状态：Phase 0—3 与 Phase 4 A—AX 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接入组合 checkpoint 游标、完整端口迁移仍待完成
 > 更新日期：2026-09-10
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -531,6 +531,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AU | checkpoint 安全点类型化（UI/headless 共用枚举与 envelope 编解码，恢复返回边界类型，缺失/未知值失败关闭） | ✅ COMPLETED |
 | AV | Provider 边界原子化（run-loop 统一执行 checkpoint→轮次裁决，覆盖首轮；写入失败不推进计数或发起 IO） | ✅ COMPLETED |
 | AW | 裸轮次入口封口（`begin_next_round` 仅测试构建可见，生产 adapter 只能走持久化原子入口或完整 run-loop） | ✅ COMPLETED |
+| AX | 桌面 adapter 高水位（同事务冻结消息/工具审计 rowid、数量与正文占位引用，恢复严格校验漂移） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -577,7 +578,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - UI/headless 的 checkpoint 不再接受任意 `safe_point` 字符串：共用 `KernelCheckpointSafePoint` 与扁平 envelope 编解码，恢复 API 同时返回 executor 和已验证边界类型。缺失或未知安全点、损坏 payload、未知 schema 均失败关闭，为后续组合恢复 adapter messages/工具结果提供可判定边界
 - `KernelIoRunLoop::begin_persisted_round` 原子包住 Provider 边界 checkpoint 与轮次裁决，UI 不再手写两个可分离步骤；headless 的首轮 Provider 也拥有恢复安全点。持久化失败不会增加 `completed_rounds`，更不会向 adapter 发放外部请求 permit
 - 裸 `begin_next_round` 已从生产 API 移除，仅保留为测试探针；非测试构建通过 `cargo check --lib` 验证，UI/headless 无法再绕过 Provider checkpoint 直接取得轮次 permit
-- Rust lib 共 957 项：949 通过、8 项按环境条件忽略；前端 113 项通过
+- 桌面 checkpoint 现通过 `DesktopAdapterCheckpointCursor` 同事务冻结可见消息与工具审计的 rowid/数量高水位，并绑定正文占位消息引用；payload 不复制正文、工具参数或输出。严格恢复会校验 schema、会话归属、占位角色与集合数量，删除、隐藏或错绑造成的漂移不会静默续跑
+- Rust lib 共 958 项：950 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -628,7 +630,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AW 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AX 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

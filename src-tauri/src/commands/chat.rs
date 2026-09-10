@@ -900,14 +900,16 @@ fn persist_desktop_executor_checkpoint(
     conversation_id: &str,
     checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
     safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
+    placeholder_message_id: Option<&str>,
 ) -> Result<(), ChatFlowError> {
     let conn = state.0.lock().map_err(|error| error.to_string())?;
-    crate::agent::runtime::append_executor_checkpoint(
+    crate::agent::runtime::append_desktop_executor_checkpoint(
         &conn,
         run_id,
         conversation_id,
         checkpoint,
         safe_point,
+        placeholder_message_id,
     )?;
     Ok(())
 }
@@ -4343,6 +4345,7 @@ async fn stream_chat_inner(
                     &conversation_id,
                     checkpoint,
                     crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+                    placeholder_msg_id.as_deref(),
                 )
             },
         )?;
@@ -5438,6 +5441,7 @@ async fn stream_chat_inner(
                             &conversation_id,
                             kernel_executor.checkpoint(),
                             crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                            placeholder_msg_id.as_deref(),
                         )?;
                         pending.clear();
                         if intercepted {
@@ -5493,6 +5497,7 @@ async fn stream_chat_inner(
                         &conversation_id,
                         kernel_executor.checkpoint(),
                         crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                        placeholder_msg_id.as_deref(),
                     )?;
                     pending.clear();
                     if intercepted {
@@ -5953,6 +5958,7 @@ async fn stream_chat_inner(
                 &conversation_id,
                 kernel_executor.checkpoint(),
                 crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                placeholder_msg_id.as_deref(),
             )?;
             }
             // for 结束：排空剩余只读批次（本轮全部输出只读工具时）
@@ -6002,6 +6008,7 @@ async fn stream_chat_inner(
                     &conversation_id,
                     kernel_executor.checkpoint(),
                     crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                    placeholder_msg_id.as_deref(),
                 )?;
                 if intercepted {
                     exhausted = true;
