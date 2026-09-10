@@ -266,6 +266,15 @@ impl KernelIoRunLoop {
         self.clock.checkpoint(&self.executor)
     }
 
+    /// 恢复 adapter 只读使用冻结限制与累计工具尝试，不能通过子运行重建来刷新预算。
+    pub fn limits(&self) -> KernelExecutorLimits {
+        self.executor.limits
+    }
+
+    pub fn tool_attempts(&self) -> u64 {
+        self.executor.tool_attempts
+    }
+
     pub fn restore(checkpoint: KernelExecutorCheckpoint) -> Result<Self, String> {
         if checkpoint.schema_version != KERNEL_EXECUTOR_CHECKPOINT_VERSION {
             return Err(format!(
@@ -776,6 +785,16 @@ mod tests {
         let checkpoint: KernelExecutorCheckpoint = serde_json::from_str(&encoded).unwrap();
         let mut restored = KernelIoRunLoop::restore(checkpoint).unwrap();
 
+        assert_eq!(
+            restored.limits(),
+            KernelExecutorLimits {
+                wall_time_ms: 60_000,
+                round_limit: Some(4),
+                tool_attempt_limit: Some(20),
+                remediation_limit: 2,
+            }
+        );
+        assert_eq!(restored.tool_attempts(), 4);
         assert!(matches!(
             restored.begin_next_round(false),
             KernelRunPermit::Proceed { round: 2, .. }

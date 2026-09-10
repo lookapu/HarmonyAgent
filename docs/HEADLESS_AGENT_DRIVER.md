@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AY 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接入组合 checkpoint 的严格恢复预检与有界物化、完整端口迁移仍待完成
+> 状态：Phase 0—3 与 Phase 4 A—AZ 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接续目标不变恢复的 executor 与动态工具预算、完整端口迁移仍待完成
 > 更新日期：2026-09-10
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -533,6 +533,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AW | 裸轮次入口封口（`begin_next_round` 仅测试构建可见，生产 adapter 只能走持久化原子入口或完整 run-loop） | ✅ COMPLETED |
 | AX | 桌面 adapter 高水位（同事务冻结消息/工具审计 rowid、数量与正文占位引用，恢复严格校验漂移） | ✅ COMPLETED |
 | AY | 桌面恢复有界物化（子运行创建前严格预检父 checkpoint，只读取高水位内最近 200 条消息/工具审计，专用游标索引并注入无正文摘要） | ✅ COMPLETED |
+| AZ | 桌面 executor 血缘接续（仅目标契约不变时恢复停机墙钟/回合/循环/补救状态，checkpoint 同步冻结动态工具额度与扩容次数） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -581,7 +582,9 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - 裸 `begin_next_round` 已从生产 API 移除，仅保留为测试探针；非测试构建通过 `cargo check --lib` 验证，UI/headless 无法再绕过 Provider checkpoint 直接取得轮次 permit
 - 桌面 checkpoint 现通过 `DesktopAdapterCheckpointCursor` 同事务冻结可见消息与工具审计的 rowid/数量高水位，并绑定正文占位消息引用；payload 不复制正文、工具参数或输出。严格恢复会校验 schema、会话归属、占位角色与集合数量，删除、隐藏或错绑造成的漂移不会静默续跑
 - 桌面血缘恢复会在创建子运行前调用 `materialize_latest_desktop_checkpoint`：旧运行没有组合 checkpoint 时兼容原恢复协议；只要最新 checkpoint 存在却损坏或集合漂移就失败关闭。物化查询同时携带 `rowid <= high-water` 与 `LIMIT 200`，通过 migration 081 的消息/工具恢复游标索引从尾部读取并恢复为时间正序；system prompt 与 `recovery.adapter_checkpoint_loaded` 事件仅记录安全点、游标、数量、截断状态及最后记录身份，不复制正文、reasoning、工具参数或输出，也不会把父 executor 的瞬态计数直接灌入新预算
-- Rust lib 共 959 项：951 通过、8 项按环境条件忽略；前端 113 项通过
+- 目标契约完全未变化的续跑会把父 `KernelIoRunLoop` 移交给子运行，停机墙钟、Provider 回合、工具调用指纹/尝试数、循环熔断首因及验收补救次数不再重置；新增、替换或删除目标要求时只使用已验证数据边界并新建 executor，`recovery.adapter_checkpoint_loaded` 明确审计是否接续及重置原因
+- `desktop_adapter_control` schema v1 与 executor/cursor 在同一 checkpoint 事件中冻结 `effective_tool_rounds` 和 `budget_extensions`；工具额度判定改用 executor 的跨血缘累计 attempt，而非当前进程内 `tool_runs.len()`。Phase AX/AY 的旧 checkpoint 缺少 control 时允许读取，但保守禁用再次扩容，避免恢复反复刷新动态预算
+- Rust lib 共 960 项：952 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -632,7 +635,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AY 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AZ 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

@@ -46,6 +46,7 @@ pub struct RunEvent {
 }
 
 pub const DESKTOP_ADAPTER_CURSOR_VERSION: u32 = 1;
+pub const DESKTOP_ADAPTER_CONTROL_VERSION: u32 = 1;
 pub const DESKTOP_RECOVERY_MESSAGE_LIMIT: usize = 200;
 pub const DESKTOP_RECOVERY_TOOL_RUN_LIMIT: usize = 200;
 
@@ -59,11 +60,20 @@ pub struct DesktopAdapterCheckpointCursor {
     pub placeholder_message_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopAdapterCheckpointControl {
+    pub schema_version: u32,
+    pub effective_tool_rounds: usize,
+    pub budget_extensions: usize,
+}
+
 #[derive(Debug)]
 pub struct RestoredDesktopExecutorCheckpoint {
     pub run_loop: crate::agent::kernel_executor::KernelIoRunLoop,
     pub safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
     pub cursor: DesktopAdapterCheckpointCursor,
+    /// Phase AZ 后的新 checkpoint 必有；Phase AX/AY 历史记录允许缺失并保守降级。
+    pub control: Option<DesktopAdapterCheckpointControl>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +346,7 @@ pub fn append_desktop_executor_checkpoint(
     checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
     safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
     placeholder_message_id: Option<&str>,
+    control: Option<&DesktopAdapterCheckpointControl>,
 ) -> Result<i64, String> {
     let now = now_ms();
     let tx = conn.unchecked_transaction().map_err(|error| error.to_string())?;
@@ -396,6 +407,16 @@ pub fn append_desktop_executor_checkpoint(
     )?;
     payload["desktop_adapter_cursor"] =
         serde_json::to_value(&cursor).map_err(|error| error.to_string())?;
+    if let Some(control) = control {
+        if control.schema_version != DESKTOP_ADAPTER_CONTROL_VERSION
+            || control.effective_tool_rounds > crate::agent::governance::MAX_EFFECTIVE_TOOL_ROUNDS
+            || control.budget_extensions > crate::agent::governance::MAX_TOOL_BUDGET_EXTENSIONS
+        {
+            return Err("桌面 checkpoint 的 adapter control 非法".into());
+        }
+        payload["desktop_adapter_control"] =
+            serde_json::to_value(control).map_err(|error| error.to_string())?;
+    }
     let seq = append_event_tx(
         &tx,
         run_id,
@@ -479,6 +500,21 @@ pub fn restore_latest_desktop_executor(
             cursor.schema_version
         ));
     }
+    let control = value
+        .get("desktop_adapter_control")
+        .cloned()
+        .map(|control| {
+            serde_json::from_value::<DesktopAdapterCheckpointControl>(control)
+                .map_err(|error| format!("桌面 adapter control 反序列化失败：{error}"))
+        })
+        .transpose()?;
+    if control.as_ref().is_some_and(|control| {
+        control.schema_version != DESKTOP_ADAPTER_CONTROL_VERSION
+            || control.effective_tool_rounds > crate::agent::governance::MAX_EFFECTIVE_TOOL_ROUNDS
+            || control.budget_extensions > crate::agent::governance::MAX_TOOL_BUDGET_EXTENSIONS
+    }) {
+        return Err("桌面 adapter control 版本或预算状态非法".into());
+    }
     let visible_message_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM messages
@@ -522,6 +558,7 @@ pub fn restore_latest_desktop_executor(
         run_loop,
         safe_point,
         cursor,
+        control,
     }))
 }
 
@@ -1084,6 +1121,11 @@ mod tests {
             run_loop.begin_next_round(false),
             crate::agent::kernel_executor::KernelRunPermit::Proceed { round: 1, .. }
         ));
+        let control = DesktopAdapterCheckpointControl {
+            schema_version: DESKTOP_ADAPTER_CONTROL_VERSION,
+            effective_tool_rounds: 72,
+            budget_extensions: 1,
+        };
         append_desktop_executor_checkpoint(
             &c,
             "r",
@@ -1091,6 +1133,7 @@ mod tests {
             run_loop.checkpoint(),
             crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
             Some("placeholder"),
+            Some(&control),
         )
         .unwrap();
 
@@ -1103,6 +1146,7 @@ mod tests {
         );
         assert_eq!(restored.cursor.visible_message_count, 2);
         assert_eq!(restored.cursor.tool_run_count, 1);
+        assert_eq!(restored.control, Some(control));
         assert_eq!(
             restored.cursor.placeholder_message_id.as_deref(),
             Some("placeholder")
@@ -1155,6 +1199,7 @@ mod tests {
             run_loop.checkpoint(),
             crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
             None,
+            None,
         )
         .unwrap();
 
@@ -1171,6 +1216,49 @@ mod tests {
         assert_eq!(snapshot.tool_runs.last().unwrap().id, "t-204");
         assert!(snapshot.messages_truncated);
         assert!(snapshot.tool_runs_truncated);
+        assert!(snapshot.checkpoint.control.is_none());
+    }
+
+    #[test]
+    fn desktop_checkpoint_rejects_corrupted_adapter_control() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        let run_loop = crate::agent::kernel_executor::KernelIoRunLoop::new(
+            crate::agent::kernel_executor::KernelExecutorLimits::default(),
+        );
+        let control = DesktopAdapterCheckpointControl {
+            schema_version: DESKTOP_ADAPTER_CONTROL_VERSION,
+            effective_tool_rounds: 72,
+            budget_extensions: 1,
+        };
+        append_desktop_executor_checkpoint(
+            &c,
+            "r",
+            "c",
+            run_loop.checkpoint(),
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+            None,
+            Some(&control),
+        )
+        .unwrap();
+        let encoded: String = c
+            .query_row(
+                "SELECT payload FROM run_events WHERE run_id='r' AND event_type='run.executor_checkpoint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        payload["desktop_adapter_control"]["budget_extensions"] = serde_json::json!(3);
+        c.execute(
+            "UPDATE run_events SET payload=?1 WHERE run_id='r' AND event_type='run.executor_checkpoint'",
+            [serde_json::to_string(&payload).unwrap()],
+        )
+        .unwrap();
+
+        assert!(restore_latest_desktop_executor(&c, "r", "c")
+            .unwrap_err()
+            .contains("adapter control"));
     }
 
     #[test]

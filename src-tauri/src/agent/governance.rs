@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const MAX_TOOL_BUDGET_EXTENSIONS: usize = 2;
+pub const MAX_EFFECTIVE_TOOL_ROUNDS: usize = 512;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureSignal {
     StreamBeforeDelta, StreamAfterDelta, ModelTruncated, ReadTimeout, WriteTimeout,
@@ -66,8 +69,12 @@ pub fn extend_tool_budget(
     loop_breaks: usize,
     extensions: usize,
 ) -> Option<usize> {
-    if recent_successes < 3 || loop_breaks > 0 || extensions >= 2 { return None; }
-    Some(current.saturating_add((current / 3).max(12)).min(512))
+    if recent_successes < 3 || loop_breaks > 0 || extensions >= MAX_TOOL_BUDGET_EXTENSIONS { return None; }
+    Some(
+        current
+            .saturating_add((current / 3).max(12))
+            .min(MAX_EFFECTIVE_TOOL_ROUNDS),
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

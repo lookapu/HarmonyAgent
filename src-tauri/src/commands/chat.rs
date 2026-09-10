@@ -901,8 +901,15 @@ fn persist_desktop_executor_checkpoint(
     checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
     safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
     placeholder_message_id: Option<&str>,
+    effective_tool_rounds: usize,
+    budget_extensions: usize,
 ) -> Result<(), ChatFlowError> {
     let conn = state.0.lock().map_err(|error| error.to_string())?;
+    let control = crate::agent::runtime::DesktopAdapterCheckpointControl {
+        schema_version: crate::agent::runtime::DESKTOP_ADAPTER_CONTROL_VERSION,
+        effective_tool_rounds,
+        budget_extensions,
+    };
     crate::agent::runtime::append_desktop_executor_checkpoint(
         &conn,
         run_id,
@@ -910,6 +917,7 @@ fn persist_desktop_executor_checkpoint(
         checkpoint,
         safe_point,
         placeholder_message_id,
+        Some(&control),
     )?;
     Ok(())
 }
@@ -2695,7 +2703,7 @@ async fn stream_chat_inner(
     let trace_id = Uuid::new_v4().to_string();
     stats.run_id = Some(trace_id.clone());
     registry.set_run_id(&conversation_id, &trace_id);
-    let (recovery_plan, recovery_adapter_snapshot) = {
+    let (recovery_plan, mut recovery_adapter_snapshot) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         let plan = options
             .as_ref()
@@ -2729,6 +2737,10 @@ async fn stream_chat_inner(
     } else {
         (crate::agent::acceptance::GoalContract::compile(content.trim()), None)
     };
+    // 只有契约完全未变化的续跑才接续父 executor。新增/替换/删除目标要求会开启新治理
+    // 状态，但仍保留父 checkpoint 的数据边界预检与恢复摘要。
+    let resume_parent_executor = recovery_adapter_snapshot.is_some()
+        && goal_diff.as_ref().is_some_and(|diff| !diff.changed);
     let execution_budget = crate::agent::governance::ExecutionBudget::for_contract(
         &goal_contract,
         usize::from(recovery_plan.is_some()),
@@ -2798,6 +2810,10 @@ async fn stream_chat_inner(
                     "materialized_tool_run_count": snapshot.tool_runs.len(),
                     "tool_runs_truncated": snapshot.tool_runs_truncated,
                     "placeholder_message_id": cursor.placeholder_message_id,
+                    "effective_tool_rounds": snapshot.checkpoint.control.as_ref().map(|control| control.effective_tool_rounds),
+                    "budget_extensions": snapshot.checkpoint.control.as_ref().map(|control| control.budget_extensions),
+                    "executor_state_resumed": resume_parent_executor,
+                    "executor_reset_reason": if resume_parent_executor { serde_json::Value::Null } else { serde_json::json!("goal_changed") },
                 }),
             )?;
         }
@@ -4280,21 +4296,52 @@ async fn stream_chat_inner(
     let mut completion_reviews: usize = 0;
     // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）；
     // 时长可在设置页动态调整（0/-1 表示不限制）
-    let task_deadline_ms = crate::services::agent_limits::current()
+    let configured_task_deadline_ms = crate::services::agent_limits::current()
         .task_duration_secs()
         .map(|s| (s.saturating_mul(1000)) as i64)
         .map(|configured| configured.min(execution_budget.duration_ms))
         .unwrap_or(execution_budget.duration_ms);
     // 共用 executor 状态：创建时冻结本次运行的墙钟与治理限制。
-    let mut kernel_executor = KernelIoRunLoop::with_started(
-        KernelExecutorLimits {
-            wall_time_ms: task_deadline_ms.max(0) as u64,
-            round_limit: None,
-            tool_attempt_limit: None,
-            remediation_limit: execution_budget.remediation_rounds,
-        },
-        task_started,
-    );
+    // 真正续跑接续父状态（含停机墙钟、回合、工具循环和补救计数）；目标变化则新建状态。
+    let restored_adapter_control = if resume_parent_executor {
+        recovery_adapter_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.checkpoint.control.clone())
+    } else {
+        None
+    };
+    let restored_executor = if resume_parent_executor {
+        recovery_adapter_snapshot
+            .take()
+            .map(|snapshot| snapshot.checkpoint.run_loop)
+    } else {
+        None
+    };
+    let mut kernel_executor = restored_executor.unwrap_or_else(|| {
+        KernelIoRunLoop::with_started(
+            KernelExecutorLimits {
+                wall_time_ms: configured_task_deadline_ms.max(0) as u64,
+                round_limit: None,
+                tool_attempt_limit: None,
+                remediation_limit: execution_budget.remediation_rounds,
+            },
+            task_started,
+        )
+    });
+    let task_deadline_ms = kernel_executor
+        .limits()
+        .wall_time_ms
+        .min(i64::MAX as u64) as i64;
+    if resume_parent_executor {
+        // Phase AZ checkpoint 精确接续动态额度；旧 AX/AY checkpoint 没有 control 时
+        // 保留当前总上限但禁用再次扩容，累计尝试仍由 executor 统一计数。
+        if let Some(control) = restored_adapter_control {
+            max_tool_rounds = control.effective_tool_rounds;
+            budget_extensions = control.budget_extensions;
+        } else {
+            budget_extensions = crate::agent::governance::MAX_TOOL_BUDGET_EXTENSIONS;
+        }
+    }
     // 任务账本（Ledger 协议）状态：目标=首轮用户消息摘要；prev_ledger 为上次未完成任务
     // 落库的账本（断点续跑继承，编号从旧账本最大编号续接）；任务结束按完成/未完成保存或清空
     let task_goal = goal_contract.original_goal
@@ -4385,6 +4432,8 @@ async fn stream_chat_inner(
                     checkpoint,
                     crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
                     placeholder_msg_id.as_deref(),
+                    max_tool_rounds,
+                    budget_extensions,
                 )
             },
         )?;
@@ -5271,11 +5320,11 @@ async fn stream_chat_inner(
                 trace_id.clone(),
             );
             for (tool, args_raw) in calls {
-                let verdict = match kernel_executor.begin_tool_attempt(&tool, &args_raw) {
+                let (tool_attempt, verdict) = match kernel_executor.begin_tool_attempt(&tool, &args_raw) {
                     crate::agent::kernel_executor::KernelToolAttemptDecision::Observed {
+                        attempt,
                         verdict,
-                        ..
-                    } => verdict,
+                    } => (attempt, verdict),
                     crate::agent::kernel_executor::KernelToolAttemptDecision::Halt { .. } => {
                         exhausted = true;
                         break;
@@ -5322,12 +5371,16 @@ async fn stream_chat_inner(
                     _ => {}
                 }
                 // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
-                let reached_tool_limit = tool_runs.len() + pending.len() >= max_tool_rounds;
+                // executor attempt 在当前调用进入时已原子 +1，因此 attempt-1 是此前累计
+                // 尝试数；它跨恢复血缘持续，不能再用本次进程内 Vec 长度重置额度。
+                let prior_tool_attempts = usize::try_from(tool_attempt.saturating_sub(1))
+                    .unwrap_or(usize::MAX);
+                let reached_tool_limit = prior_tool_attempts >= max_tool_rounds;
                 let limit_must_stop = if reached_tool_limit {
                     let recent_successes = tool_runs.iter().rev().take(8).filter(|item| item.succeeded).count();
                     match kernel_executor.decide_dynamic_tool_budget(
                         max_tool_rounds,
-                        tool_runs.len() + pending.len(),
+                        prior_tool_attempts,
                         recent_successes,
                         budget_extensions,
                     ) {
@@ -5481,6 +5534,8 @@ async fn stream_chat_inner(
                             kernel_executor.checkpoint(),
                             crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                             placeholder_msg_id.as_deref(),
+                            max_tool_rounds,
+                            budget_extensions,
                         )?;
                         pending.clear();
                         if intercepted {
@@ -5537,6 +5592,8 @@ async fn stream_chat_inner(
                         kernel_executor.checkpoint(),
                         crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                         placeholder_msg_id.as_deref(),
+                        max_tool_rounds,
+                        budget_extensions,
                     )?;
                     pending.clear();
                     if intercepted {
@@ -5998,6 +6055,8 @@ async fn stream_chat_inner(
                 kernel_executor.checkpoint(),
                 crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                 placeholder_msg_id.as_deref(),
+                max_tool_rounds,
+                budget_extensions,
             )?;
             }
             // for 结束：排空剩余只读批次（本轮全部输出只读工具时）
@@ -6048,6 +6107,8 @@ async fn stream_chat_inner(
                     kernel_executor.checkpoint(),
                     crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                     placeholder_msg_id.as_deref(),
+                    max_tool_rounds,
+                    budget_extensions,
                 )?;
                 if intercepted {
                     exhausted = true;
