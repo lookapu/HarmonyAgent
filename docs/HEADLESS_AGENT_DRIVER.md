@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AR 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI adapter 仍待迁移
+> 状态：Phase 0—3 与 Phase 4 A—AS 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接入活跃 checkpoint、完整端口迁移仍待完成
 > 更新日期：2026-09-08
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -526,6 +526,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AP | Provider 边界 checkpoint hook（统一 run-loop 生成并要求端口持久化，adapter 不再手写时机） | ✅ COMPLETED |
 | AQ | headless 生产端口迁移（Provider/路由/验收/工具/事件单轮 IO 进入 `KernelIoPort`，外循环唯一化） | ✅ COMPLETED |
 | AR | checkpoint 安全点判型（`tool_result`/`provider_boundary` 来源入事件，工具点在 adapter 状态更新后落盘） | ✅ COMPLETED |
+| AS | 桌面活跃 checkpoint（Durable Run 类型化写入/严格恢复，Provider 前受 Worker 租约 fencing） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -567,7 +568,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - `KernelIoRunLoop::run` 在首轮之后、每次尝试进入下一 Provider 边界前生成 checkpoint，并通过 `KernelIoPort::persist_checkpoint` 强制交给 adapter；即使下一步因固定回合上限或已有终态被吸收，也会先留下最后一个已完成回合的状态。端口只实现落库，边界时机和 elapsed 均由内核所有
 - headless 的生产 `HeadlessIoPort` 现只实现单轮 Provider、路由、验收、工具与事件 IO；回合循环、Provider 边界安全裁决、停止吸收和边界 checkpoint 全部由 `KernelIoRunLoop::run` 驱动。工具结果后使用端口收到的可信 clock 立即落安全点；集成测试同时断言两类 checkpoint，原有 25 条 headless 差分/治理测试保持通过
 - headless checkpoint 事件携带向后兼容的 `safe_point=tool_result|provider_boundary` 元数据；工具安全点调整到 acceptance evidence 与 Provider messages 都更新之后，后续组合 adapter checkpoint 时可据此选择一致恢复边界，不必从相同形状的 executor payload 猜测执行位置
-- Rust lib 共 954 项：946 通过、8 项按环境条件忽略；前端 113 项通过
+- 桌面 Durable Run 新增 `run.executor_checkpoint` 类型化 API：每轮 Provider IO 前写入版本化 executor 状态，写操作复用 scheduler Worker 租约 fencing，陈旧 Worker 或数据库失败会在外部请求前失败关闭；最新记录恢复复用 schema、停机墙钟和可达状态校验，损坏记录不回退。当前仅接入 executor 状态，不宣称已恢复 UI messages/流缓冲/审批状态
+- Rust lib 共 955 项：947 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 
@@ -618,7 +620,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AR 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AS 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

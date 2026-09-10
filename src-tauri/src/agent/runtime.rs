@@ -221,6 +221,50 @@ pub fn append_event(
     Ok(seq)
 }
 
+/// 把桌面 Durable Run 的活跃 executor 状态写入受 Worker 租约保护的事件流。
+/// payload 只扩展安全点来源；executor checkpoint 自身仍保持版本化契约。
+pub fn append_executor_checkpoint(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
+    safe_point: &str,
+) -> Result<i64, String> {
+    let mut payload = serde_json::to_value(checkpoint).map_err(|error| error.to_string())?;
+    payload["safe_point"] = serde_json::json!(safe_point);
+    append_event(
+        conn,
+        run_id,
+        conversation_id,
+        "run.executor_checkpoint",
+        payload,
+    )
+}
+
+/// 严格恢复某个 Durable Run 的最新 executor checkpoint。
+/// 最新事件损坏时失败关闭，不回退到更旧状态掩盖持久化故障。
+pub fn restore_latest_executor(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<crate::agent::kernel_executor::KernelIoRunLoop>, String> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM run_events
+             WHERE run_id=?1 AND event_type='run.executor_checkpoint'
+             ORDER BY seq DESC LIMIT 1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let checkpoint = serde_json::from_str(&payload)
+        .map_err(|error| format!("最新 Durable Run executor checkpoint 损坏：{error}"))?;
+    crate::agent::kernel_executor::KernelIoRunLoop::restore(checkpoint).map(Some)
+}
+
 pub fn transition(
     conn: &Connection,
     run_id: &str,
@@ -618,6 +662,52 @@ mod tests {
         assert_eq!(run.last_event_seq, 3);
         let events = events_after(&c, "r", 1, 50).unwrap();
         assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn durable_executor_checkpoint_restores_latest_kernel_state() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        let mut run_loop = crate::agent::kernel_executor::KernelIoRunLoop::new(
+            crate::agent::kernel_executor::KernelExecutorLimits {
+                wall_time_ms: 60_000,
+                round_limit: Some(3),
+                tool_attempt_limit: Some(2),
+                remediation_limit: 1,
+            },
+        );
+        assert!(matches!(
+            run_loop.begin_next_round(false),
+            crate::agent::kernel_executor::KernelRunPermit::Proceed { round: 1, .. }
+        ));
+        append_executor_checkpoint(
+            &c,
+            "r",
+            "c",
+            run_loop.checkpoint(),
+            "provider_boundary",
+        )
+        .unwrap();
+
+        let mut restored = restore_latest_executor(&c, "r").unwrap().unwrap();
+        assert!(matches!(
+            restored.begin_next_round(false),
+            crate::agent::kernel_executor::KernelRunPermit::Proceed { round: 2, .. }
+        ));
+        let event = events_after(&c, "r", 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "run.executor_checkpoint")
+            .unwrap();
+        assert_eq!(event.payload["safe_point"], "provider_boundary");
+        c.execute(
+            "UPDATE run_events SET payload='{broken' WHERE event_id=?1",
+            [&event.event_id],
+        )
+        .unwrap();
+        assert!(restore_latest_executor(&c, "r")
+            .unwrap_err()
+            .contains("checkpoint 损坏"));
     }
 
     #[test]

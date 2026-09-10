@@ -4277,6 +4277,18 @@ async fn stream_chat_inner(
                 execution_budget.lease_ms,
             );
         }
+        // 活跃 executor 状态与 Durable Run 同源持久化。该写入受 Worker 租约 fencing；
+        // 一旦失去所有权或数据库拒绝写入，必须在下一次 Provider IO 前失败关闭。
+        {
+            let conn = state.0.lock().map_err(|error| error.to_string())?;
+            crate::agent::runtime::append_executor_checkpoint(
+                &conn,
+                &trace_id,
+                &conversation_id,
+                kernel_executor.checkpoint(),
+                "provider_boundary",
+            )?;
+        }
         // 任务心跳打点（每轮循环顶部）：配合工具/请求/压缩日志，任何卡点都能从最后一条
         // 心跳定位到所在阶段——此前卡在无超时请求内时日志静默，事后无法定位“空跑”位置
         registry.touch(&conversation_id, PHASE_MAIN_LOOP);
