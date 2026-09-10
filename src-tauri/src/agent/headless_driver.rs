@@ -72,9 +72,11 @@ fn bounded_tool_output(value: String) -> (String, bool) {
 fn append_executor_checkpoint_value(
     sink: &mut SessionTrajectorySink,
     checkpoint: KernelExecutorCheckpoint,
+    safe_point: &'static str,
 ) -> Result<(), AgentDriverError> {
-    let checkpoint = serde_json::to_value(checkpoint)
+    let mut checkpoint = serde_json::to_value(checkpoint)
         .map_err(|error| AgentDriverError::Failed(error.to_string()))?;
+    checkpoint["safe_point"] = json!(safe_point);
     sink.append(
         SessionEventType::ExecutorCheckpoint,
         checkpoint.clone(),
@@ -553,7 +555,7 @@ impl KernelIoPort for HeadlessIoPort<'_> {
         &mut self,
         checkpoint: KernelExecutorCheckpoint,
     ) -> Result<(), Self::Error> {
-        append_executor_checkpoint_value(self.sink, checkpoint)
+        append_executor_checkpoint_value(self.sink, checkpoint, "provider_boundary")
     }
 
     fn run_round<'a>(
@@ -883,7 +885,6 @@ impl KernelIoPort for HeadlessIoPort<'_> {
                         }),
                     )
                     .map_err(AgentDriverError::Failed)?;
-                append_executor_checkpoint_value(self.sink, clock.checkpoint(executor))?;
                 self.acceptance.record(KernelToolEvidence {
                     tool: name.to_string(),
                     arguments: args.to_string(),
@@ -892,6 +893,11 @@ impl KernelIoPort for HeadlessIoPort<'_> {
                 });
                 self.messages
                     .push(json!({"role":"tool","tool_call_id":id,"content":text}));
+                append_executor_checkpoint_value(
+                    self.sink,
+                    clock.checkpoint(executor),
+                    "tool_result",
+                )?;
             }
             Ok(KernelIoRoundControl::Continue)
         })
@@ -1346,6 +1352,11 @@ mod tests {
         assert_eq!(checkpoint.fields["schema_version"], 1);
         assert_eq!(checkpoint.fields["state"]["completed_rounds"], 1);
         assert_eq!(checkpoint.fields["state"]["tool_attempts"], 1);
+        let safe_points = checkpoints
+            .iter()
+            .map(|event| event.fields["safe_point"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(safe_points, vec!["tool_result", "provider_boundary"]);
         let checkpoint_json = serde_json::to_string(&checkpoint.fields).unwrap();
         assert!(!checkpoint_json.contains("fixed\\n"));
         assert!(checkpoint_json.contains("sha256:"));
