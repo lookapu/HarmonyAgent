@@ -228,9 +228,14 @@ impl KernelIoRunLoop {
 
     /// Provider 请求前的唯一循环入口。adapter 只能提供当前取消信号，不能注入自行计算的
     /// deadline/elapsed；单调耗时由循环壳在裁决瞬间采样。
-    pub fn begin_next_round(&mut self, cancelled: bool) -> KernelRunPermit {
+    fn decide_next_round(&mut self, cancelled: bool) -> KernelRunPermit {
         let elapsed = self.elapsed();
         self.executor.begin_round(cancelled, elapsed)
+    }
+
+    #[cfg(test)]
+    pub fn begin_next_round(&mut self, cancelled: bool) -> KernelRunPermit {
+        self.decide_next_round(cancelled)
     }
 
     /// 在 Provider 边界原子执行“持久化当前安全点 → 轮次裁决”。持久化失败时不会推进
@@ -241,7 +246,7 @@ impl KernelIoRunLoop {
         persist: impl FnOnce(KernelExecutorCheckpoint) -> Result<(), E>,
     ) -> Result<KernelRunPermit, E> {
         persist(self.checkpoint())?;
-        Ok(self.begin_next_round(cancelled))
+        Ok(self.decide_next_round(cancelled))
     }
 
     pub fn elapsed(&self) -> Duration {

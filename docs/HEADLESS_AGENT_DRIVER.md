@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AV 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接入 Provider/工具活跃 checkpoint、完整端口迁移仍待完成
+> 状态：Phase 0—3 与 Phase 4 A—AW 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接入 Provider/工具活跃 checkpoint、完整端口迁移仍待完成
 > 更新日期：2026-09-10
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -530,6 +530,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AT | 桌面工具安全点（串行结果及只读批次提交后写入 `tool_result` checkpoint，共用严格 helper） | ✅ COMPLETED |
 | AU | checkpoint 安全点类型化（UI/headless 共用枚举与 envelope 编解码，恢复返回边界类型，缺失/未知值失败关闭） | ✅ COMPLETED |
 | AV | Provider 边界原子化（run-loop 统一执行 checkpoint→轮次裁决，覆盖首轮；写入失败不推进计数或发起 IO） | ✅ COMPLETED |
+| AW | 裸轮次入口封口（`begin_next_round` 仅测试构建可见，生产 adapter 只能走持久化原子入口或完整 run-loop） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -575,6 +576,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - 桌面串行工具在结果、审计和 `tool_runs` 更新后写入 `tool_result` checkpoint；并行只读工具在每个有界批次按模型顺序提交完成后写入。Provider 与工具路径共用 `persist_desktop_executor_checkpoint`，数据库/租约错误统一失败关闭，不再各自拼接事件 payload
 - UI/headless 的 checkpoint 不再接受任意 `safe_point` 字符串：共用 `KernelCheckpointSafePoint` 与扁平 envelope 编解码，恢复 API 同时返回 executor 和已验证边界类型。缺失或未知安全点、损坏 payload、未知 schema 均失败关闭，为后续组合恢复 adapter messages/工具结果提供可判定边界
 - `KernelIoRunLoop::begin_persisted_round` 原子包住 Provider 边界 checkpoint 与轮次裁决，UI 不再手写两个可分离步骤；headless 的首轮 Provider 也拥有恢复安全点。持久化失败不会增加 `completed_rounds`，更不会向 adapter 发放外部请求 permit
+- 裸 `begin_next_round` 已从生产 API 移除，仅保留为测试探针；非测试构建通过 `cargo check --lib` 验证，UI/headless 无法再绕过 Provider checkpoint 直接取得轮次 permit
 - Rust lib 共 957 项：949 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
@@ -626,7 +628,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AV 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—AW 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；
