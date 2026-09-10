@@ -1349,10 +1349,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             checkpoints.len(),
-            2,
-            "工具结果安全点与下一 Provider 边界都必须由生产端口持久化"
+            3,
+            "首轮/后续 Provider 边界与工具结果安全点都必须由生产端口持久化"
         );
-        let checkpoint = checkpoints[0];
+        let checkpoint = checkpoints[1];
         assert_eq!(checkpoint.fields["schema_version"], 1);
         assert_eq!(checkpoint.fields["state"]["completed_rounds"], 1);
         assert_eq!(checkpoint.fields["state"]["tool_attempts"], 1);
@@ -1360,7 +1360,10 @@ mod tests {
             .iter()
             .map(|event| event.fields["safe_point"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(safe_points, vec!["tool_result", "provider_boundary"]);
+        assert_eq!(
+            safe_points,
+            vec!["provider_boundary", "tool_result", "provider_boundary"]
+        );
         let checkpoint_json = serde_json::to_string(&checkpoint.fields).unwrap();
         assert!(!checkpoint_json.contains("fixed\\n"));
         assert!(checkpoint_json.contains("sha256:"));

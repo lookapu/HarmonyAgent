@@ -233,6 +233,17 @@ impl KernelIoRunLoop {
         self.executor.begin_round(cancelled, elapsed)
     }
 
+    /// 在 Provider 边界原子执行“持久化当前安全点 → 轮次裁决”。持久化失败时不会推进
+    /// completed_rounds，也不会给 adapter 返回可发起外部请求的 permit。
+    pub fn begin_persisted_round<E>(
+        &mut self,
+        cancelled: bool,
+        persist: impl FnOnce(KernelExecutorCheckpoint) -> Result<(), E>,
+    ) -> Result<KernelRunPermit, E> {
+        persist(self.checkpoint())?;
+        Ok(self.begin_next_round(cancelled))
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.clock.elapsed()
     }
@@ -272,10 +283,11 @@ impl KernelIoRunLoop {
         port: &mut P,
     ) -> Result<KernelIoRunExit, P::Error> {
         loop {
-            if self.executor.completed_rounds() > 0 {
-                port.persist_checkpoint(self.checkpoint())?;
-            }
-            let (round, remaining) = match self.begin_next_round(port.cancelled()) {
+            let cancelled = port.cancelled();
+            let permit = self.begin_persisted_round(cancelled, |checkpoint| {
+                port.persist_checkpoint(checkpoint)
+            })?;
+            let (round, remaining) = match permit {
                 KernelRunPermit::Proceed { round, remaining } => (round, remaining),
                 KernelRunPermit::Halt(reason) => {
                     return Ok(KernelIoRunExit::Halted(reason));
@@ -671,8 +683,9 @@ mod tests {
         assert_eq!(port.checkpoints.len(), 2);
         assert_eq!(port.checkpoints[0].state.completed_rounds, 1);
         assert_eq!(port.checkpoints[1].state.completed_rounds, 2);
-        assert_eq!(port.boundary_checkpoints.len(), 1);
-        assert_eq!(port.boundary_checkpoints[0].state.completed_rounds, 1);
+        assert_eq!(port.boundary_checkpoints.len(), 2);
+        assert_eq!(port.boundary_checkpoints[0].state.completed_rounds, 0);
+        assert_eq!(port.boundary_checkpoints[1].state.completed_rounds, 1);
     }
 
     #[tokio::test]
@@ -696,8 +709,23 @@ mod tests {
             KernelIoRunExit::Halted(KernelRunTermination::MaxStepsExceeded)
         );
         assert_eq!(port.rounds, vec![1, 2]);
-        assert_eq!(port.boundary_checkpoints.len(), 2);
-        assert_eq!(port.boundary_checkpoints[1].state.completed_rounds, 2);
+        assert_eq!(port.boundary_checkpoints.len(), 3);
+        assert_eq!(port.boundary_checkpoints[0].state.completed_rounds, 0);
+        assert_eq!(port.boundary_checkpoints[2].state.completed_rounds, 2);
+    }
+
+    #[test]
+    fn persisted_round_does_not_advance_when_checkpoint_fails() {
+        let mut run_loop = KernelIoRunLoop::new(KernelExecutorLimits::default());
+        let error = run_loop
+            .begin_persisted_round(false, |_| Err::<(), _>("checkpoint rejected"))
+            .unwrap_err();
+        assert_eq!(error, "checkpoint rejected");
+
+        let permit = run_loop
+            .begin_persisted_round(false, |_| Ok::<(), String>(()))
+            .unwrap();
+        assert!(matches!(permit, KernelRunPermit::Proceed { round: 1, .. }));
     }
 
     #[test]

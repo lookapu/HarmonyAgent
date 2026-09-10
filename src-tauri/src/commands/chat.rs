@@ -898,7 +898,7 @@ fn persist_desktop_executor_checkpoint(
     state: &tauri::State<'_, DbState>,
     run_id: &str,
     conversation_id: &str,
-    run_loop: &KernelIoRunLoop,
+    checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
     safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
 ) -> Result<(), ChatFlowError> {
     let conn = state.0.lock().map_err(|error| error.to_string())?;
@@ -906,7 +906,7 @@ fn persist_desktop_executor_checkpoint(
         &conn,
         run_id,
         conversation_id,
-        run_loop.checkpoint(),
+        checkpoint,
         safe_point,
     )?;
     Ok(())
@@ -4295,15 +4295,6 @@ async fn stream_chat_inner(
                 execution_budget.lease_ms,
             );
         }
-        // 活跃 executor 状态与 Durable Run 同源持久化。该写入受 Worker 租约 fencing；
-        // 一旦失去所有权或数据库拒绝写入，必须在下一次 Provider IO 前失败关闭。
-        persist_desktop_executor_checkpoint(
-            state,
-            &trace_id,
-            &conversation_id,
-            &kernel_executor,
-            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
-        )?;
         // 任务心跳打点（每轮循环顶部）：配合工具/请求/压缩日志，任何卡点都能从最后一条
         // 心跳定位到所在阶段——此前卡在无超时请求内时日志静默，事后无法定位“空跑”位置
         registry.touch(&conversation_id, PHASE_MAIN_LOOP);
@@ -4341,9 +4332,20 @@ async fn stream_chat_inner(
             }
             workflow_stage = Some(workflow.stage);
         }
-        // Provider 请求前共用安全点：统一 deadline/cancel 优先级与剩余时间语义。
-        let run_permit =
-            kernel_executor.begin_next_round(is_cancelled(cancel, &conversation_id));
+        // Provider 请求前共用安全点：run-loop 原子执行持久化与 deadline/cancel 裁决。
+        // 写入受 Worker 租约 fencing；失败时轮次不会推进，也不会发起 Provider IO。
+        let run_permit = kernel_executor.begin_persisted_round(
+            is_cancelled(cancel, &conversation_id),
+            |checkpoint| {
+                persist_desktop_executor_checkpoint(
+                    state,
+                    &trace_id,
+                    &conversation_id,
+                    checkpoint,
+                    crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+                )
+            },
+        )?;
         // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
         if matches!(
             run_permit,
@@ -5434,7 +5436,7 @@ async fn stream_chat_inner(
                             state,
                             &trace_id,
                             &conversation_id,
-                            &kernel_executor,
+                            kernel_executor.checkpoint(),
                             crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                         )?;
                         pending.clear();
@@ -5489,7 +5491,7 @@ async fn stream_chat_inner(
                         state,
                         &trace_id,
                         &conversation_id,
-                        &kernel_executor,
+                        kernel_executor.checkpoint(),
                         crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                     )?;
                     pending.clear();
@@ -5949,7 +5951,7 @@ async fn stream_chat_inner(
                 state,
                 &trace_id,
                 &conversation_id,
-                &kernel_executor,
+                kernel_executor.checkpoint(),
                 crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
             )?;
             }
@@ -5998,7 +6000,7 @@ async fn stream_chat_inner(
                     state,
                     &trace_id,
                     &conversation_id,
-                    &kernel_executor,
+                    kernel_executor.checkpoint(),
                     crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                 )?;
                 if intercepted {
