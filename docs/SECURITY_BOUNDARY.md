@@ -71,6 +71,14 @@ HarmonyAgent 当前**不具备默认 OS 级命令沙箱**：
 
 环境管理页还可手动调用 `verify_native_sandbox_boundary`。该命令只在应用内部创建 UUID 临时测试根目录，不读取或修改用户项目，并实际验证工作区写入、工作区外读取拒绝、只读工作区写入拒绝和符号链接逃逸拒绝。报告固定标记为 `filesystem_smoke_v1`；原生运行时不可用或任一检查失败时不会给出通过结论。该 smoke 不验证网络、凭据、进程树或资源限制，不能替代各平台的完整逃逸套件。
 
+真机或 CI 可用同一实现生成机器可读报告：
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml --features eval-cli --bin harmony-agent -- sandbox verify --json
+```
+
+全部检查通过时退出码为 `0`；运行时不可用或任一边界未建立时为 `1`；参数或内部错误为 `2`。调用方不得忽略非零退出码，也不得在失败后回退到宿主执行。该命令不需要 Docker，不会尝试拉取镜像。
+
 原生路径尚未设为默认，且完整跨平台逃逸套件仍待宿主/CI 验证，因此缺省产品能力仍按第 2 节的宿主执行边界对外说明。
 
 ## 6. Sandbox Backend 最低契约

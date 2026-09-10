@@ -3,6 +3,7 @@ use deveco_switch::agent::eval_runner::{
 };
 use deveco_switch::agent::eval_task::parse_eval_task;
 use deveco_switch::agent::headless_driver::{HeadlessAgentDriver, HeadlessProviderConfig};
+use deveco_switch::agent::sandbox::verify_native_sandbox_boundary;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,13 +19,33 @@ struct EvalRunArgs {
     output: PathBuf,
 }
 
-fn usage() -> &'static str {
-    "用法：harmony-agent eval run --task <task.json> --workspace <repo> \\
-  --run-config <run.json> --driver <absolute-adapter|builtin> [--driver-arg <arg>]... \\
-  --output <new-output-dir>"
+#[derive(Debug, PartialEq)]
+enum CliCommand {
+    EvalRun(EvalRunArgs),
+    SandboxVerify { json: bool },
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<EvalRunArgs, String> {
+fn usage() -> &'static str {
+    "用法：\n  harmony-agent eval run --task <task.json> --workspace <repo> \\
+  --run-config <run.json> --driver <absolute-adapter|builtin> [--driver-arg <arg>]... \\
+  --output <new-output-dir>\n  harmony-agent sandbox verify [--json]"
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand, String> {
+    let values = args.into_iter().collect::<Vec<_>>();
+    if values.first().map(String::as_str) == Some("sandbox")
+        && values.get(1).map(String::as_str) == Some("verify")
+    {
+        return match values.get(2..).unwrap_or_default() {
+            [] => Ok(CliCommand::SandboxVerify { json: false }),
+            [flag] if flag == "--json" => Ok(CliCommand::SandboxVerify { json: true }),
+            _ => Err(format!("sandbox verify 仅支持可选参数 --json\n{}", usage())),
+        };
+    }
+    parse_eval_args(values).map(CliCommand::EvalRun)
+}
+
+fn parse_eval_args(args: impl IntoIterator<Item = String>) -> Result<EvalRunArgs, String> {
     let mut values = args.into_iter();
     if values.next().as_deref() != Some("eval") || values.next().as_deref() != Some("run") {
         return Err(usage().into());
@@ -119,6 +140,33 @@ async fn execute(args: EvalRunArgs) -> Result<i32, String> {
     }
 }
 
+async fn verify_sandbox(json: bool) -> Result<i32, String> {
+    let report = verify_native_sandbox_boundary().await;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|error| format!("序列化 sandbox 检查报告失败：{error}"))?
+        );
+    } else {
+        println!("backend: {}", report.backend);
+        println!("scope: {}", report.scope);
+        println!(
+            "status: {}",
+            if report.passed { "passed" } else { "failed" }
+        );
+        for check in &report.checks {
+            println!(
+                "{} {}: {}",
+                if check.passed { "PASS" } else { "FAIL" },
+                check.name,
+                check.detail
+            );
+        }
+    }
+    Ok(if report.passed { 0 } else { 1 })
+}
+
 #[tokio::main]
 async fn main() {
     let args = match parse_args(std::env::args().skip(1)) {
@@ -128,10 +176,14 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    match execute(args).await {
+    let result = match args {
+        CliCommand::EvalRun(args) => execute(args).await,
+        CliCommand::SandboxVerify { json } => verify_sandbox(json).await,
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("eval run 失败：{error}");
+            eprintln!("harmony-agent 执行失败：{error}");
             std::process::exit(2);
         }
     }
@@ -167,8 +219,34 @@ mod tests {
             .map(str::to_string),
         )
         .unwrap();
+        let CliCommand::EvalRun(parsed) = parsed else {
+            panic!("expected eval run command");
+        };
         assert_eq!(parsed.driver_args, vec!["--model", "x"]);
         assert_eq!(parsed.output, PathBuf::from("out"));
+    }
+
+    #[test]
+    fn parses_sandbox_verify_and_rejects_unknown_flags() {
+        assert_eq!(
+            parse_args(["sandbox", "verify"].into_iter().map(str::to_string)).unwrap(),
+            CliCommand::SandboxVerify { json: false }
+        );
+        assert_eq!(
+            parse_args(
+                ["sandbox", "verify", "--json"]
+                    .into_iter()
+                    .map(str::to_string)
+            )
+            .unwrap(),
+            CliCommand::SandboxVerify { json: true }
+        );
+        assert!(parse_args(
+            ["sandbox", "verify", "--quiet"]
+                .into_iter()
+                .map(str::to_string)
+        )
+        .is_err());
     }
 
     #[test]

@@ -15,7 +15,7 @@
 - SCIP 精确引用：流式导入官方 protobuf、独立精确引用层、文件指纹失效、跨进程导入锁、外部覆盖检测、原子代次切换；`ForwardDefinition` 前向声明按定义位置处理。
 - 热点符号关系：单次 500 条预算 + `relations_cursor` 统一 keyset 分页；关系查询 P50/P95 基准显示 5k→1M 引用第一页 P50 稳定约 3.6 ms。
 - 统一检索入口：`repo_query` 按 `path/symbol/concept` 自动分流并标注 `source_layer`，`impact` 模式返回精确图反向依赖 + 主流约定的候选测试文件；`search_tools` 按 query 发现工具（`detail=name|summary`）。
-- 沙箱能力与命令接线：`probe_sandbox_backends` 以稳定顺序返回当前平台原生候选、Docker、Podman 的真实可用性与失败原因，环境管理页已提供能力卡片、手动刷新和原生文件边界 smoke；macOS/Linux 探测会实际启动最小隔离域而不只检查二进制，Windows AppContainer 生命周期未完成前保持 unavailable。`verify_native_sandbox_boundary` 仅使用内部 UUID 临时目录，实际检查工作区写入、外部读取拒绝、只读写入拒绝和符号链接逃逸拒绝，并明确限定为 `filesystem_smoke_v1`。`select_sandbox_target`/`resolve_sandbox_target` 按环境配置 fail-closed 选择 OCI 执行目标，`run_command` 已接入原生及可选 OCI 后端，宿主直跑持续显示风险标注（`agent::sandbox`）。
+- 沙箱能力与命令接线：`probe_sandbox_backends` 以稳定顺序返回当前平台原生候选、Docker、Podman 的真实可用性与失败原因，环境管理页已提供能力卡片、手动刷新和原生文件边界 smoke；macOS/Linux 探测会实际启动最小隔离域而不只检查二进制，Windows AppContainer 生命周期未完成前保持 unavailable。`verify_native_sandbox_boundary` 仅使用内部 UUID 临时目录，实际检查工作区写入、外部读取拒绝、只读写入拒绝和符号链接逃逸拒绝，并明确限定为 `filesystem_smoke_v1`；`harmony-agent sandbox verify --json` 复用同一实现供真机/CI 门禁，失败或不可用返回非零退出码。`select_sandbox_target`/`resolve_sandbox_target` 按环境配置 fail-closed 选择 OCI 执行目标，`run_command` 已接入原生及可选 OCI 后端，宿主直跑持续显示风险标注（`agent::sandbox`）。
 - 审批审计：`resolve_tool_approval` 决议写入 `session_events`（`ToolApproval` 事件），`audit_timeline` 把 `session_events` 与 `run_events`（沙箱升级）合并为一条按时间排序的统一审计时间线。
 - Host Capability Broker 原型：`HostCapability` 类型化窄能力（hdc 连接/断开/列表、install、deploy）+ `validate` 拒绝 shell 元字符/绝对路径/`..`/非 `.hap`（`agent::capability_broker`）。
 - headless eval harness：task schema v1 + 安全校验、`manifest`/`report`/`trajectory` 数据契约、`command grader`、补丁采集/应用、工作树准备、产物收集/导出（按声明 glob 复制到 `artifacts/`）、`run_trial` 编排（`AgentDriver` 可注入 trait，桩端到端验证），trajectory 复用 `session_events` 事件源（`agent::eval_task`/`eval_report`/`eval_trajectory`/`eval_grader`/`eval_patch`/`eval_workspace`/`eval_runner`，见 [AGENT_EVAL_HARNESS.md](./AGENT_EVAL_HARNESS.md)）。
@@ -489,7 +489,7 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - [x] 建立 10k/100k/1M 文件索引基准生成器，并记录 10k 当前基线；
 - [x] 更新 README：二进制下载、支持平台和当前限制（badge 改为仅 Windows/macOS，并明确 Linux 暂不提供官方安装包，避免“跨平台”措辞超出实际产物）。
 
-退出门槛：可以用一条命令重现当前的安全边界、检索性能和 25 题 Agent 基线。
+退出门槛：安全边界已可通过 `harmony-agent sandbox verify --json` 单命令输出并以退出码门禁；检索性能和 25 题 Agent 基线继续使用各自的固定命令与产物契约复现。
 
 ### Phase 1：第 3—6 周，补核心底座
 
