@@ -34,6 +34,9 @@ impl RecoveryAction {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryDecision {
     pub step_id: String,
+    /// 对工具步骤绑定 durable tool_runs.id；旧恢复计划允许缺失并不得继承证据。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
     pub source: String,
     pub title: String,
     pub previous_state: String,
@@ -235,6 +238,7 @@ pub fn build_plan(
                 RecoveryDecision {
                     action: action_for(&step),
                     step_id: step.step_id,
+                    external_id: (!step.external_id.is_empty()).then_some(step.external_id),
                     source: step.source,
                     title: step.title,
                     previous_state: step.state,

@@ -1,6 +1,6 @@
 # 内置 Provider Headless Agent Driver 设计（可实现版）
 
-> 状态：Phase 0—3 与 Phase 4 A—AZ 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接续目标不变恢复的 executor 与动态工具预算、完整端口迁移仍待完成
+> 状态：Phase 0—3 与 Phase 4 A—BA 已落地；headless 生产 adapter 已迁入单一 IO run-loop，桌面 UI 已接续目标不变恢复的 executor、动态预算与已完成证据、完整端口迁移仍待完成
 > 更新日期：2026-09-10
 > 适用范围：`harmony-agent eval run --driver builtin`
 
@@ -534,6 +534,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 | AX | 桌面 adapter 高水位（同事务冻结消息/工具审计 rowid、数量与正文占位引用，恢复严格校验漂移） | ✅ COMPLETED |
 | AY | 桌面恢复有界物化（子运行创建前严格预检父 checkpoint，只读取高水位内最近 200 条消息/工具审计，专用游标索引并注入无正文摘要） | ✅ COMPLETED |
 | AZ | 桌面 executor 血缘接续（仅目标契约不变时恢复停机墙钟/回合/循环/补救状态，checkpoint 同步冻结动态工具额度与扩容次数） | ✅ COMPLETED |
+| BA | 恢复证据链接续（只继承恢复计划 `SkipCompleted` 且 id/工具名/成功状态匹配的有界父工具证据，接入工作流与两阶段验收） | ✅ COMPLETED |
 
 **关键实现细节**：
 - headless 保持 fail-closed 语义：流错误不进入中断续写/重放（文档画线）
@@ -584,6 +585,8 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - 桌面血缘恢复会在创建子运行前调用 `materialize_latest_desktop_checkpoint`：旧运行没有组合 checkpoint 时兼容原恢复协议；只要最新 checkpoint 存在却损坏或集合漂移就失败关闭。物化查询同时携带 `rowid <= high-water` 与 `LIMIT 200`，通过 migration 081 的消息/工具恢复游标索引从尾部读取并恢复为时间正序；system prompt 与 `recovery.adapter_checkpoint_loaded` 事件仅记录安全点、游标、数量、截断状态及最后记录身份，不复制正文、reasoning、工具参数或输出，也不会把父 executor 的瞬态计数直接灌入新预算
 - 目标契约完全未变化的续跑会把父 `KernelIoRunLoop` 移交给子运行，停机墙钟、Provider 回合、工具调用指纹/尝试数、循环熔断首因及验收补救次数不再重置；新增、替换或删除目标要求时只使用已验证数据边界并新建 executor，`recovery.adapter_checkpoint_loaded` 明确审计是否接续及重置原因
 - `desktop_adapter_control` schema v1 与 executor/cursor 在同一 checkpoint 事件中冻结 `effective_tool_rounds` 和 `budget_extensions`；工具额度判定改用 executor 的跨血缘累计 attempt，而非当前进程内 `tool_runs.len()`。Phase AX/AY 的旧 checkpoint 缺少 control 时允许读取，但保守禁用再次扩容，避免恢复反复刷新动态预算
+- `RecoveryDecision` 新增向后兼容的 `external_id`，父工具证据只有在目标契约未变化、恢复动作是 `SkipCompleted`，并且 checkpoint 窗口内的 `tool_runs.id`、工具名和 `status=ok` 同时匹配时才可继承。继承证据按父 rowid 顺序置于本轮证据之前，进入 workflow snapshot、申请完成时的 remediation gate 与最终 acceptance；窗口截断或旧计划缺 ID 时宁可要求重新验证
+- 继承证据不写入当前 `tool_runs`：不会重复追加工具消息、重复持久化、污染本轮进度/账本或触发同一个外部动作；但 ship 声明审计与完成复核会把它视作执行型任务证据，避免恢复后无新工具时被误当成纯问答自动完成
 - Rust lib 共 960 项：952 通过、8 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
@@ -635,7 +638,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 
 ## 16. 当前执行建议
 
-Phase 2/3 与 Phase 4 A—AZ 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
+Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入单一 IO executor，并保持核心工具不依赖 Docker：
 
 1. 真实 Provider 手动 smoke workflow 与脱敏产物检查已落地
    （`headless-eval-smoke` workflow + `AGENT_EVAL_HARNESS.md` 产物规范）；

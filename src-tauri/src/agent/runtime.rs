@@ -137,6 +137,38 @@ impl DesktopAdapterRecoverySnapshot {
             cursor.placeholder_message_id.as_deref().unwrap_or("none"),
         )
     }
+
+    /// 只继承 Recovery Orchestrator 已判定为完成、且 id/工具名/成功状态三者一致的
+    /// 父工具证据。缺少 external_id 的旧计划和窗口外记录均保守忽略。
+    pub fn inheritable_tool_evidence(
+        &self,
+        plan: &crate::agent::recovery::RecoveryPlan,
+    ) -> Vec<DesktopRecoveredToolRun> {
+        let completed = plan
+            .decisions
+            .iter()
+            .filter(|decision| {
+                decision.source == "tool"
+                    && decision.action == crate::agent::recovery::RecoveryAction::SkipCompleted
+            })
+            .filter_map(|decision| {
+                decision
+                    .external_id
+                    .as_deref()
+                    .map(|id| (id, decision.title.as_str()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        self.tool_runs
+            .iter()
+            .filter(|tool| {
+                tool.status == "ok"
+                    && completed
+                        .get(tool.id.as_str())
+                        .is_some_and(|expected| *expected == tool.tool_name.as_str())
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 fn now_ms() -> i64 {
@@ -1164,6 +1196,33 @@ mod tests {
         assert!(!snapshot.messages_truncated);
         assert!(!snapshot.tool_runs_truncated);
         assert!(snapshot.prompt_hint().contains("tool_result"));
+        let plan = crate::agent::recovery::RecoveryPlan {
+            parent_run_id: "r".into(),
+            original_goal: "goal".into(),
+            original_contract: None,
+            policy: "continue".into(),
+            decisions: vec![crate::agent::recovery::RecoveryDecision {
+                step_id: "tool:tool-1".into(),
+                external_id: Some("tool-1".into()),
+                source: "tool".into(),
+                title: "read_file".into(),
+                previous_state: "completed".into(),
+                verification_state: "verified".into(),
+                recovery_policy: "replay".into(),
+                action: crate::agent::recovery::RecoveryAction::SkipCompleted,
+                evidence_domain: Some("filesystem".into()),
+                target_hints: vec!["a.rs".into()],
+            }],
+            completed_count: 1,
+            pending_count: 0,
+            verification_count: 0,
+            confirmation_count: 0,
+            created_at: 0,
+        };
+        assert_eq!(snapshot.inheritable_tool_evidence(&plan).len(), 1);
+        let mut mismatched = plan.clone();
+        mismatched.decisions[0].title = "write_file".into();
+        assert!(snapshot.inheritable_tool_evidence(&mismatched).is_empty());
 
         c.execute("DELETE FROM tool_runs WHERE id='tool-1'", [])
             .unwrap();

@@ -950,6 +950,29 @@ struct ToolRunItem {
     persisted: bool,
 }
 
+fn combined_acceptance_evidence<'a>(
+    inherited: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
+    current: &'a [ToolRunItem],
+) -> Vec<crate::agent::acceptance::ToolEvidence<'a>> {
+    inherited
+        .iter()
+        .map(|item| crate::agent::acceptance::ToolEvidence {
+            tool: &item.tool_name,
+            args: &item.input_json,
+            output: &item.result_json,
+            succeeded: item.status == "ok",
+        })
+        .chain(current.iter().map(|item| {
+            crate::agent::acceptance::ToolEvidence {
+                tool: &item.tool,
+                args: &item.args,
+                output: &item.output,
+                succeeded: item.succeeded,
+            }
+        }))
+        .collect()
+}
+
 /// 任务账本（Ledger 协议）：任务执行状态外部化——目标/已验证/待解决/下一步 四段式，
 /// 由工具执行轨迹派生，每轮作为 system 消息注入（接缝刷新，防长任务"忘记已做过什么/
 /// 卡在哪一步"），任务未完成/中断时落库 conversations.ledger，断点续跑加载合并（编号
@@ -2741,6 +2764,15 @@ async fn stream_chat_inner(
     // 状态，但仍保留父 checkpoint 的数据边界预检与恢复摘要。
     let resume_parent_executor = recovery_adapter_snapshot.is_some()
         && goal_diff.as_ref().is_some_and(|diff| !diff.changed);
+    let inherited_tool_evidence = if resume_parent_executor {
+        recovery_adapter_snapshot
+            .as_ref()
+            .zip(recovery_plan.as_ref())
+            .map(|(snapshot, plan)| snapshot.inheritable_tool_evidence(plan))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let execution_budget = crate::agent::governance::ExecutionBudget::for_contract(
         &goal_contract,
         usize::from(recovery_plan.is_some()),
@@ -2814,6 +2846,7 @@ async fn stream_chat_inner(
                     "budget_extensions": snapshot.checkpoint.control.as_ref().map(|control| control.budget_extensions),
                     "executor_state_resumed": resume_parent_executor,
                     "executor_reset_reason": if resume_parent_executor { serde_json::Value::Null } else { serde_json::json!("goal_changed") },
+                    "inherited_tool_evidence_count": inherited_tool_evidence.len(),
                 }),
             )?;
         }
@@ -4396,14 +4429,8 @@ async fn stream_chat_inner(
                 "history_limit": history_limit,
             }),
         );
-        let workflow_evidence = tool_runs.iter().map(|item| {
-            crate::agent::acceptance::ToolEvidence {
-                tool: &item.tool,
-                args: &item.args,
-                output: &item.output,
-                succeeded: item.succeeded,
-            }
-        }).collect::<Vec<_>>();
+        let workflow_evidence =
+            combined_acceptance_evidence(&inherited_tool_evidence, &tool_runs);
         let workflow = crate::agent::execution_loop::snapshot(
             &goal_contract,
             &workflow_evidence,
@@ -6278,12 +6305,8 @@ async fn stream_chat_inner(
         // 强验收前移到“申请完成”时刻。缺少写入、后置验证、构建/测试/提交/推送等
         // 契约证据时自动回到工具循环；达到动态上限才保留为未完成，避免无限补救。
         if !outcome.interrupted {
-            let evidence = tool_runs.iter().map(|item| crate::agent::acceptance::ToolEvidence {
-                tool: &item.tool,
-                args: &item.args,
-                output: &item.output,
-                succeeded: item.succeeded,
-            }).collect::<Vec<_>>();
+            let evidence =
+                combined_acceptance_evidence(&inherited_tool_evidence, &tool_runs);
             let report = state.0.lock().ok()
                 .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &evidence).ok())
                 .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &evidence));
@@ -6314,7 +6337,7 @@ async fn stream_chat_inner(
         // 验证范围（文件/模块/命令/截图等）时注入纠正要求补充或实际验证——防“声称完成却
         // 没验证”的虚假收尾（与收尾复核互补：复核问“是否真完成”，ship 查“完成声明是否
         // 有验证背书”）；达上限放行收尾，防空转
-        if !tool_runs.is_empty()
+        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
             && !outcome.interrupted
             && has_unverified_claim(&text)
             && unverified_claim_corrections < MAX_UNVERIFIED_CLAIM_CORRECTIONS
@@ -6331,7 +6354,10 @@ async fn stream_chat_inner(
         // 纯问答任务（全程无工具执行）不复核，直接收尾。
         // 本轮已判定网络连续中断（outcome.interrupted）时不复核：连接不稳，复核轮大概率
         // 再次中断白等，直接按上方“网络连续中断”提示收尾。
-        if !tool_runs.is_empty() && !outcome.interrupted && completion_reviews < MAX_COMPLETION_REVIEWS {
+        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
+            && !outcome.interrupted
+            && completion_reviews < MAX_COMPLETION_REVIEWS
+        {
             completion_reviews += 1;
             correction_text = crate::agent::tools::strip_tool_calls(&text);
             // 证据化完成确认（对齐 deepseek-harness goal-round-driver）：复核时带上任务
@@ -6345,7 +6371,10 @@ async fn stream_chat_inner(
             );
             continue;
         }
-        if !tool_runs.is_empty() && !outcome.interrupted && completion_reviews >= MAX_COMPLETION_REVIEWS {
+        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
+            && !outcome.interrupted
+            && completion_reviews >= MAX_COMPLETION_REVIEWS
+        {
             full.push_str("\n\n> ⚠️ 任务收尾前已多次要求模型确认完成情况，模型始终未确认任务已全部完成；以上内容已保留，建议检查结果或补充指令继续推进。");
         }
         break;
@@ -6363,20 +6392,14 @@ async fn stream_chat_inner(
             None,
         );
     }
-    let acceptance_evidence = tool_runs
-        .iter()
-        .map(|item| crate::agent::acceptance::ToolEvidence {
-            tool: &item.tool,
-            args: &item.args,
-            output: &item.output,
-            succeeded: item.succeeded,
-        })
-        .collect::<Vec<_>>();
+    let acceptance_evidence =
+        combined_acceptance_evidence(&inherited_tool_evidence, &tool_runs);
     let acceptance = state.0.lock().ok()
         .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &acceptance_evidence).ok())
         .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &acceptance_evidence));
     let completion_confirmed =
-        is_completion_confirmation(&last_model_text) || tool_runs.is_empty();
+        is_completion_confirmation(&last_model_text)
+            || (tool_runs.is_empty() && inherited_tool_evidence.is_empty());
     let executor_snapshot = serde_json::to_value(
         kernel_executor.finalize(KernelExecutorFinalization::Acceptance {
             governance_exhausted: exhausted,
