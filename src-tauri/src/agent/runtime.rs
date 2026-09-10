@@ -228,10 +228,12 @@ pub fn append_executor_checkpoint(
     run_id: &str,
     conversation_id: &str,
     checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
-    safe_point: &str,
+    safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
 ) -> Result<i64, String> {
-    let mut payload = serde_json::to_value(checkpoint).map_err(|error| error.to_string())?;
-    payload["safe_point"] = serde_json::json!(safe_point);
+    let payload = crate::agent::kernel_executor::executor_checkpoint_payload(
+        checkpoint,
+        safe_point,
+    )?;
     append_event(
         conn,
         run_id,
@@ -246,7 +248,13 @@ pub fn append_executor_checkpoint(
 pub fn restore_latest_executor(
     conn: &Connection,
     run_id: &str,
-) -> Result<Option<crate::agent::kernel_executor::KernelIoRunLoop>, String> {
+) -> Result<
+    Option<(
+        crate::agent::kernel_executor::KernelIoRunLoop,
+        crate::agent::kernel_executor::KernelCheckpointSafePoint,
+    )>,
+    String,
+> {
     let payload: Option<String> = conn
         .query_row(
             "SELECT payload FROM run_events
@@ -260,9 +268,11 @@ pub fn restore_latest_executor(
     let Some(payload) = payload else {
         return Ok(None);
     };
-    let checkpoint = serde_json::from_str(&payload)
+    let payload = serde_json::from_str(&payload)
         .map_err(|error| format!("最新 Durable Run executor checkpoint 损坏：{error}"))?;
-    crate::agent::kernel_executor::KernelIoRunLoop::restore(checkpoint).map(Some)
+    crate::agent::kernel_executor::restore_executor_checkpoint_payload(payload)
+        .map(Some)
+        .map_err(|error| format!("最新 Durable Run executor checkpoint 损坏：{error}"))
 }
 
 pub fn transition(
@@ -685,11 +695,15 @@ mod tests {
             "r",
             "c",
             run_loop.checkpoint(),
-            "provider_boundary",
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
         )
         .unwrap();
 
-        let mut restored = restore_latest_executor(&c, "r").unwrap().unwrap();
+        let (mut restored, safe_point) = restore_latest_executor(&c, "r").unwrap().unwrap();
+        assert_eq!(
+            safe_point,
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary
+        );
         assert!(matches!(
             restored.begin_next_round(false),
             crate::agent::kernel_executor::KernelRunPermit::Proceed { round: 2, .. }

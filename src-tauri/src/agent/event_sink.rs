@@ -4,7 +4,9 @@
 //! 同时产生可审计的 trajectory 事件，避免两套日志手写后发生漂移。
 
 use crate::agent::eval_trajectory::TrajectoryEvent;
-use crate::agent::kernel_executor::{KernelExecutorCheckpoint, KernelIoRunLoop};
+use crate::agent::kernel_executor::{
+    restore_executor_checkpoint_payload, KernelCheckpointSafePoint, KernelIoRunLoop,
+};
 use crate::agent::session_events::{append_event, latest_event_for_trace, SessionEventType};
 use crate::db::DbState;
 use rusqlite::Connection;
@@ -88,7 +90,9 @@ impl SessionTrajectorySink {
     ///
     /// adapter 的 messages、工具结果和验收证据尚未纳入该 checkpoint，因此调用方只能
     /// 把它作为内核状态恢复边界，不能据此宣称完整运行已经可续跑。
-    pub fn restore_latest_executor(&self) -> Result<Option<KernelIoRunLoop>, String> {
+    pub fn restore_latest_executor(
+        &self,
+    ) -> Result<Option<(KernelIoRunLoop, KernelCheckpointSafePoint)>, String> {
         let conn = self.conn.lock().map_err(|error| error.to_string())?;
         let Some(event) = latest_event_for_trace(
             &conn,
@@ -99,9 +103,9 @@ impl SessionTrajectorySink {
             return Ok(None);
         };
         drop(conn);
-        let checkpoint: KernelExecutorCheckpoint = serde_json::from_value(event.payload)
-            .map_err(|error| format!("executor checkpoint 反序列化失败：{error}"))?;
-        KernelIoRunLoop::restore(checkpoint).map(Some)
+        restore_executor_checkpoint_payload(event.payload)
+            .map(Some)
+            .map_err(|error| format!("executor checkpoint 反序列化失败：{error}"))
     }
 }
 
@@ -167,7 +171,11 @@ mod tests {
             run_loop.begin_next_round(false),
             KernelRunPermit::Proceed { round: 1, .. }
         ));
-        let checkpoint = serde_json::to_value(run_loop.checkpoint()).unwrap();
+        let checkpoint = crate::agent::kernel_executor::executor_checkpoint_payload(
+            run_loop.checkpoint(),
+            KernelCheckpointSafePoint::ProviderBoundary,
+        )
+        .unwrap();
         sink.append(
             SessionEventType::ExecutorCheckpoint,
             checkpoint.clone(),
@@ -176,7 +184,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut restored = sink.restore_latest_executor().unwrap().unwrap();
+        let (mut restored, safe_point) = sink.restore_latest_executor().unwrap().unwrap();
+        assert_eq!(safe_point, KernelCheckpointSafePoint::ProviderBoundary);
         assert!(matches!(
             restored.begin_next_round(false),
             KernelRunPermit::Proceed { round: 2, .. }

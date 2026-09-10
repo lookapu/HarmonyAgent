@@ -114,6 +114,13 @@ pub struct KernelIoClock {
 
 pub const KERNEL_EXECUTOR_CHECKPOINT_VERSION: u32 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelCheckpointSafePoint {
+    ProviderBoundary,
+    ToolResult,
+}
+
 /// 活跃 run-loop 的版本化恢复契约。与 final snapshot 不同，它保留 router/governor 的
 /// 完整内部状态；恢复时会把进程停止期间的墙钟时间计入预算，避免重启刷新 deadline。
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -122,6 +129,33 @@ pub struct KernelExecutorCheckpoint {
     pub checkpointed_at_ms: u64,
     pub elapsed_ms: u64,
     state: KernelExecutorState,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KernelExecutorCheckpointEnvelope {
+    #[serde(flatten)]
+    checkpoint: KernelExecutorCheckpoint,
+    safe_point: KernelCheckpointSafePoint,
+}
+
+pub fn executor_checkpoint_payload(
+    checkpoint: KernelExecutorCheckpoint,
+    safe_point: KernelCheckpointSafePoint,
+) -> Result<serde_json::Value, String> {
+    serde_json::to_value(KernelExecutorCheckpointEnvelope {
+        checkpoint,
+        safe_point,
+    })
+    .map_err(|error| error.to_string())
+}
+
+pub fn restore_executor_checkpoint_payload(
+    payload: serde_json::Value,
+) -> Result<(KernelIoRunLoop, KernelCheckpointSafePoint), String> {
+    let envelope: KernelExecutorCheckpointEnvelope =
+        serde_json::from_value(payload).map_err(|error| error.to_string())?;
+    let run_loop = KernelIoRunLoop::restore(envelope.checkpoint)?;
+    Ok((run_loop, envelope.safe_point))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -725,6 +759,29 @@ mod tests {
         assert!(KernelIoRunLoop::restore(checkpoint)
             .unwrap_err()
             .contains("schema_version"));
+    }
+
+    #[test]
+    fn checkpoint_envelope_requires_a_known_safe_point() {
+        let run_loop = KernelIoRunLoop::new(KernelExecutorLimits::default());
+        let payload = executor_checkpoint_payload(
+            run_loop.checkpoint(),
+            KernelCheckpointSafePoint::ToolResult,
+        )
+        .unwrap();
+        let (_, safe_point) = restore_executor_checkpoint_payload(payload.clone()).unwrap();
+        assert_eq!(safe_point, KernelCheckpointSafePoint::ToolResult);
+
+        for replacement in [Some(serde_json::json!("mid_tool")), None] {
+            let mut invalid = payload.clone();
+            match replacement {
+                Some(value) => invalid["safe_point"] = value,
+                None => {
+                    invalid.as_object_mut().unwrap().remove("safe_point");
+                }
+            }
+            assert!(restore_executor_checkpoint_payload(invalid).is_err());
+        }
     }
 
     #[test]

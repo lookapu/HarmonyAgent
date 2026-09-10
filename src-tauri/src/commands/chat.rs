@@ -899,7 +899,7 @@ fn persist_desktop_executor_checkpoint(
     run_id: &str,
     conversation_id: &str,
     run_loop: &KernelIoRunLoop,
-    safe_point: &str,
+    safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
 ) -> Result<(), ChatFlowError> {
     let conn = state.0.lock().map_err(|error| error.to_string())?;
     crate::agent::runtime::append_executor_checkpoint(
@@ -4302,7 +4302,7 @@ async fn stream_chat_inner(
             &trace_id,
             &conversation_id,
             &kernel_executor,
-            "provider_boundary",
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
         )?;
         // 任务心跳打点（每轮循环顶部）：配合工具/请求/压缩日志，任何卡点都能从最后一条
         // 心跳定位到所在阶段——此前卡在无超时请求内时日志静默，事后无法定位“空跑”位置
@@ -5435,7 +5435,7 @@ async fn stream_chat_inner(
                             &trace_id,
                             &conversation_id,
                             &kernel_executor,
-                            "tool_result",
+                            crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                         )?;
                         pending.clear();
                         if intercepted {
@@ -5490,7 +5490,7 @@ async fn stream_chat_inner(
                         &trace_id,
                         &conversation_id,
                         &kernel_executor,
-                        "tool_result",
+                        crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                     )?;
                     pending.clear();
                     if intercepted {
@@ -5950,7 +5950,7 @@ async fn stream_chat_inner(
                 &trace_id,
                 &conversation_id,
                 &kernel_executor,
-                "tool_result",
+                crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
             )?;
             }
             // for 结束：排空剩余只读批次（本轮全部输出只读工具时）
@@ -5999,7 +5999,7 @@ async fn stream_chat_inner(
                     &trace_id,
                     &conversation_id,
                     &kernel_executor,
-                    "tool_result",
+                    crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                 )?;
                 if intercepted {
                     exhausted = true;

@@ -12,9 +12,10 @@ use crate::agent::agent_kernel::{
     KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
 };
 use crate::agent::kernel_executor::{
-    KernelExecutorCheckpoint, KernelExecutorFinalization, KernelExecutorLimits,
-    KernelExecutorState, KernelIoClock, KernelIoPort, KernelIoRoundControl, KernelIoRunExit,
-    KernelIoRunLoop, KernelToolAttemptDecision,
+    executor_checkpoint_payload, KernelCheckpointSafePoint, KernelExecutorCheckpoint,
+    KernelExecutorFinalization, KernelExecutorLimits, KernelExecutorState, KernelIoClock,
+    KernelIoPort, KernelIoRoundControl, KernelIoRunExit, KernelIoRunLoop,
+    KernelToolAttemptDecision,
 };
 use crate::agent::kernel_loop::{KernelRoundControl, KernelRoundInput};
 use crate::agent::kernel_history::continuation_instruction;
@@ -72,11 +73,10 @@ fn bounded_tool_output(value: String) -> (String, bool) {
 fn append_executor_checkpoint_value(
     sink: &mut SessionTrajectorySink,
     checkpoint: KernelExecutorCheckpoint,
-    safe_point: &'static str,
+    safe_point: KernelCheckpointSafePoint,
 ) -> Result<(), AgentDriverError> {
-    let mut checkpoint = serde_json::to_value(checkpoint)
+    let checkpoint = executor_checkpoint_payload(checkpoint, safe_point)
         .map_err(|error| AgentDriverError::Failed(error.to_string()))?;
-    checkpoint["safe_point"] = json!(safe_point);
     sink.append(
         SessionEventType::ExecutorCheckpoint,
         checkpoint.clone(),
@@ -555,7 +555,11 @@ impl KernelIoPort for HeadlessIoPort<'_> {
         &mut self,
         checkpoint: KernelExecutorCheckpoint,
     ) -> Result<(), Self::Error> {
-        append_executor_checkpoint_value(self.sink, checkpoint, "provider_boundary")
+        append_executor_checkpoint_value(
+            self.sink,
+            checkpoint,
+            KernelCheckpointSafePoint::ProviderBoundary,
+        )
     }
 
     fn run_round<'a>(
@@ -896,7 +900,7 @@ impl KernelIoPort for HeadlessIoPort<'_> {
                 append_executor_checkpoint_value(
                     self.sink,
                     clock.checkpoint(executor),
-                    "tool_result",
+                    KernelCheckpointSafePoint::ToolResult,
                 )?;
             }
             Ok(KernelIoRoundControl::Continue)
