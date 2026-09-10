@@ -67,7 +67,7 @@ HarmonyAgent 当前**不具备默认 OS 级命令沙箱**：
 
 任何平台如果不能建立所声明的边界，必须返回 `sandbox_unavailable` 并失败关闭，不能静默切换到 `host-direct`。
 
-当前实现进度：`src-tauri/src/agent/sandbox.rs` 已提供 `SandboxBackend`/`OciBackend`、固定 digest 的 OCI 安全 argv、wall-time/取消处理、命名容器清理、输出预算和运行事件；同时提供稳定的原生/OCI capability 清单与 Tauri 探测入口。macOS/Linux 探测会实际启动无副作用的最小隔离域，Windows AppContainer 在 token/profile/ACL 生命周期完成前保持 unavailable；探测不会下载镜像或执行用户命令。平台原生后端尚未接入 `run_command`，因此当前产品能力仍按第 2 节的宿主执行边界对外说明。
+当前实现进度：`src-tauri/src/agent/sandbox.rs` 已提供 `SandboxBackend`/`OciBackend`、固定 digest 的 OCI 安全 argv、wall-time/取消处理、命名容器清理、输出预算和运行事件；同时提供稳定的原生/OCI capability 清单与 Tauri 探测入口，环境管理页以只读能力卡片展示真实状态和失败原因。macOS/Linux 探测会实际启动无副作用的最小隔离域，Windows AppContainer 在 token/profile/ACL 生命周期完成前保持 unavailable；探测不会下载镜像或执行用户命令。平台原生后端尚未接入 `run_command`，因此当前产品能力仍按第 2 节的宿主执行边界对外说明。
 
 ## 6. Sandbox Backend 最低契约
 

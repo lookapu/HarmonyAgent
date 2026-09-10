@@ -24,6 +24,7 @@ import { useProjectStore } from '../stores/projectStore'
 import { getJSON, setItem } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
 import { Skeleton } from '../components/ui/Spinner'
+import SandboxCapabilityPanel from '../components/SandboxCapabilityPanel'
 
 /** 版本号比较：v22.14.0 vs 22.13.0；返回 a-b 差值（>0 表示 a 新）。
  *  非数字段（如 git 的 windows 段）退化为字符串比较，兼容 Git for Windows 版本号。 */
@@ -764,6 +765,8 @@ export default function HealthPage() {
           </div>
         )}
       </div>
+
+      <SandboxCapabilityPanel />
 
       {/* 鸿蒙 SDK / command-line-tools 环境：自动探测 + 手动指定（后端持久化） */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.harmonyEnvTitle')}</h3>
@@ -1586,7 +1589,6 @@ export default function HealthPage() {
     </div>
   )
 }
-
 
 
 
