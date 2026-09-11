@@ -27,6 +27,12 @@ pub enum HostCapability {
     ReadHilog { device: String, level: Option<String>, tag: Option<String> },
     /// 兼容旧设备的有限行 logcat 查询。
     ReadLogcat { device: String, lines: u64 },
+    /// 把工作区内普通文件发送到设备绝对路径。
+    SendFile { device: String, local_path: String, remote_path: String },
+    /// 把设备绝对路径拉取到工作区内。
+    ReceiveFile { device: String, remote_path: String, local_path: String },
+    /// 强制停止明确 bundle 的应用进程。
+    StopAbility { device: String, bundle: String },
     /// 安装构建产物到设备（路径必须位于项目工作树内）。
     InstallHap { device: Option<String>, hap_path: String, replace: bool },
     /// 拉起一个已安装应用的明确 ability。
@@ -47,6 +53,9 @@ impl HostCapability {
             Self::DevicePidof { .. } => "device.pidof",
             Self::ReadHilog { .. } => "device.read_hilog",
             Self::ReadLogcat { .. } => "device.read_logcat",
+            Self::SendFile { .. } => "device.file_send",
+            Self::ReceiveFile { .. } => "device.file_receive",
+            Self::StopAbility { .. } => "device.stop_ability",
             Self::InstallHap { .. } => "deploy.install",
             Self::StartAbility { .. } => "deploy.start_ability",
             Self::Deploy { .. } => "deploy",
@@ -82,6 +91,16 @@ impl HostCapability {
                     return Err("logcat lines 必须在 10-1000 之间".into());
                 }
                 Ok(())
+            }
+            Self::SendFile { device, local_path, remote_path }
+            | Self::ReceiveFile { device, remote_path, local_path } => {
+                validate_device_target(device)?;
+                validate_workspace_relative_path(local_path)?;
+                validate_device_path(remote_path)
+            }
+            Self::StopAbility { device, bundle } => {
+                validate_device_target(device)?;
+                validate_app_identifier(bundle, "bundle")
             }
             Self::InstallHap { device, hap_path, .. } | Self::Deploy { device, hap_path } => {
                 if let Some(device) = device {
@@ -165,6 +184,14 @@ fn request_material(capability: &HostCapability) -> String {
             tag.as_deref().unwrap_or("").trim(),
         ),
         HostCapability::ReadLogcat { device, lines } => format!("{}\0{lines}", device.trim()),
+        HostCapability::SendFile { device, local_path, remote_path }
+        | HostCapability::ReceiveFile { device, remote_path, local_path } => format!(
+            "{}\0{}\0{}",
+            device.trim(), local_path.trim(), remote_path.trim(),
+        ),
+        HostCapability::StopAbility { device, bundle } => {
+            format!("{}\0{}", device.trim(), bundle.trim())
+        }
         HostCapability::InstallHap { device, hap_path, replace } => format!(
             "{}\0{}\0{replace}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
         ),
@@ -208,6 +235,37 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
         HostCapability::ReadLogcat { device, lines } => (
             vec![
                 "-t".into(), device.trim().into(), "logcat".into(), "-T".into(), lines.to_string(),
+            ],
+            20,
+        ),
+        HostCapability::SendFile { device, local_path, remote_path } => {
+            let local = resolve_workspace_source(
+                workspace.ok_or("device.file_send 需要明确的项目工作区")?, local_path,
+            )?;
+            (
+                vec![
+                    "-t".into(), device.trim().into(), "file".into(), "send".into(),
+                    local.to_string_lossy().into_owned(), remote_path.trim().into(),
+                ],
+                120,
+            )
+        }
+        HostCapability::ReceiveFile { device, remote_path, local_path } => {
+            let local = resolve_workspace_destination(
+                workspace.ok_or("device.file_receive 需要明确的项目工作区")?, local_path,
+            )?;
+            (
+                vec![
+                    "-t".into(), device.trim().into(), "file".into(), "recv".into(),
+                    remote_path.trim().into(), local.to_string_lossy().into_owned(),
+                ],
+                120,
+            )
+        }
+        HostCapability::StopAbility { device, bundle } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "aa".into(),
+                "force-stop".into(), bundle.trim().into(),
             ],
             20,
         ),
@@ -431,6 +489,44 @@ fn resolve_workspace_artifact(workspace: &Path, relative: &str) -> Result<std::p
     Ok(artifact)
 }
 
+fn resolve_workspace_source(workspace: &Path, relative: &str) -> Result<std::path::PathBuf, String> {
+    let root = workspace.canonicalize().map_err(|e| format!("无法解析项目工作区：{e}"))?;
+    let source = root
+        .join(relative.trim())
+        .canonicalize()
+        .map_err(|e| format!("无法解析工作区源文件：{e}"))?;
+    if !source.starts_with(&root) || !source.is_file() {
+        return Err("本地源必须是项目工作区内的普通文件".into());
+    }
+    Ok(source)
+}
+
+fn resolve_workspace_destination(
+    workspace: &Path,
+    relative: &str,
+) -> Result<std::path::PathBuf, String> {
+    let root = workspace.canonicalize().map_err(|e| format!("无法解析项目工作区：{e}"))?;
+    let requested = root.join(relative.trim());
+    if requested.exists() {
+        let destination = requested
+            .canonicalize()
+            .map_err(|e| format!("无法解析工作区目标文件：{e}"))?;
+        if !destination.starts_with(&root) || !destination.is_file() {
+            return Err("本地目标必须是项目工作区内的普通文件".into());
+        }
+        return Ok(destination);
+    }
+    let parent = requested.parent().ok_or("本地目标缺少父目录")?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("无法解析本地目标父目录：{e}"))?;
+    if !canonical_parent.starts_with(&root) {
+        return Err("本地目标父目录通过符号链接逃逸项目工作区".into());
+    }
+    let file_name = requested.file_name().ok_or("本地目标缺少文件名")?;
+    Ok(canonical_parent.join(file_name))
+}
+
 fn validate_app_identifier(value: &str, label: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty() || value.len() > 256
@@ -456,6 +552,17 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         }),
         HostCapability::ReadLogcat { device, lines } => serde_json::json!({
             "device_digest": short_digest(device), "lines": lines,
+        }),
+        HostCapability::SendFile { device, local_path, remote_path } => serde_json::json!({
+            "device_digest": short_digest(device), "local_path": local_path,
+            "remote_digest": short_digest(remote_path),
+        }),
+        HostCapability::ReceiveFile { device, remote_path, local_path } => serde_json::json!({
+            "device_digest": short_digest(device), "remote_digest": short_digest(remote_path),
+            "local_path": local_path,
+        }),
+        HostCapability::StopAbility { device, bundle } => serde_json::json!({
+            "device_digest": short_digest(device), "bundle": bundle,
         }),
         HostCapability::InstallHap { device, hap_path, replace } => serde_json::json!({
             "device_digest": device.as_deref().map(short_digest), "artifact": hap_path, "replace": replace,
@@ -502,6 +609,34 @@ fn validate_log_tag(tag: &str) -> Result<(), String> {
     let tag = tag.trim();
     if tag.is_empty() || tag.len() > 128 || tag.chars().any(char::is_control) {
         return Err("hilog tag 不能为空、不得含控制字符且最多 128 字符".into());
+    }
+    Ok(())
+}
+
+fn validate_workspace_relative_path(path: &str) -> Result<(), String> {
+    let path = path.trim();
+    let parsed = Path::new(path);
+    if path.is_empty() || parsed.is_absolute() {
+        return Err("本地文件路径必须是项目工作区内的相对路径".into());
+    }
+    if parsed.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return Err("本地文件路径不得包含上级目录或根目录".into());
+    }
+    Ok(())
+}
+
+fn validate_device_path(path: &str) -> Result<(), String> {
+    let path = path.trim();
+    if !path.starts_with('/') || path.len() > 1024 || path.chars().any(char::is_control) {
+        return Err("设备路径必须是无控制字符且不超过 1024 字符的绝对路径".into());
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        return Err("设备路径不得包含上级目录 ..".into());
     }
     Ok(())
 }
@@ -620,6 +755,95 @@ mod tests {
         assert!(HostCapability::ReadLogcat { device: "ABC123".into(), lines: 9 }
             .validate()
             .is_err());
+    }
+
+    #[test]
+    fn file_transfer_and_stop_use_scoped_fixed_argv() {
+        let root = std::env::temp_dir().join(format!("harmony-transfer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("in")).unwrap();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("in/data.bin"), b"data").unwrap();
+        let send = prepare_invocation(
+            &HostCapability::SendFile {
+                device: "ABC123".into(),
+                local_path: "in/data.bin".into(),
+                remote_path: "/data/local/tmp/data.bin".into(),
+            },
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(&send.args[..4], ["-t", "ABC123", "file", "send"]);
+        assert!(send.args[4].ends_with("in/data.bin"));
+        assert_eq!(send.args[5], "/data/local/tmp/data.bin");
+        let receive = prepare_invocation(
+            &HostCapability::ReceiveFile {
+                device: "ABC123".into(),
+                remote_path: "/data/local/tmp/result.txt".into(),
+                local_path: "out/result.txt".into(),
+            },
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(&receive.args[..4], ["-t", "ABC123", "file", "recv"]);
+        assert!(receive.args[5].ends_with("out/result.txt"));
+        let stop = prepare_invocation(
+            &HostCapability::StopAbility {
+                device: "ABC123".into(),
+                bundle: "com.example.app".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            stop.args,
+            vec!["-t", "ABC123", "shell", "aa", "force-stop", "com.example.app"]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn file_transfer_rejects_external_local_and_ambiguous_device_paths() {
+        assert!(HostCapability::SendFile {
+            device: "ABC123".into(),
+            local_path: "/tmp/secret".into(),
+            remote_path: "/data/local/tmp/secret".into(),
+        }
+        .validate()
+        .is_err());
+        assert!(HostCapability::ReceiveFile {
+            device: "ABC123".into(),
+            remote_path: "/data/../secret".into(),
+            local_path: "out/secret".into(),
+        }
+        .validate()
+        .is_err());
+        assert!(HostCapability::ReceiveFile {
+            device: "ABC123".into(),
+            remote_path: "relative/file".into(),
+            local_path: "out/file".into(),
+        }
+        .validate()
+        .is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let root = std::env::temp_dir().join(format!("harmony-recv-{}", uuid::Uuid::new_v4()));
+            let external = std::env::temp_dir().join(format!("harmony-recv-out-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&external).unwrap();
+            symlink(&external, root.join("escape")).unwrap();
+            let result = prepare_invocation(
+                &HostCapability::ReceiveFile {
+                    device: "ABC123".into(),
+                    remote_path: "/data/local/tmp/file".into(),
+                    local_path: "escape/file".into(),
+                },
+                Some(&root),
+            );
+            assert!(result.is_err());
+            std::fs::remove_dir_all(root).ok();
+            std::fs::remove_dir_all(external).ok();
+        }
     }
 
     #[test]

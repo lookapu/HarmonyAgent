@@ -378,7 +378,11 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
     ))
 }
 
-pub(super) async fn device_file(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn device_file(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("").trim();
     if action != "push" && action != "pull" {
         return Err("device_file 参数 action 仅支持 push 或 pull".into());
@@ -391,32 +395,58 @@ pub(super) async fn device_file(args: &Value, roots: &[String]) -> Result<String
     let Some(remote) = remote else {
         return Err("device_file 需要 remote（设备端路径）".into());
     };
-    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    let project_path = roots.first().map(String::as_str).filter(|path| !path.is_empty())
+        .ok_or("device_file 需要绑定项目工作区")?;
+    let project_root = Path::new(project_path)
+        .canonicalize()
+        .map_err(|e| format!("无法解析项目工作区：{e}"))?;
     let local_arg = args["local"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+    if let Some(local) = local_arg {
+        let path = Path::new(local);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir)
+            })
+        {
+            return Err("device_file 的 local 必须是工作区内且不含 .. 的相对路径".into());
+        }
+    }
     match action {
         "push" => {
             let local = local_arg.ok_or_else(|| "push 需要 local（本地文件路径）".to_string())?;
-            let local_path = resolve_local_path(local, project_path);
-            if !local_path.is_file() {
-                return Err(format!("本地文件不存在：{}", local_path.display()));
+            let requested = resolve_local_path(local, project_path);
+            let local_path = requested
+                .canonicalize()
+                .map_err(|e| format!("无法解析本地文件：{e}"))?;
+            if !local_path.starts_with(&project_root) || !local_path.is_file() {
+                return Err("push 的本地源必须是项目工作区内的普通文件".into());
             }
-            let hdc_args: Vec<String> = vec![
-                "-t".into(), device.clone(), "file".into(), "send".into(),
-                local_path.to_string_lossy().to_string(), remote.to_string(),
-            ];
-            run_cmd("hdc", &hdc_args, None, 120).await.map_err(|e| format!("推送失败：{e}"))?;
+            let relative = local_path
+                .strip_prefix(&project_root)
+                .map_err(|_| "无法把本地源转换为工作区相对路径")?
+                .to_string_lossy()
+                .into_owned();
+            let capability = crate::agent::capability_broker::HostCapability::SendFile {
+                device: device.clone(), local_path: relative, remote_path: remote.to_string(),
+            };
+            let output = crate::agent::capability_broker::execute_host_capability(
+                &capability, Some(&project_root), ctx,
+            )
+            .await
+            .map_err(|e| format!("推送失败：{e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "推送失败：{}",
+                    (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim()
+                ));
+            }
             Ok(format!("已推送 {} → {remote}（设备 {device}）", local_path.display()))
         }
         "pull" => {
             let local_path = match local_arg {
                 Some(l) => resolve_local_path(l, project_path),
                 None => {
-                    // 缺省保存到工程 .deveco-agent/files/（无工程时用系统临时目录）
-                    let base = if project_path.is_empty() {
-                        std::env::temp_dir().join("deveco-agent-files")
-                    } else {
-                        Path::new(project_path).join(".deveco-agent").join("files")
-                    };
+                    let base = project_root.join(".deveco-agent").join("files");
                     let fname = Path::new(remote)
                         .file_name()
                         .map(|f| f.to_string_lossy().to_string())
@@ -424,14 +454,43 @@ pub(super) async fn device_file(args: &Value, roots: &[String]) -> Result<String
                     base.join(fname)
                 }
             };
-            if let Some(parent) = local_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            let requested_parent = local_path.parent().ok_or("pull 的本地目标缺少父目录")?;
+            let mut existing_ancestor = requested_parent;
+            while !existing_ancestor.exists() {
+                existing_ancestor = existing_ancestor.parent().ok_or("pull 的本地目标无法定位工作区祖先")?;
             }
-            let hdc_args: Vec<String> = vec![
-                "-t".into(), device.clone(), "file".into(), "recv".into(),
-                remote.to_string(), local_path.to_string_lossy().to_string(),
-            ];
-            run_cmd("hdc", &hdc_args, None, 120).await.map_err(|e| format!("拉取失败：{e}"))?;
+            let ancestor = existing_ancestor
+                .canonicalize().map_err(|e| format!("无法解析本地目标祖先目录：{e}"))?;
+            if !ancestor.starts_with(&project_root) {
+                return Err("pull 的本地目标父目录通过符号链接逃逸项目工作区".into());
+            }
+            std::fs::create_dir_all(requested_parent).map_err(|e| e.to_string())?;
+            let parent = requested_parent
+                .canonicalize().map_err(|e| format!("无法解析本地目标父目录：{e}"))?;
+            if !parent.starts_with(&project_root) {
+                return Err("pull 的本地目标必须位于项目工作区内，且父目录不得通过符号链接逃逸".into());
+            }
+            let file_name = local_path.file_name().ok_or("pull 的本地目标缺少文件名")?;
+            let local_path = parent.join(file_name);
+            let relative = local_path
+                .strip_prefix(&project_root)
+                .map_err(|_| "无法把本地目标转换为工作区相对路径")?
+                .to_string_lossy()
+                .into_owned();
+            let capability = crate::agent::capability_broker::HostCapability::ReceiveFile {
+                device: device.clone(), remote_path: remote.to_string(), local_path: relative,
+            };
+            let output = crate::agent::capability_broker::execute_host_capability(
+                &capability, Some(&project_root), ctx,
+            )
+            .await
+            .map_err(|e| format!("拉取失败：{e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "拉取失败：{}",
+                    (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim()
+                ));
+            }
             if !local_path.exists() {
                 return Err("拉取失败：本地文件未生成（设备端路径可能不存在或权限受限）".into());
             }
@@ -452,7 +511,11 @@ pub(super) fn resolve_local_path(p: &str, project_path: &str) -> PathBuf {
     }
 }
 
-pub(super) async fn stop_app(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn stop_app(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -469,7 +532,17 @@ pub(super) async fn stop_app(args: &Value, roots: &[String]) -> Result<String, S
                 .ok_or_else(|| "未指定 bundle 且工程未解析出 bundleName".to_string())?
         }
     };
-    run_hdc_shell(&device, &["aa", "force-stop", &bundle], 20).await?;
+    let capability = crate::agent::capability_broker::HostCapability::StopAbility {
+        device: device.clone(), bundle: bundle.clone(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "停止应用失败：{}",
+            (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim()
+        ));
+    }
     Ok(format!(
         "已强制停止 {bundle}（设备 {device}）。\n后续建议：start_ability 重新启动验证冷启动；collect_perf 采样冷启动性能。"
     ))
