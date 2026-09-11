@@ -159,7 +159,12 @@ pub(super) async fn auto_explore(
         // 检查是否已访问过
         if visited_signatures.iter().any(|s| s == &sig) {
             // 已访问，返回
-            let _ = super::test_tools::execute_ui_step(&device, &serde_json::json!({"action": "key", "name": "back"})).await;
+            let _ = super::test_tools::execute_ui_step(
+                &device,
+                &serde_json::json!({"action": "key", "name": "back"}),
+                ctx,
+            )
+            .await;
             tokio::time::sleep(Duration::from_millis(delay_ms / 2)).await;
             continue;
         }
@@ -258,7 +263,12 @@ pub(super) async fn back_to_root(
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) {
     for _ in 0..max_back.max(1) {
-        let _ = super::test_tools::execute_ui_step(device, &serde_json::json!({"action": "key", "name": "back"})).await;
+        let _ = super::test_tools::execute_ui_step(
+            device,
+            &serde_json::json!({"action": "key", "name": "back"}),
+            ctx,
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         if let Some(sig) = page_signature_now(workspace, out_dir, device, ctx).await {
             if sig == root_signature {
@@ -296,7 +306,12 @@ pub(super) async fn click_nth_clickable(
     let (x, y) = find_nth_clickable_center(&content, idx)
         .ok_or_else(|| format!("未找到第 {} 个可点击元素", idx + 1))?;
 
-    super::test_tools::execute_ui_step(device, &serde_json::json!({"action": "tap", "x": x, "y": y})).await?;
+    super::test_tools::execute_ui_step(
+        device,
+        &serde_json::json!({"action": "tap", "x": x, "y": y}),
+        ctx,
+    )
+    .await?;
     Ok(())
 }
 

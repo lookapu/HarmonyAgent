@@ -72,7 +72,9 @@ pub(super) async fn run_perf_benchmark(
     let mut flow_report = String::new();
     if let Some(steps) = args["steps"].as_array() {
         if !steps.is_empty() {
-            flow_report = super::test_tools::execute_ui_steps(&device, steps).await.join("\n");
+            flow_report = super::test_tools::execute_ui_steps(&device, steps, ctx)
+                .await
+                .join("\n");
             if flow_report.contains("→ 失败") {
                 return Err(format!("性能基准的前置 UI 流程失败，已停止采样：\n{flow_report}"));
             }
@@ -1433,7 +1435,11 @@ pub(super) fn parse_ui_record_csv(csv: &str) -> (Vec<serde_json::Value>, u64) {
 }
 
 /// replay_ui：回放录制的 UI 操作。
-pub(super) async fn replay_ui(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn replay_ui(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -1481,7 +1487,7 @@ pub(super) async fn replay_ui(args: &Value, roots: &[String]) -> Result<String, 
         prev_ts = step["ts"].as_u64();
 
         let desc = step["desc"].as_str().unwrap_or(&super::test_tools::describe_step(step)).to_string();
-        match super::test_tools::execute_ui_step(&device, step).await {
+        match super::test_tools::execute_ui_step(&device, step, ctx).await {
             Ok(info) => {
                 let suffix = if info.is_empty() { String::new() } else { format!("（{info}）") };
                 results.push(format!("{}. {desc} → 成功{suffix}", i + 1));
@@ -1503,7 +1509,11 @@ pub(super) async fn replay_ui(args: &Value, roots: &[String]) -> Result<String, 
 
 /// [54] gesture_perform：单次触摸/输入手势注入（tap/swipe/longPress/doubleTap/text/key）。
 /// 坐标可直接使用 ui_locator 输出中的推荐点击坐标（bounds 中心点）。
-pub(super) async fn gesture_perform(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn gesture_perform(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -1538,6 +1548,7 @@ pub(super) async fn gesture_perform(args: &Value, roots: &[String]) -> Result<St
                 super::test_tools::execute_ui_step(
                     &device,
                     &serde_json::json!({"action": "tap", "x": x, "y": y}),
+                    ctx,
                 )
                 .await?;
                 tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1558,7 +1569,7 @@ pub(super) async fn gesture_perform(args: &Value, roots: &[String]) -> Result<St
             ))
         }
     }
-    super::test_tools::execute_ui_step(&device, &step).await.map(|info| {
+    super::test_tools::execute_ui_step(&device, &step, ctx).await.map(|info| {
         let mut out = format!("手势已执行（设备 {device}，action={action}）\n");
         if !info.is_empty() {
             out.push_str(&format!("补充：{info}\n"));
@@ -1760,7 +1771,11 @@ fn scan_hap_sizes(path: &std::path::Path) -> Result<(u64, std::collections::BTre
 /// [53] ui_locator：按文字/类型在设备当前界面控件树中定位元素，返回坐标与可点击信息。
 /// 数据来源：path 参数给本地 dumpLayout JSON（离线复用），或现场 hdc 采集后自动清理。
 /// 输出匹配项清单 + 推荐项中心坐标（可直接给 run_ui_flow 的 tap 使用）。
-pub(super) async fn ui_locator(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn ui_locator(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let text = args["text"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let ctype = args["type"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let index = args["index"].as_u64().unwrap_or(0) as usize;
@@ -1774,25 +1789,20 @@ pub(super) async fn ui_locator(args: &Value, roots: &[String]) -> Result<String,
             std::fs::read_to_string(&resolved).map_err(|e| format!("读取 {} 失败: {e}", resolved.display()))?
         }
         None => {
+            let project_path = roots.first().map(String::as_str).unwrap_or("");
+            if project_path.is_empty() {
+                return Err("当前会话未绑定项目目录，无法采集控件树".into());
+            }
             let device = match args["device"].as_str() {
                 Some(d) => d.to_string(),
                 None => default_device_id().await?,
             };
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let dev_file = format!("/data/local/tmp/ui_dump_{}.json", ts);
-            run_hdc_shell(&device, &["uitest", "dumpLayout", "-p", &dev_file], 30).await
-                .map_err(|e| format!("控件树导出失败：{e}"))?;
-            let tmp = std::env::temp_dir().join(format!("ui_dump_{ts}.json"));
-            let hdc_args = vec![
-                "-s".to_string(), device.clone(), "file".to_string(), "recv".to_string(),
-                dev_file.clone(), tmp.to_string_lossy().to_string(),
-            ];
-            run_cmd("hdc", &hdc_args, None, 30).await
-                .map_err(|e| format!("拉取控件树失败: {e}"))?;
-            let content = std::fs::read_to_string(&tmp).map_err(|e| format!("读取控件树失败: {e}"))?;
+            let (workspace, local_dir) = ensure_workspace_subdir(project_path, ".deveco-agent/ui")?;
+            let tmp = local_dir.join(format!(
+                ".locator-{}.json",
+                uuid::Uuid::new_v4().simple(),
+            ));
+            let content = capture_ui_layout_file(&workspace, &device, &tmp, ctx).await?;
             let _ = std::fs::remove_file(&tmp);
             content
         }

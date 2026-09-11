@@ -23,6 +23,16 @@ pub enum DeviceScreenshotBackend {
     Screencap,
 }
 
+/// Broker 支持的有限 UI 输入动作。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceUiAction {
+    Click { x: i64, y: i64 },
+    Swipe { x1: i64, y1: i64, x2: i64, y2: i64, speed: i64 },
+    LongClick { x: i64, y: i64 },
+    Text { text: String },
+    Key { name: String },
+}
+
 impl DeviceScreenshotBackend {
     fn as_str(self) -> &'static str {
         match self {
@@ -101,6 +111,8 @@ pub enum HostCapability {
     DumpUiLayout { device: String, remote_path: String },
     /// 删除 Broker 管理的单个设备临时文件。
     RemoveDeviceTempFile { device: String, remote_path: String },
+    /// 注入一个经过类型化与有界校验的 UI 动作。
+    DeviceUiInput { device: String, operation_id: String, action: DeviceUiAction },
     /// 强制停止明确 bundle 的应用进程。
     StopAbility { device: String, bundle: String },
     /// 卸载明确 bundle；用于新装部署失败后的补偿。
@@ -137,6 +149,7 @@ impl HostCapability {
             Self::CaptureDeviceScreenshot { .. } => "device.screenshot.capture",
             Self::DumpUiLayout { .. } => "device.ui_layout.dump",
             Self::RemoveDeviceTempFile { .. } => "device.temp_file.remove",
+            Self::DeviceUiInput { .. } => "device.ui_input",
             Self::StopAbility { .. } => "device.stop_ability",
             Self::UninstallBundle { .. } => "deploy.uninstall_bundle",
             Self::InstallHap { .. } => "deploy.install",
@@ -230,6 +243,11 @@ impl HostCapability {
             | Self::RemoveDeviceTempFile { device, remote_path } => {
                 validate_device_target(device)?;
                 validate_managed_device_temp_path(remote_path)
+            }
+            Self::DeviceUiInput { device, operation_id, action } => {
+                validate_device_target(device)?;
+                validate_operation_id(operation_id)?;
+                validate_device_ui_action(action)
             }
             Self::StopAbility { device, bundle } | Self::UninstallBundle { device, bundle } => {
                 validate_device_target(device)?;
@@ -358,6 +376,14 @@ fn request_material(capability: &HostCapability) -> String {
         HostCapability::DumpUiLayout { device, remote_path }
         | HostCapability::RemoveDeviceTempFile { device, remote_path } => {
             format!("{}\0{}", device.trim(), remote_path.trim())
+        }
+        HostCapability::DeviceUiInput { device, operation_id, action } => {
+            format!(
+                "{}\0{}\0{}",
+                device.trim(),
+                operation_id.trim(),
+                device_ui_action_material(action),
+            )
         }
         HostCapability::StopAbility { device, bundle }
         | HostCapability::UninstallBundle { device, bundle } => {
@@ -537,6 +563,33 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             ],
             10,
         ),
+        HostCapability::DeviceUiInput { device, action, .. } => {
+            let mut args = vec![
+                "-t".into(), device.trim().into(), "shell".into(), "uitest".into(),
+                "uiInput".into(),
+            ];
+            match action {
+                DeviceUiAction::Click { x, y } => {
+                    args.extend(["click".into(), x.to_string(), y.to_string()]);
+                }
+                DeviceUiAction::Swipe { x1, y1, x2, y2, speed } => {
+                    args.extend([
+                        "swipe".into(), x1.to_string(), y1.to_string(), x2.to_string(),
+                        y2.to_string(), speed.to_string(),
+                    ]);
+                }
+                DeviceUiAction::LongClick { x, y } => {
+                    args.extend(["longClick".into(), x.to_string(), y.to_string()]);
+                }
+                DeviceUiAction::Text { text } => {
+                    args.extend(["text".into(), text.clone()]);
+                }
+                DeviceUiAction::Key { name } => {
+                    args.extend(["keyEvent".into(), name.clone()]);
+                }
+            }
+            (args, 20)
+        }
         HostCapability::StopAbility { device, bundle } => (
             vec![
                 "-t".into(), device.trim().into(), "shell".into(), "aa".into(),
@@ -886,6 +939,11 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         | HostCapability::RemoveDeviceTempFile { device, remote_path } => serde_json::json!({
             "device_digest": short_digest(device), "remote_digest": short_digest(remote_path),
         }),
+        HostCapability::DeviceUiInput { device, operation_id, action } => serde_json::json!({
+            "device_digest": short_digest(device),
+            "operation_digest": short_digest(operation_id),
+            "action": device_ui_action_audit(action),
+        }),
         HostCapability::StopAbility { device, bundle }
         | HostCapability::UninstallBundle { device, bundle } => serde_json::json!({
             "device_digest": short_digest(device), "bundle": bundle,
@@ -992,6 +1050,80 @@ fn validate_managed_device_temp_path(path: &str) -> Result<(), String> {
         return Err("设备临时文件必须是受管前缀下的安全 .png/.json/.mp4 basename".into());
     }
     Ok(())
+}
+
+fn validate_device_ui_action(action: &DeviceUiAction) -> Result<(), String> {
+    let coordinate = |value: i64| (0..=100_000).contains(&value);
+    match action {
+        DeviceUiAction::Click { x, y } | DeviceUiAction::LongClick { x, y } => {
+            if !coordinate(*x) || !coordinate(*y) {
+                return Err("UI 坐标必须在 0-100000 之间".into());
+            }
+        }
+        DeviceUiAction::Swipe { x1, y1, x2, y2, speed } => {
+            if ![*x1, *y1, *x2, *y2].into_iter().all(coordinate) {
+                return Err("UI 滑动坐标必须在 0-100000 之间".into());
+            }
+            if !(1..=10_000).contains(speed) {
+                return Err("UI 滑动速度必须在 1-10000 之间".into());
+            }
+        }
+        DeviceUiAction::Text { text } => {
+            if text.is_empty() || text.len() > 2_000 || text.chars().any(|ch| ch == '\0' || ch.is_control()) {
+                return Err("UI 输入文本不能为空、不得含控制字符且最多 2000 字节".into());
+            }
+        }
+        DeviceUiAction::Key { name } => {
+            if name.is_empty()
+                || name.len() > 32
+                || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            {
+                return Err("UI 按键名非法".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_id(operation_id: &str) -> Result<(), String> {
+    let value = operation_id.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err("UI 动作 operation_id 非法".into());
+    }
+    Ok(())
+}
+
+fn device_ui_action_material(action: &DeviceUiAction) -> String {
+    match action {
+        DeviceUiAction::Click { x, y } => format!("click\0{x}\0{y}"),
+        DeviceUiAction::Swipe { x1, y1, x2, y2, speed } => {
+            format!("swipe\0{x1}\0{y1}\0{x2}\0{y2}\0{speed}")
+        }
+        DeviceUiAction::LongClick { x, y } => format!("long_click\0{x}\0{y}"),
+        DeviceUiAction::Text { text } => format!("text\0{}", short_digest(text)),
+        DeviceUiAction::Key { name } => format!("key\0{name}"),
+    }
+}
+
+fn device_ui_action_audit(action: &DeviceUiAction) -> serde_json::Value {
+    match action {
+        DeviceUiAction::Click { x, y } => serde_json::json!({ "kind": "click", "x": x, "y": y }),
+        DeviceUiAction::Swipe { x1, y1, x2, y2, speed } => serde_json::json!({
+            "kind": "swipe", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "speed": speed,
+        }),
+        DeviceUiAction::LongClick { x, y } => {
+            serde_json::json!({ "kind": "long_click", "x": x, "y": y })
+        }
+        DeviceUiAction::Text { text } => serde_json::json!({
+            "kind": "text", "text_digest": short_digest(text), "text_bytes": text.len(),
+        }),
+        DeviceUiAction::Key { name } => serde_json::json!({ "kind": "key", "name": name }),
+    }
 }
 
 fn validate_network_interface(interface: &str) -> Result<(), String> {
@@ -1413,6 +1545,66 @@ mod tests {
             .validate()
             .is_err());
         }
+    }
+
+    #[test]
+    fn device_ui_input_uses_typed_bounded_fixed_argv() {
+        let click = HostCapability::DeviceUiInput {
+            device: "ABC123".into(),
+            operation_id: "step-1".into(),
+            action: DeviceUiAction::Click { x: 120, y: 240 },
+        };
+        assert_eq!(
+            prepare_invocation(&click, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "uitest", "uiInput", "click", "120", "240"]
+        );
+        assert!(!click.replay_safe());
+        let swipe = HostCapability::DeviceUiInput {
+            device: "ABC123".into(),
+            operation_id: "step-2".into(),
+            action: DeviceUiAction::Swipe {
+                x1: 10,
+                y1: 20,
+                x2: 30,
+                y2: 40,
+                speed: 600,
+            },
+        };
+        assert_eq!(
+            prepare_invocation(&swipe, None).unwrap().args,
+            vec![
+                "-t", "ABC123", "shell", "uitest", "uiInput", "swipe", "10", "20",
+                "30", "40", "600",
+            ]
+        );
+        let text = HostCapability::DeviceUiInput {
+            device: "ABC123".into(),
+            operation_id: "step-3".into(),
+            action: DeviceUiAction::Text { text: "安全 input 文本".into() },
+        };
+        assert_eq!(prepare_invocation(&text, None).unwrap().args[5], "text");
+        assert_eq!(prepare_invocation(&text, None).unwrap().args[6], "安全 input 文本");
+        for action in [
+            DeviceUiAction::Click { x: -1, y: 0 },
+            DeviceUiAction::Swipe { x1: 0, y1: 0, x2: 1, y2: 1, speed: 0 },
+            DeviceUiAction::Text { text: "bad\ntext".into() },
+            DeviceUiAction::Key { name: "back;rm".into() },
+        ] {
+            assert!(HostCapability::DeviceUiInput {
+                device: "ABC123".into(),
+                operation_id: "invalid-step".into(),
+                action,
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(HostCapability::DeviceUiInput {
+            device: "ABC123".into(),
+            operation_id: "bad;step".into(),
+            action: DeviceUiAction::Key { name: "back".into() },
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

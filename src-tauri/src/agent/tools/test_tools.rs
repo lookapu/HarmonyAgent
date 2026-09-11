@@ -1275,7 +1275,7 @@ pub(super) async fn run_ui_flow(
     if steps.is_empty() {
         return Err("steps 不能为空".into());
     }
-    let results = execute_ui_steps(&device, steps).await;
+    let results = execute_ui_steps(&device, steps, ctx).await;
     let mut out = format!("UI 操作流程（设备 {device}，共 {} 步）：\n", steps.len());
     for r in &results {
         out.push_str(r);
@@ -1375,11 +1375,15 @@ pub(super) fn evaluate_ui_assertions(
 }
 
 /// 逐条执行 UI 步骤，返回每步结果描述；任一步失败即停止（避免在错误界面继续乱点）。
-pub(super) async fn execute_ui_steps(device: &str, steps: &[Value]) -> Vec<String> {
+pub(super) async fn execute_ui_steps(
+    device: &str,
+    steps: &[Value],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Vec<String> {
     let mut results = Vec::new();
     for (i, s) in steps.iter().enumerate() {
         let desc = describe_step(s);
-        match execute_ui_step(device, s).await {
+        match execute_ui_step(device, s, ctx).await {
             Ok(info) => {
                 let suffix = if info.is_empty() { String::new() } else { format!("（{info}）") };
                 results.push(format!("{}. {desc} → 成功{suffix}", i + 1));
@@ -1396,14 +1400,17 @@ pub(super) async fn execute_ui_steps(device: &str, steps: &[Value]) -> Vec<Strin
 }
 
 /// 执行单个 UI 步骤，返回补充信息（wait 返回等待时长）。
-pub(super) async fn execute_ui_step(device: &str, s: &Value) -> Result<String, String> {
+pub(super) async fn execute_ui_step(
+    device: &str,
+    s: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let action = s["action"].as_str().unwrap_or("");
-    let mut cmd: Vec<String> = vec!["uitest".to_string(), "uiInput".to_string()];
-    match action {
+    let action = match action {
         "tap" | "click" => {
             let x = s["x"].as_i64().unwrap_or(0);
             let y = s["y"].as_i64().unwrap_or(0);
-            cmd.extend(["click".to_string(), x.to_string(), y.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::Click { x, y }
         }
         "swipe" => {
             let x1 = s["x1"].as_i64().unwrap_or(0);
@@ -1411,23 +1418,29 @@ pub(super) async fn execute_ui_step(device: &str, s: &Value) -> Result<String, S
             let x2 = s["x2"].as_i64().unwrap_or(0);
             let y2 = s["y2"].as_i64().unwrap_or(0);
             let speed = s["speed"].as_i64().unwrap_or(600);
-            cmd.extend(["swipe".to_string(), x1.to_string(), y1.to_string(), x2.to_string(), y2.to_string(), speed.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::Swipe {
+                x1,
+                y1,
+                x2,
+                y2,
+                speed,
+            }
         }
         "long_press" | "longClick" => {
             let x = s["x"].as_i64().unwrap_or(0);
             let y = s["y"].as_i64().unwrap_or(0);
-            cmd.extend(["longClick".to_string(), x.to_string(), y.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::LongClick { x, y }
         }
         "text" => {
             let t = s["text"].as_str().unwrap_or("");
             if t.is_empty() {
                 return Err("text 步骤缺少 text 参数".into());
             }
-            cmd.extend(["text".to_string(), t.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::Text { text: t.to_string() }
         }
         "key" => {
             let name = s["name"].as_str().unwrap_or("back");
-            cmd.extend(["keyEvent".to_string(), name.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::Key { name: name.to_string() }
         }
         "wait" => {
             let ms = s["ms"].as_u64().unwrap_or(500).clamp(1, 30000);
@@ -1435,10 +1448,23 @@ pub(super) async fn execute_ui_step(device: &str, s: &Value) -> Result<String, S
             return Ok(format!("等待 {ms}ms"));
         }
         other => return Err(format!("未知 action: {other}")),
-    }
-    run_hdc_shell(device, &cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>(), 20)
+    };
+    let capability = crate::agent::capability_broker::HostCapability::DeviceUiInput {
+        device: device.to_string(),
+        operation_id: uuid::Uuid::new_v4().simple().to_string(),
+        action,
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
         .await
-        .map_err(|e| format!("uitest 注入失败（确认设备已解锁亮屏且支持 uitest）：{e}"))
+        .map_err(|error| format!("uitest 注入失败（确认设备已解锁亮屏且支持 uitest）：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!(
+            "uitest 注入失败（确认设备已解锁亮屏且支持 uitest）：{}",
+            first_line_or_unknown(&text),
+        ));
+    }
+    Ok(text.trim().to_string())
 }
 
 /// 描述单个 UI 步骤（用于报告展示）。
