@@ -152,32 +152,6 @@ pub(super) async fn manage_hdc(
     }
 }
 
-pub(super) fn emulator_exe() -> Option<PathBuf> {
-    for dir in crate::commands::health::discover_deveco_dirs() {
-        for rel in [
-            "tools/emulator/Emulator.exe",
-            "sdk/emulator/Emulator.exe",
-            "emulator/Emulator.exe",
-        ] {
-            let p = dir.join(rel);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    for p in [
-        r"C:\Program Files\Huawei\DevEco Studio\tools\emulator\Emulator.exe",
-        r"D:\Huawei\DevEco Studio\tools\emulator\Emulator.exe",
-        r"C:\Program Files\Huawei\DevEco Studio\sdk\emulator\Emulator.exe",
-    ] {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
-        }
-    }
-    None
-}
-
 async fn broker_hdc_targets(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
     let capability = crate::agent::capability_broker::HostCapability::HdcListTargets;
     let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
@@ -189,11 +163,27 @@ async fn broker_hdc_targets(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<Str
     Ok(text)
 }
 
+async fn broker_emulator_command(
+    capability: &crate::agent::capability_broker::HostCapability,
+    label: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let output = crate::agent::capability_broker::execute_host_capability(capability, None, ctx)
+        .await
+        .map_err(|error| format!("{label}失败：{error}"))?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("{label}失败：{}", text.trim()));
+    }
+    Ok(text)
+}
+
 pub(super) async fn list_emulators(
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    // emulator_exe 内部走 discover_deveco_dirs（reg query 等同步 IO），放入 blocking 线程池
-    let emu = tokio::task::spawn_blocking(emulator_exe)
+    let emu = tokio::task::spawn_blocking(
+        crate::agent::capability_broker::emulator_executable,
+    )
         .await
         .map_err(|e| format!("查找模拟器任务失败: {e}"))?;
     let Some(emu) = emu else {
@@ -202,14 +192,10 @@ pub(super) async fn list_emulators(
                 .into(),
         );
     };
-    let out = run_cmd(
-        &emu.to_string_lossy(),
-        &["-list".into()],
-        None,
-        30,
-    )
-    .await
-    .map_err(|e| format!("运行模拟器列表命令失败：{e}"))?;
+    let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+        kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+    };
+    let out = broker_emulator_command(&query, "运行模拟器列表命令", ctx).await?;
     let names: Vec<&str> = out.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     if names.is_empty() {
         return Ok(format!(
@@ -244,13 +230,11 @@ pub(super) async fn start_emulator(
     if !matches!(action, "start" | "stop") {
         return Err("action 仅支持 start|stop".into());
     }
-    let Some(emu) = emulator_exe() else {
-        return Err("未找到 DevEco Studio 模拟器（Emulator.exe），请先安装 DevEco Studio".into());
-    };
     // 校验实例存在（-list 输出逐行是实例名）
-    let list_out = run_cmd(&emu.to_string_lossy(), &["-list".into()], None, 30)
-        .await
-        .map_err(|e| format!("读取模拟器列表失败：{e}"))?;
+    let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+        kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+    };
+    let list_out = broker_emulator_command(&query, "读取模拟器列表", ctx).await?;
     let exists = list_out.lines().any(|l| l.trim() == name);
     if !exists {
         let names: Vec<&str> = list_out.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
@@ -260,15 +244,12 @@ pub(super) async fn start_emulator(
         ));
     }
     if action == "stop" {
-        let out = run_cmd(&emu.to_string_lossy(), &["-stop".into(), name.to_string()], None, 60)
-            .await
-            .map_err(|e| format!("停止模拟器失败：{e}"))?;
+        let stop = crate::agent::capability_broker::HostCapability::StopEmulator {
+            name: name.to_string(),
+        };
+        let out = broker_emulator_command(&stop, "停止模拟器", ctx).await?;
         return Ok(format!("已发送停止指令：{name}\n{}", out.trim_end()));
     }
-    // start：后台拉起（模拟器有 GUI 窗口，不隐藏、不等待退出）
-    let mut cmd = crate::utils::process::command(&emu.to_string_lossy(), &["-start".into(), name.to_string()])
-        .map_err(|e| e.to_string())?;
-    let _child = cmd.spawn().map_err(|e| format!("启动模拟器失败：{e}"))?;
     // 轮询 hdc：启动前设备快照 → 新设备出现即上线
     let wait_secs = args["wait_secs"].as_u64().unwrap_or(60).clamp(5, 120);
     let before: std::collections::HashSet<String> = broker_hdc_targets(ctx)
@@ -277,6 +258,16 @@ pub(super) async fn start_emulator(
         .lines()
         .filter_map(|l| l.split_whitespace().next().map(String::from))
         .collect();
+    // start 是 GUI 长进程：Broker 在 spawn 前 claim，spawn 成功即记录派发终态；
+    // 真实启动效果由下面独立的 HDC 查询验证。
+    let start = crate::agent::capability_broker::HostCapability::StartEmulator {
+        name: name.to_string(),
+    };
+    let dispatched_pid = crate::agent::capability_broker::dispatch_host_capability(&start, ctx)
+        .map_err(|error| format!("启动模拟器失败：{error}"))?;
+    let pid_note = dispatched_pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "进程已快速转交".into());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
     let mut seen = String::new();
     while std::time::Instant::now() < deadline {
@@ -295,29 +286,29 @@ pub(super) async fn start_emulator(
     }
     if seen.is_empty() {
         Ok(format!(
-            "模拟器 {name} 已后台启动（{wait_secs}s 内 hdc 未发现新设备）。\n模拟器首次冷启动可能需要 1-3 分钟，稍后调用 list_devices 确认在线；若始终未上线，检查 DevEco Studio 模拟器窗口是否有报错。"
+            "模拟器 {name} 已后台派发（PID：{pid_note}；{wait_secs}s 内 hdc 未发现新设备）。\n模拟器首次冷启动可能需要 1-3 分钟，稍后调用 list_devices 确认在线；若始终未上线，检查 DevEco Studio 模拟器窗口是否有报错。"
         ))
     } else {
         Ok(format!(
-            "模拟器 {name} 已启动，新设备上线：{seen}\n下一步：list_devices 查看详情后即可部署/测试（deploy 会部署到全部在线设备，注意区分真机与模拟器）。"
+            "模拟器 {name} 已启动（派发 PID：{pid_note}），新设备上线：{seen}\n下一步：list_devices 查看详情后即可部署/测试（deploy 会部署到全部在线设备，注意区分真机与模拟器）。"
         ))
     }
 }
 
-pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
+pub(super) async fn create_emulator(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("create").trim();
     if !matches!(action, "create" | "delete" | "images" | "models") {
         return Err("action 仅支持 create|delete|images|models".into());
     }
-    let Some(emu) = emulator_exe() else {
-        return Err("未找到 DevEco Studio 模拟器（Emulator.exe），请先安装 DevEco Studio".into());
-    };
-    let exe = emu.to_string_lossy();
-    // 镜像/机型查询：无参数副作用，直接执行
+    // 镜像/机型查询是 replay-safe 的固定 Broker 能力。
     if action == "images" {
-        let out = run_cmd(&exe, &["-imageList".into(), "-downloaded".into()], None, 60)
-            .await
-            .map_err(|e| format!("查询镜像失败：{e}"))?;
+        let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+            kind: crate::agent::capability_broker::EmulatorQueryKind::DownloadedImages,
+        };
+        let out = broker_emulator_command(&query, "查询镜像", ctx).await?;
         let body = out.trim();
         if body.is_empty() {
             return Ok("尚未下载任何模拟器系统镜像。\n可调用 create_emulator action=models 查看支持机型，或直接在 DevEco Studio Device Manager 中下载/创建。".into());
@@ -325,9 +316,10 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
         return Ok(format!("已下载的模拟器系统镜像：\n{body}\n\n创建实例时 os_version 传镜像对应的版本字符串（如 HarmonyOS 6.0.0(20)）。"));
     }
     if action == "models" {
-        let out = run_cmd(&exe, &["-screenProfileList".into()], None, 60)
-            .await
-            .map_err(|e| format!("查询机型失败：{e}"))?;
+        let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+            kind: crate::agent::capability_broker::EmulatorQueryKind::ScreenProfiles,
+        };
+        let out = broker_emulator_command(&query, "查询机型", ctx).await?;
         let body = out.trim();
         return Ok(if body.is_empty() {
             "未获取到机型列表（可按设备类型创建：Phone/Foldable/Tablet/2in1/Wearable/TV 等）。".into()
@@ -340,9 +332,19 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
         return Err(format!("create_emulator {action} 需要 name（实例名）"));
     };
     if action == "delete" {
-        let out = run_cmd(&exe, &["-delete".into(), name.to_string(), "-force".into()], None, 60)
+        let delete = crate::agent::capability_broker::HostCapability::DeleteEmulator {
+            name: name.to_string(),
+        };
+        let out = broker_emulator_command(&delete, "删除实例", ctx).await?;
+        let verification = crate::agent::capability_broker::HostCapability::QueryEmulator {
+            kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+        };
+        let remaining = broker_emulator_command(&verification, "验证实例删除结果", ctx)
             .await
-            .map_err(|e| format!("删除实例失败：{e}"))?;
+            .map_err(|error| format!("删除命令已返回成功，但无法验证实例清单：{error}"))?;
+        if remaining.lines().any(|line| line.trim() == name) {
+            return Err(format!("删除命令已返回成功，但实例 {name} 仍在清单中"));
+        }
         return Ok(format!("已删除模拟器实例 {name}。\n{}", out.trim_end()));
     }
     // create：校验 device_type 与 os_version
@@ -354,26 +356,28 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
     let Some(os_version) = os_version else {
         return Err("create 需要 os_version（如 \"HarmonyOS 6.0.0(20)\"，先 create_emulator action=images 查看已下载版本）".into());
     };
-    let mut cmd_args: Vec<String> = vec![
-        "-create".into(),
-        name.to_string(),
-        "-deviceType".into(),
-        device_type.to_string(),
-        "-osVersion".into(),
-        os_version.to_string(),
-    ];
-    if let Some(sp) = args["screen_profile"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        cmd_args.extend(["-screenProfile".into(), sp.to_string()]);
-    }
-    let memory = args["memory"].as_u64().unwrap_or(4);
-    if (2..=32).contains(&memory) && memory != 4 {
-        cmd_args.extend(["-memory".into(), memory.to_string()]);
-    }
-    let storage = args["storage"].as_u64().unwrap_or(6);
-    if (2..=1023).contains(&storage) && storage != 6 {
-        cmd_args.extend(["-storage".into(), storage.to_string()]);
-    }
-    let out = run_cmd(&exe, &cmd_args, None, 180)
+    let screen_profile = args["screen_profile"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from);
+    let memory_gb = match args.get("memory") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or("memory 必须是 2-32 之间的整数")?),
+    };
+    let storage_gb = match args.get("storage") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or("storage 必须是 2-1023 之间的整数")?),
+    };
+    let create = crate::agent::capability_broker::HostCapability::CreateEmulator {
+        name: name.to_string(),
+        device_type: device_type.to_string(),
+        os_version: os_version.to_string(),
+        screen_profile,
+        memory_gb,
+        storage_gb,
+    };
+    let out = broker_emulator_command(&create, "创建实例", ctx)
         .await
         .map_err(|e| {
             let hint = if e.contains("license") || e.to_lowercase().contains("agreement") {
@@ -383,8 +387,17 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
             } else {
                 ""
             };
-            format!("创建实例失败：{e}{hint}")
+            format!("{e}{hint}")
         })?;
+    let verification = crate::agent::capability_broker::HostCapability::QueryEmulator {
+        kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+    };
+    let instances = broker_emulator_command(&verification, "验证实例创建结果", ctx)
+        .await
+        .map_err(|error| format!("创建命令已返回成功，但无法验证实例清单：{error}"))?;
+    if !instances.lines().any(|line| line.trim() == name) {
+        return Err(format!("创建命令已返回成功，但实例 {name} 未出现在实例清单中"));
+    }
     Ok(format!(
         "模拟器实例 {name} 创建完成（{device_type} / {os_version}）。\n{}
 下一步：list_emulators 确认实例在列，start_emulator name={name} 启动。",

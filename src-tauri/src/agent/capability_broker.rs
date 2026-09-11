@@ -5,7 +5,7 @@
 //! [`execute_host_capability`] 生成固定 argv、执行及写入运行审计。
 
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 /// Broker 内建的 faultlog 查询范围，避免调用方把任意设备目录拼入 `hdc shell ls`。
@@ -71,6 +71,13 @@ pub enum DeviceDebuggerAction {
     Registers,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmulatorQueryKind {
+    Instances,
+    DownloadedImages,
+    ScreenProfiles,
+}
+
 impl DeviceDebuggerAction {
     fn as_command(self) -> &'static str {
         match self {
@@ -128,6 +135,23 @@ pub enum HostCapability {
         pid: u32,
         action: DeviceDebuggerAction,
     },
+    /// 查询已创建实例、已下载镜像或支持的屏幕配置。
+    QueryEmulator { kind: EmulatorQueryKind },
+    /// 派发一个已存在模拟器实例的 GUI 进程。
+    StartEmulator { name: String },
+    /// 停止一个明确的模拟器实例。
+    StopEmulator { name: String },
+    /// 创建一个有界配置的模拟器实例。
+    CreateEmulator {
+        name: String,
+        device_type: String,
+        os_version: String,
+        screen_profile: Option<String>,
+        memory_gb: Option<u64>,
+        storage_gb: Option<u64>,
+    },
+    /// 删除一个明确的模拟器实例。
+    DeleteEmulator { name: String },
     /// 查询用于签名 profile 匹配的设备 UDID。
     ReadDeviceUdid { device: String },
     /// 读取设备历史 hilog，可选最低级别和 tag。
@@ -233,6 +257,11 @@ impl HostCapability {
             Self::AttachDeviceDebugger { .. } => "device.debugger.attach",
             Self::EnableAbilityDebug { .. } => "device.debugger.enable_ability",
             Self::ControlDeviceDebugger { .. } => "device.debugger.control",
+            Self::QueryEmulator { .. } => "emulator.query",
+            Self::StartEmulator { .. } => "emulator.start",
+            Self::StopEmulator { .. } => "emulator.stop",
+            Self::CreateEmulator { .. } => "emulator.create",
+            Self::DeleteEmulator { .. } => "emulator.delete",
             Self::ReadDeviceUdid { .. } => "device.read_udid",
             Self::ReadHilog { .. } => "device.read_hilog",
             Self::SearchHilog { .. } => "device.search_hilog",
@@ -291,6 +320,32 @@ impl HostCapability {
             Self::EnableAbilityDebug { device, bundle } => {
                 validate_device_target(device)?;
                 validate_app_identifier(bundle, "bundle")
+            }
+            Self::QueryEmulator { .. } => Ok(()),
+            Self::StartEmulator { name }
+            | Self::StopEmulator { name }
+            | Self::DeleteEmulator { name } => validate_emulator_value(name, "模拟器实例名", 128),
+            Self::CreateEmulator {
+                name,
+                device_type,
+                os_version,
+                screen_profile,
+                memory_gb,
+                storage_gb,
+            } => {
+                validate_emulator_value(name, "模拟器实例名", 128)?;
+                validate_emulator_value(device_type, "模拟器设备类型", 64)?;
+                validate_emulator_value(os_version, "模拟器系统版本", 128)?;
+                if let Some(profile) = screen_profile {
+                    validate_emulator_value(profile, "模拟器屏幕配置", 128)?;
+                }
+                if memory_gb.is_some_and(|value| !(2..=32).contains(&value)) {
+                    return Err("模拟器内存必须在 2-32 GB 之间".into());
+                }
+                if storage_gb.is_some_and(|value| !(2..=1023).contains(&value)) {
+                    return Err("模拟器存储必须在 2-1023 GB 之间".into());
+                }
+                Ok(())
             }
             Self::ReadDeviceUdid { device } => validate_device_target(device),
             Self::ReadHilog { device, level, tag } => {
@@ -451,6 +506,7 @@ impl HostCapability {
             self,
             Self::HdcListTargets
                 | Self::DevicePidof { .. }
+                | Self::QueryEmulator { .. }
                 | Self::ReadDeviceUdid { .. }
                 | Self::ReadHilog { .. }
                 | Self::SearchHilog { .. }
@@ -466,7 +522,7 @@ impl HostCapability {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HostInvocation {
-    program: &'static str,
+    program: String,
     args: Vec<String>,
     timeout_seconds: u64,
 }
@@ -523,6 +579,31 @@ fn request_material(capability: &HostCapability) -> String {
         HostCapability::ControlDeviceDebugger { device, pid, action } => {
             format!("{}\0{pid}\0{}", device.trim(), action.as_command())
         }
+        HostCapability::QueryEmulator { kind } => match kind {
+            EmulatorQueryKind::Instances => "instances",
+            EmulatorQueryKind::DownloadedImages => "downloaded_images",
+            EmulatorQueryKind::ScreenProfiles => "screen_profiles",
+        }
+        .to_string(),
+        HostCapability::StartEmulator { name }
+        | HostCapability::StopEmulator { name }
+        | HostCapability::DeleteEmulator { name } => name.trim().to_string(),
+        HostCapability::CreateEmulator {
+            name,
+            device_type,
+            os_version,
+            screen_profile,
+            memory_gb,
+            storage_gb,
+        } => format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            name.trim(),
+            device_type.trim(),
+            os_version.trim(),
+            screen_profile.as_deref().unwrap_or("").trim(),
+            memory_gb.map(|value| value.to_string()).unwrap_or_default(),
+            storage_gb.map(|value| value.to_string()).unwrap_or_default(),
+        ),
         HostCapability::ReadDeviceUdid { device } => device.trim().to_string(),
         HostCapability::ReadHilog { device, level, tag } => format!(
             "{}\0{}\0{}",
@@ -675,6 +756,13 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             ],
             30,
         ),
+        HostCapability::QueryEmulator { .. }
+        | HostCapability::StartEmulator { .. }
+        | HostCapability::StopEmulator { .. }
+        | HostCapability::CreateEmulator { .. }
+        | HostCapability::DeleteEmulator { .. } => {
+            return prepare_emulator_invocation(capability);
+        }
         HostCapability::ReadDeviceUdid { device } => (
             vec![
                 "-t".into(), device.trim().into(), "shell".into(), "bm".into(), "get".into(),
@@ -996,7 +1084,100 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             return Err("deploy 是组合能力，必须拆分为 install 与 start_ability 执行".into());
         }
     };
-    Ok(HostInvocation { program: "hdc", args, timeout_seconds })
+    Ok(HostInvocation { program: "hdc".into(), args, timeout_seconds })
+}
+
+/// 只从 DevEco 安装目录和受支持的 Windows 默认位置发现官方模拟器程序。
+/// Agent 请求本身不携带可执行路径，避免把 Broker 退化为任意程序启动器。
+pub fn emulator_executable() -> Option<PathBuf> {
+    for dir in crate::commands::health::discover_deveco_dirs() {
+        for rel in [
+            "tools/emulator/Emulator.exe",
+            "sdk/emulator/Emulator.exe",
+            "emulator/Emulator.exe",
+        ] {
+            let path = dir.join(rel);
+            if path.is_file() {
+                return Some(path.canonicalize().unwrap_or(path));
+            }
+        }
+    }
+    for raw in [
+        r"C:\Program Files\Huawei\DevEco Studio\tools\emulator\Emulator.exe",
+        r"D:\Huawei\DevEco Studio\tools\emulator\Emulator.exe",
+        r"C:\Program Files\Huawei\DevEco Studio\sdk\emulator\Emulator.exe",
+    ] {
+        let path = PathBuf::from(raw);
+        if path.is_file() {
+            return Some(path.canonicalize().unwrap_or(path));
+        }
+    }
+    None
+}
+
+fn emulator_arguments(capability: &HostCapability) -> Result<(Vec<String>, u64), String> {
+    capability.validate()?;
+    match capability {
+        HostCapability::QueryEmulator { kind } => Ok((
+            match kind {
+                EmulatorQueryKind::Instances => vec!["-list".into()],
+                EmulatorQueryKind::DownloadedImages => {
+                    vec!["-imageList".into(), "-downloaded".into()]
+                }
+                EmulatorQueryKind::ScreenProfiles => vec!["-screenProfileList".into()],
+            },
+            60,
+        )),
+        HostCapability::StartEmulator { name } => {
+            Ok((vec!["-start".into(), name.trim().into()], 30))
+        }
+        HostCapability::StopEmulator { name } => {
+            Ok((vec!["-stop".into(), name.trim().into()], 60))
+        }
+        HostCapability::DeleteEmulator { name } => Ok((
+            vec!["-delete".into(), name.trim().into(), "-force".into()],
+            60,
+        )),
+        HostCapability::CreateEmulator {
+            name,
+            device_type,
+            os_version,
+            screen_profile,
+            memory_gb,
+            storage_gb,
+        } => {
+            let mut args = vec![
+                "-create".into(),
+                name.trim().into(),
+                "-deviceType".into(),
+                device_type.trim().into(),
+                "-osVersion".into(),
+                os_version.trim().into(),
+            ];
+            if let Some(profile) = screen_profile {
+                args.extend(["-screenProfile".into(), profile.trim().into()]);
+            }
+            if let Some(memory) = memory_gb {
+                args.extend(["-memory".into(), memory.to_string()]);
+            }
+            if let Some(storage) = storage_gb {
+                args.extend(["-storage".into(), storage.to_string()]);
+            }
+            Ok((args, 180))
+        }
+        _ => Err("不是模拟器能力".into()),
+    }
+}
+
+fn prepare_emulator_invocation(capability: &HostCapability) -> Result<HostInvocation, String> {
+    let executable = emulator_executable()
+        .ok_or("未找到 DevEco Studio 模拟器（Emulator.exe），请先安装 DevEco Studio")?;
+    let (args, timeout_seconds) = emulator_arguments(capability)?;
+    Ok(HostInvocation {
+        program: executable.to_string_lossy().into_owned(),
+        args,
+        timeout_seconds,
+    })
 }
 
 /// 执行经过类型化校验的宿主能力。调用方负责解释领域输出和完成后验证；本入口
@@ -1060,7 +1241,7 @@ pub async fn execute_host_capability(
         }
     }
     let result = crate::agent::exec_ctx::run_cmd_streaming(
-        ctx, invocation.program, &invocation.args, None, invocation.timeout_seconds, None,
+        ctx, &invocation.program, &invocation.args, None, invocation.timeout_seconds, None,
     ).await;
     match result {
         Ok(output) => {
@@ -1096,6 +1277,90 @@ pub async fn execute_host_capability(
                 ))?;
             }
             Err(error)
+        }
+    }
+}
+
+/// 派发一个会脱离当前工具调用继续运行的宿主 GUI 进程。
+///
+/// 该入口只接受 `emulator.start`：在 spawn 前完成持久化 claim，spawn 成功即记录
+/// “派发成功”终态，实际设备上线由调用方通过独立 HDC 只读能力验证。它不把任意
+/// executable/argv 暴露给 Agent。
+pub fn dispatch_host_capability(
+    capability: &HostCapability,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<Option<u32>, String> {
+    if !matches!(capability, HostCapability::StartEmulator { .. }) {
+        return Err("宿主进程派发入口目前只允许 emulator.start".into());
+    }
+    let capability_id = capability.capability_id();
+    let identity = request_identity(ctx, capability).map_err(|error| {
+        ctx.record_run_event("host_capability.rejected", serde_json::json!({
+            "capability_id": capability_id,
+            "reason": "missing_request_identity",
+        }));
+        error
+    })?;
+    let invocation = prepare_invocation(capability, None).map_err(|error| {
+        ctx.record_run_event("host_capability.rejected", serde_json::json!({
+            "capability_id": capability_id,
+            "tool_call_id": &identity.tool_call_id,
+            "idempotency_key": &identity.idempotency_key,
+            "reason": "validation_failed",
+        }));
+        error
+    })?;
+    let subject = audit_subject(capability);
+    match claim_request(ctx, capability_id, &identity, &subject)? {
+        crate::agent::runtime::HostCapabilityClaim::Claimed => {}
+        crate::agent::runtime::HostCapabilityClaim::Duplicate { status } => {
+            ctx.record_run_event("host_capability.rejected", serde_json::json!({
+                "capability_id": capability_id,
+                "tool_call_id": &identity.tool_call_id,
+                "idempotency_key": &identity.idempotency_key,
+                "reason": "duplicate_dispatch",
+                "previous_status": status,
+            }));
+            return Err(format!(
+                "宿主进程派发请求已登记（状态：{status}），为避免重复启动已拒绝自动重放"
+            ));
+        }
+    }
+
+    let spawn_result = match crate::utils::process::command(&invocation.program, &invocation.args) {
+        Ok(mut command) => command.spawn().map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    match spawn_result {
+        Ok(child) => {
+            let pid = child.id();
+            finish_request(
+                ctx,
+                capability_id,
+                &identity,
+                "succeeded",
+                None,
+                None,
+            )
+            .map_err(|error| {
+                format!("模拟器进程已经派发（PID {pid:?}），但持久化派发终态失败，实际状态不确定：{error}")
+            })?;
+            Ok(pid)
+        }
+        Err(error) => {
+            let message = format!("模拟器进程派发失败：{error}");
+            finish_request(
+                ctx,
+                capability_id,
+                &identity,
+                "failed",
+                None,
+                Some("spawn_failed"),
+            )
+            .map_err(|persist_error| {
+                format!("{message}；持久化失败终态时发生错误：{persist_error}")
+            })?;
+            Err(message)
         }
     }
 }
@@ -1151,7 +1416,7 @@ pub fn spawn_host_capability(
     Ok(tokio::spawn(async move {
         let result = crate::agent::exec_ctx::run_cmd_streaming(
             &task_ctx,
-            invocation.program,
+            &invocation.program,
             &invocation.args,
             None,
             invocation.timeout_seconds,
@@ -1341,6 +1606,20 @@ fn validate_process_id(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_emulator_value(value: &str, label: &str, max_bytes: usize) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > max_bytes
+        || trimmed.starts_with('-')
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "{label}不能为空、不能以 - 开头、不得含控制字符且最多 {max_bytes} 字节"
+        ));
+    }
+    Ok(())
+}
+
 fn audit_subject(capability: &HostCapability) -> serde_json::Value {
     match capability {
         HostCapability::HdcConnect { target } | HostCapability::HdcDisconnect { target } =>
@@ -1360,6 +1639,33 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         HostCapability::ControlDeviceDebugger { device, pid, action } => serde_json::json!({
             "device_digest": short_digest(device), "pid": pid,
             "action": action.as_command(),
+        }),
+        HostCapability::QueryEmulator { kind } => serde_json::json!({
+            "query": match kind {
+                EmulatorQueryKind::Instances => "instances",
+                EmulatorQueryKind::DownloadedImages => "downloaded_images",
+                EmulatorQueryKind::ScreenProfiles => "screen_profiles",
+            },
+        }),
+        HostCapability::StartEmulator { name }
+        | HostCapability::StopEmulator { name }
+        | HostCapability::DeleteEmulator { name } => serde_json::json!({
+            "instance_digest": short_digest(name),
+        }),
+        HostCapability::CreateEmulator {
+            name,
+            device_type,
+            os_version,
+            screen_profile,
+            memory_gb,
+            storage_gb,
+        } => serde_json::json!({
+            "instance_digest": short_digest(name),
+            "device_type": device_type,
+            "os_version": os_version,
+            "screen_profile": screen_profile,
+            "memory_gb": memory_gb,
+            "storage_gb": storage_gb,
         }),
         HostCapability::ReadDeviceUdid { device } => serde_json::json!({
             "device_digest": short_digest(device),
@@ -2375,6 +2681,55 @@ mod tests {
             device: "ABC123".into(),
             pid: 42,
             wait_seconds: 121,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn emulator_capabilities_use_internal_program_and_fixed_arguments() {
+        let instances = HostCapability::QueryEmulator {
+            kind: EmulatorQueryKind::Instances,
+        };
+        assert_eq!(emulator_arguments(&instances).unwrap(), (vec!["-list".into()], 60));
+        assert!(instances.replay_safe());
+
+        let create = HostCapability::CreateEmulator {
+            name: "Pura 90".into(),
+            device_type: "Phone".into(),
+            os_version: "HarmonyOS 6.0.0(20)".into(),
+            screen_profile: Some("Pura 90".into()),
+            memory_gb: Some(8),
+            storage_gb: Some(32),
+        };
+        assert_eq!(
+            emulator_arguments(&create).unwrap().0,
+            vec![
+                "-create",
+                "Pura 90",
+                "-deviceType",
+                "Phone",
+                "-osVersion",
+                "HarmonyOS 6.0.0(20)",
+                "-screenProfile",
+                "Pura 90",
+                "-memory",
+                "8",
+                "-storage",
+                "32",
+            ]
+        );
+        assert!(!create.replay_safe());
+        assert!(HostCapability::StartEmulator { name: "-delete".into() }
+            .validate()
+            .is_err());
+        assert!(HostCapability::CreateEmulator {
+            name: "test".into(),
+            device_type: "Phone".into(),
+            os_version: "HarmonyOS".into(),
+            screen_profile: None,
+            memory_gb: Some(64),
+            storage_gb: None,
         }
         .validate()
         .is_err());

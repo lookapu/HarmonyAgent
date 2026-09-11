@@ -1227,7 +1227,7 @@ pub async fn run_tool(
         "manage_hdc" => device_tools::manage_hdc(&args, db, ctx).await,
         "list_emulators" => device_tools::list_emulators(ctx).await,
         "start_emulator" => device_tools::start_emulator(&args, ctx).await,
-        "create_emulator" => device_tools::create_emulator(&args).await,
+        "create_emulator" => device_tools::create_emulator(&args, ctx).await,
         "device_file" => device_tools::device_file(&args, &roots, ctx).await,
         "stop_app" => device_tools::stop_app(&args, &roots, ctx).await,
         "device_shell" => device_tools::device_shell(&args, ctx).await,
