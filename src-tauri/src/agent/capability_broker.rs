@@ -45,6 +45,14 @@ pub enum HostCapability {
     ReadDeviceUdid { device: String },
     /// 读取设备历史 hilog，可选最低级别和 tag。
     ReadHilog { device: String, level: Option<String>, tag: Option<String> },
+    /// 带有界尾部窗口、epoch 格式与可选表达式的 hilog 搜索。
+    SearchHilog {
+        device: String,
+        level: String,
+        tag: Option<String>,
+        tail_lines: u64,
+        expression: Option<String>,
+    },
     /// 兼容旧设备的有限行 logcat 查询。
     ReadLogcat { device: String, lines: u64 },
     /// 枚举三个预定义 faultlog 目录之一。
@@ -91,6 +99,7 @@ impl HostCapability {
             Self::DevicePidof { .. } => "device.pidof",
             Self::ReadDeviceUdid { .. } => "device.read_udid",
             Self::ReadHilog { .. } => "device.read_hilog",
+            Self::SearchHilog { .. } => "device.search_hilog",
             Self::ReadLogcat { .. } => "device.read_logcat",
             Self::ListFaultLogs { .. } => "device.list_faultlogs",
             Self::ReadFaultLog { .. } => "device.read_faultlog",
@@ -128,6 +137,22 @@ impl HostCapability {
                 }
                 if let Some(tag) = tag {
                     validate_log_tag(tag)?;
+                }
+                Ok(())
+            }
+            Self::SearchHilog { device, level, tag, tail_lines, expression } => {
+                validate_device_target(device)?;
+                if !matches!(level.as_str(), "D" | "I" | "W" | "E" | "F") {
+                    return Err("hilog level 仅支持 D|I|W|E|F".into());
+                }
+                if !(100..=5_000).contains(tail_lines) {
+                    return Err("hilog tail_lines 必须在 100-5000 之间".into());
+                }
+                if let Some(tag) = tag {
+                    validate_log_tag(tag)?;
+                }
+                if let Some(expression) = expression {
+                    validate_log_expression(expression)?;
                 }
                 Ok(())
             }
@@ -196,6 +221,7 @@ impl HostCapability {
                 | Self::DevicePidof { .. }
                 | Self::ReadDeviceUdid { .. }
                 | Self::ReadHilog { .. }
+                | Self::SearchHilog { .. }
                 | Self::ReadLogcat { .. }
                 | Self::ListFaultLogs { .. }
                 | Self::ReadFaultLog { .. }
@@ -261,6 +287,11 @@ fn request_material(capability: &HostCapability) -> String {
             device.trim(),
             level.as_deref().unwrap_or(""),
             tag.as_deref().unwrap_or("").trim(),
+        ),
+        HostCapability::SearchHilog { device, level, tag, tail_lines, expression } => format!(
+            "{}\0{}\0{}\0{}\0{}",
+            device.trim(), level, tag.as_deref().unwrap_or(""), tail_lines,
+            expression.as_deref().unwrap_or(""),
         ),
         HostCapability::ReadLogcat { device, lines } => format!("{}\0{lines}", device.trim()),
         HostCapability::ListFaultLogs { device, directory } => {
@@ -336,6 +367,20 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
                 args.extend(["-T".into(), tag.trim().into()]);
             }
             (args, 25)
+        }
+        HostCapability::SearchHilog { device, level, tag, tail_lines, expression } => {
+            let mut args = vec![
+                "-t".into(), device.trim().into(), "shell".into(), "hilog".into(), "-x".into(),
+                "-z".into(), tail_lines.to_string(), "-v".into(), "epoch".into(), "-L".into(),
+                level.clone(),
+            ];
+            if let Some(tag) = tag {
+                args.extend(["-T".into(), tag.trim().into()]);
+            }
+            if let Some(expression) = expression {
+                args.extend(["-e".into(), expression.clone()]);
+            }
+            (args, 20)
         }
         HostCapability::ReadLogcat { device, lines } => (
             vec![
@@ -720,6 +765,11 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         HostCapability::ReadHilog { device, level, tag } => serde_json::json!({
             "device_digest": short_digest(device), "level": level, "tag": tag,
         }),
+        HostCapability::SearchHilog { device, level, tag, tail_lines, expression } => serde_json::json!({
+            "device_digest": short_digest(device), "level": level, "tag": tag,
+            "tail_lines": tail_lines,
+            "expression_digest": expression.as_deref().map(short_digest),
+        }),
         HostCapability::ReadLogcat { device, lines } => serde_json::json!({
             "device_digest": short_digest(device), "lines": lines,
         }),
@@ -807,6 +857,13 @@ fn validate_log_tag(tag: &str) -> Result<(), String> {
     let tag = tag.trim();
     if tag.is_empty() || tag.len() > 128 || tag.chars().any(char::is_control) {
         return Err("hilog tag 不能为空、不得含控制字符且最多 128 字符".into());
+    }
+    Ok(())
+}
+
+fn validate_log_expression(expression: &str) -> Result<(), String> {
+    if expression.is_empty() || expression.len() > 256 || expression.chars().any(char::is_control) {
+        return Err("hilog 表达式不能为空、不得含控制字符且最多 256 字符".into());
     }
     Ok(())
 }
@@ -1035,6 +1092,30 @@ mod tests {
             device: "ABC123".into(),
             level: Some("verbose".into()),
             tag: None,
+        }
+        .validate()
+        .is_err());
+        let search = HostCapability::SearchHilog {
+            device: "ABC123".into(),
+            level: "W".into(),
+            tag: Some("MyApp".into()),
+            tail_lines: 500,
+            expression: Some("TypeError.*Entry".into()),
+        };
+        assert_eq!(
+            prepare_invocation(&search, None).unwrap().args,
+            vec![
+                "-t", "ABC123", "shell", "hilog", "-x", "-z", "500", "-v", "epoch",
+                "-L", "W", "-T", "MyApp", "-e", "TypeError.*Entry"
+            ]
+        );
+        assert!(search.replay_safe());
+        assert!(HostCapability::SearchHilog {
+            device: "ABC123".into(),
+            level: "W".into(),
+            tag: None,
+            tail_lines: 50_000,
+            expression: None,
         }
         .validate()
         .is_err());

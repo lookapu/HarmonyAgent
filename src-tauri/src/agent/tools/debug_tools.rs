@@ -64,7 +64,11 @@ async fn configure_network_condition(
 }
 
 /// search_hilog：在设备 hilog 中按条件搜索。
-pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn search_hilog(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -93,22 +97,22 @@ pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<Stri
     // -L <level> 级别过滤；-T <tag> tag 过滤；-e <expr> 正则过滤；-v epoch 行首输出 epoch 时间戳（便于按 since 过滤）。
     // 注意 -T 是 tag 不是时间，不能用它做时间过滤；时间过滤在本地用 epoch 时间戳完成。
     let tail_lines = (max_lines * 3 + 300).clamp(500, 5000);
-    let mut shell_cmd: Vec<String> = vec![
-        "hilog".into(), "-x".into(), "-z".into(), tail_lines.to_string(),
-        "-v".into(), "epoch".into(), "-L".into(), level_flag.to_string(),
-    ];
-    if !tag.is_empty() {
-        shell_cmd.push("-T".into());
-        shell_cmd.push(tag.clone());
+    let capability = crate::agent::capability_broker::HostCapability::SearchHilog {
+        device: device.clone(),
+        level: level_flag.to_string(),
+        tag: (!tag.is_empty()).then_some(tag.clone()),
+        tail_lines: tail_lines as u64,
+        expression: (use_regex && !keyword.is_empty()).then_some(keyword.clone()),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "hilog 搜索失败：{}",
+            (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim()
+        ));
     }
-    if use_regex && !keyword.is_empty() {
-        shell_cmd.push("-e".into());
-        shell_cmd.push(keyword.clone());
-    }
-    let mut full: Vec<String> = vec!["-t".into(), device.clone(), "shell".into()];
-    full.extend(shell_cmd);
-    // 日志输出远超 3000 字符，用大上限读取（设备端已限行数，内存可控）
-    let out_raw = run_cmd_capped("hdc", &full, None, 20, 20_000).await.unwrap_or_default();
+    let out_raw = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
 
     let lines: Vec<&str> = out_raw.lines().collect();
     let mut matches: Vec<(usize, &str)> = Vec::new();

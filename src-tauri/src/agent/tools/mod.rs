@@ -1303,7 +1303,7 @@ pub async fn run_tool(
         "analyze_hap_size" => ui_tools::analyze_hap_size(&args, &roots).await,
         "size_diff" => ui_tools::size_diff(&args, &roots),
         "screenshot_diff" => ui_tools::screenshot_diff(&args, &roots).await,
-        "search_hilog" => debug_tools::search_hilog(&args, &roots).await,
+        "search_hilog" => debug_tools::search_hilog(&args, &roots, ctx).await,
         "log_query" => quality_tools::log_query(&args, &roots, ctx).await,
         "run_lint" => debug_tools::run_lint(&args, &roots).await,
         "set_network_condition" => debug_tools::set_network_condition(&args, &roots, ctx).await,

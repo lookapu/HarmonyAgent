@@ -237,7 +237,7 @@ pub async fn log_aggregate(
                 if sub.get("max_lines").is_none() {
                     sub["max_lines"] = json!(max_lines);
                 }
-                match crate::agent::tools::debug_tools::search_hilog(&sub, roots).await {
+                match crate::agent::tools::debug_tools::search_hilog(&sub, roots, ctx).await {
                     Ok(t) => {
                         seen_any = true;
                         out.push_str(&t);
@@ -356,7 +356,7 @@ pub async fn log_query(
                 });
                 if let Some(k) = keyword { sub["keyword"] = json!(k); }
                 if let Some(r) = regex_pat { sub["regex"] = json!(r); }
-                match crate::agent::tools::debug_tools::search_hilog(&sub, roots).await {
+                match crate::agent::tools::debug_tools::search_hilog(&sub, roots, ctx).await {
                     Ok(t) => {
                         let lines = filter_by_level(&t, level_min, re.as_ref());
                         total += lines.len();
