@@ -53,6 +53,16 @@ pub enum HostCapability {
     ReadFaultLog { device: String, directory: FaultLogDirectory, filename: String },
     /// 执行经过 Broker 二次校验的只读设备查询 argv。
     DeviceReadQuery { device: String, argv: Vec<String> },
+    /// 查询指定网络接口的 qdisc 状态。
+    ReadNetworkCondition { device: String, interface: String },
+    /// 原子替换或清除指定网络接口的 netem 条件；三个数值全零表示清除。
+    ConfigureNetworkCondition {
+        device: String,
+        interface: String,
+        delay_ms: u64,
+        loss_pct: u64,
+        bandwidth_kbps: u64,
+    },
     /// 把工作区内普通文件发送到设备绝对路径。
     SendFile { device: String, local_path: String, remote_path: String },
     /// 把设备绝对路径拉取到工作区内。
@@ -85,6 +95,8 @@ impl HostCapability {
             Self::ListFaultLogs { .. } => "device.list_faultlogs",
             Self::ReadFaultLog { .. } => "device.read_faultlog",
             Self::DeviceReadQuery { .. } => "device.read_query",
+            Self::ReadNetworkCondition { .. } => "device.network_condition.read",
+            Self::ConfigureNetworkCondition { .. } => "device.network_condition.configure",
             Self::SendFile { .. } => "device.file_send",
             Self::ReceiveFile { .. } => "device.file_receive",
             Self::StopAbility { .. } => "device.stop_ability",
@@ -135,6 +147,24 @@ impl HostCapability {
                 validate_device_target(device)?;
                 validate_read_only_device_command(argv).map(|_| ())
             }
+            Self::ReadNetworkCondition { device, interface } => {
+                validate_device_target(device)?;
+                validate_network_interface(interface)
+            }
+            Self::ConfigureNetworkCondition {
+                device,
+                interface,
+                delay_ms,
+                loss_pct,
+                bandwidth_kbps,
+            } => {
+                validate_device_target(device)?;
+                validate_network_interface(interface)?;
+                if *delay_ms > 60_000 || *loss_pct > 100 || *bandwidth_kbps > 10_000_000 {
+                    return Err("网络条件超出边界：delay<=60000ms、loss<=100%、bandwidth<=10000000kbps".into());
+                }
+                Ok(())
+            }
             Self::SendFile { device, local_path, remote_path }
             | Self::ReceiveFile { device, remote_path, local_path } => {
                 validate_device_target(device)?;
@@ -170,6 +200,7 @@ impl HostCapability {
                 | Self::ListFaultLogs { .. }
                 | Self::ReadFaultLog { .. }
                 | Self::DeviceReadQuery { .. }
+                | Self::ReadNetworkCondition { .. }
         )
     }
 }
@@ -241,6 +272,15 @@ fn request_material(capability: &HostCapability) -> String {
         HostCapability::DeviceReadQuery { device, argv } => {
             format!("{}\0{}", device.trim(), argv.join("\0"))
         }
+        HostCapability::ReadNetworkCondition { device, interface } => {
+            format!("{}\0{}", device.trim(), interface.trim())
+        }
+        HostCapability::ConfigureNetworkCondition {
+            device, interface, delay_ms, loss_pct, bandwidth_kbps,
+        } => format!(
+            "{}\0{}\0{delay_ms}\0{loss_pct}\0{bandwidth_kbps}",
+            device.trim(), interface.trim(),
+        ),
         HostCapability::SendFile { device, local_path, remote_path }
         | HostCapability::ReceiveFile { device, remote_path, local_path } => format!(
             "{}\0{}\0{}",
@@ -322,6 +362,41 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             let mut args = vec!["-t".into(), device.trim().into(), "shell".into()];
             args.extend(query);
             (args, 30)
+        }
+        HostCapability::ReadNetworkCondition { device, interface } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "tc".into(),
+                "qdisc".into(), "show".into(), "dev".into(), interface.trim().into(),
+            ],
+            10,
+        ),
+        HostCapability::ConfigureNetworkCondition {
+            device, interface, delay_ms, loss_pct, bandwidth_kbps,
+        } => {
+            let mut args = vec![
+                "-t".into(), device.trim().into(), "shell".into(), "tc".into(),
+                "qdisc".into(),
+            ];
+            if *delay_ms == 0 && *loss_pct == 0 && *bandwidth_kbps == 0 {
+                args.extend([
+                    "del".into(), "dev".into(), interface.trim().into(), "root".into(),
+                ]);
+            } else {
+                args.extend([
+                    "replace".into(), "dev".into(), interface.trim().into(), "root".into(),
+                    "netem".into(),
+                ]);
+                if *delay_ms > 0 {
+                    args.extend(["delay".into(), format!("{delay_ms}ms")]);
+                }
+                if *loss_pct > 0 {
+                    args.extend(["loss".into(), format!("{loss_pct}%")]);
+                }
+                if *bandwidth_kbps > 0 {
+                    args.extend(["rate".into(), format!("{bandwidth_kbps}kbit")]);
+                }
+            }
+            (args, 10)
         }
         HostCapability::SendFile { device, local_path, remote_path } => {
             let local = resolve_workspace_source(
@@ -661,6 +736,20 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
             "command": argv.first(),
             "query_digest": short_digest(&argv.join("\0")),
         }),
+        HostCapability::ReadNetworkCondition { device, interface } => serde_json::json!({
+            "device_digest": short_digest(device), "interface": interface,
+        }),
+        HostCapability::ConfigureNetworkCondition {
+            device, interface, delay_ms, loss_pct, bandwidth_kbps,
+        } => serde_json::json!({
+            "device_digest": short_digest(device), "interface": interface,
+            "delay_ms": delay_ms, "loss_pct": loss_pct, "bandwidth_kbps": bandwidth_kbps,
+            "action": if *delay_ms == 0 && *loss_pct == 0 && *bandwidth_kbps == 0 {
+                "clear"
+            } else {
+                "replace"
+            },
+        }),
         HostCapability::SendFile { device, local_path, remote_path } => serde_json::json!({
             "device_digest": short_digest(device), "local_path": local_path,
             "remote_digest": short_digest(remote_path),
@@ -746,6 +835,19 @@ fn validate_device_path(path: &str) -> Result<(), String> {
     }
     if path.split('/').any(|segment| segment == "..") {
         return Err("设备路径不得包含上级目录 ..".into());
+    }
+    Ok(())
+}
+
+fn validate_network_interface(interface: &str) -> Result<(), String> {
+    let interface = interface.trim();
+    if interface.is_empty()
+        || interface.len() > 64
+        || !interface
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err("网络接口名非法".into());
     }
     Ok(())
 }
@@ -1064,6 +1166,54 @@ mod tests {
         }
         .replay_safe());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn network_condition_uses_bounded_fixed_argv() {
+        let read = HostCapability::ReadNetworkCondition {
+            device: "ABC123".into(),
+            interface: "wlan0".into(),
+        };
+        assert_eq!(
+            prepare_invocation(&read, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "tc", "qdisc", "show", "dev", "wlan0"]
+        );
+        assert!(read.replay_safe());
+        let apply = HostCapability::ConfigureNetworkCondition {
+            device: "ABC123".into(),
+            interface: "wlan0".into(),
+            delay_ms: 100,
+            loss_pct: 1,
+            bandwidth_kbps: 500,
+        };
+        assert_eq!(
+            prepare_invocation(&apply, None).unwrap().args,
+            vec![
+                "-t", "ABC123", "shell", "tc", "qdisc", "replace", "dev", "wlan0",
+                "root", "netem", "delay", "100ms", "loss", "1%", "rate", "500kbit"
+            ]
+        );
+        assert!(!apply.replay_safe());
+        let clear = HostCapability::ConfigureNetworkCondition {
+            device: "ABC123".into(),
+            interface: "wlan0".into(),
+            delay_ms: 0,
+            loss_pct: 0,
+            bandwidth_kbps: 0,
+        };
+        assert_eq!(
+            prepare_invocation(&clear, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "tc", "qdisc", "del", "dev", "wlan0", "root"]
+        );
+        assert!(HostCapability::ConfigureNetworkCondition {
+            device: "ABC123".into(),
+            interface: "wlan0;bad".into(),
+            delay_ms: 1,
+            loss_pct: 0,
+            bandwidth_kbps: 0,
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

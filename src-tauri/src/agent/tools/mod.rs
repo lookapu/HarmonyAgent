@@ -659,7 +659,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "set_network_condition",
-        desc: "设置网络条件，模拟弱网/高延迟/丢包（需要 root 或 userdebug）。\n参数：{\"device\":\"<可选>\",\"mode\":\"normal|weak|slow|lossy|custom\",\"custom_bandwidth_kbps\":<kbps>,\"custom_delay_ms\":<ms>,\"custom_loss_pct\":<0-100>}。设备必须在线、已授权并具备 shell；只操作实际在线接口，设置和恢复后均用 tc qdisc 读回确认并记录当前 Run。\n副作用：改变设备所有应用的网络状态；测试必须以 mode=normal 收尾。\n返回：设置参数、接口和读回证据；命令未真实生效时失败并尝试清理。",
+        desc: "设置网络条件，模拟弱网/高延迟/丢包（需要 root 或 userdebug）。\n参数：{\"device\":\"<可选>\",\"mode\":\"normal|weak|slow|lossy|custom\",\"custom_bandwidth_kbps\":<kbps>,\"custom_delay_ms\":<ms>,\"custom_loss_pct\":<0-100>}。设备必须在线、已授权并具备 shell；只操作实际在线接口。Broker 用单次 tc qdisc replace 应用有界参数，normal 使用独立清除能力；设置和恢复后均读回确认并记录当前 Run。\n副作用：改变设备所有应用的网络状态；测试必须以 mode=normal 收尾。\n返回：设置参数、接口和读回证据；命令未真实生效或无法确认时失败并尝试清理。",
     },
     ToolSpec {
         name: "check_signature",

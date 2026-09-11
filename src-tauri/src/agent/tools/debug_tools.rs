@@ -23,6 +23,46 @@ async fn debug_device_query(
     }
 }
 
+async fn read_network_condition(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    interface: &str,
+) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::ReadNetworkCondition {
+        device: device.to_string(),
+        interface: interface.to_string(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(format!("qdisc 查询退出码 {}：{text}", output.status.code().unwrap_or(-1)))
+    }
+}
+
+async fn configure_network_condition(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    interface: &str,
+    delay_ms: u64,
+    loss_pct: u64,
+    bandwidth_kbps: u64,
+) -> Result<(bool, String), String> {
+    let capability = crate::agent::capability_broker::HostCapability::ConfigureNetworkCondition {
+        device: device.to_string(),
+        interface: interface.to_string(),
+        delay_ms,
+        loss_pct,
+        bandwidth_kbps,
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    Ok((output.status.success(), text))
+}
+
 /// search_hilog：在设备 hilog 中按条件搜索。
 pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<String, String> {
     let device = match args["device"].as_str() {
@@ -431,19 +471,24 @@ pub(super) async fn set_network_condition(
         ),
         _ => return Err("mode 必须是 normal/weak/slow/lossy/custom".into()),
     };
+    if mode != "normal" && bandwidth_kbps == 0 && delay_ms == 0 && loss_pct == 0 {
+        return Err("非 normal 网络条件至少需要带宽、延迟或丢包中的一项非零参数".into());
+    }
 
     if mode == "normal" {
         let iface = detect_network_iface(ctx, &device).await.ok_or("未发现可恢复的在线网络接口")?;
-        let output = match run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", &iface, "root"], 10).await {
-            Ok(output) => output,
-            Err(error) if error.to_ascii_lowercase().contains("no such file") => error,
-            Err(error) => return Err(format!("重置网络失败（设备 {device}，接口 {iface}）：{error}")),
-        };
+        let (success, output) = configure_network_condition(ctx, &device, &iface, 0, 0, 0)
+            .await
+            .map_err(|error| format!("重置网络失败（设备 {device}，接口 {iface}）：{error}"))?;
         let lower = output.to_lowercase();
-        if lower.contains("not found") || lower.contains("inaccessible") {
+        let absent_rule = lower.contains("no such file") || lower.contains("no such entry");
+        if (!success && !absent_rule)
+            || lower.contains("not found")
+            || lower.contains("inaccessible")
+        {
             return Err(format!("重置网络失败（设备 {device}，接口 {iface}）：{}", output.trim()));
         }
-        let state = run_hdc_shell(&device, &["tc", "qdisc", "show", "dev", &iface], 10).await?;
+        let state = read_network_condition(ctx, &device, &iface).await?;
         if qdisc_has_impairment(&state) {
             return Err(format!("网络恢复命令已返回，但读回仍存在限速规则（设备 {device}，接口 {iface}）：{}", state.trim()));
         }
@@ -458,32 +503,24 @@ pub(super) async fn set_network_condition(
     let iface = detect_network_iface(ctx, &device).await;
     let iface_str = iface.as_deref().unwrap_or("wlan0");
 
-    // 先删除现有 qdisc
-    let _ = run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", iface_str, "root"], 5).await;
-
-    let mut cmd = vec!["tc", "qdisc", "add", "dev", iface_str, "root", "netem"];
-    let mut owned: Vec<String> = Vec::new();
-    if delay_ms > 0 {
-        owned.push("delay".to_string());
-        owned.push(format!("{delay_ms}ms"));
-    }
-    if loss_pct > 0 {
-        owned.push("loss".to_string());
-        owned.push(format!("{loss_pct}%"));
-    }
-    if bandwidth_kbps > 0 {
-        owned.push("rate".to_string());
-        owned.push(format!("{bandwidth_kbps}kbit"));
-    }
-    for o in &owned {
-        cmd.push(o.as_str());
-    }
-
-    match run_hdc_shell(&device, &cmd, 10).await {
-        Ok(o) if !o.to_lowercase().contains("not found") && !o.contains("No such file") => {
-            let state = run_hdc_shell(&device, &["tc", "qdisc", "show", "dev", iface_str], 10).await?;
+    match configure_network_condition(
+        ctx, &device, iface_str, delay_ms, loss_pct, bandwidth_kbps,
+    ).await {
+        Ok((true, o)) if !o.to_lowercase().contains("not found") && !o.contains("No such file") => {
+            let state = match read_network_condition(ctx, &device, iface_str).await {
+                Ok(state) => state,
+                Err(error) => {
+                    let cleanup = configure_network_condition(ctx, &device, iface_str, 0, 0, 0)
+                        .await
+                        .map(|(success, text)| format!("success={success}, {}", text.trim()))
+                        .unwrap_or_else(|cleanup_error| cleanup_error);
+                    return Err(format!(
+                        "弱网配置后无法读回确认：{error}；已尝试恢复：{cleanup}"
+                    ));
+                }
+            };
             if !qdisc_has_impairment(&state) {
-                let _ = run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", iface_str, "root"], 5).await;
+                let _ = configure_network_condition(ctx, &device, iface_str, 0, 0, 0).await;
                 return Err(format!("弱网命令已返回，但读回未发现 netem/tbf 规则，已尝试恢复：{}", state.trim()));
             }
             let mut out = format!("网络条件已设置（设备 {device}，模式：{mode}）\n");
@@ -501,7 +538,7 @@ pub(super) async fn set_network_condition(
             }));
             Ok(out)
         }
-        Ok(o) => Err(format!("设置网络条件失败：{o}\n\n提示：需要 root 或 userdebug 权限的设备才能使用 tc 命令。")),
+        Ok((_, o)) => Err(format!("设置网络条件失败：{o}\n\n提示：需要 root 或 userdebug 权限的设备才能使用 tc 命令。")),
         Err(e) => Err(format!("设置网络条件失败：{e}\n\n提示：需要 root 或 userdebug 权限的设备才能使用 tc 命令。")),
     }
 }
