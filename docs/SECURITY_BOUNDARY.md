@@ -142,6 +142,8 @@ UI 证据与输入链也已接入 Broker：`take_screenshot`、`verify_ui`、`ru
 
 `record_ui` 的设备 uiRecord start/stop、CSV 拉取和设备端清理也已进入 Broker；远端 CSV 使用受管前缀，本地只允许 canonical 工作区内 `.deveco-agent/ui_records`。进行中录制按设备原子占位，不允许同设备用不同名称并发覆盖；停止时名称必须与启动一致。启动失败释放占位并清理临时文件，拉取无论成功失败都会尝试设备端清理。
 
+性能采样链路也已收敛：`collect_perf` 与 `run_perf_benchmark` 的 pid、`/proc`、thermal zone 和 `top` 查询均经过 replay-safe Broker 能力，重复采样仍逐次校验 Run 租约并审计。
+
 这仍是部分实现：设备属性富化查询、后台视频录屏、模拟器、签名与发布动作尚未完整迁移；后台视频不能直接套用同步能力，需持久长任务租约与进程终态审计。影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
 
 ## 8. 安全测试门禁

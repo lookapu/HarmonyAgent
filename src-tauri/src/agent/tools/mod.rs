@@ -1279,7 +1279,7 @@ pub async fn run_tool(
         "take_screenshot" => take_screenshot(&args, &roots, ctx).await,
         "view_image" => doc_tools::view_image(&args, &roots).await,
         "verify_ui" => verify_ui(&args, &roots, ctx).await,
-        "collect_perf" => collect_perf(&args, &roots).await,
+        "collect_perf" => collect_perf(&args, &roots, ctx).await,
         "deploy_all" => build_tools::deploy_all(&args, &roots, ctx, project_id).await,
         "write_unit_tests" => test_tools::write_unit_tests(&args, &roots).await,
         "run_ui_flow" => test_tools::run_ui_flow(&args, &roots, ctx).await,
@@ -2231,7 +2231,11 @@ async fn verify_ui(
 }
 
 /// collect_perf：采集应用进程级与系统级性能指标，多次采样并标注异常。
-async fn collect_perf(args: &Value, roots: &[String]) -> Result<String, String> {
+async fn collect_perf(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法采集性能".into());
@@ -2262,21 +2266,21 @@ async fn collect_perf(args: &Value, roots: &[String]) -> Result<String, String> 
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         // 系统 CPU（两次 /proc/stat）
-        if let Ok(c) = sample_cpu(&device).await {
+        if let Ok(c) = sample_cpu(&device, ctx).await {
             cpu_vals.push(c);
         }
         // 系统内存
-        if let Ok(m) = sample_sys_mem(&device).await {
+        if let Ok(m) = sample_sys_mem(&device, ctx).await {
             mem_vals.push(m);
         }
         // 温度
-        if let Ok(t) = sample_temp(&device).await {
+        if let Ok(t) = sample_temp(&device, ctx).await {
             temp_vals.push(t);
         }
         // 应用进程内存/CPU（top -b -n 1 -p <pid>）
         if !bundle.is_empty() {
-            if let Ok(pid) = pid_of(&device, &bundle).await {
-                if let Ok((pcpu, pss_mb)) = sample_proc(&device, &pid).await {
+            if let Ok(pid) = pid_of(&device, &bundle, ctx).await {
+                if let Ok((pcpu, pss_mb)) = sample_proc(&device, &pid, ctx).await {
                     proc_cpu_vals.push(pcpu);
                     pss_vals.push(pss_mb);
                 }
@@ -2360,13 +2364,45 @@ fn mean(vals: &[f64]) -> f64 {
     vals.iter().sum::<f64>() / vals.len() as f64
 }
 
-async fn pid_of(device: &str, bundle: &str) -> Result<String, String> {
-    let out = run_hdc_shell(device, &["pidof", bundle], 15).await?;
+async fn execute_perf_query(
+    device: &str,
+    argv: Vec<String>,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv,
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&query, None, ctx).await?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("设备性能查询失败：{}", first_line_or_unknown(&text)));
+    }
+    Ok(text)
+}
+
+async fn pid_of(
+    device: &str,
+    bundle: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let query = crate::agent::capability_broker::HostCapability::DevicePidof {
+        device: device.to_string(),
+        bundle: bundle.to_string(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&query, None, ctx).await?;
+    let out = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&out) {
+        return Err(format!("查询应用进程失败：{}", first_line_or_unknown(&out)));
+    }
     out.split_whitespace().next().map(|s| s.to_string()).ok_or_else(|| "no pid".to_string())
 }
 
-async fn sample_cpu(device: &str) -> Result<f64, String> {
-    let read = || run_hdc_shell(device, &["cat", "/proc/stat"], 15);
+async fn sample_cpu(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let read = || execute_perf_query(device, vec!["cat".into(), "/proc/stat".into()], ctx);
     let a = read().await?;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let b = read().await?;
@@ -2385,8 +2421,11 @@ async fn sample_cpu(device: &str) -> Result<f64, String> {
     Ok(((dt - di) / dt * 100.0).clamp(0.0, 100.0))
 }
 
-async fn sample_sys_mem(device: &str) -> Result<f64, String> {
-    let out = run_hdc_shell(device, &["cat", "/proc/meminfo"], 15).await?;
+async fn sample_sys_mem(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let out = execute_perf_query(device, vec!["cat".into(), "/proc/meminfo".into()], ctx).await?;
     let mut total = 0u64;
     let mut avail = 0u64;
     for line in out.lines() {
@@ -2401,10 +2440,13 @@ async fn sample_sys_mem(device: &str) -> Result<f64, String> {
     Ok((1.0 - avail as f64 / total as f64) * 100.0)
 }
 
-async fn sample_temp(device: &str) -> Result<f64, String> {
+async fn sample_temp(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
     for i in 0..4 {
         let path = format!("/sys/class/thermal/thermal_zone{i}/temp");
-        if let Ok(v) = run_hdc_shell(device, &["cat", &path], 10).await {
+        if let Ok(v) = execute_perf_query(device, vec!["cat".into(), path], ctx).await {
             if let Ok(t) = v.trim().parse::<f64>() {
                 return Ok(if t > 1000.0 { t / 1000.0 } else { t });
             }
@@ -2414,9 +2456,25 @@ async fn sample_temp(device: &str) -> Result<f64, String> {
 }
 
 /// 采样单个进程的 CPU% 与 PSS(MB)。优先 hidumper，回退 top -b -n 1。
-async fn sample_proc(device: &str, pid: &str) -> Result<(f64, f64), String> {
+async fn sample_proc(
+    device: &str,
+    pid: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(f64, f64), String> {
     // 先用 top -b -n 1 -p <pid>，输出含 CPU% 和 RSS
-    let out = run_hdc_shell(device, &["top", "-b", "-n", "1", "-p", pid], 20).await?;
+    let out = execute_perf_query(
+        device,
+        vec![
+            "top".into(),
+            "-b".into(),
+            "-n".into(),
+            "1".into(),
+            "-p".into(),
+            pid.into(),
+        ],
+        ctx,
+    )
+    .await?;
     let mut cpu = 0.0f64;
     let mut rss_kb = 0u64;
     for line in out.lines() {

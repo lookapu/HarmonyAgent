@@ -92,18 +92,18 @@ pub(super) async fn run_perf_benchmark(
         if i > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        if let Ok(c) = sample_cpu(&device).await {
+        if let Ok(c) = sample_cpu(&device, ctx).await {
             sys_cpu.push(c);
         }
-        if let Ok(m) = sample_sys_mem(&device).await {
+        if let Ok(m) = sample_sys_mem(&device, ctx).await {
             sys_mem.push(m);
         }
-        if let Ok(t) = sample_temp(&device).await {
+        if let Ok(t) = sample_temp(&device, ctx).await {
             temp_vals.push(t);
         }
         if !bundle.is_empty() {
-            if let Ok(pid) = pid_of(&device, &bundle).await {
-                if let Ok((pcpu, pss)) = sample_proc(&device, &pid).await {
+            if let Ok(pid) = pid_of(&device, &bundle, ctx).await {
+                if let Ok((pcpu, pss)) = sample_proc(&device, &pid, ctx).await {
                     proc_cpu.push(pcpu);
                     pss_vals.push(pss);
                 }
