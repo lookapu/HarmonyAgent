@@ -1304,7 +1304,7 @@ pub(super) async fn run_ui_flow(
     if verify {
         if let Some(project_path) = roots.first() {
             if !project_path.is_empty() {
-                match capture_screenshot(project_path, &device).await {
+                match capture_screenshot(project_path, &device, ctx).await {
                     Ok((local, _)) => {
                         out.push_str(&format!("\n操作后截图：{}\n[VISION_IMAGE: {}]", local.display(), local.display()));
                         screenshot_path = Some(local);

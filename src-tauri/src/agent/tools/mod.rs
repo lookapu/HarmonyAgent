@@ -1276,9 +1276,9 @@ pub async fn run_tool(
         "read_logcat" => test_tools::read_logcat(&args, ctx).await,
         "read_runtime_logs" => test_tools::read_runtime_logs(&args, &roots, ctx).await,
         "web_fetch" => test_tools::web_fetch(&args).await,
-        "take_screenshot" => take_screenshot(&args, &roots).await,
+        "take_screenshot" => take_screenshot(&args, &roots, ctx).await,
         "view_image" => doc_tools::view_image(&args, &roots).await,
-        "verify_ui" => verify_ui(&args, &roots).await,
+        "verify_ui" => verify_ui(&args, &roots, ctx).await,
         "collect_perf" => collect_perf(&args, &roots).await,
         "deploy_all" => build_tools::deploy_all(&args, &roots, ctx, project_id).await,
         "write_unit_tests" => test_tools::write_unit_tests(&args, &roots).await,
@@ -1909,7 +1909,11 @@ fn hdc_shell_failed(out: &str) -> bool {
 }
 
 /// take_screenshot：截取设备屏幕保存到项目内
-async fn take_screenshot(args: &Value, roots: &[String]) -> Result<String, String> {
+async fn take_screenshot(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法保存截图".into());
@@ -1918,7 +1922,7 @@ async fn take_screenshot(args: &Value, roots: &[String]) -> Result<String, Strin
         Some(d) => d.to_string(),
         None => default_device_id().await?,
     };
-    let (local, _) = capture_screenshot(project_path, &device).await?;
+    let (local, _) = capture_screenshot(project_path, &device, ctx).await?;
     Ok(format!(
         "截图已保存: {}\n（设备 {device}）\n[VISION_IMAGE: {}]",
         local.display(),
@@ -1927,27 +1931,15 @@ async fn take_screenshot(args: &Value, roots: &[String]) -> Result<String, Strin
 }
 
 /// 在设备上截图并拉取到项目截图目录，返回本地路径与设备序列号。
-async fn capture_screenshot(project_path: &str, device: &str) -> Result<(PathBuf, String), String> {
+async fn capture_screenshot(
+    project_path: &str,
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(PathBuf, String), String> {
     // 设备端截图：snapshot_display（鸿蒙标准，-t png 显式输出真 PNG 供 verify_ui 质检）
     // → 失败回退 screencap（AOSP）。路径用 /data/local/tmp（部分鸿蒙设备没有 /sdcard，
     // 且 snapshot_display 按后缀推断格式）；失败判断用文本特征（hdc shell 失败时 exit 仍为 0）。
-    let remote = "/data/local/tmp/deveco_agent_shot.png";
-    let shot = run_hdc_shell(device, &["snapshot_display", "-t", "png", "-f", remote], 30)
-        .await
-        .unwrap_or_default();
-    if hdc_shell_failed(&shot) {
-        let shot2 = run_hdc_shell(device, &["screencap", "-p", remote], 30)
-            .await
-            .unwrap_or_default();
-        if hdc_shell_failed(&shot2) {
-            return Err(format!(
-                "设备截图失败：{}",
-                shot.lines().next().unwrap_or("未知错误")
-            ));
-        }
-    }
-    let dir = Path::new(project_path).join(".deveco-agent").join("screenshots");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let (workspace, dir) = ensure_workspace_subdir(project_path, ".deveco-agent/screenshots")?;
     // 文件名：毫秒时间戳 + 设备号（清洗非字母数字字符）。
     // 必须含设备号：deploy_all 多设备并行/逐台验证时，同秒截图不含设备号会互相覆盖；
     // 时间戳精确到毫秒：同设备连续截图（run_ui_flow 验证 + 随后 verify_ui）间隔小于 1 秒时也会撞名。
@@ -1957,32 +1949,135 @@ async fn capture_screenshot(project_path: &str, device: &str) -> Result<(PathBuf
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let remote = format!("/data/local/tmp/deveco_agent_shot_{nonce}.png");
     let local = dir.join(format!("shot-{ts}-{dev_safe}.png"));
-    let pull = run_cmd(
-        "hdc",
-        &[
-            "-t".to_string(),
-            device.to_string(),
-            "file".to_string(),
-            "recv".to_string(),
-            remote.to_string(),
-            local.to_string_lossy().to_string(),
-        ],
-        None,
-        60,
-    )
-    .await
-    .map_err(|e| with_advice("take_screenshot", e))?;
-    if !local.exists() || std::fs::metadata(&local).map(|m| m.len() == 0).unwrap_or(true) {
-        return Err(format!("截图拉取失败：{pull}"));
+    let snapshot = crate::agent::capability_broker::HostCapability::CaptureDeviceScreenshot {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+        backend: crate::agent::capability_broker::DeviceScreenshotBackend::SnapshotDisplay,
+    };
+    let first = crate::agent::capability_broker::execute_host_capability(&snapshot, None, ctx).await;
+    let first_error = match first {
+        Ok(output) if output.status.success() && !hdc_shell_failed(&host_output_text(&output)) => {
+            None
+        }
+        Ok(output) => Some(host_output_text(&output)),
+        Err(error) => Some(error),
+    };
+    let capture_error = if let Some(first_error) = first_error {
+        let fallback = crate::agent::capability_broker::HostCapability::CaptureDeviceScreenshot {
+            device: device.to_string(),
+            remote_path: remote.clone(),
+            backend: crate::agent::capability_broker::DeviceScreenshotBackend::Screencap,
+        };
+        match crate::agent::capability_broker::execute_host_capability(&fallback, None, ctx).await {
+            Ok(output) => {
+                let text = host_output_text(&output);
+                if output.status.success() && !hdc_shell_failed(&text) {
+                    None
+                } else {
+                    Some(format!(
+                        "snapshot_display: {}；screencap: {}",
+                        first_line_or_unknown(&first_error),
+                        first_line_or_unknown(&text),
+                    ))
+                }
+            }
+            Err(error) => Some(format!(
+                "snapshot_display: {}；screencap: {error}",
+                first_line_or_unknown(&first_error),
+            )),
+        }
+    } else {
+        None
+    };
+    if let Some(error) = capture_error {
+        let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+            device: device.to_string(),
+            remote_path: remote,
+        };
+        let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+        return Err(format!("设备截图失败：{error}"));
     }
-    // 清理设备端临时文件，避免多次截图累积
-    let _ = run_hdc_shell(device, &["rm", remote], 10).await;
+    let relative = local
+        .strip_prefix(&workspace)
+        .map_err(|_| "截图目标越出项目工作区")?
+        .to_string_lossy()
+        .into_owned();
+    let receive = crate::agent::capability_broker::HostCapability::ReceiveFile {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+        local_path: relative,
+    };
+    let pull = crate::agent::capability_broker::execute_host_capability(
+        &receive,
+        Some(&workspace),
+        ctx,
+    )
+    .await;
+    let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+        device: device.to_string(),
+        remote_path: remote,
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+    let pull = pull.map_err(|error| with_advice("take_screenshot", error))?;
+    let pull_text = host_output_text(&pull);
+    if !pull.status.success() || hdc_shell_failed(&pull_text) {
+        return Err(format!("截图拉取失败：{pull_text}"));
+    }
+    if !local.exists() || std::fs::metadata(&local).map(|m| m.len() == 0).unwrap_or(true) {
+        return Err(format!("截图拉取失败：{pull_text}"));
+    }
     Ok((local, device.to_string()))
 }
 
+fn host_output_text(output: &std::process::Output) -> String {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    text
+}
+
+fn first_line_or_unknown(text: &str) -> &str {
+    text.lines().find(|line| !line.trim().is_empty()).unwrap_or("未知错误")
+}
+
+fn ensure_workspace_subdir(project_path: &str, relative: &str) -> Result<(PathBuf, PathBuf), String> {
+    let root = Path::new(project_path)
+        .canonicalize()
+        .map_err(|error| format!("无法解析项目工作区：{error}"))?;
+    let requested = root.join(relative);
+    let mut existing = requested.as_path();
+    while !existing.exists() {
+        existing = existing.parent().ok_or("输出目录缺少已有父目录")?;
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| format!("无法解析输出目录父级：{error}"))?;
+    if !canonical_existing.starts_with(&root) {
+        return Err("输出目录通过符号链接逃逸项目工作区".into());
+    }
+    std::fs::create_dir_all(&requested).map_err(|error| format!("创建输出目录失败：{error}"))?;
+    let directory = requested
+        .canonicalize()
+        .map_err(|error| format!("无法解析输出目录：{error}"))?;
+    if !directory.starts_with(&root) || !directory.is_dir() {
+        return Err("输出目录必须位于项目工作区内".into());
+    }
+    Ok((root, directory))
+}
+
 /// verify_ui：截图 + 自动质检（黑屏/白屏/异常纯色），返回结论与截图路径供多模态查看。
-async fn verify_ui(args: &Value, roots: &[String]) -> Result<String, String> {
+async fn verify_ui(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法截图验证".into());
@@ -1992,7 +2087,7 @@ async fn verify_ui(args: &Value, roots: &[String]) -> Result<String, String> {
         None => default_device_id().await?,
     };
     let expect = args["expect"].as_str().unwrap_or("");
-    let (local, _) = capture_screenshot(project_path, &device).await?;
+    let (local, _) = capture_screenshot(project_path, &device, ctx).await?;
 
     let bytes = std::fs::read(&local).map_err(|e| format!("读取截图失败: {e}"))?;
     let mut report = String::new();

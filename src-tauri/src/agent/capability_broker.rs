@@ -16,6 +16,22 @@ pub enum FaultLogDirectory {
     Root,
 }
 
+/// 设备截图后端。枚举值由 Broker 映射为固定 argv，调用方不能注入命令片段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceScreenshotBackend {
+    SnapshotDisplay,
+    Screencap,
+}
+
+impl DeviceScreenshotBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SnapshotDisplay => "snapshot_display",
+            Self::Screencap => "screencap",
+        }
+    }
+}
+
 impl FaultLogDirectory {
     pub fn as_path(self) -> &'static str {
         match self {
@@ -75,6 +91,16 @@ pub enum HostCapability {
     SendFile { device: String, local_path: String, remote_path: String },
     /// 把设备绝对路径拉取到工作区内。
     ReceiveFile { device: String, remote_path: String, local_path: String },
+    /// 截图到 Broker 管理的设备临时文件。
+    CaptureDeviceScreenshot {
+        device: String,
+        remote_path: String,
+        backend: DeviceScreenshotBackend,
+    },
+    /// 把当前 UI 层级导出到 Broker 管理的设备临时文件。
+    DumpUiLayout { device: String, remote_path: String },
+    /// 删除 Broker 管理的单个设备临时文件。
+    RemoveDeviceTempFile { device: String, remote_path: String },
     /// 强制停止明确 bundle 的应用进程。
     StopAbility { device: String, bundle: String },
     /// 卸载明确 bundle；用于新装部署失败后的补偿。
@@ -108,6 +134,9 @@ impl HostCapability {
             Self::ConfigureNetworkCondition { .. } => "device.network_condition.configure",
             Self::SendFile { .. } => "device.file_send",
             Self::ReceiveFile { .. } => "device.file_receive",
+            Self::CaptureDeviceScreenshot { .. } => "device.screenshot.capture",
+            Self::DumpUiLayout { .. } => "device.ui_layout.dump",
+            Self::RemoveDeviceTempFile { .. } => "device.temp_file.remove",
             Self::StopAbility { .. } => "device.stop_ability",
             Self::UninstallBundle { .. } => "deploy.uninstall_bundle",
             Self::InstallHap { .. } => "deploy.install",
@@ -195,6 +224,12 @@ impl HostCapability {
                 validate_device_target(device)?;
                 validate_workspace_relative_path(local_path)?;
                 validate_device_path(remote_path)
+            }
+            Self::CaptureDeviceScreenshot { device, remote_path, .. }
+            | Self::DumpUiLayout { device, remote_path }
+            | Self::RemoveDeviceTempFile { device, remote_path } => {
+                validate_device_target(device)?;
+                validate_managed_device_temp_path(remote_path)
             }
             Self::StopAbility { device, bundle } | Self::UninstallBundle { device, bundle } => {
                 validate_device_target(device)?;
@@ -317,6 +352,13 @@ fn request_material(capability: &HostCapability) -> String {
             "{}\0{}\0{}",
             device.trim(), local_path.trim(), remote_path.trim(),
         ),
+        HostCapability::CaptureDeviceScreenshot { device, remote_path, backend } => format!(
+            "{}\0{}\0{}", device.trim(), remote_path.trim(), backend.as_str(),
+        ),
+        HostCapability::DumpUiLayout { device, remote_path }
+        | HostCapability::RemoveDeviceTempFile { device, remote_path } => {
+            format!("{}\0{}", device.trim(), remote_path.trim())
+        }
         HostCapability::StopAbility { device, bundle }
         | HostCapability::UninstallBundle { device, bundle } => {
             format!("{}\0{}", device.trim(), bundle.trim())
@@ -467,6 +509,34 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
                 120,
             )
         }
+        HostCapability::CaptureDeviceScreenshot { device, remote_path, backend } => {
+            let command = match backend {
+                DeviceScreenshotBackend::SnapshotDisplay => vec![
+                    "snapshot_display".into(), "-t".into(), "png".into(), "-f".into(),
+                    remote_path.trim().into(),
+                ],
+                DeviceScreenshotBackend::Screencap => vec![
+                    "screencap".into(), "-p".into(), remote_path.trim().into(),
+                ],
+            };
+            let mut args = vec!["-t".into(), device.trim().into(), "shell".into()];
+            args.extend(command);
+            (args, 30)
+        }
+        HostCapability::DumpUiLayout { device, remote_path } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "uitest".into(),
+                "dumpLayout".into(), "-p".into(), remote_path.trim().into(),
+            ],
+            30,
+        ),
+        HostCapability::RemoveDeviceTempFile { device, remote_path } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "rm".into(), "-f".into(),
+                remote_path.trim().into(),
+            ],
+            10,
+        ),
         HostCapability::StopAbility { device, bundle } => (
             vec![
                 "-t".into(), device.trim().into(), "shell".into(), "aa".into(),
@@ -808,6 +878,14 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
             "device_digest": short_digest(device), "remote_digest": short_digest(remote_path),
             "local_path": local_path,
         }),
+        HostCapability::CaptureDeviceScreenshot { device, remote_path, backend } => serde_json::json!({
+            "device_digest": short_digest(device), "remote_digest": short_digest(remote_path),
+            "backend": backend.as_str(),
+        }),
+        HostCapability::DumpUiLayout { device, remote_path }
+        | HostCapability::RemoveDeviceTempFile { device, remote_path } => serde_json::json!({
+            "device_digest": short_digest(device), "remote_digest": short_digest(remote_path),
+        }),
         HostCapability::StopAbility { device, bundle }
         | HostCapability::UninstallBundle { device, bundle } => serde_json::json!({
             "device_digest": short_digest(device), "bundle": bundle,
@@ -892,6 +970,26 @@ fn validate_device_path(path: &str) -> Result<(), String> {
     }
     if path.split('/').any(|segment| segment == "..") {
         return Err("设备路径不得包含上级目录 ..".into());
+    }
+    Ok(())
+}
+
+fn validate_managed_device_temp_path(path: &str) -> Result<(), String> {
+    const PREFIX: &str = "/data/local/tmp/deveco_agent_";
+    let path = path.trim();
+    let basename = path
+        .strip_prefix(PREFIX)
+        .ok_or("设备临时文件必须位于 Broker 管理前缀 /data/local/tmp/deveco_agent_")?;
+    if basename.is_empty()
+        || basename.len() > 220
+        || basename.starts_with('.')
+        || basename.contains('/')
+        || !basename
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        || !matches!(Path::new(basename).extension().and_then(|value| value.to_str()), Some("png" | "json" | "mp4"))
+    {
+        return Err("设备临时文件必须是受管前缀下的安全 .png/.json/.mp4 basename".into());
     }
     Ok(())
 }
@@ -1247,6 +1345,74 @@ mod tests {
         }
         .replay_safe());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn device_capture_temp_files_use_scoped_fixed_argv() {
+        let remote = "/data/local/tmp/deveco_agent_shot_20250101.png";
+        let snapshot = HostCapability::CaptureDeviceScreenshot {
+            device: "ABC123".into(),
+            remote_path: remote.into(),
+            backend: DeviceScreenshotBackend::SnapshotDisplay,
+        };
+        assert_eq!(
+            prepare_invocation(&snapshot, None).unwrap().args,
+            vec![
+                "-t", "ABC123", "shell", "snapshot_display", "-t", "png", "-f", remote,
+            ]
+        );
+        assert!(!snapshot.replay_safe());
+        assert_eq!(
+            prepare_invocation(
+                &HostCapability::CaptureDeviceScreenshot {
+                    device: "ABC123".into(),
+                    remote_path: remote.into(),
+                    backend: DeviceScreenshotBackend::Screencap,
+                },
+                None,
+            )
+            .unwrap()
+            .args,
+            vec!["-t", "ABC123", "shell", "screencap", "-p", remote]
+        );
+        let layout = "/data/local/tmp/deveco_agent_layout_20250101.json";
+        assert_eq!(
+            prepare_invocation(
+                &HostCapability::DumpUiLayout {
+                    device: "ABC123".into(),
+                    remote_path: layout.into(),
+                },
+                None,
+            )
+            .unwrap()
+            .args,
+            vec!["-t", "ABC123", "shell", "uitest", "dumpLayout", "-p", layout]
+        );
+        assert_eq!(
+            prepare_invocation(
+                &HostCapability::RemoveDeviceTempFile {
+                    device: "ABC123".into(),
+                    remote_path: layout.into(),
+                },
+                None,
+            )
+            .unwrap()
+            .args,
+            vec!["-t", "ABC123", "shell", "rm", "-f", layout]
+        );
+        for invalid in [
+            "/data/local/tmp/layout.json",
+            "/data/local/tmp/deveco_agent_../layout.json",
+            "/data/local/tmp/deveco_agent_bad;name.png",
+            "/data/local/tmp/deveco_agent_script.sh",
+        ] {
+            assert!(HostCapability::DumpUiLayout {
+                device: "ABC123".into(),
+                remote_path: invalid.into(),
+            }
+            .validate()
+            .is_err());
+        }
     }
 
     #[test]
