@@ -13,17 +13,43 @@ struct MockRoute {
     response: serde_json::Value,
 }
 
-/// 包装 output_blocking：返回 stdout 字符串（阻塞调用放入 blocking 线程池，避免钉死 tokio worker）
-/// 接受任意 AsRef<str> 切片，支持混合 &str / &String
-async fn hdc_shell<S: AsRef<str>>(args: &[S]) -> Result<String, String> {
-    let owned: Vec<String> = args.iter().map(|s| s.as_ref().to_string()).collect();
-    tokio::task::spawn_blocking(move || {
-        let out = crate::utils::process::output_blocking("hdc", &owned)
-            .map_err(|e| format!("hdc 执行失败: {e}"))?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    })
-    .await
-    .map_err(|e| format!("hdc 任务失败: {e}"))?
+async fn execute_debug_capability(
+    capability: &crate::agent::capability_broker::HostCapability,
+    label: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let output = crate::agent::capability_broker::execute_host_capability(capability, None, ctx)
+        .await
+        .map_err(|error| format!("{label}失败: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let combined = format!("{stdout}\n{stderr}");
+    if !output.status.success() || debugger_command_failed(&combined) {
+        let detail = combined.trim();
+        return Err(format!(
+            "{label}失败{}",
+            if detail.is_empty() { String::new() } else { format!("：{detail}") }
+        ));
+    }
+    Ok(stdout)
+}
+
+fn debugger_command_failed(output: &str) -> bool {
+    let normalized = output.to_ascii_lowercase();
+    ["[fail]", "error:", "not found", "no such", "unknown command", "permission denied"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn parse_pid(raw: &str, label: &str) -> Result<u32, String> {
+    let value = raw.split_whitespace().next().unwrap_or("");
+    let pid = value
+        .parse::<u32>()
+        .map_err(|_| format!("{label}必须是大于 0 的十进制 PID"))?;
+    if pid == 0 {
+        return Err(format!("{label}必须大于 0"));
+    }
+    Ok(pid)
 }
 pub async fn api_test(args: &Value, roots: &[String]) -> Result<String, String> {
     let spec_raw = args["spec"].as_str().ok_or("api_test 需要参数 {\"spec\":\"<OpenAPI JSON 路径或内联>\"}")?;
@@ -298,19 +324,11 @@ pub async fn api_health(args: &Value) -> Result<String, String> {
 pub async fn attach_debugger(
     args: &Value,
     roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => {
-            // 默认设备：从 hdc 找 ★ 标记的
-            hdc_shell(&["list", "targets"])
-                .await
-                .map_err(|e| format!("hdc list targets 失败: {e}"))?
-                .lines()
-                .find(|l| l.contains('\t') || l.contains("[empty]"))
-                .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
-                .ok_or_else(|| "未找到默认设备，请先 list_devices".to_string())?
-        }
+        None => crate::agent::tools::default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -325,19 +343,46 @@ pub async fn attach_debugger(
         }
     };
     if bundle.is_empty() { return Err("无法确定应用包名".into()); }
-    let wait_secs = args["wait_secs"].as_u64().unwrap_or(30);
+    let wait_secs = args["wait_secs"].as_u64().unwrap_or(30).clamp(1, 120);
 
     // 1) 拿 pid
-    let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).await.map_err(|e| format!("hdc pidof 失败: {e}"))?;
-    let pid = pid_out.trim();
-    if pid.is_empty() {
+    let pid_query = crate::agent::capability_broker::HostCapability::DevicePidof {
+        device: device.clone(),
+        bundle: bundle.clone(),
+    };
+    let pid_out = execute_debug_capability(&pid_query, "查询应用 PID", ctx).await?;
+    if pid_out.trim().is_empty() {
         return Err("应用未运行或 pidof 返回空（先 deploy 启动应用）".to_string());
     }
+    let pid = parse_pid(&pid_out, "pidof 输出")?;
 
     // 2) attach 调试器（hdc shell debuggerd attach <pid>，系统服务）
     //    注：DevEco 工程的 attach 通常用 `aa debug -b <bundle>` 启动开发模式；
     //    这里是运行时 attach，更轻量。
-    let attach_out = hdc_shell(&["-t", &device, "shell", "debuggerd", &format!("-p {pid}")]).await.map_err(|e| format!("debuggerd attach 失败: {e}"));
+    let attach = crate::agent::capability_broker::HostCapability::AttachDeviceDebugger {
+        device: device.clone(),
+        pid,
+        wait_seconds: wait_secs,
+    };
+    let attach_output = crate::agent::capability_broker::execute_host_capability(&attach, None, ctx)
+        .await
+        .map_err(|error| {
+            format!(
+                "debuggerd attach 未取得确定终态，为避免叠加设备副作用，未自动执行 aa debug 回退：{error}"
+            )
+        })?;
+    let attach_stdout = String::from_utf8_lossy(&attach_output.stdout).into_owned();
+    let attach_stderr = String::from_utf8_lossy(&attach_output.stderr).into_owned();
+    let attach_detail = format!("{attach_stdout}\n{attach_stderr}");
+    let attach_out = if attach_output.status.success() && !debugger_command_failed(&attach_detail) {
+        Ok(attach_stdout)
+    } else {
+        Err(if attach_detail.trim().is_empty() {
+            "debuggerd attach 返回失败状态".to_string()
+        } else {
+            format!("debuggerd attach 失败：{}", attach_detail.trim())
+        })
+    };
 
     match attach_out {
         Ok(out) => Ok(format!(
@@ -346,7 +391,11 @@ pub async fn attach_debugger(
         )),
         Err(e) => {
             // 退路：尝试 aa debug 启动开发模式
-            let aa = hdc_shell(&["-t", &device, "shell", "aa", "debug", "-b", &bundle]).await;
+            let fallback = crate::agent::capability_broker::HostCapability::EnableAbilityDebug {
+                device: device.clone(),
+                bundle: bundle.clone(),
+            };
+            let aa = execute_debug_capability(&fallback, "启用 Ability 调试模式", ctx).await;
             match aa {
                 Ok(out2) => Ok(format!(
                     "调试器已通过 aa debug 启动：设备 {device} / 包 {bundle} / PID {pid}\n输出：{}\n",
@@ -363,22 +412,15 @@ pub async fn attach_debugger(
 pub async fn step_debug(
     args: &Value,
     roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => {
-            hdc_shell(&["list", "targets"])
-                .await
-                .map_err(|e| format!("hdc list targets 失败: {e}"))?
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
-                .ok_or_else(|| "未找到默认设备".to_string())?
-        }
+        None => crate::agent::tools::default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let pid = match args["pid"].as_str() {
-        Some(p) => p.to_string(),
+        Some(p) => parse_pid(p, "pid")?,
         None => {
             if project_path.is_empty() {
                 return Err("未指定 pid 且当前会话未绑定工程".into());
@@ -386,27 +428,34 @@ pub async fn step_debug(
             let bundle = crate::services::harmony::parse_project(std::path::Path::new(project_path))
                 .bundle_name
                 .ok_or_else(|| "无法确定应用包名".to_string())?;
-            let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).await.map_err(|e| format!("hdc pidof 失败: {e}"))?;
-            let p = pid_out.trim().to_string();
-            if p.is_empty() {
+            let query = crate::agent::capability_broker::HostCapability::DevicePidof {
+                device: device.clone(),
+                bundle,
+            };
+            let pid_out = execute_debug_capability(&query, "查询应用 PID", ctx).await?;
+            if pid_out.trim().is_empty() {
                 return Err("应用未运行（先 deploy 启动或 attach_debugger）".into());
             }
-            p
+            parse_pid(&pid_out, "pidof 输出")?
         }
     };
     let action = args["action"].as_str().unwrap_or("step");
-    // debuggerd 命令映射
-    let cmd = match action {
-        "step" => "s",        // step into
-        "next" => "n",        // step over
-        "continue" | "cont" | "c" => "c",
-        "interrupt" | "int" => "i",
-        "where" | "bt" | "backtrace" => "bt",
-        "info" | "registers" => "r",
+    let debugger_action = match action {
+        "step" => crate::agent::capability_broker::DeviceDebuggerAction::Step,
+        "next" => crate::agent::capability_broker::DeviceDebuggerAction::Next,
+        "continue" | "cont" | "c" => crate::agent::capability_broker::DeviceDebuggerAction::Continue,
+        "interrupt" | "int" => crate::agent::capability_broker::DeviceDebuggerAction::Interrupt,
+        "where" | "bt" | "backtrace" => crate::agent::capability_broker::DeviceDebuggerAction::Backtrace,
+        "info" | "registers" => crate::agent::capability_broker::DeviceDebuggerAction::Registers,
         other => return Err(format!("不支持的 step_debug action: {other}（step/next/continue/interrupt/where/info）")),
     };
 
-    let out = hdc_shell(&["-t", &device, "shell", "debuggerd", &format!("-p {pid} -c {cmd}")]).await.map_err(|e| format!("debuggerd 命令失败: {e}"))?;
+    let control = crate::agent::capability_broker::HostCapability::ControlDeviceDebugger {
+        device: device.clone(),
+        pid,
+        action: debugger_action,
+    };
+    let out = execute_debug_capability(&control, "debuggerd 命令", ctx).await?;
 
     Ok(format!(
         "单步调试（设备 {device} / PID {pid} / action={action}）：\n{}",

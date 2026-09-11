@@ -1434,8 +1434,8 @@ pub async fn run_tool(
         "vuln_scan" => quality_tools::vuln_scan(&args, &roots).await,
         "docx_read" => quality_tools::docx_read(&args, &roots).await,
         "audio_transcribe" => quality_tools::audio_transcribe(&args, &roots).await,
-        "attach_debugger" => quality_tools::attach_debugger(&args, &roots).await,
-        "step_debug" => quality_tools::step_debug(&args, &roots).await,
+        "attach_debugger" => quality_tools::attach_debugger(&args, &roots, ctx).await,
+        "step_debug" => quality_tools::step_debug(&args, &roots, ctx).await,
         "ota_pack" => quality_tools::ota_pack(&args, &roots).await,
         other => Err(format!("未知工具: {other}")),
       }

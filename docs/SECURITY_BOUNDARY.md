@@ -148,6 +148,8 @@ UI 证据与输入链也已接入 Broker：`take_screenshot`、`verify_ui`、`ru
 
 Agent 设备清单的型号、系统/API、ABI、屏幕与工具能力富化使用受限 `param get`、`wm size` 与三个固定 `command -v` 探测；默认设备选择只读取一次已审计 targets，不为单纯选设备重复富化。`device_perf` 的 CPU、内存、电量与温度采样同样经过 replay-safe 查询能力。前端独立设备面板继续使用无 Agent Run 身份的 Tauri 查询路径，两类调用不会混用审计身份。
 
+设备调试链也已进入 Broker：`attach_debugger` 和 `step_debug` 的默认设备枚举与 bundle PID 查询使用 replay-safe 窄能力，debuggerd attach、Ability 调试模式回退及 step/next/continue/interrupt/backtrace/registers 控制使用不可自动重放的独立能力。PID 必须是非零 `u32`，动作是封闭枚举，attach 等待上限为 120 秒，最终执行层只生成固定 argv。只有收到明确的进程失败终态才允许从 debuggerd attach 回退到 `aa debug`；超时、执行通道中断等 `indeterminate` 结果失败关闭，避免在未知 attach 状态上叠加副作用。Agent 工具目录已不再直接创建裸 HDC 进程。
+
 这仍是部分实现：模拟器进程、签名与发布动作尚未完整迁移。影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
 
 ## 8. 安全测试门禁

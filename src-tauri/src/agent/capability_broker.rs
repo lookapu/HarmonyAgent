@@ -60,6 +60,30 @@ pub enum DeviceRadioBackend {
     GlobalSettings,
 }
 
+/// Broker 支持的有限 debuggerd 控制动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceDebuggerAction {
+    Step,
+    Next,
+    Continue,
+    Interrupt,
+    Backtrace,
+    Registers,
+}
+
+impl DeviceDebuggerAction {
+    fn as_command(self) -> &'static str {
+        match self {
+            Self::Step => "s",
+            Self::Next => "n",
+            Self::Continue => "c",
+            Self::Interrupt => "i",
+            Self::Backtrace => "bt",
+            Self::Registers => "r",
+        }
+    }
+}
+
 impl DeviceScreenshotBackend {
     fn as_str(self) -> &'static str {
         match self {
@@ -94,6 +118,16 @@ pub enum HostCapability {
     HdcKillServer,
     /// 查询指定 bundle 的进程 id。
     DevicePidof { device: String, bundle: String },
+    /// 把 debuggerd 附加到明确的设备进程。
+    AttachDeviceDebugger { device: String, pid: u32, wait_seconds: u64 },
+    /// 为明确 bundle 启用 Ability 调试模式，作为 debuggerd attach 的兼容回退。
+    EnableAbilityDebug { device: String, bundle: String },
+    /// 向已附加的 debuggerd 会话发送一个枚举化控制动作。
+    ControlDeviceDebugger {
+        device: String,
+        pid: u32,
+        action: DeviceDebuggerAction,
+    },
     /// 查询用于签名 profile 匹配的设备 UDID。
     ReadDeviceUdid { device: String },
     /// 读取设备历史 hilog，可选最低级别和 tag。
@@ -196,6 +230,9 @@ impl HostCapability {
             Self::HdcStartServer => "hdc.start_server",
             Self::HdcKillServer => "hdc.kill_server",
             Self::DevicePidof { .. } => "device.pidof",
+            Self::AttachDeviceDebugger { .. } => "device.debugger.attach",
+            Self::EnableAbilityDebug { .. } => "device.debugger.enable_ability",
+            Self::ControlDeviceDebugger { .. } => "device.debugger.control",
             Self::ReadDeviceUdid { .. } => "device.read_udid",
             Self::ReadHilog { .. } => "device.read_hilog",
             Self::SearchHilog { .. } => "device.search_hilog",
@@ -236,6 +273,22 @@ impl HostCapability {
             }
             Self::HdcListTargets | Self::HdcStartServer | Self::HdcKillServer => Ok(()),
             Self::DevicePidof { device, bundle } => {
+                validate_device_target(device)?;
+                validate_app_identifier(bundle, "bundle")
+            }
+            Self::AttachDeviceDebugger { device, pid, wait_seconds } => {
+                validate_device_target(device)?;
+                validate_process_id(*pid)?;
+                if !(1..=120).contains(wait_seconds) {
+                    return Err("调试器等待时长必须在 1-120 秒之间".into());
+                }
+                Ok(())
+            }
+            Self::ControlDeviceDebugger { device, pid, .. } => {
+                validate_device_target(device)?;
+                validate_process_id(*pid)
+            }
+            Self::EnableAbilityDebug { device, bundle } => {
                 validate_device_target(device)?;
                 validate_app_identifier(bundle, "bundle")
             }
@@ -461,6 +514,15 @@ fn request_material(capability: &HostCapability) -> String {
         HostCapability::DevicePidof { device, bundle } => {
             format!("{}\0{}", device.trim(), bundle.trim())
         }
+        HostCapability::AttachDeviceDebugger { device, pid, wait_seconds } => {
+            format!("{}\0{pid}\0{wait_seconds}", device.trim())
+        }
+        HostCapability::EnableAbilityDebug { device, bundle } => {
+            format!("{}\0{}", device.trim(), bundle.trim())
+        }
+        HostCapability::ControlDeviceDebugger { device, pid, action } => {
+            format!("{}\0{pid}\0{}", device.trim(), action.as_command())
+        }
         HostCapability::ReadDeviceUdid { device } => device.trim().to_string(),
         HostCapability::ReadHilog { device, level, tag } => format!(
             "{}\0{}\0{}",
@@ -591,6 +653,27 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
                 bundle.trim().into(),
             ],
             15,
+        ),
+        HostCapability::AttachDeviceDebugger { device, pid, wait_seconds } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "debuggerd".into(),
+                "-p".into(), pid.to_string(),
+            ],
+            *wait_seconds,
+        ),
+        HostCapability::EnableAbilityDebug { device, bundle } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "aa".into(),
+                "debug".into(), "-b".into(), bundle.trim().into(),
+            ],
+            30,
+        ),
+        HostCapability::ControlDeviceDebugger { device, pid, action } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "debuggerd".into(),
+                "-p".into(), pid.to_string(), "-c".into(), action.as_command().into(),
+            ],
+            30,
         ),
         HostCapability::ReadDeviceUdid { device } => (
             vec![
@@ -1251,6 +1334,13 @@ fn validate_app_identifier(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_process_id(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("进程 PID 必须大于 0".into());
+    }
+    Ok(())
+}
+
 fn audit_subject(capability: &HostCapability) -> serde_json::Value {
     match capability {
         HostCapability::HdcConnect { target } | HostCapability::HdcDisconnect { target } =>
@@ -1260,6 +1350,16 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         | HostCapability::HdcKillServer => serde_json::json!({}),
         HostCapability::DevicePidof { device, bundle } => serde_json::json!({
             "device_digest": short_digest(device), "bundle": bundle,
+        }),
+        HostCapability::AttachDeviceDebugger { device, pid, wait_seconds } => serde_json::json!({
+            "device_digest": short_digest(device), "pid": pid, "wait_seconds": wait_seconds,
+        }),
+        HostCapability::EnableAbilityDebug { device, bundle } => serde_json::json!({
+            "device_digest": short_digest(device), "bundle": bundle,
+        }),
+        HostCapability::ControlDeviceDebugger { device, pid, action } => serde_json::json!({
+            "device_digest": short_digest(device), "pid": pid,
+            "action": action.as_command(),
         }),
         HostCapability::ReadDeviceUdid { device } => serde_json::json!({
             "device_digest": short_digest(device),
@@ -2223,6 +2323,58 @@ mod tests {
             radio: DeviceRadio::AirplaneMode,
             enable: true,
             backend: DeviceRadioBackend::WpaCli,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn debugger_capabilities_use_typed_fixed_argv() {
+        let attach = HostCapability::AttachDeviceDebugger {
+            device: "ABC123".into(),
+            pid: 4242,
+            wait_seconds: 45,
+        };
+        let attach_invocation = prepare_invocation(&attach, None).unwrap();
+        assert_eq!(
+            attach_invocation.args,
+            vec!["-t", "ABC123", "shell", "debuggerd", "-p", "4242"]
+        );
+        assert_eq!(attach_invocation.timeout_seconds, 45);
+        assert!(!attach.replay_safe());
+
+        let enable = HostCapability::EnableAbilityDebug {
+            device: "ABC123".into(),
+            bundle: "com.example.app".into(),
+        };
+        assert_eq!(
+            prepare_invocation(&enable, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "aa", "debug", "-b", "com.example.app"]
+        );
+
+        let control = HostCapability::ControlDeviceDebugger {
+            device: "ABC123".into(),
+            pid: 4242,
+            action: DeviceDebuggerAction::Backtrace,
+        };
+        assert_eq!(
+            prepare_invocation(&control, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "debuggerd", "-p", "4242", "-c", "bt"]
+        );
+        assert_eq!(control.capability_id(), "device.debugger.control");
+        assert!(!control.replay_safe());
+
+        assert!(HostCapability::AttachDeviceDebugger {
+            device: "ABC123".into(),
+            pid: 0,
+            wait_seconds: 30,
+        }
+        .validate()
+        .is_err());
+        assert!(HostCapability::AttachDeviceDebugger {
+            device: "ABC123".into(),
+            pid: 42,
+            wait_seconds: 121,
         }
         .validate()
         .is_err());
