@@ -1231,7 +1231,7 @@ pub async fn run_tool(
         "device_file" => device_tools::device_file(&args, &roots, ctx).await,
         "stop_app" => device_tools::stop_app(&args, &roots, ctx).await,
         "device_shell" => device_tools::device_shell(&args).await,
-        "analyze_crash" => device_tools::analyze_crash(&args, &roots).await,
+        "analyze_crash" => device_tools::analyze_crash(&args, &roots, ctx).await,
         "ohpm_search" => build_tools::ohpm_search(&args, &roots, db).await,
         "ohpm_recommend" => build_tools::ohpm_recommend(&args, db).await,
         "build_project" => build_tools::build_project(&args, &roots, ctx, project_id).await,
@@ -5391,6 +5391,17 @@ mod tests {
         assert_eq!(super::device_tools::crash_time_key("backup.log"), 0);
         // 多段数字取最大（含 14 位之外的更长时间戳干扰）
         assert_eq!(super::device_tools::crash_time_key("x20240101120000y-20250102123456z"), 20250102123456);
+    }
+
+    #[test]
+    fn faultlog_listing_only_accepts_safe_basenames() {
+        assert!(super::device_tools::is_safe_faultlog_name(
+            "JsError-com.example.app-20250102123456.log"
+        ));
+        assert!(!super::device_tools::is_safe_faultlog_name("../20250102123456.log"));
+        assert!(!super::device_tools::is_safe_faultlog_name("x/20250102123456.log"));
+        assert!(!super::device_tools::is_safe_faultlog_name(".20250102123456.log"));
+        assert!(!super::device_tools::is_safe_faultlog_name("crash.log"));
     }
 
     #[test]

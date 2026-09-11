@@ -606,44 +606,55 @@ pub(super) async fn device_shell(args: &Value) -> Result<String, String> {
     Ok(format!("设备 {device} 执行 `{command}`：\n{truncated}"))
 }
 
-pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn analyze_crash(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
     };
-    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    let project_path = roots.first().map(String::as_str).filter(|path| !path.is_empty())
+        .ok_or("analyze_crash 需要绑定项目工作区")?;
+    let project_root = Path::new(project_path)
+        .canonicalize()
+        .map_err(|e| format!("无法解析项目工作区：{e}"))?;
     let bundle = match args["bundle"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(b) => b.to_string(),
         None => {
-            if project_path.is_empty() {
-                String::new()
-            } else {
-                crate::services::harmony::parse_project(Path::new(project_path))
-                    .bundle_name
-                    .unwrap_or_default()
-            }
+            crate::services::harmony::parse_project(&project_root)
+                .bundle_name
+                .unwrap_or_default()
         }
     };
     let limit = args["limit"].as_u64().unwrap_or(3).clamp(1, 10) as usize;
     // 1) 扫描 faultlog 目录（真机权限可能受限，多个候选目录逐个尝试）
-    let dirs = ["/data/log/faultlog/faultlogger", "/data/log/faultlog/temp", "/data/log/faultlog"];
+    use crate::agent::capability_broker::{FaultLogDirectory, HostCapability};
+    let dirs = [FaultLogDirectory::FaultLogger, FaultLogDirectory::Temp, FaultLogDirectory::Root];
     let mut remote_files: Vec<String> = Vec::new();
-    for dir in dirs {
+    for directory in dirs {
         let mut ok = false;
-        if let Ok(out) = run_hdc_shell(&device, &["ls", "-1", dir], 15).await {
-            for line in out.lines() {
+        let capability = HostCapability::ListFaultLogs {
+            device: device.clone(), directory,
+        };
+        if let Ok(output) = crate::agent::capability_broker::execute_host_capability(
+            &capability, None, ctx,
+        ).await {
+            if !output.status.success() {
+                continue;
+            }
+            let listing = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            for line in listing.lines() {
                 // 多列输出兼容：按空白拆分逐个取文件名
                 for name in line.split_whitespace() {
                     let name = name.trim();
-                    if name.is_empty()
-                        || name.starts_with('.')
-                        || name.contains(':')
+                    if !is_safe_faultlog_name(name)
                         || name.contains("denied")
-                        || !name.chars().any(|c| c.is_ascii_digit())
                     {
                         continue;
                     }
-                    remote_files.push(format!("{dir}/{name}"));
+                    remote_files.push(format!("{}/{name}", directory.as_path()));
                     ok = true;
                 }
             }
@@ -669,12 +680,26 @@ pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<Stri
     remote_files.sort_by_key(|a| std::cmp::Reverse(crash_time_key(a)));
     remote_files.truncate(limit);
     // 4) 拉取到本地并解析
-    let base = if project_path.is_empty() {
-        std::env::temp_dir().join("deveco-agent-crashes")
-    } else {
-        Path::new(project_path).join(".deveco-agent").join("crashes")
-    };
-    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    let requested_base = project_root.join(".deveco-agent").join("crashes");
+    let mut existing_ancestor = requested_base.as_path();
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor
+            .parent()
+            .ok_or("崩溃副本目录无法定位工作区祖先")?;
+    }
+    let ancestor = existing_ancestor
+        .canonicalize()
+        .map_err(|e| format!("无法解析崩溃副本目录祖先：{e}"))?;
+    if !ancestor.starts_with(&project_root) {
+        return Err("崩溃副本目录通过符号链接逃逸项目工作区".into());
+    }
+    std::fs::create_dir_all(&requested_base).map_err(|e| e.to_string())?;
+    let base = requested_base
+        .canonicalize()
+        .map_err(|e| format!("无法解析崩溃副本目录：{e}"))?;
+    if !base.starts_with(&project_root) {
+        return Err("崩溃副本目录必须位于项目工作区内".into());
+    }
     let mut out = format!("崩溃分析（设备 {device}，{} 条）：\n", remote_files.len());
     for (i, remote) in remote_files.iter().enumerate() {
         let fname = Path::new(remote)
@@ -682,11 +707,18 @@ pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<Stri
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("crash-{i}.log"));
         let local = base.join(&fname);
-        let hdc_args: Vec<String> = vec![
-            "-t".into(), device.clone(), "file".into(), "recv".into(),
-            remote.clone(), local.to_string_lossy().to_string(),
-        ];
-        if run_cmd("hdc", &hdc_args, None, 60).await.is_err() || !local.exists() {
+        let relative = local
+            .strip_prefix(&project_root)
+            .map_err(|_| "无法把崩溃副本转换为工作区相对路径")?
+            .to_string_lossy()
+            .into_owned();
+        let capability = HostCapability::ReceiveFile {
+            device: device.clone(), remote_path: remote.clone(), local_path: relative,
+        };
+        let received = crate::agent::capability_broker::execute_host_capability(
+            &capability, Some(&project_root), ctx,
+        ).await;
+        if !matches!(received, Ok(ref output) if output.status.success()) || !local.exists() {
             out.push_str(&format!("\n[{}] {fname}：拉取失败（权限受限）\n", i + 1));
             continue;
         }
@@ -697,6 +729,16 @@ pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<Stri
     }
     out.push_str("\n建议：结合 read_runtime_logs 查看崩溃前后的运行日志；修复后重新部署验证。");
     Ok(out)
+}
+
+pub(super) fn is_safe_faultlog_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with('.')
+        && name.chars().any(|c| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 pub(super) fn crash_time_key(name: &str) -> u64 {

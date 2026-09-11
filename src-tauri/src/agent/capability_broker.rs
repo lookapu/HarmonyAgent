@@ -8,6 +8,24 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::Output;
 
+/// Broker 内建的 faultlog 查询范围，避免调用方把任意设备目录拼入 `hdc shell ls`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultLogDirectory {
+    FaultLogger,
+    Temp,
+    Root,
+}
+
+impl FaultLogDirectory {
+    pub fn as_path(self) -> &'static str {
+        match self {
+            Self::FaultLogger => "/data/log/faultlog/faultlogger",
+            Self::Temp => "/data/log/faultlog/temp",
+            Self::Root => "/data/log/faultlog",
+        }
+    }
+}
+
 /// 宿主特权能力的窄化集合。v0 覆盖 hdc 与 deploy；签名与真机操作待接线。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostCapability {
@@ -27,6 +45,8 @@ pub enum HostCapability {
     ReadHilog { device: String, level: Option<String>, tag: Option<String> },
     /// 兼容旧设备的有限行 logcat 查询。
     ReadLogcat { device: String, lines: u64 },
+    /// 枚举三个预定义 faultlog 目录之一。
+    ListFaultLogs { device: String, directory: FaultLogDirectory },
     /// 把工作区内普通文件发送到设备绝对路径。
     SendFile { device: String, local_path: String, remote_path: String },
     /// 把设备绝对路径拉取到工作区内。
@@ -53,6 +73,7 @@ impl HostCapability {
             Self::DevicePidof { .. } => "device.pidof",
             Self::ReadHilog { .. } => "device.read_hilog",
             Self::ReadLogcat { .. } => "device.read_logcat",
+            Self::ListFaultLogs { .. } => "device.list_faultlogs",
             Self::SendFile { .. } => "device.file_send",
             Self::ReceiveFile { .. } => "device.file_receive",
             Self::StopAbility { .. } => "device.stop_ability",
@@ -92,6 +113,7 @@ impl HostCapability {
                 }
                 Ok(())
             }
+            Self::ListFaultLogs { device, .. } => validate_device_target(device),
             Self::SendFile { device, local_path, remote_path }
             | Self::ReceiveFile { device, remote_path, local_path } => {
                 validate_device_target(device)?;
@@ -123,6 +145,7 @@ impl HostCapability {
                 | Self::DevicePidof { .. }
                 | Self::ReadHilog { .. }
                 | Self::ReadLogcat { .. }
+                | Self::ListFaultLogs { .. }
         )
     }
 }
@@ -184,6 +207,9 @@ fn request_material(capability: &HostCapability) -> String {
             tag.as_deref().unwrap_or("").trim(),
         ),
         HostCapability::ReadLogcat { device, lines } => format!("{}\0{lines}", device.trim()),
+        HostCapability::ListFaultLogs { device, directory } => {
+            format!("{}\0{}", device.trim(), directory.as_path())
+        }
         HostCapability::SendFile { device, local_path, remote_path }
         | HostCapability::ReceiveFile { device, remote_path, local_path } => format!(
             "{}\0{}\0{}",
@@ -237,6 +263,13 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
                 "-t".into(), device.trim().into(), "logcat".into(), "-T".into(), lines.to_string(),
             ],
             20,
+        ),
+        HostCapability::ListFaultLogs { device, directory } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "ls".into(), "-1".into(),
+                directory.as_path().into(),
+            ],
+            15,
         ),
         HostCapability::SendFile { device, local_path, remote_path } => {
             let local = resolve_workspace_source(
@@ -553,6 +586,9 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         HostCapability::ReadLogcat { device, lines } => serde_json::json!({
             "device_digest": short_digest(device), "lines": lines,
         }),
+        HostCapability::ListFaultLogs { device, directory } => serde_json::json!({
+            "device_digest": short_digest(device), "directory": directory.as_path(),
+        }),
         HostCapability::SendFile { device, local_path, remote_path } => serde_json::json!({
             "device_digest": short_digest(device), "local_path": local_path,
             "remote_digest": short_digest(remote_path),
@@ -755,6 +791,16 @@ mod tests {
         assert!(HostCapability::ReadLogcat { device: "ABC123".into(), lines: 9 }
             .validate()
             .is_err());
+        let faultlogs = HostCapability::ListFaultLogs {
+            device: "ABC123".into(),
+            directory: FaultLogDirectory::Temp,
+        };
+        let invocation = prepare_invocation(&faultlogs, None).unwrap();
+        assert_eq!(
+            invocation.args,
+            vec!["-t", "ABC123", "shell", "ls", "-1", "/data/log/faultlog/temp"]
+        );
+        assert!(faultlogs.replay_safe());
     }
 
     #[test]
