@@ -165,10 +165,23 @@ pub enum HostCapability {
     StartUiRecording { device: String, remote_path: String },
     /// 停止当前设备上的 UI 操作录制。
     StopUiRecording { device: String },
+    /// 探测设备是否支持 screenrecord。
+    ProbeScreenRecording { device: String },
+    /// 运行有界时长的 screenrecord；必须通过长任务入口派发。
+    StartScreenRecording { device: String, remote_path: String, max_seconds: u64 },
+    /// 向当前设备的 screenrecord 发送 SIGINT，使文件完成 flush。
+    StopScreenRecording { device: String },
     /// 安装构建产物到设备（路径必须位于项目工作树内）。
     InstallHap { device: Option<String>, hap_path: String, replace: bool },
     /// 拉起一个已安装应用的明确 ability。
     StartAbility { device: String, bundle: String, ability: String },
+    /// 按 bundle、可选 ability 和可选 URI 拉起应用；至少需要 bundle 或 URI。
+    StartAbilityIntent {
+        device: String,
+        bundle: Option<String>,
+        ability: Option<String>,
+        uri: Option<String>,
+    },
     /// 部署 = 安装 + 可选启动（组合窄能力）。
     Deploy { device: Option<String>, hap_path: String },
 }
@@ -205,8 +218,12 @@ impl HostCapability {
             Self::SetDeviceRadio { .. } => "device.radio.set",
             Self::StartUiRecording { .. } => "device.ui_record.start",
             Self::StopUiRecording { .. } => "device.ui_record.stop",
+            Self::ProbeScreenRecording { .. } => "device.screen_record.probe",
+            Self::StartScreenRecording { .. } => "device.screen_record.start",
+            Self::StopScreenRecording { .. } => "device.screen_record.stop",
             Self::InstallHap { .. } => "deploy.install",
             Self::StartAbility { .. } => "deploy.start_ability",
+            Self::StartAbilityIntent { .. } => "device.start_ability_intent",
             Self::Deploy { .. } => "deploy",
         }
     }
@@ -332,6 +349,17 @@ impl HostCapability {
                 validate_managed_device_temp_path(remote_path)
             }
             Self::StopUiRecording { device } => validate_device_target(device),
+            Self::ProbeScreenRecording { device } | Self::StopScreenRecording { device } => {
+                validate_device_target(device)
+            }
+            Self::StartScreenRecording { device, remote_path, max_seconds } => {
+                validate_device_target(device)?;
+                validate_managed_device_temp_path(remote_path)?;
+                if !(1..=600).contains(max_seconds) {
+                    return Err("录屏时长必须在 1-600 秒之间".into());
+                }
+                Ok(())
+            }
             Self::InstallHap { device, hap_path, .. } | Self::Deploy { device, hap_path } => {
                 if let Some(device) = device {
                     validate_device_target(device)?;
@@ -342,6 +370,25 @@ impl HostCapability {
                 validate_device_target(device)?;
                 validate_app_identifier(bundle, "bundle")?;
                 validate_app_identifier(ability, "ability")
+            }
+            Self::StartAbilityIntent { device, bundle, ability, uri } => {
+                validate_device_target(device)?;
+                if bundle.is_none() && uri.is_none() {
+                    return Err("启动意图至少需要 bundle 或 URI".into());
+                }
+                if let Some(bundle) = bundle {
+                    validate_app_identifier(bundle, "bundle")?;
+                }
+                if let Some(ability) = ability {
+                    if bundle.is_none() {
+                        return Err("指定 ability 时必须同时指定 bundle".into());
+                    }
+                    validate_app_identifier(ability, "ability")?;
+                }
+                if let Some(uri) = uri {
+                    validate_ability_uri(uri)?;
+                }
+                Ok(())
             }
         }
     }
@@ -359,6 +406,7 @@ impl HostCapability {
                 | Self::ReadFaultLog { .. }
                 | Self::DeviceReadQuery { .. }
                 | Self::ReadNetworkCondition { .. }
+                | Self::ProbeScreenRecording { .. }
         )
     }
 }
@@ -504,11 +552,23 @@ fn request_material(capability: &HostCapability) -> String {
             format!("{}\0{}", device.trim(), remote_path.trim())
         }
         HostCapability::StopUiRecording { device } => device.trim().to_string(),
+        HostCapability::ProbeScreenRecording { device }
+        | HostCapability::StopScreenRecording { device } => device.trim().to_string(),
+        HostCapability::StartScreenRecording { device, remote_path, max_seconds } => {
+            format!("{}\0{}\0{max_seconds}", device.trim(), remote_path.trim())
+        }
         HostCapability::InstallHap { device, hap_path, replace } => format!(
             "{}\0{}\0{replace}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
         ),
         HostCapability::StartAbility { device, bundle, ability } =>
             format!("{}\0{}\0{}", device.trim(), bundle.trim(), ability.trim()),
+        HostCapability::StartAbilityIntent { device, bundle, ability, uri } => format!(
+            "{}\0{}\0{}\0{}",
+            device.trim(),
+            bundle.as_deref().unwrap_or("").trim(),
+            ability.as_deref().unwrap_or("").trim(),
+            uri.as_deref().map(short_digest).unwrap_or_default(),
+        ),
         HostCapability::Deploy { device, hap_path } => format!(
             "{}\0{}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
         ),
@@ -793,6 +853,28 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             ],
             10,
         ),
+        HostCapability::ProbeScreenRecording { device } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "screenrecord".into(),
+                "--help".into(),
+            ],
+            5,
+        ),
+        HostCapability::StartScreenRecording { device, remote_path, max_seconds } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "screenrecord".into(),
+                "--time-limit".into(), max_seconds.to_string(), "--size".into(),
+                "1080x1920".into(), remote_path.trim().into(),
+            ],
+            max_seconds.saturating_add(10),
+        ),
+        HostCapability::StopScreenRecording { device } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "pkill".into(), "-2".into(),
+                "screenrecord".into(),
+            ],
+            5,
+        ),
         HostCapability::InstallHap { device, hap_path, replace } => {
             let artifact = resolve_workspace_artifact(
                 workspace.ok_or("deploy.install 需要明确的项目工作区")?, hap_path,
@@ -812,6 +894,21 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
                 "-b".into(), bundle.trim().into(), "-a".into(), ability.trim().into(),
             ], 30,
         ),
+        HostCapability::StartAbilityIntent { device, bundle, ability, uri } => {
+            let mut args = vec![
+                "-t".into(), device.trim().into(), "shell".into(), "aa".into(), "start".into(),
+            ];
+            if let Some(bundle) = bundle {
+                args.extend(["-b".into(), bundle.trim().into()]);
+            }
+            if let Some(ability) = ability {
+                args.extend(["-a".into(), ability.trim().into()]);
+            }
+            if let Some(uri) = uri {
+                args.extend(["-D".into(), uri.clone()]);
+            }
+            (args, 30)
+        }
         HostCapability::Deploy { .. } => {
             return Err("deploy 是组合能力，必须拆分为 install 与 start_ability 执行".into());
         }
@@ -918,6 +1015,99 @@ pub async fn execute_host_capability(
             Err(error)
         }
     }
+}
+
+/// 派发一个会跨越当前工具调用存活的受管宿主任务。
+///
+/// 目前只开放有硬时长上限的 screenrecord。请求在 spawn 前完成参数校验与原子 claim；
+/// 后台进程退出后写入同一 claim 的终态。若进程或应用在此期间崩溃，未完成 claim 会由
+/// Durable Run 恢复逻辑标为 indeterminate，禁止静默重放。
+pub fn spawn_host_capability(
+    capability: &HostCapability,
+    workspace: Option<&Path>,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<tokio::task::JoinHandle<Result<Output, String>>, String> {
+    if !matches!(capability, HostCapability::StartScreenRecording { .. }) {
+        return Err("长任务入口目前只允许 device.screen_record.start".into());
+    }
+    let capability_id = capability.capability_id();
+    let identity = request_identity(ctx, capability).map_err(|error| {
+        ctx.record_run_event("host_capability.rejected", serde_json::json!({
+            "capability_id": capability_id,
+            "reason": "missing_request_identity",
+        }));
+        error
+    })?;
+    let invocation = prepare_invocation(capability, workspace).map_err(|error| {
+        ctx.record_run_event("host_capability.rejected", serde_json::json!({
+            "capability_id": capability_id,
+            "tool_call_id": &identity.tool_call_id,
+            "idempotency_key": &identity.idempotency_key,
+            "reason": "validation_failed",
+        }));
+        error
+    })?;
+    let subject = audit_subject(capability);
+    match claim_request(ctx, capability_id, &identity, &subject)? {
+        crate::agent::runtime::HostCapabilityClaim::Claimed => {}
+        crate::agent::runtime::HostCapabilityClaim::Duplicate { status } => {
+            ctx.record_run_event("host_capability.rejected", serde_json::json!({
+                "capability_id": capability_id,
+                "tool_call_id": &identity.tool_call_id,
+                "idempotency_key": &identity.idempotency_key,
+                "reason": "duplicate_dispatch",
+                "previous_status": status,
+            }));
+            return Err(format!(
+                "宿主长任务请求已登记（状态：{status}），为避免重复副作用已拒绝自动重放"
+            ));
+        }
+    }
+
+    let task_ctx = ctx.clone();
+    Ok(tokio::spawn(async move {
+        let result = crate::agent::exec_ctx::run_cmd_streaming(
+            &task_ctx,
+            invocation.program,
+            &invocation.args,
+            None,
+            invocation.timeout_seconds,
+            None,
+        )
+        .await;
+        match result {
+            Ok(output) => {
+                let status = if output.status.success() { "succeeded" } else { "failed" };
+                finish_request(
+                    &task_ctx,
+                    capability_id,
+                    &identity,
+                    status,
+                    output.status.code(),
+                    None,
+                )
+                .map_err(|error| {
+                    format!("宿主长任务已经退出，但持久化终态失败，实际状态不确定：{error}")
+                })?;
+                Ok(output)
+            }
+            Err(error) => {
+                let error_kind = capability_error_kind(&error);
+                finish_request(
+                    &task_ctx,
+                    capability_id,
+                    &identity,
+                    "indeterminate",
+                    None,
+                    Some(error_kind),
+                )
+                .map_err(|persist_error| {
+                    format!("{error}；宿主长任务的不确定终态持久化失败：{persist_error}")
+                })?;
+                Err(error)
+            }
+        }
+    }))
 }
 
 fn record_replay_safe_finish(
@@ -1171,11 +1361,26 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         HostCapability::StopUiRecording { device } => serde_json::json!({
             "device_digest": short_digest(device),
         }),
+        HostCapability::ProbeScreenRecording { device }
+        | HostCapability::StopScreenRecording { device } => serde_json::json!({
+            "device_digest": short_digest(device),
+        }),
+        HostCapability::StartScreenRecording { device, remote_path, max_seconds } => serde_json::json!({
+            "device_digest": short_digest(device),
+            "remote_digest": short_digest(remote_path),
+            "max_seconds": max_seconds,
+        }),
         HostCapability::InstallHap { device, hap_path, replace } => serde_json::json!({
             "device_digest": device.as_deref().map(short_digest), "artifact": hap_path, "replace": replace,
         }),
         HostCapability::StartAbility { device, bundle, ability } => serde_json::json!({
             "device_digest": short_digest(device), "bundle": bundle, "ability": ability,
+        }),
+        HostCapability::StartAbilityIntent { device, bundle, ability, uri } => serde_json::json!({
+            "device_digest": short_digest(device),
+            "bundle": bundle,
+            "ability": ability,
+            "uri_digest": uri.as_deref().map(short_digest),
         }),
         HostCapability::Deploy { device, hap_path } => serde_json::json!({
             "device_digest": device.as_deref().map(short_digest), "artifact": hap_path,
@@ -1192,6 +1397,14 @@ fn capability_error_kind(error: &str) -> &'static str {
     if error.contains("已停止") { "cancelled" }
     else if error.contains("超时") { "timeout" }
     else { "execution_failed" }
+}
+
+fn validate_ability_uri(uri: &str) -> Result<(), String> {
+    let uri = uri.trim();
+    if uri.is_empty() || uri.len() > 2_048 || uri.chars().any(char::is_control) {
+        return Err("Ability URI 不能为空、不得含控制字符且最多 2048 字节".into());
+    }
+    Ok(())
 }
 
 fn validate_device_target(target: &str) -> Result<(), String> {
@@ -2067,6 +2280,108 @@ mod tests {
             std::fs::remove_dir_all(root).ok();
             std::fs::remove_file(external).ok();
         }
+    }
+
+    #[test]
+    fn ability_intent_uses_fixed_argv_and_redacts_uri_from_request_material() {
+        let uri = "https://example.test/private/path?token=secret";
+        let capability = HostCapability::StartAbilityIntent {
+            device: "ABC123".into(),
+            bundle: Some("com.example.app".into()),
+            ability: None,
+            uri: Some(uri.into()),
+        };
+        let invocation = prepare_invocation(&capability, None).unwrap();
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-t",
+                "ABC123",
+                "shell",
+                "aa",
+                "start",
+                "-b",
+                "com.example.app",
+                "-D",
+                uri,
+            ]
+        );
+        let material = request_material(&capability);
+        assert!(!material.contains(uri));
+        assert!(audit_subject(&capability)["uri_digest"].is_string());
+        assert!(!capability.replay_safe());
+
+        assert!(HostCapability::StartAbilityIntent {
+            device: "ABC123".into(),
+            bundle: None,
+            ability: Some("EntryAbility".into()),
+            uri: None,
+        }
+        .validate()
+        .is_err());
+        assert!(HostCapability::StartAbilityIntent {
+            device: "ABC123".into(),
+            bundle: None,
+            ability: None,
+            uri: Some("https://example.test/\nunsafe".into()),
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn screen_recording_capabilities_use_bounded_fixed_argv() {
+        let remote = "/data/local/tmp/deveco_agent_screen_record_123.mp4";
+        let probe = HostCapability::ProbeScreenRecording { device: "ABC123".into() };
+        assert!(probe.replay_safe());
+        assert_eq!(
+            prepare_invocation(&probe, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "screenrecord", "--help"]
+        );
+
+        let start = HostCapability::StartScreenRecording {
+            device: "ABC123".into(),
+            remote_path: remote.into(),
+            max_seconds: 60,
+        };
+        let invocation = prepare_invocation(&start, None).unwrap();
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-t",
+                "ABC123",
+                "shell",
+                "screenrecord",
+                "--time-limit",
+                "60",
+                "--size",
+                "1080x1920",
+                remote,
+            ]
+        );
+        assert_eq!(invocation.timeout_seconds, 70);
+        assert!(!start.replay_safe());
+        assert!(HostCapability::StartScreenRecording {
+            device: "ABC123".into(),
+            remote_path: remote.into(),
+            max_seconds: 0,
+        }
+        .validate()
+        .is_err());
+        assert!(HostCapability::StartScreenRecording {
+            device: "ABC123".into(),
+            remote_path: "/data/local/tmp/not_managed.mp4".into(),
+            max_seconds: 10,
+        }
+        .validate()
+        .is_err());
+
+        let stop = HostCapability::StopScreenRecording { device: "ABC123".into() };
+        assert_eq!(
+            prepare_invocation(&stop, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "pkill", "-2", "screenrecord"]
+        );
+        assert!(!stop.replay_safe());
     }
 
     #[test]

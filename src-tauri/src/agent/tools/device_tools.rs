@@ -178,7 +178,20 @@ pub(super) fn emulator_exe() -> Option<PathBuf> {
     None
 }
 
-pub(super) async fn list_emulators() -> Result<String, String> {
+async fn broker_hdc_targets(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::HdcListTargets;
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("设备清单查询失败：{}", text.trim()));
+    }
+    Ok(text)
+}
+
+pub(super) async fn list_emulators(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     // emulator_exe 内部走 discover_deveco_dirs（reg query 等同步 IO），放入 blocking 线程池
     let emu = tokio::task::spawn_blocking(emulator_exe)
         .await
@@ -205,9 +218,7 @@ pub(super) async fn list_emulators() -> Result<String, String> {
         ));
     }
     // 标注已在线的实例（hdc 里含 localhost/127.0.0.1 设备的粗略判断）
-    let online = run_cmd("hdc", &["list".into(), "targets".into()], None, 15)
-        .await
-        .unwrap_or_default();
+    let online = broker_hdc_targets(ctx).await.unwrap_or_default();
     let has_local = online.contains("127.0.0.1") || online.contains("localhost");
     let mut s = format!(
         "DevEco Studio 模拟器实例（{} 个，工具：{}）：\n",
@@ -221,7 +232,10 @@ pub(super) async fn list_emulators() -> Result<String, String> {
     Ok(s)
 }
 
-pub(super) async fn start_emulator(args: &Value) -> Result<String, String> {
+pub(super) async fn start_emulator(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let name = args["name"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
     let Some(name) = name else {
         return Err("start_emulator 需要 name（实例名，先用 list_emulators 查看）".into());
@@ -257,7 +271,7 @@ pub(super) async fn start_emulator(args: &Value) -> Result<String, String> {
     let _child = cmd.spawn().map_err(|e| format!("启动模拟器失败：{e}"))?;
     // 轮询 hdc：启动前设备快照 → 新设备出现即上线
     let wait_secs = args["wait_secs"].as_u64().unwrap_or(60).clamp(5, 120);
-    let before: std::collections::HashSet<String> = run_cmd("hdc", &["list".into(), "targets".into()], None, 15)
+    let before: std::collections::HashSet<String> = broker_hdc_targets(ctx)
         .await
         .unwrap_or_default()
         .lines()
@@ -267,7 +281,7 @@ pub(super) async fn start_emulator(args: &Value) -> Result<String, String> {
     let mut seen = String::new();
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if let Ok(t) = run_cmd("hdc", &["list".into(), "targets".into()], None, 15).await {
+        if let Ok(t) = broker_hdc_targets(ctx).await {
             let now_set: std::collections::HashSet<String> = t
                 .lines()
                 .filter_map(|l| l.split_whitespace().next().map(String::from))

@@ -1225,8 +1225,8 @@ pub async fn run_tool(
         "list_devices" => list_devices(ctx).await,
         "connect_device" => device_tools::connect_device(&args, ctx).await,
         "manage_hdc" => device_tools::manage_hdc(&args, db, ctx).await,
-        "list_emulators" => device_tools::list_emulators().await,
-        "start_emulator" => device_tools::start_emulator(&args).await,
+        "list_emulators" => device_tools::list_emulators(ctx).await,
+        "start_emulator" => device_tools::start_emulator(&args, ctx).await,
         "create_emulator" => device_tools::create_emulator(&args).await,
         "device_file" => device_tools::device_file(&args, &roots, ctx).await,
         "stop_app" => device_tools::stop_app(&args, &roots, ctx).await,
@@ -1296,7 +1296,7 @@ pub async fn run_tool(
         "grant_permission" => ui_tools::grant_permission(&args, &roots, ctx).await,
         "set_wifi_state" => ui_tools::set_wifi_state(&args, &roots, ctx).await,
         "set_airplane_mode" => ui_tools::set_airplane_mode(&args, &roots, ctx).await,
-        "screen_record" => ui_tools::screen_record(&args, &roots).await,
+        "screen_record" => ui_tools::screen_record(&args, &roots, ctx).await,
         "record_ui" => ui_tools::record_ui(&args, &roots, ctx).await,
         "replay_ui" => ui_tools::replay_ui(&args, &roots, ctx).await,
         "gesture_perform" => ui_tools::gesture_perform(&args, &roots, ctx).await,
@@ -1892,13 +1892,6 @@ async fn default_device_id() -> Result<String, String> {
         return Ok(default.id.clone());
     }
     Ok(online[0].id.clone())
-}
-
-/// 在指定设备上执行 `hdc -t <device> shell <args...>`
-async fn run_hdc_shell(device: &str, args: &[&str], timeout: u64) -> Result<String, String> {
-    let mut full = vec!["-t".to_string(), device.to_string(), "shell".to_string()];
-    full.extend(args.iter().map(|s| s.to_string()));
-    run_cmd("hdc", &full, None, timeout).await
 }
 
 /// hdc shell 命令输出是否失败：hdc 的 shell 子命令失败时 exit code 仍为 0，

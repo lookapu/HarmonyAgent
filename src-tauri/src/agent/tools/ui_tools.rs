@@ -650,24 +650,6 @@ pub(super) async fn start_ability(
         tokio::time::sleep(Duration::from_millis(800)).await;
     }
 
-    let mut cmd: Vec<&str> = vec!["aa", "start"];
-    let mut owned: Vec<String> = Vec::new();
-    if !bundle.is_empty() {
-        owned.push("-b".to_string());
-        owned.push(bundle.clone());
-    }
-    if !ability.is_empty() {
-        owned.push("-a".to_string());
-        owned.push(ability.clone());
-    }
-    if !uri.is_empty() {
-        owned.push("-D".to_string());
-        owned.push(uri.clone());
-    }
-    for o in &owned {
-        cmd.push(o.as_str());
-    }
-
     let out = if uri.is_empty() && !bundle.is_empty() && !ability.is_empty() {
         let start = crate::agent::capability_broker::HostCapability::StartAbility {
             device: device.clone(),
@@ -676,9 +658,13 @@ pub(super) async fn start_ability(
         };
         execute_ui_host_capability(&start, "启动 Ability", ctx).await?
     } else {
-        run_hdc_shell(&device, &cmd, 20)
-            .await
-            .map_err(|e| format!("启动 Ability 失败：{e}"))?
+        let start = crate::agent::capability_broker::HostCapability::StartAbilityIntent {
+            device: device.clone(),
+            bundle: (!bundle.is_empty()).then_some(bundle.clone()),
+            ability: (!ability.is_empty()).then_some(ability.clone()),
+            uri: (!uri.is_empty()).then_some(uri.clone()),
+        };
+        execute_ui_host_capability(&start, "按意图启动 Ability", ctx).await?
     };
 
     // 状态确认：显式 bundle 必须在多次 Ability 栈观测中至少出现一次。
@@ -1275,29 +1261,39 @@ struct RecordHandle {
     device_file: String,
     /// 后台执行 screenrecord 的任务：录制会持续到 --time-limit 或被 pkill，
     /// 不能同步 await（会把 start 卡住 60~600 秒），stop 时杀掉后 await 收尾。
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Result<std::process::Output, String>>,
 }
 
-pub(super) async fn screen_record(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn screen_record(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录，无法保存录屏".into());
+    }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
     };
     let action = args["action"].as_str().unwrap_or("start");
-    let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
 
     let store = RECORD_STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
 
     if action == "start" {
         let max = args["max_seconds"].as_u64().unwrap_or(60).clamp(1, 600);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let dev_file = format!("/data/local/tmp/record_{ts}.mp4");
+        let dev_file = format!(
+            "/data/local/tmp/deveco_agent_screen_record_{}.mp4",
+            uuid::Uuid::new_v4().simple(),
+        );
 
         // 快速探测设备是否支持 screenrecord（--help 立即返回，不阻塞）
-        let probe = run_hdc_shell(&device, &["screenrecord", "--help"], 5).await;
+        let probe_capability =
+            crate::agent::capability_broker::HostCapability::ProbeScreenRecording {
+                device: device.clone(),
+            };
+        let probe = execute_ui_host_capability(&probe_capability, "探测录屏能力", ctx).await;
         let supported = match &probe {
             Ok(o) => {
                 let low = o.to_lowercase();
@@ -1311,72 +1307,76 @@ pub(super) async fn screen_record(args: &Value, roots: &[String]) -> Result<Stri
             ));
         }
 
-        let _ = run_hdc_shell(&device, &["rm", "-f", &dev_file], 5).await;
-        // 后台执行：screenrecord 一直录到 --time-limit 上限才退出，
-        // 同步 await 会把工具调用卡住 60~600 秒，且无法边录边执行 UI 操作。
-        let d = device.clone();
-        let df = dev_file.clone();
-        let m = max;
+        cleanup_managed_device_file(&device, &dev_file, ctx).await;
         // 检查 + spawn + 登记同一锁内原子完成：并发 start 若在检查后插入，
         // 后一个会覆盖前一个 handle，导致第一次录屏失控（无法 stop）
         let mut guard = store.lock().map_err(|e| e.to_string())?;
         if guard.contains_key(&device) {
             return Err(format!("设备 {device} 已有进行中的录屏，先调用 action=stop 结束。"));
         }
-        let task = tokio::spawn(async move {
-            let _ = run_hdc_shell(
-                &d,
-                &["screenrecord", "--time-limit", &m.to_string(), "--size", "1080x1920", &df],
-                m + 10,
-            )
-            .await;
-        });
+        let start = crate::agent::capability_broker::HostCapability::StartScreenRecording {
+            device: device.clone(),
+            remote_path: dev_file.clone(),
+            max_seconds: max,
+        };
+        let task = crate::agent::capability_broker::spawn_host_capability(&start, None, ctx)?;
         guard.insert(device.clone(), RecordHandle { device_file: dev_file, task });
         Ok(format!("录屏已开始（设备 {device}，最大时长 {max}s），用 screen_record action=stop 结束并保存视频到工程目录。"))
     } else if action == "stop" {
-        let handle = {
+        let mut handle = {
             let m = store.lock().ok();
             m.and_then(|mut g| g.remove(&device))
         };
-        let Some(h) = handle else {
+        let Some(h) = handle.take() else {
             return Err(format!("当前设备 {device} 没有进行中的录屏，先调用 action=start 开始。"));
         };
 
         // 停止录屏：SIGINT 结束 screenrecord，等待后台任务收尾（文件 flush）
-        let _ = run_hdc_shell(&device, &["pkill", "-2", "screenrecord"], 5).await;
+        let stop = crate::agent::capability_broker::HostCapability::StopScreenRecording {
+            device: device.clone(),
+        };
+        if let Err(error) = execute_ui_host_capability(&stop, "停止录屏", ctx).await {
+            let mut guard = store.lock().map_err(|lock_error| lock_error.to_string())?;
+            guard.insert(device.clone(), h);
+            return Err(format!("停止录屏失败，录制句柄已保留，可重试 action=stop：{error}"));
+        }
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let _ = h.task.await;
+        let task_warning = match h.task.await {
+            Ok(Ok(output)) if output.status.success() => None,
+            Ok(Ok(output)) => Some(format!(
+                "录屏进程退出码 {}",
+                output.status.code().unwrap_or(-1),
+            )),
+            Ok(Err(error)) => Some(format!("录屏进程失败：{error}")),
+            Err(error) => Some(format!("录屏后台任务异常：{error}")),
+        };
 
         // 拉到本地：.deveco-agent 目录（与截图口径一致），文件名毫秒+设备号（多设备不覆盖）
-        let local_dir = if project_path.is_empty() {
-            std::env::temp_dir().to_string_lossy().to_string()
-        } else {
-            Path::new(&project_path)
-                .join(".deveco-agent")
-                .to_string_lossy()
-                .to_string()
-        };
-        std::fs::create_dir_all(&local_dir).ok();
+        let (workspace, local_dir) = ensure_workspace_subdir(project_path, ".deveco-agent")?;
         let ts_ms = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
         let dev_safe: String = device
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .take(32)
             .collect();
-        let local_file = format!("{local_dir}/screen_record-{ts_ms}-{dev_safe}.mp4");
+        let local_file = local_dir.join(format!("screen_record-{ts_ms}-{dev_safe}.mp4"));
+        receive_managed_device_file(
+            &workspace,
+            &device,
+            &h.device_file,
+            &local_file,
+            ctx,
+        )
+        .await?;
 
-        let hdc_args: Vec<String> = vec![
-            "-t".to_string(), device.clone(), "file".to_string(), "recv".to_string(),
-            h.device_file.clone(), local_file.clone(),
-        ];
-        let recv = run_cmd("hdc", &hdc_args, None, 60).await;
-        let ok = recv.is_ok() && std::path::Path::new(&local_file).exists();
-
-        if ok {
-            Ok(format!("录屏已保存（设备 {device}）\n本地路径：{local_file}\n可在资源管理器中播放查看。"))
-        } else {
-            Err(format!("录屏文件拉取失败（设备 {device}），视频可能未生成。"))
+        let mut report = format!(
+            "录屏已保存（设备 {device}）\n本地路径：{}\n可在资源管理器中播放查看。",
+            local_file.display(),
+        );
+        if let Some(warning) = task_warning {
+            report.push_str(&format!("\n注意：{warning}；视频文件已独立确认存在且非空。"));
         }
+        Ok(report)
     } else {
         Err("action 必须是 start 或 stop".into())
     }
