@@ -739,7 +739,11 @@ pub(super) async fn start_ability(
 }
 
 /// clear_app_data：清除缓存 / 数据 / 全部。
-pub(super) async fn clear_app_data(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn clear_app_data(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -758,17 +762,30 @@ pub(super) async fn clear_app_data(args: &Value, roots: &[String]) -> Result<Str
         return Err("无法确定应用包名".into());
     }
     let target = args["target"].as_str().unwrap_or("both");
+    if !matches!(target, "cache" | "data" | "both") {
+        return Err("target 必须是 cache、data 或 both".into());
+    }
 
     let mut results: Vec<String> = Vec::new();
     let mut any_ok = false;
     if target == "cache" || target == "both" {
-        match run_hdc_shell(&device, &["bm", "clean", "-c", "-n", &bundle], 20).await {
+        let capability = crate::agent::capability_broker::HostCapability::ClearAppStorage {
+            device: device.clone(),
+            bundle: bundle.clone(),
+            target: crate::agent::capability_broker::AppStorageTarget::Cache,
+        };
+        match execute_ui_host_capability(&capability, "清除应用缓存", ctx).await {
             Ok(o) => { results.push(format!("清除缓存：{}", o.trim())); any_ok = true; }
             Err(e) => results.push(format!("清除缓存失败：{e}")),
         }
     }
     if target == "data" || target == "both" {
-        match run_hdc_shell(&device, &["bm", "clean", "-d", "-n", &bundle], 20).await {
+        let capability = crate::agent::capability_broker::HostCapability::ClearAppStorage {
+            device: device.clone(),
+            bundle: bundle.clone(),
+            target: crate::agent::capability_broker::AppStorageTarget::Data,
+        };
+        match execute_ui_host_capability(&capability, "清除应用数据", ctx).await {
             Ok(o) => { results.push(format!("清除数据：{}", o.trim())); any_ok = true; }
             Err(e) => results.push(format!("清除数据失败：{e}")),
         }
@@ -1046,7 +1063,11 @@ pub(super) fn extract_json_num(text: &str, field: &str) -> Option<String> {
 }
 
 /// uninstall_app：卸载应用。
-pub(super) async fn uninstall_app(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn uninstall_app(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = resolve_authorized_device(args["device"].as_str(), "install").await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -1063,18 +1084,34 @@ pub(super) async fn uninstall_app(args: &Value, roots: &[String]) -> Result<Stri
     }
     let keep_data = args["keep_data"].as_bool().unwrap_or(false);
 
-    let args = if keep_data {
-        vec!["bm", "uninstall", "-k", "-n", &bundle]
-    } else {
-        vec!["bm", "uninstall", "-n", &bundle]
+    let uninstall = crate::agent::capability_broker::HostCapability::UninstallBundle {
+        device: device.clone(),
+        bundle: bundle.clone(),
+        keep_data,
     };
-    let out = run_hdc_shell(&device, &args, 30).await
-        .map_err(|e| format!("卸载失败：{e}"))?;
+    let out = execute_ui_host_capability(&uninstall, "卸载应用", ctx).await?;
 
-    let still_installed = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 20).await
-        .is_ok_and(|dump| dump.contains(&bundle) && !dump.contains("not found"));
-    if still_installed {
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["bm".into(), "dump".into(), "-n".into(), bundle.clone()],
+    };
+    let verification = crate::agent::capability_broker::execute_host_capability(&query, None, ctx)
+        .await
+        .map_err(|error| format!("卸载命令已返回，但状态确认失败：{error}"))?;
+    let verification_text = host_output_text(&verification);
+    let lower = verification_text.to_lowercase();
+    let explicitly_absent = lower.contains("bundle not found")
+        || lower.contains("not installed")
+        || lower.contains("does not exist")
+        || lower.contains("no such bundle");
+    if verification_text.contains(&bundle) && !explicitly_absent {
         return Err(format!("卸载命令已返回，但状态确认仍显示 {bundle} 已安装。结果：{}", out.trim()));
+    }
+    if (!verification.status.success() || hdc_shell_failed(&verification_text)) && !explicitly_absent {
+        return Err(format!(
+            "卸载命令已返回，但无法确认应用已不存在：{}",
+            first_line_or_unknown(&verification_text),
+        ));
     }
     if !project_path.is_empty() {
         crate::agent::runtime_log::stop(project_path);
@@ -1109,9 +1146,15 @@ pub(super) async fn grant_permission(
         return Err("action 必须是 grant 或 revoke".into());
     }
 
-    let primary = if action == "grant" { "grant-permission" } else { "revoke-permission" };
-    let fallback = if action == "grant" { "grant" } else { "revoke" };
-    let result = run_hdc_shell(&device, &["bm", primary, "-n", &bundle, "-p", &perm], 20).await;
+    let grant = action == "grant";
+    let primary = crate::agent::capability_broker::HostCapability::ChangeAppPermission {
+        device: device.clone(),
+        bundle: bundle.clone(),
+        permission: perm.clone(),
+        grant,
+        backend: crate::agent::capability_broker::PermissionCommandBackend::NamedFlags,
+    };
+    let result = execute_ui_host_capability(&primary, "变更应用权限", ctx).await;
     let primary_error = match result {
         Ok(o) if !hdc_shell_failed(&o) => {
             ctx.record_run_event("harmony.permission.changed", serde_json::json!({
@@ -1123,7 +1166,14 @@ pub(super) async fn grant_permission(
         Ok(o) => o,
         Err(e) => e,
     };
-    let result2 = run_hdc_shell(&device, &["bm", fallback, &bundle, &perm], 20).await;
+    let fallback = crate::agent::capability_broker::HostCapability::ChangeAppPermission {
+        device: device.clone(),
+        bundle: bundle.clone(),
+        permission: perm.clone(),
+        grant,
+        backend: crate::agent::capability_broker::PermissionCommandBackend::Positional,
+    };
+    let result2 = execute_ui_host_capability(&fallback, "使用兼容语法变更应用权限", ctx).await;
     match result2 {
         Ok(o) if !hdc_shell_failed(&o) => {
             ctx.record_run_event("harmony.permission.changed", serde_json::json!({
@@ -1138,23 +1188,30 @@ pub(super) async fn grant_permission(
 }
 
 /// set_wifi_state：切换 Wi-Fi 开关（尽力而为）。
-pub(super) async fn set_wifi_state(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn set_wifi_state(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
     };
     let enable = args["enable"].as_bool().unwrap_or(true);
-    let val = if enable { "1" } else { "0" };
-
-    // 尝试几种常见方式
-    let attempts = vec![
-        ("cmd wifi set_wifi_enable", vec!["cmd", "wifi", "set_wifi_enable", val]),
-        ("wpa_cli", vec!["wpa_cli", "-i", "wlan0", if enable { "ifup" } else { "ifdown" }]),
-        ("svc wifi", vec!["svc", "wifi", if enable { "enable" } else { "disable" }]),
+    let attempts = [
+        ("cmd wifi set_wifi_enable", crate::agent::capability_broker::DeviceRadioBackend::WifiCommand),
+        ("wpa_cli", crate::agent::capability_broker::DeviceRadioBackend::WpaCli),
+        ("svc wifi", crate::agent::capability_broker::DeviceRadioBackend::Svc),
     ];
     let mut errors: Vec<String> = Vec::new();
-    for (name, cmd) in &attempts {
-        match run_hdc_shell(&device, cmd, 10).await {
+    for (name, backend) in attempts {
+        let capability = crate::agent::capability_broker::HostCapability::SetDeviceRadio {
+            device: device.clone(),
+            radio: crate::agent::capability_broker::DeviceRadio::Wifi,
+            enable,
+            backend,
+        };
+        match execute_ui_host_capability(&capability, "切换 Wi-Fi", ctx).await {
             Ok(o) => {
                 let low = o.to_lowercase();
                 if !low.contains("not found") && !low.contains("unknown") && !low.contains("failed") && !low.contains("无此命令") {
@@ -1172,21 +1229,29 @@ pub(super) async fn set_wifi_state(args: &Value, _roots: &[String]) -> Result<St
 }
 
 /// set_airplane_mode：切换飞行模式（尽力而为）。
-pub(super) async fn set_airplane_mode(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn set_airplane_mode(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
     };
     let enable = args["enable"].as_bool().unwrap_or(true);
-    let val = if enable { "1" } else { "0" };
-
-    let attempts = vec![
-        ("cmd airplane_mode", vec!["cmd", "power", "set-airplane-mode", val]),
-        ("settings put global", vec!["settings", "put", "global", "airplane_mode_on", val]),
+    let attempts = [
+        ("cmd airplane_mode", crate::agent::capability_broker::DeviceRadioBackend::PowerCommand),
+        ("settings put global", crate::agent::capability_broker::DeviceRadioBackend::GlobalSettings),
     ];
     let mut errors: Vec<String> = Vec::new();
-    for (name, cmd) in &attempts {
-        match run_hdc_shell(&device, cmd, 10).await {
+    for (name, backend) in attempts {
+        let capability = crate::agent::capability_broker::HostCapability::SetDeviceRadio {
+            device: device.clone(),
+            radio: crate::agent::capability_broker::DeviceRadio::AirplaneMode,
+            enable,
+            backend,
+        };
+        match execute_ui_host_capability(&capability, "切换飞行模式", ctx).await {
             Ok(o) => {
                 let low = o.to_lowercase();
                 if !low.contains("not found") && !low.contains("unknown") && !low.contains("failed") && !low.contains("无此命令") {

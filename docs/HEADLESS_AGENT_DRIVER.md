@@ -587,7 +587,7 @@ Provider 流、工具执行和子进程都必须接受 `CancellationToken`。不
 - `desktop_adapter_control` schema v1 与 executor/cursor 在同一 checkpoint 事件中冻结 `effective_tool_rounds` 和 `budget_extensions`；工具额度判定改用 executor 的跨血缘累计 attempt，而非当前进程内 `tool_runs.len()`。Phase AX/AY 的旧 checkpoint 缺少 control 时允许读取，但保守禁用再次扩容，避免恢复反复刷新动态预算
 - `RecoveryDecision` 新增向后兼容的 `external_id`，父工具证据只有在目标契约未变化、恢复动作是 `SkipCompleted`，并且 checkpoint 窗口内的 `tool_runs.id`、工具名和 `status=ok` 同时匹配时才可继承。继承证据按父 rowid 顺序置于本轮证据之前，进入 workflow snapshot、申请完成时的 remediation gate 与最终 acceptance；窗口截断或旧计划缺 ID 时宁可要求重新验证
 - 继承证据不写入当前 `tool_runs`：不会重复追加工具消息、重复持久化、污染本轮进度/账本或触发同一个外部动作；但 ship 声明审计与完成复核会把它视作执行型任务证据，避免恢复后无新工具时被误当成纯问答自动完成
-- Rust lib 共 986 项：977 通过、9 项按环境条件忽略；前端 113 项通过
+- Rust lib 共 987 项：978 通过、9 项按环境条件忽略；前端 113 项通过
 
 ## 13. 测试策略
 

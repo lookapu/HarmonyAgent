@@ -951,6 +951,7 @@ async fn recover_fresh_install(
     let capability = crate::agent::capability_broker::HostCapability::UninstallBundle {
         device: device_id.to_string(),
         bundle: bundle.to_string(),
+        keep_data: false,
     };
     match crate::agent::capability_broker::execute_host_capability(&capability, None, ctx).await {
         Ok(output) if output.status.success() => {

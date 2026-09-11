@@ -33,6 +33,33 @@ pub enum DeviceUiAction {
     Key { name: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppStorageTarget {
+    Cache,
+    Data,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionCommandBackend {
+    NamedFlags,
+    Positional,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRadio {
+    Wifi,
+    AirplaneMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRadioBackend {
+    WifiCommand,
+    WpaCli,
+    Svc,
+    PowerCommand,
+    GlobalSettings,
+}
+
 impl DeviceScreenshotBackend {
     fn as_str(self) -> &'static str {
         match self {
@@ -116,7 +143,24 @@ pub enum HostCapability {
     /// 强制停止明确 bundle 的应用进程。
     StopAbility { device: String, bundle: String },
     /// 卸载明确 bundle；用于新装部署失败后的补偿。
-    UninstallBundle { device: String, bundle: String },
+    UninstallBundle { device: String, bundle: String, keep_data: bool },
+    /// 清除明确 bundle 的缓存或应用数据。
+    ClearAppStorage { device: String, bundle: String, target: AppStorageTarget },
+    /// 使用已知 bm 语法授予或撤销单项应用权限。
+    ChangeAppPermission {
+        device: String,
+        bundle: String,
+        permission: String,
+        grant: bool,
+        backend: PermissionCommandBackend,
+    },
+    /// 通过有限兼容后端切换 Wi-Fi 或飞行模式。
+    SetDeviceRadio {
+        device: String,
+        radio: DeviceRadio,
+        enable: bool,
+        backend: DeviceRadioBackend,
+    },
     /// 安装构建产物到设备（路径必须位于项目工作树内）。
     InstallHap { device: Option<String>, hap_path: String, replace: bool },
     /// 拉起一个已安装应用的明确 ability。
@@ -152,6 +196,9 @@ impl HostCapability {
             Self::DeviceUiInput { .. } => "device.ui_input",
             Self::StopAbility { .. } => "device.stop_ability",
             Self::UninstallBundle { .. } => "deploy.uninstall_bundle",
+            Self::ClearAppStorage { .. } => "device.app_storage.clear",
+            Self::ChangeAppPermission { .. } => "device.permission.change",
+            Self::SetDeviceRadio { .. } => "device.radio.set",
             Self::InstallHap { .. } => "deploy.install",
             Self::StartAbility { .. } => "deploy.start_ability",
             Self::Deploy { .. } => "deploy",
@@ -249,9 +296,30 @@ impl HostCapability {
                 validate_operation_id(operation_id)?;
                 validate_device_ui_action(action)
             }
-            Self::StopAbility { device, bundle } | Self::UninstallBundle { device, bundle } => {
+            Self::StopAbility { device, bundle }
+            | Self::UninstallBundle { device, bundle, .. }
+            | Self::ClearAppStorage { device, bundle, .. } => {
                 validate_device_target(device)?;
                 validate_app_identifier(bundle, "bundle")
+            }
+            Self::ChangeAppPermission { device, bundle, permission, .. } => {
+                validate_device_target(device)?;
+                validate_app_identifier(bundle, "bundle")?;
+                validate_app_identifier(permission, "permission")
+            }
+            Self::SetDeviceRadio { device, radio, backend, .. } => {
+                validate_device_target(device)?;
+                if !matches!(
+                    (radio, backend),
+                    (DeviceRadio::Wifi, DeviceRadioBackend::WifiCommand)
+                        | (DeviceRadio::Wifi, DeviceRadioBackend::WpaCli)
+                        | (DeviceRadio::Wifi, DeviceRadioBackend::Svc)
+                        | (DeviceRadio::AirplaneMode, DeviceRadioBackend::PowerCommand)
+                        | (DeviceRadio::AirplaneMode, DeviceRadioBackend::GlobalSettings)
+                ) {
+                    return Err("设备无线状态与执行后端不兼容".into());
+                }
+                Ok(())
             }
             Self::InstallHap { device, hap_path, .. } | Self::Deploy { device, hap_path } => {
                 if let Some(device) = device {
@@ -385,10 +453,42 @@ fn request_material(capability: &HostCapability) -> String {
                 device_ui_action_material(action),
             )
         }
-        HostCapability::StopAbility { device, bundle }
-        | HostCapability::UninstallBundle { device, bundle } => {
+        HostCapability::StopAbility { device, bundle } => {
             format!("{}\0{}", device.trim(), bundle.trim())
         }
+        HostCapability::UninstallBundle { device, bundle, keep_data } => {
+            format!("{}\0{}\0{keep_data}", device.trim(), bundle.trim())
+        }
+        HostCapability::ClearAppStorage { device, bundle, target } => format!(
+            "{}\0{}\0{}",
+            device.trim(),
+            bundle.trim(),
+            match target { AppStorageTarget::Cache => "cache", AppStorageTarget::Data => "data" },
+        ),
+        HostCapability::ChangeAppPermission {
+            device, bundle, permission, grant, backend,
+        } => format!(
+            "{}\0{}\0{}\0{grant}\0{}",
+            device.trim(),
+            bundle.trim(),
+            permission.trim(),
+            match backend {
+                PermissionCommandBackend::NamedFlags => "named_flags",
+                PermissionCommandBackend::Positional => "positional",
+            },
+        ),
+        HostCapability::SetDeviceRadio { device, radio, enable, backend } => format!(
+            "{}\0{}\0{enable}\0{}",
+            device.trim(),
+            match radio { DeviceRadio::Wifi => "wifi", DeviceRadio::AirplaneMode => "airplane" },
+            match backend {
+                DeviceRadioBackend::WifiCommand => "wifi_command",
+                DeviceRadioBackend::WpaCli => "wpa_cli",
+                DeviceRadioBackend::Svc => "svc",
+                DeviceRadioBackend::PowerCommand => "power_command",
+                DeviceRadioBackend::GlobalSettings => "global_settings",
+            },
+        ),
         HostCapability::InstallHap { device, hap_path, replace } => format!(
             "{}\0{}\0{replace}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
         ),
@@ -597,13 +697,73 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             ],
             20,
         ),
-        HostCapability::UninstallBundle { device, bundle } => (
-            vec![
+        HostCapability::UninstallBundle { device, bundle, keep_data } => {
+            let mut args = vec![
                 "-t".into(), device.trim().into(), "shell".into(), "bm".into(),
-                "uninstall".into(), "-n".into(), bundle.trim().into(),
+                "uninstall".into(),
+            ];
+            if *keep_data {
+                args.push("-k".into());
+            }
+            args.extend(["-n".into(), bundle.trim().into()]);
+            (args, 30)
+        }
+        HostCapability::ClearAppStorage { device, bundle, target } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "bm".into(), "clean".into(),
+                match target { AppStorageTarget::Cache => "-c", AppStorageTarget::Data => "-d" }.into(),
+                "-n".into(), bundle.trim().into(),
             ],
-            30,
+            20,
         ),
+        HostCapability::ChangeAppPermission {
+            device, bundle, permission, grant, backend,
+        } => {
+            let verb = match (grant, backend) {
+                (true, PermissionCommandBackend::NamedFlags) => "grant-permission",
+                (false, PermissionCommandBackend::NamedFlags) => "revoke-permission",
+                (true, PermissionCommandBackend::Positional) => "grant",
+                (false, PermissionCommandBackend::Positional) => "revoke",
+            };
+            let mut args = vec![
+                "-t".into(), device.trim().into(), "shell".into(), "bm".into(), verb.into(),
+            ];
+            match backend {
+                PermissionCommandBackend::NamedFlags => args.extend([
+                    "-n".into(), bundle.trim().into(), "-p".into(), permission.trim().into(),
+                ]),
+                PermissionCommandBackend::Positional => args.extend([
+                    bundle.trim().into(), permission.trim().into(),
+                ]),
+            }
+            (args, 20)
+        }
+        HostCapability::SetDeviceRadio { device, radio, enable, backend } => {
+            let value = if *enable { "1" } else { "0" };
+            let command: Vec<String> = match (radio, backend) {
+                (DeviceRadio::Wifi, DeviceRadioBackend::WifiCommand) => vec![
+                    "cmd".into(), "wifi".into(), "set_wifi_enable".into(), value.into(),
+                ],
+                (DeviceRadio::Wifi, DeviceRadioBackend::WpaCli) => vec![
+                    "wpa_cli".into(), "-i".into(), "wlan0".into(),
+                    if *enable { "ifup" } else { "ifdown" }.into(),
+                ],
+                (DeviceRadio::Wifi, DeviceRadioBackend::Svc) => vec![
+                    "svc".into(), "wifi".into(), if *enable { "enable" } else { "disable" }.into(),
+                ],
+                (DeviceRadio::AirplaneMode, DeviceRadioBackend::PowerCommand) => vec![
+                    "cmd".into(), "power".into(), "set-airplane-mode".into(), value.into(),
+                ],
+                (DeviceRadio::AirplaneMode, DeviceRadioBackend::GlobalSettings) => vec![
+                    "settings".into(), "put".into(), "global".into(), "airplane_mode_on".into(),
+                    value.into(),
+                ],
+                _ => return Err("设备无线状态与执行后端不兼容".into()),
+            };
+            let mut args = vec!["-t".into(), device.trim().into(), "shell".into()];
+            args.extend(command);
+            (args, 10)
+        }
         HostCapability::InstallHap { device, hap_path, replace } => {
             let artifact = resolve_workspace_artifact(
                 workspace.ok_or("deploy.install 需要明确的项目工作区")?, hap_path,
@@ -944,9 +1104,37 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
             "operation_digest": short_digest(operation_id),
             "action": device_ui_action_audit(action),
         }),
-        HostCapability::StopAbility { device, bundle }
-        | HostCapability::UninstallBundle { device, bundle } => serde_json::json!({
+        HostCapability::StopAbility { device, bundle } => serde_json::json!({
             "device_digest": short_digest(device), "bundle": bundle,
+        }),
+        HostCapability::UninstallBundle { device, bundle, keep_data } => serde_json::json!({
+            "device_digest": short_digest(device), "bundle": bundle, "keep_data": keep_data,
+        }),
+        HostCapability::ClearAppStorage { device, bundle, target } => serde_json::json!({
+            "device_digest": short_digest(device), "bundle": bundle,
+            "target": match target { AppStorageTarget::Cache => "cache", AppStorageTarget::Data => "data" },
+        }),
+        HostCapability::ChangeAppPermission {
+            device, bundle, permission, grant, backend,
+        } => serde_json::json!({
+            "device_digest": short_digest(device), "bundle": bundle,
+            "permission": permission, "action": if *grant { "grant" } else { "revoke" },
+            "backend": match backend {
+                PermissionCommandBackend::NamedFlags => "named_flags",
+                PermissionCommandBackend::Positional => "positional",
+            },
+        }),
+        HostCapability::SetDeviceRadio { device, radio, enable, backend } => serde_json::json!({
+            "device_digest": short_digest(device),
+            "radio": match radio { DeviceRadio::Wifi => "wifi", DeviceRadio::AirplaneMode => "airplane" },
+            "enable": enable,
+            "backend": match backend {
+                DeviceRadioBackend::WifiCommand => "wifi_command",
+                DeviceRadioBackend::WpaCli => "wpa_cli",
+                DeviceRadioBackend::Svc => "svc",
+                DeviceRadioBackend::PowerCommand => "power_command",
+                DeviceRadioBackend::GlobalSettings => "global_settings",
+            },
         }),
         HostCapability::InstallHap { device, hap_path, replace } => serde_json::json!({
             "device_digest": device.as_deref().map(short_digest), "artifact": hap_path, "replace": replace,
@@ -1463,6 +1651,7 @@ mod tests {
             &HostCapability::UninstallBundle {
                 device: "ABC123".into(),
                 bundle: "com.example.app".into(),
+                keep_data: false,
             },
             None,
         )
@@ -1471,11 +1660,61 @@ mod tests {
             uninstall.args,
             vec!["-t", "ABC123", "shell", "bm", "uninstall", "-n", "com.example.app"]
         );
+        assert_eq!(
+            prepare_invocation(
+                &HostCapability::UninstallBundle {
+                    device: "ABC123".into(),
+                    bundle: "com.example.app".into(),
+                    keep_data: true,
+                },
+                None,
+            )
+            .unwrap()
+            .args,
+            vec![
+                "-t", "ABC123", "shell", "bm", "uninstall", "-k", "-n", "com.example.app",
+            ]
+        );
         assert!(!HostCapability::UninstallBundle {
             device: "ABC123".into(),
             bundle: "com.example.app".into(),
+            keep_data: false,
         }
         .replay_safe());
+        let clear = HostCapability::ClearAppStorage {
+            device: "ABC123".into(),
+            bundle: "com.example.app".into(),
+            target: AppStorageTarget::Cache,
+        };
+        assert_eq!(
+            prepare_invocation(&clear, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "bm", "clean", "-c", "-n", "com.example.app"]
+        );
+        assert!(!clear.replay_safe());
+        let permission = HostCapability::ChangeAppPermission {
+            device: "ABC123".into(),
+            bundle: "com.example.app".into(),
+            permission: "ohos.permission.CAMERA".into(),
+            grant: true,
+            backend: PermissionCommandBackend::NamedFlags,
+        };
+        assert_eq!(
+            prepare_invocation(&permission, None).unwrap().args,
+            vec![
+                "-t", "ABC123", "shell", "bm", "grant-permission", "-n",
+                "com.example.app", "-p", "ohos.permission.CAMERA",
+            ]
+        );
+        assert!(!permission.replay_safe());
+        assert!(HostCapability::ChangeAppPermission {
+            device: "ABC123".into(),
+            bundle: "com.example.app".into(),
+            permission: "ohos.permission.CAMERA;bad".into(),
+            grant: true,
+            backend: PermissionCommandBackend::Positional,
+        }
+        .validate()
+        .is_err());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1650,6 +1889,42 @@ mod tests {
             delay_ms: 1,
             loss_pct: 0,
             bandwidth_kbps: 0,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn device_radio_backends_are_fixed_and_compatible() {
+        let wifi = HostCapability::SetDeviceRadio {
+            device: "ABC123".into(),
+            radio: DeviceRadio::Wifi,
+            enable: false,
+            backend: DeviceRadioBackend::Svc,
+        };
+        assert_eq!(
+            prepare_invocation(&wifi, None).unwrap().args,
+            vec!["-t", "ABC123", "shell", "svc", "wifi", "disable"]
+        );
+        assert!(!wifi.replay_safe());
+        let airplane = HostCapability::SetDeviceRadio {
+            device: "ABC123".into(),
+            radio: DeviceRadio::AirplaneMode,
+            enable: true,
+            backend: DeviceRadioBackend::GlobalSettings,
+        };
+        assert_eq!(
+            prepare_invocation(&airplane, None).unwrap().args,
+            vec![
+                "-t", "ABC123", "shell", "settings", "put", "global",
+                "airplane_mode_on", "1",
+            ]
+        );
+        assert!(HostCapability::SetDeviceRadio {
+            device: "ABC123".into(),
+            radio: DeviceRadio::AirplaneMode,
+            enable: true,
+            backend: DeviceRadioBackend::WpaCli,
         }
         .validate()
         .is_err());
