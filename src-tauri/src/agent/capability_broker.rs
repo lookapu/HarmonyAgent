@@ -161,6 +161,10 @@ pub enum HostCapability {
         enable: bool,
         backend: DeviceRadioBackend,
     },
+    /// 开始把 UI 操作录制到受管设备临时 CSV。
+    StartUiRecording { device: String, remote_path: String },
+    /// 停止当前设备上的 UI 操作录制。
+    StopUiRecording { device: String },
     /// 安装构建产物到设备（路径必须位于项目工作树内）。
     InstallHap { device: Option<String>, hap_path: String, replace: bool },
     /// 拉起一个已安装应用的明确 ability。
@@ -199,6 +203,8 @@ impl HostCapability {
             Self::ClearAppStorage { .. } => "device.app_storage.clear",
             Self::ChangeAppPermission { .. } => "device.permission.change",
             Self::SetDeviceRadio { .. } => "device.radio.set",
+            Self::StartUiRecording { .. } => "device.ui_record.start",
+            Self::StopUiRecording { .. } => "device.ui_record.stop",
             Self::InstallHap { .. } => "deploy.install",
             Self::StartAbility { .. } => "deploy.start_ability",
             Self::Deploy { .. } => "deploy",
@@ -321,6 +327,11 @@ impl HostCapability {
                 }
                 Ok(())
             }
+            Self::StartUiRecording { device, remote_path } => {
+                validate_device_target(device)?;
+                validate_managed_device_temp_path(remote_path)
+            }
+            Self::StopUiRecording { device } => validate_device_target(device),
             Self::InstallHap { device, hap_path, .. } | Self::Deploy { device, hap_path } => {
                 if let Some(device) = device {
                     validate_device_target(device)?;
@@ -489,6 +500,10 @@ fn request_material(capability: &HostCapability) -> String {
                 DeviceRadioBackend::GlobalSettings => "global_settings",
             },
         ),
+        HostCapability::StartUiRecording { device, remote_path } => {
+            format!("{}\0{}", device.trim(), remote_path.trim())
+        }
+        HostCapability::StopUiRecording { device } => device.trim().to_string(),
         HostCapability::InstallHap { device, hap_path, replace } => format!(
             "{}\0{}\0{replace}", device.as_deref().unwrap_or("").trim(), hap_path.trim(),
         ),
@@ -764,6 +779,20 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             args.extend(command);
             (args, 10)
         }
+        HostCapability::StartUiRecording { device, remote_path } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "uitest".into(),
+                "uiRecord".into(), "record".into(), "-p".into(), remote_path.trim().into(),
+            ],
+            10,
+        ),
+        HostCapability::StopUiRecording { device } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "uitest".into(),
+                "uiRecord".into(), "stop".into(),
+            ],
+            10,
+        ),
         HostCapability::InstallHap { device, hap_path, replace } => {
             let artifact = resolve_workspace_artifact(
                 workspace.ok_or("deploy.install 需要明确的项目工作区")?, hap_path,
@@ -1136,6 +1165,12 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
                 DeviceRadioBackend::GlobalSettings => "global_settings",
             },
         }),
+        HostCapability::StartUiRecording { device, remote_path } => serde_json::json!({
+            "device_digest": short_digest(device), "remote_digest": short_digest(remote_path),
+        }),
+        HostCapability::StopUiRecording { device } => serde_json::json!({
+            "device_digest": short_digest(device),
+        }),
         HostCapability::InstallHap { device, hap_path, replace } => serde_json::json!({
             "device_digest": device.as_deref().map(short_digest), "artifact": hap_path, "replace": replace,
         }),
@@ -1233,9 +1268,9 @@ fn validate_managed_device_temp_path(path: &str) -> Result<(), String> {
         || !basename
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-        || !matches!(Path::new(basename).extension().and_then(|value| value.to_str()), Some("png" | "json" | "mp4"))
+        || !matches!(Path::new(basename).extension().and_then(|value| value.to_str()), Some("png" | "json" | "mp4" | "csv"))
     {
-        return Err("设备临时文件必须是受管前缀下的安全 .png/.json/.mp4 basename".into());
+        return Err("设备临时文件必须是受管前缀下的安全 .png/.json/.mp4/.csv basename".into());
     }
     Ok(())
 }
@@ -1770,6 +1805,30 @@ mod tests {
             .unwrap()
             .args,
             vec!["-t", "ABC123", "shell", "rm", "-f", layout]
+        );
+        let record = "/data/local/tmp/deveco_agent_ui_record_20250101.csv";
+        assert_eq!(
+            prepare_invocation(
+                &HostCapability::StartUiRecording {
+                    device: "ABC123".into(),
+                    remote_path: record.into(),
+                },
+                None,
+            )
+            .unwrap()
+            .args,
+            vec![
+                "-t", "ABC123", "shell", "uitest", "uiRecord", "record", "-p", record,
+            ]
+        );
+        assert_eq!(
+            prepare_invocation(
+                &HostCapability::StopUiRecording { device: "ABC123".into() },
+                None,
+            )
+            .unwrap()
+            .args,
+            vec!["-t", "ABC123", "shell", "uitest", "uiRecord", "stop"]
         );
         for invalid in [
             "/data/local/tmp/layout.json",

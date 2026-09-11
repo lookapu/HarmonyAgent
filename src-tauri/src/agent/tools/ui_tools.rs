@@ -1389,6 +1389,7 @@ static RECORD_UI_STORE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Rec
 #[derive(Clone)]
 struct RecordUiHandle {
     device_file: String,
+    name: String,
 }
 
 /// record_ui：开始/停止 UI 操作录制。
@@ -1406,7 +1407,11 @@ pub(super) fn safe_file_name(raw: &str) -> String {
     if trimmed.is_empty() { "default".to_string() } else { trimmed.chars().take(64).collect() }
 }
 
-pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn record_ui(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -1414,38 +1419,42 @@ pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, 
     let action = args["action"].as_str().unwrap_or("start");
     let name = safe_file_name(args["name"].as_str().unwrap_or("default"));
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录，无法保存 UI 录制".into());
+    }
 
     let store = RECORD_UI_STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let store_key = format!("{device}|{name}");
+    let store_key = device.clone();
 
     if action == "start" {
-        if let Ok(m) = store.lock() {
-            if m.contains_key(&store_key) {
-                return Err(format!("设备 {device} 已有名为 \"{name}\" 的录制进行中，请先调用 record_ui action=stop 结束。"));
+        let dev_file = format!(
+            "/data/local/tmp/deveco_agent_ui_record_{}.csv",
+            uuid::Uuid::new_v4().simple(),
+        );
+        {
+            let mut guard = store.lock().map_err(|e| e.to_string())?;
+            if guard.contains_key(&store_key) {
+                return Err(format!("设备 {device} 已有进行中的 UI 录制，请先使用原名称调用 record_ui action=stop 结束。"));
             }
+            guard.insert(
+                store_key.clone(),
+                RecordUiHandle {
+                    device_file: dev_file.clone(),
+                    name: name.clone(),
+                },
+            );
         }
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let dev_file = format!("/data/local/tmp/ui_record_{ts}.csv");
-
-        let _ = run_hdc_shell(&device, &["rm", "-f", &dev_file], 5).await;
-        // 启动 uiRecord 录制（后台执行）
-        let out = run_hdc_shell(&device, &["uitest", "uiRecord", "record", "-p", &dev_file], 5).await;
-        match out {
-            Ok(o) if !o.to_lowercase().contains("not found") && !o.to_lowercase().contains("fail") => {}
-            Ok(o) => return Err(format!("启动 UI 录制失败：{o}")),
-            Err(e) => return Err(format!("启动 UI 录制失败：{e}")),
+        let start = crate::agent::capability_broker::HostCapability::StartUiRecording {
+            device: device.clone(),
+            remote_path: dev_file.clone(),
+        };
+        if let Err(error) = execute_ui_host_capability(&start, "启动 UI 录制", ctx).await {
+            if let Ok(mut guard) = store.lock() {
+                guard.remove(&store_key);
+            }
+            cleanup_managed_device_file(&device, &dev_file, ctx).await;
+            return Err(error);
         }
-
-        // 登记与检查同一锁内：并发 start 在检查后登记会互相覆盖 handle，
-        // 导致前一个录制 stop 时找不到；这里双重检查后原子插入
-        let mut guard = store.lock().map_err(|e| e.to_string())?;
-        if guard.contains_key(&store_key) {
-            return Err(format!("设备 {device} 已有名为 \"{name}\" 的录制进行中，请先调用 record_ui action=stop 结束。"));
-        }
-        guard.insert(store_key, RecordUiHandle { device_file: dev_file });
         Ok(format!(
             "UI 录制已开始（设备 {device}，名称：{name}）\n请在设备上操作你想录制的流程，完成后调用 record_ui action=stop 结束录制。"
         ))
@@ -1457,33 +1466,39 @@ pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, 
         let Some(h) = handle else {
             return Err(format!("没有找到名称为 \"{name}\" 的录制，先调用 record_ui action=start 开始。"));
         };
+        if h.name != name {
+            return Err(format!(
+                "设备 {device} 正在录制名称 \"{}\"，请使用该名称停止，避免写入错误目标。",
+                h.name,
+            ));
+        }
 
         // 停止录制：发送停止指令
-        let stop_out = run_hdc_shell(&device, &["uitest", "uiRecord", "stop"], 10).await;
-        let _ = stop_out;
+        let stop = crate::agent::capability_broker::HostCapability::StopUiRecording {
+            device: device.clone(),
+        };
+        execute_ui_host_capability(&stop, "停止 UI 录制", ctx).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // 把录制文件拉到本地
-        let local_dir = if project_path.is_empty() {
-            std::env::temp_dir().to_string_lossy().to_string()
-        } else {
-            format!("{project_path}/.deveco-agent/ui_records")
-        };
-        std::fs::create_dir_all(&local_dir).ok();
-        let local_csv = format!("{local_dir}/{name}.csv");
-        let local_json = format!("{local_dir}/{name}.json");
-
-        let hdc_args: Vec<String> = vec![
-            "-s".to_string(), device.clone(), "file".to_string(), "recv".to_string(),
-            h.device_file.clone(), local_csv.clone(),
-        ];
-        let recv = run_cmd("hdc", &hdc_args, None, 30).await;
-        if recv.is_err() || !std::path::Path::new(&local_csv).exists() {
+        let (workspace, local_dir) =
+            ensure_workspace_subdir(&project_path, ".deveco-agent/ui_records")?;
+        let local_csv = local_dir.join(format!("{name}.csv"));
+        let local_json = local_dir.join(format!("{name}.json"));
+        if let Err(error) = receive_managed_device_file(
+            &workspace,
+            &device,
+            &h.device_file,
+            &local_csv,
+            ctx,
+        )
+        .await
+        {
             if let Ok(mut m) = store.lock() {
                 m.remove(&store_key);
             }
             return Err(format!(
-                "录制文件拉取失败（设备 {device}）。可能设备不支持 uitest uiRecord（模拟器常见），或录制文件已丢失。"
+                "录制文件拉取失败（设备 {device}）：{error}。可能设备不支持 uitest uiRecord（模拟器常见），或录制文件已丢失。"
             ));
         }
 
@@ -1495,8 +1510,9 @@ pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, 
                 m.remove(&store_key);
             }
             return Err(format!(
-                "录制文件已拉取但未解析到任何操作步骤（{} 行）。可能 uitest uiRecord 输出格式与预期不符。原始文件：{local_csv}",
-                csv_content.lines().count()
+                "录制文件已拉取但未解析到任何操作步骤（{} 行）。可能 uitest uiRecord 输出格式与预期不符。原始文件：{}",
+                csv_content.lines().count(),
+                local_csv.display(),
             ));
         }
         let json_out = serde_json::json!({
@@ -1506,17 +1522,18 @@ pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, 
             "duration_ms": duration_ms,
             "steps": steps,
         });
-        std::fs::write(&local_json, serde_json::to_string_pretty(&json_out).unwrap_or_default())
-            .unwrap_or(());
+        let write_json =
+            std::fs::write(&local_json, serde_json::to_string_pretty(&json_out).unwrap_or_default());
 
         if let Ok(mut m) = store.lock() {
             m.remove(&store_key);
         }
+        write_json.map_err(|error| format!("写入 UI 录制 JSON 失败：{error}"))?;
 
         let mut out = format!("UI 录制完成（设备 {device}，名称 {name}）\n");
         out.push_str(&format!("共 {} 步，总时长约 {:.1} 秒\n", steps.len(), duration_ms as f64 / 1000.0));
-        out.push_str(&format!("CSV 原始文件：{local_csv}\n"));
-        out.push_str(&format!("JSON 步骤文件：{local_json}\n"));
+        out.push_str(&format!("CSV 原始文件：{}\n", local_csv.display()));
+        out.push_str(&format!("JSON 步骤文件：{}\n", local_json.display()));
         out.push_str("\n步骤预览（前 10 步）：\n");
         for (i, s) in steps.iter().take(10).enumerate() {
             out.push_str(&format!("  {}. {}\n", i + 1, s["desc"].as_str().unwrap_or("?")));

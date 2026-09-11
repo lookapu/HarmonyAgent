@@ -1297,7 +1297,7 @@ pub async fn run_tool(
         "set_wifi_state" => ui_tools::set_wifi_state(&args, &roots, ctx).await,
         "set_airplane_mode" => ui_tools::set_airplane_mode(&args, &roots, ctx).await,
         "screen_record" => ui_tools::screen_record(&args, &roots).await,
-        "record_ui" => ui_tools::record_ui(&args, &roots).await,
+        "record_ui" => ui_tools::record_ui(&args, &roots, ctx).await,
         "replay_ui" => ui_tools::replay_ui(&args, &roots, ctx).await,
         "gesture_perform" => ui_tools::gesture_perform(&args, &roots, ctx).await,
         "analyze_hap_size" => ui_tools::analyze_hap_size(&args, &roots).await,
@@ -2133,6 +2133,53 @@ async fn capture_ui_layout_file(
         return Err("拉取控件树文件失败：本地文件不存在或为空".into());
     }
     std::fs::read_to_string(local).map_err(|error| format!("读取控件树文件失败：{error}"))
+}
+
+async fn cleanup_managed_device_file(
+    device: &str,
+    remote: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) {
+    let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+        device: device.to_string(),
+        remote_path: remote.to_string(),
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+}
+
+async fn receive_managed_device_file(
+    workspace: &Path,
+    device: &str,
+    remote: &str,
+    local: &Path,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(), String> {
+    let relative = local
+        .strip_prefix(workspace)
+        .map_err(|_| "设备证据目标越出项目工作区")?
+        .to_string_lossy()
+        .into_owned();
+    let receive = crate::agent::capability_broker::HostCapability::ReceiveFile {
+        device: device.to_string(),
+        remote_path: remote.to_string(),
+        local_path: relative,
+    };
+    let result = crate::agent::capability_broker::execute_host_capability(
+        &receive,
+        Some(workspace),
+        ctx,
+    )
+    .await;
+    cleanup_managed_device_file(device, remote, ctx).await;
+    let output = result.map_err(|error| format!("拉取设备证据失败：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("拉取设备证据失败：{}", first_line_or_unknown(&text)));
+    }
+    if !local.is_file() || std::fs::metadata(local).map(|meta| meta.len() == 0).unwrap_or(true) {
+        return Err("拉取设备证据失败：本地文件不存在或为空".into());
+    }
+    Ok(())
 }
 
 /// verify_ui：截图 + 自动质检（黑屏/白屏/异常纯色），返回结论与截图路径供多模态查看。
