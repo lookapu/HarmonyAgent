@@ -61,11 +61,11 @@ pub(super) async fn run_perf_benchmark(
         .main_element
         .unwrap_or_else(|| "EntryAbility".into());
     let startup_ms = if !bundle.is_empty() && args["measure_startup"].as_bool().unwrap_or(true) {
-        measure_startup(&device, &bundle, &ability).await.ok()
+        measure_startup(&device, &bundle, &ability, ctx).await.ok()
     } else {
         None
     };
-    let battery_before = sample_battery_percent(&device).await.ok();
+    let battery_before = sample_battery_percent(&device, ctx).await.ok();
     let package_bytes = benchmark_package_bytes(args, Path::new(project_path));
 
     // 1. 可选：先跑一遍 UI 操作流程（让应用进入被测状态）
@@ -112,8 +112,8 @@ pub(super) async fn run_perf_benchmark(
     }
 
     // 3. FPS（尽力而为，设备/系统不支持时跳过）
-    let fps = sample_fps(&device).await.ok();
-    let battery_after = sample_battery_percent(&device).await.ok();
+    let fps = sample_fps(&device, ctx).await.ok();
+    let battery_after = sample_battery_percent(&device, ctx).await.ok();
     let battery_delta = battery_before.zip(battery_after).map(|(before, after)| after - before);
 
     let snap = BenchSnapshot {
@@ -256,13 +256,31 @@ pub(super) async fn run_perf_benchmark(
     Ok(out)
 }
 
-async fn measure_startup(device: &str, bundle: &str, ability: &str) -> Result<f64, String> {
-    let _ = run_hdc_shell(device, &["aa", "force-stop", bundle], 20).await;
+async fn measure_startup(
+    device: &str,
+    bundle: &str,
+    ability: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let stop = crate::agent::capability_broker::HostCapability::StopAbility {
+        device: device.to_string(),
+        bundle: bundle.to_string(),
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&stop, None, ctx).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let started = std::time::Instant::now();
-    run_hdc_shell(device, &["aa", "start", "-b", bundle, "-a", ability], 30).await?;
+    let start = crate::agent::capability_broker::HostCapability::StartAbility {
+        device: device.to_string(),
+        bundle: bundle.to_string(),
+        ability: ability.to_string(),
+    };
+    execute_ui_host_capability(&start, "启动 Ability", ctx).await?;
     for _ in 0..40 {
-        if run_hdc_shell(device, &["aa", "dump", "-l"], 10)
+        let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+            device: device.to_string(),
+            argv: vec!["aa".into(), "dump".into(), "-l".into()],
+        };
+        if execute_ui_host_capability(&query, "查询 Ability 状态", ctx)
             .await
             .is_ok_and(|dump| dump.contains(bundle))
         {
@@ -273,9 +291,33 @@ async fn measure_startup(device: &str, bundle: &str, ability: &str) -> Result<f6
     Err("10 秒内未观察到 Ability 状态".into())
 }
 
-async fn sample_battery_percent(device: &str) -> Result<f64, String> {
-    let output = run_hdc_shell(device, &["hidumper", "-s", "BatteryService", "-a", "-i"], 20).await?;
+async fn sample_battery_percent(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv: vec![
+            "hidumper".into(), "-s".into(), "BatteryService".into(), "-a".into(), "-i".into(),
+        ],
+    };
+    let output = execute_ui_host_capability(&query, "读取设备电量", ctx).await?;
     parse_battery_percent(&output).ok_or_else(|| "未读取到有效电量".into())
+}
+
+async fn execute_ui_host_capability(
+    capability: &crate::agent::capability_broker::HostCapability,
+    action: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let output = crate::agent::capability_broker::execute_host_capability(capability, None, ctx)
+        .await
+        .map_err(|error| format!("{action}失败：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("{action}失败：{}", first_line_or_unknown(&text)));
+    }
+    Ok(text)
 }
 
 fn parse_battery_percent(output: &str) -> Option<f64> {
@@ -310,8 +352,17 @@ fn benchmark_package_bytes(args: &Value, root: &Path) -> Option<u64> {
 }
 
 /// 采样当前窗口 FPS（hidumper RenderService fps），不支持时返回 Err。
-pub(super) async fn sample_fps(device: &str) -> Result<f64, String> {
-    let out = run_hdc_shell(device, &["hidumper", "-s", "RenderService", "-a", "fps"], 20).await?;
+pub(super) async fn sample_fps(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv: vec![
+            "hidumper".into(), "-s".into(), "RenderService".into(), "-a".into(), "fps".into(),
+        ],
+    };
+    let out = execute_ui_host_capability(&query, "读取 RenderService FPS", ctx).await?;
     for line in out.lines() {
         let lower = line.to_lowercase();
         if !lower.contains("fps") {
@@ -588,9 +639,14 @@ pub(super) async fn start_ability(
         if bundle.is_empty() {
             return Err("后台恢复验证需要显式 bundle 或可解析当前工程 bundleName".into());
         }
-        run_hdc_shell(&device, &["uitest", "uiInput", "keyEvent", "home"], 20)
-            .await
-            .map_err(|error| format!("将应用切入后台失败：{error}"))?;
+        let home = crate::agent::capability_broker::HostCapability::DeviceUiInput {
+            device: device.clone(),
+            operation_id: uuid::Uuid::new_v4().simple().to_string(),
+            action: crate::agent::capability_broker::DeviceUiAction::Key {
+                name: "home".into(),
+            },
+        };
+        execute_ui_host_capability(&home, "将应用切入后台", ctx).await?;
         tokio::time::sleep(Duration::from_millis(800)).await;
     }
 
@@ -612,15 +668,29 @@ pub(super) async fn start_ability(
         cmd.push(o.as_str());
     }
 
-    let out = run_hdc_shell(&device, &cmd, 20).await
-        .map_err(|e| format!("启动 Ability 失败：{e}"))?;
+    let out = if uri.is_empty() && !bundle.is_empty() && !ability.is_empty() {
+        let start = crate::agent::capability_broker::HostCapability::StartAbility {
+            device: device.clone(),
+            bundle: bundle.clone(),
+            ability: ability.clone(),
+        };
+        execute_ui_host_capability(&start, "启动 Ability", ctx).await?
+    } else {
+        run_hdc_shell(&device, &cmd, 20)
+            .await
+            .map_err(|e| format!("启动 Ability 失败：{e}"))?
+    };
 
     // 状态确认：显式 bundle 必须在多次 Ability 栈观测中至少出现一次。
     let mut observed = bundle.is_empty();
     let mut foreground = false;
     for wait in [800u64, 1200, 2000] {
         tokio::time::sleep(Duration::from_millis(wait)).await;
-        if let Ok(dump) = run_hdc_shell(&device, &["aa", "dump", "-l"], 10).await {
+        let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+            device: device.clone(),
+            argv: vec!["aa".into(), "dump".into(), "-l".into()],
+        };
+        if let Ok(dump) = execute_ui_host_capability(&query, "查询 Ability 状态", ctx).await {
             if bundle.is_empty() || dump.contains(&bundle) { observed = true; }
             if dump.lines().any(|line| line.contains(&bundle) && line.contains("foreground")) {
                 foreground = true;
@@ -629,7 +699,14 @@ pub(super) async fn start_ability(
         }
     }
     if !observed {
-        let hilog = run_hdc_shell(&device, &["hilog", "-x"], 25).await.unwrap_or_default();
+        let logs = crate::agent::capability_broker::HostCapability::ReadHilog {
+            device: device.clone(),
+            level: None,
+            tag: None,
+        };
+        let hilog = execute_ui_host_capability(&logs, "读取启动日志", ctx)
+            .await
+            .unwrap_or_default();
         let evidence = hilog.lines().filter(|line| line.contains(&bundle)).collect::<Vec<_>>().join("\n");
         return Err(format!(
             "Ability 启动命令已返回，但状态确认未观察到 {bundle}。\n日志证据：{}",
