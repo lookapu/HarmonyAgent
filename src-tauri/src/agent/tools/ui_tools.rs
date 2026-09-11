@@ -370,13 +370,17 @@ mod performance_tests {
 // ---------- UI 控件树 / 启动 Ability / 应用数据清理 / 内存分析 / 应用查询 / 卸载 / 权限 / 网络 / 录屏 ----------
 
 /// dump_ui_hierarchy：导出当前界面控件树 JSON，保存到工程目录并返回摘要。
-pub(super) async fn dump_ui_hierarchy(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn dump_ui_hierarchy(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
     };
-    let (local_path, content) = capture_ui_hierarchy(project_path, &device).await?;
+    let (local_path, content) = capture_ui_hierarchy(project_path, &device, ctx).await?;
     let local_file = local_path.to_string_lossy();
     let total_nodes = count_json_nodes(&content);
     let summary = summarize_ui_tree(&content);
@@ -391,25 +395,15 @@ pub(super) async fn dump_ui_hierarchy(args: &Value, roots: &[String]) -> Result<
     Ok(out)
 }
 
-pub(super) async fn capture_ui_hierarchy(project_path: &str, device: &str) -> Result<(PathBuf, String), String> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let dev_file = format!("/data/local/tmp/ui_dump_{}.json", ts);
-    run_hdc_shell(device, &["uitest", "dumpLayout", "-p", &dev_file], 30).await
-        .map_err(|e| format!("控件树导出失败：{e}"))?;
-
-    let local_dir = if project_path.is_empty() {
-        std::env::temp_dir().to_string_lossy().to_string()
-    } else {
-        // 与截图口径一致：.deveco-agent 目录（不用 .trae，避免 IDE 清缓存丢产物）
-        Path::new(project_path)
-            .join(".deveco-agent")
-            .to_string_lossy()
-            .to_string()
-    };
-    std::fs::create_dir_all(&local_dir).ok();
+pub(super) async fn capture_ui_hierarchy(
+    project_path: &str,
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(PathBuf, String), String> {
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录，无法保存控件树".into());
+    }
+    let (workspace, local_dir) = ensure_workspace_subdir(project_path, ".deveco-agent/ui")?;
     // 文件名：毫秒时间戳 + 设备号（与截图口径一致，多设备/连续导出不覆盖）
     let ts_ms = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
     let dev_safe: String = device
@@ -417,20 +411,12 @@ pub(super) async fn capture_ui_hierarchy(project_path: &str, device: &str) -> Re
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect();
-    let local_file = PathBuf::from(format!("{local_dir}/ui_hierarchy-{ts_ms}-{dev_safe}.json"));
-
-    // 通过 hdc file recv 拉到本地
-    let hdc_args: Vec<String> = vec![
-        "-s".to_string(), device.to_string(), "file".to_string(), "recv".to_string(),
-        dev_file.clone(), local_file.to_string_lossy().to_string(),
-    ];
-    run_cmd("hdc", &hdc_args, None, 30).await
-        .map_err(|e| format!("拉取控件树文件失败: {e}"))?;
-    if !local_file.exists() {
-        return Err("拉取控件树文件失败：本地文件未生成".into());
-    }
-
-    let content = std::fs::read_to_string(&local_file).unwrap_or_default();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let local_file = local_dir.join(format!(
+        "ui_hierarchy-{ts_ms}-{dev_safe}-{}.json",
+        &nonce[..8],
+    ));
+    let content = capture_ui_layout_file(&workspace, device, &local_file, ctx).await?;
     Ok((local_file, content))
 }
 

@@ -1288,7 +1288,8 @@ pub(super) async fn run_ui_flow(
     let mut hierarchy_path: Option<PathBuf> = None;
     if !assertions.is_empty() {
         let project_path = roots.first().map(String::as_str).unwrap_or("");
-        let (path, hierarchy) = super::ui_tools::capture_ui_hierarchy(project_path, &device).await?;
+        let (path, hierarchy) =
+            super::ui_tools::capture_ui_hierarchy(project_path, &device, ctx).await?;
         let assertion_results = evaluate_ui_assertions(&hierarchy, &assertions)?;
         out.push_str(&format!("\n页面断言（UI 树：{}）：\n", path.display()));
         for (description, passed) in &assertion_results {

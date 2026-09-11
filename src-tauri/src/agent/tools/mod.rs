@@ -1284,7 +1284,7 @@ pub async fn run_tool(
         "write_unit_tests" => test_tools::write_unit_tests(&args, &roots).await,
         "run_ui_flow" => test_tools::run_ui_flow(&args, &roots, ctx).await,
         "run_perf_benchmark" => ui_tools::run_perf_benchmark(&args, &roots, ctx).await,
-        "dump_ui_hierarchy" => ui_tools::dump_ui_hierarchy(&args, &roots).await,
+        "dump_ui_hierarchy" => ui_tools::dump_ui_hierarchy(&args, &roots, ctx).await,
         "ui_locator" => ui_tools::ui_locator(&args, &roots).await,
         "start_ability" => ui_tools::start_ability(&args, &roots, ctx).await,
         "clear_app_data" => ui_tools::clear_app_data(&args, &roots).await,
@@ -1311,7 +1311,7 @@ pub async fn run_tool(
         "diagnose_signing" => build_tools::diagnose_signing(&args, &roots, ctx).await,
         "dump_battery" => debug_tools::dump_battery(&args, &roots, ctx).await,
         "scan_api_compat" => debug_tools::scan_api_compat(&args, &roots, db).await,
-        "auto_explore" => explore_tools::auto_explore(&args, &roots).await,
+        "auto_explore" => explore_tools::auto_explore(&args, &roots, ctx).await,
         "refresh_api_db" => explore_tools::refresh_api_db(db, ctx).await,
         "search_api" => explore_tools::search_api(&args, &roots, db).await,
         "refresh_api_details" => explore_tools::refresh_api_details(db, ctx).await,
@@ -2070,6 +2070,69 @@ fn ensure_workspace_subdir(project_path: &str, relative: &str) -> Result<(PathBu
         return Err("输出目录必须位于项目工作区内".into());
     }
     Ok((root, directory))
+}
+
+async fn capture_ui_layout_file(
+    workspace: &Path,
+    device: &str,
+    local: &Path,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let relative = local
+        .strip_prefix(workspace)
+        .map_err(|_| "UI 树目标越出项目工作区")?
+        .to_string_lossy()
+        .into_owned();
+    let remote = format!(
+        "/data/local/tmp/deveco_agent_layout_{}.json",
+        uuid::Uuid::new_v4().simple(),
+    );
+    let dump = crate::agent::capability_broker::HostCapability::DumpUiLayout {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+    };
+    let dump_result = crate::agent::capability_broker::execute_host_capability(&dump, None, ctx).await;
+    let dump_error = match dump_result {
+        Ok(output) => {
+            let text = host_output_text(&output);
+            (!output.status.success() || hdc_shell_failed(&text))
+                .then(|| format!("控件树导出失败：{}", first_line_or_unknown(&text)))
+        }
+        Err(error) => Some(format!("控件树导出失败：{error}")),
+    };
+    if let Some(error) = dump_error {
+        let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+            device: device.to_string(),
+            remote_path: remote,
+        };
+        let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+        return Err(error);
+    }
+    let receive = crate::agent::capability_broker::HostCapability::ReceiveFile {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+        local_path: relative,
+    };
+    let result = crate::agent::capability_broker::execute_host_capability(
+        &receive,
+        Some(workspace),
+        ctx,
+    )
+    .await;
+    let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+        device: device.to_string(),
+        remote_path: remote,
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+    let output = result.map_err(|error| format!("拉取控件树文件失败：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("拉取控件树文件失败：{}", first_line_or_unknown(&text)));
+    }
+    if !local.is_file() || std::fs::metadata(local).map(|meta| meta.len() == 0).unwrap_or(true) {
+        return Err("拉取控件树文件失败：本地文件不存在或为空".into());
+    }
+    std::fs::read_to_string(local).map_err(|error| format!("读取控件树文件失败：{error}"))
 }
 
 /// verify_ui：截图 + 自动质检（黑屏/白屏/异常纯色），返回结论与截图路径供多模态查看。
