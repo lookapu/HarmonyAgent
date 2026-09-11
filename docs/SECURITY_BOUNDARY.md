@@ -132,7 +132,7 @@ Broker 请求必须包含 `run_id`、`tool_call_id`、精确动作、目标、�
 
 迁移 `082_host_capability_claims` 为非 replay-safe 能力提供跨进程原子 claim：获得 claim 与 `host_capability.started` 事件在同一事务提交，只有首个 Worker 可以派发命令；完成状态与 `host_capability.finished` 同样原子提交。重复的 `started/succeeded/failed/indeterminate` 请求全部失败关闭，必须先核验外部状态并发起新的工具调用。应用恢复会把遗留 `started` 标为 `indeterminate`，并把 Run 的恢复策略提升为 `verify_effects`。这是“最多一次派发 + 不确定结果人工/工具核验”，不是外部系统严格 exactly-once；命令可能已生效但进程来不及记录终态。设备目标只记录 SHA-256 短摘要，校验失败不记录恶意原参数。上层工具审批、持久工具去重、按工作区/设备的并发门禁、批量部署恢复和启动后存活验证保持不变。
 
-`device_shell` 也已改为 Broker 内二次校验的 replay-safe 查询能力：调用方提交分词后的 argv，Broker 再执行字符集、命令、参数数目和修改型子命令门禁，并只拼接固定 `hdc -t <device> shell ...` 前缀。`aa/bm` 只能以 `dump` 为首个子命令，`param` 只能 `get`，同时拒绝网络配置增删、清空内核日志、修改设备时间等伪装在查询命令后的副作用参数；审计保存首命令与完整 argv 摘要，不记录查询中的潜在敏感路径。
+`device_shell` 也已改为 Broker 内二次校验的 replay-safe 查询能力：调用方提交分词后的 argv，Broker 再执行字符集、命令、参数数目和修改型子命令门禁，并只拼接固定 `hdc -t <device> shell ...` 前缀。`aa/bm` 只能以 `dump` 为首个子命令，`param` 只能 `get`，同时拒绝网络配置增删、清空内核日志、修改设备时间等伪装在查询命令后的副作用参数；审计保存首命令与完整 argv 摘要，不记录查询中的潜在敏感路径。 `check_signature` 的已安装 bundle 查询、`dump_battery` 的 BatteryService/sysfs 查询、`stack_dump` 的进程/线程/详情查询也复用同一入口；线程遍历已移除 `sh -c`，改为直接传递 `/proc/<pid>/...` 的 `ls`/`cat` argv。
 
 这仍是部分实现：设备属性富化查询、模拟器、签名与发布动作尚未完整迁移；影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
 

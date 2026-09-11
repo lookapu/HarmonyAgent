@@ -3,6 +3,26 @@
 //! 本模块通过 `use super::*` 继承访问。
 
 use super::*;
+
+async fn debug_device_query(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    argv: &[&str],
+) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv: argv.iter().map(|value| (*value).to_string()).collect(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(format!("设备查询退出码 {}：{text}", output.status.code().unwrap_or(-1)))
+    }
+}
+
 /// search_hilog：在设备 hilog 中按条件搜索。
 pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<String, String> {
     let device = match args["device"].as_str() {
@@ -413,7 +433,7 @@ pub(super) async fn set_network_condition(
     };
 
     if mode == "normal" {
-        let iface = detect_network_iface(&device).await.ok_or("未发现可恢复的在线网络接口")?;
+        let iface = detect_network_iface(ctx, &device).await.ok_or("未发现可恢复的在线网络接口")?;
         let output = match run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", &iface, "root"], 10).await {
             Ok(output) => output,
             Err(error) if error.to_ascii_lowercase().contains("no such file") => error,
@@ -435,7 +455,7 @@ pub(super) async fn set_network_condition(
     }
 
     // 设置弱网：用 tc netem（需要 root）
-    let iface = detect_network_iface(&device).await;
+    let iface = detect_network_iface(ctx, &device).await;
     let iface_str = iface.as_deref().unwrap_or("wlan0");
 
     // 先删除现有 qdisc
@@ -511,10 +531,13 @@ mod network_condition_tests {
     }
 }
 
-pub(super) async fn detect_network_iface(device: &str) -> Option<String> {
+pub(super) async fn detect_network_iface(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+) -> Option<String> {
     // 优先尝试 wlan0，然后 eth0
     for iface in ["wlan0", "eth0", "wlan1"] {
-        if let Ok(out) = run_hdc_shell(device, &["ifconfig", iface], 3).await {
+        if let Ok(out) = debug_device_query(ctx, device, &["ifconfig", iface]).await {
             if network_iface_is_active(&out) {
                 return Some(iface.to_string());
             }
@@ -532,7 +555,11 @@ fn network_iface_is_active(output: &str) -> bool {
 }
 
 /// check_signature：检查签名信息。
-pub(super) async fn check_signature(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn check_signature(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -590,7 +617,7 @@ pub(super) async fn check_signature(args: &Value, roots: &[String]) -> Result<St
     // 如果指定了已安装包，用 bm dump 看 profile
     if !bundle.is_empty() {
         out.push_str(&format!("\n已安装应用：{bundle}\n"));
-        let dump = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 20).await
+        let dump = debug_device_query(ctx, &device, &["bm", "dump", "-n", &bundle]).await
             .unwrap_or_default();
         // 提取签名相关字段
         let app_prov = super::ui_tools::extract_json_str(&dump, "appProvisionType").unwrap_or_else(|| "（未知）".to_string());
@@ -612,7 +639,11 @@ pub(super) async fn check_signature(args: &Value, roots: &[String]) -> Result<St
 }
 
 /// dump_battery：电池与耗电分析。
-pub(super) async fn dump_battery(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn dump_battery(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -622,7 +653,9 @@ pub(super) async fn dump_battery(args: &Value, _roots: &[String]) -> Result<Stri
     let mut out = format!("电池状态报告（设备 {device}）\n\n");
 
     // 1. hidumper BatteryService
-    if let Ok(o) = run_hdc_shell(&device, &["hidumper", "-s", "BatteryService", "-a", "-i"], 10).await {
+    if let Ok(o) = debug_device_query(
+        ctx, &device, &["hidumper", "-s", "BatteryService", "-a", "-i"],
+    ).await {
         let capacity = grep_number(&o, "capacity:");
         let level = grep_number(&o, "batteryLevel:");
         let charging = grep_text(&o, "chargingStatus:");
@@ -642,13 +675,17 @@ pub(super) async fn dump_battery(args: &Value, _roots: &[String]) -> Result<Stri
     }
 
     // 2. /sys/class/power_supply/battery/ 兜底读取
-    if let Ok(o) = run_hdc_shell(&device, &["cat", "/sys/class/power_supply/battery/capacity"], 5).await {
+    if let Ok(o) = debug_device_query(
+        ctx, &device, &["cat", "/sys/class/power_supply/battery/capacity"],
+    ).await {
         let v = o.trim();
         if !v.is_empty() {
             out.push_str(&format!("  电量（sysfs）：{v}%\n"));
         }
     }
-    if let Ok(o) = run_hdc_shell(&device, &["cat", "/sys/class/power_supply/battery/status"], 5).await {
+    if let Ok(o) = debug_device_query(
+        ctx, &device, &["cat", "/sys/class/power_supply/battery/status"],
+    ).await {
         let v = o.trim();
         if !v.is_empty() {
             out.push_str(&format!("  状态（sysfs）：{v}\n"));
@@ -660,7 +697,9 @@ pub(super) async fn dump_battery(args: &Value, _roots: &[String]) -> Result<Stri
         out.push_str("\n应用耗电：\n");
         out.push_str("  （耗电排行读取需要系统权限或特定版本，结果仅供参考）\n");
         // 尝试 hidumper -s BatteryStatsService
-        if let Ok(o) = run_hdc_shell(&device, &["hidumper", "-s", "BatteryStatsService"], 10).await {
+        if let Ok(o) = debug_device_query(
+            ctx, &device, &["hidumper", "-s", "BatteryStatsService"],
+        ).await {
             if o.contains(&bundle) {
                 out.push_str("  应用在 BatteryStatsService 输出中被检测到\n");
             } else {
@@ -1082,7 +1121,11 @@ fn list_probes(conv: &str) -> Result<String, String> {
 /// stack_dump：定位应用进程并采集线程快照（ps 找 pid → /proc 线程枚举 → hidumper 进程详情）。
 /// 完整 JS 函数级调用栈依赖 DevEco Profiler 闭源协议，本工具提供可达的最强进程/线程快照，
 /// 需要函数级执行顺序时配合 debug_probe 插桩观察。
-pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn stack_dump(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
@@ -1104,7 +1147,7 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
     };
 
     // 1) 定位主进程 pid：ps -A 中 CMD 含包名
-    let ps = run_hdc_shell(&device, &["ps", "-A"], 30).await?;
+    let ps = debug_device_query(ctx, &device, &["ps", "-A"]).await?;
     let mut pids: Vec<String> = Vec::new();
     for line in ps.lines() {
         if line.contains(&bundle) {
@@ -1120,7 +1163,7 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
         }
     }
     if pids.is_empty() {
-        let bm = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 30).await?;
+        let bm = debug_device_query(ctx, &device, &["bm", "dump", "-n", &bundle]).await?;
         if hdc_shell_failed(&bm) || !bm.contains("bundleName") {
             return Err(format!(
                 "设备 {device} 上未找到应用 {bundle}（可能未安装；请先 deploy）"
@@ -1134,16 +1177,16 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
     let mut out = format!("应用 {bundle} 进程快照（设备 {device}，{} 个进程）：\n", pids.len());
     for pid in &pids {
         // 2) 线程列表：/proc/<pid>/task 枚举 + comm 名称（比 ps -T 更可靠）
-        let ls_cmd = format!("ls /proc/{pid}/task");
-        let ls_args = vec!["sh", "-c", ls_cmd.as_str()];
-        let tasks = run_hdc_shell(&device, &ls_args, 30).await.unwrap_or_default();
+        let task_path = format!("/proc/{pid}/task");
+        let tasks = debug_device_query(ctx, &device, &["ls", &task_path])
+            .await
+            .unwrap_or_default();
         let mut tids: Vec<String> = tasks.split_whitespace().map(String::from).collect();
         tids.sort_by_key(|t| t.parse::<u32>().unwrap_or(0));
         let mut thread_lines: Vec<String> = Vec::new();
         for tid in tids.iter().take(60) {
-            let cat_cmd = format!("cat /proc/{pid}/task/{tid}/comm");
-            let cat_args = vec!["sh", "-c", cat_cmd.as_str()];
-            if let Ok(comm) = run_hdc_shell(&device, &cat_args, 20).await {
+            let comm_path = format!("/proc/{pid}/task/{tid}/comm");
+            if let Ok(comm) = debug_device_query(ctx, &device, &["cat", &comm_path]).await {
                 let name = comm.trim();
                 if !name.is_empty() {
                     thread_lines.push(format!("    tid {tid}: {name}"));
@@ -1151,7 +1194,7 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
             }
         }
         // 3) 进程详情（CPU/内存/线程状态）
-        let detail = run_hdc_shell(&device, &["hidumper", "-p", pid], 40)
+        let detail = debug_device_query(ctx, &device, &["hidumper", "-p", pid])
             .await
             .unwrap_or_else(|e| format!("(hidumper 不可用: {e})"));
         out.push_str(&format!(
