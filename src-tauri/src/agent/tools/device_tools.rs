@@ -549,40 +549,16 @@ pub(super) async fn stop_app(
 }
 
 pub(super) fn validate_device_shell_command(command: &str) -> Result<Vec<&str>, String> {
-    if !command
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || " /._-:+=,[%]".contains(c))
-    {
-        return Err(format!(
-            "device_shell 拒绝执行包含 shell 元字符的命令（仅允许字母/数字/空格及 / . _ - : + = , [ ] %）：{command}"
-        ));
-    }
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    let Some(cmd) = tokens.first().copied() else {
-        return Err("device_shell 命令不能为空".into());
-    };
-    if !DEVICE_SHELL_ALLOWED.contains(&cmd) {
-        return Err(format!(
-            "命令 {cmd} 不在 device_shell 白名单（{}）；如需修改设备状态请用对应专用工具",
-            DEVICE_SHELL_ALLOWED.join("/")
-        ));
-    }
-    if let Some(bad) = DEVICE_SHELL_FORBIDDEN_TOKENS
-        .iter()
-        .find(|t| command.split_whitespace().any(|w| w.starts_with(**t)))
-    {
-        return Err(format!("device_shell 拒绝破坏性命令 {bad}，请使用对应专用工具"));
-    }
-    if cmd == "aa" && !tokens.iter().skip(1).any(|t| *t == "dump") {
-        return Err("device_shell 中 aa 仅允许 dump 查询子命令；启动/停止应用请用 start_ability/stop_app".into());
-    }
-    if cmd == "bm" && !tokens.iter().skip(1).any(|t| *t == "dump") {
-        return Err("device_shell 中 bm 仅允许 dump 查询子命令；安装/卸载请用 deploy/uninstall_app".into());
-    }
+    let owned = tokens.iter().map(|token| (*token).to_string()).collect::<Vec<_>>();
+    crate::agent::capability_broker::validate_read_only_device_command(&owned)?;
     Ok(tokens)
 }
 
-pub(super) async fn device_shell(args: &Value) -> Result<String, String> {
+pub(super) async fn device_shell(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -593,8 +569,17 @@ pub(super) async fn device_shell(args: &Value) -> Result<String, String> {
     };
     // 四重安全校验（纯函数，便于单元测试）
     let tokens = validate_device_shell_command(command)?;
-    let out = run_hdc_shell(&device, &tokens, 30).await?;
-    let out = out.trim_end();
+    let capability = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: tokens.iter().map(|token| (*token).to_string()).collect(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let decoded = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("设备查询失败：{}", decoded.trim()));
+    }
+    let out = decoded.trim_end();
     if out.is_empty() {
         return Ok(format!("命令执行成功（设备 {device}），无输出"));
     }

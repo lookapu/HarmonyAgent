@@ -311,7 +311,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "device_file",
-        desc: "在电脑与设备之间传输文件（hdc file send/recv，即 push/pull）。\n参数：{\"action\":\"push|pull\",\"device\":\"<可选设备>\",\"remote\":\"<设备端路径，如 /data/local/tmp/x.png 或 /sdcard/...>\",\"local\":\"<本地路径，绝对或相对工程根>\"}。\npull：把设备端文件拉到本地（local 缺省保存到工程 .deveco-agent/files/ 下）；push：把本地文件推送到设备端路径（local 必填）。\n适合：拉取应用沙箱数据库/SharedPreferences/崩溃文件分析、推送测试素材（图片/字体/证书）到设备。真机 /data 下部分目录权限受限时改走 /data/local/tmp 或 /sdcard。\n副作用：在本地或设备端创建文件。\n返回：传输结果与目标路径。",
+        desc: "在电脑与设备之间传输文件（hdc file send/recv，即 push/pull）。\n参数：{\"action\":\"push|pull\",\"device\":\"<可选设备>\",\"remote\":\"<设备端绝对路径，如 /data/local/tmp/x.png 或 /sdcard/...>\",\"local\":\"<工作区内且不含 .. 的相对路径>\"}。\npull：把设备端文件拉到本地（local 缺省保存到工程 .deveco-agent/files/ 下）；push：把本地文件推送到设备端路径（local 必填）。本地路径会 canonicalize 并拒绝符号链接逃逸。\n适合：拉取应用沙箱数据库/SharedPreferences/崩溃文件分析、推送测试素材（图片/字体/证书）到设备。真机 /data 下部分目录权限受限时改走 /data/local/tmp 或 /sdcard。\n副作用：在本地或设备端创建文件。\n返回：传输结果与目标路径。",
     },
     ToolSpec {
         name: "stop_app",
@@ -319,7 +319,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "device_shell",
-        desc: "在设备上执行受限白名单 shell 命令（只读/查询类，禁止破坏性操作），用于专用工具覆盖不到的系统查询。\n参数：{\"device\":\"<可选>\",\"command\":\"<命令串，如 ps -A -T 或 cat /proc/meminfo 或 ls /data/local/tmp>\"}。\n允许命令：ps/ls/cat/df/free/uptime/date/top/netstat/ip/ifconfig/getprop/param/pwd/dmesg/echo/hidumper 及 aa dump/bm dump（仅查询子命令）；禁止 rm/kill/reboot/mount/chmod 等修改类命令与 shell 元字符。\n适合：查进程、看文件、查网络、下钻系统信息；需要修改设备状态时用对应专用工具。\n副作用：无（只读）。\n返回：命令输出（截断 3000 字符）。",
+        desc: "在设备上执行受限白名单 shell 命令（只读/查询类，禁止破坏性操作），用于专用工具覆盖不到的系统查询。\n参数：{\"device\":\"<可选>\",\"command\":\"<命令串，如 ps -A -T 或 cat /proc/meminfo 或 ls /data/local/tmp>\"}。\n允许命令：ps/ls/cat/df/free/uptime/date/top/netstat/ip/ifconfig/getprop/param get/pwd/dmesg/echo/hidumper 及 aa dump/bm dump（仅查询子命令）；禁止 rm/kill/reboot/mount/chmod、param set、ip set/add/del、dmesg clear、date set 等修改型参数与 shell 元字符。命令会在 Host Capability Broker 内再次按 argv 校验、固定执行并审计。\n适合：查进程、看文件、查网络、下钻系统信息；需要修改设备状态时用对应专用工具。\n副作用：无（只读）。\n返回：命令输出（截断 3000 字符）。",
     },
     ToolSpec {
         name: "analyze_crash",
@@ -1230,7 +1230,7 @@ pub async fn run_tool(
         "create_emulator" => device_tools::create_emulator(&args).await,
         "device_file" => device_tools::device_file(&args, &roots, ctx).await,
         "stop_app" => device_tools::stop_app(&args, &roots, ctx).await,
-        "device_shell" => device_tools::device_shell(&args).await,
+        "device_shell" => device_tools::device_shell(&args, ctx).await,
         "analyze_crash" => device_tools::analyze_crash(&args, &roots, ctx).await,
         "ohpm_search" => build_tools::ohpm_search(&args, &roots, db).await,
         "ohpm_recommend" => build_tools::ohpm_recommend(&args, db).await,
@@ -3079,23 +3079,11 @@ async fn run_app(args: &Value, roots: &[String]) -> Result<String, String> {
 ///
 /// device_file：电脑与设备之间传输文件（hdc file send/recv，即 push/pull）。
 ///
-/// 解析本地路径：绝对路径直接使用，相对路径基于工程根。
+/// 解析本地路径；公开工具入口只接受相对路径，并在执行前校验 canonical 工作区边界。
 ///
 /// stop_app：强制停止设备上运行的应用进程（aa force-stop）。
 ///
 /// device_shell 白名单：仅允许只读/查询类命令；破坏性命令一律拒绝。
-const DEVICE_SHELL_ALLOWED: &[&str] = &[
-    "ps", "ls", "cat", "df", "free", "uptime", "date", "top", "netstat", "ip",
-    "ifconfig", "getprop", "param", "pwd", "dmesg", "echo", "hidumper",
-    // aa/bm 不在下方校验 4 中限定为仅 dump 查询（否则校验 2 会直接拒绝）
-    "aa", "bm",
-];
-const DEVICE_SHELL_FORBIDDEN_TOKENS: &[&str] = &[
-    "rm", "mv", "cp", "kill", "pkill", "reboot", "shutdown", "mount", "umount",
-    "chmod", "chown", "mkfs", "wipe", "flash", "format", "dd", "sed", "awk", "su",
-    "install",
-];
-
 /// 校验设备 shell 命令是否安全（四重校验），通过后返回分词结果。
 /// ① 字符集白名单（拒绝 shell 元字符）② 首命令白名单 ③ 破坏性命令词拦截 ④ aa/bm 仅允许 dump 查询。
 ///

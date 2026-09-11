@@ -47,6 +47,8 @@ pub enum HostCapability {
     ReadLogcat { device: String, lines: u64 },
     /// 枚举三个预定义 faultlog 目录之一。
     ListFaultLogs { device: String, directory: FaultLogDirectory },
+    /// 执行经过 Broker 二次校验的只读设备查询 argv。
+    DeviceReadQuery { device: String, argv: Vec<String> },
     /// 把工作区内普通文件发送到设备绝对路径。
     SendFile { device: String, local_path: String, remote_path: String },
     /// 把设备绝对路径拉取到工作区内。
@@ -74,6 +76,7 @@ impl HostCapability {
             Self::ReadHilog { .. } => "device.read_hilog",
             Self::ReadLogcat { .. } => "device.read_logcat",
             Self::ListFaultLogs { .. } => "device.list_faultlogs",
+            Self::DeviceReadQuery { .. } => "device.read_query",
             Self::SendFile { .. } => "device.file_send",
             Self::ReceiveFile { .. } => "device.file_receive",
             Self::StopAbility { .. } => "device.stop_ability",
@@ -114,6 +117,10 @@ impl HostCapability {
                 Ok(())
             }
             Self::ListFaultLogs { device, .. } => validate_device_target(device),
+            Self::DeviceReadQuery { device, argv } => {
+                validate_device_target(device)?;
+                validate_read_only_device_command(argv).map(|_| ())
+            }
             Self::SendFile { device, local_path, remote_path }
             | Self::ReceiveFile { device, remote_path, local_path } => {
                 validate_device_target(device)?;
@@ -146,6 +153,7 @@ impl HostCapability {
                 | Self::ReadHilog { .. }
                 | Self::ReadLogcat { .. }
                 | Self::ListFaultLogs { .. }
+                | Self::DeviceReadQuery { .. }
         )
     }
 }
@@ -210,6 +218,9 @@ fn request_material(capability: &HostCapability) -> String {
         HostCapability::ListFaultLogs { device, directory } => {
             format!("{}\0{}", device.trim(), directory.as_path())
         }
+        HostCapability::DeviceReadQuery { device, argv } => {
+            format!("{}\0{}", device.trim(), argv.join("\0"))
+        }
         HostCapability::SendFile { device, local_path, remote_path }
         | HostCapability::ReceiveFile { device, remote_path, local_path } => format!(
             "{}\0{}\0{}",
@@ -271,6 +282,12 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             ],
             15,
         ),
+        HostCapability::DeviceReadQuery { device, argv } => {
+            let query = validate_read_only_device_command(argv)?;
+            let mut args = vec!["-t".into(), device.trim().into(), "shell".into()];
+            args.extend(query);
+            (args, 30)
+        }
         HostCapability::SendFile { device, local_path, remote_path } => {
             let local = resolve_workspace_source(
                 workspace.ok_or("device.file_send 需要明确的项目工作区")?, local_path,
@@ -589,6 +606,11 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         HostCapability::ListFaultLogs { device, directory } => serde_json::json!({
             "device_digest": short_digest(device), "directory": directory.as_path(),
         }),
+        HostCapability::DeviceReadQuery { device, argv } => serde_json::json!({
+            "device_digest": short_digest(device),
+            "command": argv.first(),
+            "query_digest": short_digest(&argv.join("\0")),
+        }),
         HostCapability::SendFile { device, local_path, remote_path } => serde_json::json!({
             "device_digest": short_digest(device), "local_path": local_path,
             "remote_digest": short_digest(remote_path),
@@ -675,6 +697,74 @@ fn validate_device_path(path: &str) -> Result<(), String> {
         return Err("设备路径不得包含上级目录 ..".into());
     }
     Ok(())
+}
+
+const DEVICE_QUERY_COMMANDS: &[&str] = &[
+    "ps", "ls", "cat", "df", "free", "uptime", "date", "top", "netstat", "ip",
+    "ifconfig", "getprop", "param", "pwd", "dmesg", "echo", "hidumper", "aa", "bm",
+];
+const DEVICE_QUERY_FORBIDDEN_PREFIXES: &[&str] = &[
+    "rm", "mv", "cp", "kill", "pkill", "reboot", "shutdown", "mount", "umount", "chmod",
+    "chown", "mkfs", "wipe", "flash", "format", "dd", "sed", "awk", "su", "install",
+];
+const DEVICE_QUERY_MUTATORS: &[&str] = &["set", "add", "del", "delete", "flush", "replace", "clear"];
+
+/// 只接受已分词 argv；调用方与执行准备阶段都会调用，防止验证后参数漂移。
+pub fn validate_read_only_device_command(argv: &[String]) -> Result<Vec<String>, String> {
+    if argv.is_empty() || argv.len() > 64 {
+        return Err("设备查询命令必须包含 1-64 个参数".into());
+    }
+    if argv.iter().any(|token| {
+        token.is_empty()
+            || token.len() > 512
+            || !token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-:+=,[%]".contains(c))
+    }) {
+        return Err("设备查询 argv 含空参数、超长参数或非法字符".into());
+    }
+    let command = argv[0].as_str();
+    if !DEVICE_QUERY_COMMANDS.contains(&command) {
+        return Err(format!("命令 {command} 不在设备只读查询白名单"));
+    }
+    if let Some(bad) = argv.iter().skip(1).find(|token| {
+        let normalized = token.trim_start_matches('-');
+        DEVICE_QUERY_FORBIDDEN_PREFIXES
+            .iter()
+            .any(|item| normalized.starts_with(item))
+            || DEVICE_QUERY_MUTATORS.contains(&normalized)
+    }) {
+        return Err(format!("设备查询拒绝修改型参数 {bad}"));
+    }
+    match command {
+        "aa" | "bm" if argv.get(1).map(String::as_str) != Some("dump") => {
+            return Err(format!("{command} 仅允许 dump 查询子命令"));
+        }
+        "param" if argv.get(1).map(String::as_str) != Some("get") => {
+            return Err("param 仅允许 get 查询子命令".into());
+        }
+        "ifconfig" if argv.len() > 2 => {
+            return Err("ifconfig 仅允许无参数、-a 或单个网卡名查询".into());
+        }
+        "ifconfig" if argv.get(1).is_some_and(|arg| arg.starts_with('-') && arg != "-a") => {
+            return Err("ifconfig 仅允许 -a 查询选项".into());
+        }
+        "dmesg" if argv.iter().any(|arg| {
+            matches!(arg.as_str(), "-c" | "-C" | "--clear" | "-n" | "--console-level")
+        }) => {
+            return Err("dmesg 禁止清空日志或修改控制台日志级别".into());
+        }
+        "date"
+            if argv
+                .iter()
+                .skip(1)
+                .any(|arg| !arg.starts_with('+') && arg != "-u" && arg != "-R") =>
+        {
+            return Err("date 仅允许无参数、-u、-R 或 +FORMAT 查询".into());
+        }
+        _ => {}
+    }
+    Ok(argv.to_vec())
 }
 
 fn validate_hap_path(path: &str) -> Result<(), String> {
@@ -801,6 +891,28 @@ mod tests {
             vec!["-t", "ABC123", "shell", "ls", "-1", "/data/log/faultlog/temp"]
         );
         assert!(faultlogs.replay_safe());
+        let query = HostCapability::DeviceReadQuery {
+            device: "ABC123".into(),
+            argv: vec!["param".into(), "get".into(), "const.product.model".into()],
+        };
+        let invocation = prepare_invocation(&query, None).unwrap();
+        assert_eq!(
+            invocation.args,
+            vec!["-t", "ABC123", "shell", "param", "get", "const.product.model"]
+        );
+        assert!(query.replay_safe());
+        for argv in [
+            vec!["param".into(), "set".into(), "x".into(), "y".into()],
+            vec!["ip".into(), "link".into(), "set".into(), "wlan0".into()],
+            vec!["aa".into(), "start".into(), "dump".into()],
+            vec!["dmesg".into(), "-c".into()],
+            vec!["date".into(), "--set".into(), "2030-01-01".into()],
+            vec!["date".into(), "20300101".into()],
+        ] {
+            assert!(HostCapability::DeviceReadQuery { device: "ABC123".into(), argv }
+                .validate()
+                .is_err());
+        }
     }
 
     #[test]
