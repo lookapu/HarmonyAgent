@@ -2,7 +2,7 @@
 //!
 //! 调用方式不变：quality_tools::xxx(...)，通过 pub use re-export 暴露。
 
-use crate::agent::tools::{resolve_in_roots, resolve_readable};
+use crate::agent::tools::{resolve_for_write, resolve_in_roots, resolve_readable};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -466,6 +466,7 @@ pub async fn step_debug(
 pub async fn ota_pack(
     args: &Value,
     roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
     let hap_path = args["hap_path"]
         .as_str()
@@ -473,47 +474,50 @@ pub async fn ota_pack(
     let out_path = args["out_path"]
         .as_str()
         .ok_or("ota_pack 需要参数 {\"out_path\":\"<输出 .pkg 路径>\"}")?;
-    let profile_path = args["profile_path"].as_str();
+    let profile_path = args["profile_path"].as_str().map(str::trim).filter(|path| !path.is_empty());
 
-    // 1) 验证 HAP 存在
+    // 1) 把所有输入、输出绑定到同一个已授权工作区。
     let hap_full = resolve_in_roots(roots, hap_path)?;
-    if !hap_full.exists() {
-        return Err(format!("HAP 不存在: {}", hap_full.display()));
+    let out_full = resolve_for_write(roots, out_path)?;
+    let profile_full = profile_path.map(|path| resolve_in_roots(roots, path)).transpose()?;
+    let workspace = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .find(|root| {
+            hap_full.starts_with(root)
+                && out_full.starts_with(root)
+                && profile_full.as_ref().map_or(true, |profile| profile.starts_with(root))
+        })
+        .ok_or("HAP、输出和 profile 必须位于同一个已授权项目根内")?;
+    let relative = |path: &std::path::Path| -> Result<String, String> {
+        path.strip_prefix(&workspace)
+            .map(|value| value.to_string_lossy().into_owned())
+            .map_err(|_| "OTA 路径越出项目工作区".into())
+    };
+    let capability = crate::agent::capability_broker::HostCapability::PackageOta {
+        hap_path: relative(&hap_full)?,
+        output_path: relative(&out_full)?,
+        profile_path: profile_full.as_deref().map(relative).transpose()?,
+    };
+    capability.validate()?;
+    let output_parent = out_full.parent().ok_or("OTA 输出路径缺少父目录")?;
+    std::fs::create_dir_all(output_parent).map_err(|error| format!("创建 OTA 输出目录失败：{error}"))?;
+    let canonical_parent = output_parent
+        .canonicalize()
+        .map_err(|error| format!("无法解析 OTA 输出目录：{error}"))?;
+    if !canonical_parent.starts_with(&workspace) {
+        return Err("OTA 输出目录通过符号链接逃逸项目工作区".into());
     }
 
-    // 2) 找 packaging_tool（DevEco Studio 自带）
-    let packager = find_packaging_tool().ok_or_else(|| {
-        "未找到 packaging_tool.jar。请：\n  \
-         1. 安装 DevEco Studio\n  \
-         2. 或下载 HarmonyOS Sdk Command-Line Tools\n  \
-         3. 把 packagingtool.jar 路径加到环境变量 HOS_SDK_HOME 或 PATH"
-            .to_string()
-    })?;
-
-    // 3) 构造命令（hmos app packager 打 OTA 包）
-    //    实际命令：java -jar <packager> --mode ota --hap <hap> --out <pkg> --profile <profile>
-    //    java 打包可能耗时数秒~数十秒，放入 blocking 线程池避免钉死 tokio worker
+    // 2) Broker 内部发现受信任 packagingtool，固定 java argv 并持久化不可重放 claim。
     let start = std::time::Instant::now();
-    let packager_owned = packager.clone();
-    let hap_full_owned = hap_full.clone();
-    let out_path_owned = out_path.to_string();
-    let profile_owned = profile_path.map(|s| s.to_string());
-    let output = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("java");
-        cmd.arg("-jar").arg(&packager_owned);
-        cmd.arg("--mode").arg("ota");
-        cmd.arg("--hap").arg(&hap_full_owned);
-        cmd.arg("--out").arg(&out_path_owned);
-        if let Some(pp) = &profile_owned {
-            cmd.arg("--profile").arg(pp);
-        }
-        cmd.arg("--force"); // 覆盖已存在
-        cmd.output().map_err(|e| format!(
-            "启动 packaging_tool 失败: {e}（确认 java 在 PATH 且 packaging_tool.jar 可访问）"
-        ))
-    })
+    let output = crate::agent::capability_broker::execute_host_capability(
+        &capability,
+        Some(&workspace),
+        ctx,
+    )
     .await
-    .map_err(|e| format!("打包任务失败: {e}"))??;
+    .map_err(|error| format!("OTA 打包未取得确定终态：{error}"))?;
     let elapsed = start.elapsed();
 
     if !output.status.success() {
@@ -525,14 +529,21 @@ pub async fn ota_pack(
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let out_p = std::path::Path::new(out_path);
-    let size = std::fs::metadata(out_p).map(|m| m.len()).unwrap_or(0);
+    let packaged = out_full
+        .canonicalize()
+        .map_err(|error| format!("packagingtool 返回成功，但输出文件不存在：{error}"))?;
+    if !packaged.starts_with(&workspace) || !packaged.is_file() {
+        return Err("packagingtool 返回成功，但输出不是工作区内普通文件".into());
+    }
+    let size = std::fs::metadata(&packaged).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        return Err("packagingtool 返回成功，但 OTA 输出文件为空".into());
+    }
     Ok(format!(
-        "✅ OTA 包已生成：{}\n大小：{:.1} KB\n耗时：{:.1}s\npackaging_tool：{}\nstdout 摘要：\n{}",
-        out_p.display(),
+        "✅ OTA 包已生成：{}\n大小：{:.1} KB\n耗时：{:.1}s\nstdout 摘要：\n{}",
+        packaged.display(),
         size as f64 / 1024.0,
         elapsed.as_secs_f64(),
-        packager,
         if stdout.trim().is_empty() { "(无输出)".to_string() } else { stdout.chars().take(1500).collect::<String>() }
     ))
 }
@@ -660,39 +671,4 @@ fn path_template_to_regex(path: &str) -> String {
     }
     re.push('$');
     re
-}
-
-
-fn find_packaging_tool() -> Option<String> {
-    // 1) 环境变量
-    if let Ok(p) = std::env::var("HOS_PACKAGING_TOOL") {
-        if std::path::Path::new(&p).exists() { return Some(p); }
-    }
-    // 2) DevEco 常见路径
-    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-        let home = std::path::PathBuf::from(home);
-        let candidates = [
-            home.join("AppData").join("Local").join("Huawei").join("Sdk").join("toolchains").join("packagingtool.jar"),
-            home.join("Library").join("Huawei").join("Sdk").join("toolchains").join("packagingtool.jar"),
-        ];
-        for c in candidates {
-            if c.exists() { return Some(c.to_string_lossy().into_owned()); }
-        }
-    }
-    // 3) Windows 全局
-    for c in [
-        "C:/Program Files/Huawei/DevEco Studio/tools/packagingtool.jar",
-        "D:/Huawei/DevEco Studio/tools/packagingtool.jar",
-        "D:/DevEco Studio/tools/packagingtool.jar",
-    ] {
-        if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-    }
-    // 4) resources/packagingtool/ 备选
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("resources").join("packagingtool.jar");
-            if p.exists() { return Some(p.to_string_lossy().into_owned()); }
-        }
-    }
-    None
 }

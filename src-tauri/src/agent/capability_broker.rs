@@ -152,6 +152,12 @@ pub enum HostCapability {
     },
     /// 删除一个明确的模拟器实例。
     DeleteEmulator { name: String },
+    /// 使用受信任的 DevEco packagingtool 把工作区 HAP 打包为工作区内 OTA 包。
+    PackageOta {
+        hap_path: String,
+        output_path: String,
+        profile_path: Option<String>,
+    },
     /// 查询用于签名 profile 匹配的设备 UDID。
     ReadDeviceUdid { device: String },
     /// 读取设备历史 hilog，可选最低级别和 tag。
@@ -262,6 +268,7 @@ impl HostCapability {
             Self::StopEmulator { .. } => "emulator.stop",
             Self::CreateEmulator { .. } => "emulator.create",
             Self::DeleteEmulator { .. } => "emulator.delete",
+            Self::PackageOta { .. } => "release.package_ota",
             Self::ReadDeviceUdid { .. } => "device.read_udid",
             Self::ReadHilog { .. } => "device.read_hilog",
             Self::SearchHilog { .. } => "device.search_hilog",
@@ -344,6 +351,14 @@ impl HostCapability {
                 }
                 if storage_gb.is_some_and(|value| !(2..=1023).contains(&value)) {
                     return Err("模拟器存储必须在 2-1023 GB 之间".into());
+                }
+                Ok(())
+            }
+            Self::PackageOta { hap_path, output_path, profile_path } => {
+                validate_hap_path(hap_path)?;
+                validate_workspace_output_path(output_path, "pkg")?;
+                if let Some(profile) = profile_path {
+                    validate_workspace_profile_path(profile)?;
                 }
                 Ok(())
             }
@@ -604,6 +619,12 @@ fn request_material(capability: &HostCapability) -> String {
             memory_gb.map(|value| value.to_string()).unwrap_or_default(),
             storage_gb.map(|value| value.to_string()).unwrap_or_default(),
         ),
+        HostCapability::PackageOta { hap_path, output_path, profile_path } => format!(
+            "{}\0{}\0{}",
+            hap_path.trim(),
+            output_path.trim(),
+            profile_path.as_deref().unwrap_or("").trim(),
+        ),
         HostCapability::ReadDeviceUdid { device } => device.trim().to_string(),
         HostCapability::ReadHilog { device, level, tag } => format!(
             "{}\0{}\0{}",
@@ -762,6 +783,33 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
         | HostCapability::CreateEmulator { .. }
         | HostCapability::DeleteEmulator { .. } => {
             return prepare_emulator_invocation(capability);
+        }
+        HostCapability::PackageOta { hap_path, output_path, profile_path } => {
+            let workspace = workspace.ok_or("release.package_ota 需要明确的项目工作区")?;
+            let artifact = resolve_workspace_artifact(workspace, hap_path)?;
+            let destination = resolve_workspace_output(workspace, output_path, "pkg")?;
+            let packager = packaging_tool_executable()
+                .ok_or("未找到 DevEco packagingtool.jar，请安装 DevEco Studio 或配置 HOS_PACKAGING_TOOL")?;
+            let mut args = vec![
+                "-jar".into(),
+                packager.to_string_lossy().into_owned(),
+                "--mode".into(),
+                "ota".into(),
+                "--hap".into(),
+                artifact.to_string_lossy().into_owned(),
+                "--out".into(),
+                destination.to_string_lossy().into_owned(),
+            ];
+            if let Some(profile_path) = profile_path {
+                let profile = resolve_workspace_profile(workspace, profile_path)?;
+                args.extend(["--profile".into(), profile.to_string_lossy().into_owned()]);
+            }
+            args.push("--force".into());
+            return Ok(HostInvocation {
+                program: "java".into(),
+                args,
+                timeout_seconds: 180,
+            });
         }
         HostCapability::ReadDeviceUdid { device } => (
             vec![
@@ -1113,6 +1161,53 @@ pub fn emulator_executable() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn packaging_tool_executable() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("HOS_PACKAGING_TOOL") {
+        let path = PathBuf::from(raw);
+        if is_packaging_tool(&path) {
+            return path.canonicalize().ok();
+        }
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let home = PathBuf::from(home);
+        for path in [
+            home.join("AppData/Local/Huawei/Sdk/toolchains/packagingtool.jar"),
+            home.join("Library/Huawei/Sdk/toolchains/packagingtool.jar"),
+        ] {
+            if is_packaging_tool(&path) {
+                return path.canonicalize().ok();
+            }
+        }
+    }
+    for raw in [
+        "C:/Program Files/Huawei/DevEco Studio/tools/packagingtool.jar",
+        "D:/Huawei/DevEco Studio/tools/packagingtool.jar",
+        "D:/DevEco Studio/tools/packagingtool.jar",
+    ] {
+        let path = PathBuf::from(raw);
+        if is_packaging_tool(&path) {
+            return path.canonicalize().ok();
+        }
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            let path = directory.join("resources/packagingtool.jar");
+            if is_packaging_tool(&path) {
+                return path.canonicalize().ok();
+            }
+        }
+    }
+    None
+}
+
+fn is_packaging_tool(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("packagingtool.jar"))
 }
 
 fn emulator_arguments(capability: &HostCapability) -> Result<(Vec<String>, u64), String> {
@@ -1551,6 +1646,46 @@ fn resolve_workspace_artifact(workspace: &Path, relative: &str) -> Result<std::p
     Ok(artifact)
 }
 
+fn resolve_workspace_output(
+    workspace: &Path,
+    relative: &str,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    validate_workspace_output_path(relative, extension)?;
+    let root = workspace.canonicalize().map_err(|e| format!("无法解析项目工作区：{e}"))?;
+    let requested = root.join(relative.trim());
+    if requested.exists() {
+        let output = requested
+            .canonicalize()
+            .map_err(|e| format!("无法解析输出文件：{e}"))?;
+        if !output.starts_with(&root) || !output.is_file() {
+            return Err("OTA 输出必须是项目工作区内的普通文件".into());
+        }
+        return Ok(output);
+    }
+    let parent = requested.parent().ok_or("OTA 输出缺少父目录")?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("无法解析 OTA 输出父目录：{e}"))?;
+    if !canonical_parent.starts_with(&root) {
+        return Err("OTA 输出父目录通过符号链接逃逸项目工作区".into());
+    }
+    Ok(canonical_parent.join(requested.file_name().ok_or("OTA 输出缺少文件名")?))
+}
+
+fn resolve_workspace_profile(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
+    validate_workspace_profile_path(relative)?;
+    let root = workspace.canonicalize().map_err(|e| format!("无法解析项目工作区：{e}"))?;
+    let profile = root
+        .join(relative.trim())
+        .canonicalize()
+        .map_err(|e| format!("无法解析 OTA profile：{e}"))?;
+    if !profile.starts_with(&root) || !profile.is_file() {
+        return Err("OTA profile 必须是项目工作区内的普通 JSON 文件".into());
+    }
+    Ok(profile)
+}
+
 fn resolve_workspace_source(workspace: &Path, relative: &str) -> Result<std::path::PathBuf, String> {
     let root = workspace.canonicalize().map_err(|e| format!("无法解析项目工作区：{e}"))?;
     let source = root
@@ -1666,6 +1801,11 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
             "screen_profile": screen_profile,
             "memory_gb": memory_gb,
             "storage_gb": storage_gb,
+        }),
+        HostCapability::PackageOta { hap_path, output_path, profile_path } => serde_json::json!({
+            "artifact": hap_path,
+            "output": output_path,
+            "profile_digest": profile_path.as_deref().map(short_digest),
         }),
         HostCapability::ReadDeviceUdid { device } => serde_json::json!({
             "device_digest": short_digest(device),
@@ -2095,6 +2235,44 @@ fn validate_hap_path(path: &str) -> Result<(), String> {
         .unwrap_or("");
     if !name.ends_with(".hap") {
         return Err("安装/部署能力只接受 .hap 产物".into());
+    }
+    Ok(())
+}
+
+fn validate_workspace_output_path(path: &str, extension: &str) -> Result<(), String> {
+    validate_workspace_relative_extension(path, extension, "输出路径")
+}
+
+fn validate_workspace_profile_path(path: &str) -> Result<(), String> {
+    validate_workspace_relative_extension(path, "json", "profile 路径")
+}
+
+fn validate_workspace_relative_extension(
+    path: &str,
+    extension: &str,
+    label: &str,
+) -> Result<(), String> {
+    let path = path.trim();
+    let parsed = Path::new(path);
+    if path.is_empty() || parsed.is_absolute() {
+        return Err(format!("{label}必须是项目工作区内的相对路径"));
+    }
+    if parsed.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(format!("{label}不得包含上级目录或绝对路径前缀"));
+    }
+    let matches_extension = parsed
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension));
+    if !matches_extension {
+        return Err(format!("{label}必须使用 .{extension} 后缀"));
     }
     Ok(())
 }
@@ -2733,6 +2911,47 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn ota_packaging_is_workspace_scoped_and_non_replay_safe() {
+        let capability = HostCapability::PackageOta {
+            hap_path: "artifacts/app.hap".into(),
+            output_path: "release/update.pkg".into(),
+            profile_path: Some("signing/profile.json".into()),
+        };
+        assert!(capability.validate().is_ok());
+        assert_eq!(capability.capability_id(), "release.package_ota");
+        assert!(!capability.replay_safe());
+        assert!(HostCapability::PackageOta {
+            hap_path: "artifacts/app.hap".into(),
+            output_path: "/tmp/update.pkg".into(),
+            profile_path: None,
+        }
+        .validate()
+        .is_err());
+        assert!(HostCapability::PackageOta {
+            hap_path: "artifacts/app.hap".into(),
+            output_path: "release/update.zip".into(),
+            profile_path: Some("../profile.json".into()),
+        }
+        .validate()
+        .is_err());
+
+        let root = std::env::temp_dir().join(format!("harmony-ota-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        std::fs::create_dir_all(root.join("release")).unwrap();
+        std::fs::create_dir_all(root.join("signing")).unwrap();
+        std::fs::write(root.join("artifacts/app.hap"), b"hap").unwrap();
+        std::fs::write(root.join("signing/profile.json"), b"{}").unwrap();
+        assert!(resolve_workspace_output(&root, "release/update.pkg", "pkg")
+            .unwrap()
+            .starts_with(root.canonicalize().unwrap()));
+        assert!(resolve_workspace_profile(&root, "signing/profile.json")
+            .unwrap()
+            .is_file());
+        assert!(resolve_workspace_output(&root, "../escape.pkg", "pkg").is_err());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
