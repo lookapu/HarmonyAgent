@@ -128,11 +128,13 @@ Broker 请求必须包含 `run_id`、`tool_call_id`、精确动作、目标、�
 
 当前接线进度：`connect_device` 的连接/断开、`manage_hdc` 的 daemon 启动/停止/重启、Agent `list_devices` 的主清单查询、`read_logcat` 的 pid/hilog/logcat 查询、`device_file` 的 send/recv、`stop_app`、`analyze_crash` 的 faultlog 枚举与证据拉取，以及单设备 `deploy` 和 `deploy_all` 的 HAP 安装/ability 启动已经通过 `execute_host_capability` 执行。Broker 只生成固定 `hdc` argv；日志路径只接受类型化 device、bundle、level、tag、10—1000 行预算和三个枚举化 faultlog 目录，不接受任意 device shell。崩溃目录列表中的文件名按安全 basename 语法重新校验，含斜杠、上级目录、隐藏项或无时间数字的输出不会进入拉取路径。文件传输的本地源和目标必须是绑定工作区内的相对路径，canonicalize 后仍处于工作区；工作区外绝对路径、`..`、目标父目录符号链接逃逸和非绝对设备路径全部失败关闭，设备端路径只以摘要审计。崩溃副本固定写入工程 `.deveco-agent/crashes`，创建前后都校验 canonical 工作区边界。HAP 也在执行前 canonicalize 并再次确认是工作区内普通文件；bundle/ability 使用受限标识符语法。特权执行缺少 `run_id`、真实 `tool_call_id` 或应用数据库时失败关闭；幂等键稳定绑定 run、tool call、capability 和规范化目标，因此同一次批量部署中的不同设备或多个崩溃文件不会碰撞。只读列表/日志能力明确标记为 replay-safe，可在同一工具调用中重复执行，但每次仍受 Run 租约约束并写入审计事件。
 
+部署路径中的设备型号、已安装状态、ability 存活探测、启动失败 hilog 和最近 faultlog 读取也已走 Broker。新装失败的自动补偿不再直连 `bm uninstall`，而是使用非 replay-safe 的 `deploy.uninstall_bundle` 窄能力；卸载 claim 与终态持久化后，再用独立只读查询确认应用确已移除。faultlog 内容读取只接受枚举目录与重新校验过的 basename，设备返回值不能把 `cat` 引向任意路径。
+
 迁移 `082_host_capability_claims` 为非 replay-safe 能力提供跨进程原子 claim：获得 claim 与 `host_capability.started` 事件在同一事务提交，只有首个 Worker 可以派发命令；完成状态与 `host_capability.finished` 同样原子提交。重复的 `started/succeeded/failed/indeterminate` 请求全部失败关闭，必须先核验外部状态并发起新的工具调用。应用恢复会把遗留 `started` 标为 `indeterminate`，并把 Run 的恢复策略提升为 `verify_effects`。这是“最多一次派发 + 不确定结果人工/工具核验”，不是外部系统严格 exactly-once；命令可能已生效但进程来不及记录终态。设备目标只记录 SHA-256 短摘要，校验失败不记录恶意原参数。上层工具审批、持久工具去重、按工作区/设备的并发门禁、批量部署恢复和启动后存活验证保持不变。
 
 `device_shell` 也已改为 Broker 内二次校验的 replay-safe 查询能力：调用方提交分词后的 argv，Broker 再执行字符集、命令、参数数目和修改型子命令门禁，并只拼接固定 `hdc -t <device> shell ...` 前缀。`aa/bm` 只能以 `dump` 为首个子命令，`param` 只能 `get`，同时拒绝网络配置增删、清空内核日志、修改设备时间等伪装在查询命令后的副作用参数；审计保存首命令与完整 argv 摘要，不记录查询中的潜在敏感路径。
 
-这仍是部分实现：设备属性富化查询、部署故障取证中的其他诊断路径、模拟器、签名与发布尚未完整迁移；影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
+这仍是部分实现：设备属性富化查询、模拟器、签名与发布动作尚未完整迁移；影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
 
 ## 8. 安全测试门禁
 

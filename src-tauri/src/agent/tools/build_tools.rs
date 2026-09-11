@@ -1,5 +1,5 @@
 //! 构建/部署/依赖域工具：build_project / deploy / deploy_all / ohpm 系列。
-//! 共享辅助函数（run_cmd / run_hdc_shell / default_device_id / tail 等）仍定义在父模块 mod.rs，
+//! 共享辅助函数（run_cmd / default_device_id / tail 等）仍定义在父模块 mod.rs，
 //! 本模块通过 `use super::*` 继承访问。
 
 use super::*;
@@ -902,24 +902,75 @@ async fn resolve_deploy_device(requested: Option<&str>) -> Result<String, String
     Ok(selected.id.clone())
 }
 
-async fn recover_fresh_install(device_id: &str, bundle: &str) -> String {
+async fn broker_device_query(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    argv: &[&str],
+) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv: argv.iter().map(|value| (*value).to_string()).collect(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(format!("设备查询退出码 {}：{text}", output.status.code().unwrap_or(-1)))
+    }
+}
+
+async fn broker_hilog(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::ReadHilog {
+        device: device.to_string(),
+        level: None,
+        tag: None,
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(format!("hilog 查询退出码 {}：{text}", output.status.code().unwrap_or(-1)))
+    }
+}
+
+async fn recover_fresh_install(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device_id: &str,
+    bundle: &str,
+) -> String {
     if bundle.is_empty() {
         return "恢复：无法确定 bundleName，未执行自动卸载。".into();
     }
-    match run_hdc_shell(device_id, &["bm", "uninstall", "-n", bundle], 30).await {
-        Ok(output) => {
-            let still_installed = run_hdc_shell(device_id, &["bm", "dump", "-n", bundle], 20)
+    let capability = crate::agent::capability_broker::HostCapability::UninstallBundle {
+        device: device_id.to_string(),
+        bundle: bundle.to_string(),
+    };
+    match crate::agent::capability_broker::execute_host_capability(&capability, None, ctx).await {
+        Ok(output) if output.status.success() => {
+            let output_text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            let still_installed = broker_device_query(ctx, device_id, &["bm", "dump", "-n", bundle])
                 .await
                 .is_ok_and(|dump| dump.contains(bundle) && !dump.contains("not found"));
             if still_installed {
                 format!(
                     "恢复失败：已请求卸载本次新装的 {bundle}，但状态确认仍显示已安装。输出：{}",
-                    tail(&output, 200)
+                    tail(&output_text, 200)
                 )
             } else {
                 format!("恢复完成：已卸载本次新装的 {bundle}，并确认设备不再报告该应用。")
             }
         }
+        Ok(output) => format!(
+            "恢复失败：无法卸载本次新装的 {bundle}：{}",
+            tail(&(smart_decode(&output.stdout) + &smart_decode(&output.stderr)), 300)
+        ),
         Err(error) => format!("恢复失败：无法卸载本次新装的 {bundle}：{error}"),
     }
 }
@@ -947,8 +998,12 @@ fn multi_deploy_concurrency(
     }
 }
 
-async fn start_failure_evidence(device_id: &str, bundle: &str) -> String {
-    let hilog = run_hdc_shell(device_id, &["hilog", "-x"], 25)
+async fn start_failure_evidence(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device_id: &str,
+    bundle: &str,
+) -> String {
+    let hilog = broker_hilog(ctx, device_id)
         .await
         .unwrap_or_default();
     let relevant = hilog
@@ -1023,7 +1078,9 @@ pub(super) async fn deploy(
         out.push_str(&format!("应用包名: {b}\n"));
     }
     // 设备信息
-    if let Ok(model) = run_hdc_shell(&device_id, &["param", "get", "const.product.model"], 15).await
+    if let Ok(model) = broker_device_query(
+        ctx, &device_id, &["param", "get", "const.product.model"],
+    ).await
     {
         let m = model.trim();
         if !m.is_empty() {
@@ -1037,7 +1094,7 @@ pub(super) async fn deploy(
     // 2. 冲突检测：查询是否已安装同包名
     let mut already_installed = false;
     if let Some(bundle) = &info.bundle_name {
-        if let Ok(dump) = run_hdc_shell(&device_id, &["bm", "dump", "-n", bundle], 30).await {
+        if let Ok(dump) = broker_device_query(ctx, &device_id, &["bm", "dump", "-n", bundle]).await {
             if dump.contains(bundle) && !dump.contains("not found") {
                 already_installed = true;
             }
@@ -1153,9 +1210,9 @@ pub(super) async fn deploy(
     let start = match start_ability_capability(ctx, &device_id, bundle, ability).await {
         Ok(output) => output,
         Err(error) => {
-            let evidence = start_failure_evidence(&device_id, bundle).await;
+            let evidence = start_failure_evidence(ctx, &device_id, bundle).await;
             let recovery = if should_recover_fresh_install(already_installed) {
-                recover_fresh_install(&device_id, bundle).await
+                recover_fresh_install(ctx, &device_id, bundle).await
             } else {
                 "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
             };
@@ -1191,7 +1248,7 @@ pub(super) async fn deploy(
     let mut crashed = false;
     for (idx, wait) in [2u64, 3, 3].iter().enumerate() {
         tokio::time::sleep(std::time::Duration::from_secs(*wait)).await;
-        match run_hdc_shell(&device_id, &["aa", "dump", "-l"], 30).await {
+        match broker_device_query(ctx, &device_id, &["aa", "dump", "-l"]).await {
             Ok(dump) if dump.contains(bundle) => {
                 alive_at = Some(idx);
             }
@@ -1238,10 +1295,10 @@ pub(super) async fn deploy(
         ctx.emit_log("system", "应用启动后崩溃，正在抓取 faultlog 与 hilog…");
 
         // 优先拉 faultlog（结构化程度高），回退 hilog -x
-        let faultlog = fetch_recent_faultlog(&device_id, bundle)
+        let faultlog = fetch_recent_faultlog(ctx, &device_id, bundle)
             .await
             .unwrap_or_default();
-        let hilog = run_hdc_shell(&device_id, &["hilog", "-x"], 25)
+        let hilog = broker_hilog(ctx, &device_id)
             .await
             .unwrap_or_default();
         let report = crate::agent::crash::analyze(bundle, &faultlog, &hilog);
@@ -1327,7 +1384,7 @@ pub(super) async fn deploy(
         out.push_str(&err);
         out.push('\n');
         if should_recover_fresh_install(already_installed) {
-            out.push_str(&recover_fresh_install(&device_id, bundle).await);
+            out.push_str(&recover_fresh_install(ctx, &device_id, bundle).await);
             out.push('\n');
         } else {
             out.push_str("恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。\n");
@@ -1557,7 +1614,7 @@ pub(super) async fn deploy_one_device(
     // 冲突检测
     let mut already_installed = false;
     if !bundle.is_empty() {
-        if let Ok(dump) = run_hdc_shell(device_id, &["bm", "dump", "-n", bundle], 30).await {
+        if let Ok(dump) = broker_device_query(ctx, device_id, &["bm", "dump", "-n", bundle]).await {
             if dump.contains(bundle) && !dump.contains("not found") {
                 already_installed = true;
             }
@@ -1631,9 +1688,9 @@ pub(super) async fn deploy_one_device(
 
     // 拉起
     if let Err(error) = start_ability_capability(ctx, device_id, bundle, ability).await {
-        let evidence = start_failure_evidence(device_id, bundle).await;
+        let evidence = start_failure_evidence(ctx, device_id, bundle).await;
         let recovery = if should_recover_fresh_install(already_installed) {
-            recover_fresh_install(device_id, bundle).await
+            recover_fresh_install(ctx, device_id, bundle).await
         } else {
             "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
         };
@@ -1664,7 +1721,7 @@ pub(super) async fn deploy_one_device(
     let mut alive = false;
     for wait in [2u64, 3, 3] {
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-        match run_hdc_shell(device_id, &["aa", "dump", "-l"], 30).await {
+        match broker_device_query(ctx, device_id, &["aa", "dump", "-l"]).await {
             Ok(dump) if dump.contains(bundle) => alive = true,
             _ => {
                 alive = false;
@@ -1696,10 +1753,10 @@ pub(super) async fn deploy_one_device(
         Ok(out)
     } else {
         // 崩溃归因
-        let faultlog = fetch_recent_faultlog(device_id, bundle)
+        let faultlog = fetch_recent_faultlog(ctx, device_id, bundle)
             .await
             .unwrap_or_default();
-        let hilog = run_hdc_shell(device_id, &["hilog", "-x"], 25)
+        let hilog = broker_hilog(ctx, device_id)
             .await
             .unwrap_or_default();
         let report = crate::agent::crash::analyze(bundle, &faultlog, &hilog);
@@ -1725,7 +1782,7 @@ pub(super) async fn deploy_one_device(
             },
         );
         let recovery = if should_recover_fresh_install(already_installed) {
-            recover_fresh_install(device_id, bundle).await
+            recover_fresh_install(ctx, device_id, bundle).await
         } else {
             "恢复：部署前应用已存在，保留覆盖安装后的应用，避免误删用户原有安装。".to_string()
         };
@@ -1752,22 +1809,51 @@ pub(super) async fn deploy_one_device(
     }
 }
 
-async fn fetch_recent_faultlog(device: &str, bundle: &str) -> Result<String, String> {
+async fn fetch_recent_faultlog(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    bundle: &str,
+) -> Result<String, String> {
     // 列目录，过滤出本应用且类型为崩溃/JS异常的文件
-    let ls = run_hdc_shell(device, &["ls", "-t", "/data/log/faultlog/temp/"], 15).await?;
-    let candidates: Vec<&str> = ls
+    use crate::agent::capability_broker::{FaultLogDirectory, HostCapability};
+    let list_capability = HostCapability::ListFaultLogs {
+        device: device.to_string(),
+        directory: FaultLogDirectory::Temp,
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(
+        &list_capability, None, ctx,
+    ).await?;
+    if !output.status.success() {
+        return Err("无法枚举设备 faultlog 临时目录".into());
+    }
+    let listing = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    let mut candidates: Vec<&str> = listing
         .lines()
         .map(str::trim)
         .filter(|l| {
-            l.contains(bundle)
+            crate::agent::capability_broker::validate_faultlog_filename(l).is_ok()
+                && l.contains(bundle)
                 && (l.starts_with("JsError") || l.starts_with("CppCrash") || l.contains("crash"))
         })
         .collect();
+    candidates.sort_by_key(|name| std::cmp::Reverse(super::device_tools::crash_time_key(name)));
     let Some(name) = candidates.first() else {
         return Ok(String::new());
     };
-    let path = format!("/data/log/faultlog/temp/{name}");
-    run_hdc_shell(device, &["cat", &path], 20).await
+    let read_capability = HostCapability::ReadFaultLog {
+        device: device.to_string(),
+        directory: FaultLogDirectory::Temp,
+        filename: (*name).to_string(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(
+        &read_capability, None, ctx,
+    ).await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err("无法读取最近 faultlog".into())
+    }
 }
 
 pub(super) fn classify_deploy_error(output: &str, is_signed: bool) -> (String, String) {
@@ -2138,7 +2224,11 @@ fn signing_material_status(cfg: &serde_json::Value, root: &Path) -> (Vec<String>
 
 /// diagnose_signing：签名自检——核对工程签名配置、签名材料与设备 UDID 的匹配关系，
 /// 输出结构化诊断与修复指引（优先给出可自动执行的修复路径：复用匹配材料/跨工程签名配置）。
-pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn diagnose_signing(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let root = match args["path"].as_str() {
         Some(p) if !p.trim().is_empty() => resolve_in_roots(roots, p)?,
         _ => PathBuf::from(roots.first().map(String::as_str).unwrap_or("")),
@@ -2210,9 +2300,15 @@ pub(super) async fn diagnose_signing(args: &Value, roots: &[String]) -> Result<S
     let device = default_device_id().await.ok();
     let mut device_udid: Option<String> = None;
     if let Some(dev) = &device {
-        if let Ok(u) = run_hdc_shell(dev, &["bm", "get", "-u"], 30).await {
+        let capability = crate::agent::capability_broker::HostCapability::ReadDeviceUdid {
+            device: dev.clone(),
+        };
+        if let Ok(output) = crate::agent::capability_broker::execute_host_capability(
+            &capability, None, ctx,
+        ).await {
+            let u = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
             let u = u.trim();
-            if !u.is_empty() && !u.contains("error") {
+            if output.status.success() && !u.is_empty() && !u.contains("error") {
                 device_udid = Some(u.to_string());
             }
         }

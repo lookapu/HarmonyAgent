@@ -717,13 +717,7 @@ pub(super) async fn analyze_crash(
 }
 
 pub(super) fn is_safe_faultlog_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 255
-        && !name.starts_with('.')
-        && name.chars().any(|c| c.is_ascii_digit())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    crate::agent::capability_broker::validate_faultlog_filename(name).is_ok()
 }
 
 pub(super) fn crash_time_key(name: &str) -> u64 {

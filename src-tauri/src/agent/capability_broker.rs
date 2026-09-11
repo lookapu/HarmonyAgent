@@ -41,12 +41,16 @@ pub enum HostCapability {
     HdcKillServer,
     /// 查询指定 bundle 的进程 id。
     DevicePidof { device: String, bundle: String },
+    /// 查询用于签名 profile 匹配的设备 UDID。
+    ReadDeviceUdid { device: String },
     /// 读取设备历史 hilog，可选最低级别和 tag。
     ReadHilog { device: String, level: Option<String>, tag: Option<String> },
     /// 兼容旧设备的有限行 logcat 查询。
     ReadLogcat { device: String, lines: u64 },
     /// 枚举三个预定义 faultlog 目录之一。
     ListFaultLogs { device: String, directory: FaultLogDirectory },
+    /// 读取预定义 faultlog 目录中的单个安全 basename 文件。
+    ReadFaultLog { device: String, directory: FaultLogDirectory, filename: String },
     /// 执行经过 Broker 二次校验的只读设备查询 argv。
     DeviceReadQuery { device: String, argv: Vec<String> },
     /// 把工作区内普通文件发送到设备绝对路径。
@@ -55,6 +59,8 @@ pub enum HostCapability {
     ReceiveFile { device: String, remote_path: String, local_path: String },
     /// 强制停止明确 bundle 的应用进程。
     StopAbility { device: String, bundle: String },
+    /// 卸载明确 bundle；用于新装部署失败后的补偿。
+    UninstallBundle { device: String, bundle: String },
     /// 安装构建产物到设备（路径必须位于项目工作树内）。
     InstallHap { device: Option<String>, hap_path: String, replace: bool },
     /// 拉起一个已安装应用的明确 ability。
@@ -73,13 +79,16 @@ impl HostCapability {
             Self::HdcStartServer => "hdc.start_server",
             Self::HdcKillServer => "hdc.kill_server",
             Self::DevicePidof { .. } => "device.pidof",
+            Self::ReadDeviceUdid { .. } => "device.read_udid",
             Self::ReadHilog { .. } => "device.read_hilog",
             Self::ReadLogcat { .. } => "device.read_logcat",
             Self::ListFaultLogs { .. } => "device.list_faultlogs",
+            Self::ReadFaultLog { .. } => "device.read_faultlog",
             Self::DeviceReadQuery { .. } => "device.read_query",
             Self::SendFile { .. } => "device.file_send",
             Self::ReceiveFile { .. } => "device.file_receive",
             Self::StopAbility { .. } => "device.stop_ability",
+            Self::UninstallBundle { .. } => "deploy.uninstall_bundle",
             Self::InstallHap { .. } => "deploy.install",
             Self::StartAbility { .. } => "deploy.start_ability",
             Self::Deploy { .. } => "deploy",
@@ -97,6 +106,7 @@ impl HostCapability {
                 validate_device_target(device)?;
                 validate_app_identifier(bundle, "bundle")
             }
+            Self::ReadDeviceUdid { device } => validate_device_target(device),
             Self::ReadHilog { device, level, tag } => {
                 validate_device_target(device)?;
                 if let Some(level) = level {
@@ -117,6 +127,10 @@ impl HostCapability {
                 Ok(())
             }
             Self::ListFaultLogs { device, .. } => validate_device_target(device),
+            Self::ReadFaultLog { device, filename, .. } => {
+                validate_device_target(device)?;
+                validate_faultlog_filename(filename)
+            }
             Self::DeviceReadQuery { device, argv } => {
                 validate_device_target(device)?;
                 validate_read_only_device_command(argv).map(|_| ())
@@ -127,7 +141,7 @@ impl HostCapability {
                 validate_workspace_relative_path(local_path)?;
                 validate_device_path(remote_path)
             }
-            Self::StopAbility { device, bundle } => {
+            Self::StopAbility { device, bundle } | Self::UninstallBundle { device, bundle } => {
                 validate_device_target(device)?;
                 validate_app_identifier(bundle, "bundle")
             }
@@ -150,9 +164,11 @@ impl HostCapability {
             self,
             Self::HdcListTargets
                 | Self::DevicePidof { .. }
+                | Self::ReadDeviceUdid { .. }
                 | Self::ReadHilog { .. }
                 | Self::ReadLogcat { .. }
                 | Self::ListFaultLogs { .. }
+                | Self::ReadFaultLog { .. }
                 | Self::DeviceReadQuery { .. }
         )
     }
@@ -208,6 +224,7 @@ fn request_material(capability: &HostCapability) -> String {
         HostCapability::DevicePidof { device, bundle } => {
             format!("{}\0{}", device.trim(), bundle.trim())
         }
+        HostCapability::ReadDeviceUdid { device } => device.trim().to_string(),
         HostCapability::ReadHilog { device, level, tag } => format!(
             "{}\0{}\0{}",
             device.trim(),
@@ -218,6 +235,9 @@ fn request_material(capability: &HostCapability) -> String {
         HostCapability::ListFaultLogs { device, directory } => {
             format!("{}\0{}", device.trim(), directory.as_path())
         }
+        HostCapability::ReadFaultLog { device, directory, filename } => {
+            format!("{}\0{}\0{}", device.trim(), directory.as_path(), filename.trim())
+        }
         HostCapability::DeviceReadQuery { device, argv } => {
             format!("{}\0{}", device.trim(), argv.join("\0"))
         }
@@ -226,7 +246,8 @@ fn request_material(capability: &HostCapability) -> String {
             "{}\0{}\0{}",
             device.trim(), local_path.trim(), remote_path.trim(),
         ),
-        HostCapability::StopAbility { device, bundle } => {
+        HostCapability::StopAbility { device, bundle }
+        | HostCapability::UninstallBundle { device, bundle } => {
             format!("{}\0{}", device.trim(), bundle.trim())
         }
         HostCapability::InstallHap { device, hap_path, replace } => format!(
@@ -257,6 +278,13 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
             ],
             15,
         ),
+        HostCapability::ReadDeviceUdid { device } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "bm".into(), "get".into(),
+                "-u".into(),
+            ],
+            30,
+        ),
         HostCapability::ReadHilog { device, level, tag } => {
             let mut args = vec![
                 "-t".into(), device.trim().into(), "shell".into(), "hilog".into(), "-x".into(),
@@ -281,6 +309,13 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
                 directory.as_path().into(),
             ],
             15,
+        ),
+        HostCapability::ReadFaultLog { device, directory, filename } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "cat".into(),
+                format!("{}/{}", directory.as_path(), filename.trim()),
+            ],
+            20,
         ),
         HostCapability::DeviceReadQuery { device, argv } => {
             let query = validate_read_only_device_command(argv)?;
@@ -318,6 +353,13 @@ fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> 
                 "force-stop".into(), bundle.trim().into(),
             ],
             20,
+        ),
+        HostCapability::UninstallBundle { device, bundle } => (
+            vec![
+                "-t".into(), device.trim().into(), "shell".into(), "bm".into(),
+                "uninstall".into(), "-n".into(), bundle.trim().into(),
+            ],
+            30,
         ),
         HostCapability::InstallHap { device, hap_path, replace } => {
             let artifact = resolve_workspace_artifact(
@@ -597,6 +639,9 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         HostCapability::DevicePidof { device, bundle } => serde_json::json!({
             "device_digest": short_digest(device), "bundle": bundle,
         }),
+        HostCapability::ReadDeviceUdid { device } => serde_json::json!({
+            "device_digest": short_digest(device),
+        }),
         HostCapability::ReadHilog { device, level, tag } => serde_json::json!({
             "device_digest": short_digest(device), "level": level, "tag": tag,
         }),
@@ -605,6 +650,11 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
         }),
         HostCapability::ListFaultLogs { device, directory } => serde_json::json!({
             "device_digest": short_digest(device), "directory": directory.as_path(),
+        }),
+        HostCapability::ReadFaultLog { device, directory, filename } => serde_json::json!({
+            "device_digest": short_digest(device),
+            "directory": directory.as_path(),
+            "filename_digest": short_digest(filename),
         }),
         HostCapability::DeviceReadQuery { device, argv } => serde_json::json!({
             "device_digest": short_digest(device),
@@ -619,7 +669,8 @@ fn audit_subject(capability: &HostCapability) -> serde_json::Value {
             "device_digest": short_digest(device), "remote_digest": short_digest(remote_path),
             "local_path": local_path,
         }),
-        HostCapability::StopAbility { device, bundle } => serde_json::json!({
+        HostCapability::StopAbility { device, bundle }
+        | HostCapability::UninstallBundle { device, bundle } => serde_json::json!({
             "device_digest": short_digest(device), "bundle": bundle,
         }),
         HostCapability::InstallHap { device, hap_path, replace } => serde_json::json!({
@@ -695,6 +746,20 @@ fn validate_device_path(path: &str) -> Result<(), String> {
     }
     if path.split('/').any(|segment| segment == "..") {
         return Err("设备路径不得包含上级目录 ..".into());
+    }
+    Ok(())
+}
+
+pub fn validate_faultlog_filename(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 255
+        || name.starts_with('.')
+        || !name.chars().any(|c| c.is_ascii_digit())
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("faultlog 文件名必须是含数字的安全 basename".into());
     }
     Ok(())
 }
@@ -891,6 +956,31 @@ mod tests {
             vec!["-t", "ABC123", "shell", "ls", "-1", "/data/log/faultlog/temp"]
         );
         assert!(faultlogs.replay_safe());
+        let udid = HostCapability::ReadDeviceUdid { device: "ABC123".into() };
+        let invocation = prepare_invocation(&udid, None).unwrap();
+        assert_eq!(invocation.args, vec!["-t", "ABC123", "shell", "bm", "get", "-u"]);
+        assert!(udid.replay_safe());
+        let read_fault = HostCapability::ReadFaultLog {
+            device: "ABC123".into(),
+            directory: FaultLogDirectory::Temp,
+            filename: "JsError-com.example-20250102123456.log".into(),
+        };
+        let invocation = prepare_invocation(&read_fault, None).unwrap();
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-t", "ABC123", "shell", "cat",
+                "/data/log/faultlog/temp/JsError-com.example-20250102123456.log"
+            ]
+        );
+        assert!(read_fault.replay_safe());
+        assert!(HostCapability::ReadFaultLog {
+            device: "ABC123".into(),
+            directory: FaultLogDirectory::Temp,
+            filename: "../20250102123456.log".into(),
+        }
+        .validate()
+        .is_err());
         let query = HostCapability::DeviceReadQuery {
             device: "ABC123".into(),
             argv: vec!["param".into(), "get".into(), "const.product.model".into()],
@@ -956,6 +1046,23 @@ mod tests {
             stop.args,
             vec!["-t", "ABC123", "shell", "aa", "force-stop", "com.example.app"]
         );
+        let uninstall = prepare_invocation(
+            &HostCapability::UninstallBundle {
+                device: "ABC123".into(),
+                bundle: "com.example.app".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            uninstall.args,
+            vec!["-t", "ABC123", "shell", "bm", "uninstall", "-n", "com.example.app"]
+        );
+        assert!(!HostCapability::UninstallBundle {
+            device: "ABC123".into(),
+            bundle: "com.example.app".into(),
+        }
+        .replay_safe());
         std::fs::remove_dir_all(root).ok();
     }
 

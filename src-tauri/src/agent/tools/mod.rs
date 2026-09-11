@@ -1308,7 +1308,7 @@ pub async fn run_tool(
         "run_lint" => debug_tools::run_lint(&args, &roots).await,
         "set_network_condition" => debug_tools::set_network_condition(&args, &roots, ctx).await,
         "check_signature" => debug_tools::check_signature(&args, &roots).await,
-        "diagnose_signing" => build_tools::diagnose_signing(&args, &roots).await,
+        "diagnose_signing" => build_tools::diagnose_signing(&args, &roots, ctx).await,
         "dump_battery" => debug_tools::dump_battery(&args, &roots).await,
         "scan_api_compat" => debug_tools::scan_api_compat(&args, &roots, db).await,
         "auto_explore" => explore_tools::auto_explore(&args, &roots).await,
