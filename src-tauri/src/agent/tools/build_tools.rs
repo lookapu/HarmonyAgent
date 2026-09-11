@@ -876,8 +876,11 @@ fn ensure_deploy_device_ready(device: &crate::commands::devices::DeviceInfo) -> 
     Ok(())
 }
 
-async fn resolve_deploy_device(requested: Option<&str>) -> Result<String, String> {
-    let devices = crate::commands::devices::list_devices()
+async fn resolve_deploy_device(
+    requested: Option<&str>,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let devices = brokered_device_snapshot(ctx)
         .await
         .map_err(|error| format!("无法发现设备：{error}"))?;
     let selected = if let Some(requested) = requested.map(str::trim).filter(|id| !id.is_empty()) {
@@ -1067,7 +1070,7 @@ pub(super) async fn deploy(
     let _gate = crate::services::tool_limits::acquire_workspace_gate(Path::new(project_path)).await;
 
     // 1. 选择设备：优先参数指定，否则取默认设备记忆 / 第一个在线设备
-    let device_id = resolve_deploy_device(args["device"].as_str()).await?;
+    let device_id = resolve_deploy_device(args["device"].as_str(), ctx).await?;
     // per-device 门控：与 deploy_all 中同设备的任务互斥，不同设备不阻塞
     let _dev_gate =
         crate::services::tool_limits::acquire_named_gate(&format!("deploy:{device_id}")).await;
@@ -1433,7 +1436,7 @@ pub(super) async fn deploy_all(
         .unwrap_or_else(|| "EntryAbility".to_string());
 
     // 解析并复验目标设备列表；显式设备也不能绕过连接、授权与能力门禁。
-    let snapshots = crate::commands::devices::list_devices()
+    let snapshots = brokered_device_snapshot(ctx)
         .await
         .map_err(|error| format!("无法发现设备：{error}"))?;
     let mut devices: Vec<String> = if let Some(arr) = args["devices"].as_array() {
@@ -1734,7 +1737,7 @@ pub(super) async fn deploy_one_device(
     if alive {
         out.push_str(" 启动并稳定运行 ✓\n");
         // 仅在这是"默认/第一台成功设备"时挂运行日志监听，避免多设备互相 abort
-        if let Ok(default_dev) = default_device_id().await {
+        if let Ok(default_dev) = default_device_id(ctx).await {
             if default_dev == device_id {
                 crate::agent::runtime_log::start(project_path, ctx, device_id, bundle);
             }
@@ -2298,7 +2301,7 @@ pub(super) async fn diagnose_signing(
     }
 
     // 3) 设备与 profile 匹配性
-    let device = default_device_id().await.ok();
+    let device = default_device_id(ctx).await.ok();
     let mut device_udid: Option<String> = None;
     if let Some(dev) = &device {
         let capability = crate::agent::capability_broker::HostCapability::ReadDeviceUdid {

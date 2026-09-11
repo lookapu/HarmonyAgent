@@ -4,8 +4,14 @@
 
 use super::*;
 
-pub(super) async fn resolve_authorized_device(requested: Option<&str>, capability: &str) -> Result<String, String> {
-    let devices = crate::commands::devices::list_devices().await.map_err(|error| format!("无法发现设备：{error}"))?;
+pub(super) async fn resolve_authorized_device(
+    requested: Option<&str>,
+    capability: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let devices = brokered_device_snapshot(ctx)
+        .await
+        .map_err(|error| format!("无法发现设备：{error}"))?;
     let selected = if let Some(requested) = requested.map(str::trim).filter(|id| !id.is_empty()) {
         devices.iter().find(|device| device.id == requested).ok_or_else(|| format!("未发现指定设备 {requested}；请调用 list_devices 刷新设备状态。"))?
     } else {
@@ -49,7 +55,7 @@ pub(super) async fn run_perf_benchmark(
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法运行性能基准".into());
     }
-    let device = resolve_authorized_device(args["device"].as_str(), "ability").await?;
+    let device = resolve_authorized_device(args["device"].as_str(), "ability", ctx).await?;
     let bundle = match args["package"].as_str() {
         Some(p) => p.to_string(),
         None => crate::services::harmony::parse_project(Path::new(project_path)).bundle_name.unwrap_or_default(),
@@ -431,7 +437,7 @@ pub(super) async fn dump_ui_hierarchy(
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let (local_path, content) = capture_ui_hierarchy(project_path, &device, ctx).await?;
     let local_file = local_path.to_string_lossy();
@@ -616,7 +622,7 @@ pub(super) async fn start_ability(
     roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    let device = resolve_authorized_device(args["device"].as_str(), "ability").await?;
+    let device = resolve_authorized_device(args["device"].as_str(), "ability", ctx).await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -732,7 +738,7 @@ pub(super) async fn clear_app_data(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -796,7 +802,7 @@ pub(super) async fn dump_memory(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -926,7 +932,7 @@ pub(super) async fn get_installed_apps(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let filter = args["filter"].as_str().unwrap_or("").to_lowercase();
     let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
@@ -970,7 +976,7 @@ pub(super) async fn get_app_info(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -1054,7 +1060,7 @@ pub(super) async fn uninstall_app(
     roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    let device = resolve_authorized_device(args["device"].as_str(), "install").await?;
+    let device = resolve_authorized_device(args["device"].as_str(), "install", ctx).await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -1112,7 +1118,7 @@ pub(super) async fn grant_permission(
     roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    let device = resolve_authorized_device(args["device"].as_str(), "shell").await?;
+    let device = resolve_authorized_device(args["device"].as_str(), "shell", ctx).await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -1181,7 +1187,7 @@ pub(super) async fn set_wifi_state(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let enable = args["enable"].as_bool().unwrap_or(true);
     let attempts = [
@@ -1222,7 +1228,7 @@ pub(super) async fn set_airplane_mode(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let enable = args["enable"].as_bool().unwrap_or(true);
     let attempts = [
@@ -1275,7 +1281,7 @@ pub(super) async fn screen_record(
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let action = args["action"].as_str().unwrap_or("start");
 
@@ -1414,7 +1420,7 @@ pub(super) async fn record_ui(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let action = args["action"].as_str().unwrap_or("start");
     let name = safe_file_name(args["name"].as_str().unwrap_or("default"));
@@ -1640,7 +1646,7 @@ pub(super) async fn replay_ui(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
     let speed = args["speed"].as_f64().unwrap_or(1.0).clamp(0.25, 4.0);
@@ -1714,7 +1720,7 @@ pub(super) async fn gesture_perform(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let action = args["action"].as_str().ok_or("需要参数 {\"action\":\"tap|swipe|longPress|doubleTap|text|key\", ...}")?;
     let _ = roots;
@@ -1993,7 +1999,7 @@ pub(super) async fn ui_locator(
             }
             let device = match args["device"].as_str() {
                 Some(d) => d.to_string(),
-                None => default_device_id().await?,
+                None => default_device_id(ctx).await?,
             };
             let (workspace, local_dir) = ensure_workspace_subdir(project_path, ".deveco-agent/ui")?;
             let tmp = local_dir.join(format!(

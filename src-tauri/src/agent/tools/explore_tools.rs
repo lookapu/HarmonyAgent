@@ -57,7 +57,7 @@ pub(super) async fn auto_explore(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
     if project_path.is_empty() {

@@ -116,6 +116,30 @@ fn normalize_connection(state: &str) -> (&'static str, bool) {
     }
 }
 
+/// 从已获取的 targets 文本选择默认在线设备，不执行任何属性富化查询。
+pub(crate) fn select_default_device_from_targets(out: &str) -> Result<String, String> {
+    select_device_id_from_targets(out, load_default_device().as_deref())
+}
+
+fn select_device_id_from_targets(out: &str, remembered: Option<&str>) -> Result<String, String> {
+    let online = out
+        .lines()
+        .filter_map(parse_target_line)
+        .filter(|(_, state)| {
+            let (connection, authorized) = normalize_connection(state);
+            connection == "online" && authorized
+        })
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    if online.is_empty() {
+        return Err("未检测到已授权在线设备，请连接设备并确认调试授权".into());
+    }
+    Ok(remembered
+        .filter(|device| online.iter().any(|online| online == *device))
+        .map(str::to_string)
+        .unwrap_or_else(|| online[0].clone()))
+}
+
 fn parse_resolution(output: &str) -> String {
     output
         .lines()
@@ -157,6 +181,54 @@ pub async fn list_devices() -> Result<Vec<DeviceInfo>, String> {
 /// 使用已经过调用方安全边界获取的 `hdc list targets` 输出构建设备快照。
 /// Agent 入口借此通过 Host Capability Broker 获取清单，同时复用前端的富化逻辑。
 pub(crate) async fn list_devices_from_targets(out: &str) -> Result<Vec<DeviceInfo>, String> {
+    list_devices_from_targets_with_ctx(out, None).await
+}
+
+/// Agent 路径使用的设备快照：targets 已由 Broker 获取，属性与能力富化也必须复用
+/// 同一 Run/tool-call 身份，不能在公共模块中退回未审计的 hdc shell。
+pub(crate) async fn list_devices_from_targets_brokered(
+    out: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<Vec<DeviceInfo>, String> {
+    list_devices_from_targets_with_ctx(out, Some(ctx)).await
+}
+
+async fn snapshot_query(
+    device: &str,
+    argv: &[&str],
+    ctx: Option<&crate::agent::exec_ctx::ToolCtx>,
+) -> String {
+    if let Some(ctx) = ctx {
+        let capability = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+            device: device.to_string(),
+            argv: argv.iter().map(|value| (*value).to_string()).collect(),
+        };
+        return crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                (String::from_utf8_lossy(&output.stdout).to_string()
+                    + &String::from_utf8_lossy(&output.stderr))
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
+    }
+
+    let mut command = vec!["-t", device, "shell"];
+    command.extend_from_slice(argv);
+    run_hdc(&command, 20)
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+async fn list_devices_from_targets_with_ctx(
+    out: &str,
+    ctx: Option<&crate::agent::exec_ctx::ToolCtx>,
+) -> Result<Vec<DeviceInfo>, String> {
     let default = load_default_device();
     let mut devices: Vec<DeviceInfo> = Vec::new();
     for line in out.lines() {
@@ -179,17 +251,17 @@ pub(crate) async fn list_devices_from_targets(out: &str) -> Result<Vec<DeviceInf
                 uitest,
                 hidumper,
             ) = tokio::join!(
-                shell_param(&id, "const.product.model"),
-                shell_param(&id, "const.ohos.fullname"),
-                shell_param(&id, "const.ohos.version"),
-                shell_param(&id, "const.product.name"),
-                shell_param(&id, "const.ohos.apiversion"),
-                shell_param(&id, "const.product.cpu.abilist"),
-                shell_param(&id, "const.product.cpu.abi"),
-                shell_exec(&id, "wm size"),
-                shell_exec(&id, "command -v snapshot_display"),
-                shell_exec(&id, "command -v uitest"),
-                shell_exec(&id, "command -v hidumper"),
+                snapshot_query(&id, &["param", "get", "const.product.model"], ctx),
+                snapshot_query(&id, &["param", "get", "const.ohos.fullname"], ctx),
+                snapshot_query(&id, &["param", "get", "const.ohos.version"], ctx),
+                snapshot_query(&id, &["param", "get", "const.product.name"], ctx),
+                snapshot_query(&id, &["param", "get", "const.ohos.apiversion"], ctx),
+                snapshot_query(&id, &["param", "get", "const.product.cpu.abilist"], ctx),
+                snapshot_query(&id, &["param", "get", "const.product.cpu.abi"], ctx),
+                snapshot_query(&id, &["wm", "size"], ctx),
+                snapshot_query(&id, &["command", "-v", "snapshot_display"], ctx),
+                snapshot_query(&id, &["command", "-v", "uitest"], ctx),
+                snapshot_query(&id, &["command", "-v", "hidumper"], ctx),
             );
             let api_level = parse_api_level(&api);
             let base_version = [fullname, version, product_name]
@@ -1134,6 +1206,16 @@ mod tests {
         );
         assert_eq!(normalize_connection("Offline"), ("offline", false));
         assert!(parse_target_line("[Empty]").is_none());
+        let targets = "OFF Offline\nFIRST Connected\nREMEMBERED Ready\nDENIED Unauthorized\n";
+        assert_eq!(
+            select_device_id_from_targets(targets, Some("REMEMBERED")).unwrap(),
+            "REMEMBERED"
+        );
+        assert_eq!(
+            select_device_id_from_targets(targets, Some("MISSING")).unwrap(),
+            "FIRST"
+        );
+        assert!(select_device_id_from_targets("OFF Offline", None).is_err());
     }
 
     #[test]

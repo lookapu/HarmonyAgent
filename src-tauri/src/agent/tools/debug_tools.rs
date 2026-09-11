@@ -71,7 +71,7 @@ pub(super) async fn search_hilog(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let level = args["level"].as_str().unwrap_or("WARN").to_uppercase();
     let tag = args["tag"].as_str().unwrap_or("").to_string();
@@ -460,7 +460,8 @@ pub(super) async fn set_network_condition(
     _roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    let device = super::ui_tools::resolve_authorized_device(args["device"].as_str(), "shell").await?;
+    let device =
+        super::ui_tools::resolve_authorized_device(args["device"].as_str(), "shell", ctx).await?;
     let mode = args["mode"].as_str().unwrap_or("normal");
 
     let (bandwidth_kbps, delay_ms, loss_pct) = match mode {
@@ -603,7 +604,7 @@ pub(super) async fn check_signature(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -687,7 +688,7 @@ pub(super) async fn dump_battery(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let bundle = args["bundle"].as_str().unwrap_or("").to_string();
 
@@ -1170,7 +1171,7 @@ pub(super) async fn stack_dump(
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let bundle = match args["package"].as_str().map(String::from) {
         Some(b) if !b.trim().is_empty() => b,

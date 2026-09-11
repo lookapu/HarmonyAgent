@@ -1384,7 +1384,7 @@ pub async fn run_tool(
         "stack_dump" => debug_tools::stack_dump(&args, &roots, ctx).await,
         "http_request" => cmd_tools::http_request(&args, &roots).await,
         "multi_edit" => fs_tools::multi_edit(&args, &roots, &ctx.conversation_id).await,
-        "device_perf" => cmd_tools::device_perf(&args).await,
+        "device_perf" => cmd_tools::device_perf(&args, ctx).await,
         // ---- 工具自我管理域（meta_tools）----
         "tool_list" => meta_tools::tool_list(&args, &roots).await,
         "tool_help" => meta_tools::tool_help(&args, &roots).await,
@@ -1678,9 +1678,9 @@ async fn run_in_project(project_path: &str, prog: &str, args: &[String], timeout
 
 // ---------- 具体工具 ----------
 
-async fn list_devices(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
-    // 复用前端设备面板的结构化查询（含型号/系统版本/在线状态/默认标记），
-    // 比裸 hdc list targets 信息更丰富，便于 Agent 决定部署目标
+async fn brokered_device_targets(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let capability = crate::agent::capability_broker::HostCapability::HdcListTargets;
     let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
         .await
@@ -1691,8 +1691,20 @@ async fn list_devices(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, S
             (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim().to_string(),
         ));
     }
-    let targets = smart_decode(&output.stdout);
-    match crate::commands::devices::list_devices_from_targets(&targets).await {
+    Ok(smart_decode(&output.stdout))
+}
+
+async fn brokered_device_snapshot(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<Vec<crate::commands::devices::DeviceInfo>, String> {
+    let targets = brokered_device_targets(ctx).await?;
+    crate::commands::devices::list_devices_from_targets_brokered(&targets, ctx).await
+}
+
+async fn list_devices(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
+    // 复用前端设备面板的结构化快照，但 targets 和所有属性富化均使用
+    // 当前 Agent Run 的 Broker 身份，避免公共模块间接退回裸 hdc。
+    match brokered_device_snapshot(ctx).await {
         Ok(devs) if devs.is_empty() => Ok(
             "未检测到已连接设备。请用 USB 连接设备/启动模拟器并开启开发者模式；可调用 start_hdc_service 启动 hdc 服务后重试。".to_string(),
         ),
@@ -1877,21 +1889,13 @@ fn default_device_file() -> Option<std::path::PathBuf> {
 }
 
 /// 选取默认设备：优先持久化记忆且在线的设备，否则第一个在线设备
-async fn default_device_id() -> Result<String, String> {
-    let devices = crate::commands::devices::list_devices()
+async fn default_device_id(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let targets = brokered_device_targets(ctx)
         .await
         .map_err(|e| format!("hdc 不可用: {}", with_advice("list_devices", e)))?;
-    let online: Vec<_> = devices
-        .iter()
-        .filter(|device| device.connection == "online" && device.authorized)
-        .collect();
-    if online.is_empty() {
-        return Err("未检测到已授权在线设备，请连接设备并确认调试授权".into());
-    }
-    if let Some(default) = online.iter().find(|device| device.is_default) {
-        return Ok(default.id.clone());
-    }
-    Ok(online[0].id.clone())
+    crate::commands::devices::select_default_device_from_targets(&targets)
 }
 
 /// hdc shell 命令输出是否失败：hdc 的 shell 子命令失败时 exit code 仍为 0，
@@ -1913,7 +1917,7 @@ async fn take_screenshot(
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let (local, _) = capture_screenshot(project_path, &device, ctx).await?;
     Ok(format!(
@@ -2187,7 +2191,7 @@ async fn verify_ui(
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let expect = args["expect"].as_str().unwrap_or("");
     let (local, _) = capture_screenshot(project_path, &device, ctx).await?;
@@ -2235,7 +2239,7 @@ async fn collect_perf(
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let bundle = match args["package"].as_str() {
         Some(p) => p.to_string(),

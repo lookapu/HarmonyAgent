@@ -243,7 +243,7 @@ pub(super) async fn read_logcat(
     // 多设备连接时解析目标设备
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
 
     // 包名 → pid（hilog 按进程过滤更精准；多进程取全部 pid）
@@ -1269,6 +1269,7 @@ pub(super) async fn run_ui_flow(
     let device = super::ui_tools::resolve_authorized_device(
         args["device"].as_str(),
         "ui_automation",
+        ctx,
     )
     .await?;
     let steps = args["steps"].as_array().ok_or("run_ui_flow 需要参数 {\"steps\":[...]}")?;

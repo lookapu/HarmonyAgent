@@ -1592,6 +1592,7 @@ pub fn validate_faultlog_filename(name: &str) -> Result<(), String> {
 const DEVICE_QUERY_COMMANDS: &[&str] = &[
     "ps", "ls", "cat", "df", "free", "uptime", "date", "top", "netstat", "ip",
     "ifconfig", "getprop", "param", "pwd", "dmesg", "echo", "hidumper", "aa", "bm",
+    "wm", "command",
 ];
 const DEVICE_QUERY_FORBIDDEN_PREFIXES: &[&str] = &[
     "rm", "mv", "cp", "kill", "pkill", "reboot", "shutdown", "mount", "umount", "chmod",
@@ -1632,6 +1633,19 @@ pub fn validate_read_only_device_command(argv: &[String]) -> Result<Vec<String>,
         }
         "param" if argv.get(1).map(String::as_str) != Some("get") => {
             return Err("param 仅允许 get 查询子命令".into());
+        }
+        "wm" if argv.len() != 2 || argv.get(1).map(String::as_str) != Some("size") => {
+            return Err("wm 仅允许 size 查询".into());
+        }
+        "command"
+            if argv.len() != 3
+                || argv.get(1).map(String::as_str) != Some("-v")
+                || !matches!(
+                    argv.get(2).map(String::as_str),
+                    Some("snapshot_display" | "uitest" | "hidumper")
+                ) =>
+        {
+            return Err("command 仅允许探测 snapshot_display、uitest 或 hidumper".into());
         }
         "ifconfig" if argv.len() > 2 => {
             return Err("ifconfig 仅允许无参数、-a 或单个网卡名查询".into());
@@ -1841,12 +1855,24 @@ mod tests {
         );
         assert!(query.replay_safe());
         for argv in [
+            vec!["wm".into(), "size".into()],
+            vec!["command".into(), "-v".into(), "snapshot_display".into()],
+            vec!["command".into(), "-v".into(), "uitest".into()],
+            vec!["command".into(), "-v".into(), "hidumper".into()],
+        ] {
+            assert!(HostCapability::DeviceReadQuery { device: "ABC123".into(), argv }
+                .validate()
+                .is_ok());
+        }
+        for argv in [
             vec!["param".into(), "set".into(), "x".into(), "y".into()],
             vec!["ip".into(), "link".into(), "set".into(), "wlan0".into()],
             vec!["aa".into(), "start".into(), "dump".into()],
             vec!["dmesg".into(), "-c".into()],
             vec!["date".into(), "--set".into(), "2030-01-01".into()],
             vec!["date".into(), "20300101".into()],
+            vec!["wm".into(), "density".into()],
+            vec!["command".into(), "-v".into(), "sh".into()],
         ] {
             assert!(HostCapability::DeviceReadQuery { device: "ABC123".into(), argv }
                 .validate()

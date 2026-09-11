@@ -403,7 +403,7 @@ pub(super) async fn device_file(
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let remote = args["remote"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
     let Some(remote) = remote else {
@@ -532,7 +532,7 @@ pub(super) async fn stop_app(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -575,7 +575,7 @@ pub(super) async fn device_shell(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let command = args["command"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
     let Some(command) = command else {
@@ -612,7 +612,7 @@ pub(super) async fn analyze_crash(
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).filter(|path| !path.is_empty())
         .ok_or("analyze_crash 需要绑定项目工作区")?;

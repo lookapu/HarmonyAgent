@@ -692,12 +692,49 @@ pub(super) fn utf16_lossy(bytes: &[u8], little: bool) -> String {
 /// multi_edit：一次调用批量修改多个文件（逐项独立执行，失败不影响后续项，返回逐项汇总）
 // ---------- 真机性能采样 ----------
 /// device_perf：真机性能快照（CPU/内存/电量/温度），供卡顿/资源占用分析
-pub(super) async fn device_perf(args: &Value) -> Result<String, String> {
+pub(super) async fn device_perf(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
-    let perf = crate::commands::devices::get_device_perf(device.clone()).await?;
+    let cpu = sample_cpu(&device, ctx).await.unwrap_or(-1.0);
+    let mem = sample_sys_mem(&device, ctx).await.unwrap_or(-1.0);
+    let battery_query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec![
+            "hidumper".into(),
+            "-s".into(),
+            "BatteryService".into(),
+            "-a".into(),
+            "-i".into(),
+        ],
+    };
+    let battery_raw = crate::agent::capability_broker::execute_host_capability(
+        &battery_query,
+        None,
+        ctx,
+    )
+    .await
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| smart_decode(&output.stdout) + &smart_decode(&output.stderr))
+    .unwrap_or_default();
+    let read_metric = |key: &str| {
+        battery_raw.lines().find_map(|line| {
+            let (name, value) = line.trim().split_once(':')?;
+            (name.trim() == key)
+                .then(|| value.trim().parse::<f64>().ok())
+                .flatten()
+        })
+    };
+    let battery = read_metric("capacity").unwrap_or(-1.0);
+    let temp = read_metric("temperature")
+        .map(|value| value / 10.0)
+        .unwrap_or(-1.0);
+    let ts = chrono::Utc::now().timestamp_millis();
     let fmt = |v: f64, unit: &str| {
         if v < 0.0 {
             "不可用".to_string()
@@ -705,15 +742,15 @@ pub(super) async fn device_perf(args: &Value) -> Result<String, String> {
             format!("{v:.1}{unit}")
         }
     };
-    let time = chrono::DateTime::from_timestamp_millis(perf.ts)
+    let time = chrono::DateTime::from_timestamp_millis(ts)
         .map(|t| t.format("%H:%M:%S").to_string())
         .unwrap_or_default();
     Ok(format!(
         "设备 {device} 性能快照（{time}）：\nCPU 占用：{}\n内存占用：{}\n电池电量：{}\n温度：{}",
-        fmt(perf.cpu, "%"),
-        fmt(perf.mem, "%"),
-        fmt(perf.battery, "%"),
-        fmt(perf.temp, "℃")
+        fmt(cpu, "%"),
+        fmt(mem, "%"),
+        fmt(battery, "%"),
+        fmt(temp, "℃")
     ))
 }
 
