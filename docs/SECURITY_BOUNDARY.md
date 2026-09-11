@@ -136,7 +136,9 @@ UI 证据与输入链也已接入 Broker：`take_screenshot`、`verify_ui`、`ru
 
 `device_shell` 也已改为 Broker 内二次校验的 replay-safe 查询能力：调用方提交分词后的 argv，Broker 再执行字符集、命令、参数数目和修改型子命令门禁，并只拼接固定 `hdc -t <device> shell ...` 前缀。`aa/bm` 只能以 `dump` 为首个子命令，`param` 只能 `get`，同时拒绝网络配置增删、清空内核日志、修改设备时间等伪装在查询命令后的副作用参数；审计保存首命令与完整 argv 摘要，不记录查询中的潜在敏感路径。 `check_signature` 的已安装 bundle 查询、`dump_battery` 的 BatteryService/sysfs 查询、`stack_dump` 的进程/线程/详情查询也复用同一入口；线程遍历已移除 `sh -c`，改为直接传递 `/proc/<pid>/...` 的 `ls`/`cat` argv。 `set_network_condition` 的 qdisc 配置/清除与状态读回也已拆为非 replay-safe/replay-safe 两类能力：接口名及延迟、丢包、带宽都有硬边界，非 normal 配置使用单次 `replace`，读回失败会尝试独立清除补偿。 高级 `search_hilog` 也使用专用 replay-safe 能力，Broker 固定 epoch/退出读取参数，并把级别、tag、尾部窗口及表达式限制在有界字段内；表达式在审计中只保存摘要。
 
-这仍是部分实现：设备属性富化查询、模拟器、签名与发布动作尚未完整迁移；影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
+应用诊断只读面也已继续收口：`dump_memory`/`memory_snapshot` 的 pid、`/proc` 与 hidumper 查询，以及 `get_installed_apps`/`get_app_info` 的 bm dump 均通过 replay-safe Broker 能力执行；查询 argv 在最终执行层重新校验，完整 proc 路径仅进入请求摘要。内存快照现会真实透传调用方指定的 device/bundle，不再悄然退回默认目标。
+
+这仍是部分实现：设备属性富化查询、剩余 UI 状态变更/录屏、模拟器、签名与发布动作尚未完整迁移；影响摘要和审批策略仍由上层工具事件承载，已接线路径也仍需真机验证，因此不得宣称第 7 节契约已经全部完成。
 
 ## 8. 安全测试门禁
 

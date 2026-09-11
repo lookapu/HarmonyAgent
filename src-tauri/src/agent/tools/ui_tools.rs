@@ -786,7 +786,11 @@ pub(super) async fn clear_app_data(args: &Value, roots: &[String]) -> Result<Str
 }
 
 /// dump_memory：读取应用内存使用情况并结构化报告。
-pub(super) async fn dump_memory(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn dump_memory(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -804,21 +808,43 @@ pub(super) async fn dump_memory(args: &Value, roots: &[String]) -> Result<String
     if bundle.is_empty() {
         return Err("无法确定应用包名".into());
     }
-    let pid = pid_of(&device, &bundle).await?;
+    let pid_query = crate::agent::capability_broker::HostCapability::DevicePidof {
+        device: device.clone(),
+        bundle: bundle.clone(),
+    };
+    let pid = execute_ui_host_capability(&pid_query, "查询应用进程", ctx)
+        .await?
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| format!("应用 {bundle} 未运行"))?;
 
     // 1) smaps 解析（尽力而为，需要权限）
-    let smaps_raw = run_hdc_shell(&device, &["cat", &format!("/proc/{pid}/smaps")], 20).await
+    let smaps = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["cat".into(), format!("/proc/{pid}/smaps")],
+    };
+    let smaps_raw = execute_ui_host_capability(&smaps, "读取 smaps", ctx)
+        .await
         .unwrap_or_default();
     let smaps_summary = parse_smaps_summary(&smaps_raw);
 
     // 2) hidumper --mem <pid>（尽力而为）
-    let hidumper_raw = run_hdc_shell(&device, &["hidumper", "--mem", &pid.to_string()], 20)
+    let mem_query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["hidumper".into(), "--mem".into(), pid.to_string()],
+    };
+    let hidumper_raw = execute_ui_host_capability(&mem_query, "读取 hidumper 内存", ctx)
         .await
-        .unwrap_or_else(|_| String::new());
+        .unwrap_or_default();
     let hi_summary = parse_hidumper_mem(&hidumper_raw);
 
     // 3) /proc/<pid>/status
-    let status_raw = run_hdc_shell(&device, &["cat", &format!("/proc/{pid}/status")], 10)
+    let status = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["cat".into(), format!("/proc/{pid}/status")],
+    };
+    let status_raw = execute_ui_host_capability(&status, "读取进程状态", ctx)
         .await
         .unwrap_or_default();
     let rss_kb = extract_kb(&status_raw, "VmRSS:");
@@ -890,14 +916,21 @@ pub(super) fn parse_hidumper_mem(raw: &str) -> std::collections::BTreeMap<String
 }
 
 /// get_installed_apps：列出已安装应用。
-pub(super) async fn get_installed_apps(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn get_installed_apps(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
     };
     let filter = args["filter"].as_str().unwrap_or("").to_lowercase();
-    let raw = run_hdc_shell(&device, &["bm", "dump", "-a"], 30).await
-        .map_err(|e| format!("查询已安装应用失败：{e}"))?;
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["bm".into(), "dump".into(), "-a".into()],
+    };
+    let raw = execute_ui_host_capability(&query, "查询已安装应用", ctx).await?;
 
     let mut pkgs: Vec<String> = Vec::new();
     for line in raw.lines() {
@@ -927,7 +960,11 @@ pub(super) async fn get_installed_apps(args: &Value, _roots: &[String]) -> Resul
 }
 
 /// get_app_info：查询应用详情。
-pub(super) async fn get_app_info(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn get_app_info(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
         None => default_device_id().await?,
@@ -945,9 +982,11 @@ pub(super) async fn get_app_info(args: &Value, roots: &[String]) -> Result<Strin
     if bundle.is_empty() {
         return Err("无法确定应用包名".into());
     }
-    let raw = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 30)
-        .await
-        .map_err(|e| format!("查询应用信息失败：{e}"))?;
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["bm".into(), "dump".into(), "-n".into(), bundle.clone()],
+    };
+    let raw = execute_ui_host_capability(&query, "查询应用信息", ctx).await?;
 
     let version_code = extract_json_num(&raw, "versionCode");
     let version_name = extract_json_str(&raw, "versionName");

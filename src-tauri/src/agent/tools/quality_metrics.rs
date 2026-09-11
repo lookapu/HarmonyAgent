@@ -436,6 +436,7 @@ pub async fn log_query(
 pub async fn memory_snapshot(
     args: &Value,
     roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("take");
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
@@ -451,8 +452,7 @@ pub async fn memory_snapshot(
     match action {
         "take" => {
             // 透传给 dump_memory 抓一次（透传 bundle/device）
-            let pass = serde_json::json!({});
-            let raw = crate::agent::tools::ui_tools::dump_memory(&pass, roots).await?;
+            let raw = crate::agent::tools::ui_tools::dump_memory(args, roots, ctx).await?;
             // tag 缺省 = 时间戳
             let tag = args["tag"]
                 .as_str()
