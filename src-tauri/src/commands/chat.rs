@@ -5650,6 +5650,7 @@ async fn stream_chat_inner(
                 // - Approval/Generic：发 done 事件后直接终止（用户拒绝无总结机会）
                 let args_val: serde_json::Value =
                     serde_json::from_str(&args_raw).unwrap_or(serde_json::Value::Null);
+                let approval_ctx = tool_ctx.clone().with_tool_call_id(call_id.clone());
                 let inv = crate::agent::tools::ToolInvocation {
                     name: &tool,
                     args: &args_val,
@@ -5658,7 +5659,7 @@ async fn stream_chat_inner(
                     roots: &path_hints,
                     conversation_id: &conversation_id,
                     approval_mode: approval_mode(&opts),
-                    ctx: &tool_ctx,
+                    ctx: &approval_ctx,
                 };
                 if let Some(message) =
                     crate::agent::recovery::verification_block_global(&trace_id, &tool)
@@ -9546,6 +9547,7 @@ async fn execute_tool_batch_one(
     begin_tool_run(state, conversation_id, &tool_ctx.run_id, &call_id, tool, args_raw);
     let args_val: serde_json::Value =
         serde_json::from_str(args_raw).unwrap_or(serde_json::Value::Null);
+    let approval_ctx = tool_ctx.clone().with_tool_call_id(call_id.clone());
     let inv = crate::agent::tools::ToolInvocation {
         name: tool,
         args: &args_val,
@@ -9554,7 +9556,7 @@ async fn execute_tool_batch_one(
         roots: path_hints,
         conversation_id,
         approval_mode: approval_mode(opts),
-        ctx: tool_ctx,
+        ctx: &approval_ctx,
     };
     // 统一护栏预检（与串行路径同套钩子）：拦截即返回，收尾由调用方统一处理
     if let Err(intercept) = crate::agent::tools::run_pre_hooks(&inv).await {

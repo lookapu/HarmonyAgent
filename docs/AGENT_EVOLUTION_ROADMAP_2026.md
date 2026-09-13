@@ -500,6 +500,14 @@ Trae Agent 的研究重点之一是 test-time scaling，通过生成、剪枝和
 - 验证：`cargo test --manifest-path src-tauri/Cargo.toml --lib` 共 998 项，989 通过、0 失败、9 忽略；本轮新增 6 个边界测试，`git diff --check` 通过。
 - 边界：实例与设备精确映射、OTA 格式/签名/真机验收、Broker 自身审批契约及文件系统句柄级竞态防护仍待完成；不依赖 Docker。
 
+### 2026-09-13：Broker 显式审批凭据 P0
+
+- [x] OTA 显式审批落库，绑定 Run/会话/工具调用/规范化参数摘要；记录失败拒绝执行。
+- [x] 执行入口在创建目录前复验实际参数；Broker claim 前独立复验当前 `running` OTA 调用和审批凭据，审计标注审批策略。
+- [x] 主 Agent 串行/并行审批上下文补齐 tool-call ID，与 Worker 执行身份一致。
+- 验证：新增 4 个审批凭据边界测试；Rust 库全量 1002 项，993 通过、0 失败、9 忽略，`git diff --check` 通过。
+- 边界：目前仅覆盖 OTA 的工具请求级凭据，不等同于所有 capability 的精确参数授权；文件内容快照、撤销生命周期和桌面审批端到端验证仍待完成。
+
 ### Phase 1：第 3—6 周，补核心底座
 
 交付：

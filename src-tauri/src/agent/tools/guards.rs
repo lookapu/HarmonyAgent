@@ -190,7 +190,12 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
         );
     }
     match approval_result {
-        Ok(ApprovalOutcome::Approved) => {}
+        Ok(ApprovalOutcome::Approved) => {
+            if tool == "ota_pack" {
+                crate::agent::broker_approval::record_ota_approval(inv.ctx, inv.args_raw)
+                    .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
+            }
+        }
         Ok(ApprovalOutcome::Rejected(feedback)) => {
             // 拒绝理由（用户可附）反馈给模型，帮助其调整方案而非盲目重试
             let reason = feedback

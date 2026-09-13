@@ -529,6 +529,7 @@ pub async fn ota_pack(
     roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
+    crate::agent::broker_approval::verify_ota_arguments(ctx, args)?;
     let hap_path = args["hap_path"]
         .as_str()
         .ok_or("ota_pack 需要参数 {\"hap_path\":\"<HAP 路径>\"}")?;

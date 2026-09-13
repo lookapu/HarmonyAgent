@@ -31,6 +31,7 @@ pub mod versioning;
 pub mod verification_planner;
 pub mod crash;
 pub mod capability_broker;
+pub(crate) mod broker_approval;
 pub mod runtime_log;
 pub mod runtime;
 pub mod exec_ctx;

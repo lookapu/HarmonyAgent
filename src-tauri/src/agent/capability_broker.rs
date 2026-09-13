@@ -1600,6 +1600,16 @@ fn claim_request(
     let app = ctx.app.as_ref().ok_or("Host Capability Broker 缺少应用数据库，拒绝执行")?;
     let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
     let conn = db.0.lock().map_err(|_| "Host Capability Broker 数据库锁已损坏")?;
+    let mut subject = subject.clone();
+    if capability_id == "release.package_ota" {
+        crate::agent::broker_approval::verify_ota_approval(
+            &conn, &ctx.run_id, &ctx.conversation_id, &identity.tool_call_id,
+        )?;
+        subject["approval"] = serde_json::json!({
+            "policy": "fresh_explicit", "binding": "durable_tool_request",
+            "evidence_event": "host_capability.explicit_approval",
+        });
+    }
     crate::agent::runtime::claim_host_capability(
         &conn,
         &ctx.run_id,
@@ -1608,7 +1618,7 @@ fn claim_request(
         capability_id,
         &identity.request_digest,
         &identity.idempotency_key,
-        subject,
+        &subject,
     )
 }
 
