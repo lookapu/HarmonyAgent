@@ -63,6 +63,8 @@ pub struct ToolInvocation<'a> {
     pub args_raw: &'a str,
     /// 会话项目 id
     pub project_id: &'a str,
+    /// 与实际执行相同的项目根，用于审批前解析文件作用域。
+    pub project_path: &'a str,
     /// 有效根目录（用户指定目录优先，会话项目根兜底）
     pub roots: &'a [String],
     /// 会话 id（审批事件、护栏记录、注入队列均按会话定位）
@@ -163,6 +165,7 @@ mod tests {
             args,
             args_raw: "",
             project_id: "",
+            project_path: "",
             roots,
             conversation_id: "test",
             approval_mode: "allow_all",

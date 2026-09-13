@@ -1188,30 +1188,7 @@ pub async fn run_tool(
     }
     // 有效根：用户指明目录优先（按消息先后顺序），会话项目根兜底（去重）。
     // 文件工具相对路径按此顺序逐个尝试，绝对路径在任一有效根内放行。
-    let mut roots: Vec<String> = Vec::new();
-    for h in path_hints {
-        let h = h.trim();
-        if !h.is_empty() && !roots.iter().any(|r| r == h) {
-            roots.push(h.to_string());
-        }
-    }
-    if !project_path.trim().is_empty() {
-        // 会话项目根兜底：若项目配置/识别出"鸿蒙主工程"（混合工作区的子工程），
-        // 将其插入为第一个兜底根——Harmony 工具（构建/部署/依赖/对齐检查）取
-        // roots.first() 即自动落到鸿蒙工程上；未配置时鸿蒙根=项目根本身，去重不重复插入。
-        if !project_id.trim().is_empty() {
-            if let Ok(conn) = db.0.lock() {
-                if let Ok(info) = crate::commands::project::resolve_harmony_root(&conn, project_id, Some(project_path)) {
-                    if !info.root.is_empty() && !roots.iter().any(|r| r == &info.root) {
-                        roots.push(info.root);
-                    }
-                }
-            }
-        }
-        if !roots.iter().any(|r| r == project_path.trim()) {
-            roots.push(project_path.trim().to_string());
-        }
-    }
+    let roots = effective_tool_roots(db, project_id, project_path, path_hints);
     // 仅显式纯查询工具允许缓存；键包含有效根目录，避免同项目不同 worktree/path hint
     // 使用相同相对参数时串读。文件/设备/UI/状态类工具始终执行。
     if crate::services::permissions::is_cacheable(name) {
@@ -4685,6 +4662,40 @@ fn trusted_system_dir(p: &Path) -> bool {
         }
     }
     false
+}
+
+/// 审批与执行共享有序根目录：用户提示优先，其后是鸿蒙工程及项目根。
+pub(crate) fn effective_tool_roots(
+    db: &crate::db::DbState,
+    project_id: &str,
+    project_path: &str,
+    path_hints: &[String],
+) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for h in path_hints {
+        let h = h.trim();
+        if !h.is_empty() && !roots.iter().any(|r| r == h) {
+            roots.push(h.to_string());
+        }
+    }
+    if !project_path.trim().is_empty() {
+        // 会话项目根兜底：若项目配置/识别出"鸿蒙主工程"（混合工作区的子工程），
+        // 将其插入为第一个兜底根——Harmony 工具（构建/部署/依赖/对齐检查）取
+        // roots.first() 即自动落到鸿蒙工程上；未配置时鸿蒙根=项目根本身，去重不重复插入。
+        if !project_id.trim().is_empty() {
+            if let Ok(conn) = db.0.lock() {
+                if let Ok(info) = crate::commands::project::resolve_harmony_root(&conn, project_id, Some(project_path)) {
+                    if !info.root.is_empty() && !roots.iter().any(|r| r == &info.root) {
+                        roots.push(info.root);
+                    }
+                }
+            }
+        }
+        if !roots.iter().any(|r| r == project_path.trim()) {
+            roots.push(project_path.trim().to_string());
+        }
+    }
+    roots
 }
 
 /// 写入/创建用路径解析：允许目标文件尚不存在（resolve_in_roots 要求路径已存在，

@@ -479,12 +479,7 @@ impl OtaStaging {
         if std::fs::symlink_metadata(destination).is_ok() {
             return Err("OTA 输出已存在，请选择新的 .pkg 路径；不会覆盖旧产物".into());
         }
-        let parent = destination.parent().ok_or("OTA 输出缺少父目录")?;
-        let name = destination.file_name().ok_or("OTA 输出缺少文件名")?;
-        let mut stage_name = std::ffi::OsString::from(".");
-        stage_name.push(name);
-        stage_name.push(".ota-stage");
-        let directory = parent.join(stage_name);
+        let directory = crate::agent::ota_scope::staging_directory(destination)?;
         std::fs::create_dir(&directory)
             .map_err(|error| format!("无法独占 OTA 暂存目录（可能存在未完成打包，请先检查，勿自动删除）：{error}"))?;
         Ok(Self { directory })
@@ -529,7 +524,12 @@ pub async fn ota_pack(
     roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    crate::agent::broker_approval::verify_ota_arguments(ctx, args)?;
+    let approval_ctx = ctx.clone();
+    let approval_args = args.clone();
+    let approval_roots = roots.to_vec();
+    tokio::task::spawn_blocking(move || crate::agent::broker_approval::verify_ota_arguments(
+        &approval_ctx, &approval_args, &approval_roots,
+    )).await.map_err(|error| format!("OTA 审批复验任务失败：{error}"))??;
     let hap_path = args["hap_path"]
         .as_str()
         .ok_or("ota_pack 需要参数 {\"hap_path\":\"<HAP 路径>\"}")?;

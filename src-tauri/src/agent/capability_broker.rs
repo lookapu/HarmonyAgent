@@ -1282,6 +1282,25 @@ pub async fn execute_host_capability(
     workspace: Option<&Path>,
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<Output, String> {
+    if matches!(capability, HostCapability::PackageOta { .. }) {
+        let root = workspace.ok_or("OTA 能力审批需要明确工作区")?.to_path_buf();
+        let approval_ctx = ctx.clone();
+        let approved_capability = capability.clone();
+        let verification = tokio::task::spawn_blocking(move || crate::agent::broker_approval::verify_ota_capability(
+            &approval_ctx, &approved_capability, &root,
+        )).await.map_err(|error| format!("Broker OTA 作用域复验任务失败：{error}"))
+            .and_then(|result| result);
+        if let Err(error) = verification {
+            ctx.record_run_event("host_capability.rejected", serde_json::json!({
+                "capability_id": "release.package_ota", "reason": "approval_scope_mismatch",
+                "tool_call_id": ctx.tool_call_id,
+            }));
+            return Err(error);
+        }
+        if crate::agent::exec_ctx::current_tool_stop_requested() {
+            return Err("OTA 审批复验后检测到停止请求，未派发进程".into());
+        }
+    }
     let capability_id = capability.capability_id();
     let identity = match request_identity(ctx, capability) {
         Ok(identity) => identity,
@@ -1606,7 +1625,7 @@ fn claim_request(
             &conn, &ctx.run_id, &ctx.conversation_id, &identity.tool_call_id,
         )?;
         subject["approval"] = serde_json::json!({
-            "policy": "fresh_explicit", "binding": "durable_tool_request",
+            "policy": "fresh_explicit", "binding": "durable_tool_request_and_ota_scope_v2",
             "evidence_event": "host_capability.explicit_approval",
         });
     }

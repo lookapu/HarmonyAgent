@@ -28,6 +28,7 @@ fn tool_key(
 pub(crate) fn record_ota_approval(
     ctx: &crate::agent::exec_ctx::ToolCtx,
     args_raw: &str,
+    scope: &super::ota_scope::OtaScope,
 ) -> Result<(), String> {
     let call = ctx
         .tool_call_id
@@ -48,7 +49,7 @@ pub(crate) fn record_ota_approval(
         &ctx.conversation_id,
         EVENT,
         serde_json::json!({
-            "version": 1, "tool_call_id": call, "tool": "ota_pack",
+            "version": 2, "tool_call_id": call, "tool": "ota_pack", "scope": scope,
             "tool_request_key": key, "decision": "explicitly_approved",
         }),
     )?;
@@ -60,7 +61,7 @@ pub(crate) fn verify_ota_approval(
     run: &str,
     conversation: &str,
     call: &str,
-) -> Result<(), String> {
+) -> Result<super::ota_scope::OtaScope, String> {
     let key = tool_key(conn, run, conversation, call, "running")?;
     let payload: Option<String> = conn
         .query_row(
@@ -75,26 +76,28 @@ pub(crate) fn verify_ota_approval(
     let payload: serde_json::Value =
         serde_json::from_str(&payload.ok_or("Broker 缺少本次 OTA 调用的显式审批凭据")?)
             .map_err(|error| format!("Broker 审批凭据损坏：{error}"))?;
-    if payload["version"] != 1
+    if payload["version"] != 2
         || payload["tool"] != "ota_pack"
         || payload["decision"] != "explicitly_approved"
         || payload["tool_request_key"].as_str() != Some(key.as_str())
     {
         return Err("Broker 显式审批凭据与当前工具请求不匹配".into());
     }
-    Ok(())
+    serde_json::from_value(payload["scope"].clone())
+        .map_err(|_| "Broker OTA 审批缺少有效文件/能力作用域，需重新审批".into())
 }
 
 /// 在路径解析/创建暂存目录之前，再核对实际交给工具的参数，避免审批后替换参数。
 pub(crate) fn verify_ota_arguments(
     ctx: &crate::agent::exec_ctx::ToolCtx,
     args: &serde_json::Value,
+    roots: &[String],
 ) -> Result<(), String> {
     let call = ctx.tool_call_id.as_deref().ok_or("OTA 缺少工具调用 ID")?;
     let app = ctx.app.as_ref().ok_or("OTA 缺少持久审批数据库")?;
     let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
     let conn = db.0.lock().map_err(|_| "OTA 审批数据库锁损坏")?;
-    verify_ota_approval(&conn, &ctx.run_id, &ctx.conversation_id, call)?;
+    let approved = verify_ota_approval(&conn, &ctx.run_id, &ctx.conversation_id, call)?;
     let key = tool_key(&conn, &ctx.run_id, &ctx.conversation_id, call, "running")?;
     let actual = crate::agent::tool_runtime::idempotency_key(
         &ctx.run_id,
@@ -104,6 +107,28 @@ pub(crate) fn verify_ota_arguments(
     );
     if key != actual {
         return Err("OTA 执行参数已偏离本次显式审批，拒绝执行".into());
+    }
+    drop(conn);
+    if approved != super::ota_scope::argument_scope(roots, args)? {
+        return Err("OTA 文件内容或路径已偏离审批快照，需重新审批".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_ota_capability(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    capability: &super::capability_broker::HostCapability,
+    workspace: &std::path::Path,
+) -> Result<(), String> {
+    let call = ctx.tool_call_id.as_deref().ok_or("OTA 缺少工具调用 ID")?;
+    let app = ctx.app.as_ref().ok_or("OTA 缺少持久审批数据库")?;
+    let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
+    let approved = {
+        let conn = db.0.lock().map_err(|_| "OTA 审批数据库锁损坏")?;
+        verify_ota_approval(&conn, &ctx.run_id, &ctx.conversation_id, call)?
+    };
+    if approved != super::ota_scope::capability_scope(capability, workspace)? {
+        return Err("Broker 拒绝执行：OTA 能力参数或输入内容与审批快照不一致".into());
     }
     Ok(())
 }
@@ -122,7 +147,8 @@ mod tests {
     }
 
     fn receipt(conn: &Connection, call: &str, key: &str, decision: &str, seq: i64) {
-        let payload = serde_json::json!({"version":1,"tool_call_id":call,"tool":"ota_pack",
+        let payload = serde_json::json!({"version":2,"tool_call_id":call,"tool":"ota_pack",
+            "scope":{"paths_sha256":"paths","hap_sha256":"hap","profile_sha256":null},
             "tool_request_key":key,"decision":decision});
         conn.execute(
             "INSERT INTO run_events VALUES('run','conversation',?1,?2,?3)",
@@ -174,6 +200,20 @@ mod tests {
         conn.execute(
             "INSERT INTO run_events VALUES('run','conversation',?1,2,'not json')",
             [EVENT],
+        )
+        .unwrap();
+        assert!(verify_ota_approval(&conn, "run", "conversation", "call").is_err());
+    }
+
+    #[test]
+    fn old_or_missing_scope_receipts_require_reapproval() {
+        let conn = fixture();
+        receipt(&conn, "call", "key", "explicitly_approved", 1);
+        conn.execute_batch("UPDATE run_events SET payload=json_set(payload,'$.version',1)")
+            .unwrap();
+        assert!(verify_ota_approval(&conn, "run", "conversation", "call").is_err());
+        conn.execute_batch(
+            "UPDATE run_events SET payload=json_remove(json_set(payload,'$.version',2),'$.scope')",
         )
         .unwrap();
         assert!(verify_ota_approval(&conn, "run", "conversation", "call").is_err());

@@ -152,6 +152,16 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     if !needs_approval {
         return Ok(());
     }
+    // 在展示审批之前冻结作用域；摘要计算不占用异步执行线程或数据库锁。
+    let ota_scope = if tool == "ota_pack" {
+        let roots = super::effective_tool_roots(
+            &app.state::<DbState>(), inv.project_id, inv.project_path, inv.roots,
+        );
+        let args = inv.args.clone();
+        Some(tokio::task::spawn_blocking(move || crate::agent::ota_scope::argument_scope(&roots, &args))
+            .await.map_err(|error| Intercept::new(InterceptKind::Approval, error.to_string()))?
+            .map_err(|error| Intercept::new(InterceptKind::Approval, error))?)
+    } else { None };
     if crate::agent::evals::take_fault("approval_timeout") {
         return Err(Intercept::new(
             InterceptKind::Approval,
@@ -191,8 +201,8 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     }
     match approval_result {
         Ok(ApprovalOutcome::Approved) => {
-            if tool == "ota_pack" {
-                crate::agent::broker_approval::record_ota_approval(inv.ctx, inv.args_raw)
+            if let Some(scope) = &ota_scope {
+                crate::agent::broker_approval::record_ota_approval(inv.ctx, inv.args_raw, scope)
                     .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
             }
         }
@@ -459,6 +469,7 @@ mod tests {
             args,
             args_raw: "{}",
             project_id: "",
+            project_path: "",
             roots,
             conversation_id: "test",
             approval_mode: "allow_all",
@@ -529,6 +540,7 @@ mod tests {
             args: &args,
             args_raw: r#"{"command":"rm -rf /"}"#,
             project_id: "p",
+            project_path: "",
             roots: &[],
             conversation_id: "c",
             approval_mode: "ask",
