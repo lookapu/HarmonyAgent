@@ -160,7 +160,7 @@ async fn broker_hdc_targets(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<Str
     if !output.status.success() {
         return Err(format!("设备清单查询失败：{}", text.trim()));
     }
-    Ok(text)
+    Ok(smart_decode(&output.stdout))
 }
 
 async fn broker_emulator_command(
@@ -175,7 +175,7 @@ async fn broker_emulator_command(
     if !output.status.success() {
         return Err(format!("{label}失败：{}", text.trim()));
     }
-    Ok(text)
+    Ok(smart_decode(&output.stdout))
 }
 
 pub(super) async fn list_emulators(
@@ -250,14 +250,11 @@ pub(super) async fn start_emulator(
         let out = broker_emulator_command(&stop, "停止模拟器", ctx).await?;
         return Ok(format!("已发送停止指令：{name}\n{}", out.trim_end()));
     }
-    // 轮询 hdc：启动前设备快照 → 新设备出现即上线
+    // HDC 只能提供设备上线证据，不能证明设备属于指定模拟器实例。
     let wait_secs = args["wait_secs"].as_u64().unwrap_or(60).clamp(5, 120);
-    let before: std::collections::HashSet<String> = broker_hdc_targets(ctx)
-        .await
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_whitespace().next().map(String::from))
-        .collect();
+    let baseline = broker_hdc_targets(ctx).await
+        .map_err(|error| format!("未启动模拟器：无法取得启动前设备基线：{error}"))?;
+    let before = online_target_set(&baseline);
     // start 是 GUI 长进程：Broker 在 spawn 前 claim，spawn 成功即记录派发终态；
     // 真实启动效果由下面独立的 HDC 查询验证。
     let start = crate::agent::capability_broker::HostCapability::StartEmulator {
@@ -272,12 +269,13 @@ pub(super) async fn start_emulator(
     let mut seen = String::new();
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if let Ok(t) = broker_hdc_targets(ctx).await {
-            let now_set: std::collections::HashSet<String> = t
-                .lines()
-                .filter_map(|l| l.split_whitespace().next().map(String::from))
-                .collect();
-            let new: Vec<&String> = now_set.difference(&before).collect();
+        {
+            let t = broker_hdc_targets(ctx).await.map_err(|error| format!(
+                "模拟器 {name} 已派发（PID：{pid_note}），但上线验证中断，实际状态未知；请查询 list_devices，勿自动重复启动：{error}"
+            ))?;
+            let now_set = online_target_set(&t);
+            let mut new: Vec<&String> = now_set.difference(&before).collect();
+            new.sort();
             if !new.is_empty() {
                 seen = new.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
                 break;
@@ -290,8 +288,43 @@ pub(super) async fn start_emulator(
         ))
     } else {
         Ok(format!(
-            "模拟器 {name} 已启动（派发 PID：{pid_note}），新设备上线：{seen}\n下一步：list_devices 查看详情后即可部署/测试（deploy 会部署到全部在线设备，注意区分真机与模拟器）。"
+            "模拟器 {name} 已后台派发（PID：{pid_note}）；观察到新增已授权在线设备：{seen}。\n尚不能证明这些设备属于实例 {name}，请用 list_devices 核对后显式选择部署目标，勿自动部署到新设备。"
         ))
+    }
+}
+
+fn online_target_set(text: &str) -> std::collections::HashSet<String> {
+    crate::commands::devices::online_device_ids_from_targets(text).into_iter().collect()
+}
+
+#[cfg(test)]
+mod emulator_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn online_evidence_excludes_empty_offline_and_unauthorized_targets() {
+        let targets = online_target_set("[Empty]\nold Offline\nlocked Unauthorized\npending Unknown\nnew Connected\nnew Connected\nlegacy\n");
+        assert_eq!(targets, ["new".to_string(), "legacy".to_string()].into_iter().collect());
+        let before = online_target_set("device Offline\n");
+        let after = online_target_set("device Connected\n");
+        assert_eq!(after.difference(&before).count(), 1);
+    }
+
+    #[test]
+    fn instance_transition_requires_exact_precondition() {
+        assert!(validate_instance_transition("Phone\nPhone2\n", "Phone", "create").is_err());
+        assert!(validate_instance_transition("Phone2\n", "Phone", "create").is_ok());
+        assert!(validate_instance_transition("Phone2\n", "Phone", "delete").is_err());
+        assert!(validate_instance_transition(" Phone \r\n", "Phone", "delete").is_ok());
+    }
+}
+
+fn validate_instance_transition(list: &str, name: &str, action: &str) -> Result<(), String> {
+    let exists = list.lines().any(|line| line.trim() == name);
+    match (action, exists) {
+        ("create", true) => Err(format!("实例 {name} 已存在，拒绝覆盖或将旧实例误报为新建成功")),
+        ("delete", false) => Err(format!("实例 {name} 不存在，未执行删除")),
+        _ => Ok(()),
     }
 }
 
@@ -331,6 +364,11 @@ pub(super) async fn create_emulator(
     let Some(name) = name else {
         return Err(format!("create_emulator {action} 需要 name（实例名）"));
     };
+    let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+        kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+    };
+    let baseline = broker_emulator_command(&query, "读取实例变更前清单", ctx).await?;
+    validate_instance_transition(&baseline, name, action)?;
     if action == "delete" {
         let delete = crate::agent::capability_broker::HostCapability::DeleteEmulator {
             name: name.to_string(),

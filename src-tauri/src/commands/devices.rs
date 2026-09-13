@@ -121,8 +121,8 @@ pub(crate) fn select_default_device_from_targets(out: &str) -> Result<String, St
     select_device_id_from_targets(out, load_default_device().as_deref())
 }
 
-fn select_device_id_from_targets(out: &str, remembered: Option<&str>) -> Result<String, String> {
-    let online = out
+pub(crate) fn online_device_ids_from_targets(out: &str) -> Vec<String> {
+    out
         .lines()
         .filter_map(parse_target_line)
         .filter(|(_, state)| {
@@ -130,7 +130,11 @@ fn select_device_id_from_targets(out: &str, remembered: Option<&str>) -> Result<
             connection == "online" && authorized
         })
         .map(|(id, _)| id)
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn select_device_id_from_targets(out: &str, remembered: Option<&str>) -> Result<String, String> {
+    let online = online_device_ids_from_targets(out);
     if online.is_empty() {
         return Err("未检测到已授权在线设备，请连接设备并确认调试授权".into());
     }

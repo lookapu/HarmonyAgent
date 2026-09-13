@@ -1107,7 +1107,7 @@ name: "ask_history",
     },
     ToolSpec {
         name: "ota_pack",
-        desc: "基于 HAP 包制作 HarmonyOS OTA 升级包（.pkg），每次调用都必须显式审批，不能用项目/会话白名单跳过。\n参数：{\"hap_path\":\"<HAP 文件路径>\"（必填）,\"out_path\":\"<输出 .pkg 路径>\"（必填）,\"profile_path\":\"<可选签名 工作区内 profile.json；三个路径必须位于同一授权项目根，审批展示与持久审计会脱敏>\"}。\n实现：Host Capability Broker 内部发现受信任 packagingtool.jar，固定执行 java -jar packagingtool.jar --mode ota --hap <HAP> --out <pkg> --profile <profile> --force。\n前置：DevEco Studio 工具链或 Sdk Command-Line Tools（含 packagingtool.jar，HOS_PACKAGING_TOOL 环境变量）。\n副作用：创建/覆盖工作区内 .pkg；成功后验证输出是非空普通文件；失败或中断后不得自动重放，需人工复验。\n返回：出包路径 + 大小 + 耗时 + stdout 摘要；失败时 stderr。",
+        desc: "基于 HAP 包制作 HarmonyOS OTA 升级包（.pkg），每次调用都必须显式审批，不能用项目/会话白名单跳过。\n参数：{\"hap_path\":\"<HAP 文件路径>\"（必填）,\"out_path\":\"<输出 .pkg 路径>\"（必填）,\"profile_path\":\"<可选签名 工作区内 profile.json；三个路径必须位于同一授权项目根，审批展示与持久审计会脱敏>\"}。\n实现：Host Capability Broker 内部发现受信任 packagingtool.jar，固定执行 java -jar packagingtool.jar --mode ota --hap <HAP> --out <pkg> --profile <profile> --force。\n前置：DevEco Studio 工具链或 Sdk Command-Line Tools（含 packagingtool.jar，HOS_PACKAGING_TOOL 环境变量）。\n副作用：在工作区内独占暂存目录生成全新非空普通文件，再以不覆盖方式发布 .pkg；out_path 必须不存在（含悬空符号链接），不支持覆盖旧包；失败或中断后不得自动重放，需人工复验。\n返回：出包路径 + 大小 + 耗时 + stdout 摘要；失败时 stderr。",
     },
 ];
 

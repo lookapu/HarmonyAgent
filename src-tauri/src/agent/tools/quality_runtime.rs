@@ -42,7 +42,10 @@ fn debugger_command_failed(output: &str) -> bool {
 }
 
 fn parse_pid(raw: &str, label: &str) -> Result<u32, String> {
-    let value = raw.split_whitespace().next().unwrap_or("");
+    let value = raw.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{label}必须是单个十进制 PID；多个进程请显式选择 pid"));
+    }
     let pid = value
         .parse::<u32>()
         .map_err(|_| format!("{label}必须是大于 0 的十进制 PID"))?;
@@ -419,9 +422,11 @@ pub async fn step_debug(
         None => crate::agent::tools::default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
-    let pid = match args["pid"].as_str() {
-        Some(p) => parse_pid(p, "pid")?,
-        None => {
+    let pid = match args.get("pid") {
+        Some(Value::String(p)) => parse_pid(p, "pid")?,
+        Some(Value::Number(p)) => parse_pid(&p.to_string(), "pid")?,
+        Some(value) if !value.is_null() => return Err("pid 必须是十进制字符串或正整数".into()),
+        _ => {
             if project_path.is_empty() {
                 return Err("未指定 pid 且当前会话未绑定工程".into());
             }
@@ -461,6 +466,62 @@ pub async fn step_debug(
         "单步调试（设备 {device} / PID {pid} / action={action}）：\n{}",
         if out.trim().is_empty() { "(无输出，可能进程未停在断点)" } else { out.trim() }
     ))
+}
+
+/// 独占、确定性 staging 路径使重试保留同一个 Broker 请求摘要。
+/// 只清理本次拥有的已知文件和空目录，不递归删除未知内容。
+struct OtaStaging {
+    directory: std::path::PathBuf,
+}
+
+impl OtaStaging {
+    fn create(destination: &std::path::Path) -> Result<Self, String> {
+        if std::fs::symlink_metadata(destination).is_ok() {
+            return Err("OTA 输出已存在，请选择新的 .pkg 路径；不会覆盖旧产物".into());
+        }
+        let parent = destination.parent().ok_or("OTA 输出缺少父目录")?;
+        let name = destination.file_name().ok_or("OTA 输出缺少文件名")?;
+        let mut stage_name = std::ffi::OsString::from(".");
+        stage_name.push(name);
+        stage_name.push(".ota-stage");
+        let directory = parent.join(stage_name);
+        std::fs::create_dir(&directory)
+            .map_err(|error| format!("无法独占 OTA 暂存目录（可能存在未完成打包，请先检查，勿自动删除）：{error}"))?;
+        Ok(Self { directory })
+    }
+
+    fn artifact(&self) -> std::path::PathBuf {
+        self.directory.join("artifact.pkg")
+    }
+
+    fn publish(&self, destination: &std::path::Path) -> Result<u64, String> {
+        let parent = destination.parent().ok_or("OTA 输出缺少父目录")?;
+        if parent.canonicalize().map_err(|error| error.to_string())? != parent
+            || self.directory.canonicalize().map_err(|error| error.to_string())? != self.directory
+        {
+            return Err("OTA 发布前目录边界发生变化，拒绝发布".into());
+        }
+        let artifact = self.artifact();
+        let metadata = std::fs::symlink_metadata(&artifact)
+            .map_err(|error| format!("packagingtool 返回成功，但本次暂存产物不存在：{error}"))?;
+        if !metadata.file_type().is_file() || metadata.len() == 0 {
+            return Err("packagingtool 返回成功，但本次暂存产物不是非空普通文件".into());
+        }
+        // 同一父目录/文件系统内发布；目标存在时原子失败，不能 rename 覆盖旧包。
+        std::fs::hard_link(&artifact, destination)
+            .map_err(|error| format!("OTA 产物发布失败（不会覆盖已有目标）：{error}"))?;
+        Ok(metadata.len())
+    }
+}
+
+impl Drop for OtaStaging {
+    fn drop(&mut self) {
+        if self.directory.canonicalize().ok().as_ref() != Some(&self.directory) {
+            return;
+        }
+        let _ = std::fs::remove_file(self.artifact());
+        let _ = std::fs::remove_dir(&self.directory);
+    }
 }
 
 pub async fn ota_pack(
@@ -508,6 +569,13 @@ pub async fn ota_pack(
     if !canonical_parent.starts_with(&workspace) {
         return Err("OTA 输出目录通过符号链接逃逸项目工作区".into());
     }
+    let destination = canonical_parent.join(out_full.file_name().ok_or("OTA 输出缺少文件名")?);
+    let staging = OtaStaging::create(&destination)?;
+    let capability = crate::agent::capability_broker::HostCapability::PackageOta {
+        hap_path: relative(&hap_full)?,
+        output_path: relative(&staging.artifact())?,
+        profile_path: profile_full.as_deref().map(relative).transpose()?,
+    };
 
     // 2) Broker 内部发现受信任 packagingtool，固定 java argv 并持久化不可重放 claim。
     let start = std::time::Instant::now();
@@ -529,19 +597,10 @@ pub async fn ota_pack(
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let packaged = out_full
-        .canonicalize()
-        .map_err(|error| format!("packagingtool 返回成功，但输出文件不存在：{error}"))?;
-    if !packaged.starts_with(&workspace) || !packaged.is_file() {
-        return Err("packagingtool 返回成功，但输出不是工作区内普通文件".into());
-    }
-    let size = std::fs::metadata(&packaged).map(|m| m.len()).unwrap_or(0);
-    if size == 0 {
-        return Err("packagingtool 返回成功，但 OTA 输出文件为空".into());
-    }
+    let size = staging.publish(&destination)?;
     Ok(format!(
         "✅ OTA 包已生成：{}\n大小：{:.1} KB\n耗时：{:.1}s\nstdout 摘要：\n{}",
-        packaged.display(),
+        destination.display(),
         size as f64 / 1024.0,
         elapsed.as_secs_f64(),
         if stdout.trim().is_empty() { "(无输出)".to_string() } else { stdout.chars().take(1500).collect::<String>() }
@@ -651,6 +710,82 @@ fn pick_response_sample(op: &serde_json::Value, depth: usize) -> (u16, serde_jso
     (200, serde_json::Value::Null)
 }
 
+
+#[cfg(test)]
+mod runtime_boundary_tests {
+    use super::*;
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("harmony-ota-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn ota_requires_fresh_nonempty_artifact_and_cleans_owned_staging() {
+        let root = TestDirectory::new();
+        let destination = root.0.join("release.pkg");
+        let staging = OtaStaging::create(&destination).unwrap();
+        let directory = staging.directory.clone();
+        assert!(OtaStaging::create(&destination).is_err());
+        assert!(staging.publish(&destination).is_err());
+        std::fs::write(staging.artifact(), b"").unwrap();
+        assert!(staging.publish(&destination).is_err());
+        std::fs::write(staging.artifact(), b"new artifact").unwrap();
+        assert_eq!(staging.publish(&destination).unwrap(), 12);
+        drop(staging);
+        assert!(!directory.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new artifact");
+        assert!(OtaStaging::create(&destination).is_err());
+    }
+
+    #[test]
+    fn ota_publish_does_not_clobber_concurrent_output() {
+        let root = TestDirectory::new();
+        let destination = root.0.join("release.pkg");
+        let staging = OtaStaging::create(&destination).unwrap();
+        std::fs::write(staging.artifact(), b"new").unwrap();
+        std::fs::write(&destination, b"existing").unwrap();
+        assert!(staging.publish(&destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ota_rejects_symlink_artifact_and_dangling_destination() {
+        use std::os::unix::fs::symlink;
+        let root = TestDirectory::new();
+        let destination = root.0.join("release.pkg");
+        let staging = OtaStaging::create(&destination).unwrap();
+        let old = root.0.join("old.pkg");
+        std::fs::write(&old, b"old").unwrap();
+        symlink(&old, staging.artifact()).unwrap();
+        assert!(staging.publish(&destination).is_err());
+        drop(staging);
+        assert_eq!(std::fs::read(&old).unwrap(), b"old");
+        symlink(root.0.join("missing.pkg"), &destination).unwrap();
+        assert!(OtaStaging::create(&destination).is_err());
+    }
+
+    #[test]
+    fn pid_requires_one_unambiguous_positive_decimal() {
+        assert_eq!(parse_pid(" 42\n", "pid").unwrap(), 42);
+        assert_eq!(parse_pid("4294967295", "pid").unwrap(), u32::MAX);
+        for raw in ["", "0", "-1", "+1", "42 43", "42\n43", "42 junk", "4294967296", "１", "1.0"] {
+            assert!(parse_pid(raw, "pid").is_err(), "accepted {raw:?}");
+        }
+    }
+}
 
 fn path_template_to_regex(path: &str) -> String {
     let mut re = String::from("^");
