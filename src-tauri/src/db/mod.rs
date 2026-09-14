@@ -160,6 +160,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (80, "080_session_event_checkpoint_lookup", include_str!("../../migrations/080_session_event_checkpoint_lookup.sql")),
     (81, "081_desktop_recovery_cursor_indexes", include_str!("../../migrations/081_desktop_recovery_cursor_indexes.sql")),
     (82, "082_host_capability_claims", include_str!("../../migrations/082_host_capability_claims.sql")),
+    (83, "083_ota_approval_revocations", include_str!("../../migrations/083_ota_approval_revocations.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {

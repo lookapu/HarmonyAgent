@@ -3,6 +3,30 @@ use rusqlite::{Connection, OptionalExtension};
 
 const EVENT: &str = "host_capability.explicit_approval";
 
+pub(crate) fn revoke_conversation(conn: &Connection, conversation: &str) -> Result<usize, String> {
+    conn.execute(
+        "INSERT OR IGNORE INTO ota_approval_revocations(call_id,run_id,conversation_id,revoked_at,reason)
+         SELECT id,trace_id,conversation_id,?2,'user_stop' FROM tool_runs
+         WHERE conversation_id=?1 AND tool_name='ota_pack'
+         AND status IN ('prepared','running','verifying','recovery_required','stuck')",
+        rusqlite::params![conversation, chrono::Utc::now().timestamp_millis()],
+    ).map_err(|error| format!("OTA 审批撤销持久化失败：{error}"))
+}
+
+fn require_not_revoked(conn: &Connection, call: &str) -> Result<(), String> {
+    let revoked: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM ota_approval_revocations WHERE call_id=?1)",
+            [call],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法读取 OTA 审批撤销状态：{error}"))?;
+    if revoked {
+        return Err("本次 OTA 调用已被持久撤销，必须发起新的工具调用并重新审批".into());
+    }
+    Ok(())
+}
+
 fn approval_epoch() -> &'static str {
     static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     EPOCH.get_or_init(|| uuid::Uuid::new_v4().to_string())
@@ -39,6 +63,7 @@ fn tool_key(
     if run.is_empty() || conversation.is_empty() || call.is_empty() {
         return Err("Broker 审批缺少 Run/会话/工具调用身份".into());
     }
+    require_not_revoked(conn, call)?;
     conn.query_row(
         "SELECT idempotency_key FROM tool_runs WHERE id=?1 AND trace_id=?2
          AND conversation_id=?3 AND tool_name='ota_pack' AND status=?4",
@@ -190,6 +215,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE tool_runs(id TEXT,trace_id TEXT,conversation_id TEXT,
             tool_name TEXT,status TEXT,idempotency_key TEXT);
             CREATE TABLE run_events(run_id TEXT,conversation_id TEXT,event_type TEXT,seq INTEGER,payload TEXT);
+            CREATE TABLE ota_approval_revocations(call_id TEXT PRIMARY KEY,run_id TEXT,conversation_id TEXT,revoked_at INTEGER,reason TEXT);
             INSERT INTO tool_runs VALUES('call','run','conversation','ota_pack','running','key');").unwrap();
         conn
     }
@@ -291,6 +317,49 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn durable_revocation_blocks_signing_execution_and_same_call_recovery() {
+        let conn = fixture();
+        receipt(&conn, "call", "key", "explicitly_approved", 1);
+        assert_eq!(revoke_conversation(&conn, "other").unwrap(), 0);
+        assert_eq!(revoke_conversation(&conn, "conversation").unwrap(), 1);
+        assert_eq!(revoke_conversation(&conn, "conversation").unwrap(), 0);
+        assert!(verify_ota_approval(&conn, "run", "conversation", "call").is_err());
+        conn.execute_batch("UPDATE tool_runs SET status='prepared'")
+            .unwrap();
+        assert!(tool_key(&conn, "run", "conversation", "call", "prepared").is_err());
+        conn.execute_batch("UPDATE tool_runs SET id='new-call'")
+            .unwrap();
+        assert!(tool_key(&conn, "run", "conversation", "new-call", "prepared").is_ok());
+    }
+
+    #[test]
+    fn revocation_is_visible_to_separate_database_connections() {
+        let path = std::env::temp_dir().join(format!(
+            "ota-revocation-test-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let writer = Connection::open(&path).unwrap();
+            writer.execute_batch("CREATE TABLE conversations(id TEXT PRIMARY KEY);
+                CREATE TABLE tool_runs(id TEXT,trace_id TEXT,conversation_id TEXT,tool_name TEXT,status TEXT);
+                INSERT INTO conversations VALUES('conversation');
+                INSERT INTO tool_runs VALUES('call','run','conversation','ota_pack','prepared');").unwrap();
+            writer
+                .execute_batch(include_str!(
+                    "../../migrations/083_ota_approval_revocations.sql"
+                ))
+                .unwrap();
+            let reader = Connection::open(&path).unwrap();
+            assert!(require_not_revoked(&reader, "call").is_ok());
+            revoke_conversation(&writer, "conversation").unwrap();
+            assert!(require_not_revoked(&reader, "call").is_err());
+            drop(writer);
+            assert!(require_not_revoked(&reader, "call").is_err());
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

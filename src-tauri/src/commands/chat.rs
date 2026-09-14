@@ -1366,6 +1366,7 @@ pub fn stop_chat(
     conversation_id: String,
     cancel: State<'_, ChatCancel>,
     registry: State<'_, TaskRegistry>,
+    db: State<'_, DbState>,
 ) -> Result<(), String> {
     // 停止请求打点：配合 stop_effective 日志，可确认“点停止 → 后端收到 → 哪个阶段生效”
     crate::utils::logger::log_event(
@@ -1386,14 +1387,19 @@ pub fn stop_chat(
     registry.mark_stop_requested(&conversation_id);
     crate::agent::ask::cancel_conversation(&conversation_id);
     crate::agent::exec_ctx::request_stop_tool(&conversation_id);
+    drop(set);
+    let conn = db.0.lock().map_err(|_| "停止已请求，但审批数据库锁损坏")?;
+    crate::agent::broker_approval::revoke_conversation(&conn, &conversation_id)?;
     Ok(())
 }
 
 /// 停止当前正在执行的工具（不终止整个任务）：中断标志被长任务命令执行器轮询消费，
 /// 强杀子进程后把“用户已停止当前工具”反馈给模型，模型继续生成结论。
 #[tauri::command]
-pub fn stop_tool(conversation_id: String) -> Result<(), String> {
+pub fn stop_tool(conversation_id: String, db: State<'_, DbState>) -> Result<(), String> {
     crate::agent::exec_ctx::request_stop_tool(&conversation_id);
+    let conn = db.0.lock().map_err(|_| "工具停止已请求，但审批数据库锁损坏")?;
+    crate::agent::broker_approval::revoke_conversation(&conn, &conversation_id)?;
     Ok(())
 }
 
