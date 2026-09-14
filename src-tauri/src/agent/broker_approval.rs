@@ -3,6 +3,32 @@ use rusqlite::{Connection, OptionalExtension};
 
 const EVENT: &str = "host_capability.explicit_approval";
 
+fn approval_epoch() -> &'static str {
+    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn validate_lifecycle(
+    payload: &serde_json::Value,
+    conversation: &str,
+    now: i64,
+) -> Result<(), String> {
+    let issued = payload["issued_at_ms"].as_i64().ok_or("审批缺少签发时间")?;
+    let expires = payload["expires_at_ms"]
+        .as_i64()
+        .ok_or("审批缺少过期时间")?;
+    if payload["process_epoch"].as_str() != Some(approval_epoch())
+        || payload["stop_generation"].as_u64()
+            != Some(crate::agent::exec_ctx::stop_generation(conversation))
+        || issued > now
+        || expires <= now
+        || expires.checked_sub(issued) != Some(30 * 60 * 1000)
+    {
+        return Err("OTA 审批已因停止、应用重启或超时失效，请重新审批".into());
+    }
+    Ok(())
+}
+
 fn tool_key(
     conn: &Connection,
     run: &str,
@@ -29,7 +55,11 @@ pub(crate) fn record_ota_approval(
     ctx: &crate::agent::exec_ctx::ToolCtx,
     args_raw: &str,
     scope: &super::ota_scope::OtaScope,
+    stop_generation: u64,
 ) -> Result<(), String> {
+    if stop_generation != crate::agent::exec_ctx::stop_generation(&ctx.conversation_id) {
+        return Err("审批等待期间已收到停止请求，拒绝签发 OTA 凭据".into());
+    }
     let call = ctx
         .tool_call_id
         .as_deref()
@@ -43,13 +73,16 @@ pub(crate) fn record_ota_approval(
     if key != expected {
         return Err("OTA 审批参数与已登记工具调用不一致".into());
     }
+    let issued_at = chrono::Utc::now().timestamp_millis();
     crate::agent::runtime::append_event(
         &conn,
         &ctx.run_id,
         &ctx.conversation_id,
         EVENT,
         serde_json::json!({
-            "version": 2, "tool_call_id": call, "tool": "ota_pack", "scope": scope,
+            "version": 3, "tool_call_id": call, "tool": "ota_pack", "scope": scope,
+            "process_epoch": approval_epoch(), "stop_generation": stop_generation,
+            "issued_at_ms": issued_at, "expires_at_ms": issued_at + 30 * 60 * 1000,
             "tool_request_key": key, "decision": "explicitly_approved",
         }),
     )?;
@@ -76,13 +109,18 @@ pub(crate) fn verify_ota_approval(
     let payload: serde_json::Value =
         serde_json::from_str(&payload.ok_or("Broker 缺少本次 OTA 调用的显式审批凭据")?)
             .map_err(|error| format!("Broker 审批凭据损坏：{error}"))?;
-    if payload["version"] != 2
+    if payload["version"] != 3
         || payload["tool"] != "ota_pack"
         || payload["decision"] != "explicitly_approved"
         || payload["tool_request_key"].as_str() != Some(key.as_str())
     {
         return Err("Broker 显式审批凭据与当前工具请求不匹配".into());
     }
+    validate_lifecycle(
+        &payload,
+        conversation,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
     serde_json::from_value(payload["scope"].clone())
         .map_err(|_| "Broker OTA 审批缺少有效文件/能力作用域，需重新审批".into())
 }
@@ -112,6 +150,16 @@ pub(crate) fn verify_ota_arguments(
     if approved != super::ota_scope::argument_scope(roots, args)? {
         return Err("OTA 文件内容或路径已偏离审批快照，需重新审批".into());
     }
+    Ok(())
+}
+
+/// 产物发布前再次验证停止/重启/过期边界；不重新读取可能已被编辑的原输入。
+pub(crate) fn verify_ota_publication(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<(), String> {
+    let call = ctx.tool_call_id.as_deref().ok_or("OTA 缺少工具调用 ID")?;
+    let app = ctx.app.as_ref().ok_or("OTA 缺少审批数据库")?;
+    let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
+    let conn = db.0.lock().map_err(|_| "OTA 审批数据库锁损坏")?;
+    verify_ota_approval(&conn, &ctx.run_id, &ctx.conversation_id, call)?;
     Ok(())
 }
 
@@ -147,7 +195,10 @@ mod tests {
     }
 
     fn receipt(conn: &Connection, call: &str, key: &str, decision: &str, seq: i64) {
-        let payload = serde_json::json!({"version":2,"tool_call_id":call,"tool":"ota_pack",
+        let now = chrono::Utc::now().timestamp_millis();
+        let payload = serde_json::json!({"version":3,"tool_call_id":call,"tool":"ota_pack",
+            "process_epoch":approval_epoch(),"stop_generation":crate::agent::exec_ctx::stop_generation("conversation"),
+            "issued_at_ms":now,"expires_at_ms":now+30*60*1000,
             "scope":{"paths_sha256":"paths","hap_sha256":"hap","profile_sha256":null},
             "tool_request_key":key,"decision":decision});
         conn.execute(
@@ -213,9 +264,44 @@ mod tests {
             .unwrap();
         assert!(verify_ota_approval(&conn, "run", "conversation", "call").is_err());
         conn.execute_batch(
-            "UPDATE run_events SET payload=json_remove(json_set(payload,'$.version',2),'$.scope')",
+            "UPDATE run_events SET payload=json_remove(json_set(payload,'$.version',3),'$.scope')",
         )
         .unwrap();
         assert!(verify_ota_approval(&conn, "run", "conversation", "call").is_err());
+    }
+
+    #[test]
+    fn lifecycle_rejects_restart_expiry_future_and_malformed_duration() {
+        let conversation = uuid::Uuid::new_v4().to_string();
+        let now = 2_000_000;
+        let valid = serde_json::json!({"process_epoch":approval_epoch(),"stop_generation":0,
+            "issued_at_ms":now-1,"expires_at_ms":now-1+30*60*1000});
+        assert!(validate_lifecycle(&valid, &conversation, now).is_ok());
+        for (key, value) in [
+            ("process_epoch", serde_json::json!("previous-process")),
+            ("expires_at_ms", serde_json::json!(now)),
+            ("issued_at_ms", serde_json::json!(now + 1)),
+            ("expires_at_ms", serde_json::json!(i64::MAX)),
+            ("stop_generation", serde_json::Value::Null),
+        ] {
+            let mut changed = valid.clone();
+            changed[key] = value;
+            assert!(
+                validate_lifecycle(&changed, &conversation, now).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_revokes_old_receipt_but_new_approval_can_proceed() {
+        let conversation = uuid::Uuid::new_v4().to_string();
+        let mut receipt = serde_json::json!({"process_epoch":approval_epoch(),"stop_generation":0,
+            "issued_at_ms":100,"expires_at_ms":100+30*60*1000});
+        crate::agent::exec_ctx::request_stop_tool(&conversation);
+        assert!(validate_lifecycle(&receipt, &conversation, 101).is_err());
+        receipt["stop_generation"] =
+            serde_json::json!(crate::agent::exec_ctx::stop_generation(&conversation));
+        assert!(validate_lifecycle(&receipt, &conversation, 101).is_ok());
     }
 }

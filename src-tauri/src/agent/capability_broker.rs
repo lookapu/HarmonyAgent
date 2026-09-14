@@ -1636,6 +1636,7 @@ fn claim_request(
         )?;
         subject["approval"] = serde_json::json!({
             "policy": "fresh_explicit", "binding": "durable_tool_request_and_ota_scope_v2",
+            "receipt_version": 3, "lifecycle": "process_stop_generation_30min",
             "input_policy": "verified_readonly_copies",
             "evidence_event": "host_capability.explicit_approval",
         });

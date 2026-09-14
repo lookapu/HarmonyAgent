@@ -153,6 +153,7 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
         return Ok(());
     }
     // 在展示审批之前冻结作用域；摘要计算不占用异步执行线程或数据库锁。
+    let approval_stop_generation = crate::agent::exec_ctx::stop_generation(conversation_id);
     let ota_scope = if tool == "ota_pack" {
         let roots = super::effective_tool_roots(
             &app.state::<DbState>(), inv.project_id, inv.project_path, inv.roots,
@@ -202,7 +203,7 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     match approval_result {
         Ok(ApprovalOutcome::Approved) => {
             if let Some(scope) = &ota_scope {
-                crate::agent::broker_approval::record_ota_approval(inv.ctx, inv.args_raw, scope)
+                crate::agent::broker_approval::record_ota_approval(inv.ctx, inv.args_raw, scope, approval_stop_generation)
                     .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
             }
         }

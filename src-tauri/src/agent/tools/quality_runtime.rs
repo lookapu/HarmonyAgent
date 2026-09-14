@@ -598,6 +598,7 @@ pub async fn ota_pack(
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    crate::agent::broker_approval::verify_ota_publication(ctx)?;
     let size = staging.publish(&destination)?;
     Ok(format!(
         "✅ OTA 包已生成：{}\n大小：{:.1} KB\n耗时：{:.1}s\nstdout 摘要：\n{}",
