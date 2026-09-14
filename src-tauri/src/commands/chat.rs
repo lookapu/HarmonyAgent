@@ -1386,10 +1386,8 @@ pub fn stop_chat(
     // 记录停止请求时间：看门狗据此判断协作停止是否失效（宽限期内未消费则强杀任务）
     registry.mark_stop_requested(&conversation_id);
     crate::agent::ask::cancel_conversation(&conversation_id);
-    crate::agent::exec_ctx::request_stop_tool(&conversation_id);
     drop(set);
-    let conn = db.0.lock().map_err(|_| "停止已请求，但审批数据库锁损坏")?;
-    crate::agent::broker_approval::revoke_conversation(&conn, &conversation_id)?;
+    crate::agent::broker_approval::stop_and_revoke(&db, &conversation_id, crate::agent::broker_approval::StopReason::User)?;
     Ok(())
 }
 
@@ -1397,9 +1395,7 @@ pub fn stop_chat(
 /// 强杀子进程后把“用户已停止当前工具”反馈给模型，模型继续生成结论。
 #[tauri::command]
 pub fn stop_tool(conversation_id: String, db: State<'_, DbState>) -> Result<(), String> {
-    crate::agent::exec_ctx::request_stop_tool(&conversation_id);
-    let conn = db.0.lock().map_err(|_| "工具停止已请求，但审批数据库锁损坏")?;
-    crate::agent::broker_approval::revoke_conversation(&conn, &conversation_id)?;
+    crate::agent::broker_approval::stop_and_revoke(&db, &conversation_id, crate::agent::broker_approval::StopReason::User)?;
     Ok(())
 }
 
@@ -9377,10 +9373,13 @@ async fn run_tool_in_lane(
             },
             _ = &mut deadline => {
                 // 超时：先请求停止（消费停止标志并杀进程树），再放弃等待并归因卡死。
-                crate::agent::exec_ctx::request_stop_tool(conversation_id);
+                let revocation = crate::agent::broker_approval::stop_and_revoke(
+                    state, conversation_id, crate::agent::broker_approval::StopReason::Timeout,
+                );
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut lane.result).await;
                 mark_tool_stuck(state, call_id);
-                return Err(format!("工具执行超时（>{}s）：{tool}，已请求终止；不会自动重试有副作用工具", timeout.as_secs()));
+                let detail = revocation.err().map(|error| format!("；{error}")).unwrap_or_default();
+                return Err(format!("工具执行超时（>{}s）：{tool}，已请求终止；不会自动重试有副作用工具{detail}", timeout.as_secs()));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
                 if let Some(registry) = registry {
@@ -9388,10 +9387,13 @@ async fn run_tool_in_lane(
                 }
                 if let Some(cancel) = cancel {
                     if is_cancelled(cancel, conversation_id) {
-                        crate::agent::exec_ctx::request_stop_tool(conversation_id);
+                        let revocation = crate::agent::broker_approval::stop_and_revoke(
+                            state, conversation_id, crate::agent::broker_approval::StopReason::User,
+                        );
                         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut lane.result).await;
                         mark_tool_stuck(state, call_id);
-                        return Err("用户已停止生成".into());
+                        let detail = revocation.err().map(|error| format!("；{error}")).unwrap_or_default();
+                        return Err(format!("用户已停止生成{detail}"));
                     }
                 }
             }
@@ -11459,9 +11461,12 @@ fn delete_conversation_inner(
         set.insert(id.to_string());
     }
     crate::agent::ask::cancel_conversation(id);
-    crate::agent::exec_ctx::request_stop_tool(id);
+    let revocation = crate::agent::broker_approval::stop_and_revoke(
+        state, id, crate::agent::broker_approval::StopReason::ConversationDeleted,
+    );
     // 2. 立即 abort 正在运行的 tokio 任务，并从注册表移除（看门狗不再追猎）
     registry.abort_conversation(id);
+    revocation?;
     // 3. 释放项目级会话锁：仅当持有者确实是本会话时才移除，避免误删其他会话的锁
     if let Ok(mut g) = lock.0.lock() {
         if g.values().any(|v| v == id) {

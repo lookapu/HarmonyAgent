@@ -3,13 +3,55 @@ use rusqlite::{Connection, OptionalExtension};
 
 const EVENT: &str = "host_capability.explicit_approval";
 
-pub(crate) fn revoke_conversation(conn: &Connection, conversation: &str) -> Result<usize, String> {
+#[derive(Clone, Copy)]
+pub(crate) enum StopReason {
+    User,
+    Timeout,
+    Watchdog,
+    ConversationDeleted,
+}
+
+impl StopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user_stop",
+            Self::Timeout => "tool_timeout",
+            Self::Watchdog => "watchdog",
+            Self::ConversationDeleted => "conversation_deleted",
+        }
+    }
+}
+
+/// 先发本地停止，再持久撤销；数据库失败不能阻止本地停止信号。
+pub(crate) fn stop_and_revoke(
+    db: &crate::db::DbState,
+    conversation: &str,
+    reason: StopReason,
+) -> Result<(), String> {
+    crate::agent::exec_ctx::request_stop_tool(conversation);
+    let conn =
+        db.0.try_lock()
+            .map_err(|_| "停止已请求，但审批数据库忙或锁损坏，持久撤销未完成")?;
+    revoke_with_reason(&conn, conversation, reason)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn revoke_conversation(conn: &Connection, conversation: &str) -> Result<usize, String> {
+    revoke_with_reason(conn, conversation, StopReason::User)
+}
+
+fn revoke_with_reason(
+    conn: &Connection,
+    conversation: &str,
+    reason: StopReason,
+) -> Result<usize, String> {
     conn.execute(
         "INSERT OR IGNORE INTO ota_approval_revocations(call_id,run_id,conversation_id,revoked_at,reason)
-         SELECT id,trace_id,conversation_id,?2,'user_stop' FROM tool_runs
+         SELECT id,trace_id,conversation_id,?2,?3 FROM tool_runs
          WHERE conversation_id=?1 AND tool_name='ota_pack'
          AND status IN ('prepared','running','verifying','recovery_required','stuck')",
-        rusqlite::params![conversation, chrono::Utc::now().timestamp_millis()],
+        rusqlite::params![conversation, chrono::Utc::now().timestamp_millis(), reason.as_str()],
     ).map_err(|error| format!("OTA 审批撤销持久化失败：{error}"))
 }
 
@@ -333,6 +375,55 @@ mod tests {
         conn.execute_batch("UPDATE tool_runs SET id='new-call'")
             .unwrap();
         assert!(tool_key(&conn, "run", "conversation", "new-call", "prepared").is_ok());
+    }
+
+    #[test]
+    fn stop_signal_survives_database_failure() {
+        let conversation = uuid::Uuid::new_v4().to_string();
+        let db = crate::db::DbState(std::sync::Arc::new(std::sync::Mutex::new(
+            Connection::open_in_memory().unwrap(),
+        )));
+        let before = crate::agent::exec_ctx::stop_generation(&conversation);
+        assert!(stop_and_revoke(&db, &conversation, StopReason::Timeout).is_err());
+        assert_ne!(
+            crate::agent::exec_ctx::stop_generation(&conversation),
+            before
+        );
+    }
+
+    #[test]
+    fn occupied_database_does_not_block_local_stop() {
+        let conversation = uuid::Uuid::new_v4().to_string();
+        let db = crate::db::DbState(std::sync::Arc::new(std::sync::Mutex::new(fixture())));
+        let _guard = db.0.lock().unwrap();
+        let before = crate::agent::exec_ctx::stop_generation(&conversation);
+        assert!(stop_and_revoke(&db, &conversation, StopReason::Watchdog).is_err());
+        assert_ne!(
+            crate::agent::exec_ctx::stop_generation(&conversation),
+            before
+        );
+    }
+
+    #[test]
+    fn internal_stop_reasons_are_persisted_and_first_cause_is_preserved() {
+        for reason in [
+            StopReason::User,
+            StopReason::Timeout,
+            StopReason::Watchdog,
+            StopReason::ConversationDeleted,
+        ] {
+            let conn = fixture();
+            revoke_with_reason(&conn, "conversation", reason).unwrap();
+            revoke_with_reason(&conn, "conversation", StopReason::User).unwrap();
+            let recorded: String = conn
+                .query_row(
+                    "SELECT reason FROM ota_approval_revocations WHERE call_id='call'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded, reason.as_str());
+        }
     }
 
     #[test]

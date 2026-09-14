@@ -387,7 +387,13 @@ fn watchdog_loop(app: AppHandle) {
                     plans.retain(|_, pending| pending.conversation_id != cid);
                 }
                 crate::agent::ask::cancel_conversation(&cid);
-                crate::agent::exec_ctx::request_stop_tool(&cid);
+                if let Err(error) = crate::agent::broker_approval::stop_and_revoke(
+                    &app.state::<crate::db::DbState>(), &cid,
+                    crate::agent::broker_approval::StopReason::Watchdog,
+                ) {
+                    crate::utils::logger::log_event("ota_approval_revocation_failed",
+                        serde_json::json!({"source":"watchdog","error":error}));
+                }
                 task.abort.abort();
                 if !run_id.is_empty() {
                     crate::agent::runtime::transition_global(
