@@ -119,7 +119,7 @@ pub(crate) fn verify_ota_capability(
     ctx: &crate::agent::exec_ctx::ToolCtx,
     capability: &super::capability_broker::HostCapability,
     workspace: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<super::ota_scope::OtaScope, String> {
     let call = ctx.tool_call_id.as_deref().ok_or("OTA 缺少工具调用 ID")?;
     let app = ctx.app.as_ref().ok_or("OTA 缺少持久审批数据库")?;
     let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
@@ -130,7 +130,7 @@ pub(crate) fn verify_ota_capability(
     if approved != super::ota_scope::capability_scope(capability, workspace)? {
         return Err("Broker 拒绝执行：OTA 能力参数或输入内容与审批快照不一致".into());
     }
-    Ok(())
+    Ok(approved)
 }
 
 #[cfg(test)]

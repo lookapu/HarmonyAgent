@@ -33,6 +33,7 @@ pub mod crash;
 pub mod capability_broker;
 pub(crate) mod broker_approval;
 pub(crate) mod ota_scope;
+pub(crate) mod ota_inputs;
 pub mod runtime_log;
 pub mod runtime;
 pub mod exec_ctx;

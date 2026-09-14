@@ -11,6 +11,15 @@ pub(crate) struct OtaScope {
     profile_sha256: Option<String>,
 }
 
+impl OtaScope {
+    pub(crate) fn hap_digest(&self) -> &str {
+        &self.hap_sha256
+    }
+    pub(crate) fn profile_digest(&self) -> Option<&str> {
+        self.profile_sha256.as_deref()
+    }
+}
+
 pub(crate) fn staging_directory(destination: &Path) -> Result<PathBuf, String> {
     let parent = destination.parent().ok_or("OTA 输出缺少父目录")?;
     let name = destination.file_name().ok_or("OTA 输出缺少文件名")?;
