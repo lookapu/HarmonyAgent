@@ -67,6 +67,8 @@ export interface ChatErrorDetail {
 /** Agent 工具执行状态（实时卡片） */
 export interface ToolRun {
   id: string
+  /** 后端持久调用 ID，不是 UI 列表 ID。 */
+  callId?: string
   tool: string
   args: string
   status: 'running' | 'done' | 'error'

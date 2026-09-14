@@ -826,6 +826,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           ...state.toolRuns,
           {
             id: call_id ? `tool-call-${call_id}` : `tool-${Date.now()}-${toolSeq++}`,
+            callId: call_id,
             tool,
             args,
             status: 'running',

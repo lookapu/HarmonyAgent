@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { revokeOtaApproval } from '../../api/project'
 import { ToolRunGroup, ToolRunRow } from './toolRuns'
 import type { ToolRun } from '../../stores/projectStore'
 
@@ -7,6 +8,7 @@ import type { ToolRun } from '../../stores/projectStore'
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
 }))
+vi.mock('../../api/project', () => ({ revokeOtaApproval: vi.fn() }))
 
 const run = (over: Partial<ToolRun> = {}): ToolRun => ({
   id: 'r1',
@@ -18,6 +20,26 @@ const run = (over: Partial<ToolRun> = {}): ToolRun => ({
 })
 
 describe('ToolRunGroup', () => {
+  it('缺少真实调用 ID 时不提供撤销按钮', () => {
+    render(<ToolRunRow run={run({ tool: 'ota_pack', status: 'running' })} />)
+    expect(screen.queryByRole('button', { name: 'home.revokeOtaApproval' })).not.toBeInTheDocument()
+  })
+  it('OTA 独立撤销发送精确调用 ID，成功后禁用按钮', async () => {
+    vi.mocked(revokeOtaApproval).mockResolvedValueOnce(undefined)
+    render(<ToolRunRow run={run({ id: 'tool-call-ota-call', callId: 'ota-call', tool: 'ota_pack', status: 'running' })} />)
+    fireEvent.click(screen.getByRole('button', { name: 'home.revokeOtaApproval' }))
+    await waitFor(() => expect(revokeOtaApproval).toHaveBeenCalledWith('ota-call'))
+    expect(await screen.findByRole('button', { name: 'home.otaApprovalRevoked' })).toBeDisabled()
+    expect(screen.getByRole('status')).toHaveTextContent('home.otaRevokeNotice')
+  })
+
+  it('撤销失败可重试，不虚报成功', async () => {
+    vi.mocked(revokeOtaApproval).mockRejectedValueOnce(new Error('database busy'))
+    render(<ToolRunRow run={run({ callId: 'ota-call', tool: 'ota_pack', status: 'running' })} />)
+    fireEvent.click(screen.getByRole('button', { name: 'home.revokeOtaApproval' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('database busy')
+    expect(screen.getByRole('button', { name: 'home.revokeOtaApproval' })).toBeEnabled()
+  })
   it('折叠态展示工具名与完成计数', () => {
     render(<ToolRunGroup runs={[run(), run({ id: 'r2', tool: 'write_file' })]} />)
     expect(screen.getByText(/write_file/)).toBeInTheDocument() // 折叠态仅显示最后一次调用

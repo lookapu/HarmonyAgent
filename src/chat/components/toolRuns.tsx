@@ -6,6 +6,7 @@ import { AnsiText, hasAnsi } from '../../components/AnsiText'
 import { fmtElapsed } from '../chatUtils'
 import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
+import { revokeOtaApproval } from '../../api/project'
 
 type MutationGuardKind = 'syntax' | 'rollback' | 'stale'
 
@@ -109,6 +110,21 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
     })
   }
   const [copied, setCopied] = useState(false)
+  const [revocation, setRevocation] = useState<'idle' | 'pending' | 'done'>('idle')
+  const [revocationError, setRevocationError] = useState('')
+  useEffect(() => { setRevocation('idle'); setRevocationError('') }, [run.id])
+  const revokeApproval = async () => {
+    if (revocation !== 'idle' || !run.callId) return
+    setRevocation('pending')
+    setRevocationError('')
+    try {
+      await revokeOtaApproval(run.callId)
+      setRevocation('done')
+    } catch (error) {
+      setRevocation('idle')
+      setRevocationError(String(error))
+    }
+  }
   // running 态计时：每秒刷新已运行时长（静默执行的工具也能看到进度）
   const [elapsed, setElapsed] = useState(0)
   useEffect(() => {
@@ -203,6 +219,16 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
         </span>
         {(done || running) && <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />}
       </button>
+      {run.tool === 'ota_pack' && run.callId && (running || revocation === 'done') && (
+        <div className="px-3 py-2 text-xs text-[var(--text-secondary)]">
+          <button type="button" onClick={revokeApproval} disabled={revocation !== 'idle'}
+            className="text-[var(--danger)] disabled:opacity-60">
+            {t(revocation === 'done' ? 'home.otaApprovalRevoked' : revocation === 'pending' ? 'home.otaApprovalRevoking' : 'home.revokeOtaApproval')}
+          </button>
+          <p role="status">{t('home.otaRevokeNotice')}</p>
+          {revocationError && <p role="alert">{revocationError}</p>}
+        </div>
+      )}
       {(done || running) && open && (
         <div className="bg-[#0d1117] border-t border-[var(--border)]">
           {/* 终端标题栏：mac 圆点 + 工具名 + 状态 + 复制输出 */}

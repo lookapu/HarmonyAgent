@@ -3,6 +3,29 @@ use rusqlite::{Connection, OptionalExtension};
 
 const EVENT: &str = "host_capability.explicit_approval";
 
+/// 仅撤销指定 OTA 调用，不发送会话级停止信号或影响其他工具。
+pub(crate) fn revoke_call(conn: &Connection, call: &str) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let eligible: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_runs WHERE id=?1 AND tool_name='ota_pack'
+         AND status IN ('prepared','running','verifying','recovery_required','stuck'))",
+            [call],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !eligible {
+        return Err("目标不是可撤销的 OTA 调用，可能已经结束".into());
+    }
+    tx.execute("INSERT OR IGNORE INTO ota_approval_revocations(call_id,run_id,conversation_id,revoked_at,reason)
+        SELECT id,trace_id,conversation_id,?2,'user_revoke_call' FROM tool_runs WHERE id=?1",
+        rusqlite::params![call, chrono::Utc::now().timestamp_millis()],
+    ).map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum StopReason {
     User,
@@ -402,6 +425,27 @@ mod tests {
             crate::agent::exec_ctx::stop_generation(&conversation),
             before
         );
+    }
+
+    #[test]
+    fn targeted_revocation_is_exact_and_rejects_finished_or_unrelated_tools() {
+        let conn = fixture();
+        conn.execute_batch("INSERT INTO tool_runs VALUES('other','run','conversation','ota_pack','running','key');
+            INSERT INTO tool_runs VALUES('read','run','conversation','read_file','running','key');
+            INSERT INTO tool_runs VALUES('done','run','conversation','ota_pack','succeeded','key');").unwrap();
+        revoke_call(&conn, "call").unwrap();
+        revoke_call(&conn, "call").unwrap();
+        assert!(require_not_revoked(&conn, "call").is_err());
+        assert!(require_not_revoked(&conn, "other").is_ok());
+        for call in ["missing", "read", "done"] {
+            assert!(revoke_call(&conn, call).is_err());
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ota_approval_revocations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

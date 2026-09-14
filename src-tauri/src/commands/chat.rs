@@ -1399,6 +1399,12 @@ pub fn stop_tool(conversation_id: String, db: State<'_, DbState>) -> Result<(), 
     Ok(())
 }
 
+#[tauri::command]
+pub fn revoke_ota_approval(call_id: String, db: State<'_, DbState>) -> Result<(), String> {
+    let conn = db.0.try_lock().map_err(|_| "审批数据库忙，请稍后重试撤销")?;
+    crate::agent::broker_approval::revoke_call(&conn, &call_id)
+}
+
 /// 取最早一条排队消息并标记为已消费（queued=0），返回 (id, content)。
 /// agent_only=true 时仅消费"发送到 Agent"的挂起消息（任务运行中由安全点并入）；
 /// false 时消费任意排队消息（任务结束后自动续跑，含未并入的挂起消息）。
