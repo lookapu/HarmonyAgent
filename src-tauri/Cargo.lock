@@ -1173,6 +1173,7 @@ dependencies = [
  "trash",
  "tree-sitter",
  "tree-sitter-arkts",
+ "tree-sitter-java",
  "tree-sitter-typescript",
  "url",
  "uuid",
@@ -6536,6 +6537,16 @@ name = "tree-sitter-arkts"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a57ea8f49745a1c7687ed0625540aa0b189977ece05954b266d5869214b904cb"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-java"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6"
 dependencies = [
  "cc",
  "tree-sitter-language",

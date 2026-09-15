@@ -4678,6 +4678,33 @@ mod tests {
     }
 
     #[test]
+    fn java_ast_guard_rejects_write_edit_and_multi_edit_before_disk_changes() {
+        let original = "class A { int value = 1; }\n";
+        let (first, roots) = tmp_file("java_ast_transaction", original, "java");
+        let second = first.parent().unwrap().join("B.java");
+        std::fs::write(&second, "class B { int value = 1; }\n").unwrap();
+        for path in [&first, &second] {
+            block_on_rt(read_file(&serde_json::json!({"path": path.to_string_lossy()}), &roots)).unwrap();
+        }
+        let error = block_on_rt(write_file(&serde_json::json!({
+            "path": first.to_string_lossy(), "content": "class A { @Override int value = 1; }\n"
+        }), &roots, "java_ast_write")).unwrap_err();
+        assert!(error.contains("Java 声明门禁"), "{error}");
+        let error = block_on_rt(edit_file(&serde_json::json!({
+            "path": first.to_string_lossy(), "old": "= 1", "new": "="
+        }), &roots, "java_ast_edit")).unwrap_err();
+        assert!(error.contains("Java 声明门禁"), "{error}");
+        let result = block_on_rt(multi_edit(&serde_json::json!({"edits": [
+            {"path": first.to_string_lossy(), "old": "= 1", "new": "= 2"},
+            {"path": second.to_string_lossy(), "old": "= 1", "new": "="}
+        ]}), &roots, "java_ast_multi"));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "class B { int value = 1; }\n");
+        std::fs::remove_dir_all(first.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn edit_file_batch_replace_and_delete() {
         // 批量模式：一次替换 fn a、删除 fn c，中间 fn b 不受影响
         let dir = std::env::temp_dir().join(format!("ef_batch_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));

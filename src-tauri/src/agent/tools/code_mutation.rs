@@ -1,7 +1,7 @@
 //! 代码写入前的统一候选验证。
 //!
 //! 所有文件修改工具先在内存中形成完整候选文本，再经过这里的语言门禁。当前 P0 在
-//! 通用配平守卫之上为 ArkTS/TypeScript/JavaScript 提供真实语法树错误增量检查；其它
+//! 通用配平守卫之上为 ArkTS/TypeScript/JavaScript/Java 提供真实语法树错误增量检查；其它
 //! 语言明确回退配平层，后续由 language adapter 逐步补齐，不能把 fallback 冒充 AST。
 
 use std::path::Path;
@@ -23,12 +23,23 @@ fn tree_sitter_language(ext: &str) -> Option<tree_sitter::Language> {
 }
 
 fn syntax_error_count(node: tree_sitter::Node<'_>) -> usize {
-    let own = usize::from(node.is_error() || node.is_missing());
     let mut cursor = node.walk();
-    own + node
-        .children(&mut cursor)
-        .map(syntax_error_count)
-        .sum::<usize>()
+    let mut errors = 0;
+    loop {
+        let node = cursor.node();
+        errors += usize::from(node.is_error() || node.is_missing());
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return errors;
+            }
+        }
+    }
 }
 
 fn parse_error_count(language: &tree_sitter::Language, text: &str) -> Result<usize, String> {
@@ -42,106 +53,62 @@ fn parse_error_count(language: &tree_sitter::Language, text: &str) -> Result<usi
     Ok(syntax_error_count(tree.root_node()))
 }
 
-fn strip_leading_java_annotation(line: &str) -> &str {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with('@') {
-        return trimmed;
-    }
-    let mut depth = 0_i32;
-    let mut saw_paren = false;
-    for (index, ch) in trimmed.char_indices() {
-        match ch {
-            '(' => {
-                saw_paren = true;
-                depth += 1;
-            }
-            ')' if depth > 0 => depth -= 1,
-            c if c.is_whitespace() && (!saw_paren || depth == 0) => {
-                return trimmed[index..].trim_start();
-            }
-            _ => {}
-        }
-    }
-    ""
-}
-
-fn java_annotation_name(line: &str) -> Option<&'static str> {
-    let token = line.trim_start().split(['(', ' ', '\t']).next()?;
-    match token.rsplit('.').next()? {
-        "@Override" | "Override" => Some("@Override"),
-        "@Resource" | "Resource" => Some("@Resource"),
-        _ => None,
-    }
-}
-
-fn contains_java_type_declaration(candidate: &str) -> bool {
-    ["class", "interface", "record", "enum"]
-        .iter()
-        .any(|keyword| {
-            candidate
-                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-                .any(|word| word == *keyword)
-        })
-}
-
-fn looks_like_java_declaration(annotation: &str, candidate: &str) -> bool {
-    let candidate = candidate.trim();
-    if candidate.is_empty() || candidate.starts_with('}') {
-        return false;
-    }
-    if annotation == "@Resource" && contains_java_type_declaration(candidate) {
-        return true;
-    }
-    if let Some(open) = candidate.find('(') {
-        let prefix = candidate[..open].trim();
-        let has_declaration_prefix = prefix.split_whitespace().count() >= 2;
-        return has_declaration_prefix && (candidate.contains('{') || candidate.contains(';'));
-    }
-    let field_prefix = candidate.split('=').next().unwrap_or_default();
-    annotation == "@Resource"
-        && candidate.contains(';')
-        && !candidate.contains('(')
-        && field_prefix.split_whitespace().count() >= 2
-}
-
-/// Java parser/JDT 不可用时的 fail-before-write 补强：至少阻止删除声明时遗留最常见的
-/// `@Override` / `@Resource`。只比较新增违规数，允许修复原本已损坏的文件。
-fn java_orphan_annotation_count(text: &str) -> usize {
-    let lines = text.lines().collect::<Vec<_>>();
-    let mut violations = 0;
-    for (index, line) in lines.iter().enumerate() {
-        let Some(annotation) = java_annotation_name(line) else {
-            continue;
-        };
-        let mut candidate = strip_leading_java_annotation(line).to_string();
-        for next in lines.iter().skip(index + 1).take(12) {
-            let trimmed = next.trim();
-            if trimmed.is_empty()
-                || trimmed.starts_with("//")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with('*')
-            {
-                continue;
-            }
-            if trimmed.starts_with('@') {
-                let remainder = strip_leading_java_annotation(trimmed);
-                if !remainder.is_empty() {
-                    candidate.push(' ');
-                    candidate.push_str(remainder);
+/// 依据真实 AST 判断注解所附着的声明，不扫描注释、字符串或猜测后续行。
+/// 仅检查常见标准注解的声明种类，不解析继承、classpath 或依赖注入类型。
+fn java_analysis(text: &str) -> Result<(usize, usize), String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .map_err(|error| format!("初始化 Java 语法解析器失败：{error}"))?;
+    let tree = parser.parse(text, None).ok_or("Java 解析器未返回语法树")?;
+    let mut syntax = 0;
+    let mut declarations = 0;
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        syntax += usize::from(node.is_error() || node.is_missing());
+        if matches!(node.kind(), "marker_annotation" | "annotation") {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+                .unwrap_or_default();
+            let target = node
+                .parent()
+                .filter(|parent| parent.kind() == "modifiers")
+                .and_then(|modifiers| modifiers.parent())
+                .map(|target| target.kind());
+            let valid = match name {
+                "Override" | "java.lang.Override" => target == Some("method_declaration"),
+                "Resource" | "javax.annotation.Resource" | "jakarta.annotation.Resource" => {
+                    matches!(
+                        target,
+                        Some(
+                            "field_declaration"
+                                | "method_declaration"
+                                | "class_declaration"
+                                | "interface_declaration"
+                                | "enum_declaration"
+                                | "record_declaration"
+                                | "annotation_type_declaration"
+                        )
+                    )
                 }
-                continue;
-            }
-            candidate.push(' ');
-            candidate.push_str(trimmed);
-            if trimmed.starts_with('}') || trimmed.contains('{') || trimmed.contains(';') {
+                _ => true,
+            };
+            declarations += usize::from(!valid);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
                 break;
             }
-        }
-        if !looks_like_java_declaration(annotation, &candidate) {
-            violations += 1;
+            if !cursor.goto_parent() {
+                return Ok((syntax, declarations));
+            }
         }
     }
-    violations
 }
 
 /// 验证内存中的完整候选文件。原文件已有语法错误时允许错误数下降或保持，不允许增加；
@@ -158,18 +125,18 @@ pub(super) fn validate_candidate(
         .to_ascii_lowercase();
     super::fs_tools::balance_guard(before, after, &ext)?;
     if ext == "java" {
-        let before_errors = java_orphan_annotation_count(before);
-        let after_errors = java_orphan_annotation_count(after);
-        if after_errors > before_errors {
+        let (before_syntax, before_declarations) = java_analysis(before)?;
+        let (after_syntax, after_declarations) = java_analysis(after)?;
+        if after_syntax > before_syntax || after_declarations > before_declarations {
             return Err(format!(
-                "代码修改事务被 Java 声明门禁拒绝：{} 中游离的 @Override/@Resource 注解由 {} 增至 {}。候选内容未落盘；删除字段或方法时必须连同其注解一起修改。",
-                path.display(), before_errors, after_errors
+                "代码修改事务被 Java 声明门禁拒绝：{} 的语法错误 {}→{}，@Override/@Resource 声明目标错误 {}→{}。候选内容未落盘；请修改完整声明及其注解。此检查不替代 Java 编译器类型检查。",
+                path.display(), before_syntax, after_syntax, before_declarations, after_declarations
             ));
         }
         return Ok(MutationGuardReport {
-            parser: "java_declaration_guard",
-            before_errors,
-            after_errors,
+            parser: "java_tree_sitter",
+            before_errors: before_syntax + before_declarations,
+            after_errors: after_syntax + after_declarations,
         });
     }
     let Some(language) = tree_sitter_language(&ext) else {
@@ -242,8 +209,77 @@ mod tests {
             "class A {\n}\n",
         )
         .unwrap();
-        assert_eq!(report.parser, "java_declaration_guard");
+        assert_eq!(report.parser, "java_tree_sitter");
         assert_eq!(report.after_errors, 0);
+    }
+
+    #[test]
+    fn java_ast_rejects_balanced_invalid_syntax_and_wrong_annotation_targets() {
+        let before = "class A {}";
+        for after in [
+            "class A { int value = ; }",
+            "class A { @Override int value; }",
+            "class A { @Override A() {} }",
+            "class A { @javax.annotation.Resource A() {} }",
+        ] {
+            assert!(
+                validate_candidate(Path::new("A.java"), before, after).is_err(),
+                "{after}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_ast_ignores_comments_and_supports_multiline_annotation_arguments() {
+        let after = r#"class A {
+            /*
+             @Override
+             @Resource
+            */
+            String marker = "@Override";
+            @jakarta.annotation.Resource(
+                name = "service",
+                description = "a (quoted) description"
+            )
+            private Service service = new Service();
+            @java.lang.Override
+            public String toString() { return "A"; }
+        }"#;
+        let report = validate_candidate(Path::new("A.java"), "class A {}", after).unwrap();
+        assert_eq!(report.parser, "java_tree_sitter");
+        assert_eq!(report.after_errors, 0);
+    }
+
+    #[test]
+    fn java_ast_allows_repairs_but_does_not_trade_syntax_for_target_errors() {
+        let before = "class A { int value = ; }";
+        assert!(
+            validate_candidate(Path::new("A.java"), before, "class A { int value = 1; }").is_ok()
+        );
+        assert!(validate_candidate(
+            Path::new("A.java"),
+            before,
+            "class A { @Override int value = 1; }"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn java_ast_does_not_claim_type_resolution() {
+        // 语法树无法判断父类是否存在或方法是否真的 override；必须交给编译器/LSP。
+        let report = validate_candidate(
+            Path::new("A.java"),
+            "class A {}",
+            "class A extends MissingBase { @Override public void unknown() {} }",
+        )
+        .unwrap();
+        assert_eq!(report.after_errors, 0);
+        assert!(validate_candidate(
+            Path::new("A.java"),
+            "class A {}",
+            "class A { @custom.Override int value; }"
+        )
+        .is_ok());
     }
 
     #[test]

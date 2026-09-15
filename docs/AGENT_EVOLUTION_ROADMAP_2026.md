@@ -11,6 +11,8 @@
 
 以下保留 2026-09-10 起累计的阶段证据，历史数量和局部完成标记不覆盖上述最新状态。
 
+2026-09-15 补充：Java 候选写入门禁已从逐行注解启发式升级为 Tree-sitter Java AST，验证语法错误增量和标准 `@Override`/`@Resource` 的声明目标；write/edit/multi-edit 拒绝不落盘已测试。该实现仍不解析继承、classpath、import 使用关系，不替代 JDT/Javac 类型语义闭环。
+
 下面按“已落地并验证 / 部分落地 / 需外部基础设施”三类标注当前状态；每类的具体证据见对应章节与 [INDEX_SCALE_BASELINE.md](./INDEX_SCALE_BASELINE.md)。这里不把“单测通过”冒充“产品能力完成”。
 
 **已落地并通过测试/基准验证**
