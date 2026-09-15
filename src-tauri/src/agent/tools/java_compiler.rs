@@ -5,6 +5,8 @@
 //! **新出现**的编译诊断：新增即拒绝，修复或持平放行。
 //!
 //! 差分而非绝对判定：工程 classpath 未解析时依赖缺失会在基线与候选中同时出现并被抵消。
+//! 多文件事务把同批候选放在一起编译，因此“同一批里 A 改坏了 B 的调用”会被拦住；
+//! 但改动的文件破坏**未参与本批**的调用方仍不在覆盖内（那需要按引用反查受影响文件）。
 //! 无 javac 或编译超时不阻塞写入，但状态如实标注为「未做类型校验」——不得表述为已完成
 //! 类型检查，也不得据此宣称 Java 语义闭环完成。
 
@@ -28,8 +30,21 @@ pub(super) enum JavaTypeCheck {
     Unavailable { reason: String },
 }
 
-/// 对完整的候选文件做 javac 差分。只应在 `path` 为 .java 时调用。
+/// 单文件事务（write_file / edit_file 等）的差分校验。
 pub(super) fn check(path: &Path, before: &str, after: &str) -> JavaTypeCheck {
+    check_batch(&[(path, before, after)])
+}
+
+/// 批量联编差分：同批候选作为一次 javac 调用的显式输入，彼此引用解析到候选版本，
+/// 因此能拦住单文件校验看不到的“同批跨文件类型破坏”。空批次视为无诊断。
+pub(super) fn check_batch(files: &[(&Path, &str, &str)]) -> JavaTypeCheck {
+    if files.is_empty() {
+        return JavaTypeCheck::Checked {
+            before: 0,
+            after: 0,
+            added: Vec::new(),
+        };
+    }
     let work = match work_dir() {
         Some(dir) => dir,
         None => {
@@ -38,52 +53,70 @@ pub(super) fn check(path: &Path, before: &str, after: &str) -> JavaTypeCheck {
             }
         }
     };
-    let result = run(&work, path, before, after);
+    let result = run(&work, files);
     let _ = std::fs::remove_dir_all(&work);
     result
 }
 
-fn run(work: &Path, path: &Path, before: &str, after: &str) -> JavaTypeCheck {
-    let package = package_declaration(after);
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("Candidate.java");
-    let relative = package_path(&package, name);
-    let out = work.join("out");
-    if let Err(error) = std::fs::create_dir_all(&out) {
-        return JavaTypeCheck::Unavailable {
-            reason: format!("创建 javac 输出目录失败：{error}"),
-        };
+fn run(work: &Path, files: &[(&Path, &str, &str)]) -> JavaTypeCheck {
+    let candidate_root = work.join("candidate");
+    let baseline_root = work.join("baseline");
+    let out_candidate = work.join("out-candidate");
+    let out_baseline = work.join("out-baseline");
+    for dir in [&candidate_root, &baseline_root, &out_candidate, &out_baseline] {
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            return JavaTypeCheck::Unavailable {
+                reason: format!("创建 javac 临时目录失败：{error}"),
+            };
+        }
     }
-    let candidate_file = work.join("candidate").join(&relative);
-    if let Err(error) = write_source(&candidate_file, after) {
-        return JavaTypeCheck::Unavailable { reason: error };
+    // 每个文件按包名落到两侧的源码根，得到 <侧>/<包路径>/<文件名>；两侧相对路径一致，
+    // 诊断签名才可能逐条可比（绝对临时路径被剥掉）。
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut candidate_files = Vec::with_capacity(files.len());
+    let mut baseline_files = Vec::with_capacity(files.len());
+    for (path, before, after) in files {
+        let package = package_declaration(after);
+        let rel = package_path(&package, file_name(path));
+        push_root(&mut roots, source_root(path, &package));
+        if let Some(parent) = path.parent() {
+            push_root(&mut roots, parent.to_path_buf());
+        }
+        let candidate_file = candidate_root.join(&rel);
+        if let Err(reason) = write_source(&candidate_file, after) {
+            return JavaTypeCheck::Unavailable { reason };
+        }
+        let baseline_file = baseline_root.join(&rel);
+        if let Err(reason) = write_source(&baseline_file, before) {
+            return JavaTypeCheck::Unavailable { reason };
+        }
+        candidate_files.push(candidate_file);
+        baseline_files.push(baseline_file);
     }
-    let source_path = source_root(path, &package);
-    // 快速路径：候选自包含且无诊断时无需基线，省掉一次编译。
-    let candidate_errors = match compile(&candidate_file, &out, &source_path) {
-        Ok(Some(errors)) => errors,
+    let candidate = match compile(
+        &candidate_files,
+        &candidate_root,
+        &roots,
+        &out_candidate,
+    ) {
+        Ok(Some(diagnostics)) => diagnostics,
         Ok(None) => {
             return JavaTypeCheck::Unavailable {
-                reason: format!("javac 编译超时（>{}s）", COMPILE_TIMEOUT.as_secs()),
+                reason: format!("javac 候选编译超时（>{}s）", COMPILE_TIMEOUT.as_secs()),
             }
         }
         Err(reason) => return JavaTypeCheck::Unavailable { reason },
     };
-    if candidate_errors.is_empty() {
+    // 快速路径：候选自包含且无诊断时无需基线，省掉一次编译。
+    if candidate.is_empty() {
         return JavaTypeCheck::Checked {
             before: 0,
             after: 0,
             added: Vec::new(),
         };
     }
-    let baseline_file = work.join("baseline").join(&relative);
-    if let Err(error) = write_source(&baseline_file, before) {
-        return JavaTypeCheck::Unavailable { reason: error };
-    }
-    let baseline_errors = match compile(&baseline_file, &out, &source_path) {
-        Ok(Some(errors)) => errors,
+    let baseline = match compile(&baseline_files, &baseline_root, &roots, &out_baseline) {
+        Ok(Some(diagnostics)) => diagnostics,
         Ok(None) => {
             return JavaTypeCheck::Unavailable {
                 reason: format!("javac 基线编译超时（>{}s）", COMPILE_TIMEOUT.as_secs()),
@@ -92,9 +125,9 @@ fn run(work: &Path, path: &Path, before: &str, after: &str) -> JavaTypeCheck {
         Err(reason) => return JavaTypeCheck::Unavailable { reason },
     };
     JavaTypeCheck::Checked {
-        before: baseline_errors.len(),
-        after: candidate_errors.len(),
-        added: added_signatures(&baseline_errors, &candidate_errors),
+        before: baseline.len(),
+        after: candidate.len(),
+        added: added_signatures(&baseline, &candidate),
     }
 }
 
@@ -107,6 +140,18 @@ fn work_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+fn push_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if root.is_dir() && !roots.contains(&root) {
+        roots.push(root);
+    }
+}
+
+fn file_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Candidate.java")
+}
+
 fn write_source(file: &Path, source: &str) -> Result<(), String> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)
@@ -115,8 +160,14 @@ fn write_source(file: &Path, source: &str) -> Result<(), String> {
     std::fs::write(file, source).map_err(|error| format!("写入 javac 候选源码失败：{error}"))
 }
 
-/// 编译单个源文件；返回归一化后的诊断签名（空 = 无错），`None` 表示超时。
-fn compile(file: &Path, out: &Path, source_path: &Path) -> Result<Option<Vec<String>>, String> {
+/// 编译显式给出的源文件集合；返回归一化后的诊断签名（空 = 无错），`None` 表示超时。
+/// `shadow_root` 是本次候选/基线各自的源码根，用于把诊断里的绝对路径还原成相对路径。
+fn compile(
+    files: &[PathBuf],
+    shadow_root: &Path,
+    roots: &[PathBuf],
+    out: &Path,
+) -> Result<Option<Vec<String>>, String> {
     let mut args = vec![
         "-proc:none".to_string(),
         "-nowarn".to_string(),
@@ -128,11 +179,16 @@ fn compile(file: &Path, out: &Path, source_path: &Path) -> Result<Option<Vec<Str
         "-d".to_string(),
         out.to_string_lossy().to_string(),
     ];
-    if source_path.is_dir() {
+    // 影子根放最前：本批未显式给出的同类文件优先解析到候选版本，其次才回落到真实源码根
+    let mut search = vec![shadow_root.to_path_buf()];
+    search.extend(roots.iter().cloned());
+    if let Ok(joined) = std::env::join_paths(&search) {
         args.push("-sourcepath".to_string());
-        args.push(source_path.to_string_lossy().to_string());
+        args.push(joined.to_string_lossy().to_string());
     }
-    args.push(file.to_string_lossy().to_string());
+    for file in files {
+        args.push(file.to_string_lossy().to_string());
+    }
     let captured = crate::utils::process::output_stderr_blocking_with_timeout(
         "javac",
         &args,
@@ -145,20 +201,21 @@ fn compile(file: &Path, out: &Path, source_path: &Path) -> Result<Option<Vec<Str
     if code == 0 {
         return Ok(Some(Vec::new()));
     }
-    Ok(Some(diagnostic_signatures(&stderr)))
+    Ok(Some(diagnostic_signatures(&stderr, shadow_root)))
 }
 
-/// 把 javac stderr 归一化为可比较的诊断签名：去掉文件路径与行列号，保留错误消息和
-/// `symbol/location/required/found/reason` 细节行——行号随编辑漂移不会产生假新增。
-fn diagnostic_signatures(stderr: &str) -> Vec<String> {
+/// 把 javac stderr 归一化为可比较的诊断签名：去掉行号与临时根路径（保留相对文件位置），
+/// 保留错误消息和 `symbol/location/required/found/reason` 细节行——行号随编辑漂移不会
+/// 产生假新增，同时仍能指出是哪个文件出的问题。
+fn diagnostic_signatures(stderr: &str, shadow_root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut current: Vec<String> = Vec::new();
     for line in stderr.lines() {
-        if let Some(message) = header_message(line) {
+        if let Some((location, message)) = header_parts(line) {
             if !current.is_empty() {
                 out.push(current.join(" | "));
             }
-            current = vec![message.trim().to_string()];
+            current = vec![normalize_location(location, shadow_root), message.trim().to_string()];
             continue;
         }
         if current.is_empty() {
@@ -189,16 +246,26 @@ fn diagnostic_signatures(stderr: &str) -> Vec<String> {
         .collect()
 }
 
-/// 识别 `路径:行号: error: 消息` 诊断头（源码回显与脱字符行不匹配）。
-fn header_message(line: &str) -> Option<&str> {
+/// 识别 `路径:行号: error: 消息` 诊断头（源码回显与脱字符行不匹配），
+/// 返回（路径，消息）；行号被丢弃，路径交给调用方归一化。
+fn header_parts(line: &str) -> Option<(&str, &str)> {
     const MARKER: &str = ": error: ";
     let index = line.find(MARKER)?;
     let (prefix, message) = (&line[..index], &line[index + MARKER.len()..]);
-    let (_, line_no) = prefix.rsplit_once(':')?;
+    let (location, line_no) = prefix.rsplit_once(':')?;
     line_no
         .chars()
         .all(|c| c.is_ascii_digit())
-        .then_some(message)
+        .then_some((location, message))
+}
+
+/// 把影子根下的绝对路径还原成相对路径；影子根之外（真实工程文件）保持原样——两侧
+/// 指向同一真实文件，字符串相同即可抵消。
+fn normalize_location(location: &str, shadow_root: &Path) -> String {
+    match Path::new(location).strip_prefix(shadow_root) {
+        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+        Err(_) => location.to_string(),
+    }
 }
 
 /// 候选相对基线新增的诊断（按签名计数，同一诊断多出一次也算新增）。
@@ -304,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_signatures_drop_path_and_line_but_keep_symbol_details() {
+    fn diagnostic_signatures_drop_line_but_keep_relative_file_and_symbol_details() {
         let stderr = "\
 /tmp/x/a/A.java:2: error: cannot find symbol
 class A { void f() { Foo x = null; } }
@@ -313,9 +380,12 @@ class A { void f() { Foo x = null; } }
   location: class A
 2 errors
 ";
-        let signatures = diagnostic_signatures(stderr);
+        let signatures = diagnostic_signatures(stderr, Path::new("/tmp/x"));
         assert_eq!(signatures.len(), 1);
-        assert_eq!(signatures[0], "cannot find symbol | symbol: class Foo | location: class A");
+        assert_eq!(
+            signatures[0],
+            "a/A.java | cannot find symbol | symbol: class Foo | location: class A"
+        );
     }
 
     #[test]
@@ -328,25 +398,28 @@ public class B {}
        ^
 1 error
 ";
-        let signatures = diagnostic_signatures(stderr);
+        let signatures = diagnostic_signatures(stderr, Path::new("/"));
         assert_eq!(signatures.len(), 1);
-        assert!(signatures[0].starts_with("class B is public"));
+        assert_eq!(
+            signatures[0],
+            "A.java | class B is public, should be declared in a file named B.java"
+        );
     }
 
     #[test]
     fn added_signatures_counts_repeats_and_orders_stably() {
-        let before = vec!["cannot find symbol | symbol: class Foo".to_string()];
+        let before = vec!["a/A.java | cannot find symbol | symbol: class Foo".to_string()];
         let after = vec![
-            "cannot find symbol | symbol: class Foo".to_string(),
-            "cannot find symbol | symbol: class Foo".to_string(),
-            "cannot find symbol | symbol: class Bar".to_string(),
+            "a/A.java | cannot find symbol | symbol: class Foo".to_string(),
+            "a/A.java | cannot find symbol | symbol: class Foo".to_string(),
+            "a/A.java | cannot find symbol | symbol: class Bar".to_string(),
         ];
         let added = added_signatures(&before, &after);
         assert_eq!(
             added,
             vec![
-                "cannot find symbol | symbol: class Bar".to_string(),
-                "cannot find symbol | symbol: class Foo".to_string()
+                "a/A.java | cannot find symbol | symbol: class Bar".to_string(),
+                "a/A.java | cannot find symbol | symbol: class Foo".to_string()
             ]
         );
     }
@@ -374,7 +447,10 @@ public class B {}
             source_root(path, "org.other"),
             PathBuf::from("/proj/src/main/java/com/foo")
         );
-        assert_eq!(source_root(path, ""), PathBuf::from("/proj/src/main/java/com/foo"));
+        assert_eq!(
+            source_root(path, ""),
+            PathBuf::from("/proj/src/main/java/com/foo")
+        );
     }
 
     #[test]
@@ -414,6 +490,7 @@ public class B {}
         };
         assert!(count > 0, "{added:?}");
         assert!(added.iter().any(|item| item.contains("class Bar")));
+        assert!(added.iter().all(|item| item.starts_with("a/A.java | ")), "{added:?}");
     }
 
     /// 既有诊断的行号随编辑漂移不能被当成新增（差分按签名计数，不按行列号）。
@@ -446,5 +523,53 @@ public class B {}
             return;
         };
         assert_eq!(count, 0, "{added:?}");
+    }
+
+    /// 同批候选一起编译：B 仍调用 A 已删除的方法，属于本批内部不一致，必须拦住。
+    #[test]
+    fn javac_batch_diff_catches_cross_file_breakage_inside_one_edit_batch() {
+        let a_before = "package a;\nclass A {\n  static int value() { return 1; }\n}\n";
+        let a_after = "package a;\nclass A {\n}\n";
+        let b_before = "package a;\nclass B {\n  int use() { return A.value(); }\n}\n";
+        let b_after = "package a;\n// 本批同时改动 B\nclass B {\n  int use() { return A.value(); }\n}\n";
+        let files = [
+            (Path::new("A.java"), a_before, a_after),
+            (Path::new("B.java"), b_before, b_after),
+        ];
+        let Some((count, added)) = checked_or_skip(check_batch(&files)) else {
+            return;
+        };
+        assert!(count > 0, "{added:?}");
+        assert!(
+            added.iter().any(|item| item.starts_with("a/B.java | ")),
+            "新增诊断应指向批内的调用方 B：{added:?}"
+        );
+    }
+
+    /// 反例：同批把调用方一起改对，联编不得误报。
+    #[test]
+    fn javac_batch_diff_accepts_consistent_multi_file_refactor() {
+        let a_before = "package a;\nclass A {\n  static int value() { return 1; }\n}\n";
+        let a_after = "package a;\nclass A {\n  static int amount() { return 1; }\n}\n";
+        let b_before = "package a;\nclass B {\n  int use() { return A.value(); }\n}\n";
+        let b_after = "package a;\nclass B {\n  int use() { return A.amount(); }\n}\n";
+        let files = [
+            (Path::new("A.java"), a_before, a_after),
+            (Path::new("B.java"), b_before, b_after),
+        ];
+        let Some((count, added)) = checked_or_skip(check_batch(&files)) else {
+            return;
+        };
+        assert_eq!(count, 0, "{added:?}");
+    }
+
+    #[test]
+    fn javac_batch_diff_treats_empty_batch_as_clean() {
+        match check_batch(&[]) {
+            JavaTypeCheck::Checked { before, after, added } => {
+                assert_eq!((before, after, added.len()), (0, 0, 0));
+            }
+            JavaTypeCheck::Unavailable { reason } => panic!("空批次不应触发编译：{reason}"),
+        }
     }
 }

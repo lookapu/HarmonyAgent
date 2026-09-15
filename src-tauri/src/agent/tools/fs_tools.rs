@@ -4010,6 +4010,9 @@ pub(super) async fn multi_edit(
         }
         prepared.push(item);
     }
+    // 类型门禁放在全部候选准备完成之后：同批 Java 候选一起编译，才能看到
+    // “本批把 A 改坏了、B 还在调用”这类单文件校验看不到的破坏。
+    validate_batch_types(&prepared)?;
     commit_prepared_edits(&prepared, conversation_id)?;
     Ok(format!(
         "批量编辑原子提交完成：{} 个文件\n{}",
@@ -4070,9 +4073,52 @@ fn prepare_single_edit(
         None => (false, text.as_str()),
     };
     let (replaced, count) = apply_edit(body, old, new, replace_all)?;
-    super::code_mutation::validate_candidate_with_types(&p, body, &replaced)?;
+    // 单文件先过语法/注解门禁（便宜且报错精确）；Java 的类型差分管线在整批准备完后
+    // 由 validate_batch_types 联编一次，既省掉 N 次 javac，又能覆盖批内跨文件破坏。
+    super::code_mutation::validate_candidate(&p, body, &replaced)?;
     let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced };
     Ok(PreparedEdit { path: p, old_bytes: bytes, final_text, count })
+}
+
+/// 多文件事务的 Java 类型门禁：把本批候选放在一起编译一次，只拦本批新引入的编译诊断。
+/// 非 Java 批次直接通过；无 javac 或超时降级为未校验（与单文件门禁同口径，不阻塞写入）。
+fn validate_batch_types(edits: &[PreparedEdit]) -> Result<(), String> {
+    let java_files: Vec<(&std::path::Path, &str, &str)> = edits
+        .iter()
+        .filter(|item| item.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("java")))
+        .map(|item| {
+            (
+                item.path.as_path(),
+                std::str::from_utf8(&item.old_bytes).unwrap_or_default(),
+                item.final_text.as_str(),
+            )
+        })
+        .collect();
+    if java_files.is_empty() {
+        return Ok(());
+    }
+    match super::java_compiler::check_batch(&java_files) {
+        super::java_compiler::JavaTypeCheck::Checked { before, after, added } => {
+            if added.is_empty() {
+                return Ok(());
+            }
+            let shown: Vec<String> = added.iter().take(3).cloned().collect();
+            Err(format!(
+                "代码修改事务被 Java 编译器门禁拒绝：本批 {} 个候选联编后 javac 诊断由 {} 条增至 {} 条，新增：{}。该批候选未写入任何文件；请修正引用的类型或补回仍在使用的 import 后重试。判定为同批候选联编，未解析工程 classpath。",
+                java_files.len(),
+                before,
+                after,
+                shown.join("；")
+            ))
+        }
+        super::java_compiler::JavaTypeCheck::Unavailable { reason } => {
+            crate::utils::logger::log_event(
+                "java_type_gate_unavailable",
+                serde_json::json!({ "files": java_files.len(), "reason": reason }),
+            );
+            Ok(())
+        }
+    }
 }
 
 fn commit_prepared_edits(edits: &[PreparedEdit], conversation_id: &str) -> Result<(), String> {
@@ -4747,6 +4793,85 @@ mod tests {
         assert!(result.is_err(), "第二个候选语法错误时应整体拒绝: {result:?}");
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "fn first() { old(); }\n");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "function second() { return 1; }\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 同批 Java 候选联编：本批删掉 A 的方法而 B 仍在调用，属于批内跨文件破坏，
+    /// 单文件校验看不到，必须在写入前整体拒绝；无 javac 环境按未校验降级。
+    #[test]
+    fn multi_edit_batch_gate_catches_cross_file_java_breakage() {
+        let dir = std::env::temp_dir().join(format!(
+            "multi_java_batch_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let a = dir.join("A.java");
+        let b = dir.join("B.java");
+        let a_src = "package a;\nclass A {\n  static int value() { return 1; }\n}\n";
+        let b_src = "package a;\nclass B {\n  int use() { return A.value(); }\n}\n";
+        let read_baseline = |path: &std::path::Path| {
+            block_on_rt(read_file(
+                &serde_json::json!({"path": path.to_string_lossy()}),
+                &roots,
+            ))
+            .expect("read establishes edit baseline");
+        };
+        std::fs::write(&a, a_src).unwrap();
+        std::fs::write(&b, b_src).unwrap();
+        read_baseline(&a);
+        read_baseline(&b);
+        let broken = block_on_rt(multi_edit(
+            &serde_json::json!({
+                "edits": [
+                    {"path": a.to_string_lossy(), "old": "  static int value() { return 1; }\n", "new": ""},
+                    {"path": b.to_string_lossy(), "old": "class B {", "new": "// 同批改动\nclass B {"}
+                ]
+            }),
+            &roots,
+            "multi_java_batch",
+        ));
+        // 环境自检：javac 可用时该批必须被拒；不可用才允许降级放行，两条路径都不冒充对方
+        let javac_available = matches!(
+            super::java_compiler::check_batch(&[(
+                std::path::Path::new("Probe.java"),
+                "package probe;\nclass Probe {}\n",
+                "package probe;\nclass Probe { int v = ; }\n",
+            )]),
+            super::java_compiler::JavaTypeCheck::Checked { .. }
+        );
+        match (javac_available, broken) {
+            (true, Err(error)) => {
+                assert!(error.contains("Java 编译器门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), a_src);
+                assert_eq!(std::fs::read_to_string(&b).unwrap(), b_src);
+            }
+            (true, Ok(_)) => panic!("javac 可用时，批内跨文件类型破坏必须被拒绝"),
+            (false, Ok(_)) => {
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), "package a;\nclass A {\n}\n");
+                assert!(std::fs::read_to_string(&b).unwrap().contains("// 同批改动"));
+            }
+            (false, Err(error)) => panic!("无 javac 时不应由类型门禁拒绝：{error}"),
+        }
+        // 反例：同批把调用方一起改对，联编不得误拒
+        std::fs::write(&a, a_src).unwrap();
+        std::fs::write(&b, b_src).unwrap();
+        read_baseline(&a);
+        read_baseline(&b);
+        let consistent = block_on_rt(multi_edit(
+            &serde_json::json!({
+                "edits": [
+                    {"path": a.to_string_lossy(), "old": "value()", "new": "amount()"},
+                    {"path": b.to_string_lossy(), "old": "A.value()", "new": "A.amount()"}
+                ]
+            }),
+            &roots,
+            "multi_java_batch",
+        ));
+        assert!(consistent.is_ok(), "同批改对的 Java 重构不应被拒: {consistent:?}");
+        assert!(std::fs::read_to_string(&a).unwrap().contains("static int amount()"));
+        assert!(std::fs::read_to_string(&b).unwrap().contains("A.amount()"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
