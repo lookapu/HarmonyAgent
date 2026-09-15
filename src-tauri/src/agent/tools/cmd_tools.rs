@@ -387,7 +387,11 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     // 引号内的 | 等不算（如 rg -n 'a|b' 的正则竖线），保持单程序直接执行
     // 流式执行：stdout/stderr 逐行推送 agent:log（工具卡片/终端面板实时可见），
     // 同时支持“停止当前工具”中断；结果解析保持 run_cmd 语义（退出码/截断/建议）
-    let result = if needs_shell(command) {
+    // 宿主直跑的资源限制是显式配置（默认不限制，避免打断正常构建）；
+    // 配置了就如实回报施加情况，配置写错则失败关闭而不是静默不限制。
+    let host_limits = crate::agent::native_limits::host_direct_limits_from_env()
+        .map_err(|error| format!("宿主直跑资源限制配置无效：{error}"))?;
+    let (result, limits_report) = if needs_shell(command) {
         #[cfg(windows)]
         let shell_prog = "cmd";
         #[cfg(windows)]
@@ -397,26 +401,48 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         #[cfg(not(windows))]
         let shell_args = vec!["-c".to_string(), command.to_string()];
         let envs = deveco_node_env();
-        crate::agent::exec_ctx::run_cmd_streaming_env(
-            ctx, shell_prog, &shell_args, Some(cwd), timeout, None, envs.as_deref(),
+        let outcome = crate::agent::exec_ctx::run_cmd_streaming_env_with_native_limits(
+            ctx, shell_prog, &shell_args, Some(cwd), timeout, None, envs.as_deref(), &host_limits,
         )
-        .await
-        .and_then(|o| cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or("")))
-        .map_err(|e| with_advice("run_command", e))
+        .await;
+        let report = outcome.as_ref().map(|(_, _, report)| report.clone()).unwrap_or_default();
+        (
+            outcome
+                .and_then(|(o, _truncated, _)| {
+                    cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or(""))
+                })
+                .map_err(|e| with_advice("run_command", e)),
+            report,
+        )
     } else {
         // 工程内脚本（如 hvigorw.bat）优先本地路径解析；.bat/.cmd 经 cmd /C 执行（见 resolve_program）
         let (program, full_args, envs) = resolve_program(command, cwd);
-        crate::agent::exec_ctx::run_cmd_streaming_env(
-            ctx, &program, &full_args, Some(cwd), timeout, None, envs.as_deref(),
+        let outcome = crate::agent::exec_ctx::run_cmd_streaming_env_with_native_limits(
+            ctx, &program, &full_args, Some(cwd), timeout, None, envs.as_deref(), &host_limits,
         )
-        .await
-        .and_then(|o| cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or("")))
-        .map_err(|e| with_advice("run_command", e))
+        .await;
+        let report = outcome.as_ref().map(|(_, _, report)| report.clone()).unwrap_or_default();
+        (
+            outcome
+                .and_then(|(o, _truncated, _)| {
+                    cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or(""))
+                })
+                .map_err(|e| with_advice("run_command", e)),
+            report,
+        )
     };
     match result {
         Ok(out) => {
             // 宿主直跑持续显示风险（路线 5.2.3）：命令未受沙箱隔离。
-            let out = format!("⚠️ {}\n{out}", crate::agent::sandbox::host_direct_risk_note());
+            let mut prefix = format!("⚠️ {}", crate::agent::sandbox::host_direct_risk_note());
+            // 配置了限额才追加一行：让模型/用户看到这次到底限了什么、哪些没生效
+            if !limits_report.is_empty() {
+                prefix.push_str(&format!(
+                    "\n宿主直跑资源限制：{}（未施加项同样列出，见 platform_gaps 说明）",
+                    limits_report.summary()
+                ));
+            }
+            let out = format!("{prefix}\n{out}");
             Ok(append_command_changes(out, roots, cmd_start).await)
         }
         Err(e) => Err(enrich_run_error(e, command, cwd)),

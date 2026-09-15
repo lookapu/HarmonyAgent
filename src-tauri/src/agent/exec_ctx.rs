@@ -263,6 +263,39 @@ pub async fn run_cmd_streaming_limited(
     .map(|(output, truncated, _)| (output, truncated))
 }
 
+/// 与 [`run_cmd_streaming_env`] 相同，但额外把资源限制挂到子进程上，并返回
+/// **实际施加情况**——未生效的限额由调用方如实上报，不能被吞掉。
+pub async fn run_cmd_streaming_env_with_native_limits(
+    ctx: &ToolCtx,
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    timeout_secs: u64,
+    log_file: Option<&std::path::Path>,
+    envs: Option<&[(String, String)]>,
+    limits: &crate::agent::native_limits::NativeLimits,
+) -> Result<
+    (
+        Output,
+        bool,
+        crate::agent::native_limits::NativeLimitsReport,
+    ),
+    String,
+> {
+    run_cmd_streaming_inner(
+        ctx,
+        program,
+        args,
+        cwd,
+        timeout_secs,
+        log_file,
+        envs,
+        None,
+        Some(limits),
+    )
+    .await
+}
+
 /// 与 [`run_cmd_streaming_limited`] 相同，但额外把原生资源限制挂到子进程上，并返回
 /// **实际施加情况**——未生效的限额由调用方如实上报，不能被吞掉。
 pub async fn run_cmd_streaming_limited_with_native_limits(

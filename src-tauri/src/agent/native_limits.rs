@@ -56,6 +56,43 @@ impl NativeLimitsReport {
     }
 }
 
+/// 宿主直跑（默认兼容模式）的限额环境变量。未设置即不限制——直跑是显式兼容模式，
+/// 默认给每条命令套 CPU/内存上限会打断正常构建，因此这里必须由使用者显式开启。
+pub const HOST_DIRECT_CPU_SECONDS_ENV: &str = "HARMONY_HOST_DIRECT_CPU_SECONDS";
+pub const HOST_DIRECT_MEMORY_MB_ENV: &str = "HARMONY_HOST_DIRECT_MEMORY_MB";
+
+/// 解析宿主直跑限额配置；变量存在但取值非法时失败关闭（与 sandbox 配置同口径），
+/// 避免把写错的限额当成「没配置」而静默不限制。
+pub fn parse_host_direct_limits(
+    cpu_seconds: Option<&str>,
+    memory_mb: Option<&str>,
+) -> Result<NativeLimits, String> {
+    let parse = |name: &str, raw: Option<&str>, min: u64, max: u64| -> Result<Option<u64>, String> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let value: u64 = raw
+            .parse()
+            .map_err(|_| format!("{name}={raw} 不是合法整数；留空表示不限制"))?;
+        if !(min..=max).contains(&value) {
+            return Err(format!("{name}={value} 超出允许范围 {min}..={max}"));
+        }
+        Ok(Some(value))
+    };
+    Ok(NativeLimits {
+        cpu_seconds: parse(HOST_DIRECT_CPU_SECONDS_ENV, cpu_seconds, 1, 3_600)?,
+        address_space_bytes: parse(HOST_DIRECT_MEMORY_MB_ENV, memory_mb, 64, 65_536)?
+            .map(|mb| mb * 1024 * 1024),
+    })
+}
+
+/// 读取宿主直跑限额配置（未配置 = 不限制）。
+pub fn host_direct_limits_from_env() -> Result<NativeLimits, String> {
+    let cpu = std::env::var(HOST_DIRECT_CPU_SECONDS_ENV).ok();
+    let memory = std::env::var(HOST_DIRECT_MEMORY_MB_ENV).ok();
+    parse_host_direct_limits(cpu.as_deref(), memory.as_deref())
+}
+
 /// 从沙箱 spec 推导原生可表达的限额（其余限额见模块头说明）。
 pub fn from_spec(limits: &ResourceLimits) -> NativeLimits {
     NativeLimits {
@@ -209,6 +246,34 @@ mod tests {
         assert!(gaps.iter().all(|(_, reason)| !reason.is_empty()));
     }
 
+    /// 宿主直跑限额是显式配置：未设置 = 不限制，写错 = 失败关闭而不是静默忽略。
+    #[test]
+    fn host_direct_limits_are_opt_in_and_fail_closed_on_typos() {
+        assert_eq!(
+            parse_host_direct_limits(None, None).unwrap(),
+            NativeLimits::default()
+        );
+        assert_eq!(
+            parse_host_direct_limits(Some(""), Some("  ")).unwrap(),
+            NativeLimits::default()
+        );
+        let parsed = parse_host_direct_limits(Some("120"), Some("2048")).unwrap();
+        assert_eq!(parsed.cpu_seconds, Some(120));
+        assert_eq!(parsed.address_space_bytes, Some(2048 * 1024 * 1024));
+        for (cpu, memory) in [
+            (Some("abc"), None),
+            (Some("0"), None),
+            (Some("99999"), None),
+            (None, Some("12")),
+            (None, Some("0")),
+        ] {
+            assert!(
+                parse_host_direct_limits(cpu, memory).is_err(),
+                "cpu={cpu:?} memory={memory:?} 应被拒绝"
+            );
+        }
+    }
+
     #[test]
     fn report_never_hides_an_unapplied_limit() {
         let report = NativeLimitsReport {
@@ -279,6 +344,39 @@ mod tests {
             assert_eq!(report.skipped.len(), 1);
             assert!(!report.skipped[0].1.is_empty(), "未施加必须给出原因");
         }
+    }
+
+    /// 真实调用执行器入口：宿主直跑路径配置了 CPU 限额后，子进程必须被内核终止，
+    /// 且报告里如实标注已施加——这条覆盖的是「配置 → 执行器 → 子进程」整条接线。
+    #[tokio::test]
+    async fn streaming_runner_enforces_configured_host_limits() {
+        if !cpu_time_supported() {
+            eprintln!("跳过：当前平台不接受 CPU 时间限额");
+            return;
+        }
+        let limits = parse_host_direct_limits(Some("1"), None).unwrap();
+        let ctx = crate::agent::exec_ctx::ToolCtx::empty();
+        let started = std::time::Instant::now();
+        let (output, _truncated, report) =
+            crate::agent::exec_ctx::run_cmd_streaming_env_with_native_limits(
+                &ctx,
+                "/bin/sh",
+                &[
+                    "-c".to_string(),
+                    "x=0; while :; do x=$((x+1)); done".to_string(),
+                ],
+                None,
+                60,
+                None,
+                None,
+                &limits,
+            )
+            .await
+            .expect("执行器应能启动命令");
+        assert_eq!(report.applied, vec![("cpu_seconds", 1)]);
+        assert!(!output.status.success(), "自旋命令不应正常退出");
+        assert!(output.status.code().is_none(), "限额生效时应由信号终止");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     #[tokio::test]
