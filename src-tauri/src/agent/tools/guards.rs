@@ -74,6 +74,23 @@ async fn pre_blacklist(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     Ok(())
 }
 
+/// 请求型审批作用域的绑定值：run + 工具调用 + 工具名 + 原始参数的幂等键。
+/// 与签发时登记的 `tool_runs.idempotency_key` 同源，因此凭据只能匹配到这一次调用。
+fn request_key_for(inv: &ToolInvocation<'_>) -> Result<String, Intercept> {
+    let call = inv.ctx.tool_call_id.as_deref().ok_or_else(|| {
+        Intercept::new(
+            InterceptKind::Approval,
+            "宿主能力审批缺少工具调用 ID，无法签发可撤销凭据",
+        )
+    })?;
+    Ok(crate::agent::tool_runtime::idempotency_key(
+        &inv.ctx.run_id,
+        call,
+        inv.name,
+        inv.args_raw,
+    ))
+}
+
 /// 权限分级审核：
 /// - allow_all 模式：常规操作直接执行；发布/签名/证书/凭据操作仍逐次确认
 /// - ask 模式：已信任项目的 L0/L1 自动放行；L2 或未信任项目弹窗确认
@@ -149,7 +166,25 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
             }
         }
     };
+    // 变更类宿主能力即使在免弹窗路径（allow_all/白名单/项目信任）也要留下可撤销凭据：
+    // 跳过弹窗是用户配置的策略，但「停止即失效、可显式撤销」的契约不能因此消失。
+    let receipt_required = crate::agent::capability_broker::requires_durable_receipt(tool);
     if !needs_approval {
+        if receipt_required {
+            let stop_generation = crate::agent::exec_ctx::stop_generation(conversation_id);
+            crate::agent::broker_approval::record_capability_approval(
+                inv.ctx,
+                tool,
+                inv.args_raw,
+                &crate::agent::broker_approval::ApprovalScope::Request {
+                    request_key: request_key_for(inv)?,
+                    workspace: None,
+                },
+                stop_generation,
+                crate::agent::broker_approval::DECISION_AUTO,
+            )
+            .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
+        }
         return Ok(());
     }
     // 在展示审批之前冻结作用域；摘要计算不占用异步执行线程或数据库锁。
@@ -202,13 +237,26 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     }
     match approval_result {
         Ok(ApprovalOutcome::Approved) => {
-            if let Some(scope) = &ota_scope {
+            let scope = match &ota_scope {
+                Some(scope) => Some(crate::agent::broker_approval::ApprovalScope::Ota(
+                    scope.clone(),
+                )),
+                None if receipt_required => {
+                    Some(crate::agent::broker_approval::ApprovalScope::Request {
+                        request_key: request_key_for(inv)?,
+                        workspace: None,
+                    })
+                }
+                None => None,
+            };
+            if let Some(scope) = scope {
                 crate::agent::broker_approval::record_capability_approval(
                     inv.ctx,
                     tool,
                     inv.args_raw,
-                    &crate::agent::broker_approval::ApprovalScope::Ota(scope.clone()),
+                    &scope,
                     approval_stop_generation,
+                    crate::agent::broker_approval::DECISION_EXPLICIT,
                 )
                 .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
             }

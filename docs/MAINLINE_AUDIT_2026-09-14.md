@@ -281,3 +281,18 @@
 - 尚无按能力区分「必须持有凭据」的策略层，也还没有把 `tool` 写进审计投影（时间线仍只显示 `tool_call_id`/reason）。
 
 验证：后端库 1,059 通过、9 忽略（总计 1,068），新增 2 项凭据单测（通用请求型凭据按工具名隔离且不被 OTA 复核消费；撤销资格要求活动且有凭据，并落 `tool` 列）；既有 13 项审批/撤销测试全部保持通过（含跨连接可见性、生命周期失效、幂等复用拒绝）。迁移计数同步到 84 后 `scripts/check-docs.py` 通过。两组崩溃恢复集成各 3 项通过。本批未改前端，未重跑 UI、真机、系统沙箱或安装包验收。
+
+补充（阶段 2：执行期复核，同日）：把凭据接到签发与执行的接线，让变更类能力真正受「可撤销 + 停止即失效」约束。
+
+- `capability_broker::RECEIPT_REQUIRED_TOOLS` 是**显式契约清单**（deploy、deploy_all、uninstall_app、clear_app_data、grant_permission、create_emulator、start_emulator、stop_app、device_file、set_wifi_state、set_airplane_mode、screen_record、record_ui）。它是显式枚举而非自动推导：工具名与能力的对应关系分散在各工具实现里，没有单一映射表可反查。测试断言每个名字都在 `TOOL_SPECS` 注册、且对应能力不在只读白名单，避免工具改名后 fail-closed 复核误伤正常工具。
+- `execute_host_capability`：非 OTA、能力不可重放、调用带 `tool_call_id` 且有 App 上下文时，派发进程前必须复核到有效凭据。工具名以 `tool_runs` 持久台账为准（不接受调用方自报），复核涵盖撤销状态、生命周期（进程 epoch/停止代次/30 分钟 TTL）与请求身份；拒绝时写 `host_capability.rejected`（`reason=missing_or_invalid_approval_receipt` 并带具体原因）。
+- `guards::pre_approval`：契约内工具在**弹窗批准**与**免弹窗放行**两条路径都签发凭据，决定来源分别为 `explicitly_approved` 与 `auto_approved`。auto 表示「跳过弹窗」是用户配置的策略（allow_all/项目白名单/项目信任/会话记忆），不是绕过审批；复核接受两种来源，`rejected` 及其它非法来源仍失败关闭。
+- 边界不变式：用户直接在界面发起的设备操作没有 `tool_call_id`，不属于 Agent 权限边界，不受此约束；离线/无 App 上下文（测试）同样不强制。
+
+本次边界（如实标注）：
+
+- 请求型作用域绑定的是 run + 工具调用 + 工具名 + 原始参数的幂等键（签发时与台账逐字核对），**不做输入内容摘要**——内容绑定仍是 OTA 专属（文件摘要 + 只读副本）。因此「审批后替换参数」在进程内由签发时的台账核对拦截、跨重启由凭据失效拦截，但没有 OTA 那样的二次内容比对。
+- 清单是人工维护的：新增变更类能力若未同步，就仍在既有权限弹窗保护之下、不在本契约内。
+- **接线缺少端到端自动化测试**：`pre_approval` 的签发分支与 `execute_host_capability` 的复核分支都需要 Tauri `AppHandle` 与真实台账，当前只有原语级单测覆盖。不把「原语已测」表述为「接线已验收」。
+
+验证：后端库 1,061 通过、9 忽略（总计 1,070），新增「凭据契约清单与工具注册表一致」与「auto 凭据被接受、rejected/非法来源失败关闭、撤销后立即失败、台账无此调用不可凭空复核」两项测试；既有 16 项 broker_approval 测试全部通过。两组崩溃恢复集成各 3 项通过。本批未改前端，未重跑 UI、真机、系统沙箱或安装包验收。

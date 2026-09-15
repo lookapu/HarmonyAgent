@@ -1294,6 +1294,62 @@ fn prepare_emulator_invocation(capability: &HostCapability) -> Result<HostInvoca
     })
 }
 
+/// 需要持久审批凭据的高影响宿主能力工具：变更类、失败或中断后不能靠重放恢复的操作。
+///
+/// 这份清单是**显式契约**而不是自动推导：工具名与能力的对应关系分散在各工具实现里，
+/// 没有单一映射表可反查。漏掉的能力仍受既有权限弹窗保护，但不在「可撤销 + 停止即失效」
+/// 契约内；改名或新增变更类能力时必须同步这里（`receipt_required_tools_are_registered`
+/// 测试会拦住名字写错或工具被改名的情况）。
+pub const RECEIPT_REQUIRED_TOOLS: &[&str] = &[
+    "deploy",
+    "deploy_all",
+    "uninstall_app",
+    "clear_app_data",
+    "grant_permission",
+    "create_emulator",
+    "start_emulator",
+    "stop_app",
+    "device_file",
+    "set_wifi_state",
+    "set_airplane_mode",
+    "screen_record",
+    "record_ui",
+];
+
+/// 该工具是否属于「必须有可撤销持久审批凭据」的能力契约。
+pub fn requires_durable_receipt(tool: &str) -> bool {
+    RECEIPT_REQUIRED_TOOLS.contains(&tool)
+}
+
+/// 校验当前 Agent 调用是否持有有效且未撤销的持久审批凭据。
+/// 不在契约内的能力不做额外拒绝（由既有权限层保护）。
+fn verify_durable_approval(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<(), String> {
+    let call = ctx
+        .tool_call_id
+        .as_deref()
+        .ok_or("宿主能力调用缺少工具调用 ID，无法核对审批凭据")?;
+    let app = ctx.app.as_ref().ok_or("宿主能力调用缺少审批数据库")?;
+    let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
+    let conn = db.0.lock().map_err(|_| "审批数据库锁损坏")?;
+    let tool = crate::agent::broker_approval::call_tool_name(
+        &conn,
+        &ctx.run_id,
+        &ctx.conversation_id,
+        call,
+    )?;
+    if !requires_durable_receipt(&tool) {
+        return Ok(());
+    }
+    crate::agent::broker_approval::verify_capability_approval(
+        &conn,
+        &ctx.run_id,
+        &ctx.conversation_id,
+        call,
+        &tool,
+    )?;
+    Ok(())
+}
+
 /// 执行经过类型化校验的宿主能力。调用方负责解释领域输出和完成后验证；本入口
 /// 只允许固定程序/argv 模板，并保证成功、非零退出与启动失败都进入同一审计链。
 pub async fn execute_host_capability(
@@ -1327,6 +1383,24 @@ pub async fn execute_host_capability(
         }
         Some(inputs)
     } else { None };
+    // 变更类宿主能力由 Agent 发起时必须持有可撤销的持久审批凭据：停止/删除会话、应用重启
+    // 或超时都会让它失效，撤销由用户显式触发。用户在界面直接发起的调用没有 tool_call_id，
+    // 不属于 Agent 权限边界，不受此约束。
+    if !matches!(capability, HostCapability::PackageOta { .. })
+        && !capability.replay_safe()
+        && ctx.tool_call_id.is_some()
+        && ctx.app.is_some()
+    {
+        if let Err(reason) = verify_durable_approval(ctx) {
+            ctx.record_run_event("host_capability.rejected", serde_json::json!({
+                "capability_id": capability.capability_id(),
+                "reason": "missing_or_invalid_approval_receipt",
+                "tool_call_id": ctx.tool_call_id,
+                "detail": reason,
+            }));
+            return Err(reason);
+        }
+    }
     let capability_id = capability.capability_id();
     let identity = match scoped_request_identity(ctx, capability, workspace) {
         Ok(identity) => identity,
@@ -2340,6 +2414,40 @@ fn validate_workspace_relative_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 凭据契约里的工具名必须真实注册：改名或写错会被这条测试拦住，
+    /// 否则执行期的 fail-closed 复核会把正常工具拒之门外。
+    #[test]
+    fn receipt_required_tools_are_registered() {
+        for tool in RECEIPT_REQUIRED_TOOLS {
+            assert!(
+                crate::agent::tools::TOOL_SPECS
+                    .iter()
+                    .any(|spec| spec.name == *tool),
+                "凭据契约引用了未注册的工具名：{tool}"
+            );
+            assert!(requires_durable_receipt(tool));
+        }
+        assert!(!requires_durable_receipt("read_file"));
+        // 变更类能力不能落在只读白名单里，否则执行期复核会被跳过
+        for capability in [
+            HostCapability::InstallHap {
+                device: None,
+                hap_path: "a.hap".into(),
+                replace: false,
+            },
+            HostCapability::StartEmulator {
+                name: "pixel".into(),
+            },
+            HostCapability::ClearAppStorage {
+                device: "ABC123".into(),
+                bundle: "com.demo".into(),
+                target: AppStorageTarget::Data,
+            },
+        ] {
+            assert!(!capability.replay_safe(), "{}", capability.capability_id());
+        }
+    }
 
     #[test]
     fn accepts_well_formed_capabilities() {

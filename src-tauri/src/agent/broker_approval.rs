@@ -14,6 +14,11 @@ const ACTIVE_STATUSES: &str =
     "'prepared','running','verifying','recovery_required','stuck'";
 /// 审批凭据有效期；同时是签发/复核两侧共同校验的固定时长。
 const TTL_MS: i64 = 30 * 60 * 1000;
+/// 决定来源：用户在弹窗上显式批准。
+pub(crate) const DECISION_EXPLICIT: &str = "explicitly_approved";
+/// 决定来源：权限策略判定无需弹窗（allow_all/项目白名单/项目信任/会话记忆）后自动放行。
+/// 复核接受它，因为跳过弹窗是用户配置的策略，不是绕过审批；凭据仍可撤销并在停止/重启后失效。
+pub(crate) const DECISION_AUTO: &str = "auto_approved";
 
 /// 凭据绑定的作用域：签发前冻结，执行前复核，防止审批后替换参数或输入内容。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -199,7 +204,11 @@ pub(crate) fn record_capability_approval(
     args_raw: &str,
     scope: &ApprovalScope,
     stop_generation: u64,
+    decision: &str,
 ) -> Result<(), String> {
+    if decision != DECISION_EXPLICIT && decision != DECISION_AUTO {
+        return Err("审批凭据的决定来源非法".into());
+    }
     if stop_generation != crate::agent::exec_ctx::stop_generation(&ctx.conversation_id) {
         return Err("审批等待期间已收到停止请求，拒绝签发审批凭据".into());
     }
@@ -225,10 +234,27 @@ pub(crate) fn record_capability_approval(
             "version": 4, "tool_call_id": call, "tool": tool, "scope": scope,
             "process_epoch": approval_epoch(), "stop_generation": stop_generation,
             "issued_at_ms": issued_at, "expires_at_ms": issued_at + TTL_MS,
-            "tool_request_key": key, "decision": "explicitly_approved",
+            "tool_request_key": key, "decision": decision,
         }),
     )?;
     Ok(())
+}
+
+/// 以持久台账为准取回该调用的工具名：调用方不能通过自报工具名绕过审批契约。
+pub(crate) fn call_tool_name(
+    conn: &Connection,
+    run: &str,
+    conversation: &str,
+    call: &str,
+) -> Result<String, String> {
+    conn.query_row(
+        "SELECT tool_name FROM tool_runs WHERE id=?1 AND trace_id=?2 AND conversation_id=?3",
+        rusqlite::params![call, run, conversation],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "Broker 审批未匹配到工具调用".to_string())
 }
 
 /// 复核任意宿主能力工具的审批凭据，返回冻结的作用域。
@@ -253,10 +279,14 @@ pub(crate) fn verify_capability_approval(
     let payload: serde_json::Value =
         serde_json::from_str(&payload.ok_or("Broker 缺少本次调用的显式审批凭据")?)
             .map_err(|error| format!("Broker 审批凭据损坏：{error}"))?;
-    // 旧版本凭据（v3 及更早）没有通用 scope，一律失败关闭要求重新审批
+    // 旧版本凭据（v3 及更早）没有通用 scope，一律失败关闭要求重新审批；
+    // 拒绝（rejected）等其它决定来源也不可复用
     if payload["version"] != 4
         || payload["tool"].as_str() != Some(tool)
-        || payload["decision"] != "explicitly_approved"
+        || !matches!(
+            payload["decision"].as_str(),
+            Some(DECISION_EXPLICIT) | Some(DECISION_AUTO)
+        )
         || payload["tool_request_key"].as_str() != Some(key.as_str())
     {
         return Err("Broker 显式审批凭据与当前工具请求不匹配".into());
@@ -516,6 +546,43 @@ mod tests {
                 .is_err()
         );
         assert!(verify_ota_approval(&conn, "run", "conversation", "install").is_err());
+    }
+
+    /// 免弹窗路径签发的是 auto 凭据（跳过弹窗是用户配置的策略，不是绕过审批），
+    /// 但拒绝类决定与非法来源不可复用；撤销后复核同样失败。
+    #[test]
+    fn auto_decision_is_accepted_while_rejections_and_revocation_still_fail_closed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(FIXTURE_SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tool_runs VALUES('install','run','conversation','deploy','running','ik');",
+        )
+        .unwrap();
+        let scope = serde_json::json!({"kind":"request","request_key":"ik"});
+        let verify = |conn: &Connection| {
+            let tool = call_tool_name(conn, "run", "conversation", "install")?;
+            verify_capability_approval(conn, "run", "conversation", "install", &tool)
+        };
+        receipt_for(&conn, "install", "deploy", "ik", DECISION_AUTO, 1, scope.clone());
+        assert_eq!(call_tool_name(&conn, "run", "conversation", "install").unwrap(), "deploy");
+        assert_eq!(
+            verify(&conn).unwrap(),
+            ApprovalScope::Request {
+                request_key: "ik".into(),
+                workspace: None
+            }
+        );
+        receipt_for(&conn, "install", "deploy", "ik", "rejected", 2, scope.clone());
+        assert!(verify(&conn).is_err());
+        receipt_for(&conn, "install", "deploy", "ik", "maybe_later", 3, scope.clone());
+        assert!(verify(&conn).is_err());
+        // 台账里没有的调用不能凭空复核
+        assert!(call_tool_name(&conn, "run", "conversation", "ghost").is_err());
+        // 恢复为合法凭据后，持久撤销立即让其失效
+        receipt_for(&conn, "install", "deploy", "ik", DECISION_AUTO, 4, scope);
+        assert!(verify(&conn).is_ok());
+        revoke_call(&conn, "install").unwrap();
+        assert!(verify(&conn).is_err());
     }
 
     /// 撤销资格自描述：活动状态但没有凭据的调用不可撤销。
