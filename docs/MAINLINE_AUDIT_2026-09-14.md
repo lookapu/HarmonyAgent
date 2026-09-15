@@ -379,3 +379,26 @@
 - 基线从 44 调整为 **59**（`scripts/check-warnings.py` 的 `DEFAULT_BASELINE` 与 `quality.yml` 同步），构成只剩结构类：`too_many_arguments` 42 + `type_complexity` 17。脚本头部与 CI 注释都写明了这次重定的原因与"机械类仍立即阻断"的口径；`check-warnings.py --self-test` 通过。
 
 验证：`python3 scripts/check-warnings.py` → `clippy 唯一告警：59/59 PASS`；后端库 1,074 通过、9 忽略（总计 1,083）；两组崩溃恢复集成各 3 项通过；非测试 `cargo check --lib` 0 警告。本批未改前端，未运行 Docker/OCI、真机或安装包验收。
+
+## 19. 跨平台分支的编译校验尝试与收窄（2026-09-15）
+
+本会话此前只在 macOS（aarch64-apple-darwin）上编译过，而改动的代码里包含 Windows/Linux 专属分支。本轮尝试把交叉编译纳入本机校验，结论是**本机做不到**，并据此收窄了未编译面。
+
+尝试与结果（已安装 `x86_64-pc-windows-gnu`、`x86_64-unknown-linux-gnu` 两个 rust target）：
+
+| 目标 | 结果 |
+| --- | --- |
+| `cargo check --lib --target x86_64-unknown-linux-gnu` | 失败：build script 报 `pkg-config has not been configured to support cross-compilation`（需要 Linux sysroot 与 glib/gtk 交叉环境） |
+| `cargo check --lib --target x86_64-pc-windows-gnu` | 失败：`failed to find tool "x86_64-w64-mingw32-gcc"`（C 依赖需要 MinGW 工具链） |
+
+Windows MSVC（CI 实际使用的目标）无法从 macOS 交叉校验；即便装 MinGW 也只能覆盖 windows-gnu，与 MSVC 仍有差异。
+
+因此改为**收窄未编译面 + 逐处审查**：
+
+- `native_limits::apply` 原先用「带 dummy 资源号的三元组数组」在非 unix 上占位，形状本身就不易验证。现在改为：请求表只含 `(值, 未支持原因, 名称)`，unix 与 Windows/Linux 的差异全部集中在 `attach_rlimit`（unix 版设置 rlimit，非 unix 版是空实现）与两个原因常量上；非 unix 分支不再出现任何 `libc` 引用或占位值。
+- 复核了本会话新增/改动文件中的全部 cfg 分支：`native_limits.rs` 的 `libc` 使用只在 `cfg(unix)` 的 `probe` 与 `attach_rlimit` 内；`cmd_tools.rs` 的 `cfg(windows)`/`cfg(not(windows))` 两分支只是 shell 参数构造差异，且都已同步新的执行器签名。没有发现只在 Windows 上才会编译到的本会话新代码路径缺少对应处理。
+- 平台无关的判定逻辑（限额映射、宿主直跑限额解析、凭据判定等）此前已抽成纯函数并在 macOS 上跑过测试，这部分不受交叉编译限制。
+
+**如实标注**：Windows/Linux 的编译正确性在本机**未经编译验证**，仅经过代码审查；真正的门禁仍是 CI 的两个 runner（macOS + Windows）。若需要本机覆盖，可安装 MinGW（`brew install mingw-w64`）以校验 windows-gnu，但那不等于 MSVC，属可选增强，本轮未执行、也未改动本机工具链。
+
+验证：后端库 1,074 通过、9 忽略（总计 1,083）；非测试 `cargo check --lib` 与 `cargo test --no-run` 均 0 警告；两组崩溃恢复集成各 3 项通过；`check-docs.py` 与 `check-warnings.py` 门禁通过。

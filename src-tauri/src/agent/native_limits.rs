@@ -120,13 +120,6 @@ pub fn platform_gaps() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-fn unsupported_reason(name: &'static str) -> String {
-    match name {
-        "cpu_seconds" => "当前平台内核不接受 CPU 时间限额（setrlimit 探测失败）".into(),
-        _ => "当前平台内核不接受地址空间限额（如 macOS 的 RLIMIT_AS 返回 EINVAL）".into(),
-    }
-}
-
 #[cfg(unix)]
 fn probe(resource: i32) -> bool {
     unsafe {
@@ -175,22 +168,15 @@ pub fn cpu_time_supported() -> bool {
 /// 调用方据此判断「这次执行并没有被该项限制保护」，而不是误以为已经限制。
 pub fn apply(cmd: &mut tokio::process::Command, limits: &NativeLimits) -> NativeLimitsReport {
     let mut report = NativeLimitsReport::default();
-    #[cfg(unix)]
     let requested = [
-        (libc::RLIMIT_CPU as i32, limits.cpu_seconds, "cpu_seconds"),
+        (limits.cpu_seconds, UNSUPPORTED_CPU_REASON, "cpu_seconds"),
         (
-            libc::RLIMIT_AS as i32,
             limits.address_space_bytes,
+            UNSUPPORTED_ADDRESS_SPACE_REASON,
             "address_space",
         ),
     ];
-    #[cfg(not(unix))]
-    let requested: [(i32, Option<u64>, &'static str); 2] = [
-        (0, limits.cpu_seconds, "cpu_seconds"),
-        (0, limits.address_space_bytes, "address_space"),
-    ];
-
-    for (resource, value, name) in requested {
+    for (value, unsupported, name) in requested {
         let Some(value) = value else { continue };
         let supported = if name == "cpu_seconds" {
             cpu_time_supported()
@@ -198,34 +184,51 @@ pub fn apply(cmd: &mut tokio::process::Command, limits: &NativeLimits) -> Native
             address_space_supported()
         };
         if !supported {
-            report.skipped.push((name, unsupported_reason(name)));
+            report.skipped.push((name, unsupported.to_string()));
             continue;
         }
         report.applied.push((name, value));
-        #[cfg(unix)]
-        {
-            let _ = resource;
-            let which = if name == "cpu_seconds" {
-                libc::RLIMIT_CPU as i32
-            } else {
-                libc::RLIMIT_AS as i32
-            };
-            unsafe {
-                cmd.pre_exec(move || {
-                    let limit = libc::rlimit {
-                        rlim_cur: value,
-                        rlim_max: value,
-                    };
-                    if libc::setrlimit(which as _, &limit) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
+        attach_rlimit(cmd, name, value);
     }
     report
 }
+
+/// 非 unix 平台没有 rlimit：请求了就如实报告不可用，不做任何伪装。
+#[cfg(not(unix))]
+const UNSUPPORTED_CPU_REASON: &str = "当前平台不支持 POSIX rlimit（CPU 时间限额）";
+#[cfg(not(unix))]
+const UNSUPPORTED_ADDRESS_SPACE_REASON: &str = "当前平台不支持 POSIX rlimit（地址空间限额）";
+/// unix 上是否支持由运行时探测决定，这里的文案只在探测失败时使用。
+#[cfg(unix)]
+const UNSUPPORTED_CPU_REASON: &str = "当前平台内核不接受 CPU 时间限额（setrlimit 探测失败）";
+#[cfg(unix)]
+const UNSUPPORTED_ADDRESS_SPACE_REASON: &str =
+    "当前平台内核不接受地址空间限额（如 macOS 的 RLIMIT_AS 返回 EINVAL）";
+
+/// 在 fork 之后、exec 之前设置 rlimit。非 unix 平台是空实现（限额已在报告里标为未施加）。
+#[cfg(unix)]
+fn attach_rlimit(cmd: &mut tokio::process::Command, name: &'static str, value: u64) {
+    let which = if name == "cpu_seconds" {
+        libc::RLIMIT_CPU as i32
+    } else {
+        libc::RLIMIT_AS as i32
+    };
+    unsafe {
+        cmd.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: value,
+                rlim_max: value,
+            };
+            if libc::setrlimit(which as _, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn attach_rlimit(_cmd: &mut tokio::process::Command, _name: &'static str, _value: u64) {}
 
 #[cfg(test)]
 mod tests {
@@ -282,7 +285,7 @@ mod tests {
     fn report_never_hides_an_unapplied_limit() {
         let report = NativeLimitsReport {
             applied: vec![("cpu_seconds", 30)],
-            skipped: vec![("address_space", unsupported_reason("address_space"))],
+            skipped: vec![("address_space", UNSUPPORTED_ADDRESS_SPACE_REASON.to_string())],
         };
         let summary = report.summary();
         assert!(summary.contains("cpu_seconds=30"), "{summary}");
