@@ -559,6 +559,10 @@
     "toolLevelL2": "Dangerous (needs approval)",
     "toolWaitingOutput": "Running, waiting for output…",
     "mutationGuard": {
+      "rollbackIncomplete": {
+        "title": "Recovery incomplete — review required",
+        "detail": "Some files could not be confirmed restored or were changed externally. Inspect the listed files and their diffs; do not retry automatically or assume rollback succeeded."
+      },
       "boundary": {
         "title": "Unsafe structural boundary — not written",
         "detail": "This line range may include neighboring declarations or a multi-variable field. Refresh the structure or read the content and use an exact text edit; approval does not resolve an ambiguous boundary."

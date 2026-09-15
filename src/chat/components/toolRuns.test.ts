@@ -8,6 +8,10 @@ const failedRun = (tool: string, output: string) => ({
 })
 
 describe('mutationGuardKind', () => {
+  it('never labels incomplete restoration as successful rollback', () => {
+    expect(mutationGuardKind(failedRun('multi_edit', 'multi_edit 回滚未完成，部分文件已回滚'))).toBe('rollbackIncomplete')
+    expect(mutationGuardKind(failedRun('edit_file', '写入文件失败且恢复原内容失败'))).toBe('rollbackIncomplete')
+  })
   it('distinguishes unsafe node boundaries from stale handles', () => {
     expect(mutationGuardKind(failedRun('edit_file', '结构编辑句柄边界不安全：包含相邻节点'))).toBe('boundary')
   })

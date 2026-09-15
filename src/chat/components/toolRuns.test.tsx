@@ -79,6 +79,11 @@ describe('ToolRunGroup', () => {
 })
 
 describe('ToolRunRow', () => {
+  it('恢复失败时提示人工核验，不展示安全回滚文案', () => {
+    render(<ToolRunRow run={run({ tool: 'multi_edit', status: 'error', output: 'multi_edit 回滚未完成' })} />)
+    expect(screen.getByText('home.mutationGuard.rollbackIncomplete.title')).toBeInTheDocument()
+    expect(screen.queryByText('home.mutationGuard.rollback.title')).not.toBeInTheDocument()
+  })
   it('为结构边界拒绝显示独立提示，不误报成过期或语法错误', () => {
     render(<ToolRunRow run={run({ tool: 'edit_file', status: 'error', output: '结构编辑句柄边界不安全：包含相邻声明' })} />)
     expect(screen.getByText('home.mutationGuard.boundary.title')).toBeInTheDocument()

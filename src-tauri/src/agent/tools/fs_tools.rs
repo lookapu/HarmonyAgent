@@ -3385,11 +3385,7 @@ pub(super) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
     Ok((replaced, count))
 }
 
-fn write_candidate_with_restore(
-    path: &Path,
-    old_bytes: &[u8],
-    candidate: &[u8],
-) -> Result<Option<std::fs::Metadata>, String> {
+fn verify_write_baseline(path: &Path, old_bytes: &[u8]) -> Result<(), String> {
     // 候选分析与 spawn_blocking 派发之间可能发生外部改写，真正写入前再核对完整基线。
     // 这是最终前置检查，不宣称能锁住不合作的外部进程或提供文件系统级 CAS。
     let metadata = std::fs::symlink_metadata(path).map_err(|error| format!("提交前无法核验文件，未写入：{error}"))?;
@@ -3406,6 +3402,15 @@ fn write_candidate_with_restore(
     if current != old_bytes {
         return Err("结构编辑句柄已过期：文件在定位后再次发生变化，提交前校验拒绝写入；请重新读取后重试".into());
     }
+    Ok(())
+}
+
+fn write_candidate_with_restore(
+    path: &Path,
+    old_bytes: &[u8],
+    candidate: &[u8],
+) -> Result<Option<std::fs::Metadata>, String> {
+    verify_write_baseline(path, old_bytes)?;
     if let Err(error) = std::fs::write(path, candidate) {
         return match std::fs::write(path, old_bytes) {
             Ok(()) => {
@@ -4071,19 +4076,19 @@ fn prepare_single_edit(
 }
 
 fn commit_prepared_edits(edits: &[PreparedEdit], conversation_id: &str) -> Result<(), String> {
+    for item in edits {
+        verify_write_baseline(&item.path, &item.old_bytes)
+            .map_err(|error| format!("multi_edit 提交前校验失败，未写入任何文件：{}：{error}", item.path.display()))?;
+    }
     let mut committed: Vec<&PreparedEdit> = Vec::with_capacity(edits.len());
     for item in edits {
-        if let Err(error) = std::fs::write(&item.path, item.final_text.as_bytes()) {
-            // write 失败也可能已经截断或部分写入当前文件，当前项与此前项都要恢复。
-            let _ = std::fs::write(&item.path, &item.old_bytes);
-            if let Ok(meta) = std::fs::metadata(&item.path) {
-                stamp_put(&item.path, &meta, &item.old_bytes);
+        if let Err(error) = write_candidate_with_restore(&item.path, &item.old_bytes, item.final_text.as_bytes()) {
+            let mut unresolved = rollback_prepared_edits(&committed);
+            if let Err(current_error) = verify_write_baseline(&item.path, &item.old_bytes) {
+                unresolved.push(format!("{}：{current_error}", item.path.display()));
             }
-            for previous in committed.iter().rev() {
-                let _ = std::fs::write(&previous.path, &previous.old_bytes);
-                if let Ok(meta) = std::fs::metadata(&previous.path) {
-                    stamp_put(&previous.path, &meta, &previous.old_bytes);
-                }
+            if !unresolved.is_empty() {
+                return Err(format!("multi_edit 回滚未完成，需人工核验；不能保证原始基线已恢复。提交错误：{error}；未恢复项：{}", unresolved.join("；")));
             }
             return Err(format!(
                 "multi_edit 原子提交失败，已恢复当前文件并回滚此前 {} 个文件：{}：{error}",
@@ -4101,6 +4106,20 @@ fn commit_prepared_edits(edits: &[PreparedEdit], conversation_id: &str) -> Resul
         crate::agent::undo::snapshot(conversation_id, &item.path, &item.old_bytes);
     }
     Ok(())
+}
+
+/// 只恢复仍等于本事务候选的文件，绝不盲目覆盖后来发生的外部编辑。
+fn rollback_prepared_edits(committed: &[&PreparedEdit]) -> Vec<String> {
+    let mut unresolved = Vec::new();
+    for item in committed.iter().rev() {
+        if verify_write_baseline(&item.path, &item.old_bytes).is_ok() { continue; }
+        match write_candidate_with_restore(&item.path, item.final_text.as_bytes(), &item.old_bytes) {
+            Ok(Some(meta)) => stamp_put(&item.path, &meta, &item.old_bytes),
+            Ok(None) => {},
+            Err(error) => unresolved.push(format!("{}：{error}", item.path.display())),
+        }
+    }
+    unresolved
 }
 
 /// copy_file：复制项目内文件/目录（不覆盖目标，禁止受保护路径）
@@ -5214,6 +5233,28 @@ mod tests {
         assert!(!updated.contains("toString"), "{updated}");
         assert!(updated.contains("class Service"), "{updated}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn multi_edit_preflight_and_rollback_preserve_external_content() {
+        let (first, _) = tmp_file("multi_late_external", "old-a", "txt");
+        let second = first.parent().unwrap().join("second.txt");
+        std::fs::write(&second, "other").unwrap();
+        let edits = [
+            PreparedEdit { path: first.clone(), old_bytes: b"old-a".to_vec(), final_text: "new-a".into(), count: 1 },
+            PreparedEdit { path: second.clone(), old_bytes: b"old-b".to_vec(), final_text: "new-b".into(), count: 1 },
+        ];
+        assert!(commit_prepared_edits(&edits, "multi_late_external").unwrap_err().contains("未写入任何文件"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-a");
+        assert_eq!(std::fs::read(&second).unwrap(), b"other");
+        std::fs::write(&first, "new-a").unwrap();
+        let unresolved = rollback_prepared_edits(&[&edits[0], &edits[1]]);
+        assert_eq!(unresolved.len(), 1);
+        assert!(unresolved[0].contains("second.txt"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-a");
+        assert_eq!(std::fs::read(&second).unwrap(), b"other");
+        assert_eq!(rollback_prepared_edits(&[&edits[0], &edits[1]]).len(), 1);
+        std::fs::remove_dir_all(first.parent().unwrap()).unwrap();
     }
 
     #[test]

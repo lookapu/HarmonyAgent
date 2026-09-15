@@ -8,7 +8,7 @@ import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
 import { getOtaApprovalRevoked, revokeOtaApproval } from '../../api/project'
 
-type MutationGuardKind = 'syntax' | 'rollback' | 'stale' | 'boundary'
+type MutationGuardKind = 'syntax' | 'rollback' | 'stale' | 'boundary' | 'rollbackIncomplete'
 
 const MUTATION_TOOLS = new Set([
   'write_file',
@@ -24,6 +24,7 @@ const MUTATION_TOOLS = new Set([
 export function mutationGuardKind(run: Pick<ToolRun, 'tool' | 'status' | 'output'>): MutationGuardKind | null {
   if (run.status !== 'error' || !MUTATION_TOOLS.has(run.tool)) return null
   const output = run.output.toLowerCase()
+  if (/回滚未完成|恢复原内容失败/.test(output)) return 'rollbackIncomplete'
   if (/结构编辑句柄边界不安全/.test(output)) return 'boundary'
   if (/语法门禁拒绝|java 声明门禁拒绝|syntax (?:mutation )?gate|syntax error nodes?/.test(output)) return 'syntax'
   if (/原子提交失败|已回滚|atomic commit failed|rolled back/.test(output)) return 'rollback'

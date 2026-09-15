@@ -5,6 +5,7 @@
 
 /// 判断错误是否值得自动重试（瞬态/环境类，重试可恢复）
 pub fn is_retryable_err(e: &str) -> bool {
+    if recovery_requires_review(e) { return false; }
     const KEYS: [&str; 14] = [
         // 网络/超时类：请求失败、连接中断、偶发超时
         "超时", "请求失败", "timed out", "连接", "network", "timeout",
@@ -14,6 +15,10 @@ pub fn is_retryable_err(e: &str) -> bool {
         "failed to spawn", "spawn error", "cannot find the path",
     ];
     KEYS.iter().any(|k| e.to_lowercase().contains(k))
+}
+
+fn recovery_requires_review(error: &str) -> bool {
+    error.contains("回滚未完成") || error.contains("恢复原内容失败")
 }
 
 /// 工具自动重试谓词：契约 retry_safe + 可恢复错误白名单。
@@ -35,12 +40,26 @@ mod tests_retryable {
         assert!(!retryable_for("read_file", "文件不存在"));
         assert!(retryable_for("read_file", "headless 工具 read_file 超过 100 ms 超时"));
     }
+
+    #[test]
+    fn incomplete_recovery_overrides_transient_error_retry_hints() {
+        for raw in ["multi_edit 回滚未完成：resource busy", "写入文件失败且恢复原内容失败：timeout"] {
+            assert!(!is_retryable_err(raw));
+            assert!(!retryable_for("read_file", raw));
+            let error = ToolError::enrich("multi_edit", raw.into());
+            assert!(!error.retryable);
+            assert!(error.advice.unwrap().contains("不得假定回滚成功"));
+        }
+    }
 }
 
 // ---------- 错误模式诊断（常见错误 → 修复建议，帮助 Agent 快速定位，减少打转） ----------
 
 /// 按工具 + 错误文本匹配高频失败模式，返回针对性修复建议
 pub(crate) fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str> {
+    if recovery_requires_review(err) {
+        return Some("先核验错误中列出的文件和 diff，保留外部修改；不得假定回滚成功或自动重试。");
+    }
     let l = err.to_lowercase();
     let has_any = |keys: &[&str]| keys.iter().any(|k| l.contains(k));
     match tool {
