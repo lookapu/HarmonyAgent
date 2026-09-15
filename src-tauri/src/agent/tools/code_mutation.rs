@@ -6,23 +6,6 @@
 
 use std::path::Path;
 
-/// 批量行级句柄仍要求目标独占整行，避免行范围事务吞并相邻声明。
-pub(super) fn validate_java_handle_range(
-    source: &str,
-    start: usize,
-    end: usize,
-    expected_kind: Option<&str>,
-) -> Result<(), String> {
-    let (from, to) = resolve_java_handle_byte_range(source, start, end, expected_kind)?;
-    let line_start = source[..from].rfind('\n').map_or(0, |index| index + 1);
-    let line_end = source[to..]
-        .find('\n')
-        .map_or(source.len(), |index| to + index);
-    if !source[line_start..from].trim().is_empty() || !source[to..line_end].trim().is_empty() {
-        return Err(java_boundary_error());
-    }
-    Ok(())
-}
 
 fn java_boundary_error() -> String {
     "结构编辑句柄边界不安全：Java 范围无法唯一对应完整声明，可能包含相邻同类节点或多变量字段。候选内容未落盘；请重新查询结构，或读取后使用精确 old/new 修改。".into()
@@ -271,11 +254,10 @@ mod tests {
     }
 
     #[test]
-    fn java_handle_requires_exclusive_complete_declaration_lines() {
+    fn java_handle_requires_unique_complete_declaration() {
         let valid = "class A {\r\n  @Override\r\n  public void run() {}\r\n}\r\n";
-        assert!(validate_java_handle_range(valid, 2, 3, Some("method")).is_ok());
+        assert!(resolve_java_handle_byte_range(valid, 2, 3, Some("method")).is_ok());
         for (source, start, end, kind) in [
-            ("class A { public void run() {} }", 1, 1, "method"),
             ("class A {\n void a() {} void b() {}\n}", 2, 2, "method"),
             ("class A {\n int a, b;\n}", 2, 2, "field"),
             (
@@ -286,11 +268,11 @@ mod tests {
             ),
         ] {
             assert!(
-                validate_java_handle_range(source, start, end, Some(kind)).is_err(),
+                resolve_java_handle_byte_range(source, start, end, Some(kind)).is_err(),
                 "{source}"
             );
         }
-        assert!(validate_java_handle_range(valid, 2, 3, None).is_err());
+        assert!(resolve_java_handle_byte_range(valid, 2, 3, None).is_err());
     }
 
     #[test]

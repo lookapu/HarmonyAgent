@@ -3214,6 +3214,36 @@ fn plan_batch_blocks(
     compose_batch_ranges(body, located, news, "starts")
 }
 
+fn plan_java_byte_nodes(
+    body: &str,
+    nodes: &[ExpectedNode],
+    news: &[String],
+) -> Result<(String, Vec<(usize, usize)>), String> {
+    if nodes.is_empty() || nodes.len() != news.len() {
+        return Err("Java 批量节点与替换内容数量不匹配".into());
+    }
+    let mut spans = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let (start, end) = super::code_mutation::resolve_java_handle_byte_range(
+            body, node.range.0, node.range.1, node.kind.as_deref(),
+        )?;
+        spans.push((start, end, index));
+    }
+    spans.sort_by_key(|span| span.0);
+    if spans.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return Err("批量编辑的节点重叠：Java 字节区间相交或重复，未写入任何内容".into());
+    }
+    let mut result = String::with_capacity(body.len());
+    let mut cursor = 0;
+    for (start, end, index) in spans {
+        result.push_str(&body[cursor..start]);
+        result.push_str(&news[index]);
+        cursor = end;
+    }
+    result.push_str(&body[cursor..]);
+    Ok((result, nodes.iter().map(|node| (node.range.0 - 1, node.range.1 - 1)).collect()))
+}
+
 fn plan_exact_node_ranges(
     body: &str,
     nodes: &[ExpectedNode],
@@ -3360,6 +3390,22 @@ fn write_candidate_with_restore(
     old_bytes: &[u8],
     candidate: &[u8],
 ) -> Result<Option<std::fs::Metadata>, String> {
+    // 候选分析与 spawn_blocking 派发之间可能发生外部改写，真正写入前再核对完整基线。
+    // 这是最终前置检查，不宣称能锁住不合作的外部进程或提供文件系统级 CAS。
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| format!("提交前无法核验文件，未写入：{error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("编辑冲突：提交目标不再是普通文件，未写入".into());
+    }
+    if metadata.len() != old_bytes.len() as u64 {
+        return Err("结构编辑句柄已过期：文件在定位后再次发生变化，提交前长度校验拒绝写入".into());
+    }
+    use std::io::Read;
+    let mut current = Vec::with_capacity(old_bytes.len());
+    std::fs::File::open(path).and_then(|file| file.take(old_bytes.len() as u64 + 1).read_to_end(&mut current))
+        .map_err(|error| format!("提交前无法读取文件，未写入：{error}"))?;
+    if current != old_bytes {
+        return Err("结构编辑句柄已过期：文件在定位后再次发生变化，提交前校验拒绝写入；请重新读取后重试".into());
+    }
     if let Err(error) = std::fs::write(path, candidate) {
         return match std::fs::write(path, old_bytes) {
             Ok(()) => {
@@ -3441,12 +3487,9 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             .to_lowercase();
         let (final_body, ranges) = if spec.expected_nodes.is_empty() {
             plan_batch_blocks(body, starts, &spec.news, &spec.anchors, &ext)?
+        } else if ext == "java" {
+            plan_java_byte_nodes(body, &spec.expected_nodes, &spec.news)?
         } else {
-            if ext == "java" {
-                for node in &spec.expected_nodes {
-                    super::code_mutation::validate_java_handle_range(body, node.range.0, node.range.1, node.kind.as_deref())?;
-                }
-            }
             plan_exact_node_ranges(body, &spec.expected_nodes, &spec.news)?
         };
         super::code_mutation::validate_candidate(p, body, &final_body)?;
@@ -5171,6 +5214,57 @@ mod tests {
         assert!(!updated.contains("toString"), "{updated}");
         assert!(updated.contains("class Service"), "{updated}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn final_write_check_preserves_late_external_changes() {
+        let (file, _) = tmp_file("late_external_write", "old", "txt");
+        std::fs::write(&file, "new").unwrap();
+        assert!(write_candidate_with_restore(&file, b"old", b"candidate").unwrap_err().contains("再次发生变化"));
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        std::fs::write(&file, "longer").unwrap();
+        assert!(write_candidate_with_restore(&file, b"old", b"candidate").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"longer");
+        std::fs::remove_file(&file).unwrap();
+        assert!(write_candidate_with_restore(&file, b"old", b"candidate").is_err());
+        assert!(!file.exists());
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn java_batch_byte_plan_preserves_order_and_rejects_overlap() {
+        let body = "class A {\r\n void a() {} int keepA;\r\n void b() {} int keepB;\r\n}\r\n";
+        let node = |start, end, kind: &str| ExpectedNode {
+            node_id: "test".into(), kind: Some(kind.into()), range: (start, end), parent_range: None, relocated: false,
+        };
+        let nodes = [node(3, 3, "method"), node(2, 2, "method")];
+        let (result, ranges) = plan_java_byte_nodes(body, &nodes, &["void changed() {}".into(), "".into()]).unwrap();
+        assert_eq!(result, body.replace("void a() {}", "").replace("void b() {}", "void changed() {}"));
+        assert_eq!(ranges, vec![(2, 2), (1, 1)]);
+        assert!(plan_java_byte_nodes(body, &[node(2, 2, "method"), node(2, 2, "method")], &["".into(), "".into()]).unwrap_err().contains("重叠"));
+        assert!(plan_java_byte_nodes(body, &[node(1, 4, "class"), node(2, 2, "method")], &["".into(), "".into()]).unwrap_err().contains("重叠"));
+        assert!(plan_java_byte_nodes(body, &nodes, &["".into()]).is_err());
+    }
+
+    #[test]
+    fn java_batch_handles_preserve_neighbors_and_reject_invalid_candidate_atomically() {
+        let content = "class A {\n  public void first() {} int keepA;\n  public void second() {} int keepB;\n}\n";
+        let (file, roots) = tmp_file("java_batch_byte_handles", content, "java");
+        let root = file.parent().unwrap().to_path_buf();
+        let symbols = crate::services::symbol_index::index_project(&root).into_iter()
+            .filter(|symbol| symbol.kind == "method").collect::<Vec<_>>();
+        assert_eq!(symbols.len(), 2);
+        let handles = crate::services::symbol_index::symbol_read_handles(&root, &symbols)
+            .into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+        let bad = serde_json::json!({"symbol_handles": handles, "news": ["", "void broken( {"]});
+        assert!(block_on_rt(edit_file(&bad, &roots, "java_batch_byte_handles")).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        let preview = serde_json::json!({"symbol_handles": handles, "news": ["", ""], "dry_run": true});
+        block_on_rt(edit_file(&preview, &roots, "java_batch_byte_handles")).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        block_on_rt(edit_file(&serde_json::json!({"symbol_handles": handles, "news": ["", ""]}), &roots, "java_batch_byte_handles")).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content.replace("public void first() {}", "").replace("public void second() {}", ""));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
