@@ -1,5 +1,6 @@
 import { invokeWithError } from './invoke'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { ImpactContract } from '../stores/projectStoreTypes'
 
 export interface Project {
   id: string
@@ -227,6 +228,8 @@ export interface PendingConfirmation {
   args: string | null
   level: string | null
   desc: string | null
+  /** 影响契约（仅有审批类待确认项时有值；与弹窗口径一致，用于会话恢复后展示） */
+  impact?: ImpactContract | null
   plan: string | null
   question: string | null
   options: string[] | null

@@ -216,3 +216,31 @@ function scanJsonString(s: string, pos: number): number {
   }
   return pos
 }
+
+/** 影响契约的后端取值可能先于前端文案新增（Rust → TS 无类型约束），未知值回退到通用标签 */
+const IMPACT_REVERSIBILITY_KEYS = ['reversible', 'hard_to_reverse', 'irreversible'] as const
+const IMPACT_SCOPE_KEYS = ['device', 'app_data', 'workspace', 'host'] as const
+
+/**
+ * 影响契约 → 展示用的 i18n key 与语气（纯函数）。
+ * 未知可逆性按「需要确认」处理、未知范围回退通用文案，都不把原始值直接透给用户。
+ */
+export function impactDisplay(impact: { reversibility: string; scope: string }): {
+  reversibilityKey: string
+  scopeKey: string
+  tone: 'danger' | 'warning' | 'neutral'
+} {
+  const reversibility = (IMPACT_REVERSIBILITY_KEYS as readonly string[]).includes(impact.reversibility)
+    ? impact.reversibility
+    : 'unknown'
+  const scope = (IMPACT_SCOPE_KEYS as readonly string[]).includes(impact.scope)
+    ? impact.scope
+    : 'unknown'
+  const tone =
+    reversibility === 'irreversible' ? 'danger' : reversibility === 'hard_to_reverse' ? 'warning' : 'neutral'
+  return {
+    reversibilityKey: `home.toolApprovalImpact.${reversibility}`,
+    scopeKey: `home.toolApprovalScope.${scope}`,
+    tone,
+  }
+}

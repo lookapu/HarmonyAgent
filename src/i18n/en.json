@@ -611,6 +611,19 @@
     "whitelistEmpty": "No whitelisted tools yet (choose \"Always allow in this project\" in approval dialogs)",
     "whitelistRemove": "Remove from whitelist",
     "toolApprovalFeedbackPlaceholder": "Rejection reason (sent back to the Agent)…",
+    "toolApprovalImpactTargets": "Affects: ",
+    "toolApprovalImpact": {
+      "reversible": "Reversible",
+      "hard_to_reverse": "Needs rollback to restore",
+      "irreversible": "Irreversible"
+    },
+    "toolApprovalScope": {
+      "device": "Affects a device",
+      "app_data": "Affects app data on the device",
+      "workspace": "Affects the project workspace",
+      "host": "Affects the development machine"
+    ,
+      "unknown": "Scope unknown"},
     "planMode": "Plan / review mode",
     "planModeHint": "The Agent outputs a task plan first and only runs tools after you approve it. You can reject with feedback.",
     "nativeTools": "Native tool calls (function calling)",

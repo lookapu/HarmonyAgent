@@ -38,6 +38,7 @@ pub mod runtime_log;
 pub mod runtime;
 pub mod exec_ctx;
 pub mod event_sink;
+pub mod impact;
 pub mod invariants;
 pub mod jobs;
 pub mod scanner;

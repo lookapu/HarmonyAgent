@@ -121,6 +121,7 @@ import { EmptyState as UiEmptyState } from '../components/ui/EmptyState'
 import { useEscapeKey } from '../hooks/useEscapeKey'
 import {
   fmtElapsed,
+  impactDisplay,
   interruptedTailMessage,
   restoreSelectionRange,
   sanitizeToolMarkers,
@@ -6962,6 +6963,35 @@ export default function Home() {
                   {toolApprovals[0].desc}
                 </p>
               )}
+              {/* 影响契约：改什么、能不能撤销、影响到哪里（后端 impact.rs 同一口径） */}
+              {toolApprovals[0].impact && (() => {
+                const impact = toolApprovals[0].impact!
+                const { reversibilityKey, scopeKey, tone: impactTone } = impactDisplay(impact)
+                const tone =
+                  impactTone === 'danger'
+                    ? 'border-[var(--danger-border,var(--danger))] text-[var(--danger)]'
+                    : impactTone === 'warning'
+                      ? 'border-[var(--warning)] text-[var(--warning)]'
+                      : 'border-[var(--border)] text-[var(--text-muted)]'
+                return (
+                  <div className={`rounded-lg border ${tone} bg-[var(--bg-tertiary)]/40 px-3 py-2 space-y-1`}>
+                    <div className="flex items-center gap-2 text-[10px] font-medium">
+                      <span>{t(reversibilityKey)}</span>
+                      <span className="opacity-70">·</span>
+                      <span className="opacity-80">{t(scopeKey)}</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                      {impact.note}
+                    </p>
+                    {impact.targets.length > 0 && (
+                      <div className="text-[10px] text-[var(--text-muted)] truncate">
+                        {t('home.toolApprovalImpactTargets')}
+                        <span className="font-mono">{impact.targets.join(' · ')}</span>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
               <pre className="tool-output max-h-32 overflow-y-auto rounded-lg modern-card border-[var(--border)] p-2.5 text-[11px] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]">
                 {toolApprovals[0].args || '{}'}
               </pre>

@@ -74,6 +74,14 @@ async fn pre_blacklist(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     Ok(())
 }
 
+/// 该调用的影响契约（未覆盖的工具为 None）：签发凭据时连同它一起落审计。
+/// 参数不是合法 JSON 时按「无影响说明」处理——影响描述是展示与审计口径，
+/// 不应因为描述不出来就阻断一次本来可以执行的调用。
+fn request_impact(inv: &ToolInvocation<'_>) -> Option<crate::agent::impact::ImpactContract> {
+    let args: serde_json::Value = serde_json::from_str(inv.args_raw).ok()?;
+    crate::agent::impact::describe(inv.name, &args)
+}
+
 /// 请求型审批作用域的绑定值：run + 工具调用 + 工具名 + 原始参数的幂等键。
 /// 与签发时登记的 `tool_runs.idempotency_key` 同源，因此凭据只能匹配到这一次调用。
 fn request_key_for(inv: &ToolInvocation<'_>) -> Result<String, Intercept> {
@@ -172,6 +180,7 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     if !needs_approval {
         if receipt_required {
             let stop_generation = crate::agent::exec_ctx::stop_generation(conversation_id);
+            let impact = request_impact(inv);
             crate::agent::broker_approval::record_capability_approval(
                 inv.ctx,
                 tool,
@@ -182,6 +191,7 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
                 },
                 stop_generation,
                 crate::agent::broker_approval::DECISION_AUTO,
+                impact.as_ref(),
             )
             .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
         }
@@ -257,6 +267,7 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
                     &scope,
                     approval_stop_generation,
                     crate::agent::broker_approval::DECISION_EXPLICIT,
+                    request_impact(inv).as_ref(),
                 )
                 .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
             }
@@ -431,6 +442,10 @@ pub(crate) async fn request_tool_approval(
         .ok()
         .map(|value| crate::utils::redact::redact_json_value(&value).to_string())
         .unwrap_or_else(|| crate::utils::redact::redact_text(args));
+    // 影响契约与凭据、弹窗、审计同源：审批前后看到的是同一套后果说明
+    let impact = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|value| crate::agent::impact::describe(tool, &value));
     let request_id = Uuid::new_v4().to_string();
     crate::agent::interactions::begin(
         &request_id,
@@ -442,6 +457,7 @@ pub(crate) async fn request_tool_approval(
             "args": visible_args,
             "level": permissions::tool_level(tool).as_str(),
             "description": super::tool_short_desc(tool),
+            "impact": impact,
         }),
     )?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -461,6 +477,7 @@ pub(crate) async fn request_tool_approval(
             args: visible_args,
             level: permissions::tool_level(tool).as_str().to_string(),
             desc: super::tool_short_desc(tool).to_string(),
+            impact,
         },
     );
     // 给复杂任务/后台窗口留足确认时间；前端可从 pending 状态恢复弹窗。仍设上限避免

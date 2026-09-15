@@ -139,6 +139,14 @@ export interface TaskLedgerState {
   finished: boolean
 }
 
+/** 宿主能力影响契约：改什么、能不能撤销、影响到哪里（后端 impact.rs 同源提供） */
+export interface ImpactContract {
+  reversibility: 'reversible' | 'hard_to_reverse' | 'irreversible'
+  scope: 'device' | 'app_data' | 'workspace' | 'host'
+  targets: string[]
+  note: string
+}
+
 /** 工具权限审核请求（自动审核模式下待用户确认） */
 export interface ToolApproval {
   requestId: string
@@ -146,6 +154,8 @@ export interface ToolApproval {
   args: string
   level?: string
   desc?: string
+  /** 影响说明：未覆盖的工具为空，弹窗按原样展示 */
+  impact?: ImpactContract | null
 }
 
 /** Agent 推送的诊断引导卡片（需用户在 IDE/系统中手动操作的问题） */

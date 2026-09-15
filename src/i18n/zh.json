@@ -612,6 +612,19 @@
     "whitelistEmpty": "暂无白名单记录（审批时选「本项目始终允许」后出现在这里）",
     "whitelistRemove": "移除白名单",
     "toolApprovalFeedbackPlaceholder": "拒绝理由（将反馈给 Agent 调整方案）…",
+    "toolApprovalImpactTargets": "影响目标：",
+    "toolApprovalImpact": {
+      "reversible": "可撤销",
+      "hard_to_reverse": "需回滚才能恢复",
+      "irreversible": "不可撤销"
+    },
+    "toolApprovalScope": {
+      "device": "影响设备",
+      "app_data": "影响设备上的应用数据",
+      "workspace": "影响工程工作区",
+      "host": "影响开发机环境"
+    ,
+      "unknown": "影响范围未知"},
     "planMode": "计划/审查模式",
     "planModeHint": "Agent 先输出任务计划，你确认后才开始执行工具；可在驳回时附上修改意见。",
     "nativeTools": "原生工具调用（function calling）",

@@ -36,7 +36,13 @@ import {
 } from '../../api/project'
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger, ConversationBranchAnchor } from '../../api/project'
 import type { StateCreator } from 'zustand'
-import type { ChatSlice, DiagnoseCard, ProjectState, StreamingState } from '../projectStoreTypes'
+import type {
+  ChatSlice,
+  DiagnoseCard,
+  ImpactContract,
+  ProjectState,
+  StreamingState,
+} from '../projectStoreTypes'
 import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
@@ -967,35 +973,43 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   }).catch(() => {})
 
   // 工具权限审核请求（自动审核模式）：入队等待用户确认弹窗
-  listen<{ conversation_id: string; request_id: string; tool: string; args: string; level?: string; desc?: string }>(
-    'chat-tool-approval',
-    (event) => {
-      const { conversation_id, request_id, tool, args, level, desc } = event.payload
-      const isCurrent = get().currentConversation?.id === conversation_id
-      // 后台会话同样记录到待确认表（列表角标 + 切回恢复）；弹窗视图仅当前会话刷新
-      upsertPending({
-        conversation_id,
-        kind: 'approval',
-        request_id,
-        tool,
-        args,
-        level: level ?? null,
-        desc: desc ?? null,
-        plan: null,
-        question: null,
-        options: null,
-      })
-      if (isCurrent) {
-        set((s) => ({
-          toolApprovals: s.toolApprovals.some((item) => item.requestId === request_id)
-            ? s.toolApprovals.map((item) =>
-                item.requestId === request_id ? { requestId: request_id, tool, args, level, desc } : item,
-              )
-            : [...s.toolApprovals, { requestId: request_id, tool, args, level, desc }],
-        }))
-      }
-    },
-  ).catch(() => {})
+  listen<{
+    conversation_id: string
+    request_id: string
+    tool: string
+    args: string
+    level?: string
+    desc?: string
+    impact?: ImpactContract | null
+  }>('chat-tool-approval', (event) => {
+    const { conversation_id, request_id, tool, args, level, desc, impact } = event.payload
+    const isCurrent = get().currentConversation?.id === conversation_id
+    // 后台会话同样记录到待确认表（列表角标 + 切回恢复）；弹窗视图仅当前会话刷新
+    upsertPending({
+      conversation_id,
+      kind: 'approval',
+      request_id,
+      tool,
+      args,
+      level: level ?? null,
+      desc: desc ?? null,
+      impact: impact ?? null,
+      plan: null,
+      question: null,
+      options: null,
+    })
+    if (isCurrent) {
+      set((s) => ({
+        toolApprovals: s.toolApprovals.some((item) => item.requestId === request_id)
+          ? s.toolApprovals.map((item) =>
+              item.requestId === request_id
+                ? { requestId: request_id, tool, args, level, desc, impact }
+                : item,
+            )
+          : [...s.toolApprovals, { requestId: request_id, tool, args, level, desc, impact }],
+      }))
+    }
+  }).catch(() => {})
 
   // Agent 诊断引导卡片：签名/SDK/依赖等需用户手动操作时，在对话流上方展示可操作卡片
   listen<{
@@ -1412,6 +1426,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           args: p.args ?? '',
           level: p.level ?? undefined,
           desc: p.desc ?? undefined,
+          impact: p.impact ?? null,
         }))
       const restoredPlan = (() => {
         const p = pendings.find((p) => p.kind === 'plan')

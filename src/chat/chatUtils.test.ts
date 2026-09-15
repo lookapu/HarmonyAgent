@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { fmtElapsed, interruptedTailMessage, sanitizeToolMarkers, shouldSubmitComposerKey } from './chatUtils'
+import {
+  fmtElapsed,
+  impactDisplay,
+  interruptedTailMessage,
+  sanitizeToolMarkers,
+  shouldSubmitComposerKey,
+} from './chatUtils'
 import type { ChatMessage } from '../api/project'
 
 const chatMsg = (role: ChatMessage['role'], id: string, extra: Partial<ChatMessage> = {}): ChatMessage =>
@@ -107,5 +113,25 @@ describe('sanitizeToolMarkers', () => {
   it('不含工具标记的普通花括号/方括号原样保留', () => {
     const text = '配置项 { key: value } 和数组 [1, 2, 3] 正常显示'
     expect(sanitizeToolMarkers(text)).toBe(text)
+  })
+})
+
+describe('impactDisplay', () => {
+  it('把可逆性映射为语气与文案 key', () => {
+    expect(impactDisplay({ reversibility: 'irreversible', scope: 'app_data' })).toEqual({
+      reversibilityKey: 'home.toolApprovalImpact.irreversible',
+      scopeKey: 'home.toolApprovalScope.app_data',
+      tone: 'danger',
+    })
+    expect(impactDisplay({ reversibility: 'hard_to_reverse', scope: 'workspace' }).tone).toBe('warning')
+    expect(impactDisplay({ reversibility: 'reversible', scope: 'device' }).tone).toBe('neutral')
+  })
+
+  it('后端新增未覆盖取值时回退通用文案，不把原始值透给用户', () => {
+    expect(impactDisplay({ reversibility: 'eventually_consistent', scope: 'galaxy' })).toEqual({
+      reversibilityKey: 'home.toolApprovalImpact.unknown',
+      scopeKey: 'home.toolApprovalScope.unknown',
+      tone: 'neutral',
+    })
   })
 })

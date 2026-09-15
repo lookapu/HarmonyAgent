@@ -205,6 +205,7 @@ pub(crate) fn record_capability_approval(
     scope: &ApprovalScope,
     stop_generation: u64,
     decision: &str,
+    impact: Option<&super::impact::ImpactContract>,
 ) -> Result<(), String> {
     if decision != DECISION_EXPLICIT && decision != DECISION_AUTO {
         return Err("审批凭据的决定来源非法".into());
@@ -235,6 +236,8 @@ pub(crate) fn record_capability_approval(
             "process_epoch": approval_epoch(), "stop_generation": stop_generation,
             "issued_at_ms": issued_at, "expires_at_ms": issued_at + TTL_MS,
             "tool_request_key": key, "decision": decision,
+            // 影响口径与审批弹窗同源：审计时间线直接读到用户当时看到的那套说法
+            "impact": impact,
         }),
     )?;
     Ok(())

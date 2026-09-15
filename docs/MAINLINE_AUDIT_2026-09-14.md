@@ -296,3 +296,15 @@
 - **接线缺少端到端自动化测试**：`pre_approval` 的签发分支与 `execute_host_capability` 的复核分支都需要 Tauri `AppHandle` 与真实台账，当前只有原语级单测覆盖。不把「原语已测」表述为「接线已验收」。
 
 验证：后端库 1,061 通过、9 忽略（总计 1,070），新增「凭据契约清单与工具注册表一致」与「auto 凭据被接受、rejected/非法来源失败关闭、撤销后立即失败、台账无此调用不可凭空复核」两项测试；既有 16 项 broker_approval 测试全部通过。两组崩溃恢复集成各 3 项通过。本批未改前端，未重跑 UI、真机、系统沙箱或安装包验收。
+
+补充（阶段 3：影响契约进审批与审计，同日）：审批弹窗此前对 OTA 之外的能力只有工具名、参数和一句简介，用户看不到「改什么、能不能撤销、影响到哪里」。
+
+- 新增 `agent/impact.rs`：`ImpactContract { reversibility, scope, targets, note }`，可逆性分 `reversible` / `hard_to_reverse` / `irreversible`，范围分 `device` / `app_data` / `workspace` / `host`；覆盖 OTA 与 `RECEIPT_REQUIRED_TOOLS` 的 13 个变更类工具，**未覆盖的工具返回 `None`**，弹窗保持原样，不做猜测性描述。目标从参数中的已知键提取（device/bundle/path/hap_path…），去重并最多展示 3 个。
+- 口径同源：影响描述同时进入 ① 审批事件 `chat-tool-approval`（前端弹窗）② `interactions::begin` 的持久 payload（跨重启恢复的待确认项与弹窗一致）③ 凭据事件 `host_capability.explicit_approval` 的 `impact` 字段（审计时间线直接读到用户当时看到的那套说法）。
+- `list_pending_confirmations` 恢复待确认项时按同一函数重算（该处 `args` 已脱敏，目标值也一并脱敏，不引入新信息）。
+- 前端：审批卡片新增影响区块（语气色 + 可逆性 + 范围 + 一句话后果 + 影响目标），中英文文案齐备；映射抽成纯函数 `impactDisplay`，对**后端新增而未在前端登记**的取值回退到通用文案，不把原始值直接透给用户。
+- 影响描述是展示与审计口径，不参与权限判定：权限分级仍在 `permissions`，凭据与撤销仍在 `broker_approval`；参数不是合法 JSON 时按「无影响说明」处理，不因此阻断调用。
+
+边界：`targets` 只是参数里的显式目标，不代表全部受影响对象（例如应用被卸载后其依赖的外部服务状态不在其中）；`note` 是固定文案，不含运行期推算的规模评估（如「将覆盖 3 个设备」）。
+
+验证：后端库 1,067 通过、9 忽略（总计 1,076），新增 6 项 `impact` 单测（未覆盖工具返回 None、不可逆操作的范围与目标提取、OTA 目标键顺序与去重、序列化形状）；前端 14 文件 127 项通过（新增 2 项 `impactDisplay` 测试，含未知取值回退），lint、TypeScript、Web build 与 bundle gate 通过。本批未重跑真机、系统沙箱或安装包验收——**审批卡片的实际视觉效果未在真实界面确认**（无 GUI 验收环境），仅由类型检查与纯函数测试保证。

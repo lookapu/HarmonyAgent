@@ -358,6 +358,8 @@ pub struct ChatToolApprovalEvent {
     pub args: String,
     pub level: String,
     pub desc: String,
+    /// 影响契约：改什么、能不能撤销、影响到哪里。未覆盖的工具为 None，弹窗保持原样。
+    pub impact: Option<crate::agent::impact::ImpactContract>,
 }
 
 /// 回复工具权限审核结果（前端确认弹窗调用）
@@ -708,6 +710,8 @@ pub struct PendingConfirmation {
     pub args: Option<String>,
     pub level: Option<String>,
     pub desc: Option<String>,
+    /// 影响契约（审批类待确认项）：让前台会话恢复后与弹窗口径一致
+    pub impact: Option<crate::agent::impact::ImpactContract>,
     pub plan: Option<String>,
     pub question: Option<String>,
     pub options: Option<Vec<String>>,
@@ -751,6 +755,10 @@ pub fn list_pending_confirmations(
                     args: Some(args.clone()),
                     level: Some(crate::services::permissions::tool_level(tool).as_str().to_string()),
                     desc: Some(crate::agent::tools::tool_short_desc(tool).to_string()),
+                    // 用与弹窗同一套口径重算（此处 args 已脱敏，目标值同样脱敏，不引入新信息）
+                    impact: serde_json::from_str::<serde_json::Value>(args)
+                        .ok()
+                        .and_then(|value| crate::agent::impact::describe(tool, &value)),
                     plan: None,
                     question: None,
                     options: None,
@@ -772,6 +780,7 @@ pub fn list_pending_confirmations(
                     args: None,
                     level: None,
                     desc: None,
+                    impact: None,
                     plan: Some(req.plan.clone()),
                     question: None,
                     options: None,
@@ -791,6 +800,7 @@ pub fn list_pending_confirmations(
                 args: None,
                 level: None,
                 desc: None,
+                impact: None,
                 plan: None,
                 question: Some(ev.question),
                 options: Some(ev.options),
