@@ -36,6 +36,14 @@ pub struct ResourceLimits {
     pub writable_tmp_mb: u64,
     pub wall_time_seconds: u64,
     pub output_bytes: u64,
+    /// 单进程 CPU 时间上限（秒）。OCI 映射为 `--ulimit cpu=`，原生后端映射为 `RLIMIT_CPU`。
+    /// 与 `cpu_count` 不同：这是「最多烧多少 CPU 时间」，不是并行配额。
+    #[serde(default = "default_cpu_seconds")]
+    pub cpu_seconds: u64,
+}
+
+fn default_cpu_seconds() -> u64 {
+    600
 }
 
 impl Default for ResourceLimits {
@@ -47,6 +55,7 @@ impl Default for ResourceLimits {
             writable_tmp_mb: 1_024,
             wall_time_seconds: 300,
             output_bytes: 2 * 1024 * 1024,
+            cpu_seconds: default_cpu_seconds(),
         }
     }
 }
@@ -103,6 +112,8 @@ impl SandboxSpec {
             || self.limits.writable_tmp_mb > 16_384
             || self.limits.wall_time_seconds == 0
             || self.limits.wall_time_seconds > 3_600
+            || self.limits.cpu_seconds == 0
+            || self.limits.cpu_seconds > 3_600
             || self.limits.output_bytes == 0
             || self.limits.output_bytes > 64 * 1024 * 1024
         {
@@ -327,15 +338,41 @@ impl NativeBackend {
             }),
         );
         let started = Instant::now();
-        let output = crate::agent::exec_ctx::run_cmd_streaming_limited(
+        let native_limits = crate::agent::native_limits::from_spec(&spec.limits);
+        let (output, limits_report) = match crate::agent::exec_ctx::run_cmd_streaming_limited_with_native_limits(
             ctx,
             &built.program,
             &built.args,
             built.cwd.as_deref(),
             spec.limits.wall_time_seconds,
             spec.limits.output_bytes as usize,
+            &native_limits,
         )
-        .await;
+        .await
+        {
+            Ok((output, truncated, report)) => (Ok((output, truncated)), report),
+            Err(error) => (Err(error), crate::agent::native_limits::NativeLimitsReport::default()),
+        };
+        // 未施加的限额必须进入审计：不能只记录成功项，让调用方误以为整份 spec 都被执行
+        ctx.record_run_event(
+            "sandbox_native_limits",
+            serde_json::json!({
+                "backend": self.kind.backend_name(),
+                "execution_id": execution_id,
+                "applied": limits_report.applied.iter()
+                    .map(|(name, value)| serde_json::json!({"limit": name, "value": value}))
+                    .collect::<Vec<_>>(),
+                "skipped": limits_report.skipped.iter()
+                    .map(|(name, reason)| serde_json::json!({"limit": name, "reason": reason}))
+                    .collect::<Vec<_>>(),
+                "platform_gaps": crate::agent::native_limits::platform_gaps()
+                    .into_iter()
+                    .map(|(name, reason)| serde_json::json!({"limit": name, "reason": reason}))
+                    .collect::<Vec<_>>(),
+                "summary": limits_report.summary(),
+            }),
+        );
+        let output = output;
         let cleanup_failed = std::fs::remove_dir_all(&temp_root).is_err();
         let (status, exit_code, stdout, stderr, capture_truncated) = match output {
             Ok((output, truncated)) => (
@@ -1341,6 +1378,8 @@ pub fn build_oci_run_command(
         format!("--cpus={}", spec.limits.cpu_count),
         format!("--memory={}m", spec.limits.memory_mb),
         format!("--pids-limit={}", spec.limits.pids),
+        // RLIMIT_CPU 语义：单进程累计 CPU 时间（秒）
+        format!("--ulimit=cpu={}", spec.limits.cpu_seconds),
         "--tmpfs".into(),
         format!(
             "/tmp:rw,noexec,nosuid,nodev,size={}m",

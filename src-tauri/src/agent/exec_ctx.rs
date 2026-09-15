@@ -234,8 +234,9 @@ pub async fn run_cmd_streaming_env(
     log_file: Option<&std::path::Path>,
     envs: Option<&[(String, String)]>,
 ) -> Result<Output, String> {
-    run_cmd_streaming_inner(ctx, program, args, cwd, timeout_secs, log_file, envs, None)
-        .await.map(|(output, _)| output)
+    run_cmd_streaming_inner(ctx, program, args, cwd, timeout_secs, log_file, envs, None, None)
+        .await
+        .map(|(output, _truncated, _limits)| output)
 }
 
 /// 沙箱输出预算在采集、事件推送和日志落盘之前执行，stdout/stderr 共用额度。
@@ -247,7 +248,51 @@ pub async fn run_cmd_streaming_limited(
     timeout_secs: u64,
     output_bytes: usize,
 ) -> Result<(Output, bool), String> {
-    run_cmd_streaming_inner(ctx, program, args, cwd, timeout_secs, None, None, Some(output_bytes)).await
+    run_cmd_streaming_inner(
+        ctx,
+        program,
+        args,
+        cwd,
+        timeout_secs,
+        None,
+        None,
+        Some(output_bytes),
+        None,
+    )
+    .await
+    .map(|(output, truncated, _)| (output, truncated))
+}
+
+/// 与 [`run_cmd_streaming_limited`] 相同，但额外把原生资源限制挂到子进程上，并返回
+/// **实际施加情况**——未生效的限额由调用方如实上报，不能被吞掉。
+pub async fn run_cmd_streaming_limited_with_native_limits(
+    ctx: &ToolCtx,
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    timeout_secs: u64,
+    output_bytes: usize,
+    limits: &crate::agent::native_limits::NativeLimits,
+) -> Result<
+    (
+        Output,
+        bool,
+        crate::agent::native_limits::NativeLimitsReport,
+    ),
+    String,
+> {
+    run_cmd_streaming_inner(
+        ctx,
+        program,
+        args,
+        cwd,
+        timeout_secs,
+        None,
+        None,
+        Some(output_bytes),
+        Some(limits),
+    )
+    .await
 }
 
 async fn run_cmd_streaming_inner(
@@ -259,10 +304,23 @@ async fn run_cmd_streaming_inner(
     log_file: Option<&std::path::Path>,
     envs: Option<&[(String, String)]>,
     output_bytes: Option<usize>,
-) -> Result<(Output, bool), String> {
+    native_limits: Option<&crate::agent::native_limits::NativeLimits>,
+) -> Result<
+    (
+        Output,
+        bool,
+        crate::agent::native_limits::NativeLimitsReport,
+    ),
+    String,
+> {
     use tokio::io::{AsyncWriteExt, BufReader};
 
     let mut cmd = crate::utils::process::command(program, args)?;
+    // 资源限制必须在 spawn 之前挂上（fork 后、exec 前生效）
+    let limits_report = match native_limits {
+        Some(limits) => crate::agent::native_limits::apply(&mut cmd, limits),
+        None => crate::agent::native_limits::NativeLimitsReport::default(),
+    };
     if let Some(envs) = envs {
         cmd.envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
@@ -406,11 +464,15 @@ async fn run_cmd_streaming_inner(
     let (out, err) = finish_output_readers(stdout_task, stderr_task, &stdout_snapshot, &stderr_snapshot).await;
 
     let truncated = budget.lock().map(|budget| budget.truncated).unwrap_or(true);
-    Ok((Output {
-        status,
-        stdout: out.into_bytes(),
-        stderr: err.into_bytes(),
-    }, truncated))
+    Ok((
+        Output {
+            status,
+            stdout: out.into_bytes(),
+            stderr: err.into_bytes(),
+        },
+        truncated,
+        limits_report,
+    ))
 }
 
 struct StreamOutputBudget {

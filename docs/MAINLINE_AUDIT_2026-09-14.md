@@ -320,3 +320,32 @@
 关于原计划的阶段 4（通用效果证据）：**本轮不实施**。可本地落地的部分只剩「执行结果台账」（能力 id、退出码、耗时、影响对象），与既有 `host_capability_claims`（started/succeeded/failed + subject）高度重复；真正有价值的效果证据（安装后的版本、设备是否出现、产物摘要）必须连真机或真实 hdc 才能产生和验证，写了也只能是不可验证的解析代码。待有设备环境时按此顺序实施：① 定义 `HostEffectEvidence` 契约并落 run 事件；② 先接 `deploy`/`install`（hdc 输出解析 + 安装后 `bm dump` 版本核对）与 `emulator.start`（hdc list 出现）；③ 负例覆盖安装失败、版本不符、设备中途掉线。
 
 验证：后端库 1,067 通过、9 忽略（总计 1,076）；两组崩溃恢复集成各 3 项通过。本批未改前端，未重跑 UI、真机、系统沙箱或安装包验收。
+
+## 17. 原生沙箱资源限制落点（2026-09-15）
+
+发现：`SandboxSpec.limits` 里的限额只有 OCI 后端在用（`--cpus/--memory/--pids-limit/--tmpfs`），原生后端（macOS `sandbox-exec`、Linux bubblewrap）既不施加也不上报——审计里「原生 CPU/内存/PID 不强制」正是指这一点。
+
+**先实测再设计**（macOS arm64，直接调 `setrlimit`/`ulimit`，不靠文档推断）：
+
+| 限额 | 实测结果 |
+| --- | --- |
+| `RLIMIT_CPU` | 可设置且**真实生效**：自旋子进程 CPU 时间用尽后被信号终止（退出码 152 = 128 + SIGXCPU(24)） |
+| `RLIMIT_FSIZE` / `RLIMIT_NOFILE` | 可设置 |
+| `RLIMIT_AS` / `RLIMIT_DATA` | **内核不接受修改**（setrlimit 返回 EINVAL）→ macOS 无法用 rlimit 限制内存 |
+| `RLIMIT_NPROC` | 可设置，但语义是**按用户全局计数**：软限设到 40 后子进程连 `fork` 都失败（宿主已有数百进程），不能表达「容器内进程数」 |
+
+已落实：
+
+- `ResourceLimits` 新增 `cpu_seconds`（`#[serde(default)]` = 600，`validate` 限 1–3600，旧 spec 仍可反序列化）；OCI 映射 `--ulimit=cpu=`，原生映射 `RLIMIT_CPU`。
+- 新增 `src-tauri/src/agent/native_limits.rs`：`from_spec` **只映射语义等价**的限额（`cpu_seconds`、`memory_mb`→`RLIMIT_AS`）；`apply` 在 fork 之后、exec 之前用 `pre_exec` + `setrlimit` 挂到子进程。
+- 平台能力用**运行时探测**而不是硬编码平台名：以当前值回写 `setrlimit`（语义空操作），失败即判定该限额不可用——macOS 上 `RLIMIT_AS` 因此被判为不可用。
+- 未施加的限额**不被伪装成已限制**：`NativeLimitsReport` 分 `applied` / `skipped + 原因`，写入 `sandbox_native_limits` 事件，并附 `platform_gaps` 说明 `pids`（rlimit 语义不符）、`cpu_count`（需 cgroups）、`writable_tmp_mb`（`RLIMIT_FSIZE` 是单文件上限）为何不映射。执行器新增 `run_cmd_streaming_limited_with_native_limits` 返回三元组，把报告交给沙箱层。
+- 不把「平台不支持」当成失败：命令照常执行，但审计里写明这次**没有被该项限制保护**。
+
+边界（不勾选「原生资源限制已完成」）：
+
+- 原生路径仍**不限制进程数、CPU 配额、临时磁盘总量**；内存限制在 macOS 实测不可用、Windows 未实现，**只有 Linux 上有望生效且本机无法验证**。
+- `SandboxRunResult` 未新增字段，报告只进 run 事件；UI/工具输出尚未展示这份覆盖情况。
+- 宿主直跑（默认路径）不经过这里，仍然没有资源限制。
+
+验证：后端库 1,072 通过、9 忽略（总计 1,081），新增 5 项：真实子进程 CPU 限额终止、地址空间限额按平台能力分支断言（本机走 skipped 分支且必须带原因）、报告不隐藏未施加项、映射边界与平台缺口说明、无限额时不包装命令；既有沙箱测试全部保持通过。本批未运行 Docker/OCI、真机、系统沙箱边界或安装包验收。
