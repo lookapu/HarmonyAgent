@@ -165,11 +165,16 @@ def check_links(repo: Path) -> list[str]:
         if target.startswith(("http://", "https://", "mailto:", "#")) \
                 or target.startswith("<") or target.endswith((".png", ".jpg", ".jpeg")):
             return None
-        if target.startswith("../"):
-            return (base_dir / target).resolve()
-        if target.startswith("/"):
+        # 锚点片段不是文件路径（约定“锚点除外”）：先剥离 #fragment 再判定目标存在，
+        # 否则 ./x.md#section 这类合法链接会被误判成漂移。
+        path_part = target.split("#", 1)[0]
+        if not path_part:
             return None
-        return (base_dir / target).resolve()
+        if path_part.startswith("../"):
+            return (base_dir / path_part).resolve()
+        if path_part.startswith("/"):
+            return None
+        return (base_dir / path_part).resolve()
 
     root_docs = [
         path for pattern in ("README*.md", "CHANGELOG*.md")
@@ -349,6 +354,16 @@ def self_test() -> None:
         (repo / "docs/OTHER.md").unlink()
         assert any("链接目标不存在" in p for p in check_repo(repo)), "删除链接目标未被检出"
         (repo / "docs/OTHER.md").write_text("# other")
+
+        # 带锚点的相对链接是合法 Markdown，不得误判为漂移
+        (repo / "docs/ROADMAP.md").write_text(
+            "- [x] 引用 [文档](OTHER.md#section)，实现为 `src-tauri/src/agent/evals.rs`。\n"
+        )
+        assert not any("链接目标不存在" in p for p in check_repo(repo)), \
+            "带锚点的相对链接被误判为漂移"
+        (repo / "docs/ROADMAP.md").write_text(
+            "- [x] 任务引用 [文档](OTHER.md)，实现为 `src-tauri/src/agent/evals.rs`。\n"
+        )
 
         # 改坏 CI 测试名 → 必须检出
         (repo / ".github/workflows/quality.yml").write_text(
