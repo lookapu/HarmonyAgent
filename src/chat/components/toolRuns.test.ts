@@ -8,6 +8,9 @@ const failedRun = (tool: string, output: string) => ({
 })
 
 describe('mutationGuardKind', () => {
+  it('distinguishes unsafe node boundaries from stale handles', () => {
+    expect(mutationGuardKind(failedRun('edit_file', '结构编辑句柄边界不安全：包含相邻节点'))).toBe('boundary')
+  })
   it('classifies syntax gate rejections', () => {
     expect(mutationGuardKind(failedRun('edit_file', '代码修改事务被语法门禁拒绝：错误节点由 0 增至 1'))).toBe('syntax')
     expect(mutationGuardKind(failedRun('edit_file', '代码修改事务被 Java 声明门禁拒绝：游离注解由 0 增至 1'))).toBe('syntax')

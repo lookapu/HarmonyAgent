@@ -6,6 +6,75 @@
 
 use std::path::Path;
 
+/// 行级句柄只能修改独占整行的完整声明，不能把同一行的邻居一并吞掉。
+/// Java 多变量字段声明也不能冒充单字段句柄；应使用精确文本事务修改。
+pub(super) fn validate_java_handle_range(
+    source: &str,
+    start: usize,
+    end: usize,
+    expected_kind: Option<&str>,
+) -> Result<(), String> {
+    let reject = || {
+        "结构编辑句柄边界不安全：Java 行范围并非独立完整声明，可能包含相邻节点或多变量字段。候选内容未落盘；请重新查询结构，或读取后使用精确 old/new 修改。".to_string()
+    };
+    let expected_kind = expected_kind.ok_or_else(reject)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    let tree = parser.parse(source, None).ok_or_else(reject)?;
+    if tree.root_node().has_error() || start == 0 || end < start {
+        return Err(reject());
+    }
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        let kind = match node.kind() {
+            "class_declaration" | "record_declaration" => "class",
+            "interface_declaration" | "annotation_type_declaration" => "interface",
+            "enum_declaration" => "enum",
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration" => "method",
+            "field_declaration" => "field",
+            _ => "",
+        };
+        if kind == expected_kind
+            && node.start_position().row + 1 == start
+            && node.end_position().row + 1 == end
+        {
+            let lines = source.lines().collect::<Vec<_>>();
+            let first = lines.get(start - 1).ok_or_else(reject)?;
+            let last = lines.get(end - 1).ok_or_else(reject)?;
+            let prefix = first
+                .get(..node.start_position().column)
+                .ok_or_else(reject)?;
+            let suffix = last.get(node.end_position().column..).ok_or_else(reject)?;
+            let mut children = node.walk();
+            let grouped = kind == "field"
+                && node
+                    .named_children(&mut children)
+                    .filter(|child| child.kind() == "variable_declarator")
+                    .count()
+                    != 1;
+            if prefix.trim().is_empty() && suffix.trim().is_empty() && !grouped {
+                return Ok(());
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Err(reject());
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MutationGuardReport {
     pub parser: &'static str,
@@ -164,6 +233,29 @@ pub(super) fn validate_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_handle_requires_exclusive_complete_declaration_lines() {
+        let valid = "class A {\r\n  @Override\r\n  public void run() {}\r\n}\r\n";
+        assert!(validate_java_handle_range(valid, 2, 3, Some("method")).is_ok());
+        for (source, start, end, kind) in [
+            ("class A { public void run() {} }", 1, 1, "method"),
+            ("class A {\n void a() {} void b() {}\n}", 2, 2, "method"),
+            ("class A {\n int a, b;\n}", 2, 2, "field"),
+            (
+                "class A {\n @Override\n public void run() {}\n}",
+                3,
+                3,
+                "method",
+            ),
+        ] {
+            assert!(
+                validate_java_handle_range(source, start, end, Some(kind)).is_err(),
+                "{source}"
+            );
+        }
+        assert!(validate_java_handle_range(valid, 2, 3, None).is_err());
+    }
 
     #[test]
     fn rejects_balanced_but_invalid_typescript_before_write() {

@@ -3442,6 +3442,11 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         let (final_body, ranges) = if spec.expected_nodes.is_empty() {
             plan_batch_blocks(body, starts, &spec.news, &spec.anchors, &ext)?
         } else {
+            if ext == "java" {
+                for node in &spec.expected_nodes {
+                    super::code_mutation::validate_java_handle_range(body, node.range.0, node.range.1, node.kind.as_deref())?;
+                }
+            }
             plan_exact_node_ranges(body, &spec.expected_nodes, &spec.news)?
         };
         super::code_mutation::validate_candidate(p, body, &final_body)?;
@@ -3522,6 +3527,9 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             .to_lowercase();
         let body_lines: Vec<&str> = body.split('\n').collect();
         let (o, c) = if let Some((start, end)) = spec.expected_symbol_range {
+            if ext == "java" {
+                super::code_mutation::validate_java_handle_range(body, start, end, spec.expected_symbol_kind.as_deref())?;
+            }
             if start == 0 || end < start || end > body_lines.len() {
                 return Err(
                     "结构编辑句柄已过期：节点精确范围已越出当前文件，请重新查询结构后重试"
@@ -5160,6 +5168,27 @@ mod tests {
         assert!(!updated.contains("toString"), "{updated}");
         assert!(updated.contains("class Service"), "{updated}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn java_symbol_handles_never_delete_same_line_neighbors() {
+        let content = "class A {\n  public void first() {} public void second() {}\n}\n";
+        let (file, roots) = tmp_file("java_shared_line_handle", content, "java");
+        let root = file.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root).into_iter()
+            .find(|symbol| symbol.kind == "method" && symbol.name == "first").unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter().next().unwrap().unwrap();
+        for args in [
+            serde_json::json!({"symbol_handle": handle, "new": ""}),
+            serde_json::json!({"symbol_handle": handle, "new": "", "dry_run": true}),
+            serde_json::json!({"symbol_handles": [handle], "news": [""]}),
+        ] {
+            let error = block_on_rt(edit_file(&args, &roots, "java_shared_line")).unwrap_err();
+            assert!(error.contains("边界不安全"), "{error}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -79,6 +79,11 @@ describe('ToolRunGroup', () => {
 })
 
 describe('ToolRunRow', () => {
+  it('为结构边界拒绝显示独立提示，不误报成过期或语法错误', () => {
+    render(<ToolRunRow run={run({ tool: 'edit_file', status: 'error', output: '结构编辑句柄边界不安全：包含相邻声明' })} />)
+    expect(screen.getByText('home.mutationGuard.boundary.title')).toBeInTheDocument()
+    expect(screen.getByText('home.mutationGuard.boundary.detail')).toBeInTheDocument()
+  })
   it('命令工具默认展开输出', () => {
     render(<ToolRunRow run={run({ tool: 'run_command' })} />)
     expect(screen.getByText('文件内容')).toBeInTheDocument()
