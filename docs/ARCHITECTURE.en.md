@@ -46,7 +46,7 @@ The project started as a Provider manager; today its core is the Rust-backed Age
 └────────────────────────────┬─────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────┐
-│ SQLite (83 migrations) + local files/keychain + external     │
+│ SQLite (84 migrations) + local files/keychain + external     │
 │ toolchain                                                    │
 │ HarmonyOS SDK / hvigor / ohpm / hdc / ArkTS LSP              │
 └──────────────────────────────────────────────────────────────┘
@@ -62,7 +62,7 @@ Current codebase scale:
 | `commands/` command modules (excluding `mod.rs`) | 38 |
 | `services/` service modules (excluding `mod.rs`) | 58 |
 | Tauri IPC registration entry points | 301 |
-| Database migrations | 83 |
+| Database migrations | 84 |
 | React pages | 16 |
 
 These counts evolve with the codebase; the authoritative sources are `TOOL_SPECS` for tools, the `generate_handler!` in `lib.rs` for IPC entry points, and `src-tauri/migrations/` for migrations.
@@ -252,7 +252,7 @@ The model layer supports OpenAI, Anthropic, and Gemini request/streaming-respons
 
 ## 12. Data and Storage
 
-SQLite uses WAL and foreign-key constraints; migrations run sequentially at startup. The current 83 migrations cover:
+SQLite uses WAL and foreign-key constraints; migrations run sequentially at startup. The current 84 migrations cover:
 
 - providers, models, proxy, cost, and request logs;
 - projects, conversations, messages, references, tags, feedback, and versions;

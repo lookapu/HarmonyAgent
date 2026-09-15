@@ -161,6 +161,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (81, "081_desktop_recovery_cursor_indexes", include_str!("../../migrations/081_desktop_recovery_cursor_indexes.sql")),
     (82, "082_host_capability_claims", include_str!("../../migrations/082_host_capability_claims.sql")),
     (83, "083_ota_approval_revocations", include_str!("../../migrations/083_ota_approval_revocations.sql")),
+    (84, "084_host_approval_revocation_tool", include_str!("../../migrations/084_host_approval_revocation_tool.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {

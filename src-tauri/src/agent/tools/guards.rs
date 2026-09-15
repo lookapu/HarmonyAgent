@@ -203,8 +203,14 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     match approval_result {
         Ok(ApprovalOutcome::Approved) => {
             if let Some(scope) = &ota_scope {
-                crate::agent::broker_approval::record_ota_approval(inv.ctx, inv.args_raw, scope, approval_stop_generation)
-                    .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
+                crate::agent::broker_approval::record_capability_approval(
+                    inv.ctx,
+                    tool,
+                    inv.args_raw,
+                    &crate::agent::broker_approval::ApprovalScope::Ota(scope.clone()),
+                    approval_stop_generation,
+                )
+                .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
             }
         }
         Ok(ApprovalOutcome::Rejected(feedback)) => {
