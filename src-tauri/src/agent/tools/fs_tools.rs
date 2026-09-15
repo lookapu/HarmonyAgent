@@ -3526,10 +3526,12 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             .unwrap_or("")
             .to_lowercase();
         let body_lines: Vec<&str> = body.split('\n').collect();
+        let java_bytes = if ext == "java" {
+            spec.expected_symbol_range.map(|(start, end)| {
+                super::code_mutation::resolve_java_handle_byte_range(body, start, end, spec.expected_symbol_kind.as_deref())
+            }).transpose()?
+        } else { None };
         let (o, c) = if let Some((start, end)) = spec.expected_symbol_range {
-            if ext == "java" {
-                super::code_mutation::validate_java_handle_range(body, start, end, spec.expected_symbol_kind.as_deref())?;
-            }
             if start == 0 || end < start || end > body_lines.len() {
                 return Err(
                     "结构编辑句柄已过期：节点精确范围已越出当前文件，请重新查询结构后重试"
@@ -3549,10 +3551,13 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         }
         let start_off = line_starts[o];
         let end_off = if c + 1 < line_starts.len() { line_starts[c + 1] } else { body.len() };
+        let (start_off, end_off) = java_bytes.unwrap_or((start_off, end_off));
         let block_lines = c - o + 1;
         let final_body = format!("{}{}{}", &body[..start_off], spec.new, &body[end_off..]);
         // 先构造 final_text 时不再 move final_body（dry_run 分支仍需借用）
         let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body.clone() };
+        // 单节点预览与真实写入共用候选门禁，不能预览为可应用后才发现语法无效。
+        super::code_mutation::validate_candidate(p, body, &final_body)?;
         // [58] dry-run：内存 diff 预览，不落盘、不写 undo
         if args["dry_run"].as_bool().unwrap_or(false) {
             let old_lines: Vec<&str> = body.split('\n').collect();
@@ -3566,8 +3571,6 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
                 block_lines
             ));
         }
-        // 配平守卫：原文件配平而替换后失衡 → 拒绝落盘（新内容残缺，如漏结束符）
-        super::code_mutation::validate_candidate(p, body, &final_body)?;
         // 落盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
         let p_buf = p.clone();
         let final_buf = final_text.clone();
@@ -5168,6 +5171,26 @@ mod tests {
         assert!(!updated.contains("toString"), "{updated}");
         assert!(updated.contains("class Service"), "{updated}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn java_single_handle_byte_edit_preserves_different_kind_neighbor() {
+        let content = "class A {\n  public void only() {} int keep; // keep comment\n}\n";
+        let (file, roots) = tmp_file("java_byte_handle", content, "java");
+        let root = file.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root).into_iter()
+            .find(|symbol| symbol.kind == "method" && symbol.name == "only").unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter().next().unwrap().unwrap();
+        let preview = block_on_rt(edit_file(&serde_json::json!({"symbol_handle": handle, "new": "", "dry_run": true}), &roots, "java_byte_handle")).unwrap();
+        assert!(preview.contains("dry_run"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        assert!(block_on_rt(edit_file(&serde_json::json!({"symbol_handle": handle, "new": "public void broken( {", "dry_run": true}), &roots, "java_byte_handle")).is_err());
+        block_on_rt(edit_file(&serde_json::json!({"symbol_handle": handle, "new": ""}), &roots, "java_byte_handle")).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content.replace("public void only() {}", ""));
+        // 同一旧句柄仍受完整文件版本约束，不因字节模式绕过过期检查。
+        assert!(block_on_rt(edit_file(&serde_json::json!({"symbol_handle": handle, "new": ""}), &roots, "java_byte_handle")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

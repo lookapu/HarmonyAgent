@@ -6,26 +6,46 @@
 
 use std::path::Path;
 
-/// 行级句柄只能修改独占整行的完整声明，不能把同一行的邻居一并吞掉。
-/// Java 多变量字段声明也不能冒充单字段句柄；应使用精确文本事务修改。
+/// 批量行级句柄仍要求目标独占整行，避免行范围事务吞并相邻声明。
 pub(super) fn validate_java_handle_range(
     source: &str,
     start: usize,
     end: usize,
     expected_kind: Option<&str>,
 ) -> Result<(), String> {
-    let reject = || {
-        "结构编辑句柄边界不安全：Java 行范围并非独立完整声明，可能包含相邻节点或多变量字段。候选内容未落盘；请重新查询结构，或读取后使用精确 old/new 修改。".to_string()
-    };
-    let expected_kind = expected_kind.ok_or_else(reject)?;
+    let (from, to) = resolve_java_handle_byte_range(source, start, end, expected_kind)?;
+    let line_start = source[..from].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = source[to..]
+        .find('\n')
+        .map_or(source.len(), |index| to + index);
+    if !source[line_start..from].trim().is_empty() || !source[to..line_end].trim().is_empty() {
+        return Err(java_boundary_error());
+    }
+    Ok(())
+}
+
+fn java_boundary_error() -> String {
+    "结构编辑句柄边界不安全：Java 范围无法唯一对应完整声明，可能包含相邻同类节点或多变量字段。候选内容未落盘；请重新查询结构，或读取后使用精确 old/new 修改。".into()
+}
+
+/// 文件 SHA 与结构身份由调用方先验证；在绑定行范围中必须恰好找到一个同种 AST 声明。
+/// 返回原文 UTF-8 字节边界，包含注解，绝不包含同行邻居。
+pub(super) fn resolve_java_handle_byte_range(
+    source: &str,
+    start: usize,
+    end: usize,
+    expected_kind: Option<&str>,
+) -> Result<(usize, usize), String> {
+    let expected_kind = expected_kind.ok_or_else(java_boundary_error)?;
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_java::LANGUAGE.into())
         .map_err(|e| e.to_string())?;
-    let tree = parser.parse(source, None).ok_or_else(reject)?;
+    let tree = parser.parse(source, None).ok_or_else(java_boundary_error)?;
     if tree.root_node().has_error() || start == 0 || end < start {
-        return Err(reject());
+        return Err(java_boundary_error());
     }
+    let mut found = None;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
@@ -43,13 +63,6 @@ pub(super) fn validate_java_handle_range(
             && node.start_position().row + 1 == start
             && node.end_position().row + 1 == end
         {
-            let lines = source.lines().collect::<Vec<_>>();
-            let first = lines.get(start - 1).ok_or_else(reject)?;
-            let last = lines.get(end - 1).ok_or_else(reject)?;
-            let prefix = first
-                .get(..node.start_position().column)
-                .ok_or_else(reject)?;
-            let suffix = last.get(node.end_position().column..).ok_or_else(reject)?;
             let mut children = node.walk();
             let grouped = kind == "field"
                 && node
@@ -57,9 +70,10 @@ pub(super) fn validate_java_handle_range(
                     .filter(|child| child.kind() == "variable_declarator")
                     .count()
                     != 1;
-            if prefix.trim().is_empty() && suffix.trim().is_empty() && !grouped {
-                return Ok(());
+            if grouped || found.is_some() {
+                return Err(java_boundary_error());
             }
+            found = Some((node.start_byte(), node.end_byte()));
         }
         if cursor.goto_first_child() {
             continue;
@@ -69,7 +83,7 @@ pub(super) fn validate_java_handle_range(
                 break;
             }
             if !cursor.goto_parent() {
-                return Err(reject());
+                return found.ok_or_else(java_boundary_error);
             }
         }
     }
@@ -233,6 +247,28 @@ pub(super) fn validate_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_byte_range_preserves_unicode_neighbors_and_includes_annotation() {
+        let source = "class A {\n String s = \"中文\"; @Override public String toString() { return s; } int tail;\n}";
+        let (start, end) = resolve_java_handle_byte_range(source, 2, 2, Some("method")).unwrap();
+        assert_eq!(
+            &source[start..end],
+            "@Override public String toString() { return s; }"
+        );
+        let result = format!("{}{}", &source[..start], &source[end..]);
+        assert!(result.contains("String s = \"中文\";"));
+        assert!(result.contains("int tail;"));
+        assert!(!result.contains("@Override"));
+        assert!(validate_candidate(Path::new("A.java"), source, &result).is_ok());
+        assert!(resolve_java_handle_byte_range(
+            "class A { void a() {} void b() {} }",
+            1,
+            1,
+            Some("method")
+        )
+        .is_err());
+    }
 
     #[test]
     fn java_handle_requires_exclusive_complete_declaration_lines() {
