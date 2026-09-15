@@ -567,6 +567,10 @@
         "title": "Unsafe structural boundary — not written",
         "detail": "This line range may include neighboring declarations or a multi-variable field. Refresh the structure or read the content and use an exact text edit; approval does not resolve an ambiguous boundary."
       },
+      "typeCheck": {
+        "title": "Type check gate prevented the write",
+        "detail": "The candidate introduced new javac diagnostics (for example an unresolved type, or an import still referenced after removal), so the file was left unchanged. This is a single-file diff without the project classpath; fix the reference and retry."
+      },
       "syntax": {
         "title": "Syntax gate prevented the write",
         "detail": "The candidate introduced new syntax errors, so the file was left unchanged. The agent can reload the target structure and regenerate a complete syntax node."

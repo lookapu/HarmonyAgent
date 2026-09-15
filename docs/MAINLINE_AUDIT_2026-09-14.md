@@ -152,7 +152,7 @@
 | 超长命令输出 | 用受限行缓冲替代先读整行再截断；兼容按行 smart_decode | 跨平台实际构建编码与超长输出回归 |
 | 原生沙箱输出资源 | stdout/stderr 共用采集预算，在推送事件前限额；超限仍排空管道；截断标志传回 sandbox result | 不代表 CPU/内存/PID/临时磁盘总量限制已完成 |
 
-未关闭的代码主线仍包括：桌面 IO port 完整迁移、Java 类型语义变更保护、原生系统资源限制/Windows 生命周期、非 OTA Broker 审批影响契约和签名发布能力。不得将这些实现缺口改标成“只剩真实验证”。
+未关闭的代码主线仍包括：桌面 IO port 完整迁移、Java 类型语义变更保护（已推进到单文件 javac 差分门禁，JDT LS 语义联动与 Maven/Gradle 全工程验证仍缺，见第 15 节）、原生系统资源限制/Windows 生命周期、非 OTA Broker 审批影响契约和签名发布能力。不得将这些实现缺口改标成“只剩真实验证”。
 
 验证记录：前端 14 文件 120 项通过，lint 与 TypeScript 检查通过；Web build 与 bundle gate 通过。后端最终库回归为 1,025 通过、9 忽略（总计 1,034）；包括真实本机子进程的双管道超限排空和非零退出码测试，但不代表系统沙箱边界验证。没有运行 Docker、真实 Provider、设备或发行安装包。
 
@@ -222,3 +222,25 @@
 仍不承诺跨进程文件系统 CAS：不合作进程仍可能在最终检查与写入之间改写。跨文件提交也不是操作系统级原子事务，失败状态必须依据逐文件核验处理。
 
 验证：后端库 1,039 通过、9 忽略（总计 1,048）；统一诊断建议后，恢复错误重试策略定向测试通过。前端 14 文件 124 项通过，lint、TypeScript、Web build 与 bundle gate 通过；仍有大 chunk 警告。未运行真实模型、设备、原生系统边界或安装包验收。
+
+## 15. Java 编译器差分诊断门禁（2026-09-15）
+
+发现：Tree-sitter 门禁只覆盖语法与注解形态。删除仍在使用的 import、改成不存在的父类、写出并不覆盖任何方法的 `@Override`，都属于“语法合法但编译不过”，此前会直接落盘。
+
+已落实：
+
+- 新增 `src-tauri/src/agent/tools/java_compiler.rs`：基线（当前文件内容）与候选各写进独立临时目录，按包名还原目录结构并按包名从文件路径上溯推导源码根作为 `-sourcepath`，以 `javac -proc:none -nowarn -implicit:none -Xmaxerrs 2000 -J-Duser.language=en -d <tmp>` 编译，只比较 stderr 诊断，临时目录用完即删。
+- 诊断签名归一化：剥掉文件路径与行列号，保留错误消息与 `symbol/location/required/found/reason` 细节行并折叠对齐空白。既有错误的行号漂移不会被当成新增；同一签名在候选中多出现一次才算新增——因此 `/tmp/.../A.java:2` 与 `:12` 是同一签名，而 `symbol: class Bar` 是新增。
+- 差分而非绝对判定：未解析的工程 classpath 会在基线与候选中同时报错并被抵消；候选无诊断时走快速路径，只编译一次。
+- 入口统一：`code_mutation::validate_candidate_with_types` = 既有语法/注解门禁 + Java 编译器差分，`write_file`、`edit_file`（含 starts 批量、Java 单节点与批量句柄、dry-run 预览）、`multi_edit` 的单文件准备阶段与 LSP WorkspaceEdit 共用同一入口；拒绝时原文件不落盘。
+- 无 javac 或单次编译超过 10 秒：**不阻塞写入**，但记录 `java_type_gate_unavailable` 事件并把状态标注为“未做类型校验”，不冒充已校验。
+- 新增 `utils::process::output_stderr_blocking_with_timeout`：stderr 落临时文件（避免大输出写满管道缓冲死锁），超时返回 `Ok(None)` 交由调用方降级；顺带抽出 `blocking_command` 消除与 `output_blocking` 的重复。
+- UI 增加独立的 `typeCheck` 状态与中英文说明，与语法门禁分开呈现：类型错误和语法错误的修复方式不同，不能共用同一条提示；英文侧同时匹配 `java compiler gate`。
+
+边界（**不勾选** P1 Java 语义闭环）：
+
+- 这是**单文件** javac 差分，不是 Maven/Gradle 全工程构建。未解析工程 classpath、JDT LS 语义联动、跨文件类型影响（例如 A 文件删掉的方法仍被 B 文件调用）都不在覆盖内——`multi_edit` 仍是逐文件校验，不做批量联编。
+- 依赖工程 classpath 才能解析的合法引用，在源码根推导失败时可能被保守拒绝；这是可解释的保守策略，不是编译语义完整保证。
+- 编译器即本机或内置 JDK 版本，未做目标字节码版本与多 JDK 矩阵验证；诊断消息文本以英文锁定，避免 locale 漂移。
+
+验证：后端库 1,051 通过、9 忽略（总计 1,060），含 10 项 `java_compiler` 单测（本机 javac 差分断言真实执行、未走跳过分支）、1 项真实写入入口“拒绝且原文件不变”测试、1 项缺程序降级测试；两组崩溃恢复集成各 3 项通过。前端 14 文件 125 项通过，lint、TypeScript、Web build 与 bundle gate 通过（仍有大 chunk 警告）。`git diff --check` 通过。本批未运行真实模型、真实设备、原生系统边界或安装包验收，未重跑百万文件基准。

@@ -137,7 +137,7 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 299 Tauri IPC entry points · 58 service modules  │
-│  - agent/ 53 top-level modules · tools/ 30 files    │
+│  - agent/ 53 top-level modules · tools/ 31 files    │
 │  - SQLite + 79 migrations · full event sourcing for │
 │    runs/steps/tools                                 │
 │  - Bundled runtimes: Node + JDK + Git (runtime/)    │
@@ -178,7 +178,7 @@ src-tauri/src/
 │   ├── session_ctx.rs       #   - Session-level runtime state (converged)
 │   ├── invariants.rs        #   - Write invariants (.env / certs / migration SQL)
 │   ├── session_events.rs    #   - Session event sourcing
-│   └── tools/               #   - 204 Agent tools (30 files)
+│   └── tools/               #   - 204 Agent tools (31 files)
 │       ├── mod.rs               # Tool registry (TOOL_SPECS) + protocol dispatch
 │       ├── protocol.rs          # Tool-call marker parsing
 │       ├── errors.rs            # Structured error envelope (7 ToolError classes)

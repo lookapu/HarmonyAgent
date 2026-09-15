@@ -12,13 +12,14 @@ mod build_tools;
 mod cmd_tools;
 mod code_mutation;
 mod compose_tools;
+mod java_compiler;
 
 pub(crate) fn validate_code_mutation(
     path: &std::path::Path,
     before: &str,
     after: &str,
 ) -> Result<(), String> {
-    code_mutation::validate_candidate(path, before, after).map(|_| ())
+    code_mutation::validate_candidate_with_types(path, before, after).map(|_| ())
 }
 pub mod contracts;
 pub mod capabilities;

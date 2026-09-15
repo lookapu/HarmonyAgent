@@ -227,6 +227,53 @@ pub(super) fn validate_candidate(
     })
 }
 
+fn is_java_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("java"))
+}
+
+/// 写入路径上的完整门禁：先跑语法/注解检查，再为 Java 追加 javac 类型诊断差分。
+///
+/// 差分只拦「候选新增的编译诊断」——既有工程依赖缺失会在两侧同时出现并抵消，因此
+/// 不解析 Maven/Gradle classpath 也能拦住误删仍在使用的 import、不存在的父类和错误的
+/// override。无 javac 或编译超时时降级为未校验（记录事件，不阻塞写入），绝不冒充已校验。
+pub(super) fn validate_candidate_with_types(
+    path: &Path,
+    before: &str,
+    after: &str,
+) -> Result<MutationGuardReport, String> {
+    let report = validate_candidate(path, before, after)?;
+    if !is_java_source(path) {
+        return Ok(report);
+    }
+    match super::java_compiler::check(path, before, after) {
+        super::java_compiler::JavaTypeCheck::Checked {
+            before: before_errors,
+            after: after_errors,
+            added,
+        } => {
+            if !added.is_empty() {
+                let shown: Vec<String> = added.iter().take(3).cloned().collect();
+                return Err(format!(
+                    "代码修改事务被 Java 编译器门禁拒绝：{} 的 javac 诊断由 {} 条增至 {} 条，新增：{}。候选内容未落盘；请修正引用的类型或补回仍在使用的 import 后重试。判定为单文件 javac 差分，未解析工程 classpath。",
+                    path.display(),
+                    before_errors,
+                    after_errors,
+                    shown.join("；")
+                ));
+            }
+        }
+        super::java_compiler::JavaTypeCheck::Unavailable { reason } => {
+            crate::utils::logger::log_event(
+                "java_type_gate_unavailable",
+                serde_json::json!({ "path": path.display().to_string(), "reason": reason }),
+            );
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

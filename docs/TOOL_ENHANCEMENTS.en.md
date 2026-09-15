@@ -9,7 +9,7 @@
 | Item | Current value | Authoritative source |
 |---|---:|---|
 | External Agent tools | 204 | `agent/tools/mod.rs::TOOL_SPECS` |
-| Tool implementation files | 30 | `src-tauri/src/agent/tools/*.rs` |
+| Tool implementation files | 31 | `src-tauri/src/agent/tools/*.rs` |
 | Task groups | 8 | `TOOL_GROUP` / `TASK_GROUPS` |
 | Permission levels | L0/L1/L2 | `services/permissions.rs` and tool hooks |
 | Tool protocol | Textual markers + native function calling | `protocol.rs` / `commands/chat.rs` |

@@ -921,14 +921,12 @@ pub fn kill_tree(pid: Option<u32>) {
     }
 }
 
-/// 同步执行并捕获输出（Windows 下同样隐藏窗口）；用于非 async 上下文（如 git rev-parse）。
-pub fn output_blocking(program: &str, args: &[String]) -> Result<std::process::Output, String> {
-    let resolved = resolve_program(program).ok_or_else(|| not_found_error(program))?;
-
+/// 构建配置好的同步子进程命令（与 `command()` 同口径：Windows .cmd/.bat 包装、
+/// 隐藏控制台、node_cli 转发、内置 JDK 环境覆盖）。
+fn blocking_command(resolved: &Resolved, args: &[String]) -> std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // 同 command()：.cmd/.bat 经 cmd.exe /C 包装，程序换成 cmd.exe
         let mut cmd = if resolved.needs_cmd_wrap {
             std::process::Command::new("cmd.exe")
         } else {
@@ -947,7 +945,7 @@ pub fn output_blocking(program: &str, args: &[String]) -> Result<std::process::O
         for (k, v) in jdk_env_overrides() {
             cmd.env(k, v);
         }
-        cmd.output().map_err(|e| format!("执行 {program} 失败: {e}"))
+        cmd
     }
 
     #[cfg(not(windows))]
@@ -961,8 +959,79 @@ pub fn output_blocking(program: &str, args: &[String]) -> Result<std::process::O
         for (k, v) in jdk_env_overrides() {
             cmd.env(k, v);
         }
-        cmd.output().map_err(|e| format!("执行 {program} 失败: {e}"))
+        cmd
     }
+}
+
+/// 同步执行并捕获输出（Windows 下同样隐藏窗口）；用于非 async 上下文（如 git rev-parse）。
+pub fn output_blocking(program: &str, args: &[String]) -> Result<std::process::Output, String> {
+    let resolved = resolve_program(program).ok_or_else(|| not_found_error(program))?;
+    blocking_command(&resolved, args)
+        .output()
+        .map_err(|e| format!("执行 {program} 失败: {e}"))
+}
+
+/// 同步执行的临时捕获文件名（唯一，避免并发调用互相覆盖）。
+fn temp_capture_path(program: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "harmony-{program}-{}-{seq}.log",
+        std::process::id()
+    );
+    std::env::temp_dir().join(name)
+}
+
+/// 同步执行、丢弃 stdout、把 stderr 捕获到临时文件，带墙钟超时。
+///
+/// stderr 落文件而非管道：javac/构建工具在大工程上输出可超过管道缓冲，直接 pipe
+/// 且不读取会因缓冲写满而死锁。超时返回 `Ok(None)`（子进程已终止），由调用方决定
+/// 是降级处理还是报错；返回 `Ok(Some((退出码, stderr)))` 时退出码为 -1 表示被信号终止。
+pub fn output_stderr_blocking_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<Option<(i32, String)>, String> {
+    let resolved = resolve_program(program).ok_or_else(|| not_found_error(program))?;
+    let err_path = temp_capture_path(program);
+    let err_file = std::fs::File::create(&err_path)
+        .map_err(|e| format!("创建 {program} 输出临时文件失败: {e}"))?;
+    let mut cmd = blocking_command(&resolved, args);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(err_file));
+    let mut child = cmd.spawn().map_err(|e| {
+        let _ = std::fs::remove_file(&err_path);
+        format!("执行 {program} 失败: {e}")
+    })?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(&err_path);
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&err_path);
+                return Err(format!("等待 {program} 退出失败: {e}"));
+            }
+        }
+    };
+    let captured = std::fs::read(&err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&err_path);
+    Ok(Some((
+        status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&captured).to_string(),
+    )))
 }
 
 #[cfg(test)]
@@ -995,6 +1064,19 @@ mod tests {
     fn test_command_not_found_has_hint() {
         let err = command("this-program-definitely-not-exists-xyz", &[]).unwrap_err();
         assert!(err.contains("找不到程序"));
+    }
+
+    /// 缺程序时带超时的同步执行必须报错（调用方据此降级为「未校验」），
+    /// 不能伪装成一次超时或零输出。
+    #[test]
+    fn test_output_stderr_blocking_with_timeout_reports_missing_program() {
+        let err = output_stderr_blocking_with_timeout(
+            "this-program-definitely-not-exists-xyz",
+            &[],
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.contains("找不到程序"), "{err}");
     }
 
     /// system_path_has_java：PATH 中仅有真实 java 文件才视为系统已有 JDK；

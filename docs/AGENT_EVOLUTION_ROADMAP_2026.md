@@ -7,7 +7,7 @@
 
 ## 0. 当前进度快照
 
-最新实现/验收分账见 [主线盘点与后续落实（2026-09-15）](./MAINLINE_AUDIT_2026-09-14.md#9-后续实现进展2026-09-15)。恢复 OTA 卡片身份、持久撤销展示、UI 实际审计查询、Broker 工作区身份、20 工具常驻预算与原生沙箱采集侧输出预算已落实。Windows 原生生命周期、系统资源总量限制、桌面 IO port、Java 类型语义和签名发布仍是代码待办，不归类为仅需真实验证。
+最新实现/验收分账见 [主线盘点与后续落实（2026-09-15）](./MAINLINE_AUDIT_2026-09-14.md#9-后续实现进展2026-09-15)。恢复 OTA 卡片身份、持久撤销展示、UI 实际审计查询、Broker 工作区身份、20 工具常驻预算与原生沙箱采集侧输出预算已落实。Windows 原生生命周期、系统资源总量限制、桌面 IO port、Java 类型语义（已接入单文件 javac 差分诊断，JDT LS 语义联动与 Maven/Gradle 全工程验证仍缺）和签名发布仍是代码待办，不归类为仅需真实验证。
 
 以下保留 2026-09-10 起累计的阶段证据，历史数量和局部完成标记不覆盖上述最新状态。
 
@@ -464,7 +464,7 @@ Flutter/Dart、Rust、TypeScript/ArkTS 等语言采用相同协议，由语言 a
 
 - **P0 写前门禁**：先在内存副本应用、配平、解析、diff 范围核对，失败不落盘；把现有写工具统一接入事务外壳；
 - **P1 节点事务**：核心已落地——`symbol_handle` v3 封装稳定/位置 `node_id + expected_hash + node content hash + expected_kind + parent range`，支持单节点与同文件多节点原子修改；同文件非目标区域变化可显式受控重定位，目标变化、歧义或旧版句柄一律拒绝，不以模糊匹配静默越过冲突；
-- **P1 Java 语义闭环**：JDT LS/Javac adapter、annotation/import/override 联动、Maven/Gradle 验证；
+- **P1 Java 语义闭环**：JDT LS/Javac adapter、annotation/import/override 联动、Maven/Gradle 验证；已落地的 `src-tauri/src/agent/tools/java_compiler.rs` 提供单文件 javac 差分诊断（误删仍在使用的 import、不存在的父类、错误 override 都会被拦），但未解析工程 classpath，JDT LS 语义联动与 Maven/Gradle 全工程构建仍未完成，本项不勾选；
 - **P2 跨文件事务**：承接 LSP WorkspaceEdit、原子暂存/提交、失败回滚和外部编辑冲突重规划；
 - **评测出口**：固定加入漏 `) ] }`、Widget 子树错位、Java 游离 `@Override`/`@Resource`、误删仍在使用的 import、并发外部改写、部分多文件写入六类故障；要求新语法错误落盘率为 0、部分事务残留率为 0，并分别报告预防率、回滚率和误拒绝率。
 

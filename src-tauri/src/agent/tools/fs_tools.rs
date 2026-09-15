@@ -3075,7 +3075,7 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
     // 配平守卫（与 edit_file 同口径）：代码文件写入后必须配平——
     // 新文件不存在（旧内容为空串，视为配平基准），内容缺结束符（漏 } 等）→ 拒绝落盘
     let old_text = std::fs::read_to_string(p).unwrap_or_default(); // 不存在/读取失败 → 空串
-    super::code_mutation::validate_candidate(p, &old_text, &content_out)?;
+    super::code_mutation::validate_candidate_with_types(p, &old_text, &content_out)?;
     // [58] dry-run：预览将写入的内容，不落盘、不写 undo
     if args["dry_run"].as_bool().unwrap_or(false) {
         let preview: String = {
@@ -3497,7 +3497,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         } else {
             plan_exact_node_ranges(body, &spec.expected_nodes, &spec.news)?
         };
-        super::code_mutation::validate_candidate(p, body, &final_body)?;
+        super::code_mutation::validate_candidate_with_types(p, body, &final_body)?;
         let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body.clone() };
         let range_label = if spec.expected_nodes.is_empty() {
             "starts"
@@ -3605,7 +3605,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         // 先构造 final_text 时不再 move final_body（dry_run 分支仍需借用）
         let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body.clone() };
         // 单节点预览与真实写入共用候选门禁，不能预览为可应用后才发现语法无效。
-        super::code_mutation::validate_candidate(p, body, &final_body)?;
+        super::code_mutation::validate_candidate_with_types(p, body, &final_body)?;
         // [58] dry-run：内存 diff 预览，不落盘、不写 undo
         if args["dry_run"].as_bool().unwrap_or(false) {
             let old_lines: Vec<&str> = body.split('\n').collect();
@@ -3679,7 +3679,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
     let (replaced, count) = apply_edit(body, old, new, replace_all)
         .map_err(|e| with_advice("edit_file", e))?;
     // 配平守卫：原文件配平而替换后失衡 → 拒绝落盘（新内容残缺，如漏结束符）
-    super::code_mutation::validate_candidate(p, body, &replaced)?;
+    super::code_mutation::validate_candidate_with_types(p, body, &replaced)?;
     // 先构造 final_text 时不再 move replaced（dry_run 分支仍需借用）
     let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced.clone() };
     // [58] dry-run：内存 diff 预览，不落盘、不写 undo
@@ -4070,7 +4070,7 @@ fn prepare_single_edit(
         None => (false, text.as_str()),
     };
     let (replaced, count) = apply_edit(body, old, new, replace_all)?;
-    super::code_mutation::validate_candidate(&p, body, &replaced)?;
+    super::code_mutation::validate_candidate_with_types(&p, body, &replaced)?;
     let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced };
     Ok(PreparedEdit { path: p, old_bytes: bytes, final_text, count })
 }
@@ -5305,6 +5305,33 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
         block_on_rt(edit_file(&serde_json::json!({"symbol_handles": handles, "news": ["", ""]}), &roots, "java_batch_byte_handles")).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), content.replace("public void first() {}", "").replace("public void second() {}", ""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 真实入口：删除仍在使用的 import 语法依然合法，只有 javac 差分能拦住。
+    /// 拒绝时原文件不得改变；无 javac 环境按「未做类型校验」降级，测试如实区分两条路径。
+    #[test]
+    fn java_entry_type_gate_blocks_compile_breaking_edit_atomically() {
+        let content = "package a;\nimport java.util.List;\nclass A {\n  List<String> xs;\n}\n";
+        let (file, roots) = tmp_file("java_type_gate", content, "java");
+        let root = file.parent().unwrap().to_path_buf();
+        let args = serde_json::json!({
+            "path": file.to_string_lossy(),
+            "old": "import java.util.List;\n",
+            "new": ""
+        });
+        match block_on_rt(edit_file(&args, &roots, "java_type_gate")) {
+            Err(error) => {
+                assert!(error.contains("Java 编译器门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            }
+            Ok(_) => {
+                assert_eq!(
+                    std::fs::read_to_string(&file).unwrap(),
+                    content.replace("import java.util.List;\n", "")
+                );
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

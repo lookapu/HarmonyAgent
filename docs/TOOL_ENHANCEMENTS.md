@@ -9,7 +9,7 @@
 | 项目 | 当前值 | 权威来源 |
 |---|---:|---|
 | 对外 Agent 工具 | 204 | `agent/tools/mod.rs::TOOL_SPECS` |
-| 工具实现文件 | 30 | `src-tauri/src/agent/tools/*.rs` |
+| 工具实现文件 | 31 | `src-tauri/src/agent/tools/*.rs` |
 | 任务分组 | 8 | `TOOL_GROUP` / `TASK_GROUPS` |
 | 权限等级 | L0/L1/L2 | `services/permissions.rs` 与工具 hooks |
 | 工具协议 | 文本标记 + 原生 function calling | `protocol.rs` / `commands/chat.rs` |
