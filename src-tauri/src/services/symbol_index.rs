@@ -3539,9 +3539,7 @@ fn git_changed_paths(
     let mut paths = Vec::new();
     for value in output.stdout.split(|byte| *byte == 0).filter(|value| !value.is_empty()) {
         let rel = std::str::from_utf8(value).ok()?.replace('\\', "/");
-        if normalize_changed_path(root, &rel).is_none() {
-            return None;
-        }
+        normalize_changed_path(root, &rel)?;
         paths.push(rel);
         if paths.len() > MAX_GIT_DELTA_PATHS {
             return None;
@@ -4733,9 +4731,7 @@ fn normalize_project_path(base: &str, value: &str) -> Option<String> {
         match part {
             "" | "." => {}
             ".." => {
-                if parts.pop().is_none() {
-                    return None;
-                }
+                parts.pop()?;
             }
             value if value != "." && value != ".." => parts.push(value),
             _ => return None,
@@ -6315,7 +6311,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(handle.starts_with(SYMBOL_READ_HANDLE_V3_PREFIX), "{handle}");
-        let locator = resolve_symbol_read_handle(&[root.clone()], &handle).unwrap();
+        let locator = resolve_symbol_read_handle(std::slice::from_ref(&root), &handle).unwrap();
         assert_eq!(locator.expected_kind.as_deref(), Some("method"));
         assert_eq!(locator.node_id.len(), 43);
         assert_eq!((locator.start_line, locator.end_line), (2, 5));
@@ -6345,7 +6341,7 @@ mod tests {
             symbol.line,
             symbol.end_line,
         );
-        let locator = resolve_symbol_read_handle(&[root.clone()], &handle).unwrap();
+        let locator = resolve_symbol_read_handle(std::slice::from_ref(&root), &handle).unwrap();
         assert_eq!(locator.expected_kind, None);
         assert_eq!(locator.start_line, symbol.line);
         std::fs::remove_dir_all(&root).ok();
@@ -6374,7 +6370,7 @@ mod tests {
             symbol.line,
             symbol.end_line,
         );
-        let locator = resolve_symbol_read_handle(&[root.clone()], &handle).unwrap();
+        let locator = resolve_symbol_read_handle(std::slice::from_ref(&root), &handle).unwrap();
         assert_eq!(locator.expected_kind.as_deref(), Some("function"));
         assert!(!locator.relocated);
         std::fs::remove_dir_all(&root).ok();
@@ -6492,8 +6488,8 @@ impl Worker {
         assert_eq!(method.end_line, 11, "Rust 原始字符串中的大括号不能截断节点");
         assert!(!out.iter().any(|symbol| symbol.name == "helper"), "调用不应被识别成声明: {out:?}");
 
-        let handle = symbol_read_handles(&dir, &[function.clone()]).remove(0).unwrap();
-        let locator = resolve_symbol_read_handle(&[dir.clone()], &handle).unwrap();
+        let handle = symbol_read_handles(&dir, std::slice::from_ref(function)).remove(0).unwrap();
+        let locator = resolve_symbol_read_handle(std::slice::from_ref(&dir), &handle).unwrap();
         assert_eq!(locator.start_line, 1, "文档注释和属性必须随声明进入节点事务");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6554,8 +6550,8 @@ extension type UserId(int value) {
         assert!(!out.iter().any(|symbol| matches!(symbol.name.as_str(), "runApp" | "notifyListeners" | "print")), "调用不应被识别成声明: {out:?}");
         assert!(out.iter().all(|symbol| symbol.language == "dart" && symbol.source_layer == "lightweight"));
 
-        let handle = symbol_read_handles(&dir, &[increment.clone()]).remove(0).unwrap();
-        let locator = resolve_symbol_read_handle(&[dir.clone()], &handle).unwrap();
+        let handle = symbol_read_handles(&dir, std::slice::from_ref(increment)).remove(0).unwrap();
+        let locator = resolve_symbol_read_handle(std::slice::from_ref(&dir), &handle).unwrap();
         assert_eq!(locator.start_line, 8, "@override 必须随 Dart 方法进入节点事务");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7728,7 +7724,7 @@ class Service extends BaseService implements Loadable, Disposable {}
             .find(|symbol| symbol.name == "Service")
             .cloned()
             .unwrap();
-        let (resolved, _) = query_persisted_edges_at(&root, &data_dir, &[service.clone()])
+        let (resolved, _) = query_persisted_edges_at(&root, &data_dir, std::slice::from_ref(&service))
             .unwrap()
             .unwrap();
         assert_eq!(resolved.len(), 1);
@@ -7916,7 +7912,7 @@ class Service extends BaseService implements Loadable, Disposable {}
             .find(|symbol| symbol.name == "Service")
             .cloned()
             .unwrap();
-        let (unique, _) = query_persisted_edges_at(&root, &data_dir, &[service.clone()])
+        let (unique, _) = query_persisted_edges_at(&root, &data_dir, std::slice::from_ref(&service))
             .unwrap()
             .unwrap();
         assert_eq!(unique.len(), 1);
@@ -8095,7 +8091,7 @@ class Service extends BaseService implements Loadable, Disposable {}
             .find(|symbol| symbol.name == "run")
             .cloned()
             .unwrap();
-        let (edges, total) = query_persisted_edges_at(&root, &data_dir, &[run.clone()])
+        let (edges, total) = query_persisted_edges_at(&root, &data_dir, std::slice::from_ref(&run))
             .unwrap()
             .unwrap();
         assert!(edges.iter().any(|edge| {
@@ -8123,7 +8119,7 @@ class Service extends BaseService implements Loadable, Disposable {}
             &["client.ts".into()],
             &changed_target_symbols,
         ));
-        let (invalid_target, _) = query_persisted_edges_at(&root, &data_dir, &[run.clone()])
+        let (invalid_target, _) = query_persisted_edges_at(&root, &data_dir, std::slice::from_ref(&run))
             .unwrap()
             .unwrap();
         assert!(invalid_target
@@ -8383,7 +8379,7 @@ class Service extends BaseService implements Loadable, Disposable {}
             .find(|symbol| symbol.name == "CoreContract" && symbol.file == "contract.ts")
             .cloned()
             .unwrap();
-        let (forward, _) = query_persisted_edges_at(&root, &data_dir, &[service.clone()])
+        let (forward, _) = query_persisted_edges_at(&root, &data_dir, std::slice::from_ref(&service))
             .unwrap()
             .unwrap();
         assert_eq!(forward.len(), 1);

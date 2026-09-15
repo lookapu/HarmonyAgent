@@ -83,7 +83,7 @@ impl OtaInputs {
         let profile = args.iter().position(|arg| arg == "--profile");
         if hap + 1 >= args.len()
             || profile.is_some() != self.profile
-            || profile.map_or(false, |index| index + 1 >= args.len())
+            || profile.is_some_and(|index| index + 1 >= args.len())
         {
             return Err("OTA 固定 argv 与副本契约不一致".into());
         }

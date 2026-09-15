@@ -548,7 +548,7 @@ pub async fn ota_pack(
         .find(|root| {
             hap_full.starts_with(root)
                 && out_full.starts_with(root)
-                && profile_full.as_ref().map_or(true, |profile| profile.starts_with(root))
+                && profile_full.as_ref().is_none_or(|profile| profile.starts_with(root))
         })
         .ok_or("HAP、输出和 profile 必须位于同一个已授权项目根内")?;
     let relative = |path: &std::path::Path| -> Result<String, String> {
@@ -713,6 +713,28 @@ fn pick_response_sample(op: &serde_json::Value, depth: usize) -> (u16, serde_jso
 }
 
 
+
+fn path_template_to_regex(path: &str) -> String {
+    let mut re = String::from("^");
+    for seg in path.split('/') {
+        if seg.starts_with('{') && seg.ends_with('}') {
+            re.push_str("/[^/]+");
+        } else if seg.is_empty() {
+            continue;
+        } else {
+            re.push('/');
+            for c in seg.chars() {
+                if ".*+?^$|()[]\\".contains(c) {
+                    re.push('\\');
+                }
+                re.push(c);
+            }
+        }
+    }
+    re.push('$');
+    re
+}
+
 #[cfg(test)]
 mod runtime_boundary_tests {
     use super::*;
@@ -787,25 +809,4 @@ mod runtime_boundary_tests {
             assert!(parse_pid(raw, "pid").is_err(), "accepted {raw:?}");
         }
     }
-}
-
-fn path_template_to_regex(path: &str) -> String {
-    let mut re = String::from("^");
-    for seg in path.split('/') {
-        if seg.starts_with('{') && seg.ends_with('}') {
-            re.push_str("/[^/]+");
-        } else if seg.is_empty() {
-            continue;
-        } else {
-            re.push('/');
-            for c in seg.chars() {
-                if ".*+?^$|()[]\\".contains(c) {
-                    re.push('\\');
-                }
-                re.push(c);
-            }
-        }
-    }
-    re.push('$');
-    re
 }

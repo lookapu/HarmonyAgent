@@ -1057,7 +1057,7 @@ pub async fn verify_native_sandbox_boundary() -> SandboxBoundaryReport {
     let external = root.join("external");
     let setup = [&workspace, &scratch, &external]
         .iter()
-        .try_for_each(|path| std::fs::create_dir_all(path));
+        .try_for_each(std::fs::create_dir_all);
     if let Err(error) = setup {
         let _ = std::fs::remove_dir_all(&root);
         return unavailable_boundary_report(

@@ -361,7 +361,7 @@ fn fallback_name(symbol: &str) -> String {
         .split_whitespace()
         .last()
         .unwrap_or(symbol)
-        .trim_end_matches(|ch: char| matches!(ch, '.' | '#' | '/' | ')' | '('))
+        .trim_end_matches(['.', '#', '/', ')', '('])
         .to_string()
 }
 
@@ -507,6 +507,8 @@ pub fn import(root: &Path, database: &Path, index: &Path) -> Result<ScipImportSt
     let lock_path = database.with_extension("scip-import.lock");
     let lock_file = OpenOptions::new()
         .create(true)
+        // 锁文件只用于 flock，内容无意义：显式声明不截断，避免被误读成会覆盖已有内容
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

@@ -5397,29 +5397,26 @@ async fn stream_chat_inner(
                     }),
                 );
                 // 工具循环检测：由共享 KernelExecutorState 持有 governor 状态。
-                match verdict {
-                    crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, repeat, same_name, turn_calls } => {
-                        crate::utils::logger::log_event(
-                            "tool_loop_detected",
-                            serde_json::json!({
-                                "conversation_id": conversation_id,
-                                "tool": tool,
-                                "repeat": repeat,
-                                "same_name": same_name,
-                                "turn_calls": turn_calls,
-                                "breaks": kernel_executor.loop_breaks(),
-                            }),
-                        );
-                        pending.clear();
-                        if final_halt {
-                            exhausted = true;
-                        } else {
-                            correction_text = String::new();
-                            correction_hint = corrective_hint.unwrap_or_default();
-                        }
-                        break;
+                if let crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, repeat, same_name, turn_calls } = verdict {
+                    crate::utils::logger::log_event(
+                        "tool_loop_detected",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "tool": tool,
+                            "repeat": repeat,
+                            "same_name": same_name,
+                            "turn_calls": turn_calls,
+                            "breaks": kernel_executor.loop_breaks(),
+                        }),
+                    );
+                    pending.clear();
+                    if final_halt {
+                        exhausted = true;
+                    } else {
+                        correction_text = String::new();
+                        correction_hint = corrective_hint.unwrap_or_default();
                     }
-                    _ => {}
+                    break;
                 }
                 // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
                 // executor attempt 在当前调用进入时已原子 +1，因此 attempt-1 是此前累计

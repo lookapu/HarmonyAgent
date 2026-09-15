@@ -297,27 +297,6 @@ fn online_target_set(text: &str) -> std::collections::HashSet<String> {
     crate::commands::devices::online_device_ids_from_targets(text).into_iter().collect()
 }
 
-#[cfg(test)]
-mod emulator_boundary_tests {
-    use super::*;
-
-    #[test]
-    fn online_evidence_excludes_empty_offline_and_unauthorized_targets() {
-        let targets = online_target_set("[Empty]\nold Offline\nlocked Unauthorized\npending Unknown\nnew Connected\nnew Connected\nlegacy\n");
-        assert_eq!(targets, ["new".to_string(), "legacy".to_string()].into_iter().collect());
-        let before = online_target_set("device Offline\n");
-        let after = online_target_set("device Connected\n");
-        assert_eq!(after.difference(&before).count(), 1);
-    }
-
-    #[test]
-    fn instance_transition_requires_exact_precondition() {
-        assert!(validate_instance_transition("Phone\nPhone2\n", "Phone", "create").is_err());
-        assert!(validate_instance_transition("Phone2\n", "Phone", "create").is_ok());
-        assert!(validate_instance_transition("Phone2\n", "Phone", "delete").is_err());
-        assert!(validate_instance_transition(" Phone \r\n", "Phone", "delete").is_ok());
-    }
-}
 
 fn validate_instance_transition(list: &str, name: &str, action: &str) -> Result<(), String> {
     let exists = list.lines().any(|line| line.trim() == name);
@@ -838,4 +817,26 @@ pub(super) fn summarize_crash_file(content: &str) -> String {
         s.push_str("…\n");
     }
     s
+}
+
+#[cfg(test)]
+mod emulator_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn online_evidence_excludes_empty_offline_and_unauthorized_targets() {
+        let targets = online_target_set("[Empty]\nold Offline\nlocked Unauthorized\npending Unknown\nnew Connected\nnew Connected\nlegacy\n");
+        assert_eq!(targets, ["new".to_string(), "legacy".to_string()].into_iter().collect());
+        let before = online_target_set("device Offline\n");
+        let after = online_target_set("device Connected\n");
+        assert_eq!(after.difference(&before).count(), 1);
+    }
+
+    #[test]
+    fn instance_transition_requires_exact_precondition() {
+        assert!(validate_instance_transition("Phone\nPhone2\n", "Phone", "create").is_err());
+        assert!(validate_instance_transition("Phone2\n", "Phone", "create").is_ok());
+        assert!(validate_instance_transition("Phone2\n", "Phone", "delete").is_err());
+        assert!(validate_instance_transition(" Phone \r\n", "Phone", "delete").is_ok());
+    }
 }

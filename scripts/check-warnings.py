@@ -10,9 +10,17 @@
 compiler-message，按 (lint 名, 文件:行) 去重。同一告警在 lib/bin/test 等
 多个 target 会重复报告，去重后才是真实告警数。
 
-基线说明（Q-07 收敛结果）：338 → 44，剩余 44 个全为结构类告警
+基线说明（Q-07 收敛结果）：338 → 44，当时剩余 44 个全为结构类告警
 （too_many_arguments 31 + type_complexity 13），按项目哲学"不以消除全部
 历史告警作为前置条件"保留为基线；新增任何机械类告警立即阻断 CI。
+
+2026-09-15 重新定基线：44 → 59。机械类告警（bool_assert_comparison、
+cloned_ref_to_slice_refs、manual_inspect、unnecessary_map_or、question_mark、
+items_after_test_module、redundant_closure、single_match、
+manual_pattern_char_comparison、suspicious_open_options 等约 41 条）已全部收敛，
+部分属于较新 clippy lint 与测试代码；结构类随代码增长到 59
+（too_many_arguments 42 + type_complexity 17）。基线只保留结构类，
+口径不变：新增任何机械类告警仍然立即阻断。
 """
 
 import argparse
@@ -23,7 +31,7 @@ from collections import Counter
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_BASELINE = 44
+DEFAULT_BASELINE = 59
 
 
 def count_unique_warnings(json_lines):

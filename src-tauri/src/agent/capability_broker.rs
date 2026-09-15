@@ -1558,21 +1558,19 @@ pub fn dispatch_host_capability(
         return Err("宿主进程派发入口目前只允许 emulator.start".into());
     }
     let capability_id = capability.capability_id();
-    let identity = request_identity(ctx, capability).map_err(|error| {
+    let identity = request_identity(ctx, capability).inspect_err(|_| {
         ctx.record_run_event("host_capability.rejected", serde_json::json!({
             "capability_id": capability_id,
             "reason": "missing_request_identity",
         }));
-        error
     })?;
-    let invocation = prepare_invocation(capability, None).map_err(|error| {
+    let invocation = prepare_invocation(capability, None).inspect_err(|_| {
         ctx.record_run_event("host_capability.rejected", serde_json::json!({
             "capability_id": capability_id,
             "tool_call_id": &identity.tool_call_id,
             "idempotency_key": &identity.idempotency_key,
             "reason": "validation_failed",
         }));
-        error
     })?;
     let subject = audit_subject(capability);
     match claim_request(ctx, capability_id, &identity, &subject)? {
@@ -1643,21 +1641,19 @@ pub fn spawn_host_capability(
         return Err("长任务入口目前只允许 device.screen_record.start".into());
     }
     let capability_id = capability.capability_id();
-    let identity = request_identity(ctx, capability).map_err(|error| {
+    let identity = request_identity(ctx, capability).inspect_err(|_| {
         ctx.record_run_event("host_capability.rejected", serde_json::json!({
             "capability_id": capability_id,
             "reason": "missing_request_identity",
         }));
-        error
     })?;
-    let invocation = prepare_invocation(capability, workspace).map_err(|error| {
+    let invocation = prepare_invocation(capability, workspace).inspect_err(|_| {
         ctx.record_run_event("host_capability.rejected", serde_json::json!({
             "capability_id": capability_id,
             "tool_call_id": &identity.tool_call_id,
             "idempotency_key": &identity.idempotency_key,
             "reason": "validation_failed",
         }));
-        error
     })?;
     let subject = audit_subject(capability);
     match claim_request(ctx, capability_id, &identity, &subject)? {

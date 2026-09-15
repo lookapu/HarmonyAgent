@@ -372,3 +372,10 @@
 验证：非测试 `cargo check --lib` 与 `cargo test --no-run` 均为 **0 警告**；后端库 1,074 通过、9 忽略（总计 1,083）；两组崩溃恢复集成各 3 项通过。
 
 **同日发现的独立问题（不属于本批引入，需单独决策）**：CI 的 clippy 基线门禁 `scripts/check-warnings.py --baseline 44` 当前失败——唯一告警 **100/44**。按 (lint, 文件:行) 逐条与本次会话新增行比对，**落在本会话新增行上的告警为 0**，即这 100 条全部是既有技术债：结构类 61 条（too_many_arguments 44 + type_complexity 17，基线当时是 31+13）、机械类约 39 条（bool_assert_comparison 14、cloned_ref_to_slice_refs 12、manual_inspect 4、unnecessary_map_or 3 等，多为测试代码）。门禁设定「机械类新增立即阻断、结构类保留为基线」，因此要么收敛机械类并重新设定基线，要么只更新基线——两者都会改动质量门禁口径，需要明确决策后再动，本批不改。
+
+**同日跟进（按"先收敛机械类再重定基线"处理完毕）**：机械类告警已全部收敛，门禁通过。
+
+- 收敛内容：`bool_assert_comparison` 14（`assert_eq!(x, false)` → `assert!(!x)`）、`cloned_ref_to_slice_refs` 12（测试里 `&[x.clone()]` → `std::slice::from_ref(...)`，按值/引用分别处理借用）、`manual_inspect` 4（记录事件后原样返回错误的 `map_err` → `inspect_err`，**只改真正透传的四处，会转换错误类型的 `map_err` 保持不动**）、`unnecessary_map_or` 3（→ `is_none_or`/`is_some_and`）、`question_mark` 2、`items_after_test_module` 2（测试模块移到文件末尾，`device_tools` 与 `quality_runtime` 原先夹在生产项之间）、`redundant_closure`、`single_match`、`manual_pattern_char_comparison`、`suspicious_open_options`（SCIP 导入锁文件显式 `.truncate(false)` 并注明"只用于 flock"，保持行为不变）。
+- 基线从 44 调整为 **59**（`scripts/check-warnings.py` 的 `DEFAULT_BASELINE` 与 `quality.yml` 同步），构成只剩结构类：`too_many_arguments` 42 + `type_complexity` 17。脚本头部与 CI 注释都写明了这次重定的原因与"机械类仍立即阻断"的口径；`check-warnings.py --self-test` 通过。
+
+验证：`python3 scripts/check-warnings.py` → `clippy 唯一告警：59/59 PASS`；后端库 1,074 通过、9 忽略（总计 1,083）；两组崩溃恢复集成各 3 项通过；非测试 `cargo check --lib` 0 警告。本批未改前端，未运行 Docker/OCI、真机或安装包验收。

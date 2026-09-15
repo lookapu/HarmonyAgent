@@ -127,7 +127,7 @@ pub(crate) fn argument_scope(
         .find(|root| {
             hap.starts_with(root)
                 && output.starts_with(root)
-                && profile.as_ref().map_or(true, |path| path.starts_with(root))
+                && profile.as_ref().is_none_or(|path| path.starts_with(root))
         })
         .ok_or("OTA 输入和输出必须位于同一授权工作区")?;
     let relative = |path: &Path| -> Result<String, String> {

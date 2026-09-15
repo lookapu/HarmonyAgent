@@ -432,7 +432,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 2); // system + workflow directive
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false); // no history, should not compress
+        assert!(!assembled.compress); // no history, should not compress
         assert_eq!(assembled.messages[0]["role"], "system");
         assert_eq!(assembled.messages[0]["content"], "You are a helpful assistant.");
         assert_eq!(assembled.messages[1]["role"], "system");
@@ -467,7 +467,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + memo + context + workflow
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "Core rules.");
         assert_eq!(assembled.messages[1]["content"], "Memory: user prefers Rust.");
         assert_eq!(assembled.messages[2]["content"], "Context: working on auth module.");
@@ -502,7 +502,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + ledger + plan
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "System.");
         assert_eq!(assembled.messages[1]["content"], "Workflow.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("Ledger:"));
@@ -545,7 +545,7 @@ mod tests {
         // system + workflow + assistant (with reasoning)
         assert_eq!(assembled.messages.len(), 3);
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "System.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -587,7 +587,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + tool result as user
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -669,7 +669,7 @@ mod tests {
         // Short pending action phrase (< 300 chars) should be replaced with placeholder
         assert_eq!(assembled.messages.len(), 3);
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -709,7 +709,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + tool result
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("[工具执行结果 - write_file]"));
@@ -748,7 +748,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + user injection
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -784,7 +784,7 @@ mod tests {
         // system + workflow + plan + progress check
         assert_eq!(assembled.messages.len(), 4);
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("已批准任务计划"));
@@ -819,7 +819,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + assistant + user (continuation)
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -856,7 +856,7 @@ mod tests {
         // reasoning-only 截断没有正文断点，但仍必须注入“直接给结论”指令。
         assert_eq!(assembled.messages.len(), 3); // system + workflow + continuation instruction
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "user");
@@ -894,7 +894,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 4); // system + workflow + assistant + user (correction)
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert_eq!(assembled.messages[2]["role"], "assistant");
@@ -931,7 +931,7 @@ mod tests {
         let assembled = KernelHistoryAssembler::assemble(&input);
         assert_eq!(assembled.messages.len(), 3); // system + workflow + compression summary
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "S.");
         assert_eq!(assembled.messages[1]["content"], "W.");
         assert!(assembled.messages[2]["content"].as_str().unwrap().contains("历史摘要"));
@@ -997,7 +997,7 @@ mod tests {
         // 14: correction user
         assert_eq!(assembled.messages.len(), 15);
         assert_eq!(assembled.images_attached, 0);
-        assert_eq!(assembled.compress, false);
+        assert!(!assembled.compress);
         assert_eq!(assembled.messages[0]["content"], "System prompt.");
         assert_eq!(assembled.messages[1]["content"], "Memo.");
         assert_eq!(assembled.messages[2]["content"], "Context.");
