@@ -4,7 +4,7 @@
 //! 通用配平守卫之上为 ArkTS/TypeScript/JavaScript/Java 提供真实语法树错误增量检查；其它
 //! 语言明确回退配平层，后续由 language adapter 逐步补齐，不能把 fallback 冒充 AST。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 
 fn java_boundary_error() -> String {
@@ -233,6 +233,149 @@ fn is_java_source(path: &Path) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("java"))
 }
 
+/// 单次事务里最多并入多少个“未参与本批”的候选调用方文件（控制 javac 时长）。
+const MAX_AFFECTED_FILES: usize = 20;
+/// 收集候选调用方时的目录扫描上限；超出即停止扫描，按已收集结果继续。
+const MAX_AFFECTED_SCAN: usize = 400;
+/// 反查调用方时单个源文件的读取上限（与编辑能力上限一致）。
+const MAX_AFFECTED_FILE_BYTES: u64 = 1024 * 1024;
+
+/// 取 Java 源码中声明的类型、方法、构造器和字段名，用于反查引用方。
+fn java_declaration_names(source: &str) -> Vec<String> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        if matches!(
+            kind,
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+                | "method_declaration"
+                | "constructor_declaration"
+        ) {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+            {
+                names.push(name.to_string());
+            }
+        } else if kind == "field_declaration" {
+            let mut inner = node.walk();
+            for child in node.named_children(&mut inner) {
+                if child.kind() != "variable_declarator" {
+                    continue;
+                }
+                if let Some(name) = child
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                names.sort();
+                names.dedup();
+                return names;
+            }
+        }
+    }
+}
+
+/// 找出同源码根下可能引用本次改动、但没被一起编辑的 Java 文件。
+///
+/// 只做声明名文本预筛：差分校验对“多纳入无关文件”是安全的（两侧同集合编译，无关错误
+/// 会互相抵消，代价只是编译更慢），因此这里的目标是别漏掉真正的调用方而不是精确。
+/// 找不到源码根、根不是绝对路径或没有声明名时返回空，由调用方按“未覆盖调用方”处理。
+pub(super) fn affected_java_sources(path: &Path, before: &str) -> Vec<PathBuf> {
+    let names = java_declaration_names(before);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let package = super::java_compiler::package_declaration(before);
+    let root = super::java_compiler::source_root(path, &package);
+    // 相对路径或文件系统根都会让扫描范围失去边界，宁可不做
+    if !root.is_absolute() || root.parent().is_none() {
+        return Vec::new();
+    }
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut scanned = 0usize;
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        if found.len() >= MAX_AFFECTED_FILES || scanned >= MAX_AFFECTED_SCAN {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if found.len() >= MAX_AFFECTED_FILES || scanned >= MAX_AFFECTED_SCAN {
+                break;
+            }
+            let candidate = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if candidate.is_dir() {
+                if !name.starts_with('.') && !super::fs_tools::should_skip_dir(&name) {
+                    stack.push(candidate);
+                }
+                continue;
+            }
+            if !name.ends_with(".java") || candidate == path {
+                continue;
+            }
+            // 超过 1MB 的源文件按编辑能力上限直接跳过，避免为一次写入读入大量正文
+            if entry.metadata().map(|meta| meta.len()).unwrap_or(0) > MAX_AFFECTED_FILE_BYTES {
+                continue;
+            }
+            scanned += 1;
+            let Ok(text) = std::fs::read_to_string(&candidate) else {
+                continue;
+            };
+            if names.iter().any(|name| text.contains(name.as_str())) {
+                found.push(candidate);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// 合并多次反查结果：去重、排除本批已编辑的文件、按全局上限截断。
+fn merge_affected(batches: Vec<Vec<PathBuf>>, edited: &[PathBuf]) -> Vec<PathBuf> {
+    let mut merged: Vec<PathBuf> = Vec::new();
+    for batch in batches {
+        for path in batch {
+            if edited.contains(&path) || merged.contains(&path) {
+                continue;
+            }
+            merged.push(path);
+        }
+    }
+    merged.truncate(MAX_AFFECTED_FILES);
+    merged
+}
+
 /// 写入路径上的完整门禁：先跑语法/注解检查，再为 Java 追加 javac 类型诊断差分。
 ///
 /// 差分只拦「候选新增的编译诊断」——既有工程依赖缺失会在两侧同时出现并抵消，因此
@@ -247,20 +390,25 @@ pub(super) fn validate_candidate_with_types(
     if !is_java_source(path) {
         return Ok(report);
     }
-    match super::java_compiler::check(path, before, after) {
+    let affected = affected_java_sources(path, before);
+    match super::java_compiler::check_batch_with_affected(&[(path, before, after)], &affected) {
         super::java_compiler::JavaTypeCheck::Checked {
             before: before_errors,
             after: after_errors,
             added,
+            affected_files,
+            affected_skipped,
         } => {
+            log_affected_skipped(affected_skipped, path.display().to_string(), affected_files);
             if !added.is_empty() {
                 let shown: Vec<String> = added.iter().take(3).cloned().collect();
                 return Err(format!(
-                    "代码修改事务被 Java 编译器门禁拒绝：{} 的 javac 诊断由 {} 条增至 {} 条，新增：{}。候选内容未落盘；请修正引用的类型或补回仍在使用的 import 后重试。判定为单文件 javac 差分，未解析工程 classpath。",
+                    "代码修改事务被 Java 编译器门禁拒绝：{} 的 javac 诊断由 {} 条增至 {} 条，新增：{}。候选内容未落盘；请修正引用的类型或补回仍在使用的 import 后重试。判定为单文件 javac 差分{}，未解析工程 classpath。",
                     path.display(),
                     before_errors,
                     after_errors,
-                    shown.join("；")
+                    shown.join("；"),
+                    coverage_note(affected_files, affected_skipped),
                 ));
             }
         }
@@ -272,6 +420,74 @@ pub(super) fn validate_candidate_with_types(
         }
     }
     Ok(report)
+}
+
+/// 多文件事务的 Java 类型门禁：本批候选联编一次，并并入同源码根下可能引用改动的
+/// 未编辑文件（真正的调用方）。非 Java 批次无需调用；无 javac 或超时降级为未校验。
+pub(super) fn validate_batch_types(files: &[(&Path, &str, &str)]) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let edited: Vec<PathBuf> = files.iter().map(|(path, _, _)| path.to_path_buf()).collect();
+    let affected = merge_affected(
+        files
+            .iter()
+            .map(|(path, before, _)| affected_java_sources(path, before))
+            .collect(),
+        &edited,
+    );
+    match super::java_compiler::check_batch_with_affected(files, &affected) {
+        super::java_compiler::JavaTypeCheck::Checked {
+            before,
+            after,
+            added,
+            affected_files,
+            affected_skipped,
+        } => {
+            log_affected_skipped(affected_skipped, format!("{} 个文件", files.len()), affected_files);
+            if added.is_empty() {
+                return Ok(());
+            }
+            let shown: Vec<String> = added.iter().take(3).cloned().collect();
+            Err(format!(
+                "代码修改事务被 Java 编译器门禁拒绝：本批 {} 个候选联编后 javac 诊断由 {} 条增至 {} 条，新增：{}。该批候选未写入任何文件；请修正引用的类型或补回仍在使用的 import 后重试。判定为同批候选联编{}，未解析工程 classpath。",
+                files.len(),
+                before,
+                after,
+                shown.join("；"),
+                coverage_note(affected_files, affected_skipped),
+            ))
+        }
+        super::java_compiler::JavaTypeCheck::Unavailable { reason } => {
+            crate::utils::logger::log_event(
+                "java_type_gate_unavailable",
+                serde_json::json!({ "files": files.len(), "reason": reason }),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// 编译超时导致退回只编本批时如实记录：调用方覆盖已放弃，不能对外宣称已覆盖。
+fn log_affected_skipped(affected_skipped: bool, target: String, affected_files: usize) {
+    if !affected_skipped {
+        return;
+    }
+    crate::utils::logger::log_event(
+        "java_type_gate_affected_skipped",
+        serde_json::json!({ "target": target, "affected_files": affected_files }),
+    );
+}
+
+/// 说明本次是否并入了未参与编辑的调用方文件（如实标注，不夸大战果）。
+fn coverage_note(affected_files: usize, affected_skipped: bool) -> String {
+    if affected_skipped {
+        "（并入了可能引用改动的文件，但编译超时后已退回只编本批，调用方未覆盖）".into()
+    } else if affected_files > 0 {
+        format!("（并编译了 {affected_files} 个可能引用改动的未编辑文件）")
+    } else {
+        String::new()
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +653,33 @@ mod tests {
             "class A { @custom.Override int value; }"
         )
         .is_ok());
+    }
+
+    /// 反查调用方只按声明名做文本预筛：命中才并入，且不做无边界扫描。
+    #[test]
+    fn affected_java_sources_picks_declaration_name_mentions_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "java_affected_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("A.java");
+        let b = dir.join("B.java");
+        let c = dir.join("C.java");
+        let a_src = "package a;\nclass A {\n  static int compute() { return 1; }\n}\n";
+        std::fs::write(&a, a_src).unwrap();
+        std::fs::write(&b, "package a;\nclass B {\n  int use() { return A.compute(); }\n}\n").unwrap();
+        std::fs::write(&c, "package a;\nclass C {\n  int other() { return 2; }\n}\n").unwrap();
+        assert_eq!(affected_java_sources(&a, a_src), vec![b]);
+        // 相对路径可能上溯到无边界目录，宁可不扫描
+        assert!(affected_java_sources(Path::new("A.java"), a_src).is_empty());
+        // 没有声明名（空文件/非 Java 内容）时不做反查
+        assert!(affected_java_sources(&a, "").is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -4080,8 +4080,8 @@ fn prepare_single_edit(
     Ok(PreparedEdit { path: p, old_bytes: bytes, final_text, count })
 }
 
-/// 多文件事务的 Java 类型门禁：把本批候选放在一起编译一次，只拦本批新引入的编译诊断。
-/// 非 Java 批次直接通过；无 javac 或超时降级为未校验（与单文件门禁同口径，不阻塞写入）。
+/// 本批 Java 候选的联编类型门禁（含同源码根下的未编辑调用方）：取出候选文本交给
+/// code_mutation 的统一门禁，非 Java 批次直接通过。
 fn validate_batch_types(edits: &[PreparedEdit]) -> Result<(), String> {
     let java_files: Vec<(&std::path::Path, &str, &str)> = edits
         .iter()
@@ -4094,31 +4094,7 @@ fn validate_batch_types(edits: &[PreparedEdit]) -> Result<(), String> {
             )
         })
         .collect();
-    if java_files.is_empty() {
-        return Ok(());
-    }
-    match super::java_compiler::check_batch(&java_files) {
-        super::java_compiler::JavaTypeCheck::Checked { before, after, added } => {
-            if added.is_empty() {
-                return Ok(());
-            }
-            let shown: Vec<String> = added.iter().take(3).cloned().collect();
-            Err(format!(
-                "代码修改事务被 Java 编译器门禁拒绝：本批 {} 个候选联编后 javac 诊断由 {} 条增至 {} 条，新增：{}。该批候选未写入任何文件；请修正引用的类型或补回仍在使用的 import 后重试。判定为同批候选联编，未解析工程 classpath。",
-                java_files.len(),
-                before,
-                after,
-                shown.join("；")
-            ))
-        }
-        super::java_compiler::JavaTypeCheck::Unavailable { reason } => {
-            crate::utils::logger::log_event(
-                "java_type_gate_unavailable",
-                serde_json::json!({ "files": java_files.len(), "reason": reason }),
-            );
-            Ok(())
-        }
-    }
+    super::code_mutation::validate_batch_types(&java_files)
 }
 
 fn commit_prepared_edits(edits: &[PreparedEdit], conversation_id: &str) -> Result<(), String> {
@@ -4796,6 +4772,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 环境自检：javac 可用时类型门禁才能真判，不可用时只能如实降级。
+    fn javac_type_gate_available() -> bool {
+        matches!(
+            super::java_compiler::check_batch(&[(
+                std::path::Path::new("Probe.java"),
+                "package probe;\nclass Probe {}\n",
+                "package probe;\nclass Probe { int v = ; }\n",
+            )]),
+            super::java_compiler::JavaTypeCheck::Checked { .. }
+        )
+    }
+
+    /// 未参与本次编辑的调用方也要覆盖：edit_file 只改 A，同源码根下的 B 仍在调用被删掉的
+    /// 方法 —— 这正是“改坏没被一起编辑的调用方”的常见回归，必须在写入前拦住。
+    #[test]
+    fn java_type_gate_covers_unedited_java_callers() {
+        let dir = std::env::temp_dir().join(format!(
+            "java_uneedited_caller_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let a = dir.join("A.java");
+        let b = dir.join("B.java");
+        let a_src = "package a;\nclass A {\n  static int value() { return 1; }\n}\n";
+        let b_src = "package a;\nclass B {\n  int use() { return A.value(); }\n}\n";
+        std::fs::write(&a, a_src).unwrap();
+        std::fs::write(&b, b_src).unwrap();
+        for path in [&a, &b] {
+            block_on_rt(read_file(
+                &serde_json::json!({"path": path.to_string_lossy()}),
+                &roots,
+            ))
+            .expect("read establishes edit baseline");
+        }
+        let result = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": a.to_string_lossy(),
+                "old": "  static int value() { return 1; }\n",
+                "new": ""
+            }),
+            &roots,
+            "java_uneedited_caller",
+        ));
+        match (javac_type_gate_available(), result) {
+            (true, Err(error)) => {
+                assert!(error.contains("Java 编译器门禁拒绝"), "{error}");
+                assert!(
+                    error.contains("未编辑文件"),
+                    "拒绝信息应说明并入了未编辑的调用方：{error}"
+                );
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), a_src);
+                assert_eq!(std::fs::read_to_string(&b).unwrap(), b_src);
+            }
+            (true, Ok(_)) => panic!("javac 可用时，改坏未编辑的调用方必须被拒绝"),
+            (false, Ok(_)) => {
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), "package a;\nclass A {\n}\n");
+            }
+            (false, Err(error)) => panic!("无 javac 时不应由类型门禁拒绝：{error}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 同批 Java 候选联编：本批删掉 A 的方法而 B 仍在调用，属于批内跨文件破坏，
     /// 单文件校验看不到，必须在写入前整体拒绝；无 javac 环境按未校验降级。
     #[test]
@@ -4832,15 +4872,7 @@ mod tests {
             &roots,
             "multi_java_batch",
         ));
-        // 环境自检：javac 可用时该批必须被拒；不可用才允许降级放行，两条路径都不冒充对方
-        let javac_available = matches!(
-            super::java_compiler::check_batch(&[(
-                std::path::Path::new("Probe.java"),
-                "package probe;\nclass Probe {}\n",
-                "package probe;\nclass Probe { int v = ; }\n",
-            )]),
-            super::java_compiler::JavaTypeCheck::Checked { .. }
-        );
+        let javac_available = javac_type_gate_available();
         match (javac_available, broken) {
             (true, Err(error)) => {
                 assert!(error.contains("Java 编译器门禁拒绝"), "{error}");

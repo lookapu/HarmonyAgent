@@ -25,6 +25,10 @@ pub(super) enum JavaTypeCheck {
         before: usize,
         after: usize,
         added: Vec<String>,
+        /// 本次一并编译的“未参与本批但可能引用改动”的文件数。
+        affected_files: usize,
+        /// 因为编译超时退回只编本批：调用方覆盖已放弃，不得对外宣称已覆盖。
+        affected_skipped: bool,
     },
     /// 没有 javac 或编译超时：没有做类型校验，调用方不得阻塞写入。
     Unavailable { reason: String },
@@ -32,17 +36,29 @@ pub(super) enum JavaTypeCheck {
 
 /// 单文件事务（write_file / edit_file 等）的差分校验。
 pub(super) fn check(path: &Path, before: &str, after: &str) -> JavaTypeCheck {
-    check_batch(&[(path, before, after)])
+    check_batch_with_affected(&[(path, before, after)], &[])
 }
 
 /// 批量联编差分：同批候选作为一次 javac 调用的显式输入，彼此引用解析到候选版本，
 /// 因此能拦住单文件校验看不到的“同批跨文件类型破坏”。空批次视为无诊断。
 pub(super) fn check_batch(files: &[(&Path, &str, &str)]) -> JavaTypeCheck {
+    check_batch_with_affected(files, &[])
+}
+
+/// 在批量联编之上再并上 `affected`（未参与本批、但可能引用本次改动的文件）：
+/// 调用方文件在两侧都用磁盘原内容编译，所以新增诊断只会来自本批改动。
+/// 任何一侧带上受影响文件后超时，就退回只编本批（保住既有保证）并标记未覆盖调用方。
+pub(super) fn check_batch_with_affected(
+    files: &[(&Path, &str, &str)],
+    affected: &[PathBuf],
+) -> JavaTypeCheck {
     if files.is_empty() {
         return JavaTypeCheck::Checked {
             before: 0,
             after: 0,
             added: Vec::new(),
+            affected_files: 0,
+            affected_skipped: false,
         };
     }
     let work = match work_dir() {
@@ -53,12 +69,12 @@ pub(super) fn check_batch(files: &[(&Path, &str, &str)]) -> JavaTypeCheck {
             }
         }
     };
-    let result = run(&work, files);
+    let result = run(&work, files, affected);
     let _ = std::fs::remove_dir_all(&work);
     result
 }
 
-fn run(work: &Path, files: &[(&Path, &str, &str)]) -> JavaTypeCheck {
+fn run(work: &Path, files: &[(&Path, &str, &str)], affected: &[PathBuf]) -> JavaTypeCheck {
     let candidate_root = work.join("candidate");
     let baseline_root = work.join("baseline");
     let out_candidate = work.join("out-candidate");
@@ -93,41 +109,90 @@ fn run(work: &Path, files: &[(&Path, &str, &str)]) -> JavaTypeCheck {
         candidate_files.push(candidate_file);
         baseline_files.push(baseline_file);
     }
-    let candidate = match compile(
-        &candidate_files,
-        &candidate_root,
-        &roots,
-        &out_candidate,
-    ) {
-        Ok(Some(diagnostics)) => diagnostics,
-        Ok(None) => {
-            return JavaTypeCheck::Unavailable {
-                reason: format!("javac 候选编译超时（>{}s）", COMPILE_TIMEOUT.as_secs()),
+    // 受影响文件必须两侧同集合才有可比性：任一侧超时就整体退回只编本批，
+    // 不能用“候选带了调用方、基线没带”的两份不同输入做差分。
+    let mut extra: &[PathBuf] = affected;
+    for _ in 0..2 {
+        let candidate = match compile_side(
+            &candidate_files,
+            extra,
+            &candidate_root,
+            &roots,
+            &out_candidate,
+            "候选",
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(None) if !extra.is_empty() => {
+                extra = &[];
+                continue;
             }
+            Err(None) => {
+                return JavaTypeCheck::Unavailable {
+                    reason: format!("javac 候选编译超时（>{}s）", COMPILE_TIMEOUT.as_secs()),
+                }
+            }
+            Err(Some(reason)) => return JavaTypeCheck::Unavailable { reason },
+        };
+        // 快速路径：候选自包含且无诊断时无需基线，省掉一次编译。
+        if candidate.is_empty() {
+            return JavaTypeCheck::Checked {
+                before: 0,
+                after: 0,
+                added: Vec::new(),
+                affected_files: extra.len(),
+                affected_skipped: !affected.is_empty() && extra.is_empty(),
+            };
         }
-        Err(reason) => return JavaTypeCheck::Unavailable { reason },
-    };
-    // 快速路径：候选自包含且无诊断时无需基线，省掉一次编译。
-    if candidate.is_empty() {
+        let baseline = match compile_side(
+            &baseline_files,
+            extra,
+            &baseline_root,
+            &roots,
+            &out_baseline,
+            "基线",
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(None) if !extra.is_empty() => {
+                extra = &[];
+                continue;
+            }
+            Err(None) => {
+                return JavaTypeCheck::Unavailable {
+                    reason: format!("javac 基线编译超时（>{}s）", COMPILE_TIMEOUT.as_secs()),
+                }
+            }
+            Err(Some(reason)) => return JavaTypeCheck::Unavailable { reason },
+        };
         return JavaTypeCheck::Checked {
-            before: 0,
-            after: 0,
-            added: Vec::new(),
+            before: baseline.len(),
+            after: candidate.len(),
+            added: added_signatures(&baseline, &candidate),
+            affected_files: extra.len(),
+            affected_skipped: !affected.is_empty() && extra.is_empty(),
         };
     }
-    let baseline = match compile(&baseline_files, &baseline_root, &roots, &out_baseline) {
-        Ok(Some(diagnostics)) => diagnostics,
-        Ok(None) => {
-            return JavaTypeCheck::Unavailable {
-                reason: format!("javac 基线编译超时（>{}s）", COMPILE_TIMEOUT.as_secs()),
-            }
-        }
-        Err(reason) => return JavaTypeCheck::Unavailable { reason },
-    };
-    JavaTypeCheck::Checked {
-        before: baseline.len(),
-        after: candidate.len(),
-        added: added_signatures(&baseline, &candidate),
+    JavaTypeCheck::Unavailable {
+        reason: format!("javac 编译超时（>{}s）", COMPILE_TIMEOUT.as_secs()),
+    }
+}
+
+/// 编译一侧的文件集；超时且带了受影响文件时返回 `Err(None)`，由调用方决定退回重试。
+fn compile_side(
+    files: &[PathBuf],
+    affected: &[PathBuf],
+    shadow_root: &Path,
+    roots: &[PathBuf],
+    out: &Path,
+    label: &str,
+) -> Result<Vec<String>, Option<String>> {
+    match compile(files, affected, shadow_root, roots, out) {
+        Ok(Some(diagnostics)) => Ok(diagnostics),
+        Ok(None) if affected.is_empty() => Err(Some(format!(
+            "javac {label}编译超时（>{}s）",
+            COMPILE_TIMEOUT.as_secs()
+        ))),
+        Ok(None) => Err(None),
+        Err(reason) => Err(Some(reason)),
     }
 }
 
@@ -164,6 +229,7 @@ fn write_source(file: &Path, source: &str) -> Result<(), String> {
 /// `shadow_root` 是本次候选/基线各自的源码根，用于把诊断里的绝对路径还原成相对路径。
 fn compile(
     files: &[PathBuf],
+    affected: &[PathBuf],
     shadow_root: &Path,
     roots: &[PathBuf],
     out: &Path,
@@ -186,7 +252,7 @@ fn compile(
         args.push("-sourcepath".to_string());
         args.push(joined.to_string_lossy().to_string());
     }
-    for file in files {
+    for file in files.iter().chain(affected.iter()) {
         args.push(file.to_string_lossy().to_string());
     }
     let captured = crate::utils::process::output_stderr_blocking_with_timeout(
@@ -287,7 +353,7 @@ fn added_signatures(before: &[String], after: &[String]) -> Vec<String> {
 }
 
 /// 取文件首个非注释行声明的包名（package 语句必须在最前，取不到即默认包）。
-fn package_declaration(source: &str) -> String {
+pub(super) fn package_declaration(source: &str) -> String {
     for line in source.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty()
@@ -325,7 +391,7 @@ fn package_path(package: &str, file_name: &str) -> PathBuf {
 
 /// 按包名从文件目录上溯推导源码根（`.../src/main/java/com/foo/Bar.java` + `com.foo`
 /// → `.../src/main/java`）。路径与包名对不上时退回文件所在目录。
-fn source_root(path: &Path, package: &str) -> PathBuf {
+pub(super) fn source_root(path: &Path, package: &str) -> PathBuf {
     let Some(parent) = path.parent() else {
         return PathBuf::from(".");
     };
@@ -566,8 +632,14 @@ public class B {}
     #[test]
     fn javac_batch_diff_treats_empty_batch_as_clean() {
         match check_batch(&[]) {
-            JavaTypeCheck::Checked { before, after, added } => {
-                assert_eq!((before, after, added.len()), (0, 0, 0));
+            JavaTypeCheck::Checked {
+                before,
+                after,
+                added,
+                affected_files,
+                ..
+            } => {
+                assert_eq!((before, after, added.len(), affected_files), (0, 0, 0, 0));
             }
             JavaTypeCheck::Unavailable { reason } => panic!("空批次不应触发编译：{reason}"),
         }
