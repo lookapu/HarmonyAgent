@@ -6,7 +6,7 @@ import { AnsiText, hasAnsi } from '../../components/AnsiText'
 import { fmtElapsed } from '../chatUtils'
 import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
-import { revokeOtaApproval } from '../../api/project'
+import { getOtaApprovalRevoked, revokeOtaApproval } from '../../api/project'
 
 type MutationGuardKind = 'syntax' | 'rollback' | 'stale'
 
@@ -112,15 +112,30 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
   const [copied, setCopied] = useState(false)
   const [revocation, setRevocation] = useState<'idle' | 'pending' | 'done'>('idle')
   const [revocationError, setRevocationError] = useState('')
-  useEffect(() => { setRevocation('idle'); setRevocationError('') }, [run.id])
+  const revocationGeneration = useRef(0)
+  useEffect(() => {
+    revocationGeneration.current += 1
+    let active = true
+    setRevocation('idle')
+    setRevocationError('')
+    if (run.tool === 'ota_pack' && run.callId) {
+      getOtaApprovalRevoked(run.callId).then((revoked) => {
+        // 只提升到已撤销，不能用较旧的 false 覆盖刚完成的撤销操作。
+        if (active && revoked) setRevocation('done')
+      }).catch((error) => { if (active) setRevocationError(String(error)) })
+    }
+    return () => { active = false; revocationGeneration.current += 1 }
+  }, [run.id, run.callId, run.tool])
   const revokeApproval = async () => {
     if (revocation !== 'idle' || !run.callId) return
+    const generation = revocationGeneration.current
     setRevocation('pending')
     setRevocationError('')
     try {
       await revokeOtaApproval(run.callId)
-      setRevocation('done')
+      if (generation === revocationGeneration.current) setRevocation('done')
     } catch (error) {
+      if (generation !== revocationGeneration.current) return
       setRevocation('idle')
       setRevocationError(String(error))
     }

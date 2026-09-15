@@ -205,6 +205,11 @@ pub fn audit_timeline(conn: &Connection, conversation_id: &str) -> Result<Vec<Au
              UNION ALL
              SELECT 'run' AS source, event_type, payload, created_at, run_id, NULL AS trace_id
              FROM run_events WHERE conversation_id = ?1
+             UNION ALL
+             SELECT 'approval' AS source, 'host_capability.approval_revoked' AS event_type,
+                    json_object('tool_call_id',call_id,'reason',reason,'decision','revoked') AS payload,
+                    revoked_at AS created_at, run_id, NULL AS trace_id
+             FROM ota_approval_revocations WHERE conversation_id = ?1
              ORDER BY created_at ASC, source ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -417,6 +422,7 @@ mod tests {
     #[test]
     fn audit_timeline_merges_session_and_run_events() {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ota_approval_revocations(call_id TEXT PRIMARY KEY,run_id TEXT,conversation_id TEXT,revoked_at INTEGER,reason TEXT);").unwrap();
         conn.execute_batch(
             "CREATE TABLE session_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -449,8 +455,14 @@ mod tests {
             [],
         ).unwrap();
 
+        conn.execute("INSERT INTO ota_approval_revocations VALUES('call1','r1','c1',250,'user_revoke_call')", []).unwrap();
         let timeline = audit_timeline(&conn, "c1").unwrap();
-        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline.len(), 3);
+        let revoked = timeline.iter().find(|event| event.source == "approval").unwrap();
+        assert_eq!(revoked.event_type, "host_capability.approval_revoked");
+        assert_eq!(revoked.payload["tool_call_id"], "call1");
+        assert_eq!(revoked.payload["reason"], "user_revoke_call");
+        assert_eq!(revoked.run_id.as_deref(), Some("r1"));
         // 两条来源的事件都进入统一时间线，且按 created_at 升序
         let sources: Vec<&str> = timeline.iter().map(|e| e.source.as_str()).collect();
         assert!(sources.contains(&"session") && sources.contains(&"run"));

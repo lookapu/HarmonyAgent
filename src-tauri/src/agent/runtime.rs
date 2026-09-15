@@ -381,6 +381,14 @@ pub fn claim_host_capability(
     if !active {
         return Err("Host Capability Broker 的 Run 不存在、归属不符或已非活跃状态".into());
     }
+    if idempotency_key.starts_with("hcb-v2:") {
+        let legacy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM host_capability_claims WHERE run_id=?1
+             AND tool_call_id=?2 AND capability_id=?3 AND idempotency_key LIKE 'hcb-v1:%')",
+            params![run_id, tool_call_id, capability_id], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if legacy { return Err("存在未绑定工作区的历史 Broker claim，需核验副作用后发起新调用".into()); }
+    }
     let inserted = tx
         .execute(
             "INSERT INTO host_capability_claims(
@@ -1261,6 +1269,17 @@ mod tests {
             events.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
             vec!["run.started", "host_capability.started", "host_capability.finished"]
         );
+    }
+
+    #[test]
+    fn workspace_identity_upgrade_does_not_replay_legacy_claim() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        let subject = serde_json::json!({});
+        claim_host_capability(&c, "r", "c", "call", "deploy.install", "old", "hcb-v1:old", &subject).unwrap();
+        let error = claim_host_capability(&c, "r", "c", "call", "deploy.install", "new", "hcb-v2:new", &subject).unwrap_err();
+        assert!(error.contains("历史 Broker claim"));
+        assert_eq!(claim_host_capability(&c, "r", "c", "new-call", "deploy.install", "new", "hcb-v2:new", &subject).unwrap(), HostCapabilityClaim::Claimed);
     }
 
     #[test]

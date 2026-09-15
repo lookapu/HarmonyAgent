@@ -410,6 +410,7 @@ pub fn run() {
             commands::chat::stop_chat,
             commands::chat::stop_tool,
             commands::chat::revoke_ota_approval,
+            commands::chat::get_ota_approval_revoked,
             commands::chat::list_tool_whitelist,
             commands::chat::remove_tool_whitelist,
             commands::chat::queue_message,

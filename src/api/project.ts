@@ -847,6 +847,7 @@ export const stopChat = (conversationId: string) => invokeWithError<void>('stop_
 /** 停止当前正在执行的工具（不终止整个任务）：强杀子进程，模型拿到中断反馈后继续生成结论 */
 export const stopTool = (conversationId: string) => invokeWithError<void>('stop_tool', { conversationId })
 export const revokeOtaApproval = (callId: string) => invokeWithError<void>('revoke_ota_approval', { callId })
+export const getOtaApprovalRevoked = (callId: string) => invokeWithError<boolean>('get_ota_approval_revoked', { callId })
 
 export const renameConversation = (id: string, title: string) =>
   invokeWithError<void>('rename_conversation', { id, title })

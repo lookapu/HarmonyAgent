@@ -1,7 +1,8 @@
 //! Agent 命令执行沙箱的稳定策略模型、平台原生/OCI 能力探测与进程生命周期。
 //!
 //! 本模块不会自行切换现有 `run_command` 执行路径。OCI 仍需调用方显式选择；平台
-//! 原生后端当前只提供可信 capability 探测。探测或能力校验失败时一律失败关闭，禁止
+//! 原生后端提供探测及显式命令执行；输出预算在采集阶段强制，CPU/内存/PID/磁盘
+//! 总量仍未完整强制。探测或能力校验失败时一律失败关闭，禁止
 //! 静默回退宿主执行。
 
 use serde::{Deserialize, Serialize};
@@ -326,18 +327,18 @@ impl NativeBackend {
             }),
         );
         let started = Instant::now();
-        let output = crate::agent::exec_ctx::run_cmd_streaming(
+        let output = crate::agent::exec_ctx::run_cmd_streaming_limited(
             ctx,
             &built.program,
             &built.args,
             built.cwd.as_deref(),
             spec.limits.wall_time_seconds,
-            None,
+            spec.limits.output_bytes as usize,
         )
         .await;
         let cleanup_failed = std::fs::remove_dir_all(&temp_root).is_err();
-        let (status, exit_code, stdout, stderr) = match output {
-            Ok(output) => (
+        let (status, exit_code, stdout, stderr, capture_truncated) = match output {
+            Ok((output, truncated)) => (
                 if output.status.success() {
                     SandboxRunStatus::Succeeded
                 } else {
@@ -346,6 +347,7 @@ impl NativeBackend {
                 output.status.code(),
                 String::from_utf8_lossy(&output.stdout).into_owned(),
                 String::from_utf8_lossy(&output.stderr).into_owned(),
+                truncated,
             ),
             Err(error) => (
                 if error.contains("用户已停止") {
@@ -358,6 +360,7 @@ impl NativeBackend {
                 None,
                 String::new(),
                 error,
+                false,
             ),
         };
         let (stdout, stderr, output_truncated) =
@@ -370,7 +373,7 @@ impl NativeBackend {
             stdout,
             stderr,
             duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            output_truncated,
+            output_truncated: output_truncated || capture_truncated,
             // 该字段专指 OCI 容器的额外强制删除；原生临时目录清理状态单独审计。
             forced_cleanup: false,
         };

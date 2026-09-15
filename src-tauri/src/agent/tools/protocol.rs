@@ -215,7 +215,7 @@ fn clean_args_tail(args: &str) -> String {
 
 /// 生成系统提示中的工具说明
 fn selected_specs(query: &str) -> Vec<&'static super::ToolSpec> {
-    let names = super::capabilities::selected_tool_names(query, 40);
+    let names = super::capabilities::selected_tool_names(query, super::capabilities::RESIDENT_TOOL_LIMIT);
     names.into_iter().filter_map(|name| {
         TOOL_SPECS.iter().find(|spec| spec.name == name)
     }).collect()
@@ -225,7 +225,7 @@ fn selected_specs_for_phase(
     query: &str,
     phase: super::capabilities::TaskPhase,
 ) -> Vec<&'static super::ToolSpec> {
-    super::capabilities::selected_tool_names_for_phase(query, phase, 32)
+    super::capabilities::selected_tool_names_for_phase(query, phase, super::capabilities::RESIDENT_TOOL_LIMIT)
         .into_iter()
         .filter_map(|name| TOOL_SPECS.iter().find(|spec| spec.name == name))
         .collect()

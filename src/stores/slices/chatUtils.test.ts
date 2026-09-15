@@ -9,10 +9,23 @@ import {
   firstRunningIndex,
   reconcileRunUserMessage,
   upsertMessageById,
+  toolRunFromExecutionStep,
 } from './chatUtils'
-import type { ChatMessage } from '../../api/project'
+import type { ChatMessage, ExecutionStep } from '../../api/project'
 
 const msg = (role: string, content: string): ChatMessage => ({ role, content } as ChatMessage)
+
+describe('durable tool projection', () => {
+  const step = { step_id: 'step-1', external_id: 'real-call', tool_name: 'ota_pack', title: 'OTA', state: 'running', started_at: 0, updated_at: 10, finished_at: 12, result_summary: 'waiting' } as ExecutionStep
+  it('保留精确调用 ID 与零时刻耗时，两条恢复路径共用该投影', () => {
+    expect(toolRunFromExecutionStep(step)).toMatchObject({ id: 'tool-call-real-call', callId: 'real-call', tool: 'ota_pack', status: 'running', durationMs: 12 })
+    expect(toolRunFromExecutionStep({ ...step, state: 'completed' }).status).toBe('done')
+    expect(toolRunFromExecutionStep({ ...step, state: 'failed' }).status).toBe('error')
+  })
+  it('缺失持久调用身份时不伪造可撤销 ID', () => {
+    expect(toolRunFromExecutionStep({ ...step, external_id: '' })).toMatchObject({ id: 'tool-call-step-1', callId: undefined })
+  })
+})
 
 describe('acceptsRunEvent', () => {
   it('拒绝旧任务延迟事件', () => {

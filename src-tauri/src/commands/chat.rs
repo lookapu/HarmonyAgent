@@ -1405,6 +1405,12 @@ pub fn revoke_ota_approval(call_id: String, db: State<'_, DbState>) -> Result<()
     crate::agent::broker_approval::revoke_call(&conn, &call_id)
 }
 
+#[tauri::command]
+pub fn get_ota_approval_revoked(call_id: String, db: State<'_, DbState>) -> Result<bool, String> {
+    let conn = db.0.try_lock().map_err(|_| "审批数据库忙，无法读取撤销状态")?;
+    crate::agent::broker_approval::is_revoked(&conn, &call_id)
+}
+
 /// 取最早一条排队消息并标记为已消费（queued=0），返回 (id, content)。
 /// agent_only=true 时仅消费"发送到 Agent"的挂起消息（任务运行中由安全点并入）；
 /// false 时消费任意排队消息（任务结束后自动续跑，含未并入的挂起消息）。
@@ -7454,10 +7460,11 @@ async fn stream_once(
         }));
     }
     let ranked_tools = ranking.map(|items| {
-        items.into_iter().take(32).map(|rank| rank.tool).collect::<Vec<_>>()
+        items.into_iter().map(|rank| rank.tool).collect::<Vec<_>>()
     }).unwrap_or_else(|| {
-        candidate_tools.into_iter().take(32).map(str::to_string).collect()
+        candidate_tools.into_iter().map(str::to_string).collect()
     });
+    let ranked_tools = crate::agent::tools::capabilities::resident_tool_names(tool_query, tool_phase, &ranked_tools);
     let tool_schemas = if opts.native_tools.unwrap_or(false) && protocol == "openai" {
         crate::agent::tools::tool_schemas_for_names(&ranked_tools)
     } else {

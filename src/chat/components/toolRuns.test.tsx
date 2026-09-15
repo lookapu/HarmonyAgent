@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { revokeOtaApproval } from '../../api/project'
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { getOtaApprovalRevoked, revokeOtaApproval } from '../../api/project'
 import { ToolRunGroup, ToolRunRow } from './toolRuns'
 import type { ToolRun } from '../../stores/projectStore'
 
@@ -8,7 +8,7 @@ import type { ToolRun } from '../../stores/projectStore'
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
 }))
-vi.mock('../../api/project', () => ({ revokeOtaApproval: vi.fn() }))
+vi.mock('../../api/project', () => ({ revokeOtaApproval: vi.fn(), getOtaApprovalRevoked: vi.fn().mockResolvedValue(false) }))
 
 const run = (over: Partial<ToolRun> = {}): ToolRun => ({
   id: 'r1',
@@ -20,6 +20,22 @@ const run = (over: Partial<ToolRun> = {}): ToolRun => ({
 })
 
 describe('ToolRunGroup', () => {
+  it('旧调用的延迟撤销结果不会污染新调用卡片', async () => {
+    let complete!: () => void
+    vi.mocked(revokeOtaApproval).mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve }))
+    const { rerender } = render(<ToolRunRow run={run({ callId: 'old', tool: 'ota_pack', status: 'running' })} />)
+    fireEvent.click(screen.getByRole('button', { name: 'home.revokeOtaApproval' }))
+    rerender(<ToolRunRow run={run({ id: 'new', callId: 'new', tool: 'ota_pack', status: 'running' })} />)
+    await act(async () => { complete() })
+    expect(screen.getByRole('button', { name: 'home.revokeOtaApproval' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'home.otaApprovalRevoked' })).not.toBeInTheDocument()
+  })
+  it('重新挂载后从持久状态恢复已撤销提示', async () => {
+    vi.mocked(getOtaApprovalRevoked).mockResolvedValueOnce(true)
+    render(<ToolRunRow run={run({ callId: 'restored-call', tool: 'ota_pack', status: 'running' })} />)
+    expect(await screen.findByRole('button', { name: 'home.otaApprovalRevoked' })).toBeDisabled()
+    expect(getOtaApprovalRevoked).toHaveBeenCalledWith('restored-call')
+  })
   it('缺少真实调用 ID 时不提供撤销按钮', () => {
     render(<ToolRunRow run={run({ tool: 'ota_pack', status: 'running' })} />)
     expect(screen.queryByRole('button', { name: 'home.revokeOtaApproval' })).not.toBeInTheDocument()

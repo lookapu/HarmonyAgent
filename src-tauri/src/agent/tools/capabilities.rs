@@ -124,6 +124,29 @@ pub const COMMON_TOOLS: &[&str] = &[
     "plan_task", "todo_write", "todo_get", "ask_user", "tool_help", "tool_list", "tool_history",
 ];
 
+/// 常驻 schema 上限；候选发现可以更宽，Provider 实际接收的工具必须再收敛。
+pub const RESIDENT_TOOL_LIMIT: usize = 20;
+
+/// 排名不能挤掉计划、澄清和工具发现入口；其余 schema 按排名延迟展开。
+pub fn resident_tool_names(query: &str, phase: TaskPhase, ranked: &[String]) -> Vec<String> {
+    let mut names = COMMON_TOOLS.iter().map(|name| (*name).to_string()).collect::<Vec<_>>();
+    if phase == TaskPhase::Verify {
+        for tool in select(query).iter().flat_map(|pack| pack.recommended_order.iter()) {
+            if names.len() >= RESIDENT_TOOL_LIMIT { break; }
+            if super::contracts::contract(tool).validator.is_some()
+                && ranked.iter().any(|name| name == tool)
+                && !names.iter().any(|name| name == tool) {
+                names.push((*tool).to_string());
+            }
+        }
+    }
+    for name in ranked {
+        if names.len() >= RESIDENT_TOOL_LIMIT { break; }
+        if !names.contains(name) { names.push(name.clone()); }
+    }
+    names
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskPhase {
     Explore,
@@ -172,7 +195,7 @@ pub fn select(query: &str) -> Vec<&'static CapabilityPack> {
 }
 
 pub fn selected_tool_names(query: &str, limit: usize) -> Vec<&'static str> {
-    let mut names = COMMON_TOOLS.to_vec();
+    let mut names = COMMON_TOOLS.iter().copied().take(limit).collect::<Vec<_>>();
     for pack in select(query) {
         for tool in pack.tools {
             if names.len() >= limit { return names; }
@@ -208,6 +231,7 @@ pub fn selected_tool_names_for_phase(
     limit: usize,
 ) -> Vec<&'static str> {
     use super::contracts::EffectKind;
+    if limit == 0 { return Vec::new(); }
     let mut candidates = selected_tool_names(query, 64);
     if phase == TaskPhase::Verify {
         for tool in [
@@ -219,6 +243,17 @@ pub fn selected_tool_names_for_phase(
                 candidates.remove(index);
             }
             candidates.insert(COMMON_TOOLS.len().min(candidates.len()), tool);
+        }
+        // 先保留任务本身的验收动作，再填充通用检查，避免小预算把 deploy 等
+        // 唯一能完成当前验收契约的工具挤到集合之外。仍以候选集为权限边界。
+        let goal_validators = select(query).iter().flat_map(|pack| pack.recommended_order.iter().copied())
+            .filter(|tool| super::contracts::contract(tool).validator.is_some())
+            .collect::<Vec<_>>();
+        for tool in goal_validators.into_iter().rev() {
+            if let Some(index) = candidates.iter().position(|candidate| *candidate == tool) {
+                candidates.remove(index);
+                candidates.insert(COMMON_TOOLS.len().min(candidates.len()), tool);
+            }
         }
     }
     let mut names = Vec::new();
@@ -248,6 +283,50 @@ pub fn selected_tool_names_for_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_budget_preserves_discovery_and_deduplicates_ranking() {
+        let mut ranked = (0..64).map(|index| format!("candidate_{index}")).collect::<Vec<_>>();
+        ranked.insert(0, "tool_help".into());
+        ranked.insert(1, "tool_help".into());
+        let names = resident_tool_names("inspect", TaskPhase::Explore, &ranked);
+        assert_eq!(names.len(), RESIDENT_TOOL_LIMIT);
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), names.len());
+        assert!(COMMON_TOOLS.iter().all(|tool| names.iter().any(|name| name == tool)));
+        assert_eq!(names[COMMON_TOOLS.len()], "candidate_0");
+    }
+
+    #[test]
+    fn selection_obeys_even_zero_and_tiny_limits() {
+        for limit in 0..8 {
+            assert!(selected_tool_names("修复并提交", limit).len() <= limit);
+            assert!(selected_tool_names_for_phase("修复并提交", TaskPhase::Modify, limit).len() <= limit);
+        }
+    }
+
+    #[test]
+    fn production_budget_keeps_representative_phase_tools() {
+        for (goal, phase, required) in [
+            ("修复编译错误", TaskPhase::Modify, "edit_file"),
+            ("修复编译错误", TaskPhase::Verify, "run_tests"),
+            ("检查测试并提交 git", TaskPhase::Deliver, "git_commit"),
+            ("部署应用到设备", TaskPhase::Verify, "deploy"),
+        ] {
+            let candidates = selected_tool_names_for_phase(goal, phase, 64).into_iter().map(str::to_string).collect::<Vec<_>>();
+            let resident = resident_tool_names(goal, phase, &candidates);
+            assert!(resident.len() <= RESIDENT_TOOL_LIMIT);
+            assert!(resident.iter().any(|tool| tool == required), "{goal}: {resident:?}");
+        }
+    }
+
+    #[test]
+    fn ranking_cannot_starve_goal_validator_or_restore_excluded_tool() {
+        let mut ranked = (0..64).map(|i| format!("candidate_{i}")).collect::<Vec<_>>();
+        ranked.push("deploy".into());
+        assert!(resident_tool_names("部署应用", TaskPhase::Verify, &ranked).contains(&"deploy".into()));
+        ranked.pop();
+        assert!(!resident_tool_names("不要部署应用", TaskPhase::Verify, &ranked).contains(&"deploy".into()));
+    }
 
     #[test]
     fn packs_are_complete_and_reference_registered_tools() {

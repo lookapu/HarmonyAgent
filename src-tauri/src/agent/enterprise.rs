@@ -387,7 +387,16 @@ pub fn list_audit(
     run_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<AuditEvent>, String> {
-    let mut stmt = conn.prepare("SELECT audit_id,run_id,conversation_id,actor,action,resource,outcome,details_json,created_at FROM agent_audit_events WHERE (?1 IS NULL OR run_id=?1) ORDER BY created_at DESC LIMIT ?2").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT * FROM (
+        SELECT audit_id,run_id,conversation_id,actor,action,resource,outcome,details_json,created_at
+        FROM agent_audit_events WHERE (?1 IS NULL OR run_id=?1)
+        UNION ALL
+        SELECT 'ota-revoke:' || call_id,run_id,conversation_id,
+        CASE WHEN reason IN ('user_revoke_call','user_stop') THEN 'user' ELSE 'system' END,
+        'host_capability.approval_revoked',call_id,'revoked',
+        json_object('tool_call_id',call_id,'reason',reason,'decision','revoked'),revoked_at
+        FROM ota_approval_revocations WHERE (?1 IS NULL OR run_id=?1)
+        ) ORDER BY created_at DESC,audit_id DESC LIMIT ?2").map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![run_id, limit.clamp(1, 1000) as i64], |row| {
             Ok(AuditEvent {
@@ -456,12 +465,21 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,state TEXT,acceptance_json TEXT); INSERT INTO agent_runs VALUES('r','completed','{\"passed\":false}'); CREATE TABLE agent_slo_policies(policy_id TEXT PRIMARY KEY,tenant_id TEXT,name TEXT,enabled INTEGER,acceptance_target REAL,recovery_target REAL,evidence_target REAL,max_duration_ms INTEGER,max_cost_cny REAL,created_at INTEGER,updated_at INTEGER); INSERT INTO agent_slo_policies VALUES('p','local','p',1,.95,.9,.95,100,NULL,0,0); CREATE TABLE agent_alerts(alert_id TEXT PRIMARY KEY,tenant_id TEXT,run_id TEXT,policy_id TEXT,severity TEXT,code TEXT,message TEXT,state TEXT,details_json TEXT,created_at INTEGER,resolved_at INTEGER); CREATE TABLE agent_audit_events(audit_id TEXT PRIMARY KEY,tenant_id TEXT,run_id TEXT,conversation_id TEXT,actor TEXT,action TEXT,resource TEXT,outcome TEXT,details_json TEXT,created_at INTEGER); CREATE TABLE agent_quota_usage(tenant_id TEXT,period TEXT,runs INTEGER,tool_calls INTEGER,failed_tools INTEGER,duration_ms INTEGER,cost_cny REAL,updated_at INTEGER,PRIMARY KEY(tenant_id,period));").unwrap();
         record_run_started(&conn, "r", "c").unwrap();
+        conn.execute_batch("CREATE TABLE ota_approval_revocations(call_id TEXT PRIMARY KEY,run_id TEXT,conversation_id TEXT,revoked_at INTEGER,reason TEXT);").unwrap();
         record_tool(&conn, "r", "c", "read_file", "ok", "d").unwrap();
         record_run_finished(&conn, "r", "c", "completed", 200).unwrap();
         assert_eq!(quota(&conn).unwrap().runs, 1);
         assert_eq!(quota(&conn).unwrap().tool_calls, 1);
         assert_eq!(list_alerts(&conn, 10).unwrap().len(), 2);
         assert_eq!(list_audit(&conn, Some("r"), 10).unwrap().len(), 3);
+        conn.execute_batch("INSERT INTO ota_approval_revocations VALUES('call-1','r','c',9223372036854775806,'user_revoke_call'),('call-2','other','other',9223372036854775807,'timeout');").unwrap();
+        let filtered = list_audit(&conn, Some("r"), 1).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].audit_id, "ota-revoke:call-1");
+        assert_eq!(filtered[0].actor, "user");
+        assert_eq!(filtered[0].action, "host_capability.approval_revoked");
+        assert_eq!(list_audit(&conn, None, 10).unwrap().len(), 5);
+        assert_eq!(list_audit(&conn, None, 1).unwrap()[0].actor, "system");
     }
 
     #[test]

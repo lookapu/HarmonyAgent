@@ -78,7 +78,7 @@ fn revoke_with_reason(
     ).map_err(|error| format!("OTA 审批撤销持久化失败：{error}"))
 }
 
-fn require_not_revoked(conn: &Connection, call: &str) -> Result<(), String> {
+pub(crate) fn is_revoked(conn: &Connection, call: &str) -> Result<bool, String> {
     let revoked: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM ota_approval_revocations WHERE call_id=?1)",
@@ -86,7 +86,11 @@ fn require_not_revoked(conn: &Connection, call: &str) -> Result<(), String> {
             |row| row.get(0),
         )
         .map_err(|error| format!("无法读取 OTA 审批撤销状态：{error}"))?;
-    if revoked {
+    Ok(revoked)
+}
+
+fn require_not_revoked(conn: &Connection, call: &str) -> Result<(), String> {
+    if is_revoked(conn, call)? {
         return Err("本次 OTA 调用已被持久撤销，必须发起新的工具调用并重新审批".into());
     }
     Ok(())

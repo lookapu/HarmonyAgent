@@ -37,7 +37,7 @@ import {
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger, ConversationBranchAnchor } from '../../api/project'
 import type { StateCreator } from 'zustand'
 import type { ChatSlice, DiagnoseCard, ProjectState, StreamingState } from '../projectStoreTypes'
-import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, upsertMessageById } from './chatUtils'
+import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
@@ -1533,21 +1533,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           if (get().currentConversation?.id !== id || get().streamings[id]) return
           const restoredToolRuns = durableSteps
             .filter((step) => step.source === 'tool')
-            .map((step) => ({
-              id: `tool-call-${step.external_id}`,
-              tool: step.tool_name || step.title,
-              args: '',
-              status: (['prepared', 'running'].includes(step.state)
-                ? 'running'
-                : step.state === 'completed'
-                  ? 'done'
-                  : 'error') as 'running' | 'done' | 'error',
-              output: step.result_summary || '',
-              startedAt: step.started_at ?? step.updated_at,
-              durationMs: step.started_at && step.finished_at
-                ? Math.max(0, step.finished_at - step.started_at)
-                : undefined,
-            }))
+            .map(toolRunFromExecutionStep)
           const activeCalls = new Set(
             durableSteps
               .filter((step) => step.source === 'tool' && ['prepared', 'running'].includes(step.state))
@@ -1648,21 +1634,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           const refreshedSteps = await getAgentRunStepsApi(run.run_id).catch(() => durableSteps)
           const refreshedTools = refreshedSteps
             .filter((step) => step.source === 'tool')
-            .map((step) => ({
-              id: `tool-call-${step.external_id}`,
-              tool: step.tool_name || step.title,
-              args: '',
-              status: (['prepared', 'running'].includes(step.state)
-                ? 'running'
-                : step.state === 'completed'
-                  ? 'done'
-                  : 'error') as 'running' | 'done' | 'error',
-              output: step.result_summary || '',
-              startedAt: step.started_at ?? step.updated_at,
-              durationMs: step.started_at && step.finished_at
-                ? Math.max(0, step.finished_at - step.started_at)
-                : undefined,
-            }))
+            .map(toolRunFromExecutionStep)
           const reconciledActive = activeToolCallIds.get(id) ?? new Set<string>()
           for (const step of refreshedSteps.filter((item) => item.source === 'tool')) {
             const current = get().toolRuns.find((toolRun) => toolRun.id === `tool-call-${step.external_id}`)

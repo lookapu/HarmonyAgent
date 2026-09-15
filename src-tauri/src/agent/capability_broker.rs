@@ -739,6 +739,25 @@ fn request_material(capability: &HostCapability) -> String {
     }
 }
 
+/// 逻辑请求绑定 canonical 工作区；执行用随机副本路径仍不参与身份。
+fn scoped_request_identity(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    capability: &HostCapability,
+    workspace: Option<&Path>,
+) -> Result<HostRequestIdentity, String> {
+    let mut identity = request_identity(ctx, capability)?;
+    if let Some(workspace) = workspace {
+        let root = workspace.canonicalize().map_err(|error| format!("无法绑定 Broker 工作区身份：{error}"))?;
+        if !root.is_dir() { return Err("Broker 工作区必须是目录".into()); }
+        let root = root.to_str().ok_or("Broker 工作区路径不是有效 UTF-8，无法生成稳定身份")?;
+        let material = serde_json::json!([root, identity.request_digest]);
+        identity.request_digest = format!("{:x}", Sha256::digest(material.to_string().as_bytes()));
+        let material = serde_json::json!([ctx.run_id, identity.tool_call_id, capability.capability_id(), identity.request_digest]);
+        identity.idempotency_key = format!("hcb-v2:{:x}", Sha256::digest(material.to_string().as_bytes()));
+    }
+    Ok(identity)
+}
+
 fn prepare_invocation(capability: &HostCapability, workspace: Option<&Path>) -> Result<HostInvocation, String> {
     capability.validate()?;
     let (args, timeout_seconds) = match capability {
@@ -1309,7 +1328,7 @@ pub async fn execute_host_capability(
         Some(inputs)
     } else { None };
     let capability_id = capability.capability_id();
-    let identity = match request_identity(ctx, capability) {
+    let identity = match scoped_request_identity(ctx, capability, workspace) {
         Ok(identity) => identity,
         Err(error) => {
             ctx.record_run_event("host_capability.rejected", serde_json::json!({
@@ -3175,6 +3194,24 @@ mod tests {
             vec!["-t", "ABC123", "shell", "pkill", "-2", "screenrecord"]
         );
         assert!(!stop.replay_safe());
+    }
+
+    #[test]
+    fn scoped_identity_binds_canonical_workspace() {
+        let root = std::env::temp_dir().join(format!("harmony-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let mut ctx = crate::agent::exec_ctx::ToolCtx::empty();
+        ctx.run_id = "run".into();
+        ctx.tool_call_id = Some("call".into());
+        let cap = HostCapability::InstallHap { device: None, hap_path: "out/app.hap".into(), replace: false };
+        let first = scoped_request_identity(&ctx, &cap, Some(&root.join("a"))).unwrap();
+        assert!(first.idempotency_key.starts_with("hcb-v2:"));
+        assert_eq!(first, scoped_request_identity(&ctx, &cap, Some(&root.join("a/../a"))).unwrap());
+        assert_ne!(first, scoped_request_identity(&ctx, &cap, Some(&root.join("b"))).unwrap());
+        assert_eq!(request_identity(&ctx, &cap).unwrap(), scoped_request_identity(&ctx, &cap, None).unwrap());
+        assert!(scoped_request_identity(&ctx, &cap, Some(&root.join("missing"))).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
