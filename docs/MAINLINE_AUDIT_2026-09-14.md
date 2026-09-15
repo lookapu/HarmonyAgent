@@ -308,3 +308,15 @@
 边界：`targets` 只是参数里的显式目标，不代表全部受影响对象（例如应用被卸载后其依赖的外部服务状态不在其中）；`note` 是固定文案，不含运行期推算的规模评估（如「将覆盖 3 个设备」）。
 
 验证：后端库 1,067 通过、9 忽略（总计 1,076），新增 6 项 `impact` 单测（未覆盖工具返回 None、不可逆操作的范围与目标提取、OTA 目标键顺序与去重、序列化形状）；前端 14 文件 127 项通过（新增 2 项 `impactDisplay` 测试，含未知取值回退），lint、TypeScript、Web build 与 bundle gate 通过。本批未重跑真机、系统沙箱或安装包验收——**审批卡片的实际视觉效果未在真实界面确认**（无 GUI 验收环境），仅由类型检查与纯函数测试保证。
+
+补充（阶段 3 收尾：把判定逻辑变成可测纯函数，同日）：上一段如实标注了「guards 签发分支与 execute 复核分支没有端到端自动化测试」。本轮把两处**判定逻辑**抽出来，让接线里最容易出错的部分有回归。
+
+- 新增 `capability_broker::receipt_decision(tool, needs_approval)`：签发决策的唯一来源（`None` / `Auto` / `Explicit`），guards 的免弹窗与弹窗批准两条分支都改为消费它，不再各自判断 `requires_durable_receipt`。
+- 新增 `capability_broker::requires_receipt_check(replay_safe, ota, has_call_id, has_app)`：执行期是否强制复核凭据的唯一判定，`execute_host_capability` 改为调用它。
+- 新增回归断言：契约内工具弹窗批准→`Explicit`、免弹窗→`Auto`、契约外→`None`；`ota_pack` 只在显式确认后签发（它的作用域是文件内容摘要），并**守护这条不变式**——`permissions::requires_fresh_explicit_approval("ota_pack", {})` 必须为真，否则 OTA 会落到不签发凭据的分支、执行期内容复核必然失败；执行期复核的五个边界（只读能力/OTA/界面直接调用/无审批基础设施）逐条断言。
+
+仍未覆盖的部分（如实标注）：钩子与执行入口的**调用点本身**需要 Tauri `AppHandle` 与真实台账，仍未做端到端自动化；本轮补的是判定逻辑的回归，不是「接线已验收」。
+
+关于原计划的阶段 4（通用效果证据）：**本轮不实施**。可本地落地的部分只剩「执行结果台账」（能力 id、退出码、耗时、影响对象），与既有 `host_capability_claims`（started/succeeded/failed + subject）高度重复；真正有价值的效果证据（安装后的版本、设备是否出现、产物摘要）必须连真机或真实 hdc 才能产生和验证，写了也只能是不可验证的解析代码。待有设备环境时按此顺序实施：① 定义 `HostEffectEvidence` 契约并落 run 事件；② 先接 `deploy`/`install`（hdc 输出解析 + 安装后 `bm dump` 版本核对）与 `emulator.start`（hdc list 出现）；③ 负例覆盖安装失败、版本不符、设备中途掉线。
+
+验证：后端库 1,067 通过、9 忽略（总计 1,076）；两组崩溃恢复集成各 3 项通过。本批未改前端，未重跑 UI、真机、系统沙箱或安装包验收。

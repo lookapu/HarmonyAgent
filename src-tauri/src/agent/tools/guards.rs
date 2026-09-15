@@ -176,25 +176,28 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     };
     // 变更类宿主能力即使在免弹窗路径（allow_all/白名单/项目信任）也要留下可撤销凭据：
     // 跳过弹窗是用户配置的策略，但「停止即失效、可显式撤销」的契约不能因此消失。
-    let receipt_required = crate::agent::capability_broker::requires_durable_receipt(tool);
+    let receipt = crate::agent::capability_broker::receipt_decision(tool, needs_approval);
+    if matches!(
+        receipt,
+        crate::agent::capability_broker::ReceiptDecision::Auto
+    ) {
+        let stop_generation = crate::agent::exec_ctx::stop_generation(conversation_id);
+        let impact = request_impact(inv);
+        crate::agent::broker_approval::record_capability_approval(
+            inv.ctx,
+            tool,
+            inv.args_raw,
+            &crate::agent::broker_approval::ApprovalScope::Request {
+                request_key: request_key_for(inv)?,
+                workspace: None,
+            },
+            stop_generation,
+            crate::agent::broker_approval::DECISION_AUTO,
+            impact.as_ref(),
+        )
+        .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
+    }
     if !needs_approval {
-        if receipt_required {
-            let stop_generation = crate::agent::exec_ctx::stop_generation(conversation_id);
-            let impact = request_impact(inv);
-            crate::agent::broker_approval::record_capability_approval(
-                inv.ctx,
-                tool,
-                inv.args_raw,
-                &crate::agent::broker_approval::ApprovalScope::Request {
-                    request_key: request_key_for(inv)?,
-                    workspace: None,
-                },
-                stop_generation,
-                crate::agent::broker_approval::DECISION_AUTO,
-                impact.as_ref(),
-            )
-            .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
-        }
         return Ok(());
     }
     // 在展示审批之前冻结作用域；摘要计算不占用异步执行线程或数据库锁。
@@ -251,7 +254,11 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
                 Some(scope) => Some(crate::agent::broker_approval::ApprovalScope::Ota(
                     scope.clone(),
                 )),
-                None if receipt_required => {
+                None if matches!(
+                    receipt,
+                    crate::agent::capability_broker::ReceiptDecision::Explicit
+                ) =>
+                {
                     Some(crate::agent::broker_approval::ApprovalScope::Request {
                         request_key: request_key_for(inv)?,
                         workspace: None,

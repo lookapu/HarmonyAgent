@@ -1321,6 +1321,52 @@ pub fn requires_durable_receipt(tool: &str) -> bool {
     RECEIPT_REQUIRED_TOOLS.contains(&tool)
 }
 
+/// 这次审批决定应当签发哪种凭据。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptDecision {
+    /// 不签发（不在契约内）
+    None,
+    /// 免弹窗路径：策略放行，但仍留下可撤销凭据
+    Auto,
+    /// 弹窗批准
+    Explicit,
+}
+
+/// 签发决策的唯一来源：审批钩子与执行期复核共用同一判断，避免两处漂移。
+///
+/// OTA 单独处理：它绑定的是文件内容摘要（`ApprovalScope::Ota`），只能在弹窗批准后签发；
+/// 权限层保证 `ota_pack` 永远需要显式确认（`receipt_decision_keeps_ota_explicit_only` 守护
+/// 这条不变式），因此它不会落到 Auto 分支、也不会在用 Request 作用域复核时失败。
+pub fn receipt_decision(tool: &str, needs_approval: bool) -> ReceiptDecision {
+    if tool == "ota_pack" {
+        return if needs_approval {
+            ReceiptDecision::Explicit
+        } else {
+            ReceiptDecision::None
+        };
+    }
+    if !requires_durable_receipt(tool) {
+        return ReceiptDecision::None;
+    }
+    if needs_approval {
+        ReceiptDecision::Explicit
+    } else {
+        ReceiptDecision::Auto
+    }
+}
+
+/// 是否需要执行期凭据复核：变更类（不可重放）且由 Agent 发起（有工具调用 ID 与审批基础设施）。
+/// OTA 走独立的内容作用域复核，不在这里重复。用户直接在界面发起的调用没有工具调用 ID，
+/// 不属于 Agent 权限边界。
+pub fn requires_receipt_check(
+    replay_safe: bool,
+    ota: bool,
+    has_call_id: bool,
+    has_app: bool,
+) -> bool {
+    !ota && !replay_safe && has_call_id && has_app
+}
+
 /// 校验当前 Agent 调用是否持有有效且未撤销的持久审批凭据。
 /// 不在契约内的能力不做额外拒绝（由既有权限层保护）。
 fn verify_durable_approval(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<(), String> {
@@ -1386,11 +1432,12 @@ pub async fn execute_host_capability(
     // 变更类宿主能力由 Agent 发起时必须持有可撤销的持久审批凭据：停止/删除会话、应用重启
     // 或超时都会让它失效，撤销由用户显式触发。用户在界面直接发起的调用没有 tool_call_id，
     // 不属于 Agent 权限边界，不受此约束。
-    if !matches!(capability, HostCapability::PackageOta { .. })
-        && !capability.replay_safe()
-        && ctx.tool_call_id.is_some()
-        && ctx.app.is_some()
-    {
+    if requires_receipt_check(
+        capability.replay_safe(),
+        matches!(capability, HostCapability::PackageOta { .. }),
+        ctx.tool_call_id.is_some(),
+        ctx.app.is_some(),
+    ) {
         if let Err(reason) = verify_durable_approval(ctx) {
             ctx.record_run_event("host_capability.rejected", serde_json::json!({
                 "capability_id": capability.capability_id(),
@@ -2429,6 +2476,32 @@ mod tests {
             assert!(requires_durable_receipt(tool));
         }
         assert!(!requires_durable_receipt("read_file"));
+        // 签发决策：契约内工具弹窗批准发 Explicit、免弹窗发 Auto，契约外不发
+        assert_eq!(
+            receipt_decision("deploy", true),
+            ReceiptDecision::Explicit
+        );
+        assert_eq!(receipt_decision("deploy", false), ReceiptDecision::Auto);
+        assert_eq!(receipt_decision("read_file", false), ReceiptDecision::None);
+        // OTA 绑定文件内容摘要，只在弹窗批准后签发；权限层必须保证它永远需要显式确认
+        assert_eq!(
+            receipt_decision("ota_pack", true),
+            ReceiptDecision::Explicit
+        );
+        assert_eq!(receipt_decision("ota_pack", false), ReceiptDecision::None);
+        assert!(
+            crate::services::permissions::requires_fresh_explicit_approval(
+                "ota_pack",
+                &serde_json::json!({})
+            ),
+            "ota_pack 必须在任何审批模式下都强制显式确认，否则不会签发内容作用域凭据"
+        );
+        // 执行期复核的触发条件：变更类 + Agent 发起（有工具调用 ID 与审批基础设施）
+        assert!(requires_receipt_check(false, false, true, true));
+        assert!(!requires_receipt_check(true, false, true, true), "只读能力不需要凭据");
+        assert!(!requires_receipt_check(false, true, true, true), "OTA 走内容作用域复核");
+        assert!(!requires_receipt_check(false, false, false, true), "界面直接调用不属于 Agent 边界");
+        assert!(!requires_receipt_check(false, false, true, false), "无审批基础设施不强制");
         // 变更类能力不能落在只读白名单里，否则执行期复核会被跳过
         for capability in [
             HostCapability::InstallHap {
