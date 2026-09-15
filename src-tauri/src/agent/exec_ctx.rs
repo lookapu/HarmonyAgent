@@ -234,9 +234,20 @@ pub async fn run_cmd_streaming_env(
     log_file: Option<&std::path::Path>,
     envs: Option<&[(String, String)]>,
 ) -> Result<Output, String> {
-    run_cmd_streaming_inner(ctx, program, args, cwd, timeout_secs, log_file, envs, None, None)
-        .await
-        .map(|(output, _truncated, _limits)| output)
+    run_cmd_streaming_inner(
+        ctx,
+        program,
+        args,
+        cwd,
+        timeout_secs,
+        StreamRunOptions {
+            log_file,
+            envs,
+            ..Default::default()
+        },
+    )
+    .await
+    .map(|(output, _truncated, _limits)| output)
 }
 
 /// 沙箱输出预算在采集、事件推送和日志落盘之前执行，stdout/stderr 共用额度。
@@ -254,10 +265,10 @@ pub async fn run_cmd_streaming_limited(
         args,
         cwd,
         timeout_secs,
-        None,
-        None,
-        Some(output_bytes),
-        None,
+        StreamRunOptions {
+            output_bytes: Some(output_bytes),
+            ..Default::default()
+        },
     )
     .await
     .map(|(output, truncated, _)| (output, truncated))
@@ -271,7 +282,6 @@ pub async fn run_cmd_streaming_env_with_native_limits(
     args: &[String],
     cwd: Option<&std::path::Path>,
     timeout_secs: u64,
-    log_file: Option<&std::path::Path>,
     envs: Option<&[(String, String)]>,
     limits: &crate::agent::native_limits::NativeLimits,
 ) -> Result<
@@ -288,10 +298,11 @@ pub async fn run_cmd_streaming_env_with_native_limits(
         args,
         cwd,
         timeout_secs,
-        log_file,
-        envs,
-        None,
-        Some(limits),
+        StreamRunOptions {
+            envs,
+            native_limits: Some(limits),
+            ..Default::default()
+        },
     )
     .await
 }
@@ -320,12 +331,23 @@ pub async fn run_cmd_streaming_limited_with_native_limits(
         args,
         cwd,
         timeout_secs,
-        None,
-        None,
-        Some(output_bytes),
-        Some(limits),
+        StreamRunOptions {
+            output_bytes: Some(output_bytes),
+            native_limits: Some(limits),
+            ..Default::default()
+        },
     )
     .await
+}
+
+/// 流式执行的附加选项：日志落盘、环境变量、输出预算与资源限制。
+/// 收拢成结构，避免内部执行器的参数列表随功能继续膨胀。
+#[derive(Default, Clone, Copy)]
+struct StreamRunOptions<'a> {
+    log_file: Option<&'a std::path::Path>,
+    envs: Option<&'a [(String, String)]>,
+    output_bytes: Option<usize>,
+    native_limits: Option<&'a crate::agent::native_limits::NativeLimits>,
 }
 
 async fn run_cmd_streaming_inner(
@@ -334,10 +356,7 @@ async fn run_cmd_streaming_inner(
     args: &[String],
     cwd: Option<&std::path::Path>,
     timeout_secs: u64,
-    log_file: Option<&std::path::Path>,
-    envs: Option<&[(String, String)]>,
-    output_bytes: Option<usize>,
-    native_limits: Option<&crate::agent::native_limits::NativeLimits>,
+    options: StreamRunOptions<'_>,
 ) -> Result<
     (
         Output,
@@ -348,6 +367,12 @@ async fn run_cmd_streaming_inner(
 > {
     use tokio::io::{AsyncWriteExt, BufReader};
 
+    let StreamRunOptions {
+        log_file,
+        envs,
+        output_bytes,
+        native_limits,
+    } = options;
     let mut cmd = crate::utils::process::command(program, args)?;
     // 资源限制必须在 spawn 之前挂上（fork 后、exec 前生效）
     let limits_report = match native_limits {

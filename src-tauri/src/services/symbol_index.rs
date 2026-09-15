@@ -2512,6 +2512,8 @@ struct DeferredBatchResult {
 }
 
 /// 从 SQLite 领取一小批 deferred 文件，锁外解析，再以指纹条件更新提交。
+/// 生产路径走 [`promote_deferred_batch_at_if`]（带取消判定），这个不带取消的入口只供测试。
+#[cfg(test)]
 fn promote_deferred_batch_at(
     root: &Path,
     data_dir: &Path,

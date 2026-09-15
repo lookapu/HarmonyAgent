@@ -12,6 +12,10 @@
 //! - `writable_tmp_mb`：`RLIMIT_FSIZE` 限制单文件大小，不是临时目录总量。
 //! - `wall_time_seconds` / `output_bytes`：已由执行器自身的超时与输出采集预算强制。
 
+// rlimit 常量在不同平台上类型不同（macOS 是 c_int，Linux 的 __rlimit_resource_t 是 u32）。
+// 这里统一按 i32 传递再按需转换，所以 macOS 上会被 clippy 判为多余转换——不能按单一平台删掉。
+#![allow(clippy::unnecessary_cast)]
+
 use crate::agent::sandbox::ResourceLimits;
 
 /// 本次要施加到子进程的 rlimit（None = 不限制）。
@@ -367,7 +371,6 @@ mod tests {
                 ],
                 None,
                 60,
-                None,
                 None,
                 &limits,
             )

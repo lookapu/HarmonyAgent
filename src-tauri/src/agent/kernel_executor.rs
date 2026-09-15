@@ -350,6 +350,8 @@ impl std::ops::DerefMut for KernelIoRunLoop {
 }
 
 impl KernelExecutorState {
+    /// 仅供测试构造：生产路径通过 `KernelIoRunLoop::new` 或其 checkpoint 恢复创建。
+    #[cfg(test)]
     fn new() -> Self {
         Self::default()
     }
@@ -405,6 +407,8 @@ impl KernelExecutorState {
         decision
     }
 
+    /// 仅供测试断言读取；生产路径经 checkpoint 序列化暴露同一字段。
+    #[cfg(test)]
     fn completed_rounds(&self) -> u64 {
         self.completed_rounds
     }
@@ -483,6 +487,8 @@ impl KernelExecutorState {
         }
     }
 
+    /// 仅供测试断言读取；生产路径经 checkpoint 序列化暴露同一字段。
+    #[cfg(test)]
     fn tool_attempts(&self) -> u64 {
         self.tool_attempts
     }

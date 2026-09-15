@@ -372,7 +372,6 @@ impl NativeBackend {
                 "summary": limits_report.summary(),
             }),
         );
-        let output = output;
         let cleanup_failed = std::fs::remove_dir_all(&temp_root).is_err();
         let (status, exit_code, stdout, stderr, capture_truncated) = match output {
             Ok((output, truncated)) => (

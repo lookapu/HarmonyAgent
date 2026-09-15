@@ -34,13 +34,16 @@ pub(super) enum JavaTypeCheck {
     Unavailable { reason: String },
 }
 
-/// 单文件事务（write_file / edit_file 等）的差分校验。
+/// 单文件事务（write_file / edit_file 等）的差分校验。生产路径经
+/// `code_mutation::validate_candidate_with_types` 传入受影响文件，这里只供测试直调。
+#[cfg(test)]
 pub(super) fn check(path: &Path, before: &str, after: &str) -> JavaTypeCheck {
     check_batch_with_affected(&[(path, before, after)], &[])
 }
 
-/// 批量联编差分：同批候选作为一次 javac 调用的显式输入，彼此引用解析到候选版本，
-/// 因此能拦住单文件校验看不到的“同批跨文件类型破坏”。空批次视为无诊断。
+/// 批量联编差分（不带受影响文件）：同批候选作为一次 javac 调用的显式输入，能拦住单文件
+/// 校验看不到的“同批跨文件类型破坏”。生产路径经 `validate_batch_types` 并入受影响文件。
+#[cfg(test)]
 pub(super) fn check_batch(files: &[(&Path, &str, &str)]) -> JavaTypeCheck {
     check_batch_with_affected(files, &[])
 }

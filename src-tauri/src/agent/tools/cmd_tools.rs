@@ -402,7 +402,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         let shell_args = vec!["-c".to_string(), command.to_string()];
         let envs = deveco_node_env();
         let outcome = crate::agent::exec_ctx::run_cmd_streaming_env_with_native_limits(
-            ctx, shell_prog, &shell_args, Some(cwd), timeout, None, envs.as_deref(), &host_limits,
+            ctx, shell_prog, &shell_args, Some(cwd), timeout, envs.as_deref(), &host_limits,
         )
         .await;
         let report = outcome.as_ref().map(|(_, _, report)| report.clone()).unwrap_or_default();
@@ -418,7 +418,7 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         // 工程内脚本（如 hvigorw.bat）优先本地路径解析；.bat/.cmd 经 cmd /C 执行（见 resolve_program）
         let (program, full_args, envs) = resolve_program(command, cwd);
         let outcome = crate::agent::exec_ctx::run_cmd_streaming_env_with_native_limits(
-            ctx, &program, &full_args, Some(cwd), timeout, None, envs.as_deref(), &host_limits,
+            ctx, &program, &full_args, Some(cwd), timeout, envs.as_deref(), &host_limits,
         )
         .await;
         let report = outcome.as_ref().map(|(_, _, report)| report.clone()).unwrap_or_default();

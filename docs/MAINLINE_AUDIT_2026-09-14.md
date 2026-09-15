@@ -360,3 +360,15 @@
 边界：这是**使用者自选的兜底**，不改变「宿主直跑不是安全边界」的定性——进程数/CPU 配额/临时磁盘总量在直跑路径同样不限制，隔离能力仍只在 OCI/原生 sandbox 路径；限额只覆盖 `run_command`（其它工具自带的执行路径未接）。
 
 验证：后端库 1,074 通过、9 忽略（总计 1,083），新增 2 项：① 配置解析（未设置/空值=不限制，非法值失败关闭）② **真实调用执行器入口**的 CPU 限额终止（ToolCtx::empty + 自旋命令，断言报告 `applied=[("cpu_seconds",1)]` 且子进程被信号终止）；两组崩溃恢复集成各 3 项通过。本批未改前端，未运行 Docker/OCI、真机或安装包验收。
+
+## 18. dead-code 警告清零与 clippy 门禁现状（2026-09-15）
+
+前几批一直在文档里保留「非测试构建仍有既有 dead-code 警告」的说明。本轮把警告清到 0：
+
+- 4 条 dead-code 警告全部是**只被测试使用**的辅助项，处理方式是按语义标注为测试用途，而不是删掉它们（删了会丢测试覆盖）：
+  `KernelExecutorState::{new, completed_rounds, tool_attempts}`（生产经 `KernelIoRunLoop::new`/checkpoint 恢复，字段经序列化暴露）、`symbol_index::promote_deferred_batch_at`（生产走带取消判定的 `_if` 变体）、`java_compiler::{check, check_batch}`（生产经 `validate_candidate_with_types`/`validate_batch_types` 并入受影响文件）。
+- 顺带修掉本批自身引入的 clippy 噪声：`exec_ctx` 的内部执行器把「日志/环境变量/输出预算/资源限制」收拢为 `StreamRunOptions`（参数从 9 降到 6），两个 `*_with_native_limits` 包装去掉调用方从未使用的 `log_file`（8→7）；`sandbox` 去掉一处冗余重绑定；`native_limits` 的跨平台 rlimit 常量转换加显式 `allow`（macOS 是 `c_int`、Linux 是 `u32`，不能按单一平台删掉转换）。
+
+验证：非测试 `cargo check --lib` 与 `cargo test --no-run` 均为 **0 警告**；后端库 1,074 通过、9 忽略（总计 1,083）；两组崩溃恢复集成各 3 项通过。
+
+**同日发现的独立问题（不属于本批引入，需单独决策）**：CI 的 clippy 基线门禁 `scripts/check-warnings.py --baseline 44` 当前失败——唯一告警 **100/44**。按 (lint, 文件:行) 逐条与本次会话新增行比对，**落在本会话新增行上的告警为 0**，即这 100 条全部是既有技术债：结构类 61 条（too_many_arguments 44 + type_complexity 17，基线当时是 31+13）、机械类约 39 条（bool_assert_comparison 14、cloned_ref_to_slice_refs 12、manual_inspect 4、unnecessary_map_or 3 等，多为测试代码）。门禁设定「机械类新增立即阻断、结构类保留为基线」，因此要么收敛机械类并重新设定基线，要么只更新基线——两者都会改动质量门禁口径，需要明确决策后再动，本批不改。
