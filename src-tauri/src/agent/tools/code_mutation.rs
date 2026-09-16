@@ -1,8 +1,11 @@
 //! 代码写入前的统一候选验证。
 //!
-//! 所有文件修改工具先在内存中形成完整候选文本，再经过这里的语言门禁。当前 P0 在
-//! 通用配平守卫之上为 ArkTS/TypeScript/JavaScript/Java 提供真实语法树错误增量检查；其它
-//! 语言明确回退配平层，后续由 language adapter 逐步补齐，不能把 fallback 冒充 AST。
+//! 所有文件修改工具先在内存中形成完整候选文本，再经过这里的语言门禁。通用配平守卫之上：
+//! - ArkTS/TypeScript/JavaScript/Go/Python/Rust 用 tree-sitter 做真实语法树错误增量检查；
+//! - Java 另有 AST 声明检查与 javac 类型差分（见 `java_compiler`）；
+//! - Dart 另有 `dart analyze` 类型差分（见 `dart_analyzer`）。
+//!
+//! 其余语言明确回退配平层，后续由 language adapter 逐步补齐，不能把 fallback 冒充 AST。
 
 use std::path::{Path, PathBuf};
 
@@ -84,6 +87,11 @@ fn tree_sitter_language(ext: &str) -> Option<tree_sitter::Language> {
         "ets" => Some(tree_sitter_arkts::LANGUAGE.into()),
         "ts" | "js" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" | "jsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        // Go / Python / Rust 从「只做括号配平」升级为真实语法树错误增量：
+        // 语法树完全离线，不依赖用户机器上装了 go / python / 对应工具链。
+        "go" => Some(tree_sitter_go::LANGUAGE.into()),
+        "py" => Some(tree_sitter_python::LANGUAGE.into()),
+        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -583,6 +591,50 @@ mod tests {
             );
         }
         assert!(resolve_java_handle_byte_range(valid, 2, 3, None).is_err());
+    }
+
+    /// Go/Python/Rust 不再走括号配平回退：配平但语法非法的候选必须在落盘前被拒。
+    #[test]
+    fn go_python_rust_use_real_syntax_trees() {
+        for (name, before, after) in [
+            (
+                "src/a.go",
+                "package main\nfunc f() int { return 1 }\n",
+                "package main\nfunc f() int { x := ; return x }\n",
+            ),
+            (
+                "src/a.py",
+                "def f():\n    return 1\n",
+                "def f():\n    x = \n    return x\n",
+            ),
+            (
+                "src/a.rs",
+                "fn f() -> i32 { 1 }\n",
+                "fn f() -> i32 { let x = ; x }\n",
+            ),
+        ] {
+            let error = validate_candidate(Path::new(name), before, after).unwrap_err();
+            assert!(error.contains("语法门禁拒绝"), "{name}: {error}");
+        }
+        // 干净代码不得被误报，且报告要标明用的是真实语法树而不是配平回退
+        for (name, source) in [
+            ("a.go", "package main\nfunc f() int { return 1 }\n"),
+            ("a.py", "def f():\n    return 1\n"),
+            ("a.rs", "fn f() -> i32 { 1 }\n"),
+        ] {
+            let report = validate_candidate(Path::new(name), "", source).unwrap();
+            assert_eq!(report.parser, "tree_sitter", "{name}");
+            assert_eq!(report.after_errors, 0, "{name} 不应有语法错误");
+        }
+        // 修好既有错误时允许放行，并如实反映错误数下降
+        let report = validate_candidate(
+            Path::new("src/a.go"),
+            "package main\nfunc f() int { x := ; return x }\n",
+            "package main\nfunc f() int { return 1 }\n",
+        )
+        .unwrap();
+        assert_eq!(report.parser, "tree_sitter");
+        assert!(report.after_errors < report.before_errors);
     }
 
     #[test]

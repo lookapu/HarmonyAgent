@@ -428,3 +428,15 @@ Windows MSVC（CI 实际使用的目标）无法从 macOS 交叉校验；即便�
 - 因此 Dart 保持在「本文件差分」这一层：本文件的新增类型错误会拦，跨文件类型破坏不拦（multi_edit 同批也拦不到，因为候选同样不在磁盘上）。这比假装有覆盖诚实。
 
 结论：Dart 门禁按设计完成，跨文件覆盖需要「按引用反查 + 能离线编译整套输入」的工具（如把依赖一起喂给分析器），当前 Dart 工具链没有该能力；后续若引入 `dart analyze` 的替代（如自建 analysis server 会话）再评估。
+
+## 21. Go/Python/Rust 语法门禁接入真实语法树（2026-09-15）
+
+盘点：写入门禁此前只对 ets/ts/js/tsx 做 tree-sitter 语法检查，**Go/Python/Rust 等语言只做括号配平**——配平能挡住漏 `}`，挡不住「括号齐了但语法非法」（`x := ;`、`x = `、`let x = ;`）。
+
+- 新增三个 grammar 依赖并接入 `tree_sitter_language()`：`tree-sitter-go`、`tree-sitter-python`、`tree-sitter-rust`，`.go`/`.py`/`.rs` 从此走与 TS/ArkTS 同一套「错误节点增量」判定，完全离线、不依赖用户机器上装 go/python/rust 工具链。
+- **实测到的版本约束（值得记住）**：`tree-sitter-go 0.25`、`tree-sitter-python 0.25`、`tree-sitter-rust 0.24.2` 的语法 **ABI 是 15**，而项目锁定的 `tree-sitter 0.24.7` 最高支持 14 —— 失败发生在**运行时初始化**（`初始化语法解析器失败：Incompatible language version 15. Expected minimum 13, maximum 14`），编译期完全看不出来。因此三个 grammar 全部锁在 **0.23 系列**（go 0.23.4 / python 0.23.6 / rust 0.23.3），并在 `Cargo.toml` 注释里写明「只有整体升级 tree-sitter 时才能一起抬」。这条是靠新加的"干净代码不得误报"断言当场抓到的，否则会在生产写入路径上炸。
+- 判定口径不变：原文件已有语法错误时允许错误数下降或持平，只拦新增；报告里 `parser` 字段用 `tree_sitter` 而不是 `delimiter_fallback`，不把回退冒充 AST。
+
+边界：这是**语法**层，不是类型语义（Go 的类型错误、Python 的名字解析、Rust 的借用检查都不在覆盖内）；Rust 新版语法若超出 0.23 grammar 的支持范围，会因「基线与候选同样报错」而被差抵消（不会误拒，但也不会拦）；其余语言（如 Kotlin、C++）仍是配平回退。
+
+验证：后端库 1,082 通过、9 忽略（总计 1,091），新增 1 项跨语言语法测试（三种语言各验「配平但非法被拒」「干净代码不误报且报告标明 tree_sitter」「修正既有错误放行」）；两组崩溃恢复集成各 3 项通过；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；`check-docs.py` 与 `check-warnings.py`（57/57）通过。
