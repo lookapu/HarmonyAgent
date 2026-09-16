@@ -1055,6 +1055,28 @@ pub fn output_stderr_blocking_with_timeout_opts(
     cwd: Option<&Path>,
     envs: &[(String, String)],
 ) -> Result<Option<(i32, String)>, String> {
+    output_stderr_blocking_with_timeout_full(program, args, timeout, cwd, envs, None)
+}
+
+/// 同上，并可用文件作为子进程 stdin（如 `sqlite3` 需要从标准输入读脚本）。
+/// 用文件而不是管道：内容可能很大，管道写满会死锁。
+pub fn output_stderr_blocking_with_timeout_stdin(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+    stdin_file: &Path,
+) -> Result<Option<(i32, String)>, String> {
+    output_stderr_blocking_with_timeout_full(program, args, timeout, None, &[], Some(stdin_file))
+}
+
+fn output_stderr_blocking_with_timeout_full(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+    cwd: Option<&Path>,
+    envs: &[(String, String)],
+    stdin_file: Option<&Path>,
+) -> Result<Option<(i32, String)>, String> {
     let resolved = resolve_program(program).ok_or_else(|| not_found_error(program))?;
     let err_path = temp_capture_path(program);
     let err_file = std::fs::File::create(&err_path)
@@ -1066,8 +1088,17 @@ pub fn output_stderr_blocking_with_timeout_opts(
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+    match stdin_file {
+        Some(path) => {
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("打开 {program} 输入文件失败: {e}"))?;
+            cmd.stdin(std::process::Stdio::from(file));
+        }
+        None => {
+            cmd.stdin(std::process::Stdio::null());
+        }
+    }
+    cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(err_file));
     let mut child = cmd.spawn().map_err(|e| {
         let _ = std::fs::remove_file(&err_path);

@@ -459,3 +459,18 @@ Windows MSVC（CI 实际使用的目标）无法从 macOS 交叉校验；即便�
 边界：三者都只做**单文件**差分——Go 不做跨包检查、Python 不做跨模块解析、Dart 不做跨文件（§20 已说明为什么结构性做不到）；Go/Python 的降级（无工具、非模块/非包、超时）都不阻塞写入并记对应事件；`.py` 的语法层由 tree-sitter 覆盖，pyflakes 缺席时仍有语法保护。
 
 验证：后端库 1,092 通过、9 忽略（总计 1,101）；新增 `go_vet` 5 项（含真实 go vet 抓到类型错误、非模块跳过、上下文缺失分离、重复计数、干净候选无新增）、`python_lint` 4 项（解析、重复计数、**本机真实的降级路径**、有工具时的真实用例）、`.dart` 与 Go 各 1 项 `edit_file` 真实入口测试；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；`check-docs.py` 与 `check-warnings.py`（57/57）通过。
+
+## 23. Kotlin 语法门禁与 SQL 执行门禁（2026-09-15）
+
+**Kotlin（语法层）**：接入 `tree-sitter-kotlin-ng 1.1.0`，`.kt`/`.kts` 从配平回退升级为真实语法树错误增量。加依赖前先做了**静态校验**：该 crate 依赖 `tree-sitter-language`（不会与锁定版本产生 `links` 冲突），且源码 `parser.c` 里 `LANGUAGE_VERSION` 是 **14**（与 `tree-sitter 0.24.7` 的上限一致）——上一轮两次 ABI 15 的坑都是运行时才暴露，这次改成先查 `LANGUAGE_VERSION` 再决定，避免再走一遍「装上→跑测试→回退」。
+**本机没有 kotlinc**（sdkman 只装了 java/maven），因此 Kotlin **只做语法层**，语义层不实现——写了也没有本机可验证的路径，属于「不写不可验证代码」的边界。
+
+**SQL（执行层）**：不新增 grammar（`tree-sitter-sqlite3 0.1.0` 实测是 ABI 15，同样不兼容），改用系统自带 `sqlite3` 做**内存库执行差分**：
+- 两侧分别喂给 `sqlite3 -batch :memory:`，只拦新出现的 `Parse error near line N: <msg>`；行号丢弃后比消息。
+- **必须用 stdin 而不是命令行参数**：参数形式只报第一个错误且格式不同（`Error: in prepare, ...`），stdin 形式会逐行报出全部错误并带行号——这是实测出来的差别，用参数形式时测试直接失败暴露了问题。
+- 依赖工程别处 schema 的错误（`no such table/column/function/view/...`）不算新增，两侧同报时整体降级为「未做检查」；但文件内自洽的语义错误（重复列名、`INSERT` 值个数与列数不符）会照常拦下。
+- **安全边界**：库固定在内存（不落盘），且候选命中可能触碰宿主文件的语句（`ATTACH`/`DETACH`/`VACUUM INTO`/`CREATE VIRTUAL TABLE`/`.read`/`.output` 等点命令）时**直接不执行**、按未检查降级——不能为了校验就把不可信内容跑起来产生副作用。超过 256KB 的文件同样不执行。
+
+边界：SQL 不做 schema 感知分析（其它文件的建表语句不参与）、不判断迁移顺序；Kotlin 只有语法层（无类型错误、无跨文件）；两者的降级路径都记独立事件并如实标注「未做检查」。
+
+验证：后端库 1,100 通过、9 忽略（总计 1,109）；新增 `sql_check` 6 项（解析与上下文分离、副作用语句拒绝、重复计数、真实 sqlite3 抓到值个数不匹配、schema 依赖时降级、干净候选无新增）、Kotlin/SQL 各 1 项 `edit_file` 真实入口测试、`code_mutation` 跨语言语法测试扩展到 Kotlin；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；`check-docs.py` 与 `check-warnings.py`（57/57）通过。

@@ -94,6 +94,7 @@ fn tree_sitter_language(ext: &str) -> Option<tree_sitter::Language> {
         "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
         // Dart 的语法层离线可查；装了 dart 时另有 `dart analyze` 类型差分（见 dart_analyzer）
         "dart" => Some(tree_sitter_dart::language()),
+        "kt" | "kts" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -351,6 +352,42 @@ fn is_python_source(path: &Path) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("py"))
 }
 
+/// SQL 候选的 sqlite3 执行差分门禁；Skip 时记事件并放行（与其他语言的降级同口径）。
+fn check_sql(path: &Path, before: &str, after: &str) -> Result<(), String> {
+    match super::sql_check::check(path, before, after) {
+        super::sql_check::SqlCheck::Checked {
+            before: before_errors,
+            after: after_errors,
+            added,
+        } => {
+            if added.is_empty() {
+                return Ok(());
+            }
+            let shown: Vec<String> = added.iter().take(3).cloned().collect();
+            Err(format!(
+                "代码修改事务被 SQL 执行门禁拒绝：{} 在内存库执行的新增错误由 {} 条增至 {} 条，新增：{}。候选内容未落盘；请修正列名/值个数或语法后重试。判定为单文件执行差分，未做 schema 感知分析。",
+                path.display(),
+                before_errors,
+                after_errors,
+                shown.join("；")
+            ))
+        }
+        super::sql_check::SqlCheck::Skipped { reason } => {
+            crate::utils::logger::log_event(
+                "sql_check_gate_skipped",
+                serde_json::json!({ "path": path.display().to_string(), "reason": reason }),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn is_sql_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("sql"))
+}
+
 /// 单次事务里最多并入多少个“未参与本批”的候选调用方文件（控制 javac 时长）。
 const MAX_AFFECTED_FILES: usize = 20;
 /// 收集候选调用方时的目录扫描上限；超出即停止扫描，按已收集结果继续。
@@ -517,6 +554,10 @@ pub(super) fn validate_candidate_with_types(
         check_python_lint(path, before, after)?;
         return Ok(report);
     }
+    if is_sql_source(path) {
+        check_sql(path, before, after)?;
+        return Ok(report);
+    }
     if !is_java_source(path) {
         return Ok(report);
     }
@@ -569,6 +610,9 @@ pub(super) fn validate_batch_types(files: &[(&Path, &str, &str)]) -> Result<(), 
         }
         if is_python_source(path) {
             check_python_lint(path, before, after)?;
+        }
+        if is_sql_source(path) {
+            check_sql(path, before, after)?;
         }
     }
     let edited: Vec<PathBuf> = files.iter().map(|(path, _, _)| path.to_path_buf()).collect();
@@ -705,6 +749,11 @@ mod tests {
                 "int f() {\n  return 1;\n}\n",
                 "int f() {\n  final x = ;\n  return x;\n}\n",
             ),
+            (
+                "src/a.kt",
+                "fun f(): Int {\n    return 1\n}\n",
+                "fun f(): Int {\n    val x: = 1\n    return x\n}\n",
+            ),
         ] {
             let error = validate_candidate(Path::new(name), before, after).unwrap_err();
             assert!(error.contains("语法门禁拒绝"), "{name}: {error}");
@@ -715,6 +764,7 @@ mod tests {
             ("a.py", "def f():\n    return 1\n"),
             ("a.rs", "fn f() -> i32 { 1 }\n"),
             ("a.dart", "int f() {\n  return 1;\n}\n"),
+            ("a.kt", "fun f(): Int {\n    return 1\n}\n"),
         ] {
             let report = validate_candidate(Path::new(name), "", source).unwrap();
             assert_eq!(report.parser, "tree_sitter", "{name}");
@@ -878,7 +928,7 @@ mod tests {
     #[test]
     fn unsupported_language_is_explicit_delimiter_fallback() {
         // 已接入真实语法树的语言（ets/ts/js/tsx/go/py/rs/dart）不得出现在这里
-        for name in ["src/a.kt", "src/a.cpp", "src/a.swift", "src/a.unknownext"] {
+        for name in ["src/a.cpp", "src/a.swift", "src/a.groovy", "src/a.unknownext"] {
             let report = validate_candidate(
                 Path::new(name),
                 "class A {}\n",

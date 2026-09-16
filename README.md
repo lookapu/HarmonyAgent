@@ -137,7 +137,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 301 个 Tauri IPC 入口 · 58 个 service 模块        │
-│  - agent/ 58 个顶层模块 · tools/ 34 文件 · 204 工具  │
+│  - agent/ 58 个顶层模块 · tools/ 35 文件 · 204 工具  │
 │  - SQLite + 84 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
@@ -177,7 +177,7 @@ src-tauri/src/
 │   ├── session_ctx.rs       #   - 会话级运行态（统一收敛）
 │   ├── invariants.rs         #   - 写操作不变式（.env/证书/迁移 SQL）
 │   ├── session_events.rs    #   - 会话事件溯源
-│   └── tools/               #   - 204 个 Agent 工具（34 文件）
+│   └── tools/               #   - 204 个 Agent 工具（35 文件）
 │       ├── mod.rs               # 工具注册表（TOOL_SPECS）+ 协议分发
 │       ├── protocol.rs          # 工具调用标记解析
 │       ├── errors.rs            # 结构化错误信封（ToolError 7 类）

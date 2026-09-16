@@ -16,6 +16,7 @@ mod dart_analyzer;
 mod go_vet;
 mod java_compiler;
 mod python_lint;
+mod sql_check;
 
 pub(crate) fn validate_code_mutation(
     path: &std::path::Path,

@@ -4861,6 +4861,62 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 真实入口：Kotlin 候选的语法错误由 tree-sitter 拦住（离线，不依赖 kotlinc）。
+    #[test]
+    fn kotlin_entry_gate_blocks_syntax_error_atomically() {
+        let content = "fun f(): Int {\n    val x = 1\n    return x\n}\n";
+        let (file, roots) = tmp_file("kotlin_entry_gate", content, "kt");
+        let root = file.parent().unwrap().to_path_buf();
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old": "val x = 1",
+                "new": "val x: = 1"
+            }),
+            &roots,
+            "kotlin_entry_gate",
+        ))
+        .unwrap_err();
+        assert!(error.contains("语法门禁拒绝"), "{error}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// 真实入口：SQL 候选在内存库执行出的新增错误必须拦住；无 sqlite3 时降级。
+    #[test]
+    fn sql_entry_gate_blocks_execution_error_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "sql_entry_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let file = dir.join("migration.sql");
+        let content = "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n";
+        std::fs::write(&file, content).unwrap();
+        let result = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old": "VALUES (1);",
+                "new": "VALUES (1, 2);"
+            }),
+            &roots,
+            "sql_entry_gate",
+        ));
+        match result {
+            Err(error) => {
+                assert!(error.contains("SQL 执行门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            }
+            Ok(_) => {
+                // 无 sqlite3：降级为未检查，语法/配平门禁放行 → 候选落盘
+                assert!(std::fs::read_to_string(&file).unwrap().contains("VALUES (1, 2);"));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 未参与本次编辑的调用方也要覆盖：edit_file 只改 A，同源码根下的 B 仍在调用被删掉的
     /// 方法 —— 这正是“改坏没被一起编辑的调用方”的常见回归，必须在写入前拦住。
     #[test]
