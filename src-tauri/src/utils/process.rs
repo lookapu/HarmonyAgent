@@ -983,6 +983,56 @@ fn temp_capture_path(program: &str) -> PathBuf {
     std::env::temp_dir().join(name)
 }
 
+/// 同步执行、丢弃 stderr、把 stdout 捕获到临时文件，带墙钟超时。
+///
+/// `dart analyze --format machine` 这类工具把结构化诊断写在 stdout，且输出量可能很大，
+/// 因此与 stderr 版同样落文件而不是管道。超时返回 `Ok(None)`（子进程已终止）。
+pub fn output_stdout_blocking_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<Option<(i32, String)>, String> {
+    let resolved = resolve_program(program).ok_or_else(|| not_found_error(program))?;
+    let out_path = temp_capture_path(program);
+    let out_file = std::fs::File::create(&out_path)
+        .map_err(|e| format!("创建 {program} 输出临时文件失败: {e}"))?;
+    let mut cmd = blocking_command(&resolved, args);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out_file))
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| {
+        let _ = std::fs::remove_file(&out_path);
+        format!("执行 {program} 失败: {e}")
+    })?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(&out_path);
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&out_path);
+                return Err(format!("等待 {program} 退出失败: {e}"));
+            }
+        }
+    };
+    let captured = std::fs::read(&out_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    Ok(Some((
+        status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&captured).to_string(),
+    )))
+}
+
 /// 同步执行、丢弃 stdout、把 stderr 捕获到临时文件，带墙钟超时。
 ///
 /// stderr 落文件而非管道：javac/构建工具在大工程上输出可超过管道缓冲，直接 pipe

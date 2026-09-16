@@ -233,6 +233,42 @@ fn is_java_source(path: &Path) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("java"))
 }
 
+fn is_dart_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("dart"))
+}
+
+/// Dart 候选的 `dart analyze` 差分门禁；Skip 时记事件并放行（与 Java 的降级同口径）。
+fn check_dart_types(path: &Path, before: &str, after: &str) -> Result<(), String> {
+    match super::dart_analyzer::check(path, before, after) {
+        super::dart_analyzer::DartCheck::Checked {
+            before: before_errors,
+            after: after_errors,
+            added,
+        } => {
+            if added.is_empty() {
+                return Ok(());
+            }
+            let shown: Vec<String> = added.iter().take(3).cloned().collect();
+            Err(format!(
+                "代码修改事务被 Dart 分析器门禁拒绝：{} 的 dart analyze 错误由 {} 条增至 {} 条，新增：{}。候选内容未落盘；请修正未定义符号/类型不匹配或补回 import 后重试。判定为本文件差分分析，未做跨文件联编。",
+                path.display(),
+                before_errors,
+                after_errors,
+                shown.join("；")
+            ))
+        }
+        super::dart_analyzer::DartCheck::Skipped { reason } => {
+            crate::utils::logger::log_event(
+                "dart_analyze_gate_skipped",
+                serde_json::json!({ "path": path.display().to_string(), "reason": reason }),
+            );
+            Ok(())
+        }
+    }
+}
+
 /// 单次事务里最多并入多少个“未参与本批”的候选调用方文件（控制 javac 时长）。
 const MAX_AFFECTED_FILES: usize = 20;
 /// 收集候选调用方时的目录扫描上限；超出即停止扫描，按已收集结果继续。
@@ -387,6 +423,10 @@ pub(super) fn validate_candidate_with_types(
     after: &str,
 ) -> Result<MutationGuardReport, String> {
     let report = validate_candidate(path, before, after)?;
+    if is_dart_source(path) {
+        check_dart_types(path, before, after)?;
+        return Ok(report);
+    }
     if !is_java_source(path) {
         return Ok(report);
     }
@@ -427,6 +467,13 @@ pub(super) fn validate_candidate_with_types(
 pub(super) fn validate_batch_types(files: &[(&Path, &str, &str)]) -> Result<(), String> {
     if files.is_empty() {
         return Ok(());
+    }
+    // Dart 以包为单位分析、无法像 javac 那样把同批候选一次联编，因此逐个文件差分；
+    // 跨文件类型影响不在覆盖内（与单文件门禁同边界）。
+    for (path, before, after) in files {
+        if is_dart_source(path) {
+            check_dart_types(path, before, after)?;
+        }
     }
     let edited: Vec<PathBuf> = files.iter().map(|(path, _, _)| path.to_path_buf()).collect();
     let affected = merge_affected(

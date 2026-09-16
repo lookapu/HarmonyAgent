@@ -4784,6 +4784,47 @@ mod tests {
         )
     }
 
+    /// 真实入口：Dart 候选引入未定义标识符属于「语法合法但分析器报错」，
+    /// 必须在写入前拒绝；无 dart 或不在包内时按未分析降级（不阻塞）。
+    #[test]
+    fn dart_entry_gate_blocks_analyzer_error_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "dart_entry_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(
+            dir.join("pubspec.yaml"),
+            "name: probe\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n",
+        )
+        .unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let file = dir.join("lib/a.dart");
+        let content = "class A {\n  int value() { return 1; }\n}\n";
+        std::fs::write(&file, content).unwrap();
+        let result = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old": "return 1;",
+                "new": "return missingThing;"
+            }),
+            &roots,
+            "dart_entry_gate",
+        ));
+        match result {
+            Err(error) => {
+                assert!(error.contains("Dart 分析器门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            }
+            Ok(_) => {
+                // 无 dart / 未在包内：降级为未分析，语法门禁放行 → 候选落盘
+                assert!(std::fs::read_to_string(&file).unwrap().contains("missingThing"));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 未参与本次编辑的调用方也要覆盖：edit_file 只改 A，同源码根下的 B 仍在调用被删掉的
     /// 方法 —— 这正是“改坏没被一起编辑的调用方”的常见回归，必须在写入前拦住。
     #[test]

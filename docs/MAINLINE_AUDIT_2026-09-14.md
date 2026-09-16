@@ -402,3 +402,19 @@ Windows MSVC（CI 实际使用的目标）无法从 macOS 交叉校验；即便�
 **如实标注**：Windows/Linux 的编译正确性在本机**未经编译验证**，仅经过代码审查；真正的门禁仍是 CI 的两个 runner（macOS + Windows）。若需要本机覆盖，可安装 MinGW（`brew install mingw-w64`）以校验 windows-gnu，但那不等于 MSVC，属可选增强，本轮未执行、也未改动本机工具链。
 
 验证：后端库 1,074 通过、9 忽略（总计 1,083）；非测试 `cargo check --lib` 与 `cargo test --no-run` 均 0 警告；两组崩溃恢复集成各 3 项通过；`check-docs.py` 与 `check-warnings.py` 门禁通过。
+
+## 20. Dart 写入门禁接入真实分析器（2026-09-15）
+
+盘点发现：写入门禁对非 Java 语言的覆盖只有 ets/ts/js/tsx（tree-sitter 语法）与 Java（AST + javac 类型差分），**其它语言只做括号配平**。路线图里「真实 Dart/Java 变更验收」一直是缺口。本机实测 `dart analyze --format machine` 单文件约 0.3 秒、输出 `SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE`，因此可以照搬 javac 的差分门禁。
+
+- 新增 `agent/tools/dart_analyzer.rs`：基线与候选各分析一次，只拦**新出现的 ERROR 级诊断**。机器格式里文件名与行列号一律丢弃（候选是临时文件、行号也会漂移），只比「诊断代码 + 消息」并按签名计数。
+- 候选必须落盘才能被分析（分析器按文件解析 import），因此在**目标文件同级目录**写一个 `.harmony-candidate-<uuid>-<原名>` 临时文件，并在成功/降级/超时所有返回路径上删除；基线直接分析磁盘上的真实文件，不写盘。已有测试断言临时文件不残留。
+- 包根按 `pubspec.yaml` 上溯定位；不在 Dart 包内直接跳过分析（不猜包根）。`dart` 解析顺序：`HARMONY_DART_PATH` → PATH → Flutter/Homebrew 常见安装位置（GUI 启动的 macOS 应用 PATH 极简，这点与其他工具一致）。
+- 降级口径与 Java 相同：没有 dart、不在包内或单次分析超过 20 秒都**不阻塞写入**，记 `dart_analyze_gate_skipped` 事件并如实标注「未做分析」，绝不冒充已校验。
+- 接入点：`validate_candidate_with_types`（write_file / edit_file 单文件路径）与 `validate_batch_types`（multi_edit 逐文件，因为 `dart analyze` 以包为单位、无法像 javac 那样把同批候选一次联编）。
+
+边界（不勾选「Dart 语义闭环」）：不做跨文件联编，改动文件破坏**未参与本批**的 Dart 调用方不在覆盖内（Java 那套受影响文件反查未移植到 Dart）；不解析依赖版本、不跑 `pub get`，工程解析不到的包在两侧同时报错并被差抵消；分析器即本机 Dart SDK 版本（本机 3.9.2）；`.ets` 仍走 tree-sitter（tsc/dart 都解析不了 ArkTS）。
+
+验证：后端库 1,081 通过、9 忽略（总计 1,090），新增 6 项 `dart_analyzer` 测试（机器格式只取 ERROR 且丢弃路径行号、消息内含 `|` 不被截断、行号漂移与重复计数、非包内文件跳过、**真实 dart analyze 抓到新增未定义标识符并清理临时文件**、干净候选无新增）与 1 项 `edit_file` 真实入口测试（引入未定义标识符被拒且原文件不变；无 dart 时断言降级路径）；两组崩溃恢复集成各 3 项通过；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告。
+
+**同时修掉了告警门禁自身的漂移源**：`scripts/check-warnings.py` 原先按 `(lint, 文件:行)` 去重，行号随插入/删除代码漂移会把同一处告警算成「新增」，基线反复失效（本批就因此从 59 跳到 60）。改为按 `(lint, 文件, 告警所在行源码文本)` 去重，读不到源码时回退行号；新键下实测唯一告警 **57**（too_many_arguments 41 + type_complexity 16，机械类为 0），基线因此定为 57（`DEFAULT_BASELINE` 与 `quality.yml` 同步，脚本注释写明原因）。顺带修掉脚本用 PEP 604 注解在 Python 3.9 上直接报错的问题（本机 python3 即 3.9.6）。

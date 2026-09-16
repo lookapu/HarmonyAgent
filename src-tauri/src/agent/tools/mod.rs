@@ -12,6 +12,7 @@ mod build_tools;
 mod cmd_tools;
 mod code_mutation;
 mod compose_tools;
+mod dart_analyzer;
 mod java_compiler;
 
 pub(crate) fn validate_code_mutation(
