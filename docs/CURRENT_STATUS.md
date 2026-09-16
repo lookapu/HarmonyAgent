@@ -53,7 +53,7 @@
 | 按块修改与写入门禁 | 见第 2 节矩阵 | 结构句柄 v3、Java 字节级单/批量事务、多文件逆序条件回滚、各语言门禁真实入口测试 | Java 类型语义未闭环（无 JDT/Maven/Gradle）；Dart/Go/Python/SQL 均单文件，无跨文件/跨模块覆盖 |
 | 工具治理与常驻预算 | 已实现 | `capabilities`/`tool_ranking`，生产排名后上限 20、固定保底入口、验证阶段保护必需工具 | 同模型 A/B 成功率未做；不是完整程序化编排 |
 | 原生隔离与资源限制 | 部分 | `agent/native_limits.rs`（`RLIMIT_CPU` 实测生效）、`sandbox.rs` 原生后端、宿主直跑限额可用 `HARMONY_HOST_DIRECT_*` 显式开启 | macOS 内核不接受 `RLIMIT_AS`（内存限不了）；进程数/CPU 配额/临时磁盘总量未限；Windows 生命周期未实现；OCI 端到端需 Docker |
-| Host Capability Broker | 已实现核心契约 | 审批凭据 v4（与能力无关）、执行期 fail-closed 复核、自描述撤销判定、影响契约进审批卡片与审计、13 个变更类能力的显式契约清单 | 效果证据（安装版本/设备出现）需真机；钩子与执行入口的调用点无端到端自动化测试 |
+| Host Capability Broker | 已实现核心契约 | 审批凭据 v4（与能力无关）、执行期 fail-closed 复核、自描述撤销判定、影响契约进审批卡片与审计、13 个变更类能力的显式契约清单 | 效果证据（安装版本/设备出现）需真机；**闭环逻辑**（签发→复核→撤销→停止失效）已用生产函数跑回归，仅 guards/execute 的**实际调用点**因需 Tauri AppHandle 未覆盖 |
 | OTA 审批安全链 | 核心链路实现 | 只读副本 + 内容摘要绑定 + 固定 argv + 持久撤销 + 发布前复验 | 真实打包/签名/升级未验；不支持工具版本矩阵 |
 | HarmonyOS 工程与设备闭环 | 大量实现 | 工程/SDK/构建/部署/UI/性能工具与固定录制场景、沙箱边界 smoke | 真机/模拟器版本矩阵（离线、重连、安装冲突、恢复）未验 |
 | 评测与发行 | 基础设施已建 | 固定 25-ID 清单、eval harness、release workflow、更新签名配置 | HarmonyBench 50/100+、真实 SWE 报告、平台签名/SBOM/provenance/新机验收未做 |

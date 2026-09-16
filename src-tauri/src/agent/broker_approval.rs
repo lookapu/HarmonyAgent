@@ -207,12 +207,6 @@ pub(crate) fn record_capability_approval(
     decision: &str,
     impact: Option<&super::impact::ImpactContract>,
 ) -> Result<(), String> {
-    if decision != DECISION_EXPLICIT && decision != DECISION_AUTO {
-        return Err("审批凭据的决定来源非法".into());
-    }
-    if stop_generation != crate::agent::exec_ctx::stop_generation(&ctx.conversation_id) {
-        return Err("审批等待期间已收到停止请求，拒绝签发审批凭据".into());
-    }
     let call = ctx
         .tool_call_id
         .as_deref()
@@ -220,16 +214,79 @@ pub(crate) fn record_capability_approval(
     let app = ctx.app.as_ref().ok_or("审批缺少持久数据库")?;
     let db: tauri::State<crate::db::DbState> = tauri::Manager::state(app);
     let conn = db.0.lock().map_err(|_| "审批数据库锁损坏")?;
-    let key = tool_key(&conn, &ctx.run_id, &ctx.conversation_id, call, tool, "prepared")?;
-    let expected = crate::agent::tool_runtime::idempotency_key(&ctx.run_id, call, tool, args_raw);
+    record_with_conn(
+        &conn,
+        &CallIdentity {
+            run: &ctx.run_id,
+            conversation: &ctx.conversation_id,
+            call,
+        },
+        &ApprovalIssue {
+            tool,
+            args_raw,
+            scope,
+            stop_generation,
+            decision,
+            impact,
+        },
+    )
+}
+
+/// 被审批的调用身份（Run / 会话 / 工具调用）。
+#[derive(Clone, Copy)]
+pub(crate) struct CallIdentity<'a> {
+    pub run: &'a str,
+    pub conversation: &'a str,
+    pub call: &'a str,
+}
+
+/// 一次签发所需的其余输入；参数较多，用结构承载以免函数签名继续膨胀。
+#[derive(Clone, Copy)]
+pub(crate) struct ApprovalIssue<'a> {
+    pub tool: &'a str,
+    pub args_raw: &'a str,
+    pub scope: &'a ApprovalScope,
+    pub stop_generation: u64,
+    pub decision: &'a str,
+    pub impact: Option<&'a super::impact::ImpactContract>,
+}
+
+/// 签发凭据的核心（可注入连接）：审批钩子与测试共用同一条判定，避免「测的是原语、
+/// 跑的是另一份逻辑」。约定：`tool_runs` 中该调用必须处于 `prepared`。
+pub(crate) fn record_with_conn(
+    conn: &Connection,
+    identity: &CallIdentity<'_>,
+    issue: &ApprovalIssue<'_>,
+) -> Result<(), String> {
+    let CallIdentity {
+        run,
+        conversation,
+        call,
+    } = *identity;
+    let ApprovalIssue {
+        tool,
+        args_raw,
+        scope,
+        stop_generation,
+        decision,
+        impact,
+    } = *issue;
+    if decision != DECISION_EXPLICIT && decision != DECISION_AUTO {
+        return Err("审批凭据的决定来源非法".into());
+    }
+    if stop_generation != crate::agent::exec_ctx::stop_generation(conversation) {
+        return Err("审批等待期间已收到停止请求，拒绝签发审批凭据".into());
+    }
+    let key = tool_key(conn, run, conversation, call, tool, "prepared")?;
+    let expected = crate::agent::tool_runtime::idempotency_key(run, call, tool, args_raw);
     if key != expected {
         return Err(format!("{tool} 审批参数与已登记工具调用不一致"));
     }
     let issued_at = chrono::Utc::now().timestamp_millis();
     crate::agent::runtime::append_event(
-        &conn,
-        &ctx.run_id,
-        &ctx.conversation_id,
+        conn,
+        run,
+        conversation,
         EVENT,
         serde_json::json!({
             "version": 4, "tool_call_id": call, "tool": tool, "scope": scope,
@@ -549,6 +606,166 @@ mod tests {
                 .is_err()
         );
         assert!(verify_ota_approval(&conn, "run", "conversation", "install").is_err());
+    }
+
+    /// 闭环：审批钩子签发 → 执行期复核 → 用户撤销 → 复核失败。
+    ///
+    /// 这条测试刻意走**生产路径同一批函数**（`record_with_conn`、`call_tool_name`、
+    /// `requires_durable_receipt`、`verify_capability_approval`、`revoke_call`），
+    /// 而不是另写一份等价逻辑，补的正是「钩子与执行入口的调用点没有端到端覆盖」这个缺口。
+    #[test]
+    fn approval_receipt_loop_matches_production_wiring() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,last_event_seq INTEGER NOT NULL DEFAULT 0,updated_at INTEGER);
+             CREATE TABLE run_events(event_id TEXT,run_id TEXT,conversation_id TEXT,seq INTEGER,event_type TEXT,payload TEXT,created_at INTEGER);
+             CREATE TABLE tool_runs(id TEXT,trace_id TEXT,conversation_id TEXT,tool_name TEXT,status TEXT,idempotency_key TEXT);
+             CREATE TABLE ota_approval_revocations(call_id TEXT PRIMARY KEY,run_id TEXT,conversation_id TEXT,revoked_at INTEGER,reason TEXT,tool TEXT NOT NULL DEFAULT 'ota_pack');
+             INSERT INTO agent_runs(run_id,last_event_seq,updated_at) VALUES('r',0,0);",
+        )
+        .unwrap();
+        let tool = "deploy";
+        let args_raw = r#"{"device":"ABC","bundle":"com.demo"}"#;
+        let key = crate::agent::tool_runtime::idempotency_key("r", "call", tool, args_raw);
+        conn.execute(
+            "INSERT INTO tool_runs VALUES('call','r','c',?1,'prepared',?2)",
+            rusqlite::params![tool, key],
+        )
+        .unwrap();
+        let impact =
+            crate::agent::impact::describe(tool, &serde_json::from_str(args_raw).unwrap());
+
+        // 1) 免弹窗路径（allow_all/白名单）签发 auto 凭据：与 guards 调的是同一个核心
+        record_with_conn(
+            &conn,
+            &CallIdentity {
+                run: "r",
+                conversation: "c",
+                call: "call",
+            },
+            &ApprovalIssue {
+                tool,
+                args_raw,
+                scope: &ApprovalScope::Request {
+                    request_key: key.clone(),
+                    workspace: None,
+                },
+                stop_generation: crate::agent::exec_ctx::stop_generation("c"),
+                decision: DECISION_AUTO,
+                impact: impact.as_ref(),
+            },
+        )
+        .unwrap();
+
+        // 2) 执行期：工具名以台账为准 → 契约命中 → 凭据复核通过
+        conn.execute_batch("UPDATE tool_runs SET status='running'")
+            .unwrap();
+        let resolved = call_tool_name(&conn, "r", "c", "call").unwrap();
+        assert_eq!(resolved, tool);
+        assert!(crate::agent::capability_broker::requires_durable_receipt(
+            &resolved
+        ));
+        assert_eq!(
+            verify_capability_approval(&conn, "r", "c", "call", &resolved).unwrap(),
+            ApprovalScope::Request {
+                request_key: key.clone(),
+                workspace: None
+            }
+        );
+
+        // 3) 审计（时间线直接读上面这个事件）能看到与审批弹窗同源的影响说明
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM run_events WHERE event_type=?1",
+                [EVENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["decision"], DECISION_AUTO);
+        assert_eq!(
+            payload["impact"]["reversibility"],
+            crate::agent::impact::HARD_TO_REVERSE
+        );
+        assert_eq!(payload["impact"]["targets"][0], "ABC");
+
+        // 4) 用户在工具卡上撤销该调用 → 复核立即失败，且同一次调用不能重新签发
+        revoke_call(&conn, "call").unwrap();
+        assert!(verify_capability_approval(&conn, "r", "c", "call", &resolved).is_err());
+        assert!(record_with_conn(
+            &conn,
+            &CallIdentity {
+                run: "r",
+                conversation: "c",
+                call: "call"
+            },
+            &ApprovalIssue {
+                tool,
+                args_raw,
+                scope: &ApprovalScope::Request {
+                    request_key: key,
+                    workspace: None
+                },
+                stop_generation: crate::agent::exec_ctx::stop_generation("c"),
+                decision: DECISION_AUTO,
+                impact: impact.as_ref()
+            },
+        )
+        .is_err());
+
+        // 5) 契约外的工具不会被要求凭据（execute 侧判定的另一半）
+        assert!(!crate::agent::capability_broker::requires_durable_receipt(
+            "read_file"
+        ));
+    }
+
+    /// 停止会话后，同一核心签发的凭据必须立即失效——覆盖的是完整复核路径
+    /// （不只是 `validate_lifecycle`）：执行期拿到的代次与签发时不再一致。
+    #[test]
+    fn stopping_conversation_invalidates_receipt_issued_by_same_core() {
+        let conversation = uuid::Uuid::new_v4().to_string();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,last_event_seq INTEGER NOT NULL DEFAULT 0,updated_at INTEGER);
+             CREATE TABLE run_events(event_id TEXT,run_id TEXT,conversation_id TEXT,seq INTEGER,event_type TEXT,payload TEXT,created_at INTEGER);
+             CREATE TABLE tool_runs(id TEXT,trace_id TEXT,conversation_id TEXT,tool_name TEXT,status TEXT,idempotency_key TEXT);
+             CREATE TABLE ota_approval_revocations(call_id TEXT PRIMARY KEY,run_id TEXT,conversation_id TEXT,revoked_at INTEGER,reason TEXT,tool TEXT NOT NULL DEFAULT 'ota_pack');
+             INSERT INTO agent_runs(run_id,last_event_seq,updated_at) VALUES('r',0,0);",
+        )
+        .unwrap();
+        let args_raw = r#"{"device":"ABC"}"#;
+        let key = crate::agent::tool_runtime::idempotency_key("r", "call", "deploy", args_raw);
+        conn.execute(
+            "INSERT INTO tool_runs VALUES('call','r',?1,'deploy','prepared',?2)",
+            rusqlite::params![conversation, key],
+        )
+        .unwrap();
+        record_with_conn(
+            &conn,
+            &CallIdentity {
+                run: "r",
+                conversation: &conversation,
+                call: "call",
+            },
+            &ApprovalIssue {
+                tool: "deploy",
+                args_raw,
+                scope: &ApprovalScope::Request {
+                    request_key: key,
+                    workspace: None,
+                },
+                stop_generation: crate::agent::exec_ctx::stop_generation(&conversation),
+                decision: DECISION_EXPLICIT,
+                impact: None,
+            },
+        )
+        .unwrap();
+        conn.execute_batch("UPDATE tool_runs SET status='running'")
+            .unwrap();
+        assert!(verify_capability_approval(&conn, "r", &conversation, "call", "deploy").is_ok());
+
+        crate::agent::exec_ctx::request_stop_tool(&conversation);
+        assert!(verify_capability_approval(&conn, "r", &conversation, "call", "deploy").is_err());
     }
 
     /// 免弹窗路径签发的是 auto 凭据（跳过弹窗是用户配置的策略，不是绕过审批），

@@ -487,3 +487,16 @@ Windows MSVC（CI 实际使用的目标）无法从 macOS 交叉校验；即便�
 边界：C++/Swift 只有语法层（无类型语义）；Rust 同上；Go 现在能解析同包引用，但跨包引用仍属上下文缺失（两侧同报时整体降级），包过大时降级。
 
 验证：后端库 1,101 通过、9 忽略（总计 1,110）；新增 C++/Swift 跨语言语法断言（含"干净代码不得误报"）、Go 同包兄弟文件回归；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；两组崩溃恢复集成各 3 项通过；`check-docs.py` 与 `check-warnings.py`（57/57）通过。
+
+## 25. Broker 审批凭据闭环回归（2026-09-15）
+
+前几轮反复标注过一个缺口：「`pre_approval` 的签发分支与 `execute_host_capability` 的复核分支需要 Tauri `AppHandle` 与真实台账，只有原语级单测」。本轮把**可注入连接的核心**拆出来，让闭环逻辑本身有了端到端回归。
+
+- `broker_approval` 新增 `record_with_conn(conn, &CallIdentity, &ApprovalIssue)`：签发逻辑（撤回复核 → 台账幂等键比对 → 决定来源校验 → 停止代次校验 → 写 v4 凭据事件）全部在可注入 `&Connection` 的核心里；原 `record_capability_approval(ctx, …)` 只负责从 `ToolCtx` 取连接与身份后委托。参数用 `CallIdentity`/`ApprovalIssue` 两个结构承载（原样平铺会把函数顶到 10 个参数、越过 clippy 基线——这是实测发现的，改为结构化而不是重定基线）。
+- 新增两条走**生产同一批函数**的闭环回归（不是另写等价逻辑）：
+  1. `approval_receipt_loop_matches_production_wiring`：内存库 + 真实台账行 → `record_with_conn` 签发 auto 凭据 → 台账取工具名（`call_tool_name`）→ 契约命中（`requires_durable_receipt`）→ 复核通过（`verify_capability_approval`）→ **审计事件里的影响说明与审批弹窗同源**（断言 `impact.reversibility=hard_to_reverse`、`targets[0]`）→ 用户撤销（`revoke_call`）→ 复核失败 → 同一次调用不能重新签发 → 契约外工具不被要求凭据。
+  2. `stopping_conversation_invalidates_receipt_issued_by_same_core`：签发 → 复核通过 → `request_stop_tool` → 完整复核路径立即失败（覆盖的不只是 `validate_lifecycle`）。
+
+边界（未变）：guards 弹窗分支与 `execute_host_capability` 里的**实际调用点**仍需要 `AppHandle`，因此没有自动化覆盖；本轮补的是它们所依赖的**同一条逻辑链**。要覆盖调用点本身，需要给 Tauri 状态注入做测试替身或把审批钩子拆成纯函数——属于后续可选工作。
+
+验证：后端库 1,103 通过、9 忽略（总计 1,112），`broker_approval` 单测从 16 增至 18；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；两组崩溃恢复集成各 3 项通过；`check-docs.py` 与 `check-warnings.py`（57/57）通过。
