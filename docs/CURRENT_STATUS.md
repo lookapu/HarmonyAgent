@@ -32,10 +32,12 @@
 | `.ts`/`.tsx`/`.js`/`.jsx` | tree-sitter | — | — |
 | `.java` | tree-sitter + 声明/注解目标检查 | `javac` 差分（并入同源码根下未编辑的调用方） | 无 javac、编译超时 |
 | `.dart` | tree-sitter | `dart analyze` 差分 | 无 dart、不在包内、超时 |
-| `.go` | tree-sitter | `go vet` 差分（临时模块、`GOPROXY=off`） | 无 go、不在模块内、只剩上下文缺失错误、超时 |
+| `.go` | tree-sitter | `go vet` 差分（临时模块 + **同包兄弟文件一起带上** + `GOPROXY=off`） | 无 go、不在模块内、包过大、只剩上下文缺失错误、超时 |
 | `.py` | tree-sitter | `pyflakes` 差分 | 无 pyflakes/python3、超时 |
-| `.rs` | tree-sitter | —（未接 `cargo check`） | — |
+| `.rs` | tree-sitter | —（临时 crate 隔离会把同 crate 其它模块的引用误判为未定义，实测后回退，见盘点 §24） | — |
 | `.kt`/`.kts` | tree-sitter（kotlin-ng） | —（本机无 kotlinc） | — |
+| `.c`/`.h`/`.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx` | tree-sitter（cpp，C 的超集） | — | — |
+| `.swift` | tree-sitter | — | — |
 | `.sql` | 配平回退 | `sqlite3 :memory:` 执行差分（含副作用语句时拒绝执行） | 无 sqlite3、超限、含 ATTACH/VACUUM INTO/点命令、超时 |
 | 其它 | 配平回退（显式标注 `delimiter_fallback`） | — | — |
 

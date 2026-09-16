@@ -475,3 +475,15 @@ Windows MSVC（CI 实际使用的目标）无法从 macOS 交叉校验；即便�
 边界：SQL 不做 schema 感知分析（其它文件的建表语句不参与）、不判断迁移顺序；Kotlin 只有语法层（无类型错误、无跨文件）；两者的降级路径都记独立事件并如实标注「未做检查」。
 
 验证：后端库 1,100 通过、9 忽略（总计 1,109）；新增 `sql_check` 6 项（解析与上下文分离、副作用语句拒绝、重复计数、真实 sqlite3 抓到值个数不匹配、schema 依赖时降级、干净候选无新增）、Kotlin/SQL 各 1 项 `edit_file` 真实入口测试、`code_mutation` 跨语言语法测试扩展到 Kotlin；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；`check-docs.py` 与 `check-warnings.py`（57/57）通过。
+
+## 24. C++/Swift 语法层、Rust 语义层的负结果、Go 同包上下文修复（2026-09-15）
+
+**C++/Swift 语法层**：`.cpp/.cc/.cxx/.hpp/.hh/.hxx/.c/.h` 接入 `tree-sitter-cpp 0.23.4`，`.swift` 接入 `tree-sitter-swift 0.6.0`。加依赖前照上一轮的做法**先查源码**：两者都依赖 `tree-sitter-language`（无 `links` 冲突），`parser.c` 的 `LANGUAGE_VERSION` 都是 14。顺带发现 `tree-sitter-swift 0.7.x` 是 ABI 15，因此锁在 0.6（`Cargo.toml` 已注明）。
+
+**Rust 语义层：做了，实测后回退（负结果，值得记住）**：方案是把候选当作临时 crate 的 `src/lib.rs` 跑 `cargo check` 差分，实测只要约 0.1 秒、能抓到 `E0308` 类型不匹配，看起来可行。但接入后 **6 个原本通过的 `fs_tools` 测试立刻失败**，暴露了它的根本缺陷：临时 crate 看不到同 crate 其它模块，`fn a() { x(); }` 这种对同 crate 符号的引用会报**真实的** `E0425 cannot find function`。基线与候选都用同样方式检查时，**既有**引用会互相抵消，但候选**新增**一个对同模块符号的引用（真实开发里很常见）只会在候选侧报错 → 合法编辑被误拒。若把 `E0425/E0412/E0599` 这类也归入「上下文缺失」过滤，门禁就几乎不剩可判定的东西。结论：单文件隔离对 Rust 的损失过大，**保留 tree-sitter 语法层，不接语义层**；`rust_check.rs` 已删除。
+
+**Go 同包上下文修复**：顺着同一个问题复查 Go 门禁，发现它有一模一样的缺陷——临时模块只放目标文件时，候选新增对同包另一个文件符号的引用会被判为 `undefined: X` 而误拒。已修：`prepare` 现在把**同包的其它 `.go` 文件一起复制**进临时模块（跳过 `_test.go`；超过 40 个文件或 2MB 则整体降级为「未做检查」，不做半套上下文）。新增回归 `sibling_package_files_are_included_so_new_calls_resolve`：`helper.go` 定义 `helper()`、候选把调用从一次改成两次，必须**不带出新增错误**。
+
+边界：C++/Swift 只有语法层（无类型语义）；Rust 同上；Go 现在能解析同包引用，但跨包引用仍属上下文缺失（两侧同报时整体降级），包过大时降级。
+
+验证：后端库 1,101 通过、9 忽略（总计 1,110）；新增 C++/Swift 跨语言语法断言（含"干净代码不得误报"）、Go 同包兄弟文件回归；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；两组崩溃恢复集成各 3 项通过；`check-docs.py` 与 `check-warnings.py`（57/57）通过。

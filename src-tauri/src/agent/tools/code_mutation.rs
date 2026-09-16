@@ -95,6 +95,11 @@ fn tree_sitter_language(ext: &str) -> Option<tree_sitter::Language> {
         // Dart 的语法层离线可查；装了 dart 时另有 `dart analyze` 类型差分（见 dart_analyzer）
         "dart" => Some(tree_sitter_dart::language()),
         "kt" | "kts" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+        // C/C++ 共用同一个 grammar（cpp 是 C 的超集），.h 也归到它，避免与 C 头文件割裂
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => {
+            Some(tree_sitter_cpp::LANGUAGE.into())
+        }
+        "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -754,6 +759,16 @@ mod tests {
                 "fun f(): Int {\n    return 1\n}\n",
                 "fun f(): Int {\n    val x: = 1\n    return x\n}\n",
             ),
+            (
+                "src/a.cpp",
+                "int f() { return 1; }\n",
+                "int f() { int x = ; return x; }\n",
+            ),
+            (
+                "src/a.swift",
+                "func f() -> Int {\n    return 1\n}\n",
+                "func f() -> Int {\n    let x: = 1\n    return x\n}\n",
+            ),
         ] {
             let error = validate_candidate(Path::new(name), before, after).unwrap_err();
             assert!(error.contains("语法门禁拒绝"), "{name}: {error}");
@@ -765,6 +780,8 @@ mod tests {
             ("a.rs", "fn f() -> i32 { 1 }\n"),
             ("a.dart", "int f() {\n  return 1;\n}\n"),
             ("a.kt", "fun f(): Int {\n    return 1\n}\n"),
+            ("a.cpp", "int f() { return 1; }\n"),
+            ("a.swift", "func f() -> Int {\n    return 1\n}\n"),
         ] {
             let report = validate_candidate(Path::new(name), "", source).unwrap();
             assert_eq!(report.parser, "tree_sitter", "{name}");
@@ -927,8 +944,8 @@ mod tests {
 
     #[test]
     fn unsupported_language_is_explicit_delimiter_fallback() {
-        // 已接入真实语法树的语言（ets/ts/js/tsx/go/py/rs/dart）不得出现在这里
-        for name in ["src/a.cpp", "src/a.swift", "src/a.groovy", "src/a.unknownext"] {
+        // 已接入真实语法树的语言不得出现在这里（清单见 tree_sitter_language）
+        for name in ["src/a.groovy", "src/a.m", "src/a.unknownext"] {
             let report = validate_candidate(
                 Path::new(name),
                 "class A {}\n",

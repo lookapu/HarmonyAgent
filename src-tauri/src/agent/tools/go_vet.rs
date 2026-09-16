@@ -86,12 +86,60 @@ fn work_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// 同一包内可一起带上的兄弟文件上限：超过就整体按「未做检查」降级，不做半套上下文。
+const MAX_SIBLING_FILES: usize = 40;
+const MAX_SIBLING_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 把同包的其它 .go 文件一并复制进临时模块。
+///
+/// 不复制它们会误判：候选**新引用**同包另一个文件里的符号时，临时模块只看到单文件，
+/// 会报真实的 `undefined: X` 并因此拒绝一次合法编辑（基线与候选都单文件时才会互相抵消，
+/// 新增引用不会）。带上兄弟文件后同包引用能解析，语义判定才是对的。
+fn copy_siblings(dir: &Path, target: &Path) -> Result<(), String> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    let Some(name) = target.file_name().and_then(|value| value.to_str()) else {
+        return Ok(());
+    };
+    let mut files = 0;
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(parent)
+        .map_err(|error| format!("读取 Go 包目录失败：{error}"))?
+        .flatten()
+    {
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.ends_with(".go")
+            || file_name == name
+            // 测试文件常依赖 test-only 依赖，带上反而制造噪声
+            || file_name.ends_with("_test.go")
+        {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        files += 1;
+        bytes += meta.len();
+        if files > MAX_SIBLING_FILES || bytes > MAX_SIBLING_BYTES {
+            return Err("Go 包内文件过多/过大，未做静态检查".into());
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let _ = std::fs::write(dir.join(&file_name), content);
+        }
+    }
+    Ok(())
+}
+
 /// 在临时模块里放好待检查文件，并尽量沿用真实模块的 module 路径与依赖锁定信息。
 fn prepare(dir: &Path, source: &str, target: &Path, module_root: &Path) -> Result<(), String> {
     let name = target
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("candidate.go");
+    copy_siblings(dir, target)?;
     std::fs::write(dir.join(name), source)
         .map_err(|error| format!("写入 Go 临时源文件失败：{error}"))?;
     let module_path = std::fs::read_to_string(module_root.join("go.mod"))
@@ -329,6 +377,34 @@ vet: ./a.go:3:8: undefined: missingThing
                     added.iter().any(|item| item.contains("as int value")),
                     "{added:?}"
                 );
+            }
+            GoCheck::Skipped { reason } => panic!("go 可用时不应跳过：{reason}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 同包兄弟文件必须一起带上：候选新引用另一个文件里的函数不能被误判为未定义。
+    #[test]
+    fn sibling_package_files_are_included_so_new_calls_resolve() {
+        let Some(_go) = resolve_go() else {
+            eprintln!("跳过：本机没有 go");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("govet-sibling-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), "module probe\n\ngo 1.20\n").unwrap();
+        std::fs::write(
+            dir.join("helper.go"),
+            "package main\n\nfunc helper() int {\n\treturn 7\n}\n",
+        )
+        .unwrap();
+        let file = dir.join("main.go");
+        let before = "package main\n\nfunc main() {\n\t_ = helper()\n}\n";
+        let after = "package main\n\nfunc main() {\n\t_ = helper()\n\t_ = helper()\n}\n";
+        std::fs::write(&file, before).unwrap();
+        match check(&file, before, after) {
+            GoCheck::Checked { added, .. } => {
+                assert!(added.is_empty(), "同包引用不应被判为新增错误：{added:?}");
             }
             GoCheck::Skipped { reason } => panic!("go 可用时不应跳过：{reason}"),
         }
