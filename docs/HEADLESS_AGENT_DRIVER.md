@@ -660,3 +660,31 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
    任何新增工具都需显式评审其全局库边界）；
 5. 将两个 adapter 的外层 round 编排继续收敛为单一 executor；UI 生命周期、DB IO 与
    headless grader 编排仍作为端口实现保留，不再重复停止、压缩和循环决策。
+
+## 17. 桌面 IO port 迁移：可执行分步方案（2026-09-15 调研，未开始改）
+
+第 16 节第 5 条是当前唯一剩下的深度重构。本轮做了定位调研，把「为什么不能一次改完」和「按什么顺序改」写清楚，避免下一轮从零推导。
+
+**现状与体量（实测）**
+
+| 事实 | 数值/位置 |
+| --- | --- |
+| `KernelIoPort` 接口 | 3 个方法：`cancelled()`、`persist_checkpoint(checkpoint)`、`run_round(executor, clock, round, remaining)`（`agent/kernel_executor.rs:184`） |
+| 桌面主循环体 | `commands/chat.rs` 的 `'outer: loop`，**约 2,107 行**（4425 → 6531） |
+| 桌面当前接法 | 循环内调用 `kernel_executor.begin_persisted_round(is_cancelled(..), |checkpoint| persist_desktop_executor_checkpoint(..))`（4476 行），round 体是**内联在循环里**的代码，不是一个函数 |
+| headless 对照 | `headless_driver.rs` 的 `HeadlessIoPort` 已实现该 trait，外层用 `KernelIoRunLoop::run(port)` |
+| 事件发射点 | `chat.rs` 内 52 处 `emit`/`emit_log`，大量位于 round 体内 |
+
+**为什么不能一次改完**：`run_round` 要求把「一轮的全部工作」做成一个可调用的函数，而它现在依赖几十个循环内可变局部变量（预算、账本、`workflow_stage`、`exhausted`、`completion_reviews`、`merged_instructions`、`placeholder_msg_id`、`stats`…）。把这些搬进结构体再搬回来，等价于重写主循环的状态机；在没有 GUI/headless 端到端冒烟的前提下，单测与两组 crash E2E 只能覆盖「检查点/恢复/取消」这些协议面，覆盖不了「一轮里 52 个事件按顺序发对、预算与账本推进正确」这类行为。一次改完的风险是静默的行为回归。
+
+**分步方案（每步都必须独立可验证、可提交）**
+
+1. **冻结现状基线**：为桌面一键路径补一组「行为快照」测试——用注入的假 Provider（已有 `LlmProvider` 抽象）跑一条固定剧本，断言：事件序列（类型 + 顺序）、账本推进、预算计数、终态。这一步只加测试，不改行为；它是后续每一步的安全网。
+2. **提取 round 体**（最大的一步）：把 `'outer: loop` 内的 round 体搬进 `async fn desktop_round(...)`，用显式参数结构体传入、用返回结构体传回；`break`/`continue` 换成枚举返回值。**纯搬运、零行为改动**，靠第 1 步的快照测试 + 全量回归把关；此时循环仍用 `begin_persisted_round`，不换执行器。
+3. **实现 `DesktopIoPort`**：`cancelled()` 委托现有 `is_cancelled`；`persist_checkpoint()` 委托 `persist_desktop_executor_checkpoint`；`run_round()` 调用第 2 步的 `desktop_round`。此时新类型尚未接入路径（若不能立即接入，就先与第 4 步合并提交，避免留下无人调用的代码）。
+4. **切换执行器**：用 `KernelIoRunLoop::run(port)` 替换 `begin_persisted_round` + 内联体，删除旧路径；确认检查点/恢复、取消、超时三条链路的既有测试与两组 crash E2E 全绿。
+5. **清理与对齐**：核对桌面与 headless 在「停止、上下文压缩、循环决策」上不再各写一份；更新 [当前状态单页](./CURRENT_STATUS.md) 的对应行与盘点日志。
+
+**验证要求（缺一不可）**：每步跑后端库全量 + `worker_crash_e2e` + `tool_worker_crash_e2e`；第 2、4 步额外要求第 1 步的事件序列快照不变；第 4 步之后需要在真实桌面里手动跑一条「多轮工具任务 + 中途停止 + 断点续跑」，本轮无 GUI 验收环境，因此**第 4 步不应在无桌面验收窗口的批次里执行**。
+
+**当前结论**：第 1、2 步（加安全网 + 纯搬运）风险可控，可作为下一批目标；第 3、4 步需要同时具备桌面验收条件。本轮只做调研与方案，未改动 `chat.rs`。
