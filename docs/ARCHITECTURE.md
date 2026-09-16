@@ -52,7 +52,7 @@ DevEco Switch 是面向 HarmonyOS/OpenHarmony 开发者的本地桌面 Agent 工
 |---|---:|
 | Agent 对外工具 | 204 |
 | `agent/` 顶层模块（不含 `mod.rs`） | 58 |
-| `agent/tools/` Rust 文件（含 `mod.rs`） | 33 |
+| `agent/tools/` Rust 文件（含 `mod.rs`） | 35 |
 | `commands/` 命令模块（不含 `mod.rs`） | 38 |
 | `services/` 服务模块（不含 `mod.rs`） | 58 |
 | Tauri IPC 注册入口 | 301 |

@@ -92,6 +92,8 @@ fn tree_sitter_language(ext: &str) -> Option<tree_sitter::Language> {
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "py" => Some(tree_sitter_python::LANGUAGE.into()),
         "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
+        // Dart 的语法层离线可查；装了 dart 时另有 `dart analyze` 类型差分（见 dart_analyzer）
+        "dart" => Some(tree_sitter_dart::language()),
         _ => None,
     }
 }
@@ -277,6 +279,78 @@ fn check_dart_types(path: &Path, before: &str, after: &str) -> Result<(), String
     }
 }
 
+/// Go 候选的 `go vet` 差分门禁；Skip 时记事件并放行（与 Java/Dart 的降级同口径）。
+fn check_go_types(path: &Path, before: &str, after: &str) -> Result<(), String> {
+    match super::go_vet::check(path, before, after) {
+        super::go_vet::GoCheck::Checked {
+            before: before_errors,
+            after: after_errors,
+            added,
+        } => {
+            if added.is_empty() {
+                return Ok(());
+            }
+            let shown: Vec<String> = added.iter().take(3).cloned().collect();
+            Err(format!(
+                "代码修改事务被 Go 静态检查门禁拒绝：{} 的 go vet 诊断由 {} 条增至 {} 条，新增：{}。候选内容未落盘；请修正类型或补回缺失定义后重试。判定为临时模块内的单文件差分，未做跨包检查。",
+                path.display(),
+                before_errors,
+                after_errors,
+                shown.join("；")
+            ))
+        }
+        super::go_vet::GoCheck::Skipped { reason } => {
+            crate::utils::logger::log_event(
+                "go_vet_gate_skipped",
+                serde_json::json!({ "path": path.display().to_string(), "reason": reason }),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn is_go_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("go"))
+}
+
+/// Python 候选的 pyflakes 差分门禁；Skip 时记事件并放行（与 Dart/Go 的降级同口径）。
+fn check_python_lint(path: &Path, before: &str, after: &str) -> Result<(), String> {
+    match super::python_lint::check(path, before, after) {
+        super::python_lint::PythonCheck::Checked {
+            before: before_errors,
+            after: after_errors,
+            added,
+        } => {
+            if added.is_empty() {
+                return Ok(());
+            }
+            let shown: Vec<String> = added.iter().take(3).cloned().collect();
+            Err(format!(
+                "代码修改事务被 Python 静态检查门禁拒绝：{} 的 pyflakes 诊断由 {} 条增至 {} 条，新增：{}。候选内容未落盘；请补回未定义名字或清理无用 import 后重试。判定为单文件差分，未做跨模块解析。",
+                path.display(),
+                before_errors,
+                after_errors,
+                shown.join("；")
+            ))
+        }
+        super::python_lint::PythonCheck::Skipped { reason } => {
+            crate::utils::logger::log_event(
+                "pyflakes_gate_skipped",
+                serde_json::json!({ "path": path.display().to_string(), "reason": reason }),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn is_python_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("py"))
+}
+
 /// 单次事务里最多并入多少个“未参与本批”的候选调用方文件（控制 javac 时长）。
 const MAX_AFFECTED_FILES: usize = 20;
 /// 收集候选调用方时的目录扫描上限；超出即停止扫描，按已收集结果继续。
@@ -435,6 +509,14 @@ pub(super) fn validate_candidate_with_types(
         check_dart_types(path, before, after)?;
         return Ok(report);
     }
+    if is_go_source(path) {
+        check_go_types(path, before, after)?;
+        return Ok(report);
+    }
+    if is_python_source(path) {
+        check_python_lint(path, before, after)?;
+        return Ok(report);
+    }
     if !is_java_source(path) {
         return Ok(report);
     }
@@ -476,11 +558,17 @@ pub(super) fn validate_batch_types(files: &[(&Path, &str, &str)]) -> Result<(), 
     if files.is_empty() {
         return Ok(());
     }
-    // Dart 以包为单位分析、无法像 javac 那样把同批候选一次联编，因此逐个文件差分；
-    // 跨文件类型影响不在覆盖内（与单文件门禁同边界）。
+    // Dart/Go 的分析器都以包/模块为单位、无法像 javac 那样把同批候选一次联编，
+    // 因此逐个文件差分；跨文件类型影响不在覆盖内（与单文件门禁同边界）。
     for (path, before, after) in files {
         if is_dart_source(path) {
             check_dart_types(path, before, after)?;
+        }
+        if is_go_source(path) {
+            check_go_types(path, before, after)?;
+        }
+        if is_python_source(path) {
+            check_python_lint(path, before, after)?;
         }
     }
     let edited: Vec<PathBuf> = files.iter().map(|(path, _, _)| path.to_path_buf()).collect();
@@ -612,6 +700,11 @@ mod tests {
                 "fn f() -> i32 { 1 }\n",
                 "fn f() -> i32 { let x = ; x }\n",
             ),
+            (
+                "src/a.dart",
+                "int f() {\n  return 1;\n}\n",
+                "int f() {\n  final x = ;\n  return x;\n}\n",
+            ),
         ] {
             let error = validate_candidate(Path::new(name), before, after).unwrap_err();
             assert!(error.contains("语法门禁拒绝"), "{name}: {error}");
@@ -621,6 +714,7 @@ mod tests {
             ("a.go", "package main\nfunc f() int { return 1 }\n"),
             ("a.py", "def f():\n    return 1\n"),
             ("a.rs", "fn f() -> i32 { 1 }\n"),
+            ("a.dart", "int f() {\n  return 1;\n}\n"),
         ] {
             let report = validate_candidate(Path::new(name), "", source).unwrap();
             assert_eq!(report.parser, "tree_sitter", "{name}");
@@ -783,12 +877,15 @@ mod tests {
 
     #[test]
     fn unsupported_language_is_explicit_delimiter_fallback() {
-        let report = validate_candidate(
-            Path::new("src/a.dart"),
-            "class A {}\n",
-            "class A { void f() {} }\n",
-        )
-        .unwrap();
-        assert_eq!(report.parser, "delimiter_fallback");
+        // 已接入真实语法树的语言（ets/ts/js/tsx/go/py/rs/dart）不得出现在这里
+        for name in ["src/a.kt", "src/a.cpp", "src/a.swift", "src/a.unknownext"] {
+            let report = validate_candidate(
+                Path::new(name),
+                "class A {}\n",
+                "class A { void f() {} }\n",
+            )
+            .unwrap();
+            assert_eq!(report.parser, "delimiter_fallback", "{name}");
+        }
     }
 }

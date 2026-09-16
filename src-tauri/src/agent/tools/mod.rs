@@ -13,7 +13,9 @@ mod cmd_tools;
 mod code_mutation;
 mod compose_tools;
 mod dart_analyzer;
+mod go_vet;
 mod java_compiler;
+mod python_lint;
 
 pub(crate) fn validate_code_mutation(
     path: &std::path::Path,

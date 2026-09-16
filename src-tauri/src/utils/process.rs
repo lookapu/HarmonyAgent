@@ -1043,11 +1043,29 @@ pub fn output_stderr_blocking_with_timeout(
     args: &[String],
     timeout: std::time::Duration,
 ) -> Result<Option<(i32, String)>, String> {
+    output_stderr_blocking_with_timeout_opts(program, args, timeout, None, &[])
+}
+
+/// 同 [`output_stderr_blocking_with_timeout`]，但可指定工作目录与额外环境变量。
+/// `go vet` 这类工具必须在目标模块目录下执行，并需要用 `GOPROXY=off` 之类约束避免联网。
+pub fn output_stderr_blocking_with_timeout_opts(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+    cwd: Option<&Path>,
+    envs: &[(String, String)],
+) -> Result<Option<(i32, String)>, String> {
     let resolved = resolve_program(program).ok_or_else(|| not_found_error(program))?;
     let err_path = temp_capture_path(program);
     let err_file = std::fs::File::create(&err_path)
         .map_err(|e| format!("创建 {program} 输出临时文件失败: {e}"))?;
     let mut cmd = blocking_command(&resolved, args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(err_file));

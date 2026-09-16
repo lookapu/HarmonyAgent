@@ -75,12 +75,14 @@ tree-sitter = "0.24.7"
 tree-sitter-arkts = "0.2.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-java = "=0.23.5"
-# 三个 grammar 必须与 tree-sitter 0.24.x 的语法 ABI 上限（14）兼容：0.24+/0.25 版本是
+# 下面四个 grammar 必须与 tree-sitter 0.24.x 的语法 ABI 上限（14）兼容：0.24+/0.25 版本是
 # ABI 15，会在**运行时**初始化失败（编译期看不出来），所以锁在 0.23 系列。
 # 只有整体升级 tree-sitter 时才能一起抬。
 tree-sitter-go = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
+# Dart 同理：0.2.0 是 ABI 15 跑不起来，0.0.4 兼容但用的是旧 API（language()）。
+tree-sitter-dart = "0.0"
 local-ip-address = "0.6"
 candle-core = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }

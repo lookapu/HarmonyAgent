@@ -4825,6 +4825,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 真实入口：Go 候选的类型错误由 `go vet` 差分拦住；无 go 或不在模块内时降级。
+    #[test]
+    fn go_entry_gate_blocks_static_check_error_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "go_entry_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), "module probe\n\ngo 1.20\n").unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let file = dir.join("a.go");
+        let content = "package main\n\nfunc main() {\n\tvar x int = 1\n\t_ = x\n}\n";
+        std::fs::write(&file, content).unwrap();
+        let result = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old": "var x int = 1",
+                "new": "var x int = \"str\""
+            }),
+            &roots,
+            "go_entry_gate",
+        ));
+        match result {
+            Err(error) => {
+                assert!(error.contains("Go 静态检查门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            }
+            Ok(_) => {
+                // 无 go / 不在模块内：降级为未检查，语法门禁放行 → 候选落盘
+                assert!(std::fs::read_to_string(&file).unwrap().contains("var x int = \"str\""));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 未参与本次编辑的调用方也要覆盖：edit_file 只改 A，同源码根下的 B 仍在调用被删掉的
     /// 方法 —— 这正是“改坏没被一起编辑的调用方”的常见回归，必须在写入前拦住。
     #[test]

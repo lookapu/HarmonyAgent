@@ -440,3 +440,22 @@ Windows MSVC（CI 实际使用的目标）无法从 macOS 交叉校验；即便�
 边界：这是**语法**层，不是类型语义（Go 的类型错误、Python 的名字解析、Rust 的借用检查都不在覆盖内）；Rust 新版语法若超出 0.23 grammar 的支持范围，会因「基线与候选同样报错」而被差抵消（不会误拒，但也不会拦）；其余语言（如 Kotlin、C++）仍是配平回退。
 
 验证：后端库 1,082 通过、9 忽略（总计 1,091），新增 1 项跨语言语法测试（三种语言各验「配平但非法被拒」「干净代码不误报且报告标明 tree_sitter」「修正既有错误放行」）；两组崩溃恢复集成各 3 项通过；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；`check-docs.py` 与 `check-warnings.py`（57/57）通过。
+
+## 22. 其它语言的语义层与 `.dart` 语法兜底（2026-09-15）
+
+按「有工具就差分、没有就降级」把 Dart 的模式推广到 Go/Python，并让 `.dart` 在没装 Flutter 的机器上也有语法兜底。
+
+**`.dart` 语法兜底**：`tree_sitter_dart` 接入 `tree_sitter_language()`，`.dart` 从此先过离线语法树（装了 dart 时再叠加 `dart analyze` 类型差分）。版本上又踩了一次同一个坑：`tree-sitter-dart 0.2.0` 同样是 **ABI 15**，只能退回 `0.0.4`——它兼容 ABI 14 但用的是旧 API（`language()` 而不是 `LANGUAGE`），`Cargo.toml` 注释已写明。两次都是「干净代码不得误报」这条断言当场抓出的运行时初始化失败，编译期毫无提示。
+
+**Go 语义层（`go vet` 差分）**：
+- 候选不能写进用户源码树，因此放进**临时模块**：临时目录写 `go.mod`（沿用真实模块的 module 路径与 `go` 指令），并复制真实 `go.sum`，让标准库与模块缓存里的依赖能解析；`GOPROXY=off` 禁止联网，缺失依赖立即失败而不是卡住。
+- 工程上下文缺失类诊断（`no required module provides package`、`cannot find package`、`missing go.sum entry` 等）**不算新增错误**，否则「新增一个合法 import」就会把正常编辑拒掉；若某一侧只剩这类诊断，则整体降级为「未做检查」，不冒充干净。
+- 实测：类型错误（`var x int = "str"`）能被抓到，`vet: ./a.go:4:14: ...` 的路径与行列号被丢弃后再比较。
+
+**Python 语义层（pyflakes 差分）**：检查器解析顺序为 `HARMONY_PYFLAKES_PATH` → PATH 上的 `pyflakes` → `python3 -m pyflakes`（逐个候选解释器探测是否装了 pyflakes）。pyflakes 是文件内分析、不需要包上下文，因此两侧只需写进临时目录的同名文件，不存在 go vet 那种依赖失真。诊断同样丢掉路径与行列号，只比消息。
+
+**本机真实情况（如实标注）**：这台机器**没有 pyflakes/ruff/mypy**，所以 Python 门禁在本机走的是降级路径——已有测试专门断言「缺检查器时给出可操作原因（提示 pip install pyflakes 或 HARMONY_PYFLAKES_PATH）」，这条在本机是真实执行的；「有 pyflakes 时抓到新增未使用 import」的用例在有该工具的机器上才会真正跑，本机跳过。解析层（`path:line:col: message` → 消息）由合成样例单测覆盖，不依赖工具存在。
+
+边界：三者都只做**单文件**差分——Go 不做跨包检查、Python 不做跨模块解析、Dart 不做跨文件（§20 已说明为什么结构性做不到）；Go/Python 的降级（无工具、非模块/非包、超时）都不阻塞写入并记对应事件；`.py` 的语法层由 tree-sitter 覆盖，pyflakes 缺席时仍有语法保护。
+
+验证：后端库 1,092 通过、9 忽略（总计 1,101）；新增 `go_vet` 5 项（含真实 go vet 抓到类型错误、非模块跳过、上下文缺失分离、重复计数、干净候选无新增）、`python_lint` 4 项（解析、重复计数、**本机真实的降级路径**、有工具时的真实用例）、`.dart` 与 Go 各 1 项 `edit_file` 真实入口测试；`cargo check --lib` 与 `cargo test --no-run` 均 0 警告；`check-docs.py` 与 `check-warnings.py`（57/57）通过。
