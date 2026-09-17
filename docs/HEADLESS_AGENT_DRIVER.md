@@ -688,3 +688,28 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 **验证要求（缺一不可）**：每步跑后端库全量 + `worker_crash_e2e` + `tool_worker_crash_e2e`；第 2、4 步额外要求第 1 步的事件序列快照不变；第 4 步之后需要在真实桌面里手动跑一条「多轮工具任务 + 中途停止 + 断点续跑」，本轮无 GUI 验收环境，因此**第 4 步不应在无桌面验收窗口的批次里执行**。
 
 **当前结论**：第 1、2 步（加安全网 + 纯搬运）风险可控，可作为下一批目标；第 3、4 步需要同时具备桌面验收条件。本轮只做调研与方案，未改动 `chat.rs`。
+
+## 18. 桌面 IO port 迁移：第 1 步的前置条件已查明（2026-09-15 调研，仍未改 `chat.rs`）
+
+第 17 节把「补行为快照测试」列为第 1 步，本轮动手前先验证它能不能做，结论是**不能直接做**，但解法已经找到。
+
+**为什么做不了（实测）**
+
+- `stream_chat_inner`（`commands/chat.rs:2730`）直接接收 `&AppHandle` 与四个 `tauri::State`（`DbState`/`ChatLock`/`ChatCancel`/`ToolApprovalState`/`PlanApprovalState`），`stream_once`（7417）同样吃 `&AppHandle` + `&State<DbState>`；仓库里没有任何 Tauri 测试替身，`tauri` 依赖也没启用 `test` feature（`Cargo.toml:36` 只有 `tray-icon`/`protocol-asset`）。因此「用假 Provider 跑固定剧本、断言事件序列」在现状下无处落脚。
+- 主循环体内（4425→6531，2,107 行）的接线密度：**32 处 `.emit(`**、**22 处 Tauri State / DB 锁**、13 处 `kernel_executor.*`、12 处持久化调用（`persist_turn`/`append_event`/`record_run_event`）、18 行上下文压缩相关；该函数主循环之外还有 6 处 emit 与 31 处 State/DB 触达。这就是「纯搬运」需要一次性处理的可变捕获面。
+
+**解法（两个前置件，都不需要先做迁移）**
+
+1. **确定性 LLM**：仓库已有 `services/llm_replay` 录制/重放接缝（`chat.rs:10803` 起），`ReplayMode::Replay(dir)` 命中时直接返回录制文本、不发真实请求，且已被评测链路使用。用它给一键路径提供确定性回复，**不必改生产代码**（录制一次 fixture 即可）。
+2. **Tauri 测试替身**：给 `tauri` 加 `test` feature（仅测试依赖）并用 `tauri::test::mock_builder` 构造带托管状态的 app（`DbState` 用内存库跑全量迁移、`ChatCancel`/`ToolApprovalState`/`PlanApprovalState`/`TaskRegistry` 直接 `manage`），即可在测试里调用 `stream_chat_inner`。
+
+**更正后的顺序**（0 是新增的前置；原 1—5 顺延）
+
+0. **补测试替身**：`tauri` test feature + mock app 装配 + 一份 replay fixture；先拿一条最小剧本（单轮、无工具）跑通并断言终态。
+1. **行为快照**：固定剧本（多轮 + 工具调用 + 中途停止 + 断点续跑）断言事件序列（类型与顺序）、账本推进、预算计数、终态。
+2. **纯搬运** round 体到 `desktop_round(...)`（零行为改动，第 1 步守护）。
+3. **实现 `DesktopIoPort`**（`cancelled`/`persist_checkpoint`/`run_round` 三方法，见 `kernel_executor.rs:184`）。
+4. **切换执行器**：`KernelIoRunLoop::run(port)` 替换 `begin_persisted_round` + 内联体，删旧路径。
+5. **清理与对齐**：核对桌面与 headless 不再各写一份停止/压缩/循环决策，更新状态单页与盘点日志。
+
+**当前结论**：第 0 步是迁移的真正前置，且比迁移本身小、可独立验证；在没有它之前**不要开始第 2 步的 2,107 行搬运**——否则等于在没有安全网的情况下重写应用主循环。本轮只做调研与计划更正，未改动 `chat.rs`。
