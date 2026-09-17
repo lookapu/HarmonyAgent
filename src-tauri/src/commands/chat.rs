@@ -3748,6 +3748,231 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
     Ok(AssembleOutcome::Ready { messages })
 }
 
+/// 轮级路由与纠正的结论：本轮之后是继续下一轮还是结束循环。
+enum RoundRoutingOutcome {
+    /// 回到循环顶部开始下一轮（空轮重试、重放、续写、假调用纠正、各类纠正注入）
+    NextRound,
+    /// 结束循环，交由循环后的验收与收尾处理
+    Finish,
+}
+
+/// `route_round_outcome` 的输入（全部借用）。四个纠正计数器与三处可变文本随调用推进，
+/// 调用方在循环后仍继续持有它们。
+struct RoundRoutingInputs<'a> {
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    text: &'a str,
+    /// 模型本轮思考过程（router 用它判断是否"只有思考没有正文"）
+    reasoning: &'a str,
+    /// 输出被 max_tokens 截断
+    truncated: bool,
+    /// 流式连接中断
+    interrupted: bool,
+    /// 原生 function calling 调用（工具名，参数 JSON）
+    tool_calls: &'a [(String, String)],
+    tool_runs: &'a [ToolRunItem],
+    inherited_tool_evidence: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
+    goal_contract: &'a crate::agent::acceptance::GoalContract,
+    executor: &'a mut KernelIoRunLoop,
+    full: &'a mut String,
+    correction_text: &'a mut String,
+    correction_hint: &'a mut String,
+    continuation_text: &'a mut String,
+    continuation_reasoning_only: &'a mut bool,
+    pending_action_corrections: &'a mut usize,
+    action_commitment_corrections: &'a mut usize,
+    unverified_claim_corrections: &'a mut usize,
+    completion_reviews: &'a mut usize,
+}
+
+/// 轮级路由与假完成纠正（纯搬运：原主循环内联代码，行为一致）。
+///
+/// 段内 12 处 `continue`/`break` 只区分「下一轮」与「结束循环」两种去向，
+/// 因此返回 `RoundRoutingOutcome` 两个变体即可，不需要把每个路由分支都变成变体。
+fn route_round_outcome(
+    inputs: RoundRoutingInputs<'_>,
+) -> Result<RoundRoutingOutcome, ChatFlowError> {
+    // 轮级路由：由共享 KernelExecutorState 决定空轮/重放/续写/假调用纠正。
+    let router_input = KernelRoundInput {
+        text: inputs.text,
+        has_reasoning: !inputs.reasoning.trim().is_empty(),
+        truncated: inputs.truncated,
+        interrupted: inputs.interrupted,
+        has_native_tool_calls: !inputs.tool_calls.is_empty(),
+    };
+    let decision = inputs.executor.decide_round(&router_input);
+    for notice in decision.notices {
+        inputs.full.push_str(&notice);
+    }
+    match decision.control {
+        crate::agent::kernel_loop::KernelRoundControl::RetryEmpty { hint } => {
+            *inputs.correction_text = String::new();
+            *inputs.correction_hint = hint;
+            return Ok(RoundRoutingOutcome::NextRound);
+        }
+        crate::agent::kernel_loop::KernelRoundControl::StopEmpty { note } => {
+            inputs.full.push_str(&note);
+            return Ok(RoundRoutingOutcome::Finish);
+        }
+        crate::agent::kernel_loop::KernelRoundControl::ReplayFrozen => {
+            crate::utils::logger::log_event(
+                "stream_replay",
+                serde_json::json!({
+                    "conversation_id": inputs.conversation_id,
+                    "attempt": inputs.executor.round_counters().stream_replays,
+                    "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
+                }),
+            );
+            return Ok(RoundRoutingOutcome::NextRound);
+        }
+        crate::agent::kernel_loop::KernelRoundControl::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
+            *inputs.continuation_text = ct;
+            *inputs.continuation_reasoning_only = reasoning_only;
+            return Ok(RoundRoutingOutcome::NextRound);
+        }
+        crate::agent::kernel_loop::KernelRoundControl::ContinueTruncated { continuation_text: ct, reasoning_only } => {
+            *inputs.continuation_text = ct;
+            *inputs.continuation_reasoning_only = reasoning_only;
+            return Ok(RoundRoutingOutcome::NextRound);
+        }
+        crate::agent::kernel_loop::KernelRoundControl::CorrectFakeCall { correction_text: ct, hint } => {
+            *inputs.correction_text = ct;
+            *inputs.correction_hint = hint;
+            return Ok(RoundRoutingOutcome::NextRound);
+        }
+        crate::agent::kernel_loop::KernelRoundControl::Proceed => {
+            // 无特殊动作：继续后续 UI 专属门
+        }
+    }
+    // 防“未完话术”静默结束：模型承诺“还需读取/继续查看”等下一步动作但未输出【TOOL】
+    // 标记（任务实际未完成却正常收尾），注入纠正提示要求立即输出标记或明确总结
+    if has_pending_action_phrase(inputs.text)
+        && *inputs.pending_action_corrections < MAX_PENDING_ACTION_CORRECTIONS
+    {
+        *inputs.pending_action_corrections += 1;
+        *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+        *inputs.correction_hint = "（系统检测到你的回复描述了下一步动作（如还需读取/继续查看/补全读取等），但没有输出工具调用标记，本轮没有任何工具被执行。若任务未完成，本轮必须直接输出【TOOL|工具名|JSON参数】标记行来执行动作，不得再只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
+        return Ok(RoundRoutingOutcome::NextRound);
+    }
+    // 纠正多次后模型仍只描述计划不执行：向用户明确提示任务可能未完成，不再静默收尾
+    if has_pending_action_phrase(inputs.text) && *inputs.pending_action_corrections > 0 {
+        inputs.full.push_str("\n\n> ⚠️ 模型多次表示要继续执行但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
+    }
+    // 防“行动承诺假完成”静默收尾：模型宣布“开始开发/创建/新建/实现”或仅输出方案计划
+    // （如“方案如下：新建 pages/Login.ets …”）但本轮未输出任何【TOOL】标记、无任何工具
+    // 被执行时，不结束任务（任务实际未执行却正常收尾），注入纠正提示要求立即输出标记执行
+    if has_action_commitment_phrase(inputs.text)
+        && *inputs.action_commitment_corrections < MAX_ACTION_COMMITMENT_CORRECTIONS
+    {
+        *inputs.action_commitment_corrections += 1;
+        *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+        *inputs.correction_hint = "（系统检测到你的回复宣布了开始执行开发动作（如开始开发/创建/新建/实现/修改文件等）或仅输出了方案计划，但本轮没有输出任何工具调用标记，系统未执行任何操作。若任务未完成，请立即输出【TOOL|工具名|JSON参数】标记行实际执行（新建/修改文件、注册路由、构建部署等），不要只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
+        return Ok(RoundRoutingOutcome::NextRound);
+    }
+    // 纠正多次后模型仍只输出方案不执行：向用户明确提示任务可能未完成，不再静默收尾
+    if has_action_commitment_phrase(inputs.text) && *inputs.action_commitment_corrections > 0 {
+        inputs.full.push_str("\n\n> ⚠️ 模型多次宣布开始执行/输出方案但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
+    }
+    // 强验收前移到“申请完成”时刻。缺少写入、后置验证、构建/测试/提交/推送等
+    // 契约证据时自动回到工具循环；达到动态上限才保留为未完成，避免无限补救。
+    if !inputs.interrupted {
+        let evidence = combined_acceptance_evidence(inputs.inherited_tool_evidence, inputs.tool_runs);
+        let report = inputs
+            .state
+            .0
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                crate::agent::dag::evaluate_root_with_children(
+                    &conn,
+                    inputs.trace_id,
+                    inputs.goal_contract,
+                    &evidence,
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| {
+                crate::agent::acceptance::evaluate_contract(inputs.goal_contract, &evidence)
+            });
+        if let crate::agent::agent_kernel::KernelStopDecision::Remediate {
+            report,
+            prompt,
+            round,
+        } = inputs.executor.decide_stop(report)
+        {
+            *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+            *inputs.correction_hint = prompt;
+            if let Ok(conn) = inputs.state.0.lock() {
+                let value = serde_json::to_value(&report).unwrap_or_default();
+                let _ = crate::agent::runtime::set_acceptance(&conn, inputs.trace_id, &value);
+                let _ = crate::agent::runtime::record_remediation(
+                    &conn,
+                    inputs.trace_id,
+                    inputs.conversation_id,
+                    &report.blockers,
+                );
+            }
+            let _ = inputs.app.emit(
+                "chat-governance",
+                ChatGovernanceEvent {
+                    conversation_id: inputs.conversation_id.to_string(),
+                    run_id: inputs.trace_id.to_string(),
+                    remediation_count: round,
+                    blockers: report.blockers,
+                },
+            );
+            return Ok(RoundRoutingOutcome::NextRound);
+        }
+    }
+    // ship 注册表审计：模型收尾总结中“已验证/测试通过/已修复”等完成声明未绑定具体
+    // 验证范围（文件/模块/命令/截图等）时注入纠正要求补充或实际验证——防“声称完成却
+    // 没验证”的虚假收尾（与收尾复核互补：复核问“是否真完成”，ship 查“完成声明是否
+    // 有验证背书”）；达上限放行收尾，防空转
+    if (!inputs.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
+        && !inputs.interrupted
+        && has_unverified_claim(inputs.text)
+        && *inputs.unverified_claim_corrections < MAX_UNVERIFIED_CLAIM_CORRECTIONS
+    {
+        *inputs.unverified_claim_corrections += 1;
+        *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+        *inputs.correction_hint = "（系统检测到你的总结中出现了“已验证/测试通过/已修复”等完成声明，但未说明验证范围（哪些文件/模块/用例/命令/截图）。请补充声明对应的验证范围与方式；若尚未实际验证，请立即输出【TOOL|工具名|JSON参数】标记行执行真实验证（构建/部署/跑测试/读日志/截图等），验证通过后再总结。声明与验证必须绑定：没有验证背书的完成声明将被视为未完成。）".to_string();
+        return Ok(RoundRoutingOutcome::NextRound);
+    }
+    // 任务收尾复核：本任务执行过工具（执行型任务）且模型主动收尾时，不直接结束——
+    // 注入确认消息防“任务未完成却提前总结”（长任务尤其需要：宁可多问一轮也不静默收尾）。
+    // 模型回复确认词（✅ 任务已完成）则下一轮收尾；回复工具标记/补充正文则继续执行。
+    // 复核次数达上限仍未确认完成：收尾并明确提示，防“复核-收尾-复核”空转。
+    // 纯问答任务（全程无工具执行）不复核，直接收尾。
+    // 本轮已判定网络连续中断（outcome.interrupted）时不复核：连接不稳，复核轮大概率
+    // 再次中断白等，直接按上方“网络连续中断”提示收尾。
+    if (!inputs.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
+        && !inputs.interrupted
+        && *inputs.completion_reviews < MAX_COMPLETION_REVIEWS
+    {
+        *inputs.completion_reviews += 1;
+        *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+        // 证据化完成确认（对齐 deepseek-harness goal-round-driver）：复核时带上任务
+        // 原始目标并要求引用完成证据（构建/测试/文件/截图），防“完成声明无验证背书”
+        // 的假收尾——与 task_guard 每轮 <goal_round> 注入、ship 注册表审计同一口径
+        let goal_note = crate::services::task_guard::current_goal(inputs.conversation_id)
+            .map(|g| format!("本任务的目标是：{g}\n"))
+            .unwrap_or_default();
+        *inputs.correction_hint = format!(
+            "（系统检测到你的回复为任务总结，但本任务此前已执行过工具。{goal_note}请对照目标逐项核对完成情况，并引用完成证据（构建成功输出/测试通过/文件内容/截图等）后再确认：若确认已完成，请以『✅ 任务已完成』开头给出最终结论（含证据）；若仍有未完成步骤或未经验证的环节，请直接输出【TOOL|工具名|JSON参数】标记行继续执行，本轮不要输出总结。）"
+        );
+        return Ok(RoundRoutingOutcome::NextRound);
+    }
+    if (!inputs.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
+        && !inputs.interrupted
+        && *inputs.completion_reviews >= MAX_COMPLETION_REVIEWS
+    {
+        inputs.full.push_str("\n\n> ⚠️ 任务收尾前已多次要求模型确认完成情况，模型始终未确认任务已全部完成；以上内容已保留，建议检查结果或补充指令继续推进。");
+    }
+    Ok(RoundRoutingOutcome::Finish)
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -6707,161 +6932,33 @@ async fn stream_chat_inner(
             PlanGateOutcome::NextRound => continue,
             PlanGateOutcome::Finish => break,
         }
-        // 轮级路由：由共享 KernelExecutorState 决定空轮/重放/续写/假调用纠正。
-        let router_input = KernelRoundInput {
+        match route_round_outcome(RoundRoutingInputs {
+            app,
+            state,
+            conversation_id: &conversation_id,
+            trace_id: &trace_id,
             text: &text,
-            has_reasoning: !outcome.reasoning.trim().is_empty(),
+            reasoning: &outcome.reasoning,
             truncated: outcome.truncated,
             interrupted: outcome.interrupted,
-            has_native_tool_calls: !outcome.tool_calls.is_empty(),
-        };
-        let decision = kernel_executor.decide_round(&router_input);
-        for notice in decision.notices {
-            full.push_str(&notice);
+            tool_calls: &outcome.tool_calls,
+            tool_runs: &tool_runs,
+            inherited_tool_evidence: &inherited_tool_evidence,
+            goal_contract: &goal_contract,
+            executor: &mut kernel_executor,
+            full: &mut full,
+            correction_text: &mut correction_text,
+            correction_hint: &mut correction_hint,
+            continuation_text: &mut continuation_text,
+            continuation_reasoning_only: &mut continuation_reasoning_only,
+            pending_action_corrections: &mut pending_action_corrections,
+            action_commitment_corrections: &mut action_commitment_corrections,
+            unverified_claim_corrections: &mut unverified_claim_corrections,
+            completion_reviews: &mut completion_reviews,
+        })? {
+            RoundRoutingOutcome::NextRound => continue 'outer,
+            RoundRoutingOutcome::Finish => break 'outer,
         }
-        match decision.control {
-            crate::agent::kernel_loop::KernelRoundControl::RetryEmpty { hint } => {
-                correction_text = String::new();
-                correction_hint = hint;
-                continue 'outer;
-            }
-            crate::agent::kernel_loop::KernelRoundControl::StopEmpty { note } => {
-                full.push_str(&note);
-                break 'outer;
-            }
-            crate::agent::kernel_loop::KernelRoundControl::ReplayFrozen => {
-                crate::utils::logger::log_event(
-                    "stream_replay",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "attempt": kernel_executor.round_counters().stream_replays,
-                        "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
-                    }),
-                );
-                continue 'outer;
-            }
-            crate::agent::kernel_loop::KernelRoundControl::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
-                continuation_text = ct;
-                continuation_reasoning_only = reasoning_only;
-                continue 'outer;
-            }
-            crate::agent::kernel_loop::KernelRoundControl::ContinueTruncated { continuation_text: ct, reasoning_only } => {
-                continuation_text = ct;
-                continuation_reasoning_only = reasoning_only;
-                continue 'outer;
-            }
-            crate::agent::kernel_loop::KernelRoundControl::CorrectFakeCall { correction_text: ct, hint } => {
-                correction_text = ct;
-                correction_hint = hint;
-                continue 'outer;
-            }
-            crate::agent::kernel_loop::KernelRoundControl::Proceed => {
-                // 无特殊动作：继续后续 UI 专属门
-            }
-        }
-        // 防“未完话术”静默结束：模型承诺“还需读取/继续查看”等下一步动作但未输出【TOOL】
-        // 标记（任务实际未完成却正常收尾），注入纠正提示要求立即输出标记或明确总结
-        if has_pending_action_phrase(&text) && pending_action_corrections < MAX_PENDING_ACTION_CORRECTIONS {
-            pending_action_corrections += 1;
-            correction_text = crate::agent::tools::strip_tool_calls(&text);
-            correction_hint = "（系统检测到你的回复描述了下一步动作（如还需读取/继续查看/补全读取等），但没有输出工具调用标记，本轮没有任何工具被执行。若任务未完成，本轮必须直接输出【TOOL|工具名|JSON参数】标记行来执行动作，不得再只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
-            continue;
-        }
-        // 纠正多次后模型仍只描述计划不执行：向用户明确提示任务可能未完成，不再静默收尾
-        if has_pending_action_phrase(&text) && pending_action_corrections > 0 {
-            full.push_str("\n\n> ⚠️ 模型多次表示要继续执行但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
-        }
-        // 防“行动承诺假完成”静默收尾：模型宣布“开始开发/创建/新建/实现”或仅输出方案计划
-        // （如“方案如下：新建 pages/Login.ets …”）但本轮未输出任何【TOOL】标记、无任何工具
-        // 被执行时，不结束任务（任务实际未执行却正常收尾），注入纠正提示要求立即输出标记执行
-        if has_action_commitment_phrase(&text)
-            && action_commitment_corrections < MAX_ACTION_COMMITMENT_CORRECTIONS
-        {
-            action_commitment_corrections += 1;
-            correction_text = crate::agent::tools::strip_tool_calls(&text);
-            correction_hint = "（系统检测到你的回复宣布了开始执行开发动作（如开始开发/创建/新建/实现/修改文件等）或仅输出了方案计划，但本轮没有输出任何工具调用标记，系统未执行任何操作。若任务未完成，请立即输出【TOOL|工具名|JSON参数】标记行实际执行（新建/修改文件、注册路由、构建部署等），不要只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
-            continue;
-        }
-        // 纠正多次后模型仍只输出方案不执行：向用户明确提示任务可能未完成，不再静默收尾
-        if has_action_commitment_phrase(&text) && action_commitment_corrections > 0 {
-            full.push_str("\n\n> ⚠️ 模型多次宣布开始执行/输出方案但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
-        }
-        // 强验收前移到“申请完成”时刻。缺少写入、后置验证、构建/测试/提交/推送等
-        // 契约证据时自动回到工具循环；达到动态上限才保留为未完成，避免无限补救。
-        if !outcome.interrupted {
-            let evidence =
-                combined_acceptance_evidence(&inherited_tool_evidence, &tool_runs);
-            let report = state.0.lock().ok()
-                .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &evidence).ok())
-                .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &evidence));
-            if let crate::agent::agent_kernel::KernelStopDecision::Remediate {
-                report,
-                prompt,
-                round,
-            } = kernel_executor.decide_stop(report) {
-                correction_text = crate::agent::tools::strip_tool_calls(&text);
-                correction_hint = prompt;
-                if let Ok(conn) = state.0.lock() {
-                    let value = serde_json::to_value(&report).unwrap_or_default();
-                    let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
-                    let _ = crate::agent::runtime::record_remediation(
-                        &conn, &trace_id, &conversation_id, &report.blockers,
-                    );
-                }
-                let _ = app.emit("chat-governance", ChatGovernanceEvent {
-                    conversation_id: conversation_id.clone(),
-                    run_id: trace_id.clone(),
-                    remediation_count: round,
-                    blockers: report.blockers,
-                });
-                continue;
-            }
-        }
-        // ship 注册表审计：模型收尾总结中“已验证/测试通过/已修复”等完成声明未绑定具体
-        // 验证范围（文件/模块/命令/截图等）时注入纠正要求补充或实际验证——防“声称完成却
-        // 没验证”的虚假收尾（与收尾复核互补：复核问“是否真完成”，ship 查“完成声明是否
-        // 有验证背书”）；达上限放行收尾，防空转
-        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
-            && !outcome.interrupted
-            && has_unverified_claim(&text)
-            && unverified_claim_corrections < MAX_UNVERIFIED_CLAIM_CORRECTIONS
-        {
-            unverified_claim_corrections += 1;
-            correction_text = crate::agent::tools::strip_tool_calls(&text);
-            correction_hint = "（系统检测到你的总结中出现了“已验证/测试通过/已修复”等完成声明，但未说明验证范围（哪些文件/模块/用例/命令/截图）。请补充声明对应的验证范围与方式；若尚未实际验证，请立即输出【TOOL|工具名|JSON参数】标记行执行真实验证（构建/部署/跑测试/读日志/截图等），验证通过后再总结。声明与验证必须绑定：没有验证背书的完成声明将被视为未完成。）".to_string();
-            continue;
-        }
-        // 任务收尾复核：本任务执行过工具（执行型任务）且模型主动收尾时，不直接结束——
-        // 注入确认消息防“任务未完成却提前总结”（长任务尤其需要：宁可多问一轮也不静默收尾）。
-        // 模型回复确认词（✅ 任务已完成）则下一轮收尾；回复工具标记/补充正文则继续执行。
-        // 复核次数达上限仍未确认完成：收尾并明确提示，防“复核-收尾-复核”空转。
-        // 纯问答任务（全程无工具执行）不复核，直接收尾。
-        // 本轮已判定网络连续中断（outcome.interrupted）时不复核：连接不稳，复核轮大概率
-        // 再次中断白等，直接按上方“网络连续中断”提示收尾。
-        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
-            && !outcome.interrupted
-            && completion_reviews < MAX_COMPLETION_REVIEWS
-        {
-            completion_reviews += 1;
-            correction_text = crate::agent::tools::strip_tool_calls(&text);
-            // 证据化完成确认（对齐 deepseek-harness goal-round-driver）：复核时带上任务
-            // 原始目标并要求引用完成证据（构建/测试/文件/截图），防“完成声明无验证背书”
-            // 的假收尾——与 task_guard 每轮 <goal_round> 注入、ship 注册表审计同一口径
-            let goal_note = crate::services::task_guard::current_goal(&conversation_id)
-                .map(|g| format!("本任务的目标是：{g}\n"))
-                .unwrap_or_default();
-            correction_hint = format!(
-                "（系统检测到你的回复为任务总结，但本任务此前已执行过工具。{goal_note}请对照目标逐项核对完成情况，并引用完成证据（构建成功输出/测试通过/文件内容/截图等）后再确认：若确认已完成，请以『✅ 任务已完成』开头给出最终结论（含证据）；若仍有未完成步骤或未经验证的环节，请直接输出【TOOL|工具名|JSON参数】标记行继续执行，本轮不要输出总结。）"
-            );
-            continue;
-        }
-        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
-            && !outcome.interrupted
-            && completion_reviews >= MAX_COMPLETION_REVIEWS
-        {
-            full.push_str("\n\n> ⚠️ 任务收尾前已多次要求模型确认完成情况，模型始终未确认任务已全部完成；以上内容已保留，建议检查结果或补充指令继续推进。");
-        }
-        break;
     }
 
     // 6. 证据驱动验收：模型的“任务已完成”只是一份完成申请，最终状态由原始目标与
