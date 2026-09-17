@@ -807,3 +807,12 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 - **输入面**：`AssembleInputs` 34 个字段，其中 10 个是 `&mut`（`seam_count`/`history_limit`/`context_summary`/`images_attached`/`continuation_reasoning_only`/`correction_text`/`correction_hint`/`merged_instructions`/`tools_since_progress`/`replan_instruction`）。同类型字段最多的一组是若干 `&mut String`，接线时按名字逐一核对过。
 - **度量**：主循环体 1,795 → **1,547 行**；循环内 `.emit(` 29 → 17（12 处随组装段移出）；`break`/`continue` 仍 30（该段只有 1 处，已改成枚举返回）。搬运顺带消掉一处 `unused_mut`：`messages` 在函数内只读，不再需要 `mut`。
 - **验证**：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
+
+**进展（2026-09-17，第五刀）**：轮后 B 落地——共享 `KernelExecutorState` 的轮级路由（空轮重试/停止/重放/续写/假调用纠正）、四类假完成纠正门（未完话术、行动承诺、验收补救、未验证声明）与收尾复核门，整体搬进 `route_round_outcome`（`8121ae7`）。
+
+- **枚举只需两个变体**：段内 **12 处 `break`/`continue`** 只区分「下一轮」与「结束循环」两种去向，因此 `RoundRoutingOutcome { NextRound, Finish }` 即可，不必把每个路由分支都变成变体——这与按段独立枚举的做法相比，省掉了一层无意义的映射。
+- **一处必要调整**：该段原本整体读 `outcome`，但此时 `outcome.text` 已被移出（正文在轮后记账处已接管），整体借用会编译失败；改为按字段传入（`reasoning`/`truncated`/`interrupted`/`tool_calls`），表达式与原内联代码逐字一致。这是**唯一一处非逐行搬运**的改动，已记录以便复核。
+- **度量**：主循环体（按更正口径）1,418 → **1,290 行**；`break`/`continue` 30 → **20**；循环内 `.emit(` 16 → 15、`.0.lock()` 8 → 6。
+- **验证**：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
+
+**度量口径更正（2026-09-17）**：本页此前各条「主循环体 N 行」的 N 是按「循环起点 → 下一个 `fn`」量的，把循环**结束后**的验收收尾段（约 129 行）算进了循环体。正确量法是「循环起点 → 循环闭合括号」。按更正口径重述：第 19 节起点的 2,107 行对应更正后约 1,978 行；各条的**增量**不受影响（该尾段始终未改动），但绝对行数需整体下调。当前（第五刀后）主循环体为 **1,290 行**。
