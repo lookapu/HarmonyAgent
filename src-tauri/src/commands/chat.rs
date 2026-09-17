@@ -3231,6 +3231,165 @@ async fn run_plan_gate(inputs: PlanGateInputs<'_>) -> Result<PlanGateOutcome, Ch
     Ok(PlanGateOutcome::Passed)
 }
 
+/// `enforce_budget_gate` 的输入（全部借用）。
+struct BudgetGateInputs<'a> {
+    state: &'a tauri::State<'a, DbState>,
+    app: &'a AppHandle,
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    provider: &'a ProviderEndpoint,
+    messages: &'a [serde_json::Value],
+    model_choice: &'a mut ModelChoice,
+    stats: &'a mut ChatRunStats,
+    used_fallback: &'a mut bool,
+    budget_warned: &'a mut bool,
+}
+
+/// 发送前预算门控（纯搬运：原主循环内联代码，行为一致）。
+///
+/// 硬限额拦截（日/月预算超出即停止发送并返回预算类错误）、软预警提示，
+/// 以及软预警达阈值后自动降级到同 Provider 经济模型。该段没有 `break`/`continue`、
+/// 也没有 `await`，所以不需要枚举返回值——错误直接上抛。
+fn enforce_budget_gate(inputs: BudgetGateInputs<'_>) -> Result<(), ChatFlowError> {
+    // 预算门控：发送前用本地 token 预估估算本次成本，若已用+本次预估突破
+    // Provider 日/月预算则停止，避免悄悄花超（预算未设置时直接放行）。
+    {
+        let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
+        let pricing =
+            crate::services::cost_calculator::get_pricing(&conn, &inputs.model_choice.model);
+        let gate = match pricing {
+            Some(p) => crate::services::budget::check_budget(
+                &conn,
+                &inputs.provider.provider_id,
+                p.input_cost_per_mtok,
+                p.output_cost_per_mtok,
+                estimate_tokens(inputs.messages),
+                inputs.model_choice.output_limit as usize,
+            ),
+            None => crate::services::budget::GateDecision::Allow,
+        };
+        drop(conn);
+        match gate {
+            crate::services::budget::GateDecision::Allow => {
+                // 软预警 + 自动降级：硬限额放行后，再按已用占比软预警
+                // （≥80% 提醒用户；≥90% 自动切同 Provider 更便宜模型，防贵的模型继续烧预算）
+                let (soft, econ) = {
+                    let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
+                    let s = crate::services::cost_guard::soft_check(&conn, &inputs.provider.provider_id);
+                    let e = if s.should_downgrade() && !*inputs.used_fallback {
+                        crate::services::cost_guard::pick_downgrade_model(
+                            &conn,
+                            &inputs.provider.provider_id,
+                            &inputs.model_choice.model,
+                        )
+                    } else {
+                        None
+                    };
+                    (s, e)
+                };
+                if let Some(econ_model) = econ {
+                    // 查询经济模型基础配置（沿用主模型选择处的查询模式）
+                    let row = {
+                        let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
+                        conn.query_row(
+                            "SELECT use_proxy, context_limit, output_limit FROM models
+                             WHERE provider_id = ?1 AND model_id = ?2 AND enabled = 1",
+                            params![&inputs.provider.provider_id, &econ_model],
+                            |r| {
+                                Ok((
+                                    r.get::<_, bool>(0)?,
+                                    r.get::<_, Option<i64>>(1)?,
+                                    r.get::<_, Option<i64>>(2)?,
+                                ))
+                            },
+                        )
+                        .ok()
+                    };
+                    if let Some((up, _ctx, o)) = row {
+                        *inputs.used_fallback = true;
+                        *inputs.model_choice = ModelChoice {
+                            provider_id: inputs.provider.provider_id.clone(),
+                            model: econ_model.clone(),
+                            use_proxy: up,
+                            output_limit: o.unwrap_or(8192) as u32,
+                        };
+                        inputs.stats.model = Some(inputs.model_choice.model.clone());
+                        let _ = inputs.app.emit(
+                            "chat-stream",
+                            ChatStreamEvent {
+                                conversation_id: inputs.conversation_id.to_string(),
+                                run_id: inputs.trace_id.to_string(),
+                                delta: format!(
+                                    "（预算软预警：已用达 90%，已自动降级到经济模型 {econ_model} 继续任务）"
+                                ),
+                            },
+                        );
+                    }
+                } else if let crate::services::cost_guard::SoftStatus::Warn {
+                    used_cny,
+                    limit_cny,
+                    ratio,
+                } = soft
+                {
+                    if !*inputs.budget_warned {
+                        *inputs.budget_warned = true;
+                        let _ = inputs.app.emit(
+                            "chat-stream",
+                            ChatStreamEvent {
+                                conversation_id: inputs.conversation_id.to_string(),
+                                run_id: inputs.trace_id.to_string(),
+                                delta: format!(
+                                    "（⚠️ 预算软预警：已用 ¥{used_cny:.2} / ¥{limit_cny:.2}（{:.0}%），请注意控制用量）",
+                                    ratio * 100.0
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
+            crate::services::budget::GateDecision::DailyLimit { used_cny, limit_cny, est_cny } => {
+                let _ = inputs.app.emit(
+                    "chat-stream",
+                    ChatStreamEvent {
+                        conversation_id: inputs.conversation_id.to_string(),
+                        run_id: inputs.trace_id.to_string(),
+                        delta: format!(
+                            "⛔ 已达今日预算上限（已用 ¥{used_cny:.2} / ¥{limit_cny:.2}，本次约 ¥{est_cny:.2}），已停止发送。可在 Provider 设置中调高日预算或等待明日重置。"
+                        ),
+                    },
+                );
+                return Err(ChatFlowError {
+                    kind: ErrorKind::Budget,
+                    title: ErrorKind::Budget.title().to_string(),
+                    message: format!("已达今日预算上限：已用 ¥{used_cny:.2} / ¥{limit_cny:.2}"),
+                    suggestion: "在 Provider 设置中调高日预算，或等待明日重置".to_string(),
+                    status_code: None,
+                });
+            }
+            crate::services::budget::GateDecision::MonthlyLimit { used_cny, limit_cny, est_cny } => {
+                let _ = inputs.app.emit(
+                    "chat-stream",
+                    ChatStreamEvent {
+                        conversation_id: inputs.conversation_id.to_string(),
+                        run_id: inputs.trace_id.to_string(),
+                        delta: format!(
+                            "⛔ 已达本月预算上限（已用 ¥{used_cny:.2} / ¥{limit_cny:.2}，本次约 ¥{est_cny:.2}），已停止发送。可在 Provider 设置中调高月预算或等待下月重置。"
+                        ),
+                    },
+                );
+                return Err(ChatFlowError {
+                    kind: ErrorKind::Budget,
+                    title: ErrorKind::Budget.title().to_string(),
+                    message: format!("已达本月预算上限：已用 ¥{used_cny:.2} / ¥{limit_cny:.2}"),
+                    suggestion: "在 Provider 设置中调高月预算，或等待下月重置".to_string(),
+                    status_code: None,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -5304,141 +5463,18 @@ async fn stream_chat_inner(
             );
         }
 
-        // 预算门控：发送前用本地 token 预估估算本次成本，若已用+本次预估突破
-        // Provider 日/月预算则停止，避免悄悄花超（预算未设置时直接放行）。
-        {
-            let conn = state.0.lock().map_err(|e| e.to_string())?;
-            let pricing = crate::services::cost_calculator::get_pricing(&conn, &model_choice.model);
-            let gate = match pricing {
-                Some(p) => crate::services::budget::check_budget(
-                    &conn,
-                    &provider.provider_id,
-                    p.input_cost_per_mtok,
-                    p.output_cost_per_mtok,
-                    estimate_tokens(&messages),
-                    model_choice.output_limit as usize,
-                ),
-                None => crate::services::budget::GateDecision::Allow,
-            };
-            drop(conn);
-            match gate {
-                crate::services::budget::GateDecision::Allow => {
-                    // 软预警 + 自动降级：硬限额放行后，再按已用占比软预警
-                    // （≥80% 提醒用户；≥90% 自动切同 Provider 更便宜模型，防贵的模型继续烧预算）
-                    let (soft, econ) = {
-                        let conn = state.0.lock().map_err(|e| e.to_string())?;
-                        let s = crate::services::cost_guard::soft_check(&conn, &provider.provider_id);
-                        let e = if s.should_downgrade() && !used_fallback {
-                            crate::services::cost_guard::pick_downgrade_model(
-                                &conn,
-                                &provider.provider_id,
-                                &model_choice.model,
-                            )
-                        } else {
-                            None
-                        };
-                        (s, e)
-                    };
-                    if let Some(econ_model) = econ {
-                        // 查询经济模型基础配置（沿用主模型选择处的查询模式）
-                        let row = {
-                            let conn = state.0.lock().map_err(|e| e.to_string())?;
-                            conn.query_row(
-                                "SELECT use_proxy, context_limit, output_limit FROM models
-                                 WHERE provider_id = ?1 AND model_id = ?2 AND enabled = 1",
-                                params![&provider.provider_id, &econ_model],
-                                |r| {
-                                    Ok((
-                                        r.get::<_, bool>(0)?,
-                                        r.get::<_, Option<i64>>(1)?,
-                                        r.get::<_, Option<i64>>(2)?,
-                                    ))
-                                },
-                            )
-                            .ok()
-                        };
-                        if let Some((up, _ctx, o)) = row {
-                            used_fallback = true;
-                            model_choice = ModelChoice {
-                                provider_id: provider.provider_id.clone(),
-                                model: econ_model.clone(),
-                                use_proxy: up,
-                                output_limit: o.unwrap_or(8192) as u32,
-                            };
-                            stats.model = Some(model_choice.model.clone());
-                            let _ = app.emit(
-                                "chat-stream",
-                                ChatStreamEvent {
-                                    conversation_id: conversation_id.clone(),
-                                    run_id: trace_id.clone(),
-                                    delta: format!(
-                                        "（预算软预警：已用达 90%，已自动降级到经济模型 {econ_model} 继续任务）"
-                                    ),
-                                },
-                            );
-                        }
-                    } else if let crate::services::cost_guard::SoftStatus::Warn {
-                        used_cny,
-                        limit_cny,
-                        ratio,
-                    } = soft
-                    {
-                        if !budget_warned {
-                            budget_warned = true;
-                            let _ = app.emit(
-                                "chat-stream",
-                                ChatStreamEvent {
-                                    conversation_id: conversation_id.clone(),
-                                    run_id: trace_id.clone(),
-                                    delta: format!(
-                                        "（⚠️ 预算软预警：已用 ¥{used_cny:.2} / ¥{limit_cny:.2}（{:.0}%），请注意控制用量）",
-                                        ratio * 100.0
-                                    ),
-                                },
-                            );
-                        }
-                    }
-                }
-                crate::services::budget::GateDecision::DailyLimit { used_cny, limit_cny, est_cny } => {
-                    let _ = app.emit(
-                        "chat-stream",
-                        ChatStreamEvent {
-                            conversation_id: conversation_id.clone(),
-                            run_id: trace_id.clone(),
-                            delta: format!(
-                                "⛔ 已达今日预算上限（已用 ¥{used_cny:.2} / ¥{limit_cny:.2}，本次约 ¥{est_cny:.2}），已停止发送。可在 Provider 设置中调高日预算或等待明日重置。"
-                            ),
-                        },
-                    );
-                    return Err(ChatFlowError {
-                        kind: ErrorKind::Budget,
-                        title: ErrorKind::Budget.title().to_string(),
-                        message: format!("已达今日预算上限：已用 ¥{used_cny:.2} / ¥{limit_cny:.2}"),
-                        suggestion: "在 Provider 设置中调高日预算，或等待明日重置".to_string(),
-                        status_code: None,
-                    });
-                }
-                crate::services::budget::GateDecision::MonthlyLimit { used_cny, limit_cny, est_cny } => {
-                    let _ = app.emit(
-                        "chat-stream",
-                        ChatStreamEvent {
-                            conversation_id: conversation_id.clone(),
-                            run_id: trace_id.clone(),
-                            delta: format!(
-                                "⛔ 已达本月预算上限（已用 ¥{used_cny:.2} / ¥{limit_cny:.2}，本次约 ¥{est_cny:.2}），已停止发送。可在 Provider 设置中调高月预算或等待下月重置。"
-                            ),
-                        },
-                    );
-                    return Err(ChatFlowError {
-                        kind: ErrorKind::Budget,
-                        title: ErrorKind::Budget.title().to_string(),
-                        message: format!("已达本月预算上限：已用 ¥{used_cny:.2} / ¥{limit_cny:.2}"),
-                        suggestion: "在 Provider 设置中调高月预算，或等待下月重置".to_string(),
-                        status_code: None,
-                    });
-                }
-            }
-        }
+        enforce_budget_gate(BudgetGateInputs {
+            state,
+            app,
+            conversation_id: &conversation_id,
+            trace_id: &trace_id,
+            provider: &provider,
+            messages: &messages,
+            model_choice: &mut model_choice,
+            stats: &mut *stats,
+            used_fallback: &mut used_fallback,
+            budget_warned: &mut budget_warned,
+        })?;
 
         // 单轮流式请求（发送/状态检查内含指数退避重试）；打点请求开始（消息数/估算 tokens）
         registry.touch(&conversation_id, PHASE_ROUND_REQUEST);
