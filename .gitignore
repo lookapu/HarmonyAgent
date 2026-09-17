@@ -84,3 +84,7 @@ docs/PITFALLS.private.md
 # 本地生成的 Tauri 签名密码记录（仅本机保留，勿提交）
 signer_pass.tmp
 
+# 本地旧提交快照（含嵌套 .git，仅供恢复参考，不入库）
+temp-restore/
+temp-verify/
+
