@@ -99,7 +99,7 @@ def run_clippy_json():
         "--manifest-path", str(REPO / "src-tauri" / "Cargo.toml"),
         "--all-targets", "--locked", "--message-format=json",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO))
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(REPO))
     if proc.returncode != 0 and "error" in proc.stderr.lower():
         # clippy 无 error 时正常返回 0；有编译错误时返回非零，直接透传
         sys.stderr.write(proc.stderr)

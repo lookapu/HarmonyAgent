@@ -25,14 +25,14 @@ TOOL_SPEC_RE = re.compile(r"^    ToolSpec \{", re.M)
 
 
 def count_tool_specs(repo: Path) -> int:
-    source = (repo / "src-tauri/src/agent/tools/mod.rs").read_text(errors="replace")
+    source = (repo / "src-tauri/src/agent/tools/mod.rs").read_text(encoding="utf-8", errors="replace")
     return len(TOOL_SPEC_RE.findall(source))
 
 
 def count_migrations(repo: Path) -> tuple[int, int]:
     """返回 (文件数, 注册数)；两者不一致本身即漂移。"""
     files = len(list((repo / "src-tauri/migrations").glob("*.sql")))
-    text = (repo / "src-tauri/src/db/mod.rs").read_text(errors="replace")
+    text = (repo / "src-tauri/src/db/mod.rs").read_text(encoding="utf-8", errors="replace")
     registered = len(re.findall(r"include_str!\(\"\.\./\.\./migrations/", text))
     return files, registered
 
@@ -48,7 +48,7 @@ def count_files(repo: Path, rel_dir: str, exclude: tuple[str, ...]) -> int:
 
 
 def count_ipc_entries(repo: Path) -> int:
-    text = (repo / "src-tauri/src/lib.rs").read_text(errors="replace")
+    text = (repo / "src-tauri/src/lib.rs").read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     inside = False
     count = 0
@@ -143,7 +143,7 @@ def check_counts(repo: Path) -> list[str]:
         if not path.exists():
             problems.append(f"文档不存在：{doc}")
             continue
-        text = path.read_text(errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
         match = re.search(pattern, text)
         if not match:
             problems.append(f"{label}：{doc} 未找到模式 {pattern!r}")
@@ -181,7 +181,7 @@ def check_links(repo: Path) -> list[str]:
         for path in repo.glob(pattern)
     ]
     for doc in sorted([*docs_dir.glob("*.md"), *root_docs]):
-        text = doc.read_text(errors="replace")
+        text = doc.read_text(encoding="utf-8", errors="replace")
         for match in re.finditer(r"\]\(([^)]+)\)", text):
             target = match.group(1).strip()
             resolved = resolve(doc.parent, target)
@@ -198,7 +198,7 @@ def check_path_refs(repo: Path) -> list[str]:
     for roadmap in (repo / "docs/ROADMAP.md", repo / "docs/ROADMAP.en.md"):
         if not roadmap.exists():
             continue
-        text = roadmap.read_text(errors="replace")
+        text = roadmap.read_text(encoding="utf-8", errors="replace")
         for match in re.finditer(r"`((?:src-tauri|scripts|src|docs)/[^`]+)`", text):
             ref = match.group(1).strip().rstrip("/")
             if not ref:
@@ -212,17 +212,17 @@ def check_path_refs(repo: Path) -> list[str]:
 def check_ci_interfaces(repo: Path) -> list[str]:
     """quality.yml/release.yml 引用的测试与脚本必须存在。"""
     problems = []
-    quality = (repo / ".github/workflows/quality.yml").read_text(errors="replace")
+    quality = (repo / ".github/workflows/quality.yml").read_text(encoding="utf-8", errors="replace")
     for match in re.finditer(r"agent::evals::tests::([a-z_]+)", quality):
         name = match.group(1)
-        source = (repo / "src-tauri/src/agent/evals.rs").read_text(errors="replace")
+        source = (repo / "src-tauri/src/agent/evals.rs").read_text(encoding="utf-8", errors="replace")
         if not re.search(rf"fn {name}\b", source):
             problems.append(f"quality.yml 引用不存在的测试：agent::evals::tests::{name}")
     for match in re.finditer(r"--test ([a-zA-Z0-9_]+)", quality):
         name = match.group(1)
         if not (repo / f"src-tauri/tests/{name}.rs").exists():
             problems.append(f"quality.yml 引用不存在的集成测试：{name}")
-    release = (repo / ".github/workflows/release.yml").read_text(errors="replace")
+    release = (repo / ".github/workflows/release.yml").read_text(encoding="utf-8", errors="replace")
     for match in re.finditer(r"python3? scripts/([a-zA-Z0-9_.-]+\.py)", release):
         name = match.group(1)
         if not (repo / f"scripts/{name}").exists():
@@ -334,20 +334,20 @@ def self_test() -> None:
 
         # 篡改工具数 → 必须检出
         (repo / "README.md").write_text(
-            (repo / "README.md").read_text().replace("**2 个 Agent 工具**", "**3 个 Agent 工具**")
+            (repo / "README.md").read_text(encoding="utf-8", errors="replace").replace("**2 个 Agent 工具**", "**3 个 Agent 工具**")
         )
         assert any("工具数" in p for p in check_repo(repo)), "篡改工具数未被检出"
         (repo / "README.md").write_text(
-            (repo / "README.md").read_text().replace("**3 个 Agent 工具**", "**2 个 Agent 工具**")
+            (repo / "README.md").read_text(encoding="utf-8", errors="replace").replace("**3 个 Agent 工具**", "**2 个 Agent 工具**")
         )
 
         # 英文文档篡改同样必须被检出
         (repo / "README.en.md").write_text(
-            (repo / "README.en.md").read_text().replace("**2 Agent tools**", "**3 Agent tools**")
+            (repo / "README.en.md").read_text(encoding="utf-8", errors="replace").replace("**2 Agent tools**", "**3 Agent tools**")
         )
         assert any("Tool count" in p for p in check_repo(repo)), "英文工具数漂移未被检出"
         (repo / "README.en.md").write_text(
-            (repo / "README.en.md").read_text().replace("**3 Agent tools**", "**2 Agent tools**")
+            (repo / "README.en.md").read_text(encoding="utf-8", errors="replace").replace("**3 Agent tools**", "**2 Agent tools**")
         )
 
         # 删除链接目标 → 必须检出
@@ -367,7 +367,7 @@ def self_test() -> None:
 
         # 改坏 CI 测试名 → 必须检出
         (repo / ".github/workflows/quality.yml").write_text(
-            (repo / ".github/workflows/quality.yml").read_text().replace(
+            (repo / ".github/workflows/quality.yml").read_text(encoding="utf-8", errors="replace").replace(
                 "ci_baseline_gate", "no_such_gate"
             )
         )
