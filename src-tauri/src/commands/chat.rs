@@ -2826,6 +2826,176 @@ fn persist_open_ledger_and_emit(
     Ok(())
 }
 
+/// 轮前许可裁决结论：Provider 边界之前的每次裁决都必须落到这四种之一，
+/// 没有任何已锁定的终态允许穿过 Provider 边界。
+enum PreRoundPermit {
+    /// 本轮继续（正常推进，或无终态可吸收）
+    Proceed,
+    /// 命中任务超时护栏：调用方按 Timeout 收尾
+    Deadline,
+    /// 用户停止：调用方按正常停止收尾
+    Cancelled,
+    /// 其它已锁定终态：调用方跳出循环，交给循环后的收尾
+    Locked,
+}
+
+/// 轮前许可裁决的会话内输入（全部借用）。
+///
+/// 收进结构体是因为平铺会越过 clippy 参数阈值——与第 25 节「结构化而不是重定基线」
+/// 同一条教训；端口落地时这些字段整体换成端口方法，调用方不再看到它们。
+struct PreRoundInputs<'a> {
+    executor: &'a mut KernelIoRunLoop,
+    state: &'a tauri::State<'a, DbState>,
+    app: &'a AppHandle,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    task_goal: &'a str,
+    task_started: std::time::Instant,
+    task_deadline_ms: i64,
+    tool_runs: &'a [ToolRunItem],
+    full: &'a str,
+    reasoning_full: &'a str,
+    model: &'a str,
+    context_summary: &'a Option<String>,
+    modified_files: &'a [String],
+    last_model_text: &'a str,
+    ledger_base_n: u32,
+    prev_ledger: &'a mut Option<TaskLedger>,
+    placeholder_msg_id: &'a Option<String>,
+    max_tool_rounds: usize,
+    budget_extensions: usize,
+    input_tokens: i64,
+    output_tokens: i64,
+}
+
+/// 轮前许可裁决（纯搬运：原主循环内联代码，行为一致）。
+///
+/// Provider 请求前共用安全点：run-loop 原子执行持久化与 deadline/cancel 裁决；
+/// 写入受 Worker 租约 fencing，失败时轮次不会推进、也不会发起 Provider IO。
+/// 裁决结果用 `PreRoundPermit` 表达，避免在此处直接 `return`/`break` 出主循环——
+/// 这是后续把 round 体整体搬成函数（桌面 IO port 迁移第 2 步）所需的返回约定。
+async fn adjudicate_pre_round(
+    inputs: PreRoundInputs<'_>,
+) -> Result<PreRoundPermit, ChatFlowError> {
+    let run_permit = inputs.executor.begin_persisted_round(
+        is_cancelled(inputs.cancel, inputs.conversation_id),
+        |checkpoint| {
+            persist_desktop_executor_checkpoint(
+                inputs.state,
+                inputs.trace_id,
+                inputs.conversation_id,
+                checkpoint,
+                crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+                inputs.placeholder_msg_id.as_deref(),
+                inputs.max_tool_rounds,
+                inputs.budget_extensions,
+            )
+        },
+    )?;
+    // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
+    if matches!(
+        run_permit,
+        KernelRunPermit::Halt(crate::agent::agent_kernel::KernelRunTermination::DeadlineExceeded)
+    ) {
+        crate::utils::logger::log_event(
+            "task_deadline_hit",
+            serde_json::json!({
+                "conversation_id": inputs.conversation_id,
+                "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+                "tool_runs": inputs.tool_runs.len(),
+                "deadline_ms": inputs.task_deadline_ms,
+            }),
+        );
+        if !inputs.full.is_empty() {
+            persist_turn(
+                inputs.state,
+                inputs.conversation_id,
+                inputs.trace_id,
+                inputs.tool_runs,
+                inputs.full,
+                inputs.reasoning_full,
+                inputs.model,
+                inputs.context_summary,
+                inputs.modified_files,
+                inputs.app,
+                inputs.input_tokens,
+                inputs.output_tokens,
+                inputs.task_started.elapsed().as_millis() as i64,
+                true,
+                inputs.placeholder_msg_id,
+            )
+            .await?;
+        }
+        // 账本持久化：超时停止（任务未完成）→ 保存当前账本（含断点续跑合并）供续跑继承
+        persist_open_ledger_and_emit(
+            inputs.state,
+            inputs.app,
+            inputs.conversation_id,
+            OpenLedgerInputs {
+                task_goal: inputs.task_goal,
+                tool_runs: inputs.tool_runs,
+                last_model_text: inputs.last_model_text,
+                ledger_base_n: inputs.ledger_base_n,
+                prev_ledger: inputs.prev_ledger,
+            },
+        )?;
+        return Ok(PreRoundPermit::Deadline);
+    }
+    // 检查停止请求（安全点：每轮请求前，工具执行完成后会回到这里）
+    if matches!(
+        run_permit,
+        KernelRunPermit::Halt(crate::agent::agent_kernel::KernelRunTermination::UserCancelled)
+    ) {
+        crate::utils::logger::log_event(
+            "stop_effective",
+            serde_json::json!({
+                "phase": "main_loop_top",
+                "conversation_id": inputs.conversation_id,
+                "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+            }),
+        );
+        persist_turn(
+            inputs.state,
+            inputs.conversation_id,
+            inputs.trace_id,
+            inputs.tool_runs,
+            inputs.full,
+            inputs.reasoning_full,
+            inputs.model,
+            inputs.context_summary,
+            inputs.modified_files,
+            inputs.app,
+            inputs.input_tokens,
+            inputs.output_tokens,
+            inputs.task_started.elapsed().as_millis() as i64,
+            true,
+            inputs.placeholder_msg_id,
+        )
+        .await?;
+        // 账本持久化：用户停止（任务未完成）→ 保存当前账本（含断点续跑合并）供续跑继承
+        persist_open_ledger_and_emit(
+            inputs.state,
+            inputs.app,
+            inputs.conversation_id,
+            OpenLedgerInputs {
+                task_goal: inputs.task_goal,
+                tool_runs: inputs.tool_runs,
+                last_model_text: inputs.last_model_text,
+                ledger_base_n: inputs.ledger_base_n,
+                prev_ledger: inputs.prev_ledger,
+            },
+        )?;
+        return Ok(PreRoundPermit::Cancelled);
+    }
+    // 任意已锁定终态都不得穿过 Provider 边界；正常分支会在产生终态的当轮退出，
+    // 此处是防御性吸收态兜底，保留 executor 中的首个精确原因供最终快照审计。
+    if matches!(run_permit, KernelRunPermit::Halt(_)) {
+        return Ok(PreRoundPermit::Locked);
+    }
+    Ok(PreRoundPermit::Proceed)
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -4558,142 +4728,57 @@ async fn stream_chat_inner(
             workflow_stage,
         );
         workflow_stage = Some(workflow.stage);
-        // Provider 请求前共用安全点：run-loop 原子执行持久化与 deadline/cancel 裁决。
-        // 写入受 Worker 租约 fencing；失败时轮次不会推进，也不会发起 Provider IO。
-        let run_permit = kernel_executor.begin_persisted_round(
-            is_cancelled(cancel, &conversation_id),
-            |checkpoint| {
-                persist_desktop_executor_checkpoint(
-                    state,
-                    &trace_id,
-                    &conversation_id,
-                    checkpoint,
-                    crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
-                    placeholder_msg_id.as_deref(),
-                    max_tool_rounds,
-                    budget_extensions,
-                )
-            },
-        )?;
-        // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
-        if matches!(
-            run_permit,
-            KernelRunPermit::Halt(
-                crate::agent::agent_kernel::KernelRunTermination::DeadlineExceeded
-            )
-        ) {
-            crate::utils::logger::log_event(
-                "task_deadline_hit",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "elapsed_ms": task_started.elapsed().as_millis() as i64,
-                    "tool_runs": tool_runs.len(),
-                    "deadline_ms": task_deadline_ms,
-                }),
-            );
-            if !full.is_empty() {
-                persist_turn(
-                    state,
-                    &conversation_id,
-                    &trace_id,
-                    &tool_runs,
-                    &full,
-                    &reasoning_full,
-                    &model_choice.model,
-                    &context_summary,
-                    &modified_files,
-                    app,
-                    stats.input_tokens,
-                    stats.output_tokens,
-                    task_started.elapsed().as_millis() as i64,
-                    true,
-                    &placeholder_msg_id,
-                )
-                .await?;
+        match adjudicate_pre_round(PreRoundInputs {
+            executor: &mut kernel_executor,
+            state,
+            app,
+            cancel,
+            conversation_id: &conversation_id,
+            trace_id: &trace_id,
+            task_goal: &task_goal,
+            task_started,
+            task_deadline_ms,
+            tool_runs: &tool_runs,
+            full: &full,
+            reasoning_full: &reasoning_full,
+            model: &model_choice.model,
+            context_summary: &context_summary,
+            modified_files: &modified_files,
+            last_model_text: &last_model_text,
+            ledger_base_n,
+            prev_ledger: &mut prev_ledger,
+            placeholder_msg_id: &placeholder_msg_id,
+            max_tool_rounds,
+            budget_extensions,
+            input_tokens: stats.input_tokens,
+            output_tokens: stats.output_tokens,
+        })
+        .await?
+        {
+            PreRoundPermit::Proceed => {}
+            PreRoundPermit::Locked => break,
+            PreRoundPermit::Cancelled => {
+                stats.stopped = true;
+                return Ok(());
             }
-            // 账本持久化：超时停止（任务未完成）→ 保存当前账本（含断点续跑合并）供续跑继承
-            persist_open_ledger_and_emit(
-                state,
-                app,
-                &conversation_id,
-                OpenLedgerInputs {
-                    task_goal: &task_goal,
-                    tool_runs: &tool_runs,
-                    last_model_text: &last_model_text,
-                    ledger_base_n,
-                    prev_ledger: &mut prev_ledger,
-                },
-            )?;
-            return Err(ChatFlowError {
-                kind: ErrorKind::Timeout,
-                title: ErrorKind::Timeout.title().to_string(),
-                message: format!(
-                    "任务执行超过 {} 分钟上限，已自动停止",
-                    // 实际 deadline 来自设置页动态配置（agent_limits），超时消息须与之保持一致；
-                    // i64::MAX 表示未配置时长限制，理论不会走到本分支，防御性兜底
-                    if task_deadline_ms == i64::MAX {
-                        "配置的".to_string()
-                    } else {
-                        (task_deadline_ms / 60000).to_string()
-                    }
-                ),
-                suggestion: "请把任务拆分成更小的步骤，或换用更快的模型后重试".to_string(),
-                status_code: None,
-            });
-        }
-        // 检查停止请求（安全点：每轮请求前，工具执行完成后会回到这里）
-        if matches!(
-            run_permit,
-            KernelRunPermit::Halt(
-                crate::agent::agent_kernel::KernelRunTermination::UserCancelled
-            )
-        ) {
-            crate::utils::logger::log_event(
-                "stop_effective",
-                serde_json::json!({
-                    "phase": "main_loop_top",
-                    "conversation_id": conversation_id,
-                    "elapsed_ms": task_started.elapsed().as_millis() as i64,
-                }),
-            );
-            stats.stopped = true;
-            persist_turn(
-                state,
-                &conversation_id,
-                &trace_id,
-                &tool_runs,
-                &full,
-                &reasoning_full,
-                &model_choice.model,
-                &context_summary,
-                &modified_files,
-                app,
-                stats.input_tokens,
-                stats.output_tokens,
-                task_started.elapsed().as_millis() as i64,
-                true,
-                &placeholder_msg_id,
-            )
-            .await?;
-            // 账本持久化：用户停止（任务未完成）→ 保存当前账本（含断点续跑合并）供续跑继承
-            persist_open_ledger_and_emit(
-                state,
-                app,
-                &conversation_id,
-                OpenLedgerInputs {
-                    task_goal: &task_goal,
-                    tool_runs: &tool_runs,
-                    last_model_text: &last_model_text,
-                    ledger_base_n,
-                    prev_ledger: &mut prev_ledger,
-                },
-            )?;
-            return Ok(());
-        }
-        // 任意已锁定终态都不得穿过 Provider 边界；正常分支会在产生终态的当轮退出，
-        // 此处是防御性吸收态兜底，保留 executor 中的首个精确原因供最终快照审计。
-        if matches!(run_permit, KernelRunPermit::Halt(_)) {
-            break;
+            PreRoundPermit::Deadline => {
+                return Err(ChatFlowError {
+                    kind: ErrorKind::Timeout,
+                    title: ErrorKind::Timeout.title().to_string(),
+                    message: format!(
+                        "任务执行超过 {} 分钟上限，已自动停止",
+                        // 实际 deadline 来自设置页动态配置（agent_limits），超时消息须与之保持一致；
+                        // i64::MAX 表示未配置时长限制，理论不会走到本分支，防御性兜底
+                        if task_deadline_ms == i64::MAX {
+                            "配置的".to_string()
+                        } else {
+                            (task_deadline_ms / 60000).to_string()
+                        }
+                    ),
+                    suggestion: "请把任务拆分成更小的步骤，或换用更快的模型后重试".to_string(),
+                    status_code: None,
+                });
+            }
         }
         // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
         if let Some((_, pending_content)) = take_next_queued(state, &conversation_id, true)? {
