@@ -3973,6 +3973,230 @@ fn route_round_outcome(
     Ok(RoundRoutingOutcome::Finish)
 }
 
+/// 单轮请求的结论。
+enum RoundRequestOutcome {
+    /// 已拿到本轮输出（可能来自备用模型）
+    Received(StreamOutcome),
+    /// 上下文超限：已压缩历史并写入水位，本轮重来
+    RetryAfterContextCompression,
+    /// 可恢复错误：已切换到同 Provider 的备用模型，本轮重来
+    RetryAfterFallbackSwitch,
+}
+
+/// `request_round_outcome` 的输入（全部借用）。请求过程中会推进 `model_choice`/`stats`/
+/// `history_limit`/`context_summary`/`used_fallback`/`placeholder_msg_id`，调用方在本轮后续步骤继续持有。
+struct RoundRequestInputs<'a> {
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    registry: &'a TaskRegistry,
+    client: &'a reqwest::Client,
+    protocol: &'a str,
+    provider: &'a ProviderEndpoint,
+    opts: &'a ChatOptions,
+    messages: &'a [serde_json::Value],
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    task_started: std::time::Instant,
+    context_budget: i64,
+    model_choice: &'a mut ModelChoice,
+    stats: &'a mut ChatRunStats,
+    history_limit: &'a mut usize,
+    context_summary: &'a mut Option<String>,
+    used_fallback: &'a mut bool,
+    placeholder_msg_id: &'a mut Option<String>,
+    tool_runs: &'a [ToolRunItem],
+    full: &'a str,
+    reasoning_full: &'a str,
+    modified_files: &'a [String],
+}
+
+/// 单轮 Provider 往返（纯搬运：原主循环内联代码，行为一致）。
+///
+/// 两处 `continue`（上下文超限恢复、备用模型降级）换成 `RoundRequestOutcome` 的两个重试变体，
+/// 由调用方映射回 `continue 'outer`；不可恢复错误仍先保留已有成果入库、再以 `Err` 上抛。
+async fn request_round_outcome(
+    inputs: RoundRequestInputs<'_>,
+) -> Result<RoundRequestOutcome, ChatFlowError> {
+    // 单轮流式请求（发送/状态检查内含指数退避重试）；打点请求开始（消息数/估算 tokens）
+    inputs
+        .registry
+        .touch(inputs.conversation_id, PHASE_ROUND_REQUEST);
+    crate::utils::logger::log_event(
+        "round_request_start",
+        serde_json::json!({
+            "conversation_id": inputs.conversation_id,
+            "round": inputs.tool_runs.len() + 1,
+            "messages": inputs.messages.len(),
+            "est_tokens": estimate_tokens(inputs.messages),
+            "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+        }),
+    );
+    if let Ok(conn) = inputs.state.0.lock() {
+        let _ = crate::agent::runtime::transition(
+            &conn,
+            inputs.trace_id,
+            inputs.conversation_id,
+            "running",
+            "requesting_model",
+            None,
+        );
+    }
+    let outcome = match stream_once(
+        inputs.app,
+        inputs.client,
+        inputs.protocol,
+        inputs.provider,
+        inputs.model_choice,
+        inputs.opts,
+        inputs.messages,
+        inputs.conversation_id,
+        inputs.cancel,
+        inputs.registry,
+        &mut *inputs.stats,
+        inputs.state,
+        &mut *inputs.placeholder_msg_id,
+    )
+    .await
+    {
+        Ok(o) => o,
+        // 上下文超限自动恢复：先把将被裁剪的最旧历史用经济模型压成结构化摘要
+        // （摘要失败时降级为纯裁剪，不阻塞主流程），再裁剪历史后重试
+        Err(e) if e.kind == ErrorKind::ContextOverflow && *inputs.history_limit > MIN_HISTORY_KEEP => {
+            let old_limit = *inputs.history_limit;
+            *inputs.history_limit = (*inputs.history_limit / 2).max(MIN_HISTORY_KEEP);
+            inputs.stats.retry_count += 1;
+            let _ = inputs.app.emit(
+                "chat-context-warning",
+                serde_json::json!({
+                    "conversation_id": inputs.conversation_id,
+                    "kind": "context_overflow_recovery",
+                    "message": "模型上下文已超限，正在对账固定项和事实并压缩历史后重试",
+                }),
+            );
+            crate::utils::logger::log_event(
+                "context_compress",
+                serde_json::json!({
+                    "conversation_id": inputs.conversation_id,
+                    "trigger": "overflow",
+                    "old_limit": old_limit,
+                    "new_limit": *inputs.history_limit,
+                    "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+                }),
+            );
+            if let Some(s) = summarize_rolling_history(
+                inputs.state,
+                inputs.client,
+                inputs.provider,
+                inputs.model_choice,
+                inputs.conversation_id,
+                inputs.context_budget,
+                old_limit,
+                *inputs.history_limit,
+                inputs.context_summary.take(),
+                Some(inputs.cancel),
+            )
+            .await
+            {
+                *inputs.context_summary = Some(s);
+            }
+            let _ = inputs.app.emit(
+                "chat-stream",
+                ChatStreamEvent {
+                    conversation_id: inputs.conversation_id.to_string(),
+                    run_id: inputs.trace_id.to_string(),
+                    delta: format!(
+                        "（上下文超长，已{}后重试，保留最近 {} 条）",
+                        if inputs.context_summary.is_some() {
+                            "压缩早期对话为摘要"
+                        } else {
+                            "精简对话历史"
+                        },
+                        *inputs.history_limit
+                    ),
+                },
+            );
+            // 持久化压缩水位并广播：前端刷新上下文可视条（口径 = 摘要 + 最近 N 条）
+            if let Ok(conn) = inputs.state.0.lock() {
+                let _ = conn.execute(
+                    "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
+                    params![*inputs.history_limit as i64, inputs.conversation_id],
+                );
+                // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
+                crate::agent::context::bump_compress_count(&conn, inputs.conversation_id);
+                // LC-33：压缩事件写入会话事件流（超限恢复同样留痕）
+                let _ = crate::agent::session_events::append_event(
+                    &conn,
+                    inputs.conversation_id,
+                    crate::agent::session_events::SessionEventType::ContextCompress,
+                    serde_json::json!({
+                        "trigger": "overflow",
+                        "old_limit": old_limit,
+                        "new_limit": *inputs.history_limit,
+                    }),
+                    Some(inputs.trace_id),
+                );
+            }
+            let _ = inputs.app.emit(
+                "chat-compact",
+                serde_json::json!({
+                    "conversation_id": inputs.conversation_id,
+                    "keep": *inputs.history_limit,
+                }),
+            );
+            return Ok(RoundRequestOutcome::RetryAfterContextCompression);
+        }
+        Err(e) => {
+            // 可恢复性错误（限流/网络/5xx）→ 自动降级到同 Provider 备用模型重试一次
+            // （配置类错误 401/400 降级无意义；只降级一次防级联）
+            if e.retryable() && !*inputs.used_fallback {
+                let fallback = pick_fallback_model(inputs.state, inputs.model_choice);
+                if let Some(fb) = fallback {
+                    *inputs.used_fallback = true;
+                    let fb_name = fb.model.clone();
+                    *inputs.model_choice = fb;
+                    inputs.stats.model = Some(inputs.model_choice.model.clone());
+                    let _ = inputs.app.emit(
+                        "chat-stream",
+                        ChatStreamEvent {
+                            conversation_id: inputs.conversation_id.to_string(),
+                            run_id: inputs.trace_id.to_string(),
+                            delta: format!(
+                                "（主模型连续失败，已自动切换备用模型 {fb_name} 重试）"
+                            ),
+                        },
+                    );
+                    return Ok(RoundRequestOutcome::RetryAfterFallbackSwitch);
+                }
+            }
+            // 请求失败但任务已有部分成果（文本/工具结果）：先入库保留进展，再返回错误，
+            // 避免半途失败丢失全部工作（前端保留已有内容 + 错误提示）
+            if !inputs.full.trim().is_empty() || !inputs.tool_runs.is_empty() {
+                let _ = persist_turn(
+                    inputs.state,
+                    inputs.conversation_id,
+                    inputs.trace_id,
+                    inputs.tool_runs,
+                    inputs.full,
+                    inputs.reasoning_full,
+                    &inputs.model_choice.model,
+                    inputs.context_summary,
+                    inputs.modified_files,
+                    inputs.app,
+                    inputs.stats.input_tokens,
+                    inputs.stats.output_tokens,
+                    inputs.task_started.elapsed().as_millis() as i64,
+                    true,
+                    inputs.placeholder_msg_id,
+                )
+                .await;
+            }
+            return Err(e.into());
+        }
+    };
+    Ok(RoundRequestOutcome::Received(outcome))
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -5811,178 +6035,36 @@ async fn stream_chat_inner(
             budget_warned: &mut budget_warned,
         })?;
 
-        // 单轮流式请求（发送/状态检查内含指数退避重试）；打点请求开始（消息数/估算 tokens）
-        registry.touch(&conversation_id, PHASE_ROUND_REQUEST);
-        crate::utils::logger::log_event(
-            "round_request_start",
-            serde_json::json!({
-                "conversation_id": conversation_id,
-                "round": tool_runs.len() + 1,
-                "messages": messages.len(),
-                "est_tokens": estimate_tokens(&messages),
-                "elapsed_ms": task_started.elapsed().as_millis() as i64,
-            }),
-        );
-        if let Ok(conn) = state.0.lock() {
-            let _ = crate::agent::runtime::transition(
-                &conn,
-                &trace_id,
-                &conversation_id,
-                "running",
-                "requesting_model",
-                None,
-            );
-        }
-        let outcome = match stream_once(
+        let outcome = match request_round_outcome(RoundRequestInputs {
             app,
-            &client,
-            &protocol,
-            &provider,
-            &model_choice,
-            &opts,
-            &messages,
-            &conversation_id,
+            state,
             cancel,
             registry,
-            stats,
-            state,
-            &mut placeholder_msg_id,
-        )
-        .await
+            client: &client,
+            protocol: &protocol,
+            provider: &provider,
+            opts: &opts,
+            messages: &messages,
+            conversation_id: &conversation_id,
+            trace_id: &trace_id,
+            task_started,
+            context_budget,
+            model_choice: &mut model_choice,
+            stats: &mut *stats,
+            history_limit: &mut history_limit,
+            context_summary: &mut context_summary,
+            used_fallback: &mut used_fallback,
+            placeholder_msg_id: &mut placeholder_msg_id,
+            tool_runs: &tool_runs,
+            full: &full,
+            reasoning_full: &reasoning_full,
+            modified_files: &modified_files,
+        })
+        .await?
         {
-            Ok(o) => o,
-            // 上下文超限自动恢复：先把将被裁剪的最旧历史用经济模型压成结构化摘要
-            // （摘要失败时降级为纯裁剪，不阻塞主流程），再裁剪历史后重试
-            Err(e) if e.kind == ErrorKind::ContextOverflow && history_limit > MIN_HISTORY_KEEP => {
-                let old_limit = history_limit;
-                history_limit = (history_limit / 2).max(MIN_HISTORY_KEEP);
-                stats.retry_count += 1;
-                let _ = app.emit(
-                    "chat-context-warning",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "kind": "context_overflow_recovery",
-                        "message": "模型上下文已超限，正在对账固定项和事实并压缩历史后重试",
-                    }),
-                );
-                crate::utils::logger::log_event(
-                    "context_compress",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "trigger": "overflow",
-                        "old_limit": old_limit,
-                        "new_limit": history_limit,
-                        "elapsed_ms": task_started.elapsed().as_millis() as i64,
-                    }),
-                );
-                if let Some(s) = summarize_rolling_history(
-                    state,
-                    &client,
-                    &provider,
-                    &model_choice,
-                    &conversation_id,
-                    context_budget,
-                    old_limit,
-                    history_limit,
-                    context_summary.take(),
-                    Some(cancel),
-                )
-                .await
-                {
-                    context_summary = Some(s);
-                }
-                let _ = app.emit(
-                    "chat-stream",
-                    ChatStreamEvent {
-                        conversation_id: conversation_id.clone(),
-                        run_id: trace_id.clone(),
-                        delta: format!(
-                            "（上下文超长，已{}后重试，保留最近 {} 条）",
-                            if context_summary.is_some() {
-                                "压缩早期对话为摘要"
-                            } else {
-                                "精简对话历史"
-                            },
-                            history_limit
-                        ),
-                    },
-                );
-                // 持久化压缩水位并广播：前端刷新上下文可视条（口径 = 摘要 + 最近 N 条）
-                if let Ok(conn) = state.0.lock() {
-                    let _ = conn.execute(
-                        "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
-                        params![history_limit as i64, conversation_id],
-                    );
-                    // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
-                    crate::agent::context::bump_compress_count(&conn, &conversation_id);
-                    // LC-33：压缩事件写入会话事件流（超限恢复同样留痕）
-                    let _ = crate::agent::session_events::append_event(
-                        &conn,
-                        &conversation_id,
-                        crate::agent::session_events::SessionEventType::ContextCompress,
-                        serde_json::json!({
-                            "trigger": "overflow",
-                            "old_limit": old_limit,
-                            "new_limit": history_limit,
-                        }),
-                        Some(&trace_id),
-                    );
-                }
-                let _ = app.emit(
-                    "chat-compact",
-                    serde_json::json!({
-                        "conversation_id": conversation_id.clone(),
-                        "keep": history_limit,
-                    }),
-                );
-                continue;
-            }
-            Err(e) => {
-                // 可恢复性错误（限流/网络/5xx）→ 自动降级到同 Provider 备用模型重试一次
-                // （配置类错误 401/400 降级无意义；只降级一次防级联）
-                if e.retryable() && !used_fallback {
-                    if let Some(fb) = pick_fallback_model(state, &model_choice) {
-                        used_fallback = true;
-                        let fb_name = fb.model.clone();
-                        model_choice = fb;
-                        stats.model = Some(model_choice.model.clone());
-                        let _ = app.emit(
-                            "chat-stream",
-                            ChatStreamEvent {
-                                conversation_id: conversation_id.clone(),
-                                run_id: trace_id.clone(),
-                                delta: format!(
-                                    "（主模型连续失败，已自动切换备用模型 {fb_name} 重试）"
-                                ),
-                            },
-                        );
-                        continue;
-                    }
-                }
-                // 请求失败但任务已有部分成果（文本/工具结果）：先入库保留进展，再返回错误，
-                // 避免半途失败丢失全部工作（前端保留已有内容 + 错误提示）
-                if !full.trim().is_empty() || !tool_runs.is_empty() {
-                    let _ = persist_turn(
-                        state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool_runs,
-                        &full,
-                        &reasoning_full,
-                        &model_choice.model,
-                        &context_summary,
-                        &modified_files,
-                        app,
-                        stats.input_tokens,
-                        stats.output_tokens,
-                        task_started.elapsed().as_millis() as i64,
-                        true,
-                        &placeholder_msg_id,
-                    )
-                    .await;
-                }
-                return Err(e.into());
-            }
+            RoundRequestOutcome::Received(outcome) => outcome,
+            RoundRequestOutcome::RetryAfterContextCompression
+            | RoundRequestOutcome::RetryAfterFallbackSwitch => continue 'outer,
         };
         match handle_round_outcome(PostRoundInputs {
             state,
