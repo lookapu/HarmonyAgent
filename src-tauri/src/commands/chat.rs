@@ -2726,6 +2726,36 @@ fn build_rules_text(conn: &rusqlite::Connection, project_id: &str, project_path:
     s
 }
 
+/// 轮前：重算执行阶段快照；阶段相对上一轮变化时写 `workflow.stage` 审计事件。
+/// 返回本轮快照，供后续提示注入（`directive()`）使用。
+///
+/// 桌面 IO port 迁移的第一步（纯搬运，零逻辑改动）：从主循环内联代码搬出，行为一致；
+/// 仍接受 Tauri `State`，端口落地时再统一改签名。
+fn refresh_workflow_stage<'a>(
+    state: &tauri::State<'_, crate::db::DbState>,
+    trace_id: &str,
+    conversation_id: &str,
+    goal_contract: &crate::agent::acceptance::GoalContract,
+    inherited: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
+    tool_runs: &'a [ToolRunItem],
+    previous: Option<crate::agent::execution_loop::LoopStage>,
+) -> crate::agent::execution_loop::ExecutionLoopSnapshot {
+    let workflow_evidence = combined_acceptance_evidence(inherited, tool_runs);
+    let workflow = crate::agent::execution_loop::snapshot(goal_contract, &workflow_evidence);
+    if previous != Some(workflow.stage) {
+        if let Ok(conn) = state.0.lock() {
+            let _ = crate::agent::runtime::append_event(
+                &conn,
+                trace_id,
+                conversation_id,
+                "workflow.stage",
+                serde_json::to_value(&workflow).unwrap_or_default(),
+            );
+        }
+    }
+    workflow
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -4453,24 +4483,16 @@ async fn stream_chat_inner(
                 "history_limit": history_limit,
             }),
         );
-        let workflow_evidence =
-            combined_acceptance_evidence(&inherited_tool_evidence, &tool_runs);
-        let workflow = crate::agent::execution_loop::snapshot(
+        let workflow = refresh_workflow_stage(
+            state,
+            &trace_id,
+            &conversation_id,
             &goal_contract,
-            &workflow_evidence,
+            &inherited_tool_evidence,
+            &tool_runs,
+            workflow_stage,
         );
-        if workflow_stage != Some(workflow.stage) {
-            if let Ok(conn) = state.0.lock() {
-                let _ = crate::agent::runtime::append_event(
-                    &conn,
-                    &trace_id,
-                    &conversation_id,
-                    "workflow.stage",
-                    serde_json::to_value(&workflow).unwrap_or_default(),
-                );
-            }
-            workflow_stage = Some(workflow.stage);
-        }
+        workflow_stage = Some(workflow.stage);
         // Provider 请求前共用安全点：run-loop 原子执行持久化与 deadline/cancel 裁决。
         // 写入受 Worker 租约 fencing；失败时轮次不会推进，也不会发起 Provider IO。
         let run_permit = kernel_executor.begin_persisted_round(
