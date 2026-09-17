@@ -85,12 +85,16 @@ pub fn run_command_grader(grader: &EvalGrader, workspace: &Path) -> Result<Grade
 mod tests {
     use super::*;
 
-    /// 跨平台的“成功/失败”命令：Windows 没有 true/false，改用 cmd 的 exit 码。
+    /// 跨平台的“成功/失败”命令。
+    ///
+    /// 不能用 `cmd /C`：评测器明确拒绝以 shell 解释器开头的命令（安全加固），
+    /// 而 Windows 没有 `true`/`false`。这里用直接程序 + 固定参数：`rustc --version`
+    /// 成功退出，未知参数非零退出；CI 与开发机都装了 rustc（cargo test 本身就在用它）。
     fn exit_command(success: bool) -> Vec<&'static str> {
-        if cfg!(windows) {
-            vec!["cmd", "/C", if success { "exit 0" } else { "exit 1" }]
+        if success {
+            vec!["rustc", "--version"]
         } else {
-            vec![if success { "true" } else { "false" }]
+            vec!["rustc", "--harmony-intentionally-invalid-flag"]
         }
     }
 
