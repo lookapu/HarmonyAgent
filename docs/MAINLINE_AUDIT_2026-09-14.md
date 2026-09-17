@@ -537,3 +537,16 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 验证（Windows 本机）：后端库 1,102 通过 / 8 忽略（macOS 为 1,103/9，差异来自平台门控用例集，非回归）；新增 1 条 javac 参数守卫测试；两组崩溃恢复集成各 3 项通过；`cargo check --lib` 0 警告、`check-warnings.py` 回到 **57/57 通过**；`check-docs.py` 通过。提交：`aaac225`（账本收尾搬运）、`e21c022`（javac 参数守卫）、`716e117`（dart 去 flake）、`0a8226e`（状态页 Windows 证据）、`635a100`（Windows 侧机械类告警清零）。
 
 **未闭环**：macOS 侧本轮改动尚未经 CI 复核（需推送才能跑 `quality.yml`）；路径形态类（符号链接、8.3 短名）与 Windows/Linux 目标编译仍未覆盖。
+
+## 29. 桌面循环轮前段再落两刀：账本收尾合一与许可裁决枚举化（2026-09-17）
+
+沿[headless 驱动文档 §19](./HEADLESS_AGENT_DRIVER.md)的「按段拆」继续做轮前段，两刀都是纯搬运、零逻辑改动，各自一个提交。
+
+- **第三刀：三处逐字相同的账本收尾合一**（`aaac225`）。主循环里超时中断、用户停止、护栏收尾三处各写了一遍「合并续跑账本 → 落库 → 推送 `finished: true`」，收敛为 `persist_open_ledger_and_emit`；空账本守卫改用等价的提前返回表达。账本入参收进 `OpenLedgerInputs`——平铺是 8 个参数，会新增 `clippy::too_many_arguments`（与 §25 同一条教训：结构化，而不是重定基线）。
+- **第四刀：许可裁决搬出主循环并枚举化**（`50186e3`）。`begin_persisted_round` 与三个 Halt 分支整体搬进 `adjudicate_pre_round`，`return`/`break` 换成 `PreRoundPermit`（Proceed / Deadline / Cancelled / Locked），23 项借用收进 `PreRoundInputs`，调用方用一处 `match` 把枚举映射回终态（`Cancelled` 置 `stats.stopped` 后正常返回、`Deadline` 返回 Timeout 错误、`Locked` 跳出循环）。**这一刀的真正价值是返回约定**：round 体内部的 `break`/`continue` 同样可以照此改成枚举返回值——这是第 2 步「提取 round 体」的前置，否则那一步只能靠函数级控制流硬搬。
+
+度量：主循环体 **2,107 → 2,006 行**；`.emit(` 32 → 29 处、`.0.lock()` 22 → 21 处、`kernel_executor.*` 13 → 12 处。
+
+验证（Windows 本机）：后端库 1,102 通过 / 0 失败（macOS 记录为 1,103/9，差异来自平台门控用例集）；两组崩溃恢复集成各 3 项通过；`cargo check --lib` 0 告警、`check-warnings.py` 57/57 通过、`check-docs.py` 通过。
+
+**未闭环**：第 2 步（round 体整体搬运）未开始；第 4 步切换 `KernelIoRunLoop::run(port)` 之前必须有真实桌面手动验收（多轮工具任务 + 中途停止 + 断点续跑），目前无自动化方式覆盖；macOS 侧本批提交仍待 CI 复核。

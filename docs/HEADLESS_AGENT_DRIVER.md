@@ -742,3 +742,9 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 本轮只做调研与回退，未留下任何代码改动。
 
 **进展（2026-09-15）**：第 19 节第 4 条的"按段拆"已落下两刀——`log_task_heartbeat`（轮前心跳打点）与 `refresh_workflow_stage`（轮前阶段快照 + `workflow.stage` 审计事件）抽成函数（+38/−16 纯搬运，调用点语义一致：仅在阶段变化时写事件、快照仍返回给后续提示注入使用）。主循环体随之缩短，验证为后端库 1,103 通过 + 两组 crash E2E 各 3 项 + 0 编译告警 + 两个门禁通过。后续每段按同样方式继续拆（轮前剩余：心跳与许可裁决；轮中：Provider 请求与工具执行；轮后：持久化/账本/提示注入），端口落地时再把这些函数的 Tauri 参数统一替换为端口方法。
+
+**进展（2026-09-17，Windows 本机）**：轮前段再落两刀。第三刀把主循环内**三处逐字相同**的账本收尾（超时中断、用户停止、护栏收尾）收敛为 `persist_open_ledger_and_emit`（`aaac225`），账本入参收进 `OpenLedgerInputs`——平铺是 8 个参数、会新增 `clippy::too_many_arguments`（与盘点 §25 同一条教训）。第四刀是**许可裁决**：`begin_persisted_round` 与三个 Halt 分支整体搬进 `adjudicate_pre_round`，`return`/`break` 换成 `PreRoundPermit` 枚举（Proceed / Deadline / Cancelled / Locked），23 项借用收进 `PreRoundInputs`（`50186e3`）。**这个枚举返回约定正是第 2 步「提取 round 体」需要的前置**：round 体内部的 `break`/`continue` 可以照此改造为枚举返回值，而不是继续依赖函数级控制流。
+
+主循环体 **2,107 → 2,006 行**；`.emit(` 32 → 29 处、`.0.lock()` 22 → 21 处、`kernel_executor.*` 13 → 12 处。两刀均为纯搬运、零逻辑改动，验证：后端库 1,102 通过（Windows 本机；macOS 记录为 1,103，差异来自平台门控用例集）+ 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
+
+**第 2 步（round 体整体搬运）仍未开始**：按本节第 3 条，第 4 步切换 `run(port)` 之前必须有真实桌面手动验收（多轮工具任务 + 中途停止 + 断点续跑），目前没有自动化方式能覆盖这一层。
