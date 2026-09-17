@@ -128,6 +128,12 @@ def self_test() -> None:
 
 
 def main() -> int:
+    # Windows 控制台默认 cp1252：直接 print 中文会抛 UnicodeEncodeError，CI 上只会看到
+    # 编码崩溃而看不到真正的失败明细。显式改用 UTF-8 输出。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     args = sys.argv[1:]
     if "--self-test" in args:
         self_test()

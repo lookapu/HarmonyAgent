@@ -170,7 +170,7 @@ def check_registered(scenario_id: str) -> dict:
     for fixture in FIXTURES:
         if not fixture.exists():
             continue
-        scenarios = json.loads(fixture.read_text())
+        scenarios = json.loads(fixture.read_text(encoding="utf-8", errors="replace"))
         if any(item.get("id") == scenario_id for item in scenarios):
             registered = True
             break
@@ -224,6 +224,12 @@ def self_test() -> None:
 
 
 def main() -> int:
+    # Windows 控制台默认 cp1252：直接 print 中文会抛 UnicodeEncodeError，CI 上只会看到
+    # 编码崩溃而看不到真正的失败明细。显式改用 UTF-8 输出。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="失败样本回流工具（EC-16）")
     parser.add_argument("--validate", metavar="ZIP", help="校验复现包完整性与脱敏状态")
     parser.add_argument("--draft", metavar="ZIP", help="生成评测场景草案")

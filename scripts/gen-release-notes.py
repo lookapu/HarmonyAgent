@@ -38,7 +38,7 @@ ROLLBACK_TEMPLATE = """## 回滚方式
 
 def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
     )
 
 
@@ -51,7 +51,7 @@ def count_tools(repo: Path, ref: str | None) -> int:
             return 0
         source = proc.stdout
     else:
-        source = (repo / path).read_text(errors="replace")
+        source = (repo / path).read_text(encoding="utf-8", errors="replace")
     return len(re.findall(r"^    ToolSpec \{", source, re.M))
 
 
@@ -66,7 +66,7 @@ def migrations_between(repo: Path, prev: str) -> list[dict]:
         comment = ""
         current = repo / rel
         if current.exists():
-            for line in current.read_text(errors="replace").splitlines():
+            for line in current.read_text(encoding="utf-8", errors="replace").splitlines():
                 stripped = line.strip()
                 if stripped.startswith("--"):
                     comment = stripped.lstrip("-").strip()
@@ -81,7 +81,7 @@ def protocol_changes(repo: Path, prev: str) -> list[str]:
 
 
 def changelog_changes(repo: Path, release_tag: str | None) -> str:
-    text = (repo / "CHANGELOG.md").read_text(errors="replace")
+    text = (repo / "CHANGELOG.md").read_text(encoding="utf-8", errors="replace")
     if release_tag:
         match = re.search(
             rf"^##\s+{re.escape(release_tag)}(?:\s+[^\n]*)?\n(.*?)(?=^##\s+|\Z)",
@@ -95,7 +95,7 @@ def changelog_changes(repo: Path, release_tag: str | None) -> str:
 
 
 def asset_version_table(repo: Path) -> str:
-    text = (repo / VERSION_DOC).read_text(errors="replace")
+    text = (repo / VERSION_DOC).read_text(encoding="utf-8", errors="replace")
     lines = []
     for line in text.splitlines():
         if line.startswith("| 数据库 |") or line.startswith("| 工具协议 |") \
@@ -228,6 +228,12 @@ def self_test() -> None:
 
 
 def main() -> int:
+    # Windows 控制台默认 cp1252：直接 print 中文会抛 UnicodeEncodeError，CI 上只会看到
+    # 编码崩溃而看不到真正的失败明细。显式改用 UTF-8 输出。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="发布说明自动汇总（EC-17）")
     parser.add_argument("--repo", default=".", help="仓库路径")
     parser.add_argument("--prev-tag", help="基线标签（默认 git describe）")

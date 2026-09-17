@@ -234,6 +234,22 @@ fn attach_rlimit(_cmd: &mut tokio::process::Command, _name: &'static str, _value
 mod tests {
     use super::*;
 
+    /// 跨平台的 echo 命令：Windows 用 `cmd /C echo`，其它平台用 `/bin/echo`。
+    /// （这两个测试验证的是限额施加/不施加时命令仍能正常执行，不应绑定 unix 路径。）
+    fn echo_command(args: &[&str]) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "cmd".to_string(),
+                vec!["/C".to_string(), format!("echo {}", args.join(" "))],
+            )
+        } else {
+            (
+                "/bin/echo".to_string(),
+                args.iter().map(|value| value.to_string()).collect(),
+            )
+        }
+    }
+
     fn spec_limits(cpu_seconds: u64, memory_mb: u64) -> ResourceLimits {
         ResourceLimits {
             cpu_seconds,
@@ -335,7 +351,8 @@ mod tests {
     /// 地址空间限额：只在平台接受时声明已应用，否则如实进 skipped。
     #[tokio::test]
     async fn memory_limit_is_reported_according_to_platform_support() {
-        let mut cmd = crate::utils::process::command("/bin/echo", &[]).expect("echo 可用");
+        let (program, args) = echo_command(&[]);
+        let mut cmd = crate::utils::process::command(&program, &args).expect("echo 可用");
         let report = apply(
             &mut cmd,
             &NativeLimits {
@@ -387,8 +404,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_limits_means_no_report_and_no_wrapping() {
-        let mut cmd =
-            crate::utils::process::command("/bin/echo", &["ok".to_string()]).expect("echo 可用");
+        let (program, args) = echo_command(&["ok"]);
+        let mut cmd = crate::utils::process::command(&program, &args).expect("echo 可用");
         let report = apply(&mut cmd, &NativeLimits::default());
         assert!(report.is_empty());
         let output = cmd.output().await.expect("命令仍应正常执行");
