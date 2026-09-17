@@ -3390,6 +3390,364 @@ fn enforce_budget_gate(inputs: BudgetGateInputs<'_>) -> Result<(), ChatFlowError
     Ok(())
 }
 
+/// 组装段的结论。
+enum AssembleOutcome {
+    /// 消息已组装好：带上本轮要发给 Provider 的消息序列
+    Ready { messages: Vec<serde_json::Value> },
+    /// 已压缩历史并按更小的 `history_limit` 重新准备：回到循环顶部重新组装
+    RestartRound,
+}
+
+/// `assemble_round` 的输入（全部借用）。`messages` 是每轮局部，因此作为返回值传出；
+/// 其余跨段状态按借用推进，调用方继续持有。
+struct AssembleInputs<'a> {
+    state: &'a tauri::State<'a, DbState>,
+    app: &'a AppHandle,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    client: &'a reqwest::Client,
+    provider: &'a ProviderEndpoint,
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    task_started: std::time::Instant,
+    project_path: &'a str,
+    context_budget: i64,
+    model_choice: &'a ModelChoice,
+    system_prompt: &'a str,
+    system_prompt_core: &'a str,
+    workflow: &'a crate::agent::execution_loop::ExecutionLoopSnapshot,
+    protocol: &'a str,
+    images: &'a Option<Vec<String>>,
+    task_goal: &'a str,
+    tool_runs: &'a [ToolRunItem],
+    last_model_text: &'a str,
+    ledger_base_n: u32,
+    prev_ledger: &'a Option<TaskLedger>,
+    confirmed_plan: &'a Option<String>,
+    continuation_text: &'a str,
+    seam_count: &'a mut u32,
+    history_limit: &'a mut usize,
+    context_summary: &'a mut Option<String>,
+    images_attached: &'a mut usize,
+    continuation_reasoning_only: &'a mut bool,
+    correction_text: &'a mut String,
+    correction_hint: &'a mut String,
+    merged_instructions: &'a mut Vec<String>,
+    tools_since_progress: &'a mut u32,
+    replan_instruction: &'a mut Option<String>,
+}
+
+/// 轮中组装（纯搬运：原主循环内联代码，行为一致）。
+///
+/// 顺序原样保留：挂起消息并入 → 预读（历史行/账本/工具结果/注入）→ assembler 组装 →
+/// 压缩决策（命中则缩小 `history_limit` 并返回 `RestartRound`，调用方回循环顶部重装）→
+/// 组装后重置续写/纠正状态与 seam 计数 → 账本实时推送与落库 → 会话快照与 Context V2 检查点。
+async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, ChatFlowError> {
+    // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
+    if let Some((_, pending_content)) = take_next_queued(inputs.state, inputs.conversation_id, true)?
+    {
+        inputs.merged_instructions.push(pending_content);
+        let _ = inputs.app.emit(
+            "chat-stream",
+            ChatStreamEvent {
+                conversation_id: inputs.conversation_id.to_string(),
+                run_id: inputs.trace_id.to_string(),
+                delta: "\n\n> 📌 已收到你的新指令，Agent 将在当前步骤完成后处理。".to_string(),
+            },
+        );
+    }
+    // 组装消息：系统提示 + 历史（最近 history_limit 条，含 tool）+ 已执行工具结果
+    // 接缝审计 + 刷新频率分级：完整提示（含低频项目上下文/知识库）每 FULL_HINT_EVERY_ROUNDS
+    // 轮刷新一次，中间轮只带核心规则；任务账本每轮注入（账本=当前状态，接缝处刷新保证连续性）
+    let prompt_now = if inputs.seam_count.is_multiple_of(FULL_HINT_EVERY_ROUNDS) {
+        inputs.system_prompt
+    } else {
+        inputs.system_prompt_core
+    };
+
+    // IO 层：预读所有数据供 assembler 拼装
+    let memo_replay = {
+        let conn = inputs.state.0.lock().ok();
+        conn.as_ref()
+            .and_then(|c| replay_memories(c, inputs.conversation_id))
+    };
+
+    let context_hint = inputs.state.0.lock().ok().and_then(|conn| {
+        crate::agent::context::load_context_v2(&conn, inputs.conversation_id, inputs.context_budget)
+            .ok()
+            .and_then(|context| crate::agent::context::render_context_hint(&context))
+    });
+
+    // 任务账本（同时构造 ledger_now 供事件推送和快照保存）
+    let (ledger_hint, ledger_now) =
+        if !inputs.tool_runs.is_empty() || !inputs.last_model_text.is_empty() {
+            let ledger = TaskLedger::from_tool_runs(
+                inputs.task_goal,
+                inputs.tool_runs,
+                inputs.last_model_text,
+                inputs.ledger_base_n,
+            );
+            (Some(ledger.to_hint()), Some(ledger))
+        } else if let Some(prev) = inputs.prev_ledger {
+            (
+                Some(format!(
+                    "## 上一任务账本（任务未完成，本次继续推进；续跑期间按新执行轨迹更新）\n{}",
+                    prev.to_hint()
+                )),
+                Some(prev.clone()),
+            )
+        } else {
+            (None, None)
+        };
+
+    // 历史行：从 DB 读取并转换为 HistoryRow
+    let raw_history = {
+        let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT role, content, references_json, reasoning FROM messages
+                 WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0 AND hidden = 0
+                 ORDER BY created_at DESC LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![inputs.conversation_id, *inputs.history_limit as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let raw_history: Vec<(String, String, Option<String>, Option<String>)> =
+            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+        drop(stmt);
+        drop(conn);
+
+        raw_history
+    };
+    let mut history_rows = Vec::with_capacity(raw_history.len());
+    for (role, text, refs_json, reasoning) in raw_history.into_iter().rev() {
+        // @ 引用需要文件/DB IO，因此在纯策略 assembler 外预先展开。
+        let content = if role == "user" && refs_json.is_some() {
+            let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
+            inject_references(&conn, inputs.project_path, &text, refs_json.as_deref())?
+        } else {
+            text
+        };
+        history_rows.push(HistoryRow {
+            role,
+            content,
+            references_json: refs_json,
+            reasoning,
+        });
+    }
+
+    // 本轮已执行的工具结果
+    let tool_results: Vec<ToolResult> = inputs
+        .tool_runs
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let out_guard = crate::agent::tools::sanitize_tool_output(&item.output);
+            let limit = if i + 2 >= inputs.tool_runs.len() {
+                TOOL_RESULT_RECENT_LIMIT
+            } else {
+                TOOL_RESULT_OLD_LIMIT
+            };
+            let cnt = out_guard.chars().count();
+            let out_final: String = if cnt > limit {
+                let head: String = out_guard.chars().take(limit / 2).collect();
+                let tail_len = limit - limit / 2;
+                let tail: String = out_guard.chars().skip(cnt - tail_len).collect();
+                format!("{head}\n\u{2026}(输出过长，中段已省略，共 {cnt} 字符)\u{2026}\n{tail}")
+            } else {
+                out_guard
+            };
+            ToolResult {
+                tool: item.tool.clone(),
+                output: out_final,
+            }
+        })
+        .collect();
+
+    // 用户注入集合
+    // 一次性注入先并入持久到“请求成功”为止的队列；主动压缩重组消息时不能丢失。
+    for msg in crate::agent::session_ctx::drain_injected(inputs.conversation_id) {
+        inputs.merged_instructions.push(msg);
+    }
+    if inputs.confirmed_plan.is_some() && *inputs.tools_since_progress >= 3 {
+        *inputs.tools_since_progress = 0;
+        inputs.merged_instructions.push(
+            "（执行对照：请对照上方\"已批准任务计划\"，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）".to_string(),
+        );
+    }
+    if let Some(p) = inputs.replan_instruction.take() {
+        inputs.merged_instructions.push(p);
+    }
+    let user_injections = inputs
+        .merged_instructions
+        .iter()
+        .cloned()
+        .map(|content| UserInjection { content })
+        .collect();
+
+    // 调用 assembler 组装消息序列（纯策略，无 IO）
+    let supports_image = {
+        let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
+        model_supports_image(&conn, &inputs.model_choice.provider_id, &inputs.model_choice.model)
+    };
+    let assembled = KernelHistoryAssembler::assemble(&KernelHistoryInput {
+        system_prompt: prompt_now,
+        memo_replay: memo_replay.as_deref(),
+        context_hint: context_hint.as_deref(),
+        workflow_directive: &inputs.workflow.directive(),
+        ledger_hint: ledger_hint.as_deref(),
+        compression_summary: inputs.context_summary.as_deref(),
+        confirmed_plan: inputs.confirmed_plan.as_deref(),
+        history_rows,
+        tool_results,
+        user_injections,
+        continuation_text: inputs.continuation_text,
+        continuation_reasoning_only: *inputs.continuation_reasoning_only,
+        correction_text: inputs.correction_text,
+        correction_hint: inputs.correction_hint,
+        inject_progress_check: false, // progress check already collected in user_injections
+        images: inputs.images.as_ref(),
+        images_attached: *inputs.images_attached,
+        protocol: inputs.protocol,
+        supports_image,
+        context_budget: inputs.context_budget,
+        history_limit: *inputs.history_limit,
+    });
+    let messages = assembled.messages;
+    let next_images_attached = assembled.images_attached;
+
+    // E3：压缩决策——assembler 已判断是否需要压缩，adapter 执行实际压缩
+    if assembled.compress {
+        let old_limit = *inputs.history_limit;
+        *inputs.history_limit = (*inputs.history_limit / 2).max(MIN_HISTORY_KEEP);
+        let _ = inputs.app.emit(
+            "chat-context-warning",
+            serde_json::json!({
+                "conversation_id": inputs.conversation_id,
+                "kind": "compression_imminent",
+                "message": "上下文使用超过 85%，正在保留固定项和结构化事实后压缩早期历史",
+            }),
+        );
+        crate::utils::logger::log_event(
+            "context_compress",
+            serde_json::json!({
+                "conversation_id": inputs.conversation_id,
+                "trigger": "active",
+                "old_limit": old_limit,
+                "new_limit": *inputs.history_limit,
+                "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+            }),
+        );
+        if let Some(s) = summarize_rolling_history(
+            inputs.state,
+            inputs.client,
+            inputs.provider,
+            inputs.model_choice,
+            inputs.conversation_id,
+            inputs.context_budget,
+            old_limit,
+            *inputs.history_limit,
+            inputs.context_summary.take(),
+            Some(inputs.cancel),
+        )
+        .await
+        {
+            *inputs.context_summary = Some(s);
+        }
+        let _ = inputs.app.emit(
+            "chat-stream",
+            ChatStreamEvent {
+                conversation_id: inputs.conversation_id.to_string(),
+                run_id: inputs.trace_id.to_string(),
+                delta: format!(
+                    "（上下文接近模型窗口上限，已压缩早期对话为摘要，保留最近 {} 条）",
+                    *inputs.history_limit
+                ),
+            },
+        );
+        // 持久化压缩水位并广播：前端刷新上下文可视条（口径 = 摘要 + 最近 N 条）
+        if let Ok(conn) = inputs.state.0.lock() {
+            let _ = conn.execute(
+                "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
+                params![*inputs.history_limit as i64, inputs.conversation_id],
+            );
+            crate::agent::context::bump_compress_count(&conn, inputs.conversation_id);
+            let _ = crate::agent::session_events::append_event(
+                &conn,
+                inputs.conversation_id,
+                crate::agent::session_events::SessionEventType::ContextCompress,
+                serde_json::json!({
+                    "trigger": "active",
+                    "old_limit": old_limit,
+                    "new_limit": *inputs.history_limit,
+                }),
+                Some(inputs.trace_id),
+            );
+        }
+        let _ = inputs.app.emit(
+            "chat-compact",
+            serde_json::json!({
+                "conversation_id": inputs.conversation_id,
+                "keep": *inputs.history_limit,
+            }),
+        );
+        // 使用缩小后的 history_limit 和新摘要重新组装；一次性注入、图片和续写状态
+        // 尚未发给 Provider，因此都保留到下一次实际请求成功。
+        return Ok(AssembleOutcome::RestartRound);
+    }
+
+    *inputs.images_attached = next_images_attached;
+    // 重置续写/纠正状态（assembler 已消费）
+    *inputs.continuation_reasoning_only = false;
+    *inputs.correction_text = String::new();
+    *inputs.correction_hint = String::new();
+
+    *inputs.seam_count += 1;
+    // 账本实时推送（前端"任务账本"卡）：每轮刷新当前执行轨迹派生账本
+    if let Some(ref ledger_now) = ledger_now {
+        // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
+        // 应用崩溃、系统重启或看门狗强杀时，下一次任务仍能从最近一次
+        // 已执行工具及下一步继续，避免复杂任务回到起点。
+        save_task_ledger(inputs.state, inputs.conversation_id, Some(ledger_now))?;
+        let _ = inputs.app.emit(
+            "chat-ledger",
+            ChatLedgerEvent {
+                conversation_id: inputs.conversation_id.to_string(),
+                ledger: Some(ledger_now.clone()),
+                finished: false,
+            },
+        );
+    }
+    // 会话快照（时间旅行）：每轮执行后保存状态锚点（消息 rowid + 账本 + 摘要），
+    // 用户可"回到此处"从历史决策点重新引导；无执行痕迹的首轮不保存。
+    // 失败不阻塞主循环（快照是增值能力，丢一轮无碍）
+    {
+        let Ok(conn) = inputs.state.0.lock() else { return Err("数据库锁不可用".into()) };
+        let _ = save_conversation_snapshot(
+            &conn,
+            inputs.conversation_id,
+            ledger_now.as_ref(),
+            inputs.last_model_text,
+            inputs.tool_runs.len(),
+        );
+        // Context V2 检查点是可重建投影：保存任务状态、摘要覆盖游标和预算。
+        // 失败不阻断聊天主循环，旧消息/Run/事件仍是恢复真源。
+        let _ = crate::agent::context::persist_runtime_checkpoint(
+            &conn,
+            inputs.conversation_id,
+            Some(inputs.trace_id),
+            inputs.context_summary.as_deref(),
+            *inputs.history_limit,
+            inputs.context_budget,
+        );
+    }
+
+    Ok(AssembleOutcome::Ready { messages })
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -5174,294 +5532,46 @@ async fn stream_chat_inner(
                 });
             }
         }
-        // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
-        if let Some((_, pending_content)) = take_next_queued(state, &conversation_id, true)? {
-            merged_instructions.push(pending_content);
-            let _ = app.emit(
-                "chat-stream",
-                ChatStreamEvent {
-                    conversation_id: conversation_id.clone(),
-                    run_id: trace_id.clone(),
-                    delta: "\n\n> 📌 已收到你的新指令，Agent 将在当前步骤完成后处理。".to_string(),
-                },
-            );
-        }
-        // 组装消息：系统提示 + 历史（最近 history_limit 条，含 tool）+ 已执行工具结果
-        // 接缝审计 + 刷新频率分级：完整提示（含低频项目上下文/知识库）每 FULL_HINT_EVERY_ROUNDS
-        // 轮刷新一次，中间轮只带核心规则；任务账本每轮注入（账本=当前状态，接缝处刷新保证连续性）
-        let prompt_now = if seam_count.is_multiple_of(FULL_HINT_EVERY_ROUNDS) {
-            &system_prompt
-        } else {
-            &system_prompt_core
-        };
-        
-        // IO 层：预读所有数据供 assembler 拼装
-        let memo_replay = {
-            let conn = state.0.lock().ok();
-            conn.as_ref().and_then(|c| replay_memories(c, &conversation_id))
-        };
-        
-        let context_hint = state.0.lock().ok().and_then(|conn| {
-            crate::agent::context::load_context_v2(&conn, &conversation_id, context_budget)
-                .ok()
-                .and_then(|context| crate::agent::context::render_context_hint(&context))
-        });
-        
-        // 任务账本（同时构造 ledger_now 供事件推送和快照保存）
-        let (ledger_hint, ledger_now) = if !tool_runs.is_empty() || !last_model_text.is_empty() {
-            let ledger = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
-            (Some(ledger.to_hint()), Some(ledger))
-        } else if let Some(prev) = &prev_ledger {
-            (
-                Some(format!(
-                    "## 上一任务账本（任务未完成，本次继续推进；续跑期间按新执行轨迹更新）\n{}",
-                    prev.to_hint()
-                )),
-                Some(prev.clone())
-            )
-        } else {
-            (None, None)
-        };
-        
-        // 历史行：从 DB 读取并转换为 HistoryRow
-        let raw_history = {
-            let conn = state.0.lock().map_err(|e| e.to_string())?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT role, content, references_json, reasoning FROM messages
-                     WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0 AND hidden = 0
-                     ORDER BY created_at DESC LIMIT ?2",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![&conversation_id, history_limit as i64],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?)),
-                )
-                .map_err(|e| e.to_string())?;
-            let raw_history: Vec<(String, String, Option<String>, Option<String>)> =
-                rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-            drop(stmt);
-            drop(conn);
-            
-            raw_history
-        };
-        let mut history_rows = Vec::with_capacity(raw_history.len());
-        for (role, text, refs_json, reasoning) in raw_history.into_iter().rev() {
-            // @ 引用需要文件/DB IO，因此在纯策略 assembler 外预先展开。
-            let content = if role == "user" && refs_json.is_some() {
-                let conn = state.0.lock().map_err(|e| e.to_string())?;
-                inject_references(&conn, &project_path, &text, refs_json.as_deref())?
-            } else {
-                text
-            };
-            history_rows.push(HistoryRow {
-                role,
-                content,
-                references_json: refs_json,
-                reasoning,
-            });
-        }
-        
-        // 本轮已执行的工具结果
-        let tool_results: Vec<ToolResult> = tool_runs.iter().enumerate().map(|(i, item)| {
-            let out_guard = crate::agent::tools::sanitize_tool_output(&item.output);
-            let limit = if i + 2 >= tool_runs.len() {
-                TOOL_RESULT_RECENT_LIMIT
-            } else {
-                TOOL_RESULT_OLD_LIMIT
-            };
-            let cnt = out_guard.chars().count();
-            let out_final: String = if cnt > limit {
-                let head: String = out_guard.chars().take(limit / 2).collect();
-                let tail_len = limit - limit / 2;
-                let tail: String = out_guard.chars().skip(cnt - tail_len).collect();
-                format!("{head}\n\u{2026}(输出过长，中段已省略，共 {cnt} 字符)\u{2026}\n{tail}")
-            } else {
-                out_guard
-            };
-            ToolResult {
-                tool: item.tool.clone(),
-                output: out_final,
-            }
-        }).collect();
-        
-        // 用户注入集合
-        // 一次性注入先并入持久到“请求成功”为止的队列；主动压缩重组消息时不能丢失。
-        for msg in crate::agent::session_ctx::drain_injected(&conversation_id) {
-            merged_instructions.push(msg);
-        }
-        if confirmed_plan.is_some() && tools_since_progress >= 3 {
-            tools_since_progress = 0;
-            merged_instructions.push(
-                "（执行对照：请对照上方\"已批准任务计划\"，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）".to_string(),
-            );
-        }
-        if let Some(p) = replan_instruction.take() {
-            merged_instructions.push(p);
-        }
-        let user_injections = merged_instructions
-            .iter()
-            .cloned()
-            .map(|content| UserInjection { content })
-            .collect();
-        
-        // 调用 assembler 组装消息序列（纯策略，无 IO）
-        let supports_image = {
-            let conn = state.0.lock().map_err(|e| e.to_string())?;
-            model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
-        };
-        let assembled = KernelHistoryAssembler::assemble(&KernelHistoryInput {
-            system_prompt: prompt_now,
-            memo_replay: memo_replay.as_deref(),
-            context_hint: context_hint.as_deref(),
-            workflow_directive: &workflow.directive(),
-            ledger_hint: ledger_hint.as_deref(),
-            compression_summary: context_summary.as_deref(),
-            confirmed_plan: confirmed_plan.as_deref(),
-            history_rows,
-            tool_results,
-            user_injections,
-            continuation_text: &continuation_text,
-            continuation_reasoning_only,
-            correction_text: &correction_text,
-            correction_hint: &correction_hint,
-            inject_progress_check: false, // progress check already collected in user_injections
-            images: images.as_ref(),
-            images_attached,
-            protocol: &protocol,
-            supports_image,
+        let mut messages = match assemble_round(AssembleInputs {
+            state,
+            app,
+            cancel,
+            client: &client,
+            provider: &provider,
+            conversation_id: &conversation_id,
+            trace_id: &trace_id,
+            task_started,
+            project_path: &project_path,
             context_budget,
-            history_limit,
-        });
-        let mut messages = assembled.messages;
-        let next_images_attached = assembled.images_attached;
-        
-        // E3：压缩决策——assembler 已判断是否需要压缩，adapter 执行实际压缩
-        if assembled.compress {
-            let old_limit = history_limit;
-            history_limit = (history_limit / 2).max(MIN_HISTORY_KEEP);
-            let _ = app.emit(
-                "chat-context-warning",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "kind": "compression_imminent",
-                    "message": "上下文使用超过 85%，正在保留固定项和结构化事实后压缩早期历史",
-                }),
-            );
-            crate::utils::logger::log_event(
-                "context_compress",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "trigger": "active",
-                    "old_limit": old_limit,
-                    "new_limit": history_limit,
-                    "elapsed_ms": task_started.elapsed().as_millis() as i64,
-                }),
-            );
-            if let Some(s) = summarize_rolling_history(
-                state,
-                &client,
-                &provider,
-                &model_choice,
-                &conversation_id,
-                context_budget,
-                old_limit,
-                history_limit,
-                context_summary.take(),
-                Some(cancel),
-            )
-            .await
-            {
-                context_summary = Some(s);
-            }
-            let _ = app.emit(
-                "chat-stream",
-                ChatStreamEvent {
-                    conversation_id: conversation_id.clone(),
-                    run_id: trace_id.clone(),
-                    delta: format!(
-                        "（上下文接近模型窗口上限，已压缩早期对话为摘要，保留最近 {} 条）",
-                        history_limit
-                    ),
-                },
-            );
-            // 持久化压缩水位并广播：前端刷新上下文可视条（口径 = 摘要 + 最近 N 条）
-            if let Ok(conn) = state.0.lock() {
-                let _ = conn.execute(
-                    "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
-                    params![history_limit as i64, conversation_id],
-                );
-                crate::agent::context::bump_compress_count(&conn, &conversation_id);
-                let _ = crate::agent::session_events::append_event(
-                    &conn,
-                    &conversation_id,
-                    crate::agent::session_events::SessionEventType::ContextCompress,
-                    serde_json::json!({
-                        "trigger": "active",
-                        "old_limit": old_limit,
-                        "new_limit": history_limit,
-                    }),
-                    Some(&trace_id),
-                );
-            }
-            let _ = app.emit(
-                "chat-compact",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "keep": history_limit,
-                }),
-            );
-            // 使用缩小后的 history_limit 和新摘要重新组装；一次性注入、图片和续写状态
-            // 尚未发给 Provider，因此都保留到下一次实际请求成功。
-            continue 'outer;
-        }
-
-        images_attached = next_images_attached;
-        // 重置续写/纠正状态（assembler 已消费）
-        continuation_reasoning_only = false;
-        correction_text = String::new();
-        correction_hint = String::new();
-        
-        seam_count += 1;
-        // 账本实时推送（前端"任务账本"卡）：每轮刷新当前执行轨迹派生账本
-        if let Some(ref ledger_now) = ledger_now {
-            // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
-            // 应用崩溃、系统重启或看门狗强杀时，下一次任务仍能从最近一次
-            // 已执行工具及下一步继续，避免复杂任务回到起点。
-            save_task_ledger(state, &conversation_id, Some(ledger_now))?;
-            let _ = app.emit(
-                "chat-ledger",
-                ChatLedgerEvent {
-                    conversation_id: conversation_id.clone(),
-                    ledger: Some(ledger_now.clone()),
-                    finished: false,
-                },
-            );
-        }
-        // 会话快照（时间旅行）：每轮执行后保存状态锚点（消息 rowid + 账本 + 摘要），
-        // 用户可"回到此处"从历史决策点重新引导；无执行痕迹的首轮不保存。
-        // 失败不阻塞主循环（快照是增值能力，丢一轮无碍）
+            model_choice: &model_choice,
+            system_prompt: &system_prompt,
+            system_prompt_core: &system_prompt_core,
+            workflow: &workflow,
+            protocol: &protocol,
+            images: &images,
+            task_goal: &task_goal,
+            tool_runs: &tool_runs,
+            last_model_text: &last_model_text,
+            ledger_base_n,
+            prev_ledger: &prev_ledger,
+            confirmed_plan: &confirmed_plan,
+            continuation_text: &continuation_text,
+            seam_count: &mut seam_count,
+            history_limit: &mut history_limit,
+            context_summary: &mut context_summary,
+            images_attached: &mut images_attached,
+            continuation_reasoning_only: &mut continuation_reasoning_only,
+            correction_text: &mut correction_text,
+            correction_hint: &mut correction_hint,
+            merged_instructions: &mut merged_instructions,
+            tools_since_progress: &mut tools_since_progress,
+            replan_instruction: &mut replan_instruction,
+        })
+        .await?
         {
-            let Ok(conn) = state.0.lock() else { return Err("数据库锁不可用".into()) };
-            let _ = save_conversation_snapshot(
-                &conn,
-                &conversation_id,
-                ledger_now.as_ref(),
-                &last_model_text,
-                tool_runs.len(),
-            );
-            // Context V2 检查点是可重建投影：保存任务状态、摘要覆盖游标和预算。
-            // 失败不阻断聊天主循环，旧消息/Run/事件仍是恢复真源。
-            let _ = crate::agent::context::persist_runtime_checkpoint(
-                &conn,
-                &conversation_id,
-                Some(&trace_id),
-                context_summary.as_deref(),
-                history_limit,
-                context_budget,
-            );
-        }
+            AssembleOutcome::Ready { messages } => messages,
+            AssembleOutcome::RestartRound => continue 'outer,
+        };
 
         enforce_budget_gate(BudgetGateInputs {
             state,
