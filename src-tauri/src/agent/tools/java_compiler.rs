@@ -228,23 +228,28 @@ fn write_source(file: &Path, source: &str) -> Result<(), String> {
     std::fs::write(file, source).map_err(|error| format!("写入 javac 候选源码失败：{error}"))
 }
 
-/// 编译显式给出的源文件集合；返回归一化后的诊断签名（空 = 无错），`None` 表示超时。
-/// `shadow_root` 是本次候选/基线各自的源码根，用于把诊断里的绝对路径还原成相对路径。
-fn compile(
+/// 组装 javac 参数。单独成函数只为让「源码编码 / 诊断语言」这两个跨平台关键参数
+/// 有一个确定性测试落点（见 `javac_args_pin_source_encoding_and_diagnostics_language`）——
+/// 它不能依赖本机 javac 版本的默认编码，否则同一份代码会在不同机器上判定不同。
+fn javac_args(
     files: &[PathBuf],
     affected: &[PathBuf],
     shadow_root: &Path,
     roots: &[PathBuf],
     out: &Path,
-) -> Result<Option<Vec<String>>, String> {
+) -> Vec<String> {
     let mut args = vec![
         "-proc:none".to_string(),
         "-nowarn".to_string(),
         "-implicit:none".to_string(),
         "-Xmaxerrs".to_string(),
         MAX_DIAGNOSTICS.to_string(),
-        // 源码是 UTF-8：Windows 上 javac 默认按平台编码（cp1252）读源文件，
-        // 会把中文注释/字符串解成乱码并报出与基线不同的诊断（实测 CI 上误判为新增错误）
+        // 源码是 UTF-8：Windows 上 javac 默认按平台编码读源文件（中文 Windows 为 GBK、
+        // 英文 CI runner 为 cp1252），中文注释/字符串会被误解码并报出与基线不同的诊断。
+        // 实测：随包分发的 Temurin 17 上不带该参数时，UTF-8 中文源码即报
+        // `unmappable character (0xB2) for encoding GBK`，加上后编译干净。
+        // JDK ≥ 18 的 file.encoding 已是 UTF-8，该参数在那些机器上冗余但无害；
+        // 随包 JDK 17 上必需，不要以「冗余」为由删除。
         "-encoding".to_string(),
         "UTF-8".to_string(),
         // 锁定英文诊断：默认 locale 下消息会本地化，差分结果随环境漂移
@@ -262,6 +267,19 @@ fn compile(
     for file in files.iter().chain(affected.iter()) {
         args.push(file.to_string_lossy().to_string());
     }
+    args
+}
+
+/// 编译显式给出的源文件集合；返回归一化后的诊断签名（空 = 无错），`None` 表示超时。
+/// `shadow_root` 是本次候选/基线各自的源码根，用于把诊断里的绝对路径还原成相对路径。
+fn compile(
+    files: &[PathBuf],
+    affected: &[PathBuf],
+    shadow_root: &Path,
+    roots: &[PathBuf],
+    out: &Path,
+) -> Result<Option<Vec<String>>, String> {
+    let args = javac_args(files, affected, shadow_root, roots, out);
     let captured = crate::utils::process::output_stderr_blocking_with_timeout(
         "javac",
         &args,
@@ -441,6 +459,32 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// 源码编码与诊断语言必须显式钉住，且不能依赖本机 javac 的默认值：Windows 上 javac
+    /// 按平台编码读源码（中文 Windows 为 GBK、英文 CI runner 为 cp1252），本机实测随包
+    /// Temurin 17 不带 `-encoding UTF-8` 时 UTF-8 中文源码即报 `unmappable character`。
+    /// JDK ≥ 18 默认已是 UTF-8，该参数在那些机器上冗余但无害，随包 JDK 17 上必需——
+    /// 所以断言参数本身，而不是依赖某台机器上 javac 的默认行为。
+    #[test]
+    fn javac_args_pin_source_encoding_and_diagnostics_language() {
+        let args = javac_args(
+            &[PathBuf::from("A.java")],
+            &[],
+            Path::new("/tmp/harmony-javac-shadow"),
+            &[],
+            Path::new("/tmp/harmony-javac-out"),
+        );
+        let index = args
+            .iter()
+            .position(|arg| arg == "-encoding")
+            .expect("必须显式指定源码编码");
+        assert_eq!(args[index + 1], "UTF-8");
+        assert!(
+            args.iter().any(|arg| arg == "-J-Duser.language=en"),
+            "诊断语言必须锁定英文，否则差分随 locale 漂移：{args:?}"
+        );
+        assert!(args.iter().any(|arg| arg == "A.java"), "{args:?}");
     }
 
     #[test]
