@@ -4197,6 +4197,157 @@ async fn request_round_outcome(
     Ok(RoundRequestOutcome::Received(outcome))
 }
 
+/// 工具调用准备阶段的结论。
+enum ToolCallPrepOutcome {
+    /// 调用已就绪（含执行前的计划批准步骤）
+    Ready { calls: Vec<(String, String)> },
+    /// 计划被驳回：已注入重规划指令，进入下一轮
+    NextRound,
+    /// 审查期间用户停止：结束循环
+    Finish,
+}
+
+/// `prepare_tool_calls` 的输入（全部借用）。`interrupted`/`tool_calls` 逐个传入是因为
+/// `outcome.text` 此时已被移出，无法再整体借用 `outcome`。
+struct ToolCallPrepInputs<'a> {
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    plan_review: &'a tauri::State<'a, PlanApprovalState>,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    text: &'a str,
+    interrupted: bool,
+    tool_calls: &'a [(String, String)],
+    plan_mode: bool,
+    plan_confirmed: &'a mut bool,
+    confirmed_plan: &'a mut Option<String>,
+    messages: &'a mut Vec<serde_json::Value>,
+    stats: &'a mut ChatRunStats,
+}
+
+/// 工具调用准备（纯搬运：原主循环内联代码，行为一致）。
+///
+/// 解析文本标记协议的工具调用，并合入原生 function calling 中参数可解析为合法 JSON 的调用；
+/// 随后（仅当确有调用时）执行**执行工具前**的计划批准门。注意这一门与 `run_plan_gate` 里的
+/// 计划门语义不同——触发条件（有工具调用 vs 有【PLAN】块）与注入消息都不一样，因此保持独立、不合并。
+async fn prepare_tool_calls(
+    inputs: ToolCallPrepInputs<'_>,
+) -> Result<ToolCallPrepOutcome, ChatFlowError> {
+    let mut calls = if inputs.interrupted {
+        Vec::new()
+    } else {
+        crate::agent::tools::parse_tool_calls(inputs.text)
+    };
+    if !inputs.tool_calls.is_empty() {
+        // 连接中断时原生 function calling 的参数 JSON 也可能不完整（被截断在半截），
+        // 仅保留参数可解析为合法 JSON 的调用，其余交给续写轮补全
+        let safe_calls: Vec<(String, String)> = inputs
+            .tool_calls
+            .iter()
+            .filter(|(_, args)| serde_json::from_str::<serde_json::Value>(args).is_ok())
+            .cloned()
+            .collect();
+        calls.extend(safe_calls);
+    }
+    if !calls.is_empty() {
+        // 计划/审查模式：执行首个工具前必须取得用户对计划的批准
+        if inputs.plan_mode && !*inputs.plan_confirmed {
+            let plan_text = extract_plan_block(inputs.text).unwrap_or_else(|| {
+                crate::agent::tools::strip_tool_calls(inputs.text).trim().to_string()
+            });
+            let plan_text = if plan_text.is_empty() {
+                "（模型未输出显式计划，将直接执行以下工具调用）".to_string()
+            } else {
+                plan_text
+            };
+            let review = request_plan_review(
+                inputs.app,
+                inputs.plan_review,
+                inputs.cancel.inner(),
+                inputs.conversation_id,
+                inputs.trace_id,
+                &plan_text,
+            )
+            .await
+            .unwrap_or(PlanReview {
+                approved: false,
+                feedback: "计划审查通道异常，已暂停".to_string(),
+                revised_plan: None,
+                cancelled: false,
+            });
+            crate::agent::runtime::transition_global(
+                inputs.trace_id,
+                inputs.conversation_id,
+                "running",
+                "plan_review_resolved",
+                None,
+            );
+            // 用户在审查等待期间点了停止：按停止收尾，不重新规划
+            if review.cancelled {
+                let _ = inputs.app.emit(
+                    "chat-plan-resolved",
+                    serde_json::json!({
+                        "conversation_id": inputs.conversation_id,
+                        "approved": false,
+                    }),
+                );
+                inputs.stats.stopped = true;
+                return Ok(ToolCallPrepOutcome::Finish);
+            }
+            if !review.approved {
+                // 驳回：把用户意见作为下一轮 user 指令，要求重新规划，不执行任何工具
+                let _ = inputs.app.emit(
+                    "chat-plan-resolved",
+                    serde_json::json!({
+                        "conversation_id": inputs.conversation_id,
+                        "approved": false,
+                    }),
+                );
+                inputs.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "用户驳回了该计划，意见如下：\n{}\n\n请根据意见调整方案，并重新输出【PLAN】...【/PLAN】计划（仍然不要在本轮调用工具）。",
+                        if review.feedback.trim().is_empty() { "（无补充意见）" } else { review.feedback.trim() }
+                    ),
+                }));
+                return Ok(ToolCallPrepOutcome::NextRound);
+            }
+            let final_plan = review.revised_plan.as_deref().unwrap_or(&plan_text).to_string();
+            activate_approved_plan(
+                inputs.app,
+                inputs.state,
+                inputs.conversation_id,
+                inputs.trace_id,
+                &final_plan,
+            )?;
+            *inputs.plan_confirmed = true;
+            *inputs.confirmed_plan = Some(final_plan.clone());
+            let _ = inputs.app.emit(
+                "chat-plan-resolved",
+                serde_json::json!({
+                    "conversation_id": inputs.conversation_id,
+                    "approved": true,
+                    "plan": final_plan,
+                }),
+            );
+            // 用户在审查时可能直接修订了计划或补充了执行要求；批准但附带意见时，
+            // 作为下一条 user 指令注入，要求 Agent 严格按修订后的方案执行。
+            let note = review.feedback.trim().to_string();
+            if !note.is_empty() {
+                inputs.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "计划已批准，但请严格按照以下用户修订/补充执行，不得偏离：\n\n{note}\n\n现在可以开始调用工具执行。"
+                    ),
+                }));
+                return Ok(ToolCallPrepOutcome::NextRound);
+            }
+        }
+    }
+    Ok(ToolCallPrepOutcome::Ready { calls })
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -6095,94 +6246,29 @@ async fn stream_chat_inner(
         // 模型任选其一（或混用），统一进入下方执行循环，保证两者对用户/前端完全透明。
         // 连接中断时文本标记可能半截（如【TOOL|bash|... 未闭合），禁止解析执行，
         // 由续写轮模型补全后统一执行，防半截标记被容错解析误触发工具
-        let mut calls = if outcome.interrupted {
-            Vec::new()
-        } else {
-            crate::agent::tools::parse_tool_calls(&text)
+        let calls = match prepare_tool_calls(ToolCallPrepInputs {
+            app,
+            state,
+            plan_review,
+            cancel,
+            conversation_id: &conversation_id,
+            trace_id: &trace_id,
+            text: &text,
+            interrupted: outcome.interrupted,
+            tool_calls: &outcome.tool_calls,
+            plan_mode,
+            plan_confirmed: &mut plan_confirmed,
+            confirmed_plan: &mut confirmed_plan,
+            messages: &mut messages,
+            stats: &mut *stats,
+        })
+        .await?
+        {
+            ToolCallPrepOutcome::Ready { calls } => calls,
+            ToolCallPrepOutcome::NextRound => continue 'outer,
+            ToolCallPrepOutcome::Finish => break 'outer,
         };
-        if !outcome.tool_calls.is_empty() {
-            // 连接中断时原生 function calling 的参数 JSON 也可能不完整（被截断在半截），
-            // 仅保留参数可解析为合法 JSON 的调用，其余交给续写轮补全
-            let safe_calls: Vec<(String, String)> = outcome
-                .tool_calls
-                .iter()
-                .filter(|(_, args)| serde_json::from_str::<serde_json::Value>(args).is_ok())
-                .cloned()
-                .collect();
-            calls.extend(safe_calls);
-        }
         if !calls.is_empty() {
-            // 计划/审查模式：执行首个工具前必须取得用户对计划的批准
-            if plan_mode && !plan_confirmed {
-                let plan_text = extract_plan_block(&text).unwrap_or_else(|| {
-                    crate::agent::tools::strip_tool_calls(&text).trim().to_string()
-                });
-                let plan_text = if plan_text.is_empty() {
-                    "（模型未输出显式计划，将直接执行以下工具调用）".to_string()
-                } else {
-                    plan_text
-                };
-                let review = request_plan_review(app, plan_review, cancel.inner(), &conversation_id, &trace_id, &plan_text)
-                    .await
-                    .unwrap_or(PlanReview {
-                        approved: false,
-                        feedback: "计划审查通道异常，已暂停".to_string(),
-                        revised_plan: None,
-                        cancelled: false,
-                    });
-                crate::agent::runtime::transition_global(
-                    &trace_id,
-                    &conversation_id,
-                    "running",
-                    "plan_review_resolved",
-                    None,
-                );
-                // 用户在审查等待期间点了停止：按停止收尾，不重新规划
-                if review.cancelled {
-                    let _ = app.emit("chat-plan-resolved", serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "approved": false,
-                    }));
-                    stats.stopped = true;
-                    break;
-                }
-                if !review.approved {
-                    // 驳回：把用户意见作为下一轮 user 指令，要求重新规划，不执行任何工具
-                    let _ = app.emit("chat-plan-resolved", serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "approved": false,
-                    }));
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": format!(
-                            "用户驳回了该计划，意见如下：\n{}\n\n请根据意见调整方案，并重新输出【PLAN】...【/PLAN】计划（仍然不要在本轮调用工具）。",
-                            if review.feedback.trim().is_empty() { "（无补充意见）" } else { review.feedback.trim() }
-                        ),
-                    }));
-                    continue;
-                }
-                let final_plan = review.revised_plan.as_deref().unwrap_or(&plan_text).to_string();
-                activate_approved_plan(app, state, &conversation_id, &trace_id, &final_plan)?;
-                plan_confirmed = true;
-                confirmed_plan = Some(final_plan.clone());
-                let _ = app.emit("chat-plan-resolved", serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "approved": true,
-                    "plan": final_plan,
-                }));
-                // 用户在审查时可能直接修订了计划或补充了执行要求；批准但附带意见时，
-                // 作为下一条 user 指令注入，要求 Agent 严格按修订后的方案执行。
-                let note = review.feedback.trim().to_string();
-                if !note.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": format!(
-                            "计划已批准，但请严格按照以下用户修订/补充执行，不得偏离：\n\n{note}\n\n现在可以开始调用工具执行。"
-                        ),
-                    }));
-                    continue;
-                }
-            }
             // 工具循环是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾；
             // exhausted 声明在循环外，主流程据此判定任务是否被护栏强制收尾——强制收尾时账本需保留）
             // 并发调度：连续只读工具（L0 且无交互副作用）进入批次并行执行（≤4 有界池），
