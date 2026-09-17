@@ -242,8 +242,14 @@ ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|/p/.harmony-candidate-1-a.dart|2|2
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.dart");
         std::fs::write(&file, "class A {}\n").unwrap();
+        // 两种降级都是合法的：本机没有 dart（CI 常见）或目标不在包内。
+        // 断言的是"要么因缺工具跳过、要么因不在包内跳过"，不能假定工具一定存在。
+        let tool_missing = resolve_dart().is_none();
         match check(&file, "class A {}\n", "class A {}\n") {
-            DartCheck::Skipped { reason } => assert!(reason.contains("pubspec.yaml"), "{reason}"),
+            DartCheck::Skipped { reason } => {
+                let expected = if tool_missing { "dart" } else { "pubspec.yaml" };
+                assert!(reason.contains(expected), "{reason}");
+            }
             DartCheck::Checked { .. } => panic!("非 Dart 包内不应产生分析结果"),
         }
         std::fs::remove_dir_all(&dir).ok();

@@ -350,8 +350,13 @@ vet: ./a.go:3:8: undefined: missingThing
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.go");
         std::fs::write(&file, "package main\n").unwrap();
+        // 两种降级都是合法的：本机没有 go（CI 可能不在 PATH）或目标不在模块内。
+        let tool_missing = resolve_go().is_none();
         match check(&file, "package main\n", "package main\n") {
-            GoCheck::Skipped { reason } => assert!(reason.contains("go.mod"), "{reason}"),
+            GoCheck::Skipped { reason } => {
+                let expected = if tool_missing { "go" } else { "go.mod" };
+                assert!(reason.contains(expected), "{reason}");
+            }
             GoCheck::Checked { .. } => panic!("非 Go 模块内不应产生检查结果"),
         }
         std::fs::remove_dir_all(&dir).ok();

@@ -137,6 +137,11 @@ def self_test():
 
 
 def main():
+    # Windows 控制台默认 cp1252：直接 print 中文会抛 UnicodeEncodeError，CI 上因此看不到
+    # 真正的告警明细（只看到编码崩溃）。这里显式改用 UTF-8 输出。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=int, default=DEFAULT_BASELINE,
                         help=f"告警基线（默认 {DEFAULT_BASELINE}）")

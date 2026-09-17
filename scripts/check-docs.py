@@ -382,6 +382,12 @@ def self_test() -> None:
 
 
 def main() -> int:
+    # Windows 控制台默认 cp1252：直接 print 中文会抛 UnicodeEncodeError，CI 上因此看不到
+    # 真正的漂移/告警明细（只看到编码崩溃）。这里显式改用 UTF-8 输出。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="文档漂移校验（Q-08）")
     parser.add_argument("--repo", default=str(ROOT), help="仓库路径")
     parser.add_argument("--self-test", action="store_true")
