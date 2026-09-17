@@ -782,3 +782,9 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 **验证要求**：第 1–6 步每步跑后端库全量 + `worker_crash_e2e` + `tool_worker_crash_e2e` + `check-docs.py`/`check-warnings.py`；第 1、4 步若触及事件序列或账本推进，需额外对照盘点里既有的行为断言。**第 7 步是真正的重写**（控制流改枚举 + 跨段状态结构体），必须在**有桌面手动验收窗口**的批次里做：多轮工具任务 + 中途停止 + 断点续跑。本机（Windows）能构建并运行绿色版，但自动化层面**没有行为快照**（第 19 节已实测否掉 Tauri 测试替身那条路），所以第 7 步不在这里开工。
 
 **当前结论**：第 1–6 步风险可控，可作为下一批目标；第 7 步待桌面验收窗口。本节只做调研与分段，未改动主循环结构。
+
+**进展（2026-09-17）**：第 1 步落地——轮中 C 的**记账段**（原 5381–5436）搬进 `handle_round_outcome`：清挂起指令、累计 token 与思考过程、`stream_round_done` 打点、用户停止终止分支、剥标记累计正文与账本「下一步」数据源、占位消息同步；终止分支的 `return` 换成 `PostRoundOutcome`（Continue / Stopped），调用方一处 `match` 映射回原行为（`fc3e78f`）。输入收进 `PostRoundInputs`（`stats` 与三处可变文本按借用推进，调用方继续持有）。
+
+度量：主循环体 2,006 → **1,974 行**；`persist_turn` 3 → 2 处、`upsert_placeholder_message` 1 → 0 处；`.emit(` 29、`.0.lock()` 21、`kernel_executor.*` 12 均不变（这段本就没有 emit/lock，只有记账与一次入库）。验证：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
+
+**轮中 C 剩余的「工具标记解析 / `calls` 构造」不宜单独搬**：它直接产出 `calls` 供轮中 D 消费，两者合并成一刀边界更自然（顺带把 `calls` 作为返回结构的一部分，而不是循环内共享可变量）。第 2–6 步其余各段（轮中 B、轮后 A、轮中 D、轮后 B、轮中 A）尚未开工，第 7 步仍待桌面验收窗口。

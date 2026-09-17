@@ -550,3 +550,14 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 验证（Windows 本机）：后端库 1,102 通过 / 0 失败（macOS 记录为 1,103/9，差异来自平台门控用例集）；两组崩溃恢复集成各 3 项通过；`cargo check --lib` 0 告警、`check-warnings.py` 57/57 通过、`check-docs.py` 通过。
 
 **未闭环**：第 2 步（round 体整体搬运）未开始；第 4 步切换 `KernelIoRunLoop::run(port)` 之前必须有真实桌面手动验收（多轮工具任务 + 中途停止 + 断点续跑），目前无自动化方式覆盖；macOS 侧本批提交仍待 CI 复核。
+
+## 30. 第 2 步第一刀：轮后记账搬出主循环（2026-09-17）
+
+第 2 步「提取 round 体」此前只有方案（[headless 驱动文档 §20](./HEADLESS_AGENT_DRIVER.md) 的实测分段），本轮落下第一刀：轮中 C 的**记账段**搬进 `handle_round_outcome`（`fc3e78f`）。
+
+- **搬出内容**：清挂起指令 → 累计 token 与思考过程 → `stream_round_done` 打点 → 用户停止终止分支（部分内容入库后结束任务）→ 剥标记累计正文与账本「下一步」数据源 → 同步占位消息。终止分支的 `return` 改成 `PostRoundOutcome`（Continue / Stopped），调用方一处 `match` 映射回原行为；输入收进 `PostRoundInputs`（`stats` 与三处可变文本按借用推进，调用方继续持有）。
+- **度量**：主循环体 2,006 → **1,974 行**；`persist_turn` 3 → 2 处、`upsert_placeholder_message` 1 → 0 处；`.emit(`/`.0.lock()`/`kernel_executor.*` 计数不变（该段没有事件与锁触达）。
+- **顺带修正方案**：轮中 C 剩余的「工具标记解析 / `calls` 构造」直接产出 `calls` 供轮中 D 消费，单独搬会把共享可变量留在循环里；合并成一刀、让 `calls` 随返回结构传出边界更自然。
+- **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
+
+**未闭环**：第 2 步其余五段（轮中 B、轮后 A、轮中 D、轮后 B、轮中 A）未开工；第 7 步「合段」（`RoundOutcome` + `DesktopRoundState`）必须有桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。
