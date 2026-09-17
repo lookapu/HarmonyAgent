@@ -584,3 +584,15 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 - **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
 
 **未闭环**：第 2 步剩余四段（轮中 A 的组装/压缩/快照半段、轮中 B、轮中 D 含 `calls` 构造、轮后 B）未开工；第 7 步「合段」需桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。
+
+## 33. 第 2 步第四刀：组装段搬出主循环（2026-09-17）
+
+第四刀：轮中 A 的组装段整体搬进 `assemble_round`（`24d0952`）。
+
+- **搬出内容**：挂起消息并入 → 预读（历史行 / 任务账本 / 本轮工具结果 / 用户注入）→ `KernelHistoryAssembler::assemble` → 压缩决策 → 组装后重置续写与纠正状态及 seam 计数 → 账本实时推送与落库 → 会话快照与 Context V2 检查点。
+- **返回约定**：`messages` 本就是每轮局部，作为 `AssembleOutcome::Ready { messages }` 的负载返回；压缩分支的 `continue 'outer` 换成 `AssembleOutcome::RestartRound`，由调用方 `continue 'outer` 落回原语义（含「用缩小后的 `history_limit` 与新摘要重新组装」的意图）。快照段的 `return Err("数据库锁不可用")` 改为函数返回后由 `?` 上抛，语义不变。
+- **输入面**：`AssembleInputs` 34 个字段（10 个 `&mut`）。同类型字段最多的是若干 `&mut String`，接线按名字逐一核对——这是本刀唯一无法靠编译器兜底的风险点，已随 diff 复核。
+- **度量**：主循环体 1,795 → **1,547 行**；循环内 `.emit(` 29 → 17；`break`/`continue` 仍 30（该段 1 处已枚举化）。搬运顺带消掉一处 `unused_mut`（`messages` 在函数内只读）。
+- **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
+
+**未闭环**：第 2 步剩余三段（轮中 B Provider 往返、轮中 D 含 `calls` 构造、轮后 B 轮级路由与纠正）未开工；第 7 步「合段」需桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。

@@ -800,3 +800,10 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 **选段依据实测控制流密度**：剩余各段量下来是 轮中 A 1 处、轮中 B 2 处、轮后 B 12 处、轮中 D 15 处 `break`/`continue`。故把 425 行的轮中 A 拆成两半，先做其中**没有 `break`/`continue`、也没有 `await`** 的预算门控（135 行）——这类段不需要枚举返回值，错误直接上抛，是当前最容易靠阅读验证的一刀；剩下的组装/快照段（含压缩决策的 `continue 'outer`）留作后续。
 
 度量：主循环体 1,918 → **1,795 行**（`break`/`continue` 仍 30）。验证：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
+
+**进展（2026-09-17，第四刀）**：轮中 A 的**组装段**落地——挂起消息并入、预读（历史行/账本/工具结果/用户注入）、assembler 组装、压缩决策、组装后重置续写与纠正状态及 seam 计数、账本实时推送与落库、会话快照与 Context V2 检查点，整体搬进 `assemble_round`（`24d0952`）。
+
+- **返回约定**：`messages` 本就是每轮局部（`let mut messages = assembled.messages;` 在循环内声明），因此作为 `AssembleOutcome::Ready { messages }` 的负载返回，调用方 `let mut messages = match ...`；压缩分支的 `continue 'outer` 换成 `AssembleOutcome::RestartRound`，由调用方 `continue 'outer` 落回原语义。
+- **输入面**：`AssembleInputs` 34 个字段，其中 10 个是 `&mut`（`seam_count`/`history_limit`/`context_summary`/`images_attached`/`continuation_reasoning_only`/`correction_text`/`correction_hint`/`merged_instructions`/`tools_since_progress`/`replan_instruction`）。同类型字段最多的一组是若干 `&mut String`，接线时按名字逐一核对过。
+- **度量**：主循环体 1,795 → **1,547 行**；循环内 `.emit(` 29 → 17（12 处随组装段移出）；`break`/`continue` 仍 30（该段只有 1 处，已改成枚举返回）。搬运顺带消掉一处 `unused_mut`：`messages` 在函数内只读，不再需要 `mut`。
+- **验证**：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
