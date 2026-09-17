@@ -2996,6 +2996,106 @@ async fn adjudicate_pre_round(
     Ok(PreRoundPermit::Proceed)
 }
 
+/// 轮后去向：本轮拿到 Provider 输出之后的收尾结论。
+enum PostRoundOutcome {
+    /// 继续本轮的后续步骤（工具标记解析与执行）
+    Continue,
+    /// 用户停止：部分内容已入库，任务就此结束
+    Stopped,
+}
+
+/// `handle_round_outcome` 的输入（全部借用）。`stats` 与三处可变文本随调用推进，
+/// 调用方在本轮后续步骤里继续持有它们——因此这里只借用、不取所有权。
+struct PostRoundInputs<'a> {
+    state: &'a tauri::State<'a, DbState>,
+    app: &'a AppHandle,
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    model: &'a str,
+    context_summary: &'a Option<String>,
+    modified_files: &'a [String],
+    task_started: std::time::Instant,
+    outcome: &'a StreamOutcome,
+    tool_runs: &'a [ToolRunItem],
+    stats: &'a mut ChatRunStats,
+    reasoning_full: &'a mut String,
+    full: &'a mut String,
+    last_model_text: &'a mut String,
+    merged_instructions: &'a mut Vec<String>,
+    placeholder_msg_id: &'a mut Option<String>,
+}
+
+/// 轮后记账与入库（纯搬运：原主循环内联代码，行为一致）。
+///
+/// 顺序与原内联代码相同：清挂起指令 → 累计 token 与思考过程 → 打单轮完成点 →
+/// 处理「用户停止」终止分支（部分内容入库后结束任务）→ 剥标记累计正文与下一步数据源
+/// → 同步占位消息。返回 `PostRoundOutcome` 而不是直接 `return` 出主循环，
+/// 与 `adjudicate_pre_round` 的 `PreRoundPermit` 同属第 2 步所需的返回约定。
+async fn handle_round_outcome(
+    inputs: PostRoundInputs<'_>,
+) -> Result<PostRoundOutcome, ChatFlowError> {
+    // 挂起指令已随本轮请求送达模型：清除，避免后续轮次重复注入
+    // （长任务多轮循环时 token 膨胀，且同一要求被模型反复读到可能重复执行）
+    inputs.merged_instructions.clear();
+    // 累计 token 用量（供任务级 Trace 成本估算）
+    inputs.stats.input_tokens += inputs.outcome.usage.input_tokens;
+    inputs.stats.output_tokens += inputs.outcome.usage.output_tokens;
+    // full 在下方标记解析处按 strip 后的正文累计（避免工具标记进入入库文本）
+    inputs.reasoning_full.push_str(&inputs.outcome.reasoning);
+    // 打点：单轮请求完成（含请求耗时/重试次数），定位卡点用
+    crate::utils::logger::log_event(
+        "stream_round_done",
+        serde_json::json!({
+            "conversation_id": inputs.conversation_id,
+            "chars": inputs.outcome.text.chars().count(),
+            "elapsed_ms": inputs.task_started.elapsed().as_millis(),
+            "round": inputs.tool_runs.len() + 1,
+        }),
+    );
+    // 用户停止：部分内容（如有）入库并推送 chat-done / chat-stopped 后结束
+    if inputs.outcome.stopped {
+        inputs.stats.stopped = true;
+        persist_turn(
+            inputs.state,
+            inputs.conversation_id,
+            inputs.trace_id,
+            inputs.tool_runs,
+            inputs.full,
+            inputs.reasoning_full,
+            inputs.model,
+            inputs.context_summary,
+            inputs.modified_files,
+            inputs.app,
+            inputs.stats.input_tokens,
+            inputs.stats.output_tokens,
+            inputs.task_started.elapsed().as_millis() as i64,
+            true,
+            inputs.placeholder_msg_id,
+        )
+        .await?;
+        return Ok(PostRoundOutcome::Stopped);
+    }
+    // 账本“下一步”数据源：模型最近一轮输出（剥离工具标记，防【TOOL】标记混入账本）
+    *inputs.last_model_text = crate::agent::tools::strip_tool_calls(&inputs.outcome.text)
+        .trim()
+        .to_string();
+    // 工具标记剥离后累计正文（标记由工具卡片事件呈现，不进入入库文本，避免假卡片/上下文错乱）
+    inputs
+        .full
+        .push_str(&crate::agent::tools::strip_tool_calls(&inputs.outcome.text));
+    // 正文即时入库：每轮累积后同步占位消息（防“最后一次入库”丢正文）——
+    // 本任务任一轮正文已可见；任务中断后占位消息保留部分内容，前端识别后可继续生成
+    upsert_placeholder_message(
+        &inputs.state.0,
+        inputs.conversation_id,
+        inputs.model,
+        inputs.placeholder_msg_id,
+        inputs.full,
+        inputs.reasoning_full,
+    )?;
+    Ok(PostRoundOutcome::Continue)
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -5378,62 +5478,30 @@ async fn stream_chat_inner(
                 return Err(e.into());
             }
         };
-        // 挂起指令已随本轮请求送达模型：清除，避免后续轮次重复注入
-        // （长任务多轮循环时 token 膨胀，且同一要求被模型反复读到可能重复执行）
-        merged_instructions.clear();
-        // 累计 token 用量（供任务级 Trace 成本估算）
-        stats.input_tokens += outcome.usage.input_tokens;
-        stats.output_tokens += outcome.usage.output_tokens;
-        // full 在下方标记解析处按 strip 后的正文累计（避免工具标记进入入库文本）
-        reasoning_full.push_str(&outcome.reasoning);
-        // 打点：单轮请求完成（含请求耗时/重试次数），定位卡点用
-        crate::utils::logger::log_event(
-            "stream_round_done",
-            serde_json::json!({
-                "conversation_id": conversation_id,
-                "chars": outcome.text.chars().count(),
-                "elapsed_ms": task_started.elapsed().as_millis(),
-                "round": tool_runs.len() + 1,
-            }),
-        );
-        // 用户停止：部分内容（如有）入库并推送 chat-done / chat-stopped 后结束
-        if outcome.stopped {
-            stats.stopped = true;
-            persist_turn(
-                state,
-                &conversation_id,
-                &trace_id,
-                &tool_runs,
-                &full,
-                &reasoning_full,
-                &model_choice.model,
-                &context_summary,
-                &modified_files,
-                app,
-                stats.input_tokens,
-                stats.output_tokens,
-                task_started.elapsed().as_millis() as i64,
-                true,
-                &placeholder_msg_id,
-            )
-            .await?;
-            return Ok(());
+        match handle_round_outcome(PostRoundInputs {
+            state,
+            app,
+            conversation_id: &conversation_id,
+            trace_id: &trace_id,
+            model: &model_choice.model,
+            context_summary: &context_summary,
+            modified_files: &modified_files,
+            task_started,
+            outcome: &outcome,
+            tool_runs: &tool_runs,
+            stats: &mut *stats,
+            reasoning_full: &mut reasoning_full,
+            full: &mut full,
+            last_model_text: &mut last_model_text,
+            merged_instructions: &mut merged_instructions,
+            placeholder_msg_id: &mut placeholder_msg_id,
+        })
+        .await?
+        {
+            PostRoundOutcome::Stopped => return Ok(()),
+            PostRoundOutcome::Continue => {}
         }
         let text = outcome.text;
-        // 账本“下一步”数据源：模型最近一轮输出（剥离工具标记，防【TOOL】标记混入账本）
-        last_model_text = crate::agent::tools::strip_tool_calls(&text).trim().to_string();
-        // 工具标记剥离后累计正文（标记由工具卡片事件呈现，不进入入库文本，避免假卡片/上下文错乱）
-        full.push_str(&crate::agent::tools::strip_tool_calls(&text));
-        // 正文即时入库：每轮累积后同步占位消息（防“最后一次入库”丢正文）——
-        // 本任务任一轮正文已可见；任务中断后占位消息保留部分内容，前端识别后可继续生成
-        upsert_placeholder_message(
-            &state.0,
-            &conversation_id,
-            &model_choice.model,
-            &mut placeholder_msg_id,
-            &full,
-            &reasoning_full,
-        )?;
 
         // 原生 function calling（OpenAI 兼容协议 tool_calls）与文本标记协议合并：
         // 模型任选其一（或混用），统一进入下方执行循环，保证两者对用户/前端完全透明。
