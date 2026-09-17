@@ -962,8 +962,11 @@ mod tests {
         assert_eq!(outcome.status, OUTCOME_RESOLVED);
         assert_eq!(outcome.collected_artifacts, vec!["a.txt".to_string()]);
         assert!(output_dir.join("artifacts/a.txt").exists());
+        // 行尾归一到 LF：Windows 上可能写回 CRLF
         assert_eq!(
-            fs::read_to_string(output_dir.join("artifacts/a.txt")).unwrap(),
+            fs::read_to_string(output_dir.join("artifacts/a.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "fixed\n"
         );
 
@@ -1042,8 +1045,11 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.status, OUTCOME_RESOLVED);
         assert_eq!(outcome.collected_artifacts, vec!["a.txt"]);
+        // 行尾归一到 LF：Windows 上可能写回 CRLF
         assert_eq!(
-            fs::read_to_string(output_dir.join("artifacts/a.txt")).unwrap(),
+            fs::read_to_string(output_dir.join("artifacts/a.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "fixed\n"
         );
         assert!(outcome.patch.contains("package/a.txt"));

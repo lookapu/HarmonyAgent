@@ -121,13 +121,22 @@ pub(crate) fn argument_scope(
         .filter(|path| !path.is_empty())
         .map(|path| super::tools::resolve_in_roots(roots, path))
         .transpose()?;
+    // Windows 的 canonicalize 会带上 `\\?\` verbatim 前缀，而 roots/解析结果不一定有，
+    // 直接 starts_with 会把同一工作区误判成越界（实测：Windows 上合法 OTA 参数被拒）。
+    // 两侧统一走 normalize_path 去掉前缀后再比较。
+    let normalized = |path: &Path| -> String {
+        crate::utils::path::normalize_path(&path.to_string_lossy())
+    };
     let root = roots
         .iter()
         .filter_map(|root| Path::new(root).canonicalize().ok())
         .find(|root| {
-            hap.starts_with(root)
-                && output.starts_with(root)
-                && profile.as_ref().is_none_or(|path| path.starts_with(root))
+            let root = normalized(root);
+            normalized(&hap).starts_with(&root)
+                && normalized(&output).starts_with(&root)
+                && profile
+                    .as_ref()
+                    .is_none_or(|path| normalized(path).starts_with(&root))
         })
         .ok_or("OTA 输入和输出必须位于同一授权工作区")?;
     let relative = |path: &Path| -> Result<String, String> {

@@ -152,7 +152,13 @@ mod tests {
 
         let target = temp_dir("target");
         prepare_worktree(&source, &target, &base).unwrap();
-        assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "base\n");
+        // 行尾归一到 LF：git 在 Windows 检出可能是 CRLF
+        assert_eq!(
+            fs::read_to_string(target.join("a.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "base\n"
+        );
 
         // 工作树隔离：改动 target 不影响 source。
         fs::write(target.join("a.txt"), "changed\n").unwrap();

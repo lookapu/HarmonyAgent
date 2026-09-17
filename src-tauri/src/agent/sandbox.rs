@@ -1594,6 +1594,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_native_command_uses_deny_default_clean_env_and_scoped_writes() {
         let workspace = temp_workspace();
@@ -1628,6 +1629,7 @@ mod tests {
         std::fs::remove_dir_all(temp_root).ok();
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn native_read_only_profile_does_not_grant_workspace_write() {
         let workspace = temp_workspace();

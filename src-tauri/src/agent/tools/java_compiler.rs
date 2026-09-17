@@ -243,6 +243,10 @@ fn compile(
         "-implicit:none".to_string(),
         "-Xmaxerrs".to_string(),
         MAX_DIAGNOSTICS.to_string(),
+        // 源码是 UTF-8：Windows 上 javac 默认按平台编码（cp1252）读源文件，
+        // 会把中文注释/字符串解成乱码并报出与基线不同的诊断（实测 CI 上误判为新增错误）
+        "-encoding".to_string(),
+        "UTF-8".to_string(),
         // 锁定英文诊断：默认 locale 下消息会本地化，差分结果随环境漂移
         "-J-Duser.language=en".to_string(),
         "-d".to_string(),

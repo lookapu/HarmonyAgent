@@ -105,7 +105,10 @@ mod tests {
         let grader_dir = temp_dir("grader");
         let _ = init_repo(&grader_dir, "base\n");
         apply_patch(&grader_dir, &patch).unwrap();
-        let applied = fs::read_to_string(grader_dir.join("a.txt")).unwrap();
+        // 行尾风格归一到 LF：Windows 检出/写回可能是 CRLF，内容断言不应依赖它
+        let applied = fs::read_to_string(grader_dir.join("a.txt"))
+            .unwrap()
+            .replace("\r\n", "\n");
         assert_eq!(applied, "changed\n");
 
         fs::remove_dir_all(author_dir).ok();

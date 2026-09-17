@@ -2540,9 +2540,15 @@ mod tests {
 
     #[test]
     fn rejects_absolute_and_parent_paths_in_hap() {
+        // 绝对路径要按平台给：Windows 上 "/etc/passwd.hap" 并不是绝对路径
+        let absolute = if cfg!(windows) {
+            "C:\\Windows\\system32\\drivers\\etc\\hosts.hap"
+        } else {
+            "/etc/passwd.hap"
+        };
         assert!(HostCapability::InstallHap {
             device: None,
-            hap_path: "/etc/passwd.hap".into(),
+            hap_path: absolute.into(),
             replace: false,
         }
         .validate()
@@ -2717,7 +2723,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&send.args[..4], ["-t", "ABC123", "file", "send"]);
-        assert!(send.args[4].ends_with("in/data.bin"));
+        assert!(std::path::Path::new(&send.args[4]).ends_with("in/data.bin"));
         assert_eq!(send.args[5], "/data/local/tmp/data.bin");
         let receive = prepare_invocation(
             &HostCapability::ReceiveFile {
@@ -3246,7 +3252,8 @@ mod tests {
         }, Some(&root)).unwrap();
         assert_eq!(invocation.program, "hdc");
         assert_eq!(&invocation.args[..4], ["-t", "ABC123", "install", "-r"]);
-        assert!(invocation.args[4].ends_with("out/app.hap"));
+        // 按路径组件比较：Windows 上分隔符是反斜杠，字符串 ends_with 会假失败
+        assert!(std::path::Path::new(&invocation.args[4]).ends_with("out/app.hap"));
         std::fs::remove_dir_all(root).ok();
     }
 
