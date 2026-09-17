@@ -2726,6 +2726,31 @@ fn build_rules_text(conn: &rusqlite::Connection, project_id: &str, project_path:
     s
 }
 
+/// 轮前：任务心跳打点（每轮循环顶部）。配合工具/请求/压缩日志，任何卡点都能从最后一条
+/// 心跳定位到所在阶段——此前卡在无超时请求内时日志静默，事后无法定位「空跑」位置。
+///
+/// 与 `refresh_workflow_stage` 同属桌面 IO port 迁移的纯搬运切片。
+fn log_task_heartbeat(
+    registry: &TaskRegistry,
+    conversation_id: &str,
+    task_started: std::time::Instant,
+    tool_runs: usize,
+    full_chars: usize,
+    history_limit: usize,
+) {
+    registry.touch(conversation_id, PHASE_MAIN_LOOP);
+    crate::utils::logger::log_event(
+        "task_heartbeat",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "elapsed_ms": task_started.elapsed().as_millis() as i64,
+            "tool_runs": tool_runs,
+            "full_chars": full_chars,
+            "history_limit": history_limit,
+        }),
+    );
+}
+
 /// 轮前：重算执行阶段快照；阶段相对上一轮变化时写 `workflow.stage` 审计事件。
 /// 返回本轮快照，供后续提示注入（`directive()`）使用。
 ///
@@ -4470,18 +4495,13 @@ async fn stream_chat_inner(
                 execution_budget.lease_ms,
             );
         }
-        // 任务心跳打点（每轮循环顶部）：配合工具/请求/压缩日志，任何卡点都能从最后一条
-        // 心跳定位到所在阶段——此前卡在无超时请求内时日志静默，事后无法定位“空跑”位置
-        registry.touch(&conversation_id, PHASE_MAIN_LOOP);
-        crate::utils::logger::log_event(
-            "task_heartbeat",
-            serde_json::json!({
-                "conversation_id": conversation_id,
-                "elapsed_ms": task_started.elapsed().as_millis() as i64,
-                "tool_runs": tool_runs.len(),
-                "full_chars": full.chars().count(),
-                "history_limit": history_limit,
-            }),
+        log_task_heartbeat(
+            registry,
+            &conversation_id,
+            task_started,
+            tool_runs.len(),
+            full.chars().count(),
+            history_limit,
         );
         let workflow = refresh_workflow_stage(
             state,
