@@ -2781,6 +2781,51 @@ fn refresh_workflow_stage<'a>(
     workflow
 }
 
+/// `persist_open_ledger_and_emit` 的账本入参：把「本轮轨迹」与「继承账本」捆在一起。
+/// 收进结构体一是避免参数个数越过 clippy 阈值（门禁按唯一告警计数，不得新增），
+/// 二是与迁移方案「用显式参数结构体传入」的切法一致，端口落地时统一改签名。
+struct OpenLedgerInputs<'a> {
+    task_goal: &'a str,
+    tool_runs: &'a [ToolRunItem],
+    last_model_text: &'a str,
+    ledger_base_n: u32,
+    prev_ledger: &'a mut Option<TaskLedger>,
+}
+
+/// 收尾：保留未完成任务的账本——把本轮轨迹并入账本落库，并推送最终态
+/// （`finished: true`，前端据此展示未完成状态）。空账本（无工具且无继承账本）不落库、不推送。
+///
+/// 与 `log_task_heartbeat`/`refresh_workflow_stage` 同属桌面 IO port 迁移的纯搬运切片：
+/// 主循环内三处逐字相同的收尾（超时中断、用户停止、护栏收尾）收敛到一处；
+/// 仍接受 Tauri `State`/`AppHandle`，端口落地时再统一改签名。
+fn persist_open_ledger_and_emit(
+    state: &tauri::State<'_, DbState>,
+    app: &AppHandle,
+    conversation_id: &str,
+    inputs: OpenLedgerInputs<'_>,
+) -> Result<(), ChatFlowError> {
+    if inputs.tool_runs.is_empty() && inputs.prev_ledger.is_none() {
+        return Ok(());
+    }
+    let derived = TaskLedger::from_tool_runs(
+        inputs.task_goal,
+        inputs.tool_runs,
+        inputs.last_model_text,
+        inputs.ledger_base_n,
+    );
+    let merged = TaskLedger::merge_continuation(inputs.prev_ledger.take(), derived);
+    save_task_ledger(state, conversation_id, Some(&merged))?;
+    let _ = app.emit(
+        "chat-ledger",
+        ChatLedgerEvent {
+            conversation_id: conversation_id.to_string(),
+            ledger: Some(merged.clone()),
+            finished: true,
+        },
+    );
+    Ok(())
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -4567,20 +4612,18 @@ async fn stream_chat_inner(
                 .await?;
             }
             // 账本持久化：超时停止（任务未完成）→ 保存当前账本（含断点续跑合并）供续跑继承
-            if !tool_runs.is_empty() || prev_ledger.is_some() {
-                let derived = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
-                let merged = TaskLedger::merge_continuation(prev_ledger.take(), derived);
-                save_task_ledger(state, &conversation_id, Some(&merged))?;
-                // 账本最终态推送：任务中断（超时）→ 保留账本，前端展示未完成任务状态
-                let _ = app.emit(
-                    "chat-ledger",
-                    ChatLedgerEvent {
-                        conversation_id: conversation_id.clone(),
-                        ledger: Some(merged.clone()),
-                        finished: true,
-                    },
-                );
-            }
+            persist_open_ledger_and_emit(
+                state,
+                app,
+                &conversation_id,
+                OpenLedgerInputs {
+                    task_goal: &task_goal,
+                    tool_runs: &tool_runs,
+                    last_model_text: &last_model_text,
+                    ledger_base_n,
+                    prev_ledger: &mut prev_ledger,
+                },
+            )?;
             return Err(ChatFlowError {
                 kind: ErrorKind::Timeout,
                 title: ErrorKind::Timeout.title().to_string(),
@@ -4633,20 +4676,18 @@ async fn stream_chat_inner(
             )
             .await?;
             // 账本持久化：用户停止（任务未完成）→ 保存当前账本（含断点续跑合并）供续跑继承
-            if !tool_runs.is_empty() || prev_ledger.is_some() {
-                let derived = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
-                let merged = TaskLedger::merge_continuation(prev_ledger.take(), derived);
-                save_task_ledger(state, &conversation_id, Some(&merged))?;
-                // 账本最终态推送：任务中断（用户停止）→ 保留账本，前端展示未完成任务状态
-                let _ = app.emit(
-                    "chat-ledger",
-                    ChatLedgerEvent {
-                        conversation_id: conversation_id.clone(),
-                        ledger: Some(merged.clone()),
-                        finished: true,
-                    },
-                );
-            }
+            persist_open_ledger_and_emit(
+                state,
+                app,
+                &conversation_id,
+                OpenLedgerInputs {
+                    task_goal: &task_goal,
+                    tool_runs: &tool_runs,
+                    last_model_text: &last_model_text,
+                    ledger_base_n,
+                    prev_ledger: &mut prev_ledger,
+                },
+            )?;
             return Ok(());
         }
         // 任意已锁定终态都不得穿过 Provider 边界；正常分支会在产生终态的当轮退出，
@@ -6550,19 +6591,20 @@ async fn stream_chat_inner(
                 finished: true,
             },
         );
-    } else if !tool_runs.is_empty() || prev_ledger.is_some() {
-        let derived = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
-        let merged = TaskLedger::merge_continuation(prev_ledger.take(), derived);
-        save_task_ledger(state, &conversation_id, Some(&merged))?;
+    } else {
         // 账本最终态推送：任务未完成（护栏收尾）→ 保留账本供断点续跑展示
-        let _ = app.emit(
-            "chat-ledger",
-            ChatLedgerEvent {
-                conversation_id: conversation_id.clone(),
-                ledger: Some(merged.clone()),
-                finished: true,
+        persist_open_ledger_and_emit(
+            state,
+            app,
+            &conversation_id,
+            OpenLedgerInputs {
+                task_goal: &task_goal,
+                tool_runs: &tool_runs,
+                last_model_text: &last_model_text,
+                ledger_base_n,
+                prev_ledger: &mut prev_ledger,
             },
-        );
+        )?;
     }
 
     Ok(())
