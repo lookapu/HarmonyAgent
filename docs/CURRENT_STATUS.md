@@ -14,12 +14,12 @@
 | 前端测试 | `npm test` | 14 文件、127 通过 |
 | 前端 lint / 类型 | `npm run lint`、`npx tsc -b` | 通过 |
 | Web 构建与体积门禁 | `npm run build` | 通过（Home 694.5/750KB、Markdown 1500.8/1550KB、index 546.7/575KB） |
-| Rust 编译告警 | `cargo check --lib`、`cargo test --no-run` | 0 警告 |
+| Rust 编译告警 | `cargo check --lib`、`cargo test --no-run` | 0 警告（macOS）；Windows 本机 `cargo check --lib` 有 1 处 `unused_mut`（`ota_inputs.rs`），测试档另多 1 处 `dead_code`（`version.rs`） |
 | 文档漂移门禁 | `python3 scripts/check-docs.py` | 通过 |
-| clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警） |
+| clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警）；**Windows 本机实测 65/57 未通过**——基线未按平台校准，本机不可复现该结论 |
 | Windows 质量矩阵 | GitHub Actions `quality.yml`（macOS + Windows） | v2.2.0 发版时全绿（此前 16 处 Windows 失败已清零） |
 
-平台：macOS 15.7.9（arm64，Darwin 24G830）。上表的 Windows 行证据来自 CI，**本机未复现**。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
+平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,103/9 差异来自平台门控用例集，不是回归）。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
 
 ## 2. 写入门禁覆盖矩阵
 
@@ -31,7 +31,7 @@
 | --- | --- | --- | --- |
 | `.ets` | tree-sitter（ArkTS） | — | — |
 | `.ts`/`.tsx`/`.js`/`.jsx` | tree-sitter | — | — |
-| `.java` | tree-sitter + 声明/注解目标检查 | `javac` 差分（并入同源码根下未编辑的调用方；编译固定 `-encoding UTF-8`） | 无 javac、编译超时；源码非 UTF-8 编码时诊断可能失真 |
+| `.java` | tree-sitter + 声明/注解目标检查 | `javac` 差分（并入同源码根下未编辑的调用方；编译固定 `-encoding UTF-8`） | 无 javac、编译超时；源码非 UTF-8 编码时按 UTF-8 解码失真（本机实测：GBK 源码报 `unmappable character`），可能**误报拒写** |
 | `.dart` | tree-sitter | `dart analyze` 差分 | 无 dart、不在包内、超时 |
 | `.go` | tree-sitter | `go vet` 差分（临时模块 + **同包兄弟文件一起带上** + `GOPROXY=off`，超时 45s 以容纳冷缓存） | 无 go、不在模块内、包过大、只剩上下文缺失错误、超时 |
 | `.py` | tree-sitter | `pyflakes` 差分 | 无 pyflakes/python3、超时 |
@@ -49,7 +49,7 @@
 
 | 缺陷 | 现象 | 修复 | 残留边界 |
 | --- | --- | --- | --- |
-| javac 按平台默认编码读源码 | Windows 默认 cp1252，UTF-8 源码里的中文注释/字符串被误解码，产生**不存在的编译错误**，于是干净写入被 Java 门禁误拦（误报而非漏报） | `java_compiler.rs` 编译参数固定 `-encoding UTF-8` | 源码本身是 GBK/Big5 等非 UTF-8 时仍会失真；门禁当前硬假定 UTF-8 |
+| javac 按平台默认编码读源码 | Windows 默认 cp1252，UTF-8 源码里的中文注释/字符串被误解码，产生**不存在的编译错误**，于是干净写入被 Java 门禁误拦（误报而非漏报） | `java_compiler.rs` 编译参数固定 `-encoding UTF-8` | 源码本身是 GBK/Big5 等非 UTF-8 时仍会失真——2026-09-17 本机 Windows + 随包 Temurin 17 实测为**误报拒写**而非仅「诊断失真」：GBK 源码在固定 `-encoding UTF-8` 下报 38 处 `unmappable character`。门禁硬假定 UTF-8。另注：JDK ≥ 18 的 `file.encoding` 默认已是 UTF-8，该参数在那些机器上冗余；**随包分发的 JDK 17 上必需**（本机实测：不带该参数时 UTF-8 中文源码即报 `unmappable character (0xB2) for encoding GBK`，加上后编译干净） |
 | OTA 参数作用域路径前缀不一致 | Windows `canonicalize` 返回 `\\?\C:\...` 逐字（verbatim）前缀，与普通路径比较永不相等 → **工作区内的合法 OTA 参数被判越界而拒批**（真实生产路径，不是测试问题） | `ota_scope.rs` 在根匹配与相对化两侧统一走 `normalize_path`（剥离 verbatim 前缀） | 只归一了前缀；符号链接、8.3 短名等其它 Windows 路径形态未专门覆盖 |
 | 评测基线门禁从未真正比对基线 | env 变量写作 `src-tauri/target/eval-baseline.json`，而 `cargo test` 的工作目录已在 `src-tauri/`：写出的基线读不回、要对的基线读不到 → 门禁长期「产出但不比对」的假绿 | env 改为 `target/eval-baseline.json`，写前 `create_dir_all` 父目录 | 修好后才暴露它对 runner 计时抖动敏感，已改成取三次最优 + `duration_factor` 2.5（见盘点 §26）；同机耗时对比在繁忙 CI 上仍非绝对稳定 |
 
@@ -78,7 +78,7 @@
 - **Docker/Podman**：OCI 沙箱端到端与逃逸套件、artifact 导出。
 - **签名与发行**：平台代码签名、公证、SBOM/provenance、干净机器安装验收。
 - **Windows/Linux**：目标编译校验（本机只有 macOS 工具链；MinGW 只能覆盖 windows-gnu，不等于 CI 用的 MSVC）。
-- **只在 CI 成立、本机不复现**：Windows 质量矩阵结论、Windows 路径/编码类门禁行为（见第 3 节三条缺陷）；改动这些路径时须以 CI 结果为准，不能用本机绿推断。
+- **只在 CI 成立、本机不复现**：Windows 质量矩阵结论（16 处 Windows 失败清零）。**编码类门禁行为已于 2026-09-17 在本机 Windows 复现**（见第 3 节），从本清单移出；路径形态类（符号链接、8.3 短名）与 Windows/Linux 目标编译仍未覆盖。改动这些路径时须以 CI 结果为准，不能用本机绿推断。
 
 ## 6. 维护约定
 
