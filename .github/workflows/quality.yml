@@ -69,8 +69,12 @@ jobs:
             eval-baseline-${{ matrix.os }}-
       - name: Fixed evaluation with CI baseline gate
         env:
-          EVAL_BASELINE_IN: src-tauri/target/eval-baseline.json
-          EVAL_BASELINE_OUT: src-tauri/target/eval-baseline.json
+          # cargo test 的测试进程 cwd 是 crate 目录（src-tauri/），因此这里必须是
+          # target/... 而不是 src-tauri/target/...：写成后者会落到 src-tauri/src-tauri/target
+          # （既读不到基线、写也会因父目录不存在而失败——实测 CI 上该门禁因此从未真正生效）。
+          # cache 的 path 是相对工作区根，仍写 src-tauri/target/eval-baseline.json，指向同一文件。
+          EVAL_BASELINE_IN: target/eval-baseline.json
+          EVAL_BASELINE_OUT: target/eval-baseline.json
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked agent::evals::tests::ci_baseline_gate -- --exact --nocapture
       - name: Save evaluation baseline (main only)
         if: github.ref == 'refs/heads/main' && steps.eval-baseline-restore.outputs.cache-hit != 'true'

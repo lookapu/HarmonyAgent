@@ -1168,6 +1168,10 @@ mod tests {
         } else {
             eprintln!("未找到基线 {baseline_path}，本次运行将保存为基线");
         }
+        // 写前确保父目录存在：CI 上基线缓存未命中时目录可能还没建（此前直接 NotFound 失败）
+        if let Some(parent) = std::path::Path::new(&out_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         std::fs::write(&out_path, serde_json::to_string_pretty(&baseline_from_run(&run)).unwrap())
             .expect("write baseline");
     }
