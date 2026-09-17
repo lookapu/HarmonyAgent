@@ -794,3 +794,9 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 **顺序按风险重排**（偏离本节切分顺序）：原定第 2 步做轮中 B（Provider 流式往返），但读过代码后确认它独有**上下文超限恢复**与**备用模型降级**两条错误路径，并要改写 `history_limit`/`context_summary`/`used_fallback`/`model_choice` 四处跨段状态——纯搬运在这一段最不容易靠阅读验证，而当前又没有行为快照。故先做控制流更确定的轮后 A，把轮中 B 排到轮后 B 与轮中 D 之后，或留到有验收窗口的批次。
 
 度量：主循环体 1,974 → **1,918 行**；`break`/`continue` 34 → **30** 处。验证：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
+
+**进展（2026-09-17，第三刀）**：发送前**预算门控**搬进同步函数 `enforce_budget_gate`（`5e0d910`）——硬限额拦截（日/月预算超出即停止发送并返回预算类错误）、软预警提示、软预警阈值后自动降级到同 Provider 经济模型。输入收进 `BudgetGateInputs`（10 个字段）。
+
+**选段依据实测控制流密度**：剩余各段量下来是 轮中 A 1 处、轮中 B 2 处、轮后 B 12 处、轮中 D 15 处 `break`/`continue`。故把 425 行的轮中 A 拆成两半，先做其中**没有 `break`/`continue`、也没有 `await`** 的预算门控（135 行）——这类段不需要枚举返回值，错误直接上抛，是当前最容易靠阅读验证的一刀；剩下的组装/快照段（含压缩决策的 `continue 'outer`）留作后续。
+
+度量：主循环体 1,918 → **1,795 行**（`break`/`continue` 仍 30）。验证：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
