@@ -17,6 +17,7 @@ import { skillTemplates, type SkillTemplate } from '../data/skillTemplates'
 import { useProjectStore } from '../stores/projectStore'
 import Icon from '../icons/Icon'
 import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
+import { Skeleton } from '../components/ui/Spinner'
 
 /** 从 Git 仓库地址（GitHub/Gitee 的 URL / git@ / owner/name）提取 owner 和 name */
 function parseGithubUrl(input: string): { owner: string; name: string } | null {
@@ -196,7 +197,7 @@ export default function SkillsPage() {
         {view === 'skills' && (
           <button
             onClick={() => setShowForm(!showForm)}
-            className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium  active:scale-[0.98] transition-all shadow-lg shadow-[var(--accent)]/15"
+            className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-[color,background-color,border-color,opacity] shadow-lg shadow-[var(--accent)]/15"
           >
             <span className="flex items-center gap-1.5">
               <Icon name={showForm ? 'close' : 'download'} size={14} white />
@@ -298,7 +299,7 @@ export default function SkillsPage() {
             <button
               onClick={handleImport}
               disabled={!parsed || importing}
-              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {importing ? t('skill.importing') : t('skill.import')}
             </button>
@@ -334,7 +335,7 @@ export default function SkillsPage() {
                 key={tpl.key}
                 onClick={() => handleImportTemplate(tpl)}
                 disabled={installingKey !== null}
-                className={`text-left p-2.5 rounded-lg border transition-all ${
+                className={`text-left p-2.5 rounded-lg border transition-[color,background-color,border-color,opacity] ${
                   installed
                     ? 'border-[var(--success)]/50 bg-[var(--success)]/10'
                     : 'border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--accent)]/40 hover:bg-[var(--bg-hover)]'
@@ -424,6 +425,7 @@ export default function SkillsPage() {
               <button
                 onClick={() => handleRemove(s.id, s.name)}
                 title={t('skill.deleteTitle')}
+                aria-label={t('skill.deleteTitle')}
                 className="px-3 py-1 text-xs border border-[var(--danger)]/40 text-[var(--danger)] rounded hover:bg-[var(--danger)]/10 transition-colors"
               >
                 <Icon name="delete" size={12} />
@@ -496,7 +498,7 @@ function SkillUsageView({
         </button>
       </div>
 
-      {loading && <p className="text-xs text-[var(--text-muted)]">{t('common.loading')}</p>}
+      {loading && <Skeleton lines={2} label={t('common.loading')} />}
 
       {/* 汇总卡片 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">

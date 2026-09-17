@@ -4,7 +4,7 @@
 
 use super::*;
 
-pub(super) async fn connect_device(args: &Value) -> Result<String, String> {
+pub(super) async fn connect_device(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("connect").trim();
     let host = args["host"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("");
     let port = args["port"].as_u64().unwrap_or(5555);
@@ -22,8 +22,13 @@ pub(super) async fn connect_device(args: &Value) -> Result<String, String> {
     };
     match action {
         "connect" => {
-            let out = run_cmd("hdc", &["tconn".into(), target.clone()], None, 30).await
-                .map_err(|e| format!("无线连接失败：{e}"))?;
+            let capability = crate::agent::capability_broker::HostCapability::HdcConnect { target: target.clone() };
+            let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+                .await.map_err(|e| format!("无线连接失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("无线连接失败：{}", out.trim()));
+            }
             let out = out.trim();
             Ok(format!(
                 "无线连接请求已发送：{target}\n设备输出：{}\n下一步：调用 list_devices 确认设备在线；部署/截图/日志时 device 参数填 {target}。",
@@ -31,16 +36,25 @@ pub(super) async fn connect_device(args: &Value) -> Result<String, String> {
             ))
         }
         "disconnect" => {
-            let out = run_cmd("hdc", &["tconn".into(), "-d".into(), target.clone()], None, 30).await
-                .map_err(|e| format!("断开失败：{e}"))?;
+            let capability = crate::agent::capability_broker::HostCapability::HdcDisconnect { target: target.clone() };
+            let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+                .await.map_err(|e| format!("断开失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("断开失败：{}", out.trim()));
+            }
             Ok(format!("已断开 {target}\n设备输出：{}", out.trim()))
         }
-        "list" => list_devices().await,
+        "list" => list_devices(ctx).await,
         _ => Err(format!("action 仅支持 connect|disconnect|list，收到 {action}")),
     }
 }
 
-pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<String, String> {
+pub(super) async fn manage_hdc(
+    args: &Value,
+    db: &crate::db::DbState,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("status").trim();
     if !matches!(action, "start" | "stop" | "restart" | "status") {
         return Err("action 仅支持 start|stop|restart|status".into());
@@ -53,8 +67,10 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
     let hdc = env.hdc_path.clone().unwrap_or_else(|| "hdc".to_string());
     // 服务状态探测：能执行 list targets 即视为在线
     let probe = async || {
-        match run_cmd(&hdc, &["list".into(), "targets".into()], None, 15).await {
-            Ok(t) => {
+        let capability = crate::agent::capability_broker::HostCapability::HdcListTargets;
+        match crate::agent::capability_broker::execute_host_capability(&capability, None, ctx).await {
+            Ok(output) if output.status.success() => {
+                let t = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
                 let devs: Vec<&str> = t
                     .lines()
                     .map(|l| l.trim())
@@ -66,7 +82,7 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
                     devs.len()
                 ))
             }
-            Err(_) => None,
+            _ => None,
         }
     };
     match action {
@@ -77,9 +93,14 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
             )),
         },
         "start" => {
-            let out = run_cmd(&hdc, &["start".into()], None, 30)
+            let capability = crate::agent::capability_broker::HostCapability::HdcStartServer;
+            let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
                 .await
                 .map_err(|e| format!("hdc start 失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("hdc start 失败：{}", out.trim()));
+            }
             let mut s = format!("hdc start 执行完成。\n{}", out.trim_end());
             if let Some(ok) = probe().await {
                 s.push_str(&format!("\n✓ {ok}"));
@@ -89,9 +110,14 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
             Ok(s)
         }
         "stop" => {
-            let out = run_cmd(&hdc, &["kill".into()], None, 30)
+            let capability = crate::agent::capability_broker::HostCapability::HdcKillServer;
+            let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
                 .await
                 .map_err(|e| format!("hdc kill 失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("hdc kill 失败：{}", out.trim()));
+            }
             let mut s = format!("hdc 服务已停止。\n{}", out.trim_end());
             if probe().await.is_some() {
                 s.push_str("\n（探测到服务仍在响应，可能被自动拉起，可再次执行 stop）");
@@ -99,10 +125,22 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
             Ok(s)
         }
         "restart" => {
-            let _ = run_cmd(&hdc, &["kill".into()], None, 20).await;
-            let out = run_cmd(&hdc, &["start".into()], None, 30)
+            let kill = crate::agent::capability_broker::HostCapability::HdcKillServer;
+            let kill_output = crate::agent::capability_broker::execute_host_capability(&kill, None, ctx)
+                .await
+                .map_err(|e| format!("hdc restart 的停止阶段失败：{e}"))?;
+            if !kill_output.status.success() {
+                let detail = smart_decode(&kill_output.stdout) + &smart_decode(&kill_output.stderr);
+                return Err(format!("hdc restart 的停止阶段失败：{}", detail.trim()));
+            }
+            let start = crate::agent::capability_broker::HostCapability::HdcStartServer;
+            let output = crate::agent::capability_broker::execute_host_capability(&start, None, ctx)
                 .await
                 .map_err(|e| format!("hdc start 失败：{e}"))?;
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(format!("hdc start 失败：{}", out.trim()));
+            }
             let mut s = format!("hdc 服务已重启。\n{}", out.trim_end());
             match probe().await {
                 Some(ok) => s.push_str(&format!("\n✓ {ok}")),
@@ -114,35 +152,38 @@ pub(super) async fn manage_hdc(args: &Value, db: &crate::db::DbState) -> Result<
     }
 }
 
-pub(super) fn emulator_exe() -> Option<PathBuf> {
-    for dir in crate::commands::health::discover_deveco_dirs() {
-        for rel in [
-            "tools/emulator/Emulator.exe",
-            "sdk/emulator/Emulator.exe",
-            "emulator/Emulator.exe",
-        ] {
-            let p = dir.join(rel);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
+async fn broker_hdc_targets(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::HdcListTargets;
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("设备清单查询失败：{}", text.trim()));
     }
-    for p in [
-        r"C:\Program Files\Huawei\DevEco Studio\tools\emulator\Emulator.exe",
-        r"D:\Huawei\DevEco Studio\tools\emulator\Emulator.exe",
-        r"C:\Program Files\Huawei\DevEco Studio\sdk\emulator\Emulator.exe",
-    ] {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
-        }
-    }
-    None
+    Ok(smart_decode(&output.stdout))
 }
 
-pub(super) async fn list_emulators() -> Result<String, String> {
-    // emulator_exe 内部走 discover_deveco_dirs（reg query 等同步 IO），放入 blocking 线程池
-    let emu = tokio::task::spawn_blocking(emulator_exe)
+async fn broker_emulator_command(
+    capability: &crate::agent::capability_broker::HostCapability,
+    label: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let output = crate::agent::capability_broker::execute_host_capability(capability, None, ctx)
+        .await
+        .map_err(|error| format!("{label}失败：{error}"))?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("{label}失败：{}", text.trim()));
+    }
+    Ok(smart_decode(&output.stdout))
+}
+
+pub(super) async fn list_emulators(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let emu = tokio::task::spawn_blocking(
+        crate::agent::capability_broker::emulator_executable,
+    )
         .await
         .map_err(|e| format!("查找模拟器任务失败: {e}"))?;
     let Some(emu) = emu else {
@@ -151,14 +192,10 @@ pub(super) async fn list_emulators() -> Result<String, String> {
                 .into(),
         );
     };
-    let out = run_cmd(
-        &emu.to_string_lossy(),
-        &["-list".into()],
-        None,
-        30,
-    )
-    .await
-    .map_err(|e| format!("运行模拟器列表命令失败：{e}"))?;
+    let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+        kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+    };
+    let out = broker_emulator_command(&query, "运行模拟器列表命令", ctx).await?;
     let names: Vec<&str> = out.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     if names.is_empty() {
         return Ok(format!(
@@ -167,9 +204,7 @@ pub(super) async fn list_emulators() -> Result<String, String> {
         ));
     }
     // 标注已在线的实例（hdc 里含 localhost/127.0.0.1 设备的粗略判断）
-    let online = run_cmd("hdc", &["list".into(), "targets".into()], None, 15)
-        .await
-        .unwrap_or_default();
+    let online = broker_hdc_targets(ctx).await.unwrap_or_default();
     let has_local = online.contains("127.0.0.1") || online.contains("localhost");
     let mut s = format!(
         "DevEco Studio 模拟器实例（{} 个，工具：{}）：\n",
@@ -183,7 +218,10 @@ pub(super) async fn list_emulators() -> Result<String, String> {
     Ok(s)
 }
 
-pub(super) async fn start_emulator(args: &Value) -> Result<String, String> {
+pub(super) async fn start_emulator(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let name = args["name"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
     let Some(name) = name else {
         return Err("start_emulator 需要 name（实例名，先用 list_emulators 查看）".into());
@@ -192,13 +230,11 @@ pub(super) async fn start_emulator(args: &Value) -> Result<String, String> {
     if !matches!(action, "start" | "stop") {
         return Err("action 仅支持 start|stop".into());
     }
-    let Some(emu) = emulator_exe() else {
-        return Err("未找到 DevEco Studio 模拟器（Emulator.exe），请先安装 DevEco Studio".into());
-    };
     // 校验实例存在（-list 输出逐行是实例名）
-    let list_out = run_cmd(&emu.to_string_lossy(), &["-list".into()], None, 30)
-        .await
-        .map_err(|e| format!("读取模拟器列表失败：{e}"))?;
+    let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+        kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+    };
+    let list_out = broker_emulator_command(&query, "读取模拟器列表", ctx).await?;
     let exists = list_out.lines().any(|l| l.trim() == name);
     if !exists {
         let names: Vec<&str> = list_out.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
@@ -208,33 +244,38 @@ pub(super) async fn start_emulator(args: &Value) -> Result<String, String> {
         ));
     }
     if action == "stop" {
-        let out = run_cmd(&emu.to_string_lossy(), &["-stop".into(), name.to_string()], None, 60)
-            .await
-            .map_err(|e| format!("停止模拟器失败：{e}"))?;
+        let stop = crate::agent::capability_broker::HostCapability::StopEmulator {
+            name: name.to_string(),
+        };
+        let out = broker_emulator_command(&stop, "停止模拟器", ctx).await?;
         return Ok(format!("已发送停止指令：{name}\n{}", out.trim_end()));
     }
-    // start：后台拉起（模拟器有 GUI 窗口，不隐藏、不等待退出）
-    let mut cmd = crate::utils::process::command(&emu.to_string_lossy(), &["-start".into(), name.to_string()])
-        .map_err(|e| e.to_string())?;
-    let _child = cmd.spawn().map_err(|e| format!("启动模拟器失败：{e}"))?;
-    // 轮询 hdc：启动前设备快照 → 新设备出现即上线
+    // HDC 只能提供设备上线证据，不能证明设备属于指定模拟器实例。
     let wait_secs = args["wait_secs"].as_u64().unwrap_or(60).clamp(5, 120);
-    let before: std::collections::HashSet<String> = run_cmd("hdc", &["list".into(), "targets".into()], None, 15)
-        .await
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_whitespace().next().map(String::from))
-        .collect();
+    let baseline = broker_hdc_targets(ctx).await
+        .map_err(|error| format!("未启动模拟器：无法取得启动前设备基线：{error}"))?;
+    let before = online_target_set(&baseline);
+    // start 是 GUI 长进程：Broker 在 spawn 前 claim，spawn 成功即记录派发终态；
+    // 真实启动效果由下面独立的 HDC 查询验证。
+    let start = crate::agent::capability_broker::HostCapability::StartEmulator {
+        name: name.to_string(),
+    };
+    let dispatched_pid = crate::agent::capability_broker::dispatch_host_capability(&start, ctx)
+        .map_err(|error| format!("启动模拟器失败：{error}"))?;
+    let pid_note = dispatched_pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "进程已快速转交".into());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
     let mut seen = String::new();
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if let Ok(t) = run_cmd("hdc", &["list".into(), "targets".into()], None, 15).await {
-            let now_set: std::collections::HashSet<String> = t
-                .lines()
-                .filter_map(|l| l.split_whitespace().next().map(String::from))
-                .collect();
-            let new: Vec<&String> = now_set.difference(&before).collect();
+        {
+            let t = broker_hdc_targets(ctx).await.map_err(|error| format!(
+                "模拟器 {name} 已派发（PID：{pid_note}），但上线验证中断，实际状态未知；请查询 list_devices，勿自动重复启动：{error}"
+            ))?;
+            let now_set = online_target_set(&t);
+            let mut new: Vec<&String> = now_set.difference(&before).collect();
+            new.sort();
             if !new.is_empty() {
                 seen = new.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
                 break;
@@ -243,29 +284,43 @@ pub(super) async fn start_emulator(args: &Value) -> Result<String, String> {
     }
     if seen.is_empty() {
         Ok(format!(
-            "模拟器 {name} 已后台启动（{wait_secs}s 内 hdc 未发现新设备）。\n模拟器首次冷启动可能需要 1-3 分钟，稍后调用 list_devices 确认在线；若始终未上线，检查 DevEco Studio 模拟器窗口是否有报错。"
+            "模拟器 {name} 已后台派发（PID：{pid_note}；{wait_secs}s 内 hdc 未发现新设备）。\n模拟器首次冷启动可能需要 1-3 分钟，稍后调用 list_devices 确认在线；若始终未上线，检查 DevEco Studio 模拟器窗口是否有报错。"
         ))
     } else {
         Ok(format!(
-            "模拟器 {name} 已启动，新设备上线：{seen}\n下一步：list_devices 查看详情后即可部署/测试（deploy 会部署到全部在线设备，注意区分真机与模拟器）。"
+            "模拟器 {name} 已后台派发（PID：{pid_note}）；观察到新增已授权在线设备：{seen}。\n尚不能证明这些设备属于实例 {name}，请用 list_devices 核对后显式选择部署目标，勿自动部署到新设备。"
         ))
     }
 }
 
-pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
+fn online_target_set(text: &str) -> std::collections::HashSet<String> {
+    crate::commands::devices::online_device_ids_from_targets(text).into_iter().collect()
+}
+
+
+fn validate_instance_transition(list: &str, name: &str, action: &str) -> Result<(), String> {
+    let exists = list.lines().any(|line| line.trim() == name);
+    match (action, exists) {
+        ("create", true) => Err(format!("实例 {name} 已存在，拒绝覆盖或将旧实例误报为新建成功")),
+        ("delete", false) => Err(format!("实例 {name} 不存在，未执行删除")),
+        _ => Ok(()),
+    }
+}
+
+pub(super) async fn create_emulator(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("create").trim();
     if !matches!(action, "create" | "delete" | "images" | "models") {
         return Err("action 仅支持 create|delete|images|models".into());
     }
-    let Some(emu) = emulator_exe() else {
-        return Err("未找到 DevEco Studio 模拟器（Emulator.exe），请先安装 DevEco Studio".into());
-    };
-    let exe = emu.to_string_lossy();
-    // 镜像/机型查询：无参数副作用，直接执行
+    // 镜像/机型查询是 replay-safe 的固定 Broker 能力。
     if action == "images" {
-        let out = run_cmd(&exe, &["-imageList".into(), "-downloaded".into()], None, 60)
-            .await
-            .map_err(|e| format!("查询镜像失败：{e}"))?;
+        let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+            kind: crate::agent::capability_broker::EmulatorQueryKind::DownloadedImages,
+        };
+        let out = broker_emulator_command(&query, "查询镜像", ctx).await?;
         let body = out.trim();
         if body.is_empty() {
             return Ok("尚未下载任何模拟器系统镜像。\n可调用 create_emulator action=models 查看支持机型，或直接在 DevEco Studio Device Manager 中下载/创建。".into());
@@ -273,9 +328,10 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
         return Ok(format!("已下载的模拟器系统镜像：\n{body}\n\n创建实例时 os_version 传镜像对应的版本字符串（如 HarmonyOS 6.0.0(20)）。"));
     }
     if action == "models" {
-        let out = run_cmd(&exe, &["-screenProfileList".into()], None, 60)
-            .await
-            .map_err(|e| format!("查询机型失败：{e}"))?;
+        let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+            kind: crate::agent::capability_broker::EmulatorQueryKind::ScreenProfiles,
+        };
+        let out = broker_emulator_command(&query, "查询机型", ctx).await?;
         let body = out.trim();
         return Ok(if body.is_empty() {
             "未获取到机型列表（可按设备类型创建：Phone/Foldable/Tablet/2in1/Wearable/TV 等）。".into()
@@ -287,10 +343,25 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
     let Some(name) = name else {
         return Err(format!("create_emulator {action} 需要 name（实例名）"));
     };
+    let query = crate::agent::capability_broker::HostCapability::QueryEmulator {
+        kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+    };
+    let baseline = broker_emulator_command(&query, "读取实例变更前清单", ctx).await?;
+    validate_instance_transition(&baseline, name, action)?;
     if action == "delete" {
-        let out = run_cmd(&exe, &["-delete".into(), name.to_string(), "-force".into()], None, 60)
+        let delete = crate::agent::capability_broker::HostCapability::DeleteEmulator {
+            name: name.to_string(),
+        };
+        let out = broker_emulator_command(&delete, "删除实例", ctx).await?;
+        let verification = crate::agent::capability_broker::HostCapability::QueryEmulator {
+            kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+        };
+        let remaining = broker_emulator_command(&verification, "验证实例删除结果", ctx)
             .await
-            .map_err(|e| format!("删除实例失败：{e}"))?;
+            .map_err(|error| format!("删除命令已返回成功，但无法验证实例清单：{error}"))?;
+        if remaining.lines().any(|line| line.trim() == name) {
+            return Err(format!("删除命令已返回成功，但实例 {name} 仍在清单中"));
+        }
         return Ok(format!("已删除模拟器实例 {name}。\n{}", out.trim_end()));
     }
     // create：校验 device_type 与 os_version
@@ -302,26 +373,28 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
     let Some(os_version) = os_version else {
         return Err("create 需要 os_version（如 \"HarmonyOS 6.0.0(20)\"，先 create_emulator action=images 查看已下载版本）".into());
     };
-    let mut cmd_args: Vec<String> = vec![
-        "-create".into(),
-        name.to_string(),
-        "-deviceType".into(),
-        device_type.to_string(),
-        "-osVersion".into(),
-        os_version.to_string(),
-    ];
-    if let Some(sp) = args["screen_profile"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        cmd_args.extend(["-screenProfile".into(), sp.to_string()]);
-    }
-    let memory = args["memory"].as_u64().unwrap_or(4);
-    if (2..=32).contains(&memory) && memory != 4 {
-        cmd_args.extend(["-memory".into(), memory.to_string()]);
-    }
-    let storage = args["storage"].as_u64().unwrap_or(6);
-    if (2..=1023).contains(&storage) && storage != 6 {
-        cmd_args.extend(["-storage".into(), storage.to_string()]);
-    }
-    let out = run_cmd(&exe, &cmd_args, None, 180)
+    let screen_profile = args["screen_profile"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from);
+    let memory_gb = match args.get("memory") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or("memory 必须是 2-32 之间的整数")?),
+    };
+    let storage_gb = match args.get("storage") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or("storage 必须是 2-1023 之间的整数")?),
+    };
+    let create = crate::agent::capability_broker::HostCapability::CreateEmulator {
+        name: name.to_string(),
+        device_type: device_type.to_string(),
+        os_version: os_version.to_string(),
+        screen_profile,
+        memory_gb,
+        storage_gb,
+    };
+    let out = broker_emulator_command(&create, "创建实例", ctx)
         .await
         .map_err(|e| {
             let hint = if e.contains("license") || e.to_lowercase().contains("agreement") {
@@ -331,8 +404,17 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
             } else {
                 ""
             };
-            format!("创建实例失败：{e}{hint}")
+            format!("{e}{hint}")
         })?;
+    let verification = crate::agent::capability_broker::HostCapability::QueryEmulator {
+        kind: crate::agent::capability_broker::EmulatorQueryKind::Instances,
+    };
+    let instances = broker_emulator_command(&verification, "验证实例创建结果", ctx)
+        .await
+        .map_err(|error| format!("创建命令已返回成功，但无法验证实例清单：{error}"))?;
+    if !instances.lines().any(|line| line.trim() == name) {
+        return Err(format!("创建命令已返回成功，但实例 {name} 未出现在实例清单中"));
+    }
     Ok(format!(
         "模拟器实例 {name} 创建完成（{device_type} / {os_version}）。\n{}
 下一步：list_emulators 确认实例在列，start_emulator name={name} 启动。",
@@ -340,45 +422,75 @@ pub(super) async fn create_emulator(args: &Value) -> Result<String, String> {
     ))
 }
 
-pub(super) async fn device_file(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn device_file(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("").trim();
     if action != "push" && action != "pull" {
         return Err("device_file 参数 action 仅支持 push 或 pull".into());
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let remote = args["remote"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
     let Some(remote) = remote else {
         return Err("device_file 需要 remote（设备端路径）".into());
     };
-    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    let project_path = roots.first().map(String::as_str).filter(|path| !path.is_empty())
+        .ok_or("device_file 需要绑定项目工作区")?;
+    let project_root = Path::new(project_path)
+        .canonicalize()
+        .map_err(|e| format!("无法解析项目工作区：{e}"))?;
     let local_arg = args["local"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+    if let Some(local) = local_arg {
+        let path = Path::new(local);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir)
+            })
+        {
+            return Err("device_file 的 local 必须是工作区内且不含 .. 的相对路径".into());
+        }
+    }
     match action {
         "push" => {
             let local = local_arg.ok_or_else(|| "push 需要 local（本地文件路径）".to_string())?;
-            let local_path = resolve_local_path(local, project_path);
-            if !local_path.is_file() {
-                return Err(format!("本地文件不存在：{}", local_path.display()));
+            let requested = resolve_local_path(local, project_path);
+            let local_path = requested
+                .canonicalize()
+                .map_err(|e| format!("无法解析本地文件：{e}"))?;
+            if !local_path.starts_with(&project_root) || !local_path.is_file() {
+                return Err("push 的本地源必须是项目工作区内的普通文件".into());
             }
-            let hdc_args: Vec<String> = vec![
-                "-t".into(), device.clone(), "file".into(), "send".into(),
-                local_path.to_string_lossy().to_string(), remote.to_string(),
-            ];
-            run_cmd("hdc", &hdc_args, None, 120).await.map_err(|e| format!("推送失败：{e}"))?;
+            let relative = local_path
+                .strip_prefix(&project_root)
+                .map_err(|_| "无法把本地源转换为工作区相对路径")?
+                .to_string_lossy()
+                .into_owned();
+            let capability = crate::agent::capability_broker::HostCapability::SendFile {
+                device: device.clone(), local_path: relative, remote_path: remote.to_string(),
+            };
+            let output = crate::agent::capability_broker::execute_host_capability(
+                &capability, Some(&project_root), ctx,
+            )
+            .await
+            .map_err(|e| format!("推送失败：{e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "推送失败：{}",
+                    (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim()
+                ));
+            }
             Ok(format!("已推送 {} → {remote}（设备 {device}）", local_path.display()))
         }
         "pull" => {
             let local_path = match local_arg {
                 Some(l) => resolve_local_path(l, project_path),
                 None => {
-                    // 缺省保存到工程 .deveco-agent/files/（无工程时用系统临时目录）
-                    let base = if project_path.is_empty() {
-                        std::env::temp_dir().join("deveco-agent-files")
-                    } else {
-                        Path::new(project_path).join(".deveco-agent").join("files")
-                    };
+                    let base = project_root.join(".deveco-agent").join("files");
                     let fname = Path::new(remote)
                         .file_name()
                         .map(|f| f.to_string_lossy().to_string())
@@ -386,14 +498,43 @@ pub(super) async fn device_file(args: &Value, roots: &[String]) -> Result<String
                     base.join(fname)
                 }
             };
-            if let Some(parent) = local_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            let requested_parent = local_path.parent().ok_or("pull 的本地目标缺少父目录")?;
+            let mut existing_ancestor = requested_parent;
+            while !existing_ancestor.exists() {
+                existing_ancestor = existing_ancestor.parent().ok_or("pull 的本地目标无法定位工作区祖先")?;
             }
-            let hdc_args: Vec<String> = vec![
-                "-t".into(), device.clone(), "file".into(), "recv".into(),
-                remote.to_string(), local_path.to_string_lossy().to_string(),
-            ];
-            run_cmd("hdc", &hdc_args, None, 120).await.map_err(|e| format!("拉取失败：{e}"))?;
+            let ancestor = existing_ancestor
+                .canonicalize().map_err(|e| format!("无法解析本地目标祖先目录：{e}"))?;
+            if !ancestor.starts_with(&project_root) {
+                return Err("pull 的本地目标父目录通过符号链接逃逸项目工作区".into());
+            }
+            std::fs::create_dir_all(requested_parent).map_err(|e| e.to_string())?;
+            let parent = requested_parent
+                .canonicalize().map_err(|e| format!("无法解析本地目标父目录：{e}"))?;
+            if !parent.starts_with(&project_root) {
+                return Err("pull 的本地目标必须位于项目工作区内，且父目录不得通过符号链接逃逸".into());
+            }
+            let file_name = local_path.file_name().ok_or("pull 的本地目标缺少文件名")?;
+            let local_path = parent.join(file_name);
+            let relative = local_path
+                .strip_prefix(&project_root)
+                .map_err(|_| "无法把本地目标转换为工作区相对路径")?
+                .to_string_lossy()
+                .into_owned();
+            let capability = crate::agent::capability_broker::HostCapability::ReceiveFile {
+                device: device.clone(), remote_path: remote.to_string(), local_path: relative,
+            };
+            let output = crate::agent::capability_broker::execute_host_capability(
+                &capability, Some(&project_root), ctx,
+            )
+            .await
+            .map_err(|e| format!("拉取失败：{e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "拉取失败：{}",
+                    (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim()
+                ));
+            }
             if !local_path.exists() {
                 return Err("拉取失败：本地文件未生成（设备端路径可能不存在或权限受限）".into());
             }
@@ -414,10 +555,14 @@ pub(super) fn resolve_local_path(p: &str, project_path: &str) -> PathBuf {
     }
 }
 
-pub(super) async fn stop_app(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn stop_app(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -431,50 +576,36 @@ pub(super) async fn stop_app(args: &Value, roots: &[String]) -> Result<String, S
                 .ok_or_else(|| "未指定 bundle 且工程未解析出 bundleName".to_string())?
         }
     };
-    run_hdc_shell(&device, &["aa", "force-stop", &bundle], 20).await?;
+    let capability = crate::agent::capability_broker::HostCapability::StopAbility {
+        device: device.clone(), bundle: bundle.clone(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "停止应用失败：{}",
+            (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim()
+        ));
+    }
     Ok(format!(
         "已强制停止 {bundle}（设备 {device}）。\n后续建议：start_ability 重新启动验证冷启动；collect_perf 采样冷启动性能。"
     ))
 }
 
 pub(super) fn validate_device_shell_command(command: &str) -> Result<Vec<&str>, String> {
-    if !command
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || " /._-:+=,[%]".contains(c))
-    {
-        return Err(format!(
-            "device_shell 拒绝执行包含 shell 元字符的命令（仅允许字母/数字/空格及 / . _ - : + = , [ ] %）：{command}"
-        ));
-    }
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    let Some(cmd) = tokens.first().copied() else {
-        return Err("device_shell 命令不能为空".into());
-    };
-    if !DEVICE_SHELL_ALLOWED.contains(&cmd) {
-        return Err(format!(
-            "命令 {cmd} 不在 device_shell 白名单（{}）；如需修改设备状态请用对应专用工具",
-            DEVICE_SHELL_ALLOWED.join("/")
-        ));
-    }
-    if let Some(bad) = DEVICE_SHELL_FORBIDDEN_TOKENS
-        .iter()
-        .find(|t| command.split_whitespace().any(|w| w.starts_with(**t)))
-    {
-        return Err(format!("device_shell 拒绝破坏性命令 {bad}，请使用对应专用工具"));
-    }
-    if cmd == "aa" && !tokens.iter().skip(1).any(|t| *t == "dump") {
-        return Err("device_shell 中 aa 仅允许 dump 查询子命令；启动/停止应用请用 start_ability/stop_app".into());
-    }
-    if cmd == "bm" && !tokens.iter().skip(1).any(|t| *t == "dump") {
-        return Err("device_shell 中 bm 仅允许 dump 查询子命令；安装/卸载请用 deploy/uninstall_app".into());
-    }
+    let owned = tokens.iter().map(|token| (*token).to_string()).collect::<Vec<_>>();
+    crate::agent::capability_broker::validate_read_only_device_command(&owned)?;
     Ok(tokens)
 }
 
-pub(super) async fn device_shell(args: &Value) -> Result<String, String> {
+pub(super) async fn device_shell(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let command = args["command"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
     let Some(command) = command else {
@@ -482,8 +613,17 @@ pub(super) async fn device_shell(args: &Value) -> Result<String, String> {
     };
     // 四重安全校验（纯函数，便于单元测试）
     let tokens = validate_device_shell_command(command)?;
-    let out = run_hdc_shell(&device, &tokens, 30).await?;
-    let out = out.trim_end();
+    let capability = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: tokens.iter().map(|token| (*token).to_string()).collect(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let decoded = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("设备查询失败：{}", decoded.trim()));
+    }
+    let out = decoded.trim_end();
     if out.is_empty() {
         return Ok(format!("命令执行成功（设备 {device}），无输出"));
     }
@@ -495,44 +635,55 @@ pub(super) async fn device_shell(args: &Value) -> Result<String, String> {
     Ok(format!("设备 {device} 执行 `{command}`：\n{truncated}"))
 }
 
-pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn analyze_crash(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
-    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    let project_path = roots.first().map(String::as_str).filter(|path| !path.is_empty())
+        .ok_or("analyze_crash 需要绑定项目工作区")?;
+    let project_root = Path::new(project_path)
+        .canonicalize()
+        .map_err(|e| format!("无法解析项目工作区：{e}"))?;
     let bundle = match args["bundle"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(b) => b.to_string(),
         None => {
-            if project_path.is_empty() {
-                String::new()
-            } else {
-                crate::services::harmony::parse_project(Path::new(project_path))
-                    .bundle_name
-                    .unwrap_or_default()
-            }
+            crate::services::harmony::parse_project(&project_root)
+                .bundle_name
+                .unwrap_or_default()
         }
     };
     let limit = args["limit"].as_u64().unwrap_or(3).clamp(1, 10) as usize;
     // 1) 扫描 faultlog 目录（真机权限可能受限，多个候选目录逐个尝试）
-    let dirs = ["/data/log/faultlog/faultlogger", "/data/log/faultlog/temp", "/data/log/faultlog"];
+    use crate::agent::capability_broker::{FaultLogDirectory, HostCapability};
+    let dirs = [FaultLogDirectory::FaultLogger, FaultLogDirectory::Temp, FaultLogDirectory::Root];
     let mut remote_files: Vec<String> = Vec::new();
-    for dir in dirs {
+    for directory in dirs {
         let mut ok = false;
-        if let Ok(out) = run_hdc_shell(&device, &["ls", "-1", dir], 15).await {
-            for line in out.lines() {
+        let capability = HostCapability::ListFaultLogs {
+            device: device.clone(), directory,
+        };
+        if let Ok(output) = crate::agent::capability_broker::execute_host_capability(
+            &capability, None, ctx,
+        ).await {
+            if !output.status.success() {
+                continue;
+            }
+            let listing = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            for line in listing.lines() {
                 // 多列输出兼容：按空白拆分逐个取文件名
                 for name in line.split_whitespace() {
                     let name = name.trim();
-                    if name.is_empty()
-                        || name.starts_with('.')
-                        || name.contains(':')
+                    if !is_safe_faultlog_name(name)
                         || name.contains("denied")
-                        || !name.chars().any(|c| c.is_ascii_digit())
                     {
                         continue;
                     }
-                    remote_files.push(format!("{dir}/{name}"));
+                    remote_files.push(format!("{}/{name}", directory.as_path()));
                     ok = true;
                 }
             }
@@ -558,12 +709,26 @@ pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<Stri
     remote_files.sort_by_key(|a| std::cmp::Reverse(crash_time_key(a)));
     remote_files.truncate(limit);
     // 4) 拉取到本地并解析
-    let base = if project_path.is_empty() {
-        std::env::temp_dir().join("deveco-agent-crashes")
-    } else {
-        Path::new(project_path).join(".deveco-agent").join("crashes")
-    };
-    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    let requested_base = project_root.join(".deveco-agent").join("crashes");
+    let mut existing_ancestor = requested_base.as_path();
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor
+            .parent()
+            .ok_or("崩溃副本目录无法定位工作区祖先")?;
+    }
+    let ancestor = existing_ancestor
+        .canonicalize()
+        .map_err(|e| format!("无法解析崩溃副本目录祖先：{e}"))?;
+    if !ancestor.starts_with(&project_root) {
+        return Err("崩溃副本目录通过符号链接逃逸项目工作区".into());
+    }
+    std::fs::create_dir_all(&requested_base).map_err(|e| e.to_string())?;
+    let base = requested_base
+        .canonicalize()
+        .map_err(|e| format!("无法解析崩溃副本目录：{e}"))?;
+    if !base.starts_with(&project_root) {
+        return Err("崩溃副本目录必须位于项目工作区内".into());
+    }
     let mut out = format!("崩溃分析（设备 {device}，{} 条）：\n", remote_files.len());
     for (i, remote) in remote_files.iter().enumerate() {
         let fname = Path::new(remote)
@@ -571,11 +736,18 @@ pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<Stri
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("crash-{i}.log"));
         let local = base.join(&fname);
-        let hdc_args: Vec<String> = vec![
-            "-t".into(), device.clone(), "file".into(), "recv".into(),
-            remote.clone(), local.to_string_lossy().to_string(),
-        ];
-        if run_cmd("hdc", &hdc_args, None, 60).await.is_err() || !local.exists() {
+        let relative = local
+            .strip_prefix(&project_root)
+            .map_err(|_| "无法把崩溃副本转换为工作区相对路径")?
+            .to_string_lossy()
+            .into_owned();
+        let capability = HostCapability::ReceiveFile {
+            device: device.clone(), remote_path: remote.clone(), local_path: relative,
+        };
+        let received = crate::agent::capability_broker::execute_host_capability(
+            &capability, Some(&project_root), ctx,
+        ).await;
+        if !matches!(received, Ok(ref output) if output.status.success()) || !local.exists() {
             out.push_str(&format!("\n[{}] {fname}：拉取失败（权限受限）\n", i + 1));
             continue;
         }
@@ -586,6 +758,10 @@ pub(super) async fn analyze_crash(args: &Value, roots: &[String]) -> Result<Stri
     }
     out.push_str("\n建议：结合 read_runtime_logs 查看崩溃前后的运行日志；修复后重新部署验证。");
     Ok(out)
+}
+
+pub(super) fn is_safe_faultlog_name(name: &str) -> bool {
+    crate::agent::capability_broker::validate_faultlog_filename(name).is_ok()
 }
 
 pub(super) fn crash_time_key(name: &str) -> u64 {
@@ -641,4 +817,26 @@ pub(super) fn summarize_crash_file(content: &str) -> String {
         s.push_str("…\n");
     }
     s
+}
+
+#[cfg(test)]
+mod emulator_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn online_evidence_excludes_empty_offline_and_unauthorized_targets() {
+        let targets = online_target_set("[Empty]\nold Offline\nlocked Unauthorized\npending Unknown\nnew Connected\nnew Connected\nlegacy\n");
+        assert_eq!(targets, ["new".to_string(), "legacy".to_string()].into_iter().collect());
+        let before = online_target_set("device Offline\n");
+        let after = online_target_set("device Connected\n");
+        assert_eq!(after.difference(&before).count(), 1);
+    }
+
+    #[test]
+    fn instance_transition_requires_exact_precondition() {
+        assert!(validate_instance_transition("Phone\nPhone2\n", "Phone", "create").is_err());
+        assert!(validate_instance_transition("Phone2\n", "Phone", "create").is_ok());
+        assert!(validate_instance_transition("Phone2\n", "Phone", "delete").is_err());
+        assert!(validate_instance_transition(" Phone \r\n", "Phone", "delete").is_ok());
+    }
 }

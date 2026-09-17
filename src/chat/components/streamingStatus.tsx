@@ -87,20 +87,48 @@ export const RunningTaskOpsBadge = memo(function RunningTaskOpsBadge({
   agents: AgentRun[]
 }) {
   const startedAt = useProjectStore((state) => state.streamings[conversationId]?.startedAt ?? null)
+  const contentLen = useProjectStore((state) => state.streamings[conversationId]?.content?.length ?? 0)
   const elapsed = useElapsedSeconds(startedAt)
+  const { t } = useTranslation()
+
+  const runningTools = runs.filter((r) => r.status === 'running')
+  const currentTool = runningTools[0]?.tool
+  const runningCount = runningTools.length
+  const charsPerSec = elapsed > 3 ? Math.round(contentLen / elapsed) : 0
+
   if (!startedAt) return null
 
   return (
-    <TaskOpsBadge
-      running
-      count={count}
-      time={fmtElapsed(elapsed)}
-      toolName={toolName}
-      open={open}
-      onToggle={onToggle}
-      runs={runs}
-      agents={agents}
-    />
+    <div>
+      <TaskOpsBadge
+        running
+        count={count}
+        time={fmtElapsed(elapsed)}
+        toolName={toolName}
+        open={open}
+        onToggle={onToggle}
+        runs={runs}
+        agents={agents}
+      />
+      {(currentTool || charsPerSec > 0) && (
+        <div className="flex items-center gap-2 pl-3.5 text-[10.5px] text-[var(--text-muted)] mt-0.5 tabular-nums">
+          {currentTool && (
+            <span className="flex items-center gap-1 truncate max-w-[180px]" title={currentTool}>
+              <span className="w-1 h-1 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
+              <span className="truncate opacity-70">{currentTool}</span>
+              {runningCount > 1 && (
+                <span className="opacity-50">+{runningCount - 1}</span>
+              )}
+            </span>
+          )}
+          {charsPerSec > 0 && (
+            <span className="opacity-50 shrink-0">
+              {t('home.tokenRate', { rate: charsPerSec })}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
   )
 })
 

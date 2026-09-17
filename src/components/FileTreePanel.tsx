@@ -449,6 +449,7 @@ export default function FileTreePanel({
               }
             }}
             title={t('home.searchFile')}
+            aria-label={t('home.searchFile')}
             className={`p-1 rounded-md transition-colors ${searchOpen ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'}`}
           >
             <Icon name="search" size={13} />
@@ -456,6 +457,7 @@ export default function FileTreePanel({
           <button
             onClick={expanded.size > 1 ? collapseAll : expandAll}
             title={expanded.size > 1 ? t('home.collapseAll') : t('home.expandAll')}
+            aria-label={expanded.size > 1 ? t('home.collapseAll') : t('home.expandAll')}
             className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
           >
             {loadingAll ? (
@@ -471,6 +473,7 @@ export default function FileTreePanel({
           <button
             onClick={onRefresh}
             title={t('home.rebuildIndex')}
+            aria-label={t('home.rebuildIndex')}
             className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
           >
             <Icon name="refresh" size={13} />
@@ -497,6 +500,7 @@ export default function FileTreePanel({
               <button
                 onClick={() => setSearchQuery('')}
                 title={t('home.searchClear')}
+                aria-label={t('home.searchClear')}
                 className="p-1 shrink-0 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
               >
                 <Icon name="close" size={12} />
@@ -526,10 +530,9 @@ export default function FileTreePanel({
                 return (
                   <div
                     key={hit.path}
-                    className={`group flex items-center gap-1 rounded-md py-[3px] pr-1 text-[12px] cursor-pointer select-none transition-colors text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] ${
+                    className={`group flex items-center gap-1 rounded-md py-[3px] pl-2 pr-1 text-[12px] cursor-pointer select-none transition-colors text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] ${
                       ctxSelected === hit.path ? 'bg-[var(--accent-soft)] text-[var(--text-primary)]' : ''
                     }`}
-                    style={{ paddingLeft: 8 }}
                     onClick={() => openSearchHit(hit)}
                     onContextMenu={(e) => openContextMenu(e, { name: hit.name, path: hit.path, type: 'file' })}
                     title={hit.path}
@@ -548,7 +551,8 @@ export default function FileTreePanel({
                         onReference(hit.path)
                       }}
                       title={t('home.sendToChat')}
-                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-all shrink-0"
+                      aria-label={t('home.sendToChat')}
+                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-[color,background-color,border-color,opacity] shrink-0"
                     >
                       <Icon name="plus" size={12} />
                     </button>
@@ -593,7 +597,7 @@ export default function FileTreePanel({
         <div
           ref={menuRef}
           data-testid="ctx-menu"
-          className="fixed z-[9999] w-60 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
+          className="fixed z-[var(--app-z-popover)] w-60 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
           style={{
             left: Math.min(menu.x, window.innerWidth - 250),
             top: Math.min(menu.y, window.innerHeight - 320),
@@ -929,7 +933,8 @@ function TreeNodeItem({
               onReference(node.path)
             }}
             title={t('home.sendToChat')}
-            className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-all shrink-0"
+            aria-label={t('home.sendToChat')}
+            className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--accent-soft)] transition-[color,background-color,border-color,opacity] shrink-0"
           >
             <Icon name="plus" size={12} />
           </button>

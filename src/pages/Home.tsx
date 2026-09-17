@@ -97,6 +97,7 @@ import {
   ErrorCard,
   EmptyState,
   ChatEmptyState,
+  TaskSummaryCard,
 } from '../chat/components/messageBlocks'
 import { ModelSettingsPopover, PlanCard, TaskOpsBadge } from '../chat/components/plan'
 import {
@@ -107,11 +108,20 @@ import {
 } from '../chat/components/streamingStatus'
 import { LedgerCard } from '../chat/components/ledger'
 import { ToolRunGroup } from '../chat/components/toolRuns'
+import { ConversationNav } from '../chat/components/conversationNav'
 import { FeedbackDialog, VersionDiffDialog, MemoryDraftDialog, EditMessageDialog, RulesDialog } from '../chat/components/dialogs'
 import { OverviewRow, OverviewGitSummary, MemoriesPanel, ToolStatsPanel, PreviewPanel, TerminalPanel, ShellPanel } from '../chat/components/panels'
 import CommandPalette, { type PaletteCommand } from '../components/CommandPalette'
+import { Button } from '../components/ui/Button'
+import { IconButton } from '../components/ui/IconButton'
+import { Field, TextArea } from '../components/ui/Field'
+import { Skeleton, Spinner } from '../components/ui/Spinner'
+import { ConfirmDialog } from '../components/ui/ConfirmDialog'
+import { EmptyState as UiEmptyState } from '../components/ui/EmptyState'
+import { useEscapeKey } from '../hooks/useEscapeKey'
 import {
   fmtElapsed,
+  impactDisplay,
   interruptedTailMessage,
   restoreSelectionRange,
   sanitizeToolMarkers,
@@ -225,6 +235,13 @@ const convGroupKey = (ts: number): 'today' | 'yesterday' | 'week' | 'earlier' =>
   if (diffDays < 7) return 'week'
   return 'earlier'
 }
+
+// 发送圆钮的 className：流式 / 空闲两条工具栏里有一份逐字节相同的复制粘贴，
+// 抽成常量只写一次。刻意不迁 <Button>：这组控件要 rounded-full + 实心 accent
+// 底 + 发光 hover 阴影，Button 的 rounded-md 基类与软色/实心变体都表达不了，
+// 强行迁移要先给 Button 加 shape/tone 维度，等有像素取证的那批再做。
+const composerSendCls =
+  'w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,box-shadow,opacity,transform] shadow-lg shadow-[var(--accent)]/30 bg-[var(--accent-600)] hover:bg-[var(--accent-500)] hover:shadow-[0_4px_16px_var(--accent-glow)]'
 
 export default function Home() {
   const { t } = useTranslation()
@@ -556,7 +573,12 @@ export default function Home() {
   // 最近项目右键菜单（打开文件夹 / 刷新项目信息）
   const [projectMenu, setProjectMenu] = useState<{ x: number; y: number; project: Project } | null>(null)
   const projectMenuRef = useRef<HTMLDivElement>(null)
-  // 右键菜单关闭：点击菜单外 / Escape / 任意滚动
+  // 会话列表右键菜单
+  const [convMenu, setConvMenu] = useState<{ x: number; y: number; conv: Conversation } | null>(null)
+  const convMenuRef = useRef<HTMLDivElement>(null)
+  // 会话列表键盘焦点（-1 = 无焦点）
+  const [convFocusIdx, setConvFocusIdx] = useState(-1)
+  // 右键菜单关闭：点击菜单外 / 任意滚动
   useEffect(() => {
     if (!projectMenu) return
     const onDown = (e: MouseEvent) => {
@@ -564,19 +586,33 @@ export default function Home() {
         setProjectMenu(null)
       }
     }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setProjectMenu(null)
-    }
     const onScroll = () => setProjectMenu(null)
     document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onKey)
     window.addEventListener('scroll', onScroll, true)
     return () => {
       document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey)
       window.removeEventListener('scroll', onScroll, true)
     }
   }, [projectMenu])
+  // Escape 走全局栈：菜单开在模态之上时，一次 Esc 只关菜单，不把底下那层一起带走
+  useEscapeKey(projectMenu ? () => setProjectMenu(null) : null)
+  // 会话右键菜单关闭
+  useEffect(() => {
+    if (!convMenu) return
+    const onDown = (e: MouseEvent) => {
+      if (convMenuRef.current && !convMenuRef.current.contains(e.target as Node)) {
+        setConvMenu(null)
+      }
+    }
+    const onScroll = () => setConvMenu(null)
+    document.addEventListener('mousedown', onDown)
+    window.addEventListener('scroll', onScroll, true)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      window.removeEventListener('scroll', onScroll, true)
+    }
+  }, [convMenu])
+  useEscapeKey(convMenu ? () => setConvMenu(null) : null)
   useEffect(() => {
     if (!projectMetaToast) return
     const timer = setTimeout(() => setProjectMetaToast(null), 4000)
@@ -679,7 +715,7 @@ export default function Home() {
   const [confirmDeleteMsgId, setConfirmDeleteMsgId] = useState<string | null>(null)
   // 拖拽调宽中的侧栏（拖拽时禁用宽度过渡动画，避免拖尾）
   const [resizing, setResizing] = useState<'sidebar' | 'right' | null>(null)
-  const [modelCatalog, setModelCatalog] = useState<{ providerName: string; models: ProviderModel[] }[]>([])
+  const [modelCatalog, setModelCatalog] = useState<{ providerName: string; providerId: string; autoPoolMode: number; isActive: boolean; models: ProviderModel[] }[]>([])
   // 命令面板（Cmd+K）：后端静态命令 + 前端动态命令（会话/模型/斜杠）合并后 fuzzy 搜索
   const [paletteOpen, setPaletteOpen] = useState(false)
   // 快捷键速查浮层（? 触发 / Esc 关闭）
@@ -1377,6 +1413,9 @@ export default function Home() {
         const entries = await Promise.all(
           ps.map(async (p) => ({
             providerName: p.name,
+            providerId: p.id,
+            autoPoolMode: p.auto_pool_mode,
+            isActive: p.is_active,
             models: await listProviderModels(p.id).catch(() => [] as ProviderModel[]),
           })),
         )
@@ -2491,7 +2530,7 @@ export default function Home() {
   const updateModelOptions = (next: ChatOptions) => {
     setModelOptions(next)
     setJSON(STORAGE_KEYS.CHAT_OPTIONS, next)
-    if (currentConversation) {
+    if (currentConversation && next.model_id !== 'auto') {
       // 后端写入完成后再刷新可视条（避免竞态读到旧 model_id 的 context_limit）
       void setConversationModel(currentConversation.id, next.model_id ?? '')
         .then(() =>
@@ -3870,13 +3909,16 @@ export default function Home() {
 
         {/* 添加项目 */}
         <div className="px-3 pb-3 shrink-0">
-          <button
-            onClick={() => setShowAddDialog(true)}
+          <Button
+            variant="primary"
+            size="md"
+            icon="plus"
             title={t('home.addProject')}
-            className={`h-9 flex items-center justify-center gap-1.5 rounded-[10px] btn-primary text-[13px] font-medium active:scale-[0.98] transition-all ${sidebarCollapsed ? 'w-9 mx-auto' : 'w-full'}`}
+            onClick={() => setShowAddDialog(true)}
+            className={sidebarCollapsed ? 'w-9 mx-auto' : 'w-full'}
           >
-            <Icon name="plus" size={15} white /> {!sidebarCollapsed && t('home.addProject')}
-          </button>
+            {!sidebarCollapsed && t('home.addProject')}
+          </Button>
         </div>
 
         {/* 最近项目 */}
@@ -3958,11 +4000,12 @@ export default function Home() {
                             e.stopPropagation()
                             void toggleProjectPin(p.id)
                           }}
-                          className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
+                          className={`p-1 ml-0.5 rounded-md transition-[color,background-color,border-color,opacity] shrink-0 ${
                             p.pinned
                               ? 'text-[var(--accent)] opacity-100'
                               : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
                           }`}
+                          aria-label={p.pinned ? t('home.unpinProject') : t('home.pinProject')}
                           title={p.pinned ? t('home.unpinProject') : t('home.pinProject')}
                         >
                           <Icon name="pin" size={13} />
@@ -3972,11 +4015,16 @@ export default function Home() {
                             e.stopPropagation()
                             void handleDeleteProject(p.id)
                           }}
-                          className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
+                          className={`p-1 ml-0.5 rounded-md transition-[color,background-color,border-color,box-shadow,opacity] shrink-0 ${
                             confirmDeleteProjectId === p.id
                               ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)] opacity-100'
                               : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
                           }`}
+                          aria-label={
+                            confirmDeleteProjectId === p.id
+                              ? t('home.confirmDeleteProject')
+                              : t('home.deleteProject')
+                          }
                           title={
                             confirmDeleteProjectId === p.id
                               ? t('home.confirmDeleteProject')
@@ -4004,7 +4052,7 @@ export default function Home() {
         {projectMenu && (
           <div
             ref={projectMenuRef}
-            className="fixed z-[80] w-52 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
+            className="fixed z-[var(--app-z-popover)] w-52 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
             style={{
               left: Math.min(projectMenu.x, window.innerWidth - 220),
               top: Math.min(projectMenu.y, window.innerHeight - 140),
@@ -4040,6 +4088,61 @@ export default function Home() {
           </div>
         )}
 
+        {/* 会话列表右键菜单：置顶/归档/重命名/删除/复制ID */}
+        {convMenu && (
+          <div
+            ref={convMenuRef}
+            className="fixed z-[var(--app-z-popover)] w-48 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 animate-modal-in"
+            style={{
+              left: Math.min(convMenu.x, window.innerWidth - 200),
+              top: Math.min(convMenu.y, window.innerHeight - 260),
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="px-3 py-1.5 text-[11px] font-medium text-[var(--text-muted)] truncate">
+              {convMenu.conv.title}
+            </div>
+            <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+            <button
+              onClick={() => { togglePin(convMenu.conv.id, convMenu.conv.is_pinned); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="pin" size={13} />
+              {convMenu.conv.is_pinned ? t('home.unpin') : t('home.pin')}
+            </button>
+            <button
+              onClick={() => { toggleArchive(convMenu.conv.id, convMenu.conv.archived); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="archive" size={13} />
+              {convMenu.conv.archived ? t('home.unarchive') : t('home.archive')}
+            </button>
+            <button
+              onClick={() => { setRenamingId(convMenu.conv.id); setRenamingText(convMenu.conv.title); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="edit" size={13} />
+              {t('home.rename')}
+            </button>
+            <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+            <button
+              onClick={() => { navigator.clipboard.writeText(convMenu.conv.id); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            >
+              <Icon name="copy" size={13} />
+              {t('home.copyConvId')}
+            </button>
+            <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+            <button
+              onClick={() => { handleDeleteConversation(convMenu.conv.id); setConvMenu(null) }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
+            >
+              <Icon name="delete" size={13} />
+              {t('home.deleteConversation')}
+            </button>
+          </div>
+        )}
+
         {/* 会话列表 */}
         <div className="flex-1 flex flex-col min-h-0 mt-1">
           <div className={`flex items-center justify-between pb-1.5 ${sidebarCollapsed ? 'px-3 justify-center' : 'px-4'}`}>
@@ -4057,25 +4160,14 @@ export default function Home() {
                       ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                       : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
                   }`}
+                  aria-label={showArchived ? t('home.backToConversations') : t('home.viewArchived')}
                   title={showArchived ? t('home.backToConversations') : t('home.viewArchived')}
                 >
                   <Icon name="archive" size={14} />
                 </button>
-                <button
-                  onClick={() => newConversation()}
-                  className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-                  title={t('home.newConversation')}
-                >
-                  <Icon name="plus" size={14} />
-                </button>
+                <IconButton icon="plus" label={t('home.newConversation')} onClick={() => newConversation()} />
                 {/* 导入会话（只读预览：解析 md/json 文件，弹窗显示 + 复制全文） */}
-                <button
-                  onClick={handleImport}
-                  className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-                  title={t('home.import')}
-                >
-                  <Icon name="file" size={14} />
-                </button>
+                <IconButton icon="file" label={t('home.import')} onClick={handleImport} />
               </div>
             )}
           </div>
@@ -4107,6 +4199,7 @@ export default function Home() {
                       if (searchMode === 'conv') void setConversationKeyword('')
                     }}
                     className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                    aria-label={t('home.clearSearch')}
                     title={t('home.clearSearch')}
                   >
                     <Icon name="close" size={12} />
@@ -4207,7 +4300,7 @@ export default function Home() {
                     <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.searching')}</div>
                   )}
                   {!msgSearching && msgHits.length === 0 && (
-                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.noMessageHits')}</div>
+                    <UiEmptyState compact title={t('home.noMessageHits')} />
                   )}
                   {msgHits.slice(0, 30).map((hit) => (
                     <button
@@ -4240,7 +4333,7 @@ export default function Home() {
                     <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.searching')}</div>
                   )}
                   {!allProjectSearching && allProjectHits.length === 0 && (
-                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.noMessageHits')}</div>
+                    <UiEmptyState compact title={t('home.noMessageHits')} />
                   )}
                   {(() => {
                     // 按项目分组
@@ -4255,7 +4348,7 @@ export default function Home() {
                     for (const [pid, hits] of groups) {
                       const first = hits[0]
                       out.push(
-                        <div key={`gh-${pid}`} className="group-label" style={{ paddingLeft: 10, paddingRight: 10, paddingTop: 6, paddingBottom: 2 }}>
+                        <div key={`gh-${pid}`} className="group-label px-2.5 pt-1.5 pb-0.5">
                           <span className="truncate">{first.project_name ?? pid} · {hits.length}</span>
                         </div>
                       )
@@ -4292,30 +4385,57 @@ export default function Home() {
               )}
             </div>
           )}
-          <div className={`flex-1 overflow-y-auto pb-2 space-y-0.5 ${sidebarCollapsed ? 'px-2' : 'px-2'}`}>
+          <div
+            className={`flex-1 overflow-y-auto pb-2 space-y-0.5 ${sidebarCollapsed ? 'px-2' : 'px-2'}`}
+            tabIndex={0}
+            onKeyDown={(e) => {
+              const items = groupedConversations.filter((r) => r.kind === 'item')
+              if (items.length === 0) return
+              if (e.key === 'ArrowDown') {
+                e.preventDefault()
+                setConvFocusIdx((v) => Math.min(v + 1, items.length - 1))
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault()
+                setConvFocusIdx((v) => Math.max(v - 1, 0))
+              } else if (e.key === 'Enter' && convFocusIdx >= 0 && convFocusIdx < items.length) {
+                e.preventDefault()
+                const target = items[convFocusIdx]
+                if (target.kind === 'item') openConversation(target.conv.id)
+              } else if (e.key === 'Escape') {
+                setConvFocusIdx(-1)
+              }
+            }}
+          >
             {conversations.length === 0 && !sidebarCollapsed && (
-              <p className="text-[11px] text-[var(--text-muted)] px-2 py-4 text-center leading-relaxed">
-                {currentProject ? t('home.noConversation') : t('home.selectProjectFirst')}
-              </p>
+              <UiEmptyState compact title={currentProject ? t('home.noConversation') : t('home.selectProjectFirst')} />
             )}
-            {groupedConversations.map((row) => {
+            {(() => {
+              let idx = -1
+              return groupedConversations.map((row) => {
               if (row.kind === 'header') {
                 return (
-                  <div key={row.key} className="group-label" style={{ paddingLeft: 10, paddingRight: 10, paddingTop: 10, paddingBottom: 4 }}>
+                  <div key={row.key} className="group-label px-2.5 pt-2.5 pb-1">
                     <span>{row.label}</span>
                   </div>
                 )
               }
+              idx++
               const c = row.conv
               const active = c.id === currentConversation?.id
               const renaming = renamingId === c.id
               const pendingItems = pendingConfirmations[c.id] ?? []
+              const focused = convFocusIdx >= 0 && idx === convFocusIdx
               return (
                 <div
                   key={c.id}
                   className={`list-row group w-full flex items-center rounded-lg transition-colors ${
-                    active ? 'bg-[var(--bg-card)] is-active' : 'hover:bg-[var(--bg-hover)]'
+                    active ? 'bg-[var(--bg-card)] is-active' : focused ? 'bg-[var(--bg-hover)] ring-1 ring-[var(--accent)]/30' : 'hover:bg-[var(--bg-hover)]'
                   } ${sidebarCollapsed ? 'justify-center py-1' : 'pl-2.5 pr-1.5 py-1.5'}`}
+                  onContextMenu={(e) => {
+                    if (sidebarCollapsed) return
+                    e.preventDefault()
+                    setConvMenu({ x: e.clientX, y: e.clientY, conv: c })
+                  }}
                 >
                   {renaming ? (
                     <input
@@ -4330,13 +4450,13 @@ export default function Home() {
                       className="flex-1 min-w-0 bg-[var(--bg-primary)] border border-[var(--accent)] rounded-md px-2 py-1 text-[13px] outline-none"
                     />
                   ) : sidebarCollapsed ? (
-                    <button
+                    <IconButton
+                      icon="chat"
+                      label={c.title}
+                      iconSize={15}
+                      className="h-8 w-8"
                       onClick={() => openConversation(c.id)}
-                      title={c.title}
-                      className={`w-8 h-8 flex items-center justify-center rounded-lg ${active ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'}`}
-                    >
-                      <Icon name="chat" size={15} />
-                    </button>
+                    />
                   ) : (
                     <>
                       <button onClick={() => openConversation(c.id)} className="flex-1 min-w-0 text-left">
@@ -4416,7 +4536,7 @@ export default function Home() {
                             {/* 会话短 ID：hover 可见，点击复制 */}
                             <button
                               onClick={(e) => { e.stopPropagation(); copyId(c.id) }}
-                              className="debug-id-badge font-mono text-[8.5px] px-1 py-px rounded border border-transparent text-[var(--text-muted)]/70 hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-all opacity-0 group-hover:opacity-100"
+                              className="debug-id-badge font-mono text-[8.5px] px-1 py-px rounded border border-transparent text-[var(--text-muted)]/70 hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-[color,background-color,border-color,opacity,transform] opacity-0 group-hover:opacity-100"
                               title={`${t('home.convId')}: ${c.id}\n${t('home.clickToCopy')}`}
                             >
                               {copiedId === c.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
@@ -4460,36 +4580,37 @@ export default function Home() {
                           e.stopPropagation()
                           togglePin(c.id, c.is_pinned)
                         }}
-                        className={`p-1 rounded-md transition-all shrink-0 ${
+                        className={`p-1 rounded-md transition-[color,background-color,border-color,opacity] shrink-0 ${
                           c.is_pinned
                             ? 'text-[var(--accent)] opacity-100'
                             : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
                         }`}
+                        aria-label={c.is_pinned ? t('home.unpin') : t('home.pin')}
                         title={c.is_pinned ? t('home.unpin') : t('home.pin')}
                       >
                         <Icon name="pin" size={13} />
                       </button>
-                      <button
+                      <IconButton
+                        icon="archive"
+                        label={c.archived ? t('home.unarchive') : t('home.archive')}
+                        iconSize={13}
+                        className="opacity-0 group-hover:opacity-100"
                         onClick={(e) => {
                           e.stopPropagation()
                           toggleArchive(c.id, c.archived)
                         }}
-                        className="p-1 rounded-md text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-all shrink-0"
-                        title={c.archived ? t('home.unarchive') : t('home.archive')}
-                      >
-                        <Icon name="archive" size={13} />
-                      </button>
-                      <button
+                      />
+                      <IconButton
+                        icon="edit"
+                        label={t('home.rename')}
+                        iconSize={13}
+                        className="opacity-0 group-hover:opacity-100"
                         onClick={(e) => {
                           e.stopPropagation()
                           setRenamingId(c.id)
                           setRenamingText(c.title)
                         }}
-                        className="p-1 rounded-md text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-all shrink-0"
-                        title={t('home.rename')}
-                      >
-                        <Icon name="edit" size={13} />
-                      </button>
+                      />
                       {/* 分隔线：危险操作与常规操作拉开视觉距离，降低误触 */}
                       <span className="mx-0.5 w-px h-3.5 bg-[var(--border)] shrink-0" aria-hidden="true" />
                       <button
@@ -4497,11 +4618,16 @@ export default function Home() {
                           e.stopPropagation()
                           handleDeleteConversation(c.id)
                         }}
-                        className={`p-1 ml-0.5 rounded-md transition-all shrink-0 ${
+                        className={`p-1 ml-0.5 rounded-md transition-[color,background-color,border-color,box-shadow,opacity] shrink-0 ${
                           confirmDeleteId === c.id
                             ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)] opacity-100'
                             : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
                         }`}
+                        aria-label={
+                          confirmDeleteId === c.id
+                            ? t('home.confirmDeleteConversation')
+                            : t('home.deleteConversation')
+                        }
                         title={
                           confirmDeleteId === c.id
                             ? t('home.confirmDeleteConversation')
@@ -4517,7 +4643,8 @@ export default function Home() {
                   )}
                 </div>
               )
-            })}
+            })
+            })()}
           </div>
         </div>
 
@@ -4590,15 +4717,21 @@ export default function Home() {
             )}
           </div>
           <LangToggle />
-          <button
+          <IconButton
+            icon={themeResolved === 'dark' ? 'sun' : 'moon'}
+            label={t('home.theme')}
+            pad="lg"
+            iconSize={15}
+            className={sidebarCollapsed ? 'h-9 w-9' : undefined}
             onClick={toggleTheme}
-            title={t('home.theme')}
-            className={`p-2 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 flex items-center justify-center' : ''}`}
-          >
-            <Icon name={themeResolved === 'dark' ? 'sun' : 'moon'} size={15} />
-          </button>
+          />
           <NotificationBell fixed />
-          <button
+          <IconButton
+            icon={sidebarCollapsed ? 'chevron-right' : 'chevron-left'}
+            label={sidebarCollapsed ? t('home.expandSidebar') : t('home.collapseSidebar')}
+            pad="lg"
+            iconSize={15}
+            className={sidebarCollapsed ? 'mt-1 h-9 w-9' : undefined}
             onClick={() =>
               setSidebarCollapsed((v) => {
                 const next = !v
@@ -4606,11 +4739,7 @@ export default function Home() {
                 return next
               })
             }
-            title={sidebarCollapsed ? t('home.expandSidebar') : t('home.collapseSidebar')}
-            className={`p-2 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 flex items-center justify-center mt-1' : ''}`}
-          >
-            <Icon name={sidebarCollapsed ? 'chevron-right' : 'chevron-left'} size={15} />
-          </button>
+          />
         </div>
         </div>
       </aside>
@@ -4676,6 +4805,7 @@ export default function Home() {
               <div className="relative" ref={moreMenuRef}>
                 <button
                   onClick={() => setShowMoreMenu((v) => !v)}
+                  aria-label={t('home.moreActions')}
                   title={t('home.moreActions')}
                   className={`p-2 rounded-lg transition-colors ${
                     showMoreMenu
@@ -4788,9 +4918,37 @@ export default function Home() {
                         {t('home.openShell')}
                       </button>
                     )}
+                    <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
+                    <button
+                      onClick={() => {
+                        setShowMoreMenu(false)
+                        setSidebarCollapsed((v) => !v)
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                    >
+                      <Icon name="panel" size={14} />
+                      {t('home.toggleSidebar')}
+                    </button>
+                    {currentProject && messages.length > 0 && (
+                      <button
+                        onClick={() => {
+                          setShowMoreMenu(false)
+                          setSearchMode('conv')
+                          setTimeout(() => searchInputRef.current?.focus(), 50)
+                        }}
+                        className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                      >
+                        <Icon name="search" size={14} />
+                        {t('home.searchInConv')}
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
+            )}
+
+            {currentProject && messages.length > 2 && (
+              <ConversationNav messages={messages} />
             )}
 
             <button
@@ -4806,6 +4964,7 @@ export default function Home() {
                   ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                   : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
               }`}
+              aria-label={t('home.togglePanel')}
               title={t('home.togglePanel')}
             >
               <Icon name="panel" size={16} />
@@ -4837,7 +4996,7 @@ export default function Home() {
             switchingConv ? (
               // 会话切换中：messages 已清空、新会话消息尚未加载完成，轻量占位避免空状态闪烁
               <div className="h-full flex flex-col items-center justify-center text-center">
-                <div className="w-8 h-8 rounded-full border-2 border-[var(--border)] border-t-[var(--accent)] animate-spin" />
+                <Spinner size={32} />
                 <p className="text-[12px] text-[var(--text-muted)] mt-3">{t('home.loadingConv')}</p>
               </div>
             ) : (
@@ -4955,7 +5114,7 @@ export default function Home() {
                                   <span className="text-[12px] text-[var(--text-secondary)]">{t('home.todoTitle')}</span>
                                   <span className="text-[11px] text-[var(--text-muted)] tabular-nums">{done}/{todos.length}</span>
                                   <div className="ml-auto h-1 w-12 rounded-full bg-[var(--bg-hover)] overflow-hidden">
-                                    <div className="h-full rounded-full bg-[var(--accent)] transition-all" style={{ width: `${pct}%` }} />
+                                    <div className="h-full rounded-full bg-[var(--accent)] transition-[width]" style={{ width: `${pct}%` }} />
                                   </div>
                                   <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform shrink-0 ${todoOpen ? 'rotate-90' : ''}`} />
                                 </button>
@@ -4966,7 +5125,7 @@ export default function Home() {
                                         {td.status === 'done' ? (
                                           <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
                                         ) : td.status === 'in_progress' ? (
-                                          <span className="w-2.5 h-2.5 mt-0.5 rounded-full border-2 border-[var(--accent)] border-t-transparent animate-spin shrink-0" />
+                                          <Spinner variant="inline" size={10} className="mt-0.5" />
                                         ) : (
                                           <span className="w-2.5 h-2.5 mt-1 rounded-full border border-[var(--border)] shrink-0" />
                                         )}
@@ -5002,26 +5161,7 @@ export default function Home() {
                           )}
                           {/* 任务收尾摘要：明确区分正常完成与达到上限/被停止后的未完成状态。 */}
                           {lastTaskSummary && !isStreaming && (
-                            <div
-                              className={`md-task-summary animate-fade-in-up ${lastTaskSummary.status === 'incomplete' ? 'is-incomplete' : ''}`}
-                            >
-                              <div className="md-task-summary-icon">
-                                <Icon name={lastTaskSummary.status === 'incomplete' ? 'info' : 'check'} size={13} white />
-                              </div>
-                              <div className="min-w-0">
-                                <span className="md-task-summary-title">
-                                  {t(lastTaskSummary.status === 'incomplete' ? 'home.taskIncompleteTitle' : 'home.taskDoneTitle')}
-                                </span>
-                                <span className="md-task-summary-meta tabular-nums">
-                                  {t('home.taskSummary', {
-                                    time: fmtElapsed(lastTaskSummary.durationMs / 1000),
-                                    tools: lastTaskSummary.toolCount,
-                                    files: lastTaskSummary.fileCount,
-                                    tokens: (lastTaskSummary.tokensIn + lastTaskSummary.tokensOut).toLocaleString(),
-                                  })}
-                                </span>
-                              </div>
-                            </div>
+                            <TaskSummaryCard summary={lastTaskSummary} t={t} />
                           )}
                           {/* 工具过程已收进顶部“已处理 N 个操作”徽章（展开查看），对话流不再平铺工具卡 */}
                           <StreamingOutput conversationId={currentConversation?.id ?? null} speed={streamSpeed} />
@@ -5035,6 +5175,7 @@ export default function Home() {
                               detail={streamingErrorDetail}
                               onRetry={() => regenerateLast(modelOptions)}
                               retryLabel={t('home.retry')}
+                              onViewLogs={() => navigate('/health')}
                             />
                           )}
                           {/* 中断回复恢复横幅：最后一条 user 消息已提交但回复从未入库，或
@@ -5055,13 +5196,14 @@ export default function Home() {
                                     : t('home.interruptedBannerDesc')}
                                 </div>
                               </div>
-                              <button
+                              <Button
+                                variant="primary"
+                                size="sm"
+                                icon="refresh"
                                 onClick={() => void regenerateLatest()}
-                                className="shrink-0 h-7 px-3 rounded-full btn-primary text-[11.5px] font-medium flex items-center gap-1"
                               >
-                                <Icon name="refresh" size={11} />
                                 {t('home.resumeGenerate')}
-                              </button>
+                              </Button>
                             </div>
                           )}
                           <div ref={bottomRef} />
@@ -5077,7 +5219,7 @@ export default function Home() {
           {showScrollBottom && (
             <button
               onClick={() => scrollToBottom(true)}
-              className="sticky bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 pl-3 pr-2 h-8 rounded-full glass-card text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[color-mix(in_srgb,var(--accent)_50%,var(--border))] transition-all z-10 animate-fade-in-up tnum"
+              className="sticky bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 pl-3 pr-2 h-8 rounded-full glass-card text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[color-mix(in_srgb,var(--accent)_50%,var(--border))] transition-colors z-10 animate-fade-in-up tnum"
             >
               <Icon name="chevron-right" size={13} className="rotate-90" />
               {isStreaming ? t('home.scrollToLatest') : t('home.scrollBottom')}
@@ -5237,10 +5379,10 @@ export default function Home() {
                               placeholder={t('home.ctxPinDecisionPlaceholder')}
                               className="min-w-0 flex-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] px-1.5 py-1 outline-none"
                             />
-                            <button
-                              type="button"
+                            <Button
+                              variant="primary"
+                              size="xs"
                               disabled={!ctxDecisionDraft.trim()}
-                              className="rounded bg-[var(--accent)] px-2 py-1 text-white disabled:opacity-40"
                               onClick={() => {
                                 const decision = ctxDecisionDraft.trim()
                                 if (!decision) return
@@ -5249,7 +5391,7 @@ export default function Home() {
                               }}
                             >
                               {t('home.ctxPinAdd')}
-                            </button>
+                            </Button>
                           </span>
                         </span>
                         <span className="mb-2 block">
@@ -5428,7 +5570,7 @@ export default function Home() {
                         pct,
                       })}
                     >
-                      <span className="context-meter w-16 shrink-0" style={{ height: 2 }}>
+                      <span className="context-meter w-16 shrink-0 h-0.5">
                         <span
                           className="context-meter-fill"
                           data-level={level}
@@ -5484,7 +5626,7 @@ export default function Home() {
                         : modelOptions,
                     )
                   }}
-                  className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-all"
+                  className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-[filter]"
                 >
                   <Icon name="arrow-down" size={11} />
                   {unfinishedConv.recoveryPolicy === 'manual' || unfinishedConv.recoveryPolicy === 'verify_effects'
@@ -5525,13 +5667,14 @@ export default function Home() {
                           {t('home.queuedAgentLabel')}
                         </span>
                       )}
-                      <button
+                      <IconButton
+                        icon="close"
+                        label={t('home.queuedRemove')}
+                        hoverTone="danger"
+                        pad="xs"
+                        iconSize={11}
                         onClick={() => removeQueued(q.id)}
-                        className="p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
-                        title={t('home.queuedRemove')}
-                      >
-                        <Icon name="close" size={11} />
-                      </button>
+                      />
                     </div>
                   ))}
                 </div>
@@ -5539,7 +5682,7 @@ export default function Home() {
             </div>
           )}
           <div
-            className="relative max-w-3xl mx-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] transition-all focus-within:border-[var(--accent)] focus-within:shadow-[0_0_0_3px_var(--accent-soft)]"
+            className="relative max-w-3xl mx-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] transition-[color,background-color,border-color,box-shadow] focus-within:border-[var(--accent)] focus-within:shadow-[0_0_0_3px_var(--accent-soft)]"
             onDragOver={(e) => {
               if (Array.from(e.dataTransfer.types).includes('Files')) {
                 e.preventDefault()
@@ -5571,7 +5714,7 @@ export default function Home() {
                   {t('home.slashHint')}
                 </div>
                 {slashCandidates.length === 0 && (
-                  <div className="px-3 py-2.5 text-[11px] text-[var(--text-muted)]">{t('home.slashNoMatch')}</div>
+                  <UiEmptyState compact title={t('home.slashNoMatch')} />
                 )}
                 {slashCandidates.map((c, i) => (
                   <button
@@ -5600,7 +5743,7 @@ export default function Home() {
                   {t('home.refHint')}「@{refQuery}」
                 </div>
                 {refCandidates.length === 0 && (
-                  <div className="px-3 py-2.5 text-[11px] text-[var(--text-muted)]">{t('home.refNoMatch')}</div>
+                  <UiEmptyState compact title={t('home.refNoMatch')} />
                 )}
                 {refCandidates.map((c, i) => {
                   const isConv = c.path.startsWith('conv:')
@@ -5728,6 +5871,7 @@ export default function Home() {
                 <button
                   onClick={() => setPendingQuote(null)}
                   className="ml-auto shrink-0 hover:text-[var(--danger)] transition-colors"
+                  aria-label={t('home.removeQuote')}
                   title={t('home.removeQuote')}
                 >
                   <Icon name="close" size={10} />
@@ -5758,6 +5902,7 @@ export default function Home() {
                       <button
                         onClick={() => setReferences((r) => r.filter((x) => x !== p))}
                         className="shrink-0 hover:text-[var(--danger)] transition-colors"
+                        aria-label={t('home.removeReference')}
                         title={t('home.removeReference')}
                       >
                         <Icon name="close" size={10} />
@@ -5776,6 +5921,7 @@ export default function Home() {
                     <button
                       onClick={() => removePickedImage(i)}
                       className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full modern-card border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--danger)] flex items-center justify-center opacity-0 group-hover/img:opacity-100 transition-opacity"
+                      aria-label={t('home.removeImage')}
                       title={t('home.removeImage')}
                     >
                       <Icon name="close" size={9} />
@@ -5847,13 +5993,13 @@ export default function Home() {
                   )}
                 </div>
                 {/* Rules 编辑：全局指令 + 项目级 rules（注入 system_prompt） */}
-                <button
+                <IconButton
+                  icon="settings"
+                  label={t('home.rules')}
+                  pad="md"
+                  iconSize={13}
                   onClick={() => void openRulesDialog()}
-                  title={t('home.rules')}
-                  className="p-1.5 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                >
-                  <Icon name="settings" size={13} />
-                </button>
+                />
                 {/* 模型设置：切换模型 / 代理 / 采样参数 */}
                 <div className="relative shrink-0" ref={modelSettingsRef}>
                   <button
@@ -5903,7 +6049,7 @@ export default function Home() {
                     {toolRuns.some((r) => r.status === 'running') && (
                       <button
                         onClick={() => stopCurrentTool()}
-                        className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] items-center justify-start gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-all text-[12px] font-medium"
+                        className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] items-center justify-start gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-medium"
                         title={t('home.stopTool')}
                       >
                         <Icon name="bolt" size={12} className="shrink-0" />
@@ -5917,7 +6063,7 @@ export default function Home() {
                         const next = cycle[(cycle.indexOf(streamSpeed) + 1) % cycle.length]
                         setStreamSpeed(next)
                       }}
-                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center gap-1 hover:bg-[var(--bg-hover)] active:scale-95 transition-all text-[12px] font-mono font-medium tnum"
+                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center gap-1 hover:bg-[var(--bg-hover)] active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-mono font-medium tnum"
                       title={t('home.streamSpeedHint')}
                     >
                       {streamSpeed}x
@@ -5937,7 +6083,7 @@ export default function Home() {
                       }}
                       disabled={stopRequested}
                       aria-label={t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}
-                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 disabled:opacity-60 disabled:cursor-wait transition-all text-[12px] font-medium"
+                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 disabled:opacity-60 disabled:cursor-wait transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
                       title={t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}
                     >
                       <span className={`w-2.5 h-2.5 rounded-[3px] bg-[var(--danger)] shrink-0 ${stopRequested ? 'animate-pulse' : ''}`} />
@@ -5947,7 +6093,7 @@ export default function Home() {
                     <button
                       onClick={handleSendToAgent}
                       disabled={!draft.trim() || stopRequested}
-                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] items-center justify-start gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
+                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] items-center justify-start gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
                       title={t('home.sendToAgent')}
                     >
                       <Icon name="bolt" size={12} className="shrink-0" />
@@ -5958,7 +6104,7 @@ export default function Home() {
                       onClick={handleSend}
                       disabled={!draft.trim() || stopRequested || !!currentGen}
                       aria-label={t('home.queueSend')}
-                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
+                      className={composerSendCls}
                       title={t('home.queueSend')}
                     >
                       <Icon name="send" size={14} white />
@@ -5967,7 +6113,7 @@ export default function Home() {
                     <button
                       onClick={() => setBatchOpen(true)}
                       disabled={!draft.trim() || stopRequested}
-                      className="hidden xl:flex h-8 xl:px-2.5 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center justify-start gap-1 hover:bg-[var(--bg-hover)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all text-[12px] font-medium"
+                      className="hidden xl:flex h-8 xl:px-2.5 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center justify-start gap-1 hover:bg-[var(--bg-hover)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
                       title={t('home.batchSend')}
                     >
                       <Icon name="package" size={12} />
@@ -6066,7 +6212,7 @@ export default function Home() {
                       <button
                         onClick={() => setGenMode(null)}
                         title={t('home.genCancelHint', '取消生成模式')}
-                        className="h-8 px-2.5 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] flex items-center gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 transition-all text-[12px] font-medium"
+                        className="h-8 px-2.5 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] flex items-center gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-medium"
                       >
                         <Icon name={GEN_ITEMS.find((g) => g.kind === genMode)?.icon ?? 'spark'} size={12} className="shrink-0" />
                         <span className="hidden sm:inline">{t(`home.genKind.${genMode}`)}</span>
@@ -6077,7 +6223,7 @@ export default function Home() {
                       onClick={handleSend}
                       disabled={!draft.trim() || !currentProject || !!currentGen}
                       aria-label={t('home.send')}
-                      className="w-8 h-8 rounded-full text-white flex items-center justify-center active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-all shadow-lg shadow-[var(--accent)]/30 bg-[linear-gradient(135deg,var(--accent),var(--accent-hover))] hover:shadow-[0_4px_16px_var(--accent-glow)]"
+                      className={composerSendCls}
                       title={t('home.send')}
                     >
                       <Icon name="send" size={14} white />
@@ -6282,6 +6428,7 @@ export default function Home() {
                               type="button"
                               onClick={() => void handleRescanModules()}
                               disabled={rescanning}
+                              aria-label={t('home.rescanModules')}
                               title={t('home.rescanModules')}
                               className="ml-auto p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-50"
                             >
@@ -6290,6 +6437,7 @@ export default function Home() {
                             <button
                               type="button"
                               onClick={startEditModules}
+                              aria-label={t('home.editModules')}
                               title={t('home.editModules')}
                               className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                             >
@@ -6395,6 +6543,7 @@ export default function Home() {
                                   type="button"
                                   onClick={() => removeModuleRow(idx)}
                                   className="p-1 rounded text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
+                                  aria-label={t('dialog.remove')}
                                   title={t('dialog.remove')}
                                 >
                                   <Icon name="delete" size={13} />
@@ -6440,6 +6589,7 @@ export default function Home() {
                     <button
                       type="button"
                       onClick={() => void loadRecentRuns()}
+                      aria-label={t('home.refresh')}
                       title={t('home.refresh')}
                       className="ml-auto p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
@@ -6605,7 +6755,7 @@ export default function Home() {
 
       {/* ============ 计划/审查模式：任务计划确认卡片 ============ */}
       {pendingPlan && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[55] w-[640px] max-w-[calc(100vw-2rem)]">
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[var(--app-z-overlay)] w-[640px] max-w-[calc(100vw-2rem)]">
           <div className="rounded-2xl border border-[var(--accent)]/40 bg-[var(--bg-elevated)]/95 backdrop-blur shadow-2xl shadow-black/20 animate-modal-in overflow-hidden">
             <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[var(--border)] bg-[var(--accent-soft)]">
               <span className="w-2 h-2 rounded-full bg-[var(--accent)] animate-pulse" />
@@ -6659,25 +6809,22 @@ export default function Home() {
               >
                 {t('home.planReject')}
               </button>
-              <button
+              <Button
+                variant="primary"
+                size="md"
+                icon="check"
                 onClick={() => {
-                  // 批准：若编辑过计划，把修订稿作为执行要求注入；否则纯批准
+                  // 批准：编辑稿作为结构化最终计划提交，后端持久化并在恢复时复用。
                   const edited = planDraft.trim()
                   const original = pendingPlan.plan.trim()
-                  let fb = planFeedback.trim()
-                  if (edited && edited !== original) {
-                    fb = [fb, `用户修订后的最终计划（请严格据此执行）：\n${edited}`]
-                      .filter(Boolean)
-                      .join('\n\n')
-                  }
-                  void resolvePlanReview(pendingPlan.requestId, true, fb || undefined)
+                  const fb = planFeedback.trim()
+                  const revised = edited && edited !== original ? edited : undefined
+                  void resolvePlanReview(pendingPlan.requestId, true, fb || undefined, revised)
                   setPlanFeedback('')
                 }}
-                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all flex items-center gap-1.5"
               >
-                <Icon name="check" size={14} />
                 {t('home.planApprove')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -6685,7 +6832,7 @@ export default function Home() {
 
       {/* ============ 已批准任务计划（执行中锚点，可收起） ============ */}
       {approvedPlan && approvedPlan.conversationId === currentConversation?.id && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[54] w-[640px] max-w-[calc(100vw-2rem)]">
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[var(--app-z-overlay)] w-[640px] max-w-[calc(100vw-2rem)]">
           <details className="rounded-xl border border-[var(--success)]/40 bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 animate-modal-in overflow-hidden" open={false}>
             <summary className="flex items-center gap-2 px-4 py-2 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
               <Icon name="check" size={13} className="text-[var(--success)] shrink-0" />
@@ -6711,14 +6858,14 @@ export default function Home() {
           : card.action === 'open_signing_config' ? t('home.diagnoseOpenSigning')
           : ''
         return (
-          <div key={card.id} className={`fixed bottom-24 right-4 z-[53] w-[320px] rounded-xl border bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 animate-modal-in overflow-hidden ${color}`}>
+          <div key={card.id} className={`fixed bottom-24 right-4 z-[var(--app-z-overlay)] w-[320px] rounded-xl border bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 animate-modal-in overflow-hidden ${color}`}>
             <div className="flex items-start gap-2 p-3">
               <Icon name={icon as React.ComponentProps<typeof Icon>['name']} size={14} className="shrink-0 mt-0.5" />
               <div className="flex-1 min-w-0">
                 <div className="text-[12px] font-semibold">{card.title}</div>
                 <div className="text-[10.5px] text-[var(--text-secondary)] mt-1 leading-relaxed whitespace-pre-wrap break-words">{card.message}</div>
               </div>
-              <button type="button" onClick={() => handleDiagnoseDismiss(card)} className="text-[var(--text-muted)] hover:text-[var(--text-secondary)] shrink-0">
+              <button type="button" aria-label={t('common.close')} title={t('common.close')} onClick={() => handleDiagnoseDismiss(card)} className="text-[var(--text-muted)] hover:text-[var(--text-secondary)] shrink-0">
                 <Icon name="close" size={12} />
               </button>
             </div>
@@ -6727,9 +6874,9 @@ export default function Home() {
                 <button type="button" onClick={() => handleDiagnoseDismiss(card)} className="h-7 px-2.5 rounded-lg text-[10.5px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors">
                   {t('home.diagnoseLater')}
                 </button>
-                <button type="button" onClick={() => void handleDiagnoseAction(card)} className="h-7 px-3 rounded-lg text-[10.5px] font-medium btn-primary hover:opacity-90 transition-opacity">
+                <Button variant="primary" size="sm" onClick={() => void handleDiagnoseAction(card)}>
                   {actionLabel}
-                </button>
+                </Button>
               </div>
             )}
           </div>
@@ -6740,7 +6887,7 @@ export default function Home() {
 
       {/* ============ Agent 提问卡（ask_user 工具，自由文本回答闭环） ============ */}
       {askCard && askCard.conversationId === currentConversation?.id && (
-        <div className="fixed inset-0 z-[62] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+        <div className="fixed inset-0 z-[var(--app-z-modal-blocking)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[480px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="headphones" size={14} className="text-[var(--accent)] shrink-0" />
@@ -6780,21 +6927,12 @@ export default function Home() {
             />
             <div className="mt-3 flex items-center justify-end gap-2">
               <span className="text-[10.5px] text-[var(--text-muted)] mr-auto">Ctrl+Enter ↵</span>
-              <button
-                type="button"
-                onClick={handleAskSkip}
-                className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
+              <Button variant="secondary" size="md" onClick={handleAskSkip}>
                 {t('home.askSkip')}
-              </button>
-              <button
-                type="button"
-                onClick={handleAskSubmit}
-                className="h-8 px-5 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all flex items-center gap-1.5"
-              >
-                <Icon name="send" size={12} />
+              </Button>
+              <Button variant="primary" size="md" icon="send" onClick={handleAskSubmit}>
                 {t('home.askSubmit')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -6804,7 +6942,7 @@ export default function Home() {
       {toolApprovals.length > 0 && (() => {
         const risk = approvalRisk(toolApprovals[0].tool, toolApprovals[0].level)
         return (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+        <div className="fixed inset-0 z-[var(--app-z-modal-blocking)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[460px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-[var(--warning)] animate-pulse" />
@@ -6825,6 +6963,35 @@ export default function Home() {
                   {toolApprovals[0].desc}
                 </p>
               )}
+              {/* 影响契约：改什么、能不能撤销、影响到哪里（后端 impact.rs 同一口径） */}
+              {toolApprovals[0].impact && (() => {
+                const impact = toolApprovals[0].impact!
+                const { reversibilityKey, scopeKey, tone: impactTone } = impactDisplay(impact)
+                const tone =
+                  impactTone === 'danger'
+                    ? 'border-[var(--danger-border,var(--danger))] text-[var(--danger)]'
+                    : impactTone === 'warning'
+                      ? 'border-[var(--warning)] text-[var(--warning)]'
+                      : 'border-[var(--border)] text-[var(--text-muted)]'
+                return (
+                  <div className={`rounded-lg border ${tone} bg-[var(--bg-tertiary)]/40 px-3 py-2 space-y-1`}>
+                    <div className="flex items-center gap-2 text-[10px] font-medium">
+                      <span>{t(reversibilityKey)}</span>
+                      <span className="opacity-70">·</span>
+                      <span className="opacity-80">{t(scopeKey)}</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                      {impact.note}
+                    </p>
+                    {impact.targets.length > 0 && (
+                      <div className="text-[10px] text-[var(--text-muted)] truncate">
+                        {t('home.toolApprovalImpactTargets')}
+                        <span className="font-mono">{impact.targets.join(' · ')}</span>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
               <pre className="tool-output max-h-32 overflow-y-auto rounded-lg modern-card border-[var(--border)] p-2.5 text-[11px] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]">
                 {toolApprovals[0].args || '{}'}
               </pre>
@@ -6866,18 +7033,20 @@ export default function Home() {
               </button>
             </div>
             <div className="flex items-center justify-end gap-2 mt-4">
-              <button
+              <Button
+                variant="danger"
+                size="md"
                 onClick={() => resolveToolApproval(toolApprovals[0].requestId, false, false, approvalFeedback || undefined)}
-                className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--danger)] hover:border-[var(--danger)]/50 transition-colors"
               >
                 {t('home.toolApprovalReject')}
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="primary"
+                size="md"
                 onClick={() => resolveToolApproval(toolApprovals[0].requestId, true, approvalScope !== '', undefined, approvalScope || undefined)}
-                className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium  active:scale-[0.98] transition-all"
               >
                 {t('home.toolApprovalAllow')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -6887,7 +7056,7 @@ export default function Home() {
       {/* ============ 划词菜单（选中文本弹出） ============ */}
       {selectionMenu && (
         <div
-          className="fixed z-[70] animate-modal-in"
+          className="fixed z-[var(--app-z-popover)] animate-modal-in"
           style={{ left: selectionMenu.x, top: selectionMenu.y, transform: 'translateX(-50%)' }}
           onMouseDown={(e) => {
             // 阻止默认行为：防止按钮聚焦/点击清除选区高亮；并拦截冒泡避免全局 mouseup 重定位菜单
@@ -6954,17 +7123,18 @@ export default function Home() {
 
       {/* ============ 会话时间线弹窗（快照点列表 → 回到历史决策点） ============ */}
       {timelineOpen && currentConversation && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+        <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[520px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="history" size={15} />
               <span className="text-[13px] font-semibold">{t('home.timelineTitle')}</span>
-              <button
+              <IconButton
+                icon="close"
+                label={t('common.close')}
+                iconSize={13}
+                className="ml-auto"
                 onClick={() => setTimelineOpen(false)}
-                className="ml-auto p-1 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <Icon name="close" size={13} />
-              </button>
+              />
             </div>
             <div className="mt-2 text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.timelineDesc')}</div>
             {branchParentId && (
@@ -6986,7 +7156,7 @@ export default function Home() {
             )}
             <div className="mt-3 space-y-1 max-h-80 overflow-y-auto">
               {loadingSnapshots && snapshots.length === 0 ? (
-                <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('common.loading')}</div>
+                <Skeleton lines={4} label={t('common.loading')} className="py-2" />
               ) : snapshots.length === 0 ? (
                 <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('home.timelineEmpty')}</div>
               ) : (
@@ -7047,17 +7217,18 @@ export default function Home() {
       {/* ============ 编辑消息弹窗（user 消息编辑 = 重新执行任务） ============ */}
       {/* ============ 项目审批白名单管理弹窗 ============ */}
       {whitelistOpen && currentProject && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+        <div className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[460px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="check" size={15} />
               <span className="text-[13px] font-semibold">{t('home.whitelistTitle')}</span>
-              <button
+              <IconButton
+                icon="close"
+                label={t('common.close')}
+                iconSize={13}
+                className="ml-auto"
                 onClick={() => setWhitelistOpen(false)}
-                className="ml-auto p-1 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <Icon name="close" size={13} />
-              </button>
+              />
             </div>
             <div className="mt-3 space-y-1 max-h-72 overflow-y-auto">
               {whitelist.length === 0 && (
@@ -7070,17 +7241,18 @@ export default function Home() {
                 >
                   <span className="text-[11px] font-mono text-[var(--text-primary)] flex-1 truncate">{w.tool}</span>
                   <span className="text-[10px] text-[var(--text-muted)] shrink-0">{formatTime(w.created_at)}</span>
-                  <button
+                  <IconButton
+                    icon="delete"
+                    label={t('home.whitelistRemove')}
+                    hoverTone="danger"
+                    pad="xs"
+                    iconSize={12}
                     onClick={() => {
                       removeToolWhitelist(currentProject.id, w.tool)
                         .then(() => setWhitelist((l) => l.filter((x) => x.tool !== w.tool)))
                         .catch(() => {})
                     }}
-                    className="p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
-                    title={t('home.whitelistRemove')}
-                  >
-                    <Icon name="delete" size={12} />
-                  </button>
+                  />
                 </div>
               ))}
             </div>
@@ -7239,18 +7411,18 @@ export default function Home() {
             </pre>
           </div>
           <div className="flex justify-end gap-2">
-            <button
-              onClick={() => setRuntimeAnomaly(null)}
-              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)]"
-            >
+            <Button variant="secondary" size="md" onClick={() => setRuntimeAnomaly(null)}>
               {t('runtime.dismiss')}
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="danger"
+              size="md"
+              confirm
+              confirmLabel={t('common.confirmAgain')}
               onClick={() => void fixRuntimeAnomaly()}
-              className="h-8 px-4 rounded-lg bg-red-500 text-white text-[12px] hover:bg-red-600"
             >
               {t('runtime.fixNow')}
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -7302,41 +7474,34 @@ export default function Home() {
             </button>
           </div>
           <div className="space-y-2">
-            <input
+            <Field
+              fieldSize="md"
               value={knowledgeCandidate.title}
               onChange={(e) => setKnowledgeCandidate({ ...knowledgeCandidate, title: e.target.value })}
               placeholder={t('knowledge.entryTitle')}
-              className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)]"
             />
-            <textarea
+            <TextArea
+              fieldSize="md"
               value={knowledgeCandidate.error_text}
               onChange={(e) => setKnowledgeCandidate({ ...knowledgeCandidate, error_text: e.target.value })}
               rows={3}
               placeholder={t('knowledge.candidateErrorPh')}
-              className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] resize-y"
             />
-            <textarea
+            <TextArea
+              fieldSize="md"
               value={knowledgeCandidate.fix}
               onChange={(e) => setKnowledgeCandidate({ ...knowledgeCandidate, fix: e.target.value })}
               rows={4}
               placeholder={t('knowledge.candidateFixPh')}
-              className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] resize-y"
             />
           </div>
           <div className="flex justify-end gap-2">
-            <button
-              onClick={() => setKnowledgeCandidate(null)}
-              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)]"
-            >
+            <Button variant="secondary" size="md" onClick={() => setKnowledgeCandidate(null)}>
               {t('knowledge.candidateDismiss')}
-            </button>
-            <button
-              onClick={saveKnowledgeCandidate}
-              disabled={candidateSaving}
-              className="h-8 px-4 rounded-lg btn-primary text-[12px]  disabled:opacity-50"
-            >
+            </Button>
+            <Button variant="primary" size="md" loading={candidateSaving} onClick={saveKnowledgeCandidate}>
               {t('knowledge.candidateSave')}
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -7624,7 +7789,7 @@ const MessageItem = memo(function MessageItem({
               {onDeleteMessage && (
                 <button
                   onClick={() => onDeleteMessage(message)}
-                  className={`text-[10px] px-1.5 py-0.5 rounded-md transition-all ${
+                  className={`text-[10px] px-1.5 py-0.5 rounded-md transition-[color,background-color,border-color,box-shadow] ${
                     confirmDeleteMsgId === message.id
                       ? 'text-white bg-[var(--danger)] shadow-[0_0_0_3px_var(--danger-50)]'
                       : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
@@ -7779,13 +7944,13 @@ const MessageItem = memo(function MessageItem({
                   {t('home.versionLabel', { n: new Date(v.created_at * 1000).toLocaleString() })}
                 </button>
               ))}
-              <button
+              <IconButton
+                icon="close"
+                label={t('home.close')}
+                iconSize={12}
+                className="ml-auto"
                 onClick={() => setBranchOpen(false)}
-                className="ml-auto p-1 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                title={t('home.close')}
-              >
-                <Icon name="close" size={12} />
-              </button>
+              />
               <button
                 onClick={() => onOpenVersions(message, userMessageId)}
                 className="px-2.5 py-1 rounded-lg text-[11px] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
@@ -7797,37 +7962,33 @@ const MessageItem = memo(function MessageItem({
         )}
         {/* 操作栏：复制 / 引用 / 重新生成 / 点赞 / 点踩 / 朗读 / 版本对比 */}
         <div className="flex items-center gap-0.5 mt-1.5 opacity-0 group-hover:opacity-100 max-md:opacity-100 transition-opacity">
-          <button
+          <IconButton
+            icon={copied ? 'check' : 'copy'}
+            label={t('home.copyMessage')}
+            iconSize={13}
             onClick={copyMessage}
-            className={`p-1 rounded-md transition-colors ${copied ? 'text-[var(--success)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'}`}
-            title={t('home.copyMessage')}
-          >
-            {copied ? <Icon name="check" size={13} /> : <Icon name="copy" size={13} />}
-          </button>
+          />
           {onQuoteMessage && (
-            <button
+            <IconButton
+              icon="quote"
+              label={t('home.quoteMessage')}
+              iconSize={13}
               onClick={() => onQuoteMessage(message)}
-              className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-              title={t('home.quoteMessage')}
-            >
-              <Icon name="quote" size={13} />
-            </button>
+            />
           )}
-          <button
+          <IconButton
+            icon="lightbulb"
+            label={t('knowledge.rememberThisFix')}
+            iconSize={13}
             onClick={openRemember}
-            className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-            title={t('knowledge.rememberThisFix')}
-          >
-            <Icon name="lightbulb" size={13} />
-          </button>
+          />
           {isLastAssistant && onRegenerate && (
-            <button
+            <IconButton
+              icon="refresh"
+              label={t('home.regenerate')}
+              iconSize={13}
               onClick={onRegenerate}
-              className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-              title={t('home.regenerate')}
-            >
-              <Icon name="refresh" size={13} />
-            </button>
+            />
           )}
           <button
             onClick={() => onRate(message.id, feedback?.feedback === 'like' ? 'neutral' : 'like')}
@@ -7850,6 +8011,7 @@ const MessageItem = memo(function MessageItem({
           <button
             onClick={() => onSpeak(message.id, displayContent)}
             className={`p-1 rounded-md transition-colors ${speaking ? 'text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'}`}
+            aria-label={speaking ? t('home.stopSpeak') : t('home.speak')}
             title={speaking ? t('home.stopSpeak') : t('home.speak')}
           >
             <Icon name="headphones" size={13} />
@@ -7862,6 +8024,7 @@ const MessageItem = memo(function MessageItem({
                   ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
               }`}
+              aria-label={t('home.viewVersions')}
               title={t('home.viewVersions')}
             >
               <Icon name="git-branch" size={12} />
@@ -7871,7 +8034,8 @@ const MessageItem = memo(function MessageItem({
           {onDeleteMessage && (
             <button
               onClick={() => onDeleteMessage(message)}
-              className={`p-1 rounded-md transition-all ${confirmDeleteMsgId === message.id ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
+              className={`p-1 rounded-md transition-[color,background-color,border-color,box-shadow] ${confirmDeleteMsgId === message.id ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
+              aria-label={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
               title={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
             >
               <Icon name="delete" size={13} white={confirmDeleteMsgId === message.id} />
@@ -7891,48 +8055,35 @@ const MessageItem = memo(function MessageItem({
           >
             <h3 className="text-[14px] font-semibold">{t('knowledge.rememberTitle')}</h3>
             <p className="text-[11px] text-[var(--text-muted)]">{t('knowledge.rememberHint')}</p>
-            <div>
-              <label className="block text-[11px] text-[var(--text-secondary)] mb-1">{t('knowledge.entryTitle')}</label>
-              <input
-                value={rememberForm.title}
-                onChange={(e) => setRememberForm({ ...rememberForm, title: e.target.value })}
-                placeholder={t('knowledge.rememberTitlePh')}
-                className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)]"
-              />
-            </div>
-            <div>
-              <label className="block text-[11px] text-[var(--text-secondary)] mb-1">{t('knowledge.rememberError')}</label>
-              <textarea
-                value={rememberForm.error_text}
-                onChange={(e) => setRememberForm({ ...rememberForm, error_text: e.target.value })}
-                rows={4}
-                placeholder={t('knowledge.rememberErrorPh')}
-                className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] resize-y"
-              />
-            </div>
-            <div>
-              <label className="block text-[11px] text-[var(--text-secondary)] mb-1">{t('knowledge.fix')}</label>
-              <textarea
-                value={rememberForm.fix}
-                onChange={(e) => setRememberForm({ ...rememberForm, fix: e.target.value })}
-                rows={5}
-                className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] resize-y"
-              />
-            </div>
+            <Field
+              fieldSize="md"
+              label={t('knowledge.entryTitle')}
+              value={rememberForm.title}
+              onChange={(e) => setRememberForm({ ...rememberForm, title: e.target.value })}
+              placeholder={t('knowledge.rememberTitlePh')}
+            />
+            <TextArea
+              fieldSize="md"
+              label={t('knowledge.rememberError')}
+              value={rememberForm.error_text}
+              onChange={(e) => setRememberForm({ ...rememberForm, error_text: e.target.value })}
+              rows={4}
+              placeholder={t('knowledge.rememberErrorPh')}
+            />
+            <TextArea
+              fieldSize="md"
+              label={t('knowledge.fix')}
+              value={rememberForm.fix}
+              onChange={(e) => setRememberForm({ ...rememberForm, fix: e.target.value })}
+              rows={5}
+            />
             <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setRememberOpen(false)}
-                className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)]"
-              >
+              <Button variant="secondary" size="md" onClick={() => setRememberOpen(false)}>
                 {t('mcp.cancel')}
-              </button>
-              <button
-                onClick={saveRemember}
-                disabled={rememberSaving}
-                className="h-8 px-4 rounded-lg btn-primary text-[12px]  disabled:opacity-50"
-              >
+              </Button>
+              <Button variant="primary" size="md" loading={rememberSaving} onClick={saveRemember}>
                 {t('knowledge.save')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -7943,7 +8094,7 @@ const MessageItem = memo(function MessageItem({
         <div
           role="menu"
           onClick={(e) => e.stopPropagation()}
-          className="fixed z-[200] min-w-[180px] glass-card rounded-lg py-1 animate-modal-in text-[12.5px]"
+          className="fixed z-[var(--app-z-popover)] min-w-[180px] glass-card rounded-lg py-1 animate-modal-in text-[12.5px]"
           style={{ left: ctxMenu.x, top: ctxMenu.y }}
         >
           <button
@@ -8104,7 +8255,7 @@ const MessageItem = memo(function MessageItem({
                         })
                         setCtxMenu(null)
                       }}
-                      className={`w-7 h-7 rounded-md flex items-center justify-center text-[14px] font-semibold transition-all active:scale-90 ${
+                      className={`w-7 h-7 rounded-md flex items-center justify-center text-[14px] font-semibold transition-[color,background-color,border-color,box-shadow,transform] active:scale-90 ${
                         active
                           ? 'bg-[var(--warning)] text-white shadow-sm'
                           : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--warning)]'
@@ -8221,13 +8372,11 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
     }
   }
 
-  // 自动聚焦搜索框 + Esc 关闭
+  // 自动聚焦搜索框
   useEffect(() => {
     inputRef.current?.focus()
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [])
+  useEscapeKey(onClose)
 
   return (
     <div className="cmdk-backdrop" onClick={onClose}>
@@ -8241,12 +8390,7 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
             <Icon name="bolt" size={15} />
             <h2 className="text-[14px] font-semibold">{t('home.shortcuts')}</h2>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            <Icon name="close" size={14} />
-          </button>
+          <IconButton icon="close" label={t('common.close')} onClick={onClose} />
         </div>
 
         {/* 搜索框 */}
@@ -8262,6 +8406,8 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
           />
           {query && (
             <button
+              aria-label={t('home.clearSearch')}
+              title={t('home.clearSearch')}
               onClick={() => setQuery('')}
               className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
             >
@@ -8273,7 +8419,7 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
         {/* 分组列表 */}
         <div className="space-y-3 text-[12.5px] overflow-y-auto min-h-0 flex-1">
           {filtered.length === 0 ? (
-            <p className="text-center text-[12px] text-[var(--text-muted)] py-6">{t('home.shortcutNoResults')}</p>
+            <UiEmptyState compact title={t('home.shortcutNoResults')} />
           ) : (
             filtered.map((g) => (
               <div key={g.titleKey}>
@@ -8302,7 +8448,7 @@ function ShortcutsPanel({ onClose }: { onClose: () => void }) {
                         <Icon
                           name={isCopied ? 'check' : 'copy'}
                           size={10}
-                          className={`ml-1.5 transition-all ${isCopied ? 'text-[var(--success)] opacity-100' : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100'}`}
+                          className={`ml-1.5 transition-[color,background-color,border-color,opacity] ${isCopied ? 'text-[var(--success)] opacity-100' : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100'}`}
                         />
                       </span>
                     </div>
@@ -8353,13 +8499,10 @@ function ProjectSwitcher({ onClose, onSelect }: { onClose: () => void; onSelect:
     return () => clearTimeout(h)
   }, [])
 
-  // 键盘：↑↓ 移动 / Enter 选择 / Esc 关闭
+  // 键盘：↑↓ 移动 / Enter 选择（Esc 走全局栈，见下）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onClose()
-      } else if (e.key === 'ArrowDown') {
+      if (e.key === 'ArrowDown') {
         e.preventDefault()
         setSel((s) => Math.min(filtered.length - 1, s + 1))
       } else if (e.key === 'ArrowUp') {
@@ -8373,7 +8516,8 @@ function ProjectSwitcher({ onClose, onSelect }: { onClose: () => void; onSelect:
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [filtered, sel, onSelect, onClose])
+  }, [filtered, sel, onSelect])
+  useEscapeKey(onClose)
 
   return (
     <div
@@ -8474,13 +8618,10 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
     }
   }
 
-  // 快捷键：Esc 关闭 / Ctrl+Enter 提交
+  // 快捷键：Ctrl+Enter 提交（Esc 走全局栈，见下）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onClose()
-      } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault()
         void submit()
       }
@@ -8488,7 +8629,8 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lines.length, onClose]) // submit 是稳定闭包，但依赖 lines 让 Enter 触发时拿到最新行数
+  }, [lines.length]) // submit 是稳定闭包，但依赖 lines 让 Enter 触发时拿到最新行数
+  useEscapeKey(onClose)
 
   return (
     <div className="cmdk-backdrop" onClick={onClose}>
@@ -8504,13 +8646,8 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
             </div>
             <h2 className="text-[14px] font-semibold">{t('home.batch')}</h2>
           </div>
-          <button
-            onClick={onClose}
-            className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center"
-            title={t('home.cancel')}
-          >
-            <Icon name="close" size={13} />
-          </button>
+          {/* h-6 w-6 锁死 24px 盒：裸 IconButton 只有 13px 图标 + 8px padding = 21px */}
+          <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
         </div>
 
         <p className="text-[11.5px] text-[var(--text-muted)] mb-2.5 leading-relaxed">
@@ -8544,19 +8681,12 @@ function BatchSendDialog({ initial, onClose, onSubmit }: {
             <kbd className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] tnum">
               Ctrl+Enter
             </kbd>
-            <button
-              onClick={onClose}
-              className="h-7 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
-            >
+            <Button variant="secondary" size="sm" onClick={onClose}>
               {t('home.cancel')}
-            </button>
-            <button
-              onClick={submit}
-              disabled={lines.length === 0}
-              className="h-7 px-3 rounded-lg btn-primary text-[12px] active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed"
-            >
+            </Button>
+            <Button variant="primary" size="sm" disabled={lines.length === 0} onClick={submit}>
               {t('home.batchSend')}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -8606,14 +8736,7 @@ function ImportDialog({ data, onClose }: {
     return { user, assistant, other }
   }, [data.messages])
 
-  // Esc 关闭
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useEscapeKey(onClose)
 
   return (
     <div className="cmdk-backdrop" onClick={onClose}>
@@ -8632,13 +8755,7 @@ function ImportDialog({ data, onClose }: {
               {t('home.importMsgCount', { count: data.messages.length })}
             </span>
           </div>
-          <button
-            onClick={onClose}
-            className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center shrink-0"
-            title={t('home.cancel')}
-          >
-            <Icon name="close" size={13} />
-          </button>
+          <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
         </div>
 
         {/* 角色分布小条 */}
@@ -8692,20 +8809,18 @@ function ImportDialog({ data, onClose }: {
         <div className="flex items-center justify-between px-4 h-12 border-t border-[var(--border)] shrink-0">
           <span className="text-[11px] text-[var(--text-muted)]">{t('home.importReadOnly')}</span>
           <div className="flex items-center gap-2">
-            <button
-              onClick={onClose}
-              className="h-7 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
-            >
+            <Button variant="secondary" size="sm" onClick={onClose}>
               {t('home.cancel')}
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
               ref={copyRef}
+              icon={copied ? 'check' : 'copy'}
               onClick={copyAll}
-              className="h-7 px-3 rounded-lg btn-primary text-[12px] active:scale-[0.98] flex items-center gap-1.5"
             >
-              <Icon name={copied ? 'check' : 'copy'} size={12} white />
               {copied ? t('home.importCopied') : t('home.importCopyAll')}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -8769,15 +8884,16 @@ function ConvNoteBar({ convId }: { convId: string }) {
             <span className={`text-[10px] tnum ${draft.length > NOTE_MAX_LEN * 0.9 ? 'text-[var(--warning)]' : 'text-[var(--text-muted)]'}`}>
               {draft.length}/{NOTE_MAX_LEN}
             </span>
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={() => {
                 setNote(convId, draft)
                 setEditing(false)
               }}
-              className="text-[10.5px] h-6 px-2 rounded-md btn-primary active:scale-[0.98]"
             >
               {t('home.noteDone')}
-            </button>
+            </Button>
           </div>
         </div>
         <textarea
@@ -8826,6 +8942,7 @@ function ConvNoteBar({ convId }: { convId: string }) {
               }
             }}
             className="p-1 text-[var(--text-muted)] hover:text-[var(--danger)] opacity-0 group-hover:opacity-100"
+            aria-label={t('home.noteClear')}
             title={t('home.noteClear')}
           >
             <Icon name="close" size={11} />
@@ -8895,7 +9012,8 @@ function PinnedBar({ convId, onJump }: { convId: string; onJump: (msgId: string)
                     pinned: false,
                   }).catch(() => {})
                 }}
-                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger)] transition-all shrink-0"
+                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger)] transition-[color,background-color,border-color,opacity] shrink-0"
+                aria-label={t('home.unpinFromTop')}
                 title={t('home.unpinFromTop')}
               >
                 <Icon name="close" size={10} />
@@ -8903,122 +9021,6 @@ function PinnedBar({ convId, onJump }: { convId: string; onJump: (msgId: string)
             </div>
           )
         })}
-      </div>
-    </div>
-  )
-}
-
-
-/* ============ 通用确认弹层：替代 window.confirm，支持危险级别 + 自定义文案 ============
- * - tone: danger（红）/ warn（黄）/ info（蓝）
- * - confirmLabel: 主按钮文案（默认"确定"）
- * - requireInput: 需要用户输入指定短语才解锁确认按钮（最严级）
- * - 用法：调用方用 state 持有回调函数 + 参数 → 渲染时挂 onConfirm/onCancel
- */
-function ConfirmDialog({ open, title, body, tone = 'danger', confirmLabel, cancelLabel, requireInput, onConfirm, onCancel }: {
-  open: boolean
-  title: string
-  body: string | React.ReactNode
-  tone?: 'danger' | 'warn' | 'info'
-  confirmLabel?: string
-  cancelLabel?: string
-  /** 若提供此短语，用户必须在输入框中键入完全匹配的字符串才解锁确认 */
-  requireInput?: string
-  onConfirm: () => void
-  onCancel: () => void
-}) {
-  const { t } = useTranslation()
-  const [typed, setTyped] = useState('')
-  const inputRef = useRef<HTMLInputElement>(null)
-  const confirmBtnRef = useRef<HTMLButtonElement>(null)
-
-  // 重置输入态
-  useEffect(() => {
-    if (open) {
-      setTyped('')
-      setTimeout(() => (requireInput ? inputRef.current?.focus() : confirmBtnRef.current?.focus()), 30)
-    }
-  }, [open, requireInput])
-
-  // Esc 取消 / Enter 确认
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onCancel()
-      } else if (e.key === 'Enter' && !requireInput) {
-        e.preventDefault()
-        onConfirm()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onConfirm, onCancel, requireInput])
-
-  if (!open) return null
-  const canConfirm = !requireInput || typed === requireInput
-  const accent = tone === 'danger' ? 'var(--danger)' : tone === 'warn' ? 'var(--warning)' : 'var(--accent)'
-  const confirmStyle = canConfirm
-    ? { background: accent, color: '#fff' }
-    : { background: 'var(--bg-hover)', color: 'var(--text-muted)' }
-
-  return (
-    <div className="cmdk-backdrop" onClick={onCancel}>
-      <div
-        className="w-[440px] max-w-[92vw] glass-card p-4 animate-modal-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* 图标 + 标题 */}
-        <div className="flex items-start gap-3 mb-3">
-          <div
-            className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
-            style={{ background: `${accent}20`, color: accent }}
-          >
-            <Icon name={tone === 'info' ? 'info' : 'archive'} size={18} />
-          </div>
-          <div className="flex-1 min-w-0">
-            <h3 className="text-[14px] font-semibold leading-snug">{title}</h3>
-            <div className="mt-1.5 text-[12.5px] text-[var(--text-secondary)] leading-relaxed">{body}</div>
-          </div>
-        </div>
-
-        {/* 危险操作需要用户输入确认短语（防误触） */}
-        {requireInput && (
-          <div className="mb-3">
-            <label className="block text-[11px] text-[var(--text-muted)] mb-1.5">
-              {t('home.confirmTypePhrase', { phrase: requireInput })}
-            </label>
-            <input
-              ref={inputRef}
-              value={typed}
-              onChange={(e) => setTyped(e.target.value)}
-              spellCheck={false}
-              autoComplete="off"
-              className="w-full rounded-lg modern-card px-2.5 py-1.5 text-[12.5px] font-mono outline-none focus:border-[var(--accent)]"
-              placeholder={requireInput}
-            />
-          </div>
-        )}
-
-        {/* 操作按钮 */}
-        <div className="flex items-center justify-end gap-2 mt-1">
-          <button
-            onClick={onCancel}
-            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12.5px] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            {cancelLabel ?? t('home.cancel')}
-          </button>
-          <button
-            ref={confirmBtnRef}
-            onClick={onConfirm}
-            disabled={!canConfirm}
-            style={confirmStyle}
-            className="h-8 px-3 rounded-lg text-[12.5px] font-medium active:scale-[0.98] disabled:cursor-not-allowed transition-colors"
-          >
-            {confirmLabel ?? t('home.confirm')}
-          </button>
-        </div>
       </div>
     </div>
   )
@@ -9036,12 +9038,7 @@ function AuditDialog({ onClose }: { onClose: () => void }) {
   const clear = useAuditStore((s) => s.clear)
   const [filter, setFilter] = useState<'all' | AuditCategory>('all')
 
-  // Esc 关闭
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useEscapeKey(onClose)
 
   const filtered = useMemo(
     () => (filter === 'all' ? entries : entries.filter((e) => e.category === filter)).slice().sort((a, b) => b.ts - a.ts),
@@ -9083,23 +9080,21 @@ function AuditDialog({ onClose }: { onClose: () => void }) {
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <button
+            <Button
+              variant="danger"
+              size="sm"
+              confirm
+              confirmLabel={t('common.confirmAgain')}
+              title={t('home.auditClearConfirm')}
+              disabled={entries.length === 0}
               onClick={() => {
                 if (entries.length === 0) return
-                if (window.confirm(t('home.auditClearConfirm'))) clear()
+                clear()
               }}
-              disabled={entries.length === 0}
-              className="h-7 px-2.5 rounded-md border border-[var(--border)] text-[11.5px] text-[var(--danger)] hover:bg-[var(--danger)]/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
               {t('home.auditClear')}
-            </button>
-            <button
-              onClick={onClose}
-              className="w-6 h-6 rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] flex items-center justify-center"
-              title={t('home.cancel')}
-            >
-              <Icon name="close" size={13} />
-            </button>
+            </Button>
+            <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
           </div>
         </div>
 

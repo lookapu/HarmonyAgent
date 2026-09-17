@@ -6,7 +6,7 @@ pub fn list_providers(conn: &Connection) -> Result<Vec<Provider>, rusqlite::Erro
         "SELECT id, name, provider_type, protocol, base_url, api_key, npm_package,
                 is_active, in_failover_queue, priority, cost_multiplier,
                 limit_daily_cny, limit_monthly_cny, settings_json, notes, icon,
-                created_at, updated_at, endpoints_json
+                created_at, updated_at, endpoints_json, auto_pool_mode
          FROM providers ORDER BY is_active DESC, priority ASC, name ASC"
     )?;
 
@@ -31,6 +31,7 @@ pub fn list_providers(conn: &Connection) -> Result<Vec<Provider>, rusqlite::Erro
             settings_json: row.get(13)?,
             notes: row.get(14)?,
             icon: row.get(15)?,
+            auto_pool_mode: row.get(19)?,
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
         })
@@ -44,7 +45,7 @@ pub fn get_provider(conn: &Connection, id: &str) -> Result<Option<Provider>, rus
         "SELECT id, name, provider_type, protocol, base_url, api_key, npm_package,
                 is_active, in_failover_queue, priority, cost_multiplier,
                 limit_daily_cny, limit_monthly_cny, settings_json, notes, icon,
-                created_at, updated_at, endpoints_json
+                created_at, updated_at, endpoints_json, auto_pool_mode
          FROM providers WHERE id = ?1"
     )?;
 
@@ -69,6 +70,7 @@ pub fn get_provider(conn: &Connection, id: &str) -> Result<Option<Provider>, rus
             settings_json: row.get(13)?,
             notes: row.get(14)?,
             icon: row.get(15)?,
+            auto_pool_mode: row.get(19)?,
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
         })
@@ -82,14 +84,15 @@ pub fn insert_provider(conn: &Connection, p: &Provider) -> Result<(), rusqlite::
         "INSERT INTO providers (id, name, provider_type, protocol, base_url, api_key, npm_package,
             is_active, in_failover_queue, priority, cost_multiplier,
             limit_daily_cny, limit_monthly_cny, settings_json, notes, icon,
-            created_at, updated_at, endpoints_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            created_at, updated_at, endpoints_json, auto_pool_mode)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             p.id, p.name, p.provider_type, p.protocol, p.base_url, p.api_key, p.npm_package,
             p.is_active, p.in_failover_queue, p.priority, p.cost_multiplier,
             p.limit_daily_cny, p.limit_monthly_cny, p.settings_json, p.notes, p.icon,
             p.created_at, p.updated_at,
             serde_json::to_string(&p.endpoints).unwrap_or_else(|_| "[]".into()),
+            p.auto_pool_mode,
         ],
     )?;
     Ok(())
@@ -100,7 +103,8 @@ pub fn update_provider(conn: &Connection, p: &Provider) -> Result<(), rusqlite::
         "UPDATE providers SET name=?2, provider_type=?3, base_url=?4, api_key=?5,
             npm_package=?6, is_active=?7, in_failover_queue=?8, priority=?9,
             cost_multiplier=?10, limit_daily_cny=?11, limit_monthly_cny=?12,
-            settings_json=?13, notes=?14, icon=?15, updated_at=?16, endpoints_json=?17
+            settings_json=?13, notes=?14, icon=?15, updated_at=?16, endpoints_json=?17,
+            auto_pool_mode=?18
          WHERE id=?1",
         params![
             p.id, p.name, p.provider_type, p.base_url, p.api_key, p.npm_package,
@@ -108,6 +112,7 @@ pub fn update_provider(conn: &Connection, p: &Provider) -> Result<(), rusqlite::
             p.limit_daily_cny, p.limit_monthly_cny, p.settings_json, p.notes, p.icon,
             p.updated_at,
             serde_json::to_string(&p.endpoints).unwrap_or_else(|_| "[]".into()),
+            p.auto_pool_mode,
         ],
     )?;
     Ok(())
@@ -915,6 +920,65 @@ pub fn get_cost_by_model(conn: &Connection, start: i64, end: i64) -> Result<Vec<
     })?;
 
     rows.collect()
+}
+
+/* ============ Auto 池统计 ============ */
+
+/// 读取 auto 池内的 provider 概况（min_mode：主池 1 / 杂活池 2；active 恒在池内）
+fn auto_pool_providers(conn: &Connection, min_mode: i64) -> Result<Vec<AutoPoolProvider>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.name, p.auto_pool_mode, p.is_active, COUNT(m.id)
+         FROM providers p
+         LEFT JOIN models m ON m.provider_id = p.id AND m.enabled = 1
+         WHERE p.is_active = 1 OR p.auto_pool_mode >= ?1
+         GROUP BY p.id
+         ORDER BY p.is_active DESC, p.auto_pool_mode DESC, p.name ASC",
+    )?;
+    let rows = stmt.query_map([min_mode], |row| {
+        Ok(AutoPoolProvider {
+            provider_id: row.get(0)?,
+            name: row.get(1)?,
+            auto_pool_mode: row.get(2)?,
+            is_active: row.get(3)?,
+            model_count: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// auto 池统计：主池/杂活池构成 + 池内模型在主任务中的使用分布
+pub fn get_auto_pool_stats(conn: &Connection) -> Result<AutoPoolStats, rusqlite::Error> {
+    let main_pool = auto_pool_providers(conn, 1)?;
+    let aux_pool = auto_pool_providers(conn, 2)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT tr.model, tr.provider_id, p.name, COUNT(*),
+                SUM(tr.cost_cny), SUM(tr.input_tokens), SUM(tr.output_tokens)
+         FROM task_runs tr
+         JOIN providers p ON p.id = tr.provider_id
+         WHERE tr.model IS NOT NULL
+           AND (p.is_active = 1 OR p.auto_pool_mode >= 1)
+         GROUP BY tr.model, tr.provider_id
+         ORDER BY SUM(tr.cost_cny) DESC, COUNT(*) DESC",
+    )?;
+    let usage = stmt.query_map([], |row| {
+        Ok(AutoPoolModelUsage {
+            model: row.get(0)?,
+            provider_id: row.get(1)?,
+            provider_name: row.get(2)?,
+            request_count: row.get(3)?,
+            cost_cny: row.get(4)?,
+            input_tokens: row.get(5)?,
+            output_tokens: row.get(6)?,
+        })
+    })?;
+    let usage_by_model = usage.collect::<Result<Vec<_>, _>>()?;
+
+    Ok(AutoPoolStats {
+        main_pool,
+        aux_pool,
+        usage_by_model,
+    })
 }
 
 /* ============ 任务级 Trace（010） ============ */

@@ -7,6 +7,7 @@ import { mcpTemplates, mcpTemplateCategories, matchMcpTemplate, templateEnvDefau
 import { detectDevecoCli } from '../api/devecoCli'
 import { useProjectStore } from '../stores/projectStore'
 import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
+import { Skeleton } from '../components/ui/Spinner'
 
 /**
  * 解析环境变量文本为对象（每行一个 KEY=value，兼容旧的逗号分隔）。
@@ -106,7 +107,7 @@ function TemplateCard({ tpl, installed, globalOnly, justAdded, editing, onActiva
         }
       }}
       title={`${tpl.description}\n${tpl.popularity ? t('mcp.popularity', { data: tpl.popularity }) : ''}\n${tpl.envHint ? t('mcp.envSummary', { env: tpl.envHint }) : ''}\n${editing ? t('mcp.clickToFill') : t('mcp.clickToAdd')}`}
-      className={`px-2.5 py-2 rounded-xl border text-left transition-all cursor-pointer focus:outline-none focus-visible:border-[var(--accent)] ${
+      className={`px-2.5 py-2 rounded-xl border text-left transition-colors cursor-pointer focus:outline-none focus-visible:border-[var(--accent)] ${
         highlighted
           ? 'border-[var(--success)]/50 bg-[var(--success)]/10'
           : 'border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--accent)]/40 hover:bg-[var(--bg-hover)]'
@@ -1010,7 +1011,7 @@ function McpUsageView({
   }
 
   if (loading) {
-    return <p className="text-sm text-[var(--text-secondary)]">{t('mcp.loadingStats')}</p>
+    return <Skeleton lines={4} label={t('mcp.loadingStats')} className="py-2" />
   }
 
   return (

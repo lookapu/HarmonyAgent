@@ -27,6 +27,8 @@ pub struct Provider {
     pub settings_json: String,
     pub notes: Option<String>,
     pub icon: Option<String>,
+    /// auto 池三态：0=不参与，1=仅主对话，2=主对话+杂活
+    pub auto_pool_mode: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -491,4 +493,37 @@ pub struct TaskStats {
 pub struct ErrorKindCount {
     pub kind: String,
     pub count: i64,
+}
+
+/* ============ Auto 池统计 ============ */
+
+/// auto 池内的 provider 概况
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPoolProvider {
+    pub provider_id: String,
+    pub name: String,
+    pub auto_pool_mode: i64,
+    pub is_active: bool,
+    /// 已启用模型数
+    pub model_count: i64,
+}
+
+/// auto 池内某模型的实际使用（来自 task_runs 主任务口径）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPoolModelUsage {
+    pub model: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub request_count: i64,
+    pub cost_cny: f64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+/// auto 池统计：主池/杂活池构成 + 池内模型使用分布
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPoolStats {
+    pub main_pool: Vec<AutoPoolProvider>,
+    pub aux_pool: Vec<AutoPoolProvider>,
+    pub usage_by_model: Vec<AutoPoolModelUsage>,
 }

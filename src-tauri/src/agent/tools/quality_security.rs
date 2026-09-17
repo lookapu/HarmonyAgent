@@ -121,13 +121,14 @@ pub async fn sandbox_exec(args: &Value, roots: &[String]) -> Result<String, Stri
         .to_lowercase();
     let allowed = crate::services::permissions::ALLOWED_COMMANDS.contains(&program.as_str());
     let mut out = String::new();
-    out.push_str(&format!("🛡️ 沙箱干跑预览\n命令：{command}\n模式：{mode}\n"));
+    out.push_str(&format!("🧪 临时副本试运行\n命令：{command}\n模式：{mode}\n"));
+    out.push_str("边界：这不是 OS 级沙箱；进程仍以宿主用户权限运行，未限制临时目录外读取或网络访问。\n");
     out.push_str(&format!("程序：{program}（{}）\n", if allowed { "白名单内" } else { "白名单外 ⚠️" }));
     if !dangerous.is_empty() {
         out.push_str(&format!("命中危险模式：{}\n", dangerous.join(" / ")));
     }
     if mode == "preview" {
-        out.push_str("\n（preview 模式：仅分析未执行。建议：确认影响面后，或改在沙箱 simulate 模式执行，或直接 run_command 真执行）");
+        out.push_str("\n（preview 模式：仅分析未执行。建议：确认影响面后，可在临时副本中 simulate；不可信代码请勿执行。）");
         return Ok(out);
     }
     // simulate：复制 source 到临时沙箱后执行
@@ -139,14 +140,15 @@ pub async fn sandbox_exec(args: &Value, roots: &[String]) -> Result<String, Stri
         }
         std::fs::create_dir_all(&sandbox).map_err(|e| e.to_string())?;
         let copied = copy_tree(&src_path, &sandbox, 0)?;
-        out.push_str(&format!("已复制 {} 到沙箱（{} 个文件）\n", src_path.display(), copied));
-    } else if !dangerous.is_empty() && !allowed {
-        // 无 source 且命令危险且程序不在白名单：拒绝模拟执行（无隔离边界）
+        out.push_str(&format!("已复制 {} 到临时副本（{} 个文件）\n", src_path.display(), copied));
+    } else {
+        // 没有 source 就没有可声明的临时副本边界。即使程序在白名单内也不能
+        // 直接落到宿主当前目录执行，否则 simulate 会成为绕过 run_command 审批的旁路。
         return Ok(format!(
-            "{out}\n⚠️ 无 source 隔离边界且程序不在白名单，拒绝模拟执行。\n建议：传 source 参数把目录复制进沙箱后模拟，或直接 run_command 走审批流程。"
+            "{out}\n⚠️ simulate 必须提供 source；本次仅完成预览，未执行命令。\n建议：传 source 参数在临时副本中观察文件影响；不可信代码请勿执行。"
         ));
     }
-    // 在沙箱中执行（白名单程序；沙箱内影响面可控）
+    // 在临时副本中执行。cwd 只降低对 source 的误修改风险，不构成权限边界。
     let mut cmd = tokio::process::Command::new(first_word);
     cmd.args(command.split_whitespace().skip(1));
     if sandbox.exists() {
@@ -157,8 +159,8 @@ pub async fn sandbox_exec(args: &Value, roots: &[String]) -> Result<String, Stri
         cmd.output(),
     )
     .await
-    .map_err(|_| format!("沙箱执行超时（>{timeout_secs}s）"))?
-    .map_err(|e| format!("沙箱执行失败：{e}"))?;
+    .map_err(|_| format!("临时副本执行超时（>{timeout_secs}s）"))?
+    .map_err(|e| format!("临时副本执行失败：{e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     out.push_str(&format!(
@@ -172,7 +174,7 @@ pub async fn sandbox_exec(args: &Value, roots: &[String]) -> Result<String, Stri
         out.push_str(&format!("标准错误：\n{}\n", truncate_chars(&stderr, 2000)));
     }
     out.push_str(&format!(
-        "\n⚠️ 以上在临时沙箱 {} 中执行，未影响真实目录。\n确认行为符合预期后，再在真实目录执行（run_command 会走审批）。",
+        "\n⚠️ 以上在临时副本 {} 中执行，未直接修改 source；但进程没有 OS 级隔离，仍可能访问其他宿主资源。\n确认行为符合预期后，再在真实目录执行（run_command 会走审批）。",
         sandbox.display()
     ));
     Ok(out)
@@ -544,4 +546,34 @@ fn copy_tree(src: &Path, dst: &Path, depth: u32) -> Result<u32, String> {
         }
     }
     Ok(copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn temporary_copy_preview_discloses_host_permissions() {
+        let args = serde_json::json!({
+            "command": "git status",
+            "mode": "preview"
+        });
+        let output = sandbox_exec(&args, &[]).await.unwrap();
+        assert!(output.contains("临时副本试运行"));
+        assert!(output.contains("不是 OS 级沙箱"));
+        assert!(output.contains("宿主用户权限"));
+        assert!(output.contains("未限制临时目录外读取或网络访问"));
+    }
+
+    #[tokio::test]
+    async fn simulate_without_source_never_executes_on_host() {
+        let args = serde_json::json!({
+            "command": "git status",
+            "mode": "simulate"
+        });
+        let output = sandbox_exec(&args, &[]).await.unwrap();
+        assert!(output.contains("simulate 必须提供 source"));
+        assert!(output.contains("未执行命令"));
+        assert!(!output.contains("退出码："));
+    }
 }

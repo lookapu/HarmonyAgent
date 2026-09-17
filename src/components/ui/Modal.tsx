@@ -1,0 +1,164 @@
+/**
+ * 模态：全库 18 处手写模态的统一外壳
+ *
+ * 阻塞语义由 onClose 是否传入决定，这是刻意的单一开关：
+ *   传 onClose  → 可关闭：注册 Esc、渲染右上角 X（遮罩点击另由 backdropClose 决定）
+ *   不传 onClose → 阻塞式：三者全部没有（工具权限审核 / ask_user 就是这种，
+ *                  用户必须做出选择，不能被 Esc 或点空白绕过）
+ *
+ * 一律 createPortal 到 body：模态若留在原位置，任何带 transform 的祖先
+ * （例如 .render-tier-high .chat-scroll > *）都会让 position:fixed 相对该祖先
+ * 定位而不是视口，遮罩就盖不满屏。messageBlocks 的独立审核窗口此前正是为此
+ * 手写 portal。
+ *
+ * 遮罩点击用 onMouseDown 而非 onClick，且比对 e.target === e.currentTarget：
+ * 在模态内按下鼠标、拖到遮罩上松开不应关闭（onClick 会误触发）。
+ *
+ * `aria-modal="true"` 由 useFocusTrap 兑现：Tab 循环锁在容器内、打开时把焦点移进去、
+ * 关闭时还给触发元素。少了它这个属性是**反向伤害**——它向读屏声明背后内容不可达，
+ * 焦点却还能 Tab 出去（详见 hooks/useFocusTrap.ts）。dialog 因此带 tabindex="-1"，
+ * 好在没有任何可聚焦子元素时兜住焦点。
+ *
+ * 遮罩本体复用 index.css 的 .modal-backdrop（已含平涂压暗 + fade-in +
+ * z-index: var(--app-z-modal)），本文件只补 flex 居中与内边距。
+ */
+
+import { useId, useRef } from 'react'
+import type { ReactNode } from 'react'
+import { createPortal } from 'react-dom'
+import { useTranslation } from 'react-i18next'
+import { useEscapeKey } from '../../hooks/useEscapeKey'
+import { useFocusTrap } from '../../hooks/useFocusTrap'
+import { cn } from '../../utils/cn'
+import { IconButton } from './IconButton'
+import Icon from '../../icons/Icon'
+import type { IconName } from '../../icons/Icon'
+
+const sizeCls = {
+  sm: 'w-[420px]',
+  md: 'w-[480px]',
+  lg: 'w-[560px]',
+  xl: 'w-[640px]',
+  '2xl': 'w-[820px]',
+} as const
+
+const maxHeightCls = {
+  none: '',
+  '80vh': 'max-h-[80vh]',
+  '86vh': 'max-h-[86vh]',
+} as const
+
+export interface ModalProps {
+  open: boolean
+  /** 省略即阻塞式：不注册 Esc、遮罩不可点、不渲染关闭按钮 */
+  onClose?: () => void
+  title?: ReactNode
+  icon?: IconName
+  size?: keyof typeof sizeCls
+  /** light：标题与正文同层无分隔线（确认框、小表单）
+   *  formal：标题行带下边框与浅色底（多区块的设置类弹窗） */
+  header?: 'light' | 'formal'
+  /** top = 顶部 12vh 偏移，⌘K 那类「靠近触发点」的浮层用 */
+  align?: 'center' | 'top'
+  footer?: ReactNode
+  maxHeight?: keyof typeof maxHeightCls
+  /** 点击遮罩是否关闭，默认 true。持有未保存输入的表单类弹窗应传 false：
+   *  在弹窗内按下鼠标、拖到遮罩上松手是常见误操作，会直接丢掉用户已键入的内容。
+   *  这个开关**不**影响 Esc——按 Esc 是明确意图，且它是键盘用户唯一的退出路径。 */
+  backdropClose?: boolean
+  className?: string
+  children?: ReactNode
+}
+
+export function Modal({
+  open,
+  onClose,
+  title,
+  icon,
+  size = 'md',
+  header = 'light',
+  align = 'center',
+  footer,
+  maxHeight = '86vh',
+  backdropClose = true,
+  className,
+  children,
+}: ModalProps) {
+  const titleId = useId()
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const { t } = useTranslation()
+  useEscapeKey(onClose ?? null, { enabled: open })
+  useFocusTrap(dialogRef, { enabled: open })
+
+  if (!open) return null
+
+  const showHeader = title != null || onClose != null
+
+  return createPortal(
+    <div
+      className={cn(
+        'modal-backdrop flex justify-center p-4',
+        align === 'top' ? 'items-start pt-[12vh]' : 'items-center',
+      )}
+      onMouseDown={(e) => {
+        if (onClose && backdropClose && e.target === e.currentTarget) onClose()
+      }}
+    >
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title != null ? titleId : undefined}
+        className={cn(
+          'glass-card flex flex-col rounded-xl animate-modal-in max-w-[92vw]',
+          sizeCls[size],
+          maxHeightCls[maxHeight],
+          className,
+        )}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        {showHeader && (
+          <div
+            className={cn(
+              'flex shrink-0 items-center gap-2',
+              header === 'formal'
+                ? 'border-b border-[var(--border)] bg-[var(--bg-card)] px-4 py-2.5'
+                : 'px-4 pt-3.5 pb-1',
+            )}
+          >
+            {icon && (
+              <span aria-hidden="true" className="inline-flex shrink-0">
+                <Icon name={icon} size={15} />
+              </span>
+            )}
+            {title != null && (
+              <h2
+                id={titleId}
+                className="min-w-0 flex-1 truncate text-[length:var(--app-text-md)] font-semibold"
+              >
+                {title}
+              </h2>
+            )}
+            {onClose && (
+              <IconButton
+                icon="close"
+                label={t('common.close')}
+                iconSize={13}
+                onClick={onClose}
+                className={cn(title == null && 'ml-auto')}
+              />
+            )}
+          </div>
+        )}
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">{children}</div>
+
+        {footer && (
+          <div className="flex shrink-0 items-center justify-end gap-2 px-4 py-3">{footer}</div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  )
+}

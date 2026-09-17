@@ -94,18 +94,25 @@ pub struct ToolCtx {
     pub conversation_id: String,
     /// 当前任务代次 id。工具/日志事件必须携带它，避免已停止旧任务的延迟输出污染新任务。
     pub run_id: String,
+    /// 当前持久工具调用 id。Host Capability Broker 等特权边界必须要求该字段存在。
+    pub tool_call_id: Option<String>,
     /// 还可再委派子 Agent 的层数（防无限嵌套；主 Agent=1，子 Agent 由委派约束决定）
     pub spawn_remaining: usize,
 }
 
 impl ToolCtx {
     pub fn new(app: AppHandle, conversation_id: String, run_id: String) -> Self {
-        Self { app: Some(app), conversation_id, run_id, spawn_remaining: 1 }
+        Self { app: Some(app), conversation_id, run_id, tool_call_id: None, spawn_remaining: 1 }
     }
 
     #[allow(dead_code)]
     pub fn empty() -> Self {
-        Self { app: None, conversation_id: String::new(), run_id: String::new(), spawn_remaining: 0 }
+        Self { app: None, conversation_id: String::new(), run_id: String::new(), tool_call_id: None, spawn_remaining: 0 }
+    }
+
+    pub fn with_tool_call_id(mut self, tool_call_id: String) -> Self {
+        self.tool_call_id = Some(tool_call_id);
+        self
     }
 
     /// 推送一行流式日志到前端。失败静默（日志推送不应中断工具执行）。
@@ -202,7 +209,7 @@ pub fn append_log(path: &std::path::Path, text: &str) {
 }
 
 /// 带流式回调的命令执行器：逐行读取 stdout/stderr，边读边通过 ctx 推送 `agent:log`，
-/// 同时写入落盘日志。返回完整 Output（含退出码），供工具结果/错误解析使用。
+/// 同时写入落盘日志。返回含退出码的 Output；超长行与收集缓冲会截断，不能作为完整日志。
 ///
 /// 设计要点：回调只通过 `ctx.emit_log`（内部是 Clone 的 AppHandle，无 FnMut 共享问题），
 /// stdout/stderr 各自一个读取任务，互不阻塞。
@@ -227,9 +234,151 @@ pub async fn run_cmd_streaming_env(
     log_file: Option<&std::path::Path>,
     envs: Option<&[(String, String)]>,
 ) -> Result<Output, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    run_cmd_streaming_inner(
+        ctx,
+        program,
+        args,
+        cwd,
+        timeout_secs,
+        StreamRunOptions {
+            log_file,
+            envs,
+            ..Default::default()
+        },
+    )
+    .await
+    .map(|(output, _truncated, _limits)| output)
+}
 
+/// 沙箱输出预算在采集、事件推送和日志落盘之前执行，stdout/stderr 共用额度。
+pub async fn run_cmd_streaming_limited(
+    ctx: &ToolCtx,
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    timeout_secs: u64,
+    output_bytes: usize,
+) -> Result<(Output, bool), String> {
+    run_cmd_streaming_inner(
+        ctx,
+        program,
+        args,
+        cwd,
+        timeout_secs,
+        StreamRunOptions {
+            output_bytes: Some(output_bytes),
+            ..Default::default()
+        },
+    )
+    .await
+    .map(|(output, truncated, _)| (output, truncated))
+}
+
+/// 与 [`run_cmd_streaming_env`] 相同，但额外把资源限制挂到子进程上，并返回
+/// **实际施加情况**——未生效的限额由调用方如实上报，不能被吞掉。
+pub async fn run_cmd_streaming_env_with_native_limits(
+    ctx: &ToolCtx,
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    timeout_secs: u64,
+    envs: Option<&[(String, String)]>,
+    limits: &crate::agent::native_limits::NativeLimits,
+) -> Result<
+    (
+        Output,
+        bool,
+        crate::agent::native_limits::NativeLimitsReport,
+    ),
+    String,
+> {
+    run_cmd_streaming_inner(
+        ctx,
+        program,
+        args,
+        cwd,
+        timeout_secs,
+        StreamRunOptions {
+            envs,
+            native_limits: Some(limits),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// 与 [`run_cmd_streaming_limited`] 相同，但额外把原生资源限制挂到子进程上，并返回
+/// **实际施加情况**——未生效的限额由调用方如实上报，不能被吞掉。
+pub async fn run_cmd_streaming_limited_with_native_limits(
+    ctx: &ToolCtx,
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    timeout_secs: u64,
+    output_bytes: usize,
+    limits: &crate::agent::native_limits::NativeLimits,
+) -> Result<
+    (
+        Output,
+        bool,
+        crate::agent::native_limits::NativeLimitsReport,
+    ),
+    String,
+> {
+    run_cmd_streaming_inner(
+        ctx,
+        program,
+        args,
+        cwd,
+        timeout_secs,
+        StreamRunOptions {
+            output_bytes: Some(output_bytes),
+            native_limits: Some(limits),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// 流式执行的附加选项：日志落盘、环境变量、输出预算与资源限制。
+/// 收拢成结构，避免内部执行器的参数列表随功能继续膨胀。
+#[derive(Default, Clone, Copy)]
+struct StreamRunOptions<'a> {
+    log_file: Option<&'a std::path::Path>,
+    envs: Option<&'a [(String, String)]>,
+    output_bytes: Option<usize>,
+    native_limits: Option<&'a crate::agent::native_limits::NativeLimits>,
+}
+
+async fn run_cmd_streaming_inner(
+    ctx: &ToolCtx,
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    timeout_secs: u64,
+    options: StreamRunOptions<'_>,
+) -> Result<
+    (
+        Output,
+        bool,
+        crate::agent::native_limits::NativeLimitsReport,
+    ),
+    String,
+> {
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let StreamRunOptions {
+        log_file,
+        envs,
+        output_bytes,
+        native_limits,
+    } = options;
     let mut cmd = crate::utils::process::command(program, args)?;
+    // 资源限制必须在 spawn 之前挂上（fork 后、exec 前生效）
+    let limits_report = match native_limits {
+        Some(limits) => crate::agent::native_limits::apply(&mut cmd, limits),
+        None => crate::agent::native_limits::NativeLimitsReport::default(),
+    };
     if let Some(envs) = envs {
         cmd.envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
@@ -244,34 +393,6 @@ pub async fn run_cmd_streaming_env(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    // 行级读取器：按字节读一行后 smart_decode（UTF-8/GBK 检测链）。
-    // 不能直接用 BufReader::lines()：它按严格 UTF-8 解析，GBK 输出行会整行报错被吞，
-    // 导致 Windows 下 hvigor/hdc 的中文错误信息完全消失。
-    // （GBK 双字节序列不含 0x0A，按换行切行不会拆坏多字节字符）
-    async fn read_line_smart<R: tokio::io::AsyncBufRead + Unpin>(
-        reader: &mut R,
-        buf: &mut Vec<u8>,
-    ) -> Option<String> {
-        buf.clear();
-        let n = reader.read_until(b'\n', buf).await.ok()?;
-        if n == 0 {
-            return None;
-        }
-        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-            buf.pop();
-        }
-        const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
-        if buf.len() > MAX_EVENT_LINE_BYTES {
-            let drop_n = buf.len() - MAX_EVENT_LINE_BYTES;
-            buf.drain(..drop_n);
-            return Some(format!(
-                "[单行输出过长，已省略前 {drop_n} 字节] {}",
-                crate::agent::tools::smart_decode(buf)
-            ));
-        }
-        Some(crate::agent::tools::smart_decode(buf))
-    }
-
     // 日志目录只同步创建一次；文件写入由 Tokio 文件句柄批量完成，避免每一行都在
     // async worker 上同步 open/write/close（Windows Defender 下该模式尤其容易卡顿）。
     if let Some(path) = log_file {
@@ -283,6 +404,8 @@ pub async fn run_cmd_streaming_env(
     // 每个流读取任务持有 ctx 的 clone 与独立 append 句柄。stdout/stderr 原本就是并发流，
     // 因此跨流的严格行顺序不作保证；单个批次内顺序保持不变。
     let stdout_snapshot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let budget = std::sync::Arc::new(std::sync::Mutex::new(StreamOutputBudget { remaining: output_bytes, truncated: false }));
+    let stdout_budget = budget.clone();
     let stdout_for_task = stdout_snapshot.clone();
     let ctx_out = ctx.clone();
     let log_out = log_file.map(|p| p.to_path_buf());
@@ -297,12 +420,13 @@ pub async fn run_cmd_streaming_env(
             let mut event_lines: Vec<String> = Vec::with_capacity(32);
             let mut last_event_flush = tokio::time::Instant::now() - std::time::Duration::from_millis(50);
             while let Some(line) = read_line_smart(&mut reader, &mut buf).await {
+                let Some(line) = stdout_budget.lock().ok().and_then(|mut budget| budget.accept(line)) else { continue; };
                 if let Ok(mut collected) = stdout_for_task.lock() {
                     collected.push_str(&line);
                     collected.push('\n');
                     // 收集缓冲上限：构建输出可达数十 MB，只保留尾部供工具结果解析
                     // （完整日志已逐行落盘 + 推送事件，不依赖此缓冲）
-                    keep_tail_of_collected(&mut collected);
+                    if output_bytes.is_none() { keep_tail_of_collected(&mut collected); }
                 }
                 event_lines.push(line);
                 if event_lines.len() >= 32 || last_event_flush.elapsed() >= std::time::Duration::from_millis(50) {
@@ -328,6 +452,7 @@ pub async fn run_cmd_streaming_env(
     });
 
     let stderr_snapshot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_budget = budget.clone();
     let stderr_for_task = stderr_snapshot.clone();
     let ctx_err = ctx.clone();
     let log_err = log_file.map(|p| p.to_path_buf());
@@ -342,10 +467,11 @@ pub async fn run_cmd_streaming_env(
             let mut event_lines: Vec<String> = Vec::with_capacity(32);
             let mut last_event_flush = tokio::time::Instant::now() - std::time::Duration::from_millis(50);
             while let Some(line) = read_line_smart(&mut reader, &mut buf).await {
+                let Some(line) = stderr_budget.lock().ok().and_then(|mut budget| budget.accept(line)) else { continue; };
                 if let Ok(mut collected) = stderr_for_task.lock() {
                     collected.push_str(&line);
                     collected.push('\n');
-                    keep_tail_of_collected(&mut collected);
+                    if output_bytes.is_none() { keep_tail_of_collected(&mut collected); }
                 }
                 event_lines.push(line);
                 if event_lines.len() >= 32 || last_event_flush.elapsed() >= std::time::Duration::from_millis(50) {
@@ -395,11 +521,47 @@ pub async fn run_cmd_streaming_env(
 
     let (out, err) = finish_output_readers(stdout_task, stderr_task, &stdout_snapshot, &stderr_snapshot).await;
 
-    Ok(Output {
-        status,
-        stdout: out.into_bytes(),
-        stderr: err.into_bytes(),
-    })
+    let truncated = budget.lock().map(|budget| budget.truncated).unwrap_or(true);
+    Ok((
+        Output {
+            status,
+            stdout: out.into_bytes(),
+            stderr: err.into_bytes(),
+        },
+        truncated,
+        limits_report,
+    ))
+}
+
+struct StreamOutputBudget {
+    remaining: Option<usize>,
+    truncated: bool,
+}
+
+impl StreamOutputBudget {
+    fn accept(&mut self, line: StreamLine) -> Option<String> {
+        self.truncated |= line.truncated;
+        let mut text = line.text;
+        let Some(remaining) = self.remaining.as_mut() else { return Some(text); };
+        if *remaining == 0 {
+            self.truncated = true;
+            return None;
+        }
+        // 后续采集、事件批次和日志写入都会追加一个换行，必须计入预算。
+        if text.len() >= *remaining {
+            let mut end = *remaining - 1;
+            while !text.is_char_boundary(end) { end -= 1; }
+            text.truncate(end);
+            self.truncated = true;
+        }
+        *remaining -= text.len() + 1;
+        Some(text)
+    }
+}
+
+struct StreamLine {
+    text: String,
+    truncated: bool,
 }
 
 /// 子进程/包装器已退出后，孙进程在 Windows 上仍可能持有继承的 stdout/stderr 句柄，
@@ -428,8 +590,130 @@ async fn finish_output_readers(
     (out, err)
 }
 
-/// 收集缓冲超过阈值时丢弃前半（保留尾部，错误结论通常在日志末尾）：
-/// 缓冲增长到 2 倍上限才裁剪一次，避免超大输出时每行都做 drain 的 O(n²) 复制。
+const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
+
+/// 在读取阶段限制行缓冲，不能先 read_until 再截断：子进程可以一直不输出换行。
+/// 保留尾部供错误解析，按行解码继续兼容 Windows 工具的 GBK 输出。
+async fn read_line_smart<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> Option<StreamLine> {
+    use tokio::io::AsyncBufReadExt;
+    buf.clear();
+    let mut discarded = 0usize;
+    let mut received = false;
+    loop {
+        let chunk = reader.fill_buf().await.ok()?;
+        if chunk.is_empty() { break; }
+        received = true;
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(chunk.len(), |index| index + 1);
+        let bytes = &chunk[..take];
+        if bytes.len() >= MAX_EVENT_LINE_BYTES {
+            discarded = discarded.saturating_add(buf.len()).saturating_add(bytes.len() - MAX_EVENT_LINE_BYTES);
+            buf.clear();
+            buf.extend_from_slice(&bytes[bytes.len() - MAX_EVENT_LINE_BYTES..]);
+        } else {
+            let drop = (buf.len() + bytes.len()).saturating_sub(MAX_EVENT_LINE_BYTES);
+            discarded = discarded.saturating_add(drop);
+            buf.drain(..drop);
+            buf.extend_from_slice(bytes);
+        }
+        reader.consume(take);
+        if newline.is_some() { break; }
+    }
+    if !received { return None; }
+    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) { buf.pop(); }
+    let decoded = crate::agent::tools::smart_decode(buf);
+    let text = if discarded > 0 {
+        format!("[单行输出过长，已省略前 {discarded} 字节] {decoded}")
+    } else { decoded };
+    Some(StreamLine { text, truncated: discarded > 0 })
+}
+
+#[cfg(test)]
+mod bounded_line_tests {
+    use super::*;
+
+    #[test]
+    fn shared_budget_counts_newlines_and_preserves_unicode() {
+        let mut budget = StreamOutputBudget { remaining: Some(7), truncated: false };
+        let line = |text: &str| StreamLine { text: text.into(), truncated: false };
+        assert_eq!(budget.accept(line("abc")).as_deref(), Some("abc"));
+        assert_eq!(budget.accept(line("中文")).as_deref(), Some(""));
+        assert!(budget.truncated);
+        assert_eq!(budget.accept(line("x")).as_deref(), Some("x"));
+        assert!(budget.accept(line("more")).is_none());
+        assert_eq!(budget.remaining, Some(0));
+    }
+
+    #[test]
+    fn exact_output_budget_is_not_reported_as_truncated() {
+        let mut budget = StreamOutputBudget { remaining: Some(4), truncated: false };
+        assert_eq!(budget.accept(StreamLine { text: "abc".into(), truncated: false }).as_deref(), Some("abc"));
+        assert!(!budget.truncated);
+        let mut unlimited = StreamOutputBudget { remaining: None, truncated: false };
+        unlimited.accept(StreamLine { text: "tail".into(), truncated: true });
+        assert!(unlimited.truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_budget_drains_both_pipes_without_blocking_child() {
+        let args = vec!["-c".into(), "i=0; while [ \"$i\" -lt 5000 ]; do printf 'abcdefghij\\n'; printf 'error-output\\n' >&2; i=$((i+1)); done".into()];
+        let (output, truncated) = run_cmd_streaming_limited(&ToolCtx::empty(), "/bin/sh", &args, None, 10, 100).await.unwrap();
+        assert!(output.status.success());
+        assert!(truncated);
+        assert!(output.stdout.len() + output.stderr.len() <= 100);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn zero_output_budget_still_waits_for_real_exit_code() {
+        let args = vec!["-c".into(), "printf 'output'; exit 7".into()];
+        let (output, truncated) = run_cmd_streaming_limited(&ToolCtx::empty(), "/bin/sh", &args, None, 10, 0).await.unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert!(truncated);
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_line_is_bounded_during_read_and_next_line_is_preserved() {
+        let mut input = vec![b'x'; 2 * 1024 * 1024];
+        input.extend_from_slice(b"TAIL\r\nnext\n");
+        let mut reader = tokio::io::BufReader::with_capacity(4096, input.as_slice());
+        let mut buf = Vec::new();
+        let line = read_line_smart(&mut reader, &mut buf).await.unwrap();
+        assert!(line.truncated);
+        assert!(line.text.starts_with("[单行输出过长"));
+        assert!(line.text.ends_with("TAIL"));
+        assert!(buf.capacity() <= MAX_EVENT_LINE_BYTES);
+        assert_eq!(read_line_smart(&mut reader, &mut buf).await.unwrap().text, "next");
+        assert!(read_line_smart(&mut reader, &mut buf).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn huge_reader_chunk_and_unterminated_line_are_bounded() {
+        let input = vec![b'x'; 3 * MAX_EVENT_LINE_BYTES];
+        let mut reader = input.as_slice();
+        let mut buf = Vec::new();
+        assert!(read_line_smart(&mut reader, &mut buf).await.unwrap().text.contains("已省略前 131072 字节"));
+        assert_eq!(buf.len(), MAX_EVENT_LINE_BYTES);
+        assert!(buf.capacity() <= MAX_EVENT_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn short_unicode_crlf_and_empty_lines_survive() {
+        let mut reader = "中文\r\n\n末行".as_bytes();
+        let mut buf = Vec::new();
+        for expected in ["中文", "", "末行"] {
+            assert_eq!(read_line_smart(&mut reader, &mut buf).await.unwrap().text, expected);
+        }
+        assert!(read_line_smart(&mut reader, &mut buf).await.is_none());
+    }
+}
+
+/// 收集缓冲增长到 2 倍上限才裁剪，保留尾部供错误解析。
 fn keep_tail_of_collected(collected: &mut String) {
     const MAX_KEEP: usize = 8 * 1024 * 1024;
     if collected.len() <= MAX_KEEP * 2 {

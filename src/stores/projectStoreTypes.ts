@@ -67,6 +67,8 @@ export interface ChatErrorDetail {
 /** Agent 工具执行状态（实时卡片） */
 export interface ToolRun {
   id: string
+  /** 后端持久调用 ID，不是 UI 列表 ID。 */
+  callId?: string
   tool: string
   args: string
   status: 'running' | 'done' | 'error'
@@ -137,6 +139,14 @@ export interface TaskLedgerState {
   finished: boolean
 }
 
+/** 宿主能力影响契约：改什么、能不能撤销、影响到哪里（后端 impact.rs 同源提供） */
+export interface ImpactContract {
+  reversibility: 'reversible' | 'hard_to_reverse' | 'irreversible'
+  scope: 'device' | 'app_data' | 'workspace' | 'host'
+  targets: string[]
+  note: string
+}
+
 /** 工具权限审核请求（自动审核模式下待用户确认） */
 export interface ToolApproval {
   requestId: string
@@ -144,6 +154,8 @@ export interface ToolApproval {
   args: string
   level?: string
   desc?: string
+  /** 影响说明：未覆盖的工具为空，弹窗按原样展示 */
+  impact?: ImpactContract | null
 }
 
 /** Agent 推送的诊断引导卡片（需用户在 IDE/系统中手动操作的问题） */
@@ -266,7 +278,7 @@ export interface ChatSlice {
   /** 回复 Agent 提问：answer 为空串表示跳过 */
   resolveAskUser: (requestId: string, answer: string) => Promise<void>
   /** 回复计划审查：approved=true 批准执行；false 驳回并可附带修改意见 */
-  resolvePlanReview: (requestId: string, approved: boolean, feedback?: string) => Promise<void>
+  resolvePlanReview: (requestId: string, approved: boolean, feedback?: string, revisedPlan?: string) => Promise<void>
   /** 回复审核结果：true=允许执行 / false=拒绝（可附理由反馈模型）；remember=本会话始终允许该工具 */
   resolveToolApproval: (requestId: string, approved: boolean, remember?: boolean, feedback?: string, scope?: 'session' | 'project') => Promise<void>
   /** 拉取项目内所有会话的待确认项（审批/计划/提问），刷新会话列表角标与恢复数据 */

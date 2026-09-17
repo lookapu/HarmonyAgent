@@ -15,6 +15,7 @@ import {
   type OhpmPkg,
   type OhpmCategoryStat,
 } from '../api/harmonyEnv'
+import { Skeleton } from '../components/ui/Spinner'
 
 /** 秒级时间戳 → 本地日期时间（如 2026-08-17 14:30） */
 function fmtTs(ts: number): string {
@@ -507,7 +508,7 @@ export default function OhpmPage() {
             </div>
             {listMsg && <p className="text-xs text-[var(--text-secondary)] mb-2 break-all">{listMsg}</p>}
             {loading && pkgs === null ? (
-              <p className="text-xs text-[var(--text-muted)] py-6 text-center">{t('ohpm.loading')}</p>
+              <Skeleton lines={8} label={t('ohpm.loading')} className="py-3" />
             ) : pkgs && pkgs.length === 0 ? (
               <p className="text-xs text-[var(--text-muted)] py-6 text-center">
                 {query.trim() ? t('ohpm.noHits') : t('ohpm.emptyCat')}

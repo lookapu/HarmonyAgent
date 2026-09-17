@@ -202,7 +202,7 @@ export function MemoriesPanel({
         <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.memoriesTip')}</p>
         <button
           onClick={startAdd}
-          className="shrink-0 h-7 px-2.5 rounded-lg bg-[var(--accent)]/10 text-[var(--accent)] text-[11px] font-medium flex items-center gap-1 hover:bg-[var(--accent)]/20 active:scale-95 transition-all"
+          className="shrink-0 h-7 px-2.5 rounded-lg bg-[var(--accent)]/10 text-[var(--accent)] text-[11px] font-medium flex items-center gap-1 hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,border-color,transform]"
         >
           <Icon name="plus" size={12} />
           {t('home.memoryAdd')}
@@ -256,7 +256,7 @@ export function MemoriesPanel({
             <button
               onClick={submit}
               disabled={busy || !title.trim() || !content.trim()}
-              className="h-7 px-3 rounded-lg btn-primary text-[11px] font-medium active:scale-95 disabled:opacity-40 transition-all"
+              className="h-7 px-3 rounded-lg btn-primary text-[11px] font-medium active:scale-95 disabled:opacity-40 transition-[color,background-color,border-color,opacity,transform]"
             >
               {t('common.save')}
             </button>
@@ -297,24 +297,26 @@ export function MemoriesPanel({
                 title={m.enabled ? t('home.memoryDisable') : t('home.memoryEnable')}
               >
                 <span
-                  className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${m.enabled ? 'left-3.5' : 'left-0.5'}`}
+                  className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-[left] ${m.enabled ? 'left-3.5' : 'left-0.5'}`}
                 />
               </button>
               <button
                 onClick={() => startEdit(m)}
                 className="shrink-0 p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                 title={t('home.memoryEdit')}
+                aria-label={t('home.memoryEdit')}
               >
                 <Icon name="edit" size={12} />
               </button>
               <button
                 onClick={() => handleDelete(m.id)}
-                className={`shrink-0 p-1 rounded-md transition-all ${
+                className={`shrink-0 p-1 rounded-md transition-[color,background-color,border-color,box-shadow] ${
                   confirmDeleteId === m.id
                     ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]'
                     : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
                 }`}
                 title={confirmDeleteId === m.id ? t('home.memoryDeleteConfirm') : t('home.memoryDelete')}
+                aria-label={confirmDeleteId === m.id ? t('home.memoryDeleteConfirm') : t('home.memoryDelete')}
               >
                 <Icon name="delete" size={12} white={confirmDeleteId === m.id} />
               </button>
@@ -403,6 +405,7 @@ export function ToolStatsPanel({
           onClick={onRefresh}
           className="shrink-0 p-1.5 rounded-lg text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
           title={t('home.refresh')}
+          aria-label={t('home.refresh')}
         >
           <Icon name="refresh" size={13} />
         </button>
@@ -493,7 +496,7 @@ export function ToolStatsPanel({
                           </div>
                           <div className="mt-2 h-1.5 rounded-full bg-[var(--bg-hover)] overflow-hidden">
                             <div
-                              className={`h-full rounded-full transition-all ${rate >= 80 ? 'bg-[var(--success)]' : rate >= 50 ? 'bg-[var(--warning)]' : 'bg-[var(--danger)]'}`}
+                              className={`h-full rounded-full transition-[width,background-color] ${rate >= 80 ? 'bg-[var(--success)]' : rate >= 50 ? 'bg-[var(--warning)]' : 'bg-[var(--danger)]'}`}
                               style={{ width: `${rate}%` }}
                             />
                           </div>
@@ -548,7 +551,7 @@ export function PreviewPanel({
           onClick={onOpen}
           disabled={!url.trim()}
           title={t('home.open')}
-          className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium active:scale-[0.98] transition-all disabled:opacity-40 shrink-0"
+          className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium transition-[color,background-color,border-color,opacity] disabled:opacity-40 shrink-0"
         >
           {t('home.open')}
         </button>
@@ -556,6 +559,7 @@ export function PreviewPanel({
           <button
             onClick={() => setReloadKey((k) => k + 1)}
             title={t('home.previewReload')}
+            aria-label={t('home.previewReload')}
             className="w-8 h-8 flex items-center justify-center rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
           >
             <Icon name="refresh" size={13} />
@@ -638,14 +642,14 @@ export function TerminalPanel({
     tab,
   ])
   const statusColor: Record<TerminalEntry['status'], string> = {
-    running: 'text-[#58a6ff]',
-    done: 'text-[#3fb950]',
-    error: 'text-[#f85149]',
+    running: 'text-[var(--accent)]',
+    done: 'text-[var(--success)]',
+    error: 'text-[var(--danger)]',
   }
   const statusDot: Record<TerminalEntry['status'], string> = {
-    running: 'bg-[#58a6ff] animate-pulse',
-    done: 'bg-[#3fb950]',
-    error: 'bg-[#f85149]',
+    running: 'bg-[var(--accent)] animate-pulse',
+    done: 'bg-[var(--success)]',
+    error: 'bg-[var(--danger)]',
   }
   const runningNow = entries.filter((e) => e.status === 'running').length
   return (
@@ -689,6 +693,8 @@ export function TerminalPanel({
             {filter && (
               <button
                 onClick={() => setFilter('')}
+                aria-label={t('common.clear')}
+                title={t('common.clear')}
                 className="absolute right-1 top-1/2 -translate-y-1/2 p-0.5 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)]"
               >
                 <Icon name="close" size={9} />

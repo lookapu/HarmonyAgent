@@ -2,7 +2,7 @@
 //!
 //! 调用方式不变：quality_tools::xxx(...)，通过 pub use re-export 暴露。
 
-use crate::agent::tools::{resolve_in_roots, resolve_readable};
+use crate::agent::tools::{resolve_for_write, resolve_in_roots, resolve_readable};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -13,17 +13,46 @@ struct MockRoute {
     response: serde_json::Value,
 }
 
-/// 包装 output_blocking：返回 stdout 字符串（阻塞调用放入 blocking 线程池，避免钉死 tokio worker）
-/// 接受任意 AsRef<str> 切片，支持混合 &str / &String
-async fn hdc_shell<S: AsRef<str>>(args: &[S]) -> Result<String, String> {
-    let owned: Vec<String> = args.iter().map(|s| s.as_ref().to_string()).collect();
-    tokio::task::spawn_blocking(move || {
-        let out = crate::utils::process::output_blocking("hdc", &owned)
-            .map_err(|e| format!("hdc 执行失败: {e}"))?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    })
-    .await
-    .map_err(|e| format!("hdc 任务失败: {e}"))?
+async fn execute_debug_capability(
+    capability: &crate::agent::capability_broker::HostCapability,
+    label: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let output = crate::agent::capability_broker::execute_host_capability(capability, None, ctx)
+        .await
+        .map_err(|error| format!("{label}失败: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let combined = format!("{stdout}\n{stderr}");
+    if !output.status.success() || debugger_command_failed(&combined) {
+        let detail = combined.trim();
+        return Err(format!(
+            "{label}失败{}",
+            if detail.is_empty() { String::new() } else { format!("：{detail}") }
+        ));
+    }
+    Ok(stdout)
+}
+
+fn debugger_command_failed(output: &str) -> bool {
+    let normalized = output.to_ascii_lowercase();
+    ["[fail]", "error:", "not found", "no such", "unknown command", "permission denied"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn parse_pid(raw: &str, label: &str) -> Result<u32, String> {
+    let value = raw.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{label}必须是单个十进制 PID；多个进程请显式选择 pid"));
+    }
+    let pid = value
+        .parse::<u32>()
+        .map_err(|_| format!("{label}必须是大于 0 的十进制 PID"))?;
+    if pid == 0 {
+        return Err(format!("{label}必须大于 0"));
+    }
+    Ok(pid)
 }
 pub async fn api_test(args: &Value, roots: &[String]) -> Result<String, String> {
     let spec_raw = args["spec"].as_str().ok_or("api_test 需要参数 {\"spec\":\"<OpenAPI JSON 路径或内联>\"}")?;
@@ -298,19 +327,11 @@ pub async fn api_health(args: &Value) -> Result<String, String> {
 pub async fn attach_debugger(
     args: &Value,
     roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => {
-            // 默认设备：从 hdc 找 ★ 标记的
-            hdc_shell(&["list", "targets"])
-                .await
-                .map_err(|e| format!("hdc list targets 失败: {e}"))?
-                .lines()
-                .find(|l| l.contains('\t') || l.contains("[empty]"))
-                .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
-                .ok_or_else(|| "未找到默认设备，请先 list_devices".to_string())?
-        }
+        None => crate::agent::tools::default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -325,19 +346,46 @@ pub async fn attach_debugger(
         }
     };
     if bundle.is_empty() { return Err("无法确定应用包名".into()); }
-    let wait_secs = args["wait_secs"].as_u64().unwrap_or(30);
+    let wait_secs = args["wait_secs"].as_u64().unwrap_or(30).clamp(1, 120);
 
     // 1) 拿 pid
-    let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).await.map_err(|e| format!("hdc pidof 失败: {e}"))?;
-    let pid = pid_out.trim();
-    if pid.is_empty() {
+    let pid_query = crate::agent::capability_broker::HostCapability::DevicePidof {
+        device: device.clone(),
+        bundle: bundle.clone(),
+    };
+    let pid_out = execute_debug_capability(&pid_query, "查询应用 PID", ctx).await?;
+    if pid_out.trim().is_empty() {
         return Err("应用未运行或 pidof 返回空（先 deploy 启动应用）".to_string());
     }
+    let pid = parse_pid(&pid_out, "pidof 输出")?;
 
     // 2) attach 调试器（hdc shell debuggerd attach <pid>，系统服务）
     //    注：DevEco 工程的 attach 通常用 `aa debug -b <bundle>` 启动开发模式；
     //    这里是运行时 attach，更轻量。
-    let attach_out = hdc_shell(&["-t", &device, "shell", "debuggerd", &format!("-p {pid}")]).await.map_err(|e| format!("debuggerd attach 失败: {e}"));
+    let attach = crate::agent::capability_broker::HostCapability::AttachDeviceDebugger {
+        device: device.clone(),
+        pid,
+        wait_seconds: wait_secs,
+    };
+    let attach_output = crate::agent::capability_broker::execute_host_capability(&attach, None, ctx)
+        .await
+        .map_err(|error| {
+            format!(
+                "debuggerd attach 未取得确定终态，为避免叠加设备副作用，未自动执行 aa debug 回退：{error}"
+            )
+        })?;
+    let attach_stdout = String::from_utf8_lossy(&attach_output.stdout).into_owned();
+    let attach_stderr = String::from_utf8_lossy(&attach_output.stderr).into_owned();
+    let attach_detail = format!("{attach_stdout}\n{attach_stderr}");
+    let attach_out = if attach_output.status.success() && !debugger_command_failed(&attach_detail) {
+        Ok(attach_stdout)
+    } else {
+        Err(if attach_detail.trim().is_empty() {
+            "debuggerd attach 返回失败状态".to_string()
+        } else {
+            format!("debuggerd attach 失败：{}", attach_detail.trim())
+        })
+    };
 
     match attach_out {
         Ok(out) => Ok(format!(
@@ -346,7 +394,11 @@ pub async fn attach_debugger(
         )),
         Err(e) => {
             // 退路：尝试 aa debug 启动开发模式
-            let aa = hdc_shell(&["-t", &device, "shell", "aa", "debug", "-b", &bundle]).await;
+            let fallback = crate::agent::capability_broker::HostCapability::EnableAbilityDebug {
+                device: device.clone(),
+                bundle: bundle.clone(),
+            };
+            let aa = execute_debug_capability(&fallback, "启用 Ability 调试模式", ctx).await;
             match aa {
                 Ok(out2) => Ok(format!(
                     "调试器已通过 aa debug 启动：设备 {device} / 包 {bundle} / PID {pid}\n输出：{}\n",
@@ -363,50 +415,52 @@ pub async fn attach_debugger(
 pub async fn step_debug(
     args: &Value,
     roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => {
-            hdc_shell(&["list", "targets"])
-                .await
-                .map_err(|e| format!("hdc list targets 失败: {e}"))?
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
-                .ok_or_else(|| "未找到默认设备".to_string())?
-        }
+        None => crate::agent::tools::default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
-    let pid = match args["pid"].as_str() {
-        Some(p) => p.to_string(),
-        None => {
+    let pid = match args.get("pid") {
+        Some(Value::String(p)) => parse_pid(p, "pid")?,
+        Some(Value::Number(p)) => parse_pid(&p.to_string(), "pid")?,
+        Some(value) if !value.is_null() => return Err("pid 必须是十进制字符串或正整数".into()),
+        _ => {
             if project_path.is_empty() {
                 return Err("未指定 pid 且当前会话未绑定工程".into());
             }
             let bundle = crate::services::harmony::parse_project(std::path::Path::new(project_path))
                 .bundle_name
                 .ok_or_else(|| "无法确定应用包名".to_string())?;
-            let pid_out = hdc_shell(&["-t", &device, "shell", "pidof", &bundle]).await.map_err(|e| format!("hdc pidof 失败: {e}"))?;
-            let p = pid_out.trim().to_string();
-            if p.is_empty() {
+            let query = crate::agent::capability_broker::HostCapability::DevicePidof {
+                device: device.clone(),
+                bundle,
+            };
+            let pid_out = execute_debug_capability(&query, "查询应用 PID", ctx).await?;
+            if pid_out.trim().is_empty() {
                 return Err("应用未运行（先 deploy 启动或 attach_debugger）".into());
             }
-            p
+            parse_pid(&pid_out, "pidof 输出")?
         }
     };
     let action = args["action"].as_str().unwrap_or("step");
-    // debuggerd 命令映射
-    let cmd = match action {
-        "step" => "s",        // step into
-        "next" => "n",        // step over
-        "continue" | "cont" | "c" => "c",
-        "interrupt" | "int" => "i",
-        "where" | "bt" | "backtrace" => "bt",
-        "info" | "registers" => "r",
+    let debugger_action = match action {
+        "step" => crate::agent::capability_broker::DeviceDebuggerAction::Step,
+        "next" => crate::agent::capability_broker::DeviceDebuggerAction::Next,
+        "continue" | "cont" | "c" => crate::agent::capability_broker::DeviceDebuggerAction::Continue,
+        "interrupt" | "int" => crate::agent::capability_broker::DeviceDebuggerAction::Interrupt,
+        "where" | "bt" | "backtrace" => crate::agent::capability_broker::DeviceDebuggerAction::Backtrace,
+        "info" | "registers" => crate::agent::capability_broker::DeviceDebuggerAction::Registers,
         other => return Err(format!("不支持的 step_debug action: {other}（step/next/continue/interrupt/where/info）")),
     };
 
-    let out = hdc_shell(&["-t", &device, "shell", "debuggerd", &format!("-p {pid} -c {cmd}")]).await.map_err(|e| format!("debuggerd 命令失败: {e}"))?;
+    let control = crate::agent::capability_broker::HostCapability::ControlDeviceDebugger {
+        device: device.clone(),
+        pid,
+        action: debugger_action,
+    };
+    let out = execute_debug_capability(&control, "debuggerd 命令", ctx).await?;
 
     Ok(format!(
         "单步调试（设备 {device} / PID {pid} / action={action}）：\n{}",
@@ -414,57 +468,125 @@ pub async fn step_debug(
     ))
 }
 
+/// 独占、确定性 staging 路径使重试保留同一个 Broker 请求摘要。
+/// 只清理本次拥有的已知文件和空目录，不递归删除未知内容。
+struct OtaStaging {
+    directory: std::path::PathBuf,
+}
+
+impl OtaStaging {
+    fn create(destination: &std::path::Path) -> Result<Self, String> {
+        if std::fs::symlink_metadata(destination).is_ok() {
+            return Err("OTA 输出已存在，请选择新的 .pkg 路径；不会覆盖旧产物".into());
+        }
+        let directory = crate::agent::ota_scope::staging_directory(destination)?;
+        std::fs::create_dir(&directory)
+            .map_err(|error| format!("无法独占 OTA 暂存目录（可能存在未完成打包，请先检查，勿自动删除）：{error}"))?;
+        Ok(Self { directory })
+    }
+
+    fn artifact(&self) -> std::path::PathBuf {
+        self.directory.join("artifact.pkg")
+    }
+
+    fn publish(&self, destination: &std::path::Path) -> Result<u64, String> {
+        let parent = destination.parent().ok_or("OTA 输出缺少父目录")?;
+        if parent.canonicalize().map_err(|error| error.to_string())? != parent
+            || self.directory.canonicalize().map_err(|error| error.to_string())? != self.directory
+        {
+            return Err("OTA 发布前目录边界发生变化，拒绝发布".into());
+        }
+        let artifact = self.artifact();
+        let metadata = std::fs::symlink_metadata(&artifact)
+            .map_err(|error| format!("packagingtool 返回成功，但本次暂存产物不存在：{error}"))?;
+        if !metadata.file_type().is_file() || metadata.len() == 0 {
+            return Err("packagingtool 返回成功，但本次暂存产物不是非空普通文件".into());
+        }
+        // 同一父目录/文件系统内发布；目标存在时原子失败，不能 rename 覆盖旧包。
+        std::fs::hard_link(&artifact, destination)
+            .map_err(|error| format!("OTA 产物发布失败（不会覆盖已有目标）：{error}"))?;
+        Ok(metadata.len())
+    }
+}
+
+impl Drop for OtaStaging {
+    fn drop(&mut self) {
+        if self.directory.canonicalize().ok().as_ref() != Some(&self.directory) {
+            return;
+        }
+        let _ = std::fs::remove_file(self.artifact());
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
 pub async fn ota_pack(
     args: &Value,
     roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
+    let approval_ctx = ctx.clone();
+    let approval_args = args.clone();
+    let approval_roots = roots.to_vec();
+    tokio::task::spawn_blocking(move || crate::agent::broker_approval::verify_ota_arguments(
+        &approval_ctx, &approval_args, &approval_roots,
+    )).await.map_err(|error| format!("OTA 审批复验任务失败：{error}"))??;
     let hap_path = args["hap_path"]
         .as_str()
         .ok_or("ota_pack 需要参数 {\"hap_path\":\"<HAP 路径>\"}")?;
     let out_path = args["out_path"]
         .as_str()
         .ok_or("ota_pack 需要参数 {\"out_path\":\"<输出 .pkg 路径>\"}")?;
-    let profile_path = args["profile_path"].as_str();
+    let profile_path = args["profile_path"].as_str().map(str::trim).filter(|path| !path.is_empty());
 
-    // 1) 验证 HAP 存在
+    // 1) 把所有输入、输出绑定到同一个已授权工作区。
     let hap_full = resolve_in_roots(roots, hap_path)?;
-    if !hap_full.exists() {
-        return Err(format!("HAP 不存在: {}", hap_full.display()));
+    let out_full = resolve_for_write(roots, out_path)?;
+    let profile_full = profile_path.map(|path| resolve_in_roots(roots, path)).transpose()?;
+    let workspace = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .find(|root| {
+            hap_full.starts_with(root)
+                && out_full.starts_with(root)
+                && profile_full.as_ref().is_none_or(|profile| profile.starts_with(root))
+        })
+        .ok_or("HAP、输出和 profile 必须位于同一个已授权项目根内")?;
+    let relative = |path: &std::path::Path| -> Result<String, String> {
+        path.strip_prefix(&workspace)
+            .map(|value| value.to_string_lossy().into_owned())
+            .map_err(|_| "OTA 路径越出项目工作区".into())
+    };
+    let capability = crate::agent::capability_broker::HostCapability::PackageOta {
+        hap_path: relative(&hap_full)?,
+        output_path: relative(&out_full)?,
+        profile_path: profile_full.as_deref().map(relative).transpose()?,
+    };
+    capability.validate()?;
+    let output_parent = out_full.parent().ok_or("OTA 输出路径缺少父目录")?;
+    std::fs::create_dir_all(output_parent).map_err(|error| format!("创建 OTA 输出目录失败：{error}"))?;
+    let canonical_parent = output_parent
+        .canonicalize()
+        .map_err(|error| format!("无法解析 OTA 输出目录：{error}"))?;
+    if !canonical_parent.starts_with(&workspace) {
+        return Err("OTA 输出目录通过符号链接逃逸项目工作区".into());
     }
+    let destination = canonical_parent.join(out_full.file_name().ok_or("OTA 输出缺少文件名")?);
+    let staging = OtaStaging::create(&destination)?;
+    let capability = crate::agent::capability_broker::HostCapability::PackageOta {
+        hap_path: relative(&hap_full)?,
+        output_path: relative(&staging.artifact())?,
+        profile_path: profile_full.as_deref().map(relative).transpose()?,
+    };
 
-    // 2) 找 packaging_tool（DevEco Studio 自带）
-    let packager = find_packaging_tool().ok_or_else(|| {
-        "未找到 packaging_tool.jar。请：\n  \
-         1. 安装 DevEco Studio\n  \
-         2. 或下载 HarmonyOS Sdk Command-Line Tools\n  \
-         3. 把 packagingtool.jar 路径加到环境变量 HOS_SDK_HOME 或 PATH"
-            .to_string()
-    })?;
-
-    // 3) 构造命令（hmos app packager 打 OTA 包）
-    //    实际命令：java -jar <packager> --mode ota --hap <hap> --out <pkg> --profile <profile>
-    //    java 打包可能耗时数秒~数十秒，放入 blocking 线程池避免钉死 tokio worker
+    // 2) Broker 内部发现受信任 packagingtool，固定 java argv 并持久化不可重放 claim。
     let start = std::time::Instant::now();
-    let packager_owned = packager.clone();
-    let hap_full_owned = hap_full.clone();
-    let out_path_owned = out_path.to_string();
-    let profile_owned = profile_path.map(|s| s.to_string());
-    let output = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("java");
-        cmd.arg("-jar").arg(&packager_owned);
-        cmd.arg("--mode").arg("ota");
-        cmd.arg("--hap").arg(&hap_full_owned);
-        cmd.arg("--out").arg(&out_path_owned);
-        if let Some(pp) = &profile_owned {
-            cmd.arg("--profile").arg(pp);
-        }
-        cmd.arg("--force"); // 覆盖已存在
-        cmd.output().map_err(|e| format!(
-            "启动 packaging_tool 失败: {e}（确认 java 在 PATH 且 packaging_tool.jar 可访问）"
-        ))
-    })
+    let output = crate::agent::capability_broker::execute_host_capability(
+        &capability,
+        Some(&workspace),
+        ctx,
+    )
     .await
-    .map_err(|e| format!("打包任务失败: {e}"))??;
+    .map_err(|error| format!("OTA 打包未取得确定终态：{error}"))?;
     let elapsed = start.elapsed();
 
     if !output.status.success() {
@@ -476,14 +598,13 @@ pub async fn ota_pack(
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let out_p = std::path::Path::new(out_path);
-    let size = std::fs::metadata(out_p).map(|m| m.len()).unwrap_or(0);
+    crate::agent::broker_approval::verify_ota_publication(ctx)?;
+    let size = staging.publish(&destination)?;
     Ok(format!(
-        "✅ OTA 包已生成：{}\n大小：{:.1} KB\n耗时：{:.1}s\npackaging_tool：{}\nstdout 摘要：\n{}",
-        out_p.display(),
+        "✅ OTA 包已生成：{}\n大小：{:.1} KB\n耗时：{:.1}s\nstdout 摘要：\n{}",
+        destination.display(),
         size as f64 / 1024.0,
         elapsed.as_secs_f64(),
-        packager,
         if stdout.trim().is_empty() { "(无输出)".to_string() } else { stdout.chars().take(1500).collect::<String>() }
     ))
 }
@@ -592,6 +713,7 @@ fn pick_response_sample(op: &serde_json::Value, depth: usize) -> (u16, serde_jso
 }
 
 
+
 fn path_template_to_regex(path: &str) -> String {
     let mut re = String::from("^");
     for seg in path.split('/') {
@@ -613,37 +735,78 @@ fn path_template_to_regex(path: &str) -> String {
     re
 }
 
+#[cfg(test)]
+mod runtime_boundary_tests {
+    use super::*;
 
-fn find_packaging_tool() -> Option<String> {
-    // 1) 环境变量
-    if let Ok(p) = std::env::var("HOS_PACKAGING_TOOL") {
-        if std::path::Path::new(&p).exists() { return Some(p); }
-    }
-    // 2) DevEco 常见路径
-    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-        let home = std::path::PathBuf::from(home);
-        let candidates = [
-            home.join("AppData").join("Local").join("Huawei").join("Sdk").join("toolchains").join("packagingtool.jar"),
-            home.join("Library").join("Huawei").join("Sdk").join("toolchains").join("packagingtool.jar"),
-        ];
-        for c in candidates {
-            if c.exists() { return Some(c.to_string_lossy().into_owned()); }
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("harmony-ota-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path.canonicalize().unwrap())
         }
     }
-    // 3) Windows 全局
-    for c in [
-        "C:/Program Files/Huawei/DevEco Studio/tools/packagingtool.jar",
-        "D:/Huawei/DevEco Studio/tools/packagingtool.jar",
-        "D:/DevEco Studio/tools/packagingtool.jar",
-    ] {
-        if std::path::Path::new(c).exists() { return Some(c.to_string()); }
-    }
-    // 4) resources/packagingtool/ 备选
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("resources").join("packagingtool.jar");
-            if p.exists() { return Some(p.to_string_lossy().into_owned()); }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    None
+
+    #[test]
+    fn ota_requires_fresh_nonempty_artifact_and_cleans_owned_staging() {
+        let root = TestDirectory::new();
+        let destination = root.0.join("release.pkg");
+        let staging = OtaStaging::create(&destination).unwrap();
+        let directory = staging.directory.clone();
+        assert!(OtaStaging::create(&destination).is_err());
+        assert!(staging.publish(&destination).is_err());
+        std::fs::write(staging.artifact(), b"").unwrap();
+        assert!(staging.publish(&destination).is_err());
+        std::fs::write(staging.artifact(), b"new artifact").unwrap();
+        assert_eq!(staging.publish(&destination).unwrap(), 12);
+        drop(staging);
+        assert!(!directory.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new artifact");
+        assert!(OtaStaging::create(&destination).is_err());
+    }
+
+    #[test]
+    fn ota_publish_does_not_clobber_concurrent_output() {
+        let root = TestDirectory::new();
+        let destination = root.0.join("release.pkg");
+        let staging = OtaStaging::create(&destination).unwrap();
+        std::fs::write(staging.artifact(), b"new").unwrap();
+        std::fs::write(&destination, b"existing").unwrap();
+        assert!(staging.publish(&destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ota_rejects_symlink_artifact_and_dangling_destination() {
+        use std::os::unix::fs::symlink;
+        let root = TestDirectory::new();
+        let destination = root.0.join("release.pkg");
+        let staging = OtaStaging::create(&destination).unwrap();
+        let old = root.0.join("old.pkg");
+        std::fs::write(&old, b"old").unwrap();
+        symlink(&old, staging.artifact()).unwrap();
+        assert!(staging.publish(&destination).is_err());
+        drop(staging);
+        assert_eq!(std::fs::read(&old).unwrap(), b"old");
+        symlink(root.0.join("missing.pkg"), &destination).unwrap();
+        assert!(OtaStaging::create(&destination).is_err());
+    }
+
+    #[test]
+    fn pid_requires_one_unambiguous_positive_decimal() {
+        assert_eq!(parse_pid(" 42\n", "pid").unwrap(), 42);
+        assert_eq!(parse_pid("4294967295", "pid").unwrap(), u32::MAX);
+        for raw in ["", "0", "-1", "+1", "42 43", "42\n43", "42 junk", "4294967296", "１", "1.0"] {
+            assert!(parse_pid(raw, "pid").is_err(), "accepted {raw:?}");
+        }
+    }
 }

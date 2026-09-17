@@ -1224,7 +1224,7 @@ fn dispatch_api(
         ("POST", ["api", "conversations", id, "stop"]) => {
             let cancel = app.state::<ChatCancel>();
             let registry = app.state::<crate::utils::task_registry::TaskRegistry>();
-            cmd_response(chat::stop_chat(id.to_string(), cancel, registry))
+            cmd_response(chat::stop_chat(id.to_string(), cancel, registry, app.state::<DbState>()))
         }
         ("POST", ["api", "approvals", request_id]) => {
             dispatch_approval(app, request_id, body)
@@ -1333,12 +1333,14 @@ fn dispatch_approval(
                 .unwrap_or("")
                 .to_string();
             let feedback = body.get("feedback").and_then(|v| v.as_str()).map(String::from);
+            let revised_plan = body.get("revised_plan").and_then(|v| v.as_str()).map(String::from);
             let state = app.state::<PlanApprovalState>();
             cmd_response(chat::resolve_plan_review(
                 conversation_id,
                 request_id.to_string(),
                 approved,
                 feedback,
+                revised_plan,
                 state,
             ))
         }

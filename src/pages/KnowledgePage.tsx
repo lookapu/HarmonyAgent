@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import Icon from '../icons/Icon'
 import { useProjectStore } from '../stores/projectStore'
+import { Skeleton } from '../components/ui/Spinner'
 import {
   listKnowledge,
   addKnowledge,
@@ -27,6 +28,7 @@ export default function KnowledgePage() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [form, setForm] = useState(emptyForm)
   const [saving, setSaving] = useState(false)
+  const [loaded, setLoaded] = useState(false)
 
   const scopeProjectId = effectiveScope === 'project' ? projectId : null
 
@@ -36,6 +38,8 @@ export default function KnowledgePage() {
       setEntries(await listKnowledge(scopeProjectId))
     } catch (e) {
       console.error(e)
+    } finally {
+      setLoaded(true)
     }
   }, [scopeProjectId])
   useEffect(() => { load() }, [load])
@@ -103,7 +107,7 @@ export default function KnowledgePage() {
         </div>
         <button
           onClick={() => { resetForm(); setShowForm(!showForm) }}
-          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium  active:scale-[0.98] transition-all"
+          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-[color,background-color,border-color,opacity]"
         >
           <span className="flex items-center gap-1.5">
             <Icon name={showForm ? 'close' : 'plus'} size={14} white />
@@ -116,7 +120,7 @@ export default function KnowledgePage() {
         <div className="inline-flex p-0.5 rounded-lg bg-[var(--bg-secondary)]">
           <button
             onClick={() => setScope('global')}
-            className={`h-7 px-3 rounded-md text-[12px] transition-all ${
+            className={`h-7 px-3 rounded-md text-[12px] transition-[color,background-color,border-color,box-shadow] ${
               effectiveScope === 'global'
                 ? 'bg-[var(--bg-card)] text-[var(--text-primary)] shadow-sm'
                 : 'tab-inactive'
@@ -126,7 +130,7 @@ export default function KnowledgePage() {
           </button>
           <button
             onClick={() => setScope('project')}
-            className={`h-7 px-3 rounded-md text-[12px] transition-all ${
+            className={`h-7 px-3 rounded-md text-[12px] transition-[color,background-color,border-color,box-shadow] ${
               effectiveScope === 'project'
                 ? 'bg-[var(--bg-card)] text-[var(--text-primary)] shadow-sm'
                 : 'tab-inactive'
@@ -195,7 +199,9 @@ export default function KnowledgePage() {
       )}
 
       <div className="space-y-2">
-        {entries.length === 0 && (
+        {!loaded ? (
+          <Skeleton lines={4} label={t('common.loading')} />
+        ) : entries.length === 0 && (
           <div className="modern-card rounded-lg p-8 text-center text-sm text-[var(--text-secondary)]">
             {t('knowledge.empty')}
           </div>

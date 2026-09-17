@@ -237,7 +237,7 @@ pub async fn log_aggregate(
                 if sub.get("max_lines").is_none() {
                     sub["max_lines"] = json!(max_lines);
                 }
-                match crate::agent::tools::debug_tools::search_hilog(&sub, roots).await {
+                match crate::agent::tools::debug_tools::search_hilog(&sub, roots, ctx).await {
                     Ok(t) => {
                         seen_any = true;
                         out.push_str(&t);
@@ -356,7 +356,7 @@ pub async fn log_query(
                 });
                 if let Some(k) = keyword { sub["keyword"] = json!(k); }
                 if let Some(r) = regex_pat { sub["regex"] = json!(r); }
-                match crate::agent::tools::debug_tools::search_hilog(&sub, roots).await {
+                match crate::agent::tools::debug_tools::search_hilog(&sub, roots, ctx).await {
                     Ok(t) => {
                         let lines = filter_by_level(&t, level_min, re.as_ref());
                         total += lines.len();
@@ -436,6 +436,7 @@ pub async fn log_query(
 pub async fn memory_snapshot(
     args: &Value,
     roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
     let action = args["action"].as_str().unwrap_or("take");
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
@@ -451,8 +452,7 @@ pub async fn memory_snapshot(
     match action {
         "take" => {
             // 透传给 dump_memory 抓一次（透传 bundle/device）
-            let pass = serde_json::json!({});
-            let raw = crate::agent::tools::ui_tools::dump_memory(&pass, roots).await?;
+            let raw = crate::agent::tools::ui_tools::dump_memory(args, roots, ctx).await?;
             // tag 缺省 = 时间戳
             let tag = args["tag"]
                 .as_str()
@@ -830,9 +830,19 @@ fn render_trace_chain(out: &mut String, events: &[&crate::agent::session_events:
                 let note = ev.payload.to_string();
                 out.push_str(&format!("{}. [{when}] 📋 系统: {}\n", i + 1, truncate_chars(&note, 80)));
             }
+            T::ToolApproval => {
+                let tool = ev.payload.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+                let approved = ev.payload.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+                let mark = if approved { "✅ 已批准" } else { "⛔ 已拒绝" };
+                out.push_str(&format!("{}. [{when}] 🛡️ 审批 {tool}：{mark}\n", i + 1));
+            }
             T::ContextCompress => {
                 let trigger = ev.payload.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
                 out.push_str(&format!("{}. [{when}] 🗜️ 上下文压缩（{}）\n", i + 1, trigger));
+            }
+            T::ExecutorCheckpoint => {
+                let version = ev.payload.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                out.push_str(&format!("{}. [{when}] 💾 Executor 安全点（v{}）\n", i + 1, version));
             }
         }
     }
@@ -999,4 +1009,3 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
         }
     }
 }
-

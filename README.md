@@ -2,7 +2,7 @@
 
 > **Agent Workspace for HarmonyOS Developers** — 一站式桌面 AI 编程工作台
 
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)]()
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)]()
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 
@@ -12,7 +12,7 @@
 
 ## 它是什么
 
-不是简单的 Provider 切换器。**201 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
+不是简单的 Provider 切换器。**204 个 Agent 工具**覆盖鸿蒙开发的全链路——从新建工程到崩溃归因，从代码扫描到真机部署：
 
 | 维度 | 能力 |
 |------|------|
@@ -81,6 +81,8 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 - **工具限额**：tool_limits 按 8 个任务组（build / fix / explore / deploy / refactor / test / debug / other）限制调用次数，热门工具不再被全局压制
 - **权限管理**：permissions 模块按工具类型分级
 
+> 当前限制：`run_command` 虽有工作区路径校验、危险模式拒绝和审批，但命令进程仍以宿主用户权限运行；兼容工具名 `sandbox_exec` 只是“临时副本试运行”，不是 OS 级文件系统或网络沙箱。不要用它运行不可信仓库脚本。详见 [安全边界与威胁模型](docs/SECURITY_BOUNDARY.md)。
+
 ### 6. 证据驱动的可靠执行
 
 - **目标契约**：从用户目标提取修改、验证、构建、测试、部署、提交和推送等必需条件；模型只能申请完成，运行内核依据真实工具证据裁决
@@ -134,9 +136,9 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 298 个 Tauri IPC 入口 · 56 个 service 模块        │
-│  - agent/ 36 个顶层模块 · tools/ 29 文件 · 201 工具  │
-│  - SQLite + 77 个迁移 · Run/步骤/工具全链路事件溯源  │
+│  - 301 个 Tauri IPC 入口 · 58 个 service 模块        │
+│  - agent/ 58 个顶层模块 · tools/ 35 文件 · 204 工具  │
+│  - SQLite + 84 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -145,7 +147,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 
 ```
 src-tauri/src/
-├── agent/                  # AI Agent 内核（36 个顶层模块）
+├── agent/                  # AI Agent 内核（37 个顶层模块）
 │   ├── runtime.rs           #   - Durable Run 状态机与事件游标
 │   ├── scheduler.rs         #   - 持久队列、Worker 租约与 fencing
 │   ├── coordinator.rs       #   - 执行步骤与恢复检查点
@@ -155,6 +157,7 @@ src-tauri/src/
 │   ├── governance.rs        #   - 动态预算、可靠性策略与质量快照
 │   ├── dag.rs               #   - 主/子 Agent DAG 与依赖调度
 │   ├── tool_runtime.rs      #   - 工具 Worker、专用线程、租约与幂等
+│   ├── sandbox.rs           #   - 沙箱策略、能力声明与 OCI 启动契约
 │   ├── structured_result.rs #   - 工具结果 V2、产物/验证/补偿证据
 │   ├── enterprise.rs        #   - SLO、告警、审计与配额
 │   ├── evals.rs             #   - 可靠性场景评测与故障注入
@@ -174,7 +177,7 @@ src-tauri/src/
 │   ├── session_ctx.rs       #   - 会话级运行态（统一收敛）
 │   ├── invariants.rs         #   - 写操作不变式（.env/证书/迁移 SQL）
 │   ├── session_events.rs    #   - 会话事件溯源
-│   └── tools/               #   - 201 个 Agent 工具（29 文件）
+│   └── tools/               #   - 204 个 Agent 工具（35 文件）
 │       ├── mod.rs               # 工具注册表（TOOL_SPECS）+ 协议分发
 │       ├── protocol.rs          # 工具调用标记解析
 │       ├── errors.rs            # 结构化错误信封（ToolError 7 类）
@@ -203,8 +206,8 @@ src-tauri/src/
 │       ├── quality_runtime.rs   #   运行时质量（6 工具）
 │       ├── quality_media.rs     #   媒体质量（2 工具）
 │       └── schedule_tools.rs    # 定时提醒（schedule_create/list/delete）
-├── commands/               # 38 个命令模块（合计 298 个 IPC 注册入口）
-├── services/               # 业务服务（56 个）
+├── commands/               # 38 个命令模块（合计 299 个 IPC 注册入口）
+├── services/               # 业务服务（58 个）
 │   ├── proxy_service.rs    #   - 本地代理
 │   ├── circuit_breaker.rs  #   - 熔断器
 │   ├── model_router.rs     #   - 模型路由
@@ -225,7 +228,7 @@ src-tauri/src/
 
 > **关于大文件**：`src-tauri/runtime/`（便携运行时）、`src-tauri/resources/`（种子知识库 + embedding 模型，约 340MB）与 `portable-build/`（绿色版产物）共约 1GB，属构建产物/下载资源，**不随 Git 仓库分发**（见 `.gitignore`）。本机构建请保留这些目录；克隆用户可从 Release 安装包获取完整运行时，或参照 [release.yml](.github/workflows/release.yml) 的下载逻辑自行准备。
 
-## 201 个 Agent 工具按域分组
+## 204 个 Agent 工具按域分组
 
 | 域（TOOL_GROUP） | 代表工具 |
 |------|------|
@@ -246,6 +249,10 @@ src-tauri/src/
 
 - **Windows**: `.exe`（NSIS 安装包）或 `.msi`
 - **macOS**: `.dmg` 或 `.app.tar.gz`
+
+> **Linux**：暂不提供官方安装包（发布流水线当前只产出 Windows/macOS 产物）；如需在 Linux 使用请自行从源码构建，或关注后续 `.deb`/AppImage 支持。
+
+最终用户运行上述安装包不需要本地 Python 环境。Python 仅用于部分开发、文档和发布辅助脚本。
 
 ### macOS 首次打开
 
@@ -268,6 +275,10 @@ npx tauri dev
 
 # 生产构建（需本机已准备 src-tauri/runtime 与 src-tauri/resources，见下方说明）
 npx tauri build
+
+# 预览/清理可重新生成的 Rust 与前端缓存（保留 node_modules）
+npm run clean:generated:dry-run
+npm run clean:generated
 ```
 
 > **内置运行时说明**：便携版 Node / JDK / Git（约 700MB）与知识库种子、embedding 模型（约 340MB）不随仓库分发。
@@ -282,6 +293,9 @@ npx tauri build
 ## 文档
 
 - [持续演进任务路线图](docs/ROADMAP.md) — 长会话、Agent 工具链、HarmonyOS 闭环与生态集成的阶段任务和验收标准
+- [项目生成物清理](docs/GENERATED_FILES_CLEANUP.md) — 安全清理 `target`、`dist`、覆盖率和 Vite 缓存
+- [Agent 能力演进路线（2026）](docs/AGENT_EVOLUTION_ROADMAP_2026.md) — 安全沙箱、大仓理解、真实评测与 12 周执行顺序
+- [安全边界与威胁模型](docs/SECURITY_BOUNDARY.md) — 当前保证、明确限制和真实沙箱最低契约
 - [官方 DevEco CLI 的 MCP 接入](docs/DEVECO_CLI_MCP_INTEGRATION.md) — 内置 MCP 模板、命令解析增强与自研工具分工策略
 - [长会话上下文 V2](docs/CONTEXT_V2.md) — 数据映射、事实优先级、预算和兼容策略
 - [架构文档 v2](docs/ARCHITECTURE.md) — 产品定位、模块边界、设计取舍

@@ -1,13 +1,15 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { ChatErrorDetail } from '../../stores/projectStore'
+import type { ChatErrorDetail, TaskSummary } from '../../stores/projectStore'
 import Icon from '../../icons/Icon'
 import Markdown from '../../components/Markdown'
 import { gitDiffStat, gitFileDiff, gitAcceptChanges, gitRevertFile } from '../../api/git'
 import { sanitizeToolMarkers } from '../chatUtils'
+import { fmtElapsed } from '../chatUtils'
 import { createPortal } from 'react-dom'
 import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
+import { Button } from '../../components/ui/Button'
 
 /** 流式补全未闭合的代码围栏：``` 未配对时补一个闭合，否则 react-markdown 把整块当纯文本，
  *  代码块刚开头时裸露 ``` 符号闪烁；只影响展示层，不改真实内容 */
@@ -39,9 +41,9 @@ export function DiffText({ text }: { text: string }) {
     <>
       {text.split('\n').map((line, i) => {
         let cls = ''
-        if (line.startsWith('+') && !line.startsWith('+++')) cls = 'text-[#3fb950]'
-        else if (line.startsWith('-') && !line.startsWith('---')) cls = 'text-[#f85149]'
-        else if (line.startsWith('@@')) cls = 'text-[#58a6ff]'
+        if (line.startsWith('+') && !line.startsWith('+++')) cls = 'text-[var(--success)]'
+        else if (line.startsWith('-') && !line.startsWith('---')) cls = 'text-[var(--danger)]'
+        else if (line.startsWith('@@')) cls = 'text-[var(--accent)]'
         return (
           <div key={i} className={cls}>
             {line || '\u00A0'}
@@ -53,12 +55,36 @@ export function DiffText({ text }: { text: string }) {
 }
 
 /* ============ 思考过程（推理模型 reasoning 折叠展示） ============ */
-export const ThinkingBlock = memo(function ThinkingBlock({ content }: { content: string }) {
+export const ThinkingBlock = memo(function ThinkingBlock({ content, active }: { content: string; active?: boolean }) {
   const { t } = useTranslation()
   // 展开偏好记忆：用户手动开合后跨会话记住（localStorage）
-  const [open, setOpen] = useState(() => getItem(STORAGE_KEYS.THINKING_OPEN) === '1')
+  const [prefOpen, setPrefOpen] = useState(() => getItem(STORAGE_KEYS.THINKING_OPEN) === '1')
+  // 流式期间默认展开，但允许用户在本轮手动收起；流结束后恢复持久偏好。
+  const [streamOverride, setStreamOverride] = useState<boolean | null>(null)
+  const open = active ? (streamOverride ?? true) : prefOpen
+  const thinkStartRef = useRef(0)
+  const [thinkElapsed, setThinkElapsed] = useState(0)
+  useEffect(() => {
+    if (!active || !content.trim()) {
+      thinkStartRef.current = 0
+      setThinkElapsed(0)
+      return
+    }
+    if (!thinkStartRef.current) thinkStartRef.current = Date.now()
+    const update = () => setThinkElapsed(Math.floor((Date.now() - thinkStartRef.current) / 1000))
+    update()
+    const timer = setInterval(update, 1000)
+    return () => clearInterval(timer)
+  }, [active, content])
+  useEffect(() => {
+    if (!active) setStreamOverride(null)
+  }, [active])
   const toggle = () => {
-    setOpen((v) => {
+    if (active) {
+      setStreamOverride(!open)
+      return
+    }
+    setPrefOpen((v) => {
       const next = !v
       setItem(STORAGE_KEYS.THINKING_OPEN, next ? '1' : '0')
       return next
@@ -78,6 +104,9 @@ export const ThinkingBlock = memo(function ThinkingBlock({ content }: { content:
           <Icon name="spark" size={11} />
         </span>
         <span className="text-[11px] font-medium">{t('home.thinking')}</span>
+        {active && thinkElapsed > 0 && (
+          <span className="text-[10px] text-[var(--text-muted)] tabular-nums ml-1">{fmtElapsed(thinkElapsed)}</span>
+        )}
         {!open && preview && <span className="thinking-block-preview">{preview}…</span>}
         <Icon name="chevron-right" size={12} className={`thinking-block-caret ${open ? 'rotate-90' : ''}`} />
       </button>
@@ -113,8 +142,9 @@ export function ThumbDownIcon({ filled }: { filled?: boolean }) {
 /** 变更审查卡片：修改文件列表 + 逐文件 diff/接受/还原（Qoder 式变更审核） */
 export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projectPath }: { files: string[]; projectPath?: string }) {
   const { t } = useTranslation()
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(files.length <= 3)
   const [copied, setCopied] = useState<string | null>(null)
+  const [filter, setFilter] = useState('')
   // 变更统计（+N/-M）：挂载时对文件列表拉取增删行数（ChatGPT 式“N 个文件已更改 +N -M”）
   const [stat, setStat] = useState<{ files: number; insertions: number; deletions: number } | null>(null)
   useEffect(() => {
@@ -155,6 +185,12 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
   const [reverted, setReverted] = useState<Set<string>>(new Set())
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const canReview = !!projectPath
+
+  const filteredFiles = useMemo(() => {
+    if (!filter.trim()) return files
+    const q = filter.trim().toLowerCase()
+    return files.filter((f) => f.toLowerCase().includes(q))
+  }, [files, filter])
 
   const copyPath = async (p: string) => {
     try {
@@ -283,7 +319,21 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
       </button>
       {open && (
         <div className="max-h-64 overflow-y-auto border-t border-[var(--border)] py-1">
-          {files.map((p) => {
+          {files.length > 5 && (
+            <div className="px-3 py-1">
+              <input
+                type="text"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder={t('home.filterFiles')}
+                className="w-full h-6 px-2 rounded-md border border-[var(--border)] bg-[var(--bg-primary)] text-[10.5px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)]/50 transition-colors"
+              />
+            </div>
+          )}
+          {filteredFiles.length === 0 && filter && (
+            <div className="px-3 py-2 text-[10.5px] text-[var(--text-muted)] text-center">{t('home.noMatchFiles')}</div>
+          )}
+          {filteredFiles.map((p) => {
             const isAccepted = accepted.has(p)
             const isReverted = reverted.has(p)
             const diff = diffMap[p]
@@ -311,6 +361,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                         onClick={() => toggleDiff(p)}
                         disabled={diffLoading === p}
                         title={t('home.viewDiff')}
+                        aria-label={t('home.viewDiff')}
                         className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                       >
                         {diffLoading === p ? (
@@ -324,6 +375,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                         onClick={() => acceptFile(p)}
                         disabled={busy === p || isAccepted}
                         title={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
+                        aria-label={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
                         className={`p-1 rounded-md transition-colors ${
                           isAccepted
                             ? 'text-[var(--success)]'
@@ -339,6 +391,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                         onClick={() => revertFile(p)}
                         disabled={busy === p || isAccepted}
                         title={t('home.revertChange')}
+                        aria-label={t('home.revertChange')}
                         className="p-1 ml-0.5 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
                       >
                         <Icon name="close" size={11} />
@@ -375,7 +428,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
       {reviewOpen && canReview &&
         createPortal(
           <div
-            className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-6"
+            className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-6"
             onMouseDown={(e) => {
               if (e.target === e.currentTarget) setReviewOpen(false)
             }}
@@ -397,6 +450,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                   onClick={() => setReviewOpen(false)}
                   className="shrink-0 w-7 h-7 rounded-lg flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   title={t('common.close')}
+                  aria-label={t('common.close')}
                 >
                   <Icon name="close" size={14} />
                 </button>
@@ -442,6 +496,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                               onClick={() => acceptFile(p)}
                               disabled={busy === p || isAccepted}
                               title={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
+                              aria-label={isAccepted ? t('home.changeAccepted') : t('home.acceptChange')}
                               className={`p-1 rounded-md transition-colors ${
                                 isAccepted
                                   ? 'text-[var(--success)]'
@@ -456,6 +511,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                               onClick={() => revertFile(p)}
                               disabled={busy === p || isAccepted}
                               title={t('home.revertChange')}
+                              aria-label={t('home.revertChange')}
                               className="p-1 ml-0.5 rounded-md text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
                             >
                               <Icon name="close" size={11} />
@@ -584,7 +640,7 @@ export const StreamingMessage = memo(function StreamingMessage({
           )}
           <span className="msg-timestamp ml-auto tnum">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
         </div>
-        {shown.reasoning && <ThinkingBlock content={shown.reasoning} />}
+        {shown.reasoning && <ThinkingBlock content={shown.reasoning} active={active} />}
         {shown.content.trim() ? (
           <div className="text-sm break-words leading-relaxed text-[var(--text-primary)]">
             <Markdown streaming={active}>{processedContent}</Markdown>
@@ -598,53 +654,148 @@ export const StreamingMessage = memo(function StreamingMessage({
   )
 })
 
-/* ============ 结构化错误卡片（chat-error 事件友好展示） ============ */
+/* ============ 错误分类标签映射 ============ */
+const ERROR_KIND_LABELS: Record<string, string> = {
+  rate_limited: 'Rate Limited',
+  timeout: 'Timeout',
+  network: 'Network',
+  server: 'Server',
+  context_overflow: 'Context Overflow',
+  auth: 'Auth',
+  model: 'Model',
+}
+
+/* ============ 结构化错误卡片（chat-error 事件友好展示）：分类徽章 + 可折叠详情 + 操作栏 ============ */
 export const ErrorCard = memo(function ErrorCard({
   error,
   detail,
   onRetry,
   retryLabel,
+  onViewLogs,
 }: {
   error: string
   detail: ChatErrorDetail | null
   onRetry: () => void
   retryLabel: string
+  onViewLogs?: () => void
 }) {
   const { t } = useTranslation()
-  // 按错误分类着色：认证/请求被拒=红；限流/超时/网络/服务端=橙；上下文超长=黄；其余=红
+  const [expanded, setExpanded] = useState(false)
+  const [copied, setCopied] = useState(false)
+
   const color =
     detail?.kind === 'rate_limited' || detail?.kind === 'timeout' || detail?.kind === 'network' || detail?.kind === 'server'
       ? 'var(--warning)'
       : detail?.kind === 'context_overflow'
         ? 'var(--warning)'
         : 'var(--danger)'
+
   const showRetry = !detail || detail.retryable
+  const kindLabel = detail ? (ERROR_KIND_LABELS[detail.kind] ?? detail.kind) : null
+  const hasDetail = !!detail && (!!detail.reason || !!detail.suggestion)
+  const toneClass =
+    color === 'var(--warning)'
+      ? 'border-[var(--warning)]/30'
+      : 'border-[var(--danger)]/30'
+  const badgeClass =
+    color === 'var(--warning)'
+      ? 'text-[var(--warning)] bg-[var(--warning)]/10'
+      : 'text-[var(--danger)] bg-[var(--danger)]/10'
+
+  const errorText = detail
+    ? `[${detail.kind}] ${detail.title}\n${detail.reason}${detail.suggestion ? `\n建议：${detail.suggestion}` : ''}${detail.statusCode ? `\nHTTP ${detail.statusCode}` : ''}`
+    : error
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(errorText)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch { /* ignore */ }
+  }, [errorText])
+
   return (
     <div
-      className="px-3 py-2.5 text-[12px] animate-fade-in-up rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60"
-      style={{ color }}
+      className={`animate-fade-in-up rounded-lg border bg-[var(--bg-secondary)]/60 overflow-hidden ${toneClass}`}
     >
-      <div className="flex items-start gap-2">
+      {/* 头部：图标 + 标题/摘要 + 分类徽章 */}
+      <div className="flex items-start gap-2 px-3 py-2.5">
         <Icon name="info" size={13} className="shrink-0 mt-0.5" />
-        <div className="flex-1 min-w-0 space-y-1">
-          {detail ? (
-            <>
-              <p className="font-semibold leading-snug">{detail.title}</p>
-              <p className="break-all leading-snug opacity-90">{detail.reason}</p>
-              {detail.suggestion && (
-                <p className="leading-snug opacity-75">{t('home.suggestion', { text: detail.suggestion })}</p>
-              )}
-            </>
-          ) : (
-            <p className="break-all leading-snug">{error}</p>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            {kindLabel && (
+              <span
+                className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md leading-none ${badgeClass}`}
+              >
+                {kindLabel}
+              </span>
+            )}
+            {detail?.statusCode && (
+              <span className="text-[10px] text-[var(--text-muted)] font-mono">
+                HTTP {detail.statusCode}
+              </span>
+            )}
+          </div>
+          <p className="text-[12px] font-semibold leading-snug mt-1" style={{ color }}>
+            {detail ? detail.title : error.slice(0, 120)}
+          </p>
+          {hasDetail && !expanded && (
+            <p className="text-[11.5px] leading-snug text-[var(--text-muted)] mt-0.5 truncate">
+              {detail!.reason}
+            </p>
           )}
         </div>
+      </div>
+
+      {/* 可折叠详情区 */}
+      {hasDetail && expanded && (
+        <div className="px-3 pb-2 space-y-1 border-t border-[var(--border)]/40 pt-2">
+          <p className="text-[11.5px] break-all leading-relaxed text-[var(--text-secondary)]">{detail!.reason}</p>
+          {detail!.suggestion && (
+            <p className="text-[11.5px] leading-relaxed text-[var(--text-muted)]">
+              {t('home.suggestion', { text: detail!.suggestion })}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* 操作栏 */}
+      <div className="flex items-center gap-1 px-2 py-1.5 border-t border-[var(--border)]/40">
+        {hasDetail && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            <Icon name="chevron-right" size={10} className={`transition-transform ${expanded ? 'rotate-90' : ''}`} />
+            {expanded ? t('home.errorCollapse') : t('home.errorExpand')}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+        >
+          <Icon name={copied ? 'check' : 'copy'} size={11} />
+          {copied ? t('home.errorCopied') : t('home.errorCopy')}
+        </button>
+        {onViewLogs && (
+          <button
+            type="button"
+            onClick={onViewLogs}
+            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+          >
+            <Icon name="health" size={11} />
+            {t('home.errorViewLogs')}
+          </button>
+        )}
         {showRetry && (
           <button
             onClick={onRetry}
-            className="shrink-0 h-7 px-3 rounded-lg text-white text-[11px] font-medium hover:opacity-90 active:scale-95 transition-all"
+            className="ml-auto flex items-center gap-1 h-7 px-3 rounded-lg text-white text-[11px] font-medium hover:opacity-90 active:scale-95 transition-[opacity,transform]"
             style={{ backgroundColor: color }}
           >
+            <Icon name="refresh" size={11} />
             {retryLabel}
           </button>
         )}
@@ -683,12 +834,10 @@ export const EmptyState = memo(function EmptyState({
       </div>
       <h2 className="text-lg font-semibold">{t('home.welcome')}</h2>
       <p className="text-[13px] text-[var(--text-secondary)] mt-1.5 max-w-sm leading-relaxed">{t('home.welcomeDesc')}</p>
-      <button
-        onClick={onAdd}
-        className="mt-7 h-10 px-5 rounded-[10px] btn-primary text-[13px] font-medium flex items-center gap-1.5 active:scale-[0.98] transition-all"
-      >
-        <Icon name="plus" size={15} white /> {t('home.addProject')}
-      </button>
+      {/* Button 基类的 shrink-0 在这里是承重墙：外层容器矮视口下会溢出，删了它 CTA 会被压到 21.5px（比一行文字还矮） */}
+      <Button variant="primary" size="md" icon="plus" className="mt-7" onClick={onAdd}>
+        {t('home.addProject')}
+      </Button>
       {secondaryActions.length > 0 && (
         <div className="mt-8 grid grid-cols-3 gap-2.5 w-full max-w-md animate-fade-in-up">
           {secondaryActions.map((a, i) => (
@@ -696,9 +845,9 @@ export const EmptyState = memo(function EmptyState({
               key={a.title}
               onClick={a.onClick}
               style={{ animationDelay: `${i * 60}ms` }}
-              className="group p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-md transition-all duration-200"
+              className="group p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-md transition-[color,background-color,border-color,box-shadow,transform] duration-200"
             >
-              <div className="w-7 h-7 rounded-md bg-[var(--accent-soft)] flex items-center justify-center mb-1.5 group-hover:bg-[var(--accent)] transition-all">
+              <div className="w-7 h-7 rounded-md bg-[var(--accent-soft)] flex items-center justify-center mb-1.5 group-hover:bg-[var(--accent)] transition-colors">
                 <Icon name={a.icon} size={13} className="group-hover:[filter:brightness(0)_invert(1)]!" />
               </div>
               <div className="text-[12px] font-medium text-[var(--text-primary)]">{a.title}</div>
@@ -773,10 +922,10 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
             key={a.title}
             onClick={() => onQuick(a.prompt)}
             style={{ animationDelay: `${i * 60}ms` }}
-            className="group p-3.5 rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-lg hover:shadow-[var(--accent)]/5 active:translate-y-0 transition-all duration-200"
+            className="group p-3.5 rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-left hover:border-[var(--accent)]/40 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 hover:shadow-lg hover:shadow-[var(--accent)]/5 active:translate-y-0 transition-[color,background-color,border-color,box-shadow,transform] duration-200"
           >
-            <div className="w-9 h-9 rounded-[10px] bg-[var(--accent-soft)] flex items-center justify-center mb-2.5 group-hover:bg-[var(--accent)] group-hover:shadow-md group-hover:shadow-[var(--accent)]/25 transition-all">
-              <Icon name={a.icon} size={17} className="transition-all group-hover:[filter:brightness(0)_invert(1)]!" />
+            <div className="w-9 h-9 rounded-[10px] bg-[var(--accent-soft)] flex items-center justify-center mb-2.5 group-hover:bg-[var(--accent)] group-hover:shadow-md group-hover:shadow-[var(--accent)]/25 transition-[color,background-color,border-color,box-shadow]">
+              <Icon name={a.icon} size={17} className="transition-[filter] group-hover:[filter:brightness(0)_invert(1)]!" />
             </div>
             <div className="text-[13px] font-medium text-[var(--text-primary)]">{a.title}</div>
             <div className="text-[11px] text-[var(--text-muted)] mt-0.5 leading-relaxed">{a.desc}</div>
@@ -805,3 +954,64 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
   )
 })
 
+/* ============ 任务收尾摘要卡片（可展开查看 token 明细） ============ */
+export const TaskSummaryCard = memo(function TaskSummaryCard({
+  summary,
+  t,
+}: {
+  summary: TaskSummary
+  t: (key: string, opts?: Record<string, unknown>) => string
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const incomplete = summary.status === 'incomplete'
+  const totalTokens = summary.tokensIn + summary.tokensOut
+  return (
+    <div
+      className={`md-task-summary animate-fade-in-up ${incomplete ? 'is-incomplete' : ''}`}
+      style={{ cursor: 'pointer' }}
+      onClick={() => setExpanded((v) => !v)}
+    >
+      <div className="md-task-summary-icon">
+        <Icon name={incomplete ? 'info' : 'check'} size={13} white />
+      </div>
+      <div className="min-w-0 flex-1">
+        <span className="md-task-summary-title">
+          {t(incomplete ? 'home.taskIncompleteTitle' : 'home.taskDoneTitle')}
+        </span>
+        <span className="md-task-summary-meta tabular-nums">
+          {t('home.taskSummary', {
+            time: fmtElapsed(summary.durationMs / 1000),
+            tools: summary.toolCount,
+            files: summary.fileCount,
+            tokens: totalTokens.toLocaleString(),
+          })}
+        </span>
+        {expanded && (
+          <div className="mt-2 pt-2 border-t border-[var(--border)]/50 grid grid-cols-2 gap-x-4 gap-y-1 text-[10.5px]">
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">{t('home.tokensIn')}</span>
+              <span className="text-[var(--text-secondary)] tabular-nums">{summary.tokensIn.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">{t('home.tokensOut')}</span>
+              <span className="text-[var(--text-secondary)] tabular-nums">{summary.tokensOut.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">{t('home.toolCallsShort')}</span>
+              <span className="text-[var(--text-secondary)] tabular-nums">{summary.toolCount}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">{t('home.filesModified')}</span>
+              <span className="text-[var(--text-secondary)] tabular-nums">{summary.fileCount}</span>
+            </div>
+          </div>
+        )}
+      </div>
+      <Icon
+        name="chevron-right"
+        size={11}
+        className={`shrink-0 text-[var(--text-muted)] transition-transform ${expanded ? 'rotate-90' : ''}`}
+      />
+    </div>
+  )
+})

@@ -31,8 +31,8 @@ const PROJECT_UNDERSTANDING: CapabilityPack = CapabilityPack {
     min_agent_version: "2.0.0",
     permission_ceiling: PermissionCeiling::ReadOnly,
     triggers: &["project", "understand", "inspect", "项目", "理解", "阅读", "分析", "架构"],
-    tools: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "search_symbols", "read_file", "environment_check"],
-    recommended_order: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "read_file"],
+    tools: &["list_dir", "get_project_info", "list_modules", "deep_scan", "codebase_search", "search_symbols", "import_scip_index", "read_file", "environment_check"],
+    recommended_order: &["list_dir", "get_project_info", "list_modules", "search_symbols", "import_scip_index", "deep_scan", "codebase_search", "read_file"],
     stop_conditions: &["核心入口、模块边界和构建方式已有来源证据", "继续读取不会改变当前任务计划"],
     acceptance: &["给出工程类型、入口、模块、依赖和风险摘要", "所有关键判断可追溯到文件或工具结果"],
 };
@@ -44,8 +44,8 @@ const COMPILE_FIX: CapabilityPack = CapabilityPack {
     min_agent_version: "2.0.0",
     permission_ceiling: PermissionCeiling::ProjectWrite,
     triggers: &["compile", "build error", "fix", "bug", "error", "编译", "构建失败", "修复", "报错"],
-    tools: &["get_diagnostics", "get_build_log", "codebase_search", "read_file", "edit_file", "check_code", "build_project", "run_tests", "git_diff"],
-    recommended_order: &["get_diagnostics", "get_build_log", "read_file", "edit_file", "check_code", "build_project", "run_tests"],
+    tools: &["get_diagnostics", "get_build_log", "search_symbols", "codebase_search", "read_file", "edit_file", "check_code", "build_project", "run_tests", "git_diff"],
+    recommended_order: &["get_diagnostics", "get_build_log", "search_symbols", "codebase_search", "read_file", "edit_file", "check_code", "build_project", "run_tests"],
     stop_conditions: &["同一失败签名重复且没有新证据", "修复需要用户选择或外部环境变更"],
     acceptance: &["原始失败不再出现", "相关静态检查、构建或测试通过", "diff 仅包含目标修复"],
 };
@@ -57,8 +57,8 @@ const FEATURE_DEVELOPMENT: CapabilityPack = CapabilityPack {
     min_agent_version: "2.0.0",
     permission_ceiling: PermissionCeiling::ProjectWrite,
     triggers: &["feature", "implement", "add", "develop", "功能", "实现", "新增", "开发"],
-    tools: &["codebase_search", "get_symbol_details", "read_file", "write_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
-    recommended_order: &["codebase_search", "get_symbol_details", "read_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
+    tools: &["search_symbols", "codebase_search", "get_symbol_details", "read_file", "write_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
+    recommended_order: &["search_symbols", "get_symbol_details", "codebase_search", "read_file", "edit_file", "write_unit_tests", "run_tests", "build_project", "review_changes"],
     stop_conditions: &["需求或交互存在会改变实现的歧义", "验收失败且缺少新的安全修复路径"],
     acceptance: &["功能行为满足目标契约", "新增或相关测试通过", "构建通过且变更经过审查"],
 };
@@ -124,6 +124,29 @@ pub const COMMON_TOOLS: &[&str] = &[
     "plan_task", "todo_write", "todo_get", "ask_user", "tool_help", "tool_list", "tool_history",
 ];
 
+/// 常驻 schema 上限；候选发现可以更宽，Provider 实际接收的工具必须再收敛。
+pub const RESIDENT_TOOL_LIMIT: usize = 20;
+
+/// 排名不能挤掉计划、澄清和工具发现入口；其余 schema 按排名延迟展开。
+pub fn resident_tool_names(query: &str, phase: TaskPhase, ranked: &[String]) -> Vec<String> {
+    let mut names = COMMON_TOOLS.iter().map(|name| (*name).to_string()).collect::<Vec<_>>();
+    if phase == TaskPhase::Verify {
+        for tool in select(query).iter().flat_map(|pack| pack.recommended_order.iter()) {
+            if names.len() >= RESIDENT_TOOL_LIMIT { break; }
+            if super::contracts::contract(tool).validator.is_some()
+                && ranked.iter().any(|name| name == tool)
+                && !names.iter().any(|name| name == tool) {
+                names.push((*tool).to_string());
+            }
+        }
+    }
+    for name in ranked {
+        if names.len() >= RESIDENT_TOOL_LIMIT { break; }
+        if !names.contains(name) { names.push(name.clone()); }
+    }
+    names
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskPhase {
     Explore,
@@ -172,7 +195,7 @@ pub fn select(query: &str) -> Vec<&'static CapabilityPack> {
 }
 
 pub fn selected_tool_names(query: &str, limit: usize) -> Vec<&'static str> {
-    let mut names = COMMON_TOOLS.to_vec();
+    let mut names = COMMON_TOOLS.iter().copied().take(limit).collect::<Vec<_>>();
     for pack in select(query) {
         for tool in pack.tools {
             if names.len() >= limit { return names; }
@@ -208,6 +231,7 @@ pub fn selected_tool_names_for_phase(
     limit: usize,
 ) -> Vec<&'static str> {
     use super::contracts::EffectKind;
+    if limit == 0 { return Vec::new(); }
     let mut candidates = selected_tool_names(query, 64);
     if phase == TaskPhase::Verify {
         for tool in [
@@ -219,6 +243,17 @@ pub fn selected_tool_names_for_phase(
                 candidates.remove(index);
             }
             candidates.insert(COMMON_TOOLS.len().min(candidates.len()), tool);
+        }
+        // 先保留任务本身的验收动作，再填充通用检查，避免小预算把 deploy 等
+        // 唯一能完成当前验收契约的工具挤到集合之外。仍以候选集为权限边界。
+        let goal_validators = select(query).iter().flat_map(|pack| pack.recommended_order.iter().copied())
+            .filter(|tool| super::contracts::contract(tool).validator.is_some())
+            .collect::<Vec<_>>();
+        for tool in goal_validators.into_iter().rev() {
+            if let Some(index) = candidates.iter().position(|candidate| *candidate == tool) {
+                candidates.remove(index);
+                candidates.insert(COMMON_TOOLS.len().min(candidates.len()), tool);
+            }
         }
     }
     let mut names = Vec::new();
@@ -248,6 +283,50 @@ pub fn selected_tool_names_for_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_budget_preserves_discovery_and_deduplicates_ranking() {
+        let mut ranked = (0..64).map(|index| format!("candidate_{index}")).collect::<Vec<_>>();
+        ranked.insert(0, "tool_help".into());
+        ranked.insert(1, "tool_help".into());
+        let names = resident_tool_names("inspect", TaskPhase::Explore, &ranked);
+        assert_eq!(names.len(), RESIDENT_TOOL_LIMIT);
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), names.len());
+        assert!(COMMON_TOOLS.iter().all(|tool| names.iter().any(|name| name == tool)));
+        assert_eq!(names[COMMON_TOOLS.len()], "candidate_0");
+    }
+
+    #[test]
+    fn selection_obeys_even_zero_and_tiny_limits() {
+        for limit in 0..8 {
+            assert!(selected_tool_names("修复并提交", limit).len() <= limit);
+            assert!(selected_tool_names_for_phase("修复并提交", TaskPhase::Modify, limit).len() <= limit);
+        }
+    }
+
+    #[test]
+    fn production_budget_keeps_representative_phase_tools() {
+        for (goal, phase, required) in [
+            ("修复编译错误", TaskPhase::Modify, "edit_file"),
+            ("修复编译错误", TaskPhase::Verify, "run_tests"),
+            ("检查测试并提交 git", TaskPhase::Deliver, "git_commit"),
+            ("部署应用到设备", TaskPhase::Verify, "deploy"),
+        ] {
+            let candidates = selected_tool_names_for_phase(goal, phase, 64).into_iter().map(str::to_string).collect::<Vec<_>>();
+            let resident = resident_tool_names(goal, phase, &candidates);
+            assert!(resident.len() <= RESIDENT_TOOL_LIMIT);
+            assert!(resident.iter().any(|tool| tool == required), "{goal}: {resident:?}");
+        }
+    }
+
+    #[test]
+    fn ranking_cannot_starve_goal_validator_or_restore_excluded_tool() {
+        let mut ranked = (0..64).map(|i| format!("candidate_{i}")).collect::<Vec<_>>();
+        ranked.push("deploy".into());
+        assert!(resident_tool_names("部署应用", TaskPhase::Verify, &ranked).contains(&"deploy".into()));
+        ranked.pop();
+        assert!(!resident_tool_names("不要部署应用", TaskPhase::Verify, &ranked).contains(&"deploy".into()));
+    }
 
     #[test]
     fn packs_are_complete_and_reference_registered_tools() {

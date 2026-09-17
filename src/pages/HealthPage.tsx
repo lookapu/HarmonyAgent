@@ -23,6 +23,8 @@ import { checkWithProxy, withProxy } from '../api/updateProxy'
 import { useProjectStore } from '../stores/projectStore'
 import { getJSON, setItem } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
+import { Skeleton } from '../components/ui/Spinner'
+import SandboxCapabilityPanel from '../components/SandboxCapabilityPanel'
 
 /** 版本号比较：v22.14.0 vs 22.13.0；返回 a-b 差值（>0 表示 a 新）。
  *  非数字段（如 git 的 windows 段）退化为字符串比较，兼容 Git for Windows 版本号。 */
@@ -756,13 +758,15 @@ export default function HealthPage() {
             <p className="text-[var(--text-secondary)] text-sm">{t('health.noProvider')}</p>
             <button
               onClick={() => navigate('/providers')}
-              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium  active:scale-[0.98] transition-all"
+              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-colors"
             >
               {t('health.goAdd')}
             </button>
           </div>
         )}
       </div>
+
+      <SandboxCapabilityPanel />
 
       {/* 鸿蒙 SDK / command-line-tools 环境：自动探测 + 手动指定（后端持久化） */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.harmonyEnvTitle')}</h3>
@@ -771,10 +775,7 @@ export default function HealthPage() {
         <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
           <div className="flex items-center gap-3 min-w-0">
             <div
-              className="w-3 h-3 rounded-full shrink-0"
-              style={{
-                background: harmonyEnv?.sdk_root || harmonyEnv?.cli ? 'var(--success)' : 'var(--warning)',
-              }}
+              className={`w-3 h-3 rounded-full shrink-0 ${harmonyEnv?.sdk_root || harmonyEnv?.cli ? 'bg-[var(--success)]' : 'bg-[var(--warning)]'}`}
             />
             <div className="min-w-0">
               <div className="text-[13px] font-medium text-[var(--text-primary)]">
@@ -935,14 +936,11 @@ export default function HealthPage() {
             }}
           >
             <div
-              className="w-3 h-3 rounded-full shrink-0"
-              style={{
-                background:
-                  alignment.status === 'ok' ? 'var(--success)'
-                  : alignment.status === 'behind' ? 'var(--danger)'
-                  : alignment.status === 'ahead' ? 'var(--success)'
-                  : 'var(--warning)',
-              }}
+              className={`w-3 h-3 rounded-full shrink-0 ${
+                alignment.status === 'behind' ? 'bg-[var(--danger)]'
+                : alignment.status === 'ok' || alignment.status === 'ahead' ? 'bg-[var(--success)]'
+                : 'bg-[var(--warning)]'
+              }`}
             />
             <div className="min-w-0">
               <div className="text-[13px] font-medium text-[var(--text-primary)]">{alignment.message}</div>
@@ -1129,8 +1127,7 @@ export default function HealthPage() {
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-3 min-w-0">
                 <div
-                  className="w-3 h-3 rounded-full shrink-0"
-                  style={{ backgroundColor: nodeRt.node_version ? 'var(--success)' : 'var(--danger)' }}
+                  className={`w-3 h-3 rounded-full shrink-0 ${nodeRt.node_version ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
                 />
                 <div className="min-w-0">
                   <span className="font-medium">{rtSourceLabel(nodeRt.source)}</span>
@@ -1206,7 +1203,7 @@ export default function HealthPage() {
             {rtMsg && <p className="text-xs mt-2 break-all">{rtMsg}</p>}
           </>
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+          <Skeleton lines={2} label={t('common.loading')} />
         )}
       </div>
 
@@ -1217,8 +1214,7 @@ export default function HealthPage() {
           <>
             <div className="flex items-center gap-3 flex-wrap">
               <div
-                className="w-3 h-3 rounded-full shrink-0"
-                style={{ backgroundColor: devecoCli.installed ? 'var(--success)' : 'var(--danger)' }}
+                className={`w-3 h-3 rounded-full shrink-0 ${devecoCli.installed ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
               />
               <span className="font-medium">devecocli</span>
               <span className="text-xs text-[var(--text-secondary)]">
@@ -1236,7 +1232,7 @@ export default function HealthPage() {
             <p className="text-xs text-[var(--text-muted)] mt-2">{t('health.devecoCliDesc')}</p>
           </>
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+          <Skeleton lines={2} label={t('common.loading')} />
         )}
       </div>
 
@@ -1248,8 +1244,7 @@ export default function HealthPage() {
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-3 min-w-0">
                 <div
-                  className="w-3 h-3 rounded-full shrink-0"
-                  style={{ backgroundColor: gitRt.git_version ? 'var(--success)' : 'var(--danger)' }}
+                  className={`w-3 h-3 rounded-full shrink-0 ${gitRt.git_version ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
                 />
                 <div className="min-w-0">
                   <span className="font-medium">
@@ -1315,7 +1310,7 @@ export default function HealthPage() {
             {gitMsg && <p className="text-xs mt-2 break-all">{gitMsg}</p>}
           </>
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">{gitMsg ?? t('common.loading')}</p>
+          gitMsg ? <p className="text-sm text-[var(--text-secondary)]">{gitMsg}</p> : <Skeleton lines={2} label={t('common.loading')} />
         )}
       </div>
 
@@ -1327,8 +1322,7 @@ export default function HealthPage() {
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-3 min-w-0">
                 <div
-                  className="w-3 h-3 rounded-full shrink-0"
-                  style={{ backgroundColor: jdkRt.active_version ? 'var(--success)' : 'var(--danger)' }}
+                  className={`w-3 h-3 rounded-full shrink-0 ${jdkRt.active_version ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
                 />
                 <div className="min-w-0">
                   <span className="font-medium">JDK {jdkRt.active_version || t('health.unavailable')}</span>
@@ -1442,7 +1436,7 @@ export default function HealthPage() {
             {jdkMsg && <p className="text-xs mt-2 break-all">{jdkMsg}</p>}
           </>
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+          <Skeleton lines={2} label={t('common.loading')} />
         )}
       </div>
 
@@ -1501,8 +1495,7 @@ export default function HealthPage() {
             >
               <div className="flex items-start gap-3 min-w-0">
                 <div
-                  className="w-3 h-3 rounded-full mt-1 shrink-0"
-                  style={{ backgroundColor: c.found ? 'var(--success)' : 'var(--danger)' }}
+                  className={`w-3 h-3 rounded-full mt-1 shrink-0 ${c.found ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`}
                 />
                 <div className="min-w-0">
                   <span className="font-medium text-sm">
@@ -1558,7 +1551,7 @@ export default function HealthPage() {
                       </div>
                       <div className="max-h-56 overflow-y-auto">
                         {candLoading ? (
-                          <p className="px-3 py-2 text-xs text-[var(--text-muted)]">{t('common.loading')}</p>
+                          <Skeleton lines={2} label={t('common.loading')} className="px-3 py-2" />
                         ) : candidates.length === 0 ? (
                           <p className="px-3 py-2 text-xs text-[var(--text-muted)]">{t('health.toolchainNoCandidate')}</p>
                         ) : (
@@ -1596,7 +1589,6 @@ export default function HealthPage() {
     </div>
   )
 }
-
 
 
 

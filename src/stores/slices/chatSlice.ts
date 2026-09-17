@@ -36,8 +36,14 @@ import {
 } from '../../api/project'
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger, ConversationBranchAnchor } from '../../api/project'
 import type { StateCreator } from 'zustand'
-import type { ChatSlice, DiagnoseCard, ProjectState, StreamingState } from '../projectStoreTypes'
-import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, upsertMessageById } from './chatUtils'
+import type {
+  ChatSlice,
+  DiagnoseCard,
+  ImpactContract,
+  ProjectState,
+  StreamingState,
+} from '../projectStoreTypes'
+import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
@@ -300,9 +306,22 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       if (pending && pending.length > 0) continue
       // 当前会话视图级挂起（兜底，历史数据无 pendingConfirmations 时）
       if (isCurrent && s.toolApprovals.length > 0) continue
+      const elapsedSec = Math.round((now - (bucket.startedAt ?? ref)) / 1000)
+      const elapsedMin = Math.floor(elapsedSec / 60)
+      const contextInfo = bucket.content || bucket.reasoning
+        ? `已接收部分内容，但后端已 ${elapsedMin} 分钟无新事件`
+        : `等待首字节响应已 ${elapsedMin} 分钟`
       setBucket(convId, {
         ...emptyStreaming(),
         error: '后端长时间无响应，已自动停止等待。请检查模型配置与网络后重试',
+        errorDetail: {
+          kind: 'timeout',
+          title: '后端长时间无响应',
+          reason: `${contextInfo}，已自动停止等待。`,
+          suggestion: '请检查模型配置与网络连接，或尝试切换其他模型后重试。',
+          retryable: true,
+          statusCode: null,
+        },
       })
       // UI 释放必须与后端任务收敛同步；否则用户重试时旧任务仍持有项目锁，
       // 只会得到“已有任务进行中”，形成假恢复。停止命令失败仍由后端看门狗兜底。
@@ -813,6 +832,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           ...state.toolRuns,
           {
             id: call_id ? `tool-call-${call_id}` : `tool-${Date.now()}-${toolSeq++}`,
+            callId: call_id,
             tool,
             args,
             status: 'running',
@@ -953,35 +973,43 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   }).catch(() => {})
 
   // 工具权限审核请求（自动审核模式）：入队等待用户确认弹窗
-  listen<{ conversation_id: string; request_id: string; tool: string; args: string; level?: string; desc?: string }>(
-    'chat-tool-approval',
-    (event) => {
-      const { conversation_id, request_id, tool, args, level, desc } = event.payload
-      const isCurrent = get().currentConversation?.id === conversation_id
-      // 后台会话同样记录到待确认表（列表角标 + 切回恢复）；弹窗视图仅当前会话刷新
-      upsertPending({
-        conversation_id,
-        kind: 'approval',
-        request_id,
-        tool,
-        args,
-        level: level ?? null,
-        desc: desc ?? null,
-        plan: null,
-        question: null,
-        options: null,
-      })
-      if (isCurrent) {
-        set((s) => ({
-          toolApprovals: s.toolApprovals.some((item) => item.requestId === request_id)
-            ? s.toolApprovals.map((item) =>
-                item.requestId === request_id ? { requestId: request_id, tool, args, level, desc } : item,
-              )
-            : [...s.toolApprovals, { requestId: request_id, tool, args, level, desc }],
-        }))
-      }
-    },
-  ).catch(() => {})
+  listen<{
+    conversation_id: string
+    request_id: string
+    tool: string
+    args: string
+    level?: string
+    desc?: string
+    impact?: ImpactContract | null
+  }>('chat-tool-approval', (event) => {
+    const { conversation_id, request_id, tool, args, level, desc, impact } = event.payload
+    const isCurrent = get().currentConversation?.id === conversation_id
+    // 后台会话同样记录到待确认表（列表角标 + 切回恢复）；弹窗视图仅当前会话刷新
+    upsertPending({
+      conversation_id,
+      kind: 'approval',
+      request_id,
+      tool,
+      args,
+      level: level ?? null,
+      desc: desc ?? null,
+      impact: impact ?? null,
+      plan: null,
+      question: null,
+      options: null,
+    })
+    if (isCurrent) {
+      set((s) => ({
+        toolApprovals: s.toolApprovals.some((item) => item.requestId === request_id)
+          ? s.toolApprovals.map((item) =>
+              item.requestId === request_id
+                ? { requestId: request_id, tool, args, level, desc, impact }
+                : item,
+            )
+          : [...s.toolApprovals, { requestId: request_id, tool, args, level, desc, impact }],
+      }))
+    }
+  }).catch(() => {})
 
   // Agent 诊断引导卡片：签名/SDK/依赖等需用户手动操作时，在对话流上方展示可操作卡片
   listen<{
@@ -1031,8 +1059,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
 
   // 计划已被处理（批准/驳回）：清空待确认状态；批准时把计划保留为"已批准计划"执行中展示。
   // 后台会话的计划被处理时（如超时自动驳回）也要从待确认表移除，避免角标残留。
-  listen<{ conversation_id: string; approved: boolean }>('chat-plan-resolved', (event) => {
-    const { conversation_id, approved } = event.payload
+  listen<{ conversation_id: string; approved: boolean; plan?: string }>('chat-plan-resolved', (event) => {
+    const { conversation_id, approved, plan } = event.payload
     set((s) => {
       const arr = s.pendingConfirmations[conversation_id]
       let pendingConfirmations = s.pendingConfirmations
@@ -1050,7 +1078,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         pendingPlan: isCurrentPlan ? null : s.pendingPlan,
         approvedPlan:
           isCurrentPlan && approved
-            ? { conversationId: conversation_id, plan: s.pendingPlan?.plan ?? '' }
+            ? { conversationId: conversation_id, plan: plan ?? s.pendingPlan?.plan ?? '' }
             : s.approvedPlan,
       }
     })
@@ -1398,6 +1426,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           args: p.args ?? '',
           level: p.level ?? undefined,
           desc: p.desc ?? undefined,
+          impact: p.impact ?? null,
         }))
       const restoredPlan = (() => {
         const p = pendings.find((p) => p.kind === 'plan')
@@ -1519,21 +1548,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           if (get().currentConversation?.id !== id || get().streamings[id]) return
           const restoredToolRuns = durableSteps
             .filter((step) => step.source === 'tool')
-            .map((step) => ({
-              id: `tool-call-${step.external_id}`,
-              tool: step.tool_name || step.title,
-              args: '',
-              status: (['prepared', 'running'].includes(step.state)
-                ? 'running'
-                : step.state === 'completed'
-                  ? 'done'
-                  : 'error') as 'running' | 'done' | 'error',
-              output: step.result_summary || '',
-              startedAt: step.started_at ?? step.updated_at,
-              durationMs: step.started_at && step.finished_at
-                ? Math.max(0, step.finished_at - step.started_at)
-                : undefined,
-            }))
+            .map(toolRunFromExecutionStep)
           const activeCalls = new Set(
             durableSteps
               .filter((step) => step.source === 'tool' && ['prepared', 'running'].includes(step.state))
@@ -1567,6 +1582,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
                   ? [...state.messages, recoveredMessage]
                   : state.messages,
                 toolRuns: restoredToolRuns,
+                approvedPlan: run.approved_plan
+                  ? { conversationId: id, plan: run.approved_plan }
+                  : state.approvedPlan,
                 unfinishedConv: {
                   conversationId: id,
                   runId: run.run_id,
@@ -1578,7 +1596,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             })
             return
           }
-          set({ toolRuns: restoredToolRuns })
+          set({
+            toolRuns: restoredToolRuns,
+            approvedPlan: run.approved_plan ? { conversationId: id, plan: run.approved_plan } : null,
+          })
           let goalCriteriaTotal = 0
           let remediationBlockers: string[] = []
           try {
@@ -1628,21 +1649,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           const refreshedSteps = await getAgentRunStepsApi(run.run_id).catch(() => durableSteps)
           const refreshedTools = refreshedSteps
             .filter((step) => step.source === 'tool')
-            .map((step) => ({
-              id: `tool-call-${step.external_id}`,
-              tool: step.tool_name || step.title,
-              args: '',
-              status: (['prepared', 'running'].includes(step.state)
-                ? 'running'
-                : step.state === 'completed'
-                  ? 'done'
-                  : 'error') as 'running' | 'done' | 'error',
-              output: step.result_summary || '',
-              startedAt: step.started_at ?? step.updated_at,
-              durationMs: step.started_at && step.finished_at
-                ? Math.max(0, step.finished_at - step.started_at)
-                : undefined,
-            }))
+            .map(toolRunFromExecutionStep)
           const reconciledActive = activeToolCallIds.get(id) ?? new Set<string>()
           for (const step of refreshedSteps.filter((item) => item.source === 'tool')) {
             const current = get().toolRuns.find((toolRun) => toolRun.id === `tool-call-${step.external_id}`)
@@ -1862,6 +1869,14 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           setBucket(cid, {
             ...emptyStreaming(),
             error: '停止未生效：后端任务已无响应。请查看应用日志定位卡点，或重启应用后重试',
+            errorDetail: {
+              kind: 'timeout',
+              title: '停止未生效',
+              reason: '后端任务在停止命令后 60 秒内仍未响应，可能已卡死。',
+              suggestion: '请查看应用日志定位卡点，或重启应用后重试。',
+              retryable: false,
+              statusCode: null,
+            },
           })
         }
       }, 10 * 1000)
@@ -1964,12 +1979,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     },
 
     /** 回复计划审查：批准执行或驳回（可附带修改意见） */
-    resolvePlanReview: async (requestId, approved, feedback) => {
+    resolvePlanReview: async (requestId, approved, feedback, revisedPlan) => {
       const conv = get().currentConversation
       const pending = get().pendingPlan
       try {
         if (conv) {
-          await resolvePlanReviewApi(conv.id, requestId, approved, feedback)
+          await resolvePlanReviewApi(conv.id, requestId, approved, feedback, revisedPlan)
         }
       } catch {
         // 超时/失效：后端按驳回处理

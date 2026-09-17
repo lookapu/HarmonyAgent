@@ -3,11 +3,75 @@
 //! 本模块通过 `use super::*` 继承访问。
 
 use super::*;
+
+async fn debug_device_query(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    argv: &[&str],
+) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv: argv.iter().map(|value| (*value).to_string()).collect(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(format!("设备查询退出码 {}：{text}", output.status.code().unwrap_or(-1)))
+    }
+}
+
+async fn read_network_condition(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    interface: &str,
+) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::ReadNetworkCondition {
+        device: device.to_string(),
+        interface: interface.to_string(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(format!("qdisc 查询退出码 {}：{text}", output.status.code().unwrap_or(-1)))
+    }
+}
+
+async fn configure_network_condition(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+    interface: &str,
+    delay_ms: u64,
+    loss_pct: u64,
+    bandwidth_kbps: u64,
+) -> Result<(bool, String), String> {
+    let capability = crate::agent::capability_broker::HostCapability::ConfigureNetworkCondition {
+        device: device.to_string(),
+        interface: interface.to_string(),
+        delay_ms,
+        loss_pct,
+        bandwidth_kbps,
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    let text = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+    Ok((output.status.success(), text))
+}
+
 /// search_hilog：在设备 hilog 中按条件搜索。
-pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn search_hilog(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let level = args["level"].as_str().unwrap_or("WARN").to_uppercase();
     let tag = args["tag"].as_str().unwrap_or("").to_string();
@@ -33,22 +97,22 @@ pub(super) async fn search_hilog(args: &Value, _roots: &[String]) -> Result<Stri
     // -L <level> 级别过滤；-T <tag> tag 过滤；-e <expr> 正则过滤；-v epoch 行首输出 epoch 时间戳（便于按 since 过滤）。
     // 注意 -T 是 tag 不是时间，不能用它做时间过滤；时间过滤在本地用 epoch 时间戳完成。
     let tail_lines = (max_lines * 3 + 300).clamp(500, 5000);
-    let mut shell_cmd: Vec<String> = vec![
-        "hilog".into(), "-x".into(), "-z".into(), tail_lines.to_string(),
-        "-v".into(), "epoch".into(), "-L".into(), level_flag.to_string(),
-    ];
-    if !tag.is_empty() {
-        shell_cmd.push("-T".into());
-        shell_cmd.push(tag.clone());
+    let capability = crate::agent::capability_broker::HostCapability::SearchHilog {
+        device: device.clone(),
+        level: level_flag.to_string(),
+        tag: (!tag.is_empty()).then_some(tag.clone()),
+        tail_lines: tail_lines as u64,
+        expression: (use_regex && !keyword.is_empty()).then_some(keyword.clone()),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "hilog 搜索失败：{}",
+            (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim()
+        ));
     }
-    if use_regex && !keyword.is_empty() {
-        shell_cmd.push("-e".into());
-        shell_cmd.push(keyword.clone());
-    }
-    let mut full: Vec<String> = vec!["-t".into(), device.clone(), "shell".into()];
-    full.extend(shell_cmd);
-    // 日志输出远超 3000 字符，用大上限读取（设备端已限行数，内存可控）
-    let out_raw = run_cmd_capped("hdc", &full, None, 20, 20_000).await.unwrap_or_default();
+    let out_raw = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
 
     let lines: Vec<&str> = out_raw.lines().collect();
     let mut matches: Vec<(usize, &str)> = Vec::new();
@@ -396,7 +460,8 @@ pub(super) async fn set_network_condition(
     _roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    let device = super::ui_tools::resolve_authorized_device(args["device"].as_str(), "shell").await?;
+    let device =
+        super::ui_tools::resolve_authorized_device(args["device"].as_str(), "shell", ctx).await?;
     let mode = args["mode"].as_str().unwrap_or("normal");
 
     let (bandwidth_kbps, delay_ms, loss_pct) = match mode {
@@ -411,19 +476,24 @@ pub(super) async fn set_network_condition(
         ),
         _ => return Err("mode 必须是 normal/weak/slow/lossy/custom".into()),
     };
+    if mode != "normal" && bandwidth_kbps == 0 && delay_ms == 0 && loss_pct == 0 {
+        return Err("非 normal 网络条件至少需要带宽、延迟或丢包中的一项非零参数".into());
+    }
 
     if mode == "normal" {
-        let iface = detect_network_iface(&device).await.ok_or("未发现可恢复的在线网络接口")?;
-        let output = match run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", &iface, "root"], 10).await {
-            Ok(output) => output,
-            Err(error) if error.to_ascii_lowercase().contains("no such file") => error,
-            Err(error) => return Err(format!("重置网络失败（设备 {device}，接口 {iface}）：{error}")),
-        };
+        let iface = detect_network_iface(ctx, &device).await.ok_or("未发现可恢复的在线网络接口")?;
+        let (success, output) = configure_network_condition(ctx, &device, &iface, 0, 0, 0)
+            .await
+            .map_err(|error| format!("重置网络失败（设备 {device}，接口 {iface}）：{error}"))?;
         let lower = output.to_lowercase();
-        if lower.contains("not found") || lower.contains("inaccessible") {
+        let absent_rule = lower.contains("no such file") || lower.contains("no such entry");
+        if (!success && !absent_rule)
+            || lower.contains("not found")
+            || lower.contains("inaccessible")
+        {
             return Err(format!("重置网络失败（设备 {device}，接口 {iface}）：{}", output.trim()));
         }
-        let state = run_hdc_shell(&device, &["tc", "qdisc", "show", "dev", &iface], 10).await?;
+        let state = read_network_condition(ctx, &device, &iface).await?;
         if qdisc_has_impairment(&state) {
             return Err(format!("网络恢复命令已返回，但读回仍存在限速规则（设备 {device}，接口 {iface}）：{}", state.trim()));
         }
@@ -435,35 +505,27 @@ pub(super) async fn set_network_condition(
     }
 
     // 设置弱网：用 tc netem（需要 root）
-    let iface = detect_network_iface(&device).await;
+    let iface = detect_network_iface(ctx, &device).await;
     let iface_str = iface.as_deref().unwrap_or("wlan0");
 
-    // 先删除现有 qdisc
-    let _ = run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", iface_str, "root"], 5).await;
-
-    let mut cmd = vec!["tc", "qdisc", "add", "dev", iface_str, "root", "netem"];
-    let mut owned: Vec<String> = Vec::new();
-    if delay_ms > 0 {
-        owned.push("delay".to_string());
-        owned.push(format!("{delay_ms}ms"));
-    }
-    if loss_pct > 0 {
-        owned.push("loss".to_string());
-        owned.push(format!("{loss_pct}%"));
-    }
-    if bandwidth_kbps > 0 {
-        owned.push("rate".to_string());
-        owned.push(format!("{bandwidth_kbps}kbit"));
-    }
-    for o in &owned {
-        cmd.push(o.as_str());
-    }
-
-    match run_hdc_shell(&device, &cmd, 10).await {
-        Ok(o) if !o.to_lowercase().contains("not found") && !o.contains("No such file") => {
-            let state = run_hdc_shell(&device, &["tc", "qdisc", "show", "dev", iface_str], 10).await?;
+    match configure_network_condition(
+        ctx, &device, iface_str, delay_ms, loss_pct, bandwidth_kbps,
+    ).await {
+        Ok((true, o)) if !o.to_lowercase().contains("not found") && !o.contains("No such file") => {
+            let state = match read_network_condition(ctx, &device, iface_str).await {
+                Ok(state) => state,
+                Err(error) => {
+                    let cleanup = configure_network_condition(ctx, &device, iface_str, 0, 0, 0)
+                        .await
+                        .map(|(success, text)| format!("success={success}, {}", text.trim()))
+                        .unwrap_or_else(|cleanup_error| cleanup_error);
+                    return Err(format!(
+                        "弱网配置后无法读回确认：{error}；已尝试恢复：{cleanup}"
+                    ));
+                }
+            };
             if !qdisc_has_impairment(&state) {
-                let _ = run_hdc_shell(&device, &["tc", "qdisc", "del", "dev", iface_str, "root"], 5).await;
+                let _ = configure_network_condition(ctx, &device, iface_str, 0, 0, 0).await;
                 return Err(format!("弱网命令已返回，但读回未发现 netem/tbf 规则，已尝试恢复：{}", state.trim()));
             }
             let mut out = format!("网络条件已设置（设备 {device}，模式：{mode}）\n");
@@ -481,7 +543,7 @@ pub(super) async fn set_network_condition(
             }));
             Ok(out)
         }
-        Ok(o) => Err(format!("设置网络条件失败：{o}\n\n提示：需要 root 或 userdebug 权限的设备才能使用 tc 命令。")),
+        Ok((_, o)) => Err(format!("设置网络条件失败：{o}\n\n提示：需要 root 或 userdebug 权限的设备才能使用 tc 命令。")),
         Err(e) => Err(format!("设置网络条件失败：{e}\n\n提示：需要 root 或 userdebug 权限的设备才能使用 tc 命令。")),
     }
 }
@@ -511,10 +573,13 @@ mod network_condition_tests {
     }
 }
 
-pub(super) async fn detect_network_iface(device: &str) -> Option<String> {
+pub(super) async fn detect_network_iface(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+    device: &str,
+) -> Option<String> {
     // 优先尝试 wlan0，然后 eth0
     for iface in ["wlan0", "eth0", "wlan1"] {
-        if let Ok(out) = run_hdc_shell(device, &["ifconfig", iface], 3).await {
+        if let Ok(out) = debug_device_query(ctx, device, &["ifconfig", iface]).await {
             if network_iface_is_active(&out) {
                 return Some(iface.to_string());
             }
@@ -532,10 +597,14 @@ fn network_iface_is_active(output: &str) -> bool {
 }
 
 /// check_signature：检查签名信息。
-pub(super) async fn check_signature(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn check_signature(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -590,7 +659,7 @@ pub(super) async fn check_signature(args: &Value, roots: &[String]) -> Result<St
     // 如果指定了已安装包，用 bm dump 看 profile
     if !bundle.is_empty() {
         out.push_str(&format!("\n已安装应用：{bundle}\n"));
-        let dump = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 20).await
+        let dump = debug_device_query(ctx, &device, &["bm", "dump", "-n", &bundle]).await
             .unwrap_or_default();
         // 提取签名相关字段
         let app_prov = super::ui_tools::extract_json_str(&dump, "appProvisionType").unwrap_or_else(|| "（未知）".to_string());
@@ -612,17 +681,23 @@ pub(super) async fn check_signature(args: &Value, roots: &[String]) -> Result<St
 }
 
 /// dump_battery：电池与耗电分析。
-pub(super) async fn dump_battery(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn dump_battery(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let bundle = args["bundle"].as_str().unwrap_or("").to_string();
 
     let mut out = format!("电池状态报告（设备 {device}）\n\n");
 
     // 1. hidumper BatteryService
-    if let Ok(o) = run_hdc_shell(&device, &["hidumper", "-s", "BatteryService", "-a", "-i"], 10).await {
+    if let Ok(o) = debug_device_query(
+        ctx, &device, &["hidumper", "-s", "BatteryService", "-a", "-i"],
+    ).await {
         let capacity = grep_number(&o, "capacity:");
         let level = grep_number(&o, "batteryLevel:");
         let charging = grep_text(&o, "chargingStatus:");
@@ -642,13 +717,17 @@ pub(super) async fn dump_battery(args: &Value, _roots: &[String]) -> Result<Stri
     }
 
     // 2. /sys/class/power_supply/battery/ 兜底读取
-    if let Ok(o) = run_hdc_shell(&device, &["cat", "/sys/class/power_supply/battery/capacity"], 5).await {
+    if let Ok(o) = debug_device_query(
+        ctx, &device, &["cat", "/sys/class/power_supply/battery/capacity"],
+    ).await {
         let v = o.trim();
         if !v.is_empty() {
             out.push_str(&format!("  电量（sysfs）：{v}%\n"));
         }
     }
-    if let Ok(o) = run_hdc_shell(&device, &["cat", "/sys/class/power_supply/battery/status"], 5).await {
+    if let Ok(o) = debug_device_query(
+        ctx, &device, &["cat", "/sys/class/power_supply/battery/status"],
+    ).await {
         let v = o.trim();
         if !v.is_empty() {
             out.push_str(&format!("  状态（sysfs）：{v}\n"));
@@ -660,7 +739,9 @@ pub(super) async fn dump_battery(args: &Value, _roots: &[String]) -> Result<Stri
         out.push_str("\n应用耗电：\n");
         out.push_str("  （耗电排行读取需要系统权限或特定版本，结果仅供参考）\n");
         // 尝试 hidumper -s BatteryStatsService
-        if let Ok(o) = run_hdc_shell(&device, &["hidumper", "-s", "BatteryStatsService"], 10).await {
+        if let Ok(o) = debug_device_query(
+            ctx, &device, &["hidumper", "-s", "BatteryStatsService"],
+        ).await {
             if o.contains(&bundle) {
                 out.push_str("  应用在 BatteryStatsService 输出中被检测到\n");
             } else {
@@ -1082,11 +1163,15 @@ fn list_probes(conv: &str) -> Result<String, String> {
 /// stack_dump：定位应用进程并采集线程快照（ps 找 pid → /proc 线程枚举 → hidumper 进程详情）。
 /// 完整 JS 函数级调用栈依赖 DevEco Profiler 闭源协议，本工具提供可达的最强进程/线程快照，
 /// 需要函数级执行顺序时配合 debug_probe 插桩观察。
-pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn stack_dump(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let bundle = match args["package"].as_str().map(String::from) {
         Some(b) if !b.trim().is_empty() => b,
@@ -1104,7 +1189,7 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
     };
 
     // 1) 定位主进程 pid：ps -A 中 CMD 含包名
-    let ps = run_hdc_shell(&device, &["ps", "-A"], 30).await?;
+    let ps = debug_device_query(ctx, &device, &["ps", "-A"]).await?;
     let mut pids: Vec<String> = Vec::new();
     for line in ps.lines() {
         if line.contains(&bundle) {
@@ -1120,7 +1205,7 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
         }
     }
     if pids.is_empty() {
-        let bm = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 30).await?;
+        let bm = debug_device_query(ctx, &device, &["bm", "dump", "-n", &bundle]).await?;
         if hdc_shell_failed(&bm) || !bm.contains("bundleName") {
             return Err(format!(
                 "设备 {device} 上未找到应用 {bundle}（可能未安装；请先 deploy）"
@@ -1134,16 +1219,16 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
     let mut out = format!("应用 {bundle} 进程快照（设备 {device}，{} 个进程）：\n", pids.len());
     for pid in &pids {
         // 2) 线程列表：/proc/<pid>/task 枚举 + comm 名称（比 ps -T 更可靠）
-        let ls_cmd = format!("ls /proc/{pid}/task");
-        let ls_args = vec!["sh", "-c", ls_cmd.as_str()];
-        let tasks = run_hdc_shell(&device, &ls_args, 30).await.unwrap_or_default();
+        let task_path = format!("/proc/{pid}/task");
+        let tasks = debug_device_query(ctx, &device, &["ls", &task_path])
+            .await
+            .unwrap_or_default();
         let mut tids: Vec<String> = tasks.split_whitespace().map(String::from).collect();
         tids.sort_by_key(|t| t.parse::<u32>().unwrap_or(0));
         let mut thread_lines: Vec<String> = Vec::new();
         for tid in tids.iter().take(60) {
-            let cat_cmd = format!("cat /proc/{pid}/task/{tid}/comm");
-            let cat_args = vec!["sh", "-c", cat_cmd.as_str()];
-            if let Ok(comm) = run_hdc_shell(&device, &cat_args, 20).await {
+            let comm_path = format!("/proc/{pid}/task/{tid}/comm");
+            if let Ok(comm) = debug_device_query(ctx, &device, &["cat", &comm_path]).await {
                 let name = comm.trim();
                 if !name.is_empty() {
                     thread_lines.push(format!("    tid {tid}: {name}"));
@@ -1151,7 +1236,7 @@ pub(super) async fn stack_dump(args: &Value, roots: &[String]) -> Result<String,
             }
         }
         // 3) 进程详情（CPU/内存/线程状态）
-        let detail = run_hdc_shell(&device, &["hidumper", "-p", pid], 40)
+        let detail = debug_device_query(ctx, &device, &["hidumper", "-p", pid])
             .await
             .unwrap_or_else(|e| format!("(hidumper 不可用: {e})"));
         out.push_str(&format!(

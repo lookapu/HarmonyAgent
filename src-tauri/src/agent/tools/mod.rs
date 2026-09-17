@@ -10,7 +10,21 @@
 
 mod build_tools;
 mod cmd_tools;
+mod code_mutation;
 mod compose_tools;
+mod dart_analyzer;
+mod go_vet;
+mod java_compiler;
+mod python_lint;
+mod sql_check;
+
+pub(crate) fn validate_code_mutation(
+    path: &std::path::Path,
+    before: &str,
+    after: &str,
+) -> Result<(), String> {
+    code_mutation::validate_candidate_with_types(path, before, after).map(|_| ())
+}
 pub mod contracts;
 pub mod capabilities;
 mod debug_tools;
@@ -34,7 +48,7 @@ mod test_tools;
 mod ui_tools;
 mod web_tools;
 
-pub use errors::{ErrorLocation, is_retryable_err, structured_tool_error};
+pub use errors::{ErrorLocation, is_retryable_err, retryable_for, structured_tool_error};
 pub(crate) use project_tools::create_harmony_project_sync;
 // 流水线钩子类型与执行入口：chat.rs 主循环/子任务循环在工具调用点构造
 // ToolInvocation 并运行 pre/post 钩子（拦截需要控制流配合：预算/黑名单 →
@@ -48,6 +62,7 @@ pub use protocol::{
     phase_hint_for, system_hint_for, tool_short_desc, tool_schemas_for, tool_schemas_for_phase,
     tool_argument_error, validate_tool_arguments, ToolArgumentIssue,
     phase_hint_for_names, tool_schemas_for_names,
+    has_pending_action_phrase, parse_data_url,
 };
 use errors::with_advice;
 pub(crate) use errors::diagnose_tool_error;
@@ -182,10 +197,13 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("conversation_search", "explore"),
     ("search_sdk_api", "explore"),
     ("search_symbols", "explore"),
+    ("repo_query", "explore"),
+    ("import_scip_index", "explore"),
     ("stack_dump", "explore"),
     ("tool_help", "explore"),
     ("tool_history", "explore"),
     ("tool_list", "explore"),
+    ("search_tools", "explore"),
     ("view_image", "explore"),
     // refactor：Git / 重构 / 计划
     ("git_blame", "refactor"),
@@ -298,7 +316,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "device_file",
-        desc: "在电脑与设备之间传输文件（hdc file send/recv，即 push/pull）。\n参数：{\"action\":\"push|pull\",\"device\":\"<可选设备>\",\"remote\":\"<设备端路径，如 /data/local/tmp/x.png 或 /sdcard/...>\",\"local\":\"<本地路径，绝对或相对工程根>\"}。\npull：把设备端文件拉到本地（local 缺省保存到工程 .deveco-agent/files/ 下）；push：把本地文件推送到设备端路径（local 必填）。\n适合：拉取应用沙箱数据库/SharedPreferences/崩溃文件分析、推送测试素材（图片/字体/证书）到设备。真机 /data 下部分目录权限受限时改走 /data/local/tmp 或 /sdcard。\n副作用：在本地或设备端创建文件。\n返回：传输结果与目标路径。",
+        desc: "在电脑与设备之间传输文件（hdc file send/recv，即 push/pull）。\n参数：{\"action\":\"push|pull\",\"device\":\"<可选设备>\",\"remote\":\"<设备端绝对路径，如 /data/local/tmp/x.png 或 /sdcard/...>\",\"local\":\"<工作区内且不含 .. 的相对路径>\"}。\npull：把设备端文件拉到本地（local 缺省保存到工程 .deveco-agent/files/ 下）；push：把本地文件推送到设备端路径（local 必填）。本地路径会 canonicalize 并拒绝符号链接逃逸。\n适合：拉取应用沙箱数据库/SharedPreferences/崩溃文件分析、推送测试素材（图片/字体/证书）到设备。真机 /data 下部分目录权限受限时改走 /data/local/tmp 或 /sdcard。\n副作用：在本地或设备端创建文件。\n返回：传输结果与目标路径。",
     },
     ToolSpec {
         name: "stop_app",
@@ -306,7 +324,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "device_shell",
-        desc: "在设备上执行受限白名单 shell 命令（只读/查询类，禁止破坏性操作），用于专用工具覆盖不到的系统查询。\n参数：{\"device\":\"<可选>\",\"command\":\"<命令串，如 ps -A -T 或 cat /proc/meminfo 或 ls /data/local/tmp>\"}。\n允许命令：ps/ls/cat/df/free/uptime/date/top/netstat/ip/ifconfig/getprop/param/pwd/dmesg/echo/hidumper 及 aa dump/bm dump（仅查询子命令）；禁止 rm/kill/reboot/mount/chmod 等修改类命令与 shell 元字符。\n适合：查进程、看文件、查网络、下钻系统信息；需要修改设备状态时用对应专用工具。\n副作用：无（只读）。\n返回：命令输出（截断 3000 字符）。",
+        desc: "在设备上执行受限白名单 shell 命令（只读/查询类，禁止破坏性操作），用于专用工具覆盖不到的系统查询。\n参数：{\"device\":\"<可选>\",\"command\":\"<命令串，如 ps -A -T 或 cat /proc/meminfo 或 ls /data/local/tmp>\"}。\n允许命令：ps/ls/cat/df/free/uptime/date/top/netstat/ip/ifconfig/getprop/param get/pwd/dmesg/echo/hidumper 及 aa dump/bm dump（仅查询子命令）；禁止 rm/kill/reboot/mount/chmod、param set、ip set/add/del、dmesg clear、date set 等修改型参数与 shell 元字符。命令会在 Host Capability Broker 内再次按 argv 校验、固定执行并审计。\n适合：查进程、看文件、查网络、下钻系统信息；需要修改设备状态时用对应专用工具。\n副作用：无（只读）。\n返回：命令输出（截断 3000 字符）。",
     },
     ToolSpec {
         name: "analyze_crash",
@@ -378,7 +396,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "lsp_references",
-        desc: "LSP 查找引用（真实 AST）：给出文件中某个符号的行列位置，返回该符号全部引用位置。\n参数：{\"path\":\"<文件路径>\",\"line\":<行号 1 起>,\"column\":<列号 1 起>,\"include_declaration\":<可选，缺省 true=含声明本身>}。\n适合：重构前评估影响面（改名字/改签名会波及哪些地方）。\n副作用：只读查询（会话内常驻 LSP 进程）。\n返回：引用位置列表。",
+        desc: "LSP 查找引用（真实 AST）：给出文件中某个符号的行列位置，返回该符号全部引用位置；唯一工程内定义对应的成员调用会机会式批量补入结构索引（单次最多 256 个工程内引用）。也可只传 {\"auto_batch_limit\":<1-16>}，按方法优先、公开符号优先、稳定路径顺序渐进扫描尚未覆盖的 ArkTS/TypeScript 逻辑符号；扫描账本提供断点续扫，失败目标持久指数退避。\n普通参数：{\"path\":\"<文件路径>\",\"line\":<行号 1 起>,\"column\":<列号 1 起>,\"include_declaration\":<可选，缺省 true=含声明本身>}。\n适合：重构前评估影响面（改名字/改签名会波及哪些地方），或用小批次逐步提高调用图语义覆盖率。\n副作用：只读查询（会话内常驻 LSP 进程；内部结构索引缓存可能增量更新）。\n返回：普通模式返回引用位置和沉淀数量；渐进模式返回尝试目标、失败/退避数和新增调用关系数。",
     },
     ToolSpec {
         name: "lsp_symbols",
@@ -450,11 +468,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "read_file",
-        desc: "读取文本文件（UTF-8；二进制/超 1MB 拒绝整读）。\n参数：{\"path\":\"<路径，相对项目根或绝对路径>\",\"start\":<可选起始行号，1 起>,\"lines\":<可选行数，缺省全部>,\"outline\":<可选 true 只返回骨架（类/函数/组件等签名，嵌套定义按层级缩进），先快速了解大文件结构再精读>,\"outline_page\":<可选骨架分页（1 起，每页 200 条），结构项多时翻页查看，输出标注总页数与翻页提示>,\"outline_filter\":<可选类型过滤，如 \"函数\"/\"类型\"/\"组件\"：只显示该类条目，分页在过滤后集合上进行>}。\n读取窗口按语言代码块自动对齐：起点落在方法内部会从方法首行开始，末尾仍在块内会补齐到块结束符——绝不把方法截断在中间；块补齐场景输出上限放宽到 40000 字符。\n注释清洗：连续长注释块（≥8 行，如 license 头）自动折叠为一行摘要（标注行号区间，可 start/lines 精读原文），文件头标注折叠统计。\noutline 行号列为「定义行-块尾行」区间（块对齐联动）：read_file {\"start\":区间起点,\"lines\":区间长度} 整读该方法；edit_file {\"start\":区间起点} 整块替换/删除。\n普通模式单次最多 2000 行 / 15000 字符，超出自动截断并提示续读。大文件建议先 outline 看骨架再按区间精读。\n副作用：无（只读）。\n返回：带行号的文件内容（完整代码块）；outline 模式返回结构大纲（含块区间）。",
+        desc: "读取文本文件（UTF-8；拒绝二进制）。\n参数：{\"path\":\"<项目内路径>\",\"start\":<可选起始行，1 起>,\"lines\":<可选行数>,\"symbol_handle\":\"<可选，search_symbols/repo_query 返回的 read_handle；与其他参数互斥>\",\"outline\":<可选 true，只返回类/函数/组件等骨架>,\"outline_page\":<可选骨架页码，每页 200 条>,\"outline_filter\":\"<可选类型过滤，如函数/类型/组件>\"}。\nsymbol_handle v3 绑定项目、文件、完整 SHA-256、稳定/位置节点 ID、节点内容摘要、类型、精确行区间与父节点范围；读取始终严格校验文件版本，不执行重定位（旧 v1/v2 句柄保持兼容）。\n普通代码窗口会自动扩展到完整方法/块，避免截断结束符；长注释块（≥8 行）自动折叠。\n超过 1MB 的文本必须显式传 start/lines（1-2000），使用固定内存流式读取，不支持 outline/块补齐。普通模式最多 2000 行/15000 字符，块补齐最多 40000 字符，超出返回 next_start。\n副作用：无（只读）。\n返回：file_version、实际窗口、next_start 及带行号内容；outline 返回含定义起止行的结构大纲。",
     },
     ToolSpec {
         name: "find_files",
-        desc: "按文件名搜索文件（glob 模式：* 匹配单层、** 匹配任意层级、? 匹配单字符，不区分大小写；模式可匹配文件名或相对路径，如 *.ets 或 src/**/*.ets）。\n参数：{\"pattern\":\"<如 *.ets 或 **/*.json>\",\"path\":<可选搜索起点，缺省项目根或用户指明目录>}。\n自动跳过 .git、node_modules、build 等忽略目录并遵循项目 .gitignore 规则（含子目录），结果按路径排序，最多返回 100 条。\n适合定位文件位置。\n副作用：无（只读）。\n返回：匹配文件路径列表。",
+        desc: "通过持久化全库目录按文件名搜索（glob 模式：*、**、?，不区分大小写；如 *.ets 或 src/**/*.ets）。\n参数：{\"pattern\":\"<glob>\",\"path\":<可选搜索起点>,\"state\":\"<可选 indexed|deferred|oversized|unsupported|symlink|unreadable>\",\"page\":<可选页码>,\"limit\":<可选每页 1-200，缺省 100>}。\n目录记录所有未忽略文件，不因符号解析预算或文件过大而消失；目录不可用时回退即时遍历。自动跳过 .git、node_modules、build 等忽略目录。\n适合定位文件位置、核查未进入结构索引的文件。\n副作用：无（只读）。\n返回：分页文件路径、大小、索引状态和 shard。",
     },
     ToolSpec {
         name: "grep_files",
@@ -466,11 +484,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "edit_file",
-        desc: "修改文件，三种模式：old 精确文本替换、start 按「完整代码块」整体替换（推荐编辑/删除整个方法，不固定行数、不漏块结束符）、starts 批量块替换（一次改多个方法）。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文片段（模式一），须与文件内容完全一致>\",\"new\":\"<替换后内容；模式二 new 为空=整块删除>\",\"replace_all\":<可选，true 替换全部出现处，缺省仅第一处>,\"start\":<可选行号（模式二）：语言感知成对 {}() 定位该行所在完整代码块整体替换，块多长操作多长>,\"anchor\":<可选块锚签名（模式二）：块定义行内容片段（如 \"fn parse\"），行号漂移时 ±100 行内自动重定位，找不到则拒绝，防改错块>,\"starts\":<可选行号数组（模式三）：一次定位多个完整块批量替换/删除，与 news 一一对应>,\"news\":<模式三各块新内容数组（空串=整块删除）>,\"anchors\":<可选模式三各块锚签名数组，与 starts 等长（不用锚的项传 null）>,\"dry_run\":<可选 true 只返回 diff 不落盘>}。\nold/start/starts 互斥；块模式内置配平守卫（新内容漏 } 拒绝落盘）；批量块重叠拒绝、只写一个 undo 快照（一次全恢复）；建议先 dry_run 或 preview_edit 预览。\n转义提示：换行写 \\n；字面量「反斜杠+n」（如 [^\\n]*）须写 \\\\n 双重转义。\n文件 ≤1MB；old 不匹配报错并提示附近内容；文件被外部修改后编辑被拒，需重新 read_file。\n副作用：修改项目内文件（dry_run 无副作用）。\n返回：替换处数与位置（块模式返回各块行区间明细）。",
+        desc: "修改文件，支持 old 精确替换、start 完整代码块替换、starts 批量块替换，以及结构句柄节点事务。\n参数：单节点用 {\"symbol_handle\":\"<read_handle>\",\"new\":\"<完整替换节点>\"}；同文件多节点原子修改用 {\"symbol_handles\":[\"<handle>\"],\"news\":[\"<逐节点新内容>\"]}；结构句柄模式可显式加 allow_relocate=true；也兼容 path/old/new、path/start/new、path/starts/news/anchors；各模式可带 dry_run。\nold/start/starts/symbol_handle/symbol_handles 互斥；v3 句柄绑定完整 SHA-256、稳定节点身份、原节点内容摘要、expected kind、精确节点区间与 parent range，连续注解属于声明节点。默认任何文件漂移都拒绝；仅 allow_relocate=true 时允许内容和身份均未变化且候选唯一的受控重定位，旧 v1/v2 不能重定位。多句柄必须来自同一文件和版本，范围重叠会整体拒绝。所有代码候选均走语法/配平门禁。文件 ≤1MB。\n副作用：修改项目内文件（dry_run 无副作用）。\n返回：替换位置、节点事务和受控重定位信息。",
     },
     ToolSpec {
         name: "preview_edit",
-        desc: "预览文件编辑的 diff（不落盘，只读）：与 edit_file 相同的参数（path/old/new/replace_all/start/anchor/starts/news/anchors），只计算并返回 unified diff（含 @@ 行号、上下文、增删行统计），文件不会被修改。\n参数：{\"path\":\"<文件路径>\",\"old\":\"<原文本，需唯一>\",\"new\":\"<新文本>\",\"replace_all\":<可选，全部替换>,\"start\":<可选行号：语言感知定位该行所在完整代码块，diff 即整块替换效果>,\"anchor\":<可选块锚签名：块定义行内容片段，行号漂移时自动重定位>,\"starts\":<可选批量模式：行号数组一次预览多个块的替换/删除，与 news 一一对应>}。\n与 edit_file 完全同口径：超界显式报错、anchor 重定位、块重叠校验——预览即拦截错误定位，不用等落盘才发现改错块。\n适合：编辑前先展示改动（信任感），确认后同参数调用 edit_file 应用；批量重构前先整体过目 diff。\n副作用：无（只读）。\n返回：unified diff 文本 + 统计；确认后必须用 edit_file 应用同一修改。",
+        desc: "预览 edit_file 的 unified diff，不落盘。\n参数：与 edit_file 相同，包括 path/old/new、start/anchor、starts/news/anchors、symbol_handle/new 或 symbol_handles/news；v3 结构句柄可显式传 allow_relocate=true。\n结构句柄默认严格校验完整文件 SHA-256、节点 ID/类型/范围与父节点范围；受控重定位还要求原节点内容和稳定身份不变且候选唯一。预览与落盘共用精确节点范围、重叠与语法门禁，确认后可把同一参数交给 edit_file。\n副作用：无（只读）。\n返回：diff、增删统计和节点区间。",
     },
     ToolSpec {
         name: "run_command",
@@ -646,7 +664,7 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "set_network_condition",
-        desc: "设置网络条件，模拟弱网/高延迟/丢包（需要 root 或 userdebug）。\n参数：{\"device\":\"<可选>\",\"mode\":\"normal|weak|slow|lossy|custom\",\"custom_bandwidth_kbps\":<kbps>,\"custom_delay_ms\":<ms>,\"custom_loss_pct\":<0-100>}。设备必须在线、已授权并具备 shell；只操作实际在线接口，设置和恢复后均用 tc qdisc 读回确认并记录当前 Run。\n副作用：改变设备所有应用的网络状态；测试必须以 mode=normal 收尾。\n返回：设置参数、接口和读回证据；命令未真实生效时失败并尝试清理。",
+        desc: "设置网络条件，模拟弱网/高延迟/丢包（需要 root 或 userdebug）。\n参数：{\"device\":\"<可选>\",\"mode\":\"normal|weak|slow|lossy|custom\",\"custom_bandwidth_kbps\":<kbps>,\"custom_delay_ms\":<ms>,\"custom_loss_pct\":<0-100>}。设备必须在线、已授权并具备 shell；只操作实际在线接口。Broker 用单次 tc qdisc replace 应用有界参数，normal 使用独立清除能力；设置和恢复后均读回确认并记录当前 Run。\n副作用：改变设备所有应用的网络状态；测试必须以 mode=normal 收尾。\n返回：设置参数、接口和读回证据；命令未真实生效或无法确认时失败并尝试清理。",
     },
     ToolSpec {
         name: "check_signature",
@@ -766,7 +784,15 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search_symbols",
-        desc: "按名称检索项目中的代码符号（组件/类/接口/函数/方法/路由/装饰器），返回所在文件与行号。\n参数：{\"query\":\"<关键字，匹配符号名或文件路径，可空>\",\"kind\":\"<可选类型过滤：component|class|interface|function|method|route|decorator|struct|enum>\"}。\n适合在修改前快速定位某组件/函数定义在哪个文件，避免盲目 list_dir/read_file。\n副作用：无（只读，基于源码轻量扫描）。\n返回：符号清单（名称、类型、文件、行号、归属类），最多 200 条。",
+        desc: "结构优先检索代码实体与逻辑，不读取正文即可查看签名和完整行区间。\n参数：{\"query\":\"<可选名称/签名/文件关键字>\",\"role\":\"<可选 entity|logic>\",\"kind\":\"<可选 kind>\",\"file\":\"<可选路径过滤>\",\"cursor\":\"<可选 next_cursor>\",\"relations_cursor\":\"<可选关系游标>\",\"page\":<兼容页码>,\"limit\":<1-200，缺省 50>}。游标优先于页码。\n陌生仓库和修改前应先查结构，再把 read_handle 传给 read_file 精读或 edit_file 做节点事务；Rust 支持受限可见性函数和 impl/trait 方法，Dart 支持常见 Flutter 类型、构造器、getter 与函数。\n副作用：无（只读，使用增量持久索引）。\n返回：分页结构、v3 read_handle、游标、归属、行区间、coverage/staleness；关系过多时返回 relations_next_cursor。coverage 非完整时需结合 codebase_search、LSP 或精确路径补查。",
+    },
+    ToolSpec {
+        name: "repo_query",
+        desc: "统一代码检索入口：按查询形态自动路由到结构索引或全库混合检索，并标注命中的 source_layer。\n参数：{\"query\":\"<查询词、符号名或文件路径>\",\"mode\":\"<可选 auto|symbol|path|concept|impact，缺省 auto 自动判断>\",\"limit\":<可选返回条数，缺省 10>}。\n路由规则：含路径分隔符或文件扩展名 → lexical；单个标识符（函数/类名）→ 结构索引（LSP/SCIP/AST，返回 coverage/staleness）；impact → 修改影响面（精确图反向依赖：谁引用了/调用了该符号）；其余自然语言 → 全库混合检索。\n适合不熟悉项目结构时的第一步定位，避免在 search_symbols/codebase_search/grep 之间猜测；需要更细控制（按 role/kind 过滤、分页、关系翻页）时再直接用对应工具。\n副作用：无（只读）。\n返回：路由说明 + 对应工具的检索结果。",
+    },
+    ToolSpec {
+        name: "import_scip_index",
+        desc: "导入编译器生成的 SCIP 精确代码导航索引，把跨语言定义/引用接入全局结构图；适合百万级仓库避免逐文件全文读取。\n参数：{\"path\":\"<可选 SCIP 文件路径，缺省项目根 index.scip；必须位于项目目录内>\"}。\n导入按 document 流式读取且内存有界；新代次完整成功后才原子切换，文件变化时陈旧引用自动失效，重复导入未变化索引会直接复用。\n副作用：只更新 .deveco-agent 外部缓存目录中的结构索引，不修改项目源码。\n返回：文档、定义、引用、已解析引用及忽略文档数量。",
     },
     ToolSpec {
         name: "delete_file",
@@ -882,7 +908,7 @@ name: "ask_history",
     },
     ToolSpec {
         name: "multi_edit",
-        desc: "一次调用批量修改多个文件（单文件替换逻辑与 edit_file 一致：old→new、可选 replace_all、冲突保护、可撤销）。\n参数：{\"edits\":[{\"path\":\"<文件路径，相对项目根或绝对路径>\",\"old\":\"<原文>\",\"new\":\"<新文>\",\"replace_all\":<可选布尔>}]}。\n转义提示：old/new 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行，old 会匹配失败。\n单次最多 10 个文件；某项失败不影响其他项继续，返回逐项 ✅/❌ 汇总。\n适合跨多文件的重命名/统一修复/接口迁移等联动修改，减少工具调用轮次。\n副作用：修改项目内文件。\n返回：逐项替换结果汇总。",
+        desc: "一次调用批量修改多个文件（单文件替换逻辑与 edit_file 一致：old→new、可选 replace_all、冲突保护、可撤销）。\n参数：{\"edits\":[{\"path\":\"<文件路径，相对项目根或绝对路径>\",\"old\":\"<原文>\",\"new\":\"<新文>\",\"replace_all\":<可选布尔>}]}。\n转义提示：old/new 是 JSON 字符串，换行写 \\n；若要写入字面量「反斜杠+n」两个字符（如正则 [^\\n]*），必须写 \\\\n 双重转义，否则 JSON 解析后变成真实换行，old 会匹配失败。\n单次最多 10 个文件；先对全部文件做冲突、语法/配平和范围验证，任一项失败则整体拒绝且不写入；全部通过后原子提交，提交中途失败会回滚已写文件。\n适合跨多文件的重命名/统一修复/接口迁移等联动修改，减少工具调用轮次。\n副作用：修改项目内文件。\n返回：原子提交的逐文件替换结果汇总。",
     },
     ToolSpec {
         name: "device_perf",
@@ -896,6 +922,10 @@ name: "ask_history",
     ToolSpec {
         name: "tool_help",
         desc: "查某个工具的详细说明：完整描述 + 权限级别 + 执行预期（超时/重试/成本）+ 参数示例。\n参数：{\"name\":\"<工具名>\"}。\n适合：对某工具的参数、副作用、返回结构不确定时调用；不确定用法先 tool_help 而不是猜参数。\n副作用：无（只读）。\n返回：该工具完整说明。",
+    },
+    ToolSpec {
+        name: "search_tools",
+        desc: "按关键词/用途发现相关工具，而不是全量列出。\n参数：{\"query\":\"<用途/关键词/工具名>\",\"detail\":\"<可选 name|summary，缺省 summary>\",\"limit\":<可选返回条数，缺省 10>}。\n适合：知道想做什么但不确定工具名时；命中名称权重高于描述。\n副作用：无（只读注册表）。\n返回：按相关度排序的工具清单；某工具细节用 tool_help 查。",
     },
     ToolSpec {
         name: "tool_history",
@@ -1054,7 +1084,7 @@ name: "ask_history",
     },
     ToolSpec {
         name: "sandbox_exec",
-        desc: "危险命令干跑：在系统临时沙箱目录模拟执行（可先复制 source 目录进去），预览结果后再决定是否真执行。\n参数：{\"command\":\"<命令串>\",\"source\":\"<可选源目录，复制到沙箱后执行（限 50MB/200 文件）>\",\"mode\":\"simulate|preview（缺省 simulate）\",\"timeout_secs\":<可选，缺省 30>}。\nsimulate：有 source 时在沙箱内真执行（影响面仅沙箱），否则对命中危险模式的命令只做静态预览；preview：仅静态危险分析不执行。\n适合：rm -rf / git clean -f 等破坏性命令先看影响面、批量改名/重构前验证脚本行为。\n副作用：系统临时目录创建/删除文件（不影响项目）；preview 模式无任何副作用。\n返回：危险分析 + 沙箱执行输出与退出码。",
+        desc: "临时副本试运行（兼容工具名 sandbox_exec）：可把 source 复制到系统临时目录执行，预览结果后再决定是否在项目中执行。它不是 OS 级沙箱：子进程仍具有宿主用户权限，可能读取临时目录外文件或访问网络。\n参数：{\"command\":\"<命令串>\",\"source\":\"<simulate 必填的源目录，复制到临时目录后执行（限 50MB/200 文件）>\",\"mode\":\"simulate|preview（缺省 simulate）\",\"timeout_secs\":<可选，缺省 30>}。\nsimulate：有 source 时在临时副本中执行；未提供 source 时只返回预览且绝不执行。preview：仅静态危险分析不执行。\n适合：在副本中观察批量改名、重构脚本等对项目文件的影响；不得用于运行不可信代码或保护宿主凭据。\n副作用：simulate 命令在宿主机以当前用户权限运行，并可能创建/删除临时目录内文件；未提供 source 或 preview 模式无执行副作用。\n返回：危险分析、明确的隔离边界警告、执行输出与退出码。",
     },
     ToolSpec {
         name: "license_check",
@@ -1082,7 +1112,7 @@ name: "ask_history",
     },
     ToolSpec {
         name: "ota_pack",
-        desc: "基于 HAP 包制作 HarmonyOS OTA 升级包（.pkg），每次调用都必须显式审批，不能用项目/会话白名单跳过。\n参数：{\"hap_path\":\"<HAP 文件路径>\"（必填）,\"out_path\":\"<输出 .pkg 路径>\"（必填）,\"profile_path\":\"<可选签名 profile.json；审批展示与持久审计会脱敏>\"}。\n实现：调 java -jar packagingtool.jar --mode ota --hap <HAP> --out <pkg> --profile <profile> --force。\n前置：DevEco Studio 工具链或 Sdk Command-Line Tools（含 packagingtool.jar，PATH 或 HOS_PACKAGING_TOOL 环境变量）。\n副作用：写 .pkg 到 out_path；失败或中断后不得自动重放，需人工复验。\n返回：出包路径 + 大小 + 耗时 + stdout 摘要；失败时 stderr。",
+        desc: "基于 HAP 包制作 HarmonyOS OTA 升级包（.pkg），每次调用都必须显式审批，不能用项目/会话白名单跳过。\n参数：{\"hap_path\":\"<HAP 文件路径>\"（必填）,\"out_path\":\"<输出 .pkg 路径>\"（必填）,\"profile_path\":\"<可选签名 工作区内 profile.json；三个路径必须位于同一授权项目根，审批展示与持久审计会脱敏>\"}。\n实现：Host Capability Broker 内部发现受信任 packagingtool.jar，固定执行 java -jar packagingtool.jar --mode ota --hap <HAP> --out <pkg> --profile <profile> --force。\n前置：DevEco Studio 工具链或 Sdk Command-Line Tools（含 packagingtool.jar，HOS_PACKAGING_TOOL 环境变量）。\n副作用：在工作区内独占暂存目录生成全新非空普通文件，再以不覆盖方式发布 .pkg；out_path 必须不存在（含悬空符号链接），不支持覆盖旧包；失败或中断后不得自动重放，需人工复验。\n返回：出包路径 + 大小 + 耗时 + stdout 摘要；失败时 stderr。",
     },
 ];
 
@@ -1163,30 +1193,7 @@ pub async fn run_tool(
     }
     // 有效根：用户指明目录优先（按消息先后顺序），会话项目根兜底（去重）。
     // 文件工具相对路径按此顺序逐个尝试，绝对路径在任一有效根内放行。
-    let mut roots: Vec<String> = Vec::new();
-    for h in path_hints {
-        let h = h.trim();
-        if !h.is_empty() && !roots.iter().any(|r| r == h) {
-            roots.push(h.to_string());
-        }
-    }
-    if !project_path.trim().is_empty() {
-        // 会话项目根兜底：若项目配置/识别出"鸿蒙主工程"（混合工作区的子工程），
-        // 将其插入为第一个兜底根——Harmony 工具（构建/部署/依赖/对齐检查）取
-        // roots.first() 即自动落到鸿蒙工程上；未配置时鸿蒙根=项目根本身，去重不重复插入。
-        if !project_id.trim().is_empty() {
-            if let Ok(conn) = db.0.lock() {
-                if let Ok(info) = crate::commands::project::resolve_harmony_root(&conn, project_id, Some(project_path)) {
-                    if !info.root.is_empty() && !roots.iter().any(|r| r == &info.root) {
-                        roots.push(info.root);
-                    }
-                }
-            }
-        }
-        if !roots.iter().any(|r| r == project_path.trim()) {
-            roots.push(project_path.trim().to_string());
-        }
-    }
+    let roots = effective_tool_roots(db, project_id, project_path, path_hints);
     // 仅显式纯查询工具允许缓存；键包含有效根目录，避免同项目不同 worktree/path hint
     // 使用相同相对参数时串读。文件/设备/UI/状态类工具始终执行。
     if crate::services::permissions::is_cacheable(name) {
@@ -1197,16 +1204,16 @@ pub async fn run_tool(
     // 记录本工具启动时的停止代次；同批并行工具各自观察后续代次变化。
     let result = crate::agent::exec_ctx::scope_tool_session(ctx.conversation_id.clone(), stop_generation, async {
       match name {
-        "list_devices" => list_devices().await,
-        "connect_device" => device_tools::connect_device(&args).await,
-        "manage_hdc" => device_tools::manage_hdc(&args, db).await,
-        "list_emulators" => device_tools::list_emulators().await,
-        "start_emulator" => device_tools::start_emulator(&args).await,
-        "create_emulator" => device_tools::create_emulator(&args).await,
-        "device_file" => device_tools::device_file(&args, &roots).await,
-        "stop_app" => device_tools::stop_app(&args, &roots).await,
-        "device_shell" => device_tools::device_shell(&args).await,
-        "analyze_crash" => device_tools::analyze_crash(&args, &roots).await,
+        "list_devices" => list_devices(ctx).await,
+        "connect_device" => device_tools::connect_device(&args, ctx).await,
+        "manage_hdc" => device_tools::manage_hdc(&args, db, ctx).await,
+        "list_emulators" => device_tools::list_emulators(ctx).await,
+        "start_emulator" => device_tools::start_emulator(&args, ctx).await,
+        "create_emulator" => device_tools::create_emulator(&args, ctx).await,
+        "device_file" => device_tools::device_file(&args, &roots, ctx).await,
+        "stop_app" => device_tools::stop_app(&args, &roots, ctx).await,
+        "device_shell" => device_tools::device_shell(&args, ctx).await,
+        "analyze_crash" => device_tools::analyze_crash(&args, &roots, ctx).await,
         "ohpm_search" => build_tools::ohpm_search(&args, &roots, db).await,
         "ohpm_recommend" => build_tools::ohpm_recommend(&args, db).await,
         "build_project" => build_tools::build_project(&args, &roots, ctx, project_id).await,
@@ -1248,45 +1255,45 @@ pub async fn run_tool(
         "flaky_test_detect" => test_tools::flaky_test_detect(&args, &roots).await,
         "smoke_test" => compose_tools::smoke_test(&args, project_path, path_hints, project_id, db, mcp, ctx).await,
         "compose" => compose_tools::compose(&args, project_path, path_hints, project_id, db, mcp, ctx).await,
-        "read_logcat" => test_tools::read_logcat(&args).await,
+        "read_logcat" => test_tools::read_logcat(&args, ctx).await,
         "read_runtime_logs" => test_tools::read_runtime_logs(&args, &roots, ctx).await,
         "web_fetch" => test_tools::web_fetch(&args).await,
-        "take_screenshot" => take_screenshot(&args, &roots).await,
+        "take_screenshot" => take_screenshot(&args, &roots, ctx).await,
         "view_image" => doc_tools::view_image(&args, &roots).await,
-        "verify_ui" => verify_ui(&args, &roots).await,
-        "collect_perf" => collect_perf(&args, &roots).await,
+        "verify_ui" => verify_ui(&args, &roots, ctx).await,
+        "collect_perf" => collect_perf(&args, &roots, ctx).await,
         "deploy_all" => build_tools::deploy_all(&args, &roots, ctx, project_id).await,
         "write_unit_tests" => test_tools::write_unit_tests(&args, &roots).await,
         "run_ui_flow" => test_tools::run_ui_flow(&args, &roots, ctx).await,
         "run_perf_benchmark" => ui_tools::run_perf_benchmark(&args, &roots, ctx).await,
-        "dump_ui_hierarchy" => ui_tools::dump_ui_hierarchy(&args, &roots).await,
-        "ui_locator" => ui_tools::ui_locator(&args, &roots).await,
+        "dump_ui_hierarchy" => ui_tools::dump_ui_hierarchy(&args, &roots, ctx).await,
+        "ui_locator" => ui_tools::ui_locator(&args, &roots, ctx).await,
         "start_ability" => ui_tools::start_ability(&args, &roots, ctx).await,
-        "clear_app_data" => ui_tools::clear_app_data(&args, &roots).await,
-        "dump_memory" => ui_tools::dump_memory(&args, &roots).await,
-        "memory_snapshot" => quality_tools::memory_snapshot(&args, &roots).await,
-        "get_installed_apps" => ui_tools::get_installed_apps(&args, &roots).await,
-        "get_app_info" => ui_tools::get_app_info(&args, &roots).await,
-        "uninstall_app" => ui_tools::uninstall_app(&args, &roots).await,
+        "clear_app_data" => ui_tools::clear_app_data(&args, &roots, ctx).await,
+        "dump_memory" => ui_tools::dump_memory(&args, &roots, ctx).await,
+        "memory_snapshot" => quality_tools::memory_snapshot(&args, &roots, ctx).await,
+        "get_installed_apps" => ui_tools::get_installed_apps(&args, &roots, ctx).await,
+        "get_app_info" => ui_tools::get_app_info(&args, &roots, ctx).await,
+        "uninstall_app" => ui_tools::uninstall_app(&args, &roots, ctx).await,
         "grant_permission" => ui_tools::grant_permission(&args, &roots, ctx).await,
-        "set_wifi_state" => ui_tools::set_wifi_state(&args, &roots).await,
-        "set_airplane_mode" => ui_tools::set_airplane_mode(&args, &roots).await,
-        "screen_record" => ui_tools::screen_record(&args, &roots).await,
-        "record_ui" => ui_tools::record_ui(&args, &roots).await,
-        "replay_ui" => ui_tools::replay_ui(&args, &roots).await,
-        "gesture_perform" => ui_tools::gesture_perform(&args, &roots).await,
+        "set_wifi_state" => ui_tools::set_wifi_state(&args, &roots, ctx).await,
+        "set_airplane_mode" => ui_tools::set_airplane_mode(&args, &roots, ctx).await,
+        "screen_record" => ui_tools::screen_record(&args, &roots, ctx).await,
+        "record_ui" => ui_tools::record_ui(&args, &roots, ctx).await,
+        "replay_ui" => ui_tools::replay_ui(&args, &roots, ctx).await,
+        "gesture_perform" => ui_tools::gesture_perform(&args, &roots, ctx).await,
         "analyze_hap_size" => ui_tools::analyze_hap_size(&args, &roots).await,
         "size_diff" => ui_tools::size_diff(&args, &roots),
         "screenshot_diff" => ui_tools::screenshot_diff(&args, &roots).await,
-        "search_hilog" => debug_tools::search_hilog(&args, &roots).await,
+        "search_hilog" => debug_tools::search_hilog(&args, &roots, ctx).await,
         "log_query" => quality_tools::log_query(&args, &roots, ctx).await,
         "run_lint" => debug_tools::run_lint(&args, &roots).await,
         "set_network_condition" => debug_tools::set_network_condition(&args, &roots, ctx).await,
-        "check_signature" => debug_tools::check_signature(&args, &roots).await,
-        "diagnose_signing" => build_tools::diagnose_signing(&args, &roots).await,
-        "dump_battery" => debug_tools::dump_battery(&args, &roots).await,
+        "check_signature" => debug_tools::check_signature(&args, &roots, ctx).await,
+        "diagnose_signing" => build_tools::diagnose_signing(&args, &roots, ctx).await,
+        "dump_battery" => debug_tools::dump_battery(&args, &roots, ctx).await,
         "scan_api_compat" => debug_tools::scan_api_compat(&args, &roots, db).await,
-        "auto_explore" => explore_tools::auto_explore(&args, &roots).await,
+        "auto_explore" => explore_tools::auto_explore(&args, &roots, ctx).await,
         "refresh_api_db" => explore_tools::refresh_api_db(db, ctx).await,
         "search_api" => explore_tools::search_api(&args, &roots, db).await,
         "refresh_api_details" => explore_tools::refresh_api_details(db, ctx).await,
@@ -1311,6 +1318,8 @@ pub async fn run_tool(
         "read_module_config" => read_module_config(&args, &roots).await,
         "get_build_log" => get_build_log(&args, &roots).await,
         "search_symbols" => search_symbols_tool(&args, &roots).await,
+        "repo_query" => repo_query_tool(&args, &roots).await,
+        "import_scip_index" => import_scip_index_tool(&args, &roots).await,
         "delete_file" => fs_tools::delete_file(&args, &roots).await,
         "git_stash" => git_tools::git_stash(&args, &roots).await,
         "move_file" => fs_tools::move_file(&args, &roots).await,
@@ -1354,13 +1363,14 @@ pub async fn run_tool(
         "lsp_hover" => crate::agent::lsp_client::lsp_hover(&args, &roots, &ctx.conversation_id).await,
         "lsp_diagnostics" => crate::agent::lsp_client::lsp_diagnostics(&args, &roots, &ctx.conversation_id).await,
         "debug_probe" => debug_tools::debug_probe(&args, &roots, ctx).await,
-        "stack_dump" => debug_tools::stack_dump(&args, &roots).await,
+        "stack_dump" => debug_tools::stack_dump(&args, &roots, ctx).await,
         "http_request" => cmd_tools::http_request(&args, &roots).await,
         "multi_edit" => fs_tools::multi_edit(&args, &roots, &ctx.conversation_id).await,
-        "device_perf" => cmd_tools::device_perf(&args).await,
+        "device_perf" => cmd_tools::device_perf(&args, ctx).await,
         // ---- 工具自我管理域（meta_tools）----
         "tool_list" => meta_tools::tool_list(&args, &roots).await,
         "tool_help" => meta_tools::tool_help(&args, &roots).await,
+        "search_tools" => meta_tools::search_tools(&args, &roots).await,
         "tool_history" => meta_tools::tool_history(&args, &roots, &ctx.conversation_id, db).await,
         "db_query" => meta_tools::db_query(&args, &roots, db).await,
         "share_session" => meta_tools::share_session(&args, &roots, &ctx.conversation_id, db).await,
@@ -1406,9 +1416,9 @@ pub async fn run_tool(
         "vuln_scan" => quality_tools::vuln_scan(&args, &roots).await,
         "docx_read" => quality_tools::docx_read(&args, &roots).await,
         "audio_transcribe" => quality_tools::audio_transcribe(&args, &roots).await,
-        "attach_debugger" => quality_tools::attach_debugger(&args, &roots).await,
-        "step_debug" => quality_tools::step_debug(&args, &roots).await,
-        "ota_pack" => quality_tools::ota_pack(&args, &roots).await,
+        "attach_debugger" => quality_tools::attach_debugger(&args, &roots, ctx).await,
+        "step_debug" => quality_tools::step_debug(&args, &roots, ctx).await,
+        "ota_pack" => quality_tools::ota_pack(&args, &roots, ctx).await,
         other => Err(format!("未知工具: {other}")),
       }
     }).await;
@@ -1650,10 +1660,33 @@ async fn run_in_project(project_path: &str, prog: &str, args: &[String], timeout
 
 // ---------- 具体工具 ----------
 
-async fn list_devices() -> Result<String, String> {
-    // 复用前端设备面板的结构化查询（含型号/系统版本/在线状态/默认标记），
-    // 比裸 hdc list targets 信息更丰富，便于 Agent 决定部署目标
-    match crate::commands::devices::list_devices().await {
+async fn brokered_device_targets(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let capability = crate::agent::capability_broker::HostCapability::HdcListTargets;
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
+        .await
+        .map_err(|error| with_advice("list_devices", error))?;
+    if !output.status.success() {
+        return Err(with_advice(
+            "list_devices",
+            (smart_decode(&output.stdout) + &smart_decode(&output.stderr)).trim().to_string(),
+        ));
+    }
+    Ok(smart_decode(&output.stdout))
+}
+
+async fn brokered_device_snapshot(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<Vec<crate::commands::devices::DeviceInfo>, String> {
+    let targets = brokered_device_targets(ctx).await?;
+    crate::commands::devices::list_devices_from_targets_brokered(&targets, ctx).await
+}
+
+async fn list_devices(ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
+    // 复用前端设备面板的结构化快照，但 targets 和所有属性富化均使用
+    // 当前 Agent Run 的 Broker 身份，避免公共模块间接退回裸 hdc。
+    match brokered_device_snapshot(ctx).await {
         Ok(devs) if devs.is_empty() => Ok(
             "未检测到已连接设备。请用 USB 连接设备/启动模拟器并开启开发者模式；可调用 start_hdc_service 启动 hdc 服务后重试。".to_string(),
         ),
@@ -1838,28 +1871,13 @@ fn default_device_file() -> Option<std::path::PathBuf> {
 }
 
 /// 选取默认设备：优先持久化记忆且在线的设备，否则第一个在线设备
-async fn default_device_id() -> Result<String, String> {
-    let devices = crate::commands::devices::list_devices()
+async fn default_device_id(
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let targets = brokered_device_targets(ctx)
         .await
         .map_err(|e| format!("hdc 不可用: {}", with_advice("list_devices", e)))?;
-    let online: Vec<_> = devices
-        .iter()
-        .filter(|device| device.connection == "online" && device.authorized)
-        .collect();
-    if online.is_empty() {
-        return Err("未检测到已授权在线设备，请连接设备并确认调试授权".into());
-    }
-    if let Some(default) = online.iter().find(|device| device.is_default) {
-        return Ok(default.id.clone());
-    }
-    Ok(online[0].id.clone())
-}
-
-/// 在指定设备上执行 `hdc -t <device> shell <args...>`
-async fn run_hdc_shell(device: &str, args: &[&str], timeout: u64) -> Result<String, String> {
-    let mut full = vec!["-t".to_string(), device.to_string(), "shell".to_string()];
-    full.extend(args.iter().map(|s| s.to_string()));
-    run_cmd("hdc", &full, None, timeout).await
+    crate::commands::devices::select_default_device_from_targets(&targets)
 }
 
 /// hdc shell 命令输出是否失败：hdc 的 shell 子命令失败时 exit code 仍为 0，
@@ -1870,16 +1888,20 @@ fn hdc_shell_failed(out: &str) -> bool {
 }
 
 /// take_screenshot：截取设备屏幕保存到项目内
-async fn take_screenshot(args: &Value, roots: &[String]) -> Result<String, String> {
+async fn take_screenshot(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法保存截图".into());
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
-    let (local, _) = capture_screenshot(project_path, &device).await?;
+    let (local, _) = capture_screenshot(project_path, &device, ctx).await?;
     Ok(format!(
         "截图已保存: {}\n（设备 {device}）\n[VISION_IMAGE: {}]",
         local.display(),
@@ -1888,27 +1910,15 @@ async fn take_screenshot(args: &Value, roots: &[String]) -> Result<String, Strin
 }
 
 /// 在设备上截图并拉取到项目截图目录，返回本地路径与设备序列号。
-async fn capture_screenshot(project_path: &str, device: &str) -> Result<(PathBuf, String), String> {
+async fn capture_screenshot(
+    project_path: &str,
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(PathBuf, String), String> {
     // 设备端截图：snapshot_display（鸿蒙标准，-t png 显式输出真 PNG 供 verify_ui 质检）
     // → 失败回退 screencap（AOSP）。路径用 /data/local/tmp（部分鸿蒙设备没有 /sdcard，
     // 且 snapshot_display 按后缀推断格式）；失败判断用文本特征（hdc shell 失败时 exit 仍为 0）。
-    let remote = "/data/local/tmp/deveco_agent_shot.png";
-    let shot = run_hdc_shell(device, &["snapshot_display", "-t", "png", "-f", remote], 30)
-        .await
-        .unwrap_or_default();
-    if hdc_shell_failed(&shot) {
-        let shot2 = run_hdc_shell(device, &["screencap", "-p", remote], 30)
-            .await
-            .unwrap_or_default();
-        if hdc_shell_failed(&shot2) {
-            return Err(format!(
-                "设备截图失败：{}",
-                shot.lines().next().unwrap_or("未知错误")
-            ));
-        }
-    }
-    let dir = Path::new(project_path).join(".deveco-agent").join("screenshots");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let (workspace, dir) = ensure_workspace_subdir(project_path, ".deveco-agent/screenshots")?;
     // 文件名：毫秒时间戳 + 设备号（清洗非字母数字字符）。
     // 必须含设备号：deploy_all 多设备并行/逐台验证时，同秒截图不含设备号会互相覆盖；
     // 时间戳精确到毫秒：同设备连续截图（run_ui_flow 验证 + 随后 verify_ui）间隔小于 1 秒时也会撞名。
@@ -1918,42 +1928,255 @@ async fn capture_screenshot(project_path: &str, device: &str) -> Result<(PathBuf
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let remote = format!("/data/local/tmp/deveco_agent_shot_{nonce}.png");
     let local = dir.join(format!("shot-{ts}-{dev_safe}.png"));
-    let pull = run_cmd(
-        "hdc",
-        &[
-            "-t".to_string(),
-            device.to_string(),
-            "file".to_string(),
-            "recv".to_string(),
-            remote.to_string(),
-            local.to_string_lossy().to_string(),
-        ],
-        None,
-        60,
-    )
-    .await
-    .map_err(|e| with_advice("take_screenshot", e))?;
-    if !local.exists() || std::fs::metadata(&local).map(|m| m.len() == 0).unwrap_or(true) {
-        return Err(format!("截图拉取失败：{pull}"));
+    let snapshot = crate::agent::capability_broker::HostCapability::CaptureDeviceScreenshot {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+        backend: crate::agent::capability_broker::DeviceScreenshotBackend::SnapshotDisplay,
+    };
+    let first = crate::agent::capability_broker::execute_host_capability(&snapshot, None, ctx).await;
+    let first_error = match first {
+        Ok(output) if output.status.success() && !hdc_shell_failed(&host_output_text(&output)) => {
+            None
+        }
+        Ok(output) => Some(host_output_text(&output)),
+        Err(error) => Some(error),
+    };
+    let capture_error = if let Some(first_error) = first_error {
+        let fallback = crate::agent::capability_broker::HostCapability::CaptureDeviceScreenshot {
+            device: device.to_string(),
+            remote_path: remote.clone(),
+            backend: crate::agent::capability_broker::DeviceScreenshotBackend::Screencap,
+        };
+        match crate::agent::capability_broker::execute_host_capability(&fallback, None, ctx).await {
+            Ok(output) => {
+                let text = host_output_text(&output);
+                if output.status.success() && !hdc_shell_failed(&text) {
+                    None
+                } else {
+                    Some(format!(
+                        "snapshot_display: {}；screencap: {}",
+                        first_line_or_unknown(&first_error),
+                        first_line_or_unknown(&text),
+                    ))
+                }
+            }
+            Err(error) => Some(format!(
+                "snapshot_display: {}；screencap: {error}",
+                first_line_or_unknown(&first_error),
+            )),
+        }
+    } else {
+        None
+    };
+    if let Some(error) = capture_error {
+        let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+            device: device.to_string(),
+            remote_path: remote,
+        };
+        let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+        return Err(format!("设备截图失败：{error}"));
     }
-    // 清理设备端临时文件，避免多次截图累积
-    let _ = run_hdc_shell(device, &["rm", remote], 10).await;
+    let relative = local
+        .strip_prefix(&workspace)
+        .map_err(|_| "截图目标越出项目工作区")?
+        .to_string_lossy()
+        .into_owned();
+    let receive = crate::agent::capability_broker::HostCapability::ReceiveFile {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+        local_path: relative,
+    };
+    let pull = crate::agent::capability_broker::execute_host_capability(
+        &receive,
+        Some(&workspace),
+        ctx,
+    )
+    .await;
+    let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+        device: device.to_string(),
+        remote_path: remote,
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+    let pull = pull.map_err(|error| with_advice("take_screenshot", error))?;
+    let pull_text = host_output_text(&pull);
+    if !pull.status.success() || hdc_shell_failed(&pull_text) {
+        return Err(format!("截图拉取失败：{pull_text}"));
+    }
+    if !local.exists() || std::fs::metadata(&local).map(|m| m.len() == 0).unwrap_or(true) {
+        return Err(format!("截图拉取失败：{pull_text}"));
+    }
     Ok((local, device.to_string()))
 }
 
+fn host_output_text(output: &std::process::Output) -> String {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    text
+}
+
+fn first_line_or_unknown(text: &str) -> &str {
+    text.lines().find(|line| !line.trim().is_empty()).unwrap_or("未知错误")
+}
+
+fn ensure_workspace_subdir(project_path: &str, relative: &str) -> Result<(PathBuf, PathBuf), String> {
+    let root = Path::new(project_path)
+        .canonicalize()
+        .map_err(|error| format!("无法解析项目工作区：{error}"))?;
+    let requested = root.join(relative);
+    let mut existing = requested.as_path();
+    while !existing.exists() {
+        existing = existing.parent().ok_or("输出目录缺少已有父目录")?;
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| format!("无法解析输出目录父级：{error}"))?;
+    if !canonical_existing.starts_with(&root) {
+        return Err("输出目录通过符号链接逃逸项目工作区".into());
+    }
+    std::fs::create_dir_all(&requested).map_err(|error| format!("创建输出目录失败：{error}"))?;
+    let directory = requested
+        .canonicalize()
+        .map_err(|error| format!("无法解析输出目录：{error}"))?;
+    if !directory.starts_with(&root) || !directory.is_dir() {
+        return Err("输出目录必须位于项目工作区内".into());
+    }
+    Ok((root, directory))
+}
+
+async fn capture_ui_layout_file(
+    workspace: &Path,
+    device: &str,
+    local: &Path,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let relative = local
+        .strip_prefix(workspace)
+        .map_err(|_| "UI 树目标越出项目工作区")?
+        .to_string_lossy()
+        .into_owned();
+    let remote = format!(
+        "/data/local/tmp/deveco_agent_layout_{}.json",
+        uuid::Uuid::new_v4().simple(),
+    );
+    let dump = crate::agent::capability_broker::HostCapability::DumpUiLayout {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+    };
+    let dump_result = crate::agent::capability_broker::execute_host_capability(&dump, None, ctx).await;
+    let dump_error = match dump_result {
+        Ok(output) => {
+            let text = host_output_text(&output);
+            (!output.status.success() || hdc_shell_failed(&text))
+                .then(|| format!("控件树导出失败：{}", first_line_or_unknown(&text)))
+        }
+        Err(error) => Some(format!("控件树导出失败：{error}")),
+    };
+    if let Some(error) = dump_error {
+        let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+            device: device.to_string(),
+            remote_path: remote,
+        };
+        let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+        return Err(error);
+    }
+    let receive = crate::agent::capability_broker::HostCapability::ReceiveFile {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+        local_path: relative,
+    };
+    let result = crate::agent::capability_broker::execute_host_capability(
+        &receive,
+        Some(workspace),
+        ctx,
+    )
+    .await;
+    let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+        device: device.to_string(),
+        remote_path: remote,
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+    let output = result.map_err(|error| format!("拉取控件树文件失败：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("拉取控件树文件失败：{}", first_line_or_unknown(&text)));
+    }
+    if !local.is_file() || std::fs::metadata(local).map(|meta| meta.len() == 0).unwrap_or(true) {
+        return Err("拉取控件树文件失败：本地文件不存在或为空".into());
+    }
+    std::fs::read_to_string(local).map_err(|error| format!("读取控件树文件失败：{error}"))
+}
+
+async fn cleanup_managed_device_file(
+    device: &str,
+    remote: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) {
+    let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+        device: device.to_string(),
+        remote_path: remote.to_string(),
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
+}
+
+async fn receive_managed_device_file(
+    workspace: &Path,
+    device: &str,
+    remote: &str,
+    local: &Path,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(), String> {
+    let relative = local
+        .strip_prefix(workspace)
+        .map_err(|_| "设备证据目标越出项目工作区")?
+        .to_string_lossy()
+        .into_owned();
+    let receive = crate::agent::capability_broker::HostCapability::ReceiveFile {
+        device: device.to_string(),
+        remote_path: remote.to_string(),
+        local_path: relative,
+    };
+    let result = crate::agent::capability_broker::execute_host_capability(
+        &receive,
+        Some(workspace),
+        ctx,
+    )
+    .await;
+    cleanup_managed_device_file(device, remote, ctx).await;
+    let output = result.map_err(|error| format!("拉取设备证据失败：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("拉取设备证据失败：{}", first_line_or_unknown(&text)));
+    }
+    if !local.is_file() || std::fs::metadata(local).map(|meta| meta.len() == 0).unwrap_or(true) {
+        return Err("拉取设备证据失败：本地文件不存在或为空".into());
+    }
+    Ok(())
+}
+
 /// verify_ui：截图 + 自动质检（黑屏/白屏/异常纯色），返回结论与截图路径供多模态查看。
-async fn verify_ui(args: &Value, roots: &[String]) -> Result<String, String> {
+async fn verify_ui(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法截图验证".into());
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let expect = args["expect"].as_str().unwrap_or("");
-    let (local, _) = capture_screenshot(project_path, &device).await?;
+    let (local, _) = capture_screenshot(project_path, &device, ctx).await?;
 
     let bytes = std::fs::read(&local).map_err(|e| format!("读取截图失败: {e}"))?;
     let mut report = String::new();
@@ -1987,14 +2210,18 @@ async fn verify_ui(args: &Value, roots: &[String]) -> Result<String, String> {
 }
 
 /// collect_perf：采集应用进程级与系统级性能指标，多次采样并标注异常。
-async fn collect_perf(args: &Value, roots: &[String]) -> Result<String, String> {
+async fn collect_perf(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法采集性能".into());
     }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let bundle = match args["package"].as_str() {
         Some(p) => p.to_string(),
@@ -2018,21 +2245,21 @@ async fn collect_perf(args: &Value, roots: &[String]) -> Result<String, String> 
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         // 系统 CPU（两次 /proc/stat）
-        if let Ok(c) = sample_cpu(&device).await {
+        if let Ok(c) = sample_cpu(&device, ctx).await {
             cpu_vals.push(c);
         }
         // 系统内存
-        if let Ok(m) = sample_sys_mem(&device).await {
+        if let Ok(m) = sample_sys_mem(&device, ctx).await {
             mem_vals.push(m);
         }
         // 温度
-        if let Ok(t) = sample_temp(&device).await {
+        if let Ok(t) = sample_temp(&device, ctx).await {
             temp_vals.push(t);
         }
         // 应用进程内存/CPU（top -b -n 1 -p <pid>）
         if !bundle.is_empty() {
-            if let Ok(pid) = pid_of(&device, &bundle).await {
-                if let Ok((pcpu, pss_mb)) = sample_proc(&device, &pid).await {
+            if let Ok(pid) = pid_of(&device, &bundle, ctx).await {
+                if let Ok((pcpu, pss_mb)) = sample_proc(&device, &pid, ctx).await {
                     proc_cpu_vals.push(pcpu);
                     pss_vals.push(pss_mb);
                 }
@@ -2116,13 +2343,45 @@ fn mean(vals: &[f64]) -> f64 {
     vals.iter().sum::<f64>() / vals.len() as f64
 }
 
-async fn pid_of(device: &str, bundle: &str) -> Result<String, String> {
-    let out = run_hdc_shell(device, &["pidof", bundle], 15).await?;
+async fn execute_perf_query(
+    device: &str,
+    argv: Vec<String>,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv,
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&query, None, ctx).await?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("设备性能查询失败：{}", first_line_or_unknown(&text)));
+    }
+    Ok(text)
+}
+
+async fn pid_of(
+    device: &str,
+    bundle: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let query = crate::agent::capability_broker::HostCapability::DevicePidof {
+        device: device.to_string(),
+        bundle: bundle.to_string(),
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&query, None, ctx).await?;
+    let out = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&out) {
+        return Err(format!("查询应用进程失败：{}", first_line_or_unknown(&out)));
+    }
     out.split_whitespace().next().map(|s| s.to_string()).ok_or_else(|| "no pid".to_string())
 }
 
-async fn sample_cpu(device: &str) -> Result<f64, String> {
-    let read = || run_hdc_shell(device, &["cat", "/proc/stat"], 15);
+async fn sample_cpu(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let read = || execute_perf_query(device, vec!["cat".into(), "/proc/stat".into()], ctx);
     let a = read().await?;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let b = read().await?;
@@ -2141,8 +2400,11 @@ async fn sample_cpu(device: &str) -> Result<f64, String> {
     Ok(((dt - di) / dt * 100.0).clamp(0.0, 100.0))
 }
 
-async fn sample_sys_mem(device: &str) -> Result<f64, String> {
-    let out = run_hdc_shell(device, &["cat", "/proc/meminfo"], 15).await?;
+async fn sample_sys_mem(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let out = execute_perf_query(device, vec!["cat".into(), "/proc/meminfo".into()], ctx).await?;
     let mut total = 0u64;
     let mut avail = 0u64;
     for line in out.lines() {
@@ -2157,10 +2419,13 @@ async fn sample_sys_mem(device: &str) -> Result<f64, String> {
     Ok((1.0 - avail as f64 / total as f64) * 100.0)
 }
 
-async fn sample_temp(device: &str) -> Result<f64, String> {
+async fn sample_temp(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
     for i in 0..4 {
         let path = format!("/sys/class/thermal/thermal_zone{i}/temp");
-        if let Ok(v) = run_hdc_shell(device, &["cat", &path], 10).await {
+        if let Ok(v) = execute_perf_query(device, vec!["cat".into(), path], ctx).await {
             if let Ok(t) = v.trim().parse::<f64>() {
                 return Ok(if t > 1000.0 { t / 1000.0 } else { t });
             }
@@ -2170,9 +2435,25 @@ async fn sample_temp(device: &str) -> Result<f64, String> {
 }
 
 /// 采样单个进程的 CPU% 与 PSS(MB)。优先 hidumper，回退 top -b -n 1。
-async fn sample_proc(device: &str, pid: &str) -> Result<(f64, f64), String> {
+async fn sample_proc(
+    device: &str,
+    pid: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(f64, f64), String> {
     // 先用 top -b -n 1 -p <pid>，输出含 CPU% 和 RSS
-    let out = run_hdc_shell(device, &["top", "-b", "-n", "1", "-p", pid], 20).await?;
+    let out = execute_perf_query(
+        device,
+        vec![
+            "top".into(),
+            "-b".into(),
+            "-n".into(),
+            "1".into(),
+            "-p".into(),
+            pid.into(),
+        ],
+        ctx,
+    )
+    .await?;
     let mut cpu = 0.0f64;
     let mut rss_kb = 0u64;
     for line in out.lines() {
@@ -3040,23 +3321,11 @@ async fn run_app(args: &Value, roots: &[String]) -> Result<String, String> {
 ///
 /// device_file：电脑与设备之间传输文件（hdc file send/recv，即 push/pull）。
 ///
-/// 解析本地路径：绝对路径直接使用，相对路径基于工程根。
+/// 解析本地路径；公开工具入口只接受相对路径，并在执行前校验 canonical 工作区边界。
 ///
 /// stop_app：强制停止设备上运行的应用进程（aa force-stop）。
 ///
 /// device_shell 白名单：仅允许只读/查询类命令；破坏性命令一律拒绝。
-const DEVICE_SHELL_ALLOWED: &[&str] = &[
-    "ps", "ls", "cat", "df", "free", "uptime", "date", "top", "netstat", "ip",
-    "ifconfig", "getprop", "param", "pwd", "dmesg", "echo", "hidumper",
-    // aa/bm 不在下方校验 4 中限定为仅 dump 查询（否则校验 2 会直接拒绝）
-    "aa", "bm",
-];
-const DEVICE_SHELL_FORBIDDEN_TOKENS: &[&str] = &[
-    "rm", "mv", "cp", "kill", "pkill", "reboot", "shutdown", "mount", "umount",
-    "chmod", "chown", "mkfs", "wipe", "flash", "format", "dd", "sed", "awk", "su",
-    "install",
-];
-
 /// 校验设备 shell 命令是否安全（四重校验），通过后返回分词结果。
 /// ① 字符集白名单（拒绝 shell 元字符）② 首命令白名单 ③ 破坏性命令词拦截 ④ aa/bm 仅允许 dump 查询。
 ///
@@ -3613,6 +3882,151 @@ async fn read_module_config(args: &Value, roots: &[String]) -> Result<String, St
     Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
 }
 
+/// `repo_query` 的 auto 路由分类：把查询词归到 path/symbol/concept 三类之一，
+/// 让模型不必在 grep_files/codebase_search/search_symbols 之间手工猜测。
+fn classify_repo_query(query: &str) -> &'static str {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return "concept";
+    }
+    let looks_like_path = trimmed.contains('/')
+        || trimmed.contains('\\')
+        || [
+            ".ts", ".tsx", ".ets", ".js", ".jsx", ".json5", ".json", ".rs", ".dart", ".py", ".kt", ".java",
+            ".cpp", ".c", ".h", ".hpp",
+        ]
+        .iter()
+        .any(|ext| trimmed.ends_with(ext));
+    if looks_like_path {
+        return "path";
+    }
+    let is_identifier = !trimmed.contains(char::is_whitespace)
+        && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$');
+    if is_identifier {
+        "symbol"
+    } else {
+        "concept"
+    }
+}
+
+/// 反向依赖边：target 命中给定符号的边（即“谁引用了/调用了这些符号”），供影响面分析。
+fn incoming_relation_edges<'a>(
+    relations: &'a [crate::services::symbol_index::StructureEdge],
+    symbols: &[crate::services::symbol_index::Symbol],
+) -> Vec<&'a crate::services::symbol_index::StructureEdge> {
+    relations
+        .iter()
+        .filter(|edge| {
+            symbols.iter().any(|sym| {
+                sym.file == edge.target_file
+                    && sym.name == edge.target_name
+                    && sym.line == edge.target_line
+            })
+        })
+        .collect()
+}
+
+/// 测试映射：按主流约定（`*.test.*`、`*.spec.*`、`__tests__/`、`test/`）给出源文件的候选测试文件。
+fn candidate_test_files(file: &str) -> Vec<String> {
+    let path = Path::new(file);
+    let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let base = |name: &str| {
+        if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        }
+    };
+    let mut out = vec![
+        base(&format!("{stem}.test.{ext}")),
+        base(&format!("{stem}.spec.{ext}")),
+        if parent.is_empty() {
+            format!("__tests__/{stem}.{ext}")
+        } else {
+            format!("{parent}/__tests__/{stem}.{ext}")
+        },
+        format!("test/{stem}.{ext}"),
+    ];
+    out.sort();
+    out.dedup();
+    out
+}
+
+async fn repo_query_tool(args: &Value, roots: &[String]) -> Result<String, String> {
+    let query = args["query"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("repo_query 需要参数 {\"query\":\"<查询词、符号名或文件路径>\"}")?;
+    let mode = args["mode"].as_str().unwrap_or("auto");
+    let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 50);
+    let routed = match mode {
+        "auto" => classify_repo_query(query),
+        "symbol" | "path" | "concept" | "impact" => mode,
+        other => return Err(format!("repo_query mode 仅支持 auto|symbol|path|concept|impact，收到 {other}")),
+    };
+    let delegate = serde_json::json!({ "query": query, "limit": limit });
+    match routed {
+        "impact" => {
+            let project_path = roots.first().map(String::as_str).unwrap_or("");
+            if project_path.is_empty() {
+                return Err("当前会话未绑定项目目录".into());
+            }
+            let root = Path::new(project_path).to_path_buf();
+            let result = crate::services::symbol_index::query_structure(
+                &root, query, None, None, None, 1, 50,
+            );
+            let incoming = incoming_relation_edges(&result.relations, &result.items);
+            if incoming.is_empty() {
+                return Ok(format!(
+                    "修改影响面：精确语义图（SCIP/LSP/AST）中没有引用/调用 \"{query}\" 的反向依赖。"
+                ));
+            }
+            let mut out = format!("修改影响面：{} 处引用/调用 \"{query}\"（改动会波及，source_layer 精确图）：\n", incoming.len());
+            for edge in incoming.iter().take(limit as usize) {
+                out.push_str(&format!(
+                    "- {} ({}:{}) → {}\n",
+                    edge.source_name, edge.source_file, edge.source_line, edge.kind
+                ));
+            }
+            if result.relations_truncated {
+                out.push_str("（关系超过单次上限，结果可能不完整）\n");
+            }
+            // 测试映射：给出源文件对应的候选测试文件（主流命名约定）。
+            let mut test_files = Vec::new();
+            for sym in &result.items {
+                test_files.extend(candidate_test_files(&sym.file));
+            }
+            test_files.sort();
+            test_files.dedup();
+            if !test_files.is_empty() {
+                out.push_str(&format!("\n相关测试文件（候选 {} 个，命中与否以实际存在为准）：\n", test_files.len()));
+                for file in test_files.iter().take(limit as usize) {
+                    out.push_str(&format!("- {file}\n"));
+                }
+            }
+            Ok(out)
+        }
+        "symbol" => {
+            let inner = search_symbols_tool(&delegate, roots).await?;
+            Ok(format!(
+                "repo_query 路由 → 结构索引（source_layer=ast/lsp/scip，附 coverage/staleness）：\n{inner}"
+            ))
+        }
+        _ => {
+            let inner = cmd_tools::codebase_search_tool(&delegate, roots).await?;
+            Ok(format!(
+                "repo_query 路由 → 全库混合检索（source_layer=lexical，路径/内容/符号名匹配）：\n{inner}"
+            ))
+        }
+    }
+}
 
 async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
@@ -3622,24 +4036,201 @@ async fn search_symbols_tool(args: &Value, roots: &[String]) -> Result<String, S
     let root = Path::new(project_path).to_path_buf();
     let query = args["query"].as_str().unwrap_or("").to_string();
     let kind = args["kind"].as_str().map(|s| s.to_string());
-    // 复用带 60 秒 TTL 的缓存索引（连续检索/多文件定位时避免重复全量扫描）
-    let syms = tokio::task::spawn_blocking(move || crate::services::symbol_index::index_project_cached(&root))
-        .await
-        .map_err(|e| e.to_string())?;
-    let found = crate::services::symbol_index::filter_symbols(&syms, &query, kind.as_deref());
-    if found.is_empty() {
-        return Ok(format!("未找到匹配 \"{query}\" 的符号"));
+    let role = args["role"].as_str().map(|s| s.to_string());
+    if role.as_deref().is_some_and(|value| !matches!(value, "entity" | "logic")) {
+        return Err("role 仅支持 entity 或 logic".into());
     }
+    let file = args["file"].as_str().map(|s| s.to_string());
+    let cursor = args["cursor"].as_str().map(|s| s.to_string());
+    let relations_cursor = args["relations_cursor"].as_str().map(|s| s.to_string());
+    let page = args["page"].as_u64().unwrap_or(1) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    // 复用增量持久索引；只把当前页结构元数据带入模型，不把全仓源码塞进上下文。
+    let (result, read_handles) = tokio::task::spawn_blocking(move || {
+        let result = crate::services::symbol_index::query_structure_with_cursor(
+            &root,
+            &query,
+            role.as_deref(),
+            kind.as_deref(),
+            file.as_deref(),
+            page,
+            limit,
+            cursor.as_deref(),
+            relations_cursor.as_deref(),
+        )?;
+        let read_handles = crate::services::symbol_index::symbol_read_handles(&root, &result.items);
+        Ok::<_, String>((result, read_handles))
+    })
+        .await
+        .map_err(|e| e.to_string())??;
     let mut out = String::new();
-    out.push_str(&format!("找到 {} 个符号：\n", found.len()));
-    for s in found {
-        let parent = s.parent.as_deref().map(|p| format!(" in {p}")).unwrap_or_default();
+    out.push_str(&format!(
+        "结构查询：匹配 {}，第 {} 页（每页 {}）；已解析 {} 个源码文件 / {} 个结构 / {} 条关系；全库目录发现 {} 个文件（源码 {}，延期 {}，超大 {}，不可读文件/目录 {}/{}，持久化 {}）；watcher={}；coverage={}；索引更新于 {} 秒前。\n",
+        result.total_matches,
+        result.page,
+        result.page_size,
+        result.indexed_files,
+        result.indexed_symbols,
+        result.indexed_relations,
+        result.catalog.discovered_files,
+        result.catalog.source_files,
+        result.catalog.deferred_source_files,
+        result.catalog.oversized_source_files,
+        result.catalog.unreadable_files,
+        result.catalog.unreadable_directories,
+        if result.catalog.persisted { "是" } else { "否" },
+        if result.watcher_active { "active" } else { "poll-fallback" },
+        result.coverage,
+        result.synced_ago_secs,
+    ));
+    if result.coverage.starts_with("partial_") || result.coverage.starts_with("best_effort_") {
+        out.push_str("注意：当前结构索引不是全量语义保证；无结果或高风险修改时需用 codebase_search/LSP/精确路径补查。\n");
+    }
+    out.push_str(&format!(
+        "语义调用覆盖：已扫描 {}/{} 个逻辑符号（{:.2}%），沉淀 {} 条调用关系，截断目标 {}，退避目标 {}；semantic_coverage={}。\n",
+        result.semantic.scanned_logic_symbols,
+        result.semantic.indexed_logic_symbols,
+        result.semantic.coverage_percent,
+        result.semantic.semantic_call_relations,
+        result.semantic.truncated_targets,
+        result.semantic.backoff_targets,
+        result.semantic.coverage,
+    ));
+    match result.scip.state.as_str() {
+        "active" => out.push_str(&format!(
+            "SCIP 精确引用：active，索引 {}，文档 {}，定义 {}，引用 {}，已解析 {}，导入于 {} 秒前。\n",
+            result.scip.index_path.as_deref().unwrap_or("index.scip"),
+            result.scip.documents, result.scip.definitions, result.scip.references,
+            result.scip.resolved_references, result.scip.imported_ago_secs.unwrap_or(0),
+        )),
+        "available_not_imported" | "stale_index" => out.push_str(&format!(
+            "SCIP 精确引用：{}，已发现 {}；可调用 import_scip_index 导入/刷新。\n",
+            result.scip.state,
+            result.scip.index_path.as_deref().unwrap_or("index.scip"),
+        )),
+        "imported_source_missing" => out.push_str(
+            "SCIP 精确引用：上次导入仍可供未变化文件查询，但原始索引已缺失；重新生成后调用 import_scip_index 刷新。\n",
+        ),
+        _ => {}
+    }
+    if matches!(
+        result.semantic.coverage.as_str(),
+        "not_started_query_driven" | "partial_query_driven"
+    ) {
+        out.push_str(
+            "可用 lsp_references 的 {\"auto_batch_limit\":4} 小批次提升覆盖；调度会从未扫描目标断点续跑。\n",
+        );
+    }
+    if result.progressive.active {
         out.push_str(&format!(
-            "- [{}] {}{}  ({}:{})\n",
-            s.kind, s.name, parent, s.file, s.line
+            "后台渐进索引：active，本轮已提升 {} 个文件 / {} 批，剩余 {}；最近一批 {} ms（SQLite 写锁等待 {} ms），背压间隔 {} ms。\n",
+            result.progressive.promoted_this_run,
+            result.progressive.batches,
+            result.progressive.remaining_files,
+            result.progressive.last_batch_ms,
+            result.progressive.last_lock_wait_ms,
+            result.progressive.throttle_ms,
         ));
     }
+    if result.items.is_empty() {
+        out.push_str("本页无匹配结构。\n");
+        return Ok(out);
+    }
+    for (s, read_handle) in result.items.into_iter().zip(read_handles) {
+        let parent = s.parent.as_deref().map(|p| format!(" in {p}")).unwrap_or_default();
+        out.push_str(&format!(
+            "- [{}/{}; {}/{}] {}{}  ({}:{}-{})\n  {}\n",
+            s.role,
+            s.kind,
+            s.language,
+            s.source_layer,
+            s.name,
+            parent,
+            s.file,
+            s.line,
+            s.end_line,
+            s.signature
+        ));
+        match read_handle {
+            Ok(handle) => out.push_str(&format!("  read_handle={handle}\n")),
+            Err(error) => out.push_str(&format!("  read_handle=unavailable（{error}）\n")),
+        }
+    }
+    if !result.relations.is_empty() {
+        out.push_str("当前页关系：\n");
+        for edge in result.relations {
+            let target = if edge.target_file.is_empty() || edge.target_line == 0 {
+                match (
+                    edge.target_module.as_deref(),
+                    edge.target_imported_name.as_deref(),
+                ) {
+                    (Some(module), Some(imported)) => format!(
+                        "{}（来自 {} 的 {}，目标待解析）",
+                        edge.target_name, module, imported
+                    ),
+                    _ => format!("{}（语法声明，目标待解析）", edge.target_name),
+                }
+            } else {
+                format!("{} ({}:{})", edge.target_name, edge.target_file, edge.target_line)
+            };
+            out.push_str(&format!(
+                "- [{}] {} ({}:{}) -> {}\n",
+                edge.kind, edge.source_name, edge.source_file, edge.source_line, target,
+            ));
+        }
+        if result.relations_truncated {
+            if let Some(cursor) = result.relations_next_cursor.as_deref() {
+                out.push_str(&format!(
+                    "关系结果已达单次 500 条安全上限；原样传入 relations_cursor={cursor} 读取下一页关系。\n",
+                ));
+            } else {
+                out.push_str(
+                    "关系结果已达到单次 500 条安全上限；请缩小 query/file，或按具体符号继续查询。\n",
+                );
+            }
+        }
+    }
+    if let Some(next_cursor) = result.next_cursor {
+        out.push_str(&format!("还有结果：优先原样传入 cursor={next_cursor} 读取下一页。\n"));
+    } else if let Some(next_page) = result.next_page {
+        out.push_str(&format!("还有结果：使用 page={next_page} 读取下一页。\n"));
+    }
     Ok(truncate_out_max(&out, 12000))
+}
+
+async fn import_scip_index_tool(args: &Value, roots: &[String]) -> Result<String, String> {
+    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录".into());
+    }
+    let root = Path::new(project_path).to_path_buf();
+    let index = args["path"].as_str().map(|value| {
+        let value = Path::new(value);
+        if value.is_absolute() {
+            value.to_path_buf()
+        } else {
+            root.join(value)
+        }
+    });
+    let stats = tokio::task::spawn_blocking(move || {
+        crate::services::symbol_index::import_scip_index(&root, index.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(format!(
+        "SCIP 索引{}：{}；文档 {}，定义 {}，引用 {}，已解析引用 {}，忽略/陈旧文档 {}。",
+        if stats.skipped_unchanged {
+            "未变化，复用现有代次"
+        } else {
+            "导入完成"
+        },
+        stats.index_path,
+        stats.documents,
+        stats.definitions,
+        stats.references,
+        stats.resolved_references,
+        stats.ignored_documents,
+    ))
 }
 
 /// get_build_log：读取落盘的构建日志
@@ -4078,6 +4669,40 @@ fn trusted_system_dir(p: &Path) -> bool {
     false
 }
 
+/// 审批与执行共享有序根目录：用户提示优先，其后是鸿蒙工程及项目根。
+pub(crate) fn effective_tool_roots(
+    db: &crate::db::DbState,
+    project_id: &str,
+    project_path: &str,
+    path_hints: &[String],
+) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for h in path_hints {
+        let h = h.trim();
+        if !h.is_empty() && !roots.iter().any(|r| r == h) {
+            roots.push(h.to_string());
+        }
+    }
+    if !project_path.trim().is_empty() {
+        // 会话项目根兜底：若项目配置/识别出"鸿蒙主工程"（混合工作区的子工程），
+        // 将其插入为第一个兜底根——Harmony 工具（构建/部署/依赖/对齐检查）取
+        // roots.first() 即自动落到鸿蒙工程上；未配置时鸿蒙根=项目根本身，去重不重复插入。
+        if !project_id.trim().is_empty() {
+            if let Ok(conn) = db.0.lock() {
+                if let Ok(info) = crate::commands::project::resolve_harmony_root(&conn, project_id, Some(project_path)) {
+                    if !info.root.is_empty() && !roots.iter().any(|r| r == &info.root) {
+                        roots.push(info.root);
+                    }
+                }
+            }
+        }
+        if !roots.iter().any(|r| r == project_path.trim()) {
+            roots.push(project_path.trim().to_string());
+        }
+    }
+    roots
+}
+
 /// 写入/创建用路径解析：允许目标文件尚不存在（resolve_in_roots 要求路径已存在，
 /// 无法用于 write_file 创建新文件）。安全口径与 resolve_in_roots 一致（根内约束 + .. 防越界）：
 /// - 目标已存在：直接走 resolve_in_roots（含全部校验）；
@@ -4461,6 +5086,79 @@ pub(crate) fn smart_decode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_query_classifies_path_symbol_concept() {
+        assert_eq!(classify_repo_query(""), "concept");
+        assert_eq!(classify_repo_query("src/components/Button.ets"), "path");
+        assert_eq!(classify_repo_query("model\\Book.ts"), "path");
+        assert_eq!(classify_repo_query("app.json5"), "path");
+        assert_eq!(classify_repo_query("fetchData"), "symbol");
+        assert_eq!(classify_repo_query("_private_method"), "symbol");
+        assert_eq!(classify_repo_query("$store"), "symbol");
+        assert_eq!(classify_repo_query("load"), "symbol");
+        assert_eq!(classify_repo_query("支付流程在哪里实现"), "concept");
+        assert_eq!(classify_repo_query("how is auth implemented"), "concept");
+        assert_eq!(classify_repo_query("error E1001"), "concept");
+    }
+
+    #[test]
+    fn incoming_relation_edges_filters_to_target_matches() {
+        use crate::services::symbol_index::{StructureEdge, Symbol};
+        let sym = |name: &str, file: &str| Symbol {
+            kind: "function".into(),
+            name: name.into(),
+            file: file.into(),
+            line: 1,
+            end_line: 1,
+            role: "logic".into(),
+            signature: String::new(),
+            parent: None,
+            language: "ts".into(),
+            source_layer: "tree_sitter".into(),
+            declared_relations: vec![],
+        };
+        let target = sym("fetch", "target.ts");
+        let edge_incoming = StructureEdge {
+            kind: "calls".into(),
+            source_file: "source.ts".into(),
+            source_name: "caller".into(),
+            source_line: 1,
+            target_file: "target.ts".into(),
+            target_name: "fetch".into(),
+            target_line: 1,
+            target_module: None,
+            target_imported_name: None,
+        };
+        let edge_outgoing = StructureEdge {
+            kind: "calls".into(),
+            source_file: "target.ts".into(),
+            source_name: "fetch".into(),
+            source_line: 1,
+            target_file: "other.ts".into(),
+            target_name: "x".into(),
+            target_line: 1,
+            target_module: None,
+            target_imported_name: None,
+        };
+        let relations = vec![edge_incoming, edge_outgoing];
+        let incoming = incoming_relation_edges(&relations, &[target]);
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_name, "caller");
+    }
+
+    #[test]
+    fn candidate_test_files_follows_mainstream_conventions() {
+        let files = candidate_test_files("src/pages/Index.ets");
+        assert!(files.contains(&"src/pages/Index.test.ets".to_string()));
+        assert!(files.contains(&"src/pages/Index.spec.ets".to_string()));
+        assert!(files.contains(&"src/pages/__tests__/Index.ets".to_string()));
+        assert!(files.contains(&"test/Index.ets".to_string()));
+        // 顶层文件不产生带前导斜杠的路径
+        let top = candidate_test_files("App.ets");
+        assert!(top.iter().all(|f| !f.starts_with('/')));
+        assert!(top.contains(&"__tests__/App.ets".to_string()));
+    }
 
     #[test]
     fn outline_detects_arkts_structures() {
@@ -4957,6 +5655,17 @@ mod tests {
         assert_eq!(super::device_tools::crash_time_key("backup.log"), 0);
         // 多段数字取最大（含 14 位之外的更长时间戳干扰）
         assert_eq!(super::device_tools::crash_time_key("x20240101120000y-20250102123456z"), 20250102123456);
+    }
+
+    #[test]
+    fn faultlog_listing_only_accepts_safe_basenames() {
+        assert!(super::device_tools::is_safe_faultlog_name(
+            "JsError-com.example.app-20250102123456.log"
+        ));
+        assert!(!super::device_tools::is_safe_faultlog_name("../20250102123456.log"));
+        assert!(!super::device_tools::is_safe_faultlog_name("x/20250102123456.log"));
+        assert!(!super::device_tools::is_safe_faultlog_name(".20250102123456.log"));
+        assert!(!super::device_tools::is_safe_faultlog_name("crash.log"));
     }
 
     #[test]

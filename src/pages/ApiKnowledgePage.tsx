@@ -33,6 +33,7 @@ import {
   type EmbedStatus,
   type EmbedDonePayload,
 } from '../api/apiKnowledge'
+import { Skeleton, Spinner } from '../components/ui/Spinner'
 
 type Tab = 'docs' | 'details'
 
@@ -387,7 +388,7 @@ export default function ApiKnowledgePage() {
               </div>
               <div className="h-1.5 bg-[var(--bg-card)] rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-[var(--accent)] transition-all duration-300"
+                  className="h-full bg-[var(--accent)] transition-[width] duration-300"
                   style={{
                     width: embedProgress.total > 0
                       ? `${Math.min(100, (embedProgress.current / embedProgress.total) * 100)}%`
@@ -433,7 +434,7 @@ export default function ApiKnowledgePage() {
           </div>
           <div className="h-2 bg-[var(--bg-card)] rounded-full overflow-hidden">
             <div
-              className="h-full bg-[var(--accent)] transition-all duration-300"
+              className="h-full bg-[var(--accent)] transition-[width] duration-300"
               style={{ width: progress.total > 0 ? `${(progress.current / progress.total) * 100}%` : '0%' }}
             />
           </div>
@@ -594,7 +595,7 @@ export default function ApiKnowledgePage() {
       {/* Table */}
       <div className="modern-card rounded-lg overflow-hidden">
         {loading && !hasData ? (
-          <div className="p-8 text-center text-sm text-[var(--text-secondary)]">{t('apiKb.loading')}</div>
+          <Skeleton lines={8} label={t('apiKb.loading')} className="p-4" />
         ) : (
           <div className="relative">
             {tab === 'docs' ? (
@@ -609,7 +610,7 @@ export default function ApiKnowledgePage() {
             )}
             {loading && (
               <div className="absolute inset-0 z-10 flex items-center justify-center bg-[var(--bg-secondary)]/70">
-                <span className="text-sm text-[var(--text-secondary)]">{t('apiKb.loading')}</span>
+                <Spinner size={16} label={t('apiKb.loading')} />
               </div>
             )}
           </div>
@@ -869,7 +870,7 @@ function DetailDrawer({
         </div>
 
         {loading ? (
-          <div className="p-8 text-center text-sm text-[var(--text-secondary)]">{t('apiKb.loading')}</div>
+          <Skeleton lines={5} label={t('apiKb.loading')} className="p-4" />
         ) : (
           <div className="p-5 space-y-4">
             <div className="flex flex-wrap gap-2 text-[11px]">
@@ -1126,7 +1127,7 @@ function DetailFormModal({
   return (
     <Modal title={editing ? t('apiKb.editDetail') : t('apiKb.addDetail')} onClose={onClose} wide>
       {loading ? (
-        <div className="py-8 text-center text-sm text-[var(--text-secondary)]">{t('apiKb.loading')}</div>
+        <Skeleton lines={4} label={t('apiKb.loading')} className="p-4" />
       ) : (
         <div className="grid grid-cols-2 gap-3">
           <Field label={t('apiKb.colModule')} required>

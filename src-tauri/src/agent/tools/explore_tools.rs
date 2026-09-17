@@ -1,5 +1,5 @@
 //! 自动探索/API 详情域工具：auto_explore / refresh_api_db / search_api / get_api_detail / diff_api_versions 等。
-//! 共享辅助函数（run_hdc_shell / default_device_id 等）仍定义在父模块 mod.rs，
+//! 共享设备解析、工作区边界与 Broker 证据辅助函数定义在父模块 mod.rs，
 //! 本模块通过 `use super::*` 继承访问。
 
 use super::*;
@@ -50,10 +50,14 @@ pub(super) fn collect_source_files(dir: &std::path::Path, out: &mut Vec<String>)
 }
 
 /// auto_explore：自动遍历应用页面。
-pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn auto_explore(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
     if project_path.is_empty() {
@@ -63,14 +67,16 @@ pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<Strin
     let max_depth = args["max_depth"].as_u64().unwrap_or(4).min(10) as usize;
     let delay_ms = args["delay_ms"].as_u64().unwrap_or(800).min(5000);
 
-    let out_dir = format!("{project_path}/.deveco-agent/explore");
-    std::fs::create_dir_all(&out_dir).ok();
+    let (workspace, out_dir) = ensure_workspace_subdir(&project_path, ".deveco-agent/explore")?;
 
     let mut pages: Vec<ExploredPage> = Vec::new();
     let mut visited_signatures: Vec<String> = Vec::new();
 
     // 第 0 页：初始页面
-    let init_page = capture_and_analyze(&device, &out_dir, 0, 0, None, "初始页面").await?;
+    let init_page = capture_and_analyze(
+        &workspace, &device, &out_dir, 0, 0, None, "初始页面", ctx,
+    )
+    .await?;
     let sig = compute_page_signature(&init_page.tree_summary, init_page.clickable_count);
     visited_signatures.push(sig);
     let init_id = pages.len();
@@ -101,7 +107,15 @@ pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<Strin
         if current_page_id != Some(from_id) {
             // 简单策略：按返回键回首页（回到根页签名匹配即停，防止退过头退出应用），再重新导航
             // （完整的导航树回溯较复杂，这里用回首页 + 重走的简化策略）
-            back_to_root(&device, &visited_signatures[0], (depth + 2).min(max_depth + 3)).await;
+            back_to_root(
+                &workspace,
+                &out_dir,
+                &device,
+                &visited_signatures[0],
+                (depth + 2).min(max_depth + 3),
+                ctx,
+            )
+            .await;
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             current_page_id = Some(0);
 
@@ -112,7 +126,10 @@ pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<Strin
                 // 找到从当前页到 page_id 的点击
                 if let Some(&(_, cidx, _)) = actions_taken.iter().find(|(f, _, t)| *f == current_page_id.unwrap_or(0) && *t == *page_id) {
                     // 执行点击
-                    if click_nth_clickable(&device, cidx).await.is_err() {
+                    if click_nth_clickable(&workspace, &out_dir, &device, cidx, ctx)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -122,7 +139,7 @@ pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<Strin
         }
 
         // 点击第 click_idx 个可点击元素
-        if let Err(e) = click_nth_clickable(&device, click_idx).await {
+        if let Err(e) = click_nth_clickable(&workspace, &out_dir, &device, click_idx, ctx).await {
             eprintln!("click failed: {e}");
             continue;
         }
@@ -130,8 +147,8 @@ pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<Strin
 
         // 捕获新页面
         let new_page = match capture_and_analyze(
-            &device, &out_dir, pages.len(), depth + 1,
-            Some(from_id), &format!("点击第 {} 个可点击元素", click_idx + 1)
+            &workspace, &device, &out_dir, pages.len(), depth + 1,
+            Some(from_id), &format!("点击第 {} 个可点击元素", click_idx + 1), ctx,
         ).await {
             Ok(p) => p,
             Err(_) => continue,
@@ -142,7 +159,12 @@ pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<Strin
         // 检查是否已访问过
         if visited_signatures.iter().any(|s| s == &sig) {
             // 已访问，返回
-            let _ = super::test_tools::execute_ui_step(&device, &serde_json::json!({"action": "key", "name": "back"})).await;
+            let _ = super::test_tools::execute_ui_step(
+                &device,
+                &serde_json::json!({"action": "key", "name": "back"}),
+                ctx,
+            )
+            .await;
             tokio::time::sleep(Duration::from_millis(delay_ms / 2)).await;
             continue;
         }
@@ -165,7 +187,7 @@ pub(super) async fn auto_explore(args: &Value, roots: &[String]) -> Result<Strin
     let mut out = format!("自动遍历完成（设备 {device}）\n");
     out.push_str(&format!("发现页面：{} 个（上限 {max_pages}）\n", pages.len()));
     out.push_str(&format!("最大深度：{max_depth}\n"));
-    out.push_str(&format!("输出目录：{out_dir}\n\n"));
+    out.push_str(&format!("输出目录：{}\n\n", out_dir.display()));
 
     out.push_str("页面列表：\n");
     for (i, page) in pages.iter().enumerate() {
@@ -232,11 +254,23 @@ pub(super) fn find_path(actions: &[(usize, usize, usize)], target: usize) -> Vec
 
 /// 按返回键回到根页面：每次 back 后对比当前页面签名，与根页签名一致即停止，
 /// 避免固定次数 back 在浅层时退出应用；超过 max_back 次仍未匹配则强制停止。
-pub(super) async fn back_to_root(device: &str, root_signature: &str, max_back: usize) {
+pub(super) async fn back_to_root(
+    workspace: &Path,
+    out_dir: &Path,
+    device: &str,
+    root_signature: &str,
+    max_back: usize,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) {
     for _ in 0..max_back.max(1) {
-        let _ = super::test_tools::execute_ui_step(device, &serde_json::json!({"action": "key", "name": "back"})).await;
+        let _ = super::test_tools::execute_ui_step(
+            device,
+            &serde_json::json!({"action": "key", "name": "back"}),
+            ctx,
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        if let Some(sig) = page_signature_now(device).await {
+        if let Some(sig) = page_signature_now(workspace, out_dir, device, ctx).await {
             if sig == root_signature {
                 break;
             }
@@ -245,46 +279,39 @@ pub(super) async fn back_to_root(device: &str, root_signature: &str, max_back: u
 }
 
 /// 只 dump 控件树并计算页面签名（不截图，用于回退导航时的页面识别）
-pub(super) async fn page_signature_now(device: &str) -> Option<String> {
-    let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-    let dev_file = format!("/data/local/tmp/nav_{ts}.json");
-    run_hdc_shell(device, &["uitest", "dumpLayout", "-p", &dev_file], 10).await.ok()?;
-    let local = std::env::temp_dir().join("nav_check.json");
-    let hdc_args: Vec<String> = vec![
-        "-s".to_string(), device.to_string(), "file".to_string(), "recv".to_string(),
-        dev_file, local.to_string_lossy().into_owned(),
-    ];
-    let _ = run_cmd("hdc", &hdc_args, None, 15).await;
-    let content = std::fs::read_to_string(&local).ok()?;
+pub(super) async fn page_signature_now(
+    workspace: &Path,
+    out_dir: &Path,
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Option<String> {
+    let local = out_dir.join(format!(".nav-{}.json", uuid::Uuid::new_v4().simple()));
+    let content = capture_ui_layout_file(workspace, device, &local, ctx).await.ok()?;
+    let _ = std::fs::remove_file(&local);
     let summary = super::ui_tools::summarize_ui_tree(&content);
     Some(compute_page_signature(&summary, count_clickable(&content)))
 }
 
-pub(super) async fn click_nth_clickable(device: &str, idx: usize) -> Result<(), String> {
+pub(super) async fn click_nth_clickable(
+    workspace: &Path,
+    out_dir: &Path,
+    device: &str,
+    idx: usize,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(), String> {
     // 先 dump 控件树，找到第 idx 个可点击元素的坐标
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let dev_file = format!("/data/local/tmp/explore_{ts}.json");
-    run_hdc_shell(device, &["uitest", "dumpLayout", "-p", &dev_file], 10).await?;
-
-    let out_tmp = std::env::temp_dir().to_string_lossy().to_string();
-    let local_file = format!("{out_tmp}/explore_click.json");
-    let hdc_args: Vec<String> = vec![
-        "-s".to_string(), device.to_string(), "file".to_string(), "recv".to_string(),
-        dev_file.clone(), local_file.clone(),
-    ];
-    let _ = run_cmd("hdc", &hdc_args, None, 15).await;
-
-    let content = std::fs::read_to_string(&local_file).unwrap_or_default();
+    let local_file = out_dir.join(format!(".click-{}.json", uuid::Uuid::new_v4().simple()));
+    let content = capture_ui_layout_file(workspace, device, &local_file, ctx).await?;
+    let _ = std::fs::remove_file(&local_file);
     let (x, y) = find_nth_clickable_center(&content, idx)
         .ok_or_else(|| format!("未找到第 {} 个可点击元素", idx + 1))?;
 
-    super::test_tools::execute_ui_step(device, &serde_json::json!({"action": "tap", "x": x, "y": y})).await?;
+    super::test_tools::execute_ui_step(
+        device,
+        &serde_json::json!({"action": "tap", "x": x, "y": y}),
+        ctx,
+    )
+    .await?;
     Ok(())
 }
 
@@ -338,48 +365,124 @@ pub(super) fn find_nth_clickable_center(json: &str, n: usize) -> Option<(i64, i6
 }
 
 pub(super) async fn capture_and_analyze(
+    workspace: &Path,
     device: &str,
-    out_dir: &str,
+    out_dir: &Path,
     page_id: usize,
     depth: usize,
     from_page: Option<usize>,
     action: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<ExploredPage, String> {
-    // 截图（snapshot_display 默认输出 jpeg 且按后缀校验，须显式 -t png 才能写 .png）
-    let dev_png = format!("/data/local/tmp/explore_{page_id}.png");
-    let _ = run_hdc_shell(device, &["snapshot_display", "-t", "png", dev_png.as_str()], 10).await;
-    let local_screenshot = format!("{out_dir}/page_{page_id:03}.png");
-    let hdc_args: Vec<String> = vec![
-        "-s".to_string(), device.to_string(), "file".to_string(), "recv".to_string(),
-        dev_png.clone(), local_screenshot.clone(),
-    ];
-    let _ = run_cmd("hdc", &hdc_args, None, 15).await;
-    // 清理设备端临时文件
-    let _ = run_hdc_shell(device, &["rm", dev_png.as_str()], 10).await;
-
-    // 控件树
-    let dev_json = format!("/data/local/tmp/explore_{page_id}.json");
-    let _ = run_hdc_shell(device, &["uitest", "dumpLayout", "-p", &dev_json], 10).await;
-    let local_tree = format!("{out_dir}/page_{page_id:03}.json");
-    let hdc_args2: Vec<String> = vec![
-        "-s".to_string(), device.to_string(), "file".to_string(), "recv".to_string(),
-        dev_json.clone(), local_tree.clone(),
-    ];
-    let _ = run_cmd("hdc", &hdc_args2, None, 15).await;
-
-    let content = std::fs::read_to_string(&local_tree).unwrap_or_default();
+    let local_screenshot = out_dir.join(format!("page_{page_id:03}.png"));
+    capture_explore_screenshot(workspace, device, &local_screenshot, ctx).await?;
+    let local_tree = out_dir.join(format!("page_{page_id:03}.json"));
+    let content = capture_ui_layout_file(workspace, device, &local_tree, ctx).await?;
     let summary = super::ui_tools::summarize_ui_tree(&content);
     let clickable = count_clickable(&content);
 
     Ok(ExploredPage {
         depth,
-        screenshot: local_screenshot,
+        screenshot: local_screenshot.to_string_lossy().into_owned(),
         tree_summary: summary,
         clickable_count: clickable,
         title: String::new(),
         from_page,
         from_action: action.to_string(),
     })
+}
+
+async fn capture_explore_screenshot(
+    workspace: &Path,
+    device: &str,
+    local: &Path,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(), String> {
+    let remote = format!(
+        "/data/local/tmp/deveco_agent_explore_{}.png",
+        uuid::Uuid::new_v4().simple(),
+    );
+    let snapshot = crate::agent::capability_broker::HostCapability::CaptureDeviceScreenshot {
+        device: device.to_string(),
+        remote_path: remote.clone(),
+        backend: crate::agent::capability_broker::DeviceScreenshotBackend::SnapshotDisplay,
+    };
+    if let Err(snapshot_error) = execute_device_temp_creation(&snapshot, "截取探索页面", ctx).await {
+        let fallback = crate::agent::capability_broker::HostCapability::CaptureDeviceScreenshot {
+            device: device.to_string(),
+            remote_path: remote.clone(),
+            backend: crate::agent::capability_broker::DeviceScreenshotBackend::Screencap,
+        };
+        if let Err(fallback_error) =
+            execute_device_temp_creation(&fallback, "使用备用后端截取探索页面", ctx).await
+        {
+            cleanup_device_temp_file(device, &remote, ctx).await;
+            return Err(format!("{snapshot_error}；{fallback_error}"));
+        }
+    }
+    receive_device_temp_file(workspace, device, &remote, local, ctx).await
+}
+
+async fn execute_device_temp_creation(
+    capability: &crate::agent::capability_broker::HostCapability,
+    action: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(), String> {
+    let output = crate::agent::capability_broker::execute_host_capability(capability, None, ctx)
+        .await
+        .map_err(|error| format!("{action}失败：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("{action}失败：{}", first_line_or_unknown(&text)));
+    }
+    Ok(())
+}
+
+async fn receive_device_temp_file(
+    workspace: &Path,
+    device: &str,
+    remote: &str,
+    local: &Path,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(), String> {
+    let relative = local
+        .strip_prefix(workspace)
+        .map_err(|_| "探索证据目标越出项目工作区")?
+        .to_string_lossy()
+        .into_owned();
+    let receive = crate::agent::capability_broker::HostCapability::ReceiveFile {
+        device: device.to_string(),
+        remote_path: remote.to_string(),
+        local_path: relative,
+    };
+    let result = crate::agent::capability_broker::execute_host_capability(
+        &receive,
+        Some(workspace),
+        ctx,
+    )
+    .await;
+    cleanup_device_temp_file(device, remote, ctx).await;
+    let output = result.map_err(|error| format!("拉取探索证据失败：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("拉取探索证据失败：{}", first_line_or_unknown(&text)));
+    }
+    if !local.is_file() || std::fs::metadata(local).map(|meta| meta.len() == 0).unwrap_or(true) {
+        return Err("拉取探索证据失败：本地文件不存在或为空".into());
+    }
+    Ok(())
+}
+
+async fn cleanup_device_temp_file(
+    device: &str,
+    remote: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) {
+    let cleanup = crate::agent::capability_broker::HostCapability::RemoveDeviceTempFile {
+        device: device.to_string(),
+        remote_path: remote.to_string(),
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&cleanup, None, ctx).await;
 }
 
 pub(super) fn count_clickable(json: &str) -> usize {

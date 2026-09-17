@@ -95,7 +95,8 @@ export default function PerfMonitor() {
           setItem(STORAGE_KEYS.PERF_MONITOR, '1')
         }}
         title="性能监控 (Ctrl+Shift+P)"
-        className="fixed bottom-2 right-2 z-[9998] w-5 h-5 rounded-full flex items-center justify-center text-[var(--text-muted)]/40 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+        aria-label="性能监控 (Ctrl+Shift+P)"
+        className="fixed bottom-2 right-2 z-[var(--app-z-devtools)] w-5 h-5 rounded-full flex items-center justify-center text-[var(--text-muted)]/40 hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
       >
         <Icon name="spark" size={12} />
       </button>
@@ -161,10 +162,10 @@ export default function PerfMonitor() {
   }
 
   return (
-    <div className="fixed bottom-3 right-3 z-[9999]" ref={panelRef}>
+    <div className="fixed bottom-3 right-3 z-[var(--app-z-devtools)]" ref={panelRef}>
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-8 h-8 rounded-full flex items-center justify-center shadow-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] transition-all"
+        className="w-8 h-8 rounded-full flex items-center justify-center shadow-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] transition-colors"
         title="性能监控 (Ctrl+Shift+P)"
       >
         <span
@@ -175,8 +176,7 @@ export default function PerfMonitor() {
 
       {open && (
         <div
-          className="absolute bottom-10 right-0 w-[400px] max-h-[520px] rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl flex flex-col overflow-hidden"
-          style={{ backdropFilter: 'blur(12px)' }}
+          className="absolute bottom-10 right-0 w-[400px] max-h-[520px] rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl flex flex-col overflow-hidden backdrop-blur-md"
         >
           {/* 头部 */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)]">
@@ -190,6 +190,7 @@ export default function PerfMonitor() {
                 onClick={handleCopy}
                 className="p-1 rounded hover:bg-[var(--bg-hover)] transition-colors relative"
                 title="复制性能报告"
+                aria-label="复制性能报告"
                 style={{ color: copied ? '#22c55e' : undefined }}
               >
                 <Icon name={copied ? "check" : "copy"} size={11} className={copied ? "text-[#22c55e]" : "text-[var(--text-muted)] hover:text-[var(--text-primary)]"} />
@@ -198,6 +199,7 @@ export default function PerfMonitor() {
                 onClick={() => clearPerfHistory()}
                 className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                 title="清空记录"
+                aria-label="清空记录"
               >
                 <Icon name="delete" size={11} />
               </button>
@@ -209,6 +211,7 @@ export default function PerfMonitor() {
                 }}
                 className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                 title="关闭面板"
+                aria-label="关闭面板"
               >
                 <Icon name="close" size={11} />
               </button>
@@ -303,7 +306,7 @@ function RecordItem({ record }: { record: PerfRecord }) {
 
       <div className="h-0.5 mx-2 mb-1 bg-[var(--bg-hover)] rounded-full overflow-hidden">
         <div
-          className="h-full rounded-full transition-all"
+          className="h-full rounded-full transition-[width,background-color]"
           style={{ width: `${barWidthPct}%`, backgroundColor: color }}
         />
       </div>

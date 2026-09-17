@@ -24,22 +24,29 @@ pub enum SessionEventType {
     ToolCall,
     /// 工具结果（payload: { ok, output }）
     ToolResult,
+    /// 工具审批决议（payload: { tool, approved, remember?, scope? }）——与沙箱升级、
+    /// 工具调用同源进入统一审计链，可回放/进入 eval trajectory。
+    ToolApproval,
     /// 系统说明（payload: { text }）
     SystemNote,
     /// 上下文压缩（payload: { trigger, old_limit?, new_limit?, keep? }）——LC-33：
     /// 压缩预警与执行写入事件流，度量预警后用户固定行为与“无预兆压缩”体验
     ContextCompress,
+    /// 活跃 executor 安全点。仅用于恢复，不进入消息历史投影。
+    ExecutorCheckpoint,
 }
 
 impl SessionEventType {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::UserMessage => "user_message",
             Self::AssistantMessage => "assistant_message",
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
+            Self::ToolApproval => "tool_approval",
             Self::SystemNote => "system_note",
             Self::ContextCompress => "context_compress",
+            Self::ExecutorCheckpoint => "executor_checkpoint",
         }
     }
 
@@ -49,7 +56,9 @@ impl SessionEventType {
             "assistant_message" => Self::AssistantMessage,
             "tool_call" => Self::ToolCall,
             "tool_result" => Self::ToolResult,
+            "tool_approval" => Self::ToolApproval,
             "context_compress" => Self::ContextCompress,
+            "executor_checkpoint" => Self::ExecutorCheckpoint,
             _ => Self::SystemNote,
         }
     }
@@ -131,6 +140,95 @@ pub fn replay(conn: &Connection, conversation_id: &str) -> Result<Vec<SessionEve
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+/// 读取指定任务 trace 的最新一条类型化事件。
+///
+/// 恢复入口不能扫描普通 system note 猜测 payload；最新记录损坏时也必须失败关闭，
+/// 不能静默回退到更旧的安全点掩盖持久化故障。
+pub fn latest_event_for_trace(
+    conn: &Connection,
+    conversation_id: &str,
+    trace_id: &str,
+    event_type: SessionEventType,
+) -> Result<Option<SessionEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, conversation_id, seq, event_type, payload, trace_id, created_at
+             FROM session_events
+             WHERE conversation_id = ?1 AND trace_id = ?2 AND event_type = ?3
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params![
+            conversation_id,
+            trace_id,
+            event_type.as_str()
+        ])
+        .map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let raw_type: String = row.get(3).map_err(|error| error.to_string())?;
+    let raw_payload: String = row.get(4).map_err(|error| error.to_string())?;
+    let payload = serde_json::from_str(&raw_payload)
+        .map_err(|error| format!("最新 {} 事件 payload 损坏：{error}", event_type.as_str()))?;
+    Ok(Some(SessionEvent {
+        id: row.get(0).map_err(|error| error.to_string())?,
+        conversation_id: row.get(1).map_err(|error| error.to_string())?,
+        seq: row.get(2).map_err(|error| error.to_string())?,
+        event_type: SessionEventType::from_str(&raw_type),
+        payload,
+        trace_id: row.get(5).map_err(|error| error.to_string())?,
+        created_at: row.get(6).map_err(|error| error.to_string())?,
+    }))
+}
+
+/// 统一审计时间线的一条事件：把会话事件与运行事件合并到同一可查询链。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AuditEvent {
+    /// "session"（消息生命周期/审批）| "run"（沙箱升级等运行级事件）
+    pub source: String,
+    pub event_type: String,
+    pub payload: Value,
+    pub created_at: i64,
+    pub run_id: Option<String>,
+    pub trace_id: Option<String>,
+}
+
+/// 统一审计链：把 `session_events`（含审批决议）与 `run_events`（含沙箱升级）合并为
+/// 一条按时间排序的审计时间线。只读，不改动任何写入路径。
+pub fn audit_timeline(conn: &Connection, conversation_id: &str) -> Result<Vec<AuditEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT 'session' AS source, event_type, payload, created_at, NULL AS run_id, trace_id
+             FROM session_events WHERE conversation_id = ?1
+             UNION ALL
+             SELECT 'run' AS source, event_type, payload, created_at, run_id, NULL AS trace_id
+             FROM run_events WHERE conversation_id = ?1
+             UNION ALL
+             SELECT 'approval' AS source, 'host_capability.approval_revoked' AS event_type,
+                    json_object('tool_call_id',call_id,'reason',reason,'decision','revoked') AS payload,
+                    revoked_at AS created_at, run_id, NULL AS trace_id
+             FROM ota_approval_revocations WHERE conversation_id = ?1
+             ORDER BY created_at ASC, source ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([conversation_id], |row| {
+            let payload: String = row.get(2)?;
+            Ok(AuditEvent {
+                source: row.get(0)?,
+                event_type: row.get(1)?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                created_at: row.get(3)?,
+                run_id: row.get(4)?,
+                trace_id: row.get(5)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 /// 事件 → 消息历史投影（核心派生：消息历史从事件日志重建）。
 /// 工具调用/结果配对为 assistant 视角的 tool 条目，保持与消息表的语义对齐。
 pub fn derive_messages(conn: &Connection, conversation_id: &str) -> Result<Vec<DerivedMessage>, String> {
@@ -173,6 +271,10 @@ pub fn derive_messages(conn: &Connection, conversation_id: &str) -> Result<Vec<D
             }
             // 压缩事件不进消息历史投影（摘要/裁剪由 conversations 表水位承载）
             SessionEventType::ContextCompress => {}
+            // 审批决议只进审计链，不进消息历史投影
+            SessionEventType::ToolApproval => {}
+            // executor 安全点是控制状态，不得伪装成助手消息进入模型上下文
+            SessionEventType::ExecutorCheckpoint => {}
         }
     }
     Ok(out)
@@ -211,7 +313,9 @@ mod tests {
                 trace_id TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            CREATE INDEX idx_session_events_conv_seq ON session_events(conversation_id, seq);",
+            CREATE INDEX idx_session_events_conv_seq ON session_events(conversation_id, seq);
+            CREATE INDEX idx_session_events_checkpoint_lookup
+                ON session_events(conversation_id, trace_id, event_type, seq DESC);",
         )
         .unwrap();
         conn
@@ -239,12 +343,148 @@ mod tests {
     }
 
     #[test]
+    fn latest_typed_event_is_trace_scoped_and_fails_closed_on_corruption() {
+        let conn = mem_conn();
+        append_event(
+            &conn,
+            "c1",
+            SessionEventType::ExecutorCheckpoint,
+            serde_json::json!({"generation": 1}),
+            Some("trace-a"),
+        )
+        .unwrap();
+        append_event(
+            &conn,
+            "c1",
+            SessionEventType::ExecutorCheckpoint,
+            serde_json::json!({"generation": 2}),
+            Some("trace-a"),
+        )
+        .unwrap();
+        append_event(
+            &conn,
+            "c1",
+            SessionEventType::ExecutorCheckpoint,
+            serde_json::json!({"generation": 9}),
+            Some("trace-b"),
+        )
+        .unwrap();
+
+        let latest = latest_event_for_trace(
+            &conn,
+            "c1",
+            "trace-a",
+            SessionEventType::ExecutorCheckpoint,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest.payload["generation"], 2);
+        assert_eq!(latest.trace_id.as_deref(), Some("trace-a"));
+        let query_plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, conversation_id, seq, event_type, payload, trace_id, created_at
+                 FROM session_events
+                 WHERE conversation_id = ?1 AND trace_id = ?2 AND event_type = ?3
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params!["c1", "trace-a", "executor_checkpoint"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            query_plan.contains("idx_session_events_checkpoint_lookup"),
+            "unexpected query plan: {query_plan}"
+        );
+        assert!(latest_event_for_trace(
+            &conn,
+            "missing",
+            "trace-a",
+            SessionEventType::ExecutorCheckpoint,
+        )
+        .unwrap()
+        .is_none());
+
+        conn.execute(
+            "UPDATE session_events SET payload = '{broken' WHERE id = ?1",
+            [latest.id],
+        )
+        .unwrap();
+        let error = latest_event_for_trace(
+            &conn,
+            "c1",
+            "trace-a",
+            SessionEventType::ExecutorCheckpoint,
+        )
+        .unwrap_err();
+        assert!(error.contains("payload 损坏"));
+    }
+
+    #[test]
+    fn audit_timeline_merges_session_and_run_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ota_approval_revocations(call_id TEXT PRIMARY KEY,run_id TEXT,conversation_id TEXT,revoked_at INTEGER,reason TEXT);").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                event_type TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+                trace_id TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                goal TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, phase TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1, last_event_seq INTEGER NOT NULL DEFAULT 0,
+                recovery_count INTEGER NOT NULL DEFAULT 0, resume_policy TEXT NOT NULL DEFAULT 'continue',
+                acceptance_json TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', error TEXT,
+                started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, finished_at INTEGER,
+                parent_run_id TEXT, recovery_plan_json TEXT, recovery_mode TEXT NOT NULL DEFAULT 'fresh',
+                goal_contract_json TEXT, remediation_count INTEGER NOT NULL DEFAULT 0,
+                heartbeat_at INTEGER, lease_expires_at INTEGER, quality_json TEXT);
+            CREATE TABLE run_events(event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL, seq INTEGER NOT NULL, event_type TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE(run_id,seq));",
+        )
+        .unwrap();
+        append_event(&conn, "c1", SessionEventType::ToolApproval, serde_json::json!({"tool": "git_push", "approved": true}), None).unwrap();
+        conn.execute(
+            "INSERT INTO agent_runs(run_id, conversation_id, goal, state, phase, started_at, updated_at)
+             VALUES('r1','c1','','running','execute',100,101)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO run_events VALUES('e1','r1','c1',1,'sandbox_started','{}',200)",
+            [],
+        ).unwrap();
+
+        conn.execute("INSERT INTO ota_approval_revocations VALUES('call1','r1','c1',250,'user_revoke_call')", []).unwrap();
+        let timeline = audit_timeline(&conn, "c1").unwrap();
+        assert_eq!(timeline.len(), 3);
+        let revoked = timeline.iter().find(|event| event.source == "approval").unwrap();
+        assert_eq!(revoked.event_type, "host_capability.approval_revoked");
+        assert_eq!(revoked.payload["tool_call_id"], "call1");
+        assert_eq!(revoked.payload["reason"], "user_revoke_call");
+        assert_eq!(revoked.run_id.as_deref(), Some("r1"));
+        // 两条来源的事件都进入统一时间线，且按 created_at 升序
+        let sources: Vec<&str> = timeline.iter().map(|e| e.source.as_str()).collect();
+        assert!(sources.contains(&"session") && sources.contains(&"run"));
+        let created: Vec<i64> = timeline.iter().map(|e| e.created_at).collect();
+        assert!(created.windows(2).all(|w| w[0] <= w[1]));
+        let session_ev = timeline.iter().find(|e| e.source == "session").unwrap();
+        assert_eq!(session_ev.event_type, "tool_approval");
+        let run_ev = timeline.iter().find(|e| e.source == "run").unwrap();
+        assert_eq!(run_ev.event_type, "sandbox_started");
+        assert_eq!(run_ev.run_id.as_deref(), Some("r1"));
+        // 会话隔离
+        assert!(audit_timeline(&conn, "c2").unwrap().is_empty());
+    }
+
+    #[test]
     fn derive_projects_messages_from_events() {
         let conn = mem_conn();
         append_event(&conn, "c1", SessionEventType::UserMessage, serde_json::json!({"content": "读一下"}), None).unwrap();
         append_event(&conn, "c1", SessionEventType::ToolCall, serde_json::json!({"name": "read_file", "args": {"path": "a.txt"}}), Some("t1")).unwrap();
         append_event(&conn, "c1", SessionEventType::ToolResult, serde_json::json!({"ok": false, "output": "not found"}), Some("t1")).unwrap();
         append_event(&conn, "c1", SessionEventType::AssistantMessage, serde_json::json!({"content": "文件不存在"}), Some("t1")).unwrap();
+        append_event(&conn, "c1", SessionEventType::ExecutorCheckpoint, serde_json::json!({"schema_version": 1}), Some("t1")).unwrap();
         let msgs = derive_messages(&conn, "c1").unwrap();
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "user");

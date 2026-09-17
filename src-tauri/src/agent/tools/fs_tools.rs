@@ -3,11 +3,21 @@
 
 use super::*;
 
+/// 面向工具协议的稳定内容版本。与进程内冲突检测使用的 FNV 指纹分离：
+/// 该值会暴露给 Agent，后续可直接作为 expected_hash 乐观锁使用。
+fn file_content_version(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// 读文件请求（宽松）：字段均可选；路径归一化/基础文件校验集中在 `resolve()` 显式落地。
 #[derive(serde::Deserialize, Default)]
 pub(super) struct ReadFileRequest {
     /// 文件路径（相对工程根或绝对路径，resolve 校验非空）
     pub path: Option<String>,
+    /// `search_symbols` / `repo_query` 返回的、绑定文件 SHA-256 的精确结构定位句柄。
+    pub symbol_handle: Option<String>,
     /// 骨架模式：只输出结构定义行（import/类/函数等），快速了解大文件
     pub outline: Option<bool>,
     /// 骨架分页（1 起，缺省第 1 页；每页 200 条，大文件结构项多时翻页查看）
@@ -37,9 +47,14 @@ impl ReadFileRequest {
             return Err(format!("路径不是文件: {}", p.display()));
         }
         let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
-        if meta.len() > 1024 * 1024 {
+        let stream_large = meta.len() > 1024 * 1024;
+        if stream_large
+            && (self.outline.unwrap_or(false)
+                || self.lines.unwrap_or(0) == 0
+                || self.lines.unwrap_or(0) > 2_000)
+        {
             return Err(format!(
-                "文件过大（{}，>1MB），无法直接读取：先用 grep_files 定位关键词所在行号，再 read_file 传 start/lines 分段读取，或用命令行工具处理",
+                "文件较大（{}，>1MB），请显式传 start/lines 进行流式窗口读取（单次最多 2000 行，不会把整文件加载进内存）；大文件 outline 将在行偏移索引上线后支持",
                 human_size(meta.len())
             ));
         }
@@ -50,6 +65,7 @@ impl ReadFileRequest {
             outline_filter: self.outline_filter.filter(|f| !f.trim().is_empty()),
             start: self.start.unwrap_or(1).max(1),
             lines: self.lines.unwrap_or(0),
+            stream_large,
         })
     }
 }
@@ -68,6 +84,8 @@ pub(super) struct ReadFileSpec {
     pub start: u64,
     /// 读取行数（0 表示读到文件尾）
     pub lines: u64,
+    /// 超过 1 MiB 时走固定内存的流式行窗口，不加载整文件。
+    pub stream_large: bool,
 }
 
 /// 写文件请求（宽松）：默认值/校验在 `resolve()` 显式落地。
@@ -118,6 +136,12 @@ pub(super) struct WriteFileSpec {
 pub(super) struct EditFileRequest {
     /// 目标路径
     pub path: Option<String>,
+    /// `search_symbols` / `repo_query` 返回的结构读取句柄；作为单块编辑的强校验定位。
+    pub symbol_handle: Option<String>,
+    /// 同文件多节点事务：与 news 一一对应，全部句柄必须绑定同一文件版本。
+    pub symbol_handles: Option<Vec<String>>,
+    /// 显式允许 v3 句柄在非目标文件改动后做唯一、内容不变的受控重定位。
+    pub allow_relocate: Option<bool>,
     /// 被替换的原文（resolve 校验非空；与 start 互斥）
     pub old: Option<String>,
     /// 替换成的新文（缺省空串）
@@ -138,6 +162,31 @@ pub(super) struct EditFileRequest {
     pub news: Option<Vec<String>>,
     /// 批量模式各块的锚签名（可选，与 starts 等长；元素可为 null）
     pub anchors: Option<Vec<Option<String>>>,
+    /// 由已验证结构句柄注入，不接受工具 JSON 传入。
+    #[serde(skip)]
+    expected_symbol_sha256: Option<String>,
+    /// v2 结构句柄绑定的稳定节点 ID、类型、精确范围和父节点范围。
+    #[serde(skip)]
+    expected_node_id: Option<String>,
+    #[serde(skip)]
+    expected_symbol_kind: Option<String>,
+    #[serde(skip)]
+    expected_symbol_range: Option<(usize, usize)>,
+    #[serde(skip)]
+    expected_parent_range: Option<(usize, usize)>,
+    #[serde(skip)]
+    expected_relocated: bool,
+    #[serde(skip)]
+    expected_nodes: Vec<ExpectedNode>,
+}
+
+#[derive(Clone)]
+struct ExpectedNode {
+    node_id: String,
+    kind: Option<String>,
+    range: (usize, usize),
+    parent_range: Option<(usize, usize)>,
+    relocated: bool,
 }
 
 impl EditFileRequest {
@@ -217,6 +266,13 @@ impl EditFileRequest {
             } else {
                 Vec::new()
             },
+            expected_symbol_sha256: self.expected_symbol_sha256,
+            expected_node_id: self.expected_node_id,
+            expected_symbol_kind: self.expected_symbol_kind,
+            expected_symbol_range: self.expected_symbol_range,
+            expected_parent_range: self.expected_parent_range,
+            expected_relocated: self.expected_relocated,
+            expected_nodes: self.expected_nodes,
         })
     }
 }
@@ -241,6 +297,121 @@ pub(super) struct EditFileSpec {
     pub news: Vec<String>,
     /// 批量模式各块锚签名（与 starts 等长；None = 该块不用锚）
     pub anchors: Vec<Option<String>>,
+    /// 使用 symbol_handle 时绑定的完整文件 SHA-256；普通 path/start 编辑为空。
+    pub expected_symbol_sha256: Option<String>,
+    /// 结构句柄的节点事务前置条件；v2 额外绑定节点类型与父节点范围，v1 仍按精确范围兼容。
+    pub expected_node_id: Option<String>,
+    pub expected_symbol_kind: Option<String>,
+    pub expected_symbol_range: Option<(usize, usize)>,
+    pub expected_parent_range: Option<(usize, usize)>,
+    pub expected_relocated: bool,
+    /// `symbol_handles` 多节点事务的逐节点前置条件。
+    expected_nodes: Vec<ExpectedNode>,
+}
+
+async fn resolve_edit_file_spec(args: &Value, roots: &[String]) -> Result<EditFileSpec, String> {
+    let mut request = EditFileRequest::from_args(args)?;
+    let allow_relocate = request.allow_relocate.unwrap_or(false);
+    if request.symbol_handle.is_some() && request.symbol_handles.is_some() {
+        return Err("symbol_handle 与 symbol_handles 互斥，请选择单节点或多节点事务".into());
+    }
+    if let Some(handles) = request.symbol_handles.take() {
+        if request.path.is_some()
+            || request.old.is_some()
+            || request.new.is_some()
+            || request.start.is_some()
+            || request.starts.is_some()
+            || request.anchor.is_some()
+            || request.anchors.is_some()
+            || request.replace_all.is_some()
+        {
+            return Err(
+                "symbol_handles 与 path/old/new/start/starts/anchor/replace_all 参数互斥；只需传 symbol_handles、news 和可选 dry_run"
+                    .into(),
+            );
+        }
+        if handles.is_empty() || handles.len() > 20 {
+            return Err("symbol_handles 数量必须为 1-20".into());
+        }
+        let root_paths = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let locators = tokio::task::spawn_blocking(move || {
+            crate::services::symbol_index::resolve_symbol_edit_handles(
+                &root_paths,
+                &handles,
+                allow_relocate,
+            )
+        })
+        .await
+        .map_err(|error| format!("验证多节点编辑句柄任务异常：{error}"))??;
+        let first = locators.first().expect("非空已校验");
+        if locators.iter().any(|locator| {
+            locator.path != first.path || locator.file_sha256 != first.file_sha256
+        }) {
+            return Err(
+                "symbol_handles 必须属于同一文件且绑定同一文件版本；跨文件请使用 multi_edit/LSP WorkspaceEdit"
+                    .into(),
+            );
+        }
+        request.path = Some(first.path.to_string_lossy().to_string());
+        request.starts = Some(
+            locators
+                .iter()
+                .map(|locator| locator.start_line as u64)
+                .collect(),
+        );
+        request.expected_symbol_sha256 = Some(first.file_sha256.clone());
+        request.expected_nodes = locators
+            .into_iter()
+            .map(|locator| ExpectedNode {
+                node_id: locator.node_id,
+                kind: locator.expected_kind,
+                range: (locator.start_line, locator.end_line),
+                parent_range: locator.parent_range,
+                relocated: locator.relocated,
+            })
+            .collect();
+    }
+    if let Some(handle) = request.symbol_handle.take() {
+        if request.path.is_some()
+            || request.old.is_some()
+            || request.start.is_some()
+            || request.starts.is_some()
+            || request.news.is_some()
+            || request.anchor.is_some()
+            || request.anchors.is_some()
+            || request.replace_all.is_some()
+        {
+            return Err(
+                "symbol_handle 与 path/old/start/starts/anchor/replace_all 参数互斥；只需传 symbol_handle 和 new"
+                    .into(),
+            );
+        }
+        let root_paths = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let locator = tokio::task::spawn_blocking(move || {
+            crate::services::symbol_index::resolve_symbol_edit_handles(
+                &root_paths,
+                &[handle],
+                allow_relocate,
+            )
+            .and_then(|mut locators| {
+                locators.pop().ok_or_else(|| "符号编辑句柄不能为空".to_string())
+            })
+        })
+        .await
+        .map_err(|error| format!("验证符号编辑句柄任务异常：{error}"))??;
+        request.path = Some(locator.path.to_string_lossy().to_string());
+        request.start = Some(locator.start_line as u64);
+        request.expected_symbol_sha256 = Some(locator.file_sha256);
+        request.expected_node_id = Some(locator.node_id);
+        request.expected_symbol_kind = locator.expected_kind;
+        request.expected_symbol_range = Some((locator.start_line, locator.end_line));
+        request.expected_parent_range = locator.parent_range;
+        request.expected_relocated = locator.relocated;
+    }
+    if allow_relocate && request.expected_symbol_sha256.is_none() {
+        return Err("allow_relocate 仅能与 symbol_handle 或 symbol_handles 一起使用".into());
+    }
+    request.resolve(roots)
 }
 
 pub(super) async fn delete_file(args: &Value, roots: &[String]) -> Result<String, String> {
@@ -1118,13 +1289,174 @@ pub(super) async fn list_dir(args: &Value, roots: &[String]) -> Result<String, S
     Ok(truncate_out_head_tail(&out, 3000))
 }
 
+fn append_large_line_preview(
+    out: &mut String,
+    output_chars: &mut usize,
+    line_no: u64,
+    preview: &[u8],
+    line_truncated: bool,
+) -> bool {
+    const OUTPUT_CHARS: usize = 14_000;
+    let decoded = String::from_utf8_lossy(preview);
+    let snippet: String = decoded.trim_end_matches('\r').chars().take(240).collect();
+    let suffix = if line_truncated || decoded.chars().count() > 240 {
+        " …(本行已截断)"
+    } else {
+        ""
+    };
+    let rendered = format!("{line_no:>5} │ {snippet}{suffix}\n");
+    let chars = rendered.chars().count();
+    if output_chars.saturating_add(chars) > OUTPUT_CHARS {
+        return false;
+    }
+    out.push_str(&rendered);
+    *output_chars += chars;
+    true
+}
+
+/// 大文本文件的固定内存窗口读取。扫描到目标行只需要 O(1) 额外内存；单行预览也有
+/// 独立上限，避免无换行的病理文件把进程内存撑满。行偏移 sidecar 上线后可把深页扫描
+/// 从 O(n) 降为 seek + O(window)。
+fn read_large_file_window(path: &Path, start: u64, limit: u64) -> Result<String, String> {
+    use std::io::Read;
+
+    const READ_BUFFER: usize = 64 * 1024;
+    const LINE_PREVIEW_BYTES: usize = 4 * 1024;
+    let file = std::fs::File::open(path).map_err(|e| format!("读取文件失败: {e}"))?;
+    let meta = file.metadata().map_err(|e| format!("读取文件元数据失败: {e}"))?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mut reader = std::io::BufReader::with_capacity(READ_BUFFER, file);
+    let mut chunk = [0u8; READ_BUFFER];
+    let mut line_no = 1u64;
+    let mut selected = 0u64;
+    let mut preview = Vec::with_capacity(LINE_PREVIEW_BYTES);
+    let mut line_truncated = false;
+    let mut scanned = 0usize;
+    let mut out = String::new();
+    let mut output_chars = 0usize;
+    let mut next_start: Option<u64> = None;
+
+    'scan: loop {
+        let read = reader.read(&mut chunk).map_err(|e| format!("读取文件失败: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        for byte in &chunk[..read] {
+            if scanned < 8192 && *byte == 0 {
+                return Err(format!("文件是二进制（{}），无法以文本方式读取", human_size(meta.len())));
+            }
+            scanned = scanned.saturating_add(1);
+            let selected_line = line_no >= start;
+            if *byte == b'\n' {
+                if selected_line {
+                    if selected >= limit {
+                        next_start = Some(line_no);
+                        break 'scan;
+                    }
+                    if !append_large_line_preview(
+                        &mut out,
+                        &mut output_chars,
+                        line_no,
+                        &preview,
+                        line_truncated,
+                    ) {
+                        next_start = Some(line_no);
+                        break 'scan;
+                    }
+                    selected += 1;
+                }
+                line_no = line_no.saturating_add(1);
+                preview.clear();
+                line_truncated = false;
+            } else if selected_line {
+                if preview.len() < LINE_PREVIEW_BYTES {
+                    preview.push(*byte);
+                } else {
+                    line_truncated = true;
+                }
+            }
+        }
+    }
+
+    if next_start.is_none() && !preview.is_empty() && line_no >= start {
+        if selected >= limit
+            || !append_large_line_preview(
+                &mut out,
+                &mut output_chars,
+                line_no,
+                &preview,
+                line_truncated,
+            )
+        {
+            next_start = Some(line_no);
+        } else {
+            selected += 1;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("（目标窗口为空；start 可能已超过文件末尾）\n");
+    }
+    let window_end = if selected == 0 {
+        0
+    } else {
+        start.saturating_add(selected).saturating_sub(1)
+    };
+    let cursor = next_start.map_or_else(|| "end".into(), |line| line.to_string());
+    Ok(format!(
+        "文件 {}（{}；file_version=stat:{mtime_ns}:{}；流式窗口=L{start}-L{window_end}；next_start={cursor}；总行数=未预计算）：\n{out}",
+        path.display(),
+        human_size(meta.len()),
+        meta.len(),
+    ))
+}
+
 pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, String> {
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法读取文件".into());
     }
-    // Request/Spec 分离：宽松参数 ReadFileRequest → 显式 resolve() 产出严格规范 ReadFileSpec
-    let spec = ReadFileRequest::from_args(args)?.resolve(roots)?;
+    // Request/Spec 分离：宽松参数 ReadFileRequest → 显式 resolve() 产出严格规范 ReadFileSpec。
+    // 结构句柄先在阻塞线程验证完整文件 SHA-256，再转换为普通安全读取区间。
+    let mut request = ReadFileRequest::from_args(args)?;
+    if let Some(handle) = request.symbol_handle.take() {
+        if request.path.is_some()
+            || request.start.is_some()
+            || request.lines.is_some()
+            || request.outline.unwrap_or(false)
+            || request.outline_page.is_some()
+            || request.outline_filter.is_some()
+        {
+            return Err("symbol_handle 与 path/start/lines/outline 参数互斥，请只传结构读取句柄".into());
+        }
+        let root_paths = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let locator = tokio::task::spawn_blocking(move || {
+            crate::services::symbol_index::resolve_symbol_read_handle(&root_paths, &handle)
+        })
+        .await
+        .map_err(|error| format!("验证符号读取句柄任务异常：{error}"))??;
+        request.path = Some(locator.path.to_string_lossy().to_string());
+        request.start = Some(locator.start_line as u64);
+        request.lines = Some(
+            locator
+                .end_line
+                .saturating_sub(locator.start_line)
+                .saturating_add(1) as u64,
+        );
+    }
+    let spec = request.resolve(roots)?;
     let p = &spec.path;
+    if spec.stream_large {
+        let path = p.clone();
+        let start = spec.start;
+        let lines = spec.lines;
+        return tokio::task::spawn_blocking(move || read_large_file_window(&path, start, lines))
+            .await
+            .map_err(|e| format!("流式读取文件任务异常: {e}"))?;
+    }
     // 整文件读取 + metadata 为 IO 操作（大文件/日志可达数 MB~数十 MB），
     // 放 spawn_blocking 避免钉死 tokio worker
     let p_buf = p.clone();
@@ -1143,6 +1475,7 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     }
     // 记录文件指纹（外部修改检测基线）
     stamp_put(p, &meta, &bytes);
+    let file_version = file_content_version(&bytes);
     // 编码：UTF-8 严格校验；非 UTF-8 用 GBK 解码展示（Windows 老项目常见），并标注编码避免误导
     let (text, enc_note) = match std::str::from_utf8(&bytes) {
         Ok(s) => {
@@ -1386,11 +1719,20 @@ pub(super) async fn read_file(args: &Value, roots: &[String]) -> Result<String, 
     } else {
         String::new()
     };
+    let processed_end = (win_begin + shown_lines).min(win_end);
+    let window_start = if total == 0 { 0 } else { win_begin + 1 };
+    let next_start = if processed_end < total {
+        (processed_end + 1).to_string()
+    } else {
+        "end".to_string()
+    };
     Ok(truncate_out_max(
         &format!(
-            "文件 {}{enc_note}（{}，共 {total} 行）：\n{block_note}{comment_note}{out}",
+            "文件 {}{enc_note}（{}，共 {total} 行；file_version=sha256:{file_version}；窗口=L{}-L{}；next_start={next_start}）：\n{block_note}{comment_note}{out}",
             p.display(),
-            human_size(meta.len())
+            human_size(meta.len()),
+            window_start,
+            processed_end,
         ),
         if block_expanded { BLOCK_CHARS + 2000 } else { 15000 },
     ))
@@ -1797,7 +2139,7 @@ pub(super) fn block_style(ext: &str) -> BlockStyle {
 
 /// 跨行扫描状态：块注释（/* */）与多行字符串（` 模板串、三引号等）跨行持续
 #[derive(Default)]
-pub(super) struct LineScanner {
+pub(crate) struct LineScanner {
     in_block_comment: bool,
     in_str: Option<char>,
     /// Rust 原始字符串（r"…" / r#"…"# / r##"…"##，含 br/cr 前缀）：
@@ -1818,13 +2160,13 @@ impl LineScanner {
     /// 逐字符扫描一行，把「有意义的括号字符」按出现顺序交给 cb；
     /// 字符串（" ' `）、三引号字符串、Rust 原始字符串、正则字面量、转义、
     /// 行注释（//，Python/Shell 的 #）、块注释（/* */）内的字符全部跳过。
-    pub(super) fn scan(&mut self, line: &str, ext: &str, mut cb: impl FnMut(char)) {
+    pub(crate) fn scan(&mut self, line: &str, ext: &str, mut cb: impl FnMut(char)) {
         let hash_comment = matches!(ext, "py" | "pyw" | "sh" | "bash" | "zsh" | "fish");
         let raw_str = ext == "rs";
-        // 三引号字符串语言：Python 双/三单引号，JVM/Dart 系仅三双引号
+        // 三引号字符串语言：Python/Dart 支持双、三单引号，JVM 系仅三双引号
         let triple: &[u8] = match ext {
-            "py" | "pyw" => b"\"'",
-            "kt" | "kts" | "dart" | "scala" | "groovy" => b"\"",
+            "py" | "pyw" | "dart" => b"\"'",
+            "kt" | "kts" | "scala" | "groovy" => b"\"",
             _ => b"",
         };
         // 正则字面量语言（JS 系）：`/` 可为除法或正则开头，用前驱字符消歧
@@ -2314,6 +2656,59 @@ pub(super) async fn find_files(args: &Value, roots: &[String]) -> Result<String,
     if !root.is_dir() {
         return Err(format!("路径不是目录: {}", root.display()));
     }
+    let state = args["state"].as_str().map(str::trim).filter(|value| !value.is_empty());
+    if state.is_some_and(|value| {
+        !matches!(
+            value,
+            "indexed" | "deferred" | "oversized" | "unsupported" | "symlink" | "unreadable"
+        )
+    }) {
+        return Err("state 仅支持 indexed|deferred|oversized|unsupported|symlink|unreadable".into());
+    }
+    let page = args["page"].as_u64().unwrap_or(1) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+    let project_root = PathBuf::from(&roots[0]);
+    let prefix = root
+        .strip_prefix(&project_root)
+        .ok()
+        .map(|value| value.to_string_lossy().replace('\\', "/"));
+    if let Some(prefix) = prefix {
+        let project_root_for_query = project_root.clone();
+        let pattern_for_query = pattern.to_string();
+        let state_for_query = state.map(str::to_string);
+        let catalog = tokio::task::spawn_blocking(move || {
+            crate::services::symbol_index::query_catalog_files(
+                &project_root_for_query,
+                &pattern_for_query,
+                Some(&prefix),
+                state_for_query.as_deref(),
+                page,
+                limit,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Some(result) = catalog {
+            let result = result?;
+            let mut out = format!(
+                "全库目录匹配 {} 个文件，第 {} 页（每页 {}）：\n",
+                result.total_matches, result.page, result.page_size
+            );
+            for file in result.items {
+                out.push_str(&format!(
+                    "{}  [{}; {} bytes; shard={}]\n",
+                    project_root.join(&file.path).display(),
+                    file.state,
+                    file.size,
+                    file.shard,
+                ));
+            }
+            if let Some(next_page) = result.next_page {
+                out.push_str(&format!("还有结果：使用 page={next_page} 读取下一页。\n"));
+            }
+            return Ok(truncate_out(&out));
+        }
+    }
     // 全树递归遍历为 IO 密集操作，放 spawn_blocking 避免钉死 tokio worker
     let root_buf = root.clone();
     let roots_owned: Vec<String> = roots.to_vec();
@@ -2648,6 +3043,7 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
     let content = spec.content.as_str();
     let existed = p.exists();
     let mut content_out = content.to_string();
+    let mut old_bytes_for_undo: Option<Vec<u8>> = None;
     if existed {
         // 冲突保护：文件自上次读取后被外部修改（IDE/用户/其他会话）→ 拒绝覆盖，要求重读确认。
         // 整文件读取在 spawn_blocking 中执行，避免大文件读钉死 tokio worker。
@@ -2657,6 +3053,7 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
             .ok()
             .and_then(|r| r.ok());
         if let Some(bytes) = old_bytes {
+            old_bytes_for_undo = Some(bytes.clone());
             if has_external_change(p, &bytes) {
                 return Err(format!(
                     "写入冲突：文件 {} 自上次读取后被修改（可能被外部编辑器/IDE、其他会话或命令间接改动）。\n请先 read_file 查看最新内容、确认意图后再写入（重新读取会解除冲突保护）。",
@@ -2673,25 +3070,12 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
             if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) && !content_out.starts_with('\u{feff}') {
                 content_out.insert(0, '\u{feff}');
             }
-            // 撤销快照：覆盖前记录旧内容（必须记旧字节，记新内容会导致 undo 失效）
-            crate::agent::undo::snapshot(conversation_id, p, &bytes);
         }
-    }
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建目录失败 {}: {e}", parent.display()))?;
     }
     // 配平守卫（与 edit_file 同口径）：代码文件写入后必须配平——
     // 新文件不存在（旧内容为空串，视为配平基准），内容缺结束符（漏 } 等）→ 拒绝落盘
-    {
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let old_text = std::fs::read_to_string(p).unwrap_or_default(); // 不存在/读取失败 → 空串
-        balance_guard(&old_text, &content_out, &ext)?;
-    }
+    let old_text = std::fs::read_to_string(p).unwrap_or_default(); // 不存在/读取失败 → 空串
+    super::code_mutation::validate_candidate_with_types(p, &old_text, &content_out)?;
     // [58] dry-run：预览将写入的内容，不落盘、不写 undo
     if args["dry_run"].as_bool().unwrap_or(false) {
         let preview: String = {
@@ -2710,6 +3094,10 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
             preview
         ));
     }
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目录失败 {}: {e}", parent.display()))?;
+    }
     // 落盘 + 指纹登记：文件写入为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
     let p_buf = p.clone();
     let content_buf = content_out.clone();
@@ -2722,6 +3110,10 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
     .map_err(|e| format!("写入文件任务异常: {e}"))??;
     if let Some(meta) = wmeta {
         stamp_put(p, &meta, content_out.as_bytes());
+    }
+    if let Some(bytes) = old_bytes_for_undo.as_deref() {
+        // 仅成功落盘后记录旧内容，拒绝、预览或写入失败均不会污染 undo 栈。
+        crate::agent::undo::snapshot(conversation_id, p, bytes);
     }
     Ok(format!(
         "已{}文件 {}（{} 字节）",
@@ -2819,6 +3211,65 @@ fn plan_batch_blocks(
         let (o, c) = locate_edit_block(&body_lines, s, a, ext)?;
         located.push(((o, c), k));
     }
+    compose_batch_ranges(body, located, news, "starts")
+}
+
+fn plan_java_byte_nodes(
+    body: &str,
+    nodes: &[ExpectedNode],
+    news: &[String],
+) -> Result<(String, Vec<(usize, usize)>), String> {
+    if nodes.is_empty() || nodes.len() != news.len() {
+        return Err("Java 批量节点与替换内容数量不匹配".into());
+    }
+    let mut spans = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let (start, end) = super::code_mutation::resolve_java_handle_byte_range(
+            body, node.range.0, node.range.1, node.kind.as_deref(),
+        )?;
+        spans.push((start, end, index));
+    }
+    spans.sort_by_key(|span| span.0);
+    if spans.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return Err("批量编辑的节点重叠：Java 字节区间相交或重复，未写入任何内容".into());
+    }
+    let mut result = String::with_capacity(body.len());
+    let mut cursor = 0;
+    for (start, end, index) in spans {
+        result.push_str(&body[cursor..start]);
+        result.push_str(&news[index]);
+        cursor = end;
+    }
+    result.push_str(&body[cursor..]);
+    Ok((result, nodes.iter().map(|node| (node.range.0 - 1, node.range.1 - 1)).collect()))
+}
+
+fn plan_exact_node_ranges(
+    body: &str,
+    nodes: &[ExpectedNode],
+    news: &[String],
+) -> Result<(String, Vec<(usize, usize)>), String> {
+    let total = body.split('\n').count();
+    let mut located = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let (start, end) = node.range;
+        if start == 0 || end < start || end > total {
+            return Err(format!(
+                "结构编辑句柄已过期：symbol_handles[{index}] 的节点范围 L{start}-L{end} 已越出当前文件（共 {total} 行）"
+            ));
+        }
+        located.push(((start - 1, end - 1), index));
+    }
+    compose_batch_ranges(body, located, news, "symbol_handles")
+}
+
+fn compose_batch_ranges(
+    body: &str,
+    located: Vec<((usize, usize), usize)>,
+    news: &[String],
+    source: &str,
+) -> Result<(String, Vec<(usize, usize)>), String> {
+    let body_lines: Vec<&str> = body.split('\n').collect();
     // 2. 重叠校验：同一块重复或区间相交 → 拒绝（拼接语义不明确）
     let mut sorted = located.clone();
     sorted.sort_by_key(|((o, _), _)| *o);
@@ -2827,7 +3278,7 @@ fn plan_batch_blocks(
         let ((o2, _), k2) = w[1];
         if o2 <= c1 {
             return Err(format!(
-                "批量编辑的块重叠：starts[{}] 定位到 L{}-L{}，starts[{}] 定位到 L{} 起，两者相交（同一块只需出现一次）",
+                "批量编辑的节点重叠：{source}[{}] 定位到 L{}-L{}，{source}[{}] 定位到 L{} 起，两者相交（同一节点只需出现一次）",
                 k1,
                 o1 + 1,
                 c1 + 1,
@@ -2852,14 +3303,14 @@ fn plan_batch_blocks(
         cursor = if c + 1 < line_starts.len() { line_starts[c + 1] } else { body.len() };
     }
     out.push_str(&body[cursor..]);
-    // 返回区间按 starts 原顺序（报告与参数一一对应）
+    // 返回区间按参数原顺序（报告与参数一一对应）
     let ranges = located.iter().map(|(r, _)| *r).collect();
     Ok((out, ranges))
 }
 
 /// 编辑落盘守卫：原文件配平而新内容失衡 → 拒绝（返回 Err 带定位提示）。
 /// 原文件本就失衡（病态/片段文件）时放行（允许修复），仅代码类扩展名适用。
-fn balance_guard(old_text: &str, new_text: &str, ext: &str) -> Result<(), String> {
+pub(super) fn balance_guard(old_text: &str, new_text: &str, ext: &str) -> Result<(), String> {
     if !is_code_ext(ext) {
         return Ok(());
     }
@@ -2934,13 +3385,56 @@ pub(super) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
     Ok((replaced, count))
 }
 
+fn verify_write_baseline(path: &Path, old_bytes: &[u8]) -> Result<(), String> {
+    // 候选分析与 spawn_blocking 派发之间可能发生外部改写，真正写入前再核对完整基线。
+    // 这是最终前置检查，不宣称能锁住不合作的外部进程或提供文件系统级 CAS。
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| format!("提交前无法核验文件，未写入：{error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("编辑冲突：提交目标不再是普通文件，未写入".into());
+    }
+    if metadata.len() != old_bytes.len() as u64 {
+        return Err("结构编辑句柄已过期：文件在定位后再次发生变化，提交前长度校验拒绝写入".into());
+    }
+    use std::io::Read;
+    let mut current = Vec::with_capacity(old_bytes.len());
+    std::fs::File::open(path).and_then(|file| file.take(old_bytes.len() as u64 + 1).read_to_end(&mut current))
+        .map_err(|error| format!("提交前无法读取文件，未写入：{error}"))?;
+    if current != old_bytes {
+        return Err("结构编辑句柄已过期：文件在定位后再次发生变化，提交前校验拒绝写入；请重新读取后重试".into());
+    }
+    Ok(())
+}
+
+fn write_candidate_with_restore(
+    path: &Path,
+    old_bytes: &[u8],
+    candidate: &[u8],
+) -> Result<Option<std::fs::Metadata>, String> {
+    verify_write_baseline(path, old_bytes)?;
+    if let Err(error) = std::fs::write(path, candidate) {
+        return match std::fs::write(path, old_bytes) {
+            Ok(()) => {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    stamp_put(path, &meta, old_bytes);
+                }
+                Err(format!("写入文件失败，已恢复原内容: {error}"))
+            }
+            Err(restore_error) => Err(format!(
+                "写入文件失败且恢复原内容失败，请立即检查 {}：写入错误={error}；恢复错误={restore_error}",
+                path.display()
+            )),
+        };
+    }
+    Ok(std::fs::metadata(path).ok())
+}
+
 /// edit_file：精确文本替换修改文件（≤1MB）
 pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &str) -> Result<String, String> {
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法编辑文件".into());
     }
     // Request/Spec 分离：宽松参数 EditFileRequest → 显式 resolve() 产出严格规范 EditFileSpec
-    let spec = EditFileRequest::from_args(args)?.resolve(roots)?;
+    let spec = resolve_edit_file_spec(args, roots).await?;
     check_nested_module_path(&spec.path, roots)?;
     let p = &spec.path;
     let old = spec.old.as_str();
@@ -2955,8 +3449,17 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return Err("文件是二进制，无法以文本方式编辑".into());
     }
-    // 冲突保护：文件自上次读取后被外部修改 → 提前拦截（比 old 匹配失败的报错更明确）
-    if has_external_change(p, &bytes) {
+    // 结构句柄是完整 SHA-256 基线，强于进程内 FNV stamp；普通编辑仍沿用最后读取基线。
+    if spec
+        .expected_symbol_sha256
+        .as_ref()
+        .is_some_and(|expected| crate::services::symbol_index::sha256_base64(&bytes) != *expected)
+    {
+        return Err(
+            "结构编辑句柄已过期：文件在定位后再次发生变化，请重新查询结构后重试".into(),
+        );
+    }
+    if spec.expected_symbol_sha256.is_none() && has_external_change(p, &bytes) {
         return Err(format!(
             "编辑冲突：文件 {} 自上次读取后被修改（可能被外部编辑器/IDE、其他会话或命令间接改动）。\n请先 read_file 查看最新内容后重新编辑（重新读取会解除冲突保护）。",
             p.display()
@@ -2987,9 +3490,20 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
-        let (final_body, ranges) = plan_batch_blocks(body, starts, &spec.news, &spec.anchors, &ext)?;
-        balance_guard(body, &final_body, &ext)?;
+        let (final_body, ranges) = if spec.expected_nodes.is_empty() {
+            plan_batch_blocks(body, starts, &spec.news, &spec.anchors, &ext)?
+        } else if ext == "java" {
+            plan_java_byte_nodes(body, &spec.expected_nodes, &spec.news)?
+        } else {
+            plan_exact_node_ranges(body, &spec.expected_nodes, &spec.news)?
+        };
+        super::code_mutation::validate_candidate_with_types(p, body, &final_body)?;
         let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body.clone() };
+        let range_label = if spec.expected_nodes.is_empty() {
+            "starts"
+        } else {
+            "symbol_handles"
+        };
         if args["dry_run"].as_bool().unwrap_or(false) {
             let old_lines: Vec<&str> = body.split('\n').collect();
             let new_lines: Vec<&str> = final_body.split('\n').collect();
@@ -2997,7 +3511,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             let mut sum = String::new();
             for (k, (o, c)) in ranges.iter().enumerate() {
                 sum.push_str(&format!(
-                    "  starts[{k}]：L{}-L{}（{} 行）→ {}\n",
+                    "  {range_label}[{k}]：L{}-L{}（{} 行）→ {}\n",
                     o + 1,
                     c + 1,
                     c - o + 1,
@@ -3009,29 +3523,43 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
                 ranges.len()
             ));
         }
-        crate::agent::undo::snapshot(conversation_id, p, &bytes);
         // 落盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
         let p_buf = p.clone();
         let final_buf = final_text.clone();
-        let (wmeta, _) = tokio::task::spawn_blocking(move || {
-            std::fs::write(&p_buf, final_buf.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
-            Ok::<(Option<std::fs::Metadata>, ()), String>((std::fs::metadata(&p_buf).ok(), ()))
+        let old_buf = bytes.clone();
+        let wmeta = tokio::task::spawn_blocking(move || {
+            write_candidate_with_restore(&p_buf, &old_buf, final_buf.as_bytes())
         })
         .await
         .map_err(|e| format!("写入文件任务异常: {e}"))??;
         if let Some(meta) = wmeta {
             stamp_put(p, &meta, final_text.as_bytes());
         }
+        crate::agent::undo::snapshot(conversation_id, p, &bytes);
         let mut report = String::new();
         for (k, (o, c)) in ranges.iter().enumerate() {
             report.push_str(&format!(
-                "  starts[{k}]：L{}-L{}（{} 行）→ {}（新内容 {} 行）\n",
+                "  {range_label}[{k}]：L{}-L{}（{} 行）→ {}（新内容 {} 行）\n",
                 o + 1,
                 c + 1,
                 c - o + 1,
                 if spec.news[k].is_empty() { "已删除" } else { "已替换" },
                 spec.news[k].split('\n').count()
             ));
+            if let Some(node) = spec.expected_nodes.get(k) {
+                let short_id = node.node_id.chars().take(12).collect::<String>();
+                let parent = node
+                    .parent_range
+                    .map(|(start, end)| format!("L{start}-L{end}"))
+                    .unwrap_or_else(|| "top-level".into());
+                report.push_str(&format!(
+                    "    节点事务：kind={}，node_id={short_id}…，parent={parent}\n",
+                    node.kind.as_deref().unwrap_or("legacy")
+                ));
+                if node.relocated {
+                    report.push_str("    受控重定位：原文件版本已变化，目标节点内容与稳定身份唯一匹配\n");
+                }
+            }
         }
         return Ok(format!("已批量编辑 {} 个块：\n{report}文件：{}", ranges.len(), p.display()));
     }
@@ -3046,7 +3574,22 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             .unwrap_or("")
             .to_lowercase();
         let body_lines: Vec<&str> = body.split('\n').collect();
-        let (o, c) = locate_edit_block(&body_lines, start_line, spec.anchor.as_deref(), &ext)?;
+        let java_bytes = if ext == "java" {
+            spec.expected_symbol_range.map(|(start, end)| {
+                super::code_mutation::resolve_java_handle_byte_range(body, start, end, spec.expected_symbol_kind.as_deref())
+            }).transpose()?
+        } else { None };
+        let (o, c) = if let Some((start, end)) = spec.expected_symbol_range {
+            if start == 0 || end < start || end > body_lines.len() {
+                return Err(
+                    "结构编辑句柄已过期：节点精确范围已越出当前文件，请重新查询结构后重试"
+                        .into(),
+                );
+            }
+            (start - 1, end - 1)
+        } else {
+            locate_edit_block(&body_lines, start_line, spec.anchor.as_deref(), &ext)?
+        };
         // 按字节边界切出完整块（split('\n') 保留 CRLF 的 \r，替换后保持原换行风格）
         let mut line_starts: Vec<usize> = Vec::with_capacity(body_lines.len());
         let mut off = 0usize;
@@ -3056,10 +3599,13 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
         }
         let start_off = line_starts[o];
         let end_off = if c + 1 < line_starts.len() { line_starts[c + 1] } else { body.len() };
+        let (start_off, end_off) = java_bytes.unwrap_or((start_off, end_off));
         let block_lines = c - o + 1;
         let final_body = format!("{}{}{}", &body[..start_off], spec.new, &body[end_off..]);
         // 先构造 final_text 时不再 move final_body（dry_run 分支仍需借用）
         let final_text = if has_bom { format!("\u{feff}{final_body}") } else { final_body.clone() };
+        // 单节点预览与真实写入共用候选门禁，不能预览为可应用后才发现语法无效。
+        super::code_mutation::validate_candidate_with_types(p, body, &final_body)?;
         // [58] dry-run：内存 diff 预览，不落盘、不写 undo
         if args["dry_run"].as_bool().unwrap_or(false) {
             let old_lines: Vec<&str> = body.split('\n').collect();
@@ -3073,22 +3619,19 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
                 block_lines
             ));
         }
-        // 配平守卫：原文件配平而替换后失衡 → 拒绝落盘（新内容残缺，如漏结束符）
-        balance_guard(body, &final_body, &ext)?;
-        // 撤销快照：落盘前记录旧内容（会话级，undo_edit 工具按栈序恢复）
-        crate::agent::undo::snapshot(conversation_id, p, &bytes);
         // 落盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
         let p_buf = p.clone();
         let final_buf = final_text.clone();
-        let (wmeta, _) = tokio::task::spawn_blocking(move || {
-            std::fs::write(&p_buf, final_buf.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
-            Ok::<(Option<std::fs::Metadata>, ()), String>((std::fs::metadata(&p_buf).ok(), ()))
+        let old_buf = bytes.clone();
+        let wmeta = tokio::task::spawn_blocking(move || {
+            write_candidate_with_restore(&p_buf, &old_buf, final_buf.as_bytes())
         })
         .await
         .map_err(|e| format!("写入文件任务异常: {e}"))??;
         if let Some(meta) = wmeta {
             stamp_put(p, &meta, final_text.as_bytes());
         }
+        crate::agent::undo::snapshot(conversation_id, p, &bytes);
         let show = |s: &str| -> String {
             let n = s.chars().count();
             if n > 200 {
@@ -3104,6 +3647,24 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             c + 1,
             block_lines
         );
+        if let (Some(node_id), Some(kind)) = (
+            spec.expected_node_id.as_deref(),
+            spec.expected_symbol_kind.as_deref(),
+        ) {
+            let short_id = node_id.chars().take(12).collect::<String>();
+            let parent = spec
+                .expected_parent_range
+                .map(|(start, end)| format!("L{start}-L{end}"))
+                .unwrap_or_else(|| "top-level".into());
+            report.push_str(&format!(
+                "节点事务：kind={kind}，node_id={short_id}…，parent={parent}\n"
+            ));
+            if spec.expected_relocated {
+                report.push_str(
+                    "受控重定位：原文件版本已变化，目标节点内容与稳定身份唯一匹配\n",
+                );
+            }
+        }
         report.push_str(&format!("块首行：{}\n", show(body_lines[o].trim())));
         if !spec.new.is_empty() {
             report.push_str(&format!("新内容：{}\n", show(&spec.new)));
@@ -3118,14 +3679,7 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
     let (replaced, count) = apply_edit(body, old, new, replace_all)
         .map_err(|e| with_advice("edit_file", e))?;
     // 配平守卫：原文件配平而替换后失衡 → 拒绝落盘（新内容残缺，如漏结束符）
-    {
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        balance_guard(body, &replaced, &ext)?;
-    }
+    super::code_mutation::validate_candidate_with_types(p, body, &replaced)?;
     // 先构造 final_text 时不再 move replaced（dry_run 分支仍需借用）
     let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced.clone() };
     // [58] dry-run：内存 diff 预览，不落盘、不写 undo
@@ -3138,20 +3692,19 @@ pub(super) async fn edit_file(args: &Value, roots: &[String], conversation_id: &
             if replace_all { "全部替换" } else { "仅第一处" }
         ));
     }
-    // 撤销快照：落盘前记录旧内容（会话级，undo_edit 工具按栈序恢复）
-    crate::agent::undo::snapshot(conversation_id, p, &bytes);
     // 落盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
     let p_buf = p.clone();
     let final_buf = final_text.clone();
-    let (wmeta, _) = tokio::task::spawn_blocking(move || {
-        std::fs::write(&p_buf, final_buf.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
-        Ok::<(Option<std::fs::Metadata>, ()), String>((std::fs::metadata(&p_buf).ok(), ()))
+    let old_buf = bytes.clone();
+    let wmeta = tokio::task::spawn_blocking(move || {
+        write_candidate_with_restore(&p_buf, &old_buf, final_buf.as_bytes())
     })
     .await
     .map_err(|e| format!("写入文件任务异常: {e}"))??;
     if let Some(meta) = wmeta {
         stamp_put(p, &meta, final_text.as_bytes());
     }
+    crate::agent::undo::snapshot(conversation_id, p, &bytes);
     // 原文/新文各截 200 字符展示，避免大段替换把结果撑爆上下文
     let show = |s: &str| -> String {
         let n = s.chars().count();
@@ -3336,7 +3889,7 @@ pub(super) async fn preview_edit(args: &Value, roots: &[String], _conversation_i
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法预览编辑".into());
     }
-    let spec = EditFileRequest::from_args(args)?.resolve(roots)?;
+    let spec = resolve_edit_file_spec(args, roots).await?;
     let p = &spec.path;
     if !p.is_file() {
         return Err(format!(
@@ -3347,6 +3900,15 @@ pub(super) async fn preview_edit(args: &Value, roots: &[String], _conversation_i
     let bytes = std::fs::read(p).map_err(|e| format!("读取文件失败: {e}"))?;
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return Err("文件是二进制，无法以文本方式编辑".into());
+    }
+    if spec
+        .expected_symbol_sha256
+        .as_ref()
+        .is_some_and(|expected| crate::services::symbol_index::sha256_base64(&bytes) != *expected)
+    {
+        return Err(
+            "结构编辑句柄已过期：文件在定位后再次发生变化，请重新查询结构后重试".into(),
+        );
     }
     // 严格 UTF-8 校验（与 edit_file 同口径，防 GBK 文件预览后写坏）
     let text = std::str::from_utf8(&bytes)
@@ -3430,43 +3992,53 @@ pub(super) async fn multi_edit(
     if edits.len() > 10 {
         return Err("单次最多批量编辑 10 个文件，请拆分为多次调用".into());
     }
-    let mut report: Vec<String> = Vec::new();
-    let mut ok_count = 0usize;
+    let mut prepared = Vec::with_capacity(edits.len());
+    let mut paths = std::collections::HashSet::new();
     for (i, e) in edits.iter().enumerate() {
-        let raw = match e.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => {
-                report.push(format!("{}. ❌ 缺少 path 参数，跳过", i + 1));
-                continue;
-            }
-        };
+        let raw = e.get("path").and_then(|v| v.as_str()).ok_or_else(||
+            format!("第 {} 项缺少 path 参数；multi_edit 已整体拒绝，未写入任何文件", i + 1)
+        )?;
         let old = e.get("old").and_then(|v| v.as_str()).unwrap_or("");
         let new = e.get("new").and_then(|v| v.as_str()).unwrap_or("");
         let replace_all = e.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-        match apply_single_edit(raw, old, new, replace_all, roots, conversation_id) {
-            Ok(msg) => {
-                ok_count += 1;
-                report.push(format!("{}. ✅ {msg}", i + 1));
-            }
-            Err(err) => report.push(format!("{}. ❌ {err}", i + 1)),
+        let item = prepare_single_edit(raw, old, new, replace_all, roots)?;
+        if !paths.insert(item.path.clone()) {
+            return Err(format!(
+                "multi_edit 包含重复文件 {}；为避免顺序语义不确定已整体拒绝，未写入任何文件",
+                item.path.display()
+            ));
         }
+        prepared.push(item);
     }
+    // 类型门禁放在全部候选准备完成之后：同批 Java 候选一起编译，才能看到
+    // “本批把 A 改坏了、B 还在调用”这类单文件校验看不到的破坏。
+    validate_batch_types(&prepared)?;
+    commit_prepared_edits(&prepared, conversation_id)?;
     Ok(format!(
-        "批量编辑完成：{ok_count}/{} 项成功\n\n{}",
-        edits.len(),
-        report.join("\n")
+        "批量编辑原子提交完成：{} 个文件\n{}",
+        prepared.len(),
+        prepared.iter()
+            .map(|item| format!("✅ {}（替换 {} 处）", item.path.display(), item.count))
+            .collect::<Vec<_>>()
+            .join("\n")
     ))
 }
 
-/// 单文件替换核心（multi_edit 复用；校验/冲突保护/撤销快照/落盘与 edit_file 同口径）
-pub(super) fn apply_single_edit(
+struct PreparedEdit {
+    path: PathBuf,
+    old_bytes: Vec<u8>,
+    final_text: String,
+    count: usize,
+}
+
+/// 只读取、定位和验证候选文本，不产生写入或 undo 副作用。
+fn prepare_single_edit(
     raw: &str,
     old: &str,
     new: &str,
     replace_all: bool,
     roots: &[String],
-    conversation_id: &str,
-) -> Result<String, String> {
+) -> Result<PreparedEdit, String> {
     if old.is_empty() {
         return Err(format!("{raw}: old 参数不能为空"));
     }
@@ -3501,13 +4073,75 @@ pub(super) fn apply_single_edit(
         None => (false, text.as_str()),
     };
     let (replaced, count) = apply_edit(body, old, new, replace_all)?;
+    // 单文件先过语法/注解门禁（便宜且报错精确）；Java 的类型差分管线在整批准备完后
+    // 由 validate_batch_types 联编一次，既省掉 N 次 javac，又能覆盖批内跨文件破坏。
+    super::code_mutation::validate_candidate(&p, body, &replaced)?;
     let final_text = if has_bom { format!("\u{feff}{replaced}") } else { replaced };
-    crate::agent::undo::snapshot(conversation_id, &p, &bytes);
-    std::fs::write(&p, final_text.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
-    if let Ok(meta) = std::fs::metadata(&p) {
-        stamp_put(&p, &meta, final_text.as_bytes());
+    Ok(PreparedEdit { path: p, old_bytes: bytes, final_text, count })
+}
+
+/// 本批 Java 候选的联编类型门禁（含同源码根下的未编辑调用方）：取出候选文本交给
+/// code_mutation 的统一门禁，非 Java 批次直接通过。
+fn validate_batch_types(edits: &[PreparedEdit]) -> Result<(), String> {
+    let java_files: Vec<(&std::path::Path, &str, &str)> = edits
+        .iter()
+        .filter(|item| item.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("java")))
+        .map(|item| {
+            (
+                item.path.as_path(),
+                std::str::from_utf8(&item.old_bytes).unwrap_or_default(),
+                item.final_text.as_str(),
+            )
+        })
+        .collect();
+    super::code_mutation::validate_batch_types(&java_files)
+}
+
+fn commit_prepared_edits(edits: &[PreparedEdit], conversation_id: &str) -> Result<(), String> {
+    for item in edits {
+        verify_write_baseline(&item.path, &item.old_bytes)
+            .map_err(|error| format!("multi_edit 提交前校验失败，未写入任何文件：{}：{error}", item.path.display()))?;
     }
-    Ok(format!("{}（替换 {count} 处）", p.display()))
+    let mut committed: Vec<&PreparedEdit> = Vec::with_capacity(edits.len());
+    for item in edits {
+        if let Err(error) = write_candidate_with_restore(&item.path, &item.old_bytes, item.final_text.as_bytes()) {
+            let mut unresolved = rollback_prepared_edits(&committed);
+            if let Err(current_error) = verify_write_baseline(&item.path, &item.old_bytes) {
+                unresolved.push(format!("{}：{current_error}", item.path.display()));
+            }
+            if !unresolved.is_empty() {
+                return Err(format!("multi_edit 回滚未完成，需人工核验；不能保证原始基线已恢复。提交错误：{error}；未恢复项：{}", unresolved.join("；")));
+            }
+            return Err(format!(
+                "multi_edit 原子提交失败，已恢复当前文件并回滚此前 {} 个文件：{}：{error}",
+                committed.len(),
+                item.path.display()
+            ));
+        }
+        if let Ok(meta) = std::fs::metadata(&item.path) {
+            stamp_put(&item.path, &meta, item.final_text.as_bytes());
+        }
+        committed.push(item);
+    }
+    // 整批成功后才登记 undo，事务失败不会留下不可用的撤销记录。
+    for item in edits {
+        crate::agent::undo::snapshot(conversation_id, &item.path, &item.old_bytes);
+    }
+    Ok(())
+}
+
+/// 只恢复仍等于本事务候选的文件，绝不盲目覆盖后来发生的外部编辑。
+fn rollback_prepared_edits(committed: &[&PreparedEdit]) -> Vec<String> {
+    let mut unresolved = Vec::new();
+    for item in committed.iter().rev() {
+        if verify_write_baseline(&item.path, &item.old_bytes).is_ok() { continue; }
+        match write_candidate_with_restore(&item.path, item.final_text.as_bytes(), &item.old_bytes) {
+            Ok(Some(meta)) => stamp_put(&item.path, &meta, &item.old_bytes),
+            Ok(None) => {},
+            Err(error) => unresolved.push(format!("{}：{error}", item.path.display())),
+        }
+    }
+    unresolved
 }
 
 /// copy_file：复制项目内文件/目录（不覆盖目标，禁止受保护路径）
@@ -4110,6 +4744,330 @@ mod tests {
     }
 
     #[test]
+    fn multi_edit_validates_all_files_before_any_write() {
+        let dir = std::env::temp_dir().join(format!("multi_atomic_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let first = dir.join("first.rs");
+        let second = dir.join("second.ts");
+        std::fs::write(&first, "fn first() { old(); }\n").unwrap();
+        std::fs::write(&second, "function second() { return 1; }\n").unwrap();
+        for path in [&first, &second] {
+            block_on_rt(read_file(&serde_json::json!({"path": path.to_string_lossy()}), &roots))
+                .expect("read establishes edit baseline");
+        }
+        let result = block_on_rt(multi_edit(
+            &serde_json::json!({
+                "edits": [
+                    {"path": first.to_string_lossy(), "old": "old", "new": "new"},
+                    {"path": second.to_string_lossy(), "old": "return 1", "new": "const value = ;"}
+                ]
+            }),
+            &roots,
+            "multi_atomic_test",
+        ));
+        assert!(result.is_err(), "第二个候选语法错误时应整体拒绝: {result:?}");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "fn first() { old(); }\n");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "function second() { return 1; }\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 环境自检：javac 可用时类型门禁才能真判，不可用时只能如实降级。
+    fn javac_type_gate_available() -> bool {
+        matches!(
+            super::java_compiler::check_batch(&[(
+                std::path::Path::new("Probe.java"),
+                "package probe;\nclass Probe {}\n",
+                "package probe;\nclass Probe { int v = ; }\n",
+            )]),
+            super::java_compiler::JavaTypeCheck::Checked { .. }
+        )
+    }
+
+    /// 真实入口：Dart 候选引入未定义标识符属于「语法合法但分析器报错」，
+    /// 必须在写入前拒绝；无 dart 或不在包内时按未分析降级（不阻塞）。
+    #[test]
+    fn dart_entry_gate_blocks_analyzer_error_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "dart_entry_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(
+            dir.join("pubspec.yaml"),
+            "name: probe\nenvironment:\n  sdk: \">=3.0.0 <4.0.0\"\n",
+        )
+        .unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let file = dir.join("lib/a.dart");
+        let content = "class A {\n  int value() { return 1; }\n}\n";
+        std::fs::write(&file, content).unwrap();
+        let result = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old": "return 1;",
+                "new": "return missingThing;"
+            }),
+            &roots,
+            "dart_entry_gate",
+        ));
+        match result {
+            Err(error) => {
+                assert!(error.contains("Dart 分析器门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            }
+            Ok(_) => {
+                // 无 dart / 未在包内：降级为未分析，语法门禁放行 → 候选落盘
+                assert!(std::fs::read_to_string(&file).unwrap().contains("missingThing"));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 真实入口：Go 候选的类型错误由 `go vet` 差分拦住；无 go 或不在模块内时降级。
+    #[test]
+    fn go_entry_gate_blocks_static_check_error_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "go_entry_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), "module probe\n\ngo 1.20\n").unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let file = dir.join("a.go");
+        let content = "package main\n\nfunc main() {\n\tvar x int = 1\n\t_ = x\n}\n";
+        std::fs::write(&file, content).unwrap();
+        let result = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old": "var x int = 1",
+                "new": "var x int = \"str\""
+            }),
+            &roots,
+            "go_entry_gate",
+        ));
+        match result {
+            Err(error) => {
+                assert!(error.contains("Go 静态检查门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            }
+            Ok(_) => {
+                // 无 go / 不在模块内：降级为未检查，语法门禁放行 → 候选落盘
+                assert!(std::fs::read_to_string(&file).unwrap().contains("var x int = \"str\""));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 真实入口：Kotlin 候选的语法错误由 tree-sitter 拦住（离线，不依赖 kotlinc）。
+    #[test]
+    fn kotlin_entry_gate_blocks_syntax_error_atomically() {
+        let content = "fun f(): Int {\n    val x = 1\n    return x\n}\n";
+        let (file, roots) = tmp_file("kotlin_entry_gate", content, "kt");
+        let root = file.parent().unwrap().to_path_buf();
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old": "val x = 1",
+                "new": "val x: = 1"
+            }),
+            &roots,
+            "kotlin_entry_gate",
+        ))
+        .unwrap_err();
+        assert!(error.contains("语法门禁拒绝"), "{error}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// 真实入口：SQL 候选在内存库执行出的新增错误必须拦住；无 sqlite3 时降级。
+    #[test]
+    fn sql_entry_gate_blocks_execution_error_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "sql_entry_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let file = dir.join("migration.sql");
+        let content = "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n";
+        std::fs::write(&file, content).unwrap();
+        let result = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old": "VALUES (1);",
+                "new": "VALUES (1, 2);"
+            }),
+            &roots,
+            "sql_entry_gate",
+        ));
+        match result {
+            Err(error) => {
+                assert!(error.contains("SQL 执行门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            }
+            Ok(_) => {
+                // 无 sqlite3：降级为未检查，语法/配平门禁放行 → 候选落盘
+                assert!(std::fs::read_to_string(&file).unwrap().contains("VALUES (1, 2);"));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 未参与本次编辑的调用方也要覆盖：edit_file 只改 A，同源码根下的 B 仍在调用被删掉的
+    /// 方法 —— 这正是“改坏没被一起编辑的调用方”的常见回归，必须在写入前拦住。
+    #[test]
+    fn java_type_gate_covers_unedited_java_callers() {
+        let dir = std::env::temp_dir().join(format!(
+            "java_uneedited_caller_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let a = dir.join("A.java");
+        let b = dir.join("B.java");
+        let a_src = "package a;\nclass A {\n  static int value() { return 1; }\n}\n";
+        let b_src = "package a;\nclass B {\n  int use() { return A.value(); }\n}\n";
+        std::fs::write(&a, a_src).unwrap();
+        std::fs::write(&b, b_src).unwrap();
+        for path in [&a, &b] {
+            block_on_rt(read_file(
+                &serde_json::json!({"path": path.to_string_lossy()}),
+                &roots,
+            ))
+            .expect("read establishes edit baseline");
+        }
+        let result = block_on_rt(edit_file(
+            &serde_json::json!({
+                "path": a.to_string_lossy(),
+                "old": "  static int value() { return 1; }\n",
+                "new": ""
+            }),
+            &roots,
+            "java_uneedited_caller",
+        ));
+        match (javac_type_gate_available(), result) {
+            (true, Err(error)) => {
+                assert!(error.contains("Java 编译器门禁拒绝"), "{error}");
+                assert!(
+                    error.contains("未编辑文件"),
+                    "拒绝信息应说明并入了未编辑的调用方：{error}"
+                );
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), a_src);
+                assert_eq!(std::fs::read_to_string(&b).unwrap(), b_src);
+            }
+            (true, Ok(_)) => panic!("javac 可用时，改坏未编辑的调用方必须被拒绝"),
+            (false, Ok(_)) => {
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), "package a;\nclass A {\n}\n");
+            }
+            (false, Err(error)) => panic!("无 javac 时不应由类型门禁拒绝：{error}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 同批 Java 候选联编：本批删掉 A 的方法而 B 仍在调用，属于批内跨文件破坏，
+    /// 单文件校验看不到，必须在写入前整体拒绝；无 javac 环境按未校验降级。
+    #[test]
+    fn multi_edit_batch_gate_catches_cross_file_java_breakage() {
+        let dir = std::env::temp_dir().join(format!(
+            "multi_java_batch_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let a = dir.join("A.java");
+        let b = dir.join("B.java");
+        let a_src = "package a;\nclass A {\n  static int value() { return 1; }\n}\n";
+        let b_src = "package a;\nclass B {\n  int use() { return A.value(); }\n}\n";
+        let read_baseline = |path: &std::path::Path| {
+            block_on_rt(read_file(
+                &serde_json::json!({"path": path.to_string_lossy()}),
+                &roots,
+            ))
+            .expect("read establishes edit baseline");
+        };
+        std::fs::write(&a, a_src).unwrap();
+        std::fs::write(&b, b_src).unwrap();
+        read_baseline(&a);
+        read_baseline(&b);
+        let broken = block_on_rt(multi_edit(
+            &serde_json::json!({
+                "edits": [
+                    {"path": a.to_string_lossy(), "old": "  static int value() { return 1; }\n", "new": ""},
+                    {"path": b.to_string_lossy(), "old": "class B {", "new": "// 同批改动\nclass B {"}
+                ]
+            }),
+            &roots,
+            "multi_java_batch",
+        ));
+        let javac_available = javac_type_gate_available();
+        match (javac_available, broken) {
+            (true, Err(error)) => {
+                assert!(error.contains("Java 编译器门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), a_src);
+                assert_eq!(std::fs::read_to_string(&b).unwrap(), b_src);
+            }
+            (true, Ok(_)) => panic!("javac 可用时，批内跨文件类型破坏必须被拒绝"),
+            (false, Ok(_)) => {
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), "package a;\nclass A {\n}\n");
+                assert!(std::fs::read_to_string(&b).unwrap().contains("// 同批改动"));
+            }
+            (false, Err(error)) => panic!("无 javac 时不应由类型门禁拒绝：{error}"),
+        }
+        // 反例：同批把调用方一起改对，联编不得误拒
+        std::fs::write(&a, a_src).unwrap();
+        std::fs::write(&b, b_src).unwrap();
+        read_baseline(&a);
+        read_baseline(&b);
+        let consistent = block_on_rt(multi_edit(
+            &serde_json::json!({
+                "edits": [
+                    {"path": a.to_string_lossy(), "old": "value()", "new": "amount()"},
+                    {"path": b.to_string_lossy(), "old": "A.value()", "new": "A.amount()"}
+                ]
+            }),
+            &roots,
+            "multi_java_batch",
+        ));
+        assert!(consistent.is_ok(), "同批改对的 Java 重构不应被拒: {consistent:?}");
+        assert!(std::fs::read_to_string(&a).unwrap().contains("static int amount()"));
+        assert!(std::fs::read_to_string(&b).unwrap().contains("A.amount()"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn java_ast_guard_rejects_write_edit_and_multi_edit_before_disk_changes() {
+        let original = "class A { int value = 1; }\n";
+        let (first, roots) = tmp_file("java_ast_transaction", original, "java");
+        let second = first.parent().unwrap().join("B.java");
+        std::fs::write(&second, "class B { int value = 1; }\n").unwrap();
+        for path in [&first, &second] {
+            block_on_rt(read_file(&serde_json::json!({"path": path.to_string_lossy()}), &roots)).unwrap();
+        }
+        let error = block_on_rt(write_file(&serde_json::json!({
+            "path": first.to_string_lossy(), "content": "class A { @Override int value = 1; }\n"
+        }), &roots, "java_ast_write")).unwrap_err();
+        assert!(error.contains("Java 声明门禁"), "{error}");
+        let error = block_on_rt(edit_file(&serde_json::json!({
+            "path": first.to_string_lossy(), "old": "= 1", "new": "="
+        }), &roots, "java_ast_edit")).unwrap_err();
+        assert!(error.contains("Java 声明门禁"), "{error}");
+        let result = block_on_rt(multi_edit(&serde_json::json!({"edits": [
+            {"path": first.to_string_lossy(), "old": "= 1", "new": "= 2"},
+            {"path": second.to_string_lossy(), "old": "= 1", "new": "="}
+        ]}), &roots, "java_ast_multi"));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "class B { int value = 1; }\n");
+        std::fs::remove_dir_all(first.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn edit_file_batch_replace_and_delete() {
         // 批量模式：一次替换 fn a、删除 fn c，中间 fn b 不受影响
         let dir = std::env::temp_dir().join(format!("ef_batch_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -4338,6 +5296,153 @@ mod tests {
         assert!(!out.contains("代码块"), "非代码文件不应做块对齐: {out}");
         assert!(out.contains("line2") && out.contains("line3"), "{out}");
         assert!(!out.contains("line1"), "应严格按 lines=2: {out}");
+        assert!(out.contains("file_version=sha256:"), "应返回稳定文件版本: {out}");
+        assert!(out.contains("窗口=L2-L3") && out.contains("next_start=4"), "应返回续读游标: {out}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_last_window_reports_terminal_cursor() {
+        let (f, roots) = tmp_file("read_cursor_end", "line1\nline2\n", "txt");
+        let args = serde_json::json!({
+            "path": f.to_string_lossy(),
+            "start": 2,
+            "lines": 20
+        });
+        let out = block_on_rt(read_file(&args, &roots)).unwrap();
+        assert!(out.contains("窗口=L2-L2"), "{out}");
+        assert!(out.contains("next_start=end"), "{out}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_accepts_symbol_handle_and_rejects_same_size_external_rewrite() {
+        let content = "fn first() {\n  one();\n}\nfn target() {\n  old();\n}\n";
+        let (f, roots) = tmp_file("read_symbol_handle", content, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .expect("应索引目标函数");
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let out = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": handle.clone()}),
+            &roots,
+        ))
+        .expect("句柄读取应成功");
+        assert!(out.contains("fn target()") && out.contains("old();"), "{out}");
+        assert!(!out.contains("fn first()"), "应只返回目标结构区间: {out}");
+
+        // 保持总字节数不变，证明校验不依赖 size；mtime 在部分文件系统上也可能碰撞。
+        std::fs::write(&f, content.replace("old();", "new();")).unwrap();
+        let error = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": handle}),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(error.contains("结构定位已过期"), "{error}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_rejects_symbol_handle_from_another_project() {
+        let (source, _source_roots) = tmp_file("read_symbol_source", "fn source() {}\n", "rs");
+        let source_root = source.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&source_root)
+            .into_iter()
+            .find(|symbol| symbol.name == "source")
+            .expect("应索引源函数");
+        let handle = crate::services::symbol_index::symbol_read_handles(&source_root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let (other, other_roots) = tmp_file("read_symbol_other", "fn other() {}\n", "rs");
+        let error = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": handle}),
+            &other_roots,
+        ))
+        .unwrap_err();
+        assert!(error.contains("不属于当前项目"), "{error}");
+        std::fs::remove_dir_all(source.parent().unwrap()).ok();
+        std::fs::remove_dir_all(other.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_rejects_handle_built_from_stale_symbol_coordinates() {
+        let original = "fn first() {\n}\nfn target() {\n  work();\n}\n";
+        let (f, roots) = tmp_file("read_symbol_stale_index", original, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let stale_symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .expect("应索引目标函数");
+        // 模拟 watcher 尚未刷新：查询拿到旧坐标，但磁盘文件已插入一行。
+        std::fs::write(&f, original.replacen("}\nfn target", "}\n\nfn target", 1)).unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[stale_symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .expect("句柄可绑定当前文件摘要，结构复核延迟到实际读取");
+        let error = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": handle}),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(error.contains("符号范围与当前文件不一致"), "{error}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_file_rejects_malformed_or_ambiguous_symbol_handle() {
+        let (f, roots) = tmp_file("read_symbol_invalid", "fn sample() {}\n", "rs");
+        let malformed = block_on_rt(read_file(
+            &serde_json::json!({"symbol_handle": "sr1.not-base64"}),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(malformed.contains("无效或已损坏"), "{malformed}");
+        let ambiguous = block_on_rt(read_file(
+            &serde_json::json!({
+                "symbol_handle": "sr1.not-base64",
+                "path": f.to_string_lossy()
+            }),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(ambiguous.contains("互斥"), "{ambiguous}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn large_text_requires_and_supports_bounded_stream_window() {
+        let mut content = String::with_capacity(1_200_000);
+        for line in 1..=12_000 {
+            content.push_str(&format!("line-{line:05}-{}\n", "x".repeat(90)));
+        }
+        let (f, roots) = tmp_file("read_large_stream", &content, "txt");
+        assert!(std::fs::metadata(&f).unwrap().len() > 1024 * 1024);
+
+        let without_window = block_on_rt(read_file(
+            &serde_json::json!({"path": f.to_string_lossy()}),
+            &roots,
+        ))
+        .unwrap_err();
+        assert!(without_window.contains("显式传 start/lines"), "{without_window}");
+
+        let out = block_on_rt(read_file(
+            &serde_json::json!({"path": f.to_string_lossy(), "start": 10_000, "lines": 2}),
+            &roots,
+        ))
+        .unwrap();
+        assert!(out.contains("流式窗口=L10000-L10001"), "{out}");
+        assert!(out.contains("line-10000") && out.contains("line-10001"), "{out}");
+        assert!(!out.contains("line-09999"), "不应泄露窗口外内容: {out}");
+        assert!(out.contains("next_start=10002"), "{out}");
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
     }
 
@@ -4358,6 +5463,457 @@ mod tests {
         let text = std::fs::read_to_string(&f).unwrap();
         assert!(text.contains("fn b2()"), "应整块替换: {text}");
         assert!(!text.contains("let z = 3"), "旧方法体应消失: {text}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_replaces_symbol_handle_block_without_separate_read() {
+        let content = "fn keep() {\n  keep_work();\n}\nfn target() {\n  old_work();\n}\n";
+        let (f, roots) = tmp_file("edit_symbol_handle", content, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .expect("应索引目标函数");
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let out = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() {\n  new_work();\n}\n"
+            }),
+            &roots,
+            "t_edit_symbol_handle",
+        ))
+        .expect("结构句柄编辑应成功");
+        assert!(out.contains("完整代码块"), "{out}");
+        assert!(out.contains("节点事务：kind=function"), "{out}");
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.contains("keep_work();") && text.contains("new_work();"), "{text}");
+        assert!(!text.contains("old_work();"), "{text}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_symbol_handle_deletes_java_method_with_attached_annotation() {
+        let content = "class Service {\n  @Override\n  public String toString() {\n    return \"Service\";\n  }\n}\n";
+        let (f, roots) = tmp_file("edit_java_annotated_node", content, "java");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.kind == "method" && symbol.name == "toString")
+            .expect("应索引 Java 方法");
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let out = block_on_rt(edit_file(
+            &serde_json::json!({"symbol_handle": handle, "new": ""}),
+            &roots,
+            "t_edit_java_annotated_node",
+        ))
+        .expect("完整节点删除应连同注解成功");
+        assert!(out.contains("节点事务：kind=method"), "{out}");
+        let updated = std::fs::read_to_string(&f).unwrap();
+        assert!(!updated.contains("@Override"), "{updated}");
+        assert!(!updated.contains("toString"), "{updated}");
+        assert!(updated.contains("class Service"), "{updated}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn multi_edit_preflight_and_rollback_preserve_external_content() {
+        let (first, _) = tmp_file("multi_late_external", "old-a", "txt");
+        let second = first.parent().unwrap().join("second.txt");
+        std::fs::write(&second, "other").unwrap();
+        let edits = [
+            PreparedEdit { path: first.clone(), old_bytes: b"old-a".to_vec(), final_text: "new-a".into(), count: 1 },
+            PreparedEdit { path: second.clone(), old_bytes: b"old-b".to_vec(), final_text: "new-b".into(), count: 1 },
+        ];
+        assert!(commit_prepared_edits(&edits, "multi_late_external").unwrap_err().contains("未写入任何文件"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-a");
+        assert_eq!(std::fs::read(&second).unwrap(), b"other");
+        std::fs::write(&first, "new-a").unwrap();
+        let unresolved = rollback_prepared_edits(&[&edits[0], &edits[1]]);
+        assert_eq!(unresolved.len(), 1);
+        assert!(unresolved[0].contains("second.txt"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-a");
+        assert_eq!(std::fs::read(&second).unwrap(), b"other");
+        assert_eq!(rollback_prepared_edits(&[&edits[0], &edits[1]]).len(), 1);
+        std::fs::remove_dir_all(first.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn final_write_check_preserves_late_external_changes() {
+        let (file, _) = tmp_file("late_external_write", "old", "txt");
+        std::fs::write(&file, "new").unwrap();
+        assert!(write_candidate_with_restore(&file, b"old", b"candidate").unwrap_err().contains("再次发生变化"));
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        std::fs::write(&file, "longer").unwrap();
+        assert!(write_candidate_with_restore(&file, b"old", b"candidate").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"longer");
+        std::fs::remove_file(&file).unwrap();
+        assert!(write_candidate_with_restore(&file, b"old", b"candidate").is_err());
+        assert!(!file.exists());
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn java_batch_byte_plan_preserves_order_and_rejects_overlap() {
+        let body = "class A {\r\n void a() {} int keepA;\r\n void b() {} int keepB;\r\n}\r\n";
+        let node = |start, end, kind: &str| ExpectedNode {
+            node_id: "test".into(), kind: Some(kind.into()), range: (start, end), parent_range: None, relocated: false,
+        };
+        let nodes = [node(3, 3, "method"), node(2, 2, "method")];
+        let (result, ranges) = plan_java_byte_nodes(body, &nodes, &["void changed() {}".into(), "".into()]).unwrap();
+        assert_eq!(result, body.replace("void a() {}", "").replace("void b() {}", "void changed() {}"));
+        assert_eq!(ranges, vec![(2, 2), (1, 1)]);
+        assert!(plan_java_byte_nodes(body, &[node(2, 2, "method"), node(2, 2, "method")], &["".into(), "".into()]).unwrap_err().contains("重叠"));
+        assert!(plan_java_byte_nodes(body, &[node(1, 4, "class"), node(2, 2, "method")], &["".into(), "".into()]).unwrap_err().contains("重叠"));
+        assert!(plan_java_byte_nodes(body, &nodes, &["".into()]).is_err());
+    }
+
+    #[test]
+    fn java_batch_handles_preserve_neighbors_and_reject_invalid_candidate_atomically() {
+        let content = "class A {\n  public void first() {} int keepA;\n  public void second() {} int keepB;\n}\n";
+        let (file, roots) = tmp_file("java_batch_byte_handles", content, "java");
+        let root = file.parent().unwrap().to_path_buf();
+        let symbols = crate::services::symbol_index::index_project(&root).into_iter()
+            .filter(|symbol| symbol.kind == "method").collect::<Vec<_>>();
+        assert_eq!(symbols.len(), 2);
+        let handles = crate::services::symbol_index::symbol_read_handles(&root, &symbols)
+            .into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+        let bad = serde_json::json!({"symbol_handles": handles, "news": ["", "void broken( {"]});
+        assert!(block_on_rt(edit_file(&bad, &roots, "java_batch_byte_handles")).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        let preview = serde_json::json!({"symbol_handles": handles, "news": ["", ""], "dry_run": true});
+        block_on_rt(edit_file(&preview, &roots, "java_batch_byte_handles")).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        block_on_rt(edit_file(&serde_json::json!({"symbol_handles": handles, "news": ["", ""]}), &roots, "java_batch_byte_handles")).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content.replace("public void first() {}", "").replace("public void second() {}", ""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 真实入口：删除仍在使用的 import 语法依然合法，只有 javac 差分能拦住。
+    /// 拒绝时原文件不得改变；无 javac 环境按「未做类型校验」降级，测试如实区分两条路径。
+    #[test]
+    fn java_entry_type_gate_blocks_compile_breaking_edit_atomically() {
+        let content = "package a;\nimport java.util.List;\nclass A {\n  List<String> xs;\n}\n";
+        let (file, roots) = tmp_file("java_type_gate", content, "java");
+        let root = file.parent().unwrap().to_path_buf();
+        let args = serde_json::json!({
+            "path": file.to_string_lossy(),
+            "old": "import java.util.List;\n",
+            "new": ""
+        });
+        match block_on_rt(edit_file(&args, &roots, "java_type_gate")) {
+            Err(error) => {
+                assert!(error.contains("Java 编译器门禁拒绝"), "{error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            }
+            Ok(_) => {
+                assert_eq!(
+                    std::fs::read_to_string(&file).unwrap(),
+                    content.replace("import java.util.List;\n", "")
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn java_single_handle_byte_edit_preserves_different_kind_neighbor() {
+        let content = "class A {\n  public void only() {} int keep; // keep comment\n}\n";
+        let (file, roots) = tmp_file("java_byte_handle", content, "java");
+        let root = file.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root).into_iter()
+            .find(|symbol| symbol.kind == "method" && symbol.name == "only").unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter().next().unwrap().unwrap();
+        let preview = block_on_rt(edit_file(&serde_json::json!({"symbol_handle": handle, "new": "", "dry_run": true}), &roots, "java_byte_handle")).unwrap();
+        assert!(preview.contains("dry_run"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        assert!(block_on_rt(edit_file(&serde_json::json!({"symbol_handle": handle, "new": "public void broken( {", "dry_run": true}), &roots, "java_byte_handle")).is_err());
+        block_on_rt(edit_file(&serde_json::json!({"symbol_handle": handle, "new": ""}), &roots, "java_byte_handle")).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content.replace("public void only() {}", ""));
+        // 同一旧句柄仍受完整文件版本约束，不因字节模式绕过过期检查。
+        assert!(block_on_rt(edit_file(&serde_json::json!({"symbol_handle": handle, "new": ""}), &roots, "java_byte_handle")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn java_symbol_handles_never_delete_same_line_neighbors() {
+        let content = "class A {\n  public void first() {} public void second() {}\n}\n";
+        let (file, roots) = tmp_file("java_shared_line_handle", content, "java");
+        let root = file.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root).into_iter()
+            .find(|symbol| symbol.kind == "method" && symbol.name == "first").unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter().next().unwrap().unwrap();
+        for args in [
+            serde_json::json!({"symbol_handle": handle, "new": ""}),
+            serde_json::json!({"symbol_handle": handle, "new": "", "dry_run": true}),
+            serde_json::json!({"symbol_handles": [handle], "news": [""]}),
+        ] {
+            let error = block_on_rt(edit_file(&args, &roots, "java_shared_line")).unwrap_err();
+            assert!(error.contains("边界不安全"), "{error}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edit_file_symbol_handle_deletes_java_field_with_resource_annotation() {
+        let content = "class Service {\n  @Resource\n  private Repository repository;\n\n  public void run() {\n    work();\n  }\n}\n";
+        let (f, roots) = tmp_file("edit_java_resource_field", content, "java");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.kind == "field" && symbol.name == "repository")
+            .expect("应索引 Java 字段");
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let out = block_on_rt(edit_file(
+            &serde_json::json!({"symbol_handle": handle, "new": ""}),
+            &roots,
+            "t_edit_java_resource_field",
+        ))
+        .expect("字段节点删除应连同 Resource 注解成功");
+        assert!(out.contains("节点事务：kind=field"), "{out}");
+        let updated = std::fs::read_to_string(&f).unwrap();
+        assert!(!updated.contains("@Resource") && !updated.contains("repository"), "{updated}");
+        assert!(updated.contains("void run()"), "{updated}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_symbol_handles_apply_same_file_nodes_atomically() {
+        let content = "class Service {\n  @Override\n  public String first() {\n    return \"old\";\n  }\n\n  @Deprecated\n  public void second() {\n    oldWork();\n  }\n}\n";
+        let (f, roots) = tmp_file("edit_java_multi_nodes", content, "java");
+        let root = f.parent().unwrap().to_path_buf();
+        let mut methods = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .filter(|symbol| symbol.kind == "method")
+            .collect::<Vec<_>>();
+        methods.sort_by_key(|symbol| symbol.line);
+        assert_eq!(methods.len(), 2, "应索引两个 Java 方法：{methods:?}");
+        let handles = crate::services::symbol_index::symbol_read_handles(&root, &methods)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let out = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handles": handles,
+                "news": [
+                    "  @Override\n  public String first() {\n    return \"new\";\n  }\n",
+                    ""
+                ]
+            }),
+            &roots,
+            "t_edit_java_multi_nodes",
+        ))
+        .expect("同文件多节点事务应成功");
+        assert!(out.contains("symbol_handles[0]") && out.contains("symbol_handles[1]"), "{out}");
+        let updated = std::fs::read_to_string(&f).unwrap();
+        assert!(updated.contains("return \"new\""), "{updated}");
+        assert!(!updated.contains("second()") && !updated.contains("@Deprecated"), "{updated}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_symbol_handles_reject_cross_file_transaction_without_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "edit_cross_file_nodes_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.rs");
+        let second = dir.join("second.rs");
+        let first_text = "fn first() { old_one(); }\n";
+        let second_text = "fn second() { old_two(); }\n";
+        std::fs::write(&first, first_text).unwrap();
+        std::fs::write(&second, second_text).unwrap();
+        let symbols = crate::services::symbol_index::index_project(&dir);
+        let selected = ["first", "second"]
+            .iter()
+            .map(|name| symbols.iter().find(|symbol| symbol.name == *name).unwrap().clone())
+            .collect::<Vec<_>>();
+        let handles = crate::services::symbol_index::symbol_read_handles(&dir, &selected)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handles": handles,
+                "news": ["fn first() {}\n", "fn second() {}\n"]
+            }),
+            &roots,
+            "t_edit_cross_file_nodes",
+        ))
+        .unwrap_err();
+        assert!(error.contains("同一项目、文件和文件版本"), "{error}");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), first_text);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), second_text);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_edit_supports_symbol_handle_without_writing() {
+        let content = "fn target() {\n  old_work();\n}\n";
+        let (f, roots) = tmp_file("preview_symbol_handle", content, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let out = block_on_rt(preview_edit(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() {\n  preview_work();\n}\n"
+            }),
+            &roots,
+            "t_preview_symbol_handle",
+        ))
+        .expect("结构句柄预览应成功");
+        assert!(out.contains("-  old_work();") && out.contains("+  preview_work();"), "{out}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), content);
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_rejects_stale_symbol_handle() {
+        let content = "fn target() {\n  old_work();\n}\n";
+        let (f, roots) = tmp_file("edit_stale_symbol_handle", content, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::write(&f, content.replace("old_work", "new_work")).unwrap();
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({"symbol_handle": handle, "new": "fn target() {}\n"}),
+            &roots,
+            "t_edit_stale_symbol_handle",
+        ))
+        .unwrap_err();
+        assert!(error.contains("结构定位已过期"), "{error}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_relocates_unchanged_v3_node_only_when_explicitly_allowed() {
+        let original = "fn keep() { keep_work(); }\nfn target() { old_work(); }\n";
+        let (f, roots) = tmp_file("edit_relocate_symbol_handle", original, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let externally_changed = format!("// external note\n{original}");
+        std::fs::write(&f, &externally_changed).unwrap();
+        let out = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() { new_work(); }\n",
+                "allow_relocate": true
+            }),
+            &roots,
+            "t_edit_relocate_symbol_handle",
+        ))
+        .expect("非目标改动后应可显式受控重定位");
+        assert!(out.contains("受控重定位"), "{out}");
+        let updated = std::fs::read_to_string(&f).unwrap();
+        assert!(updated.starts_with("// external note\n"), "{updated}");
+        assert!(updated.contains("new_work()") && !updated.contains("old_work()"), "{updated}");
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_relocation_rejects_changed_target_node() {
+        let original = "fn target() { old_work(); }\n";
+        let (f, roots) = tmp_file("edit_relocate_changed_target", original, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let external = "fn target() { external_work(); }\n";
+        std::fs::write(&f, external).unwrap();
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() { agent_work(); }\n",
+                "allow_relocate": true
+            }),
+            &roots,
+            "t_edit_relocate_changed_target",
+        ))
+        .unwrap_err();
+        assert!(error.contains("结构重定位被拒绝"), "{error}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), external);
+        std::fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn edit_file_relocation_rejects_ambiguous_identical_nodes() {
+        let original = "fn target() { old_work(); }\n";
+        let (f, roots) = tmp_file("edit_relocate_ambiguous", original, "rs");
+        let root = f.parent().unwrap().to_path_buf();
+        let symbol = crate::services::symbol_index::index_project(&root)
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let handle = crate::services::symbol_index::symbol_read_handles(&root, &[symbol])
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let ambiguous = format!("// external duplication\n{original}{original}");
+        std::fs::write(&f, &ambiguous).unwrap();
+        let error = block_on_rt(edit_file(
+            &serde_json::json!({
+                "symbol_handle": handle,
+                "new": "fn target() { agent_work(); }\n",
+                "allow_relocate": true
+            }),
+            &roots,
+            "t_edit_relocate_ambiguous",
+        ))
+        .unwrap_err();
+        assert!(error.contains("多个完全相同"), "{error}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), ambiguous);
         std::fs::remove_dir_all(f.parent().unwrap()).ok();
     }
 

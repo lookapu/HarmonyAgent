@@ -2,7 +2,7 @@
 
 > **Agent Workspace for HarmonyOS Developers** — an all-in-one desktop AI coding workbench
 
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)]()
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)]()
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 
@@ -12,7 +12,7 @@ A desktop AI coding IDE for HarmonyOS / OpenHarmony developers. It packs multi-p
 
 ## What It Is
 
-Not just a simple provider switcher. **201 Agent tools** cover the full HarmonyOS development loop — from scaffolding a project to crash attribution, from code scanning to on-device deployment:
+Not just a simple provider switcher. **204 Agent tools** cover the full HarmonyOS development loop — from scaffolding a project to crash attribution, from code scanning to on-device deployment:
 
 | Dimension | Capability |
 |------|------|
@@ -81,6 +81,8 @@ SDK path auto-detection: `DEVECO_SDK_HOME` → DevEco Studio install path → us
 - **Tool limits**: `tool_limits` caps invocations per 8 task groups (build / fix / explore / deploy / refactor / test / debug / other) — hot tools are no longer throttled globally
 - **Permission management**: `permissions` module tiers tools by type
 
+> Current limitation: `run_command` validates the workspace path, rejects known-dangerous patterns, and uses approvals, but the child process still runs with the host user's permissions. The compatibility tool named `sandbox_exec` is only a temporary-copy trial run, not an OS-level filesystem or network sandbox. Do not use it to execute untrusted repository scripts. See [Security Boundary and Threat Model](docs/SECURITY_BOUNDARY.md).
+
 ### 6. Evidence-Driven Reliable Execution
 
 - **Goal contract**: required conditions (modify, verify, build, test, deploy, commit, push, etc.) are extracted from the user's goal; the model can only *claim* completion while the runtime kernel adjudicates against real tool evidence
@@ -134,9 +136,9 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 298 Tauri IPC entry points · 56 service modules  │
-│  - agent/ 36 top-level modules · tools/ 29 files    │
-│  - SQLite + 77 migrations · full event sourcing for │
+│  - 301 Tauri IPC entry points · 58 service modules  │
+│  - agent/ 58 top-level modules · tools/ 35 files    │
+│  - SQLite + 84 migrations · full event sourcing for │
 │    runs/steps/tools                                 │
 │  - Bundled runtimes: Node + JDK + Git (runtime/)    │
 └─────────────────────────────────────────────────────┘
@@ -146,7 +148,7 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
 
 ```
 src-tauri/src/
-├── agent/                  # AI Agent core (36 top-level modules)
+├── agent/                  # AI Agent core (37 top-level modules)
 │   ├── runtime.rs           #   - Durable Run state machine & event cursors
 │   ├── scheduler.rs         #   - Durable queue, worker leases & fencing
 │   ├── coordinator.rs       #   - Execution steps & recovery checkpoints
@@ -156,6 +158,7 @@ src-tauri/src/
 │   ├── governance.rs        #   - Dynamic budget, reliability policies & quality snapshots
 │   ├── dag.rs               #   - Main/sub-agent DAG & dependency scheduling
 │   ├── tool_runtime.rs      #   - Tool workers, dedicated threads, leases & idempotency
+│   ├── sandbox.rs           #   - Sandbox policy, capabilities & OCI launch contract
 │   ├── structured_result.rs #   - Tool result V2, artifact/verification/compensation evidence
 │   ├── enterprise.rs        #   - SLO, alerts, audit & quotas
 │   ├── evals.rs             #   - Reliability scenario evals & fault injection
@@ -175,7 +178,7 @@ src-tauri/src/
 │   ├── session_ctx.rs       #   - Session-level runtime state (converged)
 │   ├── invariants.rs        #   - Write invariants (.env / certs / migration SQL)
 │   ├── session_events.rs    #   - Session event sourcing
-│   └── tools/               #   - 201 Agent tools (29 files)
+│   └── tools/               #   - 204 Agent tools (35 files)
 │       ├── mod.rs               # Tool registry (TOOL_SPECS) + protocol dispatch
 │       ├── protocol.rs          # Tool-call marker parsing
 │       ├── errors.rs            # Structured error envelope (7 ToolError classes)
@@ -204,8 +207,8 @@ src-tauri/src/
 │       ├── quality_runtime.rs   #   Runtime quality (6 tools)
 │       ├── quality_media.rs     #   Media quality (2 tools)
 │       └── schedule_tools.rs    # Scheduled reminders (schedule_create/list/delete)
-├── commands/               # 38 command modules (298 IPC registration entry points total)
-├── services/               # Business services (56)
+├── commands/               # 38 command modules (299 IPC registration entry points total)
+├── services/               # Business services (58)
 │   ├── proxy_service.rs    #   - Local proxy
 │   ├── circuit_breaker.rs  #   - Circuit breaker
 │   ├── model_router.rs     #   - Model routing
@@ -226,7 +229,7 @@ src-tauri/src/
 
 > **About large files**: `src-tauri/runtime/` (portable runtimes), `src-tauri/resources/` (seed knowledge base + embedding models, ~340MB) and `portable-build/` (portable build artifacts) total ~1GB. They are build artifacts / downloaded resources and are **not distributed with the Git repository** (see `.gitignore`). Keep these directories for local builds; users cloning the repo can obtain the full runtime from the Release installer, or prepare it themselves following the download logic in [release.yml](.github/workflows/release.yml).
 
-## The 201 Agent Tools Grouped by Domain
+## The 204 Agent Tools Grouped by Domain
 
 | Domain (TOOL_GROUP) | Representative tools |
 |------|------|
@@ -247,6 +250,10 @@ Download the installer from [Releases](https://github.com/lookapu/HarmonyAgent/r
 
 - **Windows**: `.exe` (NSIS installer) or `.msi`
 - **macOS**: `.dmg` or `.app.tar.gz`
+
+> **Linux**: no official installer is provided yet (the release pipeline currently produces Windows/macOS artifacts only); build from source if needed, or watch for future `.deb`/AppImage support.
+
+End users do not need a local Python environment to run these installers. Python is used only by selected development, documentation, and release helper scripts.
 
 ### First Launch on macOS
 
@@ -269,6 +276,10 @@ npx tauri dev
 
 # Production build (requires local src-tauri/runtime & src-tauri/resources — see below)
 npx tauri build
+
+# Preview/remove reproducible Rust and frontend caches (keeps node_modules)
+npm run clean:generated:dry-run
+npm run clean:generated
 ```
 
 > **Bundled runtimes note**: portable Node / JDK / Git (~700MB), plus the knowledge-base seed and embedding models (~340MB), are not distributed with the repository.
@@ -283,6 +294,9 @@ npx tauri build
 ## Documentation
 
 - [Continuous evolution roadmap](docs/ROADMAP.md) — phased tasks and acceptance criteria for long sessions, the Agent toolchain, the HarmonyOS loop, and ecosystem integration
+- [Generated-file cleanup (Chinese)](docs/GENERATED_FILES_CLEANUP.md) — safely removes `target`, `dist`, coverage, and Vite caches
+- [Agent capability evolution roadmap (Chinese)](docs/AGENT_EVOLUTION_ROADMAP_2026.md) — sandboxing, large-repository intelligence, real-agent evaluation, and a 12-week delivery sequence
+- [Security boundary and threat model (Chinese)](docs/SECURITY_BOUNDARY.md) — current guarantees, explicit limitations, and the minimum real-sandbox contract
 - [Official DevEco CLI MCP integration](docs/DEVECO_CLI_MCP_INTEGRATION.md) — built-in MCP templates, command parsing enhancements, and the division of labor with custom tools
 - [Long-session context V2](docs/CONTEXT_V2.md) — data mapping, fact priority, budget, and compatibility strategy
 - [Architecture doc v2](docs/ARCHITECTURE.md) — product positioning, module boundaries, design trade-offs

@@ -74,6 +74,31 @@ async fn pre_blacklist(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
     Ok(())
 }
 
+/// 该调用的影响契约（未覆盖的工具为 None）：签发凭据时连同它一起落审计。
+/// 参数不是合法 JSON 时按「无影响说明」处理——影响描述是展示与审计口径，
+/// 不应因为描述不出来就阻断一次本来可以执行的调用。
+fn request_impact(inv: &ToolInvocation<'_>) -> Option<crate::agent::impact::ImpactContract> {
+    let args: serde_json::Value = serde_json::from_str(inv.args_raw).ok()?;
+    crate::agent::impact::describe(inv.name, &args)
+}
+
+/// 请求型审批作用域的绑定值：run + 工具调用 + 工具名 + 原始参数的幂等键。
+/// 与签发时登记的 `tool_runs.idempotency_key` 同源，因此凭据只能匹配到这一次调用。
+fn request_key_for(inv: &ToolInvocation<'_>) -> Result<String, Intercept> {
+    let call = inv.ctx.tool_call_id.as_deref().ok_or_else(|| {
+        Intercept::new(
+            InterceptKind::Approval,
+            "宿主能力审批缺少工具调用 ID，无法签发可撤销凭据",
+        )
+    })?;
+    Ok(crate::agent::tool_runtime::idempotency_key(
+        &inv.ctx.run_id,
+        call,
+        inv.name,
+        inv.args_raw,
+    ))
+}
+
 /// 权限分级审核：
 /// - allow_all 模式：常规操作直接执行；发布/签名/证书/凭据操作仍逐次确认
 /// - ask 模式：已信任项目的 L0/L1 自动放行；L2 或未信任项目弹窗确认
@@ -149,9 +174,43 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
             }
         }
     };
+    // 变更类宿主能力即使在免弹窗路径（allow_all/白名单/项目信任）也要留下可撤销凭据：
+    // 跳过弹窗是用户配置的策略，但「停止即失效、可显式撤销」的契约不能因此消失。
+    let receipt = crate::agent::capability_broker::receipt_decision(tool, needs_approval);
+    if matches!(
+        receipt,
+        crate::agent::capability_broker::ReceiptDecision::Auto
+    ) {
+        let stop_generation = crate::agent::exec_ctx::stop_generation(conversation_id);
+        let impact = request_impact(inv);
+        crate::agent::broker_approval::record_capability_approval(
+            inv.ctx,
+            tool,
+            inv.args_raw,
+            &crate::agent::broker_approval::ApprovalScope::Request {
+                request_key: request_key_for(inv)?,
+                workspace: None,
+            },
+            stop_generation,
+            crate::agent::broker_approval::DECISION_AUTO,
+            impact.as_ref(),
+        )
+        .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
+    }
     if !needs_approval {
         return Ok(());
     }
+    // 在展示审批之前冻结作用域；摘要计算不占用异步执行线程或数据库锁。
+    let approval_stop_generation = crate::agent::exec_ctx::stop_generation(conversation_id);
+    let ota_scope = if tool == "ota_pack" {
+        let roots = super::effective_tool_roots(
+            &app.state::<DbState>(), inv.project_id, inv.project_path, inv.roots,
+        );
+        let args = inv.args.clone();
+        Some(tokio::task::spawn_blocking(move || crate::agent::ota_scope::argument_scope(&roots, &args))
+            .await.map_err(|error| Intercept::new(InterceptKind::Approval, error.to_string()))?
+            .map_err(|error| Intercept::new(InterceptKind::Approval, error))?)
+    } else { None };
     if crate::agent::evals::take_fault("approval_timeout") {
         return Err(Intercept::new(
             InterceptKind::Approval,
@@ -190,7 +249,36 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
         );
     }
     match approval_result {
-        Ok(ApprovalOutcome::Approved) => {}
+        Ok(ApprovalOutcome::Approved) => {
+            let scope = match &ota_scope {
+                Some(scope) => Some(crate::agent::broker_approval::ApprovalScope::Ota(
+                    scope.clone(),
+                )),
+                None if matches!(
+                    receipt,
+                    crate::agent::capability_broker::ReceiptDecision::Explicit
+                ) =>
+                {
+                    Some(crate::agent::broker_approval::ApprovalScope::Request {
+                        request_key: request_key_for(inv)?,
+                        workspace: None,
+                    })
+                }
+                None => None,
+            };
+            if let Some(scope) = scope {
+                crate::agent::broker_approval::record_capability_approval(
+                    inv.ctx,
+                    tool,
+                    inv.args_raw,
+                    &scope,
+                    approval_stop_generation,
+                    crate::agent::broker_approval::DECISION_EXPLICIT,
+                    request_impact(inv).as_ref(),
+                )
+                .map_err(|error| Intercept::new(InterceptKind::Approval, error))?;
+            }
+        }
         Ok(ApprovalOutcome::Rejected(feedback)) => {
             // 拒绝理由（用户可附）反馈给模型，帮助其调整方案而非盲目重试
             let reason = feedback
@@ -361,6 +449,10 @@ pub(crate) async fn request_tool_approval(
         .ok()
         .map(|value| crate::utils::redact::redact_json_value(&value).to_string())
         .unwrap_or_else(|| crate::utils::redact::redact_text(args));
+    // 影响契约与凭据、弹窗、审计同源：审批前后看到的是同一套后果说明
+    let impact = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|value| crate::agent::impact::describe(tool, &value));
     let request_id = Uuid::new_v4().to_string();
     crate::agent::interactions::begin(
         &request_id,
@@ -372,6 +464,7 @@ pub(crate) async fn request_tool_approval(
             "args": visible_args,
             "level": permissions::tool_level(tool).as_str(),
             "description": super::tool_short_desc(tool),
+            "impact": impact,
         }),
     )?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -391,6 +484,7 @@ pub(crate) async fn request_tool_approval(
             args: visible_args,
             level: permissions::tool_level(tool).as_str().to_string(),
             desc: super::tool_short_desc(tool).to_string(),
+            impact,
         },
     );
     // 给复杂任务/后台窗口留足确认时间；前端可从 pending 状态恢复弹窗。仍设上限避免
@@ -454,6 +548,7 @@ mod tests {
             args,
             args_raw: "{}",
             project_id: "",
+            project_path: "",
             roots,
             conversation_id: "test",
             approval_mode: "allow_all",
@@ -524,6 +619,7 @@ mod tests {
             args: &args,
             args_raw: r#"{"command":"rm -rf /"}"#,
             project_id: "p",
+            project_path: "",
             roots: &[],
             conversation_id: "c",
             approval_mode: "ask",

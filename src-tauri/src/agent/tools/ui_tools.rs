@@ -4,8 +4,14 @@
 
 use super::*;
 
-pub(super) async fn resolve_authorized_device(requested: Option<&str>, capability: &str) -> Result<String, String> {
-    let devices = crate::commands::devices::list_devices().await.map_err(|error| format!("无法发现设备：{error}"))?;
+pub(super) async fn resolve_authorized_device(
+    requested: Option<&str>,
+    capability: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let devices = brokered_device_snapshot(ctx)
+        .await
+        .map_err(|error| format!("无法发现设备：{error}"))?;
     let selected = if let Some(requested) = requested.map(str::trim).filter(|id| !id.is_empty()) {
         devices.iter().find(|device| device.id == requested).ok_or_else(|| format!("未发现指定设备 {requested}；请调用 list_devices 刷新设备状态。"))?
     } else {
@@ -49,7 +55,7 @@ pub(super) async fn run_perf_benchmark(
     if project_path.is_empty() {
         return Err("当前会话未绑定项目目录，无法运行性能基准".into());
     }
-    let device = resolve_authorized_device(args["device"].as_str(), "ability").await?;
+    let device = resolve_authorized_device(args["device"].as_str(), "ability", ctx).await?;
     let bundle = match args["package"].as_str() {
         Some(p) => p.to_string(),
         None => crate::services::harmony::parse_project(Path::new(project_path)).bundle_name.unwrap_or_default(),
@@ -61,18 +67,20 @@ pub(super) async fn run_perf_benchmark(
         .main_element
         .unwrap_or_else(|| "EntryAbility".into());
     let startup_ms = if !bundle.is_empty() && args["measure_startup"].as_bool().unwrap_or(true) {
-        measure_startup(&device, &bundle, &ability).await.ok()
+        measure_startup(&device, &bundle, &ability, ctx).await.ok()
     } else {
         None
     };
-    let battery_before = sample_battery_percent(&device).await.ok();
+    let battery_before = sample_battery_percent(&device, ctx).await.ok();
     let package_bytes = benchmark_package_bytes(args, Path::new(project_path));
 
     // 1. 可选：先跑一遍 UI 操作流程（让应用进入被测状态）
     let mut flow_report = String::new();
     if let Some(steps) = args["steps"].as_array() {
         if !steps.is_empty() {
-            flow_report = super::test_tools::execute_ui_steps(&device, steps).await.join("\n");
+            flow_report = super::test_tools::execute_ui_steps(&device, steps, ctx)
+                .await
+                .join("\n");
             if flow_report.contains("→ 失败") {
                 return Err(format!("性能基准的前置 UI 流程失败，已停止采样：\n{flow_report}"));
             }
@@ -90,18 +98,18 @@ pub(super) async fn run_perf_benchmark(
         if i > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        if let Ok(c) = sample_cpu(&device).await {
+        if let Ok(c) = sample_cpu(&device, ctx).await {
             sys_cpu.push(c);
         }
-        if let Ok(m) = sample_sys_mem(&device).await {
+        if let Ok(m) = sample_sys_mem(&device, ctx).await {
             sys_mem.push(m);
         }
-        if let Ok(t) = sample_temp(&device).await {
+        if let Ok(t) = sample_temp(&device, ctx).await {
             temp_vals.push(t);
         }
         if !bundle.is_empty() {
-            if let Ok(pid) = pid_of(&device, &bundle).await {
-                if let Ok((pcpu, pss)) = sample_proc(&device, &pid).await {
+            if let Ok(pid) = pid_of(&device, &bundle, ctx).await {
+                if let Ok((pcpu, pss)) = sample_proc(&device, &pid, ctx).await {
                     proc_cpu.push(pcpu);
                     pss_vals.push(pss);
                 }
@@ -110,8 +118,8 @@ pub(super) async fn run_perf_benchmark(
     }
 
     // 3. FPS（尽力而为，设备/系统不支持时跳过）
-    let fps = sample_fps(&device).await.ok();
-    let battery_after = sample_battery_percent(&device).await.ok();
+    let fps = sample_fps(&device, ctx).await.ok();
+    let battery_after = sample_battery_percent(&device, ctx).await.ok();
     let battery_delta = battery_before.zip(battery_after).map(|(before, after)| after - before);
 
     let snap = BenchSnapshot {
@@ -254,13 +262,31 @@ pub(super) async fn run_perf_benchmark(
     Ok(out)
 }
 
-async fn measure_startup(device: &str, bundle: &str, ability: &str) -> Result<f64, String> {
-    let _ = run_hdc_shell(device, &["aa", "force-stop", bundle], 20).await;
+async fn measure_startup(
+    device: &str,
+    bundle: &str,
+    ability: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let stop = crate::agent::capability_broker::HostCapability::StopAbility {
+        device: device.to_string(),
+        bundle: bundle.to_string(),
+    };
+    let _ = crate::agent::capability_broker::execute_host_capability(&stop, None, ctx).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let started = std::time::Instant::now();
-    run_hdc_shell(device, &["aa", "start", "-b", bundle, "-a", ability], 30).await?;
+    let start = crate::agent::capability_broker::HostCapability::StartAbility {
+        device: device.to_string(),
+        bundle: bundle.to_string(),
+        ability: ability.to_string(),
+    };
+    execute_ui_host_capability(&start, "启动 Ability", ctx).await?;
     for _ in 0..40 {
-        if run_hdc_shell(device, &["aa", "dump", "-l"], 10)
+        let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+            device: device.to_string(),
+            argv: vec!["aa".into(), "dump".into(), "-l".into()],
+        };
+        if execute_ui_host_capability(&query, "查询 Ability 状态", ctx)
             .await
             .is_ok_and(|dump| dump.contains(bundle))
         {
@@ -271,9 +297,33 @@ async fn measure_startup(device: &str, bundle: &str, ability: &str) -> Result<f6
     Err("10 秒内未观察到 Ability 状态".into())
 }
 
-async fn sample_battery_percent(device: &str) -> Result<f64, String> {
-    let output = run_hdc_shell(device, &["hidumper", "-s", "BatteryService", "-a", "-i"], 20).await?;
+async fn sample_battery_percent(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv: vec![
+            "hidumper".into(), "-s".into(), "BatteryService".into(), "-a".into(), "-i".into(),
+        ],
+    };
+    let output = execute_ui_host_capability(&query, "读取设备电量", ctx).await?;
     parse_battery_percent(&output).ok_or_else(|| "未读取到有效电量".into())
+}
+
+async fn execute_ui_host_capability(
+    capability: &crate::agent::capability_broker::HostCapability,
+    action: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let output = crate::agent::capability_broker::execute_host_capability(capability, None, ctx)
+        .await
+        .map_err(|error| format!("{action}失败：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!("{action}失败：{}", first_line_or_unknown(&text)));
+    }
+    Ok(text)
 }
 
 fn parse_battery_percent(output: &str) -> Option<f64> {
@@ -308,8 +358,17 @@ fn benchmark_package_bytes(args: &Value, root: &Path) -> Option<u64> {
 }
 
 /// 采样当前窗口 FPS（hidumper RenderService fps），不支持时返回 Err。
-pub(super) async fn sample_fps(device: &str) -> Result<f64, String> {
-    let out = run_hdc_shell(device, &["hidumper", "-s", "RenderService", "-a", "fps"], 20).await?;
+pub(super) async fn sample_fps(
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<f64, String> {
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.to_string(),
+        argv: vec![
+            "hidumper".into(), "-s".into(), "RenderService".into(), "-a".into(), "fps".into(),
+        ],
+    };
+    let out = execute_ui_host_capability(&query, "读取 RenderService FPS", ctx).await?;
     for line in out.lines() {
         let lower = line.to_lowercase();
         if !lower.contains("fps") {
@@ -370,13 +429,17 @@ mod performance_tests {
 // ---------- UI 控件树 / 启动 Ability / 应用数据清理 / 内存分析 / 应用查询 / 卸载 / 权限 / 网络 / 录屏 ----------
 
 /// dump_ui_hierarchy：导出当前界面控件树 JSON，保存到工程目录并返回摘要。
-pub(super) async fn dump_ui_hierarchy(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn dump_ui_hierarchy(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
-    let (local_path, content) = capture_ui_hierarchy(project_path, &device).await?;
+    let (local_path, content) = capture_ui_hierarchy(project_path, &device, ctx).await?;
     let local_file = local_path.to_string_lossy();
     let total_nodes = count_json_nodes(&content);
     let summary = summarize_ui_tree(&content);
@@ -391,25 +454,15 @@ pub(super) async fn dump_ui_hierarchy(args: &Value, roots: &[String]) -> Result<
     Ok(out)
 }
 
-pub(super) async fn capture_ui_hierarchy(project_path: &str, device: &str) -> Result<(PathBuf, String), String> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let dev_file = format!("/data/local/tmp/ui_dump_{}.json", ts);
-    run_hdc_shell(device, &["uitest", "dumpLayout", "-p", &dev_file], 30).await
-        .map_err(|e| format!("控件树导出失败：{e}"))?;
-
-    let local_dir = if project_path.is_empty() {
-        std::env::temp_dir().to_string_lossy().to_string()
-    } else {
-        // 与截图口径一致：.deveco-agent 目录（不用 .trae，避免 IDE 清缓存丢产物）
-        Path::new(project_path)
-            .join(".deveco-agent")
-            .to_string_lossy()
-            .to_string()
-    };
-    std::fs::create_dir_all(&local_dir).ok();
+pub(super) async fn capture_ui_hierarchy(
+    project_path: &str,
+    device: &str,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<(PathBuf, String), String> {
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录，无法保存控件树".into());
+    }
+    let (workspace, local_dir) = ensure_workspace_subdir(project_path, ".deveco-agent/ui")?;
     // 文件名：毫秒时间戳 + 设备号（与截图口径一致，多设备/连续导出不覆盖）
     let ts_ms = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
     let dev_safe: String = device
@@ -417,20 +470,12 @@ pub(super) async fn capture_ui_hierarchy(project_path: &str, device: &str) -> Re
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect();
-    let local_file = PathBuf::from(format!("{local_dir}/ui_hierarchy-{ts_ms}-{dev_safe}.json"));
-
-    // 通过 hdc file recv 拉到本地
-    let hdc_args: Vec<String> = vec![
-        "-s".to_string(), device.to_string(), "file".to_string(), "recv".to_string(),
-        dev_file.clone(), local_file.to_string_lossy().to_string(),
-    ];
-    run_cmd("hdc", &hdc_args, None, 30).await
-        .map_err(|e| format!("拉取控件树文件失败: {e}"))?;
-    if !local_file.exists() {
-        return Err("拉取控件树文件失败：本地文件未生成".into());
-    }
-
-    let content = std::fs::read_to_string(&local_file).unwrap_or_default();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let local_file = local_dir.join(format!(
+        "ui_hierarchy-{ts_ms}-{dev_safe}-{}.json",
+        &nonce[..8],
+    ));
+    let content = capture_ui_layout_file(&workspace, device, &local_file, ctx).await?;
     Ok((local_file, content))
 }
 
@@ -577,7 +622,7 @@ pub(super) async fn start_ability(
     roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    let device = resolve_authorized_device(args["device"].as_str(), "ability").await?;
+    let device = resolve_authorized_device(args["device"].as_str(), "ability", ctx).await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -600,39 +645,44 @@ pub(super) async fn start_ability(
         if bundle.is_empty() {
             return Err("后台恢复验证需要显式 bundle 或可解析当前工程 bundleName".into());
         }
-        run_hdc_shell(&device, &["uitest", "uiInput", "keyEvent", "home"], 20)
-            .await
-            .map_err(|error| format!("将应用切入后台失败：{error}"))?;
+        let home = crate::agent::capability_broker::HostCapability::DeviceUiInput {
+            device: device.clone(),
+            operation_id: uuid::Uuid::new_v4().simple().to_string(),
+            action: crate::agent::capability_broker::DeviceUiAction::Key {
+                name: "home".into(),
+            },
+        };
+        execute_ui_host_capability(&home, "将应用切入后台", ctx).await?;
         tokio::time::sleep(Duration::from_millis(800)).await;
     }
 
-    let mut cmd: Vec<&str> = vec!["aa", "start"];
-    let mut owned: Vec<String> = Vec::new();
-    if !bundle.is_empty() {
-        owned.push("-b".to_string());
-        owned.push(bundle.clone());
-    }
-    if !ability.is_empty() {
-        owned.push("-a".to_string());
-        owned.push(ability.clone());
-    }
-    if !uri.is_empty() {
-        owned.push("-D".to_string());
-        owned.push(uri.clone());
-    }
-    for o in &owned {
-        cmd.push(o.as_str());
-    }
-
-    let out = run_hdc_shell(&device, &cmd, 20).await
-        .map_err(|e| format!("启动 Ability 失败：{e}"))?;
+    let out = if uri.is_empty() && !bundle.is_empty() && !ability.is_empty() {
+        let start = crate::agent::capability_broker::HostCapability::StartAbility {
+            device: device.clone(),
+            bundle: bundle.clone(),
+            ability: ability.clone(),
+        };
+        execute_ui_host_capability(&start, "启动 Ability", ctx).await?
+    } else {
+        let start = crate::agent::capability_broker::HostCapability::StartAbilityIntent {
+            device: device.clone(),
+            bundle: (!bundle.is_empty()).then_some(bundle.clone()),
+            ability: (!ability.is_empty()).then_some(ability.clone()),
+            uri: (!uri.is_empty()).then_some(uri.clone()),
+        };
+        execute_ui_host_capability(&start, "按意图启动 Ability", ctx).await?
+    };
 
     // 状态确认：显式 bundle 必须在多次 Ability 栈观测中至少出现一次。
     let mut observed = bundle.is_empty();
     let mut foreground = false;
     for wait in [800u64, 1200, 2000] {
         tokio::time::sleep(Duration::from_millis(wait)).await;
-        if let Ok(dump) = run_hdc_shell(&device, &["aa", "dump", "-l"], 10).await {
+        let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+            device: device.clone(),
+            argv: vec!["aa".into(), "dump".into(), "-l".into()],
+        };
+        if let Ok(dump) = execute_ui_host_capability(&query, "查询 Ability 状态", ctx).await {
             if bundle.is_empty() || dump.contains(&bundle) { observed = true; }
             if dump.lines().any(|line| line.contains(&bundle) && line.contains("foreground")) {
                 foreground = true;
@@ -641,7 +691,14 @@ pub(super) async fn start_ability(
         }
     }
     if !observed {
-        let hilog = run_hdc_shell(&device, &["hilog", "-x"], 25).await.unwrap_or_default();
+        let logs = crate::agent::capability_broker::HostCapability::ReadHilog {
+            device: device.clone(),
+            level: None,
+            tag: None,
+        };
+        let hilog = execute_ui_host_capability(&logs, "读取启动日志", ctx)
+            .await
+            .unwrap_or_default();
         let evidence = hilog.lines().filter(|line| line.contains(&bundle)).collect::<Vec<_>>().join("\n");
         return Err(format!(
             "Ability 启动命令已返回，但状态确认未观察到 {bundle}。\n日志证据：{}",
@@ -674,10 +731,14 @@ pub(super) async fn start_ability(
 }
 
 /// clear_app_data：清除缓存 / 数据 / 全部。
-pub(super) async fn clear_app_data(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn clear_app_data(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -693,17 +754,30 @@ pub(super) async fn clear_app_data(args: &Value, roots: &[String]) -> Result<Str
         return Err("无法确定应用包名".into());
     }
     let target = args["target"].as_str().unwrap_or("both");
+    if !matches!(target, "cache" | "data" | "both") {
+        return Err("target 必须是 cache、data 或 both".into());
+    }
 
     let mut results: Vec<String> = Vec::new();
     let mut any_ok = false;
     if target == "cache" || target == "both" {
-        match run_hdc_shell(&device, &["bm", "clean", "-c", "-n", &bundle], 20).await {
+        let capability = crate::agent::capability_broker::HostCapability::ClearAppStorage {
+            device: device.clone(),
+            bundle: bundle.clone(),
+            target: crate::agent::capability_broker::AppStorageTarget::Cache,
+        };
+        match execute_ui_host_capability(&capability, "清除应用缓存", ctx).await {
             Ok(o) => { results.push(format!("清除缓存：{}", o.trim())); any_ok = true; }
             Err(e) => results.push(format!("清除缓存失败：{e}")),
         }
     }
     if target == "data" || target == "both" {
-        match run_hdc_shell(&device, &["bm", "clean", "-d", "-n", &bundle], 20).await {
+        let capability = crate::agent::capability_broker::HostCapability::ClearAppStorage {
+            device: device.clone(),
+            bundle: bundle.clone(),
+            target: crate::agent::capability_broker::AppStorageTarget::Data,
+        };
+        match execute_ui_host_capability(&capability, "清除应用数据", ctx).await {
             Ok(o) => { results.push(format!("清除数据：{}", o.trim())); any_ok = true; }
             Err(e) => results.push(format!("清除数据失败：{e}")),
         }
@@ -721,10 +795,14 @@ pub(super) async fn clear_app_data(args: &Value, roots: &[String]) -> Result<Str
 }
 
 /// dump_memory：读取应用内存使用情况并结构化报告。
-pub(super) async fn dump_memory(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn dump_memory(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -739,21 +817,43 @@ pub(super) async fn dump_memory(args: &Value, roots: &[String]) -> Result<String
     if bundle.is_empty() {
         return Err("无法确定应用包名".into());
     }
-    let pid = pid_of(&device, &bundle).await?;
+    let pid_query = crate::agent::capability_broker::HostCapability::DevicePidof {
+        device: device.clone(),
+        bundle: bundle.clone(),
+    };
+    let pid = execute_ui_host_capability(&pid_query, "查询应用进程", ctx)
+        .await?
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| format!("应用 {bundle} 未运行"))?;
 
     // 1) smaps 解析（尽力而为，需要权限）
-    let smaps_raw = run_hdc_shell(&device, &["cat", &format!("/proc/{pid}/smaps")], 20).await
+    let smaps = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["cat".into(), format!("/proc/{pid}/smaps")],
+    };
+    let smaps_raw = execute_ui_host_capability(&smaps, "读取 smaps", ctx)
+        .await
         .unwrap_or_default();
     let smaps_summary = parse_smaps_summary(&smaps_raw);
 
     // 2) hidumper --mem <pid>（尽力而为）
-    let hidumper_raw = run_hdc_shell(&device, &["hidumper", "--mem", &pid.to_string()], 20)
+    let mem_query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["hidumper".into(), "--mem".into(), pid.to_string()],
+    };
+    let hidumper_raw = execute_ui_host_capability(&mem_query, "读取 hidumper 内存", ctx)
         .await
-        .unwrap_or_else(|_| String::new());
+        .unwrap_or_default();
     let hi_summary = parse_hidumper_mem(&hidumper_raw);
 
     // 3) /proc/<pid>/status
-    let status_raw = run_hdc_shell(&device, &["cat", &format!("/proc/{pid}/status")], 10)
+    let status = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["cat".into(), format!("/proc/{pid}/status")],
+    };
+    let status_raw = execute_ui_host_capability(&status, "读取进程状态", ctx)
         .await
         .unwrap_or_default();
     let rss_kb = extract_kb(&status_raw, "VmRSS:");
@@ -825,14 +925,21 @@ pub(super) fn parse_hidumper_mem(raw: &str) -> std::collections::BTreeMap<String
 }
 
 /// get_installed_apps：列出已安装应用。
-pub(super) async fn get_installed_apps(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn get_installed_apps(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let filter = args["filter"].as_str().unwrap_or("").to_lowercase();
-    let raw = run_hdc_shell(&device, &["bm", "dump", "-a"], 30).await
-        .map_err(|e| format!("查询已安装应用失败：{e}"))?;
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["bm".into(), "dump".into(), "-a".into()],
+    };
+    let raw = execute_ui_host_capability(&query, "查询已安装应用", ctx).await?;
 
     let mut pkgs: Vec<String> = Vec::new();
     for line in raw.lines() {
@@ -862,10 +969,14 @@ pub(super) async fn get_installed_apps(args: &Value, _roots: &[String]) -> Resul
 }
 
 /// get_app_info：查询应用详情。
-pub(super) async fn get_app_info(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn get_app_info(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
@@ -880,9 +991,11 @@ pub(super) async fn get_app_info(args: &Value, roots: &[String]) -> Result<Strin
     if bundle.is_empty() {
         return Err("无法确定应用包名".into());
     }
-    let raw = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 30)
-        .await
-        .map_err(|e| format!("查询应用信息失败：{e}"))?;
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["bm".into(), "dump".into(), "-n".into(), bundle.clone()],
+    };
+    let raw = execute_ui_host_capability(&query, "查询应用信息", ctx).await?;
 
     let version_code = extract_json_num(&raw, "versionCode");
     let version_name = extract_json_str(&raw, "versionName");
@@ -942,8 +1055,12 @@ pub(super) fn extract_json_num(text: &str, field: &str) -> Option<String> {
 }
 
 /// uninstall_app：卸载应用。
-pub(super) async fn uninstall_app(args: &Value, roots: &[String]) -> Result<String, String> {
-    let device = resolve_authorized_device(args["device"].as_str(), "install").await?;
+pub(super) async fn uninstall_app(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let device = resolve_authorized_device(args["device"].as_str(), "install", ctx).await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -959,18 +1076,34 @@ pub(super) async fn uninstall_app(args: &Value, roots: &[String]) -> Result<Stri
     }
     let keep_data = args["keep_data"].as_bool().unwrap_or(false);
 
-    let args = if keep_data {
-        vec!["bm", "uninstall", "-k", "-n", &bundle]
-    } else {
-        vec!["bm", "uninstall", "-n", &bundle]
+    let uninstall = crate::agent::capability_broker::HostCapability::UninstallBundle {
+        device: device.clone(),
+        bundle: bundle.clone(),
+        keep_data,
     };
-    let out = run_hdc_shell(&device, &args, 30).await
-        .map_err(|e| format!("卸载失败：{e}"))?;
+    let out = execute_ui_host_capability(&uninstall, "卸载应用", ctx).await?;
 
-    let still_installed = run_hdc_shell(&device, &["bm", "dump", "-n", &bundle], 20).await
-        .is_ok_and(|dump| dump.contains(&bundle) && !dump.contains("not found"));
-    if still_installed {
+    let query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec!["bm".into(), "dump".into(), "-n".into(), bundle.clone()],
+    };
+    let verification = crate::agent::capability_broker::execute_host_capability(&query, None, ctx)
+        .await
+        .map_err(|error| format!("卸载命令已返回，但状态确认失败：{error}"))?;
+    let verification_text = host_output_text(&verification);
+    let lower = verification_text.to_lowercase();
+    let explicitly_absent = lower.contains("bundle not found")
+        || lower.contains("not installed")
+        || lower.contains("does not exist")
+        || lower.contains("no such bundle");
+    if verification_text.contains(&bundle) && !explicitly_absent {
         return Err(format!("卸载命令已返回，但状态确认仍显示 {bundle} 已安装。结果：{}", out.trim()));
+    }
+    if (!verification.status.success() || hdc_shell_failed(&verification_text)) && !explicitly_absent {
+        return Err(format!(
+            "卸载命令已返回，但无法确认应用已不存在：{}",
+            first_line_or_unknown(&verification_text),
+        ));
     }
     if !project_path.is_empty() {
         crate::agent::runtime_log::stop(project_path);
@@ -985,7 +1118,7 @@ pub(super) async fn grant_permission(
     roots: &[String],
     ctx: &crate::agent::exec_ctx::ToolCtx,
 ) -> Result<String, String> {
-    let device = resolve_authorized_device(args["device"].as_str(), "shell").await?;
+    let device = resolve_authorized_device(args["device"].as_str(), "shell", ctx).await?;
     let project_path = roots.first().map(String::as_str).unwrap_or("");
     let bundle = match args["bundle"].as_str() {
         Some(b) => b.to_string(),
@@ -1005,9 +1138,15 @@ pub(super) async fn grant_permission(
         return Err("action 必须是 grant 或 revoke".into());
     }
 
-    let primary = if action == "grant" { "grant-permission" } else { "revoke-permission" };
-    let fallback = if action == "grant" { "grant" } else { "revoke" };
-    let result = run_hdc_shell(&device, &["bm", primary, "-n", &bundle, "-p", &perm], 20).await;
+    let grant = action == "grant";
+    let primary = crate::agent::capability_broker::HostCapability::ChangeAppPermission {
+        device: device.clone(),
+        bundle: bundle.clone(),
+        permission: perm.clone(),
+        grant,
+        backend: crate::agent::capability_broker::PermissionCommandBackend::NamedFlags,
+    };
+    let result = execute_ui_host_capability(&primary, "变更应用权限", ctx).await;
     let primary_error = match result {
         Ok(o) if !hdc_shell_failed(&o) => {
             ctx.record_run_event("harmony.permission.changed", serde_json::json!({
@@ -1019,7 +1158,14 @@ pub(super) async fn grant_permission(
         Ok(o) => o,
         Err(e) => e,
     };
-    let result2 = run_hdc_shell(&device, &["bm", fallback, &bundle, &perm], 20).await;
+    let fallback = crate::agent::capability_broker::HostCapability::ChangeAppPermission {
+        device: device.clone(),
+        bundle: bundle.clone(),
+        permission: perm.clone(),
+        grant,
+        backend: crate::agent::capability_broker::PermissionCommandBackend::Positional,
+    };
+    let result2 = execute_ui_host_capability(&fallback, "使用兼容语法变更应用权限", ctx).await;
     match result2 {
         Ok(o) if !hdc_shell_failed(&o) => {
             ctx.record_run_event("harmony.permission.changed", serde_json::json!({
@@ -1034,23 +1180,30 @@ pub(super) async fn grant_permission(
 }
 
 /// set_wifi_state：切换 Wi-Fi 开关（尽力而为）。
-pub(super) async fn set_wifi_state(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn set_wifi_state(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let enable = args["enable"].as_bool().unwrap_or(true);
-    let val = if enable { "1" } else { "0" };
-
-    // 尝试几种常见方式
-    let attempts = vec![
-        ("cmd wifi set_wifi_enable", vec!["cmd", "wifi", "set_wifi_enable", val]),
-        ("wpa_cli", vec!["wpa_cli", "-i", "wlan0", if enable { "ifup" } else { "ifdown" }]),
-        ("svc wifi", vec!["svc", "wifi", if enable { "enable" } else { "disable" }]),
+    let attempts = [
+        ("cmd wifi set_wifi_enable", crate::agent::capability_broker::DeviceRadioBackend::WifiCommand),
+        ("wpa_cli", crate::agent::capability_broker::DeviceRadioBackend::WpaCli),
+        ("svc wifi", crate::agent::capability_broker::DeviceRadioBackend::Svc),
     ];
     let mut errors: Vec<String> = Vec::new();
-    for (name, cmd) in &attempts {
-        match run_hdc_shell(&device, cmd, 10).await {
+    for (name, backend) in attempts {
+        let capability = crate::agent::capability_broker::HostCapability::SetDeviceRadio {
+            device: device.clone(),
+            radio: crate::agent::capability_broker::DeviceRadio::Wifi,
+            enable,
+            backend,
+        };
+        match execute_ui_host_capability(&capability, "切换 Wi-Fi", ctx).await {
             Ok(o) => {
                 let low = o.to_lowercase();
                 if !low.contains("not found") && !low.contains("unknown") && !low.contains("failed") && !low.contains("无此命令") {
@@ -1068,21 +1221,29 @@ pub(super) async fn set_wifi_state(args: &Value, _roots: &[String]) -> Result<St
 }
 
 /// set_airplane_mode：切换飞行模式（尽力而为）。
-pub(super) async fn set_airplane_mode(args: &Value, _roots: &[String]) -> Result<String, String> {
+pub(super) async fn set_airplane_mode(
+    args: &Value,
+    _roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let enable = args["enable"].as_bool().unwrap_or(true);
-    let val = if enable { "1" } else { "0" };
-
-    let attempts = vec![
-        ("cmd airplane_mode", vec!["cmd", "power", "set-airplane-mode", val]),
-        ("settings put global", vec!["settings", "put", "global", "airplane_mode_on", val]),
+    let attempts = [
+        ("cmd airplane_mode", crate::agent::capability_broker::DeviceRadioBackend::PowerCommand),
+        ("settings put global", crate::agent::capability_broker::DeviceRadioBackend::GlobalSettings),
     ];
     let mut errors: Vec<String> = Vec::new();
-    for (name, cmd) in &attempts {
-        match run_hdc_shell(&device, cmd, 10).await {
+    for (name, backend) in attempts {
+        let capability = crate::agent::capability_broker::HostCapability::SetDeviceRadio {
+            device: device.clone(),
+            radio: crate::agent::capability_broker::DeviceRadio::AirplaneMode,
+            enable,
+            backend,
+        };
+        match execute_ui_host_capability(&capability, "切换飞行模式", ctx).await {
             Ok(o) => {
                 let low = o.to_lowercase();
                 if !low.contains("not found") && !low.contains("unknown") && !low.contains("failed") && !low.contains("无此命令") {
@@ -1106,29 +1267,39 @@ struct RecordHandle {
     device_file: String,
     /// 后台执行 screenrecord 的任务：录制会持续到 --time-limit 或被 pkill，
     /// 不能同步 await（会把 start 卡住 60~600 秒），stop 时杀掉后 await 收尾。
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Result<std::process::Output, String>>,
 }
 
-pub(super) async fn screen_record(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn screen_record(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
+    let project_path = roots.first().map(String::as_str).unwrap_or("");
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录，无法保存录屏".into());
+    }
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let action = args["action"].as_str().unwrap_or("start");
-    let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
 
     let store = RECORD_STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
 
     if action == "start" {
         let max = args["max_seconds"].as_u64().unwrap_or(60).clamp(1, 600);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let dev_file = format!("/data/local/tmp/record_{ts}.mp4");
+        let dev_file = format!(
+            "/data/local/tmp/deveco_agent_screen_record_{}.mp4",
+            uuid::Uuid::new_v4().simple(),
+        );
 
         // 快速探测设备是否支持 screenrecord（--help 立即返回，不阻塞）
-        let probe = run_hdc_shell(&device, &["screenrecord", "--help"], 5).await;
+        let probe_capability =
+            crate::agent::capability_broker::HostCapability::ProbeScreenRecording {
+                device: device.clone(),
+            };
+        let probe = execute_ui_host_capability(&probe_capability, "探测录屏能力", ctx).await;
         let supported = match &probe {
             Ok(o) => {
                 let low = o.to_lowercase();
@@ -1142,72 +1313,76 @@ pub(super) async fn screen_record(args: &Value, roots: &[String]) -> Result<Stri
             ));
         }
 
-        let _ = run_hdc_shell(&device, &["rm", "-f", &dev_file], 5).await;
-        // 后台执行：screenrecord 一直录到 --time-limit 上限才退出，
-        // 同步 await 会把工具调用卡住 60~600 秒，且无法边录边执行 UI 操作。
-        let d = device.clone();
-        let df = dev_file.clone();
-        let m = max;
+        cleanup_managed_device_file(&device, &dev_file, ctx).await;
         // 检查 + spawn + 登记同一锁内原子完成：并发 start 若在检查后插入，
         // 后一个会覆盖前一个 handle，导致第一次录屏失控（无法 stop）
         let mut guard = store.lock().map_err(|e| e.to_string())?;
         if guard.contains_key(&device) {
             return Err(format!("设备 {device} 已有进行中的录屏，先调用 action=stop 结束。"));
         }
-        let task = tokio::spawn(async move {
-            let _ = run_hdc_shell(
-                &d,
-                &["screenrecord", "--time-limit", &m.to_string(), "--size", "1080x1920", &df],
-                m + 10,
-            )
-            .await;
-        });
+        let start = crate::agent::capability_broker::HostCapability::StartScreenRecording {
+            device: device.clone(),
+            remote_path: dev_file.clone(),
+            max_seconds: max,
+        };
+        let task = crate::agent::capability_broker::spawn_host_capability(&start, None, ctx)?;
         guard.insert(device.clone(), RecordHandle { device_file: dev_file, task });
         Ok(format!("录屏已开始（设备 {device}，最大时长 {max}s），用 screen_record action=stop 结束并保存视频到工程目录。"))
     } else if action == "stop" {
-        let handle = {
+        let mut handle = {
             let m = store.lock().ok();
             m.and_then(|mut g| g.remove(&device))
         };
-        let Some(h) = handle else {
+        let Some(h) = handle.take() else {
             return Err(format!("当前设备 {device} 没有进行中的录屏，先调用 action=start 开始。"));
         };
 
         // 停止录屏：SIGINT 结束 screenrecord，等待后台任务收尾（文件 flush）
-        let _ = run_hdc_shell(&device, &["pkill", "-2", "screenrecord"], 5).await;
+        let stop = crate::agent::capability_broker::HostCapability::StopScreenRecording {
+            device: device.clone(),
+        };
+        if let Err(error) = execute_ui_host_capability(&stop, "停止录屏", ctx).await {
+            let mut guard = store.lock().map_err(|lock_error| lock_error.to_string())?;
+            guard.insert(device.clone(), h);
+            return Err(format!("停止录屏失败，录制句柄已保留，可重试 action=stop：{error}"));
+        }
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let _ = h.task.await;
+        let task_warning = match h.task.await {
+            Ok(Ok(output)) if output.status.success() => None,
+            Ok(Ok(output)) => Some(format!(
+                "录屏进程退出码 {}",
+                output.status.code().unwrap_or(-1),
+            )),
+            Ok(Err(error)) => Some(format!("录屏进程失败：{error}")),
+            Err(error) => Some(format!("录屏后台任务异常：{error}")),
+        };
 
         // 拉到本地：.deveco-agent 目录（与截图口径一致），文件名毫秒+设备号（多设备不覆盖）
-        let local_dir = if project_path.is_empty() {
-            std::env::temp_dir().to_string_lossy().to_string()
-        } else {
-            Path::new(&project_path)
-                .join(".deveco-agent")
-                .to_string_lossy()
-                .to_string()
-        };
-        std::fs::create_dir_all(&local_dir).ok();
+        let (workspace, local_dir) = ensure_workspace_subdir(project_path, ".deveco-agent")?;
         let ts_ms = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
         let dev_safe: String = device
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .take(32)
             .collect();
-        let local_file = format!("{local_dir}/screen_record-{ts_ms}-{dev_safe}.mp4");
+        let local_file = local_dir.join(format!("screen_record-{ts_ms}-{dev_safe}.mp4"));
+        receive_managed_device_file(
+            &workspace,
+            &device,
+            &h.device_file,
+            &local_file,
+            ctx,
+        )
+        .await?;
 
-        let hdc_args: Vec<String> = vec![
-            "-t".to_string(), device.clone(), "file".to_string(), "recv".to_string(),
-            h.device_file.clone(), local_file.clone(),
-        ];
-        let recv = run_cmd("hdc", &hdc_args, None, 60).await;
-        let ok = recv.is_ok() && std::path::Path::new(&local_file).exists();
-
-        if ok {
-            Ok(format!("录屏已保存（设备 {device}）\n本地路径：{local_file}\n可在资源管理器中播放查看。"))
-        } else {
-            Err(format!("录屏文件拉取失败（设备 {device}），视频可能未生成。"))
+        let mut report = format!(
+            "录屏已保存（设备 {device}）\n本地路径：{}\n可在资源管理器中播放查看。",
+            local_file.display(),
+        );
+        if let Some(warning) = task_warning {
+            report.push_str(&format!("\n注意：{warning}；视频文件已独立确认存在且非空。"));
         }
+        Ok(report)
     } else {
         Err("action 必须是 start 或 stop".into())
     }
@@ -1220,6 +1395,7 @@ static RECORD_UI_STORE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Rec
 #[derive(Clone)]
 struct RecordUiHandle {
     device_file: String,
+    name: String,
 }
 
 /// record_ui：开始/停止 UI 操作录制。
@@ -1237,46 +1413,54 @@ pub(super) fn safe_file_name(raw: &str) -> String {
     if trimmed.is_empty() { "default".to_string() } else { trimmed.chars().take(64).collect() }
 }
 
-pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn record_ui(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let action = args["action"].as_str().unwrap_or("start");
     let name = safe_file_name(args["name"].as_str().unwrap_or("default"));
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
+    if project_path.is_empty() {
+        return Err("当前会话未绑定项目目录，无法保存 UI 录制".into());
+    }
 
     let store = RECORD_UI_STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let store_key = format!("{device}|{name}");
+    let store_key = device.clone();
 
     if action == "start" {
-        if let Ok(m) = store.lock() {
-            if m.contains_key(&store_key) {
-                return Err(format!("设备 {device} 已有名为 \"{name}\" 的录制进行中，请先调用 record_ui action=stop 结束。"));
+        let dev_file = format!(
+            "/data/local/tmp/deveco_agent_ui_record_{}.csv",
+            uuid::Uuid::new_v4().simple(),
+        );
+        {
+            let mut guard = store.lock().map_err(|e| e.to_string())?;
+            if guard.contains_key(&store_key) {
+                return Err(format!("设备 {device} 已有进行中的 UI 录制，请先使用原名称调用 record_ui action=stop 结束。"));
             }
+            guard.insert(
+                store_key.clone(),
+                RecordUiHandle {
+                    device_file: dev_file.clone(),
+                    name: name.clone(),
+                },
+            );
         }
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let dev_file = format!("/data/local/tmp/ui_record_{ts}.csv");
-
-        let _ = run_hdc_shell(&device, &["rm", "-f", &dev_file], 5).await;
-        // 启动 uiRecord 录制（后台执行）
-        let out = run_hdc_shell(&device, &["uitest", "uiRecord", "record", "-p", &dev_file], 5).await;
-        match out {
-            Ok(o) if !o.to_lowercase().contains("not found") && !o.to_lowercase().contains("fail") => {}
-            Ok(o) => return Err(format!("启动 UI 录制失败：{o}")),
-            Err(e) => return Err(format!("启动 UI 录制失败：{e}")),
+        let start = crate::agent::capability_broker::HostCapability::StartUiRecording {
+            device: device.clone(),
+            remote_path: dev_file.clone(),
+        };
+        if let Err(error) = execute_ui_host_capability(&start, "启动 UI 录制", ctx).await {
+            if let Ok(mut guard) = store.lock() {
+                guard.remove(&store_key);
+            }
+            cleanup_managed_device_file(&device, &dev_file, ctx).await;
+            return Err(error);
         }
-
-        // 登记与检查同一锁内：并发 start 在检查后登记会互相覆盖 handle，
-        // 导致前一个录制 stop 时找不到；这里双重检查后原子插入
-        let mut guard = store.lock().map_err(|e| e.to_string())?;
-        if guard.contains_key(&store_key) {
-            return Err(format!("设备 {device} 已有名为 \"{name}\" 的录制进行中，请先调用 record_ui action=stop 结束。"));
-        }
-        guard.insert(store_key, RecordUiHandle { device_file: dev_file });
         Ok(format!(
             "UI 录制已开始（设备 {device}，名称：{name}）\n请在设备上操作你想录制的流程，完成后调用 record_ui action=stop 结束录制。"
         ))
@@ -1288,33 +1472,39 @@ pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, 
         let Some(h) = handle else {
             return Err(format!("没有找到名称为 \"{name}\" 的录制，先调用 record_ui action=start 开始。"));
         };
+        if h.name != name {
+            return Err(format!(
+                "设备 {device} 正在录制名称 \"{}\"，请使用该名称停止，避免写入错误目标。",
+                h.name,
+            ));
+        }
 
         // 停止录制：发送停止指令
-        let stop_out = run_hdc_shell(&device, &["uitest", "uiRecord", "stop"], 10).await;
-        let _ = stop_out;
+        let stop = crate::agent::capability_broker::HostCapability::StopUiRecording {
+            device: device.clone(),
+        };
+        execute_ui_host_capability(&stop, "停止 UI 录制", ctx).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // 把录制文件拉到本地
-        let local_dir = if project_path.is_empty() {
-            std::env::temp_dir().to_string_lossy().to_string()
-        } else {
-            format!("{project_path}/.deveco-agent/ui_records")
-        };
-        std::fs::create_dir_all(&local_dir).ok();
-        let local_csv = format!("{local_dir}/{name}.csv");
-        let local_json = format!("{local_dir}/{name}.json");
-
-        let hdc_args: Vec<String> = vec![
-            "-s".to_string(), device.clone(), "file".to_string(), "recv".to_string(),
-            h.device_file.clone(), local_csv.clone(),
-        ];
-        let recv = run_cmd("hdc", &hdc_args, None, 30).await;
-        if recv.is_err() || !std::path::Path::new(&local_csv).exists() {
+        let (workspace, local_dir) =
+            ensure_workspace_subdir(&project_path, ".deveco-agent/ui_records")?;
+        let local_csv = local_dir.join(format!("{name}.csv"));
+        let local_json = local_dir.join(format!("{name}.json"));
+        if let Err(error) = receive_managed_device_file(
+            &workspace,
+            &device,
+            &h.device_file,
+            &local_csv,
+            ctx,
+        )
+        .await
+        {
             if let Ok(mut m) = store.lock() {
                 m.remove(&store_key);
             }
             return Err(format!(
-                "录制文件拉取失败（设备 {device}）。可能设备不支持 uitest uiRecord（模拟器常见），或录制文件已丢失。"
+                "录制文件拉取失败（设备 {device}）：{error}。可能设备不支持 uitest uiRecord（模拟器常见），或录制文件已丢失。"
             ));
         }
 
@@ -1326,8 +1516,9 @@ pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, 
                 m.remove(&store_key);
             }
             return Err(format!(
-                "录制文件已拉取但未解析到任何操作步骤（{} 行）。可能 uitest uiRecord 输出格式与预期不符。原始文件：{local_csv}",
-                csv_content.lines().count()
+                "录制文件已拉取但未解析到任何操作步骤（{} 行）。可能 uitest uiRecord 输出格式与预期不符。原始文件：{}",
+                csv_content.lines().count(),
+                local_csv.display(),
             ));
         }
         let json_out = serde_json::json!({
@@ -1337,17 +1528,18 @@ pub(super) async fn record_ui(args: &Value, roots: &[String]) -> Result<String, 
             "duration_ms": duration_ms,
             "steps": steps,
         });
-        std::fs::write(&local_json, serde_json::to_string_pretty(&json_out).unwrap_or_default())
-            .unwrap_or(());
+        let write_json =
+            std::fs::write(&local_json, serde_json::to_string_pretty(&json_out).unwrap_or_default());
 
         if let Ok(mut m) = store.lock() {
             m.remove(&store_key);
         }
+        write_json.map_err(|error| format!("写入 UI 录制 JSON 失败：{error}"))?;
 
         let mut out = format!("UI 录制完成（设备 {device}，名称 {name}）\n");
         out.push_str(&format!("共 {} 步，总时长约 {:.1} 秒\n", steps.len(), duration_ms as f64 / 1000.0));
-        out.push_str(&format!("CSV 原始文件：{local_csv}\n"));
-        out.push_str(&format!("JSON 步骤文件：{local_json}\n"));
+        out.push_str(&format!("CSV 原始文件：{}\n", local_csv.display()));
+        out.push_str(&format!("JSON 步骤文件：{}\n", local_json.display()));
         out.push_str("\n步骤预览（前 10 步）：\n");
         for (i, s) in steps.iter().take(10).enumerate() {
             out.push_str(&format!("  {}. {}\n", i + 1, s["desc"].as_str().unwrap_or("?")));
@@ -1447,10 +1639,14 @@ pub(super) fn parse_ui_record_csv(csv: &str) -> (Vec<serde_json::Value>, u64) {
 }
 
 /// replay_ui：回放录制的 UI 操作。
-pub(super) async fn replay_ui(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn replay_ui(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let project_path = roots.first().map(String::as_str).unwrap_or("").to_string();
     let speed = args["speed"].as_f64().unwrap_or(1.0).clamp(0.25, 4.0);
@@ -1495,7 +1691,7 @@ pub(super) async fn replay_ui(args: &Value, roots: &[String]) -> Result<String, 
         prev_ts = step["ts"].as_u64();
 
         let desc = step["desc"].as_str().unwrap_or(&super::test_tools::describe_step(step)).to_string();
-        match super::test_tools::execute_ui_step(&device, step).await {
+        match super::test_tools::execute_ui_step(&device, step, ctx).await {
             Ok(info) => {
                 let suffix = if info.is_empty() { String::new() } else { format!("（{info}）") };
                 results.push(format!("{}. {desc} → 成功{suffix}", i + 1));
@@ -1517,10 +1713,14 @@ pub(super) async fn replay_ui(args: &Value, roots: &[String]) -> Result<String, 
 
 /// [54] gesture_perform：单次触摸/输入手势注入（tap/swipe/longPress/doubleTap/text/key）。
 /// 坐标可直接使用 ui_locator 输出中的推荐点击坐标（bounds 中心点）。
-pub(super) async fn gesture_perform(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn gesture_perform(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
     let action = args["action"].as_str().ok_or("需要参数 {\"action\":\"tap|swipe|longPress|doubleTap|text|key\", ...}")?;
     let _ = roots;
@@ -1552,6 +1752,7 @@ pub(super) async fn gesture_perform(args: &Value, roots: &[String]) -> Result<St
                 super::test_tools::execute_ui_step(
                     &device,
                     &serde_json::json!({"action": "tap", "x": x, "y": y}),
+                    ctx,
                 )
                 .await?;
                 tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1572,7 +1773,7 @@ pub(super) async fn gesture_perform(args: &Value, roots: &[String]) -> Result<St
             ))
         }
     }
-    super::test_tools::execute_ui_step(&device, &step).await.map(|info| {
+    super::test_tools::execute_ui_step(&device, &step, ctx).await.map(|info| {
         let mut out = format!("手势已执行（设备 {device}，action={action}）\n");
         if !info.is_empty() {
             out.push_str(&format!("补充：{info}\n"));
@@ -1774,7 +1975,11 @@ fn scan_hap_sizes(path: &std::path::Path) -> Result<(u64, std::collections::BTre
 /// [53] ui_locator：按文字/类型在设备当前界面控件树中定位元素，返回坐标与可点击信息。
 /// 数据来源：path 参数给本地 dumpLayout JSON（离线复用），或现场 hdc 采集后自动清理。
 /// 输出匹配项清单 + 推荐项中心坐标（可直接给 run_ui_flow 的 tap 使用）。
-pub(super) async fn ui_locator(args: &Value, roots: &[String]) -> Result<String, String> {
+pub(super) async fn ui_locator(
+    args: &Value,
+    roots: &[String],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let text = args["text"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let ctype = args["type"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let index = args["index"].as_u64().unwrap_or(0) as usize;
@@ -1788,25 +1993,20 @@ pub(super) async fn ui_locator(args: &Value, roots: &[String]) -> Result<String,
             std::fs::read_to_string(&resolved).map_err(|e| format!("读取 {} 失败: {e}", resolved.display()))?
         }
         None => {
+            let project_path = roots.first().map(String::as_str).unwrap_or("");
+            if project_path.is_empty() {
+                return Err("当前会话未绑定项目目录，无法采集控件树".into());
+            }
             let device = match args["device"].as_str() {
                 Some(d) => d.to_string(),
-                None => default_device_id().await?,
+                None => default_device_id(ctx).await?,
             };
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let dev_file = format!("/data/local/tmp/ui_dump_{}.json", ts);
-            run_hdc_shell(&device, &["uitest", "dumpLayout", "-p", &dev_file], 30).await
-                .map_err(|e| format!("控件树导出失败：{e}"))?;
-            let tmp = std::env::temp_dir().join(format!("ui_dump_{ts}.json"));
-            let hdc_args = vec![
-                "-s".to_string(), device.clone(), "file".to_string(), "recv".to_string(),
-                dev_file.clone(), tmp.to_string_lossy().to_string(),
-            ];
-            run_cmd("hdc", &hdc_args, None, 30).await
-                .map_err(|e| format!("拉取控件树失败: {e}"))?;
-            let content = std::fs::read_to_string(&tmp).map_err(|e| format!("读取控件树失败: {e}"))?;
+            let (workspace, local_dir) = ensure_workspace_subdir(project_path, ".deveco-agent/ui")?;
+            let tmp = local_dir.join(format!(
+                ".locator-{}.json",
+                uuid::Uuid::new_v4().simple(),
+            ));
+            let content = capture_ui_layout_file(&workspace, &device, &tmp, ctx).await?;
             let _ = std::fs::remove_file(&tmp);
             content
         }

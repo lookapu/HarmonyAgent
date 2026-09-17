@@ -1,7 +1,7 @@
 // @ui-states: loading, empty, partial, failed, retry
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { getCostSummary, getDailyUsage, getTaskStats, getTaskRuns, getAllBudgetStatus, getRequestLogs, type CostSummary, type DailyUsage, type TaskStats, type TaskRun, type AllBudgetStatus, type RequestLog } from '../api/cost'
+import { getCostSummary, getDailyUsage, getTaskStats, getTaskRuns, getAllBudgetStatus, getRequestLogs, getAutoPoolStats, type CostSummary, type DailyUsage, type TaskStats, type TaskRun, type AllBudgetStatus, type RequestLog, type AutoPoolStats } from '../api/cost'
 import { queryBalances, type ProviderBalance } from '../api/balance'
 import { sendNotification } from '../api/desktop'
 import { useNotificationStore } from '../stores/notificationStore'
@@ -10,6 +10,7 @@ import { writeTextFile } from '@tauri-apps/plugin-fs'
 import Icon from '../icons/Icon'
 import { getJSON, setJSON } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
+import { Skeleton } from '../components/ui/Spinner'
 import { getAgentSloPolicy, getReliabilityDashboard, listAgentAlerts, runReliabilityEvaluation, type AgentAlert, type ReliabilityDashboard, type SloPolicy } from '../api/reliability'
 
 /** CSV 字段转义：含逗号/引号/换行的字段用双引号包裹，内部双引号 → 双重转义 */
@@ -22,6 +23,7 @@ export default function CostPage() {
   const { t } = useTranslation()
   const [summary, setSummary] = useState<CostSummary | null>(null)
   const [daily, setDaily] = useState<DailyUsage[]>([])
+  const [autoStats, setAutoStats] = useState<AutoPoolStats | null>(null)
   const [taskStats, setTaskStats] = useState<TaskStats | null>(null)
   const [taskRuns, setTaskRuns] = useState<TaskRun[]>([])
   const [runFilter, setRunFilter] = useState('')
@@ -104,6 +106,12 @@ export default function CostPage() {
       setSummary(s)
       const d = await getDailyUsage(range)
       setDaily(d)
+    } catch (e) {
+      console.error(e)
+    }
+    // auto 池统计（主池/杂活池构成 + 池内模型使用分布），失败不影响主面板
+    try {
+      setAutoStats(await getAutoPoolStats())
     } catch (e) {
       console.error(e)
     }
@@ -637,6 +645,81 @@ export default function CostPage() {
         )}
       </div>
 
+      {/* Auto 池：主池/杂活池构成 + 池内模型在主任务中的使用分布 */}
+      <h3 className="text-sm font-medium text-[var(--text-secondary)] mb-3">{t('cost.autoPool')}</h3>
+      <div className="modern-card rounded-lg p-4 mb-6">
+        {!autoStats ? (
+          <p className="text-sm text-[var(--text-secondary)]">{t('cost.noData')}</p>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex flex-wrap gap-2">
+              <div className="flex-1 min-w-[200px] rounded-lg border border-[var(--border)] p-3">
+                <p className="text-xs text-[var(--text-secondary)] mb-1.5">{t('cost.autoPoolMain')}</p>
+                {autoStats.main_pool.length === 0 ? (
+                  <p className="text-[11px] text-[var(--text-muted)]">—</p>
+                ) : (
+                  autoStats.main_pool.map((p) => (
+                    <div key={p.provider_id} className="flex items-center justify-between text-[11px] py-0.5">
+                      <span className="truncate" title={p.name}>
+                        {p.is_active ? '★ ' : ''}{p.name}
+                        {p.auto_pool_mode > 0 && !p.is_active && (
+                          <span className="text-[var(--text-muted)]"> ({p.auto_pool_mode === 1 ? t('provider.autoPoolMain') : t('provider.autoPoolMainAux')})</span>
+                        )}
+                      </span>
+                      <span className="shrink-0 text-[var(--text-muted)] tnum">{p.model_count}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="flex-1 min-w-[200px] rounded-lg border border-[var(--border)] p-3">
+                <p className="text-xs text-[var(--text-secondary)] mb-1.5">{t('cost.autoPoolAux')}</p>
+                {autoStats.aux_pool.length === 0 ? (
+                  <p className="text-[11px] text-[var(--text-muted)]">—</p>
+                ) : (
+                  autoStats.aux_pool.map((p) => (
+                    <div key={p.provider_id} className="flex items-center justify-between text-[11px] py-0.5">
+                      <span className="truncate" title={p.name}>{p.is_active ? '★ ' : ''}{p.name}</span>
+                      <span className="shrink-0 text-[var(--text-muted)] tnum">{p.model_count}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+            <div>
+              <p className="text-xs text-[var(--text-secondary)] mb-1.5">{t('cost.autoPoolUsage')}</p>
+              {autoStats.usage_by_model.length === 0 ? (
+                <p className="text-[11px] text-[var(--text-muted)]">{t('cost.autoPoolUsageEmpty')}</p>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-[var(--border)] text-[var(--text-secondary)]">
+                      <th className="text-left py-2">{t('cost.model')}</th>
+                      <th className="text-left py-2">{t('cost.autoPoolProvider')}</th>
+                      <th className="text-right py-2 tnum">{t('cost.requests')}</th>
+                      <th className="text-right py-2 tnum">{t('cost.input')}</th>
+                      <th className="text-right py-2 tnum">{t('cost.output')}</th>
+                      <th className="text-right py-2 tnum">{t('cost.fee')}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {autoStats.usage_by_model.map((u) => (
+                      <tr key={`${u.provider_id}:${u.model}`} className="border-b border-[var(--border)] last:border-0">
+                        <td className="py-2 max-w-[200px] truncate" title={u.model}>{u.model}</td>
+                        <td className="py-2 text-[var(--text-secondary)]">{u.provider_name}</td>
+                        <td className="py-2 text-right tnum">{u.request_count}</td>
+                        <td className="py-2 text-right tnum">{formatTokens(u.input_tokens)}</td>
+                        <td className="py-2 text-right tnum">{formatTokens(u.output_tokens)}</td>
+                        <td className="py-2 text-right tnum whitespace-nowrap">¥{u.cost_cny.toFixed(4)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* 最近任务明细（trace 列表：每次 Agent 任务一行） */}
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mb-3">{t('cost.recentTasks')}</h3>
       <div className="modern-card rounded-lg overflow-hidden mb-6">
@@ -787,7 +870,7 @@ export default function CostPage() {
             return logStatusFilter === 'success' ? !isError : isError
           })
           if (requestLogsLoading && requestLogs.length === 0) {
-            return <p className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]">{t('common.loading')}</p>
+            return <Skeleton lines={8} label={t('common.loading')} className="px-4 py-3" />
           }
           if (filtered.length === 0) {
             return <p className="px-4 py-8 text-center text-sm text-[var(--text-secondary)]">{t('cost.requestLogsEmpty')}</p>
@@ -960,7 +1043,7 @@ function BalanceCard({ b }: { b: ProviderBalance }) {
           </p>
           {pct != null && (
             <div className="mt-2 h-1.5 rounded-full bg-[var(--bg-hover)] overflow-hidden">
-              <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: tone }} />
+              <div className="h-full rounded-full transition-[width,background-color]" style={{ width: `${pct}%`, background: tone }} />
             </div>
           )}
           <div className="mt-1.5 flex items-center justify-between text-[10px] text-[var(--text-muted)]">
@@ -980,7 +1063,7 @@ function BalanceCard({ b }: { b: ProviderBalance }) {
 function StatCard({ label, value, tone }: { label: string; value: string | number; tone?: 'ok' | 'warn' | 'bad' }) {
   const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : tone === 'bad' ? 'var(--danger)' : undefined
   return (
-    <div className="modern-card p-4 transition-all hover:border-[var(--border-strong)]">
+    <div className="modern-card p-4 transition-colors hover:border-[var(--border-strong)]">
       <p className="text-xs text-[var(--text-secondary)]">{label}</p>
       <p className="text-lg font-semibold mt-1 tnum" style={color ? { color } : undefined}>{value}</p>
     </div>
@@ -1026,7 +1109,7 @@ function BudgetMeter({ label, used, limit }: { label: string; used: number; limi
         ¥{used.toFixed(2)}
         {hasLimit && <span className="text-xs text-[var(--text-muted)] font-normal ml-2">/ ¥{(limit as number).toFixed(2)}</span>}
       </p>
-      <div className="context-meter mt-2.5" style={{ height: 3 }}>
+      <div className="context-meter mt-2.5 h-[3px]">
         <div
           className="context-meter-fill"
           data-level={level}

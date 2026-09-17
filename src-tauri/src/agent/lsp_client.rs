@@ -17,16 +17,25 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
+use futures_util::future::join_all;
 use serde_json::{Value, json};
+use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 
 /// 会话级连接池：conversation_id → LSP 连接（懒启动，进程常驻至会话结束）
 static POOL: OnceLock<StdMutex<HashMap<String, Arc<LspConnection>>>> = OnceLock::new();
+static IDLE_SEMANTIC_GENERATION: AtomicU64 = AtomicU64::new(0);
+static IDLE_SEMANTIC_BATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+const MAX_REFERENCE_EVIDENCE_PER_REQUEST: usize = 256;
+const IDLE_SEMANTIC_DELAY_SECS: u64 = 5;
+const IDLE_SEMANTIC_BATCH_TARGETS: usize = 2;
+const IDLE_SEMANTIC_MAX_BATCHES: usize = 32;
+const IDLE_SEMANTIC_MAX_BUSY_POLLS: usize = 12;
 
 fn pool() -> &'static StdMutex<HashMap<String, Arc<LspConnection>>> {
     POOL.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -344,6 +353,21 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     url::Url::parse(uri).ok().and_then(|u| u.to_file_path().ok())
 }
 
+fn location_path_position(location: &Value) -> Option<(PathBuf, usize, usize)> {
+    let uri = location["targetUri"]
+        .as_str()
+        .or_else(|| location["uri"].as_str())?;
+    let range = location["targetSelectionRange"]
+        .as_object()
+        .or_else(|| location["targetRange"].as_object())
+        .or_else(|| location["range"].as_object())?;
+    Some((
+        uri_to_path(uri)?,
+        range["start"]["line"].as_u64().unwrap_or(0) as usize,
+        range["start"]["character"].as_u64().unwrap_or(0) as usize,
+    ))
+}
+
 /// 取某文件某行（1-based）的文本，供结果附上下文
 fn read_line_at(path: &Path, line1: usize) -> String {
     let Ok(text) = std::fs::read_to_string(path) else { return String::new() };
@@ -411,11 +435,40 @@ pub(super) async fn lsp_definition(args: &Value, roots: &[String], conversation_
         }), std::time::Duration::from_secs(20))
         .await?;
     let items = res.as_array().cloned().unwrap_or_else(|| vec![res]);
+    if items.len() == 1 {
+        let location = &items[0];
+        let uri = location["targetUri"]
+            .as_str()
+            .or_else(|| location["uri"].as_str());
+        let range = location["targetRange"]
+            .as_object()
+            .or_else(|| location["range"].as_object());
+        if let (Some(target), Some(range)) = (uri.and_then(uri_to_path), range) {
+            if let Some(root) = roots
+                .iter()
+                .map(PathBuf::from)
+                .find(|root| path.starts_with(root) && target.starts_with(root))
+            {
+                let target_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
+                let _ = crate::services::symbol_index::record_lsp_call_definition(
+                    &root,
+                    &path,
+                    line,
+                    column,
+                    &target,
+                    target_line,
+                );
+            }
+        }
+    }
     Ok(format!("符号定义（{} 处）：\n{}", items.len(), render_locations(&items)))
 }
 
 /// lsp_references：查找引用（含声明本身与否由 include_declaration 控制）
 pub(super) async fn lsp_references(args: &Value, roots: &[String], conversation_id: &str) -> Result<String, String> {
+    if let Some(limit) = args["auto_batch_limit"].as_u64() {
+        return lsp_index_call_targets(roots, conversation_id, limit as usize).await;
+    }
     let (path, line, column) = resolve_lsp_pos(args, roots)?;
     let include_decl = args["include_declaration"].as_bool().unwrap_or(true);
     let conn = conn_for(conversation_id).await?;
@@ -427,7 +480,334 @@ pub(super) async fn lsp_references(args: &Value, roots: &[String], conversation_
         }), std::time::Duration::from_secs(20))
         .await?;
     let items = res.as_array().cloned().unwrap_or_default();
-    Ok(format!("引用位置（{} 处）：\n{}", items.len(), render_locations(&items)))
+    let mut semantic_summary = String::new();
+    if !items.is_empty() {
+        let definition = conn
+            .request("textDocument/definition", json!({
+                "textDocument": {"uri": to_file_uri(&path)?},
+                "position": {"line": line, "character": column}
+            }), std::time::Duration::from_secs(20))
+            .await;
+        if let Ok(definition) = definition {
+            let definitions = match definition {
+                Value::Array(values) => values,
+                Value::Null => Vec::new(),
+                value => vec![value],
+            };
+            if definitions.len() == 1 {
+                if let Some((target_path, target_line, _)) =
+                    location_path_position(&definitions[0])
+                {
+                    if let Some(root) = roots
+                        .iter()
+                        .map(PathBuf::from)
+                        .find(|root| path.starts_with(root) && target_path.starts_with(root))
+                    {
+                        let project_references = items
+                            .iter()
+                            .filter_map(location_path_position)
+                            .filter(|(reference_path, _, _)| reference_path.starts_with(&root))
+                            .take(MAX_REFERENCE_EVIDENCE_PER_REQUEST + 1)
+                            .collect::<Vec<_>>();
+                        let truncated =
+                            project_references.len() > MAX_REFERENCE_EVIDENCE_PER_REQUEST;
+                        let evidence = &project_references
+                            [..project_references.len().min(MAX_REFERENCE_EVIDENCE_PER_REQUEST)];
+                        let recorded = crate::services::symbol_index::record_lsp_call_references(
+                            &root,
+                            &target_path,
+                            target_line,
+                            evidence,
+                            truncated,
+                        );
+                        semantic_summary = format!(
+                            "\n结构索引：已检查 {} 个工程内引用，沉淀 {} 条成员调用关系{}。",
+                            evidence.len(),
+                            recorded,
+                            if truncated { "（达到单次 256 条上限）" } else { "" },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(format!(
+        "引用位置（{} 处）：\n{}{}",
+        items.len(),
+        render_locations(&items),
+        semantic_summary,
+    ))
+}
+
+#[derive(Debug)]
+struct LspBatchOutcome {
+    attempted: usize,
+    failed: usize,
+    backed_off: usize,
+    recorded: usize,
+    names: Vec<String>,
+}
+
+impl LspBatchOutcome {
+    fn render(&self) -> String {
+        if self.attempted == 0 {
+            return "没有可调度的 ArkTS/TypeScript 逻辑符号；可能已覆盖，或需先运行 search_symbols 建立结构索引。"
+                .into();
+        }
+        format!(
+            "渐进语义扫描：尝试 {} 个高优先级未覆盖目标，失败 {} 个（已退避 {} 个），沉淀 {} 条成员调用关系。\n{}",
+            self.attempted,
+            self.failed,
+            self.backed_off,
+            self.recorded,
+            self.names.join("\n"),
+        )
+    }
+}
+
+fn idle_semantic_throttle_ms(elapsed_ms: u64) -> u64 {
+    elapsed_ms.saturating_mul(4).clamp(5_000, 60_000)
+}
+
+struct IdleSemanticBatchLease;
+
+impl IdleSemanticBatchLease {
+    fn acquire() -> Option<Self> {
+        IDLE_SEMANTIC_BATCH_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for IdleSemanticBatchLease {
+    fn drop(&mut self) {
+        IDLE_SEMANTIC_BATCH_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) fn note_foreground_activity() -> u64 {
+    IDLE_SEMANTIC_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+}
+
+pub(crate) fn schedule_idle_semantic_indexing(
+    app: AppHandle,
+    roots: Vec<String>,
+    conversation_id: String,
+    foreground_generation: u64,
+) {
+    if roots.is_empty() {
+        return;
+    }
+    let generation = foreground_generation.wrapping_add(1);
+    if IDLE_SEMANTIC_GENERATION
+        .compare_exchange(
+            foreground_generation,
+            generation,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(IDLE_SEMANTIC_DELAY_SECS)).await;
+        let mut batch = 0usize;
+        let mut busy_polls = 0usize;
+        while batch < IDLE_SEMANTIC_MAX_BATCHES {
+            if IDLE_SEMANTIC_GENERATION.load(Ordering::Acquire) != generation {
+                break;
+            }
+            let foreground_idle = app
+                .state::<crate::utils::task_registry::TaskRegistry>()
+                .is_idle();
+            let structure_ready = roots.iter().all(|root| {
+                crate::services::symbol_index::semantic_background_ready(Path::new(root))
+            });
+            if !foreground_idle || !structure_ready {
+                busy_polls += 1;
+                if busy_polls >= IDLE_SEMANTIC_MAX_BUSY_POLLS {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    IDLE_SEMANTIC_DELAY_SECS,
+                ))
+                .await;
+                continue;
+            }
+            let Some(batch_lease) = IdleSemanticBatchLease::acquire() else {
+                busy_polls += 1;
+                if busy_polls >= IDLE_SEMANTIC_MAX_BUSY_POLLS {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    IDLE_SEMANTIC_DELAY_SECS,
+                ))
+                .await;
+                continue;
+            };
+            busy_polls = 0;
+            batch += 1;
+            let started = std::time::Instant::now();
+            let outcome = lsp_index_call_targets_batch(
+                &roots,
+                &conversation_id,
+                IDLE_SEMANTIC_BATCH_TARGETS,
+            )
+            .await;
+            drop(batch_lease);
+            let outcome = match outcome {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::utils::logger::log_event(
+                        "idle_semantic_index_stopped",
+                        serde_json::json!({
+                            "conversation_id": &conversation_id,
+                            "reason": error,
+                        }),
+                    );
+                    break;
+                }
+            };
+            crate::utils::logger::log_event(
+                "idle_semantic_index_batch",
+                serde_json::json!({
+                    "conversation_id": &conversation_id,
+                    "batch": batch,
+                    "attempted": outcome.attempted,
+                    "failed": outcome.failed,
+                    "backed_off": outcome.backed_off,
+                    "recorded": outcome.recorded,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                }),
+            );
+            if outcome.attempted == 0 {
+                break;
+            }
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                idle_semantic_throttle_ms(elapsed_ms),
+            ))
+            .await;
+        }
+    });
+}
+
+async fn lsp_index_call_targets(
+    roots: &[String],
+    conversation_id: &str,
+    limit: usize,
+) -> Result<String, String> {
+    lsp_index_call_targets_batch(roots, conversation_id, limit)
+        .await
+        .map(|outcome| outcome.render())
+}
+
+async fn lsp_index_call_targets_batch(
+    roots: &[String],
+    conversation_id: &str,
+    limit: usize,
+) -> Result<LspBatchOutcome, String> {
+    let limit = limit.clamp(1, 16);
+    let mut failed = 0usize;
+    let mut backed_off = 0usize;
+    let mut recorded = 0usize;
+    let mut selected = Vec::new();
+    for root in roots {
+        let root = PathBuf::from(root);
+        let remaining = limit.saturating_sub(selected.len());
+        if remaining == 0 {
+            break;
+        }
+        selected.extend(
+            crate::services::symbol_index::next_lsp_semantic_targets(&root, remaining)
+                .into_iter()
+                .map(|target| (root.clone(), target)),
+        );
+    }
+    if selected.is_empty() {
+        return Ok(LspBatchOutcome {
+            attempted: 0,
+            failed: 0,
+            backed_off: 0,
+            recorded: 0,
+            names: Vec::new(),
+        });
+    }
+    let conn = conn_for(conversation_id).await?;
+    let mut names = Vec::new();
+    let attempted = selected.len();
+    for (_, target) in &selected {
+        names.push(format!(
+            "{}:{}:{}",
+            target.path.display(),
+            target.line + 1,
+            target.name,
+        ));
+    }
+    for chunk in selected.chunks(4) {
+        let responses = join_all(chunk.iter().cloned().map(|(root, target)| {
+            let conn = conn.clone();
+            async move {
+                let response = match to_file_uri(&target.path) {
+                    Ok(uri) => conn
+                        .request("textDocument/references", json!({
+                            "textDocument": {"uri": uri},
+                            "position": {"line": target.line, "character": target.column},
+                            "context": {"includeDeclaration": false}
+                        }), std::time::Duration::from_secs(10))
+                        .await,
+                    Err(error) => Err(error),
+                };
+                (root, target, response)
+            }
+        }))
+        .await;
+        for (root, target, response) in responses {
+            let response = match response {
+                Ok(value) => value,
+                Err(_) => {
+                    failed += 1;
+                    if crate::services::symbol_index::record_lsp_scan_failure(
+                        &root,
+                        &target.path,
+                        target.line,
+                    ) > 0
+                    {
+                        backed_off += 1;
+                    }
+                    continue;
+                }
+            };
+            let items = response.as_array().cloned().unwrap_or_default();
+            let project_references = items
+                .iter()
+                .filter_map(location_path_position)
+                .filter(|(path, _, _)| path.starts_with(&root))
+                .take(MAX_REFERENCE_EVIDENCE_PER_REQUEST + 1)
+                .collect::<Vec<_>>();
+            let truncated = project_references.len() > MAX_REFERENCE_EVIDENCE_PER_REQUEST;
+            let evidence = &project_references
+                [..project_references.len().min(MAX_REFERENCE_EVIDENCE_PER_REQUEST)];
+            recorded += crate::services::symbol_index::record_lsp_call_references(
+                &root,
+                &target.path,
+                target.line,
+                evidence,
+                truncated,
+            );
+        }
+    }
+    Ok(LspBatchOutcome {
+        attempted,
+        failed,
+        backed_off,
+        recorded,
+        names,
+    })
 }
 
 /// lsp_symbols：文档符号树（struct/方法/成员，带行号）
@@ -605,10 +985,11 @@ fn apply_edits_to_text(text: &str, edits: &[Value]) -> (String, usize, usize) {
 /// 写盘前记录 undo 快照（可 undo_edit 回退）。返回 (新增字符数, 删除字符数)。
 fn apply_text_edits(path: &Path, edits: &[Value], conversation_id: &str) -> Result<(usize, usize), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
-    // 落盘前记录快照：rename/format/code_action 的写盘可被 undo_edit 回退
-    crate::agent::undo::snapshot(conversation_id, path, &bytes);
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let (out, add, del) = apply_edits_to_text(&text, edits);
+    crate::agent::tools::validate_code_mutation(path, &text, &out)?;
+    // 候选文本通过写前门禁后才记录快照，避免失败修改污染 undo 栈。
+    crate::agent::undo::snapshot(conversation_id, path, &bytes);
     std::fs::write(path, out).map_err(|e| format!("写回 {} 失败: {e}", path.display()))?;
     Ok((add, del))
 }
@@ -865,4 +1246,47 @@ pub(super) async fn lsp_signature(args: &Value, roots: &[String], conversation_i
     }
     out.push_str(&format!("（当前参数下标：{param}）"));
     Ok(out)
+}
+
+#[cfg(test)]
+mod idle_semantic_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_throttle_caps_background_duty_cycle() {
+        assert_eq!(idle_semantic_throttle_ms(0), 5_000);
+        assert_eq!(idle_semantic_throttle_ms(500), 5_000);
+        assert_eq!(idle_semantic_throttle_ms(2_000), 8_000);
+        assert_eq!(idle_semantic_throttle_ms(20_000), 60_000);
+    }
+
+    #[test]
+    fn empty_and_nonempty_batch_results_render_stably() {
+        let empty = LspBatchOutcome {
+            attempted: 0,
+            failed: 0,
+            backed_off: 0,
+            recorded: 0,
+            names: Vec::new(),
+        };
+        assert!(empty.render().contains("没有可调度"));
+        let batch = LspBatchOutcome {
+            attempted: 2,
+            failed: 1,
+            backed_off: 1,
+            recorded: 3,
+            names: vec!["a.ts:2:run".into()],
+        };
+        let rendered = batch.render();
+        assert!(rendered.contains("失败 1 个（已退避 1 个）"));
+        assert!(rendered.contains("a.ts:2:run"));
+    }
+
+    #[test]
+    fn idle_batch_lease_allows_only_one_background_batch() {
+        let lease = IdleSemanticBatchLease::acquire().expect("first lease");
+        assert!(IdleSemanticBatchLease::acquire().is_none());
+        drop(lease);
+        assert!(IdleSemanticBatchLease::acquire().is_some());
+    }
 }

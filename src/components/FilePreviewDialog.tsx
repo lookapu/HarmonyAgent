@@ -263,7 +263,7 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-6"
+      className="fixed inset-0 z-[var(--app-z-modal)] flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-6"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose()
       }}

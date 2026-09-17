@@ -231,7 +231,10 @@ fn extract_test_summary(raw: &str) -> String {
 }
 
 /// read_logcat：读取设备最近 N 行日志（hdc logcat -T N，可选指定设备与关键词过滤）
-pub(super) async fn read_logcat(args: &Value) -> Result<String, String> {
+pub(super) async fn read_logcat(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let lines = args["lines"].as_u64().unwrap_or(200).clamp(10, 1000);
     let filter = args["filter"].as_str().unwrap_or("").trim();
     let package = args["package"].as_str().unwrap_or("").trim();
@@ -240,13 +243,23 @@ pub(super) async fn read_logcat(args: &Value) -> Result<String, String> {
     // 多设备连接时解析目标设备
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
 
     // 包名 → pid（hilog 按进程过滤更精准；多进程取全部 pid）
     let mut pids: Vec<String> = Vec::new();
     if !package.is_empty() {
-        if let Ok(out) = run_hdc_shell(&device, &["pidof", package], 15).await {
+        let capability = crate::agent::capability_broker::HostCapability::DevicePidof {
+            device: device.clone(),
+            bundle: package.to_string(),
+        };
+        let output = crate::agent::capability_broker::execute_host_capability(
+            &capability, None, ctx,
+        )
+        .await
+        .map_err(|error| with_advice("read_logcat", error))?;
+        if output.status.success() {
+            let out = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
             for tok in out.split(|c: char| c.is_whitespace()) {
                 let t = tok.trim();
                 if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
@@ -267,43 +280,34 @@ pub(super) async fn read_logcat(args: &Value) -> Result<String, String> {
         None
     };
 
-    // 组装 hilog 命令：-x 转储历史后退出（不持续跟踪）；-T 不可靠，用 tail 控制行数
-    let mut hilog_args: Vec<String> = vec!["hilog".to_string(), "-x".to_string()];
-    if let Some(lv) = level_flag {
-        hilog_args.push("-L".to_string());
-        hilog_args.push(lv.to_string());
-    }
-    // tag 过滤：-T <tag> （hilog 按 tag 过滤；部分版本用 -D domain，这里用 -T）
-    if !tag.is_empty() {
-        hilog_args.push("-T".to_string());
-        hilog_args.push(tag.to_string());
-    }
-
-    let raw = match run_hdc_shell(
-        &device,
-        &hilog_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        25,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(_) => {
+    // hilog 参数由 Broker 从类型化字段构造，不接受任意 device shell。
+    let hilog = crate::agent::capability_broker::HostCapability::ReadHilog {
+        device: device.clone(),
+        level: level_flag.map(str::to_string),
+        tag: (!tag.is_empty()).then(|| tag.to_string()),
+    };
+    let raw = match crate::agent::capability_broker::execute_host_capability(&hilog, None, ctx).await {
+        Ok(output) if output.status.success() => {
+            smart_decode(&output.stdout) + &smart_decode(&output.stderr)
+        }
+        Ok(_) => {
             // 兜底：部分设备 hilog 参数受限，回退到无过滤的 logcat -T
-            run_cmd(
-                "hdc",
-                &[
-                    "-t".to_string(),
-                    device.clone(),
-                    "logcat".to_string(),
-                    "-T".to_string(),
-                    lines.to_string(),
-                ],
-                None,
-                20,
+            let fallback = crate::agent::capability_broker::HostCapability::ReadLogcat {
+                device: device.clone(),
+                lines,
+            };
+            let output = crate::agent::capability_broker::execute_host_capability(
+                &fallback, None, ctx,
             )
             .await
-            .map_err(|e| with_advice("read_logcat", e))?
+            .map_err(|e| with_advice("read_logcat", e))?;
+            let detail = smart_decode(&output.stdout) + &smart_decode(&output.stderr);
+            if !output.status.success() {
+                return Err(with_advice("read_logcat", detail.trim().to_string()));
+            }
+            detail
         }
+        Err(error) => return Err(with_advice("read_logcat", error)),
     };
 
     // 本地逐行过滤：pid、关键词
@@ -1265,13 +1269,14 @@ pub(super) async fn run_ui_flow(
     let device = super::ui_tools::resolve_authorized_device(
         args["device"].as_str(),
         "ui_automation",
+        ctx,
     )
     .await?;
     let steps = args["steps"].as_array().ok_or("run_ui_flow 需要参数 {\"steps\":[...]}")?;
     if steps.is_empty() {
         return Err("steps 不能为空".into());
     }
-    let results = execute_ui_steps(&device, steps).await;
+    let results = execute_ui_steps(&device, steps, ctx).await;
     let mut out = format!("UI 操作流程（设备 {device}，共 {} 步）：\n", steps.len());
     for r in &results {
         out.push_str(r);
@@ -1284,7 +1289,8 @@ pub(super) async fn run_ui_flow(
     let mut hierarchy_path: Option<PathBuf> = None;
     if !assertions.is_empty() {
         let project_path = roots.first().map(String::as_str).unwrap_or("");
-        let (path, hierarchy) = super::ui_tools::capture_ui_hierarchy(project_path, &device).await?;
+        let (path, hierarchy) =
+            super::ui_tools::capture_ui_hierarchy(project_path, &device, ctx).await?;
         let assertion_results = evaluate_ui_assertions(&hierarchy, &assertions)?;
         out.push_str(&format!("\n页面断言（UI 树：{}）：\n", path.display()));
         for (description, passed) in &assertion_results {
@@ -1300,7 +1306,7 @@ pub(super) async fn run_ui_flow(
     if verify {
         if let Some(project_path) = roots.first() {
             if !project_path.is_empty() {
-                match capture_screenshot(project_path, &device).await {
+                match capture_screenshot(project_path, &device, ctx).await {
                     Ok((local, _)) => {
                         out.push_str(&format!("\n操作后截图：{}\n[VISION_IMAGE: {}]", local.display(), local.display()));
                         screenshot_path = Some(local);
@@ -1370,11 +1376,15 @@ pub(super) fn evaluate_ui_assertions(
 }
 
 /// 逐条执行 UI 步骤，返回每步结果描述；任一步失败即停止（避免在错误界面继续乱点）。
-pub(super) async fn execute_ui_steps(device: &str, steps: &[Value]) -> Vec<String> {
+pub(super) async fn execute_ui_steps(
+    device: &str,
+    steps: &[Value],
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Vec<String> {
     let mut results = Vec::new();
     for (i, s) in steps.iter().enumerate() {
         let desc = describe_step(s);
-        match execute_ui_step(device, s).await {
+        match execute_ui_step(device, s, ctx).await {
             Ok(info) => {
                 let suffix = if info.is_empty() { String::new() } else { format!("（{info}）") };
                 results.push(format!("{}. {desc} → 成功{suffix}", i + 1));
@@ -1391,14 +1401,17 @@ pub(super) async fn execute_ui_steps(device: &str, steps: &[Value]) -> Vec<Strin
 }
 
 /// 执行单个 UI 步骤，返回补充信息（wait 返回等待时长）。
-pub(super) async fn execute_ui_step(device: &str, s: &Value) -> Result<String, String> {
+pub(super) async fn execute_ui_step(
+    device: &str,
+    s: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let action = s["action"].as_str().unwrap_or("");
-    let mut cmd: Vec<String> = vec!["uitest".to_string(), "uiInput".to_string()];
-    match action {
+    let action = match action {
         "tap" | "click" => {
             let x = s["x"].as_i64().unwrap_or(0);
             let y = s["y"].as_i64().unwrap_or(0);
-            cmd.extend(["click".to_string(), x.to_string(), y.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::Click { x, y }
         }
         "swipe" => {
             let x1 = s["x1"].as_i64().unwrap_or(0);
@@ -1406,23 +1419,29 @@ pub(super) async fn execute_ui_step(device: &str, s: &Value) -> Result<String, S
             let x2 = s["x2"].as_i64().unwrap_or(0);
             let y2 = s["y2"].as_i64().unwrap_or(0);
             let speed = s["speed"].as_i64().unwrap_or(600);
-            cmd.extend(["swipe".to_string(), x1.to_string(), y1.to_string(), x2.to_string(), y2.to_string(), speed.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::Swipe {
+                x1,
+                y1,
+                x2,
+                y2,
+                speed,
+            }
         }
         "long_press" | "longClick" => {
             let x = s["x"].as_i64().unwrap_or(0);
             let y = s["y"].as_i64().unwrap_or(0);
-            cmd.extend(["longClick".to_string(), x.to_string(), y.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::LongClick { x, y }
         }
         "text" => {
             let t = s["text"].as_str().unwrap_or("");
             if t.is_empty() {
                 return Err("text 步骤缺少 text 参数".into());
             }
-            cmd.extend(["text".to_string(), t.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::Text { text: t.to_string() }
         }
         "key" => {
             let name = s["name"].as_str().unwrap_or("back");
-            cmd.extend(["keyEvent".to_string(), name.to_string()]);
+            crate::agent::capability_broker::DeviceUiAction::Key { name: name.to_string() }
         }
         "wait" => {
             let ms = s["ms"].as_u64().unwrap_or(500).clamp(1, 30000);
@@ -1430,10 +1449,23 @@ pub(super) async fn execute_ui_step(device: &str, s: &Value) -> Result<String, S
             return Ok(format!("等待 {ms}ms"));
         }
         other => return Err(format!("未知 action: {other}")),
-    }
-    run_hdc_shell(device, &cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>(), 20)
+    };
+    let capability = crate::agent::capability_broker::HostCapability::DeviceUiInput {
+        device: device.to_string(),
+        operation_id: uuid::Uuid::new_v4().simple().to_string(),
+        action,
+    };
+    let output = crate::agent::capability_broker::execute_host_capability(&capability, None, ctx)
         .await
-        .map_err(|e| format!("uitest 注入失败（确认设备已解锁亮屏且支持 uitest）：{e}"))
+        .map_err(|error| format!("uitest 注入失败（确认设备已解锁亮屏且支持 uitest）：{error}"))?;
+    let text = host_output_text(&output);
+    if !output.status.success() || hdc_shell_failed(&text) {
+        return Err(format!(
+            "uitest 注入失败（确认设备已解锁亮屏且支持 uitest）：{}",
+            first_line_or_unknown(&text),
+        ));
+    }
+    Ok(text.trim().to_string())
 }
 
 /// 描述单个 UI 步骤（用于报告展示）。

@@ -1,11 +1,26 @@
-import type { ChatMessage } from '../../api/project'
-import type { TaskPlan } from '../projectStoreTypes'
+import type { ChatMessage, ExecutionStep } from '../../api/project'
+import type { TaskPlan, ToolRun } from '../projectStoreTypes'
 import { unified } from 'unified'
 import remarkParse from 'remark-parse'
 import remarkGfm from 'remark-gfm'
 import remarkRehype from 'remark-rehype'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import rehypeStringify from 'rehype-stringify'
+
+/** 恢复与二次对账共用持久工具投影，绝不从 UI id 反推后端调用身份。 */
+export function toolRunFromExecutionStep(step: ExecutionStep): ToolRun {
+  return {
+    id: `tool-call-${step.external_id || step.step_id}`,
+    callId: step.external_id || undefined,
+    tool: step.tool_name || step.title,
+    args: '',
+    status: ['prepared', 'running'].includes(step.state) ? 'running' : step.state === 'completed' ? 'done' : 'error',
+    output: step.result_summary || '',
+    startedAt: step.started_at ?? step.updated_at,
+    durationMs: step.started_at != null && step.finished_at != null
+      ? Math.max(0, step.finished_at - step.started_at) : undefined,
+  }
+}
 
 /** 运行代次匹配：无事件 ID 兼容旧后端；有 ID 时必须与当前任务一致。 */
 export function acceptsRunEvent(activeRunId: string | null | undefined, eventRunId?: string): boolean {

@@ -6,6 +6,43 @@ import { AnsiText, hasAnsi } from '../../components/AnsiText'
 import { fmtElapsed } from '../chatUtils'
 import { getItem, setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
+import { getOtaApprovalRevoked, revokeOtaApproval } from '../../api/project'
+
+type MutationGuardKind =
+  | 'syntax'
+  | 'typeCheck'
+  | 'rollback'
+  | 'stale'
+  | 'boundary'
+  | 'rollbackIncomplete'
+
+const MUTATION_TOOLS = new Set([
+  'write_file',
+  'edit_file',
+  'multi_edit',
+  'apply_text_edits',
+  'lsp_rename',
+  'lsp_format',
+  'lsp_code_action',
+])
+
+/** 将内核写入门禁的稳定错误语义提升为 UI 状态；原始输出仍完整保留在终端区。 */
+export function mutationGuardKind(run: Pick<ToolRun, 'tool' | 'status' | 'output'>): MutationGuardKind | null {
+  if (run.status !== 'error' || !MUTATION_TOOLS.has(run.tool)) return null
+  const output = run.output.toLowerCase()
+  if (/回滚未完成|恢复原内容失败/.test(output)) return 'rollbackIncomplete'
+  if (/结构编辑句柄边界不安全/.test(output)) return 'boundary'
+  // 编译器门禁与语法门禁分开呈现：类型错误不等于语法错误，修复方式也不同
+  if (/java 编译器门禁拒绝|java compiler gate/.test(output)) return 'typeCheck'
+  if (/语法门禁拒绝|java 声明门禁拒绝|syntax (?:mutation )?gate|syntax error nodes?/.test(output)) return 'syntax'
+  if (/原子提交失败|已回滚|atomic commit failed|rolled back/.test(output)) return 'rollback'
+  if (/结构(?:编辑句柄|定位)已过期|结构重定位被拒绝|文件在定位后再次发生变化|stale (?:symbol|structure)|changed since|controlled relocation rejected/.test(output)) return 'stale'
+  return null
+}
+
+export function mutationRelocationApplied(run: Pick<ToolRun, 'tool' | 'status' | 'output'>): boolean {
+  return run.status === 'done' && MUTATION_TOOLS.has(run.tool) && /受控重定位|controlled relocation/.test(run.output.toLowerCase())
+}
 
 /* ============ 工具调用折叠组：一行展示（最后一次调用），点击展开全部 ============ */
 export const ToolRunGroup = memo(function ToolRunGroup({ runs, onRetry, onCancel }: { runs: ToolRun[]; onRetry?: (run: ToolRun) => void; onCancel?: (run: ToolRun) => void }) {
@@ -83,6 +120,36 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
     })
   }
   const [copied, setCopied] = useState(false)
+  const [revocation, setRevocation] = useState<'idle' | 'pending' | 'done'>('idle')
+  const [revocationError, setRevocationError] = useState('')
+  const revocationGeneration = useRef(0)
+  useEffect(() => {
+    revocationGeneration.current += 1
+    let active = true
+    setRevocation('idle')
+    setRevocationError('')
+    if (run.tool === 'ota_pack' && run.callId) {
+      getOtaApprovalRevoked(run.callId).then((revoked) => {
+        // 只提升到已撤销，不能用较旧的 false 覆盖刚完成的撤销操作。
+        if (active && revoked) setRevocation('done')
+      }).catch((error) => { if (active) setRevocationError(String(error)) })
+    }
+    return () => { active = false; revocationGeneration.current += 1 }
+  }, [run.id, run.callId, run.tool])
+  const revokeApproval = async () => {
+    if (revocation !== 'idle' || !run.callId) return
+    const generation = revocationGeneration.current
+    setRevocation('pending')
+    setRevocationError('')
+    try {
+      await revokeOtaApproval(run.callId)
+      if (generation === revocationGeneration.current) setRevocation('done')
+    } catch (error) {
+      if (generation !== revocationGeneration.current) return
+      setRevocation('idle')
+      setRevocationError(String(error))
+    }
+  }
   // running 态计时：每秒刷新已运行时长（静默执行的工具也能看到进度）
   const [elapsed, setElapsed] = useState(0)
   useEffect(() => {
@@ -100,6 +167,8 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
   const done = run.status === 'done' || run.status === 'error'
   // 展开内容：完成=最终输出（无输出时回退流式记录）；运行中=实时流式输出
   const displayOutput = done ? run.output || run.liveOutput || '' : run.liveOutput ?? ''
+  const guardKind = mutationGuardKind(run)
+  const relocated = mutationRelocationApplied(run)
   // 运行中实时输出自动跟随（每次新行滚到底部）
   const liveRef = useRef<HTMLPreElement>(null)
   useEffect(() => {
@@ -175,6 +244,16 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
         </span>
         {(done || running) && <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />}
       </button>
+      {run.tool === 'ota_pack' && run.callId && (running || revocation === 'done') && (
+        <div className="px-3 py-2 text-xs text-[var(--text-secondary)]">
+          <button type="button" onClick={revokeApproval} disabled={revocation !== 'idle'}
+            className="text-[var(--danger)] disabled:opacity-60">
+            {t(revocation === 'done' ? 'home.otaApprovalRevoked' : revocation === 'pending' ? 'home.otaApprovalRevoking' : 'home.revokeOtaApproval')}
+          </button>
+          <p role="status">{t('home.otaRevokeNotice')}</p>
+          {revocationError && <p role="alert">{revocationError}</p>}
+        </div>
+      )}
       {(done || running) && open && (
         <div className="bg-[#0d1117] border-t border-[var(--border)]">
           {/* 终端标题栏：mac 圆点 + 工具名 + 状态 + 复制输出 */}
@@ -191,6 +270,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
               type="button"
               onClick={copyOutput}
               title={t('home.copyOutput')}
+              aria-label={t('home.copyOutput')}
               className="p-1 rounded text-[#8b949e] hover:text-[#e6edf3] hover:bg-white/10 transition-colors"
             >
               <Icon name="copy" size={11} className={copied ? 'text-[#3fb950]' : ''} />
@@ -220,6 +300,24 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
               </button>
             )}
           </div>
+          {guardKind && (
+            <div className="mx-3 mt-2 rounded-md border border-[var(--warning)]/35 bg-[var(--warning)]/10 px-2.5 py-2 text-[11px] leading-relaxed">
+              <div className="flex items-center gap-1.5 font-semibold text-[var(--warning)]">
+                <Icon name="info" size={11} />
+                {t(`home.mutationGuard.${guardKind}.title`)}
+              </div>
+              <div className="mt-0.5 text-[#aeb8c4]">{t(`home.mutationGuard.${guardKind}.detail`)}</div>
+            </div>
+          )}
+          {relocated && (
+            <div className="mx-3 mt-2 rounded-md border border-[var(--success)]/35 bg-[var(--success)]/10 px-2.5 py-2 text-[11px] leading-relaxed">
+              <div className="flex items-center gap-1.5 font-semibold text-[var(--success)]">
+                <Icon name="info" size={11} />
+                {t('home.mutationGuard.relocated.title')}
+              </div>
+              <div className="mt-0.5 text-[#aeb8c4]">{t('home.mutationGuard.relocated.detail')}</div>
+            </div>
+          )}
           <pre
             ref={liveRef}
             className="px-3.5 py-2 text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed text-[#c9d1d9] max-h-64 overflow-y-auto"

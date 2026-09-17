@@ -120,13 +120,21 @@ export function ModelSettingsPopover({
   options,
   onChange,
 }: {
-  catalog: { providerName: string; models: ProviderModel[] }[]
+  catalog: { providerName: string; providerId: string; autoPoolMode: number; isActive: boolean; models: ProviderModel[] }[]
   options: ChatOptions
   onChange: (next: ChatOptions) => void
 }) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const totalModels = catalog.reduce((n, g) => n + g.models.length, 0)
+  // auto 池概况：active provider 恒在池内；其余按 auto_pool_mode 加入（主池 >=1，杂活池 >=2）
+  const poolOverview = useMemo(() => {
+    const main = catalog.filter((g) => g.isActive || g.autoPoolMode >= 1)
+    const aux = catalog.filter((g) => g.isActive || g.autoPoolMode >= 2)
+    const count = (gs: typeof catalog) =>
+      gs.reduce((n, g) => n + g.models.filter((m) => m.enabled).length, 0)
+    return { mainProviders: main.length, mainModels: count(main), auxProviders: aux.length, auxModels: count(aux) }
+  }, [catalog])
   // 模型推荐：打开弹层时拉最近 200 条 request_logs，按 model 分组打分（成功率 + 平均成本 + 平均延迟）
   // 打分公式：success_rate * 0.6 + cost_efficiency * 0.3 + speed_score * 0.1
   // - cost_efficiency = min(1, 0.001 / avg_cost_cny)（¥0.001 = 满分基准，贵的递减）
@@ -224,7 +232,7 @@ export function ModelSettingsPopover({
                           const m = found.models.find((m) => m.model_id === top.model || m.id === top.model)
                           if (m) onChange({ ...options, model_id: m.id })
                         }}
-                        className="h-6 px-2 rounded-md btn-primary text-[10.5px] font-medium active:scale-[0.98] shrink-0"
+                        className="h-6 px-2 rounded-md btn-primary text-[10.5px] font-medium shrink-0"
                       >
                         {t('home.modelRecApply')}
                       </button>
@@ -255,23 +263,35 @@ export function ModelSettingsPopover({
               </button>
             </div>
           ) : (
-            <select
-              value={options.model_id ?? ''}
-              onChange={(e) => onChange({ ...options, model_id: e.target.value || undefined })}
-              className="w-full h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-2 text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
-            >
-              <option value="">{t('provider.modelDefault')}</option>
-              {catalog.map((g) => (
-                <optgroup key={g.providerName} label={g.providerName}>
-                  {g.models.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.display_name ?? m.model_id}
-                      {m.is_default ? ' ★' : ''}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
+            <>
+              <select
+                value={options.model_id ?? ''}
+                onChange={(e) => onChange({ ...options, model_id: e.target.value || undefined })}
+                className="w-full h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-2 text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
+              >
+                <option value="">{t('provider.modelDefault')}</option>
+                <option value="auto">{t('home.autoMode')}</option>
+                {catalog.map((g) => (
+                  <optgroup key={g.providerName} label={g.providerName}>
+                    {g.models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.display_name ?? m.model_id}
+                        {m.is_default ? ' ★' : ''}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              {options.model_id === 'auto' && (
+                <p className="text-[10px] text-[var(--text-muted)] mt-1 leading-snug">
+                  {t('home.autoModeHint')}
+                  <span className="text-[var(--accent)]">
+                    {' '}
+                    {poolOverview.mainProviders} {t('home.autoPoolProviders')} · {poolOverview.mainModels} {t('home.autoPoolModels')}
+                  </span>
+                </p>
+              )}
+            </>
           )}
         </div>
 
@@ -570,6 +590,7 @@ export const PlanCard = memo(function PlanCard({ plan }: { plan: TaskPlan }) {
   const errCount = plan.steps.filter((s) => s.status === 'error').length
   const running = plan.phase === 'running'
   const total = plan.steps.length
+  const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0
   const statusLabel = plan.phase === 'error' ? t('home.planFailed') : running ? t('home.planRunning') : t('home.planDone')
   const statusColor = plan.phase === 'error' ? 'text-[var(--danger)]' : running ? 'text-[var(--accent)]' : 'text-[var(--success)]'
 
@@ -602,40 +623,53 @@ export const PlanCard = memo(function PlanCard({ plan }: { plan: TaskPlan }) {
         <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />
       </button>
       {open && (
-        <ol className="border-t border-[var(--border)]/60 py-1.5 space-y-0.5">
-          {plan.steps.map((s, i) => (
-            <li key={i} className="flex items-start gap-2 py-0.5">
-              <span
-                className={`w-4 h-4 rounded-full flex items-center justify-center shrink-0 mt-px text-[9px] font-semibold ${
-                  s.status === 'done'
-                    ? 'text-[var(--success)]'
-                    : s.status === 'error'
-                      ? 'text-[var(--danger)]'
-                      : s.status === 'running'
-                        ? 'text-[var(--accent)]'
-                        : 'text-[var(--text-muted)]'
+        <div className="border-t border-[var(--border)]/60">
+          <div className="flex items-center gap-2 px-1 pt-1.5 pb-1">
+            <div className="flex-1 h-1 rounded-full bg-[var(--border)]/60 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ease-out ${
+                  plan.phase === 'error' ? 'bg-[var(--danger)]' : 'bg-[var(--accent)]'
                 }`}
-              >
-                {s.status === 'done' ? (
-                  <Icon name="check" size={10} />
-                ) : s.status === 'error' ? (
-                  <Icon name="close" size={10} />
-                ) : s.status === 'running' ? (
-                  <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
-                ) : (
-                  i + 1
-                )}
-              </span>
-              <span
-                className={`flex-1 min-w-0 text-[12px] leading-relaxed ${
-                  s.status === 'pending' ? 'text-[var(--text-muted)]' : 'text-[var(--text-secondary)]'
-                }`}
-              >
-                {s.text}
-              </span>
-            </li>
-          ))}
-        </ol>
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            <span className="text-[10px] text-[var(--text-muted)] tabular-nums shrink-0">{pct}%</span>
+          </div>
+          <ol className="py-1 space-y-0.5">
+            {plan.steps.map((s, i) => (
+              <li key={i} className="flex items-start gap-2 py-0.5">
+                <span
+                  className={`w-4 h-4 rounded-full flex items-center justify-center shrink-0 mt-px text-[9px] font-semibold ${
+                    s.status === 'done'
+                      ? 'text-[var(--success)]'
+                      : s.status === 'error'
+                        ? 'text-[var(--danger)]'
+                        : s.status === 'running'
+                          ? 'text-[var(--accent)]'
+                          : 'text-[var(--text-muted)]'
+                  }`}
+                >
+                  {s.status === 'done' ? (
+                    <Icon name="check" size={10} />
+                  ) : s.status === 'error' ? (
+                    <Icon name="close" size={10} />
+                  ) : s.status === 'running' ? (
+                    <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
+                  ) : (
+                    i + 1
+                  )}
+                </span>
+                <span
+                  className={`flex-1 min-w-0 text-[12px] leading-relaxed ${
+                    s.status === 'pending' ? 'text-[var(--text-muted)]' : 'text-[var(--text-secondary)]'
+                  }`}
+                >
+                  {s.text}
+                </span>
+              </li>
+            ))}
+          </ol>
+        </div>
       )}
     </div>
   )

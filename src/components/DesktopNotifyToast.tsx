@@ -60,7 +60,7 @@ export default function DesktopNotifyToast() {
   if (toasts.length === 0) return null
 
   return (
-    <div className="fixed top-4 right-4 z-[100] flex flex-col gap-2 w-80 max-w-[calc(100vw-2rem)]">
+    <div className="fixed top-4 right-4 z-[var(--app-z-toast)] flex flex-col gap-2 w-80 max-w-[calc(100vw-2rem)]">
       {toasts.map((t) => (
         <div
           key={t.id}

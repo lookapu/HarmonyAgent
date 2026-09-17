@@ -26,6 +26,8 @@ pub struct AgentRun {
     pub heartbeat_at: Option<i64>,
     pub lease_expires_at: Option<i64>,
     pub quality_json: Option<String>,
+    /// 用户最终批准的执行计划；恢复 Run 继承该版本并持续作为执行锚点。
+    pub approved_plan: Option<String>,
     pub error: Option<String>,
     pub started_at: i64,
     pub updated_at: i64,
@@ -41,6 +43,138 @@ pub struct RunEvent {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostCapabilityClaim {
+    Claimed,
+    Duplicate { status: String },
+}
+
+pub const DESKTOP_ADAPTER_CURSOR_VERSION: u32 = 1;
+pub const DESKTOP_ADAPTER_CONTROL_VERSION: u32 = 1;
+pub const DESKTOP_RECOVERY_MESSAGE_LIMIT: usize = 200;
+pub const DESKTOP_RECOVERY_TOOL_RUN_LIMIT: usize = 200;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopAdapterCheckpointCursor {
+    pub schema_version: u32,
+    pub message_rowid: i64,
+    pub visible_message_count: u64,
+    pub tool_run_rowid: i64,
+    pub tool_run_count: u64,
+    pub placeholder_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopAdapterCheckpointControl {
+    pub schema_version: u32,
+    pub effective_tool_rounds: usize,
+    pub budget_extensions: usize,
+}
+
+#[derive(Debug)]
+pub struct RestoredDesktopExecutorCheckpoint {
+    pub run_loop: crate::agent::kernel_executor::KernelIoRunLoop,
+    pub safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
+    pub cursor: DesktopAdapterCheckpointCursor,
+    /// Phase AZ 后的新 checkpoint 必有；Phase AX/AY 历史记录允许缺失并保守降级。
+    pub control: Option<DesktopAdapterCheckpointControl>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopRecoveredMessage {
+    pub rowid: i64,
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopRecoveredToolRun {
+    pub rowid: i64,
+    pub id: String,
+    pub tool_name: String,
+    pub input_json: String,
+    pub result_json: String,
+    pub status: String,
+}
+
+#[derive(Debug)]
+pub struct DesktopAdapterRecoverySnapshot {
+    pub checkpoint: RestoredDesktopExecutorCheckpoint,
+    pub messages: Vec<DesktopRecoveredMessage>,
+    pub tool_runs: Vec<DesktopRecoveredToolRun>,
+    pub messages_truncated: bool,
+    pub tool_runs_truncated: bool,
+}
+
+impl DesktopAdapterRecoverySnapshot {
+    /// 只生成不含正文、reasoning、工具参数和工具输出的恢复提示。
+    pub fn prompt_hint(&self) -> String {
+        let cursor = &self.checkpoint.cursor;
+        let last_message = self
+            .messages
+            .last()
+            .map(|message| format!("{}:{}", message.role, message.id))
+            .unwrap_or_else(|| "none".into());
+        let last_tool = self
+            .tool_runs
+            .last()
+            .map(|tool| format!("{}:{}:{}", tool.tool_name, tool.status, tool.id))
+            .unwrap_or_else(|| "none".into());
+        format!(
+            "## 已验证的桌面恢复边界\n\
+             父运行 checkpoint 安全点：{}；可见消息 {} 条（高水位 rowid={}，本次有界读取 {} 条{}）；\n\
+             工具审计 {} 条（高水位 rowid={}，本次有界读取 {} 条{}）；最后消息={}；最后工具={}；正文占位={}。\n\
+             这些记录只用于确认恢复边界；工具是否重放必须服从恢复计划的逐项决策，不得仅因记录存在而盲目重放，也不得猜测未持久化的瞬态状态。",
+            self.checkpoint.safe_point.as_str(),
+            cursor.visible_message_count,
+            cursor.message_rowid,
+            self.messages.len(),
+            if self.messages_truncated { "，已截断" } else { "" },
+            cursor.tool_run_count,
+            cursor.tool_run_rowid,
+            self.tool_runs.len(),
+            if self.tool_runs_truncated { "，已截断" } else { "" },
+            last_message,
+            last_tool,
+            cursor.placeholder_message_id.as_deref().unwrap_or("none"),
+        )
+    }
+
+    /// 只继承 Recovery Orchestrator 已判定为完成、且 id/工具名/成功状态三者一致的
+    /// 父工具证据。缺少 external_id 的旧计划和窗口外记录均保守忽略。
+    pub fn inheritable_tool_evidence(
+        &self,
+        plan: &crate::agent::recovery::RecoveryPlan,
+    ) -> Vec<DesktopRecoveredToolRun> {
+        let completed = plan
+            .decisions
+            .iter()
+            .filter(|decision| {
+                decision.source == "tool"
+                    && decision.action == crate::agent::recovery::RecoveryAction::SkipCompleted
+            })
+            .filter_map(|decision| {
+                decision
+                    .external_id
+                    .as_deref()
+                    .map(|id| (id, decision.title.as_str()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        self.tool_runs
+            .iter()
+            .filter(|tool| {
+                tool.status == "ok"
+                    && completed
+                        .get(tool.id.as_str())
+                        .is_some_and(|expected| *expected == tool.tool_name.as_str())
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 fn now_ms() -> i64 {
@@ -96,10 +230,11 @@ pub fn begin_managed_run(
         "INSERT INTO agent_runs
          (run_id,conversation_id,goal,state,phase,attempt,last_event_seq,recovery_count,
           resume_policy,metadata_json,started_at,updated_at,parent_run_id,recovery_plan_json,recovery_mode,
-          goal_contract_json,heartbeat_at,lease_expires_at)
+          goal_contract_json,heartbeat_at,lease_expires_at,approved_plan)
          VALUES (?1,?2,?3,'running',?4,
                  COALESCE((SELECT attempt+1 FROM agent_runs WHERE run_id=?7),1),
-                 0,0,?5,'{}',?6,?6,?7,?8,?9,?10,?6,?11)",
+                 0,0,?5,'{}',?6,?6,?7,?8,?9,?10,?6,?11,
+                 CASE WHEN ?7 IS NULL THEN NULL ELSE (SELECT approved_plan FROM agent_runs WHERE run_id=?7) END)",
         params![
             run_id,
             conversation_id,
@@ -216,6 +351,469 @@ pub fn append_event(
     let seq = append_event_tx(&tx, run_id, conversation_id, event_type, &payload, now)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(seq)
+}
+
+/// 原子登记一次宿主能力派发。唯一键同时受 SQLite 主键与规范化请求唯一约束保护，
+/// 因此多个进程/Worker 最多只有一个能获得执行权。
+pub fn claim_host_capability(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    tool_call_id: &str,
+    capability_id: &str,
+    request_digest: &str,
+    idempotency_key: &str,
+    subject: &serde_json::Value,
+) -> Result<HostCapabilityClaim, String> {
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    let active = tx
+        .query_row(
+            "SELECT conversation_id=?1 AND state IN ('running','verifying')
+             FROM agent_runs WHERE run_id=?2",
+            params![conversation_id, run_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    if !active {
+        return Err("Host Capability Broker 的 Run 不存在、归属不符或已非活跃状态".into());
+    }
+    if idempotency_key.starts_with("hcb-v2:") {
+        let legacy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM host_capability_claims WHERE run_id=?1
+             AND tool_call_id=?2 AND capability_id=?3 AND idempotency_key LIKE 'hcb-v1:%')",
+            params![run_id, tool_call_id, capability_id], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if legacy { return Err("存在未绑定工作区的历史 Broker claim，需核验副作用后发起新调用".into()); }
+    }
+    let inserted = tx
+        .execute(
+            "INSERT INTO host_capability_claims(
+               idempotency_key,run_id,conversation_id,tool_call_id,capability_id,
+               request_digest,status,subject_json,claimed_at)
+             VALUES(?1,?2,?3,?4,?5,?6,'started',?7,?8)
+             ON CONFLICT DO NOTHING",
+            params![
+                idempotency_key,
+                run_id,
+                conversation_id,
+                tool_call_id,
+                capability_id,
+                request_digest,
+                subject.to_string(),
+                now,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if inserted == 0 {
+        let status = tx
+            .query_row(
+                "SELECT status FROM host_capability_claims WHERE idempotency_key=?1",
+                [idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "conflict".into());
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(HostCapabilityClaim::Duplicate { status });
+    }
+    append_event_tx(
+        &tx,
+        run_id,
+        conversation_id,
+        "host_capability.started",
+        &serde_json::json!({
+            "capability_id": capability_id,
+            "tool_call_id": tool_call_id,
+            "idempotency_key": idempotency_key,
+            "subject": subject,
+        }),
+        now,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(HostCapabilityClaim::Claimed)
+}
+
+/// 完成已 claim 的宿主能力，并与 finished 事件原子提交。若 Worker 已丢失租约，
+/// 状态会保留为 started，恢复端必须视为结果不确定且不得自动重放。
+pub fn finish_host_capability(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    idempotency_key: &str,
+    capability_id: &str,
+    tool_call_id: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    error_kind: Option<&str>,
+) -> Result<(), String> {
+    if !matches!(status, "succeeded" | "failed" | "indeterminate") {
+        return Err(format!("非法宿主能力终态：{status}"));
+    }
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    let changed = tx
+        .execute(
+            "UPDATE host_capability_claims
+             SET status=?1,finished_at=?2,exit_code=?3,error_kind=?4
+             WHERE idempotency_key=?5 AND run_id=?6 AND conversation_id=?7 AND status='started'",
+            params![status, now, exit_code, error_kind, idempotency_key, run_id, conversation_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed != 1 {
+        return Err("宿主能力 claim 不存在、归属不符或已经结束".into());
+    }
+    append_event_tx(
+        &tx,
+        run_id,
+        conversation_id,
+        "host_capability.finished",
+        &serde_json::json!({
+            "capability_id": capability_id,
+            "tool_call_id": tool_call_id,
+            "idempotency_key": idempotency_key,
+            "success": status == "succeeded",
+            "status": status,
+            "exit_code": exit_code,
+            "error_kind": error_kind,
+        }),
+        now,
+    )?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+/// 把桌面 Durable Run 的活跃 executor 状态写入受 Worker 租约保护的事件流。
+/// payload 只扩展安全点来源；executor checkpoint 自身仍保持版本化契约。
+pub fn append_executor_checkpoint(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
+    safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
+) -> Result<i64, String> {
+    let payload = crate::agent::kernel_executor::executor_checkpoint_payload(
+        checkpoint,
+        safe_point,
+    )?;
+    append_event(
+        conn,
+        run_id,
+        conversation_id,
+        "run.executor_checkpoint",
+        payload,
+    )
+}
+
+/// 在同一 SQLite 事务中冻结桌面 adapter 的持久化高水位并追加 executor checkpoint。
+/// cursor 只保存数据库引用和计数，不复制消息正文、工具参数或工具输出。
+pub fn append_desktop_executor_checkpoint(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
+    safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
+    placeholder_message_id: Option<&str>,
+    control: Option<&DesktopAdapterCheckpointControl>,
+) -> Result<i64, String> {
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(|error| error.to_string())?;
+    fence_run_write(&tx, run_id)?;
+    let owns_conversation = tx
+        .query_row(
+            "SELECT conversation_id=?1 FROM agent_runs WHERE run_id=?2",
+            params![conversation_id, run_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(false);
+    if !owns_conversation {
+        return Err("桌面 checkpoint 的运行与会话归属不一致".into());
+    }
+    let (message_rowid, visible_message_count): (i64, i64) = tx
+        .query_row(
+            "SELECT COALESCE(MAX(rowid),0),COUNT(*) FROM messages
+             WHERE conversation_id=?1 AND queued=0 AND hidden=0",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let (tool_run_rowid, tool_run_count): (i64, i64) = tx
+        .query_row(
+            "SELECT COALESCE(MAX(rowid),0),COUNT(*) FROM tool_runs WHERE trace_id=?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if let Some(message_id) = placeholder_message_id {
+        let valid = tx
+            .query_row(
+                "SELECT rowid<=?1 AND conversation_id=?2 AND role='assistant'
+                 FROM messages WHERE id=?3",
+                params![message_rowid, conversation_id, message_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+        if !valid {
+            return Err("桌面 checkpoint 的正文占位消息不存在、越过高水位或不属于当前会话".into());
+        }
+    }
+    let cursor = DesktopAdapterCheckpointCursor {
+        schema_version: DESKTOP_ADAPTER_CURSOR_VERSION,
+        message_rowid,
+        visible_message_count: visible_message_count.max(0) as u64,
+        tool_run_rowid,
+        tool_run_count: tool_run_count.max(0) as u64,
+        placeholder_message_id: placeholder_message_id.map(str::to_string),
+    };
+    let mut payload = crate::agent::kernel_executor::executor_checkpoint_payload(
+        checkpoint,
+        safe_point,
+    )?;
+    payload["desktop_adapter_cursor"] =
+        serde_json::to_value(&cursor).map_err(|error| error.to_string())?;
+    if let Some(control) = control {
+        if control.schema_version != DESKTOP_ADAPTER_CONTROL_VERSION
+            || control.effective_tool_rounds > crate::agent::governance::MAX_EFFECTIVE_TOOL_ROUNDS
+            || control.budget_extensions > crate::agent::governance::MAX_TOOL_BUDGET_EXTENSIONS
+        {
+            return Err("桌面 checkpoint 的 adapter control 非法".into());
+        }
+        payload["desktop_adapter_control"] =
+            serde_json::to_value(control).map_err(|error| error.to_string())?;
+    }
+    let seq = append_event_tx(
+        &tx,
+        run_id,
+        conversation_id,
+        "run.executor_checkpoint",
+        &payload,
+        now,
+    )?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(seq)
+}
+
+/// 严格恢复某个 Durable Run 的最新 executor checkpoint。
+/// 最新事件损坏时失败关闭，不回退到更旧状态掩盖持久化故障。
+pub fn restore_latest_executor(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<
+    Option<(
+        crate::agent::kernel_executor::KernelIoRunLoop,
+        crate::agent::kernel_executor::KernelCheckpointSafePoint,
+    )>,
+    String,
+> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM run_events
+             WHERE run_id=?1 AND event_type='run.executor_checkpoint'
+             ORDER BY seq DESC LIMIT 1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let payload = serde_json::from_str(&payload)
+        .map_err(|error| format!("最新 Durable Run executor checkpoint 损坏：{error}"))?;
+    crate::agent::kernel_executor::restore_executor_checkpoint_payload(payload)
+        .map(Some)
+        .map_err(|error| format!("最新 Durable Run executor checkpoint 损坏：{error}"))
+}
+
+/// 严格恢复桌面 executor 及其 adapter 数据高水位。任何游标版本、归属或计数漂移都
+/// 失败关闭；调用方之后只能读取 rowid 不超过 cursor 的消息与工具审计记录。
+pub fn restore_latest_desktop_executor(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+) -> Result<Option<RestoredDesktopExecutorCheckpoint>, String> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM run_events
+             WHERE run_id=?1 AND conversation_id=?2 AND event_type='run.executor_checkpoint'
+             ORDER BY seq DESC LIMIT 1",
+            params![run_id, conversation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&payload)
+        .map_err(|error| format!("最新桌面 executor checkpoint 损坏：{error}"))?;
+    let cursor: DesktopAdapterCheckpointCursor = value
+        .get("desktop_adapter_cursor")
+        .cloned()
+        .ok_or_else(|| "最新桌面 executor checkpoint 缺少 adapter cursor".to_string())
+        .and_then(|cursor| {
+            serde_json::from_value(cursor)
+                .map_err(|error| format!("桌面 adapter cursor 反序列化失败：{error}"))
+        })?;
+    if cursor.schema_version != DESKTOP_ADAPTER_CURSOR_VERSION
+        || cursor.message_rowid < 0
+        || cursor.tool_run_rowid < 0
+    {
+        return Err(format!(
+            "桌面 adapter cursor 版本或高水位非法：schema_version={}",
+            cursor.schema_version
+        ));
+    }
+    let control = value
+        .get("desktop_adapter_control")
+        .cloned()
+        .map(|control| {
+            serde_json::from_value::<DesktopAdapterCheckpointControl>(control)
+                .map_err(|error| format!("桌面 adapter control 反序列化失败：{error}"))
+        })
+        .transpose()?;
+    if control.as_ref().is_some_and(|control| {
+        control.schema_version != DESKTOP_ADAPTER_CONTROL_VERSION
+            || control.effective_tool_rounds > crate::agent::governance::MAX_EFFECTIVE_TOOL_ROUNDS
+            || control.budget_extensions > crate::agent::governance::MAX_TOOL_BUDGET_EXTENSIONS
+    }) {
+        return Err("桌面 adapter control 版本或预算状态非法".into());
+    }
+    let visible_message_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE conversation_id=?1 AND queued=0 AND hidden=0 AND rowid<=?2",
+            params![conversation_id, cursor.message_rowid],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if visible_message_count.max(0) as u64 != cursor.visible_message_count {
+        return Err("桌面 adapter cursor 指向的可见消息集合已漂移".into());
+    }
+    let tool_run_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tool_runs WHERE trace_id=?1 AND rowid<=?2",
+            params![run_id, cursor.tool_run_rowid],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if tool_run_count.max(0) as u64 != cursor.tool_run_count {
+        return Err("桌面 adapter cursor 指向的工具审计集合已漂移".into());
+    }
+    if let Some(message_id) = cursor.placeholder_message_id.as_deref() {
+        let valid = conn
+            .query_row(
+                "SELECT rowid<=?1 AND conversation_id=?2 AND role='assistant'
+                 FROM messages WHERE id=?3",
+                params![cursor.message_rowid, conversation_id, message_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+        if !valid {
+            return Err("桌面 adapter cursor 的正文占位引用已漂移".into());
+        }
+    }
+    let (run_loop, safe_point) =
+        crate::agent::kernel_executor::restore_executor_checkpoint_payload(value)
+            .map_err(|error| format!("最新桌面 executor checkpoint 损坏：{error}"))?;
+    Ok(Some(RestoredDesktopExecutorCheckpoint {
+        run_loop,
+        safe_point,
+        cursor,
+        control,
+    }))
+}
+
+/// 在严格校验 adapter cursor 后，仅物化高水位以内最近的有界消息和工具审计。
+/// 查询始终带 rowid 上界与 LIMIT，避免恢复长会话时无界加载。
+pub fn materialize_latest_desktop_checkpoint(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+) -> Result<Option<DesktopAdapterRecoverySnapshot>, String> {
+    let Some(checkpoint) = restore_latest_desktop_executor(conn, run_id, conversation_id)? else {
+        return Ok(None);
+    };
+    let cursor = &checkpoint.cursor;
+    let mut message_stmt = conn
+        .prepare(
+            "SELECT rowid,id,role,COALESCE(content,''),reasoning FROM messages
+             WHERE conversation_id=?1 AND queued=0 AND hidden=0 AND rowid<=?2
+             ORDER BY rowid DESC LIMIT ?3",
+        )
+        .map_err(|error| error.to_string())?;
+    let message_rows = message_stmt
+        .query_map(
+            params![
+                conversation_id,
+                cursor.message_rowid,
+                DESKTOP_RECOVERY_MESSAGE_LIMIT as i64
+            ],
+            |row| {
+                Ok(DesktopRecoveredMessage {
+                    rowid: row.get(0)?,
+                    id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    reasoning: row.get(4)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut messages = message_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    messages.reverse();
+
+    let mut tool_stmt = conn
+        .prepare(
+            "SELECT rowid,COALESCE(id,''),COALESCE(tool_name,''),COALESCE(input_json,''),
+                    COALESCE(result_json,''),COALESCE(status,'')
+             FROM tool_runs WHERE trace_id=?1 AND rowid<=?2
+             ORDER BY rowid DESC LIMIT ?3",
+        )
+        .map_err(|error| error.to_string())?;
+    let tool_rows = tool_stmt
+        .query_map(
+            params![
+                run_id,
+                cursor.tool_run_rowid,
+                DESKTOP_RECOVERY_TOOL_RUN_LIMIT as i64
+            ],
+            |row| {
+                Ok(DesktopRecoveredToolRun {
+                    rowid: row.get(0)?,
+                    id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    input_json: row.get(3)?,
+                    result_json: row.get(4)?,
+                    status: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut tool_runs = tool_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    tool_runs.reverse();
+
+    Ok(Some(DesktopAdapterRecoverySnapshot {
+        messages_truncated: cursor.visible_message_count > messages.len() as u64,
+        tool_runs_truncated: cursor.tool_run_count > tool_runs.len() as u64,
+        checkpoint,
+        messages,
+        tool_runs,
+    }))
 }
 
 pub fn transition(
@@ -428,7 +1026,7 @@ pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<AgentRun>, Stri
         "SELECT run_id,conversation_id,goal,state,phase,attempt,last_event_seq,recovery_count,
                 resume_policy,acceptance_json,error,started_at,updated_at,finished_at,
                 parent_run_id,recovery_plan_json,recovery_mode,goal_contract_json,
-                remediation_count,heartbeat_at,lease_expires_at,quality_json
+                remediation_count,heartbeat_at,lease_expires_at,quality_json,approved_plan
          FROM agent_runs WHERE run_id=?1",
         [run_id],
         |r| {
@@ -455,11 +1053,32 @@ pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<AgentRun>, Stri
                 heartbeat_at: r.get(19)?,
                 lease_expires_at: r.get(20)?,
                 quality_json: r.get(21)?,
+                approved_plan: r.get(22)?,
             })
         },
     )
     .optional()
     .map_err(|e| e.to_string())
+}
+
+/// 保存用户最终批准的计划，并写入 Run 事件流。
+pub fn set_approved_plan(
+    conn: &Connection,
+    run_id: &str,
+    conversation_id: &str,
+    plan: &str,
+) -> Result<(), String> {
+    let plan = plan.trim();
+    if plan.is_empty() { return Err("批准计划不能为空".into()); }
+    fence_run_write(conn, run_id)?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let changed = tx.execute(
+        "UPDATE agent_runs SET approved_plan=?1,updated_at=?2 WHERE run_id=?3 AND conversation_id=?4",
+        params![plan, now_ms(), run_id, conversation_id],
+    ).map_err(|e| e.to_string())?;
+    if changed == 0 { return Err("未找到所属会话中的 Agent Run".into()); }
+    append_event_tx(&tx, run_id, conversation_id, "plan.approved", &serde_json::json!({ "plan": plan }), now_ms())?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 pub fn latest_run(conn: &Connection, conversation_id: &str) -> Result<Option<AgentRun>, String> {
@@ -545,10 +1164,18 @@ pub fn recover_interrupted_runs(conn: &Connection) -> Result<usize, String> {
                WHEN EXISTS(SELECT 1 FROM execution_steps WHERE run_id=?2 AND state='interrupted' AND recovery_policy='manual')
                  OR EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='manual') THEN 'manual'
                WHEN EXISTS(SELECT 1 FROM execution_steps WHERE run_id=?2 AND state='interrupted' AND recovery_policy='verify')
-                 OR EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='verify') THEN 'verify_effects'
+                 OR EXISTS(SELECT 1 FROM tool_runs WHERE trace_id=?2 AND status='interrupted' AND recovery_policy='verify')
+                 OR EXISTS(SELECT 1 FROM host_capability_claims WHERE run_id=?2 AND status='started') THEN 'verify_effects'
                ELSE 'continue'
              END,
              updated_at=?1,finished_at=?1 WHERE run_id=?2",
+            params![now, run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE host_capability_claims
+             SET status='indeterminate',finished_at=?1,error_kind='process_interrupted'
+             WHERE run_id=?2 AND status='started'",
             params![now, run_id],
         )
         .map_err(|e| e.to_string())?;
@@ -575,9 +1202,11 @@ mod tests {
             "PRAGMA foreign_keys=ON;
              CREATE TABLE conversations(id TEXT PRIMARY KEY);
              INSERT INTO conversations(id) VALUES ('c');
-             CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT);
+             CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT,approved_plan TEXT);
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
-             CREATE TABLE tool_runs(trace_id TEXT,status TEXT,recovery_policy TEXT);
+             CREATE TABLE host_capability_claims(idempotency_key TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),tool_call_id TEXT NOT NULL,capability_id TEXT NOT NULL,request_digest TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'started',subject_json TEXT NOT NULL DEFAULT '{}',claimed_at INTEGER NOT NULL,finished_at INTEGER,exit_code INTEGER,error_kind TEXT,UNIQUE(run_id,tool_call_id,capability_id,request_digest));
+             CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT '',reasoning TEXT,queued INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE tool_runs(id TEXT,conversation_id TEXT,trace_id TEXT,tool_name TEXT,input_json TEXT,result_json TEXT,status TEXT,recovery_policy TEXT);
              CREATE TABLE execution_steps(run_id TEXT,state TEXT,recovery_policy TEXT);",
         ).unwrap();
         c
@@ -594,6 +1223,361 @@ mod tests {
         assert_eq!(run.last_event_seq, 3);
         let events = events_after(&c, "r", 1, 50).unwrap();
         assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn host_capability_claim_is_atomic_and_blocks_replay() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        let subject = serde_json::json!({"device_digest": "abc123"});
+        assert_eq!(
+            claim_host_capability(
+                &c, "r", "c", "call-1", "deploy.install", "request-a", "key-a", &subject,
+            )
+            .unwrap(),
+            HostCapabilityClaim::Claimed
+        );
+        assert_eq!(
+            claim_host_capability(
+                &c, "r", "c", "call-1", "deploy.install", "request-a", "key-a", &subject,
+            )
+            .unwrap(),
+            HostCapabilityClaim::Duplicate { status: "started".into() }
+        );
+        finish_host_capability(
+            &c, "r", "c", "key-a", "deploy.install", "call-1", "succeeded", Some(0), None,
+        )
+        .unwrap();
+        assert_eq!(
+            claim_host_capability(
+                &c, "r", "c", "call-1", "deploy.install", "request-a", "key-a", &subject,
+            )
+            .unwrap(),
+            HostCapabilityClaim::Duplicate { status: "succeeded".into() }
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM host_capability_claims WHERE run_id='r'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let events = events_after(&c, "r", 0, 10).unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
+            vec!["run.started", "host_capability.started", "host_capability.finished"]
+        );
+    }
+
+    #[test]
+    fn workspace_identity_upgrade_does_not_replay_legacy_claim() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        let subject = serde_json::json!({});
+        claim_host_capability(&c, "r", "c", "call", "deploy.install", "old", "hcb-v1:old", &subject).unwrap();
+        let error = claim_host_capability(&c, "r", "c", "call", "deploy.install", "new", "hcb-v2:new", &subject).unwrap_err();
+        assert!(error.contains("历史 Broker claim"));
+        assert_eq!(claim_host_capability(&c, "r", "c", "new-call", "deploy.install", "new", "hcb-v2:new", &subject).unwrap(), HostCapabilityClaim::Claimed);
+    }
+
+    #[test]
+    fn host_capability_claim_rejects_inactive_or_foreign_run() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        transition(&c, "r", "c", "completed", "done", None).unwrap();
+        let error = claim_host_capability(
+            &c,
+            "r",
+            "c",
+            "call-1",
+            "hdc.connect",
+            "request-a",
+            "key-a",
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(error.contains("非活跃"));
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM host_capability_claims", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recovery_marks_unfinished_host_capability_indeterminate() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        claim_host_capability(
+            &c,
+            "r",
+            "c",
+            "call-1",
+            "deploy.install",
+            "request-a",
+            "key-a",
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(recover_interrupted_runs(&c).unwrap(), 1);
+        let (status, error_kind): (String, String) = c
+            .query_row(
+                "SELECT status,error_kind FROM host_capability_claims WHERE idempotency_key='key-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "indeterminate");
+        assert_eq!(error_kind, "process_interrupted");
+        assert_eq!(get_run(&c, "r").unwrap().unwrap().resume_policy, "verify_effects");
+    }
+
+    #[test]
+    fn durable_executor_checkpoint_restores_latest_kernel_state() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        let mut run_loop = crate::agent::kernel_executor::KernelIoRunLoop::new(
+            crate::agent::kernel_executor::KernelExecutorLimits {
+                wall_time_ms: 60_000,
+                round_limit: Some(3),
+                tool_attempt_limit: Some(2),
+                remediation_limit: 1,
+            },
+        );
+        assert!(matches!(
+            run_loop.begin_next_round(false),
+            crate::agent::kernel_executor::KernelRunPermit::Proceed { round: 1, .. }
+        ));
+        append_executor_checkpoint(
+            &c,
+            "r",
+            "c",
+            run_loop.checkpoint(),
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+        )
+        .unwrap();
+
+        let (mut restored, safe_point) = restore_latest_executor(&c, "r").unwrap().unwrap();
+        assert_eq!(
+            safe_point,
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary
+        );
+        assert!(matches!(
+            restored.begin_next_round(false),
+            crate::agent::kernel_executor::KernelRunPermit::Proceed { round: 2, .. }
+        ));
+        let event = events_after(&c, "r", 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "run.executor_checkpoint")
+            .unwrap();
+        assert_eq!(event.payload["safe_point"], "provider_boundary");
+        c.execute(
+            "UPDATE run_events SET payload='{broken' WHERE event_id=?1",
+            [&event.event_id],
+        )
+        .unwrap();
+        assert!(restore_latest_executor(&c, "r")
+            .unwrap_err()
+            .contains("checkpoint 损坏"));
+    }
+
+    #[test]
+    fn desktop_checkpoint_freezes_and_validates_adapter_cursors() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        c.execute(
+            "INSERT INTO messages(id,conversation_id,role,content) VALUES('user','c','user','goal')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages(id,conversation_id,role,content,reasoning) VALUES('placeholder','c','assistant','partial','thinking')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tool_runs(id,conversation_id,trace_id,tool_name,input_json,result_json,status,recovery_policy)
+             VALUES('tool-1','c','r','read_file','{\"path\":\"a.rs\"}','ok','ok','replay')",
+            [],
+        )
+        .unwrap();
+        let mut run_loop = crate::agent::kernel_executor::KernelIoRunLoop::new(
+            crate::agent::kernel_executor::KernelExecutorLimits::default(),
+        );
+        assert!(matches!(
+            run_loop.begin_next_round(false),
+            crate::agent::kernel_executor::KernelRunPermit::Proceed { round: 1, .. }
+        ));
+        let control = DesktopAdapterCheckpointControl {
+            schema_version: DESKTOP_ADAPTER_CONTROL_VERSION,
+            effective_tool_rounds: 72,
+            budget_extensions: 1,
+        };
+        append_desktop_executor_checkpoint(
+            &c,
+            "r",
+            "c",
+            run_loop.checkpoint(),
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+            Some("placeholder"),
+            Some(&control),
+        )
+        .unwrap();
+
+        let restored = restore_latest_desktop_executor(&c, "r", "c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.safe_point,
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult
+        );
+        assert_eq!(restored.cursor.visible_message_count, 2);
+        assert_eq!(restored.cursor.tool_run_count, 1);
+        assert_eq!(restored.control, Some(control));
+        assert_eq!(
+            restored.cursor.placeholder_message_id.as_deref(),
+            Some("placeholder")
+        );
+
+        let snapshot = materialize_latest_desktop_checkpoint(&c, "r", "c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.messages[1].content, "partial");
+        assert_eq!(snapshot.messages[1].reasoning.as_deref(), Some("thinking"));
+        assert_eq!(snapshot.tool_runs.len(), 1);
+        assert_eq!(snapshot.tool_runs[0].tool_name, "read_file");
+        assert_eq!(snapshot.tool_runs[0].input_json, "{\"path\":\"a.rs\"}");
+        assert!(!snapshot.messages_truncated);
+        assert!(!snapshot.tool_runs_truncated);
+        assert!(snapshot.prompt_hint().contains("tool_result"));
+        let plan = crate::agent::recovery::RecoveryPlan {
+            parent_run_id: "r".into(),
+            original_goal: "goal".into(),
+            original_contract: None,
+            policy: "continue".into(),
+            decisions: vec![crate::agent::recovery::RecoveryDecision {
+                step_id: "tool:tool-1".into(),
+                external_id: Some("tool-1".into()),
+                source: "tool".into(),
+                title: "read_file".into(),
+                previous_state: "completed".into(),
+                verification_state: "verified".into(),
+                recovery_policy: "replay".into(),
+                action: crate::agent::recovery::RecoveryAction::SkipCompleted,
+                evidence_domain: Some("filesystem".into()),
+                target_hints: vec!["a.rs".into()],
+            }],
+            completed_count: 1,
+            pending_count: 0,
+            verification_count: 0,
+            confirmation_count: 0,
+            created_at: 0,
+        };
+        assert_eq!(snapshot.inheritable_tool_evidence(&plan).len(), 1);
+        let mut mismatched = plan.clone();
+        mismatched.decisions[0].title = "write_file".into();
+        assert!(snapshot.inheritable_tool_evidence(&mismatched).is_empty());
+
+        c.execute("DELETE FROM tool_runs WHERE id='tool-1'", [])
+            .unwrap();
+        assert!(restore_latest_desktop_executor(&c, "r", "c")
+            .unwrap_err()
+            .contains("工具审计集合已漂移"));
+    }
+
+    #[test]
+    fn desktop_checkpoint_materialization_is_bounded_and_chronological() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        for index in 0..205 {
+            c.execute(
+                "INSERT INTO messages(id,conversation_id,role,content) VALUES(?1,'c','user',?2)",
+                params![format!("m-{index:03}"), format!("content-{index:03}")],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO tool_runs(id,conversation_id,trace_id,tool_name,status,recovery_policy)
+                 VALUES(?1,'c','r','read_file','ok','replay')",
+                [format!("t-{index:03}")],
+            )
+            .unwrap();
+        }
+        let run_loop = crate::agent::kernel_executor::KernelIoRunLoop::new(
+            crate::agent::kernel_executor::KernelExecutorLimits::default(),
+        );
+        append_desktop_executor_checkpoint(
+            &c,
+            "r",
+            "c",
+            run_loop.checkpoint(),
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let snapshot = materialize_latest_desktop_checkpoint(&c, "r", "c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.checkpoint.cursor.visible_message_count, 205);
+        assert_eq!(snapshot.checkpoint.cursor.tool_run_count, 205);
+        assert_eq!(snapshot.messages.len(), DESKTOP_RECOVERY_MESSAGE_LIMIT);
+        assert_eq!(snapshot.tool_runs.len(), DESKTOP_RECOVERY_TOOL_RUN_LIMIT);
+        assert_eq!(snapshot.messages.first().unwrap().id, "m-005");
+        assert_eq!(snapshot.messages.last().unwrap().id, "m-204");
+        assert_eq!(snapshot.tool_runs.first().unwrap().id, "t-005");
+        assert_eq!(snapshot.tool_runs.last().unwrap().id, "t-204");
+        assert!(snapshot.messages_truncated);
+        assert!(snapshot.tool_runs_truncated);
+        assert!(snapshot.checkpoint.control.is_none());
+    }
+
+    #[test]
+    fn desktop_checkpoint_rejects_corrupted_adapter_control() {
+        let c = conn();
+        begin_run(&c, "r", "c", "goal").unwrap();
+        let run_loop = crate::agent::kernel_executor::KernelIoRunLoop::new(
+            crate::agent::kernel_executor::KernelExecutorLimits::default(),
+        );
+        let control = DesktopAdapterCheckpointControl {
+            schema_version: DESKTOP_ADAPTER_CONTROL_VERSION,
+            effective_tool_rounds: 72,
+            budget_extensions: 1,
+        };
+        append_desktop_executor_checkpoint(
+            &c,
+            "r",
+            "c",
+            run_loop.checkpoint(),
+            crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+            None,
+            Some(&control),
+        )
+        .unwrap();
+        let encoded: String = c
+            .query_row(
+                "SELECT payload FROM run_events WHERE run_id='r' AND event_type='run.executor_checkpoint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        payload["desktop_adapter_control"]["budget_extensions"] = serde_json::json!(3);
+        c.execute(
+            "UPDATE run_events SET payload=?1 WHERE run_id='r' AND event_type='run.executor_checkpoint'",
+            [serde_json::to_string(&payload).unwrap()],
+        )
+        .unwrap();
+
+        assert!(restore_latest_desktop_executor(&c, "r", "c")
+            .unwrap_err()
+            .contains("adapter control"));
     }
 
     #[test]
@@ -662,6 +1646,23 @@ mod tests {
         assert_eq!(get_run(&c, "r").unwrap().unwrap().remediation_count, 1);
         transition(&c, "r", "c", "completed", "done", None).unwrap();
         assert!(get_run(&c, "r").unwrap().unwrap().lease_expires_at.is_none());
+    }
+
+    #[test]
+    fn approved_plan_is_persisted_and_inherited_by_recovery_run() {
+        let c = conn();
+        begin_run(&c, "parent", "c", "实现目标").unwrap();
+        set_approved_plan(&c, "parent", "c", "1. 实现\n2. 验证").unwrap();
+        transition(&c, "parent", "c", "interrupted", "recovery_required", None).unwrap();
+        let plan = crate::agent::recovery::RecoveryPlan {
+            parent_run_id: "parent".into(), original_goal: "实现目标".into(),
+            original_contract: None, policy: "continue".into(), decisions: Vec::new(),
+            completed_count: 0, pending_count: 0, verification_count: 0,
+            confirmation_count: 0, created_at: 0,
+        };
+        begin_run_with_recovery(&c, "child", "c", "继续", Some(&plan)).unwrap();
+        assert_eq!(get_run(&c, "child").unwrap().unwrap().approved_plan.as_deref(), Some("1. 实现\n2. 验证"));
+        assert!(events_after(&c, "parent", 0, 20).unwrap().iter().any(|e| e.event_type == "plan.approved"));
     }
 
     #[test]

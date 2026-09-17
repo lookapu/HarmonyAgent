@@ -17,7 +17,7 @@ export default function RuntimeProgressBar({ progress }: { progress: RuntimeProg
       {showBar && (
         <div className="h-1.5 bg-[var(--bg-secondary)] rounded-full mt-2 overflow-hidden">
           <div
-            className="h-full bg-[var(--accent)] rounded-full transition-all duration-300"
+            className="h-full bg-[var(--accent)] rounded-full transition-[width] duration-300"
             style={{ width: `${Math.min(progress.percent!, 100)}%` }}
           />
         </div>

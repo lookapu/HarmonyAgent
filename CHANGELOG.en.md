@@ -7,6 +7,35 @@
 
 ---
 
+## v2.2.0 — Structure-First Navigation, Multi-Language Write Gates, and a Trustworthy Execution Kernel (2026-09-15)
+
+Positioning: moving from "the agent can edit code" to "edits are language-checked and verifiable" — writes pass language-level gates, host operations carry revocable approval receipts, and resource isolation has an explicit support matrix. 259 commits.
+
+**Structure-first navigation and large-repo indexing**
+
+- New structure-first code navigation with a persistent repository catalog: whole-tree file registration, incremental file deltas, git-checkpoint reconciliation, and a resilient index watcher; progressive indexing at million-file scale has its own baseline (see [Index Scale Baseline](docs/INDEX_SCALE_BASELINE.md)).
+- Structure queries support stable cursors, paginated structure nodes, and persistent graph edges; results are bound to safe file-read windows.
+
+**Pre-write gates (headline of this release)**
+
+- Real per-language gates: Java (Tree-sitter declaration/annotation checks plus a `javac` diagnostic diff that also compiles **unedited callers** in the same source root), Dart (`dart analyze` diff), Go (`go vet` diff in a temp module that carries same-package sibling files), Python (`pyflakes` diff), SQL (`sqlite3` in-memory execution diff with side-effect statement protection).
+- Syntax-level coverage for ArkTS/TS/JS/Go/Python/Rust/Dart/Kotlin/C++/Swift; when an external tool is missing or times out the gate degrades to "not checked" and records an event — writes are never blocked and never falsely reported as verified.
+- Multi-file transactions: baselines re-verified before batch and per-file writes, conditional reverse-order rollback, external edits preserved, and "rollback incomplete" reported honestly.
+
+**Host capability approvals and revocable receipts**
+
+- Capability-agnostic v4 approval receipts (OTA content digests are just one scope kind) with self-describing revocation; agent-initiated mutating host capabilities must hold a valid receipt, which expires on stop or restart.
+- The approval card now shows an impact contract (reversibility / blast radius / targets / consequence), and the same wording flows into pending-confirmation restore and the audit timeline.
+
+**Sandbox and resource limits**
+
+- Native sandboxed children get enforceable rlimits (CPU time verified locally; memory and process count are reported honestly as unavailable/unmapped per platform); host-direct commands can opt into limits via environment variables.
+
+**UI and quality gates**
+
+- Design tokens converged to an IDE feel (radius/shadow/type scale); static inline styles moved to utility classes.
+- Documentation-drift and clippy warning-baseline gates are green again; a new [Current Status](docs/CURRENT_STATUS.md) page is the single source of truth for capability state.
+
 ## v2.1.1 — Interaction and Quality-Gate Hardening (2026-08-25)
 
 - Provider Token fields now preserve and prefill full values with K/M suffix guidance; reply-language and reasoning-language configuration is also refined.
@@ -16,7 +45,7 @@
 
 ## v2.1.0 — Evidence-Driven Governance & Dual Execution Kernel (2026-08-22)
 
-Positioning: upgrading "the model can call many tools" to "tasks and tools are durably scheduled, acceptable, recoverable, and observable". The reliability & governance batch adds migrations `057`—`062`, `069`—`075`; work continues on long-session Context V2, and the total migration count reaches **77**. The governance batch adds 3 new external tools (`workflow_template`, `team_share`, `reproduction_bundle`), bringing `TOOL_SPECS` to **201**.
+Positioning: upgrading "the model can call many tools" to "tasks and tools are durably scheduled, acceptable, recoverable, and observable". The reliability & governance batch adds migrations `057`—`062`, `069`—`075`; work continues on long-session Context V2, and the total migration count reaches **84**. Subsequent capability work brings `TOOL_SPECS` to **204**.
 
 - Long-session hardening batch (6 items): budget dynamically profiled by session phase (`balanced/explore/execute/verify`, derived at read time from `agent_runs.phase`); 85%-window compression warning notification chain confirmed (`chat-context-warning` event + frontend notification); context panel adds tiered budget bar, profile label, invalidation count, and session health display (auto-refresh after compaction); 100+ round random-event stress regression test (fact adjudication stays correct after interleaved compaction/invalidation/reconciliation); multi-token fuzzy knowledge retrieval (`search_knowledge_fuzzy`, ranked by hit count + character overlap); session health & summary degradation detection (compaction count/fact-flip rate/reconciliation correction count/budget usage, `get_session_health` + migration 074). See [Long-Session Context V2 Design](docs/CONTEXT_V2.md).
 - Long-session correlation strengthening batch (5 items + 1 eval, 2026-08-22): unified phase classifier (`BudgetProfile::from_goal_or_phase`, runtime phase with goal fallback — dynamic budgets actually take effect); context panel shows invalidation-reason details ("why forgotten" entry point); health degradation verdicts derive true depth from the summary-coverage cursor chain (compaction count is only a secondary signal); compaction events written into the session event stream (`context_compress`, replayable in Timeline); core metrics table and eval snapshots add degradation metrics (compaction/flip/warning counts); the fixed eval suite adds a 100-round long-session compaction-recovery case (27 scenarios) included in the baseline gate.
@@ -425,7 +454,7 @@ Positioning: HarmonyOS desktop AI coding IDE prototype, **117 Agent tools** + mu
 
 ## Maintenance Notes
 
-- The tool total is authoritative at the length of the `TOOL_SPECS` array in `src-tauri/src/agent/tools/mod.rs` (currently 201).
+- The tool total is authoritative at the length of the `TOOL_SPECS` array in `src-tauri/src/agent/tools/mod.rs` (currently 204).
 - Task groups are authoritative at the `TASK_GROUPS` constant (currently 8: `build` / `fix` / `explore` / `deploy` / `refactor` / `test` / `debug` / `other`).
 - `quality_tools::*` is exposed via the facade; **importing the 4 sub-files directly (`quality_metrics`, etc.) is forbidden** — they are internal modules; external coupling goes through the facade.
 - Any "split by line count" of tools is forbidden. **Must slice completely by method**, with signature + body in the same file. Script aid: `scripts/legacy/_split_quality.py`.

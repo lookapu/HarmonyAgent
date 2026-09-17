@@ -8,13 +8,13 @@
 
 | Item | Current value | Authoritative source |
 |---|---:|---|
-| External Agent tools | 201 | `agent/tools/mod.rs::TOOL_SPECS` |
-| Tool implementation files | 29 | `src-tauri/src/agent/tools/*.rs` |
+| External Agent tools | 204 | `agent/tools/mod.rs::TOOL_SPECS` |
+| Tool implementation files | 35 | `src-tauri/src/agent/tools/*.rs` |
 | Task groups | 8 | `TOOL_GROUP` / `TASK_GROUPS` |
 | Permission levels | L0/L1/L2 | `services/permissions.rs` and tool hooks |
 | Tool protocol | Textual markers + native function calling | `protocol.rs` / `commands/chat.rs` |
 
-`TOOL_SPECS` is the single source of truth for tool names, descriptions, and side-effect markers; this file does not duplicate the full 201-item array, to avoid a second list drifting when tools are added.
+`TOOL_SPECS` is the single source of truth for tool names, descriptions, and side-effect markers; this file does not duplicate the full 204-item array, to avoid a second list drifting when tools are added.
 
 ## 2. Eight Task Domains
 
@@ -146,7 +146,7 @@ The tool count only describes external capability numbers; the 2026-08-21 focus 
 
 ## 7. Explicitly Deferred Items
 
-The following external-service integrations are not part of the current 201 tools and remain deferred:
+The following external-service integrations are not part of the current 204 tools and remain deferred:
 
 - Figma import;
 - Feishu task sync;

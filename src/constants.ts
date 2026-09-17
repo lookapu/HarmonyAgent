@@ -23,6 +23,7 @@ export const STORAGE_KEYS = {
   // 会话维度 store
   CONV_NOTES: 'deveco-switch-conv-notes',
   AUDIT_LOG: 'deveco-switch-audit-log',
+  NOTIFICATIONS: 'deveco-switch-notifications',
   PINNED: 'deveco-switch-pinned-messages',
   RATINGS: 'deveco-switch-message-ratings',
 

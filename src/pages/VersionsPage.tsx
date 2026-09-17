@@ -5,6 +5,7 @@ import { getCurrentVersion, listAvailableVersions, installVersion, type VersionI
 import { getSystemProxy } from '../api/update'
 import { getItem, setItem } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
+import { Skeleton } from '../components/ui/Spinner'
 
 export default function VersionsPage() {
   const { t } = useTranslation()
@@ -116,7 +117,7 @@ export default function VersionsPage() {
       )}
 
       {loading ? (
-        <p className="text-sm text-[var(--text-secondary)]">{t('version.loading')}</p>
+        <Skeleton lines={4} label={t('version.loading')} />
       ) : (
         <div className="space-y-2 max-h-96 overflow-y-auto">
           {versions.length === 0 && !fetchError && (

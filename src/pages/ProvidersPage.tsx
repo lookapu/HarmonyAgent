@@ -179,6 +179,7 @@ function EndpointEditor({
               onClick={() => onChange(endpoints.filter((_, j) => j !== i))}
               className="h-8 px-2 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors shrink-0"
               title={t('provider.endpointDelete')}
+              aria-label={t('provider.endpointDelete')}
             >
               <Icon name="close" size={12} />
             </button>
@@ -814,7 +815,7 @@ export default function ProvidersPage() {
         </div>
         <button
           onClick={() => setShowForm(!showForm)}
-          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium active:scale-[0.98] transition-all"
+          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-colors"
         >
           <span className="flex items-center gap-1.5">
             <Icon name={showForm ? 'close' : 'plus'} size={14} white />
@@ -840,7 +841,7 @@ export default function ProvidersPage() {
                         <button
                           key={tpl.key}
                           onClick={() => applyTemplate(tpl)}
-                          className={`group flex items-center gap-2 px-2.5 py-2 rounded-xl border text-left transition-all ${
+                          className={`group flex items-center gap-2 px-2.5 py-2 rounded-xl border text-left transition-colors ${
                             selectedTpl === tpl.key
                               ? 'border-[var(--accent)] bg-[var(--accent-soft)]'
                               : 'border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--accent)]/40 hover:bg-[var(--bg-hover)]'
@@ -925,6 +926,7 @@ export default function ProvidersPage() {
                     onClick={() => removeFormModel(m)}
                     className="text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors"
                     title={t('provider.removeModel')}
+                    aria-label={t('provider.removeModel')}
                   >
                     <Icon name="close" size={11} />
                   </button>
@@ -972,7 +974,7 @@ export default function ProvidersPage() {
             {error && <span className="text-xs text-[var(--danger)]">{error}</span>}
             <button
               onClick={handleCreate}
-              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 active:scale-[0.98] transition-all"
+              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 transition-opacity"
             >
               {t('provider.save')}
             </button>
@@ -990,7 +992,7 @@ export default function ProvidersPage() {
             <p className="text-[var(--text-secondary)] text-sm">{t('provider.empty')}</p>
             <button
               onClick={() => setShowForm(true)}
-              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-all"
+              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-colors"
             >
               {t('provider.add')}
             </button>
@@ -1022,6 +1024,31 @@ export default function ProvidersPage() {
                   )}
                 </div>
                 <p className="text-xs font-mono text-[var(--text-secondary)] mt-1 break-all">{p.base_url}</p>
+                {/* Auto 池三态：不参与 / 仅主对话 / 主对话+杂活 */}
+                <div className="flex items-center gap-1.5 mt-1.5">
+                  <span className="text-[10px] text-[var(--text-muted)]">{t('provider.autoPool')}</span>
+                  <div className="flex rounded-md border border-[var(--border)] overflow-hidden">
+                    {(
+                      [
+                        [0, t('provider.autoPoolOff')],
+                        [1, t('provider.autoPoolMain')],
+                        [2, t('provider.autoPoolMainAux')],
+                      ] as const
+                    ).map(([mode, label]) => (
+                      <button
+                        key={mode}
+                        onClick={() => void updateProvider(p.id, { auto_pool_mode: mode }).then(load).catch((e) => console.error(e))}
+                        className={`px-2 py-0.5 text-[10px] transition-colors ${
+                          p.auto_pool_mode === mode
+                            ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
+                            : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 {(p.endpoints?.length ?? 0) > 0 && (
                   <div className="flex gap-1.5 flex-wrap mt-1.5">
                     {p.endpoints.map((ep) => (
@@ -1185,6 +1212,7 @@ export default function ProvidersPage() {
                                     disabled={syncBusy[modelId] === 'remove'}
                                     className="opacity-50 hover:opacity-100 transition-opacity disabled:opacity-30"
                                     title={t('provider.syncRemove')}
+                                    aria-label={t('provider.syncRemove')}
                                   >
                                     {syncBusy[modelId] === 'remove' ? t('provider.syncBusy') : <Icon name="close" size={10} />}
                                   </button>
@@ -1235,6 +1263,7 @@ export default function ProvidersPage() {
                                       disabled={syncBusy[m.id] === 'add'}
                                       className="opacity-50 hover:opacity-100 transition-opacity disabled:opacity-30"
                                       title={t('provider.syncAdd')}
+                                      aria-label={t('provider.syncAdd')}
                                     >
                                       {syncBusy[m.id] === 'add' ? t('provider.syncBusy') : <Icon name="plus" size={10} />}
                                     </button>
@@ -1364,6 +1393,7 @@ export default function ProvidersPage() {
                               onClick={() => removeEditModel(m)}
                               className="text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors"
                               title={t('provider.removeModel')}
+                              aria-label={t('provider.removeModel')}
                             >
                               <Icon name="close" size={11} />
                             </button>
@@ -1449,7 +1479,7 @@ export default function ProvidersPage() {
                           <div className="flex items-center gap-2">
                             <button
                               onClick={saveEditType}
-                              className="h-7 px-3 text-[11px] bg-[var(--accent)] text-white rounded-lg hover:opacity-90 active:scale-[0.98] transition-all"
+                              className="h-7 px-3 text-[11px] bg-[var(--accent)] text-white rounded-lg hover:opacity-90 transition-opacity"
                             >
                               {t('provider.typeSave')}
                             </button>
@@ -1468,7 +1498,7 @@ export default function ProvidersPage() {
                       <button
                         onClick={() => saveEdit(p.id)}
                         disabled={editSaving}
-                        className="h-8 px-4 text-[12px] bg-[var(--success)] text-white rounded-lg hover:opacity-90 active:scale-[0.98] transition-all disabled:opacity-50"
+                        className="h-8 px-4 text-[12px] bg-[var(--success)] text-white rounded-lg hover:opacity-90 transition-opacity disabled:opacity-50"
                       >
                         {editSaving ? t('provider.saving') : t('provider.saveEdit')}
                       </button>

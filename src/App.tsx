@@ -45,10 +45,10 @@ const navItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/proxy', labelKey: 'nav.proxy', icon: 'proxy' },
   { path: '/mcp', labelKey: 'nav.mcp', icon: 'mcp' },
   { path: '/skills', labelKey: 'nav.skill', icon: 'skill' },
-  { path: '/team-sharing', labelKey: 'nav.teamSharing', icon: 'skill' },
+  { path: '/team-sharing', labelKey: 'nav.teamSharing', icon: 'language' },
   { path: '/reproduction-bundles', labelKey: 'nav.reproductionBundles', icon: 'archive' },
-  { path: '/knowledge', labelKey: 'nav.knowledge', icon: 'skill' },
-  { path: '/api-knowledge', labelKey: 'nav.apiKnowledge', icon: 'package' },
+  { path: '/knowledge', labelKey: 'nav.knowledge', icon: 'lightbulb' },
+  { path: '/api-knowledge', labelKey: 'nav.apiKnowledge', icon: 'terminal' },
   { path: '/health', labelKey: 'nav.health', icon: 'health' },
   { path: '/ohpm', labelKey: 'nav.ohpm', icon: 'apps' },
 ]
@@ -121,10 +121,43 @@ export default function App() {
   )
 }
 
+/**
+ * 路由级 fallback：chunk 到位前用页面形状的骨架占住版面。
+ *
+ * 刻意不 import ui/Skeleton——App.tsx 静态引入的任何组件都会把 ui/ 提进
+ * main index chunk（体积门禁红线）。这里手写的 shimmer 行与 Skeleton 共用
+ * index.css 的 .shimmer 底座，观感一致且零额外依赖。
+ */
 function PageFallback() {
+  const { t } = useTranslation()
   return (
-    <div className="flex h-full w-full items-center justify-center bg-[var(--bg-primary)] text-[var(--text-secondary)]">
-      <span className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--border)] border-t-[var(--accent)]" />
+    <div role="status" aria-label={t('common.loading')} className="w-full space-y-3">
+      <div aria-hidden="true" className="space-y-3">
+        <div className="shimmer h-5 w-40 rounded-sm bg-[var(--bg-hover)]" />
+        <div className="shimmer h-3 w-full rounded-sm bg-[var(--bg-hover)]" />
+        <div className="shimmer h-3 w-full rounded-sm bg-[var(--bg-hover)]" />
+        <div className="shimmer h-3 w-2/3 rounded-sm bg-[var(--bg-hover)]" />
+      </div>
+    </div>
+  )
+}
+
+function NotFound() {
+  const { t } = useTranslation()
+  const navigate = useNavigate()
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+      <Icon name="search" size={26} />
+      <p className="text-[length:var(--app-text-lg)] font-semibold">{t('common.pageNotFound')}</p>
+      <p className="max-w-sm text-[length:var(--app-text-sm)] leading-[var(--app-lh-sm)] text-[var(--text-secondary)]">
+        {t('common.pageNotFoundDesc')}
+      </p>
+      <button
+        onClick={() => navigate('/')}
+        className="btn-ghost mt-2 h-8 px-3 text-[length:var(--app-text-md)]"
+      >
+        {t('nav.workspace')}
+      </button>
     </div>
   )
 }
@@ -132,7 +165,9 @@ function PageFallback() {
 function AdminLayout() {
   const { t } = useTranslation()
   const navigate = useNavigate()
-  const [appVersion, setAppVersion] = useState('2.0.0')
+  // 兜底值必须是空串而不是一个写死的版本号：getVersion() 只在 Tauri 里可用，
+  // 失败时（浏览器 / IPC 未就绪）显示 "v2.0.0" 这种过期数字是在报错版本。
+  const [appVersion, setAppVersion] = useState('')
 
   useEffect(() => {
     let cancelled = false
@@ -149,15 +184,18 @@ function AdminLayout() {
   return (
     <div className="flex h-screen w-screen">
       <aside className="w-56 bg-[var(--bg-secondary)] border-r border-[var(--border)] flex flex-col">
-        <div className="p-4 border-b border-[var(--border)]">
+        <div className="shrink-0 border-b border-[var(--border)] p-4">
           <button onClick={() => navigate('/')} className="text-left">
             <h1 className="text-lg font-bold text-[var(--accent)]">DevEco Switch</h1>
-            <p className="text-xs text-[var(--text-secondary)] mt-1">
+            <p className="mt-1 text-[length:var(--app-text-xs)] text-[var(--text-secondary)]">
               {t('nav.workspace')} →
             </p>
           </button>
         </div>
-        <nav className="flex-1 p-2 space-y-1">
+        {/* min-h-0 不可省：flex 子项的 min-height 默认 auto，15 个导航项会把 nav
+            撑到内容高度，footer 直接被顶出视口（657px 高的窗口下版本号 / 通知 /
+            语言 / 主题四个控件全都点不到）。滚动只能发生在列表内部。 */}
+        <nav className="min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
           {navItems.map((item) => (
             <NavLink
               key={item.path}
@@ -177,9 +215,14 @@ function AdminLayout() {
             </NavLink>
           ))}
         </nav>
-        <div className="p-4 border-t border-[var(--border)] flex items-center justify-between">
-          <span className="text-xs text-[var(--text-secondary)]">v{appVersion}</span>
-          <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center justify-between border-t border-[var(--border)] p-4">
+          {appVersion && (
+            <span className="text-[length:var(--app-text-xs)] text-[var(--text-secondary)] tnum">
+              v{appVersion}
+            </span>
+          )}
+          {/* ml-auto 而不是靠 justify-between：版本号缺席时按钮组仍贴右，不产生位移 */}
+          <div className="ml-auto flex items-center gap-1">
             <NotificationBell />
             <LangToggle />
             <ThemeToggle />
@@ -205,6 +248,7 @@ function AdminLayout() {
             <Route path="/api-knowledge" element={<ApiKnowledgePage />} />
             <Route path="/health" element={<HealthPage />} />
             <Route path="/ohpm" element={<OhpmPage />} />
+            <Route path="*" element={<NotFound />} />
           </Routes>
         </Suspense>
       </main>
@@ -213,22 +257,20 @@ function AdminLayout() {
 }
 
 function ThemeToggle() {
+  const { t } = useTranslation()
   const { resolved, toggle } = useThemeStore()
+  // 图标指向点击后会切换到的目标主题：深色下是太阳，浅色下是月亮
+  const label = resolved === 'dark' ? t('common.themeLight') : t('common.themeDark')
   return (
     <button
       onClick={toggle}
-      className="p-1.5 rounded hover:bg-[var(--bg-card)] transition-colors"
-      title={resolved === 'dark' ? 'Light mode' : 'Dark mode'}
+      title={label}
+      aria-label={label}
+      // 不写 transition-colors：index.css 的无层控件过渡规则已给所有 button
+      // 统一挂上 120ms 过渡，该 utility 在这类元素上优先级更低，写了也不生效
+      className="rounded p-1.5 hover:bg-[var(--bg-card)]"
     >
-      {resolved === 'dark' ? (
-        <svg width="16" height="16" viewBox="0 -960 960 960" fill="currentColor">
-          <path d="M480-360q50 0 85-35t35-85q0-50-35-85t-85-35q-50 0-85 35t-35 85q0 50 35 85t85 35Zm0 80q-83 0-141.5-58.5T280-480q0-83 58.5-141.5T480-680q83 0 141.5 58.5T680-480q0 83-58.5 141.5T480-280ZM200-440H40v-80h160v80Zm720 0H760v-80h160v80ZM440-760v-160h80v160h-80Zm0 720v-160h80v160h-80ZM256-650l-101-97 57-59 96 100-52 56Zm492 496-97-101 53-55 101 97-57 59Zm-98-550 97-101 59 57-100 96-56-52ZM154-212l101-97 55 53-97 101-59-57Zm326-268Z"/>
-        </svg>
-      ) : (
-        <svg width="16" height="16" viewBox="0 -960 960 960" fill="currentColor">
-          <path d="M480-120q-150 0-255-105T120-480q0-150 105-255t255-105q14 0 27.5 1t26.5 3q-41 29-65.5 75.5T444-660q0 90 63 153t153 63q55 0 101-24.5t75-65.5q2 13 3 26.5t1 27.5q0 150-105 255T480-120Zm0-80q88 0 158-48.5T740-375q-20 5-40 8t-40 3q-123 0-209.5-86.5T364-660q0-20 3-40t8-40q-78 32-126.5 102T200-480q0 116 82 198t198 82Zm-10-270Z"/>
-        </svg>
-      )}
+      <Icon name={resolved === 'dark' ? 'sun' : 'moon'} size={16} />
     </button>
   )
 }

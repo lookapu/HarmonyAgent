@@ -250,6 +250,30 @@ fn read_tail(p: &Path, max_chars: usize) -> String {
     }
 }
 
+async fn append_command_changes(
+    out: String,
+    roots: &[String],
+    cmd_start: std::time::SystemTime,
+) -> String {
+    let roots_owned = roots.to_vec();
+    let changed = tokio::task::spawn_blocking(move || {
+        scan_recent_changes(&roots_owned, cmd_start, 200)
+    })
+    .await
+    .unwrap_or_default();
+    if changed.is_empty() {
+        return out;
+    }
+    let shown: Vec<&str> = changed.iter().take(15).map(String::as_str).collect();
+    let extra = if changed.len() > 15 { "…" } else { "" };
+    record_cmd_changes(&changed);
+    format!(
+        "{out}\n\n（命令间接修改/创建了 {} 个文件：{}{extra}）",
+        changed.len(),
+        shown.join(", ")
+    )
+}
+
 pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
     if roots.is_empty() {
         return Err("当前会话未绑定项目目录，无法执行命令".into());
@@ -259,11 +283,13 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
     let command = spec.command.as_str();
     let timeout = spec.timeout;
     let cwd: &Path = &spec.cwd;
+    let sandbox_config = crate::agent::sandbox::sandbox_config_from_env()?;
     // 全局并发护栏：与构建/部署互斥，避免并发写 build 目录
     let _gate = crate::services::tool_limits::acquire_workspace_gate(cwd).await;
     // 后台模式：解析为 (program, args) 后交给 jobs 托管进程生命周期，立即返回 job_id；
     // 任务完成时结果注入会话队列（模型下一轮请求自动看到），并可 job_output/job_kill 管理
     if spec.run_in_background {
+        crate::agent::sandbox::validate_background_execution(&sandbox_config)?;
         // 注：后台任务暂不注入环境变量（jobs 模块无 env 支持），.bat 经 cmd /C 执行即可
         let (program, args, _envs) = if needs_shell(command) {
             #[cfg(windows)]
@@ -287,14 +313,85 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
             cwd.display()
         ));
     }
-    // 间接修改追踪：记录命令开始时间，执行后扫描工作区内变更文件（排除构建产物目录）
+    // 三种执行目标共用同一个变化窗口，避免隔离分支提前返回后丢失修改证据。
     let cmd_start = std::time::SystemTime::now();
+    // 平台原生沙箱仅在显式 HARMONY_SANDBOX_BACKEND=native 时启用；不可用时失败关闭。
+    if sandbox_config.native {
+        let backend = crate::agent::sandbox::NativeBackend::current()?;
+        let command_vec = if cfg!(windows) {
+            vec!["cmd".to_string(), "/C".to_string(), command.to_string()]
+        } else {
+            vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()]
+        };
+        let native_spec = crate::agent::sandbox::SandboxSpec::workspace_write(cwd.to_path_buf());
+        let execution_id = format!("run-{}", uuid::Uuid::new_v4());
+        let result = backend.run(&native_spec, &execution_id, &command_vec, ctx).await?;
+        return match result.status {
+            crate::agent::sandbox::SandboxRunStatus::Succeeded => {
+                let out = format!(
+                    "[sandbox:{}] {}{}",
+                    result.backend,
+                    result.stdout,
+                    if result.stderr.is_empty() { String::new() } else { format!("\n{}", result.stderr) }
+                );
+                Ok(append_command_changes(out, roots, cmd_start).await)
+            }
+            _ => Err(format!(
+                "[sandbox:{}] 命令失败（{:?}，exit={:?}）：{}",
+                result.backend,
+                result.status,
+                result.exit_code,
+                if result.stderr.is_empty() { &result.stdout } else { &result.stderr }
+            )),
+        };
+    }
+    // OCI 只在显式配置时执行；缺省仍宿主直跑（下方持续显示风险）。
+    if let Some(engine) = sandbox_config.backend {
+        let image = sandbox_config.image.as_deref().ok_or_else(|| {
+            "sandbox 镜像未配置：设置了 HARMONY_SANDBOX_BACKEND 但未设置 HARMONY_SANDBOX_IMAGE".to_string()
+        })?;
+        let probe = crate::agent::sandbox::OciBackend::new(engine).probe().await;
+        let target = crate::agent::sandbox::resolve_sandbox_target(&sandbox_config, &probe)?;
+        let crate::agent::sandbox::SandboxExecutionTarget::Oci(backend) = target else {
+            return Err("sandbox 路由内部错误：OCI 请求未解析为 OCI 目标".into());
+        };
+        let command_vec = if cfg!(windows) {
+            vec!["cmd".to_string(), "/C".to_string(), command.to_string()]
+        } else {
+            vec!["sh".to_string(), "-c".to_string(), command.to_string()]
+        };
+        let spec = crate::agent::sandbox::SandboxSpec::workspace_write(cwd.to_path_buf());
+        let execution_id = format!("run-{}", uuid::Uuid::new_v4());
+        let result = backend.run(&spec, &execution_id, image, &command_vec, ctx).await?;
+        return match result.status {
+            crate::agent::sandbox::SandboxRunStatus::Succeeded => {
+                let out = format!(
+                    "[sandbox:{}] {}{}",
+                    result.backend,
+                    result.stdout,
+                    if result.stderr.is_empty() { String::new() } else { format!("\n{}", result.stderr) }
+                );
+                Ok(append_command_changes(out, roots, cmd_start).await)
+            }
+            _ => Err(format!(
+                "[sandbox:{}] 命令失败（{:?}，exit={:?}）：{}",
+                result.backend,
+                result.status,
+                result.exit_code,
+                if result.stderr.is_empty() { &result.stdout } else { &result.stderr }
+            )),
+        };
+    }
     // shell 语法（&&、||、引号外的 | > < &）经系统 shell 执行（Windows: cmd /C；
     // macOS/Linux: sh -c），对齐 ChatGPT 式整条命令；
     // 引号内的 | 等不算（如 rg -n 'a|b' 的正则竖线），保持单程序直接执行
     // 流式执行：stdout/stderr 逐行推送 agent:log（工具卡片/终端面板实时可见），
     // 同时支持“停止当前工具”中断；结果解析保持 run_cmd 语义（退出码/截断/建议）
-    let result = if needs_shell(command) {
+    // 宿主直跑的资源限制是显式配置（默认不限制，避免打断正常构建）；
+    // 配置了就如实回报施加情况，配置写错则失败关闭而不是静默不限制。
+    let host_limits = crate::agent::native_limits::host_direct_limits_from_env()
+        .map_err(|error| format!("宿主直跑资源限制配置无效：{error}"))?;
+    let (result, limits_report) = if needs_shell(command) {
         #[cfg(windows)]
         let shell_prog = "cmd";
         #[cfg(windows)]
@@ -304,44 +401,49 @@ pub(super) async fn run_command(args: &Value, roots: &[String], ctx: &crate::age
         #[cfg(not(windows))]
         let shell_args = vec!["-c".to_string(), command.to_string()];
         let envs = deveco_node_env();
-        crate::agent::exec_ctx::run_cmd_streaming_env(
-            ctx, shell_prog, &shell_args, Some(cwd), timeout, None, envs.as_deref(),
+        let outcome = crate::agent::exec_ctx::run_cmd_streaming_env_with_native_limits(
+            ctx, shell_prog, &shell_args, Some(cwd), timeout, envs.as_deref(), &host_limits,
         )
-        .await
-        .and_then(|o| cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or("")))
-        .map_err(|e| with_advice("run_command", e))
+        .await;
+        let report = outcome.as_ref().map(|(_, _, report)| report.clone()).unwrap_or_default();
+        (
+            outcome
+                .and_then(|(o, _truncated, _)| {
+                    cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or(""))
+                })
+                .map_err(|e| with_advice("run_command", e)),
+            report,
+        )
     } else {
         // 工程内脚本（如 hvigorw.bat）优先本地路径解析；.bat/.cmd 经 cmd /C 执行（见 resolve_program）
         let (program, full_args, envs) = resolve_program(command, cwd);
-        crate::agent::exec_ctx::run_cmd_streaming_env(
-            ctx, &program, &full_args, Some(cwd), timeout, None, envs.as_deref(),
+        let outcome = crate::agent::exec_ctx::run_cmd_streaming_env_with_native_limits(
+            ctx, &program, &full_args, Some(cwd), timeout, envs.as_deref(), &host_limits,
         )
-        .await
-        .and_then(|o| cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or("")))
-        .map_err(|e| with_advice("run_command", e))
+        .await;
+        let report = outcome.as_ref().map(|(_, _, report)| report.clone()).unwrap_or_default();
+        (
+            outcome
+                .and_then(|(o, _truncated, _)| {
+                    cmd_output_text(&o, 30000, roots.first().map(String::as_str).unwrap_or(""))
+                })
+                .map_err(|e| with_advice("run_command", e)),
+            report,
+        )
     };
     match result {
         Ok(out) => {
-            // 扫描命令间接修改/创建的文件（写文件类命令也受文件列表追踪，与 edit_file/write_file 一致）。
-            // 全项目递归遍历在 spawn_blocking 中执行，避免钉死 tokio worker。
-            let roots_owned = roots.to_vec();
-            let changed = tokio::task::spawn_blocking(move || {
-                scan_recent_changes(&roots_owned, cmd_start, 200)
-            })
-            .await
-            .unwrap_or_default();
-            if changed.is_empty() {
-                Ok(out)
-            } else {
-                let shown: Vec<&str> = changed.iter().take(15).map(String::as_str).collect();
-                let extra = if changed.len() > 15 { "…" } else { "" };
-                record_cmd_changes(&changed);
-                Ok(format!(
-                    "{out}\n\n（命令间接修改/创建了 {} 个文件：{}{extra}）",
-                    changed.len(),
-                    shown.join(", ")
-                ))
+            // 宿主直跑持续显示风险（路线 5.2.3）：命令未受沙箱隔离。
+            let mut prefix = format!("⚠️ {}", crate::agent::sandbox::host_direct_risk_note());
+            // 配置了限额才追加一行：让模型/用户看到这次到底限了什么、哪些没生效
+            if !limits_report.is_empty() {
+                prefix.push_str(&format!(
+                    "\n宿主直跑资源限制：{}（未施加项同样列出，见 platform_gaps 说明）",
+                    limits_report.summary()
+                ));
             }
+            let out = format!("{prefix}\n{out}");
+            Ok(append_command_changes(out, roots, cmd_start).await)
         }
         Err(e) => Err(enrich_run_error(e, command, cwd)),
     }
@@ -616,12 +718,49 @@ pub(super) fn utf16_lossy(bytes: &[u8], little: bool) -> String {
 /// multi_edit：一次调用批量修改多个文件（逐项独立执行，失败不影响后续项，返回逐项汇总）
 // ---------- 真机性能采样 ----------
 /// device_perf：真机性能快照（CPU/内存/电量/温度），供卡顿/资源占用分析
-pub(super) async fn device_perf(args: &Value) -> Result<String, String> {
+pub(super) async fn device_perf(
+    args: &Value,
+    ctx: &crate::agent::exec_ctx::ToolCtx,
+) -> Result<String, String> {
     let device = match args["device"].as_str() {
         Some(d) => d.to_string(),
-        None => default_device_id().await?,
+        None => default_device_id(ctx).await?,
     };
-    let perf = crate::commands::devices::get_device_perf(device.clone()).await?;
+    let cpu = sample_cpu(&device, ctx).await.unwrap_or(-1.0);
+    let mem = sample_sys_mem(&device, ctx).await.unwrap_or(-1.0);
+    let battery_query = crate::agent::capability_broker::HostCapability::DeviceReadQuery {
+        device: device.clone(),
+        argv: vec![
+            "hidumper".into(),
+            "-s".into(),
+            "BatteryService".into(),
+            "-a".into(),
+            "-i".into(),
+        ],
+    };
+    let battery_raw = crate::agent::capability_broker::execute_host_capability(
+        &battery_query,
+        None,
+        ctx,
+    )
+    .await
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| smart_decode(&output.stdout) + &smart_decode(&output.stderr))
+    .unwrap_or_default();
+    let read_metric = |key: &str| {
+        battery_raw.lines().find_map(|line| {
+            let (name, value) = line.trim().split_once(':')?;
+            (name.trim() == key)
+                .then(|| value.trim().parse::<f64>().ok())
+                .flatten()
+        })
+    };
+    let battery = read_metric("capacity").unwrap_or(-1.0);
+    let temp = read_metric("temperature")
+        .map(|value| value / 10.0)
+        .unwrap_or(-1.0);
+    let ts = chrono::Utc::now().timestamp_millis();
     let fmt = |v: f64, unit: &str| {
         if v < 0.0 {
             "不可用".to_string()
@@ -629,15 +768,15 @@ pub(super) async fn device_perf(args: &Value) -> Result<String, String> {
             format!("{v:.1}{unit}")
         }
     };
-    let time = chrono::DateTime::from_timestamp_millis(perf.ts)
+    let time = chrono::DateTime::from_timestamp_millis(ts)
         .map(|t| t.format("%H:%M:%S").to_string())
         .unwrap_or_default();
     Ok(format!(
         "设备 {device} 性能快照（{time}）：\nCPU 占用：{}\n内存占用：{}\n电池电量：{}\n温度：{}",
-        fmt(perf.cpu, "%"),
-        fmt(perf.mem, "%"),
-        fmt(perf.battery, "%"),
-        fmt(perf.temp, "℃")
+        fmt(cpu, "%"),
+        fmt(mem, "%"),
+        fmt(battery, "%"),
+        fmt(temp, "℃")
     ))
 }
 

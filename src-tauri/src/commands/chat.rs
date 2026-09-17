@@ -9,14 +9,26 @@ use uuid::Uuid;
 
 use crate::db::models::{ChatMessage, McpServer, TaskRun};
 use crate::db::DbState;
-use crate::services::{model_router, tool_limits};
+use crate::services::tool_limits;
 use crate::utils::errors::{
     classify_text, parse_retry_after_secs, provider_error_with_retry_after, transport_error, ErrorKind,
     FriendlyError,
 };
-use crate::utils::retry::{retry_with_backoff, STREAM_REQUEST_POLICY, TOOL_POLICY};
+use crate::utils::retry::{STREAM_REQUEST_POLICY, TOOL_POLICY};
 use crate::utils::task_registry::{TaskRegistry, PHASE_MAIN_LOOP, PHASE_ROUND_REQUEST, PHASE_SEND, PHASE_START, PHASE_STREAMING, PHASE_TOOL};
+use crate::agent::agent_kernel::{
+    KernelStreamGovernor, KernelStreamSignal, KERNEL_STREAM_MAX_BYTES,
+    KERNEL_STREAM_REASONING_GRACE, KERNEL_STREAM_SILENT_TIMEOUT,
+    run_tool_with_retry, retry_notice,
+};
+use crate::agent::kernel_executor::{
+    KernelExecutorFinalization, KernelExecutorLimits, KernelIoRunLoop, KernelRunPermit,
+};
+use crate::agent::kernel_loop::KernelRoundInput;
+use crate::agent::kernel_history::{KernelHistoryAssembler, KernelHistoryInput, HistoryRow, ToolResult, UserInjection};
+use crate::agent::kernel_history::{dynamic_history_limit, estimate_tokens};
 use crate::agent::tools::guards::is_cancelled;
+use crate::agent::tools::{has_pending_action_phrase, parse_data_url};
 
 /// 流式增量事件（每收到一个 delta 推送一次）
 #[derive(Clone, Serialize)]
@@ -346,6 +358,8 @@ pub struct ChatToolApprovalEvent {
     pub args: String,
     pub level: String,
     pub desc: String,
+    /// 影响契约：改什么、能不能撤销、影响到哪里。未覆盖的工具为 None，弹窗保持原样。
+    pub impact: Option<crate::agent::impact::ImpactContract>,
 }
 
 /// 回复工具权限审核结果（前端确认弹窗调用）
@@ -395,6 +409,17 @@ pub fn resolve_tool_approval(
                 "scope": scope,
             }),
         )?;
+        // 审批决议写入统一审计链（session_events），与沙箱升级/工具调用同源可回放，
+        // 后续可进入 eval trajectory 作为审批证据。
+        if let Ok(conn) = db.0.lock() {
+            let _ = crate::agent::session_events::append_event(
+                &conn,
+                &conv,
+                crate::agent::session_events::SessionEventType::ToolApproval,
+                serde_json::json!({ "tool": tool, "approved": approved, "remember": remember, "scope": scope }),
+                None,
+            );
+        }
         let _ = tx.send((approved, feedback));
     }
     Ok(())
@@ -450,6 +475,8 @@ pub struct PlanReview {
     pub approved: bool,
     /// 用户的修改意见/补充要求（驳回时可能附带）
     pub feedback: String,
+    /// 用户编辑后的最终计划；None 表示沿用模型草案。
+    pub revised_plan: Option<String>,
     /// 用户在审查等待期间主动停止生成（任务应终止，而非带反馈重新规划）
     pub cancelled: bool,
 }
@@ -545,6 +572,7 @@ async fn request_plan_review(
                         Ok(PlanReview {
                             approved: false,
                             feedback: "计划确认通道已关闭".to_string(),
+                            revised_plan: None,
                             cancelled: false,
                         })
                     },
@@ -560,6 +588,7 @@ async fn request_plan_review(
                 return Ok(PlanReview {
                     approved: false,
                     feedback: "计划确认超时，已暂停执行".to_string(),
+                    revised_plan: None,
                     cancelled: false,
                 });
             }
@@ -574,6 +603,7 @@ async fn request_plan_review(
                     return Ok(PlanReview {
                         approved: false,
                         feedback: "用户已停止生成".to_string(),
+                        revised_plan: None,
                         cancelled: true,
                     });
                 }
@@ -589,22 +619,52 @@ pub fn resolve_plan_review(
     request_id: String,
     approved: bool,
     feedback: Option<String>,
+    revised_plan: Option<String>,
     state: State<'_, PlanApprovalState>,
 ) -> Result<(), String> {
     let mut map = state.0.lock().map_err(|e| e.to_string())?;
+    if !map.get(&request_id).is_some_and(|req| req.conversation_id == conversation_id) {
+        return Err("计划审批请求不存在或不属于该会话".into());
+    }
     if let Some(req) = map.remove(&request_id) {
+        let revised_plan = revised_plan
+            .map(|plan| plan.trim().chars().take(40_000).collect::<String>())
+            .filter(|plan| !plan.is_empty());
         crate::agent::interactions::finish(
             &request_id,
             if approved { "approved" } else { "rejected" },
-            serde_json::json!({ "approved": approved, "feedback": feedback }),
+            serde_json::json!({ "approved": approved, "feedback": feedback, "revised_plan": revised_plan }),
         )?;
         let _ = req.tx.send(PlanReview {
             approved,
             feedback: feedback.unwrap_or_default(),
+            revised_plan,
             cancelled: false,
         });
     }
-    let _ = conversation_id;
+    Ok(())
+}
+
+/// 将最终批准计划绑定到 Durable Run，并投影成可继承的执行步骤。
+fn activate_approved_plan(
+    app: &AppHandle,
+    state: &tauri::State<'_, DbState>,
+    conversation_id: &str,
+    run_id: &str,
+    plan: &str,
+) -> Result<(), String> {
+    let todos = crate::agent::todo::from_markdown_plan(plan);
+    if !todos.is_empty() {
+        crate::agent::todo::replace(conversation_id, todos.clone());
+        let _ = app.emit("agent:todo", crate::agent::todo::TodoEvent {
+            conversation_id: conversation_id.to_string(), todos: todos.clone(),
+        });
+    }
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    crate::agent::runtime::set_approved_plan(&conn, run_id, conversation_id, plan)?;
+    if !todos.is_empty() {
+        crate::agent::coordinator::sync_todos(&conn, run_id, conversation_id, &todos)?;
+    }
     Ok(())
 }
 
@@ -650,6 +710,8 @@ pub struct PendingConfirmation {
     pub args: Option<String>,
     pub level: Option<String>,
     pub desc: Option<String>,
+    /// 影响契约（审批类待确认项）：让前台会话恢复后与弹窗口径一致
+    pub impact: Option<crate::agent::impact::ImpactContract>,
     pub plan: Option<String>,
     pub question: Option<String>,
     pub options: Option<Vec<String>>,
@@ -693,6 +755,10 @@ pub fn list_pending_confirmations(
                     args: Some(args.clone()),
                     level: Some(crate::services::permissions::tool_level(tool).as_str().to_string()),
                     desc: Some(crate::agent::tools::tool_short_desc(tool).to_string()),
+                    // 用与弹窗同一套口径重算（此处 args 已脱敏，目标值同样脱敏，不引入新信息）
+                    impact: serde_json::from_str::<serde_json::Value>(args)
+                        .ok()
+                        .and_then(|value| crate::agent::impact::describe(tool, &value)),
                     plan: None,
                     question: None,
                     options: None,
@@ -714,6 +780,7 @@ pub fn list_pending_confirmations(
                     args: None,
                     level: None,
                     desc: None,
+                    impact: None,
                     plan: Some(req.plan.clone()),
                     question: None,
                     options: None,
@@ -733,6 +800,7 @@ pub fn list_pending_confirmations(
                 args: None,
                 level: None,
                 desc: None,
+                impact: None,
                 plan: None,
                 question: Some(ev.question),
                 options: Some(ev.options),
@@ -836,6 +904,34 @@ impl From<ChatFlowError> for String {
     }
 }
 
+fn persist_desktop_executor_checkpoint(
+    state: &tauri::State<'_, DbState>,
+    run_id: &str,
+    conversation_id: &str,
+    checkpoint: crate::agent::kernel_executor::KernelExecutorCheckpoint,
+    safe_point: crate::agent::kernel_executor::KernelCheckpointSafePoint,
+    placeholder_message_id: Option<&str>,
+    effective_tool_rounds: usize,
+    budget_extensions: usize,
+) -> Result<(), ChatFlowError> {
+    let conn = state.0.lock().map_err(|error| error.to_string())?;
+    let control = crate::agent::runtime::DesktopAdapterCheckpointControl {
+        schema_version: crate::agent::runtime::DESKTOP_ADAPTER_CONTROL_VERSION,
+        effective_tool_rounds,
+        budget_extensions,
+    };
+    crate::agent::runtime::append_desktop_executor_checkpoint(
+        &conn,
+        run_id,
+        conversation_id,
+        checkpoint,
+        safe_point,
+        placeholder_message_id,
+        Some(&control),
+    )?;
+    Ok(())
+}
+
 /// 单次任务运行统计（供 task_runs 记录：耗时/重试/工具轮次/token 用量）
 #[derive(Default)]
 struct ChatRunStats {
@@ -862,6 +958,29 @@ struct ToolRunItem {
     succeeded: bool,
     /// 是否已即时入库（persist_tool_run_immediate 落库后置 true）
     persisted: bool,
+}
+
+fn combined_acceptance_evidence<'a>(
+    inherited: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
+    current: &'a [ToolRunItem],
+) -> Vec<crate::agent::acceptance::ToolEvidence<'a>> {
+    inherited
+        .iter()
+        .map(|item| crate::agent::acceptance::ToolEvidence {
+            tool: &item.tool_name,
+            args: &item.input_json,
+            output: &item.result_json,
+            succeeded: item.status == "ok",
+        })
+        .chain(current.iter().map(|item| {
+            crate::agent::acceptance::ToolEvidence {
+                tool: &item.tool,
+                args: &item.args,
+                output: &item.output,
+                succeeded: item.succeeded,
+            }
+        }))
+        .collect()
 }
 
 /// 任务账本（Ledger 协议）：任务执行状态外部化——目标/已验证/待解决/下一步 四段式，
@@ -1204,26 +1323,8 @@ pub fn restore_snapshot(
 /// 主动压缩/上下文超限时自动减半，直到 MIN_HISTORY_KEEP 下限。
 /// 上下文超限自动裁剪时的历史保留下限（少于该条数不再裁剪，直接报错）
 const MIN_HISTORY_KEEP: usize = 10;
-/// 输出截断续写次数上限：模型被 max_tokens 截断后自动追加“请继续”续写，防无限啰嗦
-const MAX_CONTINUATION_ROUNDS: usize = 8;
-/// 空响应重试上限：模型连续多轮输出为空（服务端静默失败/异常截断）时最多重试
-/// 两次即收尾提示，防止进入无限空轮循环导致界面长时间无输出看起来卡死
-const MAX_EMPTY_ROUNDS: usize = 2;
-/// 流式无产出静默超时：连接保持但长时间解析不到有效内容（服务端只发心跳/空数据行、
-/// 模型卡住不吐字）时视为中断，保留已收内容触发自动续写（与截断续写机制同链路）；
-/// 续写轮模型无需重新思考，60 秒足够判定；过长会让“不吐字”的感知持续更久。
-/// 注意：仅“无有效产出”触发——大输出/长响应解析期间产出持续刷新不会触发，
-/// 数据仍到达但无产出由独立看门狗以数据停滞判据兜底。
-const STREAM_SILENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// 连接中断自动续写次数上限：网络问题重试 3 次无意义（多为本地代理/网络故障），
-/// 超过后收尾并明确提示，避免无限续写空转
-const MAX_INTERRUPT_RETRY_ROUNDS: usize = 3;
-/// 产出前中断重放次数上限：流在输出任何内容前即中断（服务端断流/代理重置）时，
-/// 用冻结请求原样重发（对齐 DeepSeek-Reasonix 冻结请求重放机制：模型无需重新思考、
-/// prompt 缓存不失效）；连续 5 次 0 产出中断多为本地网络故障，超过后走下方续写收尾
-const MAX_STREAM_REPLAYS: usize = 5;
-/// 累计响应字节上限（仅异常无限流兜底；正常任务百倍裕量）
-const STREAM_MAX_BYTES: usize = 256 * 1024 * 1024;
+// 流式无产出静默超时、reasoning-only 宽限与累计响应字节上限已迁入共用
+// `agent_kernel::KERNEL_STREAM_*` 常量与 `KernelStreamGovernor`（与 headless 同一状态机）。
 /// 单行字节上限（覆盖超大 JSON 工具参数；超限行跳过解析防烧 CPU）
 const STREAM_MAX_LINE: usize = 4 * 1024 * 1024;
 /// 每批最大处理行数（批间让出执行权/检查预算）
@@ -1244,25 +1345,6 @@ const STREAM_DELIVER_MAX_WAITS: u32 = 25;
 /// 推送会导致前端思考区每行重渲染 + 后端 IPC 堆积（实测 4096 条事件 renderer 烧满核），
 /// 合并后事件量降两个数量级；块边界强制 flush 保证正常流显示延迟 <100ms
 const STREAM_REASONING_MERGE_BYTES: usize = 2048;
-/// reasoning-only 护栏：纯思考流（无正文产出）最长允许时长。正常深度思考 <3 分钟；
-/// 超过视为病态（模型只吐思考不吐正文，停滞线被 Reasoning 持续刷新而永不触发），
-/// 中断后由自动续写接管。正文 Delta 出现后按正常停滞线继续
-const REASONING_ONLY_GRACE_SECS: u64 = 180;
-/// 工具循环检测阈值（对齐 qwen-code LoopDetectionService 轻量版）：
-/// - 连续相同调用（同工具名+同参数）达到该次数即判定打转——重复调用必得相同结果，
-///   低于 DashScope 服务端 "Repetitive tool calls detected" 阈值，客户端先断循环防服务端 400；
-/// - 连续同名调用（不管参数）达到该次数判定参数抖动循环（模型反复调同一工具换参数试探）；
-/// - 每轮工具调用总数：软上限（仅停滞信号时生效）/ 硬上限（无条件中止，防参数变化逃逸检测）
-const TOOL_CALL_LOOP_THRESHOLD: usize = 5;
-const TOOL_NAME_STAGNATION_THRESHOLD: usize = 8;
-const MAX_TOOL_CALLS_PER_TURN: usize = 100;
-const MAX_TOOL_CALLS_HARD: usize = 1000;
-/// 循环检测命中后注入纠正提示的轮数上限：模型收到提示仍循环时最多打断两次，
-/// 之后直接收尾（防“纠正-循环-再纠正”空转）
-const MAX_LOOP_BREAKS: usize = 2;
-/// “叙述式假调用”纠正次数上限：模型在正文里写“已调用工具”却不输出标记时，
-/// 自动注入纠正提示继续（历史格式污染导致模型模仿，纠正后重走标记协议）
-const MAX_FAKE_CALL_CORRECTIONS: usize = 3;
 /// “未完话术”纠正次数上限：模型承诺“还需读取/继续查看”等下一步动作但未输出工具标记时，
 /// 自动注入纠正提示继续（任务实际未完成却正常收尾，纠正后要求立即输出标记或总结）
 const MAX_PENDING_ACTION_CORRECTIONS: usize = 5;
@@ -1294,6 +1376,7 @@ pub fn stop_chat(
     conversation_id: String,
     cancel: State<'_, ChatCancel>,
     registry: State<'_, TaskRegistry>,
+    db: State<'_, DbState>,
 ) -> Result<(), String> {
     // 停止请求打点：配合 stop_effective 日志，可确认“点停止 → 后端收到 → 哪个阶段生效”
     crate::utils::logger::log_event(
@@ -1313,16 +1396,29 @@ pub fn stop_chat(
     // 记录停止请求时间：看门狗据此判断协作停止是否失效（宽限期内未消费则强杀任务）
     registry.mark_stop_requested(&conversation_id);
     crate::agent::ask::cancel_conversation(&conversation_id);
-    crate::agent::exec_ctx::request_stop_tool(&conversation_id);
+    drop(set);
+    crate::agent::broker_approval::stop_and_revoke(&db, &conversation_id, crate::agent::broker_approval::StopReason::User)?;
     Ok(())
 }
 
 /// 停止当前正在执行的工具（不终止整个任务）：中断标志被长任务命令执行器轮询消费，
 /// 强杀子进程后把“用户已停止当前工具”反馈给模型，模型继续生成结论。
 #[tauri::command]
-pub fn stop_tool(conversation_id: String) -> Result<(), String> {
-    crate::agent::exec_ctx::request_stop_tool(&conversation_id);
+pub fn stop_tool(conversation_id: String, db: State<'_, DbState>) -> Result<(), String> {
+    crate::agent::broker_approval::stop_and_revoke(&db, &conversation_id, crate::agent::broker_approval::StopReason::User)?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn revoke_ota_approval(call_id: String, db: State<'_, DbState>) -> Result<(), String> {
+    let conn = db.0.try_lock().map_err(|_| "审批数据库忙，请稍后重试撤销")?;
+    crate::agent::broker_approval::revoke_call(&conn, &call_id)
+}
+
+#[tauri::command]
+pub fn get_ota_approval_revoked(call_id: String, db: State<'_, DbState>) -> Result<bool, String> {
+    let conn = db.0.try_lock().map_err(|_| "审批数据库忙，无法读取撤销状态")?;
+    crate::agent::broker_approval::is_revoked(&conn, &call_id)
 }
 
 /// 取最早一条排队消息并标记为已消费（queued=0），返回 (id, content)。
@@ -1605,6 +1701,115 @@ struct ModelChoice {
     output_limit: u32,
 }
 
+/// 按 provider id 加载 ProviderEndpoint（含 keyring key 与多协议端点）。
+fn load_provider_endpoint(
+    conn: &rusqlite::Connection,
+    provider_id: &str,
+) -> Option<ProviderEndpoint> {
+    let row = conn
+        .query_row(
+            "SELECT base_url, api_key, protocol, endpoints_json FROM providers WHERE id = ?1",
+            [provider_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .ok()?;
+    let endpoints: Vec<crate::db::models::EndpointDef> =
+        serde_json::from_str(&row.3).unwrap_or_default();
+    let mut ep = ProviderEndpoint {
+        provider_id: provider_id.to_string(),
+        base_url: row.0,
+        api_key: row.1,
+        protocol: row.2,
+        endpoints,
+    };
+    if let Ok(k) = crate::services::key_store::load_provider_key(conn, &ep.provider_id) {
+        ep.api_key = k;
+    }
+    Some(ep)
+}
+
+/// 按 (provider_id, model_id) 加载 ModelChoice（含代理开关与输出上限）。
+fn load_model_choice(
+    conn: &rusqlite::Connection,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<ModelChoice> {
+    let row = conn
+        .query_row(
+            "SELECT use_proxy, output_limit FROM models
+             WHERE provider_id = ?1 AND model_id = ?2 AND enabled = 1",
+            rusqlite::params![provider_id, model_id],
+            |r| Ok((r.get::<_, bool>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .ok()?;
+    Some(ModelChoice {
+        provider_id: provider_id.to_string(),
+        model: model_id.to_string(),
+        use_proxy: row.0,
+        output_limit: row.1.unwrap_or(8192) as u32,
+    })
+}
+
+/// 读取 auto 池的 provider id 列表。active provider 恒在池内（视为满足任意 min_mode）；
+/// 其余 provider 按 auto_pool_mode >= min_mode 过滤。
+/// - 主对话路由用 min_mode=1（仅主对话 / 主对话+杂活）
+/// - 辅助调用路由用 min_mode=2（仅主对话+杂活）
+fn auto_pool_ids(conn: &rusqlite::Connection, min_mode: i64) -> Vec<String> {
+    let mut ids: Vec<String> = conn
+        .prepare("SELECT id FROM providers WHERE is_active = 1")
+        .and_then(|mut s| {
+            let rows = s.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.flatten().collect::<Vec<String>>())
+        })
+        .unwrap_or_default();
+    let extra: Vec<String> = conn
+        .prepare("SELECT id FROM providers WHERE auto_pool_mode >= ?1 AND is_active = 0")
+        .and_then(|mut s| {
+            let rows = s.query_map([min_mode], |r| r.get::<_, String>(0))?;
+            Ok(rows.flatten().collect::<Vec<String>>())
+        })
+        .unwrap_or_default();
+    for id in extra {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// 为辅助调用（摘要/标题/子 Agent 杂活）在 auto 辅助池内解析经济模型。
+/// 命中且更便宜时返回 (端点, 模型)；否则 None（调用方沿用主模型）。
+fn resolve_aux_economy(
+    state: &tauri::State<'_, DbState>,
+    main_provider: &ProviderEndpoint,
+    main_choice: &ModelChoice,
+) -> Option<(ProviderEndpoint, ModelChoice)> {
+    let conn = state.0.lock().ok()?;
+    let pool = auto_pool_ids(&conn, 2);
+    let routed = crate::services::model_router::pick_economy_in_pool(
+        &conn,
+        &pool,
+        &main_provider.provider_id,
+        &main_choice.model,
+    )?;
+    if routed.provider_id == main_provider.provider_id {
+        let mut mc = main_choice.clone();
+        mc.model = routed.model_id;
+        Some((main_provider.clone(), mc))
+    } else {
+        let ep = load_provider_endpoint(&conn, &routed.provider_id)?;
+        let mc = load_model_choice(&conn, &routed.provider_id, &routed.model_id)?;
+        Some((ep, mc))
+    }
+}
+
 /// 对话级设置（来自对话框，随每次请求覆盖 Provider/模型默认值）
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct ChatOptions {
@@ -1692,6 +1897,82 @@ impl Drop for RegisteredChatTask {
     }
 }
 
+fn eligible_idle_semantic_root(
+    base_path: String,
+    worktree_path: Option<String>,
+    status: Option<String>,
+) -> Option<String> {
+    if status.as_deref() != Some("success") {
+        return None;
+    }
+    let root = worktree_path
+        .filter(|path| !path.trim().is_empty() && std::path::Path::new(path).is_dir())
+        .unwrap_or(base_path);
+    (!root.trim().is_empty() && std::path::Path::new(&root).is_dir()).then_some(root)
+}
+
+fn completed_conversation_root(app: &AppHandle, conversation_id: &str) -> Option<String> {
+    let state = app.state::<DbState>();
+    let conn = state.0.lock().ok()?;
+    let values = conn
+        .query_row(
+            "SELECT p.path, c.worktree_path,
+                    (SELECT status FROM task_runs
+                     WHERE conversation_id=c.id
+                     ORDER BY finished_at DESC, rowid DESC LIMIT 1)
+             FROM conversations c JOIN projects p ON p.id=c.project_id
+             WHERE c.id=?1",
+            [conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok()?;
+    eligible_idle_semantic_root(values.0, values.1, values.2)
+}
+
+#[cfg(test)]
+mod idle_semantic_schedule_tests {
+    use super::eligible_idle_semantic_root;
+
+    #[test]
+    fn only_successful_tasks_schedule_existing_worktree_or_base_root() {
+        let base = std::env::temp_dir().join(format!("deveco-idle-base-{}", uuid::Uuid::new_v4()));
+        let worktree =
+            std::env::temp_dir().join(format!("deveco-idle-worktree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        assert_eq!(
+            eligible_idle_semantic_root(
+                base.to_string_lossy().into_owned(),
+                Some(worktree.to_string_lossy().into_owned()),
+                Some("success".into()),
+            ),
+            Some(worktree.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            eligible_idle_semantic_root(
+                base.to_string_lossy().into_owned(),
+                Some(worktree.join("missing").to_string_lossy().into_owned()),
+                Some("success".into()),
+            ),
+            Some(base.to_string_lossy().into_owned())
+        );
+        assert!(eligible_idle_semantic_root(
+            base.to_string_lossy().into_owned(),
+            None,
+            Some("cancelled".into()),
+        )
+        .is_none());
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(worktree).ok();
+    }
+}
+
 #[tauri::command]
 pub async fn stream_chat(
     app: AppHandle,
@@ -1711,6 +1992,8 @@ pub async fn stream_chat(
     // 多模态图片（data URL，仅首次请求发送；落库时正文追加附图标记）
     images: Option<Vec<String>>,
 ) -> Result<(), String> {
+    // 任一前台消息到达都使旧后台语义批次在当前批结束后退出；新的空闲窗口由本任务收尾重建。
+    let foreground_generation = crate::agent::lsp_client::note_foreground_activity();
     // 任务监管壳：把任务主体 spawn 到 tokio（获得 AbortHandle 供看门狗强杀），
     // 注册心跳后等待收尾。State 在闭包内经 app.state() 重取（底层 'static 数据，
     // 跨线程可用），绕开命令参数借用生命周期；任务卡死/停止失效时看门狗 abort，
@@ -1780,7 +2063,18 @@ pub async fn stream_chat(
             );
         }
     }
+    let idle_root = matches!(&result, Ok(Ok(())))
+        .then(|| completed_conversation_root(&app, &conversation_id))
+        .flatten();
     registered.finish();
+    if let Some(root) = idle_root {
+        crate::agent::lsp_client::schedule_idle_semantic_indexing(
+            app.clone(),
+            vec![root],
+            conversation_id.clone(),
+            foreground_generation,
+        );
+    }
     match result {
         Ok(r) => r,
         Err(e) if e.is_cancelled() => {
@@ -2432,6 +2726,61 @@ fn build_rules_text(conn: &rusqlite::Connection, project_id: &str, project_path:
     s
 }
 
+/// 轮前：任务心跳打点（每轮循环顶部）。配合工具/请求/压缩日志，任何卡点都能从最后一条
+/// 心跳定位到所在阶段——此前卡在无超时请求内时日志静默，事后无法定位「空跑」位置。
+///
+/// 与 `refresh_workflow_stage` 同属桌面 IO port 迁移的纯搬运切片。
+fn log_task_heartbeat(
+    registry: &TaskRegistry,
+    conversation_id: &str,
+    task_started: std::time::Instant,
+    tool_runs: usize,
+    full_chars: usize,
+    history_limit: usize,
+) {
+    registry.touch(conversation_id, PHASE_MAIN_LOOP);
+    crate::utils::logger::log_event(
+        "task_heartbeat",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "elapsed_ms": task_started.elapsed().as_millis() as i64,
+            "tool_runs": tool_runs,
+            "full_chars": full_chars,
+            "history_limit": history_limit,
+        }),
+    );
+}
+
+/// 轮前：重算执行阶段快照；阶段相对上一轮变化时写 `workflow.stage` 审计事件。
+/// 返回本轮快照，供后续提示注入（`directive()`）使用。
+///
+/// 桌面 IO port 迁移的第一步（纯搬运，零逻辑改动）：从主循环内联代码搬出，行为一致；
+/// 仍接受 Tauri `State`，端口落地时再统一改签名。
+fn refresh_workflow_stage<'a>(
+    state: &tauri::State<'_, crate::db::DbState>,
+    trace_id: &str,
+    conversation_id: &str,
+    goal_contract: &crate::agent::acceptance::GoalContract,
+    inherited: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
+    tool_runs: &'a [ToolRunItem],
+    previous: Option<crate::agent::execution_loop::LoopStage>,
+) -> crate::agent::execution_loop::ExecutionLoopSnapshot {
+    let workflow_evidence = combined_acceptance_evidence(inherited, tool_runs);
+    let workflow = crate::agent::execution_loop::snapshot(goal_contract, &workflow_evidence);
+    if previous != Some(workflow.stage) {
+        if let Ok(conn) = state.0.lock() {
+            let _ = crate::agent::runtime::append_event(
+                &conn,
+                trace_id,
+                conversation_id,
+                "workflow.stage",
+                serde_json::to_value(&workflow).unwrap_or_default(),
+            );
+        }
+    }
+    workflow
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -2456,14 +2805,32 @@ async fn stream_chat_inner(
     let trace_id = Uuid::new_v4().to_string();
     stats.run_id = Some(trace_id.clone());
     registry.set_run_id(&conversation_id, &trace_id);
-    let recovery_plan = {
+    let (recovery_plan, mut recovery_adapter_snapshot) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
-        options
+        let plan = options
             .as_ref()
             .and_then(|opts| opts.resume_run_id.as_deref())
             .map(|parent| crate::agent::recovery::build_plan(&conn, &conversation_id, parent))
+            .transpose()?;
+        // 新子运行尚未落库前先严格验证父运行的组合 checkpoint。旧运行没有桌面
+        // checkpoint 时保持兼容；存在却损坏/漂移时失败关闭，避免半恢复。
+        let snapshot = plan
+            .as_ref()
+            .map(|plan| {
+                crate::agent::runtime::materialize_latest_desktop_checkpoint(
+                    &conn,
+                    &plan.parent_run_id,
+                    &conversation_id,
+                )
+            })
             .transpose()?
+            .flatten();
+        (plan, snapshot)
     };
+    let inherited_approved_plan = recovery_plan.as_ref().and_then(|plan| {
+        let conn = state.0.lock().ok()?;
+        crate::agent::runtime::get_run(&conn, &plan.parent_run_id).ok().flatten()?.approved_plan
+    });
     let (goal_contract, goal_diff) = if let Some(plan) = recovery_plan.as_ref() {
         let previous = plan.original_contract.clone()
             .unwrap_or_else(|| crate::agent::acceptance::GoalContract::compile(&plan.original_goal));
@@ -2471,6 +2838,19 @@ async fn stream_chat_inner(
         (contract, Some(diff))
     } else {
         (crate::agent::acceptance::GoalContract::compile(content.trim()), None)
+    };
+    // 只有契约完全未变化的续跑才接续父 executor。新增/替换/删除目标要求会开启新治理
+    // 状态，但仍保留父 checkpoint 的数据边界预检与恢复摘要。
+    let resume_parent_executor = recovery_adapter_snapshot.is_some()
+        && goal_diff.as_ref().is_some_and(|diff| !diff.changed);
+    let inherited_tool_evidence = if resume_parent_executor {
+        recovery_adapter_snapshot
+            .as_ref()
+            .zip(recovery_plan.as_ref())
+            .map(|(snapshot, plan)| snapshot.inheritable_tool_evidence(plan))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
     };
     let execution_budget = crate::agent::governance::ExecutionBudget::for_contract(
         &goal_contract,
@@ -2521,6 +2901,33 @@ async fn stream_chat_inner(
                     diff,
                 )?;
             }
+        }
+        if let Some(snapshot) = recovery_adapter_snapshot.as_ref() {
+            let cursor = &snapshot.checkpoint.cursor;
+            crate::agent::runtime::append_event(
+                &conn,
+                &trace_id,
+                &conversation_id,
+                "recovery.adapter_checkpoint_loaded",
+                serde_json::json!({
+                    "parent_run_id": recovery_plan.as_ref().map(|plan| plan.parent_run_id.as_str()),
+                    "safe_point": snapshot.checkpoint.safe_point.as_str(),
+                    "message_rowid": cursor.message_rowid,
+                    "visible_message_count": cursor.visible_message_count,
+                    "materialized_message_count": snapshot.messages.len(),
+                    "messages_truncated": snapshot.messages_truncated,
+                    "tool_run_rowid": cursor.tool_run_rowid,
+                    "tool_run_count": cursor.tool_run_count,
+                    "materialized_tool_run_count": snapshot.tool_runs.len(),
+                    "tool_runs_truncated": snapshot.tool_runs_truncated,
+                    "placeholder_message_id": cursor.placeholder_message_id,
+                    "effective_tool_rounds": snapshot.checkpoint.control.as_ref().map(|control| control.effective_tool_rounds),
+                    "budget_extensions": snapshot.checkpoint.control.as_ref().map(|control| control.budget_extensions),
+                    "executor_state_resumed": resume_parent_executor,
+                    "executor_reset_reason": if resume_parent_executor { serde_json::Value::Null } else { serde_json::json!("goal_changed") },
+                    "inherited_tool_evidence_count": inherited_tool_evidence.len(),
+                }),
+            )?;
         }
     }
     let _ = app.emit(
@@ -2910,7 +3317,94 @@ async fn stream_chat_inner(
 
     // 3. 选择 Provider 与模型（支持对话级指定模型）
     let opts = options.unwrap_or_default();
-    let (provider, model_choice, context_budget) = if let Some(model_id) = opts.model_id.clone() {
+    let (provider, model_choice, context_budget) = if opts.model_id.as_deref() == Some("auto") {
+        // auto 模式：锚点 = active provider 默认模型，候选 = auto 池（active + auto_pool_mode>=1）
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let anchor_id: String = conn
+            .query_row(
+                "SELECT id FROM providers WHERE is_active = 1 LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let anchor_ep = load_provider_endpoint(&conn, &anchor_id)
+            .ok_or_else(|| "激活 Provider 配置缺失".to_string())?;
+        let (default_model, default_use_proxy, default_ctx_opt, default_out_opt) = conn
+            .query_row(
+                "SELECT model_id, use_proxy, context_limit, output_limit FROM models
+                 WHERE provider_id = ?1 AND enabled = 1
+                 ORDER BY is_default DESC, created_at ASC LIMIT 1",
+                [&anchor_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, bool>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let default_ctx = default_ctx_opt.unwrap_or(200000);
+        let default_out = default_out_opt.unwrap_or(8192) as u32;
+
+        let pool = auto_pool_ids(&conn, 1);
+        let has_images = images.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let kind = crate::services::model_router::classify_task(&content, has_images, false);
+        let routed = crate::services::model_router::pick_model_for_task_in_pool(
+            &conn,
+            &pool,
+            &anchor_id,
+            &default_model,
+            kind,
+        );
+
+        let fallback = (
+            anchor_ep.clone(),
+            ModelChoice {
+                provider_id: anchor_id.clone(),
+                model: default_model.clone(),
+                use_proxy: default_use_proxy,
+                output_limit: default_out,
+            },
+            default_ctx,
+        );
+
+        match routed {
+            Some(r) => {
+                let ep_opt = if r.provider_id == anchor_id {
+                    Some(anchor_ep.clone())
+                } else {
+                    load_provider_endpoint(&conn, &r.provider_id)
+                };
+                match ep_opt {
+                    Some(ep) => {
+                        let mc = load_model_choice(&conn, &r.provider_id, &r.model_id)
+                            .unwrap_or(ModelChoice {
+                                provider_id: r.provider_id.clone(),
+                                model: r.model_id.clone(),
+                                use_proxy: default_use_proxy,
+                                output_limit: default_out,
+                            });
+                        let ctx: i64 = conn
+                            .query_row(
+                                "SELECT context_limit FROM models
+                                 WHERE provider_id = ?1 AND model_id = ?2",
+                                rusqlite::params![&r.provider_id, &r.model_id],
+                                |row| {
+                                    row.get::<_, Option<i64>>(0)
+                                        .map(|v| v.unwrap_or(default_ctx))
+                                },
+                            )
+                            .unwrap_or(default_ctx);
+                        (ep, mc, ctx)
+                    }
+                    None => fallback,
+                }
+            }
+            None => fallback,
+        }
+    } else if let Some(model_id) = opts.model_id.clone() {
         // 对话指定模型：跨 Provider 查询
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(
@@ -3060,11 +3554,13 @@ async fn stream_chat_inner(
     // 记住会话绑定的模型（models.id）：上下文可视条按会话模型查 context_limit，
     // 后续任务缺省沿用上次使用的模型（自动路由分支不写，保持默认路由）
     if let Some(ref mid) = opts.model_id {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
-        let _ = conn.execute(
-            "UPDATE conversations SET model_id = ?1 WHERE id = ?2",
-            params![mid, conversation_id],
-        );
+        if mid.as_str() != "auto" {
+            let conn = state.0.lock().map_err(|e| e.to_string())?;
+            let _ = conn.execute(
+                "UPDATE conversations SET model_id = ?1 WHERE id = ?2",
+                params![mid, conversation_id],
+            );
+        }
     }
     // 记录本次任务使用的 Provider / 模型（供任务级 Trace 聚合）
     stats.provider_id = Some(provider.provider_id.clone());
@@ -3820,6 +4316,9 @@ async fn stream_chat_inner(
         if let Some(plan) = recovery_plan.as_ref() {
             *p = format!("{p}\n\n{}", crate::agent::recovery::directive(plan));
         }
+        if let Some(snapshot) = recovery_adapter_snapshot.as_ref() {
+            *p = format!("{p}\n\n{}", snapshot.prompt_hint());
+        }
         *p = format!("{p}\n\n{}", goal_contract.directive());
         if plan_mode_enabled(&opts) {
             *p = format!(
@@ -3880,31 +4379,13 @@ async fn stream_chat_inner(
     let mut replan_given = false;
     let mut replan_instruction: Option<String> = None;
     // 输出截断续写状态：上轮输出被 max_tokens 截断时，下轮请求追加“请继续”指令（防无限续写有上限）
-    let mut continuation_rounds = 0;
-    let mut continuation_pending = false;
     // 截断续写时上轮“正文为空但思考非空”（推理模型 reasoning 耗尽预算被截断）：
     // 续写指令改为要求直接输出结论/工具调用，避免再次思考耗尽预算空转
     let mut continuation_reasoning_only = false;
-    // 空响应重试计数：模型输出为空（无正文无工具标记）时的重试次数
-    let mut empty_rounds = 0;
-    // 连接中断自动续写计数：流式中途无数据超时后的“请继续”重试次数（上限 MAX_INTERRUPT_RETRY_ROUNDS）
-    let mut interrupted_rounds = 0;
-    // 产出前中断重放计数：0 产出中断时冻结请求原样重发（上限 MAX_STREAM_REPLAYS）
-    let mut stream_replays = 0;
-    // 工具循环检测状态（对齐 qwen-code LoopDetectionService 轻量版）：
-    // 连续相同调用（name+args）/ 连续同名调用（不管参数）/ 每轮工具调用总数
-    let mut turn_tool_calls: usize = 0;
-    let mut last_tool_call_key: Option<String> = None;
-    let mut tool_call_repeat: usize = 0;
-    let mut last_tool_name: Option<String> = None;
-    let mut same_name_streak: usize = 0;
-    let mut loop_breaks: usize = 0;
     let mut continuation_text = String::new();
     // 多模态图片附加计数：已附加到请求的图片数（用户首轮上传 + 工具轮次 take_screenshot 产生的截图），
     // 每轮只附加新增部分到最新 user 消息（通常是刚注入的工具结果），避免重复注入历史图
     let mut images_attached: usize = 0;
-    // 叙述式假调用纠正次数（防死循环）：模型只写“已调用工具”叙述不输出标记时注入纠正提示
-    let mut fake_corrections = 0;
     // 未完话术纠正次数（防死循环）：模型承诺“还需读取/继续查看”但未输出标记时注入纠正提示
     let mut pending_action_corrections = 0;
     // 行动承诺假完成纠正次数（防死循环）：模型宣布开始开发/创建/实现或仅输出方案计划但未输出标记时注入纠正提示
@@ -3917,23 +4398,62 @@ async fn stream_chat_inner(
     let mut merged_instructions: Vec<String> = Vec::new();
     // 计划/审查模式：本次任务是否已经过用户批准计划（批准前只允许输出计划，不执行工具）
     let plan_mode = plan_mode_enabled(&opts);
-    let mut plan_confirmed = !plan_mode;
+    let mut plan_confirmed = !plan_mode || inherited_approved_plan.is_some();
     // 已批准计划全文：批准后每轮注入（长任务防中途遗忘/偏离目标，锚定执行方向）
-    let mut confirmed_plan: Option<String> = None;
+    let mut confirmed_plan = inherited_approved_plan;
     // 自上次进度对照以来的工具执行数（每 3 个工具注入一次“对照计划汇报进度”）
     let mut tools_since_progress: u32 = 0;
     // 任务收尾复核计数：模型主动收尾但本任务执行过工具时注入“任务是否真完成”确认，
     // 未确认则继续执行（长任务防提前收尾）；达上限仍未确认则收尾并提示用户
     let mut completion_reviews: usize = 0;
-    // 自动补救轮：强验收失败不立刻退出，而是把缺失证据作为下一轮硬约束重新交给模型。
-    let mut remediation_rounds: usize = 0;
     // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）；
     // 时长可在设置页动态调整（0/-1 表示不限制）
-    let task_deadline_ms = crate::services::agent_limits::current()
+    let configured_task_deadline_ms = crate::services::agent_limits::current()
         .task_duration_secs()
         .map(|s| (s.saturating_mul(1000)) as i64)
         .map(|configured| configured.min(execution_budget.duration_ms))
         .unwrap_or(execution_budget.duration_ms);
+    // 共用 executor 状态：创建时冻结本次运行的墙钟与治理限制。
+    // 真正续跑接续父状态（含停机墙钟、回合、工具循环和补救计数）；目标变化则新建状态。
+    let restored_adapter_control = if resume_parent_executor {
+        recovery_adapter_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.checkpoint.control.clone())
+    } else {
+        None
+    };
+    let restored_executor = if resume_parent_executor {
+        recovery_adapter_snapshot
+            .take()
+            .map(|snapshot| snapshot.checkpoint.run_loop)
+    } else {
+        None
+    };
+    let mut kernel_executor = restored_executor.unwrap_or_else(|| {
+        KernelIoRunLoop::with_started(
+            KernelExecutorLimits {
+                wall_time_ms: configured_task_deadline_ms.max(0) as u64,
+                round_limit: None,
+                tool_attempt_limit: None,
+                remediation_limit: execution_budget.remediation_rounds,
+            },
+            task_started,
+        )
+    });
+    let task_deadline_ms = kernel_executor
+        .limits()
+        .wall_time_ms
+        .min(i64::MAX as u64) as i64;
+    if resume_parent_executor {
+        // Phase AZ checkpoint 精确接续动态额度；旧 AX/AY checkpoint 没有 control 时
+        // 保留当前总上限但禁用再次扩容，累计尝试仍由 executor 统一计数。
+        if let Some(control) = restored_adapter_control {
+            max_tool_rounds = control.effective_tool_rounds;
+            budget_extensions = control.budget_extensions;
+        } else {
+            budget_extensions = crate::agent::governance::MAX_TOOL_BUDGET_EXTENSIONS;
+        }
+    }
     // 任务账本（Ledger 协议）状态：目标=首轮用户消息摘要；prev_ledger 为上次未完成任务
     // 落库的账本（断点续跑继承，编号从旧账本最大编号续接）；任务结束按完成/未完成保存或清空
     let task_goal = goal_contract.original_goal
@@ -3957,7 +4477,7 @@ async fn stream_chat_inner(
     // 工具循环是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾；
     // 声明在循环外：主流程据此判定任务是否被护栏强制收尾（强制收尾时账本需保留））
     let mut exhausted = false;
-    loop {
+    'outer: loop {
         if let Ok(conn) = state.0.lock() {
             let _ = crate::agent::runtime::transition(
                 &conn,
@@ -3975,45 +4495,48 @@ async fn stream_chat_inner(
                 execution_budget.lease_ms,
             );
         }
-        // 任务心跳打点（每轮循环顶部）：配合工具/请求/压缩日志，任何卡点都能从最后一条
-        // 心跳定位到所在阶段——此前卡在无超时请求内时日志静默，事后无法定位“空跑”位置
-        registry.touch(&conversation_id, PHASE_MAIN_LOOP);
-        crate::utils::logger::log_event(
-            "task_heartbeat",
-            serde_json::json!({
-                "conversation_id": conversation_id,
-                "elapsed_ms": task_started.elapsed().as_millis() as i64,
-                "tool_runs": tool_runs.len(),
-                "full_chars": full.chars().count(),
-                "history_limit": history_limit,
-            }),
+        log_task_heartbeat(
+            registry,
+            &conversation_id,
+            task_started,
+            tool_runs.len(),
+            full.chars().count(),
+            history_limit,
         );
-        let workflow_evidence = tool_runs.iter().map(|item| {
-            crate::agent::acceptance::ToolEvidence {
-                tool: &item.tool,
-                args: &item.args,
-                output: &item.output,
-                succeeded: item.succeeded,
-            }
-        }).collect::<Vec<_>>();
-        let workflow = crate::agent::execution_loop::snapshot(
+        let workflow = refresh_workflow_stage(
+            state,
+            &trace_id,
+            &conversation_id,
             &goal_contract,
-            &workflow_evidence,
+            &inherited_tool_evidence,
+            &tool_runs,
+            workflow_stage,
         );
-        if workflow_stage != Some(workflow.stage) {
-            if let Ok(conn) = state.0.lock() {
-                let _ = crate::agent::runtime::append_event(
-                    &conn,
+        workflow_stage = Some(workflow.stage);
+        // Provider 请求前共用安全点：run-loop 原子执行持久化与 deadline/cancel 裁决。
+        // 写入受 Worker 租约 fencing；失败时轮次不会推进，也不会发起 Provider IO。
+        let run_permit = kernel_executor.begin_persisted_round(
+            is_cancelled(cancel, &conversation_id),
+            |checkpoint| {
+                persist_desktop_executor_checkpoint(
+                    state,
                     &trace_id,
                     &conversation_id,
-                    "workflow.stage",
-                    serde_json::to_value(&workflow).unwrap_or_default(),
-                );
-            }
-            workflow_stage = Some(workflow.stage);
-        }
+                    checkpoint,
+                    crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
+                    placeholder_msg_id.as_deref(),
+                    max_tool_rounds,
+                    budget_extensions,
+                )
+            },
+        )?;
         // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）
-        if task_started.elapsed().as_millis() as i64 > task_deadline_ms {
+        if matches!(
+            run_permit,
+            KernelRunPermit::Halt(
+                crate::agent::agent_kernel::KernelRunTermination::DeadlineExceeded
+            )
+        ) {
             crate::utils::logger::log_event(
                 "task_deadline_hit",
                 serde_json::json!({
@@ -4076,7 +4599,12 @@ async fn stream_chat_inner(
             });
         }
         // 检查停止请求（安全点：每轮请求前，工具执行完成后会回到这里）
-        if is_cancelled(cancel, &conversation_id) {
+        if matches!(
+            run_permit,
+            KernelRunPermit::Halt(
+                crate::agent::agent_kernel::KernelRunTermination::UserCancelled
+            )
+        ) {
             crate::utils::logger::log_event(
                 "stop_effective",
                 serde_json::json!({
@@ -4121,6 +4649,11 @@ async fn stream_chat_inner(
             }
             return Ok(());
         }
+        // 任意已锁定终态都不得穿过 Provider 边界；正常分支会在产生终态的当轮退出，
+        // 此处是防御性吸收态兜底，保留 executor 中的首个精确原因供最终快照审计。
+        if matches!(run_permit, KernelRunPermit::Halt(_)) {
+            break;
+        }
         // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
         if let Some((_, pending_content)) = take_next_queued(state, &conversation_id, true)? {
             merged_instructions.push(pending_content);
@@ -4141,104 +4674,37 @@ async fn stream_chat_inner(
         } else {
             &system_prompt_core
         };
-        let mut messages: Vec<serde_json::Value> =
-            vec![serde_json::json!({ "role": "system", "content": prompt_now.clone() })];
-        // 关键记忆回放注入（对齐 Qwen-Agent MemoAssistant）：从历史消息重放 memorize
-        // 工具调用重建键值状态，每轮作为 system 注入（量小成本低），模型无需专门
-        // 读取——状态与消息历史天然一致，滚动摘要/时间旅行后自动正确
-        if let Some(memo) = {
+        
+        // IO 层：预读所有数据供 assembler 拼装
+        let memo_replay = {
             let conn = state.0.lock().ok();
             conn.as_ref().and_then(|c| replay_memories(c, &conversation_id))
-        } {
-            messages.push(serde_json::json!({ "role": "system", "content": memo }));
-        }
-        // Context V2 每轮从 Durable Run、执行步骤、来源化事实和产物引用重建，
-        // 不依赖可能过期的自然语言摘要；读取失败时保持旧路径继续执行。
-        if let Some(hint) = state.0.lock().ok().and_then(|conn| {
+        };
+        
+        let context_hint = state.0.lock().ok().and_then(|conn| {
             crate::agent::context::load_context_v2(&conn, &conversation_id, context_budget)
                 .ok()
                 .and_then(|context| crate::agent::context::render_context_hint(&context))
-        }) {
-            messages.push(serde_json::json!({ "role": "system", "content": hint }));
-        }
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": workflow.directive(),
-        }));
-        // 任务账本（Ledger 协议）：从工具执行轨迹派生，每轮作为 system 消息注入（状态外部化，
-        // 防长任务“忘记已做过什么/卡在哪一步”）；首轮无执行轨迹时若有上次未完成任务账本
-        // （断点续跑）先注入旧账本，续跑期间按新执行轨迹更新；同时构造 ledger_now 供事件推送
-        let ledger_now = if !tool_runs.is_empty() || !last_model_text.is_empty() {
+        });
+        
+        // 任务账本（同时构造 ledger_now 供事件推送和快照保存）
+        let (ledger_hint, ledger_now) = if !tool_runs.is_empty() || !last_model_text.is_empty() {
             let ledger = TaskLedger::from_tool_runs(&task_goal, &tool_runs, &last_model_text, ledger_base_n);
-            messages.push(serde_json::json!({ "role": "system", "content": ledger.to_hint() }));
-            Some(ledger)
+            (Some(ledger.to_hint()), Some(ledger))
         } else if let Some(prev) = &prev_ledger {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!(
+            (
+                Some(format!(
                     "## 上一任务账本（任务未完成，本次继续推进；续跑期间按新执行轨迹更新）\n{}",
                     prev.to_hint()
-                ),
-            }));
-            Some(prev.clone())
+                )),
+                Some(prev.clone())
+            )
         } else {
-            None
+            (None, None)
         };
-        seam_count += 1;
-        // 账本实时推送（前端“任务账本”卡）：每轮刷新当前执行轨迹派生账本
-        if let Some(ref ledger_now) = ledger_now {
-            // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
-            // 应用崩溃、系统重启或看门狗强杀时，下一次任务仍能从最近一次
-            // 已执行工具及下一步继续，避免复杂任务回到起点。
-            save_task_ledger(state, &conversation_id, Some(ledger_now))?;
-            let _ = app.emit(
-                "chat-ledger",
-                ChatLedgerEvent {
-                    conversation_id: conversation_id.clone(),
-                    ledger: Some(ledger_now.clone()),
-                    finished: false,
-                },
-            );
-        }
-        // 会话快照（时间旅行）：每轮执行后保存状态锚点（消息 rowid + 账本 + 摘要），
-        // 用户可“回到此处”从历史决策点重新引导；无执行痕迹的首轮不保存。
-        // 失败不阻塞主循环（快照是增值能力，丢一轮无碍）
-        {
-            let Ok(conn) = state.0.lock() else { return Err("数据库锁不可用".into()) };
-            let _ = save_conversation_snapshot(
-                &conn,
-                &conversation_id,
-                ledger_now.as_ref(),
-                &last_model_text,
-                tool_runs.len(),
-            );
-            // Context V2 检查点是可重建投影：保存任务状态、摘要覆盖游标和预算。
-            // 失败不阻断聊天主循环，旧消息/Run/事件仍是恢复真源。
-            let _ = crate::agent::context::persist_runtime_checkpoint(
-                &conn,
-                &conversation_id,
-                Some(&trace_id),
-                context_summary.as_deref(),
-                history_limit,
-                context_budget,
-            );
-        }
-        // 早期对话滚动摘要（上下文超限时生成）：作为 system 消息注入，保住被裁剪历史的决策信息
-        if let Some(ref summary) = context_summary {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!("## 历史摘要（早期对话，已被压缩）\n{summary}"),
-            }));
-        }
-        // 已批准计划锚定：长任务每轮携带计划全文（防中途遗忘/偏离），除非用户明确要求调整
-        if let Some(ref plan) = confirmed_plan {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!(
-                    "## 已批准任务计划（必须严格遵守，不得擅自偏离或扩大范围）\n{plan}"),
-            }));
-        }
-        {
+        
+        // 历史行：从 DB 读取并转换为 HistoryRow
+        let raw_history = {
             let conn = state.0.lock().map_err(|e| e.to_string())?;
             let mut stmt = conn
                 .prepare(
@@ -4253,64 +4719,34 @@ async fn stream_chat_inner(
                     |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?)),
                 )
                 .map_err(|e| e.to_string())?;
-            let mut history: Vec<(String, String, Option<String>, Option<String>)> =
+            let raw_history: Vec<(String, String, Option<String>, Option<String>)> =
                 rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-            history.reverse();
-            // 释放锁后注入引用（读文件 IO 不放锁内）；先释放 stmt 借用再解锁
             drop(stmt);
             drop(conn);
-            for (role, text, refs_json, reasoning) in history {
-                match role.as_str() {
-                    "assistant" => {
-                        let cleaned = crate::agent::tools::sanitize_markers(&text);
-                        // 未完话术污染：历史上只描述计划未执行工具的短消息不重复喂给模型，
-                        // 防止模型模仿“好的，我继续读取…”的话术风格（格式污染）
-                        if cleaned.chars().count() < 300 && has_pending_action_phrase(&cleaned) {
-                            messages.push(serde_json::json!({ "role": "user", "content": "（此前有一轮未执行的过渡回复，已省略）" }));
-                        } else {
-                            // DeepSeek 推理模型多轮合规（官方 thinking_mode 文档硬性要求）：
-                            // 携带 tools 参数的请求在后续所有请求中必须完整回传 reasoning_content，
-                            // 缺失会导致 400 报错或思考链断裂（Reasonix missing_reasoning_watch 同源）；
-                            // 未携带 tools 时服务端忽略该字段，回传双向安全。
-                            let mut m = serde_json::json!({ "role": "assistant", "content": cleaned });
-                            if let Some(r) = reasoning.as_deref() {
-                                if !r.trim().is_empty() {
-                                    m["reasoning_content"] = serde_json::json!(r);
-                                }
-                            }
-                            messages.push(m);
-                        }
-                    }
-                    "tool" => {
-                        // tool 消息入库格式：“工具名\n输出”，转 user 消息反馈给模型
-                        // 历史工具结果截断到 1200 字符：防长文件读取结果反复撑大上下文
-                        let (name, out) = text.split_once('\n').unwrap_or(("tool", &text));
-                        // 注入防护：外部内容中的指令性文字仅作参考（不影响入库原文）
-                        let out_guard = crate::agent::tools::sanitize_tool_output(out);
-                        let out_trimmed: String = out_guard.chars().take(1200).collect();
-                        let suffix = if out_guard.chars().count() > 1200 { "\n…(历史工具结果已截断)" } else { "" };
-                        messages.push(serde_json::json!({ "role": "user", "content": format!("[工具执行结果 - {name}]\n{out_trimmed}{suffix}") }));
-                    }
-                    _ => {
-                        // @ 引用重放：历史 user 消息带 references_json 时注入对应内容
-                        // （文件内容 / conv: 会话摘要），不阻塞发送；本循环已在锁外运行，
-                        // conv: 会话摘要的 DB 查询现场取锁（点查开销极小）
-                        let injected = {
-                            let conn = state.0.lock().map_err(|e| e.to_string())?;
-                            inject_references(&conn, &project_path, &text, refs_json.as_deref())?
-                        };
-                        messages.push(serde_json::json!({ "role": "user", "content": injected }));
-                    }
-                }
-            }
+            
+            raw_history
+        };
+        let mut history_rows = Vec::with_capacity(raw_history.len());
+        for (role, text, refs_json, reasoning) in raw_history.into_iter().rev() {
+            // @ 引用需要文件/DB IO，因此在纯策略 assembler 外预先展开。
+            let content = if role == "user" && refs_json.is_some() {
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                inject_references(&conn, &project_path, &text, refs_json.as_deref())?
+            } else {
+                text
+            };
+            history_rows.push(HistoryRow {
+                role,
+                content,
+                references_json: refs_json,
+                reasoning,
+            });
         }
-        // 本轮已执行的工具结果（注入防护：外部内容中的指令性文字仅作参考；
-        // 超长输出头尾截断，仅最近两个保留较多细节，更早的与历史同口径截断，
-        // 防长工具输出在多轮循环中反复重新注入、把上下文越撑越大）
-        let runs_len = tool_runs.len();
-        for (i, item) in tool_runs.iter().enumerate() {
+        
+        // 本轮已执行的工具结果
+        let tool_results: Vec<ToolResult> = tool_runs.iter().enumerate().map(|(i, item)| {
             let out_guard = crate::agent::tools::sanitize_tool_output(&item.output);
-            let limit = if i + 2 >= runs_len {
+            let limit = if i + 2 >= tool_runs.len() {
                 TOOL_RESULT_RECENT_LIMIT
             } else {
                 TOOL_RESULT_OLD_LIMIT
@@ -4320,157 +4756,69 @@ async fn stream_chat_inner(
                 let head: String = out_guard.chars().take(limit / 2).collect();
                 let tail_len = limit - limit / 2;
                 let tail: String = out_guard.chars().skip(cnt - tail_len).collect();
-                format!("{head}\n…(输出过长，中段已省略，共 {cnt} 字符)…\n{tail}")
+                format!("{head}\n\u{2026}(输出过长，中段已省略，共 {cnt} 字符)\u{2026}\n{tail}")
             } else {
                 out_guard
             };
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "[工具执行结果 - {}]\n{out_final}\n\n请根据以上结果继续，若失败请分析原因并给出修复建议。",
-                    item.tool
-                ),
-            }));
-        }
-        // 本轮并入的用户挂起指令（“发送到 Agent”）：追加为 user 消息，与当前任务一并处理
-        for inst in &merged_instructions {
-            messages.push(serde_json::json!({ "role": "user", "content": inst }));
-        }
-        // 异步事件注入（后台任务完成等）：drain 后作为 user 消息反馈给模型（取出即清空）
+            ToolResult {
+                tool: item.tool.clone(),
+                output: out_final,
+            }
+        }).collect();
+        
+        // 用户注入集合
+        // 一次性注入先并入持久到“请求成功”为止的队列；主动压缩重组消息时不能丢失。
         for msg in crate::agent::session_ctx::drain_injected(&conversation_id) {
-            messages.push(serde_json::json!({ "role": "user", "content": msg }));
+            merged_instructions.push(msg);
         }
-        // 计划执行进度对照：每执行 3 个工具注入一次“对照计划汇报进度”，保持执行不偏离
         if confirmed_plan.is_some() && tools_since_progress >= 3 {
             tools_since_progress = 0;
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": "（执行对照：请对照上方“已批准任务计划”，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）",
-            }));
+            merged_instructions.push(
+                "（执行对照：请对照上方\"已批准任务计划\"，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）".to_string(),
+            );
         }
-        // 连续失败 replan 提示：给模型一次重新规划的机会（只注入一次，仍失败走终止逻辑）
         if let Some(p) = replan_instruction.take() {
-            messages.push(serde_json::json!({ "role": "user", "content": p }));
+            merged_instructions.push(p);
         }
-        // 输出截断续写：把上轮被截断的内容与“请继续”指令加入本轮请求；
-        // 正文为空仅思考非空时，提示直接输出结论/工具调用（不再思考），防推理模型反复耗尽预算空转
-        if continuation_pending {
-            messages.push(serde_json::json!({ "role": "assistant", "content": continuation_text }));
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": if continuation_reasoning_only {
-                    "（系统提示：你的上一条回复未完成（思考过长或网络中断），本轮请不要再输出思考过程，直接给出最终结论；若任务未完成，直接输出下一步要执行的工具调用标记。）"
-                } else {
-                    "（你的上一条回复未完整送达（被截断或网络中断），请直接从断点继续完成剩余内容，不要重复已输出的部分。）"
-                },
-            }));
-            continuation_pending = false;
-            continuation_reasoning_only = false;
-        }
-        // 纠正注入（假调用/未完话术/空响应重试）：把上轮被纠正的回复与纠正提示加入本轮请求
-        if !correction_text.is_empty() || !correction_hint.is_empty() {
-            if !correction_text.is_empty() {
-                messages.push(serde_json::json!({ "role": "assistant", "content": correction_text }));
-            }
-            messages.push(serde_json::json!({ "role": "user", "content": correction_hint }));
-            correction_text = String::new();
-            correction_hint = String::new();
-        }
-        // 多模态：把尚未附加的图片（用户首轮上传 + 工具轮次 take_screenshot 产生的截图）
-        // 附加到本轮最后一条 user 消息（通常为刚注入的工具结果），按协议转换结构；
-        // 该消息已被转换过（content 为数组）时只追加新的 image part，不重复转换文本。
-        if let Some(imgs) = &images {
-            if imgs.len() > images_attached {
-                let new_imgs: Vec<&String> = imgs[images_attached..].iter().collect();
-                if !new_imgs.is_empty() {
-                    let last_user = messages.iter().rposition(|m| m["role"] == "user");
-                    let idx = match last_user {
-                        Some(i) => i,
-                        None => {
-                            messages.push(serde_json::json!({ "role": "user", "content": "" }));
-                            messages.len() - 1
-                        }
-                    };
-                    // 防御：模型不支持 image（含主模型失败后降级到纯文本备用模型）时跳过图片附加，
-                    // 仅在消息正文注明，避免向纯文本模型发送 image_url 被 Provider 拒绝
-                    let supports_image = {
-                        let conn = state.0.lock().map_err(|e| e.to_string())?;
-                        model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
-                    };
-                    if supports_image {
-                        let last = &mut messages[idx];
-                        match protocol.as_str() {
-                            "gemini" => {
-                                if !last["parts"].is_array() {
-                                    let text = last["content"].as_str().unwrap_or("").to_string();
-                                    last["parts"] =
-                                        serde_json::Value::Array(vec![serde_json::json!({ "text": text })]);
-                                }
-                                if let Some(parts) = last["parts"].as_array_mut() {
-                                    for img in &new_imgs {
-                                        if let Some((mime, data)) = parse_data_url(img) {
-                                            parts.push(serde_json::json!({
-                                                "inline_data": { "mime_type": mime, "data": data },
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                            "anthropic" => {
-                                if !last["content"].is_array() {
-                                    let text = last["content"].as_str().unwrap_or("").to_string();
-                                    last["content"] = serde_json::Value::Array(vec![serde_json::json!({ "type": "text", "text": text })]);
-                                }
-                                if let Some(parts) = last["content"].as_array_mut() {
-                                    for img in &new_imgs {
-                                        if let Some((mime, data)) = parse_data_url(img) {
-                                            parts.push(serde_json::json!({
-                                                "type": "image",
-                                                "source": { "type": "base64", "media_type": mime, "data": data },
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                if !last["content"].is_array() {
-                                    let text = last["content"].as_str().unwrap_or("").to_string();
-                                    last["content"] = serde_json::Value::Array(vec![serde_json::json!({ "type": "text", "text": text })]);
-                                }
-                                if let Some(parts) = last["content"].as_array_mut() {
-                                    for img in &new_imgs {
-                                        if let Some((mime, data)) = parse_data_url(img) {
-                                            parts.push(serde_json::json!({
-                                                "type": "image_url",
-                                                "image_url": { "url": format!("data:{mime};base64,{data}") },
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let note = format!(
-                            "（本轮 {} 张截图/图片因当前模型不支持图片输入未附带，模型无法查看图片内容）",
-                            new_imgs.len()
-                        );
-                        let last = &mut messages[idx];
-                        if last["content"].is_string() {
-                            let text = last["content"].as_str().unwrap_or("").to_string();
-                            last["content"] = serde_json::json!(format!("{text}\n{note}"));
-                        } else if let Some(parts) = last["content"].as_array_mut() {
-                            parts.push(serde_json::json!({ "type": "text", "text": note }));
-                        }
-                    }
-                    images_attached = imgs.len();
-                }
-            }
-        }
-        // 主动预算压缩：估算请求 token，超过模型窗口 85% 时不等待 400 报错，
-        // 主动把最旧历史压缩为滚动摘要后重试（保住早期关键决策，避免大窗口模型下静默丢失）
-        if history_limit > MIN_HISTORY_KEEP
-            && estimate_tokens(&messages) > context_budget as usize * 85 / 100
-        {
+        let user_injections = merged_instructions
+            .iter()
+            .cloned()
+            .map(|content| UserInjection { content })
+            .collect();
+        
+        // 调用 assembler 组装消息序列（纯策略，无 IO）
+        let supports_image = {
+            let conn = state.0.lock().map_err(|e| e.to_string())?;
+            model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
+        };
+        let assembled = KernelHistoryAssembler::assemble(&KernelHistoryInput {
+            system_prompt: prompt_now,
+            memo_replay: memo_replay.as_deref(),
+            context_hint: context_hint.as_deref(),
+            workflow_directive: &workflow.directive(),
+            ledger_hint: ledger_hint.as_deref(),
+            compression_summary: context_summary.as_deref(),
+            confirmed_plan: confirmed_plan.as_deref(),
+            history_rows,
+            tool_results,
+            user_injections,
+            continuation_text: &continuation_text,
+            continuation_reasoning_only,
+            correction_text: &correction_text,
+            correction_hint: &correction_hint,
+            inject_progress_check: false, // progress check already collected in user_injections
+            images: images.as_ref(),
+            images_attached,
+            protocol: &protocol,
+            supports_image,
+            context_budget,
+            history_limit,
+        });
+        let mut messages = assembled.messages;
+        let next_images_attached = assembled.images_attached;
+        
+        // E3：压缩决策——assembler 已判断是否需要压缩，adapter 执行实际压缩
+        if assembled.compress {
             let old_limit = history_limit;
             history_limit = (history_limit / 2).max(MIN_HISTORY_KEEP);
             let _ = app.emit(
@@ -4524,9 +4872,7 @@ async fn stream_chat_inner(
                     "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
                     params![history_limit as i64, conversation_id],
                 );
-                // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
                 crate::agent::context::bump_compress_count(&conn, &conversation_id);
-                // LC-33：压缩事件写入会话事件流（预警→执行闭环可回放、可度量）
                 let _ = crate::agent::session_events::append_event(
                     &conn,
                     &conversation_id,
@@ -4542,11 +4888,59 @@ async fn stream_chat_inner(
             let _ = app.emit(
                 "chat-compact",
                 serde_json::json!({
-                    "conversation_id": conversation_id.clone(),
+                    "conversation_id": conversation_id,
                     "keep": history_limit,
                 }),
             );
-            continue;
+            // 使用缩小后的 history_limit 和新摘要重新组装；一次性注入、图片和续写状态
+            // 尚未发给 Provider，因此都保留到下一次实际请求成功。
+            continue 'outer;
+        }
+
+        images_attached = next_images_attached;
+        // 重置续写/纠正状态（assembler 已消费）
+        continuation_reasoning_only = false;
+        correction_text = String::new();
+        correction_hint = String::new();
+        
+        seam_count += 1;
+        // 账本实时推送（前端"任务账本"卡）：每轮刷新当前执行轨迹派生账本
+        if let Some(ref ledger_now) = ledger_now {
+            // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
+            // 应用崩溃、系统重启或看门狗强杀时，下一次任务仍能从最近一次
+            // 已执行工具及下一步继续，避免复杂任务回到起点。
+            save_task_ledger(state, &conversation_id, Some(ledger_now))?;
+            let _ = app.emit(
+                "chat-ledger",
+                ChatLedgerEvent {
+                    conversation_id: conversation_id.clone(),
+                    ledger: Some(ledger_now.clone()),
+                    finished: false,
+                },
+            );
+        }
+        // 会话快照（时间旅行）：每轮执行后保存状态锚点（消息 rowid + 账本 + 摘要），
+        // 用户可"回到此处"从历史决策点重新引导；无执行痕迹的首轮不保存。
+        // 失败不阻塞主循环（快照是增值能力，丢一轮无碍）
+        {
+            let Ok(conn) = state.0.lock() else { return Err("数据库锁不可用".into()) };
+            let _ = save_conversation_snapshot(
+                &conn,
+                &conversation_id,
+                ledger_now.as_ref(),
+                &last_model_text,
+                tool_runs.len(),
+            );
+            // Context V2 检查点是可重建投影：保存任务状态、摘要覆盖游标和预算。
+            // 失败不阻断聊天主循环，旧消息/Run/事件仍是恢复真源。
+            let _ = crate::agent::context::persist_runtime_checkpoint(
+                &conn,
+                &conversation_id,
+                Some(&trace_id),
+                context_summary.as_deref(),
+                history_limit,
+                context_budget,
+            );
         }
 
         // 预算门控：发送前用本地 token 预估估算本次成本，若已用+本次预估突破
@@ -4951,6 +5345,7 @@ async fn stream_chat_inner(
                     .unwrap_or(PlanReview {
                         approved: false,
                         feedback: "计划审查通道异常，已暂停".to_string(),
+                        revised_plan: None,
                         cancelled: false,
                     });
                 crate::agent::runtime::transition_global(
@@ -4984,11 +5379,14 @@ async fn stream_chat_inner(
                     }));
                     continue;
                 }
+                let final_plan = review.revised_plan.as_deref().unwrap_or(&plan_text).to_string();
+                activate_approved_plan(app, state, &conversation_id, &trace_id, &final_plan)?;
                 plan_confirmed = true;
-                confirmed_plan = Some(plan_text);
+                confirmed_plan = Some(final_plan.clone());
                 let _ = app.emit("chat-plan-resolved", serde_json::json!({
                     "conversation_id": conversation_id,
                     "approved": true,
+                    "plan": final_plan,
                 }));
                 // 用户在审查时可能直接修订了计划或补充了执行要求；批准但附带意见时，
                 // 作为下一条 user 指令注入，要求 Agent 严格按修订后的方案执行。
@@ -5015,6 +5413,16 @@ async fn stream_chat_inner(
                 trace_id.clone(),
             );
             for (tool, args_raw) in calls {
+                let (tool_attempt, verdict) = match kernel_executor.begin_tool_attempt(&tool, &args_raw) {
+                    crate::agent::kernel_executor::KernelToolAttemptDecision::Observed {
+                        attempt,
+                        verdict,
+                    } => (attempt, verdict),
+                    crate::agent::kernel_executor::KernelToolAttemptDecision::Halt { .. } => {
+                        exhausted = true;
+                        break;
+                    }
+                };
                 // 每个工具独立计时：覆盖审批等待与重试，作为 done 事件的精确耗时
                 let tool_begin = std::time::Instant::now();
                 let call_id = Uuid::new_v4().to_string();
@@ -5030,85 +5438,66 @@ async fn stream_chat_inner(
                         "elapsed_ms": task_started.elapsed().as_millis() as i64,
                     }),
                 );
-                // 工具循环检测（对齐 qwen-code LoopDetectionService 轻量版）：
-                // 连续相同调用（name+args）≥5 次或连续同名（不管参数）≥8 次判定打转，
-                // 命中后清空已排队批次并注入纠正提示让模型换方案（不重复执行）；
-                // 每轮总调用超硬上限（1000）无条件中止，防参数变化逃逸重复检测；
-                // 纠正提示后模型仍循环时最多打断 MAX_LOOP_BREAKS 次，之后直接收尾
-                turn_tool_calls += 1;
-                let call_key = format!("{tool}|{args_raw}");
-                if last_tool_call_key.as_deref() == Some(call_key.as_str()) {
-                    tool_call_repeat += 1;
-                } else {
-                    last_tool_call_key = Some(call_key);
-                    tool_call_repeat = 1;
-                }
-                if last_tool_name.as_deref() == Some(tool.as_str()) {
-                    same_name_streak += 1;
-                } else {
-                    last_tool_name = Some(tool.to_string());
-                    same_name_streak = 1;
-                }
-                let stuck = tool_call_repeat >= TOOL_CALL_LOOP_THRESHOLD
-                    || same_name_streak >= TOOL_NAME_STAGNATION_THRESHOLD;
-                // 软上限（100）：超过后只要存在弱重复信号（连续 3 次相同调用）即中止——
-                // 长任务后期模型容易在收尾阶段重复同一验证命令，不必等满 5 次；
-                // 硬上限（1000）：无条件中止，防参数变化逃逸重复检测
-                let halt = stuck
-                    || (turn_tool_calls > MAX_TOOL_CALLS_PER_TURN && tool_call_repeat >= 3)
-                    || turn_tool_calls > MAX_TOOL_CALLS_HARD;
-                if halt {
-                    loop_breaks += 1;
+                // 工具循环检测：由共享 KernelExecutorState 持有 governor 状态。
+                if let crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, repeat, same_name, turn_calls } = verdict {
                     crate::utils::logger::log_event(
                         "tool_loop_detected",
                         serde_json::json!({
                             "conversation_id": conversation_id,
                             "tool": tool,
-                            "repeat": tool_call_repeat,
-                            "same_name": same_name_streak,
-                            "turn_calls": turn_tool_calls,
-                            "breaks": loop_breaks,
+                            "repeat": repeat,
+                            "same_name": same_name,
+                            "turn_calls": turn_calls,
+                            "breaks": kernel_executor.loop_breaks(),
                         }),
                     );
                     pending.clear();
-                    if loop_breaks > MAX_LOOP_BREAKS {
+                    if final_halt {
                         exhausted = true;
                     } else {
                         correction_text = String::new();
-                        correction_hint = format!(
-                            "（系统检测到工具调用循环：工具 {tool} 已连续重复调用 {} 次（连续同名 {} 次，本轮共 {} 次调用）。重复执行只会得到相同结果。请立即停止当前路径，改用其他工具/思路推进；若确实无法推进，请直接给出结论总结与所需条件。）",
-                            tool_call_repeat, same_name_streak, turn_tool_calls
-                        );
+                        correction_hint = corrective_hint.unwrap_or_default();
                     }
                     break;
                 }
                 // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
-                let reached_tool_limit = tool_runs.len() + pending.len() >= max_tool_rounds;
+                // executor attempt 在当前调用进入时已原子 +1，因此 attempt-1 是此前累计
+                // 尝试数；它跨恢复血缘持续，不能再用本次进程内 Vec 长度重置额度。
+                let prior_tool_attempts = usize::try_from(tool_attempt.saturating_sub(1))
+                    .unwrap_or(usize::MAX);
+                let reached_tool_limit = prior_tool_attempts >= max_tool_rounds;
                 let limit_must_stop = if reached_tool_limit {
                     let recent_successes = tool_runs.iter().rev().take(8).filter(|item| item.succeeded).count();
-                    if let Some(extended) = crate::agent::governance::extend_tool_budget(
-                        max_tool_rounds, recent_successes, loop_breaks, budget_extensions,
+                    match kernel_executor.decide_dynamic_tool_budget(
+                        max_tool_rounds,
+                        prior_tool_attempts,
+                        recent_successes,
+                        budget_extensions,
                     ) {
-                        let previous = max_tool_rounds;
-                        max_tool_rounds = extended;
-                        budget_extensions += 1;
-                        if let Ok(conn) = state.0.lock() {
-                            let _ = crate::agent::scheduler::update_budget(
-                                &conn,
-                                &trace_id,
-                                &serde_json::json!({
-                                    "base": execution_budget,
-                                    "effective_tool_rounds": extended,
-                                    "extension_count": budget_extensions,
-                                }),
-                            );
-                            let _ = crate::agent::runtime::append_event(
-                                &conn, &trace_id, &conversation_id, "budget.extended",
-                                serde_json::json!({ "previous": previous, "current": extended, "reason": "verified_progress" }),
-                            );
+                        crate::agent::kernel_loop::KernelBudgetVerdict::Extend { new_limit } => {
+                            let previous = max_tool_rounds;
+                            max_tool_rounds = new_limit;
+                            budget_extensions += 1;
+                            if let Ok(conn) = state.0.lock() {
+                                let _ = crate::agent::scheduler::update_budget(
+                                    &conn,
+                                    &trace_id,
+                                    &serde_json::json!({
+                                        "base": execution_budget,
+                                        "effective_tool_rounds": new_limit,
+                                        "extension_count": budget_extensions,
+                                    }),
+                                );
+                                let _ = crate::agent::runtime::append_event(
+                                    &conn, &trace_id, &conversation_id, "budget.extended",
+                                    serde_json::json!({ "previous": previous, "current": new_limit, "reason": "verified_progress" }),
+                                );
+                            }
+                            false
                         }
-                        false
-                    } else { true }
+                        crate::agent::kernel_loop::KernelBudgetVerdict::Halt => true,
+                        crate::agent::kernel_loop::KernelBudgetVerdict::Proceed => false,
+                    }
                 } else { false };
                 if limit_must_stop {
                     let round = (tool_runs.len() + 1) as u32;
@@ -5228,6 +5617,16 @@ async fn stream_chat_inner(
                             registry,
                         )
                         .await;
+                        persist_desktop_executor_checkpoint(
+                            state,
+                            &trace_id,
+                            &conversation_id,
+                            kernel_executor.checkpoint(),
+                            crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                            placeholder_msg_id.as_deref(),
+                            max_tool_rounds,
+                            budget_extensions,
+                        )?;
                         pending.clear();
                         if intercepted {
                             exhausted = true;
@@ -5276,6 +5675,16 @@ async fn stream_chat_inner(
                         registry,
                     )
                     .await;
+                    persist_desktop_executor_checkpoint(
+                        state,
+                        &trace_id,
+                        &conversation_id,
+                        kernel_executor.checkpoint(),
+                        crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                        placeholder_msg_id.as_deref(),
+                        max_tool_rounds,
+                        budget_extensions,
+                    )?;
                     pending.clear();
                     if intercepted {
                         exhausted = true;
@@ -5304,15 +5713,17 @@ async fn stream_chat_inner(
                 // - Approval/Generic：发 done 事件后直接终止（用户拒绝无总结机会）
                 let args_val: serde_json::Value =
                     serde_json::from_str(&args_raw).unwrap_or(serde_json::Value::Null);
+                let approval_ctx = tool_ctx.clone().with_tool_call_id(call_id.clone());
                 let inv = crate::agent::tools::ToolInvocation {
                     name: &tool,
                     args: &args_val,
                     args_raw: &args_raw,
                     project_id: &project_id,
+                    project_path: &project_path,
                     roots: &path_hints,
                     conversation_id: &conversation_id,
                     approval_mode: approval_mode(&opts),
-                    ctx: &tool_ctx,
+                    ctx: &approval_ctx,
                 };
                 if let Some(message) =
                     crate::agent::recovery::verification_block_global(&trace_id, &tool)
@@ -5500,9 +5911,11 @@ async fn stream_chat_inner(
                 (r, 0)
             } else {
                 // 执行工具：超时/网络类错误按指数退避自动重试（可恢复错误白名单）
-                let retried = retry_with_backoff(
+                let contract = crate::agent::tools::contracts::contract(&tool);
+                let retried = run_tool_with_retry(
+                    &contract,
                     &TOOL_POLICY,
-                    &mut || {
+                    || {
                         run_tool_with_guard(
                             &tool,
                             &args_raw,
@@ -5518,20 +5931,12 @@ async fn stream_chat_inner(
                             &call_id,
                         )
                     },
-                    |e: &String| tool_retry_safe(&tool) && crate::agent::tools::is_retryable_err(e),
-                    |_| None,
                 )
                 .await;
                 tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
                 stats.retry_count += (retried.attempts - 1) as i64;
                 let retry_count = (retried.attempts - 1) as i64;
-                let result = match retried.value {
-                    Ok(out) if retried.attempts > 1 => Ok(format!(
-                        "（首次执行超时/网络错误，已自动重试 {} 次）\n{out}",
-                        retried.attempts - 1
-                    )),
-                    other => other,
-                };
+                let result = retried.value.map(|out| retry_notice(out, retried.attempts));
                 (result, retry_count)
             };
             // 统一护栏后处理：任务护栏记录（进展/失败黑名单/失速）+ 大输出落盘由 pipeline
@@ -5735,6 +6140,16 @@ async fn stream_chat_inner(
             }
             // 每个工具执行完成后推进进度对照计数（计划批准后每 3 个工具注入一次进度汇报）
             tools_since_progress += 1;
+            persist_desktop_executor_checkpoint(
+                state,
+                &trace_id,
+                &conversation_id,
+                kernel_executor.checkpoint(),
+                crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                placeholder_msg_id.as_deref(),
+                max_tool_rounds,
+                budget_extensions,
+            )?;
             }
             // for 结束：排空剩余只读批次（本轮全部输出只读工具时）
             if !pending.is_empty() {
@@ -5777,6 +6192,16 @@ async fn stream_chat_inner(
                     registry,
                 )
                 .await;
+                persist_desktop_executor_checkpoint(
+                    state,
+                    &trace_id,
+                    &conversation_id,
+                    kernel_executor.checkpoint(),
+                    crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                    placeholder_msg_id.as_deref(),
+                    max_tool_rounds,
+                    budget_extensions,
+                )?;
                 if intercepted {
                     exhausted = true;
                 }
@@ -5802,6 +6227,7 @@ async fn stream_chat_inner(
                 .unwrap_or(PlanReview {
                     approved: false,
                     feedback: "计划审查通道异常，已暂停".to_string(),
+                    revised_plan: None,
                     cancelled: false,
                 });
             crate::agent::runtime::transition_global(
@@ -5834,11 +6260,14 @@ async fn stream_chat_inner(
                 }));
                 continue;
             }
+            let final_plan = review.revised_plan.as_deref().unwrap_or(&plan_text).to_string();
+            activate_approved_plan(app, state, &conversation_id, &trace_id, &final_plan)?;
             plan_confirmed = true;
-            confirmed_plan = Some(plan_text);
+            confirmed_plan = Some(final_plan.clone());
             let _ = app.emit("chat-plan-resolved", serde_json::json!({
                 "conversation_id": conversation_id,
                 "approved": true,
+                "plan": final_plan,
             }));
             let note = review.feedback.trim().to_string();
             messages.push(serde_json::json!({
@@ -5859,81 +6288,57 @@ async fn stream_chat_inner(
         if completion_reviews > 0 && is_completion_confirmation(&text) {
             break;
         }
-        // 空响应兜底：模型输出为空（无正文无工具标记，服务端静默失败/异常截断）时不进入
-        // 续写循环（空文本续写只会反复拿到空响应，白等数十秒），重试上限后收尾并明确提示。
-        // 注意：截断（truncated）与连接中断（interrupted）导致的空正文不在此列——
-        // 前者是预算问题、后者是网络问题，均走下方续写分支处理
-        if text.trim().is_empty() && !outcome.truncated && !outcome.interrupted {
-            empty_rounds += 1;
-            if empty_rounds >= MAX_EMPTY_ROUNDS {
-                full.push_str(
-                    "\n\n> ⚠️ 模型连续多次未输出内容（可能服务端异常），任务已中止；可重新发送指令重试。",
-                );
-                break;
+        // 轮级路由：由共享 KernelExecutorState 决定空轮/重放/续写/假调用纠正。
+        let router_input = KernelRoundInput {
+            text: &text,
+            has_reasoning: !outcome.reasoning.trim().is_empty(),
+            truncated: outcome.truncated,
+            interrupted: outcome.interrupted,
+            has_native_tool_calls: !outcome.tool_calls.is_empty(),
+        };
+        let decision = kernel_executor.decide_round(&router_input);
+        for notice in decision.notices {
+            full.push_str(&notice);
+        }
+        match decision.control {
+            crate::agent::kernel_loop::KernelRoundControl::RetryEmpty { hint } => {
+                correction_text = String::new();
+                correction_hint = hint;
+                continue 'outer;
             }
-            correction_text = String::new();
-            correction_hint =
-                "（系统提示：你上一轮未输出任何内容，请重新生成完整回复；若任务已完成请直接给出结论，若需继续请输出工具调用标记。）"
-                    .to_string();
-            continue;
-        }
-        // 产出前中断重放（冻结请求）：流在输出任何可见内容（正文/工具调用）之前就中断
-        // （服务端断流/代理重置）时，直接以完全相同的 payload 重发原始请求——
-        // 模型无需重新思考、prompt 缓存不失效（对齐 DeepSeek-Reasonix 冻结请求重放）。
-        // 思考链（reasoning）产出不阻塞重放（对齐 qwen-code #7832）：reasoning 是瞬态内容、
-        // 不进入对话历史，重放不会重复任何可见输出；且思考模型在思考阶段往往耗时数分钟，
-        // 正是网关关闭长 SSE 连接的高发期——此时冻结重放比“请继续”续写更可靠
-        // （续写依赖服务端保留会话状态，断流后可能失效）。已产出正文/工具调用的中断
-        // 走下方续写分支（保留已收内容从断点继续）。重放时 messages 自上次请求以来
-        // 未被修改，payload 与首次请求一致。
-        if outcome.interrupted
-            && text.trim().is_empty()
-            && outcome.tool_calls.is_empty()
-            && stream_replays < MAX_STREAM_REPLAYS
-        {
-            stream_replays += 1;
-            crate::utils::logger::log_event(
-                "stream_replay",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "attempt": stream_replays,
-                    "total": MAX_STREAM_REPLAYS,
-                }),
-            );
-            continue;
-        }
-        // 连接中断自动续写：流式无数据超时（代理悬挂/服务端异常）时保留已收内容，
-        // 自动重发“请继续”让模型从断点续写；连续多次仍中断则收尾并明确提示（不静默）
-        if outcome.interrupted && interrupted_rounds < MAX_INTERRUPT_RETRY_ROUNDS {
-            interrupted_rounds += 1;
-            continuation_pending = true;
-            continuation_text = crate::agent::tools::strip_tool_calls(&text);
-            continuation_reasoning_only = text.trim().is_empty() && !outcome.reasoning.trim().is_empty();
-            continue;
-        }
-        if outcome.interrupted {
-            full.push_str("\n\n> ⚠️ 网络连续中断（自动续写多次仍未恢复），已保留以上内容；可重新发送指令重试。");
-        }
-        // 输出被截断且本轮无工具调用：自动续写（保留已有内容，从截断处继续），
-        // 避免“输出到一半就停止”；超过续写上限或截断时无内容（异常）则按正常结束收尾。
-        // 正文为空但思考非空（推理模型 reasoning 耗尽预算）：标记为 thinking-only 续写，
-        // 下一轮请求改为要求直接输出结论/工具调用，不再思考（见续写消息构造处）
-        if outcome.truncated && continuation_rounds < MAX_CONTINUATION_ROUNDS {
-            continuation_rounds += 1;
-            continuation_pending = true;
-            continuation_text = crate::agent::tools::strip_tool_calls(&text);
-            continuation_reasoning_only = text.trim().is_empty() && !outcome.reasoning.trim().is_empty();
-            continue;
-        }
-        // 防“叙述式假调用”静默结束：模型正文出现“已调用工具/工具调用记录”等叙述但未输出
-        // 【TOOL】标记（历史格式污染导致模型模仿），不结束任务，注入纠正提示继续循环
-        if (text.contains("已调用工具") || text.contains("工具调用记录"))
-            && fake_corrections < MAX_FAKE_CALL_CORRECTIONS
-        {
-            fake_corrections += 1;
-            correction_text = crate::agent::tools::strip_tool_calls(&text);
-            correction_hint = "（检测到你的回复中出现了“已调用工具/工具调用记录”等叙述，但未输出工具调用标记，系统未执行任何工具。如需调用工具，请输出【TOOL|工具名|JSON参数】标记行，一行一个；若任务已完成，请直接给出结论总结，不要写“已调用工具”之类的叙述。）".to_string();
-            continue;
+            crate::agent::kernel_loop::KernelRoundControl::StopEmpty { note } => {
+                full.push_str(&note);
+                break 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::ReplayFrozen => {
+                crate::utils::logger::log_event(
+                    "stream_replay",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "attempt": kernel_executor.round_counters().stream_replays,
+                        "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
+                    }),
+                );
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
+                continuation_text = ct;
+                continuation_reasoning_only = reasoning_only;
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::ContinueTruncated { continuation_text: ct, reasoning_only } => {
+                continuation_text = ct;
+                continuation_reasoning_only = reasoning_only;
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::CorrectFakeCall { correction_text: ct, hint } => {
+                correction_text = ct;
+                correction_hint = hint;
+                continue 'outer;
+            }
+            crate::agent::kernel_loop::KernelRoundControl::Proceed => {
+                // 无特殊动作：继续后续 UI 专属门
+            }
         }
         // 防“未完话术”静默结束：模型承诺“还需读取/继续查看”等下一步动作但未输出【TOOL】
         // 标记（任务实际未完成却正常收尾），注入纠正提示要求立即输出标记或明确总结
@@ -5964,20 +6369,19 @@ async fn stream_chat_inner(
         }
         // 强验收前移到“申请完成”时刻。缺少写入、后置验证、构建/测试/提交/推送等
         // 契约证据时自动回到工具循环；达到动态上限才保留为未完成，避免无限补救。
-        if !outcome.interrupted && remediation_rounds < execution_budget.remediation_rounds {
-            let evidence = tool_runs.iter().map(|item| crate::agent::acceptance::ToolEvidence {
-                tool: &item.tool,
-                args: &item.args,
-                output: &item.output,
-                succeeded: item.succeeded,
-            }).collect::<Vec<_>>();
+        if !outcome.interrupted {
+            let evidence =
+                combined_acceptance_evidence(&inherited_tool_evidence, &tool_runs);
             let report = state.0.lock().ok()
                 .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &evidence).ok())
                 .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &evidence));
-            if !report.passed {
-                remediation_rounds += 1;
+            if let crate::agent::agent_kernel::KernelStopDecision::Remediate {
+                report,
+                prompt,
+                round,
+            } = kernel_executor.decide_stop(report) {
                 correction_text = crate::agent::tools::strip_tool_calls(&text);
-                correction_hint = crate::agent::acceptance::remediation_prompt(&report);
+                correction_hint = prompt;
                 if let Ok(conn) = state.0.lock() {
                     let value = serde_json::to_value(&report).unwrap_or_default();
                     let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
@@ -5988,7 +6392,7 @@ async fn stream_chat_inner(
                 let _ = app.emit("chat-governance", ChatGovernanceEvent {
                     conversation_id: conversation_id.clone(),
                     run_id: trace_id.clone(),
-                    remediation_count: remediation_rounds,
+                    remediation_count: round,
                     blockers: report.blockers,
                 });
                 continue;
@@ -5998,7 +6402,7 @@ async fn stream_chat_inner(
         // 验证范围（文件/模块/命令/截图等）时注入纠正要求补充或实际验证——防“声称完成却
         // 没验证”的虚假收尾（与收尾复核互补：复核问“是否真完成”，ship 查“完成声明是否
         // 有验证背书”）；达上限放行收尾，防空转
-        if !tool_runs.is_empty()
+        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
             && !outcome.interrupted
             && has_unverified_claim(&text)
             && unverified_claim_corrections < MAX_UNVERIFIED_CLAIM_CORRECTIONS
@@ -6015,7 +6419,10 @@ async fn stream_chat_inner(
         // 纯问答任务（全程无工具执行）不复核，直接收尾。
         // 本轮已判定网络连续中断（outcome.interrupted）时不复核：连接不稳，复核轮大概率
         // 再次中断白等，直接按上方“网络连续中断”提示收尾。
-        if !tool_runs.is_empty() && !outcome.interrupted && completion_reviews < MAX_COMPLETION_REVIEWS {
+        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
+            && !outcome.interrupted
+            && completion_reviews < MAX_COMPLETION_REVIEWS
+        {
             completion_reviews += 1;
             correction_text = crate::agent::tools::strip_tool_calls(&text);
             // 证据化完成确认（对齐 deepseek-harness goal-round-driver）：复核时带上任务
@@ -6029,7 +6436,10 @@ async fn stream_chat_inner(
             );
             continue;
         }
-        if !tool_runs.is_empty() && !outcome.interrupted && completion_reviews >= MAX_COMPLETION_REVIEWS {
+        if (!tool_runs.is_empty() || !inherited_tool_evidence.is_empty())
+            && !outcome.interrupted
+            && completion_reviews >= MAX_COMPLETION_REVIEWS
+        {
             full.push_str("\n\n> ⚠️ 任务收尾前已多次要求模型确认完成情况，模型始终未确认任务已全部完成；以上内容已保留，建议检查结果或补充指令继续推进。");
         }
         break;
@@ -6047,21 +6457,32 @@ async fn stream_chat_inner(
             None,
         );
     }
-    let acceptance_evidence = tool_runs
-        .iter()
-        .map(|item| crate::agent::acceptance::ToolEvidence {
-            tool: &item.tool,
-            args: &item.args,
-            output: &item.output,
-            succeeded: item.succeeded,
-        })
-        .collect::<Vec<_>>();
+    let acceptance_evidence =
+        combined_acceptance_evidence(&inherited_tool_evidence, &tool_runs);
     let acceptance = state.0.lock().ok()
         .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &acceptance_evidence).ok())
         .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &acceptance_evidence));
+    let completion_confirmed =
+        is_completion_confirmation(&last_model_text)
+            || (tool_runs.is_empty() && inherited_tool_evidence.is_empty());
+    let executor_snapshot = serde_json::to_value(
+        kernel_executor.finalize(KernelExecutorFinalization::Acceptance {
+            governance_exhausted: exhausted,
+            acceptance_passed: acceptance.passed,
+            completion_confirmed,
+        })?,
+    )
+    .unwrap_or_default();
     if let Ok(conn) = state.0.lock() {
         let value = serde_json::to_value(&acceptance).unwrap_or_else(|_| serde_json::json!({}));
         let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
+        let _ = crate::agent::runtime::append_event(
+            &conn,
+            &trace_id,
+            &conversation_id,
+            "run.executor_snapshot",
+            executor_snapshot,
+        );
         let _ = crate::agent::tool_metrics::annotate_run_outcomes(
             &conn,
             &trace_id,
@@ -6079,7 +6500,7 @@ async fn stream_chat_inner(
         );
         let quality = crate::agent::governance::RunQualitySnapshot::calculate(
             &acceptance,
-            remediation_rounds,
+            kernel_executor.remediation_rounds(),
             recovery_plan.is_some(),
             exhausted,
         );
@@ -6095,9 +6516,7 @@ async fn stream_chat_inner(
             acceptance.blockers.join("、")
         ));
     }
-    let task_done = !exhausted
-        && acceptance.passed
-        && (is_completion_confirmation(&last_model_text) || tool_runs.is_empty());
+    let task_done = !exhausted && acceptance.passed && completion_confirmed;
     stats.unfinished = !task_done;
     persist_turn(
         state,
@@ -6507,15 +6926,16 @@ struct StreamOutcome {
     tool_calls: Vec<(String, String)>,
 }
 
-/// Usage 提取只需要流首/流尾事件；有界保存可防超长响应重复缓存全部 JSON。
-fn retain_usage_chunk(chunks: &mut Vec<String>, data: &str) {
-    const MAX: usize = 64;
-    const KEEP_HEAD: usize = 8;
-    if chunks.len() < MAX {
-        chunks.push(data.to_string());
-    } else {
-        chunks.remove(KEEP_HEAD);
-        chunks.push(data.to_string());
+fn kernel_usage_info(
+    usage: Option<crate::agent::agent_kernel::KernelUsage>,
+) -> crate::services::cost_calculator::UsageInfo {
+    let usage = usage.unwrap_or_default();
+    let bounded = |value: u64| value.min(i64::MAX as u64) as i64;
+    crate::services::cost_calculator::UsageInfo {
+        input_tokens: bounded(usage.input_tokens),
+        output_tokens: bounded(usage.output_tokens),
+        cache_read_tokens: bounded(usage.cached_tokens),
+        cache_creation_tokens: bounded(usage.cache_creation_tokens),
     }
 }
 
@@ -6556,75 +6976,6 @@ fn pick_fallback_model(state: &tauri::State<'_, DbState>, current: &ModelChoice)
 // - 非推理模型：剥离 reasoning_content（其他模型的兼容端点不认识该字段，回传反而可能 400）；
 // - 推理模型且 effort 未显式关闭：缺失/为空的 assistant 消息填 "(reasoning omitted)" 占位符
 //   （占位符在无工具调用时被服务端忽略，双向安全）。
-
-/// 模型名判定是否为 DeepSeek 推理模型（v3.2/v4/reasoner/-reasoning/-thinking/deepseek-r 数字系列）
-fn requires_reasoning_content(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.contains("deepseek-v3.2")
-        || lower.contains("deepseek-v4")
-        || lower.contains("reasoner")
-        || lower.contains("-reasoning")
-        || lower.contains("-thinking")
-        || {
-            // deepseek-r 后接数字（deepseek-r1 / deepseek-r2 等）
-            const PREFIX: &str = "deepseek-r";
-            lower
-                .match_indices(PREFIX)
-                .any(|(idx, _)| lower[idx + PREFIX.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
-        }
-}
-
-/// 是否应回传/占位 reasoning_content：推理模型且 effort 未显式关闭（off/disabled/none/false）
-fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
-    let disabled = effort.is_some_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "off" | "disabled" | "none" | "false"
-        )
-    });
-    !disabled && requires_reasoning_content(model)
-}
-
-/// 最终净化器：返回净化后的消息副本（不修改入参）。
-/// 返回 (净化后消息, 占位符替换数, 回传 reasoning 总字符数)。
-fn sanitize_thinking_messages(
-    messages: &[serde_json::Value],
-    model: &str,
-    effort: Option<&str>,
-) -> (Vec<serde_json::Value>, u32, u64) {
-    let mut out: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
-    let mut substitutions: u32 = 0;
-    let mut replay_chars: u64 = 0;
-    let replay = should_replay_reasoning_content(model, effort);
-    for m in messages {
-        let mut mm = m.clone();
-        if !replay {
-            // 非推理模型：剥离字段，防兼容端点不认识而报错
-            if let serde_json::Value::Object(map) = &mut mm {
-                map.remove("reasoning_content");
-            }
-        } else if let serde_json::Value::Object(map) = &mut mm {
-            let missing = map
-                .get("reasoning_content")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|s| s.trim().is_empty());
-            if map.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-                && missing
-            {
-                map.insert(
-                    "reasoning_content".to_string(),
-                    serde_json::json!("(reasoning omitted)"),
-                );
-                substitutions = substitutions.saturating_add(1);
-            }
-            if let Some(r) = map.get("reasoning_content").and_then(serde_json::Value::as_str) {
-                replay_chars = replay_chars.saturating_add(r.len() as u64);
-            }
-        }
-        out.push(mm);
-    }
-    (out, substitutions, replay_chars)
-}
 
 /// 400 诊断：遍历消息，输出仍缺 reasoning_content 的 assistant 消息（标注是否带 tool_calls），
 /// 用于定位绕过净化器的代码路径（对齐 DeepSeek-TUI log_thinking_mode_violations）。
@@ -6676,6 +7027,29 @@ fn format_stream_headers(headers: &reqwest::header::HeaderMap) -> String {
         .join(", ")
 }
 
+fn request_builder_from_plan(
+    client: &reqwest::Client,
+    provider: &ProviderEndpoint,
+    plan: &crate::agent::agent_kernel::KernelRequestPlan,
+) -> reqwest::RequestBuilder {
+    let mut request = client.post(&plan.url).json(&plan.body);
+    if let Some(key) = provider.api_key.as_deref() {
+        request = match plan.auth_scheme {
+            crate::agent::agent_kernel::KernelAuthScheme::Bearer => {
+                request.header("Authorization", format!("Bearer {key}"))
+            }
+            crate::agent::agent_kernel::KernelAuthScheme::Anthropic => request
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01"),
+            crate::agent::agent_kernel::KernelAuthScheme::Gemini => {
+                request.header("x-goog-api-key", key)
+            }
+        };
+    }
+    request
+}
+
+#[cfg(test)]
 trait LlmProvider: Send + Sync {
     /// 构造流式请求（URL/headers/body 由协议决定），返回可发送的 RequestBuilder。
     /// native_tools：原生 function calling 工具 schema（OpenAI 兼容协议注入 tools；
@@ -6692,6 +7066,7 @@ trait LlmProvider: Send + Sync {
 }
 
 /// 采样参数注入：仅当显式设置时加入请求体（键名因协议而异）
+#[cfg(test)]
 fn apply_sampling(body: &mut serde_json::Value, key_temp: &str, key_top: &str, key_max: &str, opts: &ChatOptions) {
     if let Some(v) = opts.temperature {
         body[key_temp] = serde_json::json!(v);
@@ -6705,12 +7080,16 @@ fn apply_sampling(body: &mut serde_json::Value, key_temp: &str, key_top: &str, k
 }
 
 /// OpenAI 兼容协议（/chat/completions，Bearer 鉴权，reasoning_effort 可选）
+#[cfg(test)]
 struct OpenAiProvider;
 /// Anthropic 原生协议（/v1/messages，x-api-key 鉴权，system 单独字段）
+#[cfg(test)]
 struct AnthropicProvider;
 /// Gemini 原生协议（x-goog-api-key，contents + systemInstruction，SSE）
+#[cfg(test)]
 struct GeminiProvider;
 
+#[cfg(test)]
 impl LlmProvider for OpenAiProvider {
     fn build_stream_request(
         &self,
@@ -6727,7 +7106,11 @@ impl LlmProvider for OpenAiProvider {
         // 消息填 "(reasoning omitted)" 占位符（携带 tools 的请求缺失会 400）。历史构造、续写、
         // 纠正等任意来源的 assistant 消息都经此兜底，历史构造处的回传只是第一层。
         let (messages_san, substitutions, replay_chars) =
-            sanitize_thinking_messages(messages, &model_choice.model, opts.reasoning_effort.as_deref());
+            crate::agent::agent_kernel::sanitize_thinking_messages(
+                messages,
+                &model_choice.model,
+                opts.reasoning_effort.as_deref(),
+            );
         if substitutions > 0 || replay_chars > 0 {
             crate::utils::logger::log_event(
                 "reasoning_replay",
@@ -6768,6 +7151,7 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+#[cfg(test)]
 impl LlmProvider for AnthropicProvider {
     fn build_stream_request(
         &self,
@@ -6809,6 +7193,7 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+#[cfg(test)]
 impl LlmProvider for GeminiProvider {
     fn build_stream_request(
         &self,
@@ -6864,6 +7249,7 @@ impl LlmProvider for GeminiProvider {
 }
 
 /// 按协议名创建提供方实现（未知协议回退 OpenAI 兼容，与历史行为一致）
+#[cfg(test)]
 fn llm_provider_for(protocol: &str) -> Box<dyn LlmProvider> {
     match protocol {
         "anthropic" => Box::new(AnthropicProvider),
@@ -6875,6 +7261,10 @@ fn llm_provider_for(protocol: &str) -> Box<dyn LlmProvider> {
 #[cfg(test)]
 mod llm_provider_tests {
     use super::*;
+    use crate::agent::agent_kernel::{
+        requires_reasoning_content, sanitize_thinking_messages,
+        should_replay_reasoning_content,
+    };
 
     fn sample_provider(protocol: &str) -> ProviderEndpoint {
         ProviderEndpoint {
@@ -7084,8 +7474,6 @@ async fn stream_once(
     if crate::agent::evals::take_fault("stream_disconnect_before_delta") {
         return Err(FriendlyError::new(ErrorKind::Network,"可靠性评测故障注入：首个增量前断流"));
     }
-    // 能力接缝：按协议解析出提供方实现，协议特有的请求构造由 trait 承担
-    let provider_impl = llm_provider_for(protocol);
     // 原生 function calling（工具协议标准化 Phase 1）：仅 openai 协议 + 显式开启时
     // 注入当前任务相关 schema；MCP/Skill 动态工具仍可用文本标记调用。
     let tool_query = messages
@@ -7121,10 +7509,11 @@ async fn stream_once(
         }));
     }
     let ranked_tools = ranking.map(|items| {
-        items.into_iter().take(32).map(|rank| rank.tool).collect::<Vec<_>>()
+        items.into_iter().map(|rank| rank.tool).collect::<Vec<_>>()
     }).unwrap_or_else(|| {
-        candidate_tools.into_iter().take(32).map(str::to_string).collect()
+        candidate_tools.into_iter().map(str::to_string).collect()
     });
+    let ranked_tools = crate::agent::tools::capabilities::resident_tool_names(tool_query, tool_phase, &ranked_tools);
     let tool_schemas = if opts.native_tools.unwrap_or(false) && protocol == "openai" {
         crate::agent::tools::tool_schemas_for_names(&ranked_tools)
     } else {
@@ -7135,21 +7524,34 @@ async fn stream_once(
         "role": "system",
         "content": crate::agent::tools::phase_hint_for_names(tool_phase, &ranked_tools),
     }));
-    let build_req = || {
-        let tools_opt = if tool_schemas.is_empty() {
-            None
-        } else {
-            Some(tool_schemas.as_slice())
-        };
-        provider_impl.build_stream_request(
-            client,
-            provider,
-            model_choice,
-            opts,
-            &request_messages,
-            tools_opt,
-        )
-    };
+    let tools_opt = (!tool_schemas.is_empty()).then_some(tool_schemas.as_slice());
+    let request_plan = crate::agent::agent_kernel::build_model_request_plan(
+        protocol,
+        &provider.base_url,
+        &model_choice.model,
+        &request_messages,
+        tools_opt,
+        true,
+        Some(opts.max_tokens.unwrap_or(model_choice.output_limit)),
+        opts.temperature,
+        opts.top_p,
+        opts.reasoning_effort.as_deref(),
+    )
+    .map_err(|error| FriendlyError::new(ErrorKind::Client, error))?;
+    if request_plan.reasoning_replay.substitutions > 0
+        || request_plan.reasoning_replay.replay_chars > 0
+    {
+        crate::utils::logger::log_event(
+            "reasoning_replay",
+            serde_json::json!({
+                "model": model_choice.model,
+                "substitutions": request_plan.reasoning_replay.substitutions,
+                "replay_chars": request_plan.reasoning_replay.replay_chars,
+                "approx_tokens": request_plan.reasoning_replay.replay_chars / 4,
+            }),
+        );
+    }
+    let build_req = || request_builder_from_plan(client, provider, &request_plan);
 
     // LLM 录制/重放接缝（无 key 回归测试；DEVS_LLM_REPLAY=record:dir|replay:dir）：
     // 重放命中直接返回录制响应不发起真实请求；录制把原始 SSE 流落盘
@@ -7225,38 +7627,43 @@ async fn stream_once(
             }
             Ok(resp)
         };
-        let retry_fut = retry_with_backoff(
+        let transport = crate::agent::agent_kernel::run_provider_transport(
             &STREAM_REQUEST_POLICY,
+            None,
+            std::time::Duration::from_millis(300),
             &mut attempt,
             |e: &FriendlyError| e.retryable(),
             |e: &FriendlyError| e.retry_after_ms(),
-        );
-        tokio::pin!(retry_fut);
-        loop {
-            registry.touch(conversation_id, PHASE_SEND);
-            tokio::select! {
-                r = &mut retry_fut => break r,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                    if is_cancelled(cancel, conversation_id) {
-                        // 放弃当前请求（send future drop 即取消连接），返回已停止
-                        crate::utils::logger::log_event(
-                            "stop_effective",
-                            serde_json::json!({
-                                "phase": "stream_send_poll",
-                                "conversation_id": conversation_id,
-                            }),
-                        );
-                        return Ok(StreamOutcome {
-                            text: String::new(),
-                            reasoning: String::new(),
-                            stopped: true,
-                            truncated: false,
-                            interrupted: false,
-                            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&[]),
-                            tool_calls: Vec::new(),
-                        });
-                    }
-                }
+            || is_cancelled(cancel, conversation_id),
+            || registry.touch(conversation_id, PHASE_SEND),
+        )
+        .await;
+        match transport {
+            Ok(result) => result,
+            Err(crate::agent::agent_kernel::KernelTransportStop::Cancelled) => {
+                // 放弃当前请求（send future drop 即取消连接），返回已停止。
+                crate::utils::logger::log_event(
+                    "stop_effective",
+                    serde_json::json!({
+                        "phase": "stream_send_poll",
+                        "conversation_id": conversation_id,
+                    }),
+                );
+                return Ok(StreamOutcome {
+                    text: String::new(),
+                    reasoning: String::new(),
+                    stopped: true,
+                    truncated: false,
+                    interrupted: false,
+                    usage: kernel_usage_info(None),
+                    tool_calls: Vec::new(),
+                });
+            }
+            Err(crate::agent::agent_kernel::KernelTransportStop::DeadlineExceeded) => {
+                return Err(FriendlyError::new(
+                    ErrorKind::Timeout,
+                    "Provider 请求超过 Agent Kernel 截止时间",
+                ));
             }
         }
     };
@@ -7273,7 +7680,7 @@ async fn stream_once(
             stopped: true,
             truncated: false,
             interrupted: false,
-            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&[]),
+            usage: kernel_usage_info(None),
             tool_calls: Vec::new(),
         });
     }
@@ -7359,15 +7766,17 @@ async fn stream_once(
     let mut last_chunk_at = tokio::time::Instant::now();
     // 首字节打点：报告从 stream_send_begin 到收到首个网络块的耗时（连接建立/TLS/代理慢）
     let mut first_byte_logged = false;
-    let mut total_bytes: usize = 0;
-    // 停滞 wall-clock deadline：独立于流读取 future 计时。即便 stream.next()
+    // 停滞治理与字节预算共用 KernelStreamGovernor（与 headless 同一状态机）：
+    // wall-clock 停滞 deadline 独立于流读取 future 计时。即便 stream.next()
     // 在某些挂起连接上不响应取消/不被唤醒（实测会导致内部 200ms 轮询与 reqwest
     // 120s 总超时双双失效、8 分钟后才被看门狗杀），select! 也会在此 deadline
-    // 到达时强制跳出。每收到有效产出就重置。
-    let mut stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
-    // reasoning-only 护栏基线：首个 Reasoning 事件时间。纯思考流停滞线最多顺延到
-    // 该基线 + REASONING_ONLY_GRACE_SECS，防止模型只吐思考不吐正文时无限转圈
-    let mut first_reasoning_at: Option<tokio::time::Instant> = None;
+    // 到达时强制跳出。每收到有效产出就重置；纯思考流最多顺延到首次思考 + 宽限期。
+    let mut governor = KernelStreamGovernor::new(
+        KERNEL_STREAM_SILENT_TIMEOUT,
+        KERNEL_STREAM_REASONING_GRACE,
+        KERNEL_STREAM_MAX_BYTES,
+        tokio::time::Instant::now(),
+    );
     'outer: loop {
         // ── 停止检查：任何等待前先看是否已点停止 ────────────────────────
         registry.touch(conversation_id, PHASE_STREAMING);
@@ -7387,7 +7796,6 @@ async fn stream_once(
                 Some(Ok(bytes)) => {
                     if !first_byte_logged {
                         first_byte_logged = true;
-                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
                         // 首字节即视为一次数据到达+有效产出：初始化看门狗的流式
                         // 判据基线（数据到达），并保留产出基线供排障日志。
                         registry.touch_stream_data(conversation_id);
@@ -7405,24 +7813,20 @@ async fn stream_once(
                     // 看门狗以它为停滞判据：大输出/长响应传输中数据持续到达，
                     // 即使长时间无解析产出也不会被强杀；数据停滞才触发兜底。
                     registry.touch_stream_data(conversation_id);
-                    total_bytes += bytes.len();
-                    // 响应体积超限：立即中断报错（可重试），防止异常巨大流持续烧资源
-                    if total_bytes > STREAM_MAX_BYTES {
+                    if let Err(reason) = governor.observe(
+                        KernelStreamSignal::Data(bytes.len()),
+                        tokio::time::Instant::now(),
+                    ) {
+                        // 响应体积超限：立即中断报错（可重试），防止异常巨大流持续烧资源
                         crate::utils::logger::log_event(
                             "stream_too_large",
                             serde_json::json!({
                                 "conversation_id": conversation_id,
-                                "total_bytes": total_bytes,
-                                "max_bytes": STREAM_MAX_BYTES,
+                                "total_bytes": governor.total_bytes(),
+                                "max_bytes": KERNEL_STREAM_MAX_BYTES,
                             }),
                         );
-                        return Err(FriendlyError::new(
-                            ErrorKind::Network,
-                            format!(
-                                "流式响应体积超限(>{:.1}MB)，已中断防止持续卡死",
-                                STREAM_MAX_BYTES as f64 / 1024.0 / 1024.0
-                            ),
-                        ));
+                        return Err(FriendlyError::new(ErrorKind::Network, reason));
                     }
                     // 投递解析线程：有界通道背压下等待，期间每 200ms 检查停止（不丢字节）
                     if !deliver_chunk(&chunk_tx, bytes, cancel, conversation_id).await {
@@ -7445,7 +7849,7 @@ async fn stream_once(
                         serde_json::json!({
                             "conversation_id": conversation_id,
                             "error": error_chain,
-                            "bytes_received": total_bytes,
+                            "bytes_received": governor.total_bytes(),
                             "ms_since_last_chunk": last_chunk_at.elapsed().as_millis() as i64,
                             "headers": stream_headers,
                         }),
@@ -7462,9 +7866,8 @@ async fn stream_once(
                 let Some(ev) = ev else { break 'outer }; // 解析线程已退出且未发 Done（极端）
                 match ev {
                     StreamParserEvent::Delta(delta) => {
-                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
                         // 正文到达后退出 pure-reasoning 模式，恢复普通静默超时语义。
-                        first_reasoning_at = None;
+                        let _ = governor.observe(KernelStreamSignal::Content, tokio::time::Instant::now());
                         registry.touch_stream_progress(conversation_id);
                         delivered_content.push_str(&delta);
                         event_batcher.push_content(&delta);
@@ -7477,26 +7880,18 @@ async fn stream_once(
                         registry.touch_stream_progress(conversation_id);
                         // reasoning-only 护栏：停滞线最多顺延到首次思考 + 宽限期，
                         // 之后即使 reasoning 持续到达也强制判死（正文 Delta 恢复常规刷新）
-                        if first_reasoning_at.is_none() {
-                            first_reasoning_at = Some(tokio::time::Instant::now());
-                        }
-                        let now = tokio::time::Instant::now();
-                        let grace_end = first_reasoning_at.unwrap()
-                            + tokio::time::Duration::from_secs(REASONING_ONLY_GRACE_SECS);
-                        // 持续 reasoning 可推进静默线，但绝不能越过首次思考后的硬上限。
-                        stall_deadline = std::cmp::min(now + STREAM_SILENT_TIMEOUT, grace_end);
+                        let _ = governor.observe(KernelStreamSignal::Reasoning, tokio::time::Instant::now());
                         delivered_reasoning.push_str(&r);
                         event_batcher.push_reasoning(&r);
                     }
                     StreamParserEvent::ToolCall => {
-                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
-                        first_reasoning_at = None;
+                        let _ = governor.observe(KernelStreamSignal::ToolCall, tokio::time::Instant::now());
                         registry.touch_stream_progress(conversation_id);
                     }
                     StreamParserEvent::Finish { truncated: t } => {
                         finished = true;
                         truncated = t;
-                        stall_deadline = tokio::time::Instant::now() + STREAM_SILENT_TIMEOUT;
+                        let _ = governor.observe(KernelStreamSignal::Finish, tokio::time::Instant::now());
                         registry.touch_stream_progress(conversation_id);
                     }
                     StreamParserEvent::PersistWatermark { placeholder: p } => {
@@ -7514,14 +7909,14 @@ async fn stream_once(
                 tick_count += 1;
                 // 停滞兜底双保险：事件洪峰长期压制 sleep_until 分支调度时，tick 仍按
                 // 200ms 粒度 wall-clock 判死（不依赖 select! 分支公平性）
-                if tokio::time::Instant::now() >= stall_deadline {
+                if governor.stalled(tokio::time::Instant::now()) {
                     stalled = true;
                     crate::utils::logger::log_event(
                         "stream_silent_dead",
                         serde_json::json!({
                             "conversation_id": conversation_id,
                             "after_first_byte": first_byte_logged,
-                            "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
+                            "timeout_ms": KERNEL_STREAM_SILENT_TIMEOUT.as_millis() as i64,
                             "via": "tick_backstop",
                         }),
                     );
@@ -7556,14 +7951,14 @@ async fn stream_once(
             //    即便 stream.next() 在挂起连接上不被唤醒，tokio::time::sleep 也会
             //    触发，彻底避免无限转圈。与旧实现直接返回不同：统一 break 走收尾，
             //    取回解析线程 flush 后的产物（半截正文保留给续写，不丢内容）。
-            _ = tokio::time::sleep_until(stall_deadline) => {
+            _ = tokio::time::sleep_until(governor.deadline()) => {
                 stalled = true;
                 crate::utils::logger::log_event(
                     "stream_silent_dead",
                     serde_json::json!({
                         "conversation_id": conversation_id,
                         "after_first_byte": first_byte_logged,
-                        "timeout_ms": STREAM_SILENT_TIMEOUT.as_millis() as i64,
+                        "timeout_ms": KERNEL_STREAM_SILENT_TIMEOUT.as_millis() as i64,
                         "via": "wall_clock_deadline",
                     }),
                 );
@@ -7580,7 +7975,7 @@ async fn stream_once(
             "finished": finished,
             "truncated": truncated,
             "stalled": stalled,
-            "total_bytes": total_bytes,
+            "total_bytes": governor.total_bytes(),
         }),
     );
     drop(chunk_tx);
@@ -7596,11 +7991,11 @@ async fn stream_once(
             .await
         }
     };
-    let (full, reasoning_full, usage_chunks, native_tool_calls, rec_buf) = match final_ev {
+    let (full, reasoning_full, usage, native_tool_calls, rec_buf) = match final_ev {
         Some(StreamParserEvent::Done {
             text,
             reasoning,
-            usage_chunks,
+            usage,
             tool_calls,
             rec_buf,
             finished: f,
@@ -7608,10 +8003,10 @@ async fn stream_once(
         }) => {
             finished = f;
             truncated = t;
-            (text, reasoning, usage_chunks, tool_calls, rec_buf)
+            (text, reasoning, usage, tool_calls, rec_buf)
         }
         // Done 丢失（等待超时/通道异常）：用主循环快照兜底，不无限等待
-        _ => (String::new(), String::new(), Vec::new(), Vec::new(), None),
+        _ => (String::new(), String::new(), None, Vec::new(), None),
     };
     // 流读取结束/退出后，优先检查用户是否在此期间点了停止。
     // 否则连接恰在停止前关闭会落到下方 interrupted 分支，主循环自动续写“请继续”，
@@ -7631,7 +8026,7 @@ async fn stream_once(
             stopped: true,
             truncated: false,
             interrupted: false,
-            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
+            usage: kernel_usage_info(usage),
             tool_calls: Vec::new(),
         });
     }
@@ -7647,8 +8042,8 @@ async fn stream_once(
             stopped: false,
             truncated: true,
             interrupted: false,
-            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-            tool_calls: finalize_tool_calls(&native_tool_calls),
+            usage: kernel_usage_info(usage),
+            tool_calls: native_tool_calls,
         });
     }
     // 无结束标记但已有部分正文 / 停滞命中：连接被提前关闭（网络/代理抖动、服务商静默
@@ -7662,8 +8057,8 @@ async fn stream_once(
             stopped: false,
             truncated: false,
             interrupted: true,
-            usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-            tool_calls: finalize_tool_calls(&native_tool_calls),
+            usage: kernel_usage_info(usage),
+            tool_calls: native_tool_calls,
         });
     }
     // 录制模式：仅正常结束路径落盘（截断/中止/报错不录，保证重放数据完整可重放）
@@ -7681,8 +8076,8 @@ async fn stream_once(
         stopped: false,
         truncated: false,
         interrupted: false,
-        usage: crate::services::cost_calculator::extract_usage_from_sse_chunks(&usage_chunks),
-        tool_calls: finalize_tool_calls(&native_tool_calls),
+        usage: kernel_usage_info(usage),
+        tool_calls: native_tool_calls,
     })
 }
 
@@ -7755,7 +8150,7 @@ async fn await_parse_done(
                     return Some(StreamParserEvent::Done {
                         text: snapshot.0.clone(),
                         reasoning: snapshot.1.clone(),
-                        usage_chunks: Vec::new(),
+                        usage: None,
                         tool_calls: Vec::new(),
                         rec_buf: None,
                         finished: false,
@@ -7779,7 +8174,7 @@ async fn await_parse_done(
             Some(StreamParserEvent::Done {
                 text: snapshot.0,
                 reasoning: snapshot.1,
-                usage_chunks: Vec::new(),
+                usage: None,
                 tool_calls: Vec::new(),
                 rec_buf: None,
                 finished: false,
@@ -7805,8 +8200,8 @@ enum StreamParserEvent {
     Done {
         text: String,
         reasoning: String,
-        usage_chunks: Vec<String>,
-        tool_calls: Vec<(usize, String, String)>,
+        usage: Option<crate::agent::agent_kernel::KernelUsage>,
+        tool_calls: Vec<(String, String)>,
         rec_buf: Option<Vec<u8>>,
         finished: bool,
         truncated: bool,
@@ -7837,8 +8232,7 @@ fn stream_parse_thread(
     // reasoning 增量合并缓冲：满 STREAM_REASONING_MERGE_BYTES 发一条事件，
     // 块边界强制 flush（防病态流逐条 IPC 推送堆积烧前端渲染）
     let mut reasoning_pending = String::new();
-    let mut usage_chunks: Vec<String> = Vec::new(); // 收集含 usage 的块（成本统计）
-    let mut native_tool_calls: Vec<(usize, String, String)> = Vec::new();
+    let mut kernel_stream = crate::agent::agent_kernel::KernelStreamAccumulator::default();
     let mut rec_buf: Option<Vec<u8>> = rec_enabled.then(Vec::new);
     let mut finished = false;
     let mut truncated = false;
@@ -7929,12 +8323,9 @@ fn stream_parse_thread(
                         consumed += pos + 1;
                         continue;
                     }
-                    // Usage 只需首尾少量帧；有界保留避免长任务复制全部 token JSON。
-                    retain_usage_chunk(&mut usage_chunks, data);
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(delta) =
-                            crate::utils::net::extract_stream_delta(&protocol, &json)
-                        {
+                        let frame = kernel_stream.ingest(&protocol, &json);
+                        if let Some(delta) = frame.content {
                             if !delta.is_empty() {
                                 full.push_str(&delta);
                                 let _ = event_tx.send(StreamParserEvent::Delta(delta));
@@ -7942,7 +8333,7 @@ fn stream_parse_thread(
                         }
                         // 思考过程增量（推理模型）：合并缓冲，满阈值发一条事件（前端逐条
                         // 重渲染思考区是 renderer 烧核根因，合并后事件量降两个数量级）
-                        if let Some(r) = crate::utils::net::extract_reasoning_delta(&protocol, &json) {
+                        if let Some(r) = frame.reasoning {
                             if !r.is_empty() {
                                 reasoning_pending.push_str(&r);
                                 if reasoning_pending.len() >= STREAM_REASONING_MERGE_BYTES {
@@ -7955,37 +8346,30 @@ fn stream_parse_thread(
                         }
                         // 原生 function calling 增量：先透传事件（async 侧刷新产出打点），
                         // 再按 index 合并累积（name 覆盖 + arguments 拼接）
-                        if let Some((idx, name, args)) =
-                            crate::utils::net::extract_tool_call_delta(&json)
-                        {
+                        if frame.tool_call_deltas > 0 {
                             let _ = event_tx.send(StreamParserEvent::ToolCall);
-                            match native_tool_calls.iter_mut().find(|(i, _, _)| *i == idx) {
-                                Some((_, n, a)) => {
-                                    if let Some(nm) = name {
-                                        n.push_str(&nm);
-                                    }
-                                    if let Some(ar) = args {
-                                        a.push_str(&ar);
-                                    }
-                                }
-                                None => native_tool_calls.push((
-                                    idx,
-                                    name.unwrap_or_default(),
-                                    args.unwrap_or_default(),
-                                )),
-                            }
                         }
-                        match detect_finish(&protocol, &json) {
-                            FinishKind::Done => {
+                        for warning in frame.warnings {
+                            crate::utils::logger::log_event(
+                                "stream_protocol_warning",
+                                serde_json::json!({
+                                    "conversation_id": conversation_id,
+                                    "protocol": protocol,
+                                    "warning": warning,
+                                }),
+                            );
+                        }
+                        match frame.finish {
+                            crate::agent::agent_kernel::KernelStreamFinish::Done => {
                                 finished = true;
                                 let _ = event_tx.send(StreamParserEvent::Finish { truncated: false });
                             }
-                            FinishKind::Truncated => {
+                            crate::agent::agent_kernel::KernelStreamFinish::Truncated => {
                                 truncated = true;
                                 finished = true;
                                 let _ = event_tx.send(StreamParserEvent::Finish { truncated: true });
                             }
-                            FinishKind::None => {}
+                            crate::agent::agent_kernel::KernelStreamFinish::None => {}
                         }
                     }
                 }
@@ -8047,9 +8431,7 @@ fn stream_parse_thread(
                         "lines_parsed": lines_parsed,
                         "buffer_pending": buffer.len(),
                         "produced_chars": full.len(),
-                        "head_chunk": usage_chunks
-                            .first()
-                            .map(|s| s.chars().take(200).collect::<String>()),
+                        "usage_observed": kernel_stream.usage().is_some(),
                         "tail_produced": full.chars().rev().take(200).collect::<String>(),
                     }),
                 );
@@ -8084,8 +8466,12 @@ fn stream_parse_thread(
     let _ = event_tx.send(StreamParserEvent::Done {
         text: full,
         reasoning: reasoning_full,
-        usage_chunks,
-        tool_calls: native_tool_calls,
+        usage: kernel_stream.usage(),
+        tool_calls: kernel_stream
+            .finalized_tool_calls()
+            .into_iter()
+            .map(|call| (call.name, call.arguments))
+            .collect(),
         rec_buf,
         finished,
         truncated,
@@ -8101,46 +8487,6 @@ fn replay_sse_response(text: &str) -> reqwest::Response {
         .body(reqwest::Body::from(text.to_string()))
         .expect("构造重放响应失败")
         .into()
-}
-
-/// 原生 tool_calls 累积 → (工具名, 参数 JSON) 列表（按 index 排序）
-fn finalize_tool_calls(calls: &[(usize, String, String)]) -> Vec<(String, String)> {
-    let mut sorted: Vec<&(usize, String, String)> = calls.iter().collect();
-    sorted.sort_by_key(|(i, _, _)| *i);
-    sorted
-        .into_iter()
-        .map(|(_, name, args)| (name.clone(), args.clone()))
-        .collect()
-}
-
-/// 流式结束标记检测（协议差异：openai 的 finish_reason / anthropic 的 message_stop / gemini 的 finishReason）
-enum FinishKind {
-    None,
-    Done,
-    Truncated,
-}
-
-fn detect_finish(protocol: &str, json: &serde_json::Value) -> FinishKind {
-    match protocol {
-        "anthropic" => match json["type"].as_str() {
-            Some("message_stop") => FinishKind::Done,
-            Some("message_delta") => match json["delta"]["stop_reason"].as_str() {
-                Some("max_tokens") => FinishKind::Truncated,
-                _ => FinishKind::None,
-            },
-            _ => FinishKind::None,
-        },
-        "gemini" => match json["candidates"][0]["finishReason"].as_str() {
-            Some("STOP") => FinishKind::Done,
-            Some("MAX_TOKENS") => FinishKind::Truncated,
-            _ => FinishKind::None,
-        },
-        _ => match json["choices"][0]["finish_reason"].as_str() {
-            Some("stop") | Some("tool_calls") => FinishKind::Done,
-            Some("length") => FinishKind::Truncated,
-            _ => FinishKind::None,
-        },
-    }
 }
 
 /// ship 注册表审计：收尾总结中“已验证/测试通过/已修复”等完成声明（CLAIM）未在声明后的
@@ -8198,35 +8544,7 @@ fn has_unverified_claim(text: &str) -> bool {
     false
 }
 
-/// 未完话术检测：模型承诺继续动作（先读取/继续查看/补全…）但未输出工具标记
-/// （任务实际未完成却正常收尾），命中后由主循环注入纠正提示继续。
-/// 用“计划词+动作词”组合替代枚举短语，覆盖模型的各种表达；含总结/交付信号的不算。
-fn has_pending_action_phrase(text: &str) -> bool {
-    // 总结/交付信号：命中即视为收尾（最终代码、报告、结论等），不再纠正。
-    // 注意：代码块 ``` 不是收尾信号——模型常先输出代码再描述“接下来执行”，
-    // 若视为收尾会让未完任务静默结束；真正的完成由“已完成/结论”等词判定
-    const DONE_SIGNALS: &[&str] = &[
-        "总结", "结论", "已完成", "以上就是", "最终版", "效果如下",
-        "全部完成", "修改完成", "实施完成", "核查完成", "检查完成", "报告如下", "综上所述",
-    ];
-    if DONE_SIGNALS.iter().any(|s| text.contains(s)) {
-        return false;
-    }
-    // 计划词：表示“接下来要做”的意图
-    const PLAN_WORDS: &[&str] = &[
-        "还需", "还需要", "还要", "仍需", "先", "继续", "接着", "接下来", "下一步",
-        "然后", "再", "补全", "待会", "稍后", "准备", "开始", "需要先",
-    ];
-    // 动作词：工具型动作
-    const ACTION_WORDS: &[&str] = &[
-        "读取", "查看", "检查", "阅读", "执行", "修改", "分析", "确认", "验证",
-        "测试", "构建", "部署", "美化", "设计", "优化", "完善", "调整", "编写",
-        "创建", "删除", "更新", "看看", "处理", "读一下", "看下",
-    ];
-    PLAN_WORDS.iter().any(|p| text.contains(p)) && ACTION_WORDS.iter().any(|a| text.contains(a))
-}
-
-/// 行动承诺检测：模型宣布“开始开发/创建/新建/实现”等当前行动或仅输出方案计划（如
+/// 行动承诺检测：模型宣布”开始开发/创建/新建/实现”等当前行动或仅输出方案计划（如
 /// “方案如下：新建 pages/Login.ets …”）但未输出任何【TOOL】标记时命中（任务实际未执行
 /// 却正常收尾），由主循环注入纠正提示继续。与 has_pending_action_phrase（承诺“还需/继续”
 /// 做某事）互补：本函数针对“现在就开始做”的承诺式表达与“只给计划不给执行”的假完成，
@@ -8700,20 +9018,10 @@ fn resolve_agent_model(
             ));
         }
     }
-    // 3) 未指定任何模型：自动路由到同 Provider 更便宜的模型（简单任务成本优化）
-    if let Some(econ) =
-        model_router::pick_economy_model(&conn, &main_provider.provider_id, &main_choice.model)
-    {
-        return Ok((
-            main_provider.clone(),
-            ModelChoice {
-                provider_id: main_provider.provider_id.clone(),
-                model: econ,
-                use_proxy: main_choice.use_proxy,
-                // 经济模型未单独查询 output_limit：沿用主模型值（同 Provider 配置通常一致）
-                output_limit: main_choice.output_limit,
-            },
-        ));
+    // 3) 未指定任何模型：自动路由到 auto 辅助池更便宜的模型（简单任务成本优化）
+    drop(conn);
+    if let Some((ep, mc)) = resolve_aux_economy(state, main_provider, main_choice) {
+        return Ok((ep, mc));
     }
     // 4) 跟随主模型
     Ok((main_provider.clone(), main_choice.clone()))
@@ -8880,6 +9188,7 @@ async fn run_subagent(
                 app: Some(app.clone()),
                 conversation_id: conversation_id.to_string(),
                 run_id: child_run_id.to_string(),
+                tool_call_id: Some(call_id.clone()),
                 spawn_remaining: limits.max_depth.unwrap_or(0),
             };
             let args_val: serde_json::Value =
@@ -8889,6 +9198,7 @@ async fn run_subagent(
                 args: &args_val,
                 args_raw: &args_raw,
                 project_id,
+                project_path,
                 roots: path_hints,
                 conversation_id,
                 approval_mode,
@@ -9091,7 +9401,7 @@ async fn run_tool_in_lane(
     let path_owned = project_path.to_string();
     let hints_owned = path_hints.to_vec();
     let pid_owned = project_id.to_string();
-    let ctx_owned = tool_ctx.clone();
+    let ctx_owned = tool_ctx.clone().with_tool_call_id(call_id.to_string());
     let fut = async move {
         if crate::agent::evals::take_fault("tool_worker_panic") {
             panic!("reliability fault injection: tool_worker_panic");
@@ -9125,10 +9435,13 @@ async fn run_tool_in_lane(
             },
             _ = &mut deadline => {
                 // 超时：先请求停止（消费停止标志并杀进程树），再放弃等待并归因卡死。
-                crate::agent::exec_ctx::request_stop_tool(conversation_id);
+                let revocation = crate::agent::broker_approval::stop_and_revoke(
+                    state, conversation_id, crate::agent::broker_approval::StopReason::Timeout,
+                );
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut lane.result).await;
                 mark_tool_stuck(state, call_id);
-                return Err(format!("工具执行超时（>{}s）：{tool}，已请求终止；不会自动重试有副作用工具", timeout.as_secs()));
+                let detail = revocation.err().map(|error| format!("；{error}")).unwrap_or_default();
+                return Err(format!("工具执行超时（>{}s）：{tool}，已请求终止；不会自动重试有副作用工具{detail}", timeout.as_secs()));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
                 if let Some(registry) = registry {
@@ -9136,10 +9449,13 @@ async fn run_tool_in_lane(
                 }
                 if let Some(cancel) = cancel {
                     if is_cancelled(cancel, conversation_id) {
-                        crate::agent::exec_ctx::request_stop_tool(conversation_id);
+                        let revocation = crate::agent::broker_approval::stop_and_revoke(
+                            state, conversation_id, crate::agent::broker_approval::StopReason::User,
+                        );
                         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut lane.result).await;
                         mark_tool_stuck(state, call_id);
-                        return Err("用户已停止生成".into());
+                        let detail = revocation.err().map(|error| format!("；{error}")).unwrap_or_default();
+                        return Err(format!("用户已停止生成{detail}"));
                     }
                 }
             }
@@ -9303,15 +9619,17 @@ async fn execute_tool_batch_one(
     begin_tool_run(state, conversation_id, &tool_ctx.run_id, &call_id, tool, args_raw);
     let args_val: serde_json::Value =
         serde_json::from_str(args_raw).unwrap_or(serde_json::Value::Null);
+    let approval_ctx = tool_ctx.clone().with_tool_call_id(call_id.clone());
     let inv = crate::agent::tools::ToolInvocation {
         name: tool,
         args: &args_val,
         args_raw,
         project_id,
+        project_path,
         roots: path_hints,
         conversation_id,
         approval_mode: approval_mode(opts),
-        ctx: tool_ctx,
+        ctx: &approval_ctx,
     };
     // 统一护栏预检（与串行路径同套钩子）：拦截即返回，收尾由调用方统一处理
     if let Err(intercept) = crate::agent::tools::run_pre_hooks(&inv).await {
@@ -9378,9 +9696,11 @@ async fn execute_tool_batch_one(
             "args": args_raw.chars().take(200).collect::<String>(),
         }),
     );
-    let retried = retry_with_backoff(
+    let contract = crate::agent::tools::contracts::contract(tool);
+    let retried = run_tool_with_retry(
+        &contract,
         &TOOL_POLICY,
-        &mut || {
+        || {
             run_tool_with_guard(
                 tool,
                 args_raw,
@@ -9396,19 +9716,11 @@ async fn execute_tool_batch_one(
                 &call_id,
             )
         },
-        |e: &String| tool_retry_safe(tool) && crate::agent::tools::is_retryable_err(e),
-        |_| None,
     )
     .await;
     tool_limits::record_tool_call(conversation_id, tool, args_raw);
     let duration_ms = tool_started.elapsed().as_millis() as i64;
-    let mut result = match retried.value {
-        Ok(out) if retried.attempts > 1 => Ok(format!(
-            "（首次执行超时/网络错误，已自动重试 {} 次）\n{out}",
-            retried.attempts - 1
-        )),
-        other => other,
-    };
+    let mut result = retried.value.map(|out| retry_notice(out, retried.attempts));
     // 统一护栏后处理：护栏记录/大输出落盘由 pipeline post 钩子改写结果
     crate::agent::tools::run_post_hooks(&inv, &mut result).await;
     let (ok, output) = match &result {
@@ -9650,12 +9962,6 @@ async fn apply_tool_batch(
         }
     }
     intercepted
-}
-
-/// 动态历史窗口：按模型上下文预算估算初始条数（预算大窗口大；配合主动压缩与
-/// 持久摘要，保证早期对话要点不丢的同时尽量保留近期细节）
-fn dynamic_history_limit(context_budget: i64) -> usize {
-    ((context_budget / 3000) as usize).clamp(20, 60)
 }
 
 /// 从文本提取到的目录路径及其语境分类。
@@ -10141,12 +10447,6 @@ fn load_persisted_summary(
     .filter(|s| !s.trim().is_empty())
 }
 
-/// 估算请求 token：统一走 utils::tokenizer 的混合文本预估
-/// （中文 1 字符≈1 token、英文 4 字符≈1 token，比旧的"字符数/2"更贴近真实量级）
-fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
-    crate::utils::tokenizer::estimate_messages_tokens(messages)
-}
-
 /// 上下文超限时的滚动摘要：取将被裁剪的最旧历史，用经济模型压成结构化摘要。
 /// 失败（网络/解析/无历史）时返回 None，调用方降级为纯裁剪，不阻塞主流程。
 /// cancel：摘要请求期间可被用户停止中断（压缩请求此前无停止检查/超时，是“空跑+停止无效”的卡点之一）
@@ -10332,13 +10632,10 @@ async fn summarize_rolling_history(
     };
 
     // 4. 经济模型（非核心推理：有更便宜模型时用它省主模型预算；无则回退主模型）
-    let summary_model = {
-        let conn = state.0.lock().ok()?;
-        model_router::pick_economy_model(&conn, &provider.provider_id, &model_choice.model)
-            .unwrap_or_else(|| model_choice.model.clone())
+    let (summary_provider, summary_choice) = match resolve_aux_economy(state, provider, model_choice) {
+        Some((ep, mc)) => (ep, mc),
+        None => (provider.clone(), model_choice.clone()),
     };
-    let mut summary_choice = model_choice.clone();
-    summary_choice.model = summary_model;
 
     // 5. 结构化摘要（4 段式模板；已有旧摘要时增量更新）
     let prev_note = match prev_summary {
@@ -10377,7 +10674,7 @@ async fn summarize_rolling_history(
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1000 << (attempt - 1))).await;
         }
-        match non_stream_request(client, provider, &summary_choice, &messages, cancel, conversation_id, Some(summary_max_tokens))
+        match non_stream_request(client, &summary_provider, &summary_choice, &messages, cancel, conversation_id, Some(summary_max_tokens))
             .await
         {
             Ok(s) => {
@@ -10564,65 +10861,19 @@ async fn non_stream_request(
             )),
         };
     }
-    let base = provider.base_url.trim_end_matches('/');
-    let system = messages[0]["content"].as_str().unwrap_or("").to_string();
-    // Anthropic 协议不认识 OpenAI 的 reasoning_content 字段，剥离（reasoning 合规回传仅 OpenAI 协议）
-    let history: Vec<serde_json::Value> = messages[1..]
-        .iter()
-        .map(|m| {
-            let mut mm = m.clone();
-            if let serde_json::Value::Object(map) = &mut mm {
-                map.remove("reasoning_content");
-            }
-            mm
-        })
-        .collect();
-    let (url, body) = match provider.protocol.as_str() {
-        "anthropic" => (
-            format!("{base}/v1/messages"),
-            serde_json::json!({
-                "model": model_choice.model,
-                "max_tokens": max_tokens.unwrap_or(4096),
-                "system": system,
-                "messages": history,
-            }),
-        ),
-        "gemini" => (
-            format!("{base}/v1beta/models/{}:generateContent", model_choice.model),
-            serde_json::json!({
-                "contents": history
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "role": if m["role"] == "assistant" { "model" } else { "user" },
-                            "parts": [{"text": m["content"]}],
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                "systemInstruction": {"parts": [{"text": system}]},
-                "maxOutputTokens": max_tokens.unwrap_or(4096),
-            }),
-        ),
-        _ => {
-            // DeepSeek 推理模型合规净化（与流式同口径）：非推理模型剥离 reasoning_content、
-            // 推理模型对缺失/为空的 assistant 消息填占位符（子 Agent/压缩等调用方消息
-            // 可能来自任意来源，发送前统一兜底防 400）
-            let (messages_san, _, _) =
-                sanitize_thinking_messages(messages, &model_choice.model, None);
-            (
-                format!("{base}/chat/completions"),
-                serde_json::json!({ "model": model_choice.model, "messages": messages_san, "max_tokens": max_tokens.unwrap_or(4096) }),
-            )
-        }
-    };
-    let mut req = client.post(&url).json(&body);
-    if let Some(ref key) = provider.api_key {
-        match provider.protocol.as_str() {
-            "anthropic" => req = req.header("x-api-key", key).header("anthropic-version", "2023-06-01"),
-            "gemini" => req = req.header("x-goog-api-key", key),
-            _ => req = req.header("Authorization", format!("Bearer {key}")),
-        }
-    }
+    let request_plan = crate::agent::agent_kernel::build_model_request_plan(
+        &provider.protocol,
+        &provider.base_url,
+        &model_choice.model,
+        messages,
+        None,
+        false,
+        Some(max_tokens.unwrap_or(4096).min(u32::MAX as usize) as u32),
+        None,
+        None,
+        None,
+    )?;
+    let req = request_builder_from_plan(client, provider, &request_plan);
     crate::utils::logger::log_event(
         "non_stream_start",
         serde_json::json!({
@@ -10899,21 +11150,6 @@ fn build_auto_rag_hint(api_dir: &str, query: &str, api_ver: Option<&str>) -> Str
 }
 
 
-fn parse_data_url(url: &str) -> Option<(String, String)> {
-    let rest = url.strip_prefix("data:")?;
-    let (meta, data) = rest.split_once(',')?;
-    if !meta.contains("base64") || data.is_empty() {
-        return None;
-    }
-    let mime = meta
-        .split(';')
-        .next()
-        .filter(|m| m.starts_with("image/"))
-        .unwrap_or("image/png")
-        .to_string();
-    Some((mime, data.to_string()))
-}
-
 /// 从 take_screenshot 工具输出中提取 [VISION_IMAGE: <路径>] 标记的路径（无标记返回 None）
 fn extract_vision_image_path(out: &str) -> Option<String> {
     let start = out.find("[VISION_IMAGE:")?;
@@ -10937,7 +11173,7 @@ async fn generate_conversation_title(
     endpoints_json: String,
 ) -> Result<(), String> {
     let state = app.state::<DbState>();
-    // 1. Provider 默认模型 + 经济模型路由（无更便宜模型时跟随默认）
+    // 1. Provider 默认模型（锚点）+ 经济模型路由：辅助池内更便宜则跨 provider 切换
     let main_model: String = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(
@@ -10957,16 +11193,9 @@ async fn generate_conversation_title(
         )
         .unwrap_or(false)
     };
-    let model = {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
-        crate::services::model_router::pick_economy_model(&conn, &provider_id, &main_model)
-            .unwrap_or(main_model.clone())
-    };
-    // 2. 非流式请求：提炼标题（内容截断护栏：超长任务指令只取开头）
-    let client = crate::utils::net::build_client(use_proxy)?;
     let endpoints: Vec<crate::db::models::EndpointDef> =
         serde_json::from_str(&endpoints_json).unwrap_or_default();
-    let mut ep = ProviderEndpoint {
+    let mut main_ep = ProviderEndpoint {
         provider_id: provider_id.clone(),
         base_url,
         api_key,
@@ -10977,8 +11206,20 @@ async fn generate_conversation_title(
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         crate::services::key_store::load_provider_key(&conn, &provider_id)
     } {
-        ep.api_key = k;
+        main_ep.api_key = k;
     }
+    let main_mc = ModelChoice {
+        provider_id: provider_id.clone(),
+        model: main_model.clone(),
+        use_proxy,
+        output_limit: 8192,
+    };
+    let (ep, mc) = match resolve_aux_economy(&state, &main_ep, &main_mc) {
+        Some((e, m)) => (e, m),
+        None => (main_ep, main_mc),
+    };
+    // 2. 非流式请求：提炼标题（内容截断护栏：超长任务指令只取开头）
+    let client = crate::utils::net::build_client(mc.use_proxy)?;
     let snippet: String = first_content.chars().take(400).collect();
     // 标题语言跟随首条消息：检测到具体语言则点名（如“中文/英文”），否则不限定语言
     let lang_hint = crate::services::language::detect_language(&snippet)
@@ -10994,7 +11235,7 @@ async fn generate_conversation_title(
         )
     };
     let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
-    let text = non_stream_request(&client, &ep, &ModelChoice { provider_id, model: model.clone(), use_proxy, output_limit: 8192 }, &messages, None, "", None).await?;
+    let text = non_stream_request(&client, &ep, &mc, &messages, None, "", None).await?;
     let title: String = text
         .trim()
         .trim_matches(|c| matches!(c, '"' | '“' | '”' | '「' | '」' | '\''))
@@ -11130,8 +11371,8 @@ pub async fn compact_conversation(
     if total <= keep + 2 {
         return Err("会话历史较短，无需压缩".into());
     }
-    // 激活 provider + 模型
-    let (provider, model_choice) = {
+    // 激活 provider（锚点）
+    let (main_ep, main_mc) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         let row = conn
             .query_row(
@@ -11165,17 +11406,17 @@ pub async fn compact_conversation(
         if let Ok(k) = crate::services::key_store::load_provider_key(&conn, &ep.provider_id) {
             ep.api_key = k;
         }
-        (
-            ep.clone(),
-            ModelChoice {
-                provider_id: ep.provider_id.clone(),
-                model: model_router::pick_economy_model(&conn, &ep.provider_id, &row.5)
-                    .unwrap_or_else(|| row.5.clone()),
-                use_proxy: row.6,
-                output_limit: 8192,
-            },
-        )
+        let mc = ModelChoice {
+            provider_id: ep.provider_id.clone(),
+            model: row.5.clone(),
+            use_proxy: row.6,
+            output_limit: 8192,
+        };
+        (ep, mc)
     };
+    // 经济模型路由：辅助池内更便宜则跨 provider 切换（无更便宜时跟随锚点）
+    let (provider, model_choice) =
+        resolve_aux_economy(&state, &main_ep, &main_mc).unwrap_or((main_ep, main_mc));
     let client = crate::utils::net::build_client(model_choice.use_proxy)?;
     let ctx_limit: Option<i64> = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
@@ -11282,9 +11523,12 @@ fn delete_conversation_inner(
         set.insert(id.to_string());
     }
     crate::agent::ask::cancel_conversation(id);
-    crate::agent::exec_ctx::request_stop_tool(id);
+    let revocation = crate::agent::broker_approval::stop_and_revoke(
+        state, id, crate::agent::broker_approval::StopReason::ConversationDeleted,
+    );
     // 2. 立即 abort 正在运行的 tokio 任务，并从注册表移除（看门狗不再追猎）
     registry.abort_conversation(id);
+    revocation?;
     // 3. 释放项目级会话锁：仅当持有者确实是本会话时才移除，避免误删其他会话的锁
     if let Ok(mut g) = lock.0.lock() {
         if g.values().any(|v| v == id) {
@@ -11524,8 +11768,8 @@ pub async fn summarize_memory(
         return Err("会话还没有可总结的内容".into());
     }
 
-    // 2. 当前激活 Provider + 默认模型（非流式一次请求）
-    let (provider, model_choice) = {
+    // 2. 当前激活 Provider（锚点）
+    let (main_ep, main_mc) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         let row = conn
             .query_row(
@@ -11559,18 +11803,17 @@ pub async fn summarize_memory(
         if let Ok(k) = crate::services::key_store::load_provider_key(&conn, &ep.provider_id) {
             ep.api_key = k;
         }
-        (
-            ep.clone(),
-            ModelChoice {
-                provider_id: ep.provider_id.clone(),
-                // 记忆提取属非核心推理：有更便宜模型时用经济模型（省主模型预算）
-                model: model_router::pick_economy_model(&conn, &ep.provider_id, &row.5)
-                    .unwrap_or_else(|| row.5.clone()),
-                use_proxy: row.6,
-                output_limit: 8192,
-            },
-        )
+        let mc = ModelChoice {
+            provider_id: ep.provider_id.clone(),
+            model: row.5.clone(),
+            use_proxy: row.6,
+            output_limit: 8192,
+        };
+        (ep, mc)
     };
+    // 记忆提取属非核心推理：辅助池内更便宜则跨 provider 切换（无更便宜时跟随锚点）
+    let (provider, model_choice) =
+        resolve_aux_economy(&state, &main_ep, &main_mc).unwrap_or((main_ep, main_mc));
 
     // 3. 请求 LLM 提取（JSON 输出；解析失败时给出可读错误）
     let client = crate::utils::net::build_client(model_choice.use_proxy)?;
@@ -11731,18 +11974,6 @@ mod completion_confirmation_tests {
         assert!(!is_completion_confirmation("（工具结果）构建失败，正在排查"));
         assert!(!is_completion_confirmation("好的，我继续读取文件"));
         assert!(!is_completion_confirmation(""));
-    }
-
-    #[test]
-    fn usage_chunk_retention_is_bounded_and_keeps_edges() {
-        let mut chunks = Vec::new();
-        for i in 0..200 {
-            retain_usage_chunk(&mut chunks, &format!("chunk-{i}"));
-        }
-        assert_eq!(chunks.len(), 64);
-        assert_eq!(chunks.first().map(String::as_str), Some("chunk-0"));
-        assert!(chunks.iter().any(|s| s == "chunk-7"));
-        assert_eq!(chunks.last().map(String::as_str), Some("chunk-199"));
     }
 }
 

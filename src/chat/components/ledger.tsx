@@ -12,6 +12,8 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
   const { ledger, finished } = state
   if (!ledger) return null
   const running = !finished
+  const totalGoals = ledger.verified.length + ledger.open.length
+
   return (
     <div className="overflow-hidden animate-fade-in-up">
       <button
@@ -30,6 +32,11 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
             <span className="text-[11px] text-[var(--text-muted)] ml-2 truncate">{ledger.goal}</span>
           )}
         </div>
+        {totalGoals > 0 && (
+          <span className="text-[10px] text-[var(--text-muted)] tabular-nums shrink-0">
+            {ledger.verified.length}/{totalGoals}
+          </span>
+        )}
         <span
           className={`text-[11px] shrink-0 flex items-center gap-1 ${
             running ? 'text-[var(--accent)]' : 'text-[var(--text-muted)]'
@@ -53,30 +60,30 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
           {ledger.verified.length > 0 && (
             <div className="space-y-0.5">
               {ledger.verified.map((e) => (
-                <div key={e.n} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
-                  <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
-                  <span className="min-w-0 flex-1">
-                    <span className="text-[var(--text-muted)]">
-                      #{e.n} [{e.tool}]{' '}
+                  <div key={e.n} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+                    <Icon name="check" size={11} className="shrink-0 mt-0.5 text-[var(--success)]" />
+                    <span className="min-w-0 flex-1">
+                      <span className="text-[var(--text-muted)]">
+                        #{e.n} [{e.tool}]{' '}
+                      </span>
+                      <span className="text-[var(--text-secondary)]">{e.text}</span>
                     </span>
-                    <span className="text-[var(--text-secondary)]">{e.text}</span>
-                  </span>
-                </div>
+                  </div>
               ))}
             </div>
           )}
           {ledger.open.length > 0 && (
             <div className="space-y-0.5">
               {ledger.open.map((e) => (
-                <div key={e.n} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
-                  <Icon name="close" size={11} className="text-[var(--danger)] shrink-0 mt-0.5" />
-                  <span className="min-w-0 flex-1">
-                    <span className="text-[var(--text-muted)]">
-                      #{e.n} [{e.tool}]{' '}
+                  <div key={e.n} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+                    <Icon name="close" size={11} className="shrink-0 mt-0.5 text-[var(--danger)]" />
+                    <span className="min-w-0 flex-1">
+                      <span className="text-[var(--text-muted)]">
+                        #{e.n} [{e.tool}]{' '}
+                      </span>
+                      <span className="text-[var(--text-secondary)]">{e.text}</span>
                     </span>
-                    <span className="text-[var(--text-secondary)]">{e.text}</span>
-                  </span>
-                </div>
+                  </div>
               ))}
             </div>
           )}

@@ -1,6 +1,6 @@
 [package]
 name = "deveco-switch"
-version = "2.1.1"
+version = "2.2.0"
 edition = "2021"
 description = "DevEco Code Provider Manager"
 # 多二进制（deveco-switch 主程序 / full_fetch 数据脚本）时让 cargo run/tauri dev 默认选中主程序；
@@ -26,6 +26,8 @@ embedding = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep
 cuda = ["embedding", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 # 数据抓取工具 full_fetch 的独立开关（见 [[bin]] required-features）
 full-fetch = []
+# Headless Agent 评测 CLI；显式启用，避免 Tauri 日常构建额外打包命令行二进制。
+eval-cli = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -63,10 +65,28 @@ pdf-extract = { version = "0.7", default-features = false }
 fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
+libc = "0.2"
 encoding_rs = "0.8"
 sha2 = "0.10"
 ring = "0.17"
 regex = "1"
+notify = "8.2"
+tree-sitter = "0.24.7"
+tree-sitter-arkts = "0.2.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-java = "=0.23.5"
+# 下面这些 grammar 必须与 tree-sitter 0.24.x 的语法 ABI 上限（14）兼容：0.24+/0.25 版本换成 ABI 15 的
+# ABI 15，会在**运行时**初始化失败（编译期看不出来），所以锁在 0.23 系列。
+# 只有整体升级 tree-sitter 时才能一起抬（新增 grammar 前先查源码里的 LANGUAGE_VERSION，别等运行时才炸）。
+tree-sitter-go = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+# Dart 同理：0.2.0 是 ABI 15 跑不起来，0.0.4 兼容但用的是旧 API（language()）。
+tree-sitter-dart = "0.0"
+tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-cpp = "0.23"
+# Swift 的 0.7.x 是 ABI 15（不兼容），锁 0.6（ABI 14 且走 tree-sitter-language）。
+tree-sitter-swift = "0.6"
 local-ip-address = "0.6"
 candle-core = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
@@ -79,6 +99,11 @@ candle-nn = { version = "0.11", optional = true }
 name = "full_fetch"
 path = "src/bin/full_fetch.rs"
 required-features = ["full-fetch"]
+
+[[bin]]
+name = "harmony-agent"
+path = "src/bin/harmony_agent.rs"
+required-features = ["eval-cli"]
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 # 隐藏控制台（AllocConsole + SW_HIDE）：构建类子进程（hvigor worker 等孙进程）

@@ -215,7 +215,7 @@ fn clean_args_tail(args: &str) -> String {
 
 /// 生成系统提示中的工具说明
 fn selected_specs(query: &str) -> Vec<&'static super::ToolSpec> {
-    let names = super::capabilities::selected_tool_names(query, 40);
+    let names = super::capabilities::selected_tool_names(query, super::capabilities::RESIDENT_TOOL_LIMIT);
     names.into_iter().filter_map(|name| {
         TOOL_SPECS.iter().find(|spec| spec.name == name)
     }).collect()
@@ -225,7 +225,7 @@ fn selected_specs_for_phase(
     query: &str,
     phase: super::capabilities::TaskPhase,
 ) -> Vec<&'static super::ToolSpec> {
-    super::capabilities::selected_tool_names_for_phase(query, phase, 32)
+    super::capabilities::selected_tool_names_for_phase(query, phase, super::capabilities::RESIDENT_TOOL_LIMIT)
         .into_iter()
         .filter_map(|name| TOOL_SPECS.iter().find(|spec| spec.name == name))
         .collect()
@@ -284,7 +284,7 @@ fn system_hint_from_specs<'a>(specs: impl Iterator<Item = &'a super::ToolSpec>) 
          - 需要读取多个文件/执行多步操作时，可在一条回复中连续输出多个工具标记，系统会依次执行；\n\
          - 复杂多步骤任务开始前先 todo_write 拆分清单，完成一项标记一项，界面会实时展示进度；\n\
          - 改完 UI 并部署后，用 take_screenshot 截图验证：截图会自动以图片形式进入你的视野，直接观察真机界面，判断布局/样式/文字是否达标，再决定是否继续修；\n\
-         - 修改代码前先定位再动手：优先 codebase_search / get_symbol_details / search_symbols 找到目标，read_file 精读后 edit_file 小步修改；\n\
+         - 修改代码前先定位再动手：默认先用 search_symbols 按 entity/logic 结构定位并取得签名与完整行区间，再用 read_file 读取目标区块；需要文本召回或索引覆盖不足时用 codebase_search/LSP 补查，跨结构上下文确有必要时才读全文；\n\
          - 接手陌生工程或大范围重构前先 deep_scan 了解全库结构与依赖；改完代码后用 check_code 自查调试残留/硬编码密钥等常见问题；\n\
          - 大任务可 spawn_agents 并行委派互不依赖的子任务，执行后用 list_agents 回看各子任务结果；\n\
          - 工具执行失败时，根据错误信息分析原因，给出修复建议或改用其他工具；不要编造工具结果；\n\
@@ -888,6 +888,48 @@ fn find_ci_ascii(haystack: &str, needle: &str) -> Option<usize> {
     (0..=h.len() - n.len()).find(|&i| {
         haystack.is_char_boundary(i) && (0..n.len()).all(|j| h[i + j].to_ascii_lowercase() == n[j])
     })
+}
+
+/// 未完话术检测：模型回复含"还需/继续"+ 动作词（读取/查看/修改…）但未含总结/交付信号时，
+/// 视为"承诺接下来要做某事"的过渡回复；历史回放时省略此类消息，防止模型模仿话术风格。
+///
+/// 代码块 ``` 不是收尾信号——模型常先输出代码再描述"接下来执行"，若视为收尾会让未完任务
+/// 静默结束；真正的完成由"已完成/结论"等词判定。
+pub fn has_pending_action_phrase(text: &str) -> bool {
+    const DONE_SIGNALS: &[&str] = &[
+        "总结", "结论", "已完成", "以上就是", "最终版", "效果如下",
+        "全部完成", "修改完成", "实施完成", "核查完成", "检查完成", "报告如下", "综上所述",
+    ];
+    if DONE_SIGNALS.iter().any(|s| text.contains(s)) {
+        return false;
+    }
+    const PLAN_WORDS: &[&str] = &[
+        "还需", "还需要", "还要", "仍需", "先", "继续", "接着", "接下来", "下一步",
+        "然后", "再", "补全", "待会", "稍后", "准备", "开始", "需要先",
+    ];
+    const ACTION_WORDS: &[&str] = &[
+        "读取", "查看", "检查", "阅读", "执行", "修改", "分析", "确认", "验证",
+        "测试", "构建", "部署", "美化", "设计", "优化", "完善", "调整", "编写",
+        "创建", "删除", "更新", "看看", "处理", "读一下", "看下",
+    ];
+    PLAN_WORDS.iter().any(|p| text.contains(p)) && ACTION_WORDS.iter().any(|a| text.contains(a))
+}
+
+/// 解析 data URL（`data:image/...;base64,...`）为 (mime, base64_data)。
+/// 非 image mime 或非 base64 编码返回 None。
+pub fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if !meta.contains("base64") || data.is_empty() {
+        return None;
+    }
+    let mime = meta
+        .split(';')
+        .next()
+        .filter(|m| m.starts_with("image/"))
+        .unwrap_or("image/png")
+        .to_string();
+    Some((mime, data.to_string()))
 }
 
 #[cfg(test)]

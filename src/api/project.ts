@@ -1,5 +1,6 @@
 import { invokeWithError } from './invoke'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { ImpactContract } from '../stores/projectStoreTypes'
 
 export interface Project {
   id: string
@@ -141,12 +142,14 @@ export const resolvePlanReview = (
   requestId: string,
   approved: boolean,
   feedback?: string,
+  revisedPlan?: string,
 ) =>
   invokeWithError<void>('resolve_plan_review', {
     conversationId,
     requestId,
     approved,
     feedback,
+    revisedPlan,
   })
 
 /** 任务清单条目（todo_write 工具维护，agent:todo 事件推送） */
@@ -225,6 +228,8 @@ export interface PendingConfirmation {
   args: string | null
   level: string | null
   desc: string | null
+  /** 影响契约（仅有审批类待确认项时有值；与弹窗口径一致，用于会话恢复后展示） */
+  impact?: ImpactContract | null
   plan: string | null
   question: string | null
   options: string[] | null
@@ -456,6 +461,8 @@ export interface AgentRun {
   heartbeat_at: number | null
   lease_expires_at: number | null
   quality_json: string | null
+  /** 用户最终批准的计划；中断恢复后仍作为执行锚点。 */
+  approved_plan: string | null
   error: string | null
   started_at: number
   updated_at: number
@@ -842,6 +849,8 @@ export const stopChat = (conversationId: string) => invokeWithError<void>('stop_
 
 /** 停止当前正在执行的工具（不终止整个任务）：强杀子进程，模型拿到中断反馈后继续生成结论 */
 export const stopTool = (conversationId: string) => invokeWithError<void>('stop_tool', { conversationId })
+export const revokeOtaApproval = (callId: string) => invokeWithError<void>('revoke_ota_approval', { callId })
+export const getOtaApprovalRevoked = (callId: string) => invokeWithError<boolean>('get_ota_approval_revoked', { callId })
 
 export const renameConversation = (id: string, title: string) =>
   invokeWithError<void>('rename_conversation', { id, title })

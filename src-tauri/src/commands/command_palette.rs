@@ -105,7 +105,7 @@ pub fn list_palette_commands() -> Vec<PaletteEntry> {
         action("slash_tool_help", "查工具帮助", "tool_help name=<工具名>", "治理", "info"),
         action("slash_tool_history", "查工具调用历史", "查最近 N 次工具调用记录", "治理", "clock"),
         action("slash_tools_health", "工具链体检", "轻量 ping hvigorw/hdc/ohpm 等", "治理", "health"),
-        action("slash_sandbox_exec", "危险命令干跑", "在沙箱目录模拟执行 + 预览", "治理", "archive"),
+        action("slash_sandbox_exec", "临时副本试运行", "复制到临时目录执行；不提供系统级隔离", "治理", "archive"),
         // 多模态
         action("slash_docx_read", "读 Word 文档", "读 .docx 正文", "多模态", "document"),
         action("slash_audio_transcribe", "语音转文字", "调 whisper.cpp 转录音频", "多模态", "send"),

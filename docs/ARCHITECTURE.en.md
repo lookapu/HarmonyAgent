@@ -37,7 +37,7 @@ The project started as a Provider manager; today its core is the Rust-backed Age
 │   DAG / recovery / governance                                │
 │                                                              │
 │ Tool Execution Kernel                                       │
-│   201 tools / approval pipeline / dedicated threads /        │
+│   204 tools / approval pipeline / dedicated threads /        │
 │   leases / fencing / idempotency                             │
 │                                                              │
 │ Services                                                     │
@@ -46,7 +46,7 @@ The project started as a Provider manager; today its core is the Rust-backed Age
 └────────────────────────────┬─────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────┐
-│ SQLite (77 migrations) + local files/keychain + external     │
+│ SQLite (84 migrations) + local files/keychain + external     │
 │ toolchain                                                    │
 │ HarmonyOS SDK / hvigor / ohpm / hdc / ArkTS LSP              │
 └──────────────────────────────────────────────────────────────┘
@@ -56,13 +56,13 @@ Current codebase scale:
 
 | Item | Actual value |
 |---|---:|
-| Agent-facing tools | 201 |
-| `agent/` top-level modules (excluding `mod.rs`) | 36 |
-| `agent/tools/` Rust files (incl. `mod.rs`) | 30 |
+| Agent-facing tools | 204 |
+| `agent/` top-level modules (excluding `mod.rs`) | 58 |
+| `agent/tools/` Rust files (incl. `mod.rs`) | 36 |
 | `commands/` command modules (excluding `mod.rs`) | 38 |
-| `services/` service modules (excluding `mod.rs`) | 56 |
-| Tauri IPC registration entry points | 298 |
-| Database migrations | 77 |
+| `services/` service modules (excluding `mod.rs`) | 58 |
+| Tauri IPC registration entry points | 301 |
+| Database migrations | 84 |
 | React pages | 16 |
 
 These counts evolve with the codebase; the authoritative sources are `TOOL_SPECS` for tools, the `generate_handler!` in `lib.rs` for IPC entry points, and `src-tauri/migrations/` for migrations.
@@ -188,7 +188,7 @@ Each desktop process registers a unique `agent_workers` record. On exit the reco
 
 ### 8.1 Tool Registration and Protocol
 
-`TOOL_SPECS` in `agent/tools/mod.rs` is the authoritative list of 201 external tools, including name, description, and side-effect markers. Tools support both the textual marker protocol and OpenAI-compatible native function calling; MCP and Skill tools are injected dynamically at runtime.
+`TOOL_SPECS` in `agent/tools/mod.rs` is the authoritative list of 204 external tools, including name, description, and side-effect markers. Tools support both the textual marker protocol and OpenAI-compatible native function calling; MCP and Skill tools are injected dynamically at runtime.
 
 Tools are limited and measured across eight task domains: build/fix/explore/deploy/refactor/test/debug/other.
 
@@ -252,7 +252,7 @@ The model layer supports OpenAI, Anthropic, and Gemini request/streaming-respons
 
 ## 12. Data and Storage
 
-SQLite uses WAL and foreign-key constraints; migrations run sequentially at startup. The current 77 migrations cover:
+SQLite uses WAL and foreign-key constraints; migrations run sequentially at startup. The current 84 migrations cover:
 
 - providers, models, proxy, cost, and request logs;
 - projects, conversations, messages, references, tags, feedback, and versions;
@@ -311,7 +311,7 @@ The following are real code risks, not unimplemented features:
 
 1. `commands/chat.rs` simultaneously handles protocol, context, the tool loop, recovery, and persistence — the file is too large and should later be split without breaking state-machine boundaries;
 2. `pages/Home.tsx` remains large; although several chat components were extracted, layout and interaction state are still highly concentrated;
-3. `agent/tools/mod.rs` simultaneously carries 201 schemas and total dispatch — adding a tool requires synchronized verification of registration, permissions, grouping, and structured results;
+3. `agent/tools/mod.rs` simultaneously carries 204 schemas and total dispatch — adding a tool requires synchronized verification of registration, permissions, grouping, and structured results;
 4. the capability-batch versions in README/CHANGELOG and the app manifest `2.0.0` are not the same cadence; the official versioning policy should be unified before release;
 5. bundled runtime/resources are not distributed with Git, so a clean clone can only run tests and lean builds that do not depend on these resources.
 
