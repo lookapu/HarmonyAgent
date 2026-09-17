@@ -7,6 +7,35 @@
 
 ---
 
+## v2.2.0 — Structure-First Navigation, Multi-Language Write Gates, and a Trustworthy Execution Kernel (2026-09-15)
+
+Positioning: moving from "the agent can edit code" to "edits are language-checked and verifiable" — writes pass language-level gates, host operations carry revocable approval receipts, and resource isolation has an explicit support matrix. 259 commits.
+
+**Structure-first navigation and large-repo indexing**
+
+- New structure-first code navigation with a persistent repository catalog: whole-tree file registration, incremental file deltas, git-checkpoint reconciliation, and a resilient index watcher; progressive indexing at million-file scale has its own baseline (see [Index Scale Baseline](docs/INDEX_SCALE_BASELINE.md)).
+- Structure queries support stable cursors, paginated structure nodes, and persistent graph edges; results are bound to safe file-read windows.
+
+**Pre-write gates (headline of this release)**
+
+- Real per-language gates: Java (Tree-sitter declaration/annotation checks plus a `javac` diagnostic diff that also compiles **unedited callers** in the same source root), Dart (`dart analyze` diff), Go (`go vet` diff in a temp module that carries same-package sibling files), Python (`pyflakes` diff), SQL (`sqlite3` in-memory execution diff with side-effect statement protection).
+- Syntax-level coverage for ArkTS/TS/JS/Go/Python/Rust/Dart/Kotlin/C++/Swift; when an external tool is missing or times out the gate degrades to "not checked" and records an event — writes are never blocked and never falsely reported as verified.
+- Multi-file transactions: baselines re-verified before batch and per-file writes, conditional reverse-order rollback, external edits preserved, and "rollback incomplete" reported honestly.
+
+**Host capability approvals and revocable receipts**
+
+- Capability-agnostic v4 approval receipts (OTA content digests are just one scope kind) with self-describing revocation; agent-initiated mutating host capabilities must hold a valid receipt, which expires on stop or restart.
+- The approval card now shows an impact contract (reversibility / blast radius / targets / consequence), and the same wording flows into pending-confirmation restore and the audit timeline.
+
+**Sandbox and resource limits**
+
+- Native sandboxed children get enforceable rlimits (CPU time verified locally; memory and process count are reported honestly as unavailable/unmapped per platform); host-direct commands can opt into limits via environment variables.
+
+**UI and quality gates**
+
+- Design tokens converged to an IDE feel (radius/shadow/type scale); static inline styles moved to utility classes.
+- Documentation-drift and clippy warning-baseline gates are green again; a new [Current Status](docs/CURRENT_STATUS.md) page is the single source of truth for capability state.
+
 ## v2.1.1 — Interaction and Quality-Gate Hardening (2026-08-25)
 
 - Provider Token fields now preserve and prefill full values with K/M suffix guidance; reply-language and reasoning-language configuration is also refined.
