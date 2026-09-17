@@ -522,3 +522,18 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 同批发版还顺带处理：`go vet` 冷缓存超时由 20s 提到 45s（`a0ee112` 后于 `8de4872` 调整）、脚本与子进程输出强制 UTF-8（`7ce9d53`）、grader 退出码测试改用直跑程序而非 `cmd /C`（`f18448e`）。
 
 三条缺陷与其**残留边界**已同步进[当前状态单页第 3 节](./CURRENT_STATUS.md)；本节只作为日志，不重复维护结论。
+
+## 28. Windows 本机复现编码类缺陷、桌面循环纯搬运第三刀与 Windows 侧告警清零（2026-09-17）
+
+第 27 节把三条缺陷的编码/路径类行为归入「只在 CI 成立、本机不复现」，这一条的前提是当时只有 macOS 机器。本轮起有 Windows 本机可用，于是逐项补验，结论是**编码类并非不复现**，而且发现了一处门禁在 Windows 上长期为红。
+
+- **原始缺陷本机复现（推翻第 27 节的「本机不复现」）**：随包分发的 Temurin 17 上，UTF-8 中文源码不带 `-encoding UTF-8` 即报 `unmappable character (0xB2) for encoding GBK`——本机平台编码是 GBK（中文 Windows），不是 CI 的 cp1252，同一类缺陷另一种代码页；加上该参数后编译干净。门禁解析 javac 时，无系统 JDK 的机器正是回退到随包 JDK，因此该参数在绿色版里是**载荷性**的，不能以「JDK ≥ 18 默认 UTF-8、参数冗余」为由删除。
+- **残留边界复现且语义更重**：GBK 源码在固定 `-encoding UTF-8` 下报 **38 处** `unmappable character`——是**误报拒写**（干净写入会被 Java 门禁拦截），不只是第 27 节写的「诊断可能失真」。
+- **修复此前零测试覆盖**：`java_compiler` 测试里没有任何非 ASCII 用例。抽出 `javac_args()` 并加确定性守卫 `javac_args_pin_source_encoding_and_diagnostics_language`——断言**参数本身**而不是行为，因为 JDK ≥ 18 的 `file.encoding` 已是 UTF-8，行为型断言在那些机器上即使删掉参数也照样通过。
+- **桌面 IO port 迁移第三刀（纯搬运）**：轮前许可裁决里的三处**逐字相同**的账本收尾（超时中断、用户停止、护栏收尾）收敛为 `persist_open_ledger_and_emit`，守卫用等价的提前返回表达。账本入参收进 `OpenLedgerInputs` 结构体——平铺是 8 个参数，会新增 `clippy::too_many_arguments`（与第 25 节同一条教训：结构化，而不是重定基线）。
+- **Q-07 门禁在 Windows 上原本是红的**：本机唯一告警 65 条中，结构类恰为 41 `too_many_arguments` + 16 `type_complexity` = **57（与 macOS 完全一致）**，另外 8 条全是**机械类且只在 Windows 触发**（`unused_mut`、测试 cfg 下的 `dead_code`、`unnecessary_map_or`/`unnecessary_to_owned`/`unnecessary_lazy_evaluations`、`needless_return`、`doc_lazy_continuation`，以及 Windows 专有 lint `permissions_set_readonly_false`）。CI 的 `quality.yml` 对两个平台跑**同一个** `--baseline 57`，所以该门禁在 Windows 侧应为红。按既有策略「基线只保留结构类、新增机械类立即阻断」**修掉这 8 处而不抬基线**：unix 专用 `DirBuilder` 按平台分别构造、测试专用互斥量按平台门控、其余按 clippy 的机械改写；`set_readonly(false)` 一处加**有理由的局部 allow**（该 lint 的理由是 Unix 上会 world-writable，而这段代码本就只在 Windows 编译）。
+- **dart 门禁测试去 flake**：两个 real-analyzer 用例把「20s 分析超时按设计降级」当成硬失败，满载时同一族用例随机挂（两轮全量各挂一个不同用例，单独跑均通过）。改为只有「超时」这种降级按跳过并打印原因，其余跳过原因（缺 dart、不在包内、候选写入失败）仍判失败。
+
+验证（Windows 本机）：后端库 1,102 通过 / 8 忽略（macOS 为 1,103/9，差异来自平台门控用例集，非回归）；新增 1 条 javac 参数守卫测试；两组崩溃恢复集成各 3 项通过；`cargo check --lib` 0 警告、`check-warnings.py` 回到 **57/57 通过**；`check-docs.py` 通过。提交：`aaac225`（账本收尾搬运）、`e21c022`（javac 参数守卫）、`716e117`（dart 去 flake）、`0a8226e`（状态页 Windows 证据）、`635a100`（Windows 侧机械类告警清零）。
+
+**未闭环**：macOS 侧本轮改动尚未经 CI 复核（需推送才能跑 `quality.yml`）；路径形态类（符号链接、8.3 短名）与 Windows/Linux 目标编译仍未覆盖。
