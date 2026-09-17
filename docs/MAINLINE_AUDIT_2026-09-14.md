@@ -615,3 +615,16 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 同批更正：循环内 `.emit(` 与 `.0.lock()` 的计数此前也在同一口径下统计，已按更正口径重述（当前 15 处 / 6 处）。
 
 **未闭环**：第 2 步剩余两段（轮中 B Provider 往返、轮中 D 含 `calls` 构造）未开工；第 7 步「合段」需桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。
+
+## 36. 第 2 步第六刀：单轮 Provider 往返搬出主循环（2026-09-17）
+
+第六刀：轮中 B 整体搬进 `request_round_outcome`（`00cce28`）——请求打点与 Durable Run 状态推进 → `stream_once` 单轮流式请求 → 上下文超限恢复 → 备用模型降级 → 不可恢复错误先保留成果入库再上抛。输入 `RoundRequestInputs` 23 个字段。
+
+- **返回约定**：两条恢复路径换成 `RoundRequestOutcome::RetryAfterContextCompression` / `RetryAfterFallbackSwitch`（调用方映射回 `continue 'outer`），成功以 `Received(StreamOutcome)` 负载返回；fatal 分支保持原语义——**先入库保留已有文本/工具结果**，再以 `Err` 上抛。
+- **两处非逐行等价的细节**（复核时看这两处）：
+  1. `pick_fallback_model` 的调用从 `if let Some(fb) = pick_fallback_model(...)` 改为「守卫内先 `let fallback = ...` 再 `if let`」——原因是旧写法把 `&mut model_choice` 的借用延续到整个 `if let` 分支（scrutinee 临时值生命周期），随后 `model_choice = fb` 会报借用冲突。求值条件与短路顺序不变（仍在 `e.retryable() && !used_fallback` 成立时才调用）。
+  2. 该段历史上就存在的**风险/收益**不变：先判可恢复性、只降级一次、成功切模型后重试；这些语义逐字保留。
+- **度量**：主循环体 1,290 → **1,148 行**；`break`/`continue` 20 → 19；循环内 `.emit(` 15 → 11、`.0.lock()` 6 → 4。
+- **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
+
+**未闭环**：第 2 步只剩轮中 D（工具执行循环，含 `calls` 构造，约 800 行、控制流最密）；第 7 步「合段」需桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。

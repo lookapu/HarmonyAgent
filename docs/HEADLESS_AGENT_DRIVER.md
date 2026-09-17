@@ -816,3 +816,10 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 - **验证**：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
 
 **度量口径更正（2026-09-17）**：本页此前各条「主循环体 N 行」的 N 是按「循环起点 → 下一个 `fn`」量的，把循环**结束后**的验收收尾段（约 129 行）算进了循环体。正确量法是「循环起点 → 循环闭合括号」。按更正口径重述：第 19 节起点的 2,107 行对应更正后约 1,978 行；各条的**增量**不受影响（该尾段始终未改动），但绝对行数需整体下调。当前（第五刀后）主循环体为 **1,290 行**。
+
+**进展（2026-09-17，第六刀）**：轮中 B 落地——单轮 Provider 往返（请求打点与 Durable Run 状态推进 → `stream_once` → 上下文超限恢复 → 备用模型降级 → 不可恢复错误先保留成果入库再上抛）整体搬进 `request_round_outcome`（`00cce28`）。输入 `RoundRequestInputs` 23 个字段。
+
+- **返回约定**：两条恢复路径（`ContextOverflow` 压缩后重试、`retryable` 错误切备用模型）换成 `RoundRequestOutcome::RetryAfterContextCompression` / `RetryAfterFallbackSwitch`，调用方映射回 `continue 'outer`；成功时以 `Received(StreamOutcome)` 负载返回。不可恢复错误保持原语义——**先把已有文本/工具结果入库**，再以 `Err` 上抛。
+- **降级条件逐字保留**：`e.retryable() && !used_fallback` 的短路顺序与「只降级一次」的语义不变；`pick_fallback_model` 的调用改到守卫内绑定（避免 `if let` 临时值把 `&mut model_choice` 借到整个分支，导致随后赋值报借用冲突）。
+- **度量**：主循环体 1,290 → **1,148 行**；`break`/`continue` 20 → 19；循环内 `.emit(` 15 → 11、`.0.lock()` 6 → 4。
+- **验证**：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
