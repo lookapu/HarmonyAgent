@@ -139,10 +139,14 @@ pub(crate) fn argument_scope(
                     .is_none_or(|path| normalized(path).starts_with(&root))
         })
         .ok_or("OTA 输入和输出必须位于同一授权工作区")?;
+    let normalized_root = normalized(&root);
     let relative = |path: &Path| -> Result<String, String> {
-        path.strip_prefix(&root)
-            .map(|path| path.to_string_lossy().into_owned())
-            .map_err(|_| "OTA 审批路径越出工作区".into())
+        // 同样先归一化再求相对路径：Windows 上根与目标一个带 `\\?\`、一个不带，
+        // 直接 strip_prefix 会误判越界（实测 CI 上合法参数被拒）
+        normalized(path)
+            .strip_prefix(&normalized_root)
+            .map(|rest| rest.trim_start_matches(['/', '\\']).to_string())
+            .ok_or_else(|| "OTA 审批路径越出工作区".to_string())
     };
     let final_output = relative(&output)?;
     HostCapability::PackageOta {

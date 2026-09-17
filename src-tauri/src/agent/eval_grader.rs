@@ -85,6 +85,15 @@ pub fn run_command_grader(grader: &EvalGrader, workspace: &Path) -> Result<Grade
 mod tests {
     use super::*;
 
+    /// 跨平台的“成功/失败”命令：Windows 没有 true/false，改用 cmd 的 exit 码。
+    fn exit_command(success: bool) -> Vec<&'static str> {
+        if cfg!(windows) {
+            vec!["cmd", "/C", if success { "exit 0" } else { "exit 1" }]
+        } else {
+            vec![if success { "true" } else { "false" }]
+        }
+    }
+
     fn grader(command: Vec<&str>) -> EvalGrader {
         EvalGrader {
             kind: "command".into(),
@@ -96,7 +105,7 @@ mod tests {
     #[test]
     fn passing_command_marks_passed() {
         let workspace = std::env::temp_dir();
-        let outcome = run_command_grader(&grader(vec!["true"]), &workspace).unwrap();
+        let outcome = run_command_grader(&grader(exit_command(true)), &workspace).unwrap();
         assert!(outcome.passed);
         assert_eq!(outcome.exit_code, Some(0));
         assert!(!outcome.timed_out);
@@ -105,7 +114,7 @@ mod tests {
     #[test]
     fn failing_command_marks_failed_with_exit_code() {
         let workspace = std::env::temp_dir();
-        let outcome = run_command_grader(&grader(vec!["false"]), &workspace).unwrap();
+        let outcome = run_command_grader(&grader(exit_command(false)), &workspace).unwrap();
         assert!(!outcome.passed);
         assert_eq!(outcome.exit_code, Some(1));
     }

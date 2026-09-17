@@ -2735,7 +2735,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&receive.args[..4], ["-t", "ABC123", "file", "recv"]);
-        assert!(receive.args[5].ends_with("out/result.txt"));
+        assert!(std::path::Path::new(&receive.args[5]).ends_with("out/result.txt"));
         let stop = prepare_invocation(
             &HostCapability::StopAbility {
                 device: "ABC123".into(),
