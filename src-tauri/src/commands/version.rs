@@ -252,6 +252,8 @@ mod tests {
     use super::*;
 
     /// 环境变量测试互斥（与 process.rs 的 STATE_LOCK 同理，避免并行测试互相干扰）
+    /// 目前只有非 Windows 用例使用，故按平台门控，避免 Windows 侧报未使用。
+    #[cfg(not(windows))]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// PATH 中无 node 时，node_path_injection 应返回前置了探测 node bin 的 PATH（GUI 极简 PATH 的 nvm 场景）

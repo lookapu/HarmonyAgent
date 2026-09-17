@@ -179,7 +179,7 @@ async fn ocr_engine_exe(script_dir: &std::path::Path) -> Result<std::path::PathB
                 .split('.')
                 .filter_map(|s| s.parse::<u64>().ok())
                 .fold(0u64, |acc, v| acc * 10000 + v);
-            if best.as_ref().map_or(true, |(v, _)| ver > *v) {
+            if best.as_ref().is_none_or(|(v, _)| ver > *v) {
                 best = Some((ver, w));
             }
         }
@@ -242,7 +242,7 @@ pub(super) async fn ocr_image(args: &Value, roots: &[String]) -> Result<String, 
         std::fs::create_dir_all(&script_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
         let exe = ocr_engine_exe(&script_dir).await?;
         let mut cmd = crate::utils::process::command(
-            &exe.to_string_lossy().into_owned(),
+            &exe.to_string_lossy(),
             &[abs.to_string_lossy().into_owned()],
         )?;
         cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());

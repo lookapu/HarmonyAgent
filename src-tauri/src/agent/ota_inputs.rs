@@ -38,12 +38,16 @@ impl OtaInputs {
             return Err("OTA 副本目录越出工作区".into());
         }
         let directory = parent.join(format!(".inputs-{}", uuid::Uuid::new_v4()));
-        let mut builder = std::fs::DirBuilder::new();
+        // unix 上收紧目录权限；分别构造以避免非 unix 平台出现「未使用的 mut」告警
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         builder
             .create(&directory)
             .map_err(|error| format!("创建 OTA 独占副本目录失败：{error}"))?;
@@ -165,7 +169,10 @@ impl Drop for OtaInputs {
         for name in ["input.hap", "profile.json"] {
             let path = self.directory.join(name);
             // Windows 不允许直接删除 readonly 文件；只修改本目录中的普通副本。
+            // 该 clippy lint 的理由是「Unix 上 set_readonly(false) 会让文件 world-writable」；
+            // 此分支仅在 Windows 编译，调用目的正是清 FILE_ATTRIBUTE_READONLY 以便删除只读副本。
             #[cfg(windows)]
+            #[allow(clippy::permissions_set_readonly_false)]
             if let Ok(metadata) = std::fs::symlink_metadata(&path) {
                 if metadata.file_type().is_file() {
                     let mut permissions = metadata.permissions();

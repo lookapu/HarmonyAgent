@@ -14,9 +14,9 @@
 | 前端测试 | `npm test` | 14 文件、127 通过 |
 | 前端 lint / 类型 | `npm run lint`、`npx tsc -b` | 通过 |
 | Web 构建与体积门禁 | `npm run build` | 通过（Home 694.5/750KB、Markdown 1500.8/1550KB、index 546.7/575KB） |
-| Rust 编译告警 | `cargo check --lib`、`cargo test --no-run` | 0 警告（macOS）；Windows 本机 `cargo check --lib` 有 1 处 `unused_mut`（`ota_inputs.rs`），测试档另多 1 处 `dead_code`（`version.rs`） |
+| Rust 编译告警 | `cargo check --lib`、`cargo test --no-run` | 0 警告（macOS + Windows 本机） |
 | 文档漂移门禁 | `python3 scripts/check-docs.py` | 通过 |
-| clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警）；**Windows 本机实测 65/57 未通过**——基线未按平台校准，本机不可复现该结论 |
+| clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警；macOS + Windows 本机均通过——8 条只在 Windows 触发的机械类告警已修复，基线未调整） |
 | Windows 质量矩阵 | GitHub Actions `quality.yml`（macOS + Windows） | v2.2.0 发版时全绿（此前 16 处 Windows 失败已清零） |
 
 平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,103/9 差异来自平台门控用例集，不是回归）。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。

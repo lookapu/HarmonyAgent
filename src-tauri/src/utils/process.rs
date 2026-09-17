@@ -28,6 +28,7 @@ static APP_HAS_CONSOLE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// 初始化隐藏控制台（lib.rs setup 时调用一次）：
 /// - 无控制台（GUI 双击启动）→ AllocConsole 创建并立即隐藏
 /// - 已有控制台（终端/调试启动）→ 直接标记，子进程继承终端控制台也不会弹窗
+///
 /// 之后 Windows 子进程不再加 CREATE_NO_WINDOW（它会断开控制台继承链，导致孙进程新建窗口）。
 #[cfg(windows)]
 pub fn init_hidden_console() {
@@ -715,7 +716,7 @@ pub fn probe_common_program(program: &str) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let _ = program;
-        return None;
+        None
     }
     #[cfg(not(windows))]
     {
