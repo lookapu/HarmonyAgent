@@ -3096,6 +3096,141 @@ async fn handle_round_outcome(
     Ok(PostRoundOutcome::Continue)
 }
 
+/// 计划门禁与收尾复核的结论：决定本轮之后的走向。
+enum PlanGateOutcome {
+    /// 未命中任何门禁：继续常规流程
+    Passed,
+    /// 本轮已完成（计划被驳回后需重新规划、或计划获批后开始执行），进入下一轮
+    NextRound,
+    /// 任务结束（审查期间用户停止，或完成确认命中）
+    Finish,
+}
+
+/// `run_plan_gate` 的输入（全部借用；`plan_confirmed`/`confirmed_plan`/`messages`/`stats`
+/// 随调用推进，调用方在本轮后续步骤里继续持有）。
+struct PlanGateInputs<'a> {
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    plan_review: &'a tauri::State<'a, PlanApprovalState>,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    text: &'a str,
+    plan_mode: bool,
+    plan_confirmed: &'a mut bool,
+    confirmed_plan: &'a mut Option<String>,
+    messages: &'a mut Vec<serde_json::Value>,
+    stats: &'a mut ChatRunStats,
+    completion_reviews: usize,
+}
+
+/// 轮后计划门禁（纯搬运：原主循环内联代码，行为一致）。
+///
+/// 两段原样保留顺序：先处理计划模式（两阶段约定的关键闭环——只输出【PLAN】块时
+/// 同样提交用户审批，否则会因无工具调用直接结束任务、计划卡永不出现），再做收尾复核的
+/// 完成确认检测。`continue`/`break` 换成 `PlanGateOutcome`，与其它切片同属第 2 步的返回约定。
+async fn run_plan_gate(inputs: PlanGateInputs<'_>) -> Result<PlanGateOutcome, ChatFlowError> {
+    // 计划模式：模型遵守两阶段约定只输出了【PLAN】块（无工具标记）时同样提交用户审批，
+    // 否则会因无工具调用直接结束任务，计划卡永远不会出现（两阶段计划的关键闭环）
+    if inputs.plan_mode && !*inputs.plan_confirmed && !inputs.text.trim().is_empty() {
+        let plan_text = extract_plan_block(inputs.text)
+            .unwrap_or_else(|| crate::agent::tools::strip_tool_calls(inputs.text).trim().to_string());
+        let plan_text = if plan_text.trim().is_empty() {
+            inputs.text.trim().to_string()
+        } else {
+            plan_text
+        };
+        let review = request_plan_review(
+            inputs.app,
+            inputs.plan_review,
+            inputs.cancel.inner(),
+            inputs.conversation_id,
+            inputs.trace_id,
+            &plan_text,
+        )
+        .await
+        .unwrap_or(PlanReview {
+            approved: false,
+            feedback: "计划审查通道异常，已暂停".to_string(),
+            revised_plan: None,
+            cancelled: false,
+        });
+        crate::agent::runtime::transition_global(
+            inputs.trace_id,
+            inputs.conversation_id,
+            "running",
+            "plan_review_resolved",
+            None,
+        );
+        // 用户在审查等待期间点了停止：按停止收尾，不重新规划
+        if review.cancelled {
+            let _ = inputs.app.emit(
+                "chat-plan-resolved",
+                serde_json::json!({
+                    "conversation_id": inputs.conversation_id,
+                    "approved": false,
+                }),
+            );
+            inputs.stats.stopped = true;
+            return Ok(PlanGateOutcome::Finish);
+        }
+        if !review.approved {
+            let _ = inputs.app.emit(
+                "chat-plan-resolved",
+                serde_json::json!({
+                    "conversation_id": inputs.conversation_id,
+                    "approved": false,
+                }),
+            );
+            inputs.messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "用户驳回了该计划，意见如下：\n{}\n\n请根据意见调整方案，并重新输出【PLAN】...【/PLAN】计划（仍然不要在本轮调用工具）。",
+                    if review.feedback.trim().is_empty() { "（无补充意见）" } else { review.feedback.trim() }
+                ),
+            }));
+            return Ok(PlanGateOutcome::NextRound);
+        }
+        let final_plan = review.revised_plan.as_deref().unwrap_or(&plan_text).to_string();
+        activate_approved_plan(
+            inputs.app,
+            inputs.state,
+            inputs.conversation_id,
+            inputs.trace_id,
+            &final_plan,
+        )?;
+        *inputs.plan_confirmed = true;
+        *inputs.confirmed_plan = Some(final_plan.clone());
+        let _ = inputs.app.emit(
+            "chat-plan-resolved",
+            serde_json::json!({
+                "conversation_id": inputs.conversation_id,
+                "approved": true,
+                "plan": final_plan,
+            }),
+        );
+        let note = review.feedback.trim().to_string();
+        inputs.messages.push(serde_json::json!({
+            "role": "user",
+            "content": if note.is_empty() {
+                "计划已获用户批准，现在可以开始调用工具执行。".to_string()
+            } else {
+                format!(
+                    "计划已获用户批准，但请严格按照以下用户修订/补充执行，不得偏离：\n\n{note}\n\n现在可以开始调用工具执行。"
+                )
+            },
+        }));
+        return Ok(PlanGateOutcome::NextRound);
+    }
+    // 收尾复核的确认检测：上一轮注入了“任务是否真完成”确认后，模型回复命中
+    // 完成确认信号（✅ 任务已完成 / 任务已完成等）表示任务确实完成，直接收尾；
+    // 未确认（输出工具标记/补充正文）则走下方常规分支继续执行
+    if inputs.completion_reviews > 0 && is_completion_confirmation(inputs.text) {
+        return Ok(PlanGateOutcome::Finish);
+    }
+    Ok(PlanGateOutcome::Passed)
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -6405,82 +6540,26 @@ async fn stream_chat_inner(
             }
             continue;
         }
-        // 计划模式：模型遵守两阶段约定只输出了【PLAN】块（无工具标记）时同样提交用户审批，
-        // 否则会因无工具调用直接结束任务，计划卡永远不会出现（两阶段计划的关键闭环）
-        if plan_mode && !plan_confirmed && !text.trim().is_empty() {
-            let plan_text = extract_plan_block(&text).unwrap_or_else(|| {
-                crate::agent::tools::strip_tool_calls(&text).trim().to_string()
-            });
-            let plan_text = if plan_text.trim().is_empty() {
-                text.trim().to_string()
-            } else {
-                plan_text
-            };
-            let review = request_plan_review(app, plan_review, cancel.inner(), &conversation_id, &trace_id, &plan_text)
-                .await
-                .unwrap_or(PlanReview {
-                    approved: false,
-                    feedback: "计划审查通道异常，已暂停".to_string(),
-                    revised_plan: None,
-                    cancelled: false,
-                });
-            crate::agent::runtime::transition_global(
-                &trace_id,
-                &conversation_id,
-                "running",
-                "plan_review_resolved",
-                None,
-            );
-            // 用户在审查等待期间点了停止：按停止收尾，不重新规划
-            if review.cancelled {
-                let _ = app.emit("chat-plan-resolved", serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "approved": false,
-                }));
-                stats.stopped = true;
-                break;
-            }
-            if !review.approved {
-                let _ = app.emit("chat-plan-resolved", serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "approved": false,
-                }));
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!(
-                        "用户驳回了该计划，意见如下：\n{}\n\n请根据意见调整方案，并重新输出【PLAN】...【/PLAN】计划（仍然不要在本轮调用工具）。",
-                        if review.feedback.trim().is_empty() { "（无补充意见）" } else { review.feedback.trim() }
-                    ),
-                }));
-                continue;
-            }
-            let final_plan = review.revised_plan.as_deref().unwrap_or(&plan_text).to_string();
-            activate_approved_plan(app, state, &conversation_id, &trace_id, &final_plan)?;
-            plan_confirmed = true;
-            confirmed_plan = Some(final_plan.clone());
-            let _ = app.emit("chat-plan-resolved", serde_json::json!({
-                "conversation_id": conversation_id,
-                "approved": true,
-                "plan": final_plan,
-            }));
-            let note = review.feedback.trim().to_string();
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": if note.is_empty() {
-                    "计划已获用户批准，现在可以开始调用工具执行。".to_string()
-                } else {
-                    format!(
-                        "计划已获用户批准，但请严格按照以下用户修订/补充执行，不得偏离：\n\n{note}\n\n现在可以开始调用工具执行。"
-                    )
-                },
-            }));
-            continue;
-        }
-        // 收尾复核的确认检测：上一轮注入了“任务是否真完成”确认后，模型回复命中
-        // 完成确认信号（✅ 任务已完成 / 任务已完成等）表示任务确实完成，直接收尾；
-        // 未确认（输出工具标记/补充正文）则走下方常规分支继续执行
-        if completion_reviews > 0 && is_completion_confirmation(&text) {
-            break;
+        match run_plan_gate(PlanGateInputs {
+            app,
+            state,
+            plan_review,
+            cancel,
+            conversation_id: &conversation_id,
+            trace_id: &trace_id,
+            text: &text,
+            plan_mode,
+            plan_confirmed: &mut plan_confirmed,
+            confirmed_plan: &mut confirmed_plan,
+            messages: &mut messages,
+            stats: &mut *stats,
+            completion_reviews,
+        })
+        .await?
+        {
+            PlanGateOutcome::Passed => {}
+            PlanGateOutcome::NextRound => continue,
+            PlanGateOutcome::Finish => break,
         }
         // 轮级路由：由共享 KernelExecutorState 决定空轮/重放/续写/假调用纠正。
         let router_input = KernelRoundInput {
