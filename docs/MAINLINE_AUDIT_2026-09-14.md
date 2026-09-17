@@ -561,3 +561,14 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 - **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
 
 **未闭环**：第 2 步其余五段（轮中 B、轮后 A、轮中 D、轮后 B、轮中 A）未开工；第 7 步「合段」（`RoundOutcome` + `DesktopRoundState`）必须有桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。
+
+## 31. 第 2 步第二刀：计划门禁与收尾复核搬出主循环（2026-09-17）
+
+按[headless 驱动文档 §20](./HEADLESS_AGENT_DRIVER.md) 的分段，第二刀落下：轮后 A 搬进 `run_plan_gate`（`7681d61`）。
+
+- **搬出内容**：计划模式审批全流程（提交审查 → 审查期间停止 → 驳回后注入重规划消息 → 批准后激活计划并注入开始执行消息）与收尾复核的完成确认检测。三处 `continue`、一处 `break` 换成 `PlanGateOutcome`（Passed / NextRound / Finish），调用方一处 `match` 映射回原行为。
+- **度量**：主循环体 1,974 → **1,918 行**；`break`/`continue` 34 → **30** 处。
+- **按风险重排**：方案原定第 2 步做轮中 B（Provider 流式往返），读过代码后确认它独有**上下文超限恢复**与**备用模型降级**两条错误路径，并要改写 `history_limit`/`context_summary`/`used_fallback`/`model_choice` 四处跨段状态——在**没有行为快照**的前提下，纯搬运在这一段最不容易靠阅读验证。故先做控制流更确定的轮后 A，轮中 B 后移到轮后 B 与轮中 D 之后，或留到有桌面验收窗口的批次。
+- **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
+
+**未闭环**：第 2 步剩余四段（轮中 B、轮中 D 含 `calls` 构造、轮后 B、轮中 A）未开工；第 7 步「合段」需桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。

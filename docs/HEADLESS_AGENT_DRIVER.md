@@ -788,3 +788,9 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 度量：主循环体 2,006 → **1,974 行**；`persist_turn` 3 → 2 处、`upsert_placeholder_message` 1 → 0 处；`.emit(` 29、`.0.lock()` 21、`kernel_executor.*` 12 均不变（这段本就没有 emit/lock，只有记账与一次入库）。验证：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
 
 **轮中 C 剩余的「工具标记解析 / `calls` 构造」不宜单独搬**：它直接产出 `calls` 供轮中 D 消费，两者合并成一刀边界更自然（顺带把 `calls` 作为返回结构的一部分，而不是循环内共享可变量）。第 2–6 步其余各段（轮中 B、轮后 A、轮中 D、轮后 B、轮中 A）尚未开工，第 7 步仍待桌面验收窗口。
+
+**进展（2026-09-17，第二刀）**：轮后 A 落地——计划模式审批（提交 / 驳回 / 批准 / 审查期间停止）与收尾复核的完成确认检测搬进 `run_plan_gate`，三处 `continue` 与一处 `break` 换成 `PlanGateOutcome`（Passed / NextRound / Finish），调用方一处 `match` 映射回原行为（`7681d61`）。
+
+**顺序按风险重排**（偏离本节切分顺序）：原定第 2 步做轮中 B（Provider 流式往返），但读过代码后确认它独有**上下文超限恢复**与**备用模型降级**两条错误路径，并要改写 `history_limit`/`context_summary`/`used_fallback`/`model_choice` 四处跨段状态——纯搬运在这一段最不容易靠阅读验证，而当前又没有行为快照。故先做控制流更确定的轮后 A，把轮中 B 排到轮后 B 与轮中 D 之后，或留到有验收窗口的批次。
+
+度量：主循环体 1,974 → **1,918 行**；`break`/`continue` 34 → **30** 处。验证：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
