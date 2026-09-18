@@ -57,7 +57,8 @@ pub fn seed_api_knowledge(db_path: &Path, resource_dir: Option<PathBuf>) {
 /// 永远拿不到同版本的新增条目。
 fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
     let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;")
+    // 显式打开外键：宁可让「向量挂到不存在的文档」这类错误在这里失败，也不要静默写进孤儿行
+    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
         .map_err(|e| e.to_string())?;
     let attach = format!("ATTACH DATABASE '{}' AS seed", seed.to_string_lossy().replace('\'', "''"));
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -95,7 +96,11 @@ fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
 
     let mut total = 0usize;
     if missing > 0 || revision_changed {
-        let tables = ["api_docs", "api_details", "api_members", "api_docs_embeddings", "api_docs_meta"];
+        // api_docs_embeddings 不在这一批：它按「种子自己的 doc_id」存，而主库 api_docs 的
+        // id 可能与种子不一致（先做过在线抓取时 id 由主库自增分配），直接 `SELECT *` 会撞
+        // `doc_id REFERENCES api_docs(id)` 的外键，**并把整批导入一起回滚**（连已成功的
+        // api_details/api_members 都留不下来）。它按自然键重映射，见下方单独处理。
+        let tables = ["api_docs", "api_details", "api_members", "api_docs_meta"];
         for t in tables {
             // 种子库可能缺表（旧种子/精简种子），逐表容错：表不存在则跳过
             let seed_has: i64 = tx
@@ -114,6 +119,33 @@ fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
                     [],
                 )
                 .map_err(|e| format!("导入 {t} 失败: {e}"))?;
+            total += n;
+        }
+        // 向量按自然键重映射到主库 id：种子的 doc_id → 种子 api_docs 的自然键 → 主库同键那一行
+        let seed_has_emb: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM seed.sqlite_master WHERE type='table' AND name='api_docs_embeddings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if seed_has_emb > 0 {
+            let n = tx
+                .execute(
+                    "INSERT OR IGNORE INTO main.api_docs_embeddings (doc_id, model, vector, created_at)
+                     SELECT m.id, e.model, e.vector, e.created_at
+                       FROM seed.api_docs_embeddings e
+                       JOIN seed.api_docs s ON s.id = e.doc_id
+                       JOIN main.api_docs m
+                         ON m.id = (SELECT MIN(m2.id) FROM main.api_docs m2
+                                     WHERE m2.version_label = s.version_label
+                                       AND m2.kit = s.kit
+                                       AND m2.dts_file IS s.dts_file
+                                       AND m2.class_name IS s.class_name
+                                       AND m2.declaration = s.declaration)",
+                    [],
+                )
+                .map_err(|e| format!("导入 api_docs_embeddings 失败: {e}"))?;
             total += n;
         }
         tx.execute(
@@ -176,6 +208,69 @@ mod tests {
         let c = rusqlite::Connection::open(&main).unwrap();
         let cnt: i64 = c.query_row("SELECT COUNT(*) FROM api_docs", [], |r| r.get(0)).unwrap();
         assert_eq!(cnt, 1, "重复导入不应产生重复行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 主库的 doc_id 与种子不一致时（典型：先做过在线抓取，id 由主库自增分配），
+    /// 向量必须**按自然键重映射**到主库那一行；照搬种子的 doc_id 会撞
+    /// `doc_id REFERENCES api_docs(id)` 并把整批导入回滚（本机实测到的
+    /// `seed_import_error: 导入 api_docs_embeddings 失败: FOREIGN KEY constraint failed`）。
+    #[test]
+    fn test_seed_remaps_embeddings_when_doc_ids_differ() {
+        let dir = std::env::temp_dir().join(format!("deveco-seed-remap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok();
+        let main = dir.join("main.db");
+        let seed = dir.join("seed.db");
+
+        // 与真实迁移一致：api_docs 有自然键 UNIQUE、embeddings 有指向 api_docs(id) 的外键
+        let schema = "
+            CREATE TABLE api_docs (id INTEGER PRIMARY KEY AUTOINCREMENT, kit TEXT NOT NULL, dts_file TEXT, module TEXT, class_name TEXT, declaration TEXT NOT NULL, api_name TEXT, change_type TEXT NOT NULL, version_label TEXT NOT NULL, api_level INTEGER, old_declaration TEXT, source_url TEXT, fetched_at INTEGER NOT NULL, UNIQUE(version_label, kit, dts_file, class_name, declaration));
+            CREATE TABLE api_details (id INTEGER PRIMARY KEY AUTOINCREMENT, module TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, title TEXT, kit TEXT, since_api_level INTEGER, deprecated INTEGER NOT NULL DEFAULT 0, import_snippet TEXT, syscap TEXT, permissions TEXT, device_types TEXT, body TEXT, examples TEXT, members TEXT, source_url TEXT NOT NULL, fetched_at INTEGER NOT NULL);
+            CREATE TABLE api_members (id INTEGER PRIMARY KEY AUTOINCREMENT, detail_slug TEXT NOT NULL, module TEXT, parent_name TEXT, member_name TEXT NOT NULL, kind TEXT NOT NULL, declaration TEXT, description TEXT, since_api_level INTEGER, deprecated INTEGER NOT NULL DEFAULT 0, syscap TEXT, permission TEXT, source_url TEXT);
+            CREATE TABLE api_docs_embeddings (doc_id INTEGER PRIMARY KEY REFERENCES api_docs(id) ON DELETE CASCADE, model TEXT NOT NULL, vector BLOB NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE api_docs_meta (key TEXT PRIMARY KEY, value TEXT);
+        ";
+        // 种子：文档 id=1，向量挂在 1 上
+        {
+            let c = rusqlite::Connection::open(&seed).unwrap();
+            c.execute_batch(schema).unwrap();
+            c.execute_batch(
+                "INSERT INTO api_docs (id, kit, dts_file, class_name, declaration, change_type, version_label, fetched_at)
+                   VALUES (1, 'Ability Kit', '@ohos.a.d.ts', 'A', 'function f(): void;', 'added', '26.0.0 Beta1', 0);
+                 INSERT INTO api_docs_embeddings (doc_id, model, vector, created_at) VALUES (1, 'bge', x'00', 0);
+                 INSERT INTO api_docs_meta (key, value) VALUES ('last_refreshed_at', '0');",
+            )
+            .unwrap();
+        }
+        // 主库：同一条 API（同自然键）已在，但 id 是 7（模拟在线抓取先分配过 id）。
+        // 于是补入时那条 api_docs 会被自然键 UNIQUE 忽略，而向量必须改挂到 7。
+        {
+            let c = rusqlite::Connection::open(&main).unwrap();
+            c.execute_batch(schema).unwrap();
+            c.execute_batch(
+                "INSERT INTO api_docs (id, kit, dts_file, class_name, declaration, change_type, version_label, fetched_at)
+                   VALUES (7, 'Ability Kit', '@ohos.a.d.ts', 'A', 'function f(): void;', 'added', '26.0.0 Beta1', 0);",
+            )
+            .unwrap();
+        }
+
+        import_into(&main, &seed).expect("id 不一致时也必须导入成功（按自然键重映射）");
+        let c = rusqlite::Connection::open(&main).unwrap();
+        let doc_id: i64 = c
+            .query_row(
+                "SELECT e.doc_id FROM api_docs_embeddings e
+                   JOIN api_docs d ON d.id = e.doc_id
+                  WHERE d.version_label = '26.0.0 Beta1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("向量应挂到重映射后的主库行上");
+        assert_eq!(doc_id, 7, "向量必须改挂到主库原有的那一行（id=7）");
+        let total: i64 = c
+            .query_row("SELECT COUNT(*) FROM api_docs_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "只应留下一条可映射的向量");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
