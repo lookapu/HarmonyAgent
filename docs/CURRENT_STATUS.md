@@ -17,6 +17,7 @@
 | 后端库回归（Windows 本机，设备预览批次 2026-09-18） | 同上 | 1,139 通过 / 0 失败 / 10 忽略（较上一批 +10 条预览用例：引擎参数、帧格式、WebSocket 帧解析、产物定位、默认页解析） |
 | 设备预览端到端（Windows 本机，2026-09-18） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `previewer::tests::e2e_preview_frames_from_real_engine`（需 `DEVECO_PREVIEW_E2E_PROJECT`） | 通过（真实工程 → 构建 → 起引擎 → 取回 JPEG 帧；见盘点 §54） |
 | 前端测试 | `npm test` | 15 文件、133 通过（含 `previewPanel.test.tsx`：启动/停止、帧渲染、失败不静默、卸载解绑与停引擎） |
+| 前端 ↔ 后端名字一致性 | `cargo test --manifest-path src-tauri/Cargo.toml --test frontend_backend_contract` | 2 通过（前端 `invoke*` 调到的命令必须已在 `lib.rs` 注册、`listen*` 订阅的事件必须在 Rust 源码里有同名字面量；当前 307 个命令 / 55 个事件全部对得上。测试只设下限防空过，不钉具体数字） |
 | 前端 lint / 类型 | `npm run lint`、`npx tsc -b` | 通过 |
 | Web 构建与体积门禁 | `npm run build` | 通过（Home 697.0/750KB、Markdown 1500.8/1550KB、index 547.5/575KB） |
 | Rust 编译告警 | `cargo check --lib`、`cargo test --no-run` | 0 警告（macOS + Windows 本机） |
@@ -73,7 +74,7 @@
 | Host Capability Broker | 已实现核心契约 | 审批凭据 v4（与能力无关）、执行期 fail-closed 复核、自描述撤销判定、影响契约进审批卡片与审计、13 个变更类能力的显式契约清单 | 效果证据（安装版本/设备出现）需真机；**闭环逻辑**（签发→复核→撤销→停止失效）已用生产函数跑回归，仅 guards/execute 的**实际调用点**因需 Tauri AppHandle 未覆盖 |
 | OTA 审批安全链 | 核心链路实现 | 只读副本 + 内容摘要绑定 + 固定 argv + 持久撤销 + 发布前复验 | 真实打包/签名/升级未验；不支持工具版本矩阵 |
 | HarmonyOS 工程与设备闭环 | 大量实现 | 工程/SDK/构建/部署/UI/性能工具与固定录制场景、沙箱边界 smoke | 真机/模拟器版本矩阵（离线、重连、安装冲突、恢复）未验 |
-| 设备预览（驱动 SDK Previewer 取真实帧） | 已实现（双平台 CI 绿） | `services/previewer.rs`（定位引擎/组装参数/切帧/取帧客户端）+ `commands/preview.rs`（预览构建 → 起引擎 → 帧推给前端）+ 预览面板 + 面板组件测试；配方与实测见盘点 §52/§54；CI `35315010893` 双平台全绿（含本能力的单元与前端门禁） | 交互事件回传（点击/滑动送回引擎）、热重载、多设备档切换未做；**面板与后端的真实串联未在运行的应用里点过**——面板逻辑有组件测试（api 打桩）、后端链路由 e2e 覆盖，两者之间的接线只有静态检查；引擎缺失时退回 Web 预览（显式报错，不静默失败） |
+| 设备预览（驱动 SDK Previewer 取真实帧） | 已实现（双平台 CI 绿） | `services/previewer.rs`（定位引擎/组装参数/切帧/取帧客户端）+ `commands/preview.rs`（预览构建 → 起引擎 → 帧推给前端）+ 预览面板 + 面板组件测试；配方与实测见盘点 §52/§54；CI `35315010893` 双平台全绿（含本能力的单元与前端门禁） | 交互事件回传（点击/滑动送回引擎）、热重载、多设备档切换未做；**面板与后端的真实串联未在运行的应用里点过**——面板逻辑有组件测试（api 打桩）、后端链路由 e2e 覆盖，两者之间的**名字级**接线已由 `frontend_backend_contract` 钉住（命令名与事件名双向校验，见第 1 节），剩余未验的是 prop 传递与运行时的真实点击；引擎缺失时退回 Web 预览（显式报错，不静默失败） |
 | 鸿蒙官方文档 / API 知识库 | 已重建抓取链路 + 数据补齐 | `services/harmony_doc_api.rs`（`getDocumentById` 正文接口、`getCatalogTree` 目录树查表、HTML 表格/锚点/HTML→Markdown）；版本 diff 与 API 参考两条链路联网 e2e 通过；出厂种子库（空库重建）14 版本 / 1,014 页 / `api_docs` 44,856 行 / 向量 44,856 条 / 280MB；参考正文 681 页（库内 681 行 / 13,705 条成员），17 个人工取证定案的模块映射见盘点 §51/§53 | 参考候选未命中 127（模块级 25 个，经文档站搜索逐个确认无专属参考页；清单见盘点 §53）；目录树匹配依赖标题形态（末段消歧在标题改动后可能失效）；`refresh_api_db` 依赖华为接口形态，站点再变即失效 |
 | 评测与发行 | 基础设施已建 | 固定 25-ID 清单、eval harness、release workflow、更新签名配置 | HarmonyBench 50/100+、真实 SWE 报告、平台签名/SBOM/provenance/新机验收未做 |
 | 文档与 CI 门禁 | 全绿 | `check-docs.py`（数量/链接/CI 接口）、`check-warnings.py`（clippy 基线 57） | Windows/Linux 目标本机未编译验证（仅代码审查） |
