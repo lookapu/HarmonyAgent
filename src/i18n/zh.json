@@ -1198,6 +1198,12 @@
   },
   "provider": {
     "title": "Provider 管理",
+    "importFromConfig": "从配置文件导入",
+    "importing": "导入中…",
+    "importHint": "读取 ~/.config/deveco/deveco.jsonc 里手写的 provider（应用也会把已配置的写进同一份文件）。注意该文件含明文密钥，只在本机使用。",
+    "importDone": "已导入：{{names}}",
+    "importAllExist": "这些已存在，未覆盖：{{names}}",
+    "importNothing": "配置文件里没有可导入的 provider",
     "add": "添加 Provider",
     "cancel": "取消",
     "switch": "切换",

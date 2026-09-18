@@ -3,6 +3,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   listProviders,
+  importProvidersFromConfig,
   createProvider,
   updateProvider,
   deleteProvider,
@@ -276,6 +277,8 @@ export default function ProvidersPage() {
   const [showForm, setShowForm] = useState(false)
   const [testResult, setTestResult] = useState<Record<string, string>>({})
   const [error, setError] = useState<string | null>(null)
+  const [importing, setImporting] = useState(false)
+  const [importNote, setImportNote] = useState<string | null>(null)
   const [form, setForm] = useState<CreateProviderInput>({
     name: '',
     provider_type: 'openai-compatible',
@@ -338,6 +341,27 @@ export default function ProvidersPage() {
       setModelsMap(Object.fromEntries(entries.map(([id, list]) => [id, sortModels(list)])))
     } catch (e) {
       setError(String(e))
+    }
+  }
+
+  /** 导入配置文件里手写的 provider（该文件此前只写不读，写进去的配置应用看不见） */
+  const handleImportFromConfig = async () => {
+    setImporting(true)
+    setImportNote(null)
+    try {
+      const report = await importProvidersFromConfig()
+      if (report.imported.length > 0) {
+        setImportNote(t('provider.importDone', { names: report.imported.join('、') }))
+        await load()
+      } else if (report.skipped.length > 0) {
+        setImportNote(t('provider.importAllExist', { names: report.skipped.join('、') }))
+      } else {
+        setImportNote(t('provider.importNothing'))
+      }
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setImporting(false)
     }
   }
 
@@ -812,16 +836,27 @@ export default function ProvidersPage() {
         <div>
           <h2 className="text-xl font-semibold">{t('provider.title')}</h2>
           <p className="text-xs text-[var(--text-secondary)] mt-1">{t('provider.subtitle')}</p>
+          {importNote && <p className="text-[11px] text-[var(--accent)] mt-1">{importNote}</p>}
         </div>
-        <button
-          onClick={() => setShowForm(!showForm)}
-          className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-colors"
-        >
-          <span className="flex items-center gap-1.5">
-            <Icon name={showForm ? 'close' : 'plus'} size={14} white />
-            {showForm ? t('provider.cancel') : t('provider.add')}
-          </span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleImportFromConfig}
+            disabled={importing}
+            title={t('provider.importHint')}
+            className="h-9 px-4 rounded-[10px] border border-[var(--border)] text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+          >
+            {importing ? t('provider.importing') : t('provider.importFromConfig')}
+          </button>
+          <button
+            onClick={() => setShowForm(!showForm)}
+            className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-colors"
+          >
+            <span className="flex items-center gap-1.5">
+              <Icon name={showForm ? 'close' : 'plus'} size={14} white />
+              {showForm ? t('provider.cancel') : t('provider.add')}
+            </span>
+          </button>
+        </div>
       </div>
 
       {showForm && (
@@ -990,12 +1025,23 @@ export default function ProvidersPage() {
               <Icon name="bolt" size={24} className="opacity-60" />
             </div>
             <p className="text-[var(--text-secondary)] text-sm">{t('provider.empty')}</p>
-            <button
-              onClick={() => setShowForm(true)}
-              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-colors"
-            >
-              {t('provider.add')}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowForm(true)}
+                className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-colors"
+              >
+                {t('provider.add')}
+              </button>
+              <button
+                onClick={handleImportFromConfig}
+                disabled={importing}
+                title={t('provider.importHint')}
+                className="h-9 px-4 rounded-lg border border-[var(--border)] text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+              >
+                {importing ? t('provider.importing') : t('provider.importFromConfig')}
+              </button>
+            </div>
+            <p className="text-[10px] text-[var(--text-muted)] max-w-[380px]">{t('provider.importHint')}</p>
           </div>
         )}
         {providers.map((p, pIdx) => (

@@ -220,6 +220,33 @@ pub fn run() {
                 app_handle.path().resource_dir().ok(),
             );
 
+            // 配置文件里手写的 provider 也要生效：该文件（~/.config/deveco/deveco.jsonc）
+            // 过去只有 DB → 文件的单向导出，用户写进去的配置应用看不见，只会觉得"配了没用"。
+            // 仅在库内一个 provider 都没有时导入一次，避免每次启动都读文件；失败静默。
+            {
+                if let Ok(conn) = pool_arc.lock() {
+                    let empty = conn
+                        .query_row("SELECT COUNT(*) FROM providers", [], |r| r.get::<_, i64>(0))
+                        .unwrap_or(1)
+                        == 0;
+                    if empty {
+                        match services::config_service::import_providers(&conn) {
+                            Ok(report) if !report.imported.is_empty() => {
+                                crate::utils::logger::log_event(
+                                    "providers_imported",
+                                    serde_json::json!({ "names": report.imported }),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => crate::utils::logger::log_event(
+                                "providers_import_failed",
+                                serde_json::json!({ "error": e }),
+                            ),
+                        }
+                    }
+                }
+            }
+
             // ohpm 三方库推荐缓存：超过 7 天未更新时启动后后台静默刷新
             // （一次 GET 全量替换，秒级；失败静默，不影响启动）
             {
@@ -498,6 +525,7 @@ pub fn run() {
             commands::provider::list_providers,
             commands::provider::list_provider_models,
             commands::provider::create_provider,
+            commands::provider::import_providers_from_config,
             commands::provider::update_provider,
             commands::provider::delete_provider,
             commands::provider::switch_provider,

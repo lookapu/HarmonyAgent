@@ -130,6 +130,18 @@ export const listProviders = () => invokeWithError<Provider[]>('list_providers')
 /** 手动排序 Provider：orderedIds 为全部 Provider 的新顺序（含当前激活的），返回排序后的列表 */
 export const reorderProviders = (orderedIds: string[]) => invokeWithError<Provider[]>('reorder_providers', { orderedIds })
 export const createProvider = (input: CreateProviderInput) => invokeWithError<Provider>('create_provider', { input })
+
+/** 导入结果：新建的名字与因同名而跳过的名字 */
+export interface ImportProvidersReport {
+  imported: string[]
+  skipped: string[]
+}
+/**
+ * 从 `~/.config/deveco/deveco.jsonc` 的 provider 段导入（按名字去重，不覆盖已有）。
+ * 那个文件此前只写不读，手写/粘贴进去的 provider 应用看不见，这个入口让它生效。
+ */
+export const importProvidersFromConfig = () =>
+  invokeWithError<ImportProvidersReport>('import_providers_from_config')
 export const updateProvider = (id: string, input: UpdateProviderInput) => invokeWithError<Provider>('update_provider', { id, input })
 export const deleteProvider = (id: string) => invokeWithError<void>('delete_provider', { id })
 export const switchProvider = (id: string) => invokeWithError<void>('switch_provider', { id })

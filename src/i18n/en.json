@@ -1197,6 +1197,12 @@
   },
   "provider": {
     "title": "Provider Management",
+    "importFromConfig": "Import from config file",
+    "importing": "Importing…",
+    "importHint": "Reads providers you wrote by hand into ~/.config/deveco/deveco.jsonc (the app exports configured ones there too). The file holds keys in plain text — local use only.",
+    "importDone": "Imported: {{names}}",
+    "importAllExist": "Already present, left untouched: {{names}}",
+    "importNothing": "No importable provider found in the config file",
     "add": "Add Provider",
     "cancel": "Cancel",
     "switch": "Switch",

@@ -153,6 +153,19 @@ pub fn create_provider(db: State<DbState>, input: CreateProviderInput) -> Result
     Ok(provider)
 }
 
+/// 从 `~/.config/deveco/deveco.jsonc` 的 provider 段导入（按 name 去重，不覆盖已有）。
+///
+/// 存在的理由：该文件长期只有 DB → 文件的单向导出，用户手写/粘贴进去的 provider
+/// 应用根本看不见，只会觉得"配了没用"。这个入口让"自己改配置"真的生效；启动时也会在
+/// 库内没有任何 provider 的情况下自动导入一次。
+#[tauri::command]
+pub fn import_providers_from_config(
+    db: State<DbState>,
+) -> Result<crate::services::config_service::ImportReport, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::services::config_service::import_providers(&conn)
+}
+
 /// 更新模型：切换代理开关 / 设为默认 / 展示名等
 #[tauri::command]
 pub fn update_model(db: State<DbState>, id: String, input: UpdateModelInput) -> Result<crate::db::models::Model, String> {
