@@ -6622,453 +6622,53 @@ async fn stream_chat_inner(
                         break;
                     }
                 }
-                let round = (tool_runs.len() + 1) as u32;
-                let _ = app.emit(
-                    "chat-tool-start",
-                    ChatToolStartEvent {
-                        conversation_id: conversation_id.clone(),
-                        run_id: trace_id.clone(),
-                        call_id: call_id.clone(),
-                        tool: tool.clone(),
-                        args: args_raw.clone(),
-                        round,
-                        total: max_tool_rounds as u32,
-                        level: crate::services::permissions::tool_level(&tool).as_str().to_string(),
-                        desc: crate::agent::tools::tool_short_desc(&tool).to_string(),
-                    },
-                );
-                begin_tool_run(state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
-                // 统一护栏预检：任务预算/失败黑名单/权限分级审批由 pipeline pre 钩子裁决
-                // （guards.rs 注册），拦截后按 InterceptKind 收尾：
-                // - Budget/Blacklist：发 done 事件 + 请求模型总结后终止（不静默收尾）
-                // - Approval/Generic：发 done 事件后直接终止（用户拒绝无总结机会）
-                let args_val: serde_json::Value =
-                    serde_json::from_str(&args_raw).unwrap_or(serde_json::Value::Null);
-                let approval_ctx = tool_ctx.clone().with_tool_call_id(call_id.clone());
-                let inv = crate::agent::tools::ToolInvocation {
-                    name: &tool,
-                    args: &args_val,
-                    args_raw: &args_raw,
-                    project_id: &project_id,
+                match run_one_tool(ToolExecInputs {
+                    app,
+                    state,
+                    opts: &opts,
+                    mcp: &mcp,
+                    tool_ctx: &tool_ctx,
                     project_path: &project_path,
-                    roots: &path_hints,
+                    path_hints: &path_hints,
+                    project_id: &project_id,
                     conversation_id: &conversation_id,
-                    approval_mode: approval_mode(&opts),
-                    ctx: &approval_ctx,
-                };
-                if let Some(message) =
-                    crate::agent::recovery::verification_block_global(&trace_id, &tool)
+                    cancel,
+                    registry,
+                    trace_id: &trace_id,
+                    client: &client,
+                    protocol: &protocol,
+                    provider: &provider,
+                    model_choice: &model_choice,
+                    messages: &messages,
+                    approval,
+                    placeholder_msg_id: &mut placeholder_msg_id,
+                    tool_runs: &mut tool_runs,
+                    consecutive_failures: &mut consecutive_failures,
+                    replan_given: &mut replan_given,
+                    replan_instruction: &mut replan_instruction,
+                    stats: &mut *stats,
+                    full: &mut full,
+                    modified_files: &mut modified_files,
+                    images: &mut images,
+                    tool: &tool,
+                    args_raw: &args_raw,
+                    call_id: &call_id,
+                    tool_begin,
+                    max_tool_rounds,
+                })
+                .await?
                 {
-                    let duration_ms = tool_begin.elapsed().as_millis() as i64;
-                    let _ = app.emit(
-                        "chat-tool-done",
-                        ChatToolDoneEvent {
-                            conversation_id: conversation_id.clone(),
-                            run_id: trace_id.clone(),
-                            call_id: call_id.clone(),
-                            tool: tool.clone(),
-                            ok: false,
-                            output: message.clone(),
-                            duration_ms,
-                        },
-                    );
-                    persist_tool_run_immediate(
-                        state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool,
-                        &args_raw,
-                        &message,
-                        false,
-                    );
-                    finish_tool_run(
-                        app,
-                        state,
-                        &conversation_id,
-                        &trace_id,
-                        Some(&call_id),
-                        &tool,
-                        &args_raw,
-                        &message,
-                        "blocked",
-                        duration_ms,
-                    );
-                    tool_runs.push(ToolRunItem {
-                        tool: tool.clone(),
-                        args: args_raw.clone(),
-                        output: message,
-                        succeeded: false,
-                        persisted: true,
-                    });
-                    consecutive_failures += 1;
-                    continue;
-                }
-                if let Err(intercept) = crate::agent::tools::run_pre_hooks(&inv).await {
-                    crate::utils::logger::log_event(
-                        "tool_intercepted",
-                        serde_json::json!({
-                            "conversation_id": conversation_id,
-                            "tool": tool,
-                            "kind": format!("{:?}", intercept.kind),
-                            "elapsed_ms": tool_begin.elapsed().as_millis() as i64,
-                        }),
-                    );
-                    let _ = app.emit(
-                        "chat-tool-done",
-                        ChatToolDoneEvent {
-                            conversation_id: conversation_id.clone(),
-                            run_id: trace_id.clone(),
-                            call_id: call_id.clone(),
-                            tool: tool.clone(),
-                            ok: false,
-                            output: intercept.message.clone(),
-                            duration_ms: tool_begin.elapsed().as_millis() as i64,
-                        },
-                    );
-                    // 拦截结果同样即时入库（任务中断时用户可见拦截原因）
-                    persist_tool_run_immediate(
-                        state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool,
-                        &args_raw,
-                        &intercept.message,
-                        false,
-                    );
-                    finish_tool_run(
-                        app,
-                        state,
-                        &conversation_id,
-                        &trace_id,
-                        Some(&call_id),
-                        &tool,
-                        &args_raw,
-                        &intercept.message,
-                        if intercept.kind == crate::agent::tools::InterceptKind::Cancelled {
-                            "cancelled"
-                        } else {
-                            "blocked"
-                        },
-                        tool_begin.elapsed().as_millis() as i64,
-                    );
-                    tool_runs.push(ToolRunItem {
-                        tool: tool.clone(),
-                        args: args_raw.clone(),
-                        output: intercept.message.clone(),
-                        succeeded: false,
-                        persisted: true,
-                    });
-                    // 用户在工具审批等待期间主动停止：按停止收尾（不再请求模型总结，
-                    // 直接持久化已有内容并以 chat-stopped 结束，语义与点停止一致）
-                    if intercept.kind == crate::agent::tools::InterceptKind::Cancelled {
-                        stats.stopped = true;
+                    // 正常完成：调用方继续推进每轮计数与执行器检查点
+                    ToolExecOutcome::Next => {}
+                    // 该工具已跳过（未通过验证门/登记失败）：不推进计数
+                    ToolExecOutcome::Skip => continue,
+                    // 已按拦截或停止收尾：置位 `exhausted` 后结束工具循环，
+                    // 保持原代码「置位后立刻 break」的顺序（此处等价）
+                    ToolExecOutcome::Stop => {
                         exhausted = true;
                         break;
                     }
-                    if matches!(
-                        intercept.kind,
-                        crate::agent::tools::InterceptKind::Budget
-                            | crate::agent::tools::InterceptKind::Blacklist
-                    ) {
-                        // 给模型最后一次总结机会，避免输出戛然而止
-                        let summary = request_final_summary(
-                            app,
-                            &client,
-                            &protocol,
-                            &provider,
-                            &model_choice,
-                            &opts,
-                            &messages,
-                            &conversation_id,
-                            cancel,
-                            registry,
-                            stats,
-                            state,
-                            &mut placeholder_msg_id,
-                        )
-                        .await;
-                        if !summary.trim().is_empty() {
-                            full.push_str(&summary);
-                        } else if intercept.kind == crate::agent::tools::InterceptKind::Budget {
-                            full.push_str(
-                                "\n\n> ⚠️ 本任务工具调用已达预算上限，任务中止；可重新发送指令继续。",
-                            );
-                        } else {
-                            full.push_str(
-                                "\n\n> ⚠️ 检测到反复失败的操作已被拦截，请换一种方案重试。",
-                            );
-                        }
-                    }
-                    exhausted = true;
-                    break;
                 }
-            if let Err(output) = mark_tool_run_started(state, &conversation_id, &trace_id, &call_id) {
-                finish_tool_run(
-                    app, state, &conversation_id, &trace_id, Some(&call_id), &tool,
-                    &args_raw, &output, "error", tool_begin.elapsed().as_millis() as i64,
-                );
-                let _ = app.emit("chat-tool-done", ChatToolDoneEvent {
-                    conversation_id: conversation_id.clone(), run_id: trace_id.clone(),
-                    call_id: call_id.clone(), tool: tool.clone(), ok: false,
-                    output: output.clone(), duration_ms: tool_begin.elapsed().as_millis() as i64,
-                });
-                tool_runs.push(ToolRunItem {
-                    tool: tool.clone(), args: args_raw.clone(), output,
-                    succeeded: false, persisted: true,
-                });
-                consecutive_failures += 1;
-                continue;
-            }
-            // 子 Agent 委派：并发执行、可指定模型，结果汇总后继续主 Agent 循环
-            let (result, retry_count) = if tool == "spawn_agents" {
-                tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
-                let r = run_spawn_agents(
-                    app,
-                    state,
-                    &client,
-                    &project_path,
-                    &path_hints,
-                    &project_id,
-                    &provider,
-                    &model_choice,
-                    &opts,
-                    approval,
-                    &args_raw,
-                    &conversation_id,
-                    cancel,
-                    tool_ctx.spawn_remaining,
-                )
-                .await;
-                (r, 0)
-            } else {
-                // 执行工具：超时/网络类错误按指数退避自动重试（可恢复错误白名单）
-                let contract = crate::agent::tools::contracts::contract(&tool);
-                let retried = run_tool_with_retry(
-                    &contract,
-                    &TOOL_POLICY,
-                    || {
-                        run_tool_with_guard(
-                            &tool,
-                            &args_raw,
-                            &project_path,
-                            &path_hints,
-                            &project_id,
-                            state,
-                            &mcp,
-                            &tool_ctx,
-                            cancel,
-                            &conversation_id,
-                            registry,
-                            &call_id,
-                        )
-                    },
-                )
-                .await;
-                tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
-                stats.retry_count += (retried.attempts - 1) as i64;
-                let retry_count = (retried.attempts - 1) as i64;
-                let result = retried.value.map(|out| retry_notice(out, retried.attempts));
-                (result, retry_count)
-            };
-            // 统一护栏后处理：任务护栏记录（进展/失败黑名单/失速）+ 大输出落盘由 pipeline
-            // post 钩子改写结果（guards.rs 注册），可追加强制验证/失速/目标锚定提示或预览截断
-            let mut result = result;
-            crate::agent::tools::run_post_hooks(&inv, &mut result).await;
-            let audit_status = match &result {
-                Ok(_) => "ok",
-                Err(e) if e.contains("用户已停止") => "cancelled",
-                Err(_) => "error",
-            };
-            let committed = finish_tool_run(
-                app,
-                state,
-                &conversation_id,
-                &trace_id,
-                Some(&call_id),
-                &tool,
-                &args_raw,
-                result.as_ref().unwrap_or_else(|e| e),
-                audit_status,
-                tool_begin.elapsed().as_millis() as i64,
-            );
-            if committed {
-                if let Ok(conn) = state.0.lock() {
-                    let _ = crate::agent::tool_metrics::record_attempt_metrics(
-                        &conn,
-                        &call_id,
-                        retry_count,
-                        crate::agent::exec_ctx::stop_requested_at_ms(&conversation_id),
-                    );
-                }
-            }
-            if !committed {
-                result = Err("工具结果未通过执行器 Owner fencing，已丢弃迟到结果".into());
-            }
-            // 工具完成跟踪（覆盖串行 + spawn_agents 两条路径；批处理路径在 execute_tool_batch_one 内）
-            crate::utils::logger::log_event(
-                "tool_finished",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "tool": tool,
-                    "ok": result.is_ok(),
-                    "elapsed_ms": tool_begin.elapsed().as_millis() as i64,
-                    "output_chars": result.as_ref().map(|o| o.chars().count()).unwrap_or(0),
-                }),
-            );
-            match result {
-                Ok(output) => {
-                    consecutive_failures = 0;
-                    stats.tool_rounds += 1;
-                    // 记录修改过的文件（edit_file/write_file 目标 + run_command 间接修改，去重；供消息底部文件列表展示）
-                    if tool == "edit_file" || tool == "write_file" {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&args_raw) {
-                            if let Some(p) = v["path"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                                // 模型给出的绝对路径可能带 \\?\ 前缀，先规范化；项目路径同样规范化，
-                                // 避免大小写/斜杠方向/冗余分隔符不一致导致 strip_prefix 失败、保留绝对路径被前端 diff 拒绝。
-                                let p = crate::utils::path::normalize_path(p);
-                                let proj_norm = crate::utils::path::normalize_path(&project_path);
-                                // 绝对路径且位于项目内时转相对（大小写不敏感比较，Windows 友好），便于展示
-                                let rel = if p.starts_with(&proj_norm) {
-                                    p[proj_norm.len()..].trim_start_matches(['/', '\\']).to_string()
-                                } else {
-                                    // 退而求其次：用 std canonicalize 比较（处理大小写/.. 等），失败则保留原路径
-                                    match (std::fs::canonicalize(&p), std::fs::canonicalize(&proj_norm)) {
-                                        (Ok(pc), Ok(rc)) => pc
-                                            .strip_prefix(&rc)
-                                            .map(|r| r.to_string_lossy().replace('\\', "/"))
-                                            .unwrap_or_else(|_| p.clone()),
-                                        _ => p.clone(),
-                                    }
-                                };
-                                if !modified_files.contains(&rel) {
-                                    modified_files.push(rel);
-                                }
-                            }
-                        }
-                    } else if tool == "run_command" {
-                        // run_command 间接修改：取走工具扫描出的变更文件并入列表
-                        for rel in crate::agent::tools::drain_cmd_changes() {
-                            if !modified_files.contains(&rel) {
-                                modified_files.push(rel);
-                            }
-                        }
-                    }
-                    // 截图视觉闭环：take_screenshot/verify_ui/run_ui_flow 成功后剥离 [VISION_IMAGE] 标记，
-                    // 把截图编码为多模态 data URL 待附，下一轮请求时随工具结果一起进入模型视野；
-                    // 模型不支持 image 时保留标记并提示（避免发送 image_url 被纯文本模型拒绝）
-                    let mut output = output;
-                    if tool == "take_screenshot" || tool == "verify_ui" || tool == "run_ui_flow" || tool == "view_image" {
-                        if let Some(img_path) = extract_vision_image_path(&output) {
-                            let supports_image = {
-                                let conn = state.0.lock().map_err(|e| e.to_string())?;
-                                model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
-                            };
-                            // 单任务累计附带上限：防截图轮次过多导致请求体膨胀（每张 base64 数百 KB）
-                            const MAX_VISION_IMAGES: usize = 4;
-                            let room = images.as_ref().map(|v| v.len() < MAX_VISION_IMAGES).unwrap_or(true);
-                            if supports_image && room {
-                                output = output
-                                    .replace(&format!("[VISION_IMAGE: {img_path}]"), "")
-                                    .trim_end()
-                                    .to_string();
-                                // 图像解码+缩放+JPEG 编码是 CPU 密集操作（单张可达数百 ms），
-                                // 必须在 spawn_blocking 中执行，否则会钉死 tokio worker
-                                // （timer driver 停转 → 流式超时全部失效）。
-                                let path_buf = std::path::PathBuf::from(&img_path);
-                                let encoded = tokio::task::spawn_blocking(move || {
-                                    crate::agent::tools::encode_vision_image(&path_buf)
-                                })
-                                .await
-                                .unwrap_or_else(|e| Err(format!("视觉编码任务异常: {e}")));
-                                if let Ok(data_url) = encoded {
-                                    images.get_or_insert_with(Vec::new).push(data_url);
-                                }
-                            } else if supports_image {
-                                output = format!(
-                                    "{output}\n（截图已保存：{img_path}；本任务附带截图已达 {MAX_VISION_IMAGES} 张上限，后续截图不再自动附加）"
-                                );
-                            } else {
-                                output = format!(
-                                    "{output}\n（截图已保存：{img_path}；当前模型不支持图片输入，无法自动查看图片内容）"
-                                );
-                            }
-                        }
-                    }
-                    let _ = app.emit(
-                        "chat-tool-done",
-                        ChatToolDoneEvent {
-                            conversation_id: conversation_id.clone(),
-                            run_id: trace_id.clone(),
-                            call_id: call_id.clone(),
-                            tool: tool.clone(),
-                            ok: true,
-                            output: output.clone(),
-                            duration_ms: tool_begin.elapsed().as_millis() as i64,
-                        },
-                    );
-                    // 执行完成即入库：任务中断（应用退出/崩溃）时执行轨迹不丢
-                    persist_tool_run_immediate(
-                        state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool,
-                        &args_raw,
-                        &output,
-                        true,
-                    );
-                    tool_runs.push(ToolRunItem {
-                        tool: tool.clone(),
-                        args: args_raw.clone(),
-                        output,
-                        succeeded: true,
-                        persisted: true,
-                    });
-                }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    // 连续失败 replan 档：非打转（打转由 tool_limits 终止）但持续失败时，
-                    // 注入一次“重新规划”指令，让模型换工具/换思路继续，而不是直接放弃
-                    if consecutive_failures >= 2 && !replan_given {
-                        replan_given = true;
-                        replan_instruction = Some(
-                            "（系统提示：连续多次工具执行失败，请停止当前路径，重新规划整体方案——换工具、换思路或缩小目标；若已无可行路径请直接总结。本轮仍可调用工具。）".to_string(),
-                        );
-                    }
-                    let _ = app.emit(
-                        "chat-tool-done",
-                        ChatToolDoneEvent {
-                            conversation_id: conversation_id.clone(),
-                            run_id: trace_id.clone(),
-                            call_id: call_id.clone(),
-                            tool: tool.clone(),
-                            ok: false,
-                            output: e.clone(),
-                            duration_ms: tool_begin.elapsed().as_millis() as i64,
-                        },
-                    );
-                    // 失败同样即时入库（任务中断时用户可见失败原因，恢复会话可继续）
-                    persist_tool_run_immediate(
-                        state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool,
-                        &args_raw,
-                        &format!("执行失败: {e}"),
-                        false,
-                    );
-                    // Marker 绑定动作：失败结果附带障碍处理协议要求（诊断+具体动作），
-                    // 与系统提示中的“障碍处理协议”呼应，防模型对失败只描述不行动
-                    tool_runs.push(ToolRunItem {
-                        tool: tool.clone(),
-                        args: args_raw.clone(),
-                        output: format!(
-                            "执行失败: {e}\n（工具失败。请按障碍处理协议：①一句话失败诊断；②下一步具体动作——换工具/换参数/换思路后继续推进；确实无法推进时说明卡点与所需条件。）"
-                        ),
-                        succeeded: false,
-                        persisted: true,
-                    });
-                }
-            }
             // 每个工具执行完成后推进进度对照计数（计划批准后每 3 个工具注入一次进度汇报）
             tools_since_progress += 1;
             persist_desktop_executor_checkpoint(
@@ -10787,6 +10387,549 @@ async fn flush_tool_batch(inputs: ToolBatchInputs<'_>) -> Result<bool, ChatFlowE
     )?;
     inputs.pending.clear();
     Ok(intercepted)
+}
+
+/// 单个工具执行的结论（替代原内联代码里的 `continue` / `break`）。
+enum ToolExecOutcome {
+    /// 正常完成：调用方继续推进每轮计数与执行器检查点
+    Next,
+    /// 该工具已跳过（未通过验证门 / 登记失败）：调用方 `continue`，不推进计数
+    Skip,
+    /// 已按拦截或停止收尾：调用方置 `exhausted` 并结束工具循环
+    Stop,
+}
+
+/// `run_one_tool` 的输入（全部借用）。
+struct ToolExecInputs<'a> {
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    opts: &'a ChatOptions,
+    mcp: &'a crate::services::mcp_manager::McpManager,
+    tool_ctx: &'a crate::agent::exec_ctx::ToolCtx,
+    project_path: &'a String,
+    path_hints: &'a [String],
+    project_id: &'a String,
+    conversation_id: &'a String,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    registry: &'a TaskRegistry,
+    trace_id: &'a String,
+    client: &'a reqwest::Client,
+    protocol: &'a str,
+    provider: &'a ProviderEndpoint,
+    model_choice: &'a ModelChoice,
+    messages: &'a [serde_json::Value],
+    approval: &'a tauri::State<'a, ToolApprovalState>,
+    placeholder_msg_id: &'a mut Option<String>,
+    tool_runs: &'a mut Vec<ToolRunItem>,
+    consecutive_failures: &'a mut u32,
+    replan_given: &'a mut bool,
+    replan_instruction: &'a mut Option<String>,
+    stats: &'a mut ChatRunStats,
+    full: &'a mut String,
+    modified_files: &'a mut Vec<String>,
+    images: &'a mut Option<Vec<String>>,
+    tool: &'a String,
+    args_raw: &'a String,
+    call_id: &'a String,
+    tool_begin: std::time::Instant,
+    max_tool_rounds: usize,
+}
+
+/// 执行单个工具（纯搬运：原工具循环内联代码，行为一致）：开始事件与执行登记 →
+/// 验证门预检 → 护栏 pre 钩子（审批/预算/黑名单）→ 执行（spawn_agents 或带重试的
+/// 单工具）→ post 钩子 → 完成事件与即时入库 → 结果归档（成功/失败分支）。
+///
+/// **本函数体保留原内联代码的缩进**：搬运不改缩进，便于逐行比对复核（该区域缩进本就
+/// 不规范，不能用 `cargo fmt` 处理——会淹没搬运本身）。返回 `Skip` / `Stop` 对应原
+/// 代码的 `continue` / `break`，`Stop` 所需的 `exhausted = true;` 交回调用方。
+///
+/// **借用写法同样保持原样**：输入从局部变量改为引用后，原代码里对局部 `String`/`Vec`/
+/// 配置对象写的 `&x` 变成对引用的多余借用，clippy 在本函数内报 180+ 处
+/// `needless_borrow`。逐处改写会把这 445 行搬运的 diff 淹没（与「纯搬运可逐行比对」
+/// 的纪律冲突），而改成按值传入又要在每次工具调用克隆 `messages`/`opts` 等结构。
+/// 因此这一处例外在此收口：仅覆盖本函数，待第 7 步「合段」重写时随借用一并清理。
+#[allow(clippy::needless_borrow)]
+async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, ChatFlowError> {
+    let ToolExecInputs {
+        app,
+        state,
+        opts,
+        mcp,
+        tool_ctx,
+        project_path,
+        path_hints,
+        project_id,
+        conversation_id,
+        cancel,
+        registry,
+        trace_id,
+        client,
+        protocol,
+        provider,
+        model_choice,
+        messages,
+        approval,
+        placeholder_msg_id,
+        tool_runs,
+        consecutive_failures,
+        replan_given,
+        replan_instruction,
+        stats,
+        full,
+        modified_files,
+        images,
+        tool,
+        args_raw,
+        call_id,
+        tool_begin,
+        max_tool_rounds,
+    } = inputs;
+                let round = (tool_runs.len() + 1) as u32;
+                let _ = app.emit(
+                    "chat-tool-start",
+                    ChatToolStartEvent {
+                        conversation_id: conversation_id.clone(),
+                        run_id: trace_id.clone(),
+                        call_id: call_id.clone(),
+                        tool: tool.clone(),
+                        args: args_raw.clone(),
+                        round,
+                        total: max_tool_rounds as u32,
+                        level: crate::services::permissions::tool_level(&tool).as_str().to_string(),
+                        desc: crate::agent::tools::tool_short_desc(&tool).to_string(),
+                    },
+                );
+                begin_tool_run(state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
+                // 统一护栏预检：任务预算/失败黑名单/权限分级审批由 pipeline pre 钩子裁决
+                // （guards.rs 注册），拦截后按 InterceptKind 收尾：
+                // - Budget/Blacklist：发 done 事件 + 请求模型总结后终止（不静默收尾）
+                // - Approval/Generic：发 done 事件后直接终止（用户拒绝无总结机会）
+                let args_val: serde_json::Value =
+                    serde_json::from_str(&args_raw).unwrap_or(serde_json::Value::Null);
+                let approval_ctx = tool_ctx.clone().with_tool_call_id(call_id.clone());
+                let inv = crate::agent::tools::ToolInvocation {
+                    name: &tool,
+                    args: &args_val,
+                    args_raw: &args_raw,
+                    project_id: &project_id,
+                    project_path: &project_path,
+                    roots: &path_hints,
+                    conversation_id: &conversation_id,
+                    approval_mode: approval_mode(&opts),
+                    ctx: &approval_ctx,
+                };
+                if let Some(message) =
+                    crate::agent::recovery::verification_block_global(&trace_id, &tool)
+                {
+                    let duration_ms = tool_begin.elapsed().as_millis() as i64;
+                    let _ = app.emit(
+                        "chat-tool-done",
+                        ChatToolDoneEvent {
+                            conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
+                            tool: tool.clone(),
+                            ok: false,
+                            output: message.clone(),
+                            duration_ms,
+                        },
+                    );
+                    persist_tool_run_immediate(
+                        state,
+                        &conversation_id,
+                        &trace_id,
+                        &tool,
+                        &args_raw,
+                        &message,
+                        false,
+                    );
+                    finish_tool_run(
+                        app,
+                        state,
+                        &conversation_id,
+                        &trace_id,
+                        Some(&call_id),
+                        &tool,
+                        &args_raw,
+                        &message,
+                        "blocked",
+                        duration_ms,
+                    );
+                    tool_runs.push(ToolRunItem {
+                        tool: tool.clone(),
+                        args: args_raw.clone(),
+                        output: message,
+                        succeeded: false,
+                        persisted: true,
+                    });
+                    *consecutive_failures += 1;
+                    return Ok(ToolExecOutcome::Skip);
+                }
+                if let Err(intercept) = crate::agent::tools::run_pre_hooks(&inv).await {
+                    crate::utils::logger::log_event(
+                        "tool_intercepted",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "tool": tool,
+                            "kind": format!("{:?}", intercept.kind),
+                            "elapsed_ms": tool_begin.elapsed().as_millis() as i64,
+                        }),
+                    );
+                    let _ = app.emit(
+                        "chat-tool-done",
+                        ChatToolDoneEvent {
+                            conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
+                            tool: tool.clone(),
+                            ok: false,
+                            output: intercept.message.clone(),
+                            duration_ms: tool_begin.elapsed().as_millis() as i64,
+                        },
+                    );
+                    // 拦截结果同样即时入库（任务中断时用户可见拦截原因）
+                    persist_tool_run_immediate(
+                        state,
+                        &conversation_id,
+                        &trace_id,
+                        &tool,
+                        &args_raw,
+                        &intercept.message,
+                        false,
+                    );
+                    finish_tool_run(
+                        app,
+                        state,
+                        &conversation_id,
+                        &trace_id,
+                        Some(&call_id),
+                        &tool,
+                        &args_raw,
+                        &intercept.message,
+                        if intercept.kind == crate::agent::tools::InterceptKind::Cancelled {
+                            "cancelled"
+                        } else {
+                            "blocked"
+                        },
+                        tool_begin.elapsed().as_millis() as i64,
+                    );
+                    tool_runs.push(ToolRunItem {
+                        tool: tool.clone(),
+                        args: args_raw.clone(),
+                        output: intercept.message.clone(),
+                        succeeded: false,
+                        persisted: true,
+                    });
+                    // 用户在工具审批等待期间主动停止：按停止收尾（不再请求模型总结，
+                    // 直接持久化已有内容并以 chat-stopped 结束，语义与点停止一致）
+                    if intercept.kind == crate::agent::tools::InterceptKind::Cancelled {
+                        stats.stopped = true;
+                        return Ok(ToolExecOutcome::Stop);
+                    }
+                    if matches!(
+                        intercept.kind,
+                        crate::agent::tools::InterceptKind::Budget
+                            | crate::agent::tools::InterceptKind::Blacklist
+                    ) {
+                        // 给模型最后一次总结机会，避免输出戛然而止
+                        let summary = request_final_summary(
+                            app,
+                            &client,
+                            &protocol,
+                            &provider,
+                            &model_choice,
+                            &opts,
+                            &messages,
+                            &conversation_id,
+                            cancel,
+                            registry,
+                            stats,
+                            state,
+                            placeholder_msg_id,
+                        )
+                        .await;
+                        if !summary.trim().is_empty() {
+                            full.push_str(&summary);
+                        } else if intercept.kind == crate::agent::tools::InterceptKind::Budget {
+                            full.push_str(
+                                "\n\n> ⚠️ 本任务工具调用已达预算上限，任务中止；可重新发送指令继续。",
+                            );
+                        } else {
+                            full.push_str(
+                                "\n\n> ⚠️ 检测到反复失败的操作已被拦截，请换一种方案重试。",
+                            );
+                        }
+                    }
+                    return Ok(ToolExecOutcome::Stop);
+                }
+            if let Err(output) = mark_tool_run_started(state, &conversation_id, &trace_id, &call_id) {
+                finish_tool_run(
+                    app, state, &conversation_id, &trace_id, Some(&call_id), &tool,
+                    &args_raw, &output, "error", tool_begin.elapsed().as_millis() as i64,
+                );
+                let _ = app.emit("chat-tool-done", ChatToolDoneEvent {
+                    conversation_id: conversation_id.clone(), run_id: trace_id.clone(),
+                    call_id: call_id.clone(), tool: tool.clone(), ok: false,
+                    output: output.clone(), duration_ms: tool_begin.elapsed().as_millis() as i64,
+                });
+                tool_runs.push(ToolRunItem {
+                    tool: tool.clone(), args: args_raw.clone(), output,
+                    succeeded: false, persisted: true,
+                });
+                *consecutive_failures += 1;
+                return Ok(ToolExecOutcome::Skip);
+            }
+            // 子 Agent 委派：并发执行、可指定模型，结果汇总后继续主 Agent 循环
+            let (result, retry_count) = if tool == "spawn_agents" {
+                tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
+                let r = run_spawn_agents(
+                    app,
+                    state,
+                    &client,
+                    &project_path,
+                    &path_hints,
+                    &project_id,
+                    &provider,
+                    &model_choice,
+                    &opts,
+                    approval,
+                    &args_raw,
+                    &conversation_id,
+                    cancel,
+                    tool_ctx.spawn_remaining,
+                )
+                .await;
+                (r, 0)
+            } else {
+                // 执行工具：超时/网络类错误按指数退避自动重试（可恢复错误白名单）
+                let contract = crate::agent::tools::contracts::contract(&tool);
+                let retried = run_tool_with_retry(
+                    &contract,
+                    &TOOL_POLICY,
+                    || {
+                        run_tool_with_guard(
+                            &tool,
+                            &args_raw,
+                            &project_path,
+                            &path_hints,
+                            &project_id,
+                            state,
+                            &mcp,
+                            &tool_ctx,
+                            cancel,
+                            &conversation_id,
+                            registry,
+                            &call_id,
+                        )
+                    },
+                )
+                .await;
+                tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
+                stats.retry_count += (retried.attempts - 1) as i64;
+                let retry_count = (retried.attempts - 1) as i64;
+                let result = retried.value.map(|out| retry_notice(out, retried.attempts));
+                (result, retry_count)
+            };
+            // 统一护栏后处理：任务护栏记录（进展/失败黑名单/失速）+ 大输出落盘由 pipeline
+            // post 钩子改写结果（guards.rs 注册），可追加强制验证/失速/目标锚定提示或预览截断
+            let mut result = result;
+            crate::agent::tools::run_post_hooks(&inv, &mut result).await;
+            let audit_status = match &result {
+                Ok(_) => "ok",
+                Err(e) if e.contains("用户已停止") => "cancelled",
+                Err(_) => "error",
+            };
+            let committed = finish_tool_run(
+                app,
+                state,
+                &conversation_id,
+                &trace_id,
+                Some(&call_id),
+                &tool,
+                &args_raw,
+                result.as_ref().unwrap_or_else(|e| e),
+                audit_status,
+                tool_begin.elapsed().as_millis() as i64,
+            );
+            if committed {
+                if let Ok(conn) = state.0.lock() {
+                    let _ = crate::agent::tool_metrics::record_attempt_metrics(
+                        &conn,
+                        &call_id,
+                        retry_count,
+                        crate::agent::exec_ctx::stop_requested_at_ms(&conversation_id),
+                    );
+                }
+            }
+            if !committed {
+                result = Err("工具结果未通过执行器 Owner fencing，已丢弃迟到结果".into());
+            }
+            // 工具完成跟踪（覆盖串行 + spawn_agents 两条路径；批处理路径在 execute_tool_batch_one 内）
+            crate::utils::logger::log_event(
+                "tool_finished",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "tool": tool,
+                    "ok": result.is_ok(),
+                    "elapsed_ms": tool_begin.elapsed().as_millis() as i64,
+                    "output_chars": result.as_ref().map(|o| o.chars().count()).unwrap_or(0),
+                }),
+            );
+            match result {
+                Ok(output) => {
+                    *consecutive_failures = 0;
+                    stats.tool_rounds += 1;
+                    // 记录修改过的文件（edit_file/write_file 目标 + run_command 间接修改，去重；供消息底部文件列表展示）
+                    if tool == "edit_file" || tool == "write_file" {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&args_raw) {
+                            if let Some(p) = v["path"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                // 模型给出的绝对路径可能带 \\?\ 前缀，先规范化；项目路径同样规范化，
+                                // 避免大小写/斜杠方向/冗余分隔符不一致导致 strip_prefix 失败、保留绝对路径被前端 diff 拒绝。
+                                let p = crate::utils::path::normalize_path(p);
+                                let proj_norm = crate::utils::path::normalize_path(&project_path);
+                                // 绝对路径且位于项目内时转相对（大小写不敏感比较，Windows 友好），便于展示
+                                let rel = if p.starts_with(&proj_norm) {
+                                    p[proj_norm.len()..].trim_start_matches(['/', '\\']).to_string()
+                                } else {
+                                    // 退而求其次：用 std canonicalize 比较（处理大小写/.. 等），失败则保留原路径
+                                    match (std::fs::canonicalize(&p), std::fs::canonicalize(&proj_norm)) {
+                                        (Ok(pc), Ok(rc)) => pc
+                                            .strip_prefix(&rc)
+                                            .map(|r| r.to_string_lossy().replace('\\', "/"))
+                                            .unwrap_or_else(|_| p.clone()),
+                                        _ => p.clone(),
+                                    }
+                                };
+                                if !modified_files.contains(&rel) {
+                                    modified_files.push(rel);
+                                }
+                            }
+                        }
+                    } else if tool == "run_command" {
+                        // run_command 间接修改：取走工具扫描出的变更文件并入列表
+                        for rel in crate::agent::tools::drain_cmd_changes() {
+                            if !modified_files.contains(&rel) {
+                                modified_files.push(rel);
+                            }
+                        }
+                    }
+                    // 截图视觉闭环：take_screenshot/verify_ui/run_ui_flow 成功后剥离 [VISION_IMAGE] 标记，
+                    // 把截图编码为多模态 data URL 待附，下一轮请求时随工具结果一起进入模型视野；
+                    // 模型不支持 image 时保留标记并提示（避免发送 image_url 被纯文本模型拒绝）
+                    let mut output = output;
+                    if tool == "take_screenshot" || tool == "verify_ui" || tool == "run_ui_flow" || tool == "view_image" {
+                        if let Some(img_path) = extract_vision_image_path(&output) {
+                            let supports_image = {
+                                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                                model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
+                            };
+                            // 单任务累计附带上限：防截图轮次过多导致请求体膨胀（每张 base64 数百 KB）
+                            const MAX_VISION_IMAGES: usize = 4;
+                            let room = images.as_ref().map(|v| v.len() < MAX_VISION_IMAGES).unwrap_or(true);
+                            if supports_image && room {
+                                output = output
+                                    .replace(&format!("[VISION_IMAGE: {img_path}]"), "")
+                                    .trim_end()
+                                    .to_string();
+                                // 图像解码+缩放+JPEG 编码是 CPU 密集操作（单张可达数百 ms），
+                                // 必须在 spawn_blocking 中执行，否则会钉死 tokio worker
+                                // （timer driver 停转 → 流式超时全部失效）。
+                                let path_buf = std::path::PathBuf::from(&img_path);
+                                let encoded = tokio::task::spawn_blocking(move || {
+                                    crate::agent::tools::encode_vision_image(&path_buf)
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(format!("视觉编码任务异常: {e}")));
+                                if let Ok(data_url) = encoded {
+                                    images.get_or_insert_with(Vec::new).push(data_url);
+                                }
+                            } else if supports_image {
+                                output = format!(
+                                    "{output}\n（截图已保存：{img_path}；本任务附带截图已达 {MAX_VISION_IMAGES} 张上限，后续截图不再自动附加）"
+                                );
+                            } else {
+                                output = format!(
+                                    "{output}\n（截图已保存：{img_path}；当前模型不支持图片输入，无法自动查看图片内容）"
+                                );
+                            }
+                        }
+                    }
+                    let _ = app.emit(
+                        "chat-tool-done",
+                        ChatToolDoneEvent {
+                            conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
+                            tool: tool.clone(),
+                            ok: true,
+                            output: output.clone(),
+                            duration_ms: tool_begin.elapsed().as_millis() as i64,
+                        },
+                    );
+                    // 执行完成即入库：任务中断（应用退出/崩溃）时执行轨迹不丢
+                    persist_tool_run_immediate(
+                        state,
+                        &conversation_id,
+                        &trace_id,
+                        &tool,
+                        &args_raw,
+                        &output,
+                        true,
+                    );
+                    tool_runs.push(ToolRunItem {
+                        tool: tool.clone(),
+                        args: args_raw.clone(),
+                        output,
+                        succeeded: true,
+                        persisted: true,
+                    });
+                }
+                Err(e) => {
+                    *consecutive_failures += 1;
+                    // 连续失败 replan 档：非打转（打转由 tool_limits 终止）但持续失败时，
+                    // 注入一次“重新规划”指令，让模型换工具/换思路继续，而不是直接放弃
+                    if *consecutive_failures >= 2 && !*replan_given {
+                        *replan_given = true;
+                        *replan_instruction = Some(
+                            "（系统提示：连续多次工具执行失败，请停止当前路径，重新规划整体方案——换工具、换思路或缩小目标；若已无可行路径请直接总结。本轮仍可调用工具。）".to_string(),
+                        );
+                    }
+                    let _ = app.emit(
+                        "chat-tool-done",
+                        ChatToolDoneEvent {
+                            conversation_id: conversation_id.clone(),
+                            run_id: trace_id.clone(),
+                            call_id: call_id.clone(),
+                            tool: tool.clone(),
+                            ok: false,
+                            output: e.clone(),
+                            duration_ms: tool_begin.elapsed().as_millis() as i64,
+                        },
+                    );
+                    // 失败同样即时入库（任务中断时用户可见失败原因，恢复会话可继续）
+                    persist_tool_run_immediate(
+                        state,
+                        &conversation_id,
+                        &trace_id,
+                        &tool,
+                        &args_raw,
+                        &format!("执行失败: {e}"),
+                        false,
+                    );
+                    // Marker 绑定动作：失败结果附带障碍处理协议要求（诊断+具体动作），
+                    // 与系统提示中的“障碍处理协议”呼应，防模型对失败只描述不行动
+                    tool_runs.push(ToolRunItem {
+                        tool: tool.clone(),
+                        args: args_raw.clone(),
+                        output: format!(
+                            "执行失败: {e}\n（工具失败。请按障碍处理协议：①一句话失败诊断；②下一步具体动作——换工具/换参数/换思路后继续推进；确实无法推进时说明卡点与所需条件。）"
+                        ),
+                        succeeded: false,
+                        persisted: true,
+                    });
+                }
+            }
+    Ok(ToolExecOutcome::Next)
 }
 
 /// 从文本提取到的目录路径及其语境分类。
