@@ -783,3 +783,20 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **验证**（Windows 本机）：`harmony_env` 8 项通过（新增回归 `path_dirs_covers_previewer_bin_and_emulator`：断言 previewer 的 `common/bin` 与 `tools/emulator` 都在列表内，且 `ets` 等其它组件不产生条目）；`check-warnings.py` 57/57；`check-docs.py` 通过。
 
 **未闭环**：macOS 侧本批提交待 CI 复核；本批只保证「可解析」，Previewer/Emulator 的实际调用点尚未接入；预览端到端验证卡在 DevEco 环境的预览是否可用。
+
+## 48. 参考文档匹配加固：短末段、父段消歧、错误码页排除与剩余 42 项清点（2026-09-18）
+
+第 48 批：把 171 个未命中的参考候选逐个归类，并按证据加固匹配规则——**新增 27 个候选命中、0 条既有映射被改变**。
+
+- **先做证据，再改规则**：把候选集（705 个：`api_docs.module` ∪ `d.ts` 路径派生）与目录树（4,762 篇）对照，用脚本先量化四档增量的收益与副作用，再动 Rust。规则演化：末段 ≥4 无消歧 → 636 可解；**末段 ≥3 + 父段消歧** → 652（+16、0 改判）；**再排除 `errorcode-*` 页** → 663（+11、0 改判）。
+- **父段消歧**解决的是「末段撞名」：`@hms.core.map.map` 有两个候选（`map-map` 与 `js-apis-bluetooth-map`），要求 objectId 里末段前一段等于模块父段后，唯一命中 `map-map`；都命中时平票优先 `js-apis-*`（`@hms.nearlink.advertising → js-apis-nearlink-advertising`）。`errorcode-*` 是独立错误码页，多义时先排除再判（`@hms.security.trustedAuthentication → devicesecurity-trusted-auth-api`，同族另修好 fido / ifaa / soter / safetyDetect / dlpAntiPeep / trustedAppService / antifraudPicker / businessRiskIntelligentDetection / riskControlEngine / superPrivacyMode 共 11 个）。
+- **否掉的方案**：把 `hms-references`（1,141 篇）与 `hmscore-references`（2,452 篇）两棵目录树一并并入索引——实测**负收益**（+1 新增、−3 丢失：同义候选把原本唯一命中的页面变成多义）。结论记在此处，避免以后重复尝试。
+- **兜底表别名修正**：`FALLBACK_SLUGS` 里 `@ohos.preferences` / `@ohos.relationalStore` 是陈旧别名，与真实模块 `@ohos.data.preferences` / `@ohos.data.relationalStore` 指向同一篇文档；因 `api_details.slug` 唯一，先解析者占位导致真实模块名显示为"未命中"。改回真实模块名后两个模块正常入库。
+- **效果**：参考正文 639 → **664 页**、成员 12,602 → **13,236**（库内 658 行 / 13,056 条），候选未命中 171 → **144**。
+- **剩余 42 个模块级未命中，逐条清点**：
+  - **8 个有相近页面、需人工确认**（脚本给出候选，但不自动映射，避免猜错文档）：`@hms.ai.insightIntent`（intents-arkts-api-insightintent）、`@hms.core.ar.arengine` / `@kit.AREngine`（ar-engine-api vs arengine-api-arengine）、`@hms.core.atomicserviceComponent.atomicservice`（atomic-services vs scenario-fusion-atomicservice）、`@hms.data.retrieval`（dataaugmentation-retrieval-api）、`@hms.nearlink.dataTransfer`（nearlink-data-transfer-api，实际已由 `@ohos.nearlink.dataTransfer` 命中同一页）、`@hms.nearlink.remoteDevice`（nearlink-remote-device）、`@hms.security.securityAudit`（devicesecurity-securityaudit-api）。
+  - **34 个目录树里确实没有对应文档**：`@ohos.arkui.components.ArkLazy*Layout`/`ArkDynamicLayout`/`@ohos.arkui.WithEnv`（ArkUI 内部声明）、`@ohos.bluetooth.opp`/`wearDetection`、`@ohos.file.fileAccess`/`keyManager`、`@ohos.multimedia.mediaLibrary`、`@ohos.resourceschedule.deviceStandby`、`@ohos.userIAM.userAccessCtrl`、`@ohos.application.uriPermissionManager`、`@ohos.data.cloudExtension`、`@ohos.multimodalAwareness.onScreen`、`@hms.hds.*`、`@hms.health.service`/`store`、`@hms.ai.AICaption`/`AgentFramework`、`@hms.core.account.LoginComponent` 等。注意目录树里有 809 篇标题不含 ASCII 模块名的页面（纯中文），因此"标题里找不到"不完全等于"没有文档"，但无法在不人工读页面的前提下判定。
+
+**验证**（Windows 本机）：后端库 1,128 通过 / 0 失败 / 9 忽略（新增 3 条匹配规则用例：短末段、父段消歧、错误码排除/歧义拒绝）；联网 e2e（目录树命中 `@hms.*`）通过；`check-docs.py`、`check-warnings.py` 通过；种子库 `integrity_check=ok`。
+
+**未闭环**：macOS 侧本批待 CI；8 个待人工确认项未定；34 个"确实没有"中含纯中文标题页面无法自动判定；`@hms.nearlink.*` 与 `@ohos.nearlink.*` 指向同一页时会话里保留 `@ohos.*` 命名（slug 唯一约束所致，属预期）。

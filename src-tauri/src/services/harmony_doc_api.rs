@@ -143,6 +143,10 @@ pub struct CatalogIndex {
 
 impl CatalogIndex {
     /// 解析模块名对应的文档 objectId。
+    ///
+    /// 顺序：完整模块名 → 末段唯一 → 末段多义时按「父段一致」消歧（平票优先 `js-apis-*`
+    /// 的 ArkTS 文档）。多义时若除错误码页外只剩一篇，取那一篇：`errorcode-*` 是独立的
+    /// 错误码参考页，不能当作模块正文。
     pub fn resolve(&self, module: &str) -> Option<&str> {
         let key = normalize_module(module);
         if key.is_empty() {
@@ -155,15 +159,68 @@ impl CatalogIndex {
         if tail.len() < MIN_TAIL_LEN {
             return None;
         }
-        match self.tails.get(tail) {
-            Some(hits) if hits.len() == 1 => Some(hits[0].as_str()),
-            _ => None,
+        let hits: Vec<&String> = self
+            .tails
+            .get(tail)
+            .map(|hits| hits.iter().filter(|id| !id.starts_with("errorcode-")).collect())
+            .unwrap_or_default();
+        match hits.len() {
+            0 => None,
+            1 => Some(hits[0].as_str()),
+            _ => self.disambiguate(&key, tail, &hits),
+        }
+    }
+
+    /// 末段撞名时按父段消歧：objectId 里末段前一段必须等于模块的父段
+    /// （`@hms.core.map.map` → `map-map` 而不是 `js-apis-bluetooth-map`）。
+    fn disambiguate<'a>(&self, key: &str, tail: &str, hits: &[&'a String]) -> Option<&'a str> {
+        let segments: Vec<&str> = key.split('.').collect();
+        let parent = if segments.len() >= 3 {
+            segments[segments.len() - 2]
+        } else {
+            ""
+        };
+        let mut candidates: Vec<&String> = hits
+            .iter()
+            .copied()
+            .filter(|id| {
+                let parts: Vec<String> = id.to_lowercase().split('-').map(str::to_string).collect();
+                parts.iter().enumerate().any(|(i, part)| {
+                    part == tail
+                        && i > 0
+                        && (parent.is_empty()
+                            || parts[i - 1] == parent
+                            || (i > 1 && parts[i - 1] == "apis" && parts[i - 2] == parent))
+                })
+            })
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        match candidates.len() {
+            0 => None,
+            1 => Some(candidates[0].as_str()),
+            _ => {
+                // 平票：ArkTS 参考文档（js-apis-*）优先于 C API / Kit 落地页
+                let mut arkts: Vec<&String> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|id| id.starts_with("js-apis-"))
+                    .collect();
+                arkts.sort();
+                arkts.dedup();
+                if arkts.len() == 1 {
+                    Some(arkts[0].as_str())
+                } else {
+                    None
+                }
+            }
         }
     }
 }
 
-/// 末段匹配的最短长度：太短的末段（`tag`、`util`）容易撞名
-const MIN_TAIL_LEN: usize = 4;
+/// 末段匹配的最短长度：太短的末段（`tag`、`map`）容易撞名，但 3 字符配合「父段消歧 +
+/// 唯一性」仍可安全命中（`@hms.ai.A2A → hmaf-a2a-protocol`、`@hms.core.iap → iap-iap`）
+const MIN_TAIL_LEN: usize = 3;
 
 /// 去空白并小写（模块名与标题都走这一套规范化，大小写差异不影响匹配）
 fn normalize_module(raw: &str) -> String {
@@ -797,6 +854,52 @@ mod tests {
         assert_eq!(index.resolve("@hms.ai.vision.image"), None);
         // 末段过短 → 不解析
         assert_eq!(index.resolve("@ohos.foo.tag"), None);
+    }
+
+    #[test]
+    fn catalog_index_resolves_short_tails_and_disambiguates() {
+        // 3 字符末段（唯一）可解；撞名时按父段消歧；错误码页不当作正文；
+        // 平票时 ArkTS 文档（js-apis-*）优先。
+        let docs = vec![
+            CatalogDoc { object_id: "hmaf-a2a-protocol".into(), title: "A2A（智能体通信协议）".into(), path: vec![] },
+            CatalogDoc { object_id: "iap-iap".into(), title: "iap（应用内支付）".into(), path: vec![] },
+            CatalogDoc { object_id: "map-map".into(), title: "map（地图服务）".into(), path: vec![] },
+            CatalogDoc { object_id: "js-apis-bluetooth-map".into(), title: "map（蓝牙MAP）".into(), path: vec![] },
+            CatalogDoc { object_id: "js-apis-nearlink-advertising".into(), title: "@ohos.nearlink.advertising (星闪广播)".into(), path: vec![] },
+            CatalogDoc { object_id: "nearlink-advertising".into(), title: "advertising（星闪广播 C API）".into(), path: vec![] },
+            CatalogDoc { object_id: "devicesecurity-trusted-auth-api".into(), title: "TrustedAuthentication（数字盾服务）".into(), path: vec![] },
+            CatalogDoc { object_id: "errorcode-devicesecurity-trusted-auth".into(), title: "TrustedAuthentication （数字盾服务）".into(), path: vec![] },
+        ];
+        let index = catalog_index(&docs);
+        // 3 字符末段唯一 → 命中
+        assert_eq!(index.resolve("@hms.ai.A2A"), Some("hmaf-a2a-protocol"));
+        assert_eq!(index.resolve("@hms.core.iap"), Some("iap-iap"));
+        // 末段 `map` 撞名：父段消歧选中 map-map，而不是蓝牙 MAP
+        assert_eq!(index.resolve("@hms.core.map.map"), Some("map-map"));
+        // 末段撞名且都能对上父段：ArkTS 文档优先
+        assert_eq!(
+            index.resolve("@hms.nearlink.advertising"),
+            Some("js-apis-nearlink-advertising")
+        );
+        // 错误码页被排除后只剩正文页 → 命中
+        assert_eq!(
+            index.resolve("@hms.security.trustedAuthentication"),
+            Some("devicesecurity-trusted-auth-api")
+        );
+    }
+
+    #[test]
+    fn catalog_index_refuses_ambiguous_or_short_tails() {
+        let docs = vec![
+            CatalogDoc { object_id: "a-alpha".into(), title: "alpha（甲）".into(), path: vec![] },
+            CatalogDoc { object_id: "b-beta-alpha".into(), title: "beta.alpha（乙）".into(), path: vec![] },
+            CatalogDoc { object_id: "errorcode-only".into(), title: "only（错误码）".into(), path: vec![] },
+        ];
+        let index = catalog_index(&docs);
+        // 末段 `alpha` 两篇、父段都对不上唯一 → 不猜
+        assert_eq!(index.resolve("@hms.x.alpha"), None);
+        // 只剩错误码页 → 不当作正文
+        assert_eq!(index.resolve("@hms.x.only"), None);
     }
 
     #[test]
