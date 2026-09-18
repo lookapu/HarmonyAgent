@@ -24,15 +24,29 @@ DOCS = ROOT / "docs"
 TOOL_SPEC_RE = re.compile(r"^    ToolSpec \{", re.M)
 
 
+def read_doc(repo: Path, rel: str) -> str:
+    """按 UTF-8 读取仓库内文档。
+
+    校验侧一律按 UTF-8 读，而 Windows 上 write_text/read_text 默认用本地编码
+    （cp936/cp1252）：不显式指定时，中文内容会被写成/读成 mojibake，自检的合成仓库
+    即使"干净"也会报一堆未找到模式（CI 是 UTF-8 locale，碰不到这个坑）。
+    """
+    return (repo / rel).read_text(encoding="utf-8", errors="replace")
+
+
+def write_doc(repo: Path, rel: str, text: str) -> None:
+    (repo / rel).write_text(text, encoding="utf-8")
+
+
 def count_tool_specs(repo: Path) -> int:
-    source = (repo / "src-tauri/src/agent/tools/mod.rs").read_text(encoding="utf-8", errors="replace")
+    source = read_doc(repo, "src-tauri/src/agent/tools/mod.rs")
     return len(TOOL_SPEC_RE.findall(source))
 
 
 def count_migrations(repo: Path) -> tuple[int, int]:
     """返回 (文件数, 注册数)；两者不一致本身即漂移。"""
     files = len(list((repo / "src-tauri/migrations").glob("*.sql")))
-    text = (repo / "src-tauri/src/db/mod.rs").read_text(encoding="utf-8", errors="replace")
+    text = read_doc(repo, "src-tauri/src/db/mod.rs")
     registered = len(re.findall(r"include_str!\(\"\.\./\.\./migrations/", text))
     return files, registered
 
@@ -48,7 +62,7 @@ def count_files(repo: Path, rel_dir: str, exclude: tuple[str, ...]) -> int:
 
 
 def count_ipc_entries(repo: Path) -> int:
-    text = (repo / "src-tauri/src/lib.rs").read_text(encoding="utf-8", errors="replace")
+    text = read_doc(repo, "src-tauri/src/lib.rs")
     lines = text.splitlines()
     inside = False
     count = 0
@@ -212,17 +226,17 @@ def check_path_refs(repo: Path) -> list[str]:
 def check_ci_interfaces(repo: Path) -> list[str]:
     """quality.yml/release.yml 引用的测试与脚本必须存在。"""
     problems = []
-    quality = (repo / ".github/workflows/quality.yml").read_text(encoding="utf-8", errors="replace")
+    quality = read_doc(repo, ".github/workflows/quality.yml")
     for match in re.finditer(r"agent::evals::tests::([a-z_]+)", quality):
         name = match.group(1)
-        source = (repo / "src-tauri/src/agent/evals.rs").read_text(encoding="utf-8", errors="replace")
+        source = read_doc(repo, "src-tauri/src/agent/evals.rs")
         if not re.search(rf"fn {name}\b", source):
             problems.append(f"quality.yml 引用不存在的测试：agent::evals::tests::{name}")
     for match in re.finditer(r"--test ([a-zA-Z0-9_]+)", quality):
         name = match.group(1)
         if not (repo / f"src-tauri/tests/{name}.rs").exists():
             problems.append(f"quality.yml 引用不存在的集成测试：{name}")
-    release = (repo / ".github/workflows/release.yml").read_text(encoding="utf-8", errors="replace")
+    release = read_doc(repo, ".github/workflows/release.yml")
     for match in re.finditer(r"python3? scripts/([a-zA-Z0-9_.-]+\.py)", release):
         name = match.group(1)
         if not (repo / f"scripts/{name}").exists():
@@ -245,46 +259,47 @@ def self_test() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp)
+
         for rel in ("docs", "src-tauri/src/agent/tools", "src-tauri/src/agent",
                     "src-tauri/src/commands", "src-tauri/src/services",
                     "src-tauri/src/db", "src-tauri/migrations", "src-tauri/tests",
                     "src/pages", ".github/workflows", "scripts"):
             (repo / rel).mkdir(parents=True, exist_ok=True)
-        (repo / "src-tauri/src/agent/tools/mod.rs").write_text(
+        write_doc(repo, "src-tauri/src/agent/tools/mod.rs",
             "pub const TOOL_SPECS: &[ToolSpec] = &[\n    ToolSpec {},\n    ToolSpec {},\n];"
         )
-        (repo / "src-tauri/migrations/001_a.sql").write_text("-- x\n")
-        (repo / "src-tauri/src/db/mod.rs").write_text(
+        write_doc(repo, "src-tauri/migrations/001_a.sql", "-- x\n")
+        write_doc(repo, "src-tauri/src/db/mod.rs",
             "pub static MIGRATIONS: &[(i64, &str, &str)] = &[\n"
             "(1, \"001_a\", include_str!(\"../../migrations/001_a.sql\")),\n];"
         )
-        (repo / "src-tauri/src/lib.rs").write_text(
+        write_doc(repo, "src-tauri/src/lib.rs",
             ".invoke_handler(tauri::generate_handler![\n"
             "    commands::command_palette::list_palette_commands,\n"
             "    commands::project::list_projects,\n"
             "]);"
         )
-        (repo / "src-tauri/src/agent/evals.rs").write_text(
+        write_doc(repo, "src-tauri/src/agent/evals.rs",
             "pub fn ci_baseline_gate() {}\npub fn reliability_gate() {}"
         )
-        (repo / "src-tauri/tests/worker_crash_e2e.rs").write_text("")
-        (repo / "src-tauri/src/commands/a.rs").write_text("")
-        (repo / "src-tauri/src/commands/b.rs").write_text("")
-        (repo / "src-tauri/src/services/s.rs").write_text("")
-        (repo / "src/pages/P.tsx").write_text("")
-        (repo / ".github/workflows/quality.yml").write_text(
+        write_doc(repo, "src-tauri/tests/worker_crash_e2e.rs", "")
+        write_doc(repo, "src-tauri/src/commands/a.rs", "")
+        write_doc(repo, "src-tauri/src/commands/b.rs", "")
+        write_doc(repo, "src-tauri/src/services/s.rs", "")
+        write_doc(repo, "src/pages/P.tsx", "")
+        write_doc(repo, ".github/workflows/quality.yml",
             "run: cargo test agent::evals::tests::ci_baseline_gate\n"
             "run: cargo test --test worker_crash_e2e\n"
         )
-        (repo / ".github/workflows/release.yml").write_text(
+        write_doc(repo, ".github/workflows/release.yml",
             "python3 scripts/gen-release-notes.py --out notes.md"
         )
-        (repo / "scripts/gen-release-notes.py").write_text("")
-        (repo / "docs/OTHER.md").write_text("# other")
-        (repo / "docs/ROADMAP.md").write_text(
+        write_doc(repo, "scripts/gen-release-notes.py", "")
+        write_doc(repo, "docs/OTHER.md", "# other")
+        write_doc(repo, "docs/ROADMAP.md",
             "- [x] 任务引用 [文档](OTHER.md)，实现为 `src-tauri/src/agent/evals.rs`。\n"
         )
-        (repo / "docs/ARCHITECTURE.md").write_text(
+        write_doc(repo, "docs/ARCHITECTURE.md",
             "| Agent 对外工具 | 2 |\n| 数据库迁移 | 1 |\n"
             "| Tauri IPC 注册入口 | 2 |\n| React 页面 | 1 |\n"
             "| `commands/` 命令模块（不含 `mod.rs`） | 2 |\n"
@@ -293,7 +308,7 @@ def self_test() -> None:
             "| `agent/tools/` Rust 文件（含 `mod.rs`） | 1 |\n"
             "SQLite（1 个迁移）\n当前 1 个迁移\n2 工具 / 审批流水线\n"
         )
-        (repo / "docs/ARCHITECTURE.en.md").write_text(
+        write_doc(repo, "docs/ARCHITECTURE.en.md",
             "| Agent-facing tools | 2 |\n| Database migrations | 1 |\n"
             "| Tauri IPC registration entry points | 2 |\n| React pages | 1 |\n"
             "| `commands/` command modules (excluding `mod.rs`) | 2 |\n"
@@ -302,79 +317,79 @@ def self_test() -> None:
             "| `agent/tools/` Rust files (incl. `mod.rs`) | 1 |\n"
             "SQLite (1 migrations)\nthe current 1 migrations\n2 tools / approval pipeline\n"
         )
-        (repo / "README.md").write_text(
+        write_doc(repo, "README.md",
             "**2 个 Agent 工具**\n## 2 个 Agent 工具按域分组\n"
             "2 个 Tauri IPC 入口 · 1 个 service 模块\n"
             "agent/ 1 个顶层模块 · tools/ 0 文件 · 2 工具\n"
             "2 个 Agent 工具（0 文件）\n2 个命令模块\n业务服务（1 个）\n"
             "SQLite + 1 个迁移\n"
         )
-        (repo / "README.en.md").write_text(
+        write_doc(repo, "README.en.md",
             "**2 Agent tools**\n## The 2 Agent Tools Grouped\n"
             "2 Tauri IPC entry points · 1 service modules\n"
             "agent/ 1 top-level modules · tools/ 0 files\n"
             "2 command modules\nBusiness services (1)\nSQLite + 1 migrations\n"
         )
-        (repo / "CHANGELOG.md").write_text("`TOOL_SPECS` 达到 **2**\n数据库迁移总数达到 **1**\n")
-        (repo / "CHANGELOG.en.md").write_text(
+        write_doc(repo, "CHANGELOG.md", "`TOOL_SPECS` 达到 **2**\n数据库迁移总数达到 **1**\n")
+        write_doc(repo, "CHANGELOG.en.md",
             "migration count reaches **1**; `TOOL_SPECS` to **2**.\n"
         )
-        (repo / "docs/TOOL_ENHANCEMENTS.md").write_text(
+        write_doc(repo, "docs/TOOL_ENHANCEMENTS.md",
             "| 对外 Agent 工具 | 2 |\n| 工具实现文件 | 0 |\n不属于当前 2 工具\n"
         )
-        (repo / "docs/TOOL_ENHANCEMENTS.en.md").write_text(
+        write_doc(repo, "docs/TOOL_ENHANCEMENTS.en.md",
             "| External Agent tools | 2 |\n| Tool implementation files | 0 |\n"
             "not part of the current 2 tools\n"
         )
-        (repo / "docs/TOOLCHAIN_ACCEPTANCE.md").write_text("2 个注册工具共享契约真源\n")
-        (repo / "docs/TOOL_RESULT_V2.md").write_text("2 个注册工具均产生完整稳定字段\n")
-        (repo / "docs/VERSION_COMPATIBILITY.md").write_text("迁移数（当前 1）\n")
+        write_doc(repo, "docs/TOOLCHAIN_ACCEPTANCE.md", "2 个注册工具共享契约真源\n")
+        write_doc(repo, "docs/TOOL_RESULT_V2.md", "2 个注册工具均产生完整稳定字段\n")
+        write_doc(repo, "docs/VERSION_COMPATIBILITY.md", "迁移数（当前 1）\n")
 
         assert not check_repo(repo), f"干净仓库应全绿：{check_repo(repo)}"
 
         # 篡改工具数 → 必须检出
-        (repo / "README.md").write_text(
-            (repo / "README.md").read_text(encoding="utf-8", errors="replace").replace("**2 个 Agent 工具**", "**3 个 Agent 工具**")
+        write_doc(repo, "README.md",
+            read_doc(repo, "README.md").replace("**2 个 Agent 工具**", "**3 个 Agent 工具**")
         )
         assert any("工具数" in p for p in check_repo(repo)), "篡改工具数未被检出"
-        (repo / "README.md").write_text(
-            (repo / "README.md").read_text(encoding="utf-8", errors="replace").replace("**3 个 Agent 工具**", "**2 个 Agent 工具**")
+        write_doc(repo, "README.md",
+            read_doc(repo, "README.md").replace("**3 个 Agent 工具**", "**2 个 Agent 工具**")
         )
 
         # 英文文档篡改同样必须被检出
-        (repo / "README.en.md").write_text(
-            (repo / "README.en.md").read_text(encoding="utf-8", errors="replace").replace("**2 Agent tools**", "**3 Agent tools**")
+        write_doc(repo, "README.en.md",
+            read_doc(repo, "README.en.md").replace("**2 Agent tools**", "**3 Agent tools**")
         )
         assert any("Tool count" in p for p in check_repo(repo)), "英文工具数漂移未被检出"
-        (repo / "README.en.md").write_text(
-            (repo / "README.en.md").read_text(encoding="utf-8", errors="replace").replace("**3 Agent tools**", "**2 Agent tools**")
+        write_doc(repo, "README.en.md",
+            read_doc(repo, "README.en.md").replace("**3 Agent tools**", "**2 Agent tools**")
         )
 
         # 删除链接目标 → 必须检出
         (repo / "docs/OTHER.md").unlink()
         assert any("链接目标不存在" in p for p in check_repo(repo)), "删除链接目标未被检出"
-        (repo / "docs/OTHER.md").write_text("# other")
+        write_doc(repo, "docs/OTHER.md", "# other")
 
         # 带锚点的相对链接是合法 Markdown，不得误判为漂移
-        (repo / "docs/ROADMAP.md").write_text(
+        write_doc(repo, "docs/ROADMAP.md",
             "- [x] 引用 [文档](OTHER.md#section)，实现为 `src-tauri/src/agent/evals.rs`。\n"
         )
         assert not any("链接目标不存在" in p for p in check_repo(repo)), \
             "带锚点的相对链接被误判为漂移"
-        (repo / "docs/ROADMAP.md").write_text(
+        write_doc(repo, "docs/ROADMAP.md",
             "- [x] 任务引用 [文档](OTHER.md)，实现为 `src-tauri/src/agent/evals.rs`。\n"
         )
 
         # 改坏 CI 测试名 → 必须检出
-        (repo / ".github/workflows/quality.yml").write_text(
-            (repo / ".github/workflows/quality.yml").read_text(encoding="utf-8", errors="replace").replace(
+        write_doc(repo, ".github/workflows/quality.yml",
+            read_doc(repo, ".github/workflows/quality.yml").replace(
                 "ci_baseline_gate", "no_such_gate"
             )
         )
         assert any("不存在的测试" in p for p in check_repo(repo)), "CI 测试名漂移未被检出"
 
         # ROADMAP 引用不存在的路径 → 必须检出
-        (repo / "docs/ROADMAP.md").write_text(
+        write_doc(repo, "docs/ROADMAP.md",
             "- [x] 实现为 `src-tauri/src/agent/missing.rs`。\n"
         )
         assert any("引用路径不存在" in p for p in check_repo(repo)), "路径引用漂移未被检出"
