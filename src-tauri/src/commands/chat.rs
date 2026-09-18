@@ -3406,9 +3406,19 @@ struct AssembleInputs<'a> {
 /// 组装后重置续写/纠正状态与 seam 计数 → 账本实时推送与落库 → 会话快照与 Context V2 检查点。
 async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, ChatFlowError> {
     // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
-    if let Some((_, pending_content)) = take_next_queued(inputs.state, inputs.conversation_id, true)?
+    if let Some((pending_id, pending_content)) =
+        take_next_queued(inputs.state, inputs.conversation_id, true)?
     {
         inputs.round_state.merged_instructions.push(pending_content);
+        // 明确告知前端"这条已并入"：此前只推一句提示、消息气泡上的"待并入"标记一直不消，
+        // 用户会以为这条根本没被执行（本机实际反馈）。
+        let _ = inputs.app.emit(
+            "chat-queued-merged",
+            serde_json::json!({
+                "conversation_id": inputs.conversation_id,
+                "message_id": pending_id,
+            }),
+        );
         let _ = inputs.app.emit(
             "chat-stream",
             ChatStreamEvent {
@@ -6100,6 +6110,13 @@ async fn stream_chat_inner(
         if !auto_rag_hint.is_empty() {
             *p = format!("{p}\n\n{auto_rag_hint}");
         }
+    }
+    // 回复语言：把强约束放在提示词**最末**。中段那条 language_directive 会被上方上万字
+    // 中文提示与每轮注入的中文账本淹没——实测：选了英文仍回简体中文。语言要求离本轮输入
+    // 越近越有效，故两版提示词（core/full）末尾都追加一次。
+    let lang_footer = crate::services::language::language_footer(opts.reply_language.as_deref(), &content);
+    for p in prompts.iter_mut() {
+        *p = format!("{p}\n\n{lang_footer}");
     }
     let [system_prompt, system_prompt_core] = prompts;
 

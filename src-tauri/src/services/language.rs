@@ -105,9 +105,68 @@ pub fn language_directive(reply_language: Option<&str>, text: &str) -> String {
     }
 }
 
+/// 提示词**末尾**的语言强约束。
+///
+/// 中段那条 [`language_directive`] 会被上方上万字中文提示与每轮注入的中文账本淹没——
+/// 本机实测：选了英文仍回简体中文，模型几乎总是跟随最近、最长的语言信号。因此语言要求
+/// 必须同时出现在**最末**（离本轮输入最近），并显式禁止"因为系统提示是中文就回中文"。
+/// 目标语言非中文时，明确要求正文/标题/清单/思考过程都不得出现中文（代码、命令、路径、
+/// API 名与专有名词保持原样）。
+pub fn language_footer(reply_language: Option<&str>, text: &str) -> String {
+    let explicit = reply_language
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| *s != "auto");
+    let code = match explicit {
+        Some(c) => Some(c),
+        None => detect_language(text),
+    };
+    let phrase = match code {
+        Some(c) if !language_display(c).is_empty() => language_display(c).to_string(),
+        Some(c) => format!("与用户消息相同的语言（代码 {c}）"),
+        None => "与用户最近一条消息相同的语言".to_string(),
+    };
+    let avoid_chinese = !matches!(code, Some("zh"));
+    let mut footer = format!("【回复语言 · 最高优先级 · 覆盖前文任何相反的表述】全程使用{phrase}。");
+    if avoid_chinese {
+        footer.push_str(
+            "不要因为系统提示是中文就改用中文回复；正文、标题、清单与思考过程都不得出现中文。",
+        );
+    }
+    footer.push_str("代码、命令、路径、API 名与专有名词保持原样，不要翻译或音译。");
+    footer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 末尾强约束：固定语言必须点名该语言，且非中文时显式禁止中文输出
+    #[test]
+    fn footer_names_explicit_language_and_forbids_chinese() {
+        let f = language_footer(Some("en"), "帮我修一下构建错误");
+        assert!(f.contains("English"), "应点名目标语言：{f}");
+        assert!(f.contains("不得出现中文"), "非中文目标语言必须禁止中文输出：{f}");
+    }
+
+    #[test]
+    fn footer_allows_chinese_target() {
+        let f = language_footer(Some("zh"), "fix the build");
+        assert!(f.contains("中文"), "目标语言为中文时应点名中文：{f}");
+        assert!(!f.contains("不得出现中文"), "目标语言就是中文时不该禁止中文：{f}");
+    }
+
+    /// auto（或未设置）跟随用户消息语言：中文输入 → 中文，不禁止中文
+    #[test]
+    fn footer_follows_user_language_on_auto() {
+        let zh = language_footer(None, "帮我看看这个报错");
+        assert!(zh.contains("中文"), "中文输入应跟随中文：{zh}");
+        // 纯 ASCII/拉丁文本按设计不判语言（无法与西语德语等区分），走"跟随用户最近一条消息"，
+        // 但**禁止中文**的约束必须保留——否则中文系统提示会把回复带偏
+        let latin = language_footer(Some("auto"), "please fix this build error");
+        assert!(latin.contains("与用户最近一条消息相同"), "拉丁文本应回退为跟随：{latin}");
+        assert!(latin.contains("不得出现中文"), "拉丁文本输入也必须禁止中文：{latin}");
+    }
 
     #[test]
     fn detects_arabic() {

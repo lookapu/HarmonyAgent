@@ -460,6 +460,18 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     queueStreamDelta(conversation_id, 'content', delta)
   }).catch(() => {})
 
+  // 挂起消息被 Agent 并入当前任务：清掉消息气泡上的"待并入"标记。
+  // 此前并入只推一句提示、标记一直不消，用户会以为这条没被执行（本机实际反馈）。
+  listen<{ conversation_id: string; message_id: string }>('chat-queued-merged', (event) => {
+    const { conversation_id, message_id } = event.payload
+    if (get().currentConversation?.id !== conversation_id) return
+    const state = get()
+    set({
+      messages: state.messages.map((m) => (m.id === message_id ? { ...m, queued: 0 } : m)),
+      queuedList: state.queuedList.filter((q) => q.id !== message_id),
+    })
+  }).catch(() => {})
+
   // Rust 侧已按 32ms/8KB 合并模型 token，进一步降低 Tauri IPC 压力；
   // 仍进入同一个前端帧级队列，统一保证后台窗口和多会话行为。
   listen<{ conversation_id: string; run_id?: string; content: string; reasoning: string; checkpoint_seq?: number | null }>('chat-stream-batch', (event) => {
