@@ -9,8 +9,8 @@
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
 | 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,127 通过、10 忽略（总计 1,137；macOS 本机，2026-09-18 拉取 `6c8fbbe` 后实测） |
-| 后端库回归（Windows 本机，2026-09-18 本轮） | 同上 | 1,120 通过、0 失败、8 忽略（较 1,102 基线 +18 条新用例：正文接口/HTML→Markdown、SemVer 解析、种子同版本补入） |
-| 鸿蒙文档抓取联网验证（Windows 本机，2026-09-18 本轮） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `harmony_api_diff::tests::e2e_fetch_parse_store_search` 与 `harmony_api_ref::tests::e2e_fetch_parse_store_query` | 通过（实抓 26.0.0 Release 的 `js-apidiff-basicserviceskit-7003` 与 `@ohos.batteryInfo` 参考页，解析→入库→查回全链路；见盘点 §45） |
+| 后端库回归（Windows 本机，2026-09-18 本轮） | 同上 | 1,125 通过、0 失败、9 忽略（较 1,102 基线 +23 条新用例：正文接口/HTML→Markdown、目录树查表、SemVer 解析、种子修订号补入） |
+| 鸿蒙文档抓取联网验证（Windows 本机，2026-09-18 本轮） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `harmony_api_diff::tests::e2e_fetch_parse_store_search`、`harmony_api_ref::tests::e2e_fetch_parse_store_query` 与 `harmony_api_ref::tests::e2e_catalog_index_resolves_hms_modules` | 通过（实抓 26.0.0 Release 的 `js-apidiff-basicserviceskit-7003`、`@ohos.batteryInfo` 参考页，目录树命中 `@hms.*`；解析→入库→查回全链路；见盘点 §45/§46） |
 | Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test worker_crash_e2e` | 3 通过 |
 | Tool Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test tool_worker_crash_e2e` | 3 通过 |
 | 前端测试 | `npm test` | 14 文件、127 通过 |
@@ -21,7 +21,7 @@
 | clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警；macOS + Windows 本机均通过——8 条只在 Windows 触发的机械类告警已修复，基线未调整） |
 | Windows 质量矩阵 | GitHub Actions `quality.yml`（macOS + Windows） | v2.2.0 发版时全绿（此前 16 处 Windows 失败已清零） |
 
-平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,107/9 差异来自平台门控用例集，不是回归）。拉取 `6c8fbbe`（文档抓取重建 + SemVer，与 Windows 侧同一批）后 macOS 侧复验：后端库 1,127/10、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过、`check-ui-states.py` 通过。2026-09-18 本轮（文档抓取重建 + SemVer，`4026150`）**只在 Windows 本机验证**：后端库 1,120/0、两个联网 e2e 通过、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过；**macOS 侧待 CI 复核**（该批未触动平台相关代码，但仍以 CI 结论为准）。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
+平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,107/9 差异来自平台门控用例集，不是回归）。拉取 `6c8fbbe`（文档抓取重建 + 目录树查表 + SemVer，与 Windows 侧同一批）后 macOS 侧复验：后端库 1,127/10、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过、`check-ui-states.py` 通过；同批 Windows 侧为 1,125/9、三个联网 e2e 通过、其余门禁全绿——两平台用例数差异同样来自平台门控用例集。本批 push 后 CI（`Quality`）在跑，结论以 CI 为准。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
 
 ## 2. 写入门禁覆盖矩阵
 
