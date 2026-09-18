@@ -4348,6 +4348,179 @@ async fn prepare_tool_calls(
     Ok(ToolCallPrepOutcome::Ready { calls })
 }
 
+/// 工具轮次/动态预算裁决的结论。
+enum ToolLimitOutcome {
+    /// 未触限：继续执行该工具
+    Proceed,
+    /// 已达上限并中止：收尾总结已请求并追加到正文，调用方需结束工具循环
+    Stop,
+}
+
+/// `enforce_tool_budget_limit` 的输入（全部借用）。
+struct ToolLimitInputs<'a> {
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    registry: &'a TaskRegistry,
+    client: &'a reqwest::Client,
+    protocol: &'a str,
+    provider: &'a ProviderEndpoint,
+    opts: &'a ChatOptions,
+    messages: &'a [serde_json::Value],
+    model_choice: &'a ModelChoice,
+    conversation_id: &'a str,
+    trace_id: &'a str,
+    execution_budget: &'a crate::agent::governance::ExecutionBudget,
+    tool: &'a str,
+    args_raw: &'a str,
+    call_id: &'a str,
+    tool_begin: std::time::Instant,
+    tool_attempt: u64,
+    tool_runs: &'a [ToolRunItem],
+    executor: &'a mut KernelIoRunLoop,
+    max_tool_rounds: &'a mut usize,
+    budget_extensions: &'a mut usize,
+    full: &'a mut String,
+    stats: &'a mut ChatRunStats,
+    placeholder_msg_id: &'a mut Option<String>,
+}
+
+/// 工具轮次上限与动态预算门（纯搬运：原工具循环内联代码，行为一致）。
+///
+/// 到限时先问共享 executor 能否按「近期有成功」扩容（Extend → 落库并写 `budget.extended` 事件、
+/// 累计扩容次数），否则进入中止路径：发工具开始/完成事件、登记执行轨迹、请求收尾总结
+/// （为空时用固定说明兜底）后返回 `Stop`。`exhausted` 由调用方在收到 `Stop` 时置位——
+/// 原代码就是「置位后立刻 break」，因此两步仍由调用方完成，顺序不变。
+async fn enforce_tool_budget_limit(
+    inputs: ToolLimitInputs<'_>,
+) -> Result<ToolLimitOutcome, ChatFlowError> {
+    let prior_tool_attempts = usize::try_from(inputs.tool_attempt.saturating_sub(1))
+        .unwrap_or(usize::MAX);
+    let reached_tool_limit = prior_tool_attempts >= *inputs.max_tool_rounds;
+    let limit_must_stop = if reached_tool_limit {
+        let recent_successes = inputs
+            .tool_runs
+            .iter()
+            .rev()
+            .take(8)
+            .filter(|item| item.succeeded)
+            .count();
+        match inputs.executor.decide_dynamic_tool_budget(
+            *inputs.max_tool_rounds,
+            prior_tool_attempts,
+            recent_successes,
+            *inputs.budget_extensions,
+        ) {
+            crate::agent::kernel_loop::KernelBudgetVerdict::Extend { new_limit } => {
+                let previous = *inputs.max_tool_rounds;
+                *inputs.max_tool_rounds = new_limit;
+                *inputs.budget_extensions += 1;
+                if let Ok(conn) = inputs.state.0.lock() {
+                    let _ = crate::agent::scheduler::update_budget(
+                        &conn,
+                        inputs.trace_id,
+                        &serde_json::json!({
+                            "base": inputs.execution_budget,
+                            "effective_tool_rounds": new_limit,
+                            "extension_count": *inputs.budget_extensions,
+                        }),
+                    );
+                    let _ = crate::agent::runtime::append_event(
+                        &conn, inputs.trace_id, inputs.conversation_id, "budget.extended",
+                        serde_json::json!({ "previous": previous, "current": new_limit, "reason": "verified_progress" }),
+                    );
+                }
+                false
+            }
+            crate::agent::kernel_loop::KernelBudgetVerdict::Halt => true,
+            crate::agent::kernel_loop::KernelBudgetVerdict::Proceed => false,
+        }
+    } else {
+        false
+    };
+    if !limit_must_stop {
+        return Ok(ToolLimitOutcome::Proceed);
+    }
+    let round = (inputs.tool_runs.len() + 1) as u32;
+    let _ = inputs.app.emit(
+        "chat-tool-start",
+        ChatToolStartEvent {
+            conversation_id: inputs.conversation_id.to_string(),
+            run_id: inputs.trace_id.to_string(),
+            call_id: inputs.call_id.to_string(),
+            tool: inputs.tool.to_string(),
+            args: inputs.args_raw.to_string(),
+            round,
+            total: *inputs.max_tool_rounds as u32,
+            level: crate::services::permissions::tool_level(inputs.tool)
+                .as_str()
+                .to_string(),
+            desc: crate::agent::tools::tool_short_desc(inputs.tool).to_string(),
+        },
+    );
+    begin_tool_run(
+        inputs.state,
+        inputs.conversation_id,
+        inputs.trace_id,
+        inputs.call_id,
+        inputs.tool,
+        inputs.args_raw,
+    );
+    let limit_output = format!(
+        "工具调用已达轮次上限（{} 轮），本次调用未执行",
+        *inputs.max_tool_rounds
+    );
+    let _ = inputs.app.emit(
+        "chat-tool-done",
+        ChatToolDoneEvent {
+            conversation_id: inputs.conversation_id.to_string(),
+            run_id: inputs.trace_id.to_string(),
+            call_id: inputs.call_id.to_string(),
+            tool: inputs.tool.to_string(),
+            ok: false,
+            output: limit_output.clone(),
+            duration_ms: inputs.tool_begin.elapsed().as_millis() as i64,
+        },
+    );
+    finish_tool_run(
+        inputs.app,
+        inputs.state,
+        inputs.conversation_id,
+        inputs.trace_id,
+        Some(inputs.call_id),
+        inputs.tool,
+        inputs.args_raw,
+        &limit_output,
+        "blocked",
+        inputs.tool_begin.elapsed().as_millis() as i64,
+    );
+    let summary = request_final_summary(
+        inputs.app,
+        inputs.client,
+        inputs.protocol,
+        inputs.provider,
+        inputs.model_choice,
+        inputs.opts,
+        inputs.messages,
+        inputs.conversation_id,
+        inputs.cancel,
+        inputs.registry,
+        inputs.stats,
+        inputs.state,
+        inputs.placeholder_msg_id,
+    )
+    .await;
+    if !summary.trim().is_empty() {
+        inputs.full.push_str(&summary);
+    } else {
+        inputs.full.push_str(&format!(
+            "\n\n> ⚠️ 工具调用已达轮次上限（{} 轮），任务中止；可重新发送指令继续处理。",
+            *inputs.max_tool_rounds
+        ));
+    }
+    Ok(ToolLimitOutcome::Stop)
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -6331,109 +6504,35 @@ async fn stream_chat_inner(
                 // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
                 // executor attempt 在当前调用进入时已原子 +1，因此 attempt-1 是此前累计
                 // 尝试数；它跨恢复血缘持续，不能再用本次进程内 Vec 长度重置额度。
-                let prior_tool_attempts = usize::try_from(tool_attempt.saturating_sub(1))
-                    .unwrap_or(usize::MAX);
-                let reached_tool_limit = prior_tool_attempts >= max_tool_rounds;
-                let limit_must_stop = if reached_tool_limit {
-                    let recent_successes = tool_runs.iter().rev().take(8).filter(|item| item.succeeded).count();
-                    match kernel_executor.decide_dynamic_tool_budget(
-                        max_tool_rounds,
-                        prior_tool_attempts,
-                        recent_successes,
-                        budget_extensions,
-                    ) {
-                        crate::agent::kernel_loop::KernelBudgetVerdict::Extend { new_limit } => {
-                            let previous = max_tool_rounds;
-                            max_tool_rounds = new_limit;
-                            budget_extensions += 1;
-                            if let Ok(conn) = state.0.lock() {
-                                let _ = crate::agent::scheduler::update_budget(
-                                    &conn,
-                                    &trace_id,
-                                    &serde_json::json!({
-                                        "base": execution_budget,
-                                        "effective_tool_rounds": new_limit,
-                                        "extension_count": budget_extensions,
-                                    }),
-                                );
-                                let _ = crate::agent::runtime::append_event(
-                                    &conn, &trace_id, &conversation_id, "budget.extended",
-                                    serde_json::json!({ "previous": previous, "current": new_limit, "reason": "verified_progress" }),
-                                );
-                            }
-                            false
-                        }
-                        crate::agent::kernel_loop::KernelBudgetVerdict::Halt => true,
-                        crate::agent::kernel_loop::KernelBudgetVerdict::Proceed => false,
-                    }
-                } else { false };
-                if limit_must_stop {
-                    let round = (tool_runs.len() + 1) as u32;
-                    let _ = app.emit(
-                        "chat-tool-start",
-                        ChatToolStartEvent {
-                            conversation_id: conversation_id.clone(),
-                            run_id: trace_id.clone(),
-                            call_id: call_id.clone(),
-                            tool: tool.clone(),
-                            args: args_raw.clone(),
-                            round,
-                            total: max_tool_rounds as u32,
-                            level: crate::services::permissions::tool_level(&tool).as_str().to_string(),
-                            desc: crate::agent::tools::tool_short_desc(&tool).to_string(),
-                        },
-                    );
-                    begin_tool_run(state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
-                    let limit_output = format!(
-                        "工具调用已达轮次上限（{max_tool_rounds} 轮），本次调用未执行"
-                    );
-                    let _ = app.emit(
-                        "chat-tool-done",
-                        ChatToolDoneEvent {
-                            conversation_id: conversation_id.clone(),
-                            run_id: trace_id.clone(),
-                            call_id: call_id.clone(),
-                            tool: tool.clone(),
-                            ok: false,
-                            output: limit_output.clone(),
-                            duration_ms: tool_begin.elapsed().as_millis() as i64,
-                        },
-                    );
-                    finish_tool_run(
-                        app,
-                        state,
-                        &conversation_id,
-                        &trace_id,
-                        Some(&call_id),
-                        &tool,
-                        &args_raw,
-                        &limit_output,
-                        "blocked",
-                        tool_begin.elapsed().as_millis() as i64,
-                    );
-                    let summary = request_final_summary(
-                        app,
-                        &client,
-                        &protocol,
-                        &provider,
-                        &model_choice,
-                        &opts,
-                        &messages,
-                        &conversation_id,
-                        cancel,
-                        registry,
-                        stats,
-                        state,
-                        &mut placeholder_msg_id,
-                    )
-                    .await;
-                    if !summary.trim().is_empty() {
-                        full.push_str(&summary);
-                    } else {
-                        full.push_str(&format!(
-                            "\n\n> ⚠️ 工具调用已达轮次上限（{max_tool_rounds} 轮），任务中止；可重新发送指令继续处理。"
-                        ));
-                    }
+                if let ToolLimitOutcome::Stop = enforce_tool_budget_limit(ToolLimitInputs {
+                    app,
+                    state,
+                    cancel,
+                    registry,
+                    client: &client,
+                    protocol: &protocol,
+                    provider: &provider,
+                    opts: &opts,
+                    messages: &messages,
+                    model_choice: &model_choice,
+                    conversation_id: &conversation_id,
+                    trace_id: &trace_id,
+                    execution_budget: &execution_budget,
+                    tool: &tool,
+                    args_raw: &args_raw,
+                    call_id: &call_id,
+                    tool_begin,
+                    tool_attempt,
+                    tool_runs: &tool_runs,
+                    executor: &mut kernel_executor,
+                    max_tool_rounds: &mut max_tool_rounds,
+                    budget_extensions: &mut budget_extensions,
+                    full: &mut full,
+                    stats: &mut *stats,
+                    placeholder_msg_id: &mut placeholder_msg_id,
+                })
+                .await?
+                {
                     exhausted = true;
                     break;
                 }
