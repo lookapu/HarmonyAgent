@@ -4376,13 +4376,10 @@ struct ToolLimitInputs<'a> {
     call_id: &'a str,
     tool_begin: std::time::Instant,
     tool_attempt: u64,
-    tool_runs: &'a [ToolRunItem],
     executor: &'a mut KernelIoRunLoop,
-    max_tool_rounds: &'a mut usize,
-    budget_extensions: &'a mut usize,
-    full: &'a mut String,
     stats: &'a mut ChatRunStats,
-    placeholder_msg_id: &'a mut Option<String>,
+    /// 跨段可变状态（工具轨迹读取、轮次/预算上限、正文、占位消息）
+    round_state: &'a mut DesktopRoundState,
 }
 
 /// 工具轮次上限与动态预算门（纯搬运：原工具循环内联代码，行为一致）。
@@ -4396,25 +4393,24 @@ async fn enforce_tool_budget_limit(
 ) -> Result<ToolLimitOutcome, ChatFlowError> {
     let prior_tool_attempts = usize::try_from(inputs.tool_attempt.saturating_sub(1))
         .unwrap_or(usize::MAX);
-    let reached_tool_limit = prior_tool_attempts >= *inputs.max_tool_rounds;
+    let reached_tool_limit = prior_tool_attempts >= inputs.round_state.max_tool_rounds;
     let limit_must_stop = if reached_tool_limit {
-        let recent_successes = inputs
-            .tool_runs
+        let recent_successes = inputs.round_state.tool_runs
             .iter()
             .rev()
             .take(8)
             .filter(|item| item.succeeded)
             .count();
         match inputs.executor.decide_dynamic_tool_budget(
-            *inputs.max_tool_rounds,
+            inputs.round_state.max_tool_rounds,
             prior_tool_attempts,
             recent_successes,
-            *inputs.budget_extensions,
+            inputs.round_state.budget_extensions,
         ) {
             crate::agent::kernel_loop::KernelBudgetVerdict::Extend { new_limit } => {
-                let previous = *inputs.max_tool_rounds;
-                *inputs.max_tool_rounds = new_limit;
-                *inputs.budget_extensions += 1;
+                let previous = inputs.round_state.max_tool_rounds;
+                inputs.round_state.max_tool_rounds = new_limit;
+                inputs.round_state.budget_extensions += 1;
                 if let Ok(conn) = inputs.state.0.lock() {
                     let _ = crate::agent::scheduler::update_budget(
                         &conn,
@@ -4422,7 +4418,7 @@ async fn enforce_tool_budget_limit(
                         &serde_json::json!({
                             "base": inputs.execution_budget,
                             "effective_tool_rounds": new_limit,
-                            "extension_count": *inputs.budget_extensions,
+                            "extension_count": inputs.round_state.budget_extensions,
                         }),
                     );
                     let _ = crate::agent::runtime::append_event(
@@ -4441,7 +4437,7 @@ async fn enforce_tool_budget_limit(
     if !limit_must_stop {
         return Ok(ToolLimitOutcome::Proceed);
     }
-    let round = (inputs.tool_runs.len() + 1) as u32;
+    let round = (inputs.round_state.tool_runs.len() + 1) as u32;
     let _ = inputs.app.emit(
         "chat-tool-start",
         ChatToolStartEvent {
@@ -4451,7 +4447,7 @@ async fn enforce_tool_budget_limit(
             tool: inputs.tool.to_string(),
             args: inputs.args_raw.to_string(),
             round,
-            total: *inputs.max_tool_rounds as u32,
+            total: inputs.round_state.max_tool_rounds as u32,
             level: crate::services::permissions::tool_level(inputs.tool)
                 .as_str()
                 .to_string(),
@@ -4468,7 +4464,7 @@ async fn enforce_tool_budget_limit(
     );
     let limit_output = format!(
         "工具调用已达轮次上限（{} 轮），本次调用未执行",
-        *inputs.max_tool_rounds
+        inputs.round_state.max_tool_rounds
     );
     let _ = inputs.app.emit(
         "chat-tool-done",
@@ -4507,15 +4503,15 @@ async fn enforce_tool_budget_limit(
         inputs.registry,
         inputs.stats,
         inputs.state,
-        inputs.placeholder_msg_id,
+        &mut inputs.round_state.placeholder_msg_id,
     )
     .await;
     if !summary.trim().is_empty() {
-        inputs.full.push_str(&summary);
+        inputs.round_state.full.push_str(&summary);
     } else {
-        inputs.full.push_str(&format!(
+        inputs.round_state.full.push_str(&format!(
             "\n\n> ⚠️ 工具调用已达轮次上限（{} 轮），任务中止；可重新发送指令继续处理。",
-            *inputs.max_tool_rounds
+            inputs.round_state.max_tool_rounds
         ));
     }
     Ok(ToolLimitOutcome::Stop)
@@ -4528,7 +4524,11 @@ async fn enforce_tool_budget_limit(
 /// `&mut DesktopRoundState`，签名与调用点随之收敛。**本结构只装可变状态**：只读上下文
 /// （`trace_id`/`project_path`/`opts`/`plan_mode` 等）仍按原样传参，端口化（`run(port)`）
 /// 时再统一处理。
-struct DesktopRoundState<'a> {
+///
+/// `stats` 与执行器**不在这里**：它们是运行级累加器与共享执行器，作为 `&mut` 字段
+/// 会让本结构变成不变（invariant），一次长借用就会与循环里的所有读取冲突；两者按
+/// 原样作为独立参数传递。
+struct DesktopRoundState {
     // —— 运行级：跨轮保留，收尾（`finalize_run`）仍要读 ——
     /// 多轮累加的助手正文
     full: String,
@@ -4556,10 +4556,6 @@ struct DesktopRoundState<'a> {
     images: Option<Vec<String>>,
     /// 已附带上限内的图片数
     images_attached: usize,
-    /// 运行统计（轮次/重试/用量；收尾写 task_runs）
-    stats: &'a mut ChatRunStats,
-    /// 共享执行器（回合与工具尝试计数、检查点、最终快照的唯一真源）
-    executor: &'a mut KernelIoRunLoop,
 
     // —— 轮级：每轮读写，收尾不读 ——
     /// 有效工具轮次上限（动态扩容后更新）
@@ -6318,7 +6314,6 @@ async fn stream_chat_inner(
         task_started,
         images,
         images_attached,
-        stats,
         max_tool_rounds,
         budget_extensions,
         budget_warned,
@@ -6340,7 +6335,6 @@ async fn stream_chat_inner(
         confirmed_plan,
         tools_since_progress,
         seam_count,
-        executor: &mut kernel_executor,
     };
 
     'outer: loop {
@@ -6380,7 +6374,7 @@ async fn stream_chat_inner(
         );
         round_state.workflow_stage = Some(workflow.stage);
         match adjudicate_pre_round(PreRoundInputs {
-            executor: round_state.executor,
+            executor: &mut kernel_executor,
             state,
             app,
             cancel,
@@ -6401,15 +6395,15 @@ async fn stream_chat_inner(
             placeholder_msg_id: &round_state.placeholder_msg_id,
             max_tool_rounds: round_state.max_tool_rounds,
             budget_extensions: round_state.budget_extensions,
-            input_tokens: round_state.stats.input_tokens,
-            output_tokens: round_state.stats.output_tokens,
+            input_tokens: stats.input_tokens,
+            output_tokens: stats.output_tokens,
         })
         .await?
         {
             PreRoundPermit::Proceed => {}
             PreRoundPermit::Locked => break,
             PreRoundPermit::Cancelled => {
-                round_state.stats.stopped = true;
+                stats.stopped = true;
                 return Ok(());
             }
             PreRoundPermit::Deadline => {
@@ -6480,7 +6474,7 @@ async fn stream_chat_inner(
             provider: &provider,
             messages: &messages,
             model_choice: &mut model_choice,
-            stats: &mut *round_state.stats,
+            stats: &mut *stats,
             used_fallback: &mut round_state.used_fallback,
             budget_warned: &mut round_state.budget_warned,
         })?;
@@ -6500,7 +6494,7 @@ async fn stream_chat_inner(
             task_started: round_state.task_started,
             context_budget,
             model_choice: &mut model_choice,
-            stats: &mut *round_state.stats,
+            stats: &mut *stats,
             history_limit: &mut round_state.history_limit,
             context_summary: &mut round_state.context_summary,
             used_fallback: &mut round_state.used_fallback,
@@ -6527,7 +6521,7 @@ async fn stream_chat_inner(
             task_started: round_state.task_started,
             outcome: &outcome,
             tool_runs: &round_state.tool_runs,
-            stats: &mut *round_state.stats,
+            stats: &mut *stats,
             reasoning_full: &mut round_state.reasoning_full,
             full: &mut round_state.full,
             last_model_text: &mut round_state.last_model_text,
@@ -6559,7 +6553,7 @@ async fn stream_chat_inner(
             plan_confirmed: &mut round_state.plan_confirmed,
             confirmed_plan: &mut round_state.confirmed_plan,
             messages: &mut messages,
-            stats: &mut *round_state.stats,
+            stats: &mut *stats,
         })
         .await?
         {
@@ -6585,27 +6579,15 @@ async fn stream_chat_inner(
                 conversation_id: &conversation_id,
                 trace_id: &trace_id,
                 execution_budget: &execution_budget,
-                executor: round_state.executor,
-                tool_runs: &mut round_state.tool_runs,
-                max_tool_rounds: &mut round_state.max_tool_rounds,
-                budget_extensions: &mut round_state.budget_extensions,
-                full: &mut round_state.full,
-                stats: &mut *round_state.stats,
-                placeholder_msg_id: &mut round_state.placeholder_msg_id,
+                executor: &mut kernel_executor,
+                stats: &mut *stats,
                 mcp: &mcp,
                 project_path: &project_path,
                 path_hints: &path_hints,
                 project_id: &project_id,
                 approval,
-                modified_files: &mut round_state.modified_files,
-                images: &mut round_state.images,
-                consecutive_failures: &mut round_state.consecutive_failures,
-                replan_given: &mut round_state.replan_given,
-                replan_instruction: &mut round_state.replan_instruction,
-                tools_since_progress: &mut round_state.tools_since_progress,
-                correction_text: &mut round_state.correction_text,
-                correction_hint: &mut round_state.correction_hint,
                 task_started: round_state.task_started,
+                round_state: &mut round_state,
             })
             .await?;
             match tool_round {
@@ -6630,7 +6612,7 @@ async fn stream_chat_inner(
             plan_confirmed: &mut round_state.plan_confirmed,
             confirmed_plan: &mut round_state.confirmed_plan,
             messages: &mut messages,
-            stats: &mut *round_state.stats,
+            stats: &mut *stats,
             completion_reviews: round_state.completion_reviews,
         })
         .await?
@@ -6652,7 +6634,7 @@ async fn stream_chat_inner(
             tool_runs: &round_state.tool_runs,
             inherited_tool_evidence: &inherited_tool_evidence,
             goal_contract: &goal_contract,
-            executor: round_state.executor,
+            executor: &mut kernel_executor,
             full: &mut round_state.full,
             correction_text: &mut round_state.correction_text,
             correction_hint: &mut round_state.correction_hint,
@@ -6686,8 +6668,8 @@ async fn stream_chat_inner(
         modified_files: &round_state.modified_files,
         placeholder_msg_id: &round_state.placeholder_msg_id,
         full: &mut round_state.full,
-        stats: &mut *round_state.stats,
-        executor: round_state.executor,
+        stats: &mut *stats,
+        executor: &mut kernel_executor,
         recovery_plan: &recovery_plan,
         prev_ledger: &mut round_state.prev_ledger,
         ledger_base_n,
@@ -10282,13 +10264,8 @@ async fn run_tool_batch(
 #[allow(clippy::too_many_arguments)]
 async fn apply_tool_batch(
     results: &[BatchToolResult],
-    tool_runs: &mut Vec<ToolRunItem>,
-    consecutive_failures: &mut u32,
-    replan_given: &mut bool,
-    replan_instruction: &mut Option<String>,
+    round_state: &mut DesktopRoundState,
     stats: &mut ChatRunStats,
-    tools_since_progress: &mut u32,
-    full: &mut String,
     app: &AppHandle,
     state: &tauri::State<'_, DbState>,
     trace_id: &str,
@@ -10327,7 +10304,7 @@ async fn apply_tool_batch(
                 r.output
             )
         };
-        tool_runs.push(ToolRunItem {
+        round_state.tool_runs.push(ToolRunItem {
             tool: r.tool.clone(),
             args: r.args_raw.clone(),
             output,
@@ -10338,20 +10315,20 @@ async fn apply_tool_batch(
         });
         stats.retry_count += r.retries as i64;
         if r.ok {
-            *consecutive_failures = 0;
+            round_state.consecutive_failures = 0;
             stats.tool_rounds += 1;
         } else {
-            *consecutive_failures += 1;
+            round_state.consecutive_failures += 1;
             // 连续失败 replan 档（与串行路径同语义）：非打转但持续失败时注入一次
             // “重新规划”指令，让模型换工具/换思路继续
-            if *consecutive_failures >= 2 && !*replan_given {
-                *replan_given = true;
-                *replan_instruction = Some(
+            if round_state.consecutive_failures >= 2 && !round_state.replan_given {
+                round_state.replan_given = true;
+                round_state.replan_instruction = Some(
                     "（系统提示：连续多次工具执行失败，请停止当前路径，重新规划整体方案——换工具、换思路或缩小目标；若已无可行路径请直接总结。本轮仍可调用工具。）".to_string(),
                 );
             }
         }
-        *tools_since_progress += 1;
+        round_state.tools_since_progress += 1;
     }
     let mut intercepted = false;
     for r in results {
@@ -10388,11 +10365,11 @@ async fn apply_tool_batch(
                 )
                 .await;
                 if !summary.trim().is_empty() {
-                    full.push_str(&summary);
+                    round_state.full.push_str(&summary);
                 } else if intercept.kind == crate::agent::tools::InterceptKind::Budget {
-                    full.push_str("\n\n> ⚠️ 本任务工具调用已达预算上限，任务中止；可重新发送指令继续。");
+                    round_state.full.push_str("\n\n> ⚠️ 本任务工具调用已达预算上限，任务中止；可重新发送指令继续。");
                 } else {
-                    full.push_str("\n\n> ⚠️ 检测到反复失败的操作已被拦截，请换一种方案重试。");
+                    round_state.full.push_str("\n\n> ⚠️ 检测到反复失败的操作已被拦截，请换一种方案重试。");
                 }
             }
             intercepted = true;
@@ -10423,16 +10400,9 @@ struct ToolBatchInputs<'a> {
     model_choice: &'a ModelChoice,
     messages: &'a [serde_json::Value],
     executor: &'a KernelIoRunLoop,
-    tool_runs: &'a mut Vec<ToolRunItem>,
-    consecutive_failures: &'a mut u32,
-    replan_given: &'a mut bool,
-    replan_instruction: &'a mut Option<String>,
+    /// 跨段可变状态（工具轨迹、失败计数、预算、正文与占位消息）
+    round_state: &'a mut DesktopRoundState,
     stats: &'a mut ChatRunStats,
-    tools_since_progress: &'a mut u32,
-    full: &'a mut String,
-    placeholder_msg_id: Option<&'a str>,
-    max_tool_rounds: usize,
-    budget_extensions: usize,
 }
 
 /// 排空只读工具批次（纯搬运：原工具循环内联的三处相同代码，行为一致）：
@@ -10456,18 +10426,13 @@ async fn flush_tool_batch(inputs: ToolBatchInputs<'_>) -> Result<bool, ChatFlowE
         inputs.conversation_id,
         inputs.cancel,
         inputs.registry,
-        inputs.max_tool_rounds as u32,
+        inputs.round_state.max_tool_rounds as u32,
     )
     .await;
     let intercepted = apply_tool_batch(
         &results,
-        inputs.tool_runs,
-        inputs.consecutive_failures,
-        inputs.replan_given,
-        inputs.replan_instruction,
+        inputs.round_state,
         inputs.stats,
-        inputs.tools_since_progress,
-        inputs.full,
         inputs.app,
         inputs.state,
         inputs.trace_id,
@@ -10488,9 +10453,9 @@ async fn flush_tool_batch(inputs: ToolBatchInputs<'_>) -> Result<bool, ChatFlowE
         inputs.conversation_id,
         inputs.executor.checkpoint(),
         crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
-        inputs.placeholder_msg_id,
-        inputs.max_tool_rounds,
-        inputs.budget_extensions,
+        inputs.round_state.placeholder_msg_id.as_deref(),
+        inputs.round_state.max_tool_rounds,
+        inputs.round_state.budget_extensions,
     )?;
     inputs.pending.clear();
     Ok(intercepted)
@@ -10526,15 +10491,9 @@ struct ToolExecInputs<'a> {
     model_choice: &'a ModelChoice,
     messages: &'a [serde_json::Value],
     approval: &'a tauri::State<'a, ToolApprovalState>,
-    placeholder_msg_id: &'a mut Option<String>,
-    tool_runs: &'a mut Vec<ToolRunItem>,
-    consecutive_failures: &'a mut u32,
-    replan_given: &'a mut bool,
-    replan_instruction: &'a mut Option<String>,
+    /// 跨段可变状态（正文、轨迹、失败计数、replan、占位消息、变更文件、图片）
+    round_state: &'a mut DesktopRoundState,
     stats: &'a mut ChatRunStats,
-    full: &'a mut String,
-    modified_files: &'a mut Vec<String>,
-    images: &'a mut Option<Vec<String>>,
     tool: &'a String,
     args_raw: &'a String,
     call_id: &'a String,
@@ -10576,22 +10535,15 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
         model_choice,
         messages,
         approval,
-        placeholder_msg_id,
-        tool_runs,
-        consecutive_failures,
-        replan_given,
-        replan_instruction,
+        round_state,
         stats,
-        full,
-        modified_files,
-        images,
         tool,
         args_raw,
         call_id,
         tool_begin,
         max_tool_rounds,
     } = inputs;
-                let round = (tool_runs.len() + 1) as u32;
+                let round = (round_state.tool_runs.len() + 1) as u32;
                 let _ = app.emit(
                     "chat-tool-start",
                     ChatToolStartEvent {
@@ -10662,14 +10614,14 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                         "blocked",
                         duration_ms,
                     );
-                    tool_runs.push(ToolRunItem {
+                    round_state.tool_runs.push(ToolRunItem {
                         tool: tool.clone(),
                         args: args_raw.clone(),
                         output: message,
                         succeeded: false,
                         persisted: true,
                     });
-                    *consecutive_failures += 1;
+                    round_state.consecutive_failures += 1;
                     return Ok(ToolExecOutcome::Skip);
                 }
                 if let Err(intercept) = crate::agent::tools::run_pre_hooks(&inv).await {
@@ -10720,7 +10672,7 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                         },
                         tool_begin.elapsed().as_millis() as i64,
                     );
-                    tool_runs.push(ToolRunItem {
+                    round_state.tool_runs.push(ToolRunItem {
                         tool: tool.clone(),
                         args: args_raw.clone(),
                         output: intercept.message.clone(),
@@ -10752,17 +10704,17 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                             registry,
                             stats,
                             state,
-                            placeholder_msg_id,
+                            &mut round_state.placeholder_msg_id,
                         )
                         .await;
                         if !summary.trim().is_empty() {
-                            full.push_str(&summary);
+                            round_state.full.push_str(&summary);
                         } else if intercept.kind == crate::agent::tools::InterceptKind::Budget {
-                            full.push_str(
+                            round_state.full.push_str(
                                 "\n\n> ⚠️ 本任务工具调用已达预算上限，任务中止；可重新发送指令继续。",
                             );
                         } else {
-                            full.push_str(
+                            round_state.full.push_str(
                                 "\n\n> ⚠️ 检测到反复失败的操作已被拦截，请换一种方案重试。",
                             );
                         }
@@ -10779,11 +10731,11 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     call_id: call_id.clone(), tool: tool.clone(), ok: false,
                     output: output.clone(), duration_ms: tool_begin.elapsed().as_millis() as i64,
                 });
-                tool_runs.push(ToolRunItem {
+                round_state.tool_runs.push(ToolRunItem {
                     tool: tool.clone(), args: args_raw.clone(), output,
                     succeeded: false, persisted: true,
                 });
-                *consecutive_failures += 1;
+                round_state.consecutive_failures += 1;
                 return Ok(ToolExecOutcome::Skip);
             }
             // 子 Agent 委派：并发执行、可指定模型，结果汇总后继续主 Agent 循环
@@ -10884,7 +10836,7 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
             );
             match result {
                 Ok(output) => {
-                    *consecutive_failures = 0;
+                    round_state.consecutive_failures = 0;
                     stats.tool_rounds += 1;
                     // 记录修改过的文件（edit_file/write_file 目标 + run_command 间接修改，去重；供消息底部文件列表展示）
                     if tool == "edit_file" || tool == "write_file" {
@@ -10907,16 +10859,16 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                                         _ => p.clone(),
                                     }
                                 };
-                                if !modified_files.contains(&rel) {
-                                    modified_files.push(rel);
+                                if !round_state.modified_files.contains(&rel) {
+                                    round_state.modified_files.push(rel);
                                 }
                             }
                         }
                     } else if tool == "run_command" {
                         // run_command 间接修改：取走工具扫描出的变更文件并入列表
                         for rel in crate::agent::tools::drain_cmd_changes() {
-                            if !modified_files.contains(&rel) {
-                                modified_files.push(rel);
+                            if !round_state.modified_files.contains(&rel) {
+                                round_state.modified_files.push(rel);
                             }
                         }
                     }
@@ -10932,7 +10884,7 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                             };
                             // 单任务累计附带上限：防截图轮次过多导致请求体膨胀（每张 base64 数百 KB）
                             const MAX_VISION_IMAGES: usize = 4;
-                            let room = images.as_ref().map(|v| v.len() < MAX_VISION_IMAGES).unwrap_or(true);
+                            let room = round_state.images.as_ref().map(|v| v.len() < MAX_VISION_IMAGES).unwrap_or(true);
                             if supports_image && room {
                                 output = output
                                     .replace(&format!("[VISION_IMAGE: {img_path}]"), "")
@@ -10948,7 +10900,7 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                                 .await
                                 .unwrap_or_else(|e| Err(format!("视觉编码任务异常: {e}")));
                                 if let Ok(data_url) = encoded {
-                                    images.get_or_insert_with(Vec::new).push(data_url);
+                                    round_state.images.get_or_insert_with(Vec::new).push(data_url);
                                 }
                             } else if supports_image {
                                 output = format!(
@@ -10983,7 +10935,7 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                         &output,
                         true,
                     );
-                    tool_runs.push(ToolRunItem {
+                    round_state.tool_runs.push(ToolRunItem {
                         tool: tool.clone(),
                         args: args_raw.clone(),
                         output,
@@ -10992,12 +10944,12 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     });
                 }
                 Err(e) => {
-                    *consecutive_failures += 1;
+                    round_state.consecutive_failures += 1;
                     // 连续失败 replan 档：非打转（打转由 tool_limits 终止）但持续失败时，
                     // 注入一次“重新规划”指令，让模型换工具/换思路继续，而不是直接放弃
-                    if *consecutive_failures >= 2 && !*replan_given {
-                        *replan_given = true;
-                        *replan_instruction = Some(
+                    if round_state.consecutive_failures >= 2 && !round_state.replan_given {
+                        round_state.replan_given = true;
+                        round_state.replan_instruction = Some(
                             "（系统提示：连续多次工具执行失败，请停止当前路径，重新规划整体方案——换工具、换思路或缩小目标；若已无可行路径请直接总结。本轮仍可调用工具。）".to_string(),
                         );
                     }
@@ -11025,7 +10977,7 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     );
                     // Marker 绑定动作：失败结果附带障碍处理协议要求（诊断+具体动作），
                     // 与系统提示中的“障碍处理协议”呼应，防模型对失败只描述不行动
-                    tool_runs.push(ToolRunItem {
+                    round_state.tool_runs.push(ToolRunItem {
                         tool: tool.clone(),
                         args: args_raw.clone(),
                         output: format!(
@@ -11068,21 +11020,10 @@ struct ToolRoundInputs<'a> {
     path_hints: &'a [String],
     execution_budget: &'a crate::agent::governance::ExecutionBudget,
     executor: &'a mut KernelIoRunLoop,
-    tool_runs: &'a mut Vec<ToolRunItem>,
-    max_tool_rounds: &'a mut usize,
-    budget_extensions: &'a mut usize,
-    full: &'a mut String,
+    /// 跨段可变状态（本轮的全部可变状态）
+    round_state: &'a mut DesktopRoundState,
     stats: &'a mut ChatRunStats,
-    placeholder_msg_id: &'a mut Option<String>,
     mcp: &'a crate::services::mcp_manager::McpManager,
-    modified_files: &'a mut Vec<String>,
-    images: &'a mut Option<Vec<String>>,
-    consecutive_failures: &'a mut u32,
-    replan_given: &'a mut bool,
-    replan_instruction: &'a mut Option<String>,
-    tools_since_progress: &'a mut u32,
-    correction_text: &'a mut String,
-    correction_hint: &'a mut String,
     task_started: std::time::Instant,
 }
 
@@ -11115,21 +11056,9 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
         path_hints,
         execution_budget,
         executor: kernel_executor,
-        tool_runs,
-        max_tool_rounds,
-        budget_extensions,
-        full,
+        round_state,
         stats,
-        placeholder_msg_id,
         mcp,
-        modified_files,
-        images,
-        consecutive_failures,
-        replan_given,
-        replan_instruction,
-        tools_since_progress,
-        correction_text,
-        correction_hint,
         task_started,
     } = inputs;
     // 本轮是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾）
@@ -11188,8 +11117,8 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                     if final_halt {
                         exhausted = true;
                     } else {
-                        *correction_text = String::new();
-                        *correction_hint = corrective_hint.unwrap_or_default();
+                        round_state.correction_text = String::new();
+                        round_state.correction_hint = corrective_hint.unwrap_or_default();
                     }
                     break;
                 }
@@ -11215,13 +11144,9 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                     call_id: &call_id,
                     tool_begin,
                     tool_attempt,
-                    tool_runs: &tool_runs,
                     executor: kernel_executor,
-                    max_tool_rounds,
-                    budget_extensions,
-                    full,
                     stats: &mut *stats,
-                    placeholder_msg_id,
+                    round_state: &mut *round_state,
                 })
                 .await?
                 {
@@ -11234,7 +11159,7 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                     pending.push((
                         tool.clone(),
                         args_raw.clone(),
-                        (tool_runs.len() + 1 + pending.len()) as u32,
+                        (round_state.tool_runs.len() + 1 + pending.len()) as u32,
                     ));
                     if pending.len() >= MAX_TOOL_CONCURRENCY {
                         let intercepted = flush_tool_batch(ToolBatchInputs {
@@ -11257,16 +11182,8 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                             model_choice: &model_choice,
                             messages: &messages,
                             executor: &kernel_executor,
-                            tool_runs,
-                            consecutive_failures,
-                            replan_given,
-                            replan_instruction,
                             stats: &mut *stats,
-                            tools_since_progress,
-                            full,
-                            placeholder_msg_id: placeholder_msg_id.as_deref(),
-                            max_tool_rounds: *max_tool_rounds,
-                            budget_extensions: *budget_extensions,
+                            round_state: &mut *round_state,
                         })
                         .await?;
                         if intercepted {
@@ -11297,16 +11214,8 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                         model_choice: &model_choice,
                         messages: &messages,
                         executor: &kernel_executor,
-                        tool_runs,
-                        consecutive_failures,
-                        replan_given,
-                        replan_instruction,
                         stats: &mut *stats,
-                        tools_since_progress,
-                        full,
-                        placeholder_msg_id: placeholder_msg_id.as_deref(),
-                        max_tool_rounds: *max_tool_rounds,
-                        budget_extensions: *budget_extensions,
+                        round_state: &mut *round_state,
                     })
                     .await?;
                     if intercepted {
@@ -11333,20 +11242,13 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                     model_choice: &model_choice,
                     messages: &messages,
                     approval,
-                    placeholder_msg_id,
-                    tool_runs,
-                    consecutive_failures,
-                    replan_given,
-                    replan_instruction,
                     stats: &mut *stats,
-                    full,
-                    modified_files,
-                    images,
                     tool: &tool,
                     args_raw: &args_raw,
                     call_id: &call_id,
                     tool_begin,
-                    max_tool_rounds: *max_tool_rounds,
+                    max_tool_rounds: round_state.max_tool_rounds,
+                    round_state: &mut *round_state,
                 })
                 .await?
                 {
@@ -11362,16 +11264,16 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                     }
                 }
             // 每个工具执行完成后推进进度对照计数（计划批准后每 3 个工具注入一次进度汇报）
-            *tools_since_progress += 1;
+            round_state.tools_since_progress += 1;
             persist_desktop_executor_checkpoint(
                 state,
                 &trace_id,
                 &conversation_id,
                 kernel_executor.checkpoint(),
                 crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
-                placeholder_msg_id.as_deref(),
-                *max_tool_rounds,
-                *budget_extensions,
+                round_state.placeholder_msg_id.as_deref(),
+                round_state.max_tool_rounds,
+                round_state.budget_extensions,
             )?;
             }
             // for 结束：排空剩余只读批次（本轮全部输出只读工具时）
@@ -11396,16 +11298,8 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                     model_choice: &model_choice,
                     messages: &messages,
                     executor: &kernel_executor,
-                    tool_runs,
-                    consecutive_failures,
-                    replan_given,
-                    replan_instruction,
                     stats: &mut *stats,
-                    tools_since_progress,
-                    full,
-                    placeholder_msg_id: placeholder_msg_id.as_deref(),
-                    max_tool_rounds: *max_tool_rounds,
-                    budget_extensions: *budget_extensions,
+                    round_state: &mut *round_state,
                 })
                 .await?;
                 if intercepted {
