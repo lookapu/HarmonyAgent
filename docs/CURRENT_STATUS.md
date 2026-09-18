@@ -58,7 +58,7 @@
 | 能力域 | 状态 | 主要证据 | 边界（未做/未验） |
 | --- | --- | --- | --- |
 | 目标与计划驱动 | 已实现核心链路 | `commands/chat.rs` 的 GoalContract、`activate_approved_plan`、计划继承；前端计划确认卡与测试 | 真实模型「计划→多步→中断→交付」完整轨迹未验 |
-| 长会话恢复与执行治理 | 基础实现 + 本机回归充分 | `agent/kernel_executor.rs` 检查点/安全点、预算继承、两组 crash E2E | 桌面 IO adapter 未统一：迁移方案与两次更正见 [headless 驱动文档 §17/§18/§19](./HEADLESS_AGENT_DRIVER.md)（主循环体 324 行（原 2,107，口径见驱动文档 §20 的更正说明）、循环内 `.emit(` **0** 处、`.0.lock()` 1 处；**已实测否掉「先补 Tauri 测试替身」**：mock 需全仓 AppHandle 泛型化、代价更大；正确顺序是先抽取端口、再用假端口加行为快照，抽取期间靠编译器+回归+手动桌面验收把关）；剩余：循环后验收收尾段 128 行、第 7 步「合段」（需桌面验收窗口）；真实长任务未验 |
+| 长会话恢复与执行治理 | 基础实现 + 本机回归充分 | `agent/kernel_executor.rs` 检查点/安全点、预算继承、两组 crash E2E | 桌面 IO adapter 未统一：迁移方案与两次更正见 [headless 驱动文档 §17/§18/§19](./HEADLESS_AGENT_DRIVER.md)（主循环体 324 行（原 2,107，口径见驱动文档 §20 的更正说明）、循环内 `.emit(` **0** 处、`.0.lock()` 1 处；**已实测否掉「先补 Tauri 测试替身」**：mock 需全仓 AppHandle 泛型化、代价更大；正确顺序是先抽取端口、再用假端口加行为快照，抽取期间靠编译器+回归+手动桌面验收把关）；**按段搬运已全部完成**（主循环体 324 行、段内 emit 0 处），剩余只有第 7 步「合段」（`RoundOutcome` + `DesktopRoundState` + 切 `run(port)`）；真实长任务未验 |
 | Headless Agent | 核心实现 | `HeadlessIoPort` 交给 `KernelIoRunLoop::run`；评测契约与桩端到端 | 真实 trial 的 manifest/trajectory/成本未产出 |
 | 大仓索引可达性 | 已实现 + 历史基准 | `services/symbol_index.rs` 全库目录/延迟解析/watcher；`docs/INDEX_SCALE_BASELINE.md` | 真实混合仓全量收敛耗时、Recall@k、前台 P95 未测 |
 | 结构查询与影响面 | 部分 | `repo_query` 的 `auto`/`impact` 分流、SCIP/LSP/AST 边、分页与覆盖状态 | 统一依赖重排 planner、跨语言正确率未做 |

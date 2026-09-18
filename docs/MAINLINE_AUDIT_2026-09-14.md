@@ -688,4 +688,17 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 - **度量**：主循环体 557 → **324 行**；循环内 `break`/`continue` 20 → 11；`.emit(` 0、`.0.lock()` 1（均未变）。**剩余**：循环后验收收尾段 128 行（6544–6671，唯一还剩的搬运项）、第 7 步「合段」。
 - **验证**（macOS 本机）：后端库 1,105 通过 / 0 失败 / 9 忽略；两组 crash E2E 各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。**仍未覆盖**：Windows 侧与 CI；`run_tool_calls` 复用 `run_one_tool` 的 `#[allow(clippy::needless_borrow)]` 处置（现共 2 个函数，欠账记在驱动文档 §20，第 7 步清理）。
 
+## 42. 第 2 步第十二刀：循环后验收与账本收尾搬出 `stream_chat_inner`（2026-09-18）
+
+第 2 步的最后一刀落地：`stream_chat_inner` 循环之后的**验收与收尾段**搬进 `finalize_run`（`d743783`），输入 `FinalizeInputs` 23 个字段——写 `verifying` 状态 → 证据驱动验收（`evaluate_root_with_children` 失败退回 `evaluate_contract`）→ 执行器最终快照与质量快照落库 → 未通过时正文追加提示 → `persist_turn` → 按完成/未完成保存或清空账本。
+
+- **搬运保真度**：120 行进、120 行出，逐行 diff 原内联代码**只有 2 处机械差异**（`prev_ledger: &mut prev_ledger` → `prev_ledger`、`&full` → `full`）。git 的 diff 甚至把它认成「几乎没有变化」（94 增 / 3 删），正是逐字搬运的旁证。
+- **按行号搬运的第二类坑**：原块**之后**的 `Ok(())` 与函数闭合括号留在原地，搬进函数的块末尾缺 return，于是 `if task_done {} else {}` 被当成函数尾表达式，报 `expected Result<(), ChatFlowError>, found ()`。与第 41 节的坑合起来是一条完整纪律：**按行号区间搬运，必须同时核对块首判断、块尾闭合括号、以及块后的收尾语句**。
+- **度量**：`stream_chat_inner` 2,143 → **2,050 行**；主循环体保持 **324 行**（收尾段本就在循环外）。
+- **欠账**：`#[allow(clippy::needless_borrow)]` 现共 3 处（`run_one_tool`、`run_tool_calls`、`finalize_run`），同一原因、同一处置，随第 7 步重写清理。
+- **验证**（macOS 本机）：后端库 1,105 通过 / 0 失败 / 9 忽略；两组 crash E2E 各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。**仍未覆盖**：Windows 侧与 CI。
+
+**阶段性结论**：第 17 节定义的第 2 步「按段搬运」至此**全部完成**（共十二刀 + 轮前四刀），主循环体 2,107 → 324 行、`stream_chat_inner` 2,143 → 2,050 行（均为实测口径）。剩下的是第 7 步「合段」——`RoundOutcome`（替代剩余 11 处控制流）+ `DesktopRoundState`（跨段可变状态）+ 切换 `run(port)`；它是真正的重写，**必须有真实桌面验收窗口**（多轮工具任务 + 中途停止 + 断点续跑），当前没有自动化行为快照可依赖。
+
+
 

@@ -890,4 +890,18 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 
 第 7 步之前已无「纯搬运」型的刀；循环后验收收尾段（128 行）是唯一还剩的搬运项。
 
+**进展（2026-09-18，第十二刀：循环后验收与账本收尾）**：`stream_chat_inner` 循环之后的验收与收尾段搬进 `finalize_run`（`d743783`），输入 `FinalizeInputs` 23 个字段：写 `verifying` 状态 → 证据驱动验收（`evaluate_root_with_children`，失败退回 `evaluate_contract`）→ 执行器最终快照与质量快照落库 → 未通过时正文追加提示 → `persist_turn` → 按完成/未完成保存或清空账本。
+
+- **搬运保真度**：120 行进、120 行出，与原内联代码逐行 diff 只有 **2 处机械差异**（`prev_ledger: &mut prev_ledger` → `prev_ledger`、`&full` → `full`——输入改为引用后不再需要那层借用）。
+- **踩到的坑（与第十一刀同源，但这次是另一头）**：脚本按行号区间搬运时，原块**之后**的 `Ok(())` 留在原地，而搬进函数的块末尾缺少 return，于是「`if task_done {} else {}` 被当作函数尾表达式」报 `expected Result, found ()`。教训补全：按行号搬运要同时核对**块首之前与块尾之后**的收尾语句（前一刀丢的是块尾括号、这一刀丢的是块后的 `Ok(())`）。
+- **度量**：`stream_chat_inner` 2,143 → **2,050 行**；主循环体保持 **324 行**（收尾段本来就在循环外）。
+- **验证**：后端库 1,105 通过 / 0 失败 / 9 忽略 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过（macOS 本机）。
+
+**当前进度快照（截至第十二刀，2026-09-18）**：**第 2 步的「按段搬」全部完成**——主循环体 2,107（旧口径）/ 1,978（更正口径）→ **324 行**；`stream_chat_inner` 2,143 → **2,050 行**；循环内 `.emit(` 32 → 0、`.0.lock()` 约 22 → 1、`break`/`continue` 34 → 11。**剩下的只有第 7 步「合段」**：`RoundOutcome`（替代剩余 11 处控制流）+ `DesktopRoundState`（跨段可变状态）+ 切换 `run(port)`。
+
+尚未还的欠账：`run_one_tool` / `run_tool_calls` / `finalize_run` 三处 `#[allow(clippy::needless_borrow)]`（都是「输入改为引用后原 `&x` 成多余借用」的同一原因），随第 7 步重写一并清理。
+
+**第 7 步的启动条件（不变）**：必须有真实桌面验收窗口，跑「多轮工具任务 + 中途停止 + 断点续跑」；自动化层面仍无行为快照（第 19 节已实测否掉 Tauri 测试替身路线），因此第 7 步不在这里开工。
+
+
 
