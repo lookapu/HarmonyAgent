@@ -22,7 +22,7 @@
 | Rust 编译告警 | `cargo check --lib`、`cargo test --no-run` | 0 警告（macOS + Windows 本机） |
 | 文档漂移门禁 | `python3 scripts/check-docs.py` | 通过 |
 | clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警；macOS + Windows 本机均通过——8 条只在 Windows 触发的机械类告警已修复，基线未调整） |
-| Windows 质量矩阵 | GitHub Actions `quality.yml`（macOS + Windows） | v2.2.0 发版时全绿（此前 16 处 Windows 失败已清零） |
+| Windows 质量矩阵 | GitHub Actions `quality.yml`（macOS + Windows） | v2.2.0 发版时全绿（此前 16 处 Windows 失败已清零）；2026-09-18 含设备预览实现的推送后，`35315010893` **双平台全绿**（windows-latest 18m59s / macos-latest 9m55s） |
 
 平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,107/9 差异来自平台门控用例集，不是回归）。拉取 `6c8fbbe`（文档抓取重建 + 目录树查表 + SemVer，与 Windows 侧同一批）后 macOS 侧复验：后端库 1,127/10、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过、`check-ui-states.py` 通过；同批 Windows 侧为 1,125/9、三个联网 e2e 通过、其余门禁全绿——两平台用例数差异同样来自平台门控用例集。本批 push 后 CI（`Quality`）在跑，结论以 CI 为准。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
 
@@ -69,11 +69,11 @@
 | 结构查询与影响面 | 部分 | `repo_query` 的 `auto`/`impact` 分流、SCIP/LSP/AST 边、分页与覆盖状态 | 统一依赖重排 planner、跨语言正确率未做 |
 | 按块修改与写入门禁 | 见第 2 节矩阵 | 结构句柄 v3、Java 字节级单/批量事务、多文件逆序条件回滚、各语言门禁真实入口测试 | Java 类型语义未闭环（无 JDT/Maven/Gradle）；Dart/Go/Python/SQL 均单文件，无跨文件/跨模块覆盖 |
 | 工具治理与常驻预算 | 已实现 | `capabilities`/`tool_ranking`，生产排名后上限 20、固定保底入口、验证阶段保护必需工具 | 同模型 A/B 成功率未做；不是完整程序化编排 |
-| 原生隔离与资源限制 | 部分 | `agent/native_limits.rs`（`RLIMIT_CPU` 实测生效）、`sandbox.rs` 原生后端、宿主直跑限额可用 `HARMONY_HOST_DIRECT_*` 显式开启 | **macOS 原生沙箱仍不可用**：本机实测「`deny default` + 路径限定允许」的 profile 连 `/usr/bin/true` 都 SIGABRT（普通 Terminal 亦复现）；**可用性探测已改为按真实 profile 判定**（`922b9fd`，fail-closed + 一致性守门断言），故现在会如实报 `available=false` 而非假阳性（见盘点 §48/§49）；要让 macOS 真能用需重设计 profile，属待定设计决策；macOS 内核不接受 `RLIMIT_AS`（内存限不了）；进程数/CPU 配额/临时磁盘总量未限；Windows 生命周期未实现；OCI 端到端需 Docker |
+| 原生隔离与资源限制 | 部分 | `agent/native_limits.rs`（`RLIMIT_CPU` 实测生效）、`sandbox.rs` 原生后端、宿主直跑限额可用 `HARMONY_HOST_DIRECT_*` 显式开启 | **macOS 原生沙箱仍不可用**：本机实测「`deny default` + 路径限定允许」的 profile 连 `/usr/bin/true` 都 SIGABRT（普通 Terminal 亦复现）；**可用性探测已改为按真实 profile 判定**（`922b9fd`，fail-closed + 一致性守门断言），故现在会如实报 `available=false` 而非假阳性（见盘点 §55/§56）；要让 macOS 真能用需重设计 profile，属待定设计决策；macOS 内核不接受 `RLIMIT_AS`（内存限不了）；进程数/CPU 配额/临时磁盘总量未限；Windows 生命周期未实现；OCI 端到端需 Docker |
 | Host Capability Broker | 已实现核心契约 | 审批凭据 v4（与能力无关）、执行期 fail-closed 复核、自描述撤销判定、影响契约进审批卡片与审计、13 个变更类能力的显式契约清单 | 效果证据（安装版本/设备出现）需真机；**闭环逻辑**（签发→复核→撤销→停止失效）已用生产函数跑回归，仅 guards/execute 的**实际调用点**因需 Tauri AppHandle 未覆盖 |
 | OTA 审批安全链 | 核心链路实现 | 只读副本 + 内容摘要绑定 + 固定 argv + 持久撤销 + 发布前复验 | 真实打包/签名/升级未验；不支持工具版本矩阵 |
 | HarmonyOS 工程与设备闭环 | 大量实现 | 工程/SDK/构建/部署/UI/性能工具与固定录制场景、沙箱边界 smoke | 真机/模拟器版本矩阵（离线、重连、安装冲突、恢复）未验 |
-| 设备预览（驱动 SDK Previewer 取真实帧） | 已实现（Windows 本机验证） | `services/previewer.rs`（定位引擎/组装参数/切帧/取帧客户端）+ `commands/preview.rs`（预览构建 → 起引擎 → 帧推给前端）+ 预览面板；配方与实测见盘点 §52/§54 | 交互事件回传（点击/滑动送回引擎）、热重载、多设备档切换未做；macOS 侧未验；引擎缺失时退回 Web 预览（显式报错，不静默失败） |
+| 设备预览（驱动 SDK Previewer 取真实帧） | 已实现（双平台 CI 绿） | `services/previewer.rs`（定位引擎/组装参数/切帧/取帧客户端）+ `commands/preview.rs`（预览构建 → 起引擎 → 帧推给前端）+ 预览面板 + 面板组件测试；配方与实测见盘点 §52/§54；CI `35315010893` 双平台全绿（含本能力的单元与前端门禁） | 交互事件回传（点击/滑动送回引擎）、热重载、多设备档切换未做；**面板与后端的真实串联未在运行的应用里点过**——面板逻辑有组件测试（api 打桩）、后端链路由 e2e 覆盖，两者之间的接线只有静态检查；引擎缺失时退回 Web 预览（显式报错，不静默失败） |
 | 鸿蒙官方文档 / API 知识库 | 已重建抓取链路 + 数据补齐 | `services/harmony_doc_api.rs`（`getDocumentById` 正文接口、`getCatalogTree` 目录树查表、HTML 表格/锚点/HTML→Markdown）；版本 diff 与 API 参考两条链路联网 e2e 通过；出厂种子库（空库重建）14 版本 / 1,014 页 / `api_docs` 44,856 行 / 向量 44,856 条 / 280MB；参考正文 681 页（库内 681 行 / 13,705 条成员），17 个人工取证定案的模块映射见盘点 §51/§53 | 参考候选未命中 127（模块级 25 个，经文档站搜索逐个确认无专属参考页；清单见盘点 §53）；目录树匹配依赖标题形态（末段消歧在标题改动后可能失效）；`refresh_api_db` 依赖华为接口形态，站点再变即失效 |
 | 评测与发行 | 基础设施已建 | 固定 25-ID 清单、eval harness、release workflow、更新签名配置 | HarmonyBench 50/100+、真实 SWE 报告、平台签名/SBOM/provenance/新机验收未做 |
 | 文档与 CI 门禁 | 全绿 | `check-docs.py`（数量/链接/CI 接口）、`check-warnings.py`（clippy 基线 57） | Windows/Linux 目标本机未编译验证（仅代码审查） |
@@ -86,6 +86,7 @@
 - **签名与发行**：平台代码签名、公证、SBOM/provenance、干净机器安装验收。
 - **Windows/Linux**：目标编译校验（本机只有 macOS 工具链；MinGW 只能覆盖 windows-gnu，不等于 CI 用的 MSVC）。
 - **只在 CI 成立、本机不复现**：Windows 质量矩阵结论（16 处 Windows 失败清零）。**编码类门禁行为已于 2026-09-17 在本机 Windows 复现**（见第 3 节），从本清单移出；路径形态类（符号链接、8.3 短名）与 Windows/Linux 目标编译仍未覆盖。改动这些路径时须以 CI 结果为准，不能用本机绿推断。
+- **CI 偶发、方向待证**：`agent::tools::fs_tools::tests::java_type_gate_covers_unedited_java_callers` 在 windows-latest 上偶发失败——2026-09-18 的 `35313187722` 失败、同为 Windows 的 `35315010893` 通过，macOS 两次都通过；本机 JDK 17 与 25 均稳定通过。怀疑是 javac 差分的 10 秒超时在 runner 负载高时走了既定的「退回只编本批、不阻塞写入」降级路径，而该测试没区分这条**合法**降级路径（**未证**）。该测试的失败分支已加诊断（调用方是否被收集 / `affected_skipped` / javac 版本），下次出现自带现场。
 
 ## 6. 维护约定
 

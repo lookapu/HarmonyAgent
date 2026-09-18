@@ -882,7 +882,7 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 **未闭环**：交互事件回传（点击/滑动如何送回引擎）未做；热重载与多设备档切换未验；macOS 侧全流程未验；**面板与后端的真实串联未在运行中的应用里点过**——面板逻辑由组件测试（api 打桩）覆盖、后端链路由 e2e 覆盖，两者之间的接线（一行 prop 传递）只有静态检查，首次桌面验收时需确认。
 
-## 48. macOS 原生沙箱：profile 在本机建不起边界，且能力探测是假阳性（2026-09-18）
+## 55. macOS 原生沙箱：profile 在本机建不起边界，且能力探测是假阳性（2026-09-18）
 
 跑忽略用例集时发现 `agent::sandbox::tests::macos_native_backend_writes_workspace_but_denies_external_file_read` 失败（`workspace_write: 未建立所声明的文件边界`）。**用户在普通 Terminal（不在 agent 沙箱内）复现，同样失败**，因此不是受限环境问题，改用探针二分定位。
 
@@ -905,11 +905,25 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 **验证**：本机 `cargo test --lib` 1,141 通过 / 0 失败 / 11 忽略；`check-warnings.py` 57/57；`check-docs.py` 通过。
 
-## 49. macOS 沙箱探测改为「真实边界判定」（2026-09-18，`922b9fd`）
+## 56. macOS 沙箱探测改为「真实边界判定」（2026-09-18，`922b9fd`）
 
-按 §48 的建议 ① 落地：macOS 原生后端的可用性不再由静态探测给结论。
+按 §55 的建议 ① 落地：macOS 原生后端的可用性不再由静态探测给结论。
 
 - **改动**：`NativeSandboxKind::probe_program` 去掉 macOS 的 `(version 1) (allow default)` 探测项（macOS/Windows 均返回 `None`，理由写在注释里）；新增 `probe_macos_boundary` —— 建临时 workspace/scratch，按 `workspace-write` spec 用**真实 profile** 跑 `printf probe-ok > probe.txt`，要求**命令成功且文件确实落在 workspace 内**才算可用，否则 `available=false` + 原因（含退出码与「workspace 写入未发生」）。Linux 的 bwrap 静态探测路径不变。
 - **新增守门断言**：`macos_probe_availability_matches_a_real_boundary_run`（非 ignored，跑在默认套件里）——探测结论必须与 `run_native_filesystem_checks` 的真实边界执行一致。**这正是旧实现过不了的那条**：宽松探测通过而真实边界失败时两者不一致。本机现状：两边都是 false（fail-closed）✓。
 - **验证**（macOS 本机）：后端库 **1,142** 通过（+1 新用例）/ 0 失败 / 11 忽略；两组 crash E2E 各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
-- **仍未闭环**：①profile 本身仍是「`deny default` + 路径限定允许」，本机 macOS 15 上建不起边界 → macOS 原生沙箱**仍不可用**，只是现在会如实汇报；②要让 macOS 真能用需按 §48 的建议 ② 重设计（allow-default + 拒绝清单 + 写白名单，代价是读隔离弱化），属沙箱域的设计决策，未动。
+- **仍未闭环**：①profile 本身仍是「`deny default` + 路径限定允许」，本机 macOS 15 上建不起边界 → macOS 原生沙箱**仍不可用**，只是现在会如实汇报；②要让 macOS 真能用需按 §55 的建议 ② 重设计（allow-default + 拒绝清单 + 写白名单，代价是读隔离弱化），属沙箱域的设计决策，未动。
+
+## 57. 双平台 CI 结论、一处 CI 偶发失败的自述式诊断与编号修复（2026-09-18）
+
+第 57 批（`0df3d45`）：预览实现推送后拿到双平台 CI 结论，顺带处理一次 CI 专属的偶发失败与又一次编号撞号。
+
+- **双平台结论**：`35315010893` 在 windows-latest（18m59s）与 macos-latest（9m55s）**全绿**。该轮包含设备预览的全部提交（`1f1beb3` 路径注入、`56e1fd3` 后端驱动引擎、`81c4a28` 面板显示帧、`be2172c` 面板组件测试）以及并行会话的 3 个提交——**§54 记的「macOS 侧未验」到此闭环**，仍未验的是「在运行的应用里点一次面板」。
+- **一次 CI 专属偶发失败**：`35313187722` 在 windows-latest 的 `Rust tests` 挂掉，唯一失败是 `agent::tools::fs_tools::tests::java_type_gate_covers_unedited_java_callers`（panic：`javac 可用时，改坏未编辑的调用方必须被拒绝`）。取证：① 该测试与其门禁代码（`code_mutation.rs`/`java_compiler.rs`）**本批一行未动**，测试由更早的 `37e5f24` 引入；② 本机 JDK 25 与随包 Temurin 17 **都稳定通过**，完整 `cargo test --locked` 为 1139/0；③ 同一轮 macOS **通过了**该测试。→ 判为 CI 偶发，不是平台缺陷，也不是本批回归。
+  - 更正一条中途误判：该轮 macOS 作业显示的 `X` 不是测试失败，而是被**后一次推送取消**（`The operation was canceled.`，`cancel-in-progress`），取消时正走到 kernel 那步。两平台各自的真实结论是 windows 失败、macOS 通过。
+- **诊断已就位**：把该测试的失败分支改成携带现场——调用方是否被收集、门禁结果是 `Checked` 还是 `affected_skipped`、以及 `javac -version`。它只在该分支执行、平时零开销。怀疑方向是 javac 差分的 10 秒超时在 runner 负载高时走了既定的「退回只编本批、不阻塞写入」降级路径，而测试没区分这条**合法**路径——**未证**（`35315010893` 通过、诊断未触发）。下次再偶发即自带现场。
+- **编号修复**：并行会话追加的两条 macOS 沙箱条目又占用了已存在的 §48/§49，按 §46 立的约定改为 §55/§56，并同步四处引用（其内部两处、状态页一处、`agent/sandbox.rs` 注释一处）。现编号唯一。
+
+**验证**：CI `35315010893` 双平台全绿；本机库 1,139 通过 / 0 失败、clippy 57/57、前端 15 文件 133 测试、构建与体积门禁、UI 状态门禁、`check-docs.py` 全过。
+
+**未闭环**：Java 门禁偶发的根因待下次现场确证；设备预览的桌面点击验收未做；热重载与交互事件回传未做。

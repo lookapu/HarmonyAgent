@@ -520,7 +520,7 @@ async fn probe_macos_boundary(mut capabilities: SandboxCapabilities) -> SandboxC
 async fn probe_native_kind(kind: NativeSandboxKind) -> SandboxCapabilities {
     let mut capabilities = kind.declared_capabilities();
     // macOS 必须用**真实 profile** 探测：宽松 profile（`(allow default)`）在真实边界建不起来
-    // 的机器上也会成功，用它判定可用性就是假阳性（本机实测见盘点 §48）。
+    // 的机器上也会成功，用它判定可用性就是假阳性（本机实测见盘点 §55）。
     if matches!(kind, NativeSandboxKind::MacosSandboxExec) {
         return probe_macos_boundary(capabilities).await;
     }
