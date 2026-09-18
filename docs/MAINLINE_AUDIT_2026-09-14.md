@@ -639,3 +639,13 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 - **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
 
 **未闭环**：第 2 步只剩**工具执行循环本体**（约 780 行、18 处控制流中的绝大多数），建议按「单个工具执行」「结果归档与事件」再细分两刀；第 7 步「合段」需桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。
+
+## 38. 第 2 步第八刀：工具轮次/动态预算门搬出工具循环（2026-09-17）
+
+第八刀：工具循环内的轮次/动态预算门搬进 `enforce_tool_budget_limit`（`56ecb40`）——动态扩容（`KernelBudgetVerdict::Extend` 时更新上限、累加扩容次数、落库并写 `budget.extended` 事件）与触限中止路径（`chat-tool-start`/`chat-tool-done` 事件、`begin_tool_run`/`finish_tool_run` 登记、`request_final_summary` 收尾总结、为空时固定说明兜底）。输入 `ToolLimitInputs` 25 个字段。
+
+- **`exhausted` 与 `break` 刻意留在调用方**：原代码是「`exhausted = true;` 后立刻 `break;`」。函数只返回 `ToolLimitOutcome::Stop`，由调用方置位并跳出——两处副作用的发生顺序与原先逐字一致，不引入「先跳出再置位」这类顺序变化。
+- **度量**：主循环体 1,083 → **1,009 行**；循环内 `.emit(` 8 → 6、`.0.lock()` 4 → 3；`break`/`continue` 仍 18（该段的 `break` 移到调用方，总数不变）。
+- **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
+
+**未闭环**：工具循环剩余约 400 行（并发批次路径 + 审批/hook 拦截 + 工具执行本体与完成事件，17 处控制流），建议按「批量提交」「单工具执行」两刀继续；第 7 步「合段」需桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。

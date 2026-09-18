@@ -832,3 +832,11 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 - **验证**：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
 
 **轮中 D 只剩工具执行循环本体**（约 780 行，18 处控制流中的绝大多数）：建议再按「单个工具执行」「结果归档与事件」细分两刀后再合段。
+
+**进展（2026-09-17，第八刀）**：工具循环内的**轮次/动态预算门**落地——动态扩容（`Extend` 时落库新上限并写 `budget.extended` 事件、累计扩容次数）与触限中止路径（发 `chat-tool-start`/`chat-tool-done`、登记执行轨迹、请求收尾总结并在为空时用固定说明兜底），整体搬进 `enforce_tool_budget_limit`（`56ecb40`）。输入 `ToolLimitInputs` 25 个字段。
+
+- **`exhausted` 与 `break` 刻意留在调用方**：原代码是「`exhausted = true;` 后立刻 `break;`」，因此函数只返回 `ToolLimitOutcome::Stop`，两步仍由调用方完成——保持两处副作用的发生顺序与原先逐字一致。
+- **度量**：主循环体 1,083 → **1,009 行**；循环内 `.emit(` 8 → 6、`.0.lock()` 4 → 3；`break`/`continue` 仍 18（该段的 `break` 只是移到调用方）。
+- **验证**：后端库 1,102 通过 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过。
+
+**工具循环剩余部分**（约 400 行，控制流 17 处）：并发批次路径（`pending` + 按模型序提交）、工具执行前的审批与 hook 拦截、以及工具执行本体与 `chat-tool-done` 事件。这三块共享大量可变量，建议下一批继续按「批量提交」「单工具执行」两刀拆。
