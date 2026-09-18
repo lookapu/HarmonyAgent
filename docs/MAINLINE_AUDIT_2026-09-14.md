@@ -845,12 +845,15 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 - **可用参数模板**（本机实测进程存活且真在渲染）：`Previewer.exe -refresh region -projectID <数字> -ts <任意管道名> -j <含 modules.abc 的目录> -s <会话名> -cpm false -device phone -shape rect -sd 480 -ljPath <…/loader/default/loader.json> -sid <32 位无连字符十六进制> -or 1080 2340 -cr 1080 2340 -f <设备档 json> -url "pages/Index" -av "ACE_2_0" -n <模块名> -arp <…/res/default> -pm Stage -lws <端口>`。
 - **踩点（都是实测）**：`-sid` 必须匹配 `/^[a-zA-Z0-9]+$/`——带连字符的 UUID 会被拒（`Launch -sid parameter is not match regex`，进程退 11）；`-pm Stage` 正确（日志回显 `projectModel: Stage`）；`-ts` 指向的管道不存在只报 `Trace pipe is not prepared`，不致命；引擎**离屏渲染、不开窗口**（`MainWindowTitle` 为空），日志有 `Get first render buffer` / `FlushFrame surfaceNodeId=…` / 脏区 `[0,0,1080,2340]`。
-- **帧通道契约**：`-lws` 端口的 WebSocket **路径就是 `/<sid>`**——预览页的 `Ws()` 包装把 sessionID 当路径拼（`base + "/" + sessionID`），这正是 `-sid` 为何必须是无连字符字母数字。裸连 `/` 会被直接关闭且**无握手响应**；连对路径后 `101 Switching Protocols`，随后推二进制帧：实测首帧 `opcode=2 len=40651`，帧头 `12345678`（magic）+ 宽 + 高 + 宽 + 高（`0x438=1080`、`0x924=2340`，与 `-or/-cr` 一致），载荷为压缩数据（1080×2340 原始约 10MB → 实测 40KB）。
+- **帧通道契约**：`-lws` 端口的 WebSocket **路径就是 `/<sid>`**——预览页的 `Ws()` 包装把 sessionID 当路径拼（`base + "/" + sessionID`），这正是 `-sid` 为何必须是无连字符字母数字。裸连 `/` 会被直接关闭且**无握手响应**；连对路径后 `101 Switching Protocols`，随后推二进制帧。
+- **帧格式：40 字节头 + 一张标准 JPEG，不需要任何解压**（初版记的"压缩载荷"是错的）。头部实测：偏移 0 `12345678`（magic）、偏移 4/12 两组宽高 u32（`00000438`/`00000924` = 1080/2340，与 `-or/-cr` 一致）、偏移 20 起为保留字段，**偏移 40 就是 `ffd8ffe0` JPEG SOI + JFIF**，其余全部是可直接显示的 JPEG 数据。
+- **必须让 Previewer 以它自己的 `common/bin` 为 cwd 启动**（本机踩到并定位）：cwd 不对时字体配置找不到，日志报 `createZeroWidthRun: Failed to find suitable typeface for zero width run, text range [0,18)`，`LoadPage Success` 但文字整片渲染不出来——帧只有 40,651 字节纯白；cwd 改对后帧 56,195 字节，文字正常。
+- **端到端实证**：上述三步跑完后取出的帧就是靶子工程 `Index.ets` 的真实画面（`Hello previewfresh`，1080×2340）。
 - **接入方案**：后端 spawn Previewer（上表参数）+ 管好端口/sid 分配与进程生命周期；前端 webview 直接连 `ws://127.0.0.1:<lws>/<sid>` 把二进制帧画到 canvas（预览页的 `_onMessageBufferHandler` 即此做法）。构建产物目录注意：DevEco 的 `-j` 指 `assets/default/ets`，我们自己构建（无 IDE 预写的 `.preview/config/buildConfig.json`）落 `loader_out/default/ets`，指到实际目录即可。
 
-**验证**（Windows 本机）：`PreviewBuild`（带 `buildRoot=.preview`）BUILD SUCCESSFUL；Previewer 独立拉起后监听 `127.0.0.1:29998`，收到 101 与 40,651 字节渲染帧；探针脚本 `H:\work\tmp\ws-probe.js`。全程未触碰 DevEco 自己的 Previewer 进程。
+**验证**（Windows 本机）：`PreviewBuild`（带 `buildRoot=.preview`）BUILD SUCCESSFUL；Previewer 独立拉起后监听 `127.0.0.1:29998`，收到 `101` 与渲染帧，切出的 JPEG 已确认为靶子工程首页真实画面（`Hello previewfresh`）。探针脚本 `H:\work\tmp\ws-dump.js`。全程未触碰 DevEco 自己的 Previewer 进程。
 
-**未闭环**：**帧载荷的压缩格式未解**（不解压就画不出画面，这是接入前的下一步）；多设备档切换、热重载未验；preview server 与命名管道那两条路线未再验证（已不需要）；产品侧代码一行未写；macOS 侧全流程未验。
+**未闭环**：交互事件回传（点击/滑动如何送回引擎）未做；热重载与多设备档切换未验；preview server 与命名管道那两条路线未再验证（按当前方案已不需要）；产品侧代码一行未写；macOS 侧全流程未验。
 
 ## 53. 用文档站搜索接口复核剩余 34 项、再固定 9 条人工映射（2026-09-18）
 
