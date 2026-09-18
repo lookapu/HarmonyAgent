@@ -23,12 +23,14 @@
 
 **Data**
 
-- The shipped seed database was re-crawled: 14 versions / 1,014 pages / 47,410 changes; `api_docs` grew from 46,700 to 91,556 rows, with 26.0.0 going from 5,781 to 11,489 (including the full `apidiff-7003` set added by the August 29 Release).
+- API reference bodies are now resolved against the documentation catalog tree (`getCatalogTree`, 4,762 documents): coverage grew from 310 to **639 pages** (members 7,436 → 12,602). Documents whose title omits the module prefix (`@hms.ai.face.faceDetector` is titled just `faceDetector（人脸检测）`) are matched by a unique last segment; short or ambiguous segments are refused rather than guessed.
+- The shipped seed database was **rebuilt from an empty database** instead of stacking onto the previous crawl: 14 versions / 1,014 pages / 47,410 changes written, deduplicated to **44,856** `api_docs` rows with 44,856 vectors, **280MB** (the stacked state was 505MB). 26.0.0 carries the full `apidiff-7003` set added by the August 29 Release.
+- Fixed the duplication introduced by the previous refresh: HTML bodies produce different declaration strings than the Markdown era, so the conflict key never matched and every row was inserted rather than updated (stale `.d.ets` module names and two generations of the same API side by side). The upsert now refreshes the derived `module` column and the seed was rebuilt empty; stale names are gone and vectors match `api_docs` 1:1.
 - Seed import learned to ship same-version refreshes: when a version label keeps its name but gains rows (26.0.0 Beta → Release), the new rows are backfilled additively, keyed on a seed revision.
 
 **Compatibility and rollback**
 
-- No database migration and no schema change; the seed database is a local build artifact (not tracked), so roll back with the sibling `knowledge.db.bak`.
+- No database migration and no schema change; the seed database is a local build artifact (not tracked) and can be regenerated with `cargo run --bin full_fetch --features full-fetch,embedding --release -- --seed` (~6 minutes: 1 minute of crawling, 4 minutes of vector indexing).
 - The old `.md` fetch path is gone; if Huawei restores that endpoint, revert this fetch rework.
 
 ## v2.2.0 — Structure-First Navigation, Multi-Language Write Gates, and a Trustworthy Execution Kernel (2026-09-15)
