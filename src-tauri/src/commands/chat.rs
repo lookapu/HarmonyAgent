@@ -2786,10 +2786,9 @@ fn refresh_workflow_stage<'a>(
 /// 二是与迁移方案「用显式参数结构体传入」的切法一致，端口落地时统一改签名。
 struct OpenLedgerInputs<'a> {
     task_goal: &'a str,
-    tool_runs: &'a [ToolRunItem],
-    last_model_text: &'a str,
     ledger_base_n: u32,
-    prev_ledger: &'a mut Option<TaskLedger>,
+    /// 跨段可变状态（轨迹与最近文本按引用读、账本按 `&mut` 合并）
+    round_state: &'a mut DesktopRoundState,
 }
 
 /// 收尾：保留未完成任务的账本——把本轮轨迹并入账本落库，并推送最终态
@@ -2804,16 +2803,16 @@ fn persist_open_ledger_and_emit(
     conversation_id: &str,
     inputs: OpenLedgerInputs<'_>,
 ) -> Result<(), ChatFlowError> {
-    if inputs.tool_runs.is_empty() && inputs.prev_ledger.is_none() {
+    if inputs.round_state.tool_runs.is_empty() && inputs.round_state.prev_ledger.is_none() {
         return Ok(());
     }
     let derived = TaskLedger::from_tool_runs(
         inputs.task_goal,
-        inputs.tool_runs,
-        inputs.last_model_text,
+        &inputs.round_state.tool_runs,
+        &inputs.round_state.last_model_text,
         inputs.ledger_base_n,
     );
-    let merged = TaskLedger::merge_continuation(inputs.prev_ledger.take(), derived);
+    let merged = TaskLedger::merge_continuation(inputs.round_state.prev_ledger.take(), derived);
     save_task_ledger(state, conversation_id, Some(&merged))?;
     let _ = app.emit(
         "chat-ledger",
@@ -2851,20 +2850,11 @@ struct PreRoundInputs<'a> {
     conversation_id: &'a str,
     trace_id: &'a str,
     task_goal: &'a str,
-    task_started: std::time::Instant,
+    /// 跨段可变状态（本轮状态由调用方传入，见 DesktopRoundState）
+    round_state: &'a mut DesktopRoundState,
     task_deadline_ms: i64,
-    tool_runs: &'a [ToolRunItem],
-    full: &'a str,
-    reasoning_full: &'a str,
     model: &'a str,
-    context_summary: &'a Option<String>,
-    modified_files: &'a [String],
-    last_model_text: &'a str,
     ledger_base_n: u32,
-    prev_ledger: &'a mut Option<TaskLedger>,
-    placeholder_msg_id: &'a Option<String>,
-    max_tool_rounds: usize,
-    budget_extensions: usize,
     input_tokens: i64,
     output_tokens: i64,
 }
@@ -2887,9 +2877,9 @@ async fn adjudicate_pre_round(
                 inputs.conversation_id,
                 checkpoint,
                 crate::agent::kernel_executor::KernelCheckpointSafePoint::ProviderBoundary,
-                inputs.placeholder_msg_id.as_deref(),
-                inputs.max_tool_rounds,
-                inputs.budget_extensions,
+                inputs.round_state.placeholder_msg_id.as_deref(),
+                inputs.round_state.max_tool_rounds,
+                inputs.round_state.budget_extensions,
             )
         },
     )?;
@@ -2902,28 +2892,28 @@ async fn adjudicate_pre_round(
             "task_deadline_hit",
             serde_json::json!({
                 "conversation_id": inputs.conversation_id,
-                "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
-                "tool_runs": inputs.tool_runs.len(),
+                "elapsed_ms": inputs.round_state.task_started.elapsed().as_millis() as i64,
+                "tool_runs": inputs.round_state.tool_runs.len(),
                 "deadline_ms": inputs.task_deadline_ms,
             }),
         );
-        if !inputs.full.is_empty() {
+        if !inputs.round_state.full.is_empty() {
             persist_turn(
                 inputs.state,
                 inputs.conversation_id,
                 inputs.trace_id,
-                inputs.tool_runs,
-                inputs.full,
-                inputs.reasoning_full,
+                &inputs.round_state.tool_runs,
+                &inputs.round_state.full,
+                &inputs.round_state.reasoning_full,
                 inputs.model,
-                inputs.context_summary,
-                inputs.modified_files,
+                &inputs.round_state.context_summary,
+                &inputs.round_state.modified_files,
                 inputs.app,
                 inputs.input_tokens,
                 inputs.output_tokens,
-                inputs.task_started.elapsed().as_millis() as i64,
+                inputs.round_state.task_started.elapsed().as_millis() as i64,
                 true,
-                inputs.placeholder_msg_id,
+                &inputs.round_state.placeholder_msg_id,
             )
             .await?;
         }
@@ -2934,10 +2924,8 @@ async fn adjudicate_pre_round(
             inputs.conversation_id,
             OpenLedgerInputs {
                 task_goal: inputs.task_goal,
-                tool_runs: inputs.tool_runs,
-                last_model_text: inputs.last_model_text,
                 ledger_base_n: inputs.ledger_base_n,
-                prev_ledger: inputs.prev_ledger,
+                round_state: &mut *inputs.round_state,
             },
         )?;
         return Ok(PreRoundPermit::Deadline);
@@ -2952,25 +2940,25 @@ async fn adjudicate_pre_round(
             serde_json::json!({
                 "phase": "main_loop_top",
                 "conversation_id": inputs.conversation_id,
-                "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+                "elapsed_ms": inputs.round_state.task_started.elapsed().as_millis() as i64,
             }),
         );
         persist_turn(
             inputs.state,
             inputs.conversation_id,
             inputs.trace_id,
-            inputs.tool_runs,
-            inputs.full,
-            inputs.reasoning_full,
+            &inputs.round_state.tool_runs,
+            &inputs.round_state.full,
+            &inputs.round_state.reasoning_full,
             inputs.model,
-            inputs.context_summary,
-            inputs.modified_files,
+            &inputs.round_state.context_summary,
+            &inputs.round_state.modified_files,
             inputs.app,
             inputs.input_tokens,
             inputs.output_tokens,
-            inputs.task_started.elapsed().as_millis() as i64,
+            inputs.round_state.task_started.elapsed().as_millis() as i64,
             true,
-            inputs.placeholder_msg_id,
+            &inputs.round_state.placeholder_msg_id,
         )
         .await?;
         // 账本持久化：用户停止（任务未完成）→ 保存当前账本（含断点续跑合并）供续跑继承
@@ -2980,10 +2968,8 @@ async fn adjudicate_pre_round(
             inputs.conversation_id,
             OpenLedgerInputs {
                 task_goal: inputs.task_goal,
-                tool_runs: inputs.tool_runs,
-                last_model_text: inputs.last_model_text,
                 ledger_base_n: inputs.ledger_base_n,
-                prev_ledger: inputs.prev_ledger,
+                round_state: &mut *inputs.round_state,
             },
         )?;
         return Ok(PreRoundPermit::Cancelled);
@@ -3110,11 +3096,10 @@ struct PlanGateInputs<'a> {
     trace_id: &'a str,
     text: &'a str,
     plan_mode: bool,
-    plan_confirmed: &'a mut bool,
-    confirmed_plan: &'a mut Option<String>,
+    /// 跨段可变状态（本轮状态由调用方传入，见 DesktopRoundState）
+    round_state: &'a mut DesktopRoundState,
     messages: &'a mut Vec<serde_json::Value>,
     stats: &'a mut ChatRunStats,
-    completion_reviews: usize,
 }
 
 /// 轮后计划门禁（纯搬运：原主循环内联代码，行为一致）。
@@ -3125,7 +3110,7 @@ struct PlanGateInputs<'a> {
 async fn run_plan_gate(inputs: PlanGateInputs<'_>) -> Result<PlanGateOutcome, ChatFlowError> {
     // 计划模式：模型遵守两阶段约定只输出了【PLAN】块（无工具标记）时同样提交用户审批，
     // 否则会因无工具调用直接结束任务，计划卡永远不会出现（两阶段计划的关键闭环）
-    if inputs.plan_mode && !*inputs.plan_confirmed && !inputs.text.trim().is_empty() {
+    if inputs.plan_mode && !inputs.round_state.plan_confirmed && !inputs.text.trim().is_empty() {
         let plan_text = extract_plan_block(inputs.text)
             .unwrap_or_else(|| crate::agent::tools::strip_tool_calls(inputs.text).trim().to_string());
         let plan_text = if plan_text.trim().is_empty() {
@@ -3192,8 +3177,8 @@ async fn run_plan_gate(inputs: PlanGateInputs<'_>) -> Result<PlanGateOutcome, Ch
             inputs.trace_id,
             &final_plan,
         )?;
-        *inputs.plan_confirmed = true;
-        *inputs.confirmed_plan = Some(final_plan.clone());
+        inputs.round_state.plan_confirmed = true;
+        inputs.round_state.confirmed_plan = Some(final_plan.clone());
         let _ = inputs.app.emit(
             "chat-plan-resolved",
             serde_json::json!({
@@ -3218,7 +3203,7 @@ async fn run_plan_gate(inputs: PlanGateInputs<'_>) -> Result<PlanGateOutcome, Ch
     // 收尾复核的确认检测：上一轮注入了“任务是否真完成”确认后，模型回复命中
     // 完成确认信号（✅ 任务已完成 / 任务已完成等）表示任务确实完成，直接收尾；
     // 未确认（输出工具标记/补充正文）则走下方常规分支继续执行
-    if inputs.completion_reviews > 0 && is_completion_confirmation(inputs.text) {
+    if inputs.round_state.completion_reviews > 0 && is_completion_confirmation(inputs.text) {
         return Ok(PlanGateOutcome::Finish);
     }
     Ok(PlanGateOutcome::Passed)
@@ -3234,8 +3219,8 @@ struct BudgetGateInputs<'a> {
     messages: &'a [serde_json::Value],
     model_choice: &'a mut ModelChoice,
     stats: &'a mut ChatRunStats,
-    used_fallback: &'a mut bool,
-    budget_warned: &'a mut bool,
+    /// 跨段可变状态（本轮状态由调用方传入，见 DesktopRoundState）
+    round_state: &'a mut DesktopRoundState,
 }
 
 /// 发送前预算门控（纯搬运：原主循环内联代码，行为一致）。
@@ -3269,7 +3254,7 @@ fn enforce_budget_gate(inputs: BudgetGateInputs<'_>) -> Result<(), ChatFlowError
                 let (soft, econ) = {
                     let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
                     let s = crate::services::cost_guard::soft_check(&conn, &inputs.provider.provider_id);
-                    let e = if s.should_downgrade() && !*inputs.used_fallback {
+                    let e = if s.should_downgrade() && !inputs.round_state.used_fallback {
                         crate::services::cost_guard::pick_downgrade_model(
                             &conn,
                             &inputs.provider.provider_id,
@@ -3299,7 +3284,7 @@ fn enforce_budget_gate(inputs: BudgetGateInputs<'_>) -> Result<(), ChatFlowError
                         .ok()
                     };
                     if let Some((up, _ctx, o)) = row {
-                        *inputs.used_fallback = true;
+                        inputs.round_state.used_fallback = true;
                         *inputs.model_choice = ModelChoice {
                             provider_id: inputs.provider.provider_id.clone(),
                             model: econ_model.clone(),
@@ -3324,8 +3309,8 @@ fn enforce_budget_gate(inputs: BudgetGateInputs<'_>) -> Result<(), ChatFlowError
                     ratio,
                 } = soft
                 {
-                    if !*inputs.budget_warned {
-                        *inputs.budget_warned = true;
+                    if !inputs.round_state.budget_warned {
+                        inputs.round_state.budget_warned = true;
                         let _ = inputs.app.emit(
                             "chat-stream",
                             ChatStreamEvent {
@@ -3401,7 +3386,8 @@ struct AssembleInputs<'a> {
     provider: &'a ProviderEndpoint,
     conversation_id: &'a str,
     trace_id: &'a str,
-    task_started: std::time::Instant,
+    /// 跨段可变状态（本轮状态由调用方传入，见 DesktopRoundState）
+    round_state: &'a mut DesktopRoundState,
     project_path: &'a str,
     context_budget: i64,
     model_choice: &'a ModelChoice,
@@ -3409,24 +3395,8 @@ struct AssembleInputs<'a> {
     system_prompt_core: &'a str,
     workflow: &'a crate::agent::execution_loop::ExecutionLoopSnapshot,
     protocol: &'a str,
-    images: &'a Option<Vec<String>>,
     task_goal: &'a str,
-    tool_runs: &'a [ToolRunItem],
-    last_model_text: &'a str,
     ledger_base_n: u32,
-    prev_ledger: &'a Option<TaskLedger>,
-    confirmed_plan: &'a Option<String>,
-    continuation_text: &'a str,
-    seam_count: &'a mut u32,
-    history_limit: &'a mut usize,
-    context_summary: &'a mut Option<String>,
-    images_attached: &'a mut usize,
-    continuation_reasoning_only: &'a mut bool,
-    correction_text: &'a mut String,
-    correction_hint: &'a mut String,
-    merged_instructions: &'a mut Vec<String>,
-    tools_since_progress: &'a mut u32,
-    replan_instruction: &'a mut Option<String>,
 }
 
 /// 轮中组装（纯搬运：原主循环内联代码，行为一致）。
@@ -3438,7 +3408,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
     // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
     if let Some((_, pending_content)) = take_next_queued(inputs.state, inputs.conversation_id, true)?
     {
-        inputs.merged_instructions.push(pending_content);
+        inputs.round_state.merged_instructions.push(pending_content);
         let _ = inputs.app.emit(
             "chat-stream",
             ChatStreamEvent {
@@ -3451,7 +3421,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
     // 组装消息：系统提示 + 历史（最近 history_limit 条，含 tool）+ 已执行工具结果
     // 接缝审计 + 刷新频率分级：完整提示（含低频项目上下文/知识库）每 FULL_HINT_EVERY_ROUNDS
     // 轮刷新一次，中间轮只带核心规则；任务账本每轮注入（账本=当前状态，接缝处刷新保证连续性）
-    let prompt_now = if inputs.seam_count.is_multiple_of(FULL_HINT_EVERY_ROUNDS) {
+    let prompt_now = if inputs.round_state.seam_count.is_multiple_of(FULL_HINT_EVERY_ROUNDS) {
         inputs.system_prompt
     } else {
         inputs.system_prompt_core
@@ -3472,15 +3442,15 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
 
     // 任务账本（同时构造 ledger_now 供事件推送和快照保存）
     let (ledger_hint, ledger_now) =
-        if !inputs.tool_runs.is_empty() || !inputs.last_model_text.is_empty() {
+        if !inputs.round_state.tool_runs.is_empty() || !inputs.round_state.last_model_text.is_empty() {
             let ledger = TaskLedger::from_tool_runs(
                 inputs.task_goal,
-                inputs.tool_runs,
-                inputs.last_model_text,
+                &inputs.round_state.tool_runs,
+                &inputs.round_state.last_model_text,
                 inputs.ledger_base_n,
             );
             (Some(ledger.to_hint()), Some(ledger))
-        } else if let Some(prev) = inputs.prev_ledger {
+        } else if let Some(prev) = &inputs.round_state.prev_ledger {
             (
                 Some(format!(
                     "## 上一任务账本（任务未完成，本次继续推进；续跑期间按新执行轨迹更新）\n{}",
@@ -3504,7 +3474,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(
-                rusqlite::params![inputs.conversation_id, *inputs.history_limit as i64],
+                rusqlite::params![inputs.conversation_id, inputs.round_state.history_limit as i64],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?)),
             )
             .map_err(|e| e.to_string())?;
@@ -3533,13 +3503,12 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
     }
 
     // 本轮已执行的工具结果
-    let tool_results: Vec<ToolResult> = inputs
-        .tool_runs
+    let tool_results: Vec<ToolResult> = inputs.round_state.tool_runs
         .iter()
         .enumerate()
         .map(|(i, item)| {
             let out_guard = crate::agent::tools::sanitize_tool_output(&item.output);
-            let limit = if i + 2 >= inputs.tool_runs.len() {
+            let limit = if i + 2 >= inputs.round_state.tool_runs.len() {
                 TOOL_RESULT_RECENT_LIMIT
             } else {
                 TOOL_RESULT_OLD_LIMIT
@@ -3563,19 +3532,18 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
     // 用户注入集合
     // 一次性注入先并入持久到“请求成功”为止的队列；主动压缩重组消息时不能丢失。
     for msg in crate::agent::session_ctx::drain_injected(inputs.conversation_id) {
-        inputs.merged_instructions.push(msg);
+        inputs.round_state.merged_instructions.push(msg);
     }
-    if inputs.confirmed_plan.is_some() && *inputs.tools_since_progress >= 3 {
-        *inputs.tools_since_progress = 0;
-        inputs.merged_instructions.push(
+    if inputs.round_state.confirmed_plan.is_some() && inputs.round_state.tools_since_progress >= 3 {
+        inputs.round_state.tools_since_progress = 0;
+        inputs.round_state.merged_instructions.push(
             "（执行对照：请对照上方\"已批准任务计划\"，用一两句话汇报当前进度——哪些步骤已完成、当前进行到哪一步、还剩哪些步骤，然后继续执行，不要偏离计划。）".to_string(),
         );
     }
-    if let Some(p) = inputs.replan_instruction.take() {
-        inputs.merged_instructions.push(p);
+    if let Some(p) = inputs.round_state.replan_instruction.take() {
+        inputs.round_state.merged_instructions.push(p);
     }
-    let user_injections = inputs
-        .merged_instructions
+    let user_injections = inputs.round_state.merged_instructions
         .iter()
         .cloned()
         .map(|content| UserInjection { content })
@@ -3592,30 +3560,30 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
         context_hint: context_hint.as_deref(),
         workflow_directive: &inputs.workflow.directive(),
         ledger_hint: ledger_hint.as_deref(),
-        compression_summary: inputs.context_summary.as_deref(),
-        confirmed_plan: inputs.confirmed_plan.as_deref(),
+        compression_summary: inputs.round_state.context_summary.as_deref(),
+        confirmed_plan: inputs.round_state.confirmed_plan.as_deref(),
         history_rows,
         tool_results,
         user_injections,
-        continuation_text: inputs.continuation_text,
-        continuation_reasoning_only: *inputs.continuation_reasoning_only,
-        correction_text: inputs.correction_text,
-        correction_hint: inputs.correction_hint,
+        continuation_text: &inputs.round_state.continuation_text,
+        continuation_reasoning_only: inputs.round_state.continuation_reasoning_only,
+        correction_text: &inputs.round_state.correction_text,
+        correction_hint: &inputs.round_state.correction_hint,
         inject_progress_check: false, // progress check already collected in user_injections
-        images: inputs.images.as_ref(),
-        images_attached: *inputs.images_attached,
+        images: inputs.round_state.images.as_ref(),
+        images_attached: inputs.round_state.images_attached,
         protocol: inputs.protocol,
         supports_image,
         context_budget: inputs.context_budget,
-        history_limit: *inputs.history_limit,
+        history_limit: inputs.round_state.history_limit,
     });
     let messages = assembled.messages;
     let next_images_attached = assembled.images_attached;
 
     // E3：压缩决策——assembler 已判断是否需要压缩，adapter 执行实际压缩
     if assembled.compress {
-        let old_limit = *inputs.history_limit;
-        *inputs.history_limit = (*inputs.history_limit / 2).max(MIN_HISTORY_KEEP);
+        let old_limit = inputs.round_state.history_limit;
+        inputs.round_state.history_limit = (inputs.round_state.history_limit / 2).max(MIN_HISTORY_KEEP);
         let _ = inputs.app.emit(
             "chat-context-warning",
             serde_json::json!({
@@ -3630,8 +3598,8 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
                 "conversation_id": inputs.conversation_id,
                 "trigger": "active",
                 "old_limit": old_limit,
-                "new_limit": *inputs.history_limit,
-                "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+                "new_limit": inputs.round_state.history_limit,
+                "elapsed_ms": inputs.round_state.task_started.elapsed().as_millis() as i64,
             }),
         );
         if let Some(s) = summarize_rolling_history(
@@ -3642,13 +3610,13 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
             inputs.conversation_id,
             inputs.context_budget,
             old_limit,
-            *inputs.history_limit,
-            inputs.context_summary.take(),
+            inputs.round_state.history_limit,
+            inputs.round_state.context_summary.take(),
             Some(inputs.cancel),
         )
         .await
         {
-            *inputs.context_summary = Some(s);
+            inputs.round_state.context_summary = Some(s);
         }
         let _ = inputs.app.emit(
             "chat-stream",
@@ -3657,7 +3625,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
                 run_id: inputs.trace_id.to_string(),
                 delta: format!(
                     "（上下文接近模型窗口上限，已压缩早期对话为摘要，保留最近 {} 条）",
-                    *inputs.history_limit
+                    inputs.round_state.history_limit
                 ),
             },
         );
@@ -3665,7 +3633,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
         if let Ok(conn) = inputs.state.0.lock() {
             let _ = conn.execute(
                 "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
-                params![*inputs.history_limit as i64, inputs.conversation_id],
+                params![inputs.round_state.history_limit as i64, inputs.conversation_id],
             );
             crate::agent::context::bump_compress_count(&conn, inputs.conversation_id);
             let _ = crate::agent::session_events::append_event(
@@ -3675,7 +3643,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
                 serde_json::json!({
                     "trigger": "active",
                     "old_limit": old_limit,
-                    "new_limit": *inputs.history_limit,
+                    "new_limit": inputs.round_state.history_limit,
                 }),
                 Some(inputs.trace_id),
             );
@@ -3684,7 +3652,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
             "chat-compact",
             serde_json::json!({
                 "conversation_id": inputs.conversation_id,
-                "keep": *inputs.history_limit,
+                "keep": inputs.round_state.history_limit,
             }),
         );
         // 使用缩小后的 history_limit 和新摘要重新组装；一次性注入、图片和续写状态
@@ -3692,13 +3660,13 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
         return Ok(AssembleOutcome::RestartRound);
     }
 
-    *inputs.images_attached = next_images_attached;
+    inputs.round_state.images_attached = next_images_attached;
     // 重置续写/纠正状态（assembler 已消费）
-    *inputs.continuation_reasoning_only = false;
-    *inputs.correction_text = String::new();
-    *inputs.correction_hint = String::new();
+    inputs.round_state.continuation_reasoning_only = false;
+    inputs.round_state.correction_text = String::new();
+    inputs.round_state.correction_hint = String::new();
 
-    *inputs.seam_count += 1;
+    inputs.round_state.seam_count += 1;
     // 账本实时推送（前端"任务账本"卡）：每轮刷新当前执行轨迹派生账本
     if let Some(ref ledger_now) = ledger_now {
         // 每轮同步持久化检查点，而不是只在正常/超时收尾时保存。
@@ -3723,8 +3691,8 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
             &conn,
             inputs.conversation_id,
             ledger_now.as_ref(),
-            inputs.last_model_text,
-            inputs.tool_runs.len(),
+            &inputs.round_state.last_model_text,
+            inputs.round_state.tool_runs.len(),
         );
         // Context V2 检查点是可重建投影：保存任务状态、摘要覆盖游标和预算。
         // 失败不阻断聊天主循环，旧消息/Run/事件仍是恢复真源。
@@ -3732,8 +3700,8 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
             &conn,
             inputs.conversation_id,
             Some(inputs.trace_id),
-            inputs.context_summary.as_deref(),
-            *inputs.history_limit,
+            inputs.round_state.context_summary.as_deref(),
+            inputs.round_state.history_limit,
             inputs.context_budget,
         );
     }
@@ -3765,19 +3733,11 @@ struct RoundRoutingInputs<'a> {
     interrupted: bool,
     /// 原生 function calling 调用（工具名，参数 JSON）
     tool_calls: &'a [(String, String)],
-    tool_runs: &'a [ToolRunItem],
+    /// 跨段可变状态（本轮状态由调用方传入，见 DesktopRoundState）
+    round_state: &'a mut DesktopRoundState,
     inherited_tool_evidence: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
     goal_contract: &'a crate::agent::acceptance::GoalContract,
     executor: &'a mut KernelIoRunLoop,
-    full: &'a mut String,
-    correction_text: &'a mut String,
-    correction_hint: &'a mut String,
-    continuation_text: &'a mut String,
-    continuation_reasoning_only: &'a mut bool,
-    pending_action_corrections: &'a mut usize,
-    action_commitment_corrections: &'a mut usize,
-    unverified_claim_corrections: &'a mut usize,
-    completion_reviews: &'a mut usize,
 }
 
 /// 轮级路由与假完成纠正（纯搬运：原主循环内联代码，行为一致）。
@@ -3797,16 +3757,16 @@ fn route_round_outcome(
     };
     let decision = inputs.executor.decide_round(&router_input);
     for notice in decision.notices {
-        inputs.full.push_str(&notice);
+        inputs.round_state.full.push_str(&notice);
     }
     match decision.control {
         crate::agent::kernel_loop::KernelRoundControl::RetryEmpty { hint } => {
-            *inputs.correction_text = String::new();
-            *inputs.correction_hint = hint;
+            inputs.round_state.correction_text = String::new();
+            inputs.round_state.correction_hint = hint;
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::StopEmpty { note } => {
-            inputs.full.push_str(&note);
+            inputs.round_state.full.push_str(&note);
             return Ok(RoundRoutingOutcome::Finish);
         }
         crate::agent::kernel_loop::KernelRoundControl::ReplayFrozen => {
@@ -3821,18 +3781,18 @@ fn route_round_outcome(
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
-            *inputs.continuation_text = ct;
-            *inputs.continuation_reasoning_only = reasoning_only;
+            inputs.round_state.continuation_text = ct;
+            inputs.round_state.continuation_reasoning_only = reasoning_only;
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::ContinueTruncated { continuation_text: ct, reasoning_only } => {
-            *inputs.continuation_text = ct;
-            *inputs.continuation_reasoning_only = reasoning_only;
+            inputs.round_state.continuation_text = ct;
+            inputs.round_state.continuation_reasoning_only = reasoning_only;
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::CorrectFakeCall { correction_text: ct, hint } => {
-            *inputs.correction_text = ct;
-            *inputs.correction_hint = hint;
+            inputs.round_state.correction_text = ct;
+            inputs.round_state.correction_hint = hint;
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::Proceed => {
@@ -3842,36 +3802,36 @@ fn route_round_outcome(
     // 防“未完话术”静默结束：模型承诺“还需读取/继续查看”等下一步动作但未输出【TOOL】
     // 标记（任务实际未完成却正常收尾），注入纠正提示要求立即输出标记或明确总结
     if has_pending_action_phrase(inputs.text)
-        && *inputs.pending_action_corrections < MAX_PENDING_ACTION_CORRECTIONS
+        && inputs.round_state.pending_action_corrections < MAX_PENDING_ACTION_CORRECTIONS
     {
-        *inputs.pending_action_corrections += 1;
-        *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
-        *inputs.correction_hint = "（系统检测到你的回复描述了下一步动作（如还需读取/继续查看/补全读取等），但没有输出工具调用标记，本轮没有任何工具被执行。若任务未完成，本轮必须直接输出【TOOL|工具名|JSON参数】标记行来执行动作，不得再只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
+        inputs.round_state.pending_action_corrections += 1;
+        inputs.round_state.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+        inputs.round_state.correction_hint = "（系统检测到你的回复描述了下一步动作（如还需读取/继续查看/补全读取等），但没有输出工具调用标记，本轮没有任何工具被执行。若任务未完成，本轮必须直接输出【TOOL|工具名|JSON参数】标记行来执行动作，不得再只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
         return Ok(RoundRoutingOutcome::NextRound);
     }
     // 纠正多次后模型仍只描述计划不执行：向用户明确提示任务可能未完成，不再静默收尾
-    if has_pending_action_phrase(inputs.text) && *inputs.pending_action_corrections > 0 {
-        inputs.full.push_str("\n\n> ⚠️ 模型多次表示要继续执行但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
+    if has_pending_action_phrase(inputs.text) && inputs.round_state.pending_action_corrections > 0 {
+        inputs.round_state.full.push_str("\n\n> ⚠️ 模型多次表示要继续执行但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
     }
     // 防“行动承诺假完成”静默收尾：模型宣布“开始开发/创建/新建/实现”或仅输出方案计划
     // （如“方案如下：新建 pages/Login.ets …”）但本轮未输出任何【TOOL】标记、无任何工具
     // 被执行时，不结束任务（任务实际未执行却正常收尾），注入纠正提示要求立即输出标记执行
     if has_action_commitment_phrase(inputs.text)
-        && *inputs.action_commitment_corrections < MAX_ACTION_COMMITMENT_CORRECTIONS
+        && inputs.round_state.action_commitment_corrections < MAX_ACTION_COMMITMENT_CORRECTIONS
     {
-        *inputs.action_commitment_corrections += 1;
-        *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
-        *inputs.correction_hint = "（系统检测到你的回复宣布了开始执行开发动作（如开始开发/创建/新建/实现/修改文件等）或仅输出了方案计划，但本轮没有输出任何工具调用标记，系统未执行任何操作。若任务未完成，请立即输出【TOOL|工具名|JSON参数】标记行实际执行（新建/修改文件、注册路由、构建部署等），不要只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
+        inputs.round_state.action_commitment_corrections += 1;
+        inputs.round_state.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+        inputs.round_state.correction_hint = "（系统检测到你的回复宣布了开始执行开发动作（如开始开发/创建/新建/实现/修改文件等）或仅输出了方案计划，但本轮没有输出任何工具调用标记，系统未执行任何操作。若任务未完成，请立即输出【TOOL|工具名|JSON参数】标记行实际执行（新建/修改文件、注册路由、构建部署等），不要只描述计划；若任务确实已完成，请直接输出最终结论总结。）".to_string();
         return Ok(RoundRoutingOutcome::NextRound);
     }
     // 纠正多次后模型仍只输出方案不执行：向用户明确提示任务可能未完成，不再静默收尾
-    if has_action_commitment_phrase(inputs.text) && *inputs.action_commitment_corrections > 0 {
-        inputs.full.push_str("\n\n> ⚠️ 模型多次宣布开始执行/输出方案但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
+    if has_action_commitment_phrase(inputs.text) && inputs.round_state.action_commitment_corrections > 0 {
+        inputs.round_state.full.push_str("\n\n> ⚠️ 模型多次宣布开始执行/输出方案但始终未实际调用工具，任务可能未完成。建议重新发送指令重试，或检查模型配置（部分快速模型指令遵循能力较弱）。");
     }
     // 强验收前移到“申请完成”时刻。缺少写入、后置验证、构建/测试/提交/推送等
     // 契约证据时自动回到工具循环；达到动态上限才保留为未完成，避免无限补救。
     if !inputs.interrupted {
-        let evidence = combined_acceptance_evidence(inputs.inherited_tool_evidence, inputs.tool_runs);
+        let evidence = combined_acceptance_evidence(inputs.inherited_tool_evidence, &inputs.round_state.tool_runs);
         let report = inputs
             .state
             .0
@@ -3895,8 +3855,8 @@ fn route_round_outcome(
             round,
         } = inputs.executor.decide_stop(report)
         {
-            *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
-            *inputs.correction_hint = prompt;
+            inputs.round_state.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+            inputs.round_state.correction_hint = prompt;
             if let Ok(conn) = inputs.state.0.lock() {
                 let value = serde_json::to_value(&report).unwrap_or_default();
                 let _ = crate::agent::runtime::set_acceptance(&conn, inputs.trace_id, &value);
@@ -3923,14 +3883,14 @@ fn route_round_outcome(
     // 验证范围（文件/模块/命令/截图等）时注入纠正要求补充或实际验证——防“声称完成却
     // 没验证”的虚假收尾（与收尾复核互补：复核问“是否真完成”，ship 查“完成声明是否
     // 有验证背书”）；达上限放行收尾，防空转
-    if (!inputs.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
+    if (!inputs.round_state.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
         && !inputs.interrupted
         && has_unverified_claim(inputs.text)
-        && *inputs.unverified_claim_corrections < MAX_UNVERIFIED_CLAIM_CORRECTIONS
+        && inputs.round_state.unverified_claim_corrections < MAX_UNVERIFIED_CLAIM_CORRECTIONS
     {
-        *inputs.unverified_claim_corrections += 1;
-        *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
-        *inputs.correction_hint = "（系统检测到你的总结中出现了“已验证/测试通过/已修复”等完成声明，但未说明验证范围（哪些文件/模块/用例/命令/截图）。请补充声明对应的验证范围与方式；若尚未实际验证，请立即输出【TOOL|工具名|JSON参数】标记行执行真实验证（构建/部署/跑测试/读日志/截图等），验证通过后再总结。声明与验证必须绑定：没有验证背书的完成声明将被视为未完成。）".to_string();
+        inputs.round_state.unverified_claim_corrections += 1;
+        inputs.round_state.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+        inputs.round_state.correction_hint = "（系统检测到你的总结中出现了“已验证/测试通过/已修复”等完成声明，但未说明验证范围（哪些文件/模块/用例/命令/截图）。请补充声明对应的验证范围与方式；若尚未实际验证，请立即输出【TOOL|工具名|JSON参数】标记行执行真实验证（构建/部署/跑测试/读日志/截图等），验证通过后再总结。声明与验证必须绑定：没有验证背书的完成声明将被视为未完成。）".to_string();
         return Ok(RoundRoutingOutcome::NextRound);
     }
     // 任务收尾复核：本任务执行过工具（执行型任务）且模型主动收尾时，不直接结束——
@@ -3940,28 +3900,28 @@ fn route_round_outcome(
     // 纯问答任务（全程无工具执行）不复核，直接收尾。
     // 本轮已判定网络连续中断（outcome.interrupted）时不复核：连接不稳，复核轮大概率
     // 再次中断白等，直接按上方“网络连续中断”提示收尾。
-    if (!inputs.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
+    if (!inputs.round_state.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
         && !inputs.interrupted
-        && *inputs.completion_reviews < MAX_COMPLETION_REVIEWS
+        && inputs.round_state.completion_reviews < MAX_COMPLETION_REVIEWS
     {
-        *inputs.completion_reviews += 1;
-        *inputs.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
+        inputs.round_state.completion_reviews += 1;
+        inputs.round_state.correction_text = crate::agent::tools::strip_tool_calls(inputs.text);
         // 证据化完成确认（对齐 deepseek-harness goal-round-driver）：复核时带上任务
         // 原始目标并要求引用完成证据（构建/测试/文件/截图），防“完成声明无验证背书”
         // 的假收尾——与 task_guard 每轮 <goal_round> 注入、ship 注册表审计同一口径
         let goal_note = crate::services::task_guard::current_goal(inputs.conversation_id)
             .map(|g| format!("本任务的目标是：{g}\n"))
             .unwrap_or_default();
-        *inputs.correction_hint = format!(
+        inputs.round_state.correction_hint = format!(
             "（系统检测到你的回复为任务总结，但本任务此前已执行过工具。{goal_note}请对照目标逐项核对完成情况，并引用完成证据（构建成功输出/测试通过/文件内容/截图等）后再确认：若确认已完成，请以『✅ 任务已完成』开头给出最终结论（含证据）；若仍有未完成步骤或未经验证的环节，请直接输出【TOOL|工具名|JSON参数】标记行继续执行，本轮不要输出总结。）"
         );
         return Ok(RoundRoutingOutcome::NextRound);
     }
-    if (!inputs.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
+    if (!inputs.round_state.tool_runs.is_empty() || !inputs.inherited_tool_evidence.is_empty())
         && !inputs.interrupted
-        && *inputs.completion_reviews >= MAX_COMPLETION_REVIEWS
+        && inputs.round_state.completion_reviews >= MAX_COMPLETION_REVIEWS
     {
-        inputs.full.push_str("\n\n> ⚠️ 任务收尾前已多次要求模型确认完成情况，模型始终未确认任务已全部完成；以上内容已保留，建议检查结果或补充指令继续推进。");
+        inputs.round_state.full.push_str("\n\n> ⚠️ 任务收尾前已多次要求模型确认完成情况，模型始终未确认任务已全部完成；以上内容已保留，建议检查结果或补充指令继续推进。");
     }
     Ok(RoundRoutingOutcome::Finish)
 }
@@ -3990,18 +3950,11 @@ struct RoundRequestInputs<'a> {
     messages: &'a [serde_json::Value],
     conversation_id: &'a str,
     trace_id: &'a str,
-    task_started: std::time::Instant,
+    /// 跨段可变状态（本轮状态由调用方传入，见 DesktopRoundState）
+    round_state: &'a mut DesktopRoundState,
     context_budget: i64,
     model_choice: &'a mut ModelChoice,
     stats: &'a mut ChatRunStats,
-    history_limit: &'a mut usize,
-    context_summary: &'a mut Option<String>,
-    used_fallback: &'a mut bool,
-    placeholder_msg_id: &'a mut Option<String>,
-    tool_runs: &'a [ToolRunItem],
-    full: &'a str,
-    reasoning_full: &'a str,
-    modified_files: &'a [String],
 }
 
 /// 单轮 Provider 往返（纯搬运：原主循环内联代码，行为一致）。
@@ -4019,10 +3972,10 @@ async fn request_round_outcome(
         "round_request_start",
         serde_json::json!({
             "conversation_id": inputs.conversation_id,
-            "round": inputs.tool_runs.len() + 1,
+            "round": inputs.round_state.tool_runs.len() + 1,
             "messages": inputs.messages.len(),
             "est_tokens": estimate_tokens(inputs.messages),
-            "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+            "elapsed_ms": inputs.round_state.task_started.elapsed().as_millis() as i64,
         }),
     );
     if let Ok(conn) = inputs.state.0.lock() {
@@ -4048,16 +4001,16 @@ async fn request_round_outcome(
         inputs.registry,
         &mut *inputs.stats,
         inputs.state,
-        &mut *inputs.placeholder_msg_id,
+        &mut inputs.round_state.placeholder_msg_id,
     )
     .await
     {
         Ok(o) => o,
         // 上下文超限自动恢复：先把将被裁剪的最旧历史用经济模型压成结构化摘要
         // （摘要失败时降级为纯裁剪，不阻塞主流程），再裁剪历史后重试
-        Err(e) if e.kind == ErrorKind::ContextOverflow && *inputs.history_limit > MIN_HISTORY_KEEP => {
-            let old_limit = *inputs.history_limit;
-            *inputs.history_limit = (*inputs.history_limit / 2).max(MIN_HISTORY_KEEP);
+        Err(e) if e.kind == ErrorKind::ContextOverflow && inputs.round_state.history_limit > MIN_HISTORY_KEEP => {
+            let old_limit = inputs.round_state.history_limit;
+            inputs.round_state.history_limit = (inputs.round_state.history_limit / 2).max(MIN_HISTORY_KEEP);
             inputs.stats.retry_count += 1;
             let _ = inputs.app.emit(
                 "chat-context-warning",
@@ -4073,8 +4026,8 @@ async fn request_round_outcome(
                     "conversation_id": inputs.conversation_id,
                     "trigger": "overflow",
                     "old_limit": old_limit,
-                    "new_limit": *inputs.history_limit,
-                    "elapsed_ms": inputs.task_started.elapsed().as_millis() as i64,
+                    "new_limit": inputs.round_state.history_limit,
+                    "elapsed_ms": inputs.round_state.task_started.elapsed().as_millis() as i64,
                 }),
             );
             if let Some(s) = summarize_rolling_history(
@@ -4085,13 +4038,13 @@ async fn request_round_outcome(
                 inputs.conversation_id,
                 inputs.context_budget,
                 old_limit,
-                *inputs.history_limit,
-                inputs.context_summary.take(),
+                inputs.round_state.history_limit,
+                inputs.round_state.context_summary.take(),
                 Some(inputs.cancel),
             )
             .await
             {
-                *inputs.context_summary = Some(s);
+                inputs.round_state.context_summary = Some(s);
             }
             let _ = inputs.app.emit(
                 "chat-stream",
@@ -4100,12 +4053,12 @@ async fn request_round_outcome(
                     run_id: inputs.trace_id.to_string(),
                     delta: format!(
                         "（上下文超长，已{}后重试，保留最近 {} 条）",
-                        if inputs.context_summary.is_some() {
+                        if inputs.round_state.context_summary.is_some() {
                             "压缩早期对话为摘要"
                         } else {
                             "精简对话历史"
                         },
-                        *inputs.history_limit
+                        inputs.round_state.history_limit
                     ),
                 },
             );
@@ -4113,7 +4066,7 @@ async fn request_round_outcome(
             if let Ok(conn) = inputs.state.0.lock() {
                 let _ = conn.execute(
                     "UPDATE conversations SET compact_keep = ?1 WHERE id = ?2",
-                    params![*inputs.history_limit as i64, inputs.conversation_id],
+                    params![inputs.round_state.history_limit as i64, inputs.conversation_id],
                 );
                 // 健康度：压缩计数递增（074 迁移；写入失败静默忽略）
                 crate::agent::context::bump_compress_count(&conn, inputs.conversation_id);
@@ -4125,7 +4078,7 @@ async fn request_round_outcome(
                     serde_json::json!({
                         "trigger": "overflow",
                         "old_limit": old_limit,
-                        "new_limit": *inputs.history_limit,
+                        "new_limit": inputs.round_state.history_limit,
                     }),
                     Some(inputs.trace_id),
                 );
@@ -4134,7 +4087,7 @@ async fn request_round_outcome(
                 "chat-compact",
                 serde_json::json!({
                     "conversation_id": inputs.conversation_id,
-                    "keep": *inputs.history_limit,
+                    "keep": inputs.round_state.history_limit,
                 }),
             );
             return Ok(RoundRequestOutcome::RetryAfterContextCompression);
@@ -4142,10 +4095,10 @@ async fn request_round_outcome(
         Err(e) => {
             // 可恢复性错误（限流/网络/5xx）→ 自动降级到同 Provider 备用模型重试一次
             // （配置类错误 401/400 降级无意义；只降级一次防级联）
-            if e.retryable() && !*inputs.used_fallback {
+            if e.retryable() && !inputs.round_state.used_fallback {
                 let fallback = pick_fallback_model(inputs.state, inputs.model_choice);
                 if let Some(fb) = fallback {
-                    *inputs.used_fallback = true;
+                    inputs.round_state.used_fallback = true;
                     let fb_name = fb.model.clone();
                     *inputs.model_choice = fb;
                     inputs.stats.model = Some(inputs.model_choice.model.clone());
@@ -4164,23 +4117,23 @@ async fn request_round_outcome(
             }
             // 请求失败但任务已有部分成果（文本/工具结果）：先入库保留进展，再返回错误，
             // 避免半途失败丢失全部工作（前端保留已有内容 + 错误提示）
-            if !inputs.full.trim().is_empty() || !inputs.tool_runs.is_empty() {
+            if !inputs.round_state.full.trim().is_empty() || !inputs.round_state.tool_runs.is_empty() {
                 let _ = persist_turn(
                     inputs.state,
                     inputs.conversation_id,
                     inputs.trace_id,
-                    inputs.tool_runs,
-                    inputs.full,
-                    inputs.reasoning_full,
+                    &inputs.round_state.tool_runs,
+                    &inputs.round_state.full,
+                    &inputs.round_state.reasoning_full,
                     &inputs.model_choice.model,
-                    inputs.context_summary,
-                    inputs.modified_files,
+                    &inputs.round_state.context_summary,
+                    &inputs.round_state.modified_files,
                     inputs.app,
                     inputs.stats.input_tokens,
                     inputs.stats.output_tokens,
-                    inputs.task_started.elapsed().as_millis() as i64,
+                    inputs.round_state.task_started.elapsed().as_millis() as i64,
                     true,
-                    inputs.placeholder_msg_id,
+                    &inputs.round_state.placeholder_msg_id,
                 )
                 .await;
             }
@@ -4213,8 +4166,8 @@ struct ToolCallPrepInputs<'a> {
     interrupted: bool,
     tool_calls: &'a [(String, String)],
     plan_mode: bool,
-    plan_confirmed: &'a mut bool,
-    confirmed_plan: &'a mut Option<String>,
+    /// 跨段可变状态（本轮状态由调用方传入，见 DesktopRoundState）
+    round_state: &'a mut DesktopRoundState,
     messages: &'a mut Vec<serde_json::Value>,
     stats: &'a mut ChatRunStats,
 }
@@ -4245,7 +4198,7 @@ async fn prepare_tool_calls(
     }
     if !calls.is_empty() {
         // 计划/审查模式：执行首个工具前必须取得用户对计划的批准
-        if inputs.plan_mode && !*inputs.plan_confirmed {
+        if inputs.plan_mode && !inputs.round_state.plan_confirmed {
             let plan_text = extract_plan_block(inputs.text).unwrap_or_else(|| {
                 crate::agent::tools::strip_tool_calls(inputs.text).trim().to_string()
             });
@@ -4314,8 +4267,8 @@ async fn prepare_tool_calls(
                 inputs.trace_id,
                 &final_plan,
             )?;
-            *inputs.plan_confirmed = true;
-            *inputs.confirmed_plan = Some(final_plan.clone());
+            inputs.round_state.plan_confirmed = true;
+            inputs.round_state.confirmed_plan = Some(final_plan.clone());
             let _ = inputs.app.emit(
                 "chat-plan-resolved",
                 serde_json::json!({
@@ -6374,22 +6327,12 @@ async fn stream_chat_inner(
             conversation_id: &conversation_id,
             trace_id: &trace_id,
             task_goal: &task_goal,
-            task_started: round_state.task_started,
             task_deadline_ms,
-            tool_runs: &round_state.tool_runs,
-            full: &round_state.full,
-            reasoning_full: &round_state.reasoning_full,
             model: &model_choice.model,
-            context_summary: &round_state.context_summary,
-            modified_files: &round_state.modified_files,
-            last_model_text: &round_state.last_model_text,
             ledger_base_n,
-            prev_ledger: &mut round_state.prev_ledger,
-            placeholder_msg_id: &round_state.placeholder_msg_id,
-            max_tool_rounds: round_state.max_tool_rounds,
-            budget_extensions: round_state.budget_extensions,
             input_tokens: stats.input_tokens,
             output_tokens: stats.output_tokens,
+            round_state: &mut round_state,
         })
         .await?
         {
@@ -6426,7 +6369,6 @@ async fn stream_chat_inner(
             provider: &provider,
             conversation_id: &conversation_id,
             trace_id: &trace_id,
-            task_started: round_state.task_started,
             project_path: &project_path,
             context_budget,
             model_choice: &model_choice,
@@ -6434,24 +6376,9 @@ async fn stream_chat_inner(
             system_prompt_core: &system_prompt_core,
             workflow: &workflow,
             protocol: &protocol,
-            images: &round_state.images,
             task_goal: &task_goal,
-            tool_runs: &round_state.tool_runs,
-            last_model_text: &round_state.last_model_text,
             ledger_base_n,
-            prev_ledger: &round_state.prev_ledger,
-            confirmed_plan: &round_state.confirmed_plan,
-            continuation_text: &round_state.continuation_text,
-            seam_count: &mut round_state.seam_count,
-            history_limit: &mut round_state.history_limit,
-            context_summary: &mut round_state.context_summary,
-            images_attached: &mut round_state.images_attached,
-            continuation_reasoning_only: &mut round_state.continuation_reasoning_only,
-            correction_text: &mut round_state.correction_text,
-            correction_hint: &mut round_state.correction_hint,
-            merged_instructions: &mut round_state.merged_instructions,
-            tools_since_progress: &mut round_state.tools_since_progress,
-            replan_instruction: &mut round_state.replan_instruction,
+            round_state: &mut round_state,
         })
         .await?
         {
@@ -6468,8 +6395,7 @@ async fn stream_chat_inner(
             messages: &messages,
             model_choice: &mut model_choice,
             stats: &mut *stats,
-            used_fallback: &mut round_state.used_fallback,
-            budget_warned: &mut round_state.budget_warned,
+            round_state: &mut round_state,
         })?;
 
         let outcome = match request_round_outcome(RoundRequestInputs {
@@ -6484,18 +6410,10 @@ async fn stream_chat_inner(
             messages: &messages,
             conversation_id: &conversation_id,
             trace_id: &trace_id,
-            task_started: round_state.task_started,
             context_budget,
             model_choice: &mut model_choice,
             stats: &mut *stats,
-            history_limit: &mut round_state.history_limit,
-            context_summary: &mut round_state.context_summary,
-            used_fallback: &mut round_state.used_fallback,
-            placeholder_msg_id: &mut round_state.placeholder_msg_id,
-            tool_runs: &round_state.tool_runs,
-            full: &round_state.full,
-            reasoning_full: &round_state.reasoning_full,
-            modified_files: &round_state.modified_files,
+            round_state: &mut round_state,
         })
         .await?
         {
@@ -6536,10 +6454,9 @@ async fn stream_chat_inner(
             interrupted: outcome.interrupted,
             tool_calls: &outcome.tool_calls,
             plan_mode,
-            plan_confirmed: &mut round_state.plan_confirmed,
-            confirmed_plan: &mut round_state.confirmed_plan,
             messages: &mut messages,
             stats: &mut *stats,
+            round_state: &mut round_state,
         })
         .await?
         {
@@ -6595,11 +6512,9 @@ async fn stream_chat_inner(
             trace_id: &trace_id,
             text: &text,
             plan_mode,
-            plan_confirmed: &mut round_state.plan_confirmed,
-            confirmed_plan: &mut round_state.confirmed_plan,
             messages: &mut messages,
             stats: &mut *stats,
-            completion_reviews: round_state.completion_reviews,
+            round_state: &mut round_state,
         })
         .await?
         {
@@ -6617,19 +6532,10 @@ async fn stream_chat_inner(
             truncated: outcome.truncated,
             interrupted: outcome.interrupted,
             tool_calls: &outcome.tool_calls,
-            tool_runs: &round_state.tool_runs,
             inherited_tool_evidence: &inherited_tool_evidence,
             goal_contract: &goal_contract,
             executor: &mut kernel_executor,
-            full: &mut round_state.full,
-            correction_text: &mut round_state.correction_text,
-            correction_hint: &mut round_state.correction_hint,
-            continuation_text: &mut round_state.continuation_text,
-            continuation_reasoning_only: &mut round_state.continuation_reasoning_only,
-            pending_action_corrections: &mut round_state.pending_action_corrections,
-            action_commitment_corrections: &mut round_state.action_commitment_corrections,
-            unverified_claim_corrections: &mut round_state.unverified_claim_corrections,
-            completion_reviews: &mut round_state.completion_reviews,
+            round_state: &mut round_state,
         })? {
             RoundRoutingOutcome::NextRound => continue 'outer,
             RoundRoutingOutcome::Finish => break 'outer,
@@ -6818,10 +6724,8 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
             &conversation_id,
             OpenLedgerInputs {
                 task_goal: &task_goal,
-                tool_runs: &round_state.tool_runs,
-                last_model_text: &round_state.last_model_text,
+                round_state: &mut *round_state,
                 ledger_base_n,
-                prev_ledger: &mut round_state.prev_ledger,
             },
         )?;
     }
