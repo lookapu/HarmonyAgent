@@ -903,5 +903,22 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 
 **第 7 步的启动条件（不变）**：必须有真实桌面验收窗口，跑「多轮工具任务 + 中途停止 + 断点续跑」；自动化层面仍无行为快照（第 19 节已实测否掉 Tauri 测试替身路线），因此第 7 步不在这里开工。
 
+### 第 7 步的三刀（2026-09-18，按用户决定「先改签名、后合段」执行）
+
+合段本身（搬控制流 + 切 `run(port)`）仍按上面的启动条件等桌面窗口；先把它的**前置**做掉：状态收进一个结构体、各段改收 `&mut DesktopRoundState`。这样合段时只剩搬控制流与引入 `RoundOutcome`，不必再动签名。
+
+**第一刀：`DesktopRoundState`（`98a7927`）**：散落在循环外的 35 个可变局部量收进一个结构体，搬入点放在**准备段末尾**按所有权移动（`let mut round_state = DesktopRoundState { full, tool_runs, … }`），因此没有任何初始化表达式被提前或重排；循环体与收尾改写为 `round_state.X`（97 处）。保真度可机械验证：把 diff 里的 `round_state.` 归一化掉后，整个改动只剩「新增结构体 + `let mut X` → `let X`（局部量改为被移动而非被改）+ 多余 `&mut`/简写形式」，无一行逻辑变化。主循环 324 行（构造前后不变，状态搬家不缩行）。
+
+**第二刀：工具路径改收状态（`ab7c3f3`）**：`enforce_tool_budget_limit` / `flush_tool_batch` / `apply_tool_batch` / `run_one_tool` / `run_tool_calls` 的输入结构各砍 9–13 个字段，调用点同步收敛，净 **−106 行**。
+
+- **踩到的坑（值得记住）**：`stats` 与执行器若作为 `&mut` 字段留在状态结构里，结构就变成**不变**（`&'a mut Struct<'a>`），一次长借用会与循环里的所有读取冲突——编译报「cannot use X because it was mutably borrowed」且指向的是**更早**的读取行。修法是把两者移出结构（它们本来也不是「轮状态」：执行器是共享的运行循环持有者、`stats` 是运行累加器），作为显式参数传递。**教训：状态结构只装所有权数据；`&mut` 字段会让整结构不变，进而把借用期拉到与结构生命周期同长。**
+
+**第三刀：轮后与收尾改收状态（`7c9479c`）**：`handle_round_outcome` 与 `finalize_run` 各砍 8/9 个字段，净 **−37 行**。
+
+- **踩到的坑（复用纪律）**：`finalize_run` 是**解构式**输入（`let FinalizeInputs { … } = inputs;`），必须只解构块内收敛字段——第一版脚本在**整个函数体**上做「按字段名删行」，把恰好以状态字段名开头的**调用实参**也删了（`persist_turn` 的 `full`、`OpenLedgerInputs` 的 `tool_runs`/`last_model_text`/`prev_ledger`）。编译器报的是「参数个数不对」而不是语法错，容易误判方向。**教训：按字段名收敛只能作用于结构定义与解构块，不能作用于函数体。**
+
+**当前状态**：主循环 324 → **305 行**；已转换 7 个函数（工具路径 5 + 轮后/收尾 2）。**剩余 7 个**：`adjudicate_pre_round`（PreRoundInputs）、`run_plan_gate`（PlanGateInputs）、`enforce_budget_gate`（BudgetGateInputs）、`assemble_round`（AssembleInputs，34 字段）、`route_round_outcome`（RoundRoutingInputs）、`request_round_outcome`（RoundRequestInputs）、`prepare_tool_calls`（ToolCallPrepInputs）。三刀各自验证：后端库 1,107 / 0 失败 / 9 忽略、两组 crash E2E 各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过（macOS 本机）。
+
+
 
 
