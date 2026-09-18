@@ -8,7 +8,7 @@
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,103 通过、9 忽略（总计 1,112） |
+| 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,104 通过、9 忽略（总计 1,113） |
 | Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test worker_crash_e2e` | 3 通过 |
 | Tool Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test tool_worker_crash_e2e` | 3 通过 |
 | 前端测试 | `npm test` | 14 文件、127 通过 |
@@ -19,7 +19,7 @@
 | clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警；macOS + Windows 本机均通过——8 条只在 Windows 触发的机械类告警已修复，基线未调整） |
 | Windows 质量矩阵 | GitHub Actions `quality.yml`（macOS + Windows） | v2.2.0 发版时全绿（此前 16 处 Windows 失败已清零） |
 
-平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,103/9 差异来自平台门控用例集，不是回归）。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
+平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,104/9 差异来自平台门控用例集，不是回归）。拉取 `57c9626` 后 macOS 侧复验：后端库 1,104/9、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
 
 ## 2. 写入门禁覆盖矩阵
 
