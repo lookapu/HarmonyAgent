@@ -9244,10 +9244,33 @@ class Service extends BaseService implements Loadable, Disposable {}
             Some("component"),
             None,
         );
+        // 游标必须带**当前**索引版本：守卫会比较 `structure_meta.revision`
+        // （见 `query_persisted_symbols_keyset_at`），硬编码版本号会在写入/守卫升级后失效——
+        // 本测试此前固定写 0，守卫上线后一直失败（它被 `#[ignore]`，CI 不跑）。按协议取一次
+        // 第一页的游标解出真实版本，只替换定位字段，保留「直接跳到深页」的测量意图。
+        let (_, _, first_page_cursor) = query_persisted_symbols_keyset_at(
+            &root,
+            &data_dir,
+            "",
+            None,
+            Some("component"),
+            None,
+            None,
+            50,
+            cursor_filter_hash,
+        )
+        .unwrap()
+        .unwrap();
+        let live_revision = decode_structure_cursor(
+            &first_page_cursor.expect("第一页之后应返回游标"),
+            cursor_filter_hash,
+        )
+        .unwrap()
+        .index_revision;
         let cursor = StructureCursor {
             version: 1,
             filter_hash: cursor_filter_hash,
-            index_revision: 0,
+            index_revision: live_revision,
             total_matches: requested,
             exact_match: false,
             file: format!("{cursor_shard}/file_{cursor_index:07}.ets"),
