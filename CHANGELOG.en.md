@@ -7,6 +7,30 @@
 
 ---
 
+## Unreleased — Huawei Docs Fetch Rebuilt, API 26 Data Backfilled, SemVer API Versions
+
+**Fixed: the API knowledge base had been idle since Huawei retired the `.md` endpoint**
+
+- Version diffs and API reference bodies relied on appending `.md` to any doc page URL for Markdown. Huawei retired that endpoint (404 site-wide), so both feeds silently returned nothing. Content now comes from the doc center's own `documentPortal/getDocumentById` API (HTML), with anchor/table extraction and an HTML→Markdown conversion added on top.
+- Release discovery now walks by content: `apidiff-2600` only lists the release/beta sub-entries (26.0.0 Release lives at `apidiff-7003`), so kit diff pages are collected level by level (max 3). The same walk also backfilled pages the old discovery had missed for older versions.
+- Reference fallback slugs were re-verified against live objectIds (13 camelCase slugs were 404).
+- Fixed a fetch regression: the HTML→Markdown tag branch treated a relative offset as absolute and looped forever.
+
+**Versions: SemVer from 26.0.0 on**
+
+- Huawei switched API versions to `X.Y.Z` from 26.0.0 (replacing `X.Y.Z(N)`), ordered `26.0.0 > 6.1.1(24) > … > 5.0.5(17)`. Parsing, comparison and format validation now live in one place, used by project parsing, SDK alignment, API availability, the create-project `sdk_version` check and `sdk-pkg.json` combination.
+- Prompt and built-in knowledge entries follow: `6.1.1(24)` before 26.0.0, `26.0.0` from 26.0.0 on; `26.0.0(26)` is rejected as an invented combination.
+
+**Data**
+
+- The shipped seed database was re-crawled: 14 versions / 1,014 pages / 47,410 changes; `api_docs` grew from 46,700 to 91,556 rows, with 26.0.0 going from 5,781 to 11,489 (including the full `apidiff-7003` set added by the August 29 Release).
+- Seed import learned to ship same-version refreshes: when a version label keeps its name but gains rows (26.0.0 Beta → Release), the new rows are backfilled additively, keyed on a seed revision.
+
+**Compatibility and rollback**
+
+- No database migration and no schema change; the seed database is a local build artifact (not tracked), so roll back with the sibling `knowledge.db.bak`.
+- The old `.md` fetch path is gone; if Huawei restores that endpoint, revert this fetch rework.
+
 ## v2.2.0 — Structure-First Navigation, Multi-Language Write Gates, and a Trustworthy Execution Kernel (2026-09-15)
 
 Positioning: moving from "the agent can edit code" to "edits are language-checked and verifiable" — writes pass language-level gates, host operations carry revocable approval receipts, and resource isolation has an explicit support matrix. 259 commits.

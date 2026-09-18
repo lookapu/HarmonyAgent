@@ -1,4 +1,4 @@
-# 当前状态单页（2026-09-17）
+# 当前状态单页（2026-09-18）
 
 > 本页是**当前能力的唯一状态口径**：某项能力「实现了没有、证据在哪、边界是什么」看这里。
 > 历史过程与逐批发现记录在 [主线实现与验收盘点](./MAINLINE_AUDIT_2026-09-14.md)，两者不重复：
@@ -9,6 +9,8 @@
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
 | 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,107 通过、9 忽略（总计 1,116） |
+| 后端库回归（Windows 本机，2026-09-18 本轮） | 同上 | 1,120 通过、0 失败、8 忽略（较 1,102 基线 +18 条新用例：正文接口/HTML→Markdown、SemVer 解析、种子同版本补入） |
+| 鸿蒙文档抓取联网验证（Windows 本机，2026-09-18 本轮） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `harmony_api_diff::tests::e2e_fetch_parse_store_search` 与 `harmony_api_ref::tests::e2e_fetch_parse_store_query` | 通过（实抓 26.0.0 Release 的 `js-apidiff-basicserviceskit-7003` 与 `@ohos.batteryInfo` 参考页，解析→入库→查回全链路；见盘点 §39） |
 | Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test worker_crash_e2e` | 3 通过 |
 | Tool Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test tool_worker_crash_e2e` | 3 通过 |
 | 前端测试 | `npm test` | 14 文件、127 通过 |
@@ -19,7 +21,7 @@
 | clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警；macOS + Windows 本机均通过——8 条只在 Windows 触发的机械类告警已修复，基线未调整） |
 | Windows 质量矩阵 | GitHub Actions `quality.yml`（macOS + Windows） | v2.2.0 发版时全绿（此前 16 处 Windows 失败已清零） |
 
-平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,107/9 差异来自平台门控用例集，不是回归）。拉取 `57c9626` 后 macOS 侧复验：后端库 1,107/9、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
+平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,107/9 差异来自平台门控用例集，不是回归）。拉取 `57c9626` 后 macOS 侧复验：后端库 1,107/9、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过。2026-09-18 本轮（文档抓取重建 + SemVer，`4026150`）**只在 Windows 本机验证**：后端库 1,120/0、两个联网 e2e 通过、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过；**macOS 侧待 CI 复核**（该批未触动平台相关代码，但仍以 CI 结论为准）。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
 
 ## 2. 写入门禁覆盖矩阵
 
@@ -68,6 +70,7 @@
 | Host Capability Broker | 已实现核心契约 | 审批凭据 v4（与能力无关）、执行期 fail-closed 复核、自描述撤销判定、影响契约进审批卡片与审计、13 个变更类能力的显式契约清单 | 效果证据（安装版本/设备出现）需真机；**闭环逻辑**（签发→复核→撤销→停止失效）已用生产函数跑回归，仅 guards/execute 的**实际调用点**因需 Tauri AppHandle 未覆盖 |
 | OTA 审批安全链 | 核心链路实现 | 只读副本 + 内容摘要绑定 + 固定 argv + 持久撤销 + 发布前复验 | 真实打包/签名/升级未验；不支持工具版本矩阵 |
 | HarmonyOS 工程与设备闭环 | 大量实现 | 工程/SDK/构建/部署/UI/性能工具与固定录制场景、沙箱边界 smoke | 真机/模拟器版本矩阵（离线、重连、安装冲突、恢复）未验 |
+| 鸿蒙官方文档 / API 知识库 | 已重建抓取链路 + 数据补齐 | `services/harmony_doc_api.rs`（`getDocumentById` 正文接口 + HTML 表格/锚点/HTML→Markdown）；版本 diff 与 API 参考两条链路联网 e2e 通过；种子库 14 版本 / 1,014 页 / 47,410 条、`api_docs` 91,556 行 | 参考正文覆盖 308/705 个模块（未命中集中在 `@hms.*`、ArkTS 内置，靠 slug 猜测无法命中，需改为枚举文档目录树）；`refresh_api_db` 依赖华为接口形态，站点再变即失效 |
 | 评测与发行 | 基础设施已建 | 固定 25-ID 清单、eval harness、release workflow、更新签名配置 | HarmonyBench 50/100+、真实 SWE 报告、平台签名/SBOM/provenance/新机验收未做 |
 | 文档与 CI 门禁 | 全绿 | `check-docs.py`（数量/链接/CI 接口）、`check-warnings.py`（clippy 基线 57） | Windows/Linux 目标本机未编译验证（仅代码审查） |
 

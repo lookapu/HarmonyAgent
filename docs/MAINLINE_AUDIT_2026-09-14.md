@@ -727,3 +727,21 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 
 
+
+## 39. 文档抓取链路重建、26.0.0 SemVer 与 API 26 数据补齐（2026-09-18）
+
+第 39 批（`4026150`）：华为文档站在 2026-09 下线了「任意页面 URL 追加 `.md` 返回 Markdown 原文」的端点（全站 404）——API 知识库的**版本 diff** 与**API 参考正文**两条抓取链路因此整体失效（版本页抓取失败后静默 return，全量刷新等于空跑）。本批重建链路、补齐 26.0.0 Release 数据、并把版本号体系升级到语义化版本。
+
+- **正文接口**：新增 `services/harmony_doc_api.rs`——文档中心自己的 `documentPortal/getDocumentById`（POST JSON：`catalogName`/`objectId`/`language`）取 HTML 正文；附锚点提取、表格提取（`<br>`→换行、实体解码）与 HTML→Markdown 转换（`h1`→`#`、`h4`→`##`，与既有 `extract_members` 的约定一致），两条链路共用。
+- **版本清单改为按内容下钻**：版本页（`2600`）本身不含 apidiff 链接，索引页 `apidiff-2600` 只列 release/beta 子入口（26.0.0 Release=`apidiff-7003`、Beta2=`7002`、Beta1=`7001`），子入口页才列 Kit diff。原实现只认「页内含 `js-apidiff` 的索引页」，对三层结构直接判失败；现改为「含 Kit diff 链接即收、只含 apidiff 链接则继续下钻」的 BFS（≤3 层，起始候选含 `apidiff-{slug}`/`apidiff-{digit}`/`from-{digit}-{stage}`/数字子版本），并对同一批候选做 4 并发探测。
+- **解析器共用**：diff 表格行解析拆出 `entry_from_cells`，HTML 表格优先、Markdown 表格保留为回退；顺手修掉 `module_from_dts` 对 `*.d.ets` 不剥离、产出 `@arkts.collections.d.ets` 这类伪模块名的问题。
+- **抓取回归（真实缺陷）**：HTML→Markdown 的标签分支把 `html[i..].find('>')` 的**相对偏移**当绝对下标用，`i` 不前进 → 转换死循环。单测先卡死 60s+ 才暴露；已修并补回归单测（相邻闭合标签 + 表格 + 上标）。
+- **slug 兜底表逐条校正**：13 个 camelCase slug 在线上已 404，逐个对照实际 objectId 改为全小写连写（`js-apis-bundlemanager`、`js-apis-abilityaccessctrl`、`js-apis-data-relationalstore`…），NFC 两个特殊（`js-apis-nfctag`、`js-apis-cardemulation`）。
+- **版本号 SemVer**：官方从 API 26.0.0 起把版本号改为 `X.Y.Z`（取代 `X.Y.Z(N)`），次序 `26.0.0 > 6.1.1(24) > … > 5.0.5(17)`。新增 `services/sdk_version.rs`（解析/比较/格式校验/`sdk-pkg.json` 组合），四个解析点（`harmony.rs`、`harmony_env.rs`、`harmony_model.rs`、`sdk_api.rs`）与新建工程校验、系统提示词、两条内置知识条目全部改走它；`26.0.0(26)` 判为臆造组合。
+- **种子库**：`full_fetch --seed --diff-only` 重抓 → 14 版本 / 1,014 页 / 写入 47,410 行 / 0 错误 / 62.3s；`api_docs` 46,700 → **91,556**，其中 26.0.0 由 5,781 → **11,489**（Beta1 5,218 + Beta2 6,063 + Release 208；Release 官方索引页只列 21 个 Kit，已核对线上页表行数）。旧的发现逻辑对历史版本也漏页（如 6.1.1(24) 1,255 → 2,488、6.1.0(23) 3,006 → 5,982）。API 参考正文 `--ref-only`：310 页 / 7,436 成员 / 398 个候选未命中（集中在 `@hms.*` 与 ArkTS 内置）。
+- **同版本刷新下发**：种子导入原先只按 `version_label` 集合判断（missing==0 就跳过），同版本被重抓（26.0.0 Beta→Release）时老用户永远拿不到新增条目；改为叠加种子修订号（取种子库 `last_refreshed_at` 存到主库 `seeded_revision`）触发**只增不删**的 `INSERT OR IGNORE` 补入，并补两条种子测试（缺版本补入 / 同版本刷新补入且可重入）。
+- **未决策**：种子库体积由 257MB 增至 **465MB**（其中 `api_docs_embeddings` 358MB ≈ 4KB/行），随绿色版分发；压缩选项（page_size=8192、或对历史版本不装向量）留给用户决定。
+
+**验证**（Windows 本机）：后端库 1,120 通过 / 0 失败 / 8 忽略（基线 1,102/8）；两个联网 e2e（diff、ref）实抓真实页面通过；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过（service 模块数 58→60 已同步 README/ARCHITECTURE 双语）。
+
+**未闭环**：macOS 侧本批提交待 CI 复核（未触动平台相关代码，但仍以 CI 为准）；参考正文的候选发现仍需枚举文档目录树才能覆盖 `@hms.*`；种子库体积压缩待定。
