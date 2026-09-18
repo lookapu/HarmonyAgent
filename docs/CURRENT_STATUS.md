@@ -8,11 +8,12 @@
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,127 通过、10 忽略（总计 1,137；macOS 本机，2026-09-18 拉取 `6c8fbbe` 后实测） |
+| 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,141 通过、11 忽略（总计 1,152；macOS 本机，2026-09-18 拉取 `be2172c` 后实测） |
 | 后端库回归（Windows 本机，2026-09-18 本轮） | 同上 | 1,125 通过、0 失败、9 忽略（较 1,102 基线 +23 条新用例：正文接口/HTML→Markdown、目录树查表、SemVer 解析、种子修订号补入） |
 | 鸿蒙文档抓取联网验证（Windows 本机，2026-09-18 本轮） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `harmony_api_diff::tests::e2e_fetch_parse_store_search`、`harmony_api_ref::tests::e2e_fetch_parse_store_query` 与 `harmony_api_ref::tests::e2e_catalog_index_resolves_hms_modules` | 通过（实抓 26.0.0 Release 的 `js-apidiff-basicserviceskit-7003`、`@ohos.batteryInfo` 参考页，目录树命中 `@hms.*`；解析→入库→查回全链路；见盘点 §45/§46） |
 | Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test worker_crash_e2e` | 3 通过 |
 | Tool Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test tool_worker_crash_e2e` | 3 通过 |
+| 忽略用例集（`-- --ignored`，macOS 本机 2026-09-18） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` | **9 通过 / 2 失败**：三个联网 e2e（文档 diff / 参考 / 目录树）与两处规模基线通过，`agent::sandbox::tests::macos_native_backend_writes_workspace_but_denies_external_file_read`（workspace_write 未建立边界）与 `services::symbol_index::tests::million_scale_sqlite_graph_baseline`（测试内游标硬编码 `index_revision: 0`，与守卫读到的 `structure_meta.revision` 不符 → 属测试陈旧）稳定失败。**两个用例都标了 `#[ignore]`，CI 不跑**，故不影响门禁 |
 | 后端库回归（Windows 本机，设备预览批次 2026-09-18） | 同上 | 1,139 通过 / 0 失败 / 10 忽略（较上一批 +10 条预览用例：引擎参数、帧格式、WebSocket 帧解析、产物定位、默认页解析） |
 | 设备预览端到端（Windows 本机，2026-09-18） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `previewer::tests::e2e_preview_frames_from_real_engine`（需 `DEVECO_PREVIEW_E2E_PROJECT`） | 通过（真实工程 → 构建 → 起引擎 → 取回 JPEG 帧；见盘点 §54） |
 | 前端测试 | `npm test` | 15 文件、133 通过（含 `previewPanel.test.tsx`：启动/停止、帧渲染、失败不静默、卸载解绑与停引擎） |
