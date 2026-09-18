@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,127 通过、10 忽略（总计 1,137；macOS 本机，2026-09-18 拉取 `6c8fbbe` 后实测） |
 | 后端库回归（Windows 本机，2026-09-18 本轮） | 同上 | 1,120 通过、0 失败、8 忽略（较 1,102 基线 +18 条新用例：正文接口/HTML→Markdown、SemVer 解析、种子同版本补入） |
-| 鸿蒙文档抓取联网验证（Windows 本机，2026-09-18 本轮） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `harmony_api_diff::tests::e2e_fetch_parse_store_search` 与 `harmony_api_ref::tests::e2e_fetch_parse_store_query` | 通过（实抓 26.0.0 Release 的 `js-apidiff-basicserviceskit-7003` 与 `@ohos.batteryInfo` 参考页，解析→入库→查回全链路；见盘点 §39） |
+| 鸿蒙文档抓取联网验证（Windows 本机，2026-09-18 本轮） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `harmony_api_diff::tests::e2e_fetch_parse_store_search` 与 `harmony_api_ref::tests::e2e_fetch_parse_store_query` | 通过（实抓 26.0.0 Release 的 `js-apidiff-basicserviceskit-7003` 与 `@ohos.batteryInfo` 参考页，解析→入库→查回全链路；见盘点 §45） |
 | Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test worker_crash_e2e` | 3 通过 |
 | Tool Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test tool_worker_crash_e2e` | 3 通过 |
 | 前端测试 | `npm test` | 14 文件、127 通过 |

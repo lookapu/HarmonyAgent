@@ -859,7 +859,7 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 
 - **控制流改枚举**：段内 4 处控制流（2 处 `continue`、2 处 `break`）换成 `ToolExecOutcome { Next, Skip, Stop }`；`exhausted = true;` 与 `break` 两步仍在调用方完成，保持原「置位后立刻 break」顺序。调用方 `Skip => continue` 仍跳过原来的每轮计数与检查点（与原 `continue` 语义一致）。
 - **搬运保真度**：用脚本按大括号配平搬运，复用第 38 节第 1 条的纪律（**不改缩进**），搬完逐行 diff 原内联代码，**除 13 处已记录的改动外逐字相同**（4 处控制流、2 处 `exhausted = true;` 删除、7 处借用修正）。
-- **一处封口（新例外，已记录）**：输入从局部变量改为引用后，原代码里对局部 `String`/`Vec`/配置对象的 ~180 处 `&x` 变成多余借用，clippy 报 `needless_borrow`；逐处改写会把这 445 行搬运的 diff 淹没（直接违反第 1 条纪律），按值传入又要在每次工具调用克隆 `messages`/`opts`。故在 `run_one_tool` 上收口 `#[allow(clippy::needless_borrow)]`，**仅覆盖本函数**，待第 7 步合段时随借用一并清理。
+- **一处封口（新例外，已记录）**：输入从局部变量改为引用后，原代码里对局部 `String`/`Vec`/配置对象的 ~180 处 `&x` 变成多余借用，clippy 报 `needless_borrow`；逐处改写会把这 445 行搬运的 diff 淹没（直接违反第 1 条纪律），按值传入又要在每次工具调用克隆 `messages`/`opts`。故当时在 `run_one_tool` 上收口 `#[allow(clippy::needless_borrow)]`，仅覆盖该函数。**该例外已在签名改造完成后清掉**（`7e57278`）：三处例外一并撤除，由 clippy 自己的 machine-applicable 建议完成 177 处借用删除，基线仍 57/57。
 - **度量**：主循环体 957 → **557 行**；循环内 `.emit(` 6 → **0**、`.0.lock()` 3 → 1；`break`/`continue` 34 → 18 → **20**（第十刀净减 2：段内 4 处换枚举，调用方新增 `continue`/`break` 各 1）。
 - **验证**：同第九刀（后端库 1,105 / 9 忽略、两组 crash E2E、0 告警、57/57、`check-docs` 通过）。
 
@@ -899,7 +899,7 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 
 **当前进度快照（截至第十二刀，2026-09-18）**：**第 2 步的「按段搬」全部完成**——主循环体 2,107（旧口径）/ 1,978（更正口径）→ **324 行**；`stream_chat_inner` 2,143 → **2,050 行**；循环内 `.emit(` 32 → 0、`.0.lock()` 约 22 → 1、`break`/`continue` 34 → 11。**剩下的只有第 7 步「合段」**：`RoundOutcome`（替代剩余 11 处控制流）+ `DesktopRoundState`（跨段可变状态）+ 切换 `run(port)`。
 
-尚未还的欠账：`run_one_tool` / `run_tool_calls` / `finalize_run` 三处 `#[allow(clippy::needless_borrow)]`（都是「输入改为引用后原 `&x` 成多余借用」的同一原因），随第 7 步重写一并清理。
+~~三处 `#[allow(clippy::needless_borrow)]` 欠账~~ **已清**（`7e57278`）：签名改造完成后不再需要「保留原借用写法以逐行比对」，例外撤除、由 clippy 建议完成借用删除，`check-warnings.py` 仍 57/57（无任何 `needless_borrow` 例外）。
 
 **第 7 步的启动条件（不变）**：必须有真实桌面验收窗口，跑「多轮工具任务 + 中途停止 + 断点续跑」；自动化层面仍无行为快照（第 19 节已实测否掉 Tauri 测试替身路线），因此第 7 步不在这里开工。
 
@@ -928,7 +928,21 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 
 **第 7 步签名改造完成后的总体状态**：主循环体 2,107（旧口径）/ 1,978（更正口径）→ **258 行**；14 个函数统一收 `&mut DesktopRoundState`；状态结构只装所有权数据（`stats`/执行器作为显式参数，见第二刀的坑）。**剩下的只有合段本身**：`RoundOutcome`（替代剩余 11 处控制流）+ 把 round 体搬进 `desktop_round` + 切换 `run(port)`——仍按第 19 节第 3 条等真实桌面验收窗口，因为切换后旧路径不再存在、自动化层面又没有行为快照。
 
-**欠账**（合段时一并清）：3 处 `#[allow(clippy::needless_borrow)]`（`run_one_tool` / `run_tool_calls` / `finalize_run`）；Windows 侧与 CI 尚未确认这四刀。
+**欠账已清**（`7e57278`）：3 处 `#[allow(clippy::needless_borrow)]` 已随签名改造完成后撤除，借用写法回到普通形态。**仍未覆盖**：Windows 侧与 CI 尚未确认这四刀 + 清理提交。
+
+### 合段（第 7 步最后一步）的执行清单——签名前置就绪后
+
+前置已全部就位（状态结构 + 14 个段函数统一签名 + 借用欠账已清）。有桌面验收窗口时按下面顺序做，一次可完成：
+
+1. **定义 `RoundOutcome`**：替代循环体内剩余 **11 处** `break`/`continue`。分两类：①`continue 'outer`（进入下一轮）→ `ContinueRound`；②`break 'outer`（任务结束）→ `Finish`。工具轮内的 4 处控制流已由 `ToolExecOutcome` 表达，不必再包一层。
+2. **把 round 体搬进 `async fn desktop_round(...)`**：入参为 `&mut DesktopRoundState` + 只读上下文（`app`/`state`/`cancel`/`registry`/`client`/`opts`/`messages`/`project_path`/`path_hints`/`project_id`/`model_choice`/`protocol`/`provider`/`trace_id`/`conversation_id`/`goal_contract`/`execution_budget`/`plan_mode`/`text`/`task_goal`/`task_deadline_ms`/`inherited_evidence` 等，**建议再收一个 `DesktopRoundContext<'a>` 只读结构**，否则入参会越过 clippy 的 7 个上限并需要新的 allow）。搬法沿用既有纪律：按大括号配平、**不改缩进**、搬完逐行 diff 证明零逻辑改动。
+3. **切换调用点**：`stream_chat_inner` 里 `'outer: loop { ... }` 变成 `loop { match desktop_round(...).await? { ContinueRound => continue, Finish => break } }`；`finalize_run` 仍在循环后调用一次（保持原顺序：验收 + 账本在任务结束后执行）。
+4. **切 `run(port)`**：实现 `DesktopIoPort`（事件 emit / 账本读写 / 检查点），把 `desktop_round` 内对 `app.emit`、`state.0.lock()`、`persist_desktop_executor_checkpoint` 的调用改为端口方法；届时 `DesktopRoundState` 的只读上下文可并入端口，`RoundOutcome` 不变。
+5. **桌面验收（缺一不可）**：多轮工具任务 + 中途停止 + 断点续跑，观察事件序列、账本推进、预算计数与终态；另外确认 `chat-tool-start/done` 顺序、停止后账本保留、续跑继承编号。
+6. **每步验证组合**：`cargo test --lib`（当前 1,127/0/10）+ 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py`；第 4 步之后额外跑一次真实打包（签名/更新清单）确认端口化没影响 Tauri 侧装配。
+
+**风险与回退**：第 2 步是纯搬运（可逐行 diff 证伪），第 3、4 步改变运行路径——建议**分成两个提交**（先合段、后切端口），一旦桌面验收发现行为差异，能分别定位是「搬错」还是「端口化丢了副作用」。
+
 
 
 
