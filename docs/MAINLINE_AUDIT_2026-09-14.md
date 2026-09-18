@@ -881,3 +881,26 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **验证**（Windows 本机）：后端库 **1,139 通过 / 0 失败 / 10 忽略**（+10 条预览用例）；`previewer::tests::e2e_preview_frames_from_real_engine` 对着真实工程跑通（构建 → 起引擎 → 取回 JPEG，断言 SOI 与尺寸）；clippy 57/57；前端 lint 0 / tsc 0 / **15 文件 133 测试**（新增 `previewPanel.test.tsx` 6 项：无工程不可启动、启动用工程路径调后端且帧渲染成图、启动后按钮切停止且停止会释放引擎、启动失败显示后端原因且仍可重试、取帧中断错误也显示、卸载时解绑订阅并停引擎）/ 构建与体积门禁（Home 697.0KB）/ UI 状态门禁 / `check-docs.py` 全过（services 61、IPC 303 已同步四份文档）。
 
 **未闭环**：交互事件回传（点击/滑动如何送回引擎）未做；热重载与多设备档切换未验；macOS 侧全流程未验；**面板与后端的真实串联未在运行中的应用里点过**——面板逻辑由组件测试（api 打桩）覆盖、后端链路由 e2e 覆盖，两者之间的接线（一行 prop 传递）只有静态检查，首次桌面验收时需确认。
+
+## 48. macOS 原生沙箱：profile 在本机建不起边界，且能力探测是假阳性（2026-09-18）
+
+跑忽略用例集时发现 `agent::sandbox::tests::macos_native_backend_writes_workspace_but_denies_external_file_read` 失败（`workspace_write: 未建立所声明的文件边界`）。**用户在普通 Terminal（不在 agent 沙箱内）复现，同样失败**，因此不是受限环境问题，改用探针二分定位。
+
+**实测事实（本机 macOS 15.7.9 arm64，逐条 sandbox-exec 探针）**
+
+| 探针 | 结果 |
+| --- | --- |
+| `(allow default)(deny file-write*)` + `/usr/bin/true` | 正常（exit 0） |
+| `(deny default)(allow process*)(allow file-read*)(allow file-write*)(allow sysctl-read)(allow file-ioctl)(allow mach-lookup)` | 正常 |
+| `(deny default)` + **路径限定**读（`/System`,`/usr`,`/bin`,`/sbin`,workspace）+ 写白名单 | **子进程 SIGABRT（134）**，连 `/usr/bin/true`、`/bin/echo` 都起不来，且无 stderr（写 stderr 也被拒） |
+| 同上再逐条加 `/private/var`、`/Library`、`/private/etc`、dyld 缓存、`/dev/null`、全局 `file-read-metadata`、`file-map-executable`、`mach-lookup`、`ipc-posix-shm*` | **仍全部 SIGABRT**（单条都不够） |
+| 读**全局**放行 + 写白名单（workspace）+ `mach-lookup` | 正常 |
+| `(allow default)(deny file-write*)(allow file-write* (subpath workspace))` + `(deny file-read* (subpath external))` | **正常**：允许的操作可跑，外部读被拒（`cat` 退出 1） |
+
+**结论**：本机 macOS 上「`deny default` + 路径限定允许」的写法**无法让子进程启动**；而「允许默认 + 按路径拒绝 + 写白名单」可用。项目当前用的正是前一种（`build_macos_profile`），所以 macOS 原生沙箱实际不可用。
+
+**连带缺陷（更严重）**：`NativeSandboxKind::probe_program` 对 macOS 用 `(version 1) (allow default)` 探测，这条宽松 profile 在本机**成功**，于是 `available=true`——**能力探测是假阳性**：声称可用，启用后任何命令都会终止。真正的边界 smoke（`verify_native_sandbox_boundary`，`filesystem_smoke_v1`）能发现它，但那是诊断命令，其单测又标了 `#[ignore]`，CI 不跑。
+
+**处置建议（待定，属沙箱域的设计决策）**：①最小且严格更安全的一步——把 macOS 探测改成用**真实 profile** 跑一条最小命令，使本机如实返回 `available=false` + 原因（fail-closed，不再假阳性）；②再决定是否重设计 profile（allow-default + 拒绝清单会**弱化读隔离**：默认放行读、只拒指定路径，需权衡）；③在该决定落地前，macOS 侧不应声称原生沙箱可用。
+
+**验证**：本机 `cargo test --lib` 1,141 通过 / 0 失败 / 11 忽略；`check-warnings.py` 57/57；`check-docs.py` 通过。
