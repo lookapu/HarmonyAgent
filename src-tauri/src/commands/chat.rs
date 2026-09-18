@@ -459,21 +459,69 @@ fn plan_mode_enabled(opts: &ChatOptions) -> bool {
     opts.plan_mode.unwrap_or(false)
 }
 
-/// 从模型输出中提取【PLAN】...【/PLAN】计划块内容（去除标记本身）。
-/// 兼容全角【】与半角[]两种写法；未命中返回 None。
+/// 计划正文的最小字数（见 `is_real_plan_body`）
+const MIN_PLAN_CHARS: usize = 24;
+
+/// 从模型输出中提取计划块内容（去除标记本身）。
+/// 兼容全角【】与半角[]两种写法。
+///
+/// 取**内容最长**的合法块，而不是第一对标记——本机实测事故：模型引用系统提示原文时
+/// 复制了提示里那句"先用`【PLAN】...【/PLAN】`标记输出…"，于是第一条标记对的内容是
+/// 三个点"..."，而真正的计划在后面几千字处。取第一对就把"..."当成了计划，
+/// 确认弹窗里只有一个空框（用户只能驳回重做）。
+///
+/// 占位内容（纯标点/省略号）一律不算计划块。
 fn extract_plan_block(text: &str) -> Option<String> {
-    let pairs = [("【PLAN】", "【/PLAN】"), ("[PLAN]", "[/PLAN]")];
-    for (open, close) in pairs {
-        if let (Some(s), Some(e)) = (text.find(open), text.find(close)) {
-            if e > s + open.len() {
-                let body = text[s + open.len()..e].trim();
-                if !body.is_empty() {
-                    return Some(body.to_string());
-                }
+    let mut best: Option<String> = None;
+    for (open, close) in [("【PLAN】", "【/PLAN】"), ("[PLAN]", "[/PLAN]")] {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(open) {
+            let s = from + rel;
+            let body_start = s + open.len();
+            let Some(close_rel) = text[body_start..].find(close) else { break };
+            let body = text[body_start..body_start + close_rel].trim();
+            from = body_start;
+            if !is_real_plan_body(body, MIN_PLAN_CHARS) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|b| body.chars().count() > b.chars().count()) {
+                best = Some(body.to_string());
             }
         }
     }
-    None
+    best
+}
+
+/// 计划正文是否"真的是一份计划"：长度达标，且不是纯标点/省略号这类占位符。
+///
+/// 阈值取 24 字（实义字符至少一半）：一句话的闲聊（如"本轮先输出计划块。"）不该被当成
+/// 计划摆给用户确认；短到不足以是计划的，宁可让模型重出一份（有次数上限兜底）。
+fn is_real_plan_body(body: &str, min_chars: usize) -> bool {
+    if body.chars().count() < min_chars {
+        return false;
+    }
+    // 实义字符（汉字/字母/数字）不足以排除 "..."、"（略）"、"…" 这类占位
+    body.chars().filter(|c| c.is_alphanumeric()).count() >= min_chars / 2
+}
+
+/// 解析确认弹窗要展示的计划正文：优先取合法计划块，其次取去掉工具标记与计划标记的正文。
+/// 两者都算不上计划（空/占位符）时返回 None，由调用方决定"纠正重出"还是"给兜底说明"——
+/// 绝不能把 "..." 直接摆给用户确认（本机实测：弹窗只有一个空框）。
+fn resolve_plan_text(text: &str) -> Option<String> {
+    let candidate = match extract_plan_block(text) {
+        Some(body) => body,
+        None => {
+            // 兜底正文里要把计划标记本身也去掉：否则 "【PLAN】...【/PLAN】" 这种纯标记行
+            // 会因为"PLAN"这几个字母被算成实义字符而冒充成计划
+            let mut stripped = crate::agent::tools::strip_tool_calls(text);
+            for marker in ["【PLAN】", "【/PLAN】", "[PLAN]", "[/PLAN]"] {
+                stripped = stripped.replace(marker, " ");
+            }
+            stripped.trim().to_string()
+        }
+    };
+    let candidate = candidate.trim();
+    is_real_plan_body(candidate, MIN_PLAN_CHARS).then(|| candidate.to_string())
 }
 
 /// 用户对计划的审查结果
@@ -1978,6 +2026,63 @@ fn completed_conversation_root(app: &AppHandle, conversation_id: &str) -> Option
 }
 
 #[cfg(test)]
+mod plan_block_extraction_tests {
+    use super::{extract_plan_block, resolve_plan_text};
+
+    /// 事故原文（节选）：模型引用系统提示，把提示里的标记模板原样抄了出来，
+    /// 于是**第一对**标记之间的内容是"..."，真正的计划在后面几千字处。
+    const INCIDENT: &str = "用户明确要求「用计划模式」。\n\n\
+        按系统提示的硬约束：\n\n\
+        > \"在调用任何工具之前，你必须先用【PLAN】...【/PLAN】标记输出一份任务计划，包含：1. 目标与范围…\"\n\n\
+        所以本轮我必须：1. 只输出【PLAN】...【/PLAN】块 2. 不调用任何【TOOL】标记\n\n\
+        【PLAN】\n\n## 1. 目标与范围\n\n将两个超大 ArkTS 文件按职责拆分，保持对外 import 契约零破坏。\n\n\
+        ## 2. 步骤\n\n- 0.1 精确切片读 Breakpoint.ets 顶部 1-100 行\n- 0.2 读 FeihuaGamePage.ets 入口段\n\n\
+        ## 3. 涉及文件\n\n- core/breakpoint/Breakpoint.ets\n\n## 4. 风险与回滚\n\ngit revert 一条命令回滚。\n\n\
+        【/PLAN】\n\n✅ 计划已列出，等待用户审查。本轮仅输出【PLAN】...【/PLAN】块，未调用任何【TOOL】标记。";
+
+    #[test]
+    fn picks_the_longest_block_not_the_echoed_placeholder() {
+        let plan = extract_plan_block(INCIDENT).expect("应取到真正的计划块");
+        assert!(plan.contains("## 1. 目标与范围"), "拿到的是正文而不是占位：{plan}");
+        assert!(!plan.starts_with("..."), "不能把提示里的省略号当成计划：{plan}");
+        assert!(plan.len() > 100);
+    }
+
+    #[test]
+    fn placeholder_only_text_is_not_a_plan() {
+        // 模型只抄了模板，没写正文 → 不能弹确认框
+        assert!(resolve_plan_text("本轮先输出【PLAN】...【/PLAN】块。").is_none());
+        assert!(resolve_plan_text("【PLAN】\n...\n【/PLAN】").is_none());
+        assert!(resolve_plan_text("【PLAN】（略）【/PLAN】").is_none());
+        // 空文本同理
+        assert!(resolve_plan_text("   ").is_none());
+    }
+
+    #[test]
+    fn half_width_markers_and_fallback_text_still_work() {
+        let half = "[PLAN]\n## 计划\n1. 读文件\n2. 拆模块\n3. 跑构建验证\n[/PLAN]";
+        assert!(extract_plan_block(half).is_some_and(|p| p.contains("拆模块")));
+        // 没有任何标记但有实质正文：走"去工具标记后的正文"兜底
+        let plain = "## 计划\n1. 先读两个文件的关键段\n2. 按职责拆成四个子文件\n3. 每次改完跑构建冒烟";
+        assert!(resolve_plan_text(plain).is_some_and(|p| p.contains("拆成四个子文件")));
+    }
+
+    #[test]
+    fn resolve_prefers_block_body_over_surrounding_prose() {
+        let text = "开场白写了很多字但都不是计划，只是在复述用户的要求而已。\n\n【PLAN】\n## 计划\n1. 先读两个文件的关键段落\n2. 按职责拆成四个子文件\n3. 每次改完跑一次构建冒烟\n【/PLAN】\n\n结尾又啰嗦了几句总结。";
+        let plan = resolve_plan_text(text).expect("应取计划块");
+        assert!(plan.starts_with("## 计划"), "{plan}");
+        assert!(!plan.contains("开场白"), "{plan}");
+    }
+
+    #[test]
+    fn one_short_sentence_is_not_a_plan() {
+        // 一两句闲聊（含把标记模板抄一遍）不足以当计划：宁可让模型重出，也不摆给用户确认
+        assert!(resolve_plan_text("本轮先输出计划块，然后等待用户批准。").is_none());
+    }
+}
+
+#[cfg(test)]
 mod idle_semantic_schedule_tests {
     use super::eligible_idle_semantic_root;
 
@@ -3153,12 +3258,37 @@ async fn run_plan_gate(inputs: PlanGateInputs<'_>) -> Result<PlanGateOutcome, Ch
     // 计划模式：模型遵守两阶段约定只输出了【PLAN】块（无工具标记）时同样提交用户审批，
     // 否则会因无工具调用直接结束任务，计划卡永远不会出现（两阶段计划的关键闭环）
     if inputs.plan_mode && !inputs.round_state.plan_confirmed && !inputs.text.trim().is_empty() {
-        let plan_text = extract_plan_block(inputs.text)
-            .unwrap_or_else(|| crate::agent::tools::strip_tool_calls(inputs.text).trim().to_string());
-        let plan_text = if plan_text.trim().is_empty() {
-            inputs.text.trim().to_string()
-        } else {
-            plan_text
+        // 计划正文取不到可用内容时**不要弹确认框**：弹出来只有"..."，用户只能驳回，
+        // 白等一轮还以为是软件坏了（本机实际反馈）。改为注入纠正让模型重出计划，
+        // 纠正次数用尽仍拿不到就如实收尾说明，不再打扰用户。
+        let Some(plan_text) = resolve_plan_text(inputs.text) else {
+            const MAX_PLAN_REDRAFTS: usize = 2;
+            if inputs.round_state.plan_redrafts < MAX_PLAN_REDRAFTS {
+                inputs.round_state.plan_redrafts += 1;
+                inputs.round_state.correction_text =
+                    crate::agent::tools::strip_tool_calls(inputs.text).trim().to_string();
+                inputs.round_state.correction_hint = "（系统未能在你的回复里找到有效的计划正文：计划块内容为空或是占位符（如\"...\"）。请重新输出一份**完整可执行的计划**，用【PLAN】开头、【/PLAN】结尾把计划正文包起来，标记各占一行；本轮不要调用任何工具。）".to_string();
+                crate::utils::logger::log_event(
+                    "plan_redraft_requested",
+                    serde_json::json!({
+                        "conversation_id": inputs.conversation_id,
+                        "attempt": inputs.round_state.plan_redrafts,
+                        "text_chars": inputs.text.chars().count(),
+                    }),
+                );
+                return Ok(PlanGateOutcome::NextRound);
+            }
+            inputs.round_state.full.push_str(
+                "\n\n> ⚠️ 计划模式未能取得可用的计划正文（模型没有输出有效的计划块），已停止本次任务。请重新发送指令，或换一个模型再试。",
+            );
+            crate::utils::logger::log_event(
+                "plan_redraft_exhausted",
+                serde_json::json!({
+                    "conversation_id": inputs.conversation_id,
+                    "text_chars": inputs.text.chars().count(),
+                }),
+            );
+            return Ok(PlanGateOutcome::Finish);
         };
         let review = request_plan_review(
             inputs.app,
@@ -3205,7 +3335,7 @@ async fn run_plan_gate(inputs: PlanGateInputs<'_>) -> Result<PlanGateOutcome, Ch
             inputs.messages.push(serde_json::json!({
                 "role": "user",
                 "content": format!(
-                    "用户驳回了该计划，意见如下：\n{}\n\n请根据意见调整方案，并重新输出【PLAN】...【/PLAN】计划（仍然不要在本轮调用工具）。",
+                    "用户驳回了该计划，意见如下：\n{}\n\n请根据意见调整方案，并重新输出计划（单独一行【PLAN】、正文、单独一行【/PLAN】收尾；仍然不要在本轮调用工具）。",
                     if review.feedback.trim().is_empty() { "（无补充意见）" } else { review.feedback.trim() }
                 ),
             }));
@@ -4277,14 +4407,10 @@ async fn prepare_tool_calls(
     if !calls.is_empty() {
         // 计划/审查模式：执行首个工具前必须取得用户对计划的批准
         if inputs.plan_mode && !inputs.round_state.plan_confirmed {
-            let plan_text = extract_plan_block(inputs.text).unwrap_or_else(|| {
-                crate::agent::tools::strip_tool_calls(inputs.text).trim().to_string()
-            });
-            let plan_text = if plan_text.is_empty() {
-                "（模型未输出显式计划，将直接执行以下工具调用）".to_string()
-            } else {
-                plan_text
-            };
+            // 这一路是"模型没给计划就直接调工具"（违反两阶段约定）：取不到计划正文时
+            // 用一句如实的兜底说明，别把 "..." 摆给用户确认
+            let plan_text = resolve_plan_text(inputs.text)
+                .unwrap_or_else(|| "（模型未输出显式计划，将直接执行以下工具调用）".to_string());
             let review = request_plan_review(
                 inputs.app,
                 inputs.plan_review,
@@ -4331,7 +4457,7 @@ async fn prepare_tool_calls(
                 inputs.messages.push(serde_json::json!({
                     "role": "user",
                     "content": format!(
-                        "用户驳回了该计划，意见如下：\n{}\n\n请根据意见调整方案，并重新输出【PLAN】...【/PLAN】计划（仍然不要在本轮调用工具）。",
+                        "用户驳回了该计划，意见如下：\n{}\n\n请根据意见调整方案，并重新输出计划（单独一行【PLAN】、正文、单独一行【/PLAN】收尾；仍然不要在本轮调用工具）。",
                         if review.feedback.trim().is_empty() { "（无补充意见）" } else { review.feedback.trim() }
                     ),
                 }));
@@ -4618,6 +4744,8 @@ struct DesktopRoundState {
     merged_instructions: Vec<String>,
     /// 本次任务是否已经过用户批准计划
     plan_confirmed: bool,
+    /// 计划正文不可用时的重出次数（计划模式下模型只给了占位符时的纠正计数）
+    plan_redrafts: usize,
     /// 已批准计划全文（批准后每轮注入，防长任务偏离目标）
     confirmed_plan: Option<String>,
     /// 距上次进度对照以来的工具执行数（每 3 个注入一次对照汇报）
@@ -6166,11 +6294,15 @@ async fn stream_chat_inner(
         }
         *p = format!("{p}\n\n{}", goal_contract.directive());
         if plan_mode_enabled(&opts) {
+            // 标记写法刻意见分开写（不写成"标记A...标记B"连排）：那种模板会被模型原文引用，
+            // 而引文里的"..."恰好构成一个合法标记对 → 提取到空计划（本机实测事故，
+            // 确认弹窗只有一个空框）。两个标记必须各自单独出现。
             *p = format!(
                 "{p}\n\n## 计划/审查模式（当前已开启）\n\
-                 在调用任何工具之前，你必须先用【PLAN】...【/PLAN】标记输出一份任务计划，包含：\n\
-                 1. 目标与范围；2. 将要执行的步骤（编号）；3. 预计涉及/修改的文件；4. 风险与回滚点。\n\
-                 输出计划后立即结束本轮（不要在同一轮输出【TOOL】标记）。系统会把计划提交给用户审查；\n\
+                 在调用任何工具之前，你必须先输出一份任务计划。写法：单独一行写 `【PLAN】`，\n\
+                 下面写计划正文，最后单独一行写 `【/PLAN】` 收尾（两个标记都必须独立成行，中间不要留空块）。\n\
+                 计划正文必须包含：1. 目标与范围；2. 将要执行的步骤（编号）；3. 预计涉及/修改的文件；4. 风险与回滚点。\n\
+                 输出计划后立即结束本轮（不要在同一轮输出【TOOL】标记）。系统会把计划正文提交给用户审查；\n\
                  用户批准后你再开始调用工具执行。若用户驳回并给出修改意见，你必须根据意见重新输出计划。\n\
                  批准后系统会在每一轮向你重申计划内容，执行过程中必须严格对照计划，不得擅自偏离或扩大范围。",
             );
@@ -6363,6 +6495,7 @@ async fn stream_chat_inner(
         correction_hint,
         merged_instructions,
         plan_confirmed,
+        plan_redrafts: 0,
         confirmed_plan,
         tools_since_progress,
         seam_count,

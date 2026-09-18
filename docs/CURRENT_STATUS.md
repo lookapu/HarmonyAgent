@@ -16,6 +16,7 @@
 | 忽略用例集（`-- --ignored`，macOS 本机 2026-09-18） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` | **9 通过 / 2 失败**：三个联网 e2e（文档 diff / 参考 / 目录树）与两处规模基线通过，`agent::sandbox::tests::macos_native_backend_writes_workspace_but_denies_external_file_read`（workspace_write 未建立边界）与 `services::symbol_index::tests::million_scale_sqlite_graph_baseline`（测试内游标硬编码 `index_revision: 0`，与守卫读到的 `structure_meta.revision` 不符 → 属测试陈旧）稳定失败。**两个用例都标了 `#[ignore]`，CI 不跑**，故不影响门禁 |
 | 后端库回归（Windows 本机，设备预览批次 2026-09-18） | 同上 | 1,139 通过 / 0 失败 / 10 忽略（较上一批 +10 条预览用例：引擎参数、帧格式、WebSocket 帧解析、产物定位、默认页解析） |
 | 后端库回归（Windows 本机，复读防护 + 清单双向化批次 2026-09-18） | 同上 | 1,161 通过 / 0 失败 / 10 忽略（较上批 +10 条：`services::repetition` 8 条含事故原文回归、轮级路由"复读优先于截断/中断"1 条、`todo::render_hint` 2 条）；`frontend_backend_contract` 2 通过（新增 `insert_queued_now`）；clippy 57/57、`check-docs.py`、`check-ui-states.py`、前端 133 用例与体积门禁均通过 |
+| 后端库回归（Windows 本机，计划模式空弹窗批次 2026-09-18） | 同上 | 1,166 通过 / 0 失败 / 10 忽略（较上批 +5 条：`plan_block_extraction_tests` 覆盖"取最长块而非被引用的占位符""纯占位符/纯标记不算计划""半角标记与无标记兜底""短闲聊不算计划"）；clippy 57/57、`check-docs.py`、`check-ui-states.py`、前端 133 用例与体积门禁均通过 |
 | 设备预览端到端（Windows 本机，2026-09-18） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `previewer::tests::e2e_preview_frames_from_real_engine`（需 `DEVECO_PREVIEW_E2E_PROJECT`） | 通过（真实工程 → 构建 → 起引擎 → 取回 JPEG 帧；见盘点 §54） |
 | 前端测试 | `npm test` | 15 文件、133 通过（含 `previewPanel.test.tsx`：启动/停止、帧渲染、失败不静默、卸载解绑与停引擎） |
 | 前端 ↔ 后端名字一致性 | `cargo test --manifest-path src-tauri/Cargo.toml --test frontend_backend_contract` | 2 通过（前端 `invoke*` 调到的命令必须已在 `lib.rs` 注册、`listen*` 订阅的事件必须在 Rust 源码里有同名字面量；当前 307 个命令 / 55 个事件全部对得上。测试只设下限防空过，不钉具体数字） |
@@ -65,6 +66,7 @@
 | 能力域 | 状态 | 主要证据 | 边界（未做/未验） |
 | --- | --- | --- | --- |
 | 目标与计划驱动 | 已实现核心链路 | `commands/chat.rs` 的 GoalContract、`activate_approved_plan`、计划继承；前端计划确认卡与测试 | 真实模型「计划→多步→中断→交付」完整轨迹未验 |
+| 计划/审查模式的确认环节 | 已实现（含事故修复） | 计划正文提取改为**取内容最长的合法块**并拒收占位符（`extract_plan_block`/`resolve_plan_text`，5 条用例含事故原文）；拿不到可用正文时**不弹确认框**，改为注入纠正让模型重出（上限 2 次，用尽如实收尾，`plan_redrafts`）；系统提示不再把标记写成"标记A...标记B"连排（那种模板会被模型原文引用，引文里的省略号恰好构成合法标记对 → 提取到空计划，本机实测：弹窗只有一个空框，用户只能驳回重做）；计划待确认/已批准两张卡片从悬浮层改为**内嵌消息流**（悬浮层盖住输入区，想边看对话边审计划时无处下手，本机实际反馈） | 阈值 24 字是"够不够当计划"的启发式，极短但合法的计划会被要求重出；卡片内嵌后靠消息流贴底滚动带出来，用户若手动上滑需自己滚回底部（会话列表的"待确认"角标仍在） |
 | 长会话恢复与执行治理 | 基础实现 + 本机回归充分 | `agent/kernel_executor.rs` 检查点/安全点、预算继承、两组 crash E2E | 桌面 IO adapter 未统一：迁移方案与两次更正见 [headless 驱动文档 §17/§18/§19](./HEADLESS_AGENT_DRIVER.md)（主循环体 305 行（原 2,107，口径见驱动文档 §20 的更正说明）、循环内 `.emit(` **0** 处、`.0.lock()` 1 处；**已实测否掉「先补 Tauri 测试替身」**：mock 需全仓 AppHandle 泛型化、代价更大；正确顺序是先抽取端口、再用假端口加行为快照，抽取期间靠编译器+回归+手动桌面验收把关）；**按段搬运已全部完成**，第 7 步进行中（状态已收进 `DesktopRoundState`，7/14 个段函数改收 `&mut DesktopRoundState`；剩余合段本身需桌面验收窗口）；真实长任务未验 |
 | Headless Agent | 核心实现 | `HeadlessIoPort` 交给 `KernelIoRunLoop::run`；评测契约与桩端到端 | 真实 trial 的 manifest/trajectory/成本未产出 |
 | 大仓索引可达性 | 已实现 + 历史基准 | `services/symbol_index.rs` 全库目录/延迟解析/watcher；`docs/INDEX_SCALE_BASELINE.md` | 真实混合仓全量收敛耗时、Recall@k、前台 P95 未测 |

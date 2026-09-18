@@ -5127,6 +5127,96 @@ export default function Home() {
                               agents={agentRuns}
                             />
                           )}
+                          {/* 已批准任务计划（执行中锚点，可收起）：同样内嵌消息流，与待确认卡片同处一线 */}
+                          {approvedPlan && (
+                            <details className="rounded-xl border border-[var(--success)]/40 bg-[var(--bg-elevated)] animate-fade-in-up overflow-hidden" open={false}>
+                              <summary className="flex items-center gap-2 px-4 py-2 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
+                                <Icon name="check" size={13} className="text-[var(--success)] shrink-0" />
+                                <span className="text-[12px] font-semibold text-[var(--success)]">{t('home.approvedPlanTitle')}</span>
+                                <span className="text-[11px] text-[var(--text-muted)]">{t('home.approvedPlanHint')}</span>
+                              </summary>
+                              <div className="max-h-48 overflow-y-auto px-4 pb-3 border-t border-[var(--border)]">
+                                <Markdown>{approvedPlan.plan}</Markdown>
+                              </div>
+                            </details>
+                          )}
+
+                          {/* 计划/审查模式：计划待确认。内嵌在消息流里而不是悬浮层——悬浮层会盖住输入区，
+                                        用户想边看对话/切会话边审计划时无处下手（本机实际反馈） */}
+                          {pendingPlan && (
+                              <div className="rounded-2xl border border-[var(--accent)]/40 bg-[var(--bg-elevated)] animate-fade-in-up overflow-hidden">
+                                <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[var(--border)] bg-[var(--accent-soft)]">
+                                  <span className="w-2 h-2 rounded-full bg-[var(--accent)] animate-pulse" />
+                                  <span className="text-[13px] font-semibold text-[var(--accent)]">{t('home.planReviewTitle')}</span>
+                                  <span className="text-[11px] text-[var(--text-muted)] ml-auto">{t('home.planReviewHint')}</span>
+                                  <button
+                                    onClick={() => setPlanEditing((v) => !v)}
+                                    className="ml-1 flex items-center gap-1 px-2 h-6 rounded-md text-[11px] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                                    title={t('home.planEdit')}
+                                  >
+                                    <Icon name={planEditing ? 'check' : 'edit'} size={11} />
+                                    {planEditing ? t('home.planEditDone') : t('home.planEdit')}
+                                  </button>
+                                </div>
+                                {planEditing ? (
+                                  <div className="max-h-56 overflow-y-auto px-4 py-3">
+                                    <textarea
+                                      value={planDraft}
+                                      onChange={(e) => setPlanDraft(e.target.value)}
+                                      rows={10}
+                                      spellCheck={false}
+                                      className="w-full rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 py-2 text-[12px] leading-relaxed outline-none resize-y font-mono placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
+                                    />
+                                  </div>
+                                ) : (
+                                  <div className="max-h-56 overflow-y-auto px-4 py-3">
+                                    <Markdown>{pendingPlan.plan}</Markdown>
+                                  </div>
+                                )}
+                                <div className="px-4 pb-3">
+                                  <textarea
+                                    value={planFeedback}
+                                    onChange={(e) => setPlanFeedback(e.target.value)}
+                                    placeholder={t('home.planFeedbackPlaceholder')}
+                                    rows={2}
+                                    className="w-full rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 py-2 text-[12px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
+                                  />
+                                </div>
+                                <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-card)]">
+                                  <button
+                                    onClick={() => {
+                                      // 驳回：若编辑过计划，把修订稿作为意见一并反馈
+                                      const edited = planDraft.trim()
+                                      const original = pendingPlan.plan.trim()
+                                      const extra = edited && edited !== original ? `用户修改后的计划草案：\n${edited}` : ''
+                                      const fb = [planFeedback.trim(), extra].filter(Boolean).join('\n\n')
+                                      void resolvePlanReview(pendingPlan.requestId, false, fb || undefined)
+                                      setPlanFeedback('')
+                                    }}
+                                    className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--warning)] hover:border-[var(--warning)]/50 transition-colors"
+                                  >
+                                    {t('home.planReject')}
+                                  </button>
+                                  <Button
+                                    variant="primary"
+                                    size="md"
+                                    icon="check"
+                                    onClick={() => {
+                                      // 批准：编辑稿作为结构化最终计划提交，后端持久化并在恢复时复用。
+                                      const edited = planDraft.trim()
+                                      const original = pendingPlan.plan.trim()
+                                      const fb = planFeedback.trim()
+                                      const revised = edited && edited !== original ? edited : undefined
+                                      void resolvePlanReview(pendingPlan.requestId, true, fb || undefined, revised)
+                                      setPlanFeedback('')
+                                    }}
+                                  >
+                                    {t('home.planApprove')}
+                                  </Button>
+                                </div>
+                              </div>
+                          )}
+    
                           {/* 任务进度清单（计划卡）：工具联动推进，任务结束后保留展示 */}
                           {plan && <PlanCard plan={plan} />}
                           {/* 任务清单（todo_write 工具，可收起，实时进度）：内嵌消息流，任务结束后保留展示，避免小窗口悬浮遮挡 */}
@@ -6803,99 +6893,6 @@ export default function Home() {
           onReject={handleReject}
           busy={trustBusy}
         />
-      )}
-
-      {/* ============ 计划/审查模式：任务计划确认卡片 ============ */}
-      {pendingPlan && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[var(--app-z-overlay)] w-[640px] max-w-[calc(100vw-2rem)]">
-          <div className="rounded-2xl border border-[var(--accent)]/40 bg-[var(--bg-elevated)]/95 backdrop-blur shadow-2xl shadow-black/20 animate-modal-in overflow-hidden">
-            <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[var(--border)] bg-[var(--accent-soft)]">
-              <span className="w-2 h-2 rounded-full bg-[var(--accent)] animate-pulse" />
-              <span className="text-[13px] font-semibold text-[var(--accent)]">{t('home.planReviewTitle')}</span>
-              <span className="text-[11px] text-[var(--text-muted)] ml-auto">{t('home.planReviewHint')}</span>
-              <button
-                onClick={() => setPlanEditing((v) => !v)}
-                className="ml-1 flex items-center gap-1 px-2 h-6 rounded-md text-[11px] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
-                title={t('home.planEdit')}
-              >
-                <Icon name={planEditing ? 'check' : 'edit'} size={11} />
-                {planEditing ? t('home.planEditDone') : t('home.planEdit')}
-              </button>
-            </div>
-            {planEditing ? (
-              <div className="max-h-56 overflow-y-auto px-4 py-3">
-                <textarea
-                  value={planDraft}
-                  onChange={(e) => setPlanDraft(e.target.value)}
-                  rows={10}
-                  spellCheck={false}
-                  className="w-full rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 py-2 text-[12px] leading-relaxed outline-none resize-y font-mono placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
-                />
-              </div>
-            ) : (
-              <div className="max-h-56 overflow-y-auto px-4 py-3">
-                <Markdown>{pendingPlan.plan}</Markdown>
-              </div>
-            )}
-            <div className="px-4 pb-3">
-              <textarea
-                value={planFeedback}
-                onChange={(e) => setPlanFeedback(e.target.value)}
-                placeholder={t('home.planFeedbackPlaceholder')}
-                rows={2}
-                className="w-full rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 py-2 text-[12px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
-              />
-            </div>
-            <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-card)]">
-              <button
-                onClick={() => {
-                  // 驳回：若编辑过计划，把修订稿作为意见一并反馈
-                  const edited = planDraft.trim()
-                  const original = pendingPlan.plan.trim()
-                  const extra = edited && edited !== original ? `用户修改后的计划草案：\n${edited}` : ''
-                  const fb = [planFeedback.trim(), extra].filter(Boolean).join('\n\n')
-                  void resolvePlanReview(pendingPlan.requestId, false, fb || undefined)
-                  setPlanFeedback('')
-                }}
-                className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--warning)] hover:border-[var(--warning)]/50 transition-colors"
-              >
-                {t('home.planReject')}
-              </button>
-              <Button
-                variant="primary"
-                size="md"
-                icon="check"
-                onClick={() => {
-                  // 批准：编辑稿作为结构化最终计划提交，后端持久化并在恢复时复用。
-                  const edited = planDraft.trim()
-                  const original = pendingPlan.plan.trim()
-                  const fb = planFeedback.trim()
-                  const revised = edited && edited !== original ? edited : undefined
-                  void resolvePlanReview(pendingPlan.requestId, true, fb || undefined, revised)
-                  setPlanFeedback('')
-                }}
-              >
-                {t('home.planApprove')}
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ============ 已批准任务计划（执行中锚点，可收起） ============ */}
-      {approvedPlan && approvedPlan.conversationId === currentConversation?.id && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[var(--app-z-overlay)] w-[640px] max-w-[calc(100vw-2rem)]">
-          <details className="rounded-xl border border-[var(--success)]/40 bg-[var(--bg-elevated)]/95 backdrop-blur shadow-lg shadow-black/10 animate-modal-in overflow-hidden" open={false}>
-            <summary className="flex items-center gap-2 px-4 py-2 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
-              <Icon name="check" size={13} className="text-[var(--success)] shrink-0" />
-              <span className="text-[12px] font-semibold text-[var(--success)]">{t('home.approvedPlanTitle')}</span>
-              <span className="text-[11px] text-[var(--text-muted)]">{t('home.approvedPlanHint')}</span>
-            </summary>
-            <div className="max-h-48 overflow-y-auto px-4 pb-3 border-t border-[var(--border)]">
-              <Markdown>{approvedPlan.plan}</Markdown>
-            </div>
-          </details>
-        </div>
       )}
 
       {/* ============ Agent 诊断引导卡片（签名/SDK/依赖等需用户操作） ============ */}
