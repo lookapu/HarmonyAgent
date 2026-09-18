@@ -1669,11 +1669,7 @@ fn scalar_string(value: Option<&serde_json::Value>) -> Option<String> {
 }
 
 fn parse_api_level(value: &str) -> Option<i64> {
-    if let Some(start) = value.find('(') {
-        let end = value[start + 1..].find(')')? + start + 1;
-        return value[start + 1..end].trim().parse().ok();
-    }
-    value.trim().parse().ok()
+    crate::services::sdk_version::api_level(value)
 }
 
 fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {

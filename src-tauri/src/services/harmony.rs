@@ -199,12 +199,7 @@ pub fn project_summary(
 }
 
 fn parse_api_version(s: &str) -> Option<i64> {
-    if let Some(start) = s.find('(') {
-        if let Some(end) = s.find(')') {
-            return s[start + 1..end].trim().parse().ok();
-        }
-    }
-    s.trim().parse().ok()
+    crate::services::sdk_version::api_level(s)
 }
 
 /// 优先在推导的产物目录查找 hap，找不到则递归全工程（跳过依赖目录）。

@@ -78,14 +78,14 @@ const ENTRIES: &[KnowledgeEntry] = &[
     KnowledgeEntry {
         keywords: &["compatiblesdkversion", "00306042", "00303038", "schema validate", "configuration error", "specification limit", "targetsdkversion", "compilesdkversion", "api level is 10", "must be string"],
         title: "SDK 版本字段格式（hvigor 00306042/00303038）",
-        cause: "HarmonyOS 配置模式下 API 10 及以上，build-profile.json5 的 compileSdkVersion/compatibleSdkVersion/targetSdkVersion 必须写成 \"平台版本(API版本)\" 字符串（如 \"6.1.1(24)\"），裸数字 \"24\" 不合法；API 9 及以下可写数字。",
-        fix: "写法：\"compatibleSdkVersion\": \"6.1.1(24)\"、\"targetSdkVersion\": \"6.1.1(24)\"。平台版本与 API 必须取自本机实际安装的 SDK：读 DEVECO_SDK_HOME（或 DevEco Studio 内置 SDK）下 default/sdk-pkg.json 的 platformVersion 与 apiVersion 字段，二者必须匹配（如 5.0.0 平台=API 12、6.1.1 平台=API 24），禁止臆造组合。",
+        cause: "HarmonyOS 配置模式下 API 10 及以上，build-profile.json5 的 compileSdkVersion/compatibleSdkVersion/targetSdkVersion 必须写成 \"平台版本(API版本)\" 字符串（如 \"6.1.1(24)\"），裸数字 \"24\" 不合法；API 9 及以下可写数字。从 API 26.0.0 起版本号改为语义化版本（X.Y.Z），直接写 \"26.0.0\"，不再带括号后缀。",
+        fix: "写法：API 26.0.0 之前 \"compatibleSdkVersion\": \"6.1.1(24)\"、\"targetSdkVersion\": \"6.1.1(24)\"；26.0.0 起 \"compatibleSdkVersion\": \"26.0.0\"。版本值必须取自本机实际安装的 SDK：读 DEVECO_SDK_HOME（或 DevEco Studio 内置 SDK）下 default/sdk-pkg.json 的 platformVersion 与 apiVersion 字段（旧格式二者组合为 平台版本(API版本)，如 5.0.0 平台=API 12、6.1.1 平台=API 24；新格式平台版本即版本号，如 26.0.0），禁止臆造组合。",
     },
     KnowledgeEntry {
         keywords: &["00303083", "do not match", "platform version", "configured sdk version does not exist", "sdk version"],
         title: "平台版本与 API 版本不匹配（hvigor 00303083）",
-        cause: "compatibleSdkVersion 的 \"平台版本(API版本)\" 组合在本机 SDK 中不存在（如 \"5.0.0(24)\"：5.0.0 平台只对应 API 12），hvigor 报 00303083 Configuration Error。",
-        fix: "读 DEVECO_SDK_HOME 或 DevEco Studio 内置 SDK 的 default/sdk-pkg.json，用其中的 platformVersion 与 apiVersion 组合（如 \"6.1.1(24)\"）；也可直接参考本机可正常构建的鸿蒙工程（如 D:\\DevEcoStudioProjects 下用户工程的 build-profile.json5 配置）。",
+        cause: "compatibleSdkVersion 的 \"平台版本(API版本)\" 组合在本机 SDK 中不存在（如 \"5.0.0(24)\"：5.0.0 平台只对应 API 12），hvigor 报 00303083 Configuration Error。API 26.0.0 起版本号为语义化版本，写成 \"26.0.0\" 即可，写成 \"26.0.0(26)\" 同样不合法。",
+        fix: "读 DEVECO_SDK_HOME 或 DevEco Studio 内置 SDK 的 default/sdk-pkg.json，用其中的 platformVersion 与 apiVersion 组合（旧格式如 \"6.1.1(24)\"；26.0.0 起直接用 platformVersion 如 \"26.0.0\"）；也可直接参考本机可正常构建的鸿蒙工程（如用户工程 build-profile.json5 的配置）。",
     },
     KnowledgeEntry {
         keywords: &["unsigned", "signingconfigs", "signhap", "hap install", "install bundle failed", "signature", "provision profile", "signed.hap"],

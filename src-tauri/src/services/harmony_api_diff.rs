@@ -5,6 +5,9 @@
 //! - 每版本的 API 变更清单页（列出所有 Kit 的 diff 链接）
 //! - 每个 Kit 的 diff 页面是一张表格：操作 | 旧版本 | 新版本 | d.ts文件
 //!
+//! 正文经文档中心的 `documentPortal/getDocumentById` 接口获取（HTML，见
+//! [`crate::services::harmony_doc_api`]）；页面 URL 追加 `.md` 的旧端点已下线。
+//!
 //! 聚合所有版本后，可以回答：
 //! - 某个 API 在哪个版本引入、哪个版本废弃/删除
 //! - 某两个版本之间有哪些 API 变更
@@ -12,16 +15,17 @@
 //!
 //! 设计：
 //! - 数据落地到 SQLite（api_docs 表，migration 028），FTS 搜索靠 LIKE 兜底
-//! - 抓取走 reqwest + 系统代理，解析 HTML 表格（华为站表格 class 稳定），
-//!   解析失败时回退到 WebFetch 风格的 Markdown 行解析，保证鲁棒
+//! - 抓取走 reqwest + 系统代理，解析 HTML 表格；解析器同时保留 Markdown 表格分支，
+//!   以便正文形态在 HTML/Markdown 之间切换时不至失效
 //! - 提供 refresh（全量/增量刷新）与 search（按关键字/模块/版本过滤）
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::sync::Mutex;
-use std::time::Duration;
 
-use crate::utils::net::build_client_auto;
+use crate::services::harmony_doc_api::{
+    extract_anchors, fetch_document, html_tables, object_id_from_url, CATALOG_RELEASES,
+};
 
 /// 一条 API 变更记录
 #[derive(Debug, Clone, Serialize)]
@@ -75,40 +79,9 @@ const KNOWN_VERSIONS: &[(&str, &str, u32)] = &[
 
 const BASE_URL: &str = "https://developer.huawei.com/consumer/cn/doc/harmonyos-releases";
 
-/// 单页抓取（带简单重试）
-async fn fetch_html(url: &str) -> Result<String, String> {
-    let client = build_client_auto()?;
-    let mut last_err = String::new();
-    for attempt in 0..3 {
-        match client
-            .get(url)
-            .header("Accept", "text/markdown,text/html,*/*")
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                return resp.text().await.map_err(|e| format!("读取响应失败: {e}"));
-            }
-            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
-            Err(e) => last_err = e.to_string(),
-        }
-        if attempt < 2 {
-            tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
-        }
-    }
-    Err(last_err)
-}
-
-/// 抓取页面的 Markdown 版（华为文档站对任意页面 URL 追加 `.md` 即返回 markdown 原文，
-/// 避免 SPA 空壳 HTML）。自动去除已有的 `.md` 后缀再追加。
-async fn fetch_markdown(url: &str) -> Result<String, String> {
-    let md_url = if url.ends_with(".md") {
-        url.to_string()
-    } else {
-        format!("{url}.md")
-    };
-    fetch_html(&md_url).await
+/// 抓取一篇版本说明正文（HTML）。
+async fn fetch_release_doc(object_id: &str) -> Result<String, String> {
+    fetch_document(CATALOG_RELEASES, object_id).await
 }
 
 /// 从 markdown 中解析 Markdown 链接 `[text](url)`。
@@ -136,82 +109,109 @@ fn extract_md_links(md: &str) -> Vec<(String, String)> {
     out
 }
 
-/// 从版本页 Markdown 中发现该版本实际的 apidiff 入口，再从入口页提取所有 Kit diff 链接。
+/// 提取页面链接：优先 HTML 锚点，其次 Markdown 链接（兼容正文形态变化）。
+fn extract_links(body: &str) -> Vec<(String, String)> {
+    let anchors = extract_anchors(body);
+    if anchors.is_empty() {
+        extract_md_links(body)
+    } else {
+        anchors
+    }
+}
+
+/// 版本 slug → 可能的「API 变更清单」入口 objectId 候选。
 ///
-/// 例如 `2600.md` 列的是 `apidiff-2600`，`apidiff-2600.md` 再列 `apidiff-7001/7002`，
-/// `apidiff-7001.md` 才真正列每个 Kit 的链接。
+/// 版本页（如 `2600`）本身不含 apidiff 链接，真正的清单入口命名不统一：
+/// `apidiff-2600`（索引页，再分 release/beta 子入口）、`apidiff-611`、
+/// `apidiff-from-501-release`、`apidiff-6001`（无 600 索引页时）等，需枚举。
+fn starter_slugs(version_slug: &str) -> Vec<String> {
+    let digit = version_slug.replace('-', "");
+    let mut out = vec![format!("apidiff-{version_slug}")];
+    if digit != version_slug {
+        out.push(format!("apidiff-{digit}"));
+    }
+    for c in candidate_apidiff_slugs(version_slug) {
+        out.push(format!("apidiff-{c}"));
+    }
+    // 数字子版本直接入口兜底（如 6.0.0 只有 apidiff-6001/6002/6003/6004，无 apidiff-600）
+    if digit.chars().all(|c| c.is_ascii_digit()) {
+        for n in 1..=6 {
+            out.push(format!("apidiff-{digit}{n}"));
+        }
+    }
+    out
+}
+
+/// 从版本页出发发现该版本全部 Kit diff 页面。
+///
+/// 层级不固定：`apidiff-2600` 只列 release/beta 子入口（apidiff-7001/7002/7003），
+/// 子入口页才列到每个 Kit 的 diff 链接；`apidiff-611` 同理要经 apidiff-6111/6112。
+/// 因此按「页内含 Kit diff 链接即收、只含 apidiff 链接则继续下钻」做 BFS，最多 3 层。
 async fn discover_kit_pages(
     version_slug: &str,
     level: u32,
 ) -> Result<Vec<(String, String, Option<u32>)>, String> {
-    let version_md = format!("{BASE_URL}/{version_slug}.md");
-    let body = fetch_markdown(&version_md).await?;
-    let mut apidiff_urls: Vec<String> = Vec::new();
-
-    for (_text, url) in extract_md_links(&body) {
-        if url.contains("apidiff") && !url.ends_with(".md") {
-            apidiff_urls.push(normalize_url(&url));
-        }
-    }
-
-    // 若版本页没有 apidiff 链接，尝试多种候选路径
-    if apidiff_urls.is_empty() {
-        let digit = version_slug.replace('-', "");
-
-        // 1) 优先找「API变更清单」索引页 apidiff-{slug}（其内列出所有 release/beta 子入口）
-        let mut index_slugs = vec![version_slug.to_string()];
-        if digit.as_str() != version_slug {
-            index_slugs.push(digit.clone());
-        }
-        let mut found_index = false;
-        for idx in index_slugs {
-            let u = format!("{BASE_URL}/apidiff-{idx}");
-            if let Ok(b) = fetch_markdown(&format!("{u}.md")).await {
-                if b.contains("js-apidiff")
-                    || b.contains("c-apidiff")
-                    || b.contains("apidiff-from")
-                    || b.contains("apidiff-beta")
-                {
-                    apidiff_urls.push(u);
-                    found_index = true;
-                    break;
-                }
-            }
-        }
-
-        // 2) 无索引页时，枚举所有直接入口候选。
-        //    一个版本可能同时存在多个入口（如 5.0.1 有 apidiff-from-501-release 与
-        //    apidiff-from-501-beta3），必须全部收集，不能只取第一个。
-        if !found_index {
-            for c in candidate_apidiff_slugs(version_slug) {
-                let u = format!("{BASE_URL}/apidiff-{c}");
-                if let Ok(b) = fetch_markdown(&format!("{u}.md")).await {
-                    if b.contains("js-apidiff") || b.contains("c-apidiff") {
-                        apidiff_urls.push(u);
-                    }
-                }
-            }
-        }
-
-        // 3) 仍无，数字子版本直接入口兜底（如 6.0.0 只有 apidiff-6001/6002/6003/6004，无 apidiff-600）
-        if apidiff_urls.is_empty()
-            && digit.chars().all(|c| c.is_ascii_digit()) {
-                for n in 1..=6 {
-                    let u = format!("{BASE_URL}/apidiff-{digit}{n}");
-                    if let Ok(b) = fetch_markdown(&format!("{u}.md")).await {
-                        if b.contains("js-apidiff") || b.contains("c-apidiff") {
-                            apidiff_urls.push(u);
-                        }
-                    }
-                }
-            }
-    }
-
-    let mut out: Vec<(String, String, Option<u32>)> = Vec::new();
+    let mut queue: Vec<String> = starter_slugs(version_slug);
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<(String, String, Option<u32>)> = Vec::new();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
 
-    for apidiff_url in apidiff_urls {
-        collect_kit_pages(&apidiff_url, level, &mut out, &mut visited, 0).await;
+    for _depth in 0..3 {
+        let batch: Vec<String> = std::mem::take(&mut queue);
+        if batch.is_empty() {
+            break;
+        }
+        let mut handles = Vec::new();
+        for object_id in batch {
+            if object_id.trim().is_empty() || !visited.insert(object_id.clone()) {
+                continue;
+            }
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok();
+                let body = fetch_release_doc(&object_id).await;
+                (object_id, body)
+            }));
+        }
+        // 并发结果按提交顺序回收，保持候选枚举的确定性
+        let mut pages: Vec<(String, String)> = Vec::new();
+        for h in handles {
+            if let Ok((object_id, Ok(body))) = h.await {
+                pages.push((object_id, body));
+            }
+        }
+        for (_object_id, body) in pages {
+            let links = extract_links(&body);
+            let mut has_kit_diff = false;
+            for (text, href) in &links {
+                if is_kit_diff_url(href) {
+                    let url = normalize_url(href);
+                    if !out.iter().any(|(_, u, _)| u == &url) {
+                        out.push((text.clone(), url, Some(level)));
+                    }
+                    has_kit_diff = true;
+                }
+            }
+            if has_kit_diff {
+                continue;
+            }
+            for (_text, href) in links {
+                if !href.contains("apidiff") && !href.contains("apis-diff") {
+                    continue;
+                }
+                if let Some(id) = object_id_from_url(&href) {
+                    if !visited.contains(&id) {
+                        queue.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return Err(format!(
+            "未发现 {version_slug} 的 Kit diff 页面（API 变更清单索引页缺失或页面结构变化）"
+        ));
     }
     Ok(out)
 }
@@ -256,100 +256,6 @@ fn is_kit_diff_url(url: &str) -> bool {
         || url.contains("arkui-apidiff")
 }
 
-/// 递归从 apidiff 入口页收集 Kit diff 页面，最多深入 3 层。
-fn collect_kit_pages<'a>(
-    url: &'a str,
-    level: u32,
-    out: &'a mut Vec<(String, String, Option<u32>)>,
-    visited: &'a mut std::collections::HashSet<String>,
-    depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-    Box::pin(async move {
-        if depth > 3 || !visited.insert(url.to_string()) {
-            return;
-        }
-        let md_url = if url.ends_with(".md") { url.to_string() } else { format!("{url}.md") };
-        let body = match fetch_markdown(&md_url).await {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-
-        for (text, link) in extract_md_links(&body) {
-            // C API diff 用 c-apis-diff-* 命名，不含 "apidiff" 子串，需一并识别，
-            // 避免被 is_kit_diff_url 认可却在这里被提前过滤掉。
-            if !link.contains("apidiff") && !link.contains("apis-diff") {
-                continue;
-            }
-            let full = normalize_url(&link);
-            if is_kit_diff_url(&full) {
-                if !out.iter().any(|(_, u, _)| u == &full) {
-                    out.push((text, full, Some(level)));
-                }
-            } else if !full.contains("overview") {
-                collect_kit_pages(&full, level, out, visited, depth + 1).await;
-            }
-        }
-    })
-}
-
-/// 从一个版本的 API 变更清单页中，提取该版本所有 Kit diff 页面链接。
-///
-/// 页面里形如：
-///   <a href="/consumer/cn/doc/harmonyos-releases/js-apidiff-abilitykit-7001">Ability Kit</a>
-///   <a href="/consumer/cn/doc/harmonyos-releases/c-apis-diff-...">C API</a>
-///   <a href="/consumer/cn/doc/harmonyos-releases/arkui-apidiff-...">ArkUI 声明式/...</a>
-///
-/// 统一匹配所有 "-diff-" / "apidiff-" 模式，避免漏掉 C API / ArkUI 组件 diff。
-/// 从 HTML 版本页中提取 Kit diff 链接（保留用于兜底：某些老版本页可能仍是 HTML）。
-#[allow(dead_code)]
-fn extract_kit_links(html: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let needles = ["js-apidiff-", "-apidiff-", "c-apis-diff-", "c-apidiff-"];
-    let bytes = html.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let mut matched = false;
-        for needle in &needles {
-            let nb = needle.as_bytes();
-            if i + nb.len() <= bytes.len() && &bytes[i..i + nb.len()] == nb {
-                // 向前找 href="
-                if let Some(href_start) = html[..i].rfind("href=\"") {
-                    let href_value_start = href_start + 6;
-                    if let Some(href_end_rel) = html[href_value_start..].find('"') {
-                        let href = &html[href_value_start..href_value_start + href_end_rel];
-                        if needles.iter().any(|n| href.contains(n)) {
-                            // 向后找链接文本（跳过同位置属性后到 </a>）
-                            let after_quote = href_value_start + href_end_rel + 2; // 越过 ">
-                            if let Some(close) = html[after_quote..].find("</a>") {
-                                let text = strip_html_tags(&html[after_quote..after_quote + close])
-                                    .trim()
-                                    .to_string();
-                                let url = if href.starts_with("http") {
-                                    href.to_string()
-                                } else if href.starts_with('/') {
-                                    format!("https://developer.huawei.com{href}")
-                                } else {
-                                    format!("{BASE_URL}/{href}")
-                                };
-                                if !out.iter().any(|(u, _)| u == &url) {
-                                    out.push((url, text));
-                                }
-                            }
-                        }
-                    }
-                }
-                matched = true;
-                i += nb.len();
-                break;
-            }
-        }
-        if !matched {
-            i += 1;
-        }
-    }
-    out
-}
-
 fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
@@ -386,7 +292,13 @@ fn module_from_dts(dts: &str) -> Option<String> {
         .unwrap_or(dts);
     let name = name.trim();
     if name.starts_with('@') {
-        Some(name.trim_end_matches(".d.ts").trim_end_matches(".ts").to_string())
+        // ArkTS 声明文件可能是 *.d.ets（如 @arkts.collections.d.ets），需一并剥离
+        Some(
+            name.trim_end_matches(".d.ts")
+                .trim_end_matches(".d.ets")
+                .trim_end_matches(".ts")
+                .to_string(),
+        )
     } else if name.contains('.') {
         // api/bundleManager/SkillInfo.d.ts 这种没有 @ 前缀，不归入模块
         None
@@ -470,6 +382,31 @@ fn extract_api_name(decl: &str, class: &str) -> Option<String> {
     None
 }
 
+/// 解析一个 Kit diff 页面：优先 HTML 表格，回退 Markdown 表格。
+///
+/// 正文经 `getDocumentById` 返回 HTML（`<table><tr><td>`），但解析器保留
+/// Markdown 分支：正文形态若回退，抓取不至失效。
+fn parse_diff_page(
+    body: &str,
+    kit: &str,
+    version_label: &str,
+    api_level: Option<u32>,
+    source_url: &str,
+) -> Vec<ApiEntry> {
+    let mut entries = Vec::new();
+    for table in html_tables(body) {
+        for row in table {
+            if let Some(entry) = entry_from_cells(&row, kit, version_label, api_level, source_url) {
+                entries.push(entry);
+            }
+        }
+    }
+    if entries.is_empty() {
+        entries = parse_diff_table(body, kit, version_label, api_level, source_url);
+    }
+    entries
+}
+
 /// 解析一个 Kit diff 页面（Markdown 格式），返回 API 条目列表。
 ///
 /// Markdown 表格形如：
@@ -495,74 +432,98 @@ fn parse_diff_table(md: &str, kit: &str, version_label: &str, api_level: Option<
         if cells.len() < 4 {
             continue;
         }
-        let op_raw = cells[0].trim();
-        if op_raw == "操作" || op_raw.contains("操作") && cells[1].trim() == "旧版本" {
-            continue;
+        let normalized = vec![
+            cells[0].trim().to_string(),
+            normalize_cell(&cells[1]),
+            normalize_cell(&cells[2]),
+            cells[3].trim().to_string(),
+        ];
+        if let Some(entry) = entry_from_cells(&normalized, kit, version_label, api_level, source_url)
+        {
+            entries.push(entry);
         }
-        let old_raw = normalize_cell(&cells[1]);
-        let new_raw = normalize_cell(&cells[2]);
-        let dts_raw = cells[3].trim();
-
-        let op = op_raw.to_lowercase();
-        let change_type = if op.contains("新增api") || op.contains("新增错误码") || op.contains("新增") {
-            "added"
-        } else if op.contains("删除") {
-            "removed"
-        } else if op.contains("废弃") {
-            "deprecated"
-        } else if op.contains("变更") || op.contains("修改") {
-            "modified"
-        } else if op.contains("kit") {
-            "new_kit"
-        } else {
-            continue;
-        };
-
-        let dts_file = if dts_raw.is_empty() {
-            None
-        } else {
-            Some(dts_raw.replace("api\\", "api/").to_string())
-        };
-        let module = dts_file.as_deref().and_then(module_from_dts);
-
-        let primary = if new_raw.trim() != "NA" && !new_raw.trim().is_empty() {
-            new_raw.clone()
-        } else {
-            old_raw.clone()
-        };
-
-        let class_name = extract_field_value(&primary, "类名");
-        let declaration = extract_field_value(&primary, "API声明")
-            .or_else(|| extract_field_value(&primary, "差异内容"))
-            .unwrap_or_else(|| primary.trim().to_string());
-
-        if declaration.trim().is_empty() || declaration.trim() == "NA" {
-            continue;
-        }
-
-        let api_name = extract_api_name(&declaration, class_name.as_deref().unwrap_or(""));
-        let old_declaration = if old_raw.trim() == "NA" || old_raw.trim().is_empty() {
-            None
-        } else {
-            Some(old_raw.trim().to_string())
-        };
-
-        entries.push(ApiEntry {
-            id: None,
-            kit: kit.to_string(),
-            dts_file: dts_file.clone(),
-            module,
-            class_name,
-            declaration: declaration.trim().to_string(),
-            api_name,
-            change_type: change_type.to_string(),
-            version_label: version_label.to_string(),
-            api_level,
-            old_declaration,
-            source_url: source_url.to_string(),
-        });
     }
     entries
+}
+
+/// 表格行 → API 条目。单元格需已是纯文本（HTML 路径已去标签解码；
+/// Markdown 路径先经 [`normalize_cell`]）。
+fn entry_from_cells(
+    cells: &[String],
+    kit: &str,
+    version_label: &str,
+    api_level: Option<u32>,
+    source_url: &str,
+) -> Option<ApiEntry> {
+    if cells.len() < 4 {
+        return None;
+    }
+    let op_raw = cells[0].trim();
+    if op_raw == "操作" || op_raw.contains("操作") && cells[1].trim() == "旧版本" {
+        return None;
+    }
+    let old_raw = cells[1].trim().to_string();
+    let new_raw = cells[2].trim().to_string();
+    let dts_raw = cells[3].trim();
+
+    let op = op_raw.to_lowercase();
+    let change_type = if op.contains("新增api") || op.contains("新增错误码") || op.contains("新增") {
+        "added"
+    } else if op.contains("删除") {
+        "removed"
+    } else if op.contains("废弃") {
+        "deprecated"
+    } else if op.contains("变更") || op.contains("修改") {
+        "modified"
+    } else if op.contains("kit") {
+        "new_kit"
+    } else {
+        return None;
+    };
+
+    let dts_file = if dts_raw.is_empty() {
+        None
+    } else {
+        Some(dts_raw.replace("api\\", "api/").to_string())
+    };
+    let module = dts_file.as_deref().and_then(module_from_dts);
+
+    let primary = if new_raw.trim() != "NA" && !new_raw.trim().is_empty() {
+        new_raw.clone()
+    } else {
+        old_raw.clone()
+    };
+
+    let class_name = extract_field_value(&primary, "类名");
+    let declaration = extract_field_value(&primary, "API声明")
+        .or_else(|| extract_field_value(&primary, "差异内容"))
+        .unwrap_or_else(|| primary.trim().to_string());
+
+    if declaration.trim().is_empty() || declaration.trim() == "NA" {
+        return None;
+    }
+
+    let api_name = extract_api_name(&declaration, class_name.as_deref().unwrap_or(""));
+    let old_declaration = if old_raw.trim() == "NA" || old_raw.trim().is_empty() {
+        None
+    } else {
+        Some(old_raw.trim().to_string())
+    };
+
+    Some(ApiEntry {
+        id: None,
+        kit: kit.to_string(),
+        dts_file,
+        module,
+        class_name,
+        declaration: declaration.trim().to_string(),
+        api_name,
+        change_type: change_type.to_string(),
+        version_label: version_label.to_string(),
+        api_level,
+        old_declaration,
+        source_url: source_url.to_string(),
+    })
 }
 
 /// 按未转义的 `|` 切分 Markdown 表格行。
@@ -622,67 +583,6 @@ fn extract_field_value(text: &str, field: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// 粗略切分所有 <tr>...</tr>（不区分表头/正文）
-#[allow(dead_code)]
-fn split_rows(html: &str) -> Vec<String> {
-    let lower = html.to_lowercase();
-    let mut out = Vec::new();
-    let mut search_from = 0;
-    while let Some(rel) = lower[search_from..].find("<tr") {
-        let start = search_from + rel;
-        if let Some(rel_end) = lower[start..].find("</tr>") {
-            let end = start + rel_end + "</tr>".len();
-            out.push(html[start..end].to_string());
-            search_from = end;
-        } else {
-            break;
-        }
-    }
-    out
-}
-
-/// 从一行 tr 中提取 td/th 的纯文本内容
-#[allow(dead_code)]
-fn split_cells(row: &str) -> Vec<String> {
-    let lower = row.to_lowercase();
-    let mut cells = Vec::new();
-    let mut search_from = 0;
-    while search_from < row.len() {
-        // 找 <td 或 <th
-        let td_rel = lower[search_from..].find("<td");
-        let th_rel = lower[search_from..].find("<th");
-        let (tag_start, tag_len) = match (td_rel, th_rel) {
-            (Some(a), Some(b)) if a <= b => (search_from + a, 3),
-            (Some(_), Some(b)) => (search_from + b, 3),
-            (Some(a), None) => (search_from + a, 3),
-            (None, Some(b)) => (search_from + b, 3),
-            (None, None) => break,
-        };
-        // 找到对应 </td> 或 </th>
-        let close_td = lower[tag_start..].find("</td>");
-        let close_th = lower[tag_start..].find("</th>");
-        let (close_rel, close_len) = match (close_td, close_th) {
-            (Some(a), Some(b)) if a <= b => (a, 4),
-            (Some(_), Some(b)) => (b, 4),
-            (Some(a), None) => (a, 4),
-            (None, Some(b)) => (b, 4),
-            (None, None) => break,
-        };
-        let content_start = {
-            // 越过 <td ...>
-            let gt = lower[tag_start..tag_start + close_rel].find('>');
-            match gt {
-                Some(g) => tag_start + g + 1,
-                None => tag_start + tag_len,
-            }
-        };
-        let content_end = tag_start + close_rel;
-        cells.push(row[content_start..content_end].to_string());
-        search_from = content_end + close_len;
-    }
-    cells
 }
 
 /// 写入数据库（批量，UPSERT）
@@ -791,9 +691,10 @@ pub async fn refresh_all(db: &crate::db::DbState, mut on_progress: Option<Progre
         let cb = progress_cb.clone();
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.ok();
-            match fetch_markdown(&url).await {
+            let object_id = object_id_from_url(&url).unwrap_or_default();
+            match fetch_release_doc(&object_id).await {
                 Ok(html) => {
-                    let entries = parse_diff_table(&html, &kit, &version_label, level, &url);
+                    let entries = parse_diff_page(&html, &kit, &version_label, level, &url);
                     let n = entries.len();
                     all_entries.lock().unwrap().extend(entries);
                     pages_fetched.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1034,10 +935,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_diff_page_parses_html_table() {
+        // 26.0.0 起正文为 HTML 表格（原 .md 端点下线），须与 Markdown 分支等价解析
+        let html = r#"<html><body><div class="tablenoborder"><table><thead><tr>
+            <th>操作</th><th>旧版本</th><th>新版本</th><th>d.ts文件</th></tr></thead><tbody><tr>
+            <td>新增API</td><td>NA</td>
+            <td>类名：skillManager；<br>API声明：function getSkillInfoForSelf(moduleName: string): Promise&lt;SkillInfo&gt;;<br>差异内容：function getSkillInfoForSelf(...)</td>
+            <td>api/@ohos.bundle.skillManager.d.ts</td></tr></tbody></table></div></body></html>"#;
+        let entries = parse_diff_page(html, "Ability Kit", "26.0.0", Some(26), "http://x");
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.change_type, "added");
+        assert_eq!(e.class_name.as_deref(), Some("skillManager"));
+        assert_eq!(e.api_name.as_deref(), Some("getSkillInfoForSelf"));
+        assert_eq!(e.module.as_deref(), Some("@ohos.bundle.skillManager"));
+        assert_eq!(e.api_level, Some(26));
+    }
+
+    #[test]
+    fn discover_starters_cover_known_slug_shapes() {
+        let s = starter_slugs("2600");
+        assert!(s.contains(&"apidiff-2600".to_string()));
+        assert!(s.contains(&"apidiff-26001".to_string()));
+        let s = starter_slugs("5-0-1");
+        assert!(s.contains(&"apidiff-5-0-1".to_string()));
+        assert!(s.contains(&"apidiff-501".to_string()));
+        assert!(s.contains(&"apidiff-from-501-release".to_string()));
+    }
+
+    #[test]
     fn module_from_dts_handles_paths() {
         assert_eq!(
             module_from_dts("api/@ohos.app.ability.scriptManager.d.ts"),
             Some("@ohos.app.ability.scriptManager".to_string())
+        );
+        assert_eq!(
+            module_from_dts("api/@arkts.collections.d.ets"),
+            Some("@arkts.collections".to_string())
         );
         assert_eq!(module_from_dts("api/bundleManager/SkillInfo.d.ts"), None);
     }
@@ -1078,9 +1012,12 @@ mod tests {
         conn.execute_batch(include_str!("../../migrations/028_api_docs.sql"))
             .unwrap();
 
-        let url = "https://developer.huawei.com/consumer/cn/doc/harmonyos-releases/js-apidiff-basicserviceskit-7001";
-        let html = fetch_markdown(url).await.expect("fetch");
-        let entries = parse_diff_table(&html, "Basic Services Kit", "26.0.0", Some(26), url);
+        // 26.0.0 Release 的 Basic Services Kit diff（objectId 后缀 7003 为 Release 入口）
+        let url = "https://developer.huawei.com/consumer/cn/doc/harmonyos-releases/js-apidiff-basicserviceskit-7003";
+        let html = fetch_release_doc("js-apidiff-basicserviceskit-7003")
+            .await
+            .expect("fetch");
+        let entries = parse_diff_page(&html, "Basic Services Kit", "26.0.0", Some(26), url);
         assert!(!entries.is_empty(), "至少应解析到 1 条 diff；若华为站点结构变更，需检查 parser");
         let n = store_entries(&conn, &entries).expect("store");
         assert!(n > 0, "写入行数应 > 0");

@@ -5673,7 +5673,7 @@ async fn stream_chat_inner(
             s.push_str("正在从零创建鸿蒙工程，必须遵守：\n");
             s.push_str("- 优先调用 create_harmony_project 工具一次性生成完整标准骨架（含根 build-profile.json5/oh-package.json5/hvigorfile.ts/hvigor-config.json5/code-linter.json5、根 .gitignore/.hvigorignore/README.md、hvigorw 启动脚本、AppScope 多语言与 PNG 图标、入口模块、hypium 单测骨架），生成后不要用 write_file 重写同名单文件；\n");
             s.push_str("- 仅当 create_harmony_project 不可用时才允许 write_file 手写模板，且必须包含标准模板全套文件：根 .gitignore（/oh_modules、**/build、/.hvigor、.cxx、/.appanalyzer 等）、根 .hvigorignore、根 README.md、hvigorw.bat 与 hvigor/hvigor-wrapper.js、AppScope/resources 多语言与 media/app_icon.png、entry/src/main/resources 全套（element/color/profile/media/多语言）——不允许创建后缺这些再补；\n");
-            s.push_str("- 先读 DEVECO_SDK_HOME（或 DevEco Studio 内置 SDK）的 default/sdk-pkg.json 确认 platformVersion 与 apiVersion，build-profile.json5 的 compileSdkVersion/compatibleSdkVersion/targetSdkVersion 写成 \"平台版本(API版本)\" 字符串（如 \"6.1.1(24)\"），禁止写裸数字或臆造组合；\n");
+            s.push_str("- 先读 DEVECO_SDK_HOME（或 DevEco Studio 内置 SDK）的 default/sdk-pkg.json 确认 platformVersion 与 apiVersion：API 26.0.0 之前写成 \"平台版本(API版本)\" 字符串（如 \"6.1.1(24)\"），26.0.0 起为语义化版本，直接写 \"26.0.0\"；禁止写裸数字或臆造组合；\n");
             s.push_str("- AppScope 的 app.json5 引用 $media:app_icon、entry 的 module.json5 引用 $media:icon 时，必须同时创建对应 PNG 资源文件（AppScope/resources/base/media/ 与 entry/src/main/resources/base/media/），否则构建报资源缺失；\n");
             s.push_str("- 创建完成后必须执行构建验证；构建/校验失败不得作为任务终点，必须修复后重试直到构建成功，才算任务完成。\n");
         }

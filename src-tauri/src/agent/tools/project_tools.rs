@@ -515,12 +515,14 @@ fn install_hvigorw(root: &Path) -> Vec<String> {
     Vec::new()
 }
 
-/// 探测 SDK 版本字符串（形如 6.1.1(24)）：
+/// 探测 SDK 版本字符串（形如 6.1.1(24)、26.0.0）：
 /// 显式参数 > DEVECO_SDK_HOME > DevEco Studio 工具链 SDK。
 fn detect_sdk_version(explicit: Option<&str>) -> Result<String, String> {
     if let Some(v) = explicit.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if !is_sdk_version_like(v) {
-            return Err(format!("sdk_version 格式非法：{v}（应为 平台版本(API版本) 字符串，如 6.1.1(24)）"));
+            return Err(format!(
+                "sdk_version 格式非法：{v}（应为 平台版本(API版本)，如 6.1.1(24)；API 26.0.0 起为语义化版本，如 26.0.0）"
+            ));
         }
         return Ok(v.to_string());
     }
@@ -542,7 +544,7 @@ fn detect_sdk_version(explicit: Option<&str>) -> Result<String, String> {
     if let Some(v) = cli_sdk_version() {
         return Ok(v);
     }
-    Err("无法探测本机 HarmonyOS SDK 版本：DEVECO_SDK_HOME 未设置且未找到 DevEco Studio 内置 SDK。\n请安装/配置 DevEco Studio（或 SDK），或用 sdk_version 参数显式指定（如 6.1.1(24)）。".into())
+    Err("无法探测本机 HarmonyOS SDK 版本：DEVECO_SDK_HOME 未设置且未找到 DevEco Studio 内置 SDK。\n请安装/配置 DevEco Studio（或 SDK），或用 sdk_version 参数显式指定（如 6.1.1(24)、26.0.0）。".into())
 }
 
 /// 从探测缓存的 command-line-tools 读取 SDK 版本（<cli_root>/sdk/default/sdk-pkg.json）。
@@ -551,7 +553,8 @@ fn cli_sdk_version() -> Option<String> {
     sdk_version_from_pkg(&cli.join("sdk").join("default").join("sdk-pkg.json"))
 }
 
-/// 从 sdk-pkg.json 读取 platformVersion 与 apiVersion，拼成 "6.1.1(24)"。
+/// 从 sdk-pkg.json 读取 platformVersion 与 apiVersion，组合成配置字符串：
+/// 旧格式 `6.1.1` + `24` → `"6.1.1(24)"`；26.0.0 起语义化版本 → `"26.0.0"`。
 fn sdk_version_from_pkg(pkg_path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(pkg_path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -560,23 +563,12 @@ fn sdk_version_from_pkg(pkg_path: &Path) -> Option<String> {
     if platform.is_empty() || api.is_empty() {
         return None;
     }
-    Some(format!("{platform}({api})"))
+    crate::services::sdk_version::join(platform, api)
 }
 
-/// SDK 版本字符串形如 "6.1.1(24)" 或 "5.0.0(12)"：数字点分 + 括号数字。
+/// SDK 版本字符串形如 "6.1.1(24)"、"5.0.0(12)"，或 26.0.0 起的语义化版本 "26.0.0"。
 fn is_sdk_version_like(s: &str) -> bool {
-    let Some(open) = s.find('(') else { return false };
-    let Some(close) = s.rfind(')') else { return false };
-    if !s.ends_with(')') {
-        return false;
-    }
-    let platform = &s[..open];
-    let api = &s[open + 1..close];
-    platform
-        .split('.')
-        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
-        && !api.is_empty()
-        && api.chars().all(|c| c.is_ascii_digit())
+    crate::services::sdk_version::is_config_version_like(s)
 }
 
 /// 模板占位符替换
@@ -1449,7 +1441,7 @@ mod tests {
 
     #[test]
     fn detect_sdk_version_parses_pkg() {
-        // 使用内联构造的 sdk-pkg.json 校验拼接格式
+        // 使用内联构造的 sdk-pkg.json 校验拼接格式（旧格式：平台版本(API版本)）
         let tmp = std::env::temp_dir().join(format!("dsv_pkg_{}.json", std::process::id()));
         std::fs::write(
             &tmp,
@@ -1457,8 +1449,16 @@ mod tests {
         )
         .unwrap();
         let v = sdk_version_from_pkg(&tmp);
+        // 26.0.0 起语义化版本：platformVersion 与 apiVersion 同体系，直接用平台版本
+        std::fs::write(
+            &tmp,
+            r#"{"data":{"apiVersion":"26","platformVersion":"26.0.0","version":"26.0.0.105"}}"#,
+        )
+        .unwrap();
+        let v26 = sdk_version_from_pkg(&tmp);
         std::fs::remove_file(&tmp).ok();
         assert_eq!(v.as_deref(), Some("6.1.1(24)"));
+        assert_eq!(v26.as_deref(), Some("26.0.0"));
     }
 
     #[test]
@@ -1483,6 +1483,9 @@ mod tests {
     fn sdk_version_like_validation() {
         assert!(is_sdk_version_like("6.1.1(24)"));
         assert!(is_sdk_version_like("5.0.0(12)"));
+        // 26.0.0 起为语义化版本
+        assert!(is_sdk_version_like("26.0.0"));
+        assert!(!is_sdk_version_like("26.0.0(26)"));
         assert!(!is_sdk_version_like("24"));
         assert!(!is_sdk_version_like("6.1.1(24"));
         assert!(!is_sdk_version_like("(24)"));

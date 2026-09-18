@@ -145,10 +145,7 @@ pub fn project_api_context(
 }
 
 fn parse_api_level(value: &str) -> Option<u32> {
-    value
-        .rsplit_once('(')
-        .and_then(|(_, suffix)| suffix.trim_end_matches(')').parse().ok())
-        .or_else(|| value.trim().parse().ok())
+    crate::services::sdk_version::api_level(value).and_then(|v| u32::try_from(v).ok())
 }
 
 /// 一次扫描的完整索引

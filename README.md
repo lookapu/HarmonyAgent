@@ -136,7 +136,7 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 301 个 Tauri IPC 入口 · 58 个 service 模块        │
+│  - 301 个 Tauri IPC 入口 · 60 个 service 模块        │
 │  - agent/ 58 个顶层模块 · tools/ 35 文件 · 204 工具  │
 │  - SQLite + 84 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
@@ -207,7 +207,7 @@ src-tauri/src/
 │       ├── quality_media.rs     #   媒体质量（2 工具）
 │       └── schedule_tools.rs    # 定时提醒（schedule_create/list/delete）
 ├── commands/               # 38 个命令模块（合计 299 个 IPC 注册入口）
-├── services/               # 业务服务（58 个）
+├── services/               # 业务服务（60 个）
 │   ├── proxy_service.rs    #   - 本地代理
 │   ├── circuit_breaker.rs  #   - 熔断器
 │   ├── model_router.rs     #   - 模型路由

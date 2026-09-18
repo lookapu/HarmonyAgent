@@ -18,10 +18,8 @@
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::time::Duration;
 
 use crate::services::harmony_api_diff::split_md_row;
-use crate::utils::net::build_client_auto;
 
 const REF_BASE: &str = "https://developer.huawei.com/consumer/cn/doc/harmonyos-references";
 
@@ -76,7 +74,11 @@ pub struct RefReport {
     pub errors: Vec<String>,
 }
 
-/// 常用模块 → slug 兜底（当 api_docs 无数据时，仍可抓取这些核心页面）
+/// 常用模块 → slug 兜底（当 api_docs 无数据时，仍可抓取这些核心页面）。
+///
+/// slug 取自文档中心实际 objectId：驼峰模块名一律转全小写连写
+/// （`bundleManager → js-apis-bundlemanager`、`abilityAccessCtrl → js-apis-abilityaccessctrl`），
+/// 只有 `battery-info` / `device-info` 这类单词边界才带连字符。已逐个对照线上校验。
 const FALLBACK_SLUGS: &[(&str, &str)] = &[
     ("@ohos.batteryInfo", "js-apis-battery-info"),
     ("@ohos.deviceInfo", "js-apis-device-info"),
@@ -84,21 +86,21 @@ const FALLBACK_SLUGS: &[(&str, &str)] = &[
     ("@ohos.file.fs", "js-apis-file-fs"),
     ("@ohos.fileio", "js-apis-fileio"),
     ("@ohos.router", "js-apis-router"),
-    ("@ohos.app.ability.UIAbility", "js-apis-app-ability-uiAbility"),
+    ("@ohos.app.ability.UIAbility", "js-apis-app-ability-uiability"),
     ("@ohos.app.ability.common", "js-apis-app-ability-common"),
-    ("@ohos.bundle.bundleManager", "js-apis-bundleManager"),
-    ("@ohos.abilityAccessCtrl", "js-apis-abilityAccessCtrl"),
-    ("@ohos.ability.particleAbility", "js-apis-ability-particleAbility"),
+    ("@ohos.bundle.bundleManager", "js-apis-bundlemanager"),
+    ("@ohos.abilityAccessCtrl", "js-apis-abilityaccessctrl"),
+    ("@ohos.ability.particleAbility", "js-apis-ability-particleability"),
     ("@ohos.window", "js-apis-window"),
     ("@ohos.display", "js-apis-display"),
     ("@ohos.measure", "js-apis-measure"),
-    ("@ohos.promptAction", "js-apis-promptAction"),
+    ("@ohos.promptAction", "js-apis-promptaction"),
     ("@ohos.prompt", "js-apis-prompt"),
-    ("@ohos.notificationManager", "js-apis-notificationManager"),
-    ("@ohos.reminderAgentManager", "js-apis-reminderAgentManager"),
+    ("@ohos.notificationManager", "js-apis-notificationmanager"),
+    ("@ohos.reminderAgentManager", "js-apis-reminderagentmanager"),
     ("@ohos.preferences", "js-apis-data-preferences"),
-    ("@ohos.relationalStore", "js-apis-data-relationalStore"),
-    ("@ohos.data.distributedKVStore", "js-apis-distributedKVStore"),
+    ("@ohos.relationalStore", "js-apis-data-relationalstore"),
+    ("@ohos.data.distributedKVStore", "js-apis-distributedkvstore"),
     ("@ohos.net.http", "js-apis-http"),
     ("@ohos.net.connection", "js-apis-net-connection"),
     ("@ohos.net.socket", "js-apis-socket"),
@@ -117,47 +119,26 @@ const FALLBACK_SLUGS: &[(&str, &str)] = &[
     ("@ohos.multimedia.image", "js-apis-image"),
     ("@ohos.bluetooth", "js-apis-bluetooth"),
     ("@ohos.bluetooth.ble", "js-apis-bluetooth-ble"),
-    ("@ohos.wifiManager", "js-apis-wifiManager"),
+    ("@ohos.wifiManager", "js-apis-wifimanager"),
     ("@ohos.telephony.sms", "js-apis-sms"),
     ("@ohos.telephony.call", "js-apis-call"),
     ("@ohos.telephony.radio", "js-apis-radio"),
-    ("@ohos.connectedTag", "js-apis-connectedTag"),
-    ("@ohos.nfc.tag", "js-apis-nfc-tag"),
-    ("@ohos.nfc.cardEmulation", "js-apis-nfc-cardEmulation"),
+    ("@ohos.connectedTag", "js-apis-connectedtag"),
+    ("@ohos.nfc.tag", "js-apis-nfctag"),
+    ("@ohos.nfc.cardEmulation", "js-apis-cardemulation"),
 ];
 
-async fn fetch_html(url: &str) -> Result<String, String> {
-    let client = build_client_auto()?;
-    let mut last_err = String::new();
-    for attempt in 0..3 {
-        match client
-            .get(url)
-            .header("Accept", "text/markdown,text/plain,*/*")
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                return resp.text().await.map_err(|e| format!("读取响应失败: {e}"));
-            }
-            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
-            Err(e) => last_err = e.to_string(),
-        }
-        if attempt < 2 {
-            tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
-        }
-    }
-    Err(last_err)
-}
-
-/// 华为文档站对任意页面 URL 追加 `.md` 即返回 Markdown 原文，避免 SPA 空壳 HTML。
-async fn fetch_markdown(url: &str) -> Result<String, String> {
-    let md_url = if url.ends_with(".md") {
-        url.to_string()
-    } else {
-        format!("{url}.md")
-    };
-    fetch_html(&md_url).await
+/// 抓取一篇 API 参考正文并转成 Markdown。
+///
+/// 正文经文档中心 `getDocumentById` 接口获取（HTML）；页面 URL 追加 `.md` 的旧端点
+/// 已下线，故统一在此把 HTML 转成既有 Markdown 解析管线可消费的形态。
+async fn fetch_markdown(slug: &str) -> Result<String, String> {
+    let html = crate::services::harmony_doc_api::fetch_document(
+        crate::services::harmony_doc_api::CATALOG_REFERENCES,
+        slug,
+    )
+    .await?;
+    Ok(crate::services::harmony_doc_api::html_to_markdown(&html))
 }
 
 /// 把 @ohos.xxx 转成华为文档常用的 slug（主候选：全小写连写）。
@@ -1093,7 +1074,7 @@ pub async fn refresh_all(
     let mut done: usize = 0;
 
     // 分块：每 4 个模块一组并发；模块内部多个候选 slug 也并发尝试，
-    // 取第一个返回 200 且正文以 `#` 开头（真正的 Markdown 文档）的 slug。
+    // 取第一个返回正文且以 `#` 开头（H1 = 模块标题）的 slug。
     // 抓完一组后串行落库（rusqlite Connection 不是 Sync）。
     for chunk in candidates.chunks(4) {
         let mut futs = Vec::new();
@@ -1103,7 +1084,6 @@ pub async fn refresh_all(
             let slugs = slugs.clone();
             futs.push(async move {
                 let _permit = sem.acquire().await.ok();
-                let mut last_err: Option<String> = None;
                 // 并发尝试所有候选 slug，取第一个成功的
                 let slug_futs: Vec<_> = slugs
                     .iter()
@@ -1111,13 +1091,13 @@ pub async fn refresh_all(
                         let url = format!("{REF_BASE}/{slug}");
                         let slug = slug.clone();
                         async move {
-                            match fetch_markdown(&url).await {
-                                Ok(html) => {
-                                    let t = html.trim_start();
-                                    // 华为 404 页返回的是 HTML 壳，以 `<` 开头；
-                                    // 真正的文档以 `#` 开头。
+                            match fetch_markdown(&slug).await {
+                                Ok(md) => {
+                                    // 文档不存在时接口返回 code != 0（Err）；真正的文档
+                                    // 转成 Markdown 后以 `#` 开头。
+                                    let t = md.trim_start();
                                     if t.starts_with('#') && !t.is_empty() {
-                                        Some((slug, url, html))
+                                        Some((slug, url, md))
                                     } else {
                                         None
                                     }
@@ -1129,10 +1109,13 @@ pub async fn refresh_all(
                     .collect();
                 let results = futures_util::future::join_all(slug_futs).await;
                 if let Some(triple) = results.into_iter().flatten().next() {
-                    return (module, Some(triple), last_err);
+                    return (module, Some(triple), None);
                 }
-                last_err = Some(format!("所有候选 slug 均 404: {}", slugs.join(", ")));
-                (module, None, last_err)
+                (
+                    module,
+                    None,
+                    Some(format!("所有候选 slug 均不存在: {}", slugs.join(", "))),
+                )
             });
         }
         let results = futures_util::future::join_all(futs).await;
@@ -1441,17 +1424,10 @@ console.info("The batterySOCInfo is: " + batterySOCInfo);
         conn.execute_batch(include_str!("../../migrations/029_api_details.sql"))
             .unwrap();
 
-        let url = format!(
-            "{}/js-apis-battery-info",
-            "https://developer.huawei.com/consumer/cn/doc/harmonyos-references"
-        );
-        let html = fetch_markdown(&url).await.expect("fetch");
-        let detail = parse_reference(
-            &html,
-            "@ohos.batteryInfo",
-            "js-apis-battery-info",
-            &url,
-        );
+        let slug = "js-apis-battery-info";
+        let url = format!("{REF_BASE}/{slug}");
+        let html = fetch_markdown(slug).await.expect("fetch");
+        let detail = parse_reference(&html, "@ohos.batteryInfo", slug, &url);
         assert!(
             detail.title.as_deref().unwrap_or("").contains("batteryInfo"),
             "标题应包含 batteryInfo，实际：{:?}",

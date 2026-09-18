@@ -45,11 +45,16 @@ pub fn seed_api_knowledge(db_path: &Path, resource_dir: Option<PathBuf>) {
     });
 }
 
-/// 打开主库新连接执行导入/补全：ATTACH 种子库 → 比对版本集合 → 需要补全时
-/// 逐表 INSERT OR IGNORE → 记录 meta。返回本次补全的总行数。
+/// 打开主库新连接执行导入/补全：ATTACH 种子库 → 判断是否需要补 → 逐表
+/// INSERT OR IGNORE → 记录 meta。返回本次补全的总行数。
 ///
-/// 补全条件：种子库中存在主库没有的 version_label（主库为空时天然成立）。
-/// 主库版本已全覆盖种子库 → 返回 0 跳过，避免每次启动重复写库。
+/// 补全条件（任一成立即补，均为只增不删）：
+/// 1. 种子库存在主库没有的 version_label（主库为空时天然成立）；
+/// 2. 种子库已重新生成（`last_refreshed_at` 与主库记录的 `seeded_revision` 不同）。
+///
+/// 条件 2 的必要性：同一版本的数据会被重新抓取刷新（如 26.0.0 先有 Beta 后有
+/// Release，两者 version_label 相同但条目更多）。只按版本集合判断会让老用户
+/// 永远拿不到同版本的新增条目。
 fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
     let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA busy_timeout=5000;")
@@ -70,8 +75,26 @@ fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
         )
         .unwrap_or(0);
 
+    // 种子库构建批次：以种子库自身的 last_refreshed_at 为修订号
+    let seed_revision: String = tx
+        .query_row(
+            "SELECT COALESCE((SELECT value FROM seed.api_docs_meta WHERE key='last_refreshed_at'), '')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let imported_revision: String = tx
+        .query_row(
+            "SELECT COALESCE((SELECT value FROM main.api_docs_meta WHERE key='seeded_revision'), '')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    // 修订号为空（旧种子库没有 last_refreshed_at）时不据此触发，避免每次启动全表比对
+    let revision_changed = !seed_revision.is_empty() && seed_revision != imported_revision;
+
     let mut total = 0usize;
-    if missing > 0 {
+    if missing > 0 || revision_changed {
         let tables = ["api_docs", "api_details", "api_members", "api_docs_embeddings", "api_docs_meta"];
         for t in tables {
             // 种子库可能缺表（旧种子/精简种子），逐表容错：表不存在则跳过
@@ -98,6 +121,13 @@ fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
             [],
         )
         .map_err(|e| format!("写入导入标记失败: {e}"))?;
+        if !seed_revision.is_empty() {
+            tx.execute(
+                "INSERT OR REPLACE INTO main.api_docs_meta (key, value) VALUES ('seeded_revision', ?1)",
+                [seed_revision.as_str()],
+            )
+            .map_err(|e| format!("写入种子修订号失败: {e}"))?;
+        }
     }
     tx.commit().map_err(|e| e.to_string())?;
     let _ = conn.execute_batch("DETACH DATABASE seed");
@@ -202,6 +232,67 @@ mod tests {
         // 幂等：版本已全覆盖后再次调用应跳过
         let again = import_into(&main, &seed).expect("二次调用应跳过");
         assert_eq!(again, 0, "版本已齐全时不再导入");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同版本数据被重新抓取（如 26.0.0 从 Beta 口径刷新到 Release 口径）→
+    /// 版本集合没变，但条目更多：应按种子修订号补入新增条目，且只增不删、可重入。
+    #[test]
+    fn test_seed_import_backfills_same_version_refresh() {
+        let dir = std::env::temp_dir().join(format!("deveco-seed-rev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let main = dir.join("main.db");
+        let seed = dir.join("seed.db");
+
+        let schema = "
+            CREATE TABLE api_docs (id INTEGER PRIMARY KEY AUTOINCREMENT, kit TEXT NOT NULL, dts_file TEXT, module TEXT, class_name TEXT, declaration TEXT NOT NULL, api_name TEXT, change_type TEXT NOT NULL, version_label TEXT NOT NULL, api_level INTEGER, old_declaration TEXT, source_url TEXT, fetched_at INTEGER NOT NULL);
+            CREATE TABLE api_details (id INTEGER PRIMARY KEY AUTOINCREMENT, module TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, title TEXT, kit TEXT, since_api_level INTEGER, deprecated INTEGER NOT NULL DEFAULT 0, import_snippet TEXT, syscap TEXT, permissions TEXT, device_types TEXT, body TEXT, examples TEXT, members TEXT, source_url TEXT NOT NULL, fetched_at INTEGER NOT NULL);
+            CREATE TABLE api_members (id INTEGER PRIMARY KEY AUTOINCREMENT, detail_slug TEXT NOT NULL, module TEXT, parent_name TEXT, member_name TEXT NOT NULL, kind TEXT NOT NULL, declaration TEXT, description TEXT, since_api_level INTEGER, deprecated INTEGER NOT NULL DEFAULT 0, syscap TEXT, permission TEXT, source_url TEXT);
+            CREATE TABLE api_docs_meta (key TEXT PRIMARY KEY, value TEXT);
+        ";
+        // 种子库：26.0.0 两条，修订号 100
+        {
+            let c = rusqlite::Connection::open(&seed).unwrap();
+            c.execute_batch(schema).unwrap();
+            c.execute_batch(
+                "INSERT INTO api_docs (kit, declaration, change_type, version_label, fetched_at) VALUES
+                   ('Ability Kit','function betaOnly(): void;','added','26.0.0', 0),
+                   ('Ability Kit','function releaseOnly(): void;','added','26.0.0', 0);
+                 INSERT INTO api_docs_meta (key, value) VALUES ('last_refreshed_at', '100');",
+            )
+            .unwrap();
+        }
+        // 主库：同一版本只有 Beta 期的一条，记录的是上一批次修订号 50
+        {
+            let c = rusqlite::Connection::open(&main).unwrap();
+            c.execute_batch(schema).unwrap();
+            c.execute_batch(
+                "INSERT INTO api_docs (kit, declaration, change_type, version_label, fetched_at) VALUES
+                   ('Ability Kit','function betaOnly(): void;','added','26.0.0', 0);
+                 INSERT INTO api_docs_meta (key, value) VALUES ('seeded_revision', '50');",
+            )
+            .unwrap();
+        }
+
+        let n = import_into(&main, &seed).expect("同版本刷新应补入新增条目");
+        assert!(n >= 1, "应补入 Release 期新增条目，实际插入 {n} 行");
+        let c = rusqlite::Connection::open(&main).unwrap();
+        let rows: i64 = c
+            .query_row("SELECT COUNT(*) FROM api_docs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "原有条目保留 + 新增 1 条");
+        let rev: String = c
+            .query_row(
+                "SELECT value FROM api_docs_meta WHERE key='seeded_revision'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rev, "100", "应记录本批种子修订号");
+
+        // 幂等：修订号已一致 → 跳过
+        let again = import_into(&main, &seed).expect("二次调用应跳过");
+        assert_eq!(again, 0, "修订号已对齐时不再导入");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

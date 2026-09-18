@@ -1026,14 +1026,9 @@ fn extract_compatible(text: &str) -> Option<(String, Option<i64>)> {
     }
 }
 
-/// 从 "5.0.0(12)" 或 "12" 提取 API level 数字
+/// 从 "5.0.0(12)"、"26.0.0" 或 "12" 提取等价 API level
 fn parse_compatible_version(s: &str) -> Option<i64> {
-    if let Some(start) = s.find('(') {
-        if let Some(end) = s.find(')') {
-            return s[start + 1..end].trim().parse().ok();
-        }
-    }
-    s.trim().parse().ok()
+    crate::services::sdk_version::api_level(s)
 }
 
 // ---------- OpenHarmony 文档本地镜像（替代需登录的华为文档站） ----------
