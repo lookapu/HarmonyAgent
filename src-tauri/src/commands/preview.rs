@@ -196,7 +196,12 @@ pub async fn preview_start(
         .map(|p| p.trim().trim_start_matches('/').to_string())
         .filter(|p| !p.is_empty())
         .or_else(|| previewer::default_page(&root, &module))
-        .ok_or_else(|| format!("无法确定预览页面：{} 内没有 main_pages.json", module))?;
+        .ok_or_else(|| {
+            format!(
+                "无法确定预览页面：{module} 里既没有 module.json5 声明的页面清单（$profile:），\
+                 也找不到约定入口 pages/Index。请在 DevEco 里确认该模块能正常预览。"
+            )
+        })?;
 
     // 先停掉旧会话，避免重复点击泄漏引擎进程
     let previous = { SESSION.lock().map_err(|e| e.to_string())?.take() };

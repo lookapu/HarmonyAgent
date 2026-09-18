@@ -238,16 +238,62 @@ pub fn parse_ws_frame(buf: &[u8]) -> WsFrame {
     }
 }
 
-/// 默认预览页：取模块 `main_pages.json` 的首个页面，省得用户填路径。
+/// 默认预览页：省得用户为点一次预览去查页面路径。
+///
+/// 页面清单的文件名由 `module.json5` 的 `"pages": "$profile:<name>"` 决定，**不一定是
+/// `main_pages.json`**（实测有工程用 `mvp_pages.json`）；写死文件名会让正常工程取不到
+/// 入口页。顺序：声明的 profile（含 `base` 之外的限定目录）→ `main_pages.json` →
+/// 约定入口 `pages/Index`（存在该文件时）。
 pub fn default_page(project_root: &Path, module: &str) -> Option<String> {
-    let profile = project_root
-        .join(module)
+    let module_dir = project_root.join(module);
+    let main = module_dir.join("src").join("main");
+    let resources = main.join("resources");
+    let mut profiles: Vec<PathBuf> = Vec::new();
+    let declared = std::fs::read_to_string(main.join("module.json5"))
+        .ok()
+        .and_then(|text| declared_pages_profile(&text));
+    if let Some(name) = &declared {
+        profiles.push(resources.join("base").join("profile").join(name));
+        // 同一 profile 也可能放在其它资源限定目录（zh_CN 等）下
+        if let Ok(entries) = std::fs::read_dir(&resources) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("profile").join(name);
+                if candidate.is_file() {
+                    profiles.push(candidate);
+                }
+            }
+        }
+    }
+    profiles.push(resources.join("base").join("profile").join("main_pages.json"));
+    for profile in profiles {
+        if let Some(page) = first_page_in(&profile) {
+            return Some(page);
+        }
+    }
+    module_dir
         .join("src")
         .join("main")
-        .join("resources")
-        .join("base")
-        .join("profile")
-        .join("main_pages.json");
+        .join("ets")
+        .join("pages")
+        .join("Index.ets")
+        .is_file()
+        .then(|| "pages/Index".to_string())
+}
+
+/// 从 `module.json5` 文本里取 `"pages": "$profile:<name>"` 的配置文件名（补 `.json`）。
+fn declared_pages_profile(text: &str) -> Option<String> {
+    let marker = "$profile:";
+    let after = &text[text.find("\"pages\"")?..];
+    let at = after.find(marker)? + marker.len();
+    let name: String = after[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    (!name.is_empty()).then(|| format!("{name}.json"))
+}
+
+/// 页面清单里 `src` 的首项（去掉前导斜杠，引擎要的是 `pages/Index` 这种相对形式）。
+fn first_page_in(profile: &Path) -> Option<String> {
     let text = std::fs::read_to_string(profile).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     value["src"]
@@ -652,22 +698,69 @@ mod tests {
         assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF], "应是 JPEG SOI");
     }
 
+    /// 页面清单文件名由 module.json5 的 `$profile:` 决定——真实工程里有叫 `mvp_pages` 的，
+    /// 写死 `main_pages.json` 会让正常工程取不到入口页（本机实测过的误报）。
     #[test]
-    fn default_page_reads_first_entry_of_main_pages() {
-        let root = std::env::temp_dir().join(format!("deveco-prev-page-{}", std::process::id()));
+    fn default_page_reads_the_declared_pages_profile() {
+        let root = std::env::temp_dir().join(format!("deveco-prev-profile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let dir = root.join("entry/src/main/resources/base/profile");
-        std::fs::create_dir_all(&dir).unwrap();
+        let main = root.join("entry/src/main");
+        std::fs::create_dir_all(main.join("resources/base/profile")).unwrap();
         std::fs::write(
-            dir.join("main_pages.json"),
+            main.join("module.json5"),
+            r#"{"module":{"name":"entry","pages":"$profile:mvp_pages"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            main.join("resources/base/profile/mvp_pages.json"),
+            r#"{"src":["pages/Index","pages/MainPage"]}"#,
+        )
+        .unwrap();
+        assert_eq!(default_page(&root, "entry").as_deref(), Some("pages/Index"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 声明缺失时退回 `main_pages.json`，并且前导斜杠要去掉（引擎要相对形式）。
+    #[test]
+    fn default_page_falls_back_to_main_pages() {
+        let root = std::env::temp_dir().join(format!("deveco-prev-main-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("entry/src/main");
+        std::fs::create_dir_all(main.join("resources/base/profile")).unwrap();
+        std::fs::write(
+            main.join("resources/base/profile/main_pages.json"),
             r#"{"src":["/pages/Second","pages/Index"]}"#,
         )
         .unwrap();
-        assert_eq!(
-            default_page(&root, "entry").as_deref(),
-            Some("pages/Second")
-        );
+        assert_eq!(default_page(&root, "entry").as_deref(), Some("pages/Second"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 两份清单都没有时，看约定入口文件是否存在；没有就不猜。
+    #[test]
+    fn default_page_falls_back_to_index_only_when_it_exists() {
+        let root = std::env::temp_dir().join(format!("deveco-prev-index-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ets = root.join("entry/src/main/ets/pages");
+        std::fs::create_dir_all(&ets).unwrap();
+        assert!(default_page(&root, "entry").is_none(), "没有 Index.ets 时不该猜");
+        std::fs::write(ets.join("Index.ets"), "//").unwrap();
+        assert_eq!(default_page(&root, "entry").as_deref(), Some("pages/Index"));
         assert!(default_page(&root, "missing").is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn declared_pages_profile_parses_and_rejects_missing() {
+        assert_eq!(
+            declared_pages_profile(r#"{"pages":"$profile:mvp_pages"}"#).as_deref(),
+            Some("mvp_pages.json")
+        );
+        assert_eq!(
+            declared_pages_profile(r#"{"module":{"pages":"$profile:main_pages"}}"#).as_deref(),
+            Some("main_pages.json")
+        );
+        assert!(declared_pages_profile(r#"{"pages":"pages/Index"}"#).is_none());
+        assert!(declared_pages_profile(r#"{"pages":"$profile:"}"#).is_none());
     }
 }
