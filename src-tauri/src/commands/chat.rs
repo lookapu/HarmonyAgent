@@ -6442,288 +6442,55 @@ async fn stream_chat_inner(
             ToolCallPrepOutcome::Finish => break 'outer,
         };
         if !calls.is_empty() {
-            // 工具循环是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾；
-            // exhausted 声明在循环外，主流程据此判定任务是否被护栏强制收尾——强制收尾时账本需保留）
-            // 并发调度：连续只读工具（L0 且无交互副作用）进入批次并行执行（≤4 有界池），
-            // 写工具串行 barrier；结果按模型序提交（行为与串行一致，只读工具提速）
-            let mut pending: Vec<(String, String, u32)> = Vec::new();
-            // 工具执行上下文（并发批次与串行工具共享；主 Agent 可委派 1 层子 Agent）
-            let tool_ctx = crate::agent::exec_ctx::ToolCtx::new(
-                app.clone(),
-                conversation_id.clone(),
-                trace_id.clone(),
-            );
-            for (tool, args_raw) in calls {
-                let (tool_attempt, verdict) = match kernel_executor.begin_tool_attempt(&tool, &args_raw) {
-                    crate::agent::kernel_executor::KernelToolAttemptDecision::Observed {
-                        attempt,
-                        verdict,
-                    } => (attempt, verdict),
-                    crate::agent::kernel_executor::KernelToolAttemptDecision::Halt { .. } => {
-                        exhausted = true;
-                        break;
-                    }
-                };
-                // 每个工具独立计时：覆盖审批等待与重试，作为 done 事件的精确耗时
-                let tool_begin = std::time::Instant::now();
-                let call_id = Uuid::new_v4().to_string();
-                // 工具心跳：长工具执行（build/run 可达数分钟）期间保持心跳，防看门狗误杀
-                registry.touch(&conversation_id, PHASE_TOOL);
-                // 工具执行跟踪（含批处理路径：本循环所有工具均经过此处）
-                crate::utils::logger::log_event(
-                    "tool_started",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "tool": tool,
-                        "args": args_raw.chars().take(200).collect::<String>(),
-                        "elapsed_ms": task_started.elapsed().as_millis() as i64,
-                    }),
-                );
-                // 工具循环检测：由共享 KernelExecutorState 持有 governor 状态。
-                if let crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, repeat, same_name, turn_calls } = verdict {
-                    crate::utils::logger::log_event(
-                        "tool_loop_detected",
-                        serde_json::json!({
-                            "conversation_id": conversation_id,
-                            "tool": tool,
-                            "repeat": repeat,
-                            "same_name": same_name,
-                            "turn_calls": turn_calls,
-                            "breaks": kernel_executor.loop_breaks(),
-                        }),
-                    );
-                    pending.clear();
-                    if final_halt {
-                        exhausted = true;
-                    } else {
-                        correction_text = String::new();
-                        correction_hint = corrective_hint.unwrap_or_default();
-                    }
-                    break;
-                }
-                // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
-                // executor attempt 在当前调用进入时已原子 +1，因此 attempt-1 是此前累计
-                // 尝试数；它跨恢复血缘持续，不能再用本次进程内 Vec 长度重置额度。
-                if let ToolLimitOutcome::Stop = enforce_tool_budget_limit(ToolLimitInputs {
-                    app,
-                    state,
-                    cancel,
-                    registry,
-                    client: &client,
-                    protocol: &protocol,
-                    provider: &provider,
-                    opts: &opts,
-                    messages: &messages,
-                    model_choice: &model_choice,
-                    conversation_id: &conversation_id,
-                    trace_id: &trace_id,
-                    execution_budget: &execution_budget,
-                    tool: &tool,
-                    args_raw: &args_raw,
-                    call_id: &call_id,
-                    tool_begin,
-                    tool_attempt,
-                    tool_runs: &tool_runs,
-                    executor: &mut kernel_executor,
-                    max_tool_rounds: &mut max_tool_rounds,
-                    budget_extensions: &mut budget_extensions,
-                    full: &mut full,
-                    stats: &mut *stats,
-                    placeholder_msg_id: &mut placeholder_msg_id,
-                })
-                .await?
-                {
-                    exhausted = true;
-                    break;
-                }
-                // 只读工具进入批次（达到并发上限先排空防占位）；写工具为 barrier：
-                // 先排空批次（并行执行 + 按模型序提交）再串行执行当前工具
-                if is_concurrency_safe(&tool) {
-                    pending.push((
-                        tool.clone(),
-                        args_raw.clone(),
-                        (tool_runs.len() + 1 + pending.len()) as u32,
-                    ));
-                    if pending.len() >= MAX_TOOL_CONCURRENCY {
-                        let intercepted = flush_tool_batch(ToolBatchInputs {
-                            pending: &mut pending,
-                            app,
-                            state,
-                            opts: &opts,
-                            mcp: &mcp,
-                            tool_ctx: &tool_ctx,
-                            project_path: &project_path,
-                            path_hints: &path_hints,
-                            project_id: &project_id,
-                            conversation_id: &conversation_id,
-                            cancel,
-                            registry,
-                            trace_id: &trace_id,
-                            client: &client,
-                            protocol: &protocol,
-                            provider: &provider,
-                            model_choice: &model_choice,
-                            messages: &messages,
-                            executor: &kernel_executor,
-                            tool_runs: &mut tool_runs,
-                            consecutive_failures: &mut consecutive_failures,
-                            replan_given: &mut replan_given,
-                            replan_instruction: &mut replan_instruction,
-                            stats: &mut *stats,
-                            tools_since_progress: &mut tools_since_progress,
-                            full: &mut full,
-                            placeholder_msg_id: placeholder_msg_id.as_deref(),
-                            max_tool_rounds,
-                            budget_extensions,
-                        })
-                        .await?;
-                        if intercepted {
-                            exhausted = true;
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                if !pending.is_empty() {
-                    let intercepted = flush_tool_batch(ToolBatchInputs {
-                        pending: &mut pending,
-                        app,
-                        state,
-                        opts: &opts,
-                        mcp: &mcp,
-                        tool_ctx: &tool_ctx,
-                        project_path: &project_path,
-                        path_hints: &path_hints,
-                        project_id: &project_id,
-                        conversation_id: &conversation_id,
-                        cancel,
-                        registry,
-                        trace_id: &trace_id,
-                        client: &client,
-                        protocol: &protocol,
-                        provider: &provider,
-                        model_choice: &model_choice,
-                        messages: &messages,
-                        executor: &kernel_executor,
-                        tool_runs: &mut tool_runs,
-                        consecutive_failures: &mut consecutive_failures,
-                        replan_given: &mut replan_given,
-                        replan_instruction: &mut replan_instruction,
-                        stats: &mut *stats,
-                        tools_since_progress: &mut tools_since_progress,
-                        full: &mut full,
-                        placeholder_msg_id: placeholder_msg_id.as_deref(),
-                        max_tool_rounds,
-                        budget_extensions,
-                    })
-                    .await?;
-                    if intercepted {
-                        exhausted = true;
-                        break;
-                    }
-                }
-                match run_one_tool(ToolExecInputs {
-                    app,
-                    state,
-                    opts: &opts,
-                    mcp: &mcp,
-                    tool_ctx: &tool_ctx,
-                    project_path: &project_path,
-                    path_hints: &path_hints,
-                    project_id: &project_id,
-                    conversation_id: &conversation_id,
-                    cancel,
-                    registry,
-                    trace_id: &trace_id,
-                    client: &client,
-                    protocol: &protocol,
-                    provider: &provider,
-                    model_choice: &model_choice,
-                    messages: &messages,
-                    approval,
-                    placeholder_msg_id: &mut placeholder_msg_id,
-                    tool_runs: &mut tool_runs,
-                    consecutive_failures: &mut consecutive_failures,
-                    replan_given: &mut replan_given,
-                    replan_instruction: &mut replan_instruction,
-                    stats: &mut *stats,
-                    full: &mut full,
-                    modified_files: &mut modified_files,
-                    images: &mut images,
-                    tool: &tool,
-                    args_raw: &args_raw,
-                    call_id: &call_id,
-                    tool_begin,
-                    max_tool_rounds,
-                })
-                .await?
-                {
-                    // 正常完成：调用方继续推进每轮计数与执行器检查点
-                    ToolExecOutcome::Next => {}
-                    // 该工具已跳过（未通过验证门/登记失败）：不推进计数
-                    ToolExecOutcome::Skip => continue,
-                    // 已按拦截或停止收尾：置位 `exhausted` 后结束工具循环，
-                    // 保持原代码「置位后立刻 break」的顺序（此处等价）
-                    ToolExecOutcome::Stop => {
-                        exhausted = true;
-                        break;
-                    }
-                }
-            // 每个工具执行完成后推进进度对照计数（计划批准后每 3 个工具注入一次进度汇报）
-            tools_since_progress += 1;
-            persist_desktop_executor_checkpoint(
+            // 结算本轮工具执行：`Finish` 表示被护栏强制收尾（置位后结束任务），
+            // `ContinueRound` 表示本轮工具已跑完，进入下一轮
+            let tool_round = run_tool_calls(ToolRoundInputs {
+                calls,
+                app,
                 state,
-                &trace_id,
-                &conversation_id,
-                kernel_executor.checkpoint(),
-                crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
-                placeholder_msg_id.as_deref(),
-                max_tool_rounds,
-                budget_extensions,
-            )?;
-            }
-            // for 结束：排空剩余只读批次（本轮全部输出只读工具时）
-            if !pending.is_empty() {
-                let intercepted = flush_tool_batch(ToolBatchInputs {
-                    pending: &mut pending,
-                    app,
-                    state,
-                    opts: &opts,
-                    mcp: &mcp,
-                    tool_ctx: &tool_ctx,
-                    project_path: &project_path,
-                    path_hints: &path_hints,
-                    project_id: &project_id,
-                    conversation_id: &conversation_id,
-                    cancel,
-                    registry,
-                    trace_id: &trace_id,
-                    client: &client,
-                    protocol: &protocol,
-                    provider: &provider,
-                    model_choice: &model_choice,
-                    messages: &messages,
-                    executor: &kernel_executor,
-                    tool_runs: &mut tool_runs,
-                    consecutive_failures: &mut consecutive_failures,
-                    replan_given: &mut replan_given,
-                    replan_instruction: &mut replan_instruction,
-                    stats: &mut *stats,
-                    tools_since_progress: &mut tools_since_progress,
-                    full: &mut full,
-                    placeholder_msg_id: placeholder_msg_id.as_deref(),
-                    max_tool_rounds,
-                    budget_extensions,
-                })
-                .await?;
-                if intercepted {
+                cancel,
+                registry,
+                client: &client,
+                protocol: &protocol,
+                provider: &provider,
+                opts: &opts,
+                messages: &messages,
+                model_choice: &model_choice,
+                conversation_id: &conversation_id,
+                trace_id: &trace_id,
+                execution_budget: &execution_budget,
+                executor: &mut kernel_executor,
+                tool_runs: &mut tool_runs,
+                max_tool_rounds: &mut max_tool_rounds,
+                budget_extensions: &mut budget_extensions,
+                full: &mut full,
+                stats: &mut *stats,
+                placeholder_msg_id: &mut placeholder_msg_id,
+                mcp: &mcp,
+                project_path: &project_path,
+                path_hints: &path_hints,
+                project_id: &project_id,
+                approval,
+                modified_files: &mut modified_files,
+                images: &mut images,
+                consecutive_failures: &mut consecutive_failures,
+                replan_given: &mut replan_given,
+                replan_instruction: &mut replan_instruction,
+                tools_since_progress: &mut tools_since_progress,
+                correction_text: &mut correction_text,
+                correction_hint: &mut correction_hint,
+                task_started,
+            })
+            .await?;
+            match tool_round {
+                // 被护栏强制收尾：置位外层标志并结束任务（账本保留）
+                ToolRoundOutcome::Finish => {
                     exhausted = true;
+                    break;
                 }
+                // 本轮工具执行完毕：进入下一轮
+                ToolRoundOutcome::ContinueRound => continue,
             }
-            if exhausted {
-                break;
-            }
-            continue;
         }
         match run_plan_gate(PlanGateInputs {
             app,
@@ -10930,6 +10697,385 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                 }
             }
     Ok(ToolExecOutcome::Next)
+}
+
+/// 一轮工具执行的结论（替代原内联代码末尾的 `break` / `continue`）。
+enum ToolRoundOutcome {
+    /// 被护栏强制收尾（上限/预算/用户拒绝拦截）：调用方置位 `exhausted` 并结束任务
+    Finish,
+    /// 本轮工具执行完毕：调用方进入下一轮
+    ContinueRound,
+}
+
+/// `run_tool_calls` 的输入（`calls` 按值传入：原 `for` 循环即消费它，其余全部借用）。
+struct ToolRoundInputs<'a> {
+    calls: Vec<(String, String)>,
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    approval: &'a tauri::State<'a, ToolApprovalState>,
+    registry: &'a TaskRegistry,
+    client: &'a reqwest::Client,
+    protocol: &'a str,
+    provider: &'a ProviderEndpoint,
+    opts: &'a ChatOptions,
+    messages: &'a [serde_json::Value],
+    model_choice: &'a ModelChoice,
+    conversation_id: &'a String,
+    trace_id: &'a String,
+    project_path: &'a String,
+    project_id: &'a String,
+    path_hints: &'a [String],
+    execution_budget: &'a crate::agent::governance::ExecutionBudget,
+    executor: &'a mut KernelIoRunLoop,
+    tool_runs: &'a mut Vec<ToolRunItem>,
+    max_tool_rounds: &'a mut usize,
+    budget_extensions: &'a mut usize,
+    full: &'a mut String,
+    stats: &'a mut ChatRunStats,
+    placeholder_msg_id: &'a mut Option<String>,
+    mcp: &'a crate::services::mcp_manager::McpManager,
+    modified_files: &'a mut Vec<String>,
+    images: &'a mut Option<Vec<String>>,
+    consecutive_failures: &'a mut u32,
+    replan_given: &'a mut bool,
+    replan_instruction: &'a mut Option<String>,
+    tools_since_progress: &'a mut u32,
+    correction_text: &'a mut String,
+    correction_hint: &'a mut String,
+    task_started: std::time::Instant,
+}
+
+/// 执行本轮的全部工具调用（纯搬运：原工具循环内联代码，行为一致）：只读批次并发调度、
+/// 每工具的尝试裁决与预算门、调用 `run_one_tool`、循环末尾批次兜底排空。
+///
+/// `exhausted` 在本函数内累计；返回 `Finish` 时由调用方置位外层标志并结束任务。
+/// 函数体保留原内联代码的缩进与借用写法（便于逐行比对），因此与 `run_one_tool` 一样
+/// 在函数级收口 `clippy::needless_borrow`：输入改为引用后，原代码对局部变量的 `&x`
+/// 成了多余借用，逐处改写会淹没搬运本身。两处例外都在第 7 步合段时随借用一并清理。
+#[allow(clippy::needless_borrow)]
+async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome, ChatFlowError> {
+    let ToolRoundInputs {
+        calls,
+        app,
+        state,
+        cancel,
+        approval,
+        registry,
+        client,
+        protocol,
+        provider,
+        opts,
+        messages,
+        model_choice,
+        conversation_id,
+        trace_id,
+        project_path,
+        project_id,
+        path_hints,
+        execution_budget,
+        executor: kernel_executor,
+        tool_runs,
+        max_tool_rounds,
+        budget_extensions,
+        full,
+        stats,
+        placeholder_msg_id,
+        mcp,
+        modified_files,
+        images,
+        consecutive_failures,
+        replan_given,
+        replan_instruction,
+        tools_since_progress,
+        correction_text,
+        correction_hint,
+        task_started,
+    } = inputs;
+    // 本轮是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾）
+    let mut exhausted = false;
+            // 工具循环是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾；
+            // 本函数内的 exhausted 一旦置位即返回 Finish，由调用方结束任务——强制收尾时账本需保留）
+            // 并发调度：连续只读工具（L0 且无交互副作用）进入批次并行执行（≤4 有界池），
+            // 写工具串行 barrier；结果按模型序提交（行为与串行一致，只读工具提速）
+            let mut pending: Vec<(String, String, u32)> = Vec::new();
+            // 工具执行上下文（并发批次与串行工具共享；主 Agent 可委派 1 层子 Agent）
+            let tool_ctx = crate::agent::exec_ctx::ToolCtx::new(
+                app.clone(),
+                conversation_id.clone(),
+                trace_id.clone(),
+            );
+            for (tool, args_raw) in calls {
+                let (tool_attempt, verdict) = match kernel_executor.begin_tool_attempt(&tool, &args_raw) {
+                    crate::agent::kernel_executor::KernelToolAttemptDecision::Observed {
+                        attempt,
+                        verdict,
+                    } => (attempt, verdict),
+                    crate::agent::kernel_executor::KernelToolAttemptDecision::Halt { .. } => {
+                        exhausted = true;
+                        break;
+                    }
+                };
+                // 每个工具独立计时：覆盖审批等待与重试，作为 done 事件的精确耗时
+                let tool_begin = std::time::Instant::now();
+                let call_id = Uuid::new_v4().to_string();
+                // 工具心跳：长工具执行（build/run 可达数分钟）期间保持心跳，防看门狗误杀
+                registry.touch(&conversation_id, PHASE_TOOL);
+                // 工具执行跟踪（含批处理路径：本循环所有工具均经过此处）
+                crate::utils::logger::log_event(
+                    "tool_started",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "tool": tool,
+                        "args": args_raw.chars().take(200).collect::<String>(),
+                        "elapsed_ms": task_started.elapsed().as_millis() as i64,
+                    }),
+                );
+                // 工具循环检测：由共享 KernelExecutorState 持有 governor 状态。
+                if let crate::agent::kernel_loop::KernelLoopVerdict::Halt { corrective_hint, final_halt, repeat, same_name, turn_calls } = verdict {
+                    crate::utils::logger::log_event(
+                        "tool_loop_detected",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "tool": tool,
+                            "repeat": repeat,
+                            "same_name": same_name,
+                            "turn_calls": turn_calls,
+                            "breaks": kernel_executor.loop_breaks(),
+                        }),
+                    );
+                    pending.clear();
+                    if final_halt {
+                        exhausted = true;
+                    } else {
+                        *correction_text = String::new();
+                        *correction_hint = corrective_hint.unwrap_or_default();
+                    }
+                    break;
+                }
+                // 工具轮次上限：明确提示 + 给模型最后一次总结机会，避免输出戛然而止
+                // executor attempt 在当前调用进入时已原子 +1，因此 attempt-1 是此前累计
+                // 尝试数；它跨恢复血缘持续，不能再用本次进程内 Vec 长度重置额度。
+                if let ToolLimitOutcome::Stop = enforce_tool_budget_limit(ToolLimitInputs {
+                    app,
+                    state,
+                    cancel,
+                    registry,
+                    client: &client,
+                    protocol: &protocol,
+                    provider: &provider,
+                    opts: &opts,
+                    messages: &messages,
+                    model_choice: &model_choice,
+                    conversation_id: &conversation_id,
+                    trace_id: &trace_id,
+                    execution_budget: &execution_budget,
+                    tool: &tool,
+                    args_raw: &args_raw,
+                    call_id: &call_id,
+                    tool_begin,
+                    tool_attempt,
+                    tool_runs: &tool_runs,
+                    executor: kernel_executor,
+                    max_tool_rounds,
+                    budget_extensions,
+                    full,
+                    stats: &mut *stats,
+                    placeholder_msg_id,
+                })
+                .await?
+                {
+                    exhausted = true;
+                    break;
+                }
+                // 只读工具进入批次（达到并发上限先排空防占位）；写工具为 barrier：
+                // 先排空批次（并行执行 + 按模型序提交）再串行执行当前工具
+                if is_concurrency_safe(&tool) {
+                    pending.push((
+                        tool.clone(),
+                        args_raw.clone(),
+                        (tool_runs.len() + 1 + pending.len()) as u32,
+                    ));
+                    if pending.len() >= MAX_TOOL_CONCURRENCY {
+                        let intercepted = flush_tool_batch(ToolBatchInputs {
+                            pending: &mut pending,
+                            app,
+                            state,
+                            opts: &opts,
+                            mcp: &mcp,
+                            tool_ctx: &tool_ctx,
+                            project_path: &project_path,
+                            path_hints: &path_hints,
+                            project_id: &project_id,
+                            conversation_id: &conversation_id,
+                            cancel,
+                            registry,
+                            trace_id: &trace_id,
+                            client: &client,
+                            protocol: &protocol,
+                            provider: &provider,
+                            model_choice: &model_choice,
+                            messages: &messages,
+                            executor: &kernel_executor,
+                            tool_runs,
+                            consecutive_failures,
+                            replan_given,
+                            replan_instruction,
+                            stats: &mut *stats,
+                            tools_since_progress,
+                            full,
+                            placeholder_msg_id: placeholder_msg_id.as_deref(),
+                            max_tool_rounds: *max_tool_rounds,
+                            budget_extensions: *budget_extensions,
+                        })
+                        .await?;
+                        if intercepted {
+                            exhausted = true;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if !pending.is_empty() {
+                    let intercepted = flush_tool_batch(ToolBatchInputs {
+                        pending: &mut pending,
+                        app,
+                        state,
+                        opts: &opts,
+                        mcp: &mcp,
+                        tool_ctx: &tool_ctx,
+                        project_path: &project_path,
+                        path_hints: &path_hints,
+                        project_id: &project_id,
+                        conversation_id: &conversation_id,
+                        cancel,
+                        registry,
+                        trace_id: &trace_id,
+                        client: &client,
+                        protocol: &protocol,
+                        provider: &provider,
+                        model_choice: &model_choice,
+                        messages: &messages,
+                        executor: &kernel_executor,
+                        tool_runs,
+                        consecutive_failures,
+                        replan_given,
+                        replan_instruction,
+                        stats: &mut *stats,
+                        tools_since_progress,
+                        full,
+                        placeholder_msg_id: placeholder_msg_id.as_deref(),
+                        max_tool_rounds: *max_tool_rounds,
+                        budget_extensions: *budget_extensions,
+                    })
+                    .await?;
+                    if intercepted {
+                        exhausted = true;
+                        break;
+                    }
+                }
+                match run_one_tool(ToolExecInputs {
+                    app,
+                    state,
+                    opts: &opts,
+                    mcp: &mcp,
+                    tool_ctx: &tool_ctx,
+                    project_path: &project_path,
+                    path_hints: &path_hints,
+                    project_id: &project_id,
+                    conversation_id: &conversation_id,
+                    cancel,
+                    registry,
+                    trace_id: &trace_id,
+                    client: &client,
+                    protocol: &protocol,
+                    provider: &provider,
+                    model_choice: &model_choice,
+                    messages: &messages,
+                    approval,
+                    placeholder_msg_id,
+                    tool_runs,
+                    consecutive_failures,
+                    replan_given,
+                    replan_instruction,
+                    stats: &mut *stats,
+                    full,
+                    modified_files,
+                    images,
+                    tool: &tool,
+                    args_raw: &args_raw,
+                    call_id: &call_id,
+                    tool_begin,
+                    max_tool_rounds: *max_tool_rounds,
+                })
+                .await?
+                {
+                    // 正常完成：调用方继续推进每轮计数与执行器检查点
+                    ToolExecOutcome::Next => {}
+                    // 该工具已跳过（未通过验证门/登记失败）：不推进计数
+                    ToolExecOutcome::Skip => continue,
+                    // 已按拦截或停止收尾：置位 `exhausted` 后结束工具循环，
+                    // 保持原代码「置位后立刻 break」的顺序（此处等价）
+                    ToolExecOutcome::Stop => {
+                        exhausted = true;
+                        break;
+                    }
+                }
+            // 每个工具执行完成后推进进度对照计数（计划批准后每 3 个工具注入一次进度汇报）
+            *tools_since_progress += 1;
+            persist_desktop_executor_checkpoint(
+                state,
+                &trace_id,
+                &conversation_id,
+                kernel_executor.checkpoint(),
+                crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+                placeholder_msg_id.as_deref(),
+                *max_tool_rounds,
+                *budget_extensions,
+            )?;
+            }
+            // for 结束：排空剩余只读批次（本轮全部输出只读工具时）
+            if !pending.is_empty() {
+                let intercepted = flush_tool_batch(ToolBatchInputs {
+                    pending: &mut pending,
+                    app,
+                    state,
+                    opts: &opts,
+                    mcp: &mcp,
+                    tool_ctx: &tool_ctx,
+                    project_path: &project_path,
+                    path_hints: &path_hints,
+                    project_id: &project_id,
+                    conversation_id: &conversation_id,
+                    cancel,
+                    registry,
+                    trace_id: &trace_id,
+                    client: &client,
+                    protocol: &protocol,
+                    provider: &provider,
+                    model_choice: &model_choice,
+                    messages: &messages,
+                    executor: &kernel_executor,
+                    tool_runs,
+                    consecutive_failures,
+                    replan_given,
+                    replan_instruction,
+                    stats: &mut *stats,
+                    tools_since_progress,
+                    full,
+                    placeholder_msg_id: placeholder_msg_id.as_deref(),
+                    max_tool_rounds: *max_tool_rounds,
+                    budget_extensions: *budget_extensions,
+                })
+                .await?;
+                if intercepted {
+                    exhausted = true;
+                }
+            }
+            if exhausted {
+                return Ok(ToolRoundOutcome::Finish);
+            }
+            Ok(ToolRoundOutcome::ContinueRound)
 }
 
 /// 从文本提取到的目录路径及其语境分类。
