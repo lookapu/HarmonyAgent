@@ -868,3 +868,16 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **验证**（Windows 本机）：后端库 1,129 通过 / 0 失败 / 9 忽略；参考正文 672 → **681 页**（成员 13,500 → 13,705）；模块级未命中 34 → **25**；`check-docs.py` 通过；种子库 `integrity_check=ok`。
 
 **未闭环**：macOS 侧本批待 CI；25 个未映射项如需覆盖，只能靠"页面正文隶属关系"人工指定（当前证据显示它们没有独立页面）。
+
+## 54. 设备预览落地：后端驱动引擎 + 面板显示帧（2026-09-18）
+
+第 54 批（`56e1fd3` + `81c4a28`）：把 §52 的手工配方做成产品能力——预览面板不再只是 iframe 占位，而是显示引擎真渲染的页面。
+
+- **`services/previewer.rs`（新）**：定位 SDK 引擎（`<sdk>/<variant>/previewer/common/bin`）、组装 §52 验证过的参数表、从帧里切出 JPEG、以及一个**只收不发**的 WebSocket 客户端。只收的代价为零——服务端帧不掩码，解析器只需处理三种长度形态，因此**没有为此新增依赖**（握手用现成的 `ring` SHA-1 + `base64`）。另有默认页解析（取模块 `main_pages.json` 首个页面，用户不必填路径）与端口挑选（引擎硬约束 29000~50000，先探测占用）。
+- **`commands/preview.rs`**：`preview_start` 编排「预览构建（带 `buildRoot=.preview`）→ 起引擎 → 后台收帧推给前端」，`preview_stop` 收尾；同一时刻只保留一个会话，重复启动先停旧的，`spawn` 用 `kill_on_drop`（一个被丢弃的 child 不会留下 600MB 的引擎），取帧循环把 JPEG 以 base64 走 `preview-frame` 事件推出，错误走 `preview-error`。
+- **前端**：预览面板改为「设备预览（上）+ Web 预览 iframe（下，保留为回退）」；引擎缺失/构建失败时把后端给的原因直接显示出来，**不静默失败**；订阅在卸载时解绑，卸载同时停引擎。
+- **构建期踩到并修掉的自身问题**：`pick_port` 原来每轮重算 seed，快速循环里 seed 几乎不变，等于把同一端口重试 64 次（已改为按尝试次数扰动）；`clippy` 报的 `unnecessary_cast` 一并清掉。
+
+**验证**（Windows 本机）：后端库 **1,139 通过 / 0 失败 / 10 忽略**（+10 条预览用例）；`previewer::tests::e2e_preview_frames_from_real_engine` 对着真实工程跑通（构建 → 起引擎 → 取回 JPEG，断言 SOI 与尺寸）；clippy 57/57；前端 lint 0 / tsc 0 / 127 测试 / 构建与体积门禁（Home 697.0KB）/ UI 状态门禁 / `check-docs.py` 全过（services 61、IPC 303 已同步四份文档）。
+
+**未闭环**：交互事件回传（点击/滑动如何送回引擎）未做；热重载与多设备档切换未验；macOS 侧全流程未验；`preview_start` 需要 Tauri AppHandle，其调用点未纳入回归（与 Broker 同类边界）。
