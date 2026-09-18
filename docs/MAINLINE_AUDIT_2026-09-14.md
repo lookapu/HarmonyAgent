@@ -784,6 +784,20 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 **未闭环**：macOS 侧本批提交待 CI 复核；本批只保证「可解析」，Previewer/Emulator 的实际调用点尚未接入；预览端到端验证卡在 DevEco 环境的预览是否可用。
 
+## 49. 更正上一节：预览构建的阻塞点是缺 `-p buildRoot=.preview`（2026-09-18）
+
+第 49 批：上一节（工具链 PATH 注入那条，编号与并行会话的条目撞号，见下）把 `PreviewArkTS` 的稳定失败（error 00308018）记成「hvigor 侧缺陷、预览端到端待 DevEco 确认」。用户在本机 DevEco 里对同一个靶子工程 `H:\work\tmp\preview-fresh` 点预览**成功出画面**后复查，结论更正：**那是我们的调用缺了一个参数**，DevEco 不会踩。
+
+- **根因**：`BuildDirConst.PREVIEW_BUILD_PATH=".preview"`，插件用 `isPreview = hvigorCore.getExtraConfig().get(InjectConst.BUILD_ROOT /* = "buildRoot" */) === ".preview"` 决定构建根。**不传该参数时 `isPreview=false`**，预览任务链退化为 `PreBuild → CreateBuildProfile → buildPreviewerResource → PreviewArkTS`（跳过 `MergeProfile`/`ProcessProfile`/`CompileResource`/`PreviewCompileResource`），`.preview/` 目录根本不生成，而 `PreviewArkTS` 仍去读 `<module>/.preview/default/intermediates/res/default/module.json` → `undefined` → `writeFileSync(path, JSON.stringify(undefined))` 抛 TypeError。**hvigor 少一层 undefined 防护是次因，主因是调用没切到预览构建根**；§48 里「hvigor 缺陷、环境待确认」的框架因此作废（「全新空工程同样复现」这一现象仍成立，但解释不同）。
+- **正确调用**（本机实测 BUILD SUCCESSFUL，完整任务链 18 步、10.2s）：
+  `node <DevEco>/tools/hvigor/bin/hvigorw.js --mode module -p module=entry@default -p product=default -p buildRoot=.preview PreviewBuild`，产物落 `entry/.preview/`。对照排除：`daemon` 与 `--no-daemon` 不影响结果。
+- **预览服务已在 IDE 外跑通**：`node <DevEco>/plugins/openharmony/openharmony-preview-server/index.js -c <日志目录> -i <module>/.preview -p 29999 -pjd <id>`。日志自证契约：`Start preview web args: -c ***** -i ***** -p 29999 -pjd … -tpn undefined -hosp`（`-tpn`/`-hosp` 可缺省；端口须落在 (29000, 50000)）。两个实测坑：**`-c` 是目录不是文件**（传文件会因 log4js mkdir 报 `EEXIST` 直接崩）；`-i` 不存在会自动 mkdir，并在其下生成 `previewer/{phone,tablet,wearable,tv,car,2in1,smartVision,liteWearable}` 与 `previewConfigV2.json`。静态页 `http://127.0.0.1:<port>/ohpreviewer/` 返回 200，标题 `DevEco Studio Previewer`。
+- **DevEco 自己的 Previewer 命令行（旁证，接入时不必照抄）**：引擎由 preview server 托管，其实际参数为 `Previewer.exe -refresh region -projectID <id> -ts <pipe> -j <…/assets/default/ets> -s <session> -cpm false -device phone -shape rect -sd 480 -ljPath <…/loader/default/loader.json> -sid <uuid> -or 1080 2340 -cr 1080 2340 -f <.idea/previewer/phone/phoneSettingConfig_Phone.json> -url "pages/Index" -av "ACE_2_0" -n "entry" -arp <…/res/default> -pm …`。
+
+**验证**（Windows 本机）：`-p buildRoot=.preview` 下 `PreviewBuild` BUILD SUCCESSFUL，`entry/.preview/default/intermediates/...` 全部生成；preview server 在 29999 监听（`websocket server started successfully, port is 29999`），`/ohpreviewer/` 200。
+
+**未闭环**：只加载静态页不会拉起引擎（本机查到的 `Previewer.exe` 是 DevEco 自己启动的），客户端仍需按协议发起预览请求；前端预览面板接入与真实画面回显未做；macOS 侧全流程未验。
+
 ## 48. 参考文档匹配加固：短末段、父段消歧、错误码页排除与剩余 42 项清点（2026-09-18）
 
 第 48 批：把 171 个未命中的参考候选逐个归类，并按证据加固匹配规则——**新增 27 个候选命中、0 条既有映射被改变**。
@@ -800,3 +814,27 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **验证**（Windows 本机）：后端库 1,128 通过 / 0 失败 / 9 忽略（新增 3 条匹配规则用例：短末段、父段消歧、错误码排除/歧义拒绝）；联网 e2e（目录树命中 `@hms.*`）通过；`check-docs.py`、`check-warnings.py` 通过；种子库 `integrity_check=ok`。
 
 **未闭环**：macOS 侧本批待 CI；8 个待人工确认项未定；34 个"确实没有"中含纯中文标题页面无法自动判定；`@hms.nearlink.*` 与 `@ohos.nearlink.*` 指向同一页时会话里保留 `@ohos.*` 命名（slug 唯一约束所致，属预期）。
+
+## 49. 8 个待确认映射逐页取证定案、命名空间取页规则（2026-09-18）
+
+第 49 批：§48 留下的 8 个「有相近页面、需人工确认」不是拍脑袋选的——逐个抓官方页面正文取证后定案，并把取证中发现的一般规律写成规则。参考正文 664 → **672 页**、成员 13,236 → 13,500；模块级未命中 42 → **34**（只剩"目录树里没有对应文档"那一档）。
+
+**判据**（页面正文，不靠名字猜）：① 页面导入的 Kit —— `@kit.NearLinkKit` 是 HMS 版、`@kit.ConnectivityKit` 是 HarmonyOS 版；② `-api` / `-capi-` 后缀 —— ArkTS API 页 vs C API 页；③ 页面能力是否与模块 `d.ts` 一致。
+
+| 模块 | 定为 | 依据 |
+| --- | --- | --- |
+| `@hms.security.securityAudit` | `devicesecurity-securityaudit-api` | ArkTS 页（`@kit.DeviceSecurityKit`）；`-capi-` 是 C API |
+| `@hms.data.retrieval` | `dataaugmentation-retrieval-api` | ArkTS 页（`@kit.DataAugmentationKit`） |
+| `@hms.core.atomicserviceComponent.atomicservice` | `scenario-fusion-atomicservice` | 模块 d.ts 的 `FollowResult`/`FollowComponentParams`（关注组件）与该页声明的"关注组件"能力一致 |
+| `@hms.ai.insightIntent` | `intents-arkts-api-insightintent` | Intents Kit 的 `insightIntent` 子模块（共享/删除意图）；另一篇是 `@ohos.app.ability.insightIntent` |
+| `@hms.core.ar.arengine` | `arengine-api-arengine` | ArkTS API 页（`@kit.AREngine`）；`ar-engine-api` 是 Kit 落地页（导航到 ArkTS/组件/C API/错误码） |
+| `@kit.AREngine` | `ar-engine-api` | Kit 名对应落地页，本身没有 API 签名 |
+| `@hms.nearlink.remoteDevice` | `nearlink-remote-device` | HMS 页（`@kit.NearLinkKit`） |
+| `@hms.nearlink.dataTransfer` | `nearlink-data-transfer-api` | HMS 页（同上） |
+
+- **实现**：新增 `CATALOG_OVERRIDES` 人工映射表（8 条，模块名规范化后比较），在 `resolve()` 里优先于任何启发式——这类"标题完全不含模块名"或同族多义的页面，规则本来就不该硬猜。
+- **规则升级（取证副产物）**：消歧平票时改为**按命名空间取页**——`@hms.*` 取 Kit 文档（`nearlink-*`，导入 `@kit.NearLinkKit`），`@ohos.*` 取 `js-apis-*`（导入 `@kit.ConnectivityKit`）。此前一律优先 `js-apis-*`，导致 `@hms.nearlink.*` 与 `@ohos.nearlink.*` 争抢同一页、而 `api_details.slug` 唯一只能留一篇；现在两侧各取各的文档，6 个 `@hms.nearlink.*` 与对应的 `@ohos.nearlink.*` 都入库了。
+
+**验证**（Windows 本机）：后端库 1,129 通过 / 0 失败 / 9 忽略（新增人工映射优先级与命名空间取页用例）；`check-docs.py` 通过；种子库 `integrity_check=ok`（`api_details` 672 行 / `api_members` 13,401 条）。
+
+**未闭环**：macOS 侧本批待 CI；剩余 34 个模块在目录树里确实没有对应文档（其中含 809 篇纯中文标题页面，不逐页人工读无法排除"有文档但标题不含模块名"）。

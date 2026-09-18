@@ -141,13 +141,46 @@ pub struct CatalogIndex {
     tails: std::collections::HashMap<String, Vec<String>>,
 }
 
+/// 人工核对过的模块 → 文档 objectId 映射，优先于任何启发式匹配。
+///
+/// 这些模块靠规则命中不了或会多义，逐条对着官方页面正文确认过，判据是：
+/// 页面导入的 Kit（`@kit.NearLinkKit` 是 HMS 版、`@kit.ConnectivityKit` 是 HarmonyOS 版）、
+/// `-api` / `-capi-` 后缀（ArkTS API vs C API）、以及页面声明的能力是否与模块 d.ts 一致
+/// （如 `@hms.core.atomicserviceComponent.atomicservice` 的 `FollowResult`/关注组件对应
+/// `scenario-fusion-atomicservice` 的"关注组件"能力）。
+const CATALOG_OVERRIDES: &[(&str, &str)] = &[
+    ("@hms.security.securityAudit", "devicesecurity-securityaudit-api"),
+    ("@hms.data.retrieval", "dataaugmentation-retrieval-api"),
+    (
+        "@hms.core.atomicserviceComponent.atomicservice",
+        "scenario-fusion-atomicservice",
+    ),
+    ("@hms.ai.insightIntent", "intents-arkts-api-insightintent"),
+    ("@hms.core.ar.arengine", "arengine-api-arengine"),
+    ("@kit.AREngine", "ar-engine-api"),
+    ("@hms.nearlink.remoteDevice", "nearlink-remote-device"),
+    ("@hms.nearlink.dataTransfer", "nearlink-data-transfer-api"),
+];
+
+/// 查人工映射表（模块名规范化后比较，大小写与空白不敏感）。
+pub fn catalog_override(module: &str) -> Option<&'static str> {
+    let key = normalize_module(module);
+    CATALOG_OVERRIDES
+        .iter()
+        .find(|(m, _)| normalize_module(m) == key)
+        .map(|(_, object_id)| *object_id)
+}
+
 impl CatalogIndex {
     /// 解析模块名对应的文档 objectId。
     ///
-    /// 顺序：完整模块名 → 末段唯一 → 末段多义时按「父段一致」消歧（平票优先 `js-apis-*`
-    /// 的 ArkTS 文档）。多义时若除错误码页外只剩一篇，取那一篇：`errorcode-*` 是独立的
-    /// 错误码参考页，不能当作模块正文。
+    /// 顺序：人工映射 → 完整模块名 → 末段唯一 → 末段多义时按「父段一致」消歧（平票按命名
+    /// 空间取页：`@hms.*` 取 Kit 文档、其余取 `js-apis-*`）。多义时若除错误码页外只剩一篇，
+    /// 取那一篇：`errorcode-*` 是独立的错误码参考页，不能当作模块正文。
     pub fn resolve(&self, module: &str) -> Option<&str> {
+        if let Some(hit) = catalog_override(module) {
+            return Some(hit);
+        }
         let key = normalize_module(module);
         if key.is_empty() {
             return None;
@@ -199,21 +232,32 @@ impl CatalogIndex {
         match candidates.len() {
             0 => None,
             1 => Some(candidates[0].as_str()),
-            _ => {
-                // 平票：ArkTS 参考文档（js-apis-*）优先于 C API / Kit 落地页
-                let mut arkts: Vec<&String> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|id| id.starts_with("js-apis-"))
-                    .collect();
-                arkts.sort();
-                arkts.dedup();
-                if arkts.len() == 1 {
-                    Some(arkts[0].as_str())
+            _ => self.prefer_by_namespace(key, &candidates),
+        }
+    }
+
+    /// 平票时按命名空间取页：`@hms.*` 是 HMS Kit 面（如 `nearlink-*` 页面导入
+    /// `@kit.NearLinkKit`），其余（`@ohos.*`）是 HarmonyOS 面（`js-apis-*` 页面导入
+    /// `@kit.ConnectivityKit`）。两侧各自取到自己的文档，也避免同一页被两个模块争抢。
+    fn prefer_by_namespace<'a>(&self, key: &str, candidates: &[&'a String]) -> Option<&'a str> {
+        let hms = key.starts_with("@hms.");
+        let mut preferred: Vec<&String> = candidates
+            .iter()
+            .copied()
+            .filter(|id| {
+                if hms {
+                    !id.starts_with("js-apis-")
                 } else {
-                    None
+                    id.starts_with("js-apis-")
                 }
-            }
+            })
+            .collect();
+        preferred.sort();
+        preferred.dedup();
+        if preferred.len() == 1 {
+            Some(preferred[0].as_str())
+        } else {
+            None
         }
     }
 }
@@ -859,14 +903,14 @@ mod tests {
     #[test]
     fn catalog_index_resolves_short_tails_and_disambiguates() {
         // 3 字符末段（唯一）可解；撞名时按父段消歧；错误码页不当作正文；
-        // 平票时 ArkTS 文档（js-apis-*）优先。
+        // 平票按命名空间取页（@hms.* 取 Kit 文档、@ohos.* 取 js-apis 文档）。
         let docs = vec![
             CatalogDoc { object_id: "hmaf-a2a-protocol".into(), title: "A2A（智能体通信协议）".into(), path: vec![] },
             CatalogDoc { object_id: "iap-iap".into(), title: "iap（应用内支付）".into(), path: vec![] },
             CatalogDoc { object_id: "map-map".into(), title: "map（地图服务）".into(), path: vec![] },
             CatalogDoc { object_id: "js-apis-bluetooth-map".into(), title: "map（蓝牙MAP）".into(), path: vec![] },
             CatalogDoc { object_id: "js-apis-nearlink-advertising".into(), title: "@ohos.nearlink.advertising (星闪广播)".into(), path: vec![] },
-            CatalogDoc { object_id: "nearlink-advertising".into(), title: "advertising（星闪广播 C API）".into(), path: vec![] },
+            CatalogDoc { object_id: "nearlink-advertising".into(), title: "advertising（星闪广播能力）".into(), path: vec![] },
             CatalogDoc { object_id: "devicesecurity-trusted-auth-api".into(), title: "TrustedAuthentication（数字盾服务）".into(), path: vec![] },
             CatalogDoc { object_id: "errorcode-devicesecurity-trusted-auth".into(), title: "TrustedAuthentication （数字盾服务）".into(), path: vec![] },
         ];
@@ -876,15 +920,40 @@ mod tests {
         assert_eq!(index.resolve("@hms.core.iap"), Some("iap-iap"));
         // 末段 `map` 撞名：父段消歧选中 map-map，而不是蓝牙 MAP
         assert_eq!(index.resolve("@hms.core.map.map"), Some("map-map"));
-        // 末段撞名且都能对上父段：ArkTS 文档优先
+        // 撞名平票：@hms.* 取 Kit 文档、@ohos.* 取 js-apis 文档（各自拿到自己那篇）
         assert_eq!(
             index.resolve("@hms.nearlink.advertising"),
+            Some("nearlink-advertising")
+        );
+        assert_eq!(
+            index.resolve("@ohos.nearlink.advertising"),
             Some("js-apis-nearlink-advertising")
         );
         // 错误码页被排除后只剩正文页 → 命中
         assert_eq!(
             index.resolve("@hms.security.trustedAuthentication"),
             Some("devicesecurity-trusted-auth-api")
+        );
+    }
+
+    #[test]
+    fn catalog_overrides_win_over_heuristics() {
+        // 人工核对过的映射优先于任何规则（含"标题完全不含模块名"这类规则够不着的情况）
+        assert_eq!(
+            catalog_override("@hms.core.atomicserviceComponent.atomicservice"),
+            Some("scenario-fusion-atomicservice")
+        );
+        // 大小写/空白不敏感
+        assert_eq!(
+            catalog_override("@hms.security.securityAudit"),
+            Some("devicesecurity-securityaudit-api")
+        );
+        assert_eq!(catalog_override("@ohos.batteryInfo"), None);
+        // 通过索引解析时同样优先
+        let index = catalog_index(&[]);
+        assert_eq!(
+            index.resolve("@hms.ai.insightIntent"),
+            Some("intents-arkts-api-insightintent")
         );
     }
 
