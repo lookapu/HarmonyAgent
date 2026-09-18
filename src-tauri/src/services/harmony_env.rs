@@ -763,8 +763,9 @@ pub fn detect_auto() -> HarmonyEnv {
     detect_with(&HarmonyEnvConfig::default())
 }
 
-/// 获取应注入子进程 PATH 的目录列表（command-line-tools/bin 等），
-/// 供 utils/process 在启动 hdc/ohpm/hvigor 时优先使用。
+/// 获取应注入子进程 PATH 的目录列表（command-line-tools/bin、hdc、previewer、模拟器等），
+/// 供 utils/process 在启动 hdc/ohpm/hvigor/Previewer/Emulator 时优先使用。
+/// 目录不要求存在：解析时逐个候选做 is_file 判断，不存在的条目不产生副作用。
 pub fn path_dirs(env: &HarmonyEnv) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(cli) = &env.cli {
@@ -774,6 +775,18 @@ pub fn path_dirs(env: &HarmonyEnv) -> Vec<PathBuf> {
         if let Some(parent) = Path::new(hdc).parent() {
             dirs.push(parent.to_path_buf());
         }
+    }
+    // previewer 组件根是 <sdk>/<variant>/previewer，可执行文件在其 common/bin 下
+    for variant in &env.sdk_variants {
+        for comp in &variant.components {
+            if comp.name == "previewer" {
+                dirs.push(Path::new(&comp.path).join("common").join("bin"));
+            }
+        }
+    }
+    // 官方模拟器不在 SDK 内，位于 DevEco 安装目录的 tools/emulator
+    if let Some(studio) = &env.studio_dir {
+        dirs.push(Path::new(studio).join("tools").join("emulator"));
     }
     dirs
 }
@@ -1170,6 +1183,78 @@ mod tests {
         assert!(find_hdc_in_sdk(&root).is_none());
         assert!(find_hdc_in_sdk(&root.join("nonexistent")).is_none());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 回归：注入 PATH 的目录必须覆盖 previewer 的 common/bin 与 DevEco 的 tools/emulator，
+    /// 否则 Previewer/Emulator 只能靠调用方各自拼路径（早期只有 cli.bin 与 hdc 目录）。
+    #[test]
+    fn path_dirs_covers_previewer_bin_and_emulator() {
+        let sdk = tmp_dir("pathdirs");
+        let prev = sdk.join("default").join("openharmony").join("previewer");
+        let ets = sdk.join("default").join("openharmony").join("ets");
+        let toolchains = sdk.join("default").join("openharmony").join("toolchains");
+        let studio = tmp_dir("pathdirs-studio");
+        let cli_bin = tmp_dir("pathdirs-cli");
+
+        let env = HarmonyEnv {
+            sdk_root: Some(sdk.to_string_lossy().to_string()),
+            default_api: Some("24".into()),
+            sdk_variants: vec![SdkVariant {
+                variant: "default".into(),
+                path: sdk.to_string_lossy().to_string(),
+                components: vec![
+                    SdkComponent {
+                        name: "ets".into(),
+                        api_version: "24".into(),
+                        version: None,
+                        path: ets.to_string_lossy().to_string(),
+                        api_dir: None,
+                    },
+                    SdkComponent {
+                        name: "previewer".into(),
+                        api_version: "24".into(),
+                        version: None,
+                        path: prev.to_string_lossy().to_string(),
+                        api_dir: None,
+                    },
+                ],
+                api_version: Some("24".into()),
+                is_default: true,
+            }],
+            sdk_versions: vec!["24".into()],
+            cli: Some(CommandLineTools {
+                root: cli_bin.to_string_lossy().to_string(),
+                bin: cli_bin.to_string_lossy().to_string(),
+                has_hdc: true,
+                has_ohpm: true,
+                has_hvigorw: true,
+            }),
+            hdc_path: Some(toolchains.join(exe_name("hdc")).to_string_lossy().to_string()),
+            hdc_source: Some("sdk".into()),
+            ohpm_path: None,
+            hvigorw_path: None,
+            studio_dir: Some(studio.to_string_lossy().to_string()),
+            source: "test".into(),
+            suggestions: Vec::new(),
+        };
+
+        let dirs = path_dirs(&env);
+        assert!(dirs.contains(&cli_bin), "cli/bin 应在列表内：{dirs:?}");
+        assert!(dirs.contains(&toolchains), "hdc 目录应在列表内：{dirs:?}");
+        assert!(
+            dirs.contains(&prev.join("common").join("bin")),
+            "previewer 可执行目录应在列表内：{dirs:?}"
+        );
+        assert!(
+            dirs.contains(&studio.join("tools").join("emulator")),
+            "模拟器目录应在列表内：{dirs:?}"
+        );
+        // 仅 previewer 组件带 common/bin；ets 等其它组件不得产生条目
+        assert_eq!(dirs.len(), 4, "不应产生多余条目：{dirs:?}");
+
+        for d in [&sdk, &studio, &cli_bin] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 }
 
