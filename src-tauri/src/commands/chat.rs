@@ -6542,6 +6542,98 @@ async fn stream_chat_inner(
         }
     }
 
+    // 6. 证据驱动验收 + 账本最终态（纯搬运：原 stream_chat_inner 尾部内联代码）
+    finalize_run(FinalizeInputs {
+        app,
+        state,
+        conversation_id: &conversation_id,
+        trace_id: &trace_id,
+        project_id: &project_id,
+        task_goal: &task_goal,
+        goal_contract: &goal_contract,
+        model_choice: &model_choice,
+        tool_runs: &tool_runs,
+        inherited_tool_evidence: &inherited_tool_evidence,
+        last_model_text: &last_model_text,
+        context_summary: &context_summary,
+        reasoning_full: &reasoning_full,
+        modified_files: &modified_files,
+        placeholder_msg_id: &placeholder_msg_id,
+        full: &mut full,
+        stats: &mut *stats,
+        executor: &mut kernel_executor,
+        recovery_plan: &recovery_plan,
+        prev_ledger: &mut prev_ledger,
+        ledger_base_n,
+        task_started,
+        exhausted,
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// `finalize_run` 的输入（全部借用）。
+struct FinalizeInputs<'a> {
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    conversation_id: &'a String,
+    trace_id: &'a String,
+    project_id: &'a String,
+    task_goal: &'a String,
+    goal_contract: &'a crate::agent::acceptance::GoalContract,
+    model_choice: &'a ModelChoice,
+    tool_runs: &'a [ToolRunItem],
+    inherited_tool_evidence: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
+    last_model_text: &'a String,
+    context_summary: &'a Option<String>,
+    reasoning_full: &'a String,
+    modified_files: &'a [String],
+    placeholder_msg_id: &'a Option<String>,
+    full: &'a mut String,
+    stats: &'a mut ChatRunStats,
+    executor: &'a mut KernelIoRunLoop,
+    recovery_plan: &'a Option<crate::agent::recovery::RecoveryPlan>,
+    prev_ledger: &'a mut Option<TaskLedger>,
+    ledger_base_n: u32,
+    task_started: std::time::Instant,
+    exhausted: bool,
+}
+
+/// 任务收尾（纯搬运：原 `stream_chat_inner` 尾部内联代码，行为一致）：证据驱动验收
+/// （写 `verifying` 状态、按原始目标与工具轨迹裁决、落执行器最终快照与质量快照）、
+/// 未通过时在正文追加提示、持久化本轮消息、最后按完成/未完成保存或清空账本。
+///
+/// 函数体保留原内联代码的缩进与借用写法（便于逐行比对），因此与 `run_one_tool`、
+/// `run_tool_calls` 一样在函数级收口 `clippy::needless_borrow`（现共 3 处，均待第 7 步
+/// 合段重写时随借用一并清理）。
+#[allow(clippy::needless_borrow)]
+async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
+    let FinalizeInputs {
+        app,
+        state,
+        conversation_id,
+        trace_id,
+        project_id,
+        task_goal,
+        goal_contract,
+        model_choice,
+        tool_runs,
+        inherited_tool_evidence,
+        last_model_text,
+        context_summary,
+        reasoning_full,
+        modified_files,
+        placeholder_msg_id,
+        full,
+        stats,
+        executor: kernel_executor,
+        recovery_plan,
+        prev_ledger,
+        ledger_base_n,
+        task_started,
+        exhausted,
+    } = inputs;
     // 6. 证据驱动验收：模型的“任务已完成”只是一份完成申请，最终状态由原始目标与
     // 真实工具轨迹计算。显式要求构建/测试/部署或修改却无对应成功证据时保持未完成。
     if let Ok(conn) = state.0.lock() {
@@ -6620,7 +6712,7 @@ async fn stream_chat_inner(
         &conversation_id,
         &trace_id,
         &tool_runs,
-        &full,
+        full,
         &reasoning_full,
         &model_choice.model,
         &context_summary,
@@ -6658,11 +6750,10 @@ async fn stream_chat_inner(
                 tool_runs: &tool_runs,
                 last_model_text: &last_model_text,
                 ledger_base_n,
-                prev_ledger: &mut prev_ledger,
+                prev_ledger,
             },
         )?;
     }
-
     Ok(())
 }
 
