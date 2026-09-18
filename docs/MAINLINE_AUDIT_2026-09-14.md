@@ -786,9 +786,9 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 ## 49. 更正上一节：预览构建的阻塞点是缺 `-p buildRoot=.preview`（2026-09-18）
 
-第 49 批：上一节（工具链 PATH 注入那条，编号与并行会话的条目撞号，见下）把 `PreviewArkTS` 的稳定失败（error 00308018）记成「hvigor 侧缺陷、预览端到端待 DevEco 确认」。用户在本机 DevEco 里对同一个靶子工程 `H:\work\tmp\preview-fresh` 点预览**成功出画面**后复查，结论更正：**那是我们的调用缺了一个参数**，DevEco 不会踩。
+第 49 批：上一节（工具链 PATH 注入那条）把 `PreviewArkTS` 的稳定失败（error 00308018）记成「hvigor 侧缺陷、预览端到端待 DevEco 确认」。用户在本机 DevEco 里对同一个靶子工程 `H:\work\tmp\preview-fresh` 点预览**成功出画面**后复查，结论更正：**那是我们的调用缺了一个参数**，DevEco 不会踩。
 
-- **根因**：`BuildDirConst.PREVIEW_BUILD_PATH=".preview"`，插件用 `isPreview = hvigorCore.getExtraConfig().get(InjectConst.BUILD_ROOT /* = "buildRoot" */) === ".preview"` 决定构建根。**不传该参数时 `isPreview=false`**，预览任务链退化为 `PreBuild → CreateBuildProfile → buildPreviewerResource → PreviewArkTS`（跳过 `MergeProfile`/`ProcessProfile`/`CompileResource`/`PreviewCompileResource`），`.preview/` 目录根本不生成，而 `PreviewArkTS` 仍去读 `<module>/.preview/default/intermediates/res/default/module.json` → `undefined` → `writeFileSync(path, JSON.stringify(undefined))` 抛 TypeError。**hvigor 少一层 undefined 防护是次因，主因是调用没切到预览构建根**；§48 里「hvigor 缺陷、环境待确认」的框架因此作废（「全新空工程同样复现」这一现象仍成立，但解释不同）。
+- **根因**：`BuildDirConst.PREVIEW_BUILD_PATH=".preview"`，插件用 `isPreview = hvigorCore.getExtraConfig().get(InjectConst.BUILD_ROOT /* = "buildRoot" */) === ".preview"` 决定构建根。**不传该参数时 `isPreview=false`**，预览任务链退化为 `PreBuild → CreateBuildProfile → buildPreviewerResource → PreviewArkTS`（跳过 `MergeProfile`/`ProcessProfile`/`CompileResource`/`PreviewCompileResource`），`.preview/` 目录根本不生成，而 `PreviewArkTS` 仍去读 `<module>/.preview/default/intermediates/res/default/module.json` → `undefined` → `writeFileSync(path, JSON.stringify(undefined))` 抛 TypeError。**hvigor 少一层 undefined 防护是次因，主因是调用没切到预览构建根**；上一节里「hvigor 缺陷、环境待确认」的框架因此作废（「全新空工程同样复现」这一现象仍成立，但解释不同）。
 - **正确调用**（本机实测 BUILD SUCCESSFUL，完整任务链 18 步、10.2s）：
   `node <DevEco>/tools/hvigor/bin/hvigorw.js --mode module -p module=entry@default -p product=default -p buildRoot=.preview PreviewBuild`，产物落 `entry/.preview/`。对照排除：`daemon` 与 `--no-daemon` 不影响结果。
 - **预览服务已在 IDE 外跑通**：`node <DevEco>/plugins/openharmony/openharmony-preview-server/index.js -c <日志目录> -i <module>/.preview -p 29999 -pjd <id>`。日志自证契约：`Start preview web args: -c ***** -i ***** -p 29999 -pjd … -tpn undefined -hosp`（`-tpn`/`-hosp` 可缺省；端口须落在 (29000, 50000)）。两个实测坑：**`-c` 是目录不是文件**（传文件会因 log4js mkdir 报 `EEXIST` 直接崩）；`-i` 不存在会自动 mkdir，并在其下生成 `previewer/{phone,tablet,wearable,tv,car,2in1,smartVision,liteWearable}` 与 `previewConfigV2.json`。静态页 `http://127.0.0.1:<port>/ohpreviewer/` 返回 200，标题 `DevEco Studio Previewer`。
@@ -798,9 +798,9 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 **未闭环**：只加载静态页不会拉起引擎（本机查到的 `Previewer.exe` 是 DevEco 自己启动的），客户端仍需按协议发起预览请求；前端预览面板接入与真实画面回显未做；macOS 侧全流程未验。
 
-## 48. 参考文档匹配加固：短末段、父段消歧、错误码页排除与剩余 42 项清点（2026-09-18）
+## 50. 参考文档匹配加固：短末段、父段消歧、错误码页排除与剩余 42 项清点（2026-09-18）
 
-第 48 批：把 171 个未命中的参考候选逐个归类，并按证据加固匹配规则——**新增 27 个候选命中、0 条既有映射被改变**。
+第 50 批：把 171 个未命中的参考候选逐个归类，并按证据加固匹配规则——**新增 27 个候选命中、0 条既有映射被改变**。
 
 - **先做证据，再改规则**：把候选集（705 个：`api_docs.module` ∪ `d.ts` 路径派生）与目录树（4,762 篇）对照，用脚本先量化四档增量的收益与副作用，再动 Rust。规则演化：末段 ≥4 无消歧 → 636 可解；**末段 ≥3 + 父段消歧** → 652（+16、0 改判）；**再排除 `errorcode-*` 页** → 663（+11、0 改判）。
 - **父段消歧**解决的是「末段撞名」：`@hms.core.map.map` 有两个候选（`map-map` 与 `js-apis-bluetooth-map`），要求 objectId 里末段前一段等于模块父段后，唯一命中 `map-map`；都命中时平票优先 `js-apis-*`（`@hms.nearlink.advertising → js-apis-nearlink-advertising`）。`errorcode-*` 是独立错误码页，多义时先排除再判（`@hms.security.trustedAuthentication → devicesecurity-trusted-auth-api`，同族另修好 fido / ifaa / soter / safetyDetect / dlpAntiPeep / trustedAppService / antifraudPicker / businessRiskIntelligentDetection / riskControlEngine / superPrivacyMode 共 11 个）。
@@ -815,9 +815,9 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 **未闭环**：macOS 侧本批待 CI；8 个待人工确认项未定；34 个"确实没有"中含纯中文标题页面无法自动判定；`@hms.nearlink.*` 与 `@ohos.nearlink.*` 指向同一页时会话里保留 `@ohos.*` 命名（slug 唯一约束所致，属预期）。
 
-## 49. 8 个待确认映射逐页取证定案、命名空间取页规则（2026-09-18）
+## 51. 8 个待确认映射逐页取证定案、命名空间取页规则（2026-09-18）
 
-第 49 批：§48 留下的 8 个「有相近页面、需人工确认」不是拍脑袋选的——逐个抓官方页面正文取证后定案，并把取证中发现的一般规律写成规则。参考正文 664 → **672 页**、成员 13,236 → 13,500；模块级未命中 42 → **34**（只剩"目录树里没有对应文档"那一档）。
+第 51 批：§50 留下的 8 个「有相近页面、需人工确认」不是拍脑袋选的——逐个抓官方页面正文取证后定案，并把取证中发现的一般规律写成规则。参考正文 664 → **672 页**、成员 13,236 → 13,500；模块级未命中 42 → **34**（只剩"目录树里没有对应文档"那一档）。
 
 **判据**（页面正文，不靠名字猜）：① 页面导入的 Kit —— `@kit.NearLinkKit` 是 HMS 版、`@kit.ConnectivityKit` 是 HarmonyOS 版；② `-api` / `-capi-` 后缀 —— ArkTS API 页 vs C API 页；③ 页面能力是否与模块 `d.ts` 一致。
 
