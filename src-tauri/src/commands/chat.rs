@@ -9693,6 +9693,129 @@ mod tool_execution_policy_tests {
         assert!(!tool_retry_safe("mcp__server__read_file"));
     }
 
+    /// 并发批次的准入是「写工具 barrier」的前提：只有契约声明为只读的工具能进批次。
+    /// 白名单（手写）与契约（由工具描述派生）是两处独立真源，必须交叉一致——任何
+    /// 新增工具被误加进白名单，都要在这里失败，而不是等用户遇到顺序敏感的并发写。
+    #[test]
+    fn batch_safe_tools_are_declared_read_only() {
+        use crate::agent::tools::{contracts::EffectKind, TOOL_SPECS};
+
+        for spec in TOOL_SPECS {
+            if is_concurrency_safe(spec.name) {
+                assert_eq!(
+                    crate::agent::tools::contracts::contract(spec.name).effect,
+                    EffectKind::Read,
+                    "{} 被允许并行，但契约不是只读",
+                    spec.name
+                );
+            }
+        }
+
+        // 白名单里的名字必须都还在注册表中：改名后残留的白名单会静默变成「永不并行」，
+        // 少一个入口比多一个并行写更难被发现。
+        for safe in [
+            "list_dir",
+            "read_file",
+            "find_files",
+            "grep_files",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_blame",
+            "search_symbols",
+            "codebase_search",
+            "get_symbol_details",
+            "search_sdk_api",
+            "read_sdk_api_module",
+            "search_harmony_docs",
+            "read_harmony_doc",
+            "get_api_detail",
+            "diff_api_versions",
+            "get_file_info",
+        ] {
+            assert!(TOOL_SPECS.iter().any(|spec| spec.name == safe), "{safe} 已不在工具注册表中");
+            assert!(is_concurrency_safe(safe), "{safe} 应在并发白名单内");
+        }
+
+        // 有副作用、有交互或顺序敏感的工具必须走串行 barrier
+        for tool in [
+            "edit_file",
+            "write_file",
+            "delete_file",
+            "multi_edit",
+            "run_command",
+            "sandbox_exec",
+            "deploy",
+            "uninstall_app",
+            "ota_pack",
+            "create_emulator",
+            "start_ability",
+            "take_screenshot",
+            "verify_ui",
+            "run_ui_flow",
+            "spawn_agents",
+            "ask_user",
+            "mcp__fs__read_file",
+        ] {
+            assert!(!is_concurrency_safe(tool), "{tool} 不应进并发批次");
+        }
+    }
+
+    /// 验收证据的来源合并：继承轨迹在前、本轮轨迹在后，且成功与否按各自字段映射。
+    /// 这个顺序与映射直接决定「任务算不算完成」，进而决定账本是清空还是保留。
+    #[test]
+    fn acceptance_evidence_keeps_inherited_then_current_order() {
+        let inherited = vec![
+            crate::agent::runtime::DesktopRecoveredToolRun {
+                rowid: 1,
+                id: "recovered-1".into(),
+                tool_name: "build_project".into(),
+                input_json: "{}".into(),
+                result_json: "ok".into(),
+                status: "ok".into(),
+            },
+            crate::agent::runtime::DesktopRecoveredToolRun {
+                rowid: 2,
+                id: "recovered-2".into(),
+                tool_name: "run_command".into(),
+                input_json: "{}".into(),
+                result_json: "failed".into(),
+                status: "error".into(),
+            },
+        ];
+        let current = vec![
+            ToolRunItem {
+                tool: "read_file".into(),
+                args: "{}".into(),
+                output: "done".into(),
+                succeeded: true,
+                persisted: true,
+            },
+            ToolRunItem {
+                tool: "edit_file".into(),
+                args: "{}".into(),
+                output: "boom".into(),
+                succeeded: false,
+                persisted: true,
+            },
+        ];
+
+        let evidence = combined_acceptance_evidence(&inherited, &current);
+        let seen: Vec<(&str, bool)> = evidence.iter().map(|e| (e.tool, e.succeeded)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("build_project", true),
+                ("run_command", false),
+                ("read_file", true),
+                ("edit_file", false),
+            ]
+        );
+        // 参数与输出必须原样带过去：验收按工具与原文判定证据，截断或串味会让裁决失真
+        assert_eq!(evidence[0].args, "{}");
+        assert_eq!(evidence[3].output, "boom");
+    }
+
     #[test]
     fn recovery_contract_is_conservative_and_default_approval_is_safe() {
         use crate::agent::tools::contracts::{contract, EffectKind, RecoveryPolicy};
