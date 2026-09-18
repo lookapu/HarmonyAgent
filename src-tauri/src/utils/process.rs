@@ -584,6 +584,30 @@ fn resolve_ohpm_direct(program: &str) -> Option<Resolved> {
 /// 系统 npx/npm 直调：找到 npx/npm 脚本（nvm/brew 等安装，多为 `#!/usr/bin/env node`
 /// 的 JS 脚本/软链）与配套 node，经 `node <cli.js>` 启动，绕开 shebang 对 PATH 的
 /// 依赖——GUI 启动（LaunchServices）PATH 极简时 `env node` 会直接失败。
+/// 候选入口是否**真的是 JS**。
+///
+/// nvm-windows 的版本目录里同时放着无扩展名的 `npm`（`#!/usr/bin/env bash` 的 shell 脚本，
+/// 给 cygwin/mingw 用）与 `npm.cmd`；`find_system_program` 先命中的是无扩展名那个，若直接
+/// 交给 `node` 执行，node 会把 shell 内容当 JS 解析并抛 `SyntaxError`（本机实测报错即此）。
+/// 因此只接受 `.js/.cjs/.mjs`，或无扩展名但首行 shebang 指向 node 的文件。
+fn looks_like_js_entry(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if matches!(ext.to_ascii_lowercase().as_str(), "js" | "cjs" | "mjs") {
+            return true;
+        }
+    }
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 256];
+    let read = file.read(&mut head).unwrap_or(0);
+    let text = String::from_utf8_lossy(&head[..read]);
+    text.lines().next().is_some_and(|line| {
+        line.starts_with("#!") && line.to_ascii_lowercase().contains("node")
+    })
+}
+
 fn resolve_system_npx(program: &str) -> Option<Resolved> {
     let base = program
         .strip_suffix(".exe")
@@ -599,7 +623,8 @@ fn resolve_system_npx(program: &str) -> Option<Resolved> {
     let script = find_system_program(program)?;
     // 软链解析（nvm 的 npx → ../lib/node_modules/npm/bin/npx-cli.js）得到真实 JS 入口
     let cli = std::fs::canonicalize(&script).ok()?;
-    if !cli.is_file() {
+    // 不是 JS 就交回常规解析（Windows 上会命中 npm.cmd），绝不把 shell 脚本喂给 node
+    if !cli.is_file() || !looks_like_js_entry(&cli) {
         return None;
     }
     let node = find_system_program("node")?;
@@ -1390,6 +1415,38 @@ mod tests {
         assert!(!r.needs_cmd_wrap);
         assert!(r.program.ends_with("node.exe"));
         assert!(resolve_ohpm_direct("hdc").is_none(), "非 ohpm 不兑底");
+        set_harmony_path_dirs(Vec::new());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// nvm-windows 的版本目录里，无扩展名的 `npm` 是给 cygwin/mingw 用的 bash 脚本，
+    /// 旁边才是 `npm.cmd`。早先只做 canonicalize 就把它当 JS 入口交给 node，node 把 shell
+    /// 内容当 JS 解析，直接以 SyntaxError 让「版本列表」整条失败（本机实测报错）。
+    #[test]
+    fn system_npx_skips_shell_script_candidates() {
+        let _g = STATE_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("deveco-npx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("node"), "fake").unwrap();
+        std::fs::write(
+            tmp.join("npm"),
+            "#!/usr/bin/env bash\n# This is used by the Node.js installer, which expects the cygwin/mingw\n",
+        )
+        .unwrap();
+        set_harmony_path_dirs(vec![tmp.clone()]);
+        assert!(
+            resolve_system_npx("npm").is_none(),
+            "shell 脚本不能被当成 node 入口"
+        );
+
+        // 换成真的 JS 入口（shebang 指向 node）就该直调
+        std::fs::write(tmp.join("npm"), "#!/usr/bin/env node\nconsole.log(1)\n").unwrap();
+        let resolved = resolve_system_npx("npm").expect("JS 入口应可直调");
+        assert_eq!(
+            resolved.node_cli.expect("应带 JS 入口"),
+            std::fs::canonicalize(tmp.join("npm")).unwrap()
+        );
         set_harmony_path_dirs(Vec::new());
         let _ = std::fs::remove_dir_all(&tmp);
     }
