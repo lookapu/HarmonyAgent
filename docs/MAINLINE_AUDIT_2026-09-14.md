@@ -770,3 +770,16 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **审计编号冲突修复**：拉取的 Windows 侧两个条目（文档抓取重建、目录树查表）被追加时占用了已存在的 §39/§40，导致编号重复、交叉引用歧义。按「日志只增不改」的原则，**不重排历史顺序**，只把后追加的两条改为 **§45 / §46**（文件顺序仍与追加时间一致），并同步修正三处引用：其自身条目内的 `§39 数字更正` → `§45`、`第 40 批` → `第 46 批`，以及状态页「见盘点 §39」→「见盘点 §45」。现已无重复编号。
 
 **合段的执行清单已写进** [驱动文档 §20](./HEADLESS_AGENT_DRIVER.md)（`RoundOutcome` 定义 → round 体搬进 `desktop_round` → 切换调用点 → 切 `run(port)` → 桌面验收 → 每步验证组合，并建议拆成「先合段、后切端口」两个提交以便定位行为差异）。前置全部就位，等真实桌面验收窗口。
+
+## 48. 工具链 PATH 注入补齐 previewer 与模拟器目录（2026-09-18）
+
+第 48 批（`1f1beb3`）：`harmony_env::path_dirs` 只把 `command-line-tools/bin` 与 hdc 所在目录注册进 `HARMONY_EXTRA_PATH`，**SDK 内的 Previewer 与官方模拟器不在注入列表里**——即使环境探测已经定位到 SDK，`process::command("Previewer")` / `("Emulator")` 仍不可达，调用方只能各自拼候选路径（`capability_broker::emulator_executable` 至今带三条写死的绝对路径）。
+
+- **补齐两类目录**：每个 SDK 变体的 `<sdk>/<variant>/previewer/common/bin`（组件根由 `scan_components` 给出，可执行文件在其 `common/bin` 下），以及 `<studio>/tools/emulator`。
+- **条目不要求存在**：解析阶段逐个候选做 `is_file` 判断，陈旧条目是惰性的，不产生副作用。
+- **平台判断**：previewer 组件布局两平台一致，只是可执行文件名差 `.exe`（由 `resolve_program` 的扩展名回退处理）；模拟器条目在 macOS 上惰性——`studio_dir` 在 mac 上解析为 `DevEco-Studio.app/Contents`，其下没有 `tools/emulator`。
+- **背景动机**：本批是「设备预览」能力的前置。本机实测 DevEco 的 `openharmony-preview-server` 可由外部启动（`node index.js -c <日志> -i <预览工作目录> -p <端口> -pjd -tpn -hosp -sid`，端口须落在 (29000, 50000) 且引擎由它自己从 SDK 解析），但 `hvigor PreviewBuild` 在 `:entry:default@PreviewArkTS` 稳定失败（00308018：`PreviewerArkCompile.addOhmurlToHarAbility` 里 `JSON.stringify(undefined)` 直传 `writeFileSync`），已排除三方 HAR 依赖、`useNormalizedOHMUrl` 与 fixture 旧状态三个假设（全新空工程同样复现）。预览端到端仍待 DevEco 侧确认后才能定架构。
+
+**验证**（Windows 本机）：`harmony_env` 8 项通过（新增回归 `path_dirs_covers_previewer_bin_and_emulator`：断言 previewer 的 `common/bin` 与 `tools/emulator` 都在列表内，且 `ets` 等其它组件不产生条目）；`check-warnings.py` 57/57；`check-docs.py` 通过。
+
+**未闭环**：macOS 侧本批提交待 CI 复核；本批只保证「可解析」，Previewer/Emulator 的实际调用点尚未接入；预览端到端验证卡在 DevEco 环境的预览是否可用。
