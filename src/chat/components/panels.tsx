@@ -4,6 +4,7 @@ import type { TerminalEntry, BuildLogLine } from '../../stores/projectStore'
 import type { ProjectMemory, ToolStat, ToolTokenStat } from '../../api/project'
 import { gitBranchInfo, gitInitRepo, type GitBranchInfo } from '../../api/git'
 import { terminalExec, terminalKill, terminalStatus } from '../../api/terminal'
+import { onPreviewError, onPreviewFrame, previewStart, previewStop } from '../../api/preview'
 import Icon from '../../icons/Icon'
 import { AnsiText, hasAnsi } from '../../components/AnsiText'
 import { fmtElapsed } from '../chatUtils'
@@ -522,23 +523,131 @@ export function ToolStatsPanel({
   )
 }
 
-/* ============ Web 预览面板：右侧栏内嵌 iframe 加载 http/https 地址 ============ */
+/* ============ 预览面板：设备预览（引擎真渲染）+ Web 预览（iframe） ============ */
 export function PreviewPanel({
   url,
   setUrl,
   src,
   onOpen,
+  project,
 }: {
   url: string
   setUrl: (v: string) => void
   src: string
   onOpen: () => void
+  /** 当前工程目录；有值时才能做设备预览 */
+  project?: string
 }) {
   const { t } = useTranslation()
   const [reloadKey, setReloadKey] = useState(0)
+  const [frame, setFrame] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [live, setLive] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const unlisteners: Array<() => void> = []
+    let disposed = false
+    const keep = (un: () => void) => (disposed ? un() : unlisteners.push(un))
+    void onPreviewFrame((f) => {
+      if (!disposed) setFrame(f.jpeg)
+    }).then(keep)
+    void onPreviewError((msg) => {
+      if (!disposed) {
+        setError(msg)
+        setLive(false)
+      }
+    }).then(keep)
+    return () => {
+      disposed = true
+      unlisteners.forEach((un) => un())
+    }
+  }, [])
+
+  // 面板卸载时收掉引擎，避免后台留一个预览进程
+  useEffect(() => () => void previewStop().catch(() => {}), [])
+
+  const startDevice = async () => {
+    if (!project) return
+    setBusy(true)
+    setError(null)
+    setFrame(null)
+    try {
+      await previewStart({ project })
+      setLive(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setLive(false)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const stopDevice = async () => {
+    setBusy(true)
+    try {
+      await previewStop()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLive(false)
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="flex items-center gap-1.5 p-2 border-b border-[var(--border)] shrink-0">
+        <span className="text-[12px] font-medium text-[var(--text-primary)]">
+          {t('home.previewDeviceTitle')}
+        </span>
+        <span className="flex-1" />
+        {live ? (
+          <button
+            onClick={() => void stopDevice()}
+            disabled={busy}
+            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 shrink-0"
+          >
+            {t('home.previewDeviceStop')}
+          </button>
+        ) : (
+          <button
+            onClick={() => void startDevice()}
+            disabled={busy || !project}
+            title={project ? undefined : t('home.previewDeviceEmpty')}
+            className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium transition-[color,background-color,border-color,opacity] disabled:opacity-40 shrink-0"
+          >
+            {busy ? t('home.previewDeviceStarting') : t('home.previewDeviceStart')}
+          </button>
+        )}
+      </div>
+      <div className="flex-1 min-h-0 bg-white flex items-center justify-center overflow-hidden">
+        {frame ? (
+          <img
+            src={`data:image/jpeg;base64,${frame}`}
+            alt={t('home.previewDeviceTitle')}
+            className="max-w-full max-h-full object-contain"
+          />
+        ) : (
+          <div className="flex flex-col items-center justify-center gap-2 text-center px-6">
+            <Icon name="devices" size={28} className="opacity-40" />
+            <span className="text-[12px] text-[var(--text-muted)]">
+              {busy ? t('home.previewDeviceStarting') : t('home.previewDeviceEmpty')}
+            </span>
+            {error && (
+              <span className="text-[11px] text-[var(--danger)] break-all">
+                {t('home.previewDeviceFailed')}：{error}
+              </span>
+            )}
+            {error && (
+              <span className="text-[11px] text-[var(--text-muted)]/70">
+                {t('home.previewDeviceFallback')}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="flex items-center gap-1.5 p-2 border-y border-[var(--border)] shrink-0">
         <input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
@@ -566,7 +675,7 @@ export function PreviewPanel({
           </button>
         )}
       </div>
-      <div className="flex-1 min-h-0 bg-white">
+      <div className="h-[240px] shrink-0 min-h-0 bg-white">
         {src ? (
           <iframe
             key={reloadKey}
@@ -576,7 +685,7 @@ export function PreviewPanel({
           />
         ) : (
           <div className="h-full flex flex-col items-center justify-center gap-2 text-center px-6">
-            <Icon name="devices" size={28} className="opacity-40" />
+            <Icon name="devices" size={24} className="opacity-40" />
             <span className="text-[12px] text-[var(--text-muted)]">{t('home.previewEmpty')}</span>
             <span className="text-[11px] text-[var(--text-muted)]/70">{t('home.previewBlocked')}</span>
           </div>

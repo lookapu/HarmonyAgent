@@ -6679,6 +6679,7 @@ export default function Home() {
                 setUrl={setPreviewUrl}
                 src={previewSrc}
                 onOpen={handleOpenPreview}
+                project={currentProject?.path}
               />
             ) : rightTab === 'devices' ? (
               <DevicesPanel
