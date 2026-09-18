@@ -711,6 +711,19 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 **验证**（macOS 本机）：后端库 **1,107** 通过（+2）/ 0 失败 / 9 忽略；两组 crash E2E 各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
 
+## 44. 第 7 步的签名前置：状态结构 + 14 个段函数改收 `&mut DesktopRoundState`（2026-09-18）
+
+合段本身（搬控制流 + 切 `run(port)`）按 §19 第 3 条仍需真实桌面验收窗口；本批只吃它的**机械前置**，用户在该抉择中明确选择「先做签名前置」（见驱动文档 §20「第 7 步的三刀」）。
+
+- **`98a7927` 状态收拢**：35 个跨段可变局部量收进 `DesktopRoundState`，搬入点放在准备段末尾**按所有权移动**，因此没有任何初始化表达式被重排。保真度用「归一化掉 `round_state.` 后再 diff」证明：整个改动只剩新增结构体、`let mut X` → `let X`（局部量改为被移动）、多余 `&mut`/简写形式，**零逻辑改动**。
+- **`ab7c3f3` 工具路径 / `7c9479c` 轮后与收尾 / `10f99f6` 其余七个**：`enforce_tool_budget_limit`、`flush_tool_batch`、`apply_tool_batch`、`run_one_tool`、`run_tool_calls`、`handle_round_outcome`、`finalize_run`、`run_plan_gate`、`enforce_budget_gate`、`prepare_tool_calls`、`adjudicate_pre_round`、`assemble_round`、`route_round_outcome`、`request_round_outcome` 与账本叶子 `persist_open_ledger_and_emit` **全部改收 `&mut DesktopRoundState`**；净减 106 + 37 + 96 行（`assemble_round` 单函数 33 → 16 字段）。控制流**一条未动**（仍 11 处 `break`/`continue`，属合段那一刀）。
+- **度量**：主循环体 2,107（旧口径）/ 1,978（更正口径）→ **258 行**；循环内 `.emit(` 32 → 0、`.0.lock()` 约 22 → 1。
+- **两条硬约束（已进 `project-refactor-invariants` 记忆）**：① 状态结构只装所有权数据——`stats`/执行器若作 `&mut` 字段会让结构**不变**，一次长借用即与循环内所有读取冲突，且报错行指向更早的读取，极易误判；② 按字段名收敛只作用于结构定义与**解构块**，作用于函数体会删掉恰好以字段名开头的调用实参（本批真的踩了一次，编译器只报「参数个数不对」）。
+- **工具层教训**：调用字面量可能**在行中结束**（`})? {`），切分必须按字符扫描大括号配平；引用修正（`&`/`&mut`）交给 rustc 的 machine-applicable suggestion 批量应用最稳（一次 31 处）。
+- **验证**（macOS 本机，四刀各自一遍）：后端库 1,107 通过 / 0 失败 / 9 忽略；两组 crash E2E 各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。四刀均**未触碰任何 `cfg(` 行**，改动仅限 `chat.rs` 与文档，打包/签名配置未动。
+- **仍未闭环**：合段本身（`RoundOutcome` + `desktop_round` + `run(port)`）等真实桌面验收窗口（多轮工具任务 + 中途停止 + 断点续跑）；3 处 `#[allow(clippy::needless_borrow)]` 欠账待合段时清；Windows 侧与 CI 尚未复核这四刀。
+
+
 
 
 
