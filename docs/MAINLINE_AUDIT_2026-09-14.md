@@ -851,3 +851,17 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **验证**（Windows 本机）：`PreviewBuild`（带 `buildRoot=.preview`）BUILD SUCCESSFUL；Previewer 独立拉起后监听 `127.0.0.1:29998`，收到 101 与 40,651 字节渲染帧；探针脚本 `H:\work\tmp\ws-probe.js`。全程未触碰 DevEco 自己的 Previewer 进程。
 
 **未闭环**：**帧载荷的压缩格式未解**（不解压就画不出画面，这是接入前的下一步）；多设备档切换、热重载未验；preview server 与命名管道那两条路线未再验证（已不需要）；产品侧代码一行未写；macOS 侧全流程未验。
+
+## 53. 用文档站搜索接口复核剩余 34 项、再固定 9 条人工映射（2026-09-18）
+
+第 53 批：§50/§51 剩下的 34 个模块级未命中，改用**文档站自己的搜索接口**逐个复核（目录树只能看标题，而该目录有 809 篇纯中文标题页面，标题索引看不见它们）。结论：新增 9 条人工映射、撤回 1 条错配、其余 25 个确认无专属参考页。
+
+- **方法**：从页面里抓到搜索接口 `partnerCommunityService/developer/search`（body 用 `developerVertical.categoryList=[1]` 表示文档），对每个模块查「模块名 + 末段名」两轮，只看 `harmonyos-references` 目录的命中；对候选再抓页面正文核对模块名是否真的出现。
+- **新增 9 条映射**（正文里确实出现该模块名，或能力明确对应）：`@hms.health.store → health-api-healthstore-lite`、`@hms.health.service → health-api-healthservice-lite`、`@hms.core.weather → weather-service-weatherservice`、`@hms.networkboost.handover → networkboost-nethandover`、`@hms.core.account.LoginComponent → account-api-component-manager`、`@hms.ai.AICaption → speech-aicaptioncomponent`、`@hms.pcService.recoveryKeyService → dataguard-recoverykey`、`@hms.ai.AgentFramework → harmony-agent-framework-api`（Kit 落地页，目录里唯一相关页）、`@ohos.arkui.WithEnv → ts-container-with-env`。
+- **撤回 1 条**：`@hms.carService.smartMobility → car-smartmobilitycommon` 是错配——该页标题是 `smartMobilityCommon`，且已被同名模块 `@hms.carService.smartMobilityCommon` 正当占用；`smartMobility` 自己无页面。**教训**：人工映射也要检查目标 slug 是否已被更贴切的模块占用（`api_details.slug` 唯一）。
+- **反面证据（避免误判为"有文档"）**：`readerComponent` 在 Reader Kit 页面里出现 14/90 次，但全部是示例代码里的属性名 `readerComponentController`，不是模块名 → 不算命中，`@hms.core.readerservice.readerComponent` 保持未映射。
+- **剩余 25 个，逐类确认无专属参考页**：ArkUI 内部声明（`arkui.components.ArkLazy*Layout`/`ArkDynamicLayout`）、已下架模块（`@ohos.multimedia.mediaLibrary` 只剩 Kit 落地页与错误码页，ArkTS 页已被 photoAccessHelper 取代）、HMS 组件类（`@hms.hds.hdsBaseComponent`/`HdsStyle`、`core.atomicserviceComponent.atomicserviceUi`/`atomicserviceInput`、`core.readerservice.readerComponent`）、以及一批确无文档的能力模块（`bluetooth.opp`/`wearDetection`、`file.fileAccess`/`keyManager`、`resourceschedule.deviceStandby`、`userIAM.userAccessCtrl`、`application.uriPermissionManager`、`data.cloudExtension`、`multimodalAwareness.onScreen`、`multimodalInput.inputDeviceCooperate`、`hms.hiviewdfx.feedbackService`、`hms.collaboration.service`、`hms.carService.smartMobility`）。`@hms.security.MediaAuthVerify`/`mediaAuthVerify` 是 `devicesecurity-taas-api` 页的一个小节，而该 slug 已被 `@hms.security.trustedAppService` 占用（slug 唯一），故无法各自入库。
+
+**验证**（Windows 本机）：后端库 1,129 通过 / 0 失败 / 9 忽略；参考正文 672 → **681 页**（成员 13,500 → 13,705）；模块级未命中 34 → **25**；`check-docs.py` 通过；种子库 `integrity_check=ok`。
+
+**未闭环**：macOS 侧本批待 CI；25 个未映射项如需覆盖，只能靠"页面正文隶属关系"人工指定（当前证据显示它们没有独立页面）。

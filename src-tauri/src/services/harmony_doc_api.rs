@@ -160,6 +160,17 @@ const CATALOG_OVERRIDES: &[(&str, &str)] = &[
     ("@kit.AREngine", "ar-engine-api"),
     ("@hms.nearlink.remoteDevice", "nearlink-remote-device"),
     ("@hms.nearlink.dataTransfer", "nearlink-data-transfer-api"),
+    // 下面这批由文档站搜索 + 页面正文逐个核对（正文里确实出现该模块名/能力）后固定，
+    // 规则够不着的原因多为「页面标题是纯中文」或「模块名与页面标题不同名」。
+    ("@hms.health.store", "health-api-healthstore-lite"),
+    ("@hms.health.service", "health-api-healthservice-lite"),
+    ("@hms.core.weather", "weather-service-weatherservice"),
+    ("@hms.networkboost.handover", "networkboost-nethandover"),
+    ("@hms.core.account.LoginComponent", "account-api-component-manager"),
+    ("@hms.ai.AICaption", "speech-aicaptioncomponent"),
+    ("@hms.pcService.recoveryKeyService", "dataguard-recoverykey"),
+    ("@hms.ai.AgentFramework", "harmony-agent-framework-api"),
+    ("@ohos.arkui.WithEnv", "ts-container-with-env"),
 ];
 
 /// 查人工映射表（模块名规范化后比较，大小写与空白不敏感）。

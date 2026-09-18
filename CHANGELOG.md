@@ -23,8 +23,8 @@
 
 **数据**
 
-- API 参考正文改为按文档目录树精确查表（`getCatalogTree` 返回 4,762 篇）：覆盖由 310 页提升到 **672 页**（成员 7,436 → 13,500）。`@hms.*` 这类页面标题不含模块前缀的文档按「末段唯一 + 父段消歧」命中；末段过短或撞名时宁可不匹配。加固要点：末段最短长度 4→3、撞名按父段消歧（`@hms.core.map.map` 取 `map-map` 而非蓝牙 MAP）、排除 `errorcode-*` 错误码页、平票**按命名空间取页**（`@hms.*` 取 Kit 文档、`@ohos.*` 取 `js-apis-*`，两侧各取各的，不再争抢同一页）。
-- 8 个规则够不着的模块（如 `@hms.core.atomicserviceComponent.atomicservice`、`@kit.AREngine`）逐个抓官方页面正文取证后写成人工映射表，判据是页面导入的 Kit、`-api`/`-capi-` 后缀与页面能力是否匹配模块 d.ts；参考正文覆盖 672 页，模块级未命中降到 34 个（均为目录树里确实没有对应文档）。
+- API 参考正文改为按文档目录树精确查表（`getCatalogTree` 返回 4,762 篇）：覆盖由 310 页提升到 **681 页**（成员 7,436 → 13,705）。`@hms.*` 这类页面标题不含模块前缀的文档按「末段唯一 + 父段消歧」命中；末段过短或撞名时宁可不匹配。加固要点：末段最短长度 4→3、撞名按父段消歧（`@hms.core.map.map` 取 `map-map` 而非蓝牙 MAP）、排除 `errorcode-*` 错误码页、平票**按命名空间取页**（`@hms.*` 取 Kit 文档、`@ohos.*` 取 `js-apis-*`，两侧各取各的，不再争抢同一页）。
+- 17 个规则够不着的模块写成人工映射表（如 `@hms.core.atomicserviceComponent.atomicservice`、`@kit.AREngine`、`@hms.health.store`、`@hms.core.weather`、`@hms.ai.AICaption`、`@ohos.arkui.WithEnv`）：逐个抓官方页面正文取证，判据是页面导入的 Kit、`-api`/`-capi-` 后缀与页面能力是否匹配模块 d.ts，并用文档站搜索接口复核（目录树只能看标题，该目录有 809 篇纯中文标题页面）。参考正文覆盖 **681 页**，模块级未命中降到 **25 个**——均经搜索逐个确认没有专属参考页（ArkUI 内部声明、已下架的 `@ohos.multimedia.mediaLibrary` ArkTS 页、HMS 组件类，以及 `bluetooth.opp`、`file.keyManager`、`resourceschedule.deviceStandby` 等确无文档的能力模块）。
 - 兜底 slug 表里两个陈旧别名（`@ohos.preferences`、`@ohos.relationalStore`）改回真实模块名 `@ohos.data.*`：别名与真名指向同一篇文档，而 `api_details.slug` 唯一，别名先占位会让真名显示为"未命中"。
 - 出厂种子库**从空库重建**（不再叠加旧抓取代）：14 个版本 / 1,014 个页面 / 47,410 条变更写入，去重后 `api_docs` **44,856** 行、向量 44,856 条，体积 **280MB**（叠加态为 505MB）；26.0.0 含 8 月 29 日 Release 新增的 `apidiff-7003` 一整套变更。
 - 修正上一轮刷新的数据叠加：HTML 正文解析出的声明串与 Markdown 时代不同，冲突键对不上导致**整体插入**而非更新（`.d.ets` 伪模块名未清、同一 API 两代并存）。UPSERT 补上 `module` 派生列刷新 + 空库重建后，伪模块名清零、embeddings 与 `api_docs` 1:1。
