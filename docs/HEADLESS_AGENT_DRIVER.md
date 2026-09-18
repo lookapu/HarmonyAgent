@@ -919,6 +919,18 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 
 **当前状态**：主循环 324 → **305 行**；已转换 7 个函数（工具路径 5 + 轮后/收尾 2）。**剩余 7 个**：`adjudicate_pre_round`（PreRoundInputs）、`run_plan_gate`（PlanGateInputs）、`enforce_budget_gate`（BudgetGateInputs）、`assemble_round`（AssembleInputs，34 字段）、`route_round_outcome`（RoundRoutingInputs）、`request_round_outcome`（RoundRequestInputs）、`prepare_tool_calls`（ToolCallPrepInputs）。三刀各自验证：后端库 1,107 / 0 失败 / 9 忽略、两组 crash E2E 各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过（macOS 本机）。
 
+**第四刀：剩余七个段函数全部改收状态（`10f99f6`）**：计划门、预算门、工具调用准备、轮前裁决、组装、轮级路由、Provider 往返，外加账本叶子辅助 `persist_open_ledger_and_emit` —— **至此 14 个函数全部收 `&mut DesktopRoundState`**，调用点不再逐字段传递轮状态。净 **−96 行**。
+
+- **`assemble_round` 收益最大**：输入从 33 字段降到 16 个（全是只读上下文与 `stats`），`full`/`tool_runs`/`context_summary`/`images`/`correction_*`/`history_limit`/`seam_count`/`tools_since_progress`/`replan_instruction`/`merged_instructions`/`prev_ledger`/`confirmed_plan` 等一律从状态取。
+- **本条最容易踩的是工具而非代码**：① 调用字面量可能**在行中结束**（`})? {`——闭合 `}` 后面还跟着 match 的开头），所以切分必须**按字符扫描大括号配平**，不能靠「找一行是 `})`」；② 引用修正交给 **rustc 的 machine-applicable suggestion** 批量应用（一次 31 处），比手改可靠得多。
+- **度量**：主循环 305 → **258 行**；循环内 `break`/`continue` 仍 11（控制流一条未动，这是合段那一刀的事）。
+- **验证**：后端库 1,107 / 0 失败 / 9 忽略 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过（macOS 本机）。
+
+**第 7 步签名改造完成后的总体状态**：主循环体 2,107（旧口径）/ 1,978（更正口径）→ **258 行**；14 个函数统一收 `&mut DesktopRoundState`；状态结构只装所有权数据（`stats`/执行器作为显式参数，见第二刀的坑）。**剩下的只有合段本身**：`RoundOutcome`（替代剩余 11 处控制流）+ 把 round 体搬进 `desktop_round` + 切换 `run(port)`——仍按第 19 节第 3 条等真实桌面验收窗口，因为切换后旧路径不再存在、自动化层面又没有行为快照。
+
+**欠账**（合段时一并清）：3 处 `#[allow(clippy::needless_borrow)]`（`run_one_tool` / `run_tool_calls` / `finalize_run`）；Windows 侧与 CI 尚未确认这四刀。
+
+
 
 
 
