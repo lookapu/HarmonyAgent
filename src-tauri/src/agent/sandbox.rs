@@ -186,10 +186,6 @@ impl NativeSandboxKind {
         match self {
             // 不只检查可执行文件是否存在，而是运行一个无副作用的最小隔离域；否则
             // Linux user namespace 被系统策略禁用时会产生假阳性。
-            Self::MacosSandboxExec => Some((
-                "sandbox-exec",
-                &["-p", "(version 1) (allow default)", "/usr/bin/true"],
-            )),
             Self::LinuxBubblewrap => Some((
                 "bwrap",
                 &[
@@ -202,9 +198,10 @@ impl NativeSandboxKind {
                     "/bin/true",
                 ],
             )),
-            // AppContainer 需要 token/profile/ACL 生命周期实现，不能用“系统是 Windows”
-            // 冒充后端已经可用。
-            Self::WindowsAppContainer => None,
+            // macOS 与 Windows 不走静态探测：macOS 的宽松 profile（`allow default`）即使在
+            // 真实边界建不起来时也会成功，属假阳性（本机实测，见 `probe_macos_boundary`）；
+            // Windows AppContainer 尚未实现 token/profile/ACL 生命周期。
+            Self::MacosSandboxExec | Self::WindowsAppContainer => None,
         }
     }
 
@@ -429,8 +426,104 @@ impl NativeBackend {
     }
 }
 
+/// macOS 原生后端的边界探测：建临时 workspace，按 `workspace-write` spec 用**真实 profile**
+/// 跑一条写入命令，只有「命令成功 **且** 文件确实落在 workspace 内」才算可用，否则
+/// fail-closed 并给出原因。
+///
+/// 为什么不能用原来的静态探测：`sandbox-exec -p "(version 1) (allow default)"` 只要能起
+/// 进程就成功，而真实边界（`deny default` + 路径限定允许）在本机 macOS 15 上会让子进程
+/// 直接 SIGABRT——两者结论相反，可用性必须以后者为准。
+#[cfg(target_os = "macos")]
+async fn probe_macos_boundary(mut capabilities: SandboxCapabilities) -> SandboxCapabilities {
+    let root = std::env::temp_dir().join(format!(
+        "harmony-agent-sandbox-probe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workspace = root.join("workspace");
+    let scratch = root.join("scratch");
+    if let Err(error) = std::fs::create_dir_all(&workspace).and_then(|_| std::fs::create_dir_all(&scratch)) {
+        capabilities.reason = Some(format!("无法创建沙箱探测临时目录：{error}"));
+        return capabilities;
+    }
+    let spec = SandboxSpec::workspace_write(workspace.clone());
+    let command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "printf probe-ok > probe.txt".to_string(),
+    ];
+    let built = match build_native_run_command(
+        NativeSandboxKind::MacosSandboxExec,
+        &spec,
+        &scratch,
+        &command,
+    ) {
+        Ok(built) => built,
+        Err(error) => {
+            capabilities.reason = Some(format!("无法构造 macOS 沙箱探测命令：{error}"));
+            let _ = std::fs::remove_dir_all(&root);
+            return capabilities;
+        }
+    };
+    let mut probe = match crate::utils::process::command(&built.program, &built.args) {
+        Ok(command) => command,
+        Err(error) => {
+            capabilities.reason = Some(format!("无法构造 {} 探测命令：{error}", built.program));
+            let _ = std::fs::remove_dir_all(&root);
+            return capabilities;
+        }
+    };
+    if let Some(cwd) = &built.cwd {
+        probe.current_dir(cwd);
+    }
+    probe
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let outcome = tokio::time::timeout(Duration::from_secs(3), probe.output()).await;
+    let wrote = workspace.join("probe.txt").is_file();
+    match outcome {
+        Ok(Ok(output)) if output.status.success() && wrote => {
+            capabilities.available = true;
+            capabilities.reason =
+                Some("macOS 原生沙箱边界探测通过（真实 profile 下可写 workspace）".into());
+        }
+        Ok(Ok(output)) => {
+            let detail = first_summary_line(&output.stderr)
+                .or_else(|| first_summary_line(&output.stdout))
+                .unwrap_or_else(|| {
+                    format!(
+                        "退出码 {}；workspace 写入{}",
+                        output.status.code().unwrap_or(-1),
+                        if wrote { "已发生" } else { "未发生" }
+                    )
+                });
+            capabilities.reason = Some(format!("sandbox-exec 无法建立真实边界：{detail}"));
+        }
+        Ok(Err(error)) => {
+            capabilities.reason = Some(format!("无法启动 sandbox-exec：{error}"));
+        }
+        Err(_) => {
+            capabilities.reason = Some("sandbox-exec 边界探测超时（3s）".into());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    capabilities
+}
+
+/// 非 macOS 平台不应调用：macOS 的可用性由 [`probe_macos_boundary`] 判定。
+#[cfg(not(target_os = "macos"))]
+async fn probe_macos_boundary(mut capabilities: SandboxCapabilities) -> SandboxCapabilities {
+    capabilities.reason = Some("当前平台没有 macOS 原生沙箱后端".into());
+    capabilities
+}
+
 async fn probe_native_kind(kind: NativeSandboxKind) -> SandboxCapabilities {
     let mut capabilities = kind.declared_capabilities();
+    // macOS 必须用**真实 profile** 探测：宽松 profile（`(allow default)`）在真实边界建不起来
+    // 的机器上也会成功，用它判定可用性就是假阳性（本机实测见盘点 §48）。
+    if matches!(kind, NativeSandboxKind::MacosSandboxExec) {
+        return probe_macos_boundary(capabilities).await;
+    }
     let Some((program, probe_args)) = kind.probe_program() else {
         capabilities.reason = Some(
             "Windows AppContainer backend 尚未实现 token/profile/ACL 生命周期，拒绝标记为可用"
@@ -1738,6 +1831,37 @@ mod tests {
         assert_eq!(oci.image.as_deref(), Some("image"));
         let invalid = sandbox_config_from_values(Some("natvie"), None).unwrap_err();
         assert!(invalid.contains("sandbox_config_invalid"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_probe_availability_matches_a_real_boundary_run() {
+        // 这条断言是「假阳性」的守门人：旧实现用 `(allow default)` 静态探测，在真实边界
+        // 建不起来的机器上照样报 available=true（本机 macOS 15 实测）。可用性必须来自
+        // 真实 profile 的执行结论，两者不允许不一致。
+        let workspace = temp_workspace();
+        let scratch = temp_workspace();
+        let external_root = temp_workspace();
+        let external_secret = external_root.join("secret.txt");
+        std::fs::write(&external_secret, "harmony-boundary-secret").unwrap();
+        let checks = run_native_filesystem_checks(
+            NativeSandboxKind::MacosSandboxExec,
+            &workspace,
+            &scratch,
+            &external_secret,
+        )
+        .await
+        .unwrap();
+        let boundary_ok = checks.iter().all(|check| check.passed);
+        let capabilities = probe_native_backend().await;
+        assert_eq!(
+            capabilities.available, boundary_ok,
+            "探测结论与真实边界执行不一致：{checks:#?}；reason={:?}",
+            capabilities.reason
+        );
+        for path in [workspace, scratch, external_root] {
+            std::fs::remove_dir_all(path).ok();
+        }
     }
 
     #[cfg(target_os = "macos")]
