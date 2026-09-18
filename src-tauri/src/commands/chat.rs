@@ -6545,56 +6545,38 @@ async fn stream_chat_inner(
                         (tool_runs.len() + 1 + pending.len()) as u32,
                     ));
                     if pending.len() >= MAX_TOOL_CONCURRENCY {
-                        let results = run_tool_batch(
-                            &pending,
+                        let intercepted = flush_tool_batch(ToolBatchInputs {
+                            pending: &mut pending,
                             app,
                             state,
-                            &opts,
-                            &mcp,
-                            &tool_ctx,
-                            &project_path,
-                            &path_hints,
-                            &project_id,
-                            &conversation_id,
+                            opts: &opts,
+                            mcp: &mcp,
+                            tool_ctx: &tool_ctx,
+                            project_path: &project_path,
+                            path_hints: &path_hints,
+                            project_id: &project_id,
+                            conversation_id: &conversation_id,
                             cancel,
                             registry,
-                            max_tool_rounds as u32,
-                        )
-                        .await;
-                        let intercepted = apply_tool_batch(
-                            &results,
-                            &mut tool_runs,
-                            &mut consecutive_failures,
-                            &mut replan_given,
-                            &mut replan_instruction,
-                            stats,
-                            &mut tools_since_progress,
-                            &mut full,
-                            app,
-                            state,
-                            &trace_id,
-                            &client,
-                            &protocol,
-                            &provider,
-                            &model_choice,
-                            &opts,
-                            &messages,
-                            &conversation_id,
-                            cancel,
-                            registry,
-                        )
-                        .await;
-                        persist_desktop_executor_checkpoint(
-                            state,
-                            &trace_id,
-                            &conversation_id,
-                            kernel_executor.checkpoint(),
-                            crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
-                            placeholder_msg_id.as_deref(),
+                            trace_id: &trace_id,
+                            client: &client,
+                            protocol: &protocol,
+                            provider: &provider,
+                            model_choice: &model_choice,
+                            messages: &messages,
+                            executor: &kernel_executor,
+                            tool_runs: &mut tool_runs,
+                            consecutive_failures: &mut consecutive_failures,
+                            replan_given: &mut replan_given,
+                            replan_instruction: &mut replan_instruction,
+                            stats: &mut *stats,
+                            tools_since_progress: &mut tools_since_progress,
+                            full: &mut full,
+                            placeholder_msg_id: placeholder_msg_id.as_deref(),
                             max_tool_rounds,
                             budget_extensions,
-                        )?;
-                        pending.clear();
+                        })
+                        .await?;
                         if intercepted {
                             exhausted = true;
                             break;
@@ -6603,56 +6585,38 @@ async fn stream_chat_inner(
                     continue;
                 }
                 if !pending.is_empty() {
-                    let results = run_tool_batch(
-                        &pending,
+                    let intercepted = flush_tool_batch(ToolBatchInputs {
+                        pending: &mut pending,
                         app,
                         state,
-                        &opts,
-                        &mcp,
-                        &tool_ctx,
-                        &project_path,
-                        &path_hints,
-                        &project_id,
-                        &conversation_id,
+                        opts: &opts,
+                        mcp: &mcp,
+                        tool_ctx: &tool_ctx,
+                        project_path: &project_path,
+                        path_hints: &path_hints,
+                        project_id: &project_id,
+                        conversation_id: &conversation_id,
                         cancel,
                         registry,
-                        max_tool_rounds as u32,
-                    )
-                    .await;
-                    let intercepted = apply_tool_batch(
-                        &results,
-                        &mut tool_runs,
-                        &mut consecutive_failures,
-                        &mut replan_given,
-                        &mut replan_instruction,
-                        stats,
-                        &mut tools_since_progress,
-                        &mut full,
-                        app,
-                        state,
-                        &trace_id,
-                        &client,
-                        &protocol,
-                        &provider,
-                        &model_choice,
-                        &opts,
-                        &messages,
-                        &conversation_id,
-                        cancel,
-                        registry,
-                    )
-                    .await;
-                    persist_desktop_executor_checkpoint(
-                        state,
-                        &trace_id,
-                        &conversation_id,
-                        kernel_executor.checkpoint(),
-                        crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
-                        placeholder_msg_id.as_deref(),
+                        trace_id: &trace_id,
+                        client: &client,
+                        protocol: &protocol,
+                        provider: &provider,
+                        model_choice: &model_choice,
+                        messages: &messages,
+                        executor: &kernel_executor,
+                        tool_runs: &mut tool_runs,
+                        consecutive_failures: &mut consecutive_failures,
+                        replan_given: &mut replan_given,
+                        replan_instruction: &mut replan_instruction,
+                        stats: &mut *stats,
+                        tools_since_progress: &mut tools_since_progress,
+                        full: &mut full,
+                        placeholder_msg_id: placeholder_msg_id.as_deref(),
                         max_tool_rounds,
                         budget_extensions,
-                    )?;
-                    pending.clear();
+                    })
+                    .await?;
                     if intercepted {
                         exhausted = true;
                         break;
@@ -7120,55 +7084,38 @@ async fn stream_chat_inner(
             }
             // for 结束：排空剩余只读批次（本轮全部输出只读工具时）
             if !pending.is_empty() {
-                let results = run_tool_batch(
-                    &pending,
+                let intercepted = flush_tool_batch(ToolBatchInputs {
+                    pending: &mut pending,
                     app,
                     state,
-                    &opts,
-                    &mcp,
-                    &tool_ctx,
-                    &project_path,
-                    &path_hints,
-                    &project_id,
-                    &conversation_id,
+                    opts: &opts,
+                    mcp: &mcp,
+                    tool_ctx: &tool_ctx,
+                    project_path: &project_path,
+                    path_hints: &path_hints,
+                    project_id: &project_id,
+                    conversation_id: &conversation_id,
                     cancel,
                     registry,
-                    max_tool_rounds as u32,
-                )
-                .await;
-                let intercepted = apply_tool_batch(
-                    &results,
-                    &mut tool_runs,
-                    &mut consecutive_failures,
-                    &mut replan_given,
-                    &mut replan_instruction,
-                    stats,
-                    &mut tools_since_progress,
-                    &mut full,
-                    app,
-                    state,
-                    &trace_id,
-                    &client,
-                    &protocol,
-                    &provider,
-                    &model_choice,
-                    &opts,
-                    &messages,
-                    &conversation_id,
-                    cancel,
-                    registry,
-                )
-                .await;
-                persist_desktop_executor_checkpoint(
-                    state,
-                    &trace_id,
-                    &conversation_id,
-                    kernel_executor.checkpoint(),
-                    crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
-                    placeholder_msg_id.as_deref(),
+                    trace_id: &trace_id,
+                    client: &client,
+                    protocol: &protocol,
+                    provider: &provider,
+                    model_choice: &model_choice,
+                    messages: &messages,
+                    executor: &kernel_executor,
+                    tool_runs: &mut tool_runs,
+                    consecutive_failures: &mut consecutive_failures,
+                    replan_given: &mut replan_given,
+                    replan_instruction: &mut replan_instruction,
+                    stats: &mut *stats,
+                    tools_since_progress: &mut tools_since_progress,
+                    full: &mut full,
+                    placeholder_msg_id: placeholder_msg_id.as_deref(),
                     max_tool_rounds,
                     budget_extensions,
-                )?;
+                })
+                .await?;
                 if intercepted {
                     exhausted = true;
                 }
@@ -10746,6 +10693,100 @@ async fn apply_tool_batch(
         }
     }
     intercepted
+}
+
+/// `flush_tool_batch` 的输入（全部借用）。
+struct ToolBatchInputs<'a> {
+    pending: &'a mut Vec<(String, String, u32)>,
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    opts: &'a ChatOptions,
+    mcp: &'a crate::services::mcp_manager::McpManager,
+    tool_ctx: &'a crate::agent::exec_ctx::ToolCtx,
+    project_path: &'a str,
+    path_hints: &'a [String],
+    project_id: &'a str,
+    conversation_id: &'a str,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    registry: &'a TaskRegistry,
+    trace_id: &'a str,
+    client: &'a reqwest::Client,
+    protocol: &'a str,
+    provider: &'a ProviderEndpoint,
+    model_choice: &'a ModelChoice,
+    messages: &'a [serde_json::Value],
+    executor: &'a KernelIoRunLoop,
+    tool_runs: &'a mut Vec<ToolRunItem>,
+    consecutive_failures: &'a mut u32,
+    replan_given: &'a mut bool,
+    replan_instruction: &'a mut Option<String>,
+    stats: &'a mut ChatRunStats,
+    tools_since_progress: &'a mut u32,
+    full: &'a mut String,
+    placeholder_msg_id: Option<&'a str>,
+    max_tool_rounds: usize,
+    budget_extensions: usize,
+}
+
+/// 排空只读工具批次（纯搬运：原工具循环内联的三处相同代码，行为一致）：
+/// 并行执行 → 按模型序提交 → 落执行器检查点，最后清空批次。返回是否被拦截
+/// （调用方据此置 `exhausted` 并结束任务）。
+///
+/// 三处调用点的差异只有清空之后做的事（上限触发的 `break` / barrier 前的 `break` /
+/// 循环末尾只置位不 `break`），因此清空放在函数内统一执行：循环末尾那次清空对随后
+/// 即被丢弃的局部变量无可观察差异。
+async fn flush_tool_batch(inputs: ToolBatchInputs<'_>) -> Result<bool, ChatFlowError> {
+    let results = run_tool_batch(
+        inputs.pending,
+        inputs.app,
+        inputs.state,
+        inputs.opts,
+        inputs.mcp,
+        inputs.tool_ctx,
+        inputs.project_path,
+        inputs.path_hints,
+        inputs.project_id,
+        inputs.conversation_id,
+        inputs.cancel,
+        inputs.registry,
+        inputs.max_tool_rounds as u32,
+    )
+    .await;
+    let intercepted = apply_tool_batch(
+        &results,
+        inputs.tool_runs,
+        inputs.consecutive_failures,
+        inputs.replan_given,
+        inputs.replan_instruction,
+        inputs.stats,
+        inputs.tools_since_progress,
+        inputs.full,
+        inputs.app,
+        inputs.state,
+        inputs.trace_id,
+        inputs.client,
+        inputs.protocol,
+        inputs.provider,
+        inputs.model_choice,
+        inputs.opts,
+        inputs.messages,
+        inputs.conversation_id,
+        inputs.cancel,
+        inputs.registry,
+    )
+    .await;
+    persist_desktop_executor_checkpoint(
+        inputs.state,
+        inputs.trace_id,
+        inputs.conversation_id,
+        inputs.executor.checkpoint(),
+        crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
+        inputs.placeholder_msg_id,
+        inputs.max_tool_rounds,
+        inputs.budget_extensions,
+    )?;
+    inputs.pending.clear();
+    Ok(intercepted)
 }
 
 /// 从文本提取到的目录路径及其语境分类。
