@@ -873,3 +873,21 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 
 **仍未闭环**：第 7 步是真正的重写，必须在有真实桌面验收窗口的批次里做（多轮工具任务 + 中途停止 + 断点续跑）；本机没有行为快照，抽取期间仍靠编译器 + 全量回归 + 两组 crash E2E 把关。另：本次两刀的结论已在 macOS 本机复验，Windows 侧与 CI 尚待确认。
 
+**进展（2026-09-18，第十一刀：工具轮整体）**：整个「一轮的工具执行」块（`pending` 批次、每工具尝试裁决、心跳与打点、预算门、三处批次排空、`run_one_tool` 调用、循环末尾兜底排空与 `exhausted` 判断）搬进 `run_tool_calls`（`7d3dcb1`），输入 `ToolRoundInputs` 34 个字段（`calls` 按值传入，原 `for` 循环即消费它），结论为 `ToolRoundOutcome { Finish, ContinueRound }`。
+
+- **控制流这次几乎不用改**：`for` 的 `break`/`continue` 与循环同在一个函数里，因此原样保留；只有块末尾的 `break` / `continue` 换成 `return Ok(Finish)` / `Ok(ContinueRound)`。`exhausted` 改为函数内局部量（它只在本块内读写），`Finish` 时由调用方置位外层同名标志并结束任务——与原「置位后立刻 break」同序。
+- **搬完逐行 diff**：与原文 20 组差异全部是机械改写——丢掉嵌套调用点上多余的 `&mut`（输入已是 `&mut`）、两处按值传入的 `usize` 加 `*`、`*correction_text`/`*correction_hint`/`*tools_since_progress += 1` 解引用、以及那两行末尾控制流。**循环自身的 4 处 `break` 与 2 处 `continue` 未动**。
+- **踩到的门禁**：搬运脚本按「行号区间」替换时，块首的 `if !calls.is_empty() {` 留在原地、块尾的 `}` 也留下，形成「同条件嵌套两层 if」——编译通过但被 clippy 判 `collapsible_if`（它建议的 `if a && a` 看着荒谬，其实正是指这处重复）。已按原意收敛为一层并顺手把 `match` 结果先绑到局部量，避免同一 lint 再次触发。
+- **度量**：主循环体 557 → **324 行**；循环内 `break`/`continue` 20 → 11；`.emit(` 保持 0、`.0.lock()` 保持 1。
+- **验证**：后端库 1,105 通过 / 0 失败 / 9 忽略 + 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py` 通过（macOS 本机）。
+
+**当前进度快照（截至第十一刀，2026-09-18）**：主循环体 2,107（旧口径）/ 1,978（更正口径）→ **324 行**；循环内 `.emit(` 32 → 0、`.0.lock()` 约 22 → 1、`break`/`continue` 34 → 11。剩下的只有：
+
+| 剩余块 | 位置 | 行数 | 说明 |
+| --- | --- | --- | --- |
+| 循环后验收收尾段 | 6544–6671 | 128 | 循环外、`stream_chat_inner` 内的验收与收尾，可单独搬成一刀 |
+| 第 7 步「合段」 | — | — | `RoundOutcome` + `DesktopRoundState` + 切换 `run(port)`；**需真实桌面验收窗口** |
+
+第 7 步之前已无「纯搬运」型的刀；循环后验收收尾段（128 行）是唯一还剩的搬运项。
+
+

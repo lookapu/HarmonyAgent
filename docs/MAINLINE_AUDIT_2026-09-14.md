@@ -678,3 +678,14 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 
 **验证**（macOS 本机，每刀各跑一遍）：后端库 1,105 通过 / 0 失败 / 9 忽略；两组 crash E2E 各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。**仍未覆盖**：Windows 侧与 CI 待确认；桌面主循环的行为等价在两平台都无自动化快照，第 7 步仍需真实桌面验收窗口（多轮工具任务 + 中途停止 + 断点续跑）。
 
+## 41. 第 2 步第十一刀：工具轮整体搬出主循环（2026-09-18）
+
+第 40 节剩下的「工具 `for` 循环骨架」一刀落地：整个**一轮的工具执行**块（`pending` 批次、每工具尝试裁决、心跳与打点、预算门、三处批次排空、`run_one_tool` 调用、循环末尾兜底排空与 `exhausted` 判断）搬进 `run_tool_calls`（`7d3dcb1`），输入 `ToolRoundInputs` 34 个字段（`calls` 按值传入——原 `for` 就消费它），结论 `ToolRoundOutcome { Finish, ContinueRound }`。
+
+- **控制流这次几乎不用改**：`for` 的 4 处 `break` / 2 处 `continue` 与循环同在一个函数里，原样保留；只有块末尾的 `break` / `continue` 换成 `return Ok(Finish)` / `Ok(ContinueRound)`。`exhausted` 收敛为函数内局部量（它只在本块内读写），`Finish` 时由调用方置位外层同名标志再 `break`，与原「置位后立刻 break」同序。
+- **搬运保真度**：逐行 diff 原内联代码，20 组差异**全部是机械改写**——嵌套调用点上多余的 `&mut`（输入已是 `&mut`）、两处按值传入的 `usize` 补 `*`、`*correction_text`/`*correction_hint`/`*tools_since_progress += 1`、以及末尾两行控制流。循环自身的控制流一行未动。
+- **一处工具链坑（值得记住）**：本次搬运用「按行号区间替换」的脚本，块首的 `if !calls.is_empty() {` 与块尾的 `}` 不在替换区间内，于是留下「同条件嵌套两层 if」——**编译通过**，但 clippy 判 `collapsible_if` 才暴露（它的建议 `if a && a {` 看着荒谬，正是指这处重复）。教训：按行号搬运时，区间必须包含块首的判断行与块尾的闭合括号，或搬完显式核对配对；不然错误会以「看着不像错误」的 lint 形式出现。
+- **度量**：主循环体 557 → **324 行**；循环内 `break`/`continue` 20 → 11；`.emit(` 0、`.0.lock()` 1（均未变）。**剩余**：循环后验收收尾段 128 行（6544–6671，唯一还剩的搬运项）、第 7 步「合段」。
+- **验证**（macOS 本机）：后端库 1,105 通过 / 0 失败 / 9 忽略；两组 crash E2E 各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。**仍未覆盖**：Windows 侧与 CI；`run_tool_calls` 复用 `run_one_tool` 的 `#[allow(clippy::needless_borrow)]` 处置（现共 2 个函数，欠账记在驱动文档 §20，第 7 步清理）。
+
+
