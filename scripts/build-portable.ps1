@@ -27,16 +27,23 @@ $map = @(
     @{ Src = "resources\embedding"; Dst = "embedding" }
 )
 
+# 先装到临时目录、校验通过后再换位：绝不先删成品。
+# 早先「先 Remove-Item -Recurse 再拷」的写法在目录被占用时（资源管理器窗口开在里面、
+# 或应用正在运行）会把成品删到一半就中断——exe 与 resources 都没了，只剩一个删不掉的空目录，
+# 此时用户运行到的那份绿色版就没有 seed，表现为"API 知识库内容全没了"（本机实际发生过）。
+$staging = "$out.new"
+$previous = "$out.old"
+
 Write-Host "==> 输出目录: $out"
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-New-Item -ItemType Directory -Path $out -Force | Out-Null
+if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
+New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
 Write-Host "==> 复制 exe ($([math]::Round((Get-Item $exe).Length/1MB,1)) MB)"
-Copy-Item $exe (Join-Path $out "deveco-switch.exe")
+Copy-Item $exe (Join-Path $staging "deveco-switch.exe")
 
 foreach ($m in $map) {
     $src = Join-Path $srcTauri $m.Src
-    $dst = Join-Path $out "resources\$($m.Dst)"
+    $dst = Join-Path $staging "resources\$($m.Dst)"
     if (-not (Test-Path $src)) {
         Write-Host "    跳过（源缺失）: $($m.Src)"
         continue
@@ -47,7 +54,7 @@ foreach ($m in $map) {
     if ($LASTEXITCODE -ge 8) { throw "robocopy 失败: $($m.Src) (exit $LASTEXITCODE)" }
 }
 
-# 校验关键文件
+# 校验关键文件：在换上去之前做，避免把不完整的目录落到成品位置
 $checks = @(
     "deveco-switch.exe",
     "resources\node\node.exe",
@@ -58,10 +65,38 @@ $checks = @(
 )
 $missing = @()
 foreach ($c in $checks) {
-    if (-not (Test-Path (Join-Path $out $c))) { $missing += $c }
+    if (-not (Test-Path (Join-Path $staging $c))) { $missing += $c }
 }
 if ($missing.Count -gt 0) {
+    Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
     throw "关键文件缺失: $($missing -join ', ')"
+}
+
+# 换位：优先「改名挪开旧的 → 把新的改名就位」（原子、不留残留）。
+# 改名失败说明目录本身被占用（典型情形：资源管理器窗口开在里面，或用户正从这个目录
+# 启动绿色版）——此时**回退为合并拷贝**：往现有目录里逐文件覆盖，不删目录本身。
+# 合并的代价是可能残留本次未产出的旧文件，所以只作为回退并明确提示。
+$swapped = $false
+if (Test-Path $out) {
+    if (Test-Path $previous) { Remove-Item $previous -Recurse -Force -ErrorAction SilentlyContinue }
+    try {
+        Rename-Item -LiteralPath $out -NewName (Split-Path $previous -Leaf) -ErrorAction Stop
+    } catch {
+        Write-Host "==> 成品目录被占用（$($_.Exception.Message.Trim())）"
+        Write-Host "==> 回退为合并拷贝：不动原目录，逐文件覆盖"
+        robocopy $staging $out /E /NJH /NJS /NFL /NDL /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "合并拷贝失败（exit $LASTEXITCODE），原目录未被改动" }
+        Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+        $swapped = $true
+        Write-Host "==> 已完成（合并方式换位；若有本次已移除的旧文件会残留在成品目录里）"
+    }
+}
+if (-not $swapped) {
+    Rename-Item -LiteralPath $staging -NewName (Split-Path $out -Leaf)
+    if (Test-Path $previous) {
+        Remove-Item $previous -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $previous) { Write-Host "提示：旧目录未能删除（仍被占用），可稍后手动删：$previous" }
+    }
 }
 
 $total = (Get-ChildItem $out -Recurse -File | Measure-Object Length -Sum).Sum
