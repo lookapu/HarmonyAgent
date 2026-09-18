@@ -6589,10 +6589,7 @@ struct FinalizeInputs<'a> {
 /// （写 `verifying` 状态、按原始目标与工具轨迹裁决、落执行器最终快照与质量快照）、
 /// 未通过时在正文追加提示、持久化本轮消息、最后按完成/未完成保存或清空账本。
 ///
-/// 函数体保留原内联代码的缩进与借用写法（便于逐行比对），因此与 `run_one_tool`、
-/// `run_tool_calls` 一样在函数级收口 `clippy::needless_borrow`（现共 3 处，均待第 7 步
-/// 合段重写时随借用一并清理）。
-#[allow(clippy::needless_borrow)]
+/// 函数体保留原内联代码的缩进（便于逐行比对）。
 async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
     let FinalizeInputs {
         app,
@@ -6616,18 +6613,18 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
     if let Ok(conn) = state.0.lock() {
         let _ = crate::agent::runtime::transition(
             &conn,
-            &trace_id,
-            &conversation_id,
+            trace_id,
+            conversation_id,
             "verifying",
             "acceptance",
             None,
         );
     }
     let acceptance_evidence =
-        combined_acceptance_evidence(&inherited_tool_evidence, &round_state.tool_runs);
+        combined_acceptance_evidence(inherited_tool_evidence, &round_state.tool_runs);
     let acceptance = state.0.lock().ok()
-        .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &acceptance_evidence).ok())
-        .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &acceptance_evidence));
+        .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, trace_id, goal_contract, &acceptance_evidence).ok())
+        .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(goal_contract, &acceptance_evidence));
     let completion_confirmed =
         is_completion_confirmation(&round_state.last_model_text)
             || (round_state.tool_runs.is_empty() && inherited_tool_evidence.is_empty());
@@ -6641,26 +6638,26 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
     .unwrap_or_default();
     if let Ok(conn) = state.0.lock() {
         let value = serde_json::to_value(&acceptance).unwrap_or_else(|_| serde_json::json!({}));
-        let _ = crate::agent::runtime::set_acceptance(&conn, &trace_id, &value);
+        let _ = crate::agent::runtime::set_acceptance(&conn, trace_id, &value);
         let _ = crate::agent::runtime::append_event(
             &conn,
-            &trace_id,
-            &conversation_id,
+            trace_id,
+            conversation_id,
             "run.executor_snapshot",
             executor_snapshot,
         );
         let _ = crate::agent::tool_metrics::annotate_run_outcomes(
             &conn,
-            &trace_id,
-            &task_goal,
+            trace_id,
+            task_goal,
             &model_choice.model,
-            &project_id,
+            project_id,
             &acceptance,
         );
         let _ = crate::agent::runtime::append_event(
             &conn,
-            &trace_id,
-            &conversation_id,
+            trace_id,
+            conversation_id,
             "run.acceptance",
             value,
         );
@@ -6671,9 +6668,9 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
             round_state.exhausted,
         );
         let quality_value = serde_json::to_value(quality).unwrap_or_default();
-        let _ = crate::agent::runtime::set_quality(&conn, &trace_id, &quality_value);
+        let _ = crate::agent::runtime::set_quality(&conn, trace_id, &quality_value);
         let _ = crate::agent::runtime::append_event(
-            &conn, &trace_id, &conversation_id, "run.quality", quality_value,
+            &conn, trace_id, conversation_id, "run.quality", quality_value,
         );
     }
     if !acceptance.passed {
@@ -6686,8 +6683,8 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
     stats.unfinished = !task_done;
     persist_turn(
         state,
-        &conversation_id,
-        &trace_id,
+        conversation_id,
+        trace_id,
         &round_state.tool_runs,
         &round_state.full,
         &round_state.reasoning_full,
@@ -6706,7 +6703,7 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
     // 账本持久化（Ledger 协议）：任务确认完成（模型明确确认或纯问答无工具）则清空账本；
     // 否则保存当前账本（含断点续跑合并），下次续跑继承——完成/未完成状态不静默丢失
     if task_done {
-        save_task_ledger(state, &conversation_id, None)?;
+        save_task_ledger(state, conversation_id, None)?;
         // 账本最终态推送：任务完成 → 清空账本（前端收起账本卡，任务摘要接管展示）
         let _ = app.emit(
             "chat-ledger",
@@ -6721,9 +6718,9 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
         persist_open_ledger_and_emit(
             state,
             app,
-            &conversation_id,
+            conversation_id,
             OpenLedgerInputs {
-                task_goal: &task_goal,
+                task_goal,
                 round_state: &mut *round_state,
                 ledger_base_n,
             },
@@ -10376,12 +10373,9 @@ struct ToolExecInputs<'a> {
 /// 不规范，不能用 `cargo fmt` 处理——会淹没搬运本身）。返回 `Skip` / `Stop` 对应原
 /// 代码的 `continue` / `break`，`Stop` 所需的 `exhausted = true;` 交回调用方。
 ///
-/// **借用写法同样保持原样**：输入从局部变量改为引用后，原代码里对局部 `String`/`Vec`/
-/// 配置对象写的 `&x` 变成对引用的多余借用，clippy 在本函数内报 180+ 处
-/// `needless_borrow`。逐处改写会把这 445 行搬运的 diff 淹没（与「纯搬运可逐行比对」
-/// 的纪律冲突），而改成按值传入又要在每次工具调用克隆 `messages`/`opts` 等结构。
-/// 因此这一处例外在此收口：仅覆盖本函数，待第 7 步「合段」重写时随借用一并清理。
-#[allow(clippy::needless_borrow)]
+/// 搬运时曾为「逐行可比对」保留原代码对局部变量的 `&x`（输入改引用后成了多余借用），
+/// 由函数级 `#[allow(clippy::needless_borrow)]` 收口；该例外随后已清理，现在本函数
+/// 接受 clippy 的借用检查。
 async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, ChatFlowError> {
     let ToolExecInputs {
         app,
@@ -10421,31 +10415,31 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                         args: args_raw.clone(),
                         round,
                         total: max_tool_rounds as u32,
-                        level: crate::services::permissions::tool_level(&tool).as_str().to_string(),
-                        desc: crate::agent::tools::tool_short_desc(&tool).to_string(),
+                        level: crate::services::permissions::tool_level(tool).as_str().to_string(),
+                        desc: crate::agent::tools::tool_short_desc(tool).to_string(),
                     },
                 );
-                begin_tool_run(state, &conversation_id, &trace_id, &call_id, &tool, &args_raw);
+                begin_tool_run(state, conversation_id, trace_id, call_id, tool, args_raw);
                 // 统一护栏预检：任务预算/失败黑名单/权限分级审批由 pipeline pre 钩子裁决
                 // （guards.rs 注册），拦截后按 InterceptKind 收尾：
                 // - Budget/Blacklist：发 done 事件 + 请求模型总结后终止（不静默收尾）
                 // - Approval/Generic：发 done 事件后直接终止（用户拒绝无总结机会）
                 let args_val: serde_json::Value =
-                    serde_json::from_str(&args_raw).unwrap_or(serde_json::Value::Null);
+                    serde_json::from_str(args_raw).unwrap_or(serde_json::Value::Null);
                 let approval_ctx = tool_ctx.clone().with_tool_call_id(call_id.clone());
                 let inv = crate::agent::tools::ToolInvocation {
-                    name: &tool,
+                    name: tool,
                     args: &args_val,
-                    args_raw: &args_raw,
-                    project_id: &project_id,
-                    project_path: &project_path,
-                    roots: &path_hints,
-                    conversation_id: &conversation_id,
-                    approval_mode: approval_mode(&opts),
+                    args_raw,
+                    project_id,
+                    project_path,
+                    roots: path_hints,
+                    conversation_id,
+                    approval_mode: approval_mode(opts),
                     ctx: &approval_ctx,
                 };
                 if let Some(message) =
-                    crate::agent::recovery::verification_block_global(&trace_id, &tool)
+                    crate::agent::recovery::verification_block_global(trace_id, tool)
                 {
                     let duration_ms = tool_begin.elapsed().as_millis() as i64;
                     let _ = app.emit(
@@ -10462,21 +10456,21 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     );
                     persist_tool_run_immediate(
                         state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool,
-                        &args_raw,
+                        conversation_id,
+                        trace_id,
+                        tool,
+                        args_raw,
                         &message,
                         false,
                     );
                     finish_tool_run(
                         app,
                         state,
-                        &conversation_id,
-                        &trace_id,
-                        Some(&call_id),
-                        &tool,
-                        &args_raw,
+                        conversation_id,
+                        trace_id,
+                        Some(call_id),
+                        tool,
+                        args_raw,
                         &message,
                         "blocked",
                         duration_ms,
@@ -10516,21 +10510,21 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     // 拦截结果同样即时入库（任务中断时用户可见拦截原因）
                     persist_tool_run_immediate(
                         state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool,
-                        &args_raw,
+                        conversation_id,
+                        trace_id,
+                        tool,
+                        args_raw,
                         &intercept.message,
                         false,
                     );
                     finish_tool_run(
                         app,
                         state,
-                        &conversation_id,
-                        &trace_id,
-                        Some(&call_id),
-                        &tool,
-                        &args_raw,
+                        conversation_id,
+                        trace_id,
+                        Some(call_id),
+                        tool,
+                        args_raw,
                         &intercept.message,
                         if intercept.kind == crate::agent::tools::InterceptKind::Cancelled {
                             "cancelled"
@@ -10560,13 +10554,13 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                         // 给模型最后一次总结机会，避免输出戛然而止
                         let summary = request_final_summary(
                             app,
-                            &client,
-                            &protocol,
-                            &provider,
-                            &model_choice,
-                            &opts,
-                            &messages,
-                            &conversation_id,
+                            client,
+                            protocol,
+                            provider,
+                            model_choice,
+                            opts,
+                            messages,
+                            conversation_id,
                             cancel,
                             registry,
                             stats,
@@ -10588,10 +10582,10 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     }
                     return Ok(ToolExecOutcome::Stop);
                 }
-            if let Err(output) = mark_tool_run_started(state, &conversation_id, &trace_id, &call_id) {
+            if let Err(output) = mark_tool_run_started(state, conversation_id, trace_id, call_id) {
                 finish_tool_run(
-                    app, state, &conversation_id, &trace_id, Some(&call_id), &tool,
-                    &args_raw, &output, "error", tool_begin.elapsed().as_millis() as i64,
+                    app, state, conversation_id, trace_id, Some(call_id), tool,
+                    args_raw, &output, "error", tool_begin.elapsed().as_millis() as i64,
                 );
                 let _ = app.emit("chat-tool-done", ChatToolDoneEvent {
                     conversation_id: conversation_id.clone(), run_id: trace_id.clone(),
@@ -10607,20 +10601,20 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
             }
             // 子 Agent 委派：并发执行、可指定模型，结果汇总后继续主 Agent 循环
             let (result, retry_count) = if tool == "spawn_agents" {
-                tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
+                tool_limits::record_tool_call(conversation_id, tool, args_raw);
                 let r = run_spawn_agents(
                     app,
                     state,
-                    &client,
-                    &project_path,
-                    &path_hints,
-                    &project_id,
-                    &provider,
-                    &model_choice,
-                    &opts,
+                    client,
+                    project_path,
+                    path_hints,
+                    project_id,
+                    provider,
+                    model_choice,
+                    opts,
                     approval,
-                    &args_raw,
-                    &conversation_id,
+                    args_raw,
+                    conversation_id,
                     cancel,
                     tool_ctx.spawn_remaining,
                 )
@@ -10628,29 +10622,29 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                 (r, 0)
             } else {
                 // 执行工具：超时/网络类错误按指数退避自动重试（可恢复错误白名单）
-                let contract = crate::agent::tools::contracts::contract(&tool);
+                let contract = crate::agent::tools::contracts::contract(tool);
                 let retried = run_tool_with_retry(
                     &contract,
                     &TOOL_POLICY,
                     || {
                         run_tool_with_guard(
-                            &tool,
-                            &args_raw,
-                            &project_path,
-                            &path_hints,
-                            &project_id,
+                            tool,
+                            args_raw,
+                            project_path,
+                            path_hints,
+                            project_id,
                             state,
-                            &mcp,
-                            &tool_ctx,
+                            mcp,
+                            tool_ctx,
                             cancel,
-                            &conversation_id,
+                            conversation_id,
                             registry,
-                            &call_id,
+                            call_id,
                         )
                     },
                 )
                 .await;
-                tool_limits::record_tool_call(&conversation_id, &tool, &args_raw);
+                tool_limits::record_tool_call(conversation_id, tool, args_raw);
                 stats.retry_count += (retried.attempts - 1) as i64;
                 let retry_count = (retried.attempts - 1) as i64;
                 let result = retried.value.map(|out| retry_notice(out, retried.attempts));
@@ -10668,11 +10662,11 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
             let committed = finish_tool_run(
                 app,
                 state,
-                &conversation_id,
-                &trace_id,
-                Some(&call_id),
-                &tool,
-                &args_raw,
+                conversation_id,
+                trace_id,
+                Some(call_id),
+                tool,
+                args_raw,
                 result.as_ref().unwrap_or_else(|e| e),
                 audit_status,
                 tool_begin.elapsed().as_millis() as i64,
@@ -10681,9 +10675,9 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                 if let Ok(conn) = state.0.lock() {
                     let _ = crate::agent::tool_metrics::record_attempt_metrics(
                         &conn,
-                        &call_id,
+                        call_id,
                         retry_count,
-                        crate::agent::exec_ctx::stop_requested_at_ms(&conversation_id),
+                        crate::agent::exec_ctx::stop_requested_at_ms(conversation_id),
                     );
                 }
             }
@@ -10707,12 +10701,12 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     stats.tool_rounds += 1;
                     // 记录修改过的文件（edit_file/write_file 目标 + run_command 间接修改，去重；供消息底部文件列表展示）
                     if tool == "edit_file" || tool == "write_file" {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&args_raw) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_raw) {
                             if let Some(p) = v["path"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
                                 // 模型给出的绝对路径可能带 \\?\ 前缀，先规范化；项目路径同样规范化，
                                 // 避免大小写/斜杠方向/冗余分隔符不一致导致 strip_prefix 失败、保留绝对路径被前端 diff 拒绝。
                                 let p = crate::utils::path::normalize_path(p);
-                                let proj_norm = crate::utils::path::normalize_path(&project_path);
+                                let proj_norm = crate::utils::path::normalize_path(project_path);
                                 // 绝对路径且位于项目内时转相对（大小写不敏感比较，Windows 友好），便于展示
                                 let rel = if p.starts_with(&proj_norm) {
                                     p[proj_norm.len()..].trim_start_matches(['/', '\\']).to_string()
@@ -10795,10 +10789,10 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     // 执行完成即入库：任务中断（应用退出/崩溃）时执行轨迹不丢
                     persist_tool_run_immediate(
                         state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool,
-                        &args_raw,
+                        conversation_id,
+                        trace_id,
+                        tool,
+                        args_raw,
                         &output,
                         true,
                     );
@@ -10835,10 +10829,10 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                     // 失败同样即时入库（任务中断时用户可见失败原因，恢复会话可继续）
                     persist_tool_run_immediate(
                         state,
-                        &conversation_id,
-                        &trace_id,
-                        &tool,
-                        &args_raw,
+                        conversation_id,
+                        trace_id,
+                        tool,
+                        args_raw,
                         &format!("执行失败: {e}"),
                         false,
                     );
@@ -10898,10 +10892,7 @@ struct ToolRoundInputs<'a> {
 /// 每工具的尝试裁决与预算门、调用 `run_one_tool`、循环末尾批次兜底排空。
 ///
 /// `exhausted` 在本函数内累计；返回 `Finish` 时由调用方置位外层标志并结束任务。
-/// 函数体保留原内联代码的缩进与借用写法（便于逐行比对），因此与 `run_one_tool` 一样
-/// 在函数级收口 `clippy::needless_borrow`：输入改为引用后，原代码对局部变量的 `&x`
-/// 成了多余借用，逐处改写会淹没搬运本身。两处例外都在第 7 步合段时随借用一并清理。
-#[allow(clippy::needless_borrow)]
+/// 函数体保留原内联代码的缩进（便于逐行比对）。
 async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome, ChatFlowError> {
     let ToolRoundInputs {
         calls,
@@ -10956,7 +10947,7 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                 let tool_begin = std::time::Instant::now();
                 let call_id = Uuid::new_v4().to_string();
                 // 工具心跳：长工具执行（build/run 可达数分钟）期间保持心跳，防看门狗误杀
-                registry.touch(&conversation_id, PHASE_TOOL);
+                registry.touch(conversation_id, PHASE_TOOL);
                 // 工具执行跟踪（含批处理路径：本循环所有工具均经过此处）
                 crate::utils::logger::log_event(
                     "tool_started",
@@ -10997,15 +10988,15 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                     state,
                     cancel,
                     registry,
-                    client: &client,
-                    protocol: &protocol,
-                    provider: &provider,
-                    opts: &opts,
-                    messages: &messages,
-                    model_choice: &model_choice,
-                    conversation_id: &conversation_id,
-                    trace_id: &trace_id,
-                    execution_budget: &execution_budget,
+                    client,
+                    protocol,
+                    provider,
+                    opts,
+                    messages,
+                    model_choice,
+                    conversation_id,
+                    trace_id,
+                    execution_budget,
                     tool: &tool,
                     args_raw: &args_raw,
                     call_id: &call_id,
@@ -11033,22 +11024,22 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                             pending: &mut pending,
                             app,
                             state,
-                            opts: &opts,
-                            mcp: &mcp,
+                            opts,
+                            mcp,
                             tool_ctx: &tool_ctx,
-                            project_path: &project_path,
-                            path_hints: &path_hints,
-                            project_id: &project_id,
-                            conversation_id: &conversation_id,
+                            project_path,
+                            path_hints,
+                            project_id,
+                            conversation_id,
                             cancel,
                             registry,
-                            trace_id: &trace_id,
-                            client: &client,
-                            protocol: &protocol,
-                            provider: &provider,
-                            model_choice: &model_choice,
-                            messages: &messages,
-                            executor: &kernel_executor,
+                            trace_id,
+                            client,
+                            protocol,
+                            provider,
+                            model_choice,
+                            messages,
+                            executor: kernel_executor,
                             stats: &mut *stats,
                             round_state: &mut *round_state,
                         })
@@ -11065,22 +11056,22 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                         pending: &mut pending,
                         app,
                         state,
-                        opts: &opts,
-                        mcp: &mcp,
+                        opts,
+                        mcp,
                         tool_ctx: &tool_ctx,
-                        project_path: &project_path,
-                        path_hints: &path_hints,
-                        project_id: &project_id,
-                        conversation_id: &conversation_id,
+                        project_path,
+                        path_hints,
+                        project_id,
+                        conversation_id,
                         cancel,
                         registry,
-                        trace_id: &trace_id,
-                        client: &client,
-                        protocol: &protocol,
-                        provider: &provider,
-                        model_choice: &model_choice,
-                        messages: &messages,
-                        executor: &kernel_executor,
+                        trace_id,
+                        client,
+                        protocol,
+                        provider,
+                        model_choice,
+                        messages,
+                        executor: kernel_executor,
                         stats: &mut *stats,
                         round_state: &mut *round_state,
                     })
@@ -11093,21 +11084,21 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                 match run_one_tool(ToolExecInputs {
                     app,
                     state,
-                    opts: &opts,
-                    mcp: &mcp,
+                    opts,
+                    mcp,
                     tool_ctx: &tool_ctx,
-                    project_path: &project_path,
-                    path_hints: &path_hints,
-                    project_id: &project_id,
-                    conversation_id: &conversation_id,
+                    project_path,
+                    path_hints,
+                    project_id,
+                    conversation_id,
                     cancel,
                     registry,
-                    trace_id: &trace_id,
-                    client: &client,
-                    protocol: &protocol,
-                    provider: &provider,
-                    model_choice: &model_choice,
-                    messages: &messages,
+                    trace_id,
+                    client,
+                    protocol,
+                    provider,
+                    model_choice,
+                    messages,
                     approval,
                     stats: &mut *stats,
                     tool: &tool,
@@ -11134,8 +11125,8 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
             round_state.tools_since_progress += 1;
             persist_desktop_executor_checkpoint(
                 state,
-                &trace_id,
-                &conversation_id,
+                trace_id,
+                conversation_id,
                 kernel_executor.checkpoint(),
                 crate::agent::kernel_executor::KernelCheckpointSafePoint::ToolResult,
                 round_state.placeholder_msg_id.as_deref(),
@@ -11149,22 +11140,22 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                     pending: &mut pending,
                     app,
                     state,
-                    opts: &opts,
-                    mcp: &mcp,
+                    opts,
+                    mcp,
                     tool_ctx: &tool_ctx,
-                    project_path: &project_path,
-                    path_hints: &path_hints,
-                    project_id: &project_id,
-                    conversation_id: &conversation_id,
+                    project_path,
+                    path_hints,
+                    project_id,
+                    conversation_id,
                     cancel,
                     registry,
-                    trace_id: &trace_id,
-                    client: &client,
-                    protocol: &protocol,
-                    provider: &provider,
-                    model_choice: &model_choice,
-                    messages: &messages,
-                    executor: &kernel_executor,
+                    trace_id,
+                    client,
+                    protocol,
+                    provider,
+                    model_choice,
+                    messages,
+                    executor: kernel_executor,
                     stats: &mut *stats,
                     round_state: &mut *round_state,
                 })
