@@ -1048,6 +1048,18 @@ fn candidate_slugs(module: &str) -> Vec<String> {
         .collect()
 }
 
+/// 规划一个模块的候选 slug：目录树精确命中时只试该 objectId，否则退回猜出的候选。
+fn plan_candidates(
+    module: &str,
+    guessed: &[String],
+    catalog: &crate::services::harmony_doc_api::CatalogIndex,
+) -> Vec<String> {
+    match catalog.resolve(module) {
+        Some(exact) => vec![exact.to_string()],
+        None => guessed.to_vec(),
+    }
+}
+
 pub async fn refresh_all(
     db: &crate::db::DbState,
     on_progress: Option<ProgressCb>,
@@ -1056,6 +1068,39 @@ pub async fn refresh_all(
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         collect_candidates_from_db(&conn)
     };
+
+    // 目录树索引：模块名 → 文档 objectId 精确查表。老版本用「按命名规则猜 slug」，
+    // 对 @hms.*（如 @hms.security.confidentialSpace → confidentialspace-confidentialspace）
+    // 这类无法从模块名推导的文档永远命中不了。取树失败时退回猜 slug，不阻塞刷新。
+    let mut catalog_note: Option<String> = None;
+    let catalog = match crate::services::harmony_doc_api::fetch_catalog_docs(
+        crate::services::harmony_doc_api::CATALOG_REFERENCES,
+    )
+    .await
+    {
+        Ok(docs) => {
+            if let Some(cb) = &on_progress {
+                cb(&RefProgress {
+                    phase: "discover".to_string(),
+                    current: 0,
+                    total: candidates.len(),
+                    message: format!("目录树 {} 个文档", docs.len()),
+                });
+            }
+            crate::services::harmony_doc_api::catalog_index(&docs)
+        }
+        Err(e) => {
+            catalog_note = Some(format!("目录树获取失败，退回 slug 猜测：{e}"));
+            crate::services::harmony_doc_api::CatalogIndex::default()
+        }
+    };
+    let candidates: Vec<(String, Vec<String>)> = candidates
+        .into_iter()
+        .map(|(module, slugs)| {
+            let planned = plan_candidates(&module, &slugs, &catalog);
+            (module, planned)
+        })
+        .collect();
 
     let total = candidates.len();
     if let Some(cb) = &on_progress {
@@ -1071,6 +1116,9 @@ pub async fn refresh_all(
     let progress_cb: Option<std::sync::Arc<dyn Fn(&RefProgress) + Send + Sync>> =
         on_progress.map(std::sync::Arc::from);
     let mut report = RefReport::default();
+    if let Some(note) = catalog_note {
+        report.errors.push(note);
+    }
     let mut done: usize = 0;
 
     // 分块：每 4 个模块一组并发；模块内部多个候选 slug 也并发尝试，
@@ -1458,5 +1506,60 @@ console.info("The batterySOCInfo is: " + batterySOCInfo);
         .expect("query");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].members.iter().any(|m| m.member_name == "batterySOC"));
+    }
+
+    #[test]
+    fn catalog_hit_replaces_guessed_slugs() {
+        let docs = vec![
+            crate::services::harmony_doc_api::CatalogDoc {
+                object_id: "confidentialspace-confidentialspace".into(),
+                title: "@hms.security.confidentialSpace (机密空间服务)".into(),
+                path: vec![],
+            },
+            crate::services::harmony_doc_api::CatalogDoc {
+                object_id: "core-vision-face-detector-api".into(),
+                title: "faceDetector（人脸检测）".into(),
+                path: vec![],
+            },
+        ];
+        let catalog = crate::services::harmony_doc_api::catalog_index(&docs);
+        let guessed = vec!["js-apis-confidentialspace".to_string()];
+        // 完整模块名命中（@hms.* 无法从模块名推导 slug，只能靠目录树）
+        assert_eq!(
+            plan_candidates("@hms.security.confidentialSpace", &guessed, &catalog),
+            vec!["confidentialspace-confidentialspace".to_string()]
+        );
+        // 标题不带模块前缀时走末段匹配
+        assert_eq!(
+            plan_candidates("@hms.ai.face.faceDetector", &guessed, &catalog),
+            vec!["core-vision-face-detector-api".to_string()]
+        );
+        // 未命中：原样保留猜出的候选
+        assert_eq!(
+            plan_candidates("@ohos.batteryInfo", &guessed, &catalog),
+            guessed
+        );
+    }
+
+    /// 联网：目录树能覆盖 @hms.* 这类猜不出 slug 的模块（默认 ignore）。
+    #[tokio::test]
+    #[ignore = "需要联网，手动执行：cargo test --lib -- --ignored"]
+    async fn e2e_catalog_index_resolves_hms_modules() {
+        let docs = crate::services::harmony_doc_api::fetch_catalog_docs(
+            crate::services::harmony_doc_api::CATALOG_REFERENCES,
+        )
+        .await
+        .expect("fetch catalog tree");
+        assert!(docs.len() > 1000, "参考目录应有上千篇文档，实际 {}", docs.len());
+        let index = crate::services::harmony_doc_api::catalog_index(&docs);
+        // 完整模块名与「标题省略模块前缀」两种形态都要能命中
+        assert_eq!(
+            plan_candidates("@hms.security.confidentialSpace", &[], &index),
+            vec!["confidentialspace-confidentialspace".to_string()]
+        );
+        assert_eq!(
+            plan_candidates("@hms.ai.face.faceDetector", &[], &index),
+            vec!["core-vision-face-detector-api".to_string()]
+        );
     }
 }

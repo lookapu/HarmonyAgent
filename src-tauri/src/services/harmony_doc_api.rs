@@ -11,6 +11,7 @@
 //! - [`html_to_markdown`]：HTML → 近似 Markdown，供仍按 Markdown 解析的
 //!   API 参考正文管线复用。
 
+use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -22,6 +23,187 @@ pub const CATALOG_RELEASES: &str = "harmonyos-releases";
 pub const CATALOG_REFERENCES: &str = "harmonyos-references";
 
 const DOC_API: &str = "https://svc-drcn.developer.huawei.com/community/servlet/consumer/cn/documentPortal/getDocumentById";
+const DOC_TREE_API: &str = "https://svc-drcn.developer.huawei.com/community/servlet/consumer/cn/documentPortal/getCatalogTree";
+
+/// 文档目录树中的一个文档节点（叶子）
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogDoc {
+    /// 文档 objectId（`getDocumentById` 直接可用）
+    pub object_id: String,
+    /// 目录节点标题（参考文档形如 `@ohos.batteryInfo (电量信息)`）
+    pub title: String,
+    /// 从根到该节点的标题路径，便于区分同名节点
+    pub path: Vec<String>,
+}
+
+/// 拉取某个目录的完整文档树（文档中心的 `getCatalogTree`）。
+///
+/// 用于把「模块名 → 文档 objectId」变成精确查表，取代按命名规则猜 slug：
+/// 参考文档的 slug 命名不统一（`@ohos.nfc.tag → js-apis-nfctag`、
+/// `@hms.security.confidentialSpace → confidentialspace-confidentialspace`），
+/// 靠猜永远覆盖不全。
+pub async fn fetch_catalog_docs(catalog: &str) -> Result<Vec<CatalogDoc>, String> {
+    let body = serde_json::json!({
+        "language": "cn",
+        "catalogName": catalog,
+        "showHide": 0,
+    });
+    let client = build_client_auto()?;
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        match client
+            .post(DOC_TREE_API)
+            .header("Origin", "https://developer.huawei.com")
+            .header("Referer", "https://developer.huawei.com/consumer/cn/doc/")
+            .timeout(Duration::from_secs(40))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let text = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
+                return parse_catalog_tree(&text);
+            }
+            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
+            Err(e) => last_err = e.to_string(),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+        }
+    }
+    Err(last_err)
+}
+
+/// 解析 `getCatalogTree` 响应，收集全部带 `relateDocument` 的叶子节点。
+pub fn parse_catalog_tree(text: &str) -> Result<Vec<CatalogDoc>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("目录树 JSON 解析失败: {e}"))?;
+    if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
+        if code != 0 {
+            return Err(format!("目录树接口返回 code={code}"));
+        }
+    }
+    let list = v
+        .get("value")
+        .and_then(|value| value.get("catalogTreeList"))
+        .and_then(|list| list.as_array())
+        .ok_or_else(|| "目录树响应缺少 catalogTreeList".to_string())?;
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    for node in list {
+        walk_catalog_node(node, &mut path, &mut out);
+    }
+    Ok(out)
+}
+
+fn walk_catalog_node(node: &Value, path: &mut Vec<String>, out: &mut Vec<CatalogDoc>) {
+    let title = node
+        .get("nodeName")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // 注意：带 relateDocument 的节点也可能是父节点（其下还有子文档），
+    // 因此记录自身后必须继续下钻，不能提前 return。
+    if let Some(object_id) = node.get("relateDocument").and_then(|d| d.as_str()) {
+        let object_id = object_id.trim();
+        if !object_id.is_empty() {
+            out.push(CatalogDoc {
+                object_id: object_id.to_string(),
+                title: title.clone(),
+                path: path.clone(),
+            });
+        }
+    }
+    let pushed = !title.is_empty();
+    if pushed {
+        path.push(title);
+    }
+    if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            walk_catalog_node(child, path, out);
+        }
+    }
+    if pushed {
+        path.pop();
+    }
+}
+
+/// 文档目录索引：把「模块名 → objectId」变成查表。
+///
+/// 参考文档的标题不一定带完整模块名：`@hms.ai.face.faceDetector` 的页面标题是
+/// `faceDetector（人脸检测）`，`@hms.security.confidentialSpace` 的标题却是完整的
+/// `@hms.security.confidentialSpace (机密空间服务)`。因此索引同时保存
+/// 「完整标题键」与「末段键」，解析时优先完整匹配，其次在末段**唯一**命中时才采用
+/// （避免 `image`、`common` 这类通用末段误配）。
+#[derive(Debug, Default)]
+pub struct CatalogIndex {
+    full: std::collections::HashMap<String, String>,
+    tails: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl CatalogIndex {
+    /// 解析模块名对应的文档 objectId。
+    pub fn resolve(&self, module: &str) -> Option<&str> {
+        let key = normalize_module(module);
+        if key.is_empty() {
+            return None;
+        }
+        if let Some(hit) = self.full.get(&key) {
+            return Some(hit.as_str());
+        }
+        let tail = key.rsplit('.').next().unwrap_or("");
+        if tail.len() < MIN_TAIL_LEN {
+            return None;
+        }
+        match self.tails.get(tail) {
+            Some(hits) if hits.len() == 1 => Some(hits[0].as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// 末段匹配的最短长度：太短的末段（`tag`、`util`）容易撞名
+const MIN_TAIL_LEN: usize = 4;
+
+/// 去空白并小写（模块名与标题都走这一套规范化，大小写差异不影响匹配）
+fn normalize_module(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// 文档标题 → 模块名键：取括号（中英文）之前的部分，去空白并小写。
+///
+/// `@ohos.batteryInfo (电量信息)` → `@ohos.batteryinfo`
+/// `@hms.enterpriseSpaceService.fileTransfer(空间数据传输)` → `@hms.enterprisespaceservice.filetransfer`
+pub fn module_key(title: &str) -> String {
+    normalize_module(title.split(['(', '（']).next().unwrap_or(title).trim())
+}
+
+/// 从文档目录构建索引；标题不以 `@` 开头的目录节点不进索引。
+pub fn catalog_index(docs: &[CatalogDoc]) -> CatalogIndex {
+    let mut index = CatalogIndex::default();
+    for doc in docs {
+        let key = module_key(&doc.title);
+        if key.is_empty() {
+            continue;
+        }
+        if key.starts_with('@') {
+            index.full.entry(key.clone()).or_insert_with(|| doc.object_id.clone());
+        }
+        // 末段键负责「标题省略模块前缀」的页面（faceDetector（人脸检测））；
+        // 只收含 ASCII 字母的末段，纯中文目录节点不参与匹配。
+        let tail = key.rsplit('.').next().unwrap_or("").to_string();
+        if tail.chars().any(|c| c.is_ascii_alphabetic()) {
+            let entry = index.tails.entry(tail).or_default();
+            if !entry.contains(&doc.object_id) {
+                entry.push(doc.object_id.clone());
+            }
+        }
+    }
+    index
+}
 
 /// 抓取一篇文档正文（HTML），带 3 次重试。
 ///
@@ -540,4 +722,98 @@ mod tests {
         assert!(md.contains("## 章节"), "{md}");
         assert!(md.ends_with("尾"), "{md}");
     }
+
+    #[test]
+    fn catalog_tree_collects_leaf_object_ids() {
+        let json = r#"{"code":0,"value":{"catalogTreeList":[
+            {"nodeName":"API参考","isLeaf":false,"children":[
+                {"nodeName":"@ohos.batteryInfo (电量信息)","isLeaf":true,"relateDocument":"js-apis-battery-info"},
+                {"nodeName":"@hms.security.confidentialSpace (机密空间服务)","isLeaf":true,"relateDocument":"confidentialspace-confidentialspace"},
+                {"nodeName":"@arkts.collections (ArkTS容器集)","isLeaf":true,"relateDocument":"js-apis-arkts-collections"},
+                {"nodeName":"空节点"}
+            ]},
+            {"nodeName":"应用框架","relateDocument":"app-framework-overview","isLeaf":false,"children":[
+                {"nodeName":"@ohos.app.ability.UIAbility (UIAbility)","isLeaf":true,"relateDocument":"js-apis-app-ability-uiability"}
+            ]}
+        ]}}"#;
+        let docs = parse_catalog_tree(json).expect("解析目录树");
+        // 带 relateDocument 的父节点自身要收，其子文档也不能被漏掉（曾经的 return 提前退出 bug）
+        assert_eq!(docs.len(), 5);
+        assert_eq!(docs[0].object_id, "js-apis-battery-info");
+        assert_eq!(docs[0].path, vec!["API参考".to_string()]);
+        assert!(
+            docs.iter().any(|d| d.object_id == "js-apis-app-ability-uiability"),
+            "父节点带 relateDocument 时仍须下钻：{:?}",
+            docs.iter().map(|d| d.object_id.as_str()).collect::<Vec<_>>()
+        );
+        let index = catalog_index(&docs);
+        assert_eq!(
+            index.resolve("@hms.security.confidentialSpace"),
+            Some("confidentialspace-confidentialspace"),
+            "标题带完整模块名时走完整匹配"
+        );
+        assert_eq!(index.resolve("@ohos.batteryInfo"), Some("js-apis-battery-info"));
+        assert_eq!(
+            index.resolve("@ohos.app.ability.UIAbility"),
+            Some("js-apis-app-ability-uiability")
+        );
+        assert_eq!(index.resolve("空节点"), None, "非 @ 开头节点不进索引");
+        assert_eq!(index.resolve("应用框架"), None, "目录节点不进索引");
+    }
+
+    #[test]
+    fn catalog_index_falls_back_to_unique_tail() {
+        // @hms.ai.* 的页面标题不带模块前缀（faceDetector（人脸检测）），只能靠末段匹配；
+        // 末段不唯一或过短时宁可不匹配，也不能猜错文档。
+        let docs = vec![
+            CatalogDoc {
+                object_id: "core-vision-face-detector-api".into(),
+                title: "faceDetector（人脸检测）".into(),
+                path: vec![],
+            },
+            CatalogDoc {
+                object_id: "hms-ai-speechrecognizer".into(),
+                title: "speechRecognizer（语音识别）".into(),
+                path: vec![],
+            },
+            CatalogDoc {
+                object_id: "js-apis-image".into(),
+                title: "@ohos.multimedia.image (图片)".into(),
+                path: vec![],
+            },
+            CatalogDoc {
+                object_id: "js-apis-image-other".into(),
+                title: "@ohos.other.image (另一处 image)".into(),
+                path: vec![],
+            },
+        ];
+        let index = catalog_index(&docs);
+        assert_eq!(
+            index.resolve("@hms.ai.face.faceDetector"),
+            Some("core-vision-face-detector-api")
+        );
+        assert_eq!(index.resolve("@hms.ai.speechRecognizer"), Some("hms-ai-speechrecognizer"));
+        // 末段 `image` 命中两篇 → 不解析，退回猜 slug
+        assert_eq!(index.resolve("@hms.ai.vision.image"), None);
+        // 末段过短 → 不解析
+        assert_eq!(index.resolve("@ohos.foo.tag"), None);
+    }
+
+    #[test]
+    fn catalog_tree_rejects_error_response() {
+        assert!(parse_catalog_tree(r#"{"code":92511002,"message":"bad"}"#).is_err());
+        assert!(parse_catalog_tree("not json").is_err());
+    }
+
+    #[test]
+    fn module_key_normalizes_titles() {
+        assert_eq!(module_key("@ohos.batteryInfo (电量信息)"), "@ohos.batteryinfo");
+        assert_eq!(
+            module_key("@hms.enterpriseSpaceService.fileTransfer(空间数据传输)"),
+            "@hms.enterprisespaceservice.filetransfer"
+        );
+        assert_eq!(module_key("@ohos.nfc.tag（标准NFC-Tag）"), "@ohos.nfc.tag");
+        assert_eq!(module_key("导入模块"), "导入模块");
+    }
 }
+

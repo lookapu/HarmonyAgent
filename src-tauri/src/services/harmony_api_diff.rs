@@ -602,6 +602,7 @@ fn store_entries(conn: &Connection, entries: &[ApiEntry]) -> Result<usize, Strin
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(version_label, kit, dts_file, class_name, declaration)
                  DO UPDATE SET
+                    module=excluded.module,
                     change_type=excluded.change_type,
                     api_name=excluded.api_name,
                     api_level=excluded.api_level,
