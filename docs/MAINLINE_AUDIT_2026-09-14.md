@@ -838,3 +838,16 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **验证**（Windows 本机）：后端库 1,129 通过 / 0 失败 / 9 忽略（新增人工映射优先级与命名空间取页用例）；`check-docs.py` 通过；种子库 `integrity_check=ok`（`api_details` 672 行 / `api_members` 13,401 条）。
 
 **未闭环**：macOS 侧本批待 CI；剩余 34 个模块在目录树里确实没有对应文档（其中含 809 篇纯中文标题页面，不逐页人工读无法排除"有文档但标题不含模块名"）。
+
+## 52. 预览取帧打通：Previewer 参数模板与帧通道契约（2026-09-18）
+
+第 52 批（研究性，**未落产品代码**）：§49 确认了「预览构建 + preview server 都能在 IDE 外跑」，本节把最后一段——**取帧**——也解掉，路线定为**直接驱动 `Previewer.exe`**，绕开 preview server 与它的命名管道。
+
+- **可用参数模板**（本机实测进程存活且真在渲染）：`Previewer.exe -refresh region -projectID <数字> -ts <任意管道名> -j <含 modules.abc 的目录> -s <会话名> -cpm false -device phone -shape rect -sd 480 -ljPath <…/loader/default/loader.json> -sid <32 位无连字符十六进制> -or 1080 2340 -cr 1080 2340 -f <设备档 json> -url "pages/Index" -av "ACE_2_0" -n <模块名> -arp <…/res/default> -pm Stage -lws <端口>`。
+- **踩点（都是实测）**：`-sid` 必须匹配 `/^[a-zA-Z0-9]+$/`——带连字符的 UUID 会被拒（`Launch -sid parameter is not match regex`，进程退 11）；`-pm Stage` 正确（日志回显 `projectModel: Stage`）；`-ts` 指向的管道不存在只报 `Trace pipe is not prepared`，不致命；引擎**离屏渲染、不开窗口**（`MainWindowTitle` 为空），日志有 `Get first render buffer` / `FlushFrame surfaceNodeId=…` / 脏区 `[0,0,1080,2340]`。
+- **帧通道契约**：`-lws` 端口的 WebSocket **路径就是 `/<sid>`**——预览页的 `Ws()` 包装把 sessionID 当路径拼（`base + "/" + sessionID`），这正是 `-sid` 为何必须是无连字符字母数字。裸连 `/` 会被直接关闭且**无握手响应**；连对路径后 `101 Switching Protocols`，随后推二进制帧：实测首帧 `opcode=2 len=40651`，帧头 `12345678`（magic）+ 宽 + 高 + 宽 + 高（`0x438=1080`、`0x924=2340`，与 `-or/-cr` 一致），载荷为压缩数据（1080×2340 原始约 10MB → 实测 40KB）。
+- **接入方案**：后端 spawn Previewer（上表参数）+ 管好端口/sid 分配与进程生命周期；前端 webview 直接连 `ws://127.0.0.1:<lws>/<sid>` 把二进制帧画到 canvas（预览页的 `_onMessageBufferHandler` 即此做法）。构建产物目录注意：DevEco 的 `-j` 指 `assets/default/ets`，我们自己构建（无 IDE 预写的 `.preview/config/buildConfig.json`）落 `loader_out/default/ets`，指到实际目录即可。
+
+**验证**（Windows 本机）：`PreviewBuild`（带 `buildRoot=.preview`）BUILD SUCCESSFUL；Previewer 独立拉起后监听 `127.0.0.1:29998`，收到 101 与 40,651 字节渲染帧；探针脚本 `H:\work\tmp\ws-probe.js`。全程未触碰 DevEco 自己的 Previewer 进程。
+
+**未闭环**：**帧载荷的压缩格式未解**（不解压就画不出画面，这是接入前的下一步）；多设备档切换、热重载未验；preview server 与命名管道那两条路线未再验证（已不需要）；产品侧代码一行未写；macOS 侧全流程未验。
