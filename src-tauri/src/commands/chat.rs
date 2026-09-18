@@ -4521,6 +4521,91 @@ async fn enforce_tool_budget_limit(
     Ok(ToolLimitOutcome::Stop)
 }
 
+/// 桌面运行的跨段可变状态（第 2 步「合段」的状态容器，第 7 步）。
+///
+/// 原先散落在 `stream_chat_inner` 循环之外的这些变量，被循环体与各段函数逐项以
+/// `&mut` 传参（单是 `ToolRoundInputs` 就有 34 个字段）。收进本结构后，各段函数只接
+/// `&mut DesktopRoundState`，签名与调用点随之收敛。**本结构只装可变状态**：只读上下文
+/// （`trace_id`/`project_path`/`opts`/`plan_mode` 等）仍按原样传参，端口化（`run(port)`）
+/// 时再统一处理。
+struct DesktopRoundState<'a> {
+    // —— 运行级：跨轮保留，收尾（`finalize_run`）仍要读 ——
+    /// 多轮累加的助手正文
+    full: String,
+    /// 思考过程文本（回放/续写用）
+    reasoning_full: String,
+    /// 占位消息 id（流式期间逐轮更新，收尾时定点更新它）
+    placeholder_msg_id: Option<String>,
+    /// 工具执行轨迹（成功/失败/拦截都进；完成即入库，防中断丢失）
+    tool_runs: Vec<ToolRunItem>,
+    /// 已修改文件（供消息底部文件列表展示）
+    modified_files: Vec<String>,
+    /// 早期对话滚动摘要（压缩时增量更新，安全点双写检查点）
+    context_summary: Option<String>,
+    /// 最近一次模型输出文本（完成确认与账本「下一步」的数据源）
+    last_model_text: String,
+    /// 上次未完成任务落库的账本（断点续跑继承，结束时保存或清空）
+    prev_ledger: Option<TaskLedger>,
+    /// 是否已被护栏强制收尾（上限/预算/用户拒绝拦截）
+    exhausted: bool,
+    /// 统一执行循环当前阶段（变化时写 Durable Run 事件并注入本轮提示）
+    workflow_stage: Option<crate::agent::execution_loop::LoopStage>,
+    /// 任务计时起点（事件耗时与任务时长统计）
+    task_started: std::time::Instant,
+    /// 多模态图片附件（用户首轮上传 + 工具截图；每轮只附带新增部分）
+    images: Option<Vec<String>>,
+    /// 已附带上限内的图片数
+    images_attached: usize,
+    /// 运行统计（轮次/重试/用量；收尾写 task_runs）
+    stats: &'a mut ChatRunStats,
+    /// 共享执行器（回合与工具尝试计数、检查点、最终快照的唯一真源）
+    executor: &'a mut KernelIoRunLoop,
+
+    // —— 轮级：每轮读写，收尾不读 ——
+    /// 有效工具轮次上限（动态扩容后更新）
+    max_tool_rounds: usize,
+    /// 已扩容次数（与上限一起进桌面检查点）
+    budget_extensions: usize,
+    /// 预算软预警已提示（每任务只提醒一次，避免每轮刷屏）
+    budget_warned: bool,
+    /// 已切过一次备用模型（只降级一次，不级联）
+    used_fallback: bool,
+    /// 历史消息条数上限（按上下文预算动态初始，压缩/超限时减半）
+    history_limit: usize,
+    /// 连续失败计数（达阈值注入 replan 指令）
+    consecutive_failures: u32,
+    /// 本次任务是否已注入过 replan 指令
+    replan_given: bool,
+    /// 待注入的 replan 指令
+    replan_instruction: Option<String>,
+    /// 续写是否只带思考过程
+    continuation_reasoning_only: bool,
+    /// 待注入的续写指令
+    continuation_text: String,
+    /// 未完话术纠正计数
+    pending_action_corrections: usize,
+    /// 行动承诺假完成纠正计数
+    action_commitment_corrections: usize,
+    /// 未验证声明纠正计数
+    unverified_claim_corrections: usize,
+    /// 收尾复核计数
+    completion_reviews: usize,
+    /// 待注入的纠正文本（假调用/未完话术共用）
+    correction_text: String,
+    /// 待注入的纠正提示
+    correction_hint: String,
+    /// 本轮并入的用户挂起指令（安全点消费后追加为下一轮 user 消息）
+    merged_instructions: Vec<String>,
+    /// 本次任务是否已经过用户批准计划
+    plan_confirmed: bool,
+    /// 已批准计划全文（批准后每轮注入，防长任务偏离目标）
+    confirmed_plan: Option<String>,
+    /// 距上次进度对照以来的工具执行数（每 3 个注入一次对照汇报）
+    tools_since_progress: u32,
+    /// 接缝计数：每轮请求计一缝，满 `FULL_HINT_EVERY_ROUNDS` 刷新完整系统提示
+    seam_count: u32,
+}
+
 /// 流式主流程（wrapper 负责计时、Trace 记录与错误事件分发）
 async fn stream_chat_inner(
     app: &AppHandle,
@@ -4538,7 +4623,7 @@ async fn stream_chat_inner(
     persist_user: bool,
     stats: &mut ChatRunStats,
     references: Option<Vec<String>>,
-    mut images: Option<Vec<String>>,
+    images: Option<Vec<String>>,
 ) -> Result<(), ChatFlowError> {
     // 任务级 Trace ID：本次任务（一次用户消息触发的完整执行）的全部会话事件共享同一 ID，
     // 全链路可 grep（session_events.trace_id），前端 timeline 按它折叠
@@ -6090,23 +6175,23 @@ async fn stream_chat_inner(
         .unwrap_or(execution_budget.tool_rounds);
     let mut budget_extensions = 0usize;
 
-    let mut full = String::new();
-    let mut reasoning_full = String::new();
+    let full = String::new();
+    let reasoning_full = String::new();
     // 正文占位消息 id：每轮正文累积后即时入库（duration_ms=NULL 标记未完成），
     // 任务结束/停止时 persist_turn UPDATE 补全——中断（退出/崩溃）不丢已生成正文
-    let mut placeholder_msg_id: Option<String> = None;
-    let mut tool_runs: Vec<ToolRunItem> = Vec::new(); // (工具名, 原始参数, 执行输出；执行完成即入库防中断丢失)
+    let placeholder_msg_id: Option<String> = None;
+    let tool_runs: Vec<ToolRunItem> = Vec::new(); // (工具名, 原始参数, 执行输出；执行完成即入库防中断丢失)
     // 本次任务修改过的文件（edit_file/write_file 目标，去重；消息底部文件列表展示用）
-    let mut modified_files: Vec<String> = Vec::new();
+    let modified_files: Vec<String> = Vec::new();
     // 主模型连续失败后的自动降级：已切换备用模型则置 true（只降级一次，不级联）
-    let mut used_fallback = false;
+    let used_fallback = false;
     // 预算软预警已提示标记：每任务只提醒一次（预算门控每轮都执行，避免反复刷屏）
-    let mut budget_warned = false;
+    let budget_warned = false;
     // 历史消息条数上限：按模型上下文预算动态初始（预算大窗口大），主动压缩/超限时自动减半
-    let mut history_limit = dynamic_history_limit(context_budget);
+    let history_limit = dynamic_history_limit(context_budget);
     // 早期对话滚动摘要：优先读取 Context V2（含覆盖游标），尚未建立 V2 状态时
     // 兼容 conversations.summary。压缩时增量更新，并在每轮安全点双写检查点。
-    let mut context_summary: Option<String> = state
+    let context_summary: Option<String> = state
         .0
         .lock()
         .ok()
@@ -6115,37 +6200,37 @@ async fn stream_chat_inner(
         })
         .or_else(|| load_persisted_summary(state, &conversation_id));
     // 连续工具失败 replan 提示：连续失败 ≥2 时注入一次“重新规划”指令（重试/改策略/终止 三档）
-    let mut consecutive_failures: u32 = 0;
-    let mut replan_given = false;
-    let mut replan_instruction: Option<String> = None;
+    let consecutive_failures: u32 = 0;
+    let replan_given = false;
+    let replan_instruction: Option<String> = None;
     // 输出截断续写状态：上轮输出被 max_tokens 截断时，下轮请求追加“请继续”指令（防无限续写有上限）
     // 截断续写时上轮“正文为空但思考非空”（推理模型 reasoning 耗尽预算被截断）：
     // 续写指令改为要求直接输出结论/工具调用，避免再次思考耗尽预算空转
-    let mut continuation_reasoning_only = false;
-    let mut continuation_text = String::new();
+    let continuation_reasoning_only = false;
+    let continuation_text = String::new();
     // 多模态图片附加计数：已附加到请求的图片数（用户首轮上传 + 工具轮次 take_screenshot 产生的截图），
     // 每轮只附加新增部分到最新 user 消息（通常是刚注入的工具结果），避免重复注入历史图
-    let mut images_attached: usize = 0;
+    let images_attached: usize = 0;
     // 未完话术纠正次数（防死循环）：模型承诺“还需读取/继续查看”但未输出标记时注入纠正提示
-    let mut pending_action_corrections = 0;
+    let pending_action_corrections = 0;
     // 行动承诺假完成纠正次数（防死循环）：模型宣布开始开发/创建/实现或仅输出方案计划但未输出标记时注入纠正提示
-    let mut action_commitment_corrections = 0;
+    let action_commitment_corrections = 0;
     // 纠正注入状态（假调用/未完话术共用）：检测发生在 stream 之后，下一轮组装消息时注入，
     // 避免直接 push 到 messages 后因每轮重建而丢失
-    let mut correction_text = String::new();
-    let mut correction_hint = String::new();
+    let correction_text = String::new();
+    let correction_hint = String::new();
     // 本轮并入的用户挂起指令（“发送到 Agent”）：安全点消费后追加为下一轮 user 消息
-    let mut merged_instructions: Vec<String> = Vec::new();
+    let merged_instructions: Vec<String> = Vec::new();
     // 计划/审查模式：本次任务是否已经过用户批准计划（批准前只允许输出计划，不执行工具）
     let plan_mode = plan_mode_enabled(&opts);
-    let mut plan_confirmed = !plan_mode || inherited_approved_plan.is_some();
+    let plan_confirmed = !plan_mode || inherited_approved_plan.is_some();
     // 已批准计划全文：批准后每轮注入（长任务防中途遗忘/偏离目标，锚定执行方向）
-    let mut confirmed_plan = inherited_approved_plan;
+    let confirmed_plan = inherited_approved_plan;
     // 自上次进度对照以来的工具执行数（每 3 个工具注入一次“对照计划汇报进度”）
-    let mut tools_since_progress: u32 = 0;
+    let tools_since_progress: u32 = 0;
     // 任务收尾复核计数：模型主动收尾但本任务执行过工具时注入“任务是否真完成”确认，
     // 未确认则继续执行（长任务防提前收尾）；达上限仍未确认则收尾并提示用户
-    let mut completion_reviews: usize = 0;
+    let completion_reviews: usize = 0;
     // 任务超时护栏：超过上限优雅停止（部分内容已入库时保留，再报超时错误）；
     // 时长可在设置页动态调整（0/-1 表示不限制）
     let configured_task_deadline_ms = crate::services::agent_limits::current()
@@ -6201,22 +6286,63 @@ async fn stream_chat_inner(
         .chars()
         .take(200)
         .collect::<String>();
-    let mut prev_ledger = load_task_ledger(state, &conversation_id);
+    let prev_ledger = load_task_ledger(state, &conversation_id);
     let ledger_base_n = prev_ledger
         .as_ref()
         .map(|l| l.verified.iter().chain(l.open.iter()).map(|e| e.n).max().unwrap_or(0))
         .unwrap_or(0);
     // 接缝计数（Seam 审计）：每轮请求计一缝，完整系统提示每 FULL_HINT_EVERY_ROUNDS 缝刷新
-    let mut seam_count: u32 = 0;
+    let seam_count: u32 = 0;
     // ship 注册表审计纠正计数（防死循环）：完成声明未绑定验证范围时注入纠正，达上限放行收尾
-    let mut unverified_claim_corrections: usize = 0;
+    let unverified_claim_corrections: usize = 0;
     // 模型最近一轮输出（账本“下一步”数据源，剥离工具标记）
-    let mut last_model_text = String::new();
+    let last_model_text = String::new();
     // 统一执行循环当前阶段：每次变化写 Durable Run 事件并注入本轮提示。
-    let mut workflow_stage: Option<crate::agent::execution_loop::LoopStage> = None;
+    let workflow_stage: Option<crate::agent::execution_loop::LoopStage> = None;
     // 工具循环是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾；
-    // 声明在循环外：主流程据此判定任务是否被护栏强制收尾（强制收尾时账本需保留））
-    let mut exhausted = false;
+    // 收进 round_state：主流程据此判定任务是否被护栏强制收尾（强制收尾时账本需保留））
+    let exhausted = false;
+    // 跨段可变状态：上述局部变量在此**按所有权搬入**（`stats` 与执行器按 `&mut` 借用），
+    // 搬入点必须晚于它们各自的用法——之后循环体与收尾统一读写 `round_state`。
+    let mut round_state = DesktopRoundState {
+        full,
+        reasoning_full,
+        placeholder_msg_id,
+        tool_runs,
+        modified_files,
+        context_summary,
+        last_model_text,
+        prev_ledger,
+        exhausted,
+        workflow_stage,
+        task_started,
+        images,
+        images_attached,
+        stats,
+        max_tool_rounds,
+        budget_extensions,
+        budget_warned,
+        used_fallback,
+        history_limit,
+        consecutive_failures,
+        replan_given,
+        replan_instruction,
+        continuation_reasoning_only,
+        continuation_text,
+        pending_action_corrections,
+        action_commitment_corrections,
+        unverified_claim_corrections,
+        completion_reviews,
+        correction_text,
+        correction_hint,
+        merged_instructions,
+        plan_confirmed,
+        confirmed_plan,
+        tools_since_progress,
+        seam_count,
+        executor: &mut kernel_executor,
+    };
+
     'outer: loop {
         if let Ok(conn) = state.0.lock() {
             let _ = crate::agent::runtime::transition(
@@ -6238,10 +6364,10 @@ async fn stream_chat_inner(
         log_task_heartbeat(
             registry,
             &conversation_id,
-            task_started,
-            tool_runs.len(),
-            full.chars().count(),
-            history_limit,
+            round_state.task_started,
+            round_state.tool_runs.len(),
+            round_state.full.chars().count(),
+            round_state.history_limit,
         );
         let workflow = refresh_workflow_stage(
             state,
@@ -6249,41 +6375,41 @@ async fn stream_chat_inner(
             &conversation_id,
             &goal_contract,
             &inherited_tool_evidence,
-            &tool_runs,
-            workflow_stage,
+            &round_state.tool_runs,
+            round_state.workflow_stage,
         );
-        workflow_stage = Some(workflow.stage);
+        round_state.workflow_stage = Some(workflow.stage);
         match adjudicate_pre_round(PreRoundInputs {
-            executor: &mut kernel_executor,
+            executor: round_state.executor,
             state,
             app,
             cancel,
             conversation_id: &conversation_id,
             trace_id: &trace_id,
             task_goal: &task_goal,
-            task_started,
+            task_started: round_state.task_started,
             task_deadline_ms,
-            tool_runs: &tool_runs,
-            full: &full,
-            reasoning_full: &reasoning_full,
+            tool_runs: &round_state.tool_runs,
+            full: &round_state.full,
+            reasoning_full: &round_state.reasoning_full,
             model: &model_choice.model,
-            context_summary: &context_summary,
-            modified_files: &modified_files,
-            last_model_text: &last_model_text,
+            context_summary: &round_state.context_summary,
+            modified_files: &round_state.modified_files,
+            last_model_text: &round_state.last_model_text,
             ledger_base_n,
-            prev_ledger: &mut prev_ledger,
-            placeholder_msg_id: &placeholder_msg_id,
-            max_tool_rounds,
-            budget_extensions,
-            input_tokens: stats.input_tokens,
-            output_tokens: stats.output_tokens,
+            prev_ledger: &mut round_state.prev_ledger,
+            placeholder_msg_id: &round_state.placeholder_msg_id,
+            max_tool_rounds: round_state.max_tool_rounds,
+            budget_extensions: round_state.budget_extensions,
+            input_tokens: round_state.stats.input_tokens,
+            output_tokens: round_state.stats.output_tokens,
         })
         .await?
         {
             PreRoundPermit::Proceed => {}
             PreRoundPermit::Locked => break,
             PreRoundPermit::Cancelled => {
-                stats.stopped = true;
+                round_state.stats.stopped = true;
                 return Ok(());
             }
             PreRoundPermit::Deadline => {
@@ -6313,7 +6439,7 @@ async fn stream_chat_inner(
             provider: &provider,
             conversation_id: &conversation_id,
             trace_id: &trace_id,
-            task_started,
+            task_started: round_state.task_started,
             project_path: &project_path,
             context_budget,
             model_choice: &model_choice,
@@ -6321,24 +6447,24 @@ async fn stream_chat_inner(
             system_prompt_core: &system_prompt_core,
             workflow: &workflow,
             protocol: &protocol,
-            images: &images,
+            images: &round_state.images,
             task_goal: &task_goal,
-            tool_runs: &tool_runs,
-            last_model_text: &last_model_text,
+            tool_runs: &round_state.tool_runs,
+            last_model_text: &round_state.last_model_text,
             ledger_base_n,
-            prev_ledger: &prev_ledger,
-            confirmed_plan: &confirmed_plan,
-            continuation_text: &continuation_text,
-            seam_count: &mut seam_count,
-            history_limit: &mut history_limit,
-            context_summary: &mut context_summary,
-            images_attached: &mut images_attached,
-            continuation_reasoning_only: &mut continuation_reasoning_only,
-            correction_text: &mut correction_text,
-            correction_hint: &mut correction_hint,
-            merged_instructions: &mut merged_instructions,
-            tools_since_progress: &mut tools_since_progress,
-            replan_instruction: &mut replan_instruction,
+            prev_ledger: &round_state.prev_ledger,
+            confirmed_plan: &round_state.confirmed_plan,
+            continuation_text: &round_state.continuation_text,
+            seam_count: &mut round_state.seam_count,
+            history_limit: &mut round_state.history_limit,
+            context_summary: &mut round_state.context_summary,
+            images_attached: &mut round_state.images_attached,
+            continuation_reasoning_only: &mut round_state.continuation_reasoning_only,
+            correction_text: &mut round_state.correction_text,
+            correction_hint: &mut round_state.correction_hint,
+            merged_instructions: &mut round_state.merged_instructions,
+            tools_since_progress: &mut round_state.tools_since_progress,
+            replan_instruction: &mut round_state.replan_instruction,
         })
         .await?
         {
@@ -6354,9 +6480,9 @@ async fn stream_chat_inner(
             provider: &provider,
             messages: &messages,
             model_choice: &mut model_choice,
-            stats: &mut *stats,
-            used_fallback: &mut used_fallback,
-            budget_warned: &mut budget_warned,
+            stats: &mut *round_state.stats,
+            used_fallback: &mut round_state.used_fallback,
+            budget_warned: &mut round_state.budget_warned,
         })?;
 
         let outcome = match request_round_outcome(RoundRequestInputs {
@@ -6371,18 +6497,18 @@ async fn stream_chat_inner(
             messages: &messages,
             conversation_id: &conversation_id,
             trace_id: &trace_id,
-            task_started,
+            task_started: round_state.task_started,
             context_budget,
             model_choice: &mut model_choice,
-            stats: &mut *stats,
-            history_limit: &mut history_limit,
-            context_summary: &mut context_summary,
-            used_fallback: &mut used_fallback,
-            placeholder_msg_id: &mut placeholder_msg_id,
-            tool_runs: &tool_runs,
-            full: &full,
-            reasoning_full: &reasoning_full,
-            modified_files: &modified_files,
+            stats: &mut *round_state.stats,
+            history_limit: &mut round_state.history_limit,
+            context_summary: &mut round_state.context_summary,
+            used_fallback: &mut round_state.used_fallback,
+            placeholder_msg_id: &mut round_state.placeholder_msg_id,
+            tool_runs: &round_state.tool_runs,
+            full: &round_state.full,
+            reasoning_full: &round_state.reasoning_full,
+            modified_files: &round_state.modified_files,
         })
         .await?
         {
@@ -6396,17 +6522,17 @@ async fn stream_chat_inner(
             conversation_id: &conversation_id,
             trace_id: &trace_id,
             model: &model_choice.model,
-            context_summary: &context_summary,
-            modified_files: &modified_files,
-            task_started,
+            context_summary: &round_state.context_summary,
+            modified_files: &round_state.modified_files,
+            task_started: round_state.task_started,
             outcome: &outcome,
-            tool_runs: &tool_runs,
-            stats: &mut *stats,
-            reasoning_full: &mut reasoning_full,
-            full: &mut full,
-            last_model_text: &mut last_model_text,
-            merged_instructions: &mut merged_instructions,
-            placeholder_msg_id: &mut placeholder_msg_id,
+            tool_runs: &round_state.tool_runs,
+            stats: &mut *round_state.stats,
+            reasoning_full: &mut round_state.reasoning_full,
+            full: &mut round_state.full,
+            last_model_text: &mut round_state.last_model_text,
+            merged_instructions: &mut round_state.merged_instructions,
+            placeholder_msg_id: &mut round_state.placeholder_msg_id,
         })
         .await?
         {
@@ -6430,10 +6556,10 @@ async fn stream_chat_inner(
             interrupted: outcome.interrupted,
             tool_calls: &outcome.tool_calls,
             plan_mode,
-            plan_confirmed: &mut plan_confirmed,
-            confirmed_plan: &mut confirmed_plan,
+            plan_confirmed: &mut round_state.plan_confirmed,
+            confirmed_plan: &mut round_state.confirmed_plan,
             messages: &mut messages,
-            stats: &mut *stats,
+            stats: &mut *round_state.stats,
         })
         .await?
         {
@@ -6459,33 +6585,33 @@ async fn stream_chat_inner(
                 conversation_id: &conversation_id,
                 trace_id: &trace_id,
                 execution_budget: &execution_budget,
-                executor: &mut kernel_executor,
-                tool_runs: &mut tool_runs,
-                max_tool_rounds: &mut max_tool_rounds,
-                budget_extensions: &mut budget_extensions,
-                full: &mut full,
-                stats: &mut *stats,
-                placeholder_msg_id: &mut placeholder_msg_id,
+                executor: round_state.executor,
+                tool_runs: &mut round_state.tool_runs,
+                max_tool_rounds: &mut round_state.max_tool_rounds,
+                budget_extensions: &mut round_state.budget_extensions,
+                full: &mut round_state.full,
+                stats: &mut *round_state.stats,
+                placeholder_msg_id: &mut round_state.placeholder_msg_id,
                 mcp: &mcp,
                 project_path: &project_path,
                 path_hints: &path_hints,
                 project_id: &project_id,
                 approval,
-                modified_files: &mut modified_files,
-                images: &mut images,
-                consecutive_failures: &mut consecutive_failures,
-                replan_given: &mut replan_given,
-                replan_instruction: &mut replan_instruction,
-                tools_since_progress: &mut tools_since_progress,
-                correction_text: &mut correction_text,
-                correction_hint: &mut correction_hint,
-                task_started,
+                modified_files: &mut round_state.modified_files,
+                images: &mut round_state.images,
+                consecutive_failures: &mut round_state.consecutive_failures,
+                replan_given: &mut round_state.replan_given,
+                replan_instruction: &mut round_state.replan_instruction,
+                tools_since_progress: &mut round_state.tools_since_progress,
+                correction_text: &mut round_state.correction_text,
+                correction_hint: &mut round_state.correction_hint,
+                task_started: round_state.task_started,
             })
             .await?;
             match tool_round {
                 // 被护栏强制收尾：置位外层标志并结束任务（账本保留）
                 ToolRoundOutcome::Finish => {
-                    exhausted = true;
+                    round_state.exhausted = true;
                     break;
                 }
                 // 本轮工具执行完毕：进入下一轮
@@ -6501,11 +6627,11 @@ async fn stream_chat_inner(
             trace_id: &trace_id,
             text: &text,
             plan_mode,
-            plan_confirmed: &mut plan_confirmed,
-            confirmed_plan: &mut confirmed_plan,
+            plan_confirmed: &mut round_state.plan_confirmed,
+            confirmed_plan: &mut round_state.confirmed_plan,
             messages: &mut messages,
-            stats: &mut *stats,
-            completion_reviews,
+            stats: &mut *round_state.stats,
+            completion_reviews: round_state.completion_reviews,
         })
         .await?
         {
@@ -6523,19 +6649,19 @@ async fn stream_chat_inner(
             truncated: outcome.truncated,
             interrupted: outcome.interrupted,
             tool_calls: &outcome.tool_calls,
-            tool_runs: &tool_runs,
+            tool_runs: &round_state.tool_runs,
             inherited_tool_evidence: &inherited_tool_evidence,
             goal_contract: &goal_contract,
-            executor: &mut kernel_executor,
-            full: &mut full,
-            correction_text: &mut correction_text,
-            correction_hint: &mut correction_hint,
-            continuation_text: &mut continuation_text,
-            continuation_reasoning_only: &mut continuation_reasoning_only,
-            pending_action_corrections: &mut pending_action_corrections,
-            action_commitment_corrections: &mut action_commitment_corrections,
-            unverified_claim_corrections: &mut unverified_claim_corrections,
-            completion_reviews: &mut completion_reviews,
+            executor: round_state.executor,
+            full: &mut round_state.full,
+            correction_text: &mut round_state.correction_text,
+            correction_hint: &mut round_state.correction_hint,
+            continuation_text: &mut round_state.continuation_text,
+            continuation_reasoning_only: &mut round_state.continuation_reasoning_only,
+            pending_action_corrections: &mut round_state.pending_action_corrections,
+            action_commitment_corrections: &mut round_state.action_commitment_corrections,
+            unverified_claim_corrections: &mut round_state.unverified_claim_corrections,
+            completion_reviews: &mut round_state.completion_reviews,
         })? {
             RoundRoutingOutcome::NextRound => continue 'outer,
             RoundRoutingOutcome::Finish => break 'outer,
@@ -6552,21 +6678,21 @@ async fn stream_chat_inner(
         task_goal: &task_goal,
         goal_contract: &goal_contract,
         model_choice: &model_choice,
-        tool_runs: &tool_runs,
+        tool_runs: &round_state.tool_runs,
         inherited_tool_evidence: &inherited_tool_evidence,
-        last_model_text: &last_model_text,
-        context_summary: &context_summary,
-        reasoning_full: &reasoning_full,
-        modified_files: &modified_files,
-        placeholder_msg_id: &placeholder_msg_id,
-        full: &mut full,
-        stats: &mut *stats,
-        executor: &mut kernel_executor,
+        last_model_text: &round_state.last_model_text,
+        context_summary: &round_state.context_summary,
+        reasoning_full: &round_state.reasoning_full,
+        modified_files: &round_state.modified_files,
+        placeholder_msg_id: &round_state.placeholder_msg_id,
+        full: &mut round_state.full,
+        stats: &mut *round_state.stats,
+        executor: round_state.executor,
         recovery_plan: &recovery_plan,
-        prev_ledger: &mut prev_ledger,
+        prev_ledger: &mut round_state.prev_ledger,
         ledger_base_n,
-        task_started,
-        exhausted,
+        task_started: round_state.task_started,
+        exhausted: round_state.exhausted,
     })
     .await?;
 
