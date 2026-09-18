@@ -200,6 +200,16 @@ impl TaskRegistry {
         }
     }
 
+    /// 清除停止请求时间：停止已被任务消费（含"停止后立即续跑"）后调用，
+    /// 否则看门狗仍会按旧时间戳判 stop_not_effective 强杀后续正常推进的轮次
+    pub fn clear_stop_requested(&self, conversation_id: &str) {
+        if let Ok(m) = self.0.lock() {
+            if let Some(h) = m.get(conversation_id) {
+                h.stop_requested_at.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// 删除会话等场景：立即请求停止并 abort 正在运行的任务。
     /// 返回 true 表示曾有运行中任务被中止。
     pub fn abort_conversation(&self, conversation_id: &str) -> bool {
@@ -472,6 +482,34 @@ mod tests {
         registry.unregister("conv", generation);
         assert!(!registry.0.lock().unwrap().contains_key("conv"));
         first.abort();
+    }
+
+    /// 「停止后立即续跑」把停止标志留在了注册表上，若不清零，看门狗会在 40s 后按旧
+    /// 时间戳判 stop_not_effective 强杀正在正常推进的续跑轮。
+    #[tokio::test]
+    async fn clearing_the_stop_marker_lets_a_resumed_run_survive_the_watchdog() {
+        let registry = TaskRegistry::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let generation = registry.register("conv", task.abort_handle()).unwrap();
+        let marker = || {
+            registry
+                .0
+                .lock()
+                .unwrap()
+                .get("conv")
+                .unwrap()
+                .stop_requested_at
+                .load(Ordering::Relaxed)
+        };
+        assert_eq!(marker(), 0, "新任务不该带停止计时");
+        registry.mark_stop_requested("conv");
+        assert!(marker() > 0);
+        registry.clear_stop_requested("conv");
+        assert_eq!(marker(), 0);
+        // 未登记的会话上清零是空操作，不 panic
+        registry.clear_stop_requested("missing");
+        registry.unregister("conv", generation);
+        task.abort();
     }
 
     #[tokio::test]

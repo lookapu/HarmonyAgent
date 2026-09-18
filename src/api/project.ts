@@ -813,6 +813,8 @@ export interface QueuedMessageInfo {
   content: string
   agent_owned: boolean
   created_at: number
+  /** 原 @ 引用列表（JSON 数组字符串）；空闲态"立即插入"改走普通发送时回传，避免引用丢失 */
+  references_json: string | null
 }
 
 /** 查询会话排队中消息列表 */
@@ -844,8 +846,10 @@ export const updateMessage = (messageId: string, content: string) =>
 /** 删除单条消息及其之后的所有消息 */
 export const deleteMessage = (messageId: string) => invokeWithError<number>('delete_message', { messageId })
 
-/** 停止当前流式生成（后端在安全点退出，部分内容会入库） */
-export const stopChat = (conversationId: string) => invokeWithError<void>('stop_chat', { conversationId })
+/** 停止当前流式生成（后端在安全点退出，部分内容会入库）；
+ * resumeQueued=true 表示排队条"立即插入"：停完立刻消费排队消息续跑，而不是就此收工 */
+export const stopChat = (conversationId: string, resumeQueued?: boolean) =>
+  invokeWithError<void>('stop_chat', { conversationId, resumeQueued })
 
 /** 停止当前正在执行的工具（不终止整个任务）：强杀子进程，模型拿到中断反馈后继续生成结论 */
 export const stopTool = (conversationId: string) => invokeWithError<void>('stop_tool', { conversationId })

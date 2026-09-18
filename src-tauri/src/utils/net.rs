@@ -1,5 +1,10 @@
 /// 网络共享工具：系统代理读取、请求客户端构建、SSE 增量提取
 ///
+/// 走系统代理时**必须绕过**的主机：本机回环地址。
+/// 本机服务（预览面板指向的本地站点、局域网服务、本机 Provider）经代理会直接失败，
+/// 报错却是"拒绝连接"，用户只会以为是服务没启动。
+const LOOPBACK_NO_PROXY: &str = "localhost,127.0.0.1,::1";
+
 /// 读取系统代理地址：环境变量优先，Windows 注册表兜底
 pub fn read_system_proxy() -> Option<String> {
     for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
@@ -82,8 +87,12 @@ pub fn build_client(use_proxy: bool) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120));
     if use_proxy {
         if let Some(proxy) = read_system_proxy() {
-            builder = builder
-                .proxy(reqwest::Proxy::all(proxy).map_err(|e| e.to_string())?)
+            // 本地回环必须绕过代理：本机服务（预览、局域网、本机 Provider）经代理一律连不上，
+            // 表现为"拒绝连接"，用户只会以为是服务没起
+            let proxy = reqwest::Proxy::all(proxy)
+                .map_err(|e| e.to_string())?
+                .no_proxy(reqwest::NoProxy::from_string(LOOPBACK_NO_PROXY));
+            builder = builder.proxy(proxy);
         }
     }
     let client = builder.build().map_err(|e| e.to_string())?;
@@ -98,7 +107,11 @@ pub fn build_client_auto() -> Result<reqwest::Client, String> {
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36");
     if let Some(proxy) = read_system_proxy() {
-        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|e| e.to_string())?);
+        // 同上：本地回环绕开代理
+        let proxy = reqwest::Proxy::all(proxy)
+            .map_err(|e| e.to_string())?
+            .no_proxy(reqwest::NoProxy::from_string(LOOPBACK_NO_PROXY));
+        builder = builder.proxy(proxy);
     } else {
         // 无系统代理时显式禁用环境变量代理，保证直连
         builder = builder.no_proxy();

@@ -540,7 +540,9 @@ export default function Home() {
   // 用户点击停止后立即进入本地“停止中”状态，直到对应流式桶真正收敛。
   const [stopRequested, setStopRequested] = useState(false)
   // 右侧栏 Web 预览：待打开地址 + 当前 iframe 地址
-  const [previewUrl, setPreviewUrl] = useState(() => getItem(STORAGE_KEYS.PREVIEW_URL) || 'http://localhost:5173')
+  // 不预填开发机地址：绿色版里没有 5173 的开发服务器，预填只会让人看到"拒绝连接"
+  // （本机实际反馈）。留空并给出提示，由用户填自己要看的地址。
+  const [previewUrl, setPreviewUrl] = useState(() => getItem(STORAGE_KEYS.PREVIEW_URL) || '')
   const [previewSrc, setPreviewSrc] = useState('')
   const [inputHeight, setInputHeight] = useState(96)
   const [renamingId, setRenamingId] = useState<string | null>(null)
@@ -1955,6 +1957,36 @@ export default function Home() {
   const orphanUserMessage = useMemo(() => {
     return interruptedTailMessage(messages, isStreaming)
   }, [messages, isStreaming])
+
+  // 排队条「立即插入」防重入：点击到后端真正续跑之间有几百毫秒的窗口
+  // （chat-stopped 清空流式桶 → 续跑轮 chat-run-started 重建），此间再点一次会被误判成
+  // "空闲态"从而重复发一条。短暂忽略重复点击即可，代价远小于重复指令。
+  const insertQueuedAtRef = useRef(0)
+  /** 排队条主按钮：运行中=停当前轮立刻带上排队消息续跑；空闲（停止后遗留）=当成新一轮开启 */
+  const handleInsertQueued = async () => {
+    const conv = currentConversation
+    if (!conv || queuedList.length === 0) return
+    if (isStreaming) {
+      if (Date.now() - insertQueuedAtRef.current < 3000) return
+      insertQueuedAtRef.current = Date.now()
+      setStopRequested(true)
+      void stopGeneration(true)
+      return
+    }
+    const first = queuedList[0]
+    if (!first || Date.now() - insertQueuedAtRef.current < 3000) return
+    insertQueuedAtRef.current = Date.now()
+    // 引用随原消息存的是 JSON 数组字符串，改走普通发送要原样带上，否则 @ 文件丢失
+    let refs: string[] | undefined
+    try {
+      const parsed = first.references_json ? JSON.parse(first.references_json) : null
+      if (Array.isArray(parsed) && parsed.length) refs = parsed as string[]
+    } catch {
+      refs = undefined
+    }
+    await removeQueued(first.id)
+    void sendUserMessage(first.content, modelOptions, refs)
+  }
 
   /** 构建错误一键修复：将结构化错误摘要注入对话输入框并聚焦，让用户直接交给 Agent 修复 */
   const handleFixBuildErrors = (errors: AnalyzedBuildError[]) => {
@@ -5636,22 +5668,33 @@ export default function Home() {
               </div>
             )}
           </div>
-          {/* 排队中消息条：运行中提交的消息，任务结束后续跑；支持单条移除 */}
+          {/* 排队中消息条：运行中提交的消息，默认排队等当前任务结束续跑；
+              行首按钮可"立即插入"——不等当前轮跑完，停掉它立刻带上排队消息继续 */}
           {queuedList.length > 0 && currentConversation && (
             <div className="max-w-3xl mx-auto pb-1.5">
-              <button
-                onClick={() => setQueuedOpen((v) => !v)}
-                aria-expanded={queuedOpen}
-                className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
-              >
-                <Icon name="terminal" size={11} />
-                {t('home.queuedBar', { count: queuedList.length })}
-                <Icon
-                  name="chevron-right"
-                  size={10}
-                  className={`transition-transform ${queuedOpen ? 'rotate-90' : ''}`}
-                />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setQueuedOpen((v) => !v)}
+                  aria-expanded={queuedOpen}
+                  className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                >
+                  <Icon name="terminal" size={11} />
+                  {t('home.queuedBar', { count: queuedList.length })}
+                  <Icon
+                    name="chevron-right"
+                    size={10}
+                    className={`transition-transform ${queuedOpen ? 'rotate-90' : ''}`}
+                  />
+                </button>
+                <button
+                  onClick={() => void handleInsertQueued()}
+                  title={t(isStreaming ? 'home.queuedInsertHint' : 'home.queuedInsertIdleHint')}
+                  className="flex items-center gap-1 h-5 px-2 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] text-[10px] font-medium hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,transform]"
+                >
+                  <Icon name="bolt" size={10} />
+                  {t(isStreaming ? 'home.queuedInsert' : 'home.queuedInsertIdle')}
+                </button>
+              </div>
               {queuedOpen && (
                 <div className="mt-1 space-y-1 max-h-36 overflow-y-auto">
                   {queuedList.map((q) => (

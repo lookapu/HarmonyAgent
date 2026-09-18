@@ -337,6 +337,7 @@ pub fn run() {
             )));
             app.manage(ChatLock::default());
             app.manage(ChatCancel::default());
+            app.manage(commands::chat::ChatResumeAfterStop::default());
             app.manage(ToolApprovalState::default());
             app.manage(commands::chat::SessionToolAllowState::default());
             app.manage(commands::chat::FirstWriteApprovedState::default());

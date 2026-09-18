@@ -1853,15 +1853,19 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       }
     },
 
-    stopGeneration: async () => {
+    /** 停止生成；insertQueued=true 时后端停完立即消费排队消息续跑（排队条"立即插入"） */
+    stopGeneration: async (insertQueued?: boolean) => {
       const conv = get().currentConversation
       if (!conv) return
       const cid = conv.id
       try {
-        await stopChatApi(cid)
+        await stopChatApi(cid, insertQueued)
       } catch {
         // 忽略：后端在安全点自行退出
       }
+      // 「立即插入」预期任务马上继续，不启动下面的释放兜底：那会把续跑轮的分桶清成
+      // 空态并在 60s 后误报"停止未生效"（其实模型正在正常输出）。
+      if (insertQueued) return
       // 停止兜底：后端任务若已死（线程卡死、join 永不返回），invoke 永不 reject，
       // 前端须在宽限期后自行释放流式桶，否则界面永久转圈且无法再发消息。
       // 用代次 token（startedAt）校验：用户停止后若立即重新发送，新桶的 startedAt
@@ -2094,7 +2098,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       if (!conv) return
       try {
         await removeQueuedMessageApi(conv.id, messageId)
-        set((s) => ({ queuedList: s.queuedList.filter((q) => q.id !== messageId) }))
+        set((s) => ({
+          queuedList: s.queuedList.filter((q) => q.id !== messageId),
+          // 库里那条已经删了，气泡也得跟着撤：否则界面上留下一个永远带"排队中"标记的幽灵
+          // （空闲态"立即插入"正是先移除再重发，不撤会显示成两条一样的内容）
+          messages: s.messages.filter((m) => m.id !== messageId),
+        }))
       } catch {
         // 失败静默（下次刷新自愈）
       }

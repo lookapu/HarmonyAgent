@@ -12,6 +12,19 @@ use tauri::{Emitter, Manager};
 
 use crate::services::previewer;
 
+/// 内嵌 WebView 的浏览器参数：本机回环必须绕过系统代理。
+///
+/// WebView2 默认跟随系统代理，开着代理时 `http://localhost:5173` 会被送到代理上，
+/// 报回来的却是"拒绝连接"——看起来像服务没起，实际是代理拦了（本机实际反馈）。
+/// `--proxy-bypass-list` 让 localhost / 127.0.0.1 / 无点主机名直连。
+///
+/// 注意：wry 规定一旦显式传参就不再注入默认值，故默认的 `--disable-features` 必须原样带上，
+/// 否则会退回 WebView2 的迷你菜单与 SmartScreen 拦截。
+/// 主窗口在 tauri.conf.json 的 `app.windows[].additionalBrowserArgs` 里是同一串。
+pub const WEBVIEW_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+     --proxy-bypass-list=localhost;127.0.0.1;<local>";
+
 /// 打开（或导航）Web 预览窗口。仅接受 http/https，防协议注入。
 #[tauri::command]
 pub async fn open_preview_window(app: tauri::AppHandle, url: String) -> Result<(), String> {
@@ -30,6 +43,7 @@ pub async fn open_preview_window(app: tauri::AppHandle, url: String) -> Result<(
         .title("Web 预览")
         .inner_size(1100.0, 760.0)
         .min_inner_size(480.0, 360.0)
+        .additional_browser_args(WEBVIEW_BROWSER_ARGS)
         .build()
         .map_err(|e| e.to_string())?;
     Ok(())

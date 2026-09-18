@@ -309,6 +309,12 @@ pub struct ChatLock(pub StdMutex<HashMap<String, String>>);
 #[derive(Default)]
 pub struct ChatCancel(pub StdMutex<HashSet<String>>);
 
+/// 「停止后立即续跑」集合：用户点排队条上的"立即插入"时置位。
+/// 与 ChatCancel 同时置位，但任务在停止安全点发现它就不中断，而是立刻消费排队消息续跑——
+/// 语义是"别等这轮干完，先把排队的话带上"，而不是"别干了"。一次性，消费即清除。
+#[derive(Default)]
+pub struct ChatResumeAfterStop(pub StdMutex<HashSet<String>>);
+
 /// 工具权限待审核表：request_id -> (用户选择通道, 工具名, 会话 id, 参数)
 /// 通道值：true=允许执行 / false=拒绝；携带工具名与会话 id 用于“本会话始终允许”记忆落表，
 /// 参数用于切回会话时恢复审批弹窗原文
@@ -1371,10 +1377,15 @@ const MAX_UNVERIFIED_CLAIM_CORRECTIONS: usize = 2;
 /// 若 Agent 正挂在 ask_user 提问等待上，同步关闭提问通道立即退出；
 /// 若正在执行长工具（run_command/build 等），同步发出工具中断请求强杀子进程——
 /// 否则停止要等工具跑完才生效（表现为点停止没反应，用户只能强杀软件）。
+///
+/// resume_queued=true 是排队条的「立即插入」：停只是手段，停完立刻消费排队消息续跑，
+/// 而不是就此收工（见 ChatResumeAfterStop）。
 #[tauri::command]
 pub fn stop_chat(
     conversation_id: String,
+    resume_queued: Option<bool>,
     cancel: State<'_, ChatCancel>,
+    resume: State<'_, ChatResumeAfterStop>,
     registry: State<'_, TaskRegistry>,
     db: State<'_, DbState>,
 ) -> Result<(), String> {
@@ -1393,12 +1404,34 @@ pub fn stop_chat(
         format!("停止标志锁被占用，无法设置停止请求（{e}）")
     })?;
     set.insert(conversation_id.clone());
+    // 「立即插入」：停止只是手段，目的是把排队消息提前带上。任务在停止安全点
+    // （stream_chat_body 的 stats.stopped 分支）读这个标志，命中则不中断而直接续跑。
+    if resume_queued.unwrap_or(false) {
+        if let Ok(mut r) = resume.0.lock() {
+            r.insert(conversation_id.clone());
+        }
+        crate::utils::logger::log_event(
+            "insert_queued_requested",
+            serde_json::json!({ "conversation_id": conversation_id }),
+        );
+    }
     // 记录停止请求时间：看门狗据此判断协作停止是否失效（宽限期内未消费则强杀任务）
     registry.mark_stop_requested(&conversation_id);
     crate::agent::ask::cancel_conversation(&conversation_id);
     drop(set);
     crate::agent::broker_approval::stop_and_revoke(&db, &conversation_id, crate::agent::broker_approval::StopReason::User)?;
     Ok(())
+}
+
+/// 消费「停止后立即续跑」标志（一次性）：true 表示这次停止是"插入排队消息"而非终止。
+fn take_resume_after_stop(app: &AppHandle, conversation_id: &str) -> bool {
+    let state = app.state::<ChatResumeAfterStop>();
+    // 先落到具名局部再返回：match 的临时值若留在尾表达式，会活过 state 的析构点
+    let hit = match state.0.lock() {
+        Ok(mut set) => set.remove(conversation_id),
+        Err(_) => false,
+    };
+    hit
 }
 
 /// 停止当前正在执行的工具（不终止整个任务）：中断标志被长任务命令执行器轮询消费，
@@ -1570,6 +1603,8 @@ pub struct QueuedMessageInfo {
     pub content: String,
     pub agent_owned: bool,
     pub created_at: i64,
+    /// 原 @ 引用列表（JSON 数组）：前端"立即插入"在空闲态改走普通发送时要带上，否则引用丢失
+    pub references_json: Option<String>,
 }
 
 /// 查询会话排队中消息（用于前端“排队中”条展示与移除）
@@ -1581,7 +1616,7 @@ pub fn list_queued_messages(
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, content, agent_owned, created_at FROM messages
+            "SELECT id, content, agent_owned, created_at, references_json FROM messages
              WHERE conversation_id = ?1 AND queued = 1 AND role = 'user' AND hidden = 0
              ORDER BY created_at ASC, rowid ASC",
         )
@@ -1593,6 +1628,7 @@ pub fn list_queued_messages(
                 content: r.get(1)?,
                 agent_owned: r.get::<_, i64>(2)? != 0,
                 created_at: r.get(3)?,
+                references_json: r.get(4)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -2224,10 +2260,17 @@ async fn stream_chat_body(
             // 任务失败：不再自动续跑（错误返回前端展示），排队消息保留待下次处理
             return result.map_err(|e| e.message);
         }
-        // 用户主动停止：不再自动续跑排队队列。排队消息原样保留（queued=1），
+        // 用户主动停止：默认不再自动续跑排队队列。排队消息原样保留（queued=1），
         // 由用户决定是否继续，避免"点了停止，AI 过会儿又自己开始干活"。
+        // 例外：排队条上的"立即插入"（stop_chat resume_queued=true）——停止只是手段，
+        // 目的是把排队消息提前带上，此时不 break 而是落到下面的续跑分支。
         if stats.stopped {
-            break;
+            if !take_resume_after_stop(app, &conversation_id) {
+                break;
+            }
+            // 本轮停止已生效（不是"停止没反应"）：清掉看门狗的停止计时，
+            // 否则 40s 后会被判 stop_not_effective 强杀正在正常推进的续跑轮
+            registry.clear_stop_requested(&conversation_id);
         }
         // 任务结束（成功）：消费排队队列（含 Agent 挂起未并入的），依次续跑
         // 逐个模式：一次取一条，原文保留在历史（queued=0 后进历史组装）；
@@ -4727,6 +4770,10 @@ async fn stream_chat_inner(
     );
     // 清除该会话历史停止标志（一次性标志，避免残留影响本次请求）
     if let Ok(mut set) = cancel.0.lock() {
+        set.remove(&conversation_id);
+    }
+    // 同上：清掉上一任务残留的"停止后立即续跑"标志，避免误把一次新的停止当成插入
+    if let Ok(mut set) = app.state::<ChatResumeAfterStop>().0.lock() {
         set.remove(&conversation_id);
     }
     // 重置任务级工具预算（防打转护栏，每次任务独立计数）

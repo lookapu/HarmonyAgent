@@ -524,6 +524,11 @@ export function ToolStatsPanel({
 }
 
 /* ============ 预览面板：设备预览（引擎真渲染）+ Web 预览（iframe） ============ */
+/** 本机回环地址：这类地址打不开时，多半是服务没起或系统代理拦了，而不是站点禁嵌 */
+function isLoopbackUrl(url: string): boolean {
+  return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(url.trim())
+}
+
 export function PreviewPanel({
   url,
   setUrl,
@@ -688,6 +693,9 @@ export function PreviewPanel({
             <Icon name="devices" size={24} className="opacity-40" />
             <span className="text-[12px] text-[var(--text-muted)]">{t('home.previewEmpty')}</span>
             <span className="text-[11px] text-[var(--text-muted)]/70">{t('home.previewBlocked')}</span>
+            {isLoopbackUrl(url) && (
+              <span className="text-[11px] text-[var(--text-muted)]/70">{t('home.previewLocalHint')}</span>
+            )}
           </div>
         )}
       </div>

@@ -19,7 +19,8 @@
         "height": 720,
         "resizable": true,
         "fullscreen": false,
-        "center": true
+        "center": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-bypass-list=localhost;127.0.0.1;<local>"
       }
     ],
     "security": {
