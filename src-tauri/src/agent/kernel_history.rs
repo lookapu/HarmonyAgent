@@ -69,6 +69,8 @@ pub struct KernelHistoryInput<'a> {
     pub context_hint: Option<&'a str>,
     pub workflow_directive: &'a str,
     pub ledger_hint: Option<&'a str>,
+    /// 任务清单（todo_write）未完成项：每轮注入，防模型写完就忘（见 todo::render_hint）
+    pub todos_hint: Option<&'a str>,
     pub compression_summary: Option<&'a str>,
     pub confirmed_plan: Option<&'a str>,
 
@@ -146,6 +148,11 @@ impl KernelHistoryAssembler {
         // 5. Task Ledger（任务账本，防长任务"忘记已做过什么/卡在哪一步"）
         if let Some(ledger) = input.ledger_hint {
             messages.push(serde_json::json!({ "role": "system", "content": ledger }));
+        }
+
+        // 5b. 任务清单未完成项（防 todo_write 写完就忘；与账本同为每轮任务状态块）
+        if let Some(todos) = input.todos_hint {
+            messages.push(serde_json::json!({ "role": "system", "content": todos }));
         }
 
         // 6. Compression summary（早期对话滚动摘要）
@@ -412,6 +419,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "Follow the plan.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![],
@@ -447,6 +455,7 @@ mod tests {
             context_hint: Some("Context: working on auth module."),
             workflow_directive: "Use tools.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![],
@@ -482,6 +491,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "Workflow.",
             ledger_hint: Some("Ledger: step 1 done."),
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: Some("Plan: 1. Read 2. Write"),
             history_rows: vec![],
@@ -517,6 +527,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![
@@ -560,6 +571,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![
@@ -603,6 +615,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![HistoryRow {
@@ -641,6 +654,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![
@@ -684,6 +698,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![],
@@ -724,6 +739,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![],
@@ -763,6 +779,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: Some("Plan steps."),
             history_rows: vec![],
@@ -799,6 +816,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![],
@@ -835,6 +853,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![],
@@ -874,6 +893,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: None,
             confirmed_plan: None,
             history_rows: vec![],
@@ -911,6 +931,7 @@ mod tests {
             context_hint: None,
             workflow_directive: "W.",
             ledger_hint: None,
+            todos_hint: None,
             compression_summary: Some("Early conversation was about X and Y."),
             confirmed_plan: None,
             history_rows: vec![],
@@ -945,6 +966,7 @@ mod tests {
             context_hint: Some("Context."),
             workflow_directive: "Workflow.",
             ledger_hint: Some("Ledger."),
+            todos_hint: None,
             compression_summary: Some("Summary."),
             confirmed_plan: Some("Plan."),
             history_rows: vec![

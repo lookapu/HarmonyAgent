@@ -337,7 +337,7 @@ pub fn run() {
             )));
             app.manage(ChatLock::default());
             app.manage(ChatCancel::default());
-            app.manage(commands::chat::ChatResumeAfterStop::default());
+            app.manage(commands::chat::ChatForceMerge::default());
             app.manage(ToolApprovalState::default());
             app.manage(commands::chat::SessionToolAllowState::default());
             app.manage(commands::chat::FirstWriteApprovedState::default());
@@ -436,6 +436,7 @@ pub fn run() {
             commands::project::send_message,
             commands::chat::stream_chat,
             commands::chat::stop_chat,
+            commands::chat::insert_queued_now,
             commands::chat::stop_tool,
             commands::chat::revoke_ota_approval,
             commands::chat::get_ota_approval_revoked,

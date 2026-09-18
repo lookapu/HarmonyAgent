@@ -1224,14 +1224,7 @@ fn dispatch_api(
         ("POST", ["api", "conversations", id, "stop"]) => {
             let cancel = app.state::<ChatCancel>();
             let registry = app.state::<crate::utils::task_registry::TaskRegistry>();
-            cmd_response(chat::stop_chat(
-                id.to_string(),
-                None,
-                cancel,
-                app.state::<chat::ChatResumeAfterStop>(),
-                registry,
-                app.state::<DbState>(),
-            ))
+            cmd_response(chat::stop_chat(id.to_string(), cancel, registry, app.state::<DbState>()))
         }
         ("POST", ["api", "approvals", request_id]) => {
             dispatch_approval(app, request_id, body)

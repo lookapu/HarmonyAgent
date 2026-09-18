@@ -9,6 +9,7 @@ import {
   listMessagesPage,
   streamChat as streamChatApi,
   stopChat as stopChatApi,
+  insertQueuedNow as insertQueuedNowApi,
   stopTool as stopToolApi,
   queueMessage as queueMessageApi,
   listQueuedMessages as listQueuedMessagesApi,
@@ -1853,19 +1854,15 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       }
     },
 
-    /** 停止生成；insertQueued=true 时后端停完立即消费排队消息续跑（排队条"立即插入"） */
-    stopGeneration: async (insertQueued?: boolean) => {
+    stopGeneration: async () => {
       const conv = get().currentConversation
       if (!conv) return
       const cid = conv.id
       try {
-        await stopChatApi(cid, insertQueued)
+        await stopChatApi(cid)
       } catch {
         // 忽略：后端在安全点自行退出
       }
-      // 「立即插入」预期任务马上继续，不启动下面的释放兜底：那会把续跑轮的分桶清成
-      // 空态并在 60s 后误报"停止未生效"（其实模型正在正常输出）。
-      if (insertQueued) return
       // 停止兜底：后端任务若已死（线程卡死、join 永不返回），invoke 永不 reject，
       // 前端须在宽限期后自行释放流式桶，否则界面永久转圈且无法再发消息。
       // 用代次 token（startedAt）校验：用户停止后若立即重新发送，新桶的 startedAt
@@ -1896,6 +1893,20 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           })
         }
       }, 10 * 1000)
+    },
+
+    /**
+     * 「立即插入」：请后端在下一个安全点把排队消息并入**正在跑的任务**（不停止当前任务，
+     * 也不新建轮次），原任务随后照原目标继续。与"发送到 Agent"的差别只在不由模型决定。
+     */
+    insertQueuedNow: async () => {
+      const conv = get().currentConversation
+      if (!conv) return
+      try {
+        await insertQueuedNowApi(conv.id)
+      } catch {
+        // 失败静默：消息仍在队列里，任务收尾时会照常逐条续跑，不会丢
+      }
     },
 
     /** 停止当前正在执行的工具：强杀子进程，模型拿到中断反馈后继续生成结论（不终止任务） */

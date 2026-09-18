@@ -273,7 +273,7 @@
     "queuedBar": "排队中 {{count}} 条（点击展开）",
     "queuedRemove": "移除（不再续跑）",
     "queuedInsert": "立即插入",
-    "queuedInsertHint": "不等当前任务跑完：停掉当前这一轮，立刻带上排队的消息继续（已生成的内容会保留）",
+    "queuedInsertHint": "不等当前任务结束：把排队消息立刻交给正在跑的任务一起处理，当前任务不会中断，处理完继续原来的工作",
     "queuedInsertIdle": "接着执行",
     "queuedInsertIdleHint": "当前没有任务在跑，直接用它开启新一轮",
     "editMessage": "编辑消息",

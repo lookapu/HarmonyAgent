@@ -183,6 +183,9 @@ pub struct KernelRoundInput<'a> {
     pub has_reasoning: bool,
     pub truncated: bool,
     pub interrupted: bool,
+    /// 输出退化（复读）：同一段内容被连续重写，已掐断并裁掉重复尾巴。
+    /// 优先级最高，且**绝不续写**——续写只会把复读喂得更长。
+    pub degenerate: bool,
     pub has_native_tool_calls: bool,
 }
 
@@ -207,6 +210,8 @@ pub enum KernelRoundControl {
         continuation_text: String,
         reasoning_only: bool,
     },
+    /// 复读退化：收尾（保留已裁过的内容 + 注记），不做任何续写
+    StopDegenerate { note: String },
     /// 假调用纠正：注入纠正提示继续
     CorrectFakeCall {
         correction_text: String,
@@ -255,6 +260,16 @@ impl KernelRoundRouter {
     /// 每轮 turn 解析后调用：返回一个完整决策，adapter 先应用注记再执行主控制。
     pub fn decide(&mut self, input: &KernelRoundInput) -> KernelRoundDecision {
         let mut notices = Vec::new();
+        // 复读退化优先于一切：这类流常同时被判定为截断/中断，若先走那两条分支就会
+        // 追加"请继续"，把复读喂得更长（本机实测的放大路径）。
+        if input.degenerate {
+            return KernelRoundDecision {
+                notices,
+                control: KernelRoundControl::StopDegenerate {
+                    note: "\n\n> ⚠️ 检测到模型输出陷入重复（同一段内容连续重写），已自动停止本轮并保留以上有效内容。可重新发送指令继续，或换一个模型再试。".to_string(),
+                },
+            };
+        }
         let text_empty = input.text.trim().is_empty();
         // 空轮：text 空且非截断非中断且无工具调用（工具调用响应可能无正文，属正常）
         if text_empty && !input.truncated && !input.interrupted && !input.has_native_tool_calls {
@@ -495,6 +510,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         // 第 1 次空轮：RetryEmpty
@@ -516,11 +532,36 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: true,
         };
         let decision = router.decide(&input);
         assert!(decision.notices.is_empty());
         assert!(matches!(decision.control, KernelRoundControl::Proceed));
+    }
+
+    /// 复读退化必须优先于截断/中断收尾：那两条分支都会追加"请继续"，
+    /// 而续写只会把复读喂得更长（本机实测的放大路径）。
+    #[test]
+    fn round_router_degenerate_wins_over_truncated_and_interrupted() {
+        for (truncated, interrupted) in [(true, false), (false, true), (true, true)] {
+            let mut router = KernelRoundRouter::new();
+            let input = KernelRoundInput {
+                text: "反复重写的正文",
+                has_reasoning: false,
+                truncated,
+                interrupted,
+                degenerate: true,
+                has_native_tool_calls: false,
+            };
+            let decision = router.decide(&input);
+            assert!(
+                matches!(decision.control, KernelRoundControl::StopDegenerate { .. }),
+                "复读应直接收尾而不是续写（truncated={truncated} interrupted={interrupted}）"
+            );
+            assert_eq!(router.counters().continuation_rounds, 0, "不该消耗续写次数");
+            assert_eq!(router.counters().interrupted_rounds, 0, "不该消耗中断续写次数");
+        }
     }
 
     #[test]
@@ -531,6 +572,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: true,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         // 前 5 次中断：ReplayFrozen
@@ -554,6 +596,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: true,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         for _ in 0..3 {
@@ -574,6 +617,7 @@ mod tests {
             has_reasoning: false,
             truncated: true,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         // 前 8 次截断：ContinueTruncated
@@ -595,6 +639,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         // 前 3 次假调用：CorrectFakeCall
@@ -616,6 +661,7 @@ mod tests {
             has_reasoning: true,
             truncated: true,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         let decision = router.decide(&input);
@@ -635,6 +681,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: true,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         for _ in 0..KERNEL_MAX_INTERRUPT_RETRY_ROUNDS {

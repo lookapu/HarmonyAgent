@@ -273,7 +273,7 @@
     "queuedBar": "{{count}} queued (click to expand)",
     "queuedRemove": "Remove (skip)",
     "queuedInsert": "Insert now",
-    "queuedInsertHint": "Don't wait for the current task: stop this round and continue with the queued message right away (anything already generated is kept)",
+    "queuedInsertHint": "Don't wait for the current task to end: hand the queued message to the running task right away. It is not interrupted and carries on with the original work afterwards",
     "queuedInsertIdle": "Run now",
     "queuedInsertIdleHint": "Nothing is running — start a new round with this message",
     "editMessage": "Edit message",

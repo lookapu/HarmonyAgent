@@ -288,6 +288,7 @@ export default function Home() {
     openConversation,
     sendUserMessage,
     stopGeneration,
+    insertQueuedNow,
     stopCurrentTool,
     regenerateLast,
     renameConversation,
@@ -375,6 +376,7 @@ export default function Home() {
     openConversation: s.openConversation,
     sendUserMessage: s.sendUserMessage,
     stopGeneration: s.stopGeneration,
+    insertQueuedNow: s.insertQueuedNow,
     stopCurrentTool: s.stopCurrentTool,
     regenerateLast: s.regenerateLast,
     renameConversation: s.renameConversation,
@@ -1958,24 +1960,21 @@ export default function Home() {
     return interruptedTailMessage(messages, isStreaming)
   }, [messages, isStreaming])
 
-  // 排队条「立即插入」防重入：点击到后端真正续跑之间有几百毫秒的窗口
-  // （chat-stopped 清空流式桶 → 续跑轮 chat-run-started 重建），此间再点一次会被误判成
-  // "空闲态"从而重复发一条。短暂忽略重复点击即可，代价远小于重复指令。
+  // 排队条「立即插入」防重入：连点两次会推两条一模一样的"已插入"提示（消息本身只会被并入
+  // 一次，不会重复执行）。短暂忽略重复点击即可。
   const insertQueuedAtRef = useRef(0)
-  /** 排队条主按钮：运行中=停当前轮立刻带上排队消息续跑；空闲（停止后遗留）=当成新一轮开启 */
+  /** 排队条主按钮：运行中=把排队消息立刻并入当前任务（不中断，原任务继续）；空闲=当成新一轮开启 */
   const handleInsertQueued = async () => {
     const conv = currentConversation
     if (!conv || queuedList.length === 0) return
+    if (Date.now() - insertQueuedAtRef.current < 2000) return
+    insertQueuedAtRef.current = Date.now()
     if (isStreaming) {
-      if (Date.now() - insertQueuedAtRef.current < 3000) return
-      insertQueuedAtRef.current = Date.now()
-      setStopRequested(true)
-      void stopGeneration(true)
+      void insertQueuedNow()
       return
     }
     const first = queuedList[0]
-    if (!first || Date.now() - insertQueuedAtRef.current < 3000) return
-    insertQueuedAtRef.current = Date.now()
+    if (!first) return
     // 引用随原消息存的是 JSON 数组字符串，改走普通发送要原样带上，否则 @ 文件丢失
     let refs: string[] | undefined
     try {
@@ -5156,8 +5155,12 @@ export default function Home() {
                                       <div key={td.id} className="flex items-start gap-2 py-0.5 text-[12px] leading-relaxed">
                                         {td.status === 'done' ? (
                                           <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
-                                        ) : td.status === 'in_progress' ? (
+                                        ) : td.status === 'in_progress' && isStreaming ? (
                                           <Spinner variant="inline" size={10} className="mt-0.5" />
+                                        ) : td.status === 'in_progress' ? (
+                                          // 任务已结束还挂着 in_progress：不再转圈（否则看起来像还在干活，
+                                          // 与回复里的"已完成"直接矛盾），如实标成未完成
+                                          <span className="w-2.5 h-2.5 mt-1 rounded-full border border-[var(--warning)] shrink-0" />
                                         ) : (
                                           <span className="w-2.5 h-2.5 mt-1 rounded-full border border-[var(--border)] shrink-0" />
                                         )}
@@ -5166,11 +5169,16 @@ export default function Home() {
                                             td.status === 'done'
                                               ? 'text-[var(--text-muted)] line-through'
                                               : td.status === 'in_progress'
-                                                ? 'text-[var(--accent)] font-medium'
+                                                ? isStreaming
+                                                  ? 'text-[var(--accent)] font-medium'
+                                                  : 'text-[var(--warning)]'
                                                 : 'text-[var(--text-secondary)]'
                                           }
                                         >
                                           {td.content}
+                                          {td.status === 'in_progress' && !isStreaming && (
+                                            <span className="text-[11px] text-[var(--text-muted)]">（未完成）</span>
+                                          )}
                                         </span>
                                       </div>
                                     ))}

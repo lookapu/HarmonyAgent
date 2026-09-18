@@ -4342,11 +4342,19 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
     let key = project
         .map(crate::agent::todo::project_key)
         .unwrap_or_else(|| ctx.conversation_id.clone());
+    let before = crate::agent::todo::get(&key);
     let todos = if merge {
         crate::agent::todo::merge(&key, items)
     } else {
         crate::agent::todo::replace(&key, items)
     };
+    // 一字未改的重写要如实回话：否则模型以为"更新了清单"就有了进展，实际什么都没变
+    // （本机实测：同一份清单被原样重写，工具仍回"清单已更新"，随后模型就宣称完成了）。
+    let unchanged = before.len() == todos.len()
+        && before
+            .iter()
+            .zip(todos.iter())
+            .all(|(a, b)| a.id == b.id && a.content == b.content && a.status == b.status);
     // 会话级 todo 同步为当前 Run 的持久化计划步骤。项目级 todo 可能跨多个 Run 共享，
     // 不绑定到单次执行图，避免其他会话的更新污染本次恢复决策。
     if project.is_none() && !ctx.run_id.is_empty() {
@@ -4375,11 +4383,20 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
         todos.iter().filter(|t| t.status == "done").count(),
         todos.iter().filter(|t| t.status == "in_progress").count(),
     );
-    let mut out = format!(
-        "任务清单已更新：共 {} 项，已完成 {done}，进行中 {doing}，待处理 {}",
-        todos.len(),
-        todos.len() - done - doing,
-    );
+    let mut out = if unchanged {
+        format!(
+            "任务清单未变化：共 {} 项，已完成 {done}，进行中 {doing}，待处理 {}（内容与上次完全相同；\
+             本次调用不构成任何进展，请直接推进实际工作，或在状态确实改变后再调用）",
+            todos.len(),
+            todos.len() - done - doing,
+        )
+    } else {
+        format!(
+            "任务清单已更新：共 {} 项，已完成 {done}，进行中 {doing}，待处理 {}",
+            todos.len(),
+            todos.len() - done - doing,
+        )
+    };
     if let Some(p) = project {
         out.push_str(&format!("\n（项目级共享模式：同一项目其他会话可读写同一份清单）\n{}", crate::agent::todo::project_digest(p)));
     }

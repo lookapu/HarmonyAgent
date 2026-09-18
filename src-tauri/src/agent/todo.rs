@@ -126,6 +126,41 @@ pub fn project_key(project_path: &str) -> String {
     format!("@project:{}", project_path.trim_end_matches(['/', '\\']))
 }
 
+/// 每轮注入系统提示的任务清单块（空清单返回 None，不占上下文）。
+///
+/// 此前清单是**只写不读**的：模型不主动调 `todo_get` 就再也看不到自己建过的清单，
+/// 于是写一次就忘（本机实测：16:37 建了 4 项，之后再没更新过，界面永远停在 0/4）。
+/// 这里把未完成项每轮回灌，并明确要求"完成一项就地标记"，让清单真正参与对话推进。
+pub fn render_hint(items: &[TodoItem]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let done = items.iter().filter(|t| t.status == "done").count();
+    let mut s = format!(
+        "## 任务清单（共 {} 项，已完成 {done}）\n\
+         这是你为本会话建的清单，随每轮注入以**防遗忘**。完成一项就立刻用 \
+         todo_write（merge=true 只传变化项）把状态改成 done；未开始的改回 pending；\
+         清单里还有未完成项时，不要宣称任务已完成。\n",
+        items.len()
+    );
+    // 未完成项优先展示（最多 12 条，避免长清单挤占上下文）
+    let mut open: Vec<&TodoItem> =
+        items.iter().filter(|t| t.status != "done").collect();
+    if open.is_empty() {
+        s.push_str("（全部已完成）\n");
+        return Some(s);
+    }
+    open.truncate(12);
+    for t in open {
+        s.push_str(&format!("- [{}] {} {}\n", t.status, t.id, t.content));
+    }
+    if items.iter().filter(|t| t.status != "done").count() > 12 {
+        let rest = items.iter().filter(|t| t.status != "done").count() - 12;
+        s.push_str(&format!("（另有 {rest} 项未列出）\n"));
+    }
+    Some(s)
+}
+
 /// 项目级清单统计（供 todo_write 带 project 时返回：跨会话可见历史任务）。
 pub fn project_digest(project_path: &str) -> String {
     let items = get(&project_key(project_path));
@@ -189,5 +224,23 @@ mod tests {
         assert_eq!(items[0].id, "approved-plan-1");
         assert_eq!(items[1].content, "验证增量更新");
         assert!(items.iter().all(|item| item.status == "pending"));
+    }
+
+    #[test]
+    fn hint_is_absent_for_empty_list_and_lists_open_items() {
+        assert!(render_hint(&[]).is_none(), "空清单不注入，不占上下文");
+        let items = vec![item("t1", "done"), item("t2", "in_progress"), item("t3", "pending")];
+        let hint = render_hint(&items).expect("非空清单应注入");
+        assert!(hint.contains("共 3 项，已完成 1"), "{hint}");
+        assert!(hint.contains("todo_write"), "要明确要求完成一项就标记：{hint}");
+        assert!(hint.contains("t2") && hint.contains("t3"), "{hint}");
+        // 已完成项不再列出，避免每轮重复占上下文
+        assert!(!hint.contains("任务 t1"), "{hint}");
+    }
+
+    #[test]
+    fn hint_reports_all_done() {
+        let hint = render_hint(&[item("a", "done")]).unwrap();
+        assert!(hint.contains("全部已完成"), "{hint}");
     }
 }

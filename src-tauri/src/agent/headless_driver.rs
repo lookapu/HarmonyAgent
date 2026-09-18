@@ -622,6 +622,7 @@ impl KernelIoPort for HeadlessIoPort<'_> {
                 has_reasoning,
                 truncated: turn.was_truncated(),
                 interrupted: false,
+                degenerate: false,
                 has_native_tool_calls: !turn.tool_calls.is_empty(),
             });
             for notice in decision.notices {
@@ -656,6 +657,17 @@ impl KernelIoPort for HeadlessIoPort<'_> {
                             SessionEventType::SystemNote,
                             json!({"note": note}),
                             "round_stop_empty",
+                            json!({"note": note}),
+                        )
+                        .map_err(AgentDriverError::Failed)?;
+                    return Ok(KernelIoRoundControl::Stop);
+                }
+                KernelRoundControl::StopDegenerate { note } => {
+                    self.sink
+                        .append(
+                            SessionEventType::SystemNote,
+                            json!({"note": note}),
+                            "round_stop_degenerate",
                             json!({"note": note}),
                         )
                         .map_err(AgentDriverError::Failed)?;
@@ -2056,6 +2068,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         

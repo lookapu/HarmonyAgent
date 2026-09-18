@@ -46,6 +46,7 @@ pub mod permissions;
 pub mod previewer;
 pub mod proxy_service;
 pub mod repo_watcher;
+pub mod repetition;
 pub mod reminders;
 pub mod runtime_progress;
 pub mod seed;

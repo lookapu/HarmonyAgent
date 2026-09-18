@@ -774,6 +774,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         assert!(matches!(
@@ -967,6 +968,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         assert!(matches!(
@@ -1197,6 +1199,7 @@ mod tests {
             has_reasoning: false,
             truncated: false,
             interrupted: false,
+            degenerate: false,
             has_native_tool_calls: false,
         };
         rounds.decide_round(&empty);

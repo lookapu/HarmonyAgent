@@ -309,11 +309,13 @@ pub struct ChatLock(pub StdMutex<HashMap<String, String>>);
 #[derive(Default)]
 pub struct ChatCancel(pub StdMutex<HashSet<String>>);
 
-/// 「停止后立即续跑」集合：用户点排队条上的"立即插入"时置位。
-/// 与 ChatCancel 同时置位，但任务在停止安全点发现它就不中断，而是立刻消费排队消息续跑——
-/// 语义是"别等这轮干完，先把排队的话带上"，而不是"别干了"。一次性，消费即清除。
+/// 「立即插入」请求集合：用户点排队条上的"立即插入"时置位，安全点无条件把排队消息并入当前任务。
+/// 与"发送到 Agent"（agent_owned 消息在安全点并入）的区别只在**不由模型决定**：这里是用户
+/// 点了就并，且不看 agent_owned（普通排队的消息也提前并）。一次性，消费即清除。
+///
+/// 刻意不是停止：并入后当前任务照原目标继续跑，不中断也不丢弃已做的工作。
 #[derive(Default)]
-pub struct ChatResumeAfterStop(pub StdMutex<HashSet<String>>);
+pub struct ChatForceMerge(pub StdMutex<HashSet<String>>);
 
 /// 工具权限待审核表：request_id -> (用户选择通道, 工具名, 会话 id, 参数)
 /// 通道值：true=允许执行 / false=拒绝；携带工具名与会话 id 用于“本会话始终允许”记忆落表，
@@ -1377,15 +1379,10 @@ const MAX_UNVERIFIED_CLAIM_CORRECTIONS: usize = 2;
 /// 若 Agent 正挂在 ask_user 提问等待上，同步关闭提问通道立即退出；
 /// 若正在执行长工具（run_command/build 等），同步发出工具中断请求强杀子进程——
 /// 否则停止要等工具跑完才生效（表现为点停止没反应，用户只能强杀软件）。
-///
-/// resume_queued=true 是排队条的「立即插入」：停只是手段，停完立刻消费排队消息续跑，
-/// 而不是就此收工（见 ChatResumeAfterStop）。
 #[tauri::command]
 pub fn stop_chat(
     conversation_id: String,
-    resume_queued: Option<bool>,
     cancel: State<'_, ChatCancel>,
-    resume: State<'_, ChatResumeAfterStop>,
     registry: State<'_, TaskRegistry>,
     db: State<'_, DbState>,
 ) -> Result<(), String> {
@@ -1404,17 +1401,6 @@ pub fn stop_chat(
         format!("停止标志锁被占用，无法设置停止请求（{e}）")
     })?;
     set.insert(conversation_id.clone());
-    // 「立即插入」：停止只是手段，目的是把排队消息提前带上。任务在停止安全点
-    // （stream_chat_body 的 stats.stopped 分支）读这个标志，命中则不中断而直接续跑。
-    if resume_queued.unwrap_or(false) {
-        if let Ok(mut r) = resume.0.lock() {
-            r.insert(conversation_id.clone());
-        }
-        crate::utils::logger::log_event(
-            "insert_queued_requested",
-            serde_json::json!({ "conversation_id": conversation_id }),
-        );
-    }
     // 记录停止请求时间：看门狗据此判断协作停止是否失效（宽限期内未消费则强杀任务）
     registry.mark_stop_requested(&conversation_id);
     crate::agent::ask::cancel_conversation(&conversation_id);
@@ -1423,9 +1409,29 @@ pub fn stop_chat(
     Ok(())
 }
 
-/// 消费「停止后立即续跑」标志（一次性）：true 表示这次停止是"插入排队消息"而非终止。
-fn take_resume_after_stop(app: &AppHandle, conversation_id: &str) -> bool {
-    let state = app.state::<ChatResumeAfterStop>();
+/// 「立即插入」：把当前排队的消息**立即**并入正在跑的任务（不停止、不新建轮次），
+/// 当前任务随后照原目标继续。排队默认仍由任务收尾逐条续跑；本命令只把"什么时候并"
+/// 从模型自己决定改成用户点了就并。
+///
+/// 消费在安全点（assemble_round 每轮开头）：正在执行的那一轮已经发出请求，只能等本轮
+/// 结束，这是模型调用不可中断决定的粒度，不是"要等全部工具跑完"。
+#[tauri::command]
+pub fn insert_queued_now(
+    conversation_id: String,
+    merge: State<'_, ChatForceMerge>,
+) -> Result<(), String> {
+    let mut set = merge.0.lock().map_err(|e| e.to_string())?;
+    set.insert(conversation_id.clone());
+    crate::utils::logger::log_event(
+        "insert_queued_requested",
+        serde_json::json!({ "conversation_id": conversation_id }),
+    );
+    Ok(())
+}
+
+/// 消费「立即插入」标志（一次性）：true 表示本安全点要无条件并入排队消息。
+fn take_force_merge(app: &AppHandle, conversation_id: &str) -> bool {
+    let state = app.state::<ChatForceMerge>();
     // 先落到具名局部再返回：match 的临时值若留在尾表达式，会活过 state 的析构点
     let hit = match state.0.lock() {
         Ok(mut set) => set.remove(conversation_id),
@@ -2260,17 +2266,10 @@ async fn stream_chat_body(
             // 任务失败：不再自动续跑（错误返回前端展示），排队消息保留待下次处理
             return result.map_err(|e| e.message);
         }
-        // 用户主动停止：默认不再自动续跑排队队列。排队消息原样保留（queued=1），
+        // 用户主动停止：不再自动续跑排队队列。排队消息原样保留（queued=1），
         // 由用户决定是否继续，避免"点了停止，AI 过会儿又自己开始干活"。
-        // 例外：排队条上的"立即插入"（stop_chat resume_queued=true）——停止只是手段，
-        // 目的是把排队消息提前带上，此时不 break 而是落到下面的续跑分支。
         if stats.stopped {
-            if !take_resume_after_stop(app, &conversation_id) {
-                break;
-            }
-            // 本轮停止已生效（不是"停止没反应"）：清掉看门狗的停止计时，
-            // 否则 40s 后会被判 stop_not_effective 强杀正在正常推进的续跑轮
-            registry.clear_stop_requested(&conversation_id);
+            break;
         }
         // 任务结束（成功）：消费排队队列（含 Agent 挂起未并入的），依次续跑
         // 逐个模式：一次取一条，原文保留在历史（queued=0 后进历史组装）；
@@ -3448,10 +3447,17 @@ struct AssembleInputs<'a> {
 /// 压缩决策（命中则缩小 `history_limit` 并返回 `RestartRound`，调用方回循环顶部重装）→
 /// 组装后重置续写/纠正状态与 seam 计数 → 账本实时推送与落库 → 会话快照与 Context V2 检查点。
 async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, ChatFlowError> {
-    // 安全点：消费“发送到 Agent”的挂起消息并入当前任务（用户新指令在工具步骤间隙送达）
-    if let Some((pending_id, pending_content)) =
-        take_next_queued(inputs.state, inputs.conversation_id, true)?
-    {
+    // 安全点：消费排队的挂起消息并入当前任务。
+    // 默认只并"发送到 Agent"的（agent_owned=1，模型自己决定何时接）；用户点过「立即插入」
+    // 则本轮无条件并、且不限 agent_owned——当前任务不中断，继续照原目标跑。
+    let force = take_force_merge(inputs.app, inputs.conversation_id);
+    // 强制插入时把当时排队的都并进来（用户点的是"这些排队消息"，不是"其中一条"）；
+    // 默认路径保持一次一条（避免把多轮上下文一次性倒进同一轮）。
+    loop {
+        let next = take_next_queued(inputs.state, inputs.conversation_id, !force)?;
+        let Some((pending_id, pending_content)) = next else {
+            break;
+        };
         inputs.round_state.merged_instructions.push(pending_content);
         // 明确告知前端"这条已并入"：此前只推一句提示、消息气泡上的"待并入"标记一直不消，
         // 用户会以为这条根本没被执行（本机实际反馈）。
@@ -3467,9 +3473,16 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
             ChatStreamEvent {
                 conversation_id: inputs.conversation_id.to_string(),
                 run_id: inputs.trace_id.to_string(),
-                delta: "\n\n> 📌 已收到你的新指令，Agent 将在当前步骤完成后处理。".to_string(),
+                delta: if force {
+                    "\n\n> 📌 已按你的要求插入当前任务，正在处理；原任务会继续执行。".to_string()
+                } else {
+                    "\n\n> 📌 已收到你的新指令，Agent 将在当前步骤完成后处理。".to_string()
+                },
             },
         );
+        if !force {
+            break;
+        }
     }
     // 组装消息：系统提示 + 历史（最近 history_limit 条，含 tool）+ 已执行工具结果
     // 接缝审计 + 刷新频率分级：完整提示（含低频项目上下文/知识库）每 FULL_HINT_EVERY_ROUNDS
@@ -3514,6 +3527,10 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
         } else {
             (None, None)
         };
+
+    // 任务清单未完成项：每轮注入（此前清单只写不读——模型不主动 todo_get 就再也看不见
+    // 自己建过的清单，写完就忘，界面停在 0/4 而回复已宣称完成，本机实际反馈）
+    let todos_hint = crate::agent::todo::render_hint(&crate::agent::todo::get(inputs.conversation_id));
 
     // 历史行：从 DB 读取并转换为 HistoryRow
     let raw_history = {
@@ -3613,6 +3630,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
         context_hint: context_hint.as_deref(),
         workflow_directive: &inputs.workflow.directive(),
         ledger_hint: ledger_hint.as_deref(),
+        todos_hint: todos_hint.as_deref(),
         compression_summary: inputs.round_state.context_summary.as_deref(),
         confirmed_plan: inputs.round_state.confirmed_plan.as_deref(),
         history_rows,
@@ -3784,6 +3802,8 @@ struct RoundRoutingInputs<'a> {
     truncated: bool,
     /// 流式连接中断
     interrupted: bool,
+    /// 输出退化（复读）：已裁掉重复尾巴，本轮必须收尾而非续写
+    degenerate: bool,
     /// 原生 function calling 调用（工具名，参数 JSON）
     tool_calls: &'a [(String, String)],
     /// 跨段可变状态（本轮状态由调用方传入，见 DesktopRoundState）
@@ -3806,6 +3826,7 @@ fn route_round_outcome(
         has_reasoning: !inputs.reasoning.trim().is_empty(),
         truncated: inputs.truncated,
         interrupted: inputs.interrupted,
+        degenerate: inputs.degenerate,
         has_native_tool_calls: !inputs.tool_calls.is_empty(),
     };
     let decision = inputs.executor.decide_round(&router_input);
@@ -3819,6 +3840,10 @@ fn route_round_outcome(
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::StopEmpty { note } => {
+            inputs.round_state.full.push_str(&note);
+            return Ok(RoundRoutingOutcome::Finish);
+        }
+        crate::agent::kernel_loop::KernelRoundControl::StopDegenerate { note } => {
             inputs.round_state.full.push_str(&note);
             return Ok(RoundRoutingOutcome::Finish);
         }
@@ -4770,10 +4795,6 @@ async fn stream_chat_inner(
     );
     // 清除该会话历史停止标志（一次性标志，避免残留影响本次请求）
     if let Ok(mut set) = cancel.0.lock() {
-        set.remove(&conversation_id);
-    }
-    // 同上：清掉上一任务残留的"停止后立即续跑"标志，避免误把一次新的停止当成插入
-    if let Ok(mut set) = app.state::<ChatResumeAfterStop>().0.lock() {
         set.remove(&conversation_id);
     }
     // 重置任务级工具预算（防打转护栏，每次任务独立计数）
@@ -6595,6 +6616,7 @@ async fn stream_chat_inner(
             reasoning: &outcome.reasoning,
             truncated: outcome.truncated,
             interrupted: outcome.interrupted,
+            degenerate: outcome.degenerate,
             tool_calls: &outcome.tool_calls,
             inherited_tool_evidence: &inherited_tool_evidence,
             goal_contract: &goal_contract,
@@ -7143,6 +7165,9 @@ struct StreamOutcome {
     stopped: bool,
     /// 输出达到 max_tokens 上限被截断（内容不完整，主循环应追加“请继续”续写）
     truncated: bool,
+    /// 输出退化：模型把同一段内容连续重写，已掐断并裁掉重复尾巴。
+    /// 与 truncated/interrupted 的区别是**绝不能再续写**——续写只会把复读喂得更长。
+    degenerate: bool,
     /// 流式连接中断（静默超时/网络悬挂）：内容不完整，主循环自动续写；已收到的部分保留
     interrupted: bool,
     /// 本轮 token 用量（从 SSE usage 块提取，用于任务级成本统计）
@@ -7879,6 +7904,7 @@ async fn stream_once(
                     reasoning: String::new(),
                     stopped: true,
                     truncated: false,
+                    degenerate: false,
                     interrupted: false,
                     usage: kernel_usage_info(None),
                     tool_calls: Vec::new(),
@@ -7904,6 +7930,7 @@ async fn stream_once(
             reasoning: String::new(),
             stopped: true,
             truncated: false,
+            degenerate: false,
             interrupted: false,
             usage: kernel_usage_info(None),
             tool_calls: Vec::new(),
@@ -7973,6 +8000,11 @@ async fn stream_once(
     let mut finished = false; // 收到正常结束标记（finish_reason / [DONE] / message_stop）
     let mut truncated = false; // 收到 length / max_tokens 截断标记
     let mut stalled = false; // wall-clock 停滞 deadline 命中（无有效产出）
+    // 输出退化（复读）检测：模型把同一段话连着重写时掐断本轮。
+    // 现有护栏全是工具级判据，纯文本复读（一个工具都不调）会全部落空——本机实测出现过
+    // 一条回复 87% 是同一段 90 字模板重复 110 次，只能靠用户手动停止。
+    let mut repeat_guard = crate::services::repetition::RepeatGuard::new();
+    let mut degenerate = false;
     // 解析线程最终产物（Done 事件）：收尾组装 outcome 用
     let mut done: Option<StreamParserEvent> = None;
     // 保留本地 run_id 隔离与 Rust 侧 32ms/8KB IPC 合批，避免前端事件洪峰。
@@ -8096,6 +8128,19 @@ async fn stream_once(
                         registry.touch_stream_progress(conversation_id);
                         delivered_content.push_str(&delta);
                         event_batcher.push_content(&delta);
+                        // 文本级复读防护：命中即停本轮（不续写——续写只会把复读喂更长）
+                        if repeat_guard.observe(&delivered_content) {
+                            degenerate = true;
+                            crate::utils::logger::log_event(
+                                "stream_degenerate_repeat",
+                                serde_json::json!({
+                                    "conversation_id": conversation_id,
+                                    "chars": delivered_content.chars().count(),
+                                    "kept_chars": repeat_guard.trim(&delivered_content).chars().count(),
+                                }),
+                            );
+                            break 'outer;
+                        }
                         if crate::agent::evals::take_fault("stream_disconnect_after_delta") {
                             event_batcher.flush();
                             return Err(FriendlyError::new(ErrorKind::Network,"可靠性评测故障注入：增量检查点后断流"));
@@ -8233,6 +8278,17 @@ async fn stream_once(
         // Done 丢失（等待超时/通道异常）：用主循环快照兜底，不无限等待
         _ => (String::new(), String::new(), None, Vec::new(), None),
     };
+    // 复读退化：裁掉重复尾巴再往下走（入库/展示的都是裁过的），并标记 degenerate。
+    // 优先级最高：这类流常常同时被判定为 truncated/interrupted，若走那两条分支就会
+    // 追加"请继续"把复读喂得更长。
+    let full = if degenerate {
+        let kept = repeat_guard.trim(&full);
+        format!(
+            "{kept}\n\n> ⚠️ 检测到模型输出陷入重复（同一段内容连续重写），已自动停止本轮并保留以上有效内容。可重新发送指令继续，或换一个模型再试。"
+        )
+    } else {
+        full
+    };
     // 流读取结束/退出后，优先检查用户是否在此期间点了停止。
     // 否则连接恰在停止前关闭会落到下方 interrupted 分支，主循环自动续写“请继续”，
     // 表现为“点了停止却停不下来、重试提示已有任务进行中”。
@@ -8250,6 +8306,7 @@ async fn stream_once(
             reasoning: reasoning_full,
             stopped: true,
             truncated: false,
+            degenerate: false,
             interrupted: false,
             usage: kernel_usage_info(usage),
             tool_calls: Vec::new(),
@@ -8257,6 +8314,19 @@ async fn stream_once(
     }
     if crate::agent::evals::take_fault("model_output_truncated") {
         truncated = true;
+    }
+    // 复读退化：优先于截断/中断返回，主循环据此**收尾而非续写**（续写会把复读喂更长）。
+    if degenerate {
+        return Ok(StreamOutcome {
+            text: full,
+            reasoning: reasoning_full,
+            stopped: false,
+            truncated: false,
+            degenerate: true,
+            interrupted: false,
+            usage: kernel_usage_info(usage),
+            tool_calls: native_tool_calls,
+        });
     }
     // 截断：不报错退出，保留已输出内容并标记 truncated，由主循环决定追加“请继续”续写。
     // 注意：输出截断不等于上下文超限，裁剪历史对其无效，必须续写才能继续。
@@ -8266,6 +8336,7 @@ async fn stream_once(
             reasoning: reasoning_full,
             stopped: false,
             truncated: true,
+            degenerate: false,
             interrupted: false,
             usage: kernel_usage_info(usage),
             tool_calls: native_tool_calls,
@@ -8281,6 +8352,7 @@ async fn stream_once(
             reasoning: reasoning_full,
             stopped: false,
             truncated: false,
+            degenerate: false,
             interrupted: true,
             usage: kernel_usage_info(usage),
             tool_calls: native_tool_calls,
@@ -8300,6 +8372,7 @@ async fn stream_once(
         reasoning: reasoning_full,
         stopped: false,
         truncated: false,
+        degenerate: false,
         interrupted: false,
         usage: kernel_usage_info(usage),
         tool_calls: native_tool_calls,

@@ -302,7 +302,9 @@ export interface ChatSlice {
   editMessage: (messageId: string, content: string) => Promise<void>
   /** 删除单条消息及其之后的所有消息（刷新列表） */
   removeMessage: (messageId: string) => Promise<void>
-  stopGeneration: (insertQueued?: boolean) => Promise<void>
+  stopGeneration: () => Promise<void>
+  /** 「立即插入」：让后端在下一个安全点把排队消息并入正在跑的任务（不停止当前任务） */
+  insertQueuedNow: () => Promise<void>
   /** 停止当前正在执行的工具（不终止整个任务）：模型拿到中断反馈后继续生成结论 */
   stopCurrentTool: () => Promise<void>
   /** 重新生成：messageId 指定时从该 user 消息分支重生成（丢弃其后主线并归档旧回复） */
