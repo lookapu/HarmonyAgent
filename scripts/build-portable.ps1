@@ -1,7 +1,14 @@
-# 绿色版一键打包：deveco-switch.exe + 完整 resources 自包含目录，拷贝即用。
+# 绿色版一键打包：deveco-switch.exe + 自包含资源目录，拷贝即用。
 # 用法：pwsh scripts/build-portable.ps1 [-Config release]
-# 产物：portable-build\DevEco Switch 绿色版\（deveco-switch.exe + resources\{node,git,jdk,seed,embedding}）
-# 布局与安装版一致（tauri 的 resource_dir 在 Windows 上 = exe 所在目录），
+# 产物：portable-build\DevEco Switch 绿色版\（deveco-switch.exe + {node,git,jdk,seed,embedding}）
+#
+# ⚠️ 资源必须与 exe **同级**，不能再套一层 resources\：
+# tauri 的 resource_dir() 在 Windows 上就是 exe 所在目录（tauri-utils platform.rs 的
+# resource_dir_from 里 `if cfg!(target_os = "windows") { return Ok(exe_dir) }`），
+# 而应用侧一律按 `resource_dir()/seed/knowledge.db`、`resource_dir()/node`、
+# `resource_dir()/embedding` 找。多一层 resources\ 会让内置 Node/Git/JDK、种子知识库与
+# 向量模型**全部静默找不到**——表现为内置 npm 用不上（回退系统 npm，遇 nvm 的 sh 脚本即崩）、
+# API 知识库永远为空（seed 导入静默 early return）。
 # exe 已静态链接 VC 运行库 + 内置 comctl32 v6 manifest，不依赖系统任何第三方运行时。
 
 param(
@@ -43,7 +50,7 @@ Copy-Item $exe (Join-Path $staging "deveco-switch.exe")
 
 foreach ($m in $map) {
     $src = Join-Path $srcTauri $m.Src
-    $dst = Join-Path $staging "resources\$($m.Dst)"
+    $dst = Join-Path $staging $m.Dst
     if (-not (Test-Path $src)) {
         Write-Host "    跳过（源缺失）: $($m.Src)"
         continue
@@ -57,11 +64,11 @@ foreach ($m in $map) {
 # 校验关键文件：在换上去之前做，避免把不完整的目录落到成品位置
 $checks = @(
     "deveco-switch.exe",
-    "resources\node\node.exe",
-    "resources\git\cmd\git.exe",
-    "resources\jdk\bin\java.exe",
-    "resources\seed\knowledge.db",
-    "resources\embedding\bge-small-zh-v1.5\model.safetensors"
+    "node\node.exe",
+    "git\cmd\git.exe",
+    "jdk\bin\java.exe",
+    "seed\knowledge.db",
+    "embedding\bge-small-zh-v1.5\model.safetensors"
 )
 $missing = @()
 foreach ($c in $checks) {
@@ -87,6 +94,13 @@ if (Test-Path $out) {
         robocopy $staging $out /E /NJH /NJS /NFL /NDL /NP | Out-Null
         if ($LASTEXITCODE -ge 8) { throw "合并拷贝失败（exit $LASTEXITCODE），原目录未被改动" }
         Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+        # 合并模式下旧目录里可能残留上一个布局的 resources\（资源已改到 exe 同级），
+        # 它不被任何代码读取，但会白占一份体积并造成误解，best-effort 清掉。
+        $legacy = Join-Path $out "resources"
+        if (Test-Path $legacy) {
+            Remove-Item $legacy -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path $legacy) { Write-Host "提示：旧布局目录未能删除，可手动删：$legacy" } else { Write-Host "==> 已清除旧布局目录 resources\" }
+        }
         $swapped = $true
         Write-Host "==> 已完成（合并方式换位；若有本次已移除的旧文件会残留在成品目录里）"
     }
