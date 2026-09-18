@@ -467,6 +467,8 @@ pub fn run() {
             commands::git::git_file_log,
             commands::git::git_diff_stat,
             commands::preview::open_preview_window,
+            commands::preview::preview_start,
+            commands::preview::preview_stop,
             commands::terminal::open_terminal,
             commands::terminal::terminal_exec,
             commands::terminal::terminal_kill,

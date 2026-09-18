@@ -43,6 +43,7 @@ pub mod node_runtime;
 pub mod ohpm_landscape;
 pub mod ohpm_audit;
 pub mod permissions;
+pub mod previewer;
 pub mod proxy_service;
 pub mod repo_watcher;
 pub mod reminders;
