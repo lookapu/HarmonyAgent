@@ -4960,7 +4960,43 @@ mod tests {
                 assert_eq!(std::fs::read_to_string(&a).unwrap(), a_src);
                 assert_eq!(std::fs::read_to_string(&b).unwrap(), b_src);
             }
-            (true, Ok(_)) => panic!("javac 可用时，改坏未编辑的调用方必须被拒绝"),
+            (true, Ok(_)) => {
+                // 该分支只在 CI 上出现（本机 JDK 17/25 均通过），所以把判定现场带进 panic：
+                // 调用方是否被收集、门禁是「已检查」还是「超时退回只编本批」，以及 javac 版本。
+                // 测试默认捕获 stdout，只有 panic 内容会出现在 CI 日志里。
+                let edited = a_src.replace("  static int value() { return 1; }\n", "");
+                let affected = super::code_mutation::affected_java_sources(&a, a_src);
+                let verdict = match super::java_compiler::check_batch_with_affected(
+                    &[(a.as_path(), a_src, edited.as_str())],
+                    &affected,
+                ) {
+                    super::java_compiler::JavaTypeCheck::Checked {
+                        before,
+                        after,
+                        added,
+                        affected_files,
+                        affected_skipped,
+                    } => format!(
+                        "Checked before={before} after={after} added={added:?} \
+                         affected_files={affected_files} affected_skipped={affected_skipped}"
+                    ),
+                    super::java_compiler::JavaTypeCheck::Unavailable { reason } => {
+                        format!("Unavailable reason={reason}")
+                    }
+                };
+                let javac = match std::process::Command::new("javac").arg("-version").output() {
+                    Ok(out) => format!(
+                        "code={:?} {}",
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                    Err(e) => format!("spawn failed: {e}"),
+                };
+                panic!(
+                    "javac 可用时，改坏未编辑的调用方必须被拒绝\n\
+                     诊断 affected={affected:?}\n诊断 verdict={verdict}\n诊断 javac={javac}"
+                )
+            }
             (false, Ok(_)) => {
                 assert_eq!(std::fs::read_to_string(&a).unwrap(), "package a;\nclass A {\n}\n");
             }
