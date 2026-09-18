@@ -17,6 +17,20 @@ use std::time::Duration;
 /// 单次 `dart analyze` 的墙钟上限；超时按「未分析」降级而不是判定失败。
 const ANALYZE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// 超时降级的文案只在这里生成，判定也只认这里生成的原文。
+///
+/// `Skipped` 的 reason 既可能来自本模块的固定文案，也可能来自分析器 stderr；测试要放过的
+/// 只是「工具超时」这一类，因此判定不能靠子串——`contains("超时")` 会把恰好含该词的
+/// 分析器输出一并放行。
+fn timeout_reason(stage: &str) -> String {
+    format!("dart analyze {stage}超时（>{}s）", ANALYZE_TIMEOUT.as_secs())
+}
+
+#[cfg(test)]
+fn is_timeout_reason(reason: &str) -> bool {
+    ["基线", "候选"].iter().any(|stage| *reason == timeout_reason(stage))
+}
+
 pub(super) enum DartCheck {
     /// 两侧都拿到并完成差分；`added` 为候选新增的诊断签名。
     Checked {
@@ -178,7 +192,7 @@ fn run(dart: &str, root: &Path, path: &Path, candidate: &Path, before: &str) -> 
         Ok(Some(diagnostics)) => diagnostics,
         Ok(None) => {
             return DartCheck::Skipped {
-                reason: format!("dart analyze 基线超时（>{}s）", ANALYZE_TIMEOUT.as_secs()),
+                reason: timeout_reason("基线"),
             }
         }
         Err(reason) => return DartCheck::Skipped { reason },
@@ -187,7 +201,7 @@ fn run(dart: &str, root: &Path, path: &Path, candidate: &Path, before: &str) -> 
         Ok(Some(diagnostics)) => diagnostics,
         Ok(None) => {
             return DartCheck::Skipped {
-                reason: format!("dart analyze 候选超时（>{}s）", ANALYZE_TIMEOUT.as_secs()),
+                reason: timeout_reason("候选"),
             }
         }
         Err(reason) => return DartCheck::Skipped { reason },
@@ -203,6 +217,17 @@ fn run(dart: &str, root: &Path, path: &Path, candidate: &Path, before: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试只放过「本模块生成的超时原文」：任何含「超时」字样的其它原因（分析器 stderr、
+    /// 写入失败文案）都必须继续判失败，否则本机负载高时测试会静默变成空跑。
+    #[test]
+    fn timeout_skip_matcher_only_accepts_its_own_text() {
+        assert!(is_timeout_reason(&timeout_reason("基线")));
+        assert!(is_timeout_reason(&timeout_reason("候选")));
+        assert!(!is_timeout_reason("dart analyze 执行失败：连接超时"));
+        assert!(!is_timeout_reason("写入 Dart 候选临时文件失败：设备超时"));
+        assert!(!is_timeout_reason("未找到 dart 可执行文件（可设置 HARMONY_DART_PATH）"));
+    }
 
     #[test]
     fn machine_output_keeps_only_errors_and_drops_paths_and_positions() {
@@ -281,9 +306,9 @@ ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|/p/.harmony-candidate-1-a.dart|2|2
                 );
             }
             // 并行满载时 dart analyze 可能超过 20s 上限而降级；「外部工具超时降级」是生产上的
-            // 既定行为（不阻塞写入），不应把「本机太忙」记成门禁缺陷。其余跳过原因
-            // （缺 dart、不在包内、候选写入失败）仍视为测试失败。
-            DartCheck::Skipped { reason } if reason.contains("超时") => {
+            // 既定行为（不阻塞写入），不应把「本机太忙」记成门禁缺陷。只认本模块自己生成的
+            // 超时原文（见 `timeout_reason`），分析器 stderr 之类的其它跳过原因仍视为测试失败。
+            DartCheck::Skipped { reason } if is_timeout_reason(&reason) => {
                 eprintln!("跳过：本机负载下 dart analyze 超时降级（{reason}）");
             }
             DartCheck::Skipped { reason } => panic!("dart 可用时不应跳过：{reason}"),
@@ -320,9 +345,9 @@ ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|/p/.harmony-candidate-1-a.dart|2|2
         match check(&file, before, after) {
             DartCheck::Checked { added, .. } => assert!(added.is_empty(), "{added:?}"),
             // 并行满载时 dart analyze 可能超过 20s 上限而降级；「外部工具超时降级」是生产上的
-            // 既定行为（不阻塞写入），不应把「本机太忙」记成门禁缺陷。其余跳过原因
-            // （缺 dart、不在包内、候选写入失败）仍视为测试失败。
-            DartCheck::Skipped { reason } if reason.contains("超时") => {
+            // 既定行为（不阻塞写入），不应把「本机太忙」记成门禁缺陷。只认本模块自己生成的
+            // 超时原文（见 `timeout_reason`），分析器 stderr 之类的其它跳过原因仍视为测试失败。
+            DartCheck::Skipped { reason } if is_timeout_reason(&reason) => {
                 eprintln!("跳过：本机负载下 dart analyze 超时降级（{reason}）");
             }
             DartCheck::Skipped { reason } => panic!("dart 可用时不应跳过：{reason}"),

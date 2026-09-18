@@ -8,7 +8,7 @@
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,104 通过、9 忽略（总计 1,113） |
+| 后端库回归 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 1,105 通过、9 忽略（总计 1,114） |
 | Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test worker_crash_e2e` | 3 通过 |
 | Tool Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test tool_worker_crash_e2e` | 3 通过 |
 | 前端测试 | `npm test` | 14 文件、127 通过 |
@@ -19,7 +19,7 @@
 | clippy 基线门禁 | `python3 scripts/check-warnings.py` | 通过（57/57，仅结构类告警；macOS + Windows 本机均通过——8 条只在 Windows 触发的机械类告警已修复，基线未调整） |
 | Windows 质量矩阵 | GitHub Actions `quality.yml`（macOS + Windows） | v2.2.0 发版时全绿（此前 16 处 Windows 失败已清零） |
 
-平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,104/9 差异来自平台门控用例集，不是回归）。拉取 `57c9626` 后 macOS 侧复验：后端库 1,104/9、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
+平台：macOS 15.7.9（arm64，Darwin 24G830）；另有 Windows 本机（2026-09-17 起用于编码/路径类缺陷复现，同日后端库全量：1,102 通过 / 8 忽略——与 macOS 的 1,105/9 差异来自平台门控用例集，不是回归）。拉取 `57c9626` 后 macOS 侧复验：后端库 1,105/9、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过。上表的 Windows 质量矩阵行证据来自 CI；**编码类缺陷已在本机 Windows + 随包 Temurin 17 复现并验证修复**（见第 3 节）。**未运行**：Docker/OCI、真实 Provider 模型、真机/模拟器、Windows/Linux 目标本机编译、安装包与签名验收。
 
 ## 2. 写入门禁覆盖矩阵
 
@@ -49,7 +49,7 @@
 
 | 缺陷 | 现象 | 修复 | 残留边界 |
 | --- | --- | --- | --- |
-| javac 按平台默认编码读源码 | Windows 默认 cp1252，UTF-8 源码里的中文注释/字符串被误解码，产生**不存在的编译错误**，于是干净写入被 Java 门禁误拦（误报而非漏报） | `java_compiler.rs` 编译参数固定 `-encoding UTF-8` | 源码本身是 GBK/Big5 等非 UTF-8 时仍会失真——2026-09-17 本机 Windows + 随包 Temurin 17 实测为**误报拒写**而非仅「诊断失真」：GBK 源码在固定 `-encoding UTF-8` 下报 38 处 `unmappable character`。门禁硬假定 UTF-8。另注：JDK ≥ 18 的 `file.encoding` 默认已是 UTF-8，该参数在那些机器上冗余；**随包分发的 JDK 17 上必需**（本机实测：不带该参数时 UTF-8 中文源码即报 `unmappable character (0xB2) for encoding GBK`，加上后编译干净） |
+| javac 按平台默认编码读源码 | Windows 默认 cp1252，UTF-8 源码里的中文注释/字符串被误解码，产生**不存在的编译错误**，于是干净写入被 Java 门禁误拦（误报而非漏报） | `java_compiler.rs` 编译参数固定 `-encoding UTF-8`（另抽出 `javac_args`，用参数级用例钉住编码与诊断语言） | 源码本身非 UTF-8（GBK/Big5 等）时按 UTF-8 解码失真：本机 Windows + 随包 Temurin 17 实测为**误报拒写**（38 处 `unmappable character`，见盘点 §28）。门禁硬假定 UTF-8；该参数在随包 JDK 17 上是载荷性的，不能以「JDK ≥ 18 默认 UTF-8」为由删除 |
 | OTA 参数作用域路径前缀不一致 | Windows `canonicalize` 返回 `\\?\C:\...` 逐字（verbatim）前缀，与普通路径比较永不相等 → **工作区内的合法 OTA 参数被判越界而拒批**（真实生产路径，不是测试问题） | `ota_scope.rs` 在根匹配与相对化两侧统一走 `normalize_path`（剥离 verbatim 前缀） | 只归一了前缀；符号链接、8.3 短名等其它 Windows 路径形态未专门覆盖 |
 | 评测基线门禁从未真正比对基线 | env 变量写作 `src-tauri/target/eval-baseline.json`，而 `cargo test` 的工作目录已在 `src-tauri/`：写出的基线读不回、要对的基线读不到 → 门禁长期「产出但不比对」的假绿 | env 改为 `target/eval-baseline.json`，写前 `create_dir_all` 父目录 | 修好后才暴露它对 runner 计时抖动敏感，已改成取三次最优 + `duration_factor` 2.5（见盘点 §26）；同机耗时对比在繁忙 CI 上仍非绝对稳定 |
 
