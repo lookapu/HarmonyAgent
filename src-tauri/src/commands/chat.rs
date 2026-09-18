@@ -3012,17 +3012,11 @@ struct PostRoundInputs<'a> {
     conversation_id: &'a str,
     trace_id: &'a str,
     model: &'a str,
-    context_summary: &'a Option<String>,
-    modified_files: &'a [String],
+    /// 跨段可变状态（正文、轨迹、摘要、变更文件、最近文本、挂起指令、占位消息）
+    round_state: &'a mut DesktopRoundState,
     task_started: std::time::Instant,
     outcome: &'a StreamOutcome,
-    tool_runs: &'a [ToolRunItem],
     stats: &'a mut ChatRunStats,
-    reasoning_full: &'a mut String,
-    full: &'a mut String,
-    last_model_text: &'a mut String,
-    merged_instructions: &'a mut Vec<String>,
-    placeholder_msg_id: &'a mut Option<String>,
 }
 
 /// 轮后记账与入库（纯搬运：原主循环内联代码，行为一致）。
@@ -3036,12 +3030,12 @@ async fn handle_round_outcome(
 ) -> Result<PostRoundOutcome, ChatFlowError> {
     // 挂起指令已随本轮请求送达模型：清除，避免后续轮次重复注入
     // （长任务多轮循环时 token 膨胀，且同一要求被模型反复读到可能重复执行）
-    inputs.merged_instructions.clear();
+    inputs.round_state.merged_instructions.clear();
     // 累计 token 用量（供任务级 Trace 成本估算）
     inputs.stats.input_tokens += inputs.outcome.usage.input_tokens;
     inputs.stats.output_tokens += inputs.outcome.usage.output_tokens;
     // full 在下方标记解析处按 strip 后的正文累计（避免工具标记进入入库文本）
-    inputs.reasoning_full.push_str(&inputs.outcome.reasoning);
+    inputs.round_state.reasoning_full.push_str(&inputs.outcome.reasoning);
     // 打点：单轮请求完成（含请求耗时/重试次数），定位卡点用
     crate::utils::logger::log_event(
         "stream_round_done",
@@ -3049,7 +3043,7 @@ async fn handle_round_outcome(
             "conversation_id": inputs.conversation_id,
             "chars": inputs.outcome.text.chars().count(),
             "elapsed_ms": inputs.task_started.elapsed().as_millis(),
-            "round": inputs.tool_runs.len() + 1,
+            "round": inputs.round_state.tool_runs.len() + 1,
         }),
     );
     // 用户停止：部分内容（如有）入库并推送 chat-done / chat-stopped 后结束
@@ -3059,29 +3053,28 @@ async fn handle_round_outcome(
             inputs.state,
             inputs.conversation_id,
             inputs.trace_id,
-            inputs.tool_runs,
-            inputs.full,
-            inputs.reasoning_full,
+            &inputs.round_state.tool_runs,
+            &inputs.round_state.full,
+            &inputs.round_state.reasoning_full,
             inputs.model,
-            inputs.context_summary,
-            inputs.modified_files,
+            &inputs.round_state.context_summary,
+            &inputs.round_state.modified_files,
             inputs.app,
             inputs.stats.input_tokens,
             inputs.stats.output_tokens,
             inputs.task_started.elapsed().as_millis() as i64,
             true,
-            inputs.placeholder_msg_id,
+            &inputs.round_state.placeholder_msg_id,
         )
         .await?;
         return Ok(PostRoundOutcome::Stopped);
     }
     // 账本“下一步”数据源：模型最近一轮输出（剥离工具标记，防【TOOL】标记混入账本）
-    *inputs.last_model_text = crate::agent::tools::strip_tool_calls(&inputs.outcome.text)
+    inputs.round_state.last_model_text = crate::agent::tools::strip_tool_calls(&inputs.outcome.text)
         .trim()
         .to_string();
     // 工具标记剥离后累计正文（标记由工具卡片事件呈现，不进入入库文本，避免假卡片/上下文错乱）
-    inputs
-        .full
+    inputs.round_state.full
         .push_str(&crate::agent::tools::strip_tool_calls(&inputs.outcome.text));
     // 正文即时入库：每轮累积后同步占位消息（防“最后一次入库”丢正文）——
     // 本任务任一轮正文已可见；任务中断后占位消息保留部分内容，前端识别后可继续生成
@@ -3089,9 +3082,9 @@ async fn handle_round_outcome(
         &inputs.state.0,
         inputs.conversation_id,
         inputs.model,
-        inputs.placeholder_msg_id,
-        inputs.full,
-        inputs.reasoning_full,
+        &mut inputs.round_state.placeholder_msg_id,
+        &inputs.round_state.full,
+        &inputs.round_state.reasoning_full,
     )?;
     Ok(PostRoundOutcome::Continue)
 }
@@ -6516,17 +6509,10 @@ async fn stream_chat_inner(
             conversation_id: &conversation_id,
             trace_id: &trace_id,
             model: &model_choice.model,
-            context_summary: &round_state.context_summary,
-            modified_files: &round_state.modified_files,
             task_started: round_state.task_started,
             outcome: &outcome,
-            tool_runs: &round_state.tool_runs,
             stats: &mut *stats,
-            reasoning_full: &mut round_state.reasoning_full,
-            full: &mut round_state.full,
-            last_model_text: &mut round_state.last_model_text,
-            merged_instructions: &mut round_state.merged_instructions,
-            placeholder_msg_id: &mut round_state.placeholder_msg_id,
+            round_state: &mut round_state,
         })
         .await?
         {
@@ -6660,21 +6646,13 @@ async fn stream_chat_inner(
         task_goal: &task_goal,
         goal_contract: &goal_contract,
         model_choice: &model_choice,
-        tool_runs: &round_state.tool_runs,
         inherited_tool_evidence: &inherited_tool_evidence,
-        last_model_text: &round_state.last_model_text,
-        context_summary: &round_state.context_summary,
-        reasoning_full: &round_state.reasoning_full,
-        modified_files: &round_state.modified_files,
-        placeholder_msg_id: &round_state.placeholder_msg_id,
-        full: &mut round_state.full,
         stats: &mut *stats,
         executor: &mut kernel_executor,
         recovery_plan: &recovery_plan,
-        prev_ledger: &mut round_state.prev_ledger,
         ledger_base_n,
         task_started: round_state.task_started,
-        exhausted: round_state.exhausted,
+        round_state: &mut round_state,
     })
     .await?;
 
@@ -6691,21 +6669,14 @@ struct FinalizeInputs<'a> {
     task_goal: &'a String,
     goal_contract: &'a crate::agent::acceptance::GoalContract,
     model_choice: &'a ModelChoice,
-    tool_runs: &'a [ToolRunItem],
+    /// 跨段可变状态（正文、轨迹、占位消息、摘要、变更文件、最近文本、账本、收尾标志）
+    round_state: &'a mut DesktopRoundState,
     inherited_tool_evidence: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
-    last_model_text: &'a String,
-    context_summary: &'a Option<String>,
-    reasoning_full: &'a String,
-    modified_files: &'a [String],
-    placeholder_msg_id: &'a Option<String>,
-    full: &'a mut String,
     stats: &'a mut ChatRunStats,
     executor: &'a mut KernelIoRunLoop,
     recovery_plan: &'a Option<crate::agent::recovery::RecoveryPlan>,
-    prev_ledger: &'a mut Option<TaskLedger>,
     ledger_base_n: u32,
     task_started: std::time::Instant,
-    exhausted: bool,
 }
 
 /// 任务收尾（纯搬运：原 `stream_chat_inner` 尾部内联代码，行为一致）：证据驱动验收
@@ -6726,21 +6697,13 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
         task_goal,
         goal_contract,
         model_choice,
-        tool_runs,
+        round_state,
         inherited_tool_evidence,
-        last_model_text,
-        context_summary,
-        reasoning_full,
-        modified_files,
-        placeholder_msg_id,
-        full,
         stats,
         executor: kernel_executor,
         recovery_plan,
-        prev_ledger,
         ledger_base_n,
         task_started,
-        exhausted,
     } = inputs;
     // 6. 证据驱动验收：模型的“任务已完成”只是一份完成申请，最终状态由原始目标与
     // 真实工具轨迹计算。显式要求构建/测试/部署或修改却无对应成功证据时保持未完成。
@@ -6755,16 +6718,16 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
         );
     }
     let acceptance_evidence =
-        combined_acceptance_evidence(&inherited_tool_evidence, &tool_runs);
+        combined_acceptance_evidence(&inherited_tool_evidence, &round_state.tool_runs);
     let acceptance = state.0.lock().ok()
         .and_then(|conn| crate::agent::dag::evaluate_root_with_children(&conn, &trace_id, &goal_contract, &acceptance_evidence).ok())
         .unwrap_or_else(|| crate::agent::acceptance::evaluate_contract(&goal_contract, &acceptance_evidence));
     let completion_confirmed =
-        is_completion_confirmation(&last_model_text)
-            || (tool_runs.is_empty() && inherited_tool_evidence.is_empty());
+        is_completion_confirmation(&round_state.last_model_text)
+            || (round_state.tool_runs.is_empty() && inherited_tool_evidence.is_empty());
     let executor_snapshot = serde_json::to_value(
         kernel_executor.finalize(KernelExecutorFinalization::Acceptance {
-            governance_exhausted: exhausted,
+            governance_exhausted: round_state.exhausted,
             acceptance_passed: acceptance.passed,
             completion_confirmed,
         })?,
@@ -6799,7 +6762,7 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
             &acceptance,
             kernel_executor.remediation_rounds(),
             recovery_plan.is_some(),
-            exhausted,
+            round_state.exhausted,
         );
         let quality_value = serde_json::to_value(quality).unwrap_or_default();
         let _ = crate::agent::runtime::set_quality(&conn, &trace_id, &quality_value);
@@ -6808,29 +6771,29 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
         );
     }
     if !acceptance.passed {
-        full.push_str(&format!(
+        round_state.full.push_str(&format!(
             "\n\n> ⚠️ 自动验收未通过：{}。任务已保留为未完成，可继续执行并补齐证据。",
             acceptance.blockers.join("、")
         ));
     }
-    let task_done = !exhausted && acceptance.passed && completion_confirmed;
+    let task_done = !round_state.exhausted && acceptance.passed && completion_confirmed;
     stats.unfinished = !task_done;
     persist_turn(
         state,
         &conversation_id,
         &trace_id,
-        &tool_runs,
-        full,
-        &reasoning_full,
+        &round_state.tool_runs,
+        &round_state.full,
+        &round_state.reasoning_full,
         &model_choice.model,
-        &context_summary,
-        &modified_files,
+        &round_state.context_summary,
+        &round_state.modified_files,
         app,
         stats.input_tokens,
         stats.output_tokens,
         task_started.elapsed().as_millis() as i64,
         !task_done,
-        &placeholder_msg_id,
+        &round_state.placeholder_msg_id,
     )
     .await?;
 
@@ -6855,10 +6818,10 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
             &conversation_id,
             OpenLedgerInputs {
                 task_goal: &task_goal,
-                tool_runs: &tool_runs,
-                last_model_text: &last_model_text,
+                tool_runs: &round_state.tool_runs,
+                last_model_text: &round_state.last_model_text,
                 ledger_base_n,
-                prev_ledger,
+                prev_ledger: &mut round_state.prev_ledger,
             },
         )?;
     }
