@@ -904,3 +904,12 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **处置建议（待定，属沙箱域的设计决策）**：①最小且严格更安全的一步——把 macOS 探测改成用**真实 profile** 跑一条最小命令，使本机如实返回 `available=false` + 原因（fail-closed，不再假阳性）；②再决定是否重设计 profile（allow-default + 拒绝清单会**弱化读隔离**：默认放行读、只拒指定路径，需权衡）；③在该决定落地前，macOS 侧不应声称原生沙箱可用。
 
 **验证**：本机 `cargo test --lib` 1,141 通过 / 0 失败 / 11 忽略；`check-warnings.py` 57/57；`check-docs.py` 通过。
+
+## 49. macOS 沙箱探测改为「真实边界判定」（2026-09-18，`922b9fd`）
+
+按 §48 的建议 ① 落地：macOS 原生后端的可用性不再由静态探测给结论。
+
+- **改动**：`NativeSandboxKind::probe_program` 去掉 macOS 的 `(version 1) (allow default)` 探测项（macOS/Windows 均返回 `None`，理由写在注释里）；新增 `probe_macos_boundary` —— 建临时 workspace/scratch，按 `workspace-write` spec 用**真实 profile** 跑 `printf probe-ok > probe.txt`，要求**命令成功且文件确实落在 workspace 内**才算可用，否则 `available=false` + 原因（含退出码与「workspace 写入未发生」）。Linux 的 bwrap 静态探测路径不变。
+- **新增守门断言**：`macos_probe_availability_matches_a_real_boundary_run`（非 ignored，跑在默认套件里）——探测结论必须与 `run_native_filesystem_checks` 的真实边界执行一致。**这正是旧实现过不了的那条**：宽松探测通过而真实边界失败时两者不一致。本机现状：两边都是 false（fail-closed）✓。
+- **验证**（macOS 本机）：后端库 **1,142** 通过（+1 新用例）/ 0 失败 / 11 忽略；两组 crash E2E 各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
+- **仍未闭环**：①profile 本身仍是「`deny default` + 路径限定允许」，本机 macOS 15 上建不起边界 → macOS 原生沙箱**仍不可用**，只是现在会如实汇报；②要让 macOS 真能用需按 §48 的建议 ② 重设计（allow-default + 拒绝清单 + 写白名单，代价是读隔离弱化），属沙箱域的设计决策，未动。
