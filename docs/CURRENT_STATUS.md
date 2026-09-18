@@ -15,7 +15,7 @@
 | Tool Worker 崩溃恢复 | `cargo test --manifest-path src-tauri/Cargo.toml --test tool_worker_crash_e2e` | 3 通过 |
 | 后端库回归（Windows 本机，设备预览批次 2026-09-18） | 同上 | 1,139 通过 / 0 失败 / 10 忽略（较上一批 +10 条预览用例：引擎参数、帧格式、WebSocket 帧解析、产物定位、默认页解析） |
 | 设备预览端到端（Windows 本机，2026-09-18） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `previewer::tests::e2e_preview_frames_from_real_engine`（需 `DEVECO_PREVIEW_E2E_PROJECT`） | 通过（真实工程 → 构建 → 起引擎 → 取回 JPEG 帧；见盘点 §54） |
-| 前端测试 | `npm test` | 14 文件、127 通过 |
+| 前端测试 | `npm test` | 15 文件、133 通过（含 `previewPanel.test.tsx`：启动/停止、帧渲染、失败不静默、卸载解绑与停引擎） |
 | 前端 lint / 类型 | `npm run lint`、`npx tsc -b` | 通过 |
 | Web 构建与体积门禁 | `npm run build` | 通过（Home 697.0/750KB、Markdown 1500.8/1550KB、index 547.5/575KB） |
 | Rust 编译告警 | `cargo check --lib`、`cargo test --no-run` | 0 警告（macOS + Windows 本机） |
