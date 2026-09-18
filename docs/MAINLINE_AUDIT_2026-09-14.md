@@ -649,3 +649,15 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 - **验证**（Windows 本机）：后端库 1,102 通过 / 0 失败；两组崩溃恢复集成各 3 项；`cargo check --lib` 0 告警；`check-warnings.py` 57/57；`check-docs.py` 通过。
 
 **未闭环**：工具循环剩余约 400 行（并发批次路径 + 审批/hook 拦截 + 工具执行本体与完成事件，17 处控制流），建议按「批量提交」「单工具执行」两刀继续；第 7 步「合段」需桌面手动验收窗口；macOS 侧本批提交仍待 CI 复核。
+
+## 39. macOS 侧复验第 2–38 节并修掉三处小瑕疵（2026-09-18）
+
+拉取 `57c9626` 后在本机 macOS 复验第 28–38 节的全部提交，结论：**平台分支均正确，无 macOS 回归**。
+
+- **平台条件分支逐个核对**：`ota_inputs.rs` 的 `cfg(unix)` 仍走 `mode(0o700)`（只是把 `mut` 收进分支消 Windows 告警）；`process.rs::probe_common_program` 由 `return None` 改为尾表达式 `None`，macOS 下 `cfg(not(windows))` 块仍是函数尾值；`version.rs` 的 `ENV_LOCK` 按 `cfg(not(windows))` 门控，macOS 侧照旧编译并使用；`media_tools.rs`/`harmony.rs` 的 `is_none_or`/`then_some`/`&Cow<str>` 为等价改写；Windows-only 的 `#[allow(clippy::permissions_set_readonly_false)]` 在 macOS 不参与编译，57/57 证明无 unknown-lint 噪声。
+- **抽取系列的平台无关性**：`commands/chat.rs` 内只有 `cfg(test)`，抽取 diff 未增删任何 `cfg(` 行，因此 20 个搬运提交不可能引入平台分歧；抽查第 34 节记录的「唯一非逐行搬运」——`route_round_outcome` 内部按同样表达式重算 `has_reasoning`/`has_native_tool_calls`，语义一致。
+- **macOS 实测**：后端库 **1,105 通过 / 0 失败 / 9 忽略**（+1 为第 28 节新增的 javac 参数钉定用例，+1 为本节新增的超时判定用例）、两组崩溃恢复各 3 项、`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过。
+- **修掉三处小瑕疵**（`8e040b0`）：① dart 门禁测试原先用 `reason.contains("超时")` 放行降级，会把恰好含该词的分析器 stderr 一并放过——超时文案改为单点生成（`timeout_reason`）、判定改为全等（`is_timeout_reason`），并补一条不需要 dart 的确定性用例覆盖正反例；② `.gitignore` 的 `temp-restore/`、`temp-verify/` 未锚定，会顺带忽略将来出现在源码目录里的同名目录，改为锚定仓库根；③ 状态页 §3 javac 行的「残留边界」已膨胀成表格单元里的整段文字，实测细节移回本节（§28），单元只留结论与指针。
+- **仍未覆盖**：Windows 质量矩阵、Windows 侧 1,102/8 与 57/57 只能引用其余机器证据；桌面主循环的行为等价在两平台都无自动化快照，合段（第 7 步）仍需真实桌面验收——但该批改动不涉平台分支，两平台跑同一段代码。
+
+文档口径更正：状态页 §1 的 macOS 库计数由 1,103 更正为 **1,105**（`58ba25a`、`8e040b0`）。
