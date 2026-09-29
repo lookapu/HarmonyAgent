@@ -92,6 +92,14 @@ pub fn parse_catalog_tree(text: &str) -> Result<Vec<CatalogDoc>, String> {
     for node in list {
         walk_catalog_node(node, &mut path, &mut out);
     }
+    // code:0 但目录为空不是合法状态（该目录树有数千篇），按失败处理。
+    // 返回 Ok(vec![]) 会让调用方建出空索引，随后所有模块静默退回 slug 猜测
+    // 且不留任何痕迹——与"接口失败"无法区分。调用方对 Err 的退路与空索引一致
+    // （harmony_api_ref.rs 的 Err 分支同样退回 slug 猜测），所以改成 Err 只是
+    // 多留一条 catalog_note，行为不变而故障可见。
+    if out.is_empty() {
+        return Err("目录树返回空列表（code=0 但 catalogTreeList 无有效条目）".to_string());
+    }
     Ok(out)
 }
 

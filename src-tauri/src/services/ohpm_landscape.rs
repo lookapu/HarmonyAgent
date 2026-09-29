@@ -362,7 +362,16 @@ pub async fn repo_url(package_name: &str) -> Result<Option<String>, String> {
         .await
         .map_err(|e| format!("查询 {package_name} 元数据失败：{e}"))?;
     if !resp.status().is_success() {
-        return Ok(None);
+        // 404 = 该包在仓库里不存在，"没有仓库地址"是对它唯一说得通的解释；
+        // 其余非成功状态（5xx / 3xx）= 仓库侧故障，与"包没有 repository 字段"
+        // 是两件事，原实现把两者都报成 Ok(None)，故障会被静默吞掉。
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        return Err(format!(
+            "查询 {package_name} 元数据失败：仓库返回 HTTP {}",
+            resp.status()
+        ));
     }
     let v: serde_json::Value = resp
         .json()
