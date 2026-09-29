@@ -54,17 +54,16 @@ pub fn snapshot(conversation_id: &str, path: &std::path::Path, old_content: &[u8
     }
 }
 
-/// 弹出最近一次快照（LIFO）。无快照时返回 None。
-pub fn pop_undo(conversation_id: &str) -> Option<Snapshot> {
-    table().undo_stacks.get_mut(conversation_id).and_then(|l| l.pop())
-}
-
 /// 弹出**最近 `count` 条中通过 `keep` 筛选的**快照（LIFO 顺序），不通过的原样留在栈里。
 ///
-/// 为什么不能「先 pop 再判断」：`undo_edit` 需要按会话可见根过滤（跨项目快照不可恢复），
-/// 而旧写法是 pop 出来发现越界就 `continue` —— 快照被**永久销毁**，用户那次撤销能力
-/// 凭空消失，而返回文案还告诉调用方「本会话尚无 Agent 文件写入记录」。
-/// 本原语让越界条目留在栈内（换个项目/根重绑后仍可撤销），并让调用方能如实报告跳过数。
+/// 为什么没有「先全 pop 再逐条判断」的写法：那会让被否决的条目**永久离开栈**。
+/// `fs_tools::undo_edit` 旧实现正是如此——快照 pop 出来发现路径不在会话可见根内就
+/// `continue` 丢弃，用户那次撤销能力凭空消失，而返回文案还告诉调用方
+/// 「本会话尚无 Agent 文件写入记录」。本原语让越界条目留在栈内
+/// （换个项目/根重绑后仍可撤销），并让调用方能如实报告跳过数。
+///
+/// ⚠️ 这是本模块**唯一**的弹栈入口。不要为了「省事」再加一个无条件 `pop` 版本——
+/// 那等于给同一个破坏性操作开出第二条没有护栏的路。
 pub fn pop_undo_filtered<F: Fn(&Snapshot) -> bool>(
     conversation_id: &str,
     count: usize,
@@ -122,11 +121,11 @@ mod tests {
         snapshot("t1", std::path::Path::new("/x/a.txt"), b"v1");
         snapshot("t1", std::path::Path::new("/x/b.txt"), b"v2");
         assert_eq!(undo_count("t1"), 2);
-        let s = pop_undo("t1").unwrap();
+        let s = pop_undo_filtered("t1", 1, |_| true).0.remove(0);
         assert_eq!(s.content, b"v2");
-        let s = pop_undo("t1").unwrap();
+        let s = pop_undo_filtered("t1", 1, |_| true).0.remove(0);
         assert_eq!(s.content, b"v1");
-        assert!(pop_undo("t1").is_none());
+        assert!(pop_undo_filtered("t1", 1, |_| true).0.is_empty());
     }
 
     #[test]
@@ -137,7 +136,7 @@ mod tests {
         }
         assert_eq!(undo_count("t2"), MAX_PER_SESSION);
         // 最老的被淘汰，最早可弹出的应是第 5 条之后的内容
-        let s = pop_undo("t2").unwrap();
+        let s = pop_undo_filtered("t2", 1, |_| true).0.remove(0);
         assert_eq!(s.content, &[(MAX_PER_SESSION + 4) as u8]);
     }
 
