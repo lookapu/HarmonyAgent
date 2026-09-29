@@ -132,7 +132,11 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
         crate::agent::recovery::requires_confirmation_global(&inv.ctx.run_id, tool);
     let sensitive_operation_forces_approval =
         permissions::requires_fresh_explicit_approval(tool, inv.args);
-    let is_write_tool = matches!(tool, "edit_file" | "write_file" | "delete_file");
+    // 「哪些工具会改工作区文件」只有一份清单（`verification_planner::is_mutation_tool`）。
+    // 这里原先自己抄了一份三个名字的（edit_file/write_file/delete_file），漏掉 multi_edit
+    // 与 lsp_rename——两者都会写工作区，却掉进下面的「非写工具直接放行」分支，
+    // 于是 first_write 模式对它们一次都不弹窗，而该模式的全部意义就是首次改文件前确认一次。
+    let is_write_tool = crate::agent::verification_planner::is_mutation_tool(tool);
     let needs_approval = if recovery_forces_approval || sensitive_operation_forces_approval {
         true
     } else if approval_mode_str == "first_write" && is_write_tool {

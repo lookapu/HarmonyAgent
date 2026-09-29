@@ -155,6 +155,13 @@ docs/postmortem/000N-<复发模式 slug>.md
   **这个条件对几乎任何含路径的 JSON 都恒真**，于是整段 args 被当成文件路径写进了产物。
   实测（修复前）：`artifacts[0].path` 与 `side_effects[0]` 都是那串 JSON 原文。
 
+  > **2026-09-29 更正**：本条当时把触发工具写成了 `apply_patch`，**而 `apply_patch` 根本不是注册工具**
+  > （证据见下方「工具名清单里的幽灵条目」）。触发源是当时构造的合成证据，生产里走不到。
+  > **但下面这个修复本身仍然承重**，触发源换成真实工具：任何**没有 path 类字段**的调用都会走 walk
+  > 空收，再撞上恒真的兜底——`web_fetch` 的 `{"url":"https://…/a.html"}`、`run_command` 的
+  > `{"command":"python -m pytest tests/"}` 都会把整段 JSON 当成文件路径。
+  > 错的是**理由**（点名了一个不存在的工具），不是**判据**（兜底确实过宽）。
+
   后果有两处：
   1. `side_effects` / `modifications` 对外披露的改动目标是假的；
   2. `acceptance::evaluate_contract` 的 `mutation_targets` 取自信封 `artifacts`，
@@ -184,7 +191,7 @@ docs/postmortem/000N-<复发模式 slug>.md
 
   `evaluate_contract` 用 `is_mutation` 定位 `last_mutation`，Verification 判据要求
   证据出现在 `last_mutation` **之后**。`multi_edit` 不被认成变更时，这个「最后」还停在
-  上一次 `edit_file`／`apply_patch`——于是**在 multi_edit 之前跑过的 `git_diff`／构建／
+  上一次 `edit_file`／`lsp_rename`——于是**在 multi_edit 之前跑过的 `git_diff`／构建／
   测试会被当成它之后的验证而放行**。模型改完文件不用再验证，验收照样通过。
 
   修复前后实测（同一序列 `edit_file(a.rs)` → `git_diff` → `multi_edit(b.rs, c.rs)`）：
@@ -204,6 +211,84 @@ docs/postmortem/000N-<复发模式 slug>.md
   **与前一条同源**：同一份判定写两遍就必然分叉，而分叉的后果发生在**下游闸门**上——
   两处都不报错、都不崩，只是各自安静地按自己的理解工作。
   这类缺陷靠读单个函数看不出来，必须把两个函数并排比。
+
+- **同一族的第五处：审批闸门也自己抄了一份写工具清单，`first_write` 模式形同虚设**。
+  `guards.rs::pre_approval` 里的
+  `is_write_tool = matches!(tool, "edit_file" | "write_file" | "delete_file")`
+  是第三份手写清单，漏掉 `multi_edit` 与 `lsp_rename`——两者都是注册工具，
+  ToolSpec 明写「副作用：修改项目内文件」，`is_mutation_tool` 也早把它们算作变更。
+
+  后果不是「少弹一次窗」，是**这个模式的核心承诺失效**。分支结构是：
+
+  ```
+  if recovery || sensitive_operations        -> true   （弹窗）
+  else if first_write && is_write_tool       -> !approved
+  else if first_write                        -> false  ← 非写工具直接放行
+  ```
+
+  `is_write_tool` 漏掉两个工具后，它们全部落进第三条 → `needs_approval = false` → 直接放行。
+  **用户特意选了最保守的权限模式，Agent 用 `multi_edit` 改工作区却一次都不确认。**
+  两条兜底臂都确认过不覆盖它们：`permissions::requires_fresh_explicit_approval`
+  只处理发布安全域（`ota_pack`/`sign_hap`/`secret_get` 等），
+  `recovery::requires_confirmation_global` 只在存在 AwaitConfirmation 恢复计划时才为真。
+
+  讽刺的是 `multi_edit` 正是项目自己推荐给模型用的编辑工具
+  （`errors.rs:310` 的「替换原文未找到」建议、`reflexion.rs` 的连续失败兜底都在引导它）。
+
+  修复前后实测（同一判据对同一组工具）：
+
+  | 工具 | 旧清单（是否弹窗） | 收敛后（是否弹窗） |
+  |---|---|---|
+  | `write_file` / `edit_file` / `delete_file` | true | true |
+  | `multi_edit` | **false** | true |
+  | `lsp_rename` | **false** | true |
+  | `run_command` | false | false ← 按设计仍免审（first_write 只管写文件） |
+
+  已修：`is_write_tool` 直接复用 `verification_planner::is_mutation_tool`，
+  与验收侧共用同一份真源。**这是收紧不是放宽**：多弹一次窗，方向朝安全侧。
+
+  **复发模式补充**：这一族前四次都发生在**验收**侧（判定「验证过没有」），
+  这次发生在**审批**侧（判定「该不该拦」）。同一个概念的清单会沿着调用链向下传染，
+  修完一处不等于修完这条链——`is_mutation_tool` 被 `acceptance` / `chat.rs` 复用之后，
+  下一个不知道它存在的人照样会在旁边新写一份。
+
+- **工具名清单里的幽灵条目：`apply_patch` 根本不是注册工具**。
+  它被当作写工具列在**五处判据**里（`verification_planner::is_mutation_tool`、
+  `context.rs` 两处缓存失效、`structured_result::argument_artifacts` 的 operation 映射、
+  `contracts::recovery_action`），但全仓核实：
+
+  - `TOOL_SPECS` 共 207 个工具，`name` 里含 `patch` 的**零个**；
+  - `run_tool` 没有 `"apply_patch" =>` 派发臂；
+  - 全树唯一叫 `apply_patch` 的函数是 `agent/eval_patch.rs::apply_patch`——
+    评测 harness 往 git 工作树里应用补丁，与工具目录无关；
+  - `chat.rs:12135` 里的 `"apply_patch"` 与 `"diff --git"`、`"*** begin patch"`
+    并列，是**压缩钉住用的文本特征**：模型可能在正文里吐出裸补丁，靠子串识别。
+  - 没有任何注册工具声明 `patch` 参数，因此
+    `verification_planner::patch_paths_from_args`（唯一调用方 `structured_result.rs:479`）
+    在生产里恒返回空——为幽灵工具写的解析路径走不到。
+
+  **直接后果**：为它写的修复是给幽灵治病的。上文「兜底分支把自己的输入当成了结论」
+  一条的 `patch_paths_from_args` 复用即属此类（该条已就地标注更正）。
+  运行时无害（死条目不改变任何判定），但它有两个真实代价：
+  1. 让人据此写下整段修复并以为验证过——本项目的 `4f1e746` 就是这么来的；
+  2. 让「6 个写工具」这个说法虚高，`is_mutation_tool` 自称**唯一真源**却含一个不存在的成员。
+
+  同一份文档里 `create_project` 早已被标注为「非注册工具，保留为防御性条目」，
+  说明这条纪律存在过，只是没被套用。
+
+  **复发模式**：给「某个工具的行为」写修复前，**先确认这个工具存在**。
+  在本项目里这是一条命令的成本：
+
+  ```
+  rg -o --no-filename 'name: "[a-z0-9_]+"' src-tauri/src/agent/tools/mod.rs | Sort-Object -Unique
+  ```
+
+  拿到的目录就是全集。**任何工具名清单（含 `is_mutation_tool` 这类自称真源的）
+  里的每个名字都应当在这份目录里查得到**；查不到的，要么删掉，要么注明是为
+  尚未注册的能力预留的防御性条目——不能两者都不说，让它看起来像已接线。
+
+  与「同一份判定写两遍必然分叉」互补：那一族是**同一概念出现多次**，
+  这一族是**同一清单里混进了不存在的东西**。共同点是都靠肉眼维护，都不报错。
 
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的

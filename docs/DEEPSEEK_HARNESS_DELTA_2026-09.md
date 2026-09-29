@@ -136,15 +136,21 @@
 
 `chat.rs` 记录文件列表时只认 `edit_file` / `write_file` 两个工具，
 而**同一时刻** `verification_planner` 把 `write_file / edit_file / delete_file /
-apply_patch / multi_edit / lsp_rename` 六个都算作变更。两份清单分叉的直接后果是：
-模型用 `apply_patch` 或 `multi_edit` 改的文件，**验收侧认为变了、交付给用户的那张
+multi_edit / lsp_rename` 五个都算作变更。两份清单分叉的直接后果是：
+模型用 `multi_edit` 或 `lsp_rename` 改的文件，**验收侧认为变了、交付给用户的那张
 清单里却没有**——而那张清单正是用户做最终验收的依据。
 
 已修：把这份清单收敛成 `verification_planner::is_mutation_tool` 单一真源，
-`chat.rs` 改用它，并复用同一套路径解析（`paths_from_args`，覆盖 `path`/`file`/`from`/`to`、
-`edits[]`、以及 `apply_patch` 的 `*** Update/Add/Delete File:` 与 `+++ b/` 补丁头）。
+`chat.rs` 改用它，并复用同一套路径解析（`paths_from_args`，覆盖 `path`/`file`/`from`/`to`
+与 `multi_edit` 的 `edits[]` 逐条）。
 顺带收紧一处：`write_file` 的 `content` 是整份文件正文，**不再**按补丁头扫描，
 否则写入内容里恰好出现 `+++ b/` 就会凭空造出一个假变更。
+
+> **2026-09-29 更正**：本节初稿把 `apply_patch` 也算进这六条，**而 `apply_patch` 根本不是
+> 注册工具**（`TOOL_SPECS` 207 个工具里没有它；全树唯一同名的 `eval_patch::apply_patch`
+> 是评测 harness 的函数）。真实清单是五个。差集不影响本节结论——`multi_edit` 确实是
+> 注册工具，分叉与后果都成立——但「六个」这个数字和据此写出的补丁头解析都是虚的，
+> 已一并清理。根因与核对方法见 [postmortem 的「工具名清单里的幽灵条目」](./postmortem/README.md)。
 
 
 ### 2.5 其他

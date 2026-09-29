@@ -209,8 +209,15 @@ fn same_path(left: &str, right: &str) -> bool {
 /// 必须认同一份清单：前者决定「这次任务要验证哪些文件」，后者是用户实际看到的
 /// 那张单子。两者一旦分叉，就会出现「验收认为改了 4 个文件、清单只列 1 个」，
 /// 而用户正是拿这张清单去做最终验收的。
+/// 审批侧（`tools::guards::pre_approval` 的 first_write 判定）同样复用本函数。
+///
+/// ⚠️ **加名字之前先确认它是个真工具**。`apply_patch` 在这里当过很久的写工具，
+/// 但 `TOOL_SPECS` 里从来没有它（全树唯一的同名函数是评测 harness 的
+/// `eval_patch::apply_patch`）——为它写的解析与修复全是死代码。
+/// 核对命令（输出即工具全集）：
+/// `rg -o --no-filename 'name: "[a-z0-9_]+"' src-tauri/src/agent/tools/mod.rs | Sort-Object -Unique`
 pub(crate) fn is_mutation_tool(tool: &str) -> bool {
-    matches!(tool, "write_file" | "edit_file" | "delete_file" | "apply_patch" | "multi_edit" | "lsp_rename")
+    matches!(tool, "write_file" | "edit_file" | "delete_file" | "multi_edit" | "lsp_rename")
 }
 
 fn changed_paths(evidence: &ToolEvidence<'_>) -> Vec<String> {
@@ -375,14 +382,22 @@ mod tests {
     }
 
     #[test]
-    fn patch_headers_define_verification_scope() {
-        let item = ToolEvidence {
-            tool: "apply_patch",
-            args: r#"{"patch":"*** Update File: src/lib.rs\n@@"}"#,
-            output: "ok",
-            succeeded: true,
-        };
-        assert_eq!(plan(&[item]).changed_files, ["src/lib.rs"]);
+    fn patch_headers_parse_from_args_and_never_override_named_target() {
+        // 直接测 paths_from_args，而不是经由某个工具名。
+        // 原用例挂在 `apply_patch` 上断言 changed_files，但 TOOL_SPECS 里从来没有
+        // apply_patch——那是评测 harness 的 eval_patch::apply_patch 的同名误认。
+        // 断言一条生产里走不到的路径，只会让「解析器可用」看起来像「接线正确」。
+        assert_eq!(
+            paths_from_args(r#"{"patch":"*** Update File: src/lib.rs\n@@"}"#),
+            ["src/lib.rs"]
+        );
+        // 补丁正文不该盖掉调用方已经给出的目标路径
+        assert_eq!(
+            paths_from_args(
+                r#"{"path":"real.rs","content":"*** Update File: ghost.rs\n"}"#
+            ),
+            ["real.rs"]
+        );
     }
 
     #[test]
