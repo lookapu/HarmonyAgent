@@ -27,12 +27,14 @@
 |---|---|---|
 | `score` | 当前 < 基线 − 0.05（5 个百分点） | fail |
 | `total_cases` | 当前 < 基线 × 0.95（覆盖缩水超 5%） | fail |
-| `duration_ms` | 当前 > 基线 × 1.5，且基线 ≥ 50 ms（过短基线不比较，避免机器噪声误报） | fail |
+| `duration_ms` | 当前 > 基线 × 2.5，且基线 ≥ 50 ms（过短基线不比较，避免机器噪声误报） | fail |
 | `tool_registry_digest` | 摘要变化（工具增删或描述变更） | warn |
 | `producer_version` | 应用版本变化 | warn |
 | `suite` | 套件名不一致（评测升级） | warn，且不再比较其余指标 |
 
 任意 `fail` 违规使测试退出非零并阻断合并；`warn` 只出现在日志中。工具集演进是正常开发行为，不允许让 CI 常红；评测套件升级时旧基线自动失效，由下一次 main 运行保存新基线。
+
+> `duration_ms` 的 2.5 倍容差是实测定的，不是随手放宽：CI 共享 runner 的墙钟抖动实测可达约 2 倍（329ms → 634ms），1.5 倍会把一次调度抖动误判成关键延迟回退。配套地，`ci_baseline_gate` 改为取多次运行的最优值——真实变慢（每次都慢）仍会被拦。改这个数字前先看 `src-tauri/src/agent/evals.rs` 里 `duration_factor` 的注释。
 
 ## 4. 本地复现
 

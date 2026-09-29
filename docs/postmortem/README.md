@@ -54,27 +54,68 @@ docs/postmortem/000N-<复发模式 slug>.md
 两篇都从 `CHANGELOG.md` 的既有记录反推，不是新编的事故。
 凡证据不足的判断一律写 `待补` 而不是补全——**缺口本身是信息**。
 
-### 待查的同构风险
+### 已核实并已修（2026-09-29）
 
-以下是**尚未核实的方向**，写在这里是为了下次有人踩到时能接上，不是结论。
+- **沙箱不可用被错分类**：`sandbox.rs` 把错误类型做成 `String` 前缀
+  （`sandbox_unavailable: …`，6 处），下游只能按关键词反推。探测超时的文案含「超时」，
+  于是 `classify_error` 报成 `TOOL_TIMEOUT` + 可重试、`is_retryable_err` 判为瞬态、
+  `run_command` 的建议还让模型「调大 timeout 参数」——而那 3s 是**后端探测**超时，
+  与命令超时无关，调大只会烧掉重试预算。其余变体（无原生后端 / AppContainer 未实现）
+  则落到 `TOOL_EXECUTION_FAILED`。**基础设施缺失被报成任务失败或命令超时，两种都导致错误决策。**
+  已修：`structured_result.rs` 增加 `SANDBOX_UNAVAILABLE` 分类臂（排在超时分支之前），
+  `errors.rs` 对 `sandbox_unavailable` 前缀短路可重试判断与建议分支。
 
-- **测试路径 ≠ 出货路径**：`chat.rs` 已 12000+ 行且有独立 `headless_driver` 路径。
-  两条路径的行为分叉需要独立验证——UI 路径测过不等于 headless 路径正确
-- **宽泛的错误包装抹掉结构化错误码**：`capability_broker.rs`（140KB）、
-  `sandbox.rs`（78KB）这类大模块的错误分类，是否还有被上层统一 catch 抹平的地方
-- **刷新断言基线在语义断言之前**：`evals.rs` / `eval_runner.rs` /
-  `EVALUATION_CI_GATES.md` 的期望产物是生成的，**生成顺序**决定了它能不能发现回归
-- **空跑断言**：`ohpm_search` / MCP instructions 两条外部链路，
-  断言的是"请求成功"还是"内容真实"（见 0002 末节）
-- **相对/绝对语义混用**：`0002` 同批修掉的另一个回归是 HTML→Markdown 的标签分支
-  把相对偏移当绝对下标用，转换陷入死循环。同一变量在不同分支语义不一致是一个类
-- **唯一约束下的别名占位**：兜底 slug 表里别名先占位会把真名挤出
-  `api_details.slug`（见 0002）
+### 已核实并证伪（风险面缩小）
+
+- **评测期望产物在断言前被刷新** —— **不成立**。`ci_baseline_gate` 的实际顺序是
+  run → 读基线 → `compare_with_baseline` → `assert!` → 才 `std::fs::write` 落基线；
+  `assert!` panic 会让测试在写之前中止，CI 里 IN == OUT 所以回退run无法自我祝福。
+  固定 fixture 由 `include_str!` 编译进二进制，**仓库里没有任何写入它们的代码路径**，
+  `git log -p` 也显示 5 次改动全是新增、没有一次把 `expected` 改成匹配既有运行。
+  另有更强的两道：16 个内核场景的 `expected` 被 `governance.rs` 钉到生产治理函数
+  `reliability_disposition()` 上（不是录制的 transcript），未知 id 落 `"unhandled"`
+  而 `reliability_gate` 要求 `score == 1.0`，无法通过。
+  **残留的窄口**（比原假设弱得多）：没有哨兵校验防止**人**手改 fixture 去匹配坏运行；
+  基线缺失时按设计跳过比较（CI 缓存被清空会静默关掉回归门禁）。
+
+- **大模块错误分类被统一 catch 抹平** —— **大部分不成立**。
+  `capability_broker.rs` 的审计 `reason` 是 snake_case 机器码而非散文
+  （`approval_scope_or_snapshot_failed` 等 6 种），`TOOL_POLICY_BLOCKED` 真实可达，
+  `KernelRunTermination` / `SandboxRunStatus` / `RecoveryAction` / `ToolErrorCategory`
+  都是真枚举，`ToolError.raw` 保留原串使沙箱前缀仍可读。全仓 `map_err(|_| …)` 扫描只命中
+  `strip_prefix` / `from_utf8` / 锁中毒 / `timeout` 这类内部错误本就不带类型的地方，
+  **没有丢弃已类型化错误种子的 `map_err(|_|)`**。唯一的真实缺口就是上面已修的沙箱那条。
+
+### 已核实，风险真实但项目自认未统一
+
+- **UI 与 headless 的循环分叉** —— **成立，且已开在文档里**，不是隐藏地雷。
+  `docs/HEADLESS_AGENT_DRIVER.md:16` 明写「它仍然不等价于 Tauri UI 的完整 Agent loop：
+  两个 adapter 已共享关键策略组件，但尚未由同一个 run-loop executor 驱动」，
+  `:474-476` 是未完成清单（流响应读取/停滞治理、消息历史、tool loop、reflexion、
+  governance、recovery 待抽取）。策略层（`kernel_loop.rs` / `kernel_history.rs`）
+  确实无 Tauri 依赖，共享是干净的；分叉只在**效果层**（事件、DB 写入、continue/break）。
+  评测侧 `harmony-agent` bin 在 `required-features = ["eval-cli"]` 之后，
+  走的是 headless/ProcessAgentDriver，**所以 CI 门禁量的是内核路径，不是桌面 UI 路径**。
+  收敛方向已在 Phase B-A 的切片表里排好，无需重新设计。
+
+### 已核实，仍未修（低影响，记录备查）
+
+- **`ohpm` registry 仓库地址**：`ohpm_landscape.rs:364-366` 对非 2xx 返回 `Ok(None)`，
+  与「该包没有 repository 字段」不可区分。唯一调用方是 Tauri command，
+  **没有 agent 工具用它**，影响面限于一个 UI 展示位。
+- **MCP「测试连接」**：空 `tools` 数组仍返回「连接成功 ✓ 未返回工具列表」——
+  文案本身如实披露了未返回工具列表，且传输失败会正常报错，**不打算改**
+  （零工具的 MCP server 是合法配置）。
+- **文档目录树空值**：`harmony_doc_api.rs:89-95` 在 `code:0` 但目录为空时返回
+  `Ok(vec![])`，随后 `harmony_api_ref.rs:1090` 静默退回 slug 猜测且不记错误。
+  这是 0002 那类形状的残留，但**行为与改为 `Err` 相同**（`Err` 也走 slug 猜测回退），
+  差别仅在于是否留痕。
 
 ### 外部对照
 
 DeepSeek Harness `docs/postmortem/` 四篇披露的复发模式，与本项目风险面重合度最高的两条
-（测试手工注入依赖导致无法复现、宽泛错误包装盖住结构化码）已列入上方待查项。
+（测试手工注入依赖导致无法复现、宽泛错误包装盖住结构化码）均已核实：
+后者在本项目基本不成立，前者的近亲（UI/headless 路径分叉）成立且项目自认。
 
 ---
 
