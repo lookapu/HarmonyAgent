@@ -176,6 +176,55 @@ docs/postmortem/000N-<复发模式 slug>.md
   `Ok(None)`，其余非成功状态改为 `Err` 并带 HTTP 状态码。唯一调用方是 Tauri command，
   错误通道本来就存在，不改签名。
 
+### 同一族扫描的收口：哪些闸门真的承重，哪些只是提示
+
+这一族四处已修之后，逐个把 postconditions 矩阵里的确认器重新核实了一遍，
+结论分三档。
+
+**① `postconditions::pending()` 是 display-only，不是闸门。**
+`execution_loop.rs:56` 只是把它存进快照，`directive()` 拼成提示文本，
+**从不影响 `acceptance.passed`、`stage` 或 `blockers`**（对比同文件 49-55 行：
+`pending_verification` 是会 push 进 blockers 的硬闸门）。
+承重的只有一条路径——`acceptance::evaluate_contract` 对
+Deploy / GitCommit / GitPush 三类判据走 `postconditions::criterion_evidence_indices`，
+它同样用 `verifier_confirmed`，返回 `None` 就清空 evidence → `passed=false` → **硬阻断**。
+所以 `verify_ui` 与 `get_app_info` 两处修复是通过这条路径生效的，
+判定它们「无效」会是错的；而挂在 `manage_memory` / `manage_knowledge` /
+`db_migrate` / `secret_store` / `http_request` 上的那些确认器，改成结论感知
+只是多一句提示，值不值得改要单独算，不能和前两者混为一谈。
+
+**② `search_knowledge` 查不到被当成写入已确认 —— 成立，但决定不改。**
+`memory_tools.rs:197` 在 0 命中时返回 `Ok("知识库中没有匹配「X」的条目。…")`，
+而它正是 `manage_memory` / `manage_knowledge` 的确认器，
+于是「查不到」被读成「写入已确认」——模型搜了个对不上的词就算交差。
+**但这条矩阵是 ① 里的 display-only**，改成「必须命中才算确认」会在
+`manage_memory action=delete|disable` 时变成永远满足不了的提示
+（条目已删/已禁用，再搜必然搜不到），把一个提示问题换成死循环。**记为待评估项。**
+
+**③ 硬路径上的其余确认器全部核实为正确。**
+`git_status` 的 `branch` 与 `status` 两条 `run_cmd` 分支都用 `?` 传播错误
+（`git_tools.rs:40,45`），`git_diff` 同理（`:68-70`），因此在非 Git 仓库里
+exit code 非零 → `Err` → 不进 `is_global_verifier`。
+`run_tests` / `build_project` / `build_generic` 已在前一条记过。
+`db_query`（0 行是合法的 schema 确认）、`secret_get`（掩码值仍确认存在）、
+`read_runtime_logs`（部署后暂无日志是合法观测）按原样保留——
+这三个若按「必须有非空结果」收紧都会造成误阻断。
+
+### 顺带自检：上一轮新增的判据不会被输出落盘改写
+
+结论感知判据读的是 `item.output`，而 `guards.rs::post_spill` 在输出超过
+`SPILL_THRESHOLD = 20_000` 字符时会把结果**换成 head+tail 预览**——
+如果触顶，`run_lint` 的「错误 (error)：N」和 `check_code` 的规则分组都会被抹掉，
+新判据就会永远匹配不上、把必需步骤变成永久阻断。核对两侧上限后确认**不会触发**：
+`check_code` 被 `scanner::cut` 封在 15_000，`run_lint` 报告最多列 50 条问题，
+都远低于 20_000。
+
+同时确认「输出被截断一律不算通过」这条**不是理论防御而是承重的**：
+`scanner::RULES` 里唯一的高危规则 `hardcoded-secret` 排在**第三位**
+（前两条 `debug-log`、`todo-mark` 都是 Info），
+在 console.log / TODO 较多的仓库里，它确实会被 15_000 的**头部**截断整段吃掉。
+所以「没看到高危」在这种仓库里真的可能是假的，该拦。
+
 ### 已核实并证伪（风险面缩小）
 
 - **评测期望产物在断言前被刷新** —— **不成立**。`ci_baseline_gate` 的实际顺序是
