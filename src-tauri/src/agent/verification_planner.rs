@@ -256,17 +256,40 @@ pub(crate) fn paths_from_args(args_raw: &str) -> Vec<String> {
         let Some(text) = args.get(key).and_then(|value| value.as_str()) else {
             continue;
         };
-        for line in text.lines() {
-            let path = line.strip_prefix("*** Update File: ")
-                .or_else(|| line.strip_prefix("*** Add File: "))
-                .or_else(|| line.strip_prefix("*** Delete File: "))
-                .or_else(|| line.strip_prefix("+++ b/"));
-            if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
-                paths.push(path.to_string());
-            }
-        }
+        paths.extend(patch_header_paths(text));
     }
     paths
+}
+
+/// 从 `apply_patch` 的补丁正文里取 `*** Update/Add/Delete File:` 与 `+++ b/` 后的路径。
+///
+/// 单独成函数是因为结构化结果信封（`structured_result::argument_artifacts`）也要用同一套
+/// 补丁头解析：它原先只认「键名里带 path/file」的字段，而 `patch` 两个条件都不满足，
+/// 于是 `apply_patch` 一次都产不出产物，最后落到「把整段 args 当路径」的兜底，
+/// 写进 `side_effects` 与读回校验目标的是一段 JSON 原文。
+pub(crate) fn patch_paths_from_args(args_raw: &str) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(args_raw) else {
+        return Vec::new();
+    };
+    let Some(text) = args.get("patch").and_then(|value| value.as_str()) else {
+        return Vec::new();
+    };
+    patch_header_paths(text)
+}
+
+fn patch_header_paths(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            line.strip_prefix("*** Update File: ")
+                .or_else(|| line.strip_prefix("*** Add File: "))
+                .or_else(|| line.strip_prefix("*** Delete File: "))
+                .or_else(|| line.strip_prefix("+++ b/"))
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn deleted_paths(evidence: &ToolEvidence<'_>) -> Vec<String> {

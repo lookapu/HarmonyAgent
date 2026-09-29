@@ -434,6 +434,23 @@ fn first_line(output: &str) -> String {
         .collect()
 }
 
+/// 原始参数本身就是一条路径（少数工具接受裸路径串而不是 JSON 对象）。
+///
+/// **显式排除 JSON 形态**：结构化调用里没有路径字段，含义是「这次没碰文件」，
+/// 不是「路径是这段 JSON」。原来的兜底条件（参数里含斜杠或带扩展名）对 JSON 原文
+/// 恒真，于是 `apply_patch` 会把 `{"patch":"*** Update File: src/lib.rs\n…"}` 整段
+/// 当成文件写进 `side_effects` 与 `modifications`，
+/// 而 `acceptance` 的读回校验拿它去和真实 `read_file` 路径比对，永远匹配不上。
+fn looks_like_bare_path(args: &str) -> bool {
+    let text = args.trim();
+    !text.is_empty()
+        && text.chars().count() <= 1024
+        && !text.contains('{')
+        && !text.contains('"')
+        && !text.contains('\n')
+        && (text.contains('/') || text.contains('\\') || text.rsplit_once('.').is_some())
+}
+
 fn argument_artifacts(tool: &str, args: &str) -> Vec<ArtifactEvidence> {
     fn walk(value: &serde_json::Value, key: &str, out: &mut Vec<String>) {
         match value {
@@ -453,12 +470,14 @@ fn argument_artifacts(tool: &str, args: &str) -> Vec<ArtifactEvidence> {
         }
     }
     let mut paths = Vec::new();
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
-        walk(&value, "", &mut paths);
+    let parsed = serde_json::from_str::<serde_json::Value>(args).ok();
+    if let Some(value) = &parsed {
+        walk(value, "", &mut paths);
     }
-    if paths.is_empty()
-        && (args.contains('/') || args.contains('\\') || args.rsplit_once('.').is_some())
-    {
+    // `patch` 键既不含 "path" 也不含 "file"，walk 收不到；补丁头解析与验证计划共用一份。
+    // 少了这一步，apply_patch 会落到下面的兜底，把整段 args 当成文件路径。
+    paths.extend(crate::agent::verification_planner::patch_paths_from_args(args));
+    if paths.is_empty() && looks_like_bare_path(args) {
         paths.push(args.trim().to_string());
     }
     paths.sort();

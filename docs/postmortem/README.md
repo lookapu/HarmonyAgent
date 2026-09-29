@@ -147,6 +147,33 @@ docs/postmortem/000N-<复发模式 slug>.md
   同文件的 `sample_battery_percent` 早就用 `.ok_or_else(|| "未读取到有效电量")`
   堵过同一类空读，这次是把同一口径补到 `get_app_info` 上。
 
+- **兜底分支把自己的输入当成了结论**：`structured_result::argument_artifacts` 解析工具
+  产物路径时，先用一个 `walk` 递归找出「键名里含 `path` 或 `file`、或键名正好是 `hap`」
+  的字符串值。`apply_patch` 的参数是 `{"patch":"*** Update File: src/lib.rs\n…"}`，
+  而 `"patch".contains("path")` 是 **false**（第 4 位是 `c` 不是 `h`），于是 walk 一个路径都收不到。
+  接着落到兜底：`args.contains('/') || args.contains('\\') || args.rsplit_once('.').is_some()`。
+  **这个条件对几乎任何含路径的 JSON 都恒真**，于是整段 args 被当成文件路径写进了产物。
+  实测（修复前）：`artifacts[0].path` 与 `side_effects[0]` 都是那串 JSON 原文。
+
+  后果有两处：
+  1. `side_effects` / `modifications` 对外披露的改动目标是假的；
+  2. `acceptance::evaluate_contract` 的 `mutation_targets` 取自信封 `artifacts`，
+     读回校验拿这个假路径去和真实 `read_file` 路径比对，**永远匹配不上**——
+     于是「`apply_patch` 改文件 + 读回验证」这条路径无法满足 Verification 判据
+     （只有先跑过构建/测试/`git_diff` 走全局验证器那条分支才能绕开）。
+
+  已修：补丁头解析抽成 `verification_planner::patch_paths_from_args` 共用（`paths_from_args`
+  本来就有这套解析，两处各写各的才会分叉）；兜底条件改为 `looks_like_bare_path`，
+  **显式排除 JSON 形态**（含 `{` / `"` / 换行，或超长）。
+
+  **复发模式**：兜底分支必须先回答「输入会不会其实是别的东西」。
+  原兜底想表达的是「参数本身就是一个裸路径串」，
+  但它实际也覆盖了「参数是结构化对象、只是没有路径字段」——
+  **而这两种情况的含义恰好相反**：前者是「路径 = 整段参数」，
+  后者是「这次没碰文件」。前者产出正确结果，后者产出假证据。
+  判据写成「含斜杠」这类**对宽松输入恒真**的形状时，
+  兜底就会在它最不该触发的地方触发。
+
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
   是无分隔符的裸词 `build` / `test`。于是
