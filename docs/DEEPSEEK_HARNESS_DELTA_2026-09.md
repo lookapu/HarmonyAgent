@@ -275,16 +275,44 @@ if (framedSummaryTokenCount >= prepared.shadowedRouteTokenCount) {
 
 ## 七、建议动作（复核后）
 
-| # | 动作 | 状态 |
-|---|---|---|
-| 1 | 补压缩切点配对规则 | ❌ **作废** —— 已实现且更细（§六） |
-| 2 | 补"摘要必须比被替换内容便宜" | ✅ 已实现（§4.1） |
-| 3 | 抄持久化变更判定表 | ✅ 已落 `docs/PERSISTENCE_CHANGE_RULES.md`（§2.1） |
-| 4 | 审 `guards.rs` 审批路径 | ✅ 已审：顺序无漏洞；发现一处反向 fail-open（§3） |
-| 5 | 建 `docs/postmortem/` | ◐ 目录+模板已建，事故条目待团队提供（§5.2） |
-| 6 | 刷新 `references/deepseek-harness` | ✅ 已到 `0.2.0-rc.1` |
-| 7 | 评估 SSH 执行世界适配远程设备调试 | ⬜ 注意 E2B 前车之鉴（§2.2） |
-| 8 | `deliverables/workspace-changes` 变更卡 | ⬜ 中等成本（§2.4） |
+**状态列于 2026-09-29 逐条核实**：不是照抄初版判断，而是对每条动作回到仓库确认产物存在、
+改动落地。写清"怎么核的"，是为了让下一位读者能自己重核而不是只能相信这张表。
+
+| # | 动作 | 状态（2026-09-29 核实） | 核实方式 |
+|---|---|---|---|
+| 1 | 补压缩切点配对规则 | ❌ **作废** —— 已实现且比上游更细（§六） | 实读 `summarize_rolling_history`：`PAIR_LOOKBACK=8` + 窗口起点孤立结果丢弃 + 跨度表 + head/tail 四向配对平衡吸附 |
+| 2 | 补"摘要必须比被替换内容便宜" | ✅ 已实现 | `shadowed_chars` 计量 + 断言，失败记 `context_summary_not_smaller` |
+| 3 | 抄持久化变更判定表 | ✅ 已落 | `docs/PERSISTENCE_CHANGE_RULES.md` 存在 |
+| 4 | 审 `guards.rs` 审批路径 | ✅ 已审；**§3.2 的建议已部分落地** | 见下方处置说明 |
+| 5 | 建 `docs/postmortem/` | ✅ **已完成**（初版写的"待团队提供"已过时） | 目录 + 模板 + 2 篇事故条目，均从 `CHANGELOG.md` 既有记录反推，非新编 |
+| 6 | 刷新 `references/deepseek-harness` | ✅ | `dsh-v0.2.0-rc.1` / `4878cdabd8`（2026-09-28） |
+| 7 | 评估 SSH 执行世界适配远程设备调试 | ⬜ **仍未评估** | 无产物 |
+| 8 | `deliverables/workspace-changes` 变更卡 | ⬜ **仍未做** | 无产物 |
+
+### §3.2 那处反向 fail-open 的处置
+
+初版给的是二选一："改成拒绝，**或**至少留一条显式注释"。**实际取了弱的那个，
+且是有意识地取的**：`guards.rs:111-117` 现在带完整注释（当前为何安全、
+headless 接入 `ToolCtx` 前必须改成拒绝）加一条 `approval_bypassed_no_app_handle`
+日志，把静默默认变成可见事件。**行为零变化**——`ToolCtx::empty()` 没有审批 UI 是
+真实现状而非漏洞，改 deny 会直接打断离线/测试执行。
+强选项（改 deny）留作 headless 接线的前置动作，不适合现在做。
+
+### 初版报告之后的追加工作（不来自上游对照）
+
+初版之后又做了一轮**项目内自查审计**，与 deepseek-harness 无关。
+列在这里是为了不让它从索引里消失——它已经改了 10 余个 commit，
+但来源是本仓库自身的验收闸门缺陷，不是对照结论：
+
+- **「工具跑成功」被当成「验证出好结果」**——`verify_ui` / `run_lint` / `check_code` /
+  `get_app_info` / `run_command` 五处同族缺陷，全部已修。其中 `run_lint` 与
+  `check_code` 是 `required: true` 的必需验证步骤。
+- **验收证据可被命令行措辞伪造**——`acceptance.rs` 的 `is_command` 按整段参数子串匹配，
+  `git commit -m "fix build"` 能顶掉构建判据。
+- 沙箱不可用被错分类成超时并给出"调大 timeout"的错误建议；压缩摘要闸门；
+  ohpm / 鸿蒙文档接口的空值不吞。
+
+逐条机制与取舍见 `docs/postmortem/README.md`（该目录的"已核实并已修"一节）。
 
 **不建议**：跟 Cordis DI、seam 三件套、v0→v4 多代迁移、`!!js` 表达式
 （他们自己因此出过事故 postmortem 0002）。
@@ -300,3 +328,10 @@ if (framedSummaryTokenCount >= prepared.shadowedRouteTokenCount) {
 - 本项目 `chat.rs` `summarize_rolling_history`（12064-12365）、`guards.rs`、`exec_ctx.rs`：实读
 - 工具循环 / 审批安全 / 上下文与子 agent / 组合与工程实践：4 个只读子代理并行深挖
 - `cargo check` 通过（9.70s）
+
+**§七 状态列的复核（2026-09-29）**：`docs/PERSISTENCE_CHANGE_RULES.md`、
+`docs/postmortem/0001-*.md`、`0002-*.md` 三个文件实测存在；
+`references/deepseek-harness` 实测 `git describe` = `dsh-v0.2.0-rc.1`、
+HEAD = `4878cdabd8`（2026-09-28）；`guards.rs:111-117` 的注释与
+`approval_bypassed_no_app_handle` 日志实读确认。#7 / #8 无任何产物，如实标 ⬜。
+
