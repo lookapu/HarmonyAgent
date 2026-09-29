@@ -940,3 +940,17 @@ v2.2.0 发版把代码真放到 macOS + Windows 双平台 CI 上跑，暴露三�
 **验证**（Windows 本机）：`cargo test --locked` 全绿（库 1,139 / 0、契约 2、两组崩溃恢复各 3）；`check-warnings.py` 57/57（新测试文件未新增告警）；`check-docs.py` 通过。
 
 **未闭环**：名字级接线已钉住，但**运行时的真实点击**（prop 传递 + 按钮到命令的整条路径）仍只能由桌面验收确认；测试只覆盖字面量调用，动态拼名（当前没有）不受保护。
+
+## 59. 合段第 1-3 步：主循环收成一次调用（本机 Windows，`45e897a`）
+
+第 59 批：前面六刀把 14 个段函数的签名统一了，但 round 体本身仍然内联在 `stream_chat_inner` 的 `'outer: loop` 里——259 行、11 处 `break`/`continue`、3 处提前 return 靠手写控制流驱动。本批把它搬进 `desktop_round`，主循环降到 **42 行**，只负责调用与分派。
+
+- **`RoundOutcome` 是三变体，不是计划里写的两变体**：原循环体有两处 `return Ok(())`（轮前 `PreRoundPermit::Cancelled`、轮后 `PostRoundOutcome::Stopped`），它们从 `stream_chat_inner` 直接返回，**跳过循环后的 `finalize_run`**（证据驱动验收 + 账本最终态）。照原计划只分 `ContinueRound`/`Finish` 的话，这两处会被并进 `Finish`，于是**每次取消都会多跑一次收尾**。加 `Stop` 变体、主循环侧 `Stop => return Ok(())`，两条路径才保持分开。
+- **`DesktopRoundContext<'a>` 收 25 个只读量**（app/state/cancel/approval/plan_review/registry/client/protocol/provider/opts/各 id/execution_budget/mcp/system_prompt 等），进入函数时解构成**与原作用域同名的局部量**，因此主体能逐行沿用原标识符。三个**可变**量（`stats` / `model_choice` / `kernel_executor`）仍走显式参数——它们不是轮状态，`&mut` 字段会让结构本身不变、把借用期拉到与结构同长，正是第二刀踩过的坑。
+- **搬移用脚本而非手打**：257 行主体按字节原样复制，每处替换以「缩进 + 原文完全匹配」为前提，不匹配即中止，避免手抄引入偏差。
+- **保真度可机械验证**：搬完把新函数体与原循环体逐行比对，**257 行中 36 行有差异，归因只有两类**——① **13 行控制流**（设计内：11 处 `break`/`continue` → `return Ok(RoundOutcome::X)`，2 处提前 return → `Stop`；末尾 match 两分支按 clippy 建议去 `return` 改为尾表达式）；② **23 行借用形态**（局部量从自有值 `T` 变成 `&T`/`&mut T` 后，原有的 `&trace_id`、`&mut round_state` 等成了多余重借用，语义恒等）。这 23 行让 clippy 从 57 涨到 **83 而 FAIL**，用 rustc 的 machine-applicable suggestion **两轮修到 57/57**，**未抬基线**。
+- **先建基线这一步是值的**：`agent::eval_runner::tests` 的 4 条用例把 grader 程序硬编码成 POSIX `grep`、经 PATH 解析，GitHub `windows-latest` 镜像恰好带 `Git\usr\bin` 才绿；本机首跑直接 `grader 启动失败：program not found`，1162/4 失败。**不是产品缺陷**（eval 侧按清单声明启动 grader，行为正确），是用例把平台工具写死。临时把 `Git\usr\bin` 加入 PATH 后 9 条 `eval_runner` 全过、回到 1,166/0/10。**只记录未修**。
+
+**验证**（Windows 本机，与搬移前基线逐位一致）：后端库 **1,166 通过 / 0 失败 / 10 忽略**；两组 crash E2E 各 3 项；`frontend_backend_contract` 2 项；`cargo check --lib` 0 告警；`check-warnings.py` **57/57 未新增**；`check-docs.py` 通过。前端未改动故未重跑（基线已 133 通过）。
+
+**未闭环**：第 7 步只剩**第 4 步切 `run(port)`** 与**桌面验收**。第 4 步改的是运行路径而非搬文本，按风险约定单独成提交、单独验收；桌面验收窗口本机已具备（绿色版可构建可运行，`target/release/deveco-switch.exe` 与 `portable-build/` 均在最后一次提交后重新产出过，库与 `symbol_cache` 也有真实写入痕迹），但这**不构成行为快照**——第 19 节实测否掉的 Tauri 测试替身路线仍然有效，该验收只能由人在运行的应用里做。
