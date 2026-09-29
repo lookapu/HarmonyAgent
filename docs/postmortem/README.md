@@ -382,6 +382,44 @@ docs/postmortem/000N-<复发模式 slug>.md
   分层上 `services` → `crate::agent` 已有先例（`team_sharing` / `reproduction_bundle`
   等 5 处），不新增依赖方向。
 
+- **写文件不变式只接了 fs 侧，LSP 写路径整条绕开**：`agent::invariants` 的模块文档写着
+  「环境约束 > Prompt 约束——写文件前必须满足的硬性不变式…**全部写路径自动生效，
+  无需改动各调用点**」。核实后发现：真正调用 `check_write` 的 6 处**全在 `fs_tools.rs`**
+  （`write_file` / `edit_file` / `delete` / `move` / `copy` / `multi_edit`），
+  `lsp_client.rs` **一处都没有**——整个模块没有任何 `check_write` / `is_protected_file` /
+  保护名单，而它的唯一落盘点 `apply_text_edits`（`std::fs::write` 全模块只出现这一次）
+  是**无条件写盘**。
+
+  于是 `lsp_rename` / `lsp_format` / `format_file` / `lsp_code_action` 全部可以改
+  `.env*`、`.key|.pem|.pfx|.p12` 与已应用的迁移 SQL——而 `invariants.rs:4` 那行注释
+  恰恰把覆盖范围写成了 `write_file/edit_file/delete/move/copy/multi_edit`，
+  读的人只会以为「名单之外的都是 LSP，本来就不归它管」，
+  不会意识到那句「全部写路径自动生效」是假的。
+
+  修复前后实测（真实 `apply_text_edits` 调用，对一个含 `TOKEN=old` 的 `.env` 施加文本编辑）：
+
+  | | 结果 |
+  |---|---|
+  | 修复前 | 写入**成功返回 Ok**，`.env` 内容被改（`unwrap_err` 直接 panic） |
+  | 修复后 | 返回 `写入被安全策略拒绝（secrets_env 不变式）：…`，文件内容原样 |
+
+  已修：在 `apply_text_edits` 落盘前接 `check_write`。选这一处而不是四处各接，
+  因为它是 LSP 写路径的**唯一收口**（`apply_workspace_edit` 的 4 个调用点全经它）。
+  同时确认正常文件仍放行并真正写入（`var a = 1` → `var b = 1`），没有误伤。
+
+  **与上面「写前门禁」的既有说明区分开**：`apply_text_edits` 里早就有
+  `validate_code_mutation`（校验**候选文本**的括号配平 / Tree-sitter），
+  容易误以为「写前门禁已覆盖」。那是**文本合法性**，这一条是**目标文件该不该被改**，
+  两道不同的门，缺一不可。
+
+  **复发模式**：**闸门的「覆盖范围」是一个会被文档固化、却没人复核的断言。**
+  「新增一条不变式 = 往 INVARIANTS 追加，全部写路径自动生效」这句话，
+  让后来人以为覆盖是自动维持的——而**接入点是手工的**。
+  正确写法是把接入点显式列出来并在文档里点名文件（本轮已改）：
+  新增任何能落盘的工具时，必须在它的落盘点补一次 `check_write`。
+  **判据：宁可写「已接入的写路径是 A/B/C」，也不要写「全部写路径」。**
+  覆盖率这种断言一旦写「全部」，就再也没人会去数。
+
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
   是无分隔符的裸词 `build` / `test`。于是

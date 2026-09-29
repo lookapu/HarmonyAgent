@@ -1,7 +1,14 @@
 //! 文件操作不变式注册表（对齐 deepseek-harness invariants 子系统）：
 //! 环境约束 > Prompt 约束——写文件前必须满足的硬性不变式。
-//! 新增不变式 = 往 INVARIANTS 追加一条（name + 检查函数），全部写路径自动生效，
-//! 无需改动各调用点（write_file/edit_file/delete/move/copy/multi_edit 统一经 check_write 拦截）。
+//! 新增不变式 = 往 INVARIANTS 追加一条（name + 检查函数），已接入的写路径自动生效，
+//! 无需再逐个改检查内容（write_file/edit_file/delete/move/copy/multi_edit 经
+//! fs_tools::is_protected_file，lsp_rename/lsp_format/format_file 经
+//! lsp_client::apply_text_edits）。
+//!
+//! ⚠️ 但**接入点仍要手工覆盖**——「新增一条不变式」与「多接一条写路径」是两件事。
+//! 本模块原先写着「全部写路径自动生效，无需改动各调用点」，而 LSP 写路径一个都没接，
+//! 于是 `lsp_format` 改 `.env` 之类的文件绕开了整道闸门，而那句话让人以为不必查。
+//! **新增任何能落盘的工具时，必须在它的落盘点补一次 `check_write`。**
 
 use std::path::Path;
 

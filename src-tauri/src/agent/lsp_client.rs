@@ -984,6 +984,19 @@ fn apply_edits_to_text(text: &str, edits: &[Value]) -> (String, usize, usize) {
 /// 应用 TextEdit 列表到文件（按位置倒序应用，行号不会因前面的编辑漂移）。
 /// 写盘前记录 undo 快照（可 undo_edit 回退）。返回 (新增字符数, 删除字符数)。
 fn apply_text_edits(path: &Path, edits: &[Value], conversation_id: &str) -> Result<(usize, usize), String> {
+    // 文件级保护不变式（.env* / .key|.pem|.pfx|.p12 / 已应用的迁移 SQL）。
+    // fs 侧 6 处写路径都经 `invariants::check_write` 拦截，本模块原先**一处都没有**，
+    // 而 invariants 的模块文档写着「全部写路径自动生效，无需改动各调用点」——
+    // 那句话对 LSP 路径是假的。本函数是 lsp_client 里**唯一**的落盘点
+    // （`std::fs::write` 全模块只出现这一次），lsp_rename / lsp_format /
+    // format_file / lsp_code_activation 全部经 apply_workspace_edit 走到这里，
+    // 所以加在这一处即覆盖全部 LSP 写路径。
+    //
+    // 与上面的 `validate_code_mutation` 是**两道不同的门**：那一条校验候选文本
+    // （括号配平 / Tree-sitter），这一条校验**目标文件本身该不该被改**。
+    if let Some((invariant, reason)) = crate::agent::invariants::check_write(path) {
+        return Err(format!("写入被安全策略拒绝（{invariant} 不变式）：{reason}"));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let (out, add, del) = apply_edits_to_text(&text, edits);
