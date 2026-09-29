@@ -420,17 +420,21 @@ pub async fn vuln_scan(
     let scan_ohpm = source == "all" || source == "ohpm";
     let scan_cargo = source == "all" || source == "cargo";
     let scan_uv = source == "all" || source == "uv";
+    // 与 license_check 共用 read_dep_file：存在却读不动的清单文件必须单独记，
+    // 否则「文件全读不动」会走到下面的 `found.is_empty()` 分支，
+    // 给一次**根本没跑**的安全扫描打上「✅ 未发现已知漏洞」。
+    let mut unreadable: Vec<String> = Vec::new();
+    let mut scanned_sources: Vec<&str> = Vec::new();
 
     if scan_ohpm {
         let lock = base.join("oh-package-lock.json5");
-        if lock.exists() {
-            if let Ok(text) = std::fs::read_to_string(&lock) {
-                for line in text.lines() {
-                    if let Some((name, ver)) = parse_dep_line(line) {
-                        for (vn, vprefix, sev, desc) in &known {
-                            if name == *vn && version_lt(&ver, vprefix) {
-                                found.push(("ohpm".into(), name.clone(), ver.clone(), (*sev).into(), (*desc).into()));
-                            }
+        if let Some(text) = read_dep_file(&lock, &mut unreadable) {
+            scanned_sources.push("ohpm");
+            for line in text.lines() {
+                if let Some((name, ver)) = parse_dep_line(line) {
+                    for (vn, vprefix, sev, desc) in &known {
+                        if name == *vn && version_lt(&ver, vprefix) {
+                            found.push(("ohpm".into(), name.clone(), ver.clone(), (*sev).into(), (*desc).into()));
                         }
                     }
                 }
@@ -439,29 +443,22 @@ pub async fn vuln_scan(
     }
     if scan_cargo {
         let lock = base.join("Cargo.lock");
-        if lock.exists() {
-            if let Ok(text) = std::fs::read_to_string(&lock) {
-                for line in text.lines() {
-                    if line.trim().starts_with("name = ") || line.trim().starts_with("version = ") {
-                        // 简单占位解析（实际逻辑在下方 block 维护 last_name / last_version）
-                        let _ = extract_toml_string(line);
-                    }
-                }
-                // 用更稳的解析：按行扫，name + version 配对
-                let mut last_name = String::new();
-                for line in text.lines() {
-                    if let Some(eq) = line.find('=') {
-                        let key = line[..eq].trim();
-                        if let Some(val) = extract_toml_string(line) {
-                            if key == "name" { last_name = val; }
-                            else if key == "version" && !last_name.is_empty() {
-                                for (vn, vprefix, sev, desc) in &known {
-                                    if last_name == *vn && version_lt(&val, vprefix) {
-                                        found.push(("cargo".into(), last_name.clone(), val.clone(), (*sev).into(), (*desc).into()));
-                                    }
+        if let Some(text) = read_dep_file(&lock, &mut unreadable) {
+            scanned_sources.push("cargo");
+            // 按行扫，name + version 配对
+            let mut last_name = String::new();
+            for line in text.lines() {
+                if let Some(eq) = line.find('=') {
+                    let key = line[..eq].trim();
+                    if let Some(val) = extract_toml_string(line) {
+                        if key == "name" { last_name = val; }
+                        else if key == "version" && !last_name.is_empty() {
+                            for (vn, vprefix, sev, desc) in &known {
+                                if last_name == *vn && version_lt(&val, vprefix) {
+                                    found.push(("cargo".into(), last_name.clone(), val.clone(), (*sev).into(), (*desc).into()));
                                 }
-                                last_name.clear();
                             }
+                            last_name.clear();
                         }
                     }
                 }
@@ -471,14 +468,13 @@ pub async fn vuln_scan(
     if scan_uv {
         // pip 锁定文件 requirements.txt with ==
         let req = base.join("requirements.txt");
-        if req.exists() {
-            if let Ok(text) = std::fs::read_to_string(&req) {
-                for line in text.lines() {
-                    if let Some((name, ver)) = parse_dep_line(line) {
-                        for (vn, vprefix, sev, desc) in &known {
-                            if name.eq_ignore_ascii_case(vn) && version_lt(&ver, vprefix) {
-                                found.push(("uv".into(), name.clone(), ver.clone(), (*sev).into(), (*desc).into()));
-                            }
+        if let Some(text) = read_dep_file(&req, &mut unreadable) {
+            scanned_sources.push("uv");
+            for line in text.lines() {
+                if let Some((name, ver)) = parse_dep_line(line) {
+                    for (vn, vprefix, sev, desc) in &known {
+                        if name.eq_ignore_ascii_case(vn) && version_lt(&ver, vprefix) {
+                            found.push(("uv".into(), name.clone(), ver.clone(), (*sev).into(), (*desc).into()));
                         }
                     }
                 }
@@ -488,8 +484,26 @@ pub async fn vuln_scan(
 
     let mut out = String::new();
     out.push_str(&format!("依赖漏洞扫描报告（来源：{source}，路径：{}）\n", base.display()));
+    if !unreadable.is_empty() {
+        out.push_str(&format!(
+            "⚠️ 本次扫描不完整：以下 {} 个依赖清单存在但读取失败，其依赖**未纳入**本次漏洞比对：\n  {}\n",
+            unreadable.len(),
+            unreadable.join("\n  ")
+        ));
+    }
     if found.is_empty() {
-        out.push_str("✅ 未发现已知漏洞（基于内置小型漏洞库；生产建议接 OSV / NVD 实时数据）\n");
+        // 「扫过了确实没有」与「没扫成」必须分开。清单全读不动时，
+        // 旧实现照样打 ✅，等于给一次没跑的安全扫描发合格证。
+        if scanned_sources.is_empty() {
+            out.push_str("❌ 未扫描任何依赖清单（oh-package-lock.json5 / Cargo.lock / requirements.txt 均不存在或不可读），\
+                          本次**没有得出任何安全结论**，请确认依赖已安装并生成锁文件后重试。\n");
+        } else {
+            out.push_str(&format!(
+                "✅ 已比对 {} 类清单（{}），未发现已知漏洞（基于内置小型漏洞库；生产建议接 OSV / NVD 实时数据）\n",
+                scanned_sources.len(),
+                scanned_sources.join(" / ")
+            ));
+        }
         return Ok(out);
     }
     out.push_str(&format!("⚠️ 发现 {} 个匹配已知漏洞的依赖：\n\n", found.len()));
