@@ -52,10 +52,63 @@ struct CollectedSrcFiles {
     metadata_failed: usize,
 }
 
+/// check_code 单次扫描的文件数上限。超出部分计入覆盖缺口并在报告里披露。
+const SCAN_FILE_CAP: usize = 300;
+/// secret_scan 源码文件单次扫描上限。
+const SECRET_FILE_CAP: usize = 500;
+/// secret_scan 配置文件单次扫描上限。
+const SECRET_CONF_CAP: usize = 200;
+
 /// 覆盖率不完整时写入输出的稳定标记。
 /// `verification_planner::completion` 读它来决定 check_code 是否算通过验证——
 /// **「没看到高危」不等于「没有高危」**，读不到的文件上同样看不到。
 pub const SCAN_INCOMPLETE: &str = "⚠️ 扫描覆盖不完整";
+
+/// 一次扫描的覆盖缺口。check_code 与 secret_scan 共用同一套披露口径——
+/// 格式若各写一份，改一处必然漏另一处。
+struct CoverageGaps {
+    unreadable_dirs: Vec<String>,
+    metadata_failed: usize,
+    read_failed: usize,
+    dropped_by_cap: usize,
+}
+
+impl CoverageGaps {
+    fn is_empty(&self) -> bool {
+        self.unreadable_dirs.is_empty()
+            && self.metadata_failed == 0
+            && self.read_failed == 0
+            && self.dropped_by_cap == 0
+    }
+
+    /// 渲染披露段落；无缺口返回 None。
+    fn render(&self, cap: usize) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut gaps: Vec<String> = Vec::new();
+        if !self.unreadable_dirs.is_empty() {
+            gaps.push(format!(
+                "{} 个目录读不到（{}）",
+                self.unreadable_dirs.len(),
+                self.unreadable_dirs.join("、")
+            ));
+        }
+        if self.read_failed > 0 {
+            gaps.push(format!("{} 个文件读不到内容", self.read_failed));
+        }
+        if self.metadata_failed > 0 {
+            gaps.push(format!("{} 个文件取不到元数据", self.metadata_failed));
+        }
+        if self.dropped_by_cap > 0 {
+            gaps.push(format!("{} 个文件超过单次 {cap} 上限未扫描", self.dropped_by_cap));
+        }
+        Some(format!(
+            "{SCAN_INCOMPLETE}：{}\n本次「无命中」结论**不覆盖**以上文件，修复访问权限或分目录重扫后才能作为干净结论。\n",
+            gaps.join("；")
+        ))
+    }
+}
 
 /// 递归收集源码文件（跳过忽略目录与超大文件），并记录未能收集到的部分
 fn collect_src_files(root: &Path, max_size: u64) -> CollectedSrcFiles {
@@ -64,11 +117,16 @@ fn collect_src_files(root: &Path, max_size: u64) -> CollectedSrcFiles {
         unreadable_dirs: Vec::new(),
         metadata_failed: 0,
     };
-    walk(root, max_size, &mut out);
+    walk_filtered(root, max_size, is_src_file, &mut out);
     out
 }
 
-fn walk(dir: &Path, max_size: u64, out: &mut CollectedSrcFiles) {
+/// 遍历 + 收集的唯一实现。`keep` 决定哪些文件名算数。
+///
+/// 原先有 `walk` 与 `walk_conf` 两份几乎相同的拷贝，`keep` 分别是
+/// `is_src_file` 与 `is_secret_config_file`；修好 `walk` 之后 `walk_conf`
+/// 仍是旧形态（静默丢目录 / 元数据失败混成「过大」）——**修完一处 ≠ 修完这条链**。
+fn walk_filtered(dir: &Path, max_size: u64, keep: fn(&str) -> bool, out: &mut CollectedSrcFiles) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         // 原先 `else { return }` 静默放弃整棵子树
         out.unreadable_dirs.push(dir.display().to_string());
@@ -79,9 +137,9 @@ fn walk(dir: &Path, max_size: u64, out: &mut CollectedSrcFiles) {
         let name = e.file_name().to_string_lossy().to_string();
         if p.is_dir() {
             if !should_skip_dir(&name) {
-                walk(&p, max_size, out);
+                walk_filtered(&p, max_size, keep, out);
             }
-        } else if is_src_file(&name) {
+        } else if keep(&name) {
             // 元数据取不到 ≠ 文件过大：原先 unwrap_or(false) 把两类混成「跳过」
             match e.metadata() {
                 Ok(meta) if meta.len() <= max_size => out.files.push(p),
@@ -257,7 +315,8 @@ pub fn check_code(root: &Path, path: Option<&str>, kind: Option<&str>) -> Result
     // 而 scanned 已在 continue 之前自增——**读不到的文件被算成「已扫描」**，
     // 于是「扫描 N 个文件」高估了真实覆盖面，「未发现规则命中」也高估了结论强度。
     let mut read_failed = 0usize;
-    let selected: Vec<&std::path::PathBuf> = collected.files.iter().take(300).collect();
+    let selected: Vec<&std::path::PathBuf> =
+        collected.files.iter().take(SCAN_FILE_CAP).collect();
     let dropped_by_cap = collected.files.len().saturating_sub(selected.len());
     for f in &selected {
         scanned += 1;
@@ -296,29 +355,15 @@ pub fn check_code(root: &Path, path: Option<&str>, kind: Option<&str>) -> Result
         by_rule.iter().map(|(_, h)| h.len()).sum::<usize>()
     ));
     // 覆盖率不完整 → 结论打折。**「没看到高危」不等于「没有高危」**：
-    // 读不到的文件上同样看不到高危规则命中。写入稳定标记供闸门识别。
-    let mut gaps: Vec<String> = Vec::new();
-    if !collected.unreadable_dirs.is_empty() {
-        gaps.push(format!(
-            "{} 个目录读不到（{}）",
-            collected.unreadable_dirs.len(),
-            collected.unreadable_dirs.join("、")
-        ));
-    }
-    if read_failed > 0 {
-        gaps.push(format!("{read_failed} 个文件读不到内容"));
-    }
-    if collected.metadata_failed > 0 {
-        gaps.push(format!("{} 个文件取不到元数据", collected.metadata_failed));
-    }
-    if dropped_by_cap > 0 {
-        gaps.push(format!("{dropped_by_cap} 个文件超过单次 300 上限未扫描"));
-    }
-    if !gaps.is_empty() {
-        out.push_str(&format!(
-            "{SCAN_INCOMPLETE}：{}\n本次「无命中」结论**不覆盖**以上文件，修复访问权限或分目录重扫后才能作为干净结论。\n",
-            gaps.join("；")
-        ));
+    // 读不到的文件上同样看不到高危规则命中。
+    let gaps = CoverageGaps {
+        unreadable_dirs: collected.unreadable_dirs.clone(),
+        metadata_failed: collected.metadata_failed,
+        read_failed,
+        dropped_by_cap,
+    };
+    if let Some(disclosure) = gaps.render(SCAN_FILE_CAP) {
+        out.push_str(&disclosure);
     }
     for (rule, hits) in &by_rule {
         if hits.is_empty() {
@@ -827,11 +872,28 @@ pub fn secret_scan(
     let rule = RULES.iter().find(|r| r.id == "hardcoded-secret").unwrap();
     let mut hits: Vec<(String, usize, String)> = Vec::new(); // (file, line, 掩码文本)
     let mut scanned_files = 0usize;
+    // 覆盖缺口：与 check_code 同一套口径。secret_scan 是 git_commit 前的推荐
+    // 扫描（capabilities.rs 的 commit 流程里），「安全状况良好」这句话若建立在
+    // 一份漏了文件的清单上，等于发了一张覆盖面不足的合格证。
+    let mut read_failed = 0usize;
+    let mut dropped_by_cap = 0usize;
+    let mut unreadable_dirs: Vec<String> = Vec::new();
+    let mut metadata_failed = 0usize;
 
     // 1) 源码文件：复用 hardcoded-secret 规则
-    for f in collect_src_files(&scan_root, 512 * 1024).files.iter().take(500) {
+    let src_collected = collect_src_files(&scan_root, 512 * 1024);
+    unreadable_dirs.extend(src_collected.unreadable_dirs.iter().cloned());
+    metadata_failed += src_collected.metadata_failed;
+    let src_selected: Vec<&std::path::PathBuf> =
+        src_collected.files.iter().take(SECRET_FILE_CAP).collect();
+    dropped_by_cap += src_collected.files.len().saturating_sub(src_selected.len());
+    for f in &src_selected {
         scanned_files += 1;
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let Ok(text) = std::fs::read_to_string(f) else {
+            // 计数器已在上面自增：读不到的文件原先被算成「已检查」
+            read_failed += 1;
+            continue;
+        };
         let relf = rel(root, f);
         let mut n = 0usize;
         for (i, line) in text.lines().enumerate() {
@@ -855,31 +917,24 @@ pub fn secret_scan(
     // 2) 配置文件：白名单名 + 键值模式检测
     let mut conf_hits: Vec<(String, usize, String)> = Vec::new();
     if include_config.unwrap_or(true) {
-        let mut conf_files: Vec<std::path::PathBuf> = Vec::new();
-        fn walk_conf(
-            dir: &Path,
-            root: &Path,
-            out: &mut Vec<std::path::PathBuf>,
-        ) {
-            let Ok(entries) = std::fs::read_dir(dir) else { return };
-            for e in entries.flatten() {
-                let p = e.path();
-                let name = e.file_name().to_string_lossy().to_string();
-                if p.is_dir() {
-                    if !should_skip_dir(&name) {
-                        walk_conf(&p, root, out);
-                    }
-                } else if is_secret_config_file(&name)
-                    && e.metadata().map(|m| m.len() <= 512 * 1024).unwrap_or(false) {
-                        out.push(p);
-                    }
-            }
-            let _ = root;
-        }
-        walk_conf(&scan_root, &scan_root, &mut conf_files);
-        for f in conf_files.iter().take(200) {
+        // 与源码扫描共用 walk_filtered，不再各写一份遍历
+        let mut conf_collected = CollectedSrcFiles {
+            files: Vec::new(),
+            unreadable_dirs: Vec::new(),
+            metadata_failed: 0,
+        };
+        walk_filtered(&scan_root, 512 * 1024, is_secret_config_file, &mut conf_collected);
+        unreadable_dirs.extend(conf_collected.unreadable_dirs.iter().cloned());
+        metadata_failed += conf_collected.metadata_failed;
+        let conf_selected: Vec<&std::path::PathBuf> =
+            conf_collected.files.iter().take(SECRET_CONF_CAP).collect();
+        dropped_by_cap += conf_collected.files.len().saturating_sub(conf_selected.len());
+        for f in &conf_selected {
             scanned_files += 1;
-            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            let Ok(text) = std::fs::read_to_string(f) else {
+                read_failed += 1;
+                continue;
+            };
             let relf = rel(root, f);
             let mut n = 0usize;
             for (i, line) in text.lines().enumerate() {
@@ -921,7 +976,21 @@ pub fn secret_scan(
         }
     }
     if total == 0 {
-        out.push_str("\n未发现疑似密钥，安全状况良好。");
+        let gaps = CoverageGaps {
+            unreadable_dirs,
+            metadata_failed,
+            read_failed,
+            dropped_by_cap,
+        };
+        if gaps.is_empty() {
+            out.push_str("\n未发现疑似密钥，安全状况良好。");
+        } else {
+            if let Some(disclosure) = gaps.render(SECRET_FILE_CAP) {
+                out.push('\n');
+                out.push_str(&disclosure);
+            }
+            out.push_str("\n已检查到的文件中未发现疑似密钥（覆盖不完整，见上）。");
+        }
     }
     Ok(cut(&out, 12000))
 }
