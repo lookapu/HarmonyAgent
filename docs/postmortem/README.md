@@ -65,6 +65,17 @@ docs/postmortem/000N-<复发模式 slug>.md
   已修：`structured_result.rs` 增加 `SANDBOX_UNAVAILABLE` 分类臂（排在超时分支之前），
   `errors.rs` 对 `sandbox_unavailable` 前缀短路可重试判断与建议分支。
 
+- **目录树空列表被当成"接口正常但没内容"**：`harmony_doc_api.rs` 对
+  `code:0` 且 `catalogTreeList` 为空数组的响应返回 `Ok(vec![])`，调用方建出空索引后
+  所有模块静默退回 slug 猜测且不留痕迹——与"接口失败"不可区分，正是 0002 的形状。
+  已修：空列表改为 `Err`。**行为不变**——调用方对 `Err` 的退路（`harmony_api_ref.rs`
+  的 Err 分支）同样是退回 slug 猜测，只是多留一条 `catalog_note`，故障从静默变可见。
+
+- **ohpm 仓库查询把"仓库挂了"报成"该包没有仓库地址"**：`ohpm_landscape.rs::repo_url`
+  对所有非成功状态返回 `Ok(None)`，5xx 与 404 不可区分。已修：404（包不存在）仍是
+  `Ok(None)`，其余非成功状态改为 `Err` 并带 HTTP 状态码。唯一调用方是 Tauri command，
+  错误通道本来就存在，不改签名。
+
 ### 已核实并证伪（风险面缩小）
 
 - **评测期望产物在断言前被刷新** —— **不成立**。`ci_baseline_gate` 的实际顺序是
@@ -98,18 +109,13 @@ docs/postmortem/000N-<复发模式 slug>.md
   走的是 headless/ProcessAgentDriver，**所以 CI 门禁量的是内核路径，不是桌面 UI 路径**。
   收敛方向已在 Phase B-A 的切片表里排好，无需重新设计。
 
-### 已核实，仍未修（低影响，记录备查）
+### 已核实，决定不改
 
-- **`ohpm` registry 仓库地址**：`ohpm_landscape.rs:364-366` 对非 2xx 返回 `Ok(None)`，
-  与「该包没有 repository 字段」不可区分。唯一调用方是 Tauri command，
-  **没有 agent 工具用它**，影响面限于一个 UI 展示位。
-- **MCP「测试连接」**：空 `tools` 数组仍返回「连接成功 ✓ 未返回工具列表」——
-  文案本身如实披露了未返回工具列表，且传输失败会正常报错，**不打算改**
-  （零工具的 MCP server 是合法配置）。
-- **文档目录树空值**：`harmony_doc_api.rs:89-95` 在 `code:0` 但目录为空时返回
-  `Ok(vec![])`，随后 `harmony_api_ref.rs:1090` 静默退回 slug 猜测且不记错误。
-  这是 0002 那类形状的残留，但**行为与改为 `Err` 相同**（`Err` 也走 slug 猜测回退），
-  差别仅在于是否留痕。
+- **MCP「测试连接」**：空 `tools` 数组仍返回「连接成功 ✓ 未返回工具列表」。
+  文案本身如实披露了未返回工具列表，传输失败也走正常错误路径，
+  且**零工具的 MCP server 是合法配置**——把空列表判成失败是错的。
+  真正"该报错没报"的是 agent 侧的 `mcp_client.rs`：`tools/call` 空文本已判 `Err`，
+  `tools/list` 空数组返回 `Ok(vec![])`，但该结果对 Agent 无害（就是没有工具可调）。
 
 ### 外部对照
 
