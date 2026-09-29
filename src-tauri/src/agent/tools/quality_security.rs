@@ -180,6 +180,26 @@ pub async fn sandbox_exec(args: &Value, roots: &[String]) -> Result<String, Stri
     Ok(out)
 }
 
+/// 读取一个候选依赖文件，三态必须分开：
+/// `None` = 文件不存在（真的没这个依赖文件），读失败时把原因记进 `unreadable`。
+///
+/// 原实现四处都是 `if path.exists() { if let Ok(text) = read_to_string(path) { … } }`，
+/// 读失败与不存在长得一模一样（都是「没扫到依赖」）。后果是权限错误 / 非 UTF-8
+/// / I/O 故障会让 `license_check` 报成「未发现可扫描的依赖文件」——
+/// 把一次**检查没做成**伪装成「本项目没有三方依赖」，而这是许可证合规检查。
+fn read_dep_file(path: &std::path::Path, unreadable: &mut Vec<String>) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            unreadable.push(format!("{}（{error}）", path.display()));
+            None
+        }
+    }
+}
+
 pub async fn license_check(
     args: &Value,
     roots: &[String],
@@ -212,46 +232,64 @@ pub async fn license_check(
     }
 
     let mut findings: Vec<(String, String, String, String)> = Vec::new();
+    // 存在却读不动的依赖文件。必须与「文件不存在」分开记：
+    // 两者都表现为「没扫到依赖」，但前者是**检查没做成**，后者才是**没有依赖**。
+    let mut unreadable: Vec<String> = Vec::new();
     // 解析 oh-package.json5
     let oh_pkg = base.join("oh-package.json5");
-    if oh_pkg.exists() {
-        if let Ok(text) = std::fs::read_to_string(&oh_pkg) {
-            for line in text.lines() {
-                let t = line.trim();
-                if t.starts_with("//") || t.is_empty() { continue; }
-                // 形如 "@ohos/xxx": "1.0.0" 或 "name": "version"
-                if let Some((name, version)) = parse_dep_line(t) {
-                    findings.push((
-                        "ohpm".into(),
-                        name,
-                        version,
-                        "(license 待 lock 解析)".into(),
-                    ));
+    if let Some(text) = read_dep_file(&oh_pkg, &mut unreadable) {
+        // 只认 dependencies / devDependencies **块内部**的叶子条目。
+        // 原实现对每一行都调 parse_dep_line，于是 `"dependencies": {` 这类
+        // **容器键**被解析成一条名为 `dependencies`、版本为 `{` 的依赖——
+        // 标准 oh-package.json5 必带这个键，等于每个鸿蒙工程稳定多出一条幽灵依赖，
+        // 虚高「共 N 个依赖」与 ALLOW/DENY/待查 三项汇总。实测报告里出现过
+        // `| ohpm | dependencies | { | ⚠️ 待查 |`。
+        let mut depth: i32 = 0;
+        let mut in_deps = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with("//") || t.is_empty() { continue; }
+            if let Some((key, opens_object)) = json5_entry(t) {
+                if opens_object {
+                    // 根对象自身已让 depth 为 1，此时的容器键才是顶层块；
+                    // 嵌套容器（如 overrides 里的子对象）不参与块归属判断。
+                    if depth == 1 {
+                        in_deps = key == "dependencies" || key == "devDependencies";
+                    }
+                } else if in_deps {
+                    if let Some((name, version)) = parse_dep_line(t) {
+                        findings.push((
+                            "ohpm".into(),
+                            name,
+                            version,
+                            "(license 待 lock 解析)".into(),
+                        ));
+                    }
                 }
             }
+            depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
+            if depth < 0 { depth = 0; }
         }
     }
     // 解析 oh-package-lock.json5（取 dependencies.*.license）
     let lock = base.join("oh-package-lock.json5");
-    if lock.exists() {
-        if let Ok(text) = std::fs::read_to_string(&lock) {
-            // 简化：按 "name": { "version": "x", "license": "MIT" } 的结构匹配
-            for line in text.lines() {
-                if !line.contains("license") { continue; }
-                // 提取 license 值
-                if let Some(pos) = line.find("\"license\":") {
-                    let tail = &line[pos + 10..];
-                    if let Some(lv) = extract_quoted(tail) {
-                        // 找本块对应的 package（上一行 "name": "...")
-                        // 简化：直接记一个全局
-                        if let Some(name) = extract_quoted(&line[..pos]) {
-                            if let Some(last) = findings.last_mut() {
-                                if last.0 == "ohpm" && last.3.starts_with("(") {
-                                    last.3 = lv;
-                                }
+    if let Some(text) = read_dep_file(&lock, &mut unreadable) {
+        // 简化：按 "name": { "version": "x", "license": "MIT" } 的结构匹配
+        for line in text.lines() {
+            if !line.contains("license") { continue; }
+            // 提取 license 值
+            if let Some(pos) = line.find("\"license\":") {
+                let tail = &line[pos + 10..];
+                if let Some(lv) = extract_quoted(tail) {
+                    // 找本块对应的 package（上一行 "name": "..."）
+                    // 简化：直接记一个全局
+                    if let Some(name) = extract_quoted(&line[..pos]) {
+                        if let Some(last) = findings.last_mut() {
+                            if last.0 == "ohpm" && last.3.starts_with("(") {
+                                last.3 = lv;
                             }
-                            let _ = name; // unused
                         }
+                        let _ = name; // unused
                     }
                 }
             }
@@ -259,48 +297,62 @@ pub async fn license_check(
     }
     // 解析 Cargo.toml
     let cargo = base.join("Cargo.toml");
-    if cargo.exists() {
-        if let Ok(text) = std::fs::read_to_string(&cargo) {
-            let mut in_deps = false;
-            for line in text.lines() {
-                if line.starts_with("[dependencies]") { in_deps = true; continue; }
-                if line.starts_with("[") && in_deps { in_deps = false; }
-                if !in_deps { continue; }
-                if let Some((name, version)) = parse_dep_line(line) {
-                    findings.push((
-                        "cargo".into(),
-                        name,
-                        version,
-                        "(license 需 cargo metadata 联网查询)".into(),
-                    ));
-                }
+    if let Some(text) = read_dep_file(&cargo, &mut unreadable) {
+        let mut in_deps = false;
+        for line in text.lines() {
+            if line.starts_with("[dependencies]") { in_deps = true; continue; }
+            if line.starts_with("[") && in_deps { in_deps = false; }
+            if !in_deps { continue; }
+            if let Some((name, version)) = parse_dep_line(line) {
+                findings.push((
+                    "cargo".into(),
+                    name,
+                    version,
+                    "(license 需 cargo metadata 联网查询)".into(),
+                ));
             }
         }
     }
     // pyproject.toml 依赖段
     let pyp = base.join("pyproject.toml");
-    if pyp.exists() {
-        if let Ok(text) = std::fs::read_to_string(&pyp) {
-            for line in text.lines() {
-                if !line.contains("==") { continue; }
-                if let Some((name, version)) = parse_dep_line(line) {
-                    findings.push((
-                        "uv".into(),
-                        name,
-                        version,
-                        "(license 需 uv pip 联网查询)".into(),
-                    ));
-                }
+    if let Some(text) = read_dep_file(&pyp, &mut unreadable) {
+        for line in text.lines() {
+            if !line.contains("==") { continue; }
+            if let Some((name, version)) = parse_dep_line(line) {
+                findings.push((
+                    "uv".into(),
+                    name,
+                    version,
+                    "(license 需 uv pip 联网查询)".into(),
+                ));
             }
         }
     }
 
     if findings.is_empty() {
-        return Ok("未发现可扫描的依赖文件（oh-package.json5 / Cargo.toml / pyproject.toml）".into());
+        if unreadable.is_empty() {
+            return Ok("未发现可扫描的依赖文件（oh-package.json5 / Cargo.toml / pyproject.toml）".into());
+        }
+        // 依赖文件存在却读不动：这是**检查没做成**，不是「没有依赖」。
+        // 报成「未发现可扫描的依赖文件」会把一次 I/O 失败伪装成合规通过。
+        return Ok(format!(
+            "⚠️ 扫描不完整：有 {} 个依赖文件存在但读取失败，本次未能解析出任何依赖。\
+             **不能据此认为本项目没有三方依赖**，请修复后重试：\n  {}",
+            unreadable.len(),
+            unreadable.join("\n  ")
+        ));
     }
 
     // 合规性检查
     let mut out = format!("许可证合规扫描报告（基础目录：{}）\n共 {} 个依赖\n\n", base.display(), findings.len());
+    // 部分文件读不动：下面这份清单是**不完整**的，汇总里的 DENY 数可能偏低。
+    if !unreadable.is_empty() {
+        out.push_str(&format!(
+            "⚠️ 本次扫描不完整：以下 {} 个依赖文件存在但读取失败，其依赖未纳入下面的清单与汇总（DENY 数可能偏低）：\n  {}\n\n",
+            unreadable.len(),
+            unreadable.join("\n  ")
+        ));
+    }
     let mut allow_count = 0;
     let mut deny_count = 0;
     let mut unknown_count = 0;
@@ -453,6 +505,19 @@ pub async fn vuln_scan(
     Ok(out)
 }
 
+
+/// 解析 JSON5 单行条目，返回 (key, 该行是否开启了一个对象)。
+/// 用来区分**容器键** `"dependencies": {` 与**叶子键** `"@ohos/axios": "2.2.0"`——
+/// 前者不是一条依赖。
+fn json5_entry(line: &str) -> Option<(String, bool)> {
+    let colon = line.find(':')?;
+    let key = line[..colon].trim().trim_matches('"').trim_matches('\'').to_string();
+    if key.is_empty() || key.contains(' ') || key.contains('=') {
+        return None;
+    }
+    let val = line[colon + 1..].trim();
+    Some((key, val.starts_with('{')))
+}
 
 fn parse_dep_line(line: &str) -> Option<(String, String)> {
     let line = line.trim().trim_end_matches(',');
