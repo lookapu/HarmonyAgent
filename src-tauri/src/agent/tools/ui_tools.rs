@@ -996,6 +996,19 @@ pub(super) async fn get_app_info(
         argv: vec!["bm".into(), "dump".into(), "-n".into(), bundle.clone()],
     };
     let raw = execute_ui_host_capability(&query, "查询应用信息", ctx).await?;
+    // bm dump 对不存在的包名会返回一份没有应用记录的输出，而不是报错（exit 0、
+    // 也不含 error: / [Fail] 之类的文本特征），于是下面六个字段全落成空串，
+    // 输出一份"查到了但什么都是空"的报告。这种空读一旦被当成设备侧确认，
+    // 「部署成功 + 查询到应用信息」就会在应用根本没装上的情况下成立。
+    //
+    // 判据用 "bundleName" 这个键：commands/devices.rs 的 list_installed_apps
+    // 解析的是同一份 bm dump，它认的键就是它（且不依赖冒号两侧空格），
+    // 所以「dump 里没有 bundleName」等价于「这次查询没拿到应用记录」。
+    if !raw.contains("\"bundleName\"") {
+        return Err(format!(
+            "设备 {device} 上未查询到应用 {bundle}：bm dump 未返回该包记录（应用可能未安装或包名不符）"
+        ));
+    }
 
     let version_code = extract_json_num(&raw, "versionCode");
     let version_name = extract_json_str(&raw, "versionName");

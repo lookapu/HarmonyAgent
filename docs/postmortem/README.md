@@ -131,6 +131,22 @@ docs/postmortem/000N-<复发模式 slug>.md
   严格在副作用之后——同一条记录两者索引相等，所以它顶不掉「写完之后还要验证」这一关。
   真正把关的 `acceptance.rs` 判据上一轮已单独收紧。
 
+- **同一族的第四处：设备侧空读被当成部署已确认**。`postconditions` 的 deploy 写后读
+  确认器包含 `get_app_info`，只要它 `succeeded` 就算「已从设备读取应用状态并确认」。
+  而 `get_app_info`（`ui_tools.rs`）对不存在的包名会拿到一份**没有应用记录**的
+  `bm dump` 输出——exit 0，也不含 `error:` / `[Fail]` / `not found` 这些
+  `hdc_shell_failed` 认识的文本特征——于是六个字段全部 `unwrap_or_default()` 成空串，
+  照样 `Ok` 一份「查到了但什么都是空」的报告。**空读不是确认。**
+  触发路径不需要部署真的失败：包名与工程元数据不一致、查询落到另一台设备、
+  安装后包未注册，都会走到这里。
+  已修：拿到 `raw` 后先判 `"bundleName"` 这个键在不在，不在就返回 `Err`。
+  判据不是猜的——`commands/devices.rs` 的 `list_installed_apps` 解析的是**同一份**
+  `bm dump`，它认的键就是 `"bundleName"`（`strip_prefix("\"bundleName\" : \"")`），
+  所以「dump 里没有 bundleName」等价于「这次查询没拿到应用记录」，
+  且该检查不依赖冒号两侧的空格写法。
+  同文件的 `sample_battery_percent` 早就用 `.ok_or_else(|| "未读取到有效电量")`
+  堵过同一类空读，这次是把同一口径补到 `get_app_info` 上。
+
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
   是无分隔符的裸词 `build` / `test`。于是
