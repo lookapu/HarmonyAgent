@@ -484,7 +484,11 @@ fn argument_artifacts(tool: &str, args: &str) -> Vec<ArtifactEvidence> {
     paths.dedup();
     let operation = match tool {
         "delete_file" => "delete",
-        "write_file" | "edit_file" | "apply_patch" | "create_project" => "write",
+        // 原先只列 write_file/edit_file/apply_patch/create_project：前两个是真工具，
+        // 后两个都不是（apply_patch 见 postmortem「幽灵条目」，create_project 亦未注册），
+        // 而真正会改文件的 multi_edit / lsp_rename 反而漏了，落进下面的 "produce"。
+        // 这个字段只用于展示（信封与 context 标签），没有闸门读它，但给模型的标签不能是错的。
+        "write_file" | "edit_file" | "multi_edit" | "lsp_rename" => "write",
         _ if crate::agent::tools::contracts::contract(tool)
             .effect
             .as_str()

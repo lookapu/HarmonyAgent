@@ -1007,10 +1007,13 @@ pub fn record_tool_evidence(
     let observed_at = now_ms();
 
     if succeeded {
-        let invalidated_kinds: &[&str] = if matches!(
-            tool,
-            "write_file" | "edit_file" | "multi_edit" | "apply_patch" | "delete_file"
-        ) {
+        // 「会改工作区文件的工具」复用唯一真源（与验收侧、审批侧同一份）。
+        // 原先这里自己抄了一份，漏掉 lsp_rename——它按 AST 找出全部引用并跨文件同步改名，
+        // ToolSpec 明写「副作用：修改文件（可 undo_edit 回退）」。漏掉的代价有两层：
+        // 会话内 verification/workspace 事实不失效（后续轮次读到的是改之前的结论），
+        // 且 durable project memory 的 file_changed 失效链整条不触发。
+        let is_mutation = crate::agent::verification_planner::is_mutation_tool(tool);
+        let invalidated_kinds: &[&str] = if is_mutation {
             &["verification", "workspace"]
         } else if matches!(
             tool,
@@ -1032,10 +1035,9 @@ pub fn record_tool_evidence(
             &format!("tool_mutation:{tool}"),
         );
         if let Some(project_id) = project_id.as_deref() {
-            let (event, references) = if matches!(
-                tool,
-                "write_file" | "edit_file" | "multi_edit" | "apply_patch" | "delete_file"
-            ) {
+            // 与上面的 invalidated_kinds 复用同一个 is_mutation，
+            // 这样「哪些工具算改了文件」在本函数内不可能再分叉。
+            let (event, references) = if is_mutation {
                 (Some("file_changed"), tool_file_references(args))
             } else if matches!(tool, "git_branch" | "git_pull" | "git_merge" | "git_restore") {
                 (Some("git_branch_changed"), Vec::new())

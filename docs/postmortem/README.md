@@ -290,6 +290,43 @@ docs/postmortem/000N-<复发模式 slug>.md
   与「同一份判定写两遍必然分叉」互补：那一族是**同一概念出现多次**，
   这一族是**同一清单里混进了不存在的东西**。共同点是都靠肉眼维护，都不报错。
 
+- **同一族的第六处：跨文件改名后，会话事实与项目记忆都停在改之前的结论**。
+  `context.rs::record_tool_evidence` 里有**两份内容相同**的手写清单
+  （`invalidated_kinds` 与 `file_changed` 事件各一份），都漏掉 `lsp_rename`。
+  而 `lsp_rename` 的 ToolSpec 明写「基于 AST 找出全部引用并同步修改（**跨文件**）…
+  副作用：修改文件」——**它是改动面最广的那个，恰恰是唯一被漏掉的那个**。
+
+  后果有两层：
+  1. `invalidated_kinds` 取 `&[]` → 会话内 `verification` / `workspace` 两类事实
+     不失效 → 后续轮次注入的是改之前的结论；
+  2. `event` 取 `None` → `invalidate_project_memories` **根本不调用** →
+     durable project memory 的 `file_changed` 失效链整条不触发。
+     用户亲手写下的「`build-profile.json5` 修改时失效」这类记忆，
+     在一次跨文件重命名之后，依然被当作有效事实喂给模型。
+
+  修复前后实测（真实 SQLite + 真实 `record_tool_evidence` 调用路径，
+  记忆条件设为「`src/main.ets` 修改时失效」，工具参数 `{"path":"src/main.ets",…}`）：
+
+  | | `project_memories.invalidated_at` |
+  |---|---|
+  | 旧清单 | `None`，断言 panic |
+  | 收敛后 | `Some(…)`，通过 |
+
+  已修：两处共用同一个 `is_mutation`，且都来自 `verification_planner::is_mutation_tool`。
+  **在同一个函数作用域里先算出 `is_mutation` 再复用两次，比"两次调用同一函数"
+  更能防住再次分叉**——第二次根本没有机会写出不同的名字。
+
+  顺带：`structured_result::argument_artifacts` 的 `operation` 映射同样漏了
+  `multi_edit` / `lsp_rename`，还带着两个幽灵条目（`apply_patch` / `create_project`），
+  于是这两个工具的产物被标成 `produce`——**写操作报成「产出」**。
+  该字段是 display-only（只进信封与 context 标签，没有闸门读它），
+  但给模型的标签不该是错的，一并修。
+
+  **这一族已数到第六处，且每一处都在不同的下游**：
+  `acceptance` 变更集 → `chat.rs` 变更清单 → `postconditions` 确认器 →
+  `execution_loop` 验证器 → 审批 `first_write` → **`context` 事实失效**。
+  共同点始终不变：不报错、不崩、测试全绿，只是各自安静地按自己的理解工作。
+
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
   是无分隔符的裸词 `build` / `test`。于是
