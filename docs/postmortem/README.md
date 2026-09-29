@@ -65,6 +65,20 @@ docs/postmortem/000N-<复发模式 slug>.md
   已修：`structured_result.rs` 增加 `SANDBOX_UNAVAILABLE` 分类臂（排在超时分支之前），
   `errors.rs` 对 `sandbox_unavailable` 前缀短路可重试判断与建议分支。
 
+- **"验证工具跑成功"被当成"它验证出了好结果"**：`verify_ui` 无论判定黑屏/白屏还是正常，
+  都返回 `Ok(report)`——它确实成功截到了图，所以 `succeeded` 为 true。而
+  `postconditions.rs` 的写后读确认矩阵只看 `succeeded`，于是
+  「`deploy` 成功 + 在黑屏上 `verify_ui`」被判成"已从设备读取界面状态并确认"，
+  模型可以据此宣布部署完成。**这正是把请求成功误当任务成功**——与本目录 0002 同一族，
+  只是这次错位发生在验收闸门而不是数据链路。
+  讽刺的是 `verify_ui` 内部的黑屏/白屏/纯色检测做得很扎实，判定也带 ❌ 标记，
+  **但这个结论没能穿过工具边界变成失败信号**，只留在给模型看的文本里。
+  已修：`postconditions.rs` 引入 `verifier_confirmed`——验证工具除了 `succeeded`
+  还必须没有负面结论才计入确认。范围刻意收窄：只有 `verify_ui` 自带结论，
+  只有 ❌ 阻断，`⚠️ 异常纯色` 不阻断（启动页/纯色遮罩本来就可能是平的）。
+  刻意**没有**改 `verify_ui` 本身去返回 `Err`——那样会让工具报错路径接管，
+  截图多半不再自动进入模型视野，反而丢掉最好的诊断信息。
+
 - **目录树空列表被当成"接口正常但没内容"**：`harmony_doc_api.rs` 对
   `code:0` 且 `catalogTreeList` 为空数组的响应返回 `Ok(vec![])`，调用方建出空索引后
   所有模块静默退回 slug 猜测且不留痕迹——与"接口失败"不可区分，正是 0002 的形状。
