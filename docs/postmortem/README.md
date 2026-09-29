@@ -174,6 +174,37 @@ docs/postmortem/000N-<复发模式 slug>.md
   判据写成「含斜杠」这类**对宽松输入恒真**的形状时，
   兜底就会在它最不该触发的地方触发。
 
+- **验收闸门用「更早的证据」验证「更晚的改动」**：`acceptance::is_mutation` 与
+  `verification_planner::is_mutation_tool` 是同一概念（哪些工具算变更）的两份手写清单，
+  且**双向都不同**。前者是
+  `write_file|edit_file|delete_file|apply_patch|create_project|git_merge|db_migrate`，
+  后者是 `write_file|edit_file|delete_file|apply_patch|multi_edit|lsp_rename`——
+  **`multi_edit` 与 `lsp_rename` 只在后者里**，而两者都是注册工具、ToolSpec 明写
+  「副作用：修改项目内文件」。
+
+  `evaluate_contract` 用 `is_mutation` 定位 `last_mutation`，Verification 判据要求
+  证据出现在 `last_mutation` **之后**。`multi_edit` 不被认成变更时，这个「最后」还停在
+  上一次 `edit_file`／`apply_patch`——于是**在 multi_edit 之前跑过的 `git_diff`／构建／
+  测试会被当成它之后的验证而放行**。模型改完文件不用再验证，验收照样通过。
+
+  修复前后实测（同一序列 `edit_file(a.rs)` → `git_diff` → `multi_edit(b.rs, c.rs)`）：
+
+  | | 结果 |
+  |---|---|
+  | 旧清单（漏 `multi_edit`） | `passed=true`，`blockers=[]` ← 误放行 |
+  | 收敛后 | `passed=false`，`blockers=["变更后已读取、差异检查、构建或测试验证"]` |
+
+  已修：`is_mutation` 改为 `is_mutation_tool(tool) || <非文件类变更>`，让
+  **「文件变更工具集 ⊆ 变更工具集」成为结构性保证**而不是靠人记得同步。
+  反向多出的 `git_merge` / `db_migrate` 是有意的分工——它们不写工作区文件，
+  但同样让既有验证失效；`verification_planner` 只回答「哪些文件要验证」，
+  这里回答「哪些操作让已有验证作废」。两个函数名的差别就是这个分工，不是重复。
+  （`create_project` 目前不是注册工具，TOOL_SPECS 无此项，保留为防御性条目。）
+
+  **与前一条同源**：同一份判定写两遍就必然分叉，而分叉的后果发生在**下游闸门**上——
+  两处都不报错、都不崩，只是各自安静地按自己的理解工作。
+  这类缺陷靠读单个函数看不出来，必须把两个函数并排比。
+
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
   是无分隔符的裸词 `build` / `test`。于是

@@ -203,8 +203,22 @@ pub struct AcceptanceReport {
     pub evidence_count: usize,
 }
 
+/// 一次调用之后，先前的验证证据就作废了。
+///
+/// **必须覆盖 `verification_planner::is_mutation_tool` 的全部工具**：任何写工作区文件的
+/// 工具都要在这里被认成变更，否则「验证必须发生在最后一次变更之后」这条不变量会静默失效。
+/// 原先这里是一份手写清单，漏了 `multi_edit` 与 `lsp_rename`——两者都是注册工具且
+/// ToolSpec 明写「副作用：修改项目内文件」。后果是：模型用 `multi_edit` 改完文件后，
+/// 界定的「最后一次变更」仍停在上一次 `edit_file`，于是在 multi_edit **之前**跑过的
+/// 构建 / 差异核对会被当成它之后的验证而放行——**用更早的证据验证更晚的改动**。
+///
+/// 本函数是那个集合的**超集**（多出 `git_merge` / `db_migrate` 这类不写工作区文件、
+/// 但同样让既有验证失效的操作），这是有意的分工：`verification_planner` 只负责
+/// 「哪些文件需要验证」，这里负责「哪些操作让已有验证作废」。
+/// `create_project` 目前不是注册工具（TOOL_SPECS 无此项），保留为防御性条目。
 fn is_mutation(tool: &str) -> bool {
-    matches!(tool, "write_file" | "edit_file" | "delete_file" | "apply_patch" | "create_project" | "git_merge" | "db_migrate")
+    crate::agent::verification_planner::is_mutation_tool(tool)
+        || matches!(tool, "create_project" | "git_merge" | "db_migrate")
 }
 
 fn is_command(e: &ToolEvidence<'_>, words: &[&str]) -> bool {
