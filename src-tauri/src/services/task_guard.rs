@@ -96,8 +96,8 @@ pub fn record_tool(
         }
 
         // 写文件类：累计同文件连续编辑次数
-        let edited_file = edited_path(tool, args);
-        if let Some(f) = &edited_file {
+        let edited_files = edited_paths(tool, args);
+        for f in &edited_files {
             *g.edit_counts.entry(f.clone()).or_insert(0) += 1;
             g.last_edited = Some(f.clone());
         }
@@ -111,7 +111,7 @@ pub fn record_tool(
             }
         }
 
-        let is_progress = is_progress_action(tool, ok, &edited_file);
+        let is_progress = is_progress_action(tool, ok, !edited_files.is_empty());
         if is_progress {
             g.since_progress = 0;
             // 发生构建/部署/测试等强验证动作后，清空文件连续编辑计数
@@ -233,21 +233,32 @@ impl GuardHint {
     }
 }
 
-fn edited_path(tool: &str, args: &serde_json::Value) -> Option<String> {
-    match tool {
-        "write_file" | "edit_file" | "delete_file" => args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        _ => None,
+/// 本次调用改动了哪些工作区文件。
+///
+/// 「哪些工具会改工作区文件」与「路径怎么取」两件事都复用
+/// `agent::verification_planner` 的唯一真源，不在本文件另抄一份清单。
+/// 原先这里只认 `write_file|edit_file|delete_file` 的 `path` 字段，漏掉
+/// `multi_edit`（走 `edits[]`）与 `lsp_rename`（走 `path` 但不在名单里），
+/// 后果有两处：
+/// 1. `is_progress_action` 把成功改了文件的调用判成「无进展」→ `since_progress`
+///    照涨 → 模型正在正确干活，却被注入「你没进展，换个思路」的失速警告；
+/// 2. 「同一文件连续编辑 N 次仍未验证」的强制验证提示对这两个工具**永远不触发**，
+///    而 `multi_edit` 正是项目自己的错误诊断引导模型使用的编辑工具。
+///
+/// 返回全部命中的文件而非单个：一次 `multi_edit` 可以改多个文件，
+/// 只记第一个会让同文件连续编辑次数被系统性低估。
+fn edited_paths(tool: &str, args: &serde_json::Value) -> Vec<String> {
+    if !crate::agent::verification_planner::is_mutation_tool(tool) {
+        return Vec::new();
     }
+    crate::agent::verification_planner::paths_from_args(&args.to_string())
 }
 
-fn is_progress_action(tool: &str, ok: bool, edited_file: &Option<String>) -> bool {
+fn is_progress_action(tool: &str, ok: bool, edited_any_file: bool) -> bool {
     if !ok {
         return false;
     }
-    if edited_file.is_some() {
+    if edited_any_file {
         return true;
     }
     matches!(tool, "build_project" | "deploy" | "run_tests" | "ohpm_install" | "git_commit")

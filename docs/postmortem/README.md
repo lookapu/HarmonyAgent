@@ -344,10 +344,43 @@ docs/postmortem/000N-<复发模式 slug>.md
   该字段是 display-only（只进信封与 context 标签，没有闸门读它），
   但给模型的标签不该是错的，一并修。
 
-  **这一族已数到第六处，且每一处都在不同的下游**：
+  **这一族已数到第七处，且每一处都在不同的下游**：
   `acceptance` 变更集 → `chat.rs` 变更清单 → `postconditions` 确认器 →
-  `execution_loop` 验证器 → 审批 `first_write` → **`context` 事实失效**。
-  共同点始终不变：不报错、不崩、测试全绿，只是各自安静地按自己的理解工作。
+  `execution_loop` 验证器 → 审批 `first_write` → `context` 事实失效 →
+  **`task_guard` 进展判定**。共同点始终不变：不报错、不崩、测试全绿，
+  只是各自安静地按自己的理解工作。
+
+- **同一族的第七处：模型成功改了文件，却被告知「你没有进展」**。
+  `services/task_guard.rs::edited_path` 是**又一份**手写清单，只认
+  `write_file|edit_file|delete_file` 的 `path` 字段，漏掉 `multi_edit`（走 `edits[]`）
+  与 `lsp_rename`（走 `path` 但不在名单里）。
+
+  这一处漏项的后果**不是陈旧状态，而是往模型上下文里注入假信号**：
+  1. `is_progress_action` 把成功的写文件调用判成「无进展」→ `since_progress` 照涨 →
+     达到阈值后注入
+     「已连续 N 次工具调用未产生实质进展（**无写文件**/构建/部署/测试）…不要长时间停留在只读探索上」。
+     失速警告的文案白纸黑字写着「无写文件」，而 `multi_edit` 恰恰是写文件——
+     **模型正在正确干活，却被劝去换思路。**
+  2. 「同一文件连续编辑 N 次仍未验证，请立即构建验证」的强制验证提示对这两个工具
+     **永远不触发**，而 `multi_edit` 正是项目自己的错误诊断（`errors.rs:310`）
+     引导模型使用的编辑工具。
+
+  修复前后实测（真实 `record_tool` 调用路径，连续 `STALL_TOOL_THRESHOLD + 3` 次
+  成功的 `multi_edit`，每次改 `src/a.ts` + `src/b.ts`）：
+
+  | | 结果 |
+  |---|---|
+  | 旧清单 | 第 N 轮即 `stall_warning` 出现，断言 panic |
+  | 收敛后 | 全程无失速警告，`edit_counts` 两个文件各累计 13 次 |
+
+  已修：`edited_path` → `edited_paths`，工具判据与路径提取**双双**复用
+  `verification_planner` 的唯一真源（`is_mutation_tool` + `paths_from_args`）。
+  改成返回全部命中文件而非单个：一次 `multi_edit` 可以改多个文件，
+  只记第一个会让同文件连续编辑次数被系统性低估。
+  `is_progress_action` 的第三个参数相应收敛为 `bool`（是否改过任何文件），
+  避免又把「单个 Option」这种会诱发分叉的形状带进来。
+  分层上 `services` → `crate::agent` 已有先例（`team_sharing` / `reproduction_bundle`
+  等 5 处），不新增依赖方向。
 
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
