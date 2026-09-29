@@ -12074,7 +12074,7 @@ async fn summarize_rolling_history(
     cancel: Option<&ChatCancel>,
 ) -> Option<String> {
     // 1. 取最近 old_limit 条中最旧的 (old_limit - keep) 条作为待摘要文本（DB 借用限定在块内）
-    let dropped = {
+    let (dropped, shadowed_chars) = {
         let conn = state.0.lock().ok()?;
         // 多取 PAIR_LOOKBACK 条旧消息作为工具配对余量：窗口最旧端若切开"调用→结果"对
         // （最旧一条是 tool 结果、其调用在窗口外），靠余量把起点前移到配对调用处；
@@ -12114,6 +12114,9 @@ async fn summarize_rolling_history(
         if list.is_empty() {
             return None;
         }
+        // 被替换内容的真实字符数：此刻 list 已是最终待摘要窗口。下面的 out 会被逐条截断
+        // + 全局预算裁剪，长度不再等于真实被丢弃量，故在此单独计量（压缩有效性闸门用）
+        let shadowed_chars: usize = list.iter().map(|(_, t)| t.chars().count()).sum();
         // 2. 待摘要消息分级（对齐 DeepSeek-TUI should_pin_message + enforce_tool_call_pairs 的
         //    轻量版）：错误标记与补丁标记的消息全文保留原文——错误细节与补丁是最容易被摘要
         //    稀释的关键信息；assistant 工具调用消息（【TOOL| 标记）与其紧随的 tool 结果消息
@@ -12238,7 +12241,7 @@ async fn summarize_rolling_history(
             let omitted = tail_start.saturating_sub(head_end);
             out = format!("{head}\n\n[… {omitted} 字符已省略（早期对话）…]\n\n{tail}");
         }
-        out
+        (out, shadowed_chars)
     };
 
     // 4. 经济模型（非核心推理：有更便宜模型时用它省主模型预算；无则回退主模型）
@@ -12248,6 +12251,8 @@ async fn summarize_rolling_history(
     };
 
     // 5. 结构化摘要（4 段式模板；已有旧摘要时增量更新）
+    // prev_summary 随后被移入提示词，先记下长度供压缩有效性闸门比较
+    let prev_summary_chars = prev_summary.as_deref().map_or(0, |p| p.chars().count());
     let prev_note = match prev_summary {
         Some(p) if !p.trim().is_empty() => {
             format!("（已有早期摘要，请结合其内容更新为最新状态，不要重复旧信息：\n{p}\n）\n")
@@ -12338,6 +12343,23 @@ async fn summarize_rolling_history(
                     }),
                 ),
             }
+        }
+        // 8. 压缩有效性闸门（对齐 dsh compaction-basic region.ts:414-422 "summary is not
+        //    smaller than the shadowed content"）：新摘要替换的是「被丢弃的早期消息 + 旧摘要」，
+        //    若摘要不比被替换内容小，压缩反而让上下文变大，反复压缩会滚雪球。命中则不落摘要，
+        //    返回 None 让调用方退回纯裁剪——history_limit 照常下调，上下文仍然收缩。
+        let summary_chars = summary.chars().count();
+        let shadowed_total = shadowed_chars + prev_summary_chars;
+        if summary_chars >= shadowed_total {
+            crate::utils::logger::log_event(
+                "context_summary_not_smaller",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "summary_chars": summary_chars,
+                    "shadowed_chars": shadowed_total,
+                }),
+            );
+            return None;
         }
         Some(summary)
     }
