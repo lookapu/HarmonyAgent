@@ -109,6 +109,28 @@ docs/postmortem/000N-<复发模式 slug>.md
   兜底分支对它们是可信的。也就是说兜底分支本身没错，
   **错的是把两个「跑通即 Ok」的工具一起塞进了兜底**。
 
+- **同一族的第三处：执行循环把「跑过一条命令」当成「验证过改动」**。`execution_loop.rs`
+  的 `last_verifier` 判据是 `contract(item.tool).validator.is_some()`，**只查工具名**。
+  而 `contracts::validator` 里 `run_command` 恒为 `Some(ValidatorKind::Command)`
+  ——契约描述的是「这类工具**可以**当验证器」，不是「这次调用**就是**验证」，
+  两个语义被当成了一个。于是 `edit_file` 之后跑一条 `run_command("echo hi")`，
+  `last_verifier` 就落在 `last_effect` 之后，`needs_post_effect_verification` 变 false，
+  循环从 `Verify` 提前跳到 `Execute`。**执行过命令 ≠ 验证过改动。**
+
+  讽刺的是正确判据**项目里早就写好了**：`structured_result.rs::declared_validator`
+  已经把 `run_command` 收窄成「命令本身确实含 test / build / cargo check /
+  git diff / git status」才算一次验证，`echo hi` / `ls` / `cat` 拿不到 `Command` 标签——
+  只是 `execution_loop` 没有复用它。已修：把 `declared_validator` 提为 `pub(crate)`
+  并在 `execution_loop` 里复用。**刻意复用而不是另写一份**：结构化结果信封会把这个
+  标签展示给模型，两处各判各的就会出现「信封说这不是验证器、循环却当它是」的漂移，
+  那本身就是一个新 bug。
+
+  残留（比原设想窄得多）：`declared_validator` 的命令匹配仍是整段子串包含，
+  `git commit -m "fix build"` 仍能拿到 `Command` 标签。但这类命令**自身是 Destructive
+  副作用**，会同时成为 `last_effect`，而 `last_verifier <= last_effect` 的判据要求验证器
+  严格在副作用之后——同一条记录两者索引相等，所以它顶不掉「写完之后还要验证」这一关。
+  真正把关的 `acceptance.rs` 判据上一轮已单独收紧。
+
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
   是无分隔符的裸词 `build` / `test`。于是

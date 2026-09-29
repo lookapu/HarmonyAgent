@@ -499,7 +499,13 @@ fn artifact_kind(path: &str) -> &'static str {
     }
 }
 
-fn declared_validator(tool: &str, args: &str) -> Option<&'static str> {
+/// 本次执行**实际**充当的验证器类型。
+///
+/// 与 `contracts::validator` 的区别：`run_command` 在契约里恒为 `ValidatorKind::Command`，
+/// 但只有命令本身真的是构建/测试/差异核对时才算一次验证。`echo hi` / `ls` / `cat`
+/// 拿到 `Command` 标签会让「执行过一条命令」冒充「验证过改动」。
+/// 复用本函数的调用方与结构化结果信封对同一次执行的判断保持一致，不会各说各话。
+pub(crate) fn declared_validator(tool: &str, args: &str) -> Option<&'static str> {
     use crate::agent::tools::contracts::ValidatorKind;
     let validator = crate::agent::tools::contracts::contract(tool).validator?;
     if validator == ValidatorKind::Command

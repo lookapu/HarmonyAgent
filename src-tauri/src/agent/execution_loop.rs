@@ -71,8 +71,13 @@ pub fn snapshot(contract: &GoalContract, evidence: &[ToolEvidence<'_>]) -> Execu
             && contract.validator.is_none()
             && !matches!(item.tool, "plan_task" | "todo_write" | "todo_get")
     }).map(|(index, _)| index).next_back();
+    // 「验证过」不能只看契约里声明了验证器：run_command 的契约恒为 Command，
+    // 用工具名直接判定的话，edit_file 之后跑一条 `echo hi` 就能把
+    // needs_post_effect_verification 压成 false，循环提前跳去 Execute。
+    // 这里复用结构化结果信封的同一个判据——run_command 需命令本身确实是
+    // 构建/测试/差异核对，才算一次真正的验证。
     let last_verifier = evidence.iter().enumerate().filter(|(_, item)| {
-        item.succeeded && super::tools::contracts::contract(item.tool).validator.is_some()
+        item.succeeded && super::structured_result::declared_validator(item.tool, item.args).is_some()
     }).map(|(index, _)| index).next_back();
     let needs_post_effect_verification = last_effect.is_some_and(|effect| {
         last_verifier.is_none_or(|verifier| verifier <= effect)
