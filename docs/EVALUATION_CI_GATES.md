@@ -50,6 +50,30 @@ EVAL_BASELINE_IN=/tmp/eval-baseline.json EVAL_BASELINE_OUT=/tmp/eval-baseline.js
 
 比较逻辑的单元测试 `baseline_comparison_detects_regressions` 覆盖分数回退、覆盖缩水、延迟超限、工具摘要告警、套件切换与过短基线跳过。
 
+### 本机基线（2026-09-29 实测）
+
+`cargo test --manifest-path src-tauri/Cargo.toml --lib` 在 Windows 开发机的结果：
+
+```
+test result: FAILED. 1162 passed; 4 failed; 10 ignored
+```
+
+**那 4 个失败是本机环境问题，不是回归。** 全部是 `agent::eval_runner::tests::*`，
+报错 `grader 启动失败：program not found`：
+
+| | |
+|---|---|
+| 原因 | 测试夹具 `eval_runner.rs:796` 把 grader 硬编码成 POSIX `grep` |
+| 本机 | `C:\Program Files\Git\usr\bin\grep.exe` 存在，但该目录**不在** PATH |
+| CI | `windows-latest` 镜像把 Git 的 `usr\bin` 加进了 PATH，所以全绿 |
+
+**先比对这条基线再判断自己有没有改坏东西**：改动后若仍是 `1162 passed / 4 failed /
+10 ignored`，说明没有引入新问题；出现第 5 个失败才是你造成的。
+
+修复方向是让夹具跨平台（或让 grader 按任务 JSON 声明的 argv 执行，不在测试里假定
+POSIX 工具名）——生产代码不应替换 grader 命令，那会让"任务声明什么就跑什么"这条
+契约失效。
+
 ## 5. 边界
 
 - 基线是运行证据快照，不是发布验收；真机、SDK 与模型评测证据仍由 [评测运行快照](EVALUATION_RUN_SNAPSHOTS.md) 记录。
