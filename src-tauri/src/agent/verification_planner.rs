@@ -144,6 +144,22 @@ fn completion(
                 index + 1
             )]);
         }
+        // 覆盖率不完整（目录/文件读不到、超 300 上限）与输出截断是同一类问题：
+        // 结论的覆盖面小于它字面声称的范围。**读不到的文件上同样看不到高危命中**，
+        // 所以「无高危」此时不成立。标记由 scanner::check_code 写入，两边共用同一常量。
+        if item.output.contains(crate::agent::scanner::SCAN_INCOMPLETE) {
+            return (false, vec![format!(
+                "#{} check_code 扫描覆盖不完整（{}），本次「无高危」结论不覆盖这些文件；请修复访问权限或分目录重扫",
+                index + 1,
+                item.output
+                    .lines()
+                    .find(|line| line.contains(crate::agent::scanner::SCAN_INCOMPLETE))
+                    .unwrap_or("原因未给出")
+                    .split_once('：')
+                    .map(|(_, reason)| reason.trim())
+                    .unwrap_or("原因未给出")
+            )]);
+        }
         let blocking = scan_blocking_groups(&item.output);
         return if blocking == 0 {
             (true, vec![format!("#{} check_code 无高危/中危（共 {total} 条提示）", index + 1)])

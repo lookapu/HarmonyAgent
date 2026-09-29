@@ -39,28 +39,57 @@ fn rel(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// 递归收集源码文件（跳过忽略目录与超大文件）
-fn collect_src_files(root: &Path, max_size: u64) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    walk(root, root, max_size, &mut out);
+/// 收集源码文件的结果：文件列表 + **没能收集到**的部分。
+///
+/// 原实现只回 `Vec<PathBuf>`，读不到的目录、读失败的目录条目、取不到元数据的文件
+/// 三种丢失全部静默。`check_code` 随后会拿这份残缺清单得出「未发现规则命中，
+/// 代码整体较整洁」——**结论的覆盖面小于它字面声称的范围**，而调用方无从分辨。
+struct CollectedSrcFiles {
+    files: Vec<std::path::PathBuf>,
+    /// 整棵子树读不到的目录（`read_dir` 失败 → 递归直接 return）
+    unreadable_dirs: Vec<String>,
+    /// 取不到元数据、因而被跳过的文件
+    metadata_failed: usize,
+}
+
+/// 覆盖率不完整时写入输出的稳定标记。
+/// `verification_planner::completion` 读它来决定 check_code 是否算通过验证——
+/// **「没看到高危」不等于「没有高危」**，读不到的文件上同样看不到。
+pub const SCAN_INCOMPLETE: &str = "⚠️ 扫描覆盖不完整";
+
+/// 递归收集源码文件（跳过忽略目录与超大文件），并记录未能收集到的部分
+fn collect_src_files(root: &Path, max_size: u64) -> CollectedSrcFiles {
+    let mut out = CollectedSrcFiles {
+        files: Vec::new(),
+        unreadable_dirs: Vec::new(),
+        metadata_failed: 0,
+    };
+    walk(root, max_size, &mut out);
     out
 }
 
-fn walk(dir: &Path, root: &Path, max_size: u64, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+fn walk(dir: &Path, max_size: u64, out: &mut CollectedSrcFiles) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // 原先 `else { return }` 静默放弃整棵子树
+        out.unreadable_dirs.push(dir.display().to_string());
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
         if p.is_dir() {
             if !should_skip_dir(&name) {
-                walk(&p, root, max_size, out);
+                walk(&p, max_size, out);
             }
-        } else if is_src_file(&name)
-            && e.metadata().map(|m| m.len() <= max_size).unwrap_or(false) {
-                out.push(p.clone());
+        } else if is_src_file(&name) {
+            // 元数据取不到 ≠ 文件过大：原先 unwrap_or(false) 把两类混成「跳过」
+            match e.metadata() {
+                Ok(meta) if meta.len() <= max_size => out.files.push(p),
+                Ok(_) => {}
+                Err(_) => out.metadata_failed += 1,
             }
+        }
     }
-    let _ = root;
 }
 
 /// 快速统计文件行数（BufRead 按行 count，避免整文件读入内存）
@@ -207,20 +236,39 @@ pub fn check_code(root: &Path, path: Option<&str>, kind: Option<&str>) -> Result
         _ => root.to_path_buf(),
     };
     let kind_arkts = kind.map(|k| k == "arkts").unwrap_or(false);
-    let files = collect_src_files(&scan_root, 512 * 1024);
-    if files.is_empty() {
-        return Ok("未发现可扫描的源码文件（.ets/.ts/.js 等）".into());
+    let collected = collect_src_files(&scan_root, 512 * 1024);
+    if collected.files.is_empty() {
+        // 目录读不到与「确实没有源码文件」不是一回事，照旧要说清楚
+        let extra = if collected.unreadable_dirs.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "（另有 {} 个目录读不到：{}）",
+                collected.unreadable_dirs.len(),
+                collected.unreadable_dirs.join("、")
+            )
+        };
+        return Ok(format!("未发现可扫描的源码文件（.ets/.ts/.js 等）{extra}"));
     }
     // 每个规则聚合命中（文件+行号+行内容），限制总量防输出爆炸
     let mut by_rule: Vec<(&'static Rule, Vec<Hit>)> = RULES.iter().map(|r| (r, Vec::new())).collect();
     let mut scanned = 0usize;
-    for f in files.iter().take(300) {
+    // 读不到内容的文件：原先 `let Ok(text) = … else { continue }` 静默跳过，
+    // 而 scanned 已在 continue 之前自增——**读不到的文件被算成「已扫描」**，
+    // 于是「扫描 N 个文件」高估了真实覆盖面，「未发现规则命中」也高估了结论强度。
+    let mut read_failed = 0usize;
+    let selected: Vec<&std::path::PathBuf> = collected.files.iter().take(300).collect();
+    let dropped_by_cap = collected.files.len().saturating_sub(selected.len());
+    for f in &selected {
         scanned += 1;
         let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
         if kind_arkts && ext != "ets" && ext != "ts" {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let Ok(text) = std::fs::read_to_string(f) else {
+            read_failed += 1;
+            continue;
+        };
         let mut counts: Vec<usize> = vec![0; RULES.len()];
         for (i, line) in text.lines().enumerate() {
             for (ri, rule) in RULES.iter().enumerate() {
@@ -247,6 +295,31 @@ pub fn check_code(root: &Path, path: Option<&str>, kind: Option<&str>) -> Result
         "静态检查完成：扫描 {scanned} 个文件，{} 条命中。\n",
         by_rule.iter().map(|(_, h)| h.len()).sum::<usize>()
     ));
+    // 覆盖率不完整 → 结论打折。**「没看到高危」不等于「没有高危」**：
+    // 读不到的文件上同样看不到高危规则命中。写入稳定标记供闸门识别。
+    let mut gaps: Vec<String> = Vec::new();
+    if !collected.unreadable_dirs.is_empty() {
+        gaps.push(format!(
+            "{} 个目录读不到（{}）",
+            collected.unreadable_dirs.len(),
+            collected.unreadable_dirs.join("、")
+        ));
+    }
+    if read_failed > 0 {
+        gaps.push(format!("{read_failed} 个文件读不到内容"));
+    }
+    if collected.metadata_failed > 0 {
+        gaps.push(format!("{} 个文件取不到元数据", collected.metadata_failed));
+    }
+    if dropped_by_cap > 0 {
+        gaps.push(format!("{dropped_by_cap} 个文件超过单次 300 上限未扫描"));
+    }
+    if !gaps.is_empty() {
+        out.push_str(&format!(
+            "{SCAN_INCOMPLETE}：{}\n本次「无命中」结论**不覆盖**以上文件，修复访问权限或分目录重扫后才能作为干净结论。\n",
+            gaps.join("；")
+        ));
+    }
     for (rule, hits) in &by_rule {
         if hits.is_empty() {
             continue;
@@ -265,7 +338,12 @@ pub fn check_code(root: &Path, path: Option<&str>, kind: Option<&str>) -> Result
         }
     }
     if by_rule.iter().all(|(_, h)| h.is_empty()) {
-        out.push_str("\n未发现规则命中，代码整体较整洁。");
+        if gaps.is_empty() {
+            out.push_str("\n未发现规则命中，代码整体较整洁。");
+        } else {
+            // 覆盖不全时不能说「整洁」——没扫到的地方同样可能是脏的
+            out.push_str("\n已扫描到的文件中未发现规则命中（覆盖不完整，见上）。");
+        }
     }
     Ok(cut(&out, 15000))
 }
@@ -299,7 +377,7 @@ pub fn deep_scan(root: &Path, path: Option<&str>) -> Result<String, String> {
         }
         _ => root.to_path_buf(),
     };
-    let files = collect_src_files(&scan_root, 1024 * 1024);
+    let files = collect_src_files(&scan_root, 1024 * 1024).files;
     if files.is_empty() {
         return Ok("未发现可扫描的源码文件".into());
     }
@@ -496,8 +574,7 @@ pub fn codebase_search(root: &Path, query: &str, limit: usize) -> Result<String,
     }
 
     // 路 2：内容行匹配（低权重，量大截断）
-    let files = collect_src_files(root, 256 * 1024);
-    'outer: for f in files.iter().take(400) {
+    'outer: for f in collect_src_files(root, 256 * 1024).files.iter().take(400) {
         let Ok(text) = std::fs::read_to_string(f) else { continue };
         let relf = rel(root, f);
         for (i, line) in text.lines().enumerate() {
@@ -610,7 +687,7 @@ pub fn symbol_details(root: &Path, name: &str, file_filter: Option<&str>) -> Res
     // 引用反查：全库 grep（词边界粗匹配，排除定义文件:行）
     out.push_str(&format!("\n全库引用（\"{name}\" 出现位置，排除定义处，最多 20 条）：\n"));
     let mut refs = 0usize;
-    for f in collect_src_files(root, 256 * 1024).iter().take(400) {
+    for f in collect_src_files(root, 256 * 1024).files.iter().take(400) {
         let Ok(text) = std::fs::read_to_string(f) else { continue };
         let relf = rel(root, f);
         for (i, line) in text.lines().enumerate() {
@@ -752,7 +829,7 @@ pub fn secret_scan(
     let mut scanned_files = 0usize;
 
     // 1) 源码文件：复用 hardcoded-secret 规则
-    for f in collect_src_files(&scan_root, 512 * 1024).iter().take(500) {
+    for f in collect_src_files(&scan_root, 512 * 1024).files.iter().take(500) {
         scanned_files += 1;
         let Ok(text) = std::fs::read_to_string(f) else { continue };
         let relf = rel(root, f);
