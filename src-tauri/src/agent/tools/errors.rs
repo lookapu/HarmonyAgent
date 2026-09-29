@@ -6,6 +6,10 @@
 /// 判断错误是否值得自动重试（瞬态/环境类，重试可恢复）
 pub fn is_retryable_err(e: &str) -> bool {
     if recovery_requires_review(e) { return false; }
+    // 沙箱不可用是宿主能力缺失，不是瞬态故障：后端探测超时也会被拼进
+    // "sandbox_unavailable: ... 能力探测超时（3s）"，若继续按关键词扫描就会命中
+    // "超时" 判为可重试，反复重试一个必然失败关闭的调用。先短路。
+    if e.to_lowercase().contains("sandbox_unavailable") { return false; }
     const KEYS: [&str; 14] = [
         // 网络/超时类：请求失败、连接中断、偶发超时
         "超时", "请求失败", "timed out", "连接", "network", "timeout",
@@ -146,7 +150,11 @@ pub(crate) fn diagnose_tool_error(tool: &str, err: &str) -> Option<&'static str>
             }
         }
         "run_command" => {
-            if has_any(&["危险", "blacklist", "拒绝执行"]) {
+            if has_any(&["sandbox_unavailable"]) {
+                // 排在 "超时" 之前：探测超时文案含 "超时"，但调大命令 timeout
+                // 对"宿主没有可用沙箱后端"完全无效，只会烧掉重试预算。
+                Some("沙箱不可用：当前宿主没有可用的原生沙箱后端（非命令本身的问题，调大 timeout 无效）。改用不需要沙箱隔离的工具，或在设置里改用其他执行方式后重试")
+            } else if has_any(&["危险", "blacklist", "拒绝执行"]) {
                 Some("命令被安全策略拒绝：删除/格式化类命令禁止执行，请改用 write_file/edit_file 或 git 工具完成")
             } else if has_any(&["找不到程序", "not found", "no such file"]) {
                 Some("程序不存在：确认命令名正确且已安装（如 hvigorw.bat 在工程根目录），或使用完整路径")

@@ -224,6 +224,14 @@ fn classify_error(status: &str, output: &str, retry_safe: bool) -> ToolErrorEvid
     let lower = output.to_lowercase();
     let (code, category, transient) = if status == "cancelled" {
         ("TOOL_CANCELLED", "cancelled", false)
+    } else if lower.contains("sandbox_unavailable") {
+        // 必须排在 "超时" 分支之前：sandbox.rs 的探测超时会拼出
+        // "sandbox_unavailable: <prog> 能力探测超时（3s）"，先命中超时分支就会把
+        // "宿主没有可用沙箱后端" 报成 TOOL_TIMEOUT + 可重试，进而让模型去调大
+        // 命令 timeout——而那 3s 是后端探测超时，与命令超时无关，调大无用。
+        // 沙箱不可用是宿主能力缺失（Windows AppContainer 未实现 / 无原生后端 /
+        // 探测失败），重试无意义，故 transient=false。
+        ("SANDBOX_UNAVAILABLE", "infrastructure", false)
     } else if lower.contains("参数未通过 schema 校验")
         || lower.contains("argument schema validation")
     {
