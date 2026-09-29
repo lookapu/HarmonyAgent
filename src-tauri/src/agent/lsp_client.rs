@@ -981,18 +981,34 @@ fn apply_edits_to_text(text: &str, edits: &[Value]) -> (String, usize, usize) {
     (lines.join("\n"), add, del)
 }
 
-/// 应用 TextEdit 列表到文件（按位置倒序应用，行号不会因前面的编辑漂移）。
-/// 写盘前记录 undo 快照（可 undo_edit 回退）。返回 (新增字符数, 删除字符数)。
-fn apply_text_edits(path: &Path, edits: &[Value], conversation_id: &str) -> Result<(usize, usize), String> {
+/// 一条待落盘的文本编辑：写前门禁全部通过后的产物（尚未落盘）。
+///
+/// 准备与提交必须分离：跨文件 WorkspaceEdit 会在一次调用里写多个文件，
+/// 若「边校验边落盘」，第 N 个文件校验失败时前 N-1 个已经在磁盘上，
+/// 而工具返回的是 `Err`——模型读到「写入被拒绝」会合理地以为什么都没发生，
+/// 实际磁盘上却是半改状态，重试只会把状态搅得更碎。
+/// 与 fs 侧 multi_edit 的 prepare→validate→commit 是同一个形状。
+struct PendingTextEdit {
+    path: PathBuf,
+    /// 磁盘原始内容（提交时作为 undo 快照；同文件多次编辑只保留最初这份）
+    before: Vec<u8>,
+    /// 累积到当前步骤的新内容
+    after: String,
+    add: usize,
+    del: usize,
+}
+
+/// 写前准备（不落盘）：读原文件 → 文件级保护不变式 → 合成候选文本 → 候选文本门禁。
+fn prepare_text_edits(path: &Path, edits: &[Value]) -> Result<PendingTextEdit, String> {
     // 文件级保护不变式（.env* / .key|.pem|.pfx|.p12 / 已应用的迁移 SQL）。
     // fs 侧 6 处写路径都经 `invariants::check_write` 拦截，本模块原先**一处都没有**，
     // 而 invariants 的模块文档写着「全部写路径自动生效，无需改动各调用点」——
-    // 那句话对 LSP 路径是假的。本函数是 lsp_client 里**唯一**的落盘点
+    // 那句话对 LSP 路径是假的。本模块**唯一**的落盘点是 commit_text_edits
     // （`std::fs::write` 全模块只出现这一次），lsp_rename / lsp_format /
-    // format_file / lsp_code_activation 全部经 apply_workspace_edit 走到这里，
-    // 所以加在这一处即覆盖全部 LSP 写路径。
+    // format_file / lsp_code_activation 全部经它落盘，所以检查放在准备阶段
+    // （commit 前的最后一道），即覆盖全部 LSP 写路径。
     //
-    // 与上面的 `validate_code_mutation` 是**两道不同的门**：那一条校验候选文本
+    // 与 `validate_code_mutation` 是**两道不同的门**：那一条校验候选文本
     // （括号配平 / Tree-sitter），这一条校验**目标文件本身该不该被改**。
     if let Some((invariant, reason)) = crate::agent::invariants::check_write(path) {
         return Err(format!("写入被安全策略拒绝（{invariant} 不变式）：{reason}"));
@@ -1001,25 +1017,125 @@ fn apply_text_edits(path: &Path, edits: &[Value], conversation_id: &str) -> Resu
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let (out, add, del) = apply_edits_to_text(&text, edits);
     crate::agent::tools::validate_code_mutation(path, &text, &out)?;
-    // 候选文本通过写前门禁后才记录快照，避免失败修改污染 undo 栈。
-    crate::agent::undo::snapshot(conversation_id, path, &bytes);
-    std::fs::write(path, out).map_err(|e| format!("写回 {} 失败: {e}", path.display()))?;
+    Ok(PendingTextEdit {
+        path: path.to_path_buf(),
+        before: bytes,
+        after: out,
+        add,
+        del,
+    })
+}
+
+/// 同一 URI 再次出现：LSP 语义是后一条编辑作用于前一条的结果之上。
+/// 只重算 `after`，`before`（undo 快照）保持磁盘原文——
+/// 这与旧的「每次重新读已落盘的磁盘」行为一致。
+fn rebase_pending(item: &mut PendingTextEdit, edits: &[Value]) -> Result<(), String> {
+    let text = item.after.clone();
+    let (out, add, del) = apply_edits_to_text(&text, edits);
+    crate::agent::tools::validate_code_mutation(&item.path, &text, &out)?;
+    item.add += add;
+    item.del += del;
+    item.after = out;
+    Ok(())
+}
+
+/// 收集一条待写编辑；同路径已存在则叠加到既有条目上（保持 LSP 的顺序语义）。
+fn push_pending(pending: &mut Vec<PendingTextEdit>, path: &Path, edits: &[Value]) -> Result<(), String> {
+    match pending.iter_mut().find(|p| p.path == path) {
+        Some(prev) => rebase_pending(prev, edits),
+        None => {
+            pending.push(prepare_text_edits(path, edits)?);
+            Ok(())
+        }
+    }
+}
+
+/// 提交：提交前全量基线核对 → 逐个落盘（失败即回滚已落盘文件）→ 整批成功才登记 undo。
+///
+/// 与 fs 侧 `commit_prepared_edits` 同一形状，共用 `verify_write_baseline` /
+/// `write_candidate_with_restore` 两个原语，不在这里另写一份弱版本：
+/// 原实现是裸 `std::fs::write` 逐个写，既没有提交前基线核对，也没有回滚。
+fn commit_text_edits(pending: &[PendingTextEdit], conversation_id: &str) -> Result<(), String> {
+    // 准备阶段读到的内容若已被外部改写，整批拒绝，一个字节都不写。
+    for item in pending {
+        crate::agent::tools::fs_tools::verify_write_baseline(&item.path, &item.before).map_err(|e| {
+            format!(
+                "LSP 编辑提交前校验失败，未写入任何文件：{}：{e}",
+                item.path.display()
+            )
+        })?;
+    }
+    let mut committed: Vec<&PendingTextEdit> = Vec::with_capacity(pending.len());
+    for item in pending {
+        if let Err(e) = crate::agent::tools::fs_tools::write_candidate_with_restore(
+            &item.path,
+            &item.before,
+            item.after.as_bytes(),
+        ) {
+            let unresolved = rollback_pending(&committed);
+            if !unresolved.is_empty() {
+                return Err(format!(
+                    "LSP 编辑提交失败且回滚未完成，需人工核验；不能保证原始基线已恢复。提交错误：{e}；未恢复项：{}",
+                    unresolved.join("；")
+                ));
+            }
+            return Err(format!(
+                "LSP 编辑原子提交失败，已恢复当前文件并回滚此前 {} 个文件：{}：{e}",
+                committed.len(),
+                item.path.display()
+            ));
+        }
+        committed.push(item);
+    }
+    // 整批成功后才登记 undo，事务失败不会留下不可用的撤销记录。
+    for item in pending {
+        crate::agent::undo::snapshot(conversation_id, &item.path, &item.before);
+    }
+    Ok(())
+}
+
+/// 只恢复仍等于本事务候选的文件，绝不盲目覆盖后来发生的外部编辑。
+fn rollback_pending(committed: &[&PendingTextEdit]) -> Vec<String> {
+    let mut unresolved = Vec::new();
+    for item in committed.iter().rev() {
+        if crate::agent::tools::fs_tools::verify_write_baseline(&item.path, item.after.as_bytes()).is_ok() {
+            continue;
+        }
+        if let Err(e) = crate::agent::tools::fs_tools::write_candidate_with_restore(
+            &item.path,
+            item.after.as_bytes(),
+            &item.before,
+        ) {
+            unresolved.push(format!("{}：{e}", item.path.display()));
+        }
+    }
+    unresolved
+}
+
+/// 单文件写入口（lsp_format / format_file）：准备 + 提交。
+/// 应用 TextEdit 列表到文件（按位置倒序应用，行号不会因前面的编辑漂移）。
+/// 返回 (新增字符数, 删除字符数)。
+fn apply_text_edits(path: &Path, edits: &[Value], conversation_id: &str) -> Result<(usize, usize), String> {
+    let item = prepare_text_edits(path, edits)?;
+    let (add, del) = (item.add, item.del);
+    commit_text_edits(std::slice::from_ref(&item), conversation_id)?;
     Ok((add, del))
 }
 
 /// 应用 LSP WorkspaceEdit（changes / documentChanges 两种形态）到磁盘，返回 (文件数, 新增字符, 删除字符)
+///
+/// **两阶段**：先把所有文件的编辑全部走完写前门禁（不落盘），全部通过后才统一提交。
+/// 旧实现是「边校验边落盘 + `?` 短路」，第 N 个文件被 `check_write` 拒绝时前 N-1 个
+/// 已经写进磁盘，而返回值是 `Err`——调用方（lsp_rename）原样把错误抛给模型，
+/// 模型据此以为整个重命名没发生。实测：一次跨 2 文件的 WorkspaceEdit，
+/// 第二个是 `.env`，返回「写入被安全策略拒绝」，第一个文件的内容已被改掉。
 fn apply_workspace_edit(res: &Value, conversation_id: &str) -> Result<(usize, usize, usize), String> {
-    let mut files = 0usize;
-    let mut total_add = 0usize;
-    let mut total_del = 0usize;
+    let mut pending: Vec<PendingTextEdit> = Vec::new();
     if let Some(changes) = res["changes"].as_object() {
         for (uri, edits) in changes {
             let Some(p) = uri_to_path(uri) else { continue };
             if let Some(arr) = edits.as_array() {
-                let (a, d) = apply_text_edits(&p, arr, conversation_id)?;
-                total_add += a;
-                total_del += d;
-                files += 1;
+                push_pending(&mut pending, &p, arr)?;
             }
         }
     }
@@ -1031,14 +1147,15 @@ fn apply_workspace_edit(res: &Value, conversation_id: &str) -> Result<(usize, us
                 dc["edits"].as_array(),
             ) {
                 if let Some(p) = uri_to_path(uri) {
-                    let (a, d) = apply_text_edits(&p, edits, conversation_id)?;
-                    total_add += a;
-                    total_del += d;
-                    files += 1;
+                    push_pending(&mut pending, &p, edits)?;
                 }
             }
         }
     }
+    let files = pending.len();
+    let total_add: usize = pending.iter().map(|p| p.add).sum();
+    let total_del: usize = pending.iter().map(|p| p.del).sum();
+    commit_text_edits(&pending, conversation_id)?;
     Ok((files, total_add, total_del))
 }
 
@@ -1059,6 +1176,18 @@ pub(super) async fn lsp_rename(args: &Value, roots: &[String], conversation_id: 
         return Ok("该位置没有可重命名的符号（检查光标是否在符号上）".into());
     }
     let (files, add, del) = apply_workspace_edit(&res, conversation_id)?;
+    // 不可假成功：apply_workspace_edit 会静默跳过它不认识的 documentChanges 条目
+    // （如只含 RenameFile 操作的响应，实测返回 0/0/0）。不加这一支就会对模型说
+    // 「重命名完成（涉及 0 个文件）」并建议它去验证——把「什么都没发生」
+    // 包装成成功，白烧一轮。lsp_format / lsp_code_action 本来就有空编辑分支，
+    // 只有这里漏了。
+    if files == 0 {
+        return Ok(format!(
+            "语言服务返回了重命名结果，但没有可应用的文本编辑，**未写入任何文件**。\
+             请确认光标位置确实落在可重命名的符号上；若该语言服务只返回文件重命名操作（RenameFile），\
+             本工具暂不支持，会保留原文件。"
+        ));
+    }
     Ok(format!(
         "重命名完成：\"{new_name}\"（涉及 {files} 个文件，+{add} −{del} 字符）\n\
          建议随后用 check_code 或构建验证无残留引用。"

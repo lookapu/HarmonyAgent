@@ -3385,9 +3385,10 @@ pub(super) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
     Ok((replaced, count))
 }
 
-fn verify_write_baseline(path: &Path, old_bytes: &[u8]) -> Result<(), String> {
-    // 候选分析与 spawn_blocking 派发之间可能发生外部改写，真正写入前再核对完整基线。
-    // 这是最终前置检查，不宣称能锁住不合作的外部进程或提供文件系统级 CAS。
+/// 提交前基线核对（TOCTOU 最终前置检查）。fs 侧与 lsp_client 侧的写路径共用。
+/// 候选分析与真正写入之间可能发生外部改写，写入前再核对完整基线。
+/// 不宣称能锁住不合作的外部进程，也不提供文件系统级 CAS。
+pub(crate) fn verify_write_baseline(path: &Path, old_bytes: &[u8]) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| format!("提交前无法核验文件，未写入：{error}"))?;
     if !metadata.file_type().is_file() {
         return Err("编辑冲突：提交目标不再是普通文件，未写入".into());
@@ -3405,7 +3406,9 @@ fn verify_write_baseline(path: &Path, old_bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn write_candidate_with_restore(
+/// 先核对基线再写入；写入失败时立即把原内容写回。
+/// fs 侧 multi_edit 提交与 lsp_client 的 LSP 编辑提交共用同一原语。
+pub(crate) fn write_candidate_with_restore(
     path: &Path,
     old_bytes: &[u8],
     candidate: &[u8],
