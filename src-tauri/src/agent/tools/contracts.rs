@@ -198,6 +198,14 @@ fn validator(tool: &str) -> Option<ValidatorKind> {
 
 fn recovery_action(tool: &str, effect: EffectKind) -> RecoveryAction {
     match tool {
+        // ⚠️ 这里曾把 `apply_patch` 当成真实工具，而 TOOL_SPECS 里从来没有它
+        // （全树唯一的同名函数是评测 harness 的 eval_patch::apply_patch）。
+        // 它是死条目，不改变任何判定，因此没有按「唯一真源」的口径删除——
+        // 本表的语义是「这类工具用哪种恢复手段」，multi_edit 走自带的原子回滚、
+        // lsp_rename 走 undo_edit，落进下面的 VerifyThenCompensate 是**有意的**，
+        // 与验收/审批/事实失效那几处不同：那里的漏项会产生陈旧或不安全状态。
+        // 核对工具是否真实存在：
+        // rg -o --no-filename 'name: "[a-z0-9_]+"' src-tauri/src/agent/tools/mod.rs | Sort-Object -Unique
         "write_file" | "edit_file" | "apply_patch" | "delete_file" => RecoveryAction::RestoreSnapshot,
         "git_commit" => RecoveryAction::GitRevert,
         "deploy" | "deploy_all" => RecoveryAction::RedeployPrevious,
