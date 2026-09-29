@@ -54,6 +54,16 @@ fn cards() -> std::sync::MutexGuard<'static, Option<Vec<ReflexionCard>>> {
 /// 从失败输出提炼"下次怎么做"的启发式建议（按错误关键词匹配，先命中先返回）。
 fn suggest(tool: &str, out_lower: &str) -> String {
     let pairs: &[(&str, &str)] = &[
+        // ⚠️ 必须排在 "超时" 之前：sandbox.rs 的探测失败会拼出
+        // "sandbox_unavailable: <prog> 能力探测超时（3s）"，表里又有裸词 "超时"，
+        // 顺序颠倒就会把「宿主没有可用沙箱后端」复盘成「命令超时了，拆小再试」——
+        // 而那 3s 是后端探测超时，与命令耗时无关，拆多少次都不会成功。
+        // structured_result::classify_error 与 errors::is_retryable_err 都已在这条
+        // 语义上短路过，本表是同一族里的第三处，缺它会让模型照着错误建议原地打转。
+        (
+            "sandbox_unavailable",
+            "沙箱不可用：当前宿主没有可用的原生沙箱后端（Windows AppContainer 未实现 / 无原生后端 / 探测失败），不是命令本身的问题。缩小任务、调大 timeout 都无效；改用不需要沙箱隔离的工具，或在设置里改用其他执行方式",
+        ),
         (
             "sdkpath",
             "先检查 SDK 路径/版本对齐（check_sdk_alignment / harmony_env），不要重复相同构建",

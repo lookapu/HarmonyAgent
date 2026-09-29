@@ -65,6 +65,28 @@ docs/postmortem/000N-<复发模式 slug>.md
   已修：`structured_result.rs` 增加 `SANDBOX_UNAVAILABLE` 分类臂（排在超时分支之前），
   `errors.rs` 对 `sandbox_unavailable` 前缀短路可重试判断与建议分支。
 
+  **同一语义的第三处（本轮补上）**：`reflexion.rs::suggest` 是**复盘建议表**，
+  按关键词「先命中先返回」给模型下一步指引，表里有裸词 `"超时"`（第 7 位），
+  却没有 `sandbox_unavailable`——于是同一类错误在这里被复盘成第三条路。
+  实测（修复前，`suggest("run_command", "sandbox_unavailable: hdc 能力探测超时（3s）")`）：
+
+  | | 实际给出的建议 |
+  |---|---|
+  | 修复前 | 「任务/命令超时后应拆分为更小的步骤重试，不要原样重复长命令」 |
+  | 修复后 | 「沙箱不可用：…改用不需要沙箱隔离的工具，或在设置里改用其他执行方式」 |
+
+  前者让模型把**宿主能力缺失**当成命令慢，拆多少次都不会成功。
+  这处比前两处更靠后也更要紧：`classify_error` 只影响错误分类，
+  `is_retryable_err` 只影响重试预算，而 `suggest` 决定的是模型**接下来做什么**。
+  已修：表首加 `sandbox_unavailable` 条目，并写明必须排在 `"超时"` 之前。
+  修复后同时确认**真命令超时**（`命令执行超时（300s）`）仍命中原来那条，没有被误伤。
+
+  **这一族的审计形状**：「某个错误文本有两种含义，而下游用关键词反推」——
+  每加一个下游消费者就得记得加一次短路。已确认**三处全部覆盖**：
+  `structured_result::classify_error`（分类）、`errors::is_retryable_err`（可重试）、
+  `reflexion::suggest`（建议）。新增第四个消费者时，
+  先 grep `sandbox_unavailable` 看这三处是否都被覆盖。
+
 - **"验证工具跑成功"被当成"它验证出了好结果"**：`verify_ui` 无论判定黑屏/白屏还是正常，
   都返回 `Ok(report)`——它确实成功截到了图，所以 `succeeded` 为 true。而
   `postconditions.rs` 的写后读确认矩阵只看 `succeeded`，于是
@@ -406,6 +428,37 @@ exit code 非零 → `Err` → 不进 `is_global_verifier`。
 所以「没看到高危」在这种仓库里真的可能是假的，该拦。
 
 ### 已核实并证伪（风险面缩小）
+
+- **工具响应缓存会返回写入前的旧内容** —— **不成立，且设计上就免疫**。
+  `tool_cache.rs` 的文档写着「任意成功的非缓存工具调用都会由调用方清空缓存」，
+  看起来是「清单驱动」，实读 `tools/mod.rs:1436-1440` 发现它**根本不看工具名**：
+  `if is_ok && is_cacheable(name) { put } else if is_ok { clear() }`——
+  任何一次成功的非缓存调用都**整体清空**，与「哪些工具会改文件」这份清单无关。
+  缓存键也含 `project_id` + 有效根目录范围 + 参数全文（`key()` 三者都 hash）。
+  **这是本项目里对该族最稳的一处写法，值得作为模板**：宁可整体失效，
+  也不维护「工具 → 资源」依赖图。上一族六处缺陷全部源于维护那份依赖图。
+
+- **符号索引在 `lsp_rename` 后残留旧符号** —— **不成立**。
+  `tools/mod.rs:1445-1465` 的增量失效清单确实漏了 `lsp_rename`
+  （只列 `write_file|edit_file|delete_file|move_file|copy_file|multi_edit`），
+  看起来会让索引存旧数据。**但兜底是承重的**：文件指纹用
+  **mtime 纳秒 + 字节数**（`symbol_index.rs:1606`，注释明写「NTFS 精度 100ns，
+  可察觉同秒内改写」），而 `index_project_cached` 在热路径上每次查询都会跑
+  （`scanner.rs` 三处、`commands/index.rs` 四处、`repo_watcher` 两处）。
+  符号改名恰好是最容易「同秒 + 同字节数」的操作（`foo`→`bar` 长度不变），
+  纳秒精度仍能抓住。
+  **结论：这里只是性能损失（下次查询全量重扫该文件）而非正确性问题，故不改。**
+  判据仍是那条：「漏掉之后会不会出事」——不会出事就不动。
+
+- **ToolSpec 承诺的 `undo_edit` 回退是空头支票** —— **不成立，三个工具全部兑现**。
+  `format_file` / `lsp_format` / `lsp_rename` 的描述都写着「可 undo_edit 回退」。
+  全仓 `undo::snapshot` 只有 6 个调用点，逐个确认覆盖：
+  LSP 侧全部经 `lsp_client::apply_workspace_edit`（4 处调用）→ `apply_text_edits`
+  → 落盘前 snapshot（`lsp_client.rs:992`）；fs 侧经 `write_candidate_with_restore`
+  （3 处）与 `commit_prepared_edits`（`multi_edit`，1 处）。
+  `format_file` 的 `dry_run=true` 分支明确标注「不落盘、不入 undo」，与描述一致。
+  **「共享辅助函数 + 在里面统一落快照」是这类承诺的正确实现方式**，
+  比在每个工具里各写一遍更不容易漏。
 
 - **评测期望产物在断言前被刷新** —— **不成立**。`ci_baseline_gate` 的实际顺序是
   run → 读基线 → `compare_with_baseline` → `assert!` → 才 `std::fs::write` 落基线；
