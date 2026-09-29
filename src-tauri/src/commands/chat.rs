@@ -11103,30 +11103,32 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                 Ok(output) => {
                     round_state.consecutive_failures = 0;
                     stats.tool_rounds += 1;
-                    // 记录修改过的文件（edit_file/write_file 目标 + run_command 间接修改，去重；供消息底部文件列表展示）
-                    if tool == "edit_file" || tool == "write_file" {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_raw) {
-                            if let Some(p) = v["path"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                                // 模型给出的绝对路径可能带 \\?\ 前缀，先规范化；项目路径同样规范化，
-                                // 避免大小写/斜杠方向/冗余分隔符不一致导致 strip_prefix 失败、保留绝对路径被前端 diff 拒绝。
-                                let p = crate::utils::path::normalize_path(p);
-                                let proj_norm = crate::utils::path::normalize_path(project_path);
-                                // 绝对路径且位于项目内时转相对（大小写不敏感比较，Windows 友好），便于展示
-                                let rel = if p.starts_with(&proj_norm) {
-                                    p[proj_norm.len()..].trim_start_matches(['/', '\\']).to_string()
-                                } else {
-                                    // 退而求其次：用 std canonicalize 比较（处理大小写/.. 等），失败则保留原路径
-                                    match (std::fs::canonicalize(&p), std::fs::canonicalize(&proj_norm)) {
-                                        (Ok(pc), Ok(rc)) => pc
-                                            .strip_prefix(&rc)
-                                            .map(|r| r.to_string_lossy().replace('\\', "/"))
-                                            .unwrap_or_else(|_| p.clone()),
-                                        _ => p.clone(),
-                                    }
-                                };
-                                if !round_state.modified_files.contains(&rel) {
-                                    round_state.modified_files.push(rel);
+                    // 记录修改过的文件（写工具目标 + run_command 间接修改，去重；供消息底部文件列表展示）。
+                    // 写工具清单必须与 verification_planner 的变更范围一致：那边把
+                    // apply_patch / multi_edit / delete_file / lsp_rename 都算作变更，
+                    // 这边若只认 edit_file/write_file，就会出现「验收认为改了 4 个文件、
+                    // 交付清单只列出 1 个」这种对不上的状态——而这张清单正是用户验收的依据。
+                    if crate::agent::verification_planner::is_mutation_tool(tool) {
+                        let proj_norm = crate::utils::path::normalize_path(project_path);
+                        for raw in crate::agent::verification_planner::paths_from_args(args_raw) {
+                            // 模型给出的绝对路径可能带 \\?\ 前缀，先规范化；项目路径同样规范化，
+                            // 避免大小写/斜杠方向/冗余分隔符不一致导致 strip_prefix 失败、保留绝对路径被前端 diff 拒绝。
+                            let p = crate::utils::path::normalize_path(&raw);
+                            // 绝对路径且位于项目内时转相对（大小写不敏感比较，Windows 友好），便于展示
+                            let rel = if p.starts_with(&proj_norm) {
+                                p[proj_norm.len()..].trim_start_matches(['/', '\\']).to_string()
+                            } else {
+                                // 退而求其次：用 std canonicalize 比较（处理大小写/.. 等），失败则保留原路径
+                                match (std::fs::canonicalize(&p), std::fs::canonicalize(&proj_norm)) {
+                                    (Ok(pc), Ok(rc)) => pc
+                                        .strip_prefix(&rc)
+                                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                                        .unwrap_or_else(|_| p.clone()),
+                                    _ => p.clone(),
                                 }
+                            };
+                            if !rel.is_empty() && !round_state.modified_files.contains(&rel) {
+                                round_state.modified_files.push(rel);
                             }
                         }
                     } else if tool == "run_command" {

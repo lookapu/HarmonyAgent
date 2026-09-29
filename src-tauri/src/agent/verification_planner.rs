@@ -23,8 +23,7 @@ pub struct VerificationPlan {
 
 pub fn plan(evidence: &[ToolEvidence<'_>]) -> VerificationPlan {
     let mut changed_files = evidence.iter().filter(|item| {
-        item.succeeded && matches!(item.tool,
-            "write_file" | "edit_file" | "delete_file" | "apply_patch" | "multi_edit" | "lsp_rename")
+        item.succeeded && is_mutation_tool(item.tool)
     }).flat_map(changed_paths).collect::<Vec<_>>();
     changed_files.sort();
     changed_files.dedup();
@@ -35,8 +34,7 @@ pub fn plan(evidence: &[ToolEvidence<'_>]) -> VerificationPlan {
             && !deleted_files.iter().any(|deleted| same_path(deleted, path))
     }).cloned().collect::<Vec<_>>();
     let last_mutation = evidence.iter().enumerate().filter(|(_, item)| {
-        item.succeeded && matches!(item.tool,
-            "write_file" | "edit_file" | "delete_file" | "apply_patch" | "multi_edit" | "lsp_rename")
+        item.succeeded && is_mutation_tool(item.tool)
     }).map(|(index, _)| index).next_back();
     let mut steps = Vec::new();
     let mut add = |tool: &str, reason: &str, required: bool| {
@@ -205,31 +203,66 @@ fn same_path(left: &str, right: &str) -> bool {
     left == right || left.ends_with(&format!("/{right}")) || right.ends_with(&format!("/{left}"))
 }
 
+/// 会改变工作区文件的工具。**唯一真源**。
+///
+/// 验证范围（`plan`）与交付给用户的变更清单（`chat.rs` 的 `modified_files`）
+/// 必须认同一份清单：前者决定「这次任务要验证哪些文件」，后者是用户实际看到的
+/// 那张单子。两者一旦分叉，就会出现「验收认为改了 4 个文件、清单只列 1 个」，
+/// 而用户正是拿这张清单去做最终验收的。
+pub(crate) fn is_mutation_tool(tool: &str) -> bool {
+    matches!(tool, "write_file" | "edit_file" | "delete_file" | "apply_patch" | "multi_edit" | "lsp_rename")
+}
+
 fn changed_paths(evidence: &ToolEvidence<'_>) -> Vec<String> {
-    let Ok(args) = serde_json::from_str::<serde_json::Value>(evidence.args) else {
+    paths_from_args(evidence.args)
+}
+
+/// 从工具参数里取出这次调用命中的文件路径（写工具专用）。
+///
+/// 覆盖三种形态：`path`/`file`/`from`/`to` 直给、`edits[]` 逐条、
+/// 以及 `apply_patch` 的 `*** Update/Add/Delete File:` 与 `+++ b/` 补丁头。
+///
+/// **调用方不再各自写一份路径解析**——验证范围、任务账本、消息底部的文件列表
+/// 消费的是同一批工具，解析规则一旦分叉就会出现「验收认为改了文件、
+/// 交付清单里没有」这种对不上的状态。
+///
+/// `content` 只在调用**没有**给出路径时才当补丁扫：`write_file` 的 `content`
+/// 是整份文件正文，写进去的内容里出现 `+++ b/` 这类行并不代表它改过那个文件，
+/// 按补丁头解析只会凭空造出假变更。
+pub(crate) fn paths_from_args(args_raw: &str) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(args_raw) else {
         return Vec::new();
     };
     let mut paths = Vec::new();
     for key in ["path", "file", "from", "to"] {
         if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
-            paths.push(path.to_string());
+            let path = path.trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+            }
         }
     }
     if let Some(edits) = args.get("edits").and_then(|value| value.as_array()) {
         paths.extend(edits.iter().filter_map(|edit| {
-            edit.get("path").or_else(|| edit.get("file"))?.as_str().map(str::to_string)
+            let raw = edit.get("path").or_else(|| edit.get("file"))?.as_str()?.trim();
+            (!raw.is_empty()).then(|| raw.to_string())
         }));
     }
+    let names_target = !paths.is_empty();
     for key in ["patch", "content"] {
-        if let Some(patch) = args.get(key).and_then(|value| value.as_str()) {
-            for line in patch.lines() {
-                let path = line.strip_prefix("*** Update File: ")
-                    .or_else(|| line.strip_prefix("*** Add File: "))
-                    .or_else(|| line.strip_prefix("*** Delete File: "))
-                    .or_else(|| line.strip_prefix("+++ b/"));
-                if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
-                    paths.push(path.to_string());
-                }
+        if names_target && key == "content" {
+            continue;
+        }
+        let Some(text) = args.get(key).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        for line in text.lines() {
+            let path = line.strip_prefix("*** Update File: ")
+                .or_else(|| line.strip_prefix("*** Add File: "))
+                .or_else(|| line.strip_prefix("*** Delete File: "))
+                .or_else(|| line.strip_prefix("+++ b/"));
+            if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
+                paths.push(path.to_string());
             }
         }
     }

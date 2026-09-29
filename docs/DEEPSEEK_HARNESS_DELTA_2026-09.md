@@ -110,8 +110,42 @@
 - 一次文件编辑重复多次只计一次
 - 只追加一个 log-only `workspace/changes` 事件，**不进模型上下文**
 
-我们的 `acceptance.rs`（目标契约与证据验收）已经在做"写操作之后必须出现覆盖产物的验证" ——
-这个补的是**给人看的**那张变更卡，且证据来源是独立的 git 树快照而非工具自述。
+#### 更正：本项目已有这套能力，初版把它写成了「缺失」
+
+初版结论是「我们的 `acceptance.rs` 已经在做写后验证，这个补的是**给人看的**那张变更卡」——
+**这个措辞暗示本项目没有这张卡，是错的。** 实读后发现本项目已经实现了它的主体：
+
+| 上游设计 | 本项目对应 | 位置 |
+|---|---|---|
+| 每轮汇总改动的文件 | `DesktopRoundState.modified_files`，按任务去重、存相对路径 | `chat.rs:4692` |
+| 落库并可回看 | `messages.modified_files_json` | `chat.rs:7304` |
+| 用户可见 | 消息底部的文件列表（字段注释即写明用途） | `chat.rs:4691` |
+| shell 改动也覆盖 | `run_command` 后走 `scan_recent_changes`：按 mtime + 长度 + FNV-64 扫目录，排除 `.git/node_modules/build/…` | `tools/mod.rs:4990` |
+| 独立于工具自述 | 部分达成——`run_command` 那路是**结果**（扫出来），文件工具那路是**意图**（模型报了哪个路径） | `chat.rs:11106` |
+
+上游真正多出来的是：**回合首尾的 git 树快照**（比我们的目录扫描更强的一点是能
+把「用户本轮开始前就有的未提交改动」摘出去）、**每文件增删行数**、**每文件对比服务**、
+**Web 卡片**。前两项要落进本项目属中等偏大工程（要先解决临时 object 目录的生命周期），
+且用户的 HarmonyOS 工程未必都在 git 仓库里，收益不确定。
+
+**这一节的教训和 §六 是同一类**：初版据上游 README 推断了本项目的缺口，
+没有回到本项目确认。真正动手前先实读，发现主体已存在，
+于是把范围收窄成「补真实缺口」而不是「新建一套」。
+
+#### 复核时发现的真实缺口（已修）
+
+`chat.rs` 记录文件列表时只认 `edit_file` / `write_file` 两个工具，
+而**同一时刻** `verification_planner` 把 `write_file / edit_file / delete_file /
+apply_patch / multi_edit / lsp_rename` 六个都算作变更。两份清单分叉的直接后果是：
+模型用 `apply_patch` 或 `multi_edit` 改的文件，**验收侧认为变了、交付给用户的那张
+清单里却没有**——而那张清单正是用户做最终验收的依据。
+
+已修：把这份清单收敛成 `verification_planner::is_mutation_tool` 单一真源，
+`chat.rs` 改用它，并复用同一套路径解析（`paths_from_args`，覆盖 `path`/`file`/`from`/`to`、
+`edits[]`、以及 `apply_patch` 的 `*** Update/Add/Delete File:` 与 `+++ b/` 补丁头）。
+顺带收紧一处：`write_file` 的 `content` 是整份文件正文，**不再**按补丁头扫描，
+否则写入内容里恰好出现 `+++ b/` 就会凭空造出一个假变更。
+
 
 ### 2.5 其他
 
@@ -271,6 +305,13 @@ if (framedSummaryTokenCount >= prepared.shadowedRouteTokenCount) {
 本项目 `HARNESS_ENHANCEMENTS.md` 里那 23 条已全部 ✅，说明团队早就做过一轮对齐，
 初版分析把"已实现"误判成"缺失"了。
 
+**同一个错误在初版犯了两次**，第二次是 §2.4 的变更卡——同样是读了上游 README 就
+断定本项目没有对应能力，动手前实读才发现主体已实现（`modified_files` +
+`scan_recent_changes` 已在跑）。两次的成因相同：**上游文档描述的是"他们的方案"，
+不是"我们的缺口"**，把前者当成后者读就会系统性地高估差距。
+**动一行代码之前先花一次实读成本，永远比按错误前提做完一整轮再返工便宜。**
+
+
 ---
 
 ## 七、建议动作（复核后）
@@ -287,7 +328,7 @@ if (framedSummaryTokenCount >= prepared.shadowedRouteTokenCount) {
 | 5 | 建 `docs/postmortem/` | ✅ **已完成**（初版写的"待团队提供"已过时） | 目录 + 模板 + 2 篇事故条目，均从 `CHANGELOG.md` 既有记录反推，非新编 |
 | 6 | 刷新 `references/deepseek-harness` | ✅ | `dsh-v0.2.0-rc.1` / `4878cdabd8`（2026-09-28） |
 | 7 | 评估 SSH 执行世界适配远程设备调试 | ⬜ **仍未评估** | 无产物 |
-| 8 | `deliverables/workspace-changes` 变更卡 | ⬜ **仍未做** | 无产物 |
+| 8 | `deliverables/workspace-changes` 变更卡 | ◐ **主体本项目已有**（初版写 ⬜ 是错的，见 §2.4 更正）；已补真实缺口：写工具清单与验证范围统一 | 本次核对：文件列表与 `verification_planner` 曾认 6 个 / 2 个写工具，已收敛为单一真源 |
 
 ### §3.2 那处反向 fail-open 的处置
 
