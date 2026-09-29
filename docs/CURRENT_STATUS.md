@@ -17,6 +17,7 @@
 | 后端库回归（Windows 本机，设备预览批次 2026-09-18） | 同上 | 1,139 通过 / 0 失败 / 10 忽略（较上一批 +10 条预览用例：引擎参数、帧格式、WebSocket 帧解析、产物定位、默认页解析） |
 | 后端库回归（Windows 本机，复读防护 + 清单双向化批次 2026-09-18） | 同上 | 1,161 通过 / 0 失败 / 10 忽略（较上批 +10 条：`services::repetition` 8 条含事故原文回归、轮级路由"复读优先于截断/中断"1 条、`todo::render_hint` 2 条）；`frontend_backend_contract` 2 通过（新增 `insert_queued_now`）；clippy 57/57、`check-docs.py`、`check-ui-states.py`、前端 133 用例与体积门禁均通过 |
 | 后端库回归（Windows 本机，计划模式空弹窗批次 2026-09-18） | 同上 | 1,166 通过 / 0 失败 / 10 忽略（较上批 +5 条：`plan_block_extraction_tests` 覆盖"取最长块而非被引用的占位符""纯占位符/纯标记不算计划""半角标记与无标记兜底""短闲聊不算计划"）；clippy 57/57、`check-docs.py`、`check-ui-states.py`、前端 133 用例与体积门禁均通过 |
+| 后端库回归（Windows 本机，合段第 1-3 步批次 2026-09-29） | 同上 | 1,166 通过 / 0 失败 / 10 忽略（与上一批同数，确认合段搬运未改变任何用例结果）；两组 crash E2E 各 3 项、`frontend_backend_contract` 2 项通过；`cargo check --lib` 0 告警、`check-warnings.py` 57/57、`check-docs.py` 通过。**前置修正**：首跑本机基线时 `eval_runner` 4 条失败（硬编码 POSIX `grep` 不在本机 PATH，见第 5 节），临时把 `Git\usr\bin` 加入 PATH 后恢复 1,166/0/10；首轮 clippy 因搬运产生的 23 行多余重借用 FAIL 83，由 rustc suggestion 修到 57/57，未抬基线 |
 | 设备预览端到端（Windows 本机，2026-09-18） | `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` 中的 `previewer::tests::e2e_preview_frames_from_real_engine`（需 `DEVECO_PREVIEW_E2E_PROJECT`） | 通过（真实工程 → 构建 → 起引擎 → 取回 JPEG 帧；见盘点 §54） |
 | 前端测试 | `npm test` | 15 文件、133 通过（含 `previewPanel.test.tsx`：启动/停止、帧渲染、失败不静默、卸载解绑与停引擎） |
 | 前端 ↔ 后端名字一致性 | `cargo test --manifest-path src-tauri/Cargo.toml --test frontend_backend_contract` | 2 通过（前端 `invoke*` 调到的命令必须已在 `lib.rs` 注册、`listen*` 订阅的事件必须在 Rust 源码里有同名字面量；当前 307 个命令 / 55 个事件全部对得上。测试只设下限防空过，不钉具体数字） |
@@ -67,7 +68,7 @@
 | --- | --- | --- | --- |
 | 目标与计划驱动 | 已实现核心链路 | `commands/chat.rs` 的 GoalContract、`activate_approved_plan`、计划继承；前端计划确认卡与测试 | 真实模型「计划→多步→中断→交付」完整轨迹未验 |
 | 计划/审查模式的确认环节 | 已实现（含事故修复） | 计划正文提取改为**取内容最长的合法块**并拒收占位符（`extract_plan_block`/`resolve_plan_text`，5 条用例含事故原文）；拿不到可用正文时**不弹确认框**，改为注入纠正让模型重出（上限 2 次，用尽如实收尾，`plan_redrafts`）；系统提示不再把标记写成"标记A...标记B"连排（那种模板会被模型原文引用，引文里的省略号恰好构成合法标记对 → 提取到空计划，本机实测：弹窗只有一个空框，用户只能驳回重做）；计划待确认/已批准两张卡片从悬浮层改为**内嵌消息流**（悬浮层盖住输入区，想边看对话边审计划时无处下手，本机实际反馈） | 阈值 24 字是"够不够当计划"的启发式，极短但合法的计划会被要求重出；卡片内嵌后靠消息流贴底滚动带出来，用户若手动上滑需自己滚回底部（会话列表的"待确认"角标仍在） |
-| 长会话恢复与执行治理 | 基础实现 + 本机回归充分 | `agent/kernel_executor.rs` 检查点/安全点、预算继承、两组 crash E2E | 桌面 IO adapter 未统一：迁移方案与两次更正见 [headless 驱动文档 §17/§18/§19](./HEADLESS_AGENT_DRIVER.md)（主循环体 305 行（原 2,107，口径见驱动文档 §20 的更正说明）、循环内 `.emit(` **0** 处、`.0.lock()` 1 处；**已实测否掉「先补 Tauri 测试替身」**：mock 需全仓 AppHandle 泛型化、代价更大；正确顺序是先抽取端口、再用假端口加行为快照，抽取期间靠编译器+回归+手动桌面验收把关）；**按段搬运已全部完成**，第 7 步进行中（状态已收进 `DesktopRoundState`，7/14 个段函数改收 `&mut DesktopRoundState`；剩余合段本身需桌面验收窗口）；真实长任务未验 |
+| 长会话恢复与执行治理 | 基础实现 + 本机回归充分 | `agent/kernel_executor.rs` 检查点/安全点、预算继承、两组 crash E2E | 桌面 IO adapter 未统一：迁移方案与两次更正见 [headless 驱动文档 §17/§18/§19](./HEADLESS_AGENT_DRIVER.md)（主循环体 **42 行**（原 2,107，口径见驱动文档 §20 的更正说明）、循环内 `.emit(` **0** 处、`.0.lock()` 1 处；**已实测否掉「先补 Tauri 测试替身」**：mock 需全仓 AppHandle 泛型化、代价更大；正确顺序是先抽取端口、再用假端口加行为快照，抽取期间靠编译器+回归+手动桌面验收把关）；**按段搬运与合段第 1-3 步已全部完成**（14/14 个段函数收 `&mut DesktopRoundState`；`RoundOutcome` 三变体 + round 体搬进 `desktop_round` + 主循环切调用点，257 行主体逐行比对只有 13 行控制流 + 23 行借用形态差异）；**第 7 步只剩第 4 步切 `run(port)` 与桌面验收**（改运行路径，单独成提交）；真实长任务未验 |
 | Headless Agent | 核心实现 | `HeadlessIoPort` 交给 `KernelIoRunLoop::run`；评测契约与桩端到端 | 真实 trial 的 manifest/trajectory/成本未产出 |
 | 大仓索引可达性 | 已实现 + 历史基准 | `services/symbol_index.rs` 全库目录/延迟解析/watcher；`docs/INDEX_SCALE_BASELINE.md` | 真实混合仓全量收敛耗时、Recall@k、前台 P95 未测 |
 | 结构查询与影响面 | 部分 | `repo_query` 的 `auto`/`impact` 分流、SCIP/LSP/AST 边、分页与覆盖状态 | 统一依赖重排 planner、跨语言正确率未做 |
@@ -92,8 +93,9 @@
 - **真实模型**：任务成功率、常驻工具 A/B、eval 报告与成本。
 - **Docker/Podman**：OCI 沙箱端到端与逃逸套件、artifact 导出。
 - **签名与发行**：平台代码签名、公证、SBOM/provenance、干净机器安装验收。
-- **Windows/Linux**：目标编译校验（本机只有 macOS 工具链；MinGW 只能覆盖 windows-gnu，不等于 CI 用的 MSVC）。
+- **Windows/Linux**：Linux 目标本机编译仍未覆盖；Windows 侧已于 2026-09-29 在本机用 MSVC 工具链编译通过（后端库 + 三组集成测试 + 打包 exe），「本机只有 macOS 工具链」的记录已过期。MinGW 只能覆盖 windows-gnu，不等于 CI 用的 MSVC。
 - **只在 CI 成立、本机不复现**：Windows 质量矩阵结论（16 处 Windows 失败清零）。**编码类门禁行为已于 2026-09-17 在本机 Windows 复现**（见第 3 节），从本清单移出；路径形态类（符号链接、8.3 短名）与 Windows/Linux 目标编译仍未覆盖。改动这些路径时须以 CI 结果为准，不能用本机绿推断。
+- **测试用例依赖 POSIX 工具、CI 绿是镜像巧合**（2026-09-29 本机建基线时暴露）：`agent::eval_runner::tests` 的 4 条用例把 grader 程序硬编码成 `grep`（`task_with_grader(vec!["grep", "-q", "fixed", "a.txt"])`），经 `Command::new` 按 **PATH** 解析。GitHub 的 `windows-latest` 镜像恰好把 `C:\Program Files\Git\usr\bin` 放进 PATH，所以 Windows CI 全绿；普通 Windows 开发机（Git 装了但该目录不在 PATH）上这 4 条必然失败，报 `grader 启动失败：program not found`。**不是产品缺陷**——eval 侧按清单声明的命令启动 grader，行为正确；缺陷在用例把平台工具写死。验证：把 `Git\usr\bin` 临时加进 PATH 后 9 条 `eval_runner` 用例全过，本机基线回到 1,166/0/10。**未修**：修法要么换成本机必然存在的程序，要么解析不到就跳过；本轮只记录，未改用例。
 - **CI 偶发、方向待证**：`agent::tools::fs_tools::tests::java_type_gate_covers_unedited_java_callers` 在 windows-latest 上偶发失败——2026-09-18 的 `35313187722` 失败、同为 Windows 的 `35315010893` 通过，macOS 两次都通过；本机 JDK 17 与 25 均稳定通过。怀疑是 javac 差分的 10 秒超时在 runner 负载高时走了既定的「退回只编本批、不阻塞写入」降级路径，而该测试没区分这条**合法**降级路径（**未证**）。该测试的失败分支已加诊断（调用方是否被收集 / `affected_skipped` / javac 版本），下次出现自带现场。
 
 ## 6. 维护约定

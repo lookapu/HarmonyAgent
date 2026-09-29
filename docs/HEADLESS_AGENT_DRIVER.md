@@ -928,7 +928,7 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 
 **第 7 步签名改造完成后的总体状态**：主循环体 2,107（旧口径）/ 1,978（更正口径）→ **258 行**；14 个函数统一收 `&mut DesktopRoundState`；状态结构只装所有权数据（`stats`/执行器作为显式参数，见第二刀的坑）。**剩下的只有合段本身**：`RoundOutcome`（替代剩余 11 处控制流）+ 把 round 体搬进 `desktop_round` + 切换 `run(port)`——仍按第 19 节第 3 条等真实桌面验收窗口，因为切换后旧路径不再存在、自动化层面又没有行为快照。
 
-**欠账已清**（`7e57278`）：3 处 `#[allow(clippy::needless_borrow)]` 已随签名改造完成后撤除，借用写法回到普通形态。**仍未覆盖**：Windows 侧与 CI 尚未确认这四刀 + 清理提交。
+**欠账已清**（`7e57278`）：3 处 `#[allow(clippy::needless_borrow)]` 已随签名改造完成后撤除，借用写法回到普通形态。四刀 + 清理提交的 CI 已确认（`8778f6f` 双平台全绿），此前「Windows 侧与 CI 尚未确认」的记录已过期。
 
 ### 合段（第 7 步最后一步）的执行清单——签名前置就绪后
 
@@ -942,6 +942,23 @@ Phase 2/3 与 Phase 4 A—BA 已完成；后续继续把桌面 UI adapter 迁入
 6. **每步验证组合**：`cargo test --lib`（当前 1,127/0/10）+ 两组 crash E2E 各 3 项 + `cargo check --lib` 0 告警 + `check-warnings.py` 57/57 + `check-docs.py`；第 4 步之后额外跑一次真实打包（签名/更新清单）确认端口化没影响 Tauri 侧装配。
 
 **风险与回退**：第 2 步是纯搬运（可逐行 diff 证伪），第 3、4 步改变运行路径——建议**分成两个提交**（先合段、后切端口），一旦桌面验收发现行为差异，能分别定位是「搬错」还是「端口化丢了副作用」。
+
+### 合段第 1-3 步已落地（2026-09-29，`待提交`）
+
+清单第 1-3 步完成，第 4 步（切 `run(port)`）与第 5 步（桌面验收）仍未做。**主循环体 258 → 42 行**，`desktop_round` 函数体 287 行；`stream_chat_inner` 的收尾顺序（`finalize_run` 在循环后调用一次）保持不变。
+
+**`RoundOutcome` 是三变体而不是两变体**——原循环体里有两处 `return Ok(())`（轮前 `PreRoundPermit::Cancelled`、轮后 `PostRoundOutcome::Stopped`），它们**直接结束任务并跳过 `finalize_run`**，与 `break` 的语义不同。若按清单原文只分 `ContinueRound`/`Finish`，这两处会被并进 `Finish`，收尾（证据驱动验收 + 账本最终态）就会**多跑一次**。故增 `Stop` 变体，主循环侧对应 `RoundOutcome::Stop => return Ok(())`。
+
+**搬移用程序化脚本而非手打**：257 行主体按字节原样复制，只做控制流替换，避免手抄引入偏差；每处替换以「缩进 + 原文完全匹配」为前提，不匹配即中止。
+
+**保真度可机械验证**：搬完后把新函数体与原循环体逐行比对——**257 行中 36 行有差异，归因只有两类**：
+
+1. **13 行控制流**（设计内）：11 处 `break`/`continue` → `return Ok(RoundOutcome::X)`，2 处 `return Ok(())` → `return Ok(RoundOutcome::Stop)`；末尾 match 的两个分支按 clippy 建议去掉 `return` 改为尾表达式。
+2. **23 行借用形态**（clippy 机械修复，语义恒等）：原局部量是自有值（`trace_id: String`），现在经 `DesktopRoundContext` 解构后是引用，于是 `&trace_id` → `trace_id`、`&mut round_state` → `round_state`、`&mut kernel_executor` → `kernel_executor`、`&mut model_choice` → `model_choice`。这一类是**搬移的必然结果**而非逻辑改动——局部量类型从 `T` 变成 `&T`/`&mut T` 后，原来那层引用就成了多余的重借用。
+
+**验证组合（Windows 本机，与基线逐位一致）**：后端库 **1,166 通过 / 0 失败 / 10 忽略**、两组 crash E2E 各 3 项、`frontend_backend_contract` 2 项、`cargo check --lib` 0 告警、`check-warnings.py` **57/57 未新增**（首轮因上述 23 行触发 26 条 `needless_borrow`/`needless_return` 而 FAIL 83，由 rustc machine-applicable suggestion 批量修到收敛，**未抬基线**）、`check-docs.py` 通过。前端未改动，未重跑。
+
+**仍未做**：第 4 步切 `run(port)` 与第 5 步桌面验收。桌面验收窗口在本机已具备（绿色版可构建可运行），但 `run(port)` 改的是运行路径而非纯搬运，仍按上面的风险约定单独成提交、单独验收。
 
 
 

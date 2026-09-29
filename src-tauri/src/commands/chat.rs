@@ -6502,263 +6502,46 @@ async fn stream_chat_inner(
         seam_count,
     };
 
-    'outer: loop {
-        if let Ok(conn) = state.0.lock() {
-            let _ = crate::agent::runtime::transition(
-                &conn,
-                &trace_id,
-                &conversation_id,
-                "running",
-                "orchestrating",
-                None,
-            );
-            let _ = crate::agent::runtime::renew_lease(
-                &conn,
-                &trace_id,
-                &conversation_id,
-                "orchestrating",
-                execution_budget.lease_ms,
-            );
-        }
-        log_task_heartbeat(
-            registry,
-            &conversation_id,
-            round_state.task_started,
-            round_state.tool_runs.len(),
-            round_state.full.chars().count(),
-            round_state.history_limit,
-        );
-        let workflow = refresh_workflow_stage(
-            state,
-            &trace_id,
-            &conversation_id,
-            &goal_contract,
-            &inherited_tool_evidence,
-            &round_state.tool_runs,
-            round_state.workflow_stage,
-        );
-        round_state.workflow_stage = Some(workflow.stage);
-        match adjudicate_pre_round(PreRoundInputs {
-            executor: &mut kernel_executor,
-            state,
-            app,
-            cancel,
-            conversation_id: &conversation_id,
-            trace_id: &trace_id,
-            task_goal: &task_goal,
-            task_deadline_ms,
-            model: &model_choice.model,
-            ledger_base_n,
-            input_tokens: stats.input_tokens,
-            output_tokens: stats.output_tokens,
-            round_state: &mut round_state,
-        })
-        .await?
-        {
-            PreRoundPermit::Proceed => {}
-            PreRoundPermit::Locked => break,
-            PreRoundPermit::Cancelled => {
-                stats.stopped = true;
-                return Ok(());
-            }
-            PreRoundPermit::Deadline => {
-                return Err(ChatFlowError {
-                    kind: ErrorKind::Timeout,
-                    title: ErrorKind::Timeout.title().to_string(),
-                    message: format!(
-                        "任务执行超过 {} 分钟上限，已自动停止",
-                        // 实际 deadline 来自设置页动态配置（agent_limits），超时消息须与之保持一致；
-                        // i64::MAX 表示未配置时长限制，理论不会走到本分支，防御性兜底
-                        if task_deadline_ms == i64::MAX {
-                            "配置的".to_string()
-                        } else {
-                            (task_deadline_ms / 60000).to_string()
-                        }
-                    ),
-                    suggestion: "请把任务拆分成更小的步骤，或换用更快的模型后重试".to_string(),
-                    status_code: None,
-                });
-            }
-        }
-        let mut messages = match assemble_round(AssembleInputs {
-            state,
-            app,
-            cancel,
-            client: &client,
-            provider: &provider,
-            conversation_id: &conversation_id,
-            trace_id: &trace_id,
-            project_path: &project_path,
-            context_budget,
-            model_choice: &model_choice,
-            system_prompt: &system_prompt,
-            system_prompt_core: &system_prompt_core,
-            workflow: &workflow,
-            protocol: &protocol,
-            task_goal: &task_goal,
-            ledger_base_n,
-            round_state: &mut round_state,
-        })
-        .await?
-        {
-            AssembleOutcome::Ready { messages } => messages,
-            AssembleOutcome::RestartRound => continue 'outer,
-        };
-
-        enforce_budget_gate(BudgetGateInputs {
-            state,
-            app,
-            conversation_id: &conversation_id,
-            trace_id: &trace_id,
-            provider: &provider,
-            messages: &messages,
-            model_choice: &mut model_choice,
-            stats: &mut *stats,
-            round_state: &mut round_state,
-        })?;
-
-        let outcome = match request_round_outcome(RoundRequestInputs {
-            app,
-            state,
-            cancel,
-            registry,
-            client: &client,
-            protocol: &protocol,
-            provider: &provider,
-            opts: &opts,
-            messages: &messages,
-            conversation_id: &conversation_id,
-            trace_id: &trace_id,
-            context_budget,
-            model_choice: &mut model_choice,
-            stats: &mut *stats,
-            round_state: &mut round_state,
-        })
-        .await?
-        {
-            RoundRequestOutcome::Received(outcome) => outcome,
-            RoundRequestOutcome::RetryAfterContextCompression
-            | RoundRequestOutcome::RetryAfterFallbackSwitch => continue 'outer,
-        };
-        match handle_round_outcome(PostRoundInputs {
-            state,
-            app,
-            conversation_id: &conversation_id,
-            trace_id: &trace_id,
-            model: &model_choice.model,
-            task_started: round_state.task_started,
-            outcome: &outcome,
-            stats: &mut *stats,
-            round_state: &mut round_state,
-        })
-        .await?
-        {
-            PostRoundOutcome::Stopped => return Ok(()),
-            PostRoundOutcome::Continue => {}
-        }
-        let text = outcome.text;
-
-        // 原生 function calling（OpenAI 兼容协议 tool_calls）与文本标记协议合并：
-        // 模型任选其一（或混用），统一进入下方执行循环，保证两者对用户/前端完全透明。
-        // 连接中断时文本标记可能半截（如【TOOL|bash|... 未闭合），禁止解析执行，
-        // 由续写轮模型补全后统一执行，防半截标记被容错解析误触发工具
-        let calls = match prepare_tool_calls(ToolCallPrepInputs {
-            app,
-            state,
-            plan_review,
-            cancel,
-            conversation_id: &conversation_id,
-            trace_id: &trace_id,
-            text: &text,
-            interrupted: outcome.interrupted,
-            tool_calls: &outcome.tool_calls,
-            plan_mode,
-            messages: &mut messages,
-            stats: &mut *stats,
-            round_state: &mut round_state,
-        })
-        .await?
-        {
-            ToolCallPrepOutcome::Ready { calls } => calls,
-            ToolCallPrepOutcome::NextRound => continue 'outer,
-            ToolCallPrepOutcome::Finish => break 'outer,
-        };
-        if !calls.is_empty() {
-            // 结算本轮工具执行：`Finish` 表示被护栏强制收尾（置位后结束任务），
-            // `ContinueRound` 表示本轮工具已跑完，进入下一轮
-            let tool_round = run_tool_calls(ToolRoundInputs {
-                calls,
+    loop {
+        match desktop_round(
+            DesktopRoundContext {
                 app,
                 state,
                 cancel,
+                approval,
+                plan_review,
                 registry,
                 client: &client,
                 protocol: &protocol,
                 provider: &provider,
                 opts: &opts,
-                messages: &messages,
-                model_choice: &model_choice,
                 conversation_id: &conversation_id,
                 trace_id: &trace_id,
-                execution_budget: &execution_budget,
-                executor: &mut kernel_executor,
-                stats: &mut *stats,
-                mcp: &mcp,
                 project_path: &project_path,
-                path_hints: &path_hints,
                 project_id: &project_id,
-                approval,
-                task_started: round_state.task_started,
-                round_state: &mut round_state,
-            })
-            .await?;
-            match tool_round {
-                // 被护栏强制收尾：置位外层标志并结束任务（账本保留）
-                ToolRoundOutcome::Finish => {
-                    round_state.exhausted = true;
-                    break;
-                }
-                // 本轮工具执行完毕：进入下一轮
-                ToolRoundOutcome::ContinueRound => continue,
-            }
-        }
-        match run_plan_gate(PlanGateInputs {
-            app,
-            state,
-            plan_review,
-            cancel,
-            conversation_id: &conversation_id,
-            trace_id: &trace_id,
-            text: &text,
-            plan_mode,
-            messages: &mut messages,
-            stats: &mut *stats,
-            round_state: &mut round_state,
-        })
+                path_hints: &path_hints,
+                goal_contract: &goal_contract,
+                inherited_tool_evidence: &inherited_tool_evidence,
+                execution_budget: &execution_budget,
+                mcp: &mcp,
+                task_goal: &task_goal,
+                task_deadline_ms,
+                ledger_base_n,
+                context_budget,
+                plan_mode,
+                system_prompt: &system_prompt,
+                system_prompt_core: &system_prompt_core,
+            },
+            &mut round_state,
+            &mut *stats,
+            &mut model_choice,
+            &mut kernel_executor,
+        )
         .await?
         {
-            PlanGateOutcome::Passed => {}
-            PlanGateOutcome::NextRound => continue,
-            PlanGateOutcome::Finish => break,
-        }
-        match route_round_outcome(RoundRoutingInputs {
-            app,
-            state,
-            conversation_id: &conversation_id,
-            trace_id: &trace_id,
-            text: &text,
-            reasoning: &outcome.reasoning,
-            truncated: outcome.truncated,
-            interrupted: outcome.interrupted,
-            degenerate: outcome.degenerate,
-            tool_calls: &outcome.tool_calls,
-            inherited_tool_evidence: &inherited_tool_evidence,
-            goal_contract: &goal_contract,
-            executor: &mut kernel_executor,
-            round_state: &mut round_state,
-        })? {
-            RoundRoutingOutcome::NextRound => continue 'outer,
-            RoundRoutingOutcome::Finish => break 'outer,
+            RoundOutcome::ContinueRound => continue,
+            RoundOutcome::Finish => break,
+            RoundOutcome::Stop => return Ok(()),
         }
     }
 
@@ -6783,6 +6566,357 @@ async fn stream_chat_inner(
     .await?;
 
     Ok(())
+}
+
+/// 主循环每一轮的终局（替代原循环体内剩余的 `break`/`continue`）。
+///
+/// `ContinueRound` 对应原 `continue 'outer`，`Finish` 对应原 `break 'outer`：
+/// 两者都会走到循环后的 `finalize_run`（证据驱动验收 + 账本最终态）。
+/// `Stop` 对应原代码中两处 `return Ok(())`（轮前取消、轮后停止）——
+/// 它**直接结束任务并跳过 `finalize_run`**，与 `Finish` 的差别是行为性的，
+/// 不能合并成同一个变体，否则收尾（验收 + 账本）会被悄悄多跑一次。
+enum RoundOutcome {
+    /// 本轮结束，进入下一轮
+    ContinueRound,
+    /// 任务结束，退出主循环并进入 `finalize_run`
+    Finish,
+    /// 用户取消/停止：立即结束，**不进入 `finalize_run`**
+    Stop,
+}
+
+/// `desktop_round` 的只读上下文（全部借用）。
+///
+/// 一次性收下主循环体内引用到的**只读**外部量，使 `desktop_round` 的入参保持在
+/// clippy 的 7 个上限内。三个**可变**量（`stats`/`model_choice`/`kernel_executor`）
+/// 仍走显式参数而不是塞进本结构：它们不是「轮状态」，`&mut` 字段会让结构本身不变，
+/// 把借用期拉到与结构同长，进而与循环里的每次读取冲突（见驱动文档第二刀的坑）。
+struct DesktopRoundContext<'a> {
+    app: &'a AppHandle,
+    state: &'a tauri::State<'a, DbState>,
+    cancel: &'a tauri::State<'a, ChatCancel>,
+    approval: &'a tauri::State<'a, ToolApprovalState>,
+    plan_review: &'a tauri::State<'a, PlanApprovalState>,
+    registry: &'a TaskRegistry,
+    client: &'a reqwest::Client,
+    protocol: &'a str,
+    provider: &'a ProviderEndpoint,
+    opts: &'a ChatOptions,
+    conversation_id: &'a String,
+    trace_id: &'a String,
+    project_path: &'a String,
+    project_id: &'a String,
+    path_hints: &'a [String],
+    goal_contract: &'a crate::agent::acceptance::GoalContract,
+    inherited_tool_evidence: &'a [crate::agent::runtime::DesktopRecoveredToolRun],
+    execution_budget: &'a crate::agent::governance::ExecutionBudget,
+    mcp: &'a crate::services::mcp_manager::McpManager,
+    task_goal: &'a str,
+    task_deadline_ms: i64,
+    ledger_base_n: u32,
+    context_budget: i64,
+    plan_mode: bool,
+    system_prompt: &'a str,
+    system_prompt_core: &'a str,
+}
+
+/// 执行主循环的一轮（纯搬运：原 `stream_chat_inner` 内 `'outer: loop` 的循环体）。
+///
+/// 控制流出口全部由 `RoundOutcome` 表达，函数体本身不含 `break`/`continue`，
+/// 因此整段可被主循环当作一次调用来驱动。
+async fn desktop_round<'a>(
+    ctx: DesktopRoundContext<'a>,
+    round_state: &mut DesktopRoundState,
+    stats: &mut ChatRunStats,
+    model_choice: &mut ModelChoice,
+    kernel_executor: &mut KernelIoRunLoop,
+) -> Result<RoundOutcome, ChatFlowError> {
+    // 解构出与原作用域同名的局部量：下面循环体**逐行原样**沿用原标识符
+    let DesktopRoundContext {
+        app,
+        state,
+        cancel,
+        approval,
+        plan_review,
+        registry,
+        client,
+        protocol,
+        provider,
+        opts,
+        conversation_id,
+        trace_id,
+        project_path,
+        project_id,
+        path_hints,
+        goal_contract,
+        inherited_tool_evidence,
+        execution_budget,
+        mcp,
+        task_goal,
+        task_deadline_ms,
+        ledger_base_n,
+        context_budget,
+        plan_mode,
+        system_prompt,
+        system_prompt_core,
+    } = ctx;
+
+        if let Ok(conn) = state.0.lock() {
+            let _ = crate::agent::runtime::transition(
+                &conn,
+                trace_id,
+                conversation_id,
+                "running",
+                "orchestrating",
+                None,
+            );
+            let _ = crate::agent::runtime::renew_lease(
+                &conn,
+                trace_id,
+                conversation_id,
+                "orchestrating",
+                execution_budget.lease_ms,
+            );
+        }
+        log_task_heartbeat(
+            registry,
+            conversation_id,
+            round_state.task_started,
+            round_state.tool_runs.len(),
+            round_state.full.chars().count(),
+            round_state.history_limit,
+        );
+        let workflow = refresh_workflow_stage(
+            state,
+            trace_id,
+            conversation_id,
+            goal_contract,
+            inherited_tool_evidence,
+            &round_state.tool_runs,
+            round_state.workflow_stage,
+        );
+        round_state.workflow_stage = Some(workflow.stage);
+        match adjudicate_pre_round(PreRoundInputs {
+            executor: kernel_executor,
+            state,
+            app,
+            cancel,
+            conversation_id,
+            trace_id,
+            task_goal,
+            task_deadline_ms,
+            model: &model_choice.model,
+            ledger_base_n,
+            input_tokens: stats.input_tokens,
+            output_tokens: stats.output_tokens,
+            round_state,
+        })
+        .await?
+        {
+            PreRoundPermit::Proceed => {}
+            PreRoundPermit::Locked => return Ok(RoundOutcome::Finish),
+            PreRoundPermit::Cancelled => {
+                stats.stopped = true;
+                return Ok(RoundOutcome::Stop);
+            }
+            PreRoundPermit::Deadline => {
+                return Err(ChatFlowError {
+                    kind: ErrorKind::Timeout,
+                    title: ErrorKind::Timeout.title().to_string(),
+                    message: format!(
+                        "任务执行超过 {} 分钟上限，已自动停止",
+                        // 实际 deadline 来自设置页动态配置（agent_limits），超时消息须与之保持一致；
+                        // i64::MAX 表示未配置时长限制，理论不会走到本分支，防御性兜底
+                        if task_deadline_ms == i64::MAX {
+                            "配置的".to_string()
+                        } else {
+                            (task_deadline_ms / 60000).to_string()
+                        }
+                    ),
+                    suggestion: "请把任务拆分成更小的步骤，或换用更快的模型后重试".to_string(),
+                    status_code: None,
+                });
+            }
+        }
+        let mut messages = match assemble_round(AssembleInputs {
+            state,
+            app,
+            cancel,
+            client,
+            provider,
+            conversation_id,
+            trace_id,
+            project_path,
+            context_budget,
+            model_choice,
+            system_prompt,
+            system_prompt_core,
+            workflow: &workflow,
+            protocol,
+            task_goal,
+            ledger_base_n,
+            round_state,
+        })
+        .await?
+        {
+            AssembleOutcome::Ready { messages } => messages,
+            AssembleOutcome::RestartRound => return Ok(RoundOutcome::ContinueRound),
+        };
+
+        enforce_budget_gate(BudgetGateInputs {
+            state,
+            app,
+            conversation_id,
+            trace_id,
+            provider,
+            messages: &messages,
+            model_choice,
+            stats: &mut *stats,
+            round_state,
+        })?;
+
+        let outcome = match request_round_outcome(RoundRequestInputs {
+            app,
+            state,
+            cancel,
+            registry,
+            client,
+            protocol,
+            provider,
+            opts,
+            messages: &messages,
+            conversation_id,
+            trace_id,
+            context_budget,
+            model_choice,
+            stats: &mut *stats,
+            round_state,
+        })
+        .await?
+        {
+            RoundRequestOutcome::Received(outcome) => outcome,
+            RoundRequestOutcome::RetryAfterContextCompression
+            | RoundRequestOutcome::RetryAfterFallbackSwitch => return Ok(RoundOutcome::ContinueRound),
+        };
+        match handle_round_outcome(PostRoundInputs {
+            state,
+            app,
+            conversation_id,
+            trace_id,
+            model: &model_choice.model,
+            task_started: round_state.task_started,
+            outcome: &outcome,
+            stats: &mut *stats,
+            round_state,
+        })
+        .await?
+        {
+            PostRoundOutcome::Stopped => return Ok(RoundOutcome::Stop),
+            PostRoundOutcome::Continue => {}
+        }
+        let text = outcome.text;
+
+        // 原生 function calling（OpenAI 兼容协议 tool_calls）与文本标记协议合并：
+        // 模型任选其一（或混用），统一进入下方执行循环，保证两者对用户/前端完全透明。
+        // 连接中断时文本标记可能半截（如【TOOL|bash|... 未闭合），禁止解析执行，
+        // 由续写轮模型补全后统一执行，防半截标记被容错解析误触发工具
+        let calls = match prepare_tool_calls(ToolCallPrepInputs {
+            app,
+            state,
+            plan_review,
+            cancel,
+            conversation_id,
+            trace_id,
+            text: &text,
+            interrupted: outcome.interrupted,
+            tool_calls: &outcome.tool_calls,
+            plan_mode,
+            messages: &mut messages,
+            stats: &mut *stats,
+            round_state,
+        })
+        .await?
+        {
+            ToolCallPrepOutcome::Ready { calls } => calls,
+            ToolCallPrepOutcome::NextRound => return Ok(RoundOutcome::ContinueRound),
+            ToolCallPrepOutcome::Finish => return Ok(RoundOutcome::Finish),
+        };
+        if !calls.is_empty() {
+            // 结算本轮工具执行：`Finish` 表示被护栏强制收尾（置位后结束任务），
+            // `ContinueRound` 表示本轮工具已跑完，进入下一轮
+            let tool_round = run_tool_calls(ToolRoundInputs {
+                calls,
+                app,
+                state,
+                cancel,
+                registry,
+                client,
+                protocol,
+                provider,
+                opts,
+                messages: &messages,
+                model_choice,
+                conversation_id,
+                trace_id,
+                execution_budget,
+                executor: kernel_executor,
+                stats: &mut *stats,
+                mcp,
+                project_path,
+                path_hints,
+                project_id,
+                approval,
+                task_started: round_state.task_started,
+                round_state,
+            })
+            .await?;
+            match tool_round {
+                // 被护栏强制收尾：置位外层标志并结束任务（账本保留）
+                ToolRoundOutcome::Finish => {
+                    round_state.exhausted = true;
+                    return Ok(RoundOutcome::Finish);
+                }
+                // 本轮工具执行完毕：进入下一轮
+                ToolRoundOutcome::ContinueRound => return Ok(RoundOutcome::ContinueRound),
+            }
+        }
+        match run_plan_gate(PlanGateInputs {
+            app,
+            state,
+            plan_review,
+            cancel,
+            conversation_id,
+            trace_id,
+            text: &text,
+            plan_mode,
+            messages: &mut messages,
+            stats: &mut *stats,
+            round_state,
+        })
+        .await?
+        {
+            PlanGateOutcome::Passed => {}
+            PlanGateOutcome::NextRound => return Ok(RoundOutcome::ContinueRound),
+            PlanGateOutcome::Finish => return Ok(RoundOutcome::Finish),
+        }
+        match route_round_outcome(RoundRoutingInputs {
+            app,
+            state,
+            conversation_id,
+            trace_id,
+            text: &text,
+            reasoning: &outcome.reasoning,
+            truncated: outcome.truncated,
+            interrupted: outcome.interrupted,
+            degenerate: outcome.degenerate,
+            tool_calls: &outcome.tool_calls,
+            inherited_tool_evidence,
+            goal_contract,
+            executor: kernel_executor,
+            round_state,
+        })? {
+            RoundRoutingOutcome::NextRound => Ok(RoundOutcome::ContinueRound),
+            RoundRoutingOutcome::Finish => Ok(RoundOutcome::Finish),
+        }
 }
 
 /// `finalize_run` 的输入（全部借用）。
