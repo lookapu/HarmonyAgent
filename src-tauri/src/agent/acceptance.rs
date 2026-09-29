@@ -208,7 +208,24 @@ fn is_mutation(tool: &str) -> bool {
 }
 
 fn is_command(e: &ToolEvidence<'_>, words: &[&str]) -> bool {
-    e.tool == "run_command" && words.iter().any(|word| e.args.to_lowercase().contains(word))
+    if e.tool != "run_command" { return false; }
+    // 只在**真正会被执行**的前几个词里找证据，而不是整条命令行。
+    //
+    // 匹配整段参数会让引号里的说明文字变成证据：`git commit -m "fix build"` 含 "build"，
+    // 会被判成"构建成功"；`git commit -m "add tests"` 含 "test"，会被判成"测试通过"。
+    // 而这两条判据都是 required：目标里提到"构建"/"测试"就一定会生成，
+    // 一次提交就能顶掉构建与测试两项——是当前最容易踩到的形式化证据漏洞。
+    //
+    // 按 shell 操作符分段后各取头部，这样 `cd frontend && npm run build` 这种
+    // 常见写法仍然匹配得到（第二段头部就是 build），而引号里的说明不在头部。
+    let Some(value) = serde_json::from_str::<serde_json::Value>(e.args).ok() else { return false };
+    let Some(raw) = value.get("command").or_else(|| value.get("cmd")).and_then(|v| v.as_str()) else {
+        return false;
+    };
+    raw.to_lowercase().split(['&', '|', ';']).filter_map(|segment| {
+        let head = segment.split_whitespace().take(4).collect::<Vec<_>>().join(" ");
+        (!head.is_empty()).then_some(head)
+    }).any(|head| words.iter().any(|word| head.contains(word)))
 }
 
 fn matches_kind(kind: &CriterionKind, e: &ToolEvidence<'_>) -> bool {

@@ -79,6 +79,24 @@ docs/postmortem/000N-<复发模式 slug>.md
   刻意**没有**改 `verify_ui` 本身去返回 `Err`——那样会让工具报错路径接管，
   截图多半不再自动进入模型视野，反而丢掉最好的诊断信息。
 
+- **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
+  充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
+  是无分隔符的裸词 `build` / `test`。于是
+  `run_command("git commit -m \"fix build\"")` 满足「构建成功」，
+  `run_command("git commit -m \"add tests\"")` 满足「测试通过」。
+  两条判据都是 `required: true`（目标里提到"构建"/"测试"就必生成），
+  **一次提交就能同时顶掉构建与测试两项**。
+  已修：`is_command` 改为按 shell 操作符分段、只取每段**真正被执行的前 4 个词**再匹配，
+  引号里的说明文字不再算证据。同时保留 `cd frontend && npm run build`
+  这类常见写法（第二段头部仍是 build）。
+  **残留**：`cat test_notes.md` 这类"文件名词里含关键词"仍会匹配——
+  再收紧就要判断"这个命令到底跑不跑测试"，那是产品决策不是字符串匹配问题，
+  留待单独评估。
+
+  同批核实为**正确、无需改动**的：`build_project` 构建失败时两个子路径都 `return Err`
+  （`build_tools.rs:490`）、`run_cmd` 非零退出码返回 `Err`（`mod.rs:1596-1599`），
+  所以 `succeeded` 对这两条主验证路径是可信的。
+
 - **目录树空列表被当成"接口正常但没内容"**：`harmony_doc_api.rs` 对
   `code:0` 且 `catalogTreeList` 为空数组的响应返回 `Ok(vec![])`，调用方建出空索引后
   所有模块静默退回 slug 猜测且不留痕迹——与"接口失败"不可区分，正是 0002 的形状。
