@@ -59,6 +59,41 @@ pub fn pop_undo(conversation_id: &str) -> Option<Snapshot> {
     table().undo_stacks.get_mut(conversation_id).and_then(|l| l.pop())
 }
 
+/// 弹出**最近 `count` 条中通过 `keep` 筛选的**快照（LIFO 顺序），不通过的原样留在栈里。
+///
+/// 为什么不能「先 pop 再判断」：`undo_edit` 需要按会话可见根过滤（跨项目快照不可恢复），
+/// 而旧写法是 pop 出来发现越界就 `continue` —— 快照被**永久销毁**，用户那次撤销能力
+/// 凭空消失，而返回文案还告诉调用方「本会话尚无 Agent 文件写入记录」。
+/// 本原语让越界条目留在栈内（换个项目/根重绑后仍可撤销），并让调用方能如实报告跳过数。
+pub fn pop_undo_filtered<F: Fn(&Snapshot) -> bool>(
+    conversation_id: &str,
+    count: usize,
+    keep: F,
+) -> (Vec<Snapshot>, usize) {
+    let mut ctx = table();
+    let Some(list) = ctx.undo_stacks.get_mut(conversation_id) else {
+        return (Vec::new(), 0);
+    };
+    // 从栈顶往下最多检查 count 条；保持其余条目的相对顺序不动。
+    let window = count.min(list.len());
+    let split = list.len() - window;
+    let mut taken: Vec<Snapshot> = Vec::with_capacity(window);
+    let mut skipped: Vec<Snapshot> = Vec::with_capacity(window);
+    for item in list.drain(split..) {
+        if taken.len() < count && keep(&item) {
+            taken.push(item);
+        } else {
+            skipped.push(item);
+        }
+    }
+    // 跳过的按原顺序接回去（栈是 FIFO 淘汰 + LIFO 弹出，顺序必须保持）
+    let skipped_n = skipped.len();
+    for item in skipped.into_iter().rev() {
+        list.push(item);
+    }
+    (taken, skipped_n)
+}
+
 
 /// 查看从栈顶数第 n 条快照（n=0 为最近一次，不弹出，撤销预览用）。
 pub fn peek_at(conversation_id: &str, n: usize) -> Option<Snapshot> {

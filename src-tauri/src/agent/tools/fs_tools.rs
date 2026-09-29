@@ -586,21 +586,29 @@ pub(super) async fn undo_edit(args: &Value, roots: &[String], conversation_id: &
         return undo_preview(conversation_id, roots, count);
     }
     let mut restored: Vec<String> = Vec::new();
-    for _ in 0..count {
-        let Some(s) = crate::agent::undo::pop_undo(conversation_id) else {
-            break;
-        };
+    // 恢复范围必须在**弹出前**判定。旧写法是 pop 出来再判越界 → continue：
+    // 快照被**永久销毁**（用户那次撤销能力凭空消失），而下面的空结果分支还会告诉
+    // 调用方「本会话尚无 Agent 文件写入记录」——那是不实描述。
+    // 改用 pop_undo_filtered：只弹该恢复的，越界条目原地留在栈里（换个根重绑后仍可撤销）。
+    let allowed_paths = |s: &crate::agent::undo::Snapshot| -> bool {
         // 恢复前校验路径仍在会话可见根内（跨项目快照不可恢复）。
         // 注意：canonicalize 在 Windows 返回 \\?\ 前缀路径，而快照路径已 normalize
         // 剥掉前缀——直接 starts_with 会永远失配（undo 静默失效），须同口径归一化。
-        let allowed = roots.iter().any(|r| {
+        roots.iter().any(|r| {
             let rc = std::fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r));
             let rc = PathBuf::from(crate::utils::path::normalize_path(&rc.to_string_lossy()));
             crate::utils::path::path_within(&s.path, &rc)
-        });
-        if !allowed {
-            continue;
+        })
+    };
+    // 先如实收集被跳过的路径（peek 不动栈）
+    let mut skipped: Vec<String> = Vec::new();
+    for i in 0..count {
+        let Some(s) = crate::agent::undo::peek_at(conversation_id, i) else { break };
+        if !allowed_paths(&s) {
+            skipped.push(s.path.display().to_string());
         }
+    }
+    for s in crate::agent::undo::pop_undo_filtered(conversation_id, count, allowed_paths).0 {
         if let Some(parent) = s.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -621,6 +629,14 @@ pub(super) async fn undo_edit(args: &Value, roots: &[String], conversation_id: &
         restored.push(restored_path.0);
     }
     if restored.is_empty() {
+        if !skipped.is_empty() {
+            return Ok(format!(
+                "未撤销任何修改：本次检查的 {} 条记录全部不在当前会话可见工程根内（跨项目快照不可恢复）。\n\
+                 这些快照**仍保留在撤销栈中**，未丢失；重新绑定对应工程后可直接再次 undo_edit。\n跳过：\n  {}",
+                skipped.len(),
+                skipped.join("\n  ")
+            ));
+        }
         return Ok("没有可撤销的修改（本会话尚无 Agent 文件写入记录）".into());
     }
     let remain = crate::agent::undo::undo_count(conversation_id);
@@ -630,6 +646,13 @@ pub(super) async fn undo_edit(args: &Value, roots: &[String], conversation_id: &
     );
     for p in &restored {
         out.push_str(&format!("- {p}\n"));
+    }
+    if !skipped.is_empty() {
+        out.push_str(&format!(
+            "\n另有 {} 条记录不在当前会话可见工程根内而跳过（**未丢失**，仍在撤销栈中，重新绑定对应工程后可直接再次 undo_edit）：\n  {}\n",
+            skipped.len(),
+            skipped.join("\n  ")
+        ));
     }
     Ok(out)
 }

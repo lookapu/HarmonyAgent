@@ -340,7 +340,11 @@ pub struct ToolApprovalState(
 pub struct SessionToolAllowState(pub StdMutex<std::collections::HashSet<(String, String)>>);
 
 /// 会话级“首次写文件已确认”标记：first_write 审批模式下，用户确认第一次写文件后，
-/// 本任务后续写文件（edit_file/write_file/delete_file）一律免审
+/// 本任务后续写文件一律免审。
+/// 覆盖范围以 `verification_planner::is_mutation_tool` 为准（write_file / edit_file /
+/// delete_file / multi_edit / lsp_rename），此处不再手抄工具名——原先这里写的
+/// 「edit_file/write_file/delete_file」三个名字已与实现分叉（guards.rs 早已收敛到
+/// 单一真源），照着注释理解会以为 first_write 管不到 multi_edit 与 lsp_rename。
 #[derive(Default)]
 pub struct FirstWriteApprovedState(pub StdMutex<std::collections::HashSet<String>>);
 
