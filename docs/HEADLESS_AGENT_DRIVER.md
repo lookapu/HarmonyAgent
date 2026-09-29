@@ -13,7 +13,18 @@ OpenAI-compatible 流式 chat completions（SSE 字节级行缓冲 + `KernelStre
 模型调用通过可注入的 `HeadlessModelClient` 边界，离线脚本 Provider 测试可以完整执行
 `write_file` tool loop，不需要网络或 Docker。流式读取对停滞、无结束标记提前关闭、空流、
 坏帧和超限正文全部失败关闭；停滞错误归类为 Network，自动进入与 UI 共用的指数退避重试。
-它仍然不等价于 Tauri UI 的完整 Agent loop：两个 adapter 已共享关键策略组件，但尚未由同一个 run-loop executor 驱动。
+它仍然不等价于 Tauri UI 的完整 Agent loop，但分叉的边界要说准，否则容易读成两种说法：
+
+- **决策面已统一**：两个 adapter 持有的是同一个 `KernelIoRunLoop`（`chat.rs:6418` 与
+  `headless_driver.rs:963` 都走 `KernelIoRunLoop::with_started`），router / governor /
+  计数 / 终止归因 / 最终快照都是同一套。
+- **IO 循环壳未统一**：只有 headless 实现了 `KernelIoPort` 并由
+  `KernelIoRunLoop::run` 驱动（`headless_driver.rs:547`）；桌面侧没有 `impl KernelIoPort`，
+  而是用 `desktop_round` 系列的 adapter 函数直接调 executor 的决策方法。
+  切片表里的 AG（共用 IO 循环壳）与 AQ（**headless** 生产端口迁移）只覆盖了 headless 一侧，
+  桌面侧迁移还没有对应切片。
+
+所以准确说法是「决策共用、IO 驱动未共用」，而不是笼统的「尚未由同一个 executor 驱动」。
 
 ## 1. 结论先行
 

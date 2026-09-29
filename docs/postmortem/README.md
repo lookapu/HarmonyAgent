@@ -97,17 +97,30 @@ docs/postmortem/000N-<复发模式 slug>.md
   `strip_prefix` / `from_utf8` / 锁中毒 / `timeout` 这类内部错误本就不带类型的地方，
   **没有丢弃已类型化错误种子的 `map_err(|_|)`**。唯一的真实缺口就是上面已修的沙箱那条。
 
-### 已核实，风险真实但项目自认未统一
+### 已核实，成立，但边界比原记录窄
 
 - **UI 与 headless 的循环分叉** —— **成立，且已开在文档里**，不是隐藏地雷。
-  `docs/HEADLESS_AGENT_DRIVER.md:16` 明写「它仍然不等价于 Tauri UI 的完整 Agent loop：
-  两个 adapter 已共享关键策略组件，但尚未由同一个 run-loop executor 驱动」，
-  `:474-476` 是未完成清单（流响应读取/停滞治理、消息历史、tool loop、reflexion、
-  governance、recovery 待抽取）。策略层（`kernel_loop.rs` / `kernel_history.rs`）
-  确实无 Tauri 依赖，共享是干净的；分叉只在**效果层**（事件、DB 写入、continue/break）。
-  评测侧 `harmony-agent` bin 在 `required-features = ["eval-cli"]` 之后，
-  走的是 headless/ProcessAgentDriver，**所以 CI 门禁量的是内核路径，不是桌面 UI 路径**。
-  收敛方向已在 Phase B-A 的切片表里排好，无需重新设计。
+  `docs/HEADLESS_AGENT_DRIVER.md` 的切片表 A—BA 共 53 项**全部 COMPLETED**，
+  其中 AG（共用 IO 循环壳）与 AQ（headless 生产端口迁移）已落地。
+  实读代码后的准确边界是：**决策面已统一，IO 驱动未统一**。
+
+  | | UI (`chat.rs`) | headless (`headless_driver.rs`) |
+  |---|---|---|
+  | executor 实例 | `KernelIoRunLoop::with_started`（:6418） | `KernelIoRunLoop::with_started`（:963） |
+  | 决策方法 | 直接调（经 Deref 到同一 executor） | 直接调 |
+  | `impl KernelIoPort` | **无** | 有（:547） |
+  | 由 `KernelIoRunLoop::run` 驱动 | **否** | **是** |
+
+  也就是说 router / governor / 计数 / 终止归因 / 最终快照本来就是同一套，
+  分叉只在**谁来驱动 IO 循环**：桌面用 `desktop_round` 系列 adapter 函数自己转，
+  headless 走统一 run-loop。切片表里没有「桌面生产端口迁移」这一项。
+
+  另注：`harmony-agent` bin 在 `required-features = ["eval-cli"]` 之后，
+  驱动的是 headless/ProcessAgentDriver，**所以 CI 门禁量的是这条统一路径**，
+  未被门禁覆盖的是桌面侧自己转的那圈。风险点是具体的，不是"整体未统一"。
+
+  （本条最初依据文档 L16「尚未由同一个 run-loop executor 驱动」写成"整体未统一"，
+  那句话有歧义；已按代码改正 L16 的措辞并收窄本条。）
 
 ### 已核实，决定不改
 
