@@ -115,8 +115,83 @@ fn completion(
         }
         return (false, Vec::new());
     }
+    if tool == "run_lint" {
+        // run_lint 只要 lint 工具跑通就返回 Ok，即使报告里写着「错误 (error)：37」——
+        // 工具执行成功 ≠ 代码干净。沿用上面两条结论感知臂的口径：必须看到明确的干净结论。
+        // 严重级过滤只筛 warning/info 的运行根本没统计 error，不能据此判定无错误。
+        let Some((index, item)) = runs.iter().rev().find(|(_, item)| lint_covers_errors(item.args))
+        else {
+            return (false, Vec::new());
+        };
+        return match lint_error_count(&item.output) {
+            Some(0) => (true, vec![format!("#{} run_lint 无 error 级问题", index + 1)]),
+            Some(errors) => (false, vec![format!("#{} run_lint 仍有 {errors} 个 error 级问题", index + 1)]),
+            None => (false, vec![format!("#{} run_lint 输出未给出 error 计数", index + 1)]),
+        };
+    }
+    if tool == "check_code" {
+        // check_code 同理：规则扫描命中再多也返回 Ok（「静态检查完成：… N 条命中」）。
+        // 只把高危/中危当阻断项——debug-log、plaintext-http 这类提示/低危在任何真实
+        // 仓库都会命中，一并阻断会让这个必需步骤永远无法完成。
+        let Some((index, item)) = runs.last() else {
+            return (false, Vec::new());
+        };
+        let Some(total) = scan_hit_count(&item.output) else {
+            return (false, vec![format!("#{} check_code 输出未给出命中数", index + 1)]);
+        };
+        // 命中列表被截断时，高危分组可能整段没进输出，此时「没看到高危」不等于「没有高危」。
+        if item.output.contains(SCAN_TRUNCATED) {
+            return (false, vec![format!(
+                "#{} check_code 输出被截断（共 {total} 条命中未完整列出），请缩小扫描范围后重跑",
+                index + 1
+            )]);
+        }
+        let blocking = scan_blocking_groups(&item.output);
+        return if blocking == 0 {
+            (true, vec![format!("#{} check_code 无高危/中危（共 {total} 条提示）", index + 1)])
+        } else {
+            (false, vec![format!("#{} check_code 仍有 {blocking} 组高危/中危规则命中", index + 1)])
+        };
+    }
     runs.last().map(|(index, _)| (true, vec![format!("#{} {tool}", index + 1)]))
         .unwrap_or((false, Vec::new()))
+}
+
+/// `scanner::cut` 在输出超长时追加的截断标记。
+const SCAN_TRUNCATED: &str = "输出已截断";
+
+/// run_lint 的 severity 过滤是否覆盖 error：空表示全量统计；只筛 warning 时报告里
+/// 的「错误 (error)：0」是统计口径造成的空值，不是干净结论。
+fn lint_covers_errors(args: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return false;
+    };
+    let severity = value.get("severity").and_then(|value| value.as_str())
+        .unwrap_or("").trim().to_lowercase();
+    severity.is_empty() || severity.contains("error")
+}
+
+/// 取 run_lint 报告里「错误 (error)：N」的 N。
+fn lint_error_count(output: &str) -> Option<usize> {
+    output.lines().find_map(|line| {
+        line.trim().strip_prefix("错误 (error)：")
+            .and_then(|rest| rest.trim().split_whitespace().next())
+            .and_then(|count| count.parse::<usize>().ok())
+    })
+}
+
+/// 取 check_code 报告里「扫描 N 个文件，M 条命中」的 M。
+fn scan_hit_count(output: &str) -> Option<usize> {
+    let (head, _) = output.lines().next()?.split_once("条命中")?;
+    head.rsplit_once('，')?.1.trim().parse::<usize>().ok()
+}
+
+/// 统计 check_code 报告里处于阻断级别（高危/中危）的规则分组数。
+fn scan_blocking_groups(output: &str) -> usize {
+    output.lines().filter(|line| {
+        let head = line.trim();
+        head.starts_with("## [") && (head.contains("高危") || head.contains("中危"))
+    }).count()
 }
 
 fn evidence_path(args: &str) -> Option<String> {
@@ -273,7 +348,7 @@ mod tests {
             edit("entry/src/main/ets/pages/Index.ets"),
             ToolEvidence { tool: "check_sdk_alignment", args: "{}", output: "状态：ahead\n工程一致性审计：0 error / 0 warning / 0 info", succeeded: true },
             ToolEvidence { tool: "lsp_diagnostics", args: r#"{"path":"entry/src/main/ets/pages/Index.ets"}"#, output: "无诊断错误（文件通过类型检查）", succeeded: true },
-            ToolEvidence { tool: "run_lint", args: "{}", output: "ok", succeeded: true },
+            ToolEvidence { tool: "run_lint", args: "{}", output: "Lint 检查完成（工具：codelinter）\n共发现 0 个问题\n  错误 (error)：0\n  警告 (warn)：0\n  其他：0", succeeded: true },
             ToolEvidence { tool: "run_tests", args: "{}", output: "ok", succeeded: true },
             ToolEvidence { tool: "build_project", args: "{}", output: "BUILD SUCCESS", succeeded: true },
             ToolEvidence { tool: "git_diff", args: "{}", output: "diff", succeeded: true },

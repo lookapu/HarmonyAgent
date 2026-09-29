@@ -79,6 +79,36 @@ docs/postmortem/000N-<复发模式 slug>.md
   刻意**没有**改 `verify_ui` 本身去返回 `Err`——那样会让工具报错路径接管，
   截图多半不再自动进入模型视野，反而丢掉最好的诊断信息。
 
+- **同一族的第二处：静态检查闸门对 `succeeded` 完全失明**。`verification_planner::completion`
+  对 `lsp_diagnostics` 和 `check_sdk_alignment` 都做了结论感知（要求输出里出现
+  「无诊断错误」/「0 error」），但对 `run_lint` / `check_code` 落到兜底分支
+  `runs.last().map(|_| (true, …))`——**只看 `succeeded`**。而这两个工具恰恰是
+  「跑通即 `Ok`」的：
+  - `run_lint`（`debug_tools.rs:350`）只要 lint 工具本身启动成功就 `Ok(out)`，
+    报告正文白纸黑字写着「共发现 37 个问题 / 错误 (error)：12」；
+  - `check_code`（`scanner.rs:270`）是规则扫描，命中再多也 `Ok`，
+    开头就是「静态检查完成：扫描 210 个文件，48 条命中」。
+
+  两者在计划里都是 `required: true`（`verification_planner.rs:67` / `:69`），
+  于是「改了 ETS → 跑一次 `run_lint`，报告 12 个 error」会被判成
+  **「静态规则检查已完成」**，`pending_required()` 为空，验收闸门放行。
+  **这不是「检查没发现问题」，是「检查发现了问题但闸门看不见」。**
+  已修：`completion` 为这两个工具各加一条结论感知臂——
+  `run_lint` 要求输出出现「错误 (error)：0」，且**带 `severity` 过滤只筛 warning 的
+  运行不算数**（那种运行报告里的 0 是统计口径造成的空值，不是干净结论）；
+  `check_code` 只把**高危/中危**当阻断项（`debug-log`、`plaintext-http` 这类提示/低危
+  在任何真实仓库都会命中，一并阻断会让这个必需步骤永远无法完成），
+  且**输出被 `scanner::cut` 截断时一律不算通过**——高危分组可能整段没进输出，
+  「没看到高危」不等于「没有高危」，此时证据里直接要求缩小扫描范围重跑。
+  与 `verify_ui` 同理，**刻意不改工具本身**：`run_lint` / `check_code` 改为返回
+  `Err` 会把问题清单塞进错误通道，而完整报告正是模型修复所需的输入。
+
+  同批核实为**正确**、无需改动的另一半：`run_tests` 走 `run_cmd`（非零退出即 `Err`）、
+  `build_generic` 显式判 `output.status.success()`（`mod.rs:2818`）、
+  `build_project` 失败两子路径都 `return Err`，这三者失败时 `succeeded` 确实为 false，
+  兜底分支对它们是可信的。也就是说兜底分支本身没错，
+  **错的是把两个「跑通即 Ok」的工具一起塞进了兜底**。
+
 - **验收证据可以靠"命令行里出现关键词"伪造**：`acceptance.rs` 允许 `run_command`
   充当构建/测试的验证证据，判定方式是**参数子串匹配**，而 Build / Tests 用的
   是无分隔符的裸词 `build` / `test`。于是
