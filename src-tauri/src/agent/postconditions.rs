@@ -44,13 +44,30 @@ fn is_http_write(args: &str) -> bool {
         .is_some_and(|method| !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS"))
 }
 
+/// 验证工具本身"跑成功了"不等于"它验证出了好结果"。
+///
+/// `verify_ui` 无论判定为黑屏/白屏还是正常，都返回 `Ok(report)`——它确实成功截到了图，
+/// 所以 `succeeded` 为 true。如果后置条件只看 `succeeded`，那么
+/// 「部署成功 + 在黑屏上 verify_ui」会被判成"已从设备读取界面状态并确认"，
+/// 也就是把"截图这个动作成功"当成"界面是好的"。这正是把请求成功误当任务成功的形态。
+///
+/// 只有 `verify_ui` 自带结论，且只有 ❌ 级别的结论阻断：
+/// `⚠️ 异常纯色` 不阻断——启动页/纯色遮罩本来就可能是平的，那不是缺陷。
+fn reports_negative_verdict(item: &ToolEvidence<'_>) -> bool {
+    item.tool == "verify_ui" && item.output.contains('❌')
+}
+
+fn verifier_confirmed(item: &ToolEvidence<'_>) -> bool {
+    item.succeeded && !reports_negative_verdict(item)
+}
+
 pub fn pending(evidence: &[ToolEvidence<'_>]) -> Vec<PendingPostcondition> {
     let mut pending = Vec::new();
     for (index, item) in evidence.iter().enumerate() {
         if !item.succeeded { continue; }
         let Some((verifiers, reason)) = requirement(item.tool, item.args) else { continue };
         let confirmed = evidence[index + 1..].iter().any(|later| {
-            later.succeeded && verifiers.contains(&later.tool)
+            verifier_confirmed(later) && verifiers.contains(&later.tool)
                 && !(item.tool == "http_request" && later.tool == "http_request" && is_http_write(later.args))
         });
         if !confirmed {
@@ -78,7 +95,7 @@ pub fn criterion_evidence_indices(
         .find(|(_, item)| item.succeeded && mutator.contains(&item.tool))?;
     let (verifiers, _) = requirement(item.tool, item.args)?;
     evidence[index + 1..].iter().position(|later| {
-        later.succeeded && verifiers.contains(&later.tool)
+        verifier_confirmed(later) && verifiers.contains(&later.tool)
     }).map(|offset| (index, index + 1 + offset))
 }
 
