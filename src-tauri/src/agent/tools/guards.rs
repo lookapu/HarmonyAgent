@@ -108,8 +108,22 @@ fn request_key_for(inv: &ToolInvocation<'_>) -> Result<String, Intercept> {
 /// run_command 的命令白名单裁决在此完成：白名单内命令 → L1 免审；白名单外 → L2 弹窗
 /// （ask/auto 模式）或直接放行（allow_all/first_write）。
 async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
+    // ⚠️ 本分支是 fail-open，且方向与上游 dsh 相反：dsh 的 user-approval 在拿不到
+    //    应答器时返回 deny（"没有审批 UI"不等于"已允许"），这里却直接放行。
+    //    当前安全：桌面端 app 恒为 Some，ToolCtx::empty() 带 #[allow(dead_code)] 且仅测试用，
+    //    headless_driver 不构造 ToolCtx（走另一条执行路径）。
+    //    改动前提：若将来给 headless 接入 ToolCtx，必须先把这里改成拒绝——
+    //    否则 headless 会静默变成"全部免审"，而不是"需要审批但无人应答"。
+    //    保留放行是因为离线/测试执行确实没有 UI；用日志把这个默认从静默变成可见。
     let Some(app) = inv.ctx.app.as_ref() else {
-        return Ok(()); // 无事件环境（测试/离线）：直接放行
+        crate::utils::logger::log_event(
+            "approval_bypassed_no_app_handle",
+            serde_json::json!({
+                "tool": inv.name,
+                "conversation_id": inv.conversation_id,
+            }),
+        );
+        return Ok(());
     };
     let approval_mode_str = inv.approval_mode;
     let tool = inv.name;
