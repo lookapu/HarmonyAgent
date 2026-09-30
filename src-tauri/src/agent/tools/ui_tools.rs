@@ -1522,15 +1522,30 @@ pub(super) async fn record_ui(
         }
 
         // 读取 csv 并解析为步骤 JSON
-        let csv_content = std::fs::read_to_string(&local_csv).unwrap_or_default();
-        let (steps, duration_ms) = parse_ui_record_csv(&csv_content);
+        // 读失败绝不能退化成空串：那会一路走到「未解析到任何步骤（0 行）」，
+        // 把一次本地读取/解码失败说成「设备输出格式与预期不符」——而文件就在下面这个路径上、内容是真的。
+        // read_to_string 对非 UTF-8 内容必然失败，设备侧输出中文时这是现实可能。
+        let csv_content = match std::fs::read_to_string(&local_csv) {
+            Ok(c) => c,
+            Err(error) => {
+                if let Ok(mut m) = store.lock() {
+                    m.remove(&store_key);
+                }
+                return Err(format!(
+                    "录制文件已拉取到 {}，但读取失败：{error}。\n文件可能不是 UTF-8 编码（设备侧输出中文时常见），无法按文本解析；原始文件保留在该路径，转换编码后可直接查看。",
+                    local_csv.display()
+                ));
+            }
+        };
+        let (steps, duration_ms, bad_ts) = parse_ui_record_csv(&csv_content);
         if steps.is_empty() {
             if let Ok(mut m) = store.lock() {
                 m.remove(&store_key);
             }
             return Err(format!(
-                "录制文件已拉取但未解析到任何操作步骤（{} 行）。可能 uitest uiRecord 输出格式与预期不符。原始文件：{}",
+                "录制文件已拉取但未解析到任何操作步骤（{} 行，其中 {} 行时间戳无法解析为数字）。\n可能 uitest uiRecord 的输出格式与预期不符。原始文件：{}",
                 csv_content.lines().count(),
+                bad_ts,
                 local_csv.display(),
             ));
         }
@@ -1568,10 +1583,13 @@ pub(super) async fn record_ui(
 }
 
 /// 解析 uiRecord CSV 为步骤列表与总时长。
-pub(super) fn parse_ui_record_csv(csv: &str) -> (Vec<serde_json::Value>, u64) {
+/// 第三个返回值是「时间戳无法解析为数字而被跳过的行数」——必须带出来，
+/// 否则「格式不符」这个判断就没有证据，调用方只能报一个笼统的 0 行。
+pub(super) fn parse_ui_record_csv(csv: &str) -> (Vec<serde_json::Value>, u64, usize) {
     let mut steps: Vec<serde_json::Value> = Vec::new();
     let mut first_ts: Option<u64> = None;
     let mut last_ts: u64 = 0;
+    let mut bad_ts = 0usize;
 
     for line in csv.lines() {
         let line = line.trim();
@@ -1582,7 +1600,16 @@ pub(super) fn parse_ui_record_csv(csv: &str) -> (Vec<serde_json::Value>, u64) {
         if cols.len() < 2 {
             continue;
         }
-        let ts: u64 = cols[0].parse().unwrap_or(0);
+        // 时间戳读不出来，这一行就不是一条有效步骤。旧实现 unwrap_or(0) 会把它当成
+        // 「时刻 0 的操作」塞进时间线，并把 last_ts 归零 → 整段录制的总时长算成 0，
+        // 产出一个看起来正常、实则全错的回放。
+        let ts: u64 = match cols[0].trim().parse() {
+            Ok(v) => v,
+            Err(_) => {
+                bad_ts += 1;
+                continue;
+            }
+        };
         if first_ts.is_none() {
             first_ts = Some(ts);
         }
@@ -1648,7 +1675,7 @@ pub(super) fn parse_ui_record_csv(csv: &str) -> (Vec<serde_json::Value>, u64) {
     } else {
         0
     };
-    (steps, duration)
+    (steps, duration, bad_ts)
 }
 
 /// replay_ui：回放录制的 UI 操作。
