@@ -522,6 +522,61 @@ fn artifact_kind(path: &str) -> &'static str {
     }
 }
 
+/// 「什么命令算跑过测试」——`acceptance` 的 Tests 判据与 `declared_validator` 共用这一张表。
+///
+/// 收敛的原因：两边的表本来是分开写的，且**已经分叉**——`declared_validator` 的表里
+/// 根本没有 `pytest` / `vitest`，`python -m pytest` 之所以一直被判成验证，
+/// 只是因为它做的是**子串**包含（"pytest" 里含 "test"）。子串一去掉，这个
+/// 「一直是对的」就变成了误判：`python -m pytest` 不再算验证，于是执行循环会
+/// 判定「还没验证」而多要一轮，而验收闸门却认它为测试证据——对同一次执行各说各话，
+/// 正是本函数注释里声明要避免的事。
+pub(crate) const TEST_WORDS: &[&str] = &["test", "vitest", "pytest", "cargo test"];
+
+/// 命令头是否出现某个**词元**，而不是「整段命令行里含这个子串」。
+///
+/// 子串包含会让文件名冒充证据：`cat test_notes.md` 的命令头就是整条命令，
+/// 含 "test" → 被判成「测试通过」；`ls tests`、`cat build_log.txt` 同理。
+/// 词元相等才作数：文件名 `test_notes.md`、目录 `tests` 都不再算数，
+/// 而 `npm test` / `cargo test` / `npm run test:watch` 仍然匹配。
+fn head_has_token(head: &[&str], word: &str) -> bool {
+    if word.contains(' ') {
+        // 复合词（`cargo test` / `npm run build` / `hdc install`）要求**相邻**词元依次相等。
+        let parts = word.split_whitespace().collect::<Vec<_>>();
+        return head.windows(parts.len()).any(|window| window == &parts[..]);
+    }
+    head.iter().any(|token| {
+        *token == word
+            // npm 脚本名带子命令：`test:watch` / `build:prod` 的「脚本名」部分是 test / build。
+            || token.split(':').next().is_some_and(|script| script == word)
+    })
+}
+
+/// `run_command` 的参数里，这次执行**真正充当**了哪些验证动作。
+///
+/// 唯一真源：过去这里（`declared_validator`）在整段 args JSON 上做子串包含，
+/// 而 `acceptance::is_command` 另写了一份「解析 JSON + 分段 + 取前 4 词」的版本——
+/// **同一判据两处实现，已经分叉**：前者会把参数里的任何位置出现 "test" 都算验证，
+/// 后者好一些但仍会被文件名命中。两边对同一次执行会各说各话
+/// （结构化结果信封说「已验证」，验收闸门可能说「没验证」），所以收敛到这一个函数。
+///
+/// 取词窗口固定 4 是**防护**不是偷懒：`git commit -m "run test now"` 的前 4 个词是
+/// `git commit -m "run`，引号里的说明不会进窗口。放宽窗口会把说明文字重新变成证据，
+/// 收紧取词则会让 `cd a && cd b && npm test` 这样的真实写法漏判——两个方向都要先实测。
+pub(crate) fn command_head_matches(args: &str, words: &[&str]) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return false;
+    };
+    let Some(raw) = value.get("command").or_else(|| value.get("cmd")).and_then(|v| v.as_str())
+    else {
+        return false;
+    };
+    // 按 shell 操作符分段后各取头部，`cd frontend && npm run build` 仍能匹配到第二段。
+    raw.to_lowercase().split(['&', '|', ';']).any(|segment| {
+        let head = segment.split_whitespace().take(4).collect::<Vec<_>>();
+        words.iter().any(|word| head_has_token(&head, word))
+    })
+}
+
 /// 本次执行**实际**充当的验证器类型。
 ///
 /// 与 `contracts::validator` 的区别：`run_command` 在契约里恒为 `ValidatorKind::Command`，
@@ -532,9 +587,8 @@ pub(crate) fn declared_validator(tool: &str, args: &str) -> Option<&'static str>
     use crate::agent::tools::contracts::ValidatorKind;
     let validator = crate::agent::tools::contracts::contract(tool).validator?;
     if validator == ValidatorKind::Command
-        && !["test", "build", "cargo check", "git diff", "git status"]
-            .iter()
-            .any(|word| args.to_lowercase().contains(word))
+        && !command_head_matches(args, TEST_WORDS)
+        && !command_head_matches(args, &["build", "cargo check", "git diff", "git status"])
     {
         return None;
     }

@@ -232,24 +232,24 @@ fn is_command(e: &ToolEvidence<'_>, words: &[&str]) -> bool {
     //
     // 按 shell 操作符分段后各取头部，这样 `cd frontend && npm run build` 这种
     // 常见写法仍然匹配得到（第二段头部就是 build），而引号里的说明不在头部。
-    let Some(value) = serde_json::from_str::<serde_json::Value>(e.args).ok() else { return false };
-    let Some(raw) = value.get("command").or_else(|| value.get("cmd")).and_then(|v| v.as_str()) else {
-        return false;
-    };
-    raw.to_lowercase().split(['&', '|', ';']).filter_map(|segment| {
-        let head = segment.split_whitespace().take(4).collect::<Vec<_>>().join(" ");
-        (!head.is_empty()).then_some(head)
-    }).any(|head| words.iter().any(|word| head.contains(word)))
+    // 解析、shell 分段、取词窗口、词元匹配全部收敛到 structured_result 的单一真源。
+    // 本函数过去自己实现了一份，而 declared_validator 那边是「在整段 args JSON 上做子串
+    // 包含」——同一判据两份实现早已分叉。详见 command_head_matches 的注释。
+    //
+    // 词表里不要再写带空格的词条（如 " test"）：词元匹配下词元永远不含空格，
+    // 那样的词条会恒假。复合命令写成 "cargo test"、"npm run build" 这样的多词形式。
+    crate::agent::structured_result::command_head_matches(e.args, words)
 }
 
 fn matches_kind(kind: &CriterionKind, e: &ToolEvidence<'_>) -> bool {
     match kind {
         CriterionKind::Mutation => is_mutation(e.tool),
         CriterionKind::Verification => matches!(e.tool, "read_file" | "git_diff" | "git_status" | "build_project" | "build_generic" | "run_tests" | "test_project")
-            || is_command(e, &["git diff", "git status", " test", "test ", "cargo check", "npm run build"]),
+            || is_command(e, &["git diff", "git status", "test", "cargo check", "npm run build"]),
         CriterionKind::Build => matches!(e.tool, "build_project" | "build_hap" | "hvigor_build" | "build_generic")
             || is_command(e, &["build", "compile", "hvigor", "assemble", "cargo check"]),
-        CriterionKind::Tests => matches!(e.tool, "run_tests" | "test_project") || is_command(e, &["test", "vitest", "pytest", "cargo test"]),
+        CriterionKind::Tests => matches!(e.tool, "run_tests" | "test_project")
+            || is_command(e, crate::agent::structured_result::TEST_WORDS),
         CriterionKind::Deploy => matches!(e.tool, "deploy" | "install_launch" | "install_app") || is_command(e, &["deploy", "hdc install"]),
         CriterionKind::GitCommit => e.tool == "git_commit" || is_command(e, &["git commit"]),
         CriterionKind::GitPush => e.tool == "git_push" || is_command(e, &["git push"]),
@@ -267,7 +267,7 @@ fn evidence_label(index: usize, e: &ToolEvidence<'_>) -> String {
 
 fn is_global_verifier(e: &ToolEvidence<'_>) -> bool {
     matches!(e.tool, "git_diff" | "git_status" | "build_project" | "build_generic" | "run_tests" | "test_project")
-        || is_command(e, &["git diff", "git status", " test", "test ", "cargo check", "npm run build"])
+        || is_command(e, &["git diff", "git status", "test", "cargo check", "npm run build"])
 }
 
 pub fn evaluate_contract(contract: &GoalContract, tool_runs: &[ToolEvidence<'_>]) -> AcceptanceReport {
