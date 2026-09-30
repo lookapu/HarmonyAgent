@@ -5960,13 +5960,22 @@ async fn stream_chat_inner(
             let app = tauri::AppHandle::clone(app);
             let root = crate::services::harmony_docs::docs_root(&app);
             if let Some(r) = root {
-                if crate::services::harmony_docs::is_downloaded(&r) {
-                    let n = crate::services::harmony_docs::count_docs(&r);
-                    lines.push(format!(
-                        "- 本地 OpenHarmony 文档库已就绪（{n} 篇，无需登录）：查询 API 说明/示例代码时优先用 search_harmony_docs 工具"
-                    ));
-                } else {
-                    lines.push("- 本地 OpenHarmony 文档库未下载：可在「健康检查」页一键下载（无需登录），或直接用 web_fetch 抓 docs.openharmony.cn".to_string());
+                // 三态：读不到 ≠ 未下载。把读失败说成「未下载」会让用户去重新下载
+                // 一个早就下好的文档库——那是**有代价的错误建议**，比单纯漏报更糟。
+                match crate::services::harmony_docs::docs_index_state(&r) {
+                    crate::services::harmony_docs::DocsIndexState::Ready { doc_count } => {
+                        lines.push(format!(
+                            "- 本地 OpenHarmony 文档库已就绪（{doc_count} 篇，无需登录）：查询 API 说明/示例代码时优先用 search_harmony_docs 工具"
+                        ));
+                    }
+                    crate::services::harmony_docs::DocsIndexState::NotDownloaded => {
+                        lines.push("- 本地 OpenHarmony 文档库未下载：可在「健康检查」页一键下载（无需登录），或直接用 web_fetch 抓 docs.openharmony.cn".to_string());
+                    }
+                    crate::services::harmony_docs::DocsIndexState::Unreadable(reason) => {
+                        lines.push(format!(
+                            "- 本地 OpenHarmony 文档库目录存在但**读不到内容**（{reason}），无法确认是否已就绪。\n  请先检查该目录的访问权限/占用进程；**不要据此重新下载**——重新下载解决不了读不到的问题。可先用 web_fetch 抓 docs.openharmony.cn。"
+                        ));
+                    }
                 }
             }
         }

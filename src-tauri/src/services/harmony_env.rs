@@ -1053,6 +1053,10 @@ pub struct HarmonyDocsStatus {
     pub downloaded: bool,
     /// 已下载文档 .md 数量（0 = 未下载）
     pub doc_count: usize,
+    /// 目录存在但读不动时的原因。**不为空说明 downloaded=false 是因为读不到，
+    /// 不是因为没下载**——界面据此阻止「重新下载」这条无效建议。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
     /// 文档库根目录（未下载时为空）
     pub root: String,
 }
@@ -1061,22 +1065,23 @@ pub struct HarmonyDocsStatus {
 #[tauri::command]
 pub fn get_harmony_docs_status(app: tauri::AppHandle) -> HarmonyDocsStatus {
     let downloaded = crate::services::harmony_docs::docs_root(&app);
-    let (root, doc_count, is_dl) = match downloaded {
+    use crate::services::harmony_docs::DocsIndexState;
+    let (root, doc_count, is_dl, unreadable) = match downloaded {
         Some(r) => {
-            let n = crate::services::harmony_docs::count_docs(&r);
-            let dl = crate::services::harmony_docs::is_downloaded(&r);
-            (
-                crate::utils::path::normalize_path(&r.display().to_string()),
-                n,
-                dl,
-            )
+            let path = crate::utils::path::normalize_path(&r.display().to_string());
+            match crate::services::harmony_docs::docs_index_state(&r) {
+                DocsIndexState::Ready { doc_count } => (path, doc_count, true, None),
+                DocsIndexState::NotDownloaded => (path, 0, false, None),
+                DocsIndexState::Unreadable(reason) => (path, 0, false, Some(reason)),
+            }
         }
-        None => (String::new(), 0, false),
+        None => (String::new(), 0, false, None),
     };
     HarmonyDocsStatus {
         downloaded: is_dl,
         doc_count,
         root,
+        unreadable,
     }
 }
 

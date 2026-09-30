@@ -62,24 +62,49 @@ pub fn docs_root(app: &tauri::AppHandle) -> Option<PathBuf> {
     }
 }
 
-/// 索引是否存在（目录里至少有一个 .md）
-pub fn is_downloaded(root: &Path) -> bool {
+/// 文档索引的三种状态。**「读不到」不能塌缩成「没下载」**——
+/// 目录存在但读不动时若报成未下载，界面会给出「去下载」的按钮、
+/// agent 侧会说「本地文档库未下载」并建议重新下载，而它其实早就下好了。
+/// 那是**有代价的错误建议**（OpenHarmony 文档库不小），比单纯的漏报更糟。
+#[derive(Debug, Clone)]
+pub enum DocsIndexState {
+    /// 索引可用，且已统计到 .md 数量
+    Ready { doc_count: usize },
+    /// 目录确实不存在或确实没有文档（这是合法的空态）
+    NotDownloaded,
+    /// 目录存在但读不动：无法判断是否已就绪
+    Unreadable(String),
+}
+
+/// 判定文档索引状态。`count_docs` 复用这里的遍历结果，避免两次扫盘得到互相矛盾的结论。
+pub fn docs_index_state(root: &Path) -> DocsIndexState {
+    let entries = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        // NotFound 才是「确实没下载」；其余（权限/占用/路径是文件）都是「存在但读不到」。
+        // 不区分的话，不存在的目录会被报成「读不到，请检查权限」——同样是错的方向。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DocsIndexState::NotDownloaded,
+        Err(e) => return DocsIndexState::Unreadable(e.to_string()),
+    };
     let mut found = false;
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_file() && p.extension().is_some_and(|x| x == "md") {
-                found = true;
-                break;
-            }
-            if p.is_dir() && p.join("apis-arkui").is_dir() {
-                found = true;
-                break;
-            }
+    let mut count = 0usize;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_file() && p.extension().is_some_and(|x| x == "md") {
+            found = true;
+            count += 1;
+        } else if p.is_dir() && p.join("apis-arkui").is_dir() {
+            found = true;
+            count += count_docs(&p);
         }
     }
-    found
+    if found { DocsIndexState::Ready { doc_count: count } } else { DocsIndexState::NotDownloaded }
 }
+
+/// 索引是否存在（目录里至少有一个 .md）。三态在此收敛为 bool，供不需要区分的调用方使用。
+pub fn is_downloaded(root: &Path) -> bool {
+    matches!(docs_index_state(root), DocsIndexState::Ready { .. })
+}
+
 
 /// 统计已下载的 .md 数量（遍历可能慢，仅健康检查用）
 pub fn count_docs(root: &Path) -> usize {

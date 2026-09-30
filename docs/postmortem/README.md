@@ -1358,6 +1358,40 @@ DeepSeek Harness `docs/postmortem/` 四篇披露的复发模式，与本项目�
   **判据与本文件已记录的「阴性结论可信度取决于覆盖率」同源，
   区别在于这里一旦出错，产物本身是错的，而不只是报告措辞不准。**
 
+### 「读不到」被报成「未下载」，于是让用户去重下早就下好��文档库
+
+- **现象**：`harmony_docs::is_downloaded` 是 `if let Ok(rd) = read_dir(root) { … } found`，
+  `read_dir` 失败就返回 `false`。两个消费方都把它读成「没下载」：
+  ① `chat.rs` 注入给 agent 的环境提示：「本地文档库未下载：可在健康检查页**一键下载**」，
+     同时让 agent 别用 `search_harmony_docs`；
+  ② 健康检查页据此显示灰点 + **下载按钮**（`HealthPage.tsx` 直接看 `downloaded`）。
+
+  真实情况是文档库早就下好了、只是目录读不到（权限/占用/被杀软锁）。
+  这是本文件已记录的那条判据的又一次命中：
+  **当「没做」会触发一条有代价的修复建议时，「没做」比「没有」更危险**——
+  单纯漏报只损失一次排查，这里损失的是把一个 sizable 的文档镜像重下一遍，
+  而重下**根本解决不了读不到**的问题。
+
+- **修法**：改为三态 `DocsIndexState { Ready{doc_count}, NotDownloaded, Unreadable(String) }`。
+  `is_downloaded` 收敛为 `matches!(…, Ready{..})`（单一真源，不再另写一份遍历），
+  两个消费方各自按三态渲染。`Unreadable` 的文案明确写
+  「**不要据此重新下载**——重新下载解决不了读不到的问题，请先检查权限/占用」。
+  健康页结构体加 `#[serde(skip_serializing_if)] pub unreadable: Option<String>`，
+  向前兼容（TS 侧会忽略未知字段），供前端禁用下载按钮。
+
+- **探针当场抓到我自己的一个错误**：第一版把**不存在的目录**也归成了 `Unreadable`
+  （`missing_is_not_downloaded = false`），于是不存在的目录会被报成
+  「读不到，请检查权限」——同样是错的方向。补上
+  `Err(e) if e.kind() == NotFound => NotDownloaded` 后五项断言全对。
+  **这正是我在 `state_snapshot list` 用过的同一条判据，在新写的地方又漏了一遍**——
+  说明「按 `ErrorKind::NotFound` 区分不存在与读不动」应该固化成习惯，而不是记住一次。
+
+- **复发模式**：**「探测型布尔函数」通常需要三态而不是两态。**
+  审计形状：凡是 `fn is_X() -> bool` / `fn has_X() -> bool` 内部用
+  `if let Ok(..) = read_dir/read(..)`，就问一句「读失败时返回的 false，
+  调用方会当成『不存在』并给出一条修复建议吗？」——是的话就是这一族。
+  同类还有 `is_installed` / `is_configured` / `has_cache`。
+
 ---
 
 ## 模板
