@@ -35,13 +35,13 @@ pub(super) async fn view_image(args: &Value, roots: &[String]) -> Result<String,
     .await
     .map_err(|e| format!("视觉编码任务异常: {e}"))??;
     Ok(format!(
-        "已读取图片: {}\n（分辨率 {}x{}，原大小 {}，压缩后约 {:.0}KB，随下轮请求进入模型视野）\n[VISION_IMAGE: {}]",
+        "已读取图片: {}\n（分辨率 {}x{}，原大小 {}，压缩后约 {:.0}KB，随下轮请求进入模型视野）\n{}",
         p.display(),
         w,
         h,
         crate::agent::tools::fs_tools::human_size(meta.len()),
         data_url.len() as f64 / 1024.0,
-        p.display()
+        crate::agent::tools::vision_marker(&p.display().to_string())
     ))
 }
 
@@ -129,7 +129,8 @@ pub(super) async fn chart_extract(args: &Value, roots: &[String]) -> Result<Stri
     });
     out.push_str("  输出以 \"【图N数据】\" 开头标注对应图片编号。\n");
     for m in markers {
-        out.push_str(&format!("\n[VISION_IMAGE: {}]", m));
+        out.push('\n');
+        out.push_str(&crate::agent::tools::vision_marker(&m));
     }
     Ok(out)
 }

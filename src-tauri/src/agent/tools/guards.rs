@@ -44,8 +44,10 @@ pub fn ensure_registered() {
 const SPILL_THRESHOLD: usize = 20_000;
 const SPILL_HEAD_CHARS: usize = 3_000;
 const SPILL_TAIL_CHARS: usize = 2_000;
-/// 免落盘工具：输出含结构化标记，必须原样保留给上层处理（截图视觉闭环）
-const NO_SPILL_TOOLS: &[&str] = &["take_screenshot", "verify_ui", "run_ui_flow"];
+/// 免落盘工具：输出含结构化标记，必须原样保留给上层处理（截图视觉闭环）。
+/// 名单来自 `VISION_MARKER_TOOLS`（视觉闭环的唯一真源）——**不在这里另写一份**。
+/// 原先这里手写三个名字，漏了同样会发 `VISION_IMAGE` 标记的 `view_image`。
+const NO_SPILL_TOOLS: &[&str] = super::VISION_MARKER_TOOLS;
 
 // ---------- pre 钩子 ----------
 

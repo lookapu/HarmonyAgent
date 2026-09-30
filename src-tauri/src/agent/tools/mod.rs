@@ -70,6 +70,43 @@ use protocol::truncate_chars;
 
 pub(crate) use cmd_tools::encode_vision_image;
 
+/// 视觉闭环标记：`[VISION_IMAGE: <路径>]`。
+pub const VISION_MARKER: &str = "[VISION_IMAGE:";
+
+/// 拼出视觉闭环标记 `[VISION_IMAGE: <path>]`。
+///
+/// 生产方一律用这个函数拼，**标记格式只在这里定义一次**。消费者
+/// （`commands/chat.rs::extract_vision_image_paths`）依赖这个精确形状，
+/// 格式若在五处生产方各手写一份，改格式就会漏改某一处。
+#[must_use]
+pub fn vision_marker(path: &str) -> String {
+    format!("{VISION_MARKER} {path}]")
+}
+
+/// **会输出 `VISION_MARKER` 的工具全集**——视觉闭环的唯一真源。
+///
+/// 这份名单原先散在两处手写清单里，且**已经漂移**：
+/// - `tools/guards.rs::NO_SPILL_TOOLS`（3 个）决定「输出不许被落盘截断」，
+///   缺 `view_image`（它也发标记）
+/// - `commands/chat.rs` 的消费方分支（4 个）决定「剥离标记并把图编码进模型视野」，
+///   缺 `chart_extract`
+///
+/// 后果：①`view_image` 的标记可能被 `post_spill` 截掉；②`chart_extract` 明明在
+/// 输出里承诺「随下轮请求进入模型视野」，消费方却从不认它的标记——**该功能对图表是死的**。
+///
+/// 两个消费方（免落盘 / 剥离附加）关心的是**同一件事**：产出会被结构化解析的工具，
+/// 所以必须共用这一个常量。**新增会发标记的工具时，只改这里。**
+///
+/// 校验方式（生产方一律调 `vision_marker()`，改名单时照这个命令点一遍，不要凭印象增删）：
+/// `rg -n 'vision_marker\(' src-tauri/src/agent/tools/`
+pub const VISION_MARKER_TOOLS: &[&str] = &[
+    "take_screenshot", // mod.rs take_screenshot
+    "verify_ui",       // mod.rs verify_ui
+    "run_ui_flow",     // test_tools.rs run_ui_flow
+    "view_image",      // doc_tools.rs view_image
+    "chart_extract",   // doc_tools.rs chart_extract（一次可发多个标记）
+];
+
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1903,9 +1940,9 @@ async fn take_screenshot(
     };
     let (local, _) = capture_screenshot(project_path, &device, ctx).await?;
     Ok(format!(
-        "截图已保存: {}\n（设备 {device}）\n[VISION_IMAGE: {}]",
+        "截图已保存: {}\n（设备 {device}）\n{}",
         local.display(),
-        local.display()
+        vision_marker(&local.display().to_string())
     ))
 }
 
@@ -2205,7 +2242,7 @@ async fn verify_ui(
     if !expect.is_empty() {
         report.push_str(&format!("\n期望界面：{expect}\n"));
     }
-    report.push_str(&format!("\n截图路径：{}\n请读取该图片查看实际画面；若与期望不符或质检异常，定位问题并修复后重新部署验证。\n[VISION_IMAGE: {}]", local.display(), local.display()));
+    report.push_str(&format!("\n截图路径：{}\n请读取该图片查看实际画面；若与期望不符或质检异常，定位问题并修复后重新部署验证。\n{}", local.display(), vision_marker(&local.display().to_string())));
     Ok(report)
 }
 

@@ -11143,45 +11143,70 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                             }
                         }
                     }
-                    // 截图视觉闭环：take_screenshot/verify_ui/run_ui_flow 成功后剥离 [VISION_IMAGE] 标记，
-                    // 把截图编码为多模态 data URL 待附，下一轮请求时随工具结果一起进入模型视野；
-                    // 模型不支持 image 时保留标记并提示（避免发送 image_url 被纯文本模型拒绝）
+                    // 截图视觉闭环：产出 VISION_MARKER 的工具成功后剥离标记，
+                    // 把图片编码为多模态 data URL 待附，下一轮请求时随工具结果一起进入模型视野；
+                    // 模型不支持 image 时保留标记并提示（避免发送 image_url 被纯文本模型拒绝）。
+                    // 工具名单来自 `VISION_MARKER_TOOLS`（唯一真源）——原先这里手写四个名字，
+                    // 与 guards.rs 的免落盘名单已经漂移，且漏了 chart_extract，
+                    // 导致图表图永远进不了模型视野（工具自己却承诺「随下轮请求进入模型视野」）。
                     let mut output = output;
-                    if tool == "take_screenshot" || tool == "verify_ui" || tool == "run_ui_flow" || tool == "view_image" {
-                        if let Some(img_path) = extract_vision_image_path(&output) {
-                            let supports_image = {
-                                let conn = state.0.lock().map_err(|e| e.to_string())?;
-                                model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
-                            };
-                            // 单任务累计附带上限：防截图轮次过多导致请求体膨胀（每张 base64 数百 KB）
-                            const MAX_VISION_IMAGES: usize = 4;
-                            let room = round_state.images.as_ref().map(|v| v.len() < MAX_VISION_IMAGES).unwrap_or(true);
-                            if supports_image && room {
-                                output = output
-                                    .replace(&format!("[VISION_IMAGE: {img_path}]"), "")
-                                    .trim_end()
-                                    .to_string();
-                                // 图像解码+缩放+JPEG 编码是 CPU 密集操作（单张可达数百 ms），
-                                // 必须在 spawn_blocking 中执行，否则会钉死 tokio worker
-                                // （timer driver 停转 → 流式超时全部失效）。
-                                let path_buf = std::path::PathBuf::from(&img_path);
-                                let encoded = tokio::task::spawn_blocking(move || {
-                                    crate::agent::tools::encode_vision_image(&path_buf)
-                                })
-                                .await
-                                .unwrap_or_else(|e| Err(format!("视觉编码任务异常: {e}")));
-                                if let Ok(data_url) = encoded {
-                                    round_state.images.get_or_insert_with(Vec::new).push(data_url);
-                                }
-                            } else if supports_image {
-                                output = format!(
-                                    "{output}\n（截图已保存：{img_path}；本任务附带截图已达 {MAX_VISION_IMAGES} 张上限，后续截图不再自动附加）"
-                                );
-                            } else {
-                                output = format!(
-                                    "{output}\n（截图已保存：{img_path}；当前模型不支持图片输入，无法自动查看图片内容）"
-                                );
+                    let vision_paths = if crate::agent::tools::VISION_MARKER_TOOLS.contains(&tool.as_str()) {
+                        extract_vision_image_paths(&output)
+                    } else {
+                        Vec::new()
+                    };
+                    if !vision_paths.is_empty() {
+                        let supports_image = {
+                            let conn = state.0.lock().map_err(|e| e.to_string())?;
+                            model_supports_image(&conn, &model_choice.provider_id, &model_choice.model)
+                        };
+                        // 单任务累计附带上限：防截图轮次过多导致请求体膨胀（每张 base64 数百 KB）
+                        const MAX_VISION_IMAGES: usize = 4;
+                        let mut attached: Vec<String> = Vec::new();
+                        let mut deferred: Vec<String> = Vec::new();
+                        for img_path in &vision_paths {
+                            let room = round_state
+                                .images
+                                .as_ref()
+                                .map(|v| v.len() + attached.len() < MAX_VISION_IMAGES)
+                                .unwrap_or(true);
+                            if !(supports_image && room) {
+                                deferred.push(img_path.clone());
+                                continue;
                             }
+                            // 图像解码+缩放+JPEG 编码是 CPU 密集操作（单张可达数百 ms），
+                            // 必须在 spawn_blocking 中执行，否则会钉死 tokio worker
+                            // （timer driver 停转 → 流式超时全部失效）。
+                            let path_buf = std::path::PathBuf::from(img_path);
+                            let encoded = tokio::task::spawn_blocking(move || {
+                                crate::agent::tools::encode_vision_image(&path_buf)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("视觉编码任务异常: {e}")));
+                            if let Ok(data_url) = encoded {
+                                round_state.images.get_or_insert_with(Vec::new).push(data_url);
+                                attached.push(img_path.clone());
+                            } else {
+                                deferred.push(img_path.clone());
+                            }
+                        }
+                        // 只剥离**已附加**的那几个标记，未附加的保留原文让模型知道路径
+                        for img_path in &attached {
+                            output = output
+                                .replace(&crate::agent::tools::vision_marker(img_path), "")
+                                .trim_end()
+                                .to_string();
+                        }
+                        if !deferred.is_empty() {
+                            let reason = if !supports_image {
+                                "当前模型不支持图片输入，无法自动查看图片内容"
+                            } else {
+                                "本任务附带图片已达上限，后续不再自动附加"
+                            };
+                            output.push_str(&format!(
+                                "\n（图片已保存：{}；{reason}）",
+                                deferred.join("、")
+                            ));
                         }
                     }
                     let _ = app.emit(
@@ -12788,14 +12813,28 @@ fn build_auto_rag_hint(api_dir: &str, query: &str, api_ver: Option<&str>) -> Str
 }
 
 
-/// 从 take_screenshot 工具输出中提取 [VISION_IMAGE: <路径>] 标记的路径（无标记返回 None）
-fn extract_vision_image_path(out: &str) -> Option<String> {
-    let start = out.find("[VISION_IMAGE:")?;
-    let after = &out[start + "[VISION_IMAGE:".len()..];
-    // 取最后一个 ]：Windows 合法文件名可含 ]（如 C:\a[b]\shot.png），
-    // 用 find 会在路径中间的 ] 处截断错误；标记固定位于行尾，rfind 定位标记的收尾括号
-    let end = after.rfind(']')?;
-    Some(after[..end].trim().to_string())
+/// 提取工具输出里全部 `[VISION_IMAGE: <路径>]` 标记的路径（按出现顺序，无标记返回空）。
+///
+/// 必须**按行**取收尾括号，不能用「整段输出里的最后一个 `]`」：
+/// `rfind(']')` 当初是为了对付 Windows 合法文件名里的 `]`（如 `C:\a[b]\shot.png`），
+/// 它的前提是「标记固定位于行尾」——`take_screenshot` / `verify_ui` / `run_ui_flow`
+/// 确实只发一个且在末尾，但 `chart_extract` 会在循环里发**多个**标记。
+/// 前提不成立时 `rfind` 会一路找到最后一个标记的收尾括号，返回横跨多个标记的垃圾路径。
+/// 实测：`"...[VISION_IMAGE: C:\a\c1.png]\n[VISION_IMAGE: C:\a\c2.png]"`
+/// 旧实现返回 `"C:\a\c1.png]\n[VISION_IMAGE: C:\a\c2.png"`。
+///
+/// 按行切分后，`]` 仍可安全地取**该行最后一个**——既覆盖文件名含 `]`，
+/// 又不会被下一行标记干扰。
+fn extract_vision_image_paths(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|line| {
+            let start = line.find(crate::agent::tools::VISION_MARKER)? + crate::agent::tools::VISION_MARKER.len();
+            let rest = &line[start..];
+            let end = rest.rfind(']')?;
+            let path = rest[..end].trim();
+            (!path.is_empty()).then(|| path.to_string())
+        })
+        .collect()
 }
 
 /// 后台自动标题：用经济模型从首条消息提炼简短标题（≤20 字），成功后更新会话并推送
