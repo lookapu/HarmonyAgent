@@ -608,21 +608,50 @@ pub(super) async fn undo_edit(args: &Value, roots: &[String], conversation_id: &
             skipped.push(s.path.display().to_string());
         }
     }
-    for s in crate::agent::undo::pop_undo_filtered(conversation_id, count, allowed_paths).0 {
+    let pending = crate::agent::undo::pop_undo_filtered(conversation_id, count, allowed_paths).0;
+    let total_pending = pending.len();
+    for (idx, s) in pending.iter().enumerate() {
         if let Some(parent) = s.path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            // 父目录建不出来时不吞错误——否则后面的写盘会报一个
+            // 「写入失败」���这种把人带偏的错因（真实原因是目录建不出来）
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let msg = format!("撤销中止：无法为 {} 创建父目录：{e}", s.path.display());
+                crate::agent::undo::restore_undo(conversation_id, pending[idx..].to_vec());
+                return Err(format!(
+                    "{msg}\n已恢复 {idx} 条；剩余 {} 条快照已放回撤销栈，未丢失，可在解决后重试 undo_edit。",
+                    total_pending - idx
+                ));
+            }
         }
         // 恢复写盘为 IO 操作，放 spawn_blocking 避免钉死 tokio worker
         let path_buf = s.path.clone();
         let content_buf = s.content.clone();
-        let restored_path = tokio::task::spawn_blocking(move || {
+        let restored_path = match tokio::task::spawn_blocking(move || {
             std::fs::write(&path_buf, &content_buf)
                 .map_err(|e| format!("恢复 {} 失败: {e}", path_buf.display()))?;
             let meta = std::fs::metadata(&path_buf).ok();
             Ok::<(String, Option<std::fs::Metadata>), String>((path_buf.display().to_string(), meta))
         })
         .await
-        .map_err(|e| format!("撤销恢复任务异常: {e}"))??;
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                // 关键：已弹出但还没恢复的条目必须放回栈内。磁盘上已是新内容，
+                // 快照是旧内容的唯一副本——留在这里就等于这次撤销能力永久消失。
+                crate::agent::undo::restore_undo(conversation_id, pending[idx..].to_vec());
+                return Err(format!(
+                    "{e}\n已恢复 {idx} 条；剩余 {} 条快照已放回撤销栈，未丢失，可在解决后重试 undo_edit。",
+                    total_pending - idx
+                ));
+            }
+            Err(e) => {
+                crate::agent::undo::restore_undo(conversation_id, pending[idx..].to_vec());
+                return Err(format!(
+                    "撤销恢复任务异常：{e}\n已恢复 {idx} 条；剩余 {} 条快照已放回撤销栈，未丢失，可在解决后重试 undo_edit。",
+                    total_pending - idx
+                ));
+            }
+        };
         if let Some(meta) = &restored_path.1 {
             stamp_put(&s.path, meta, &s.content);
         }

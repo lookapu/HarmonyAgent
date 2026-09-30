@@ -54,7 +54,16 @@ pub fn snapshot(conversation_id: &str, path: &std::path::Path, old_content: &[u8
     }
 }
 
-/// 弹出**最近 `count` 条中通过 `keep` 筛选的**快照（LIFO 顺序），不通过的原样留在栈里。
+/// 弹出**最近 `count` 条中通过 `keep` 筛选的**快照，不通过的原样留在栈里。
+///
+/// 返回顺序 = **LIFO：栈顶（最近一次）在前**，`taken.first()` 是最新的一条。
+///
+/// ⚠️ 这里曾经是「从旧到新」，与本函数自己的文档相反，也与 `undo_preview` 相反——
+/// 预览用 `peek_at(i)` 枚举，`peek_at(0)` 是最近一次，所以预览把最近一次列为「步骤 1」，
+/// 而实际恢复却从最旧的一条开始。中途失败时得到的是一段**与预览描述相反顺序**的部分撤销。
+/// 现在实现与文档、与预览三者一致。
+/// 终态（同一文件连续改 N 次全部恢复）在两种顺序下相同，差别只在**中途失败**时，
+/// 所以这是修正契约漂移，不是改变既有语义。
 ///
 /// 为什么没有「先全 pop 再逐条判断」的写法：那会让被否决的条目**永久离开栈**。
 /// `fs_tools::undo_edit` 旧实现正是如此——快照 pop 出来发现路径不在会话可见根内就
@@ -90,7 +99,42 @@ pub fn pop_undo_filtered<F: Fn(&Snapshot) -> bool>(
     for item in skipped.into_iter().rev() {
         list.push(item);
     }
+    // drain 按下标递增产出，得到的是「最旧 → 最新」；反转成 LIFO 后返回。
+    taken.reverse();
     (taken, skipped_n)
+}
+
+/// 把一批已弹出的快照**放回**栈中，恢复它们原先的相对顺序。
+///
+/// 为什么需要它：`pop_undo_filtered` 是破坏性的，而 `fs_tools::undo_edit` 弹栈之后
+/// 才逐条写盘。写盘失败时若不回填，那几条快照就**永久离开撤销栈**——
+/// 而它们是旧内容的**唯一副本**（磁盘上已经是新内容了），丢掉等于用户的撤销能力
+/// 凭空消失且再也找不回来。实测可达：一次 undo 恢复多条，第 2 条写失败
+/// （父目录创建被拒、路径已变成目录、磁盘满）时，后续条目一并消失。
+///
+/// `pop_undo_filtered` 解决的是「被筛选否决的条目不能销毁」，本原语解决
+/// 「取出来之后没派上用场也不能销毁」——同一条纪律的两半，缺一半就仍有洞。
+///
+/// ⚠️ `items` 必须是 `pop_undo_filtered` 返回的**原始 LIFO 顺序（栈顶在前）**，
+/// 本函数**逆序**压回，从而恢复原有栈序（最后压入的落在栈尾 = 最新的那条）。
+/// 若误正序压回，栈序会被整个颠倒，下次 undo 恢复的顺序全错。
+/// ⚠️ 只回填**尚未恢复成功**的条目：已成功恢复的若也放回，会被二次恢复，
+/// 把用户在两次 undo 之间做的修改覆盖掉。
+pub fn restore_undo(conversation_id: &str, items: Vec<Snapshot>) {
+    if conversation_id.is_empty() || items.is_empty() {
+        return;
+    }
+    let mut ctx = table();
+    let list = ctx.undo_stacks.entry(conversation_id.to_string()).or_default();
+    // items 是栈顶在前，逆序 push 才能让其中最新的一条最终落在栈尾。
+    for item in items.into_iter().rev() {
+        list.push(item);
+    }
+    // 回填后仍受同一 FIFO 上限约束，避免回填把栈顶破
+    if list.len() > MAX_PER_SESSION {
+        let drop_n = list.len() - MAX_PER_SESSION;
+        list.drain(0..drop_n);
+    }
 }
 
 
