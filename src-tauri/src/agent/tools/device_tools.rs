@@ -751,8 +751,33 @@ pub(super) async fn analyze_crash(
             out.push_str(&format!("\n[{}] {fname}：拉取失败（权限受限）\n", i + 1));
             continue;
         }
-        let content = std::fs::read_to_string(&local).unwrap_or_default();
+        // 读不到 ≠ 文件是空的。旧实现 read_to_string(..).unwrap_or_default() 把
+        // 「解码失败」塌缩成空串，于是 summarize_crash_file("") 渲染出「堆栈片段（无）」，
+        // 看起来像「这份崩溃日志里没有堆栈」——而真实原因是我们没读出来。
+        // 设备侧崩溃日志含混合编码很常见，所以：字节读不到就如实报错；读到了但非 UTF-8，
+        // 则有损解码并**声明可能失真**，而不是悄悄丢成空串。
+        let raw = match std::fs::read(&local) {
+            Ok(b) => b,
+            Err(error) => {
+                out.push_str(&format!(
+                    "\n[{}] {fname}：已拉取到 {}，但读取失败（{error}），内容未分析\n",
+                    i + 1,
+                    local.display()
+                ));
+                continue;
+            }
+        };
+        let (content, lossy) = match String::from_utf8(raw) {
+            Ok(s) => (s, false),
+            Err(e) => {
+                let s = String::from_utf8_lossy(e.as_bytes()).into_owned();
+                (s, true)
+            }
+        };
         out.push_str(&format!("\n[{}] {fname}（{} KB）\n", i + 1, content.len() / 1024));
+        if lossy {
+            out.push_str("（该文件不是 UTF-8 文本，已按有损方式解码，个别字符可能显示为替换符）\n");
+        }
         out.push_str(&summarize_crash_file(&content));
         out.push_str(&format!("\n本地副本：{}\n", local.display()));
     }

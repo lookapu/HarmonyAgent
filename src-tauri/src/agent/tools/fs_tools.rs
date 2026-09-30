@@ -3075,29 +3075,48 @@ pub(super) async fn write_file(args: &Value, roots: &[String], conversation_id: 
             .await
             .ok()
             .and_then(|r| r.ok());
-        if let Some(bytes) = old_bytes {
-            old_bytes_for_undo = Some(bytes.clone());
-            if has_external_change(p, &bytes) {
-                return Err(format!(
-                    "写入冲突：文件 {} 自上次读取后被修改（可能被外部编辑器/IDE、其他会话或命令间接改动）。\n请先 read_file 查看最新内容、确认意图后再写入（重新读取会解除冲突保护）。",
-                    p.display()
-                ));
-            }
-            // 换行风格保持：原文件 CRLF（Windows 项目常见）且新内容纯 LF → 统一转 CRLF，
-            // 避免覆盖后整个文件 diff 全部变化
-            if bytes.windows(2).any(|w| w == b"\r\n") && !content.contains('\r') {
-                content_out = content.replace('\n', "\r\n");
-            }
-            // BOM 保留：原文件带 UTF-8 BOM（EF BB BF）时新内容也前置 BOM（与 edit_file 同口径），
-            // 避免覆盖后 .bat/带 BOM 文本文件的首行字节变化导致乱码
-            if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) && !content_out.starts_with('\u{feff}') {
-                content_out.insert(0, '\u{feff}');
-            }
+        // 「存在但读不到」必须停在这里，不能当作「不存在」继续覆盖：
+        // 读不到原内容 = 既无法做冲突核对，也无法为 undo 留底，
+        // 继续写下去会永久销毁旧内容且不留下任何撤销途径。
+        // 旧实现是 `if let Some(bytes) = old_bytes`，读失败时整段被静默跳过，
+        // 于是覆盖照样发生、undo 快照不记、还返回干净的「已覆盖文件」——实测确认。
+        let Some(bytes) = old_bytes else {
+            return Err(format!(
+                "写入中止：文件 {} 存在，但读取失败。\n\
+                 未读到原内容既无法做「自上次读取后是否被外部修改」的冲突核对，也无法为 undo 留底；\
+                 继续覆盖会永久丢失原内容且无法撤销，因此已停止。\n\
+                 常见原因：文件被其他进程以写方式独占（构建工具/日志写入/编辑器/同步客户端/杀毒扫描）、\
+                 权限不足，或该路径其实是目录。\n\
+                 请先释放占用该文件的进程后重试。",
+                p.display()
+            ));
+        };
+        old_bytes_for_undo = Some(bytes.clone());
+        if has_external_change(p, &bytes) {
+            return Err(format!(
+                "写入冲突：文件 {} 自上次读取后被修改（可能被外部编辑器/IDE、其他会话或命令间接改动）。\n请先 read_file 查看最新内容、确认意图后再写入（重新读取会解除冲突保护）。",
+                p.display()
+            ));
+        }
+        // 换行风格保持：原文件 CRLF（Windows 项目常见）且新内容纯 LF → 统一转 CRLF，
+        // 避免覆盖后整个文件 diff 全部变化
+        if bytes.windows(2).any(|w| w == b"\r\n") && !content.contains('\r') {
+            content_out = content.replace('\n', "\r\n");
+        }
+        // BOM 保留：原文件带 UTF-8 BOM（EF BB BF）时新内容也前置 BOM（与 edit_file 同口径），
+        // 避免覆盖后 .bat/带 BOM 文本文件的首行字节变化导致乱码
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) && !content_out.starts_with('\u{feff}') {
+            content_out.insert(0, '\u{feff}');
         }
     }
     // 配平守卫（与 edit_file 同口径）：代码文件写入后必须配平——
     // 新文件不存在（旧内容为空串，视为配平基准），内容缺结束符（漏 } 等）→ 拒绝落盘
-    let old_text = std::fs::read_to_string(p).unwrap_or_default(); // 不存在/读取失败 → 空串
+    // 基准直接复用上面已读到的字节：既省掉第二次读盘，也避免「字节读到了但 read_to_string
+    // 因非 UTF-8 失败 → 基准悄悄变成空串」把一个已存在的文件当成新文件。
+    let old_text = match old_bytes_for_undo.as_deref() {
+        Some(b) => String::from_utf8_lossy(b).to_string(),
+        None => String::new(),
+    };
     super::code_mutation::validate_candidate_with_types(p, &old_text, &content_out)?;
     // [58] dry-run：预览将写入的内容，不落盘、不写 undo
     if args["dry_run"].as_bool().unwrap_or(false) {
