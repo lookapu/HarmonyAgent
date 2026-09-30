@@ -104,14 +104,38 @@ fn completion(
         return (!lsp_files.is_empty() && all_clean, proof);
     }
     if tool == "check_sdk_alignment" {
-        if let Some((index, _)) = runs.iter().find(|(_, item)| {
-            item.output.contains("0 error")
-                && !item.output.contains("sdk_index_unavailable")
-                && (item.output.contains("状态：ok") || item.output.contains("状态：ahead"))
-        }) {
-            return (true, vec![format!("#{} SDK/一致性审计通过", index + 1)]);
+        // 与 check_code 臂同一条纪律，两处必须一起改。
+        // ⚠️ 这里**不能**用 `find`/`rev().find()` 过滤出「满足通过条件」的那次运行——
+        // 那等于「历史上任意一次通过就永久满足闸门」：先通过一次，之后改代码再查出
+        // 3 个 error 也照样判通过。必须取**最近一次**该工具的运行，再判定它是否通过。
+        // （第一版我写成 `rev().find(通过条件)`，被探针的 stale 用例打回。）
+        let Some((index, item)) = runs.last() else {
+            return (false, Vec::new());
+        };
+        let clean = item.output.contains("0 error")
+            && !item.output.contains("sdk_index_unavailable")
+            && (item.output.contains("状态：ok") || item.output.contains("状态：ahead"));
+        if !clean {
+            return (false, Vec::new());
         }
-        return (false, Vec::new());
+        // 覆盖不完整时不得判通过。harmony_consistency 的头部在有缺口时**照样**输出
+        // 「0 error / …」，只额外加一段披露；不查 SCAN_INCOMPLETE 就会把
+        // 「只审了部分文件」当成「审过了且没问题」——而它恰恰还打印着「覆盖不完整」，
+        // 用户会同时看到两句自相矛盾的话。
+        if item.output.contains(crate::agent::scanner::SCAN_INCOMPLETE) {
+            return (false, vec![format!(
+                "#{} check_sdk_alignment 扫描覆盖不完整（{}），本次「未发现不一致」结论不覆盖这些文件；请修复访问权限或分模块重扫",
+                index + 1,
+                item.output
+                    .lines()
+                    .find(|line| line.contains(crate::agent::scanner::SCAN_INCOMPLETE))
+                    .unwrap_or("原因未给出")
+                    .split_once('：')
+                    .map(|(_, reason)| reason.trim())
+                    .unwrap_or("原因未给出")
+            )]);
+        }
+        return (true, vec![format!("#{} SDK/一致性审计通过", index + 1)]);
     }
     if tool == "run_lint" {
         // run_lint 只要 lint 工具跑通就返回 Ok，即使报告里写着「错误 (error)：37」——

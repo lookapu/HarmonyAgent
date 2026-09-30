@@ -1392,6 +1392,48 @@ DeepSeek Harness `docs/postmortem/` 四篇披露的复发模式，与本项目�
   调用方会当成『不存在』并给出一条修复建议吗？」——是的话就是这一族。
   同类还有 `is_installed` / `is_configured` / `has_cache`。
 
+### 收紧一个工具的结论口径，会让它穿透另一个只认旧口径的闸门
+
+- **现象**：`verification_planner::completion` 对每个验收工具各有一个「结论感知臂」。
+  `check_code` 的臂里有 `SCAN_INCOMPLETE` 守卫（覆盖不完整 → 不算通过），
+  **`check_sdk_alignment` 的臂里没有**——它只看输出含不含 `0 error`。
+
+  而我上一轮刚把 `harmony_consistency::render` 改成「覆盖不完整时照常输出头部
+  （含 `0 error`）并额外加一段披露」。于是：一份只审了部分文件的审计，
+  被完成闸门判成「SDK/一致性审计通过」，**同时用户还能看到「覆盖不完整」那一句**——
+  两句自相矛盾的话并排出现在同一次验收里。
+
+  **这比修之前更糟**：修之前是「静默地假通过」，修之后是「一边说覆盖不完整、
+  一边判通过」。收紧一个工具的措辞，必须同时收紧**消费它措辞的那个闸门**。
+
+- **同一臂里还有第二个问题（更隐蔽）**：它用
+  `runs.iter().find(|(_, item)| item.output.contains("0 error") …)` 取运行——
+  这是「**找历史上任意一次满足通过条件的运行**」，不是「看最近一次是否通过」。
+  于是「先通过一次 → 改代码 → 再查出 3 个 error」仍然判通过。
+  `check_code` 用 `runs.last()`、`run_lint` 用 `.rev().find()`（按 args 覆盖度过滤，
+  不是按通过条件过滤），两条兄弟臂都不是这个写法——**又一次两处实现分叉**。
+
+- **我第一版的修复是错的，被自己的探针打回**：我先写成
+  `runs.iter().rev().find(通过条件)`，以为「取最近一次匹配」就够了。
+  探针的 stale 用例打出 `stale_pass_not_accepted = false`——
+  因为「最近一次**满足通过条件**的运行」在最近那次失败时**仍然是早先那次通过**。
+  正确写法是 `runs.last()` 取最近一次运行，再**单独判定**它是否通过。
+  **过滤条件里不能包含判定条件**：那样等于「历史上通过过一次就永久通过」。
+
+- **修法**：`runs.last()` + 显式 `clean` 判定 + `SCAN_INCOMPLETE` 守卫，
+  三者与 `check_code` 臂对齐。
+
+- **实测（临时探针，跑完已删）**：`clean_passes = true`（对照组，不得误阻断）、
+  `clean_msg_says_pass = true`、`incomplete_blocked = true`、
+  `incomplete_names_dir = true`（点名是哪个目录读不到）、
+  `incomplete_not_reported_as_pass = true`、**`stale_pass_not_accepted = true`**。
+
+- **复发模式**：**「改一个结论的产出方之前，先找出所有消费它的判定方」。**
+  我改 `render` 时只验证了「输出是否诚实」，没验证「读它的闸门是否还认这个新口径」——
+  而这个闸门是**按字符串匹配**的（`contains("0 error")`），它对工具语义的改动一无所知。
+  审计形状：凡是「某模块负责产出 X 的措辞」，grep 谁 `contains`/解析这个措辞；
+  **产出方加字段/改口径，必须同时改判定方**，否则就是「修好了一个、漏了另一个」。
+
 ---
 
 ## 模板
