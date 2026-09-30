@@ -34,6 +34,9 @@ mod errors;
 mod explore_tools;
 pub(crate) mod fs_tools;
 mod git_tools;
+/// `git status --short` 的 XY 解析全仓唯一实现（见 git_tools::StatusEntry 注释）。
+/// `commands/git.rs` 的文件树状态着色复用它，避免同一份判据出现第二份拷贝。
+pub(crate) use git_tools::{parse_status_line, StatusEntry};
 pub(crate) mod guards;
 mod media_tools;
 mod memory_tools;

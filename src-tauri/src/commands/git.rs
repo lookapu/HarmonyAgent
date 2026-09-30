@@ -871,6 +871,7 @@ pub async fn git_file_status(project_path: String, path: String) -> Result<GitFi
     .map(|o| !o.trim().is_empty())
     .unwrap_or(false);
     // 状态判断：git status --short -- path（目录为聚合：全未跟踪→untracked，含暂存→staged，含删除→deleted，否则 modified）
+    // XY 判据复用 agent::tools::parse_status_line（全仓唯一实现），不要在这里另写一份字节判断。
     let mut status = "clean".to_string();
     if let Ok(s) = crate::agent::tools::run_cmd(
         "git",
@@ -880,17 +881,12 @@ pub async fn git_file_status(project_path: String, path: String) -> Result<GitFi
     )
     .await
     {
-        let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
-        if !lines.is_empty() {
-            let all_untracked = lines.iter().all(|l| l.trim_start().starts_with("??"));
-            let any_staged = lines.iter().any(|l| {
-                let b = l.as_bytes();
-                b.len() > 1 && !matches!(b[0], b' ' | b'?' | b'!')
-            });
-            let any_deleted = lines.iter().any(|l| {
-                let b = l.as_bytes();
-                b.len() > 1 && (b[0] == b'D' || (b[0] == b' ' && b[1] == b'D'))
-            });
+        let entries: Vec<crate::agent::tools::StatusEntry> =
+            s.lines().filter_map(crate::agent::tools::parse_status_line).collect();
+        if !entries.is_empty() {
+            let all_untracked = entries.iter().all(|e| e.untracked());
+            let any_staged = entries.iter().any(|e| e.staged());
+            let any_deleted = entries.iter().any(|e| e.deleted());
             status = if all_untracked {
                 "untracked".into()
             } else if any_staged {

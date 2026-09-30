@@ -370,26 +370,21 @@ pub(super) async fn review_changes(args: &Value, roots: &[String]) -> Result<Str
     let status = run_cmd("git", &["status".into(), "--short".into()], Some(cwd), 15)
         .await
         .map_err(|e| with_advice("review_changes", e))?;
-    let files: Vec<&str> = status
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if files.is_empty() {
+    let entries: Vec<StatusEntry> = status.lines().filter_map(parse_status_line).collect();
+    if entries.is_empty() {
         return Ok("工作区干净，没有待审查的改动（git_status 显示无变更）。".into());
     }
     // 按 scope 过滤：staged 只看已暂存，unstaged 只看未暂存（含未跟踪）
-    let filtered: Vec<&str> = files
+    let filtered: Vec<&StatusEntry> = entries
         .iter()
-        .copied()
-        .filter(|l| match scope {
-            "staged" => !l.starts_with(" ") && !l.starts_with("??"),
-            "unstaged" => l.starts_with(" ") || l.starts_with("??"),
+        .filter(|e| match scope {
+            "staged" => e.staged(),
+            "unstaged" => e.unstaged(),
             _ => true,
         })
         .collect();
     if filtered.is_empty() {
-        return Ok(format!("scope={scope} 下没有待审查的改动（共 {} 个变更文件，全部在另一侧）。", files.len()));
+        return Ok(format!("scope={scope} 下没有待审查的改动（共 {} 个变更文件，全部在另一侧）。", entries.len()));
     }
     // diff 统计与全文（staged 用 --cached，unstaged 用普通 diff，all 两者叠加）
     let mut diff_text = String::new();
@@ -421,22 +416,102 @@ pub(super) async fn review_changes(args: &Value, roots: &[String]) -> Result<Str
             }
         }
     }
-    let (nf, ins, del) = summarize_diff_stats(&stat_text);
+    let (_diff_segments, ins, del) = summarize_diff_stats(&stat_text);
     let max_lines = args["max_lines"].as_u64().unwrap_or(400).clamp(20, 2000) as usize;
-    let mut out = format!(
-        "待审查改动（{} 个文件）：\n",
-        filtered.len()
-    );
-    for f in &filtered {
-        out.push_str(&format!("  {f}\n"));
+    // 清单、统计、缺口三处口径必须能对上：清单按 XY 列标注归属，统计标明只数有 diff 的文件，
+    // 并把「进了清单但 git diff 结构上给不出内容」的文件点名——否则读者会把 N 个文件
+    // 误当成都已评审，而未跟踪文件的内容其实从未被读取过。
+    let untracked: Vec<&str> = filtered.iter().filter(|e| e.untracked()).map(|e| e.path).collect();
+    let binary = stat_text
+        .lines()
+        .filter(|l| l.starts_with("Binary files ") || l.starts_with("GIT binary patch"))
+        .count();
+    // diff 段数 != 文件数：scope=all 时同时跑 --cached 与普通 diff，一个两侧都改过的文件
+    // （`MM`）会出现两段。所以这里数段、并且说清是「段」，不用段数冒充文件数。
+    let diff_segments = stat_text.lines().filter(|l| l.starts_with("diff --git ")).count();
+    let mut out = format!("待审查改动（清单 {} 个文件）：\n", filtered.len());
+    for e in &filtered {
+        let tag = if e.untracked() {
+            "未跟踪"
+        } else if e.staged() && e.unstaged() {
+            "已暂存+未暂存"
+        } else if e.staged() {
+            "已暂存"
+        } else {
+            "未暂存"
+        };
+        out.push_str(&format!("  [{tag}] {}\n", e.path));
     }
-    out.push_str(&format!("\n统计：{nf} 个文件，+{ins} 行 / -{del} 行\n"));
-    if diff_text.trim().is_empty() {
-        out.push_str("（该 scope 下无文本 diff，可能是新增未跟踪文件或二进制变更）");
+    out.push_str(&format!("\n统计：{diff_segments} 段 diff"));
+    if binary > 0 {
+        out.push_str(&format!("（其中 {binary} 段为二进制，无文本内容）"));
+    }
+    if diff_segments > filtered.len() {
+        out.push_str("（段数多于文件数：同一文件在暂存区与工作区各有一段）");
+    }
+    out.push_str(&format!("，+{ins} 行 / -{del} 行\n"));
+    if !untracked.is_empty() {
+        out.push_str(&format!(
+            "⚠️ {} 个未跟踪文件（{}）不在 git diff 中，内容未纳入本次评审；如需评审请先 `git add -N <路径>` 再复查，或直接读取文件。\n",
+            untracked.len(),
+            untracked.join("、")
+        ));
+    }
+    let reviewed = filtered.len() - untracked.len();
+    if reviewed == 0 {
+        out.push_str("（该 scope 下无文本 diff：以上文件均无 git 文本 diff 可看）");
     } else {
         out.push_str(&format!("\nDiff：\n{}", super::cmd_tools::cut_str(&diff_text, max_lines * 80)));
     }
     Ok(out)
+}
+
+/// `git status --short` 的一行。前两列 XY 是「是否已暂存 / 是否仅工作区修改」的**唯一**信号：
+/// ` M`=仅工作区、`A `/`M `=仅暂存、`MM`=两侧都有、`??`=未跟踪、`!!`=被忽略。
+/// 早期实现先 `trim()` 再用 `starts_with(" ")` 判别，前导空格被抹掉后判据恒假——
+/// 未暂存的已跟踪文件在 scope=unstaged 下整体消失，在 scope=staged 下被误算成已暂存。
+///
+/// 这是全仓解析 `git status --short` 的**唯一**实现。`commands/git.rs` 的文件树状态着色
+/// 历史上有一份独立拷贝（那份是正确的字节判据），两份已分叉过一次；新增解析点请复用这里。
+pub(crate) struct StatusEntry<'a> {
+    x: u8,
+    y: u8,
+    path: &'a str,
+}
+
+impl StatusEntry<'_> {
+    pub(crate) fn path(&self) -> &str {
+        self.path
+    }
+    pub(crate) fn untracked(&self) -> bool {
+        self.x == b'?' && self.y == b'?'
+    }
+    /// 暂存区有变化。`??`/`!!` 的 X 列是 `?`/`!`，两者都不是变更，必须排除。
+    pub(crate) fn staged(&self) -> bool {
+        !matches!(self.x, b' ' | b'?' | b'!')
+    }
+    /// 工作区有变化（含未跟踪——它们只存在于工作区）。
+    pub(crate) fn unstaged(&self) -> bool {
+        self.untracked() || !matches!(self.y, b' ' | b'?' | b'!')
+    }
+    /// 暂存区或工作区任一侧是删除（`D ` / ` D` / `DD`）。
+    pub(crate) fn deleted(&self) -> bool {
+        self.x == b'D' || self.y == b'D'
+    }
+}
+
+/// 解析一行 `git status --short`。只裁掉行尾换行残留，**前导空格是数据不能动**；
+/// 路径部分再 `trim_start()` 去掉 XY 与路径之间的分隔空格。
+pub(crate) fn parse_status_line(line: &str) -> Option<StatusEntry<'_>> {
+    let b = line.as_bytes();
+    if b.len() < 4 {
+        return None;
+    }
+    let path = line[2..].trim_start();
+    if path.is_empty() {
+        return None;
+    }
+    Some(StatusEntry { x: b[0], y: b[1], path })
 }
 
 pub(super) fn summarize_diff_stats(diff: &str) -> (usize, usize, usize) {
