@@ -919,6 +919,11 @@ fn table_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>
     Ok(cols)
 }
 
+/// 快照文件命名前缀。export 用它写文件，list 用它认文件——**两边必须共用这一个常量**：
+/// 没有项目绑定时快照目录退化成系统临时目录，那里躺着大量无关 json，
+/// 只按扩展名过滤会把别人的文件报成「快照」。
+const STATE_SNAPSHOT_PREFIX: &str = "state-";
+
 /// state_snapshot：把关键表（settings/projects/project_memories/knowledge_entries/mcp_servers/providers）
 /// 导出为可读 JSON 快照（敏感列掩码），或从快照文件恢复（按主键 INSERT OR REPLACE 合并）。
 /// 参数：{"action":"export|import|list"（缺省 export）,"path":"<可选快照文件路径>","tables":["<可选子集>"],"dest":"<可选导出目录>"}。
@@ -984,7 +989,7 @@ pub(super) async fn state_snapshot(
             let dest = args["dest"].as_str().map(String::from).unwrap_or(base_dir);
             std::fs::create_dir_all(&dest).map_err(|e| format!("创建快照目录失败：{e}"))?;
             let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            let file = std::path::Path::new(&dest).join(format!("state-{ts}.json"));
+            let file = std::path::Path::new(&dest).join(format!("{STATE_SNAPSHOT_PREFIX}{ts}.json"));
             std::fs::write(&file, serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("写入快照失败：{e}"))?;
             let mut out = format!("状态快照已导出：{}\n", file.display());
@@ -1071,24 +1076,51 @@ pub(super) async fn state_snapshot(
                 .first()
                 .map(|r| format!("{r}/.deveco-agent/snapshots"))
                 .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
-            let Ok(entries) = std::fs::read_dir(&base_dir) else {
-                return Ok(format!("快照目录不存在：{base_dir}"));
+            // read_dir 失败原因很多，不能一律报「目录不存在」——那是一个没验证过的断言。
+            // 另外无项目绑定时 base_dir 会退化成系统临时目录，那里躺着大量与快照无关的 json，
+            // 所以还必须按导出时的命名前缀过滤，否则会把无关文件报成「快照」。
+            let entries = match std::fs::read_dir(&base_dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(format!("快照目录不存在（尚未导出过快照）：{base_dir}"));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "读取快照目录失败：{base_dir}（{e}）。\n不能据此认为没有快照——目录可能存在但读不到，请检查权限后重试。"
+                    ));
+                }
             };
-            let mut files: Vec<(String, u64)> = entries
-                .flatten()
-                .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
-                .filter_map(|e| {
-                    let meta = e.metadata().ok()?;
-                    Some((e.file_name().to_string_lossy().to_string(), meta.len()))
-                })
-                .collect();
+            let mut files: Vec<(String, u64)> = Vec::new();
+            let mut unreadable = 0usize;
+            for e in entries.flatten() {
+                if e.path().extension().map(|x| x == "json") != Some(true) {
+                    continue;
+                }
+                if !e.file_name().to_string_lossy().starts_with(STATE_SNAPSHOT_PREFIX) {
+                    continue;
+                }
+                match e.metadata() {
+                    Ok(meta) => files.push((e.file_name().to_string_lossy().to_string(), meta.len())),
+                    Err(_) => unreadable += 1,
+                }
+            }
             files.sort_by_key(|a| std::cmp::Reverse(a.0.clone()));
             if files.is_empty() {
-                return Ok(format!("快照目录中没有 JSON 快照：{base_dir}"));
+                return Ok(if unreadable > 0 {
+                    format!("快照目录中没有可列出的快照（{unreadable} 个条目元数据读不到，未计入）：{base_dir}")
+                } else {
+                    format!("快照目录中没有 JSON 快照：{base_dir}")
+                });
             }
             let mut out = format!("快照文件（{} 个）：\n", files.len());
             for (f, sz) in files.iter().take(20) {
                 out.push_str(&format!("  {f}（{} KB）\n", sz / 1024));
+            }
+            if files.len() > 20 {
+                out.push_str(&format!("  ……另有 {} 个未列出\n", files.len() - 20));
+            }
+            if unreadable > 0 {
+                out.push_str(&format!("\n⚠️ {unreadable} 个快照条目读不到元数据，未计入以上清单。"));
             }
             out.push_str("\n恢复：state_snapshot action=import path=<文件路径>");
             Ok(out)

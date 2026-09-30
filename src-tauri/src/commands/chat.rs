@@ -13598,10 +13598,32 @@ async fn load_mcp_hint(
         };
         match r {
             Ok(()) => {
+                // 授权判定出错不能当成「不允许」——那会让整个 server 的工具静默消失。
+                // 这里没有对外的计数声明，但「已连接却一个工具都不可用」是最需要被告知的状态
+                // （新配的 server 默认 allowed_tools="[]"，正是这个状态）。
+                let mut policy_err: Option<String> = None;
+                let mut usable_here = 0usize;
+                let mut total_here = 0usize;
                 for t in tools {
-                    if crate::services::mcp_policy::tool_allowed(s, &t.name).unwrap_or(false) {
-                        entries.push((unique_name.clone(), t));
+                    total_here += 1;
+                    match crate::services::mcp_policy::tool_allowed(s, &t.name) {
+                        Ok(true) => {
+                            usable_here += 1;
+                            entries.push((unique_name.clone(), t));
+                        }
+                        Ok(false) => {}
+                        Err(e) => policy_err = Some(e),
                     }
+                }
+                if let Some(e) = policy_err {
+                    notes.push_str(&format!(
+                        "（MCP 服务器「{unique_name}」授权清单解析失败（{e}），无法判断哪些工具可用）\n"
+                    ));
+                } else if total_here > 0 && usable_here == 0 {
+                    notes.push_str(&format!(
+                        "（MCP 服务器「{unique_name}」连接正常，但 {} 个工具都不在本项目授权清单 allowed_tools 内，本次对话未加载；如需使用请在 MCP 页为其授权）\n",
+                        total_here
+                    ));
                 }
             }
             Err(e) => {
