@@ -2157,17 +2157,48 @@ fn parse_profile_meta(bytes: &[u8]) -> serde_json::Value {
     serde_json::Value::Object(meta)
 }
 
-/// 扫描用户签名材料目录（~/.ohos/config），返回 [(文件名, profile 元数据)]。
-fn scan_sign_materials() -> Vec<(String, serde_json::Value)> {
-    let mut out = Vec::new();
-    let home = std::env::var_os("USERPROFILE")
+/// 签名材料扫描结果：材料列表 + **没能读到的部分**。
+///
+/// 读不到必须与「没有」分开。`diagnose_signing` 在材料库里找不到匹配项时会输出
+/// 「只能通过 DevEco Studio 登录华为账号自动生成签名」——若真实原因只是
+/// `~/.ohos/config` 读不动，用户**本来就有**有效签名材料，却被指引去做一次
+/// 需要登录华为账号的交互式生成；提示里还写着「下次自检即可自动修复」，
+/// 而下次会读到同样的失败、说同样的话，成了没有出口的循环。
+struct SignMaterials {
+    found: Vec<(String, serde_json::Value)>,
+    /// 目录/文件读不到的原因。`None` = 目录确实不存在或读到了但没有匹配材料。
+    unreadable: Option<String>,
+}
+
+/// 扫描用户签名材料目录（~/.ohos/config）。
+///
+/// 目录**不存在**是合法状态（从没签过名的机器就是这样）→ 不算缺口；
+/// 目录存在却读不动、以及取不到 USERPROFILE/HOME → 记进 `unreadable`。
+fn scan_sign_materials() -> SignMaterials {
+    let mut found = Vec::new();
+    let Some(home) = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
-        .map(std::path::PathBuf::from);
-    let Some(home) = home else { return out };
-    let dir = home.join(".ohos").join("config");
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return out;
+        .map(std::path::PathBuf::from)
+    else {
+        return SignMaterials {
+            found,
+            unreadable: Some("取不到 USERPROFILE/HOME，无法定位 ~/.ohos/config".into()),
+        };
     };
+    let dir = home.join(".ohos").join("config");
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SignMaterials { found, unreadable: None };
+        }
+        Err(error) => {
+            return SignMaterials {
+                found,
+                unreadable: Some(format!("读取 {} 失败：{error}", dir.display())),
+            };
+        }
+    };
+    let mut unreadable: Vec<String> = Vec::new();
     for e in rd.flatten() {
         let p = e.path();
         let is_p7b = p
@@ -2177,24 +2208,32 @@ fn scan_sign_materials() -> Vec<(String, serde_json::Value)> {
         if !is_p7b {
             continue;
         }
-        if let Ok(bytes) = std::fs::read(&p) {
-            let meta = parse_profile_meta(&bytes);
-            if meta
-                .get("bundle-name")
-                .map(|v| v.is_string())
-                .unwrap_or(false)
-            {
-                out.push((
-                    p.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                    meta,
-                ));
+        match std::fs::read(&p) {
+            Ok(bytes) => {
+                let meta = parse_profile_meta(&bytes);
+                if meta
+                    .get("bundle-name")
+                    .map(|v| v.is_string())
+                    .unwrap_or(false)
+                {
+                    found.push((
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        meta,
+                    ));
+                }
             }
+            Err(error) => unreadable.push(format!("{}（{error}）", p.display())),
         }
     }
-    out
+    SignMaterials {
+        found,
+        unreadable: (!unreadable.is_empty()).then(|| {
+            format!("{} 个签名材料文件读不到内容", unreadable.len())
+        }),
+    }
 }
 
 /// 检查 build-profile.json5 的签名配置引用的材料文件是否齐全。
@@ -2328,11 +2367,15 @@ pub(super) async fn diagnose_signing(
     // 4) 签名材料库扫描（~/.ohos/config）
     let materials = scan_sign_materials();
     out.push_str(&format!(
-        "4. 本地签名材料（~/.ohos/config）：{} 套\n",
-        materials.len()
+        "4. 本地签名材料（~/.ohos/config）：{} 套{}\n",
+        materials.found.len(),
+        match &materials.unreadable {
+            Some(reason) => format!("　⚠️ 扫描不完整：{reason}，下面的匹配结论不覆盖读不到的部分"),
+            None => String::new(),
+        }
     ));
     let mut matched_material: Option<String> = None;
-    for (fname, meta) in &materials {
+    for (fname, meta) in &materials.found {
         let mb = meta
             .get("bundle-name")
             .and_then(|v| v.as_str())
@@ -2372,7 +2415,7 @@ pub(super) async fn diagnose_signing(
     let current_ok = current_profile
         .as_ref()
         .and_then(|p| Path::new(p).file_name())
-        .and_then(|f| materials.iter().find(|(n, _)| n == &f.to_string_lossy()))
+        .and_then(|f| materials.found.iter().find(|(n, _)| n == &f.to_string_lossy()))
         .is_some_and(|(_, m)| {
             let mb = m.get("bundle-name").and_then(|v| v.as_str()).unwrap_or("");
             let ids: Vec<String> = m
@@ -2390,7 +2433,13 @@ pub(super) async fn diagnose_signing(
 
     // 5) 结论与修复指引
     out.push_str("\n5. 结论与建议：\n");
-    if cfgs.is_empty() {
+    // 材料库读不动时**不得**给出「去 DevEco Studio 重新生成签名」——
+    // 那是需要登录华为账号的交互式流程，而用户很可能本来就有有效材料，
+    // 只是我们读不到。旧实现把两种情况都落到「没有匹配材料」分支。
+    if let Some(reason) = &materials.unreadable {
+        out.push_str(&format!("   • ⚠️ 签名材料库扫描未完成（{reason}），**无法判断是否需要配置签名**。\n"));
+        out.push_str("   • 请先修复该目录的访问权限/可读性后重新自检；不要据此结论去重新生成签名材料。\n");
+    } else if cfgs.is_empty() {
         if let Some(m) = &matched_material {
             out.push_str(&format!("   • 未配置签名，但材料库中存在匹配材料 {m}。\n"));
             out.push_str("   • 修复路径：请在 build-profile.json5 的 app.signingConfigs 添加配置并引用该材料\n");
