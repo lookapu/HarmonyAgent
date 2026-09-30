@@ -341,9 +341,17 @@ fn has_affected_downstream(
     })
 }
 
-pub fn begin(root: &Path, workflow_key: &str, fingerprint: &str) -> (HarmonyBuildCheckpoint, bool) {
+pub fn begin(
+    root: &Path,
+    workflow_key: &str,
+    fingerprint: &str,
+    fingerprint_complete: bool,
+) -> (HarmonyBuildCheckpoint, bool) {
     if let Some(mut checkpoint) = load(root) {
-        let resumable = checkpoint.schema_version == CHECKPOINT_SCHEMA
+        // 指纹来自一次不完整的遍历时**绝不续做**：不完整指纹对「被跳过的那些文件的变化」
+        // 是盲的，续做等于拿过期产物当新产物。从头构建只是慢，不会错。
+        let resumable = fingerprint_complete
+            && checkpoint.schema_version == CHECKPOINT_SCHEMA
             && checkpoint.workflow_key == workflow_key
             && checkpoint.project_fingerprint == fingerprint
             && matches!(checkpoint.status.as_str(), "running" | "failed");
@@ -410,19 +418,38 @@ pub fn completed(
     save(root, checkpoint);
 }
 
-pub fn project_fingerprint(root: &Path) -> String {
-    fn walk(path: &Path, root: &Path, hasher: &mut Sha256) {
+/// 工程内容指纹（构建断点续做与「产物是否已过期」两处的门）。
+/// 返回 `(指纹, 是否完整遍历)`。
+///
+/// ⚠️ 第二个返回值不能省。旧实现把「读不到」当成「内容没变」：
+/// `fs::read(&child)` 失败的文件**只把相对路径并进哈希、不并内容**，
+/// 于是**在那个文件里改内容不会改变指纹**——构建因此判定可以续做、跳过重编译，
+/// 最终产出**旧产物却报构建成功**。`read_dir` 失败放弃整棵子树、
+/// `entries.flatten()` 丢弃读不到的条目，同理。
+/// Windows 上源文件被编辑器/同步客户端/杀毒扫描短暂独占就会走到这条路径。
+pub fn project_fingerprint(root: &Path) -> (String, bool) {
+    fn walk(path: &Path, root: &Path, hasher: &mut Sha256, complete: &mut bool) {
         let Ok(entries) = std::fs::read_dir(path) else {
+            *complete = false;
             return;
         };
-        let mut entries = entries.flatten().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
+        let mut items: Vec<std::fs::DirEntry> = Vec::new();
         for entry in entries {
+            match entry {
+                Ok(e) => items.push(e),
+                Err(_) => {
+                    *complete = false;
+                    continue;
+                }
+            }
+        }
+        items.sort_by_key(|entry| entry.file_name());
+        for entry in items {
             let child = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if child.is_dir() {
                 if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
-                    walk(&child, root, hasher);
+                    walk(&child, root, hasher, complete);
                 }
                 continue;
             }
@@ -436,14 +463,24 @@ pub fn project_fingerprint(root: &Path) -> String {
             if let Ok(relative) = child.strip_prefix(root) {
                 hasher.update(relative.to_string_lossy().as_bytes());
             }
-            if let Ok(bytes) = std::fs::read(&child) {
-                hasher.update(&bytes);
+            match std::fs::read(&child) {
+                Ok(bytes) => hasher.update(&bytes),
+                Err(_) => {
+                    // 路径已并入、内容没并 → 这个文件的状态**没有被指纹覆盖**，
+                    // 继续把它当作「没变化」就会复用过期产物。
+                    *complete = false;
+                }
             }
         }
     }
     let mut hasher = Sha256::new();
-    walk(root, root, &mut hasher);
-    format!("{:x}", hasher.finalize())
+    let mut complete = true;
+    walk(root, root, &mut hasher, &mut complete);
+    if !complete {
+        // 让「不完整」本身进入指纹：否则不完整状态可能与某个完整状态撞同一个值
+        hasher.update(b"\x00dsh:incomplete-walk\x00");
+    }
+    (format!("{:x}", hasher.finalize()), complete)
 }
 
 pub fn dependency_state(
@@ -531,7 +568,14 @@ pub fn select_deploy_artifact(
 ) -> Result<HarmonyDeployArtifact, String> {
     let manifest = load_artifact_manifest(root)
         .ok_or_else(|| "缺少持久产物清单；请先运行 build_project，再部署".to_string())?;
-    let current_fingerprint = project_fingerprint(root);
+    let (current_fingerprint, fingerprint_complete) = project_fingerprint(root);
+    if !fingerprint_complete {
+        return Err(
+            "工程目录未完整遍历（部分源码读不到，无法确认产物是否已过期）。\n\
+             为避免部署过期产物已中止；请释放占用这些文件的进程（编辑器/同步客户端/杀毒扫描）后重试。"
+                .to_string(),
+        );
+    }
     if manifest.project_fingerprint != current_fingerprint {
         return Err(
             "产物清单生成后工程源码或配置已变化；请先重新运行 build_project，或显式传 hap 确认部署旧产物"
@@ -1020,12 +1064,13 @@ mod tests {
             "@Entry struct Index {}",
         )
         .unwrap();
-        let fingerprint = project_fingerprint(&root);
-        let (mut checkpoint, resumed) = begin(&root, "entry:debug", &fingerprint);
+        let (fingerprint, complete) = project_fingerprint(&root);
+        assert!(complete, "临时工程应能完整遍历");
+        let (mut checkpoint, resumed) = begin(&root, "entry:debug", &fingerprint, complete);
         assert!(!resumed);
         stage_completed(&root, &mut checkpoint, "environment");
         stage_failed(&root, &mut checkpoint, "build", "interrupted");
-        let (checkpoint, resumed) = begin(&root, "entry:debug", &fingerprint);
+        let (checkpoint, resumed) = begin(&root, "entry:debug", &fingerprint, complete);
         assert!(resumed);
         assert!(checkpoint
             .completed_stages
@@ -1035,7 +1080,8 @@ mod tests {
             "@Entry struct Changed {}",
         )
         .unwrap();
-        let (_, resumed) = begin(&root, "entry:debug", &project_fingerprint(&root));
+        let (fingerprint, complete) = project_fingerprint(&root);
+        let (_, resumed) = begin(&root, "entry:debug", &fingerprint, complete);
         assert!(!resumed);
         std::fs::remove_dir_all(root).ok();
     }
@@ -1188,7 +1234,7 @@ mod tests {
         std::fs::write(&source, "@Entry struct Before {}").unwrap();
         let fingerprint = project_fingerprint(&root);
         let manifest =
-            record_artifact_manifest(&root, &model, &plan, "workflow", &fingerprint).unwrap();
+            record_artifact_manifest(&root, &model, &plan, "workflow", &fingerprint.0).unwrap();
         assert_eq!(manifest.artifacts.len(), 1);
         let artifact = &manifest.artifacts[0];
         assert_eq!(artifact.signing_status, "verified_signed");
@@ -1260,7 +1306,7 @@ mod tests {
             &model,
             &plan,
             "workflow",
-            &project_fingerprint(&root),
+            &project_fingerprint(&root).0,
         )
         .unwrap();
         assert!(select_deploy_artifact(&root, None, None)

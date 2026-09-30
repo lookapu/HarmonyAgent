@@ -1313,6 +1313,51 @@ DeepSeek Harness `docs/postmortem/` 四篇披露的复发模式，与本项目�
   匹配上就判 `summary_positive_claim_conflicts_with_failed_fact` 并附上权威块。
   **它用工具执行结果去反证模型的自我声明**，这是对的。仓里已经做对的实现值得先读再下判断。
 
+### 内容哈希把「读不到」当成「内容没变」，于是拿过期产物当新产物
+
+- **现象**：`harmony_build::project_fingerprint` 是**构建断点续做**与
+  **「产物是否已过期」**两处的门——指纹相同就跳过已完成阶段。
+  但 `walk` 里：
+
+  ```rust
+  if let Ok(relative) = child.strip_prefix(root) { hasher.update(relative…); }
+  if let Ok(bytes) = std::fs::read(&child)        { hasher.update(&bytes);      }
+  ```
+
+  **读不到内容的文件只把相对路径并进哈希、不并内容。**
+  于是**在那个文件里改内容，指纹纹丝不动** → 构建判定「没变化、可续做」→
+  跳过重编译 → **产出旧产物却报构建成功**。
+  `read_dir` 失败放弃整棵子树、`entries.flatten()` 丢弃读不到的条目，同理。
+
+- **为什么比「阴性结论」那一类更严重**：那条至少会输出「未发现不一致」这种**限定性**结论；
+  这条产出的是一个**可安装的产物**，而且整条链路上的每一环都显示「成功」。
+  Windows 上源文件被编辑器/同步客户端/杀毒扫描短暂独占就会走到——
+  这不是病态构造，是日常。
+
+- **修法**：`project_fingerprint` 改为返回 `(指纹, 是否完整遍历)`；
+  任一处读不到就把 `complete` 置 false，并且**把「不完整」这件事本身并进哈希**，
+  使不完整状态不可能与任何完整状态撞同一个值。
+  然后在两个消费点都加上门：
+  ① `begin()` 增加 `fingerprint_complete` 参数，**不完整时一律不续做**——
+  不完整指纹对「被跳过那些文件的变化」是盲的，从头构建只是慢，不会错；
+  ② 部署侧的过期检查**不完整时直接拒绝部署**并说明原因。
+  `build_project` 另发一条 system 日志如实告知「本次不使用断点续做」，
+  否则用户只会看到一次从头构建，完全不知道有源文件没被读进指纹。
+
+- **实测（临时探针，跑完已删）**：
+  `baseline_complete = true`（happy path 不误报）、`fs_read_is_err = true`、
+  `locked_complete_is_false = true`、`fingerprint_differs_from_baseline = true`
+  （不完整状态不会撞值）、**`not_resumed_when_incomplete = true`**（危险路径已关闭）、
+  `after_unlock_complete = true` / `after_unlock_differs = true`（释放锁后恢复正常）。
+
+- **复发模式**：**「哈希/指纹类摘要函数必须同时回答『覆盖全了吗』」。**
+  只返回摘要值，就等于让调用方把「部分输入算出的摘要」当成「输入没变」。
+  审计形状：凡是 `hasher.update(…)` 出现在一个 `if let Ok(...)` 旁边，
+  就要问「这个 `Err` 分支下，这个文件的**状态**是不是没被摘要覆盖？」
+  ——路径进了哈希、内容没进，恰恰是最容易被误读成「已覆盖」的一种。
+  **判据与本文件已记录的「阴性结论可信度取决于覆盖率」同源，
+  区别在于这里一旦出错，产物本身是错的，而不只是报告措辞不准。**
+
 ---
 
 ## 模板

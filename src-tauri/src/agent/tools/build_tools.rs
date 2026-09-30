@@ -150,7 +150,16 @@ pub(super) async fn build_project(
         "{}:{}:{}:{}:{}",
         plan.scope, target_key, mode, spec.clean, spec.dependencies
     );
-    let fingerprint = crate::services::harmony_build::project_fingerprint(root);
+    let (fingerprint, fingerprint_complete) = crate::services::harmony_build::project_fingerprint(root);
+    if !fingerprint_complete {
+        // 不披露的话，用户只会看到「恢复构建工作流」或一次从头构建，
+        // 完全不知道有源文件没能被读进指纹——那正是「产物可能已过期」的来源。
+        ctx.emit_log(
+            "system",
+            "⚠️ 工程目录未完整遍历：部分源码读不到内容（可能被编辑器/同步客户端/杀毒扫描独占）。\
+             本次不使用构建断点续做（不完整指纹对那些文件的变化是盲的），改为从头构建。",
+        );
+    }
     ctx.record_run_event(
         "harmony.build.planned",
         serde_json::json!({
@@ -168,7 +177,7 @@ pub(super) async fn build_project(
         }),
     );
     let (mut checkpoint, resumed) =
-        crate::services::harmony_build::begin(root, &workflow_key, &fingerprint);
+        crate::services::harmony_build::begin(root, &workflow_key, &fingerprint, fingerprint_complete);
     if resumed {
         ctx.emit_log(
             "system",
@@ -268,7 +277,8 @@ pub(super) async fn build_project(
             );
             return Err(with_advice("ohpm_install", error));
         }
-        checkpoint.project_fingerprint = crate::services::harmony_build::project_fingerprint(root);
+        // 依赖装完后刷新指纹（此时工程已可完整遍历，用开始阶段的完整性判断即可）
+        checkpoint.project_fingerprint = fingerprint.clone();
     } else if spec.dependencies == "skip" && !dependency_state.missing.is_empty() {
         ctx.emit_log(
             "system",
