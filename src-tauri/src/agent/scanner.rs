@@ -66,23 +66,28 @@ pub const SCAN_INCOMPLETE: &str = "⚠️ 扫描覆盖不完整";
 
 /// 一次扫描的覆盖缺口。check_code 与 secret_scan 共用同一套披露口径——
 /// 格式若各写一份，改一处必然漏另一处。
-struct CoverageGaps {
-    unreadable_dirs: Vec<String>,
-    metadata_failed: usize,
-    read_failed: usize,
-    dropped_by_cap: usize,
+/// 公开是因为**第三处**也需要它：`services::harmony_consistency` 自己的遍历策略
+/// （深度上限 12 + 跳符号链接）与 `walk_filtered` 不同，不能强行换掉；
+/// 但**缺口的枚举与措辞必须同一份**，否则「扫描覆盖不完整」这句话又会分叉。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CoverageGaps {
+    pub unreadable_dirs: Vec<String>,
+    pub metadata_failed: usize,
+    pub read_failed: usize,
+    pub dropped_by_cap: usize,
 }
 
 impl CoverageGaps {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.unreadable_dirs.is_empty()
             && self.metadata_failed == 0
             && self.read_failed == 0
             && self.dropped_by_cap == 0
     }
 
-    /// 渲染披露段落；无缺口返回 None。
-    fn render(&self, cap: usize) -> Option<String> {
+    /// 缺口的**统一描述**（单一真源）。只说「漏了什么」，不替调用方下结论——
+    /// 「无命中」与「未发现不一致」是不同的结论，措辞不能共用，由各消费方自配。
+    pub fn describe(&self, cap: usize) -> Option<String> {
         if self.is_empty() {
             return None;
         }
@@ -103,10 +108,16 @@ impl CoverageGaps {
         if self.dropped_by_cap > 0 {
             gaps.push(format!("{} 个文件超过单次 {cap} 上限未扫描", self.dropped_by_cap));
         }
-        Some(format!(
-            "{SCAN_INCOMPLETE}：{}\n本次「无命中」结论**不覆盖**以上文件，修复访问权限或分目录重扫后才能作为干净结论。\n",
-            gaps.join("；")
-        ))
+        Some(gaps.join("；"))
+    }
+
+    /// 渲染披露段落；无缺口返回 None。
+    fn render(&self, cap: usize) -> Option<String> {
+        self.describe(cap).map(|d| {
+            format!(
+                "{SCAN_INCOMPLETE}：{d}\n本次「无命中」结论**不覆盖**以上文件，修复访问权限或分目录重扫后才能作为干净结论。\n"
+            )
+        })
     }
 }
 

@@ -29,6 +29,9 @@ pub struct HarmonyConsistencyReport {
     pub warnings: usize,
     pub infos: usize,
     pub issues: Vec<ConsistencyIssue>,
+    /// 扫描覆盖缺口：读不到的目录/文件、超出上限而未看的部分。
+    /// 缺口不为空时，「未发现不一致」这句话**只覆盖已扫描的部分**。
+    pub gaps: crate::agent::scanner::CoverageGaps,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +43,9 @@ struct ApiUsage {
     line: usize,
 }
 
+/// 单次审计扫描的文件数上限。超出部分计入覆盖缺口并在报告里披露。
+pub const HARMONY_CONSISTENCY_FILE_CAP: usize = 2_000;
+
 /// 执行只读一致性审计。`official_db` 可选；缺失时只跳过官方设备类型证据。
 pub fn analyze(
     root: &Path,
@@ -48,7 +54,8 @@ pub fn analyze(
     index: Option<&ApiIndex>,
     official_db: Option<&Connection>,
 ) -> HarmonyConsistencyReport {
-    let (files_scanned, usages) = collect_api_usages(root, &model.modules);
+    let mut gaps = crate::agent::scanner::CoverageGaps::default();
+    let (files_scanned, usages) = collect_api_usages(root, &model.modules, &mut gaps);
     let modules = index
         .map(|index| {
             index
@@ -117,6 +124,7 @@ pub fn analyze(
             .filter(|issue| issue.severity == "info")
             .count(),
         issues,
+        gaps,
     }
 }
 
@@ -125,9 +133,22 @@ pub fn render(report: &HarmonyConsistencyReport) -> String {
         "工程一致性审计：扫描 {} 个源码文件、{} 条 SDK API import；{} error / {} warning / {} info",
         report.files_scanned, report.api_imports, report.errors, report.warnings, report.infos
     );
+    // 覆盖不完整时**不能**说「未发现不一致」：读不到的目录、超上限未看的文件、
+    // 读不出内容的文件上同样看不到不一致——那个「未发现」是覆盖不全的产物，
+    // 而它会被当成工程没问题的干净结论。措辞与 scanner::SCAN_INCOMPLETE 共用同一真源。
+    let gaps_note = report.gaps.describe(HARMONY_CONSISTENCY_FILE_CAP);
     if report.issues.is_empty() {
-        out.push_str("\n- 未发现 API、权限、设备能力或模块配置不一致。");
+        match &gaps_note {
+            Some(note) => out.push_str(&format!(
+                "\n- 在已扫描的 {} 个文件内未发现 API、权限、设备能力或模块配置不一致；**但本次扫描覆盖不完整**：{note}。\n  上述「未发现」**不覆盖**缺口里的文件，修复访问权限或分模块重扫后才能作为干净结论。",
+                report.files_scanned
+            )),
+            None => out.push_str("\n- 未发现 API、权限、设备能力或模块配置不一致。"),
+        }
         return out;
+    }
+    if let Some(note) = &gaps_note {
+        out.push_str(&format!("\n- {}：{note}\n  以上部分未被审计，下面的结论**不覆盖**它们。", crate::agent::scanner::SCAN_INCOMPLETE));
     }
     for issue in report.issues.iter().take(80) {
         out.push_str(&format!(
@@ -464,7 +485,11 @@ fn audit_usage(
     }
 }
 
-fn collect_api_usages(root: &Path, modules: &[HarmonyModule]) -> (usize, Vec<ApiUsage>) {
+fn collect_api_usages(
+    root: &Path,
+    modules: &[HarmonyModule],
+    gaps: &mut crate::agent::scanner::CoverageGaps,
+) -> (usize, Vec<ApiUsage>) {
     let mut files_scanned = 0;
     let mut usages = Vec::new();
     for module in modules {
@@ -474,14 +499,23 @@ fn collect_api_usages(root: &Path, modules: &[HarmonyModule]) -> (usize, Vec<Api
             root.join(&module.rel_path)
         };
         let mut files = Vec::new();
-        collect_source_files(&module_root.join("src/main"), 0, &mut files);
+        collect_source_files(&module_root.join("src/main"), 0, &mut files, gaps);
         files.sort();
-        files.truncate(2_000usize.saturating_sub(files_scanned));
-        files_scanned += files.len();
+        // 截断必须计入缺口：原先静默 truncate，随后照常输出「未发现不一致」，
+        // 读者无从知道有文件根本没被看过。
+        let room = HARMONY_CONSISTENCY_FILE_CAP.saturating_sub(files_scanned);
+        if files.len() > room {
+            gaps.dropped_by_cap += files.len() - room;
+            files.truncate(room);
+        }
         for path in files {
+            // 读不到的文件**不计入 files_scanned**：原先先加进计数再 continue，
+            // 于是「扫描 N 个源码文件」里的 N 包含了根本没读成功的文件。
             let Ok(text) = fs::read_to_string(&path) else {
+                gaps.read_failed += 1;
                 continue;
             };
+            files_scanned += 1;
             let source_file = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -501,16 +535,32 @@ fn collect_api_usages(root: &Path, modules: &[HarmonyModule]) -> (usize, Vec<Api
     (files_scanned, usages)
 }
 
-fn collect_source_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 12 || out.len() >= 2_000 {
+fn collect_source_files(
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+    gaps: &mut crate::agent::scanner::CoverageGaps,
+) {
+    if depth > 12 || out.len() >= HARMONY_CONSISTENCY_FILE_CAP {
         return;
     }
+    // 原先 `else { return }` 静默放弃整棵子树——这正是 check_code/secret_scan
+    // 早已修过、这里仍是旧形态的第三份拷贝。
     let Ok(entries) = fs::read_dir(dir) else {
+        gaps.unreadable_dirs.push(dir.display().to_string());
         return;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                gaps.metadata_failed += 1;
+                continue;
+            }
+        };
         let path = entry.path();
         let Ok(kind) = entry.file_type() else {
+            gaps.metadata_failed += 1;
             continue;
         };
         if kind.is_symlink() {
@@ -519,7 +569,7 @@ fn collect_source_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if kind.is_dir() {
             let name = entry.file_name();
             if !name.to_string_lossy().starts_with('.') {
-                collect_source_files(&path, depth + 1, out);
+                collect_source_files(&path, depth + 1, out, gaps);
             }
         } else if path
             .extension()
