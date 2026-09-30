@@ -115,6 +115,11 @@ export interface HarmonyDocsStatus {
   downloaded: boolean
   doc_count: number
   root: string
+  /**
+   * 目录存在但读不到时的原因。为空表示确实是「未下载」；
+   * 非空表示 downloaded=false 是因为读不到，**不能**据此提示用户重新下载。
+   */
+  unreadable?: string | null
 }
 
 export interface DocEntry {

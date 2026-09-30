@@ -1969,6 +1969,7 @@
     "docsTitle": "OpenHarmony 文档库（无需登录）",
     "docsReady": "已就绪 · {{count}} 篇文档",
     "docsNotReady": "未下载（华为官方文档站需登录，这里提供公开的 OpenHarmony 文档离线镜像）",
+    "docsUnreadable": "目录存在但读不到（{{reason}}）——无法确认是否已就绪。请先修复访问权限或释放占用进程；重新下载解决不了这个问题，故已停用下载按钮。",
     "docsDownload": "下载文档库",
     "docsUpdate": "更新文档库",
     "docsSyncing": "下载中…（需联网，首次约几分钟）",

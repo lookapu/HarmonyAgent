@@ -965,11 +965,23 @@ export default function HealthPage() {
       <h3 className="text-sm font-medium text-[var(--text-secondary)] mt-8 mb-3">{t('health.docsTitle')}</h3>
       <div className="modern-card rounded-lg p-4 mb-3">
         <div className="flex items-center gap-3 flex-wrap">
-          <div className={`w-3 h-3 rounded-full ${docsStatus?.downloaded ? 'bg-[var(--success)]' : 'bg-[var(--muted)]'} shrink-0`} />
+          {/* 「读不到」与「未下载」是两件事：前者重新下载解决不了问题，
+              给出下载按钮会引导用户做一次无效的大体积下载。 */}
+          <div
+            className={`w-3 h-3 rounded-full shrink-0 ${
+              docsStatus?.downloaded
+                ? 'bg-[var(--success)]'
+                : docsStatus?.unreadable
+                  ? 'bg-[var(--warning)]'
+                  : 'bg-[var(--muted)]'
+            }`}
+          />
           <span className="text-xs text-[var(--text-secondary)]">
             {docsStatus?.downloaded
               ? t('health.docsReady', { count: docsStatus.doc_count })
-              : t('health.docsNotReady')}
+              : docsStatus?.unreadable
+                ? t('health.docsUnreadable', { reason: docsStatus.unreadable })
+                : t('health.docsNotReady')}
           </span>
           <label className="ml-auto flex items-center gap-1.5 text-xs text-[var(--text-secondary)] cursor-pointer select-none shrink-0">
             <input
@@ -982,7 +994,8 @@ export default function HealthPage() {
           </label>
           <button
             onClick={() => void handleDocsSync()}
-            disabled={docsBusy}
+            disabled={docsBusy || Boolean(docsStatus?.unreadable)}
+            title={docsStatus?.unreadable ? t('health.docsUnreadable', { reason: docsStatus.unreadable }) : undefined}
             className="px-3 h-8 rounded-lg btn-primary text-xs font-medium  disabled:opacity-50 transition-colors"
           >
             {docsBusy ? t('health.docsSyncing') : (docsStatus?.downloaded ? t('health.docsUpdate') : t('health.docsDownload'))}

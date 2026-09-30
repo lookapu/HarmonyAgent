@@ -1968,6 +1968,7 @@
     "docsTitle": "OpenHarmony Docs Library (no login)",
     "docsReady": "Ready · {{count}} docs",
     "docsNotReady": "Not downloaded (Huawei docs site requires login; this provides a public offline mirror of OpenHarmony docs)",
+    "docsUnreadable": "Directory exists but cannot be read ({{reason}}) — cannot tell whether it is ready. Fix access permissions or release the process holding it; re-downloading cannot fix this, so the download button is disabled.",
     "docsDownload": "Download docs",
     "docsUpdate": "Update docs",
     "docsSyncing": "Downloading… (needs network, a few minutes first time)",
