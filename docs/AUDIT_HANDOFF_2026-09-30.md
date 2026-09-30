@@ -72,6 +72,23 @@
 
 ---
 
+## D1. 关于「4 个失败用例」的核实结论（收口前补验）
+
+- **真实失败原因**：`agent::eval_runner` 的 4 个用例 panic 于
+  `called Result::unwrap() on an Err value: "grader 启动失败：program not found"`。
+  测试构造的 grader 命令是 `["grep", "-q", "fixed", "a.txt"]`，
+  而 `grep` 在 Windows 上**不是独立可执行文件**（没有 `grep.exe`），
+  `Command::new("grep").spawn()` 必然失败。
+- **结论**：这 4 个是**环境项，不是被长期忽略的真缺陷**。生产代码路径
+  `run_command_grader` 在 spawn 失败时用 `?` 传播并报「grader 启动失败：{error}」，
+  是 fail-closed 的正确行为，没有「执行器报成功但其实失败」的问题。
+- **但有一个需要你知道的事实**：在这台机器上，这 4 个测试**从未跑过 spawn 之后的任何逻辑**——
+  `run_command_grader` 的实际执行、超时、分级判定路径本地是**零覆盖**。
+  本轮我修的所有东西都不在这条路径上（工具层 / 闸门层 / 文件层），
+  但「eval grader 执行路径在 Windows 本地未被验证」这件事应当记录在案。
+
+---
+
 ## E. 如果要继续扫，还剩什么
 
 已系统审过：全部工具模块、破坏性写入全路径、覆盖/披露族（7 处）、
