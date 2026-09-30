@@ -73,17 +73,30 @@ fn glob_matches(pattern: &str, rel: &str) -> bool {
 }
 
 /// 采集任务声明的 artifacts（glob 匹配）到输出目录的 `artifacts/` 子目录，保留相对结构。
-/// 返回收集到的相对路径列表。工作树内无匹配文件不视为错误。
+///
+/// 返回 `(收集到的相对路径, 声明了但一个文件都没匹配到的 pattern)`。
+///
+/// 第二个返回值是**哨兵**。旧实现只返回收集结果，且注释写明「工作树内无匹配文件不视为错误」，
+/// 于是 `collect_artifacts` 的结果压根不参与 outcome 判定：grader 一通过就算 resolved，
+/// 「声明了但没产出」的 fixture 被原样放过，评测结论偏乐观。
+/// 契约改为「**声明即承诺**」：任务写了 `artifacts: ["test-results/**"]` 就是承诺本次会产出它，
+/// 一个都没匹配上说明这次运行没做到它承诺的事。只想「有就采集、没有也无所谓」的 fixture
+/// 不要写这个 pattern——不写就没有承诺，也就没有这条约束。
 pub fn collect_artifacts(
     worktree: &Path,
     artifacts: &[String],
     output_dir: &Path,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<String>), String> {
     let dest = output_dir.join("artifacts");
     std::fs::create_dir_all(&dest).map_err(|error| format!("创建 artifacts 目录失败：{error}"))?;
     let mut collected = Vec::new();
     walk_and_collect(worktree, worktree, &dest, artifacts, &mut collected)?;
-    Ok(collected)
+    let missing = artifacts
+        .iter()
+        .filter(|pattern| !collected.iter().any(|rel| glob_matches(pattern, rel)))
+        .cloned()
+        .collect();
+    Ok((collected, missing))
 }
 
 fn walk_and_collect(
@@ -205,9 +218,14 @@ mod tests {
         fs::write(worktree.join("src/main.ets"), "code").unwrap();
 
         let output = temp_dir("art-out");
-        let mut collected = collect_artifacts(
+        let (mut collected, missing) = collect_artifacts(
             &worktree,
-            &["test-results/**".to_string(), "**/*.hap".to_string()],
+            &[
+                "test-results/**".to_string(),
+                "**/*.hap".to_string(),
+                // 声明了但工作树里没有的 pattern：必须被哨兵点名，而不是悄悄采到 0 个。
+                "coverage/**".to_string(),
+            ],
             &output,
         )
         .unwrap();
@@ -220,6 +238,7 @@ mod tests {
                 "test-results/sub/b.log".to_string(),
             ]
         );
+        assert_eq!(missing, vec!["coverage/**".to_string()]);
         assert!(output.join("artifacts/test-results/sub/b.log").exists());
         assert!(output.join("artifacts/entry/build/app.hap").exists());
         assert!(!output.join("artifacts/src/main.ets").exists());

@@ -306,6 +306,8 @@ pub struct EvalTrialOutcome {
     pub patch: String,
     pub grader: GraderOutcome,
     pub collected_artifacts: Vec<String>,
+    /// 声明了但一个都没匹配到的 pattern；非空则 status 必为 unresolved。
+    pub missing_artifacts: Vec<String>,
     pub duration_ms: u64,
     pub trajectory_events: u64,
     pub patch_digest: String,
@@ -450,6 +452,9 @@ pub async fn run_trial(
                     }
                     .into()],
                     policy_violations: 0,
+                    // 中断/驱动出错发生在产物采集之前，无从判断是否缺失；
+                    // 这条路径的 status 本就不是 resolved，哨兵不适用。
+                    missing_artifacts: vec![],
                 },
             };
             write_json(
@@ -526,9 +531,16 @@ pub async fn run_trial(
     let (trajectory_events, raw_trajectory_digest) = trajectory.finish()?;
     let trajectory_digest = format!("sha256:{raw_trajectory_digest}");
     // 采集任务声明的产物（如 test-results/**），从 grader 干净工作树收集，保留相对结构。
-    let collected_artifacts = collect_artifacts(&grader_task_ws, &task.artifacts, output_dir)?;
+    let (collected_artifacts, missing_artifacts) =
+        collect_artifacts(&grader_task_ws, &task.artifacts, output_dir)?;
 
-    let status = if grader.passed {
+    // 「声明即承诺」：grader 通过**且**声明的产物全部落地，才算 resolved。
+    // 旧实现只让 grader.passed 决定状态，采集结果仅作日志——一个 fixture 声明了
+    // test-results/** 却什么都没产出时照样记 resolved，评测结论偏乐观。
+    // fail_to_pass 仍只反映 grader 测到的用例（不拿产物缺失去改写 grader 的测量结果），
+    // 缺什么由 missing_artifacts 单独说清。
+    let resolved = grader.passed && missing_artifacts.is_empty();
+    let status = if resolved {
         OUTCOME_RESOLVED
     } else {
         OUTCOME_UNRESOLVED
@@ -565,6 +577,7 @@ pub async fn run_trial(
             pass_to_pass: 0,
             failure_taxonomy: driver_outcome.failure_taxonomy,
             policy_violations: driver_outcome.policy_violations,
+            missing_artifacts: missing_artifacts.clone(),
         },
     };
     write_json(
@@ -577,6 +590,7 @@ pub async fn run_trial(
         patch,
         grader,
         collected_artifacts,
+        missing_artifacts,
         duration_ms,
         trajectory_events,
         patch_digest,

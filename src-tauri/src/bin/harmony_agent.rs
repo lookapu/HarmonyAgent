@@ -127,11 +127,21 @@ async fn execute(args: EvalRunArgs) -> Result<i32, String> {
         run_trial(&task, &workspace, &args.output, &adapter, &config).await
     };
     match result {
-        Ok(outcome) => Ok(if outcome.status == OUTCOME_RESOLVED {
-            0
-        } else {
-            1
-        }),
+        Ok(outcome) => {
+            if outcome.status == OUTCOME_RESOLVED {
+                return Ok(0);
+            }
+            // 收紧「声明即承诺」之后，unresolved 有两种成因。不说出来的话，
+            // CI 只拿到一个裸 exit 1，分不清是「修复没通过 grader」还是
+            //「grader 过了但声明的证据文件没产出」——两者的排查方向完全不同。
+            if !outcome.missing_artifacts.is_empty() {
+                eprintln!(
+                    "评测未通过：grader 已通过，但任务声明的产物一个都没产出：{}",
+                    outcome.missing_artifacts.join("、")
+                );
+            }
+            Ok(1)
+        }
         Err(error) if error.starts_with(OUTCOME_CANCELLED) => {
             eprintln!("{error}");
             Ok(130)

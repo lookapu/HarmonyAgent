@@ -91,6 +91,10 @@ pub struct OutcomeInfo {
     pub pass_to_pass: u64,
     pub failure_taxonomy: Vec<String>,
     pub policy_violations: u64,
+    /// 任务在 `artifacts` 里声明、但本次运行一个文件都没匹配到的 pattern。
+    /// 非空时 `status` 必为 `unresolved`（即便 grader 通过）——「声明即承诺」。
+    /// 空数组表示未声明产物或全部落地，两种情况都属正常，不要据此推断采集功能有故障。
+    pub missing_artifacts: Vec<String>,
 }
 
 impl EvalReport {
@@ -182,6 +186,7 @@ mod tests {
                 pass_to_pass: 10,
                 failure_taxonomy: vec![],
                 policy_violations: 0,
+                missing_artifacts: vec![],
             },
         }
     }
