@@ -354,23 +354,45 @@ pub(super) async fn list_mcp_servers(
                 out.push_str(&format!("  描述: {}\n", super::cmd_tools::cut_str(d, 200)));
             }
             match conn_res {
-                Ok(()) => out.push_str(&format!(
-                    "  状态: ✓ 连接成功，{} 个工具：\n",
-                    tools.len()
-                )),
+                Ok(()) => {
+                    // 授权判定与网络策略有关，出错时不能当成「不允许」——那会让全部工具
+                    // 静默消失，看起来像服务器只提供了 0 个可用工具。
+                    let mut usable: Vec<&str> = Vec::new();
+                    let mut blocked: Vec<&str> = Vec::new();
+                    let mut policy_err: Option<String> = None;
+                    for t in tools.iter() {
+                        match crate::services::mcp_policy::tool_allowed(server, &t.name) {
+                            Ok(true) => usable.push(&t.name),
+                            Ok(false) => blocked.push(&t.name),
+                            Err(e) => policy_err = Some(e),
+                        }
+                    }
+                    match &policy_err {
+                        Some(e) => out.push_str(&format!(
+                            "  状态: ✓ 连接成功，服务器提供 {} 个工具，但授权清单解析失败（{e}），本工具无法判断哪些可用\n",
+                            tools.len()
+                        )),
+                        None => out.push_str(&format!(
+                            "  状态: ✓ 连接成功，服务器提供 {} 个工具，其中 {} 个在本项目授权清单内：\n",
+                            tools.len(),
+                            usable.len()
+                        )),
+                    }
+                    for tool_name in &usable {
+                        out.push_str(&format!("    - mcp__{name}__{tool_name}\n"));
+                    }
+                    if !blocked.is_empty() {
+                        out.push_str(&format!(
+                            "  ⚠️ {} 个工具不在本项目授权清单（allowed_tools），未列出：{}\n",
+                            blocked.len(),
+                            blocked.join("、")
+                        ));
+                    }
+                }
                 Err(e) => out.push_str(&format!(
                     "  状态: ✗ 连接失败：{}\n",
                     super::cmd_tools::cut_str(e, 300)
                 )),
-            }
-            for t in tools {
-                if !crate::services::mcp_policy::tool_allowed(server, &t.name).unwrap_or(false) {
-                    continue;
-                }
-                out.push_str(&format!(
-                    "    - mcp__{name}__{}\n",
-                    t.name
-                ));
             }
         }
         out.push_str("\n提示：调用格式为【TOOL|mcp__服务器名__工具名|JSON参数】；连接失败的服务器可检查配置/重启后重试。");
