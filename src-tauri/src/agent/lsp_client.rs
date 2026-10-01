@@ -1182,11 +1182,10 @@ pub(super) async fn lsp_rename(args: &Value, roots: &[String], conversation_id: 
     // 包装成成功，白烧一轮。lsp_format / lsp_code_action 本来就有空编辑分支，
     // 只有这里漏了。
     if files == 0 {
-        return Ok(format!(
-            "语言服务返回了重命名结果，但没有可应用的文本编辑，**未写入任何文件**。\
+        return Ok("语言服务返回了重命名结果，但没有可应用的文本编辑，**未写入任何文件**。\
              请确认光标位置确实落在可重命名的符号上；若该语言服务只返回文件重命名操作（RenameFile），\
              本工具暂不支持，会保留原文件。"
-        ));
+            .to_string());
     }
     Ok(format!(
         "重命名完成：\"{new_name}\"（涉及 {files} 个文件，+{add} −{del} 字符）\n\

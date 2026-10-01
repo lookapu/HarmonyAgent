@@ -480,9 +480,6 @@ pub(crate) struct StatusEntry<'a> {
 }
 
 impl StatusEntry<'_> {
-    pub(crate) fn path(&self) -> &str {
-        self.path
-    }
     pub(crate) fn untracked(&self) -> bool {
         self.x == b'?' && self.y == b'?'
     }

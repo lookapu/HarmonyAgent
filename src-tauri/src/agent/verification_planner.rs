@@ -145,7 +145,7 @@ fn completion(
         else {
             return (false, Vec::new());
         };
-        return match lint_error_count(&item.output) {
+        return match lint_error_count(item.output) {
             Some(0) => (true, vec![format!("#{} run_lint 无 error 级问题", index + 1)]),
             Some(errors) => (false, vec![format!("#{} run_lint 仍有 {errors} 个 error 级问题", index + 1)]),
             None => (false, vec![format!("#{} run_lint 输出未给出 error 计数", index + 1)]),
@@ -158,7 +158,7 @@ fn completion(
         let Some((index, item)) = runs.last() else {
             return (false, Vec::new());
         };
-        let Some(total) = scan_hit_count(&item.output) else {
+        let Some(total) = scan_hit_count(item.output) else {
             return (false, vec![format!("#{} check_code 输出未给出命中数", index + 1)]);
         };
         // 命中列表被截断时，高危分组可能整段没进输出，此时「没看到高危」不等于「没有高危」。
@@ -184,7 +184,7 @@ fn completion(
                     .unwrap_or("原因未给出")
             )]);
         }
-        let blocking = scan_blocking_groups(&item.output);
+        let blocking = scan_blocking_groups(item.output);
         return if blocking == 0 {
             (true, vec![format!("#{} check_code 无高危/中危（共 {total} 条提示）", index + 1)])
         } else {
@@ -213,7 +213,9 @@ fn lint_covers_errors(args: &str) -> bool {
 fn lint_error_count(output: &str) -> Option<usize> {
     output.lines().find_map(|line| {
         line.trim().strip_prefix("错误 (error)：")
-            .and_then(|rest| rest.trim().split_whitespace().next())
+            // 不要再 trim：clippy trim_split_whitespace —— split_whitespace 本身就跳过前导空白，
+            // 且这里是机械类告警，项目基线只保留结构类，新增机械类会直接阻断 CI。
+            .and_then(|rest| rest.split_whitespace().next())
             .and_then(|count| count.parse::<usize>().ok())
     })
 }
