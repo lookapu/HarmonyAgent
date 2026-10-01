@@ -667,7 +667,29 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    fn task_with_grader(grader_command: Vec<&str>) -> EvalTask {
+    /// 跨平台的「a.txt 内容包含 needle」命令。
+    ///
+    /// Windows 上没有独立的 `grep`（`Command::new("grep")` 必然
+    /// "grader 启动失败：program not found"，本机实测 Get-Command grep 直接
+    /// 查不到，Git 装在 `C:\Program Files\Git\usr\bin\grep.exe` 但该目录不在 PATH）。
+    /// 改用系统自带的 `findstr`：命中退出 0、未命中退出 1，与 `grep -q` 同语义。
+    ///
+    /// 不用 `/c:<needle>` 字面匹配开关——`validate_grader` 拒绝任何以 `/` 开头的令牌
+    /// （`grader.command 含不安全令牌：/c:fixed`）。测试用 needle 都是纯 ASCII 单词，
+    /// findstr 默认的正则模式与字面匹配等价。
+    ///
+    /// 两边都是「直接程序 + 固定参数」，不经 shell 解释器（评测器本就拒绝
+    /// `cmd /C` 这类 shell 开头命令）。与 `eval_grader` 里
+    /// `rustc --version` 那次同源：选一个**运行环境必然自带**的程序。
+    fn contains_command(needle: &str) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["findstr".to_string(), needle.to_string(), "a.txt".to_string()]
+        } else {
+            vec!["grep".to_string(), "-q".to_string(), needle.to_string(), "a.txt".to_string()]
+        }
+    }
+
+    fn task_with_grader(grader_command: Vec<String>) -> EvalTask {
         EvalTask {
             schema_version: crate::agent::eval_task::EVAL_TASK_SCHEMA_VERSION,
             task_id: "smoke__fix-1".into(),
@@ -687,7 +709,7 @@ mod tests {
             },
             grader: EvalGrader {
                 kind: "command".into(),
-                command: grader_command.into_iter().map(str::to_string).collect(),
+                command: grader_command,
                 timeout_seconds: 30,
             },
             artifacts: vec![],
@@ -770,7 +792,7 @@ mod tests {
     async fn request_timeout_exceeding_wall_time_is_rejected_before_worktree() {
         let mut config = run_config();
         config.request_timeout_seconds = Some(120);
-        let task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
+        let task = task_with_grader(contains_command("fixed"));
         assert!(task.limits.wall_time_seconds < 120);
         let error = run_trial(
             &task,
@@ -787,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn run_trial_rejects_driver_outcome_over_tool_call_budget() {
         let (source, base) = source_repo_with_base();
-        let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
+        let mut task = task_with_grader(contains_command("fixed"));
         task.repo.base_commit = base;
         task.limits.max_tool_calls = 1;
         let output_dir = std::env::temp_dir().join(format!(
@@ -807,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn run_trial_resolves_when_stub_fix_passes_grader() {
         let (source, base) = source_repo_with_base();
-        let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
+        let mut task = task_with_grader(contains_command("fixed"));
         task.repo.base_commit = base.clone();
         let output_dir =
             std::env::temp_dir().join(format!("deveco-eval-run-out-{}", uuid::Uuid::new_v4()));
@@ -859,7 +881,7 @@ mod tests {
     async fn run_trial_unresolved_when_grader_fails() {
         let (source, base) = source_repo_with_base();
         // grader 要求 a.txt 含 "other"，但 stub 写的是 "fixed"
-        let mut task = task_with_grader(vec!["grep", "-q", "other", "a.txt"]);
+        let mut task = task_with_grader(contains_command("other"));
         task.repo.base_commit = base.clone();
         let output_dir =
             std::env::temp_dir().join(format!("deveco-eval-run-out2-{}", uuid::Uuid::new_v4()));
@@ -897,7 +919,7 @@ mod tests {
     async fn driver_failure_and_cancel_still_emit_complete_trial_bundle() {
         for (cancelled, expected) in [(false, OUTCOME_HARNESS_ERROR), (true, OUTCOME_CANCELLED)] {
             let (source, base) = source_repo_with_base();
-            let mut task = task_with_grader(vec!["true"]);
+            let mut task = task_with_grader(contains_command("fixed"));
             task.repo.base_commit = base;
             let output_dir =
                 std::env::temp_dir().join(format!("deveco-eval-terminal-{}", uuid::Uuid::new_v4()));
@@ -942,7 +964,7 @@ mod tests {
         let mut permissions = fs::metadata(&program).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&program, permissions).unwrap();
-        let task = task_with_grader(vec!["true"]);
+        let task = task_with_grader(contains_command("fixed"));
         let outcome = ProcessAgentDriver {
             program,
             args: vec![],
@@ -964,7 +986,7 @@ mod tests {
     async fn run_trial_collects_declared_artifacts() {
         let (source, base) = source_repo_with_base();
         // 声明 a.txt 为产物：stub 把 a.txt 改为 fixed，patch 应用后 grader 工作树含 a.txt=fixed。
-        let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
+        let mut task = task_with_grader(contains_command("fixed"));
         task.repo.base_commit = base.clone();
         task.artifacts = vec!["a.txt".to_string()];
         let output_dir =
@@ -991,7 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn run_trial_rejects_missing_reproducibility_fingerprints_before_workspace_changes() {
         let (source, base) = source_repo_with_base();
-        let mut task = task_with_grader(vec!["true"]);
+        let mut task = task_with_grader(contains_command("fixed"));
         task.repo.base_commit = base;
         let output_dir =
             std::env::temp_dir().join(format!("deveco-eval-run-invalid-{}", uuid::Uuid::new_v4()));
@@ -1047,7 +1069,7 @@ mod tests {
             ],
         );
         let base = git(&source, &["rev-parse", "HEAD"]);
-        let mut task = task_with_grader(vec!["grep", "-q", "fixed", "a.txt"]);
+        let mut task = task_with_grader(contains_command("fixed"));
         task.repo.base_commit = base;
         task.repo.subdir = Some("package".into());
         task.artifacts = vec!["a.txt".into()];

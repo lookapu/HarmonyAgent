@@ -7,7 +7,112 @@
 
 ---
 
-## Unreleased — Huawei Docs Fetch Rebuilt, API 26 Data Backfilled, SemVer API Versions
+## v2.3.0 — Verdict-Blindness Fixes, Tighter Acceptance and Eval Rules, Rebuilt Huawei Docs Fetch (2026-10-01)
+
+Positioning: the core of this release is a dedicated audit of "**the report says everything is
+fine, but it never actually looked at everything — or looked at the wrong thing**". This is not
+a feature release but a systematic cleanup of verdict and gate defects, two of which are
+deliberate tightenings: **some task outcomes change after upgrading** (see *Behavior changes*
+below). Also included: the rebuilt Huawei docs fetch pipeline and backfilled API 26 data.
+
+**Verdict blindness (the focus of this release)**
+
+- The static-check gate no longer treats "ran successfully" as "passed". `check_code` and
+  `run_lint` returned Ok no matter how many rules they hit, so only the fact that the tool ran
+  was being checked. They now require an explicit clean verdict, and require the rule severity
+  filter to cover errors — with a warning-only filter, "错误 (error)：0" is an artifact of the
+  counting scope, not a clean result.
+- The execution loop no longer treats "ran a command" as "verified the change". `run_command`
+  always carried a `Command` label, so `echo hi` / `ls` / `cat` got one too, letting "a command
+  was executed" impersonate "the change was verified".
+- "No API/permission/capability inconsistencies found" was previously established on an
+  **incomplete walk** (the third copy of the same directory traversal): inconsistencies on files
+  that could not be read are simply invisible, yet the report still printed "0 error". Incomplete
+  coverage is now disclosed, and the acceptance gate no longer accepts such a "nothing found".
+- `check_code` reported a clean result for files it could not read, so the gate could not tell
+  how much was actually covered; a truncated hit list can drop the high-severity group entirely,
+  so "no high-severity hits seen" was not "no high-severity hits". Both now block with a reason.
+- `vuln_scan` put a ✅ on security scans that **never ran** (the second instance of this family);
+  `license_check` read "cannot read" as "none found" and reported a failed check as
+  **compliance passed**.
+- An empty read on the device no longer counts as a confirmed deploy; a `verify_ui` that reports
+  a black screen no longer confirms a deploy.
+
+**Behavior changes (may affect existing task outcomes after upgrading)**
+
+- Acceptance gate: "which commands count as verification" used **substring containment** over the
+  command head, so `cat test_notes.md` contained "test" and satisfied *tests passed* — `ls tests`
+  likewise. A goal mentioning tests always generates that required criterion, so one `cat` could
+  clear the entire test requirement. Matching is now **token equality** (compound commands such as
+  `cargo test` require adjacent tokens in order; `npm run test:watch` matches on the script-name
+  part). Real test/build commands behave exactly as before (`npm test`, `cargo test`,
+  `python -m pytest`, `npx vitest run`, `cd frontend && npm run test`, …); what is now rejected is
+  reading a file whose name happens to contain "test".
+- Eval harness: artifacts declared in a task are now a **commitment**. They used to be a collection
+  log, so a passing `grader` alone meant `resolved` — a fixture declaring `test-results/**` that
+  produced nothing was waved through. A run that declares artifacts but matches none is now
+  `unresolved`; the report names them in `missing_artifacts` and the CLI prints the missing
+  patterns to stderr. Fixtures that only want best-effort capture should not declare the pattern.
+
+**One predicate, two implementations — all converged**
+
+- Parsing the XY prefix of `git status --short` had two implementations that had already diverged;
+  and `review_changes`' scope filter was **always false** — the verdict depends on the leading
+  space that distinguishes staged-only from unstaged-only, and the collection step `trim()`ed it
+  away one line earlier. Both now resolve to a single source of truth (`git_tools::StatusEntry` /
+  `parse_status_line`).
+- The change-tool set, the visual-closure marker list, and the `secret_scan` traversal config had
+  the same kind of second copy; all converged.
+- The acceptance gate and the structured-result envelope used to disagree about whether an
+  execution counted as verification (the latter was looser, matching substrings anywhere in the raw
+  argument JSON). They now share one implementation.
+
+**Destructive writes and undo**
+
+- A file that exists but **cannot be read** was silently overwritten: the conflict check was
+  skipped entirely, no undo snapshot was taken, and it still reported success — destructive,
+  unrecorded, and falsely successful at once. Writing is now refused outright.
+- `undo_edit` popped the stack before range-checking, permanently destroying undo capability while
+  reporting "no write record"; a mid-way failure discarded the remaining snapshots, which were the
+  only copies of the old content. Both fixed; the remaining snapshots are now restored on failure.
+- Cross-file LSP edits were not atomic (a reported failure left the disk half-modified), and the
+  write invariant only covered the fs side — the entire LSP write path bypassed it.
+
+**"Cannot read" used to be reported as something else**
+
+- An unreadable docs directory was reported as "not downloaded", prompting users to re-download an
+  image they already had (which would not even fix the read failure). This is now a distinct state
+  that explicitly says not to re-download.
+- State-snapshot listing reported "does not exist" for "cannot read", and listed other people's
+  json files from the system temp directory as this tool's snapshots.
+- A failed UI recording read was reported as "device output format mismatch (0 rows)", and corrupt
+  timestamps were treated as operations at time 0, zeroing the total duration. Signature self-check
+  escalated "cannot read the material library" into "log into your Huawei account and regenerate".
+- The build content fingerprint treated "cannot read" as "content unchanged" — it hashed paths but
+  not content, so **stale artifacts were passed off as fresh ones**. The fingerprint now carries a
+  completeness flag and refuses to resume from cache when incomplete.
+- An unavailable sandbox was reported as "command timed out, try smaller pieces".
+
+**Change detection, memory, and observability**
+
+- `lsp_rename` changed the workspace without invalidating facts or project memory; `first_write`
+  approval mode never prompted for `multi_edit` / `lsp_rename`; `multi_edit` changing files was
+  judged as "no progress" and injected a stall warning.
+- The change list shown to the user and the verification scope now derive from one tool set
+  (previously "acceptance saw 4 files changed, the delivery list showed 1").
+- Context compaction is rejected when the summary is not smaller than the content it replaces.
+- `mcp_list` reported "N tools" without saying how many were blocked by the allowlist (a freshly
+  created MCP server defaults to an empty `allowed_tools`, producing a count followed by nothing).
+- Approval bypasses caused by a missing app handle are now logged instead of happening silently.
+
+**Engineering and gates**
+
+- The main loop was collapsed into a single round function.
+- Cleared 6 mechanical clippy warnings (`needless_borrow` ×3, `trim_split_whitespace`, `dead_code`,
+  `useless_format`), restoring the Q-07 warning baseline gate (57/57).
+- Eval grader tests are now cross-platform (Windows uses the built-in `findstr` instead of `grep`,
+  which has no standalone executable there); the local backend suite reaches 0 failures for the
+  first time.
 
 **Fixed: the API knowledge base had been idle since Huawei retired the `.md` endpoint**
 
@@ -34,6 +139,14 @@
 
 - No database migration and no schema change; the seed database is a local build artifact (not tracked) and can be regenerated with `cargo run --bin full_fetch --features full-fetch,embedding --release -- --seed` (~6 minutes: 1 minute of crawling, 4 minutes of vector indexing).
 - The old `.md` fetch path is gone; if Huawei restores that endpoint, revert this fetch rework.
+- **The two tightenings to acceptance and eval rules need to be rolled back separately**: they
+  turn some previously passing tasks into failing ones, which is a correction rather than a
+  regression. To return to the old behavior temporarily, revert the token matching in
+  `agent/acceptance.rs` (`is_command` / `declared_validator`) and the `missing` check in
+  `eval_workspace::collect_artifacts` — no need to revert the whole release.
+- The tool protocol (`ToolResultV2`) is unchanged in this release. The new `missing_artifacts` field
+  on `OutcomeInfo` is an optional addition that older readers ignore, so it is not a breaking
+  change.
 
 ## v2.2.0 — Structure-First Navigation, Multi-Language Write Gates, and a Trustworthy Execution Kernel (2026-09-15)
 
