@@ -57,7 +57,14 @@ foreach ($m in $map) {
     }
     New-Item -ItemType Directory -Path $dst -Force | Out-Null
     Write-Host "==> 复制 $($m.Src) ..."
-    robocopy $src $dst /E /NJH /NJS /NFL /NDL /NP | Out-Null
+    # 知识库目录排除备份与 SQLite 运行时文件：knowledge.db.bak 曾让绿色版白涨约 443MB，
+    # *.db-shm 是瞬时共享内存文件、不可分发。**不排除 *.db-wal**——它可能含尚未 checkpoint
+    # 的已提交事务，排除会打到旧数据。
+    $exclude = @()
+    if ($m.Dst -eq "seed") {
+        $exclude = @("/XF", "*.bak", "*.db-shm", "*.db-journal")
+    }
+    robocopy $src $dst /E /NJH /NJS /NFL /NDL /NP @exclude | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy 失败: $($m.Src) (exit $LASTEXITCODE)" }
 }
 
