@@ -717,6 +717,70 @@ gates **36/36**.
 **19.7 MB** off the seed database, with **zero functional change** for the user — because
 nothing ever read that column.
 
+### The stall guardrail went from "only reminds" to a three-stage ladder (T-8)
+
+A review of one real session found the guardrail repeating **the same sentence 16 times
+without the model ever changing strategy** — a 9-character question, 25 tool calls,
+**209,825 input tokens**, of which tool execution was only **2.2%** of the time.
+The old `stall_warning` was flat prose whose only variable was the round counter.
+
+| Stage | Trigger | Content |
+|---|---|---|
+| 1 | `≥ threshold` | original wording kept — a task that just crossed the line shouldn't be startled |
+| 2 | `≥ 2×threshold` | names the trap ("more of the same read-only calls will not produce new information") and demands one **verifiable** action this round |
+| 3 | `≥ 3×threshold` | **must do one of two things this round**: produce a verifiable step, or report status and recommendations to the user |
+
+Three design constraints:
+
+- **Staged by multiples of the threshold, not by absolute rounds.** The threshold is
+  configurable on the settings page (a user may set 3 or 30); hard-coded absolute rounds
+  would strand one end at stage 1 forever and send the other straight to the top.
+  The self-test checks `[3, 10, 30]`.
+- **The guardrail can see bytes for the first time.** `record_tool` gained a
+  `result_bytes` parameter, and at the call site `result` *already is* the tool output
+  string, so `len()` is free ⇒ the **context KB consumed during the stall is now written
+  into the stage 2/3 wording**, and reset the moment real progress happens. That targets
+  "the budget counts only rounds and wall-clock, and is completely blind to bytes".
+- The signature changed, so **all 12 call sites were updated** (including the existing
+  self-tests). Each was done with `replace_all` then re-read for verification — the first
+  pass missed one, found only by grepping (because `&args, true` and `&args, false` are
+  different patterns).
+
+The settings-page description for the stall threshold was updated to say "escalating
+reminder" (both zh and en).
+
+#### Mutation verification caught a **fake self-test of my own**
+
+The first version of the byte-counting self-test only asserted "no longer stalled after
+progress" — but that assertion is decided by `since_progress` alone, so deleting
+`stalled_bytes = 0` left it **fully green**. Mutation M2 produced no reaction, which
+forced a rewrite into a criterion that can actually tell the difference:
+**the second stall accumulates back to 160 KB rather than continuing on to 320 KB**.
+
+| Mutation | Result |
+|---|---|
+| M1 three stages → one flat sentence (the original shape) | **red** (3 tests) |
+| M2 remove `stalled_bytes = 0` | **red** (the first version could not be moved; it can now) |
+| M3 keep only two stages (stage 3 never appears) | **red** (3 tests) |
+| M4 stage by absolute rounds instead of threshold multiples | **red** (2 tests) |
+| M5 bytes never accumulate (always 0) | **red** (1 test) |
+
+#### The half deliberately **not** done
+
+"At which round should the guardrail **force the task to finish**" remains an undecided
+product question. Even the heaviest stage only **asks** the model to pick one of two
+things — **it does not actually terminate the loop**. Crossing that line would no longer
+be an engineering judgement; it would be making a product decision on the user's behalf.
+
+> **Stating plainly what this batch cannot verify**: whether the ladder actually changes
+> the model's behaviour **cannot be checked here** — that needs a real Agent session.
+> What *can* be verified is only the fact that the wording no longer repeats identically.
+
+#### Verification for this batch
+
+`task_guard` self-tests **7** (+3) · mutations **5/5** · full `cargo test` ·
+`check-i18n-wording.py` green · gates **38/38**.
+
 ---
 
 ## Unreleased — Batch 23: the sample size of the census is itself a finding (2026-10-02)

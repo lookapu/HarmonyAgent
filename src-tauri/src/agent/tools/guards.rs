@@ -335,7 +335,17 @@ async fn pre_approval(inv: &ToolInvocation<'_>) -> Result<(), Intercept> {
 /// 任务护栏：记录进展并在需要时注入强制验证/失速/目标锚定提示
 async fn post_guard(inv: &ToolInvocation<'_>, result: &mut Result<String, String>) {
     let args_val = serde_json::from_str(inv.args_raw).unwrap_or(serde_json::Value::Null);
-    let hint = task_guard::record_tool(inv.conversation_id, inv.name, &args_val, result.is_ok());
+    // 结果字节数喂给护栏：停滞期要靠它告诉模型「这轮只读探索已经花了多少上下文」，
+    // 而预算只按轮次/时长计价，对这笔成本原本完全失明（T-8 实测 209,825 输入 token
+    // 里工具总耗时只占 2.2%）。Err 的长度照算——错误文本同样进上下文。
+    let result_bytes = result.as_ref().map_or(0, |s| s.len());
+    let hint = task_guard::record_tool(
+        inv.conversation_id,
+        inv.name,
+        &args_val,
+        result.is_ok(),
+        result_bytes,
+    );
     if let Some(note) = hint.to_injection() {
         match result {
             Ok(out) => out.push_str(&format!("\n\n{note}")),

@@ -1589,7 +1589,7 @@
     "repeatEdit": "Repeat-Edit Threshold",
     "repeatEditDesc": "Forces a build verification after editing the same file N times without one",
     "stall": "Stall Detection",
-    "stallDesc": "Suggests action after N tool calls with no real progress (no writes/build/deploy/tests)",
+    "stallDesc": "Escalating reminder after N tool calls with no real progress: advisory at N, stronger wording at 2N / 3N plus the context the stall has already consumed",
     "buildFail": "Build-Fail Converge",
     "buildFailDesc": "Forces a new approach or a user report after N consecutive build failures",
     "goalReinject": "Goal Reinject Interval",
