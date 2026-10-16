@@ -320,7 +320,10 @@ export default function TimelinePanel({
 
       <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
         {!events && !loading && (
-          <div className="px-3 py-8 text-center text-[length:var(--app-text-sm)] text-[var(--text-muted)]">{t('home.timelineEmpty')}</div>
+          // 本面板列的是**会话事件**（按 trace_id 折叠），不是快照点。
+          // 空态曾用 home.timelineEmpty，而那个键归快照时间线对话框所有，
+          // 于是这里长期显示「暂无历史快照点，每轮工具执行后会自动保存」。
+          <div className="px-3 py-8 text-center text-[length:var(--app-text-sm)] text-[var(--text-muted)]">{t('home.timelineLogEmpty')}</div>
         )}
         {loading && (
           <div className="px-3 py-8 text-center text-[length:var(--app-text-sm)] text-[var(--text-muted)]">…</div>

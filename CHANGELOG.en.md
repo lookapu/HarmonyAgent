@@ -887,6 +887,68 @@ New gate self-tests **13/13** · real-source mutations **8/8** ·
 `check-i18n-wording.py` green (2268 keys / 0 unexplained conflicts) ·
 `check-docs.py` green · gates **40/40**.
 
+### C-4 settled: the root cause of those 5 conflicting strings was **one key shared by two panels**
+
+Tracing the consumers showed the 5 conflicts whitelisted in the previous section
+were **not a question of which wording is better**.
+
+| Consumer | What it actually is | What it has always displayed |
+|---|---|---|
+| "More" menu button (`handleOpenTimeline` → `loadSnapshots`) | the **snapshot timeline** dialog | Timeline (back to a checkpoint) / No checkpoints yet… |
+| Sidebar `timeline` item → **`TimelinePanel`** | the **session event log** (grouped by `trace_id`) | the very same two keys |
+
+Two entry points leading to two different things while sharing one key means:
+
+- the sidebar tab has always read "Timeline (back to a checkpoint)" while **what it opens
+  is the event log**;
+- `TimelinePanel`'s empty state has always told the user to wait for a checkpoint
+  that has nothing to do with it — it lists **events**.
+
+**Fixing one screen's wording broke the other, and nothing reported it.**
+
+⇒ **The shadowed sentence was not an outdated draft — it was a sentence that belonged
+to a different panel and was simply filed under the wrong key.** The right fix is not to
+pick a winner but to **split the key per consumer**: `home.timelineLog` /
+`home.timelineLogEmpty` (both languages), with the two shadowed sentences **moved back
+verbatim** to where they always belonged — not one word of the copy was rewritten,
+it was just filed correctly.
+
+`home.forkFromHere` is a different case: the Chinese changed and **the English did not**
+⇒ en now reads `Fork session from here` (keeping the "fork" term the code already uses,
+adding the missing "session").
+
+> **Generalisation**: the same string appearing in two places has **two** possible causes
+> — the wording drifted, or two genuinely different features share one key.
+> The first is fixed by editing copy; **the second merely moves the defect from one side
+> to the other**. Grep the key's consumers and ask "are these the same thing?" first.
+
+#### The cost of emptying the whitelist: real-source load drops from 6 to 2
+
+Settling C-4 empties the gate's whitelist — zero exemptions from here on. But with no
+duplicate left in the real source, weakening the criterion can no longer turn it red.
+The remedy is a different proof: **inject duplicates into the real files** (N1 identical,
+N2 conflicting). The two kinds of proof guard different things — one asks "is the
+criterion accurate", the other "would a duplicate in the real source be caught" — and
+**once the debt is clean, only the latter remains**.
+
+> A **mislabeled mutation** was also fixed: the first version labeled "key path loses its
+> parent block" as "cross-object same-name also counts". The former changes **what gets
+> reported**, the latter changes **how much gets judged**. A wrong label tells the next
+> reader a property is guarded when nothing guards it.
+
+#### This gate caught a duplicate key **I created in the same batch**
+
+When splitting the key I first named it `home.timelineEvents`; the gate went red
+immediately — that name was already taken by "{{count}} events", i.e. **I had made
+exactly the mistake it exists to catch**.
+
+#### Verification
+
+`check-i18n-dupe-keys.py` **zero duplicates, empty whitelist** · self-tests **13/13** ·
+mutations **8/8** (sha256-verified restore each time, green baseline) ·
+`check-i18n-wording.py` green (**2270** keys / 0 unexplained conflicts) ·
+`tsc` / `eslint` / `vitest` green · gates **40/40**.
+
 ---
 
 ## Unreleased — Batch 23: the sample size of the census is itself a finding (2026-10-02)

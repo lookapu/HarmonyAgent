@@ -484,7 +484,10 @@ export default function Home() {
     { key: 'analyze', icon: 'spark', label: t('home.analyze') },
     { key: 'shell', icon: 'terminal', label: t('home.terminal') },
     { key: 'terminal', icon: 'receipt', label: t('home.terminalLogs') },
-    { key: 'timeline', icon: 'archive', label: t('home.timeline') },
+    // 侧栏这一项打开的是 **事件日志面板**（rightTab === 'timeline' → TimelinePanel），
+    // 不是快照时间线；文案曾与快照时间线共用 home.timeline，
+    // 于是这里长期显示「回到历史点」，而面板里列的是按 trace_id 折叠的事件。
+    { key: 'timeline', icon: 'archive', label: t('home.timelineLog') },
   ]
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => getItem(STORAGE_KEYS.SIDEBAR_COLLAPSED) === '1',
