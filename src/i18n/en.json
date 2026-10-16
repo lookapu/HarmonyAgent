@@ -2254,8 +2254,6 @@
     "fetchedAt": "Fetched at",
     "editDetail": "Edit Reference Detail",
     "embedTitle": "Semantic Index",
-    "embedReady": "Ready",
-    "embedUnavailable": "Unavailable",
     "embedRunning": "Indexing…",
     "embedBuilding": "Indexing…",
     "embedBuild": "Rebuild Index",

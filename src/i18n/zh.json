@@ -2254,8 +2254,6 @@
     "fetchedAt": "抓取时间",
     "editDetail": "编辑参考详情",
     "embedTitle": "语义索引",
-    "embedReady": "已启用",
-    "embedUnavailable": "未启用",
     "embedRunning": "建索引中…",
     "embedBuilding": "建索引中…",
     "embedBuild": "重建索引",

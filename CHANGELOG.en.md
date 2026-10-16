@@ -6,6 +6,441 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 28: the gate I had just shipped had three false negatives (2026-10-16)
+
+This batch changes no product behaviour — only a gate and the translation files.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### It started with a **self-contradictory** report
+
+The dead-key census (an independent implementation) reported
+`cost.errKind.rate_limited` as dead. Yet `src/pages/CostPage.tsx:198`
+plainly reads `t('cost.errKind.rate_limited')`.
+
+**When a census and a gate disagree, suspect the gate.** Gate 18 turned out to
+have three false negatives:
+
+| # | Shape it missed | What the real source looks like | Root cause |
+|---|---|---|---|
+| 1 | **Underscore** inside a key segment | `cost.errKind.rate_limited` | `NS_SHAPE` used `[A-Za-z0-9]+`, which **rejects `_`** |
+| 2 | Key passed through a **wrapper declared in the same file** | `run(() => stop(), 'config.lanStopFailed')` | the AST cannot follow a local function |
+| 3 | Key inside a **conditional expression** | `t(loading ? 'teamShare.loading' : 'teamShare.working')` | only `arguments[0]` was checked for being a string literal |
+
+The three fixes:
+
+- `NS_SHAPE` now allows `_` inside a segment (`[A-Za-z0-9_]*`).
+- When calling a function **declared in this file**, its namespace-shaped string
+  arguments count as references too. The criterion is a `locals` set, **not a
+  function-name blacklist** — `run` (a local `const`) and `track` (an imported
+  telemetry API) have exactly the same shape. A blacklist is a guess; "was it
+  declared in this file" is decidable.
+- Arguments are **walked as a subtree**, but only the **first** argument of
+  `t(...)`: walking the whole file drags in telemetry names (`project.trust`),
+  module names (`highlight.js`) and file names (`diagram.svg`) — measured
+  **15 false positives**.
+
+### A fourth hole, closed along the way: file names were being read as keys
+
+Added `FILE_SHAPE` to exclude shapes like `diagram.svg` / `image.png` /
+`qrcode.react`.
+
+### Dead keys: **reported, never failed**
+
+The translation files carry **2271** leaf keys each in zh / en, **2273** in
+union — the 2-key difference is the i18next plural form
+(zh `home.batchLines` ↔ en `home.batchLines_other`).
+
+| Item | Count |
+|---|---:|
+| `t()` static references | **2550** occurrences, hitting **1989** distinct keys |
+| keymap references | **103** keys |
+| Distinct keys referenced at all | **2088** / 2273 |
+| Dynamic keys | **38** sites, covering **1101** keys across 13 files |
+| Trustworthy dead keys (after excluding static refs / keymap / dynamic coverage) | **6** |
+| Confirmed dead by hand, then deleted | **2** |
+
+Every number in that table is printed directly by
+`node scripts/check-i18n-key-usage.mjs --report-dead` — the reporting mode was
+extended to emit those figures. The previous version of the table carried
+"static references 1965 / keymap 145" from a throwaway census script, and
+**those cannot be reproduced on another machine**: the census counted raw
+entries, the gate counts deduplicated keys, and mixing the two left nobody able
+to say what 1965 actually was.
+**A number in the ledger has to be something the gate can print again**,
+otherwise it is a second-hand remark nobody can check.
+
+The deleted pair is `apiKb.embedReady` / `apiKb.embedUnavailable` (removed from
+both languages); they had long been superseded by the `embedState*` family.
+
+All 6 survivors were checked one by one and are **all alive**: 3 are keys passed
+through a tuple array (`src/pages/ReproductionBundlesPage.tsx:62`), 3 live in the
+non-i18n data file `src/data/providerTemplates.ts`.
+
+**Why this direction does not fail the build**: the moment a dynamic key is
+written as a bare prefix (such as `home.`), coverage degrades to the whole
+namespace and what remains is an **upper bound**, not a fact. Failing would only
+force a whitelist that then has to be maintained forever. The bound of the
+criterion is right there; writing "must be zero" would be self-deception.
+
+### A path rejected: deleting dead keys to buy first-screen budget
+
+Real dead keys are **0.09%** of the file (2 / 2271), so the payoff is **zero**;
+the cost is a new criterion to maintain long-term plus a whitelist that will
+inevitably need entries. Recorded as a rejected path (same family as T-5,
+"compacting the translation files").
+
+### Methodology: run a **differently-implemented** census beside every gate
+
+A freshly shipped gate has false negatives too, and it will **never announce
+itself as "the gate is broken"** — it only surfaces when a different tool
+reaches the opposite conclusion. All three false negatives here were found
+exactly that way.
+
+### Verification
+
+New gate self-test **21/21** (+6) · mutations **13/13**:
+N1 misspelled leaf key / N2 misspelled namespace / N4 underscore segment /
+N5 conditional / N6 local wrapper = **load-bearing on real source**;
+N3 injects a bad key into a comment only = **reverse evidence** (proving it
+is not passing by "report anything that mentions `t()`");
+M1 dropping the namespace-shape restriction makes the **real source** exit 1.
+Each was restored with a sha256 check, and the baseline returned to green.
+
+`check-i18n-dupe-keys.py` green (zero duplicate keys, empty whitelist) ·
+`check-i18n-wording.py` green (**2271** keys / 0 unexplained conflicts) ·
+`check-self-test-counts.py` reports "**18** gates match the ledger" (including
+the `.mjs` one) · gates **42/42**.
+
+### A documentation-structure defect, fixed in passing
+
+Four consecutive batches (25 through 27) had been written into this file as
+`###` subsections nested under **Batch 24**'s heading — a heading dated
+2026-10-02. A changelog that describes itself as reverse-chronological had four
+shipped batches buried inside someone else's subsection.
+
+This batch promotes those four blocks to `##` level and moves them **above**
+Batch 24.
+
+⚠️ `check-docs.py` matches the current-scale declarations **only inside the
+first `## ` section**, so the new top section must carry the `TOOL_SPECS` and
+migration-count sentences itself — that is precisely the constraint behind its
+"only the newest version section" rule, and it is easy to trip over when
+reshuffling this file.
+
+## Unreleased — Batch 27: the code references i18n keys that **do not exist** — three user-visible (gate 18, 2026-10-16)
+
+| Key | Symptom in the UI |
+|---|---|
+| `common.off` | the dropdown option literally reads **`common.off`** |
+| `md.copied` | after copying a code block the button literally reads **`md.copied`** |
+| `home.queueFailed` | it carried a Chinese default, so **English users saw Chinese** |
+
+i18next's fallback renders **the key name itself**, so the symptom is not "the
+translation didn't load" — it is a raw key sitting on screen, which sends you
+debugging in exactly the wrong direction.
+
+`check-i18n-wording.py` structurally cannot catch this: it compares whether the
+two languages line up, and when a key is missing on **both** sides the parity
+check sees nothing wrong.
+
+A fourth hit, `about.tauri`, turned out to be inside a **comment** — the code had
+long since switched to `about.runtimeValue`. A dead key name in a comment is still
+harmful, so the comment was fixed too.
+
+### The big one: a hand-rolled lexer **ate the real references**
+
+The first version used a hand-written Python state machine to strip comments.
+Injecting a bad key and running it, **the gate was green**. Investigation showed:
+
+| File | Real references | Left after comment stripping |
+|---|---:|---:|
+| `Home.tsx` | 424 | **35** |
+| `ConfigPage.tsx` | 75 | **0** |
+| `Markdown.tsx` | 27 | **0** |
+
+Root cause is template literals —
+`` setError(`${t('config.clearError')}: ${e}`) ``: inside `` `${...} `` there is
+**real code**, and the state machine blanked the whole template as a string.
+
+⇒ The repository already has TypeScript (`tsc` runs it daily). Switching to
+`ts.createSourceFile` + AST walk: not one reference lost, dead keys inside comments
+still correctly ignored, and an injected bad key is reported with an exact
+`file:line`.
+
+> "Nobody guards this" comes in two kinds: **the guard was never built**, and
+> **the guard was built but has been dead all along**. The first mutation round
+> reported "load-bearing: none" and I nearly concluded the former; the truth was
+> the latter.
+
+### A gate's language need not be uniform, but the **ledger parsing must follow**
+
+With the gate now in Node, the gate-list regex in both `check-self-test-counts.py`
+and the full verification script widened from `check-xxx.py` to `py|mjs`.
+Otherwise the new gate is reported as "the ledger is missing N gates" —
+**which looks like a documentation problem but is actually a parsing-scope problem**,
+and is very easy to fix in the wrong place.
+
+### Two directions are red; dead keys are not judged
+
+"A namespace that does not exist" was simply filtered out in the first version,
+but its symptom is identical to a missing key and the real source has **0**
+such hits — so judging it produces no noise and there is no reason to leave a
+silent hole.
+
+Dead keys are not judged: 13 files use dynamic keys ``t(`...`)`` which cannot be
+enumerated statically, so any number reported is an **upper bound, not a fact**.
+
+### Mutations 8/8
+
+| Mutation | Real source | Self-test | Load-bearing |
+|---|---|---|---|
+| Inject a **misspelled leaf key** | red | green | **Real source** |
+| Inject a **misspelled namespace** | red | green | **Real source** |
+| Bad key in a **comment** only | green | green | Reverse evidence (must not false-alarm) |
+| No longer require namespaced shape | green | red | Synthetic only |
+| No longer exclude test files | green | red | Synthetic only |
+| No longer check "this file uses i18next" | green | red | Synthetic only |
+| Silently drop "namespace missing" | green | red | Synthetic only |
+| Missing keys never reported | green | red | Synthetic only |
+
+### Verification
+
+New gate self-tests **15/15** · mutations **8/8** ·
+`check-self-test-counts.py` reports "**18** gates match the ledger" (including the
+`.mjs` one) · `check-i18n-wording.py` green (**2273** keys / 0 unexplained
+conflicts) · gates **42/42**.
+
+## Unreleased — Batch 26 (cont.): C-4 settled: the root cause of those 5 conflicting strings was **one key shared by two panels** (2026-10-16)
+
+Tracing the consumers showed the 5 conflicts whitelisted in the previous section
+were **not a question of which wording is better**.
+
+| Consumer | What it actually is | What it has always displayed |
+|---|---|---|
+| "More" menu button (`handleOpenTimeline` → `loadSnapshots`) | the **snapshot timeline** dialog | Timeline (back to a checkpoint) / No checkpoints yet… |
+| Sidebar `timeline` item → **`TimelinePanel`** | the **session event log** (grouped by `trace_id`) | the very same two keys |
+
+Two entry points leading to two different things while sharing one key means:
+
+- the sidebar tab has always read "Timeline (back to a checkpoint)" while **what it opens
+  is the event log**;
+- `TimelinePanel`'s empty state has always told the user to wait for a checkpoint
+  that has nothing to do with it — it lists **events**.
+
+**Fixing one screen's wording broke the other, and nothing reported it.**
+
+⇒ **The shadowed sentence was not an outdated draft — it was a sentence that belonged
+to a different panel and was simply filed under the wrong key.** The right fix is not to
+pick a winner but to **split the key per consumer**: `home.timelineLog` /
+`home.timelineLogEmpty` (both languages), with the two shadowed sentences **moved back
+verbatim** to where they always belonged — not one word of the copy was rewritten,
+it was just filed correctly.
+
+`home.forkFromHere` is a different case: the Chinese changed and **the English did not**
+⇒ en now reads `Fork session from here` (keeping the "fork" term the code already uses,
+adding the missing "session").
+
+> **Generalisation**: the same string appearing in two places has **two** possible causes
+> — the wording drifted, or two genuinely different features share one key.
+> The first is fixed by editing copy; **the second merely moves the defect from one side
+> to the other**. Grep the key's consumers and ask "are these the same thing?" first.
+
+### The cost of emptying the whitelist: real-source load drops from 6 to 2
+
+Settling C-4 empties the gate's whitelist — zero exemptions from here on. But with no
+duplicate left in the real source, weakening the criterion can no longer turn it red.
+The remedy is a different proof: **inject duplicates into the real files** (N1 identical,
+N2 conflicting). The two kinds of proof guard different things — one asks "is the
+criterion accurate", the other "would a duplicate in the real source be caught" — and
+**once the debt is clean, only the latter remains**.
+
+> A **mislabeled mutation** was also fixed: the first version labeled "key path loses its
+> parent block" as "cross-object same-name also counts". The former changes **what gets
+> reported**, the latter changes **how much gets judged**. A wrong label tells the next
+> reader a property is guarded when nothing guards it.
+
+### This gate caught a duplicate key **I created in the same batch**
+
+When splitting the key I first named it `home.timelineEvents`; the gate went red
+immediately — that name was already taken by "{{count}} events", i.e. **I had made
+exactly the mistake it exists to catch**.
+
+### Verification
+
+`check-i18n-dupe-keys.py` **zero duplicates, empty whitelist** · self-tests **13/13** ·
+mutations **8/8** (sha256-verified restore each time, green baseline) ·
+`check-i18n-wording.py` green (**2270** keys / 0 unexplained conflicts) ·
+`tsc` / `eslint` / `vitest` green · gates **40/40**.
+
+## Unreleased — Batch 26: **9 keys written twice** in the translation files; the first copy can never display (gate 17, 2026-10-16)
+
+JSON permits duplicate keys, and `JSON.parse` / Python `json` / `serde_json`
+**all keep the last one and silently drop the earlier ones**. Measured:
+**5** in `zh.json`, **4** in `en.json` — **all inside the top-level `home` block**.
+
+### How silent it is — **the other i18n gate cannot see it either**
+
+`tsc` / `eslint` / `vitest` / `build` all green is routine.
+The notable part is `check-i18n-wording.py`: all three of its parse sites
+(lines 183 / 512 / 513) call bare `json.loads(raw)` —
+**the parser has already thrown the duplicate keys away for it**.
+
+⇒ The two i18n gates are **complementary, not overlapping**: one covers duplicate
+keys, the other covers wording, and **neither can find the other's blind spot**.
+
+### "Whether to delete" and "which one to keep" are two different questions
+
+Only the last value is ever used at runtime, so **deleting the shadowed copy is a
+zero-behaviour-change edit** regardless of which wording is correct; but **which
+one should stay** is a wording decision.
+
+| Category | Count | This batch |
+|---|---:|---|
+| Both copies **textually identical** | 4 | **Deleted** (not even a wording question) |
+| The two copies **differ** | 5 | Whitelisted, logged as content debt **C-4** for a human |
+
+Collapsing this into "duplicate keys are just cruft, delete them" would have made
+5 wording decisions on the user's behalf.
+
+`home.forkFromHere` has an extra layer: **the Chinese changed and the English did
+not**. The two `zh` values differ ("从这里分叉" / "从此派生会话") while both `en`
+values are identical and both are literal translations of the *old* Chinese
+⇒ the current Chinese string **has no counterpart in English**.
+`check-i18n-wording.py` structurally cannot catch this: it compares casing and
+word substitutions, and translations of the same key are *supposed* to differ.
+
+### How "zero behaviour change" was proven
+
+Not by "I don't think it affects anything", but by flattening both files before and
+after and comparing **every key and value**: **2268** leaf keys per file, all
+identical, two lines shorter each. That also shows **deleting duplicates changes no
+number derived from the translation files**.
+
+### New gate 17 — `scripts/check-i18n-dupe-keys.py`
+
+The criterion covers duplicate keys **within the same object** only —
+the same key name in *different* blocks is fine (`searching` legitimately exists in
+`home`, `nav` and `perf`). Misjudging that turns a gate into noise,
+and **the fate of noise is a whitelist**.
+
+Self-tests **13/13**, mutations **8/8** (sha256-verified restore each time, green baseline):
+
+| Mutation | Real source | Self-test | Load-bearing |
+|---|---|---|---|
+| Only flags keys seen 3+ times | red | red | **Real source** |
+| Top-level objects only, no recursion | red | red | **Real source** |
+| Cross-object same-name also counts | red | red | **Real source** |
+| Whitelist filter inverted | red | red | **Real source** |
+| Whitelist emptied | red | red | **Real source** |
+| Whitelist carries one extra, non-existent key | red | green | **Real source** |
+| Value comparison not normalised | green | red | Synthetic only |
+| No longer reports stale whitelist entries | green | red | Synthetic only |
+
+The two **"synthetic only"** rows are called out honestly: the real source has no
+duplicate whose value is an object (so key-order normalisation is untested by real
+data), and no stale whitelist entry currently exists to report.
+
+### A real hole found during reverse review: a whitelist can turn from exemption into vulnerability
+
+The first version only blocked duplicate keys that were **not** whitelisted.
+But if someone fixes `zh.json`'s `home.timeline` and forgets to remove the whitelist
+entry, then **any future duplicate at that same key is silently allowed** —
+the whitelist has turned from an exemption into a hole, and **nothing reports it**.
+
+⇒ The whitelist has to stay aligned with the real source in **both** directions:
+unregistered duplicates must be blocked, and **stale entries must be blocked too**.
+Adding that check also gave the criterion itself a **second net**: after M1 / M3
+weakened the criterion, the real source flipped from green to red — and the reason it
+went red was **not** "the duplicate wasn't detected" but **"the five registered
+duplicates can no longer be found"**.
+
+> The self-test caught a bug of mine: the sentinel used a `tuple` to preserve
+> key order, so normalising a value made `json.dumps` serialise objects as
+> **arrays**, pushing key order back into the "same value" decision.
+> "Same value" has to be defined first: **equality by content or by spelling?**
+> By spelling, `{"x":1,"y":2}` and `{"y":2,"x":1}` become two different sentences,
+> though they are the same value in JSON semantics.
+> The same run also caught **my test case being wrong** (I had treated "unregistered"
+> as "stale") — the criterion was right, the expectation was wrong, and both had to
+> change.
+
+### Also corrected a number that **never existed**
+
+The ledger's "i18n keys **2119**" is checked by **no gate at all**. Replaying
+history under the same counting rule, the closest values are **2120** and **2118**,
+both from 2026-09-15 — **2119 never existed**. It was not a stale value, it was a
+**mistyped** one. Replaced with **2268**, the value `check-i18n-wording.py` reports.
+
+### Verification for this batch
+
+New gate self-tests **13/13** · real-source mutations **8/8** ·
+`check-self-test-counts.py` reports "17 gates match the ledger" ·
+`check-i18n-wording.py` green (2268 keys / 0 unexplained conflicts) ·
+`check-docs.py` green · gates **40/40**.
+
+## Unreleased — Batch 25: the stall guardrail went from "only reminds" to a three-stage ladder (T-8, 2026-10-16)
+
+A review of one real session found the guardrail repeating **the same sentence 16 times
+without the model ever changing strategy** — a 9-character question, 25 tool calls,
+**209,825 input tokens**, of which tool execution was only **2.2%** of the time.
+The old `stall_warning` was flat prose whose only variable was the round counter.
+
+| Stage | Trigger | Content |
+|---|---|---|
+| 1 | `≥ threshold` | original wording kept — a task that just crossed the line shouldn't be startled |
+| 2 | `≥ 2×threshold` | names the trap ("more of the same read-only calls will not produce new information") and demands one **verifiable** action this round |
+| 3 | `≥ 3×threshold` | **must do one of two things this round**: produce a verifiable step, or report status and recommendations to the user |
+
+Three design constraints:
+
+- **Staged by multiples of the threshold, not by absolute rounds.** The threshold is
+  configurable on the settings page (a user may set 3 or 30); hard-coded absolute rounds
+  would strand one end at stage 1 forever and send the other straight to the top.
+  The self-test checks `[3, 10, 30]`.
+- **The guardrail can see bytes for the first time.** `record_tool` gained a
+  `result_bytes` parameter, and at the call site `result` *already is* the tool output
+  string, so `len()` is free ⇒ the **context KB consumed during the stall is now written
+  into the stage 2/3 wording**, and reset the moment real progress happens. That targets
+  "the budget counts only rounds and wall-clock, and is completely blind to bytes".
+- The signature changed, so **all 12 call sites were updated** (including the existing
+  self-tests). Each was done with `replace_all` then re-read for verification — the first
+  pass missed one, found only by grepping (because `&args, true` and `&args, false` are
+  different patterns).
+
+The settings-page description for the stall threshold was updated to say "escalating
+reminder" (both zh and en).
+
+### Mutation verification caught a **fake self-test of my own**
+
+The first version of the byte-counting self-test only asserted "no longer stalled after
+progress" — but that assertion is decided by `since_progress` alone, so deleting
+`stalled_bytes = 0` left it **fully green**. Mutation M2 produced no reaction, which
+forced a rewrite into a criterion that can actually tell the difference:
+**the second stall accumulates back to 160 KB rather than continuing on to 320 KB**.
+
+| Mutation | Result |
+|---|---|
+| M1 three stages → one flat sentence (the original shape) | **red** (3 tests) |
+| M2 remove `stalled_bytes = 0` | **red** (the first version could not be moved; it can now) |
+| M3 keep only two stages (stage 3 never appears) | **red** (3 tests) |
+| M4 stage by absolute rounds instead of threshold multiples | **red** (2 tests) |
+| M5 bytes never accumulate (always 0) | **red** (1 test) |
+
+### The half deliberately **not** done
+
+"At which round should the guardrail **force the task to finish**" remains an undecided
+product question. Even the heaviest stage only **asks** the model to pick one of two
+things — **it does not actually terminate the loop**. Crossing that line would no longer
+be an engineering judgement; it would be making a product decision on the user's behalf.
+
+> **Stating plainly what this batch cannot verify**: whether the ladder actually changes
+> the model's behaviour **cannot be checked here** — that needs a real Agent session.
+> What *can* be verified is only the fact that the wording no longer repeats identically.
+
+### Verification for this batch
+
+`task_guard` self-tests **7** (+3) · mutations **5/5** · full `cargo test` ·
+`check-i18n-wording.py` green · gates **38/38**.
 
 ## Unreleased — Batch 24: overturning my own root cause from the previous batch (2026-10-02)
 
@@ -716,321 +1151,6 @@ gates **36/36**.
 **This is the project's first batch that deletes code**: the net effect is another
 **19.7 MB** off the seed database, with **zero functional change** for the user — because
 nothing ever read that column.
-
-### The stall guardrail went from "only reminds" to a three-stage ladder (T-8)
-
-A review of one real session found the guardrail repeating **the same sentence 16 times
-without the model ever changing strategy** — a 9-character question, 25 tool calls,
-**209,825 input tokens**, of which tool execution was only **2.2%** of the time.
-The old `stall_warning` was flat prose whose only variable was the round counter.
-
-| Stage | Trigger | Content |
-|---|---|---|
-| 1 | `≥ threshold` | original wording kept — a task that just crossed the line shouldn't be startled |
-| 2 | `≥ 2×threshold` | names the trap ("more of the same read-only calls will not produce new information") and demands one **verifiable** action this round |
-| 3 | `≥ 3×threshold` | **must do one of two things this round**: produce a verifiable step, or report status and recommendations to the user |
-
-Three design constraints:
-
-- **Staged by multiples of the threshold, not by absolute rounds.** The threshold is
-  configurable on the settings page (a user may set 3 or 30); hard-coded absolute rounds
-  would strand one end at stage 1 forever and send the other straight to the top.
-  The self-test checks `[3, 10, 30]`.
-- **The guardrail can see bytes for the first time.** `record_tool` gained a
-  `result_bytes` parameter, and at the call site `result` *already is* the tool output
-  string, so `len()` is free ⇒ the **context KB consumed during the stall is now written
-  into the stage 2/3 wording**, and reset the moment real progress happens. That targets
-  "the budget counts only rounds and wall-clock, and is completely blind to bytes".
-- The signature changed, so **all 12 call sites were updated** (including the existing
-  self-tests). Each was done with `replace_all` then re-read for verification — the first
-  pass missed one, found only by grepping (because `&args, true` and `&args, false` are
-  different patterns).
-
-The settings-page description for the stall threshold was updated to say "escalating
-reminder" (both zh and en).
-
-#### Mutation verification caught a **fake self-test of my own**
-
-The first version of the byte-counting self-test only asserted "no longer stalled after
-progress" — but that assertion is decided by `since_progress` alone, so deleting
-`stalled_bytes = 0` left it **fully green**. Mutation M2 produced no reaction, which
-forced a rewrite into a criterion that can actually tell the difference:
-**the second stall accumulates back to 160 KB rather than continuing on to 320 KB**.
-
-| Mutation | Result |
-|---|---|
-| M1 three stages → one flat sentence (the original shape) | **red** (3 tests) |
-| M2 remove `stalled_bytes = 0` | **red** (the first version could not be moved; it can now) |
-| M3 keep only two stages (stage 3 never appears) | **red** (3 tests) |
-| M4 stage by absolute rounds instead of threshold multiples | **red** (2 tests) |
-| M5 bytes never accumulate (always 0) | **red** (1 test) |
-
-#### The half deliberately **not** done
-
-"At which round should the guardrail **force the task to finish**" remains an undecided
-product question. Even the heaviest stage only **asks** the model to pick one of two
-things — **it does not actually terminate the loop**. Crossing that line would no longer
-be an engineering judgement; it would be making a product decision on the user's behalf.
-
-> **Stating plainly what this batch cannot verify**: whether the ladder actually changes
-> the model's behaviour **cannot be checked here** — that needs a real Agent session.
-> What *can* be verified is only the fact that the wording no longer repeats identically.
-
-#### Verification for this batch
-
-`task_guard` self-tests **7** (+3) · mutations **5/5** · full `cargo test` ·
-`check-i18n-wording.py` green · gates **38/38**.
-
-### **9 keys written twice** in the translation files; the first copy can never display (gate 17)
-
-JSON permits duplicate keys, and `JSON.parse` / Python `json` / `serde_json`
-**all keep the last one and silently drop the earlier ones**. Measured:
-**5** in `zh.json`, **4** in `en.json` — **all inside the top-level `home` block**.
-
-#### How silent it is — **the other i18n gate cannot see it either**
-
-`tsc` / `eslint` / `vitest` / `build` all green is routine.
-The notable part is `check-i18n-wording.py`: all three of its parse sites
-(lines 183 / 512 / 513) call bare `json.loads(raw)` —
-**the parser has already thrown the duplicate keys away for it**.
-
-⇒ The two i18n gates are **complementary, not overlapping**: one covers duplicate
-keys, the other covers wording, and **neither can find the other's blind spot**.
-
-#### "Whether to delete" and "which one to keep" are two different questions
-
-Only the last value is ever used at runtime, so **deleting the shadowed copy is a
-zero-behaviour-change edit** regardless of which wording is correct; but **which
-one should stay** is a wording decision.
-
-| Category | Count | This batch |
-|---|---:|---|
-| Both copies **textually identical** | 4 | **Deleted** (not even a wording question) |
-| The two copies **differ** | 5 | Whitelisted, logged as content debt **C-4** for a human |
-
-Collapsing this into "duplicate keys are just cruft, delete them" would have made
-5 wording decisions on the user's behalf.
-
-`home.forkFromHere` has an extra layer: **the Chinese changed and the English did
-not**. The two `zh` values differ ("从这里分叉" / "从此派生会话") while both `en`
-values are identical and both are literal translations of the *old* Chinese
-⇒ the current Chinese string **has no counterpart in English**.
-`check-i18n-wording.py` structurally cannot catch this: it compares casing and
-word substitutions, and translations of the same key are *supposed* to differ.
-
-#### How "zero behaviour change" was proven
-
-Not by "I don't think it affects anything", but by flattening both files before and
-after and comparing **every key and value**: **2268** leaf keys per file, all
-identical, two lines shorter each. That also shows **deleting duplicates changes no
-number derived from the translation files**.
-
-#### New gate 17 — `scripts/check-i18n-dupe-keys.py`
-
-The criterion covers duplicate keys **within the same object** only —
-the same key name in *different* blocks is fine (`searching` legitimately exists in
-`home`, `nav` and `perf`). Misjudging that turns a gate into noise,
-and **the fate of noise is a whitelist**.
-
-Self-tests **13/13**, mutations **8/8** (sha256-verified restore each time, green baseline):
-
-| Mutation | Real source | Self-test | Load-bearing |
-|---|---|---|---|
-| Only flags keys seen 3+ times | red | red | **Real source** |
-| Top-level objects only, no recursion | red | red | **Real source** |
-| Cross-object same-name also counts | red | red | **Real source** |
-| Whitelist filter inverted | red | red | **Real source** |
-| Whitelist emptied | red | red | **Real source** |
-| Whitelist carries one extra, non-existent key | red | green | **Real source** |
-| Value comparison not normalised | green | red | Synthetic only |
-| No longer reports stale whitelist entries | green | red | Synthetic only |
-
-The two **"synthetic only"** rows are called out honestly: the real source has no
-duplicate whose value is an object (so key-order normalisation is untested by real
-data), and no stale whitelist entry currently exists to report.
-
-#### A real hole found during reverse review: a whitelist can turn from exemption into vulnerability
-
-The first version only blocked duplicate keys that were **not** whitelisted.
-But if someone fixes `zh.json`'s `home.timeline` and forgets to remove the whitelist
-entry, then **any future duplicate at that same key is silently allowed** —
-the whitelist has turned from an exemption into a hole, and **nothing reports it**.
-
-⇒ The whitelist has to stay aligned with the real source in **both** directions:
-unregistered duplicates must be blocked, and **stale entries must be blocked too**.
-Adding that check also gave the criterion itself a **second net**: after M1 / M3
-weakened the criterion, the real source flipped from green to red — and the reason it
-went red was **not** "the duplicate wasn't detected" but **"the five registered
-duplicates can no longer be found"**.
-
-> The self-test caught a bug of mine: the sentinel used a `tuple` to preserve
-> key order, so normalising a value made `json.dumps` serialise objects as
-> **arrays**, pushing key order back into the "same value" decision.
-> "Same value" has to be defined first: **equality by content or by spelling?**
-> By spelling, `{"x":1,"y":2}` and `{"y":2,"x":1}` become two different sentences,
-> though they are the same value in JSON semantics.
-> The same run also caught **my test case being wrong** (I had treated "unregistered"
-> as "stale") — the criterion was right, the expectation was wrong, and both had to
-> change.
-
-#### Also corrected a number that **never existed**
-
-The ledger's "i18n keys **2119**" is checked by **no gate at all**. Replaying
-history under the same counting rule, the closest values are **2120** and **2118**,
-both from 2026-09-15 — **2119 never existed**. It was not a stale value, it was a
-**mistyped** one. Replaced with **2268**, the value `check-i18n-wording.py` reports.
-
-#### Verification for this batch
-
-New gate self-tests **13/13** · real-source mutations **8/8** ·
-`check-self-test-counts.py` reports "17 gates match the ledger" ·
-`check-i18n-wording.py` green (2268 keys / 0 unexplained conflicts) ·
-`check-docs.py` green · gates **40/40**.
-
-### C-4 settled: the root cause of those 5 conflicting strings was **one key shared by two panels**
-
-Tracing the consumers showed the 5 conflicts whitelisted in the previous section
-were **not a question of which wording is better**.
-
-| Consumer | What it actually is | What it has always displayed |
-|---|---|---|
-| "More" menu button (`handleOpenTimeline` → `loadSnapshots`) | the **snapshot timeline** dialog | Timeline (back to a checkpoint) / No checkpoints yet… |
-| Sidebar `timeline` item → **`TimelinePanel`** | the **session event log** (grouped by `trace_id`) | the very same two keys |
-
-Two entry points leading to two different things while sharing one key means:
-
-- the sidebar tab has always read "Timeline (back to a checkpoint)" while **what it opens
-  is the event log**;
-- `TimelinePanel`'s empty state has always told the user to wait for a checkpoint
-  that has nothing to do with it — it lists **events**.
-
-**Fixing one screen's wording broke the other, and nothing reported it.**
-
-⇒ **The shadowed sentence was not an outdated draft — it was a sentence that belonged
-to a different panel and was simply filed under the wrong key.** The right fix is not to
-pick a winner but to **split the key per consumer**: `home.timelineLog` /
-`home.timelineLogEmpty` (both languages), with the two shadowed sentences **moved back
-verbatim** to where they always belonged — not one word of the copy was rewritten,
-it was just filed correctly.
-
-`home.forkFromHere` is a different case: the Chinese changed and **the English did not**
-⇒ en now reads `Fork session from here` (keeping the "fork" term the code already uses,
-adding the missing "session").
-
-> **Generalisation**: the same string appearing in two places has **two** possible causes
-> — the wording drifted, or two genuinely different features share one key.
-> The first is fixed by editing copy; **the second merely moves the defect from one side
-> to the other**. Grep the key's consumers and ask "are these the same thing?" first.
-
-#### The cost of emptying the whitelist: real-source load drops from 6 to 2
-
-Settling C-4 empties the gate's whitelist — zero exemptions from here on. But with no
-duplicate left in the real source, weakening the criterion can no longer turn it red.
-The remedy is a different proof: **inject duplicates into the real files** (N1 identical,
-N2 conflicting). The two kinds of proof guard different things — one asks "is the
-criterion accurate", the other "would a duplicate in the real source be caught" — and
-**once the debt is clean, only the latter remains**.
-
-> A **mislabeled mutation** was also fixed: the first version labeled "key path loses its
-> parent block" as "cross-object same-name also counts". The former changes **what gets
-> reported**, the latter changes **how much gets judged**. A wrong label tells the next
-> reader a property is guarded when nothing guards it.
-
-#### This gate caught a duplicate key **I created in the same batch**
-
-When splitting the key I first named it `home.timelineEvents`; the gate went red
-immediately — that name was already taken by "{{count}} events", i.e. **I had made
-exactly the mistake it exists to catch**.
-
-#### Verification
-
-`check-i18n-dupe-keys.py` **zero duplicates, empty whitelist** · self-tests **13/13** ·
-mutations **8/8** (sha256-verified restore each time, green baseline) ·
-`check-i18n-wording.py` green (**2270** keys / 0 unexplained conflicts) ·
-`tsc` / `eslint` / `vitest` green · gates **40/40**.
-
-### The code references i18n keys that **do not exist** — three user-visible (gate 18)
-
-| Key | Symptom in the UI |
-|---|---|
-| `common.off` | the dropdown option literally reads **`common.off`** |
-| `md.copied` | after copying a code block the button literally reads **`md.copied`** |
-| `home.queueFailed` | it carried a Chinese default, so **English users saw Chinese** |
-
-i18next's fallback renders **the key name itself**, so the symptom is not "the
-translation didn't load" — it is a raw key sitting on screen, which sends you
-debugging in exactly the wrong direction.
-
-`check-i18n-wording.py` structurally cannot catch this: it compares whether the
-two languages line up, and when a key is missing on **both** sides the parity
-check sees nothing wrong.
-
-A fourth hit, `about.tauri`, turned out to be inside a **comment** — the code had
-long since switched to `about.runtimeValue`. A dead key name in a comment is still
-harmful, so the comment was fixed too.
-
-#### The big one: a hand-rolled lexer **ate the real references**
-
-The first version used a hand-written Python state machine to strip comments.
-Injecting a bad key and running it, **the gate was green**. Investigation showed:
-
-| File | Real references | Left after comment stripping |
-|---|---:|---:|
-| `Home.tsx` | 424 | **35** |
-| `ConfigPage.tsx` | 75 | **0** |
-| `Markdown.tsx` | 27 | **0** |
-
-Root cause is template literals —
-`` setError(`${t('config.clearError')}: ${e}`) ``: inside `` `${...} `` there is
-**real code**, and the state machine blanked the whole template as a string.
-
-⇒ The repository already has TypeScript (`tsc` runs it daily). Switching to
-`ts.createSourceFile` + AST walk: not one reference lost, dead keys inside comments
-still correctly ignored, and an injected bad key is reported with an exact
-`file:line`.
-
-> "Nobody guards this" comes in two kinds: **the guard was never built**, and
-> **the guard was built but has been dead all along**. The first mutation round
-> reported "load-bearing: none" and I nearly concluded the former; the truth was
-> the latter.
-
-#### A gate's language need not be uniform, but the **ledger parsing must follow**
-
-With the gate now in Node, the gate-list regex in both `check-self-test-counts.py`
-and the full verification script widened from `check-xxx.py` to `py|mjs`.
-Otherwise the new gate is reported as "the ledger is missing N gates" —
-**which looks like a documentation problem but is actually a parsing-scope problem**,
-and is very easy to fix in the wrong place.
-
-#### Two directions are red; dead keys are not judged
-
-"A namespace that does not exist" was simply filtered out in the first version,
-but its symptom is identical to a missing key and the real source has **0**
-such hits — so judging it produces no noise and there is no reason to leave a
-silent hole.
-
-Dead keys are not judged: 13 files use dynamic keys ``t(`...`)`` which cannot be
-enumerated statically, so any number reported is an **upper bound, not a fact**.
-
-#### Mutations 8/8
-
-| Mutation | Real source | Self-test | Load-bearing |
-|---|---|---|---|
-| Inject a **misspelled leaf key** | red | green | **Real source** |
-| Inject a **misspelled namespace** | red | green | **Real source** |
-| Bad key in a **comment** only | green | green | Reverse evidence (must not false-alarm) |
-| No longer require namespaced shape | green | red | Synthetic only |
-| No longer exclude test files | green | red | Synthetic only |
-| No longer check "this file uses i18next" | green | red | Synthetic only |
-| Silently drop "namespace missing" | green | red | Synthetic only |
-| Missing keys never reported | green | red | Synthetic only |
-
-#### Verification
-
-New gate self-tests **15/15** · mutations **8/8** ·
-`check-self-test-counts.py` reports "**18** gates match the ledger" (including the
-`.mjs` one) · `check-i18n-wording.py` green (**2273** keys / 0 unexplained
-conflicts) · gates **42/42**.
 
 ---
 
